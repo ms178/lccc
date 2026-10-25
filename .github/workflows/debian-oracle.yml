@@ -81,7 +81,9 @@ jobs:
           PY
 
       - name: Packed vector relations against exact Debian GCC 16.2
-        run: python3 tests/regression/check_packed_vector_relations.py --json debian-packed-vector-relations.json
+        run: |
+          python3 tests/regression/check_packed_vector_relations.py --json debian-packed-vector-relations.json
+          python3 tests/regression/check_shuffle_composition.py --json debian-shuffle-composition.json
 
       - name: Integer order networks against exact Debian GCC 16.2
         run: python3 tests/regression/check_integer_order_networks.py

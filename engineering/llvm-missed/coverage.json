@@ -2995,6 +2995,292 @@
         "tests/regression/check_count_observations.py"
       ],
       "remaining": "Broader original-report semantics and target-cost decisions are not claimed; see the per-report audit."
+    },
+    {
+      "number": 29612,
+      "status": "reviewed-deferred",
+      "cohort": "shuffle-composition",
+      "scope": "Two-source concatenation/constant selection needs a two-source register shuffle and target cost model. Unary dword composition is only a seed, not the reported reduction.",
+      "evidence": [
+        "engineering/llvm-missed/SHUFFLE-COMPOSITION.md",
+        "engineering/llvm-missed/shuffle-composition-sources.json"
+      ],
+      "remaining": "Original report scope remains deferred; tested fixed SSE2 seeds are narrower."
+    },
+    {
+      "number": 40778,
+      "status": "reviewed-deferred",
+      "cohort": "shuffle-composition",
+      "scope": "Partial/identity shuffles becoming partial stores need memory demand and dead-store analysis; a full 16-byte store cannot be silently narrowed.",
+      "evidence": [
+        "engineering/llvm-missed/SHUFFLE-COMPOSITION.md",
+        "engineering/llvm-missed/shuffle-composition-sources.json"
+      ],
+      "remaining": "Original report scope remains deferred; tested fixed SSE2 seeds are narrower."
+    },
+    {
+      "number": 46238,
+      "status": "reviewed-deferred",
+      "cohort": "shuffle-composition",
+      "scope": "Original smax/minmax/FMA/funnel intrinsic factoring and poison discussion exceed the integer/bitwise binops admitted here. No FP arithmetic is moved; discarded lanes can affect exceptions.",
+      "evidence": [
+        "engineering/llvm-missed/SHUFFLE-COMPOSITION.md",
+        "engineering/llvm-missed/shuffle-composition-sources.json"
+      ],
+      "remaining": "Original report scope remains deferred; tested fixed SSE2 seeds are narrower."
+    },
+    {
+      "number": 55066,
+      "status": "reviewed-deferred",
+      "cohort": "shuffle-composition",
+      "scope": "Arbitrary 32-byte byte shuffle plus bitcast/dword permutation requires byte provenance and AVX2 lane legalization; flattening masks can worsen target code.",
+      "evidence": [
+        "engineering/llvm-missed/SHUFFLE-COMPOSITION.md",
+        "engineering/llvm-missed/shuffle-composition-sources.json"
+      ],
+      "remaining": "Original report scope remains deferred; tested fixed SSE2 seeds are narrower."
+    },
+    {
+      "number": 55994,
+      "status": "reviewed-deferred",
+      "cohort": "shuffle-composition",
+      "scope": "2-to-16 byte repeated splat construction changes lengths and merges partial poison lanes; not a four-dword unary chain. Discussion reports an upstream fix, not local coverage.",
+      "evidence": [
+        "engineering/llvm-missed/SHUFFLE-COMPOSITION.md",
+        "engineering/llvm-missed/shuffle-composition-sources.json"
+      ],
+      "remaining": "Original report scope remains deferred; tested fixed SSE2 seeds are narrower."
+    },
+    {
+      "number": 60632,
+      "status": "reviewed-deferred",
+      "cohort": "shuffle-composition",
+      "scope": "Equivalent multiuse splat/binop/extract demands require demanded-element equivalence and dominance-safe reuse, not private syntactic composition.",
+      "evidence": [
+        "engineering/llvm-missed/SHUFFLE-COMPOSITION.md",
+        "engineering/llvm-missed/shuffle-composition-sources.json"
+      ],
+      "remaining": "Original report scope remains deferred; tested fixed SSE2 seeds are narrower."
+    },
+    {
+      "number": 62688,
+      "status": "reviewed-deferred",
+      "cohort": "shuffle-composition",
+      "scope": "bswap plus reversal needs byte-granularity combination during legalization; converting everything to middle-end shuffles is not universally profitable.",
+      "evidence": [
+        "engineering/llvm-missed/SHUFFLE-COMPOSITION.md",
+        "engineering/llvm-missed/shuffle-composition-sources.json"
+      ],
+      "remaining": "Original report scope remains deferred; tested fixed SSE2 seeds are narrower."
+    },
+    {
+      "number": 63946,
+      "status": "reviewed-deferred",
+      "cohort": "shuffle-composition",
+      "scope": "The 8-dword shared-input compare/reduction also requires sign-extension/legalization/reassociation tuning. A private 4-dword 57-then-78 seed is tested, but the actual shared AVX2 network remains deferred.",
+      "evidence": [
+        "engineering/llvm-missed/SHUFFLE-COMPOSITION.md",
+        "engineering/llvm-missed/shuffle-composition-sources.json"
+      ],
+      "remaining": "Original report scope remains deferred; tested fixed SSE2 seeds are narrower."
+    },
+    {
+      "number": 69929,
+      "status": "reviewed-deferred",
+      "cohort": "shuffle-composition",
+      "scope": "Fixed-order recurrence PHIs/history reductions require loop/reduction work (n=2/4/5), not local shuffle composition. Upstream closure is not a local result.",
+      "evidence": [
+        "engineering/llvm-missed/SHUFFLE-COMPOSITION.md",
+        "engineering/llvm-missed/shuffle-composition-sources.json"
+      ],
+      "remaining": "Original report scope remains deferred; tested fixed SSE2 seeds are narrower."
+    },
+    {
+      "number": 86068,
+      "status": "reviewed-deferred",
+      "cohort": "shuffle-composition",
+      "scope": "Two-source nested partial masks need a two-source composition representation and profitability accounting; poison lanes cannot become arbitrary observed data.",
+      "evidence": [
+        "engineering/llvm-missed/SHUFFLE-COMPOSITION.md",
+        "engineering/llvm-missed/shuffle-composition-sources.json"
+      ],
+      "remaining": "Original report scope remains deferred; tested fixed SSE2 seeds are narrower."
+    },
+    {
+      "number": 86079,
+      "status": "reviewed-deferred",
+      "cohort": "shuffle-composition",
+      "scope": "Partial two-source shuffle/fneg needs sign-bit mask semantics and target cost checks. Pure bit permutation is supported, but no FP-negation motion is introduced.",
+      "evidence": [
+        "engineering/llvm-missed/SHUFFLE-COMPOSITION.md",
+        "engineering/llvm-missed/shuffle-composition-sources.json"
+      ],
+      "remaining": "Original report scope remains deferred; tested fixed SSE2 seeds are narrower."
+    },
+    {
+      "number": 96884,
+      "status": "reviewed-deferred",
+      "cohort": "shuffle-composition",
+      "scope": "Bitcast-obstructed identity requires byte-level lane tracking across changing element interpretation; this matcher deliberately does not peel casts.",
+      "evidence": [
+        "engineering/llvm-missed/SHUFFLE-COMPOSITION.md",
+        "engineering/llvm-missed/shuffle-composition-sources.json"
+      ],
+      "remaining": "Original report scope remains deferred; tested fixed SSE2 seeds are narrower."
+    },
+    {
+      "number": 98346,
+      "status": "reviewed-deferred",
+      "cohort": "shuffle-composition",
+      "scope": "AVX2 mask constant sharing and AND/packuswb versus shuffle cost is port- and legalization-dependent; fixed SSE2 immediate composition does not choose this tradeoff.",
+      "evidence": [
+        "engineering/llvm-missed/SHUFFLE-COMPOSITION.md",
+        "engineering/llvm-missed/shuffle-composition-sources.json"
+      ],
+      "remaining": "Original report scope remains deferred; tested fixed SSE2 seeds are narrower."
+    },
+    {
+      "number": 104482,
+      "status": "reviewed-deferred",
+      "cohort": "shuffle-composition",
+      "scope": "Byte zero-extension/unpack and word permutations expand during legalization; retaining efficient widening/shuffle forms needs additional backend representation.",
+      "evidence": [
+        "engineering/llvm-missed/SHUFFLE-COMPOSITION.md",
+        "engineering/llvm-missed/shuffle-composition-sources.json"
+      ],
+      "remaining": "Original report scope remains deferred; tested fixed SSE2 seeds are narrower."
+    },
+    {
+      "number": 111611,
+      "status": "reviewed-deferred",
+      "cohort": "shuffle-composition",
+      "scope": "Odd-byte extraction is logical-shift-by-eight plus narrowing 32*u16 to u8; width-changing truncation and AVX512 lowering are outside the fixed-width domain.",
+      "evidence": [
+        "engineering/llvm-missed/SHUFFLE-COMPOSITION.md",
+        "engineering/llvm-missed/shuffle-composition-sources.json"
+      ],
+      "remaining": "Original report scope remains deferred; tested fixed SSE2 seeds are narrower."
+    },
+    {
+      "number": 120764,
+      "status": "reviewed-deferred",
+      "cohort": "shuffle-composition",
+      "scope": "Nested four-double two-source masks share operands and need two-source composition; FP add must remain. A 128-bit unary dword rule does not solve this 256-bit example.",
+      "evidence": [
+        "engineering/llvm-missed/SHUFFLE-COMPOSITION.md",
+        "engineering/llvm-missed/shuffle-composition-sources.json"
+      ],
+      "remaining": "Original report scope remains deferred; tested fixed SSE2 seeds are narrower."
+    },
+    {
+      "number": 120772,
+      "status": "reviewed-deferred",
+      "cohort": "shuffle-composition",
+      "scope": "Insert/extract of differing vector lengths requires costed narrowing/widening rather than blanket conversion to shuffles.",
+      "evidence": [
+        "engineering/llvm-missed/SHUFFLE-COMPOSITION.md",
+        "engineering/llvm-missed/shuffle-composition-sources.json"
+      ],
+      "remaining": "Original report scope remains deferred; tested fixed SSE2 seeds are narrower."
+    },
+    {
+      "number": 120775,
+      "status": "reviewed-deferred",
+      "cohort": "shuffle-composition",
+      "scope": "Pushing shuffle through select is usually three instructions to four unless inner shuffles simplify; no unconditional select distribution is enabled.",
+      "evidence": [
+        "engineering/llvm-missed/SHUFFLE-COMPOSITION.md",
+        "engineering/llvm-missed/shuffle-composition-sources.json"
+      ],
+      "remaining": "Original report scope remains deferred; tested fixed SSE2 seeds are narrower."
+    },
+    {
+      "number": 121823,
+      "status": "reviewed-deferred",
+      "cohort": "shuffle-composition",
+      "scope": "Zero-producing AVX2 PSHUFB/VPERMD masks need explicit zero-byte provenance and target blend/register costs; PSHUFD has no zeroing lanes.",
+      "evidence": [
+        "engineering/llvm-missed/SHUFFLE-COMPOSITION.md",
+        "engineering/llvm-missed/shuffle-composition-sources.json"
+      ],
+      "remaining": "Original report scope remains deferred; tested fixed SSE2 seeds are narrower."
+    },
+    {
+      "number": 144227,
+      "status": "reviewed-deferred",
+      "cohort": "shuffle-composition",
+      "scope": "Reduction-chain vector users need demanded-lane/cycle proof and scalar-to-vector replacement only for unobserved other lanes; SSE4.1 reduction legalization remains separate.",
+      "evidence": [
+        "engineering/llvm-missed/SHUFFLE-COMPOSITION.md",
+        "engineering/llvm-missed/shuffle-composition-sources.json"
+      ],
+      "remaining": "Original report scope remains deferred; tested fixed SSE2 seeds are narrower."
+    },
+    {
+      "number": 144656,
+      "status": "reviewed-deferred",
+      "cohort": "shuffle-composition",
+      "scope": "Concat four-to-eight then interleave is length-changing and two-source; the same-length example already folds upstream and is not a new local success.",
+      "evidence": [
+        "engineering/llvm-missed/SHUFFLE-COMPOSITION.md",
+        "engineering/llvm-missed/shuffle-composition-sources.json"
+      ],
+      "remaining": "Original report scope remains deferred; tested fixed SSE2 seeds are narrower."
+    },
+    {
+      "number": 156853,
+      "status": "reviewed-deferred",
+      "cohort": "shuffle-composition",
+      "scope": "Cast hoisting across unary shuffle requires source-length bounds and poison-versus-undef semantics; no cast peeling or width inference from mask length here.",
+      "evidence": [
+        "engineering/llvm-missed/SHUFFLE-COMPOSITION.md",
+        "engineering/llvm-missed/shuffle-composition-sources.json"
+      ],
+      "remaining": "Original report scope remains deferred; tested fixed SSE2 seeds are narrower."
+    },
+    {
+      "number": 170665,
+      "status": "reviewed-deferred",
+      "cohort": "shuffle-composition",
+      "scope": "Generated concat shuffles block multiuse FMA merging; a reuse cache must respect dominance/insertion and worklist invalidation. No unsafe global cache is added.",
+      "evidence": [
+        "engineering/llvm-missed/SHUFFLE-COMPOSITION.md",
+        "engineering/llvm-missed/shuffle-composition-sources.json"
+      ],
+      "remaining": "Original report scope remains deferred; tested fixed SSE2 seeds are narrower."
+    },
+    {
+      "number": 173035,
+      "status": "reviewed-deferred",
+      "cohort": "shuffle-composition",
+      "scope": "Requested removal of one-use constraints needs retained-cost accounting. This batch deliberately retains private producers, rather than claim shared-case coverage.",
+      "evidence": [
+        "engineering/llvm-missed/SHUFFLE-COMPOSITION.md",
+        "engineering/llvm-missed/shuffle-composition-sources.json"
+      ],
+      "remaining": "Original report scope remains deferred; tested fixed SSE2 seeds are narrower."
+    },
+    {
+      "number": 219717,
+      "status": "reviewed-deferred",
+      "cohort": "shuffle-composition",
+      "scope": "ONNX byte-to-word shuffles across bitcasts require byte provenance and per-target gating; reported x86/RVV gains regress AArch64.",
+      "evidence": [
+        "engineering/llvm-missed/SHUFFLE-COMPOSITION.md",
+        "engineering/llvm-missed/shuffle-composition-sources.json"
+      ],
+      "remaining": "Original report scope remains deferred; tested fixed SSE2 seeds are narrower."
+    },
+    {
+      "number": 230345,
+      "status": "reviewed-deferred",
+      "cohort": "shuffle-composition",
+      "scope": "Calls retain original binops/shuffles, invalidating naive removal credits (real five-to-seven growth). Both shuffled operands must be private in the implemented seed; shared original report remains deferred.",
+      "evidence": [
+        "engineering/llvm-missed/SHUFFLE-COMPOSITION.md",
+        "engineering/llvm-missed/shuffle-composition-sources.json"
+      ],
+      "remaining": "Original report scope remains deferred; tested fixed SSE2 seeds are narrower."
     }
   ],
   "latest_batch": 2,

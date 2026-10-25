@@ -200,3 +200,12 @@ preimages. Two limited scopes and five new deferrals bring the cumulative ledger
 to 144 reviewed scopes (52 limited, 92 deferred); 2,967 rows remain unreviewed.
 Private exact zero/full observations bridge builtin input/result types without
 rewriting shared count producers. Native controls are not whole-issue closure.
+
+## Fixed SSE2 shuffle composition
+
+[Shuffle composition](SHUFFLE-COMPOSITION.md) records 26 new original-report
+reviews and private fixed-dword permutation seeds. All 26 **original scopes
+remain deferred**: the ledger is now 170 reviewed (52 limited, 118 deferred),
+2,941 unreviewed. Typed GNU shuffle homes reduce copies and expose register
+algebra; matching private shuffles factor around safe integer/bitwise binops.
+Existing machine-level adjacent shuffle composition is not claimed as new.
