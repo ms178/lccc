@@ -5718,6 +5718,31 @@ mod prefetch_isa_tests {
     }
 
     #[test]
+    fn i686_native_avx_permissions_keep_vectorizer_ceiling_closed() {
+        use crate::common::x86_features::X86Feature as F;
+
+        for (flags, avx, avx2) in [
+            (&["-m32"][..], false, false),
+            (&["-m32", "-mavx"][..], true, false),
+            (&["-m32", "-mavx2"][..], true, true),
+            (&["-m32", "-mavx2", "-mno-avx2"][..], true, false),
+            (&["-m32", "-mavx", "-mno-avx"][..], false, false),
+            (&["-m32", "-mno-avx", "-mavx"][..], true, false),
+            (&["-m32", "-mavx2", "-mno-avx2", "-mavx2"][..], true, true),
+            (&["-m32", "-mavx2", "-mno-sse2"][..], false, false),
+            (&["-m32", "-mavx2", "-mno-sse"][..], false, false),
+            (&["-m32", "-mavx2", "-mgeneral-regs-only"][..], false, false),
+        ] {
+            let driver = parse(flags);
+            let features = driver.effective_x86_features();
+            assert_eq!(features.contains(F::Avx), avx, "{flags:?}");
+            assert_eq!(features.contains(F::Avx2), avx2, "{flags:?}");
+            assert!(!driver.x86_isa().avx, "{flags:?}");
+            assert!(!driver.x86_isa().ymm, "{flags:?}");
+        }
+    }
+
+    #[test]
     fn x86_64_sse_prefetch_is_baseline() {
         // GCC 16 emits prefetcht* even without xmm state on x86-64.
         for flags in [

@@ -3528,8 +3528,19 @@ impl Driver {
 
         // SIMD classes straight from the codegen ceiling.
         let isa = self.x86_isa();
-        set.insert_if(isa.avx, F::Avx);
-        set.insert_if(isa.ymm, F::Avx2);
+        // The i686 native intrinsic emitters support VEX even though the
+        // x86-64-only vectorizer ceiling above deliberately remains NONE.
+        // Do not borrow that backend policy to reject explicitly requested
+        // i686 instructions, or widen the vectorizer ceiling to admit them.
+        let i686_avx = !x86_64
+            && set.contains(F::Sse2)
+            && self.enable_avx
+            && !self.avx_explicitly_disabled;
+        set.insert_if(isa.avx || i686_avx, F::Avx);
+        set.insert_if(
+            isa.ymm || (i686_avx && self.enable_avx2 && !self.avx2_explicitly_disabled),
+            F::Avx2,
+        );
         set.insert_if(isa.fma, F::Fma);
         // F16C is VEX-encoded: `-mno-avx` removes it even when a `-march=`
         // profile asked for it (GCC undefines `__F16C__` for the same

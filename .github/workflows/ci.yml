@@ -606,7 +606,7 @@ jobs:
     - name: RISC-V relocation rejection and positive controls
       run: python3 tests/linker/check_riscv_relocation_contract.py --lccc target/fastbuild/lccc-riscv
     - name: ISA-sensitive intrinsic feature gate
-      run: env CCC=target/fastbuild/lccc bash tests/regression/check_intrinsic_feature_gate.sh
+      run: python3 scripts/ci_test_report.py -- env CCC=target/fastbuild/lccc bash tests/regression/check_intrinsic_feature_gate.sh
     - name: Verify native VEX flag-read architectural controls
       run: bash tests/regression/check_vex_flag_reads.sh
     # The provisioner is the only thing between the differential harness

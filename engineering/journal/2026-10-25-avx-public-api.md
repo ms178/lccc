@@ -73,3 +73,23 @@ A foreign or failed nonempty prefix is never overlaid or removed. Six isolated
 provisioning contract tests pass without network or real compiler invocation.
 The full source build and performance observations remain hosted evidence,
 not fabricated local measurements.
+
+### i686 permission separation and hosted failure visibility
+
+The first expanded feature-gate run failed. Inspection found that published
+AVX/AVX2 permissions came exclusively from `x86_isa()`, whose vectorizer ceiling
+is intentionally NONE on i686. Native VTEST and widening emitters must not use
+that unrelated backend policy. Publish i686's explicit AVX/AVX2 requests from
+the resolved SSE2 prerequisite and independent explicit denials instead; keep
+the x86-64 vectorizer ceiling unchanged. Ten unit-test flag combinations cover
+baseline, grants, independent AVX2 denial, re-enabling, and SIMD vetoes. Dedicated
+i686 corpus entries run the complete existing VTEST and widening contracts.
+Hosted acceptance of this correction is still required.
+
+The instrumentation bootstrap also failed before measurements, but the log
+storage endpoint remained inaccessible and its check carried no root cause.
+Move the unchanged tool sequence into a fail-closed bootstrap script and run
+it through the existing failure reporter. Preserve installer annotations when
+capturing driver paths, and surface GAS configure/build logs on failure. The
+intrinsic feature step now uses the same reporter. Neither wrapper changes
+acceptance criteria or bypasses a failed command.
