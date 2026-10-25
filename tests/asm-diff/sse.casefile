@@ -91,34 +91,6 @@ sqrtpd %xmm15, %xmm0
 sqrtpd %xmm3, %xmm12
 sqrtpd 16(%rdi), %xmm5
 sqrtpd (%r13,%r14,8), %xmm13
-;;; ssse3_horizontal_saturating
-.text
-phaddsw %mm1, %mm2
-phaddsw %xmm1, %xmm2
-phaddsw (%rdi), %xmm2
-phsubsw %mm1, %mm2
-phsubsw %xmm1, %xmm2
-phsubsw (%rdi), %xmm2
-;;; sse42_pcmpstr
-.text
-pcmpestrm $0x08, %xmm1, %xmm2
-pcmpestri $0x08, (%rdi), %xmm2
-pcmpistrm $0x08, %xmm1, %xmm2
-pcmpistri $0x08, (%rdi), %xmm2
-rex64 pcmpestri $0x08, %xmm1, %xmm2
-rex64 pcmpestri $0x08, %xmm9, %xmm10
-rex64 pcmpestrm $0x08, %xmm1, %xmm2
-rex64 pcmpestrm $0x08, (%rdi), %xmm2
-rex64 pcmpistri $0x08, %xmm1, %xmm2
-rex64 pcmpistri $0x08, %xmm9, %xmm10
-;;; amd_sse4a
-.text
-extrq %xmm1, %xmm2
-extrq $7, $9, %xmm2
-insertq %xmm1, %xmm2
-insertq $7, $9, %xmm1, %xmm2
-movntsd %xmm1, (%rdi)
-movntss %xmm1, (%rdi)
 ;;; sse_ps
 .text
 addps %xmm0, %xmm1
