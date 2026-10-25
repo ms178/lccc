@@ -1712,6 +1712,8 @@ jobs:
     - name: Verify i686 assembly differential vs GNU as 2.47
       run: python3 scripts/asmdiff.py --32 --jobs 2 --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" --objdump "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump"
         --lccc target/fastbuild/lccc-i686
+    - name: Verify complete SSE3 SSSE3 SSE4 encodings vs Clang 23.1.4
+      run: python3 tests/regression/check_sse34_clang.py
     - name: Verify encdiff corpus vs GNU as 2.47 (offline)
       run: |
         python3 scripts/encdiff.py --offline --quiet \

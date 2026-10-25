@@ -13,6 +13,8 @@ mod gp_integer;
 mod promoted;
 mod registers;
 mod sse;
+mod sse34;
+pub(crate) use sse34::check_sse34_operands;
 mod system;
 mod x87_misc;
 mod xop;
@@ -3420,6 +3422,7 @@ impl InstructionEncoder {
         let suffixed = infer_suffix(&mnemonic_raw, &instr.operands);
         let mnemonic = suffixed.as_str();
         let ops = &instr.operands;
+        check_sse34_operands(mnemonic, ops, true)?;
 
         // Validate role-specific widths before either forced or automatic
         // EVEX dispatch can reinterpret malformed register names.
@@ -4968,6 +4971,17 @@ impl InstructionEncoder {
             "movmskpd" => self.encode_sse_cvt_xmm_to_gp(ops, &[0x66, 0x0F, 0x50], 4),
             "movmskps" => self.encode_sse_cvt_xmm_to_gp(ops, &[0x0F, 0x50], 4),
             "movntps" => self.encode_sse_store(ops, &[0x0F, 0x2B]),
+
+            "phaddsw" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x03]),
+            "phsubsw" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x07]),
+            "pcmpestrm" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x60]),
+            "pcmpestri" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x61]),
+            "pcmpistrm" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x62]),
+            "pcmpistri" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x63]),
+            "extrq" => self.encode_sse4a_bits(ops, false),
+            "insertq" => self.encode_sse4a_bits(ops, true),
+            "movntsd" => self.encode_sse_store(ops, &[0xF2, 0x0F, 0x2B]),
+            "movntss" => self.encode_sse_store(ops, &[0xF3, 0x0F, 0x2B]),
 
             // ---- SSE4.1 ----
             // blendv instructions use xmm0 as implicit mask; 3-op form names it explicitly

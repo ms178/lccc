@@ -204,6 +204,14 @@
     },
     {
       "repo": "intelxed/xed",
+      "path": "datafiles/amd/xed-amd-sse4a.txt",
+      "role": "AMD SSE4a: EXTRQ/INSERTQ/MOVNTSD/MOVNTSS",
+      "sha256": "24e17a081a71c920bcba142a89cbafefa692bac8a94fbd3927e6d0db9815aa5d",
+      "bytes": 3463,
+      "license": "Apache-2.0"
+    },
+    {
+      "repo": "intelxed/xed",
       "path": "datafiles/amd/xed-amd-3dnow.txt",
       "role": "3DNow!/MMX extensions",
       "sha256": "eb29b459d38e2648f4035710a078cea83f38c215e46880b248ef6ce1f3cc8058",
@@ -331,6 +339,6 @@
       "license": "Apache-2.0"
     }
   ],
-  "classes": 1435,
-  "encodings": 4991
+  "classes": 1439,
+  "encodings": 4998
 }
