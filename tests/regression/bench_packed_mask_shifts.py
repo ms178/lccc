@@ -6,7 +6,6 @@ Use the runner's normal options, e.g. --candidate before=/path/to/frozen/lccc
 --reps 15 --json /path/results.json --artifact-dir /path/artifacts --strict.
 The driver is identical across compiler arms; no LTO or kernel inlining.
 """
-import hashlib
 from pathlib import Path
 import sys
 
@@ -14,19 +13,18 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'tests/benchmark'))
 import run_benchmarks as lab
 
-DRIVER = ROOT / 'tests/benchmark/programs/packed_mask_shifts_driver.c'
+DRIVER = ROOT / 'tests/regression/packed_mask_shifts/driver.c'
 KERNELS = ROOT / 'tests/regression/packed_mask_shifts.c'
 NAMES = ('packed_shl16', 'packed_ashr32', 'packed_mask16', 'packed_tree32', 'packed_shared32_control')
 lab.BENCHMARKS = tuple(lab.Benchmark(name, 'Dependent SSE2 map including call/memory cost',
                        (str(DRIVER),), ('simd', 'sse2', 'micro'), ci_sharded=False) for name in NAMES)
-original_compile = lab.compile_one
 # Do not change discovery or any measurement/statistics/environment code.
 gcc = lab.build_arg_parser().parse_args(lab.normalize_flag_valued_options(sys.argv[1:])).gcc
 
 
 def compile_separate(compiler, benchmark, source, output, artifacts):
     index = NAMES.index(benchmark.name)
-    iterations = 33554432 if index == 3 else 268435456
+    iterations = 134217728 if index == 3 else 268435456
     output.parent.mkdir(parents=True, exist_ok=True)
     output.unlink(missing_ok=True)
     kernel = output.with_suffix('.kernel.o')
