@@ -4,6 +4,34 @@ Keep unimplemented opportunities here only when a reproducible workload or
 assembly witness exists. Move completed work to its change review with measured
 results; do not turn unmeasured expectations into claims.
 
+## Remaining gaps after the fresh worst-ten investigation
+
+[The 56-workload screen and 31-round follow-up](../engineering/evidence/worst-ten-runtime-2026-10-25/README.md)
+measure real nbody/hot-loop gains, but do not close the other eight gaps. Retain
+canonical sources, sizes and flags; preserve a before compiler; use randomized
+paired timings, output checks and bounded Callgrind. Never attribute a timing
+fluctuation in a byte-identical executable to optimization.
+
+- **gzip_longest_match / byte_load_reassembly:** final LCCC/Clang ratios
+  1.3225 / 1.2588. Baseline bounded Ir ratios are 1.5459 / 2.1439. Investigate
+  redundant address/extract/extension work and allocator traffic using emitted
+  loop assembly. gzip's helper is already inlined; byte-load induction already
+  widened. Acceptance: a generic sound lowering change, negative width/alias
+  witnesses, native paired gain and no full-corpus codegen regression.
+- **expat_xml_scan / chacha20_block:** 1.2569 / 1.1947 versus Clang. Separate
+  loop instructions, register pressure and scheduling; chacha's baseline
+  simulated Ir is already lower than Clang, so count reduction is not enough.
+  No fast-math/undefined-behavior assumptions or benchmark-name special cases.
+- **switch_dispatch / sqlite_varint / llvm_scalar_facts / binary_trees:**
+  1.1664 / 1.1167 / 1.0946 / 1.0806 versus GCC. Start from retained profiles;
+  establish a specific legal IR/assembly witness before changing global
+  heuristics. Preserve switch and pointer/provenance correctness boundaries.
+- **nbody / hot_web_loop:** remaining Clang gaps 1.0484 / 1.1013. The scalar
+  SQRT and placement fixes are implemented, not open tasks. Further LICM needs
+  must-execute/zero-trip/alias proofs. A wider stack-veto relaxation needs
+  stronger spill evidence and broad corpus protection. Return-copy/widened-IV
+  variants were measured without a convincing win; do not replay them blindly.
+
 ## Population-count and CRC follow-through
 
 The population-count loop recognizer and range-aware CRC index lowering are

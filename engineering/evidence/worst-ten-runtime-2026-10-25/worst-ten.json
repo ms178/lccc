@@ -1,0 +1,52 @@
+[
+  {
+    "name": "nbody",
+    "reference": "clang",
+    "screen_paired_ratio": 1.4968337460436358
+  },
+  {
+    "name": "hot_web_loop",
+    "reference": "clang",
+    "screen_paired_ratio": 1.423624470154985
+  },
+  {
+    "name": "gzip_longest_match",
+    "reference": "clang",
+    "screen_paired_ratio": 1.34693654650464
+  },
+  {
+    "name": "byte_load_reassembly",
+    "reference": "clang",
+    "screen_paired_ratio": 1.2523390452064187
+  },
+  {
+    "name": "sqlite_varint",
+    "reference": "gcc",
+    "screen_paired_ratio": 1.2276587969961736
+  },
+  {
+    "name": "expat_xml_scan",
+    "reference": "clang",
+    "screen_paired_ratio": 1.2066886516789694
+  },
+  {
+    "name": "chacha20_block",
+    "reference": "clang",
+    "screen_paired_ratio": 1.1710677457582586
+  },
+  {
+    "name": "switch_dispatch",
+    "reference": "gcc",
+    "screen_paired_ratio": 1.1554795817991004
+  },
+  {
+    "name": "llvm_scalar_facts",
+    "reference": "gcc",
+    "screen_paired_ratio": 1.1519522359674628
+  },
+  {
+    "name": "binary_trees",
+    "reference": "gcc",
+    "screen_paired_ratio": 1.1513591355041402
+  }
+]
