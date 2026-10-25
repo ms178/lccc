@@ -24,7 +24,6 @@ use crate::common::const_arith;
 use crate::common::const_eval as shared_const_eval;
 use crate::common::fx_hash::FxHashMap;
 use crate::common::symbol_table::{FoldedValue, SymbolTable};
-use crate::common::types::AddressSpace;
 use crate::common::types::{CType, ExtVectorLayout};
 use crate::frontend::parser::ast::{
     BinOp, DerivedDeclarator, Expr, ExprId, SizeofArg, StructFieldDecl, TypeSpecifier, UnaryOp,
@@ -558,6 +557,30 @@ impl<'a> SemaConstEval<'a> {
                         _ => 1,
                     }
                 }
+                // `CCC_DEBUG_TYPES_COMPATIBLE=1` explains every answer: the two
+                // type names as parsed, the two CType conversions, the qualifier
+                // levels and the two independent halves of the verdict.  A wrong
+                // answer here is a silently wrong constant in code that is
+                // *specified* by it, so the reasoning must be inspectable.
+                if std::env::var_os("CCC_DEBUG_TYPES_COMPATIBLE").is_some() {
+                    eprintln!(
+                        "[types-compatible] {t1:?} vs {t2:?}: quals {q1:?}/{q2:?} \
+                         levels {l1}/{l2} types_equal={teq} quals_compatible={qok}",
+                        t1 = ctype1,
+                        t2 = ctype2,
+                        q1 = qualifiers1,
+                        q2 = qualifiers2,
+                        l1 = qualifier_levels(&ctype1),
+                        l2 = qualifier_levels(&ctype2),
+                        teq = self.ctypes_compatible(&ctype1, &ctype2),
+                        qok = crate::frontend::parser::ast::nested_type_qualifiers_compatible(
+                            qualifiers1,
+                            qualifier_levels(&ctype1),
+                            qualifiers2,
+                            qualifier_levels(&ctype2),
+                        ),
+                    );
+                }
                 let compatible = crate::frontend::parser::ast::nested_type_qualifiers_compatible(
                     qualifiers1,
                     qualifier_levels(&ctype1),
@@ -839,31 +862,12 @@ impl<'a> SemaConstEval<'a> {
 
     /// Check if two CTypes are compatible (for __builtin_types_compatible_p).
     fn ctypes_compatible(&self, t1: &CType, t2: &CType) -> bool {
-        // Strip qualifiers (CType doesn't carry them) and compare.  The named
-        // ADDRESS SPACE is part of the pointer type's identity, not a
-        // qualifier: gcc reports `__builtin_types_compatible_p(T *,
-        // __seg_gs T *) == 0`, and the kernel leans on that answer in
-        // `__same_type`-shaped static assertions.  Ignoring the space here made
-        // every space pair compatible, so `__same_type(gs_ptr, plain_ptr)`
-        // answered 1 where gcc answers 0 — a silently wrong constant in code
-        // that is *specified* by the compiler's answer.
-        match (t1, t2) {
-            (CType::Pointer(a, sa), CType::Pointer(b, sb)) => {
-                sa == sb && self.ctypes_compatible(a, b)
-            }
-            (CType::Array(a, sa), CType::Array(b, sb)) => {
-                self.ctypes_compatible(a, b) && (sa == sb || sa.is_none() || sb.is_none())
-            }
-            // C11 6.7.2.2p4: an enum type is compatible with its compatible
-            // integer type (chosen from the completed definition's value
-            // range), so `typeof(again)` of a body-less `enum tag` reference
-            // answers 1 against `int`/`unsigned int` exactly like GCC —
-            // pointers to the two interchange in both directions.
-            (CType::Enum(e), other) | (other, CType::Enum(e)) if other.is_integer() => {
-                &e.compatible_ctype() == other
-            }
-            _ => t1 == t2,
-        }
+        // ONE definition, shared with the lowering: see
+        // `crate::common::types::ctypes_compatible`.  The copy that used to live
+        // here and the copy in the lowering disagreed on function types (this
+        // one ignored parameter names, the lowering's did not), so the same
+        // predicate answered 1 in sema and 0 in the object.
+        crate::common::types::ctypes_compatible(t1, t2)
     }
 
     // === Type helper methods ===
@@ -894,15 +898,8 @@ impl<'a> SemaConstEval<'a> {
         }
     }
 
-    /// Convert a TypeSpecifier to CType using sema's type resolution.
+    /// Convert a TypeSpecifier to CType using sema's canonical type resolution.
     fn type_spec_to_ctype(&self, spec: &TypeSpecifier) -> CType {
-        // Handle typeof(expr) which requires expression type inference - the
-        // standalone ctype_from_type_spec function can't handle this because it
-        // lacks access to the symbol table and expression type checker.
-        if let TypeSpecifier::Typeof(expr, _) = spec {
-            return self.infer_expr_ctype(expr).unwrap_or(CType::Int);
-        }
-        // Delegate to a simple inline conversion for all other cases.
         self.ctype_from_type_spec(spec)
     }
 
@@ -1627,163 +1624,32 @@ impl<'a> SemaConstEval<'a> {
     }
 
     /// Convert a TypeSpecifier to CType using the TypeContext for typedef/struct resolution.
-    /// This is a standalone function that doesn't need the full TypeConvertContext trait.
+    /// Convert a TypeSpecifier to CType via `ExprTypeChecker::resolve_type_spec`
+    /// so constant evaluation (`_Static_assert`, enum/bitfield bounds, array sizes,
+    /// `__builtin_types_compatible_p`) never diverges from expression type checking
+    /// or IR lowering on function-pointer parameters, constant array bounds,
+    /// nested `typeof(expr)`, address spaces, or inline record definitions.
     fn ctype_from_type_spec(&self, spec: &TypeSpecifier) -> CType {
-        match spec {
-            TypeSpecifier::Void => CType::Void,
-            TypeSpecifier::Bool => CType::Bool,
-            TypeSpecifier::Char => CType::Char,
-            TypeSpecifier::SignedChar => CType::SChar,
-            TypeSpecifier::UnsignedChar => CType::UChar,
-            TypeSpecifier::PlainUnsignedChar => CType::PlainUChar,
-            TypeSpecifier::Short => CType::Short,
-            TypeSpecifier::UnsignedShort => CType::UShort,
-            TypeSpecifier::Int | TypeSpecifier::Signed => CType::Int,
-            TypeSpecifier::UnsignedInt | TypeSpecifier::Unsigned => CType::UInt,
-            TypeSpecifier::Long => CType::Long,
-            TypeSpecifier::UnsignedLong => CType::ULong,
-            TypeSpecifier::LongLong => CType::LongLong,
-            TypeSpecifier::UnsignedLongLong => CType::ULongLong,
-            TypeSpecifier::Int128 => CType::Int128,
-            TypeSpecifier::UnsignedInt128 => CType::UInt128,
-            TypeSpecifier::Float => CType::Float,
-            TypeSpecifier::Double => CType::Double,
-            TypeSpecifier::LongDouble => CType::LongDouble,
-            TypeSpecifier::Pointer(inner, addr_space) => {
-                // Iterative pointer spine -- see type_checker::resolve_type_spec
-                // and type_builder::resolve_type_spec_to_ctype for why.
-                if !matches!(**inner, TypeSpecifier::Pointer(_, _)) {
-                    CType::Pointer(Box::new(self.ctype_from_type_spec(inner)), *addr_space)
-                } else {
-                    let mut spaces = Vec::with_capacity(8);
-                    spaces.push(*addr_space);
-                    let mut cur: &TypeSpecifier = inner;
-                    let mut ty = loop {
-                        match cur {
-                            TypeSpecifier::Pointer(i, s) => {
-                                spaces.push(*s);
-                                cur = i;
-                            }
-                            other => break self.ctype_from_type_spec(other),
-                        }
-                    };
-                    for space in spaces.iter().rev() {
-                        ty = CType::Pointer(Box::new(ty), *space);
-                    }
-                    ty
-                }
-            }
-            TypeSpecifier::Array(elem, size) => {
-                let elem_ty = self.ctype_from_type_spec(elem);
-                // TODO: evaluate array size expression when available
-                let array_size = size.as_ref().and_then(|s| {
-                    // Try simple literal evaluation for array sizes
-                    match s.as_ref() {
-                        Expr::IntLiteral(n, _)
-                        | Expr::LongLiteral(n, _)
-                        | Expr::LongLongLiteral(n, _) => Some(*n as usize),
-                        Expr::UIntLiteral(n, _)
-                        | Expr::ULongLiteral(n, _)
-                        | Expr::ULongLongLiteral(n, _) => Some(*n as usize),
-                        _ => None,
-                    }
-                });
-                CType::Array(Box::new(elem_ty), array_size)
-            }
-            TypeSpecifier::TypedefName(name) => {
-                if let Some(resolved) = self.types.typedefs.get(name) {
-                    resolved.clone()
-                } else {
-                    CType::Int // fallback
-                }
-            }
-            TypeSpecifier::Struct(tag, ..) => {
-                if let Some(tag) = tag {
-                    CType::Struct(
-                        self.types
-                            .resolve_record_key(&format!("struct.{}", tag))
-                            .into(),
-                    )
-                } else {
-                    CType::Int // anonymous struct without context
-                }
-            }
-            TypeSpecifier::Union(tag, ..) => {
-                if let Some(tag) = tag {
-                    CType::Union(
-                        self.types
-                            .resolve_record_key(&format!("union.{}", tag))
-                            .into(),
-                    )
-                } else {
-                    CType::Int // anonymous union without context
-                }
-            }
-            TypeSpecifier::Enum(name, variants, is_packed, underlying) => CType::Enum(
-                self.resolve_enum_type(name, variants, *is_packed, underlying.as_deref()),
-            ),
-            TypeSpecifier::TypeofType(inner) => self.ctype_from_type_spec(inner),
-            TypeSpecifier::FunctionPointer(_, _, _) => {
-                CType::Pointer(Box::new(CType::Void), AddressSpace::Default) // function pointers are pointer-sized
-            }
-            TypeSpecifier::Vector(inner, total_bytes) => {
-                let elem_ctype = self.ctype_from_type_spec(inner);
-                CType::Vector(Box::new(elem_ctype), *total_bytes)
-            }
-            TypeSpecifier::ExtVector(inner, lanes) => {
-                let elem_ctype = self.ctype_from_type_spec(inner);
-                match ExtVectorLayout::new(&elem_ctype, *lanes) {
-                    Some(layout) => CType::ExtVector(Box::new(elem_ctype), layout),
-                    // Malformed recovery: drop the attribute, keep the scalar.
-                    None => elem_ctype,
-                }
-            }
-            _ => CType::Int, // fallback
-        }
+        self.type_checker().resolve_type_spec(spec)
     }
 
-    /// Convert a TypeSpecifier with derived declarators to CType.
+    /// Convert a TypeSpecifier with derived declarators to CType via the shared
+    /// `type_builder` implementation.
     fn ctype_from_type_spec_with_derived(
         &self,
         spec: &TypeSpecifier,
         derived: &[DerivedDeclarator],
     ) -> CType {
-        let mut ty = self.ctype_from_type_spec(spec);
+        let base = self.ctype_from_type_spec(spec);
         if derived.is_empty() {
-            return ty;
+            return base;
         }
-        // pointee_space_before mapping (see fold_simple_derived): the wrapper
-        // built at step i takes the space stored at derived[i-1].
-        let mut pending_space = AddressSpace::Default;
-        for d in derived {
-            match d {
-                DerivedDeclarator::Pointer(space) => {
-                    ty = CType::Pointer(Box::new(ty), pending_space);
-                    pending_space = *space;
-                }
-                DerivedDeclarator::Array(Some(size_expr)) => {
-                    let expr: &Expr = size_expr;
-                    let size = match expr {
-                        Expr::IntLiteral(n, _)
-                        | Expr::LongLiteral(n, _)
-                        | Expr::LongLongLiteral(n, _) => Some(*n as usize),
-                        Expr::UIntLiteral(n, _)
-                        | Expr::ULongLiteral(n, _)
-                        | Expr::ULongLongLiteral(n, _) => Some(*n as usize),
-                        _ => None,
-                    };
-                    ty = CType::Array(Box::new(ty), size);
-                }
-                DerivedDeclarator::Array(None) => {
-                    ty = CType::Array(Box::new(ty), None);
-                }
-                DerivedDeclarator::Function(_, _) | DerivedDeclarator::FunctionPointer(_, _) => {
-                    ty = CType::Pointer(Box::new(CType::Void), AddressSpace::Default);
-                    // function -> pointer
-                }
-            }
-        }
-        ty
+        crate::common::type_builder::build_full_ctype_with_callbacks(
+            base,
+            derived,
+            &|ts| self.ctype_from_type_spec(ts),
+            &|e, _| self.eval_const_expr(e).and_then(|c| c.to_usize()),
+        )
     }
 }
 

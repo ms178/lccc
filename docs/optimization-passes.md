@@ -263,6 +263,28 @@ spelling shared by both `bit_idioms` tiers) and re-read at emission
 (`supports_and_not`), so fold-time prediction and emission-time decision
 cannot drift within one compilation.
 
+## Debug / explain knobs added with the S07-S08 work
+
+These three are pure diagnostics: each gates a trace the compiler otherwise
+computes nothing for, none changes emitted code, and each is named here because
+`scripts/audit_census.py` requires every `CCC_*`/`LCCC_*` literal in `src/` to be
+documented in a tracked markdown file.
+
+| Knob | What it shows |
+|---|---|
+| `CCC_DEBUG_VOLRED=1` | `volatile_reduce`'s interleave budget: how many lanes the pass admitted, which bound (lane count vs. budget) bound the group, and why a candidate was dropped. Budget exhaustion is a normal outcome, not a defect, so it is silent by default. |
+| `CCC_DEBUG_STATIC_INIT=1` | The static-initializer builder's decision for an element it cannot fold: which evaluator ran (scalar constant, sema's folded value, address constant, byte fill), and the offset each one wrote. |
+| `CCC_DEBUG_TYPES_COMPATIBLE=1` | `__builtin_types_compatible_p`'s verdict for each query with the two resolved types in canonical form, i.e. exactly the pair the predicate compared after qualification stripping and parameter-name erasure. |
+
+Debug traces are opt-in and rate-limited by construction: each is a
+`std::env::var_os` probe per decision site, so a knob left exported in a
+benchmark or kernel environment changes nothing.  That is a checked invariant,
+not a promise: `tests/regression/check_debug_knobs_neutral.py` compiles a
+fixture that reaches all three decision sites at `-O0/-O1/-O2/-O3` with the
+knob unset and set and requires the emitted assembly to be identical, and
+requires the knob name to still be present in the compiler binary so a knob
+cannot rot into dead documentation.
+
 ## Verifying IR Between Passes
 
 `CCC_VERIFY_IR` runs a structural check on the IR after **every** pass, so the

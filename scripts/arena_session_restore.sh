@@ -155,10 +155,15 @@ log "exec bits restored: $n_modes"
 
 # ---- 5. optional: kernel tree regeneration -----------------------------------
 if [[ ${1:-} == --with-kernel ]]; then
-    if [[ ! -f /home/user/target/kernel-work/linux-6.18.55/.lccc-prepared ]] \
-       || [[ ! -f /home/user/target/kernel-work/linux-6.18.55/arch/x86/boot/setup.ld ]]; then
-        log 'regenerating linux-cachymod-6.18.55 tree'
-        ./scripts/prepare_kernel_tree.sh || log 'KERNEL TREE RESTORE FAILED'
+    # The tree path is resolved, never spelled: prepare_kernel_tree.sh derives
+    # the version from the package PKGBUILD, so a hardcoded directory here would
+    # regenerate (or silently skip) the wrong tree after a version bump.  Both
+    # this script and prepare_kernel_tree.sh call the same resolver.
+    kernel_tree=$(bash ./scripts/kernel_version.sh --default-dir)
+    if [[ ! -f $kernel_tree/.lccc-prepared ]] \
+       || [[ ! -f $kernel_tree/arch/x86/boot/setup.ld ]]; then
+        log "regenerating $(basename -- "$kernel_tree") tree"
+        ./scripts/prepare_kernel_tree.sh "$kernel_tree" || log 'KERNEL TREE RESTORE FAILED'
     else
         log 'kernel tree present'
     fi

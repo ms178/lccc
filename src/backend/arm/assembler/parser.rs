@@ -794,7 +794,7 @@ pub fn parse_asm(text: &str) -> Result<Vec<AsmStatement>, String> {
     let mut defined_symbols: crate::common::fx_hash::FxHashSet<String> =
         crate::common::fx_hash::FxHashSet::default();
     for (line_num, line) in expanded_lines.iter().enumerate() {
-        let line = line.trim();
+        let line = asm_expr::trim_asm_line(line);
 
         // Skip empty lines
         if line.is_empty() {
@@ -804,7 +804,7 @@ pub fn parse_asm(text: &str) -> Result<Vec<AsmStatement>, String> {
 
         // Strip comments (// style)
         let line = strip_comment(line);
-        let line = line.trim();
+        let line = asm_expr::trim_asm_line(line);
         if line.is_empty() {
             statements.push(AsmStatement::Empty);
             continue;
@@ -991,7 +991,7 @@ pub fn parse_asm(text: &str) -> Result<Vec<AsmStatement>, String> {
         // Split the line on ';' and parse each part independently.
         let parts = split_on_semicolons(line);
         for part in parts {
-            let part = part.trim();
+            let part = asm_expr::trim_asm_line(part);
             if part.is_empty() {
                 continue;
             }
@@ -1024,29 +1024,37 @@ pub fn parse_asm(text: &str) -> Result<Vec<AsmStatement>, String> {
 fn split_on_semicolons(line: &str) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut in_string = false;
-    let mut escape = false;
-    let mut start = 0;
+    let mut start = 0usize;
     let bytes = line.as_bytes();
-    for (i, c) in line.char_indices() {
-        if escape {
-            escape = false;
-            continue;
-        }
-        if c == '\\' && in_string {
-            escape = true;
-            continue;
-        }
-        if c == '"' {
-            in_string = !in_string;
-            continue;
-        }
-        if !in_string {
-            // Stop splitting at // comment start
-            if c == '/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
-                break;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if in_string {
+            if bytes[i] == b'\\' {
+                i += 1;
+                if i < bytes.len() {
+                    i += std::str::from_utf8(&bytes[i..])
+                        .ok()
+                        .and_then(|rest| rest.chars().next())
+                        .map_or(1, char::len_utf8);
+                }
+                continue;
             }
-            // Stop splitting at @ comment start (but not @function, @object, etc.)
-            if c == '@' {
+            if bytes[i] == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        match bytes[i] {
+            b'"' => {
+                in_string = true;
+                i += 1;
+            }
+            b'\'' => {
+                i = asm_expr::skip_gas_char_literal(bytes, i);
+            }
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'/' => break,
+            b'@' => {
                 let after = &line[i + 1..];
                 if !after.starts_with("object")
                     && !after.starts_with("function")
@@ -1057,10 +1065,15 @@ fn split_on_semicolons(line: &str) -> Vec<&str> {
                 {
                     break;
                 }
+                i += 1;
             }
-            if c == ';' {
+            b';' => {
                 parts.push(&line[start..i]);
-                start = i + 1;
+                i += 1;
+                start = i;
+            }
+            _ => {
+                i += 1;
             }
         }
     }
@@ -1069,51 +1082,10 @@ fn split_on_semicolons(line: &str) -> Vec<&str> {
 }
 
 fn strip_comment(line: &str) -> &str {
-    // Scan character by character, tracking string state to find comments
-    // outside of string literals. This correctly handles escaped quotes (\")
-    // inside strings (e.g. .asciz "a\"b//c" should not strip at //).
-    let bytes = line.as_bytes();
-    let mut in_string = false;
-    let mut i = 0;
-    while i < bytes.len() {
-        if in_string {
-            if bytes[i] == b'\\' {
-                i += 2; // skip escaped character
-                continue;
-            }
-            if bytes[i] == b'"' {
-                in_string = false;
-            }
-            i += 1;
-            continue;
-        }
-        // Not in string
-        if bytes[i] == b'"' {
-            in_string = true;
-            i += 1;
-            continue;
-        }
-        // Check for // comment
-        if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
-            return &line[..i];
-        }
-        // Check for @ comment (GAS ARM comment character).
-        // Skip \@ which is the GAS macro invocation counter, not a comment.
-        if bytes[i] == b'@' && !(i > 0 && bytes[i - 1] == b'\\') {
-            let after = &line[i + 1..];
-            if !after.starts_with("object")
-                && !after.starts_with("function")
-                && !after.starts_with("progbits")
-                && !after.starts_with("nobits")
-                && !after.starts_with("tls_object")
-                && !after.starts_with("note")
-            {
-                return &line[..i];
-            }
-        }
-        i += 1;
-    }
-    line
+    crate::backend::asm_preprocess::strip_comment(
+        line,
+        &crate::backend::asm_preprocess::CommentStyle::SlashSlashAndAt,
+    )
 }
 
 /// Try to parse `ldr Rd, =symbol[+offset]` pseudo-instruction.
@@ -1209,7 +1181,7 @@ fn parse_line(line: &str) -> Result<Vec<AsmStatement>, String> {
         }
     }
 
-    let trimmed = line.trim();
+    let trimmed = asm_expr::trim_asm_line(line);
 
     // Register alias: "name .req register" or "name .unreq register"
     // These define register aliases and can be safely ignored.
@@ -1245,7 +1217,7 @@ fn parse_directive(line: &str) -> Result<AsmStatement, String> {
         (".inst", line[5..].trim())
     } else if let Some(space_pos) = line.find([' ', '\t']) {
         let name = &line[..space_pos];
-        let args = line[space_pos..].trim();
+        let args = asm_expr::trim_asm_line(&line[space_pos..]);
         (name, args)
     } else {
         (line, "")
@@ -2436,8 +2408,8 @@ fn parse_size_directive(args: &str) -> Result<AsmDirective, String> {
 /// Parse comma-separated data values that may be integers, symbols, or symbol expressions.
 fn parse_data_values(s: &str) -> Result<Vec<DataValue>, String> {
     let mut vals = Vec::new();
-    for part in s.split(',') {
-        let trimmed = part.trim();
+    for part in asm_expr::split_comma_args(s) {
+        let trimmed = asm_expr::trim_data_arg(part);
         if trimmed.is_empty() {
             continue;
         }
@@ -2510,7 +2482,7 @@ fn strip_sym_parens(s: &str) -> &str {
 
 /// Parse a data value (integer literal, possibly negative).
 fn parse_data_value(s: &str) -> Result<i64, String> {
-    let s = s.trim();
+    let s = asm_expr::trim_data_arg(s);
     if s.is_empty() {
         return Ok(0);
     }

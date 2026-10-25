@@ -1836,6 +1836,7 @@ impl X86Codegen {
         // own defining instruction (ArchCodegen::note_dest_defined).
         self.home_fresh.clear();
         self.home_clobbered.clear();
+        self.home_clobber_cause.clear();
         self.home_sharers.clear();
         self.value_live_segments.clear();
         self.home_transient_evictions.clear();

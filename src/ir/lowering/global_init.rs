@@ -957,8 +957,27 @@ impl Lowerer {
         total_size: usize,
         array_dim_strides: &[usize],
     ) -> GlobalInit {
-        let has_ptr_fields = layout.has_pointer_fields(&*self.types.borrow_struct_layouts());
-        if has_ptr_fields {
+        // Which image can express this array: bytes only, or bytes plus
+        // pointer-sized relocations?  The element *type* is not the whole
+        // answer.  `struct x86_cpu_id { ... unsigned long driver_data; }` has no
+        // pointer member, yet the kernel's CPU tables initialize that member
+        // with an address constant -- `{ .driver_data = (unsigned long)&model }`
+        // (arch/x86/events/rapl.c, the X86_MATCH_* tables).  A byte image
+        // cannot hold a relocation, so the content decides, exactly as it does
+        // for a single struct object (`struct_init_has_addr_fields`); the
+        // declared type alone routed these arrays to the byte serializer, which
+        // can only report "initializer element is not constant".
+        // Does the image need relocations?  A pointer member forces it; so does
+        // an address constant stored in a pointer-sized integer member, which
+        // is exactly how the kernel's `x86_cpu_id` tables are written
+        // (`(unsigned long)&model`).  Those tables have no pointer member at
+        // all, so the declared type alone used to send them to the byte
+        // serializer, which cannot hold a relocation and could only report
+        // "initializer element is not constant" (GCC, Clang and ICX accept
+        // them: C11 6.6p9).  Both halves are needed -- the member that can hold
+        // an address, and an initializer that stores one -- so a byte image is
+        // chosen only when one of them is absent.
+        if self.init_needs_relocations(items, layout) {
             if array_dim_strides.len() > 1 {
                 return self.lower_struct_array_with_ptrs_multidim(
                     items,
@@ -1777,8 +1796,7 @@ impl Lowerer {
         items: &[InitializerItem],
         layout: &StructLayout,
     ) -> GlobalInit {
-        let has_addr_fields = self.struct_init_has_addr_fields(items, layout);
-        if has_addr_fields {
+        if self.init_needs_relocations(items, layout) {
             return self.lower_struct_global_init_compound(items, layout);
         }
 
@@ -1832,6 +1850,72 @@ impl Lowerer {
             }
         }
         0
+    }
+
+    /// Does this initializer need a relocation-aware image (bytes plus
+    /// pointer-sized relocations) rather than a plain byte image?
+    ///
+    /// Two independent questions, and the image must satisfy both:
+    ///   * can any member, at any nesting depth, hold a relocation?  A pointer
+    ///     or function member always can; a member of integer type can when it
+    ///     is exactly pointer-sized (C11 6.6p9 -- the kernel's
+    ///     `x86_cpu_id.driver_data` is `unsigned long`);
+    ///   * does the initializer actually store an address anywhere?
+    ///
+    /// `StructLayout::has_pointer_fields` answers only the pointer half of the
+    /// first question, and it is the right predicate *there* (it decides ABI
+    /// class and copy shape).  Here the question is what the image can express,
+    /// which is why a struct with no pointer member can still need relocations.
+    /// Being conservative is correct and cheap: an initializer that stores no
+    /// address produces byte-identical output on either path.
+    pub(super) fn init_needs_relocations(
+        &self,
+        items: &[InitializerItem],
+        layout: &StructLayout,
+    ) -> bool {
+        if layout.has_pointer_fields(&*self.types.borrow_struct_layouts()) {
+            return true;
+        }
+        self.layout_can_hold_addr_constant(layout)
+            && items
+                .iter()
+                .any(|item| self.init_has_addr_exprs(&item.init))
+    }
+
+    /// The struct-layout equivalent of `ctype_can_hold_addr_constant`: does any
+    /// member of `layout`, at any nesting depth, have a type that can hold an
+    /// address constant?
+    pub(super) fn layout_can_hold_addr_constant(&self, layout: &StructLayout) -> bool {
+        layout
+            .fields
+            .iter()
+            .any(|field| self.ctype_can_hold_addr_constant(&field.ty))
+    }
+
+    /// Can a member of this type hold a relocation, i.e. an address constant?
+    ///
+    /// A pointer or function member obviously can.  So can a member of integer
+    /// type that is exactly pointer-sized: C11 6.6p9 admits an address constant
+    /// cast to an integer type, and the kernel keeps its CPU tables that way
+    /// (`struct x86_cpu_id`'s `unsigned long driver_data` initialized with
+    /// `(unsigned long)&model`, arch/x86/include/asm/cpu_device_id.h).  A
+    /// narrower integer member cannot -- GCC and Clang both reject the
+    /// truncating cast as a non-constant initializer -- so it is not counted.
+    ///
+    /// Recursive through aggregates: the member that receives the address may
+    /// sit inside a nested struct, union or array of an array element.
+    pub(super) fn ctype_can_hold_addr_constant(&self, ty: &CType) -> bool {
+        match ty {
+            CType::Pointer(_, _) | CType::Function(_) => true,
+            CType::Struct(_) | CType::Union(_) => self
+                .get_struct_layout_for_ctype(ty)
+                .is_some_and(|layout| self.layout_can_hold_addr_constant(&layout)),
+            CType::Array(elem, _) => self.ctype_can_hold_addr_constant(elem),
+            other => {
+                other.is_integer()
+                    && self.resolve_ctype_size(other) == crate::common::types::target_ptr_size()
+            }
+        }
     }
 
     /// Check if a struct initializer contains fields needing address relocations.
@@ -2552,7 +2636,7 @@ impl Lowerer {
     }
 
     /// Check if an expression tree contains label addresses.
-    fn expr_contains_label_addr(expr: &Expr) -> bool {
+    pub(super) fn expr_contains_label_addr(expr: &Expr) -> bool {
         match expr {
             Expr::LabelAddr(_, _) => true,
             Expr::BinaryOp(_, lhs, rhs, _) => {

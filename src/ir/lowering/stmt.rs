@@ -299,9 +299,10 @@ impl Lowerer {
                     .insert(declarator.name.clone(), fti);
             }
             let mut resolved_ctype = self.build_full_ctype(type_spec, &declarator.derived);
-            crate::common::type_builder::apply_declaration_address_space(
+            crate::common::type_builder::apply_declaration_address_space_for_object(
                 &mut resolved_ctype,
                 decl.address_space,
+                &declarator.derived,
             );
             if !resolved_ctype.is_vector() {
                 if let Some(vector_ctype) = decl.resolve_vector_ctype(resolved_ctype.clone()) {
@@ -510,35 +511,39 @@ impl Lowerer {
     }
 
     fn track_fptr_sig(&mut self, declarator: &InitDeclarator, type_spec: &TypeSpecifier) {
-        for (i, d) in declarator.derived.iter().enumerate() {
-            if let DerivedDeclarator::FunctionPointer(params, _) = d {
-                // The derived layout is: [return_type_pointers..., syntax_marker_Pointer,
-                // FunctionPointer, ...]. Pointers before the FunctionPointer include the
-                // syntax marker (1) plus any return-type pointer indirections.
-                // If there are return-type pointers, the return type is a pointer.
-                let ptr_count_before = declarator.derived[..i]
-                    .iter()
-                    .filter(|d| {
-                        matches!(
-                            d,
-                            DerivedDeclarator::Pointer(_) | DerivedDeclarator::Array(_)
-                        )
-                    })
-                    .count();
-                // Subtract 1 for the syntax marker pointer
-                let return_type_ptrs = ptr_count_before.saturating_sub(1);
-                let ret_ty = if return_type_ptrs > 0 {
-                    IrType::Ptr
-                } else {
-                    self.type_spec_to_ir(type_spec)
-                };
-                let param_tys: Vec<IrType> = params
-                    .iter()
-                    .map(|p| self.type_spec_to_ir(&p.type_spec))
-                    .collect();
-                self.set_local_fptr_sig(&declarator.name, FuncSig::for_ptr(ret_ty, param_tys));
-                break;
-            }
+        // For nested function pointers (`int (*(*p)(long))(char)` ->
+        // `[Pointer, FunctionPointer([char]), Pointer, FunctionPointer([long])]`),
+        // the LAST `FunctionPointer` is the entity's own call signature and any
+        // earlier `Pointer`/`FunctionPointer` layer means its return value is a pointer.
+        if let Some((i, DerivedDeclarator::FunctionPointer(params, _))) = declarator
+            .derived
+            .iter()
+            .enumerate()
+            .rfind(|(_, d)| matches!(d, DerivedDeclarator::FunctionPointer(_, _)))
+        {
+            let ptr_count_before = declarator.derived[..i]
+                .iter()
+                .filter(|d| {
+                    matches!(
+                        d,
+                        DerivedDeclarator::Pointer(_)
+                            | DerivedDeclarator::Array(_)
+                            | DerivedDeclarator::FunctionPointer(_, _)
+                    )
+                })
+                .count();
+            // Subtract 1 for this `FunctionPointer`'s own syntax-marker `Pointer`.
+            let return_type_ptrs = ptr_count_before.saturating_sub(1);
+            let ret_ty = if return_type_ptrs > 0 {
+                IrType::Ptr
+            } else {
+                self.type_spec_to_ir(type_spec)
+            };
+            let param_tys: Vec<IrType> = params
+                .iter()
+                .map(|p| self.type_spec_to_ir(&p.type_spec))
+                .collect();
+            self.set_local_fptr_sig(&declarator.name, FuncSig::for_ptr(ret_ty, param_tys));
         }
     }
 
@@ -776,31 +781,7 @@ impl Lowerer {
         // Track function pointer return and param types for static locals too,
         // so that calls through static function pointers apply correct argument
         // promotions (e.g. float->double for unprototyped `float (*sfp)()`).
-        for (i, d) in declarator.derived.iter().enumerate() {
-            if let DerivedDeclarator::FunctionPointer(params, _) = d {
-                let ptr_count_before = declarator.derived[..i]
-                    .iter()
-                    .filter(|d| {
-                        matches!(
-                            d,
-                            DerivedDeclarator::Pointer(_) | DerivedDeclarator::Array(_)
-                        )
-                    })
-                    .count();
-                let return_type_ptrs = ptr_count_before.saturating_sub(1);
-                let ret_ty = if return_type_ptrs > 0 {
-                    IrType::Ptr
-                } else {
-                    self.type_spec_to_ir(type_spec)
-                };
-                let param_tys: Vec<IrType> = params
-                    .iter()
-                    .map(|p| self.type_spec_to_ir(&p.type_spec))
-                    .collect();
-                self.set_local_fptr_sig(&declarator.name, FuncSig::for_ptr(ret_ty, param_tys));
-                break;
-            }
-        }
+        self.track_fptr_sig(declarator, type_spec);
     }
 
     /// Lower a {real, imag} list initializer for a complex field.

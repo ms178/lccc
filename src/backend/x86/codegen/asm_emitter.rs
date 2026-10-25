@@ -161,15 +161,28 @@ impl InlineAsmEmitter for X86Codegen {
         }
     }
 
+    fn fallback_scratch_reg(&mut self, kind: &AsmOperandKind) -> String {
+        match kind {
+            AsmOperandKind::FpReg => "xmm0".to_string(),
+            AsmOperandKind::QReg => "rax".to_string(),
+            _ => {
+                if let Some(phys) = super::emit::home_phys_by_asm_name("rcx") {
+                    self.note_reg_clobbered(phys);
+                }
+                "rcx".to_string()
+            }
+        }
+    }
+
     fn resolve_memory_operand(
         &mut self,
         op: &mut AsmOperand,
         val: &Operand,
         excluded: &[String],
-    ) -> bool {
+    ) -> Option<String> {
         // If mem_addr is already set (normal alloca case), nothing to do
         if !op.mem_addr.is_empty() {
-            return false;
+            return None;
         }
         // If we have a symbol name for this memory operand, use a direct RIP-relative
         // symbol reference. This is critical for correctness when the inline asm template
@@ -178,20 +191,24 @@ impl InlineAsmEmitter for X86Codegen {
         // but a direct symbol(%rip) reference provides the correct per-CPU offset.
         if let Some(ref sym) = op.imm_symbol {
             op.mem_addr = format!("{}(%rip)", sym);
-            return false; // no scratch register used
+            return None; // no scratch register used
         }
+        let alloc_gp_tmp = |this: &mut Self| -> String {
+            let mut r = this.assign_scratch_reg(&AsmOperandKind::GpReg, excluded);
+            if r.is_empty() {
+                r = this.fallback_scratch_reg(&AsmOperandKind::GpReg);
+            }
+            r
+        };
         // Load the pointer value into a temporary register for indirect addressing.
         // Each memory operand gets its own unique register via assign_scratch_reg,
         // so multiple "=m" outputs don't overwrite each other's addresses.
         match val {
             Operand::Value(v) => {
                 if let Some(slot) = self.state.get_slot(v.0) {
-                    let tmp_reg = self.assign_scratch_reg(&AsmOperandKind::GpReg, excluded);
                     if self.state.is_alloca(v.0) {
+                        let tmp_reg = alloc_gp_tmp(self);
                         if let Some(align) = self.state.alloca_over_align(v.0) {
-                            // Over-aligned alloca: compute runtime-aligned address.
-                            // The raw stack slot has extra padding; the aligned address
-                            // is (slot_addr + align-1) & ~(align-1).
                             self.state
                                 .out
                                 .emit_instr_rbp_reg("    leaq", slot.0, &tmp_reg);
@@ -206,43 +223,41 @@ impl InlineAsmEmitter for X86Codegen {
                                 &tmp_reg,
                             );
                         } else {
-                            // Normal alloca (shouldn't reach here since setup_operand_metadata
-                            // would have set mem_addr, but handle defensively)
                             self.state
                                 .out
                                 .emit_instr_rbp_reg("    leaq", slot.0, &tmp_reg);
                         }
+                        op.mem_addr = format!("(%{})", tmp_reg);
+                        return Some(tmp_reg);
                     } else if self.state.vector_values.contains(&v.0) {
-                        // Vector value: use leaq to get address (vectors are stored directly at slot)
+                        let tmp_reg = alloc_gp_tmp(self);
                         self.state
                             .out
                             .emit_instr_rbp_reg("    leaq", slot.0, &tmp_reg);
-                    } else {
-                        // Non-alloca: slot holds a pointer, load it
-                        self.state
-                            .out
-                            .emit_instr_rbp_reg("    movq", slot.0, &tmp_reg);
+                        op.mem_addr = format!("(%{})", tmp_reg);
+                        return Some(tmp_reg);
                     }
-                    op.mem_addr = format!("(%{})", tmp_reg);
-                    return true;
                 }
+                // Materialise the pointer via `value_to_reg`, which handles both
+                // slotted and register-homed/Copy/Cast/GlobalAddr/accumulator
+                // values while preferring a fresh register home over a stack load.
+                let tmp_reg = alloc_gp_tmp(self);
+                self.value_to_reg(v, &tmp_reg);
+                op.mem_addr = format!("(%{})", tmp_reg);
+                return Some(tmp_reg);
             }
             Operand::Const(c) => {
-                // Constant address (e.g., from volatile MMIO reads like readl() in the kernel).
-                // Copy propagation can replace Value operands with Const when the address
-                // was originally a compile-time constant (e.g., fix_to_virt(X) + offset).
-                // Load the constant address into a scratch register for indirect addressing.
                 if let Some(addr) = c.to_i64() {
-                    let tmp_reg = self.assign_scratch_reg(&AsmOperandKind::GpReg, excluded);
+                    let tmp_reg = alloc_gp_tmp(self);
                     self.state
                         .out
                         .emit_instr_imm_reg("    movabsq", addr, &tmp_reg);
                     op.mem_addr = format!("(%{})", tmp_reg);
-                    return true;
+                    return Some(tmp_reg);
                 }
             }
         }
-        false
+        None
     }
 
     fn assign_scratch_reg(&mut self, kind: &AsmOperandKind, excluded: &[String]) -> String {
@@ -253,55 +268,76 @@ impl InlineAsmEmitter for X86Codegen {
                 let idx = self.asm_xmm_scratch_idx;
                 self.asm_xmm_scratch_idx += 1;
                 if idx >= X86_XMM_SCRATCH.len() {
-                    // All 16 XMM registers exhausted in the linear scan.
-                    // Wrap around and pick the first non-excluded register.
-                    // This allows register reuse between operands, which is
-                    // acceptable for inline asm (inputs read before outputs written).
                     for r in X86_XMM_SCRATCH {
                         if !excluded.iter().any(|e| e == *r) {
+                            if let Some(phys) = super::emit::home_phys_by_asm_name(r) {
+                                self.note_reg_clobbered(phys);
+                            }
                             return r.to_string();
                         }
                     }
-                    // Every XMM register is excluded (extremely unlikely).
-                    return "xmm0".to_string();
+                    return String::new();
                 }
                 let reg = X86_XMM_SCRATCH[idx].to_string();
                 if !excluded.iter().any(|e| e == &reg) {
+                    if let Some(phys) = super::emit::home_phys_by_asm_name(&reg) {
+                        self.note_reg_clobbered(phys);
+                    }
                     return reg;
                 }
             }
         } else if matches!(kind, AsmOperandKind::QReg) {
-            // "Q" constraint: only rax/rbx/rcx/rdx have high-byte forms (%ah/%bh/%ch/%dh).
-            // These are the only registers valid for the %h modifier in inline asm templates.
-            for reg_name in &["rax", "rbx", "rcx", "rdx"] {
-                if !excluded.iter().any(|e| e == *reg_name) {
+            // "Q" constraint: only rax/rcx/rdx/rbx have high-byte forms (%ah/%ch/%dh/%bh).
+            // Try caller-saved rax/rcx/rdx before callee-saved rbx.
+            for &reg_name in &["rax", "rcx", "rdx", "rbx"] {
+                if !excluded.iter().any(|e| e == reg_name) {
+                    if reg_name == "rbx" {
+                        self.state.emit_fmt(format_args!("    # asm clobber %rbx"));
+                    }
+                    if let Some(phys) = super::emit::home_phys_by_asm_name(reg_name) {
+                        self.note_reg_clobbered(phys);
+                    }
                     return reg_name.to_string();
                 }
             }
-            // Fallback: all four legacy regs are excluded; use rax anyway.
-            // This shouldn't happen in practice with correct inline asm.
-            "rax".to_string()
+            String::new()
         } else {
-            // Skip registers that are claimed by specific-register constraints.
-            // x86-64 GP registers: rcx, rdx, rsi, rdi, r8-r15 (no r16+).
-            loop {
+            const X86_CALLEE_OVERFLOW: &[&str] = &["rbx", "r12", "r13", "r14", "r15"];
+            // First walk caller-saved scratch registers, then unallocated callee-saved
+            // registers, and only touch RA-assigned callee-saved registers if every
+            // unallocated candidate is excluded.
+            let total_pool = X86_GP_SCRATCH.len() + X86_CALLEE_OVERFLOW.len();
+            while self.asm_scratch_idx < total_pool {
                 let idx = self.asm_scratch_idx;
                 self.asm_scratch_idx += 1;
-                let reg = if idx < X86_GP_SCRATCH.len() {
-                    X86_GP_SCRATCH[idx].to_string()
+                let (reg_name, is_callee_saved) = if idx < X86_GP_SCRATCH.len() {
+                    (X86_GP_SCRATCH[idx], false)
                 } else {
-                    let extra = idx - X86_GP_SCRATCH.len();
-                    let gp_extra = extra + 12; // r12, r13, r14, r15
-                    if gp_extra > 15 {
-                        // All GP registers exhausted; fall back to rcx.
-                        return "rcx".to_string();
-                    }
-                    format!("r{}", gp_extra)
+                    (X86_CALLEE_OVERFLOW[idx - X86_GP_SCRATCH.len()], true)
                 };
-                if !excluded.iter().any(|e| e == &reg) {
-                    return reg;
+                if excluded.iter().any(|e| e == reg_name) {
+                    continue;
                 }
+                if is_callee_saved
+                    && self
+                        .reg_assignments
+                        .values()
+                        .any(|&p| super::emit::phys_reg_name(p) == reg_name)
+                {
+                    continue;
+                }
+                if is_callee_saved {
+                    self.state
+                        .emit_fmt(format_args!("    # asm clobber %{}", reg_name));
+                }
+                if let Some(phys) = super::emit::home_phys_by_asm_name(reg_name) {
+                    self.note_reg_clobbered(phys);
+                }
+                return reg_name.to_string();
             }
+            // All non-excluded GP candidates exhausted: return empty so `"g"`/`"rm"`
+            // constraints fall back to memory (`fallback_scratch_reg` handles pure `"r"`).
+            String::new()
         }
     }
 
@@ -616,6 +652,7 @@ impl InlineAsmEmitter for X86Codegen {
         goto_labels: &[(String, BlockId)],
     ) -> String {
         // Build the parallel arrays that substitute_x86_asm_operands expects
+        crate::backend::x86_common::assert_memory_operands_resolved(operands, "x86-64");
         let op_regs: Vec<String> = operands.iter().map(|o| o.reg.clone()).collect();
         let op_names: Vec<Option<String>> = operands.iter().map(|o| o.name.clone()).collect();
         let op_is_memory: Vec<bool> = operands

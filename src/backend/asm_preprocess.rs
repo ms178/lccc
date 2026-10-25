@@ -97,7 +97,13 @@ pub fn strip_comment<'a>(line: &'a str, style: &CommentStyle) -> &'a str {
     while i < bytes.len() {
         if in_string {
             if bytes[i] == b'\\' {
-                i += 2; // skip escaped character
+                i += 1;
+                if i < bytes.len() {
+                    i += std::str::from_utf8(&bytes[i..])
+                        .ok()
+                        .and_then(|rest| rest.chars().next())
+                        .map_or(1, char::len_utf8);
+                }
                 continue;
             }
             if bytes[i] == b'"' {
@@ -110,6 +116,10 @@ pub fn strip_comment<'a>(line: &'a str, style: &CommentStyle) -> &'a str {
         if bytes[i] == b'"' {
             in_string = true;
             i += 1;
+            continue;
+        }
+        if bytes[i] == b'\'' {
+            i = crate::backend::asm_expr::skip_gas_char_literal(bytes, i);
             continue;
         }
         match style {
@@ -151,41 +161,52 @@ pub fn strip_comment<'a>(line: &'a str, style: &CommentStyle) -> &'a str {
     line
 }
 
-/// Split a line on `;` characters, respecting string literals and comments.
+/// Split a line on `;` characters, respecting string literals, GAS character
+/// literals, and comments.
 /// In GAS syntax, `;` separates multiple statements on the same line.
 /// Stops splitting once a line comment (`#` or `//`) is encountered outside strings,
 /// so semicolons inside comments are not treated as statement separators.
 pub fn split_on_semicolons(line: &str) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut in_string = false;
-    let mut escape = false;
-    let mut start = 0;
+    let mut start = 0usize;
     let bytes = line.as_bytes();
-    for (i, c) in line.char_indices() {
-        if escape {
-            escape = false;
-            continue;
-        }
-        if c == '\\' && in_string {
-            escape = true;
-            continue;
-        }
-        if c == '"' {
-            in_string = !in_string;
-            continue;
-        }
-        if !in_string {
-            // Stop splitting at # comment start
-            if c == '#' {
-                break;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if in_string {
+            if bytes[i] == b'\\' {
+                i += 1;
+                if i < bytes.len() {
+                    i += std::str::from_utf8(&bytes[i..])
+                        .ok()
+                        .and_then(|rest| rest.chars().next())
+                        .map_or(1, char::len_utf8);
+                }
+                continue;
             }
-            // Stop splitting at // comment start
-            if c == '/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
-                break;
+            if bytes[i] == b'"' {
+                in_string = false;
             }
-            if c == ';' {
+            i += 1;
+            continue;
+        }
+        match bytes[i] {
+            b'"' => {
+                in_string = true;
+                i += 1;
+            }
+            b'\'' => {
+                i = crate::backend::asm_expr::skip_gas_char_literal(bytes, i);
+            }
+            b'#' => break,
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'/' => break,
+            b';' => {
                 parts.push(&line[start..i]);
-                start = i + 1;
+                i += 1;
+                start = i;
+            }
+            _ => {
+                i += 1;
             }
         }
     }
@@ -778,6 +799,28 @@ fn is_macro_param_name(s: &str) -> bool {
 
 fn strip_arg_quotes(s: &str) -> &str {
     if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
+        let bytes = s.as_bytes();
+        let mut i = 1usize;
+        while i + 1 < bytes.len() {
+            if bytes[i] == b'\\' {
+                i += 1;
+                if i + 1 < bytes.len() {
+                    i += std::str::from_utf8(&bytes[i..])
+                        .ok()
+                        .and_then(|rest| rest.chars().next())
+                        .map_or(1, char::len_utf8);
+                } else {
+                    // Trailing backslash escapes the closing quote (`"foo\"`): not balanced.
+                    return s;
+                }
+                continue;
+            }
+            if bytes[i] == b'"' {
+                // Quote closed before end of token (e.g. `"a" + "b"`): keep both quotes.
+                return s;
+            }
+            i += 1;
+        }
         &s[1..s.len() - 1]
     } else {
         s
@@ -786,14 +829,42 @@ fn strip_arg_quotes(s: &str) -> &str {
 
 /// Index of the first `=` that separates a parameter name from its default.
 ///
-/// Ignores `=` inside parentheses and skips the comparison operators `==`,
-/// `!=`, `<=` and `>=` so an expression default is never split mid-operator.
+/// Ignores `=` inside parentheses, quoted strings, or character literals, and
+/// skips the comparison operators `==`, `!=`, `<=` and `>=` so an expression
+/// default or quoted positional argument is never split mid-token.
 fn find_toplevel_eq(s: &str) -> Option<usize> {
     let b = s.as_bytes();
     let mut depth = 0i32;
+    let mut in_string = false;
     let mut i = 0;
     while i < b.len() {
+        if in_string {
+            if b[i] == b'\\' {
+                i += 1;
+                if i < b.len() {
+                    i += std::str::from_utf8(&s.as_bytes()[i..])
+                        .ok()
+                        .and_then(|rest| rest.chars().next())
+                        .map_or(1, char::len_utf8);
+                }
+                continue;
+            }
+            if b[i] == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
         match b[i] {
+            b'"' => {
+                in_string = true;
+                i += 1;
+                continue;
+            }
+            b'\'' => {
+                i = crate::backend::asm_expr::skip_gas_char_literal(b, i);
+                continue;
+            }
             b'(' => depth += 1,
             b')' => depth -= 1,
             b'=' if depth == 0 => {
@@ -847,42 +918,154 @@ pub(crate) fn parse_macro_header(rest: &str) -> (&str, Vec<MacroParam>) {
 
 /// Parse a macro parameter list, handling `param = default_value` syntax.
 ///
-/// GAS allows parameters like `enable = 1` where `1` is the default value
-/// used when the caller omits that argument. Parameters are separated by
-/// commas or whitespace.
+/// GAS splits `.macro` parameters on top-level commas **and/or whitespace**,
+/// and a `= default` belongs to exactly one parameter: the default is the
+/// single operand token that follows the `=`, ending at the next top-level
+/// whitespace or comma.  Everything here was byte-probed against binutils
+/// 2.47 (`as`) because the rule is not documented in this detail:
+///
+/// | header                       | `as` behaviour                                  |
+/// |------------------------------|-------------------------------------------------|
+/// | `a=1 b=2`                    | two parameters, defaults 1 and 2                |
+/// | `a=1,b=2`                    | two parameters (comma separator)                |
+/// | `a = 1`                      | one parameter, default 1 (spaces around `=` ok) |
+/// | `a b=1`                      | bare `a`, `b` with default 1                    |
+/// | `type:req a=0 b=0 c=0`       | four parameters                                 |
+/// | `ftr2=((0x8000 | (3*32+21)))`| default keeps every space inside the parens      |
+/// | `a=1 << 2 b=3`               | `a` (default 1), `<<`, `2`, `b` (default 3)      |
+///
+/// The previous implementation split the header on top-level COMMAS first and
+/// then attached everything after the first `=` on a part to that parameter,
+/// so a header like the kernel's
+///
+///     .macro UNWIND_HINT type:req sp_reg=0 sp_offset=0 signal=0
+///
+/// (arch/x86/include/asm/objtool.h, reachable from arch/x86/entry/entry.S via
+/// <asm/unwind_hints.h>) became ONE parameter `type` with the default
+/// `req sp_reg=0 sp_offset=0 signal=0`.  Every `UNWIND_HINT ... sp_offset=`
+/// invocation then failed with "Parameter named `sp_offset' does not exist
+/// for macro `UNWIND_HINT'", which is what stopped the full kernel build at
+/// its first object.
+///
+/// Parens/brackets/braces are tracked so a default may contain separators
+/// (`ALT_NOT(feature)` after the C preprocessor is `((... | (3*32+21)))`).
 fn parse_macro_params(params_str: &str) -> Vec<MacroParam> {
     let mut params = Vec::new();
-    // Split on TOP-LEVEL commas only: a parameter default may itself contain
-    // commas inside parentheses. The kernel's
-    //     .macro FILL_RETURN_BUFFER reg:req nr:req ftr:req ftr2=ALT_NOT(X86_FEATURE_ALWAYS)
-    // expands ALT_NOT() to `((... << 16) | ((3*32+21)))`, and a naive
-    // `split(',')` tore that default apart, leaving a bogus parameter whose
-    // value later reached `.4byte` as the unparsable fragment `(((1`.
-    for part in split_on_commas_raw(params_str) {
-        let part = part.trim();
-        if part.is_empty() {
+    let bytes = params_str.as_bytes();
+    let mut i = 0usize;
+
+    // Next byte that is not a parameter separator (space, tab, comma).
+    let skip_separators = |i: &mut usize| {
+        while *i < bytes.len() && matches!(bytes[*i], b' ' | b'\t' | b',') {
+            *i += 1;
+        }
+    };
+
+    loop {
+        skip_separators(&mut i);
+        if i >= bytes.len() {
+            break;
+        }
+        // Parameter name, together with any `:req`/`:vararg` qualifier: it ends
+        // at a separator or at the `=` that introduces its default.
+        let name_start = i;
+        while i < bytes.len() && !matches!(bytes[i], b' ' | b'\t' | b',' | b'=') {
+            i += 1;
+        }
+        let token = &params_str[name_start..i];
+        if token.is_empty() {
+            // A stray `=` (e.g. `a=1 == 2`): consume it so the loop advances.
+            i += 1;
             continue;
         }
-        // Only the FIRST `=` at paren depth 0 separates the name from the
-        // default; everything after it belongs to the default, spaces
-        // included. The tokens before it are further parameters (GAS allows
-        // whitespace as a separator), but the default itself must never be
-        // whitespace-split: treating the spaces inside
-        // `(((1 << 0) << 16) | ((3*32+21)))` as separators invented
-        // parameters named `<<` and `0)` and left `\ftr2` expanding to `(((1`.
-        let (names, default) = match find_toplevel_eq(part) {
-            Some(eq) => (part[..eq].trim(), Some(part[eq + 1..].trim())),
-            None => (part, None),
-        };
-        let tokens: Vec<&str> = names.split_whitespace().collect();
-        for (i, tok) in tokens.iter().enumerate() {
-            let mut param = split_param_qualifier(tok);
-            if i + 1 == tokens.len() {
-                param.default = default.map(str::to_string);
+        let mut param = split_param_qualifier(token);
+
+        // `name = default` with optional whitespace around the `=`.
+        let mut look = i;
+        skip_separators(&mut look);
+        if look < bytes.len() && bytes[look] == b'=' {
+            look += 1;
+            while look < bytes.len() && matches!(bytes[look], b' ' | b'\t') {
+                look += 1;
             }
-            params.push(param);
+            let mut default_buf = String::new();
+            let mut depth = 0i32;
+            let mut in_string = false;
+            while look < bytes.len() {
+                if in_string {
+                    let Some(ch) = params_str[look..].chars().next() else {
+                        break;
+                    };
+                    default_buf.push(ch);
+                    look += ch.len_utf8();
+                    if ch == '\\' {
+                        if let Some(esc) = params_str[look..].chars().next() {
+                            default_buf.push(esc);
+                            look += esc.len_utf8();
+                        }
+                    } else if ch == '"' {
+                        in_string = false;
+                    }
+                    continue;
+                }
+                match bytes[look] {
+                    b'"' => {
+                        in_string = true;
+                        default_buf.push('"');
+                        look += 1;
+                    }
+                    b'\'' => {
+                        // GAS's input scrubber turns an ASCII character literal
+                        // `'x` / `'\n'` into its decimal value before `.macro`
+                        // parses the header (matching `split_macro_arg_fields`).
+                        let next_end = crate::backend::asm_expr::skip_gas_char_literal(bytes, look);
+                        let raw_lit = &params_str[look..next_end];
+                        let mut lit_chars = raw_lit[1..].chars();
+                        let val_opt = match lit_chars.next() {
+                            Some('\\') => lit_chars.next().map(|e| match e {
+                                'b' => '\u{8}',
+                                'f' => '\u{c}',
+                                'n' => '\n',
+                                'r' => '\r',
+                                't' => '\t',
+                                other => other,
+                            }),
+                            other => other,
+                        };
+                        match val_opt {
+                            Some(v) if v.is_ascii() => {
+                                default_buf.push_str(&u32::from(v).to_string());
+                            }
+                            _ => default_buf.push_str(raw_lit),
+                        }
+                        look = next_end;
+                    }
+                    b'(' | b'[' | b'{' => {
+                        depth += 1;
+                        default_buf.push(bytes[look] as char);
+                        look += 1;
+                    }
+                    b')' | b']' | b'}' => {
+                        depth -= 1;
+                        default_buf.push(bytes[look] as char);
+                        look += 1;
+                    }
+                    b' ' | b'\t' | b',' if depth == 0 => break,
+                    _ => {
+                        let Some(ch) = params_str[look..].chars().next() else {
+                            break;
+                        };
+                        default_buf.push(ch);
+                        look += ch.len_utf8();
+                    }
+                }
+            }
+            param.default = Some(strip_arg_quotes(&default_buf).to_string());
+            i = look;
         }
+        params.push(param);
     }
+
     params
 }
 
@@ -1033,78 +1216,6 @@ pub(crate) fn split_macro_arg_fields(s: &str, lexing: MacroArgLexing) -> Vec<Vec
     fields
 }
 
-/// Split a string on top-level commas (outside parens and quotes).
-fn split_on_commas_raw(s: &str) -> Vec<String> {
-    let mut fields = Vec::new();
-    let mut current = String::new();
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    let mut paren_depth = 0i32;
-    let mut in_quote = false;
-
-    while i < bytes.len() {
-        if in_quote {
-            if bytes[i] == b'\\' && i + 1 < bytes.len() {
-                current.push(bytes[i] as char);
-                current.push(bytes[i + 1] as char);
-                i += 2;
-                continue;
-            }
-            if bytes[i] == b'"' {
-                in_quote = false;
-            }
-            current.push(bytes[i] as char);
-            i += 1;
-            continue;
-        }
-        match bytes[i] {
-            b'"' => {
-                in_quote = true;
-                current.push('"');
-            }
-            b'\'' => {
-                // GAS character literal: 'x (optionally closed: 'x'). The
-                // byte after the quote is data, even a space or comma
-                // (`movb $' ', %bl` in relocate_kernel_64.S). Copy the whole
-                // literal through verbatim so it never splits the token.
-                current.push('\'');
-                if i + 1 < bytes.len() {
-                    if bytes[i + 1] == b'\\' && i + 2 < bytes.len() {
-                        current.push('\\');
-                        current.push(bytes[i + 2] as char);
-                        i += 2;
-                    } else {
-                        current.push(bytes[i + 1] as char);
-                        i += 1;
-                    }
-                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
-                        current.push('\'');
-                        i += 1;
-                    }
-                }
-            }
-            b'(' => {
-                paren_depth += 1;
-                current.push('(');
-            }
-            b')' => {
-                paren_depth -= 1;
-                current.push(')');
-            }
-            b',' if paren_depth == 0 => {
-                fields.push(current.clone());
-                current.clear();
-            }
-            _ => {
-                current.push(bytes[i] as char);
-            }
-        }
-        i += 1;
-    }
-    fields.push(current);
-    fields
-}
-
 /// Expand `.macro`/`.endm` definitions and macro invocations.
 ///
 /// Definitions take effect in order, including ones made by an expanded
@@ -1245,18 +1356,44 @@ fn split_statements<'l>(lines: &[&'l str], style: &CommentStyle) -> Vec<std::bor
     let mut out = Vec::with_capacity(lines.len());
     for &line in lines {
         let code = strip_comment(line, style);
+        let bytes = code.as_bytes();
         let mut parts = Vec::new();
-        let (mut start, mut in_str, mut escaped) = (0, false, false);
-        for (i, c) in code.char_indices() {
-            match c {
-                _ if escaped => escaped = false,
-                '\\' if in_str => escaped = true,
-                '"' => in_str = !in_str,
-                ';' if !in_str => {
-                    parts.push(&code[start..i]);
-                    start = i + 1;
+        let (mut start, mut in_str) = (0usize, false);
+        let mut i = 0usize;
+        while i < bytes.len() {
+            if in_str {
+                if bytes[i] == b'\\' {
+                    i += 1;
+                    if i < bytes.len() {
+                        i += std::str::from_utf8(&bytes[i..])
+                            .ok()
+                            .and_then(|rest| rest.chars().next())
+                            .map_or(1, char::len_utf8);
+                    }
+                    continue;
                 }
-                _ => {}
+                if bytes[i] == b'"' {
+                    in_str = false;
+                }
+                i += 1;
+                continue;
+            }
+            match bytes[i] {
+                b'"' => {
+                    in_str = true;
+                    i += 1;
+                }
+                b'\'' => {
+                    i = crate::backend::asm_expr::skip_gas_char_literal(bytes, i);
+                }
+                b';' => {
+                    parts.push(&code[start..i]);
+                    i += 1;
+                    start = i;
+                }
+                _ => {
+                    i += 1;
+                }
             }
         }
         if parts.is_empty() {
@@ -1267,7 +1404,7 @@ fn split_statements<'l>(lines: &[&'l str], style: &CommentStyle) -> Vec<std::bor
         out.extend(
             parts
                 .into_iter()
-                .map(str::trim)
+                .map(crate::backend::asm_expr::trim_asm_line)
                 .filter(|s| !s.is_empty())
                 .map(|s| std::borrow::Cow::Owned(s.to_string())),
         );
@@ -2539,5 +2676,94 @@ mod tests {
             bind("o a", "z=1").unwrap_err(),
             "Parameter named `z' does not exist for macro `o'"
         );
+    }
+
+    #[test]
+    fn macro_headers_split_on_whitespace_as_well_as_commas() {
+        // Every expectation below was byte-probed against binutils 2.47 `as`.
+        let names = |s: &str| -> Vec<(String, Option<String>)> {
+            super::parse_macro_params(s)
+                .into_iter()
+                .map(|p| (p.name, p.default))
+                .collect()
+        };
+        // The kernel's UNWIND_HINT header (arch/x86/include/asm/objtool.h):
+        // parsed as ONE parameter `type` before this fix, so every
+        // `UNWIND_HINT ... sp_offset=N` invocation died with
+        // "Parameter named `sp_offset' does not exist".
+        assert_eq!(
+            names("type:req sp_reg=0 sp_offset=0 signal=0"),
+            vec![
+                ("type".to_string(), None),
+                ("sp_reg".to_string(), Some("0".into())),
+                ("sp_offset".to_string(), Some("0".into())),
+                ("signal".to_string(), Some("0".into())),
+            ]
+        );
+        assert_eq!(
+            names("base=%rsp offset=0 indirect=0 extra=1"),
+            vec![
+                ("base".to_string(), Some("%rsp".into())),
+                ("offset".to_string(), Some("0".into())),
+                ("indirect".to_string(), Some("0".into())),
+                ("extra".to_string(), Some("1".into())),
+            ]
+        );
+        // Comma separation, spaces around `=`, and a bare parameter.
+        assert_eq!(
+            names("a=1,b=2"),
+            vec![
+                ("a".to_string(), Some("1".into())),
+                ("b".to_string(), Some("2".into()))
+            ]
+        );
+        assert_eq!(names("a = 1"), vec![("a".to_string(), Some("1".into()))]);
+        assert_eq!(
+            names("a b=1"),
+            vec![("a".to_string(), None), ("b".to_string(), Some("1".into()))]
+        );
+        // A default keeps separators that are inside brackets: after the C
+        // preprocessor ALT_NOT(X86_FEATURE_ALWAYS) is `((... | (3*32+21)))`.
+        assert_eq!(
+            names("ftr2=((0x80000000 | (3*32+21)))"),
+            vec![(
+                "ftr2".to_string(),
+                Some("((0x80000000 | (3*32+21)))".into())
+            )]
+        );
+        // `as` ends a default at the first top-level space, so `<<` and `2`
+        // become (unused) parameters.  Matching that keeps a header's
+        // parameter count identical to the oracle's, which is what decides
+        // "too many positional arguments".
+        assert_eq!(
+            names("a=1 << 2 b=3"),
+            vec![
+                ("a".to_string(), Some("1".into())),
+                ("<<".to_string(), None),
+                ("2".to_string(), None),
+                ("b".to_string(), Some("3".into())),
+            ]
+        );
+        // Quoted and character-literal defaults keep commas, spaces, `:req`,
+        // and escaped quotes inside a single parameter default, stripping only
+        // balanced outer quotes (matching GAS 2.47).
+        assert_eq!(
+            names(r#"p="1, 2" q="x y:req" r="ab\"cd" s=',', t=' '"#),
+            vec![
+                ("p".to_string(), Some("1, 2".into())),
+                ("q".to_string(), Some("x y:req".into())),
+                ("r".to_string(), Some(r#"ab\"cd"#.into())),
+                ("s".to_string(), Some("44".into())),
+                ("t".to_string(), Some("32".into())),
+            ]
+        );
+    }
+
+    #[test]
+    fn strip_comment_and_split_semicolons_preserve_gas_char_literals() {
+        let line = ".byte 'A', ' ', ',', ';', '#' # trailing ; comment";
+        let stripped = strip_comment(line, &CommentStyle::Hash);
+        assert_eq!(stripped.trim(), ".byte 'A', ' ', ',', ';', '#'");
+        assert_eq!(split_on_semicolons(stripped).len(), 1);
     }
 }

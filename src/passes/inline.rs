@@ -4975,16 +4975,46 @@ fn inline_call_site(
 
     // Use the global max block ID to avoid collisions with ANY function's blocks
     let value_offset = caller_next_value;
-    let block_offset = *global_max_block_id + 1;
+    // Labels are handed out above every label in the module *and* above the
+    // caller's own maximum: `global_max_block_id` is a maintained counter, and
+    // structural transforms elsewhere can mint labels from a function's
+    // `next_label` without advancing it (measured here: the caller held
+    // 4189138786 while the counter stood at 4093052108).  Taking the maximum of
+    // both is what makes the dense assignment collision-free by construction.
+    let caller_max_label = caller
+        .blocks
+        .iter()
+        .map(|block| block.label.0)
+        .max()
+        .unwrap_or(0);
+    // Reserve `label_base` plus at least `callee.blocks.len() + 1` dense slots
+    // (every callee block + the post-call merge block) strictly below `u32::MAX`
+    // so `caller.next_label` can still advance past `merge_block_id` without
+    // saturating at `u32::MAX`. `LabelMap` also checks every individual mint
+    // in case a callee terminator names an undefined block label.
+    let Some(label_base) = (*global_max_block_id).max(caller_max_label).checked_add(1) else {
+        return false;
+    };
+    let min_labels_needed = u32::try_from(callee.blocks.len())
+        .ok()
+        .and_then(|n| n.checked_add(1));
+    if min_labels_needed
+        .and_then(|n| label_base.checked_add(n))
+        .is_none()
+    {
+        // Fail closed: an inline that cannot mint collision-free labels and
+        // leave headroom for `caller.next_label` must not clone blocks.
+        return false;
+    }
 
     let debug_inline_detail = std::env::var("CCC_INLINE_DEBUG_DETAIL").is_ok();
     if debug_inline_detail {
         eprintln!(
-            "[INLINE_DETAIL] Inlining '{}' into '{}': value_offset={}, block_offset={}, callee.next_value_id={}, caller.next_value_id={}",
+            "[INLINE_DETAIL] Inlining '{}' into '{}': value_offset={}, label_base={}, callee.next_value_id={}, caller.next_value_id={}",
             site.callee_name,
             caller.name,
             value_offset,
-            block_offset,
+            label_base,
             callee.next_value_id,
             caller.next_value_id
         );
@@ -4997,21 +5027,45 @@ fn inline_call_site(
         }
     }
 
-    // Clone and remap the callee's blocks
+    // Clone and remap the callee's blocks.
+    //
+    // Block labels are remapped DENSELY, through `labels`, never by adding a
+    // constant offset to the callee's own labels.  Additive re-basing is
+    // exponential: every clone's labels sit above the module-wide maximum, and
+    // the next clone adds that maximum again, so a function that inlines a few
+    // times per optimization round drives the u32 label space to its top.
+    // Measured on linux-6.18.58 kernel/workqueue.c: `process_scheduled_works`
+    // inlined `process_one_work` (whose own labels had been rebased below
+    // 4.09e9), then the next clones in that caller reused the same base and one
+    // landed back on an existing label by u32 wraparound -- two live blocks
+    // with one label.  `cfg-simplify` then merged the wrong blocks, deleted the
+    // definition of v277 and left five dangling uses (observed as
+    // `x86 codegen: operand_to_rax: value 277 ... cannot be materialised`):
+    // a miscompile, not a diagnostic.
+    //
+    // Dense assignment keeps label growth linear in the number of cloned blocks
+    // and makes collisions structurally impossible: labels are handed out from
+    // a counter above every label in the module (and above the caller's own
+    // highest label), and each distinct callee label consumes exactly one slot.
+    let mut labels = LabelMap::new(label_base);
+    for callee_block in &callee.blocks {
+        labels.assign(callee_block.label);
+    }
+
     let mut inlined_blocks: Vec<BasicBlock> = Vec::with_capacity(callee.blocks.len());
 
     for callee_block in &callee.blocks {
         let mut new_block = BasicBlock {
-            label: BlockId(callee_block.label.0 + block_offset),
+            label: labels.get(callee_block.label),
             instructions: Vec::with_capacity(callee_block.instructions.len()),
             source_spans: callee_block.source_spans.clone(),
-            terminator: remap_terminator(&callee_block.terminator, value_offset, block_offset),
+            terminator: remap_terminator(&callee_block.terminator, value_offset, &mut labels),
         };
 
         for inst in &callee_block.instructions {
             new_block
                 .instructions
-                .push(remap_instruction(inst, value_offset, block_offset));
+                .push(remap_instruction(inst, value_offset, &mut labels));
         }
 
         inlined_blocks.push(new_block);
@@ -5127,21 +5181,13 @@ fn inline_call_site(
     }
 
     // Create a merge block that the callee's return statements will branch to.
-    // `callee.max_block_id` is the same kind of hint that `next_value_id` is:
-    // structural transforms inside the callee (nested inlining included) can
-    // leave it below the labels actually live, so reserve past the maximum
-    // present in the IR. Otherwise a cloned block gets a label above the merge
-    // block — and above the caller's `next_label`, which is only advanced to
-    // `merge_block_id + 1` — so the next pass that mints a label from that
-    // counter collides with a live block.
-    let callee_max_label = callee
-        .blocks
-        .iter()
-        .map(|block| block.label.0)
-        .max()
-        .unwrap_or(0)
-        .max(callee.max_block_id);
-    let merge_block_id = BlockId(block_offset + callee_max_label + 1);
+    // Its label comes from the same dense allocator, so it is above every label
+    // the clone minted and above anything the caller already had — including the
+    // labels of any later clone in this caller that mints from `next_label`.
+    let merge_block_id = labels.assign_fresh();
+    if labels.overflowed {
+        return false;
+    }
 
     // Collect return values from all return blocks to build a Phi node.
     // Each Return(Some(val)) becomes a branch to the merge block, and
@@ -5748,9 +5794,61 @@ fn remap_value(v: Value, offset: u32) -> Value {
     Value(v.0 + offset)
 }
 
-/// Remap a BlockId by adding an offset.
-fn remap_block(b: BlockId, offset: u32) -> BlockId {
-    BlockId(b.0 + offset)
+/// Dense callee-label -> caller-label assignment for one inline clone.
+///
+/// One counter, one slot per distinct callee label: no arithmetic on label
+/// *values*, so no wraparound and no exponential growth (see the comment at the
+/// clone site for the miscompile this replaced).  A label the callee references
+/// but does not define — a `possible_targets` entry or a stale phi predecessor —
+/// still gets its own fresh label rather than aliasing a live block.
+struct LabelMap {
+    next: u32,
+    overflowed: bool,
+    map: FxHashMap<u32, BlockId>,
+}
+
+impl LabelMap {
+    fn new(base: u32) -> Self {
+        Self {
+            next: base,
+            overflowed: false,
+            map: FxHashMap::default(),
+        }
+    }
+
+    /// The caller label for a callee label, minting it if this is the first
+    /// reference (references always precede or accompany the definition in the
+    /// remap walk because every block's label is assigned up front).
+    fn get(&mut self, label: BlockId) -> BlockId {
+        if let Some(mapped) = self.map.get(&label.0) {
+            return *mapped;
+        }
+        self.assign(label)
+    }
+
+    /// Assign a label to a callee label that has none yet.
+    fn assign(&mut self, label: BlockId) -> BlockId {
+        let mapped = self.assign_fresh();
+        self.map.insert(label.0, mapped);
+        mapped
+    }
+
+    /// A brand-new label, which is above every label the clone will use.
+    /// Records `overflowed` instead of panicking/wrapping if `u32::MAX` is
+    /// reached so the caller can abort before mutating the CFG.
+    fn assign_fresh(&mut self) -> BlockId {
+        let id = BlockId(self.next);
+        match self.next.checked_add(1) {
+            Some(next) => self.next = next,
+            None => self.overflowed = true,
+        }
+        id
+    }
+}
+
+/// Remap a BlockId through the clone's dense label assignment.
+fn remap_block(b: BlockId, labels: &mut LabelMap) -> BlockId {
+    labels.get(b)
 }
 
 /// Remap an Operand (only Value operands need remapping; constants stay the same).
@@ -5795,7 +5893,7 @@ fn remap_call_info(info: &CallInfo, vo: u32) -> CallInfo {
 }
 
 /// Remap all values and block references in an instruction.
-fn remap_instruction(inst: &Instruction, vo: u32, bo: u32) -> Instruction {
+fn remap_instruction(inst: &Instruction, vo: u32, labels: &mut LabelMap) -> Instruction {
     match inst {
         Instruction::PgoCounterInc {
             name,
@@ -6047,7 +6145,7 @@ fn remap_instruction(inst: &Instruction, vo: u32, bo: u32) -> Instruction {
             ty: *ty,
             incoming: incoming
                 .iter()
-                .map(|(op, bid)| (remap_operand(op, vo), remap_block(*bid, bo)))
+                .map(|(op, bid)| (remap_operand(op, vo), remap_block(*bid, labels)))
                 .collect(),
         },
         Instruction::LabelAddr { dest, label } => Instruction::LabelAddr {
@@ -6056,7 +6154,7 @@ fn remap_instruction(inst: &Instruction, vo: u32, bo: u32) -> Instruction {
             // branch target. Keeping the original BlockId made every inline
             // clone point at another function/clone's label (or an undefined
             // .LBB symbol), violating GCC's per-clone label identity.
-            label: remap_block(*label, bo),
+            label: remap_block(*label, labels),
         },
         Instruction::GetReturnF64Second { dest } => Instruction::GetReturnF64Second {
             dest: remap_value(*dest, vo),
@@ -6140,7 +6238,7 @@ fn remap_instruction(inst: &Instruction, vo: u32, bo: u32) -> Instruction {
             operand_types: operand_types.clone(),
             goto_labels: goto_labels
                 .iter()
-                .map(|(name, bid)| (name.clone(), remap_block(*bid, bo)))
+                .map(|(name, bid)| (name.clone(), remap_block(*bid, labels)))
                 .collect(),
             input_symbols: input_symbols.clone(),
             seg_overrides: seg_overrides.clone(),
@@ -6188,18 +6286,18 @@ fn remap_instruction(inst: &Instruction, vo: u32, bo: u32) -> Instruction {
 }
 
 /// Remap block references in a terminator.
-fn remap_terminator(term: &Terminator, vo: u32, bo: u32) -> Terminator {
+fn remap_terminator(term: &Terminator, vo: u32, labels: &mut LabelMap) -> Terminator {
     match term {
         Terminator::Return(op) => Terminator::Return(op.map(|o| remap_operand(&o, vo))),
-        Terminator::Branch(bid) => Terminator::Branch(remap_block(*bid, bo)),
+        Terminator::Branch(bid) => Terminator::Branch(remap_block(*bid, labels)),
         Terminator::CondBranch {
             cond,
             true_label,
             false_label,
         } => Terminator::CondBranch {
             cond: remap_operand(cond, vo),
-            true_label: remap_block(*true_label, bo),
-            false_label: remap_block(*false_label, bo),
+            true_label: remap_block(*true_label, labels),
+            false_label: remap_block(*false_label, labels),
         },
         Terminator::IndirectBranch {
             target,
@@ -6208,7 +6306,7 @@ fn remap_terminator(term: &Terminator, vo: u32, bo: u32) -> Terminator {
             target: remap_operand(target, vo),
             possible_targets: possible_targets
                 .iter()
-                .map(|b| remap_block(*b, bo))
+                .map(|b| remap_block(*b, labels))
                 .collect(),
         },
         Terminator::Switch {
@@ -6220,9 +6318,9 @@ fn remap_terminator(term: &Terminator, vo: u32, bo: u32) -> Terminator {
             val: remap_operand(val, vo),
             cases: cases
                 .iter()
-                .map(|&(v, bid)| (v, remap_block(bid, bo)))
+                .map(|&(v, bid)| (v, remap_block(bid, labels)))
                 .collect(),
-            default: remap_block(*default, bo),
+            default: remap_block(*default, labels),
             ty: *ty,
         },
         Terminator::Unreachable => Terminator::Unreachable,
@@ -9596,5 +9694,16 @@ mod sroa_unlock_tests {
             }],
         );
         assert!(!admitted(&used));
+    }
+
+    #[test]
+    fn label_map_records_overflow_at_u32_max_without_wrapping() {
+        let mut lm = LabelMap::new(u32::MAX - 1);
+        assert_eq!(lm.assign(BlockId(10)), BlockId(u32::MAX - 1));
+        assert!(!lm.overflowed);
+        assert_eq!(lm.get(BlockId(10)), BlockId(u32::MAX - 1));
+        assert!(!lm.overflowed);
+        assert_eq!(lm.assign_fresh(), BlockId(u32::MAX));
+        assert!(lm.overflowed);
     }
 }

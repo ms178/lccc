@@ -514,7 +514,7 @@ pub fn parse_asm(text: &str) -> Result<Vec<AsmItem>, String> {
         let parts = asm_preprocess::split_on_semicolons(line);
         if parts.len() > 1 {
             for part in parts {
-                let part = part.trim();
+                let part = crate::backend::asm_expr::trim_asm_line(part);
                 if !part.is_empty() {
                     lines.push(part.to_string());
                 }
@@ -532,7 +532,7 @@ pub fn parse_asm(text: &str) -> Result<Vec<AsmItem>, String> {
 
         // Strip comments (# to end of line, but not inside strings)
         let stripped = strip_comment(line);
-        let trimmed = stripped.trim();
+        let trimmed = crate::backend::asm_expr::trim_asm_line(stripped);
 
         if trimmed.is_empty() {
             items.push(AsmItem::Empty);
@@ -543,7 +543,7 @@ pub fn parse_asm(text: &str) -> Result<Vec<AsmItem>, String> {
         // Split the line on ';' and parse each part independently.
         let parts: Vec<&str> = asm_preprocess::split_on_semicolons(trimmed);
         for part in parts {
-            let part = part.trim();
+            let part = crate::backend::asm_expr::trim_asm_line(part);
             if part.is_empty() {
                 continue;
             }
@@ -614,7 +614,7 @@ fn parse_line_items(line: &str) -> Result<Vec<AsmItem>, String> {
         items.push(AsmItem::Label(label));
         rest
     } else {
-        line.trim()
+        crate::backend::asm_expr::trim_asm_line(line)
     };
 
     // If there's nothing after the label, we're done
@@ -695,7 +695,10 @@ fn try_parse_label(line: &str) -> Option<(String, &str)> {
 fn parse_directive(line: &str) -> Result<AsmItem, String> {
     let parts: Vec<&str> = line.splitn(2, |c: char| c.is_whitespace()).collect();
     let directive = parts[0];
-    let args = parts.get(1).map(|s| s.trim()).unwrap_or("");
+    let args = parts
+        .get(1)
+        .map(|s| crate::backend::asm_expr::trim_asm_line(s))
+        .unwrap_or("");
 
     match directive {
         ".section" => parse_section_directive(args),
@@ -2803,7 +2806,7 @@ pub(crate) fn is_label_like(s: &str) -> bool {
 /// Strip balanced outer parentheses from an expression.
 /// E.g. "((1b) - .)" -> "(1b) - ." -> "1b - ." (recursive).
 fn strip_outer_parens(s: &str) -> &str {
-    let s = s.trim();
+    let s = crate::backend::asm_expr::trim_data_arg(s);
     if !s.starts_with('(') || !s.ends_with(')') {
         return s;
     }
@@ -2960,8 +2963,8 @@ fn classify_data_expr(s: &str) -> Option<DataValue> {
 
 fn parse_data_values(s: &str) -> Result<Vec<DataValue>, String> {
     let mut vals = Vec::new();
-    for part in s.split(',') {
-        let trimmed = strip_outer_parens(part.trim());
+    for part in crate::backend::asm_expr::split_comma_args(s) {
+        let trimmed = strip_outer_parens(crate::backend::asm_expr::trim_data_arg(part));
         if trimmed.is_empty() {
             continue;
         }

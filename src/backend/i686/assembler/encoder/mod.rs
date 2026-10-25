@@ -120,28 +120,28 @@ fn fma3_opcode(m: &str) -> Option<(u8, u8)> {
 
 /// Split a label string like `"pa_tr_efer + 4"` or `"symbol-8"` into (symbol, addend).
 /// Returns the original string with addend 0 if no offset is found.
+///
+/// GAS evaluates the whole expression around the symbol, so `sym+38+4` is
+/// `sym+(38+4)` and `sym-4+2` is `sym+(-4+2)`.  The local loop this replaces
+/// parsed only a SINGLE term after the first sign and then kept scanning:
+/// for `boot_params+38+4` the first candidate parsed as symbol `boot_params`
+/// with a non-numeric tail, so scanning continued and the NEXT sign produced
+/// the "symbol" `boot_params+38` with addend 4.  That name is not a symbol, but
+/// it was used as one, so the object carried an UNDEFINED symbol literally
+/// named `boot_params+38` and lccc-ld refused the kernel's `setup.elf` with
+/// `undefined symbols: boot_params+38, vminfo+31`.  The x86 boot code emits
+/// exactly that shape for 64-bit field copies in -m16 mode
+/// (`movl vminfo+31+4, %eax`, arch/x86/boot/video-vesa.c).
+///
+/// The x86-64 encoder already had the correct implementation — full constant
+/// expression evaluation on either side of the sign, with a symbol-character
+/// check on the symbol half — so i686 now delegates to it instead of keeping a
+/// second, weaker copy.  Both encoders therefore agree with GAS (and with each
+/// other) by construction: `as` folds `vminfo+31+4` to `vminfo+0x23`, and so
+/// does this.
 pub(super) fn split_label_offset(label: &str) -> (&str, i64) {
-    // Scan for '+' or '-' that separates the symbol from the offset.
-    // Skip the first character to avoid splitting on leading sign/dot.
-    for (i, c) in label.char_indices().skip(1) {
-        if c == '+' || c == '-' {
-            let left = label[..i].trim();
-            if left.is_empty() {
-                continue;
-            }
-            // Extract the numeric part (including sign for '-')
-            let num_str = if c == '+' {
-                label[i + 1..].trim()
-            } else {
-                // Keep the '-' sign
-                label[i..].trim()
-            };
-            if let Ok(offset) = num_str.parse::<i64>() {
-                return (left, offset);
-            }
-        }
-    }
-    (label, 0)
+    crate::backend::x86::assembler::parser::split_relocation_symbol_addend(label)
+        .unwrap_or((label, 0))
 }
 
 /// Relocation entry for the linker to resolve.
@@ -4363,5 +4363,39 @@ mod x87_integer_and_conditional_tests {
         // alias by this assembler.
         assert_eq!(assemble("fisttp 8(%esp)").as_deref(), Ok("dd 4c 24 08"));
         assert_eq!(assemble("fisttpq 8(%esp)").as_deref(), Ok("dd 4c 24 08"));
+    }
+}
+
+#[cfg(test)]
+mod symbol_offset_tests {
+    use super::split_label_offset;
+
+    #[test]
+    fn chained_addends_fold_like_gas() {
+        // `as` on `movl vminfo+31+4, %eax` emits R_386_32 against `vminfo`
+        // with 0x23 in the field (verified with binutils 2.47); the boot code
+        // relies on it for 64-bit field copies.
+        assert_eq!(split_label_offset("boot_params+38+4"), ("boot_params", 42));
+        assert_eq!(split_label_offset("vminfo+31+4"), ("vminfo", 35));
+        assert_eq!(split_label_offset("sym-4+2"), ("sym", -2));
+        assert_eq!(split_label_offset("sym+8-10"), ("sym", -2));
+    }
+
+    #[test]
+    fn hexadecimal_addends_are_numbers_not_symbol_text() {
+        // The old `parse::<i64>()` refused `0x10` and then returned a "symbol"
+        // named `sym+0x10`.  GAS reads it as the number it is.
+        assert_eq!(split_label_offset("sym+0x10"), ("sym", 16));
+        assert_eq!(split_label_offset("sym-0x10"), ("sym", -16));
+    }
+
+    #[test]
+    fn a_plain_symbol_and_a_symbol_difference_are_untouched() {
+        assert_eq!(split_label_offset("plain"), ("plain", 0));
+        // `a-b` is a symbol difference, not a symbol plus a constant: the tail
+        // is not a constant expression, so nothing may be split off.
+        assert_eq!(split_label_offset("a-b"), ("a-b", 0));
+        // Whitespace around the sign is allowed, as in `pa_tr_efer + 4`.
+        assert_eq!(split_label_offset("pa_tr_efer + 4"), ("pa_tr_efer", 4));
     }
 }

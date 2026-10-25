@@ -276,3 +276,53 @@ fn line_directive_inside_an_invocation_moves_its_tail() {
         2,
     );
 }
+
+/// Preprocess `src` in assembly mode (`.S` / `-x assembler-with-cpp`).
+fn preprocess_asm(src: &str) -> (Preprocessor, String) {
+    let mut pp = Preprocessor::new();
+    pp.set_filename("unit.S");
+    pp.set_asm_mode(true);
+    let out = pp.preprocess(src);
+    (pp, out)
+}
+
+#[test]
+fn assembly_splices_are_real_splices() {
+    // arch/x86/boot/header.S spells ONE PE Characteristics expression over four
+    // physical lines.  GCC and clang both give `as` a single joined line for
+    // `.S` input (`gcc -E -x assembler-with-cpp`), and `as` itself rejects the
+    // continuation form — so the splice must be cpp's.  C mode deliberately
+    // keeps the break (the elision in join_continued_lines); assembly mode must
+    // not, or the assembler sees a truncated `.word 0x0002 |` expression.
+    let (_, out) = preprocess_asm(
+        "\t.word\t0x0002\t| \\\n\
+         \t\t0x0400\t| \\\n\
+         \t\t0x0004\n\
+         \t.long\t1\n",
+    );
+    let body: Vec<&str> = out
+        .lines()
+        .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+        .collect();
+    assert_eq!(
+        body,
+        vec!["\t.word\t0x0002\t| \t\t0x0400\t| \t\t0x0004", "\t.long\t1"],
+        "assembly continuation must collapse to one line"
+    );
+    assert!(
+        !out.contains("0x0002\t|\n"),
+        "a splice was split into two assembly lines:\n{out}"
+    );
+}
+
+#[test]
+fn c_splices_still_keep_their_break() {
+    // The elision under test is the C-mode one: it keeps the physical break
+    // (so later tokens keep their physical line/column) as long as the break
+    // cannot change the token sequence.
+    let (_, out) = preprocess("int a = 1 + \\\n 2;\n");
+    assert!(
+        out.contains("1 + \n 2;"),
+        "C-mode splice elision changed shape:\n{out}"
+    );
+}

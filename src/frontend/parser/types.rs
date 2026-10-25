@@ -1696,6 +1696,7 @@ impl Parser {
         let saved_attrs = self.attrs.clone();
         self.attrs.set_const(false);
         self.attrs.set_volatile(false);
+        self.attrs.parsing_address_space = AddressSpace::Default;
 
         let Some(type_spec) = self.parse_type_specifier() else {
             let span = self.peek_span();
@@ -1704,76 +1705,26 @@ impl Parser {
             return (TypeSpecifier::Int, vec![0]);
         };
 
-        let mut result_type = type_spec;
-        let mut qualifiers = vec![
-            u8::from(self.attrs.parsing_const()) | (u8::from(self.attrs.parsing_volatile()) << 1),
-        ];
+        // Capture trailing CVR and address-space qualifiers written after the
+        // base specifier (`typeof(x) const *`, `int __seg_gs (*)[4]`).
+        let q_start = self.pos;
+        self.skip_cv_qualifiers();
+        let restrict_bit = u8::from(
+            self.tokens[q_start..self.pos]
+                .iter()
+                .any(|tok| matches!(tok.kind, TokenKind::Restrict)),
+        ) << 2;
+        let base_quals = u8::from(self.attrs.parsing_const())
+            | (u8::from(self.attrs.parsing_volatile()) << 1)
+            | restrict_bit;
+        let base_space = std::mem::take(&mut self.attrs.parsing_address_space);
         self.attrs.set_const(false);
         self.attrs.set_volatile(false);
 
-        let mut ptr_depth = 0u32;
-        loop {
-            let star_span = self.peek_span();
-            if !self.consume_if(&TokenKind::Star) {
-                break;
-            }
-            ptr_depth += 1;
-            if !self.enter_pointer_level(ptr_depth, star_span) {
-                break;
-            }
-            result_type = TypeSpecifier::Pointer(Box::new(result_type), AddressSpace::Default);
-            let mut q = 0u8;
-            loop {
-                match self.peek() {
-                    TokenKind::Const => {
-                        q |= 1;
-                        self.advance();
-                    }
-                    TokenKind::Volatile => {
-                        q |= 2;
-                        self.advance();
-                    }
-                    TokenKind::Restrict => {
-                        q |= 4;
-                        self.advance();
-                    }
-                    _ => break,
-                }
-            }
-            qualifiers.push(q);
-        }
-
-        // Handle the common abstract function-pointer spelling `(*)`.
-        if matches!(self.peek(), TokenKind::LParen) {
-            let save = self.pos;
-            self.advance();
-            if self.consume_if(&TokenKind::Star) {
-                while !matches!(self.peek(), TokenKind::RParen | TokenKind::Eof) {
-                    self.advance();
-                }
-                self.consume_if(&TokenKind::RParen);
-                if matches!(self.peek(), TokenKind::LParen) {
-                    self.skip_balanced_parens();
-                }
-                result_type = TypeSpecifier::Pointer(Box::new(result_type), AddressSpace::Default);
-                qualifiers.push(0);
-            } else {
-                self.pos = save;
-            }
-        }
-
-        while matches!(self.peek(), TokenKind::LBracket) {
-            let open = self.peek_span();
-            self.advance();
-            let size = if matches!(self.peek(), TokenKind::RBracket) {
-                None
-            } else {
-                Some(Box::new(self.parse_expr()))
-            };
-            self.expect_closing(&TokenKind::RBracket, open);
-            result_type = TypeSpecifier::Array(Box::new(result_type), size);
-            qualifiers.push(0);
-        }
+        let mut qualifiers = vec![base_quals];
+        let mut ptr_budget = 0u32;
+        let level = self.parse_abstract_declarator_level(&mut ptr_budget);
+        let result_type = level.apply_to(type_spec, base_space, Some(&mut qualifiers));
 
         self.attrs = saved_attrs;
         (result_type, qualifiers)
@@ -1836,197 +1787,20 @@ impl Parser {
     /// the leading `skip_cv_qualifiers`/`*` arms below capture it.
     pub(super) fn parse_abstract_declarator_suffix(
         &mut self,
-        mut result_type: TypeSpecifier,
+        result_type: TypeSpecifier,
     ) -> TypeSpecifier {
         // Consume address space qualifiers that appear before the first '*'
         // e.g., typeof(var) __seg_gs * → __seg_gs sets parsing_address_space
         self.skip_cv_qualifiers();
-        // Parse leading pointer(s). Bounded: see POINTER_DEPTH_BUDGET.
-        let mut ptr_depth = 0u32;
-        loop {
-            let star_span = self.peek_span();
-            if !self.consume_if(&TokenKind::Star) {
-                break;
-            }
-            ptr_depth += 1;
-            if !self.enter_pointer_level(ptr_depth, star_span) {
-                break;
-            }
-            // Capture any address space qualifier that preceded the '*'
-            // (e.g., __seg_gs in "typeof(var) __seg_gs *")
-            let addr_space = std::mem::take(&mut self.attrs.parsing_address_space);
-            result_type = TypeSpecifier::Pointer(Box::new(result_type), addr_space);
-            self.skip_cv_qualifiers();
+        let base_space = std::mem::take(&mut self.attrs.parsing_address_space);
+        let mut ptr_budget = 0u32;
+        let level = self.parse_abstract_declarator_level(&mut ptr_budget);
+        if level.is_empty() {
+            self.attrs.parsing_address_space = base_space;
+            result_type
+        } else {
+            level.apply_to(result_type, base_space, None)
         }
-        // Handle parenthesized abstract declarators: (*), (*)(params), (*)[N], (*[3][4])
-        // Also handles nested function pointers: (*(*)(params))(params)
-        if matches!(self.peek(), TokenKind::LParen) {
-            let save = self.pos;
-            // A qualifier still pending here came from the base specifier
-            // (`long __seg_gs (*)[4]`): it names the storage the pointer
-            // addresses, so it belongs on the innermost pointer layer, exactly
-            // as a declaration's base qualifier does through
-            // `apply_declaration_address_space`. Star arms above have already
-            // taken their own qualifiers, so nothing is applied twice.
-            // Read, not taken: the slot stays with the declaration's snapshot.
-            let base_space = self.attrs.parsing_address_space;
-            if let Some(paren_decl) = self.try_parse_paren_abstract_declarator() {
-                use super::declarators::ParenAbstractDecl;
-                match paren_decl {
-                    ParenAbstractDecl::Simple {
-                        ptr_depth,
-                        array_dims: inner_array_dims,
-                    } => {
-                        if matches!(self.peek(), TokenKind::LParen) {
-                            // Function pointer cast: (*)(params) or (**)(params)
-                            let (params, variadic) = self.parse_param_list();
-                            result_type = TypeSpecifier::FunctionPointer(
-                                Box::new(result_type),
-                                params,
-                                variadic,
-                            );
-                            // Extra pointer levels for multi-indirection (e.g., ** means ptr-to-func-ptr)
-                            for _ in 0..ptr_depth.saturating_sub(1) {
-                                result_type = TypeSpecifier::Pointer(
-                                    Box::new(result_type),
-                                    AddressSpace::Default,
-                                );
-                            }
-                            // Wrap with inner array dims (for array of function pointers)
-                            for dim in inner_array_dims.into_iter().rev() {
-                                result_type = TypeSpecifier::Array(Box::new(result_type), dim);
-                            }
-                        } else if matches!(self.peek(), TokenKind::LBracket)
-                            || !inner_array_dims.is_empty()
-                        {
-                            // Pointer to array: (*)[N] or (*[3][4])[2]
-                            let mut outer_dims: Vec<Option<Box<Expr>>> = Vec::new();
-                            while matches!(self.peek(), TokenKind::LBracket) {
-                                let open_bracket = self.peek_span();
-                                self.advance();
-                                let size = if matches!(self.peek(), TokenKind::RBracket) {
-                                    None
-                                } else {
-                                    Some(Box::new(self.parse_expr()))
-                                };
-                                self.expect_closing(&TokenKind::RBracket, open_bracket);
-                                outer_dims.push(size);
-                            }
-                            for dim in outer_dims.into_iter().rev() {
-                                result_type = TypeSpecifier::Array(Box::new(result_type), dim);
-                            }
-                            for level in 0..ptr_depth {
-                                let space = if level == 0 {
-                                    base_space
-                                } else {
-                                    AddressSpace::Default
-                                };
-                                result_type = TypeSpecifier::Pointer(Box::new(result_type), space);
-                            }
-                            for dim in inner_array_dims.into_iter().rev() {
-                                result_type = TypeSpecifier::Array(Box::new(result_type), dim);
-                            }
-                        } else {
-                            for level in 0..ptr_depth {
-                                let space = if level == 0 {
-                                    base_space
-                                } else {
-                                    AddressSpace::Default
-                                };
-                                result_type = TypeSpecifier::Pointer(Box::new(result_type), space);
-                            }
-                        }
-                    }
-                    ParenAbstractDecl::NestedFnPtr {
-                        outer_ptr_depth,
-                        inner_ptr_depth,
-                        inner_params,
-                        inner_variadic,
-                    } => {
-                        // Nested function pointer: (*(*)(inner_params))(outer_params)
-                        // e.g., void(*(*)(void*))(void):
-                        //   base = void, inner_params = [void*], outer_params = [void]
-                        //   Result: Pointer(FunctionPointer(
-                        //       return_type = FunctionPointer(return_type=void, params=[], variadic=false),
-                        //       params = [Pointer(Void)],
-                        //       variadic = false))
-                        if matches!(self.peek(), TokenKind::LParen) {
-                            let (outer_params, outer_variadic) = self.parse_param_list();
-                            // Build the return type: function pointer returning base type
-                            for _ in 0..inner_ptr_depth.saturating_sub(1) {
-                                result_type = TypeSpecifier::Pointer(
-                                    Box::new(result_type),
-                                    AddressSpace::Default,
-                                );
-                            }
-                            let return_fn_type = TypeSpecifier::FunctionPointer(
-                                Box::new(result_type),
-                                outer_params,
-                                outer_variadic,
-                            );
-                            // Build the outer function: takes inner_params, returns return_fn_type
-                            result_type = TypeSpecifier::FunctionPointer(
-                                Box::new(return_fn_type),
-                                inner_params,
-                                inner_variadic,
-                            );
-                            // Apply extra outer pointer levels (for outer_ptr_depth > 1)
-                            for _ in 0..outer_ptr_depth.saturating_sub(1) {
-                                result_type = TypeSpecifier::Pointer(
-                                    Box::new(result_type),
-                                    AddressSpace::Default,
-                                );
-                            }
-                        } else {
-                            // No outer params - treat as simple pointer
-                            let total = outer_ptr_depth + inner_ptr_depth;
-                            for _ in 0..total {
-                                result_type = TypeSpecifier::Pointer(
-                                    Box::new(result_type),
-                                    AddressSpace::Default,
-                                );
-                            }
-                        }
-                    }
-                }
-            } else {
-                self.pos = save;
-                // Not a parenthesized declarator, so the function abstract
-                // declarator of `int (void)` (C23 6.7.8), as in
-                // `typeof(int (int))` or a `_Generic` type name. Its
-                // parameter list cannot be an identifier list, so requiring
-                // `)`, `...` or a declaration specifier keeps an expression
-                // like `(T(x))` from being read as a type.
-                self.advance();
-                let is_param_list = matches!(self.peek(), TokenKind::RParen | TokenKind::Ellipsis)
-                    || self.is_type_specifier();
-                self.pos = save;
-                if is_param_list {
-                    let (params, variadic) = self.parse_param_list();
-                    return TypeSpecifier::BareFunction(Box::new(result_type), params, variadic);
-                }
-            }
-        }
-        // Parse trailing array dimensions, collecting them first so we can
-        // apply in reverse order. In C, `int[1][3]` is "1 element of int[3]",
-        // so the rightmost dimension wraps first (innermost).
-        let mut array_dims: Vec<Option<Box<Expr>>> = Vec::new();
-        while matches!(self.peek(), TokenKind::LBracket) {
-            let open = self.peek_span();
-            self.advance();
-            let size = if matches!(self.peek(), TokenKind::RBracket) {
-                None
-            } else {
-                Some(Box::new(self.parse_expr()))
-            };
-            self.expect_closing(&TokenKind::RBracket, open);
-            array_dims.push(size);
-        }
-        // Apply in reverse: innermost (rightmost) dimension wraps first
-        for dim in array_dims.into_iter().rev() {
-            result_type = TypeSpecifier::Array(Box::new(result_type), dim);
-        }
-        result_type
     }
 }
 

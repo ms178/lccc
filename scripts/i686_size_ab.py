@@ -13,7 +13,7 @@ delta is a code-generation delta.  Sizes come from the ELF section table
 
     scripts/i686_size_ab.py                       # tests/regression, -Os and -O2
     scripts/i686_size_ab.py --opt -Os --top 15
-    scripts/i686_size_ab.py --corpus 'arch/x86/boot/*.c' --kernel-dir /opt/kwork/linux-6.18.55
+    scripts/i686_size_ab.py --corpus 'arch/x86/boot/*.c' --kernel-dir ~/.cache/lccc/kernel-work/linux-6.18.58
 
 Environment / defaults:
     NEW   new compiler   (default <repo>/target/fastbuild/lccc)

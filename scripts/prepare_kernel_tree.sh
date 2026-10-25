@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================================
-# prepare_kernel_tree.sh — regenerate the patched linux-cachymod-6.18.55 tree
+# prepare_kernel_tree.sh — regenerate the patched linux-cachymod tree
+# (linux-$KVER, KVER derived from the package PKGBUILD)
 # used by build_kernel_boot.sh / build_kernel_vm.sh / realmode_corpus.sh.
 #
 # The persisted workspace snapshot is size-capped (~128 MiB / 10k files), so the
@@ -448,6 +449,21 @@ if ! tarball_ok; then
     SOURCE_MODE=git
     cd "$KDIR"
   fi
+fi
+
+# `auto` must COMMIT to the archive once it is verified.  The extraction block
+# below is guarded by `SOURCE_MODE == tarball` (git mode has already produced
+# its tree), so leaving the mode at `auto` after a successful verify/download
+# skipped extraction entirely: KDIR was never created, the `cd "$KDIR"` inside
+# that guard never ran, and the patch series executed in the *work* directory
+# instead.  The observable failure was `patch` asking
+# "File to patch: kernel/ksysfs.c" and the run dying 4 s after start — on a
+# fresh machine, which is exactly the situation this script exists for (a
+# prepared tree exits through the stamp fast-path long before this code).
+# Verification already happened above (xz -t + the PKGBUILD sha256), so this
+# is a mode decision, not a second integrity gate.
+if [[ $SOURCE_MODE != git ]] && tarball_ok; then
+  SOURCE_MODE=tarball
 fi
 
 # ---- 2. extract -------------------------------------------------------------

@@ -1,0 +1,52 @@
+id	expect	prefix	left	right
+fnptr_plain	1	-	void (*)(int)	void (*)(int)
+fnptr_param_names	1	-	void (*)(int)	void (*)(int p)
+fnptr_param_names_two	1	-	void (*)(int, char *)	void (*)(int a, char *b)
+fnptr_via_typedef	1	typedef void (*fnptr_int_t)(int);	void (*)(int)	fnptr_int_t
+fnptr_via_member	1	struct s { void (*f)(int); };	void (*)(int)	CC_TYPEOF_MEMBER
+fnptr_differs_void_ptr	0	-	void (*)(int)	void *
+fnptr_differs_return	0	-	void (*)(int)	void (*)(long)
+fnptr_fixed_vs_variadic	0	-	void (*)(int)	void (*)(int, ...)
+fnptr_fixed_vs_no_params	0	-	void (*)(int)	void (*)(void)
+fnptr_no_params_vs_void	1	-	void (*)()	void (*)(void)
+bare_fn_vs_pointer	0	-	void (int)	void (*)(int)
+bare_fn_self	1	-	void (int)	void (int)
+bare_fn_via_typeof	1	void f(int);	void (int)	CC_TYPEOF_F
+ptr_adds_space	0	-	int *	__seg_gs int *
+seg_same_space	1	-	__seg_gs int *	__seg_gs int *
+seg_nested_same	1	-	int * __seg_gs *	int * __seg_gs *
+seg_nested_vs_plain	0	-	int * __seg_gs *	int **
+array_vs_pointer	0	-	int [4]	int *
+array_unknown_bound	1	-	int []	int [8]
+char_signed_differs	0	-	char *	signed char *
+pointee_const_differs	0	-	const int *	int *
+pointee_volatile_differs	0	-	volatile int *	int *
+enum_underlying	1	enum e { E0 };	enum e	unsigned int
+struct_same_tag_same_fields	1	struct a { int x; };	struct a	struct a
+pointer_width_differs	0	-	int *	long *
+fnptr_nested_permutation	1	void (*(*p)(int))(char);	CC_TYPEOF_P	void (*(*)(int))(char)
+fnptr_nested_mismatch_outer	0	void (*(*p)(int))(char);	CC_TYPEOF_P	void (*(*)(int))(long)
+fnptr_nested_mismatch_inner	0	void (*(*p)(int))(char);	CC_TYPEOF_P	void (*(*)(long))(char)
+fnptr_nested_3level	1	int (*(*(*p)(int))(long))(char);	CC_TYPEOF_P	int (*(*(*)(int))(long))(char)
+fnptr_nested_3level_typedef	1	typedef int (*(*(*fp3_t)(int))(long))(char);	fp3_t	int (*(*(*)(int))(long))(char)
+fnptr_param_is_fptr_match	1	-	void (*)(void (*)(int))	void (*)(void (*)(int))
+fnptr_param_is_fptr_mismatch	0	-	void (*)(void (*)(int))	void (*)(void (*)(long))
+fnptr_param_is_nested_fptr	1	void f(int (*(*cb)(long))(char));	typeof(&f)	void (*)(int (*(*)(long))(char))
+fnptr_param_array_decay	1	-	void (*)(int[4])	void (*)(int *)
+fnptr_returning_array_ptr	1	int (*(*p)(int))[4];	CC_TYPEOF_P	int (*(*)(int))[4]
+fn_returning_array_ptr	1	int (*f(int))[4];	typeof(f(0))	int (*)[4]
+fn_returning_ptr_to_fptr	1	int (**f(int))(char);	typeof(f(0))	int (**)(char)
+array_of_nested_fptr	1	int (*(*p[3])(int))(char);	CC_TYPEOF_P	int (*(*[3])(int))(char)
+multidim_array_match	1	typedef int a24_t[2][4];	a24_t	int[2][4]
+multidim_array_transpose_diff	0	typedef int a24_t[2][4];	a24_t	int[4][2]
+const_expr_array_bound	1	enum { N = 2 + 2 };	int[N]	int[4]
+anon_struct_fptr_member	1	struct { void (*fp)(int); } s;	typeof(s.fp)	void (*)(int)
+stmt_expr_fptr_typeof	1	void target(int);	typeof(({ void (*fp)(int) = target; fp; }))	void (*)(int)
+seg_ptr_to_array_match	1	extern __seg_gs int ga[4];	typeof(&ga)	int __seg_gs (*)[4]
+seg_ptr_to_array_vs_plain	0	-	int (*)[4]	int __seg_gs (*)[4]
+seg_top_qual_ptr_to_array	1	-	int (*)[4]	int (* __seg_gs)[4]
+seg_nested_ptr_to_array_diff	0	-	int (**)[4]	int (* __seg_gs *)[4]
+seg_nested_ptr_to_array_match	1	typedef int (*pa_t)[4];	pa_t __seg_gs *	int (* __seg_gs *)[4]
+seg_array_of_ptrs_ptr_diff	0	-	int *(*)[4]	int * __seg_gs (*)[4]
+seg_fptr_ret_ptr_diff	0	-	int **(*)(void)	int * __seg_gs * (*)(void)
+seg_fptr_ret_ptr_match	1	typedef int * __seg_gs *gspp_t;	gspp_t (*)(void)	int * __seg_gs * (*)(void)

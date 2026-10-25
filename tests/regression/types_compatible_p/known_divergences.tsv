@@ -1,0 +1,2 @@
+id	prefix	left	right	lccc	oracle	cause	impact	fix_location
+# Currently 0 open divergences against GCC 16.2 (`fnptr_nested_permutation` promoted to `cases.tsv`).

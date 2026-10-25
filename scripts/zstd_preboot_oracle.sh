@@ -15,7 +15,13 @@
 # scripts/zstd_oracle_cc.sh.
 set -euo pipefail
 
-K=${KERNEL_DIR:-/home/user/kernel-work/linux-6.18.55}
+# Which kernel tree?  scripts/kernel_version.sh is the single source of truth
+# (explicit KERNEL_DIR/KVER > the prepared tree on disk > the package PKGBUILD
+# > a pinned fallback); the literal that used to live here went stale the
+# moment archpkgbuilds bumped 6.18.55 -> 6.18.58.
+# shellcheck source=kernel_version.sh
+. "$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/kernel_version.sh"
+K=${KERNEL_DIR:-$(lccc_kernel_default_dir)}
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 LCCC=${LCCC:-$REPO_ROOT/target/fastbuild/lccc}

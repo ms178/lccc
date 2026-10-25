@@ -40,18 +40,50 @@ pub fn collect_inline_asm_callee_saved(
 }
 
 /// Like `collect_inline_asm_callee_saved`, but triggers conservative marking
-/// of all callee-saved registers when any single inline asm has more generic GP
-/// register operands than the caller-saved scratch pool can hold. This avoids
-/// the overly conservative behavior of `_with_generic` (which marks all callee-saved
-/// for ANY generic "r" constraint, even if only 1 register is needed).
+/// of all callee-saved registers whenever an inline asm's worst-case GP scratch
+/// demand (including memory-operand address staging and register pairs) exceeds
+/// the remaining un-clobbered caller-saved GP scratch pool.
+#[allow(clippy::too_many_arguments)]
 pub fn collect_inline_asm_callee_saved_with_overflow(
     func: &IrFunction,
     used: &mut Vec<PhysReg>,
     constraint_to_phys: impl Fn(&str) -> Option<PhysReg>,
     clobber_to_phys: impl Fn(&str) -> Option<PhysReg>,
+    constraint_to_caller_scratch: impl Fn(&str) -> Option<usize>,
+    clobber_to_caller_scratch: impl Fn(&str) -> Option<usize>,
+    is_specific_non_scratch_constraint: impl Fn(&str) -> bool,
     all_callee_saved: &[PhysReg],
     caller_saved_scratch_count: usize,
 ) {
+    use crate::common::types::IrType;
+
+    fn is_non_gp_scratch_constraint(c: &str) -> bool {
+        !c.is_empty()
+            && c.chars().all(|ch| {
+                matches!(
+                    ch,
+                    'i' | 'n'
+                        | 'I'
+                        | 'J'
+                        | 'K'
+                        | 'L'
+                        | 'M'
+                        | 'N'
+                        | 'O'
+                        | 'e'
+                        | 'Z'
+                        | 's'
+                        | 'x'
+                        | 'v'
+                        | 'Y'
+                        | 'w'
+                        | 'f'
+                        | 't'
+                        | 'u'
+                )
+            })
+    }
+
     let mut already: FxHashSet<u8> = used.iter().map(|r| r.0).collect();
     for block in &func.blocks {
         for inst in &block.instructions {
@@ -59,41 +91,73 @@ pub fn collect_inline_asm_callee_saved_with_overflow(
                 outputs,
                 inputs,
                 clobbers,
+                operand_types,
                 ..
             } = inst
             {
-                // Count how many generic GP register operands this inline asm has.
-                // This approximates how many scratch registers will be needed.
-                // Note: "+" outputs create synthetic inputs too, but those are handled
-                // by finalize (not scratch alloc), so we only count non-plus outputs
-                // and non-synthetic inputs for the overflow check.
-                let mut generic_gp_count = 0usize;
-                let mut specific_claimed = 0usize;
-                let mut clobber_claimed = 0usize;
+                let mut generic_gp_demand = 0usize;
+                let mut claimed_caller_scratch: u64 = 0;
+                let mut force_callee_saved = false;
                 let num_plus = outputs.iter().filter(|(c, _, _)| c.contains('+')).count();
 
-                for (constraint, _, _) in outputs {
+                for (op_idx, (constraint, _, _)) in outputs.iter().enumerate() {
                     let c = constraint.trim_start_matches(['=', '+', '&', '%']);
+                    if c.starts_with("@cc")
+                        || (!c.is_empty() && c.chars().all(|ch| ch.is_ascii_digit()))
+                        || is_non_gp_scratch_constraint(c)
+                    {
+                        continue;
+                    }
                     if let Some(phys) = constraint_to_phys(c) {
                         if already.insert(phys.0) {
                             used.push(phys);
                         }
-                        specific_claimed += 1;
-                    } else if is_generic_gp_constraint(c) {
-                        generic_gp_count += 1;
+                    } else if let Some(slot) = constraint_to_caller_scratch(c) {
+                        if slot < 64 {
+                            claimed_caller_scratch |= 1u64 << slot;
+                        }
+                    } else if is_specific_non_scratch_constraint(c) || c.starts_with('{') {
+                        // Explicit non-scratch register (e.g. "a" / "{rax}")
+                    } else {
+                        if c.contains('Q') {
+                            // x86 "Q" draws from [rax, rbx, rcx, rdx], reaching callee-saved rbx directly.
+                            force_callee_saved = true;
+                        }
+                        let is_pair = matches!(
+                            operand_types.get(op_idx),
+                            Some(IrType::I128) | Some(IrType::U128)
+                        );
+                        generic_gp_demand += if is_pair { 2 } else { 1 };
                     }
                 }
                 for (idx, (constraint, _, _)) in inputs.iter().enumerate() {
+                    let op_idx = outputs.len() + idx;
                     let c = constraint.trim_start_matches(['=', '+', '&', '%']);
+                    if c.starts_with("@cc")
+                        || (!c.is_empty() && c.chars().all(|ch| ch.is_ascii_digit()))
+                        || is_non_gp_scratch_constraint(c)
+                    {
+                        continue;
+                    }
                     if let Some(phys) = constraint_to_phys(c) {
                         if already.insert(phys.0) {
                             used.push(phys);
                         }
-                        specific_claimed += 1;
-                    } else if idx >= num_plus && is_generic_gp_constraint(c) {
-                        // Only count non-synthetic inputs (synthetic "+" inputs
-                        // don't consume scratch registers)
-                        generic_gp_count += 1;
+                    } else if let Some(slot) = constraint_to_caller_scratch(c) {
+                        if slot < 64 {
+                            claimed_caller_scratch |= 1u64 << slot;
+                        }
+                    } else if is_specific_non_scratch_constraint(c) || c.starts_with('{') {
+                        // Explicit non-scratch register
+                    } else if idx >= num_plus {
+                        if c.contains('Q') {
+                            force_callee_saved = true;
+                        }
+                        let is_pair = matches!(
+                            operand_types.get(op_idx),
+                            Some(IrType::I128) | Some(IrType::U128)
+                        );
+                        generic_gp_demand += if is_pair { 2 } else { 1 };
                     }
                 }
                 for clobber in clobbers {
@@ -101,15 +165,16 @@ pub fn collect_inline_asm_callee_saved_with_overflow(
                         if already.insert(phys.0) {
                             used.push(phys);
                         }
-                        clobber_claimed += 1;
+                    }
+                    if let Some(slot) = clobber_to_caller_scratch(clobber.as_str()) {
+                        if slot < 64 {
+                            claimed_caller_scratch |= 1u64 << slot;
+                        }
                     }
                 }
-                // If generic GP operands exceed the available caller-saved scratch
-                // pool (after accounting for specific/clobber claims), the scratch
-                // allocator will overflow into callee-saved registers.
-                let available_scratch =
-                    caller_saved_scratch_count.saturating_sub(specific_claimed + clobber_claimed);
-                if generic_gp_count > available_scratch {
+                let available_scratch = caller_saved_scratch_count
+                    .saturating_sub(claimed_caller_scratch.count_ones() as usize);
+                if force_callee_saved || generic_gp_demand > available_scratch {
                     for &phys in all_callee_saved {
                         if already.insert(phys.0) {
                             used.push(phys);
@@ -299,12 +364,12 @@ pub fn collect_inline_asm_callee_saved_i686(
                 op_idx += 1;
             }
             for cl in clobbers {
-                let name = cl.trim_start_matches('%');
-                if (name == "ecx" || name == "cx") && !ecx_gone {
+                let name = crate::backend::inline_asm::normalize_inline_asm_reg_name(cl);
+                if matches!(name, "ecx" | "cx" | "cl" | "ch") && !ecx_gone {
                     ecx_gone = true;
                     avail -= 1;
                 }
-                if (name == "edx" || name == "dx") && !edx_gone {
+                if matches!(name, "edx" | "dx" | "dl" | "dh") && !edx_gone {
                     edx_gone = true;
                     avail -= 1;
                 }
@@ -323,6 +388,9 @@ pub fn collect_inline_asm_callee_saved_i686(
         // the proven-sufficient ecx/edx prefix.
         collect_inline_asm_callee_saved_inner(func, used, constraint_to_phys, clobber_to_phys, &[]);
     } else {
+        // Scratch demand (including memory-operand address staging) can overflow
+        // the ecx/edx caller-saved prefix into esi/edi/ebx, so mark all callee-saved
+        // registers even when no operand used a generic "r" letter (e.g. 3 "m" operands).
         collect_inline_asm_callee_saved_inner(
             func,
             used,
@@ -330,6 +398,12 @@ pub fn collect_inline_asm_callee_saved_i686(
             clobber_to_phys,
             all_callee_saved,
         );
+        let already: FxHashSet<u8> = used.iter().map(|r| r.0).collect();
+        for &phys in all_callee_saved {
+            if !already.contains(&phys.0) {
+                used.push(phys);
+            }
+        }
     }
 }
 
@@ -390,5 +464,115 @@ fn collect_inline_asm_callee_saved_inner(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::types::{AddressSpace, IrType};
+    use crate::ir::reexports::{BasicBlock, BlockId, Operand, Terminator, Value};
+
+    fn make_func_with_asm(inst: Instruction) -> IrFunction {
+        let mut func = IrFunction::new("test_asm".to_string(), IrType::I64, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![inst],
+            terminator: Terminator::Return(None),
+            source_spans: vec![],
+        });
+        func
+    }
+
+    #[test]
+    fn overflow_tracks_caller_saved_clobbers_and_mem_operands() {
+        let all_cs = [PhysReg(1), PhysReg(2), PhysReg(3), PhysReg(4), PhysReg(5)];
+        let caller_slot = |name: &str| match name {
+            "rcx" | "c" => Some(0),
+            "rdx" | "d" => Some(1),
+            "rsi" | "S" => Some(2),
+            "rdi" | "D" => Some(3),
+            "r8" => Some(4),
+            "r9" => Some(5),
+            "r10" => Some(6),
+            "r11" => Some(7),
+            _ => None,
+        };
+        // Common 2-operand asm with no caller-saved clobbers fits in 8 caller-saved regs.
+        let simple = make_func_with_asm(Instruction::InlineAsm {
+            template: "movq %1, %0".to_string(),
+            outputs: vec![("=r".to_string(), Value(0), None)],
+            inputs: vec![("r".to_string(), Operand::Value(Value(1)), None)],
+            clobbers: vec!["memory".to_string()],
+            operand_types: vec![IrType::I64, IrType::I64],
+            goto_labels: vec![],
+            input_symbols: vec![None],
+            seg_overrides: vec![AddressSpace::Default, AddressSpace::Default],
+        });
+        let mut used = Vec::new();
+        collect_inline_asm_callee_saved_with_overflow(
+            &simple,
+            &mut used,
+            |_| None,
+            |_| None,
+            caller_slot,
+            caller_slot,
+            |c| c == "a" || c == "A",
+            &all_cs,
+            8,
+        );
+        assert!(
+            used.is_empty(),
+            "simple 2-operand asm must not reserve callee-saved regs"
+        );
+
+        // Clobbering all 8 caller-saved scratch regs with a "+m" operand forces overflow.
+        let overflow = make_func_with_asm(Instruction::InlineAsm {
+            template: "incq %0".to_string(),
+            outputs: vec![("+m".to_string(), Value(0), None)],
+            inputs: vec![("m".to_string(), Operand::Value(Value(0)), None)],
+            clobbers: vec!["rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            operand_types: vec![IrType::I64, IrType::I64],
+            goto_labels: vec![],
+            input_symbols: vec![None],
+            seg_overrides: vec![AddressSpace::Default, AddressSpace::Default],
+        });
+        used.clear();
+        collect_inline_asm_callee_saved_with_overflow(
+            &overflow,
+            &mut used,
+            |_| None,
+            |_| None,
+            caller_slot,
+            caller_slot,
+            |c| c == "a" || c == "A",
+            &all_cs,
+            8,
+        );
+        assert_eq!(used, all_cs);
+    }
+
+    #[test]
+    fn i686_subreg_clobbers_and_mem_only_overflow_mark_callee_saved() {
+        let all_cs = [PhysReg(1), PhysReg(2), PhysReg(3)];
+        let mem_overflow = make_func_with_asm(Instruction::InlineAsm {
+            template: "movl $1, %0; movl $2, %1".to_string(),
+            outputs: vec![
+                ("=m".to_string(), Value(0), None),
+                ("=m".to_string(), Value(1), None),
+            ],
+            inputs: vec![],
+            clobbers: vec!["cl".to_string(), "dl".to_string()],
+            operand_types: vec![IrType::I32, IrType::I32],
+            goto_labels: vec![],
+            input_symbols: vec![],
+            seg_overrides: vec![AddressSpace::Default, AddressSpace::Default],
+        });
+        let mut used = Vec::new();
+        collect_inline_asm_callee_saved_i686(&mem_overflow, &mut used, |_| None, |_| None, &all_cs);
+        assert_eq!(used, all_cs);
     }
 }

@@ -35,38 +35,91 @@ pub struct FunctionTypedefInfo {
     pub variadic: bool,
 }
 
-/// Extract function pointer typedef info from a declarator with `FunctionPointer`
-/// derived declarators.
+/// Build the return `TypeSpecifier` encoded by `prefix` (the derived declarator
+/// slice preceding a function or function-pointer's own syntax-marker/parameter
+/// core), folding return-type `Pointer`, `Array`, and nested `(Pointer, FunctionPointer)`
+/// layers in inside-out order.
+pub fn build_prefix_return_type_spec(
+    base_type: &TypeSpecifier,
+    derived_full: &[DerivedDeclarator],
+    prefix_len: usize,
+) -> TypeSpecifier {
+    let prefix = &derived_full[..prefix_len];
+    let mut return_type = base_type.clone();
+    let mut i = 0;
+    while i < prefix.len() {
+        match &prefix[i] {
+            DerivedDeclarator::Pointer(_) => {
+                if let Some(DerivedDeclarator::FunctionPointer(params, variadic)) =
+                    prefix.get(i + 1)
+                {
+                    return_type = TypeSpecifier::FunctionPointer(
+                        Box::new(return_type),
+                        params.clone(),
+                        *variadic,
+                    );
+                    i += 2;
+                } else {
+                    return_type = TypeSpecifier::Pointer(
+                        Box::new(return_type),
+                        crate::common::type_builder::pointee_space_before(derived_full, i),
+                    );
+                    i += 1;
+                }
+            }
+            DerivedDeclarator::FunctionPointer(params, variadic) => {
+                return_type = TypeSpecifier::FunctionPointer(
+                    Box::new(return_type),
+                    params.clone(),
+                    *variadic,
+                );
+                i += 1;
+            }
+            DerivedDeclarator::Array(_) => {
+                let start = i;
+                while i < prefix.len() && matches!(&prefix[i], DerivedDeclarator::Array(_)) {
+                    i += 1;
+                }
+                for j in (start..i).rev() {
+                    if let DerivedDeclarator::Array(size_expr) = &prefix[j] {
+                        return_type =
+                            TypeSpecifier::Array(Box::new(return_type), size_expr.clone());
+                    }
+                }
+            }
+            DerivedDeclarator::Function(_, _) => {
+                i += 1;
+            }
+        }
+    }
+    return_type
+}
+
+/// Extract function pointer typedef info from a declarator whose outermost
+/// derived declarator is `FunctionPointer`.
 ///
-/// For typedefs like `typedef void *(*lua_Alloc)(void *, ...)`, finds the
-/// `FunctionPointer` derived and builds the return type. The last `Pointer` before
-/// `FunctionPointer` is the `(*)` indirection, not a return-type pointer.
+/// Handles simple (`typedef void *(*lua_Alloc)(void *, ...)`), nested
+/// (`typedef int (*(*(*fp3_t)(int))(long))(char)`), and pointer-to-array-returning
+/// (`typedef int (*(*fp_arr_t)(int))[4]`) function-pointer typedefs, while
+/// excluding function typedefs (`typedef void (*fn_t(int))(void)`), arrays of
+/// function pointers (`typedef int (*fps_t[4])(int)`), and pointers to function
+/// pointers (`typedef int (**fpp_t)(int)`).
 pub fn extract_fptr_typedef_info(
     base_type: &TypeSpecifier,
     derived: &[DerivedDeclarator],
 ) -> Option<FunctionTypedefInfo> {
-    // A FUNCTION type whose return type is a function pointer
-    // (`typedef void (*fn_t(int))(void);`) is not a function-pointer typedef.
-    if DerivedDeclarator::declares_function(derived) {
+    let Some(DerivedDeclarator::FunctionPointer(params, variadic)) = derived.last() else {
         return None;
-    }
-    let (params, variadic) = derived.iter().find_map(|d| {
-        if let DerivedDeclarator::FunctionPointer(p, v) = d {
-            Some((p, v))
-        } else {
-            None
-        }
-    })?;
-    let ptr_count_before_fptr = derived
-        .iter()
-        .take_while(|d| !matches!(d, DerivedDeclarator::FunctionPointer(_, _)))
-        .filter(|d| matches!(d, DerivedDeclarator::Pointer(_)))
-        .count();
-    let ret_ptr_count = ptr_count_before_fptr.saturating_sub(1);
-    let mut return_type = base_type.clone();
-    for _ in 0..ret_ptr_count {
-        return_type = TypeSpecifier::Pointer(Box::new(return_type), AddressSpace::Default);
-    }
+    };
+    // Strip the entity's own `FunctionPointer` and its preceding syntax-marker `Pointer`.
+    let prefix_len = if derived.len() >= 2
+        && matches!(derived[derived.len() - 2], DerivedDeclarator::Pointer(_))
+    {
+        derived.len() - 2
+    } else {
+        derived.len() - 1
+    };
+    let return_type = build_prefix_return_type_spec(base_type, derived, prefix_len);
     Some(FunctionTypedefInfo {
         return_type,
         params: params.clone(),

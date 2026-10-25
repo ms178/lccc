@@ -699,8 +699,9 @@ impl<'a> ExprTypeChecker<'a> {
     }
 
     /// Resolve a TypeSpecifier to a CType using sema's type context.
-    /// This delegates to the type_builder's shared conversion via TypeConvertContext.
-    fn resolve_type_spec(&self, spec: &TypeSpecifier) -> CType {
+    /// Shared with `SemaConstEval` so compile-time constant evaluation and
+    /// expression type checking always produce identical `CType`s.
+    pub(super) fn resolve_type_spec(&self, spec: &TypeSpecifier) -> CType {
         // Use a simple inline resolution for common cases to avoid the trait dispatch
         match spec {
             TypeSpecifier::Void => CType::Void,
@@ -1171,27 +1172,13 @@ impl<'a> ExprTypeChecker<'a> {
 
     /// Get the CType for a struct field declaration, accounting for derived declarators.
     fn resolve_field_ctype(&self, f: &StructFieldDecl) -> CType {
-        let mut ctype = self.resolve_type_spec(&f.type_spec);
-        // Space mapping follows pointee_space_before (see fold_simple_derived):
-        // the wrapper built at step i takes the space stored at derived[i-1].
-        let mut pending_space = AddressSpace::Default;
-        for derived in &f.derived {
-            match derived {
-                DerivedDeclarator::Pointer(space) => {
-                    ctype = CType::Pointer(Box::new(ctype), pending_space);
-                    pending_space = *space;
-                }
-                DerivedDeclarator::Array(Some(size_expr)) => {
-                    let size = self.eval_const_expr(size_expr).unwrap_or(0) as usize;
-                    ctype = CType::Array(Box::new(ctype), Some(size));
-                }
-                DerivedDeclarator::Array(None) => {
-                    ctype = CType::Array(Box::new(ctype), None);
-                }
-                _ => {} // Function/FunctionPointer not expected in struct fields
-            }
-        }
-        ctype
+        let base = self.resolve_type_spec(&f.type_spec);
+        crate::common::type_builder::build_full_ctype_with_callbacks(
+            base,
+            &f.derived,
+            &|ts| self.resolve_type_spec(ts),
+            &|e, _| self.eval_const_expr(e).map(|v| v as usize),
+        )
     }
 
     /// Return CType for known builtins.
@@ -1401,26 +1388,18 @@ impl<'a> ExprTypeChecker<'a> {
                     }
                     // Resolve this declaration's type, using the local scope
                     // for typeof expressions referencing earlier declarations.
-                    let mut ctype =
-                        self.resolve_type_spec_with_scope(&decl.type_spec, &local_scope);
-                    // pointee_space_before mapping (see fold_simple_derived).
-                    let mut pending_space = AddressSpace::Default;
-                    for derived in &declarator.derived {
-                        match derived {
-                            DerivedDeclarator::Pointer(space) => {
-                                ctype = CType::Pointer(Box::new(ctype), pending_space);
-                                pending_space = *space;
-                            }
-                            DerivedDeclarator::Array(Some(size_expr)) => {
-                                let size = self.eval_const_expr(size_expr).unwrap_or(0) as usize;
-                                ctype = CType::Array(Box::new(ctype), Some(size));
-                            }
-                            DerivedDeclarator::Array(None) => {
-                                ctype = CType::Array(Box::new(ctype), None);
-                            }
-                            _ => {} // Function/FunctionPointer not expected here
-                        }
-                    }
+                    let base = self.resolve_type_spec_with_scope(&decl.type_spec, &local_scope);
+                    let mut ctype = crate::common::type_builder::build_full_ctype_with_callbacks(
+                        base,
+                        &declarator.derived,
+                        &|ts| self.resolve_type_spec_with_scope(ts, &local_scope),
+                        &|e, _| self.eval_const_expr(e).map(|v| v as usize),
+                    );
+                    crate::common::type_builder::apply_declaration_address_space_for_object(
+                        &mut ctype,
+                        decl.address_space,
+                        &declarator.derived,
+                    );
                     if declarator.name == target_name {
                         return Some(ctype);
                     }
@@ -1453,26 +1432,18 @@ impl<'a> ExprTypeChecker<'a> {
                     if declarator.name.is_empty() {
                         continue;
                     }
-                    let mut ctype =
-                        self.resolve_type_spec_with_scope(&decl.type_spec, &local_scope);
-                    // pointee_space_before mapping (see fold_simple_derived).
-                    let mut pending_space = AddressSpace::Default;
-                    for derived in &declarator.derived {
-                        match derived {
-                            DerivedDeclarator::Pointer(space) => {
-                                ctype = CType::Pointer(Box::new(ctype), pending_space);
-                                pending_space = *space;
-                            }
-                            DerivedDeclarator::Array(Some(size_expr)) => {
-                                let size = self.eval_const_expr(size_expr).unwrap_or(0) as usize;
-                                ctype = CType::Array(Box::new(ctype), Some(size));
-                            }
-                            DerivedDeclarator::Array(None) => {
-                                ctype = CType::Array(Box::new(ctype), None);
-                            }
-                            _ => {}
-                        }
-                    }
+                    let base = self.resolve_type_spec_with_scope(&decl.type_spec, &local_scope);
+                    let mut ctype = crate::common::type_builder::build_full_ctype_with_callbacks(
+                        base,
+                        &declarator.derived,
+                        &|ts| self.resolve_type_spec_with_scope(ts, &local_scope),
+                        &|e, _| self.eval_const_expr(e).map(|v| v as usize),
+                    );
+                    crate::common::type_builder::apply_declaration_address_space_for_object(
+                        &mut ctype,
+                        decl.address_space,
+                        &declarator.derived,
+                    );
                     local_scope.insert(declarator.name.clone(), ctype);
                 }
             }

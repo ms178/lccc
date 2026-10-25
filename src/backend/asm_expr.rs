@@ -31,6 +31,158 @@ fn char_escape_value(esc: u8) -> i64 {
     }
 }
 
+/// Advance past a GAS character literal starting at `quote_idx` (`bytes[quote_idx] == b'\''`).
+///
+/// In GAS (`do_scrub_chars`), a character literal is `'X` or `'\X`, optionally
+/// closed by a trailing `'`. Because the literal is bounded to a single character
+/// (or escape pair), any `,`, `;`, `#`, `//`, `@`, or `(`/`)'` inside the literal
+/// is data rather than punctuation, and an unclosed `'x` never runs past that single character.
+pub fn skip_gas_char_literal(bytes: &[u8], quote_idx: usize) -> usize {
+    let mut i = quote_idx + 1;
+    if i < bytes.len() {
+        if bytes[i] == b'\\' {
+            i += 1;
+            if i < bytes.len() {
+                i += std::str::from_utf8(&bytes[i..])
+                    .ok()
+                    .and_then(|s| s.chars().next())
+                    .map_or(1, char::len_utf8);
+            }
+        } else {
+            i += std::str::from_utf8(&bytes[i..])
+                .ok()
+                .and_then(|s| s.chars().next())
+                .map_or(1, char::len_utf8);
+        }
+        if i < bytes.len() && bytes[i] == b'\'' {
+            i += 1;
+        }
+    }
+    i
+}
+
+/// Trim leading and trailing ASCII whitespace on an assembly line or operand
+/// slice while preserving the single payload whitespace byte of a trailing
+/// unclosed GAS character literal (`... ' ` or `... '\ `).
+pub fn trim_asm_line(s: &str) -> &str {
+    let s = s.trim_start();
+    if s.is_empty() {
+        return s;
+    }
+    let bytes = s.as_bytes();
+    let mut in_string = false;
+    let mut i = 0usize;
+    let mut keep_end = 0usize;
+    while i < bytes.len() {
+        if in_string {
+            if bytes[i] == b'\\' {
+                i += 1;
+                if i < bytes.len() {
+                    i += std::str::from_utf8(&bytes[i..])
+                        .ok()
+                        .and_then(|rest| rest.chars().next())
+                        .map_or(1, char::len_utf8);
+                }
+                keep_end = i;
+                continue;
+            }
+            if bytes[i] == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            keep_end = i;
+            continue;
+        }
+        match bytes[i] {
+            b'"' => {
+                in_string = true;
+                i += 1;
+                keep_end = i;
+            }
+            b'\'' => {
+                i = skip_gas_char_literal(bytes, i);
+                keep_end = i;
+            }
+            b if b.is_ascii_whitespace() => {
+                i += 1;
+            }
+            _ => {
+                i += std::str::from_utf8(&bytes[i..])
+                    .ok()
+                    .and_then(|rest| rest.chars().next())
+                    .map_or(1, char::len_utf8);
+                keep_end = i;
+            }
+        }
+    }
+    &s[..keep_end]
+}
+
+/// Trim ASCII whitespace around an assembler operand while preserving the
+/// payload whitespace byte of an unclosed GAS character literal (`' ` or `'\ `).
+pub fn trim_data_arg(s: &str) -> &str {
+    trim_asm_line(s)
+}
+
+/// Split a comma-separated assembler operand list on top-level commas,
+/// respecting `"..."` strings (with `\.` escapes), GAS character literals
+/// (`'c'` / `'\n'` / unclosed `'c`), and balanced parentheses `(...)`.
+pub fn split_comma_args(s: &str) -> Vec<&str> {
+    let bytes = s.as_bytes();
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    let mut in_string = false;
+    let mut paren_depth = 0i32;
+
+    while i < bytes.len() {
+        if in_string {
+            if bytes[i] == b'\\' {
+                i += 1;
+                if i < bytes.len() {
+                    i += std::str::from_utf8(&bytes[i..])
+                        .ok()
+                        .and_then(|rest| rest.chars().next())
+                        .map_or(1, char::len_utf8);
+                }
+                continue;
+            }
+            if bytes[i] == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        match bytes[i] {
+            b'"' => {
+                in_string = true;
+                i += 1;
+            }
+            b'\'' => {
+                i = skip_gas_char_literal(bytes, i);
+            }
+            b'(' => {
+                paren_depth += 1;
+                i += 1;
+            }
+            b')' => {
+                paren_depth = (paren_depth - 1).max(0);
+                i += 1;
+            }
+            b',' if paren_depth == 0 => {
+                parts.push(&s[start..i]);
+                i += 1;
+                start = i;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    parts.push(&s[start..]);
+    parts
+}
+
 /// Token type for the expression evaluator.
 #[derive(Debug)]
 enum ExprToken {
@@ -777,26 +929,13 @@ pub fn bare_integer_literal(bytes: &[u8]) -> Option<i64> {
 /// Supports decimal, hex (0x/0X), binary (0b/0B), octal (leading 0),
 /// and character literals ('c', '\n', etc.).
 fn parse_single_integer(s: &str) -> Result<i64, String> {
-    let s = s.trim();
+    let s = trim_data_arg(s);
     if s.is_empty() {
         return Err("empty integer".to_string());
     }
 
-    // Strip C integer suffixes (u/U/l/L/z/Z, incl. LL/ULL combos).
-    let s = {
-        let bytes = s.as_bytes();
-        let mut end = bytes.len();
-        while end > 0 && matches!(bytes[end - 1], b'u' | b'U' | b'l' | b'L' | b'z' | b'Z') {
-            end -= 1;
-        }
-        &s[..end]
-    };
-    if s.is_empty() {
-        return Err("integer has only a suffix".to_string());
-    }
-
-    // Character literal: 'c' or '\n' etc. Must be the entire string
-    // (e.g., "'!'" or "'\n'"), not part of a larger expression.
+    // Character literal: 'c', '\n', or unclosed GAS 'c (including 'u/'l/' ').
+    // Must run BEFORE C integer suffix stripping so `'u`/`'l`/`'z` aren't truncated.
     if s.starts_with('\'') {
         let bytes = s.as_bytes();
         let mut i = 1;
@@ -813,18 +952,31 @@ fn parse_single_integer(s: &str) -> Result<i64, String> {
             i += 1;
         } else {
             val = bytes[i] as i64;
-            i += 1;
+            i += std::str::from_utf8(&bytes[i..])
+                .ok()
+                .and_then(|rest| rest.chars().next())
+                .map_or(1, char::len_utf8);
         }
-        // Skip closing quote
         if i < bytes.len() && bytes[i] == b'\'' {
             i += 1;
         }
-        // Only accept if we consumed the whole string
         if i == bytes.len() {
             return Ok(val);
         }
-        // Otherwise, fall through to let tokenize_expr handle it as an expression
         return Err("character literal has trailing content".to_string());
+    }
+
+    // Strip C integer suffixes (u/U/l/L/z/Z, incl. LL/ULL combos).
+    let s = {
+        let bytes = s.as_bytes();
+        let mut end = bytes.len();
+        while end > 0 && matches!(bytes[end - 1], b'u' | b'U' | b'l' | b'L' | b'z' | b'Z') {
+            end -= 1;
+        }
+        &s[..end]
+    };
+    if s.is_empty() {
+        return Err("integer has only a suffix".to_string());
     }
 
     let (negative, s) = if let Some(rest) = s.strip_prefix('-') {
@@ -852,7 +1004,7 @@ fn parse_single_integer(s: &str) -> Result<i64, String> {
 /// Supports: |, ^, &, <<, >>, +, -, *, /, %, ~, parentheses.
 /// Falls back to simple integer parsing for plain numbers.
 pub fn parse_integer_expr(s: &str) -> Result<i64, String> {
-    let s = s.trim();
+    let s = trim_data_arg(s);
     if s.is_empty() {
         return Err("empty integer".to_string());
     }
@@ -1403,6 +1555,28 @@ mod tests {
                 .unwrap_err()
                 .to_message(),
             ".balign: fill `junk` is not an integer"
+        );
+    }
+
+    #[test]
+    fn gas_char_literals_split_and_eval_cleanly() {
+        let parts = split_comma_args("'A', ' ', ',', ';', '#', 'u, 'l, ' ");
+        let vals: Vec<i64> = parts
+            .into_iter()
+            .map(|p| parse_integer_expr(trim_data_arg(p)).unwrap())
+            .collect();
+        assert_eq!(
+            vals,
+            vec![
+                b'A' as i64,
+                b' ' as i64,
+                b',' as i64,
+                b';' as i64,
+                b'#' as i64,
+                b'u' as i64,
+                b'l' as i64,
+                b' ' as i64,
+            ]
         );
     }
 }

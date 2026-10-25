@@ -175,16 +175,22 @@ pub trait InlineAsmEmitter {
         false
     }
 
+    /// Last-resort scratch register when all non-excluded candidates are
+    /// exhausted and the constraint has no usable memory alternative.
+    fn fallback_scratch_reg(&mut self, _kind: &AsmOperandKind) -> String {
+        String::new()
+    }
+
     /// Resolve memory operand addresses that require indirection (non-alloca pointers).
-    /// `excluded` contains registers claimed by specific-register constraints,
-    /// used to avoid conflicts when allocating a temp register for the address.
+    /// Returns `Some(reg)` when a scratch register was allocated to hold the address,
+    /// so subsequent memory operands in the same inline asm add it to `busy_regs`.
     fn resolve_memory_operand(
         &mut self,
         _op: &mut AsmOperand,
         _val: &Operand,
         _excluded: &[String],
-    ) -> bool {
-        false
+    ) -> Option<String> {
+        None
     }
 
     /// Set up a memory operand for a register-to-memory fallback (e.g., "g" constraint
@@ -791,14 +797,41 @@ fn resolve_symbols_and_immediates(
     }
 }
 
+fn x86_32bit_alias_of_64bit(canonical_64: &str) -> Option<&'static str> {
+    match canonical_64 {
+        "rax" => Some("eax"),
+        "rbx" => Some("ebx"),
+        "rcx" => Some("ecx"),
+        "rdx" => Some("edx"),
+        "rsi" => Some("esi"),
+        "rdi" => Some("edi"),
+        _ => None,
+    }
+}
+
 /// Phase 1c: Collect registers excluded from scratch allocation (specific-register
 /// constraints and clobber registers).
 fn collect_excluded_registers(operands: &[AsmOperand], clobbers: &[String]) -> Vec<String> {
-    let mut specific_regs: Vec<String> = operands
-        .iter()
-        .filter(|op| matches!(op.kind, AsmOperandKind::Specific(_)))
-        .map(|op| op.reg.clone())
-        .collect();
+    let mut specific_regs: Vec<String> = Vec::new();
+    for op in operands {
+        if matches!(op.kind, AsmOperandKind::Specific(_)) {
+            for r in [&op.reg, &op.reg_hi] {
+                if !r.is_empty() && !specific_regs.iter().any(|s| s == r) {
+                    specific_regs.push(r.clone());
+                }
+                if let Some(canonical) = x86_normalize_reg_to_64bit(r) {
+                    if !specific_regs.iter().any(|s| s == canonical.as_ref()) {
+                        specific_regs.push(canonical.clone().into_owned());
+                    }
+                    if let Some(alias32) = x86_32bit_alias_of_64bit(&canonical) {
+                        if !specific_regs.iter().any(|s| s == alias32) {
+                            specific_regs.push(alias32.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     for clobber in clobbers {
         let clobber = normalize_inline_asm_reg_name(clobber);
@@ -845,8 +878,13 @@ fn collect_excluded_registers(operands: &[AsmOperand], clobbers: &[String]) -> V
                 }
             }
         }
-        // x86-64: normalize sub-register names to 64-bit canonical form
+        // x86-64 / i686: normalize sub-register names to 64-bit and 32-bit canonical forms
         if let Some(canonical) = x86_normalize_reg_to_64bit(clobber) {
+            if let Some(alias32) = x86_32bit_alias_of_64bit(&canonical) {
+                if !specific_regs.iter().any(|r| r == alias32) {
+                    specific_regs.push(alias32.to_string());
+                }
+            }
             let canonical = canonical.into_owned();
             if canonical != clobber && !specific_regs.iter().any(|r| r == &canonical) {
                 specific_regs.push(canonical);
@@ -1005,9 +1043,9 @@ fn assign_one_scratch(
                     return;
                 }
             }
-            let reg = emitter.assign_scratch_reg(kind, excluded);
+            let kind_clone = kind.clone();
+            let reg = emitter.assign_scratch_reg(&kind_clone, excluded);
             if reg.is_empty() && constraint_has_memory_alt(&operands[i].constraint) {
-                operands[i].kind = AsmOperandKind::Memory;
                 if i < outputs.len() {
                     let val = Operand::Value(outputs[i].1);
                     emitter.setup_memory_fallback(&mut operands[i], &val);
@@ -1016,14 +1054,31 @@ fn assign_one_scratch(
                     let val = inputs[input_idx].1;
                     emitter.setup_memory_fallback(&mut operands[i], &val);
                 }
+                if !operands[i].mem_addr.is_empty() || operands[i].mem_offset != 0 {
+                    operands[i].kind = AsmOperandKind::Memory;
+                } else {
+                    operands[i].reg = emitter.fallback_scratch_reg(&kind_clone);
+                }
             } else {
-                operands[i].reg = reg;
+                let assigned = if reg.is_empty() {
+                    emitter.fallback_scratch_reg(&kind_clone)
+                } else {
+                    reg
+                };
+                operands[i].reg = assigned;
                 // For 64-bit register pairs on 32-bit architectures (i686),
                 // allocate a second GP register for the high 32 bits.
-                if matches!(kind, AsmOperandKind::GpReg)
+                if matches!(kind_clone, AsmOperandKind::GpReg)
                     && emitter.needs_register_pair(operands[i].operand_type)
                 {
-                    let reg_hi = emitter.assign_scratch_reg(kind, excluded);
+                    let mut pair_excluded = excluded.to_vec();
+                    if !operands[i].reg.is_empty() && !pair_excluded.contains(&operands[i].reg) {
+                        pair_excluded.push(operands[i].reg.clone());
+                    }
+                    let mut reg_hi = emitter.assign_scratch_reg(&kind_clone, &pair_excluded);
+                    if reg_hi.is_empty() {
+                        reg_hi = emitter.fallback_scratch_reg(&kind_clone);
+                    }
                     operands[i].reg_hi = reg_hi;
                 }
             }
@@ -1080,11 +1135,51 @@ fn finalize_operands_and_build_gcc_map(
 ) -> (usize, Vec<usize>) {
     let total_operands = outputs.len() + inputs.len();
 
+    fn push_busy_reg(busy: &mut Vec<String>, reg: &str) {
+        if reg.is_empty() {
+            return;
+        }
+        if !busy.iter().any(|b| b == reg) {
+            busy.push(reg.to_string());
+        }
+        if let Some(canonical) = x86_normalize_reg_to_64bit(reg) {
+            if let Some(alias32) = x86_32bit_alias_of_64bit(&canonical) {
+                if !busy.iter().any(|b| b == alias32) {
+                    busy.push(alias32.to_string());
+                }
+            }
+            if !busy.iter().any(|b| b == canonical.as_ref()) {
+                busy.push(canonical.into_owned());
+            }
+        }
+    }
+
+    // Exclude every register already claimed by specific constraints, clobbers,
+    // or operand scratch allocations (including `reg_hi` register pairs), and
+    // dynamically append each scratch register allocated for `"m"` address staging
+    // so multiple memory operands never overwrite one another's base registers.
+    let mut busy_regs: Vec<String> = Vec::new();
+    for r in specific_regs {
+        push_busy_reg(&mut busy_regs, r);
+    }
+    for op in operands.iter() {
+        push_busy_reg(&mut busy_regs, &op.reg);
+        push_busy_reg(&mut busy_regs, &op.reg_hi);
+    }
+
     // Resolve memory operand addresses for outputs
     for (i, (_, ptr, _)) in outputs.iter().enumerate() {
         if matches!(operands[i].kind, AsmOperandKind::Memory) {
             let val = Operand::Value(*ptr);
-            emitter.resolve_memory_operand(&mut operands[i], &val, specific_regs);
+            if let Some(tmp_reg) =
+                emitter.resolve_memory_operand(&mut operands[i], &val, &busy_regs)
+            {
+                push_busy_reg(&mut busy_regs, &tmp_reg);
+            }
+            debug_assert!(
+                !operands[i].mem_addr.is_empty() || operands[i].mem_offset != 0,
+                "inline asm output memory operand {i} left unresolved"
+            );
         }
     }
 
@@ -1120,7 +1215,15 @@ fn finalize_operands_and_build_gcc_map(
         }
         let op_idx = outputs.len() + i;
         if matches!(operands[op_idx].kind, AsmOperandKind::Memory) {
-            emitter.resolve_memory_operand(&mut operands[op_idx], val, specific_regs);
+            if let Some(tmp_reg) =
+                emitter.resolve_memory_operand(&mut operands[op_idx], val, &busy_regs)
+            {
+                push_busy_reg(&mut busy_regs, &tmp_reg);
+            }
+            debug_assert!(
+                !operands[op_idx].mem_addr.is_empty() || operands[op_idx].mem_offset != 0,
+                "inline asm input memory operand {op_idx} left unresolved"
+            );
         }
     }
 

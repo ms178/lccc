@@ -527,6 +527,24 @@ impl Preprocessor {
         // Whether the open joined line may be split at all (not a directive).
         let mut splittable = false;
         let mut lines = source.lines().peekable();
+        // Keeping the physical break (the elision above) is sound only when the
+        // consumer is a C tokenizer, for which a newline is just white space.
+        // The assembly consumer is an *assembler*, where a newline terminates a
+        // statement: `arch/x86/boot/header.S` writes one PE Characteristics
+        // expression across four physical lines
+        //
+        //     .word IMAGE_FILE_EXECUTABLE_IMAGE | \
+        //           image_file_add_flags       | \
+        //           ...
+        //
+        // and GCC/clang both hand `as` a SINGLE joined line for `.S` input
+        // (`gcc -E -x assembler-with-cpp` — verified; `as` itself rejects the
+        // continuation form, so the splice is cpp's job, not as's).  With the
+        // break retained, the lccc assembler saw `.word 0x0002 |` and failed
+        // with "unsupported data expression", which is what blocked the kernel
+        // boot code.  Under `asm_mode` the splice is therefore always a real
+        // splice.
+        let may_keep_break = !self.macros.asm_mode;
         while let Some(line) = lines.next() {
             let bs_pos = Self::find_continuation_backslash(line);
             if let Some(pos) = bs_pos {
@@ -539,7 +557,8 @@ impl Preprocessor {
                 let boundary = pos == 0
                     || matches!(line.as_bytes()[pos - 1], b' ' | b'\t')
                     || matches!(next.first(), None | Some(b' ' | b'\t'));
-                if splittable
+                if may_keep_break
+                    && splittable
                     && boundary
                     && matches!(splice_state, SpliceState::Code | SpliceState::BlockComment)
                     && first_non_blank(next) != Some(b'#')

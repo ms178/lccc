@@ -35,7 +35,13 @@
 # ============================================================================
 set -euo pipefail
 
-K=${KERNEL_DIR:-/home/user/target/kernel-work/linux-6.18.55}
+# Which kernel tree?  scripts/kernel_version.sh is the single source of truth
+# (explicit KERNEL_DIR/KVER > the prepared tree on disk > the package PKGBUILD
+# > a pinned fallback); the literal that used to live here went stale the
+# moment archpkgbuilds bumped 6.18.55 -> 6.18.58.
+# shellcheck source=kernel_version.sh
+. "$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/kernel_version.sh"
+K=${KERNEL_DIR:-$(lccc_kernel_default_dir)}
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 LCCC=${LCCC:-$here/../target/fastbuild/lccc}
 LCCC_LD=${LCCC_LD:-$here/../target/fastbuild/lccc-ld}

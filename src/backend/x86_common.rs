@@ -5,6 +5,7 @@
 //! template parsing logic. This module provides shared free functions to
 //! avoid duplicating these across both backends.
 
+use crate::backend::inline_asm::{AsmOperand, AsmOperandKind};
 use crate::common::types::IrType;
 use crate::ir::reexports::BlockId;
 use std::borrow::Cow;
@@ -367,6 +368,32 @@ pub(crate) fn substitute_x86_asm_operands(
         }
     }
     result
+}
+
+/// Fail closed when a memory operand reaches template substitution without an
+/// address string.
+///
+/// `AsmOperand::mem_addr` is empty in two very different situations: "not
+/// resolved yet" (the normal state before phase 1f, and the permanent state for
+/// targets whose memory operands are printed from registers, e.g. arm/riscv)
+/// and "resolution failed". The x86 family prints the string verbatim, so the
+/// second case used to substitute nothing at all and hand the assembler a
+/// truncated instruction: Linux 6.18 mm/zsmalloc.c (`folio_trylock` ->
+/// `test_and_set_bit_lock` -> `GEN_BINARY_RMWcc`) produced
+/// `lock  btsq  $0,` and the assembler answered "expecting lockable
+/// instruction after `lock'". Both x86 backends call this immediately after
+/// phase 1f, where an empty address is always a bug.
+pub(crate) fn assert_memory_operands_resolved(operands: &[AsmOperand], arch: &str) {
+    for (i, op) in operands.iter().enumerate() {
+        assert!(
+            !matches!(op.kind, AsmOperandKind::Memory) || !op.mem_addr.is_empty(),
+            "{arch} inline asm: memory operand {i} (name {:?}, constraint {:?}) still has \
+             no address after operand resolution; substituting it would print an empty \
+             operand and emit a truncated instruction",
+            op.name,
+            op.constraint,
+        );
+    }
 }
 
 /// Emit a single operand with modifier — shared logic for `%n`, `%c`/`%P`,

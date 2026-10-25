@@ -42,7 +42,12 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
-DEFAULT_KERNEL = os.environ.get("KERNEL_DIR", "/home/user/target/kernel-work/linux-6.18.55")
+
+# The tree default is resolved, not spelled: scripts/kernel_version.sh owns the
+# answer (a literal here went stale on the 6.18.55 -> 6.18.58 bump).
+from lccc_paths import kernel_default_dir  # noqa: E402  (needs HERE on sys.path)
+
+DEFAULT_KERNEL = kernel_default_dir()
 
 # Sourced from boot_flags.sh rather than duplicated: the whole value of this
 # tool is that both arms see the identical command line.

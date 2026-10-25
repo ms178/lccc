@@ -73,6 +73,8 @@ impl InlineAsmEmitter for I686Codegen {
                 'd' if specific.is_none() => specific = Some("edx".to_string()),
                 'S' if specific.is_none() => specific = Some("esi".to_string()),
                 'D' if specific.is_none() => specific = Some("edi".to_string()),
+                // GCC "A" constraint on x86-32: edx:eax register pair (`reg` = eax, `reg_hi` = edx).
+                'A' if specific.is_none() => specific = Some("eax".to_string()),
                 _ => {}
             }
         }
@@ -93,6 +95,13 @@ impl InlineAsmEmitter for I686Codegen {
     }
 
     fn setup_operand_metadata(&self, op: &mut AsmOperand, val: &Operand, _is_output: bool) {
+        if op
+            .constraint
+            .trim_start_matches(['=', '+', '&', '%'])
+            .contains('A')
+        {
+            op.reg_hi = "edx".to_string();
+        }
         if matches!(op.kind, AsmOperandKind::Memory) {
             if let Operand::Value(v) = val {
                 if let Some(slot) = self.state.get_slot(v.0) {
@@ -115,23 +124,40 @@ impl InlineAsmEmitter for I686Codegen {
         }
     }
 
+    fn fallback_scratch_reg(&mut self, kind: &AsmOperandKind) -> String {
+        match kind {
+            AsmOperandKind::FpReg => "xmm0".to_string(),
+            _ => "ecx".to_string(),
+        }
+    }
+
     fn resolve_memory_operand(
         &mut self,
         op: &mut AsmOperand,
         val: &Operand,
         excluded: &[String],
-    ) -> bool {
+    ) -> Option<String> {
         if !op.mem_addr.is_empty() {
-            return false;
+            return None;
         }
         if let Some(ref sym) = op.imm_symbol {
             op.mem_addr = sym.clone();
-            return false;
+            return None;
         }
+        let alloc_gp_tmp = |this: &mut Self| -> String {
+            let mut r = this.assign_scratch_reg(&AsmOperandKind::GpReg, excluded);
+            if r.is_empty() {
+                r = this.fallback_scratch_reg(&AsmOperandKind::GpReg);
+            }
+            if r == "eax" {
+                this.state.reg_cache.invalidate_acc();
+            }
+            r
+        };
         match val {
             Operand::Value(v) => {
                 if let Some(slot) = self.state.get_slot(v.0) {
-                    let tmp_reg = self.assign_scratch_reg(&AsmOperandKind::GpReg, excluded);
+                    let tmp_reg = alloc_gp_tmp(self);
                     if self.state.is_alloca(v.0) {
                         let sr = self.slot_ref(slot);
                         if let Some(align) = self.state.alloca_over_align(v.0) {
@@ -141,24 +167,51 @@ impl InlineAsmEmitter for I686Codegen {
                         } else {
                             emit!(self.state, "    leal {}, %{}", sr, tmp_reg);
                         }
+                    } else if let Some(&phys) = self.reg_assignments.get(&v.0) {
+                        let src = super::emit::phys_reg_name(phys);
+                        if src != tmp_reg {
+                            emit!(self.state, "    movl %{}, %{}", src, tmp_reg);
+                        }
                     } else {
                         let sr = self.slot_ref(slot);
                         emit!(self.state, "    movl {}, %{}", sr, tmp_reg);
                     }
                     op.mem_addr = format!("(%{})", tmp_reg);
-                    return true;
+                    return Some(tmp_reg);
+                } else if let Some(&phys) = self.reg_assignments.get(&v.0) {
+                    let tmp_reg = alloc_gp_tmp(self);
+                    let src = super::emit::phys_reg_name(phys);
+                    if src != tmp_reg {
+                        emit!(self.state, "    movl %{}, %{}", src, tmp_reg);
+                    }
+                    op.mem_addr = format!("(%{})", tmp_reg);
+                    return Some(tmp_reg);
+                } else if self.state.reg_cache.acc_has(v.0, false) {
+                    let tmp_reg = alloc_gp_tmp(self);
+                    if tmp_reg != "eax" {
+                        emit!(self.state, "    movl %eax, %{}", tmp_reg);
+                    }
+                    op.mem_addr = format!("(%{})", tmp_reg);
+                    return Some(tmp_reg);
+                } else {
+                    assert!(
+                        !op.mem_addr.is_empty(),
+                        "i686 codegen: inline-asm memory operand value {} has neither \
+                         stack slot nor register assignment",
+                        v.0
+                    );
                 }
             }
             Operand::Const(c) => {
                 if let Some(addr) = c.to_i64() {
-                    let tmp_reg = self.assign_scratch_reg(&AsmOperandKind::GpReg, excluded);
+                    let tmp_reg = alloc_gp_tmp(self);
                     emit!(self.state, "    movl ${}, %{}", addr as i32, tmp_reg);
                     op.mem_addr = format!("(%{})", tmp_reg);
-                    return true;
+                    return Some(tmp_reg);
                 }
             }
         }
-        false
+        None
     }
 
     fn assign_scratch_reg(&mut self, kind: &AsmOperandKind, excluded: &[String]) -> String {
@@ -169,14 +222,12 @@ impl InlineAsmEmitter for I686Codegen {
                 let idx = self.asm_xmm_scratch_idx;
                 self.asm_xmm_scratch_idx += 1;
                 if idx >= I686_XMM_SCRATCH.len() {
-                    // All 8 XMM registers exhausted; wrap around and pick
-                    // the first non-excluded register for reuse.
                     for r in I686_XMM_SCRATCH {
                         if !excluded.iter().any(|e| e == *r) {
                             return r.to_string();
                         }
                     }
-                    return "xmm0".to_string();
+                    return String::new();
                 }
                 let reg = I686_XMM_SCRATCH[idx].to_string();
                 if !excluded.iter().any(|e| e == &reg) {
@@ -184,23 +235,27 @@ impl InlineAsmEmitter for I686Codegen {
                 }
             }
         } else {
-            // All GP registers on i686 (including caller-saved)
+            // Prefer GP registers that are NOT live RA homes (`esi/edi/ebx`) first;
+            // only touch RA-assigned callee-saved registers on a second pass if
+            // all unallocated candidates are excluded (note that `collect_inline_asm_callee_saved_i686`
+            // already withholds `esi/edi/ebx` from RA whenever scratch demand > avail).
             const ALL_GP: &[&str] = &["ecx", "edx", "esi", "edi", "eax", "ebx"];
-            for _ in 0..ALL_GP.len() {
+            while self.asm_scratch_idx < ALL_GP.len() * 2 {
                 let idx = self.asm_scratch_idx;
                 self.asm_scratch_idx += 1;
-                let reg = if idx < ALL_GP.len() {
-                    ALL_GP[idx].to_string()
-                } else {
-                    // All registers exhausted — return empty to signal spill-to-memory.
-                    // The caller (emit_inline_asm_common_impl) will detect the empty
-                    // string and fall back to a memory operand for constraints like "g"
-                    // that have a memory alternative.
-                    return String::new();
-                };
-                if !excluded.iter().any(|e| e == &reg) {
-                    return reg;
+                let allow_ra_home = idx >= ALL_GP.len();
+                let reg_name = ALL_GP[idx % ALL_GP.len()];
+                if excluded.iter().any(|e| e == reg_name) {
+                    continue;
                 }
+                let in_ra = self
+                    .reg_assignments
+                    .values()
+                    .any(|&p| super::emit::phys_reg_name(p) == reg_name);
+                if in_ra != allow_ra_home {
+                    continue;
+                }
+                return reg_name.to_string();
             }
             // All registers excluded — return empty to signal spill-to-memory.
             String::new()
@@ -505,6 +560,7 @@ impl InlineAsmEmitter for I686Codegen {
         operand_types: &[IrType],
         goto_labels: &[(String, BlockId)],
     ) -> String {
+        crate::backend::x86_common::assert_memory_operands_resolved(operands, "i686");
         let op_regs: Vec<String> = operands.iter().map(|o| o.reg.clone()).collect();
         let op_names: Vec<Option<String>> = operands.iter().map(|o| o.name.clone()).collect();
         let op_is_memory: Vec<bool> = operands

@@ -37,6 +37,10 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 
+# Sibling module: `python3 scripts/boot_ab_size.py` puts this directory on
+# sys.path, which is how the rest of the tooling imports its helpers.
+from lccc_paths import kernel_default_dir  # noqa: E402  (needs HERE on sys.path)
+
 
 def boot_flags(kernel: Path) -> tuple[list[str], list[str]]:
     out = subprocess.run(
@@ -90,7 +94,7 @@ def compile_arm(cc: str, cflags: list[str], cppflags: list[str], files: list[str
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--kernel", default=os.environ.get("KERNEL_DIR", "/opt/kwork/linux-6.18.55"))
+    ap.add_argument("--kernel", default=kernel_default_dir())
     ap.add_argument("--a", required=True, help="baseline lccc binary")
     ap.add_argument("--b", required=True, help="candidate lccc binary")
     ap.add_argument("--a-env", default="", help="KEY=V[,KEY=V] for arm A")

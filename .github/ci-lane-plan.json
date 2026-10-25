@@ -1169,7 +1169,7 @@
     "frontend-b": {
       "group": "frontend",
       "mode": "steps",
-      "predicted_gate_seconds": 345.07,
+      "predicted_gate_seconds": 348.59,
       "shards": 2,
       "steps": [
         {
@@ -1407,6 +1407,30 @@
         {
           "measured_s": 2.72,
           "name": "Incoming MEMORY parameter homes and cross-compiler ABI"
+        },
+        {
+          "measured_s": 0.34,
+          "name": "Named-space pointer declarator levels"
+        },
+        {
+          "measured_s": 0.44,
+          "name": "Inline-asm memory operands always carry an address"
+        },
+        {
+          "measured_s": 1.3,
+          "name": "__builtin_types_compatible_p answers about the type"
+        },
+        {
+          "measured_s": 0.92,
+          "name": "Compound literal as a designated aggregate element"
+        },
+        {
+          "measured_s": 0.18,
+          "name": "GAS character literals and quoted macro defaults across assemblers"
+        },
+        {
+          "measured_s": 0.34,
+          "name": "Debug knobs are neutral"
         }
       ]
     }

@@ -670,6 +670,7 @@ impl Lowerer {
         let esz = geo.elem_size();
         for (flat, init) in plan.iter() {
             let at = offset + flat * esz;
+            Self::clear_bytes_and_ptrs(bytes, ptr_ranges, at, esz);
             let value = match (self.plan_elem_const(init, geo), init) {
                 (Some(c), _) => Some(c),
                 (None, ElemInit::Expr(e)) => {
