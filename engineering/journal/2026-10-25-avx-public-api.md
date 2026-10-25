@@ -93,3 +93,14 @@ it through the existing failure reporter. Preserve installer annotations when
 capturing driver paths, and surface GAS configure/build logs on failure. The
 intrinsic feature step now uses the same reporter. Neither wrapper changes
 acceptance criteria or bypasses a failed command.
+
+Hosted fast-contract annotations exposed two source-inventory regressions:
+the strict enum scanner did not recognize qualified Rust payload paths, and
+an old header substring expected VTEST's return type to touch the function
+name despite its new intervening target attribute. Extend only the scanner's
+payload type grammar to qualified identifier paths, retain fail-closed store
+payload checks, and add malformed-path/generic-payload mutation controls.
+Replace the single outdated VTEST substring with independent exact contracts
+for all twelve signatures, AVX-only target attributes, private prototypes and
+dispatches. The targeted inventory and header suites pass locally; no full
+local CI was run.
