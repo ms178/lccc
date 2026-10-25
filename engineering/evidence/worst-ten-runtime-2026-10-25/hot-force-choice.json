@@ -1,0 +1,396 @@
+{
+  "scope": "forced compiler layout experiment, not selected default",
+  "raw": [
+    {
+      "order": [
+        "clang",
+        "force",
+        "before"
+      ],
+      "seconds": {
+        "clang": 0.07328319399994143,
+        "force": 0.07238555699996141,
+        "before": 0.10014794999960941
+      }
+    },
+    {
+      "order": [
+        "force",
+        "clang",
+        "before"
+      ],
+      "seconds": {
+        "force": 0.07461132999969777,
+        "clang": 0.06717273100002785,
+        "before": 0.10916235299964683
+      }
+    },
+    {
+      "order": [
+        "force",
+        "clang",
+        "before"
+      ],
+      "seconds": {
+        "force": 0.08139911699981894,
+        "clang": 0.07692810800017469,
+        "before": 0.09838888200010842
+      }
+    },
+    {
+      "order": [
+        "force",
+        "before",
+        "clang"
+      ],
+      "seconds": {
+        "force": 0.07162408999965919,
+        "before": 0.09825671600037822,
+        "clang": 0.06610204199978398
+      }
+    },
+    {
+      "order": [
+        "before",
+        "clang",
+        "force"
+      ],
+      "seconds": {
+        "before": 0.09848754999984521,
+        "clang": 0.06848139900012029,
+        "force": 0.07468095900003391
+      }
+    },
+    {
+      "order": [
+        "force",
+        "clang",
+        "before"
+      ],
+      "seconds": {
+        "force": 0.07295094399978552,
+        "clang": 0.06681745100013359,
+        "before": 0.09824110999988989
+      }
+    },
+    {
+      "order": [
+        "clang",
+        "before",
+        "force"
+      ],
+      "seconds": {
+        "clang": 0.06804163299966604,
+        "before": 0.09869195900000705,
+        "force": 0.07550473499986765
+      }
+    },
+    {
+      "order": [
+        "force",
+        "clang",
+        "before"
+      ],
+      "seconds": {
+        "force": 0.0726147239997772,
+        "clang": 0.06709812700000839,
+        "before": 0.10136651799984975
+      }
+    },
+    {
+      "order": [
+        "before",
+        "clang",
+        "force"
+      ],
+      "seconds": {
+        "before": 0.1019226820003496,
+        "clang": 0.06672733299956235,
+        "force": 0.0731957150001108
+      }
+    },
+    {
+      "order": [
+        "before",
+        "clang",
+        "force"
+      ],
+      "seconds": {
+        "before": 0.09912557200004812,
+        "clang": 0.06710148000001936,
+        "force": 0.07197532200007117
+      }
+    },
+    {
+      "order": [
+        "force",
+        "before",
+        "clang"
+      ],
+      "seconds": {
+        "force": 0.07265902600011032,
+        "before": 0.09428294099961931,
+        "clang": 0.0675842969999394
+      }
+    },
+    {
+      "order": [
+        "before",
+        "clang",
+        "force"
+      ],
+      "seconds": {
+        "before": 0.09935900100026629,
+        "clang": 0.06857798999999432,
+        "force": 0.0734039149997443
+      }
+    },
+    {
+      "order": [
+        "force",
+        "clang",
+        "before"
+      ],
+      "seconds": {
+        "force": 0.07680739499983247,
+        "clang": 0.0669099719998485,
+        "before": 0.10149531199976991
+      }
+    },
+    {
+      "order": [
+        "force",
+        "before",
+        "clang"
+      ],
+      "seconds": {
+        "force": 0.0729200620003212,
+        "before": 0.09820317899993825,
+        "clang": 0.06866855299995223
+      }
+    },
+    {
+      "order": [
+        "before",
+        "clang",
+        "force"
+      ],
+      "seconds": {
+        "before": 0.10151518700013185,
+        "clang": 0.07543565300011323,
+        "force": 0.07594257700020535
+      }
+    },
+    {
+      "order": [
+        "before",
+        "force",
+        "clang"
+      ],
+      "seconds": {
+        "before": 0.09965264999982537,
+        "force": 0.07277618800026175,
+        "clang": 0.07598380600029486
+      }
+    },
+    {
+      "order": [
+        "force",
+        "before",
+        "clang"
+      ],
+      "seconds": {
+        "force": 0.07770598600018275,
+        "before": 0.10077743600004396,
+        "clang": 0.06808092900018892
+      }
+    },
+    {
+      "order": [
+        "before",
+        "force",
+        "clang"
+      ],
+      "seconds": {
+        "before": 0.09991880500001571,
+        "force": 0.07335792200001379,
+        "clang": 0.06891629699975965
+      }
+    },
+    {
+      "order": [
+        "force",
+        "before",
+        "clang"
+      ],
+      "seconds": {
+        "force": 0.07332414600023185,
+        "before": 0.10036648000004789,
+        "clang": 0.06916342700014866
+      }
+    },
+    {
+      "order": [
+        "force",
+        "before",
+        "clang"
+      ],
+      "seconds": {
+        "force": 0.07548754099980215,
+        "before": 0.10139945599985367,
+        "clang": 0.07434051100017314
+      }
+    },
+    {
+      "order": [
+        "clang",
+        "force",
+        "before"
+      ],
+      "seconds": {
+        "clang": 0.07600871300019207,
+        "force": 0.07336104199976035,
+        "before": 0.09895779600037713
+      }
+    },
+    {
+      "order": [
+        "before",
+        "clang",
+        "force"
+      ],
+      "seconds": {
+        "before": 0.10049642500007394,
+        "clang": 0.06649648100028571,
+        "force": 0.07201702500015017
+      }
+    },
+    {
+      "order": [
+        "force",
+        "clang",
+        "before"
+      ],
+      "seconds": {
+        "force": 0.07348742599970137,
+        "clang": 0.06650387200033947,
+        "before": 0.10037082799999553
+      }
+    },
+    {
+      "order": [
+        "clang",
+        "force",
+        "before"
+      ],
+      "seconds": {
+        "clang": 0.06880494300003193,
+        "force": 0.07349318999968091,
+        "before": 0.1030257200000051
+      }
+    },
+    {
+      "order": [
+        "before",
+        "clang",
+        "force"
+      ],
+      "seconds": {
+        "before": 0.10171343799993338,
+        "clang": 0.069092174999696,
+        "force": 0.08278045500037479
+      }
+    },
+    {
+      "order": [
+        "force",
+        "clang",
+        "before"
+      ],
+      "seconds": {
+        "force": 0.08249305400022422,
+        "clang": 0.07858041000008598,
+        "before": 0.10118212200040944
+      }
+    },
+    {
+      "order": [
+        "clang",
+        "before",
+        "force"
+      ],
+      "seconds": {
+        "clang": 0.06982670700017479,
+        "before": 0.0989192050001293,
+        "force": 0.07386762899977839
+      }
+    },
+    {
+      "order": [
+        "before",
+        "clang",
+        "force"
+      ],
+      "seconds": {
+        "before": 0.09978456900034871,
+        "clang": 0.0690640389998407,
+        "force": 0.07325962799995978
+      }
+    },
+    {
+      "order": [
+        "force",
+        "clang",
+        "before"
+      ],
+      "seconds": {
+        "force": 0.07631212500018592,
+        "clang": 0.06835546999991493,
+        "before": 0.09940052499996455
+      }
+    },
+    {
+      "order": [
+        "force",
+        "before",
+        "clang"
+      ],
+      "seconds": {
+        "force": 0.07313079599998673,
+        "before": 0.10244025099973442,
+        "clang": 0.07798109399982422
+      }
+    },
+    {
+      "order": [
+        "clang",
+        "before",
+        "force"
+      ],
+      "seconds": {
+        "clang": 0.06992483100020763,
+        "before": 0.10018413699981465,
+        "force": 0.07470449299989923
+      }
+    }
+  ],
+  "medians": {
+    "before": 0.10014794999960941,
+    "force": 0.0734039149997443,
+    "clang": 0.06866855299995223
+  },
+  "force/before": {
+    "median": 0.7413366603221515,
+    "ci95": [
+      0.7305640887295924,
+      0.7467470952650888
+    ]
+  },
+  "clang/before": {
+    "median": 0.6897229905796893,
+    "ci95": [
+      0.679282662726839,
+      0.6992497971984737
+    ]
+  }
+}
