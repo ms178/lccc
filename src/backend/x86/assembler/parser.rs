@@ -1451,12 +1451,12 @@ fn parse_symver_directive(args: &str) -> Result<AsmItem, String> {
 /// Words the assembler treats as leading instruction prefixes (HLE hints
 /// `xacquire`/`xrelease` included: they only ever appear prefix-stacked).
 /// `addr16`/`addr32`/`data16`/`data32` are the GAS spellings of the
-/// address-/operand-size overrides as standalone words, and `rex`/`rex.x`/
-/// `rex64` force explicit legacy REX bits (64-bit mode only; GAS documents
-/// `rex64xyz` as the bitwise prefix family).
-const INSN_PREFIXES: [&str; 22] = [
+/// address-/operand-size overrides as standalone words, and `rex`/`rex.x`
+/// force an explicit legacy REX byte (64-bit mode only; GAS 2.47 rejects
+/// the `.y/.xy/.z` spellings entirely).
+const INSN_PREFIXES: [&str; 21] = [
     "lock", "rep", "repz", "repe", "repnz", "repne", "notrack", "cs", "ds", "es", "ss", "fs", "gs",
-    "xacquire", "xrelease", "addr16", "addr32", "data16", "data32", "rex", "rex.x", "rex64",
+    "xacquire", "xrelease", "addr16", "addr32", "data16", "data32", "rex", "rex.x",
 ];
 
 fn is_prefixed_instruction(rest: &str) -> bool {

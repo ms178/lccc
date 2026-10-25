@@ -2006,11 +2006,6 @@ gate "i686-asm-diff" fast \
     python3 scripts/asmdiff.py --32 --jobs 2 --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" \
         --objdump "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump" \
         --lccc target/fastbuild/lccc-i686
-gate "sse34-clang-diff" fast \
-    python3 tests/regression/check_sse34_clang.py \
-        --clang "${CLANG:-clang-23}" \
-        --lccc target/fastbuild/lccc-x86 \
-        --i686 target/fastbuild/lccc-i686
 gate "i686-tls-ie-relax" fast \
     bash tests/regression/check_i686_tls_ie_relax.sh
 

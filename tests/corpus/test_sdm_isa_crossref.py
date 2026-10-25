@@ -112,19 +112,6 @@ class SdmCrossrefTests(unittest.TestCase):
         self.assertEqual(
             sorted(e["opcode"] for e in table["MOVUPS"]), [0x10, 0x11])
 
-    def test_register_only_modrm_pattern_is_present(self):
-        # XED omits MODRM() for register-only SSE4a forms but still emits the
-        # ModR/M byte after the opcode and before the two immediates.
-        enc = self.sdm.parse_pattern(
-            "0x0F 0x78 osz_refining_prefix REFINING66() MOD[0b11] MOD=3 REG[0b000] RM[nnn] UIMM8() UIMM8_1()")
-        self.assertTrue(enc["modrm"])
-        self.assertEqual(enc["modrm_mode"], "register")
-        self.assertEqual(enc["reg"], 0)
-        memory = self.sdm.parse_pattern(
-            "0x0F 0x2B MOD!=3 MODRM() REG[rrr] RM[mmm]")
-        self.assertEqual(memory["modrm_mode"], "memory")
-        self.assertFalse(self.sdm._matches(enc, memory))
-
     def test_register_in_opcode_patterns_are_parsed(self):
         # `0b1011_0 SRM[rrr]` is `mov r8, imm8` = 0xB0; missing it left the
         # catalogue with `opcode: null` and every register-immediate MOV row

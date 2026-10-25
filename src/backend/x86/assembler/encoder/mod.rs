@@ -13,8 +13,6 @@ mod gp_integer;
 mod promoted;
 mod registers;
 mod sse;
-mod sse34;
-pub(crate) use sse34::check_sse34_operands;
 mod system;
 mod x87_misc;
 mod xop;
@@ -993,7 +991,6 @@ impl InstructionEncoder {
                 "data32" => return Err("`data32' is not supported in 64-bit mode".to_string()),
                 "rex" => rex_floor |= 0x40,
                 "rex.x" => rex_floor |= 0x42,
-                "rex64" => rex_floor |= 0x48,
                 _ => {}
             }
         }
@@ -1100,7 +1097,7 @@ impl InstructionEncoder {
                 // addr32 0x67 byte is appended to seg_pre AFTER the loop
                 // so segment overrides always precede it (GAS:
                 // `fs addr32 mov %eax,(%ebx)' = 64 67 89 03).
-                "addr32" | "data16" | "rex" | "rex.x" | "rex64" => {}
+                "addr32" | "data16" | "rex" | "rex.x" => {}
                 // Segment overrides used as standalone prefixes. The kernel's
                 // `ds wrmsr` relies on the byte being emitted so an
                 // ALTERNATIVE can patch the instruction in place.
@@ -1799,12 +1796,14 @@ impl InstructionEncoder {
             "vpackusdw" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x2B)),
             "vpmaddubsw" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x04)),
             "vpshufb" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x00)),
-            // SSSE3 horizontal add/sub and sign instructions have VEX/legacy
-            // encodings but no EVEX encodings in the pinned GAS 2.47 opcode
-            // table. Do not add them here: letting them fall through reaches
-            // the VEX encoder, which rejects ZMM operands instead of emitting
-            // an architecturally undefined EVEX opcode.
+            "vpsignb" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x08)),
+            "vpsignw" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x09)),
+            "vpsignd" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x0A)),
             "vpmulhrsw" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x0B)),
+            "vphaddw" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x01)),
+            "vphaddd" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x02)),
+            "vphsubw" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x05)),
+            "vphsubd" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x06)),
             // AVX-VNNI / AVX-VNNI-INT8 (EVEX.NDS.512.66.0F38)
             "vpdpbusd" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x50)),
             "vpdpbusds" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x51)),
@@ -3421,7 +3420,6 @@ impl InstructionEncoder {
         let suffixed = infer_suffix(&mnemonic_raw, &instr.operands);
         let mnemonic = suffixed.as_str();
         let ops = &instr.operands;
-        check_sse34_operands(mnemonic, ops, true)?;
 
         // Validate role-specific widths before either forced or automatic
         // EVEX dispatch can reinterpret malformed register names.
@@ -4373,7 +4371,6 @@ impl InstructionEncoder {
             "pmaddubsw" => self.encode_sse_op_38(ops, 0x04),
             "phaddw" => self.encode_sse_op_38(ops, 0x01),
             "phaddd" => self.encode_sse_op_38(ops, 0x02),
-            "phaddsw" => self.encode_sse_op_38(ops, 0x03),
             "pabsb" => self.encode_sse_op_38(ops, 0x1C),
             "pabsw" => self.encode_sse_op_38(ops, 0x1D),
             "pabsd" => self.encode_sse_op_38(ops, 0x1E),
@@ -4509,24 +4506,10 @@ impl InstructionEncoder {
             "crc32q" => self.encode_crc32(ops, 8),
             // Suffix-less crc32: source register width decides the form
             // (kernel crc32c-3way.S writes `crc32 %rax, %rdi`).
-            "pcmpestrm" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x60]),
-            "pcmpestri" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x61]),
-            "pcmpistrm" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x62]),
-            "pcmpistri" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x63]),
-            "extrq" => self.encode_sse4a_bits(ops, false),
-            "insertq" => self.encode_sse4a_bits(ops, true),
-            "movntsd" => self.encode_sse_store(ops, &[0xF2, 0x0F, 0x2B]),
-            "movntss" => self.encode_sse_store(ops, &[0xF3, 0x0F, 0x2B]),
             "crc32" => {
-                // Register source width is explicit; for memory, infer from
-                // the accumulator/result register rather than defaulting to
-                // an eight-byte read (GAS's suffix-less source form).
                 let size = match ops.first() {
                     Some(Operand::Register(r)) => infer_reg_size(&r.name),
-                    _ => match ops.last() {
-                        Some(Operand::Register(r)) => infer_reg_size(&r.name),
-                        _ => 4,
-                    },
+                    _ => 8,
                 };
                 self.encode_crc32(ops, size)
             }
@@ -5068,7 +5051,6 @@ impl InstructionEncoder {
             "psignd" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x0A]),
             "phsubw" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x05]),
             "phsubd" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x06]),
-            "phsubsw" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x07]),
             "pmulhrsw" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x0B]),
 
             // ---- AVX instructions (VEX-encoded) ----
