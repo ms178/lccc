@@ -1,6 +1,9 @@
 name: Targeted compiler research
 
 on:
+  pull_request:
+    branches: [main]
+    paths: ['.github/workflows/compiler-research.yml']
   workflow_dispatch:
     inputs:
       baseline_ref:
@@ -8,7 +11,7 @@ on:
         required: true
         default: main
       cases:
-        description: Comma-separated canonical workloads (empty selects the full corpus)
+        description: Comma-separated canonical workloads (all selects the full corpus)
         required: false
         default: "nbody,hot_web_loop,byte_load_reassembly,expat_siphash24,double_reduction,spectral_norm,matmul,binary_trees,expat_xml_scan,zstd_count,f32_sse1_map,fp32_product_map"
       rounds:
@@ -25,7 +28,7 @@ concurrency:
 
 jobs:
   evidence:
-    # Explicit research only: no duplicated compiler builds on ordinary PRs.
+    # Opt-in research: manual, or a PR explicitly changing this definition.
     name: Same-host portable/native runtime and Callgrind
     runs-on: ubuntu-24.04
     timeout-minutes: 90
@@ -33,9 +36,9 @@ jobs:
       RUSTUP_TOOLCHAIN: stable
       CARGO_BUILD_JOBS: "2"
       RUSTFLAGS: -D warnings
-      BASELINE_REF: ${{ inputs.baseline_ref || 'main' }}
-      RESEARCH_CASES: ${{ inputs.cases }}
-      RESEARCH_ROUNDS: ${{ inputs.rounds }}
+      BASELINE_REF: ${{ inputs.baseline_ref || github.event.pull_request.base.sha || 'main' }}
+      RESEARCH_CASES: ${{ inputs.cases || 'nbody,hot_web_loop,byte_load_reassembly,expat_siphash24,double_reduction,spectral_norm,matmul,binary_trees,expat_xml_scan,zstd_count,f32_sse1_map,fp32_product_map' }}
+      RESEARCH_ROUNDS: ${{ inputs.rounds || '31' }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -89,6 +92,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          if [[ "$RESEARCH_CASES" == all ]]; then RESEARCH_CASES=""; fi
           [[ "$RESEARCH_ROUNDS" =~ ^[0-9]+$ ]] && (( RESEARCH_ROUNDS >= 9 && RESEARCH_ROUNDS <= 101 ))
           as --version | head -1
           ld --version
@@ -152,6 +156,7 @@ jobs:
       - name: Correctness-gated bounded Callgrind main/candidate A-B
         timeout-minutes: 8
         run: |
+          if [[ "$RESEARCH_CASES" == all ]]; then RESEARCH_CASES=""; fi
           python3 scripts/callgrind_corpus.py \
             --mine target/fastbuild/lccc \
             --ref "$RUNNER_TEMP/research-main-target/fastbuild/lccc" \
@@ -161,6 +166,7 @@ jobs:
         timeout-minutes: 8
         # Identified native GCC16; this is not measured execution of CE binaries.
         run: |
+          if [[ "$RESEARCH_CASES" == all ]]; then RESEARCH_CASES=""; fi
           python3 scripts/callgrind_corpus.py \
             --mine target/fastbuild/lccc --ref gcc-16 --gcc-include-command gcc-16 \
             --only "$RESEARCH_CASES" --out results/research/callgrind-gcc
@@ -181,7 +187,7 @@ jobs:
                      'artifact': 'compiler-research', 'callgrind': {}}
           from tests.benchmark.run_benchmarks import BENCHMARKS
           selected = (set(os.environ['RESEARCH_CASES'].split(','))
-                      if os.environ['RESEARCH_CASES'] else {b.name for b in BENCHMARKS})
+                      if os.environ['RESEARCH_CASES'] not in ('', 'all') else {b.name for b in BENCHMARKS})
           for arm in ('main', 'gcc'):
               path = root / f'callgrind-{arm}' / 'index.json'
               if not path.exists():

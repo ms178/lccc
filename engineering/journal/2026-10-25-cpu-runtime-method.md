@@ -14,7 +14,7 @@ the nbody gap disappear. Merged rows now identify their shard; each shard keeps
 its complete machine/affinity/PMU metadata; Markdown shows per-row CPUs and
 actual optimization flags. Cross-host aggregates are explicitly qualified.
 
-The manually dispatched research lane now builds an archived, immutable
+The opt-in research lane now builds an archived, immutable
 baseline and the candidate with the same Rust toolchain, then measures
 before/current/GCC/latest Clang on the SAME host, serially, for both portable
 and native settings. Canonical workload sources/sizes and required per-workload
@@ -53,3 +53,7 @@ GCC 16.2, binutils 2.47 and mold 2.42.1. Local Rust is the verified 1.97 MSRV
 cache; hosted baseline and candidate use the same current stable Rust.
 An 8 GiB swap file is active; builds use warning-denied fastbuild and two jobs.
 No local CI sweep is run.
+
+The integration cannot dispatch Actions manually (403 authorization). The
+research definition therefore also opts in PRs that explicitly change that
+workflow file; ordinary code-only PRs do not acquire an extra research build.
