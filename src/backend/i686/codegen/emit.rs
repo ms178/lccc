@@ -38,6 +38,75 @@ pub(super) enum I686FastcallSlot {
     Stack { offset: i64, size: usize },
 }
 
+/// Where the bytes of an outgoing by-value argument are read from.
+///
+/// The by-value staging sites differ only in how the source and the
+/// destination are named, so the copy *policy* — instruction mix, tail
+/// handling, the in-bounds guarantee and the accumulator contract — is
+/// written exactly once, in [`I686Codegen::emit_copy_bytes`].
+#[derive(Clone, Copy)]
+pub(super) enum CopySrc {
+    /// A frame slot, resolved through `slot_ref_offset` so the source honours
+    /// `param_direct_homes` and `-fomit-frame-pointer` exactly like every
+    /// other slot reference.
+    Slot(StackSlot),
+    /// `%ecx` already holds the source address.
+    Ecx,
+}
+
+/// Destination of a by-value argument copy.
+#[derive(Clone, Copy)]
+pub(super) enum CopyDst {
+    /// `off(%esp)`: the outgoing argument area.
+    OutgoingArea(usize),
+    /// `off(%reg)`: a destination pointer that is already in a register.
+    Register(&'static str, usize),
+}
+
+impl CopyDst {
+    /// The memory operand naming byte `off` of the destination.
+    fn at(self, off: usize) -> String {
+        match self {
+            CopyDst::OutgoingArea(base) => format!("{}(%esp)", base + off),
+            CopyDst::Register(reg, base) => format!("{}({})", base + off, reg),
+        }
+    }
+}
+
+/// The general-purpose register a scalar tail may use as its scratch.
+///
+/// An enum rather than three strings so the 32/16/8-bit spellings can never
+/// drift apart (`%eax`/`%ax`/`%al` versus `%edx`/`%dx`/`%dl`): a mismatch
+/// would assemble to a different width than the one the copy intends.
+#[derive(Clone, Copy)]
+pub(super) enum CopyScratch {
+    Eax,
+    Edx,
+}
+
+impl CopyScratch {
+    fn r32(self) -> &'static str {
+        match self {
+            CopyScratch::Eax => "%eax",
+            CopyScratch::Edx => "%edx",
+        }
+    }
+
+    fn r16(self) -> &'static str {
+        match self {
+            CopyScratch::Eax => "%ax",
+            CopyScratch::Edx => "%dx",
+        }
+    }
+
+    fn r8(self) -> &'static str {
+        match self {
+            CopyScratch::Eax => "%al",
+            CopyScratch::Edx => "%dl",
+        }
+    }
+}
+
 /// i686 code generator. Implements the ArchCodegen trait for the shared framework.
 /// Uses cdecl calling convention with no register allocation (accumulator-based).
 pub struct I686Codegen {
@@ -2102,40 +2171,121 @@ impl I686Codegen {
         self.state.emit("    xchgl %eax, %edx");
     }
 
-    /// Copy `n_bytes` from stack slot to call stack area, 4 bytes at a time.
+    /// Copy `n_bytes` of a by-value object to `dst`.
+    ///
+    /// Every access below is **strictly inside** both the source object
+    /// (`[0, n_bytes)`) and the destination slot, so no padding byte is ever
+    /// read or written and no access can reach a neighbouring argument. That
+    /// in-bounds property is what makes the vector form safe here: the i686
+    /// outgoing area is sized by the object's own footprint, and every chunk
+    /// offset below satisfies `offset + 16 <= n_bytes`.
+    ///
+    /// Policy, decided by measurement (`scripts/measure_i686_stack_copy.py`, min of 101
+    /// rounds, L1-hot, destination = outgoing area, callee reading the last
+    /// field immediately afterwards — the call sequence's own regime):
+    ///
+    /// 1. **16 bytes per `movups` pair** when the TU permits SSE. `movups` is
+    ///    a *bit* copy — it preserves NaN payloads and signalling bits, unlike
+    ///    any FP movement — and it is the SSE1 form, so it stays available
+    ///    under `-mno-sse2` and only the genuinely SSE-less targets
+    ///    (`-mno-sse`, `-mgeneral-regs-only`) fall back to the scalar loop.
+    ///    Measured: 1.93 cycles against the scalar 3.86 at 16 bytes, and
+    ///    0.048 cyc/byte against 0.120 at 64 bytes.
+    /// 2. **The last chunk is the overlapping one at `n_bytes - 16`** — the
+    ///    classic memcpy tail. It needs no 8-byte or 4-byte tail sequences at
+    ///    all, and it keeps the final 16 bytes in a *single* store, so a field
+    ///    read by the callee is store-forwarded from one store instead of
+    ///    being recombined from two. This is the decisive measured case: a
+    ///    24-byte argument whose 8-byte tail used two `movl` pairs cost 14.6
+    ///    cycles (a forwarding stall) and costs 2.3 now; the whole 21..31-byte
+    ///    range went from 14.6-16.1 to 2.3. Rejected alternatives, both
+    ///    measured: an 8-byte `movlps` tail is equal here (2.31) but needs an
+    ///    extra instruction for every remainder of 9..15 bytes, and `rep
+    ///    movsl` costs 25+ cycles at every size up to 256 bytes.
+    /// 3. **Objects under 16 bytes**, and every non-SSE TU, take the scalar
+    ///    4 / 2 / 1-byte tail. The 2-byte step is not decoration: a 3-byte
+    ///    remainder is 4 instructions instead of 6, and it is the same 4/2/1
+    ///    policy the `va_arg` struct copier applies, so both by-value paths
+    ///    agree byte for byte.
+    ///
+    /// `scratch` is never a register the copy itself needs. Every caller
+    /// stages stack arguments before register arguments, so the staging
+    /// scratch is dead on entry; the accumulator cache is invalidated on exit
+    /// so that any `%eax`-derived state stays honest.
+    pub(super) fn emit_copy_bytes(
+        &mut self,
+        src: CopySrc,
+        dst: CopyDst,
+        scratch: CopyScratch,
+        n_bytes: usize,
+    ) {
+        let mut copied = 0usize;
+        if self.sse_enabled && n_bytes >= 16 {
+            while copied + 16 <= n_bytes {
+                let sr = self.copy_src_ref(src, copied);
+                emit!(self.state, "    movups {}, %xmm0", sr);
+                let dr = dst.at(copied);
+                emit!(self.state, "    movups %xmm0, {}", dr);
+                copied += 16;
+            }
+            if copied < n_bytes {
+                // Overlapping tail, wholly inside `[0, n_bytes)` because
+                // `n_bytes >= 16`, and it covers every byte the chunk loop
+                // did not. The overlap is intentional, not a bookkeeping
+                // slip: it replaces up to eight scalar tail instructions.
+                let tail = n_bytes - 16;
+                let sr = self.copy_src_ref(src, tail);
+                emit!(self.state, "    movups {}, %xmm0", sr);
+                let dr = dst.at(tail);
+                emit!(self.state, "    movups %xmm0, {}", dr);
+            }
+        } else {
+            while copied + 4 <= n_bytes {
+                let sr = self.copy_src_ref(src, copied);
+                emit!(self.state, "    movl {}, {}", sr, scratch.r32());
+                let dr = dst.at(copied);
+                emit!(self.state, "    movl {}, {}", scratch.r32(), dr);
+                copied += 4;
+            }
+            while copied + 2 <= n_bytes {
+                let sr = self.copy_src_ref(src, copied);
+                emit!(self.state, "    movzwl {}, {}", sr, scratch.r32());
+                let dr = dst.at(copied);
+                emit!(self.state, "    movw {}, {}", scratch.r16(), dr);
+                copied += 2;
+            }
+            while copied < n_bytes {
+                let sr = self.copy_src_ref(src, copied);
+                emit!(self.state, "    movb {}, {}", sr, scratch.r8());
+                let dr = dst.at(copied);
+                emit!(self.state, "    movb {}, {}", scratch.r8(), dr);
+                copied += 1;
+            }
+        }
+        self.state.reg_cache.invalidate_acc();
+    }
+
+    /// Name byte `off` of `src` for the copy policy above.
+    fn copy_src_ref(&self, src: CopySrc, off: usize) -> String {
+        match src {
+            CopySrc::Slot(slot) => self.slot_ref_offset(slot, off as i64),
+            CopySrc::Ecx => format!("{}(%ecx)", off),
+        }
+    }
+
+    /// Copy `n_bytes` from a frame slot to the outgoing argument area.
     pub(super) fn emit_copy_slot_to_stack(
         &mut self,
         slot: StackSlot,
         stack_offset: usize,
         n_bytes: usize,
     ) {
-        let mut copied = 0usize;
-        // SSE1 movups is a bit copy, not an FP conversion. It is valid for
-        // unaligned slots and avoids eight dword instructions per 16 bytes;
-        // no-SSE targets keep the exact scalar loop below.
-        while self.sse_enabled && copied + 16 <= n_bytes {
-            let sr = self.slot_ref_offset(slot, copied as i64);
-            emit!(self.state, "    movups {}, %xmm0", sr);
-            emit!(
-                self.state,
-                "    movups %xmm0, {}(%esp)",
-                stack_offset + copied
-            );
-            copied += 16;
-        }
-        while copied + 4 <= n_bytes {
-            let sr = self.slot_ref_offset(slot, copied as i64);
-            emit!(self.state, "    movl {}, %eax", sr);
-            emit!(self.state, "    movl %eax, {}(%esp)", stack_offset + copied);
-            copied += 4;
-        }
-        while copied < n_bytes {
-            let sr = self.slot_ref_offset(slot, copied as i64);
-            emit!(self.state, "    movb {}, %al", sr);
-            emit!(self.state, "    movb %al, {}(%esp)", stack_offset + copied);
-            copied += 1;
-        }
-        self.state.reg_cache.invalidate_acc();
+        self.emit_copy_bytes(
+            CopySrc::Slot(slot),
+            CopyDst::OutgoingArea(stack_offset),
+            CopyScratch::Eax,
+            n_bytes,
+        );
     }
 
     /// Fallback: store eax to stack, zero-fill remaining bytes.
@@ -2345,27 +2495,12 @@ impl I686Codegen {
                         emit!(self.state, "    leal {}, %ecx", sr);
                         emit!(self.state, "    addl ${}, %ecx", a - 1);
                         emit!(self.state, "    andl ${}, %ecx", -(a as i32));
-                        let mut copied = 0usize;
-                        while self.sse_enabled && copied + 16 <= size {
-                            emit!(self.state, "    movups {}(%ecx), %xmm0", copied);
-                            emit!(
-                                self.state,
-                                "    movups %xmm0, {}(%esp)",
-                                stack_offset + copied
-                            );
-                            copied += 16;
-                        }
-                        while copied + 4 <= size {
-                            emit!(self.state, "    movl {}(%ecx), %eax", copied);
-                            emit!(self.state, "    movl %eax, {}(%esp)", stack_offset + copied);
-                            copied += 4;
-                        }
-                        while copied < size {
-                            emit!(self.state, "    movb {}(%ecx), %al", copied);
-                            emit!(self.state, "    movb %al, {}(%esp)", stack_offset + copied);
-                            copied += 1;
-                        }
-                        self.state.reg_cache.invalidate_acc();
+                        self.emit_copy_bytes(
+                            CopySrc::Ecx,
+                            CopyDst::OutgoingArea(stack_offset),
+                            CopyScratch::Eax,
+                            size,
+                        );
                     } else {
                         self.emit_copy_slot_to_stack(slot, stack_offset, size);
                     }
@@ -2382,27 +2517,12 @@ impl I686Codegen {
                 // Non-alloca: value is a pointer to struct data.
                 self.operand_to_eax(arg);
                 self.state.emit("    movl %eax, %ecx");
-                let mut copied = 0usize;
-                while self.sse_enabled && copied + 16 <= size {
-                    emit!(self.state, "    movups {}(%ecx), %xmm0", copied);
-                    emit!(
-                        self.state,
-                        "    movups %xmm0, {}(%esp)",
-                        stack_offset + copied
-                    );
-                    copied += 16;
-                }
-                while copied + 4 <= size {
-                    emit!(self.state, "    movl {}(%ecx), %eax", copied);
-                    emit!(self.state, "    movl %eax, {}(%esp)", stack_offset + copied);
-                    copied += 4;
-                }
-                while copied < size {
-                    emit!(self.state, "    movb {}(%ecx), %al", copied);
-                    emit!(self.state, "    movb %al, {}(%esp)", stack_offset + copied);
-                    copied += 1;
-                }
-                self.state.reg_cache.invalidate_acc();
+                self.emit_copy_bytes(
+                    CopySrc::Ecx,
+                    CopyDst::OutgoingArea(stack_offset),
+                    CopyScratch::Eax,
+                    size,
+                );
             }
         }
     }
@@ -4722,12 +4842,210 @@ mod tests {
         let mut opts = crate::backend::CodegenOptions::default();
         cg.apply_options(&opts);
         assert!(cg.sse_enabled);
+        let default_lines = copy_lines_with(&opts, 32);
+        assert!(
+            default_lines[0].contains("xmm"),
+            "default TU must copy via SSE"
+        );
         opts.no_sse = true;
         cg.apply_options(&opts);
         assert!(!cg.sse_enabled);
+        let no_sse_lines = copy_lines_with(&opts, 32);
+        assert!(no_sse_lines.iter().all(|l| !l.contains("xmm")), "-mno-sse");
         opts.no_sse = false;
         opts.general_regs_only = true;
         cg.apply_options(&opts);
         assert!(!cg.sse_enabled);
+        let gp_only_lines = copy_lines_with(&opts, 32);
+        assert!(gp_only_lines.iter().all(|l| !l.contains("xmm")), "gp-only");
+    }
+
+    /// The copy policy's instruction stream for `size` bytes at
+    /// `8(%esp)` from `%ecx`, with the target's SSE permission left at its
+    /// default.
+    fn copy_lines_with(opts: &crate::backend::CodegenOptions, size: usize) -> Vec<String> {
+        let mut cg = I686Codegen::new();
+        cg.apply_options(opts);
+        cg.emit_copy_bytes(
+            CopySrc::Ecx,
+            CopyDst::OutgoingArea(8),
+            CopyScratch::Eax,
+            size,
+        );
+        cg.state
+            .out
+            .buf
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn copy_lines(size: usize, sse: bool) -> Vec<String> {
+        let mut opts = crate::backend::CodegenOptions::default();
+        opts.no_sse = !sse;
+        copy_lines_with(&opts, size)
+    }
+
+    /// The exact instruction stream, not just the count: a size that is a
+    /// multiple of 16 is pure 16-byte chunks; every other size ≥ 16 ends in
+    /// the single overlapping chunk at `size - 16` (never a 4/2/1-byte tail,
+    /// and never a chunk that would cross `size`).
+    #[test]
+    fn sse_copy_is_chunks_plus_one_overlapping_tail() {
+        assert_eq!(
+            copy_lines(16, true),
+            vec!["movups 0(%ecx), %xmm0", "movups %xmm0, 8(%esp)"]
+        );
+        assert_eq!(
+            copy_lines(17, true),
+            vec![
+                "movups 0(%ecx), %xmm0",
+                "movups %xmm0, 8(%esp)",
+                "movups 1(%ecx), %xmm0",
+                "movups %xmm0, 9(%esp)",
+            ]
+        );
+        assert_eq!(
+            copy_lines(24, true),
+            vec![
+                "movups 0(%ecx), %xmm0",
+                "movups %xmm0, 8(%esp)",
+                "movups 8(%ecx), %xmm0",
+                "movups %xmm0, 16(%esp)",
+            ]
+        );
+        assert_eq!(
+            copy_lines(32, true),
+            vec![
+                "movups 0(%ecx), %xmm0",
+                "movups %xmm0, 8(%esp)",
+                "movups 16(%ecx), %xmm0",
+                "movups %xmm0, 24(%esp)",
+            ]
+        );
+        // 33 bytes: two full chunks, then the tail at 17 (not at 32, which
+        // would write [32, 48) and overrun the object by 15 bytes).
+        assert_eq!(
+            copy_lines(33, true),
+            vec![
+                "movups 0(%ecx), %xmm0",
+                "movups %xmm0, 8(%esp)",
+                "movups 16(%ecx), %xmm0",
+                "movups %xmm0, 24(%esp)",
+                "movups 17(%ecx), %xmm0",
+                "movups %xmm0, 25(%esp)",
+            ]
+        );
+        // Below 16 bytes there is no in-object 16-byte window, so the scalar
+        // path is mandatory even when SSE is available.
+        assert!(copy_lines(15, true).iter().all(|l| !l.contains("xmm")));
+    }
+
+    /// The scalar policy is 4 / 2 / 1 bytes -- the same tail the `va_arg`
+    /// struct copier uses. The 2-byte step is what keeps a 3-byte remainder at
+    /// four instructions instead of six.
+    #[test]
+    fn scalar_copy_tail_is_four_two_one() {
+        assert_eq!(
+            copy_lines(6, false),
+            vec![
+                "movl 0(%ecx), %eax",
+                "movl %eax, 8(%esp)",
+                "movzwl 4(%ecx), %eax",
+                "movw %ax, 12(%esp)",
+            ]
+        );
+        assert_eq!(
+            copy_lines(3, false),
+            vec![
+                "movzwl 0(%ecx), %eax",
+                "movw %ax, 8(%esp)",
+                "movb 2(%ecx), %al",
+                "movb %al, 10(%esp)",
+            ]
+        );
+        // Odd tails cost two instructions per byte at worst, never four.
+        assert_eq!(copy_lines(1, false).len(), 2);
+        assert_eq!(copy_lines(7, false).len(), 6);
+    }
+
+    /// Safety property, exhaustive over the sizes a by-value argument can have
+    /// in practice: **every** memory access the policy emits must lie inside
+    /// `[0, size)`. A copy that read or wrote one byte past the object would
+    /// read frame padding or clobber the next argument's slot.
+    #[test]
+    fn copy_policy_never_touches_a_byte_outside_the_object() {
+        const BASE: usize = 8;
+        fn width_of(mn: &str) -> usize {
+            match mn {
+                "movb" => 1,
+                "movw" | "movzwl" => 2,
+                "movl" => 4,
+                "movups" => 16,
+                other => panic!("copy policy emitted an unmodelled mnemonic {other}"),
+            }
+        }
+        for size in 0..=512usize {
+            for sse in [false, true] {
+                for line in copy_lines(size, sse) {
+                    let mut parts = line.split_ascii_whitespace();
+                    let mn = parts.next().expect("instruction");
+                    let width = width_of(mn);
+                    for operand in parts.filter(|o| o.contains('(')) {
+                        let open = operand.find('(').expect("address");
+                        let disp = &operand[..open];
+                        let off: usize = disp.parse().expect("plain displacement");
+                        // The destination is `BASE + off(%esp)`; the source is
+                        // `off(%ecx)`. Compare the offset WITHIN the object.
+                        let rel = if operand.ends_with("(%esp)") {
+                            off - BASE
+                        } else {
+                            off
+                        };
+                        let end = rel + width;
+                        assert!(end <= size, "size {size} sse {sse}: `{line}` overruns");
+                    }
+                }
+            }
+        }
+    }
+
+    /// A `CopyDst::Register` destination is named off the register, and the
+    /// `%edx` scratch spellings keep their widths consistent -- the `va_arg`
+    /// copier depends on both, and a `%dl`/`%dx`/`%edx` mismatch would store
+    /// the wrong width.
+    #[test]
+    fn register_destination_and_edx_scratch_spellings() {
+        let mut cg = I686Codegen::new();
+        let mut opts = crate::backend::CodegenOptions::default();
+        opts.no_sse = true;
+        cg.apply_options(&opts);
+        cg.emit_copy_bytes(
+            CopySrc::Ecx,
+            CopyDst::Register("%eax", 4),
+            CopyScratch::Edx,
+            7,
+        );
+        let lines: Vec<&str> = cg
+            .state
+            .out
+            .buf
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                "movl 0(%ecx), %edx",
+                "movl %edx, 4(%eax)",
+                "movzwl 4(%ecx), %edx",
+                "movw %dx, 8(%eax)",
+                "movb 6(%ecx), %dl",
+                "movb %dl, 10(%eax)",
+            ]
+        );
     }
 }

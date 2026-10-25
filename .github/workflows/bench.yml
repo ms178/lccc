@@ -136,11 +136,29 @@ jobs:
         if: inputs.gate_steps
         env:
           GCC_INC: ${{ steps.gcc.outputs.inc }}
+          # Opt-in assembly dump. The numbers AND the emitted code are
+          # published as workflow annotations, because the job log is not
+          # queryable from the API: without this, a codegen metric can only be
+          # read by a human scrolling a log, and an agent auditing a PR cannot
+          # see what the compiler actually emitted. Set the repository variable
+          # LCCC_CODEGEN_ASM=1 to include the `-S` text (~40 KiB, chunked).
+          LCCC_CODEGEN_ASM: ${{ vars.LCCC_CODEGEN_ASM }}
         run: |
           set -o pipefail
+          # The metrics/assembly payload is published at warning level, because
+          # that is the only level the checks API returns; it must stay OPT-IN
+          # so a normal run carries no annotations at all. Set the repository
+          # variable LCCC_CODEGEN_ASM=1 (or "asm" for the emitted code too) to
+          # turn it on for an audit run.
+          evidence_flag=""
+          case "${LCCC_CODEGEN_ASM:-}" in
+            1|metrics) evidence_flag="--annotate" ;;
+            asm)       evidence_flag="--annotate --annotate-asm" ;;
+          esac
           python3 .github/scripts/ci-codegen-gate.py \
             --lccc target/fastbuild/lccc \
-            --gcc-inc "$GCC_INC" 2>&1 | tee codegen-gate.txt
+            --gcc-inc "$GCC_INC" \
+            $evidence_flag 2>&1 | tee codegen-gate.txt
 
       - name: Run benchmark corpus shard
         env:

@@ -5436,10 +5436,22 @@ enum SlotWrite {
 fn esp_store_operand(mn: &str, op: &str) -> Option<(i32, i32)> {
     let width = match mn {
         "movl" => 4,
+        // `movss %xmmN, slot` is a 4-byte store the backend emits for scalar
+        // F32 spills, and `movd` moves one dword either way.
+        "movss" | "movd" => 4,
         "movw" => 2,
         "movb" => 1,
-        "movq" | "movsd" | "movlps" | "movups" | "movaps" | "movapd" | "movupd" => 8,
-        "movdqa" | "movdqu" => 16,
+        // 8-byte forms. `movlps`/`movhps`/`movlpd`/`movhpd` are half-width:
+        // the other half of the register is architecturally unchanged, so the
+        // store really does touch eight bytes.
+        "movq" | "movsd" | "movlps" | "movhps" | "movlpd" | "movhpd" => 8,
+        // Full-width 16-byte moves. These were listed under the 8-byte arm
+        // while `frame_mem_width` already said 16; a 16-byte vector store
+        // covering a tracked pair was therefore modelled as covering only its
+        // low half. The by-value argument copier emits exactly these stores
+        // (`emit_copy_bytes`), so the two tables are now pinned together by
+        // `both_width_tables_agree_on_every_shared_mnemonic`.
+        "movups" | "movaps" | "movapd" | "movupd" | "movdqa" | "movdqu" | "movntdq" => 16,
         // x87 stores: the width is the MEMORY format, never the register's.
         // Overstating it would "prove" bytes overwritten that are not.
         "fstl" | "fstpl" | "fistpq" | "fisttpq" => 8,
@@ -21541,6 +21553,74 @@ f:
         ));
         assert!(matches!(
             slot_write_extent("    fisttps 8(%esp)", 8, 12),
+            SlotWrite::ReadOrUnknown
+        ));
+    }
+
+    #[test]
+    fn both_width_tables_agree_on_every_shared_mnemonic() {
+        // Two tables answer "how many bytes does this store write": the
+        // frame model (`frame_mem_width`) and the slot-overwrite proof
+        // (`esp_store_operand`). A disagreement is a silent precision hazard
+        // at best and a wrong verdict at worst, so every mnemonic either table
+        // knows is pinned here against its ISA width.
+        //
+        // `movups`/`movaps`/`movapd`/`movupd` were 8 in `esp_store_operand`
+        // and 16 in `frame_mem_width`; `movntdq`, `movhps`, `movhpd` and
+        // `movlpd` were missing from the slot table entirely.
+        for (mn, w) in [
+            ("movb", 1),
+            ("movw", 2),
+            ("movl", 4),
+            ("movss", 4),
+            ("movq", 8),
+            ("movsd", 8),
+            ("movlps", 8),
+            ("movhps", 8),
+            ("movlpd", 8),
+            ("movhpd", 8),
+            ("movups", 16),
+            ("movaps", 16),
+            ("movapd", 16),
+            ("movupd", 16),
+            ("movdqa", 16),
+            ("movdqu", 16),
+            ("movntdq", 16),
+            ("fstl", 8),
+            ("fstpl", 8),
+            ("fstps", 4),
+            ("fstpt", 10),
+        ] {
+            assert_eq!(esp_store_operand(mn, "4(%esp)"), Some((4, w)), "slot: {mn}");
+            assert_eq!(frame_mem_width(mn), w, "frame: {mn}");
+        }
+        // Tracked pair [8, 12). A store at 4(%esp) of 16 bytes covers
+        // [4, 20) and therefore retires BOTH halves; the old 8-byte reading
+        // said `Lo` only, so the high half kept looking live.
+        assert!(matches!(
+            slot_write_extent("    movups %xmm0, 8(%esp)", 8, 12),
+            SlotWrite::Both
+        ));
+        assert!(matches!(
+            slot_write_extent("    movups %xmm0, 4(%esp)", 8, 12),
+            SlotWrite::Both
+        ));
+        // A store that starts at the high half covers it alone: [12, 28) does
+        // not reach [8, 12).
+        assert!(matches!(
+            slot_write_extent("    movaps %xmm0, 12(%esp)", 8, 12),
+            SlotWrite::Hi
+        ));
+        // Half-width stores must not be promoted. `movlps` writes [4, 12),
+        // which retires the low half only -- exactly why it stays at 8.
+        assert!(matches!(
+            slot_write_extent("    movlps %xmm0, 4(%esp)", 8, 12),
+            SlotWrite::Lo
+        ));
+        // A vector LOAD writes nothing: the mnemonic is known, but the store
+        // operand is not the memory one.
+        assert!(matches!(
+            slot_write_extent("    movups 8(%esp), %xmm0", 8, 12),
             SlotWrite::ReadOrUnknown
         ));
     }

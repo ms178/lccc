@@ -1622,6 +1622,45 @@ mod tests {
         assert_eq!(assemble_text(asm), golden);
     }
 
+    /// `movlps`/`movhps`/`movlpd`/`movhpd` **stores** were rejected outright
+    /// by the i686 assembler ("unsupported SSE op operands"): only the load
+    /// row was implemented, so a valid GAS line such as
+    /// `movlps %xmm0, (%eax)` — which inline asm and half-width lane stores
+    /// produce — failed to assemble. The half-width moves have their own
+    /// store rows; the register stays in ModRM.reg.
+    ///
+    /// These are TWO-ROW instructions: `0f 12/13` and `0f 16/17` (plus the
+    /// `66`-prefixed `movlpd`/`movhpd` twins) mean LOAD with the memory
+    /// operand as source and STORE with it as destination. The bytes below are
+    /// fixed by the ISA encoding, not by an assembler build; their AUTHORITY is
+    /// the differential lane, where `tests/asm-diff/i686/sse-half-width.casefile`
+    /// is compared byte-for-byte against the GNU as the tree provisions
+    /// (`scripts/ensure_gas_247.sh`, 2.47 in CI). This test is only the fast
+    /// in-tree check that the encoder still emits them.
+    #[test]
+    fn half_width_sse_store_encodings_match_gas_golden_bytes() {
+        let asm = concat!(
+            ".text\n",
+            "movlps %xmm0, 8(%esp)\n",
+            "movhps %xmm1, 12(%ebp)\n",
+            "movlpd %xmm2, 4(%esp)\n",
+            "movhpd %xmm3, 8(%esp)\n",
+            "movlps 8(%esp), %xmm0\n",
+            "movlps %xmm0, (%ecx)\n",
+            "movups %xmm0, 16(%esp)\n",
+        );
+        let golden: &[u8] = &[
+            0x0f, 0x13, 0x44, 0x24, 0x08, // movlps %xmm0,8(%esp)
+            0x0f, 0x17, 0x4d, 0x0c, // movhps %xmm1,12(%ebp)
+            0x66, 0x0f, 0x13, 0x54, 0x24, 0x04, // movlpd %xmm2,4(%esp)
+            0x66, 0x0f, 0x17, 0x5c, 0x24, 0x08, // movhpd %xmm3,8(%esp)
+            0x0f, 0x12, 0x44, 0x24, 0x08, // movlps 8(%esp),%xmm0
+            0x0f, 0x13, 0x01, // movlps %xmm0,(%ecx)
+            0x0f, 0x11, 0x44, 0x24, 0x10, // movups %xmm0,16(%esp)
+        ];
+        assert_eq!(assemble_text(asm), golden);
+    }
+
     /// Golden-byte lock for the legacy SSE/ISA encodings repaired by the
     /// differential audit against GNU as (2.44, re-audited byte-identical
     /// on 2.47): EXTRACTPS emitted PEXTRW's

@@ -2246,10 +2246,15 @@ impl InstructionEncoder {
             "movups" => self.encode_sse_rr_rm(ops, &[0x0F, 0x10], &[0x0F, 0x11]),
             "movaps" => self.encode_sse_rr_rm(ops, &[0x0F, 0x28], &[0x0F, 0x29]),
             "movdqa" => self.encode_sse_rr_rm(ops, &[0x66, 0x0F, 0x6F], &[0x66, 0x0F, 0x7F]),
-            "movlps" => self.encode_sse_op(ops, &[0x0F, 0x12]),
-            "movhps" => self.encode_sse_op(ops, &[0x0F, 0x16]),
-            "movlpd" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x12]),
-            "movhpd" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x16]),
+            // Half-width moves have a DISTINCT store row (0F 13/17, and the
+            // 66-prefixed SSE2 pair), not a flipped load row: the store keeps
+            // the register in ModRM.reg and the memory operand in ModRM.r/m.
+            // Routing them through the single-opcode `encode_sse_op` left
+            // `movlps %xmm0, (%eax)` (valid GAS) unassemblable.
+            "movlps" => self.encode_sse_rr_rm(ops, &[0x0F, 0x12], &[0x0F, 0x13]),
+            "movhps" => self.encode_sse_rr_rm(ops, &[0x0F, 0x16], &[0x0F, 0x17]),
+            "movlpd" => self.encode_sse_rr_rm(ops, &[0x66, 0x0F, 0x12], &[0x66, 0x0F, 0x13]),
+            "movhpd" => self.encode_sse_rr_rm(ops, &[0x66, 0x0F, 0x16], &[0x66, 0x0F, 0x17]),
 
             // Non-temporal stores
             "movnti" | "movntil" => self.encode_movnti(ops),

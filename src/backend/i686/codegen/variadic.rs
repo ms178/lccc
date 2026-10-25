@@ -1,6 +1,6 @@
 //! I686Codegen: variadic argument operations (va_arg, va_start, va_copy).
 
-use super::emit::I686Codegen;
+use super::emit::{CopyDst, CopyScratch, CopySrc, I686Codegen};
 use crate::backend::generation::is_i128_type;
 use crate::common::types::IrType;
 use crate::emit;
@@ -95,30 +95,15 @@ impl I686Codegen {
             emit!(self.state, "    andl ${}, %ecx", -(align as i64));
         }
 
-        let mut offset = 0usize;
-        // SSE1 movups copies exact bits and handles unaligned struct slots;
-        // the scalar path remains mandatory for -mno-sse.
-        while self.sse_enabled && offset + 16 <= size {
-            emit!(self.state, "    movups {}(%ecx), %xmm0", offset);
-            emit!(self.state, "    movups %xmm0, {}(%eax)", offset);
-            offset += 16;
-        }
-        while offset < size {
-            let remaining = size - offset;
-            if remaining >= 4 {
-                emit!(self.state, "    movl {}(%ecx), %edx", offset);
-                emit!(self.state, "    movl %edx, {}(%eax)", offset);
-                offset += 4;
-            } else if remaining >= 2 {
-                emit!(self.state, "    movzwl {}(%ecx), %edx", offset);
-                emit!(self.state, "    movw %dx, {}(%eax)", offset);
-                offset += 2;
-            } else {
-                emit!(self.state, "    movzbl {}(%ecx), %edx", offset);
-                emit!(self.state, "    movb %dl, {}(%eax)", offset);
-                offset += 1;
-            }
-        }
+        // One copy policy for every by-value path: the source is the aligned
+        // cursor in %ecx, the destination is the caller's buffer in %eax, and
+        // %edx is the scalar scratch (this path may not touch %eax or %ecx).
+        self.emit_copy_bytes(
+            CopySrc::Ecx,
+            CopyDst::Register("%eax", 0),
+            CopyScratch::Edx,
+            size,
+        );
 
         let advance = size.div_ceil(4) * 4;
         emit!(self.state, "    addl ${}, %ecx", advance);
