@@ -464,6 +464,127 @@ fn relayout_blocks_loop_aware_impl(func: &mut IrFunction, start: BlockLayoutStar
     apply_order(func, order)
 }
 
+/// Static hint, not a semantic/range fact: equality to zero of several
+/// masked low bits is usually the exceptional arm of a loop diamond. Avoid
+/// spending a taken branch on the nonzero arm merely because it has the same
+/// loop depth. The limited mask range excludes single-bit predicates and
+/// general null/integer-zero tests. Biased data can invalidate the frequency
+/// estimate; never use it for deleting/speculating instructions.
+fn rare_mask_zero_targets(func: &IrFunction) -> Vec<Option<u32>> {
+    use crate::ir::reexports::{Instruction, IrBinOp, IrCmpOp, Operand};
+    func.blocks
+        .iter()
+        .map(|block| {
+            let Terminator::CondBranch {
+                cond: Operand::Value(cond),
+                true_label,
+                false_label,
+            } = &block.terminator
+            else {
+                return None;
+            };
+            let cmp = block
+                .instructions
+                .iter()
+                .rev()
+                .find(|i| i.dest() == Some(*cond))?;
+            let Instruction::Cmp {
+                op, lhs, rhs, ty, ..
+            } = cmp
+            else {
+                return None;
+            };
+            if !ty.is_integer() || !matches!(op, IrCmpOp::Eq | IrCmpOp::Ne) {
+                return None;
+            }
+            let masked = match (lhs, rhs) {
+                (Operand::Value(v), Operand::Const(c)) | (Operand::Const(c), Operand::Value(v))
+                    if c.to_i64() == Some(0) =>
+                {
+                    v
+                }
+                _ => return None,
+            };
+            let and = block
+                .instructions
+                .iter()
+                .rev()
+                .find(|i| i.dest() == Some(*masked))?;
+            let Instruction::BinOp {
+                op: IrBinOp::And,
+                lhs,
+                rhs,
+                ty: mask_ty,
+                ..
+            } = and
+            else {
+                return None;
+            };
+            if mask_ty != ty {
+                return None;
+            }
+            let mask = match (lhs, rhs) {
+                (Operand::Value(_), Operand::Const(c)) | (Operand::Const(c), Operand::Value(_)) => {
+                    c.to_i64()?
+                }
+                _ => return None,
+            };
+            if !(15..=65535).contains(&mask) || !((mask + 1) as u64).is_power_of_two() {
+                return None;
+            }
+            Some(if *op == IrCmpOp::Eq {
+                true_label.0
+            } else {
+                false_label.0
+            })
+        })
+        .collect()
+}
+
+/// Propagate the hint only through single-entry straight-line arms in the
+/// same innermost loop. Stop at joins, loop headers, branches and exits. An
+/// edge out of a rare arm must not cancel the estimated saving on its entry.
+fn masked_cold_blocks(
+    func: &IrFunction,
+    cfg: &crate::ir::analysis::CfgAnalysis,
+    rare: &[Option<u32>],
+    innermost: &[Option<usize>],
+) -> Vec<bool> {
+    let positions: FxHashMap<_, _> = func
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (b.label.0, i))
+        .collect();
+    let mut cold = vec![false; func.blocks.len()];
+    for (source, target) in rare.iter().enumerate() {
+        let Some(mut target) = target.and_then(|label| positions.get(&label).copied()) else {
+            continue;
+        };
+        let mut predecessor = source;
+        loop {
+            if cold[target]
+                || innermost[source].is_none()
+                || innermost[target] != innermost[source]
+                || cfg.preds.row(target) != [predecessor as u32]
+                || crate::ir::analysis::dominates_idom(&cfg.idom, target, predecessor)
+            {
+                break;
+            }
+            cold[target] = true;
+            let Terminator::Branch(next) = &func.blocks[target].terminator else {
+                break;
+            };
+            let Some(&next) = positions.get(&next.0) else {
+                break;
+            };
+            predecessor = target;
+            target = next;
+        }
+    }
+    cold
+}
+
 /// Static-frequency greedy chain layout (profile-free block placement).
 ///
 /// The throughput pipeline's historical start (`BlockLayoutStart::Existing`)
@@ -480,13 +601,16 @@ fn relayout_blocks_loop_aware_impl(func: &mut IrFunction, start: BlockLayoutStar
 /// unplaced successor next (it becomes the fall-through), and when the
 /// current trace is stuck (all successors placed), start the next trace at
 /// the unplaced block with the strongest claim (a placed predecessor and a
-/// high static frequency). Edge estimates are structural, not guessed:
+/// high static frequency). Edge estimates use loop structure plus a narrow masked-zero hint:
 ///
 /// * an edge that stays inside a natural loop carries the iteration weight
 ///   (loops run many times);
 /// * an edge that leaves a loop is cold;
 /// * an edge that *enters* a loop from outside is hot (it leads to the
 ///   iterations);
+/// * an in-loop zero arm of a low-bit mask with 4..16 bits is estimated rare,
+///   including its single-entry straight-line continuation up to a join; this
+///   is a frequency heuristic, not a value/range or uniform-data guarantee;
 /// * everything else (straight-line, if/else arms) is neutral, and ties
 ///   keep the TRUE successor first — the same default the backend's
 ///   conditional emitter prefers (`pref_true`), so the two components agree
@@ -595,9 +719,17 @@ pub(crate) fn relayout_blocks_static_chain(
     }
 
     // Edge weight: which successor of `s` deserves the fall-through slot.
+    let rare_zero = rare_mask_zero_targets(func);
+    let masked_cold = masked_cold_blocks(func, &cfg, &rare_zero, &innermost);
     let weight = |s: usize, t: usize| -> u32 {
+        if masked_cold[s] {
+            return 1;
+        }
         if let Some(li) = innermost[s] {
             if loops[li].body.contains(&t) {
+                if rare_zero[s] == Some(func.blocks[t].label.0) {
+                    return 1;
+                }
                 9 // stays inside the loop: the iteration path
             } else if depth[t] > depth[s] {
                 8 // enters a deeper nest (cannot be an exit of `s`'s loop)
@@ -613,7 +745,13 @@ pub(crate) fn relayout_blocks_static_chain(
         }
     };
     // Static frequency estimate for trace-head choice: nesting dominates.
-    let freq = |b: usize| -> u64 { 10u64.saturating_pow(depth[b].min(9) as u32) };
+    let freq = |b: usize| -> u64 {
+        if masked_cold[b] {
+            1
+        } else {
+            10u64.saturating_pow(depth[b].min(9) as u32)
+        }
+    };
 
     let mut is_placed = vec![false; n];
     let mut placed_pred = vec![0usize; n]; // placed predecessors of each block
@@ -914,6 +1052,63 @@ pub(crate) fn count_stack_operands(region: &str) -> usize {
         .count()
 }
 
+/// Extra cold-arm/prologue slots are not extra per-iteration spill traffic.
+/// For functions with a modeled masked-zero arm, count only stack operands in
+/// non-rare loop blocks. None keeps the historical veto for every other shape
+/// or an emitted label that cannot be mapped back to this IR. This is still
+/// a static frequency estimate, not a dynamic profile or no-spill guarantee.
+pub(crate) fn masked_layout_hot_stack_operands(region: &str, func: &IrFunction) -> Option<usize> {
+    if func.blocks.is_empty() {
+        return None;
+    }
+    let rare = rare_mask_zero_targets(func);
+    if rare.iter().all(Option::is_none) {
+        return None;
+    }
+    let cfg = crate::ir::analysis::CfgAnalysis::build(func);
+    let loops = crate::passes::loop_analysis::merge_loops_by_header(
+        crate::passes::loop_analysis::find_natural_loops(
+            cfg.num_blocks,
+            &cfg.preds,
+            &cfg.succs,
+            &cfg.idom,
+        ),
+    );
+    let mut innermost: Vec<Option<usize>> = vec![None; func.blocks.len()];
+    for (li, lp) in loops.iter().enumerate() {
+        for &b in &lp.body {
+            if innermost[b].is_none_or(|prev| lp.body.len() < loops[prev].body.len()) {
+                innermost[b] = Some(li);
+            }
+        }
+    }
+    let cold = masked_cold_blocks(func, &cfg, &rare, &innermost);
+    if !cold.iter().any(|&b| b) {
+        return None;
+    }
+    let hot: FxHashMap<_, _> = func
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (b.label.0, innermost[i].is_some() && !cold[i]))
+        .collect();
+    let mut current_hot = hot[&func.blocks[0].label.0];
+    let mut count = 0;
+    let mut saw_hot_label = false;
+    for line in region.lines() {
+        let text = line.trim();
+        if let Some(label) = text.strip_prefix(".LBB").and_then(|t| t.strip_suffix(':')) {
+            let label = label.parse::<u32>().ok()?;
+            current_hot = *hot.get(&label)?;
+            saw_hot_label |= current_hot;
+        }
+        if current_hot {
+            count += count_stack_operands(line);
+        }
+    }
+    saw_hot_label.then_some(count)
+}
+
 /// A line is an instruction when it is non-empty, is not a directive
 /// (leading `.`), not a comment (`#`), not a label (trailing `:`), and not a
 /// cfi marker — the same test [`count_instruction_lines`] uses.
@@ -1001,9 +1196,18 @@ pub(crate) fn layout_branch_cost(func: &IrFunction) -> u64 {
     // The chain builder's structural edge weights, mirrored: 9 stays inside
     // the loop, 8 enters a deeper nest, 5 the single successor of a
     // straight-line block, 4 a branch in straight-line code, 1 leaves a loop.
+    // Masked-zero arms and their single-entry continuations carry weight 1.
+    let rare_zero = rare_mask_zero_targets(func);
+    let masked_cold = masked_cold_blocks(func, &cfg, &rare_zero, &innermost);
     let weight = |s: usize, t: usize| -> u32 {
+        if masked_cold[s] {
+            return 1;
+        }
         if let Some(li) = innermost[s] {
             if loops[li].body.contains(&t) {
+                if rare_zero[s] == Some(func.blocks[t].label.0) {
+                    return 1;
+                }
                 9
             } else if depth[t] > depth[s] {
                 8
@@ -1036,7 +1240,12 @@ pub(crate) fn layout_branch_cost(func: &IrFunction) -> u64 {
         let falls_through =
             func.blocks.get(pos + 1).map(|b| b.label.0) == Some(func.blocks[t].label.0);
         if !falls_through {
-            cost = cost.saturating_add(10u64.saturating_pow(depth[pos].min(9)));
+            let frequency = if masked_cold[pos] {
+                1
+            } else {
+                10u64.saturating_pow(depth[pos].min(9))
+            };
+            cost = cost.saturating_add(frequency);
         }
     }
     cost
@@ -1091,6 +1300,150 @@ mod tests {
     use crate::common::types::IrType;
     use crate::ir::instruction::BlockId;
     use crate::ir::reexports::{IrConst, Operand, Value};
+
+    fn masked_diamond(mask: i64, predicate: crate::ir::reexports::IrCmpOp) -> IrFunction {
+        use crate::ir::reexports::{Instruction, IrBinOp};
+        let mut body = blk(
+            2,
+            Terminator::CondBranch {
+                cond: Operand::Value(Value(2)),
+                true_label: BlockId(4),
+                false_label: BlockId(3),
+            },
+        );
+        body.instructions = vec![
+            Instruction::BinOp {
+                dest: Value(1),
+                op: IrBinOp::And,
+                lhs: Operand::Value(Value(0)),
+                rhs: Operand::Const(IrConst::I64(mask)),
+                ty: IrType::U64,
+            },
+            Instruction::Cmp {
+                dest: Value(2),
+                op: predicate,
+                lhs: Operand::Value(Value(1)),
+                rhs: Operand::Const(IrConst::I64(0)),
+                ty: IrType::U64,
+            },
+        ];
+        func_of(vec![
+            blk(0, br(1)),
+            blk(1, cond(2, 6)),
+            body,
+            blk(3, br(5)),
+            blk(4, br(5)),
+            blk(5, cond(2, 6)),
+            blk(6, ret()),
+        ])
+    }
+
+    #[test]
+    fn masked_zero_hint_is_narrow_and_understands_both_polarities() {
+        use crate::ir::reexports::IrCmpOp;
+        for (op, target) in [(IrCmpOp::Eq, 4), (IrCmpOp::Ne, 3)] {
+            for mask in [15, 255, 65535] {
+                assert_eq!(
+                    rare_mask_zero_targets(&masked_diamond(mask, op))[2],
+                    Some(target)
+                );
+            }
+        }
+        for mask in [-1, 0, 1, 3, 7, 16, 240, 65536] {
+            assert_eq!(
+                rare_mask_zero_targets(&masked_diamond(mask, IrCmpOp::Eq))[2],
+                None
+            );
+        }
+        assert_eq!(
+            rare_mask_zero_targets(&masked_diamond(255, IrCmpOp::Ult))[2],
+            None
+        );
+    }
+
+    #[test]
+    fn masked_zero_frequency_stops_at_the_join_and_does_not_predict_outside_loops() {
+        let f = masked_diamond(255, crate::ir::reexports::IrCmpOp::Eq);
+        let cfg = crate::ir::analysis::CfgAnalysis::build(&f);
+        let rare = rare_mask_zero_targets(&f);
+        let frames = vec![None, None, Some(0), Some(0), Some(0), Some(0), None];
+        assert_eq!(
+            masked_cold_blocks(&f, &cfg, &rare, &frames),
+            vec![false, false, false, false, true, false, false]
+        );
+        assert!(
+            masked_cold_blocks(&f, &cfg, &rare, &vec![None; f.blocks.len()])
+                .iter()
+                .all(|c| !c)
+        );
+        let mut alternative = f.clone();
+        alternative.blocks[0].terminator = cond(1, 4);
+        let multiple_entries = crate::ir::analysis::CfgAnalysis::build(&alternative);
+        assert!(
+            masked_cold_blocks(&alternative, &multiple_entries, &rare, &frames)
+                .iter()
+                .all(|c| !c)
+        );
+    }
+
+    #[test]
+    fn masked_zero_hint_does_not_mark_a_function_entry_self_loop_cold() {
+        let mut f = masked_diamond(255, crate::ir::reexports::IrCmpOp::Eq);
+        let mut entry = f.blocks.remove(2);
+        entry.terminator = Terminator::CondBranch {
+            cond: Operand::Value(Value(2)),
+            true_label: entry.label,
+            false_label: BlockId(6),
+        };
+        f.blocks = vec![entry, blk(6, ret())];
+        let cfg = crate::ir::analysis::CfgAnalysis::build(&f);
+        assert_eq!(
+            masked_cold_blocks(&f, &cfg, &rare_mask_zero_targets(&f), &[Some(0), None]),
+            vec![false, false]
+        );
+    }
+
+    #[test]
+    fn masked_layout_stack_metric_counts_hot_traffic_and_fails_closed_on_labels() {
+        let f = masked_diamond(255, crate::ir::reexports::IrCmpOp::Eq);
+        let text = "    movq %rax, 8(%rsp)\n.LBB2:\n    addq 16(%rsp), %rax\n.LBB4:\n    movq 24(%rsp), %rcx\n.LBB5:\n    movq 32(%rsp), %rdx\n.LBB6:\n    xorq 40(%rsp), %rdx\n";
+        assert_eq!(masked_layout_hot_stack_operands(text, &f), Some(2));
+        assert_eq!(
+            masked_layout_hot_stack_operands(".LBB999:\n    movq (%rsp), %rax\n", &f),
+            None
+        );
+        assert_eq!(
+            masked_layout_hot_stack_operands(
+                text,
+                &masked_diamond(7, crate::ir::reexports::IrCmpOp::Eq)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn masked_zero_loop_diamond_places_the_join_before_the_rare_arm() {
+        let mut f = masked_diamond(255, crate::ir::reexports::IrCmpOp::Eq);
+        let before_cost = layout_branch_cost(&f);
+        let edges: std::collections::BTreeMap<_, _> = f
+            .blocks
+            .iter()
+            .map(|b| (b.label.0, format!("{:?}", b.terminator)))
+            .collect();
+        let before: std::collections::BTreeSet<_> = f.blocks.iter().map(|b| b.label.0).collect();
+        assert!(relayout_blocks_static_chain(&mut f, DualLayout::ChainOnly) > 0);
+        let pos = |label| f.blocks.iter().position(|b| b.label.0 == label).unwrap();
+        assert!(pos(5) < pos(4), "join should precede rare work");
+        assert!(layout_branch_cost(&f) < before_cost);
+        assert_eq!(
+            edges,
+            f.blocks
+                .iter()
+                .map(|b| (b.label.0, format!("{:?}", b.terminator)))
+                .collect()
+        );
+        assert_eq!(before, f.blocks.iter().map(|b| b.label.0).collect());
+    }
 
     fn blk(label: u32, term: Terminator) -> BasicBlock {
         BasicBlock {

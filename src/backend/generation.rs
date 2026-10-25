@@ -4550,6 +4550,26 @@ fn adopt_chain_layout(
     stack_ok && (chain_count < orig_count || tie)
 }
 
+/// Preserve the historical stack veto except for a strictly better masked-arm
+/// layout whose extra static slots introduce no extra estimated hot-loop
+/// traffic. A tie or an unmappable block never gets this exception.
+fn adopt_chain_layout_with_hot_traffic(
+    chain_count: u64,
+    orig_count: u64,
+    chain_stack: usize,
+    orig_stack: usize,
+    tie_to_chain: bool,
+    hot_stack: Option<(usize, usize)>,
+) -> bool {
+    adopt_chain_layout(
+        chain_count,
+        orig_count,
+        chain_stack,
+        orig_stack,
+        tie_to_chain,
+    ) || (chain_count < orig_count && hot_stack.is_some_and(|(c, o)| c <= o))
+}
+
 /// Always re-selects the function's section immediately before emission so a
 /// previous function's `.rodata` constant pool or PFE section cannot leak.
 fn emit_functions_and_sections(
@@ -4714,12 +4734,22 @@ fn emit_functions_and_sections(
                     // carries the rule, its stack-traffic veto and the measured
                     // calibration cases.
                     let tie_to_chain = std::env::var_os("CCC_LAYOUT_TIE_ORIG").is_none();
-                    if adopt_chain_layout(
+                    let hot_stack = crate::passes::block_layout::masked_layout_hot_stack_operands(
+                        &chain_peep,
+                        func,
+                    )
+                    .zip(
+                        crate::passes::block_layout::masked_layout_hot_stack_operands(
+                            &orig_peep, &alt,
+                        ),
+                    );
+                    if adopt_chain_layout_with_hot_traffic(
                         chain_count,
                         orig_count,
                         chain_stack,
                         orig_stack,
                         tie_to_chain,
+                        hot_stack,
                     ) {
                         generate_function(cg, attr_align, func, source_mgr, file_table);
                     } else {
@@ -9158,5 +9188,48 @@ mod adopt_chain_layout_tests {
         // the historical band decides instead.
         assert!(!adopt_chain_layout(NO_TIE, NO_TIE, 28, 28, false));
         assert!(adopt_chain_layout(67, 68, 30, 28, false));
+    }
+}
+
+#[cfg(test)]
+mod masked_layout_selection_tests {
+    use super::adopt_chain_layout_with_hot_traffic;
+    #[test]
+    fn cold_slots_need_a_strict_layout_win_and_no_extra_hot_stack_traffic() {
+        assert!(adopt_chain_layout_with_hot_traffic(
+            79,
+            84,
+            12,
+            9,
+            true,
+            Some((0, 0))
+        ));
+        assert!(!adopt_chain_layout_with_hot_traffic(
+            79,
+            84,
+            12,
+            9,
+            true,
+            Some((1, 0))
+        ));
+        assert!(!adopt_chain_layout_with_hot_traffic(
+            79, 84, 12, 9, true, None
+        ));
+        assert!(!adopt_chain_layout_with_hot_traffic(
+            84,
+            84,
+            12,
+            9,
+            true,
+            Some((0, 0))
+        ));
+        assert!(!adopt_chain_layout_with_hot_traffic(
+            85,
+            84,
+            12,
+            9,
+            true,
+            Some((0, 0))
+        ));
     }
 }
