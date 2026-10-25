@@ -131,3 +131,14 @@ x86-64-v3 target leaving the SQRT candidate inactive. Its diagnostic source/size
 target is distinct from the default-size wall-clock study. Complete summary
 receipts and report hashes are in the adjacent evidence directory; raw samples
 and executables remain in the linked hosted artifact, not these receipts.
+
+The lower-register candidate passed warning-denied fastbuild of both binaries,
+147 targeted allocator tests (including the pool-order tie regression), and the
+GCC16/LCCC differential C witness. Its portable 31-pair study measured I32 maps
+0.9843 (0.9683–0.9957), F32 maps 0.9967 (0.9824–1.0045), and F64 maps 1.0159
+(0.9979–1.0246). The unchanged hot-web executable also measured 0.9855 with an
+interval excluding one, so the small I32 result alone is not robust evidence
+of a source speedup. Assembly confirms the intended mechanism: F64 map
+arithmetic uses XMM3/XMM4 instead of XMM14/XMM15, removing four REX bytes per
+unrolled hot loop without changing the operations or widening the ISA. Native
+and hosted measurements remain pending. Do not advertise runtime gains yet.
