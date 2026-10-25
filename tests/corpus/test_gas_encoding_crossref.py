@@ -239,6 +239,64 @@ class GasEncodingCrossrefTests(unittest.TestCase):
         self.assertTrue(has("crc32", "legacy", "0f38", "f2", 0xF0))
         self.assertTrue(has("fcmovb", "legacy", "none", "none", 0xDA))
 
+    def test_the_alu_code_model_derives_the_opcode_from_the_dispatch_arm(self):
+        """`code_models()` reads `encode_alu`, it does not restate the SDM.
+
+        The nine legacy forms are the arithmetic in that function: the six
+        opcode forms are `0x01 + op * 8` off the dispatch index, the three
+        immediate forms are `/op` over a fixed opcode.  `add` (0), `and` (4) and
+        `cmp` (7) therefore land on three different blocks from one table.
+        """
+        models = self.gas.code_models()
+
+        def forms(name):
+            return sorted((f["opcode"], f["reg"]) for f in models[name])
+
+        self.assertEqual(
+            forms("add"),
+            [(0x00, None), (0x01, None), (0x02, None), (0x03, None),
+             (0x04, None), (0x05, None), (0x80, 0), (0x81, 0), (0x83, 0)],
+        )
+        self.assertEqual(
+            forms("and"),
+            [(0x20, None), (0x21, None), (0x22, None), (0x23, None),
+             (0x24, None), (0x25, None), (0x80, 4), (0x81, 4), (0x83, 4)],
+        )
+        self.assertEqual(
+            forms("cmp"),
+            [(0x38, None), (0x39, None), (0x3A, None), (0x3B, None),
+             (0x3C, None), (0x3D, None), (0x80, 7), (0x81, 7), (0x83, 7)],
+        )
+        # The model is keyed by the GAS spelling, so all four suffixed arms of
+        # `add` collapse onto one name instead of duplicating the forms.
+        self.assertEqual(len(models["add"]), 9)
+
+    def test_a_code_modelled_family_leaves_the_gap_list(self):
+        """The ALU gap entries were a modelling hole, not missing encodings.
+
+        Without the model, `add`'s `01`/`05`/`80 /0` rows are reported as gaps
+        that `as` accepts; with it they are covered, and the unrelated families
+        (`call ff /3` is a far indirect call, which lccc does not encode) stay.
+        """
+        model = self.sdm.model_any
+        before = self.gas.missing(self.rows, self.table, model)
+        after = self.gas.missing(self.rows, self.table, model, self.gas.code_models())
+
+        def opcodes(gaps, name):
+            return sorted(e["opcode"] for e in gaps.get(name, [])
+                          if e["family"] == "legacy")
+
+        self.assertIn(0x01, opcodes(before, "add"))
+        for name in ("add", "and", "cmp", "sub", "xor", "or", "adc", "sbb"):
+            self.assertEqual(opcodes(after, name), [], name)
+        self.assertLessEqual(sum(len(v) for v in after.values()),
+                             sum(len(v) for v in before.values()))
+        # A gap that is not an ALU form must survive the model: `cs`/`ds`/`es`
+        # are segment-prefix pseudo-mnemonics, not instructions with an
+        # encoding, so no code path can claim them.
+        for name in ("cs", "ds", "es"):
+            self.assertIn(name, after, name)
+
 
 class GasAbsentTriageTests(unittest.TestCase):
     """``--triage`` splits the declarative-row gap list by source spelling.

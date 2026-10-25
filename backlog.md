@@ -989,17 +989,32 @@ share helpers.  Measured on the current tree with ``--backend all``:
 | invocation | count | what it actually is |
 |---|---|---|
 | ``--verify`` | 1638 rows, 0 findings | every *row* is a legal encoding (sound) |
-| ``--missing`` | 349 encodings / 150 mnemonics | rows the model lacks, incl. `add 01`, `call ff /3` |
-| ``--absent`` | 1767 mnemonics | names with no row; includes `add`, `call`, `cmovle`, all `jcc` |
+| ``--missing`` | **349 → 286** encodings | 63 closed by modelling `encode_alu`; the rest are rows the model lacks |
+| ``--absent`` | 1767 mnemonics | names with no row; includes `cmovle`, `jnae`, `jrcxz` and the alias spellings |
 | ``--absent --triage`` | 1061 UNMENTIONED / 706 MENTIONED | spelling census, not coverage |
 
-Every instruction in those lists that the encoder does produce (`add`, `call`,
-`jcc`, `movbe`, `rorx`, `pdep`, `pext`, `mulx` — opcode from `encode_alu` or a
-literal in `encoder/*.rs`) is a false gap.  Reading the counts as a worklist
-invites "implementing" encodings that already work — the one failure mode a
-coverage gate must not have.  That these spellings also assemble to the same
-bytes as `as` 2.47 is the `as`-diff suite's claim, not this tool's: it is
-measured on the corpus, in CI, and is not assumed here.
+The 349 was not a gap list: `add`, `call`, `movbe`, `rorx`, `pdep`, `pext`,
+`mulx`, `andn` and the ALU family are all *encoded*, and `call`/`add` are not
+even in the ``--absent`` set (a row names them) — the model simply could not see
+`0x01 + op * 8`.  Reading the counts as a worklist invites "implementing"
+encodings that already work, the one failure mode a coverage gate must not have.
+That these spellings also assemble to the same bytes as `as` 2.47 is the
+`as`-diff suite's claim, not this tool's: it is measured on the corpus, in CI,
+and is not assumed here.
+
+**Progress (2026-10-25): the integer ALU family is modelled.**  `code_models()`
+reads the `self.encode_alu(ops, mnemonic, <op>)` dispatch arms out of
+`encoder/mod.rs` and `alu_forms(op)` derives the nine legacy encodings from the
+dispatch index exactly as the encoder does — six opcode forms at
+`0x01 + op * 8`, three immediate forms at `80`/`81`/`83` with `/op`.  `add`
+therefore lands on `00..05`, `and` on `20..25` and `cmp` on `38..3D` from the
+same two lines, and a change to either side fails the model.  Effect:
+``--missing`` 349 → 286 encodings for ``--backend all`` (349 → 297 for
+``--backend i686``), with `add 01`, `add 05` and `add 80 /0` and their seven
+siblings closed.  Pinned by `test_the_alu_code_model_derives_the_opcode_from_the_dispatch_arm`
+and `test_a_code_modelled_family_leaves_the_gap_list`, the second of which also
+asserts that non-instruction pseudo-mnemonics (`cs`, `ds`, `es`) stay in the
+list, so the model cannot silently swallow everything.
 
 The docstring and the three summary lines now say exactly this, and ``--triage``
 splits the list by whether the *spelling* appears anywhere in the backend
@@ -1012,10 +1027,12 @@ pinned by tests in `tests/corpus/test_gas_encoding_crossref.py`.
 "What a row cannot see"), `tests/corpus/test_gas_encoding_crossref.py`.
 
 **Plan (each step independently landable).**
-1. Teach the model the *code-driven* families: one extractor per family that
-   reads the helper's own table instead of a row (the pattern already exists for
-   `vcvt_base_params` and `HELPERS`).  Start with `encode_alu`, then BMI/BMI2,
-   then `movbe`/`movdir*`, then the branch/`cmov`/`setcc` suffix families.
+1. ~~`encode_alu`~~ **done** (above).  Next, in this order: BMI/BMI2 (`pd`/`pe`/
+   `mulx`/`rorx`/`sarx`/`shlx`/`shrx`/`andn`/`bls*`), then `movbe`/`movdir*`,
+   then the branch/`cmov`/`setcc` suffix families (where the work is the suffix
+   *table*, not the encodings), then `crc32`'s EVEX forms.  Each extractor reads
+   the helper's own table, the pattern `vcvt_base_params` and `HELPERS` already
+   use.
 2. Only after step 1, make ``--missing`` exit non-zero (`--strict`) and wire it
    into CI.  Until then it stays an interactive reading aid.
 3. Delete the ``--absent`` list from the docstring's promise set once step 1

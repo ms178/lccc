@@ -52,16 +52,23 @@ The model sees only a backend's *declarative* rows, and the 64-bit backend
 encodes most instructions in code: `encode_alu` derives the opcode
 arithmetically (`0x01 + op * 8`, `encoder/gp_integer.rs`), the `jcc`/`cmov*`/
 `setcc` families dispatch on a suffix match, and the VEX/EVEX emitters share
-helpers, so none of them has a row.  ``--missing``/``--absent`` therefore count
-those instructions as gaps although the assembler encodes them: with
-``--backend all`` the current tree reports `add`, `call`, `cmovle` and the whole
-`jcc` family under ``--absent`` and `add 01` under ``--missing``, while
-`encode_alu` computes that `01` and the other spellings appear as literals in
-`encoder/*.rs`.  The two counts are a *declarative-row* census,
-not an ISA-coverage census, and the sound direction is ``--verify`` — it asks
-whether each row that does exist is a legal encoding.  Making the other two
-directions a real worklist means teaching the model the code-driven families
-(`backlog.md` MB-45), not reading their counts as missing instructions.
+helpers, so none of them has a row.  The gap counts therefore blame the model
+rather than the encoder: with ``--backend all`` the tree reported `add 01` under
+``--missing`` before `encode_alu` was modelled, and still reports alias
+spellings such as `cmovle`, `jnae` and `jrcxz` under ``--absent`` although a
+suffix arm encodes them, while `add`, `call`, `movbe`, `rorx`, `pdep`, `pext`,
+`mulx` and `andn` are *not* listed there because some row names them.  The two
+counts are a *declarative-row* census, not an ISA-coverage census, and the sound
+direction is ``--verify`` — it asks whether each row that does exist is a legal
+encoding.
+
+The cure is to model the code, which is what ``code_models()`` now does for the
+integer ALU family: it reads the `self.encode_alu(ops, mnemonic, <op>)` dispatch
+arms and derives the nine legacy forms from `op` exactly as `encode_alu` does
+(`0x01 + op * 8` for the six opcode forms, `/op` over a fixed opcode for 80/81/
+83).  That alone takes ``--missing`` from 349 to 286 encodings across 159
+mnemonics, and the same pattern extends to the remaining families
+(`backlog.md` MB-45).
 
 `--backend {all,i686,x86}` selects the encoder sources.  The 64-bit backend is
 not a superset of the 32-bit one — x87 integer memory arithmetic, `fcmov*` and
@@ -716,7 +723,73 @@ def verify(rows: list[dict], table: dict[str, list[dict]],
     return findings, unmodeLLed, checked, uncovered
 
 
-def missing(rows: list[dict], table: dict[str, list[dict]], model) -> dict[str, list[dict]]:
+# ---------------------------------------------------------------------------
+# Code-driven families.
+#
+# Not every instruction the backend encodes has a declarative row: `encode_alu`
+# derives its opcodes arithmetically, so the whole integer ALU family is
+# invisible to the row model and its nine legacy forms were reported as gaps
+# (`add 01`, `add 05`, `add 80 /0`, ...).  The model below is read from the
+# encoder, not copied from the SDM: the dispatch arms come from the
+# `match mnemonic` chain and the nine forms from the arithmetic in
+# `encode_alu` itself, so a change there fails this model instead of drifting.
+# ---------------------------------------------------------------------------
+
+# `"addq" | "addl" | "addw" | "addb" => self.encode_alu(ops, mnemonic, 0),`
+ALU_ARM = re.compile(
+    r'((?:"[a-z0-9]+"\s*\|\s*)*"[a-z0-9]+")\s*=>\s*'
+    r'self\.encode_alu\(ops,\s*mnemonic,\s*(\d+)\)'
+)
+QUOTED = re.compile(r'"([a-z0-9]+)"')
+
+def alu_forms(op: int) -> list[dict]:
+    """The nine legacy encodings `encode_alu` emits for dispatch index `op`.
+
+    `op` is the ALU index the dispatch arm passes (0 = add, 4 = and, 7 = cmp).
+    The six opcode forms carry it in the opcode byte (`0x01 + op * 8`), the
+    three immediate forms carry it in ModR/M's `/digit` field with a fixed
+    opcode — 80 imm8, 81 imm32, 83 sign-extended imm8.  Deriving both from `op`
+    is what makes this a model of the code rather than a second table: `add`
+    lands on 00..05 and `and` on 20..25 from the same two lines.
+    """
+    forms = [{
+        "family": "legacy", "map": "none", "pp": "none", "w": None,
+        "opcode": base + op * 8, "reg": None,
+    } for base in (0x00, 0x01, 0x02, 0x03, 0x04, 0x05)]
+    forms.extend({
+        "family": "legacy", "map": "none", "pp": "none", "w": None,
+        "opcode": opcode, "reg": op,
+    } for opcode in (0x80, 0x81, 0x83))
+    return forms
+
+
+def alu_code_models() -> dict[str, list[dict]]:
+    """`{gas mnemonic: [encoding, ...]}` for every `encode_alu` dispatch arm."""
+    text = (REPO / "src/backend/x86/assembler/encoder/mod.rs").read_text(
+        encoding="utf-8", errors="replace")
+    out: dict[str, dict[tuple[int, int | None], dict]] = {}
+    for names, op in ALU_ARM.findall(text):
+        forms = alu_forms(int(op))
+        for name in QUOTED.findall(names):
+            slot = out.setdefault(gas_name(name), {})
+            for form in forms:
+                slot[(form["opcode"], form["reg"])] = form
+    return {name: list(slot.values()) for name, slot in out.items()}
+
+
+_ALU_MODELS: dict[str, list[dict]] | None = None
+
+
+def code_models() -> dict[str, list[dict]]:
+    """Encodings produced by code paths the row model cannot see."""
+    global _ALU_MODELS
+    if _ALU_MODELS is None:
+        _ALU_MODELS = alu_code_models()
+    return _ALU_MODELS
+
+
+def missing(rows: list[dict], table: dict[str, list[dict]], model,
+            extra: dict[str, list[dict]] | None = None) -> dict[str, list[dict]]:
     """Encodings `as` accepts for mnemonics the encoder already knows."""
     have: dict[str, list[dict]] = {}
     for row in rows:
@@ -727,6 +800,8 @@ def missing(rows: list[dict], table: dict[str, list[dict]], model) -> dict[str, 
             base = gas_name(name)
             have.setdefault(name, []).extend(encs)
             have.setdefault(base, []).extend(encs)
+    for name, encs in (extra or {}).items():
+        have.setdefault(name, []).extend(encs)
     gaps: dict[str, list[dict]] = {}
     for name, encs in table.items():
         if name not in have:
@@ -738,8 +813,9 @@ def missing(rows: list[dict], table: dict[str, list[dict]], model) -> dict[str, 
     return gaps
 
 
-def unimplemented_mnemonics(rows: list[dict], table: dict[str, list[dict]]) -> list[str]:
-    named = set()
+def unimplemented_mnemonics(rows: list[dict], table: dict[str, list[dict]],
+                            extra: dict[str, list[dict]] | None = None) -> list[str]:
+    named = set(extra or {})
     for row in rows:
         for name in row["names"]:
             named.add(name)
@@ -747,9 +823,10 @@ def unimplemented_mnemonics(rows: list[dict], table: dict[str, list[dict]]) -> l
     return sorted(n for n in table if n not in named)
 
 
-def coverage(rows: list[dict], table: dict[str, list[dict]]) -> dict[str, list[dict]]:
+def coverage(rows: list[dict], table: dict[str, list[dict]],
+             extra: dict[str, list[dict]] | None = None) -> dict[str, list[dict]]:
     """Reference encodings for every mnemonic the encoder has no row for."""
-    have = set()
+    have = set(extra or {})
     for row in rows:
         for name in row["names"]:
             have.add(name)
@@ -893,7 +970,7 @@ def main() -> int:
             return 1
 
     if args.missing:
-        gaps = missing(rows, table, model)
+        gaps = missing(rows, table, model, code_models())
         total = sum(len(v) for v in gaps.values())
         print(f"\nencodings as 2.47 accepts that no declarative row models: {total} "
               f"across {len(gaps)} mnemonics with at least one row "
@@ -903,14 +980,14 @@ def main() -> int:
             print(f"  {name:14s} {forms}")
 
     if args.coverage:
-        gap = coverage(rows, table)
+        gap = coverage(rows, table, code_models())
         Path(args.coverage).write_text(json.dumps(gap, indent=1, sort_keys=True) + "\n")
         legal = sum(len(v) for v in gap.values())
         print(f"\nmnemonics with no declarative row (written to {args.coverage}):"
               f" {len(gap)} carrying {legal} reference encodings")
 
     if args.absent:
-        absent = unimplemented_mnemonics(rows, table)
+        absent = unimplemented_mnemonics(rows, table, code_models())
         print(f"\nmnemonics as 2.47 knows with no declarative row: {len(absent)}")
         if args.triage:
             unmentioned, mentioned = triage_absent(absent, files)
