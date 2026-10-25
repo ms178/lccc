@@ -57,7 +57,9 @@ to i686 and CI tooling, not the x86-64 optimizer/emitter under comparison.
 Binary hashes in `identity.json` and `performance.json` identify the actual arms;
 the runner's revision field records the checkpoint before the named-space
 follow-up, not a claim that its binary was built from a clean checkpoint.
-No local ICX timing is claimed; the hosted benchmark lane includes ICX.
+No local ICX timing is claimed. The authenticated hosted ICX integration lane
+compiles this SSE1-only workload in strict FP mode and compares its output
+with LCCC; the sharded timed benchmark lane uses GCC.
 
 The retained disassemblies show two four-lane MULPS/ADDPS copies per hot loop,
 unaligned-safe loads/stores, no FMA, and no SSE2 SIMD instructions in the
