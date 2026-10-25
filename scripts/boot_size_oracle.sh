@@ -27,7 +27,9 @@
 #   CC_ORACLE=clang scripts/boot_size_oracle.sh           # clang oracle
 #   CC_ORACLE="clang gcc" scripts/boot_size_oracle.sh     # both
 # Environment:
-#   KERNEL_DIR   kernel tree        (default /home/user/target/kernel-work/linux-6.18.55)
+#   KERNEL_DIR   kernel tree        (default: the prepared tree resolved by
+#                                    kernel_version.sh, i.e.
+#                                    $KERNEL_WORK/linux-$KVER)
 #   LCCC         lccc compiler      (default <repo>/target/fastbuild/lccc)
 #   LCCC_LD      lccc linker        (default <repo>/target/fastbuild/lccc-ld)
 #   OUT          work directory     (default /var/tmp/bootbuild)
@@ -36,7 +38,13 @@
 set -euo pipefail
 
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-K=${KERNEL_DIR:-/home/user/target/kernel-work/linux-6.18.55}
+# Which kernel tree?  scripts/kernel_version.sh is the single source of truth
+# (explicit KERNEL_DIR/KVER > the prepared tree on disk > the package PKGBUILD
+# > a pinned fallback); the literal that used to live here went stale the
+# moment archpkgbuilds bumped 6.18.55 -> 6.18.58.
+# shellcheck source=kernel_version.sh
+. "$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/kernel_version.sh"
+K=${KERNEL_DIR:-$(lccc_kernel_default_dir)}
 LCCC=${LCCC:-$here/../target/fastbuild/lccc}
 LCCC_LD=${LCCC_LD:-$here/../target/fastbuild/lccc-ld}
 OUT=${OUT:-/var/tmp/bootbuild}

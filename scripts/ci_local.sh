@@ -1342,6 +1342,48 @@ gate "tls-runtime-oracle" fast bash tests/regression/check_tls_runtime_oracle.sh
 gate "volatile-reduction" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_volatile_reduction.sh
 
+# `__builtin_types_compatible_p` answers type IDENTITY, not type spelling
+# (C11 6.2.7): Linux 6.18 asserts `__builtin_types_compatible_p(__typeof__(&f),
+# void *(void *))` in arch/x86/kernel/irq.c, so a type builder that keeps
+# parameter names, a typedef's spelling or a typeof's origin in the type makes
+# the kernel fail to build.  Every row is compiled AND run by lccc and GCC 16.2
+# and the answers are compared; `known_divergences.tsv` is checked in both
+# directions so documentation cannot rot.
+# An inline-asm memory operand must always carry an address.  When operand
+# resolution could not compute one it printed the EMPTY string and the assembler
+# got a truncated instruction (`lock  btsq  $0,`), which is how Linux 6.18
+# mm/zsmalloc.c (folio_trylock -> GEN_BINARY_RMWcc) failed to build.  The gate
+# asserts, at -O0..-O3 and with the kernel flag set, that no inline-asm line
+# ends with a comma, that every RMWcc site shows an address, and that the
+# program's output still matches GCC 16.2 -- a wrong address is as bad as a
+# missing one.
+gate "rmwcc-mem-operand" fast \
+    env GCC="${GCC:-gcc-16}" CCC="$LCCC" python3 tests/regression/check_rmwcc_mem_operand.py
+
+gate "types-compatible-p" fast \
+    env GCC="${GCC:-gcc-16}" CCC="$LCCC" python3 tests/regression/check_types_compatible_p.py
+
+# Named address spaces in pointer declarators and type-names
+# (`pe * __seg_gs *`, `__builtin_types_compatible_p(struct s __seg_gs *,
+# struct s *)`): the kernel's `__percpu` is exactly this spelling on x86.
+gate "seg-pointer-declarators" fast \
+    env GCC="${GCC:-gcc-16}" CCC="$LCCC" python3 tests/regression/check_seg_pointer_declarators.py
+
+# A compound literal used as a designated array element
+# (`nodemask_t node_states[3] = {[1] = ((nodemask_t){{[0]=1UL}})}` in Linux
+# mm/page_alloc.c) must fold, not be diagnosed as "initializer element is not
+# constant" and not be routed into the element's first member's scalar path.
+gate "compound-literal-element" fast \
+    env GCC="${GCC:-gcc-16}" CCC="$LCCC" python3 tests/regression/check_compound_literal_element.py
+
+# The debug knobs this series documents (`CCC_DEBUG_VOLRED`,
+# `CCC_DEBUG_STATIC_INIT`, `CCC_DEBUG_TYPES_COMPATIBLE`) may explain a decision
+# but must never change emitted code: a knob left exported in a benchmark or
+# kernel environment would otherwise silently select an unrecorded compiler.
+# Mirrors the hosted step in ci.yml; ci-gate-parity fails if the two drift apart.
+gate "debug-knobs-neutral" fast \
+    env CCC="$LCCC" python3 tests/regression/check_debug_knobs_neutral.py
+
 gate "llvm-missed-inventory-tests" fast python3 scripts/test_llvm_missed_inventory.py
 gate "llvm-missed-inventory-optimized-tests" fast python3 -O scripts/test_llvm_missed_inventory.py
 gate "llvm-missed-zero-choice" fast python3 tests/regression/check_llvm_missed_zero_choice.py

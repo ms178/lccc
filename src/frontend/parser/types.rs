@@ -1712,6 +1712,10 @@ impl Parser {
         self.attrs.set_volatile(false);
 
         let mut ptr_depth = 0u32;
+        // Named address space carried by the type's own specifiers
+        // (`__seg_gs int *`): it qualifies the memory the FIRST star points
+        // into, exactly as `build_full_ctype` places it.
+        let mut pending_space = self.attrs.parsing_address_space;
         loop {
             let star_span = self.peek_span();
             if !self.consume_if(&TokenKind::Star) {
@@ -1721,7 +1725,14 @@ impl Parser {
             if !self.enter_pointer_level(ptr_depth, star_span) {
                 break;
             }
-            result_type = TypeSpecifier::Pointer(Box::new(result_type), AddressSpace::Default);
+            // The wrapper built here takes the space written after the PREVIOUS
+            // star (`pointee_space_before`): `int * __seg_gs *` is a pointer to
+            // a %gs-resident `int *`, not a %gs `int *`.  A hardcoded Default
+            // dropped the qualifier, so `__builtin_types_compatible_p(pe *
+            // __seg_gs *, pe **)` answered 1 where GCC answers 0 -- and the
+            // type-name could not even be parsed, because the qualifier loop
+            // below did not know the keyword.
+            result_type = TypeSpecifier::Pointer(Box::new(result_type), pending_space);
             let mut q = 0u8;
             loop {
                 match self.peek() {
@@ -1737,28 +1748,39 @@ impl Parser {
                         q |= 4;
                         self.advance();
                     }
+                    TokenKind::SegGs => {
+                        pending_space = AddressSpace::SegGs;
+                        self.advance();
+                    }
+                    TokenKind::SegFs => {
+                        pending_space = AddressSpace::SegFs;
+                        self.advance();
+                    }
                     _ => break,
                 }
             }
             qualifiers.push(q);
         }
 
-        // Handle the common abstract function-pointer spelling `(*)`.
+        // Parenthesized abstract declarators: `(*)`, `(*)(int)`, `(*[3])(int)`,
+        // `(*(*)(int))(char)`, `(*)[4]`.  These belong to the ONE abstract
+        // declarator parser, and the type this builtin compares has to be the
+        // type the declaration path builds: a hand-rolled skip that consumed the
+        // group and the parameter list without building a function type made
+        // `__builtin_types_compatible_p(typeof(&f), void (*)(int))` compare
+        // `void (*)(int)` against `void *` and answer 0 for compatible types.
+        // Measured cost: the kernel's
+        // `assert_function_type()` macro (arch/x86/include/asm/irq_stack.h:
+        // `static_assert(__builtin_types_compatible_p(typeof(&func), proto))`,
+        // reached from DEFINE_IDTENTRY_SYSVEC) rejected arch/x86/kernel/irq.c.
+        // The parenthesized group's own CVR qualifiers do not participate in
+        // compatibility (`void (*const)(int)` is compatible with
+        // `void (*)(int)`), so the level is recorded as unqualified.
         if matches!(self.peek(), TokenKind::LParen) {
-            let save = self.pos;
-            self.advance();
-            if self.consume_if(&TokenKind::Star) {
-                while !matches!(self.peek(), TokenKind::RParen | TokenKind::Eof) {
-                    self.advance();
-                }
-                self.consume_if(&TokenKind::RParen);
-                if matches!(self.peek(), TokenKind::LParen) {
-                    self.skip_balanced_parens();
-                }
-                result_type = TypeSpecifier::Pointer(Box::new(result_type), AddressSpace::Default);
+            let before = self.pos;
+            result_type = self.parse_abstract_declarator_suffix(result_type);
+            if self.pos != before {
                 qualifiers.push(0);
-            } else {
-                self.pos = save;
             }
         }
 

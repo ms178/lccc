@@ -425,6 +425,99 @@ impl Lowerer {
         }
     }
 
+    /// The braced list inside a compound literal value, with any enclosing
+    /// cast removed, or `None` when `init` is not a compound literal.
+    ///
+    /// `(T){ a, b }` is an lvalue of type `T` (C11 6.5.2.5p5), and in a static
+    /// initializer it names exactly the bytes the braced list `{ a, b }` names,
+    /// so a designated aggregate element may be written that way:
+    ///
+    /// ```c
+    /// typedef struct { unsigned long bits[2]; } nodemask_t;
+    /// nodemask_t node_states[3] = { [1] = (nodemask_t){ { [0] = 1UL } } };
+    /// ```
+    ///
+    /// which is how Linux 6.18's `NODE_MASK_ALL` initializes `node_states`
+    /// (mm/page_alloc.c).  Every aggregate path below used to hand that
+    /// expression to the *scalar* evaluator, which cannot fold a compound
+    /// literal, so the object was rejected with "initializer element is not
+    /// constant" (bytes image) — or, worse, the expression was accepted as a
+    /// scalar and written into the element's FIRST member, so the designated
+    /// element silently lost its value.  GCC 16.2, Clang 23.1.3 and ICX 2026.2
+    /// all accept the shape (tests/regression/compound_literal_element/).
+    ///
+    /// The literal is matched directly, NOT through a cast: `(T)(T){ ... }` is
+    /// a cast expression, and a cast is not an integer/address constant
+    /// expression (C11 6.6p6), so GCC 16.2 rejects it and lccc must too
+    /// ("initializer element is not constant" is the oracle's answer, checked
+    /// in tests/regression/compound_literal_element/).  A qualified literal
+    /// `(const T){ ... }` is still a compound literal -- the qualifier is part
+    /// of the literal's type, not a cast around it.
+    /// The `Field` designator of an initializer item, if it carries one
+    /// (`[idx].field = value`), cloned so the caller can keep borrowing the
+    /// layout while it looks the field up.
+    fn field_designator_name(item: &InitializerItem) -> Option<String> {
+        item.designators.iter().find_map(|d| {
+            if let Designator::Field(name) = d {
+                Some(name.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Byte offset contributed by the designator indices AFTER the first one,
+    /// walking the still-nested array dimensions.  `strides[i]` is the stride of
+    /// the dimension being entered; once the dimensions run out the innermost
+    /// stride is the struct size itself.
+    fn sub_element_byte_offset(
+        sub_indices: &[usize],
+        strides: &[usize],
+        struct_size: usize,
+    ) -> usize {
+        let mut offset = 0usize;
+        for (i, &idx) in sub_indices.iter().enumerate() {
+            let stride = strides.get(i).copied().unwrap_or(struct_size);
+            offset += idx * stride;
+        }
+        offset
+    }
+
+    pub(super) fn compound_literal_items<'a>(
+        &self,
+        init: &'a Initializer,
+    ) -> Option<&'a [InitializerItem]> {
+        let Initializer::Expr(expr) = init else {
+            return None;
+        };
+        match expr {
+            Expr::CompoundLiteral(_, inner, _) => match inner.as_ref() {
+                Initializer::List(items) => Some(items),
+                // `(T)x` is a scalar compound literal; some paths already
+                // handle it, and none of them treats it as a braced list.
+                Initializer::Expr(_) => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// The inner expression of a scalar compound literal (`(T)value`), with any
+    /// enclosing cast removed, or `None`.  The aggregate paths treat `(T)value`
+    /// as a positional value for the object's first member; `(T){ ... }` is a
+    /// braced list and is answered by [`Self::compound_literal_items`].
+    pub(super) fn compound_literal_expr<'a>(&self, init: &'a Initializer) -> Option<&'a Expr> {
+        let Initializer::Expr(expr) = init else {
+            return None;
+        };
+        match expr {
+            Expr::CompoundLiteral(_, inner, _) => match inner.as_ref() {
+                Initializer::Expr(inner_expr) => Some(inner_expr),
+                Initializer::List(_) => None,
+            },
+            _ => None,
+        }
+    }
+
     /// Write a string literal into a byte buffer at the given offset, with null terminator.
     /// Each char in the string is treated as a raw byte value (0-255).
     pub(super) fn write_string_to_bytes(bytes: &mut [u8], offset: usize, s: &str, max_len: usize) {
@@ -669,13 +762,14 @@ impl Lowerer {
                 self.fill_struct_global_bytes(sub_items, sub_layout, bytes, field_offset);
                 1
             }
-            Initializer::Expr(expr) => {
-                // Unwrap compound literal: (type){ init_list } -> use inner init_list
-                if let Expr::CompoundLiteral(_, cl_init, _) = expr {
-                    if let Initializer::List(sub_items) = cl_init.as_ref() {
-                        self.fill_struct_global_bytes(sub_items, sub_layout, bytes, field_offset);
-                        return 1;
-                    }
+            Initializer::Expr(_) => {
+                // Unwrap compound literal: (type){ init_list } -> use inner
+                // init_list.  `compound_literal_items` is used rather than a
+                // direct match so a cast around the literal (`(const T){ ... }`,
+                // `(T)(T){ ... }`) names the same bytes.
+                if let Some(cl_items) = self.compound_literal_items(&items[0].init) {
+                    self.fill_struct_global_bytes(cl_items, sub_layout, bytes, field_offset);
+                    return 1;
                 }
                 // If the item has a designator (e.g., `.y = 42` where y is a struct),
                 // strip it so the scalar is treated as a positional init for the first
@@ -1451,31 +1545,36 @@ impl Lowerer {
                 // a byte offset within this_stride and recurse or write directly.
                 if index_designators.len() > 1 && !remaining_strides.is_empty() {
                     let elem_offset = base_offset + current_idx * this_stride;
-                    // Compute sub-offset from remaining designators
-                    let mut sub_byte_offset = 0usize;
-                    let mut sub_strides = remaining_strides;
-                    for &idx in &index_designators[1..] {
-                        let sub_stride = if !sub_strides.is_empty() {
-                            sub_strides[0]
-                        } else {
-                            struct_size
-                        };
-                        sub_byte_offset += idx * sub_stride;
-                        if sub_strides.len() > 1 {
-                            sub_strides = &sub_strides[1..];
-                        } else {
-                            sub_strides = &remaining_strides[0..0]; // empty
-                        }
-                    }
+                    // `[i][j]...`: the first index selected at this level, so the
+                    // sub-offset and the remaining strides come from the rest.
+                    let sub_byte_offset = Self::sub_element_byte_offset(
+                        &index_designators[1..],
+                        remaining_strides,
+                        struct_size,
+                    );
+                    let sub_strides = &remaining_strides
+                        [(index_designators.len() - 1).min(remaining_strides.len())..];
 
                     // Handle field designator for [i][j].field = val
-                    let field_designator_name = item.designators.iter().find_map(|d| {
-                        if let Designator::Field(name) = d {
-                            Some(name.clone())
-                        } else {
-                            None
-                        }
-                    });
+                    let field_designator_name = Self::field_designator_name(item);
+
+                    // `[i][j] = (T){ ... }`: the compound literal names the
+                    // element's bytes (C11 6.5.2.5p5), so fill the element from
+                    // its braced list.  Handing the literal to the scalar
+                    // evaluator below either rejects the program or writes it
+                    // into the element's first member (see
+                    // `compound_literal_items`).
+                    if let Some(cl_items) = self.compound_literal_items(&item.init) {
+                        self.fill_struct_global_bytes(
+                            cl_items,
+                            layout,
+                            bytes,
+                            elem_offset + sub_byte_offset,
+                        );
+                        item_idx += 1;
+                        current_idx += 1;
+                        continue;
+                    }
 
                     match &item.init {
                         Initializer::Expr(expr) => {
@@ -1566,15 +1665,20 @@ impl Lowerer {
             }
 
             // Check for field designator: [idx].field = val
-            let field_designator_name = item.designators.iter().find_map(|d| {
-                if let Designator::Field(name) = d {
-                    Some(name.clone())
-                } else {
-                    None
-                }
-            });
+            let field_designator_name = Self::field_designator_name(item);
 
             let elem_offset = base_offset + current_idx * this_stride;
+
+            // `[i] = (T){ ... }`: same rule as the multi-index case above --
+            // the compound literal names the element's bytes, so fill the
+            // element from its braced list instead of asking the scalar
+            // evaluator to fold the literal.
+            if let Some(cl_items) = self.compound_literal_items(&item.init) {
+                self.fill_struct_global_bytes(cl_items, layout, bytes, elem_offset);
+                item_idx += 1;
+                current_idx += 1;
+                continue;
+            }
 
             match &item.init {
                 Initializer::List(sub_items) => {

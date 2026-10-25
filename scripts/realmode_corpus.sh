@@ -13,7 +13,13 @@ set -euo pipefail
 
 LCCC=$(realpath "${1:?usage: realmode_corpus.sh <lccc-binary> [outdir]}")
 OUT=${2:-/tmp/realmode}
-K=${KERNEL_DIR:-/home/user/kernel-work/linux-6.18.55}
+# Which kernel tree?  scripts/kernel_version.sh is the single source of truth
+# (explicit KERNEL_DIR/KVER > the prepared tree on disk > the package PKGBUILD
+# > a pinned fallback); the literal that used to live here went stale the
+# moment archpkgbuilds bumped 6.18.55 -> 6.18.58.
+# shellcheck source=kernel_version.sh
+. "$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/kernel_version.sh"
+K=${KERNEL_DIR:-$(lccc_kernel_default_dir)}
 # Resolve the script directory before `cd "$K"`: the shared ELF section helper
 # has to be found relative to THIS script, not inside the kernel tree.
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)

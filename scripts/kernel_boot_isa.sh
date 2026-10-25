@@ -54,6 +54,19 @@ VEX_RE='(^|[[:space:]])v[a-z][a-z0-9]+[[:space:]]'
 SSE42_RE='\b(pcmpgtq|pcmpistri|pcmpestri|crc32[ql]?|popcnt[ql]?)\b'
 ISA_RE="$BMI_RE|$VEX_RE|$SSE42_RE"
 
+# `verr` and `verw` are the only two REAL x86 mnemonics that begin with `v`.
+# They are 286 instructions and part of the x86-64 baseline, so they are not
+# VEX evidence.  They matter here because objdump decodes a .code16 object
+# (arch/x86/boot is -m16) with its default 32/64-bit algorithm: the
+# instruction/data boundary errors that produces invent plausible-looking
+# mnemonics out of operand bytes, and the VEX pattern's `v[a-z]+` net caught
+# `verr (%ebx)` out of the middle of `movzww`'s operand in video-vesa.o — a
+# FAIL that was entirely the scanner's own.  Deleting the two legacy
+# mnemonics first keeps the net as wide as before (any other `v*` mnemonic is
+# an AVX encoding and must not be in a baseline build) without the two
+# false positives.
+LEGACY_V_RE='(^|[[:space:]])(verr|verw)([[:space:]]|$)'
+
 # file / pristine line / patched line / description
 FILES=(
     "arch/x86/boot/compressed/Makefile"
@@ -168,6 +181,7 @@ scan_obj() { # scan_obj <file> ; echoes the offending mnemonics, rc 1 on a hit
     local file=$1 hits
     # Strip `#` comments first: a comment naming an instruction is not one.
     hits=$(objdump -d --no-show-raw-insn "$file" 2>/dev/null | sed 's/#.*//' \
+           | sed -E "s/$LEGACY_V_RE//g" \
            | grep -oE "$ISA_RE" | sort -u | tr '\n' ' ' || true)
     if [[ -n ${hits// /} ]]; then
         printf 'kernel_boot_isa: FAIL: %s: %s\n' "$file" "$hits" >&2

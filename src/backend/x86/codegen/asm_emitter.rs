@@ -226,6 +226,23 @@ impl InlineAsmEmitter for X86Codegen {
                     op.mem_addr = format!("(%{})", tmp_reg);
                     return true;
                 }
+                // No stack slot: the address is register-homed, is a Copy/Cast
+                // chain, or is accumulator-resident. This used to fall through
+                // and leave `mem_addr` EMPTY, so the template operand printed
+                // as nothing at all and the assembler received a truncated
+                // instruction: Linux 6.18 mm/zsmalloc.c (folio_trylock ->
+                // test_and_set_bit_lock -> GEN_BINARY_RMWcc) emitted
+                // `lock  btsq  $0,` with the `"+m"` address missing, which the
+                // integrated assembler rejected ("expecting lockable
+                // instruction after `lock'"). Materialise the address exactly
+                // like `preload_input` does for register operands;
+                // `value_to_reg` resolves fresh/stale homes, typed slot loads,
+                // Copy/bit-identical Cast chains, GlobalAddr remats and the
+                // accumulator, and panics loudly when none applies.
+                let tmp_reg = self.assign_scratch_reg(&AsmOperandKind::GpReg, excluded);
+                self.value_to_reg(v, &tmp_reg);
+                op.mem_addr = format!("(%{})", tmp_reg);
+                return true;
             }
             Operand::Const(c) => {
                 // Constant address (e.g., from volatile MMIO reads like readl() in the kernel).
@@ -616,6 +633,7 @@ impl InlineAsmEmitter for X86Codegen {
         goto_labels: &[(String, BlockId)],
     ) -> String {
         // Build the parallel arrays that substitute_x86_asm_operands expects
+        crate::backend::x86_common::assert_memory_operands_resolved(operands, "x86-64");
         let op_regs: Vec<String> = operands.iter().map(|o| o.reg.clone()).collect();
         let op_names: Vec<Option<String>> = operands.iter().map(|o| o.name.clone()).collect();
         let op_is_memory: Vec<bool> = operands

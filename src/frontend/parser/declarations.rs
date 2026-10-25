@@ -484,9 +484,18 @@ impl Parser {
                             );
                             i += 2;
                         } else {
+                            // Each star keeps its own address space, by the same
+                            // pointee_space_before rule every other declarator
+                            // path uses.  Hardcoding Default here is what made
+                            // `T * __seg_gs *f(void)` return a Default-space
+                            // pointer: the kernel's `struct perf_event *
+                            // __percpu *` returns were then unassignable from
+                            // their own casts (kernel/events/hw_breakpoint.c),
+                            // while the identical spelling on a parameter, a
+                            // variable or a member kept %gs.
                             return_type = TypeSpecifier::Pointer(
                                 Box::new(return_type),
-                                AddressSpace::Default,
+                                crate::common::type_builder::pointee_space_before(derived, i),
                             );
                             i += 1;
                         }

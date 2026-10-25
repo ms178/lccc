@@ -888,6 +888,16 @@ jobs:
       run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_seg_init_brace_elision.sh
     - name: Named-space typedef code generation
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_seg_typedef_codegen.sh
+    - name: Named-space pointer declarator levels
+      run: env GCC=gcc-16 CCC=target/fastbuild/lccc python3 tests/regression/check_seg_pointer_declarators.py
+    - name: Inline-asm memory operands always carry an address
+      run: env GCC=gcc-16 CCC=target/fastbuild/lccc python3 tests/regression/check_rmwcc_mem_operand.py
+    - name: __builtin_types_compatible_p answers about the type
+      run: env GCC=gcc-16 CCC=target/fastbuild/lccc python3 tests/regression/check_types_compatible_p.py
+    - name: Compound literal as a designated aggregate element
+      run: env GCC=gcc-16 CCC=target/fastbuild/lccc python3 tests/regression/check_compound_literal_element.py
+    - name: Debug knobs are neutral
+      run: env CCC=target/fastbuild/lccc python3 tests/regression/check_debug_knobs_neutral.py
     - name: Verify binary-equivalence attribution contracts
       run: python3 tests/corpus/test_binary_equivalence.py
     - name: Check the recursion-to-iteration pass

@@ -3,7 +3,8 @@
 # build_kernel_full.sh — drive a full linux-cachymod kernel build with LCCC.
 #
 # This is the incremental "real workload" harness for the kernel-compilation
-# quest.  It prepares the patched 6.18.55 tree (see prepare_kernel_tree.sh),
+# quest.  It prepares the patched linux-cachymod tree (see prepare_kernel_tree.sh;
+# the version is whatever the package PKGBUILD pins),
 # selects an LCCC-bootable x86_64 configuration (the package's custom
 # scheduler functionality enabled; function tracing/objtool/stack-protector
 # disabled because LCCC does not yet emit `-pg`/`__fentry__`, emit objects
@@ -22,7 +23,8 @@
 #          build_kernel_full.sh net/core/ fs/ ...        # selected subdirs
 #
 # Environment:
-#   KERNEL_DIR  patched tree  (default /home/user/target/kernel-work/linux-6.18.55)
+#   KERNEL_DIR  patched tree  (default: kernel_version.sh's answer, i.e.
+#               $KERNEL_WORK/linux-$KVER under ~/.cache/lccc/kernel-work)
 #   PKGDIR      archpkgbuilds pkg dir (default .../packages/linux-cachymod-6.18)
 #   LCCC        compiler (default <repo>/target/fastbuild/lccc, where <repo> is
 #               the checkout this script lives in)
@@ -37,7 +39,13 @@
 set -euo pipefail
 
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-K=${KERNEL_DIR:-/home/user/target/kernel-work/linux-6.18.55}
+# Which kernel tree?  scripts/kernel_version.sh is the single source of truth
+# (explicit KERNEL_DIR/KVER > the prepared tree on disk > the package PKGBUILD
+# > a pinned fallback); the literal that used to live here went stale the
+# moment archpkgbuilds bumped 6.18.55 -> 6.18.58.
+# shellcheck source=kernel_version.sh
+. "$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/kernel_version.sh"
+K=${KERNEL_DIR:-$(lccc_kernel_default_dir)}
 PKGDIR=${PKGDIR:-/home/user/archpkgbuilds/packages/linux-cachymod-6.18}
 REPO_ROOT=$(CDPATH= cd -- "$here/.." && pwd)
 LCCC=${LCCC:-$REPO_ROOT/target/fastbuild/lccc}

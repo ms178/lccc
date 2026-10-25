@@ -505,6 +505,7 @@ impl InlineAsmEmitter for I686Codegen {
         operand_types: &[IrType],
         goto_labels: &[(String, BlockId)],
     ) -> String {
+        crate::backend::x86_common::assert_memory_operands_resolved(operands, "i686");
         let op_regs: Vec<String> = operands.iter().map(|o| o.reg.clone()).collect();
         let op_names: Vec<Option<String>> = operands.iter().map(|o| o.name.clone()).collect();
         let op_is_memory: Vec<bool> = operands

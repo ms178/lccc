@@ -106,6 +106,7 @@ impl<'s> StaticInitChecker<'s> {
         match init {
             Initializer::Expr(e) => {
                 if self.whole_initializer_kind(e) == Kind::Bad {
+                    self.explain_rejected_leaf(e);
                     out.push(e.span());
                 }
             }
@@ -139,10 +140,34 @@ impl<'s> StaticInitChecker<'s> {
         self.non_constant_leaves(init).is_empty()
     }
 
+    /// Explain a rejected leaf on demand.
+    ///
+    /// The diagnostic names the source span; this names the leaf's *shape* and
+    /// its inferred type, which is what a reader needs to tell "the address of
+    /// an automatic object" from "a cast to a type an address constant may not
+    /// become".  Off unless `CCC_DEBUG_STATIC_INIT=1`, so the language stays
+    /// quiet by default; this is the explainability contract ("why was this
+    /// rejected?") applied to the initializer rules, and it is how
+    /// arch/x86/events/rapl.c's `(unsigned long)&model_amd_hygon` inside an
+    /// array element was traced.
+    fn explain_rejected_leaf(&self, e: &Expr) {
+        if std::env::var_os("CCC_DEBUG_STATIC_INIT").is_none() {
+            return;
+        }
+        eprintln!(
+            "[static-init] leaf rejected as non-constant: {e:?}\n\
+             [static-init]   inferred type: {:?}\n\
+             [static-init]   kind: {:?}",
+            (self.ctype)(e),
+            self.leaf_kind(e)
+        );
+    }
+
     fn collect_bad(&self, init: &Initializer, out: &mut Vec<Span>) {
         match init {
             Initializer::Expr(e) => {
                 if self.leaf_kind(e) == Kind::Bad {
+                    self.explain_rejected_leaf(e);
                     out.push(e.span());
                 }
             }

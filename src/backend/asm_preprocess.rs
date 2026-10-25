@@ -847,42 +847,93 @@ pub(crate) fn parse_macro_header(rest: &str) -> (&str, Vec<MacroParam>) {
 
 /// Parse a macro parameter list, handling `param = default_value` syntax.
 ///
-/// GAS allows parameters like `enable = 1` where `1` is the default value
-/// used when the caller omits that argument. Parameters are separated by
-/// commas or whitespace.
+/// GAS splits `.macro` parameters on top-level commas **and/or whitespace**,
+/// and a `= default` belongs to exactly one parameter: the default is the
+/// single operand token that follows the `=`, ending at the next top-level
+/// whitespace or comma.  Everything here was byte-probed against binutils
+/// 2.47 (`as`) because the rule is not documented in this detail:
+///
+/// | header                       | `as` behaviour                                  |
+/// |------------------------------|-------------------------------------------------|
+/// | `a=1 b=2`                    | two parameters, defaults 1 and 2                |
+/// | `a=1,b=2`                    | two parameters (comma separator)                |
+/// | `a = 1`                      | one parameter, default 1 (spaces around `=` ok) |
+/// | `a b=1`                      | bare `a`, `b` with default 1                    |
+/// | `type:req a=0 b=0 c=0`       | four parameters                                 |
+/// | `ftr2=((0x8000 | (3*32+21)))`| default keeps every space inside the parens      |
+/// | `a=1 << 2 b=3`               | `a` (default 1), `<<`, `2`, `b` (default 3)      |
+///
+/// The previous implementation split the header on top-level COMMAS first and
+/// then attached everything after the first `=` on a part to that parameter,
+/// so a header like the kernel's
+///
+///     .macro UNWIND_HINT type:req sp_reg=0 sp_offset=0 signal=0
+///
+/// (arch/x86/include/asm/objtool.h, reachable from arch/x86/entry/entry.S via
+/// <asm/unwind_hints.h>) became ONE parameter `type` with the default
+/// `req sp_reg=0 sp_offset=0 signal=0`.  Every `UNWIND_HINT ... sp_offset=`
+/// invocation then failed with "Parameter named `sp_offset' does not exist
+/// for macro `UNWIND_HINT'", which is what stopped the full kernel build at
+/// its first object.
+///
+/// Parens/brackets/braces are tracked so a default may contain separators
+/// (`ALT_NOT(feature)` after the C preprocessor is `((... | (3*32+21)))`).
 fn parse_macro_params(params_str: &str) -> Vec<MacroParam> {
     let mut params = Vec::new();
-    // Split on TOP-LEVEL commas only: a parameter default may itself contain
-    // commas inside parentheses. The kernel's
-    //     .macro FILL_RETURN_BUFFER reg:req nr:req ftr:req ftr2=ALT_NOT(X86_FEATURE_ALWAYS)
-    // expands ALT_NOT() to `((... << 16) | ((3*32+21)))`, and a naive
-    // `split(',')` tore that default apart, leaving a bogus parameter whose
-    // value later reached `.4byte` as the unparsable fragment `(((1`.
-    for part in split_on_commas_raw(params_str) {
-        let part = part.trim();
-        if part.is_empty() {
+    let bytes = params_str.as_bytes();
+    let mut i = 0usize;
+
+    // Next byte that is not a parameter separator (space, tab, comma).
+    let skip_separators = |i: &mut usize| {
+        while *i < bytes.len() && matches!(bytes[*i], b' ' | b'\t' | b',') {
+            *i += 1;
+        }
+    };
+
+    loop {
+        skip_separators(&mut i);
+        if i >= bytes.len() {
+            break;
+        }
+        // Parameter name, together with any `:req`/`:vararg` qualifier: it ends
+        // at a separator or at the `=` that introduces its default.
+        let name_start = i;
+        while i < bytes.len() && !matches!(bytes[i], b' ' | b'\t' | b',' | b'=') {
+            i += 1;
+        }
+        let token = &params_str[name_start..i];
+        if token.is_empty() {
+            // A stray `=` (e.g. `a=1 == 2`): consume it so the loop advances.
+            i += 1;
             continue;
         }
-        // Only the FIRST `=` at paren depth 0 separates the name from the
-        // default; everything after it belongs to the default, spaces
-        // included. The tokens before it are further parameters (GAS allows
-        // whitespace as a separator), but the default itself must never be
-        // whitespace-split: treating the spaces inside
-        // `(((1 << 0) << 16) | ((3*32+21)))` as separators invented
-        // parameters named `<<` and `0)` and left `\ftr2` expanding to `(((1`.
-        let (names, default) = match find_toplevel_eq(part) {
-            Some(eq) => (part[..eq].trim(), Some(part[eq + 1..].trim())),
-            None => (part, None),
-        };
-        let tokens: Vec<&str> = names.split_whitespace().collect();
-        for (i, tok) in tokens.iter().enumerate() {
-            let mut param = split_param_qualifier(tok);
-            if i + 1 == tokens.len() {
-                param.default = default.map(str::to_string);
+        let mut param = split_param_qualifier(token);
+
+        // `name = default` with optional whitespace around the `=`.
+        let mut look = i;
+        skip_separators(&mut look);
+        if look < bytes.len() && bytes[look] == b'=' {
+            look += 1;
+            while look < bytes.len() && matches!(bytes[look], b' ' | b'\t') {
+                look += 1;
             }
-            params.push(param);
+            let default_start = look;
+            let mut depth = 0i32;
+            while look < bytes.len() {
+                match bytes[look] {
+                    b'(' | b'[' | b'{' => depth += 1,
+                    b')' | b']' | b'}' => depth -= 1,
+                    b' ' | b'\t' | b',' if depth == 0 => break,
+                    _ => {}
+                }
+                look += 1;
+            }
+            param.default = Some(params_str[default_start..look].to_string());
+            i = look;
         }
+        params.push(param);
     }
+
     params
 }
 
@@ -1030,78 +1081,6 @@ pub(crate) fn split_macro_arg_fields(s: &str, lexing: MacroArgLexing) -> Vec<Vec
     if !field.is_empty() {
         fields.push(field);
     }
-    fields
-}
-
-/// Split a string on top-level commas (outside parens and quotes).
-fn split_on_commas_raw(s: &str) -> Vec<String> {
-    let mut fields = Vec::new();
-    let mut current = String::new();
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    let mut paren_depth = 0i32;
-    let mut in_quote = false;
-
-    while i < bytes.len() {
-        if in_quote {
-            if bytes[i] == b'\\' && i + 1 < bytes.len() {
-                current.push(bytes[i] as char);
-                current.push(bytes[i + 1] as char);
-                i += 2;
-                continue;
-            }
-            if bytes[i] == b'"' {
-                in_quote = false;
-            }
-            current.push(bytes[i] as char);
-            i += 1;
-            continue;
-        }
-        match bytes[i] {
-            b'"' => {
-                in_quote = true;
-                current.push('"');
-            }
-            b'\'' => {
-                // GAS character literal: 'x (optionally closed: 'x'). The
-                // byte after the quote is data, even a space or comma
-                // (`movb $' ', %bl` in relocate_kernel_64.S). Copy the whole
-                // literal through verbatim so it never splits the token.
-                current.push('\'');
-                if i + 1 < bytes.len() {
-                    if bytes[i + 1] == b'\\' && i + 2 < bytes.len() {
-                        current.push('\\');
-                        current.push(bytes[i + 2] as char);
-                        i += 2;
-                    } else {
-                        current.push(bytes[i + 1] as char);
-                        i += 1;
-                    }
-                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
-                        current.push('\'');
-                        i += 1;
-                    }
-                }
-            }
-            b'(' => {
-                paren_depth += 1;
-                current.push('(');
-            }
-            b')' => {
-                paren_depth -= 1;
-                current.push(')');
-            }
-            b',' if paren_depth == 0 => {
-                fields.push(current.clone());
-                current.clear();
-            }
-            _ => {
-                current.push(bytes[i] as char);
-            }
-        }
-        i += 1;
-    }
-    fields.push(current);
     fields
 }
 
@@ -2538,6 +2517,74 @@ mod tests {
         assert_eq!(
             bind("o a", "z=1").unwrap_err(),
             "Parameter named `z' does not exist for macro `o'"
+        );
+    }
+
+    #[test]
+    fn macro_headers_split_on_whitespace_as_well_as_commas() {
+        // Every expectation below was byte-probed against binutils 2.47 `as`.
+        let names = |s: &str| -> Vec<(String, Option<String>)> {
+            super::parse_macro_params(s)
+                .into_iter()
+                .map(|p| (p.name, p.default))
+                .collect()
+        };
+        // The kernel's UNWIND_HINT header (arch/x86/include/asm/objtool.h):
+        // parsed as ONE parameter `type` before this fix, so every
+        // `UNWIND_HINT ... sp_offset=N` invocation died with
+        // "Parameter named `sp_offset' does not exist".
+        assert_eq!(
+            names("type:req sp_reg=0 sp_offset=0 signal=0"),
+            vec![
+                ("type".to_string(), None),
+                ("sp_reg".to_string(), Some("0".into())),
+                ("sp_offset".to_string(), Some("0".into())),
+                ("signal".to_string(), Some("0".into())),
+            ]
+        );
+        assert_eq!(
+            names("base=%rsp offset=0 indirect=0 extra=1"),
+            vec![
+                ("base".to_string(), Some("%rsp".into())),
+                ("offset".to_string(), Some("0".into())),
+                ("indirect".to_string(), Some("0".into())),
+                ("extra".to_string(), Some("1".into())),
+            ]
+        );
+        // Comma separation, spaces around `=`, and a bare parameter.
+        assert_eq!(
+            names("a=1,b=2"),
+            vec![
+                ("a".to_string(), Some("1".into())),
+                ("b".to_string(), Some("2".into()))
+            ]
+        );
+        assert_eq!(names("a = 1"), vec![("a".to_string(), Some("1".into()))]);
+        assert_eq!(
+            names("a b=1"),
+            vec![("a".to_string(), None), ("b".to_string(), Some("1".into()))]
+        );
+        // A default keeps separators that are inside brackets: after the C
+        // preprocessor ALT_NOT(X86_FEATURE_ALWAYS) is `((... | (3*32+21)))`.
+        assert_eq!(
+            names("ftr2=((0x80000000 | (3*32+21)))"),
+            vec![(
+                "ftr2".to_string(),
+                Some("((0x80000000 | (3*32+21)))".into())
+            )]
+        );
+        // `as` ends a default at the first top-level space, so `<<` and `2`
+        // become (unused) parameters.  Matching that keeps a header's
+        // parameter count identical to the oracle's, which is what decides
+        // "too many positional arguments".
+        assert_eq!(
+            names("a=1 << 2 b=3"),
+            vec![
+                ("a".to_string(), Some("1".into())),
+                ("<<".to_string(), None),
+                ("2".to_string(), None),
+                ("b".to_string(), Some("3".into())),
+            ]
         );
     }
 }

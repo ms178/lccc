@@ -22,27 +22,43 @@
 #     compiler-{types,gcc}.h for __GNUC__ with sane function alignment)
 #
 # Usage:
-#   ./boot_kconfigless_stage.sh /path/to/linux-6.18.55.tar.xz /path/to/workdir
+#   ./boot_kconfigless_stage.sh /path/to/linux-6.18.58.tar.xz /path/to/workdir
 #   eval "$(./boot_kconfigless_stage.sh ... | grep ^export)"  # sets LCCC_BOOT_EXTRA
-#   KERNEL_DIR=/path/to/workdir/linux-6.18.55 LCCC=... OUT=... ./build_kernel_boot.sh
+#   KERNEL_DIR=/path/to/workdir/linux-6.18.58 LCCC=... OUT=... ./build_kernel_boot.sh
 # ============================================================================
 set -euo pipefail
 
 TARBALL=${1:?usage: $0 <kernel.tar.xz> <workdir>}
 WORK=${2:?usage: $0 <kernel.tar.xz> <workdir>}
+# The version is a property of the ARCHIVE, not of this script: kernel.org
+# tarballs unpack into a single top-level `linux-<version>/` directory, so the
+# archive basename names the tree.  Hardcoding it here meant the staging script
+# silently extracted nothing (tar: not found in archive) after the package
+# moved from 6.18.55 to 6.18.58, while `set -e` turned that into a bare
+# "tar: exited with status 2" thousands of lines later.
+[[ -f $TARBALL ]] || { echo "boot_kconfigless_stage: no such tarball: $TARBALL" >&2; exit 1; }
+SRC=$(basename -- "$TARBALL")
+SRC=${SRC%.tar.xz}
+SRC=${SRC%.tar.gz}
+KV=${SRC#linux-}
+[[ $KV =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || {
+    echo "boot_kconfigless_stage: cannot read a kernel version from '$TARBALL'" >&2
+    echo "  (expected a kernel.org name such as linux-6.18.58.tar.xz)" >&2
+    exit 1
+}
 mkdir -p "$WORK"
 cd "$WORK"
 tar -xJf "$TARBALL" \
-    linux-6.18.55/arch/x86/boot \
-    linux-6.18.55/arch/x86/include \
-    linux-6.18.55/include \
-    linux-6.18.55/scripts \
-    linux-6.18.55/arch/x86/kernel/cpu \
-    linux-6.18.55/arch/x86/tools \
-    linux-6.18.55/arch/x86/lib \
-    linux-6.18.55/arch/x86/Makefile \
-    linux-6.18.55/Makefile
-K="$WORK/linux-6.18.55"
+    "$SRC/arch/x86/boot" \
+    "$SRC/arch/x86/include" \
+    "$SRC/include" \
+    "$SRC/scripts" \
+    "$SRC/arch/x86/kernel/cpu" \
+    "$SRC/arch/x86/tools" \
+    "$SRC/arch/x86/lib" \
+    "$SRC/arch/x86/Makefile" \
+    "$SRC/Makefile"
+K="$WORK/$SRC"
 
 # ---- capflags.c (in-tree generator) ----------------------------------------
 sh "$K/arch/x86/kernel/cpu/mkcapflags.sh" \
@@ -63,7 +79,7 @@ for h in ioctl.h errno.h; do
     printf '#include <uapi/asm-generic/%s>\n' "$h" \
         > "$K/arch/x86/include/generated/uapi/asm/$h"
 done
-printf '#define UTS_RELEASE "6.18.55"\n' > "$K/include/generated/utsrelease.h"
+printf '#define UTS_RELEASE "%s"\n' "$KV" > "$K/include/generated/utsrelease.h"
 
 # ---- cpufeaturemasks.h (in-tree awk generator + stub .config) ---------------
 {

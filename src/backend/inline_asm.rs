@@ -1080,11 +1080,28 @@ fn finalize_operands_and_build_gcc_map(
 ) -> (usize, Vec<usize>) {
     let total_operands = outputs.len() + inputs.len();
 
+    // A memory operand's address is materialised into a scratch register here,
+    // i.e. AFTER the inputs have already been loaded into theirs.  The scratch
+    // allocator only knows about explicit-register constraints, so on a template
+    // with enough operands to exhaust the pool it could hand out a register an
+    // input is living in and destroy it before the asm body runs.  Exclude every
+    // register an operand already owns, not just the specific ones.  (GP and XMM
+    // pools are named disjointly, so plain string equality is the right test.)
+    let busy_regs: Vec<String> = {
+        let mut busy = specific_regs.to_vec();
+        for op in operands.iter() {
+            if !op.reg.is_empty() && !busy.contains(&op.reg) {
+                busy.push(op.reg.clone());
+            }
+        }
+        busy
+    };
+
     // Resolve memory operand addresses for outputs
     for (i, (_, ptr, _)) in outputs.iter().enumerate() {
         if matches!(operands[i].kind, AsmOperandKind::Memory) {
             let val = Operand::Value(*ptr);
-            emitter.resolve_memory_operand(&mut operands[i], &val, specific_regs);
+            emitter.resolve_memory_operand(&mut operands[i], &val, &busy_regs);
         }
     }
 
@@ -1120,7 +1137,7 @@ fn finalize_operands_and_build_gcc_map(
         }
         let op_idx = outputs.len() + i;
         if matches!(operands[op_idx].kind, AsmOperandKind::Memory) {
-            emitter.resolve_memory_operand(&mut operands[op_idx], val, specific_regs);
+            emitter.resolve_memory_operand(&mut operands[op_idx], val, &busy_regs);
         }
     }
 

@@ -1691,7 +1691,7 @@ mod zext_home_policy_tests {
         ));
         // A clobbered home no longer holds the loaded value.
         let mut cg = zext_cg(IrType::U32);
-        cg.home_clobbered.insert(1);
+        cg.mark_home_clobbered(1, "cast-ops");
         assert!(
             !cg.try_emit_zext_loaded_cast(
                 &Value(9),

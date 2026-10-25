@@ -26,6 +26,64 @@ use crate::emit;
 use crate::ir::reexports::TlsModel;
 use crate::ir::reexports::{IrConst, Operand, Value};
 
+/// Memory-operand text for the high word of a 64-bit (pair) access at
+/// `sym`, whose text may already carry a constant offset (`sym+38`).
+///
+/// The pair paths used to spell `sym` and then append a literal `+4`
+/// unconditionally, which produced `boot_params+38+4` — legal GAS syntax (the
+/// expression is folded), but it hides the real offset from every tool that
+/// reads the assembly and, until the assembler learned to fold chained terms,
+/// it also produced a bogus undefined symbol named `boot_params+38`.  Folding
+/// here keeps the emitted text as simple as what GCC/Clang write.
+/// Magnitude of a constant tail as written in an AT&T memory operand
+/// (`12`, `0x1f`, `0b101`).  `None` means the tail is not a constant, so the
+/// caller must not touch it.
+fn pair_offset_magnitude(tail: &str) -> Option<i64> {
+    if let Some(digits) = tail.strip_prefix("0x").or_else(|| tail.strip_prefix("0X")) {
+        return i64::from_str_radix(digits, 16).ok();
+    }
+    if let Some(digits) = tail.strip_prefix("0b").or_else(|| tail.strip_prefix("0B")) {
+        return i64::from_str_radix(digits, 2).ok();
+    }
+    tail.parse::<i64>().ok()
+}
+
+fn pair_hi_operand(sym: &str) -> String {
+    // Split a trailing `+N` / `-N` (decimal or 0x/0b), i.e. exactly the shape
+    // this file's callers build.  Anything else (TLS prefixes, expressions
+    // with a second symbol) keeps the plain `+4` spelling, which the assembler
+    // folds anyway.
+    let bytes = sym.as_bytes();
+    let mut split = None;
+    for i in (1..bytes.len()).rev() {
+        if bytes[i] == b'+' || bytes[i] == b'-' {
+            split = Some(i);
+            break;
+        }
+    }
+    if let Some(i) = split {
+        let tail = sym[i + 1..].trim();
+        if let Some(magnitude) = pair_offset_magnitude(tail) {
+            let signed = if bytes[i] == b'-' {
+                -magnitude
+            } else {
+                magnitude
+            };
+            if let Some(sum) = signed.checked_add(4) {
+                let head = &sym[..i];
+                return if sum == 0 {
+                    head.to_string()
+                } else if sum > 0 {
+                    format!("{}+{}", head, sum)
+                } else {
+                    format!("{}{}", head, sum)
+                };
+            }
+        }
+    }
+    format!("{}+4", sym)
+}
+
 /// Return the register spelling needed for a scalar store of `ty`.
 ///
 /// In 32-bit mode only eax, ebx, ecx and edx have encodable low-byte
@@ -112,7 +170,7 @@ impl I686Codegen {
 
         if super::emit::is_pair_scalar(ty) {
             emit!(self.state, "    movl {}, %eax", sym);
-            emit!(self.state, "    movl {}+4, %edx", sym);
+            emit!(self.state, "    movl {}, %edx", pair_hi_operand(sym));
 
             // The loads have replaced both halves of the accumulator pair.
             // Do not expose stale pair metadata to the store helper.
@@ -161,7 +219,7 @@ impl I686Codegen {
         if super::emit::is_pair_scalar(ty) {
             self.emit_load_acc_pair_impl(val);
             emit!(self.state, "    movl %eax, {}", sym);
-            emit!(self.state, "    movl %edx, {}+4", sym);
+            emit!(self.state, "    movl %edx, {}", pair_hi_operand(sym));
             self.state.reg_cache.invalidate_acc();
             self.state.reg_cache.invalidate_sec();
             return;
@@ -436,5 +494,23 @@ mod tests {
         for ty in [IrType::I8, IrType::U8, IrType::I16, IrType::U16] {
             assert_eq!(i686_store_register(ty, "not_a_register"), None);
         }
+    }
+
+    #[test]
+    fn pair_hi_operand_folds_the_offset_instead_of_stacking_addends() {
+        // The shape arch/x86/boot/video-vesa.c triggers: a 64-bit field copy
+        // out of `vminfo` at byte 31 and into `boot_params` at byte 38.
+        assert_eq!(pair_hi_operand("boot_params+38"), "boot_params+42");
+        assert_eq!(pair_hi_operand("vminfo+31"), "vminfo+35");
+        // Negative and hexadecimal offsets stay legal assembly.
+        assert_eq!(pair_hi_operand("sym-8"), "sym-4");
+        assert_eq!(pair_hi_operand("sym+0x10"), "sym+20");
+        // No offset / a bare symbol: the plain `+4` spelling is correct.
+        assert_eq!(pair_hi_operand("sym"), "sym+4");
+        // A tail that is not a constant is left to the assembler's expression
+        // folding (which now handles chained terms like GNU as).
+        assert_eq!(pair_hi_operand("sym+other"), "sym+other+4");
+        // The fold also cancels: `sym-4` + 4 is just `sym`.
+        assert_eq!(pair_hi_operand("sym-4"), "sym");
     }
 }

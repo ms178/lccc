@@ -1,0 +1,12 @@
+id	expect	payload
+scalar_literal_int	accept	int i[3] = { [1] = (int){42} };  int probe(void) { return i[1]; }  # probe: 42
+struct_one_level	accept	typedef struct { unsigned long b[2]; } nm_t;  nm_t a[2] = { [1] = (nm_t){ {[0] = 1UL, [1] = 2UL} } };  unsigned long probe(void) { return a[1].b[0] * 10 + a[1].b[1]; }  # probe: 12
+struct_qualified_literal	accept	typedef struct { unsigned long b[2]; } nm_t;  nm_t a[2] = { [0] = (const nm_t){ {[0] = 3UL} } };  unsigned long probe(void) { return a[0].b[0]; }  # probe: 3
+struct_multi_index	accept	typedef struct { unsigned long b[2]; } nm_t;  nm_t a[2][2] = { [1][0] = (nm_t){ {[1] = 5UL} } };  unsigned long probe(void) { return a[1][0].b[1]; }  # probe: 5
+nested_field_literal	accept	typedef struct { unsigned long b[2]; } nm_t;  typedef struct { nm_t n; } wrap_t;  wrap_t w[2] = { [1].n = (nm_t){ {[0] = 6UL} } };  unsigned long probe(void) { return w[1].n.b[0]; }  # probe: 6
+whole_element_literal	accept	typedef struct { unsigned long b[2]; } nm_t;  typedef struct { nm_t n; } wrap_t;  wrap_t w[2] = { [0] = (wrap_t){ .n = (nm_t){ {[0] = 8UL} } } };  unsigned long probe(void) { return w[0].n.b[0]; }  # probe: 8
+relocation_image	accept	typedef struct { const char *s; unsigned long v; } ptr_t;  int g = 7;  ptr_t p[2] = { [1] = (ptr_t){ .s = "abc", .v = (unsigned long)&g } };  unsigned long probe(void) { return p[1].s[0] + (p[1].v == (unsigned long)&g); }  # probe: 98
+plain_struct_literal	accept	struct inner { int x, y; };  struct inner s[2] = { [1] = (struct inner){9, 10} };  int probe(void) { return s[1].x * 100 + s[1].y; }  # probe: 910
+braced_equivalent	accept	typedef struct { unsigned long b[2]; } nm_t;  nm_t a[2] = { [1] = { {[0] = 4UL} } };  unsigned long probe(void) { return a[1].b[0]; }  # probe: 4
+cast_of_literal	reject	typedef struct { unsigned long b[2]; } nm_t;  nm_t a[2] = { [0] = (nm_t)(nm_t){ {[0] = 4UL} } };
+non_constant_field	reject	struct p2 { const char *s; int v; };  int g = 7;  struct p2 q[1] = { [0] = (struct p2){ .v = g } };

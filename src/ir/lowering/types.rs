@@ -172,47 +172,15 @@ impl Lowerer {
         }
     }
 
-    /// Check if two CTypes are compatible for __builtin_types_compatible_p purposes.
-    /// This is structural equality with special handling for:
-    /// - Arrays: compatible if element types match (ignore size for unsized arrays)
-    /// - Pointers: compatible if pointee types are compatible
-    /// - Enums: treated as compatible with int
+    /// Check if two CTypes are compatible for `__builtin_types_compatible_p`.
+    ///
+    /// ONE definition, shared with sema: `crate::common::types::ctypes_compatible`.
+    /// The private twin that used to live here compared function types with
+    /// `CType::Function`'s derived equality, which includes the parameter
+    /// NAMES, so an initializer folded in the lowering answered 0 for
+    /// compatible function types that sema had already accepted as 1.
     fn ctypes_compatible(a: &CType, b: &CType) -> bool {
-        // Normalize enum to int for compatibility purposes
-        let a_norm = match a {
-            CType::Enum(_) => &CType::Int,
-            other => other,
-        };
-        let b_norm = match b {
-            CType::Enum(_) => &CType::Int,
-            other => other,
-        };
-
-        match (a_norm, b_norm) {
-            // Pointers: pointee types must be compatible AND the named address
-            // spaces must be equal.  The space is part of the pointer type's
-            // identity (gcc: `__builtin_types_compatible_p(int *, __seg_gs int *)`
-            // is 0); treating it as invisible made every space pair compatible
-            // and answered `__same_type(...)` wrongly in the kernel's static
-            // assertions.  See the twin in sema's const_eval.rs.
-            (CType::Pointer(p1, s1), CType::Pointer(p2, s2)) => {
-                s1 == s2 && Self::ctypes_compatible(p1, p2)
-            }
-            // Arrays with compatible elements are compatible when both known
-            // bounds agree OR either side is incomplete (C17 6.2.7p3).
-            // `int[5]` and `int[]` are therefore compatible, while `int[5]`
-            // and `int[6]` are not.
-            (CType::Array(e1, s1), CType::Array(e2, s2)) => {
-                Self::ctypes_compatible(e1, e2) && (s1 == s2 || s1.is_none() || s2.is_none())
-            }
-            // Structs/Unions: use derived PartialEq (compares name + fields)
-            (CType::Struct(s1), CType::Struct(s2)) => s1 == s2,
-            (CType::Union(u1), CType::Union(u2)) => u1 == u2,
-            // Function types
-            (CType::Function(f1), CType::Function(f2)) => f1 == f2,
-            // All other types (scalars, void, bool, etc.): direct enum equality
-            _ => a_norm == b_norm,
-        }
+        crate::common::types::ctypes_compatible(a, b)
     }
 
     pub(super) fn type_spec_to_ir(&self, ts: &TypeSpecifier) -> IrType {

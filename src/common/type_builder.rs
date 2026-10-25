@@ -376,7 +376,19 @@ pub fn enum_type_of(
 /// the star immediately before it. The first star has no earlier star, so its
 /// pointee is the base type, and the base-specifier space is placed on it by
 /// `apply_declaration_address_space`.
-fn pointee_space_before(derived: &[DerivedDeclarator], i: usize) -> AddressSpace {
+/// The address space of the POINTEE of the pointer declared at `derived[i]`:
+/// the space recorded on the previous star (`Default` when there is none).
+///
+/// `T * __seg_gs *p` writes two stars; the qualifier after the first one says
+/// the pointer values that the NEXT (outer) star points at live in %gs, so the
+/// wrapper built for star `i` takes star `i-1`'s space.  This is the single
+/// definition of that rule: `build_full_ctype_with_base` and the parser's
+/// `build_return_type` both call it, so a named variable, a parameter, a
+/// struct member and a function's return type cannot disagree again
+/// (`T * __seg_gs *f(void)` used to lose %gs on the return type only, which
+/// made the kernel's `struct perf_event * __percpu *` return values
+/// unassignable in kernel/events/hw_breakpoint.c).
+pub fn pointee_space_before(derived: &[DerivedDeclarator], i: usize) -> AddressSpace {
     match i.checked_sub(1).map(|j| &derived[j]) {
         Some(DerivedDeclarator::Pointer(space)) => *space,
         _ => AddressSpace::Default,

@@ -343,7 +343,10 @@ impl Lowerer {
                         let layouts = self.types.borrow_struct_layouts();
                         layouts.get(&**key).map(|l| {
                             let cloned = l.clone();
-                            let has_ptrs = cloned.has_pointer_fields(&*layouts);
+                            let has_ptrs = cloned.has_pointer_fields(&*layouts)
+                                // A pointer-sized integer member holding an
+                                // address needs relocation tracking as well.
+                                || self.layout_can_hold_addr_constant(&cloned);
                             (cloned, has_ptrs)
                         })
                     }
@@ -510,36 +513,39 @@ impl Lowerer {
                     );
                     item_idx += 1;
                 }
-                Initializer::Expr(expr) => {
+                Initializer::Expr(_) => {
                     // Compound literal, e.g., ((struct Wrap) {inc_global}):
-                    // unwrap it and process the inner initializer list as struct fields.
-                    if let Expr::CompoundLiteral(_, inner_init, _) = expr {
-                        if let Initializer::List(ref sub_items) = **inner_init {
-                            self.fill_struct_fields_from_items(
-                                sub_items,
-                                layout,
-                                base_offset,
+                    // unwrap it and process the inner initializer list as
+                    // struct fields.  `compound_literal_items` /
+                    // `compound_literal_expr` are answered from the item's own
+                    // initializer, so both the braced and the scalar form are
+                    // recognised here without re-deriving the AST shape.
+                    if let Some(sub_items) = self.compound_literal_items(&item.init) {
+                        self.fill_struct_fields_from_items(
+                            sub_items,
+                            layout,
+                            base_offset,
+                            bytes,
+                            ptr_ranges,
+                        );
+                        item_idx += 1;
+                    } else if let Some(inner_expr) = self.compound_literal_expr(&item.init) {
+                        // Scalar compound literal (e.g., ((type){expr})):
+                        // treat the inner expression as the value for the first field
+                        if !layout.fields.is_empty() {
+                            let field = &layout.fields[0];
+                            let field_offset = base_offset + field.offset;
+                            let synth_item = InitializerItem {
+                                designators: Vec::new(),
+                                init: Initializer::Expr(inner_expr.clone()),
+                            };
+                            self.emit_struct_field_init_compound(
+                                &synth_item,
+                                field,
+                                field_offset,
                                 bytes,
                                 ptr_ranges,
                             );
-                        } else if let Initializer::Expr(ref inner_expr) = **inner_init {
-                            // Scalar compound literal (e.g., ((type){expr})):
-                            // treat the inner expression as the value for the first field
-                            if !layout.fields.is_empty() {
-                                let field = &layout.fields[0];
-                                let field_offset = base_offset + field.offset;
-                                let synth_item = InitializerItem {
-                                    designators: Vec::new(),
-                                    init: Initializer::Expr(inner_expr.clone()),
-                                };
-                                self.emit_struct_field_init_compound(
-                                    &synth_item,
-                                    field,
-                                    field_offset,
-                                    bytes,
-                                    ptr_ranges,
-                                );
-                            }
                         }
                         item_idx += 1;
                     } else {
@@ -919,7 +925,53 @@ impl Lowerer {
         } else if let Some(val) = self.eval_const_expr(expr) {
             let ir_ty = IrType::from_ctype(ty);
             self.write_const_to_bytes(bytes, offset, &val, ir_ty);
+        } else if self.member_holds_addr_constant(expr, ty) {
+            // A pointer-sized *integer* member can hold an address constant
+            // (C11 6.6p9): the kernel's `struct x86_cpu_id` keeps
+            // `(unsigned long)&model` in `unsigned long driver_data`.  The
+            // value a relocation writes is that address, so record the slot.
+            // Narrower integer members cannot hold it -- GCC and Clang both
+            // reject that truncating cast as a non-constant initializer -- and
+            // are left to the diagnostic below.
+            // The predicate above looked the same address up, so a `None` here
+            // is a contradiction inside this function -- but it is reached from
+            // user input, so it diagnoses instead of aborting: a rejected
+            // initializer with a real diagnostic beats an ICE.
+            match self.resolve_ptr_field_init(expr) {
+                Some(addr_init) => ptr_ranges.push((offset, addr_init)),
+                None => self.diagnose_non_constant(expr),
+            }
+        } else if let Some(val) = self.lookup_sema_const(expr) {
+            // Sema's folded value is the answer the initializer was accepted
+            // on (`lower_global_init_expr` documents the same rule); the
+            // lowering recomputes what it can and consumes sema's answer
+            // otherwise.
+            let ir_ty = IrType::from_ctype(ty);
+            self.write_const_to_bytes(bytes, offset, &val, ir_ty);
+        } else {
+            // Nothing could write this member.  Falling off the end left it
+            // zero *silently*: `struct S { int *p; int x; }; struct S s = {
+            // &m, f() };` compiled with `x == 0` and no diagnostic, while GCC,
+            // Clang and ICX all report a non-constant initializer (C11
+            // 6.7.9p4).  Diagnose instead of miscompiling.
+            self.diagnose_non_constant(expr);
         }
+    }
+
+    /// Does this member initializer store an address constant in a member of
+    /// integer type that is exactly pointer-sized?
+    ///
+    /// `unsigned long driver_data = (unsigned long)&model` is the kernel's
+    /// `struct x86_cpu_id` shape: C11 6.6p9 allows an address constant cast to
+    /// an integer type, and GCC and Clang accept it only where the member can
+    /// hold the address exactly (a narrower member is "initializer element is
+    /// not constant").  Both halves need the lowerer -- the address expression
+    /// and the non-constant check -- so this is a method, not a predicate.
+    fn member_holds_addr_constant(&self, expr: &Expr, ty: &CType) -> bool {
+        ty.is_integer()
+            && self.resolve_ctype_size(ty) == crate::common::types::target_ptr_size()
+            && self.eval_const_expr(expr).is_none()
+            && (self.eval_global_addr_expr(expr).is_some() || Self::expr_contains_label_addr(expr))
     }
 
     /// Consume consecutive expression items from `items` to flat-initialize an array field.
@@ -1081,7 +1133,10 @@ impl Lowerer {
         ptr_ranges: &mut Vec<(usize, GlobalInit)>,
     ) {
         if let Some(sub_layout) = self.get_struct_layout_for_ctype(field_ty) {
-            if sub_layout.has_pointer_fields(&*self.types.borrow_struct_layouts()) {
+            // Content decides, not the declared type: a nested struct whose only
+            // relocation is an address in a pointer-sized integer member must be
+            // filled with relocation tracking too (see `init_needs_relocations`).
+            if self.init_needs_relocations(items, &sub_layout) {
                 self.fill_nested_struct_with_ptrs(items, &sub_layout, offset, bytes, ptr_ranges);
             } else {
                 self.fill_struct_global_bytes(items, &sub_layout, bytes, offset);
@@ -1089,7 +1144,7 @@ impl Lowerer {
         } else if let CType::Array(elem_ty, _) = field_ty {
             // Array field: check if elements are structs/unions with pointer fields
             if let Some(elem_layout) = self.get_struct_layout_for_ctype(elem_ty) {
-                if elem_layout.has_pointer_fields(&*self.types.borrow_struct_layouts()) {
+                if self.init_needs_relocations(items, &elem_layout) {
                     // Array of structs with pointer fields: handle each element
                     let struct_size = elem_layout.size;
                     for (ai, item) in items.iter().enumerate() {
@@ -1207,19 +1262,18 @@ impl Lowerer {
                 );
                 1
             }
-            Initializer::Expr(expr) => {
-                // Unwrap compound literal: (type){ init_list } -> use inner init_list
-                if let Expr::CompoundLiteral(_, cl_init, _) = expr {
-                    if let Initializer::List(sub_items) = cl_init.as_ref() {
-                        self.fill_nested_struct_with_ptrs(
-                            sub_items,
-                            sub_layout,
-                            base_offset,
-                            bytes,
-                            ptr_ranges,
-                        );
-                        return 1;
-                    }
+            Initializer::Expr(_) => {
+                // Unwrap compound literal: (type){ init_list } -> use inner
+                // init_list (see `compound_literal_items`).
+                if let Some(sub_items) = self.compound_literal_items(&items[0].init) {
+                    self.fill_nested_struct_with_ptrs(
+                        sub_items,
+                        sub_layout,
+                        base_offset,
+                        bytes,
+                        ptr_ranges,
+                    );
+                    return 1;
                 }
                 // Brace-elided: pass remaining items to fill_nested_struct_with_ptrs
                 // which will consume items field-by-field for the sub-struct.

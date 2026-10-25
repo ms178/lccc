@@ -361,6 +361,57 @@ impl std::fmt::Display for AddressSpace {
     }
 }
 
+/// Compatibility of two C types in the sense of `__builtin_types_compatible_p`
+/// (C11 6.2.7 "compatible type and composite type").
+///
+/// This is the ONE definition.  Two earlier copies lived in sema and in the
+/// lowering and disagreed: the sema copy compared function types structurally
+/// (parameter names are not part of a function type, C11 6.7.6.3p2), the
+/// lowering copy used `CType::Function`'s derived `PartialEq`, which compares
+/// `FunctionType::params` — and those carry the parameter's NAME because a
+/// definition needs it.  A constant initializer is folded by the lowering, so
+/// `__builtin_types_compatible_p(void (*)(int), void (*)(int p))` answered 1 in
+/// sema's log and 0 in the emitted object: the exact shape the kernel asserts
+/// on (`assert_function_type()` in arch/x86/include/asm/irq_stack.h, fed by
+/// DEFINE_IDTENTRY_SYSVEC whose parameter is named `regs`).  Whatever the
+/// answer is, it must not depend on which half of the compiler asked.
+///
+/// The rules, each measured against GCC 16.2:
+///   * pointers: equal named address space and compatible pointees.  The space
+///     is part of the pointer's identity (`int *` and `__seg_gs int *` are
+///     incompatible), which the kernel relies on for `__same_type`;
+///   * arrays: compatible elements and either equal bounds or one unknown
+///     bound (C17 6.2.7p3);
+///   * functions: same variadic-ness, same parameter count, compatible return
+///     and parameter types.  NAMES ARE IGNORED;
+///   * enums: compatible with the integer type their value range picks
+///     (C11 6.7.2.2p4), so a body-less `enum tag` still matches `int` or
+///     `unsigned int` exactly like GCC;
+///   * everything else: structural equality.  (CV qualification lives in the
+///     parser's per-level qualifier vector, not in `CType`; the predicate's
+///     callers combine the two.)
+pub fn ctypes_compatible(t1: &CType, t2: &CType) -> bool {
+    match (t1, t2) {
+        (CType::Pointer(a, sa), CType::Pointer(b, sb)) => sa == sb && ctypes_compatible(a, b),
+        (CType::Array(a, sa), CType::Array(b, sb)) => {
+            ctypes_compatible(a, b) && (sa == sb || sa.is_none() || sb.is_none())
+        }
+        (CType::Function(a), CType::Function(b)) => {
+            a.variadic == b.variadic
+                && a.params.len() == b.params.len()
+                && ctypes_compatible(&a.return_type, &b.return_type)
+                && a.params
+                    .iter()
+                    .zip(b.params.iter())
+                    .all(|((x, _), (y, _))| ctypes_compatible(x, y))
+        }
+        (CType::Enum(e), other) | (other, CType::Enum(e)) if other.is_integer() => {
+            &e.compatible_ctype() == other
+        }
+        _ => t1 == t2,
+    }
+}
+
 /// Represents C types in the compiler.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum CType {

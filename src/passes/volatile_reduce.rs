@@ -544,18 +544,29 @@ impl CostlyAddresses {
 
 /// Pipeline caller resolves environment policy once per translation unit.
 /// Keep block/loop budgets explicit; the matcher reads no process-global state.
+/// Explainability for the pass' own bounds (`CCC_DEBUG_VOLRED=1`), matching the
+/// `CCC_DEBUG_BEPRE`/`CCC_DEBUG_AGGFWD` convention. Budget exhaustion is not a
+/// user-visible condition: a large function simply keeps its volatile loads, so
+/// printing it on every translation unit made a kernel build emit thousands of
+/// lines that no reader can act on.
+fn volred_dbg(args: std::fmt::Arguments<'_>) {
+    if std::env::var_os("CCC_DEBUG_VOLRED").is_some() {
+        eprintln!("volatile_reduce: {args}");
+    }
+}
+
 pub(crate) fn run(
     func: &mut IrFunction,
     costly_symbols: &FxHashSet<String>,
     enforce_block_budget: bool,
 ) -> usize {
     if enforce_block_budget && func.blocks.len() > MAX_BLOCKS_BUDGET {
-        eprintln!(
-            "volatile_reduce: skipping {}: {} blocks > {} (budget)",
+        volred_dbg(format_args!(
+            "skipping {}: {} blocks > {} (budget)",
             func.name,
             func.blocks.len(),
             MAX_BLOCKS_BUDGET
-        );
+        ));
         return 0;
     }
     if !func.blocks.iter().any(|b| {
@@ -587,10 +598,10 @@ pub(crate) fn run(
         }
         count += 1;
         if count >= MAX_VOLATILE_LOOPS_BUDGET {
-            eprintln!(
-                "volatile_reduce: budget {} loops reached in {}, stopping",
+            volred_dbg(format_args!(
+                "budget {} loops reached in {}, stopping",
                 MAX_VOLATILE_LOOPS_BUDGET, func.name
-            );
+            ));
             break;
         }
     }
