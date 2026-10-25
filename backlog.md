@@ -1015,33 +1015,75 @@ is read as, because the 64-bit backend encodes most instructions *in code*:
 dispatch on a suffix or a table built in a helper, and the VEX/EVEX emitters
 share helpers.  Measured on the current tree with ``--backend all``:
 
-| invocation | count | what it actually is |
+| invocation | count (re-derived 2026-10-25) | what it actually is |
 |---|---|---|
-| ``--verify`` | 1638 rows, 0 findings | every *row* is a legal encoding (sound) |
-| ``--missing`` | **349 → 286** encodings | 63 closed by modelling `encode_alu`; the rest are rows the model lacks |
-| ``--absent`` | 1767 mnemonics | names with no row; includes `cmovle`, `jnae`, `jrcxz` and the alias spellings |
-| ``--absent --triage`` | 1061 UNMENTIONED / 706 MENTIONED | spelling census, not coverage |
+| ``--verify --strict`` | 1638 rows + 224 code-model encodings, 0 findings | every *row* and every code-derived family is a legal encoding (sound) |
+| ``--missing`` | **896** encodings / 454 mnemonics | forms `as` accepts that nothing models yet; the ALU and the suffix families are no longer in it |
+| ``--absent`` | 1354 mnemonics | names with no row; includes APX/AVX-512 spellings and the alias spellings |
+| ``--absent --triage`` | 740 UNMENTIONED / 614 MENTIONED | spelling census, not coverage |
 
-The 349 was not a gap list: `add`, `call`, `movbe`, `rorx`, `pdep`, `pext`,
-`mulx`, `andn` and the ALU family are all *encoded*, and `call`/`add` are not
-even in the ``--absent`` set (a row names them) — the model simply could not see
-`0x01 + op * 8`.  Reading the counts as a worklist invites "implementing"
-encodings that already work, the one failure mode a coverage gate must not have.
-That these spellings also assemble to the same bytes as `as` 2.47 is the
-`as`-diff suite's claim, not this tool's: it is measured on the corpus, in CI,
-and is not assumed here.
+Every number in that table moved when the snapshot learned the direction bit
+(below), so none of the figures published before PR #965's snapshot may be
+quoted: the old 349/286 pair was measured against a snapshot that had `and
+0x22` missing *and* `movdqa 0x66 0f 6e` (which is `movd`) present.  The counts
+are only comparable within one snapshot; the tool prints the snapshot's own
+totals (2195 mnemonics, 4022 encodings) in ``--summary`` so a stale figure is
+visible.
 
-**Progress (2026-10-25): the integer ALU family is modelled.**  `code_models()`
-reads the `self.encode_alu(ops, mnemonic, <op>)` dispatch arms out of
-`encoder/mod.rs` and `alu_forms(op)` derives the nine legacy encodings from the
-dispatch index exactly as the encoder does — six opcode forms at
-`0x01 + op * 8`, three immediate forms at `80`/`81`/`83` with `/op`.  `add`
-therefore lands on `00..05`, `and` on `20..25` and `cmp` on `38..3D` from the
-same two lines, and a change to either side fails the model.  Effect:
-``--missing`` 349 → 286 encodings for ``--backend all`` (349 → 297 for
-``--backend i686``), with `add 01`, `add 05` and `add 80 /0` and their seven
-siblings closed.  Pinned by `test_the_alu_code_model_derives_the_opcode_from_the_dispatch_arm`
-and `test_a_code_modelled_family_leaves_the_gap_list`, the second of which also
+The list is still not a gap list: `add`, `call`, `movbe`, `rorx`, `pdep`,
+`pext`, `mulx`, `andn` and the ALU family are all *encoded*, and `call`/`add`
+are not even in the ``--absent`` set (a row names them) — the model simply
+could not see `0x01 + op * 8`.  Reading the counts as a worklist invites
+"implementing" encodings that already work, the one failure mode a coverage
+gate must not have.  That these spellings also assemble to the same bytes as
+`as` 2.47 is the `as`-diff suite's claim, not this tool's: it is measured on
+the corpus, in CI, and is not assumed here.
+
+**Progress (2026-10-25, second pass): four code-driven families, and the gate
+that checks them.**  `code_models()` now reads four code paths, not one:
+
+* `encode_alu` — the `self.encode_alu(ops, mnemonic, <op>)` dispatch arms out
+  of `encoder/mod.rs`; `alu_forms(op)` derives the nine legacy encodings from
+  the dispatch index (`add` `00..05` + `80`/`81`/`83 /0`, `and` `20..25`, `cmp`
+  `38..3D`).
+* `cc_from_mnemonic` — the 30-alias condition table in *both* backends'
+  `registers.rs`, giving `j<cc>` `0x70+cc`, `cmov<cc>` `0f 4x`, `set<cc>`
+  `0f 9x /0`.
+* `inc`/`dec` — the one-byte `40+rd`/`48+rd` forms, which only the **i686**
+  backend can use (REX owns `40..4F` in 64-bit mode, so `x86` must go through
+  `FE`/`FF`, which are declarative rows there).
+* `fma3_opcode` — the `vfm{,n}m{add,sub}{132,213,231}{ps,pd,ss,sd}` grid, whose
+  opcode lives in the mnemonic's digits and in no row at all.
+
+The claims are no longer trusted: `verify_code_models()` requires every one of
+the 224 encodings in 160 mnemonics to be a form `as` 2.47 actually accepts, in
+both directions (`CODE-UNKNOWN` for a mnemonic the snapshot does not have,
+`CODE-EXTRA` for an encoding it does not accept).  It is wired into `--verify`
+and into `--strict`, so a model that drifts from the encoder fails CI instead of
+quietly shrinking the gap counts.  That gate is what made the snapshot's own
+defects visible: the first run reported 16 findings, all of them the ALU `reg`
+forms, and the cause was in the *oracle* (see the next paragraph), not in the
+model.
+
+**The direction bit was transcribed wrong, and that is fixed.**  `D` does not
+mean "XOR 1": GNU as picks one of four schemes (`Opcode_D` 0x2 for the base
+map, `Opcode_ExtD` 0x1 for the extended maps, `Opcode_SIMD_IntD` 0x10 for the
+compact SIMD moves, `Opcode_FloatD` 0x4 for x87) and three cases — `Ugh` rows,
+FMA4/XOP rows, and commutative `C` rows — change no opcode at all.  The old
+transcription therefore **invented** encodings (`movdqa 66 0f 6e`, which is
+`movd`; `test 86`, which is `xchg`; `faddp da`, which is `fiadd`) and **missed**
+real ones (`and (%rax),%al` is `22 00`).  Two more gaps closed with it: `D|W`
+compose, so `mov` has all four of `88/89/8a/8b`, and rows with no ModR/M keep
+their register in the opcode (`push %rcx` is `51`), which the snapshot now
+expands over all eight registers.  Snapshot: 3975 → 4022 encodings, with 105
+wrong entries removed and 151 right ones added; every single change was
+cross-checked against `objdump -D` on synthesized bytes
+(`tests/corpus/test_gas_snapshot_decode.py`, which decodes the whole
+direction-sensitive subset in one pass and pins the six encodings the decoder
+itself spells differently, each with its reason).  Pinned hermetically by
+`GasDirectionModelTests` and `GasCodeModelGateTests`; the ALU forms by
+`test_the_alu_code_model_derives_the_opcode_from_the_dispatch_arm` and
+`test_a_code_modelled_family_leaves_the_gap_list`, the second of which also
 asserts that non-instruction pseudo-mnemonics (`cs`, `ds`, `es`) stay in the
 list, so the model cannot silently swallow everything.
 
@@ -1056,14 +1098,15 @@ pinned by tests in `tests/corpus/test_gas_encoding_crossref.py`.
 "What a row cannot see"), `tests/corpus/test_gas_encoding_crossref.py`.
 
 **Plan (each step independently landable).**
-1. ~~`encode_alu`~~ **done** (above).  Next, in this order: BMI/BMI2 (`pd`/`pe`/
-   `mulx`/`rorx`/`sarx`/`shlx`/`shrx`/`andn`/`bls*`), then `movbe`/`movdir*`,
-   then the branch/`cmov`/`setcc` suffix families (where the work is the suffix
-   *table*, not the encodings), then `crc32`'s EVEX forms.  Each extractor reads
-   the helper's own table, the pattern `vcvt_base_params` and `HELPERS` already
-   use.
-2. Only after step 1, make ``--missing`` exit non-zero (`--strict`) and wire it
-   into CI.  Until then it stays an interactive reading aid.
+1. ~~`encode_alu`~~, ~~`cc_from_mnemonic`~~, ~~`inc`/`dec`~~, ~~`fma3_opcode`~~
+   **done** (above).  Next, in this order: BMI/BMI2 (`pdep`/`pext`/`mulx`/
+   `rorx`/`sarx`/`shlx`/`shrx`/`andn`/`bls*`), then `movbe`/`movdir*`, then
+   `crc32`'s EVEX forms.  Each extractor reads the helper's own table, the
+   pattern `vcvt_base_params` and `HELPERS` already use, and each one lands
+   with a `verify_code_models()` claim so it cannot drift.
+2. ~~Wire the check into `--strict`~~ **done**: `--verify --strict` fails on a
+   `CODE-*` finding, and ``--missing``'s own exit status is still interactive
+   (the list is a reading aid until step 1 reaches zero).
 3. Delete the ``--absent`` list from the docstring's promise set once step 1
    covers the families it names.
 
@@ -1073,7 +1116,9 @@ watch the row count fall), plus ``--verify`` staying at 0 findings.
 
 **Accept.** ``--missing`` reaches 0 for both backends with ``--strict`` and the
 code-driven families modelled; no count in this file is quoted as coverage
-until then.  **Effort** M (the families are the work).  **ROI** 3.0 — it buys no
+until then.  Current distance: 896 encodings over 454 mnemonics, of which the
+ALU, the condition-code aliases, `inc`/`dec` and FMA3 are already *claims* that
+`--verify` checks, so the remaining list is a real worklist again.  **Effort** M (the families are the work).  **ROI** 3.0 — it buys no
 runtime, but it is the difference between a gate and a rumour, and three
 sessions have now spent time re-deriving that these numbers are not gaps.
 
