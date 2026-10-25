@@ -576,31 +576,20 @@ impl X86Codegen {
         ty: IrType,
         inst: &str,
     ) {
-        // `inst` is the VEX spelling (`vsqrtsd`); without AVX the legacy
-        // two-operand `sqrtsd %src, %dst` is used.  The legacy form is a
-        // merging op on the destination's upper lanes exactly like `movsd`,
-        // so the source-direct read-in-place path is still the right shape
-        // (one instruction, no staging copy).
+        // `inst` is the VEX spelling (`vsqrtsd`). Legacy scalar sqrt merges
+        // the destination's old upper lanes, even when its low-lane source
+        // is a different register. Seed the destination with a full-register
+        // copy first: this removes the false dependency on its previous
+        // iteration's result. load_fp_to_reg uses MOVAPS/MOVAPD (not the
+        // merging register-register MOVSS/MOVSD); an aliased source needs no
+        // copy. Scalar IR observes only the low lane. Keep the VEX path below
+        // source-direct: its explicit upper-lane source already avoids this.
         if !self.isa.avx {
             let legacy = inst.strip_prefix('v').unwrap_or(inst);
             if let Some(d) = dest {
                 if let Some(&reg) = self.reg_assignments.get(&d.0) {
                     if is_xmm_reg(reg) {
                         let dname = phys_reg_name(reg);
-                        if let Operand::Value(sv) = arg {
-                            if let Some(&sreg) = self.reg_assignments.get(&sv.0) {
-                                if is_xmm_reg(sreg) && sreg != reg {
-                                    self.state.emit_fmt(format_args!(
-                                        "    {} %{}, %{}",
-                                        legacy,
-                                        phys_reg_name(sreg),
-                                        dname
-                                    ));
-                                    self.state.reg_cache.invalidate_acc();
-                                    return;
-                                }
-                            }
-                        }
                         self.load_fp_to_reg(arg, ty, dname);
                         self.state
                             .emit_fmt(format_args!("    {} %{}, %{}", legacy, dname, dname));
@@ -2223,4 +2212,65 @@ enum FmaSrc1 {
     Home(&'static str),
     /// A slot- or pool-resident factor, loaded into the scratch %xmm1.
     Stage(Operand),
+}
+
+#[cfg(test)]
+mod scalar_sqrt_dependency_tests {
+    use super::*;
+    use crate::backend::regalloc::PhysReg;
+
+    #[test]
+    fn legacy_sqrt_seeds_the_entire_destination_without_a_merging_move() {
+        for (ty, sqrt, copy) in [
+            (IrType::F32, "sqrtss", "movaps"),
+            (IrType::F64, "sqrtsd", "movapd"),
+        ] {
+            for (source, destination) in [(20, 21), (33, 20), (20, 20)] {
+                let mut cg = X86Codegen::new();
+                cg.isa.avx = false;
+                cg.reg_assignments.insert(1, PhysReg(source));
+                cg.reg_assignments.insert(2, PhysReg(destination));
+                cg.emit_fp_scalar_unary(
+                    &Some(Value(2)),
+                    &Operand::Value(Value(1)),
+                    ty,
+                    &format!("v{sqrt}"),
+                );
+                let text = &cg.state.out.buf;
+                let dst = phys_reg_name(PhysReg(destination));
+                assert!(text.contains(&format!("{sqrt} %{dst}, %{dst}")), "{text}");
+                if source != destination {
+                    let src = phys_reg_name(PhysReg(source));
+                    let seed = format!("{copy} %{src}, %{dst}");
+                    assert!(
+                        text.find(&seed).unwrap() < text.find(sqrt).unwrap(),
+                        "{text}"
+                    );
+                } else {
+                    assert!(!text.contains(copy), "{text}");
+                }
+                assert!(
+                    !text.contains("    movsd %") && !text.contains("    movss %"),
+                    "{text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn vex_sqrt_keeps_its_explicit_source_dependency() {
+        for (ty, sqrt) in [(IrType::F32, "vsqrtss"), (IrType::F64, "vsqrtsd")] {
+            let mut cg = X86Codegen::new();
+            cg.isa.avx = true;
+            cg.reg_assignments.insert(1, PhysReg(20));
+            cg.reg_assignments.insert(2, PhysReg(21));
+            cg.emit_fp_scalar_unary(&Some(Value(2)), &Operand::Value(Value(1)), ty, sqrt);
+            let text = &cg.state.out.buf;
+            assert!(
+                text.contains(&format!("{sqrt} %xmm2, %xmm2, %xmm3")),
+                "{text}"
+            );
+            assert!(!text.contains("movap"), "{text}");
+        }
+    }
 }
