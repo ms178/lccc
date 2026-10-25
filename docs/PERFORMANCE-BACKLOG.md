@@ -72,6 +72,25 @@ New items, each with a witness, on top of the list above:
    (`fold_copy_and_mask_into_movz` handles the `movl`+`andl` pair, not the
    in-place mask).
 
+Status 2026-10-25 (read from source; no runtime claim):
+
+* Item 3 is **closed**.  `fold_scaled_index_temp_into_mem`
+  (`src/backend/x86/codegen/peephole/passes/relay_and_lea.rs`) composes a
+  scaled-index temporary into a `lea` consumer as one `(%B,%I,s)` address —
+  the `leaq 0(,%r14,8),%r9` + `leaq (%r8,%r9,1),%rdi` shape — through the same
+  `compose_sib` every LEA fold uses, and declines when the composition would
+  need a displacement (the 3-component slow LEA).  The unit
+  `lea_chain_with_index_producer_composes_not_concatenates` pins that it never
+  concatenates into the unencodable two-index form.  Do not re-open it; the
+  remaining `hot_web_loop` work is the loop-carried copies below.
+* The measured levers that are actually left are the allocator-side ones in
+  [`FOLLOWUP-2026-10-23-remaining-codegen-gap.md`](FOLLOWUP-2026-10-23-remaining-codegen-gap.md):
+  cross-web zero-extending copy coalescing (76 % of `zstd_count`'s instruction
+  gap), the loop-carried spill, and re-homing the `%cl` shift count into `%rcx`
+  instead of copying into it.  All three are interference/coalescing work in
+  `src/backend/regalloc.rs`; none is a peephole, and the document's "what this
+  rules out" section explains why more peephole copies cannot substitute.
+
 ## Callgrind re-baseline after the sibling-call conversion (TODO-9 + TODO-3)
 
 `scripts/callgrind_ab.py`, simulated Ir (not wall-clock), correctness-gated on

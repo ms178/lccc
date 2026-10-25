@@ -31,12 +31,37 @@ What it answers, all offline and from a vendored snapshot
 * ``--verify``   every declarative encoder row is a legal `as` 2.47 encoding of
                  that mnemonic (LCCC-EXTRA pinpoints a wrong opcode/prefix/digit),
                  or an invented mnemonic (LCCC-UNKNOWN).
-* ``--missing``  every (mnemonic, encoding) `as` 2.47 accepts that the encoder
-                 has no row for, grouped by mnemonic: the implementation
-                 worklist, with no alias guessing anywhere.
-* ``--coverage`` write the mnemonics with no encoder row at all to JSON, i.e. the
-                 worklist for instructions the backend does not implement yet.
+* ``--missing``  every (mnemonic, encoding) `as` 2.47 accepts that no
+                 *declarative row* models, grouped by mnemonic.  Read "what a row
+                 cannot see" below before treating the count as a worklist.
+* ``--coverage`` write the mnemonics with no declarative row at all to JSON.
+* ``--absent``   the same set as a flat mnemonic list.
+* ``--triage``   with ``--absent``: split that list by whether the mnemonic is
+                 spelled *anywhere* in the backend's sources.  Neither half is a
+                 verdict: a mention can be a comment, a deny-list entry or a
+                 family prefix that does not cover the spelling, and a family
+                 that composes its mnemonic (`format!`, `concat!`) leaves no
+                 literal at all, so a supported instruction can land in
+                 UNMENTIONED.  It is a reading aid for the two counts, run
+                 interactively (one full source scan per name), never in CI.
 * ``--summary``  counts per family/map, and the template-expansion statistics.
+
+What a row cannot see
+---------------------
+The model sees only a backend's *declarative* rows, and the 64-bit backend
+encodes most instructions in code: `encode_alu` derives the opcode
+arithmetically (`0x01 + op * 8`, `encoder/gp_integer.rs`), the `jcc`/`cmov*`/
+`setcc` families dispatch on a suffix match, and the VEX/EVEX emitters share
+helpers, so none of them has a row.  ``--missing``/``--absent`` therefore count
+those instructions as gaps although the assembler encodes them: with
+``--backend all`` the current tree reports `add`, `call`, `cmovle` and the whole
+`jcc` family under ``--absent`` and `add 01` under ``--missing``, while
+`encode_alu` computes that `01` and the other spellings appear as literals in
+`encoder/*.rs`.  The two counts are a *declarative-row* census,
+not an ISA-coverage census, and the sound direction is ``--verify`` — it asks
+whether each row that does exist is a legal encoding.  Making the other two
+directions a real worklist means teaching the model the code-driven families
+(`backlog.md` MB-45), not reading their counts as missing instructions.
 
 `--backend {all,i686,x86}` selects the encoder sources.  The 64-bit backend is
 not a superset of the 32-bit one — x87 integer memory arithmetic, `fcmov*` and
@@ -739,6 +764,28 @@ def coverage(rows: list[dict], table: dict[str, list[dict]]) -> dict[str, list[d
     return gap
 
 
+def triage_absent(absent: list[str], files: list[str]) -> tuple[list[str], list[str]]:
+    """Split `absent` into (unmentioned, mentioned) over the backend sources.
+
+    Both halves need care, which is why this is a reading aid and not a gate:
+
+    * MENTIONED may be a comment, a deny-list entry, or a family prefix
+      (`cmov`, `set`) whose arm does not cover the spelling.
+    * UNMENTIONED may still be supported: an encoder that composes the mnemonic
+      (`format!("vfmadd{op}...")`, `concat!`) has no literal for it.
+
+    What it does buy is the *order* to read the list in: a name that appears
+    nowhere at all is the cheapest place to start.  One scan of the whole source
+    per name is why this runs interactively, never in CI.
+    """
+    text = "\n".join(Path(f).read_text(encoding="utf-8", errors="replace") for f in files)
+    unmentioned, mentioned = [], []
+    for name in absent:
+        pat = re.compile(r"(?<![A-Za-z0-9_.])" + re.escape(name) + r"(?![A-Za-z0-9_])")
+        (mentioned if pat.search(text) else unmentioned).append(name)
+    return unmentioned, mentioned
+
+
 def _fmt(enc: dict) -> str:
     parts = [enc["family"], enc.get("map") or "-", enc.get("pp") or "-"]
     if enc.get("w") is not None:
@@ -759,6 +806,8 @@ def main() -> int:
     ap.add_argument("--verify", action="store_true", help="check every encoder row")
     ap.add_argument("--missing", action="store_true", help="encodings the encoder lacks")
     ap.add_argument("--absent", action="store_true", help="mnemonics with no row at all")
+    ap.add_argument("--triage", action="store_true",
+                    help="with --absent: split by whether the backend sources mention the name")
     ap.add_argument("--coverage", metavar="OUT",
                     help="write a JSON worklist of mnemonics with no encoder row")
     ap.add_argument("--summary", action="store_true")
@@ -846,8 +895,9 @@ def main() -> int:
     if args.missing:
         gaps = missing(rows, table, model)
         total = sum(len(v) for v in gaps.values())
-        print(f"\nencodings as 2.47 accepts that the encoder has no row for: {total} "
-              f"across {len(gaps)} mnemonics already implemented")
+        print(f"\nencodings as 2.47 accepts that no declarative row models: {total} "
+              f"across {len(gaps)} mnemonics with at least one row "
+              f"(code-implemented families are not rows; see the docstring)")
         for name in sorted(gaps):
             forms = ", ".join(_fmt(e) for e in gaps[name])
             print(f"  {name:14s} {forms}")
@@ -856,12 +906,20 @@ def main() -> int:
         gap = coverage(rows, table)
         Path(args.coverage).write_text(json.dumps(gap, indent=1, sort_keys=True) + "\n")
         legal = sum(len(v) for v in gap.values())
-        print(f"\nmnemonics with no encoder row (written to {args.coverage}): {len(gap)}"
-              f" carrying {legal} reference encodings")
+        print(f"\nmnemonics with no declarative row (written to {args.coverage}):"
+              f" {len(gap)} carrying {legal} reference encodings")
 
     if args.absent:
         absent = unimplemented_mnemonics(rows, table)
-        print(f"\nmnemonics as 2.47 knows with no encoder row: {len(absent)}")
+        print(f"\nmnemonics as 2.47 knows with no declarative row: {len(absent)}")
+        if args.triage:
+            unmentioned, mentioned = triage_absent(absent, files)
+            print(f"  UNMENTIONED {len(unmentioned)}: the spelling appears in no "
+                  f"backend source -- read these first, not a verdict")
+            print("    " + " ".join(unmentioned))
+            print(f"  MENTIONED   {len(mentioned)}: named somewhere in the sources; "
+                  f"candidates, not proof (a comment or a deny list names them too)")
+            return 0
         print("  " + " ".join(absent))
     return 0
 
