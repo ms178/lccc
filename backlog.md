@@ -915,6 +915,45 @@ re-check `gas_encoding_crossref.py --verify --strict --backend all`. Accept:
 both gates exit 0 on a clean tree, and adding a row with a wrong opcode,
 prefix, map or `/digit` makes exactly that row fail.
 
+### MB-44 · P0 · R — close the runtime gaps the ranker can now report
+The corpus ranking tool could not read five of the six checked-in evidence
+reports (they predate the nested `runtime` schema), so it wrote them off as
+"INCORRECT/FAILED" and the worst-workload list has been derived by hand since.
+`scripts/bench_rank.py` now normalises the older flat schema and refuses an
+unknown one instead of labelling it a failure, which makes the recorded corpus
+usable again. Ranking `engineering/evidence/benchmarks/2026-09-27-s13-685da054`
+(ratios are lccc/GCC, >1 = lccc slower, 95 % paired bootstrap):
+
+| # | workload | lccc | GCC | ratio | CI |
+|---|---|---|---|---|---|
+| 1 | `lz4_match_extend` | 2332.0 ms | 1250.6 ms | **1.937** | [1.787, 2.059] |
+| 2 | `nbody` | 527.7 ms | 374.4 ms | **1.414** | [1.407, 1.548] |
+| 3 | `expat_xml_scan` | 52.2 ms | 41.5 ms | **1.246** | [1.045, 1.306] |
+| 4 | `hash_table` | 15817.2 ms | 13412.7 ms | **1.176** | [1.076, 1.223] |
+| 5 | `linux_find_bit_scaled` | 1058.0 ms | 932.9 ms | **1.162** | [1.078, 1.235] |
+
+The 2026-09-25 red-team run ranks the same kernels the same way over a wider
+set (`linux_find_bit` 1.312, `mandelbrot` 1.285, `binary_trees` 1.186,
+`sha256_transform` 1.177, `sqlite_varint` 1.131, `zstd_count` 1.119,
+`switch_dispatch` 1.109, `nbody` 1.078) and puts `spectral_norm` at 27.7×, which
+the 2026-10-17 archive records as later repaired to ≈1.0 — re-measure before
+quoting it. Work order: `lz4_match_extend` (byte-compare match extension: the
+classic "GCC widens the compare, we go one byte at a time" shape) and `nbody`
+(FP-heavy, no vectorisation win) first, then `expat_xml_scan` (`sqlite_varint`
+overlap) and `hash_table` (probe loop).
+
+**Blocker, stated once so it stops costing a session each time:** `lccc` needs a
+Rust toolchain, and this sandbox has none and no route to one — `static.rust-lang.org`
+is unreachable and rust-lang/rust publishes no binary release assets; the
+tag-cache ref (`harness-cache-1`) carries `gcc-16-bookworm-x86_64`,
+`binutils-2.47`, `debs-bookworm` and `mold-2.42.1`, and no Rust. Both are now
+provisioned and verified from that ref here (GNU as/objdump 2.47.20260726, GCC
+16.2.0, SHA-256 checked against `MANIFEST.sha256`), so every oracle-shaped gate
+in this file can be run locally; only `cargo`-shaped work cannot. Runtime
+numbers therefore still come from hosted CI — `python3 scripts/bench_rank.py
+<shard report>` is the reader, and `--compare` is the A/B that decides whether a
+change stays.
+
 ---
 
 ## 10. Carried over from the superseded live queue (full text in the archives)
