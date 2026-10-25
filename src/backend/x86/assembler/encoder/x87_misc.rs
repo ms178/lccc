@@ -1,5 +1,75 @@
 use super::*;
 
+/// Operand-size index into the suffix-less mnemonic tables below.
+///
+/// Index 3 is the 64-bit spelling, which is also the fallback: for the
+/// spellings these tables serve, a size that is not 1, 2 or 4 bytes can only
+/// be the 64-bit case (this is what the `_ => "q"` suffix arms did before).
+const fn size_index(size: u8) -> usize {
+    match size {
+        1 => 0,
+        2 => 1,
+        4 => 2,
+        _ => 3,
+    }
+}
+
+/// Suffix-less ALU mnemonics indexed by `[digit][size_index]`.
+///
+/// The digit is the ModRM `/r` extension field (`0` add, `1` or, `2` adc,
+/// `3` sbb, `4` and, `5` sub, `6` xor, `7` cmp) and every caller passes a
+/// literal from that closed set, so the table is exhaustive by construction.
+/// Spellings are assembled at compile time instead of being formatted per
+/// instruction: the encoder runs once per emitted ADD/CMP/... row, which is the
+/// most frequent row kind in compiled code.
+const ALU_NAMES: [[&str; 4]; 8] = [
+    ["addb", "addw", "addl", "addq"],
+    ["orb", "orw", "orl", "orq"],
+    ["adcb", "adcw", "adcl", "adcq"],
+    ["sbbb", "sbbw", "sbbl", "sbbq"],
+    ["andb", "andw", "andl", "andq"],
+    ["subb", "subw", "subl", "subq"],
+    ["xorb", "xorw", "xorl", "xorq"],
+    ["cmpb", "cmpw", "cmpl", "cmpq"],
+];
+
+/// Suffix-less shift/rotate mnemonics indexed by `[digit][size_index]`.
+///
+/// Digit 6 has no shift encoding; it keeps its dense slot holding the `?`
+/// placeholder this code used before, so an impossible digit still reaches
+/// `encode_shift` and fails there with the same message rather than panicking
+/// on an index.
+const SHIFT_NAMES: [[&str; 4]; 8] = [
+    ["rolb", "rolw", "roll", "rolq"],
+    ["rorb", "rorw", "rorl", "rorq"],
+    ["rclb", "rclw", "rcll", "rclq"],
+    ["rcrb", "rcrw", "rcrl", "rcrq"],
+    ["shlb", "shlw", "shll", "shlq"],
+    ["shrb", "shrw", "shrl", "shrq"],
+    ["?b", "?w", "?l", "?q"],
+    ["sarb", "sarw", "sarl", "sarq"],
+];
+
+/// `test` mnemonic indexed by `size_index`.
+const TEST_NAMES: [&str; 4] = ["testb", "testw", "testl", "testq"];
+
+/// Resolve a suffix-less mnemonic from one of the tables above.
+///
+/// An out-of-range digit is a caller bug, not user input, but it still has to
+/// produce an error rather than a panic, and the message names the family so
+/// the failure is diagnosable from the driver.
+fn suffixless_name(
+    table: &[[&'static str; 4]; 8],
+    digit: u8,
+    size: u8,
+    family: &str,
+) -> Result<&'static str, String> {
+    table
+        .get(usize::from(digit))
+        .map(|names| names[size_index(size)])
+        .ok_or_else(|| format!("unsupported {family} opcode digit {digit}"))
+}
+
 impl super::InstructionEncoder {
     // ---- BT/BTS/BTR/BTC encoding ----
 
@@ -665,32 +735,13 @@ impl super::InstructionEncoder {
         } else {
             infer_operand_size_from_pair(&ops[0], &ops[1])
         };
-        let suffix = match size {
-            1 => "b",
-            2 => "w",
-            4 => "l",
-            _ => "q",
-        };
-        let op_name = match alu_op {
-            0 => "add",
-            1 => "or",
-            2 => "adc",
-            3 => "sbb",
-            4 => "and",
-            5 => "sub",
-            6 => "xor",
-            7 => "cmp",
-            _ => "?",
-        };
         // `format!` allocated a `String` for every suffix-less ALU row -- the
         // most common row in compiled code -- only to hand the encoder a
-        // three-character mnemonic and drop it again.  Build it on the stack.
-        let mut buf = [0u8; 8];
-        let n = op_name.len();
-        buf[..n].copy_from_slice(op_name.as_bytes());
-        buf[n] = suffix.as_bytes()[0];
-        let mnemonic = core::str::from_utf8(&buf[..n + 1])
-            .map_err(|_| "internal: non-ASCII mnemonic".to_string())?;
+        // three-character mnemonic and drop it again.  The name is fully
+        // determined by (digit, size), both of which come from small closed
+        // domains, so it is a table lookup into `'static` text: no buffer, no
+        // bounds arithmetic and no UTF-8 validation on the hot path.
+        let mnemonic = suffixless_name(&ALU_NAMES, alu_op, size, "ALU")?;
         self.encode_alu(ops, mnemonic, alu_op)
     }
 
@@ -699,18 +750,8 @@ impl super::InstructionEncoder {
             return Err("test requires 2 operands".to_string());
         }
         let size = infer_operand_size_from_pair(&ops[0], &ops[1]);
-        let suffix = match size {
-            1 => "b",
-            2 => "w",
-            4 => "l",
-            _ => "q",
-        };
-        // Stack-built for the same reason as in `encode_suffixless_alu`.
-        let mut buf = [0u8; 8];
-        buf[..4].copy_from_slice(b"test");
-        buf[4] = suffix.as_bytes()[0];
-        let mnemonic = core::str::from_utf8(&buf[..5])
-            .map_err(|_| "internal: non-ASCII mnemonic".to_string())?;
+        // Table lookup for the same reason as in `encode_suffixless_alu`.
+        let mnemonic = TEST_NAMES[size_index(size)];
         self.encode_test(ops, mnemonic)
     }
 
@@ -734,29 +775,9 @@ impl super::InstructionEncoder {
                 _ => None,
             })
             .unwrap_or(4);
-        let op_name = match shift_op {
-            4 => "shl",
-            5 => "shr",
-            7 => "sar",
-            0 => "rol",
-            1 => "ror",
-            2 => "rcl",
-            3 => "rcr",
-            _ => "?",
-        };
-        let suffix = match size {
-            1 => "b",
-            2 => "w",
-            4 => "l",
-            _ => "q",
-        };
-        // Stack-built for the same reason as in `encode_suffixless_alu`.
-        let mut buf = [0u8; 8];
-        let n = op_name.len();
-        buf[..n].copy_from_slice(op_name.as_bytes());
-        buf[n] = suffix.as_bytes()[0];
-        let mnemonic = core::str::from_utf8(&buf[..n + 1])
-            .map_err(|_| "internal: non-ASCII mnemonic".to_string())?;
+        // Same reasoning as `encode_suffixless_alu`: the mnemonic is a pure
+        // function of (digit, size), so it comes from `'static` data.
+        let mnemonic = suffixless_name(&SHIFT_NAMES, shift_op, size, "shift")?;
         self.encode_shift(ops, mnemonic, shift_op)
     }
 
@@ -781,5 +802,59 @@ impl super::InstructionEncoder {
             self.bytes.push(0x66);
         }
         self.encode_unary_rm(ops, op_ext, size)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every spelling the removed `format!` code produced must be reproduced
+    /// exactly, for every digit that can reach these helpers and every operand
+    /// size. A wrong table entry would silently assemble a different operation,
+    /// so the whole cross product is pinned rather than sampled.
+    #[test]
+    fn suffixless_names_match_the_formatted_spellings() {
+        let sizes = [1u8, 2, 4, 8];
+        let suffixes = ["b", "w", "l", "q"];
+        let alu_stems = ["add", "or", "adc", "sbb", "and", "sub", "xor", "cmp"];
+        for (digit, stem) in alu_stems.iter().enumerate() {
+            for (size, suffix) in sizes.iter().zip(suffixes.iter()) {
+                let got = suffixless_name(&ALU_NAMES, digit as u8, *size, "ALU").unwrap();
+                assert_eq!(got, format!("{stem}{suffix}"));
+            }
+        }
+        let shift_stems = ["rol", "ror", "rcl", "rcr", "shl", "shr", "?", "sar"];
+        for (digit, stem) in shift_stems.iter().enumerate() {
+            for (size, suffix) in sizes.iter().zip(suffixes.iter()) {
+                let got = suffixless_name(&SHIFT_NAMES, digit as u8, *size, "shift");
+                assert_eq!(got.unwrap(), format!("{stem}{suffix}"));
+            }
+        }
+        for (size, suffix) in sizes.iter().zip(suffixes.iter()) {
+            assert_eq!(TEST_NAMES[size_index(*size)], format!("test{suffix}"));
+        }
+    }
+
+    /// A size that is not 1, 2 or 4 bytes keeps the 64-bit spelling, which is
+    /// what the `_ => "q"` fallback arms did before the tables existed.
+    #[test]
+    fn unusual_sizes_keep_the_64_bit_spelling() {
+        for size in [0u8, 3, 5, 16, 255] {
+            assert_eq!(size_index(size), 3);
+            assert_eq!(suffixless_name(&ALU_NAMES, 0, size, "ALU"), Ok("addq"));
+        }
+    }
+
+    /// An impossible digit is a caller bug, but it must not panic on an index:
+    /// it has to come back as a diagnosable error.
+    #[test]
+    fn out_of_range_digits_are_errors_not_panics() {
+        for digit in 8u8..=255 {
+            assert!(suffixless_name(&ALU_NAMES, digit, 4, "ALU").is_err());
+            assert!(suffixless_name(&SHIFT_NAMES, digit, 4, "shift").is_err());
+        }
+        let err = suffixless_name(&ALU_NAMES, 8, 4, "ALU").unwrap_err();
+        assert!(err.contains("ALU opcode digit 8"));
     }
 }
