@@ -98,6 +98,16 @@ pub(crate) struct CodegenOptions {
     /// `R_X86_64_TPOFF32` when producing a shared object. Codegen needs to
     /// tell those two apart; `pic` alone cannot.
     pub(crate) shared_lib: bool,
+    /// The driver confirmed this translation unit is being linked IN THIS
+    /// INVOCATION into a position-fixed ET_EXEC (no `-shared`, no `-r`, no
+    /// `-pie`). Codegen may then use references that a linker can only
+    /// resolve in position-fixed output — notably the SIB-scale-8 switch
+    /// dispatch `jmp *tbl(,%rax,8)` with `R_X86_64_32S` plus `.quad` table
+    /// entries: one instruction per dispatch instead of the portable
+    /// table-base-load + entry-load sequence. Without this the driver has
+    /// to assume the object may later be linked into an ET_DYN, where the
+    /// linker rejects `R_X86_64_32S` ("recompile with -fPIC").
+    pub(crate) fixed_exec_link: bool,
     /// `-ftls-model=` floor (GCC `flag_tls_default`). Together with `pic`
     /// (GCC's `flag_shlib`) it is the compilation-wide input of
     /// `common::tls::select_model`.

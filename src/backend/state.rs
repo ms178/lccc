@@ -395,6 +395,10 @@ pub struct CodegenState {
     pub pie_mode: bool,
     /// Shared-object output (`-shared`).
     pub shared_lib: bool,
+    /// Driver-confirmed position-fixed ET_EXEC final link for this
+    /// invocation (see `CodegenOptions::fixed_exec_link`): absolute
+    /// link-time-resolvable forms (SIB-scale-8 switch tables) are allowed.
+    pub fixed_exec_link: bool,
     /// Compilation-wide TLS model inputs: shared-library code (`-fPIC`/
     /// `-fpic`/`-shared`) and the `-ftls-model=` floor.
     pub tls_policy: crate::common::tls::TlsPolicy,
@@ -805,6 +809,7 @@ impl CodegenState {
             trampoline_data_blocks: Vec::new(),
             pic_mode: false,
             shared_lib: false,
+            fixed_exec_link: false,
             tls_policy: crate::common::tls::TlsPolicy::default(),
             tls_models: FxHashMap::default(),
             pie_mode: false,

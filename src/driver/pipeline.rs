@@ -3022,6 +3022,16 @@ impl Driver {
             pic: self.pic || self.shared_lib,
             shared_lib: self.shared_lib,
             pie: self.pie && !self.pic && !self.shared_lib,
+            // Only a FULL invocation that final-links in position-fixed
+            // ET_EXEC may emit the absolute switch-table form (its jump
+            // instruction's R_X86_64_32S is unresolvable in ET_DYN). The
+            // PIE decision must match the linker's exactly — same
+            // last-`-pie`/`-no-pie`-wins scan over the same argument list
+            // the link receives — so the codegen and link never disagree.
+            fixed_exec_link: matches!(self.mode, CompileMode::Full)
+                && !self.shared_lib
+                && !self.relocatable
+                && !crate::backend::common::linker_pie_effective(&self.build_linker_args()),
             tls_model_floor: self.tls_model_floor,
             function_return_thunk: self.function_return_thunk,
             indirect_branch_thunk: self.indirect_branch_thunk,

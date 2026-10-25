@@ -7076,6 +7076,12 @@ impl X86Codegen {
             }
             IntrinsicOp::VecMulI32x4 => {
                 if let Some(d) = dest {
+
+                    // ISA-gated: `pmulld` only under SSE4.1, the bit-identical
+                    // `pmuludq` pair on the SSE2 baseline. (This arm used to
+                    // emit `pmulld` unconditionally, shipping an SSE4.1
+                    // instruction in default-baseline TUs — `emit_int_mul_i32x4`
+                    // below is the gate with the full lane-math audit.)
                     self.emit_int_mul_i32x4(d, args);
                 }
             }

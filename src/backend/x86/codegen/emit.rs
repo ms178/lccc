@@ -1702,6 +1702,7 @@ impl X86Codegen {
         self.state.apply_tls_options(opts);
         self.set_pic(opts.pic || opts.pie);
         self.state.pie_mode = opts.pie;
+        self.state.fixed_exec_link = opts.fixed_exec_link;
         self.set_function_return_thunk(opts.function_return_thunk);
         self.set_indirect_branch_thunk(opts.indirect_branch_thunk);
         self.set_indirect_branch_thunk_inline(opts.indirect_branch_thunk_inline);
@@ -9210,35 +9211,47 @@ impl ArchCodegen for X86Codegen {
         let table_label = self.state.fresh_label("jt");
         let default_label = default.as_label();
 
-        self.operand_to_rax(val);
-
-        // For 32-bit switch types, sign-extend to 64-bit for the jump table indexing
+        // For 32-bit switch types, the table index is the value's low 32
+        // bits. Two ways to materialise it:
+        //
+        // (a) CANONICAL RAX PATH (default): load the value into %rax,
+        //     zero/sign-extend for 64-bit arithmetic, subtract min,
+        //     compare range — all in 64-bit form.
+        //
+        // (b) DIRECT 32-BIT REGISTERS (fast path): when the switch value
+        //     is already resident in a GPR, index the table from that
+        //     register's 64-bit view and run the whole sub/cmp sequence
+        //     in 32-bit form. A 32-bit definition always leaves the full
+        //     64-bit register equal to the value's low word (32-bit ops
+        //     zero the upper word; 64-bit definitions store the value
+        //     itself), so no extend is needed; and the unsigned 32-bit
+        //     wraparound test
+        //         (v - min) mod 2^32 < range   (jae when ≥)
+        //     is exactly the in-range predicate for every i8..u32
+        //     switch: a value below min wraps above 2^31, which is
+        //     always ≥ range (for min == i32::MIN no representable v
+        //     lies below min). This is the canonical `subl $min,%reg;
+        //     cmpl $range,%reg; jae` shape and drops the rax
+        //     materialisation plus the zero/sign extend from the hot
+        //     dispatch path.
         let use_32bit = matches!(
             ty,
             IrType::I32 | IrType::U32 | IrType::I16 | IrType::U16 | IrType::I8 | IrType::U8
         );
-        if use_32bit {
-            if ty.is_unsigned() {
-                // Zero-extend: mov %eax, %eax clears upper 32 bits
-                self.state.emit("    movl %eax, %eax");
+        let direct32: Option<(u32, &'static str, &'static str)> = if use_32bit {
+            if let Operand::Value(v) = val {
+                // rsp is the one GPR that cannot appear as a scale-8 SIB
+                // index (#UD); xmm homes need a move anyway.
+                self.fresh_home_of(v.0)
+                    .filter(|&reg| !is_xmm_reg(reg) && phys_reg_name(reg) != "rsp")
+                    .map(|reg| (v.0, phys_reg_name(reg), phys_reg_name_32(reg)))
             } else {
-                // Sign-extend 32-bit to 64-bit
-                self.state.emit("    cltq");
+                None
             }
-        }
+        } else {
+            None
+        };
 
-        if min_val != 0 {
-            if min_val >= i32::MIN as i64 && min_val <= i32::MAX as i64 {
-                self.state
-                    .out
-                    .emit_instr_imm_reg("    subq", min_val, "rax");
-            } else {
-                self.state
-                    .out
-                    .emit_instr_imm_reg("    movabsq", min_val, "rcx");
-                self.state.emit("    subq %rcx, %rax");
-            }
-        }
         let in_range = match val {
             Operand::Value(v) => {
                 self.state
@@ -9250,44 +9263,120 @@ impl ArchCodegen for X86Codegen {
             }
             _ => false,
         };
-        if !in_range {
-            if (range as i64) >= i32::MIN as i64 && (range as i64) <= i32::MAX as i64 {
-                self.state
-                    .out
-                    .emit_instr_imm_reg("    cmpq", range as i64, "rax");
-            } else {
-                self.state
-                    .out
-                    .emit_instr_imm_reg("    movabsq", range as i64, "rcx");
-                self.state.emit("    cmpq %rcx, %rax");
-            }
-            self.state.out.emit_jcc_label("    jae", &default_label);
-        }
 
-        // Kernel / non-PIC code model: emit the GCC-canonical ABSOLUTE jump
-        // table — `jmp *jt_table(,%rax,8)` (R_X86_64_32S against .rodata)
-        // plus `.quad` entries (R_X86_64_64 with absolute target offsets).
-        // This is the only shape the kernel's objtool can validate: its
+        let index_reg: &'static str = match direct32 {
+            Some((v_id, r64, r32)) => {
+                if min_val != 0 {
+                    // min_val fits i32: every 32-bit-class case value
+                    // does. The 32-bit sub wraps mod 2^32 — exactly the
+                    // index arithmetic the wraparound test expects.
+                    self.state
+                        .out
+                        .emit_instr_imm_reg("    subl", min_val as i32 as i64, r32);
+                    // The home now holds v - min; a later consumer of v
+                    // must not read it.
+                    self.home_clobbered.insert(v_id);
+                }
+                if !in_range && range <= u32::MAX as usize {
+                    // range == 2^32 (full 32-bit span): every 32-bit
+                    // index is in range, so the test is skipped. The raw
+                    // low word of range is the correct imm32 either way.
+                    self.state
+                        .out
+                        .emit_instr_imm_reg("    cmpl", range as u32 as i64, r32);
+                    self.state.out.emit_jcc_label("    jae", &default_label);
+                }
+                r64
+            }
+            None => {
+                self.operand_to_rax(val);
+                if use_32bit {
+                    if ty.is_unsigned() {
+                        // Zero-extend: mov %eax, %eax clears upper 32 bits
+                        self.state.emit("    movl %eax, %eax");
+                    } else {
+                        // Sign-extend 32-bit to 64-bit
+                        self.state.emit("    cltq");
+                    }
+                }
+                if min_val != 0 {
+                    if min_val >= i32::MIN as i64 && min_val <= i32::MAX as i64 {
+                        self.state
+                            .out
+                            .emit_instr_imm_reg("    subq", min_val, "rax");
+                    } else {
+                        self.state
+                            .out
+                            .emit_instr_imm_reg("    movabsq", min_val, "rcx");
+                        self.state.emit("    subq %rcx, %rax");
+                    }
+                }
+                if !in_range {
+                    if (range as i64) >= i32::MIN as i64 && (range as i64) <= i32::MAX as i64 {
+                        self.state
+                            .out
+                            .emit_instr_imm_reg("    cmpq", range as i64, "rax");
+                    } else {
+                        self.state
+                            .out
+                            .emit_instr_imm_reg("    movabsq", range as i64, "rcx");
+                        self.state.emit("    cmpq %rcx, %rax");
+                    }
+                    self.state.out.emit_jcc_label("    jae", &default_label);
+                }
+                "rax"
+            }
+        };
+
+        // DISPATCH SHAPE — the GCC-canonical ABSOLUTE jump table,
+        // `jmp *tbl(,%reg,8)` (R_X86_64_32S against .rodata) plus `.quad`
+        // entries (R_X86_64_64 with absolute target offsets): ONE
+        // instruction per dispatch, versus the portable form's table-base
+        // load + 4-byte entry load + add + indirect jump (three extra
+        // instructions plus a dependent .rodata load per dispatch; the
+        // base lea cannot be hoisted by the loop pass because it sits
+        // inside the dispatch sequence).
+        //
+        // The direct form's jump instruction carries R_X86_64_32S, which
+        // linkers reject in ET_DYN output ("recompile with -fPIC"), so it
+        // may only be emitted when this translation unit will end up in a
+        // position-fixed executable: non-PIC code, the kernel model, or a
+        // driver-confirmed ET_EXEC link of this very invocation
+        // (`fixed_exec_link`: not -shared, not -r, not -pie). It is also
+        // the ONLY shape the kernel's objtool can validate: its
         // add_jump_table() reads each entry's RELA addend as an absolute
         // instruction offset, but PIC-style `.long target - table` entries
         // carry position-baked addends (the GAS convention adds the entry's
         // own offset, so S + A - P resolves at link time), which objtool
         // then resolves mid-instruction and rejects the object with
         // "can't find switch jump table" (observed on
-        // arch/x86/kernel/platform-quirks.o). GCC avoids this entirely by
+        // arch/x86/kernel/platform-quirks.o). GCC avoids that entirely by
         // using absolute tables under -mcmodel=kernel/-fno-pic, so mirror
-        // that shape here.
-        let absolute_table = self.state.code_model_kernel || !self.state.pic_mode;
+        // that shape here. The .quad entries themselves are resolved at
+        // link time in ET_EXEC — lccc-ld would convert them to
+        // R_X86_64_RELATIVE in ET_DYN output (see emit_shared.rs) — but
+        // the SIB reference is what keeps this form out of
+        // position-dependent code.
+        // A Spectre-v2 retpoline option keeps the portable form, since the
+        // thunk wrapper applies to the indirect-jump sequence rather than
+        // to a SIB reference.
+        let retpoline_on =
+            self.state.indirect_branch_thunk || self.state.indirect_branch_thunk_inline;
+        let absolute_table = self.state.code_model_kernel
+            || !self.state.pic_mode
+            || (self.state.fixed_exec_link && !retpoline_on);
         if absolute_table {
             self.state
-                .emit_fmt(format_args!("    jmpq *{}(,%rax,8)", table_label));
+                .emit_fmt(format_args!("    jmpq *{}(,%{},8)", table_label, index_reg));
         } else {
             // PIC: RIP-relative table base + PC32 differences. Correct for
-            // user-space PIC (no objtool validation there).
+            // user-space PIC (no objtool validation there). The entry
+            // load indexes the same register the range test used.
             self.state
                 .out
                 .emit_instr_sym_base_reg("    leaq", &table_label, "rip", "rcx");
-            self.state.emit("    movslq (%rcx,%rax,4), %rdx");
+            self.state
+                .emit_fmt(format_args!("    movslq (%rcx,%{},4), %rdx", index_reg));
             self.state.emit("    addq %rcx, %rdx");
             // Switch-table dispatch is an indirect branch: it needs the same
             // retpoline protection as calls (Spectre v2 via the BTB applies to
