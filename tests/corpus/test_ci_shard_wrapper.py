@@ -40,7 +40,17 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import yaml
+try:
+    import yaml
+except ModuleNotFoundError as exc:  # pragma: no cover - host dependency
+    # CI installs python3-yaml (scripts/ci_ubuntu_chroot.sh PACKAGES), so this
+    # only fires on a developer box.  Importing the workflow contracts without a
+    # parser is impossible, and failing during collection reports the missing
+    # package as an unrelated test error; a skip states the real cause once.
+    raise unittest.SkipTest(
+        "PyYAML is required to read the CI workflow contracts "
+        "(install python3-yaml, or `pip install pyyaml`)"
+    ) from exc
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
