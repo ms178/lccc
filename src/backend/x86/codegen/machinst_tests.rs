@@ -5054,6 +5054,331 @@ fn isel_refuses_register_homed_store_value() {
 }
 
 #[test]
+fn dead_shift_add_move_folds_to_scaled_lea() {
+    let base = MachReg::Phys(PhysReg(14)); // rdi
+    let shift = MachInst::Shift {
+        op: ShiftOp::Shl,
+        amount: MachOperand::Imm(3),
+        dst: base,
+        size: OpSize::S32,
+    };
+    let add = MachInst::Alu {
+        op: AluOp::Add,
+        src: MachOperand::Imm(36),
+        dst: base,
+        size: OpSize::S32,
+    };
+    let mov = MachInst::Mov {
+        src: MachOperand::Reg(base),
+        dst: MachOperand::Reg(MachReg::Phys(PhysReg(0))), // eax
+        size: OpSize::S32,
+    };
+    let mut out = AsmOutput::new();
+    emit_machinsts(&[shift, add, mov, MachInst::Ret], &mut out);
+    let text = out.buf;
+    let compact: String = text.chars().filter(|ch| !ch.is_whitespace()).collect();
+    assert!(
+        compact.contains("leal36(,%rdi,8),%eax"),
+        "dead shift/add/move should become a scaled LEA, got {text}"
+    );
+    assert!(text.contains("ret"), "return remains in place: {text}");
+    assert!(!text.contains("shll"), "shift should be consumed: {text}");
+    assert!(!text.contains("addl"), "add should be consumed: {text}");
+    assert!(!text.contains("movl"), "copy should be consumed: {text}");
+}
+
+#[test]
+fn shift_add_imm_fuses_to_scaled_lea_when_flags_are_dead() {
+    let base = MachReg::Phys(PhysReg(14)); // rdi
+    let shift = MachInst::Shift {
+        op: ShiftOp::Shl,
+        amount: MachOperand::Imm(3),
+        dst: base,
+        size: OpSize::S32,
+    };
+    let add = MachInst::Alu {
+        op: AluOp::Add,
+        src: MachOperand::Imm(36),
+        dst: base,
+        size: OpSize::S32,
+    };
+    let mut out = AsmOutput::new();
+    emit_machinsts(&[shift, add, MachInst::Ret], &mut out);
+    let text = out.buf;
+    let compact: String = text.chars().filter(|ch| !ch.is_whitespace()).collect();
+    assert!(compact.contains("leal36(,%rdi,8),%edi"), "got {text}");
+    assert!(!text.contains("shll"), "shift should be consumed: {text}");
+    assert!(!text.contains("addl"), "add should be consumed: {text}");
+}
+
+#[test]
+fn shift_add_imm_fusion_refuses_live_flags() {
+    let base = MachReg::Phys(PhysReg(14));
+    let shift = MachInst::Shift {
+        op: ShiftOp::Shl,
+        amount: MachOperand::Imm(3),
+        dst: base,
+        size: OpSize::S32,
+    };
+    let add = MachInst::Alu {
+        op: AluOp::Add,
+        src: MachOperand::Imm(36),
+        dst: base,
+        size: OpSize::S32,
+    };
+    let setcc = MachInst::SetCC {
+        cc: CondCode::E,
+        dst: MachReg::Phys(PhysReg(15)),
+    };
+    let mut out = AsmOutput::new();
+    emit_machinsts(&[shift, add, setcc], &mut out);
+    let text = out.buf;
+    assert!(text.contains("shll"), "flags-live shift stays: {text}");
+    assert!(text.contains("addl"), "flags-live Add stays: {text}");
+    assert!(text.contains("sete"), "flag consumer remains: {text}");
+}
+
+#[test]
+fn shift_add_fusion_refuses_flags_live_through_neutral_or_unknown_ops() {
+    let base = MachReg::Phys(PhysReg(14));
+    let consumer = MachInst::SetCC {
+        cc: CondCode::E,
+        dst: MachReg::Phys(PhysReg(15)),
+    };
+    let tails = [
+        vec![
+            MachInst::Not {
+                dst: MachReg::Phys(PhysReg(15)),
+                size: OpSize::S32,
+            },
+            consumer.clone(),
+        ],
+        vec![MachInst::Cqto { size: OpSize::S64 }, consumer.clone()],
+        vec![
+            MachInst::Shift {
+                op: ShiftOp::Shl,
+                amount: MachOperand::Imm(0),
+                dst: base,
+                size: OpSize::S32,
+            },
+            consumer.clone(),
+        ],
+        vec![MachInst::Raw("    nop".to_string()), consumer],
+    ];
+    for tail in tails {
+        let mut insts = vec![
+            MachInst::Shift {
+                op: ShiftOp::Shl,
+                amount: MachOperand::Imm(3),
+                dst: base,
+                size: OpSize::S32,
+            },
+            MachInst::Alu {
+                op: AluOp::Add,
+                src: MachOperand::Imm(36),
+                dst: base,
+                size: OpSize::S32,
+            },
+        ];
+        insts.extend(tail);
+        let mut out = AsmOutput::new();
+        emit_machinsts(&insts, &mut out);
+        assert!(
+            out.buf.contains("shll"),
+            "flags-preserving tail: {}",
+            out.buf
+        );
+        assert!(
+            out.buf.contains("addl"),
+            "flags-preserving tail: {}",
+            out.buf
+        );
+        assert!(out.buf.contains("sete"), "consumer remains: {}", out.buf);
+    }
+}
+
+#[test]
+fn physical_register_observation_includes_implicit_and_indirect_operands() {
+    let cases = [
+        (MachInst::Ret, &[RAX.0][..]),
+        (MachInst::Cqto { size: OpSize::S64 }, &[RAX.0, RDX.0][..]),
+        (MachInst::XorRdx, &[RDX.0][..]),
+        (
+            MachInst::Div {
+                divisor: reg(RCX),
+                signed: true,
+                size: OpSize::S64,
+            },
+            &[RAX.0, RDX.0, RCX.0][..],
+        ),
+        (
+            MachInst::Call {
+                target: "callee".to_string(),
+            },
+            &[RAX.0, RCX.0, RDX.0, RDI.0, RSI.0, R8.0, R9.0, R10.0, R11.0][..],
+        ),
+        (
+            MachInst::CallTyped {
+                caller_saves: vec![],
+                args: vec![],
+                target: CallTarget::Indirect(R14),
+                ret: None,
+                gp_arg_count: None,
+                ipa_keep: 0,
+            },
+            &[
+                RAX.0, RCX.0, RDX.0, RDI.0, RSI.0, R8.0, R9.0, R10.0, R11.0, R14.0,
+            ][..],
+        ),
+    ];
+    for (inst, expected) in cases {
+        let touched = super::machinst_alloc::touched_phys_regs(&inst);
+        for &reg in expected {
+            assert!(
+                touched.contains(&reg),
+                "{inst:?} must observe physical register {reg}, got {touched:?}"
+            );
+        }
+    }
+}
+
+/// The three-instruction shift/add/move fold must not discard the original
+/// source home when a later instruction observes an implicit register effect.
+/// The two-instruction shift/add LEA is still legal (it updates the source
+/// home), so the witness is the surviving move into the final destination.
+#[test]
+fn dead_shift_add_move_refuses_each_implicit_source_witness() {
+    let cases = [
+        (
+            RAX,
+            vec![MachInst::Ret],
+            "%rax",
+            "%eax",
+            "ret reads the integer return home",
+        ),
+        (
+            RAX,
+            vec![MachInst::Cqto { size: OpSize::S64 }],
+            "%rax",
+            "%eax",
+            "cqto reads rax and writes rdx",
+        ),
+        (
+            RAX,
+            vec![MachInst::Div {
+                divisor: reg(RCX),
+                signed: true,
+                size: OpSize::S64,
+            }],
+            "%rax",
+            "%eax",
+            "div reads the rdx:rax dividend",
+        ),
+        (
+            RAX,
+            vec![MachInst::Call {
+                target: "callee".to_string(),
+            }],
+            "%rax",
+            "%eax",
+            "a direct call clobbers the caller-save return register",
+        ),
+        (
+            R14,
+            vec![MachInst::CallTyped {
+                caller_saves: vec![],
+                args: vec![],
+                target: CallTarget::Indirect(R14),
+                ret: None,
+                gp_arg_count: None,
+                ipa_keep: 0,
+            }],
+            "%r14",
+            "%r14d",
+            "an indirect call reads its target register",
+        ),
+    ];
+    for (base, tail, base_addr_name, base_name, reason) in cases {
+        let shift = MachInst::Shift {
+            op: ShiftOp::Shl,
+            amount: MachOperand::Imm(3),
+            dst: MachReg::Phys(base),
+            size: OpSize::S32,
+        };
+        let add = MachInst::Alu {
+            op: AluOp::Add,
+            src: MachOperand::Imm(36),
+            dst: MachReg::Phys(base),
+            size: OpSize::S32,
+        };
+        let mov = MachInst::Mov {
+            src: reg(base),
+            dst: reg(RDI),
+            size: OpSize::S32,
+        };
+        let mut insts = vec![shift, add, mov];
+        insts.extend(tail);
+        let mut out = AsmOutput::new();
+        emit_machinsts(&insts, &mut out);
+        let compact: String = out.buf.chars().filter(|ch| !ch.is_whitespace()).collect();
+        assert!(
+            compact.contains(&format!("leal36(,{base_addr_name},8),{base_name}")),
+            "{reason}: the safe two-instruction LEA must update the source home: {compact}"
+        );
+        assert!(
+            compact.contains(&format!("movl{base_name},%edi")),
+            "{reason}: the source-to-destination move must survive: {compact}"
+        );
+        assert!(
+            !compact.contains(&format!("leal36(,{base_addr_name},8),%edi")),
+            "{reason}: the three-instruction fold discarded a live source: {compact}"
+        );
+    }
+}
+
+#[test]
+fn shift_add_fusion_preserves_live_source_home() {
+    let base = MachReg::Phys(PhysReg(14)); // rdi
+    let shift = MachInst::Shift {
+        op: ShiftOp::Shl,
+        amount: MachOperand::Imm(3),
+        dst: base,
+        size: OpSize::S32,
+    };
+    let add = MachInst::Alu {
+        op: AluOp::Add,
+        src: MachOperand::Imm(36),
+        dst: base,
+        size: OpSize::S32,
+    };
+    let mov = MachInst::Mov {
+        src: MachOperand::Reg(base),
+        dst: MachOperand::Reg(MachReg::Phys(PhysReg(0))),
+        size: OpSize::S32,
+    };
+    let later_read = MachInst::Mov {
+        src: MachOperand::Reg(base),
+        dst: MachOperand::Reg(MachReg::Phys(PhysReg(15))),
+        size: OpSize::S32,
+    };
+    let mut out = AsmOutput::new();
+    emit_machinsts(&[shift, add, mov, later_read], &mut out);
+    let text = out.buf;
+    assert!(
+        text.contains("leal"),
+        "same-home LEA keeps the updated source: {text}"
+    );
+    assert!(
+        text.contains("movl"),
+        "return copy remains in place: {text}"
+    );
+    assert!(
+        text.contains("%esi"),
+        "later source read remains in place: {text}"
+    );
+}
+
+#[test]
 fn mov_plus_add_folds_to_lea_even_without_apx() {
     let mov = MachInst::Mov {
         src: MachOperand::Reg(MachReg::Phys(PhysReg(14))), // rdi
