@@ -4,6 +4,9 @@ import argparse
 import hashlib
 import json
 import os
+import platform
+import re
+import sys
 from pathlib import Path
 import statistics
 import subprocess
@@ -34,8 +37,15 @@ def main():
     if args.pairs < 1 or args.rounds < 1:
         ap.error("positive pairs and rounds required")
     report = {"kind": "synthetic isolated calls, two TUs, no LTO", "timing": "wall seconds; two warmups; alternating pair order; no PMU or affinity claim", "rounds": args.rounds, "pairs": args.pairs, "source_sha256": {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest() for p in SOURCES}, "cases": {}}
+    cpu = Path("/proc/cpuinfo").read_text() if Path("/proc/cpuinfo").exists() else ""
+    report["host"] = {"platform": platform.platform(), "cpu_model": next((x.split(":", 1)[1].strip() for x in cpu.splitlines() if x.startswith("model name")), "unknown"), "affinity": sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else None}
+    report["command"] = sys.argv
     compilers = {"candidate": args.compiler, "baseline": args.baseline, "gcc": args.gcc, "clang": args.clang}
     report["versions"] = {name: command([cc, "--version"]).decode().splitlines()[0] for name, cc in compilers.items()}
+    if not re.search(r"\b16\.2(?:\.0)?\b", report["versions"]["gcc"]):
+        raise ValueError("GCC 16.2 required")
+    if not re.search(r"\b23\.1\.3\b", report["versions"]["clang"]):
+        raise ValueError("Clang 23.1.3 required")
     with tempfile.TemporaryDirectory() as tmp:
         for case, name in enumerate(["bounded-popcount", "zero-preimage", "nonzero-implication"]):
             bins = {}

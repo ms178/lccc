@@ -113,3 +113,25 @@ remains 428 instructions, with a 120-byte frame adjustment and 65 non-push/pop
 RSP-referencing instructions on both sides. This is a structural stack/code-size
 nonregression check, not an assertion that those 65 references are spills or a
 measurement of gzip throughput.
+
+### Isolated-call wall-time receipt
+
+`count-observations-runtime.json` records 268,435,456 iterations per execution,
+two warmups and 15 alternating pairs per case/compiler, with the host identity,
+affinity mask, exact versions, raw samples and source hashes. All checksum
+comparisons pass and no sample is below the 200 ms warning threshold.
+
+| Synthetic case | Baseline median (s) | Candidate median (s) | GCC 16.2 (s) | Clang 23.1.3 (s) | Baseline / candidate |
+|---|---:|---:|---:|---:|---:|
+| bounded-popcount | 0.868 | 0.481 | 0.462 | 0.452 | 1.80x |
+| zero-preimage | 0.893 | 0.662 | 0.522 | 0.553 | 1.35x |
+| nonzero-implication | 1.014 | 0.722 | 0.573 | 0.586 | 1.40x |
+
+The candidate improves over the frozen compiler in these three isolated-call
+cases, but remains slower than both modern vendors in this longer receipt.
+This is deliberately not advertised as vendor parity or a production-workload
+speedup. The count-zero result still lowers through a Boolean CMOV sequence,
+and the nonzero case retains software population count on the default target;
+those backend cost/Boolean-materialization opportunities remain separate work.
+Wall timing includes process overhead and host scheduling; no CPU isolation,
+frequency lock, PMU or statistical significance certificate is asserted.
