@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Scalar <-> GNU vector conversion diagnostics and ext-vector splat.
 #
-# Both oracles (GCC 16.2, Clang 23.1.3) reject every scalar <-> plain
+# Both oracles (GCC 16.2, Clang 23.1.4) reject every scalar <-> plain
 # `vector_size` conversion shape, with one documented divergence at the
 # tail (same-size vector -> scalar: Clang accepts, GCC rejects; lccc
 # implements the GCC verdict):
@@ -89,7 +89,7 @@ expect_rejected assign_v2s.c "incompatible types"
 # --- oracle agreement for every rejected shape ------------------------------
 # When the pinned oracle compilers are available, each litmus they reject
 # must be one lccc rejects, and each shape they accept must still run.
-# Oracle agreement, measured 2026-10-18 against gcc-16.2.0 / clang-23.1.3:
+# Oracle agreement, measured 2026-10-18 against gcc-16.2.0 / clang-23.1.4:
 # the seven shapes that leave the same-size lane domain intact are rejected
 # by BOTH oracles.  The two SAME-SIZE vector -> scalar shapes
 # (init_v2s.c, assign_v2s.c) are a documented GNU/Clang divergence: GCC

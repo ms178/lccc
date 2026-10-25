@@ -494,7 +494,7 @@ gate "oracle-toolchain-self-test" fast \
 gate "gcc-oracle-installer-self-test" fast \
     bash scripts/ci_install_gcc_oracle.sh --self-test
 gate "oracle-toolchain" fast \
-    bash scripts/ci_verify_oracles.sh --gcc-version 16.2 --clang-version 23.1.3
+    bash scripts/ci_verify_oracles.sh --gcc-version 16.2 --clang-version 23.1.4
 
 gate "rust-toolchain-selector" fast \
     bash tests/regression/check_rust_toolchain_selector.sh
@@ -523,7 +523,7 @@ gate "ext-vector-rvalue-subscript" fast \
 
 # The by-value ext-vector ABI grid: every shape (lane type x lane count) on
 # -m64 and -m32 at -O0/-O2, built as provider and caller by lccc and by the
-# pinned Clang 23.1.3 oracle and linked in all four combinations; shapes
+# pinned Clang 23.1.4 oracle and linked in all four combinations; shapes
 # Clang returns in register sequences lccc has no carrier for must be
 # rejected with the by-value diagnostic. Needs the exact oracle:
 # scripts/ci_install_clang_oracle.sh installs it (CLANG=... selects it).
@@ -539,7 +539,7 @@ gate "ext-vector-varargs-abi" fast \
 # The layout matrix is the other half of the ext-vector contract: the ABI grid
 # above pins how shapes cross a call boundary, this pins what sizeof/_Alignof
 # say and how lanes address inside an object, over 120 shapes x 2 targets at
-# -O0 and -O2, against the pinned Clang 23.1.3 oracle.  It needs no i686
+# -O0 and -O2, against the pinned Clang 23.1.4 oracle.  It needs no i686
 # headers (freestanding fixture) but does need the host driver to link -m32.
 gate "ext-vector-layout-matrix" fast \
     env CCC="$LCCC" bash tests/regression/check_ext_vector_layout_matrix.sh
@@ -724,7 +724,7 @@ gate "gnu-vector-align-abi" fast \
 # GCC-compatible 16-byte vector_size i686 carriers, including the SSE-only
 # and no-SSE boundaries, with typed shuffles across every compiler pairing.
 # The hosted leg runs after a swap-enabled fastbuild with GNU as 2.47 and the
-# exact GCC 16.2 / Clang 23.1.3 oracles in the unsharded differential lane.
+# exact GCC 16.2 / Clang 23.1.4 oracles in the unsharded differential lane.
 gate "i686-gnu-vector-abi" fast \
     env CCC="$LCCC" bash tests/regression/check_i686_gnu_vector_abi.sh
 
@@ -758,7 +758,7 @@ gate "ivsr-reproducers" fast \
 gate "shuffle-diagnostics" fast \
     env CCC="$LCCC" bash tests/regression/check_shuffle_diagnostics.sh
 
-# Clang ext_vector_type component access against the Clang 23.1.3 oracle:
+# Clang ext_vector_type component access against the Clang 23.1.4 oracle:
 # LCCC's diagnostics for ext_vector_select/errors.c equal Clang's (line,
 # column, message), LCCC accepts exactly the forms Clang accepts and puts the
 # first error at Clang's position, and select.c prints what Clang -O0 prints

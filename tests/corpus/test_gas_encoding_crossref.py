@@ -358,9 +358,8 @@ class GasEncodingCrossrefTests(unittest.TestCase):
     def test_a_code_modelled_family_leaves_the_gap_list(self):
         """The ALU gap entries were a modelling hole, not missing encodings.
 
-        Without the model, `add`'s `01`/`05`/`80 /0` rows are reported as gaps
-        that `as` accepts; with it they are covered, and the unrelated families
-        (`call ff /3` is a far indirect call, which lccc does not encode) stay.
+        These forms are now covered by the declarative per-spelling row model;
+        code models may expose new APX gaps but must not silently erase row gaps.
         """
         model = self.sdm.model_any
         before = self.gas.missing(self.rows, self.table, model)
@@ -370,8 +369,11 @@ class GasEncodingCrossrefTests(unittest.TestCase):
             return sorted(e["opcode"] for e in gaps.get(name, [])
                           if e["family"] == "legacy")
 
-        self.assertIn(0x01, opcodes(before, "add"))
+        # `add` is now covered per spelling by the row model (including the
+        # direction and width variants), so it must not be presented as a gap
+        # even before code-driven families are layered on.
         for name in ("add", "and", "cmp", "sub", "xor", "or", "adc", "sbb"):
+            self.assertEqual(opcodes(before, name), [], name)
             self.assertEqual(opcodes(after, name), [], name)
         # The model may *add* names to the comparison: `cmov<cc>`, `j<cc>` and
         # `set<cc>` have no declarative row at all today, so before the model
@@ -381,13 +383,8 @@ class GasEncodingCrossrefTests(unittest.TestCase):
         # coverage, so the guarantee is per name, not on the total.
         for name, gaps in before.items():
             self.assertLessEqual(len(after.get(name, [])), len(gaps), name)
-        self.assertLess(sum(len(after.get(n, [])) for n in before),
-                        sum(len(v) for v in before.values()))
-        # A gap that is not an ALU form must survive the model: `cs`/`ds`/`es`
-        # are segment-prefix pseudo-mnemonics, not instructions with an
-        # encoding, so no code path can claim them.
-        for name in ("cs", "ds", "es"):
-            self.assertIn(name, after, name)
+        self.assertEqual(sum(len(after.get(n, [])) for n in before),
+                         sum(len(v) for v in before.values()))
 
 
 class GasAbsentTriageTests(unittest.TestCase):
@@ -586,6 +583,67 @@ class GasCodeModelGateTests(unittest.TestCase):
                          ["CODE-EXTRA", "CODE-UNKNOWN"])
         self.assertIn("not_a_mnemonic",
                       [f["name"] for f in findings if f["kind"] == "CODE-UNKNOWN"])
+
+
+class GasGapModelTests(unittest.TestCase):
+    """The row model has to see the opcode the *encoder* derives, not one of it.
+
+    Three defects of that shape were live: `missing()` modelled a row once with
+    its first mnemonic (so `"rolq" | "roll" | "rolw" | "rolb"` credited every
+    spelling with the first one's opcode), `D`/`W` were expanded one-dimensionally
+    in the row model (so `testl` claimed `84`, the byte opcode), and `+rd` rows
+    (`push`, `pop`, `bswap`, `mov $imm,%reg`, `inc`/`dec` in 32-bit mode) were
+    modelled as a single opcode.  Each of them made the gap list quote encodings
+    the encoder already emits.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.gas = _load(CROSSREF, "gas_encoding_crossref")
+        cls.sdm = _load(SDM, "sdm_isa_crossref")
+        cls.table = cls.gas.load_snapshot()
+        cls.rows = []
+        for path in cls.sdm.encoder_files("all"):
+            cls.rows.extend(cls.sdm.extract_rows(Path(path).resolve()))
+
+    def _row(self, name):
+        """The first encoder row that binds `name` (spellings differ by backend)."""
+        for row in self.rows:
+            if name in row["names"]:
+                return row
+        self.fail(f"no encoder row binds {name}")
+
+    def test_each_spelling_of_a_shared_row_is_modelled_on_its_own(self):
+        row = self._row("roll")
+        by_name = {n: sorted(e["opcode"] for e in self.sdm.model_any(row, n))
+                   for n in ("rolb", "roll") if n in row["names"]}
+        self.assertIn("rolb", by_name)
+        self.assertIn(0xD0, by_name["rolb"])
+        self.assertNotIn(0xD0, by_name["roll"])
+        self.assertIn(0xD1, by_name["roll"])
+
+    def test_the_width_bit_moves_the_opcode(self):
+        """`testl` is `85`/`A9`/`F7`, not the byte `84`/`A8`/`F6`."""
+        row = self._row("testl")
+        wide = {e["opcode"] for e in self.sdm.model_any(row, "testl")}
+        narrow = {e["opcode"] for e in self.sdm.model_any(row, "testb")}
+        self.assertLessEqual({0x85, 0xA9, 0xF7}, wide)
+        self.assertLessEqual({0x84, 0xA8, 0xF6}, narrow)
+        self.assertNotIn(0x84, wide)
+
+    def test_register_in_opcode_rows_claim_the_whole_range(self):
+        row = self._row("pushq")  # x86 dispatches pushq/pushl to one arm
+        gaps = self.gas.missing(self.rows, self.table, self.sdm.model_any)
+        opcodes = {e["opcode"] for e in gaps.get("push", [])}
+        self.assertTrue(set(range(0x50, 0x58)).isdisjoint(opcodes))
+        for opcode in range(0x50, 0x58):
+            self.assertTrue(any(e["opcode"] == opcode for e in self.table["push"]))
+
+    def test_the_gap_report_does_not_count_prefixes_or_mm_x_twins(self):
+        gaps = self.gas.missing(self.rows, self.table, self.sdm.model_any,
+                                self.gas.code_models())
+        for name in ("cs", "ds", "es", "ss", "fs", "gs", "movs", "cmps"):
+            self.assertNotIn(name, gaps, name)
 
 
 if __name__ == "__main__":

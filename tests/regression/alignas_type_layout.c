@@ -4,7 +4,7 @@
  * merge of several alignment sources (C11 6.7.5p6). The parser used to guess
  * (typedef -> pointer size, enum -> 4) and the guess decided the layout:
  * `struct { char a; _Alignas(uint16_t) char b; }` was 16 bytes, not 4.
- * Expected values hold for GCC 16.2 and Clang 23.1.3 on x86-64, i686 and
+ * Expected values hold for GCC 16.2 and Clang 23.1.4 on x86-64, i686 and
  * AArch64; every fact is asserted statically and checked at run time.
  */
 #include <stddef.h>

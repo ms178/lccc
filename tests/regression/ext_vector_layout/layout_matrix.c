@@ -7,7 +7,7 @@
  * count.  Rounding those byte counts, or assuming the LP64 answer on i686, is
  * exactly the class of defect this file exists to catch, so the fixture never
  * names a byte count: it prints what the compiler used and the gate compares
- * that against Clang 23.1.3 for the same target.
+ * that against Clang 23.1.4 for the same target.
  *
  * Three independent properties are exercised per shape:
  *

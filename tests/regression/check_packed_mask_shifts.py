@@ -24,8 +24,8 @@ def main():
     args = p.parse_args()
     version = run([args.gcc, '-dumpfullversion']).decode().strip()
     normative = gcc_oracle_identity(version, args.allow_gcc16_snapshot)
-    if args.clang and run([args.clang, '-dumpversion']).decode().strip() != '23.1.3':
-        raise ValueError('exact Clang 23.1.3 required')
+    if args.clang and run([args.clang, '-dumpversion']).decode().strip() != '23.1.4':
+        raise ValueError('exact Clang 23.1.4 required')
     env = os.environ | {'CCC_VERIFY_IR': 'abort', 'CCC_VERIFY_REGALLOC': '1', 'CCC_VALIDATE_SSA': '1'}
     off = env | {'CCC_DISABLE_PASSES': 'vecrelations'}
     names = re.findall(r'void (packed_\w+)\(', SOURCE.read_text())
@@ -87,7 +87,7 @@ def main():
             receipts.append({'width': width, 'checksum': expected.decode().strip(), 'comparisons': rows})
         run([args.compiler, '-O2', '-m32', '-msse2', '-DONLY128', '-DMASK_KERNELS_ONLY', '-S', str(SOURCE), '-o', str(directory / 'i686.s')], env=env)
     report = {'correct': True, 'native_kernels': 52, 'gcc_version': version, 'gcc_16_2_normative': normative,
-              'clang_version': '23.1.3' if args.clang else None, 'receipts': receipts,
+              'clang_version': '23.1.4' if args.clang else None, 'receipts': receipts,
               'timing_claim': False, 'control': 'only vecrelations disabled; existing lowering, SSA and backend optimizations remain active'}
     if args.json:
         Path(args.json).write_text(json.dumps(report, indent=2) + '\n')

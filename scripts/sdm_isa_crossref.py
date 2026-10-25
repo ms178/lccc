@@ -422,7 +422,8 @@ LEGACY_SPECS = {
                     {"family": "legacy", "map": ("const", "none"),
                      "pp": ("const", "none"), "opcode": 0x87},
                     {"family": "legacy", "map": ("const", "none"),
-                     "pp": ("const", "none"), "opcode": 0x90}],
+                     "pp": ("const", "none"), "opcode": 0x90,
+                     "opreg": True}],
     # ---- relative and indirect control transfer -------------------------
     "encode_call": [{"family": "legacy", "map": ("const", "none"),
                      "pp": ("const", "none"), "opcode": 0xE8},
@@ -444,12 +445,22 @@ LEGACY_SPECS = {
                      "pp": ("const", "none"), "opcode": 0x68},
                     {"family": "legacy", "map": ("const", "none"),
                      "pp": ("const", "none"), "opcode": 0xFF,
-                     "reg": ("const", 6)}],
+                     "reg": ("const", 6)},
+                    # `push %fs` / `push %gs` are the only segment pushes long
+                    # mode keeps (`0F A0` / `0F A8`).
+                    {"family": "legacy", "map": ("const", "0f"),
+                     "pp": ("const", "none"), "opcode": 0xA0},
+                    {"family": "legacy", "map": ("const", "0f"),
+                     "pp": ("const", "none"), "opcode": 0xA8}],
     "encode_pop": [{"family": "legacy", "map": ("const", "none"),
                     "pp": ("const", "none"), "opcode": 0x58},
                    {"family": "legacy", "map": ("const", "none"),
                     "pp": ("const", "none"), "opcode": 0x8F,
-                    "reg": ("const", 0)}],
+                    "reg": ("const", 0)},
+                   {"family": "legacy", "map": ("const", "0f"),
+                    "pp": ("const", "none"), "opcode": 0xA1},
+                   {"family": "legacy", "map": ("const", "0f"),
+                    "pp": ("const", "none"), "opcode": 0xA9}],
     "encode_push16": [{"family": "legacy", "map": ("const", "none"),
                        "pp": ("const", "none"), "opcode": 0x50},
                       {"family": "legacy", "map": ("const", "none"),
@@ -483,7 +494,8 @@ LEGACY_SPECS = {
                      "pp": ("const", "none"), "opcode": 0xEA}],
     # movabs: REX.W + B8+rd with a 64-bit immediate, i.e. the MOV class.
     "encode_movabs": {"family": "legacy", "map": ("const", "none"),
-                      "pp": ("const", "none"), "opcode": 0xB8},
+                      "pp": ("const", "none"), "opcode": 0xB8,
+                      "opreg": True},
     "encode_int": {"family": "legacy", "map": ("const", "none"),
                    "pp": ("const", "none"), "opcode": 0xCD},
     "encode_cvtsi2x": {"family": "legacy", "map": ("const", "0f"),
@@ -1411,7 +1423,11 @@ def _model_unary_rm(args, name, b64) -> list[dict] | None:
 
 
 def _model_inc_dec(args, name, b64) -> list[dict] | None:
-    """`encode_inc_dec(ops, digit, size)` - Group 5 only."""
+    """`encode_inc_dec(ops, digit, size)` - Group 5; XED's canonical form.
+
+    The 32-bit `40+rd`/`48+rd` register range is expanded by the GAS snapshot
+    gap-report layer; it is not a single opcode in XED's canonical model.
+    """
     digit, size = arg_int(args, 1), arg_int(args, 2)
     if digit is None or size is None:
         return None
@@ -1492,9 +1508,14 @@ def _model_alu(args, name, b64) -> list[dict] | None:
         return None
     forms = []
     for size in model_sizes(name, b64):
-        forms.extend(_sized({size: 0x00 + digit * 8}, size, None))
-        forms.extend(_sized({size: 0x02 + digit * 8}, size, None))
-        forms.extend(_sized({size: 0x04 + digit * 8}, size, None))
+        # `W`: the byte form is the listed opcode and the wider ones are `| 1`
+        # (`00/01`, `02/03`, `04/05`).  Without it the model claimed the byte
+        # opcode for every size -- legal under the same mnemonic, so `--verify`
+        # could not see it, and `--missing` listed the wide forms as gaps.
+        wide = 0 if size == 1 else 1
+        forms.extend(_sized({size: 0x00 + digit * 8 + wide}, size, None))
+        forms.extend(_sized({size: 0x02 + digit * 8 + wide}, size, None))
+        forms.extend(_sized({size: 0x04 + digit * 8 + wide}, size, None))
         if size == 1:
             forms.extend(_sized({size: 0x80}, size, digit))
         else:
@@ -1507,8 +1528,14 @@ def _model_test(args, name, b64) -> list[dict] | None:
     """`encode_test(ops, mnemonic)` - `84/85`, `A8/A9` and `F6/F7 /0`."""
     forms = []
     for size in model_sizes(name, b64):
-        forms.extend(_sized({size: 0x84}, size, None))
-        forms.extend(_sized({size: 0xA8}, size, None))
+        # `W`: the byte form is the listed opcode, the wider ones are `| 1`
+        # (`84`/`85` and `A8`/`A9`).  Spelling `{size: 0x84}` looked right and
+        # claimed the byte opcode for every size, which the snapshot accepted
+        # because `test 84` exists under the same name -- the gate could not
+        # tell, and `--missing` then reported `85`/`A9`/`F7 /0` as gaps.
+        wide = 0 if size == 1 else 1
+        forms.extend(_sized({size: 0x84 + wide}, size, None))
+        forms.extend(_sized({size: 0xA8 + wide}, size, None))
         forms.extend(_sized({size: 0xF6 if size == 1 else 0xF7}, size, 0))
     return forms or None
 
@@ -1704,13 +1731,18 @@ _model_xadd = _model_sized_pair({"b": ("0f", 0xC0), "d": ("0f", 0xC1)})
 
 
 def _model_out(args, name, b64) -> list[dict] | None:
-    """`out`: `EE` (DX) and `E6` (imm8)."""
-    return [form(0xEE), form(0xE6)]
+    """`out`: `EE/E6` for a byte port operand, `EF/E7` for a word or dword.
+
+    The operand size picks the same `| 1` the ALU uses: `out %al,%dx` is `EE`
+    and `out %eax,%dx` is `EF`.  Claiming only the byte pair left the wide forms
+    in the gap list even though the encoder emits them.
+    """
+    return [form(0xEE), form(0xE6), form(0xEF), form(0xE7)]
 
 
 def _model_in(args, name, b64) -> list[dict] | None:
-    """`in`: `EC` (DX) and `E4` (imm8)."""
-    return [form(0xEC), form(0xE4)]
+    """`in`: `EC/E4` byte, `ED/E5` word and dword (see `_model_out`)."""
+    return [form(0xEC), form(0xE4), form(0xED), form(0xE5)]
 
 
 def _model_bsr_bsf(args, name, b64) -> list[dict] | None:

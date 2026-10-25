@@ -15,7 +15,7 @@ C
 "$CCC" -O2 "$t/good.c" -o "$t/g"; "$t/g"
 
 # Lvalue constraints (C11 6.5.16p2, 6.5.2.4p1, 6.5.3.1p1, 6.5.3.2p1), Clang
-# 23.1.3's spellings. Each line used to compile to nothing (the store went
+# 23.1.4's spellings. Each line used to compile to nothing (the store went
 # nowhere); GCC 16.2 and Clang reject every one.
 cat >"$t/lv_bad.c" <<'C'
 struct S{int m;}; struct S sf(void){struct S s={0}; return s;} int fi(void){return 1;}

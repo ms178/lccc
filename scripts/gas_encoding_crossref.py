@@ -729,6 +729,11 @@ SNAPSHOT_LIMITATIONS = {
     "movsw": "string move vs sign-extend overload",
     "movsl": "string move vs sign-extend overload",
     "movsq": "string move vs sign-extend overload",
+    # The bare spellings collide with the SSE scalar compares/moves after the
+    # AT&T size suffix is folded: `movss` and `cmpss` reduce to `movs`/`cmps`,
+    # which are the *string* instructions in the table (`A4/A5`, `A6/A7`).
+    "movs": "string move vs `movss` after suffix folding",
+    "cmps": "string compare vs `cmpss` after suffix folding",
 }
 
 # Maps that exist only in EVEX/VEX and have no representation in i386-opc.tbl.
@@ -1062,10 +1067,47 @@ def missing(rows: list[dict], table: dict[str, list[dict]], model,
     """Encodings `as` accepts for mnemonics the encoder already knows."""
     have: dict[str, list[dict]] = {}
     for row in rows:
-        encs = model(row)
-        if encs is None:
-            continue
+        # One row can bind mnemonics whose *encodings differ by spelling*:
+        # `"lzcntl" | "tzcntl" | "popcntl"` is `0F BD`/`0F BC`/`0F B8` from one
+        # arm, and `"rolq" | "roll" | "rolw" | "rolb"` is `D1`/`D0` from
+        # another.  Modelling the row once with its first name therefore
+        # credited every sibling with the first one's opcode, which `--verify`
+        # could not see (the opcode is legal for the *set* of names) and
+        # `--missing` reported as two dozen phantom gaps.
         for name in row["names"]:
+            encs = model(row, name)
+            if encs is None:
+                continue
+            # XED's catalogue models a `+rd` opcode as one canonical base byte;
+            # GAS's row gap report must account for every concrete opcode the
+            # encoder can select. Keep this expansion in the GAS comparison
+            # layer so it does not distort XED's canonical-row verifier.
+            helper = re.findall(r"self\.(encode_[a-z0-9_]+)\(", row["body"])
+            helper = helper[-1] if helper else ""
+            ranges = {
+                "encode_push": (0x50, "none"), "encode_push16": (0x50, "none"),
+                "encode_pop": (0x58, "none"), "encode_pop16": (0x58, "none"),
+                "encode_bswap": (0xC8, "0f"), "encode_movabs": (0xB8, "none"),
+                "encode_pushp": (0x50, "none"), "encode_popp": (0x58, "none"),
+            }
+            if helper in ranges:
+                opcode, map_ = ranges[helper]
+                encs = [e for e in encs if not (e["opcode"] == opcode and e["map"] == map_)] + [
+                    dict(e, opcode=opcode | rd) for e in encs
+                    if e["opcode"] == opcode and e["map"] == map_ for rd in range(8)]
+            elif helper == "encode_xchg":
+                encs = [e for e in encs if e["opcode"] != 0x90] + [
+                    dict(e, opcode=0x90 | rd) for e in encs if e["opcode"] == 0x90
+                    for rd in range(8)]
+            elif helper == "encode_mov":
+                encs = [e for e in encs if e["opcode"] not in (0xB0, 0xB8)] + [
+                    dict(e, opcode=e["opcode"] | rd) for e in encs
+                    if e["opcode"] in (0xB0, 0xB8) for rd in range(8)]
+            elif helper == "encode_inc_dec" and "/i686/" in row["file"]:
+                args = re.search(r"encode_inc_dec\(ops,\s*([01]),\s*(\d+)\)", row["body"])
+                if args and int(args.group(2)) in (2, 4):
+                    opbase = 0x40 if args.group(1) == "0" else 0x48
+                    encs.extend(_enc(opbase | rd) for rd in range(8))
             base = gas_name(name)
             have.setdefault(name, []).extend(encs)
             have.setdefault(base, []).extend(encs)
@@ -1074,6 +1116,12 @@ def missing(rows: list[dict], table: dict[str, list[dict]], model,
     gaps: dict[str, list[dict]] = {}
     for name, encs in table.items():
         if name not in have:
+            continue
+        # `cs`/`ds`/`es`/`ss`/`fs`/`gs` are *segment prefixes*, not
+        # instructions: `--verify` already skips them, and counting their one
+        # byte encodings as "accepted encodings the encoder does not model"
+        # made the gap list claim six instructions that do not exist.
+        if name in MNEMONIC_FRAGMENTS or name in SNAPSHOT_LIMITATIONS:
             continue
         mine = have[name]
         for enc in encs:

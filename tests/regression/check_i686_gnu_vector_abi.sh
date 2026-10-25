@@ -12,10 +12,10 @@
 #   * GCC 16.2 -m32 16-byte-aligns (natural) 16-byte fixed vector arguments
 #     with a dynamically realigned %esp; lccc agrees (the i386 GNU-vector
 #     marker carries natural alignment through caller/callee classification
-#     and the variadic cursor). Clang 23.1.3 packs them 4-byte-granular
+#     and the variadic cursor). Clang 23.1.4 packs them 4-byte-granular
 #     (measured fork), so c-driver x {gcc,lccc} and g-driver x clang pairs
 #     fail at the first 16-byte check.
-#   * Clang 23.1.3 pre-SSE ext-vector variadics are broken in Clang itself:
+#   * Clang 23.1.4 pre-SSE ext-vector variadics are broken in Clang itself:
 #     its own driver x its own functions fails at the variadic check (RC 8).
 #   * The typed float bit-preservation check is invalid pre-SSE for ALL
 #     compilers: the shuffles lower through x87 and `flds` normalizes
@@ -25,7 +25,7 @@
 # per (driver, compiler) pair below. lccc's target is the GCC column: every
 # g-driver x lccc leg must pass (0:0), the remaining forks are latched, and
 # no leg may regress against the table. Re-measure with the pinned oracles
-# (GCC 16.2.0 / Clang 23.1.3 / as 2.47) before changing the table.
+# (GCC 16.2.0 / Clang 23.1.4 / as 2.47) before changing the table.
 
 set -euo pipefail
 cd "$(dirname "$0")/../.."
@@ -95,7 +95,7 @@ sed -e '/v4f floats; memcpy/d' \
     "$tmp/typed_sse.c" > "$tmp/typed_presse.c"
 
 # Latched pre-SSE first-failure RCs per (driver, compiler), measured 2026-10-25
-# with GCC 16.2.0 / Clang 23.1.3 / as 2.47, identical at -O0/-O2/-O3/-Os for
+# with GCC 16.2.0 / Clang 23.1.4 / as 2.47, identical at -O0/-O2/-O3/-Os for
 # both the i686 and no-sse modes:
 #   pair      abi typed   explanation
 #   g,g       0   0       GCC is self-consistent pre-SSE

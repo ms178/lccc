@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Install the Clang oracle the ext_vector_type gates compare against:
-# Clang 23.1.3, EXACTLY (tests/regression/lib/clang_oracle.sh states why the
+# Clang 23.1.4, EXACTLY (tests/regression/lib/clang_oracle.sh states why the
 # version is part of the contract). Hosted CI and developers without that
 # release on PATH both use this script; it is idempotent and cache-friendly.
 #
@@ -13,17 +13,17 @@
 # Usage:
 #   scripts/ci_install_clang_oracle.sh [--prefix DIR] [--print-bin]
 #
-# Exit status 0 means `$PREFIX/bin/clang -dumpversion` prints 23.1.3. Under
+# Exit status 0 means `$PREFIX/bin/clang -dumpversion` prints 23.1.4. Under
 # GitHub Actions the script also exports CLANG=<that binary> through
 # $GITHUB_ENV so every later step's gate resolves the oracle via $CLANG.
 set -Eeuo pipefail
 
-VERSION=23.1.3
+VERSION=23.1.4
 ASSET="LLVM-$VERSION-Linux-X64.tar.zst"
 URL="https://github.com/llvm/llvm-project/releases/download/llvmorg-$VERSION/$ASSET"
-# `gh api repos/llvm/llvm-project/releases/tags/llvmorg-23.1.3 --jq
-#  '.assets[] | select(.name=="LLVM-23.1.3-Linux-X64.tar.zst") | .digest'`
-SHA256=14d2f701eb68fb799001bdea6231048f3990690fa2f406d563555ff8f744daba
+# `gh api repos/llvm/llvm-project/releases/tags/llvmorg-23.1.4 --jq
+#  '.assets[] | select(.name=="LLVM-23.1.4-Linux-X64.tar.zst") | .digest'`
+SHA256=efdd1dbd089b99bfcfcde7b8eb1236163f2e88df5a981cca4f783ec9cb5e0378
 
 prefix=${LCCC_CLANG_ORACLE_PREFIX:-${XDG_CACHE_HOME:-$HOME/.cache}/lccc/clang-oracle/$VERSION}
 print_bin=0

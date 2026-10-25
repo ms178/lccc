@@ -29,7 +29,7 @@ def main():
         "--baseline", required=True, help="saved compiler from before this batch"
     )
     parser.add_argument("--gcc", default=os.environ.get("GCC", "gcc-16"))
-    parser.add_argument("--clang", required=True, help="exact Clang 23.1.3 executable")
+    parser.add_argument("--clang", required=True, help="exact Clang 23.1.4 executable")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     versions = {
@@ -37,9 +37,9 @@ def main():
         for name, tool in (("gcc", args.gcc), ("clang", args.clang))
     }
     if not re.search(r"\b16\.2(?:\.0)?\b", versions["gcc"]) or not re.search(
-        r"\b23\.1\.3\b", versions["clang"]
+        r"\b23\.1\.4\b", versions["clang"]
     ):
-        raise ValueError("requires GCC 16.2 and Clang 23.1.3")
+        raise ValueError("requires GCC 16.2 and Clang 23.1.4")
     if args.wide and args.suite != "bit-demand":
         raise ValueError("--wide requires --suite=bit-demand")
     stem = {

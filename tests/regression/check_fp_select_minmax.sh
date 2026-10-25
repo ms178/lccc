@@ -15,7 +15,7 @@
 #   {gt,lt,ge,le} x {natural,swapped arms} x {f32,f64}.
 #
 # Validation has two independent halves:
-#   1. bit-exact runtime differential against GCC 16.2 and Clang 23.1.3 at
+#   1. bit-exact runtime differential against GCC 16.2 and Clang 23.1.4 at
 #      -O0/-O1/-O2/-O3/-Os, in SSE and AVX modes, over infinities, ordinary
 #      values, +/-0, QNaN and SNaN in both operand positions. Constant selects
 #      and register-pressure/alias shapes are included alongside the matrix.
@@ -51,8 +51,8 @@ if [ "$icx_only" = 1 ]; then
 else
     "$gcc" --version 2>/dev/null | grep -c '16\.2' >/dev/null \
         || { echo "SKIP: gcc-16.2 oracle not on PATH" >&2; exit 0; }
-    "$clang" --version 2>/dev/null | grep -c '23\.1\.3' >/dev/null \
-        || { echo "SKIP: clang-23.1.3 oracle not on PATH" >&2; exit 0; }
+    "$clang" --version 2>/dev/null | grep -c '23\.1\.4' >/dev/null \
+        || { echo "SKIP: clang-23.1.4 oracle not on PATH" >&2; exit 0; }
 fi
 
 cat >"$work/matrix.c" <<'EOF'

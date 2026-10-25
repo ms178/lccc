@@ -26,8 +26,8 @@ def main():
     gcc_version = run([args.gcc, "-dumpfullversion"]).decode().strip()
     gcc_normative = gcc_oracle_identity(gcc_version, args.allow_gcc16_snapshot)
     report_gcc_oracle(args.gcc, gcc_version, gcc_normative)
-    if args.clang and run([args.clang, "-dumpversion"]).decode().strip() != "23.1.3":
-        raise ValueError("Clang 23.1.3 oracle required")
+    if args.clang and run([args.clang, "-dumpversion"]).decode().strip() != "23.1.4":
+        raise ValueError("Clang 23.1.4 oracle required")
     env = os.environ | {"CCC_VERIFY_IR": "abort", "CCC_VERIFY_REGALLOC": "1", "CCC_VALIDATE_SSA": "1"}
     references = [("gcc", args.gcc)] + ([("clang", args.clang)] if args.clang else [])
     measurements = []
@@ -71,7 +71,7 @@ def main():
         if not improved:
             raise ValueError("no instruction reduction against the disabled-pass control")
         report = {"gcc_version": gcc_version, "gcc_16_2_normative": gcc_normative,
-                  "clang_version": "23.1.3" if args.clang else None, "native_forms": len(names), "correct": True, "timing_claim": False,
+                  "clang_version": "23.1.4" if args.clang else None, "native_forms": len(names), "correct": True, "timing_claim": False,
                   "comparisons": measurements, "improved_vs_disabled": len(improved),
                   "note": "The disabled-pass control is not an immutable before-implementation baseline."}
         if args.json:

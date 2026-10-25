@@ -27,7 +27,7 @@ def main():
     ap.add_argument("--report", type=Path)
     args = ap.parse_args()
     versions = {}
-    for compiler, version in [(args.gcc, r"\b16\.2(?:\.0)?\b")] + ([(args.clang, r"\b23\.1\.3\b")] if args.clang else []):
+    for compiler, version in [(args.gcc, r"\b16\.2(?:\.0)?\b")] + ([(args.clang, r"\b23\.1\.4\b")] if args.clang else []):
         versions[compiler] = run([compiler, "--version"]).decode().splitlines()[0]
         if not re.search(version, versions[compiler]):
             raise ValueError(f"unexpected oracle version: {versions[compiler]}")

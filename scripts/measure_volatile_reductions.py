@@ -3,7 +3,7 @@
 
 All binaries must agree on stdout and successfully finish. Rotating compiler
 order and a pinned CPU reduce, but do not eliminate, virtual-host noise. Pass
-explicit GCC 16.2 / Clang 23.1.3 paths for reference comparisons.
+explicit GCC 16.2 / Clang 23.1.4 paths for reference comparisons.
 """
 
 import argparse
@@ -68,7 +68,7 @@ def provenance(compilers, env):
     tools = {}
     requirements = {
         "gcc": r"\b16\.2(?:\.0)?\b",
-        "clang": r"\b23\.1\.3\b",
+        "clang": r"\b23\.1\.4\b",
         "icx": r"\b2026\.2(?:\.0)?\b",
     }
     for name, compiler in compilers.items():

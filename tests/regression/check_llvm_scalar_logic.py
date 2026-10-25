@@ -22,8 +22,8 @@ def main():
     args = parser.parse_args()
     if not run([args.gcc, "-dumpfullversion"]).decode().strip().startswith("16."):
         raise ValueError("GCC 16 oracle required")
-    if args.clang and run([args.clang, "-dumpversion"]).decode().strip() != "23.1.3":
-        raise ValueError("Clang 23.1.3 oracle required")
+    if args.clang and run([args.clang, "-dumpversion"]).decode().strip() != "23.1.4":
+        raise ValueError("Clang 23.1.4 oracle required")
     env = os.environ | {"CCC_VERIFY_IR": "abort", "CCC_VERIFY_REGALLOC": "1", "CCC_VALIDATE_SSA": "1"}
     references = [("gcc", args.gcc)] + ([("clang", args.clang)] if args.clang else [])
     measurements = []

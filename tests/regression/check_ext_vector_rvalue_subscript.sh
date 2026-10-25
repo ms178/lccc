@@ -100,7 +100,7 @@ done
 # --- 3. Oracle-diagnosed rvalue lane forms --------------------------------
 # A lane or selection of a vector rvalue is not an lvalue: the materialized
 # temporary dies at the end of the full expression, so a store must be
-# DIAGNOSED, never silently discarded. Each form carries Clang 23.1.3's
+# DIAGNOSED, never silently discarded. Each form carries Clang 23.1.4's
 # first diagnostic (ext vectors are Clang's extension): a store says
 # "expression is not assignable", `&` "cannot take the address of an
 # rvalue", and the reversed `0[v]` is no subscript at all (commutativity is
@@ -152,7 +152,7 @@ for entry in "${rejects[@]}"; do
     fi
     # Pipefail-safe: avoid `grep -m1 | grep -q` (early-exit consumer under pipefail
     # makes SIGPIPE=141 look like failure — see scripts/check_pipefail_sigpipe.py).
-    # Use command substitution + case (no pipe, no SIGPIPE, preserves GCC 16.2/Clang 23.1.3 parity).
+    # Use command substitution + case (no pipe, no SIGPIPE, preserves GCC 16.2/Clang 23.1.4 parity).
     err_line=$(grep 'error:' <<<"$out" | sed -n '1p')
     case "$err_line" in
         *"$want"*) ;;

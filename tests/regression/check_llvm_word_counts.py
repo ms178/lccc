@@ -26,8 +26,8 @@ def main():
         # distinguish a lane provisioned with 16.3 from one whose `gcc-16` is
         # not on PATH at all, and the two have different fixes.
         raise ValueError(f"GCC 16.2 required, found: {banner!r} ({args.gcc})")
-    if args.clang and not re.search(r"\b23\.1\.3\b", run([args.clang, "--version"]).decode()):
-        raise ValueError("Clang 23.1.3 required")
+    if args.clang and not re.search(r"\b23\.1\.4\b", run([args.clang, "--version"]).decode()):
+        raise ValueError("Clang 23.1.4 required")
     env = os.environ | {"CCC_VERIFY_IR": "abort", "CCC_VERIFY_REGALLOC": "1", "CCC_VALIDATE_SSA": "1"}
     with tempfile.TemporaryDirectory() as tmp:
         p = Path(tmp)

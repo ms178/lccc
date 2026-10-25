@@ -85,7 +85,7 @@ int main(void) {
     t.xz = t.zx;
     if (t.x != 3.5L || t.y != 7.0L || t.z != 5.0L) bad |= 1 << 16;
 
-    /* packed bool lanes.  Clang 23.1.3 gives bool ext vectors subscripts
+    /* packed bool lanes.  Clang 23.1.4 gives bool ext vectors subscripts
      * only: `m.s1` / `m.lo` are "illegal vector component name" (lccc
      * matches; the diagnostic is pinned by the swizzle diagnostics gate). */
     B8 m = {1, 0, 1, 0, 1, 0, 1, 0};

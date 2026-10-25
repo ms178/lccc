@@ -3,7 +3,7 @@
 # (`ext_vector_type` layout and by-value ABI: GCC has no such type, so Clang is
 # the only reference implementation).
 #
-# The oracle is Clang 23.1.3, EXACTLY. The version is part of the contract:
+# The oracle is Clang 23.1.4, EXACTLY. The version is part of the contract:
 #   * Clang's i386 convention for 8-byte vectors changed between releases
 #     (Clang 19 returns an `ext_vector_type(2)` of `unsigned` in %eax:%edx,
 #     Clang 23 in %xmm0), so "whatever `clang` is on PATH" is not a reference.
@@ -13,12 +13,12 @@
 #     comparison that never ran.
 #
 # Resolution, in order:
-#   1. $CLANG, if set. It must report version 23.1.3, otherwise the gate fails
+#   1. $CLANG, if set. It must report version 23.1.4, otherwise the gate fails
 #      (an explicit choice is never replaced).
-#   2. clang-23 on PATH, then clang on PATH, each only if it reports 23.1.3.
+#   2. clang-23 on PATH, then clang on PATH, each only if it reports 23.1.4.
 #
-# CI installs the official LLVM 23.1.3 release (.github/workflows/ci.yml,
-# "Install the Clang 23.1.3 oracle") and exports CLANG.
+# CI installs the official LLVM 23.1.4 release (.github/workflows/ci.yml,
+# "Install the Clang 23.1.4 oracle") and exports CLANG.
 #
 # Usage (from a gate script, run from the repository root):
 #   . tests/regression/lib/clang_oracle.sh
@@ -26,10 +26,10 @@
 #   "$CLANG_ORACLE_BIN" -m64 -O2 -c fixture.c -o out.o
 #
 # Variable set by require_clang_oracle (read by the sourcing gate):
-#   CLANG_ORACLE_BIN  absolute path of the Clang 23.1.3 oracle binary
+#   CLANG_ORACLE_BIN  absolute path of the Clang 23.1.4 oracle binary
 # shellcheck disable=SC2034  # consumed by the gates that source this file
 
-CLANG_ORACLE_VERSION=23.1.3
+CLANG_ORACLE_VERSION=23.1.4
 
 # clang_oracle_version <clang-binary> -> its full version, or nothing.
 clang_oracle_version() {

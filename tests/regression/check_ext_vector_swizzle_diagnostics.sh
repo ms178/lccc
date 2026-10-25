@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Clang ext_vector_type component access ("swizzles"), checked against the
-# Clang 23.1.3 oracle -- never against expectations written by hand.
+# Clang 23.1.4 oracle -- never against expectations written by hand.
 #
 # GCC has no ext_vector_type, so Clang is the only reference. Every verdict
 # and every diagnostic below is what that Clang itself produces on the same
@@ -19,7 +19,7 @@
 #      ++/--, nested selection, single evaluation of the base, aliasing, the
 #      exact footprint of 10-byte x87 lanes): LCCC -O0/-O1/-O2 on -m64 and
 #      -m32 prints byte-for-byte what Clang -O0 prints and exits 0. Clang runs
-#      at -O0 only: Clang 23.1.3 miscompiles `<N x x86_fp80>` at -O1+.
+#      at -O0 only: Clang 23.1.4 miscompiles `<N x x86_fp80>` at -O1+.
 #   4. The one GCC-expressible rejection (a 16-byte GNU vector assigned to an
 #      8-byte one) is checked against GCC 16 as well.
 #

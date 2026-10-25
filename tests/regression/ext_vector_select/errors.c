@@ -1,6 +1,6 @@
 /* Invalid ext-vector element selections. check_ext_vector_swizzle_diagnostics.sh
  * requires LCCC's `line:col: error: message` list for this file to equal Clang
- * 23.1.3's (the type spelling after "exceeds type" aside: LCCC has no typedef
+ * 23.1.4's (the type spelling after "exceeds type" aside: LCCC has no typedef
  * names in its types). It never compiles: kept out of the runner's glob. */
 typedef int I1 __attribute__((ext_vector_type(1)));
 typedef int I2 __attribute__((ext_vector_type(2)));

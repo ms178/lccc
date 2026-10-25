@@ -54,7 +54,7 @@ compile_with() {
 # No shape is excluded. The caller supports -DABI_SKIP_<SHAPE> for a
 # MEASURED oracle defect; the exclusions this gate carried were measurements
 # of Clang 19 (x87-pair returns, a self-inconsistent i386 bool4 at -O2) and
-# of lccc's former i386 sret convention, all superseded by the Clang 23.1.3
+# of lccc's former i386 sret convention, all superseded by the Clang 23.1.4
 # convention lccc now implements (tests/regression/check_ext_vector_abi_grid.sh
 # records the i386 and x86-64 measurements shape by shape). Re-adding one
 # requires its evidence here, as before.

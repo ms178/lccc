@@ -2,7 +2,7 @@
  * assignment, compound assignment, ++/--, nested selection, single
  * evaluation of the base, aliasing operands, and the exact memory footprint
  * of 10-byte x87 long double lanes. (_Bool ext vectors have no selection.)
- * Every printed value is also checked against the result of Clang 23.1.3
+ * Every printed value is also checked against the result of Clang 23.1.4
  * -O0 (m64 and m32 agree), so the program fails on its own; in addition
  * check_ext_vector_swizzle_diagnostics.sh diffs its output against that Clang
  * at LCCC -O0/-O1/-O2 on -m64 and -m32. */

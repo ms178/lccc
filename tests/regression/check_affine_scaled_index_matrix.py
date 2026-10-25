@@ -65,7 +65,7 @@ def main():
     report_gcc_oracle(args.gcc, gcc_version,
                       gcc_oracle_identity(gcc_version, args.allow_gcc16_snapshot))
     oracles = [args.gcc]
-    for compiler, pattern in ((args.clang, r"clang version 23\.1\.3\b"),
+    for compiler, pattern in ((args.clang, r"clang version 23\.1\.4\b"),
                               (args.icx, r"\b2026\.2(?:\.|\b)")):
         if compiler:
             banner = run([compiler, "--version"])
