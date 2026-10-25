@@ -427,6 +427,15 @@ def _canonical(value: int, ext: int | None, attrs: str) -> dict | None:
                 arr = arr[1:]
         else:
             map_ = "none"
+    if map_ == "0f" and len(arr) == 2 and arr[0] == 0x01:
+        # Three-byte-opcode rows: the field is `0F 01 <ModRM>`, where the ModRM
+        # byte is the fixed form the row encodes and its `/reg` field is the
+        # row's digit (`wrmsrns 0x0f01c6` is `0F 01 /0` with the fixed ModRM
+        # `C6`).  When the row spells the digit itself (`sgdt 0x0f010/0`) that
+        # spelling wins.
+        if ext is None:
+            ext = (arr[1] >> 3) & 7
+        arr = arr[:1]
     if len(arr) != 1:
         return None
     fams = ["vex", "evex"] if family == "vexevex" else [family]
@@ -573,9 +582,10 @@ VEX_PAIR = {frozenset(("vex", "legacy")), frozenset(("evex", "legacy")),
             frozenset(("vex", "evex"))}
 # Mnemonics whose `i386-opc.tbl` entry cannot be compared with the encoder's row,
 # with the reason.  Every one of them is pinned byte-for-byte by the as-2.47
-# differential instead (`tests/asm-diff/prefix.casefile` for the string forms,
-# `tests/asm-diff/suffix-s.casefile` for WRMSRNS), which compares against the
-# assembler's actual output rather than against a transcription of its table.
+# differential instead (`tests/asm-diff/prefix.casefile`), which compares
+# against the assembler's actual output rather than against a transcription of
+# its table.  `wrmsrns` used to be listed here; it is now distilled (0F 01 /0)
+# and checked like every other row.
 SNAPSHOT_LIMITATIONS = {
     # `movsb` is two different instructions in GAS: the string move (0xA4) and,
     # with operands, the sign-extending move (0F BE).  The snapshot holds only
@@ -584,10 +594,6 @@ SNAPSHOT_LIMITATIONS = {
     "movsw": "string move vs sign-extend overload",
     "movsl": "string move vs sign-extend overload",
     "movsq": "string move vs sign-extend overload",
-    # The distiller reads the last byte of the `0F 01 /0` form as the opcode and
-    # records `f6` (the ModR/M byte of `wrmsrns`), so the snapshot entry does not
-    # describe the instruction the SDM defines (0F 01 C6).
-    "wrmsrns": "snapshot recorded the ModR/M byte as the opcode",
 }
 
 # Maps that exist only in EVEX/VEX and have no representation in i386-opc.tbl.

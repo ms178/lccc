@@ -175,6 +175,25 @@ class GasEncodingCrossrefTests(unittest.TestCase):
                  for e in self.table["shrx"]}
         self.assertIn(("vex", "0f38", "f2", 0xF7, None), forms)
 
+    def test_three_byte_opcode_rows_keep_their_modrm_digit(self):
+        """`0F 01 <ModRM>`: the digit the row encodes is ModRM's `/reg` field.
+
+        The table spells the whole thing in one field (`wrmsrns 0x0f01c6`,
+        `sgdt 0x0f010/0`), so the distiller has to split escape, opcode and
+        ModRM.  Verified against GNU as 2.47: `swapgs` is `0F 01 F8` (=/7),
+        `monitor` `0F 01 C8` (=/1), `xgetbv` `0F 01 D0` (=/2), `rdpkru` `0F 01
+        EE` (=/5), `wrmsrns` `0F 01 C6` (=/0).
+        """
+
+        def encs(name):
+            return {(e["family"], e["map"], e["opcode"], e["reg"])
+                    for e in self.table.get(name, [])}
+
+        for name, digit in (("wrmsrns", 0), ("sgdt", 0), ("monitor", 1),
+                            ("mwait", 1), ("xgetbv", 2), ("serialize", 5),
+                            ("rdpkru", 5), ("swapgs", 7), ("rdtscp", 7)):
+            self.assertIn(("legacy", "0f", 0x01, digit), encs(name), name)
+
     def test_no_encoder_row_is_uncovered(self):
         """The gate's worklist must stay empty (MB-43).
 

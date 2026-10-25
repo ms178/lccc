@@ -908,15 +908,21 @@ noise (`--strict` fails on UNMODELLED), and a class XED does not model goes into
 `SDM_ONLY_CLASSES` with a provenance comment **and** a byte-level assertion in
 `tests/asm-diff/` — `PREFETCHW` (`0F 0D /1`) is the only entry today. The
 as-2.47 reference gap is closed: the distiller used to read a lone `f2`/`f3`
-opcode byte as a mandatory prefix and drop the whole row, which is why `andn`,
-`blsi`, `blsr` and `blsmsk` were reported as UNCOVERED; the opcode is now taken
-as the *last* byte of the field, and the parameterised `setcc` resolves through
-`SNAPSHOT_ALIASES` to the `setc` row it encodes. `gas_encoding_crossref.py
---verify --strict --backend all` therefore checks 1637 rows with 0 findings, 0
-unmodelled rows and an **empty** UNCOVERED list — a ratchet that
-`tests/corpus/test_gas_encoding_crossref.py` pins by asserting both lists are
-empty and that the four BMI rows carry `VEX.NDS.LZ.0F38 F2/F3 /digit` in the
-snapshot. Accept: both gates exit 0 on a clean tree, and adding a row with a
+opcode byte as a mandatory prefix and drop the whole row (which is why `andn`,
+`blsi`, `blsr` and `blsmsk` were UNCOVERED), and it dropped the
+`0F 01 <ModRM>` rows whose field mixes escape, opcode and digit (`wrmsrns
+0x0f01c6`, `sgdt 0x0f010/0`). The opcode is now the *last* byte of the field, a
+three-byte-opcode row keeps its ModRM `/digit`, and the parameterised `setcc`
+resolves through `SNAPSHOT_ALIASES` to the `setc` row it encodes. The snapshot
+therefore grows from 2431 to 2518 mnemonics (5999 -> 6113 encodings) and
+`gas_encoding_crossref.py --verify --strict --backend all` checks 1638 rows
+with 0 findings, 0 unmodelled rows and an **empty** UNCOVERED list — a ratchet
+that `tests/corpus/test_gas_encoding_crossref.py` pins by asserting both lists
+are empty, that the four BMI rows carry `VEX.NDS.LZ.0F38 F2/F3 /digit`, and
+that the `0F 01` group keeps its ModRM digits (`swapgs` /7, `monitor` /1,
+`xgetbv` /2, `rdpkru` /5, `wrmsrns` /0). Only the four `movs*` string moves
+remain in `SNAPSHOT_LIMITATIONS`, and those are pinned by the as-2.47
+differential instead. Accept: both gates exit 0 on a clean tree, and adding a row with a
 wrong opcode, prefix, map or `/digit` makes exactly that row fail.
 
 ### MB-44 · P0 · R — close the runtime gaps the ranker can now report
@@ -957,6 +963,16 @@ in this file can be run locally; only `cargo`-shaped work cannot. Runtime
 numbers therefore still come from hosted CI — `python3 scripts/bench_rank.py
 <shard report>` is the reader, and `--compare` is the A/B that decides whether a
 change stays.
+
+**The table above is the 2026-09-27 ranking and is kept only as the schema
+witness; it is not the live list.** Two of its rows are repaired and must not be
+re-quoted: `spectral_norm` was 1.13 by 2026-10-22 (the 27.7× figure was a
+transient regression, repaired to ≈1.0), and `hash_table` gained −18.0 % from
+CFG-priced block placement in the round-2 layout work. The current, witnessed
+worklist lives in [`docs/PERFORMANCE-BACKLOG.md`](docs/PERFORMANCE-BACKLOG.md)
+(load-operand commutation in `linux_find_bit`, value-table switch lowering in
+`switch_dispatch`, affine loop-PRE for `IV + k` in `spectral_norm`, scalar
+unrolling before `mandelbrot`/`fannkuch`); add to that file, not here.
 
 ---
 

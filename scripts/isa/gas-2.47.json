@@ -3277,6 +3277,18 @@
 "w": null
 }
 ],
+"clac": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "none",
+"reg": 1,
+"vector": null,
+"w": null
+}
+],
 "clc": [
 {
 "family": "legacy",
@@ -3333,6 +3345,18 @@
 "opcode": 174,
 "pp": "66",
 "reg": 7,
+"vector": null,
+"w": null
+}
+],
+"clgi": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "none",
+"reg": 3,
 "vector": null,
 "w": null
 }
@@ -3459,6 +3483,18 @@
 "w": null
 }
 ],
+"clui": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "f3",
+"reg": 5,
+"vector": null,
+"w": null
+}
+],
 "clwb": [
 {
 "family": "legacy",
@@ -3467,6 +3503,18 @@
 "opcode": 174,
 "pp": "66",
 "reg": 6,
+"vector": null,
+"w": null
+}
+],
+"clzero": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "none",
+"reg": 7,
 "vector": null,
 "w": null
 }
@@ -6689,6 +6737,42 @@
 "w": null
 }
 ],
+"encls": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "none",
+"reg": 1,
+"vector": null,
+"w": null
+}
+],
+"enclu": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "none",
+"reg": 2,
+"vector": null,
+"w": null
+}
+],
+"enclv": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "none",
+"reg": 0,
+"vector": null,
+"w": null
+}
+],
 "encodekey128": [
 {
 "family": "legacy",
@@ -6785,6 +6869,30 @@
 "opcode": 200,
 "pp": "none",
 "reg": null,
+"vector": null,
+"w": null
+}
+],
+"erets": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "f2",
+"reg": 1,
+"vector": null,
+"w": null
+}
+],
+"eretu": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "f3",
+"reg": 1,
 "vector": null,
 "w": null
 }
@@ -8957,6 +9065,30 @@
 "w": null
 }
 ],
+"invlpga": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "none",
+"reg": 3,
+"vector": null,
+"w": null
+}
+],
+"invlpgb": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "none",
+"reg": 7,
+"vector": null,
+"w": null
+}
+],
 "invpcid": [
 {
 "family": "legacy",
@@ -11055,6 +11187,18 @@
 "w": 0
 }
 ],
+"mcommit": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "f3",
+"reg": 7,
+"vector": null,
+"w": null
+}
+],
 "minpd": [
 {
 "family": "evex",
@@ -11201,6 +11345,30 @@
 "reg": null,
 "vector": null,
 "w": 0
+}
+],
+"monitor": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "none",
+"reg": 1,
+"vector": null,
+"w": null
+}
+],
+"monitorx": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "none",
+"reg": 7,
+"vector": null,
+"w": null
 }
 ],
 "mov": [
@@ -13709,6 +13877,30 @@
 "w": null
 }
 ],
+"mwait": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "none",
+"reg": 1,
+"vector": null,
+"w": null
+}
+],
+"mwaitx": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "none",
+"reg": 7,
+"vector": null,
+"w": null
+}
+],
 "neg": [
 {
 "family": "evex",
@@ -15085,6 +15277,18 @@
 "w": 0
 }
 ],
+"pbndkb": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "none",
+"reg": 0,
+"vector": null,
+"w": null
+}
+],
 "pclmulhqhqdq": [
 {
 "family": "evex",
@@ -15587,6 +15791,18 @@
 "reg": null,
 "vector": 128,
 "w": 0
+}
+],
+"pconfig": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "none",
+"reg": 0,
+"vector": null,
+"w": null
 }
 ],
 "pdep": [
@@ -18537,6 +18753,18 @@
 "w": 0
 }
 ],
+"psmash": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "f3",
+"reg": 7,
+"vector": null,
+"w": null
+}
+],
 "psrad": [
 {
 "family": "evex",
@@ -19869,6 +20097,18 @@
 "w": null
 }
 ],
+"pvalidate": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "f2",
+"reg": 7,
+"vector": null,
+"w": null
+}
+],
 "pxor": [
 {
 "family": "evex",
@@ -20415,6 +20655,18 @@
 "w": 0
 }
 ],
+"rdmsrlist": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "f2",
+"reg": 0,
+"vector": null,
+"w": null
+}
+],
 "rdpid": [
 {
 "family": "legacy",
@@ -20427,6 +20679,18 @@
 "w": null
 }
 ],
+"rdpkru": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "none",
+"reg": 5,
+"vector": null,
+"w": null
+}
+],
 "rdpmc": [
 {
 "family": "legacy",
@@ -20435,6 +20699,18 @@
 "opcode": 51,
 "pp": "none",
 "reg": null,
+"vector": null,
+"w": null
+}
+],
+"rdpru": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "none",
+"reg": 7,
 "vector": null,
 "w": null
 }
@@ -20495,6 +20771,18 @@
 "opcode": 49,
 "pp": "none",
 "reg": null,
+"vector": null,
+"w": null
+}
+],
+"rdtscp": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "none",
+"reg": 7,
 "vector": null,
 "w": null
 }
@@ -20731,6 +21019,54 @@
 "opcode": 65,
 "pp": "none",
 "reg": null,
+"vector": null,
+"w": null
+}
+],
+"rmpadjust": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "f3",
+"reg": 7,
+"vector": null,
+"w": null
+}
+],
+"rmpquery": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "f3",
+"reg": 7,
+"vector": null,
+"w": null
+}
+],
+"rmpread": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "f2",
+"reg": 7,
+"vector": null,
+"w": null
+}
+],
+"rmpupdate": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "f2",
+"reg": 7,
 "vector": null,
 "w": null
 }
@@ -21787,6 +22123,18 @@
 "w": null
 }
 ],
+"saveprevssp": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "f3",
+"reg": 5,
+"vector": null,
+"w": null
+}
+],
 "sbb": [
 {
 "family": "evex",
@@ -22003,6 +22351,42 @@
 "w": null
 }
 ],
+"seamcall": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "66",
+"reg": 1,
+"vector": null,
+"w": null
+}
+],
+"seamops": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "66",
+"reg": 1,
+"vector": null,
+"w": null
+}
+],
+"seamret": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "66",
+"reg": 1,
+"vector": null,
+"w": null
+}
+],
 "senduipi": [
 {
 "family": "legacy",
@@ -22011,6 +22395,18 @@
 "opcode": 199,
 "pp": "f3",
 "reg": 6,
+"vector": null,
+"w": null
+}
+],
+"serialize": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "none",
+"reg": 5,
 "vector": null,
 "w": null
 }
@@ -22939,6 +23335,18 @@
 "opcode": 72,
 "pp": "f2",
 "reg": 0,
+"vector": null,
+"w": null
+}
+],
+"setssbsy": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "f3",
+"reg": 5,
 "vector": null,
 "w": null
 }
@@ -24349,6 +24757,18 @@
 "w": null
 }
 ],
+"skinit": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "none",
+"reg": 3,
+"vector": null,
+"w": null
+}
+],
 "sldt": [
 {
 "family": "legacy",
@@ -24633,6 +25053,18 @@
 "w": null
 }
 ],
+"stac": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "none",
+"reg": 1,
+"vector": null,
+"w": null
+}
+],
 "stc": [
 {
 "family": "legacy",
@@ -24653,6 +25085,18 @@
 "opcode": 253,
 "pp": "none",
 "reg": null,
+"vector": null,
+"w": null
+}
+],
+"stgi": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "none",
+"reg": 3,
 "vector": null,
 "w": null
 }
@@ -24745,6 +25189,18 @@
 "reg": 0,
 "vector": 128,
 "w": 0
+}
+],
+"stui": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "f3",
+"reg": 5,
+"vector": null,
+"w": null
 }
 ],
 "sub": [
@@ -25065,6 +25521,18 @@
 "reg": null,
 "vector": null,
 "w": 0
+}
+],
+"swapgs": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "none",
+"reg": 7,
+"vector": null,
+"w": null
 }
 ],
 "syscall": [
@@ -25561,6 +26029,18 @@
 "w": 0
 }
 ],
+"tdcall": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "66",
+"reg": 1,
+"vector": null,
+"w": null
+}
+],
 "tdpbf16ps": [
 {
 "family": "vex",
@@ -25743,6 +26223,18 @@
 "w": null
 }
 ],
+"testui": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "f3",
+"reg": 5,
+"vector": null,
+"w": null
+}
+],
 "tileloadd": [
 {
 "family": "evex",
@@ -25905,6 +26397,18 @@
 "reg": null,
 "vector": 128,
 "w": 0
+}
+],
+"tlbsync": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "none",
+"reg": 7,
+"vector": null,
+"w": null
 }
 ],
 "tmmultf32ps": [
@@ -26189,6 +26693,18 @@
 "opcode": 214,
 "pp": "none",
 "reg": null,
+"vector": null,
+"w": null
+}
+],
+"uiret": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "f3",
+"reg": 5,
 "vector": null,
 "w": null
 }
@@ -43909,6 +44425,18 @@
 "w": null
 }
 ],
+"vmcall": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "none",
+"reg": 0,
+"vector": null,
+"w": null
+}
+],
 "vmclear": [
 {
 "family": "legacy",
@@ -43917,6 +44445,30 @@
 "opcode": 199,
 "pp": "66",
 "reg": 6,
+"vector": null,
+"w": null
+}
+],
+"vmfunc": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "none",
+"reg": 2,
+"vector": null,
+"w": null
+}
+],
+"vmgexit": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "f3",
+"reg": 3,
 "vector": null,
 "w": null
 }
@@ -44245,6 +44797,42 @@
 "opcode": 93,
 "pp": "f3",
 "reg": null,
+"vector": null,
+"w": null
+}
+],
+"vmlaunch": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "none",
+"reg": 0,
+"vector": null,
+"w": null
+}
+],
+"vmload": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "none",
+"reg": 3,
+"vector": null,
+"w": null
+}
+],
+"vmmcall": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "none",
+"reg": 3,
 "vector": null,
 "w": null
 }
@@ -46879,6 +47467,42 @@
 "w": null
 }
 ],
+"vmresume": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "none",
+"reg": 0,
+"vector": null,
+"w": null
+}
+],
+"vmrun": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "none",
+"reg": 3,
+"vector": null,
+"w": null
+}
+],
+"vmsave": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "none",
+"reg": 3,
+"vector": null,
+"w": null
+}
+],
 "vmul": [
 {
 "family": "evex",
@@ -47165,6 +47789,18 @@
 "opcode": 121,
 "pp": "none",
 "reg": null,
+"vector": null,
+"w": null
+}
+],
+"vmxoff": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "none",
+"reg": 0,
 "vector": null,
 "w": null
 }
@@ -64847,6 +65483,18 @@
 "w": null
 }
 ],
+"wrmsrlist": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "f3",
+"reg": 0,
+"vector": null,
+"w": null
+}
+],
 "wrmsrns": [
 {
 "family": "evex",
@@ -64859,6 +65507,16 @@
 "w": 0
 },
 {
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "none",
+"reg": 0,
+"vector": null,
+"w": null
+},
+{
 "family": "vex",
 "imm_ext": null,
 "map": "none",
@@ -64867,6 +65525,18 @@
 "reg": 0,
 "vector": 128,
 "w": 0
+}
+],
+"wrpkru": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "none",
+"reg": 5,
+"vector": null,
+"w": null
 }
 ],
 "wrssd": [
@@ -65017,6 +65687,30 @@
 "opcode": 145,
 "pp": "none",
 "reg": null,
+"vector": null,
+"w": null
+}
+],
+"xend": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "none",
+"reg": 2,
+"vector": null,
+"w": null
+}
+],
+"xgetbv": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "none",
+"reg": 2,
 "vector": null,
 "w": null
 }
@@ -65279,6 +65973,18 @@
 "w": 0
 }
 ],
+"xresldtrk": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "f2",
+"reg": 5,
+"vector": null,
+"w": null
+}
+],
 "xrstor": [
 {
 "family": "legacy",
@@ -65419,6 +66125,42 @@
 "opcode": 199,
 "pp": "none",
 "reg": 5,
+"vector": null,
+"w": null
+}
+],
+"xsetbv": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "none",
+"reg": 2,
+"vector": null,
+"w": null
+}
+],
+"xsusldtrk": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "f2",
+"reg": 5,
+"vector": null,
+"w": null
+}
+],
+"xtest": [
+{
+"family": "legacy",
+"imm_ext": null,
+"map": "0f",
+"opcode": 1,
+"pp": "none",
+"reg": 2,
 "vector": null,
 "w": null
 }
