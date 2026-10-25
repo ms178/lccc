@@ -1241,6 +1241,10 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86MulEpi32),
     );
     m.insert(
+        "__builtin_ia32_pmulld128",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86MulloEpi32),
+    );
+    m.insert(
         "_mm_mullo_epi32",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86MulloEpi32),
     );
@@ -1746,6 +1750,70 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
     m.insert(
         "__builtin_ia32_phaddw128",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Phaddw128),
+    );
+    m.insert(
+        "_mm_hsub_epi16",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Phsubw128),
+    );
+    m.insert(
+        "__builtin_ia32_phsubw128",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Phsubw128),
+    );
+    m.insert(
+        "_mm_hsub_epi32",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Phsubd128),
+    );
+    m.insert(
+        "__builtin_ia32_phsubd128",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Phsubd128),
+    );
+    m.insert(
+        "_mm_hadds_epi16",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Phaddsw128),
+    );
+    m.insert(
+        "__builtin_ia32_phaddsw128",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Phaddsw128),
+    );
+    m.insert(
+        "_mm_hsubs_epi16",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Phsubsw128),
+    );
+    m.insert(
+        "__builtin_ia32_phsubsw128",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Phsubsw128),
+    );
+    m.insert(
+        "_mm_sign_epi8",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psignb128),
+    );
+    m.insert(
+        "__builtin_ia32_psignb128",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psignb128),
+    );
+    m.insert(
+        "_mm_sign_epi16",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psignw128),
+    );
+    m.insert(
+        "__builtin_ia32_psignw128",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psignw128),
+    );
+    m.insert(
+        "_mm_sign_epi32",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psignd128),
+    );
+    m.insert(
+        "__builtin_ia32_psignd128",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Psignd128),
+    );
+    m.insert(
+        "_mm_mulhrs_epi16",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pmulhrsw128),
+    );
+    m.insert(
+        "__builtin_ia32_pmulhrsw128",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pmulhrsw128),
     );
     m.insert(
         "__builtin_ia32_phaddd128",
@@ -3206,6 +3274,14 @@ pub enum BuiltinIntrinsic {
     X86Pmaddubsw128,  // _mm_maddubs_epi16 (PMADDUBSW, SSSE3)
     X86Phaddw128,     // _mm_hadd_epi16 (PHADDW, SSSE3)
     X86Phaddd128,     // _mm_hadd_epi32 (PHADDD, SSSE3)
+    X86Phsubw128,     // _mm_hsub_epi16 (SSSE3)
+    X86Phsubd128,     // _mm_hsub_epi32 (SSSE3)
+    X86Phaddsw128,    // _mm_hadds_epi16 (SSSE3)
+    X86Phsubsw128,    // _mm_hsubs_epi16 (SSSE3)
+    X86Psignb128,     // _mm_sign_epi8 (SSSE3)
+    X86Psignw128,     // _mm_sign_epi16 (SSSE3)
+    X86Psignd128,     // _mm_sign_epi32 (SSSE3)
+    X86Pmulhrsw128,   // _mm_mulhrs_epi16 (SSSE3)
     X86Pshufb128,     // _mm_shuffle_epi8 (PSHUFB, SSSE3)
     X86Pabsb128,      // _mm_abs_epi8 (PABSB, SSSE3)
     X86Pabsw128,      // _mm_abs_epi16 (PABSW, SSSE3)

@@ -1203,6 +1203,14 @@ pub enum IntrinsicOp {
     Phaddw128,
     /// Packed 32-bit horizontal add (PHADDD, SSSE3)
     Phaddd128,
+    Phsubw128,
+    Phsubd128,
+    Phaddsw128,
+    Phsubsw128,
+    Psignb128,
+    Psignw128,
+    Psignd128,
+    Pmulhrsw128,
     /// Packed byte shuffle (PSHUFB, SSSE3)
     Pshufb128,
     /// Packed absolute value bytes (PABSB, SSSE3)
@@ -2145,7 +2153,7 @@ impl IntrinsicOp {
             | SetEpi32 | Pslldqi128 | Psrldqi128 | Psllqi128 | Psrlqi128
             | Pshufd128 | Paddw128 | Psubw128 | Paddb128 | Psubb128
             | Psubusw128 | Psadbw128 | Pmullw128 | Pmaddubsw128 | Phaddw128
-            | Phaddd128 | Pshufb128 | Pabsb128 | Pabsw128 | Pabsd128
+            | Phaddd128 | Phsubw128 | Phsubd128 | Phaddsw128 | Phsubsw128 | Psignb128 | Psignw128 | Psignd128 | Pmulhrsw128 | Pshufb128 | Pabsb128 | Pabsw128 | Pabsd128
             | Palignr128 | Pmaxub128 | Pminub128 | Pblendvb128 | Pblendw128 | Pmovzxbw128
             | Pmovzxwd128 | Psllw128 | Psrlw128 | Pmulhw128 | Pmaddwd128
             | Pcmpgtw128 | Pcmpgtb128 | Psllwi128 | Psrlwi128 | Psrawi128
@@ -3419,6 +3427,31 @@ mod memory_classification_tests {
                 !op.writes_memory_via_args() && !op.may_read_memory(),
                 "{op:?} is pure compute and must not look like a memory op"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod ssse3_native_contract_tests {
+    use super::IntrinsicOp::*;
+    #[test]
+    fn native_binary_results_have_full_vector_homes() {
+        for op in [
+            Phsubw128,
+            Phsubd128,
+            Phaddsw128,
+            Phsubsw128,
+            Psignb128,
+            Psignw128,
+            Psignd128,
+            Pmulhrsw128,
+        ] {
+            assert_eq!(op.vector_result_width(), Some(16), "{op:?}");
+            assert_eq!(op.vector_home_width(), Some(16), "{op:?}");
+            // Explicit-SIMD nodes read argument pointers and write a
+            // destination slot; match the existing horizontal-add contract.
+            assert_eq!(op.is_pure(), Phaddd128.is_pure());
+            assert!(op.is_vector_op());
         }
     }
 }

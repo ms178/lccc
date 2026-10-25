@@ -1181,6 +1181,14 @@ impl Lowerer {
             | BuiltinIntrinsic::X86Pmaddubsw128
             | BuiltinIntrinsic::X86Phaddw128
             | BuiltinIntrinsic::X86Phaddd128
+            | BuiltinIntrinsic::X86Phsubw128
+            | BuiltinIntrinsic::X86Phsubd128
+            | BuiltinIntrinsic::X86Phaddsw128
+            | BuiltinIntrinsic::X86Phsubsw128
+            | BuiltinIntrinsic::X86Psignb128
+            | BuiltinIntrinsic::X86Psignw128
+            | BuiltinIntrinsic::X86Psignd128
+            | BuiltinIntrinsic::X86Pmulhrsw128
             | BuiltinIntrinsic::X86Pshufb128
             | BuiltinIntrinsic::X86Pabsb128
             | BuiltinIntrinsic::X86Pabsw128
@@ -2644,7 +2652,41 @@ impl Lowerer {
         let Some(requirement) = x86_intrinsic_required_feature(intrinsic) else {
             return;
         };
-        if crate::common::x86_features::effective().contains(requirement.feature) {
+        let mut permitted = crate::common::x86_features::effective().contains(requirement.feature);
+        // Legacy 128-bit extensions keep the same register/ABI class under a
+        // function target attribute. Honor that local permission without leaking
+        // it into another function or claiming per-function wider-vector support.
+        use crate::common::x86_features::X86Feature as F;
+        let needed = match requirement.feature {
+            F::Ssse3 => Some(3),
+            F::Sse41 => Some(4),
+            F::Sse42 => Some(5),
+            _ => None,
+        };
+        if let (Some(needed), Some(function)) = (needed, self.func_state.as_ref()) {
+            for request in &function.target_features {
+                let (enabled, feature) = request
+                    .strip_prefix("no-")
+                    .map_or((true, request.as_str()), |f| (false, f));
+                let level = match feature {
+                    "sse" => 0,
+                    "sse2" => 1,
+                    "sse3" => 2,
+                    "ssse3" => 3,
+                    "sse4.1" => 4,
+                    "sse4.2" => 5,
+                    "avx" | "avx2" => 6,
+                    _ => continue,
+                };
+                if enabled && level >= needed {
+                    permitted = true;
+                }
+                if !enabled && level <= needed {
+                    permitted = false;
+                }
+            }
+        }
+        if permitted {
             return;
         }
         self.diagnostics.borrow_mut().error(
@@ -3342,6 +3384,45 @@ fn x86_intrinsic_required_feature(intrinsic: &BuiltinIntrinsic) -> Option<Intrin
     use crate::common::x86_features::X86Feature as F;
     use BuiltinIntrinsic as B;
     Some(match intrinsic {
+        // Public headers must not silently introduce SSSE3 above a declared
+        // SSE2 ceiling. Include the raw builtin aliases in this same gate.
+        B::X86Pmaddubsw128
+        | B::X86Phaddw128
+        | B::X86Phaddd128
+        | B::X86Phsubw128
+        | B::X86Phsubd128
+        | B::X86Phaddsw128
+        | B::X86Phsubsw128
+        | B::X86Psignb128
+        | B::X86Psignw128
+        | B::X86Psignd128
+        | B::X86Pmulhrsw128
+        | B::X86Pshufb128
+        | B::X86Pabsb128
+        | B::X86Pabsw128
+        | B::X86Pabsd128
+        | B::X86Palignr128 => IntrinsicRequirement {
+            feature: F::Ssse3,
+            flag: "-mssse3",
+            also: None,
+        },
+        B::X86Pinsrd128
+        | B::X86Pextrd128
+        | B::X86Pinsrb128
+        | B::X86Pextrb128
+        | B::X86Pinsrq128
+        | B::X86Pextrq128
+        | B::X86Pblendvb128
+        | B::X86Pblendw128
+        | B::X86Pmovzxbw128
+        | B::X86Pmovzxwd128
+        | B::X86MulEpi32
+        | B::X86MulloEpi32
+        | B::X86Testz128 => IntrinsicRequirement {
+            feature: F::Sse41,
+            flag: "-msse4.1",
+            also: None,
+        },
         // SSE4.2 introduced CRC32: `_mm_crc32_u8` and its width siblings.
         B::X86Crc32_8 | B::X86Crc32_16 | B::X86Crc32_32 | B::X86Crc32_64 => IntrinsicRequirement {
             feature: F::Sse42,
@@ -3585,6 +3666,14 @@ fn x86_intrinsic_op(intrinsic: &BuiltinIntrinsic) -> IntrinsicOp {
         BuiltinIntrinsic::X86Pmaddubsw128 => IntrinsicOp::Pmaddubsw128,
         BuiltinIntrinsic::X86Phaddw128 => IntrinsicOp::Phaddw128,
         BuiltinIntrinsic::X86Phaddd128 => IntrinsicOp::Phaddd128,
+        BuiltinIntrinsic::X86Phsubw128 => IntrinsicOp::Phsubw128,
+        BuiltinIntrinsic::X86Phsubd128 => IntrinsicOp::Phsubd128,
+        BuiltinIntrinsic::X86Phaddsw128 => IntrinsicOp::Phaddsw128,
+        BuiltinIntrinsic::X86Phsubsw128 => IntrinsicOp::Phsubsw128,
+        BuiltinIntrinsic::X86Psignb128 => IntrinsicOp::Psignb128,
+        BuiltinIntrinsic::X86Psignw128 => IntrinsicOp::Psignw128,
+        BuiltinIntrinsic::X86Psignd128 => IntrinsicOp::Psignd128,
+        BuiltinIntrinsic::X86Pmulhrsw128 => IntrinsicOp::Pmulhrsw128,
         BuiltinIntrinsic::X86Pshufb128 => IntrinsicOp::Pshufb128,
         BuiltinIntrinsic::X86Pabsb128 => IntrinsicOp::Pabsb128,
         BuiltinIntrinsic::X86Pabsw128 => IntrinsicOp::Pabsw128,

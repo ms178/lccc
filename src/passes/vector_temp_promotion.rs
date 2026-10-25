@@ -337,6 +337,14 @@ fn pointer_vector_arg_width_consumer(op: IntrinsicOp, index: usize) -> Option<us
         | O::Pmaddubsw128
         | O::Phaddw128
         | O::Phaddd128
+        | O::Phsubw128
+        | O::Phsubd128
+        | O::Phaddsw128
+        | O::Phsubsw128
+        | O::Psignb128
+        | O::Psignw128
+        | O::Psignd128
+        | O::Pmulhrsw128
         | O::Pshufb128
         | O::Palignr128
         | O::Pmaxub128

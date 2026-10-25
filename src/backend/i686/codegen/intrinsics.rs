@@ -1034,12 +1034,29 @@ impl I686Codegen {
             }
 
             // SSSE3 horizontal adds: (a, b) → phaddw/phaddd %xmm1, %xmm0.
-            IntrinsicOp::Phaddw128 | IntrinsicOp::Phaddd128 => {
+            IntrinsicOp::Phaddw128
+            | IntrinsicOp::Phaddd128
+            | IntrinsicOp::Phsubw128
+            | IntrinsicOp::Phsubd128
+            | IntrinsicOp::Phaddsw128
+            | IntrinsicOp::Phsubsw128
+            | IntrinsicOp::Psignb128
+            | IntrinsicOp::Psignw128
+            | IntrinsicOp::Psignd128
+            | IntrinsicOp::Pmulhrsw128 => {
                 if let Some(dptr) = dest_ptr {
-                    let inst = if matches!(op, IntrinsicOp::Phaddw128) {
-                        "phaddw"
-                    } else {
-                        "phaddd"
+                    let inst = match op {
+                        IntrinsicOp::Phaddw128 => "phaddw",
+                        IntrinsicOp::Phaddd128 => "phaddd",
+                        IntrinsicOp::Phsubw128 => "phsubw",
+                        IntrinsicOp::Phsubd128 => "phsubd",
+                        IntrinsicOp::Phaddsw128 => "phaddsw",
+                        IntrinsicOp::Phsubsw128 => "phsubsw",
+                        IntrinsicOp::Psignb128 => "psignb",
+                        IntrinsicOp::Psignw128 => "psignw",
+                        IntrinsicOp::Psignd128 => "psignd",
+                        IntrinsicOp::Pmulhrsw128 => "pmulhrsw",
+                        _ => unreachable!(),
                     };
                     self.operand_to_eax(&args[0]);
                     self.state.emit("    movdqu (%eax), %xmm0");

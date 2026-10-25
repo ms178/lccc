@@ -2970,11 +2970,29 @@ impl X86Codegen {
             }
 
             // SSSE3 horizontal add and alignr (imm arg in args[2] for alignr)
-            IntrinsicOp::Phaddw128 | IntrinsicOp::Phaddd128 | IntrinsicOp::Palignr128 => {
+            IntrinsicOp::Phaddw128
+            | IntrinsicOp::Phaddd128
+            | IntrinsicOp::Phsubw128
+            | IntrinsicOp::Phsubd128
+            | IntrinsicOp::Phaddsw128
+            | IntrinsicOp::Phsubsw128
+            | IntrinsicOp::Psignb128
+            | IntrinsicOp::Psignw128
+            | IntrinsicOp::Psignd128
+            | IntrinsicOp::Pmulhrsw128
+            | IntrinsicOp::Palignr128 => {
                 if let Some(dptr) = dest_ptr {
                     let inst = match op {
                         IntrinsicOp::Phaddw128 => "phaddw",
                         IntrinsicOp::Phaddd128 => "phaddd",
+                        IntrinsicOp::Phsubw128 => "phsubw",
+                        IntrinsicOp::Phsubd128 => "phsubd",
+                        IntrinsicOp::Phaddsw128 => "phaddsw",
+                        IntrinsicOp::Phsubsw128 => "phsubsw",
+                        IntrinsicOp::Psignb128 => "psignb",
+                        IntrinsicOp::Psignw128 => "psignw",
+                        IntrinsicOp::Psignd128 => "psignd",
+                        IntrinsicOp::Pmulhrsw128 => "pmulhrsw",
                         IntrinsicOp::Palignr128 => "palignr",
                         _ => unreachable!(),
                     };
@@ -2982,8 +3000,20 @@ impl X86Codegen {
                     self.sse_load_arg(&args[1], "xmm1");
                     if matches!(op, IntrinsicOp::Palignr128) {
                         let imm = self.operand_to_imm_i64(&args[2]);
+                        if self.isa.avx {
+                            self.state.emit_fmt(format_args!(
+                                "    vpalignr ${}, %xmm1, %xmm0, %xmm0",
+                                imm
+                            ));
+                        } else {
+                            self.state
+                                .emit_fmt(format_args!("    palignr ${}, %xmm1, %xmm0", imm));
+                        }
+                    } else if self.isa.avx {
+                        // Keep AVX-enabled code in the VEX domain rather than
+                        // introducing a legacy SSE instruction between VEX loads.
                         self.state
-                            .emit_fmt(format_args!("    palignr ${}, %xmm1, %xmm0", imm));
+                            .emit_fmt(format_args!("    v{} %xmm1, %xmm0, %xmm0", inst));
                     } else {
                         self.state
                             .emit_fmt(format_args!("    {} %xmm1, %xmm0", inst));

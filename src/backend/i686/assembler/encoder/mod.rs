@@ -419,7 +419,9 @@ impl InstructionEncoder {
                     self.explicit_data16 = true;
                 }
                 "data32" => return Err("redundant data32 prefix".to_string()),
-                "rex" | "rex.x" => return Err("`rex' is not supported in 32-bit mode".to_string()),
+                "rex" | "rex.x" | "rex64" => {
+                    return Err("`rex' is not supported in 32-bit mode".to_string());
+                }
                 _ => return Err(format!("unknown prefix: {}", prefix)),
             }
         }

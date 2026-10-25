@@ -993,8 +993,16 @@ impl InstructionEncoder {
                 "data32" => return Err("`data32' is not supported in 64-bit mode".to_string()),
                 "rex" => rex_floor |= 0x40,
                 "rex.x" => rex_floor |= 0x42,
+                "rex64" => rex_floor |= 0x48,
                 _ => {}
             }
+        }
+        // AH/BH/CH/DH do not exist under any REX prefix. Never silently
+        // change a named high-byte operand into SPL/BPL/SIL/DIL.
+        if rex_floor != 0 && instr.operands.iter().any(|o| {
+            matches!(o, Operand::Register(r) if matches!(r.name.as_str(), "ah" | "bh" | "ch" | "dh"))
+        }) {
+            return Err("high-byte register cannot be encoded with a REX prefix".into());
         }
         // The `addr32` word COALESCES with the body's address-size
         // override: GAS `addr32 mov %eax,(%eax)' = 67 89 00 (one byte,
@@ -1099,7 +1107,7 @@ impl InstructionEncoder {
                 // addr32 0x67 byte is appended to seg_pre AFTER the loop
                 // so segment overrides always precede it (GAS:
                 // `fs addr32 mov %eax,(%ebx)' = 64 67 89 03).
-                "addr32" | "data16" | "rex" | "rex.x" => {}
+                "addr32" | "data16" | "rex" | "rex.x" | "rex64" => {}
                 // Segment overrides used as standalone prefixes. The kernel's
                 // `ds wrmsr` relies on the byte being emitted so an
                 // ALTERNATIVE can patch the instruction in place.
@@ -1487,7 +1495,17 @@ impl InstructionEncoder {
             while at < self.bytes.len()
                 && matches!(
                     self.bytes[at],
-                    0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65 | 0x67 | 0x66 | 0x9B
+                    0x26 | 0x2E
+                        | 0x36
+                        | 0x3E
+                        | 0x64
+                        | 0x65
+                        | 0x67
+                        | 0x66
+                        | 0x9B
+                        | 0xF0
+                        | 0xF2
+                        | 0xF3
                 )
             {
                 at += 1;
@@ -1798,14 +1816,7 @@ impl InstructionEncoder {
             "vpackusdw" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x2B)),
             "vpmaddubsw" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x04)),
             "vpshufb" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x00)),
-            "vpsignb" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x08)),
-            "vpsignw" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x09)),
-            "vpsignd" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x0A)),
             "vpmulhrsw" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x0B)),
-            "vphaddw" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x01)),
-            "vphaddd" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x02)),
-            "vphsubw" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x05)),
-            "vphsubd" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x06)),
             // AVX-VNNI / AVX-VNNI-INT8 (EVEX.NDS.512.66.0F38)
             "vpdpbusd" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x50)),
             "vpdpbusds" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x51)),
@@ -6958,6 +6969,20 @@ mod encoding_opt_tests {
 
     #[test]
     fn ssse3_vex_arms() {
+        // SDM PHSUBW/PHSUBD and PSIGNB/W/D list no EVEX form. Reject
+        // ZMM/high-register/masked requests instead of inventing opcodes.
+        for m in [
+            "vphaddw", "vphaddd", "vphsubw", "vphsubd", "vpsignb", "vpsignw", "vpsignd",
+        ] {
+            for operands in [
+                "%zmm1,%zmm2,%zmm3",
+                "%xmm16,%xmm2,%xmm3",
+                "%xmm1,%xmm2,%xmm3 {%k1}",
+            ] {
+                assert!(fails(&format!("{m} {operands}")), "{m} {operands}");
+            }
+        }
+
         assert_eq!(hex("vphaddsw %xmm1, %xmm2, %xmm3"), "c4 e2 69 03 d9");
         assert_eq!(hex("vphsubw %xmm1, %xmm2, %xmm3"), "c4 e2 69 05 d9");
         assert_eq!(hex("vphsubd %xmm1, %xmm2, %xmm3"), "c4 e2 69 06 d9");

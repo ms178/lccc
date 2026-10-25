@@ -1,0 +1,18 @@
+;;; horizontal-no-evex reject
+.text
+vphaddw %zmm1,%zmm2,%zmm3
+;;; sign-no-evex reject
+.text
+vpsignd %xmm16,%xmm2,%xmm3
+;;; horizontal-no-mask reject
+.text
+vphsubd %xmm1,%xmm2,%xmm3 {%k1}
+;;; still-vex
+.text
+vphaddw %xmm1,%xmm2,%xmm3
+vphaddd %ymm1,%ymm2,%ymm3
+vphsubw %ymm1,%ymm2,%ymm3
+vphsubd %xmm1,%xmm2,%xmm3
+vpsignb %ymm1,%ymm2,%ymm3
+vpsignw %xmm1,%xmm2,%xmm3
+vpsignd %ymm1,%ymm2,%ymm3

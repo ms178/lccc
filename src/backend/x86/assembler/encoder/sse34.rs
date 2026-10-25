@@ -153,6 +153,10 @@ impl InstructionEncoder {
         if ops.len() == 2 {
             return self.encode_sse_op(ops, &[prefix, 0x0F, 0x79]);
         }
+        let expected = if insert { 4 } else { 3 };
+        if ops.len() != expected {
+            return Err(format!("SSE4a immediate form requires {expected} operands"));
+        }
         let (
             Operand::Immediate(ImmediateValue::Integer(length)),
             Operand::Immediate(ImmediateValue::Integer(index)),
@@ -194,6 +198,11 @@ mod tests {
     fn saturation_strings_and_sse4a_have_distinct_prefixes_and_fields() {
         for (source, bytes) in [
             ("phaddsw %mm1,%mm2", "0f 38 03 d1"),
+            ("rex64 pcmpestri $0,%xmm1,%xmm2", "66 48 0f 3a 61 d1 00"),
+            ("rex64 pcmpestrm $0,%xmm9,%xmm10", "66 4d 0f 3a 60 d1 00"),
+            ("rex movddup %xmm1,%xmm2", "f2 40 0f 12 d1"),
+            ("rex crc32b %al,%eax", "f2 40 0f 38 f0 c0"),
+            ("rex64 crc32b %al,%rax", "f2 48 0f 38 f0 c0"),
             ("phsubsw %xmm1,%xmm2", "66 0f 38 07 d1"),
             ("pcmpistri $255,%xmm1,%xmm2", "66 0f 3a 63 d1 ff"),
             ("pcmpestrm $1,%xmm1,%xmm2", "66 0f 3a 60 d1 01"),
@@ -214,6 +223,8 @@ mod tests {
             "crc32w %ax,%rax",
             "crc32l %eax,%rax",
             "crc32b %xmm0,%eax",
+            "rex crc32b %ah,%eax",
+            "rex64 crc32b %ah,%rax",
             "extrq $256,$1,%xmm0",
             "insertq (%rax),%xmm0",
         ] {

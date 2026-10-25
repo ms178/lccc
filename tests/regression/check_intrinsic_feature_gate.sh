@@ -168,6 +168,45 @@ compare() {
     echo "ok: $src $* -> $ours (gcc agrees)"
 }
 
+# Native packed integer operations are not baseline SSE2 merely because
+# their C arguments fit in 128 bits. Raw and public names share permission.
+cat >"$tmp/o_ssse3.c" <<'EOF'
+#include <tmmintrin.h>
+__m128i sub(__m128i a,__m128i b) { return _mm_hsub_epi32(a,b); }
+EOF
+cat >"$tmp/o_sse41.c" <<'EOF'
+#include <smmintrin.h>
+__m128i mul(__m128i a,__m128i b) { return _mm_mullo_epi32(a,b); }
+EOF
+reject o_ssse3.c -mssse3 -march=x86-64
+reject o_ssse3.c -mssse3 -mssse3 -mno-ssse3
+accept o_ssse3.c phsubd -march=x86-64 -mssse3
+accept o_ssse3.c phsubd -mno-ssse3 -mssse3
+reject o_sse41.c -msse4.1 -march=x86-64
+accept o_sse41.c pmulld -march=x86-64 -msse4.1
+cat >"$tmp/o_local_ssse3.c" <<'EOF'
+#include <tmmintrin.h>
+__attribute__((target("ssse3"))) __m128i f(__m128i a,__m128i b) { return _mm_hsub_epi32(a,b); }
+EOF
+cat >"$tmp/o_local_sse41.c" <<'EOF'
+#include <smmintrin.h>
+__attribute__((target("sse4.1"))) __m128i f(__m128i a,__m128i b) { return _mm_mullo_epi32(a,b); }
+EOF
+accept o_local_ssse3.c phsubd -march=x86-64
+accept o_local_sse41.c pmulld -march=x86-64
+compare o_local_ssse3.c -march=x86-64
+compare o_local_sse41.c -march=x86-64
+# A local grant must not make an unrelated baseline function legal.
+cat "$tmp/o_local_ssse3.c" > "$tmp/o_local_no_leak.c"
+printf '%s\n' '__m128i g(__m128i a,__m128i b) { return _mm_hsub_epi32(a,b); }' >> "$tmp/o_local_no_leak.c"
+reject o_local_no_leak.c -mssse3 -march=x86-64
+compare o_local_no_leak.c -march=x86-64
+compare o_ssse3.c -march=x86-64
+compare o_ssse3.c -march=x86-64 -mssse3
+compare o_ssse3.c -mssse3 -mno-ssse3
+compare o_sse41.c -march=x86-64
+compare o_sse41.c -march=x86-64 -msse4.1
+
 compare o_crc.c -march=x86-64
 compare o_crc.c -msse4.2
 compare o_crc.c -march=x86-64-v2

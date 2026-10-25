@@ -102,6 +102,8 @@ pub(super) struct FunctionBuildState {
     pub current_label: BlockId,
     /// Name of the function currently being lowered
     pub name: String,
+    /// Normalized per-function ISA requests; never change the invocation globally.
+    pub target_features: Vec<String>,
     /// Return type of the function currently being lowered
     pub return_type: IrType,
     /// Whether the current function returns _Bool
@@ -296,6 +298,7 @@ impl FunctionBuildState {
             instrs: Vec::new(),
             current_label: BlockId(0),
             name,
+            target_features: Vec::new(),
             return_type,
             return_is_bool,
             return_ctype: None,

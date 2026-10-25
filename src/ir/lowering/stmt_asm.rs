@@ -67,7 +67,8 @@ impl Lowerer {
             let out_ty = self.asm_operand_ir_type(&self.expr_ctype(&out.expr));
             // Detect address space for memory operands (e.g., __seg_gs pointer dereferences)
             let out_seg = self.get_asm_operand_addr_space(&out.expr);
-            let ptr = if let Some(lv) = self.lower_lvalue(&out.expr) {
+            let out_lvalue = self.lower_lvalue(&out.expr);
+            let ptr = if let Some(lv) = out_lvalue {
                 match lv.kind {
                     crate::ir::lowering::definitions::LValueKind::Variable(v)
                     | crate::ir::lowering::definitions::LValueKind::Address(v, _)
@@ -171,14 +172,19 @@ impl Lowerer {
                     self.expr_ctype(&out.expr),
                     crate::common::types::CType::Vector(_, _)
                 ) {
-                    // For "+x" read-write constraints on vector types, pass the alloca pointer
-                    // directly instead of emitting a Load instruction. Vector types (e.g.,
-                    // __attribute__((vector_size(16)))) are 128 bits but IrType::Ptr is only
-                    // 64 bits, so a Load would truncate the value to 64 bits, zeroing the
-                    // upper half of the XMM register. By passing the alloca directly, the
-                    // backend's load_input_to_reg will use movdqu to load the full 128-bit
-                    // vector from the alloca's stack slot.
-                    Operand::Value(ptr)
+                    // x86 register operands carry a value, not the address of
+                    // a vector member/pointee. Materialize all 16 bytes using a
+                    // typed load; a spilled GEP is only an 8-byte POINTER home.
+                    // Preserve volatile and segment metadata from the lvalue.
+                    if self.is_x86() && out_ty == IrType::I128 {
+                        if let Some(lv) = out_lvalue {
+                            self.load_lvalue_typed(&lv, out_ty)
+                        } else {
+                            Operand::Value(ptr)
+                        }
+                    } else {
+                        Operand::Value(ptr)
+                    }
                 } else {
                     let cur_val = self.fresh_value();
                     self.emit(Instruction::Load {
@@ -289,6 +295,17 @@ impl Lowerer {
                         } => v,
                     };
                     Operand::Value(ptr)
+                } else {
+                    self.lower_expr(&inp.expr)
+                }
+            } else if self.is_x86()
+                && matches!(
+                    self.expr_ctype(&inp.expr),
+                    crate::common::types::CType::Vector(_, 16)
+                )
+            {
+                if let Some(lv) = self.lower_lvalue(&inp.expr) {
+                    self.load_lvalue_typed(&lv, IrType::I128)
                 } else {
                     self.lower_expr(&inp.expr)
                 }
