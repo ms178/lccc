@@ -105,6 +105,20 @@ pcmpestrm $0x08, %xmm1, %xmm2
 pcmpestri $0x08, (%rdi), %xmm2
 pcmpistrm $0x08, %xmm1, %xmm2
 pcmpistri $0x08, (%rdi), %xmm2
+rex64 pcmpestri $0x08, %xmm1, %xmm2
+rex64 pcmpestri $0x08, %xmm9, %xmm10
+rex64 pcmpestrm $0x08, %xmm1, %xmm2
+rex64 pcmpestrm $0x08, (%rdi), %xmm2
+rex64 pcmpistri $0x08, %xmm1, %xmm2
+rex64 pcmpistri $0x08, %xmm9, %xmm10
+;;; amd_sse4a
+.text
+extrq %xmm1, %xmm2
+extrq $7, $9, %xmm2
+insertq %xmm1, %xmm2
+insertq $7, $9, %xmm1, %xmm2
+movntsd %xmm1, (%rdi)
+movntss %xmm1, (%rdi)
 ;;; sse_ps
 .text
 addps %xmm0, %xmm1

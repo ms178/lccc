@@ -13,6 +13,8 @@ mod gp_integer;
 mod promoted;
 mod registers;
 mod sse;
+mod sse34;
+pub(crate) use sse34::check_sse34_operands;
 mod system;
 mod x87_misc;
 mod xop;
@@ -991,6 +993,7 @@ impl InstructionEncoder {
                 "data32" => return Err("`data32' is not supported in 64-bit mode".to_string()),
                 "rex" => rex_floor |= 0x40,
                 "rex.x" => rex_floor |= 0x42,
+                "rex64" => rex_floor |= 0x48,
                 _ => {}
             }
         }
@@ -1097,7 +1100,7 @@ impl InstructionEncoder {
                 // addr32 0x67 byte is appended to seg_pre AFTER the loop
                 // so segment overrides always precede it (GAS:
                 // `fs addr32 mov %eax,(%ebx)' = 64 67 89 03).
-                "addr32" | "data16" | "rex" | "rex.x" => {}
+                "addr32" | "data16" | "rex" | "rex.x" | "rex64" => {}
                 // Segment overrides used as standalone prefixes. The kernel's
                 // `ds wrmsr` relies on the byte being emitted so an
                 // ALTERNATIVE can patch the instruction in place.
@@ -3418,6 +3421,7 @@ impl InstructionEncoder {
         let suffixed = infer_suffix(&mnemonic_raw, &instr.operands);
         let mnemonic = suffixed.as_str();
         let ops = &instr.operands;
+        check_sse34_operands(mnemonic, ops, true)?;
 
         // Validate role-specific widths before either forced or automatic
         // EVEX dispatch can reinterpret malformed register names.
@@ -4509,10 +4513,20 @@ impl InstructionEncoder {
             "pcmpestri" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x61]),
             "pcmpistrm" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x62]),
             "pcmpistri" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x63]),
+            "extrq" => self.encode_sse4a_bits(ops, false),
+            "insertq" => self.encode_sse4a_bits(ops, true),
+            "movntsd" => self.encode_sse_store(ops, &[0xF2, 0x0F, 0x2B]),
+            "movntss" => self.encode_sse_store(ops, &[0xF3, 0x0F, 0x2B]),
             "crc32" => {
+                // Register source width is explicit; for memory, infer from
+                // the accumulator/result register rather than defaulting to
+                // an eight-byte read (GAS's suffix-less source form).
                 let size = match ops.first() {
                     Some(Operand::Register(r)) => infer_reg_size(&r.name),
-                    _ => 8,
+                    _ => match ops.last() {
+                        Some(Operand::Register(r)) => infer_reg_size(&r.name),
+                        _ => 4,
+                    },
                 };
                 self.encode_crc32(ops, size)
             }

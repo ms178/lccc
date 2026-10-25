@@ -1357,6 +1357,7 @@ impl InstructionEncoder {
             }
         };
         let ops = &instr.operands;
+        crate::backend::x86::assembler::encoder::check_sse34_operands(mnemonic, ops, false)?;
 
         // Malformed GP data operands do not delegate to the shared vector
         // encoder. Apply the same role check before the local VEX path can
@@ -1619,7 +1620,8 @@ impl InstructionEncoder {
             "bswapl" | "bswap" => self.encode_bswap(ops),
 
             // Bit operations
-            "lzcntl" | "tzcntl" | "popcntl" => self.encode_bit_count(ops, mnemonic),
+            "lzcntl" | "tzcntl" => self.encode_bit_count(ops, mnemonic),
+            "popcnt" | "popcntw" | "popcntl" => self.encode_via_x64(instr),
             "bsrl" | "bsfl" | "bsr" | "bsf" => self.encode_bsr_bsf(ops, mnemonic),
             "bsrw" | "bsfw" => self.encode_bsr_bsf_16(ops, mnemonic),
             "btl" | "btsl" | "btrl" | "btcl" | "bt" | "bts" | "btr" | "btc" => {
@@ -2324,9 +2326,10 @@ impl InstructionEncoder {
             "pcmpestri" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x61]),
             "pcmpistrm" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x62]),
             "pcmpistri" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x63]),
-            "crc32b" => self.encode_sse_op(ops, &[0xF2, 0x0F, 0x38, 0xF0]),
-            "crc32w" => self.encode_sse_op(ops, &[0x66, 0xF2, 0x0F, 0x38, 0xF1]),
-            "crc32l" => self.encode_sse_op(ops, &[0xF2, 0x0F, 0x38, 0xF1]),
+            "extrq" | "insertq" => self.encode_via_x64(instr),
+            "movntsd" => self.encode_sse_store_only(ops, &[0xF2, 0x0F, 0x2B]),
+            "movntss" => self.encode_sse_store_only(ops, &[0xF3, 0x0F, 0x2B]),
+            "crc32" | "crc32b" | "crc32w" | "crc32l" => self.encode_via_x64(instr),
             "aesimc" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0xDB]),
             "aeskeygenassist" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0xDF]),
 
@@ -2846,6 +2849,10 @@ impl InstructionEncoder {
             "phsubsw" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x07]),
             "pmulhrsw" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x0B]),
 
+            // SSE3/SSE4.1 unaligned and non-temporal vector loads.
+            "lddqu" => self.encode_sse_op(ops, &[0xF2, 0x0F, 0xF0]),
+            "movntdqa" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x2A]),
+
             // SSE4.1 blend
             "blendvpd" => {
                 let ops2 = if ops.len() == 3 { &ops[1..] } else { ops };
@@ -2890,6 +2897,7 @@ impl InstructionEncoder {
             "pextrb" => self.encode_sse_extract(ops, &[0x66, 0x0F, 0x3A, 0x14]),
 
             // SSE4.1/SSE4.2 packed integer extensions
+            "pcmpeqq" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x29]),
             "pcmpgtq" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x37]),
 
             // SSE4.1 zero/sign extend
