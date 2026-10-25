@@ -1,0 +1,10 @@
+{
+  "correct": {
+    "exit_code": 0,
+    "output": "strict packed: 18216 output/exception/guard-page comparisons PASS\n"
+  },
+  "reordered": {
+    "exit_code": 1,
+    "output": "k=0 n=12 bias=-2147483648 rounding=1: 2.2551406405808636e+83 != 2.2551406586733776e+83 flags=30/30\n"
+  }
+}

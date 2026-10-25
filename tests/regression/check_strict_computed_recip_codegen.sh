@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # PERF-41 structural guard: AVX2 computes reciprocal/products packed, while
-# scalar VADDSD retains source lane order.  The transform must never leak to a
-# baseline target merely because the generic x86 vectorizer is enabled.
+# scalar VADDSD retains source lane order. SSE2 uses two packets and ADDSD;
+# neither spelling may exceed the resolved target's ISA permission.
 set -euo pipefail
 CCC=${CCC:-./target/fastbuild/lccc}
 dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -16,16 +16,22 @@ CCC_NO_VEX_PROMOTE=1 "$CCC" -O2 -march=x86-64-v3 -S "$src" -o "$tmp/no-promote.s
 "$CCC" -O2 -march=x86-64 -S "$src" -o "$tmp/baseline.s"
 "$CCC" -O2 -S "$src" -o "$tmp/default.s"
 "$CCC" -O2 -mno-avx2 -S "$src" -o "$tmp/no-avx2.s"
-# The optimizer intentionally requires AVX2 *and* SSE4.1 for this path;
-# keep both feature-gate fallbacks even though individual VEX FP operations
-# are available on some weaker targets.
+if "$CCC" -O2 -mno-sse2 -msse -S "$src" -o "$tmp/sse1.s" 2>"$tmp/sse1.err"; then
+    echo "SSE1-only target unexpectedly accepted this F64 kernel" >&2
+    exit 1
+fi
+grep -q 'requires SSE2' "$tmp/sse1.err"
+CCC_NO_XMM_REGALLOC=1 "$CCC" -O2 -S "$src" -o "$tmp/sse2-stack.s"
+# The four-wide AVX2 spelling still requires SSE4.1. AVX-only may use
+# the two-packet SSE2 spelling; AVX2 with an explicit SSE4.1 denial retains
+# the original scalar fallback rather than mixing legacy and YMM code.
 "$CCC" -O2 -march=x86-64-v2 -mavx -msse4.1 -S "$src" -o "$tmp/avx-only.s"
 "$CCC" -O2 -mavx2 -mno-sse4.1 -S "$src" -o "$tmp/no-sse41.s"
 # Exercise the private-allocation fallback too: no scalar XMM homes means the
 # packed product must spill once and be read as offsets 0, 8, 16, 24.
 CCC_NO_XMM_REGALLOC=1 "$CCC" -O2 -march=x86-64-v3 -S "$src" -o "$tmp/stack.s"
 
-python3 - "$tmp/v3.s" "$tmp/baseline.s" "$tmp/avx-only.s" "$tmp/no-sse41.s" "$tmp/stack.s" "$tmp/no-promote.s" "$tmp/default.s" "$tmp/no-avx2.s" <<'PY'
+python3 - "$tmp/v3.s" "$tmp/baseline.s" "$tmp/avx-only.s" "$tmp/no-sse41.s" "$tmp/stack.s" "$tmp/no-promote.s" "$tmp/default.s" "$tmp/no-avx2.s" "$tmp/sse1.err" "$tmp/sse2-stack.s" <<'PY'
 import re
 import sys
 
@@ -69,6 +75,16 @@ for name, text in (("baseline", baseline), ("default (plain x86-64)", default), 
                    ("AVX-only", avx_only), ("AVX2 without SSE4.1", no_sse41)):
     if any(op in text for op in ("vcvtdq2pd", "vdivpd", "vmulpd")):
         raise SystemExit(f"strict reciprocal lowering escaped its AVX2+SSE4.1 gate ({name})")
+
+for name, text in (("baseline", baseline), ("default", default), ("AVX2 denied", no_avx2),
+                   ("SSE2 stack", open(sys.argv[10], encoding="utf-8").read())):
+    code = body(text, "ordered_recip_sum")
+    if len(re.findall(r"\bdivpd\b", code)) < 2 or len(re.findall(r"\bcvtdq2pd\b", code)) < 2:
+        raise SystemExit(f"{name}: SSE2 two-packet prefix missing")
+    if re.search(r"\b(?:addpd|pinsrd|pmulld)\b|%ymm", code):
+        raise SystemExit(f"{name}: reassociation or a post-SSE2 instruction")
+if "requires SSE2" not in open(sys.argv[9], encoding="utf-8").read():
+    raise SystemExit("SSE1 permission did not diagnose unsupported F64")
 
 stack_body = body(stack, "ordered_recip_sum")
 if not re.search(r"\bvmovupd\s+%ymm0,\s*\(%rax\)", stack_body):

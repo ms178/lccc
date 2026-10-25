@@ -1,0 +1,4698 @@
+{
+  "aggregate_lccc_vs_best_reference": {
+    "arithmetic_mean_ratio": 1.2477341683441943,
+    "best": {
+      "benchmark": "lz4_match_extend",
+      "ratio": 1.0006560596836978,
+      "reference": "gcc"
+    },
+    "geometric_mean_ratio": 1.2230261497917083,
+    "interpretation": "LCCC / fastest available reference paired median; <1 means LCCC faster",
+    "n_correct_benchmarks": 2,
+    "worst": {
+      "benchmark": "nbody",
+      "ratio": 1.4948122770046908,
+      "reference": "clang"
+    }
+  },
+  "aggregate_lccc_vs_gcc": {
+    "arithmetic_mean_ratio": 1.2183560183888982,
+    "best": {
+      "benchmark": "lz4_match_extend",
+      "ratio": 1.0006560596836978
+    },
+    "geometric_mean_ratio": 1.1987485622615792,
+    "interpretation": "LCCC/GCC paired median ratios; <1 means LCCC faster",
+    "n_correct_benchmarks": 2,
+    "worst": {
+      "benchmark": "nbody",
+      "ratio": 1.4360559770940986
+    }
+  },
+  "benchmarks": [
+    {
+      "baseline_compiler": "gcc",
+      "compile": {
+        "clang": {
+          "binary_bytes": 10400,
+          "binary_sha256": "ba150010695597ad57cb5cd95c83b2a79bade2c1715dd130ff69e01412fac6c7",
+          "child_cpu_s": 0.05660399999999999,
+          "command": [
+            "/home/user/oracles/clang-23.1.3/bin/clang-23",
+            "-O2",
+            "-o",
+            "/home/user/audit/runtime-modern-artifacts/nbody/clang/benchmark.bin",
+            "/home/user/lccc/tests/benchmark/programs/nbody.c",
+            "-lm"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "45db2f21add3645a945f1a6635d642f1aad5caecfa4c7b47da4943331a321837",
+          "stderr": "",
+          "stdout": "",
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "text_bytes": 2624,
+          "wall_s": 0.06647562
+        },
+        "gcc": {
+          "binary_bytes": 9832,
+          "binary_sha256": "14e440dd0568e68891de2a3552fd1255e73569cde3ca754107efd9c69cde38e1",
+          "child_cpu_s": 0.08250399999999997,
+          "command": [
+            "/home/user/oracles/gcc-16.2.0/bin/gcc-16",
+            "-O2",
+            "-o",
+            "/home/user/audit/runtime-modern-artifacts/nbody/gcc/benchmark.bin",
+            "/home/user/lccc/tests/benchmark/programs/nbody.c",
+            "-lm"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "45db2f21add3645a945f1a6635d642f1aad5caecfa4c7b47da4943331a321837",
+          "stderr": "",
+          "stdout": "",
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "text_bytes": 2333,
+          "wall_s": 0.09372599
+        },
+        "lccc": {
+          "binary_bytes": 8016,
+          "binary_sha256": "54ff0912f2cefbd12df5a8b42dc8974629713382d1d43dc1a3d78c267c928ad3",
+          "child_cpu_s": 0.11396900000000001,
+          "command": [
+            "/home/user/lccc/target/fastbuild/lccc",
+            "-I/home/user/oracles/gcc-16.2.0/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+            "-O2",
+            "-o",
+            "/home/user/audit/runtime-modern-artifacts/nbody/lccc/benchmark.bin",
+            "/home/user/lccc/tests/benchmark/programs/nbody.c",
+            "-lm"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "45db2f21add3645a945f1a6635d642f1aad5caecfa4c7b47da4943331a321837",
+          "stderr": "",
+          "stdout": "",
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "text_bytes": 2637,
+          "wall_s": 0.102884064
+        }
+      },
+      "correctness": {
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "-0.169075164\n-0.169083134\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "-0.169075164\n-0.169083134\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "-0.169075164\n-0.169083134\n",
+          "stable_within_compiler": true
+        }
+      },
+      "description": "N-body simulation / FP structs",
+      "name": "nbody",
+      "ratios_from_lccc": {
+        "clang": {
+          "cv": 0.032367656754351,
+          "interpretation": "numerator/denominator; <1 means numerator faster",
+          "mad": 0.03194288026757519,
+          "max": 1.578674946706328,
+          "mean": 1.4955479943327197,
+          "median": 1.4948122770046908,
+          "median_ci95_bootstrap": [
+            1.4834944259624856,
+            1.5228525888252726
+          ],
+          "min": 1.4223237456127285,
+          "n": 15,
+          "outlier_count_mad": 0,
+          "raw": [
+            {
+              "ratio": 1.4223237456127285,
+              "round": 0
+            },
+            {
+              "ratio": 1.4321079564052406,
+              "round": 1
+            },
+            {
+              "ratio": 1.4342901891768551,
+              "round": 2
+            },
+            {
+              "ratio": 1.489334954436653,
+              "round": 3
+            },
+            {
+              "ratio": 1.4921851687723808,
+              "round": 4
+            },
+            {
+              "ratio": 1.5758516258769888,
+              "round": 5
+            },
+            {
+              "ratio": 1.526755157272266,
+              "round": 6
+            },
+            {
+              "ratio": 1.4948122770046908,
+              "round": 7
+            },
+            {
+              "ratio": 1.4834944259624856,
+              "round": 8
+            },
+            {
+              "ratio": 1.5228525888252726,
+              "round": 9
+            },
+            {
+              "ratio": 1.5033749741238773,
+              "round": 10
+            },
+            {
+              "ratio": 1.5368613394391966,
+              "round": 11
+            },
+            {
+              "ratio": 1.4959846283782614,
+              "round": 12
+            },
+            {
+              "ratio": 1.4443159369975698,
+              "round": 13
+            },
+            {
+              "ratio": 1.578674946706328,
+              "round": 14
+            }
+          ],
+          "stdev": 0.04840738414021955
+        },
+        "gcc": {
+          "cv": 0.033250365871773546,
+          "interpretation": "numerator/denominator; <1 means numerator faster",
+          "mad": 0.0092585771418352,
+          "max": 1.5327453992437652,
+          "mean": 1.4453879366015683,
+          "median": 1.4360559770940986,
+          "median_ci95_bootstrap": [
+            1.4267973999522634,
+            1.4521281418165544
+          ],
+          "min": 1.347972426104331,
+          "n": 15,
+          "outlier_count_mad": 4,
+          "raw": [
+            {
+              "ratio": 1.4359693717930677,
+              "round": 0
+            },
+            {
+              "ratio": 1.431111044626841,
+              "round": 1
+            },
+            {
+              "ratio": 1.4521281418165544,
+              "round": 2
+            },
+            {
+              "ratio": 1.4423066560129856,
+              "round": 3
+            },
+            {
+              "ratio": 1.4345673863202368,
+              "round": 4
+            },
+            {
+              "ratio": 1.5327453992437652,
+              "round": 5
+            },
+            {
+              "ratio": 1.4267973999522634,
+              "round": 6
+            },
+            {
+              "ratio": 1.444240684705281,
+              "round": 7
+            },
+            {
+              "ratio": 1.422852803488684,
+              "round": 8
+            },
+            {
+              "ratio": 1.4360559770940986,
+              "round": 9
+            },
+            {
+              "ratio": 1.4451483049992124,
+              "round": 10
+            },
+            {
+              "ratio": 1.5257424044010175,
+              "round": 11
+            },
+            {
+              "ratio": 1.391279178952062,
+              "round": 12
+            },
+            {
+              "ratio": 1.5119018695131219,
+              "round": 13
+            },
+            {
+              "ratio": 1.347972426104331,
+              "round": 14
+            }
+          ],
+          "stdev": 0.048059677718649975
+        }
+      },
+      "ratios_to_gcc": {
+        "clang": {
+          "cv": 0.04615307846787881,
+          "interpretation": "numerator/denominator; <1 means numerator faster",
+          "mad": 0.02659656721763537,
+          "max": 1.0467944241175162,
+          "mean": 0.9674210663981676,
+          "median": 0.9661685998453631,
+          "median_ci95_bootstrap": [
+            0.9591224466957754,
+            0.999303885036082
+          ],
+          "min": 0.8538631900865193,
+          "n": 15,
+          "outlier_count_mad": 0,
+          "raw": [
+            {
+              "ratio": 1.0095938960608866,
+              "round": 0
+            },
+            {
+              "ratio": 0.999303885036082,
+              "round": 1
+            },
+            {
+              "ratio": 1.0124367807674515,
+              "round": 2
+            },
+            {
+              "ratio": 0.9684232896813624,
+              "round": 3
+            },
+            {
+              "ratio": 0.961386975518899,
+              "round": 4
+            },
+            {
+              "ratio": 0.9726457580616231,
+              "round": 5
+            },
+            {
+              "ratio": 0.9345292813691298,
+              "round": 6
+            },
+            {
+              "ratio": 0.9661685998453631,
+              "round": 7
+            },
+            {
+              "ratio": 0.9591224466957754,
+              "round": 8
+            },
+            {
+              "ratio": 0.9430039306705786,
+              "round": 9
+            },
+            {
+              "ratio": 0.961269363846769,
+              "round": 10
+            },
+            {
+              "ratio": 0.9927651670629984,
+              "round": 11
+            },
+            {
+              "ratio": 0.9300090071515597,
+              "round": 12
+            },
+            {
+              "ratio": 1.0467944241175162,
+              "round": 13
+            },
+            {
+              "ratio": 0.8538631900865193,
+              "round": 14
+            }
+          ],
+          "stdev": 0.04464946038895363
+        },
+        "lccc": {
+          "cv": 0.033250365871773546,
+          "interpretation": "numerator/denominator; <1 means numerator faster",
+          "mad": 0.0092585771418352,
+          "max": 1.5327453992437652,
+          "mean": 1.4453879366015683,
+          "median": 1.4360559770940986,
+          "median_ci95_bootstrap": [
+            1.4267973999522634,
+            1.4521281418165544
+          ],
+          "min": 1.347972426104331,
+          "n": 15,
+          "outlier_count_mad": 4,
+          "raw": [
+            {
+              "ratio": 1.4359693717930677,
+              "round": 0
+            },
+            {
+              "ratio": 1.431111044626841,
+              "round": 1
+            },
+            {
+              "ratio": 1.4521281418165544,
+              "round": 2
+            },
+            {
+              "ratio": 1.4423066560129856,
+              "round": 3
+            },
+            {
+              "ratio": 1.4345673863202368,
+              "round": 4
+            },
+            {
+              "ratio": 1.5327453992437652,
+              "round": 5
+            },
+            {
+              "ratio": 1.4267973999522634,
+              "round": 6
+            },
+            {
+              "ratio": 1.444240684705281,
+              "round": 7
+            },
+            {
+              "ratio": 1.422852803488684,
+              "round": 8
+            },
+            {
+              "ratio": 1.4360559770940986,
+              "round": 9
+            },
+            {
+              "ratio": 1.4451483049992124,
+              "round": 10
+            },
+            {
+              "ratio": 1.5257424044010175,
+              "round": 11
+            },
+            {
+              "ratio": 1.391279178952062,
+              "round": 12
+            },
+            {
+              "ratio": 1.5119018695131219,
+              "round": 13
+            },
+            {
+              "ratio": 1.347972426104331,
+              "round": 14
+            }
+          ],
+          "stdev": 0.048059677718649975
+        }
+      },
+      "rounds": [
+        {
+          "order": [
+            "clang",
+            "lccc",
+            "gcc"
+          ],
+          "round": 0,
+          "runs": {
+            "clang": {
+              "child_cpu_s": 0.26072000000000006,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/nbody/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "-0.169075164\n-0.169083134\n",
+              "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+              "wall_s": 0.261034098
+            },
+            "gcc": {
+              "child_cpu_s": 0.2581450000000003,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/nbody/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "-0.169075164\n-0.169083134\n",
+              "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+              "wall_s": 0.258553562
+            },
+            "lccc": {
+              "child_cpu_s": 0.37092999999999954,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/nbody/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "-0.169075164\n-0.169083134\n",
+              "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+              "wall_s": 0.371274996
+            }
+          }
+        },
+        {
+          "order": [
+            "lccc",
+            "gcc",
+            "clang"
+          ],
+          "round": 1,
+          "runs": {
+            "clang": {
+              "child_cpu_s": 0.2536240000000003,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/nbody/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "-0.169075164\n-0.169083134\n",
+              "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+              "wall_s": 0.253985115
+            },
+            "gcc": {
+              "child_cpu_s": 0.2538089999999995,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/nbody/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "-0.169075164\n-0.169083134\n",
+              "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+              "wall_s": 0.254162041
+            },
+            "lccc": {
+              "child_cpu_s": 0.3633000000000002,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/nbody/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "-0.169075164\n-0.169083134\n",
+              "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+              "wall_s": 0.363734104
+            }
+          }
+        },
+        {
+          "order": [
+            "gcc",
+            "clang",
+            "lccc"
+          ],
+          "round": 2,
+          "runs": {
+            "clang": {
+              "child_cpu_s": 0.2590380000000003,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/nbody/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "-0.169075164\n-0.169083134\n",
+              "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+              "wall_s": 0.259414451
+            },
+            "gcc": {
+              "child_cpu_s": 0.2558179999999992,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/nbody/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "-0.169075164\n-0.169083134\n",
+              "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+              "wall_s": 0.256227802
+            },
+            "lccc": {
+              "child_cpu_s": 0.37168500000000027,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/nbody/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "-0.169075164\n-0.169083134\n",
+              "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+              "wall_s": 0.372075602
+            }
+          }
+        },
+        {
+          "order": [
+            "clang",
+            "lccc",
+            "gcc"
+          ],
+          "round": 3,
+          "runs": {
+            "clang": {
+              "child_cpu_s": 0.2429009999999998,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/nbody/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "-0.169075164\n-0.169083134\n",
+              "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+              "wall_s": 0.243259017
+            },
+            "gcc": {
+              "child_cpu_s": 0.250877,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/nbody/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "-0.169075164\n-0.169083134\n",
+              "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+              "wall_s": 0.251190796
+            },
+            "lccc": {
+              "child_cpu_s": 0.36172499999999985,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/nbody/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "-0.169075164\n-0.169083134\n",
+              "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+              "wall_s": 0.362294157
+            }
+          }
+        },
+        {
+          "order": [
+            "lccc",
+            "clang",
+            "gcc"
+          ],
+          "round": 4,
+          "runs": {
+            "clang": {
+              "child_cpu_s": 0.24144100000000002,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/nbody/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "-0.169075164\n-0.169083134\n",
+              "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+              "wall_s": 0.241798568
+            },
+            "gcc": {
+              "child_cpu_s": 0.2511720000000004,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/nbody/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "-0.169075164\n-0.169083134\n",
+              "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+              "wall_s": 0.251510135
+            },
+            "lccc": {
+              "child_cpu_s": 0.3603329999999998,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/nbody/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "-0.169075164\n-0.169083134\n",
+              "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+              "wall_s": 0.360808237
+            }
+          }
+        },
+        {
+          "order": [
+            "clang",
+            "gcc",
+            "lccc"
+          ],
+          "round": 5,
+          "runs": {
+            "clang": {
+              "child_cpu_s": 0.24539699999999964,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/nbody/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "-0.169075164\n-0.169083134\n",
+              "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+              "wall_s": 0.245748081
+            },
+            "gcc": {
+              "child_cpu_s": 0.2523350000000004,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/nbody/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "-0.169075164\n-0.169083134\n",
+              "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+              "wall_s": 0.252659387
+            },
+            "lccc": {
+              "child_cpu_s": 0.3868539999999996,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/nbody/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "-0.169075164\n-0.169083134\n",
+              "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+              "wall_s": 0.387262513
+            }
+          }
+        },
+        {
+          "order": [
+            "lccc",
+            "gcc",
+            "clang"
+          ],
+          "round": 6,
+          "runs": {
+            "clang": {
+              "child_cpu_s": 0.24866499999999903,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/nbody/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "-0.169075164\n-0.169083134\n",
+              "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+              "wall_s": 0.249029222
+            },
+            "gcc": {
+              "child_cpu_s": 0.2661360000000004,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/nbody/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "-0.169075164\n-0.169083134\n",
+              "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+              "wall_s": 0.266475569
+            },
+            "lccc": {
+              "child_cpu_s": 0.3798060000000003,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/nbody/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "-0.169075164\n-0.169083134\n",
+              "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+              "wall_s": 0.380206649
+            }
+          }
+        },
+        {
+          "order": [
+            "clang",
+            "gcc",
+            "lccc"
+          ],
+          "round": 7,
+          "runs": {
+            "clang": {
+              "child_cpu_s": 0.2514350000000025,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/nbody/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "-0.169075164\n-0.169083134\n",
+              "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+              "wall_s": 0.25175978
+            },
+            "gcc": {
+              "child_cpu_s": 0.26013799999999954,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/nbody/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "-0.169075164\n-0.169083134\n",
+              "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+              "wall_s": 0.260575411
+            },
+            "lccc": {
+              "child_cpu_s": 0.3759119999999996,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/nbody/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "-0.169075164\n-0.169083134\n",
+              "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+              "wall_s": 0.37633361
+            }
+          }
+        },
+        {
+          "order": [
+            "clang",
+            "gcc",
+            "lccc"
+          ],
+          "round": 8,
+          "runs": {
+            "clang": {
+              "child_cpu_s": 0.24655699999999747,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/nbody/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "-0.169075164\n-0.169083134\n",
+              "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+              "wall_s": 0.246990713
+            },
+            "gcc": {
+              "child_cpu_s": 0.2570390000000007,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/nbody/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "-0.169075164\n-0.169083134\n",
+              "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+              "wall_s": 0.257517394
+            },
+            "lccc": {
+              "child_cpu_s": 0.36607200000000084,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/nbody/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "-0.169075164\n-0.169083134\n",
+              "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+              "wall_s": 0.366409346
+            }
+          }
+        },
+        {
+          "order": [
+            "clang",
+            "gcc",
+            "lccc"
+          ],
+          "round": 9,
+          "runs": {
+            "clang": {
+              "child_cpu_s": 0.23742799999999953,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/nbody/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "-0.169075164\n-0.169083134\n",
+              "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+              "wall_s": 0.237863948
+            },
+            "gcc": {
+              "child_cpu_s": 0.2518860000000007,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/nbody/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "-0.169075164\n-0.169083134\n",
+              "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+              "wall_s": 0.252240675
+            },
+            "lccc": {
+              "child_cpu_s": 0.36183300000000074,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/nbody/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "-0.169075164\n-0.169083134\n",
+              "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+              "wall_s": 0.362231729
+            }
+          }
+        },
+        {
+          "order": [
+            "lccc",
+            "clang",
+            "gcc"
+          ],
+          "round": 10,
+          "runs": {
+            "clang": {
+              "child_cpu_s": 0.24194899999999997,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/nbody/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "-0.169075164\n-0.169083134\n",
+              "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+              "wall_s": 0.242390451
+            },
+            "gcc": {
+              "child_cpu_s": 0.2517579999999988,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/nbody/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "-0.169075164\n-0.169083134\n",
+              "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+              "wall_s": 0.252156638
+            },
+            "lccc": {
+              "child_cpu_s": 0.3640150000000002,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/nbody/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "-0.169075164\n-0.169083134\n",
+              "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+              "wall_s": 0.364403738
+            }
+          }
+        },
+        {
+          "order": [
+            "gcc",
+            "lccc",
+            "clang"
+          ],
+          "round": 11,
+          "runs": {
+            "clang": {
+              "child_cpu_s": 0.24973300000000087,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/nbody/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "-0.169075164\n-0.169083134\n",
+              "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+              "wall_s": 0.250073509
+            },
+            "gcc": {
+              "child_cpu_s": 0.25151199999999996,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/nbody/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "-0.169075164\n-0.169083134\n",
+              "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+              "wall_s": 0.251895934
+            },
+            "lccc": {
+              "child_cpu_s": 0.38384899999999966,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/nbody/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "-0.169075164\n-0.169083134\n",
+              "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+              "wall_s": 0.384328308
+            }
+          }
+        },
+        {
+          "order": [
+            "gcc",
+            "lccc",
+            "clang"
+          ],
+          "round": 12,
+          "runs": {
+            "clang": {
+              "child_cpu_s": 0.24537399999999998,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/nbody/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "-0.169075164\n-0.169083134\n",
+              "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+              "wall_s": 0.24571773
+            },
+            "gcc": {
+              "child_cpu_s": 0.26393299999999975,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/nbody/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "-0.169075164\n-0.169083134\n",
+              "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+              "wall_s": 0.264210054
+            },
+            "lccc": {
+              "child_cpu_s": 0.3671579999999999,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/nbody/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "-0.169075164\n-0.169083134\n",
+              "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+              "wall_s": 0.367589947
+            }
+          }
+        },
+        {
+          "order": [
+            "lccc",
+            "clang",
+            "gcc"
+          ],
+          "round": 13,
+          "runs": {
+            "clang": {
+              "child_cpu_s": 0.2652750000000008,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/nbody/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "-0.169075164\n-0.169083134\n",
+              "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+              "wall_s": 0.265730385
+            },
+            "gcc": {
+              "child_cpu_s": 0.2534899999999993,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/nbody/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "-0.169075164\n-0.169083134\n",
+              "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+              "wall_s": 0.253851548
+            },
+            "lccc": {
+              "child_cpu_s": 0.38338800000000006,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/nbody/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "-0.169075164\n-0.169083134\n",
+              "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+              "wall_s": 0.38379863
+            }
+          }
+        },
+        {
+          "order": [
+            "clang",
+            "gcc",
+            "lccc"
+          ],
+          "round": 14,
+          "runs": {
+            "clang": {
+              "child_cpu_s": 0.2539920000000002,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/nbody/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "-0.169075164\n-0.169083134\n",
+              "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+              "wall_s": 0.254439683
+            },
+            "gcc": {
+              "child_cpu_s": 0.2975159999999999,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/nbody/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "-0.169075164\n-0.169083134\n",
+              "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+              "wall_s": 0.297986476
+            },
+            "lccc": {
+              "child_cpu_s": 0.40116399999999963,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/nbody/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "-0.169075164\n-0.169083134\n",
+              "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+              "wall_s": 0.401677553
+            }
+          }
+        }
+      ],
+      "runs": {
+        "clang": [
+          {
+            "child_cpu_s": 0.26072000000000006,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/nbody/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "-0.169075164\n-0.169083134\n",
+            "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+            "wall_s": 0.261034098
+          },
+          {
+            "child_cpu_s": 0.2536240000000003,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/nbody/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "-0.169075164\n-0.169083134\n",
+            "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+            "wall_s": 0.253985115
+          },
+          {
+            "child_cpu_s": 0.2590380000000003,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/nbody/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "-0.169075164\n-0.169083134\n",
+            "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+            "wall_s": 0.259414451
+          },
+          {
+            "child_cpu_s": 0.2429009999999998,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/nbody/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "-0.169075164\n-0.169083134\n",
+            "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+            "wall_s": 0.243259017
+          },
+          {
+            "child_cpu_s": 0.24144100000000002,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/nbody/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "-0.169075164\n-0.169083134\n",
+            "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+            "wall_s": 0.241798568
+          },
+          {
+            "child_cpu_s": 0.24539699999999964,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/nbody/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "-0.169075164\n-0.169083134\n",
+            "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+            "wall_s": 0.245748081
+          },
+          {
+            "child_cpu_s": 0.24866499999999903,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/nbody/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "-0.169075164\n-0.169083134\n",
+            "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+            "wall_s": 0.249029222
+          },
+          {
+            "child_cpu_s": 0.2514350000000025,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/nbody/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "-0.169075164\n-0.169083134\n",
+            "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+            "wall_s": 0.25175978
+          },
+          {
+            "child_cpu_s": 0.24655699999999747,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/nbody/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "-0.169075164\n-0.169083134\n",
+            "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+            "wall_s": 0.246990713
+          },
+          {
+            "child_cpu_s": 0.23742799999999953,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/nbody/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "-0.169075164\n-0.169083134\n",
+            "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+            "wall_s": 0.237863948
+          },
+          {
+            "child_cpu_s": 0.24194899999999997,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/nbody/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "-0.169075164\n-0.169083134\n",
+            "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+            "wall_s": 0.242390451
+          },
+          {
+            "child_cpu_s": 0.24973300000000087,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/nbody/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "-0.169075164\n-0.169083134\n",
+            "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+            "wall_s": 0.250073509
+          },
+          {
+            "child_cpu_s": 0.24537399999999998,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/nbody/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "-0.169075164\n-0.169083134\n",
+            "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+            "wall_s": 0.24571773
+          },
+          {
+            "child_cpu_s": 0.2652750000000008,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/nbody/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "-0.169075164\n-0.169083134\n",
+            "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+            "wall_s": 0.265730385
+          },
+          {
+            "child_cpu_s": 0.2539920000000002,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/nbody/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "-0.169075164\n-0.169083134\n",
+            "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+            "wall_s": 0.254439683
+          }
+        ],
+        "gcc": [
+          {
+            "child_cpu_s": 0.2581450000000003,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/nbody/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "-0.169075164\n-0.169083134\n",
+            "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+            "wall_s": 0.258553562
+          },
+          {
+            "child_cpu_s": 0.2538089999999995,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/nbody/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "-0.169075164\n-0.169083134\n",
+            "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+            "wall_s": 0.254162041
+          },
+          {
+            "child_cpu_s": 0.2558179999999992,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/nbody/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "-0.169075164\n-0.169083134\n",
+            "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+            "wall_s": 0.256227802
+          },
+          {
+            "child_cpu_s": 0.250877,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/nbody/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "-0.169075164\n-0.169083134\n",
+            "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+            "wall_s": 0.251190796
+          },
+          {
+            "child_cpu_s": 0.2511720000000004,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/nbody/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "-0.169075164\n-0.169083134\n",
+            "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+            "wall_s": 0.251510135
+          },
+          {
+            "child_cpu_s": 0.2523350000000004,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/nbody/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "-0.169075164\n-0.169083134\n",
+            "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+            "wall_s": 0.252659387
+          },
+          {
+            "child_cpu_s": 0.2661360000000004,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/nbody/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "-0.169075164\n-0.169083134\n",
+            "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+            "wall_s": 0.266475569
+          },
+          {
+            "child_cpu_s": 0.26013799999999954,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/nbody/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "-0.169075164\n-0.169083134\n",
+            "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+            "wall_s": 0.260575411
+          },
+          {
+            "child_cpu_s": 0.2570390000000007,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/nbody/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "-0.169075164\n-0.169083134\n",
+            "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+            "wall_s": 0.257517394
+          },
+          {
+            "child_cpu_s": 0.2518860000000007,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/nbody/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "-0.169075164\n-0.169083134\n",
+            "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+            "wall_s": 0.252240675
+          },
+          {
+            "child_cpu_s": 0.2517579999999988,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/nbody/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "-0.169075164\n-0.169083134\n",
+            "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+            "wall_s": 0.252156638
+          },
+          {
+            "child_cpu_s": 0.25151199999999996,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/nbody/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "-0.169075164\n-0.169083134\n",
+            "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+            "wall_s": 0.251895934
+          },
+          {
+            "child_cpu_s": 0.26393299999999975,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/nbody/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "-0.169075164\n-0.169083134\n",
+            "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+            "wall_s": 0.264210054
+          },
+          {
+            "child_cpu_s": 0.2534899999999993,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/nbody/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "-0.169075164\n-0.169083134\n",
+            "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+            "wall_s": 0.253851548
+          },
+          {
+            "child_cpu_s": 0.2975159999999999,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/nbody/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "-0.169075164\n-0.169083134\n",
+            "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+            "wall_s": 0.297986476
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 0.37092999999999954,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/nbody/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "-0.169075164\n-0.169083134\n",
+            "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+            "wall_s": 0.371274996
+          },
+          {
+            "child_cpu_s": 0.3633000000000002,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/nbody/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "-0.169075164\n-0.169083134\n",
+            "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+            "wall_s": 0.363734104
+          },
+          {
+            "child_cpu_s": 0.37168500000000027,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/nbody/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "-0.169075164\n-0.169083134\n",
+            "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+            "wall_s": 0.372075602
+          },
+          {
+            "child_cpu_s": 0.36172499999999985,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/nbody/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "-0.169075164\n-0.169083134\n",
+            "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+            "wall_s": 0.362294157
+          },
+          {
+            "child_cpu_s": 0.3603329999999998,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/nbody/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "-0.169075164\n-0.169083134\n",
+            "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+            "wall_s": 0.360808237
+          },
+          {
+            "child_cpu_s": 0.3868539999999996,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/nbody/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "-0.169075164\n-0.169083134\n",
+            "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+            "wall_s": 0.387262513
+          },
+          {
+            "child_cpu_s": 0.3798060000000003,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/nbody/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "-0.169075164\n-0.169083134\n",
+            "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+            "wall_s": 0.380206649
+          },
+          {
+            "child_cpu_s": 0.3759119999999996,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/nbody/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "-0.169075164\n-0.169083134\n",
+            "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+            "wall_s": 0.37633361
+          },
+          {
+            "child_cpu_s": 0.36607200000000084,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/nbody/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "-0.169075164\n-0.169083134\n",
+            "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+            "wall_s": 0.366409346
+          },
+          {
+            "child_cpu_s": 0.36183300000000074,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/nbody/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "-0.169075164\n-0.169083134\n",
+            "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+            "wall_s": 0.362231729
+          },
+          {
+            "child_cpu_s": 0.3640150000000002,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/nbody/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "-0.169075164\n-0.169083134\n",
+            "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+            "wall_s": 0.364403738
+          },
+          {
+            "child_cpu_s": 0.38384899999999966,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/nbody/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "-0.169075164\n-0.169083134\n",
+            "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+            "wall_s": 0.384328308
+          },
+          {
+            "child_cpu_s": 0.3671579999999999,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/nbody/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "-0.169075164\n-0.169083134\n",
+            "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+            "wall_s": 0.367589947
+          },
+          {
+            "child_cpu_s": 0.38338800000000006,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/nbody/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "-0.169075164\n-0.169083134\n",
+            "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+            "wall_s": 0.38379863
+          },
+          {
+            "child_cpu_s": 0.40116399999999963,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/nbody/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "-0.169075164\n-0.169083134\n",
+            "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+            "wall_s": 0.401677553
+          }
+        ]
+      },
+      "runtime": {
+        "clang": {
+          "child_cpu": {
+            "cv": 0.03142460102584795,
+            "mad": 0.005327000000001192,
+            "max": 0.2652750000000008,
+            "mean": 0.24956860000000003,
+            "median": 0.24866499999999903,
+            "median_ci95_bootstrap": [
+              0.2429009999999998,
+              0.2539920000000002
+            ],
+            "min": 0.23742799999999953,
+            "n": 15,
+            "outlier_count_mad": 0,
+            "stdev": 0.007842593683579438
+          },
+          "quality_warnings": [],
+          "raw_wall_s": [
+            0.261034098,
+            0.253985115,
+            0.259414451,
+            0.243259017,
+            0.241798568,
+            0.245748081,
+            0.249029222,
+            0.25175978,
+            0.246990713,
+            0.237863948,
+            0.242390451,
+            0.250073509,
+            0.24571773,
+            0.265730385,
+            0.254439683
+          ],
+          "wall": {
+            "cv": 0.03137137842774711,
+            "mad": 0.005410461000000033,
+            "max": 0.265730385,
+            "mean": 0.2499489834,
+            "median": 0.249029222,
+            "median_ci95_bootstrap": [
+              0.24571773,
+              0.253985115
+            ],
+            "min": 0.237863948,
+            "n": 15,
+            "outlier_count_mad": 0,
+            "stdev": 0.007841244145872079
+          }
+        },
+        "gcc": {
+          "child_cpu": {
+            "cv": 0.0457591915581867,
+            "mad": 0.0026369999999991123,
+            "max": 0.2975159999999999,
+            "mean": 0.2583709333333333,
+            "median": 0.2538089999999995,
+            "median_ci95_bootstrap": [
+              0.2517579999999988,
+              0.26013799999999954
+            ],
+            "min": 0.250877,
+            "n": 15,
+            "outlier_count_mad": 1,
+            "stdev": 0.011822845031467483
+          },
+          "quality_warnings": [
+            "1 MAD outlier(s) retained (never silently discarded)"
+          ],
+          "raw_wall_s": [
+            0.258553562,
+            0.254162041,
+            0.256227802,
+            0.251190796,
+            0.251510135,
+            0.252659387,
+            0.266475569,
+            0.260575411,
+            0.257517394,
+            0.252240675,
+            0.252156638,
+            0.251895934,
+            0.264210054,
+            0.253851548,
+            0.297986476
+          ],
+          "wall": {
+            "cv": 0.04578417110731085,
+            "mad": 0.0026519059999999817,
+            "max": 0.297986476,
+            "mean": 0.25874756146666666,
+            "median": 0.254162041,
+            "median_ci95_bootstrap": [
+              0.252156638,
+              0.258553562
+            ],
+            "min": 0.251190796,
+            "n": 15,
+            "outlier_count_mad": 1,
+            "stdev": 0.0118465426277893
+          }
+        },
+        "lccc": {
+          "child_cpu": {
+            "cv": 0.031543829351123855,
+            "mad": 0.008876000000000772,
+            "max": 0.40116399999999963,
+            "mean": 0.3732016,
+            "median": 0.37092999999999954,
+            "median_ci95_bootstrap": [
+              0.3640150000000002,
+              0.3798060000000003
+            ],
+            "min": 0.3603329999999998,
+            "n": 15,
+            "outlier_count_mad": 0,
+            "stdev": 0.011772207583966385
+          },
+          "quality_warnings": [],
+          "raw_wall_s": [
+            0.371274996,
+            0.363734104,
+            0.372075602,
+            0.362294157,
+            0.360808237,
+            0.387262513,
+            0.380206649,
+            0.37633361,
+            0.366409346,
+            0.362231729,
+            0.364403738,
+            0.384328308,
+            0.367589947,
+            0.38379863,
+            0.401677553
+          ],
+          "wall": {
+            "cv": 0.03153369905789299,
+            "mad": 0.008931652999999984,
+            "max": 0.401677553,
+            "mean": 0.3736286079333333,
+            "median": 0.371274996,
+            "median_ci95_bootstrap": [
+              0.364403738,
+              0.380206649
+            ],
+            "min": 0.360808237,
+            "n": 15,
+            "outlier_count_mad": 0,
+            "stdev": 0.01178189208198922
+          }
+        }
+      },
+      "source": "/home/user/lccc/tests/benchmark/programs/nbody.c",
+      "source_sha256": "45db2f21add3645a945f1a6635d642f1aad5caecfa4c7b47da4943331a321837",
+      "tags": [
+        "synthetic",
+        "fp",
+        "struct"
+      ],
+      "warmups": {
+        "clang": [
+          {
+            "child_cpu_s": 0.255738,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/nbody/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "-0.169075164\n-0.169083134\n",
+            "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+            "wall_s": 0.256041131
+          },
+          {
+            "child_cpu_s": 0.2742659999999999,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/nbody/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "-0.169075164\n-0.169083134\n",
+            "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+            "wall_s": 0.274587111
+          }
+        ],
+        "gcc": [
+          {
+            "child_cpu_s": 0.2548940000000002,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/nbody/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "-0.169075164\n-0.169083134\n",
+            "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+            "wall_s": 0.255259628
+          },
+          {
+            "child_cpu_s": 0.2597460000000005,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/nbody/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "-0.169075164\n-0.169083134\n",
+            "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+            "wall_s": 0.260143135
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 0.37286699999999984,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/nbody/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "-0.169075164\n-0.169083134\n",
+            "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+            "wall_s": 0.374823746
+          },
+          {
+            "child_cpu_s": 0.3909449999999999,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/nbody/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "-0.169075164\n-0.169083134\n",
+            "stdout_sha256": "a209785651d3f855b56ffcac6bce1eda49dff67124f34418aedd4ddb91c384c8",
+            "wall_s": 0.391385808
+          }
+        ]
+      },
+      "warnings": []
+    },
+    {
+      "baseline_compiler": "gcc",
+      "compile": {
+        "clang": {
+          "binary_bytes": 10112,
+          "binary_sha256": "dc2d589e6319806950daab21123f46ba6ca5da8bb99a34934ebf7483fddd31a4",
+          "child_cpu_s": 0.053456999999999866,
+          "command": [
+            "/home/user/oracles/clang-23.1.3/bin/clang-23",
+            "-O2",
+            "-o",
+            "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/clang/benchmark.bin",
+            "/home/user/lccc/tests/benchmark/programs/lz4_compress.c",
+            "-DMATCH_RICH=1",
+            "-DPASSES=2048"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "2c8e7054fa444f5a68405d8c25975534d736073cb842b3a3d6dec53dd1ecd4a4",
+          "stderr": "",
+          "stdout": "",
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "text_bytes": 2706,
+          "wall_s": 0.061010213
+        },
+        "gcc": {
+          "binary_bytes": 9840,
+          "binary_sha256": "cf03f83f34bf2ba2621a507ae0c39babe4deaf0303aea7ba2bbab9ef559f8154",
+          "child_cpu_s": 0.0826129999999985,
+          "command": [
+            "/home/user/oracles/gcc-16.2.0/bin/gcc-16",
+            "-O2",
+            "-o",
+            "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/gcc/benchmark.bin",
+            "/home/user/lccc/tests/benchmark/programs/lz4_compress.c",
+            "-DMATCH_RICH=1",
+            "-DPASSES=2048"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "2c8e7054fa444f5a68405d8c25975534d736073cb842b3a3d6dec53dd1ecd4a4",
+          "stderr": "",
+          "stdout": "",
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "text_bytes": 2570,
+          "wall_s": 0.092544934
+        },
+        "lccc": {
+          "binary_bytes": 7536,
+          "binary_sha256": "a6d2e9add9f4e15ead990ff91f90c7b8f11212f6eefdd245e1dbf01665152241",
+          "child_cpu_s": 0.12812599999999996,
+          "command": [
+            "/home/user/lccc/target/fastbuild/lccc",
+            "-I/home/user/oracles/gcc-16.2.0/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+            "-O2",
+            "-o",
+            "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/lccc/benchmark.bin",
+            "/home/user/lccc/tests/benchmark/programs/lz4_compress.c",
+            "-DMATCH_RICH=1",
+            "-DPASSES=2048"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "2c8e7054fa444f5a68405d8c25975534d736073cb842b3a3d6dec53dd1ecd4a4",
+          "stderr": "",
+          "stdout": "",
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "text_bytes": 2382,
+          "wall_s": 0.113797446
+        }
+      },
+      "correctness": {
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "29f49acaab81f800\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "29f49acaab81f800\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "29f49acaab81f800\n",
+          "stable_within_compiler": true
+        }
+      },
+      "description": "LZ4 repeat-rich input / byte match extension",
+      "name": "lz4_match_extend",
+      "ratios_from_lccc": {
+        "clang": {
+          "cv": 0.03259036309187701,
+          "interpretation": "numerator/denominator; <1 means numerator faster",
+          "mad": 0.019467630074731623,
+          "max": 1.0573245614549547,
+          "mean": 0.9858194250107327,
+          "median": 0.9815211046860562,
+          "median_ci95_bootstrap": [
+            0.9620534746113246,
+            0.9904461571763034
+          ],
+          "min": 0.9335031744125292,
+          "n": 15,
+          "outlier_count_mad": 0,
+          "raw": [
+            {
+              "ratio": 0.9771213401950573,
+              "round": 0
+            },
+            {
+              "ratio": 1.0042892402840229,
+              "round": 1
+            },
+            {
+              "ratio": 1.017497848621964,
+              "round": 2
+            },
+            {
+              "ratio": 1.0573245614549547,
+              "round": 3
+            },
+            {
+              "ratio": 0.9815211046860562,
+              "round": 4
+            },
+            {
+              "ratio": 0.9902183523019099,
+              "round": 5
+            },
+            {
+              "ratio": 0.9858183801928568,
+              "round": 6
+            },
+            {
+              "ratio": 0.9620534746113246,
+              "round": 7
+            },
+            {
+              "ratio": 0.9513323885527125,
+              "round": 8
+            },
+            {
+              "ratio": 0.9575541728773453,
+              "round": 9
+            },
+            {
+              "ratio": 0.9335031744125292,
+              "round": 10
+            },
+            {
+              "ratio": 1.0319685405972507,
+              "round": 11
+            },
+            {
+              "ratio": 0.9812693262987975,
+              "round": 12
+            },
+            {
+              "ratio": 0.9653733128979042,
+              "round": 13
+            },
+            {
+              "ratio": 0.9904461571763034,
+              "round": 14
+            }
+          ],
+          "stdev": 0.0321282130041252
+        },
+        "gcc": {
+          "cv": 0.035328576514976416,
+          "interpretation": "numerator/denominator; <1 means numerator faster",
+          "mad": 0.029390961220171263,
+          "max": 1.063140778080673,
+          "mean": 0.9984723345806792,
+          "median": 1.0006560596836978,
+          "median_ci95_bootstrap": [
+            0.9647129050730741,
+            1.0164497347195793
+          ],
+          "min": 0.9329172815909098,
+          "n": 15,
+          "outlier_count_mad": 0,
+          "raw": [
+            {
+              "ratio": 0.994434022701705,
+              "round": 0
+            },
+            {
+              "ratio": 1.004278548028462,
+              "round": 1
+            },
+            {
+              "ratio": 1.0095257074530861,
+              "round": 2
+            },
+            {
+              "ratio": 1.029335510429437,
+              "round": 3
+            },
+            {
+              "ratio": 0.9969675362904666,
+              "round": 4
+            },
+            {
+              "ratio": 1.0164497347195793,
+              "round": 5
+            },
+            {
+              "ratio": 0.9601007944034937,
+              "round": 6
+            },
+            {
+              "ratio": 0.9688109448089027,
+              "round": 7
+            },
+            {
+              "ratio": 0.9329172815909098,
+              "round": 8
+            },
+            {
+              "ratio": 0.9643929899307719,
+              "round": 9
+            },
+            {
+              "ratio": 0.9647129050730741,
+              "round": 10
+            },
+            {
+              "ratio": 1.063140778080673,
+              "round": 11
+            },
+            {
+              "ratio": 1.0413151846120592,
+              "round": 12
+            },
+            {
+              "ratio": 1.0006560596836978,
+              "round": 13
+            },
+            {
+              "ratio": 1.030047020903869,
+              "round": 14
+            }
+          ],
+          "stdev": 0.035274606270320655
+        }
+      },
+      "ratios_to_gcc": {
+        "clang": {
+          "cv": 0.025491781526049632,
+          "interpretation": "numerator/denominator; <1 means numerator faster",
+          "mad": 0.017695674877594048,
+          "max": 1.0611920261889218,
+          "mean": 1.013047495240261,
+          "median": 1.0157372383850585,
+          "median_ci95_bootstrap": [
+            0.9999893534102207,
+            1.0334329132626525
+          ],
+          "min": 0.9735284206516466,
+          "n": 15,
+          "outlier_count_mad": 0,
+          "raw": [
+            {
+              "ratio": 1.0177180476922054,
+              "round": 0
+            },
+            {
+              "ratio": 0.9999893534102207,
+              "round": 1
+            },
+            {
+              "ratio": 0.9921649552579647,
+              "round": 2
+            },
+            {
+              "ratio": 0.9735284206516466,
+              "round": 3
+            },
+            {
+              "ratio": 1.0157372383850585,
+              "round": 4
+            },
+            {
+              "ratio": 1.0264905031871916,
+              "round": 5
+            },
+            {
+              "ratio": 0.9739124505019555,
+              "round": 6
+            },
+            {
+              "ratio": 1.0070240068519145,
+              "round": 7
+            },
+            {
+              "ratio": 0.9806428255955649,
+              "round": 8
+            },
+            {
+              "ratio": 1.0071419636059615,
+              "round": 9
+            },
+            {
+              "ratio": 1.0334329132626525,
+              "round": 10
+            },
+            {
+              "ratio": 1.0302065772909912,
+              "round": 11
+            },
+            {
+              "ratio": 1.0611920261889218,
+              "round": 12
+            },
+            {
+              "ratio": 1.0365482930949066,
+              "round": 13
+            },
+            {
+              "ratio": 1.0399828536267586,
+              "round": 14
+            }
+          ],
+          "stdev": 0.02582438542417654
+        },
+        "lccc": {
+          "cv": 0.035328576514976416,
+          "interpretation": "numerator/denominator; <1 means numerator faster",
+          "mad": 0.029390961220171263,
+          "max": 1.063140778080673,
+          "mean": 0.9984723345806792,
+          "median": 1.0006560596836978,
+          "median_ci95_bootstrap": [
+            0.9647129050730741,
+            1.0164497347195793
+          ],
+          "min": 0.9329172815909098,
+          "n": 15,
+          "outlier_count_mad": 0,
+          "raw": [
+            {
+              "ratio": 0.994434022701705,
+              "round": 0
+            },
+            {
+              "ratio": 1.004278548028462,
+              "round": 1
+            },
+            {
+              "ratio": 1.0095257074530861,
+              "round": 2
+            },
+            {
+              "ratio": 1.029335510429437,
+              "round": 3
+            },
+            {
+              "ratio": 0.9969675362904666,
+              "round": 4
+            },
+            {
+              "ratio": 1.0164497347195793,
+              "round": 5
+            },
+            {
+              "ratio": 0.9601007944034937,
+              "round": 6
+            },
+            {
+              "ratio": 0.9688109448089027,
+              "round": 7
+            },
+            {
+              "ratio": 0.9329172815909098,
+              "round": 8
+            },
+            {
+              "ratio": 0.9643929899307719,
+              "round": 9
+            },
+            {
+              "ratio": 0.9647129050730741,
+              "round": 10
+            },
+            {
+              "ratio": 1.063140778080673,
+              "round": 11
+            },
+            {
+              "ratio": 1.0413151846120592,
+              "round": 12
+            },
+            {
+              "ratio": 1.0006560596836978,
+              "round": 13
+            },
+            {
+              "ratio": 1.030047020903869,
+              "round": 14
+            }
+          ],
+          "stdev": 0.035274606270320655
+        }
+      },
+      "rounds": [
+        {
+          "order": [
+            "gcc",
+            "lccc",
+            "clang"
+          ],
+          "round": 0,
+          "runs": {
+            "clang": {
+              "child_cpu_s": 0.973510000000001,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800\n",
+              "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+              "wall_s": 0.974121963
+            },
+            "gcc": {
+              "child_cpu_s": 0.9567359999999994,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800\n",
+              "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+              "wall_s": 0.957162905
+            },
+            "lccc": {
+              "child_cpu_s": 0.9514539999999982,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800\n",
+              "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+              "wall_s": 0.951835358
+            }
+          }
+        },
+        {
+          "order": [
+            "gcc",
+            "clang",
+            "lccc"
+          ],
+          "round": 1,
+          "runs": {
+            "clang": {
+              "child_cpu_s": 0.974609000000001,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800\n",
+              "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+              "wall_s": 0.975325401
+            },
+            "gcc": {
+              "child_cpu_s": 0.9749769999999991,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800\n",
+              "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+              "wall_s": 0.975335785
+            },
+            "lccc": {
+              "child_cpu_s": 0.9790090000000014,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800\n",
+              "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+              "wall_s": 0.979508806
+            }
+          }
+        },
+        {
+          "order": [
+            "lccc",
+            "gcc",
+            "clang"
+          ],
+          "round": 2,
+          "runs": {
+            "clang": {
+              "child_cpu_s": 0.9585460000000019,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800\n",
+              "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+              "wall_s": 0.958879595
+            },
+            "gcc": {
+              "child_cpu_s": 0.9660930000000008,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800\n",
+              "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+              "wall_s": 0.966451788
+            },
+            "lccc": {
+              "child_cpu_s": 0.9749549999999978,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800\n",
+              "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+              "wall_s": 0.975657925
+            }
+          }
+        },
+        {
+          "order": [
+            "lccc",
+            "clang",
+            "gcc"
+          ],
+          "round": 3,
+          "runs": {
+            "clang": {
+              "child_cpu_s": 0.9689490000000056,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800\n",
+              "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+              "wall_s": 0.969338109
+            },
+            "gcc": {
+              "child_cpu_s": 0.9953129999999959,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800\n",
+              "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+              "wall_s": 0.995695748
+            },
+            "lccc": {
+              "child_cpu_s": 1.0243849999999988,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800\n",
+              "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+              "wall_s": 1.024904991
+            }
+          }
+        },
+        {
+          "order": [
+            "lccc",
+            "clang",
+            "gcc"
+          ],
+          "round": 4,
+          "runs": {
+            "clang": {
+              "child_cpu_s": 1.0142990000000012,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800\n",
+              "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+              "wall_s": 1.014852386
+            },
+            "gcc": {
+              "child_cpu_s": 0.9987190000000012,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800\n",
+              "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+              "wall_s": 0.999128857
+            },
+            "lccc": {
+              "child_cpu_s": 0.9956930000000028,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800\n",
+              "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+              "wall_s": 0.996099035
+            }
+          }
+        },
+        {
+          "order": [
+            "clang",
+            "lccc",
+            "gcc"
+          ],
+          "round": 5,
+          "runs": {
+            "clang": {
+              "child_cpu_s": 1.0127199999999945,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800\n",
+              "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+              "wall_s": 1.013231544
+            },
+            "gcc": {
+              "child_cpu_s": 0.986697999999997,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800\n",
+              "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+              "wall_s": 0.987083213
+            },
+            "lccc": {
+              "child_cpu_s": 1.0028720000000035,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800\n",
+              "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+              "wall_s": 1.00332047
+            }
+          }
+        },
+        {
+          "order": [
+            "clang",
+            "lccc",
+            "gcc"
+          ],
+          "round": 6,
+          "runs": {
+            "clang": {
+              "child_cpu_s": 0.9758959999999988,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800\n",
+              "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+              "wall_s": 0.97627931
+            },
+            "gcc": {
+              "child_cpu_s": 1.0018969999999996,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800\n",
+              "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+              "wall_s": 1.002430259
+            },
+            "lccc": {
+              "child_cpu_s": 0.9620050000000049,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800\n",
+              "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+              "wall_s": 0.962434088
+            }
+          }
+        },
+        {
+          "order": [
+            "lccc",
+            "gcc",
+            "clang"
+          ],
+          "round": 7,
+          "runs": {
+            "clang": {
+              "child_cpu_s": 1.0089520000000007,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800\n",
+              "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+              "wall_s": 1.0093575
+            },
+            "gcc": {
+              "child_cpu_s": 1.0010890000000003,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800\n",
+              "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+              "wall_s": 1.002317217
+            },
+            "lccc": {
+              "child_cpu_s": 0.970565999999998,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800\n",
+              "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+              "wall_s": 0.97105589
+            }
+          }
+        },
+        {
+          "order": [
+            "gcc",
+            "clang",
+            "lccc"
+          ],
+          "round": 8,
+          "runs": {
+            "clang": {
+              "child_cpu_s": 1.0096169999999987,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800\n",
+              "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+              "wall_s": 1.010095514
+            },
+            "gcc": {
+              "child_cpu_s": 1.0295130000000015,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800\n",
+              "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+              "wall_s": 1.030034063
+            },
+            "lccc": {
+              "child_cpu_s": 0.9604209999999966,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800\n",
+              "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+              "wall_s": 0.960936578
+            }
+          }
+        },
+        {
+          "order": [
+            "gcc",
+            "clang",
+            "lccc"
+          ],
+          "round": 9,
+          "runs": {
+            "clang": {
+              "child_cpu_s": 0.984884000000001,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800\n",
+              "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+              "wall_s": 0.985306303
+            },
+            "gcc": {
+              "child_cpu_s": 0.9779520000000019,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800\n",
+              "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+              "wall_s": 0.978319183
+            },
+            "lccc": {
+              "child_cpu_s": 0.943131000000001,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800\n",
+              "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+              "wall_s": 0.943484162
+            }
+          }
+        },
+        {
+          "order": [
+            "lccc",
+            "gcc",
+            "clang"
+          ],
+          "round": 10,
+          "runs": {
+            "clang": {
+              "child_cpu_s": 1.0327570000000037,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800\n",
+              "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+              "wall_s": 1.033122655
+            },
+            "gcc": {
+              "child_cpu_s": 0.9993139999999983,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800\n",
+              "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+              "wall_s": 0.999699779
+            },
+            "lccc": {
+              "child_cpu_s": 0.964027999999999,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800\n",
+              "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+              "wall_s": 0.964423278
+            }
+          }
+        },
+        {
+          "order": [
+            "lccc",
+            "clang",
+            "gcc"
+          ],
+          "round": 11,
+          "runs": {
+            "clang": {
+              "child_cpu_s": 0.9863129999999956,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800\n",
+              "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+              "wall_s": 0.986711167
+            },
+            "gcc": {
+              "child_cpu_s": 0.9573740000000015,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800\n",
+              "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+              "wall_s": 0.957779914
+            },
+            "lccc": {
+              "child_cpu_s": 1.0178849999999997,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800\n",
+              "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+              "wall_s": 1.018254883
+            }
+          }
+        },
+        {
+          "order": [
+            "clang",
+            "lccc",
+            "gcc"
+          ],
+          "round": 12,
+          "runs": {
+            "clang": {
+              "child_cpu_s": 1.027276999999998,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800\n",
+              "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+              "wall_s": 1.027764367
+            },
+            "gcc": {
+              "child_cpu_s": 0.9680749999999989,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800\n",
+              "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+              "wall_s": 0.968499896
+            },
+            "lccc": {
+              "child_cpu_s": 1.0081330000000008,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800\n",
+              "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+              "wall_s": 1.008513648
+            }
+          }
+        },
+        {
+          "order": [
+            "gcc",
+            "lccc",
+            "clang"
+          ],
+          "round": 13,
+          "runs": {
+            "clang": {
+              "child_cpu_s": 0.9855559999999954,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800\n",
+              "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+              "wall_s": 0.985964782
+            },
+            "gcc": {
+              "child_cpu_s": 0.9469159999999945,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800\n",
+              "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+              "wall_s": 0.951200044
+            },
+            "lccc": {
+              "child_cpu_s": 0.9514390000000077,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800\n",
+              "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+              "wall_s": 0.951824088
+            }
+          }
+        },
+        {
+          "order": [
+            "gcc",
+            "clang",
+            "lccc"
+          ],
+          "round": 14,
+          "runs": {
+            "clang": {
+              "child_cpu_s": 1.0019270000000091,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800\n",
+              "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+              "wall_s": 1.002352789
+            },
+            "gcc": {
+              "child_cpu_s": 0.9634539999999987,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800\n",
+              "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+              "wall_s": 0.963816649
+            },
+            "lccc": {
+              "child_cpu_s": 0.992328999999998,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "29f49acaab81f800\n",
+              "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+              "wall_s": 0.992776468
+            }
+          }
+        }
+      ],
+      "runs": {
+        "clang": [
+          {
+            "child_cpu_s": 0.973510000000001,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800\n",
+            "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+            "wall_s": 0.974121963
+          },
+          {
+            "child_cpu_s": 0.974609000000001,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800\n",
+            "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+            "wall_s": 0.975325401
+          },
+          {
+            "child_cpu_s": 0.9585460000000019,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800\n",
+            "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+            "wall_s": 0.958879595
+          },
+          {
+            "child_cpu_s": 0.9689490000000056,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800\n",
+            "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+            "wall_s": 0.969338109
+          },
+          {
+            "child_cpu_s": 1.0142990000000012,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800\n",
+            "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+            "wall_s": 1.014852386
+          },
+          {
+            "child_cpu_s": 1.0127199999999945,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800\n",
+            "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+            "wall_s": 1.013231544
+          },
+          {
+            "child_cpu_s": 0.9758959999999988,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800\n",
+            "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+            "wall_s": 0.97627931
+          },
+          {
+            "child_cpu_s": 1.0089520000000007,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800\n",
+            "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+            "wall_s": 1.0093575
+          },
+          {
+            "child_cpu_s": 1.0096169999999987,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800\n",
+            "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+            "wall_s": 1.010095514
+          },
+          {
+            "child_cpu_s": 0.984884000000001,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800\n",
+            "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+            "wall_s": 0.985306303
+          },
+          {
+            "child_cpu_s": 1.0327570000000037,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800\n",
+            "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+            "wall_s": 1.033122655
+          },
+          {
+            "child_cpu_s": 0.9863129999999956,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800\n",
+            "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+            "wall_s": 0.986711167
+          },
+          {
+            "child_cpu_s": 1.027276999999998,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800\n",
+            "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+            "wall_s": 1.027764367
+          },
+          {
+            "child_cpu_s": 0.9855559999999954,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800\n",
+            "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+            "wall_s": 0.985964782
+          },
+          {
+            "child_cpu_s": 1.0019270000000091,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800\n",
+            "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+            "wall_s": 1.002352789
+          }
+        ],
+        "gcc": [
+          {
+            "child_cpu_s": 0.9567359999999994,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800\n",
+            "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+            "wall_s": 0.957162905
+          },
+          {
+            "child_cpu_s": 0.9749769999999991,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800\n",
+            "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+            "wall_s": 0.975335785
+          },
+          {
+            "child_cpu_s": 0.9660930000000008,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800\n",
+            "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+            "wall_s": 0.966451788
+          },
+          {
+            "child_cpu_s": 0.9953129999999959,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800\n",
+            "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+            "wall_s": 0.995695748
+          },
+          {
+            "child_cpu_s": 0.9987190000000012,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800\n",
+            "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+            "wall_s": 0.999128857
+          },
+          {
+            "child_cpu_s": 0.986697999999997,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800\n",
+            "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+            "wall_s": 0.987083213
+          },
+          {
+            "child_cpu_s": 1.0018969999999996,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800\n",
+            "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+            "wall_s": 1.002430259
+          },
+          {
+            "child_cpu_s": 1.0010890000000003,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800\n",
+            "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+            "wall_s": 1.002317217
+          },
+          {
+            "child_cpu_s": 1.0295130000000015,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800\n",
+            "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+            "wall_s": 1.030034063
+          },
+          {
+            "child_cpu_s": 0.9779520000000019,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800\n",
+            "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+            "wall_s": 0.978319183
+          },
+          {
+            "child_cpu_s": 0.9993139999999983,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800\n",
+            "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+            "wall_s": 0.999699779
+          },
+          {
+            "child_cpu_s": 0.9573740000000015,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800\n",
+            "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+            "wall_s": 0.957779914
+          },
+          {
+            "child_cpu_s": 0.9680749999999989,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800\n",
+            "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+            "wall_s": 0.968499896
+          },
+          {
+            "child_cpu_s": 0.9469159999999945,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800\n",
+            "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+            "wall_s": 0.951200044
+          },
+          {
+            "child_cpu_s": 0.9634539999999987,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800\n",
+            "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+            "wall_s": 0.963816649
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 0.9514539999999982,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800\n",
+            "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+            "wall_s": 0.951835358
+          },
+          {
+            "child_cpu_s": 0.9790090000000014,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800\n",
+            "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+            "wall_s": 0.979508806
+          },
+          {
+            "child_cpu_s": 0.9749549999999978,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800\n",
+            "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+            "wall_s": 0.975657925
+          },
+          {
+            "child_cpu_s": 1.0243849999999988,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800\n",
+            "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+            "wall_s": 1.024904991
+          },
+          {
+            "child_cpu_s": 0.9956930000000028,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800\n",
+            "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+            "wall_s": 0.996099035
+          },
+          {
+            "child_cpu_s": 1.0028720000000035,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800\n",
+            "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+            "wall_s": 1.00332047
+          },
+          {
+            "child_cpu_s": 0.9620050000000049,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800\n",
+            "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+            "wall_s": 0.962434088
+          },
+          {
+            "child_cpu_s": 0.970565999999998,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800\n",
+            "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+            "wall_s": 0.97105589
+          },
+          {
+            "child_cpu_s": 0.9604209999999966,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800\n",
+            "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+            "wall_s": 0.960936578
+          },
+          {
+            "child_cpu_s": 0.943131000000001,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800\n",
+            "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+            "wall_s": 0.943484162
+          },
+          {
+            "child_cpu_s": 0.964027999999999,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800\n",
+            "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+            "wall_s": 0.964423278
+          },
+          {
+            "child_cpu_s": 1.0178849999999997,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800\n",
+            "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+            "wall_s": 1.018254883
+          },
+          {
+            "child_cpu_s": 1.0081330000000008,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800\n",
+            "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+            "wall_s": 1.008513648
+          },
+          {
+            "child_cpu_s": 0.9514390000000077,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800\n",
+            "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+            "wall_s": 0.951824088
+          },
+          {
+            "child_cpu_s": 0.992328999999998,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800\n",
+            "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+            "wall_s": 0.992776468
+          }
+        ]
+      },
+      "runtime": {
+        "clang": {
+          "child_cpu": {
+            "cv": 0.022681404962175265,
+            "mad": 0.017363999999989943,
+            "max": 1.0327570000000037,
+            "mean": 0.9943874666666671,
+            "median": 0.9863129999999956,
+            "median_ci95_bootstrap": [
+              0.974609000000001,
+              1.0127199999999945
+            ],
+            "min": 0.9585460000000019,
+            "n": 15,
+            "outlier_count_mad": 0,
+            "stdev": 0.022554104820778235
+          },
+          "quality_warnings": [],
+          "raw_wall_s": [
+            0.974121963,
+            0.975325401,
+            0.958879595,
+            0.969338109,
+            1.014852386,
+            1.013231544,
+            0.97627931,
+            1.0093575,
+            1.010095514,
+            0.985306303,
+            1.033122655,
+            0.986711167,
+            1.027764367,
+            0.985964782,
+            1.002352789
+          ],
+          "wall": {
+            "cv": 0.022671590627393937,
+            "mad": 0.017373057999999997,
+            "max": 1.033122655,
+            "mean": 0.9948468923333333,
+            "median": 0.986711167,
+            "median_ci95_bootstrap": [
+              0.97627931,
+              1.013231544
+            ],
+            "min": 0.958879595,
+            "n": 15,
+            "outlier_count_mad": 0,
+            "stdev": 0.022554761479916384
+          }
+        },
+        "gcc": {
+          "child_cpu": {
+            "cv": 0.022984173259691865,
+            "mad": 0.02057800000000043,
+            "max": 1.0295130000000015,
+            "mean": 0.9816079999999993,
+            "median": 0.9779520000000019,
+            "median_ci95_bootstrap": [
+              0.9660930000000008,
+              0.9987190000000012
+            ],
+            "min": 0.9469159999999945,
+            "n": 15,
+            "outlier_count_mad": 0,
+            "stdev": 0.022561448345099596
+          },
+          "quality_warnings": [],
+          "raw_wall_s": [
+            0.957162905,
+            0.975335785,
+            0.966451788,
+            0.995695748,
+            0.999128857,
+            0.987083213,
+            1.002430259,
+            1.002317217,
+            1.030034063,
+            0.978319183,
+            0.999699779,
+            0.957779914,
+            0.968499896,
+            0.951200044,
+            0.963816649
+          ],
+          "wall": {
+            "cv": 0.022633485854196847,
+            "mad": 0.020539269000000027,
+            "max": 1.030034063,
+            "mean": 0.9823303533333333,
+            "median": 0.978319183,
+            "median_ci95_bootstrap": [
+              0.963816649,
+              0.999128857
+            ],
+            "min": 0.951200044,
+            "n": 15,
+            "outlier_count_mad": 0,
+            "stdev": 0.02223356015631819
+          }
+        },
+        "lccc": {
+          "child_cpu": {
+            "cv": 0.02614049586578765,
+            "mad": 0.02073800000000503,
+            "max": 1.0243849999999988,
+            "mean": 0.9798870000000005,
+            "median": 0.9749549999999978,
+            "median_ci95_bootstrap": [
+              0.9604209999999966,
+              0.9956930000000028
+            ],
+            "min": 0.943131000000001,
+            "n": 15,
+            "outlier_count_mad": 0,
+            "stdev": 0.025614732072439077
+          },
+          "quality_warnings": [],
+          "raw_wall_s": [
+            0.951835358,
+            0.979508806,
+            0.975657925,
+            1.024904991,
+            0.996099035,
+            1.00332047,
+            0.962434088,
+            0.97105589,
+            0.960936578,
+            0.943484162,
+            0.964423278,
+            1.018254883,
+            1.008513648,
+            0.951824088,
+            0.992776468
+          ],
+          "wall": {
+            "cv": 0.02613726065475557,
+            "mad": 0.02044110999999993,
+            "max": 1.024904991,
+            "mean": 0.9803353112,
+            "median": 0.975657925,
+            "median_ci95_bootstrap": [
+              0.960936578,
+              0.996099035
+            ],
+            "min": 0.943484162,
+            "n": 15,
+            "outlier_count_mad": 0,
+            "stdev": 0.02562327955789532
+          }
+        }
+      },
+      "source": "/home/user/lccc/tests/benchmark/programs/lz4_compress.c",
+      "source_sha256": "2c8e7054fa444f5a68405d8c25975534d736073cb842b3a3d6dec53dd1ecd4a4",
+      "tags": [
+        "workload",
+        "lz4",
+        "compression",
+        "byte-compare"
+      ],
+      "warmups": {
+        "clang": [
+          {
+            "child_cpu_s": 1.0258020000000005,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800\n",
+            "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+            "wall_s": 1.026181666
+          },
+          {
+            "child_cpu_s": 0.9581340000000012,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800\n",
+            "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+            "wall_s": 0.958619794
+          }
+        ],
+        "gcc": [
+          {
+            "child_cpu_s": 0.9934379999999976,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800\n",
+            "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+            "wall_s": 0.995170319
+          },
+          {
+            "child_cpu_s": 0.9435520000000004,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800\n",
+            "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+            "wall_s": 0.944012785
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 0.9972390000000004,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800\n",
+            "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+            "wall_s": 0.997987217
+          },
+          {
+            "child_cpu_s": 1.040412,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/audit/runtime-modern-artifacts/lz4_match_extend/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "29f49acaab81f800\n",
+            "stdout_sha256": "8757bea17de30800e8ea87ce6524cf62d450d94e6e7aac9ed2d76b9b0192f0f2",
+            "wall_s": 1.040854451
+          }
+        ]
+      },
+      "warnings": []
+    }
+  ],
+  "compilers": [
+    {
+      "binary_sha256": "25562dd38e1024ba6d9d385de83d5652ce665ddd965b5247668a04663a482fd8",
+      "executable": "/home/user/lccc/target/fastbuild/lccc",
+      "flags": [
+        "-I/home/user/oracles/gcc-16.2.0/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+        "-O2"
+      ],
+      "key": "lccc",
+      "label": "LCCC"
+    },
+    {
+      "binary_sha256": "67ed99639f746b8e83e4e685a7189ae1172fb9c23a3e83aa9b09a1d68f3fb1c2",
+      "executable": "/home/user/oracles/gcc-16.2.0/bin/gcc-16",
+      "flags": [
+        "-O2"
+      ],
+      "key": "gcc",
+      "label": "GCC"
+    },
+    {
+      "binary_sha256": "913453afb492abab17025139852413ba7fd7a52b4fb75fcce58ff3fe399d0a9e",
+      "executable": "/home/user/oracles/clang-23.1.3/bin/clang-23",
+      "flags": [
+        "-O2"
+      ],
+      "key": "clang",
+      "label": "Clang"
+    }
+  ],
+  "complete": true,
+  "metadata": {
+    "compiler_versions": {
+      "clang": "clang version 23.1.3 (https://github.com/llvm/llvm-project 0d261d1ca552c95a8f007e061c787ac7132fbcbc)",
+      "gcc": "gcc-16 (GCC) 16.2.0",
+      "lccc": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0"
+    },
+    "cpu_governors": {},
+    "cpu_models": [
+      "Intel(R) Xeon(R) Processor @ 2.60GHz"
+    ],
+    "git": {
+      "repo": "/home/user/lccc",
+      "revision": "126b0f75a63530aea544e9e3e42b2b4327f7848c\n",
+      "status": " M scripts/gas_encoding_crossref.py\n M scripts/isa/gas-2.47.json\n M scripts/isa/gas-2.47.manifest.json\n M tests/corpus/test_gas_encoding_crossref.py\n"
+    },
+    "hypervisor_detected": true,
+    "meminfo": "MemTotal:        4034452 kB\nMemFree:         2141504 kB\nMemAvailable:    3668452 kB\nBuffers:           15728 kB\nCached:          1672156 kB\nSwapCached:            8 kB\nActive:           695548 kB\nInactive:        1022932 kB\nActive(anon):        592 kB\nInactive(anon):    31048 kB\nActive(file):     694956 kB\nInactive(file):   991884 kB\nUnevictable:           8 kB\nMlocked:               4 kB\nSwapTotal:       8388604 kB\nSwapFree:        8387824 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:               324 kB\nWriteback:             0 kB\nAnonPages:         30712 kB\nMapped:            30564 kB\nShmem:              1040 kB\nKReclaimable:      89452 kB\nSlab:             109540 kB\nSReclaimable:      89452 kB\nSUnreclaim:        20088 kB\nKernelStack:        1304 kB\nPageTables:          924 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    10405828 kB\nCommitted_AS:     147140 kB\nVmallocTotal:   34359738367 kB\nVmallocUsed:        6440 kB\nVmallocChunk:          0 kB\nPercpu:              592 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:       2048 kB\nHugetlb:               0 kB\nDirectMap4k:       36864 kB\nDirectMap2M:     2060288 kB\nDirectMap1G:     4194304 kB",
+    "pinning": {
+      "allowed_cpus": [
+        0,
+        1
+      ],
+      "applied": true,
+      "cpu": 0,
+      "reason": "taskset pinning",
+      "requested": "auto"
+    },
+    "platform": "Linux-6.1.158+-x86_64-with-glibc2.36",
+    "pmu": {
+      "available": false,
+      "perf_event_paranoid": "2",
+      "perf_path": null,
+      "probed": true,
+      "reason": "perf is not installed"
+    },
+    "python": "3.11.2 (main, Apr  8 2026, 01:58:00) [GCC 12.2.0]",
+    "swap": "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n/swapfile                               file\t\t8388604\t\t780\t\t-2",
+    "timestamp_utc": "2026-10-25T11:58:11.081346+00:00",
+    "uname": [
+      "Linux",
+      "e2b.local",
+      "6.1.158+",
+      "#1 SMP PREEMPT_DYNAMIC Mon May 11 18:48:24 UTC 2026",
+      "x86_64"
+    ],
+    "work_root": {
+      "candidates": [
+        {
+          "free_bytes": 7190089728,
+          "path": "/home/user/lccc"
+        },
+        {
+          "free_bytes": 7190089728,
+          "path": "/var/tmp"
+        },
+        {
+          "free_bytes": 7190089728,
+          "path": "/tmp"
+        }
+      ],
+      "free_bytes": 7190089728,
+      "reason": "largest writable candidate among repository, /var/tmp, /tmp",
+      "selected": "/home/user/lccc"
+    }
+  },
+  "runner_warnings": [],
+  "schema": "lccc-bench-v2",
+  "settings": {
+    "common_cflags": [],
+    "compiler_order_policy": "randomized independently in every paired round",
+    "opt": "-O2",
+    "outlier_policy": "MAD outliers counted and reported; none are removed",
+    "reps": 15,
+    "seed": 20260810,
+    "skip_perf": false,
+    "timer": "time.perf_counter_ns wall-clock plus resource.RUSAGE_CHILDREN CPU time",
+    "warmup": 2
+  },
+  "unavailable_compilers": {}
+}

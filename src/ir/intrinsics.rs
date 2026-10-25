@@ -889,14 +889,16 @@ pub enum IntrinsicOp {
     /// integer denominators. Arguments are `[acc, d0, d1, d2, d3, base,
     /// byte_offset, scratch]`; it evaluates `acc + (1.0/(double)d0)*base[0]`
     /// through lane 3 in that exact order. Unlike a horizontal reduction, it
-    /// never forms a reassociated FP addition tree. `scratch` is a private
-    /// 32-byte alloca used only if the scalar result cannot remain XMM-homed.
-    /// x86-64 AVX2-only; emitted solely by the strict computed-reduction pass.
+    /// never forms a reassociated FP addition tree. Private 32-byte `scratch`
+    /// stages SSE2 products; AVX2 needs it only without a scalar XMM home.
+    /// x86-64 SSE2 (two packets) or AVX2; emitted solely by the strict
+    /// computed-reduction pass. Scratch needs only 16-byte alignment.
     StrictRecipMulAddF64x4,
     /// Same ordered FP contract, with four already-packed signed I32 lanes.
     /// Args: [acc, packed_denominator, base, byte_offset, scratch]. The vector
     /// input is exactly 128 bits, never a 256-bit load. Scalar F64 result;
-    /// only xmm0/ymm0 and xmm1/ymm1 are scratch. AVX2 + SSE4.1, x86-64 only.
+    /// only xmm0/ymm0 and xmm1/ymm1 are scratch. x86-64 SSE2 or AVX2.
+    /// SSE2 converts two pairs; AVX2 converts all four lanes at once.
     /// Four products are added in source order, without horizontal reassociation.
     StrictRecipMulAddPackedF64x4,
     /// Horizontal reduction: %scalar = horizontal_add(%vec) - AVX2 8×I32 → I32

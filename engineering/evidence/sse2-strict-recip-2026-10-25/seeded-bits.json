@@ -1,0 +1,26 @@
+{
+  "/home/user/bin/gcc-16:normal": {
+    "lines": 1260,
+    "stdout_sha256": "80bb8c60d8bd983b4c0fc0d02314f6db80633fb4f47feb8615abebaa3444c934"
+  },
+  "/home/user/bin/clang-23:normal": {
+    "lines": 1260,
+    "stdout_sha256": "80bb8c60d8bd983b4c0fc0d02314f6db80633fb4f47feb8615abebaa3444c934"
+  },
+  "target/fastbuild/lccc:normal": {
+    "lines": 1260,
+    "stdout_sha256": "80bb8c60d8bd983b4c0fc0d02314f6db80633fb4f47feb8615abebaa3444c934"
+  },
+  "target/fastbuild/lccc:stack": {
+    "lines": 1260,
+    "stdout_sha256": "80bb8c60d8bd983b4c0fc0d02314f6db80633fb4f47feb8615abebaa3444c934"
+  },
+  "target/fastbuild/lccc:all-stack": {
+    "lines": 1260,
+    "stdout_sha256": "80bb8c60d8bd983b4c0fc0d02314f6db80633fb4f47feb8615abebaa3444c934"
+  },
+  "target/fastbuild/lccc:scalar-denominators": {
+    "lines": 1260,
+    "stdout_sha256": "80bb8c60d8bd983b4c0fc0d02314f6db80633fb4f47feb8615abebaa3444c934"
+  }
+}

@@ -1,0 +1,130 @@
+{
+  "gcc": {
+    "command": [
+      "gcc-16",
+      "-O2",
+      "-fuse-ld=mold",
+      "/home/user/audit/portable-native/expressions.c",
+      "-o",
+      "/home/user/audit/portable-native/gcc-expressions"
+    ],
+    "version": "gcc-16 (GCC) 16.2.0",
+    "stdout_sha256": "21a7b027326707070c2f0b3f35a3386271fa8f3bc5b3c61ba0f93e500157e3b7",
+    "assembly_sha256": "36f3247bea6da0fe422755990a37bf5c71d864850aaa6d9f8527675768084e7c",
+    "exit_code": 0
+  },
+  "clang": {
+    "command": [
+      "clang-23",
+      "-O2",
+      "-fuse-ld=mold",
+      "/home/user/audit/portable-native/expressions.c",
+      "-o",
+      "/home/user/audit/portable-native/clang-expressions"
+    ],
+    "version": "clang version 23.1.3 (https://github.com/llvm/llvm-project 0d261d1ca552c95a8f007e061c787ac7132fbcbc)",
+    "stdout_sha256": "21a7b027326707070c2f0b3f35a3386271fa8f3bc5b3c61ba0f93e500157e3b7",
+    "assembly_sha256": "9f492949bd0d21503a69c769e428cee3ae4708d9020f6ffc1ac6b77a7f27689f",
+    "exit_code": 0
+  },
+  "lccc": {
+    "command": [
+      "target/fastbuild/lccc",
+      "-O2",
+      "/home/user/audit/portable-native/expressions.c",
+      "-o",
+      "/home/user/audit/portable-native/lccc-expressions"
+    ],
+    "version": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0",
+    "stdout_sha256": "21a7b027326707070c2f0b3f35a3386271fa8f3bc5b3c61ba0f93e500157e3b7",
+    "assembly_sha256": "770a7d4806f7978c25413db1434743693fde3bed1ce25b343fdccac3b4c88176",
+    "exit_code": 0
+  },
+  "expressions": {
+    "count": 1024,
+    "old_disagreements": 116,
+    "source_sha256": "5d866b2d0c8929b6382b3b8378c6dcc634a1ce5ed14a6b91ec1693fefeef5dd2"
+  },
+  "gas": {
+    "version": "GNU assembler (GNU Binutils) 2.47.20260726",
+    "cases": {
+      "evex_fpclass": {
+        "source": "vfpclassps $1, %xmm0, %k1",
+        "exit_code": 0,
+        "expected_success": true,
+        "diagnostic": "",
+        "disassembly": "\n/home/user/audit/portable-native/evex_fpclass.o:     file format elf64-x86-64\n\n\nDisassembly of section .text:\n\n0000000000000000 <.text>:\n   0:\t62 f3 7d 08 66 c8 01 \tvfpclassps $0x1,%xmm0,%k1\n"
+      },
+      "evex_blend": {
+        "source": "vpblendmb %xmm0, %xmm1, %xmm2",
+        "exit_code": 0,
+        "expected_success": true,
+        "diagnostic": "",
+        "disassembly": "\n/home/user/audit/portable-native/evex_blend.o:     file format elf64-x86-64\n\n\nDisassembly of section .text:\n\n0000000000000000 <.text>:\n   0:\t62 f2 75 08 66 d0    \tvpblendmb %xmm0,%xmm1,%xmm2\n"
+      },
+      "bmi_andn": {
+        "source": "andn %rdx, %rcx, %rax",
+        "exit_code": 0,
+        "expected_success": true,
+        "diagnostic": "",
+        "disassembly": "\n/home/user/audit/portable-native/bmi_andn.o:     file format elf64-x86-64\n\n\nDisassembly of section .text:\n\n0000000000000000 <.text>:\n   0:\tc4 e2 f0 f2 c2       \tandn   %rdx,%rcx,%rax\n"
+      },
+      "vex_sqrt": {
+        "source": "vsqrtps %xmm0, %xmm1",
+        "exit_code": 0,
+        "expected_success": true,
+        "diagnostic": "",
+        "disassembly": "\n/home/user/audit/portable-native/vex_sqrt.o:     file format elf64-x86-64\n\n\nDisassembly of section .text:\n\n0000000000000000 <.text>:\n   0:\tc5 f8 51 c8          \tvsqrtps %xmm0,%xmm1\n"
+      },
+      "forced_vex_fpclass": {
+        "source": "{vex} vfpclassps $1, %xmm0, %k1",
+        "exit_code": 1,
+        "expected_success": false,
+        "diagnostic": "/home/user/audit/portable-native/forced_vex_fpclass.s: Assembler messages:\n/home/user/audit/portable-native/forced_vex_fpclass.s:2: Error: no VEX/XOP encoding for `vfpclassps'\n",
+        "disassembly": ""
+      },
+      "forced_vex_blend": {
+        "source": "{vex} vpblendmb %xmm0, %xmm1, %xmm2",
+        "exit_code": 1,
+        "expected_success": false,
+        "diagnostic": "/home/user/audit/portable-native/forced_vex_blend.s: Assembler messages:\n/home/user/audit/portable-native/forced_vex_blend.s:2: Error: no VEX/XOP encoding for `vpblendmb'\n",
+        "disassembly": ""
+      },
+      "vandn": {
+        "source": "vandn %rdx, %rcx, %rax",
+        "exit_code": 1,
+        "expected_success": false,
+        "diagnostic": "/home/user/audit/portable-native/vandn.s: Assembler messages:\n/home/user/audit/portable-native/vandn.s:2: Error: no such instruction: `vandn %rdx,%rcx,%rax'\n",
+        "disassembly": ""
+      },
+      "vblsi": {
+        "source": "vblsi %rdx, %rax",
+        "exit_code": 1,
+        "expected_success": false,
+        "diagnostic": "/home/user/audit/portable-native/vblsi.s: Assembler messages:\n/home/user/audit/portable-native/vblsi.s:2: Error: no such instruction: `vblsi %rdx,%rax'\n",
+        "disassembly": ""
+      },
+      "vblsr": {
+        "source": "vblsr %rdx, %rax",
+        "exit_code": 1,
+        "expected_success": false,
+        "diagnostic": "/home/user/audit/portable-native/vblsr.s: Assembler messages:\n/home/user/audit/portable-native/vblsr.s:2: Error: no such instruction: `vblsr %rdx,%rax'\n",
+        "disassembly": ""
+      },
+      "vblsmsk": {
+        "source": "vblsmsk %rdx, %rax",
+        "exit_code": 1,
+        "expected_success": false,
+        "diagnostic": "/home/user/audit/portable-native/vblsmsk.s: Assembler messages:\n/home/user/audit/portable-native/vblsmsk.s:2: Error: no such instruction: `vblsmsk %rdx,%rax'\n",
+        "disassembly": ""
+      },
+      "vshrx": {
+        "source": "vshrx %rdx, %rcx, %rax",
+        "exit_code": 1,
+        "expected_success": false,
+        "diagnostic": "/home/user/audit/portable-native/vshrx.s: Assembler messages:\n/home/user/audit/portable-native/vshrx.s:2: Error: no such instruction: `vshrx %rdx,%rcx,%rax'\n",
+        "disassembly": ""
+      }
+    }
+  }
+}
