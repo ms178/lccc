@@ -550,6 +550,11 @@ gate "ext-vector-layout-matrix" fast \
 gate "ext-vector-abi-avx" fast \
     env CCC="$LCCC" bash tests/regression/check_ext_vector_abi_avx.sh
 
+# Same strict current-tool public native-vector boundary contract as hosted
+# research. This wiring does not relax either ABI or permit multilib skips.
+gate "public-native-simd-abi" fast \
+    python3 tests/regression/check_public_simd_abi.py --lccc "$LCCC" --gcc gcc-16
+
 # One-lane ext_vector carriers: caller-side marshalling (register class and
 # width at -O0/-O1/-O2), FP/int lane-1 carrier correctness, and narrow
 # add/sub/mul/neg with signedness, A/B across the small-slot configuration.
