@@ -154,6 +154,9 @@ impl Context<'_> {
             Instruction::Cmp {
                 op, lhs, rhs, ty, ..
             } if scalar(*ty) => {
+                if let Some(result) = count_observe::comparison(self, *op, *lhs, *rhs, *ty, facts) {
+                    return Some(result);
+                }
                 let a = self.known(*lhs, *ty, facts, 8);
                 let b = self.known(*rhs, *ty, facts, 8);
                 if matches!(op, IrCmpOp::Eq | IrCmpOp::Ne) && ((a.0 & b.1) | (a.1 & b.0)) != 0 {
@@ -273,23 +276,25 @@ impl Context<'_> {
                         if negative { sign } else { 0 },
                     ));
                 }
-                if truth
-                    && matches!(op, IrCmpOp::Ult | IrCmpOp::Ule)
-                    && let Some(c) = const_in_ring(*rhs, w)
+                // Normalize both edge polarities and operand orders. Only
+                // unsigned upper bounds imply these high known-zero bits.
+                let upper = match (*op, truth) {
+                    (IrCmpOp::Ult, true) | (IrCmpOp::Uge, false) => Some((*lhs, *rhs, true)),
+                    (IrCmpOp::Ule, true) | (IrCmpOp::Ugt, false) => Some((*lhs, *rhs, false)),
+                    (IrCmpOp::Ugt, true) | (IrCmpOp::Ule, false) => Some((*rhs, *lhs, true)),
+                    (IrCmpOp::Uge, true) | (IrCmpOp::Ult, false) => Some((*rhs, *lhs, false)),
+                    _ => None,
+                };
+                if let Some((value, bound, strict)) = upper
+                    && let Some(c) = const_in_ring(bound, w)
+                    && let Some(max) = if strict { c.checked_sub(1) } else { Some(c) }
                 {
-                    let max = if *op == IrCmpOp::Ult {
-                        c.checked_sub(1)
+                    let used = if max == 0 {
+                        0
                     } else {
-                        Some(c)
+                        u64::MAX >> max.leading_zeros()
                     };
-                    if let Some(max) = max {
-                        let used = if max == 0 {
-                            0
-                        } else {
-                            u64::MAX >> (max.leading_zeros())
-                        };
-                        out.0.push((*lhs, w, !used & mask, 0));
-                    }
+                    out.0.push((value, w, !used & mask, 0));
                 }
             }
             _ => {}
@@ -381,6 +386,9 @@ fn fold(
     fresh: Value,
 ) -> Option<Vec<Instruction>> {
     cx.visits.set(512);
+    if let Some(replacement) = count_observe::fold(inst, cx) {
+        return Some(replacement);
+    }
     if let Some(replacement) = extrema::fold(inst, cx) {
         return Some(replacement);
     }
@@ -919,6 +927,7 @@ pub(super) fn run(func: &mut IrFunction) -> usize {
         .next_value_id
         .max(func.max_value_id().saturating_add(1));
     let mut plans = Vec::new();
+    let mut terminal_plans = Vec::new();
     let labels = crate::ir::analysis::build_label_map(func);
     if labels.len() != func.blocks.len() {
         return 0;
@@ -965,8 +974,26 @@ pub(super) fn run(func: &mut IrFunction) -> usize {
                 plans.push((bi, ii, replacement));
             }
         }
+        if !facts.0.is_empty()
+            && let Terminator::CondBranch {
+                cond,
+                true_label,
+                false_label,
+            } = &b.terminator
+            && true_label != false_label
+        {
+            cx.visits.set(512);
+            if let Some(truth) = count_observe::branch(*cond, &cx, &facts, 8) {
+                terminal_plans.push((bi, truth));
+            }
+        }
     }
-    let changes = plans.len();
+    let changes = plans.len() + terminal_plans.len();
+    for (bi, truth) in terminal_plans {
+        if let Terminator::CondBranch { cond, .. } = &mut func.blocks[bi].terminator {
+            *cond = constant(u64::from(truth), IrType::I32);
+        }
+    }
     for (bi, ii, replacement) in plans.into_iter().rev() {
         let b = &mut func.blocks[bi];
         if !b.source_spans.is_empty() {
@@ -1010,3 +1037,6 @@ mod reverse_networks;
 
 #[path = "bit_idioms_extrema.rs"]
 mod extrema;
+
+#[path = "bit_idioms_count_observe.rs"]
+mod count_observe;

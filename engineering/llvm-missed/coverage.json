@@ -157,6 +157,17 @@
             "tests/corpus/test_predicate_relations_inventory.py"
           ],
           "previous_scope": "Odd-multiplication zero preimages now supported; the upstream CTTZ nonzero-through-path example is not certified"
+        },
+        {
+          "cohort": "count-observations",
+          "status": "reviewed-deferred",
+          "scope": "Odd-product native controls and full accessible discussion re-audit; arbitrary nonzero path upgrade remains deferred.",
+          "evidence": [
+            "engineering/llvm-missed/COUNT-OBSERVATIONS.md",
+            "engineering/llvm-missed/count-observations-sources.json",
+            "tests/regression/count_observations.c",
+            "tests/regression/check_count_observations.py"
+          ]
         }
       ],
       "remaining": "Odd multiplication preserves CTZ/nonzero, but path nonzero facts for arbitrary words and scan legalization remain separate from bitwise known-one inference."
@@ -2893,6 +2904,97 @@
         "tests/regression/llvm_predicate_relations.c",
         "tests/corpus/test_predicate_relations_inventory.py"
       ]
+    },
+    {
+      "number": 210673,
+      "status": "covered-limited",
+      "cohort": "count-observations",
+      "scope": "Consumer-local scalar count interval observations from exact unsigned edge and known-bit facts; 8/16/32/64-bit carriers with independent input word types.",
+      "evidence": [
+        "engineering/llvm-missed/COUNT-OBSERVATIONS.md",
+        "engineering/llvm-missed/count-observations-sources.json",
+        "tests/regression/count_observations.c",
+        "tests/regression/check_count_observations.py"
+      ],
+      "remaining": "Broader original-report semantics and target-cost decisions are not claimed; see the per-report audit."
+    },
+    {
+      "number": 115751,
+      "status": "covered-limited",
+      "cohort": "count-observations",
+      "scope": "Exact scalar population-count zero/nonzero preimages for the same SSA source and word, including defined C guarded div/rem zero-sentinel controls.",
+      "evidence": [
+        "engineering/llvm-missed/COUNT-OBSERVATIONS.md",
+        "engineering/llvm-missed/count-observations-sources.json",
+        "tests/regression/count_observations.c",
+        "tests/regression/check_count_observations.py"
+      ],
+      "remaining": "Broader original-report semantics and target-cost decisions are not claimed; see the per-report audit."
+    },
+    {
+      "number": 47250,
+      "status": "reviewed-deferred",
+      "cohort": "count-observations",
+      "scope": "Reviewed backend power-of-two/count-equals-one branch profitability; no new target instruction/cost policy.",
+      "evidence": [
+        "engineering/llvm-missed/COUNT-OBSERVATIONS.md",
+        "engineering/llvm-missed/count-observations-sources.json",
+        "tests/regression/count_observations.c",
+        "tests/regression/check_count_observations.py"
+      ],
+      "remaining": "Broader original-report semantics and target-cost decisions are not claimed; see the per-report audit."
+    },
+    {
+      "number": 83772,
+      "status": "reviewed-deferred",
+      "cohort": "count-observations",
+      "scope": "Reviewed QEMU power-of-two CFG/count cost tradeoff; native CFG control only, no new PHI/speculation profitability policy.",
+      "evidence": [
+        "engineering/llvm-missed/COUNT-OBSERVATIONS.md",
+        "engineering/llvm-missed/count-observations-sources.json",
+        "tests/regression/count_observations.c",
+        "tests/regression/check_count_observations.py"
+      ],
+      "remaining": "Broader original-report semantics and target-cost decisions are not claimed; see the per-report audit."
+    },
+    {
+      "number": 76810,
+      "status": "reviewed-deferred",
+      "cohort": "count-observations",
+      "scope": "Reviewed total-count parity mask identities; target-dependent mask/scan costs deferred, defined-zero native controls only.",
+      "evidence": [
+        "engineering/llvm-missed/COUNT-OBSERVATIONS.md",
+        "engineering/llvm-missed/count-observations-sources.json",
+        "tests/regression/count_observations.c",
+        "tests/regression/check_count_observations.py"
+      ],
+      "remaining": "Broader original-report semantics and target-cost decisions are not claimed; see the per-report audit."
+    },
+    {
+      "number": 131444,
+      "status": "reviewed-deferred",
+      "cohort": "count-observations",
+      "scope": "LLVM exact-shift/poison contract not imported into defined C or masked x86 shift semantics; guarded semantic control only.",
+      "evidence": [
+        "engineering/llvm-missed/COUNT-OBSERVATIONS.md",
+        "engineering/llvm-missed/count-observations-sources.json",
+        "tests/regression/count_observations.c",
+        "tests/regression/check_count_observations.py"
+      ],
+      "remaining": "Broader original-report semantics and target-cost decisions are not claimed; see the per-report audit."
+    },
+    {
+      "number": 231124,
+      "status": "reviewed-deferred",
+      "cohort": "count-observations",
+      "scope": "Split trailing-count CFG/PHI profitability and custom zero32 sentinel preserved by native controls; no wide-count rewrite.",
+      "evidence": [
+        "engineering/llvm-missed/COUNT-OBSERVATIONS.md",
+        "engineering/llvm-missed/count-observations-sources.json",
+        "tests/regression/count_observations.c",
+        "tests/regression/check_count_observations.py"
+      ],
+      "remaining": "Broader original-report semantics and target-cost decisions are not claimed; see the per-report audit."
     }
   ],
   "latest_batch": 2,

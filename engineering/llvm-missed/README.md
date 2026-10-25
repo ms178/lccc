@@ -191,3 +191,12 @@ caps, the six-report source audit, and explicit refusals/deferred work.
 [predicate relations](PREDICATE-RELATIONS.md) adds a 50-report review and explicit follow-up on all 56 prior deferrals. Five new scopes and ten prior deferred scopes gain limited coverage; 91 of these 106 reviews remain blocked/refused, with reasons and controls. This is not a claim to close every deferral.
 
 [Packed relations](PACKED-RELATIONS.md) adds exact packed integer/register-image simplification across 128/256-bit shapes, a vector range-arm proof, private bit-reversal networks and scalar extrema observations. Four previously deferred scopes gain limited coverage; 87 cumulative reviewed scopes remain deferred. Historical cohort receipts are not rewritten to imply they covered these changes.
+
+## Count observations
+
+[COUNT-OBSERVATIONS.md](COUNT-OBSERVATIONS.md) records the eight-report body and
+conversation audit, consumer-local count ranges and exact population-count
+preimages. Two limited scopes and five new deferrals bring the cumulative ledger
+to 144 reviewed scopes (52 limited, 92 deferred); 2,967 rows remain unreviewed.
+Private exact zero/full observations bridge builtin input/result types without
+rewriting shared count producers. Native controls are not whole-issue closure.

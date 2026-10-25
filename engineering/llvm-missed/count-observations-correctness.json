@@ -1,0 +1,372 @@
+{
+  "oracle_versions": {
+    "gcc-16": "gcc-16 (GCC) 16.2.0",
+    "clang-23": "clang version 23.1.3 (https://github.com/llvm/llvm-project 0d261d1ca552c95a8f007e061c787ac7132fbcbc)"
+  },
+  "instruction_counts": {
+    "co_cap32": {
+      "on": 2,
+      "off": 23,
+      "before": 23
+    },
+    "co_inverse32": {
+      "on": 2,
+      "off": 24,
+      "before": 24
+    },
+    "co_swapped32": {
+      "on": 2,
+      "off": 23,
+      "before": 23
+    },
+    "co_leading32": {
+      "on": 2,
+      "off": 15,
+      "before": 15
+    },
+    "co_trailing32": {
+      "on": 2,
+      "off": 14,
+      "before": 14
+    },
+    "co_cap64": {
+      "on": 2,
+      "off": 27,
+      "before": 27
+    },
+    "co_inverse64": {
+      "on": 2,
+      "off": 28,
+      "before": 28
+    },
+    "co_swapped64": {
+      "on": 2,
+      "off": 27,
+      "before": 27
+    },
+    "co_leading64": {
+      "on": 2,
+      "off": 14,
+      "before": 14
+    },
+    "co_trailing64": {
+      "on": 2,
+      "off": 16,
+      "before": 16
+    },
+    "co_nonzero32": {
+      "on": 21,
+      "off": 23,
+      "before": 23
+    },
+    "co_zero32": {
+      "on": 5,
+      "off": 23,
+      "before": 6
+    },
+    "co_full32": {
+      "on": 5,
+      "off": 20,
+      "before": 4
+    },
+    "co_total_leading32": {
+      "on": 4,
+      "off": 7,
+      "before": 4
+    },
+    "co_total_trailing32": {
+      "on": 4,
+      "off": 6,
+      "before": 4
+    },
+    "co_shared32": {
+      "on": 18,
+      "off": 26,
+      "before": 26
+    },
+    "co_volatile32": {
+      "on": 3,
+      "off": 24,
+      "before": 24
+    },
+    "co_near_cap32": {
+      "on": 23,
+      "off": 23,
+      "before": 23
+    },
+    "co_near_signed32": {
+      "on": 23,
+      "off": 23,
+      "before": 23
+    },
+    "co_near_other32": {
+      "on": 23,
+      "off": 23,
+      "before": 23
+    },
+    "co_near_leading32": {
+      "on": 15,
+      "off": 15,
+      "before": 15
+    },
+    "co_near_nonzero32": {
+      "on": 23,
+      "off": 23,
+      "before": 23
+    },
+    "co_join_div32": {
+      "on": 32,
+      "off": 32,
+      "before": 32
+    },
+    "co_div32": {
+      "on": 24,
+      "off": 28,
+      "before": 28
+    },
+    "co_rem32": {
+      "on": 25,
+      "off": 29,
+      "before": 29
+    },
+    "co_pow2_cfg32": {
+      "on": 11,
+      "off": 11,
+      "before": 11
+    },
+    "co_ctz_parity32": {
+      "on": 4,
+      "off": 4,
+      "before": 4
+    },
+    "co_clz_parity32": {
+      "on": 5,
+      "off": 5,
+      "before": 5
+    },
+    "co_odd32": {
+      "on": 7,
+      "off": 4,
+      "before": 7
+    },
+    "co_exact_control32": {
+      "on": 11,
+      "off": 11,
+      "before": 11
+    },
+    "co_nonzero64": {
+      "on": 25,
+      "off": 27,
+      "before": 27
+    },
+    "co_zero64": {
+      "on": 5,
+      "off": 27,
+      "before": 27
+    },
+    "co_full64": {
+      "on": 4,
+      "off": 26,
+      "before": 26
+    },
+    "co_total_leading64": {
+      "on": 4,
+      "off": 7,
+      "before": 7
+    },
+    "co_total_trailing64": {
+      "on": 4,
+      "off": 6,
+      "before": 6
+    },
+    "co_shared64": {
+      "on": 22,
+      "off": 30,
+      "before": 30
+    },
+    "co_volatile64": {
+      "on": 3,
+      "off": 28,
+      "before": 28
+    },
+    "co_near_cap64": {
+      "on": 27,
+      "off": 27,
+      "before": 27
+    },
+    "co_near_signed64": {
+      "on": 27,
+      "off": 27,
+      "before": 27
+    },
+    "co_near_other64": {
+      "on": 27,
+      "off": 27,
+      "before": 27
+    },
+    "co_near_leading64": {
+      "on": 14,
+      "off": 14,
+      "before": 14
+    },
+    "co_near_nonzero64": {
+      "on": 27,
+      "off": 27,
+      "before": 27
+    },
+    "co_join_div64": {
+      "on": 37,
+      "off": 37,
+      "before": 37
+    },
+    "co_div64": {
+      "on": 28,
+      "off": 32,
+      "before": 32
+    },
+    "co_rem64": {
+      "on": 29,
+      "off": 33,
+      "before": 33
+    },
+    "co_pow2_cfg64": {
+      "on": 11,
+      "off": 11,
+      "before": 11
+    },
+    "co_ctz_parity64": {
+      "on": 4,
+      "off": 4,
+      "before": 4
+    },
+    "co_clz_parity64": {
+      "on": 5,
+      "off": 5,
+      "before": 5
+    },
+    "co_odd64": {
+      "on": 7,
+      "off": 7,
+      "before": 7
+    },
+    "co_exact_control64": {
+      "on": 12,
+      "off": 12,
+      "before": 12
+    },
+    "co_split_zero32": {
+      "on": 15,
+      "off": 15,
+      "before": 15
+    }
+  },
+  "modes": [
+    {
+      "flags": [
+        "-O0"
+      ],
+      "disabled": false
+    },
+    {
+      "flags": [
+        "-O1"
+      ],
+      "disabled": false
+    },
+    {
+      "flags": [
+        "-O2"
+      ],
+      "disabled": false
+    },
+    {
+      "flags": [
+        "-O3"
+      ],
+      "disabled": false
+    },
+    {
+      "flags": [
+        "-Os"
+      ],
+      "disabled": false
+    },
+    {
+      "flags": [
+        "-O2",
+        "-g"
+      ],
+      "disabled": false
+    },
+    {
+      "flags": [
+        "-O2",
+        "-mpopcnt"
+      ],
+      "disabled": false
+    },
+    {
+      "flags": [
+        "-O2"
+      ],
+      "disabled": true
+    }
+  ],
+  "checksum_and_volatile_reads": "245f21e2c05c4eb8 139776",
+  "native_forms": 51,
+  "samples": 69888,
+  "unit_tests": {
+    "count": 12,
+    "result": "passed",
+    "warnings": "denied",
+    "profile": "fastbuild",
+    "jobs": 2
+  },
+  "build": {
+    "binaries": [
+      "lccc",
+      "lccc-ld"
+    ],
+    "profile": "fastbuild",
+    "jobs": 2,
+    "warnings": "denied",
+    "swap": "8 GiB enabled"
+  },
+  "binary_sha256": {
+    "candidate": "8bea7b3a26d3e94ca188005a6fff1b207e23f3b27db2ee7df2761a104699e608",
+    "baseline": "f69461ca6d6988760a534d955a6c940b4d69cc6d49296fc60e5475862435658b"
+  },
+  "sources_sha256": {
+    "tests/regression/count_observations.c": "aad8a202db739b59c7e58b91c09b48248d4e2afa36dcfdcea7bd62fd02cb41f4",
+    "src/passes/bit_idioms_count_observe.rs": "4da35568e8476c967f5077ae27513ad307929a0ab6ca705055088b8922df2458",
+    "src/passes/bit_idioms_count_observe_tests.rs": "499e58c985c769a075dee711760716df71626d96a6d6c93f166ae086ba165844",
+    "src/passes/bit_idioms_facts.rs": "428ce3b822ce182de76534336af8f4dcba62fbba647907fb412f3a5c1c571563"
+  },
+  "gzip_longest_match_static": {
+    "before": {
+      "main": {
+        "instructions": 428,
+        "rsp_references": 65,
+        "frame_adjustments": [
+          "subq $120, %rsp",
+          "addq $120, %rsp"
+        ]
+      }
+    },
+    "after": {
+      "main": {
+        "instructions": 428,
+        "rsp_references": 65,
+        "frame_adjustments": [
+          "subq $120, %rsp",
+          "addq $120, %rsp"
+        ]
+      }
+    }
+  },
+  "limitations": [
+    "Native equivalence covers the fixture, not every program or every 64-bit input.",
+    "Instruction counts and stack references are not PMU or workload runtime evidence.",
+    "Hosted ICX and broader CI results are not inferred from this receipt."
+  ]
+}

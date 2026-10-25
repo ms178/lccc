@@ -137,6 +137,9 @@ fn arm(
             }
             cx.simplify_operand(op, ty, facts)
         }
+        Some(Instruction::Cmp { .. }) => cx
+            .truth(op, facts, depth - 1)
+            .map_or(op, |yes| constant(u64::from(yes), ty)),
         _ => cx.simplify_operand(op, ty, facts),
     }
 }

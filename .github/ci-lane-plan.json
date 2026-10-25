@@ -312,7 +312,7 @@
     "backend-contracts-b": {
       "group": "backend-contracts",
       "mode": "shell",
-      "predicted_gate_seconds": 411.03,
+      "predicted_gate_seconds": 419.938,
       "shards": 2,
       "step": "Verify remaining fast local contracts (shard b of 2)",
       "steps": [
@@ -563,6 +563,10 @@
         {
           "measured_s": 1.49,
           "name": "python3 tests/regression/check_llvm_word_counts.py"
+        },
+        {
+          "measured_s": 8.908,
+          "name": "python3 tests/regression/check_count_observations.py --clang \"${CLANG:-clang-23}\""
         },
         {
           "measured_s": 1.71,
@@ -1402,8 +1406,8 @@
   "provenance": {
     "backend-contracts": {
       "costs": "/tmp/audit/backend_contracts_costs.tsv",
-      "measured_seconds_total": 820.31,
-      "source": "measured: scripts/ci_gate_costs.py (previous plan measured_s); iabs-cmp-fold 0.40 s measured fresh by scripts/ci_gate_costs.py --only iabs_cmp; arithmetic-test-sign-cmov 2 s measured fresh by scripts/ci_local.sh --only arithmetic-test-sign-cmov (2026-10-24)"
+      "measured_seconds_total": 829.218,
+      "source": "measured: scripts/ci_gate_costs.py (previous plan measured_s); iabs-cmp-fold 0.40 s measured fresh by scripts/ci_gate_costs.py --only iabs_cmp; arithmetic-test-sign-cmov 2 s measured fresh by scripts/ci_local.sh --only arithmetic-test-sign-cmov (2026-10-24); count-observations 8.908 s measured with both pinned vendors and extra frozen-baseline mechanism leg (conservative hosted scheduling estimate, 2026-10-25)"
     },
     "codegen": {
       "costs": "/home/user/.cache/tmp/codegen.tsv",
