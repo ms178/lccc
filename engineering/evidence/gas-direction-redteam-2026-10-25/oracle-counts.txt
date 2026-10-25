@@ -1,0 +1,48 @@
+# oracle counts, 2026-10-25, pinned binutils 2.47 (as/objdump 2.47.20260726)
+
+$ python3 scripts/gas_encoding_crossref.py --summary
+as 2.47 table: 2195 mnemonics, 4022 encodings, 73 templates, 633 instantiation rows, 1122 skipped
+encoder rows:  633 in 6 files
+
+$ python3 scripts/gas_encoding_crossref.py --verify --strict --backend i686
+
+rows checked against as 2.47: 706
+code-model encodings checked: 224 in 160 mnemonics
+findings: 0   code-model findings: 0   unmodelled rows: 0   not in the as 2.47 snapshot: 0
+exit=0
+
+$ python3 scripts/gas_encoding_crossref.py --missing --backend i686
+encodings as 2.47 accepts that no declarative row models: 756 across 357 mnemonics with at least one row (code-implemented families are not rows; see the docstring)
+
+$ python3 scripts/gas_encoding_crossref.py --absent --backend i686
+mnemonics as 2.47 knows with no declarative row: 1524
+
+$ python3 scripts/gas_encoding_crossref.py --verify --strict --backend x86
+
+rows checked against as 2.47: 932
+code-model encodings checked: 222 in 158 mnemonics
+findings: 0   code-model findings: 0   unmodelled rows: 0   not in the as 2.47 snapshot: 0
+exit=0
+
+$ python3 scripts/gas_encoding_crossref.py --missing --backend x86
+encodings as 2.47 accepts that no declarative row models: 859 across 437 mnemonics with at least one row (code-implemented families are not rows; see the docstring)
+
+$ python3 scripts/gas_encoding_crossref.py --absent --backend x86
+mnemonics as 2.47 knows with no declarative row: 1380
+
+$ python3 scripts/gas_encoding_crossref.py --verify --strict --backend all
+
+rows checked against as 2.47: 1638
+code-model encodings checked: 224 in 160 mnemonics
+findings: 0   code-model findings: 0   unmodelled rows: 0   not in the as 2.47 snapshot: 0
+exit=0
+
+$ python3 scripts/gas_encoding_crossref.py --missing --backend all
+encodings as 2.47 accepts that no declarative row models: 896 across 454 mnemonics with at least one row (code-implemented families are not rows; see the docstring)
+
+$ python3 scripts/gas_encoding_crossref.py --absent --backend all
+mnemonics as 2.47 knows with no declarative row: 1354
+
+$ python3 scripts/gas_encoding_crossref.py --absent --triage --backend all
+mnemonics as 2.47 knows with no declarative row: 1354
+  UNMENTIONED 740: the spelling appears in no backend source -- read these first, not a verdict

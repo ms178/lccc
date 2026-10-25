@@ -30,7 +30,8 @@ What it answers, all offline and from a vendored snapshot
 ---------------------------------------------------------
 * ``--verify``   every declarative encoder row is a legal `as` 2.47 encoding of
                  that mnemonic (LCCC-EXTRA pinpoints a wrong opcode/prefix/digit),
-                 or an invented mnemonic (LCCC-UNKNOWN).
+                 or an invented mnemonic (LCCC-UNKNOWN); plus every encoding a
+                 modelled *code* path derives (`CODE-EXTRA`/`CODE-UNKNOWN`).
 * ``--missing``  every (mnemonic, encoding) `as` 2.47 accepts that no
                  *declarative row* models, grouped by mnemonic.  Read "what a row
                  cannot see" below before treating the count as a worklist.
@@ -62,13 +63,23 @@ counts are a *declarative-row* census, not an ISA-coverage census, and the sound
 direction is ``--verify`` — it asks whether each row that does exist is a legal
 encoding.
 
-The cure is to model the code, which is what ``code_models()`` now does for the
-integer ALU family: it reads the `self.encode_alu(ops, mnemonic, <op>)` dispatch
-arms and derives the nine legacy forms from `op` exactly as `encode_alu` does
-(`0x01 + op * 8` for the six opcode forms, `/op` over a fixed opcode for 80/81/
-83).  That alone takes ``--missing`` from 349 to 286 encodings across 159
-mnemonics, and the same pattern extends to the remaining families
-(`backlog.md` MB-45).
+The cure is to model the code, which is what ``code_models()`` now does for four
+families: the integer ALU (`encode_alu`'s dispatch index, nine legacy forms),
+the condition-code spellings (`cc_from_mnemonic`: `j<cc>`, `cmov<cc>`,
+`set<cc>`), the one-byte `inc`/`dec` of the i686 backend, and the FMA3 grid
+(`fma3_opcode`, whose opcode lives in the mnemonic's digits).  Their claims are
+not trusted: ``--verify`` requires every one of them to be a form `as` 2.47
+accepts, so a model that drifts fails the gate instead of shrinking the gap
+list.  The remaining families are the worklist in `backlog.md` MB-45.
+
+The snapshot's own transcription is the other half of the story, and it is
+checkable: `D` is not "XOR 1" (GNU as uses four different schemes and leaves
+three cases unflipped), `D` and `W` compose, and rows without a ModR/M keep
+their register in the opcode (`push %rcx` is `51`).  Getting those wrong makes
+the oracle accept `movdqa 66 0f 6e` (which is `movd`) and reject `and
+(%rax),%al` (`22 00`) — the two failure modes a cross-reference tool must not
+have.  ``tests/corpus/test_gas_snapshot_decode.py`` anchors the transcription to
+``objdump`` instead of to a second reading of the table.
 
 `--backend {all,i686,x86}` selects the encoder sources.  The 64-bit backend is
 not a superset of the 32-bit one — x87 integer memory arithmetic, `fcmov*` and
@@ -89,6 +100,7 @@ import argparse
 import hashlib
 import json
 import re
+import signal
 import sys
 from itertools import product
 from pathlib import Path
@@ -105,9 +117,6 @@ UPSTREAM_REF = "binutils-2_47-branch"
 LEGACY_PREFIXES = (0x66, 0xF2, 0xF3)
 
 PP_FOR_BYTE = {0x66: "66", 0xF2: "f2", 0xF3: "f3"}
-
-# Opcodes whose store direction is 0x10 above the load form (SDM Vol. 2B).
-SSE_INT_MOVE = {0x6E, 0x6F, 0x7E, 0x7F}
 
 
 # --------------------------------------------------------------------------
@@ -355,7 +364,9 @@ def _parse_row(line: str) -> list[dict] | None:
     if not mnemonic or not re.fullmatch(r"[a-z][a-z0-9]*", mnemonic):
         return None
     opcode_field = parts[1].strip()
+    cpu = parts[2].strip()
     attrs = parts[3].strip()
+    operands = parts[4].strip() if len(parts) > 4 else ""
     # i386-gen prefixes only SSE2AVX template names; VEX itself does not
     # invent a v spelling (vandn/vblsi/vshrx are not GAS mnemonics).
     if "SSE2AVX" in {t.strip() for t in attrs.split("|")}:
@@ -385,7 +396,7 @@ def _parse_row(line: str) -> list[dict] | None:
     for fam in fams:
         one = dict(enc, family=fam)
         one["mnemonic"] = mnemonic
-        one["directions"] = _directions(one, attrs)
+        one["directions"] = _directions(one, attrs, cpu, operands)
         out.extend(one["directions"])
     return out
 
@@ -494,41 +505,135 @@ def _canonical(value: int, ext: int | None, attrs: str) -> dict | None:
     return enc, fams
 
 
-def _directions(enc: dict, attrs: str) -> list[dict]:
-    """Expand the `D` attribute into the two opcode directions GAS really emits.
+def _direction_mask(enc: dict, attrs: str, cpu: str) -> int:
+    """The opcode bit `D` flips, exactly as `tc-i386.c` chooses it.
 
-    `D` marks an instruction whose register/memory operands may appear in either
-    order: `movups %xmm0,(%rax)` is `0f 11 00`, one byte above the `0f 10` load
-    form in the table.  Without this expansion every store form in the encoder
-    looks like an illegal encoding, which is exactly the false positive that
-    makes a cross-reference tool untrustworthy.
+    `D` does not mean "flip one bit": `tc-i386.c` picks one of four schemes,
+    and three of the cases change nothing at all.  Transcribed from
+    `install_template` / `match_template`:
+
+      * `Ugh` rows (`faddp`, `fsubrp`, ...) are *rewritten* rather than
+        re-encoded — `faddp %st(1),%st` assembles as `faddp %st,%st(1)`, both
+        `de c1`, so no opcode moves (`found_reverse_match = ~0`);
+      * FMA4 and XOP put the operand order in VEX.W (`Opcode_VexW`), so again
+        no opcode moves — the scalar FMA4 block is `6a/6b/6e/6f/7a/7b/7e/7f`
+        for eight *different* instructions, and flipping "the direction bit"
+        there invents a spelling that belongs to its neighbour;
+      * x87 register forms are the tbyte case (`FloatReg Class=RegFP|Tbyte`):
+        the reverse form is the neighbouring arithmetic block, `D8` <-> `DC`
+        (`Opcode_FloatD`, 0x4);
+      * base-map rows XOR `Opcode_D` (0x2), which includes the APX `EVexMap4`
+        rows — they keep `SPACE_MAP4` but take the base decision at 3+ operands
+        and for promoted two-operand forms;
+      * the extended maps XOR `Opcode_ExtD` (0x1) — except the compact SIMD
+        integer moves, whose `6e/6f` and `7e/7f` pairs are their own
+        load/store partners (`Opcode_SIMD_IntD`, 0x10), and `mov` to/from
+        CR/DR/TR (`0f 20..27`), which the table marks `NoRex64` and GAS keeps
+        on the base-map scheme:
+
+            i.tm.base_opcode ^= (base_opcode & 0xee) != 0x6e
+                                ? Opcode_ExtD : Opcode_SIMD_IntD;
+
+    Getting this wrong is not academic: the 0x1 scheme on `movdqa 0x66 0f 6f`
+    claims `66 0f 6e`, which is `movd`, so the oracle accepted an invented
+    encoding — the exact defect this file exists to prevent.
+    """
+    tokens = {t.strip() for t in attrs.split("|")}
+    opcode, map_ = enc["opcode"], enc["map"]
+    if "Ugh" in tokens or "FMA4" in cpu or "XOP" in cpu:
+        return 0
+    if tokens & {"C", "StaticRounding"}:
+        # `C` is `#define C StaticRounding`: the bit GAS reads as
+        # `opcode_modifier.commutative` for operand-order purposes.  A
+        # commutative row keeps its opcode when the operands are reversed --
+        # `test %eax,(%rax)` and `test (%rax),%eax` are both `85 00`, and
+        # `xchg` likewise, so flipping a bit here would invent `86`/`87` for
+        # `test` (which are `xchg`).
+        return 0
+    if map_ == "none" and 0xD8 <= opcode <= 0xDF:
+        return 0x04
+    if map_ == "none":
+        return 0x02
+    if map_ == "0f" and 0x20 <= opcode <= 0x27:
+        return 0x02
+    return 0x10 if (opcode & 0xEE) == 0x6E else 0x01
+
+
+GPR_OPERAND = re.compile(r"^Reg(?:8|16|32|64)(?:\|Reg(?:8|16|32|64))*$")
+
+
+def _register_opcode(attrs: str, operands: str) -> bool:
+    """Does GAS put this row's register number in the opcode byte (`+rd`)?
+
+    `push %rcx` is `51`, `bswap %ecx` is `0f c9`, `mov $1,%ecx` is `b9`: one
+    row covers eight encodings because the ModR/M byte has nowhere to go.
+    Without this the snapshot knew only `0x50` for `push` and would have called
+    the encoder's `pushq %rcx` an invented encoding.
+
+    The test is structural rather than a list of mnemonics: no ModR/M and no
+    `RegMem` (those put the register in ModR/M), and exactly one operand that
+    is a bare GPR group.  `Acc` is deliberately excluded — `in $1,%al` is `e4
+    01`, whose accumulator is implied, and `push %fs` (`0f a0`) takes its
+    register from a fixed segment-register row instead.
+    """
+    tokens = {t.strip() for t in attrs.split("|")}
+    if tokens & {"Modrm", "RegMem"}:
+        return False
+    body = operands.strip()
+    if not (body.startswith("{") and body.endswith("}")):
+        return False
+    terms = [t.strip() for t in _split_top(body[1:-1]) if t.strip()]
+    return sum(1 for t in terms if GPR_OPERAND.match(t)) == 1
+
+
+def _directions(enc: dict, attrs: str, cpu: str = "",
+                operands: str = "") -> list[dict]:
+    """Every opcode the assembler derives from one table row.
+
+    Three modifiers move the opcode within a row, and because they flip
+    distinct bits they compose rather than replace each other:
+
+      * `D`   -- the operand-order bit (see `_direction_mask`);
+      * `W`   -- byte operands use the listed opcode, wider ones `opcode | 1`
+                 (`mov 0x88` is `mov %al,(%rax)`, `0x89` is `mov %eax,(%rax)`);
+      * `FloatMF` -- x87's memory-operand size bit (`fld 0xd9/0` is the dword
+                 form, `0xdd/0` the qword one).
+
+    The cross product matters: `mov` carries both `D` and `W`, and `as`
+    accepts all four of `88`, `89`, `8a`, `8b`.  Enumerating the modifiers
+    one-dimensionally produced only three and silently declared the fourth
+    illegal -- the same class of false positive this whole expansion exists to
+    remove.
+
+    Rows that carry a register in the opcode (`+rd`) additionally expand over
+    the eight registers (see `_register_opcode`).
     """
     base = {k: v for k, v in enc.items() if k != "directions"}
     tokens = {t.strip() for t in attrs.split("|")}
-    opcode, map_ = base["opcode"], base["map"]
-    deltas: list[int] = []
+    masks: list[int] = []
     if "D" in tokens:
-        if map_ == "none" and 0xD8 <= opcode <= 0xDF:
-            # x87: the operand-order pair is the neighbouring arithmetic block
-            # (D8 <-> DC, D9 <-> DD, DA <-> DE, DB <-> DF).
-            deltas.append(0x04)
-        else:
-            deltas.append(0x01)
-            if opcode in SSE_INT_MOVE:
-                # MOVD/MOVQ/MOVDQA/MOVDQU: the store form is 0x10 above the load.
-                deltas.append(0x10)
-    if "W" in tokens:            # byte operand: base opcode; wider: base|1
-        deltas.append(0x01)
-    if "FloatMF" in tokens:      # x87 float memory form: dword as listed, qword ^4
-        deltas.append(0x04)
-    if not deltas:
-        return [base]
-    out = [base]
-    for delta in deltas:
-        paired = dict(base, opcode=base["opcode"] ^ delta)
-        if paired["opcode"] not in {e["opcode"] for e in out}:
-            out.append(paired)
+        mask = _direction_mask(base, attrs, cpu)
+        if mask:
+            masks.append(mask)
+    if "W" in tokens:
+        masks.append(0x01)
+    if "FloatMF" in tokens:
+        masks.append(0x04)
+    opcodes = [base["opcode"]]
+    for mask in masks:
+        opcodes.extend(op ^ mask for op in list(opcodes))
+    if _register_opcode(attrs, operands):
+        opcodes = [op | rd for op in opcodes for rd in range(8)]
+    out: list[dict] = []
+    seen: set[int] = set()
+    for opcode in opcodes:
+        if opcode in seen:
+            continue
+        seen.add(opcode)
+        out.append(base if opcode == base["opcode"] else dict(base, opcode=opcode))
     return out
+
+
 def build_snapshot(tbl: Path) -> int:
     raw = tbl.read_bytes()
     text = raw.decode("utf-8", errors="replace")
@@ -660,7 +765,7 @@ def verify(rows: list[dict], table: dict[str, list[dict]],
     Returns `(findings, unmodelled, checked, uncovered)`: `uncovered` names the
     mnemonics the snapshot has no entry for at all (see the comment at the
     `known is None` branch)."""
-    findings, unmodeLLed, uncovered, checked = [], [], [], 0
+    findings, unmodelled, uncovered, checked = [], [], [], 0
     for row in rows:
         # A row that binds a relocation kind or an operand name (`es`, `fs`,
         # `gotpcrel`, ...) is not an instruction row; the SDM gate skips exactly
@@ -668,7 +773,7 @@ def verify(rows: list[dict], table: dict[str, list[dict]],
         if row["names"] and all(n in MNEMONIC_FRAGMENTS for n in row["names"]):
             continue
         if model(row) is None:
-            unmodeLLed.append(row)
+            unmodelled.append(row)
             continue
         for name in row["names"]:
             if name in MNEMONIC_FRAGMENTS or name in SNAPSHOT_LIMITATIONS:
@@ -678,7 +783,7 @@ def verify(rows: list[dict], table: dict[str, list[dict]],
             # comes from the mnemonic.
             encs = model(row, name)
             if encs is None:
-                unmodeLLed.append(row)
+                unmodelled.append(row)
                 continue
             prefixes = [name]
             base = SNAPSHOT_ALIASES.get(name, gas_name(name))
@@ -708,19 +813,26 @@ def verify(rows: list[dict], table: dict[str, list[dict]],
                 findings.append({"kind": "LCCC-EXTRA", "name": name,
                                  "file": row["file"], "line": row["line"],
                                  "body": row["body"], "want": extra[0]})
-    return findings, unmodeLLed, checked, uncovered
+    return findings, unmodelled, checked, uncovered
 
 
 # ---------------------------------------------------------------------------
-# Code-driven families.
+# Code-driven families (MB-45).
 #
 # Not every instruction the backend encodes has a declarative row: `encode_alu`
-# derives its opcodes arithmetically, so the whole integer ALU family is
-# invisible to the row model and its nine legacy forms were reported as gaps
-# (`add 01`, `add 05`, `add 80 /0`, ...).  The model below is read from the
-# encoder, not copied from the SDM: the dispatch arms come from the
-# `match mnemonic` chain and the nine forms from the arithmetic in
-# `encode_alu` itself, so a change there fails this model instead of drifting.
+# derives its opcodes arithmetically, `encode_jcc`/`encode_cmovcc`/
+# `encode_setcc` resolve a condition-code alias through a table, and FMA3 reads
+# its opcode out of the mnemonic's own digits.  The row model cannot see any of
+# them, so the gap counts blamed the encoder for the model's blind spots.
+#
+# Each model below is a *claim* about what the encoder can emit, derived from
+# the encoder's own source — the dispatch arms, the arithmetic in `encode_alu`,
+# the alias table in `cc_from_mnemonic`, the grid in `fma3_opcode`.  Claims are
+# not trusted: `verify_code_models` requires every claimed encoding to exist in
+# the `as` 2.47 snapshot under that mnemonic, so a model that drifts from the
+# encoder (or an encoder that drifts from `as`) fails the gate instead of
+# quietly shrinking the gap list.  That check is the reason these families are
+# worth modelling at all: before it, no gate looked at an ALU encoding.
 # ---------------------------------------------------------------------------
 
 # `"addq" | "addl" | "addw" | "addb" => self.encode_alu(ops, mnemonic, 0),`
@@ -729,6 +841,51 @@ ALU_ARM = re.compile(
     r'self\.encode_alu\(ops,\s*mnemonic,\s*(\d+)\)'
 )
 QUOTED = re.compile(r'"([a-z0-9]+)"')
+
+
+def _enc(opcode: int, *, family: str = "legacy", map_: str = "none",
+         pp: str = "none", w: int | None = None,
+         reg: int | None = None) -> dict:
+    """One encoding, in the exact shape the snapshot uses for comparisons."""
+    return {"family": family, "map": map_, "pp": pp, "w": w,
+            "opcode": opcode, "reg": reg}
+
+
+def _dedupe(models: dict[str, list[dict]]) -> dict[str, list[dict]]:
+    out: dict[str, list[dict]] = {}
+    for name, encs in models.items():
+        seen: dict[tuple, dict] = {}
+        for enc in encs:
+            seen[(enc["family"], enc["map"], enc["pp"], enc["opcode"],
+                  enc["reg"], enc["w"])] = enc
+        out[name] = list(seen.values())
+    return out
+
+
+def _fn_body(path: Path, name: str) -> str | None:
+    """The brace-matched body of `fn name(...)`, or `None`.
+
+    Brace matching rather than "find the next `\n}`": these functions contain
+    nested blocks and string literals, and a truncated body silently drops
+    table rows, which is the failure mode the models exist to avoid.
+    """
+    text = path.read_text(encoding="utf-8", errors="replace")
+    head = text.find(f"fn {name}(")
+    if head < 0:
+        return None
+    open_brace = text.find("{", head)
+    if open_brace < 0:
+        return None
+    depth = 0
+    for i in range(open_brace, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[open_brace + 1:i]
+    return None
+
 
 def alu_forms(op: int) -> list[dict]:
     """The nine legacy encodings `encode_alu` emits for dispatch index `op`.
@@ -740,14 +897,8 @@ def alu_forms(op: int) -> list[dict]:
     is what makes this a model of the code rather than a second table: `add`
     lands on 00..05 and `and` on 20..25 from the same two lines.
     """
-    forms = [{
-        "family": "legacy", "map": "none", "pp": "none", "w": None,
-        "opcode": base + op * 8, "reg": None,
-    } for base in (0x00, 0x01, 0x02, 0x03, 0x04, 0x05)]
-    forms.extend({
-        "family": "legacy", "map": "none", "pp": "none", "w": None,
-        "opcode": opcode, "reg": op,
-    } for opcode in (0x80, 0x81, 0x83))
+    forms = [_enc(base + op * 8) for base in (0x00, 0x01, 0x02, 0x03, 0x04, 0x05)]
+    forms.extend(_enc(opcode, reg=op) for opcode in (0x80, 0x81, 0x83))
     return forms
 
 
@@ -755,25 +906,155 @@ def alu_code_models() -> dict[str, list[dict]]:
     """`{gas mnemonic: [encoding, ...]}` for every `encode_alu` dispatch arm."""
     text = (REPO / "src/backend/x86/assembler/encoder/mod.rs").read_text(
         encoding="utf-8", errors="replace")
-    out: dict[str, dict[tuple[int, int | None], dict]] = {}
+    out: dict[str, list[dict]] = {}
     for names, op in ALU_ARM.findall(text):
         forms = alu_forms(int(op))
         for name in QUOTED.findall(names):
-            slot = out.setdefault(gas_name(name), {})
-            for form in forms:
-                slot[(form["opcode"], form["reg"])] = form
-    return {name: list(slot.values()) for name, slot in out.items()}
+            out.setdefault(gas_name(name), []).extend(forms)
+    return _dedupe(out)
 
 
-_ALU_MODELS: dict[str, list[dict]] | None = None
+# `cc_from_mnemonic` lives in each backend's `registers.rs`; the two tables are
+# byte-identical today, and modelling both means a divergence shows up here
+# instead of as a silent gap in one backend.
+CC_FILES = {
+    "i686": "src/backend/i686/assembler/encoder/registers.rs",
+    "x86": "src/backend/x86/assembler/encoder/registers.rs",
+}
+# `"b" | "c" | "nae" => Ok(2),`
+CC_ARM = re.compile(r'((?:"[a-z]+"\s*\|\s*)*"[a-z]+")\s*=>\s*Ok\((\d+)\)')
 
 
-def code_models() -> dict[str, list[dict]]:
+def cc_code_models(backend: str = "all") -> dict[str, list[dict]]:
+    """`j<cc>`, `cmov<cc>` and `set<cc>` for every alias `cc_from_mnemonic` takes.
+
+    Only the SHORT `jcc` form is claimed: `as`'s table carries `0x70+cc` under
+    `j<cc>` and leaves the near relaxation (`0F 8x`) to its front end, so a
+    claim on `0F 8x` would be a claim the oracle cannot confirm — the model
+    fails closed rather than reporting a phantom disagreement.
+    """
+    out: dict[str, list[dict]] = {}
+    backends = ("i686", "x86") if backend == "all" else (backend,)
+    for be in backends:
+        body = _fn_body(REPO / CC_FILES[be], "cc_from_mnemonic")
+        if body is None:
+            continue
+        for names, code in CC_ARM.findall(body):
+            cc = int(code)
+            for alias in QUOTED.findall(names):
+                out.setdefault(f"j{alias}", []).append(_enc(0x70 + cc))
+                out.setdefault(f"cmov{alias}", []).append(_enc(0x40 + cc, map_="0f"))
+                out.setdefault(f"set{alias}", []).append(
+                    _enc(0x90 + cc, map_="0f", reg=0))
+    return _dedupe(out)
+
+
+# `incq`/`decq` in the i686 backend use the one-byte `40+rd`/`48+rd` forms for a
+# 32-bit register; the 64-bit backend cannot (REX owns `40..4F`) and goes
+# through `FE`/`FF`, which are declarative rows there.
+INCDEC_I686 = {"inc": 0x40, "dec": 0x48}
+
+
+def incdec_code_models(backend: str = "all") -> dict[str, list[dict]]:
+    if backend not in ("i686", "all"):
+        return {}
+    return {name: [_enc(opcode)] for name, opcode in INCDEC_I686.items()}
+
+
+FMA_ELEM = {"ps": (0, 0), "pd": (1, 0), "ss": (0, 1), "sd": (1, 1)}
+FMA_ORDER = {"132": 0, "213": 1, "231": 2}
+FMA_BASE = {("add", False): 0x98, ("sub", False): 0x9A,
+            ("add", True): 0x9C, ("sub", True): 0x9E}
+FMA_PACKED_ONLY = {"addsub": 0x96, "subadd": 0x97}
+
+
+def fma3_encoding(mnemonic: str) -> dict | None:
+    """Mirror of `fma3_opcode` in `encoder/registers.rs` (identical in i686).
+
+    The encoder reads the opcode out of the mnemonic itself —
+    `vfm<op><order><elem>` — so no row can carry it.  Reimplementing the grid
+    is the only way to model it, and `verify_code_models` is what makes the
+    reimplementation trustworthy: every derived opcode must match `as` 2.47.
+    """
+    if mnemonic.startswith("vfm"):
+        rest, negated = mnemonic[3:], False
+    elif mnemonic.startswith("vfnm"):
+        rest, negated = mnemonic[4:], True
+    else:
+        return None
+    if len(rest) < 5:
+        return None
+    elem, body = rest[-2:], rest[:-2]
+    if elem not in FMA_ELEM:
+        return None
+    w, scalar = FMA_ELEM[elem]
+    op, order = body[:-3], body[-3:]
+    if order not in FMA_ORDER:
+        return None
+    base = FMA_BASE.get((op, negated))
+    if base is None:
+        # addsub/subadd have no scalar form and no negated spelling.
+        if scalar or negated:
+            return None
+        base = FMA_PACKED_ONLY.get(op)
+        if base is None:
+            return None
+    return _enc(base + 0x10 * FMA_ORDER[order] + scalar,
+                family="vex", map_="0f38", pp="66", w=w)
+
+
+def fma3_code_models(table: dict[str, list[dict]]) -> dict[str, list[dict]]:
+    """FMA3 encodings for every spelling the table knows and the grid accepts.
+
+    The name set comes from the reference table because the encoder's dispatch
+    is `m if is_fma3_vex(m)` — it accepts every mnemonic the grid parses — and
+    the table is the only list of the spellings `as` will assemble.  The
+    *encodings* are derived from the grid, which is what gets verified.
+    """
+    out: dict[str, list[dict]] = {}
+    for name in table:
+        enc = fma3_encoding(name)
+        if enc is not None:
+            out[name] = [enc]
+    return out
+
+
+def code_models(backend: str = "all",
+                table: dict[str, list[dict]] | None = None) -> dict[str, list[dict]]:
     """Encodings produced by code paths the row model cannot see."""
-    global _ALU_MODELS
-    if _ALU_MODELS is None:
-        _ALU_MODELS = alu_code_models()
-    return _ALU_MODELS
+    out: dict[str, list[dict]] = {}
+    for part in (alu_code_models(), cc_code_models(backend),
+                 incdec_code_models(backend),
+                 fma3_code_models(table) if table is not None else {}):
+        for name, encs in part.items():
+            out.setdefault(name, []).extend(encs)
+    return _dedupe(out)
+
+
+def verify_code_models(extra: dict[str, list[dict]],
+                       table: dict[str, list[dict]]) -> tuple[list[dict], int]:
+    """Check every code-model claim against the snapshot.
+
+    Returns `(findings, checked)`.  A claim the snapshot cannot confirm is a
+    finding, in both directions: `CODE-UNKNOWN` when the mnemonic itself is not
+    a `as` 2.47 mnemonic, `CODE-EXTRA` when the derived encoding is not one of
+    the forms `as` accepts for it.  This is the same contract `LCCC-EXTRA`
+    applies to declarative rows, which is why a check on it is worth having.
+    """
+    findings: list[dict] = []
+    checked = 0
+    for name in sorted(extra):
+        known = table.get(name)
+        if known is None:
+            findings.append({"kind": "CODE-UNKNOWN", "name": name,
+                             "want": extra[name][0]})
+            continue
+        for enc in extra[name]:
+            if any(_same(enc, have) for have in known):
+                checked += 1
+            else:
+                findings.append({"kind": "CODE-EXTRA", "name": name, "want": enc})
+    return findings, checked
 
 
 def missing(rows: list[dict], table: dict[str, list[dict]], model,
@@ -862,6 +1143,10 @@ def _fmt(enc: dict) -> str:
 
 
 def main() -> int:
+    # `--missing | head` closes the pipe early; without this the interpreter
+    # prints a BrokenPipeError traceback for a perfectly ordinary pipeline.
+    if hasattr(signal, "SIGPIPE"):
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--backend", default="i686", choices=["all", "i686", "x86"],
@@ -921,11 +1206,25 @@ def main() -> int:
               f"{manifest['stats']['skipped']} skipped")
         print(f"encoder rows:  {len(rows)} in {len(files)} files")
 
+    code_findings: list[dict] = []
     if args.verify:
-        findings, unmodeLLed, checked, uncovered = verify(rows, table, model)
+        findings, unmodelled, checked, uncovered = verify(rows, table, model)
+        # The declarative rows are only half of the encoder: `encode_alu`,
+        # `cc_from_mnemonic`, `inc`/`dec` and `fma3_opcode` derive their
+        # opcodes in code, so no row exists to check.  `code_models()` reads
+        # those code paths and `verify_code_models` requires every claim it
+        # makes to be a form `as` 2.47 accepts -- otherwise a model could
+        # quietly drift from the encoder and shrink the gap counts instead of
+        # failing.
+        claims = code_models(args.backend, table)
+        code_findings, code_checked = verify_code_models(claims, table)
         print(f"\nrows checked against as 2.47: {checked}")
-        print(f"findings: {len(findings)}   unmodeLLed rows: {len(unmodeLLed)}"
+        print(f"code-model encodings checked: {code_checked} in {len(claims)} mnemonics")
+        print(f"findings: {len(findings)}   code-model findings: "
+              f"{len(code_findings)}   unmodelled rows: {len(unmodelled)}"
               f"   not in the as 2.47 snapshot: {len(uncovered)}")
+        for f in code_findings:
+            print(f"  {f['kind']:13s} {f['name']:14s} {_fmt(f['want'])}")
         shown = 0
         for f in findings:
             if args.limit and shown >= args.limit:
@@ -939,22 +1238,22 @@ def main() -> int:
         # the model *should* understand; the hundreds that come from prefix and
         # tuple tables are pure noise, so they are counted by helper instead of
         # listed one by one.  `--limit` still prints individual rows on demand.
-        if unmodeLLed:
+        if unmodelled:
             groups: dict[str, int] = {}
-            for row in unmodeLLed:
+            for row in unmodelled:
                 helper = HELPER_OF.search(row["body"])
                 key = helper.group(1) if helper else row["body"].split("(")[0].strip()
                 groups[key] = groups.get(key, 0) + 1
             for key in sorted(groups, key=lambda k: (-groups[k], k)):
                 print(f"  UNMODELLED    {groups[key]:5d} rows via {key}")
-            for row in unmodeLLed[: args.limit]:
+            for row in unmodelled[: args.limit]:
                 print(f"  UNMODELLED    {row['names'][0]:14s} {row['file']}:{row['line']}")
                 print(f"                {row['body'][:110]}")
         if uncovered:
             names = sorted({u["name"] for u in uncovered})
             print(f"  UNCOVERED     {len(names)} mnemonic(s) with no entry in the "
                   f"as 2.47 snapshot: {' '.join(names)}")
-        if args.strict and (findings or unmodeLLed or uncovered):
+        if args.strict and (findings or code_findings or unmodelled or uncovered):
             return 1
 
     if args.missing:

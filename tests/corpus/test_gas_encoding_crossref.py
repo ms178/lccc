@@ -373,8 +373,16 @@ class GasEncodingCrossrefTests(unittest.TestCase):
         self.assertIn(0x01, opcodes(before, "add"))
         for name in ("add", "and", "cmp", "sub", "xor", "or", "adc", "sbb"):
             self.assertEqual(opcodes(after, name), [], name)
-        self.assertLessEqual(sum(len(v) for v in after.values()),
-                             sum(len(v) for v in before.values()))
+        # The model may *add* names to the comparison: `cmov<cc>`, `j<cc>` and
+        # `set<cc>` have no declarative row at all today, so before the model
+        # they were not looked at, and with it their APX forms (`cmovne` is
+        # also `EVexMap4 0x45` in the table) become visible as real gaps.  What
+        # must never happen is a mnemonic the row model already covered losing
+        # coverage, so the guarantee is per name, not on the total.
+        for name, gaps in before.items():
+            self.assertLessEqual(len(after.get(name, [])), len(gaps), name)
+        self.assertLess(sum(len(after.get(n, [])) for n in before),
+                        sum(len(v) for v in before.values()))
         # A gap that is not an ALU form must survive the model: `cs`/`ds`/`es`
         # are segment-prefix pseudo-mnemonics, not instructions with an
         # encoding, so no code path can claim them.
@@ -427,6 +435,157 @@ class GasAbsentTriageTests(unittest.TestCase):
         )
         self.assertEqual(unmentioned, ["vfmadd132pd"])
         self.assertEqual(mentioned, [])
+
+
+class GasDirectionModelTests(unittest.TestCase):
+    """`D`/`W`/`+rd` expansion, pinned to what GNU as 2.47 really emits.
+
+    PR #965 made the snapshot an oracle that rejects invented encodings, but it
+    modelled the direction bit as "XOR 1" for everything.  GNU as picks one of
+    four schemes, and three of the nine cases it applies to change nothing --
+    so the snapshot simultaneously *invented* encodings (`movdqa 66 0f 6e` is
+    `movd`) and *missed* real ones (`and (%rax),%al` is `22 00`).  Every
+    assertion below is a byte sequence produced by the pinned 2.47 pair, not a
+    reading of the SDM.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.gas = _load(CROSSREF, "gas_encoding_crossref")
+        cls.table = cls.gas.load_snapshot()
+
+    def opcodes(self, name, family="legacy", map_="none", pp="none"):
+        return sorted(e["opcode"] for e in self.table.get(name, [])
+                      if e["family"] == family and e["map"] == map_
+                      and e["pp"] == pp)
+
+    def test_the_alu_direction_pair_is_two_apart_not_one(self):
+        """`Opcode_D` is 0x2: `add %al,(%rax)` is `00`, `add (%rax),%al` is `02`."""
+        for name, base in (("add", 0x00), ("or", 0x08), ("adc", 0x10),
+                           ("sbb", 0x18), ("and", 0x20), ("sub", 0x28),
+                           ("xor", 0x30), ("cmp", 0x38)):
+            block = self.opcodes(name)
+            self.assertIn(base + 0, block, name)
+            self.assertIn(base + 2, block, name)
+            self.assertIn(base + 2 + 1, block, name)   # +2 direction, +1 word
+            # The accumulator-immediate rows (`04`/`05` for add) are a
+            # different row and carry no `D`, so they stay where the table
+            # puts them.
+            acc = base + 4
+            self.assertIn(acc, block, name)
+            self.assertIn(acc + 1, block, name)
+
+    def test_direction_and_width_compose(self):
+        """`mov` carries `D|W`: all four of `88`, `89`, `8a`, `8b` are real."""
+        block = self.opcodes("mov")
+        for opcode in (0x88, 0x89, 0x8A, 0x8B):
+            self.assertIn(opcode, block)
+        # ... and `8d` is `lea`, which the old one-dimensional expansion
+        # claimed for `mov`.
+        self.assertNotIn(0x8D, block)
+
+    def test_the_compact_simd_moves_pair_by_ten_not_by_one(self):
+        """`Opcode_SIMD_IntD`: `movdqa` is `6f`/`7f`; `6e` is `movd`."""
+        self.assertEqual(self.opcodes("movdqa", map_="0f", pp="66"), [0x6F, 0x7F])
+        self.assertEqual(self.opcodes("movd", map_="0f", pp="66"), [0x6E, 0x7E])
+        # `movq %xmm0,%rax` is `66 0f 7e`, and `66 0f 6f` is `movdqa`.
+        self.assertIn(0x7E, self.opcodes("movq", map_="0f", pp="66"))
+        self.assertNotIn(0x6F, self.opcodes("movq", map_="0f", pp="66"))
+
+    def test_a_commutative_row_keeps_its_opcode(self):
+        """`C` is `#define C StaticRounding`, the commutative bit.
+
+        `test %eax,(%rax)` and `test (%rax),%eax` are both `85 00`, so `86`/`87`
+        -- which are `xchg` -- must not appear under `test`.
+        """
+        self.assertNotIn(0x86, self.opcodes("test"))
+        self.assertNotIn(0x87, self.opcodes("test"))
+        self.assertIn(0x86, self.opcodes("xchg"))
+        self.assertIn(0x87, self.opcodes("xchg"))
+
+    def test_ugh_and_fma4_rows_never_flip(self):
+        """`faddp` is rewritten, not re-encoded; FMA4 puts the order in VEX.W."""
+        self.assertNotIn(0xDA, self.opcodes("faddp"))     # `DA` is `fiadd`
+        self.assertIn(0xDE, self.opcodes("faddp"))
+        # The eight scalar FMA4 spellings are `6a/6b/6e/6f/7a/7b/7e/7f`.
+        self.assertIn(0x6E, self.opcodes("vfmsubss", family="vex", map_="0f3a",
+                                         pp="66"))
+        self.assertNotIn(0x7E, self.opcodes("vfmsubss", family="vex",
+                                            map_="0f3a", pp="66"))
+
+    def test_x87_reverse_is_the_neighbouring_block(self):
+        """`fadd %st,%st(1)` is `DC`, four above `D8` (`Opcode_FloatD`)."""
+        self.assertIn(0xD8, self.opcodes("fadd"))
+        self.assertIn(0xDC, self.opcodes("fadd"))
+
+    def test_mov_to_and_from_the_special_registers_keeps_the_base_scheme(self):
+        """`mov cr/dr/tr` (`0f 20..27`) is exempt from the extended scheme."""
+        block = self.opcodes("mov", map_="0f")
+        for opcode in (0x20, 0x21, 0x22, 0x23, 0x24, 0x26):
+            self.assertIn(opcode, block)
+        self.assertNotIn(0x25, block)     # `0f 25` is not an instruction
+
+    def test_register_in_opcode_rows_expand_over_all_eight_registers(self):
+        """No ModR/M means the register number is the opcode's low three bits."""
+        for opcode in range(0x50, 0x58):
+            self.assertIn(opcode, self.opcodes("push"))
+            self.assertIn(opcode + 0x08, self.opcodes("pop"))
+        self.assertEqual(self.opcodes("bswap", map_="0f"),
+                         list(range(0xC8, 0xD0)))
+        self.assertIn(0xB9, self.opcodes("mov"))
+        self.assertIn(0x91, self.opcodes("xchg"))     # `xchg %eax,%ecx`
+        # ... but only when the row really has a GPR operand in the opcode:
+        # `in $1,%al` is `e4 01`, with the accumulator implied.
+        self.assertEqual(self.opcodes("in")[:2], [0xE4, 0xE5])
+
+
+class GasCodeModelGateTests(unittest.TestCase):
+    """`--verify` gates the code-driven families, not just the declarative rows.
+
+    The ALU, the condition-code spelling, `inc`/`dec` and FMA3 derive their
+    opcodes in code, so before this gate no check looked at them at all: a
+    model could drift from the encoder (or the encoder from `as`) and the only
+    symptom would be a *smaller* gap list.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.gas = _load(CROSSREF, "gas_encoding_crossref")
+        cls.table = cls.gas.load_snapshot()
+
+    def test_every_claim_is_a_form_as_accepts(self):
+        for backend in ("i686", "x86", "all"):
+            with self.subTest(backend=backend):
+                claims = self.gas.code_models(backend, self.table)
+                findings, checked = self.gas.verify_code_models(claims, self.table)
+                self.assertEqual(findings, [])
+                self.assertEqual(checked, sum(len(v) for v in claims.values()))
+                self.assertGreater(len(claims), 100)
+
+    def test_the_cc_and_fma_claims_are_derived_from_the_encoder_tables(self):
+        claims = self.gas.code_models("all", self.table)
+        # `jne` short form, `cmovne` `0f 45`, `setne` `0f 95 /0`.
+        self.assertEqual([e["opcode"] for e in claims["jne"]], [0x75])
+        self.assertEqual([(e["map"], e["opcode"]) for e in claims["cmovne"]],
+                         [("0f", 0x45)])
+        self.assertEqual([(e["map"], e["opcode"], e["reg"])
+                          for e in claims["setne"]], [("0f", 0x95, 0)])
+        # FMA3 reads the opcode out of the mnemonic: `vfmadd132ps` is
+        # VEX.66.0F38.W0 98, and `vfnmsub231sd` is `9e` + `0x20` for the 231
+        # operand order + `1` for the scalar form, with W=1 for `sd`.
+        self.assertEqual(self.gas.fma3_encoding("vfmadd132ps")["opcode"], 0x98)
+        self.assertEqual(self.gas.fma3_encoding("vfnmsub231sd")["opcode"], 0xBF)
+        self.assertIsNone(self.gas.fma3_encoding("vfmaddsub132ss"))
+
+    def test_a_claim_the_oracle_cannot_confirm_is_a_finding(self):
+        bogus = {"add": [self.gas._enc(0x0F)], "not_a_mnemonic":
+                 [self.gas._enc(0x90)]}
+        findings, checked = self.gas.verify_code_models(bogus, self.table)
+        self.assertEqual(checked, 0)
+        self.assertEqual(sorted(f["kind"] for f in findings),
+                         ["CODE-EXTRA", "CODE-UNKNOWN"])
+        self.assertIn("not_a_mnemonic",
+                      [f["name"] for f in findings if f["kind"] == "CODE-UNKNOWN"])
 
 
 if __name__ == "__main__":
