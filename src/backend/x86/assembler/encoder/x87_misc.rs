@@ -364,6 +364,72 @@ impl super::InstructionEncoder {
         }
     }
 
+    /// Encode an x87 instruction whose ModR/M byte is `base + ST(i)`, with
+    /// ST(0) as the implicit other operand (`fcmovb`, `fcomi`, ...).
+    ///
+    /// AT&T spells the source first, so a two-operand form is
+    /// `%st(i), %st` and the register is taken from the *first* operand while
+    /// the second is required to name ST(0).  `default_reg` supplies the
+    /// implicit operand of the bare spelling; `fcmov*` has none, because the
+    /// condition alone does not determine the source register.
+    pub(crate) fn encode_x87_st0_sti(
+        &mut self,
+        ops: &[Operand],
+        opcode: u8,
+        base: u8,
+        default_reg: Option<u8>,
+        name: &str,
+    ) -> Result<(), String> {
+        let n = match ops {
+            [] => default_reg.ok_or_else(|| format!("`{name}' requires an st register operand"))?,
+            [Operand::Register(reg)] => parse_st_num(&reg.name)?,
+            [Operand::Register(first), Operand::Register(second)] => {
+                if parse_st_num(&second.name)? != 0 {
+                    return Err(format!("`{name}' requires %st as its second operand"));
+                }
+                parse_st_num(&first.name)?
+            }
+            _ => return Err(format!("`{name}' requires an st register operand")),
+        };
+        self.bytes.extend_from_slice(&[opcode, base + n]);
+        Ok(())
+    }
+
+    /// Encode fucom (`DD E0+i`, no pop) and fucomp (`DD E8+i`, pop).
+    ///
+    /// The bare spelling compares against ST(1) (SDM Vol. 2B, FUCOM/FUCOMP
+    /// "FUCOM ST(1)"), which is the form x87 exit sequences use.
+    fn encode_x87_unordered_compare(
+        &mut self,
+        ops: &[Operand],
+        base: u8,
+        name: &str,
+    ) -> Result<(), String> {
+        let n = match ops {
+            [] => 1,
+            [Operand::Register(reg)] => parse_st_num(&reg.name)?,
+            [Operand::Register(first), Operand::Register(second)] => {
+                if parse_st_num(&second.name)? != 0 {
+                    return Err(format!("`{name}' requires %st as its second operand"));
+                }
+                parse_st_num(&first.name)?
+            }
+            _ => return Err(format!("`{name}' requires an st register operand")),
+        };
+        self.bytes.extend_from_slice(&[0xDD, base + n]);
+        Ok(())
+    }
+
+    /// Encode fucom (compare unordered, no pop).
+    pub(crate) fn encode_fucom(&mut self, ops: &[Operand]) -> Result<(), String> {
+        self.encode_x87_unordered_compare(ops, 0xE0, "fucom")
+    }
+
+    /// Encode fucomp (compare unordered and pop).
+    pub(crate) fn encode_fucomp(&mut self, ops: &[Operand]) -> Result<(), String> {
+        self.encode_x87_unordered_compare(ops, 0xE8, "fucomp")
+    }
+
     // ---- Bit scan (BSF/BSR) ----
 
     pub(crate) fn encode_bit_scan(

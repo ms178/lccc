@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cross-reference the i686 encoder against GNU as 2.47's own instruction table.
+"""Cross-reference both encoder backends against GNU as 2.47's own instruction table.
 
 Why a second reference
 ----------------------
@@ -29,7 +29,14 @@ What it answers, all offline and from a vendored snapshot
 * ``--missing``  every (mnemonic, encoding) `as` 2.47 accepts that the encoder
                  has no row for, grouped by mnemonic: the implementation
                  worklist, with no alias guessing anywhere.
+* ``--coverage`` write the mnemonics with no encoder row at all to JSON, i.e. the
+                 worklist for instructions the backend does not implement yet.
 * ``--summary``  counts per family/map, and the template-expansion statistics.
+
+`--backend {all,i686,x86}` selects the encoder sources.  The 64-bit backend is
+not a superset of the 32-bit one — x87 integer memory arithmetic, `fcmov*` and
+`fucom*` live only in `i686` — so `--backend all` is the default question worth
+asking before a release.
 
 Provenance
 ----------
@@ -60,6 +67,8 @@ UPSTREAM_PATH = "opcodes/i386-opc.tbl"
 UPSTREAM_REF = "binutils-2_47-branch"
 
 LEGACY_PREFIXES = (0x66, 0xF2, 0xF3)
+
+PP_FOR_BYTE = {0x66: "66", 0xF2: "f2", 0xF3: "f3"}
 
 # Opcodes whose store direction is 0x10 above the load form (SDM Vol. 2B).
 SSE_INT_MOVE = {0x6E, 0x6F, 0x7E, 0x7F}
@@ -335,11 +344,7 @@ def _parse_row(line: str) -> dict | None:
     out = []
     for fam in fams:
         one = dict(enc, family=fam)
-        # GAS writes every AVX/EVEX mnemonic as the legacy mnemonic with a `v`
-        # prefix and carries one row per template; the letter is added by the
-        # front end, not spelled out in the table.
-        one["mnemonic"] = mnemonic if fam == "legacy" or mnemonic.startswith("v") \
-            else "v" + mnemonic
+        one["mnemonic"] = mnemonic
         one["directions"] = _directions(one, attrs)
         out.extend(one["directions"])
     return out
@@ -387,8 +392,10 @@ def _canonical(value: int, ext: int | None, attrs: str) -> dict | None:
     else:
         # VEX/EVEX rows carry the mandatory prefix as a `0x66` byte only in a few
         # SSE2AVX rows; pp comes from the prefix byte when present.
-        while arr and arr[0] in (0x66,):
-            pp = "66"
+        while arr and arr[0] in LEGACY_PREFIXES:
+            # GAS packs the mandatory prefix into the opcode field for the
+            # vector rows too (`shrx` is `0xf2f7`, `shlxl` `0x66f7`).
+            pp = PP_FOR_BYTE[arr[0]]
             arr = arr[1:]
     if map_ is None:
         if arr and arr[0] == 0x0F:
@@ -457,10 +464,14 @@ def build_snapshot(tbl: Path) -> int:
     rows, templates, stats = parse_table(text)
     by_mnemonic: dict[str, list[dict]] = {}
     for row in rows:
-        mnemonic = row["mnemonic"]
-        by_mnemonic.setdefault(mnemonic, []).append(
-            {k: v for k, v in row.items() if k != "mnemonic"}
-        )
+        entry = {k: v for k, v in row.items() if k != "mnemonic"}
+        by_mnemonic.setdefault(row["mnemonic"], []).append(entry)
+        # GAS's front end prepends `v` to the vector-encoded rows, and the table
+        # does not spell the letter out; BMI2 (`shrx`, `bzhi`, ...) and SM4 rows
+        # are VEX-encoded but keep their plain name.  Registering both spellings
+        # is what keeps this exact for either convention.
+        if row["family"] != "legacy" and not row["mnemonic"].startswith("v"):
+            by_mnemonic.setdefault("v" + row["mnemonic"], []).append(entry)
     for name, encodings in by_mnemonic.items():
         seen, unique = set(), []
         for enc in encodings:
@@ -528,6 +539,8 @@ def gas_name(mnemonic: str) -> str:
 
 
 VEX_PAIR = {frozenset(("vex", "legacy")), frozenset(("evex", "legacy"))}
+
+HELPER_OF = re.compile(r"(?:self\.)?([a-z_][a-z0-9_]*)\(")
 
 
 def _same(want: dict, have: dict) -> bool:
@@ -613,6 +626,23 @@ def unimplemented_mnemonics(rows: list[dict], table: dict[str, list[dict]]) -> l
     return sorted(n for n in table if n not in named)
 
 
+def coverage(rows: list[dict], table: dict[str, list[dict]]) -> dict[str, list[dict]]:
+    """Reference encodings for every mnemonic the encoder has no row for."""
+    have = set()
+    for row in rows:
+        for name in row["names"]:
+            have.add(name)
+            have.add(gas_name(name))
+    gap: dict[str, list[dict]] = {}
+    for name in sorted(table):
+        if name in have:
+            continue
+        forms = [e for e in table[name] if e["family"] != "evex"]
+        if forms:
+            gap[name] = forms
+    return gap
+
+
 def _fmt(enc: dict) -> str:
     parts = [enc["family"], enc.get("map") or "-", enc.get("pp") or "-"]
     if enc.get("w") is not None:
@@ -626,11 +656,15 @@ def _fmt(enc: dict) -> str:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--backend", default="i686", choices=["all", "i686", "x86"],
+                    help="encoder backend(s) to check (default: i686)")
     ap.add_argument("--build", metavar="TBL",
                     help="regenerate the snapshot from an i386-opc.tbl")
     ap.add_argument("--verify", action="store_true", help="check every encoder row")
     ap.add_argument("--missing", action="store_true", help="encodings the encoder lacks")
     ap.add_argument("--absent", action="store_true", help="mnemonics with no row at all")
+    ap.add_argument("--coverage", metavar="OUT",
+                    help="write a JSON worklist of mnemonics with no encoder row")
     ap.add_argument("--summary", action="store_true")
     ap.add_argument("--strict", action="store_true", help="non-zero exit on findings")
     ap.add_argument("--limit", type=int, default=0)
@@ -644,8 +678,15 @@ def main() -> int:
 
     table = load_snapshot()
     rows = []
-    for path in sdm.ENCODER_FILES:
+    files = sdm.encoder_files(args.backend)
+    for path in files:
         rows.extend(sdm.extract_rows(Path(path).resolve()))
+    # REX (`40..4F`) is a prefix in the 64-bit encoder and an inc/dec opcode in
+    # the 32-bit one, so the model has to know which backend it is reading.
+    # The mode that gives a byte array its meaning is a property of the row's
+    # backend, not of the whole run: `--backend all` mixes both.
+    model = sdm.model_any if args.backend == "all" else (
+        (lambda row: sdm.model_row(row, True)) if args.backend == "x86" else sdm.model_row)
 
     if args.summary or not (args.verify or args.missing or args.absent):
         manifest = json.loads(MANIFEST.read_text())
@@ -654,10 +695,10 @@ def main() -> int:
               f"{manifest['stats']['declarations']} templates, "
               f"{manifest['stats']['instantiations']} instantiation rows, "
               f"{manifest['stats']['skipped']} skipped")
-        print(f"encoder rows:  {len(rows)} in {len(sdm.ENCODER_FILES)} files")
+        print(f"encoder rows:  {len(rows)} in {len(files)} files")
 
     if args.verify:
-        findings, unmodeLLed, checked = verify(rows, table, sdm.model_row)
+        findings, unmodeLLed, checked = verify(rows, table, model)
         print(f"\nrows checked against as 2.47: {checked}")
         print(f"findings: {len(findings)}   unmodeLLed rows: {len(unmodeLLed)}")
         shown = 0
@@ -669,20 +710,39 @@ def main() -> int:
             want = f" [{_fmt(f['want'])}]" if f["want"] else ""
             print(f"  {f['kind']:13s} {f['name']:14s} {f['file']}:{f['line']}{want}")
             print(f"                {f['body'][:110]}")
-        for row in unmodeLLed[: args.limit or len(unmodeLLed)]:
-            print(f"  UNMODELLED    {row['names'][0]:14s} {row['file']}:{row['line']}")
-            print(f"                {row['body'][:110]}")
+        # A row the model cannot read is only actionable when it is a binding
+        # the model *should* understand; the hundreds that come from prefix and
+        # tuple tables are pure noise, so they are counted by helper instead of
+        # listed one by one.  `--limit` still prints individual rows on demand.
+        if unmodeLLed:
+            groups: dict[str, int] = {}
+            for row in unmodeLLed:
+                helper = HELPER_OF.search(row["body"])
+                key = helper.group(1) if helper else row["body"].split("(")[0].strip()
+                groups[key] = groups.get(key, 0) + 1
+            for key in sorted(groups, key=lambda k: (-groups[k], k)):
+                print(f"  UNMODELLED    {groups[key]:5d} rows via {key}")
+            for row in unmodeLLed[: args.limit]:
+                print(f"  UNMODELLED    {row['names'][0]:14s} {row['file']}:{row['line']}")
+                print(f"                {row['body'][:110]}")
         if args.strict and findings:
             return 1
 
     if args.missing:
-        gaps = missing(rows, table, sdm.model_row)
+        gaps = missing(rows, table, model)
         total = sum(len(v) for v in gaps.values())
         print(f"\nencodings as 2.47 accepts that the encoder has no row for: {total} "
               f"across {len(gaps)} mnemonics already implemented")
         for name in sorted(gaps):
             forms = ", ".join(_fmt(e) for e in gaps[name])
             print(f"  {name:14s} {forms}")
+
+    if args.coverage:
+        gap = coverage(rows, table)
+        Path(args.coverage).write_text(json.dumps(gap, indent=1, sort_keys=True) + "\n")
+        legal = sum(len(v) for v in gap.values())
+        print(f"\nmnemonics with no encoder row (written to {args.coverage}): {len(gap)}"
+              f" carrying {legal} reference encodings")
 
     if args.absent:
         absent = unimplemented_mnemonics(rows, table)

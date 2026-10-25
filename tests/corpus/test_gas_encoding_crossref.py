@@ -4,7 +4,8 @@ The differential harness compares LCCC against `as` 2.47 byte for byte, but only
 for the instructions a corpus happens to contain.  ``scripts/gas_encoding_crossref.py``
 closes that gap: it expands `opcodes/i386-opc.tbl` — GNU as 2.47's own
 instruction table, including its template blocks — into a vendored snapshot, and
-checks every declarative row of the i686 encoder against it.
+checks every declarative row of *both* encoder backends (`i686` and `x86`)
+against it.
 
 This test runs that check hermetically (no network, no reference file) so a row
 that is added with a wrong opcode, prefix, map or `/digit` fails in CI even when
@@ -19,6 +20,10 @@ The snapshot is regenerated from upstream with::
 
 ``scripts/isa/gas-2.47.manifest.json`` records the upstream path, ref and blob
 digest of the table the snapshot was built from.
+
+The two backends differ in one thing the model cannot infer from a row: `40..4F`
+is a REX prefix in 64-bit mode and an `inc`/`dec` opcode in 32-bit mode, so the
+mode is taken from the row's own path (`sdm.model_any`).
 """
 
 from __future__ import annotations
@@ -78,6 +83,47 @@ class GasEncodingCrossrefTests(unittest.TestCase):
                 for f in findings[:20]
             ),
         )
+
+    def test_both_backends_are_legal_encodings(self):
+        rows = []
+        for path in self.sdm.encoder_files("all"):
+            rows.extend(self.sdm.extract_rows(Path(path).resolve()))
+        findings, unmodeLLed, checked = self.gas.verify(rows, self.table, self.sdm.model_any)
+        self.assertGreater(checked, 900)
+        self.assertLess(len(unmodeLLed), len(rows))
+        self.assertEqual(
+            findings,
+            [],
+            "\n".join(
+                f"{f['kind']} {f['name']} at {f['file']}:{f['line']}: {f['body']}"
+                for f in findings[:20]
+            ),
+        )
+
+    def test_32_bit_inc_dec_is_not_read_as_a_rex_prefix(self):
+        # `40` is `inc %eax` in 32-bit mode, so a 32-bit row must keep it; the
+        # 64-bit backend reads the same byte as a REX prefix.
+        row = {"file": "src/backend/i686/assembler/encoder/mod.rs", "line": 1,
+               "names": ["incl"], "body": "self.encode_inc_dec(ops, 0x40)", "arrays": [[0x40]]}
+        self.assertFalse(self.sdm.row_is_64bit(row))
+        self.assertEqual(self.sdm.model_any(row)[0]["opcode"], 0x40)
+        self.assertTrue(self.sdm.row_is_64bit({**row, "file": row["file"].replace("i686", "x86")}))
+
+    def test_coverage_lists_only_mnemonics_without_a_row(self):
+        table = {
+            # Implemented: must not appear in the worklist.
+            "addl": [{"family": "legacy", "map": "none", "pp": "none",
+                      "opcode": 0x01, "w": None, "reg": None}],
+            # VEX-encoded and unimplemented, and EVEX-only (out of scope for a
+            # VEX/legacy backend), which the worklist drops.
+            "vmptrld": [{"family": "vex", "map": "0f38", "pp": "none",
+                         "opcode": 0x06, "w": None, "reg": 6}],
+            "vpaddd": [{"family": "evex", "map": "0f", "pp": "66",
+                        "opcode": 0xFE, "w": None, "reg": None}],
+        }
+        rows = [{"file": "x", "line": 1, "names": ["addl"],
+                 "body": "self.encode_alu(ops)", "arrays": []}]
+        self.assertEqual(sorted(self.gas.coverage(rows, table)), ["vmptrld"])
 
     def test_core_isa_encodings_are_pinned(self):
         """A spot check so a snapshot regenerated from the wrong branch fails."""

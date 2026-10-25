@@ -2691,12 +2691,16 @@ impl InstructionEncoder {
             "fidivrl" => self.encode_x87_mem(ops, &[0xDA], 7),
             // x87 conditional moves and the SSE-era compare-into-flags forms.
             "fcmovb" => self.encode_x87_st0_sti(ops, 0xDA, 0xC0, None, "fcmovb"),
+            "fcmovnae" => self.encode_x87_st0_sti(ops, 0xDA, 0xC0, None, "fcmovnae"),
             "fcmove" => self.encode_x87_st0_sti(ops, 0xDA, 0xC8, None, "fcmove"),
             "fcmovbe" => self.encode_x87_st0_sti(ops, 0xDA, 0xD0, None, "fcmovbe"),
+            "fcmovna" => self.encode_x87_st0_sti(ops, 0xDA, 0xD0, None, "fcmovna"),
             "fcmovu" => self.encode_x87_st0_sti(ops, 0xDA, 0xD8, None, "fcmovu"),
             "fcmovnb" => self.encode_x87_st0_sti(ops, 0xDB, 0xC0, None, "fcmovnb"),
+            "fcmovae" => self.encode_x87_st0_sti(ops, 0xDB, 0xC0, None, "fcmovae"),
             "fcmovne" => self.encode_x87_st0_sti(ops, 0xDB, 0xC8, None, "fcmovne"),
             "fcmovnbe" => self.encode_x87_st0_sti(ops, 0xDB, 0xD0, None, "fcmovnbe"),
+            "fcmova" => self.encode_x87_st0_sti(ops, 0xDB, 0xD0, None, "fcmova"),
             "fcmovnu" => self.encode_x87_st0_sti(ops, 0xDB, 0xD8, None, "fcmovnu"),
             "fcomi" => self.encode_x87_st0_sti(ops, 0xDB, 0xF0, Some(1), "fcomi"),
             "ffreep" => self.encode_x87_st0_sti(ops, 0xDF, 0xC0, None, "ffreep"),
@@ -4334,6 +4338,13 @@ mod x87_integer_and_conditional_tests {
             ("fcmovnbe %st(7)", "db d7"),
             ("fcmovnu %st(1)", "db d9"),
             ("fcmovb %st(1),%st", "da c1"),
+            // `a`/`ae`/`na`/`nae` are the integer names of the same four
+            // status-word tests (above = not below-or-equal), so they decode
+            // onto the B/NB/BE/NBE encodings instead of inventing new ones.
+            ("fcmovnae %st(1)", "da c1"),
+            ("fcmovna %st(3)", "da d3"),
+            ("fcmovae %st(5)", "db c5"),
+            ("fcmova %st(7)", "db d7"),
             ("ffreep %st(3)", "df c3"),
             ("ffreep %st", "df c0"),
         ] {

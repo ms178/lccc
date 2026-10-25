@@ -68,14 +68,36 @@ REPO = Path(__file__).resolve().parent.parent
 ISA_DIR = REPO / "scripts" / "isa"
 CATALOGUE = ISA_DIR / "catalogue.json"
 MANIFEST = ISA_DIR / "MANIFEST.json"
-ENCODER_FILES = [
-    "src/backend/i686/assembler/encoder/mod.rs",
-    "src/backend/i686/assembler/encoder/gp_integer.rs",
-    "src/backend/i686/assembler/encoder/sse.rs",
-    "src/backend/i686/assembler/encoder/vex.rs",
-    "src/backend/i686/assembler/encoder/x87.rs",
-    "src/backend/i686/assembler/encoder/system.rs",
-]
+# Both assemblers are in scope: the 32-bit encoder is not the only one that
+# emits these bytes, and a table cross-reference that only covers half the
+# backends hides defects in the other half.
+BACKENDS = {
+    "i686": [
+        "src/backend/i686/assembler/encoder/mod.rs",
+        "src/backend/i686/assembler/encoder/gp_integer.rs",
+        "src/backend/i686/assembler/encoder/sse.rs",
+        "src/backend/i686/assembler/encoder/vex.rs",
+        "src/backend/i686/assembler/encoder/x87.rs",
+        "src/backend/i686/assembler/encoder/system.rs",
+    ],
+    "x86": [
+        "src/backend/x86/assembler/encoder/mod.rs",
+        "src/backend/x86/assembler/encoder/gp_integer.rs",
+        "src/backend/x86/assembler/encoder/sse.rs",
+        "src/backend/x86/assembler/encoder/avx.rs",
+        "src/backend/x86/assembler/encoder/x87_misc.rs",
+        "src/backend/x86/assembler/encoder/core.rs",
+        "src/backend/x86/assembler/encoder/system.rs",
+    ],
+}
+ENCODER_FILES = BACKENDS["i686"]
+
+
+def encoder_files(backend: str = "i686") -> list[str]:
+    """Encoder sources of `backend` (`i686`, `x86`, or `all`)."""
+    if backend == "all":
+        return [f for files in BACKENDS.values() for f in files]
+    return list(BACKENDS[backend])
 
 # Reference files, as published by intelxed/xed.  XED's ISA descriptions are
 # generated from and validated against the Intel Software Developer's Manual;
@@ -123,6 +145,67 @@ HELPERS = {
     "encode_avx_broadcast": ("0f38", "66", None, None),
 }
 
+# The 64-bit encoder spells the same information as *arguments*: an opcode-map
+# number (1 = 0F, 2 = 0F38, 3 = 0F3A), a mandatory-prefix number (0 = none,
+# 1 = 66, 2 = F3, 3 = F2), a W bit and the opcode byte.  Reading the argument
+# positions out of the source (not out of a naming convention) is what makes
+# this exact: the models below were taken from the helper bodies, and each one
+# says which argument carries what.
+METHOD_MAP = {1: "0f", 2: "0f38", 3: "0f3a"}
+KOPMASK_SIZE = {8: ("none", 1), 4: ("66", 1), 2: ("none", 0), 1: ("66", 0)}
+
+
+def _evex_five(map_idx: int = 1, pp_idx: int = 2, w_idx: int = 3, opcode_idx: int = 4) -> dict:
+    return {"family": "evex", "map": ("argmap", map_idx), "pp": ("argpp", pp_idx),
+            "w": ("arg", w_idx), "opcode": opcode_idx}
+
+
+HELPER_SPEC = {
+    # EVEX: (ops, map, pp, w, opcode), with extra trailing parameters on some.
+    "encode_evex_binary": _evex_five(),
+    "encode_evex_unary": _evex_five(),
+    "encode_evex_binary_scalar": _evex_five(),
+    "encode_evex_binary_scalar_elem": _evex_five(),
+    "encode_evex_3src_imm": _evex_five(),
+    "encode_evex_3src_imm_sae": _evex_five(),
+    # (ops, mnemonic, map, pp, w, opcode, ...)
+    "encode_evex_cmp_mask": _evex_five(2, 3, 4, 5),
+    # (ops, opcode, pp)
+    # (ops, opcode, pp): the body emits `emit_vex(.., 2, 0, ..)`, so W is
+    # fixed at 0 even though the mnemonic family varies its mandatory prefix.
+    "encode_avx_3op_38_pp": {"family": "vex", "map": ("const", "0f38"),
+                             "pp": ("argpp", 2), "w": ("const", 0), "opcode": 1},
+    # (ops, opcode, pp, mnemonic) -> VEX.128.0F: `emit_vex(.., mm = 1, ..)`.
+    "encode_avx_scalar_3op": {"family": "vex", "map": ("const", "0f"),
+                              "pp": ("argpp", 2), "w": ("const", 0), "opcode": 1},
+    "encode_avx_3op_38_pp_w1": {"family": "vex", "map": ("const", "0f38"),
+                                "pp": ("argpp", 2), "w": 1, "opcode": 1},
+    # (ops, opcode, base, default_reg, name): `fcmov*` is DA/DB with the
+    # condition in the ModR/M reg field, i.e. reg = (base & 0x38) >> 3.
+    "encode_x87_st0_sti": {"family": "legacy", "map": ("const", "none"),
+                           "pp": ("const", "none"), "w": None,
+                           "opcode": ("arg", 1), "reg": ("x87_base", 2)},
+    # (ops) with the byte pair fixed in the helper: fucom DD /4, fucomp DD /5.
+    "encode_fucom": {"family": "legacy", "map": ("const", "none"),
+                     "pp": ("const", "none"), "w": None,
+                     "opcode": ("const", 0xDD), "reg": ("const", 4)},
+    "encode_fucomp": {"family": "legacy", "map": ("const", "none"),
+                      "pp": ("const", "none"), "w": None,
+                      "opcode": ("const", 0xDD), "reg": ("const", 5)},
+    # (ops, &[map, opcode], /digit): `vldmxcsr`/`vstmxcsr`, VEX.0F AE /2 /3.
+    "encode_vex_mem_only": {"family": "vex", "map": ("argbytes_map", 1),
+                            "pp": ("const", "none"), "w": 0,
+                            "opcode": ("argbytes_last", 1), "reg": ("arg", 2)},
+    # (ops, opcode, pp, w): BMI2 is VEX.0F38 with the W bit selecting 32/64.
+    "encode_bmi2_shift": {"family": "vex", "map": ("const", "0f38"),
+                          "pp": ("argpp", 2), "w": ("arg", 3), "opcode": 1},
+    # (ops, opcode, size): opmask arithmetic, VEX.L0.66.0F, w/pp from the size.
+    "encode_kopmask_3op": {"family": "vex", "map": ("const", "0f"),
+                           "pp": ("kopmask", 2, 0), "w": ("kopmask", 2, 1), "opcode": 1},
+    "encode_kopmask_2op": {"family": "vex", "map": ("const", "0f"),
+                           "pp": ("kopmask", 2, 0), "w": ("kopmask", 2, 1), "opcode": 1},
+}
+
 PP_BY_INDEX = {0: "none", 1: "66", 2: "f3", 3: "f2"}
 PP_BY_BYTE = {0x66: "66", 0xF3: "f3", 0xF2: "f2"}
 PP_BYTE_PREFIXES = (0x66, 0xF2, 0xF3)
@@ -156,6 +239,11 @@ ALIASES = {
     "jl": "JL", "jge": "JNL", "jle": "JLE", "jg": "JNLE",
     "js": "JS", "jns": "JNS", "jo": "JO", "jno": "JNO", "jp": "JP", "jnp": "JNP",
     "shl": "SHL", "sal": "SHL", "shldl": "SHLD", "shrdl": "SHRD",
+    # FCMOVcc is documented under both spellings: `a`/`ae`/`na`/`nae` name the
+    # same arithmetic condition the integer CMOVcc uses, i.e. not-below-or-equal
+    # and friends, which XED catalogues as the NBE/NB/BE/B forms (SDM Vol. 2B).
+    "fcmova": "FCMOVNBE", "fcmovae": "FCMOVNB",
+    "fcmovna": "FCMOVBE", "fcmovnae": "FCMOVB",
     "movsbl": "MOVSX", "movswl": "MOVSX", "movsbw": "MOVSX", "movzb": "MOVZX",
     "movzbl": "MOVZX", "movzwl": "MOVZX", "movzbw": "MOVZX",
     "cltd": "CDQ", "cwtl": "CWDE", "cbtw": "CBW", "cwtd": "CWD",
@@ -320,11 +408,125 @@ def extract_rows(path: Path) -> list[dict]:
     return rows
 
 
-def model_row(row: dict) -> list[dict] | None:
+def _model_spec_helper(name: str, body: str, b64: bool = False) -> list[dict] | None:
+    """Read a helper call through `HELPER_SPEC`.
+
+    The argument positions come from the helper bodies in the 64-bit encoder, so
+    a helper whose parameters are reordered fails here as UNMODELLED instead of
+    being modelled with the old layout.
+    """
+    spec = HELPER_SPEC[name]
+    # A helper argument can itself carry parentheses (`encode_x87_st0_sti(ops,
+    # 0xDF, 0xF0, Some(1), "fcomip")`), so the argument list is delimited by
+    # balancing brackets from the call's own `(` and not by the first `)`.
+    start = body.find("(", body.find(name) + len(name))
+    if start < 0:
+        return None
+    depth_args, end = 0, -1
+    for i in range(start, len(body)):
+        if body[i] == "(":
+            depth_args += 1
+        elif body[i] == ")":
+            depth_args -= 1
+            if depth_args == 0:
+                end = i
+                break
+    if end < 0:
+        return None
+    vals, depth, cur = [], 0, ""
+    for ch in body[start + 1 : end]:
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+        if ch == "," and depth == 0:
+            vals.append(cur.strip())
+            cur = ""
+        else:
+            cur += ch
+    vals.append(cur.strip())
+
+    def byte_array(idx: int) -> list[int]:
+        raw = vals[idx]
+        inner = raw[raw.index("[") + 1 : raw.rindex("]")]
+        return [int(v.strip(), 16) for v in inner.split(",") if v.strip()]
+
+    def take(rule):
+        if rule is None:
+            return None
+        kind = rule[0]
+        if kind == "const":
+            return rule[1]
+        idx = rule[1]
+        if idx >= len(vals):
+            raise ValueError("missing argument")
+        raw = vals[idx]
+        if kind == "argmap":
+            return METHOD_MAP.get(int(raw, 0))
+        if kind == "argpp":
+            return PP_BY_INDEX.get(int(raw, 0))
+        if kind == "argbytes_map":
+            arr = byte_array(idx)
+            stripped = legacy_encoding(arr, b64)
+            return None if stripped is None else stripped["map"]
+        if kind == "argbytes_last":
+            return byte_array(idx)[-1]
+        if kind == "kopmask":
+            pair = KOPMASK_SIZE.get(int(vals[idx], 0))
+            return None if pair is None else pair[rule[2]]
+        if kind == "x87_base":
+            # DA C0 -> /0, DA D0 -> /2, DB D8 -> /3.
+            return (int(raw, 0) & 0x38) >> 3
+        if kind == "arg":
+            return int(raw, 0)
+        raise ValueError(f"bad spec {rule!r}")
+
+    # A spec may spell the opcode as a rule (`("arg", 1)`, `("const", "dd")`) or
+    # as a bare literal; both mean "this is where the opcode byte comes from".
+    opcode_rule = spec["opcode"]
+    if not isinstance(opcode_rule, tuple):
+        opcode_rule = ("arg", opcode_rule) if isinstance(opcode_rule, int) else ("const", opcode_rule)
+
+    try:
+        enc = {
+            "family": spec["family"],
+            "map": take(spec["map"]),
+            "pp": take(spec["pp"]),
+            "w": take(spec["w"]),
+            "opcode": take(opcode_rule),
+            "modrm": True,
+            "reg": take(spec.get("reg")),
+        }
+    except (ValueError, TypeError):
+        return None
+    if enc["map"] is None or enc["pp"] is None:
+        return None
+    return [enc]
+
+
+def row_is_64bit(row: dict) -> bool:
+    """Whether a row comes from the 64-bit encoder.
+
+    The two backends share the SDM-format model but differ in one respect that
+    changes the meaning of the bytes: `40..4F` is a REX prefix in 64-bit mode
+    and an `inc`/`dec` opcode in 32-bit mode.  Deciding per row from its path
+    keeps `--backend all` correct instead of applying one mode to both.
+    """
+    return "/i686/" not in row["file"].replace("\\", "/")
+
+
+def model_any(row: dict) -> list[dict] | None:
+    """Model a row with the mode implied by the backend that declares it."""
+    return model_row(row, row_is_64bit(row))
+
+
+def model_row(row: dict, b64: bool = False) -> list[dict] | None:
     """Interpret one encoder row as SDM-comparable encodings."""
     body = row["body"]
     encs: list[dict] = []
     helper = re.match(r"self\.(encode_[a-z0-9_]+)\(", body)
+    if helper and helper.group(1) in HELPER_SPEC:
+        return _model_spec_helper(helper.group(1), body, b64)
     if helper and helper.group(1) in HELPERS:
         name = helper.group(1)
         map_, fixed_pp, pp_idx, w = HELPERS[name]
@@ -361,14 +563,14 @@ def model_row(row: dict) -> list[dict] | None:
             ext = int(vals[-1], 0)
         except ValueError:
             return None
-        enc = legacy_encoding(row["arrays"][0])
+        enc = legacy_encoding(row["arrays"][0], b64)
         if enc is None:
             return None
         enc["reg"] = ext
         return [enc]
     if row["arrays"]:
         for arr in row["arrays"]:
-            enc = legacy_encoding(arr)
+            enc = legacy_encoding(arr, b64)
             if enc is None:
                 return None
             encs.append(enc)
@@ -421,7 +623,7 @@ def model_row(row: dict) -> list[dict] | None:
     return None
 
 
-def legacy_encoding(arr: list[int]) -> dict | None:
+def legacy_encoding(arr: list[int], b64: bool = False) -> dict | None:
     """`&[0x66, 0x0F, 0x58]` -> (map, pp, opcode).
 
     `0x66` and `0xF2`/`0xF3` are not alternatives: the SSE mandatory prefix is
@@ -431,6 +633,13 @@ def legacy_encoding(arr: list[int]) -> dict | None:
     """
     pp = "none"
     seen_66 = False
+    if b64:
+        # In 64-bit mode `40..4F` is a REX prefix, not an inc/dec opcode: it
+        # carries W/R/X/B and no encoding information of its own here.  Only
+        # strip it for the 64-bit backend — in the 32-bit encoder `&[0x40]` is
+        # `inc %eax`.
+        while arr and 0x40 <= arr[0] <= 0x4F:
+            arr = arr[1:]
     while arr and arr[0] in PP_BYTE_PREFIXES:
         if arr[0] == 0x66:
             seen_66 = True
@@ -466,12 +675,13 @@ def _matches(want: dict, have: dict) -> bool:
     return True
 
 
-def verify(catalogue: dict, files: list[Path], verbose: bool) -> tuple[list, list]:
+def verify(catalogue: dict, files: list[Path], verbose: bool,
+           b64: bool = False) -> tuple[list, list]:
     findings, unmodeLLed = [], []
     verified = 0
     for path in files:
         for row in extract_rows(path):
-            encs = model_row(row)
+            encs = model_row(row, b64)
             if encs is None:
                 unmodeLLed.append(row)
                 continue
@@ -530,6 +740,8 @@ def build_catalogue(out: Path, manifest_out: Path, ref_dir: Path) -> int:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--catalogue", default=str(CATALOGUE))
+    ap.add_argument("--backend", default="all", choices=["all", *BACKENDS],
+                    help="encoder backend(s) to check (default: all)")
     ap.add_argument("--list-rows", nargs="*", default=None,
                     help="verify only these encoder files (repo-relative)")
     ap.add_argument("--strict", action="store_true",
@@ -558,8 +770,9 @@ def main() -> int:
     catalogue = json.loads(cat_path.read_text())
 
     files = ([REPO / f for f in args.list_rows] if args.list_rows
-             else [REPO / f for f in ENCODER_FILES if (REPO / f).is_file()])
-    findings, unmodeLLed = verify(catalogue, files, verbose=True)
+             else [REPO / f for f in encoder_files(args.backend) if (REPO / f).is_file()])
+    b64 = args.backend != "i686"
+    findings, unmodeLLed = verify(catalogue, files, verbose=True, b64=b64)
     implemented = {c for f in files for r in extract_rows(f)
                    for n in r["names"] for c in _upper_class(n)}
 
