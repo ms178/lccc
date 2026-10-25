@@ -70,6 +70,29 @@ jobs:
           )
           sha256sum target/fastbuild/lccc "$RUNNER_TEMP/research-main-target/fastbuild/lccc" \
             > results/research/compiler-binaries.sha256
+      - name: Dual-mode native AVX API contracts with exact current tools
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(gcc-16 -dumpfullversion)" = 16.2.0
+          for family in avx_vtest_sign_bits avx2_widen_native; do
+            python3 scripts/ci_test_report.py -- \
+              python3 tests/regression/run_regression.py \
+                --lccc target/fastbuild/lccc --gcc gcc-16 -j 2 \
+                --filter "$family" --json "results/research/$family.json"
+          done
+          python3 - <<'PYCONTRACT'
+          import json
+          from pathlib import Path
+          for family in ('avx_vtest_sign_bits', 'avx2_widen_native'):
+              report = json.loads(Path(f'results/research/{family}.json').read_text())
+              expected = {'total': 2, 'passed': 2, 'failed': 0, 'skipped_compare': 0, 'skipped_run': 0}
+              actual = {key: report[key] for key in expected}
+              if actual != expected:
+                  raise SystemExit(f'{family}: required real amd64+i686 execution, got {actual}')
+              print(f'::notice title=Native AVX dual-mode execution::{family}: {json.dumps(actual, sort_keys=True)}; GCC 16.2.0')
+          PYCONTRACT
       - name: Same-host before/after/vendor portable and native comparisons
         timeout-minutes: 45
         shell: bash

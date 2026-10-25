@@ -115,3 +115,16 @@ Two additional isolated controls prove missing headers stop before network
 access and that bootstrap explicitly installs the correct architecture's
 headers. All eight provisioning tests pass; the real hosted rebuild remains
 required before any instrumentation result can be accepted.
+
+Hosted run 40236162609 successfully built Valgrind 3.28.0 and passed its real
+amd64/i386 smoke checks after the header correction. Candidate and baseline
+fastbuilds succeeded and the paired native/portable experiment began. Main
+CI's assertions/corpus, feature gate, assembler/linker and codegen contracts
+also passed, but some legacy lanes still provision a rolling GCC 16.0.1 and
+distribution Valgrind; those are not presented as the required current-tool
+instrumentation evidence. Add a dedicated research acceptance step using the
+already authenticated exact GCC 16.2.0/GAS/mold environment. It runs both API
+families' default-O2 exhaustive fixtures and their i686 entries, requires
+exactly two passes per family with zero skips, and publishes those counts as
+check annotations. This does not claim all optimization levels or complete
+public SIMD ABI migration.
