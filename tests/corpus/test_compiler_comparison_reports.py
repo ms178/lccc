@@ -179,7 +179,10 @@ class ComparisonReport(unittest.TestCase):
 
 class HostedComparison(unittest.TestCase):
     def workflow(self):
-        import yaml
+        try:
+            import yaml
+        except ModuleNotFoundError:  # pragma: no cover - host dependency
+            self.skipTest("PyYAML is required to read compiler-comparison.yml")
         return yaml.load((ROOT / '.github/workflows/compiler-comparison.yml').read_text(), Loader=yaml.BaseLoader)
 
     def test_research_is_explicitly_opted_in_without_widening_token_permissions(self):

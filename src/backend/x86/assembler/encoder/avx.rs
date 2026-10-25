@@ -552,6 +552,37 @@ pub(crate) fn check_vex_same_vector_width(mnemonic: &str, ops: &[Operand]) -> Re
     Ok(())
 }
 
+/// Enforce the packed same-width rule for every EVEX entry point: all vector
+/// REGISTER operands must agree on `%xmm`/`%ymm`/`%zmm`, otherwise GAS 2.47
+/// reports `register type mismatch`.
+///
+/// `allow_mixed` exists for the forms whose shapes admit differing widths; the
+/// caller then only wants the operands' own validation, not this rule.
+///
+/// This replaces three copies of the same code that collected every width into
+/// a `Vec::with_capacity(n)` and then searched for a neighbouring mismatch: one
+/// heap allocation per vector instruction to answer a question that fits in a
+/// single `u8`. "Some adjacent pair differs" is "some element differs from the
+/// first" on an ordered sequence, so the first width is remembered and each
+/// later one is compared against it.
+pub(crate) fn check_evex_vector_widths(ops: &[Operand], allow_mixed: bool) -> Result<(), String> {
+    if allow_mixed {
+        return Ok(());
+    }
+    let mut agreed: Option<u8> = None;
+    for op in ops {
+        if let Operand::Register(reg) = op
+            && let Some(current) = vec_width(&reg.name)
+        {
+            if agreed.is_some_and(|previous| previous != current) {
+                return Err(REG_TYPE_MISMATCH.to_string());
+            }
+            agreed = Some(current);
+        }
+    }
+    Ok(())
+}
+
 /// Validate EVEX lane-insert shapes before the generic three-source encoder
 /// derives LL from the widest operand. The inserted lane is XMM for x4 and
 /// YMM for x8; the base and destination must have the same width, and the
@@ -1149,28 +1180,7 @@ impl super::InstructionEncoder {
             // agree on xmm/ymm/zmm (sentinel — the dispatcher attaches
             // the mnemonic). Without it a mixed spelling silently encodes
             // with the widest operand's L'L and a truncated register field.
-            let width = |name: &str| -> Option<u8> {
-                if is_zmm(name) {
-                    Some(2)
-                } else if is_ymm(name) {
-                    Some(1)
-                } else if is_xmm(name) {
-                    Some(0)
-                } else {
-                    None
-                }
-            };
-            let mut widths: Vec<u8> = Vec::with_capacity(3);
-            for op in ops {
-                if let Operand::Register(r) = op
-                    && let Some(vw) = width(&r.name)
-                {
-                    widths.push(vw);
-                }
-            }
-            if widths.windows(2).any(|p| p[0] != p[1]) {
-                return Err(REG_TYPE_MISMATCH.to_string());
-            }
+            check_evex_vector_widths(ops, false)?;
         }
         let vl_ll = Self::evex_ll(ops);
         let (sae_bcst, ll) =
@@ -2044,30 +2054,7 @@ impl super::InstructionEncoder {
         // xmm/ymm/zmm (GAS 2.47 byte-probed on vpternlogd: mixed →
         // `register type mismatch'); the sentinel is attached by the
         // dispatcher's r() wrapper.
-        {
-            let width = |name: &str| -> Option<u8> {
-                if is_zmm(name) {
-                    Some(2)
-                } else if is_ymm(name) {
-                    Some(1)
-                } else if is_xmm(name) {
-                    Some(0)
-                } else {
-                    None
-                }
-            };
-            let mut widths: Vec<u8> = Vec::with_capacity(4);
-            for op in ops {
-                if let Operand::Register(r) = op
-                    && let Some(vw) = width(&r.name)
-                {
-                    widths.push(vw);
-                }
-            }
-            if !allow_mixed && widths.windows(2).any(|p| p[0] != p[1]) {
-                return Err(REG_TYPE_MISMATCH.to_string());
-            }
-        }
+        check_evex_vector_widths(ops, allow_mixed)?;
 
         // Head-position decorator on an imm8-first form: GAS reports the
         // placement, not the decorator.
@@ -2254,30 +2241,7 @@ impl super::InstructionEncoder {
         // xmm/ymm/zmm (GAS 2.47: `vcmpps $0, %ymm5, %zmm6, %k5` is
         // `register type mismatch`; previously a silent false accept
         // that encoded with the widest operand's LL).
-        {
-            let width = |name: &str| -> Option<u8> {
-                if is_zmm(name) {
-                    Some(2)
-                } else if is_ymm(name) {
-                    Some(1)
-                } else if is_xmm(name) {
-                    Some(0)
-                } else {
-                    None
-                }
-            };
-            let mut widths: Vec<u8> = Vec::with_capacity(3);
-            for op in rest {
-                if let Operand::Register(r) = op
-                    && let Some(vw) = width(&r.name)
-                {
-                    widths.push(vw);
-                }
-            }
-            if widths.windows(2).any(|p| p[0] != p[1]) {
-                return Err(REG_TYPE_MISMATCH.to_string());
-            }
-        }
+        check_evex_vector_widths(rest, false)?;
         let vl_ll = Self::evex_ll(rest);
         if scalar_tuple != 0 && vl_ll != 0 {
             return Err(CMP_SIZE_MISMATCH.to_string());
@@ -6984,5 +6948,65 @@ impl super::InstructionEncoder {
             }
             _ => Err("unsupported AVX extract-gpr operands".to_string()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reg(name: &str) -> Operand {
+        Operand::Register(Register::new(name))
+    }
+
+    /// The rule the three EVEX entry points share: a uniform spelling passes at
+    /// every width, a mixed one is `register type mismatch`. This is the check
+    /// that used to be made by collecting the widths into a `Vec` per
+    /// instruction, so the equivalence between "adjacent pair differs" and
+    /// "element differs from the first" is pinned here rather than reasoned
+    /// about at each call site.
+    #[test]
+    fn evex_vector_widths_must_agree() {
+        for width in ["xmm", "ymm", "zmm"] {
+            let ops = [
+                reg(&format!("{width}3")),
+                reg(&format!("{width}4")),
+                reg(&format!("{width}5")),
+            ];
+            assert!(check_evex_vector_widths(&ops, false).is_ok());
+        }
+        for (first, second) in [("xmm", "ymm"), ("ymm", "zmm"), ("xmm", "zmm")] {
+            let ops = [
+                reg(&format!("{first}1")),
+                reg(&format!("{second}2")),
+                reg("zmm3"),
+            ];
+            assert!(check_evex_vector_widths(&ops, false).is_err());
+        }
+        // A mismatch that is not adjacent to the first element either: the
+        // original scanned *pairs*, so the last element could disagree.
+        let ops = [reg("xmm1"), reg("xmm2"), reg("ymm3")];
+        assert!(check_evex_vector_widths(&ops, false).is_err());
+    }
+
+    /// General-purpose and mask registers take part in these instruction shapes
+    /// (`vpextrq %xmm1, %rax, $1`, `vcmpps ..., %k5`) and have no width class,
+    /// so they must be skipped rather than treated as a mismatch.
+    #[test]
+    fn non_vector_registers_are_ignored() {
+        let ops = [reg("xmm1"), reg("rax"), reg("k1")];
+        assert!(check_evex_vector_widths(&ops, false).is_ok());
+        let mixed_around_gp = [reg("ymm1"), reg("rax"), reg("ymm2")];
+        assert!(check_evex_vector_widths(&mixed_around_gp, false).is_ok());
+    }
+
+    /// The forms whose shapes admit different widths ask for the operands' own
+    /// validation only; with `allow_mixed` the rule is skipped entirely (and,
+    /// unlike the previous code, without doing the width scan first).
+    #[test]
+    fn allow_mixed_skips_the_rule() {
+        let ops = [reg("ymm1"), reg("zmm2"), reg("xmm3")];
+        assert!(check_evex_vector_widths(&ops, false).is_err());
+        assert!(check_evex_vector_widths(&ops, true).is_ok());
     }
 }
