@@ -8,7 +8,7 @@
 # (minimal sandboxes, containers, and this workspace before the bookworm i686
 # sysroot was assembled).  This gate closes that gap with a freestanding
 # fixture: 12 element types x 10 lane counts on both targets, at -O0 and -O2,
-# each compared byte-for-byte with Clang 23.1.3 for the same target.
+# each compared byte-for-byte with Clang 23.1.4 for the same target.
 #
 # The fixture prints `sizeof`/`_Alignof` per shape and one hash over lane
 # stores+loads, and carries its own `_Static_assert` layout laws, so a

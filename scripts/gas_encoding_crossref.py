@@ -729,6 +729,11 @@ SNAPSHOT_LIMITATIONS = {
     "movsw": "string move vs sign-extend overload",
     "movsl": "string move vs sign-extend overload",
     "movsq": "string move vs sign-extend overload",
+    # The bare spellings collide with the SSE scalar compares/moves after the
+    # AT&T size suffix is folded: `movss` and `cmpss` reduce to `movs`/`cmps`,
+    # which are the *string* instructions in the table (`A4/A5`, `A6/A7`).
+    "movs": "string move vs `movss` after suffix folding",
+    "cmps": "string compare vs `cmpss` after suffix folding",
 }
 
 # Maps that exist only in EVEX/VEX and have no representation in i386-opc.tbl.
@@ -1062,10 +1067,17 @@ def missing(rows: list[dict], table: dict[str, list[dict]], model,
     """Encodings `as` accepts for mnemonics the encoder already knows."""
     have: dict[str, list[dict]] = {}
     for row in rows:
-        encs = model(row)
-        if encs is None:
-            continue
+        # One row can bind mnemonics whose *encodings differ by spelling*:
+        # `"lzcntl" | "tzcntl" | "popcntl"` is `0F BD`/`0F BC`/`0F B8` from one
+        # arm, and `"rolq" | "roll" | "rolw" | "rolb"` is `D1`/`D0` from
+        # another.  Modelling the row once with its first name therefore
+        # credited every sibling with the first one's opcode, which `--verify`
+        # could not see (the opcode is legal for the *set* of names) and
+        # `--missing` reported as two dozen phantom gaps.
         for name in row["names"]:
+            encs = model(row, name)
+            if encs is None:
+                continue
             base = gas_name(name)
             have.setdefault(name, []).extend(encs)
             have.setdefault(base, []).extend(encs)
@@ -1074,6 +1086,12 @@ def missing(rows: list[dict], table: dict[str, list[dict]], model,
     gaps: dict[str, list[dict]] = {}
     for name, encs in table.items():
         if name not in have:
+            continue
+        # `cs`/`ds`/`es`/`ss`/`fs`/`gs` are *segment prefixes*, not
+        # instructions: `--verify` already skips them, and counting their one
+        # byte encodings as "accepted encodings the encoder does not model"
+        # made the gap list claim six instructions that do not exist.
+        if name in MNEMONIC_FRAGMENTS or name in SNAPSHOT_LIMITATIONS:
             continue
         mine = have[name]
         for enc in encs:

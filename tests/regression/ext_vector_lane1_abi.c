@@ -5,7 +5,7 @@
 //  * signed narrow lanes retain their sign, unsigned lanes retain high bits.
 // Register locations are determined by the ABI classifier, not lane type:
 // ext f32x1 is INTEGER bits, ext f64x1 is a stack argument/SSE return,
-// and ext u64x1 uses SSE on x86-64 (Clang 23.1.3).
+// and ext u64x1 uses SSE on x86-64 (Clang 23.1.4).
 //
 // Previously i8x1 identity emitted `movsbl %dil,%edi; movzbl %dil,%eax`,
 // returning 255 for -1; i64x1 returned the alloca address as a pointer.

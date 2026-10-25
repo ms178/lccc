@@ -7,7 +7,7 @@
 # WHY THIS EXISTS
 # ---------------
 # Every gate in this repository that says "compare against GCC 16.2 / Clang
-# 23.1.3" resolves its oracle by NAME on PATH (`gcc-16`, `clang-23`), and CI
+# 23.1.4" resolves its oracle by NAME on PATH (`gcc-16`, `clang-23`), and CI
 # provisions those names from a distribution repository or a vendor PPA. A
 # developer (or an agent) working on a host whose distribution does not carry
 # GCC 16 has exactly two options today: skip every gate that needs the oracle
@@ -17,7 +17,7 @@
 #
 # The payloads are already in this repository: the transport tags
 # `harness-cache-1` (GCC 16 x86-64 prefix, mold, binutils sources) and
-# `harness-cache-4` (Clang 23.1.3 driver + resource headers) exist precisely to
+# `harness-cache-4` (Clang 23.1.4 driver + resource headers) exist precisely to
 # move these bytes to a constrained host. Each tag carries a `MANIFEST.sha256`,
 # so restoring from it is verifiable offline and end-to-end: the bytes that
 # leave the tag are checked against the digest committed beside them, and the
@@ -69,7 +69,7 @@ VERIFY_ONLY=0
 # The pins. These are the versions the gates name; a tag that carries a
 # different version is a provisioning error, not a new default.
 GCC_VERSION=16.2.0
-CLANG_VERSION=23.1.3
+CLANG_VERSION=23.1.4
 MOLD_VERSION=2.42.1
 BINUTILS_VERSION=2.47
 
@@ -101,7 +101,7 @@ done
 TAG_GCC=harness-cache-1
 TAG_CLANG=harness-cache-4
 GCC_MEMBER=gcc-16-bookworm-x86_64.tar.xz
-CLANG_MEMBER=clang-23.1.3-linux-x64.tar.xz
+CLANG_MEMBER=clang-23.1.4-linux-x64.tar.xz
 MOLD_MEMBER=mold-2.42.1-x86_64
 BINUTILS_MEMBER=binutils-2.47.tar.xz
 

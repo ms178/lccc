@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# By-value ext_vector_type ABI grid against the Clang 23.1.3 oracle.
+# By-value ext_vector_type ABI grid against the Clang 23.1.4 oracle.
 #
 # GCC has no ext_vector_type, so Clang is the reference implementation of
 # its calling convention (tests/regression/lib/clang_oracle.sh pins the
@@ -22,11 +22,11 @@
 # argument) must be REJECTED with a diagnostic, never silently compiled; the
 # rest of their ABI (arguments, varargs) is still checked with -DNO_RET.
 # The lists are the measurements recorded in the i386 and x86-64 tables of
-# the Clang 23.1.3 ext-vector ABI notes (engineering/FOLLOWUP-2026-10-15-pr833.md).
+# the Clang 23.1.4 ext-vector ABI notes (engineering/FOLLOWUP-2026-10-15-pr833.md).
 #
 # Verdict: the set of failing checks per leg is compared EXACTLY with
 # ext_vector_abi/grid_expectations.txt, which records (a) checks on which
-# Clang 23.1.3 disagrees with itself (no reference exists) and (b) open lccc
+# Clang 23.1.4 disagrees with itself (no reference exists) and (b) open lccc
 # defects, each with a tracking id. An unlisted failure is red; so is a
 # listed failure that stops happening (remove its line with the fix). The
 # summary line reports both classes so the open-defect count is never
@@ -148,7 +148,7 @@ elem_of() {
 
 in_list() { [[ " $2 " == *" $1 "* ]]; }
 
-# Clang 23.1.3 returns these in a multi-register sequence on both targets
+# Clang 23.1.4 returns these in a multi-register sequence on both targets
 # (a vector is not an aggregate for Clang's ABI code, so a MEMORY-class
 # return goes "direct" to LLVM, which splits it over %xmm0-3). `ldx2`
 # (%st(0)/%st(1), the _Complex long double pair) is implemented on x86-64

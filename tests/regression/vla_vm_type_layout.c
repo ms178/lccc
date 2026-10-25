@@ -10,7 +10,7 @@
  *   - through typeof/typedef/__auto_type: typeof(m[1]) sized 4, not 4*k;
  *   - `sizeof m[f()]` and `typeof(m[f()])` never called f;
  *   - __auto_type from any array did not decay (sizeof 48, garbage reads).
- * Expected output is GCC 16.2's (Clang 23.1.3 agrees).
+ * Expected output is GCC 16.2's (Clang 23.1.4 agrees).
  */
 #include <stdio.h>
 

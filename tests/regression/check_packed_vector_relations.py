@@ -24,8 +24,8 @@ def main():
     args = parser.parse_args()
     version = run([args.gcc, "-dumpfullversion"]).decode().strip()
     normative = gcc_oracle_identity(version, args.allow_gcc16_snapshot)
-    if args.clang and run([args.clang, "-dumpversion"]).decode().strip() != "23.1.3":
-        raise ValueError("exact Clang 23.1.3 required")
+    if args.clang and run([args.clang, "-dumpversion"]).decode().strip() != "23.1.4":
+        raise ValueError("exact Clang 23.1.4 required")
     references = [("gcc", args.gcc)] + ([("clang", args.clang)] if args.clang else [])
     env = os.environ | {"CCC_VERIFY_IR": "abort", "CCC_VERIFY_REGALLOC": "1", "CCC_VALIDATE_SSA": "1"}
     off = env | {"CCC_DISABLE_PASSES": "vecrelations"}
@@ -82,7 +82,7 @@ def main():
                 if any(re.match(r"v?pxor\b|v?xorps\b|v?xorpd\b", line) for line in body(assembly["enabled"], name)):
                     raise ValueError(f"XOR cancellation did not fire: {name}")
         report = {"correct": True, "native_forms": 120, "gcc_version": version,
-                  "gcc_16_2_normative": normative, "clang_version": "23.1.3" if args.clang else None,
+                  "gcc_16_2_normative": normative, "clang_version": "23.1.4" if args.clang else None,
                   "improved_vs_isolated_disable": len(improved), "comparisons": rows,
                   "timing_claim": False, "control": "only vecrelations disabled; existing vector SSA remains enabled"}
         if args.json:

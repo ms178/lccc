@@ -1,6 +1,6 @@
 /* -fmath-errno sqrt/sqrtf (C17 7.12.7.5, glibc MATH_ERRNO): a negative
  * operand must set errno = EDOM; -0, +inf, NaN and every non-negative
- * operand must not.  GCC 16.2 and Clang 23.1.3 inline the instruction and
+ * operand must not.  GCC 16.2 and Clang 23.1.4 inline the instruction and
  * call the library only on the ordered `x < 0` slow path.
  *
  * The .flags bind `sqrt`/`sqrtf` to the test_* definitions at link time, so

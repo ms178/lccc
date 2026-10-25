@@ -21,7 +21,7 @@ for spec in \
 done
 # Square root is only a pure map without errno. Under C's default -fmath-errno
 # `sqrt(x)` for x < 0 must set errno = EDOM, which a packed vsqrtp[sd] cannot
-# do; GCC 16.2 and Clang 23.1.3 at `-O3 -march=x86-64-v3` therefore keep the
+# do; GCC 16.2 and Clang 23.1.4 at `-O3 -march=x86-64-v3` therefore keep the
 # scalar sqrtsd with its `call sqrt` slow path and vectorize only under
 # -fno-math-errno (ICX vectorizes because its default FP model is fast-math).
 # The packed legs are checked where the transform is legal, and the default

@@ -35,14 +35,14 @@ def main():
     )
     parser.add_argument("--gcc", default=os.environ.get("GCC", "gcc-16"))
     parser.add_argument("--baseline")
-    parser.add_argument("--clang", help="optional exact Clang 23.1.3 oracle")
+    parser.add_argument("--clang", help="optional exact Clang 23.1.4 oracle")
     args = parser.parse_args()
     if not re.search(r"\b16\.2(?:\.0)?\b", run([args.gcc, "--version"]).decode()):
         raise ValueError("GCC 16.2 required")
     if args.clang and not re.search(
         r"\b23\.1\.3\b", run([args.clang, "--version"]).decode()
     ):
-        raise ValueError("Clang 23.1.3 required")
+        raise ValueError("Clang 23.1.4 required")
     env = os.environ | {"CCC_VERIFY_IR": "abort", "CCC_VERIFY_REGALLOC": "1"}
     with tempfile.TemporaryDirectory() as directory:
         p = Path(directory)

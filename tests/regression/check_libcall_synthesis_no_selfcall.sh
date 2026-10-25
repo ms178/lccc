@@ -12,7 +12,7 @@
 #   * `call memset@PLT` inside a TU-defined `memset` with a constant fill,
 #   * a self-recursive `call puts@PLT` inside a TU-defined `puts` via the
 #     printf->puts fold. Measured on this host (main calls puts("x"); the TU
-#     puts calls printf("hello\n")): GCC 16.2 recurses and SIGSEGVs; Clang 23.1.3
+#     puts calls printf("hello\n")): GCC 16.2 recurses and SIGSEGVs; Clang 23.1.4
 #     and ICX 2026.2 compile the body to `jmp puts` (an infinite loop, timeout);
 #     LCCC prints "hello" and returns 0, the C semantics. The runtime section (TU-defined puts row) pins it.
 #   * a constant-size `memset`/`memcpy` call expanded inline with the
@@ -367,7 +367,7 @@ expect_no_call_to "$tmp/tu_gnu_inline_memset.c" f memset -O2
 
 # ── 5. runtime ──────────────────────────────────────────────────────────────
 # The fill check above sees stores only; a library-semantics fold returns the
-# fill in a register (`movl $7, %eax`: Clang 23.1.3 in every mode, GCC 16.2
+# fill in a register (`movl $7, %eax`: Clang 23.1.4 in every mode, GCC 16.2
 # under -fPIC). Pin the TU definition's result: f() == 0.
 printf 'int f(void);\nint main(void) { return f(); }\n' >"$tmp/tu_def_main.c"
 for pic in "" -fPIC; do

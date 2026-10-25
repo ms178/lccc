@@ -45,7 +45,7 @@ def main():
     if not re.search(r"\b16\.2(?:\.0)?\b", report["versions"]["gcc"]):
         raise ValueError("GCC 16.2 required")
     if not re.search(r"\b23\.1\.3\b", report["versions"]["clang"]):
-        raise ValueError("Clang 23.1.3 required")
+        raise ValueError("Clang 23.1.4 required")
     with tempfile.TemporaryDirectory() as tmp:
         for case, name in enumerate(["bounded-popcount", "zero-preimage", "nonzero-implication"]):
             bins = {}

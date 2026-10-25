@@ -1,7 +1,7 @@
 // AUD-VABI-4: one-lane ext_vector_type ABI per the pinned oracles — the
-// DOUBLE vector returns in the low half of %xmm0 (Clang 23.1.3 measured),
+// DOUBLE vector returns in the low half of %xmm0 (Clang 23.1.4 measured),
 // while the FLOAT vector returns through the INTEGER eightbyte (%rax bit
-// pattern), also Clang 23.1.3-measured via the exact-expectation ABI grid.
+// pattern), also Clang 23.1.4-measured via the exact-expectation ABI grid.
 // Earlier LCCC builds carried the ONE-element double vector in %rax via the
 // INTEGER eightbyte class, which broke lccc->lccc at -O1 (the callee
 // materialised a `vaddsd` into %xmm2 and emitted no movq into %rax) and

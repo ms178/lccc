@@ -4,7 +4,7 @@
  * output used to be "asserted via the GCC oracle", but GCC rejects the
  * multi-level braces around a scalar ("braces around scalar initializer";
  * C11 6.7.9p11 allows one optional level), so the runner could only ever
- * SKIP-COMPARE it. The case therefore checks itself: Clang 23.1.3, which
+ * SKIP-COMPARE it. The case therefore checks itself: Clang 23.1.4, which
  * accepts the extension, prints 6 (f0 = 6, read back through f4). */
 
 int printf(const char *, ...);

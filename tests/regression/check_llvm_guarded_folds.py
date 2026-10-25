@@ -32,7 +32,7 @@ def main():
     report_gcc_oracle(args.gcc, gcc_version,
                       gcc_oracle_identity(gcc_version, args.allow_gcc16_snapshot))
     if args.clang and not re.search(r"\b23\.1\.3\b", run([args.clang, "--version"]).decode()):
-        raise ValueError("Clang 23.1.3 required")
+        raise ValueError("Clang 23.1.4 required")
     env = os.environ | {"CCC_VERIFY_IR": "abort", "CCC_VERIFY_REGALLOC": "1"}
     with tempfile.TemporaryDirectory() as tmp:
         p = Path(tmp)

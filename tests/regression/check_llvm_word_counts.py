@@ -27,7 +27,7 @@ def main():
         # not on PATH at all, and the two have different fixes.
         raise ValueError(f"GCC 16.2 required, found: {banner!r} ({args.gcc})")
     if args.clang and not re.search(r"\b23\.1\.3\b", run([args.clang, "--version"]).decode()):
-        raise ValueError("Clang 23.1.3 required")
+        raise ValueError("Clang 23.1.4 required")
     env = os.environ | {"CCC_VERIFY_IR": "abort", "CCC_VERIFY_REGALLOC": "1", "CCC_VALIDATE_SSA": "1"}
     with tempfile.TemporaryDirectory() as tmp:
         p = Path(tmp)

@@ -1,5 +1,5 @@
 /*
- * Enum and enumerator types, as GCC 16.2 and Clang 23.1.3 both define them
+ * Enum and enumerator types, as GCC 16.2 and Clang 23.1.4 both define them
  * (measured identically under -std=gnu17, gnu23 and c11 on x86-64, i686 and
  * AArch64):
  *  - an enum's compatible type is `unsigned int` without negative

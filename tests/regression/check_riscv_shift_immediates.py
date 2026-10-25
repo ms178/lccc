@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""RV64 shift-immediate acceptance/byte oracle (Clang 23.1.3, no emulation).
+"""RV64 shift-immediate acceptance/byte oracle (Clang 23.1.4, no emulation).
 
 Example: python3 tests/regression/check_riscv_shift_immediates.py \
   --compiler target/fastbuild/lccc-riscv --clang clang-23 --out /tmp/rv-shifts.json
@@ -51,7 +51,7 @@ def main() -> None:
     # Do not resolve compiler symlinks: argv[0] selects the backend.
     version = subprocess.check_output([tools["clang"], "--version"], text=True)
     if not re.search(r"\bclang version 23\.1\.3(?:\s|$)", version.splitlines()[0]):
-        parser.error("this oracle pins Clang 23.1.3")
+        parser.error("this oracle pins Clang 23.1.4")
     report = {"scope": "RV64 assembler acceptance and exact bytes, not runtime",
               "tools": tools, "clang_version": version.splitlines()[0],
               "binary_sha256": {key: hashlib.sha256(Path(value).read_bytes()).hexdigest()

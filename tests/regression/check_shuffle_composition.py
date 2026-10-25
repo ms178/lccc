@@ -23,8 +23,8 @@ def main():
     args = p.parse_args()
     version = run([args.gcc, "-dumpfullversion"]).decode().strip()
     normative = gcc_oracle_identity(version, args.allow_gcc16_snapshot)
-    if args.clang and run([args.clang, "-dumpversion"]).decode().strip() != "23.1.3":
-        raise ValueError("exact Clang 23.1.3 required")
+    if args.clang and run([args.clang, "-dumpversion"]).decode().strip() != "23.1.4":
+        raise ValueError("exact Clang 23.1.4 required")
     env = os.environ | {"CCC_VERIFY_IR": "abort", "CCC_VERIFY_REGALLOC": "1", "CCC_VALIDATE_SSA": "1"}
     off = env | {"CCC_DISABLE_PASSES": "vecrelations"}
     names = re.findall(r"void (shuffle_\d+)\(", SOURCE.read_text())
@@ -72,7 +72,7 @@ def main():
                 raise ValueError(f"private-binop mechanism did not improve: {row}")
         report = {"correct": True, "native_kernels": 26, "lane_checks": 425984,
                   "checksum": expected.decode().strip(), "gcc_version": version,
-                  "gcc_16_2_normative": normative, "clang_version": "23.1.3" if args.clang else None,
+                  "gcc_16_2_normative": normative, "clang_version": "23.1.4" if args.clang else None,
                   "improved_vs_isolated_disable": improved, "comparisons": rows,
                   "timing_claim": False, "control": "only vecrelations disabled; typed lowering and vector SSA remain enabled"}
         if args.json:

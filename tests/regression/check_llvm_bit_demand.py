@@ -25,7 +25,7 @@ def main():
     parser.add_argument(
         "--baseline", help="optional saved main compiler; independent of disabling"
     )
-    parser.add_argument("--clang", help="optional exact Clang 23.1.3 oracle")
+    parser.add_argument("--clang", help="optional exact Clang 23.1.4 oracle")
     args = parser.parse_args()
     cases = json.loads(SOURCE.with_suffix(".json").read_text())
     if len(cases) != 60 or len({c["name"] for c in cases}) != 60:
@@ -40,7 +40,7 @@ def main():
     if args.clang and not re.search(
         r"\b23\.1\.3\b", run([args.clang, "--version"]).decode()
     ):
-        raise ValueError("exact Clang 23.1.3 required")
+        raise ValueError("exact Clang 23.1.4 required")
     for source in (SOURCE, SOURCE.with_name("llvm_bit_demand_wide.c")):
         check_source(args, source, cases)
 

@@ -161,7 +161,7 @@ def preamble(step_list: list[dict], planned: set[str], mode: str) -> list[str]:
 # That is not hypothetical.  Run 39809624659 spent a six-minute contract job to
 # report "LCCC, GCC, Clang and Valgrind are all required" from the
 # hexadecimal-literal oracle, because no lane installed valgrind (and the
-# contract lanes never installed the pinned Clang 23.1.3 oracle either); the
+# contract lanes never installed the pinned Clang 23.1.4 oracle either); the
 # same run's sibling shard failed check_llvm_word_counts.py because the lane
 # could receive any GCC 16.x while the oracle family pins 16.2.  Both are
 # one-line provisioning facts that this audit can read from the workflow in
@@ -327,7 +327,7 @@ def oracle_provisioning(document: dict) -> list[str]:
                     if (step.get("name") or "") == VERIFY_STEP]
         if "clang" in tools and not installs_clang:
             problems.append(
-                f"{name}: runs a gate that pins the Clang 23.1.3 oracle but no step "
+                f"{name}: runs a gate that pins the Clang 23.1.4 oracle but no step "
                 f"installs it ({CLANG_ORACLE_INSTALL}): the runner image's `clang` is "
                 f"several releases older, so the gate would either fail or compare "
                 f"against the wrong reference")
@@ -347,7 +347,7 @@ def oracle_provisioning(document: dict) -> list[str]:
                     problems.append(
                         f"{name}: installs the pinned Clang oracle but its "
                         f"{VERIFY_STEP!r} step does not assert --clang-version: "
-                        f"'the oracle' must mean exactly 23.1.3")
+                        f"'the oracle' must mean exactly 23.1.4")
         # R6: the lane runs a gate that pins the GCC minor, so the lane's own
         # probe must assert it too.  Without this, a lane can be provisioned
         # with 16.3 and pass its probe, only for the first pinning gate to fail
@@ -623,7 +623,7 @@ def self_test() -> None:
         step("Run the contracts", "bash tests/regression/check_fma_gating.sh"),
     ]}}}
     problems = oracle_provisioning(bare)
-    assert any("pins the Clang 23.1.3 oracle" in p and "contracts" in p for p in problems), problems
+    assert any("pins the Clang 23.1.4 oracle" in p and "contracts" in p for p in problems), problems
     assert any("Memcheck gate" in p and "contracts" in p for p in problems), problems
 
     # A lane that provisions and never verifies: the tool is there, but nothing
@@ -661,14 +661,14 @@ def self_test() -> None:
     # The fully provisioned, pinned lane is clean: the rule can pass as well
     # as fail, and it needs the cache step to do so.
     complete = {"jobs": {"contracts": {"steps": pinned_preamble + [
-        step(VERIFY_STEP, "bash scripts/ci_verify_oracles.sh --gcc-version 16.2 --clang-version 23.1.3"),
+        step(VERIFY_STEP, "bash scripts/ci_verify_oracles.sh --gcc-version 16.2 --clang-version 23.1.4"),
         step("Run the contracts", "bash tests/regression/check_fma_gating.sh"),
     ]}}}
     assert oracle_provisioning(complete) == [], oracle_provisioning(complete)
 
     # R7: the pin is asserted but nothing delivers it -- run 39822157492.
     undelivered = {"jobs": {"contracts": {"steps": pinned_preamble[:1] + pinned_preamble[1:4] + [
-        step(VERIFY_STEP, "bash scripts/ci_verify_oracles.sh --gcc-version 16.2 --clang-version 23.1.3"),
+        step(VERIFY_STEP, "bash scripts/ci_verify_oracles.sh --gcc-version 16.2 --clang-version 23.1.4"),
     ]}}}
     problems = oracle_provisioning(undelivered)
     assert any("no step installs that release" in p for p in problems), problems
@@ -689,7 +689,7 @@ def self_test() -> None:
     # R9: narrowing the probe set past what the lane's gates consume.
     narrowed = json.loads(json.dumps(complete))
     narrowed["jobs"]["contracts"]["steps"][-2]["run"] = (
-        "bash scripts/ci_verify_oracles.sh --gcc-version 16.2 --clang-version 23.1.3"
+        "bash scripts/ci_verify_oracles.sh --gcc-version 16.2 --clang-version 23.1.4"
         " --require gcc,pyyaml")
     problems = oracle_provisioning(narrowed)
     assert any("does not require the 'valgrind' probe" in p for p in problems), problems
@@ -714,7 +714,7 @@ def self_test() -> None:
         step("Checkout"),
         step("Provision", "bash scripts/ci_provision_toolchain.sh --multilib"),
         step("Clang", "bash scripts/ci_install_clang_oracle.sh"),
-        step(VERIFY_STEP, "bash scripts/ci_verify_oracles.sh --clang-version 23.1.3"),
+        step(VERIFY_STEP, "bash scripts/ci_verify_oracles.sh --clang-version 23.1.4"),
         step("Run the contracts", "bash tests/regression/check_llvm_word_counts.py"),
     ]}}}
     problems = oracle_provisioning(gcc_loose)

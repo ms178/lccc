@@ -65,7 +65,7 @@
 # ci_provision_toolchain.sh.
 #
 # Usage:
-#   scripts/ci_verify_oracles.sh [--gcc-version 16.2] [--clang-version 23.1.3]
+#   scripts/ci_verify_oracles.sh [--gcc-version 16.2] [--clang-version 23.1.4]
 #                                [--require gcc,multilib,valgrind,pyyaml]
 #                                [--valgrind-tool NAME]
 #   scripts/ci_verify_oracles.sh --self-test
@@ -348,7 +348,7 @@ MOCK
     done
     printf '#!/bin/sh\necho "valgrind-3.19.0"\n' >"$work/tools/valgrind"
     printf '#!/bin/sh\necho 18.1.3\n' >"$work/clang18/clang"
-    printf '#!/bin/sh\necho 23.1.3\n' >"$work/clang23/clang"
+    printf '#!/bin/sh\necho 23.1.4\n' >"$work/clang23/clang"
     chmod +x "$work/tools"/* "$work/clang18/clang" "$work/clang23/clang"
     # The dev host this gate also runs on: the tag cache ships no ld.lld, so a
     # host can be fully able to run every gate and still have no linker oracle.
@@ -359,9 +359,9 @@ MOCK
     # 1. A complete, correct tool set passes and reports every version.
     status=0
     PATH="$work/tools:$work/clang23:$PATH" CLANG=clang CASES_VERSION=16.2.0 \
-        bash "$0" --gcc-version 16.2 --clang-version 23.1.3 >"$work/out" 2>"$work/err" || status=$?
+        bash "$0" --gcc-version 16.2 --clang-version 23.1.4 >"$work/out" 2>"$work/err" || status=$?
     if (( status == 0 )) && grep -q 'gcc-16=16.2.0' "$work/out" \
-            && grep -q 'clang=23.1.3' "$work/out" && grep -q 'valgrind=valgrind-3.19.0' "$work/out"; then
+            && grep -q 'clang=23.1.4' "$work/out" && grep -q 'valgrind=valgrind-3.19.0' "$work/out"; then
         echo "  ok   complete tool set: exit 0 with every version reported"
     else
         case_fail "  FAIL complete tool set: exit $status, out=$(sed -n '1,3p' "$work/out") err=$(sed -n '1,5p' "$work/err")"
@@ -396,8 +396,8 @@ MOCK
     #    requested, and tolerated when none is.
     status=0
     PATH="$work/tools:$work/clang18:$PATH" CLANG=clang CASES_VERSION=16.2.0 \
-        bash "$0" --gcc-version 16.2 --clang-version 23.1.3 >"$work/out" 2>"$work/err" || status=$?
-    if (( status != 0 )) && grep -q 'is 18.1.3; the oracles pin 23.1.3' "$work/err"; then
+        bash "$0" --gcc-version 16.2 --clang-version 23.1.4 >"$work/out" 2>"$work/err" || status=$?
+    if (( status != 0 )) && grep -q 'is 18.1.3; the oracles pin 23.1.4' "$work/err"; then
         echo "  ok   unpinned clang refused when the lane asks for the pinned oracle"
     else
         case_fail "  FAIL pinned clang: exit $status, stderr=$(sed -n '1,5p' "$work/err")"
@@ -471,8 +471,8 @@ MOCK
     #    lane silently compared against the runner's /usr/bin/clang.
     status=0
     PATH="$work/tools:$PATH" CLANG="$work/clang18/clang" CASES_VERSION=16.2.0 \
-        bash "$0" --gcc-version 16.2 --clang-version 23.1.3 >"$work/out" 2>"$work/err" || status=$?
-    if (( status != 0 )) && grep -q 'is 18.1.3; the oracles pin 23.1.3' "$work/err"; then
+        bash "$0" --gcc-version 16.2 --clang-version 23.1.4 >"$work/out" 2>"$work/err" || status=$?
+    if (( status != 0 )) && grep -q 'is 18.1.3; the oracles pin 23.1.4' "$work/err"; then
         echo "  ok   the CLANG override is honoured, and the pin applies through it"
     else
         case_fail "  FAIL CLANG override: exit $status, err=$(sed -n '1,5p' "$work/err")"

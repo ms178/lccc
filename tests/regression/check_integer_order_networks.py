@@ -22,8 +22,8 @@ def main():
     args=parser.parse_args()
     version=run([args.gcc,'-dumpfullversion']).decode().strip()
     normative=gcc_oracle_identity(version,args.allow_gcc16_snapshot)
-    if args.clang and run([args.clang,'-dumpversion']).decode().strip()!='23.1.3':
-        raise ValueError('exact Clang 23.1.3 required')
+    if args.clang and run([args.clang,'-dumpversion']).decode().strip()!='23.1.4':
+        raise ValueError('exact Clang 23.1.4 required')
     env=os.environ|{'CCC_VERIFY_IR':'abort','CCC_VERIFY_REGALLOC':'1','CCC_VALIDATE_SSA':'1'}
     with tempfile.TemporaryDirectory() as tmp:
         directory=Path(tmp);expected=None

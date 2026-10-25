@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # By-value ext_vector_type ABI under the AVX / AVX-512F ABI level, against
-# the Clang 23.1.3 oracle (x86-64 only).
+# the Clang 23.1.4 oracle (x86-64 only).
 #
 # The main grid (check_ext_vector_abi_grid.sh) measures the no-AVX
 # convention, where a vector over 16 bytes is MEMORY for Clang and the

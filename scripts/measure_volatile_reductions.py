@@ -3,7 +3,7 @@
 
 All binaries must agree on stdout and successfully finish. Rotating compiler
 order and a pinned CPU reduce, but do not eliminate, virtual-host noise. Pass
-explicit GCC 16.2 / Clang 23.1.3 paths for reference comparisons.
+explicit GCC 16.2 / Clang 23.1.4 paths for reference comparisons.
 """
 
 import argparse

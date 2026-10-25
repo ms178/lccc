@@ -1,5 +1,5 @@
 /* strcmp/memcmp of string literals answer with the SIGN, which is all C
- * specifies and what gcc 14.2 and clang 23.1.3 both fold to; glibc's runtime
+ * specifies and what gcc 14.2 and clang 23.1.4 both fold to; glibc's runtime
  * answer is a magnitude, so folding to the magnitude made the same program
  * print different numbers at -O0 and -O2.
  *
@@ -14,7 +14,7 @@
  * opaque rows exist to prove the fix did not turn into a blanket rewrite of
  * every compare call, and they assert SIGN CLASSES only: asserting an exact
  * runtime magnitude would be over-specified against one vendor (measured:
- * clang 23.1.3 at -O2 returns 256 for a runtime `strcmp(a,"b")` where gcc and
+ * clang 23.1.4 at -O2 returns 256 for a runtime `strcmp(a,"b")` where gcc and
  * lccc return 1 -- both conforming, because only the sign is specified).
  *
  * A `static` pointer object with a constant initializer is NOT a usable way to
