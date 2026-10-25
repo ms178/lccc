@@ -63,14 +63,18 @@ counts are a *declarative-row* census, not an ISA-coverage census, and the sound
 direction is ``--verify`` — it asks whether each row that does exist is a legal
 encoding.
 
-The cure is to model the code, which is what ``code_models()`` now does for four
-families: the integer ALU (`encode_alu`'s dispatch index, nine legacy forms),
-the condition-code spellings (`cc_from_mnemonic`: `j<cc>`, `cmov<cc>`,
-`set<cc>`), the one-byte `inc`/`dec` of the i686 backend, and the FMA3 grid
-(`fma3_opcode`, whose opcode lives in the mnemonic's digits).  Their claims are
-not trusted: ``--verify`` requires every one of them to be a form `as` 2.47
-accepts, so a model that drifts fails the gate instead of shrinking the gap
-list.  The remaining families are the worklist in `backlog.md` MB-45.
+The cure is to model code only where the backend demonstrably emits it.
+``code_models()`` covers the integer ALU, condition-code spellings, i686
+one-byte `inc`/`dec`, APX EVEX map-4 ALU/shift/double-shift/unary/IMUL/bit-count/inc-dec and
+condition-code forms, and the FMA3 grid. APX opcode formulas are derived from
+the encoder dispatch/helper implementations; all claims are checked against
+the pinned GAS 2.47 snapshot. ``--missing`` must pass the same snapshot into
+``code_models()`` so snapshot-derived models (including FMA3 spellings) are
+included consistently in the report. A model is not proof that the encoder is
+correct: it proves only that the claimed form exists in GAS's opcode table.
+The remaining families are the worklist in `backlog.md` MB-45, and every
+reported gap still needs source-path classification and byte-level regression
+coverage before it can be called an implementation omission.
 
 The snapshot's own transcription is the other half of the story, and it is
 checkable: `D` is not "XOR 1" (GNU as uses four different schemes and leaves
@@ -951,6 +955,13 @@ def cc_code_models(backend: str = "all") -> dict[str, list[dict]]:
                 out.setdefault(f"cmov{alias}", []).append(_enc(0x40 + cc, map_="0f"))
                 out.setdefault(f"set{alias}", []).append(
                     _enc(0x90 + cc, map_="0f", reg=0))
+                if be == "x86":
+                    out[f"cmov{alias}"].append(_enc(0x40 + cc, family="evex"))
+                    # APX map-4 promotes byte register destinations to the
+                    # zero-extending SETcc form; GAS drops legacy F2 and uses
+                    # opcode 40+cc, ModR/M /0. The x86 APX path emits it.
+                    out[f"set{alias}"].append(
+                        _enc(0x40 + cc, family="evex", pp="f2", reg=0))
     return _dedupe(out)
 
 
@@ -1024,13 +1035,111 @@ def fma3_code_models(table: dict[str, list[dict]]) -> dict[str, list[dict]]:
     return out
 
 
+def _apx_alu_models() -> dict[str, list[dict]]:
+    """APX EVEX map-4 forms emitted by `encode_alu_apx`.
+
+    `encode_alu_apx` is the implementation used for explicit `{evex}` / `{nf}`
+    2-operand forms and 3-operand NDD forms. The APX map keeps the legacy
+    opcode byte: its four r/m<->reg directions are `00..03 + op*8`; immediate
+    groups are `80 /op`, `81 /op`, `83 /op`. It intentionally has no accumulator
+    short encodings. `cmp` uses APX NCI/CCMP instead and is not this helper.
+    These formulas are derived from `alu_forms` and the Rust dispatch indices;
+    `verify_code_models` checks each emitted claim against GAS 2.47.
+    """
+    out = {}
+    for name, forms in alu_code_models().items():
+        if name not in ALU_DIGITS:
+            continue
+        forms = [e for e in forms
+                 if e["opcode"] < 0x80 or e["opcode"] in (0x80, 0x81, 0x83)]
+        # `04+op*8`/`05+op*8` are the accumulator-immediate shortcuts and do
+        # not survive the APX NDD form; keep only the four ModR/M directions.
+        op = ALU_DIGITS[name]
+        forms = [e for e in forms if e["opcode"] not in (0x04 + op * 8,
+                                                           0x05 + op * 8)]
+        out[name] = [dict(e, family="evex", map="none") for e in forms]
+    return out
+
+
+ALU_DIGITS = {"add": 0, "or": 1, "adc": 2, "sbb": 3,
+              "and": 4, "sub": 5, "xor": 6}
+APX_SHIFT_ARM = re.compile(
+    r'((?:"[a-z0-9]+"\s*\|\s*)*"[a-z0-9]+")\s*=>\s*'
+    r'(?:\{\s*)?self\.encode_shift\(ops,\s*mnemonic,\s*(\d+)\)'
+)
+APX_INCDEC_ARM = re.compile(
+    r'"(inc|dec)[a-z]?"\s*=>\s*self\.encode_inc_dec\(ops,\s*([01]),\s*([1248])\)'
+)
+
+
+def apx_integer_code_models() -> dict[str, list[dict]]:
+    """Map-4 opcodes for x86 integer helper paths that explicitly emit APX.
+
+    This deliberately covers only helpers whose implementation has an APX
+    branch (`encode_alu`, `encode_shift`, `encode_inc_dec`, `encode_imul`,
+    `encode_bit_count`, and the cc helpers). BMI, MOVBE/MOVDIR and CRC32 get
+    separate evidence/model work rather than a blanket EVEX-family guess.
+    """
+    out = _apx_alu_models()
+    text = (REPO / "src/backend/x86/assembler/encoder/mod.rs").read_text(
+        encoding="utf-8", errors="replace")
+    for names, digit_s in APX_SHIFT_ARM.findall(text):
+        digit = int(digit_s)
+        # `encode_shift_apx` puts the group digit in ModR/M.reg for all six
+        # count forms; the opcode chooses imm8, 1, or CL and byte vs wider size.
+        forms = [_enc(opcode, family="evex", reg=digit)
+                 for opcode in (0xC0, 0xC1, 0xD0, 0xD1, 0xD2, 0xD3)]
+        for name in QUOTED.findall(names):
+            out.setdefault(gas_name(name), []).extend(forms)
+    for name, digit_s, size_s in APX_INCDEC_ARM.findall(text):
+        digit = int(digit_s)
+        out.setdefault(name, []).extend(
+            _enc(opcode, family="evex", reg=digit) for opcode in (0xFE, 0xFF))
+    # `encode_imul` explicitly uses APX EVEX for unary, two-operand and
+    # immediate forms. The opcode table is F6/F7 /5, 0F AF, and 69/6B.
+    out["imul"] = [_enc(0xF6, family="evex", reg=5),
+                   _enc(0xF7, family="evex", reg=5),
+                   _enc(0xAF, family="evex"),
+                   _enc(0x69, family="evex"), _enc(0x6B, family="evex")]
+    # `encode_unary_apx` is also the actual APX path for one-operand and
+    # NDD unary forms. Extract each mnemonic/op-extension/size dispatch arm
+    # rather than guessing from names, then claim the byte and word/dword/qword
+    # Group 3 or Group 5 opcode with its ModR/M digit.
+    unary = re.compile(
+        r'"([a-z0-9]+)"\s*=>\s*self\.encode_unary_rm(?:_66)?'
+        r'\(ops,\s*(\d+),\s*(\d+)\)')
+    for name, ext_s, size_s in unary.findall(text):
+        ext = int(ext_s)
+        op = (0xFE if int(size_s) == 1 else 0xFF) if ext <= 1 else (
+            0xF6 if int(size_s) == 1 else 0xF7)
+        out.setdefault(gas_name(name), []).append(
+            _enc(op, family="evex", reg=ext))
+    # NDD double shifts keep A5/AD for the CL form and remap immediate A4/AC
+    # to 24/2C. The code path is explicit in encode_double_shift(_ndd).
+    for name, imm_opcode, cl_opcode in (
+        ("shld", 0x24, 0xA5), ("shrd", 0x2C, 0xAD)):
+        out.setdefault(name, []).extend((
+            _enc(imm_opcode, family="evex"),
+            _enc(cl_opcode, family="evex"),
+        ))
+    # `encode_bit_count` has APX map-4 remaps: LZCNT F5, TZCNT F4,
+    # POPCNT 88 (with the map carried by the EVEX prefix, not 0F).
+    for name, opcode in (("lzcnt", 0xF5), ("tzcnt", 0xF4), ("popcnt", 0x88)):
+        out.setdefault(name, []).append(_enc(opcode, family="evex"))
+    for name in list(out):
+        out[name] = _dedupe({name: out[name]})[name]
+    return out
+
+
 def code_models(backend: str = "all",
                 table: dict[str, list[dict]] | None = None) -> dict[str, list[dict]]:
     """Encodings produced by code paths the row model cannot see."""
     out: dict[str, list[dict]] = {}
-    for part in (alu_code_models(), cc_code_models(backend),
-                 incdec_code_models(backend),
-                 fma3_code_models(table) if table is not None else {}):
+    parts = (alu_code_models(), cc_code_models(backend),
+             incdec_code_models(backend),
+             apx_integer_code_models() if backend in ("x86", "all") else {},
+             fma3_code_models(table) if table is not None else {})
+    for part in parts:
         for name, encs in part.items():
             out.setdefault(name, []).extend(encs)
     return _dedupe(out)
@@ -1305,7 +1414,7 @@ def main() -> int:
             return 1
 
     if args.missing:
-        gaps = missing(rows, table, model, code_models())
+        gaps = missing(rows, table, model, code_models(args.backend, table))
         total = sum(len(v) for v in gaps.values())
         print(f"\nencodings as 2.47 accepts that no declarative row models: {total} "
               f"across {len(gaps)} mnemonics with at least one row "
@@ -1315,14 +1424,14 @@ def main() -> int:
             print(f"  {name:14s} {forms}")
 
     if args.coverage:
-        gap = coverage(rows, table, code_models())
+        gap = coverage(rows, table, code_models(args.backend, table))
         Path(args.coverage).write_text(json.dumps(gap, indent=1, sort_keys=True) + "\n")
         legal = sum(len(v) for v in gap.values())
         print(f"\nmnemonics with no declarative row (written to {args.coverage}):"
               f" {len(gap)} carrying {legal} reference encodings")
 
     if args.absent:
-        absent = unimplemented_mnemonics(rows, table, code_models())
+        absent = unimplemented_mnemonics(rows, table, code_models(args.backend, table))
         print(f"\nmnemonics as 2.47 knows with no declarative row: {len(absent)}")
         if args.triage:
             unmentioned, mentioned = triage_absent(absent, files)
