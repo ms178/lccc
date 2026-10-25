@@ -1796,14 +1796,12 @@ impl InstructionEncoder {
             "vpackusdw" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x2B)),
             "vpmaddubsw" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x04)),
             "vpshufb" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x00)),
-            "vpsignb" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x08)),
-            "vpsignw" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x09)),
-            "vpsignd" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x0A)),
+            // SSSE3 horizontal add/sub and sign instructions have VEX/legacy
+            // encodings but no EVEX encodings in the pinned GAS 2.47 opcode
+            // table. Do not add them here: letting them fall through reaches
+            // the VEX encoder, which rejects ZMM operands instead of emitting
+            // an architecturally undefined EVEX opcode.
             "vpmulhrsw" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x0B)),
-            "vphaddw" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x01)),
-            "vphaddd" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x02)),
-            "vphsubw" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x05)),
-            "vphsubd" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x06)),
             // AVX-VNNI / AVX-VNNI-INT8 (EVEX.NDS.512.66.0F38)
             "vpdpbusd" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x50)),
             "vpdpbusds" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x51)),

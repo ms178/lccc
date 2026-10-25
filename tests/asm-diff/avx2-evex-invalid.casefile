@@ -1,0 +1,9 @@
+;;; ssse3_no_evex_encodings_reject reject
+.text
+vphaddw %zmm1, %zmm2, %zmm3
+vphaddd %zmm1, %zmm2, %zmm3
+vphsubw %zmm1, %zmm2, %zmm3
+vphsubd %zmm1, %zmm2, %zmm3
+vpsignb %zmm1, %zmm2, %zmm3
+vpsignw %zmm1, %zmm2, %zmm3
+vpsignd %zmm1, %zmm2, %zmm3

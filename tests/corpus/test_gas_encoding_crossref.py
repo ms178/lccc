@@ -561,6 +561,19 @@ class GasCodeModelGateTests(unittest.TestCase):
                 self.assertEqual(checked, sum(len(v) for v in claims.values()))
                 self.assertGreater(len(claims), 100)
 
+    def test_direct_evex_models_follow_literal_dispatch_and_reject_illegal_forms(self):
+        claims = self.gas.evex_direct_code_models()
+        self.assertGreaterEqual(sum(map(len, claims.values())), 350)
+        findings, checked = self.gas.verify_code_models(claims, self.table)
+        self.assertEqual(findings, [])
+        self.assertEqual(checked, sum(map(len, claims.values())))
+        # These SSSE3 operations are VEX/legacy-only; GAS 2.47 has no EVEX
+        # row. Their accidental EVEX dispatch arms were a real illegal-encoding
+        # defect, removed from the encoder and pinned by an asm-diff reject case.
+        for name in ("vphaddw", "vphaddd", "vphsubw", "vphsubd",
+                     "vpsignb", "vpsignw", "vpsignd"):
+            self.assertNotIn(name, claims)
+
     def test_apx_integer_models_cover_only_verified_encoder_helper_paths(self):
         claims = self.gas.code_models("x86", self.table)
         # These opcode families are selected in explicit APX EVEX branches in

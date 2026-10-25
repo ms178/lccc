@@ -1122,6 +1122,46 @@ def apx_integer_code_models() -> dict[str, list[dict]]:
             _enc(imm_opcode, family="evex"),
             _enc(cl_opcode, family="evex"),
         ))
+    # BMI1/BMI2 helpers contain explicit EVEX branches (`avx.rs`): APX EVEX
+    # versions retain the instruction's 0F38/0F3A map, pp and opcode, while
+    # encoding the wider GPR registers through EVEX. Keep helper parameters
+    # adjacent to
+    # the source method names so a changed opcode/pp is caught by GAS verify.
+    bmi_pp = {0: "none", 1: "66", 2: "f3", 3: "f2"}
+    bmi_forms = {
+        "andn": [(0xF2, 0, "0f38")],
+        "blsi": [(0xF3, 0, "0f38")],
+        "blsr": [(0xF3, 0, "0f38")],
+        "blsmsk": [(0xF3, 0, "0f38")],
+        "bextr": [(0xF7, 0, "0f38")],
+        "bzhi": [(0xF5, 0, "0f38")],
+        "shlx": [(0xF7, 1, "0f38")],
+        "shrx": [(0xF7, 3, "0f38")],
+        "sarx": [(0xF7, 2, "0f38")],
+        "pext": [(0xF5, 2, "0f38")],
+        "pdep": [(0xF5, 3, "0f38")],
+        "mulx": [(0xF6, 3, "0f38")],
+        # RORX does not use EVexMap4: APX uses EVEX map 0F3A and F2.pp.
+        "rorx": [(0xF0, 3, "0f3a")],
+    }
+    for name, forms in bmi_forms.items():
+        out.setdefault(name, []).extend(
+            _enc(opcode, family="evex", map_=map_, pp=bmi_pp[pp])
+            for opcode, pp, map_ in forms)
+    # `encode_div_idiv` has APX branches through `encode_unary_apx`; the
+    # ModR/M extension remains /6 or /7 over Group-3 F6/F7. The base opcode
+    # varies with byte versus wider operand size, but these helpers dispatch
+    # only word/dword/qword `div`/`idiv` spellings here.
+    for name, ext in (("div", 6), ("idiv", 7)):
+        out.setdefault(name, []).extend((
+            _enc(0xF6, family="evex", reg=ext),
+            _enc(0xF7, family="evex", reg=ext),
+        ))
+    # `encode_crc32` drops the legacy F2 prefix for its APX branch. Width is
+    # reflected in W/pp but all map-4 forms share F0/F1.
+    out.setdefault("crc32", []).extend((
+        _enc(0xF0, family="evex"), _enc(0xF1, family="evex"),
+    ))
     # `encode_bit_count` has APX map-4 remaps: LZCNT F5, TZCNT F4,
     # POPCNT 88 (with the map carried by the EVEX prefix, not 0F).
     for name, opcode in (("lzcnt", 0xF5), ("tzcnt", 0xF4), ("popcnt", 0x88)):
@@ -1131,13 +1171,185 @@ def apx_integer_code_models() -> dict[str, list[dict]]:
     return out
 
 
+def i686_sse_code_models(
+        table: dict[str, list[dict]] | None = None) -> dict[str, list[dict]]:
+    """Model the i686 generic SSE helper's literal prefix/opcode dispatch.
+
+    `encode_sse_op` intentionally drops a leading 66 for MMX operands, so an
+    SSE2 helper arm with that literal prefix emits both the XMM `66 0F xx`
+    and MMX `0F xx` forms. Other leading mandatory prefixes are not dropped.
+    The model is sourced from each dispatch's literal byte array and checked
+    against the pinned assembler table.
+    """
+    path = REPO / "src/backend/i686/assembler/encoder/mod.rs"
+    text = path.read_text(encoding="utf-8", errors="replace")
+    table = table if table is not None else load_snapshot()
+    out: dict[str, list[dict]] = {}
+    arm = re.compile(
+        r'(?P<names>(?:"[a-z0-9]+"(?:\s*\|\s*"[a-z0-9]+")*))'
+        r'\s*=>\s*self\.(?P<helper>encode_sse_[a-z0-9_]+)'
+        r'\(ops,(?P<args>[^\n]*)')
+    arrays = re.compile(r'&\[([^\]]+)\]')
+    for match in arm.finditer(text):
+        names = QUOTED.findall(match.group("names"))
+        helper, args = match.group("helper"), match.group("args")
+        raw_arrays = arrays.findall(args)
+        if helper == "encode_sse_byte_shift":
+            digits = re.findall(r",\s*(\d+)(?:\s*\)|\s*,)", args)
+            if not digits:
+                continue
+            ext = int(digits[0])
+            for name in names:
+                key = name if name in table else gas_name(name)
+                candidates = [_enc(0x73, map_="0f", pp="66", reg=ext)]
+                accepted = [e for e in candidates
+                            if any(_same(e, row) for row in table.get(key, []))]
+                if accepted:
+                    out.setdefault(key, []).extend(accepted)
+            continue
+        parsed = []
+        for byte_list in raw_arrays:
+            try:
+                bs = [int(tok.strip(), 0) for tok in byte_list.split(",")]
+            except ValueError:
+                continue
+            pp = "none"
+            if bs and bs[0] in PP_FOR_BYTE:
+                pp = PP_FOR_BYTE[bs.pop(0)]
+            map_ = "none"
+            if bs[:2] == [0x0F, 0x38]:
+                map_, bs = "0f38", bs[2:]
+            elif bs[:2] == [0x0F, 0x3A]:
+                map_, bs = "0f3a", bs[2:]
+            elif bs[:1] == [0x0F]:
+                map_, bs = "0f", bs[1:]
+            if len(bs) == 1:
+                parsed.append((bs[0], map_, pp))
+        if not parsed:
+            continue
+        for name in names:
+            key = name if name in table else gas_name(name)
+            candidates = [_enc(op, map_=map_, pp=pp)
+                          for op, map_, pp in parsed]
+            if helper in ("encode_sse_op", "encode_sse_op_imm8") \
+                    and parsed[0][2] == "66":
+                # Both helpers remove a 66 prefix for MMX operands.
+                candidates.append(_enc(parsed[0][0], map_=parsed[0][1]))
+            if helper == "encode_sse_shift" and len(parsed) > 1:
+                ext_match = re.search(
+                    r'&\[[^\]]+\]\s*,\s*(\d+)\s*,\s*&\[', args)
+                if ext_match:
+                    ext = int(ext_match.group(1))
+                    op, map_, pp = parsed[1]
+                    candidates.append(_enc(op, map_=map_, pp=pp, reg=ext))
+                    if parsed[0][2] == "66":
+                        # The helper uses the shared MMX prefix-elision logic
+                        # for both CL/register and immediate shift encodings.
+                        op0, map0, _ = parsed[0]
+                        candidates.append(_enc(op0, map_=map0))
+                        candidates.append(_enc(op, map_=map_, reg=ext))
+            accepted = [e for e in candidates
+                        if any(_same(e, row) for row in table.get(key, []))]
+            if accepted:
+                out.setdefault(key, []).extend(accepted)
+    return _dedupe(out)
+
+
+def x86_special_code_models() -> dict[str, list[dict]]:
+    """Model fixed instruction families whose encodings are emitted in code.
+
+    Each entry corresponds to a named encoder path: APX PUSH/POP helpers,
+    moffs MOVABS, MOV segment/control-register transfers, and MOVSXD. These
+    models deliberately enumerate only bytes present in the implementations;
+    the verifier still requires GAS 2.47 to accept every claim.
+    """
+    out: dict[str, list[dict]] = {}
+    # apx.rs: pushp/popp use REX2 plus 50+rd/58+rd; table records the opcode
+    # byte after the prefix, with the register range expanded by the snapshot.
+    out["pushp"] = [_enc(0x50 + n) for n in range(8)]
+    out["popp"] = [_enc(0x58 + n) for n in range(8)]
+    # APX push2/pop2 emit EVEX map-4, with W set by the p suffix.
+    for name, opcode, digit in (("push2", 0xFF, 6), ("pop2", 0x8F, 0)):
+        out[name] = [_enc(opcode, family="evex", reg=digit, w=0)]
+        out[name + "p"] = [_enc(opcode, family="evex", reg=digit, w=1)]
+    # encode_movabs emits A0..A3 for absolute moffs transfers to/from AL/AX/EAX/RAX.
+    out["movabs"] = [_enc(op) for op in range(0xA0, 0xA4)]
+    # encode_mov handles segment and control/debug/test registers through
+    # 8C/8E and 0F20..26, respectively. The opcodes are explicit in the helper.
+    out["mov"] = ([_enc(op, map_="0f") for op in (0x20, 0x21, 0x22, 0x23, 0x24, 0x26)]
+                  + [_enc(0x8C), _enc(0x8E)])
+    # `encode_movsx`'s dword-to-qword MOVSXD path is opcode 63.
+    out["movsx"] = [_enc(0x63)]
+    return _dedupe(out)
+
+
+def evex_direct_code_models() -> dict[str, list[dict]]:
+    """Extract directly parameterized EVEX dispatch arms.
+
+    The x86 dispatcher gives each mnemonic's map, pp, W and opcode as literal
+    arguments to helpers such as `encode_evex_binary`, `encode_evex_binary_scalar`,
+    `encode_evex_unary`, and EVEX immediate forms. Model exactly those
+    arguments, not an ISA-family guess. EVEX maps 5 and 6 are represented by
+    the opcode table's `none` map (the prefix map value itself has no 0F escape
+    byte). The strict GAS snapshot gate catches stale or illegal arms.
+    """
+    text = (REPO / "src/backend/x86/assembler/encoder/mod.rs").read_text(
+        encoding="utf-8", errors="replace")
+    arm = re.compile(
+        r'"([a-z0-9]+)"\s*=>\s*r?\(self\.encode_evex_\w+'
+        r'\(ops,\s*(\d+),\s*(\d+),\s*(\d+),\s*'
+        r'(0x[0-9a-fA-F]+|\d+)\)\)')
+    maps = {1: "0f", 2: "0f38", 3: "0f3a", 5: "none", 6: "none"}
+    pps = {0: "none", 1: "66", 2: "f3", 3: "f2"}
+    out: dict[str, list[dict]] = {}
+    for name, map_s, pp_s, w_s, opcode_s in arm.findall(text):
+        map_n, pp_n = int(map_s), int(pp_s)
+        if map_n not in maps or pp_n not in pps:
+            continue
+        out.setdefault(name, []).append(_enc(
+            int(opcode_s, 0), family="evex", map_=maps[map_n],
+            pp=pps[pp_n], w=int(w_s)))
+
+    def add(name: str, map_n: int, pp_n: int, w: int, opcode: str | int) -> None:
+        if map_n in maps and pp_n in pps:
+            out.setdefault(name, []).append(_enc(
+                int(opcode, 0) if isinstance(opcode, str) else opcode,
+                family="evex", map_=maps[map_n], pp=pps[pp_n], w=w))
+
+    # EVEX helpers with the same encoded map/pp/W/opcode axes but a different
+    # operand-shape/SAE contract. The structural shape is enforced by each
+    # encoder helper; these models only claim the source-literal opcode tuple.
+    for name, ma, pp, w, op, _imm in re.findall(
+            r'"([a-z0-9]+)"\s*=>\s*r\(self\.encode_evex_3src_imm'
+            r'\(ops,\s*(\d+),\s*(\d+),\s*(\d+),\s*'
+            r'(0x[0-9a-fA-F]+|\d+),\s*(true|false)\)\)', text):
+        add(name, int(ma), int(pp), int(w), op)
+    for name, ma, pp, w, op in re.findall(
+            r'"([a-z0-9]+)"\s*=>\s*\{?\s*r\(self\.encode_evex_cmp_mask'
+            r'\(ops,\s*mnemonic,\s*(\d+),\s*(\d+),\s*(\d+),\s*'
+            r'(0x[0-9a-fA-F]+|\d+)', text):
+        add(name, int(ma), int(pp), int(w), op)
+    for name, op, w in re.findall(
+            r'"([a-z0-9]+)"\s*=>\s*r\(self\.encode_evex_gather'
+            r'\(ops,\s*(0x[0-9a-fA-F]+|\d+),\s*(\d+)\)\)', text):
+        add(name, 2, 1, int(w), op)
+    for name, method, w, op in re.findall(
+            r'"([a-z0-9]+)"\s*=>\s*r\(self\.encode_evex_(insert|extract)_lane'
+            r'\(ops,\s*mnemonic,\s*(\d+),\s*(0x[0-9a-fA-F]+|\d+)\)\)', text):
+        add(name, 3, 1, int(w), op)
+    return _dedupe(out)
+
+
 def code_models(backend: str = "all",
                 table: dict[str, list[dict]] | None = None) -> dict[str, list[dict]]:
     """Encodings produced by code paths the row model cannot see."""
     out: dict[str, list[dict]] = {}
     parts = (alu_code_models(), cc_code_models(backend),
              incdec_code_models(backend),
+             i686_sse_code_models(table) if backend in ("i686", "all") else {},
              apx_integer_code_models() if backend in ("x86", "all") else {},
+             x86_special_code_models() if backend in ("x86", "all") else {},
+             evex_direct_code_models() if backend in ("x86", "all") else {},
              fma3_code_models(table) if table is not None else {})
     for part in parts:
         for name, encs in part.items():
