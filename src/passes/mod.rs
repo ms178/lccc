@@ -1385,6 +1385,7 @@ pub(crate) fn run_passes(
     // `-fmath-errno` (the C default; cleared by -fno-math-errno/-ffast-math).
     math_errno: bool,
     x86_isa: X86Isa,
+    x86_sse1: bool,
     x86_avx: bool,
     x86_fma: bool,
     x86_bmi1: bool,
@@ -1440,6 +1441,7 @@ pub(crate) fn run_passes(
     // vectorize.rs). AVX2 is tracked separately so `-mno-avx` downgrades to
     // 128-bit SSE2 instead of disabling vectorization outright.
     vectorize::set_x86_simd_isa(x86_isa.simd, x86_isa.ymm, x86_isa.sse41, x86_avx512vl);
+    vectorize::set_x86_sse1_available(target == crate::backend::Target::X86_64 && x86_sse1);
     // I64 maps and unfused packed multiply/add are x86-64-only lowerings.
     // Refresh the per-thread gate for every TU: a worker may compile i686
     // immediately after x86-64 in the same process.
@@ -4270,6 +4272,7 @@ mod signed_wrap_policy_tests {
             FpContract::Off,
             true,
             X86Isa::default(),
+            false,
             false,
             false,
             false,

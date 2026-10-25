@@ -963,6 +963,7 @@ jobs:
         env CCC=target/fastbuild/lccc GCC=gcc-16 python3 tests/regression/check_sse2_i32_product.py
         env CCC=target/fastbuild/lccc GCC=gcc-16 python3 tests/regression/check_i32_map_unroll.py
         env CCC=target/fastbuild/lccc GCC=gcc-16 python3 tests/regression/check_fp_map_unroll.py
+        env CCC=target/fastbuild/lccc GCC=gcc-16 python3 tests/regression/check_sse1_f32_map.py
     # The two-wide matmul arm and its guards arrived with the synthesized
     # SIMD work; each gate below pins one property that a scalar fallback
     # would otherwise hide (see the gate headers for the measured costs).
@@ -2599,6 +2600,7 @@ jobs:
       # The bounded F32 map extends this shard; F64 extends shard b.
       only: >-
           fp32_product_map,
+          f32_sse1_map,
           ackermann,
           arith_loop,
           ascii_case_fold,
@@ -2758,6 +2760,19 @@ jobs:
           GCC_SIGN_CMOV="${GCC16:-gcc}" CLANG_SIGN_CMOV="${CLANG:-clang}" \
           ICX_SIGN_CMOV="$LCCC_ICX_BIN" LCCC_FASTBUILD_BIN=target/fastbuild/lccc \
           bash tests/regression/check_sign_test_cmov.sh
+    - name: SSE1-only packed F32 workload against ICX
+      run: |
+        set -euo pipefail
+        # Keep the independent vendor's strict FP mode explicit; this is
+        # correctness/target coverage, not an ICX timing claim.
+        source=tests/benchmark/programs/f32_sse1_map.c
+        "$LCCC_ICX_BIN" -O2 -fp-model=strict -mno-sse2 -msse -ffp-contract=off \
+          -DSSE1_MAP_REQUIRE_ONLY "$source" -o intel-evidence/sse1-f32-icx
+        target/fastbuild/lccc -O2 -mno-sse2 -msse -ffp-contract=off \
+          -DSSE1_MAP_REQUIRE_ONLY "$source" -o intel-evidence/sse1-f32-lccc
+        intel-evidence/sse1-f32-icx > intel-evidence/sse1-f32-icx.txt
+        intel-evidence/sse1-f32-lccc > intel-evidence/sse1-f32-lccc.txt
+        diff -u intel-evidence/sse1-f32-icx.txt intel-evidence/sse1-f32-lccc.txt
     - name: Incoming MEMORY parameter ABI against ICX
       run: env CCC=target/fastbuild/lccc ORACLE_CC="$LCCC_ICX_BIN" bash tests/regression/check_incoming_byval_homes.sh
     - name: FP select min/max matrix against ICX

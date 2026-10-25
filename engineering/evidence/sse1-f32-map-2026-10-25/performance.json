@@ -1,0 +1,3213 @@
+{
+  "aggregate_lccc_vs_best_reference": {
+    "arithmetic_mean_ratio": 1.0454114193125754,
+    "best": {
+      "benchmark": "f32_sse1_map",
+      "ratio": 1.0454114193125754,
+      "reference": "gcc"
+    },
+    "geometric_mean_ratio": 1.0454114193125754,
+    "interpretation": "LCCC / fastest available reference paired median; <1 means LCCC faster",
+    "n_correct_benchmarks": 1,
+    "worst": {
+      "benchmark": "f32_sse1_map",
+      "ratio": 1.0454114193125754,
+      "reference": "gcc"
+    }
+  },
+  "aggregate_lccc_vs_gcc": {
+    "arithmetic_mean_ratio": 1.0454114193125754,
+    "best": {
+      "benchmark": "f32_sse1_map",
+      "ratio": 1.0454114193125754
+    },
+    "geometric_mean_ratio": 1.0454114193125754,
+    "interpretation": "LCCC/GCC paired median ratios; <1 means LCCC faster",
+    "n_correct_benchmarks": 1,
+    "worst": {
+      "benchmark": "f32_sse1_map",
+      "ratio": 1.0454114193125754
+    }
+  },
+  "benchmarks": [
+    {
+      "baseline_compiler": "gcc",
+      "compile": {
+        "clang": {
+          "binary_bytes": 16104,
+          "binary_sha256": "5899845302c34859be3bfec0ff80bebbaf045c88a4d456b2a0e5b06d7b36e302",
+          "child_cpu_s": 0.138065,
+          "command": [
+            "/home/user/tools/oracle-bin/clang-23",
+            "-O2",
+            "-o",
+            "/home/user/artifacts/sse1/performance/f32_sse1_map/clang/benchmark.bin",
+            "/home/user/lccc/tests/benchmark/programs/f32_sse1_map.c",
+            "-mno-sse2",
+            "-msse",
+            "-ffp-contract=off"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "175801bac9a87fff4054417367b2a32131fb285a8824529ecbed7070a3ef8c5e",
+          "stderr": "",
+          "stdout": "",
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "text_bytes": 2239,
+          "wall_s": 0.289211988
+        },
+        "gcc": {
+          "binary_bytes": 15904,
+          "binary_sha256": "9fd0c00d60d20b15b9333f1a083755b4c492c57456600164781b48cf2396ad0d",
+          "child_cpu_s": 0.10533499999999996,
+          "command": [
+            "/home/user/tools/gcc-16/bin/gcc-16",
+            "-O2",
+            "-o",
+            "/home/user/artifacts/sse1/performance/f32_sse1_map/gcc/benchmark.bin",
+            "/home/user/lccc/tests/benchmark/programs/f32_sse1_map.c",
+            "-mno-sse2",
+            "-msse",
+            "-ffp-contract=off"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "175801bac9a87fff4054417367b2a32131fb285a8824529ecbed7070a3ef8c5e",
+          "stderr": "",
+          "stdout": "",
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "text_bytes": 1456,
+          "wall_s": 0.105748393
+        },
+        "lccc": {
+          "binary_bytes": 6888,
+          "binary_sha256": "6504f4c5f14f4c8af56e372c379c60b5ef5eb9de547600e712ebac0c1beccc8d",
+          "child_cpu_s": 0.06485,
+          "command": [
+            "/home/user/lccc/target/fastbuild/lccc",
+            "-I/home/user/tools/gcc-16/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+            "-O2",
+            "-o",
+            "/home/user/artifacts/sse1/performance/f32_sse1_map/lccc/benchmark.bin",
+            "/home/user/lccc/tests/benchmark/programs/f32_sse1_map.c",
+            "-mno-sse2",
+            "-msse",
+            "-ffp-contract=off"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "175801bac9a87fff4054417367b2a32131fb285a8824529ecbed7070a3ef8c5e",
+          "stderr": "",
+          "stdout": "",
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "text_bytes": 1675,
+          "wall_s": 0.09592782
+        },
+        "scalar": {
+          "binary_bytes": 6824,
+          "binary_sha256": "589c129ad578b3ebfaece566896b8cb9c0bad550121ca0a9ed10d33a2b2dbf6e",
+          "child_cpu_s": 0.07060900000000003,
+          "command": [
+            "/home/user/artifacts/sse1/scalar/lccc",
+            "-I/home/user/tools/gcc-16/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+            "-O2",
+            "-o",
+            "/home/user/artifacts/sse1/performance/f32_sse1_map/scalar/benchmark.bin",
+            "/home/user/lccc/tests/benchmark/programs/f32_sse1_map.c",
+            "-mno-sse2",
+            "-msse",
+            "-ffp-contract=off"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "175801bac9a87fff4054417367b2a32131fb285a8824529ecbed7070a3ef8c5e",
+          "stderr": "",
+          "stdout": "",
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "text_bytes": 1611,
+          "wall_s": 0.080459315
+        }
+      },
+      "correctness": {
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "5612d63b3564ff24\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "5612d63b3564ff24\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "5612d63b3564ff24\n",
+          "stable_within_compiler": true
+        },
+        "scalar": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "5612d63b3564ff24\n",
+          "stable_within_compiler": true
+        }
+      },
+      "description": "strict cache-resident F32 maps without SSE2",
+      "name": "f32_sse1_map",
+      "ratios_from_lccc": {
+        "clang": {
+          "cv": 0.06838061555933449,
+          "interpretation": "numerator/denominator; <1 means numerator faster",
+          "mad": 0.049115185000699335,
+          "max": 1.1664185558456035,
+          "mean": 1.0311485412460886,
+          "median": 1.0212849342123886,
+          "median_ci95_bootstrap": [
+            0.9915579864771592,
+            1.0884665021374118
+          ],
+          "min": 0.9062010842273064,
+          "n": 15,
+          "outlier_count_mad": 0,
+          "raw": [
+            {
+              "ratio": 1.0426737138053284,
+              "round": 0
+            },
+            {
+              "ratio": 1.1066761676769925,
+              "round": 1
+            },
+            {
+              "ratio": 1.1664185558456035,
+              "round": 2
+            },
+            {
+              "ratio": 1.0203414864974016,
+              "round": 3
+            },
+            {
+              "ratio": 1.0884665021374118,
+              "round": 4
+            },
+            {
+              "ratio": 1.0137657077914677,
+              "round": 5
+            },
+            {
+              "ratio": 1.0252706706077954,
+              "round": 6
+            },
+            {
+              "ratio": 1.0212849342123886,
+              "round": 7
+            },
+            {
+              "ratio": 0.9062010842273064,
+              "round": 8
+            },
+            {
+              "ratio": 0.9721697492116893,
+              "round": 9
+            },
+            {
+              "ratio": 0.9339766816249622,
+              "round": 10
+            },
+            {
+              "ratio": 1.1131794339765135,
+              "round": 11
+            },
+            {
+              "ratio": 1.0816096426894257,
+              "round": 12
+            },
+            {
+              "ratio": 0.9836358019098831,
+              "round": 13
+            },
+            {
+              "ratio": 0.9915579864771592,
+              "round": 14
+            }
+          ],
+          "stdev": 0.07051057198351735
+        },
+        "gcc": {
+          "cv": 0.045668719622854154,
+          "interpretation": "numerator/denominator; <1 means numerator faster",
+          "mad": 0.0247039549628163,
+          "max": 1.1813138527635498,
+          "mean": 1.0504597580150548,
+          "median": 1.0454114193125754,
+          "median_ci95_bootstrap": [
+            1.0231290178097894,
+            1.0562571348363956
+          ],
+          "min": 1.0001990095503797,
+          "n": 15,
+          "outlier_count_mad": 1,
+          "raw": [
+            {
+              "ratio": 1.047373731453085,
+              "round": 0
+            },
+            {
+              "ratio": 1.0793019703273627,
+              "round": 1
+            },
+            {
+              "ratio": 1.1813138527635498,
+              "round": 2
+            },
+            {
+              "ratio": 1.0562571348363956,
+              "round": 3
+            },
+            {
+              "ratio": 1.0701153742753917,
+              "round": 4
+            },
+            {
+              "ratio": 1.0374679878190265,
+              "round": 5
+            },
+            {
+              "ratio": 1.0454114193125754,
+              "round": 6
+            },
+            {
+              "ratio": 1.0515554266470573,
+              "round": 7
+            },
+            {
+              "ratio": 1.0231290178097894,
+              "round": 8
+            },
+            {
+              "ratio": 1.0308063914969277,
+              "round": 9
+            },
+            {
+              "ratio": 1.005054533623095,
+              "round": 10
+            },
+            {
+              "ratio": 1.0001990095503797,
+              "round": 11
+            },
+            {
+              "ratio": 1.1146207839078204,
+              "round": 12
+            },
+            {
+              "ratio": 1.0021292643201356,
+              "round": 13
+            },
+            {
+              "ratio": 1.0121604720832282,
+              "round": 14
+            }
+          ],
+          "stdev": 0.047973152163880754
+        },
+        "scalar": {
+          "cv": 0.06630891993729919,
+          "interpretation": "numerator/denominator; <1 means numerator faster",
+          "mad": 0.005350264735478172,
+          "max": 0.2891239435849841,
+          "mean": 0.258194860030937,
+          "median": 0.25573212713355103,
+          "median_ci95_bootstrap": [
+            0.2515393672716846,
+            0.2610823918690292
+          ],
+          "min": 0.21360861196527794,
+          "n": 15,
+          "outlier_count_mad": 3,
+          "raw": [
+            {
+              "ratio": 0.2551329163625277,
+              "round": 0
+            },
+            {
+              "ratio": 0.28512495781416386,
+              "round": 1
+            },
+            {
+              "ratio": 0.2891239435849841,
+              "round": 2
+            },
+            {
+              "ratio": 0.2606730262606679,
+              "round": 3
+            },
+            {
+              "ratio": 0.2618400468685533,
+              "round": 4
+            },
+            {
+              "ratio": 0.24966831232700465,
+              "round": 5
+            },
+            {
+              "ratio": 0.25573212713355103,
+              "round": 6
+            },
+            {
+              "ratio": 0.2515393672716846,
+              "round": 7
+            },
+            {
+              "ratio": 0.24977544643754562,
+              "round": 8
+            },
+            {
+              "ratio": 0.2548085146515706,
+              "round": 9
+            },
+            {
+              "ratio": 0.2597037103989575,
+              "round": 10
+            },
+            {
+              "ratio": 0.2610823918690292,
+              "round": 11
+            },
+            {
+              "ratio": 0.2712437027522859,
+              "round": 12
+            },
+            {
+              "ratio": 0.253865824766251,
+              "round": 13
+            },
+            {
+              "ratio": 0.21360861196527794,
+              "round": 14
+            }
+          ],
+          "stdev": 0.017120622302013572
+        }
+      },
+      "ratios_to_gcc": {
+        "clang": {
+          "cv": 0.04931243299920716,
+          "interpretation": "numerator/denominator; <1 means numerator faster",
+          "mad": 0.014421742571620433,
+          "max": 1.1290308912863245,
+          "mean": 1.0211734073543135,
+          "median": 1.0207778928585571,
+          "median_ci95_bootstrap": [
+            1.0045076590936617,
+            1.0351996354301776
+          ],
+          "min": 0.8985065471228265,
+          "n": 15,
+          "outlier_count_mad": 2,
+          "raw": [
+            {
+              "ratio": 1.0045076590936617,
+              "round": 0
+            },
+            {
+              "ratio": 0.9752644918638752,
+              "round": 1
+            },
+            {
+              "ratio": 1.0127701131324578,
+              "round": 2
+            },
+            {
+              "ratio": 1.0351996354301776,
+              "round": 3
+            },
+            {
+              "ratio": 0.9831403834422243,
+              "round": 4
+            },
+            {
+              "ratio": 1.0233804318348816,
+              "round": 5
+            },
+            {
+              "ratio": 1.0196443234768828,
+              "round": 6
+            },
+            {
+              "ratio": 1.029639615175576,
+              "round": 7
+            },
+            {
+              "ratio": 1.1290308912863245,
+              "round": 8
+            },
+            {
+              "ratio": 1.0603152302700074,
+              "round": 9
+            },
+            {
+              "ratio": 1.0761023839208377,
+              "round": 10
+            },
+            {
+              "ratio": 0.8985065471228265,
+              "round": 11
+            },
+            {
+              "ratio": 1.0305203836166923,
+              "round": 12
+            },
+            {
+              "ratio": 1.018801127789721,
+              "round": 13
+            },
+            {
+              "ratio": 1.0207778928585571,
+              "round": 14
+            }
+          ],
+          "stdev": 0.050356545230731665
+        },
+        "lccc": {
+          "cv": 0.045668719622854154,
+          "interpretation": "numerator/denominator; <1 means numerator faster",
+          "mad": 0.0247039549628163,
+          "max": 1.1813138527635498,
+          "mean": 1.0504597580150548,
+          "median": 1.0454114193125754,
+          "median_ci95_bootstrap": [
+            1.0231290178097894,
+            1.0562571348363956
+          ],
+          "min": 1.0001990095503797,
+          "n": 15,
+          "outlier_count_mad": 1,
+          "raw": [
+            {
+              "ratio": 1.047373731453085,
+              "round": 0
+            },
+            {
+              "ratio": 1.0793019703273627,
+              "round": 1
+            },
+            {
+              "ratio": 1.1813138527635498,
+              "round": 2
+            },
+            {
+              "ratio": 1.0562571348363956,
+              "round": 3
+            },
+            {
+              "ratio": 1.0701153742753917,
+              "round": 4
+            },
+            {
+              "ratio": 1.0374679878190265,
+              "round": 5
+            },
+            {
+              "ratio": 1.0454114193125754,
+              "round": 6
+            },
+            {
+              "ratio": 1.0515554266470573,
+              "round": 7
+            },
+            {
+              "ratio": 1.0231290178097894,
+              "round": 8
+            },
+            {
+              "ratio": 1.0308063914969277,
+              "round": 9
+            },
+            {
+              "ratio": 1.005054533623095,
+              "round": 10
+            },
+            {
+              "ratio": 1.0001990095503797,
+              "round": 11
+            },
+            {
+              "ratio": 1.1146207839078204,
+              "round": 12
+            },
+            {
+              "ratio": 1.0021292643201356,
+              "round": 13
+            },
+            {
+              "ratio": 1.0121604720832282,
+              "round": 14
+            }
+          ],
+          "stdev": 0.047973152163880754
+        },
+        "scalar": {
+          "cv": 0.053381094081979184,
+          "interpretation": "numerator/denominator; <1 means numerator faster",
+          "mad": 0.04148911279962686,
+          "max": 4.738387945930546,
+          "mean": 4.078458906125841,
+          "median": 4.086904914176867,
+          "median_ci95_bootstrap": [
+            3.947476054497899,
+            4.105208165162168
+          ],
+          "min": 3.7853647698943997,
+          "n": 15,
+          "outlier_count_mad": 4,
+          "raw": [
+            {
+              "ratio": 4.105208165162168,
+              "round": 0
+            },
+            {
+              "ratio": 3.7853647698943997,
+              "round": 1
+            },
+            {
+              "ratio": 4.085838890117098,
+              "round": 2
+            },
+            {
+              "ratio": 4.052038486637121,
+              "round": 3
+            },
+            {
+              "ratio": 4.086904914176867,
+              "round": 4
+            },
+            {
+              "ratio": 4.1553851113480365,
+              "round": 5
+            },
+            {
+              "ratio": 4.087915863487226,
+              "round": 6
+            },
+            {
+              "ratio": 4.180480526975665,
+              "round": 7
+            },
+            {
+              "ratio": 4.0961953322566265,
+              "round": 8
+            },
+            {
+              "ratio": 4.04541580137724,
+              "round": 9
+            },
+            {
+              "ratio": 3.8700045219959605,
+              "round": 10
+            },
+            {
+              "ratio": 3.8309707613377655,
+              "round": 11
+            },
+            {
+              "ratio": 4.1092964466929995,
+              "round": 12
+            },
+            {
+              "ratio": 3.947476054497899,
+              "round": 13
+            },
+            {
+              "ratio": 4.738387945930546,
+              "round": 14
+            }
+          ],
+          "stdev": 0.21771259857738945
+        }
+      },
+      "rounds": [
+        {
+          "order": [
+            "gcc",
+            "clang",
+            "lccc",
+            "scalar"
+          ],
+          "round": 0,
+          "runs": {
+            "clang": {
+              "child_cpu_s": 0.25112499999999915,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 0.251561958
+            },
+            "gcc": {
+              "child_cpu_s": 0.24995300000000054,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 0.250433091
+            },
+            "lccc": {
+              "child_cpu_s": 0.26180500000000073,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 0.262297041
+            },
+            "scalar": {
+              "child_cpu_s": 1.0272959999999998,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/scalar/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 1.02807997
+            }
+          }
+        },
+        {
+          "order": [
+            "clang",
+            "gcc",
+            "lccc",
+            "scalar"
+          ],
+          "round": 1,
+          "runs": {
+            "clang": {
+              "child_cpu_s": 0.26160100000000064,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 0.262209307
+            },
+            "gcc": {
+              "child_cpu_s": 0.2683200000000001,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 0.268859688
+            },
+            "lccc": {
+              "child_cpu_s": 0.28720499999999927,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 0.290180791
+            },
+            "scalar": {
+              "child_cpu_s": 1.0170730000000008,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/scalar/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 1.017731991
+            }
+          }
+        },
+        {
+          "order": [
+            "scalar",
+            "gcc",
+            "lccc",
+            "clang"
+          ],
+          "round": 2,
+          "runs": {
+            "clang": {
+              "child_cpu_s": 0.2542200000000001,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 0.254587848
+            },
+            "gcc": {
+              "child_cpu_s": 0.25093099999999957,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 0.251377726
+            },
+            "lccc": {
+              "child_cpu_s": 0.2965990000000005,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 0.29695599
+            },
+            "scalar": {
+              "child_cpu_s": 1.0265350000000009,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/scalar/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 1.027088889
+            }
+          }
+        },
+        {
+          "order": [
+            "clang",
+            "gcc",
+            "lccc",
+            "scalar"
+          ],
+          "round": 3,
+          "runs": {
+            "clang": {
+              "child_cpu_s": 0.256219999999999,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 0.258672541
+            },
+            "gcc": {
+              "child_cpu_s": 0.24949499999999958,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 0.249876963
+            },
+            "lccc": {
+              "child_cpu_s": 0.26345500000000044,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 0.263934325
+            },
+            "scalar": {
+              "child_cpu_s": 1.0120880000000003,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/scalar/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 1.012511071
+            }
+          }
+        },
+        {
+          "order": [
+            "clang",
+            "scalar",
+            "gcc",
+            "lccc"
+          ],
+          "round": 4,
+          "runs": {
+            "clang": {
+              "child_cpu_s": 0.2523799999999987,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 0.252755455
+            },
+            "gcc": {
+              "child_cpu_s": 0.2565450000000009,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 0.257089892
+            },
+            "lccc": {
+              "child_cpu_s": 0.2745679999999986,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 0.275115846
+            },
+            "scalar": {
+              "child_cpu_s": 1.0502350000000007,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/scalar/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 1.050701943
+            }
+          }
+        },
+        {
+          "order": [
+            "lccc",
+            "clang",
+            "gcc",
+            "scalar"
+          ],
+          "round": 5,
+          "runs": {
+            "clang": {
+              "child_cpu_s": 0.25955199999999934,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 0.259997165
+            },
+            "gcc": {
+              "child_cpu_s": 0.25221799999999917,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 0.254057198
+            },
+            "lccc": {
+              "child_cpu_s": 0.26308600000000126,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 0.26357621
+            },
+            "scalar": {
+              "child_cpu_s": 1.055136000000001,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/scalar/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 1.055705498
+            }
+          }
+        },
+        {
+          "order": [
+            "gcc",
+            "scalar",
+            "clang",
+            "lccc"
+          ],
+          "round": 6,
+          "runs": {
+            "clang": {
+              "child_cpu_s": 0.2560500000000019,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 0.256500791
+            },
+            "gcc": {
+              "child_cpu_s": 0.25094700000000003,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 0.251559083
+            },
+            "lccc": {
+              "child_cpu_s": 0.26239599999999896,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 0.262982738
+            },
+            "scalar": {
+              "child_cpu_s": 1.0274149999999977,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/scalar/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 1.028352366
+            }
+          }
+        },
+        {
+          "order": [
+            "scalar",
+            "lccc",
+            "gcc",
+            "clang"
+          ],
+          "round": 7,
+          "runs": {
+            "clang": {
+              "child_cpu_s": 0.2567610000000009,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 0.257228749
+            },
+            "gcc": {
+              "child_cpu_s": 0.24935800000000086,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 0.24982406
+            },
+            "lccc": {
+              "child_cpu_s": 0.2622940000000007,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 0.262703846
+            },
+            "scalar": {
+              "child_cpu_s": 1.0437939999999983,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/scalar/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 1.044384618
+            }
+          }
+        },
+        {
+          "order": [
+            "lccc",
+            "scalar",
+            "gcc",
+            "clang"
+          ],
+          "round": 8,
+          "runs": {
+            "clang": {
+              "child_cpu_s": 0.2881149999999977,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 0.288612174
+            },
+            "gcc": {
+              "child_cpu_s": 0.2552380000000021,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 0.255628235
+            },
+            "lccc": {
+              "child_cpu_s": 0.26085899999999995,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 0.261540665
+            },
+            "scalar": {
+              "child_cpu_s": 1.0465729999999986,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/scalar/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 1.047103183
+            }
+          }
+        },
+        {
+          "order": [
+            "clang",
+            "scalar",
+            "gcc",
+            "lccc"
+          ],
+          "round": 9,
+          "runs": {
+            "clang": {
+              "child_cpu_s": 0.266058000000001,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 0.266527494
+            },
+            "gcc": {
+              "child_cpu_s": 0.25092599999999976,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 0.251366279
+            },
+            "lccc": {
+              "child_cpu_s": 0.2586510000000004,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 0.259109967
+            },
+            "scalar": {
+              "child_cpu_s": 1.016300000000001,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/scalar/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 1.016881117
+            }
+          }
+        },
+        {
+          "order": [
+            "clang",
+            "gcc",
+            "lccc",
+            "scalar"
+          ],
+          "round": 10,
+          "runs": {
+            "clang": {
+              "child_cpu_s": 0.2889330000000001,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 0.289365189
+            },
+            "gcc": {
+              "child_cpu_s": 0.2682859999999998,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 0.268901169
+            },
+            "lccc": {
+              "child_cpu_s": 0.26978499999999883,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 0.270260339
+            },
+            "scalar": {
+              "child_cpu_s": 1.0401939999999996,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/scalar/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 1.04064874
+            }
+          }
+        },
+        {
+          "order": [
+            "clang",
+            "gcc",
+            "scalar",
+            "lccc"
+          ],
+          "round": 11,
+          "runs": {
+            "clang": {
+              "child_cpu_s": 0.2524940000000022,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 0.252856504
+            },
+            "gcc": {
+              "child_cpu_s": 0.2810539999999975,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 0.281418655
+            },
+            "lccc": {
+              "child_cpu_s": 0.28085300000000046,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 0.28147466
+            },
+            "scalar": {
+              "child_cpu_s": 1.0775770000000016,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/scalar/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 1.078106639
+            }
+          }
+        },
+        {
+          "order": [
+            "scalar",
+            "clang",
+            "gcc",
+            "lccc"
+          ],
+          "round": 12,
+          "runs": {
+            "clang": {
+              "child_cpu_s": 0.25964500000000257,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 0.260127594
+            },
+            "gcc": {
+              "child_cpu_s": 0.2519439999999946,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 0.252423531
+            },
+            "lccc": {
+              "child_cpu_s": 0.28080699999999936,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 0.281356514
+            },
+            "scalar": {
+              "child_cpu_s": 1.03369,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/scalar/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 1.037283119
+            }
+          }
+        },
+        {
+          "order": [
+            "gcc",
+            "lccc",
+            "clang",
+            "scalar"
+          ],
+          "round": 13,
+          "runs": {
+            "clang": {
+              "child_cpu_s": 0.2670980000000043,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 0.267652101
+            },
+            "gcc": {
+              "child_cpu_s": 0.26215400000000244,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 0.262712804
+            },
+            "lccc": {
+              "child_cpu_s": 0.262794999999997,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 0.263272189
+            },
+            "scalar": {
+              "child_cpu_s": 1.0365649999999995,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/scalar/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 1.037052503
+            }
+          }
+        },
+        {
+          "order": [
+            "clang",
+            "gcc",
+            "lccc",
+            "scalar"
+          ],
+          "round": 14,
+          "runs": {
+            "clang": {
+              "child_cpu_s": 0.26197199999999654,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 0.262523389
+            },
+            "gcc": {
+              "child_cpu_s": 0.2567610000000009,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 0.257179736
+            },
+            "lccc": {
+              "child_cpu_s": 0.2598930000000017,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 0.260307163
+            },
+            "scalar": {
+              "child_cpu_s": 1.2181800000000038,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/sse1/performance/f32_sse1_map/scalar/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "5612d63b3564ff24\n",
+              "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+              "wall_s": 1.218617361
+            }
+          }
+        }
+      ],
+      "runs": {
+        "clang": [
+          {
+            "child_cpu_s": 0.25112499999999915,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 0.251561958
+          },
+          {
+            "child_cpu_s": 0.26160100000000064,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 0.262209307
+          },
+          {
+            "child_cpu_s": 0.2542200000000001,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 0.254587848
+          },
+          {
+            "child_cpu_s": 0.256219999999999,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 0.258672541
+          },
+          {
+            "child_cpu_s": 0.2523799999999987,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 0.252755455
+          },
+          {
+            "child_cpu_s": 0.25955199999999934,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 0.259997165
+          },
+          {
+            "child_cpu_s": 0.2560500000000019,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 0.256500791
+          },
+          {
+            "child_cpu_s": 0.2567610000000009,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 0.257228749
+          },
+          {
+            "child_cpu_s": 0.2881149999999977,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 0.288612174
+          },
+          {
+            "child_cpu_s": 0.266058000000001,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 0.266527494
+          },
+          {
+            "child_cpu_s": 0.2889330000000001,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 0.289365189
+          },
+          {
+            "child_cpu_s": 0.2524940000000022,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 0.252856504
+          },
+          {
+            "child_cpu_s": 0.25964500000000257,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 0.260127594
+          },
+          {
+            "child_cpu_s": 0.2670980000000043,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 0.267652101
+          },
+          {
+            "child_cpu_s": 0.26197199999999654,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 0.262523389
+          }
+        ],
+        "gcc": [
+          {
+            "child_cpu_s": 0.24995300000000054,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 0.250433091
+          },
+          {
+            "child_cpu_s": 0.2683200000000001,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 0.268859688
+          },
+          {
+            "child_cpu_s": 0.25093099999999957,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 0.251377726
+          },
+          {
+            "child_cpu_s": 0.24949499999999958,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 0.249876963
+          },
+          {
+            "child_cpu_s": 0.2565450000000009,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 0.257089892
+          },
+          {
+            "child_cpu_s": 0.25221799999999917,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 0.254057198
+          },
+          {
+            "child_cpu_s": 0.25094700000000003,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 0.251559083
+          },
+          {
+            "child_cpu_s": 0.24935800000000086,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 0.24982406
+          },
+          {
+            "child_cpu_s": 0.2552380000000021,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 0.255628235
+          },
+          {
+            "child_cpu_s": 0.25092599999999976,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 0.251366279
+          },
+          {
+            "child_cpu_s": 0.2682859999999998,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 0.268901169
+          },
+          {
+            "child_cpu_s": 0.2810539999999975,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 0.281418655
+          },
+          {
+            "child_cpu_s": 0.2519439999999946,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 0.252423531
+          },
+          {
+            "child_cpu_s": 0.26215400000000244,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 0.262712804
+          },
+          {
+            "child_cpu_s": 0.2567610000000009,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 0.257179736
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 0.26180500000000073,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 0.262297041
+          },
+          {
+            "child_cpu_s": 0.28720499999999927,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 0.290180791
+          },
+          {
+            "child_cpu_s": 0.2965990000000005,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 0.29695599
+          },
+          {
+            "child_cpu_s": 0.26345500000000044,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 0.263934325
+          },
+          {
+            "child_cpu_s": 0.2745679999999986,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 0.275115846
+          },
+          {
+            "child_cpu_s": 0.26308600000000126,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 0.26357621
+          },
+          {
+            "child_cpu_s": 0.26239599999999896,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 0.262982738
+          },
+          {
+            "child_cpu_s": 0.2622940000000007,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 0.262703846
+          },
+          {
+            "child_cpu_s": 0.26085899999999995,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 0.261540665
+          },
+          {
+            "child_cpu_s": 0.2586510000000004,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 0.259109967
+          },
+          {
+            "child_cpu_s": 0.26978499999999883,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 0.270260339
+          },
+          {
+            "child_cpu_s": 0.28085300000000046,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 0.28147466
+          },
+          {
+            "child_cpu_s": 0.28080699999999936,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 0.281356514
+          },
+          {
+            "child_cpu_s": 0.262794999999997,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 0.263272189
+          },
+          {
+            "child_cpu_s": 0.2598930000000017,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 0.260307163
+          }
+        ],
+        "scalar": [
+          {
+            "child_cpu_s": 1.0272959999999998,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/scalar/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 1.02807997
+          },
+          {
+            "child_cpu_s": 1.0170730000000008,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/scalar/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 1.017731991
+          },
+          {
+            "child_cpu_s": 1.0265350000000009,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/scalar/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 1.027088889
+          },
+          {
+            "child_cpu_s": 1.0120880000000003,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/scalar/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 1.012511071
+          },
+          {
+            "child_cpu_s": 1.0502350000000007,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/scalar/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 1.050701943
+          },
+          {
+            "child_cpu_s": 1.055136000000001,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/scalar/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 1.055705498
+          },
+          {
+            "child_cpu_s": 1.0274149999999977,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/scalar/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 1.028352366
+          },
+          {
+            "child_cpu_s": 1.0437939999999983,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/scalar/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 1.044384618
+          },
+          {
+            "child_cpu_s": 1.0465729999999986,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/scalar/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 1.047103183
+          },
+          {
+            "child_cpu_s": 1.016300000000001,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/scalar/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 1.016881117
+          },
+          {
+            "child_cpu_s": 1.0401939999999996,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/scalar/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 1.04064874
+          },
+          {
+            "child_cpu_s": 1.0775770000000016,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/scalar/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 1.078106639
+          },
+          {
+            "child_cpu_s": 1.03369,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/scalar/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 1.037283119
+          },
+          {
+            "child_cpu_s": 1.0365649999999995,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/scalar/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 1.037052503
+          },
+          {
+            "child_cpu_s": 1.2181800000000038,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/scalar/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 1.218617361
+          }
+        ]
+      },
+      "runtime": {
+        "clang": {
+          "child_cpu": {
+            "cv": 0.044662731186150204,
+            "mad": 0.005331999999999226,
+            "max": 0.2889330000000001,
+            "mean": 0.26214826666666696,
+            "median": 0.25955199999999934,
+            "median_ci95_bootstrap": [
+              0.2560500000000019,
+              0.26197199999999654
+            ],
+            "min": 0.25112499999999915,
+            "n": 15,
+            "outlier_count_mad": 2,
+            "stdev": 0.011708257565048567
+          },
+          "quality_warnings": [
+            "2 MAD outlier(s) retained (never silently discarded)"
+          ],
+          "raw_wall_s": [
+            0.251561958,
+            0.262209307,
+            0.254587848,
+            0.258672541,
+            0.252755455,
+            0.259997165,
+            0.256500791,
+            0.257228749,
+            0.288612174,
+            0.266527494,
+            0.289365189,
+            0.252856504,
+            0.260127594,
+            0.267652101,
+            0.262523389
+          ],
+          "wall": {
+            "cv": 0.04440868516952392,
+            "mad": 0.005409316999999969,
+            "max": 0.289365189,
+            "mean": 0.26274521726666666,
+            "median": 0.259997165,
+            "median_ci95_bootstrap": [
+              0.254587848,
+              0.262523389
+            ],
+            "min": 0.251561958,
+            "n": 15,
+            "outlier_count_mad": 2,
+            "stdev": 0.01166816963339356
+          }
+        },
+        "gcc": {
+          "child_cpu": {
+            "cv": 0.035839184429727874,
+            "mad": 0.0028599999999983083,
+            "max": 0.2810539999999975,
+            "mean": 0.25694199999999984,
+            "median": 0.25221799999999917,
+            "median_ci95_bootstrap": [
+              0.25092599999999976,
+              0.26215400000000244
+            ],
+            "min": 0.24935800000000086,
+            "n": 15,
+            "outlier_count_mad": 3,
+            "stdev": 0.009208591725743134
+          },
+          "quality_warnings": [
+            "1 MAD outlier(s) retained (never silently discarded)"
+          ],
+          "raw_wall_s": [
+            0.250433091,
+            0.268859688,
+            0.251377726,
+            0.249876963,
+            0.257089892,
+            0.254057198,
+            0.251559083,
+            0.24982406,
+            0.255628235,
+            0.251366279,
+            0.268901169,
+            0.281418655,
+            0.252423531,
+            0.262712804,
+            0.257179736
+          ],
+          "wall": {
+            "cv": 0.03560709959733169,
+            "mad": 0.003122538000000008,
+            "max": 0.281418655,
+            "mean": 0.257513874,
+            "median": 0.254057198,
+            "median_ci95_bootstrap": [
+              0.251366279,
+              0.262712804
+            ],
+            "min": 0.24982406,
+            "n": 15,
+            "outlier_count_mad": 1,
+            "stdev": 0.009169322159212722
+          }
+        },
+        "lccc": {
+          "child_cpu": {
+            "cv": 0.04318599336715269,
+            "mad": 0.0031929999999995573,
+            "max": 0.2965990000000005,
+            "mean": 0.26967006666666654,
+            "median": 0.26308600000000126,
+            "median_ci95_bootstrap": [
+              0.26180500000000073,
+              0.2745679999999986
+            ],
+            "min": 0.2586510000000004,
+            "n": 15,
+            "outlier_count_mad": 4,
+            "stdev": 0.011645969710386285
+          },
+          "quality_warnings": [
+            "4 MAD outlier(s) retained (never silently discarded)"
+          ],
+          "raw_wall_s": [
+            0.262297041,
+            0.290180791,
+            0.29695599,
+            0.263934325,
+            0.275115846,
+            0.26357621,
+            0.262982738,
+            0.262703846,
+            0.261540665,
+            0.259109967,
+            0.270260339,
+            0.28147466,
+            0.281356514,
+            0.263272189,
+            0.260307163
+          ],
+          "wall": {
+            "cv": 0.044082794740038844,
+            "mad": 0.0032690469999999694,
+            "max": 0.29695599,
+            "mean": 0.2703378856,
+            "median": 0.26357621,
+            "median_ci95_bootstrap": [
+              0.262703846,
+              0.281356514
+            ],
+            "min": 0.259109967,
+            "n": 15,
+            "outlier_count_mad": 4,
+            "stdev": 0.011917249521360902
+          }
+        },
+        "scalar": {
+          "child_cpu": {
+            "cv": 0.04759322969577158,
+            "mad": 0.010029999999998651,
+            "max": 1.2181800000000038,
+            "mean": 1.0485767333333336,
+            "median": 1.0365649999999995,
+            "median_ci95_bootstrap": [
+              1.0265350000000009,
+              1.0465729999999986
+            ],
+            "min": 1.0120880000000003,
+            "n": 15,
+            "outlier_count_mad": 1,
+            "stdev": 0.04990515332317517
+          },
+          "quality_warnings": [
+            "1 MAD outlier(s) retained (never silently discarded)"
+          ],
+          "raw_wall_s": [
+            1.02807997,
+            1.017731991,
+            1.027088889,
+            1.012511071,
+            1.050701943,
+            1.055705498,
+            1.028352366,
+            1.044384618,
+            1.047103183,
+            1.016881117,
+            1.04064874,
+            1.078106639,
+            1.037283119,
+            1.037052503,
+            1.218617361
+          ],
+          "wall": {
+            "cv": 0.04745945836856574,
+            "mad": 0.01019422999999997,
+            "max": 1.218617361,
+            "mean": 1.0493499338666665,
+            "median": 1.037283119,
+            "median_ci95_bootstrap": [
+              1.027088889,
+              1.047103183
+            ],
+            "min": 1.012511071,
+            "n": 15,
+            "outlier_count_mad": 1,
+            "stdev": 0.049801579500402274
+          }
+        }
+      },
+      "source": "/home/user/lccc/tests/benchmark/programs/f32_sse1_map.c",
+      "source_sha256": "175801bac9a87fff4054417367b2a32131fb285a8824529ecbed7070a3ef8c5e",
+      "tags": [
+        "synthetic",
+        "simd",
+        "fp",
+        "map",
+        "sse1"
+      ],
+      "warmups": {
+        "clang": [
+          {
+            "child_cpu_s": 0.259487,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 0.260004905
+          },
+          {
+            "child_cpu_s": 0.25815600000000005,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 0.258849896
+          }
+        ],
+        "gcc": [
+          {
+            "child_cpu_s": 0.28040699999999985,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 0.280924566
+          },
+          {
+            "child_cpu_s": 0.24981399999999976,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 0.250430366
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 0.270883,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 0.271318064
+          },
+          {
+            "child_cpu_s": 0.2580689999999999,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 0.258551047
+          }
+        ],
+        "scalar": [
+          {
+            "child_cpu_s": 1.2671059999999998,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/scalar/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 1.26780046
+          },
+          {
+            "child_cpu_s": 1.057096,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/sse1/performance/f32_sse1_map/scalar/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "5612d63b3564ff24\n",
+            "stdout_sha256": "57b9d0312e81c82475b77e7852f8f5d8e07e9f74b53d26ae8551d04a24fa2b7a",
+            "wall_s": 1.057767131
+          }
+        ]
+      },
+      "warnings": []
+    }
+  ],
+  "compilers": [
+    {
+      "binary_sha256": "f69461ca6d6988760a534d955a6c940b4d69cc6d49296fc60e5475862435658b",
+      "executable": "/home/user/lccc/target/fastbuild/lccc",
+      "flags": [
+        "-I/home/user/tools/gcc-16/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+        "-O2"
+      ],
+      "key": "lccc",
+      "label": "LCCC"
+    },
+    {
+      "binary_sha256": "67ed99639f746b8e83e4e685a7189ae1172fb9c23a3e83aa9b09a1d68f3fb1c2",
+      "executable": "/home/user/tools/gcc-16/bin/gcc-16",
+      "flags": [
+        "-O2"
+      ],
+      "key": "gcc",
+      "label": "GCC"
+    },
+    {
+      "binary_sha256": "66d31b319924d93605b3972c547ed8c0c7b2d3f9dde646c7eebffaa236273cdc",
+      "executable": "/home/user/tools/oracle-bin/clang-23",
+      "flags": [
+        "-O2"
+      ],
+      "key": "clang",
+      "label": "Clang"
+    },
+    {
+      "binary_sha256": "e13de2b8806e99e41f8f9688345294ad1c242d268cc5b6db1d5af8e97da51351",
+      "executable": "/home/user/artifacts/sse1/scalar/lccc",
+      "flags": [
+        "-I/home/user/tools/gcc-16/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+        "-O2"
+      ],
+      "key": "scalar",
+      "label": "LCCC candidate: scalar"
+    }
+  ],
+  "complete": true,
+  "metadata": {
+    "compiler_versions": {
+      "clang": "clang version 23.1.3 (https://github.com/llvm/llvm-project 0d261d1ca552c95a8f007e061c787ac7132fbcbc)",
+      "gcc": "gcc-16 (GCC) 16.2.0",
+      "lccc": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0",
+      "scalar": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0"
+    },
+    "cpu_governors": {},
+    "cpu_models": [
+      "Intel(R) Xeon(R) Processor @ 2.60GHz"
+    ],
+    "git": {
+      "repo": "/home/user/lccc",
+      "revision": "bcb344cba291eb56037231ad3a8f42832cc301b7\n",
+      "status": " M backlog.md\n M engineering/agent/BACKLOG.md\n M src/passes/vectorize.rs\n M tests/regression/check_sse1_f32_map.py\n"
+    },
+    "hypervisor_detected": true,
+    "meminfo": "MemTotal:        4034452 kB\nMemFree:         2611936 kB\nMemAvailable:    3717796 kB\nBuffers:            7420 kB\nCached:          1265040 kB\nSwapCached:         1316 kB\nActive:           610248 kB\nInactive:         690440 kB\nActive(anon):       5752 kB\nInactive(anon):    23136 kB\nActive(file):     604496 kB\nInactive(file):   667304 kB\nUnevictable:           8 kB\nMlocked:               4 kB\nSwapTotal:       8388604 kB\nSwapFree:        8382276 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:               320 kB\nWriteback:             0 kB\nAnonPages:         27136 kB\nMapped:            20068 kB\nShmem:               656 kB\nKReclaimable:      77360 kB\nSlab:              95020 kB\nSReclaimable:      77360 kB\nSUnreclaim:        17660 kB\nKernelStack:        1288 kB\nPageTables:          984 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    10405828 kB\nCommitted_AS:     146884 kB\nVmallocTotal:   34359738367 kB\nVmallocUsed:        6440 kB\nVmallocChunk:          0 kB\nPercpu:              592 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:       2048 kB\nHugetlb:               0 kB\nDirectMap4k:       36864 kB\nDirectMap2M:     2060288 kB\nDirectMap1G:     4194304 kB",
+    "pinning": {
+      "allowed_cpus": [
+        0,
+        1
+      ],
+      "applied": true,
+      "cpu": 0,
+      "reason": "taskset pinning",
+      "requested": "auto"
+    },
+    "platform": "Linux-6.1.158+-x86_64-with-glibc2.36",
+    "pmu": {
+      "available": false,
+      "perf_event_paranoid": "2",
+      "perf_path": null,
+      "probed": false,
+      "reason": "not probed"
+    },
+    "python": "3.11.2 (main, Apr  8 2026, 01:58:00) [GCC 12.2.0]",
+    "swap": "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n/swapfile                               file\t\t8388604\t\t6328\t\t-2",
+    "timestamp_utc": "2026-10-25T00:33:00.876752+00:00",
+    "uname": [
+      "Linux",
+      "e2b.local",
+      "6.1.158+",
+      "#1 SMP PREEMPT_DYNAMIC Mon May 11 18:48:24 UTC 2026",
+      "x86_64"
+    ],
+    "work_root": {
+      "candidates": [
+        {
+          "free_bytes": 4583108608,
+          "path": "/home/user/lccc"
+        },
+        {
+          "free_bytes": 4583108608,
+          "path": "/var/tmp"
+        },
+        {
+          "free_bytes": 4583108608,
+          "path": "/tmp"
+        }
+      ],
+      "free_bytes": 4583108608,
+      "reason": "largest writable candidate among repository, /var/tmp, /tmp",
+      "selected": "/home/user/lccc"
+    }
+  },
+  "runner_warnings": [],
+  "schema": "lccc-bench-v2",
+  "settings": {
+    "common_cflags": [],
+    "compiler_order_policy": "randomized independently in every paired round",
+    "opt": "-O2",
+    "outlier_policy": "MAD outliers counted and reported; none are removed",
+    "reps": 15,
+    "seed": 20260810,
+    "skip_perf": false,
+    "timer": "time.perf_counter_ns wall-clock plus resource.RUSAGE_CHILDREN CPU time",
+    "warmup": 2
+  },
+  "unavailable_compilers": {}
+}

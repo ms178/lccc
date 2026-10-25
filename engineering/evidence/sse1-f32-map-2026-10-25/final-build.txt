@@ -1,0 +1,2 @@
+   Compiling lccc v0.1.0 (/home/user/lccc)
+    Finished `fastbuild` profile [optimized + debuginfo] target(s) in 2m 08s

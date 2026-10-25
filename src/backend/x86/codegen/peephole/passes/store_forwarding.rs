@@ -526,13 +526,17 @@ fn parse_xmm_family(text: &str) -> Option<RegId> {
 /// is `movd` (not `movl`) when an XMM register is the operand, and the
 /// SD/SS forms are `movsd`/`movss`.
 fn xmm_mnemonic(size: MoveSize) -> Option<&'static str> {
+    xmm_mnemonic_for_isa(size, crate::backend::x86::isa::current().simd)
+}
+
+fn xmm_mnemonic_for_isa(size: MoveSize, sse2: bool) -> Option<&'static str> {
     match size {
-        MoveSize::SD => Some("movsd"),
+        MoveSize::SD if sse2 => Some("movsd"),
         MoveSize::SS => Some("movss"),
-        MoveSize::Q => Some("movq"),
-        MoveSize::L => Some("movd"),
-        MoveSize::DQ => Some("movdqu"),
-        MoveSize::W | MoveSize::B | MoveSize::SLQ => None,
+        MoveSize::Q if sse2 => Some("movq"),
+        MoveSize::L if sse2 => Some("movd"),
+        MoveSize::DQ => Some(if sse2 { "movdqu" } else { "movups" }),
+        _ => None,
     }
 }
 
@@ -695,7 +699,10 @@ fn gsf_handle_load(
                     changed = true;
                 }
             }
-        } else if is_xmm_family(mapping.reg_id) && load_reg != REG_NONE {
+        } else if is_xmm_family(mapping.reg_id)
+            && load_reg != REG_NONE
+            && crate::backend::x86::isa::current().simd
+        {
             // XMM-BACKED mapping read by a GP load: bit-exact reinterpret
             // forwards. The stored SD(8)/Q(8)/SS(4)/L(4) bytes equal the
             // backing XMM's low bits, and the GP move forms observe exactly
@@ -1144,12 +1151,14 @@ fn gsf_handle_load_xmm(
             } else {
                 let vex = infos[i].trimmed(store.get(i)).starts_with('v');
                 let replacement = match (load_size, vex) {
-                    (MoveSize::SD | MoveSize::Q, _) => Some(format!(
-                        "    {}movq %xmm{}, %xmm{}",
-                        if vex { "v" } else { "" },
-                        src - 24,
-                        dst - 24
-                    )),
+                    (MoveSize::SD | MoveSize::Q, _) if crate::backend::x86::isa::current().simd => {
+                        Some(format!(
+                            "    {}movq %xmm{}, %xmm{}",
+                            if vex { "v" } else { "" },
+                            src - 24,
+                            dst - 24
+                        ))
+                    }
                     // 16-byte register-to-register moves carry no alignment
                     // requirement, so the load's own mnemonic is always
                     // emittable and always the faithful choice: an aligned
@@ -1183,7 +1192,10 @@ fn gsf_handle_load_xmm(
                     changed = true;
                 }
             }
-        } else if bytes_match && is_valid_gp_reg(mapping.reg_id) {
+        } else if bytes_match
+            && is_valid_gp_reg(mapping.reg_id)
+            && crate::backend::x86::isa::current().simd
+        {
             if try_pair_fuse_gp_to_xmm_relay(
                 store,
                 infos,
@@ -2159,6 +2171,20 @@ mod tests {
             .find(|&i| store.get(i).contains("movsd 72(%rsp), %xmm12"))
             .expect("relay load line");
         assert!(infos[load_idx].is_nop(), "the relay load must be nop'd");
+    }
+
+    #[test]
+    fn sse1_raw_copy_mnemonics_do_not_require_sse2() {
+        // Test pure policy: mutating the process-global ISA here would race
+        // unrelated emitter tests. Native no-RA coverage exercises both
+        // cross-domain forwarding directions under the real driver state.
+        assert_eq!(xmm_mnemonic_for_isa(MoveSize::SS, false), Some("movss"));
+        assert_eq!(xmm_mnemonic_for_isa(MoveSize::DQ, false), Some("movups"));
+        for size in [MoveSize::L, MoveSize::Q, MoveSize::SD] {
+            assert_eq!(xmm_mnemonic_for_isa(size, false), None);
+        }
+        assert_eq!(xmm_mnemonic_for_isa(MoveSize::L, true), Some("movd"));
+        assert_eq!(xmm_mnemonic_for_isa(MoveSize::DQ, true), Some("movdqu"));
     }
 
     #[test]
