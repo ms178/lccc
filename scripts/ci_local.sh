@@ -1352,6 +1352,7 @@ gate "count-observations" fast python3 tests/regression/check_count_observations
 gate "llvm-scalar-logic" fast python3 tests/regression/check_llvm_scalar_logic.py
 gate "llvm-predicate-relations" fast python3 tests/regression/check_llvm_predicate_relations.py
 gate "packed-vector-relations" fast python3 tests/regression/check_packed_vector_relations.py
+gate "shuffle-composition" fast python3 tests/regression/check_shuffle_composition.py
 gate "integer-order-networks" fast python3 tests/regression/check_integer_order_networks.py --arm target/fastbuild/lccc-arm
 
 # Dual-layout metric pair: assembly identity across serial/auto/forced, kill
