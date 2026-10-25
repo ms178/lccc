@@ -1792,13 +1792,33 @@ impl Lowerer {
             } else {
                 self.load_vector_lane(rhs_val, &rhs_ct, lane, AddressSpace::Default, rhs_volatile)
             };
-            let result = self.emit_binop_val(ir_op, lhs_elem, rhs_elem, elem_ir_ty);
+            // Small integer shifts must consume the lane's low bits, not a
+            // potentially unnormalized register home forwarded from an earlier
+            // lane store. The scalar backend shifts at 32/64-bit width; make
+            // the extension explicit before that shift and narrow on storage.
+            // In particular, (i16(x << 7) >> 7) must discard the high bits of
+            // the first shift before doing the arithmetic right shift.
+            let shift_ty = if matches!(op, BinOp::Shl | BinOp::Shr)
+                && !elem_ir_ty.is_float()
+                && elem_ir_ty.size() < 4
+            {
+                if is_unsigned {
+                    IrType::U32
+                } else {
+                    IrType::I32
+                }
+            } else {
+                elem_ir_ty
+            };
+            let lhs_elem = self.emit_implicit_cast(lhs_elem, elem_ir_ty, shift_ty);
+            let rhs_elem = self.emit_implicit_cast(rhs_elem, elem_ir_ty, shift_ty);
+            let result = self.emit_binop_val(ir_op, lhs_elem, rhs_elem, shift_ty);
             self.store_vector_lane(
                 result_alloca,
                 vec_ct,
                 lane,
                 Operand::Value(result),
-                elem_ir_ty,
+                shift_ty,
                 AddressSpace::Default,
                 false,
             );

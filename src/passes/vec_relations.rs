@@ -12,6 +12,9 @@ use crate::ir::reexports::{
 #[path = "vec_shuffle.rs"]
 mod shuffle;
 
+#[path = "vec_mask_shifts.rs"]
+mod mask_shifts;
+
 #[derive(Clone, Copy)]
 struct Family {
     and: IntrinsicOp,
@@ -277,6 +280,9 @@ fn fold(
     else {
         return None;
     };
+    if let Some(replacement) = mask_shifts::fold(inst, defs, uses, families) {
+        return Some(replacement);
+    }
     if let Some(replacement) = shuffle::fold(inst, defs, uses, families, fresh) {
         return Some(replacement);
     }
