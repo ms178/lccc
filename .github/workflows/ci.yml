@@ -2574,6 +2574,8 @@ jobs:
         submodules: recursive
     - name: Verify generated SIMD header matches its generator
       run: python3 scripts/gen_lcccsimd.py --check
+    - name: Canonical GNU builtin type contract synchronization
+      run: python3 scripts/gen_x86_builtin_types.py --check
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
       with:

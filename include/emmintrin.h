@@ -82,13 +82,13 @@ _mm_setzero_si128(void)
 static __inline__ __m128i __attribute__((__always_inline__))
 _mm_cmpeq_epi8(__m128i __a, __m128i __b)
 {
-    return __CCC_M128I_FROM_BUILTIN(__builtin_ia32_pcmpeqb128(__a, __b));
+    return ((__m128i)(__builtin_ia32_pcmpeqb128(__a, __b)));
 }
 
 static __inline__ __m128i __attribute__((__always_inline__))
 _mm_cmpeq_epi32(__m128i __a, __m128i __b)
 {
-    return __CCC_M128I_FROM_BUILTIN(__builtin_ia32_pcmpeqd128(__a, __b));
+    return ((__m128i)(__builtin_ia32_pcmpeqd128(__a, __b)));
 }
 
 static __inline__ __m128i __attribute__((__always_inline__))
@@ -118,7 +118,7 @@ _mm_cmplt_epi16(__m128i __a, __m128i __b)
 {
     /* Returns 0xFFFF for lanes where a < b (signed), 0 otherwise.
      * Equivalent to _mm_cmpgt_epi16(b, a). */
-    return __CCC_M128I_FROM_BUILTIN(__builtin_ia32_pcmpgtw128(__b, __a));
+    return ((__m128i)(__builtin_ia32_pcmpgtw128(__b, __a)));
 }
 
 /* === Unsigned Saturating Arithmetic === */
@@ -209,7 +209,7 @@ _mm_subs_epi16(__m128i __a, __m128i __b)
 static __inline__ __m128i __attribute__((__always_inline__))
 _mm_subs_epu16(__m128i __a, __m128i __b)
 {
-    return __CCC_M128I_FROM_BUILTIN(__builtin_ia32_psubusw128(__a, __b));
+    return ((__m128i)(__builtin_ia32_psubusw128(__a, __b)));
 }
 
 /* === Arithmetic === */
@@ -217,13 +217,13 @@ _mm_subs_epu16(__m128i __a, __m128i __b)
 static __inline__ __m128i __attribute__((__always_inline__))
 _mm_subs_epu8(__m128i __a, __m128i __b)
 {
-    return __CCC_M128I_FROM_BUILTIN(__builtin_ia32_psubusb128(__a, __b));
+    return ((__m128i)(__builtin_ia32_psubusb128(__a, __b)));
 }
 
 static __inline__ __m128i __attribute__((__always_inline__))
 _mm_subs_epi8(__m128i __a, __m128i __b)
 {
-    return __CCC_M128I_FROM_BUILTIN(__builtin_ia32_psubsb128(__a, __b));
+    return ((__m128i)(__builtin_ia32_psubsb128(__a, __b)));
 }
 
 static __inline__ __m128i __attribute__((__always_inline__))
@@ -268,13 +268,13 @@ _mm_max_epi16(__m128i __a, __m128i __b)
 static __inline__ __m128i __attribute__((__always_inline__))
 _mm_min_epu8(__m128i __a, __m128i __b)
 {
-    return __CCC_M128I_FROM_BUILTIN(__builtin_ia32_pminub128(__a, __b));
+    return ((__m128i)(__builtin_ia32_pminub128(__a, __b)));
 }
 
 static __inline__ __m128i __attribute__((__always_inline__))
 _mm_max_epu8(__m128i __a, __m128i __b)
 {
-    return __CCC_M128I_FROM_BUILTIN(__builtin_ia32_pmaxub128(__a, __b));
+    return ((__m128i)(__builtin_ia32_pmaxub128(__a, __b)));
 }
 
 /* === Bitwise === */
@@ -312,13 +312,13 @@ _mm_xor_si128(__m128i __a, __m128i __b)
 static __inline__ __m128i __attribute__((__always_inline__))
 _mm_add_epi8(__m128i __a, __m128i __b)
 {
-    return __CCC_M128I_FROM_BUILTIN(__builtin_ia32_paddb128(__a, __b));
+    return ((__m128i)(__builtin_ia32_paddb128(__a, __b)));
 }
 
 static __inline__ __m128i __attribute__((__always_inline__))
 _mm_sub_epi8(__m128i __a, __m128i __b)
 {
-    return __CCC_M128I_FROM_BUILTIN(__builtin_ia32_psubb128(__a, __b));
+    return ((__m128i)(__builtin_ia32_psubb128(__a, __b)));
 }
 
 /* === 16-bit Arithmetic === */
@@ -326,25 +326,25 @@ _mm_sub_epi8(__m128i __a, __m128i __b)
 static __inline__ __m128i __attribute__((__always_inline__))
 _mm_add_epi16(__m128i __a, __m128i __b)
 {
-    return __CCC_M128I_FROM_BUILTIN(__builtin_ia32_paddw128(__a, __b));
+    return ((__m128i)(__builtin_ia32_paddw128(__a, __b)));
 }
 
 static __inline__ __m128i __attribute__((__always_inline__))
 _mm_sub_epi16(__m128i __a, __m128i __b)
 {
-    return __CCC_M128I_FROM_BUILTIN(__builtin_ia32_psubw128(__a, __b));
+    return ((__m128i)(__builtin_ia32_psubw128(__a, __b)));
 }
 
 static __inline__ __m128i __attribute__((__always_inline__))
 _mm_mullo_epi16(__m128i __a, __m128i __b)
 {
-    return __CCC_M128I_FROM_BUILTIN(__builtin_ia32_pmullw128(__a, __b));
+    return ((__m128i)(__builtin_ia32_pmullw128(__a, __b)));
 }
 
 static __inline__ __m128i __attribute__((__always_inline__))
 _mm_mulhi_epi16(__m128i __a, __m128i __b)
 {
-    return __CCC_M128I_FROM_BUILTIN(__builtin_ia32_pmulhw128(__a, __b));
+    return ((__m128i)(__builtin_ia32_pmulhw128(__a, __b)));
 }
 
 static __inline__ __m128i __attribute__((__always_inline__))
@@ -363,7 +363,7 @@ _mm_mulhi_epu16(__m128i __a, __m128i __b)
 static __inline__ __m128i __attribute__((__always_inline__))
 _mm_madd_epi16(__m128i __a, __m128i __b)
 {
-    return __CCC_M128I_FROM_BUILTIN(__builtin_ia32_pmaddwd128(__a, __b));
+    return ((__m128i)(__builtin_ia32_pmaddwd128(__a, __b)));
 }
 
 /* === 32-bit Arithmetic === */
@@ -371,25 +371,25 @@ _mm_madd_epi16(__m128i __a, __m128i __b)
 static __inline__ __m128i __attribute__((__always_inline__))
 _mm_add_epi32(__m128i __a, __m128i __b)
 {
-    return __CCC_M128I_FROM_BUILTIN(__builtin_ia32_paddd128(__a, __b));
+    return ((__m128i)(__builtin_ia32_paddd128(__a, __b)));
 }
 
 static __inline__ __m128i __attribute__((__always_inline__))
 _mm_sub_epi32(__m128i __a, __m128i __b)
 {
-    return __CCC_M128I_FROM_BUILTIN(__builtin_ia32_psubd128(__a, __b));
+    return ((__m128i)(__builtin_ia32_psubd128(__a, __b)));
 }
 
 static __inline__ __m128i __attribute__((__always_inline__))
 _mm_cmpgt_epi16(__m128i __a, __m128i __b)
 {
-    return __CCC_M128I_FROM_BUILTIN(__builtin_ia32_pcmpgtw128(__a, __b));
+    return ((__m128i)(__builtin_ia32_pcmpgtw128(__a, __b)));
 }
 
 static __inline__ __m128i __attribute__((__always_inline__))
 _mm_cmpgt_epi8(__m128i __a, __m128i __b)
 {
-    return __CCC_M128I_FROM_BUILTIN(__builtin_ia32_pcmpgtb128(__a, __b));
+    return ((__m128i)(__builtin_ia32_pcmpgtb128(__a, __b)));
 }
 
 static __inline__ __m128i __attribute__((__always_inline__))
@@ -410,7 +410,7 @@ _mm_cmplt_epi8(__m128i __a, __m128i __b)
 {
     /* Returns 0xFF for lanes where a < b (signed), 0 otherwise.
      * Equivalent to _mm_cmpgt_epi8(b, a). */
-    return __CCC_M128I_FROM_BUILTIN(__builtin_ia32_pcmpgtb128(__b, __a));
+    return ((__m128i)(__builtin_ia32_pcmpgtb128(__b, __a)));
 }
 
 static __inline__ __m128i __attribute__((__always_inline__))
@@ -463,43 +463,43 @@ _mm_sub_epi64(__m128i __a, __m128i __b)
 static __inline__ __m128i __attribute__((__always_inline__))
 _mm_packs_epi32(__m128i __a, __m128i __b)
 {
-    return __CCC_M128I_FROM_BUILTIN(__builtin_ia32_packssdw128(__a, __b));
+    return ((__m128i)(__builtin_ia32_packssdw128(__a, __b)));
 }
 
 static __inline__ __m128i __attribute__((__always_inline__))
 _mm_packs_epi16(__m128i __a, __m128i __b)
 {
-    return __CCC_M128I_FROM_BUILTIN(__builtin_ia32_packsswb128(__a, __b));
+    return ((__m128i)(__builtin_ia32_packsswb128(__a, __b)));
 }
 
 static __inline__ __m128i __attribute__((__always_inline__))
 _mm_packus_epi16(__m128i __a, __m128i __b)
 {
-    return __CCC_M128I_FROM_BUILTIN(__builtin_ia32_packuswb128(__a, __b));
+    return ((__m128i)(__builtin_ia32_packuswb128(__a, __b)));
 }
 
 static __inline__ __m128i __attribute__((__always_inline__))
 _mm_unpacklo_epi8(__m128i __a, __m128i __b)
 {
-    return __CCC_M128I_FROM_BUILTIN(__builtin_ia32_punpcklbw128(__a, __b));
+    return ((__m128i)(__builtin_ia32_punpcklbw128(__a, __b)));
 }
 
 static __inline__ __m128i __attribute__((__always_inline__))
 _mm_unpackhi_epi8(__m128i __a, __m128i __b)
 {
-    return __CCC_M128I_FROM_BUILTIN(__builtin_ia32_punpckhbw128(__a, __b));
+    return ((__m128i)(__builtin_ia32_punpckhbw128(__a, __b)));
 }
 
 static __inline__ __m128i __attribute__((__always_inline__))
 _mm_unpacklo_epi16(__m128i __a, __m128i __b)
 {
-    return __CCC_M128I_FROM_BUILTIN(__builtin_ia32_punpcklwd128(__a, __b));
+    return ((__m128i)(__builtin_ia32_punpcklwd128(__a, __b)));
 }
 
 static __inline__ __m128i __attribute__((__always_inline__))
 _mm_unpackhi_epi16(__m128i __a, __m128i __b)
 {
-    return __CCC_M128I_FROM_BUILTIN(__builtin_ia32_punpckhwd128(__a, __b));
+    return ((__m128i)(__builtin_ia32_punpckhwd128(__a, __b)));
 }
 
 /* Interleave low 32-bit integers: a0, b0, a1, b1 */
@@ -707,43 +707,43 @@ _mm_storel_epi64(__m128i *__p, __m128i __a)
 
 /* Bit-level shift left on each 16-bit element (PSLLW) */
 #define _mm_slli_epi16(a, count) \
-    __CCC_M128I_FROM_BUILTIN(__builtin_ia32_psllwi128((a), (count)))
+    ((__m128i)(__builtin_ia32_psllwi128((a), (count))))
 
 /* Bit-level shift right logical on each 16-bit element (PSRLW) */
 #define _mm_srli_epi16(a, count) \
-    __CCC_M128I_FROM_BUILTIN(__builtin_ia32_psrlwi128((a), (count)))
+    ((__m128i)(__builtin_ia32_psrlwi128((a), (count))))
 
 /* Bit-level shift right arithmetic on each 16-bit element (PSRAW) */
 #define _mm_srai_epi16(a, count) \
-    __CCC_M128I_FROM_BUILTIN(__builtin_ia32_psrawi128((a), (count)))
+    ((__m128i)(__builtin_ia32_psrawi128((a), (count))))
 
 /* Bit-level shift right arithmetic on each 32-bit element (PSRAD) */
 #define _mm_srai_epi32(a, count) \
-    __CCC_M128I_FROM_BUILTIN(__builtin_ia32_psradi128((a), (count)))
+    ((__m128i)(__builtin_ia32_psradi128((a), (count))))
 
 /* Bit-level shift left on each 32-bit element (PSLLD) */
 #define _mm_slli_epi32(a, count) \
-    __CCC_M128I_FROM_BUILTIN(__builtin_ia32_pslldi128((a), (count)))
+    ((__m128i)(__builtin_ia32_pslldi128((a), (count))))
 
 /* Bit-level shift right logical on each 32-bit element (PSRLD) */
 #define _mm_srli_epi32(a, count) \
-    __CCC_M128I_FROM_BUILTIN(__builtin_ia32_psrldi128((a), (count)))
+    ((__m128i)(__builtin_ia32_psrldi128((a), (count))))
 
 /* Byte-level shift left (PSLLDQ): shift __a left by __N bytes, zero-fill */
 #define _mm_slli_si128(a, N) \
-    __CCC_M128I_FROM_BUILTIN(__builtin_ia32_pslldqi128((a), (N)))
+    ((__m128i)(__builtin_ia32_pslldqi128((a), ((N) * 8))))
 
 /* Byte-level shift right (PSRLDQ): shift __a right by __N bytes, zero-fill */
 #define _mm_srli_si128(a, N) \
-    __CCC_M128I_FROM_BUILTIN(__builtin_ia32_psrldqi128((a), (N)))
+    ((__m128i)(__builtin_ia32_psrldqi128((a), ((N) * 8))))
 
 /* Bit-level shift left on each 64-bit element (PSLLQ) */
 #define _mm_slli_epi64(a, count) \
-    __CCC_M128I_FROM_BUILTIN(__builtin_ia32_psllqi128((a), (count)))
+    ((__m128i)(__builtin_ia32_psllqi128((a), (count))))
 
 /* Bit-level shift right on each 64-bit element (PSRLQ) */
 #define _mm_srli_epi64(a, count) \
-    __CCC_M128I_FROM_BUILTIN(__builtin_ia32_psrlqi128((a), (count)))
+    ((__m128i)(__builtin_ia32_psrlqi128((a), (count))))
 
 /* Shuffle 32-bit integers (PSHUFD) */
 #define _mm_shuffle_epi32(a, imm) \
@@ -1261,7 +1261,7 @@ _mm_clflush(void const *__p)
 static __inline__ __m128i __attribute__((__always_inline__))
 _mm_sad_epu8(__m128i __a, __m128i __b)
 {
-    return __CCC_M128I_FROM_BUILTIN(__builtin_ia32_psadbw128(__a, __b));
+    return ((__m128i)(__builtin_ia32_psadbw128(__a, __b)));
 }
 
 #endif /* _EMMINTRIN_H_INCLUDED */

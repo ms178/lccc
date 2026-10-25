@@ -22,6 +22,7 @@ pub(crate) mod temp_files;
 pub(crate) mod tls;
 pub(crate) mod type_builder;
 pub(crate) mod types;
+pub(crate) mod x86_builtin_types;
 pub(crate) mod x86_features;
 
 pub(crate) mod pass_policy;

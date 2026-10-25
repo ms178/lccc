@@ -191,6 +191,8 @@ gate "volatile-destructuring" fast \
 # hosted Clippy-lane step (gate parity).
 gate "generated-simd-header-sync" fast \
     python3 scripts/gen_lcccsimd.py --check
+gate "generated-gnu-builtin-types-sync" fast \
+    python3 scripts/gen_x86_builtin_types.py --check
 
 # ---------------------------------------------------------------- build ----
 gate "build" fast ./scripts/build_lccc_fast.sh
@@ -552,6 +554,9 @@ gate "ext-vector-abi-avx" fast \
 
 # Same strict current-tool public native-vector boundary contract as hosted
 # research. This wiring does not relax either ABI or permit multilib skips.
+gate "gnu-native-builtin-diagnostics" fast \
+    python3 tests/regression/check_gnu_builtin_diagnostics.py --lccc "$LCCC" --gcc gcc-16
+
 gate "public-native-simd-abi" fast \
     python3 tests/regression/check_public_simd_abi.py --lccc "$LCCC" --gcc gcc-16
 

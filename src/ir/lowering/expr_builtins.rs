@@ -2139,46 +2139,10 @@ impl Lowerer {
         Some(Operand::Value(alloca))
     }
 
-    /// Lower a 128-bit vector ARGUMENT expression to a pointer at its
-    /// 16 data bytes. Vector lvalues already lower to their alloca POINTER;
-    /// a nested raw builtin (Vec128Value) yields a packed I128 VALUE, which
-    /// must be spilled to a fresh slot first. Distinguishing via the C type
-    /// (is_vector => pointer convention) is the load-bearing check: spilling
-    /// a pointer, or passing an I128 through unspilled, both corrupt lanes.
+    /// Native vectors, including nested GNU builtin results and equal-width
+    /// casts, share the ordinary vector object-address IR representation.
     fn vec128_arg_ptr(&mut self, arg: &Expr) -> Operand {
-        // By-value producers are exactly the raw 128-bit builtins (they have
-        // no vector CType on purpose — see expr_types.rs). Everything else
-        // with 16-byte vector shape lowers to an alloca POINTER.
-        let is_by_value = matches!(arg,
-            Expr::FunctionCall(callee, _, _)
-                if matches!(&**callee, Expr::Identifier(n, _)
-                    if matches!(n.as_str(),
-                        "__builtin_ia32_maxps" | "__builtin_ia32_minps"
-                        | "__builtin_ia32_shufps"
-                        | "__builtin_ia32_vextractf128_ps256")));
-        let op = self.lower_expr(arg);
-        if !is_by_value {
-            return op; // alloca pointer convention
-        }
-        // By-value packed I128 (nested raw builtin): spill to a slot.
-        let slot = self.fresh_value();
-        self.emit(Instruction::Alloca {
-            dest: slot,
-            ty: IrType::Ptr,
-            size: 16,
-            align: 16,
-            volatile: false,
-            semantic_volatile: false,
-        });
-        let val = self.operand_to_value(op);
-        self.emit(Instruction::Store {
-            volatile: false,
-            val: Operand::Value(val),
-            ptr: slot,
-            ty: IrType::I128,
-            seg_override: AddressSpace::Default,
-        });
-        Operand::Value(slot)
+        self.lower_expr(arg)
     }
 
     /// Load the 16 bytes at `slot` and pack them into a by-value I128
@@ -2980,6 +2944,15 @@ impl Lowerer {
                 16,
             );
         }
+        if self.target == crate::backend::Target::I686
+            && crate::common::x86_builtin_types::requires_64_bit(name)
+        {
+            return self.reject_builtin_call(
+                format!("'{name}' is only available in 64-bit x86 mode"),
+                args,
+                16,
+            );
+        }
         let op = x86_intrinsic_op(intrinsic);
         match x86_intrinsic_kind(intrinsic) {
             X86IntrinsicKind::Fence => {
@@ -3020,7 +2993,39 @@ impl Lowerer {
                 Some(Operand::Const(IrConst::I64(0)))
             }
             X86IntrinsicKind::Vec128 | X86IntrinsicKind::Vec256 => {
-                let arg_ops: Vec<Operand> = args.iter().map(|a| self.lower_expr(a)).collect();
+                // GNU's byte-lane shift/align builtins take BIT counts;
+                // the instruction IR and public _mm APIs take byte counts.
+                let bit_count = name.starts_with("__builtin_ia32_")
+                    && matches!(
+                        intrinsic,
+                        BuiltinIntrinsic::X86Pslldqi128
+                            | BuiltinIntrinsic::X86Psrldqi128
+                            | BuiltinIntrinsic::X86Pslldqi256
+                            | BuiltinIntrinsic::X86Psrldqi256
+                            | BuiltinIntrinsic::X86Palignr128
+                    );
+                let normalized_count = if bit_count {
+                    let count = args
+                        .last()
+                        .and_then(|arg| self.eval_const_expr(arg))
+                        .and_then(|value| value.to_i64());
+                    let Some(count) =
+                        count.filter(|count| (0..=2040).contains(count) && count % 8 == 0)
+                    else {
+                        return self.reject_builtin_call(
+                            format!("'{name}' requires a constant bit count in 0..2040 divisible by eight"),
+                            args,
+                            16,
+                        );
+                    };
+                    Some(count / 8)
+                } else {
+                    None
+                };
+                let mut arg_ops: Vec<Operand> = args.iter().map(|a| self.lower_expr(a)).collect();
+                if let (Some(count), Some(last)) = (normalized_count, arg_ops.last_mut()) {
+                    *last = Operand::Const(IrConst::I64(count));
+                }
                 let result_size = match x86_intrinsic_kind(intrinsic) {
                     X86IntrinsicKind::Vec128 => 16,
                     X86IntrinsicKind::Vec256 => 32,
@@ -3047,120 +3052,6 @@ impl Lowerer {
                     args: arg_ops,
                 });
                 Some(Operand::Value(result_alloca))
-            }
-            X86IntrinsicKind::Vec128Value => {
-                // GCC's __builtin_ia32_* return the vector BY VALUE — unlike
-                // the _mm_* wrappers, whose bundled-header definition routes
-                // through __lccc_simd* and dereferences the returned pointer
-                // itself (__CCC_M128_FROM_BUILTIN = *(__m128*)(e)). A caller
-                // of the raw builtin has no such deref: handing back the
-                // alloca POINTER made the function return `lea slot(%rsp)`
-                // + cqto — an address and sign-extension garbage instead of
-                // the 16 data bytes (kernel NAP governor's v4sf clamp
-                // produced -3e+34). Materialize the I128 value: two I64
-                // halves loaded from the result slot, widened and packed —
-                // the same representation ordinary v4sf loads lower to.
-                // Vector args go through vec128_arg_ptr: vector lvalues are
-                // already alloca pointers, nested raw-builtin results are
-                // packed I128 values that must be spilled to a slot first.
-                // Integer args (the imm8 of shufps/vextractf128) pass through.
-                let arg_ops: Vec<Operand> = args
-                    .iter()
-                    .map(|a| {
-                        let is_int = self
-                            .get_expr_ctype(a)
-                            .map(|ct| ct.is_integer())
-                            .unwrap_or(false);
-                        if is_int {
-                            self.lower_expr(a)
-                        } else {
-                            self.vec128_arg_ptr(a)
-                        }
-                    })
-                    .collect();
-
-                let result_alloca = self.fresh_value();
-                self.emit(Instruction::Alloca {
-                    dest: result_alloca,
-                    ty: IrType::Ptr,
-                    size: 16,
-                    align: 16,
-                    volatile: false,
-                    semantic_volatile: false,
-                });
-                let dest_val = self.fresh_value();
-                self.emit(Instruction::Intrinsic {
-                    dest: Some(dest_val),
-                    op,
-                    dest_ptr: Some(result_alloca),
-                    args: arg_ops,
-                });
-                // lo half
-                let lo = self.fresh_value();
-                self.emit(Instruction::Load {
-                    volatile: false,
-                    dest: lo,
-                    ptr: result_alloca,
-                    ty: IrType::I64,
-                    seg_override: crate::common::types::AddressSpace::Default,
-                });
-                // hi half: result_alloca + 8 (GEP so analyses see a proper derived pointer)
-                let hi_ptr = self.fresh_value();
-                self.emit(Instruction::GetElementPtr {
-                    dest: hi_ptr,
-                    base: result_alloca,
-                    offset: Operand::Const(IrConst::I64(8)),
-                    ty: IrType::I8,
-                });
-                let hi = self.fresh_value();
-                self.emit(Instruction::Load {
-                    volatile: false,
-                    dest: hi,
-                    ptr: hi_ptr,
-                    ty: IrType::I64,
-                    seg_override: crate::common::types::AddressSpace::Default,
-                });
-                // ILP32 targets have no I128 value representation (the i686
-                // backend's I128 arithmetic is a libgcc-helper shape for
-                // __int128, not a general 128-bit scalar), so the x86-64
-                // pack-into-I128 trick does not port. There the aggregate
-                // convention IS pointer-based: hand back the result alloca
-                // pointer and let the caller copy the 16 bytes like any other
-                // aggregate expression.
-                if self.target == crate::backend::Target::I686 {
-                    return Some(Operand::Value(result_alloca));
-                }
-                let lo128 = self.fresh_value();
-                self.emit(Instruction::Cast {
-                    dest: lo128,
-                    src: Operand::Value(lo),
-                    from_ty: IrType::U64,
-                    to_ty: IrType::I128,
-                });
-                let hi128 = self.fresh_value();
-                self.emit(Instruction::Cast {
-                    dest: hi128,
-                    src: Operand::Value(hi),
-                    from_ty: IrType::U64,
-                    to_ty: IrType::I128,
-                });
-                let shifted = self.fresh_value();
-                self.emit(Instruction::BinOp {
-                    dest: shifted,
-                    op: IrBinOp::Shl,
-                    lhs: Operand::Value(hi128),
-                    rhs: Operand::Const(IrConst::I64(64)),
-                    ty: IrType::I128,
-                });
-                let packed = self.fresh_value();
-                self.emit(Instruction::BinOp {
-                    dest: packed,
-                    op: IrBinOp::Or,
-                    lhs: Operand::Value(shifted),
-                    rhs: Operand::Value(lo128),
-                    ty: IrType::I128,
-                });
-                Some(Operand::Value(packed))
             }
             X86IntrinsicKind::Scalar => {
                 let arg_ops: Vec<Operand> = args.iter().map(|a| self.lower_expr(a)).collect();
@@ -3196,9 +3087,6 @@ enum X86IntrinsicKind {
     PtrStore,
     /// 128-bit vector result allocated on stack, returns pointer.
     Vec128,
-    /// 128-bit vector returned BY VALUE as packed I128 (raw GCC
-    /// __builtin_ia32_* semantics — no header wrapper dereferences it).
-    Vec128Value,
     /// 256-bit vector result allocated on stack.
     Vec256,
     /// Scalar result in a dest register.
@@ -3470,20 +3358,11 @@ fn x86_intrinsic_kind(intrinsic: &BuiltinIntrinsic) -> X86IntrinsicKind {
         | BuiltinIntrinsic::X86Pabsd256
         | BuiltinIntrinsic::X86Pmuludq256 => X86IntrinsicKind::Vec256,
         BuiltinIntrinsic::X86CastReinterpret => X86IntrinsicKind::CastReinterpret,
-        // Raw GCC vector builtins (no _mm_ wrapper): value semantics.
-        BuiltinIntrinsic::X86MaxPs128 | BuiltinIntrinsic::X86MinPs128 => {
-            X86IntrinsicKind::Vec128Value
-        }
-        // __builtin_ia32_shufps returns BY VALUE (raw GCC builtin, no wrapper
-        // deref); the imm8 rides as the last argument, which is exactly the
-        // (a, b, imm) shape the ShufPs128 backend op consumes.
-        BuiltinIntrinsic::X86ShufPsValue => X86IntrinsicKind::Vec128Value,
-        // __builtin_ia32_cvtpd2ps returns v4sf BY VALUE (raw GCC builtin).
-        BuiltinIntrinsic::X86CvtPd2PsValue => X86IntrinsicKind::Vec128Value,
-        // vextractf128_ps256 returns a 16-byte vector BY VALUE from a ymm arg.
-        BuiltinIntrinsic::X86Vextractf128V => X86IntrinsicKind::Vec128Value,
-        // 256-bit raw builtins: v8sf is pointer/sret convention everywhere,
-        // so the Vec256 pointer-returning arm is already value-correct.
+        // Native C vectors share object-address IR carriers on both x86 modes.
+        BuiltinIntrinsic::X86MaxPs128 | BuiltinIntrinsic::X86MinPs128 => X86IntrinsicKind::Vec128,
+        BuiltinIntrinsic::X86ShufPsValue => X86IntrinsicKind::Vec128,
+        BuiltinIntrinsic::X86CvtPd2PsValue => X86IntrinsicKind::Vec128,
+        BuiltinIntrinsic::X86Vextractf128V => X86IntrinsicKind::Vec128,
         BuiltinIntrinsic::X86MaxPs256V
         | BuiltinIntrinsic::X86MinPs256V
         | BuiltinIntrinsic::X86AndPs256V

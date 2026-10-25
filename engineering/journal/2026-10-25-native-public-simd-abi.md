@@ -44,3 +44,48 @@ The hosted public ABI step is mandatory before runtime/Callgrind comparisons.
 This is not a claim of exhaustive GNU raw-builtin typing, completion of the
 full manual audit, expert approval, or a measured performance improvement.
 Those require their own implementation and current hosted evidence.
+
+## Canonical GNU result follow-up
+
+The checked-in GCC 16.2 type catalog now has 233 canonical names with complete
+function descriptors and mode availability. One generator supplies native CTypes
+and a C oracle: 233 result assertions on x86-64, 228 on i686 (five genuinely
+64-bit-only names). Twenty post-AVX2 VNNI operations have type contracts only;
+the executable witness covers 191 vector-returning operations. All 191 outputs
+match real GCC 16.2 byte-for-byte on both modes at O0 and O2. Ninety-two additional
+canonical spellings reuse existing native emitters; dynamically registered
+widening names remain owned by their shared table rather than duplicated.
+
+Raw 128-bit results now share object-address IR carriers with native 256-bit
+results; no packed-I128 exception remains. Public conversion helpers use vector
+casts, not pointer dereferences of native results. Fifty-two AVX2 wrappers now
+call canonical native builtins with explicit input lane casts instead of scalar
+C loop implementations. Immediate wrappers are macros so their arguments remain
+visible to immediate validation during lowering.
+
+GNU byte-shift/alignment builtins take bit counts. Public byte counts are
+multiplied by eight, and lowering divides only valid constant multiples of eight
+in 0..2040. Negative, non-byte-multiple, and oversized raw counts are diagnosed
+rather than wrapped. Forty runtime edge results (0, 1, 15, 16, 17, 31, 32, 255
+public bytes) match GCC on both modes at O0/O2. A separate negative oracle checks
+35 invalid count/mode cases per compiler without allowing ICEs.
+
+The hosted frontend failure was an obsolete test requiring rejection of
+`__m256` indexing under its former struct representation. Its replacement
+retains all nine truly invalid-subscript rejections and executes public native
+128/256 indexing against GCC at O0/O2. Generated arity metadata now includes
+public function-like macros, canonical facts, and dynamically registered AVX
+families; 558 intrinsic arities are pinned. CI/local command parity is 399/27;
+the local CI orchestrator itself was not run. New exact-tool dual-mode research
+steps require both GNU fixtures to execute without skips.
+
+The final local build still uses the documented cached Rust bootstrap; current
+stable acceptance and the full matrix belong to GitHub. This does not establish
+full GNU argument-signature enforcement, exhaustive remaining API completion,
+new performance gains, latest-manual verification, or expert approval.
+
+Final follow-up fastbuild completed in 24.63 seconds, with swap active and two
+jobs. The rebuilt binary again passed the 35-case diagnostic oracle and public
+subscript oracle. Fresh public cross-compiler ABI grids passed 72 executable
+legs per mode, 144 total, without skips; expanded GNU result outputs were also
+rechecked against both GCC binaries after the final arity-table rebuild.

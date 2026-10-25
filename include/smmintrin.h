@@ -286,7 +286,7 @@ _mm_testz_si128(__m128i __a, __m128i __b)
 static __inline__ __m128i __attribute__((__always_inline__, target("sse4.1")))
 _mm_mullo_epi32(__m128i __a, __m128i __b)
 {
-    return __CCC_M128I_FROM_BUILTIN(__builtin_ia32_pmulld128(__a, __b));
+    return ((__m128i)(__builtin_ia32_pmulld128(__a, __b)));
 }
 
 /* === CRC32 intrinsics (SSE4.2) === */
