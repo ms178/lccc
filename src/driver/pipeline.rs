@@ -3532,10 +3532,8 @@ impl Driver {
         // x86-64-only vectorizer ceiling above deliberately remains NONE.
         // Do not borrow that backend policy to reject explicitly requested
         // i686 instructions, or widen the vectorizer ceiling to admit them.
-        let i686_avx = !x86_64
-            && set.contains(F::Sse2)
-            && self.enable_avx
-            && !self.avx_explicitly_disabled;
+        let i686_avx =
+            !x86_64 && set.contains(F::Sse2) && self.enable_avx && !self.avx_explicitly_disabled;
         set.insert_if(isa.avx || i686_avx, F::Avx);
         set.insert_if(
             isa.ymm || (i686_avx && self.enable_avx2 && !self.avx2_explicitly_disabled),
