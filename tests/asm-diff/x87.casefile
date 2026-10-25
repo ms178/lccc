@@ -249,15 +249,15 @@ fucom %st(2)
 fucomp %st(1)
 fucom %st(0)
 fucomp %st(7)
-fcmovb %st(0)
-fcmove %st(1)
-fcmovbe %st(2)
-fcmovu %st(3)
-fcmovnb %st(4)
-fcmovne %st(5)
-fcmovnbe %st(6)
-fcmovnu %st(7)
-fcmova %st(2)
-fcmovae %st(2)
-fcmovna %st(2)
-fcmovnae %st(2)
+fcmovb %st(0), %st
+fcmove %st(1), %st
+fcmovbe %st(2), %st
+fcmovu %st(3), %st
+fcmovnb %st(4), %st
+fcmovne %st(5), %st
+fcmovnbe %st(6), %st
+fcmovnu %st(7), %st
+fcmova %st(2), %st
+fcmovae %st(2), %st
+fcmovna %st(2), %st
+fcmovnae %st(2), %st

@@ -4614,6 +4614,7 @@ impl InstructionEncoder {
             "fcmove" => self.encode_x87_st0_sti(ops, 0xDA, 0xC8, None, "fcmove"),
             "fcmovbe" => self.encode_x87_st0_sti(ops, 0xDA, 0xD0, None, "fcmovbe"),
             "fcmovna" => self.encode_x87_st0_sti(ops, 0xDA, 0xD0, None, "fcmovna"),
+            "fcmovnae" => self.encode_x87_st0_sti(ops, 0xDA, 0xC0, None, "fcmovnae"),
             "fcmovu" => self.encode_x87_st0_sti(ops, 0xDA, 0xD8, None, "fcmovu"),
             "fcmovnb" => self.encode_x87_st0_sti(ops, 0xDB, 0xC0, None, "fcmovnb"),
             "fcmovae" => self.encode_x87_st0_sti(ops, 0xDB, 0xC0, None, "fcmovae"),
@@ -8176,18 +8177,22 @@ mod x87_integer_and_conditional_tests {
         // `/digit` in the ModR/M reg field selects the operation and the two
         // tables carry the same list (SDM Vol. 2B). `fiadds`/`fiaddl` are
         // pinned by the as 2.47 golden `gas/testsuite/gas/i386/float.l`.
-        assert_eq!(hex("fiadds (%ebx)"), "de 03");
-        assert_eq!(hex("fiaddl (%ebx)"), "da 03");
-        assert_eq!(hex("fimuls (%ebx)"), "de 0b");
-        assert_eq!(hex("ficoms (%ebx)"), "de 13");
-        assert_eq!(hex("ficomps (%ebx)"), "de 1b");
-        assert_eq!(hex("fisubs (%ebx)"), "de 23");
-        assert_eq!(hex("fisubrs (%ebx)"), "de 2b");
-        assert_eq!(hex("fidivs (%ebx)"), "de 33");
-        assert_eq!(hex("fidivrs (%ebx)"), "de 3b");
-        assert_eq!(hex("fidivrl (%ebx)"), "da 3b");
-        // 64-bit addressing reuses the same tables through a ModR/M base.
-        assert_eq!(hex("fimull (%rax)"), "da 01");
+        assert_eq!(hex("fiadds (%rbx)"), "de 03");
+        assert_eq!(hex("fiaddl (%rbx)"), "da 03");
+        assert_eq!(hex("fimuls (%rbx)"), "de 0b");
+        assert_eq!(hex("ficoms (%rbx)"), "de 13");
+        assert_eq!(hex("ficomps (%rbx)"), "de 1b");
+        assert_eq!(hex("fisubs (%rbx)"), "de 23");
+        assert_eq!(hex("fisubrs (%rbx)"), "de 2b");
+        assert_eq!(hex("fidivs (%rbx)"), "de 33");
+        assert_eq!(hex("fidivrs (%rbx)"), "de 3b");
+        assert_eq!(hex("fidivrl (%rbx)"), "da 3b");
+        // The suffix picks the table; the ModR/M reg field carries the
+        // operation, not the index, so `/1` on `(%rax)` is `da 08`.
+        assert_eq!(hex("fimull (%rax)"), "da 08");
+        // A 32-bit address register is an address-size override, as with every
+        // other memory form: the 0x67 goes in front of the same DE /0.
+        assert_eq!(hex("fiaddl (%ebx)"), "67 da 03");
         // A register operand is not an integer-memory form.
         assert!(fails("fiadds %eax"), "{}", fail_msg("fiadds %eax"));
     }
