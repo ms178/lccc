@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Private, current-toolchain research bootstrap. Invoked through ci_test_report.
 set -euo pipefail
+# The -m32 compiler needs the i386 UAPI asm/ headers, not only libc stubs.
+sudo dpkg --add-architecture i386
 sudo apt-get update
-sudo apt-get install -y --no-install-recommends python3-yaml autoconf automake libc6-dev-i386 libc6-dbg
+sudo apt-get install -y --no-install-recommends python3-yaml autoconf automake libc6-dev-i386 linux-libc-dev:i386 libc6-dbg
 # Bootstrap with a current binary linker and Clang's integrated assembler.
 git fetch --depth=1 origin tag harness-cache-1
 mkdir -p "$RUNNER_TEMP/current-linker"

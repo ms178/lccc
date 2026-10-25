@@ -58,6 +58,12 @@ as_version=$(as --version | sed -n '1p')
 [[ $as_version =~ [[:space:]]2\.47(\.[0-9]+)?$ ]] || fail "GAS 2.47 is required: $as_version"
 ld_version=$(ld --version | sed -n '1p')
 [[ $ld_version = 'mold 2.42.1 '* ]] || fail "mold 2.42.1 is required: $ld_version"
+# A successful -m32 libc link alone does not prove Linux UAPI headers exist.
+# Valgrind's i386 gdbserver includes linux/types.h -> asm/types.h: diagnose a
+# missing multiarch header package before downloading and compiling the tree.
+printf '#include <linux/types.h>\n#include <sys/types.h>\n#include <stdio.h>\n' | \
+    "$CC" -m32 -x c -fsyntax-only - || \
+    fail "missing i386 Linux/libc development headers; install linux-libc-dev:i386 and libc6-dev-i386"
 for tool in curl tar sha256sum autoconf autoheader automake aclocal make; do
     command -v "$tool" >/dev/null || fail "missing build dependency: $tool"
 done

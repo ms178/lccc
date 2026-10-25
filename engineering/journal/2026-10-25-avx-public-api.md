@@ -104,3 +104,14 @@ Replace the single outdated VTEST substring with independent exact contracts
 for all twelve signatures, AVX-only target attributes, private prototypes and
 dispatches. The targeted inventory and header suites pass locally; no full
 local CI was run.
+
+The reporter recovered the actual hosted instrumentation failure: GCC 16.2's
+`-m32` build of Valgrind's gdbserver could not include `asm/types.h` through
+`linux/types.h`. The libc multilib package is not the i386 Linux UAPI header
+package. Enable the i386 package architecture and install `linux-libc-dev:i386`
+without adding an old compiler or assembler. A GCC 16.2 i386 syntax preflight
+now includes both Linux and libc headers before any source download or build.
+Two additional isolated controls prove missing headers stop before network
+access and that bootstrap explicitly installs the correct architecture's
+headers. All eight provisioning tests pass; the real hosted rebuild remains
+required before any instrumentation result can be accepted.
