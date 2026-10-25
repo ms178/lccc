@@ -2607,9 +2607,9 @@ impl InstructionEncoder {
                 self.bytes.extend_from_slice(&[0xD9, 0xF6]);
                 Ok(())
             }
-            "fcomip" => self.encode_fcomip(ops),
-            "fucomip" => self.encode_fucomip(ops),
-            "fucomi" => self.encode_fucomi(ops),
+            "fcomip" => self.encode_x87_st0_sti(ops, 0xDF, 0xF0, Some(1), "fcomip"),
+            "fucomip" => self.encode_x87_st0_sti(ops, 0xDF, 0xE8, Some(1), "fucomip"),
+            "fucomi" => self.encode_x87_st0_sti(ops, 0xDB, 0xE8, Some(1), "fucomi"),
             "fucomp" => self.encode_fucomp(ops),
             "fucom" => self.encode_fucom(ops),
             "fld" => self.encode_fld_st(ops),
@@ -2690,16 +2690,16 @@ impl InstructionEncoder {
             "fidivrs" => self.encode_x87_mem(ops, &[0xDE], 7),
             "fidivrl" => self.encode_x87_mem(ops, &[0xDA], 7),
             // x87 conditional moves and the SSE-era compare-into-flags forms.
-            "fcmovb" => self.encode_x87_st0_sti(ops, 0xDA, 0xC0, "fcmovb"),
-            "fcmove" => self.encode_x87_st0_sti(ops, 0xDA, 0xC8, "fcmove"),
-            "fcmovbe" => self.encode_x87_st0_sti(ops, 0xDA, 0xD0, "fcmovbe"),
-            "fcmovu" => self.encode_x87_st0_sti(ops, 0xDA, 0xD8, "fcmovu"),
-            "fcmovnb" => self.encode_x87_st0_sti(ops, 0xDB, 0xC0, "fcmovnb"),
-            "fcmovne" => self.encode_x87_st0_sti(ops, 0xDB, 0xC8, "fcmovne"),
-            "fcmovnbe" => self.encode_x87_st0_sti(ops, 0xDB, 0xD0, "fcmovnbe"),
-            "fcmovnu" => self.encode_x87_st0_sti(ops, 0xDB, 0xD8, "fcmovnu"),
-            "fcomi" => self.encode_x87_st0_sti(ops, 0xDB, 0xF0, "fcomi"),
-            "ffreep" => self.encode_x87_st0_sti(ops, 0xDF, 0xC0, "ffreep"),
+            "fcmovb" => self.encode_x87_st0_sti(ops, 0xDA, 0xC0, None, "fcmovb"),
+            "fcmove" => self.encode_x87_st0_sti(ops, 0xDA, 0xC8, None, "fcmove"),
+            "fcmovbe" => self.encode_x87_st0_sti(ops, 0xDA, 0xD0, None, "fcmovbe"),
+            "fcmovu" => self.encode_x87_st0_sti(ops, 0xDA, 0xD8, None, "fcmovu"),
+            "fcmovnb" => self.encode_x87_st0_sti(ops, 0xDB, 0xC0, None, "fcmovnb"),
+            "fcmovne" => self.encode_x87_st0_sti(ops, 0xDB, 0xC8, None, "fcmovne"),
+            "fcmovnbe" => self.encode_x87_st0_sti(ops, 0xDB, 0xD0, None, "fcmovnbe"),
+            "fcmovnu" => self.encode_x87_st0_sti(ops, 0xDB, 0xD8, None, "fcmovnu"),
+            "fcomi" => self.encode_x87_st0_sti(ops, 0xDB, 0xF0, Some(1), "fcomi"),
+            "ffreep" => self.encode_x87_st0_sti(ops, 0xDF, 0xC0, None, "ffreep"),
             // `fisttp` without a suffix is the 64-bit form: AT&T only spells
             // the `q` suffix for `fildq`/`fistpq`, and GAS accepts the bare
             // mnemonic for the quadword `fisttp` (gas/doc/c-i386.texi).
@@ -4301,16 +4301,21 @@ mod x87_integer_and_conditional_tests {
         // `fucomi %st(4)` = DB EC, `fucomip %st(5)` = DF ED.
         for (line, hex) in [
             ("fcomi %st(2)", "db f2"),
-            ("fcomi %st,%st(2)", "db f2"),
+            ("fcomi %st(2),%st", "db f2"),
+            ("fcomi", "db f1"),
             ("fcomip %st(3)", "df f3"),
+            ("fcomip %st(3),%st", "df f3"),
             ("fucomi %st(4)", "db ec"),
             ("fucomip %st(5)", "df ed"),
+            // The i686 cast path emits this spelling for x87 -> u64; it has to
+            // keep assembling to the same two bytes.
+            ("fucomip %st(1), %st", "df e9"),
         ] {
             assert_eq!(assemble(line).as_deref(), Ok(hex), "{line}");
         }
-        // The reversed spelling is a different operand order; encoding it as
-        // `fcomi %st(2)` would compare the wrong pair.
-        assert!(assemble("fcomi %st(2),%st").is_err());
+        // The implicit `st(0)` is the *second* operand; this order names a
+        // different comparison and must not be encoded as `fcomi %st(2)`.
+        assert!(assemble("fcomi %st,%st(2)").is_err());
     }
 
     /// `FCMOVcc`/`FFREEP` take `ST(0)` as their implicit first operand and the
@@ -4328,15 +4333,16 @@ mod x87_integer_and_conditional_tests {
             ("fcmovne %st(6)", "db ce"),
             ("fcmovnbe %st(7)", "db d7"),
             ("fcmovnu %st(1)", "db d9"),
-            ("fcmovb %st,%st(1)", "da c1"),
+            ("fcmovb %st(1),%st", "da c1"),
             ("ffreep %st(3)", "df c3"),
             ("ffreep %st", "df c0"),
         ] {
             assert_eq!(assemble(line).as_deref(), Ok(hex), "{line}");
         }
         // The condition is part of the mnemonic, not of the register: the
-        // implicit `st(0)` has to be first.
-        assert!(assemble("fcmovb %st(1),%st").is_err());
+        // implicit `st(0)` has to be last, as the table's `{ FloatReg, FloatAcc }`
+        // operand order says.
+        assert!(assemble("fcmovb %st,%st(1)").is_err());
     }
 
     #[test]
