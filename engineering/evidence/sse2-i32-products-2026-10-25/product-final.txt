@@ -1,0 +1,23 @@
+gcc: PASS 808 exact-output cases + oracle legality
+clang: PASS 808 exact-output cases + oracle legality
+default: PASS 808 exact-output cases + sse2 legality
+wrong-odd: KILLED (28 sites, native exit zero)
+swapped-lanes: KILLED (14 sites, native exit zero)
+sse2: PASS 808 exact-output cases + sse2 legality
+sse3: PASS 808 exact-output cases + sse2 legality
+ssse3: PASS 808 exact-output cases + sse2 legality
+sse41: PASS 808 exact-output cases + sse41 legality
+sse42: PASS 808 exact-output cases + sse41 legality
+avx: PASS 808 exact-output cases + sse41 legality
+avx2: PASS 808 exact-output cases + avx2 legality
+sse41-denied: PASS 808 exact-output cases + sse2 legality
+no-xmm: PASS 808 exact-output cases + sse2 legality
+no-vecreg: PASS 808 exact-output cases + sse2 legality
+no-homes: PASS 808 exact-output cases + sse2 legality
+no-promote: PASS 808 exact-output cases + sse2 legality
+gcc-denial: PASS 44 exact-output cases + oracle legality
+clang-denial: PASS 44 exact-output cases + oracle legality
+deny-then-sse1: PASS 44 exact-output cases + sse1 legality
+sse1-deny-sse1: PASS 44 exact-output cases + sse1 legality
+v3-deny-sse1: PASS 44 exact-output cases + sse1 legality
+sse2-regrant: PASS 44 exact-output cases + sse2 legality

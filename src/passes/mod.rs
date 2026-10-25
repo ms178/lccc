@@ -1569,6 +1569,8 @@ pub(crate) fn run_passes(
     let no_bytecmp_vec = std::env::var_os("LCCC_NO_BYTECMP_VEC").is_some();
     vectorize::set_no_map_vec(no_map_vec);
     vectorize::set_no_map_i64_unroll(no_map_i64_unroll);
+    vectorize::set_no_map_i32_unroll(std::env::var_os("CCC_NO_MAP_I32_UNROLL").is_some());
+    vectorize::set_no_map_fp_unroll(std::env::var_os("CCC_NO_MAP_FP_UNROLL").is_some());
     vectorize::set_no_map_zero_rem(no_map_zero_rem);
     vectorize::set_no_bytecmp_vec(no_bytecmp_vec);
     // Fixed-distance SLP kill switch, snapshotted here like the map

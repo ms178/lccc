@@ -200,6 +200,8 @@ thread_local! {
     // policy bit.  Keeping it beside the map switch avoids an environment
     // lookup in every candidate loop and makes the early/main entries agree.
     static NO_MAP_I64_UNROLL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static NO_MAP_I32_UNROLL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static NO_MAP_FP_UNROLL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     // Generator-map vectorizer policy: `(enabled, trace)`. Resolved once per
     // pipeline run, like the map switches above.
     static GENERATOR_MAP: std::cell::Cell<(bool, bool)> = const { std::cell::Cell::new((true, false)) };
@@ -233,6 +235,14 @@ pub(crate) fn set_no_map_vec(disabled: bool) {
 
 pub(crate) fn set_no_map_i64_unroll(disabled: bool) {
     NO_MAP_I64_UNROLL.with(|cell| cell.set(disabled));
+}
+
+pub(crate) fn set_no_map_i32_unroll(disabled: bool) {
+    NO_MAP_I32_UNROLL.with(|cell| cell.set(disabled));
+}
+
+pub(crate) fn set_no_map_fp_unroll(disabled: bool) {
+    NO_MAP_FP_UNROLL.with(|cell| cell.set(disabled));
 }
 
 /// Generator-map policy for this translation unit: `enabled` is false under the
@@ -300,8 +310,8 @@ pub(crate) fn x86_avx512vl_available_pub() -> bool {
 }
 
 /// SSE4.1 availability on the 128-bit path, for every consumer: `pmulld`
-/// (VecMulI32x4) has no SSE2 encoding, so an I32 multiply map/dot under
-/// `-mno-sse4.1` / `-march=x86-64` must not be vectorised; and since
+/// uses the direct `pmulld` encoding only with this permission; the SSE2
+/// backend instead reconstructs low products from two `pmuludq`s. Since
 /// SSE4.1 implies SSSE3, this is also the gate for `pshufb`-based rotate
 /// masks in the ARX vectorizers.
 pub(crate) fn x86_sse41_available_pub() -> bool {
@@ -6479,6 +6489,22 @@ enum MapExpr {
 }
 
 impl MapExpr {
+    /// Only short unfused arithmetic trees get the FP two-copy policy.
+    /// Exclude selects, comparisons, rounding, sqrt, division and explicit
+    /// FMA: their lowering/pressure is not described by this small budget.
+    fn small_fp_arithmetic(&self) -> bool {
+        fn arithmetic(e: &MapExpr) -> bool {
+            match e {
+                MapExpr::Load(_) | MapExpr::Invariant(_) => true,
+                MapExpr::BinOp(IrBinOp::Add | IrBinOp::Sub | IrBinOp::Mul, l, r) => {
+                    arithmetic(l) && arithmetic(r)
+                }
+                _ => false,
+            }
+        }
+        matches!(self, MapExpr::BinOp(_, _, _)) && self.unroll_cost() <= 5 && arithmetic(self)
+    }
+
     fn node_count(&self) -> usize {
         match self {
             MapExpr::Load(_) | MapExpr::Invariant(_) => 1,
@@ -6498,7 +6524,7 @@ impl MapExpr {
     /// `MapEmitCtx::broadcast_cache`; charging them here made an expression
     /// such as `(x[i] + y[i]) + k` look more expensive than the work that is
     /// actually copied.  Keep `node_count` as the syntax/compile-time budget
-    /// metric and use this separate metric only for the I64/U64 unroll choice.
+    /// metric and use this separate metric for bounded map unroll choices.
     fn unroll_cost(&self) -> usize {
         match self {
             MapExpr::Load(_) => 1,
@@ -28347,18 +28373,10 @@ fn transform_reduction_sse2(
                 IntrinsicOp::VecHorizontalAddI64x2,
             ),
             IrType::I32 => {
-                // `VecMulI32x4` is `pmulld` where SSE4.1 exists and a
-                // `pmuludq` pair (two shifts, two `pshufd`, one
-                // `punpckldq`) on the SSE2 baseline -- see
-                // `x86::codegen::intrinsics::emit_int_mul_i32x4`. That
-                // sequence is exact, not an approximation: a C int32 product
-                // keeps the low 32 bits, which are the same bits whether
-                // `pmuludq` reads the operands as signed or unsigned. Eight
-                // instructions therefore produce four products instead of
-                // four `imul`s on the port the loop's dependency chain
-                // already saturates, which is what the correlation loop in
-                // tests/benchmark/programs/double_reduction.c measures
-                // (268 ms -> 121 ms against gcc's 210 ms on this box).
+                // The backend selects direct SSE4.1 pmulld or seven SSE2
+                // instructions reconstructing the even/odd pmuludq low
+                // products. Signed and unsigned products have the same low
+                // 32 bits, so both implement modular I32 multiplication.
                 (
                     4u64,
                     IntrinsicOp::LoadI32x4,
@@ -29724,11 +29742,50 @@ mod map_unroll_policy_tests {
     }
 
     #[test]
+    fn two_copy_maps_keep_packed_work_at_both_widths() {
+        for width in [2, 4, 8] {
+            for count in 0..=259 {
+                let unroll = map_constant_unroll(width, 2, count);
+                assert!(matches!(unroll, 1 | 2));
+                if count > width {
+                    assert!(width * unroll < count);
+                }
+                if count <= 16 {
+                    assert!(count % (width * unroll) < width);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn invariant_cost_is_separate_from_tree_budget() {
         let k = MapExpr::Invariant(Operand::Value(Value(42)));
         let expr = MapExpr::BinOp(IrBinOp::Sub, Box::new(MapExpr::Load(0)), Box::new(k));
         assert_eq!(expr.node_count(), 3);
         assert_eq!(expr.unroll_cost(), 2);
+    }
+
+    #[test]
+    fn fp_unroll_budget_excludes_complex_and_nonarithmetic_trees() {
+        let product = MapExpr::BinOp(
+            IrBinOp::Mul,
+            Box::new(MapExpr::Load(0)),
+            Box::new(MapExpr::Load(1)),
+        );
+        let sum = MapExpr::BinOp(IrBinOp::Add, Box::new(product), Box::new(MapExpr::Load(2)));
+        assert!(sum.small_fp_arithmetic());
+        let larger = MapExpr::BinOp(IrBinOp::Add, Box::new(sum), Box::new(MapExpr::Load(3)));
+        assert!(!larger.small_fp_arithmetic());
+        assert!(!MapExpr::Load(0).small_fp_arithmetic());
+        let sqrt = MapExpr::Sqrt(Box::new(MapExpr::Load(0)));
+        let nested_sqrt = MapExpr::BinOp(IrBinOp::Mul, Box::new(sqrt), Box::new(MapExpr::Load(1)));
+        assert!(!nested_sqrt.small_fp_arithmetic());
+        let divide = MapExpr::BinOp(
+            IrBinOp::SDiv,
+            Box::new(MapExpr::Load(0)),
+            Box::new(MapExpr::Load(1)),
+        );
+        assert!(!divide.small_fp_arithmetic());
     }
 
     #[test]
@@ -29739,6 +29796,18 @@ mod map_unroll_policy_tests {
         set_no_map_i64_unroll(false);
         assert!(!no_map_i64_unroll());
         set_no_map_i64_unroll(previous);
+        let previous_i32 = NO_MAP_I32_UNROLL.with(std::cell::Cell::get);
+        set_no_map_i32_unroll(true);
+        assert!(NO_MAP_I32_UNROLL.with(std::cell::Cell::get));
+        set_no_map_i32_unroll(false);
+        assert!(!NO_MAP_I32_UNROLL.with(std::cell::Cell::get));
+        set_no_map_i32_unroll(previous_i32);
+        let previous_fp = NO_MAP_FP_UNROLL.with(std::cell::Cell::get);
+        set_no_map_fp_unroll(true);
+        assert!(NO_MAP_FP_UNROLL.with(std::cell::Cell::get));
+        set_no_map_fp_unroll(false);
+        assert!(!NO_MAP_FP_UNROLL.with(std::cell::Cell::get));
+        set_no_map_fp_unroll(previous_fp);
     }
 }
 
@@ -29865,6 +29934,20 @@ fn transform_map_vector(
                 _ => 1,
             }
         }
+    } else if !neon
+        && ((matches!(pattern.elem_ty, IrType::I32 | IrType::U32)
+            && matches!(pattern.expr, MapExpr::BinOp(IrBinOp::Mul, _, _))
+            && pattern.expr.unroll_cost() <= 3
+            && !NO_MAP_I32_UNROLL.with(std::cell::Cell::get))
+            || (matches!(pattern.elem_ty, IrType::F32 | IrType::F64)
+                && pattern.expr.small_fp_arithmetic()
+                && !NO_MAP_FP_UNROLL.with(std::cell::Cell::get)))
+    {
+        // Two independent copies amortize loop control at both widths. The
+        // type-specific budgets prevent amplification of larger DAGs. Every
+        // FP lane retains its expression/rounding order, and packed_width
+        // continues to own alias guards, byte displacements and scalar tails.
+        2
     } else {
         1
     };
@@ -30117,10 +30200,9 @@ fn transform_map_vector(
             (IrType::I32 | IrType::U32, true, IrBinOp::Add) => Some(IntrinsicOp::VecAddI32x8),
             (IrType::I32 | IrType::U32, false, IrBinOp::Add) => Some(IntrinsicOp::VecAddI32x4),
             (IrType::I32 | IrType::U32, true, IrBinOp::Mul) => Some(IntrinsicOp::VecMulI32x8),
-            // `pmulld` is SSE4.1: no SSE2 spelling of a 4-lane I32 multiply.
-            (IrType::I32 | IrType::U32, false, IrBinOp::Mul) if x86_sse41_available() => {
-                Some(IntrinsicOp::VecMulI32x4)
-            }
+            // The backend selects direct SSE4.1 pmulld or the exact SSE2
+            // even/odd pmuludq reconstruction; both implement modular I32.
+            (IrType::I32 | IrType::U32, false, IrBinOp::Mul) => Some(IntrinsicOp::VecMulI32x4),
             (IrType::I32 | IrType::U32, true, IrBinOp::Sub) => Some(IntrinsicOp::VecSubI32x8),
             (IrType::I32 | IrType::U32, false, IrBinOp::Sub) => Some(IntrinsicOp::VecSubI32x4),
             (IrType::I32 | IrType::U32, true, IrBinOp::And) => Some(IntrinsicOp::VecAndI32x8),

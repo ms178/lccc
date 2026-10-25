@@ -958,7 +958,11 @@ jobs:
     - name: Check a value live across a 16-byte atomic survives the libatomic call
       run: env CCC=target/fastbuild/lccc GCC16=gcc-16 bash tests/regression/check_i128_atomic_call_clobber.sh
     - name: Check baseline-SSE2 packed multiply-add codegen
-      run: env CCC=target/fastbuild/lccc bash tests/regression/check_sse2_matmul_vectorization.sh
+      run: |
+        env CCC=target/fastbuild/lccc bash tests/regression/check_sse2_matmul_vectorization.sh
+        env CCC=target/fastbuild/lccc GCC=gcc-16 python3 tests/regression/check_sse2_i32_product.py
+        env CCC=target/fastbuild/lccc GCC=gcc-16 python3 tests/regression/check_i32_map_unroll.py
+        env CCC=target/fastbuild/lccc GCC=gcc-16 python3 tests/regression/check_fp_map_unroll.py
     # The two-wide matmul arm and its guards arrived with the synthesized
     # SIMD work; each gate below pins one property that a scalar fallback
     # would otherwise hide (see the gate headers for the measured costs).
@@ -2591,8 +2595,10 @@ jobs:
       # compiler) + 6 s of fixed per-kernel cost (two compiles and twenty
       # process spawns on the hosted runner), assigned longest-processing-
       # time first by scripts/ci_bench_shards.py.
-      # Predicted 389 s of 771 s for 23 kernels.
+      # Original assignment: predicted 389 s of 771 s for 23 kernels.
+      # The bounded F32 map extends this shard; F64 extends shard b.
       only: >-
+          fp32_product_map,
           ackermann,
           arith_loop,
           ascii_case_fold,
@@ -2629,8 +2635,11 @@ jobs:
       # compiler) + 6 s of fixed per-kernel cost (two compiles and twenty
       # process spawns on the hosted runner), assigned longest-processing-
       # time first by scripts/ci_bench_shards.py.
-      # Predicted 383 s of 771 s for 26 kernels.
+      # Original 26-kernel assignment: predicted 383 s of 771 s. The
+      # cache-resident I32 and strict F64 maps add bounded workloads here.
       only: >-
+          fp64_product_map,
+          i32_product_map,
           aarch64_select_patterns,
           binary_trees,
           bitops,

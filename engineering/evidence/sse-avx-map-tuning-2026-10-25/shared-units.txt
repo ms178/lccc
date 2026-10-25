@@ -1,0 +1,12 @@
+   Compiling lccc v0.1.0 (/home/user/lccc)
+    Finished `fastbuild` profile [optimized + debuginfo] target(s) in 1m 10s
+     Running unittests src/lib.rs (target/fastbuild/deps/lccc-244ecc21c018cae1)
+
+running 5 tests
+test passes::vectorize::map_unroll_policy_tests::fp_unroll_budget_excludes_complex_and_nonarithmetic_trees ... ok
+test passes::vectorize::map_unroll_policy_tests::constant_trips_preserve_packed_work_and_small_tails ... ok
+test passes::vectorize::map_unroll_policy_tests::invariant_cost_is_separate_from_tree_budget ... ok
+test passes::vectorize::map_unroll_policy_tests::two_copy_maps_keep_packed_work_at_both_widths ... ok
+test passes::vectorize::map_unroll_policy_tests::unroll_policy_refreshes_on_the_same_worker ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 6297 filtered out; finished in 0.00s

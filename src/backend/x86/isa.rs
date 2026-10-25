@@ -55,9 +55,9 @@ use std::sync::atomic::{AtomicU8, Ordering};
 /// while denying VEX.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct X86Isa {
-    /// The xmm register file may be touched at all (`-mno-sse` /
-    /// `-mgeneral-regs-only` clear it).  When false no vector or scalar-SSE
-    /// instruction of any encoding is legal; FP is not expected in such TUs.
+    /// SSE2 vector-codegen permission (`-mno-sse`, `-mno-sse2` and
+    /// `-mgeneral-regs-only` clear it). A later independent SSE1 grant does
+    /// not reopen this ceiling; scalar SSE1 follows the driver's `no_sse`.
     pub simd: bool,
     /// SSE4.1 (`pmulld`, `roundsd`, `blendvpd`, `pmovsx*`, `pinsr*` …).
     pub sse41: bool,

@@ -1,0 +1,14 @@
+f32/gcc: PASS 606 exact-bit alias/guard cases
+f32/clang: PASS 606 exact-bit alias/guard cases
+f32/sse2: PASS 606 exact-bit alias/guard cases
+f32/sse2-rolled: PASS 606 exact-bit alias/guard cases
+f32/sse41: PASS 606 exact-bit alias/guard cases
+f32/sse41-rolled: PASS 606 exact-bit alias/guard cases
+f32/avx2: PASS 606 exact-bit alias/guard cases
+f32/avx2-rolled: PASS 606 exact-bit alias/guard cases
+Traceback (most recent call last):
+  File "/home/user/lccc/tests/regression/check_fp_map_unroll.py", line 115, in <module>
+    main()
+  File "/home/user/lccc/tests/regression/check_fp_map_unroll.py", line 80, in main
+    raise RuntimeError(f'{dtype}/{profile}: unroll ablation not observable: {counts}')
+RuntimeError: f32/sse2: unroll ablation not observable: {'sse2': 1, 'sse2-rolled': 1, 'sse41': 1, 'sse41-rolled': 1, 'avx2': 1, 'avx2-rolled': 1}

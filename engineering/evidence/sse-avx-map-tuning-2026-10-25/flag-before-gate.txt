@@ -1,0 +1,6 @@
+Traceback (most recent call last):
+  File "/home/user/lccc/tests/regression/check_sse2_i32_product.py", line 223, in <module>
+    main()
+  File "/home/user/lccc/tests/regression/check_sse2_i32_product.py", line 62, in main
+    raise RuntimeError(f'{compiler} {flags}: unexpected SSE macro set {present}')
+RuntimeError: /home/user/artifacts/sse-tune/i32-compiler/lccc ['-msse', '-mno-sse2']: unexpected SSE macro set set()
