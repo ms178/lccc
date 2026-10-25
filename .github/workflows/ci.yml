@@ -2587,7 +2587,22 @@ jobs:
         rustfmt --version
         cargo clippy --version
     - name: Check Rust formatting
+      id: rust-format
       run: cargo fmt --all -- --check
+    - name: Surface Rust formatting diagnostics
+      if: ${{ failure() && steps.rust-format.outcome == 'failure' }}
+      run: |
+        python3 - <<'PYFMT'
+        import os
+        import subprocess
+        from pathlib import Path
+        result = subprocess.run(
+            ["cargo", "fmt", "--all", "--", "--check"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+        Path(os.environ["RUNNER_TEMP"], "rustfmt.log").write_text(result.stdout)
+        PYFMT
+        python3 scripts/ci_annotate_log.py --title "Rust formatting diff" --tail 600 --max 10 "$RUNNER_TEMP/rustfmt.log"
     - name: Run strict Clippy
       env:
         CARGO_BUILD_JOBS: '2'
