@@ -187,7 +187,10 @@ mod tests {
             assert_eq!(AvxWiden::raw_builtin(public), None);
             assert_eq!(AvxWiden::raw_builtin(private), None);
             assert!(matches!(op.source_bits(), 8 | 16 | 32));
-            assert!(matches!(op.result_element(), CType::Short | CType::Int | CType::LongLong));
+            assert!(matches!(
+                op.result_element(),
+                CType::Short | CType::Int | CType::LongLong
+            ));
             let ir = crate::ir::intrinsics::IntrinsicOp::AvxWiden(op);
             assert_eq!(ir.vector_result_width(), Some(32));
             assert!(ir.reads_pointer_arg());

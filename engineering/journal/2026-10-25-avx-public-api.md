@@ -57,3 +57,19 @@ VTEST and widening witnesses passed with GCC 16.2.0, GAS 2.47.20260726 and
 mold 2.42.1 locally. Candidate acceptance and latest-stable Rust formatting are
 tracked by hosted CI; oracle success is not candidate acceptance. No runtime
 speedup has been measured or claimed.
+
+## Current instrumentation and compiler oracle
+
+The research lane now bootstraps GAS with Clang 23.1.4's integrated assembler
+and the pinned mold 2.42.1 binary, then restores and explicitly verifies GCC
+16.2.0 from the authenticated cache. Installer `--print-bin` results are driver
+paths, not directories; PATH uses their parent directories explicitly.
+
+Distribution Valgrind is replaced by the current 3.28.0 release, built from a
+commit- and digest-pinned upstream mirror in a private prefix with GCC 16.2.0,
+GAS 2.47 and mold 2.42.1. Binary hash receipts, source identity, both amd64 and
+i386 Callgrind executables, and actual dual-mode smoke execution gate reuse.
+A foreign or failed nonempty prefix is never overlaid or removed. Six isolated
+provisioning contract tests pass without network or real compiler invocation.
+The full source build and performance observations remain hosted evidence,
+not fabricated local measurements.

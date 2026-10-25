@@ -626,11 +626,7 @@ impl Lowerer {
     ) -> Option<Operand> {
         self.check_x86_intrinsic_feature(&BuiltinIntrinsic::X86AvxWiden(op), name, args);
         if args.len() != 1 {
-            return self.reject_builtin_call(
-                format!("'{}' requires 1 argument", name),
-                args,
-                32,
-            );
+            return self.reject_builtin_call(format!("'{}' requires 1 argument", name), args, 32);
         }
         if !matches!(
             self.target,
