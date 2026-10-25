@@ -207,6 +207,18 @@ slot; new rows must be mutation-verified (turn the option into a silent no-op an
 watch the `effect:` row fail). **Accept.** No artifact-changing option is accepted
 silently; the options document is generated and current. **Effort** S · **ROI** 4.6.
 
+**SSE option-contract progress (2026-10-25).** Independent SSE1 permission
+now enables packed F32 maps under `-mno-sse2`, including either ordering with
+`-msse`, without enabling integer/F64 SIMD. The focused native gate checks
+observable packed instructions, exact results, aliases, page ends and scalar
+ablation, not just option acceptance. SSE1 scalar parameter capture and the
+store-forwarding cross-domain rewrites also respect that permission. Tiny
+constant-trip maps now share the main entry's named-address-space veto;
+a native GS-relative regression catches the former default-space load. See
+[`SSE1 evidence`](engineering/evidence/sse1-f32-map-2026-10-25/README.md).
+This is a bounded MB-01/UP-7 contribution, **not** closure of the option inventory,
+all-architecture audit or full comparison backlog.
+
 ### MB-02 · P0 · R — linker option contract and the dead flags
 
 **Why.** `lccc-ld` and `-Wl,…` accepted 92/93 probed options without a word on

@@ -192,7 +192,7 @@ substance; consult the archive for full Accept/Do-not text where elided.
 | MS-03 | P1 | CI correctness+regression+fuzz smoke beyond lib tests | **C** |
 | MS-04 | P1 | OnceLock env knobs break parameterized tests | **C** |
 | MS-10 | P1 | `CCC_VALIDATE_SSA` in CI for the regression corpus | **C** |
-| MS-12 | P1 | Audit remaining `phys_reg_name_32` sites for XMM-homed operands | **C** |
+| MS-12 | P1 | Audit remaining `phys_reg_name_32` sites for XMM-homed operands | **C**; [SSE1 capture/forwarding subcase repaired](../evidence/sse1-f32-map-2026-10-25/README.md), general audit open |
 | MS-13/14 | P2 | as in archive | — |
 
 ## 2. New items admitted from the 2026-10-16 external audit + S05 probes

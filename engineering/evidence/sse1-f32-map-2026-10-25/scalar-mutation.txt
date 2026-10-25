@@ -1,0 +1,9 @@
+op0/order-0: compiling and checking
+ Traceback (most recent call last):
+  File "/home/user/lccc/tests/regression/check_sse1_f32_map.py", line 160, in <module>
+    main()
+  File "/home/user/lccc/tests/regression/check_sse1_f32_map.py", line 90, in main
+    raise RuntimeError(f'op{op}/{name}: missing packed F32 arithmetic')
+RuntimeError: op0/order-0: missing packed F32 arithmetic
+
+PASS: forced-scalar compiler mutation rejected by normal packed-code arm

@@ -1,0 +1,849 @@
+{
+  "complete": true,
+  "source_sha256": "e1d593e339f0653378172d48ceb50087ee45f430d7afd7551e7000464e4181d5",
+  "arms": [
+    {
+      "op": 0,
+      "name": "order-0",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-ffp-contract=off",
+        "-fno-math-errno",
+        "-mno-sse2",
+        "-DMAP_OP=0",
+        "-x",
+        "c"
+      ],
+      "env": {},
+      "cases": 606,
+      "packed": true,
+      "sha256": "f37987657476eb7ef0e49a6ba63beeb67561d0f83f2a0afe38bb57e8272f0702",
+      "assembly_sha256": "bbb41f1554fd183dac66457da0a406d481a0e8cecc1c782ec5d8044b008a0bdf"
+    },
+    {
+      "op": 0,
+      "name": "order-1",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-ffp-contract=off",
+        "-fno-math-errno",
+        "-mno-sse2",
+        "-msse",
+        "-DMAP_OP=0",
+        "-x",
+        "c"
+      ],
+      "env": {},
+      "cases": 606,
+      "packed": true,
+      "sha256": "f37987657476eb7ef0e49a6ba63beeb67561d0f83f2a0afe38bb57e8272f0702",
+      "assembly_sha256": "bbb41f1554fd183dac66457da0a406d481a0e8cecc1c782ec5d8044b008a0bdf"
+    },
+    {
+      "op": 0,
+      "name": "order-2",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-ffp-contract=off",
+        "-fno-math-errno",
+        "-msse",
+        "-mno-sse2",
+        "-DMAP_OP=0",
+        "-x",
+        "c"
+      ],
+      "env": {},
+      "cases": 606,
+      "packed": true,
+      "sha256": "f37987657476eb7ef0e49a6ba63beeb67561d0f83f2a0afe38bb57e8272f0702",
+      "assembly_sha256": "bbb41f1554fd183dac66457da0a406d481a0e8cecc1c782ec5d8044b008a0bdf"
+    },
+    {
+      "op": 0,
+      "name": "order-3",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-ffp-contract=off",
+        "-fno-math-errno",
+        "-march=x86-64-v3",
+        "-mno-sse2",
+        "-msse",
+        "-DMAP_OP=0",
+        "-x",
+        "c"
+      ],
+      "env": {},
+      "cases": 606,
+      "packed": true,
+      "sha256": "f37987657476eb7ef0e49a6ba63beeb67561d0f83f2a0afe38bb57e8272f0702",
+      "assembly_sha256": "bbb41f1554fd183dac66457da0a406d481a0e8cecc1c782ec5d8044b008a0bdf"
+    },
+    {
+      "op": 0,
+      "name": "scalar",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-ffp-contract=off",
+        "-fno-math-errno",
+        "-mno-sse2",
+        "-DMAP_OP=0",
+        "-x",
+        "c"
+      ],
+      "env": {
+        "CCC_NO_MAP_VEC": "1"
+      },
+      "cases": 606,
+      "packed": false,
+      "sha256": "f37987657476eb7ef0e49a6ba63beeb67561d0f83f2a0afe38bb57e8272f0702",
+      "assembly_sha256": "67300e725881ce4525ce81285e90c1779e3546af3fabcca48c9c31c676776e44"
+    },
+    {
+      "op": 0,
+      "name": "no-ra",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-ffp-contract=off",
+        "-fno-math-errno",
+        "-mno-sse2",
+        "-DMAP_OP=0",
+        "-x",
+        "c"
+      ],
+      "env": {
+        "CCC_NO_REGALLOC": "1"
+      },
+      "cases": 606,
+      "packed": true,
+      "sha256": "f37987657476eb7ef0e49a6ba63beeb67561d0f83f2a0afe38bb57e8272f0702",
+      "assembly_sha256": "210a2cdf5b20621ae1e21d4cb913515822208c124648136cbed24675aa843377"
+    },
+    {
+      "op": 0,
+      "name": "-O0",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O0",
+        "-ffp-contract=off",
+        "-fno-math-errno",
+        "-mno-sse2",
+        "-DMAP_OP=0",
+        "-x",
+        "c"
+      ],
+      "env": {},
+      "cases": 606,
+      "packed": false,
+      "sha256": "f37987657476eb7ef0e49a6ba63beeb67561d0f83f2a0afe38bb57e8272f0702",
+      "assembly_sha256": "f57faca1a610e9a605bcfd2f92b812dee7b31aaa89e312cf42e123f8c3dd3eda"
+    },
+    {
+      "op": 0,
+      "name": "-O1",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O1",
+        "-ffp-contract=off",
+        "-fno-math-errno",
+        "-mno-sse2",
+        "-DMAP_OP=0",
+        "-x",
+        "c"
+      ],
+      "env": {},
+      "cases": 606,
+      "packed": false,
+      "sha256": "f37987657476eb7ef0e49a6ba63beeb67561d0f83f2a0afe38bb57e8272f0702",
+      "assembly_sha256": "4f32156b51e9c37fae850212cc3fc123374e434b5a058a923955ddadcc4cdf6e"
+    },
+    {
+      "op": 0,
+      "name": "-O3",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O3",
+        "-ffp-contract=off",
+        "-fno-math-errno",
+        "-mno-sse2",
+        "-DMAP_OP=0",
+        "-x",
+        "c"
+      ],
+      "env": {},
+      "cases": 606,
+      "packed": true,
+      "sha256": "f37987657476eb7ef0e49a6ba63beeb67561d0f83f2a0afe38bb57e8272f0702",
+      "assembly_sha256": "bbb41f1554fd183dac66457da0a406d481a0e8cecc1c782ec5d8044b008a0bdf"
+    },
+    {
+      "op": 0,
+      "name": "-Os",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-Os",
+        "-ffp-contract=off",
+        "-fno-math-errno",
+        "-mno-sse2",
+        "-DMAP_OP=0",
+        "-x",
+        "c"
+      ],
+      "env": {},
+      "cases": 606,
+      "packed": false,
+      "sha256": "f37987657476eb7ef0e49a6ba63beeb67561d0f83f2a0afe38bb57e8272f0702",
+      "assembly_sha256": "87792be4470dd39a8f4295b52daf231c2bb16c239a7397dc8691552bb3b5d6b7"
+    },
+    {
+      "op": 1,
+      "name": "order-0",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-ffp-contract=off",
+        "-fno-math-errno",
+        "-mno-sse2",
+        "-DMAP_OP=1",
+        "-x",
+        "c"
+      ],
+      "env": {},
+      "cases": 606,
+      "packed": true,
+      "sha256": "c3441cc6963759771d740a30d19758d222bae755f7ea0a1b7d1df6950a6ad09b",
+      "assembly_sha256": "d8b75c29b566772cc375aa9512db035896c830f08c1c444ec6d9a31f02c17c99"
+    },
+    {
+      "op": 1,
+      "name": "order-1",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-ffp-contract=off",
+        "-fno-math-errno",
+        "-mno-sse2",
+        "-msse",
+        "-DMAP_OP=1",
+        "-x",
+        "c"
+      ],
+      "env": {},
+      "cases": 606,
+      "packed": true,
+      "sha256": "c3441cc6963759771d740a30d19758d222bae755f7ea0a1b7d1df6950a6ad09b",
+      "assembly_sha256": "d8b75c29b566772cc375aa9512db035896c830f08c1c444ec6d9a31f02c17c99"
+    },
+    {
+      "op": 1,
+      "name": "order-2",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-ffp-contract=off",
+        "-fno-math-errno",
+        "-msse",
+        "-mno-sse2",
+        "-DMAP_OP=1",
+        "-x",
+        "c"
+      ],
+      "env": {},
+      "cases": 606,
+      "packed": true,
+      "sha256": "c3441cc6963759771d740a30d19758d222bae755f7ea0a1b7d1df6950a6ad09b",
+      "assembly_sha256": "d8b75c29b566772cc375aa9512db035896c830f08c1c444ec6d9a31f02c17c99"
+    },
+    {
+      "op": 1,
+      "name": "order-3",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-ffp-contract=off",
+        "-fno-math-errno",
+        "-march=x86-64-v3",
+        "-mno-sse2",
+        "-msse",
+        "-DMAP_OP=1",
+        "-x",
+        "c"
+      ],
+      "env": {},
+      "cases": 606,
+      "packed": true,
+      "sha256": "c3441cc6963759771d740a30d19758d222bae755f7ea0a1b7d1df6950a6ad09b",
+      "assembly_sha256": "d8b75c29b566772cc375aa9512db035896c830f08c1c444ec6d9a31f02c17c99"
+    },
+    {
+      "op": 1,
+      "name": "scalar",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-ffp-contract=off",
+        "-fno-math-errno",
+        "-mno-sse2",
+        "-DMAP_OP=1",
+        "-x",
+        "c"
+      ],
+      "env": {
+        "CCC_NO_MAP_VEC": "1"
+      },
+      "cases": 606,
+      "packed": false,
+      "sha256": "c3441cc6963759771d740a30d19758d222bae755f7ea0a1b7d1df6950a6ad09b",
+      "assembly_sha256": "c0213312fc9ab41915b54fc47caa368dbd6e55c816c0304bde53a90f56e2aab6"
+    },
+    {
+      "op": 1,
+      "name": "no-ra",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-ffp-contract=off",
+        "-fno-math-errno",
+        "-mno-sse2",
+        "-DMAP_OP=1",
+        "-x",
+        "c"
+      ],
+      "env": {
+        "CCC_NO_REGALLOC": "1"
+      },
+      "cases": 606,
+      "packed": true,
+      "sha256": "c3441cc6963759771d740a30d19758d222bae755f7ea0a1b7d1df6950a6ad09b",
+      "assembly_sha256": "07fe6023ec0e82ec4f769fc8e302c3f761177afb8bb84bf1152b701b80f29d71"
+    },
+    {
+      "op": 2,
+      "name": "order-0",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-ffp-contract=off",
+        "-fno-math-errno",
+        "-mno-sse2",
+        "-DMAP_OP=2",
+        "-x",
+        "c"
+      ],
+      "env": {},
+      "cases": 606,
+      "packed": true,
+      "sha256": "8ba9658e31ec0378405cc640aa9dbaa30501dd7edce9d62274c0fd05a4a3545c",
+      "assembly_sha256": "356c69afc69f146ac830a8d4fad4b6c0eef309099a700fcc8363321e04b25c1c"
+    },
+    {
+      "op": 2,
+      "name": "order-1",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-ffp-contract=off",
+        "-fno-math-errno",
+        "-mno-sse2",
+        "-msse",
+        "-DMAP_OP=2",
+        "-x",
+        "c"
+      ],
+      "env": {},
+      "cases": 606,
+      "packed": true,
+      "sha256": "8ba9658e31ec0378405cc640aa9dbaa30501dd7edce9d62274c0fd05a4a3545c",
+      "assembly_sha256": "356c69afc69f146ac830a8d4fad4b6c0eef309099a700fcc8363321e04b25c1c"
+    },
+    {
+      "op": 2,
+      "name": "order-2",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-ffp-contract=off",
+        "-fno-math-errno",
+        "-msse",
+        "-mno-sse2",
+        "-DMAP_OP=2",
+        "-x",
+        "c"
+      ],
+      "env": {},
+      "cases": 606,
+      "packed": true,
+      "sha256": "8ba9658e31ec0378405cc640aa9dbaa30501dd7edce9d62274c0fd05a4a3545c",
+      "assembly_sha256": "356c69afc69f146ac830a8d4fad4b6c0eef309099a700fcc8363321e04b25c1c"
+    },
+    {
+      "op": 2,
+      "name": "order-3",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-ffp-contract=off",
+        "-fno-math-errno",
+        "-march=x86-64-v3",
+        "-mno-sse2",
+        "-msse",
+        "-DMAP_OP=2",
+        "-x",
+        "c"
+      ],
+      "env": {},
+      "cases": 606,
+      "packed": true,
+      "sha256": "8ba9658e31ec0378405cc640aa9dbaa30501dd7edce9d62274c0fd05a4a3545c",
+      "assembly_sha256": "356c69afc69f146ac830a8d4fad4b6c0eef309099a700fcc8363321e04b25c1c"
+    },
+    {
+      "op": 2,
+      "name": "scalar",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-ffp-contract=off",
+        "-fno-math-errno",
+        "-mno-sse2",
+        "-DMAP_OP=2",
+        "-x",
+        "c"
+      ],
+      "env": {
+        "CCC_NO_MAP_VEC": "1"
+      },
+      "cases": 606,
+      "packed": false,
+      "sha256": "8ba9658e31ec0378405cc640aa9dbaa30501dd7edce9d62274c0fd05a4a3545c",
+      "assembly_sha256": "8fb35a8ffcbc81869d453c8edaf7503902c2fe847a5de269fcdc496bc401347e"
+    },
+    {
+      "op": 2,
+      "name": "no-ra",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-ffp-contract=off",
+        "-fno-math-errno",
+        "-mno-sse2",
+        "-DMAP_OP=2",
+        "-x",
+        "c"
+      ],
+      "env": {
+        "CCC_NO_REGALLOC": "1"
+      },
+      "cases": 606,
+      "packed": true,
+      "sha256": "8ba9658e31ec0378405cc640aa9dbaa30501dd7edce9d62274c0fd05a4a3545c",
+      "assembly_sha256": "330af81c8ae45fdcfda8fdcfbbf4838adf6b99310fcc0cd2030101faeedea7f4"
+    },
+    {
+      "op": 3,
+      "name": "order-0",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-ffp-contract=off",
+        "-fno-math-errno",
+        "-mno-sse2",
+        "-DMAP_OP=3",
+        "-x",
+        "c"
+      ],
+      "env": {},
+      "cases": 606,
+      "packed": true,
+      "sha256": "648f73fb310317efb657b8617dbab4f6a07a8985db7508594cbc69807f2a3207",
+      "assembly_sha256": "1938ef6840b4c3c14ad700f418acf2e9e83f496171c29c2ad7bc778e6dc0faa9"
+    },
+    {
+      "op": 3,
+      "name": "order-1",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-ffp-contract=off",
+        "-fno-math-errno",
+        "-mno-sse2",
+        "-msse",
+        "-DMAP_OP=3",
+        "-x",
+        "c"
+      ],
+      "env": {},
+      "cases": 606,
+      "packed": true,
+      "sha256": "648f73fb310317efb657b8617dbab4f6a07a8985db7508594cbc69807f2a3207",
+      "assembly_sha256": "1938ef6840b4c3c14ad700f418acf2e9e83f496171c29c2ad7bc778e6dc0faa9"
+    },
+    {
+      "op": 3,
+      "name": "order-2",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-ffp-contract=off",
+        "-fno-math-errno",
+        "-msse",
+        "-mno-sse2",
+        "-DMAP_OP=3",
+        "-x",
+        "c"
+      ],
+      "env": {},
+      "cases": 606,
+      "packed": true,
+      "sha256": "648f73fb310317efb657b8617dbab4f6a07a8985db7508594cbc69807f2a3207",
+      "assembly_sha256": "1938ef6840b4c3c14ad700f418acf2e9e83f496171c29c2ad7bc778e6dc0faa9"
+    },
+    {
+      "op": 3,
+      "name": "order-3",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-ffp-contract=off",
+        "-fno-math-errno",
+        "-march=x86-64-v3",
+        "-mno-sse2",
+        "-msse",
+        "-DMAP_OP=3",
+        "-x",
+        "c"
+      ],
+      "env": {},
+      "cases": 606,
+      "packed": true,
+      "sha256": "648f73fb310317efb657b8617dbab4f6a07a8985db7508594cbc69807f2a3207",
+      "assembly_sha256": "1938ef6840b4c3c14ad700f418acf2e9e83f496171c29c2ad7bc778e6dc0faa9"
+    },
+    {
+      "op": 3,
+      "name": "scalar",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-ffp-contract=off",
+        "-fno-math-errno",
+        "-mno-sse2",
+        "-DMAP_OP=3",
+        "-x",
+        "c"
+      ],
+      "env": {
+        "CCC_NO_MAP_VEC": "1"
+      },
+      "cases": 606,
+      "packed": false,
+      "sha256": "648f73fb310317efb657b8617dbab4f6a07a8985db7508594cbc69807f2a3207",
+      "assembly_sha256": "00cf5f096c996fc46abab57d2a9ae6834eca88bcdee19bd04d6f7ce5691e5d21"
+    },
+    {
+      "op": 3,
+      "name": "no-ra",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-ffp-contract=off",
+        "-fno-math-errno",
+        "-mno-sse2",
+        "-DMAP_OP=3",
+        "-x",
+        "c"
+      ],
+      "env": {
+        "CCC_NO_REGALLOC": "1"
+      },
+      "cases": 606,
+      "packed": true,
+      "sha256": "648f73fb310317efb657b8617dbab4f6a07a8985db7508594cbc69807f2a3207",
+      "assembly_sha256": "0fdf45f1ab5f5486f49d692f88944767a6ead3ef25ea0477dddba7b0784cda2c"
+    },
+    {
+      "op": 4,
+      "name": "order-0",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-ffp-contract=off",
+        "-fno-math-errno",
+        "-mno-sse2",
+        "-DMAP_OP=4",
+        "-x",
+        "c"
+      ],
+      "env": {},
+      "cases": 606,
+      "packed": true,
+      "sha256": "631df3e0b237e044276bfe5cb0f70078f5ac88ea6655aa765e5079ccb4e5b5e8",
+      "assembly_sha256": "e53b850d44f13c175223b243795524b4aed5cd3313a89e2b999faaef5a612291"
+    },
+    {
+      "op": 4,
+      "name": "order-1",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-ffp-contract=off",
+        "-fno-math-errno",
+        "-mno-sse2",
+        "-msse",
+        "-DMAP_OP=4",
+        "-x",
+        "c"
+      ],
+      "env": {},
+      "cases": 606,
+      "packed": true,
+      "sha256": "631df3e0b237e044276bfe5cb0f70078f5ac88ea6655aa765e5079ccb4e5b5e8",
+      "assembly_sha256": "e53b850d44f13c175223b243795524b4aed5cd3313a89e2b999faaef5a612291"
+    },
+    {
+      "op": 4,
+      "name": "order-2",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-ffp-contract=off",
+        "-fno-math-errno",
+        "-msse",
+        "-mno-sse2",
+        "-DMAP_OP=4",
+        "-x",
+        "c"
+      ],
+      "env": {},
+      "cases": 606,
+      "packed": true,
+      "sha256": "631df3e0b237e044276bfe5cb0f70078f5ac88ea6655aa765e5079ccb4e5b5e8",
+      "assembly_sha256": "e53b850d44f13c175223b243795524b4aed5cd3313a89e2b999faaef5a612291"
+    },
+    {
+      "op": 4,
+      "name": "order-3",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-ffp-contract=off",
+        "-fno-math-errno",
+        "-march=x86-64-v3",
+        "-mno-sse2",
+        "-msse",
+        "-DMAP_OP=4",
+        "-x",
+        "c"
+      ],
+      "env": {},
+      "cases": 606,
+      "packed": true,
+      "sha256": "631df3e0b237e044276bfe5cb0f70078f5ac88ea6655aa765e5079ccb4e5b5e8",
+      "assembly_sha256": "e53b850d44f13c175223b243795524b4aed5cd3313a89e2b999faaef5a612291"
+    },
+    {
+      "op": 4,
+      "name": "scalar",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-ffp-contract=off",
+        "-fno-math-errno",
+        "-mno-sse2",
+        "-DMAP_OP=4",
+        "-x",
+        "c"
+      ],
+      "env": {
+        "CCC_NO_MAP_VEC": "1"
+      },
+      "cases": 606,
+      "packed": false,
+      "sha256": "631df3e0b237e044276bfe5cb0f70078f5ac88ea6655aa765e5079ccb4e5b5e8",
+      "assembly_sha256": "fd4c40e60589aad0e13ba016a1de2fe406ae6222c7a1083d05b8d5b044cbfdd0"
+    },
+    {
+      "op": 4,
+      "name": "no-ra",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-ffp-contract=off",
+        "-fno-math-errno",
+        "-mno-sse2",
+        "-DMAP_OP=4",
+        "-x",
+        "c"
+      ],
+      "env": {
+        "CCC_NO_REGALLOC": "1"
+      },
+      "cases": 606,
+      "packed": true,
+      "sha256": "631df3e0b237e044276bfe5cb0f70078f5ac88ea6655aa765e5079ccb4e5b5e8",
+      "assembly_sha256": "b0dfc96c74d2e54408075dc435b4be5af09088c8ab5a647cd4815b91076934fa"
+    },
+    {
+      "op": 5,
+      "name": "order-0",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-ffp-contract=off",
+        "-fno-math-errno",
+        "-mno-sse2",
+        "-DMAP_OP=5",
+        "-x",
+        "c"
+      ],
+      "env": {},
+      "cases": 606,
+      "packed": true,
+      "sha256": "10d14ba8a7dc56cdc3acafde0f3d50d76d6f2071f8531c4363c841d4268313bf",
+      "assembly_sha256": "155e0c272c96e7a58fbab843e0832f238bfffdbe8706c4e4b1e1354421b2fcdc"
+    },
+    {
+      "op": 5,
+      "name": "order-1",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-ffp-contract=off",
+        "-fno-math-errno",
+        "-mno-sse2",
+        "-msse",
+        "-DMAP_OP=5",
+        "-x",
+        "c"
+      ],
+      "env": {},
+      "cases": 606,
+      "packed": true,
+      "sha256": "10d14ba8a7dc56cdc3acafde0f3d50d76d6f2071f8531c4363c841d4268313bf",
+      "assembly_sha256": "155e0c272c96e7a58fbab843e0832f238bfffdbe8706c4e4b1e1354421b2fcdc"
+    },
+    {
+      "op": 5,
+      "name": "order-2",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-ffp-contract=off",
+        "-fno-math-errno",
+        "-msse",
+        "-mno-sse2",
+        "-DMAP_OP=5",
+        "-x",
+        "c"
+      ],
+      "env": {},
+      "cases": 606,
+      "packed": true,
+      "sha256": "10d14ba8a7dc56cdc3acafde0f3d50d76d6f2071f8531c4363c841d4268313bf",
+      "assembly_sha256": "155e0c272c96e7a58fbab843e0832f238bfffdbe8706c4e4b1e1354421b2fcdc"
+    },
+    {
+      "op": 5,
+      "name": "order-3",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-ffp-contract=off",
+        "-fno-math-errno",
+        "-march=x86-64-v3",
+        "-mno-sse2",
+        "-msse",
+        "-DMAP_OP=5",
+        "-x",
+        "c"
+      ],
+      "env": {},
+      "cases": 606,
+      "packed": true,
+      "sha256": "10d14ba8a7dc56cdc3acafde0f3d50d76d6f2071f8531c4363c841d4268313bf",
+      "assembly_sha256": "155e0c272c96e7a58fbab843e0832f238bfffdbe8706c4e4b1e1354421b2fcdc"
+    },
+    {
+      "op": 5,
+      "name": "scalar",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-ffp-contract=off",
+        "-fno-math-errno",
+        "-mno-sse2",
+        "-DMAP_OP=5",
+        "-x",
+        "c"
+      ],
+      "env": {
+        "CCC_NO_MAP_VEC": "1"
+      },
+      "cases": 606,
+      "packed": false,
+      "sha256": "10d14ba8a7dc56cdc3acafde0f3d50d76d6f2071f8531c4363c841d4268313bf",
+      "assembly_sha256": "b2963879e55bfbf0711bf4ff3878c220172dbb1faa0110caec43c7e15fb817cd"
+    },
+    {
+      "op": 5,
+      "name": "no-ra",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-ffp-contract=off",
+        "-fno-math-errno",
+        "-mno-sse2",
+        "-DMAP_OP=5",
+        "-x",
+        "c"
+      ],
+      "env": {
+        "CCC_NO_REGALLOC": "1"
+      },
+      "cases": 606,
+      "packed": true,
+      "sha256": "10d14ba8a7dc56cdc3acafde0f3d50d76d6f2071f8531c4363c841d4268313bf",
+      "assembly_sha256": "f68ea46ea248c7fe3b186c99d51f664d98dbf55c0e94e6393d4303aa844f6e4e"
+    }
+  ],
+  "negative_controls": [
+    {
+      "named_address_space": "gs",
+      "flags": [
+        "-mno-sse2"
+      ],
+      "preserved": true
+    },
+    {
+      "named_address_space": "gs",
+      "flags": [],
+      "preserved": true
+    },
+    {
+      "flags": [
+        "-mno-sse2",
+        "-msse"
+      ],
+      "rejected": true
+    },
+    {
+      "flags": [
+        "-mno-sse"
+      ],
+      "rejected": true
+    }
+  ],
+  "isa_mutations": [
+    "movdqu (%rdi), %xmm0",
+    "pxor %xmm0, %xmm0",
+    "addsd %xmm1,%xmm0",
+    "movd %xmm0,%eax",
+    "movd %eax,%xmm0",
+    "movq %xmm0,%rax"
+  ]
+}
