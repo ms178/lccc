@@ -82,6 +82,10 @@ was added.
 - Inherited strict F32/F64 gate passes all 40 arms, including contraction
   mutants; vectorizer ISA and default-feature gates pass.
 - Twelve deterministic differential fuzz cases pass against GCC/Clang at O2.
+- Debug/size parity now reads benchmark build profiles instead of compiling
+  every source with a fixed ISA. This preserves the SSE1-only assertion and
+  also covers both registered F32/F64 builds; the focused three-profile check
+  passes (`debug-parity.txt`). Raw diagnostic TUs retain default coverage.
 
 Commands and raw samples are retained in the JSON and text files. Absolute
 artifact/tool paths record this sandbox and are not claimed to exist elsewhere.

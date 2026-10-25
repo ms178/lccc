@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """Debug attribution must not change emitted .text (all benchmark programs)."""
+import argparse
 import difflib
 import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "tests/benchmark"))
+from run_benchmarks import BENCHMARKS, PROGRAMS
 
 
 def disassembly_window(obj: Path, start: int, end: int) -> str:
@@ -142,7 +146,7 @@ def instruction_text_diff(before, after) -> str:
     )
 
 
-def peephole_trace_diff(compiler: str, source: Path, work: Path) -> str:
+def peephole_trace_diff(compiler: str, source: Path, work: Path, profile=()) -> str:
     """Rerun only a failing source with pre-peephole and per-pass dumps."""
     results = {}
     for mode, flags in [("plain", []), ("debug", ["-g"])]:
@@ -152,7 +156,7 @@ def peephole_trace_diff(compiler: str, source: Path, work: Path) -> str:
         env = os.environ.copy()
         env["CCC_DUMP_ASM"] = str(dump)
         env["CCC_PEEPHOLE_TRACE"] = str(trace_dir)
-        command = [compiler, "-O2", "-march=x86-64-v3", "-c", *flags,
+        command = [compiler, "-O2", "-march=x86-64-v3", *profile, "-c", *flags,
                    str(source), "-o", str(obj)]
         try:
             proc = subprocess.run(command, check=False, capture_output=True, text=True, env=env)
@@ -254,21 +258,37 @@ def report_mismatch(
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--only", action="append", metavar="SOURCE.c",
+                        help="restrict to a source basename (repeatable)")
+    args = parser.parse_args()
     compiler = os.environ.get("CCC", str(ROOT / "target/fastbuild/lccc"))
     failures = []
     # Diagnostic driver/kernel are not standalone benchmarks, but their debug
     # attribution must still exercise the same late-backend parity contract.
     sources = sorted((ROOT / "tests/benchmark/programs").glob("*.c"))
     sources += sorted((ROOT / "tests/benchmark/volatile").glob("*.c"))
+    if args.only:
+        sources = [source for source in sources if source.name in args.only]
     assert sources, "empty parity corpus"
+    # A source can have several registered builds (e.g. F32 and F64).
+    # Exercise every profile, with its flags AFTER the shared ISA default;
+    # raw diagnostic TUs retain their original default-profile coverage.
+    profiles = {}
+    for benchmark in BENCHMARKS:
+        for name in benchmark.sources:
+            source = (PROGRAMS / name).resolve()
+            profiles.setdefault(source, set()).add(benchmark.extra_flags)
+    cases = [(source, profile) for source in sources
+             for profile in sorted(profiles.get(source.resolve(), {()}))]
     with tempfile.TemporaryDirectory(prefix="lccc-debug-parity-") as tmp:
         work = Path(tmp)
-        for source in sources:
+        for source, profile in cases:
             code = []
             objects = []
             for mode, flags in [("plain", []), ("debug", ["-g"])]:
                 obj, raw = work / (mode + ".o"), work / (mode + ".text")
-                subprocess.run([compiler, "-O2", "-march=x86-64-v3", "-c", *flags,
+                subprocess.run([compiler, "-O2", "-march=x86-64-v3", *profile, "-c", *flags,
                                 str(source), "-o", str(obj)], check=True)
                 subprocess.run(["objcopy", "-O", "binary", "--only-section=.text",
                                 str(obj), str(raw)], check=True)
@@ -276,9 +296,9 @@ def main():
                 code.append(raw.read_bytes())
             if not code[0] or code[0] != code[1]:
                 failures.append(source.name)
-                trace_info = peephole_trace_diff(compiler, source, work)
+                trace_info = peephole_trace_diff(compiler, source, work, profile)
                 report_mismatch(
-                    "debug .text parity",
+                    "debug .text parity " + repr(profile),
                     source,
                     code[0],
                     code[1],
@@ -289,14 +309,14 @@ def main():
         # Size policy is driver-owned, not a heuristic reconstructed by a
         # peephole. On every program, -Os must already disable retargeting;
         # the explicit bisection switch must therefore leave .text unchanged.
-        for source in sources:
+        for source, profile in cases:
             code = []
             objects = []
             for mode, skip in [("size", ""), ("size-no-jump", "jump_thread")]:
                 obj, raw = work / (mode + ".o"), work / (mode + ".text")
                 env = os.environ.copy()
                 env["CCC_PEEPHOLE_SKIP"] = skip
-                subprocess.run([compiler, "-Os", "-march=x86-64-v3", "-c",
+                subprocess.run([compiler, "-Os", "-march=x86-64-v3", *profile, "-c",
                                 str(source), "-o", str(obj)], env=env, check=True)
                 subprocess.run(["objcopy", "-O", "binary", "--only-section=.text",
                                 str(obj), str(raw)], check=True)
@@ -305,10 +325,10 @@ def main():
             if not code[0] or code[0] != code[1]:
                 failures.append("size-policy:" + source.name)
                 report_mismatch(
-                    "size threading policy", source, code[0], code[1], objects[0], objects[1]
+                    "size threading policy " + repr(profile), source, code[0], code[1], objects[0], objects[1]
                 )
     assert not failures, f"debug changes machine code: {failures}"
-    print(f"PASS debug .text parity and size threading policy: {len(sources)} programs")
+    print(f"PASS debug .text parity and size threading policy: {len(sources)} programs / {len(cases)} build profiles")
 
 
 if __name__ == "__main__":
