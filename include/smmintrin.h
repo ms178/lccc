@@ -277,7 +277,7 @@ _mm_cvtepu32_epi64(__m128i __a)
 static __inline__ int __attribute__((__always_inline__, target("sse4.1")))
 _mm_testz_si128(__m128i __a, __m128i __b)
 {
-    return (__a.__val[0] & __b.__val[0]) == 0 && (__a.__val[1] & __b.__val[1]) == 0;
+    return (__a[0] & __b[0]) == 0 && (__a[1] & __b[1]) == 0;
 }
 
 /* === SSE4.1 multiply === */
@@ -322,8 +322,8 @@ static __inline__ __m128i __attribute__((__always_inline__, target("sse4.1")))
 _mm_packus_epi32(__m128i __a, __m128i __b)
 {
     __m128i __r;
-    int *__ai = (int *)&__a.__val;
-    int *__bi = (int *)&__b.__val;
+    int *__ai = (int *)&__a;
+    int *__bi = (int *)&__b;
     unsigned short __rr[8];
     for (int __i = 0; __i < 4; __i++) {
         int __v = __ai[__i];
@@ -337,7 +337,7 @@ _mm_packus_epi32(__m128i __a, __m128i __b)
         if (__v < 0) __v = 0;
         __rr[__i + 4] = (unsigned short)__v;
     }
-    __builtin_memcpy(&__r.__val, __rr, 16);
+    __builtin_memcpy(&__r, __rr, 16);
     return __r;
 }
 

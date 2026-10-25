@@ -1980,6 +1980,12 @@ impl Lowerer {
         expr: &Expr,
     ) -> Vec<crate::common::types::EightbyteClass> {
         if let Some(ctype) = self.get_expr_ctype(expr) {
+            // Native AVX vectors use the same register classification for
+            // direct and indirect calls. Only the memory fallback carries
+            // the i386 natural-stack-alignment marker.
+            if let Some((classes, _)) = self.sysv_arg_abi(&ctype) {
+                return classes;
+            }
             if self.target == crate::backend::Target::I686 && matches!(&ctype, CType::Vector(..)) {
                 // Distinguish naturally aligned GNU vectors from ordinary
                 // MEMORY records without adding a parallel CallInfo array.
@@ -1988,10 +1994,6 @@ impl Lowerer {
                     crate::common::types::EightbyteClass::Memory,
                     crate::common::types::EightbyteClass::NoClass,
                 ];
-            }
-            // x86-64 structs, unions AND vectors (a vector has no layout).
-            if let Some((classes, _)) = self.sysv_arg_abi(&ctype) {
-                return classes;
             }
             if let Some(layout) = self.get_struct_layout_for_ctype(&ctype) {
                 return layout.classify_sysv_eightbytes(&*self.types.borrow_struct_layouts());

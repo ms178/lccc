@@ -615,7 +615,17 @@ impl I686Codegen {
             self.conflict_param_slots
                 .insert(param_idx, StackSlot(offset));
         }
-        space + conflict_params.len() as i64 * 4
+        let mut space = space + conflict_params.len() as i64 * 4;
+        self.vector_ret_buffer_bytes = crate::backend::call_abi::hidden_vector_return_bytes(
+            func.uses_sret,
+            &func.ret_eightbyte_classes,
+        )
+        .unwrap_or(0);
+        if self.vector_ret_buffer_bytes > 0 {
+            space += self.vector_ret_buffer_bytes as i64;
+            self.vector_ret_buffer_offset = -space;
+        }
+        space
     }
 
     // ---- aligned_frame_size ----
@@ -1280,12 +1290,35 @@ impl I686Codegen {
             // CoreArgClass::StructXmmReg -> ParamClass::F128SseReg). Nothing
             // in the prologue uses an XMM register, so the store can sit in
             // parameter order; the parameter object is its 16-byte alloca.
-            if let ParamClass::F128SseReg { reg_idx, .. } = class {
+            if let ParamClass::VectorReturnBuffer { .. } = class {
                 if let Some(slot) =
                     find_param_alloca(func, i).and_then(|(dest, _)| self.state.get_slot(dest.0))
                 {
-                    let dst = self.slot_ref(slot);
-                    emit!(self.state, "    movups %xmm{}, {}", reg_idx, dst);
+                    let source = self.slot_ref(StackSlot(self.vector_ret_buffer_offset));
+                    let destination = self.slot_ref(slot);
+                    emit!(self.state, "    leal {}, %eax", source);
+                    emit!(self.state, "    movl %eax, {}", destination);
+                }
+                continue;
+            }
+            if let ParamClass::F128SseReg { reg_idx, size } = class {
+                if let Some((destination, _)) = find_param_alloca(func, i) {
+                    let Some(slot) = self.state.get_slot(destination.0) else {
+                        continue;
+                    };
+                    let dst = if self.state.alloca_over_align(destination.0).is_some() {
+                        self.emit_alloca_addr_to("eax", destination.0, slot);
+                        "(%eax)".to_string()
+                    } else {
+                        self.slot_ref(slot)
+                    };
+                    let (instruction, register) = match size {
+                        16 => ("movups", format!("xmm{reg_idx}")),
+                        32 => ("vmovups", format!("ymm{reg_idx}")),
+                        64 => ("vmovups", format!("zmm{reg_idx}")),
+                        _ => unreachable!("invalid native vector parameter width"),
+                    };
+                    emit!(self.state, "    {} %{}, {}", instruction, register, dst);
                 }
                 continue;
             }
@@ -1793,6 +1826,12 @@ impl I686Codegen {
                     );
                     return;
                 }
+                ParamClass::VectorReturnBuffer { .. } => {
+                    let source = self.slot_ref(StackSlot(self.vector_ret_buffer_offset));
+                    emit!(self.state, "    leal {}, %eax", source);
+                    self.store_eax_to(dest);
+                    return;
+                }
                 _ => stack_base + (param_idx as i64) * 4,
             }
         } else {
@@ -1843,7 +1882,7 @@ impl I686Codegen {
 
     pub(super) fn emit_epilogue_and_ret_impl(&mut self, frame_size: i64) {
         self.emit_epilogue(frame_size);
-        if self.state.uses_sret && self.regparm == 0 {
+        if self.state.uses_sret && self.vector_ret_buffer_bytes == 0 && self.regparm == 0 {
             // i386 SysV sret: callee pops the hidden pointer.
             // Under -mregparm>=1 the hidden pointer travels in %eax (GCC
             // function_value semantics) — nothing is on the stack to pop.

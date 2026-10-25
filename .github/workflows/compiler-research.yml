@@ -94,6 +94,26 @@ jobs:
                   raise SystemExit(f'{family}: required real amd64+i686 execution, got {actual}')
               print(f'::notice title=Native AVX dual-mode execution::{family}: {json.dumps(actual, sort_keys=True)}; GCC 16.2.0')
           PYCONTRACT
+      - name: Public native SIMD type and cross-compiler ABI contracts
+        timeout-minutes: 15
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/ci_test_report.py -- \
+            python3 tests/regression/run_regression.py \
+              --lccc target/fastbuild/lccc --gcc gcc-16 -j 2 \
+              --filter public_simd_native_types --json results/research/public-simd-types.json
+          python3 - <<'PYTYPES'
+          import json
+          from pathlib import Path
+          report = json.loads(Path('results/research/public-simd-types.json').read_text())
+          expected = {'total': 2, 'passed': 2, 'failed': 0, 'skipped_compare': 0, 'skipped_run': 0}
+          actual = {key: report[key] for key in expected}
+          if actual != expected:
+              raise SystemExit(f'public SIMD types require real dual-mode execution: {actual}')
+          PYTYPES
+          python3 scripts/ci_test_report.py -- \
+            python3 tests/regression/check_public_simd_abi.py --gcc gcc-16
       - name: Same-host before/after/vendor portable and native comparisons
         timeout-minutes: 45
         shell: bash

@@ -60,7 +60,7 @@ _mm_set1_epi8(char __b)
     __q |= __q << 8;
     __q |= __q << 16;
     __q |= __q << 32;
-    return (__m128i){ { __q, __q } };
+    return (__m128i){  __q, __q  };
 }
 
 static __inline__ __m128i __attribute__((__always_inline__))
@@ -68,13 +68,13 @@ _mm_set1_epi32(int __i)
 {
     long long __q = (long long)(unsigned int)__i
                   | ((long long)(unsigned int)__i << 32);
-    return (__m128i){ { __q, __q } };
+    return (__m128i){  __q, __q  };
 }
 
 static __inline__ __m128i __attribute__((__always_inline__))
 _mm_setzero_si128(void)
 {
-    return (__m128i){ { 0LL, 0LL } };
+    return (__m128i){  0LL, 0LL  };
 }
 
 /* === Compare === */
@@ -96,10 +96,10 @@ _mm_cmpeq_epi16(__m128i __a, __m128i __b)
 {
     /* Compare 8 x 16-bit elements for equality. Returns 0xFFFF for equal, 0x0000 otherwise. */
     unsigned long long __r0 = 0, __r1 = 0;
-    unsigned long long __a0 = (unsigned long long)__a.__val[0];
-    unsigned long long __b0 = (unsigned long long)__b.__val[0];
-    unsigned long long __a1 = (unsigned long long)__a.__val[1];
-    unsigned long long __b1 = (unsigned long long)__b.__val[1];
+    unsigned long long __a0 = (unsigned long long)__a[0];
+    unsigned long long __b0 = (unsigned long long)__b[0];
+    unsigned long long __a1 = (unsigned long long)__a[1];
+    unsigned long long __b1 = (unsigned long long)__b[1];
     for (int __i = 0; __i < 4; __i++) {
         unsigned short __va = (unsigned short)(__a0 >> (__i * 16));
         unsigned short __vb = (unsigned short)(__b0 >> (__i * 16));
@@ -110,7 +110,7 @@ _mm_cmpeq_epi16(__m128i __a, __m128i __b)
         unsigned short __vb = (unsigned short)(__b1 >> (__i * 16));
         if (__va == __vb) __r1 |= (0xFFFFULL << (__i * 16));
     }
-    return (__m128i){ { (long long)__r0, (long long)__r1 } };
+    return (__m128i){  (long long)__r0, (long long)__r1  };
 }
 
 static __inline__ __m128i __attribute__((__always_inline__))
@@ -282,29 +282,29 @@ _mm_max_epu8(__m128i __a, __m128i __b)
 static __inline__ __m128i __attribute__((__always_inline__))
 _mm_or_si128(__m128i __a, __m128i __b)
 {
-    return (__m128i){ { __a.__val[0] | __b.__val[0],
-                        __a.__val[1] | __b.__val[1] } };
+    return (__m128i){  __a[0] | __b[0],
+                        __a[1] | __b[1]  };
 }
 
 static __inline__ __m128i __attribute__((__always_inline__))
 _mm_and_si128(__m128i __a, __m128i __b)
 {
-    return (__m128i){ { __a.__val[0] & __b.__val[0],
-                        __a.__val[1] & __b.__val[1] } };
+    return (__m128i){  __a[0] & __b[0],
+                        __a[1] & __b[1]  };
 }
 
 static __inline__ __m128i __attribute__((__always_inline__))
 _mm_andnot_si128(__m128i __a, __m128i __b)
 {
-    return (__m128i){ { ~__a.__val[0] & __b.__val[0],
-                        ~__a.__val[1] & __b.__val[1] } };
+    return (__m128i){  ~__a[0] & __b[0],
+                        ~__a[1] & __b[1]  };
 }
 
 static __inline__ __m128i __attribute__((__always_inline__))
 _mm_xor_si128(__m128i __a, __m128i __b)
 {
-    return (__m128i){ { __a.__val[0] ^ __b.__val[0],
-                        __a.__val[1] ^ __b.__val[1] } };
+    return (__m128i){  __a[0] ^ __b[0],
+                        __a[1] ^ __b[1]  };
 }
 
 /* === 8-bit Arithmetic === */
@@ -433,11 +433,11 @@ _mm_cmplt_epi32(__m128i __a, __m128i __b)
 static __inline__ __m128i __attribute__((__always_inline__))
 _mm_mul_epu32(__m128i __a, __m128i __b)
 {
-    unsigned long long __a0 = (unsigned long long)(unsigned int)__a.__val[0];
-    unsigned long long __b0 = (unsigned long long)(unsigned int)__b.__val[0];
-    unsigned long long __a1 = (unsigned long long)(unsigned int)__a.__val[1];
-    unsigned long long __b1 = (unsigned long long)(unsigned int)__b.__val[1];
-    return (__m128i){ { (long long)(__a0 * __b0), (long long)(__a1 * __b1) } };
+    unsigned long long __a0 = (unsigned long long)(unsigned int)__a[0];
+    unsigned long long __b0 = (unsigned long long)(unsigned int)__b[0];
+    unsigned long long __a1 = (unsigned long long)(unsigned int)__a[1];
+    unsigned long long __b1 = (unsigned long long)(unsigned int)__b[1];
+    return (__m128i){  (long long)(__a0 * __b0), (long long)(__a1 * __b1)  };
 }
 
 /* NOTE: _mm_mullo_epi16 is already defined above */
@@ -447,15 +447,15 @@ _mm_mul_epu32(__m128i __a, __m128i __b)
 static __inline__ __m128i __attribute__((__always_inline__))
 _mm_add_epi64(__m128i __a, __m128i __b)
 {
-    return (__m128i){ { __a.__val[0] + __b.__val[0],
-                        __a.__val[1] + __b.__val[1] } };
+    return (__m128i){  __a[0] + __b[0],
+                        __a[1] + __b[1]  };
 }
 
 static __inline__ __m128i __attribute__((__always_inline__))
 _mm_sub_epi64(__m128i __a, __m128i __b)
 {
-    return (__m128i){ { __a.__val[0] - __b.__val[0],
-                        __a.__val[1] - __b.__val[1] } };
+    return (__m128i){  __a[0] - __b[0],
+                        __a[1] - __b[1]  };
 }
 
 /* === Pack / Unpack === */
@@ -506,40 +506,40 @@ _mm_unpackhi_epi16(__m128i __a, __m128i __b)
 static __inline__ __m128i __attribute__((__always_inline__))
 _mm_unpacklo_epi32(__m128i __a, __m128i __b)
 {
-    unsigned int __a0 = (unsigned int)__a.__val[0];
-    unsigned int __a1 = (unsigned int)(__a.__val[0] >> 32);
-    unsigned int __b0 = (unsigned int)__b.__val[0];
-    unsigned int __b1 = (unsigned int)(__b.__val[0] >> 32);
+    unsigned int __a0 = (unsigned int)__a[0];
+    unsigned int __a1 = (unsigned int)(__a[0] >> 32);
+    unsigned int __b0 = (unsigned int)__b[0];
+    unsigned int __b1 = (unsigned int)(__b[0] >> 32);
     long long __lo = (long long)__a0 | ((long long)__b0 << 32);
     long long __hi = (long long)__a1 | ((long long)__b1 << 32);
-    return (__m128i){ { __lo, __hi } };
+    return (__m128i){  __lo, __hi  };
 }
 
 /* Interleave high 32-bit integers: a2, b2, a3, b3 */
 static __inline__ __m128i __attribute__((__always_inline__))
 _mm_unpackhi_epi32(__m128i __a, __m128i __b)
 {
-    unsigned int __a2 = (unsigned int)__a.__val[1];
-    unsigned int __a3 = (unsigned int)(__a.__val[1] >> 32);
-    unsigned int __b2 = (unsigned int)__b.__val[1];
-    unsigned int __b3 = (unsigned int)(__b.__val[1] >> 32);
+    unsigned int __a2 = (unsigned int)__a[1];
+    unsigned int __a3 = (unsigned int)(__a[1] >> 32);
+    unsigned int __b2 = (unsigned int)__b[1];
+    unsigned int __b3 = (unsigned int)(__b[1] >> 32);
     long long __lo = (long long)__a2 | ((long long)__b2 << 32);
     long long __hi = (long long)__a3 | ((long long)__b3 << 32);
-    return (__m128i){ { __lo, __hi } };
+    return (__m128i){  __lo, __hi  };
 }
 
 /* Interleave low 64-bit integers: a0, b0 */
 static __inline__ __m128i __attribute__((__always_inline__))
 _mm_unpacklo_epi64(__m128i __a, __m128i __b)
 {
-    return (__m128i){ { __a.__val[0], __b.__val[0] } };
+    return (__m128i){  __a[0], __b[0]  };
 }
 
 /* Interleave high 64-bit integers: a1, b1 */
 static __inline__ __m128i __attribute__((__always_inline__))
 _mm_unpackhi_epi64(__m128i __a, __m128i __b)
 {
-    return (__m128i){ { __a.__val[1], __b.__val[1] } };
+    return (__m128i){  __a[1], __b[1]  };
 }
 
 /* === Set / Broadcast === */
@@ -550,7 +550,7 @@ _mm_set1_epi16(short __w)
     unsigned short __uw = (unsigned short)__w;
     long long __q = (long long)__uw | ((long long)__uw << 16)
                   | ((long long)__uw << 32) | ((long long)__uw << 48);
-    return (__m128i){ { __q, __q } };
+    return (__m128i){  __q, __q  };
 }
 
 /* _mm_setr_epi16: set 8 x 16-bit lanes in natural (low-to-high) order */
@@ -566,7 +566,7 @@ _mm_setr_epi16(short __w0, short __w1, short __w2, short __w3,
                    | ((long long)(unsigned short)__w5 << 16)
                    | ((long long)(unsigned short)__w6 << 32)
                    | ((long long)(unsigned short)__w7 << 48);
-    return (__m128i){ { __lo, __hi } };
+    return (__m128i){  __lo, __hi  };
 }
 
 /* _mm_set_epi16: set 8 x 16-bit lanes in reverse (high-to-low) order */
@@ -585,7 +585,7 @@ _mm_setr_epi32(int __i0, int __i1, int __i2, int __i3)
                    | ((long long)(unsigned int)__i1 << 32);
     long long __hi = (long long)(unsigned int)__i2
                    | ((long long)(unsigned int)__i3 << 32);
-    return (__m128i){ { __lo, __hi } };
+    return (__m128i){  __lo, __hi  };
 }
 
 /* _mm_set_epi32: set 4 x 32-bit lanes in reverse (high-to-low) order */
@@ -618,7 +618,7 @@ _mm_set_epi8(char __b15, char __b14, char __b13, char __b12,
                    | ((long long)(unsigned char)__b13 << 40)
                    | ((long long)(unsigned char)__b14 << 48)
                    | ((long long)(unsigned char)__b15 << 56);
-    return (__m128i){ { __lo, __hi } };
+    return (__m128i){  __lo, __hi  };
 }
 
 /* _mm_setr_epi8: set 16 x 8-bit lanes in natural (low-to-high) order */
@@ -638,14 +638,14 @@ _mm_setr_epi8(char __b0, char __b1, char __b2, char __b3,
 static __inline__ __m128i __attribute__((__always_inline__))
 _mm_set_epi64x(long long __hi, long long __lo)
 {
-    return (__m128i){ { __lo, __hi } };
+    return (__m128i){  __lo, __hi  };
 }
 
 /* _mm_set1_epi64x: broadcast 64-bit integer to both lanes */
 static __inline__ __m128i __attribute__((__always_inline__))
 _mm_set1_epi64x(long long __q)
 {
-    return (__m128i){ { __q, __q } };
+    return (__m128i){  __q, __q  };
 }
 
 /* === Insert / Extract === */
@@ -858,14 +858,14 @@ _mm_castsi128_pd(__m128i __a)
 static __inline__ __m128d __attribute__((__always_inline__))
 _mm_set_pd(double __hi, double __lo)
 {
-    return (__m128d){ { __lo, __hi } };
+    return (__m128d){  __lo, __hi  };
 }
 
 /* _mm_set1_pd: broadcast one double to both lanes */
 static __inline__ __m128d __attribute__((__always_inline__))
 _mm_set1_pd(double __d)
 {
-    return (__m128d){ { __d, __d } };
+    return (__m128d){  __d, __d  };
 }
 
 #define _mm_set_pd1(d) _mm_set1_pd(d)
@@ -874,28 +874,28 @@ _mm_set1_pd(double __d)
 static __inline__ __m128d __attribute__((__always_inline__))
 _mm_set_sd(double __d)
 {
-    return (__m128d){ { __d, 0.0 } };
+    return (__m128d){  __d, 0.0  };
 }
 
 /* _mm_setr_pd: set in natural order (low, high) */
 static __inline__ __m128d __attribute__((__always_inline__))
 _mm_setr_pd(double __lo, double __hi)
 {
-    return (__m128d){ { __lo, __hi } };
+    return (__m128d){  __lo, __hi  };
 }
 
 /* _mm_setzero_pd: zero both lanes */
 static __inline__ __m128d __attribute__((__always_inline__))
 _mm_setzero_pd(void)
 {
-    return (__m128d){ { 0.0, 0.0 } };
+    return (__m128d){  0.0, 0.0  };
 }
 
 /* _mm_undefined_pd: uninitialized (returns zero for safety) */
 static __inline__ __m128d __attribute__((__always_inline__))
 _mm_undefined_pd(void)
 {
-    return (__m128d){ { 0.0, 0.0 } };
+    return (__m128d){  0.0, 0.0  };
 }
 
 /* === Double Load === */
@@ -918,7 +918,7 @@ _mm_loadu_pd(double const *__p)
 static __inline__ __m128d __attribute__((__always_inline__))
 _mm_load_sd(double const *__p)
 {
-    return (__m128d){ { *__p, 0.0 } };
+    return (__m128d){  *__p, 0.0  };
 }
 
 /* _mm_load1_pd: load one double, broadcast to both lanes */
@@ -926,7 +926,7 @@ static __inline__ __m128d __attribute__((__always_inline__))
 _mm_load1_pd(double const *__p)
 {
     double __d = *__p;
-    return (__m128d){ { __d, __d } };
+    return (__m128d){  __d, __d  };
 }
 
 #define _mm_load_pd1(p) _mm_load1_pd(p)
@@ -935,14 +935,14 @@ _mm_load1_pd(double const *__p)
 static __inline__ __m128d __attribute__((__always_inline__))
 _mm_loadr_pd(double const *__p)
 {
-    return (__m128d){ { __p[1], __p[0] } };
+    return (__m128d){  __p[1], __p[0]  };
 }
 
 /* _mm_loadl_pd: load low double, keep high from __a */
 static __inline__ __m128d __attribute__((__always_inline__))
 _mm_loadl_pd(__m128d __a, double const *__p)
 {
-    __a.__val[0] = *__p;
+    __a[0] = *__p;
     return __a;
 }
 
@@ -950,7 +950,7 @@ _mm_loadl_pd(__m128d __a, double const *__p)
 static __inline__ __m128d __attribute__((__always_inline__))
 _mm_loadh_pd(__m128d __a, double const *__p)
 {
-    __a.__val[1] = *__p;
+    __a[1] = *__p;
     return __a;
 }
 
@@ -974,15 +974,15 @@ _mm_storeu_pd(double *__p, __m128d __a)
 static __inline__ void __attribute__((__always_inline__))
 _mm_store_sd(double *__p, __m128d __a)
 {
-    *__p = __a.__val[0];
+    *__p = __a[0];
 }
 
 /* _mm_store1_pd: store low double to both positions */
 static __inline__ void __attribute__((__always_inline__))
 _mm_store1_pd(double *__p, __m128d __a)
 {
-    __p[0] = __a.__val[0];
-    __p[1] = __a.__val[0];
+    __p[0] = __a[0];
+    __p[1] = __a[0];
 }
 
 #define _mm_store_pd1(p, a) _mm_store1_pd(p, a)
@@ -991,22 +991,22 @@ _mm_store1_pd(double *__p, __m128d __a)
 static __inline__ void __attribute__((__always_inline__))
 _mm_storer_pd(double *__p, __m128d __a)
 {
-    __p[0] = __a.__val[1];
-    __p[1] = __a.__val[0];
+    __p[0] = __a[1];
+    __p[1] = __a[0];
 }
 
 /* _mm_storel_pd: store low double to memory */
 static __inline__ void __attribute__((__always_inline__))
 _mm_storel_pd(double *__p, __m128d __a)
 {
-    *__p = __a.__val[0];
+    *__p = __a[0];
 }
 
 /* _mm_storeh_pd: store high double to memory */
 static __inline__ void __attribute__((__always_inline__))
 _mm_storeh_pd(double *__p, __m128d __a)
 {
-    *__p = __a.__val[1];
+    *__p = __a[1];
 }
 
 /* === Double Arithmetic === */
@@ -1015,24 +1015,24 @@ _mm_storeh_pd(double *__p, __m128d __a)
 static __inline__ __m128d __attribute__((__always_inline__))
 _mm_add_pd(__m128d __a, __m128d __b)
 {
-    return (__m128d){ { __a.__val[0] + __b.__val[0],
-                        __a.__val[1] + __b.__val[1] } };
+    return (__m128d){  __a[0] + __b[0],
+                        __a[1] + __b[1]  };
 }
 
 /* _mm_sub_pd: packed double subtract */
 static __inline__ __m128d __attribute__((__always_inline__))
 _mm_sub_pd(__m128d __a, __m128d __b)
 {
-    return (__m128d){ { __a.__val[0] - __b.__val[0],
-                        __a.__val[1] - __b.__val[1] } };
+    return (__m128d){  __a[0] - __b[0],
+                        __a[1] - __b[1]  };
 }
 
 /* _mm_mul_pd: packed double multiply */
 static __inline__ __m128d __attribute__((__always_inline__))
 _mm_mul_pd(__m128d __a, __m128d __b)
 {
-    return (__m128d){ { __a.__val[0] * __b.__val[0],
-                        __a.__val[1] * __b.__val[1] } };
+    return (__m128d){  __a[0] * __b[0],
+                        __a[1] * __b[1]  };
 }
 
 /* _mm_div_pd: packed double divide */
@@ -1079,7 +1079,7 @@ static __inline__ __m128d __attribute__((__always_inline__))
 _mm_cmpeq_sd(__m128d __a, __m128d __b)
 {
     long long *__ra = (long long *)&__a;
-    __ra[0] = __a.__val[0] == __b.__val[0] ? ~0LL : 0LL;
+    __ra[0] = __a[0] == __b[0] ? ~0LL : 0LL;
     return __a;
 }
 
@@ -1087,7 +1087,7 @@ static __inline__ __m128d __attribute__((__always_inline__))
 _mm_cmplt_sd(__m128d __a, __m128d __b)
 {
     long long *__ra = (long long *)&__a;
-    __ra[0] = __a.__val[0] < __b.__val[0] ? ~0LL : 0LL;
+    __ra[0] = __a[0] < __b[0] ? ~0LL : 0LL;
     return __a;
 }
 
@@ -1095,7 +1095,7 @@ static __inline__ __m128d __attribute__((__always_inline__))
 _mm_cmple_sd(__m128d __a, __m128d __b)
 {
     long long *__ra = (long long *)&__a;
-    __ra[0] = __a.__val[0] <= __b.__val[0] ? ~0LL : 0LL;
+    __ra[0] = __a[0] <= __b[0] ? ~0LL : 0LL;
     return __a;
 }
 
@@ -1103,7 +1103,7 @@ static __inline__ __m128d __attribute__((__always_inline__))
 _mm_cmpgt_sd(__m128d __a, __m128d __b)
 {
     long long *__ra = (long long *)&__a;
-    __ra[0] = __a.__val[0] > __b.__val[0] ? ~0LL : 0LL;
+    __ra[0] = __a[0] > __b[0] ? ~0LL : 0LL;
     return __a;
 }
 
@@ -1111,7 +1111,7 @@ static __inline__ __m128d __attribute__((__always_inline__))
 _mm_cmpge_sd(__m128d __a, __m128d __b)
 {
     long long *__ra = (long long *)&__a;
-    __ra[0] = __a.__val[0] >= __b.__val[0] ? ~0LL : 0LL;
+    __ra[0] = __a[0] >= __b[0] ? ~0LL : 0LL;
     return __a;
 }
 
@@ -1120,37 +1120,37 @@ _mm_cmpge_sd(__m128d __a, __m128d __b)
 static __inline__ int __attribute__((__always_inline__))
 _mm_comieq_sd(__m128d __a, __m128d __b)
 {
-    return __a.__val[0] == __b.__val[0];
+    return __a[0] == __b[0];
 }
 
 static __inline__ int __attribute__((__always_inline__))
 _mm_comilt_sd(__m128d __a, __m128d __b)
 {
-    return __a.__val[0] < __b.__val[0];
+    return __a[0] < __b[0];
 }
 
 static __inline__ int __attribute__((__always_inline__))
 _mm_comile_sd(__m128d __a, __m128d __b)
 {
-    return __a.__val[0] <= __b.__val[0];
+    return __a[0] <= __b[0];
 }
 
 static __inline__ int __attribute__((__always_inline__))
 _mm_comigt_sd(__m128d __a, __m128d __b)
 {
-    return __a.__val[0] > __b.__val[0];
+    return __a[0] > __b[0];
 }
 
 static __inline__ int __attribute__((__always_inline__))
 _mm_comige_sd(__m128d __a, __m128d __b)
 {
-    return __a.__val[0] >= __b.__val[0];
+    return __a[0] >= __b[0];
 }
 
 static __inline__ int __attribute__((__always_inline__))
 _mm_comineq_sd(__m128d __a, __m128d __b)
 {
-    return __a.__val[0] != __b.__val[0];
+    return __a[0] != __b[0];
 }
 
 #define _mm_ucomieq_sd(a, b) _mm_comieq_sd(a, b)
@@ -1178,7 +1178,7 @@ _mm_comineq_sd(__m128d __a, __m128d __b)
 static __inline__ double __attribute__((__always_inline__))
 _mm_cvtsd_f64(__m128d __a)
 {
-    return __a.__val[0];
+    return __a[0];
 }
 
 /* _mm_cvtsd_si32: convert low double to int (round to nearest) */
@@ -1200,7 +1200,7 @@ _mm_cvtsd_si64(__m128d __a)
 #else
     /* 32-bit x86 has no 64-bit `cvtsd2si`; keep a portable truncating
        definition rather than silently rounding the wrong way. */
-    return (long long)__a.__val[0];
+    return (long long)__a[0];
 #endif
 }
 
@@ -1210,7 +1210,7 @@ _mm_cvtsd_si64(__m128d __a)
 static __inline__ long long __attribute__((__always_inline__))
 _mm_cvttsd_si64(__m128d __a)
 {
-    return (long long)__a.__val[0];
+    return (long long)__a[0];
 }
 
 #define _mm_cvttsd_si64x(a) _mm_cvttsd_si64(a)

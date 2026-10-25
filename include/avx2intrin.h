@@ -14,7 +14,7 @@ _mm256_set1_epi8(char __b)
     __q |= __q << 8;
     __q |= __q << 16;
     __q |= __q << 32;
-    return (__m256i){ { __q, __q, __q, __q } };
+    return (__m256i){  __q, __q, __q, __q  };
 }
 
 static __inline__ __m256i __attribute__((__always_inline__))
@@ -24,7 +24,7 @@ _mm256_set1_epi16(short __w)
     long long __q = (long long)__uw;
     __q |= __q << 16;
     __q |= __q << 32;
-    return (__m256i){ { __q, __q, __q, __q } };
+    return (__m256i){  __q, __q, __q, __q  };
 }
 
 static __inline__ __m256i __attribute__((__always_inline__))
@@ -32,13 +32,13 @@ _mm256_set1_epi32(int __i)
 {
     long long __q = (long long)(unsigned int)__i
                   | ((long long)(unsigned int)__i << 32);
-    return (__m256i){ { __q, __q, __q, __q } };
+    return (__m256i){  __q, __q, __q, __q  };
 }
 
 static __inline__ __m256i __attribute__((__always_inline__))
 _mm256_set1_epi64x(long long __q)
 {
-    return (__m256i){ { __q, __q, __q, __q } };
+    return (__m256i){  __q, __q, __q, __q  };
 }
 
 static __inline__ __m256i __attribute__((__always_inline__))
@@ -78,37 +78,37 @@ _mm256_setr_epi8(
 static __inline__ __m256i __attribute__((__always_inline__))
 _mm256_and_si256(__m256i __a, __m256i __b)
 {
-    return (__m256i){ { __a.__val[0] & __b.__val[0],
-                        __a.__val[1] & __b.__val[1],
-                        __a.__val[2] & __b.__val[2],
-                        __a.__val[3] & __b.__val[3] } };
+    return (__m256i){  __a[0] & __b[0],
+                        __a[1] & __b[1],
+                        __a[2] & __b[2],
+                        __a[3] & __b[3]  };
 }
 
 static __inline__ __m256i __attribute__((__always_inline__))
 _mm256_andnot_si256(__m256i __a, __m256i __b)
 {
-    return (__m256i){ { ~__a.__val[0] & __b.__val[0],
-                        ~__a.__val[1] & __b.__val[1],
-                        ~__a.__val[2] & __b.__val[2],
-                        ~__a.__val[3] & __b.__val[3] } };
+    return (__m256i){  ~__a[0] & __b[0],
+                        ~__a[1] & __b[1],
+                        ~__a[2] & __b[2],
+                        ~__a[3] & __b[3]  };
 }
 
 static __inline__ __m256i __attribute__((__always_inline__))
 _mm256_or_si256(__m256i __a, __m256i __b)
 {
-    return (__m256i){ { __a.__val[0] | __b.__val[0],
-                        __a.__val[1] | __b.__val[1],
-                        __a.__val[2] | __b.__val[2],
-                        __a.__val[3] | __b.__val[3] } };
+    return (__m256i){  __a[0] | __b[0],
+                        __a[1] | __b[1],
+                        __a[2] | __b[2],
+                        __a[3] | __b[3]  };
 }
 
 static __inline__ __m256i __attribute__((__always_inline__))
 _mm256_xor_si256(__m256i __a, __m256i __b)
 {
-    return (__m256i){ { __a.__val[0] ^ __b.__val[0],
-                        __a.__val[1] ^ __b.__val[1],
-                        __a.__val[2] ^ __b.__val[2],
-                        __a.__val[3] ^ __b.__val[3] } };
+    return (__m256i){  __a[0] ^ __b[0],
+                        __a[1] ^ __b[1],
+                        __a[2] ^ __b[2],
+                        __a[3] ^ __b[3]  };
 }
 
 /* === Shift === */
@@ -213,9 +213,9 @@ static __inline__ __m128i __attribute__((__always_inline__))
 _mm256_extracti128_si256(__m256i __a, int __imm)
 {
     if (__imm & 1)
-        return (__m128i){ { __a.__val[2], __a.__val[3] } };
+        return (__m128i){  __a[2], __a[3]  };
     else
-        return (__m128i){ { __a.__val[0], __a.__val[1] } };
+        return (__m128i){  __a[0], __a[1]  };
 }
 
 /* === Add / Sub === */
@@ -254,10 +254,10 @@ _mm256_add_epi32(__m256i __a, __m256i __b)
 static __inline__ __m256i __attribute__((__always_inline__))
 _mm256_add_epi64(__m256i __a, __m256i __b)
 {
-    return (__m256i){ { __a.__val[0] + __b.__val[0],
-                        __a.__val[1] + __b.__val[1],
-                        __a.__val[2] + __b.__val[2],
-                        __a.__val[3] + __b.__val[3] } };
+    return (__m256i){  __a[0] + __b[0],
+                        __a[1] + __b[1],
+                        __a[2] + __b[2],
+                        __a[3] + __b[3]  };
 }
 
 static __inline__ __m256i __attribute__((__always_inline__))
@@ -309,23 +309,23 @@ _mm256_permute2x128_si256(__m256i __a, __m256i __b, int __imm)
 
     /* Select low 128 bits */
     switch (__sel_lo) {
-        case 0: __result[0] = __a.__val[0]; __result[1] = __a.__val[1]; break;
-        case 1: __result[0] = __a.__val[2]; __result[1] = __a.__val[3]; break;
-        case 2: __result[0] = __b.__val[0]; __result[1] = __b.__val[1]; break;
-        case 3: __result[0] = __b.__val[2]; __result[1] = __b.__val[3]; break;
+        case 0: __result[0] = __a[0]; __result[1] = __a[1]; break;
+        case 1: __result[0] = __a[2]; __result[1] = __a[3]; break;
+        case 2: __result[0] = __b[0]; __result[1] = __b[1]; break;
+        case 3: __result[0] = __b[2]; __result[1] = __b[3]; break;
     }
     if (__imm & 0x08) { __result[0] = 0; __result[1] = 0; }
 
     /* Select high 128 bits */
     switch (__sel_hi) {
-        case 0: __result[2] = __a.__val[0]; __result[3] = __a.__val[1]; break;
-        case 1: __result[2] = __a.__val[2]; __result[3] = __a.__val[3]; break;
-        case 2: __result[2] = __b.__val[0]; __result[3] = __b.__val[1]; break;
-        case 3: __result[2] = __b.__val[2]; __result[3] = __b.__val[3]; break;
+        case 0: __result[2] = __a[0]; __result[3] = __a[1]; break;
+        case 1: __result[2] = __a[2]; __result[3] = __a[3]; break;
+        case 2: __result[2] = __b[0]; __result[3] = __b[1]; break;
+        case 3: __result[2] = __b[2]; __result[3] = __b[3]; break;
     }
     if (__imm & 0x80) { __result[2] = 0; __result[3] = 0; }
 
-    return (__m256i){ { __result[0], __result[1], __result[2], __result[3] } };
+    return (__m256i){  __result[0], __result[1], __result[2], __result[3]  };
 }
 
 /* === Set (non-broadcast) === */
@@ -383,11 +383,11 @@ _mm256_inserti128_si256(__m256i __a, __m128i __b, int __imm)
 {
     __m256i __r = __a;
     if (__imm & 1) {
-        __r.__val[2] = __b.__val[0];
-        __r.__val[3] = __b.__val[1];
+        __r[2] = __b[0];
+        __r[3] = __b[1];
     } else {
-        __r.__val[0] = __b.__val[0];
-        __r.__val[1] = __b.__val[1];
+        __r[0] = __b[0];
+        __r[1] = __b[1];
     }
     return __r;
 }
@@ -481,10 +481,10 @@ static __inline__ __m256i __attribute__((__always_inline__))
 _mm256_permute4x64_epi64(__m256i __a, int __imm)
 {
     __m256i __r;
-    __r.__val[0] = __a.__val[(__imm >> 0) & 3];
-    __r.__val[1] = __a.__val[(__imm >> 2) & 3];
-    __r.__val[2] = __a.__val[(__imm >> 4) & 3];
-    __r.__val[3] = __a.__val[(__imm >> 6) & 3];
+    __r[0] = __a[(__imm >> 0) & 3];
+    __r[1] = __a[(__imm >> 2) & 3];
+    __r[2] = __a[(__imm >> 4) & 3];
+    __r[3] = __a[(__imm >> 6) & 3];
     return __r;
 }
 
@@ -625,14 +625,14 @@ _mm256_unpackhi_epi32(__m256i __a, __m256i __b)
 static __inline__ __m256i __attribute__((__always_inline__))
 _mm256_unpacklo_epi64(__m256i __a, __m256i __b)
 {
-    return (__m256i){ { __a.__val[0], __b.__val[0], __a.__val[2], __b.__val[2] } };
+    return (__m256i){  __a[0], __b[0], __a[2], __b[2]  };
 }
 
 /* _mm256_unpackhi_epi64: VPUNPCKHQDQ - interleave high 64-bit ints within lanes */
 static __inline__ __m256i __attribute__((__always_inline__))
 _mm256_unpackhi_epi64(__m256i __a, __m256i __b)
 {
-    return (__m256i){ { __a.__val[1], __b.__val[1], __a.__val[3], __b.__val[3] } };
+    return (__m256i){  __a[1], __b[1], __a[3], __b[3]  };
 }
 
 /* === Additional intrinsics for CPython HACL Blake2b SIMD256 === */
@@ -641,7 +641,7 @@ _mm256_unpackhi_epi64(__m256i __a, __m256i __b)
 static __inline__ __m256i __attribute__((__always_inline__))
 _mm256_set_epi64x(long long __e3, long long __e2, long long __e1, long long __e0)
 {
-    return (__m256i){ { __e0, __e1, __e2, __e3 } };
+    return (__m256i){  __e0, __e1, __e2, __e3  };
 }
 
 /* _mm256_set_m128i: combine two __m128i into __m256i (lo, hi) */
@@ -751,8 +751,8 @@ _mm256_insert_epi64(__m256i __a, long long __val, int __imm)
 static __inline__ __m256i __attribute__((__always_inline__))
 _mm256_sub_epi64(__m256i __a, __m256i __b)
 {
-    return (__m256i){ { __a.__val[0] - __b.__val[0], __a.__val[1] - __b.__val[1],
-                        __a.__val[2] - __b.__val[2], __a.__val[3] - __b.__val[3] } };
+    return (__m256i){  __a[0] - __b[0], __a[1] - __b[1],
+                        __a[2] - __b[2], __a[3] - __b[3]  };
 }
 
 /* _mm256_mul_epu32: multiply unsigned 32-bit integers, produce 64-bit results */

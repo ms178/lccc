@@ -848,13 +848,15 @@ impl Driver {
         // (`__m256` in one `%ymm` under `-mavx`, `__m512` in one `%zmm`
         // under `-mavx512f`, MEMORY otherwise) follows the same requested
         // ISA state, exactly like GCC's `TARGET_AVX`/`TARGET_AVX512F` and
-        // Clang's `AVXLevel`. x86-64 only: the i386 psABI has no AVX
-        // register convention (`sysv_classify` is not consulted there).
-        crate::common::types::set_target_vector_abi_bytes(if self.target == Target::X86_64 {
-            x86_isa_width
-        } else {
-            16
-        });
+        // Clang's `AVXLevel`. Both x86 ABIs use native wide registers
+        // for explicitly enabled GNU vectors.
+        crate::common::types::set_target_vector_abi_bytes(
+            if matches!(self.target, Target::X86_64 | Target::I686) {
+                x86_isa_width
+            } else {
+                16
+            },
+        );
         // 4-byte width-partitioned spill slots are only enabled where the
         // backend's store/load paths are proven width-consistent.  x86-64
         // narrows ≤32-bit spills; i686 naturally accesses every non-wide

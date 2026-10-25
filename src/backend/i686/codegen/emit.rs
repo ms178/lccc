@@ -118,6 +118,8 @@ pub struct I686Codegen {
     /// Whether this function returns a 16-byte i386 vector piece in %xmm0
     /// (IR: I128 with `[Sse, SseUp]` return classes).
     pub(super) current_return_i686_xmm: bool,
+    pub(super) vector_ret_buffer_bytes: usize,
+    pub(super) vector_ret_buffer_offset: i64,
     /// Whether the current function is variadic
     pub(super) is_variadic: bool,
     /// Register allocation results (callee-saved registers: ebx, esi, edi)
@@ -583,6 +585,8 @@ impl I686Codegen {
             current_return_type: IrType::I32,
             current_return_i686_ext_vector_gp3: false,
             current_return_i686_xmm: false,
+            vector_ret_buffer_bytes: 0,
+            vector_ret_buffer_offset: 0,
             is_variadic: false,
             reg_assignments: FxHashMap::default(),
             narrow_images: FxHashMap::default(),
@@ -3047,17 +3051,23 @@ impl ArchCodegen for I686Codegen {
         // behind for a regparm -> cdecl call classifies register arguments
         // which neither the stack writer nor the cdecl register writer emits.
         config.max_int_regs = self.current_call_regparm as usize;
-        let arg_classes_vec = classify_call_args(
-            args,
-            arg_types,
-            struct_arg_sizes,
-            struct_arg_aligns,
-            struct_arg_classes,
-            struct_arg_riscv_float_classes,
+        let vector_return_bytes =
+            hidden_vector_return_bytes(is_sret, ret_eightbyte_classes).filter(|_| !args.is_empty());
+        let skip = usize::from(vector_return_bytes.is_some());
+        let mut arg_classes_vec = classify_call_args(
+            &args[skip..],
+            arg_types.get(skip..).unwrap_or(&[]),
+            struct_arg_sizes.get(skip..).unwrap_or(&[]),
+            struct_arg_aligns.get(skip..).unwrap_or(&[]),
+            struct_arg_classes.get(skip..).unwrap_or(&[]),
+            struct_arg_riscv_float_classes.get(skip..).unwrap_or(&[]),
             &[],
             is_variadic,
             &config,
         );
+        if skip == 1 {
+            arg_classes_vec.insert(0, CallArgClass::ZeroSizeSkip);
+        }
         let indirect = func_ptr.is_some() && direct_name.is_none();
         if indirect {
             self.emit_call_spill_fptr(func_ptr.expect("indirect call requires func_ptr"));
@@ -3098,7 +3108,7 @@ impl ArchCodegen for I686Codegen {
             &[],
         );
         self.emit_call_instruction(direct_name, func_ptr, indirect, stack_arg_space);
-        let callee_pops = self.callee_pops_bytes_for_sret(is_sret);
+        let callee_pops = self.callee_pops_bytes_for_sret(is_sret && vector_return_bytes.is_none());
         if indirect || direct_name.is_some() {
             let target = if indirect { None } else { direct_name };
             self.state.record_call_pop(target, Some(callee_pops as u32));
@@ -3109,7 +3119,9 @@ impl ArchCodegen for I686Codegen {
         }
         let effective_stack_cleanup = stack_arg_space.saturating_sub(callee_pops);
         self.emit_call_cleanup(effective_stack_cleanup, f128_temp_space, indirect);
-        if let Some(dest) = dest {
+        if let Some(bytes) = vector_return_bytes {
+            self.emit_call_store_vector_return(&args[0], bytes, dest.as_ref());
+        } else if let Some(dest) = dest {
             self.set_call_ret_eightbyte_classes(ret_eightbyte_classes);
             self.emit_call_store_result(&dest, return_type);
             if returns_i686_ext_vector_gp3 {
@@ -3889,6 +3901,7 @@ impl ArchCodegen for I686Codegen {
         fn emit_call_instruction(&mut self, direct_name: Option<&str>, func_ptr: Option<&Operand>, indirect: bool, stack_arg_space: usize) => emit_call_instruction_impl;
         fn emit_call_cleanup(&mut self, stack_arg_space: usize, f128_temp_space: usize, indirect: bool) => emit_call_cleanup_impl;
         fn emit_call_store_result(&mut self, dest: &Value, return_type: IrType) => emit_call_store_result_impl;
+        fn emit_call_store_vector_return(&mut self, buffer: &Operand, bytes: usize, dest: Option<&Value>) => emit_call_store_vector_return_impl;
         fn emit_call_store_i128_result(&mut self, dest: &Value) => emit_call_store_i128_result_impl;
         fn emit_call_store_f128_result(&mut self, dest: &Value) => emit_call_store_f128_result_impl;
         fn emit_call_move_f32_to_acc(&mut self) => emit_call_move_f32_to_acc_impl;

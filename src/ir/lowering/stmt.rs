@@ -515,7 +515,7 @@ impl Lowerer {
         // `[Pointer, FunctionPointer([char]), Pointer, FunctionPointer([long])]`),
         // the LAST `FunctionPointer` is the entity's own call signature and any
         // earlier `Pointer`/`FunctionPointer` layer means its return value is a pointer.
-        if let Some((i, DerivedDeclarator::FunctionPointer(params, _))) = declarator
+        if let Some((i, DerivedDeclarator::FunctionPointer(params, variadic))) = declarator
             .derived
             .iter()
             .enumerate()
@@ -543,7 +543,10 @@ impl Lowerer {
                 .iter()
                 .map(|p| self.type_spec_to_ir(&p.type_spec))
                 .collect();
-            self.set_local_fptr_sig(&declarator.name, FuncSig::for_ptr(ret_ty, param_tys));
+            let mut signature = FuncSig::for_ptr(ret_ty, param_tys);
+            signature.is_variadic = *variadic;
+            signature.param_ctypes = params.iter().map(|param| self.param_ctype(param)).collect();
+            self.set_local_fptr_sig(&declarator.name, signature);
         }
     }
 

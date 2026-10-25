@@ -11,6 +11,17 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class ConversionHeaders(unittest.TestCase):
+    def test_public_types_are_native_vectors_with_only_unaligned_overrides(self):
+        header = (ROOT / 'include/lcccsimd.h').read_text()
+        for width in (128, 256, 512):
+            for suffix, element in (('', 'float'), ('d', 'double'), ('i', 'long long')):
+                name = f'__m{width}{suffix}'
+                self.assertIn(f'typedef {element} {name} __attribute__((__vector_size__({width // 8}), __may_alias__));', header)
+                self.assertIn(f'typedef {element} {name}_u __attribute__((__vector_size__({width // 8}), __aligned__(1), __may_alias__));', header)
+        self.assertNotIn('__val[', header)
+        self.assertIn('int __lccc_simd128_ps_extractps128(long, __m128 __a);', header)
+        self.assertIn('void * __lccc_simd128_ps_addss128(long, __m128 __a, __m128 __b);', header)
+
     def test_packed_signatures(self):
         header = (ROOT / 'include/lcccsimd.h').read_text()
         # Explicit ISA contracts, independent of the generator's inference.

@@ -514,11 +514,13 @@ pub(crate) fn i386_gnu_vector_stack_align(
     (config.i386_ext_vector_lanes
         && align >= 16
         && align.is_power_of_two()
-        && classes
+        && (classes
             == [
                 crate::common::types::EightbyteClass::Memory,
                 crate::common::types::EightbyteClass::NoClass,
-            ])
+            ]
+            || crate::common::sysv_classify::vector_reg_bytes_of(classes)
+                .is_some_and(|bytes| bytes > 16)))
     .then_some(align)
 }
 
@@ -792,21 +794,18 @@ fn classify_args_core(
         // touches the GP sequence, so regparm/fastcall registers stay
         // available for later arguments.
         if config.vector_xmm_regs > 0
-            && info.struct_size == Some(16)
-            && info.eightbyte_classes
-                == [
-                    crate::common::types::EightbyteClass::Sse,
-                    crate::common::types::EightbyteClass::SseUp,
-                ]
+            && let Some(size) =
+                crate::common::sysv_classify::vector_reg_bytes_of(info.eightbyte_classes)
+            && info.struct_size == Some(size)
         {
             if !real_variadic && vec_xmm_idx < config.vector_xmm_regs {
                 result.push(CoreArgClass::StructXmmReg {
                     reg_idx: vec_xmm_idx,
-                    size: 16,
+                    size,
                 });
                 vec_xmm_idx += 1;
             } else {
-                result.push(CoreArgClass::StructByValStack { size: 16 });
+                result.push(CoreArgClass::StructByValStack { size });
             }
             continue;
         }
@@ -1892,6 +1891,59 @@ mod tests {
             struct_align: None,
             eightbyte_classes: classes,
             riscv_float_class: None,
+        }
+    }
+
+    #[test]
+    fn i386_wide_vectors_share_three_registers_and_keep_gp_arguments_independent() {
+        let config = i686_regparm3();
+        for bytes in [16, 32, 64] {
+            let mut classes = vec![EightbyteClass::SseUp; bytes / 8];
+            classes[0] = EightbyteClass::Sse;
+            let vector = || ArgInfo {
+                struct_size: Some(bytes),
+                struct_align: Some(bytes),
+                ..scalar(&classes)
+            };
+            let args = [
+                scalar(&[]),
+                vector(),
+                vector(),
+                vector(),
+                vector(),
+                scalar(&[]),
+            ];
+            let result = classify_args_core(&args, false, false, &config);
+            assert!(matches!(
+                result.classes[0],
+                CoreArgClass::IntReg { reg_idx: 0 }
+            ));
+            for index in 0..3 {
+                assert!(
+                    matches!(result.classes[index + 1], CoreArgClass::StructXmmReg { reg_idx, size }
+                    if reg_idx == index && size == bytes)
+                );
+            }
+            assert!(
+                matches!(result.classes[4], CoreArgClass::StructByValStack { size } if size == bytes)
+            );
+            assert!(matches!(
+                result.classes[5],
+                CoreArgClass::IntReg { reg_idx: 1 }
+            ));
+            if bytes > 16 {
+                assert_eq!(
+                    i386_gnu_vector_stack_align(&config, &classes, bytes),
+                    Some(bytes)
+                );
+            }
+            let variadic = classify_args_core(&args, true, true, &config);
+            assert!(
+                variadic
+                    .classes
+                    .iter()
+                    .all(|class| !matches!(class, CoreArgClass::StructXmmReg { .. }))
+            );
         }
     }
 
