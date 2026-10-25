@@ -2668,6 +2668,42 @@ impl InstructionEncoder {
             "fistl" => self.encode_x87_mem(ops, &[0xDB], 2),
             "fists" => self.encode_x87_mem(ops, &[0xDF], 2),
             "fistps" => self.encode_x87_mem(ops, &[0xDF], 3),
+            // x87 integer arithmetic and comparison on integer memory
+            // operands.  The 16-bit form is the DE /digit block, the 32-bit
+            // form the DA /digit block (SDM Vol. 2A, Table 3-8); the digit is
+            // the same for both, which is why the two rows differ only in the
+            // opcode byte.
+            "fiadds" => self.encode_x87_mem(ops, &[0xDE], 0),
+            "fiaddl" => self.encode_x87_mem(ops, &[0xDA], 0),
+            "fimuls" => self.encode_x87_mem(ops, &[0xDE], 1),
+            "fimull" => self.encode_x87_mem(ops, &[0xDA], 1),
+            "ficoms" => self.encode_x87_mem(ops, &[0xDE], 2),
+            "ficoml" => self.encode_x87_mem(ops, &[0xDA], 2),
+            "ficomps" => self.encode_x87_mem(ops, &[0xDE], 3),
+            "ficompl" => self.encode_x87_mem(ops, &[0xDA], 3),
+            "fisubs" => self.encode_x87_mem(ops, &[0xDE], 4),
+            "fisubl" => self.encode_x87_mem(ops, &[0xDA], 4),
+            "fisubrs" => self.encode_x87_mem(ops, &[0xDE], 5),
+            "fisubrl" => self.encode_x87_mem(ops, &[0xDA], 5),
+            "fidivs" => self.encode_x87_mem(ops, &[0xDE], 6),
+            "fidivl" => self.encode_x87_mem(ops, &[0xDA], 6),
+            "fidivrs" => self.encode_x87_mem(ops, &[0xDE], 7),
+            "fidivrl" => self.encode_x87_mem(ops, &[0xDA], 7),
+            // x87 conditional moves and the SSE-era compare-into-flags forms.
+            "fcmovb" => self.encode_x87_st0_sti(ops, 0xDA, 0xC0, "fcmovb"),
+            "fcmove" => self.encode_x87_st0_sti(ops, 0xDA, 0xC8, "fcmove"),
+            "fcmovbe" => self.encode_x87_st0_sti(ops, 0xDA, 0xD0, "fcmovbe"),
+            "fcmovu" => self.encode_x87_st0_sti(ops, 0xDA, 0xD8, "fcmovu"),
+            "fcmovnb" => self.encode_x87_st0_sti(ops, 0xDB, 0xC0, "fcmovnb"),
+            "fcmovne" => self.encode_x87_st0_sti(ops, 0xDB, 0xC8, "fcmovne"),
+            "fcmovnbe" => self.encode_x87_st0_sti(ops, 0xDB, 0xD0, "fcmovnbe"),
+            "fcmovnu" => self.encode_x87_st0_sti(ops, 0xDB, 0xD8, "fcmovnu"),
+            "fcomi" => self.encode_x87_st0_sti(ops, 0xDB, 0xF0, "fcomi"),
+            "ffreep" => self.encode_x87_st0_sti(ops, 0xDF, 0xC0, "ffreep"),
+            // `fisttp` without a suffix is the 64-bit form: AT&T only spells
+            // the `q` suffix for `fildq`/`fistpq`, and GAS accepts the bare
+            // mnemonic for the quadword `fisttp` (gas/doc/c-i386.texi).
+            "fisttp" => self.encode_x87_mem(ops, &[0xDD], 1),
             "fisttps" => self.encode_x87_mem(ops, &[0xDF], 1),
             "fildll" => self.encode_x87_mem(ops, &[0xDF], 5),
             "fisttpll" => self.encode_x87_mem(ops, &[0xDD], 1),
@@ -4198,5 +4234,117 @@ mod encoding_choice_minimality_tests {
             assemble("addl $0xffffff80, %ecx").as_deref(),
             Ok("83 c1 80")
         );
+    }
+}
+
+#[cfg(test)]
+mod x87_integer_and_conditional_tests {
+    use super::*;
+
+    fn assemble(line: &str) -> Result<String, String> {
+        let mut encoder = InstructionEncoder::new();
+        for item in parse_asm(line)? {
+            if let AsmItem::Instruction(instr) = item {
+                encoder.encode(&instr)?;
+            }
+        }
+        Ok(encoder
+            .bytes
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(" "))
+    }
+
+    /// Golden bytes for the integer arithmetic forms come from GNU as 2.47's
+    /// own encoding test: `gas/testsuite/gas/i386/float.s`, whose expected
+    /// listing `float.l` records `fiadds (%ebx)` as `DE 03` and `fiaddl
+    /// (%ebx)` as `DA 03`, with the same `/digit` in both blocks.
+    #[test]
+    fn x87_integer_arithmetic_matches_gnu_as_2_47() {
+        for (line, hex) in [
+            ("fiadds (%ebx)", "de 03"),
+            ("fiaddl (%ebx)", "da 03"),
+            ("fimuls (%ebx)", "de 0b"),
+            ("fimull (%ebx)", "da 0b"),
+            ("fisubs (%ebx)", "de 23"),
+            ("fisubl (%ebx)", "da 23"),
+            ("fisubrs (%ebx)", "de 2b"),
+            ("fisubrl (%ebx)", "da 2b"),
+            ("fidivs (%ebx)", "de 33"),
+            ("fidivl (%ebx)", "da 33"),
+            ("fidivrs (%ebx)", "de 3b"),
+            ("fidivrl (%ebx)", "da 3b"),
+        ] {
+            assert_eq!(assemble(line).as_deref(), Ok(hex), "{line}");
+        }
+    }
+
+    /// `ficom`/`ficomp` follow the same two-block layout at `/2` and `/3`
+    /// (SDM Vol. 2A `FICOM`/`FICOMP`: `DE /2`, `DE /3` for m16int and `DA /2`,
+    /// `DA /3` for m32int).
+    #[test]
+    fn x87_integer_compare_uses_the_sdm_digits() {
+        for (line, hex) in [
+            ("ficoms (%ebx)", "de 13"),
+            ("ficoml (%ebx)", "da 13"),
+            ("ficomps (%ebx)", "de 1b"),
+            ("ficompl (%ebx)", "da 1b"),
+        ] {
+            assert_eq!(assemble(line).as_deref(), Ok(hex), "{line}");
+        }
+    }
+
+    #[test]
+    fn x87_compare_into_flags_matches_gnu_as_2_47() {
+        // `float.l`: `fcomi %st(2)` = DB F2, `fcomip %st(3)` = DF F3,
+        // `fucomi %st(4)` = DB EC, `fucomip %st(5)` = DF ED.
+        for (line, hex) in [
+            ("fcomi %st(2)", "db f2"),
+            ("fcomi %st,%st(2)", "db f2"),
+            ("fcomip %st(3)", "df f3"),
+            ("fucomi %st(4)", "db ec"),
+            ("fucomip %st(5)", "df ed"),
+        ] {
+            assert_eq!(assemble(line).as_deref(), Ok(hex), "{line}");
+        }
+        // The reversed spelling is a different operand order; encoding it as
+        // `fcomi %st(2)` would compare the wrong pair.
+        assert!(assemble("fcomi %st(2),%st").is_err());
+    }
+
+    /// `FCMOVcc`/`FFREEP` take `ST(0)` as their implicit first operand and the
+    /// register number in ModR/M.r/m, with the condition in the reg field
+    /// (SDM Vol. 2A: `DA C0+i`, `DA C8+i`, `DA D0+i`, `DA D8+i`, `DB C0+i`,
+    /// `DB C8+i`, `DB D0+i`, `DB D8+i`; `FFREEP` is `DF C0+i`).
+    #[test]
+    fn x87_conditional_moves_and_ffreep() {
+        for (line, hex) in [
+            ("fcmovb %st(1)", "da c1"),
+            ("fcmove %st(2)", "da ca"),
+            ("fcmovbe %st(3)", "da d3"),
+            ("fcmovu %st(4)", "da dc"),
+            ("fcmovnb %st(5)", "db c5"),
+            ("fcmovne %st(6)", "db ce"),
+            ("fcmovnbe %st(7)", "db d7"),
+            ("fcmovnu %st(1)", "db d9"),
+            ("fcmovb %st,%st(1)", "da c1"),
+            ("ffreep %st(3)", "df c3"),
+            ("ffreep %st", "df c0"),
+        ] {
+            assert_eq!(assemble(line).as_deref(), Ok(hex), "{line}");
+        }
+        // The condition is part of the mnemonic, not of the register: the
+        // implicit `st(0)` has to be first.
+        assert!(assemble("fcmovb %st(1),%st").is_err());
+    }
+
+    #[test]
+    fn bare_fisttp_is_the_quadword_form() {
+        // GAS spells the 64-bit integer store `fisttp` (the `q` suffix is only
+        // sanctioned for `fildq`/`fistpq`), and `fisttpq` is accepted as an
+        // alias by this assembler.
+        assert_eq!(assemble("fisttp 8(%esp)").as_deref(), Ok("dd 4c 24 08"));
+        assert_eq!(assemble("fisttpq 8(%esp)").as_deref(), Ok("dd 4c 24 08"));
     }
 }

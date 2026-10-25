@@ -191,6 +191,37 @@ impl super::InstructionEncoder {
         }
     }
 
+    /// Encode the x87 forms whose ModR/M byte is `base + i` over an explicit
+    /// `st(0), st(i)` comparison or conditional move: `fcomi`, `fcmovcc`,
+    /// `ffreep`.
+    ///
+    /// Both spellings the assembler accepts are handled: the single-operand
+    /// `fcomi %st(2)` (`DB F2`) and the explicit `fcomi %st,%st(2)`.  The
+    /// implicit `st(0)` is the *first* operand in the two-operand form, so it
+    /// has to be validated rather than ignored — `fcomi %st(2),%st` is a
+    /// different (and here unsupported) operand order, and silently encoding it
+    /// as `fcomi %st(2)` would assemble to the wrong comparison.
+    pub(super) fn encode_x87_st0_sti(
+        &mut self,
+        ops: &[Operand],
+        opcode: u8,
+        base: u8,
+        name: &str,
+    ) -> Result<(), String> {
+        let n = match ops {
+            [Operand::Register(reg)] => parse_st_num(&reg.name)?,
+            [Operand::Register(first), Operand::Register(second)] => {
+                if parse_st_num(&first.name)? != 0 {
+                    return Err(format!("`{name}' requires %st as its first operand"));
+                }
+                parse_st_num(&second.name)?
+            }
+            _ => return Err(format!("`{name}' requires an st register operand")),
+        };
+        self.bytes.extend_from_slice(&[opcode, base + n]);
+        Ok(())
+    }
+
     pub(super) fn encode_fcom(&mut self, ops: &[Operand]) -> Result<(), String> {
         if ops.len() == 1 || ops.len() == 2 {
             match &ops[0] {
