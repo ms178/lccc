@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ============================================================================
-# oracle_toolchains_from_tags.sh — restore the pinned reference-compiler
-# oracles from the repository's own transport tags, verified, with no network
-# access to a vendor.
+# oracle_toolchains_from_tags.sh — restore GCC/mold/binutils from the
+# repository's verified transport tags and install the pinned current Clang
+# from its checksum-pinned official release archive.
 #
 # WHY THIS EXISTS
 # ---------------
@@ -15,19 +15,19 @@
 # long time building one. Neither is acceptable when the point of the gate is
 # to be run.
 #
-# The payloads are already in this repository: the transport tags
-# `harness-cache-1` (GCC 16 x86-64 prefix, mold, binutils sources) and
-# `harness-cache-4` (Clang 23.1.4 driver + resource headers) exist precisely to
-# move these bytes to a constrained host. Each tag carries a `MANIFEST.sha256`,
-# so restoring from it is verifiable offline and end-to-end: the bytes that
-# leave the tag are checked against the digest committed beside them, and the
-# extracted tool is then *run* to print its version. A restore that produces a
-# binary of the right name and the wrong version is a failed restore.
+# `harness-cache-1` carries the GCC 16 x86-64 prefix, mold and binutils
+# sources. Its `MANIFEST.sha256` is cross-checked against these pins before any
+# payload is restored, then the extracted tools are run and their versions are
+# checked. The current `harness-cache-4` still contains Clang 23.1.3, not the
+# now-required 23.1.4. Do not relabel that payload or its digest: install 23.1.4
+# via `ci_install_clang_oracle.sh`, which pins the official LLVM archive by its
+# published SHA-256. A right-looking filename is never accepted as provenance.
 #
 # WHAT IT DOES NOT DO
 # -------------------
-# * It never silently substitutes a different compiler for a missing one. A
-#   missing payload is an error with the tag and member named.
+# * It never silently substitutes a different compiler. Tag payloads must
+#   match their recorded digest; Clang must match the official installer hash
+#   and the requested version.
 # * It does not build binutils from `binutils-2.47.tar.xz` unless asked
 #   (--with-binutils), because a from-source binutils build is ~10 minutes on
 #   the two-core research host and almost no gate needs it. The tarball is
@@ -40,7 +40,7 @@
 #
 #     --prefix DIR      install root (default: ${LCCC_ORACLE_PREFIX:-/opt/oracles})
 #     --bin-dir DIR     where the PATH shims go (default: /usr/local/bin)
-#     --no-shims        extract into --prefix only; print the env file path
+#     --no-shims        install under --prefix only; print the env file path
 #     --with-binutils   also build+install binutils 2.47 (slow)
 #     --verify-only     check an existing install and exit
 #     -h, --help        this text
@@ -99,14 +99,11 @@ done
 # the in-tree MANIFEST and this table agree, so a legitimate re-issue of a tag
 # fails loudly here (with both digests printed) instead of silently.
 TAG_GCC=harness-cache-1
-TAG_CLANG=harness-cache-4
 GCC_MEMBER=gcc-16-bookworm-x86_64.tar.xz
-CLANG_MEMBER=clang-23.1.4-linux-x64.tar.xz
 MOLD_MEMBER=mold-2.42.1-x86_64
 BINUTILS_MEMBER=binutils-2.47.tar.xz
 
 GCC_SHA=4fa6af4f6b29991e31631af18d83964a69caa9daf3f78546d4dc30f39880cd8a
-CLANG_SHA=e9cdb92b09a89840eb15fec382955cc920d9106fc8ecd4a2996ef25fd37b14d9
 MOLD_SHA=86b918f8af9444aed086ea73b593b88e910d49829d2cae979cbb84509b64dc76
 BINUTILS_SHA=154ab23b60070e8f27013c22977f1129425d67d1e8acd6e13010e617811e4cff
 
@@ -209,7 +206,11 @@ restore_toolchain() {  # restore_toolchain <tag> <member> <sha> <root> <label>
 }
 
 restore_toolchain "$TAG_GCC" "$GCC_MEMBER" "$GCC_SHA" "$GCC_ROOT" "gcc-$GCC_VERSION"
-restore_toolchain "$TAG_CLANG" "$CLANG_MEMBER" "$CLANG_SHA" "$CLANG_ROOT" "clang-$CLANG_VERSION"
+# harness-cache-4 carries the old 23.1.3 payload. The current LLVM pin is
+# provisioned from the release asset with a separately verified SHA-256; never
+# relabel the old tag member or accept it as a 23.1.4 oracle.
+log "installing Clang $CLANG_VERSION from the official checksum-pinned release"
+"$REPO/scripts/ci_install_clang_oracle.sh" --prefix "$CLANG_ROOT" >/dev/null
 
 # mold is a single static binary: verify it in place rather than extracting.
 mkdir -p "$PREFIX/bin"

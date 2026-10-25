@@ -3,7 +3,7 @@
   "fns_over_300": 228,
   "fns_over_500": 94,
   "ignored_tests": 10,
-  "knob_literals": 538,
+  "knob_literals": 536,
   "knob_names": [
     "CCC_AGGREGATE_SPLIT",
     "CCC_AGG_BYVAL_DEBUG",
@@ -79,16 +79,13 @@
     "CCC_DEBUG_SPLIT",
     "CCC_DEBUG_SROA",
     "CCC_DEBUG_STACK_ALIGN",
-    "CCC_DEBUG_STATIC_INIT",
     "CCC_DEBUG_TIGHT",
-    "CCC_DEBUG_TYPES_COMPATIBLE",
     "CCC_DEBUG_VARARG",
     "CCC_DEBUG_VDEFER",
     "CCC_DEBUG_VECWEB",
     "CCC_DEBUG_VEC_AVAIL",
     "CCC_DEBUG_VEC_LOAD_SINK",
     "CCC_DEBUG_VLFOLD",
-    "CCC_DEBUG_VOLRED",
     "CCC_DISABLE_AGGREGATE_SROA",
     "CCC_DISABLE_PASSES",
     "CCC_DISABLE_SCALAR_FP_XMM",
@@ -317,6 +314,7 @@
     "CCC_NO_RDX_HAZARD",
     "CCC_NO_RDX_PARAM_HOMES",
     "CCC_NO_REASSOC_GUARD",
+    "CCC_NO_REASSOC_STRAIGHTLINE",
     "CCC_NO_REDUCTION_VECREG",
     "CCC_NO_REDUNDANT_EXT",
     "CCC_NO_REDUNDANT_LOADS",
@@ -545,7 +543,7 @@
     "LCCC_WHY_NOT_VECTORIZE"
   ],
   "knobs_undocumented": 268,
-  "panic_sites": 835,
+  "panic_sites": 834,
   "panic_sites_hot": 105,
   "unsafe_sites": 25
 }

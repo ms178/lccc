@@ -40,15 +40,53 @@ type Object = u32;
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct ObjectSet(Vec<Object>);
 
+#[derive(Clone, Copy, Debug)]
+struct InsertPlan {
+    position: usize,
+    already_present: bool,
+    work: usize,
+}
+
 impl ObjectSet {
-    fn insert(&mut self, object: Object) -> bool {
-        match self.0.binary_search(&object) {
-            Ok(_) => false,
-            Err(position) => {
-                self.0.insert(position, object);
-                true
-            }
+    /// Find an insertion point once and account for both the search and the
+    /// vector movement before the solver commits the change. The logarithmic
+    /// bound is deliberately rounded up; a sorted Vec insertion shifts every
+    /// element after the insertion point.
+    fn plan_insert(&self, object: Object) -> InsertPlan {
+        let position = self.0.binary_search(&object);
+        let (position, already_present) = match position {
+            Ok(position) => (position, true),
+            Err(position) => (position, false),
+        };
+        let search_bound = usize::BITS.saturating_sub(self.0.len().leading_zeros()) as usize;
+        let shifts = if already_present {
+            0
+        } else {
+            self.0.len().saturating_sub(position)
+        };
+        InsertPlan {
+            position,
+            already_present,
+            work: search_bound
+                .saturating_add(shifts)
+                .saturating_add(usize::from(!already_present)),
         }
+    }
+
+    fn insert(&mut self, object: Object) -> bool {
+        let plan = self.plan_insert(object);
+        self.insert_at(object, plan)
+    }
+
+    fn insert_at(&mut self, object: Object, plan: InsertPlan) -> bool {
+        if plan.already_present {
+            return false;
+        }
+        debug_assert!(plan.position <= self.0.len());
+        debug_assert!(self.0.get(plan.position).is_none_or(|&next| next > object));
+        debug_assert!(plan.position == 0 || self.0[plan.position - 1] < object);
+        self.0.insert(plan.position, object);
+        true
     }
 
     fn union_with(&mut self, other: &Self) -> bool {
@@ -265,15 +303,19 @@ impl Solver {
         if !self.complete {
             return;
         }
-        if self.points[node as usize].0.len() >= self.budget.max_points_per_node
-            && !self.points[node as usize].contains(object)
-        {
+        let index = node as usize;
+        let plan = self.points[index].plan_insert(object);
+        let point_count = self.points[index].0.len();
+        self.charge(plan.work);
+        if !self.complete || plan.already_present {
+            return;
+        }
+        if point_count >= self.budget.max_points_per_node {
             self.complete = false;
             self.queue.clear();
             return;
         }
-        self.charge(1);
-        if self.complete && self.points[node as usize].insert(object) {
+        if self.points[node as usize].insert_at(object, plan) {
             self.queue.push_back((node, object));
         }
     }
@@ -1900,6 +1942,23 @@ mod tests {
         let mut module = test_module(vec![profiled, caller]);
         assert_eq!(run(&mut module, false), 0);
         assert_eq!(load_count(&module.functions[1]), 2);
+    }
+
+    #[test]
+    fn insertion_plan_accounts_for_search_shift_and_duplicate() {
+        let mut set = ObjectSet(vec![1, 2, 4, 8]);
+        let plan = set.plan_insert(7);
+        assert_eq!(plan.position, 3);
+        assert!(!plan.already_present);
+        assert_eq!(plan.work, 5, "search bound + one shifted item + insert");
+        assert!(set.insert_at(7, plan));
+        assert_eq!(set.0, vec![1, 2, 4, 7, 8]);
+
+        let duplicate = set.plan_insert(4);
+        assert!(duplicate.already_present);
+        assert_eq!(duplicate.work, 3, "duplicate still pays the search cost");
+        assert!(!set.insert_at(4, duplicate));
+        assert_eq!(set.0, vec![1, 2, 4, 7, 8]);
     }
 
     #[test]

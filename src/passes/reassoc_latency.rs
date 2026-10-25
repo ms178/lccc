@@ -136,7 +136,7 @@
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
 use crate::ir::analysis;
-use crate::ir::reexports::{Instruction, IrBinOp, IrFunction, Operand, Value};
+use crate::ir::reexports::{Instruction, IrBinOp, IrConst, IrFunction, Operand, Terminator, Value};
 use crate::passes::loop_analysis;
 use crate::passes::round_cap;
 
@@ -487,6 +487,19 @@ pub(crate) fn run_function(func: &mut IrFunction) -> usize {
         round_cap::note_cap_hit(round_cap::Site::ReassocLatency);
     }
     total
+}
+
+/// Run the loop recurrence transform and, when enabled by the x86-64 pipeline,
+/// a narrow wrapping-Add reduction in terminal return blocks.
+pub(crate) fn run_function_with_straightline(
+    func: &mut IrFunction,
+    straightline_enabled: bool,
+) -> usize {
+    let mut changed = run_function(func);
+    if straightline_enabled {
+        changed += rewrite_terminal_add_return(func);
+    }
+    changed
 }
 
 fn run_round(func: &mut IrFunction) -> usize {
@@ -1020,10 +1033,300 @@ fn rewrite_block(
     rewrites
 }
 
+/// Return the integer bit pattern represented by an IR integer constant.
+/// Widen smaller signed constants through their mathematical value first; the
+/// caller then truncates to the Add width, matching IR integer promotion.
+fn integer_constant_bits(c: IrConst) -> Option<u64> {
+    c.to_i128().map(|value| value as u128 as u64)
+}
+
+fn integer_constant_for(bits: u64, ty: IrType) -> Option<IrConst> {
+    match ty {
+        IrType::I32 | IrType::U32 => Some(IrConst::I32(bits as u32 as i32)),
+        IrType::I64 | IrType::U64 => Some(IrConst::I64(bits as i64)),
+        _ => None,
+    }
+}
+
+fn type_gpr_weight(ty: Option<IrType>) -> u32 {
+    match ty {
+        Some(t) if t.is_float() || t == IrType::Void => 0,
+        Some(t) => t.size().div_ceil(8).max(1) as u32,
+        None => 1,
+    }
+}
+
+/// Conservative block-local live-GPR peak. Values used by the terminator are
+/// live at block exit; reverse transfer then models each instruction's uses
+/// and definition. Unknown value types count as one GPR so this check fails
+/// closed rather than granting pressure headroom.
+fn block_gpr_peak(
+    instructions: &[Instruction],
+    terminator: &Terminator,
+    types: &FxHashMap<u32, IrType>,
+) -> u32 {
+    let weight = |v: u32| type_gpr_weight(types.get(&v).copied());
+    let mut live = FxHashSet::default();
+    terminator.for_each_used_value(|v| {
+        live.insert(v);
+    });
+    let mut current: u32 = live.iter().map(|&v| weight(v)).sum();
+    let mut peak = current;
+    for inst in instructions.iter().rev() {
+        if let Some(dest) = inst.dest() {
+            if live.remove(&dest.0) {
+                current = current.saturating_sub(weight(dest.0));
+            }
+        }
+        inst.for_each_used_value(|v| {
+            if live.insert(v) {
+                current = current.saturating_add(weight(v));
+            }
+        });
+        peak = peak.max(current);
+    }
+    peak
+}
+
+fn collect_value_types(func: &IrFunction) -> FxHashMap<u32, IrType> {
+    let mut types = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Some(dest) = inst.dest() {
+                if let Some(ty) = inst.result_type() {
+                    types.insert(dest.0, ty);
+                }
+            }
+        }
+    }
+    types
+}
+
+/// Expand a same-type Add tree only through nodes that are single-use in the
+/// function. The returned leaf list retains source order; all other operations
+/// remain leaves and are never moved or re-evaluated.
+fn flatten_single_use_add_tree(
+    instructions: &[Instruction],
+    root: usize,
+    ty: IrType,
+    use_counts: &FxHashMap<u32, usize>,
+) -> Option<(Vec<usize>, Vec<Operand>)> {
+    let mut local_defs = FxHashMap::default();
+    for (index, inst) in instructions.iter().enumerate() {
+        if let Some(dest) = inst.dest() {
+            local_defs.insert(dest.0, index);
+        }
+    }
+    let mut nodes = Vec::new();
+    let mut leaves = Vec::new();
+    let mut stack = vec![root];
+    while let Some(index) = stack.pop() {
+        let Instruction::BinOp {
+            dest,
+            op: IrBinOp::Add,
+            lhs,
+            rhs,
+            ty: node_ty,
+        } = &instructions[index]
+        else {
+            return None;
+        };
+        if *node_ty != ty || use_counts.get(&dest.0) != Some(&1) {
+            return None;
+        }
+        nodes.push(index);
+        for operand in [rhs, lhs] {
+            let child = match operand {
+                Operand::Value(value) => local_defs.get(&value.0).copied().filter(|&i| {
+                    matches!(
+                        instructions[i],
+                        Instruction::BinOp { op: IrBinOp::Add, ty: child_ty, .. }
+                            if child_ty == ty && use_counts.get(&value.0) == Some(&1)
+                    )
+                }),
+                Operand::Const(_) => None,
+            };
+            if let Some(child) = child {
+                stack.push(child);
+            } else {
+                leaves.push((*operand).clone());
+            }
+        }
+        if leaves.len() > MAX_LEAVES {
+            return None;
+        }
+    }
+    (leaves.len() >= 3).then_some((nodes, leaves))
+}
+
+/// Reduce a return-only, repeated-base wrapping Add tree to `base * count + c`.
+/// No intermediate result is observable: every removed node is single-use,
+/// all operations have one integer type, and the IR has no signed-overflow
+/// flags. Multiplication is therefore modulo the same width as the additions.
+fn rewrite_terminal_add_return(func: &mut IrFunction) -> usize {
+    let mut use_counts: FxHashMap<u32, usize> = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            inst.for_each_used_value(|v| *use_counts.entry(v).or_insert(0) += 1);
+        }
+        block
+            .terminator
+            .for_each_used_value(|v| *use_counts.entry(v).or_insert(0) += 1);
+    }
+    let types = collect_value_types(func);
+    let type_mask = |ty: IrType| -> Option<u64> {
+        match ty {
+            IrType::I32 | IrType::U32 => Some(u32::MAX as u64),
+            IrType::I64 | IrType::U64 => Some(u64::MAX),
+            _ => None,
+        }
+    };
+
+    for bi in 0..func.blocks.len() {
+        let (return_value, root_index) = match &func.blocks[bi].terminator {
+            Terminator::Return(Some(Operand::Value(value))) => {
+                let root = func.blocks[bi]
+                    .instructions
+                    .iter()
+                    .position(|inst| inst.dest() == Some(*value));
+                let Some(root) = root else { continue };
+                (*value, root)
+            }
+            _ => continue,
+        };
+        if use_counts.get(&return_value.0) != Some(&1) {
+            continue;
+        }
+        let Instruction::BinOp {
+            op: IrBinOp::Add,
+            ty,
+            ..
+        } = &func.blocks[bi].instructions[root_index]
+        else {
+            continue;
+        };
+        let ty = *ty;
+        let Some(mask) = type_mask(ty) else { continue };
+        let Some((nodes, leaves)) =
+            flatten_single_use_add_tree(&func.blocks[bi].instructions, root_index, ty, &use_counts)
+        else {
+            continue;
+        };
+
+        let mut base: Option<Operand> = None;
+        let mut base_count = 0u64;
+        let mut constant_sum = 0u64;
+        let mut valid = true;
+        for leaf in &leaves {
+            match leaf {
+                Operand::Const(value) => {
+                    let Some(bits) = integer_constant_bits(*value) else {
+                        valid = false;
+                        break;
+                    };
+                    constant_sum = constant_sum.wrapping_add(bits) & mask;
+                }
+                Operand::Value(value) => {
+                    if types.get(&value.0).is_some_and(|leaf_ty| *leaf_ty != ty) {
+                        valid = false;
+                        break;
+                    }
+                    match &base {
+                        None => {
+                            base = Some(leaf.clone());
+                            base_count = 1;
+                        }
+                        Some(existing) if existing == leaf => {
+                            base_count = base_count.saturating_add(1);
+                        }
+                        Some(_) => {
+                            valid = false;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if !valid || base_count < 2 {
+            continue;
+        }
+        let Some(base) = base else { continue };
+        let Some(count_constant) = integer_constant_for(base_count & mask, ty) else {
+            continue;
+        };
+        let Some(sum_constant) = integer_constant_for(constant_sum, ty) else {
+            continue;
+        };
+        let root_dest = return_value;
+        let mut next_id = func.sound_next_value_id();
+        let multiply_dest = if constant_sum == 0 {
+            root_dest
+        } else {
+            let fresh = Value(next_id);
+            next_id = next_id.saturating_add(1);
+            fresh
+        };
+        let mut generated = vec![Instruction::BinOp {
+            dest: multiply_dest,
+            op: IrBinOp::Mul,
+            lhs: base,
+            rhs: Operand::Const(count_constant),
+            ty,
+        }];
+        if constant_sum != 0 {
+            generated.push(Instruction::BinOp {
+                dest: root_dest,
+                op: IrBinOp::Add,
+                lhs: Operand::Value(multiply_dest),
+                rhs: Operand::Const(sum_constant),
+                ty,
+            });
+        }
+
+        let block = &func.blocks[bi];
+        if !block.source_spans.is_empty() && block.source_spans.len() != block.instructions.len() {
+            continue;
+        }
+        let root_span = block.source_spans.get(root_index).copied();
+        let node_set: FxHashSet<usize> = nodes.into_iter().collect();
+        let mut replacement = Vec::with_capacity(block.instructions.len() + generated.len());
+        let mut replacement_spans = Vec::with_capacity(block.source_spans.len() + generated.len());
+        for (index, inst) in block.instructions.iter().enumerate() {
+            if index == root_index {
+                for item in generated.iter().cloned() {
+                    replacement.push(item);
+                    if let Some(span) = root_span {
+                        replacement_spans.push(span);
+                    }
+                }
+            }
+            if !node_set.contains(&index) {
+                replacement.push(inst.clone());
+                if !block.source_spans.is_empty() {
+                    replacement_spans.push(block.source_spans[index]);
+                }
+            }
+        }
+        let before_peak = block_gpr_peak(&block.instructions, &block.terminator, &types);
+        let after_peak = block_gpr_peak(&replacement, &block.terminator, &types);
+        if after_peak > before_peak || after_peak > gpr_budget() {
+            continue;
+        }
+        let block = &mut func.blocks[bi];
+        block.instructions = replacement;
+        if !block.source_spans.is_empty() {
+            block.source_spans = replacement_spans;
+        }
+        func.next_value_id = next_id;
+        return 1;
+    }
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::reexports::{BasicBlock, BlockId, IrConst, Terminator};
+    use crate::ir::reexports::{BasicBlock, BlockId, IrConst, IrParam, Terminator};
 
     fn blk(id: u32, instructions: Vec<Instruction>, terminator: Terminator) -> BasicBlock {
         BasicBlock {
@@ -1251,6 +1554,139 @@ mod tests {
         let mut f = sha_like(false);
         let before = format!("{:?}", f.blocks);
         assert_eq!(run_function(&mut f), 0);
+        assert_eq!(format!("{:?}", f.blocks), before);
+    }
+
+    fn scalar_param(ty: IrType) -> IrParam {
+        IrParam {
+            ty,
+            noalias: false,
+            struct_size: None,
+            struct_align: None,
+            param_align: None,
+            struct_eightbyte_classes: Vec::new(),
+            is_f128_sse: false,
+            riscv_float_class: None,
+        }
+    }
+
+    fn affine_add_tree() -> IrFunction {
+        let mut f = IrFunction::new(
+            "affine".to_string(),
+            IrType::U32,
+            vec![scalar_param(IrType::U32)],
+            false,
+        );
+        let mut instructions = vec![Instruction::ParamRef {
+            dest: Value(0),
+            param_idx: 0,
+            ty: IrType::U32,
+        }];
+        for k in 1..=8u32 {
+            instructions.push(bin(
+                k,
+                IrBinOp::Add,
+                v(0),
+                Operand::Const(IrConst::I32(k as i32)),
+                IrType::U32,
+            ));
+        }
+        let mut acc = 1u32;
+        let mut next = 9u32;
+        for term in 2..=8u32 {
+            instructions.push(bin(next, IrBinOp::Add, v(acc), v(term), IrType::U32));
+            acc = next;
+            next += 1;
+        }
+        f.blocks = vec![blk(0, instructions, Terminator::Return(Some(v(acc))))];
+        f.next_value_id = next;
+        f.next_label = 1;
+        f
+    }
+
+    #[test]
+    fn integer_constants_preserve_signed_extension_before_width_masking() {
+        assert_eq!(integer_constant_bits(IrConst::I8(-1)), Some(u64::MAX));
+        assert_eq!(integer_constant_bits(IrConst::I16(-1)), Some(u64::MAX));
+        assert_eq!(integer_constant_bits(IrConst::I32(-1)), Some(u64::MAX));
+        assert_eq!(integer_constant_bits(IrConst::I64(-1)), Some(u64::MAX));
+        assert_eq!(integer_constant_bits(IrConst::Zero), Some(0));
+        assert_eq!(integer_constant_bits(IrConst::F32(1.0)), None);
+    }
+
+    #[test]
+    fn straight_line_wrapping_add_folds_repeated_base() {
+        let mut f = affine_add_tree();
+        assert_eq!(run_function_with_straightline(&mut f, true), 1);
+        assert_valid(&f);
+        let body = &f.blocks[0].instructions;
+        assert_eq!(body.len(), 3, "one ParamRef, one multiply, one add");
+        assert!(matches!(
+            &body[1],
+            Instruction::BinOp {
+                dest: Value(16),
+                op: IrBinOp::Mul,
+                lhs: Operand::Value(Value(0)),
+                rhs: Operand::Const(IrConst::I32(8)),
+                ty: IrType::U32,
+            }
+        ));
+        assert!(matches!(
+            &body[2],
+            Instruction::BinOp {
+                dest: Value(15),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(16)),
+                rhs: Operand::Const(IrConst::I32(36)),
+                ty: IrType::U32,
+            }
+        ));
+        assert_eq!(f.next_value_id, 17);
+    }
+
+    #[test]
+    fn straight_line_kill_switch_keeps_source_shape() {
+        let mut f = affine_add_tree();
+        let before = format!("{:?}", f.blocks);
+        assert_eq!(run_function_with_straightline(&mut f, false), 0);
+        assert_eq!(format!("{:?}", f.blocks), before);
+    }
+
+    #[test]
+    fn straight_line_non_add_tree_keeps_source_shape() {
+        let mut f = IrFunction::new(
+            "xor".to_string(),
+            IrType::U32,
+            vec![scalar_param(IrType::U32)],
+            false,
+        );
+        let instructions = vec![
+            Instruction::ParamRef {
+                dest: Value(0),
+                param_idx: 0,
+                ty: IrType::U32,
+            },
+            bin(
+                1,
+                IrBinOp::Xor,
+                v(0),
+                Operand::Const(IrConst::I32(1)),
+                IrType::U32,
+            ),
+            bin(
+                2,
+                IrBinOp::Xor,
+                v(0),
+                Operand::Const(IrConst::I32(2)),
+                IrType::U32,
+            ),
+            bin(3, IrBinOp::Xor, v(1), v(2), IrType::U32),
+        ];
+        f.blocks = vec![blk(0, instructions, Terminator::Return(Some(v(3))))];
+        f.next_value_id = 4;
+        f.next_label = 1;
+        let before = format!("{:?}", f.blocks);
+        assert_eq!(run_function_with_straightline(&mut f, true), 0);
         assert_eq!(format!("{:?}", f.blocks), before);
     }
 

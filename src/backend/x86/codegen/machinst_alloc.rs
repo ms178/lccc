@@ -426,7 +426,7 @@ impl<'a> Scan<'a> {
 
 /// Physical registers referenced by an instruction's operands (read or
 /// write alike — for interference both directions matter equally).
-fn touched_phys_regs(inst: &MachInst) -> Vec<u8> {
+pub(super) fn touched_phys_regs(inst: &MachInst) -> Vec<u8> {
     fn reg_of(r: &MachReg, out: &mut Vec<u8>) {
         if let MachReg::Phys(p) = r {
             out.push(p.0);

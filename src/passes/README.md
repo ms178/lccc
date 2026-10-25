@@ -897,7 +897,8 @@ CCC_DISABLE_PASSES=gvn,licm ./ccc input.c -o output.o
 ```
 
 Recognized names: `all`, `inline`, `cfg`, `copyprop`, `narrow`, `simplify`,
-`constfold`, `gvn`, `licm`, `ifconv`, `dce`, `ipcp`, `divconst`, `ivsr`.
+`constfold`, `gvn`, `licm`, `ifconv`, `dce`, `ipcp`, `divconst`, `ivsr`,
+`reassoc_lat`.
 
 Setting the variable to `all` skips the entire optimization pipeline.
 
@@ -932,9 +933,19 @@ behavior across iterations.
 | `licm.rs`                | Loop-invariant code motion                             |
 | `loop_analysis.rs`       | Shared loop detection and body computation utilities   |
 | `narrow.rs`              | Integer narrowing (3-phase C promotion elimination)    |
-| `reassoc_latency.rs`     | Loop-recurrence-driven reassociation of int trees      |
+| `reassoc_latency.rs`     | Loop recurrences plus guarded wrapping-Add reduction   |
 | `resolve_asm.rs`         | Post-inline assembly symbol resolution                 |
 | `simplify.rs`            | Algebraic simplification, strength reduction, and peephole |
+
+`reassoc_lat` normally changes only loop-carried associative integer trees.
+Its optional straight-line extension is narrower: on x86-64 it can fold a
+single-use, same-type `Add` tree in a terminal return block into
+`base * count + constant` for wrapping I32/U32/I64/U64 arithmetic. The rewrite
+requires one repeated non-constant base, preserves source evaluation of all
+leaves, and is rejected if block-local live-GPR peak would exceed either the
+original peak or the target budget. It never reshapes straight-line XOR/AND/OR
+trees. Set `CCC_NO_REASSOC_STRAIGHTLINE=1` to bisect this extension, or disable
+the full pass with `CCC_DISABLE_PASSES=reassoc_lat`.
 
 ### Exact floating recurrences and doubling
 

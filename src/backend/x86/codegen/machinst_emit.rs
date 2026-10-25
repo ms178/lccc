@@ -1347,6 +1347,28 @@ pub fn emit_machinsts_with_tune(
     let apx = super::isel::apx_enabled();
     let mut i = 0;
     while i < insts.len() {
+        // `shl $k, %base; add $disp, %base; mov %base, %dst` is one LEA
+        // when the shifted home dies here and the final flags are dead. This
+        // is a strict three-instruction window; no intervening instruction is
+        // skipped and the displaced source register is not live afterward.
+        if i + 2 < insts.len()
+            && try_emit_shift_add_mov_lea(
+                &insts[i],
+                &insts[i + 1],
+                &insts[i + 2],
+                &insts[i + 3..],
+                out,
+            )
+        {
+            i += 3;
+            continue;
+        }
+        if i + 1 < insts.len()
+            && try_emit_shift_add_lea(&insts[i], &insts[i + 1], &insts[i + 2..], out)
+        {
+            i += 2;
+            continue;
+        }
         // 64/32-bit `mov %src1, %dst; add %src, %dst` → LEA. One µop, no
         // flags, 4 bytes vs NDD EVEX 6 or mov+add 6. Legal on every x86-64
         // (the 14700KF default path included) — dest ≠ src1 is the only
@@ -1385,8 +1407,10 @@ pub fn emit_machinsts_with_tune(
     }
 }
 
-/// True when a later MachInst still consumes EFLAGS produced here.
-/// Flag-neutral moves/LEAs are skipped; the next flag writer kills them.
+/// True when a later MachInst can still consume EFLAGS produced here.
+/// Flag-neutral instructions are skipped. A flag writer kills the old value,
+/// except a zero-count shift/rotate, which preserves it. Unknown Raw text and
+/// register-count shifts fail closed because they may read/preserve EFLAGS.
 fn flags_live_after(rest: &[MachInst]) -> bool {
     for inst in rest {
         match inst {
@@ -1394,17 +1418,169 @@ fn flags_live_after(rest: &[MachInst]) -> bool {
             MachInst::Alu { .. }
             | MachInst::Imul3 { .. }
             | MachInst::Neg { .. }
-            | MachInst::Not { .. }
-            | MachInst::Shift { .. }
             | MachInst::Cmp { .. }
             | MachInst::Test { .. }
             | MachInst::Div { .. }
-            | MachInst::Cqto { .. }
-            | MachInst::XorRdx => return false,
+            | MachInst::XorRdx
+            | MachInst::Call { .. }
+            | MachInst::CallTyped { .. } => return false,
+            MachInst::Shift {
+                op, amount, size, ..
+            } => {
+                let MachOperand::Imm(amount) = amount else {
+                    return true;
+                };
+                let count_mask = if *size == OpSize::S64 { 0x3f } else { 0x1f };
+                let count = (*amount as u64) & count_mask;
+                let width_bits = match *size {
+                    OpSize::S8 => 8,
+                    OpSize::S16 => 16,
+                    OpSize::S32 => 32,
+                    OpSize::S64 => 64,
+                };
+                let effective = match op {
+                    ShiftOp::Rol | ShiftOp::Ror => count % width_bits,
+                    _ => count,
+                };
+                if effective == 0 {
+                    return true;
+                }
+                return false;
+            }
+            MachInst::Raw(_) => return true,
+            // `not` and `cqto` (like moves, LEAs, and BMI2 shifts) preserve
+            // flags; continue looking for a later consumer or writer.
             _ => {}
         }
     }
     false
+}
+
+/// Fuse `shl $k, %base; add $disp, %base` into an indexed LEA in the same
+/// destination home. The final Add flags must be dead; unlike the three-op
+/// form this preserves the shifted home for later uses.
+fn try_emit_shift_add_lea(
+    shift: &MachInst,
+    add: &MachInst,
+    rest: &[MachInst],
+    out: &mut AsmOutput,
+) -> bool {
+    let MachInst::Shift {
+        op: ShiftOp::Shl,
+        amount: MachOperand::Imm(amount),
+        dst: base,
+        size,
+    } = shift
+    else {
+        return false;
+    };
+    let MachInst::Alu {
+        op: AluOp::Add,
+        src: MachOperand::Imm(offset),
+        dst,
+        size: add_size,
+    } = add
+    else {
+        return false;
+    };
+    if !matches!(*size, OpSize::S32 | OpSize::S64)
+        || add_size != size
+        || dst != base
+        || !(0..=3).contains(amount)
+        || *offset < i32::MIN as i64
+        || *offset > i32::MAX as i64
+        || flags_live_after(rest)
+    {
+        return false;
+    }
+    let MachReg::Phys(_) = base else {
+        return false;
+    };
+    let scale = 1u8 << (*amount as u32);
+    let (mnem, dst_size) = if *size == OpSize::S32 {
+        ("leal", OpSize::S32)
+    } else {
+        ("leaq", OpSize::S64)
+    };
+    let base_name = fmt_reg(base, OpSize::S64);
+    let dst_name = fmt_reg(dst, dst_size);
+    out.emit_fmt(format_args!(
+        "    {mnem} {offset}(, {base_name}, {scale}), {dst_name}"
+    ));
+    true
+}
+
+/// Fuse a dead `shl; add-imm; mov` chain into an indexed LEA.
+///
+/// The LEA writes the final move destination directly. This is sound only
+/// when the shifted home has no later mention (including a later overwrite,
+/// conservatively) and no consumer observes the Add flags.
+fn try_emit_shift_add_mov_lea(
+    shift: &MachInst,
+    add: &MachInst,
+    mov: &MachInst,
+    rest: &[MachInst],
+    out: &mut AsmOutput,
+) -> bool {
+    let MachInst::Shift {
+        op: ShiftOp::Shl,
+        amount: MachOperand::Imm(amount),
+        dst: base,
+        size,
+    } = shift
+    else {
+        return false;
+    };
+    let MachInst::Alu {
+        op: AluOp::Add,
+        src: MachOperand::Imm(offset),
+        dst: add_dst,
+        size: add_size,
+    } = add
+    else {
+        return false;
+    };
+    let MachInst::Mov {
+        src: MachOperand::Reg(mov_src),
+        dst: MachOperand::Reg(dst),
+        size: mov_size,
+    } = mov
+    else {
+        return false;
+    };
+    if !matches!(*size, OpSize::S32 | OpSize::S64)
+        || add_size != size
+        || mov_size != size
+        || add_dst != base
+        || mov_src != base
+        || !(0..=3).contains(amount)
+        || *offset < i32::MIN as i64
+        || *offset > i32::MAX as i64
+        || flags_live_after(rest)
+    {
+        return false;
+    }
+    let MachReg::Phys(base_phys) = base else {
+        return false;
+    };
+    if rest
+        .iter()
+        .any(|inst| super::machinst_alloc::touched_phys_regs(inst).contains(&base_phys.0))
+    {
+        return false;
+    }
+    let scale = 1u8 << (*amount as u32);
+    let (mnem, dst_size) = if *size == OpSize::S32 {
+        ("leal", OpSize::S32)
+    } else {
+        ("leaq", OpSize::S64)
+    };
+    let base_name = fmt_reg(base, OpSize::S64);
+    let dst_name = fmt_reg(dst, dst_size);
+    out.emit_fmt(format_args!(
+        "    {mnem} {offset}(, {base_name}, {scale}), {dst_name}"
+    ));
+    true
 }
 
 /// Fuse `mov %src1, %dst; add %src, %dst` into `lea (src1, src), dst`.
