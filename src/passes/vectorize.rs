@@ -814,10 +814,11 @@ fn vectorize_with_analysis_mode(
                 );
             }
         } else if !neon
-            && !force_two_wide
             && !late_minmax_only()
-            && !force_sse2
-            && x86_strict_recip_avx2_enabled()
+            && ((!force_two_wide && !force_sse2 && x86_strict_recip_avx2_enabled())
+                || (x86_64_vector_intrinsics_available()
+                    && x86_simd_available_pub()
+                    && !x86_avx2_available()))
             && let Some(strict_pattern) =
                 analyze_strict_computed_recip_reduction(func, loop_info, cfg)
             && let Some(changes) = transform_strict_computed_recip_reduction(func, &strict_pattern)
@@ -18992,9 +18993,9 @@ fn find_inst_in_loop<'a>(
 // is not a conventional vector reduction.  The quotient/product for different
 // j values are lane-independent, but an FP horizontal add tree changes the
 // observable result.  This deliberately narrow transform versions the loop:
-// a four-wide AVX2 prefix calculates four quotient/products at once and then
-// folds their lanes into the scalar accumulator in source order.  The original
-// loop remains intact as the exact scalar tail.
+// a four-element prefix uses AVX2 or two SSE2 packets for quotient/products,
+// then folds their lanes into the scalar accumulator in source order. The
+// original loop remains intact as the exact scalar tail.
 //
 // The accepted CFG is intentionally stricter than the generic reduction
 // matcher: a two-block, zero-based, signed-I32 counted loop with a single F64
@@ -19839,8 +19840,11 @@ fn transform_strict_computed_recip_reduction(
     let change_count =
         1 + prefix.len() + vector_header.instructions.len() + vector_body.instructions.len() + 2;
 
-    // `scratch` is normally unused by the direct XMM-result lowering, but it
-    // gives the code generator a sound register-pressure fallback without
+    // SSE2 uses `scratch` for its two product packets; AVX2 only needs it
+    // when the scalar result has no XMM home. Neither spelling needs more
+    // than 16-byte alignment: both store products with MOVUPD/VMOVUPD.
+    // Avoid over-alignment and its pointer materialization in the hot loop.
+    // This gives the code generator a sound register-pressure fallback without
     // borrowing an allocator-owned XMM register or dynamically moving %rsp.
     // Loop-invariant packed constants/broadcasts run once: the matcher proved
     // every external leaf dominates the preheader (strict_external_value_available).
@@ -19854,7 +19858,7 @@ fn transform_strict_computed_recip_reduction(
             dest: scratch,
             ty: IrType::F64,
             size: 32,
-            align: 32,
+            align: 16,
             volatile: false,
             semantic_volatile: false,
         });

@@ -10,12 +10,13 @@ flags=(-O2 -fwrapv -ffp-contract=off)
 renames=(-Dpacked_poly=actual_packed_poly -Dpacked_bits=actual_packed_bits -Dscalar_shift=actual_scalar_shift)
 for arch in x86-64-v3 x86-64; do
     "$GCC" "${flags[@]}" "-march=$arch" -c "$src/kernels.c" -o "$work/ref.o"
-    for homes in normal stack all-stack no-promotion; do
+    for homes in normal stack all-stack no-promotion scalar-denominators; do
         env_args=()
         case $homes in
             stack) env_args=(CCC_NO_XMM_REGALLOC=1);;
             all-stack) env_args=(CCC_NO_REGALLOC=1);;
             no-promotion) env_args=(CCC_NO_VEX_PROMOTE=1);;
+            scalar-denominators) env_args=(CCC_DISABLE_PASSES=strict_recip_pack);;
         esac
         env "${env_args[@]}" CCC_VERIFY_IR=abort CCC_VALIDATE_SSA=1 "$CCC" \
             "${flags[@]}" "-march=$arch" "${renames[@]}" -c "$src/kernels.c" -o "$work/got.o"
@@ -45,6 +46,14 @@ for name, operation in [('packed_poly', 'vpmulld'), ('packed_bits', 'vpxor')]:
     assert not re.search(r'\b(?:movdqa|movdqu|paddd|pmulld|pinsrd)\b', code), name
     for fallback in [scalar, avx, no_sse41]:
         assert 'vdivpd' not in body(fallback, name), name
+    sse = body(scalar, name)
+    assert len(re.findall(r'\bcvtdq2pd\b', sse)) >= 2, name
+    assert len(re.findall(r'\bdivpd\b', sse)) >= 2, name
+    assert len(re.findall(r'\bmulpd\b', sse)) >= 2, name
+    assert len(re.findall(r'\baddsd\b', sse)) >= 4, name
+    assert not re.search(r'\b(?:addpd|pinsrd|pmulld)\b|%ymm', sse), name
+    if name == 'packed_poly':
+        assert 'pmuludq' in sse, 'SSE2 multiplication fallback disappeared'
 assert 'vpinsrd' in body(packed, 'scalar_shift'), 'variable-shift scalar-DAG fallback lost'
 PY
 

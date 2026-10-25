@@ -1,8 +1,18 @@
 # Red-team review: GNU as reference integrity
 
-This is an oracle-correctness repair, **not a generated-code speedup**. It does
-not change the Rust compiler or linker. All production changes are confined to
-the reference distiller/matcher and its derived snapshot.
+This report records the oracle-only stage, **not a generated-code speedup**.
+The later [SSE2 runtime follow-up](../sse2-strict-recip-2026-10-25/README.md)
+changes the Rust compiler; its measurements and numerical boundaries are
+reported separately. The historical measurements below are not attributed to
+that runtime change.
+
+The rebase onto the subsequently merged `0F 01 <ModRM>` distiller work retains
+its system-instruction rows. With both repairs the regenerated snapshot has
+2,195 names/3,975 forms, and all 1,638 encoder rows pass strict checking.
+Twenty-three GAS tests now pass, including the upstream ModR/M-group and
+coverage-triage and ALU-family regressions. The subsequent coverage-reporting work is retained;
+it changes no Rust compiler source or native measurement.
+The earlier counts below describe the original oracle-only experiment.
 
 ## Decisions on the upstream work
 

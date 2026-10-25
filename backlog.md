@@ -978,6 +978,21 @@ GCC; do not equate them with native cycles or the default-size native ratios.
 Full receipts, toolchain limits and review rationale:
 [`gas reference red-team audit`](engineering/evidence/gas-reference-redteam-2026-10-25/README.md).
 
+Runtime follow-up: the computed-reciprocal reduction now has a strict SSE2
+spelling, not just AVX2. The canonical default-size `spectral_norm` case falls
+from 200.22 to 158.23 ms: after/before paired ratio **0.7974 [0.7881,0.8100]**
+in31 randomized rounds (20.26% lower runtime). After/GCC is1.0087
+[1.0032,1.0237], still slightly behind; after/Clang is0.8080 [0.8011,0.8227].
+The nbody/F32/F64/I32 controls have byte-identical `.text` before/after: no
+speedup is attributed to them. Reduced-size baseline-SSE2 Callgrind reports
+24.92% fewer whole-program simulated instructions for spectral norm, and an
+unchanged nbody count. The FP unroll-budget, SSE-copy and register-streaming
+experiments did not outperform the selected lowering and are not shipped.
+This closes a demonstrated SSE2 legalization gap, **not MB-44 as a whole**;
+nbody remains an open priority. Full numerical/ISA boundaries, failure
+witnesses and receipts:
+[`SSE2 runtime follow-up`](engineering/evidence/sse2-strict-recip-2026-10-25/README.md).
+
 **The table above is the 2026-09-27 ranking and is kept only as the schema
 witness; it is not the live list.** Two of its rows are repaired and must not be
 re-quoted: `spectral_norm` was 1.13 by 2026-10-22 (the 27.7× figure was a

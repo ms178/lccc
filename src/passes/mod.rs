@@ -1508,8 +1508,9 @@ pub(crate) fn run_passes(
     // (see vectorize::set_x86_fma_enabled). AArch64 fmla is baseline ISA and
     // ignores this.
     vectorize::set_x86_fma_enabled(x86_isa.fma && target == crate::backend::Target::X86_64);
-    // PERF-41's strict computed-reciprocal prefix uses VPINSRD (SSE4.1) plus
-    // AVX2 packed conversion/division.  Do not infer this from generic x86
+    // The four-wide AVX2 strict reciprocal spelling uses VPINSRD (SSE4.1).
+    // SSE2 has a separate two-packet spelling under the x86-64 SIMD gate.
+    // Do not infer permission for the AVX2 spelling from generic x86
     // vectorization or from AVX alone; the pass must fail closed for a target
     // which does not permit both required ISA subsets. Raw driver request
     // bits are NOT permissions: `x86_isa` is the RESOLVED ceiling, which an

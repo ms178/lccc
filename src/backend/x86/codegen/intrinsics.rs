@@ -7878,6 +7878,11 @@ impl X86Codegen {
                 self.flush_pending_vec_store_impl();
                 self.state.invalidate_vec_peephole();
 
+                if !self.avx2_enabled {
+                    self.emit_strict_recip_sse2(dest.as_ref(), args, packed);
+                    return;
+                }
+
                 // Pack d0..d3 into the low four i32 lanes, convert the full
                 // XMM payload to four F64 lanes, and form 1.0 / denom.  All
                 // scratch is confined to xmm0/ymm0 and xmm1/ymm1; the scalar
@@ -11451,6 +11456,99 @@ impl X86Codegen {
         self.avx_store_dest(dest_ptr);
     }
 
+    /// Four exact reciprocal/products as two SSE2 packets. The private
+    /// 32-byte scratch holds denominators at 0..16; packet zero overwrites
+    /// 16..32, then packet one may overwrite the now-dead denominators.
+    /// No allocator-owned SIMD family is scratch, even with homes disabled.
+    fn emit_strict_recip_sse2(&mut self, dest: Option<&Value>, args: &[Operand], packed: bool) {
+        let base = if packed { 2 } else { 5 };
+        let scratch = &args[base + 2];
+        let scratch_mem = |this: &mut Self, offset: i64| -> String {
+            if let Operand::Value(v) = scratch {
+                if let Some(crate::backend::state::SlotAddr::Direct(slot)) =
+                    this.state.resolve_slot_addr(v.0)
+                {
+                    return this.slot_ref(slot.0 + offset);
+                }
+            }
+            this.operand_to_reg(scratch, "rax");
+            format!("{}(%rax)", offset)
+        };
+        let denominator_home = if packed {
+            match &args[1] {
+                Operand::Value(v) => self
+                    .vec_operand_reg(v)
+                    .filter(|r| r.starts_with("xmm") && *r != "xmm0" && *r != "xmm1"),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if packed && denominator_home.is_none() {
+            self.sse_load_arg(&args[1], "xmm0");
+            let mem = scratch_mem(self, 0);
+            self.state
+                .emit_fmt(format_args!("    movdqu %xmm0, {}", mem));
+        } else if !packed {
+            for (lane, denominator) in args[1..5].iter().enumerate() {
+                self.operand_to_eax(denominator);
+                // Address materialization may use rax: preserve the scalar
+                // denominator in reserved SIMD scratch first.
+                self.state.emit("    movd %eax, %xmm0");
+                let mem = scratch_mem(self, lane as i64 * 4);
+                self.state.emit_fmt(format_args!("    movd %xmm0, {}", mem));
+            }
+        }
+        let one = self.lane_const_rip_operand(1.0f64.to_bits(), 8, 16);
+        for packet in 0..2 {
+            if let Some(home) = denominator_home {
+                if packet == 0 {
+                    self.state
+                        .emit_fmt(format_args!("    cvtdq2pd %{}, %xmm0", home));
+                } else {
+                    self.state
+                        .emit_fmt(format_args!("    pshufd $0xee, %{}, %xmm0", home));
+                    self.state.emit("    cvtdq2pd %xmm0, %xmm0");
+                }
+            } else {
+                let denominator = scratch_mem(self, packet * 8);
+                self.state
+                    .emit_fmt(format_args!("    cvtdq2pd {}, %xmm0", denominator));
+            }
+            self.state
+                .emit_fmt(format_args!("    movupd {}, %xmm1", one));
+            self.state.emit("    divpd %xmm0, %xmm1");
+            let source = self.vec_mem_operand(&args[base], &args[base + 1], packet * 16);
+            // Legacy arithmetic m128 operands require alignment. The user
+            // source is only double-aligned: explicitly load it unaligned.
+            self.state
+                .emit_fmt(format_args!("    movupd {}, %xmm0", source));
+            self.state.emit("    mulpd %xmm0, %xmm1");
+            let product = scratch_mem(self, if packet == 0 { 16 } else { 0 });
+            self.state
+                .emit_fmt(format_args!("    movupd %xmm1, {}", product));
+        }
+        self.state.reg_cache.invalidate_acc();
+        let home = dest.and_then(|d| self.dest_xmm_home_name(d));
+        let accumulator = home.unwrap_or("xmm0");
+        self.emit_fp_operand_to_xmm(&args[0], IrType::F64, accumulator);
+        for offset in [16, 24, 0, 8] {
+            let product = scratch_mem(self, offset);
+            self.state
+                .emit_fmt(format_args!("    addsd {}, %{}", product, accumulator));
+        }
+        // sse_load_arg may have recorded the now-consumed denominator in
+        // scratch. Both scratch banks have since been overwritten.
+        self.state.vec_evict_bank_except("xmm0", u32::MAX);
+        self.state.vec_evict_bank_except("xmm1", u32::MAX);
+        self.state.invalidate_vec_peephole();
+        if home.is_none() {
+            if let Some(d) = dest {
+                self.store_xmm_to(d, "xmm0", IrType::F64);
+            }
+        }
+    }
+
     /// Look up GEP decomposition for a value: returns (base_id, offset_id) if the
     /// value was produced by a GEP(base, offset) instruction with a variable offset.
     fn find_gep_base_offset(&self, val_id: u32) -> Option<(u32, u32)> {
@@ -11809,5 +11907,70 @@ mod vector_address_contract_tests {
         cg.state.alloca_values.insert(0);
         cg.state.alloca_alignments.insert(0, 32);
         assert_eq!(cg.vec_direct_stack_operand(&base, 16), None);
+    }
+}
+
+#[cfg(test)]
+mod strict_recip_sse2_tests {
+    use super::*;
+
+    fn setup() -> X86Codegen {
+        let mut cg = X86Codegen::new();
+        cg.avx2_enabled = false;
+        cg.reg_assignments.insert(0, super::super::machinst::R12);
+        cg.reg_assignments.insert(1, super::super::machinst::R13);
+        cg.state.alloca_values.insert(9);
+        cg.state.value_locations.insert(9, StackSlot(-64));
+        cg
+    }
+
+    fn packed_args() -> Vec<Operand> {
+        [4, 2, 0, 1, 9]
+            .into_iter()
+            .map(|v| Operand::Value(Value(v)))
+            .collect()
+    }
+
+    #[test]
+    fn sse2_reciprocal_home_aliases_keep_both_denominator_halves_before_the_sum() {
+        for denominator in [20, 21, 32] {
+            for destination in [denominator, 22, 33] {
+                let mut cg = setup();
+                cg.reg_assignments.insert(2, PhysReg(denominator));
+                cg.reg_assignments.insert(3, PhysReg(destination));
+                cg.reg_assignments.insert(4, PhysReg(23));
+                cg.emit_strict_recip_sse2(Some(&Value(3)), &packed_args(), true);
+                let text = &cg.state.out.buf;
+                assert_eq!(text.matches("cvtdq2pd").count(), 2, "{text}");
+                assert_eq!(text.matches("    divpd").count(), 2, "{text}");
+                assert_eq!(text.matches("    mulpd").count(), 2, "{text}");
+                assert_eq!(text.matches("    addsd").count(), 4, "{text}");
+                assert!(text.find("pshufd $0xee").unwrap() < text.find("addsd").unwrap());
+                assert!(!text.contains("%ymm") && !text.contains("%rdx"), "{text}");
+                // Private scratch packet order is reversed, additions are not.
+                let adds: Vec<_> = text.lines().filter(|l| l.contains("addsd")).collect();
+                for (line, offset) in adds.iter().zip([-48, -40, -64, -56]) {
+                    assert!(line.contains(&cg.slot_ref(offset)), "{text}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sse2_reciprocal_scalar_denominators_use_only_reserved_scratch() {
+        let mut cg = setup();
+        cg.state.value_locations.insert(4, StackSlot(-8));
+        let mut args = vec![Operand::Value(Value(4))];
+        args.extend(
+            [0, -1, i32::MIN, i32::MAX]
+                .into_iter()
+                .map(|v| Operand::Const(IrConst::I32(v))),
+        );
+        args.extend([0, 1, 9].into_iter().map(|v| Operand::Value(Value(v))));
+        cg.emit_strict_recip_sse2(None, &args, false);
+        let text = &cg.state.out.buf;
+        assert_eq!(text.matches("movd %xmm0,").count(), 4, "{text}");
+        assert!(!text.contains("%rdx") && !text.contains("%ymm"), "{text}");
+        assert_eq!(text.matches("    addsd").count(), 4, "{text}");
     }
 }

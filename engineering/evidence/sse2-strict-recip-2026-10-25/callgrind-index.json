@@ -1,0 +1,73 @@
+{
+  "complete": true,
+  "metric": "bounded whole-program simulated Ir; not runtime",
+  "selected": [
+    "nbody",
+    "spectral_norm"
+  ],
+  "results": {
+    "nbody": {
+      "flags": "-std=gnu17 -O2 -march=x86-64 -fwrapv -Wl,--no-as-needed -lm -lm -DSTEPS=1000",
+      "metrics": {
+        "conditional_mispredicts": [
+          3575,
+          3575
+        ],
+        "d1_misses": [
+          1847,
+          1847
+        ],
+        "i1_misses": [
+          1395,
+          1395
+        ],
+        "indirect_mispredicts": [
+          202,
+          202
+        ],
+        "ir_mine": 816667,
+        "ir_ratio": 1.0,
+        "ir_ref": 816667,
+        "ll_misses": [
+          2872,
+          2872
+        ]
+      },
+      "manifest": "/home/user/audit/runtime-followup/callgrind/nbody/manifest.json"
+    },
+    "spectral_norm": {
+      "flags": "-std=gnu17 -O2 -march=x86-64 -fwrapv -Wl,--no-as-needed -lm -lm -DN=128",
+      "metrics": {
+        "conditional_mispredicts": [
+          8700,
+          8704
+        ],
+        "d1_misses": [
+          1866,
+          1866
+        ],
+        "i1_misses": [
+          1369,
+          1359
+        ],
+        "indirect_mispredicts": [
+          205,
+          205
+        ],
+        "ir_mine": 8019472,
+        "ir_ratio": 0.7507623267001018,
+        "ir_ref": 10681772,
+        "ll_misses": [
+          2840,
+          2830
+        ]
+      },
+      "manifest": "/home/user/audit/runtime-followup/callgrind/spectral_norm/manifest.json"
+    }
+  },
+  "failures": [],
+  "worst_first": [
+    "nbody",
+    "spectral_norm"
+  ]
+}
