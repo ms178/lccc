@@ -3246,12 +3246,16 @@ pub(crate) fn run_passes(
         // rerun that was already open.
         let late_mode = late_vectorize_entry(target, fp_reassoc, fp_contract, x86_avx);
         let symbol_facts = module_symbol_facts::ModuleSymbolFacts::from_module(module, pic);
-        // SCOPE: min/max reductions only. The unrestricted rerun also
-        // transforms the guarded-sum reduction in `zlib_ng_adler32`, which
-        // measured +1.05 % retired instructions (callgrind, whole program)
-        // for a denser but more spill- and prologue-heavy loop. Admitting
-        // only what the rerun exists for keeps the min/max win and leaves
-        // every other kernel byte-identical. See `set_late_minmax_only`.
+        // SCOPE: min/max reductions, plus the guarded I32→I64 widening
+        // sum (`if (a[i] > k) s += a[i]`) — the only reduction the early
+        // run can structurally never transform (its guard is a body
+        // branch before if_convert, and the Select form only exists
+        // after). The unrestricted rerun also transformed the unguarded
+        // s1/s2 class (measured +1.05 % retired instructions, callgrind
+        // whole program, on `zlib_ng_adler32`) for a denser but more
+        // spill- and prologue-heavy loop; admitting only the structurally
+        // forced shape above keeps every judgment-declined kernel
+        // byte-identical. See `set_late_minmax_only`.
         // RAII via block scope, not set/reset and not a bare named binding
         // with a hand-written `drop()`: a panic between the two calls used to
         // leave the restriction set for the rest of this worker thread's life,

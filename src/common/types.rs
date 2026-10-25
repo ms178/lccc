@@ -2733,6 +2733,36 @@ impl CType {
         }
     }
 
+    /// Whether this type is a 16-byte SIMD vector on i386: the GNU
+    /// `vector_size(16)` form with integer/FP lanes, or a Clang
+    /// `ext_vector_type` occupying exactly one 16-byte XMM piece. This is
+    /// the i386 psABI "16-byte class": an XMM carrier under SSE, and —
+    /// independent of the baseline — a 16-byte-aligned slot in the
+    /// variadic argument area and in `va_arg` (the GCC 4.6 va rule;
+    /// measured on GCC 16.2 and Clang 23.1.3, which agree on both the
+    /// caller padding and the va_arg realignment).
+    pub fn is_i386_16b_simd_vector(&self) -> bool {
+        if target_elf_machine() != 3 {
+            return false;
+        }
+        match self {
+            CType::Vector(elem, 16) => {
+                elem.is_integer() || matches!(**elem, CType::Float | CType::Double)
+            }
+            CType::ExtVector(elem, layout) => {
+                // One XMM can *hold* an 8-byte vector too, so
+                // `ext_vector_xmm_pieces() == Some(1)` alone is not the
+                // 16-byte class: require the type to actually occupy 16
+                // bytes (u8x8/u16x4/u32x2 stay the ordinary aggregate path).
+                self.size() == 16
+                    && !layout.bitpacked_bool
+                    && (elem.is_integer() || matches!(**elem, CType::Float | CType::Double))
+                    && self.ext_vector_xmm_pieces() == Some(1)
+            }
+            _ => false,
+        }
+    }
+
     /// GNU 16-byte vectors share the single-XMM i386 ext-vector carrier only
     /// when this invocation has SSE. Explicit `-mno-sse` (or an equivalent
     /// general-register restriction) retains the ordinary aggregate
@@ -2757,6 +2787,16 @@ impl CType {
             return None;
         };
         let n = layout.lanes;
+        // The XMM carrier exists only on a baseline that actually has SSE:
+        // Clang 23.1.3 `-m32 -mno-sse` passes a 16-byte ext vector as an
+        // ordinary 4-granular by-value aggregate (measured: no XMM in the
+        // callee at all). Returning `None` pre-SSE hands the argument to
+        // the aggregate path in every consumer (decompose, classify,
+        // prologue) — with the one deliberate exception, handled in the
+        // caller lowering, that a VARIADIC 16-byte class is still
+        // 16-byte aligned (GCC 4.6 va rule, `is_i386_16b_simd_vector`).
+        let sse = crate::common::x86_features::effective()
+            .contains(crate::common::x86_features::X86Feature::Sse);
         Some(if n == 1 {
             I386ExtVectorCarrier::Lanes
         } else if layout.bitpacked_bool && n > 64 {
@@ -2766,7 +2806,11 @@ impl CType {
         {
             I386ExtVectorCarrier::Image64
         } else if let Some(pieces) = self.ext_vector_xmm_pieces() {
-            I386ExtVectorCarrier::Xmm { pieces }
+            if sse {
+                I386ExtVectorCarrier::Xmm { pieces }
+            } else {
+                return None;
+            }
         } else {
             I386ExtVectorCarrier::Lanes
         })
@@ -2795,11 +2839,20 @@ impl CType {
         };
         let n = layout.lanes;
         let int_lanes = layout.bitpacked_bool || elem.is_integer();
+        // XMM return under SSE only — the same measured fork as
+        // `i386_ext_vector_arg`: pre-SSE 16-byte ext vectors return
+        // through the ordinary aggregate path (hidden pointer on i386;
+        // GCC 16.2 and Clang 23.1.3 both do so, measured).
+        let sse = crate::common::x86_features::effective()
+            .contains(crate::common::x86_features::X86Feature::Sse);
         Some(if n == 1 {
             I386ExtVectorCarrier::Scalar
         } else if layout.bitpacked_bool && n > 64 {
             I386ExtVectorCarrier::Unsupported
         } else if let Some(pieces) = self.ext_vector_xmm_pieces() {
+            if !sse {
+                return None;
+            }
             match pieces {
                 1 => I386ExtVectorCarrier::Xmm { pieces },
                 // %xmm0..%xmm3: no lccc carrier for a multi-register return.

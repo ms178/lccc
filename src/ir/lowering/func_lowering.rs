@@ -377,7 +377,25 @@ impl Lowerer {
                     // "ONE 16-byte %xmm" -- the same carrier _Float128 uses.
                     // A one-XMM aggregate is identified by its `[Sse, SseUp]`
                     // classes; the flag is reserved for `_Float128` values.
-                    is_f128_sse: false,
+                    //
+                    // Exception: a 16-byte SIMD vector parameter of a
+                    // VARIADIC i386 function (pre-SSE baseline or -mno-sse,
+                    // where the type has no XMM carrier and reaches this
+                    // by-value path). The GCC 4.6 va rule 16-byte-aligns the
+                    // 16-byte class inside the variadic argument area, and
+                    // GCC 16.2 -m32 places a named 16-byte SIMD vector
+                    // there: `v4u f(v4u a, ...)` puts a at call-esp+16
+                    // (after the hidden sret word), and `int f(v4u a, ...)`
+                    // puts a at call-esp+0 (16-aligned on every psABI
+                    // caller). The caller mirrors this through the variadic
+                    // decompose pieces (which carry this same marker), so
+                    // the named-param layout, the va_start overflow offset
+                    // derived from it, and the caller's piece placement all
+                    // agree. Non-variadic functions keep the 4-byte slot
+                    // granularity (measured GCC/Clang pre-SSE fixed args).
+                    is_f128_sse: func.variadic
+                        && crate::common::types::target_is_32bit()
+                        && param_ctype.is_i386_16b_simd_vector(),
                 });
                 param_kinds.push(ParamKind::Struct(ir_idx));
                 continue;

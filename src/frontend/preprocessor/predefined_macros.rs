@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use super::macro_defs::MacroDef;
+use super::macro_defs::{MacroDef, MacroTable};
 use super::pipeline::Preprocessor;
 
 /// LCCC_SYSROOT-aware candidate mapping for built-in include discovery.
@@ -686,53 +686,28 @@ impl Preprocessor {
     /// independently suppress only the SSE2 macros in an SSE-only i686 TU.
     ///
     /// Must be called after set_target() since it checks which arch is active.
-    pub fn set_sse_macros(&mut self, no_sse: bool, no_sse2: bool) {
-        if no_sse {
-            // The baseline macros are pre-defined in PREDEFINED_OBJECT_MACROS
-            // (most translation units never pass -mno-sse and the fast path
-            // avoids re-defining them here), so -mno-sse must actively UNDEFINE
-            // them — an early return left __SSE2__ visible and the kernel's
-            // NAP governor compiled its `#ifdef __SSE2__` vector-extension
-            // code in a translation unit built with FPU_KILL_FLAGS, i.e. SSE
-            // codegen was both requested-off and semantically unavailable
-            // (idle context, no kernel_fpu_begin()). GCC: -mno-sse undefines
-            // __SSE__/__SSE2__/__SSE_MATH__/__SSE2_MATH__ (verified with
-            // gcc -mno-sse -mno-sse2 -dM -E).
-            self.macros.undefine("__SSE__");
-            self.macros.undefine("__SSE2__");
-            self.macros.undefine("__SSE_MATH__");
-            self.macros.undefine("__SSE2_MATH__");
-            self.macros.undefine("__MMX_WITH_SSE__");
-            return;
-        }
-        // Only define SSE macros for x86 targets (x86_64 and i686).
-        // Check that we're on an x86 target by looking for __x86_64__ or __i386__.
+
+    /// Define/undefine the baseline SSE/MMX macros to the invocation's
+    /// resolved levels. The baseline macros are pre-defined in
+    /// PREDEFINED_OBJECT_MACROS (the x86 default state: SSE/SSE2/MMX all on),
+    /// so an OFF level must actively UNDEFINE its macro — the old
+    /// `-mno-sse` early return left `__SSE2__` visible and the kernel's NAP
+    /// governor compiled its `#ifdef __SSE2__` vector-extension code in a
+    /// translation unit built with FPU_KILL_FLAGS, i.e. SSE codegen was both
+    /// requested-off and semantically unavailable (idle context, no
+    /// kernel_fpu_begin()).
+    ///
+    /// The levels are independent (GCC 16.2 / Clang 23.1.3, measured):
+    /// i386 `-mno-sse2` keeps `__SSE__`; i386 `-march=i686` (and other
+    /// pre-SSE `-march=` spellings) drops `__SSE__`, `__SSE2__` AND `__MMX__`;
+    /// `-mno-sse` never touches `__MMX__` (MMX is independent of SSE).
+    /// `__MMX_WITH_SSE__` is x86-64-only (neither oracle defines it for
+    /// i386) and follows the SSE2 level, not the SSE1 level (GCC 16.2,
+    /// measured: `-m32 -mno-sse2` keeps `__SSE__` but drops it).
+    pub fn set_sse_macros(&mut self, sse_on: bool, sse2_on: bool, mmx_on: bool) {
         let is_x86_64 = self.macros.is_defined("__x86_64__");
-        let is_i386 = self.macros.is_defined("__i386__");
-        if !is_x86_64 && !is_i386 {
-            return;
-        }
 
-        // SSE and SSE2 are baseline for x86_64; retain the existing i686
-        // default while honoring an independent SSE2 denial.
-        self.define_simple_macro("__SSE__", "1");
-        self.define_simple_macro("__MMX__", "1");
-        if no_sse2 {
-            self.macros.undefine("__SSE2__");
-            self.macros.undefine("__SSE2_MATH__");
-        } else {
-            self.define_simple_macro("__SSE2__", "1");
-        }
-
-        if is_x86_64 {
-            // x86_64 uses SSE for floating-point math by default
-            self.define_simple_macro("__SSE_MATH__", "1");
-            if !no_sse2 {
-                self.define_simple_macro("__SSE2_MATH__", "1");
-            }
-            // GCC also defines this for x86_64
-            self.define_simple_macro("__MMX_WITH_SSE__", "1");
-        }
+        apply_sse_macro_levels(&mut self.macros, is_x86_64, sse_on, sse2_on, mmx_on);
     }
 
     /// Define extended SIMD feature macros (__SSE3__, __AVX__, __AVX2__, etc.)
@@ -1395,37 +1370,173 @@ impl Preprocessor {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Apply the granular SSE/SSE2/MMX macro state to a preprocessor macro
+/// table — the core of [`Preprocessor::set_sse_macros`], factored free so
+/// the oracle-verified matrix is testable without a full preprocessor.
+///
+/// Non-x86 targets (no `__x86_64__` and no `__i386__`) get none of the
+/// family at all. The four level macros plus the Clang-style `_MATH` pair
+/// follow their levels exactly (see `set_sse_macros` for the oracle
+/// provenance); `__MMX_WITH_SSE__` is granted only on x86-64, following
+/// the SSE2 level (GCC 16.2, measured).
+pub(crate) fn apply_sse_macro_levels(
+    macros: &mut MacroTable,
+    is_x86_64: bool,
+    sse_on: bool,
+    sse2_on: bool,
+    mmx_on: bool,
+) {
+    if !is_x86_64 && !macros.is_defined("__i386__") {
+        return;
+    }
 
+    let mut set = |name: &str, on: bool| {
+        if on {
+            macros.define(MacroDef {
+                name: name.to_string(),
+                is_function_like: false,
+                params: Vec::new(),
+                is_variadic: false,
+                has_named_variadic: false,
+                body: "1".to_string(),
+            });
+        } else {
+            macros.undefine(name);
+        }
+    };
+    set("__SSE__", sse_on);
+    set("__SSE2__", sse2_on);
+    set("__MMX__", mmx_on);
+    set("__SSE_MATH__", sse_on);
+    set("__SSE2_MATH__", sse2_on);
+    // GCC 16.2, measured: x86-64-only, and it tracks the SSE2 level, NOT
+    // the SSE1 level — `-mno-sse2` (SSE1 still granted) drops it, exactly
+    // like `__SSE2__`; i386 never gets it, even at the x86-64 baseline
+    // (`-m32` defines `__SSE2__` but not `__MMX_WITH_SSE__`).
+    if is_x86_64 {
+        set("__MMX_WITH_SSE__", mmx_on && sse2_on);
+    }
+}
+
+#[cfg(test)]
+mod sse_macro_tests {
+    use super::*;
+    use crate::frontend::preprocessor::macro_defs::{MacroDef, MacroTable};
+
+    fn i386_table() -> MacroTable {
+        let mut macros = MacroTable::new();
+        macros.define(MacroDef {
+            name: "__i386__".to_string(),
+            is_function_like: false,
+            params: Vec::new(),
+            is_variadic: false,
+            has_named_variadic: false,
+            body: "1".to_string(),
+        });
+        macros
+    }
+
+    /// `[__SSE__, __SSE2__, __MMX__, __SSE_MATH__, __SSE2_MATH__, __MMX_WITH_SSE__]`
+    fn defined_set(macros: &MacroTable) -> [bool; 6] {
+        [
+            macros.is_defined("__SSE__"),
+            macros.is_defined("__SSE2__"),
+            macros.is_defined("__MMX__"),
+            macros.is_defined("__SSE_MATH__"),
+            macros.is_defined("__SSE2_MATH__"),
+            macros.is_defined("__MMX_WITH_SSE__"),
+        ]
+    }
+
+    // Oracle-verified matrix (GCC 16.2 / Clang 23.1.3, i386 `-m32` family).
+    // The driver resolves [sse, sse2, mmx]; `set_sse_macros` must publish
+    // exactly the oracle macro set: the plain level macros AND the
+    // Clang-style `_MATH` pair follow the same levels (lccc follows Clang
+    // here — GCC 16.2 defines neither on i386, documented fork), and
+    // `__MMX_WITH_SSE__` is x86-64-only, so `set_sse_macros` (i386 path)
+    // never defines it.
+    #[test]
+    fn sse_macros_follow_granular_levels() {
+        for (sse, sse2, mmx) in [
+            (true, true, true),    // -m32 baseline (-march=x86-64 default)
+            (true, false, true),   // -m32 -mno-sse2
+            (false, false, true),  // -m32 -mno-sse
+            (false, false, false), // -m32 -march=i686 (and -mgeneral-regs-only)
+            (true, false, true),   // -m32 -march=i686 -msse: SSE revives, MMX with it
+            (true, true, false),   // -m32 -march=i686 -msse2: SSE+MMX revive with SSE2
+        ] {
+            let mut macros = i386_table();
+            apply_sse_macro_levels(&mut macros, false, sse, sse2, mmx);
+            let d = defined_set(&macros);
+            assert_eq!(
+                d,
+                [sse, sse2, mmx, sse, sse2, false],
+                "levels (sse={sse}, sse2={sse2}, mmx={mmx})"
+            );
+        }
+    }
+
+    // State tracking across changes: a state must clear what a prior state
+    // defined and redefine what it grants — no stale level may survive.
+    #[test]
+    fn sse_macros_track_state_changes() {
+        let mut macros = i386_table();
+        apply_sse_macro_levels(&mut macros, false, true, true, true); // baseline
+        apply_sse_macro_levels(&mut macros, false, false, false, false); // pre-SSE -march
+        assert!(!macros.is_defined("__SSE__"));
+        assert!(!macros.is_defined("__SSE2__"));
+        assert!(!macros.is_defined("__MMX__"));
+        assert!(!macros.is_defined("__SSE_MATH__"));
+        assert!(!macros.is_defined("__SSE2_MATH__"));
+        apply_sse_macro_levels(&mut macros, false, true, false, true); // -msse revival
+        assert!(macros.is_defined("__SSE__"));
+        assert!(macros.is_defined("__MMX__"));
+        assert!(macros.is_defined("__SSE_MATH__"));
+        assert!(!macros.is_defined("__SSE2__"));
+        assert!(!macros.is_defined("__SSE2_MATH__"));
+        // `__MMX_WITH_SSE__` is published by the x86-64 path, never here.
+        assert!(!macros.is_defined("__MMX_WITH_SSE__"));
+    }
+
+    // Driver-facing API: the same granular levels through the real
+    // preprocessor (target state included).
     #[test]
     fn sse_only_i686_preserves_sse_but_not_sse2_macros() {
         let mut pp = Preprocessor::new();
         pp.set_target("i686");
-        pp.set_sse_macros(false, true);
+        pp.set_sse_macros(true, false, true); // -m32 -mno-sse2
         assert!(pp.macros.is_defined("__SSE__"));
         assert!(!pp.macros.is_defined("__SSE2__"));
         assert!(!pp.macros.is_defined("__SSE2_MATH__"));
+        assert!(pp.macros.is_defined("__MMX__"));
 
-        pp.set_sse_macros(false, false);
+        pp.set_sse_macros(true, true, true); // -m32 baseline
         assert!(pp.macros.is_defined("__SSE__"));
         assert!(pp.macros.is_defined("__SSE2__"));
 
-        pp.set_sse_macros(true, true);
+        pp.set_sse_macros(false, false, true); // -m32 -mno-sse (MMX keeps)
         assert!(!pp.macros.is_defined("__SSE__"));
         assert!(!pp.macros.is_defined("__SSE2__"));
+        assert!(pp.macros.is_defined("__MMX__"));
     }
 
     #[test]
     fn sse2_denial_does_not_erase_independent_x86_64_sse_macros() {
         let mut pp = Preprocessor::new();
         pp.set_target("x86_64");
-        pp.set_sse_macros(false, true);
+        pp.set_sse_macros(true, false, true); // -mno-sse2 on x86-64
         assert!(pp.macros.is_defined("__SSE__"));
         assert!(pp.macros.is_defined("__SSE_MATH__"));
-        assert!(pp.macros.is_defined("__MMX_WITH_SSE__"));
+        assert!(pp.macros.is_defined("__MMX__"));
+        // GCC 16.2 (measured): `__MMX_WITH_SSE__` tracks the SSE2 level, so
+        // the explicit SSE2 denial drops it even though SSE1 is preserved.
+        assert!(!pp.macros.is_defined("__MMX_WITH_SSE__"));
         assert!(!pp.macros.is_defined("__SSE2__"));
         assert!(!pp.macros.is_defined("__SSE2_MATH__"));
+
+        pp.set_sse_macros(true, true, true); // baseline again
+        assert!(pp.macros.is_defined("__MMX_WITH_SSE__"));
+        pp.set_sse_macros(true, false, true); // denial again clears it
+        assert!(!pp.macros.is_defined("__MMX_WITH_SSE__"));
     }
 }

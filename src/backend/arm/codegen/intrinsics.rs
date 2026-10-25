@@ -1210,7 +1210,9 @@ impl ArmCodegen {
             | IntrinsicOp::VecStoreF64x4
             | IntrinsicOp::VecStoreI32x8
             | IntrinsicOp::VecWidenAddI32x4ToI64x2
-            | IntrinsicOp::VecWidenMaskedAddI32x4ToI64x2 => {
+            | IntrinsicOp::VecWidenMaskedAddI32x4ToI64x2
+            | IntrinsicOp::VecWidenAddValueI32x4ToI64x2
+            | IntrinsicOp::VecWidenMaskedAddValueI32x4ToI64x2 => {
                 // An x86-shaped 256-bit op reached the AArch64 emitter: the
                 // vectorizer's target gate is the invariant that prevents this,
                 // and `unimplemented!` used to turn that invariant into a

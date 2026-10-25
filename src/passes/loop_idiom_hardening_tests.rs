@@ -1,7 +1,7 @@
 // Direct IR contracts: these exercise the matcher independently of frontend
 // simplification, and verify CFG/SSA and debug-span invariants after rewriting.
-use crate::passes::module_symbol_facts::ModuleSymbolFacts;
 use super::*;
+use crate::passes::module_symbol_facts::ModuleSymbolFacts;
 
 fn rotated(narrow_condition: bool, compare: Option<IrCmpOp>) -> IrFunction {
     rotated_width(narrow_condition, compare, IrType::I8, IrType::I32)
@@ -171,7 +171,11 @@ fn normalized_rotated_predicates_rewrite_and_preserve_ssa_and_spans() {
         for cmp in [None, Some(IrCmpOp::Eq), Some(IrCmpOp::Ne)] {
             let mut f = rotated_width(true, cmp, narrow, wide);
             verify(&f);
-            assert_eq!(run_function(&mut f), 1, "{narrow:?} narrow predicate {cmp:?}");
+            assert_eq!(
+                run_function(&mut f),
+                1,
+                "{narrow:?} narrow predicate {cmp:?}"
+            );
             assert!(has_popcount(&f));
             verify(&f);
         }

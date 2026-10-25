@@ -117,15 +117,20 @@ refuse_le x86-64 "$CCC" gcc
 # `%fs:v@dtpoff(%rax)`).  lccc-ld must define it -- hidden, at the TLS block
 # start in a DSO and at its end (the TP) in an executable -- or the link fails
 # (executable) or the DSO dies at load time with an undefined dynamic symbol.
+# The gnu2 anchor only exists in objects built by a recent GCC (binutils
+# >= 2.41 convention), so these legs compile their objects with the pinned
+# GCC 16 oracle ($GCC or gcc-16 on PATH); the system gcc on an older distro
+# emits pre-anchor gnu2 and cannot prove what the leg claims to.
+orac=${GCC:-gcc-16}
 LEG_CFLAGS=-mtls-dialect=gnu2 NEED_SYM=_TLS_MODULE_BASE_ \
-    leg "x86-64 lccc-ld, GCC gnu2 objects (_TLS_MODULE_BASE_)" gcc gcc "-B$shim"
+    leg "x86-64 lccc-ld, GCC gnu2 objects (_TLS_MODULE_BASE_)" "$orac" gcc "-B$shim"
 
 if [ -x "$bin/lccc-i686" ] && echo 'int main(void){return 0;}' | gcc -m32 -x c - -o "$work/m32" 2>/dev/null; then
     leg "i686 bfd" "$bin/lccc-i686" "gcc -m32" ""
     refuse_le i686 "$bin/lccc-i686" "gcc -m32"
     MAIN=nopie leg "i686 lccc-ld (non-PIE: @INDNTPOFF)" "$bin/lccc-i686" "gcc -m32" "-B$shim"
     LEG_CFLAGS="-m32 -mtls-dialect=gnu2" NEED_SYM=_TLS_MODULE_BASE_ MAIN=nopie \
-        leg "i686 lccc-ld, GCC gnu2 objects (_TLS_MODULE_BASE_)" gcc "gcc -m32" "-B$shim"
+        leg "i686 lccc-ld, GCC gnu2 objects (_TLS_MODULE_BASE_)" "$orac" "gcc -m32" "-B$shim"
     if command -v ld.mold >/dev/null 2>&1; then leg "i686 mold" "$bin/lccc-i686" "gcc -m32" "-fuse-ld=mold"; else echo "SKIP [i686 mold]"; fi
 else
     echo "SKIP [i686: lccc-i686 or gcc -m32 unavailable]"

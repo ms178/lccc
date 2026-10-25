@@ -1120,6 +1120,25 @@ fn pic_crt_objects(objs: &[String], start: Option<&str>) -> Vec<String> {
 ///
 /// For shared library output (-shared), delegates to the per-arch `link_shared`
 /// entry point with gcc's `-shared` startup objects and default libraries.
+///
+/// PIE intent of a final link, as decided by the linker: the last of
+/// `-pie`/`-no-pie` in the user's linker arguments wins, defaulting to
+/// non-PIE.  Shared by the link setup (below) and the driver, which needs
+/// the same answer at codegen time to decide whether the translation unit
+/// will end up in a position-fixed ET_EXEC (fast jump tables) or a
+/// position-dependent ET_DYN (portable jump tables).
+pub fn linker_pie_effective(linker_args: &[String]) -> bool {
+    linker_args
+        .iter()
+        .rev()
+        .find_map(|a| match a.as_str() {
+            "-pie" | "--pie" | "--pic-executable" => Some(true),
+            "-no-pie" | "--no-pie" | "--no-pic-executable" => Some(false),
+            _ => None,
+        })
+        .unwrap_or(false)
+}
+
 #[cfg(not(feature = "gcc_linker"))]
 fn link_builtin_native(
     arch: &DirectLdArchConfig,
@@ -1204,15 +1223,7 @@ fn link_builtin_native(
     // `-pie` (the last of `-pie`/`-no-pie` wins, as for the linker) takes
     // gcc's PIE startfiles.  x86-64 only here: the i686 linker does not
     // produce PIEs yet, and other backends own their own policy.
-    let is_pie = user_args
-        .iter()
-        .rev()
-        .find_map(|a| match a.as_str() {
-            "-pie" | "--pie" | "--pic-executable" => Some(true),
-            "-no-pie" | "--no-pie" | "--no-pic-executable" => Some(false),
-            _ => None,
-        })
-        .unwrap_or(false);
+    let is_pie = linker_pie_effective(user_args);
     if arch.elf_machine == EM_X86_64 && is_pie && !is_static {
         setup.crt_before = pic_crt_objects(&setup.crt_before, Some("Scrt1.o"));
         setup.crt_after = pic_crt_objects(&setup.crt_after, None);

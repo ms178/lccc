@@ -386,6 +386,16 @@ pub fn run_regalloc_and_merge_clobbers_ipa(
                             | O::FmaF64x2Hoisted
                             | O::MulAddF64x2Hoisted
                             | O::MulAddF64x4HoistedSIB
+                            // SSE2 value-shaped 4-lane widening reductions:
+                            // the dual sign-unpack (psrad/punpck pair) stages
+                            // the low and high 64-bit halves through two
+                            // scratch registers on top of the raw vector, so
+                            // the third scratch is %xmm2 exactly like the
+                            // VecMulI32x4 SSE2 lowering. Always reachable
+                            // (SSE2-only op, no higher-ISA alternative), so
+                            // unconditional.
+                            | O::VecWidenAddValueI32x4ToI64x2
+                            | O::VecWidenMaskedAddValueI32x4ToI64x2
                     ) || (sse2_i32_mul_lowering && matches!(op, O::VecMulI32x4))
                 } else {
                     false

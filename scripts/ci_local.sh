@@ -213,6 +213,8 @@ gate "ipa-pta-live-range" fast \
 
 gate "default-isa-policy" fast \
     env CCC="$LCCC" bash tests/regression/check_default_isa_policy.sh
+gate "sse2-widening-4lane-sum" fast \
+    env CCC="$LCCC" bash tests/regression/check_sse2_widening_4lane_sum.sh
 gate "cas16-lowering" fast \
     env CCC="$LCCC" bash tests/regression/check_cas16_lowering.sh
 gate "target-attribute-isa" fast \

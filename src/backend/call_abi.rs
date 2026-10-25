@@ -1998,6 +1998,7 @@ mod tests {
     }
 
     #[test]
+
     fn scalar_f128_overflow_uses_the_value_stack_class_on_x86() {
         let f128 = || ArgInfo {
             struct_size: Some(16),

@@ -35,19 +35,4 @@ bisection and A/B measurement. It is invocation-owned in `RaConfig`, not read
 per function or per instruction. The runtime gate checks both switch states,
 both frame modes, both optimization levels and all four compiler pairings.
 
-## FP loop promotion
 
-`promote_loop_invariant_fp_load` may replace only a full `movq %rax, slot`
-preheader store and an unpinned `movsd slot, %xmm0` body load. Both participants
-must be unpinned. A byte/word/dword store preserves the other slot bytes; it
-cannot supply the eight-byte MOVSD value from `%rax`. This is distinct from
-the register-destination rule that a dword GP write zeroes the upper half.
-The slot-stability, single-entry and FP-liveness proofs remain mandatory.
-
-Its lazy label index retains the first matching label and admits only labels
-strictly preceding the jump, matching the old prefix scan even for malformed
-duplicate names. The pass rewrites only instructions, never label text,
-classification or positions, so those entries remain valid for its invocation.
-Tests pin that invariant, forward/missing/deleted labels and one construction
-across 256 jumps. Do not reuse this index in a pass that edits labels without
-explicit invalidation.

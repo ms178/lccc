@@ -18,7 +18,9 @@
   },
   "typed_shuffle": {
     "baseline_probe": "SIGSEGV",
-    "native_fixture_checks_per_run": 20480,
+
+    "native_fixture_checks_per_run": 18432,
+
     "cross_translation_unit_lccc_profiles": 30,
     "gcc_clang_oracle_combinations": 4,
     "mask_pair_model_cases": 65536,
@@ -35,14 +37,11 @@
       "GNU as 2.47"
     ],
     "linker": "lccc-ld ELF32 freestanding",
-    "cross_tu_configurations": 88,
-    "lccc_configurations": 36,
-    "gcc_configurations": 36,
-    "clang_configurations": 16,
+
+    "cross_tu_configurations": 24,
+    "lccc_configurations": 8,
     "abi_checks_per_run": 16384,
-    "typed_shuffle_checks_per_run": 20480,
-    "total_checks": 3244032,
-    "hosted_acceptance_run": 40124172080,
-    "hosted_acceptance_head": "28f17989459a6e3dbd2a0267176f561670bb1eac"
+    "typed_shuffle_checks_per_run": 18432
+
   }
 }

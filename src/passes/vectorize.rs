@@ -942,8 +942,27 @@ fn vectorize_with_analysis_mode(
                 }
                 continue;
             }
+            // The one non-min/max late admission: the guarded I32→I64
+            // widening sum (`if (a[i] > k) s += a[i]`). It is the ONLY
+            // reduction shape the early run can structurally never see in
+            // transformable form — before if_convert the guard is still a
+            // body branch (the internal-CondBranch legality check rejects
+            // it), and after if_convert the Select form exists but the
+            // early run has already finished. The late rerun's masked
+            // value-shaped composite (VecWidenMaskedAddValueI32x4ToI64x2
+            // on SSE2, VecWidenMaskedAddI32x4ToI64x2 on AVX2) handles
+            // exactly this shape. Kept out on purpose: unguarded sums
+            // (the adler32 s1/s2 class) and every other kind still fail
+            // closed here — the original unrestricted rerun measured
+            // +1.05 % retired instructions on zlib_ng_adler32 for
+            // re-admitting shapes the early pass declined on judgment,
+            // not on structure.
             if late_minmax_only()
                 && !matches!(red_pattern.kind, ReductionKind::Min | ReductionKind::Max)
+                && !(red_pattern.kind == ReductionKind::Sum
+                    && red_pattern.element_type == IrType::I32
+                    && red_pattern.accumulator_type == IrType::I64
+                    && red_pattern.guard_cond.is_some())
             {
                 if debug {
                     eprintln!(
@@ -4795,14 +4814,16 @@ fn analyze_reduction_pattern(
         // EXCEPTION (the widening form): `long s; if (a[i] > k) s += a[i]`
         // lowers the added value as `Cast(I32→I64)(load)` with the guard
         // comparing the I32 LOADED element — the accumulator's ADD type is
-        // I64 but the lanes are I32, and the masked WIDENING composite
-        // (`VecWidenMaskedAddI32x4ToI64x2`, the AVX2 transform's
-        // `widening_i64 && guard_cond.is_some()` arm) covers exactly that
-        // shape.  The exception is gated on the AVX2 transform actually
-        // being selected — the SSE2 path fail-closes on guarded patterns
-        // (it has no masked composite; the generic emitter would drop the
-        // guard), so at -mno-avx / CCC_FORCE_SSE2 the loop must stay
-        // scalar here rather than reach a transform that miscompiles it.
+        // I64 but the lanes are I32, and a masked WIDENING composite covers
+        // exactly that shape on either transform: the AVX2 path's
+        // `VecWidenMaskedAddI32x4ToI64x2` (vpmovsxdq, needs AVX2/SSE4.1) or
+        // the SSE2 path's `VecWidenMaskedAddValueI32x4ToI64x2` (pcmpgtd +
+        // pand + dual sign-unpack, pure SSE2). The exception is gated on at
+        // least one of those transforms being selectable for the target:
+        // `x86_avx2_available` OR the 128-bit SSE2 XMM file
+        // (`x86_simd_available`, non-NEON). On targets with neither
+        // (AArch64, -mno-sse x86) the loop must stay scalar here rather
+        // than reach a transform that would drop the guard.
         let guard_widening_i32 = matches!(
             added_inst,
             Instruction::Cast {
@@ -4811,8 +4832,7 @@ fn analyze_reduction_pattern(
                 ..
             }
         ) && element_type == IrType::I64
-            && x86_avx2_available()
-            && std::env::var("CCC_FORCE_SSE2").is_err();
+            && (x86_avx2_available() || (x86_simd_available() && !neon));
         if element_type != IrType::I32 && !guard_widening_i32 {
             set_reject("conditional-sum guard needs an I32 element type (masked equal-width form)");
             return None;
@@ -28327,17 +28347,26 @@ fn transform_reduction_sse2(
         return 0;
     }
 
-    // GUARDED REDUCTIONS FAIL CLOSED here: this 128-bit path has no masked
-    // composite (the AVX2 transform's `VecWidenMaskedAddI32x4ToI64x2` /
-    // masked equal-width arms are the only guarded forms), and the generic
-    // Sum emitter would silently DROP the guard — the loop would sum every
-    // element instead of the guarded subset. Measured at -mno-avx on the
-    // widen_i32_i64_sse2_reduction battery's int-accumulator spelling:
-    // `if (p[i] > 0) s += p[i]` printed the UNGUARDED total (pre-existing;
-    // the long-accumulator spelling joined it when the analyzer's widening
-    // exception opened, now gated on AVX2). NEON keeps its own audited
-    // paths.
-    if !neon && pattern.guard_cond.is_some() {
+    // GUARDED REDUCTIONS FAIL CLOSED here EXCEPT the guarded widening sum:
+    // the 128-bit register-based path now has a masked value-shaped
+    // composite (VecWidenMaskedAddValueI32x4ToI64x2, pcmpgtd + pand +
+    // dual sign-unpack — the SSE2 form of the AVX2 transform's
+    // `VecWidenMaskedAddI32x4ToI64x2`), selected in the width table below
+    // for the I32→I64 Sum arm. Every other guarded shape on this path
+    // (Max/DotProduct guards, the I32-equal-width guard) still has no
+    // masked composite, and the generic Sum emitter would silently DROP
+    // the guard — the loop would sum every element instead of the guarded
+    // subset. Measured at -mno-avx on the widen_i32_i64_sse2_reduction
+    // battery's int-accumulator spelling: `if (p[i] > 0) s += p[i]`
+    // printed the UNGUARDED total (pre-existing; the long-accumulator
+    // spelling joined it when the analyzer's widening exception opened).
+    // NEON keeps its own audited paths.
+    if !neon
+        && pattern.guard_cond.is_some()
+        && !(pattern.kind == ReductionKind::Sum
+            && pattern.element_type == IrType::I32
+            && pattern.accumulator_type == IrType::I64)
+    {
         if debug {
             eprintln!("[VEC-RED] SSE2 path cannot express a guarded reduction; staying scalar");
         }
@@ -28406,6 +28435,29 @@ fn transform_reduction_sse2(
                 None,
                 IntrinsicOp::VecHorizontalAddI64x2,
             ),
+            // x86 SSE2 4-lane i32→i64 SUM: load 4×I32, sign-extend into
+            // two I64 halves, paddq both into the accumulator — the
+            // `long s += a[i]` loop at GCC's 16-byte/iteration width on
+            // the SSE2 baseline. The memory-shaped composite
+            // (VecWidenAddI32x4ToI64x2) needs vpmovsxdq (SSE4.1), so this
+            // arm uses the VALUE-shaped composite built by the Sum
+            // emitter from VecLoadI32x4 (psrad/punpck dual unpack +
+            // paddq×2; guarded sums take the masked sibling). Sum only:
+            // Max/Min/DotProduct keep the 2-lane arm below (no SSE2
+            // 4-lane form exists for them).
+            IrType::I32
+                if pattern.accumulator_type == IrType::I64
+                    && pattern.kind == ReductionKind::Sum
+                    && !neon =>
+            {
+                (
+                    4u64,
+                    IntrinsicOp::VecLoadI32x4,
+                    IntrinsicOp::VecWidenAddValueI32x4ToI64x2,
+                    None,
+                    IntrinsicOp::VecHorizontalAddI64x2,
+                )
+            }
             IrType::I32 if pattern.accumulator_type == IrType::I64 => (
                 2u64,
                 IntrinsicOp::VecLoadWidenI32ToI64x2,
@@ -28923,9 +28975,24 @@ fn transform_reduction_sse2(
                         IntrinsicOp::VecZeroI64x2,
                     ),
                     // NEON 4-wide i32→i64 sum: load 4×I32, accumulate pairs (sadalp).
-                    IntrinsicOp::VecLoadI32x4 => (
+                    IntrinsicOp::VecLoadI32x4 if neon => (
                         IntrinsicOp::VecLoadI32x4,
                         IntrinsicOp::VecSadalpI32x4,
+                        IntrinsicOp::VecZeroI64x2,
+                    ),
+                    // x86 SSE2 4-lane i32→i64 sum: the (acc, vec) value-
+                    // shaped composite folds the dual sign-unpack + paddq×2
+                    // into one op. Guarded sums take the masked sibling
+                    // (pcmpgtd + pand before the unpack) — the analyzer
+                    // validated the guard as `loaded_lane > guard_rhs`
+                    // (signed), which is exactly pcmpgtd(rhs, lane).
+                    IntrinsicOp::VecLoadI32x4 => (
+                        IntrinsicOp::VecLoadI32x4,
+                        if pattern.guard_cond.is_some() {
+                            IntrinsicOp::VecWidenMaskedAddValueI32x4ToI64x2
+                        } else {
+                            IntrinsicOp::VecWidenAddValueI32x4ToI64x2
+                        },
                         IntrinsicOp::VecZeroI64x2,
                     ),
                     _ => panic!("Unsupported SSE2 load intrinsic: {:?}", load_intrinsic),
@@ -28991,14 +29058,25 @@ fn transform_reduction_sse2(
                 };
 
                 // Create vector add (accumulate) - reads from PHI, produces new value
+                // (the masked value-shaped widening sibling carries the
+                // validated guard rhs as a third argument)
+                let mut add_args = vec![
+                    Operand::Value(pattern.accumulator_phi),
+                    Operand::Value(vec_load),
+                ];
+                if vec_add_op == IntrinsicOp::VecWidenMaskedAddValueI32x4ToI64x2 {
+                    add_args.push(
+                        pattern
+                            .guard_rhs
+                            .clone()
+                            .unwrap_or(Operand::Const(IrConst::I32(0))),
+                    );
+                }
                 let add_inst = Instruction::Intrinsic {
                     dest: Some(vec_sum_value),
                     op: vec_add_op,
                     dest_ptr: None,
-                    args: vec![
-                        Operand::Value(pattern.accumulator_phi),
-                        Operand::Value(vec_load),
-                    ],
+                    args: add_args,
                 };
 
                 // Insert instructions and remove old scalar add

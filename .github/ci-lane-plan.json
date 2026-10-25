@@ -312,13 +312,17 @@
     "backend-contracts-b": {
       "group": "backend-contracts",
       "mode": "shell",
-      "predicted_gate_seconds": 419.938,
+      "predicted_gate_seconds": 421.488,
       "shards": 2,
       "step": "Verify remaining fast local contracts (shard b of 2)",
       "steps": [
         {
           "measured_s": 0.25,
           "name": "bash tests/regression/check_i686_atomics.sh"
+        },
+        {
+          "measured_s": 1.55,
+          "name": "env LCCC_TEST_ASSEMBLER=\"$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as\" bash tests/regression/check_i686_gnu_vector_abi.sh"
         },
         {
           "measured_s": 0.25,
@@ -1165,7 +1169,7 @@
     "frontend-b": {
       "group": "frontend",
       "mode": "steps",
-      "predicted_gate_seconds": 344.82,
+      "predicted_gate_seconds": 345.07,
       "shards": 2,
       "steps": [
         {
@@ -1215,6 +1219,10 @@
         {
           "measured_s": 0.25,
           "name": "Check default ISA policy (x86-64 default emits no post-baseline instruction)"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Check SSE2 4-lane widening sums (plain + masked) and AVX2 composite"
         },
         {
           "measured_s": 1.0,

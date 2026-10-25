@@ -245,12 +245,32 @@ pub struct Driver {
     pub(super) enable_prfchw: bool,
     /// Sticky `-mno-prfchw` (GCC: wins over a later PRFCHW `-march=`).
     pub(super) prfchw_explicitly_disabled: bool,
-    /// Explicit SSE/SSE2 grant, used as a positive i686 prefetch grant.
-    /// This is deliberately narrower than the backend's SSE2 ABI baseline:
-    /// default i686 code generation does not by itself promise prefetch-
-    /// capable silicon. Every higher SSE/AVX grant is visible through its
-    /// own `enable_*` bit.
+
+    /// Explicit `-msse` (and, as its weaker spelling, `-msse2`). On x86-64
+    /// SSE is baseline and only `no_sse` matters; on i686 the default
+    /// baseline is the x86-64 ISA level (SSE/SSE2 on — GCC 16.2's default
+    /// `-m32` resolves to `-march=x86-64`, measured), so this positive grant
+    /// only matters after an explicit pre-SSE `-march=` or `-mno-sse2`
+    /// denial. Every higher SSE/AVX grant is visible through its own
+    /// `enable_*` bit.
     pub(super) enable_sse: bool,
+    /// Explicit `-msse2` only (the SSE2 level, above `-msse`). i686 resolves
+    /// its SSE2 baseline through this bit, the SSE-family `enable_*` bits
+    /// (SSE3 and up all imply SSE2), and the default-baseline grant — see
+    /// [`Self::resolved_i686_sse2`]. x86-64 codegen treats SSE2 as an
+    /// inescapable baseline, so there this bit feeds nothing: a `-mno-sse2`
+    /// denial is normalized to the full `-mno-sse` state at the end of parse
+    /// instead.
+    pub(super) enable_sse2: bool,
+    /// The final accepted `-march=` for an i686 invocation names a pre-SSE
+    /// micro-architecture (`i386`/`i486`/`i586`/`i686`/`pentium`/
+    /// `pentiumpro`/`pentium-mmx`), which vetoes the default x86-64-baseline
+    /// SSE/SSE2/MMX grant (GCC 16.2 `-m32 -march=i686` measures
+    /// `-msse`/`-msse2` [disabled] and no `__MMX__`). Set by the `-march=`
+    /// handler per accepted spelling (last `-march=` wins, like the arch
+    /// profile it selects); explicit `-msse`/`-msse2` still override the
+    /// veto at resolve time.
+    pub(super) march_pre_sse: bool,
     /// Set by `-mno-movbe`: MOVBE forbidden.
     pub(super) movbe_explicitly_disabled: bool,
     /// Set by `-mno-cx16`: CMPXCHG16B forbidden.
@@ -602,6 +622,8 @@ impl Driver {
             enable_prfchw: false,
             prfchw_explicitly_disabled: false,
             enable_sse: false,
+            enable_sse2: false,
+            march_pre_sse: false,
             movbe_explicitly_disabled: false,
             cx16_explicitly_disabled: false,
             x86_explicit_isa_args: Vec::new(),
@@ -1657,9 +1679,49 @@ impl Driver {
         preprocessor.set_pie(self.pie && !self.pic && !self.shared_lib);
         // Set SSE/SSE2/MMX predefined macros for x86 targets.
         // GCC/Clang always define __SSE__, __SSE2__, __MMX__ for x86_64 (baseline ISA).
-        // Our i686 backend also uses SSE2, so we define them for i686 as well.
-        // Projects like stb_image, minimp3, dr_libs use #ifdef __SSE2__ to enable SIMD paths.
-        preprocessor.set_sse_macros(self.no_sse, self.no_sse2);
+
+        // i686's default baseline is the same ISA level (GCC 16.2 default
+        // `-m32` = `-march=x86-64`, measured), so the baseline defines them
+        // there too; an explicit pre-SSE `-march=` drops SSE/SSE2 AND __MMX__
+        // (measured on GCC 16.2 / Clang 23.1.3: `-m32 -march=i686` defines
+        // none of the three — but `-m32 -march=i686 -msse` revives ALL of
+        // them, so MMX follows `!march_pre_sse || sse_on`, not the arch
+        // alone), while `-mno-sse2` drops only the SSE2 pair and `-mno-sse`
+        // drops SSE (MMX stays — measured on both oracles).
+        // Projects like stb_image, minimp3, dr_libs use #ifdef __SSE2__ to
+        // enable SIMD paths.
+        let (sse_on, sse2_on, mmx_on) = if self.target == Target::I686 {
+            let sse = self.resolved_i686_sse();
+            (
+                sse,
+                self.resolved_i686_sse2(),
+                // MMX follows the arch unless a full register-file denial is
+                // active: `-m32 -mgeneral-regs-only` defines none of
+                // __SSE__/__SSE2__/__MMX__ (measured), unlike `-mno-sse`,
+                // which keeps __MMX__ (both oracles). x86-64 keeps __MMX__
+                // under `-mgeneral-regs-only` — the i386 asymmetry is
+                // GCC's own (measured on 16.2).
+                (!self.march_pre_sse || sse) && !self.general_regs_only,
+            )
+        } else {
+            // x86-64: the SSE pair and MMX ride the x86-64 baseline, and the
+            // order-sensitive raw denial bits already carry the exact GCC
+            // 16.2 matrix (measured on 16.2.0): `-mno-sse2` drops ONLY
+            // __SSE2__ (and __SSE2_MATH__); `__SSE__` and `__MMX__` stay.
+            // `-mno-sse` drops the SSE pair but keeps `__MMX__` (MMX is
+            // independent of the vector level). A later `-msse` re-opens the
+            // SSE level: its handler clears `no_sse2` only when no EXPLICIT
+            // SSE2 denial is pending, so `-mno-sse -msse` restores baseline
+            // SSE2 while `-mno-sse2 -msse` must not. `-mgeneral-regs-only`
+            // drops all three, including `__MMX__`.
+            (
+                self.target == Target::X86_64 && !self.no_sse,
+                self.target == Target::X86_64 && !self.no_sse2,
+                self.target == Target::X86_64 && !self.general_regs_only,
+            )
+        };
+        preprocessor.set_sse_macros(sse_on, sse2_on, mmx_on);
+
         // Define extended feature macros (__SSE3__, __AVX__, __BMI__, ...).
         // The SIMD half is gated on the xmm file being open and its SSE2
         // prerequisite not being denied. A later `-march=` cannot make a
@@ -2966,6 +3028,16 @@ impl Driver {
             pic: self.pic || self.shared_lib,
             shared_lib: self.shared_lib,
             pie: self.pie && !self.pic && !self.shared_lib,
+            // Only a FULL invocation that final-links in position-fixed
+            // ET_EXEC may emit the absolute switch-table form (its jump
+            // instruction's R_X86_64_32S is unresolvable in ET_DYN). The
+            // PIE decision must match the linker's exactly — same
+            // last-`-pie`/`-no-pie`-wins scan over the same argument list
+            // the link receives — so the codegen and link never disagree.
+            fixed_exec_link: matches!(self.mode, CompileMode::Full)
+                && !self.shared_lib
+                && !self.relocatable
+                && !crate::backend::common::linker_pie_effective(&self.build_linker_args()),
             tls_model_floor: self.tls_model_floor,
             function_return_thunk: self.function_return_thunk,
             indirect_branch_thunk: self.indirect_branch_thunk,
@@ -3269,6 +3341,55 @@ impl Driver {
             && !self.prfchw_explicitly_disabled
     }
 
+    /// Whether this i686 invocation enables the SSE register file.
+    ///
+    /// The i386 DEFAULT baseline is the x86-64 ISA level (SSE/SSE2 on):
+    /// GCC 16.2's default `-m32` resolves to `-march=x86-64` with
+    /// `-msse`/`-msse2` [enabled] (measured; Clang 23.1.3's default `-m32`
+    /// agrees — 16-byte vectors take `%xmm0` in both), and lccc's i386
+    /// preprocessor defines `__SSE__`/`__SSE2__` on the baseline too. The
+    /// grant is vetoed only by an explicit pre-SSE `-march=` (i386/i486/
+    /// i586/i686/pentium/pentiumpro/pentium-mmx) or the sticky `-mno-sse`;
+    /// an explicit `-msse` (or any higher family grant) overrides the
+    /// `-march=` veto, in either flag order (the replay machinery settles
+    /// the order). The separate `general_regs_only` permission veto is
+    /// applied by consumers such as `effective_x86_features`; prefetch has
+    /// its own established `-mno-sse` policy below.
+    pub(crate) fn resolved_i686_sse(&self) -> bool {
+        self.target == Target::I686
+            && !self.no_sse
+            && (self.enable_sse
+                || self.enable_sse3
+                || self.enable_ssse3
+                || self.enable_sse4_1
+                || self.enable_sse4_2
+                || self.enable_avx
+                || self.enable_avx2
+                || self.enable_avx512f
+                || !self.march_pre_sse)
+    }
+
+    /// Whether this i686 invocation enables the SSE2 level (above the SSE
+    /// level of [`Self::resolved_i686_sse`]). The baseline and vetoes are
+    /// identical; additionally the sticky `-mno-sse2` denies only this
+    /// level — GCC 16.2 measures `-m32 -mno-sse2` as `-msse` [enabled] /
+    /// `-msse2` [disabled] — and every SSE3-and-up grant implies it (as
+    /// does AVX), exactly like the explicit `-msse2` bit.
+    pub(crate) fn resolved_i686_sse2(&self) -> bool {
+        self.target == Target::I686
+            && !self.no_sse
+            && !self.sse2_explicitly_disabled
+            && (self.enable_sse2
+                || self.enable_sse3
+                || self.enable_ssse3
+                || self.enable_sse4_1
+                || self.enable_sse4_2
+                || self.enable_avx
+                || self.enable_avx2
+                || self.enable_avx512f
+                || !self.march_pre_sse)
+    }
+
     /// Whether the SSE prefetch family (`prefetchnta/t0/t1/t2`, `0F 18
     /// /0-3`) may be emitted — GCC's `ix86_prefetch_sse`:
     ///
@@ -3283,18 +3404,7 @@ impl Driver {
     pub(crate) fn resolved_prefetch_sse(&self) -> bool {
         match self.target {
             Target::X86_64 => true,
-            Target::I686 => {
-                let sse = !self.no_sse
-                    && (self.enable_sse
-                        || self.enable_sse3
-                        || self.enable_ssse3
-                        || self.enable_sse4_1
-                        || self.enable_sse4_2
-                        || self.enable_avx
-                        || self.enable_avx2
-                        || self.enable_avx512f);
-                sse || self.resolved_prfchw()
-            }
+            Target::I686 => self.resolved_i686_sse() || self.resolved_prfchw(),
             _ => false,
         }
     }
@@ -3372,11 +3482,32 @@ impl Driver {
         set.insert_if(x86_64, F::Cmov);
         set.insert_if(x86_64, F::Fxsr);
         set.insert_if(x86_64 && simd, F::Mmx);
-        // SSE/SSE2 are the x86-64 architectural baseline and the existing
-        // i686 backend baseline. Publish both for ABI classification and
-        // intrinsic gating; an independent SSE2 denial retains SSE-only i686.
-        set.insert_if(simd, F::Sse);
-        set.insert_if(simd && !self.no_sse2, F::Sse2);
+
+        // SSE/SSE2 are part of the x86-64 architectural baseline (v1 already
+        // has them). i686's default baseline is the same ISA level (GCC 16.2
+        // default `-m32` = `-march=x86-64`, measured) — publish its resolved
+        // SSE/SSE2 grants so ABI classification (the 16-byte XMM vector
+        // carrier, `__SSE__`/`__SSE2__` and friends) tracks the codegen:
+        // only an explicit pre-SSE `-march=` / `-mno-sse` / `-mno-sse2`
+        // drops to the pre-SSE stack/sret convention.
+        //
+        // The SSE2 bit rides the order-sensitive `no_sse2` denial, NOT the
+        // SSE1 level (mirrors `x86_isa()`, whose NONE arm covers
+        // `no_sse || no_sse2 || general_regs_only`): an explicit `-mno-sse2`
+        // keeps `F::Sse` (scalar SSE1 and the typed SSE1 F32 maps stay
+        // legal) while dropping `F::Sse2`, and a later `-msse` must not
+        // reopen it — the `-msse` handler clears `no_sse2` only when no
+        // explicit SSE2 denial is pending. Publishing Sse2 under an SSE1-only
+        // target let the `__builtin_shufflevector` i32x4 lowering take the
+        // `pshufd` path and emit an illegal instruction (or hit the
+        // fail-closed SSE2 scan as a hard error); with the bit dropped the
+        // lowering keeps its portable scalar gather, exactly what GCC 16.2
+        // does for `-mno-sse2 -msse` (measured: scalar oracle, no shuffles).
+        set.insert_if(simd && (x86_64 || self.resolved_i686_sse()), F::Sse);
+        set.insert_if(
+            simd && !self.no_sse2 && (x86_64 || self.resolved_i686_sse2()),
+            F::Sse2,
+        );
 
         // The SSE3..SSE4.2 ladder.  `x86_isa()` carries only the 128-bit
         // SSE4.1 class, so SSE3/SSSE3/SSE4.2 have no codegen bit of their

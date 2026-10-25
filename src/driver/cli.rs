@@ -217,7 +217,12 @@ impl Driver {
     fn reset_x86_arch_implied_isa(&mut self) {
         // `enable_sse` is set only by explicit SSE/SSE2-granting flags,
         // which are replayed after the profile like every other explicit
-        // decision; `enable_prfchw` is arch-implied or explicit.
+        // decision; `enable_prfchw` is arch-implied or explicit. The sticky
+        // denials (`no_sse`, `sse_explicitly_disabled`, `sse2_explicitly_disabled`,
+        // `no_sse2`) and `march_pre_sse` are NOT reset here: the denials
+        // survive every `-march=` (GCC keeps them in either flag order), and
+        // `march_pre_sse` is re-set by the `-march=` handler that this reset
+        // serves.
         self.enable_sse = false;
         self.enable_prfchw = false;
         self.enable_sse3 = false;
@@ -636,6 +641,7 @@ impl Driver {
                 // resolution preserves x86-64's existing no-SSE2 path.
                 let all_sse = arg == "-mno-sse";
                 self.no_sse2 = true;
+                self.enable_sse2 = false;
                 if all_sse {
                     self.no_sse = true;
                     self.sse_explicitly_disabled = true;
@@ -685,6 +691,7 @@ impl Driver {
         self.avx_explicitly_disabled = true;
         self.fma_explicitly_disabled = true;
         self.sse41_explicitly_disabled = true;
+        self.enable_sse2 = false;
         self.enable_sse3 = false;
         self.enable_ssse3 = false;
         self.enable_sse4_1 = false;
@@ -702,6 +709,10 @@ impl Driver {
         self.sse_explicitly_disabled = false;
         self.sse2_explicitly_disabled = false;
         self.general_regs_only = false;
+        // Every SSE2-class grant lights the SSE2 level signal so the
+        // resolved i686 levels keep it even over a sticky pre-SSE `-march=`
+        // veto (GCC 16.2: `-m32 -march=i686 -msse2` keeps `__SSE2__`).
+        self.enable_sse2 = true;
     }
 
     fn enable_x86_avx_profile(&mut self) {
@@ -1939,172 +1950,192 @@ impl Driver {
                     }
                     match self.target {
                         Target::Riscv64 => self.riscv_march = Some(march.to_string()),
-                        Target::X86_64 | Target::I686 => match march {
-                            "x86-64" | "x86-64-v1" | "generic" => {}
-                            // Legacy 32-bit baselines (kernel REALMODE_CFLAGS
-                            // pass `-march=i386 -m16`). The i686 backend's
-                            // baseline output uses no instruction newer than
-                            // the 486 except CMOV in explicit-asm paths; the
-                            // kernel pairs this with -mno-sse/-mno-80387 which
-                            // are honored independently. Real-mode setup code
-                            // executes on the boot CPU — a physical x86-64
-                            // machine — so the i686 baseline is sound there.
-                            "i386" | "i486" | "i586" | "i686" | "pentium" | "pentiumpro"
-                            | "pentium-mmx" => {
-                                if self.target != Target::I686 {
+                        Target::X86_64 | Target::I686 => {
+                            // The baseline SSE/SSE2/MMX grant follows the
+                            // FINAL `-march=` (last wins, like the profile):
+                            // every accepted spelling resets the pre-SSE veto,
+                            // and the legacy 32-bit baselines re-set it.
+                            self.march_pre_sse = false;
+                            match march {
+                                "x86-64" | "x86-64-v1" | "generic" => {}
+                                // Legacy 32-bit baselines (kernel REALMODE_CFLAGS
+                                // pass `-march=i386 -m16`). The i686 backend's
+                                // baseline output uses no instruction newer than
+                                // the 486 except CMOV in explicit-asm paths; the
+                                // kernel pairs this with -mno-sse/-mno-80387 which
+                                // are honored independently. Real-mode setup code
+                                // executes on the boot CPU — a physical x86-64
+                                // machine — so the i686 baseline is sound there.
+                                "i386" | "i486" | "i586" | "i686" | "pentium" | "pentiumpro"
+                                | "pentium-mmx" => {
+                                    if self.target != Target::I686 {
+                                        return Err(format!(
+                                            "-march={} is only valid with -m32/-m16 (i686 target)",
+                                            march
+                                        ));
+                                    }
+                                    // Pre-SSE baseline: vetoes the default
+                                    // x86-64-baseline SSE/SSE2/MMX grant on i686
+                                    // (GCC 16.2 `-m32 -march=i686` measures
+                                    // `-msse`/`-msse2` [disabled], no `__MMX__`);
+                                    // explicit `-msse`/`-msse2` still override at
+                                    // resolve time, and MMX follows the arch (the
+                                    // kernel's `-march=i386 -m16` real-mode code
+                                    // gets neither, as measured).
+                                    self.march_pre_sse = true;
+                                }
+                                "nehalem" => self.enable_x86_nehalem_profile(),
+                                "westmere" => self.enable_x86_westmere_profile(),
+                                "sandybridge" => self.enable_x86_sandybridge_profile(),
+                                "ivybridge" => self.enable_x86_ivybridge_profile(),
+                                "silvermont" => self.enable_x86_silvermont_profile(),
+                                "goldmont" => self.enable_x86_goldmont_profile(),
+                                "x86-64-v2" => {
+                                    self.enable_x86_nehalem_profile();
+                                }
+                                "x86-64-v3" => self.enable_x86_v3_profile(),
+                                "haswell" | "broadwell" | "skylake" | "znver1" | "znver2" => {
+                                    self.enable_x86_haswell_profile()
+                                }
+                                "znver3" => self.enable_x86_znver3_profile(),
+                                "znver4" => self.enable_x86_znver4_profile(),
+                                "znver5" => self.enable_x86_znver5_profile(),
+                                // Alder Lake ISA (the E-core's capability set: AVX2,
+                                // AVX-VNNI, GFNI, VAES, VPCLMULQDQ, no AVX-512):
+                                // shared by Raptor Lake, Meteor Lake, Alder Lake-N
+                                // and the Gracemont-only spelling.  The *tuning* row
+                                // still differs (cpu_model::resolve maps gracemont /
+                                // alderlake-n to the E-core row, meteorlake to the
+                                // Raptor Lake class).
+                                "alderlake" | "raptorlake" | "raptor-lake" | "meteorlake"
+                                | "gracemont" | "alderlake-n" => {
+                                    self.enable_x86_alderlake_profile()
+                                }
+                                // Sierra Forest / Grand Ridge (Crestmont E-core): Alder
+                                // Lake ISA + AVX-IFMA, AVX-NE-CONVERT, AVX-VNNI-INT8,
+                                // CMPCCXADD — the same additions Arrow Lake carries
+                                // (GCC `PTA_SIERRAFOREST`, LLVM `SRFFeatures`).
+                                "arrowlake" | "sierraforest" | "grandridge" => {
+                                    self.enable_x86_arrowlake_profile()
+                                }
+                                // Clearwater Forest (Darkmont) adds AVX-VNNI-INT16
+                                // like Arrow Lake-S / Lunar Lake.
+                                "arrowlake-s" | "lunarlake" | "wildcatlake"
+                                | "clearwaterforest" => {
+                                    self.enable_x86_arrowlake_profile();
+                                    self.enable_avxvnniint16 = true;
+                                }
+                                "x86-64-v4" => self.enable_x86_avx512_profile(),
+                                "skylake-avx512" => self.enable_x86_avx512_cpu_profile(),
+                                "cascadelake" => self.enable_x86_cascadelake_profile(),
+                                "cooperlake" => self.enable_x86_cooperlake_profile(),
+                                "icelake-client" | "icelake-server" | "tigerlake"
+                                | "rocketlake" => self.enable_x86_icelake_profile(),
+                                "sapphirerapids" | "graniterapids" | "graniterapids-d" => {
+                                    self.enable_x86_sapphirerapids_profile()
+                                }
+                                "knl" => self.enable_x86_knl_profile(),
+                                "knm" => {
+                                    self.enable_x86_knl_profile();
+                                    self.enable_avx512vpopcntdq = true;
+                                }
+                                "novalake" | "diamondrapids" => {
                                     return Err(format!(
-                                        "-march={} is only valid with -m32/-m16 (i686 target)",
+                                        "-march={} requires unimplemented AVX10/APX lowering",
                                         march
                                     ));
                                 }
-                            }
-                            "nehalem" => self.enable_x86_nehalem_profile(),
-                            "westmere" => self.enable_x86_westmere_profile(),
-                            "sandybridge" => self.enable_x86_sandybridge_profile(),
-                            "ivybridge" => self.enable_x86_ivybridge_profile(),
-                            "silvermont" => self.enable_x86_silvermont_profile(),
-                            "goldmont" => self.enable_x86_goldmont_profile(),
-                            "x86-64-v2" => {
-                                self.enable_x86_nehalem_profile();
-                            }
-                            "x86-64-v3" => self.enable_x86_v3_profile(),
-                            "haswell" | "broadwell" | "skylake" | "znver1" | "znver2" => {
-                                self.enable_x86_haswell_profile()
-                            }
-                            "znver3" => self.enable_x86_znver3_profile(),
-                            "znver4" => self.enable_x86_znver4_profile(),
-                            "znver5" => self.enable_x86_znver5_profile(),
-                            // Alder Lake ISA (the E-core's capability set: AVX2,
-                            // AVX-VNNI, GFNI, VAES, VPCLMULQDQ, no AVX-512):
-                            // shared by Raptor Lake, Meteor Lake, Alder Lake-N
-                            // and the Gracemont-only spelling.  The *tuning* row
-                            // still differs (cpu_model::resolve maps gracemont /
-                            // alderlake-n to the E-core row, meteorlake to the
-                            // Raptor Lake class).
-                            "alderlake" | "raptorlake" | "raptor-lake" | "meteorlake"
-                            | "gracemont" | "alderlake-n" => self.enable_x86_alderlake_profile(),
-                            // Sierra Forest / Grand Ridge (Crestmont E-core): Alder
-                            // Lake ISA + AVX-IFMA, AVX-NE-CONVERT, AVX-VNNI-INT8,
-                            // CMPCCXADD — the same additions Arrow Lake carries
-                            // (GCC `PTA_SIERRAFOREST`, LLVM `SRFFeatures`).
-                            "arrowlake" | "sierraforest" | "grandridge" => {
-                                self.enable_x86_arrowlake_profile()
-                            }
-                            // Clearwater Forest (Darkmont) adds AVX-VNNI-INT16
-                            // like Arrow Lake-S / Lunar Lake.
-                            "arrowlake-s" | "lunarlake" | "wildcatlake" | "clearwaterforest" => {
-                                self.enable_x86_arrowlake_profile();
-                                self.enable_avxvnniint16 = true;
-                            }
-                            "x86-64-v4" => self.enable_x86_avx512_profile(),
-                            "skylake-avx512" => self.enable_x86_avx512_cpu_profile(),
-                            "cascadelake" => self.enable_x86_cascadelake_profile(),
-                            "cooperlake" => self.enable_x86_cooperlake_profile(),
-                            "icelake-client" | "icelake-server" | "tigerlake" | "rocketlake" => {
-                                self.enable_x86_icelake_profile()
-                            }
-                            "sapphirerapids" | "graniterapids" | "graniterapids-d" => {
-                                self.enable_x86_sapphirerapids_profile()
-                            }
-                            "knl" => self.enable_x86_knl_profile(),
-                            "knm" => {
-                                self.enable_x86_knl_profile();
-                                self.enable_avx512vpopcntdq = true;
-                            }
-                            "novalake" | "diamondrapids" => {
-                                return Err(format!(
-                                    "-march={} requires unimplemented AVX10/APX lowering",
-                                    march
-                                ));
-                            }
-                            "native" => {
-                                // Detect the HOST CPU's features. Only
-                                // meaningful when the compiler itself runs on
-                                // x86-64 (cross builds must pass an explicit
-                                // profile — matching GCC, whose native probe
-                                // also reads the host CPUID).
-                                #[cfg(target_arch = "x86_64")]
-                                {
-                                    if !self.sse_explicitly_disabled {
-                                        self.no_sse = false;
-                                        if std::arch::is_x86_feature_detected!("sse3") {
-                                            self.enable_sse3 = true;
+                                "native" => {
+                                    // Detect the HOST CPU's features. Only
+                                    // meaningful when the compiler itself runs on
+                                    // x86-64 (cross builds must pass an explicit
+                                    // profile — matching GCC, whose native probe
+                                    // also reads the host CPUID).
+                                    #[cfg(target_arch = "x86_64")]
+                                    {
+                                        if !self.sse_explicitly_disabled {
+                                            self.no_sse = false;
+                                            if std::arch::is_x86_feature_detected!("sse3") {
+                                                self.enable_sse3 = true;
+                                            }
+                                            if std::arch::is_x86_feature_detected!("ssse3") {
+                                                self.enable_ssse3 = true;
+                                            }
+                                            if std::arch::is_x86_feature_detected!("sse4.1") {
+                                                self.enable_sse4_1 = true;
+                                            }
+                                            if std::arch::is_x86_feature_detected!("sse4.2") {
+                                                self.enable_sse4_2 = true;
+                                            }
+                                            if std::arch::is_x86_feature_detected!("avx") {
+                                                self.enable_avx = true;
+                                            }
+                                            if std::arch::is_x86_feature_detected!("avx2") {
+                                                self.enable_avx2 = true;
+                                            }
+                                            if std::arch::is_x86_feature_detected!("fma") {
+                                                self.enable_fma = true;
+                                            }
                                         }
-                                        if std::arch::is_x86_feature_detected!("ssse3") {
-                                            self.enable_ssse3 = true;
+                                        if std::arch::is_x86_feature_detected!("bmi1") {
+                                            self.enable_bmi = true;
                                         }
-                                        if std::arch::is_x86_feature_detected!("sse4.1") {
-                                            self.enable_sse4_1 = true;
+                                        if std::arch::is_x86_feature_detected!("bmi2") {
+                                            self.enable_bmi2 = true;
                                         }
-                                        if std::arch::is_x86_feature_detected!("sse4.2") {
-                                            self.enable_sse4_2 = true;
+                                        if std::arch::is_x86_feature_detected!("lzcnt") {
+                                            self.enable_lzcnt = true;
                                         }
-                                        if std::arch::is_x86_feature_detected!("avx") {
-                                            self.enable_avx = true;
+                                        if std::arch::is_x86_feature_detected!("popcnt") {
+                                            self.enable_popcnt = true;
                                         }
-                                        if std::arch::is_x86_feature_detected!("avx2") {
-                                            self.enable_avx2 = true;
+                                        if std::arch::is_x86_feature_detected!("movbe") {
+                                            self.enable_movbe = true;
                                         }
-                                        if std::arch::is_x86_feature_detected!("fma") {
-                                            self.enable_fma = true;
+                                        if std::arch::is_x86_feature_detected!("cmpxchg16b") {
+                                            self.enable_cx16 = true;
                                         }
-                                    }
-                                    if std::arch::is_x86_feature_detected!("bmi1") {
-                                        self.enable_bmi = true;
-                                    }
-                                    if std::arch::is_x86_feature_detected!("bmi2") {
-                                        self.enable_bmi2 = true;
-                                    }
-                                    if std::arch::is_x86_feature_detected!("lzcnt") {
-                                        self.enable_lzcnt = true;
-                                    }
-                                    if std::arch::is_x86_feature_detected!("popcnt") {
-                                        self.enable_popcnt = true;
-                                    }
-                                    if std::arch::is_x86_feature_detected!("movbe") {
-                                        self.enable_movbe = true;
-                                    }
-                                    if std::arch::is_x86_feature_detected!("cmpxchg16b") {
-                                        self.enable_cx16 = true;
-                                    }
-                                    // Integer-side hint ISA (no xmm state),
-                                    // so it is not gated on `-mno-sse`.
-                                    if crate::backend::x86::cpu_model::X86Cpu::host_has_prfchw() {
-                                        self.enable_prfchw = true;
-                                    }
-                                    if !self.sse_explicitly_disabled {
-                                        if std::arch::is_x86_feature_detected!("aes") {
-                                            self.enable_aes = true;
+                                        // Integer-side hint ISA (no xmm state),
+                                        // so it is not gated on `-mno-sse`.
+                                        if crate::backend::x86::cpu_model::X86Cpu::host_has_prfchw()
+                                        {
+                                            self.enable_prfchw = true;
                                         }
-                                        if std::arch::is_x86_feature_detected!("pclmulqdq") {
-                                            self.enable_pclmul = true;
-                                        }
-                                        if std::arch::is_x86_feature_detected!("f16c") {
-                                            self.enable_f16c = true;
-                                        }
-                                        if std::arch::is_x86_feature_detected!("avx512f") {
-                                            self.enable_x86_avx512_profile();
-                                            // VL is its own CPUID bit, not implied by F:
-                                            // Xeon Phi (KNL: F+CD+ER+PF, no VL) plus
-                                            // several early-SP parts have F without
-                                            // VL, and the xmm/ymm EVEX forms (e.g.
-                                            // `vprold`) are #UD there.  The profile
-                                            // grants VL unconditionally; clear it
-                                            // unless the host really has it (GCC's
-                                            // native probe reads the VL bit too).
-                                            if !std::arch::is_x86_feature_detected!("avx512vl") {
-                                                self.enable_avx512vl = false;
+                                        if !self.sse_explicitly_disabled {
+                                            if std::arch::is_x86_feature_detected!("aes") {
+                                                self.enable_aes = true;
+                                            }
+                                            if std::arch::is_x86_feature_detected!("pclmulqdq") {
+                                                self.enable_pclmul = true;
+                                            }
+                                            if std::arch::is_x86_feature_detected!("f16c") {
+                                                self.enable_f16c = true;
+                                            }
+                                            if std::arch::is_x86_feature_detected!("avx512f") {
+                                                self.enable_x86_avx512_profile();
+                                                // VL is its own CPUID bit, not implied by F:
+                                                // Xeon Phi (KNL: F+CD+ER+PF, no VL) plus
+                                                // several early-SP parts have F without
+                                                // VL, and the xmm/ymm EVEX forms (e.g.
+                                                // `vprold`) are #UD there.  The profile
+                                                // grants VL unconditionally; clear it
+                                                // unless the host really has it (GCC's
+                                                // native probe reads the VL bit too).
+                                                if !std::arch::is_x86_feature_detected!("avx512vl")
+                                                {
+                                                    self.enable_avx512vl = false;
+                                                }
                                             }
                                         }
                                     }
+                                    #[cfg(not(target_arch = "x86_64"))]
+                                    {
+                                        return Err("-march=native requires an x86-64 host; pass an explicit profile".to_string());
+                                    }
                                 }
-                                #[cfg(not(target_arch = "x86_64"))]
-                                {
-                                    return Err("-march=native requires an x86-64 host; pass an explicit profile".to_string());
-                                }
+                                _ => return Err(format!("unsupported x86 -march={}", march)),
                             }
-                            _ => return Err(format!("unsupported x86 -march={}", march)),
-                        },
+                        }
                         _ => {
                             return Err(format!(
                                 "-march={} is not implemented for target {}",
@@ -5509,25 +5540,35 @@ mod prefetch_isa_tests {
 
     #[test]
     fn i686_sse_prefetch_needs_sse_or_prfchw() {
-        // GCC emits nothing for these (pre-SSE i686 baseline).
+        // The i386 default baseline is the x86-64 ISA level, so the
+        // prefetcht*/nta family is baseline for plain `-m32` (GCC 16.2 and
+        // Clang 23.1.3 both emit it there, measured). An explicit pre-SSE
+        // `-march=` still suppresses it (both oracles: 0 instructions for
+        // `-m32 -march=i686`), as does `-mno-sse`.
+        //
+        // The `-mno-sse` corner is a measured oracle fork: GCC 16.2 EMITS
+        // `prefetcht0` under `-m32 -mno-sse` (0F 18, an SSE encoding), while
+        // Clang 23.1.3 suppresses it. lccc follows Clang: the `-mno-sse`
+        // contract is that NO SSE instruction of any encoding is emitted
+        // (the kernel's -mno-sse use is precisely to avoid FPU/SSE state),
+        // and a lone prefetch hint does not justify breaking that invariant.
         for flags in [
-            &["-m32"][..],
-            &["-m32", "-march=i686"],
+            &["-m32", "-march=i686"][..],
             &["-m32", "-march=pentiumpro"],
             &["-m32", "-msse", "-mno-sse"],
+            &["-m32", "-mno-sse"],
             &["-m32", "-march=raptorlake", "-mno-sse", "-mno-prfchw"],
         ] {
             assert!(!parse(flags).resolved_prefetch_sse(), "{flags:?}");
         }
-        // GCC emits the prefetcht*/nta family for these.
+        // The prefetcht*/nta family is granted for these.
         for flags in [
-            &["-m32", "-msse"][..],
+            &["-m32"][..],
+            &["-m32", "-msse"],
             &["-m32", "-msse2"],
             &["-m32", "-msse", "-march=i686"],
             &["-m32", "-march=i686", "-msse"],
             &["-m32", "-msse4.1"],
-            &["-m32", "-maes"],
-            &["-m32", "-mpclmul"],
             &["-m32", "-march=nehalem"],
             &["-m32", "-march=raptorlake"],
             &["-m32", "-mprfchw"],
@@ -5539,24 +5580,41 @@ mod prefetch_isa_tests {
 
     #[test]
     fn i686_sse_feature_mirror_tracks_abi_permission() {
+        // The i386 default baseline is the x86-64 ISA level: `-m32` alone
+        // resolves SSE AND SSE2 on (GCC 16.2 default `-m32` = `-march=x86-64`
+        // with both [enabled], Clang 23.1.3 agrees). Only an explicit
+        // pre-SSE `-march=`, the sticky `-mno-sse`, or (SSE2 only) the
+        // sticky `-mno-sse2` / `-mgeneral-regs-only` denial drop the level;
+        // explicit grants override the `-march=` veto and lift the
+        // `-mno-sse2` denial (last-explicit wins, in either order). The
+        // effective-feature mirror and the resolved i686 levels must agree.
         for (flags, sse, sse2) in [
+            // (flags, resolved SSE level, resolved SSE2 level)
             (&["-m32"][..], true, true),
-            (&["-m32", "-march=i686"][..], true, true),
-            (&["-m32", "-msse", "-mno-sse"][..], false, false),
-            (&["-m32", "-mno-sse2"][..], true, false),
-            (&["-mno-sse2", "-m32"][..], true, false),
-            (&["-m32", "-mgeneral-regs-only"][..], false, false),
+            (&["-m32", "-march=i686"][..], false, false),
+            (&["-m32", "-march=i386"][..], false, false),
+            (&["-m32", "-march=i686", "-msse"][..], true, false),
+            (&["-m32", "-march=i686", "-msse2"][..], true, true),
+            (&["-m32", "-msse", "-march=i686"][..], true, false),
             (&["-m32", "-msse"][..], true, true),
             (&["-m32", "-msse2"][..], true, true),
             (&["-m32", "-msse4.1"][..], true, true),
             (&["-m32", "-march=nehalem"][..], true, true),
+            (&["-m32", "-march=i686", "-march=nehalem"][..], true, true),
+            (&["-m32", "-march=nehalem", "-march=i686"][..], false, false),
+            (&["-m32", "-msse", "-mno-sse"][..], false, false),
             (&["-m32", "-mno-sse", "-msse"][..], true, true),
             (&["-mno-sse", "-msse", "-m32"][..], true, true),
+            (&["-m32", "-mno-sse"][..], false, false),
+            (&["-m32", "-mno-sse2"][..], true, false),
+            (&["-mno-sse2", "-m32"][..], true, false),
             (&["-m32", "-msse", "-mno-sse2"][..], true, false),
             (&["-m32", "-mno-sse2", "-msse"][..], true, false),
             (&["-msse", "-mno-sse2", "-m32"][..], true, false),
+            (&["-m32", "-mno-sse2", "-msse2"][..], true, true),
             (&["-m32", "-mno-sse", "-mno-sse2", "-msse"][..], true, false),
             (&["-m32", "-mno-sse2", "-mno-sse", "-msse"][..], true, false),
+            (&["-m32", "-mgeneral-regs-only"][..], false, false),
             (&["-m32", "-mgeneral-regs-only", "-msse"][..], true, false),
             (&["-m32", "-mgeneral-regs-only", "-msse2"][..], true, true),
             (&["-m32", "-msse", "-mgeneral-regs-only"][..], false, false),
@@ -5583,7 +5641,6 @@ mod prefetch_isa_tests {
             (&["-m32", "-msse2", "-mno-sse2"][..], true, false),
             (&["-m32", "-msse2", "-msse"][..], true, true),
             (&["-m32", "-msse", "-msse2"][..], true, true),
-            (&["-m32", "-mno-sse2", "-msse2"][..], true, true),
             (&["-m32", "-mno-sse", "-msse2"][..], true, true),
             (&["-m32", "-mno-sse2", "-msse3"][..], true, true),
             (&["-m32", "-mno-sse2", "-mavx"][..], true, true),
@@ -5601,7 +5658,10 @@ mod prefetch_isa_tests {
             (&["-m32", "-mno-sse2", "-mamx-tile"][..], true, false),
             (&["-m32", "-mno-sse2", "-mcmpccxadd"][..], true, false),
         ] {
-            let features = parse(flags).effective_x86_features();
+            let driver = parse(flags);
+            assert_eq!(driver.resolved_i686_sse(), sse, "{flags:?}");
+            assert_eq!(driver.resolved_i686_sse2(), sse2, "{flags:?}");
+            let features = driver.effective_x86_features();
             assert_eq!(
                 features.contains(crate::common::x86_features::X86Feature::Sse),
                 sse,
@@ -5613,6 +5673,24 @@ mod prefetch_isa_tests {
                 "effective SSE2 mirror disagrees for {flags:?}"
             );
         }
+
+        // `-mgeneral-regs-only` is a full SSE denial (it sets `no_sse`, so
+        // the resolved levels drop too): no XMM state of any kind, which
+        // also vetoes the published features and the prefetch grant.
+        let driver = parse(&["-m32", "-mgeneral-regs-only"]);
+        assert!(!driver.resolved_i686_sse());
+        assert!(!driver.resolved_i686_sse2());
+        assert!(
+            !driver
+                .effective_x86_features()
+                .contains(crate::common::x86_features::X86Feature::Sse)
+        );
+        assert!(
+            !driver
+                .effective_x86_features()
+                .contains(crate::common::x86_features::X86Feature::Sse2)
+        );
+        assert!(!driver.resolved_prefetch_sse());
     }
 
     #[test]
