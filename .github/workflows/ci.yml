@@ -1546,8 +1546,15 @@ jobs:
       env:
         LCCC_CROSS_DEB_DIR: /home/runner/.cache/lccc-cross-debs
       run: bash scripts/ci_provision_cross.sh
+    - name: Cache Clang 23 oracle
+      uses: actions/cache@v6
+      with:
+        path: ~/.cache/lccc/clang-oracle
+        key: lccc-clang-oracle-${{ runner.os }}-${{ hashFiles('scripts/ci_install_clang_oracle.sh') }}
+    - name: Install Clang 23.1.4 oracle for SIMD encodings
+      run: bash scripts/ci_install_clang_oracle.sh
     - name: Verify the lane's oracle toolchain
-      run: bash scripts/ci_verify_oracles.sh
+      run: bash scripts/ci_verify_oracles.sh --clang-version 23.1.4
     - name: Select GCC 16 for legacy oracle invocations
       run: |
         mkdir -p "$RUNNER_TEMP/lccc-oracles"

@@ -16,7 +16,7 @@ class ClangGate(unittest.TestCase):
             self.assertFalse(m.check_version(bad),bad)
 
     def test_old_version_stops_before_any_assembly(self):
-        with patch.object(m.subprocess,'run',return_value=subprocess.CompletedProcess([],0,'clang version 23.1.3\n','')) as run, patch.object(m.sys,'argv',['gate']):
+        with patch.object(m.subprocess,'run',return_value=subprocess.CompletedProcess([],0,'clang version 23.1.3\n','')) as run, patch.object(m.sys,'argv',['gate']), patch('builtins.print'):
             with self.assertRaises(SystemExit): m.main()
             self.assertEqual(run.call_count,1)
 
@@ -32,3 +32,10 @@ class ClangGate(unittest.TestCase):
                     self.assertTrue(any('-m32' in c for c in commands))
                     self.assertTrue(any('-m64' in c for c in commands))
                     self.assertEqual(compare.call_count,2)
+
+    def test_assembler_failure_cannot_reach_comparison(self):
+        version=subprocess.CompletedProcess([],0,'clang version 23.1.4\n','')
+        broken=subprocess.CompletedProcess([],1,'','rejected valid input')
+        with patch.object(m.subprocess,'run',side_effect=[version,broken]), patch.object(m.asmdiff,'compare') as compare, patch.object(m.sys,'argv',['gate']), patch('builtins.print'):
+            with self.assertRaisesRegex(SystemExit,'rejected valid input'): m.main()
+            compare.assert_not_called()
