@@ -57,3 +57,77 @@ No local CI sweep is run.
 The integration cannot dispatch Actions manually (403 authorization). The
 research definition therefore also opts in PRs that explicitly change that
 workflow file; ordinary code-only PRs do not acquire an extra research build.
+
+## Follow-up findings
+
+The first local 15-pair SQRT study does **not** establish a gain: portable nbody
+was 0.9968 after/before (95% bootstrap interval 0.9825–1.0013), spectral norm
+1.0042 (0.9900–1.0109). The other ten portable and all twelve native executables
+were byte-identical before/after; their timing variation is not an optimization
+result. Hosted evidence is still pending.
+
+The private-address experiment now additionally removes a whole closed
+signature only when every formal is specialized and at least one is a private
+address. It does not renumber partially live signatures. It excludes exported,
+escaped, weak, TLS, aliased, symver, assembly-visible, runtime-hook and ABI/frame
+introspection cases, mismatched/variadic/sret calls, and fastcall/regparm pruning.
+Mutable object contents remain mutable. Three targeted unit tests and a GCC16/
+LCCC differential fixture cover positive and refusal cases, argument-expression
+side effects, partial signatures and nonzero pointer offsets. The completed 31-pair study rejected this prototype: portable F64 maps regressed
+15.05% (after/before 1.1505, interval 1.1354–1.1587), F32 maps 1.52%
+(1.0078–1.0218). The native SSE1 result was 0.9864 (0.9808–0.9948), but
+small isolated wins do not justify the larger regression. The implementation
+was removed, with source and evidence preserved outside the patchset. The C
+correctness witness is retained. An unchanged native hot-web executable even
+showed a 1.0161 timing ratio with an interval excluding one: finite-round VM
+bootstrap intervals are not a guarantee against false discoveries or drift. No legacy
+SSE memory fold was added: backend placement alignment is not itself a proof
+that a particular access is 16-byte aligned.
+
+The first hosted contract failure was in research workflow wiring, not compiler
+correctness. GAS now uses the contracted default installation path. Hosted-only
+measurement/publication commands have explicit reasons; ELF, output and report
+rejection contracts remain mirrored by corpus discovery. The publication unit
+suite was moved into that discovery rather than exempting its correctness checks.
+The targeted static parity checker and eleven reporting/provenance tests pass.
+Research concurrency is revision-specific so a follow-up push does not cancel
+an already-running measurement experiment.
+
+The next candidate changes only destructive SSE register-allocation ties: preserve
+handoff preference, reservation, interference checks and reuse recency, but prefer
+a lower register number on an otherwise exact tie to reduce REX/VEX encoding
+bytes. It introduces no alignment assumption or new ISA requirement. Targeted RA
+checks and a separate serial paired study are running. This is not yet a measured
+speedup. The Callgrind lane now explicitly requests empty target flags: its helper
+default was x86-64-v3, which was not the intended portable diagnostic.
+
+## First hosted same-host result
+
+The completed research run allocated **AMD EPYC 7763**, not EPYC 9V74. GCC16.2
+and Clang23.1.4 were identified. Portable nbody after/before was 0.997804
+(0.997206–0.998014): only 0.22%, not a remedy for the vendor gap and not proof
+of a gain on 9V74. Portable spectral norm was 1.000267 (0.999745–1.001021).
+Only those two portable binaries changed. All twelve native binaries were
+identical. Native binary trees nevertheless timed 7.4% slower and XML scanning
+2.5% faster with intervals excluding one: both are timing/system effects,
+not source-code effects. This reinforces the need to inspect executable hashes.
+
+| Workload | Portable LCCC/GCC16 | Native LCCC/GCC16 |
+| --- | ---: | ---: |
+| nbody | 1.3052 | 0.9945 |
+| hot web loop | 0.7592 | 0.8628 |
+| byte loads | 1.4308 | 1.6743 |
+| siphash | 1.3019 | 1.3468 |
+| double reduction | 1.2097 | 1.0185 |
+| spectral norm | 1.1691 | 1.0075 |
+| F32 product map | 1.0160 | 1.0026 |
+
+These are within-profile vendor ratios, not paired native-versus-portable gains;
+the two profiles ran serially. Their differences do not transfer across CPU
+models. Startup-excluded byte-load results were worse still: GCC/reference
+0.5621 portable and 0.4311 native, i.e. LCCC remained substantially behind.
+All bounded main/candidate Callgrind Ir ratios were 1.0, consistent with its
+x86-64-v3 target leaving the SQRT candidate inactive. Its diagnostic source/size/
+target is distinct from the default-size wall-clock study. Complete summary
+receipts and report hashes are in the adjacent evidence directory; raw samples
+and executables remain in the linked hosted artifact, not these receipts.

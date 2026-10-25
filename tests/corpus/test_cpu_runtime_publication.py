@@ -3,7 +3,7 @@ import importlib.util
 from pathlib import Path
 import unittest
 
-spec = importlib.util.spec_from_file_location('cpu_evidence', Path(__file__).with_name('publish_cpu_runtime_evidence.py'))
+spec = importlib.util.spec_from_file_location('cpu_evidence', Path(__file__).resolve().parents[2] / 'scripts/publish_cpu_runtime_evidence.py')
 m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
 

@@ -7,3 +7,6 @@
 .github/scripts/ci-bench.py  # timed benchmark run on the runner's hardware; its pass/fail is output-only, which ci_local's benchmark-output-oracle checks
 scripts/ci_annotate_log.py  # attaches a failed gate's output to the check run as annotations; a terminal shows that output directly
 tests/regression/measure_i686_vector_copy.sh  # hosted-hardware timing measurement; ci_local deliberately runs correctness checks without host timing loops
+
+scripts/benchmark_native_batched.py  # hosted CPU timing; ELF rename/calibration/output invariants are covered by corpus discovery (test_batched_* and test_benchmark_elf_identity), source outputs by benchmark-output-oracle
+scripts/publish_cpu_runtime_evidence.py  # publishes hosted machine measurements to checks annotations; rejection/identity contracts are mirrored by corpus discovery (test_cpu_runtime_publication)

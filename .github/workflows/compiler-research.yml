@@ -22,8 +22,9 @@ on:
 permissions:
   contents: read
 
+# Keep a running measurement experiment when a follow-up commit is pushed.
 concurrency:
-  group: compiler-research-${{ github.ref }}
+  group: compiler-research-${{ github.ref }}-${{ github.sha }}
   cancel-in-progress: true
 
 jobs:
@@ -54,8 +55,8 @@ jobs:
           valgrind --version
           gcc-16 --version
           bash scripts/ci_install_clang_oracle.sh
-          bash scripts/ensure_gas_247.sh x86_64-linux-gnu "$RUNNER_TEMP/gas-247"
-          echo "$RUNNER_TEMP/gas-247/bin" >> "$GITHUB_PATH"
+          bash scripts/ensure_gas_247.sh x86_64-linux-gnu
+          echo "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin" >> "$GITHUB_PATH"
           # Use an identified current linker, not the image's default GNU ld.
           git fetch --depth=1 origin tag harness-cache-1
           mkdir -p "$RUNNER_TEMP/current-linker"
@@ -160,7 +161,7 @@ jobs:
           python3 scripts/callgrind_corpus.py \
             --mine target/fastbuild/lccc \
             --ref "$RUNNER_TEMP/research-main-target/fastbuild/lccc" \
-            --gcc-include-command gcc-16 \
+            --gcc-include-command gcc-16 --target-flags="" \
             --only "$RESEARCH_CASES" --out results/research/callgrind-main
       - name: Supplementary Callgrind against identified native GCC
         timeout-minutes: 8
@@ -168,7 +169,7 @@ jobs:
         run: |
           if [[ "$RESEARCH_CASES" == all ]]; then RESEARCH_CASES=""; fi
           python3 scripts/callgrind_corpus.py \
-            --mine target/fastbuild/lccc --ref gcc-16 --gcc-include-command gcc-16 \
+            --mine target/fastbuild/lccc --ref gcc-16 --gcc-include-command gcc-16 --target-flags="" \
             --only "$RESEARCH_CASES" --out results/research/callgrind-gcc
       - name: Publish bounded measurement verdicts and full-report hashes
         if: always()
