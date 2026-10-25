@@ -860,6 +860,8 @@ jobs:
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_got_slot_local_addend.sh
     - name: Check default ISA policy (x86-64 default emits no post-baseline instruction)
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_default_isa_policy.sh
+    - name: Check SSE2 4-lane widening sums (plain + masked) and AVX2 composite
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_sse2_widening_4lane_sum.sh
     - name: Check per-function target("...") ISA scoping and inline refusal
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_target_attribute_isa.sh
     - name: Check bundled scalar x86 intrinsics (BMI1/BMI2/LZCNT/ia32) against GCC

@@ -9277,7 +9277,15 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
             // web — VecZero → Copy(phi) → VecWiden → Copy(backedge) →
             // VecHorizontalAdd — stays classified and reaches the XMM
             // allocator (register-homed accumulator, no stack round-trip).
-            O::VecWidenAddI32x4ToI64x2 | O::VecWidenMaskedAddI32x4ToI64x2 => Some(7),
+            O::VecWidenAddI32x4ToI64x2
+            | O::VecWidenMaskedAddI32x4ToI64x2
+            // Value-shaped SSE2 siblings: same I64x2 accumulator contract;
+            // their lowering confines scratch to the reserved xmm0/xmm1/xmm2
+            // triple (xmm2 via the clobbers_xmm2 pool withhold), so a
+            // register-homed accumulator is safe exactly as for the memory
+            // forms.
+            | O::VecWidenAddValueI32x4ToI64x2
+            | O::VecWidenMaskedAddValueI32x4ToI64x2 => Some(7),
             // Equal-width masked add consumes an I32x8 accumulator exactly
             // like VecAddI32x8 (its lowering confines scratch to ymm0/ymm1,
             // mirroring the widening-masked path's xmm0/xmm1 discipline).
@@ -9462,6 +9470,11 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                     // verification fixpoint does not evict the accumulator.
                     | O::VecWidenAddI32x4ToI64x2
                     | O::VecWidenMaskedAddI32x4ToI64x2
+                    // SSE2 value-shaped widening siblings: same
+                    // accumulator-consumer contract (scratch xmm0/xmm1/xmm2,
+                    // xmm2 pool-withheld).
+                    | O::VecWidenAddValueI32x4ToI64x2
+                    | O::VecWidenMaskedAddValueI32x4ToI64x2
                     // BB-SLP sinks: 128-bit store (register-home source)
                     // and lane extract (xmm1-only staging).
                     | O::VecStoreI64x2
@@ -9584,6 +9597,11 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                                 // them poison the whole function.
                                 | O::VecWidenAddI32x4ToI64x2
                                 | O::VecWidenMaskedAddI32x4ToI64x2
+                                // SSE2 value-shaped widening siblings: same
+                                // reserved-triple scratch discipline, no
+                                // poisoning of unrelated webs.
+                                | O::VecWidenAddValueI32x4ToI64x2
+                                | O::VecWidenMaskedAddValueI32x4ToI64x2
                                 // StrictRecipMulAddF64x4 owns only the
                                 // reserved xmm0/xmm1 scratch pair and has no
                                 // vector SSA result. It therefore cannot

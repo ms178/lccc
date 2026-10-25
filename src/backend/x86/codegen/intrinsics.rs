@@ -437,6 +437,192 @@ impl X86Codegen {
         self.sse_store_dest(dest, "xmm0");
     }
 
+    /// Shared tail of the SSE2 4-lane value-shaped widening adds: both
+    /// widened halves (low in `lo`, high in `hi`) are folded into the
+    /// I64x2 accumulator, which may live in an XMM home (xmm3..xmm15 — the
+    /// pool never homes xmm0/xmm1/xmm2 here, see `clobbers_xmm2`), in a
+    /// stack slot, or be dead. `acc`/`dest` are the intrinsic operands.
+    fn widen_value_fold_acc_i64x2(
+        &mut self,
+        dest: &Value,
+        acc: &Operand,
+        lo: &str,
+        hi: &str,
+    ) {
+        if let (Some(d), Operand::Value(acc)) = (Some(*dest), acc) {
+            let acc_reg = self
+                .reg_assignments
+                .get(&acc.0)
+                .copied()
+                .filter(|r| is_xmm_reg(*r))
+                .map(|r| phys_reg_name(r));
+            let dst_reg = self
+                .reg_assignments
+                .get(&d.0)
+                .copied()
+                .filter(|r| is_xmm_reg(*r))
+                .map(|r| phys_reg_name(r));
+            match (acc_reg, dst_reg) {
+                (Some(a), Some(dst)) => {
+                    if dst != a {
+                        self.state
+                            .emit_fmt(format_args!("    movdqa %{}, %{}", a, dst));
+                    }
+                    self.state
+                        .emit_fmt(format_args!("    paddq %{}, %{}", lo, dst));
+                    self.state
+                        .emit_fmt(format_args!("    paddq %{}, %{}", hi, dst));
+                    self.state.vector_values.insert(d.0);
+                    self.state.vec_claim_live_reg(d.0, dst);
+                    self.state.vec_last_store_val = Some(d.0);
+                    self.state.vec_last_store_reg = true;
+                    self.state.vec_last_store_reg_name = Some(dst);
+                }
+                _ => {
+                    // Slot-homed (or dead) accumulator: xmm1 is dead by the
+                    // time both halves exist, so it carries the round-trip.
+                    // Never touch an allocatable XMM home.
+                    if let Some(slot) = self.state.get_slot(acc.0) {
+                        self.state
+                            .out
+                            .emit_instr_rbp_reg("    movdqa", slot.0, "xmm1");
+                        self.state
+                            .emit_fmt(format_args!("    paddq %{}, %xmm1", lo));
+                        self.state
+                            .emit_fmt(format_args!("    paddq %{}, %xmm1", hi));
+                        if let Some(dslot) = self.state.get_slot(d.0) {
+                            self.state.out.emit_instr_reg_rbp(
+                                "    movdqa",
+                                "xmm1",
+                                dslot.0,
+                            );
+                        }
+                    } else {
+                        // Dead accumulator: xmm1 is dead, seed it with the
+                        // low half and fold in the high one — the result
+                        // sits in the xmm1 holding register exactly like
+                        // the memory-shaped sibling's dead-acc path.
+                        self.state
+                            .emit_fmt(format_args!("    movdqa %{}, %xmm1", lo));
+                        self.state
+                            .emit_fmt(format_args!("    paddq %{}, %xmm1", hi));
+                        if let Some(dslot) = self.state.get_slot(d.0) {
+                            self.state.out.emit_instr_reg_rbp(
+                                "    movdqa",
+                                "xmm1",
+                                dslot.0,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// SSE2 4-lane value-shaped widening sum: `acc(I64x2) += sext4(vec)`.
+    ///
+    /// args = [accumulator, vec(4×I32)]. One 128-bit value in, two 64-bit
+    /// widened halves folded into the accumulator:
+    ///
+    /// ```text
+    /// xmm0 = {a0,a1,a2,a3}
+    /// xmm1 = copy;  xmm2 = copy
+    /// xmm1 = psrad $31 (signs)
+    /// xmm2 = punpckldq(xmm1, xmm2) = {sext(a0), sext(a1)}
+    /// xmm0 = punpckhdq(xmm1, xmm0) = {sext(a2), sext(a3)}
+    /// acc  += xmm2; acc += xmm0
+    /// ```
+    ///
+    /// The dual unpack is the exact inverse of GCC's SSE2 baseline form
+    /// (psrad + punpck pair + two paddq per 4 elements) — `pmovsxdq` is
+    /// SSE4.1 and the memory-shaped sibling is AVX2-only, so this is the
+    /// only 4-lane widening step the SSE2 transform can use. Scratch is the
+    /// reserved xmm0/xmm1/xmm2 triple: xmm0/xmm1 never enter the vector
+    /// pool, and xmm2 is withheld by `clobbers_xmm2` whenever this op is
+    /// present, so no live home is clobbered. Legacy (non-VEX) encodings:
+    /// the op is reachable without AVX, and a legacy instruction next to a
+    /// dirty upper half would cost an AVX->SSE transition anyway.
+    fn emit_widen_add_value_i32x4(&mut self, dest: &Value, args: &[Operand]) {
+        self.flush_pending_vec_store_impl();
+        self.state.invalidate_vec_peephole();
+        debug_assert!(
+            args.len() >= 2,
+            "VecWidenAddValueI32x4ToI64x2: malformed intrinsic ({} args)",
+            args.len()
+        );
+        self.sse_load_arg(&args[1], "xmm0");
+        self.state.emit("    movdqa %xmm0, %xmm1");
+        self.state.emit("    movdqa %xmm0, %xmm2");
+        self.state.emit("    psrad $31, %xmm1");
+        self.state.emit("    punpckldq %xmm1, %xmm2");
+        self.state.emit("    punpckhdq %xmm1, %xmm0");
+        self.widen_value_fold_acc_i64x2(dest, &args[0], "xmm2", "xmm0");
+    }
+
+    /// SSE2 4-lane MASKED value-shaped widening sum:
+    /// `acc(I64x2) += sext4(vec)` for lanes with `lane > guard_rhs`
+    /// (signed), zero for the rest. args = [accumulator, vec, guard_rhs].
+    ///
+    /// Masking happens at I32 BEFORE the dual unpack, which is exact only
+    /// because the pcmpgtd mask is all-ones/all-zeros per lane
+    /// (sext(a & m) == sext(a) & sext(m) for m ∈ {0, -1}) — the same
+    /// identity the AVX2 memory-shaped sibling relies on:
+    ///
+    /// ```text
+    /// xmm0 = {a0,a1,a2,a3};  xmm1 = copy;  xmm2 = broadcast(rhs)
+    /// xmm1 = pcmpgtd(xmm2, xmm1)   = {-1 where a > rhs}
+    /// xmm0 = pand(xmm1, xmm0)      = zero-masked I32 values
+    /// ... dual unpack of xmm0 into xmm2 (low) / xmm0 (high) ...
+    /// acc  += xmm2; acc += xmm0
+    /// ```
+    ///
+    /// For the common `lane > 0` guarded sum (rhs = 0) the broadcast is a
+    /// `pxor` zero. Scratch: the reserved xmm0/xmm1/xmm2 triple (see the
+    /// unmasked sibling for the register-safety argument).
+    fn emit_widen_masked_add_value_i32x4(&mut self, dest: &Value, args: &[Operand]) {
+        self.flush_pending_vec_store_impl();
+        self.state.invalidate_vec_peephole();
+        debug_assert!(
+            args.len() >= 3,
+            "VecWidenMaskedAddValueI32x4ToI64x2: malformed intrinsic ({} args)",
+            args.len()
+        );
+        self.sse_load_arg(&args[1], "xmm0");
+        self.state.emit("    movdqa %xmm0, %xmm1");
+        // Broadcast guard_rhs into xmm2.
+        match &args[2] {
+            Operand::Const(c) if c.to_i64() == Some(0) => {
+                self.state.emit("    pxor %xmm2, %xmm2");
+            }
+            Operand::Const(c) => {
+                if let Some(v) = c.to_i64() {
+                    self.state
+                        .emit_fmt(format_args!("    movl ${}, %eax", v as i32));
+                    self.state.emit("    movd %eax, %xmm2");
+                    self.state.emit("    pshufd $0, %xmm2, %xmm2");
+                } else {
+                    self.state.emit("    pxor %xmm2, %xmm2");
+                }
+            }
+            other => {
+                // Scalar value operand: materialize into %eax, then splat.
+                self.operand_to_reg(other, "rax");
+                self.state.emit("    movd %eax, %xmm2");
+                self.state.emit("    pshufd $0, %xmm2, %xmm2");
+            }
+        }
+        // xmm1 = {-1 where lane > rhs}; mask the I32 values in xmm0.
+        self.state.emit("    pcmpgtd %xmm2, %xmm1");
+        self.state.emit("    pand %xmm1, %xmm0");
+        // Dual sign-unpack of the masked values (xmm1/xmm2 are free).
+        self.state.emit("    movdqa %xmm0, %xmm1");
+        self.state.emit("    movdqa %xmm0, %xmm2");
+        self.state.emit("    psrad $31, %xmm1");
+        self.state.emit("    punpckldq %xmm1, %xmm2");
+        self.state.emit("    punpckhdq %xmm1, %xmm0");
+        self.widen_value_fold_acc_i64x2(dest, &args[0], "xmm2", "xmm0");
+    }
+
     /// Lazy-flush a pending deferred vector-result store: the producer
     /// kept its result in the holding register instead of storing it. Called
     /// whenever anything is about to clobber that register, read the slot, or
@@ -4756,6 +4942,24 @@ impl X86Codegen {
                                 self.state.emit("    vpaddq %xmm1, %xmm1, %xmm1");
                             }
                         }
+                    }
+                }
+            }
+            IntrinsicOp::VecWidenAddValueI32x4ToI64x2
+            | IntrinsicOp::VecWidenMaskedAddValueI32x4ToI64x2 => {
+                // SSE2 4-lane value-shaped widening sums (the (acc, vec)
+                // composites the 128-bit register-based transform builds;
+                // see the emitters for the lane math and the xmm0/xmm1/xmm2
+                // scratch contract).
+                if let Some(d) = dest {
+                    match op {
+                        IntrinsicOp::VecWidenAddValueI32x4ToI64x2 => {
+                            self.emit_widen_add_value_i32x4(d, args);
+                        }
+                        IntrinsicOp::VecWidenMaskedAddValueI32x4ToI64x2 => {
+                            self.emit_widen_masked_add_value_i32x4(d, args);
+                        }
+                        _ => unreachable!("narrowed by the outer match"),
                     }
                 }
             }

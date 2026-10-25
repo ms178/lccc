@@ -1169,8 +1169,7 @@
     "frontend-b": {
       "group": "frontend",
       "mode": "steps",
-     "predicted_gate_seconds": 344.82,
-
+      "predicted_gate_seconds": 345.07,
       "shards": 2,
       "steps": [
         {
@@ -1220,6 +1219,10 @@
         {
           "measured_s": 0.25,
           "name": "Check default ISA policy (x86-64 default emits no post-baseline instruction)"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Check SSE2 4-lane widening sums (plain + masked) and AVX2 composite"
         },
         {
           "measured_s": 1.0,

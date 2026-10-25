@@ -626,6 +626,29 @@ pub enum IntrinsicOp {
     /// values before the paddq folds — exact lane-guarded I64 accumulation
     /// (GCC's canonical conditional-reduction form).
     VecWidenMaskedAddI32x4ToI64x2,
+    /// Widening reduction step over VALUE operands (SSE2 4-lane form):
+    /// dest(I64x2 accumulator) += sign-extend of the 4×I32 VALUE in
+    /// args[1]. args = [accumulator, vec]. Unlike the memory-shaped
+    /// VecWidenAddI32x4ToI64x2 (AVX2, load fused into the composite) the
+    /// load is a separate VecLoadI32x4 — this op is the (acc, vec)
+    /// widening add the 128-bit register-based transform builds, the same
+    /// shape as NEON's VecSadalpI32x4. x86 lowering (SSE2-only ops):
+    /// dual sign-unpack (psrad $31 + punpckldq/punpckhdq) + paddq×2 into
+    /// the accumulator, scratch confined to the reserved xmm0/xmm1/xmm2
+    /// triple (xmm2 withheld from the vector pool by the clobbers_xmm2
+    /// contract, so it is never a live home).
+    VecWidenAddValueI32x4ToI64x2,
+    /// Masked VALUE-operand widening reduction step (SSE2 4-lane form):
+    /// dest(I64x2 accumulator) += sext of the 4×I32 VALUE in args[1]
+    /// WHERE the lane satisfies `lane > guard_rhs` (signed). args =
+    /// [accumulator, vec, guard_rhs]. The x86 lowering builds the per-lane
+    /// all-ones/zero I32 mask with pcmpgtd, pand zero-masks the I32 value
+    /// BEFORE the dual sign-unpack (masking at I32 with a 0/-1 mask is
+    /// exact: sext(a & m) == sext(a) & sext(m)), then folds both widened
+    /// halves into the accumulator — the value-shaped sibling of
+    /// VecWidenMaskedAddI32x4ToI64x2, same xmm0/xmm1/xmm2 scratch
+    /// discipline.
+    VecWidenMaskedAddValueI32x4ToI64x2,
     /// Masked equal-width reduction step: dest(I32x8 accumulator) +=
     /// 8×I32 loaded from (base, byte_offset) WHERE the lane satisfies
     /// `lane > guard_rhs` (signed).  args = [accumulator, base,
@@ -2170,6 +2193,8 @@ impl IntrinsicOp {
             | VecLShrvI64x2
             | VecWidenAddI32x4ToI64x2
             | VecWidenMaskedAddI32x4ToI64x2
+            | VecWidenAddValueI32x4ToI64x2
+            | VecWidenMaskedAddValueI32x4ToI64x2
             | VecLoadWidenI32ToI64x2 | VecLoadI64x2 | VecAddI64x2 | VecMulI64x2 | VecStoreI64x2 | VecBroadcastI64x2 | VecZeroI64x2
             | VecSubI32x4 | VecSubI64x2 | VecAndI32x4 | VecOrI32x4 | VecXorI32x4
             | VecMulI32x4 | VecBroadcastI32x4 | VecSmaxI32x4 | VecSminI32x4
@@ -2560,6 +2585,8 @@ impl IntrinsicOp {
                 | IntrinsicOp::VecXorF32x4
                 | IntrinsicOp::VecWidenAddI32x4ToI64x2
                 | IntrinsicOp::VecWidenMaskedAddI32x4ToI64x2
+                | IntrinsicOp::VecWidenAddValueI32x4ToI64x2
+                | IntrinsicOp::VecWidenMaskedAddValueI32x4ToI64x2
                 | IntrinsicOp::VecMaskedAddI32x8
                 | IntrinsicOp::VecBroadcastF32x8
                 | IntrinsicOp::VecBroadcastF32x4
@@ -2663,6 +2690,8 @@ mod vector_width_tests {
             (IntrinsicOp::VecMaskedAddI32x8, 32),
             (IntrinsicOp::VecWidenMaskedAddI32x4ToI64x2, 16),
             (IntrinsicOp::VecWidenAddI32x4ToI64x2, 16),
+            (IntrinsicOp::VecWidenMaskedAddValueI32x4ToI64x2, 16),
+            (IntrinsicOp::VecWidenAddValueI32x4ToI64x2, 16),
         ] {
             assert_eq!(op.vector_home_width(), Some(width), "{op:?} home");
             assert_eq!(op.vector_result_width(), Some(width), "{op:?} result");
@@ -3103,6 +3132,8 @@ mod vector_width_tests {
             "VecSubI64x2" => IntrinsicOp::VecSubI64x2,
             "VecWidenAddI32x4ToI64x2" => IntrinsicOp::VecWidenAddI32x4ToI64x2,
             "VecWidenMaskedAddI32x4ToI64x2" => IntrinsicOp::VecWidenMaskedAddI32x4ToI64x2,
+            "VecWidenAddValueI32x4ToI64x2" => IntrinsicOp::VecWidenAddValueI32x4ToI64x2,
+            "VecWidenMaskedAddValueI32x4ToI64x2" => IntrinsicOp::VecWidenMaskedAddValueI32x4ToI64x2,
             "VecXorI32x4" => IntrinsicOp::VecXorI32x4,
             "VecXorI32x8" => IntrinsicOp::VecXorI32x8,
             "VecZeroF32x4" => IntrinsicOp::VecZeroF32x4,
