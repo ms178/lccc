@@ -240,5 +240,52 @@ class GasEncodingCrossrefTests(unittest.TestCase):
         self.assertTrue(has("fcmovb", "legacy", "none", "none", 0xDA))
 
 
+class GasAbsentTriageTests(unittest.TestCase):
+    """``--triage`` splits the declarative-row gap list by source spelling.
+
+    The split is a reading aid, and these tests pin exactly the two ways it can
+    mislead so the help text keeps saying so: a name that is only a *prefix* of
+    another mnemonic must not count as a mention, and a family that composes its
+    mnemonic has no literal to find.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.gas = _load(CROSSREF, "gas_encoding_crossref")
+
+    def _triage(self, source: str, names: list[str]):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "encoder.rs"
+            path.write_text(source)
+            return self.gas.triage_absent(names, [str(path)])
+
+    def test_a_prefix_of_a_longer_mnemonic_is_not_a_mention(self):
+        unmentioned, mentioned = self._triage(
+            'fn f() { match m { "vaddps" | "addn" | "blsi" => {} } }',
+            ["add", "vaddps", "addn"],
+        )
+        self.assertEqual(mentioned, ["vaddps", "addn"])
+        self.assertEqual(unmentioned, ["add"])
+
+    def test_a_quoted_or_commented_spelling_counts_as_a_mention(self):
+        unmentioned, mentioned = self._triage(
+            '// movbe is handled by encode_movbe\nlet n = "rorx";\n',
+            ["movbe", "rorx", "pdep"],
+        )
+        self.assertEqual(mentioned, ["movbe", "rorx"])
+        self.assertEqual(unmentioned, ["pdep"])
+
+    def test_a_composed_mnemonic_has_no_literal_and_lands_unmentioned(self):
+        # The documented limitation: `format!("vfmadd{op}132pd")` covers the
+        # whole family, so the UNMENTIONED half is not a coverage verdict.
+        unmentioned, mentioned = self._triage(
+            'let m = format!("vfmadd{}132pd", op);\n', ["vfmadd132pd"]
+        )
+        self.assertEqual(unmentioned, ["vfmadd132pd"])
+        self.assertEqual(mentioned, [])
+
+
 if __name__ == "__main__":
     unittest.main()

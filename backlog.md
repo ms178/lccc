@@ -974,6 +974,96 @@ worklist lives in [`docs/PERFORMANCE-BACKLOG.md`](docs/PERFORMANCE-BACKLOG.md)
 `switch_dispatch`, affine loop-PRE for `IV + k` in `spectral_norm`, scalar
 unrolling before `mandelbrot`/`fannkuch`); add to that file, not here.
 
+### MB-45 · P1 · S — make the ISA "gap" counts mean what they say
+
+**Why.** `scripts/gas_encoding_crossref.py` has two directions: ``--verify`` asks
+"is every declarative encoder row a legal `as` 2.47 encoding" (0 findings, 1638
+rows, both backends) and the other three ask "what does `as` accept that the
+encoder has no row for".  The second question is not the coverage question it
+is read as, because the 64-bit backend encodes most instructions *in code*:
+`encode_alu` derives the opcode arithmetically (`0x01 + op * 8`,
+`encoder/gp_integer.rs`), the `jcc`/`cmov*`/`setcc`/`movbe`/BMI2 families
+dispatch on a suffix or a table built in a helper, and the VEX/EVEX emitters
+share helpers.  Measured on the current tree with ``--backend all``:
+
+| invocation | count | what it actually is |
+|---|---|---|
+| ``--verify`` | 1638 rows, 0 findings | every *row* is a legal encoding (sound) |
+| ``--missing`` | 349 encodings / 150 mnemonics | rows the model lacks, incl. `add 01`, `call ff /3` |
+| ``--absent`` | 1767 mnemonics | names with no row; includes `add`, `call`, `cmovle`, all `jcc` |
+| ``--absent --triage`` | 1061 UNMENTIONED / 706 MENTIONED | spelling census, not coverage |
+
+Every instruction in those lists that the encoder does produce (`add`, `call`,
+`jcc`, `movbe`, `rorx`, `pdep`, `pext`, `mulx` — opcode from `encode_alu` or a
+literal in `encoder/*.rs`) is a false gap.  Reading the counts as a worklist
+invites "implementing" encodings that already work — the one failure mode a
+coverage gate must not have.  That these spellings also assemble to the same
+bytes as `as` 2.47 is the `as`-diff suite's claim, not this tool's: it is
+measured on the corpus, in CI, and is not assumed here.
+
+The docstring and the three summary lines now say exactly this, and ``--triage``
+splits the list by whether the *spelling* appears anywhere in the backend
+sources.  Neither half is a verdict: a mention can be a comment or a deny-list
+entry, and a family that composes its mnemonic (`format!`) leaves no literal, so
+`vfmadd132pd` lands in UNMENTIONED while being supported.  Both limits are
+pinned by tests in `tests/corpus/test_gas_encoding_crossref.py`.
+
+**Where.** `scripts/gas_encoding_crossref.py` (`triage_absent`, the docstring's
+"What a row cannot see"), `tests/corpus/test_gas_encoding_crossref.py`.
+
+**Plan (each step independently landable).**
+1. Teach the model the *code-driven* families: one extractor per family that
+   reads the helper's own table instead of a row (the pattern already exists for
+   `vcvt_base_params` and `HELPERS`).  Start with `encode_alu`, then BMI/BMI2,
+   then `movbe`/`movdir*`, then the branch/`cmov`/`setcc` suffix families.
+2. Only after step 1, make ``--missing`` exit non-zero (`--strict`) and wire it
+   into CI.  Until then it stays an interactive reading aid.
+3. Delete the ``--absent`` list from the docstring's promise set once step 1
+   covers the families it names.
+
+**Gates.** For each family: a test that the extractor reproduces the bytes the
+`as`-diff corpus already pins for it (mutation-verified: break the extractor,
+watch the row count fall), plus ``--verify`` staying at 0 findings.
+
+**Accept.** ``--missing`` reaches 0 for both backends with ``--strict`` and the
+code-driven families modelled; no count in this file is quoted as coverage
+until then.  **Effort** M (the families are the work).  **ROI** 3.0 — it buys no
+runtime, but it is the difference between a gate and a rumour, and three
+sessions have now spent time re-deriving that these numbers are not gaps.
+
+#### Campaign state, 2026-10-25 (what the manuals can and cannot give here)
+
+* **Intel SDM.** The machine-readable form is XED's `datafiles/*.txt`, and
+  `scripts/sdm_isa_crossref.py` consumes 39 of them for encodings (2595 rows,
+  1436 classes, 4992 encodings, 0 findings).  The one attributes axis still
+  unexploited is `FLAGS:` on each ISA line: it would validate
+  `flag_peepholes::flags_written_mask` (the table that decides when a flag write
+  may be dropped) against the SDM's own per-instruction flag lists.  That is the
+  next gate worth building, and it needs the SDM's operand-*width* refinements
+  (`inc`/`dec` preserve CF, `bt` preserves ZF) modelled explicitly, not guessed.
+* **AMD 2026 SOG.** Not reachable from this sandbox (`www.amd.com` refuses
+  connections), so no Zen tuning claim may be sourced from its prose here.
+  The reachable machine-readable cross-check is LLVM `X86.td` at `main`
+  (`b24cdd737024be039fc644d802e677af9e91945c`), whose resolved
+  `ProcessorFeatures` give: Zen3 ⊇ {FSRM, PKU, INVPCID, CLWB, RDPRU, WBNOINVD},
+  Zen4 ⊇ AVX-512 CD/BW/DQ/IFMA/VBMI/VBMI2/VL/VNNI/BF16/BITALG/VPOPCNTDQ/GFNI +
+  VAES/VPCLMULQDQ/SHSTK, Zen5 ⊇ {AVXVNNI, MOVDIRI, MOVDIR64B, PREFETCHI,
+  VP2INTERSECT}.  lccc tracks **none** of `fsrm`, `pku`, `invpcid`, `clwb`,
+  `rdpru`, `wbnoinvd`, `movdiri`, `movdir64b`, `prefetchi` as a CLI feature bit,
+  and `src/common/x86_features.rs` states the rule that forbids adding them as
+  flag-only surface: a `-m` flag with no codegen permission bit is a silent
+  no-op, and a `__builtin_cpu_supports` answer that promises an instruction the
+  backend cannot emit is the AUD-CPU-1 bug.  Closing those gaps means adding the
+  permission bit *and* its consumer — that is AUD-CPU-3, not a flag-table edit.
+* **Resolved earlier in the campaign, do not re-open:** the `0F 01 <ModRM>`
+  system group is distilled (#964, 1638 rows, UNCOVERED 0); `lea3_latency`,
+  `lea3_uops` and `lea3_rtp_x100` *are* consumed (they derive
+  `X86Tune::avoid_lea3_on_critical_path`, `cpu_model.rs`); Zen 5's
+  `tzcnt` false dependency is modelled and pinned by
+  `false_dependency_rows_match_uops_info`; the scaled-index LEA is composed into
+  a `lea` consumer by `fold_scaled_index_temp_into_mem`
+  (`relay_and_lea.rs`, including the `leaq 0(,%I,s)` + `leaq (%B,%T,1)` shape).
+
 ---
 
 ## 10. Carried over from the superseded live queue (full text in the archives)
