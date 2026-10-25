@@ -572,10 +572,11 @@ fn vectorize_with_analysis_mode(
     let why_not = std::env::var_os("LCCC_WHY_NOT_VECTORIZE").is_some();
 
     // ISA gate: the x86 vector lowerings require the SIMD register file. Under
-    // `-mno-sse` / `-mno-sse2` / `-mgeneral-regs-only` the target has no xmm
-    // state at all (kernel: CR4.OSFXSR=0), so bail out before any transform
-    // rewrites the loop. `neon` entry points are AArch64, where the vector ISA
-    // is baseline and this gate does not apply.
+    // `-mno-sse` / `-mgeneral-regs-only` the target has no xmm state
+    // (kernel: CR4.OSFXSR=0), so bail out before rewriting the loop.
+    // `-mno-sse2` alone retains SSE1: only the typed F32 map gate below
+    // may admit work under that narrower permission. `neon` entry points are
+    // AArch64, where the vector ISA is baseline and this gate does not apply.
     //
     // The gate is answered BEFORE the natural-loop analysis, which it otherwise
     // makes dead work.  `find_natural_loops` walks every back edge and the
@@ -32534,7 +32535,9 @@ pub(crate) fn vectorize_const_trip_map_loops(
             &cfg.idom,
         );
         for lp in &loops {
-            if lp.body.len() > 4 {
+            // Match the main entry's address-space guard: packed loads have
+            // no segment override, even when the trip count is tiny/constant.
+            if lp.body.len() > 4 || loop_touches_named_space(func, lp) {
                 continue; // the unroller's tiny/general 2-3-block window
             }
             let Some(pattern) = analyze_map_pattern(func, lp, false, symbol_facts) else {

@@ -99,6 +99,37 @@ def main():
                                            'sha256': hashlib.sha256(actual).hexdigest(),
                                            'assembly_sha256': hashlib.sha256(code.encode()).hexdigest()})
                 print(f'op{op}: PASS {len(modes)} native/ISA arms', flush=True)
+            # Constant-trip early maps must retain named address spaces too.
+            # A non-null GS-relative offset makes the broken default-space
+            # vector load fault instead of accidentally reading the right data.
+            named = td / 'named.c'
+            named.write_text('void named_map(float *d, const __seg_gs float *x) {'
+                             'for(int i=0;i<8;++i)d[i]=x[i]*0.5f;}\n')
+            named_main = td / 'named-main.c'
+            named_main.write_text("""
+extern long syscall(long, ...);
+extern void named_map(float *, const float *);
+int main(void) {
+    float src[8], dst[8];
+    unsigned long old;
+    for(int i=0;i<8;++i) src[i]=(float)(i+1);
+    if(syscall(158,0x1004,&old) || syscall(158,0x1001,(unsigned long)src-16)) return 77;
+    named_map(dst,(const float *)16);
+    if(syscall(158,0x1001,old)) return 78;
+    for(int i=0;i<8;++i) if(dst[i]!=src[i]*0.5f) return 1;
+    return 0;
+}
+""")
+            for flags in [orders[0], []]:
+                run([args.lccc, '-O2', *FLAGS, *flags, '-c', str(named), '-o', str(obj)], env)
+                run([args.lccc, '-O2', *FLAGS, *flags, '-S', str(named), '-o', str(asm)], env)
+                code = asm.read_text()
+                if '%gs:' not in code or re.search(r'^\s+mulps\s', code, re.M):
+                    raise RuntimeError('early map discarded named address space')
+                run([args.gcc, str(named_main), str(obj), '-o', str(binary)], env)
+                run([str(binary)], env)
+                report['negative_controls'].append({'named_address_space': 'gs', 'flags': flags,
+                                                     'preserved': True})
             for source, flags in [('double f(double a,double b){return a+b;}', ['-mno-sse2', '-msse']),
                                   ('float f(float a,float b){return a+b;}', ['-mno-sse'])]:
                 bad = td / 'unsupported.c'
@@ -109,7 +140,10 @@ def main():
                     raise RuntimeError('denied FP feature escaped diagnostic')
                 report['negative_controls'].append({'flags': flags, 'rejected': True})
             # The legality oracle must reject SSE2 moves even on an SSE2 host.
-            for instruction in ['movdqu (%rdi), %xmm0', 'pxor %xmm0, %xmm0', 'addsd %xmm1,%xmm0']:
+            report['isa_mutations'] = ['movdqu (%rdi), %xmm0', 'pxor %xmm0, %xmm0',
+                                       'addsd %xmm1,%xmm0', 'movd %xmm0,%eax',
+                                       'movd %eax,%xmm0', 'movq %xmm0,%rax']
+            for instruction in report['isa_mutations']:
                 try:
                     legal(instruction)
                 except RuntimeError:
