@@ -84,6 +84,7 @@ jobs:
         run: |
           python3 tests/regression/check_packed_vector_relations.py --json debian-packed-vector-relations.json
           python3 tests/regression/check_shuffle_composition.py --json debian-shuffle-composition.json
+          python3 tests/regression/check_packed_mask_shifts.py --json debian-packed-mask-shifts.json
 
       - name: Integer order networks against exact Debian GCC 16.2
         run: python3 tests/regression/check_integer_order_networks.py
@@ -186,6 +187,8 @@ jobs:
             debian-results.json
             debian-predicate-relations.json
             debian-packed-vector-relations.json
+            debian-shuffle-composition.json
+            debian-packed-mask-shifts.json
             debian-summary.md
             debian-artifacts/
             debian-callgrind/

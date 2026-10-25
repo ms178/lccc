@@ -571,6 +571,7 @@ jobs:
       run: |
         python3 tests/regression/check_packed_vector_relations.py --allow-gcc16-snapshot
         python3 tests/regression/check_shuffle_composition.py --allow-gcc16-snapshot
+        python3 tests/regression/check_packed_mask_shifts.py --allow-gcc16-snapshot
     - name: Verify benchmark codegen registry and evidence (mock only)
       run: python3 tests/regression/check_benchmark_codegen_registry.py
     - name: Verify missed-alarm pair engines and slice superoptimiser
