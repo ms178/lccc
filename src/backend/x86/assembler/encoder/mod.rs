@@ -4561,6 +4561,28 @@ impl InstructionEncoder {
             "fildq" | "fildll" => self.encode_x87_mem(ops, &[0xDF], 5),
             "fisttpq" | "fisttpll" => self.encode_x87_mem(ops, &[0xDD], 1),
             "fistpq" | "fistpll" => self.encode_x87_mem(ops, &[0xDF], 7),
+            // Integer-memory x87 arithmetic.  The `s`/`l` suffix names the
+            // *memory* width (m16int = DE, m32int = DA), never a register
+            // width, and the `/digit` in the ModR/M reg field selects the
+            // operation, so both byte tables carry the same operation list
+            // (SDM Vol. 2B, "x87 FPU Instructions"; as 2.47 `float.l` pins
+            // `fiadds (%ebx)` = de 03 and `fiaddl (%ebx)` = da 03).
+            "fiadds" => self.encode_x87_mem(ops, &[0xDE], 0),
+            "fiaddl" => self.encode_x87_mem(ops, &[0xDA], 0),
+            "fimuls" => self.encode_x87_mem(ops, &[0xDE], 1),
+            "fimull" => self.encode_x87_mem(ops, &[0xDA], 1),
+            "ficoms" => self.encode_x87_mem(ops, &[0xDE], 2),
+            "ficoml" => self.encode_x87_mem(ops, &[0xDA], 2),
+            "ficomps" => self.encode_x87_mem(ops, &[0xDE], 3),
+            "ficompl" => self.encode_x87_mem(ops, &[0xDA], 3),
+            "fisubs" => self.encode_x87_mem(ops, &[0xDE], 4),
+            "fisubl" => self.encode_x87_mem(ops, &[0xDA], 4),
+            "fisubrs" => self.encode_x87_mem(ops, &[0xDE], 5),
+            "fisubrl" => self.encode_x87_mem(ops, &[0xDA], 5),
+            "fidivs" => self.encode_x87_mem(ops, &[0xDE], 6),
+            "fidivl" => self.encode_x87_mem(ops, &[0xDA], 6),
+            "fidivrs" => self.encode_x87_mem(ops, &[0xDE], 7),
+            "fidivrl" => self.encode_x87_mem(ops, &[0xDA], 7),
             // Note: AT&T syntax swaps the meaning of fsub/fsubr and fdiv/fdivr
             // relative to Intel mnemonics for the *p (pop) forms.
             // GAS: fsubp = DE E1, fsubrp = DE E9, fdivp = DE F1, fdivrp = DE F9
@@ -4582,6 +4604,24 @@ impl InstructionEncoder {
             "fcomip" => self.encode_fcomip(ops),
             "fucomi" => self.encode_fcomi(ops, 0xE8),
             "fucomip" => self.encode_fucomip(ops),
+            "fucom" => self.encode_fucom(ops),
+            "fucomp" => self.encode_fucomp(ops),
+            // FCMOVcc tests the C0-C3 bits of the x87 status word, which is
+            // exactly the integer condition encoding, so AT&T accepts the
+            // `a`/`ae`/`na`/`nae` spellings as aliases of `nb`/`nbe`/`be`/`b`
+            // (SDM Vol. 2B: FCMOVB..FCMOVNU are DA /0-3 and DB /0-3).
+            "fcmovb" => self.encode_x87_st0_sti(ops, 0xDA, 0xC0, None, "fcmovb"),
+            "fcmove" => self.encode_x87_st0_sti(ops, 0xDA, 0xC8, None, "fcmove"),
+            "fcmovbe" => self.encode_x87_st0_sti(ops, 0xDA, 0xD0, None, "fcmovbe"),
+            "fcmovna" => self.encode_x87_st0_sti(ops, 0xDA, 0xD0, None, "fcmovna"),
+            "fcmovnae" => self.encode_x87_st0_sti(ops, 0xDA, 0xC0, None, "fcmovnae"),
+            "fcmovu" => self.encode_x87_st0_sti(ops, 0xDA, 0xD8, None, "fcmovu"),
+            "fcmovnb" => self.encode_x87_st0_sti(ops, 0xDB, 0xC0, None, "fcmovnb"),
+            "fcmovae" => self.encode_x87_st0_sti(ops, 0xDB, 0xC0, None, "fcmovae"),
+            "fcmovne" => self.encode_x87_st0_sti(ops, 0xDB, 0xC8, None, "fcmovne"),
+            "fcmovnbe" => self.encode_x87_st0_sti(ops, 0xDB, 0xD0, None, "fcmovnbe"),
+            "fcmova" => self.encode_x87_st0_sti(ops, 0xDB, 0xD0, None, "fcmova"),
+            "fcmovnu" => self.encode_x87_st0_sti(ops, 0xDB, 0xD8, None, "fcmovnu"),
             "fld" => self.encode_fld_st(ops),
             "fstp" => self.encode_fstp_st(ops),
             // `fst %st(N)` -> DD D0+N (the non-popping sibling of fstp).
@@ -8127,6 +8167,82 @@ mod x87_pop_tests {
 /// invariant (the register moves X->X4 into B->B4 with the slot) is pinned
 /// per prefix family. All expected bytes were probed against the built
 /// encoder, not derived.
+#[cfg(test)]
+mod x87_integer_and_conditional_tests {
+    use super::apx_tests::{fail_msg, fails, hex};
+
+    #[test]
+    fn integer_memory_arithmetic_uses_the_suffix_byte_table() {
+        // m16int lives in the DE table and m32int in the DA table; the
+        // `/digit` in the ModR/M reg field selects the operation and the two
+        // tables carry the same list (SDM Vol. 2B). `fiadds`/`fiaddl` are
+        // pinned by the as 2.47 golden `gas/testsuite/gas/i386/float.l`.
+        assert_eq!(hex("fiadds (%rbx)"), "de 03");
+        assert_eq!(hex("fiaddl (%rbx)"), "da 03");
+        assert_eq!(hex("fimuls (%rbx)"), "de 0b");
+        assert_eq!(hex("ficoms (%rbx)"), "de 13");
+        assert_eq!(hex("ficomps (%rbx)"), "de 1b");
+        assert_eq!(hex("fisubs (%rbx)"), "de 23");
+        assert_eq!(hex("fisubrs (%rbx)"), "de 2b");
+        assert_eq!(hex("fidivs (%rbx)"), "de 33");
+        assert_eq!(hex("fidivrs (%rbx)"), "de 3b");
+        assert_eq!(hex("fidivrl (%rbx)"), "da 3b");
+        // The suffix picks the table; the ModR/M reg field carries the
+        // operation, not the index, so `/1` on `(%rax)` is `da 08`.
+        assert_eq!(hex("fimull (%rax)"), "da 08");
+        // A 32-bit address register is an address-size override, as with every
+        // other memory form: the 0x67 goes in front of the same DE /0.
+        assert_eq!(hex("fiaddl (%ebx)"), "67 da 03");
+        // A register operand is not an integer-memory form.
+        assert!(fails("fiadds %eax"), "{}", fail_msg("fiadds %eax"));
+    }
+
+    #[test]
+    fn fcmov_encodes_the_condition_and_register() {
+        // DA /0-3 and DB /0-3 with the register in the low three bits.
+        assert_eq!(hex("fcmovb %st(3)"), "da c3");
+        assert_eq!(hex("fcmove %st(2)"), "da ca");
+        assert_eq!(hex("fcmovbe %st(1)"), "da d1");
+        assert_eq!(hex("fcmovu %st(0)"), "da d8");
+        assert_eq!(hex("fcmovnb %st(3)"), "db c3");
+        assert_eq!(hex("fcmovne %st(2)"), "db ca");
+        assert_eq!(hex("fcmovnbe %st(1)"), "db d1");
+        assert_eq!(hex("fcmovnu %st(0)"), "db d8");
+        // `a`/`ae`/`na`/`nae` name the same four status-word tests, so they
+        // decode to the NB/NBE/BE/B encodings rather than inventing new ones.
+        assert_eq!(hex("fcmova %st(3)"), "db d3");
+        assert_eq!(hex("fcmovae %st(3)"), "db c3");
+        assert_eq!(hex("fcmovna %st(3)"), "da d3");
+        assert_eq!(hex("fcmovnae %st(3)"), "da c3");
+        // AT&T operand order: source first, ST(0) implicit or explicit.
+        assert_eq!(hex("fcmovb %st(2), %st"), "da c2");
+        // The condition alone never determines the source register.
+        assert!(fails("fcmovb"), "{}", fail_msg("fcmovb"));
+        assert!(
+            fails("fcmovb %st(1), %st(2)"),
+            "{}",
+            fail_msg("fcmovb %st(1), %st(2)")
+        );
+    }
+
+    #[test]
+    fn unordered_compare_forms() {
+        // Bare `fucom`/`fucomp` compare against ST(1) (SDM Vol. 2B).
+        assert_eq!(hex("fucom"), "dd e1");
+        assert_eq!(hex("fucomp"), "dd e9");
+        assert_eq!(hex("fucom %st(2)"), "dd e2");
+        assert_eq!(hex("fucomp %st(2)"), "dd ea");
+        assert_eq!(hex("fucom %st(0)"), "dd e0");
+        assert_eq!(hex("fucomp %st(7)"), "dd ef");
+        assert_eq!(hex("fucom %st(3), %st"), "dd e3");
+        assert!(
+            fails("fucom %st(1), %st(2)"),
+            "{}",
+            fail_msg("fucom %st(1), %st(2)")
+        );
+    }
+}
+
 #[cfg(test)]
 mod index_fold_tests {
     use super::apx_tests::{fails, hex, hex_relocs};

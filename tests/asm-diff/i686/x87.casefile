@@ -44,3 +44,37 @@ fsubp %st(5), %st
 fsubrp %st(6), %st
 fdivp %st(2), %st
 fdivrp %st(2), %st
+;;; x87 integer-memory arithmetic and conditional moves
+fiadds (%ebx)
+fiaddl (%ebx)
+fimuls (%ebx)
+fimull (%ebx)
+ficoms (%ebx)
+ficoml (%ebx)
+ficomps (%ebx)
+ficompl (%ebx)
+fisubs (%ebx)
+fisubl (%ebx)
+fisubrs (%ebx)
+fisubrl (%ebx)
+fidivs (%ebx)
+fidivl (%ebx)
+fidivrs (%ebx)
+fidivrl (%ebx)
+fidivs 8(%ebp)
+fucom %st(2)
+fucomp %st(1)
+fucom %st(0)
+fucomp %st(7)
+fcmovb %st(0), %st
+fcmove %st(1), %st
+fcmovbe %st(2), %st
+fcmovu %st(3), %st
+fcmovnb %st(4), %st
+fcmovne %st(5), %st
+fcmovnbe %st(6), %st
+fcmovnu %st(7), %st
+fcmova %st(2), %st
+fcmovae %st(2), %st
+fcmovna %st(2), %st
+fcmovnae %st(2), %st
