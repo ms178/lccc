@@ -16,6 +16,18 @@ class NativeBuiltinTypes(unittest.TestCase):
         self.assertEqual(generator.OUTPUT.read_text(), generator.generate())
         self.assertEqual(generator.CONTRACT.read_text(), generator.contract_source())
 
+    def test_hosted_dual_mode_fixtures_have_real_i686_entries(self):
+        for family in ('gnu_native_builtin_types', 'gnu_byte_shift_counts', 'public_simd_native_types'):
+            with self.subTest(family=family):
+                directory = ROOT / 'tests/regression'
+                entry = (directory / f'{family}_i686.c').read_text()
+                self.assertIn(f'#include "{family}.c"', entry)
+                flags = (directory / f'{family}_i686.flags').read_text().split()
+                self.assertEqual(flags.count('-m32'), 1)
+                self.assertNotIn('-m64', flags)
+                flags.remove('-m32')
+                self.assertEqual(flags, (directory / f'{family}.flags').read_text().split())
+
     def test_lane_width_is_not_ir_pointer_type(self):
         self.assertEqual(generator.result_expression('V4SI'), 'CType::Vector(Box::new(CType::Int), 16)')
         self.assertEqual(generator.result_expression('V4DI'), 'CType::Vector(Box::new(CType::LongLong), 32)')

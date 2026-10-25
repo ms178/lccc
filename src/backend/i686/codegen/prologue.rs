@@ -120,36 +120,8 @@ impl I686Codegen {
         false
     }
 
-    // ---- calculate_stack_space ----
-
-    pub(super) fn calculate_stack_space_impl(&mut self, func: &IrFunction) -> i64 {
-        self.is_variadic = func.is_variadic;
-        self.is_fastcall = func.is_fastcall;
-        self.current_return_type = func.return_type;
-        self.current_return_i686_xmm = func.return_type == IrType::I128
-            && func.ret_eightbyte_classes
-                == [
-                    crate::common::types::EightbyteClass::Sse,
-                    crate::common::types::EightbyteClass::SseUp,
-                ];
-        self.current_return_i686_ext_vector_gp3 = func.return_type == IrType::I128
-            && func.ret_eightbyte_classes.len() == 3
-            && func
-                .ret_eightbyte_classes
-                .iter()
-                .all(|class| *class == crate::common::types::EightbyteClass::Integer);
-        // Effective regparm for this function: a function-level
-        // `__attribute__((regparm(N)))` overrides the global -mregparm
-        // flag; fastcall wins over both (GCC passes ECX/EDX and the two
-        // attributes together are rejected at parse time). The
-        // classification itself ignores regparm for variadic functions
-        // (GCC function_arg_32: all-stack).
-        self.regparm = if func.is_fastcall {
-            0
-        } else {
-            func.regparm.unwrap_or(self.base_regparm).min(3)
-        };
-
+    /// Resolve incoming parameter homes once, before conflict analysis and allocation.
+    fn prepare_parameter_layout(&mut self, func: &IrFunction) {
         // Fastcall layout: the single source of truth shared by parameter
         // capture, ParamRef and the return instruction. Computed here (not
         // in emit_store_params) because the conflict analysis below needs
@@ -190,6 +162,39 @@ impl I686Codegen {
         } else {
             self.fastcall_stack_cleanup = 0;
         }
+    }
+
+    // ---- calculate_stack_space ----
+
+    pub(super) fn calculate_stack_space_impl(&mut self, func: &IrFunction) -> i64 {
+        self.is_variadic = func.is_variadic;
+        self.is_fastcall = func.is_fastcall;
+        self.current_return_type = func.return_type;
+        self.current_return_i686_xmm = func.return_type == IrType::I128
+            && func.ret_eightbyte_classes
+                == [
+                    crate::common::types::EightbyteClass::Sse,
+                    crate::common::types::EightbyteClass::SseUp,
+                ];
+        self.current_return_i686_ext_vector_gp3 = func.return_type == IrType::I128
+            && func.ret_eightbyte_classes.len() == 3
+            && func
+                .ret_eightbyte_classes
+                .iter()
+                .all(|class| *class == crate::common::types::EightbyteClass::Integer);
+        // Effective regparm for this function: a function-level
+        // `__attribute__((regparm(N)))` overrides the global -mregparm
+        // flag; fastcall wins over both (GCC passes ECX/EDX and the two
+        // attributes together are rejected at parse time). The
+        // classification itself ignores regparm for variadic functions
+        // (GCC function_arg_32: all-stack).
+        self.regparm = if func.is_fastcall {
+            0
+        } else {
+            func.regparm.unwrap_or(self.base_regparm).min(3)
+        };
+
+        self.prepare_parameter_layout(func);
 
         // Same-block div/rem pair fusion table (one divl serves a
         // URem+UDiv couple with identical operands). Constant-RHS pairs
