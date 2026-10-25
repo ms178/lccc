@@ -1348,6 +1348,7 @@ gate "llvm-bit-demand" fast python3 tests/regression/check_llvm_bit_demand.py
 gate "llvm-scalar-facts" fast python3 tests/regression/check_llvm_scalar_facts.py
 gate "llvm-guarded-folds" fast python3 tests/regression/check_llvm_guarded_folds.py
 gate "llvm-word-counts" fast python3 tests/regression/check_llvm_word_counts.py
+gate "count-observations" fast python3 tests/regression/check_count_observations.py --clang "${CLANG:-clang-23}"
 gate "llvm-scalar-logic" fast python3 tests/regression/check_llvm_scalar_logic.py
 gate "llvm-predicate-relations" fast python3 tests/regression/check_llvm_predicate_relations.py
 gate "packed-vector-relations" fast python3 tests/regression/check_packed_vector_relations.py

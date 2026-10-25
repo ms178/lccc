@@ -2444,6 +2444,7 @@ jobs:
         CCC=target/fastbuild/lccc bash tests/regression/check_sparse_bss_nobits.sh
         python3 scripts/glibc_check_triage.py --self-test
         python3 tests/regression/check_llvm_word_counts.py
+        python3 tests/regression/check_count_observations.py --clang "${CLANG:-clang-23}"
         bash tests/regression/check_vectorize_round_maps.sh
         python3 tests/regression/check_llvm_guarded_folds.py
         # ZERO-ROT-AFFINE: loop_rotate's cloned exit compare folds its
@@ -2743,7 +2744,7 @@ jobs:
         exec > >(tee intel-evidence/dispatch.log) 2>&1
         trap 'status=$?; if [ "$status" -ne 0 ]; then while IFS= read -r line; do printf "::error::%s\n" "$line"; done < <(tail -n 30 intel-evidence/dispatch.log); fi' EXIT
         python3 scripts/test_local_oracles.py
-        for fixture in popcount_loop_idiom crc32_index_narrowing_variants affine_scaled_index_matrix sign_test_cmov shufflevector_value_convention; do
+        for fixture in popcount_loop_idiom crc32_index_narrowing_variants affine_scaled_index_matrix sign_test_cmov shufflevector_value_convention count_observations; do
           "$LCCC_ICX_BIN" -O2 -fwrapv -Wall -Wextra -Werror "tests/regression/$fixture.c" -o "intel-evidence/$fixture-icx"
           target/fastbuild/lccc -O2 -fwrapv -Wall -Wextra -Werror "tests/regression/$fixture.c" -o "intel-evidence/$fixture-lccc"
           "intel-evidence/$fixture-icx" > "intel-evidence/$fixture-icx.txt"
