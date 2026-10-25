@@ -2,10 +2,10 @@
    the harness itself legal without SSE2 (no MOVD float/integer bitcasts). */
 #include <stdint.h>
 #include <stdio.h>
-#ifndef __SSE__
+#if defined(SSE1_MAP_REQUIRE_ONLY) && !defined(__SSE__)
 #error SSE1 is required
 #endif
-#ifdef __SSE2__
+#if defined(SSE1_MAP_REQUIRE_ONLY) && defined(__SSE2__)
 #error this workload must exercise an SSE1-only target
 #endif
 #ifndef SSE1_MAP_PASSES

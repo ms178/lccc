@@ -86,6 +86,14 @@ was added.
   every source with a fixed ISA. This preserves the SSE1-only assertion and
   also covers both registered F32/F64 builds; the focused three-profile check
   passes (`debug-parity.txt`). Raw diagnostic TUs retain default coverage.
+- The benchmark's ISA assertion is scoped to its registered
+  `SSE1_MAP_REQUIRE_ONLY` profile so generic SSA/cross-target corpus consumers
+  can build the ordinary portable C workload too. It still rejects SSE2 when
+  that profile is requested (`benchmark-assertion.txt`), and the focused SSA
+  corpus case passes. `timed-source.c` retains the measured source; all four
+  recompiled binaries are byte-identical after this guard-only change
+  (`source-guard-identity.json`). The native kernel keeps its unconditional
+  SSE1-only assertion.
 
 Commands and raw samples are retained in the JSON and text files. Absolute
 artifact/tool paths record this sandbox and are not claimed to exist elsewhere.
