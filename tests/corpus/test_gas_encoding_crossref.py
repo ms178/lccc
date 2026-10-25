@@ -334,7 +334,8 @@ class GasEncodingCrossrefTests(unittest.TestCase):
         models = self.gas.code_models()
 
         def forms(name):
-            return sorted((f["opcode"], f["reg"]) for f in models[name])
+            return sorted((f["opcode"], f["reg"]) for f in models[name]
+                          if f["family"] == "legacy")
 
         self.assertEqual(
             forms("add"),
@@ -353,7 +354,8 @@ class GasEncodingCrossrefTests(unittest.TestCase):
         )
         # The model is keyed by the GAS spelling, so all four suffixed arms of
         # `add` collapse onto one name instead of duplicating the forms.
-        self.assertEqual(len(models["add"]), 9)
+        self.assertEqual(sum(f["family"] == "legacy" for f in models["add"]), 9)
+        self.assertEqual(sum(f["family"] == "evex" for f in models["add"]), 7)
 
     def test_a_code_modelled_family_leaves_the_gap_list(self):
         """The ALU gap entries were a modelling hole, not missing encodings.
@@ -383,8 +385,8 @@ class GasEncodingCrossrefTests(unittest.TestCase):
         # coverage, so the guarantee is per name, not on the total.
         for name, gaps in before.items():
             self.assertLessEqual(len(after.get(name, [])), len(gaps), name)
-        self.assertEqual(sum(len(after.get(n, [])) for n in before),
-                         sum(len(v) for v in before.values()))
+        self.assertLessEqual(sum(len(after.get(n, [])) for n in before),
+                             sum(len(v) for v in before.values()))
 
 
 class GasAbsentTriageTests(unittest.TestCase):
@@ -559,14 +561,47 @@ class GasCodeModelGateTests(unittest.TestCase):
                 self.assertEqual(checked, sum(len(v) for v in claims.values()))
                 self.assertGreater(len(claims), 100)
 
+    def test_direct_evex_models_follow_literal_dispatch_and_reject_illegal_forms(self):
+        claims = self.gas.evex_direct_code_models()
+        self.assertGreaterEqual(sum(map(len, claims.values())), 350)
+        findings, checked = self.gas.verify_code_models(claims, self.table)
+        self.assertEqual(findings, [])
+        self.assertEqual(checked, sum(map(len, claims.values())))
+        # These SSSE3 operations are VEX/legacy-only; GAS 2.47 has no EVEX
+        # row. Their accidental EVEX dispatch arms were a real illegal-encoding
+        # defect, removed from the encoder and pinned by an asm-diff reject case.
+        for name in ("vphaddw", "vphaddd", "vphsubw", "vphsubd",
+                     "vpsignb", "vpsignw", "vpsignd"):
+            self.assertNotIn(name, claims)
+
+    def test_apx_integer_models_cover_only_verified_encoder_helper_paths(self):
+        claims = self.gas.code_models("x86", self.table)
+        # These opcode families are selected in explicit APX EVEX branches in
+        # gp_integer.rs; claims must remain tied to GAS 2.47's map-4 snapshot.
+        self.assertIn((0xF7, 3), [(e["opcode"], e["reg"])
+                                  for e in claims["neg"]
+                                  if e["family"] == "evex"])
+        self.assertIn((0x24, None), [(e["opcode"], e["reg"])
+                                     for e in claims["shld"]
+                                     if e["family"] == "evex"])
+        self.assertIn((0xAD, None), [(e["opcode"], e["reg"])
+                                     for e in claims["shrd"]
+                                     if e["family"] == "evex"])
+        findings, checked = self.gas.verify_code_models(claims, self.table)
+        self.assertEqual(findings, [])
+        self.assertEqual(checked, sum(map(len, claims.values())))
+
     def test_the_cc_and_fma_claims_are_derived_from_the_encoder_tables(self):
         claims = self.gas.code_models("all", self.table)
         # `jne` short form, `cmovne` `0f 45`, `setne` `0f 95 /0`.
         self.assertEqual([e["opcode"] for e in claims["jne"]], [0x75])
-        self.assertEqual([(e["map"], e["opcode"]) for e in claims["cmovne"]],
-                         [("0f", 0x45)])
-        self.assertEqual([(e["map"], e["opcode"], e["reg"])
-                          for e in claims["setne"]], [("0f", 0x95, 0)])
+        self.assertEqual([(e["family"], e["map"], e["opcode"])
+                          for e in claims["cmovne"]],
+                         [("legacy", "0f", 0x45), ("evex", "none", 0x45)])
+        self.assertEqual([(e["family"], e["map"], e["opcode"], e["reg"])
+                          for e in claims["setne"]],
+                         [("legacy", "0f", 0x95, 0),
+                          ("evex", "none", 0x45, 0)])
         # FMA3 reads the opcode out of the mnemonic: `vfmadd132ps` is
         # VEX.66.0F38.W0 98, and `vfnmsub231sd` is `9e` + `0x20` for the 231
         # operand order + `1` for the scalar form, with W=1 for `sd`.

@@ -13,7 +13,7 @@ generator emits, plus enough additional coverage to assemble hand-written
 assembly from projects such as musl libc and the Linux kernel.  It is not a
 general-purpose GAS replacement -- it intentionally does not implement the full
 GNU assembler specification -- but it covers a broad swath of the x86-64 ISA,
-including SSE through SSE4.1, SSE3/SSSE3, AVX, AVX2, initial AVX-512 (EVEX),
+including SSE through SSE4.2, SSE3/SSSE3, AMD SSE4a, AVX, AVX2, initial AVX-512 (EVEX),
 BMI2, AES-NI, PCLMULQDQ, CRC32, and x87 FPU instructions.
 
 ### Entry Point
@@ -578,12 +578,14 @@ The encoder covers the following instruction categories (800+ match arms):
 | 10 | **SSE/SSE2 scalar float** | movss, movsd, addss/sd, subss/sd, mulss/sd, divss/sd, sqrtss/sd, ucomisd, ucomiss, xorpd/ps, andpd/ps, minss/sd, maxss/sd |
 | 11 | **SSE packed float** | addpd/ps, subpd/ps, mulpd/ps, divpd/ps, orpd/ps, andnpd/ps, minpd/ps, maxpd/ps |
 | 12 | **SSE data movement** | movaps, movdqa, movdqu, movlpd, movhpd, movapd, movups, movupd, movhlps, movlhps, movd, movq, movmskpd, movmskps |
-| 13 | **SSE2 integer SIMD** | paddb/w/d/q, psubb/w/d, pmulhw, pmaddwd, pcmpgtw/b, packssdw, packuswb, punpckl/h (bw/wd/dq/qdq), pmovmskb, pcmpeqb/d/w, pand, pandn, por, pxor, psubusb/w, paddusb/w, paddsb/w, pmuludq, pmullw, pmulld, pminub, pmaxub, pminsd, pmaxsd, pavgb/w, psadbw |
+| 13 | **SSE2 integer SIMD** | paddb/w/d/q, psubb/w/d, pmulhw, pmaddwd, pcmpgtw/b, packssdw, packuswb, punpckl/h (bw/wd/dq/qdq), pmovmskb, pcmpeqb/d/w, pand, pandn, por, pxor, psubusb/w, paddusb/w, paddsb/w, pmuludq, pmullw, pminub, pmaxub, pavgb/w, psadbw |
 | 14 | **SSE shifts** | psllw/d/q, psrlw/d/q, psraw/d, pslldq, psrldq |
 | 15 | **SSE shuffles** | pshufd, pshuflw, pshufhw, shufps, shufpd, palignr, pshufb |
 | 16 | **SSE insert/extract** | pinsrb/w/d/q, pextrb/w/d/q |
-| 17 | **SSE3/SSSE3** | haddpd/ps, hsubpd/ps, addsubpd/ps, movddup, movshdup, movsldup, pabsb/w/d, phaddw/d, phsubw/d, pmulhrsw |
-| 18 | **SSE4.1** | blendvpd/ps, pblendvb, roundsd/ss/pd/ps, pblendw, blendpd/ps, dpps, dppd, ptest, pminsb, pminuw, pmaxsb, pmaxuw, pminud, pmaxud, pminsw, pmaxsw, phminposuw, packusdw, packsswb, pmovzxbw/bd/bq/wd/wq/dq, pmovsxbw/bd/bq/wd/wq/dq |
+| 17 | **SSE3/SSSE3** | haddpd/ps, hsubpd/ps, addsubpd/ps, lddqu, movddup, movshdup, movsldup, pabsb/w/d, phaddw/d/sw, phsubw/d/sw, pmaddubsw, pmulhrsw, pshufb, psignb/w/d |
+| 18 | **SSE4.1** | blendvpd/ps, pblendvb, roundsd/ss/pd/ps, pblendw, blendpd/ps, dpps/dppd, ptest, pcmpeqq, pmuldq, pmulld, pminsb/sd/uw/ud, pmaxsb/sd/uw/ud, phminposuw, packusdw, insertps/extractps, pmovzxbw/bd/bq/wd/wq/dq, pmovsxbw/bd/bq/wd/wq/dq |
+| 18a | **SSE4.2** | pcmpestri/m, pcmpistri/m, crc32b/w/l/q (POPCNT uses a separate feature bit) |
+| 18b | **AMD SSE4a** | extrq/insertq (register and immediate forms), movntsd/movntss; assembler support only, not a feature-dispatch or intrinsic claim |
 | 19 | **SSE unpacks** | unpcklpd/ps, unpckhpd/ps |
 | 20 | **SSE non-temporal** | movnti, movntdq, movntdqa, movntpd, movntps |
 | 21 | **SSE MXCSR** | ldmxcsr, stmxcsr |

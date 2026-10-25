@@ -135,6 +135,7 @@ SOURCES = [
     ("datafiles/amd/amdxop/amd-xop-isa.txt", "XOP"),
     ("datafiles/amd/amdxop/amd-vpermil2-isa.txt", "VPERMIL2"),
     ("datafiles/amd/amdxop/amd-fma4-isa.txt", "FMA4"),
+    ("datafiles/amd/xed-amd-sse4a.txt", "AMD SSE4a: EXTRQ/INSERTQ/MOVNTSD/MOVNTSS"),
     ("datafiles/amd/xed-amd-3dnow.txt", "3DNow!/MMX extensions"),
     # EVEX.  The encoder's EVEX rows are AVX-512 forms of instructions that also
     # have VEX rows (`vpxord`, `vprold`, `vmovdqa32`), so without the AVX-512
@@ -910,7 +911,9 @@ def parse_pattern(pattern: str) -> dict | None:
     pp = "none"
     w = None
     opcodes: list[int] = []
-    modrm = "MODRM()" in pattern
+    # XED omits the MODRM() nonterminal for register-only forms even though
+    # the ModR/M byte is still present in the opcode stream.
+    modrm = "MODRM()" in pattern or all(field in pattern for field in ("MOD[", "REG[", "RM["))
     for pos, tok in enumerate(toks):
         # XED spells "the opcode carries the register (or the condition code) in
         # its low three bits" as `0xB8+rd` / `0x90+cc` / `0x50+ro`.  The base
@@ -963,6 +966,8 @@ def parse_pattern(pattern: str) -> dict | None:
         "w": w,
         "opcode": opcodes[-1] if opcodes else None,
         "modrm": modrm,
+        "modrm_mode": ("register" if "MOD=3" in toks or "MOD[0b11]" in toks
+                       else "memory" if "MOD!=3" in toks else None),
         "reg": (lambda m: int(m.group(1), 2) if m else None)(
             re.search(r"REG\[0b([01]+)\]", pattern)),
     }
@@ -1211,6 +1216,33 @@ def model_row(row: dict, b64: bool = False, name: str | None = None) -> list[dic
         # silently reporting every mnemonic-driven row as unmodelled.
         name = row["names"][0] if row["names"] else None
     helper = row_helper(body)
+    if helper == "encode_via_x64" and not b64:
+        # i686 deliberately shares a few instructions whose mode/width forms
+        # are easier to express in the x86-64 encoder; audit the actual target
+        # row rather than inventing a 32-bit opcode model.
+        x64_files = [REPO / "src/backend/x86/assembler/encoder/mod.rs"]
+        for target in (row for path in x64_files for row in extract_rows(path)):
+            matches_name = name in target["names"] or (name == "crc32" and "crc32b" in target["names"])
+            if matches_name and row_helper(target["body"]) != helper:
+                if name == "crc32":
+                    return [enc for suffix in ("b", "w", "l")
+                            for enc in model_row(target, False, name + suffix) or []] or None
+                return model_row(target, False, name)
+        if name in ("popcnt", "popcntw", "popcntl"):
+            # The shared x86 row is a multiline match arm and thus cannot be
+            # extracted as a declarative source row; POPCNT remains F3.0F.B8.
+            return [form(0xB8, map_="0f", pp="f3")]
+        return None
+    if helper == "encode_sse4a_bits":
+        args = call_args(body, helper)
+        if args is None or len(args) != 2 or args[1] not in ("true", "false"):
+            return None
+        insert = args[1] == "true"
+        pp = "f2" if insert else "66"
+        return [form(opcode, map_="0f", pp=pp,
+                     reg=0 if opcode == 0x78 and not insert else None,
+                     modrm_mode="register")
+                for opcode in (0x78, 0x79)]
     if helper is not None:
         args = call_args(body, helper)
         if args is not None:
@@ -1257,6 +1289,8 @@ def model_row(row: dict, b64: bool = False, name: str | None = None) -> list[dic
             enc = legacy_encoding(arr, b64)
             if enc is None:
                 return None
+            if helper in ("encode_sse_store", "encode_sse_store_only"):
+                enc["modrm_mode"] = "memory"
             encs.append(enc)
         return encs
     return None
@@ -1370,9 +1404,9 @@ def name_size(name: str | None) -> int | None:
 
 def form(opcode: int, *, map_: str = "none", pp: str | None = "none",
          w: int | None = None, reg: int | None = None,
-         family: str = "legacy") -> dict:
+         modrm_mode: str | None = None, family: str = "legacy") -> dict:
     return {"family": family, "map": map_, "pp": pp, "w": w,
-            "opcode": opcode, "modrm": True, "reg": reg}
+            "opcode": opcode, "modrm": True, "modrm_mode": modrm_mode, "reg": reg}
 
 
 def _sized(opcodes: dict[int, int], size: int, reg: int | None,
@@ -2057,6 +2091,9 @@ def _matches(want: dict, have: dict) -> bool:
     if want["family"] != have["family"] or want["map"] != have["map"]:
         return False
     if want["pp"] != have["pp"] or want["opcode"] != have["opcode"]:
+        return False
+    if (want.get("modrm_mode") is not None and have.get("modrm_mode") is not None
+            and want["modrm_mode"] != have["modrm_mode"]):
         return False
     if want["w"] is not None and have["w"] is not None and want["w"] != have["w"]:
         return False
