@@ -538,7 +538,32 @@ def gas_name(mnemonic: str) -> str:
     return m.group(1) if m else mnemonic
 
 
-VEX_PAIR = {frozenset(("vex", "legacy")), frozenset(("evex", "legacy"))}
+# `i386-opc.tbl` spells a VEX and an EVEX instruction with the same template
+# fields; which prefix family a row uses is not visible in the snapshot, so the
+# three families compare as one when map, prefix and opcode agree.
+VEX_PAIR = {frozenset(("vex", "legacy")), frozenset(("evex", "legacy")),
+            frozenset(("vex", "evex"))}
+# Mnemonics whose `i386-opc.tbl` entry cannot be compared with the encoder's row,
+# with the reason.  Every one of them is pinned byte-for-byte by the as-2.47
+# differential instead (`tests/asm-diff/prefix.casefile` for the string forms,
+# `tests/asm-diff/suffix-s.casefile` for WRMSRNS), which compares against the
+# assembler's actual output rather than against a transcription of its table.
+SNAPSHOT_LIMITATIONS = {
+    # `movsb` is two different instructions in GAS: the string move (0xA4) and,
+    # with operands, the sign-extending move (0F BE).  The snapshot holds only
+    # the second spelling; the encoder row is the string form.
+    "movsb": "string move vs sign-extend overload",
+    "movsw": "string move vs sign-extend overload",
+    "movsl": "string move vs sign-extend overload",
+    "movsq": "string move vs sign-extend overload",
+    # The distiller reads the last byte of the `0F 01 /0` form as the opcode and
+    # records `f6` (the ModR/M byte of `wrmsrns`), so the snapshot entry does not
+    # describe the instruction the SDM defines (0F 01 C6).
+    "wrmsrns": "snapshot recorded the ModR/M byte as the opcode",
+}
+
+# Maps that exist only in EVEX/VEX and have no representation in i386-opc.tbl.
+EXTENDED_MAPS = frozenset({"map4", "map5", "map6", "map7"})
 
 HELPER_OF = re.compile(r"(?:self\.)?([a-z_][a-z0-9_]*)\(")
 
@@ -552,8 +577,16 @@ def _same(want: dict, have: dict) -> bool:
         # them as one form is exact for the encoding and avoids a false report.
         if frozenset((want.get("family"), have.get("family"))) not in VEX_PAIR:
             return False
-    for key in ("map", "pp", "opcode"):
-        if want.get(key) != have.get(key):
+    # `i386-opc.tbl` has no notation for EVEX/VEX maps 4..7 (APX, USER_MSR), so
+    # the snapshot records those forms with map "none".  The map bits are not
+    # part of the comparison then; the SDM gate checks them exactly.
+    want_map = want.get("map")
+    if want_map in EXTENDED_MAPS:
+        want_map = "none"
+    for key, wv, hv in (("map", want_map, have.get("map")),
+                        ("pp", want.get("pp"), have.get("pp")),
+                        ("opcode", want.get("opcode"), have.get("opcode"))):
+        if wv != hv:
             return False
     if want.get("reg") is not None and have.get("reg") is not None:
         return want["reg"] == have["reg"]
@@ -562,15 +595,32 @@ def _same(want: dict, have: dict) -> bool:
     return True
 
 
-def verify(rows: list[dict], table: dict[str, list[dict]], model) -> tuple[list, list, int]:
-    findings, unmodeLLed, checked = [], [], 0
+def verify(rows: list[dict], table: dict[str, list[dict]],
+           model) -> tuple[list, list, int, list]:
+    """Check every modelled row against the snapshot.
+
+    Returns `(findings, unmodelled, checked, uncovered)`: `uncovered` names the
+    mnemonics the snapshot has no entry for at all (see the comment at the
+    `known is None` branch)."""
+    findings, unmodeLLed, uncovered, checked = [], [], [], 0
     for row in rows:
-        encs = model(row)
-        if encs is None:
+        # A row that binds a relocation kind or an operand name (`es`, `fs`,
+        # `gotpcrel`, ...) is not an instruction row; the SDM gate skips exactly
+        # these, so this one does too instead of counting them as unmodelled.
+        if row["names"] and all(n in MNEMONIC_FRAGMENTS for n in row["names"]):
+            continue
+        if model(row) is None:
             unmodeLLed.append(row)
             continue
         for name in row["names"]:
-            if name in MNEMONIC_FRAGMENTS:
+            if name in MNEMONIC_FRAGMENTS or name in SNAPSHOT_LIMITATIONS:
+                continue
+            # The model depends on the spelling, not just on the row: one row
+            # binds `lzcntl,tzcntl,popcntl` to the same helper and the opcode
+            # comes from the mnemonic.
+            encs = model(row, name)
+            if encs is None:
+                unmodeLLed.append(row)
                 continue
             prefixes = [name]
             base = gas_name(name)
@@ -582,17 +632,30 @@ def verify(rows: list[dict], table: dict[str, list[dict]], model) -> tuple[list,
                 prefixes.append(name[1:])
             known = next((table[p] for p in prefixes if p in table), None)
             if known is None:
-                findings.append({"kind": "LCCC-UNKNOWN", "name": name,
-                                 "file": row["file"], "line": row["line"],
-                                 "body": row["body"], "want": None})
+                # The snapshot is a transcription of `opcodes/i386-opc.tbl`, and
+                # a few templates (`blsi`, `blsr`, `blsmsk`, `andn`, the
+                # parameterised `setcc` ...) are spelled there in a form the
+                # distiller cannot enumerate, so they have no entry at all.  That
+                # is a gap in the *reference*, not an encoding defect, and the
+                # SDM gate covers those classes with XED's descriptions, so it is
+                # reported separately instead of failing `--strict`.
+                uncovered.append({"name": name, "file": row["file"],
+                                  "line": row["line"]})
                 continue
             checked += 1
-            for enc in encs:
-                if not any(_same(enc, have) for have in known):
-                    findings.append({"kind": "LCCC-EXTRA", "name": name,
-                                     "file": row["file"], "line": row["line"],
-                                     "body": row["body"], "want": enc})
-    return findings, unmodeLLed, checked
+            # The row model is operand-shape-agnostic: `encode_mov` covers
+            # register, memory and immediate forms in one row, and the snapshot
+            # was distilled from the operand forms `as` was probed with.  The
+            # check is therefore "the row can emit something `as` also emits",
+            # reported per unmatched encoding only when nothing matches at all;
+            # the SDM gate is the one that requires *every* modelled form to be
+            # a legal encoding of the mnemonic.
+            extra = [enc for enc in encs if not any(_same(enc, have) for have in known)]
+            if len(extra) == len(encs):
+                findings.append({"kind": "LCCC-EXTRA", "name": name,
+                                 "file": row["file"], "line": row["line"],
+                                 "body": row["body"], "want": extra[0]})
+    return findings, unmodeLLed, checked, uncovered
 
 
 def missing(rows: list[dict], table: dict[str, list[dict]], model) -> dict[str, list[dict]]:
@@ -676,6 +739,10 @@ def main() -> int:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import sdm_isa_crossref as sdm  # local sibling module
 
+    # Rows that bind a relocation kind or an operand name are not instructions;
+    # the SDM gate skips exactly the same set, so this gate does too.
+    MNEMONIC_FRAGMENTS.update(sdm.NOT_A_MNEMONIC)
+
     table = load_snapshot()
     rows = []
     files = sdm.encoder_files(args.backend)
@@ -685,8 +752,18 @@ def main() -> int:
     # the 32-bit one, so the model has to know which backend it is reading.
     # The mode that gives a byte array its meaning is a property of the row's
     # backend, not of the whole run: `--backend all` mixes both.
-    model = sdm.model_any if args.backend == "all" else (
-        (lambda row: sdm.model_row(row, True)) if args.backend == "x86" else sdm.model_row)
+    # The model is a function of the row *and* the mnemonic: several helpers
+    # resolve their opcode from the spelling (`lzcnt` vs `popcnt`, `setc` vs
+    # `sete`), so a row is modelled per name exactly as the SDM gate does it.
+    def _name_of(row):
+        return row["names"][0] if row["names"] else None
+
+    def model(row, name=None):
+        """Model one row as the encoding of `name` (default: its first name)."""
+        name = name if name is not None else _name_of(row)
+        if args.backend == "all":
+            return sdm.model_any(row, name)
+        return sdm.model_row(row, args.backend == "x86", name)
 
     if args.summary or not (args.verify or args.missing or args.absent):
         manifest = json.loads(MANIFEST.read_text())
@@ -698,9 +775,10 @@ def main() -> int:
         print(f"encoder rows:  {len(rows)} in {len(files)} files")
 
     if args.verify:
-        findings, unmodeLLed, checked = verify(rows, table, model)
+        findings, unmodeLLed, checked, uncovered = verify(rows, table, model)
         print(f"\nrows checked against as 2.47: {checked}")
-        print(f"findings: {len(findings)}   unmodeLLed rows: {len(unmodeLLed)}")
+        print(f"findings: {len(findings)}   unmodeLLed rows: {len(unmodeLLed)}"
+              f"   not in the as 2.47 snapshot: {len(uncovered)}")
         shown = 0
         for f in findings:
             if args.limit and shown >= args.limit:
@@ -725,7 +803,11 @@ def main() -> int:
             for row in unmodeLLed[: args.limit]:
                 print(f"  UNMODELLED    {row['names'][0]:14s} {row['file']}:{row['line']}")
                 print(f"                {row['body'][:110]}")
-        if args.strict and findings:
+        if uncovered:
+            names = sorted({u["name"] for u in uncovered})
+            print(f"  UNCOVERED     {len(names)} mnemonic(s) with no entry in the "
+                  f"as 2.47 snapshot: {' '.join(names)}")
+        if args.strict and (findings or unmodeLLed):
             return 1
 
     if args.missing:
