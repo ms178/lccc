@@ -5579,6 +5579,30 @@ mod prefetch_isa_tests {
     }
 
     #[test]
+    fn legacy_sse41_permission_is_not_the_x86_64_codegen_ceiling() {
+        use crate::common::x86_features::X86Feature as F;
+        for mode in ["-m32", "-m64"] {
+            for (flags, granted) in [
+                (&[][..], false),
+                (&["-msse4.1"][..], true),
+                (&["-march=nehalem"][..], true),
+                (&["-msse4.1", "-mno-sse4.1"][..], false),
+                (&["-mno-sse4.1", "-msse4.1"][..], true),
+                (&["-msse4.1", "-mno-sse2", "-msse"][..], false),
+                (&["-msse4.1", "-mno-sse"][..], false),
+            ] {
+                let mut args = vec![mode];
+                args.extend_from_slice(flags);
+                assert_eq!(
+                    parse(&args).effective_x86_features().contains(F::Sse41),
+                    granted,
+                    "{args:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn i686_sse_feature_mirror_tracks_abi_permission() {
         // The i386 default baseline is the x86-64 ISA level: `-m32` alone
         // resolves SSE AND SSE2 on (GCC 16.2 default `-m32` = `-march=x86-64`

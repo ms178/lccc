@@ -100,6 +100,23 @@ architecture". Retain VPMULHRSW EVEX and add a positive assembler witness.
 9. **Defensive SSE4a helper arity.** Check immediate-form arity before indexing
    operands, even though the ordinary dispatch already validates it.
 
+10. **i686 permission/backend confusion.** A real 32-bit compile probe found
+    that the common feature mirror borrowed the x86-64-only SSE4.1 ceiling,
+    rejecting explicitly requested PMULLD on i686. Resolve the legacy grant
+    from the actual SSE2 prerequisite and order-sensitive request/denial state.
+    A focused driver unit covers both modes, defaults, CPU profiles and sticky
+    denials. Native 32-bit semantic executables now pass O0/O1/O2/O3 using the
+    current assembler and linker; a freestanding entry point and minimal
+    fixed-width typedef shim avoid the unavailable 32-bit libc headers.
+    Scope the REX.W string-length witness to long mode, where that encoding
+    has architectural meaning; its two 64-bit length distinctions are intact.
+11. **Generated arity ordering.** Hosted assertion-enabled units caught the
+    unsorted manually inserted intrinsic rows. Regenerate the sorted table
+    from the headers instead of modifying the binary-search invariant or
+    excluding its test. All three focused arity units and header re-derivation
+    pass, with 350 names pinned across 21 headers; both-mode native runtime
+    and feature-permission checks pass again after regeneration.
+
 ## Evidence discipline and remaining scope
 
 The new scalar expectations avoid signed overflow. They include unsigned

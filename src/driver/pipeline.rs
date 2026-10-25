@@ -3515,7 +3515,12 @@ impl Driver {
         // profile that sets it): the default x86-64 baseline has none of them.
         set.insert_if(simd && self.enable_sse3, F::Sse3);
         set.insert_if(simd && self.enable_ssse3, F::Ssse3);
-        set.insert_if(self.x86_isa().sse41, F::Sse41);
+        // The x86-64 codegen ceiling is deliberately NONE for i686, but
+        // i686 still has explicit 128-bit SSE4.1 intrinsic emitters. Publish
+        // that request from its real SSE2 prerequisite, not the other backend.
+        let legacy_sse41 =
+            set.contains(F::Sse2) && self.enable_sse4_1 && !self.sse41_explicitly_disabled;
+        set.insert_if(legacy_sse41, F::Sse41);
         set.insert_if(simd && self.enable_sse4_2, F::Sse42);
         set.insert_if(self.resolved_popcnt(), F::Popcnt);
         // CMPXCHG16B: granted only by `-mcx16` or a v2+ `-march` profile.

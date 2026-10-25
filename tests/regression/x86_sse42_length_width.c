@@ -1,5 +1,7 @@
 /* SDM PCMPESTRI/M effective operand-size table: REX.W selects RAX/RDX
  * lengths, not wider vector operands, and the index is still ECX. */
+/* REX.W string lengths are a long-mode-only architectural witness. */
+#if defined(__x86_64__)
 typedef unsigned char bytes16 __attribute__((vector_size(16)));
 typedef union { bytes16 v; unsigned char b[16]; unsigned long long q[2]; } data;
 int main(void) {
@@ -19,3 +21,7 @@ int main(void) {
     }
     return 0;
 }
+
+#else
+int main(void) { return 0; }
+#endif
