@@ -209,3 +209,14 @@ remain deferred**: the ledger is now 170 reviewed (52 limited, 118 deferred),
 2,941 unreviewed. Typed GNU shuffle homes reduce copies and expose register
 algebra; matching private shuffles factor around safe integer/bitwise binops.
 Existing machine-level adjacent shuffle composition is not claimed as new.
+
+## Packed shifts and canonical masks
+
+[Packed mask shifts](PACKED-MASK-SHIFTS.md) adds **250 new excerpt-based report
+reviews** and reassesses **all 118 previous deferrals**. One new reduced scope
+is covered; none of the prior full scopes is silently promoted. The cumulative
+ledger is **420 reviewed (53 limited, 367 deferred), 2,691 unreviewed**. Native
+feature-veto testing also exposed and repaired narrow scalarized vector-shift
+wrong code. Paired SSE2 microkernels improve over frozen main, but the amplified
+deep-mask case and unchanged-code shared control still trail GCC; this is not a
+claim of universal runtime supremacy.

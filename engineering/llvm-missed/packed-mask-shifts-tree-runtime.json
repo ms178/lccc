@@ -1,0 +1,3353 @@
+{
+  "aggregate_lccc_vs_best_reference": {
+    "arithmetic_mean_ratio": 1.0440444373609317,
+    "best": {
+      "benchmark": "packed_tree32",
+      "ratio": 1.0440444373609317,
+      "reference": "gcc"
+    },
+    "geometric_mean_ratio": 1.0440444373609317,
+    "interpretation": "LCCC / fastest available reference paired median; <1 means LCCC faster",
+    "n_correct_benchmarks": 1,
+    "worst": {
+      "benchmark": "packed_tree32",
+      "ratio": 1.0440444373609317,
+      "reference": "gcc"
+    }
+  },
+  "aggregate_lccc_vs_gcc": {
+    "arithmetic_mean_ratio": 1.0440444373609317,
+    "best": {
+      "benchmark": "packed_tree32",
+      "ratio": 1.0440444373609317
+    },
+    "geometric_mean_ratio": 1.0440444373609317,
+    "interpretation": "LCCC/GCC paired median ratios; <1 means LCCC faster",
+    "n_correct_benchmarks": 1,
+    "worst": {
+      "benchmark": "packed_tree32",
+      "ratio": 1.0440444373609317
+    }
+  },
+  "benchmarks": [
+    {
+      "baseline_compiler": "gcc",
+      "compile": {
+        "before": {
+          "binary_bytes": 17064,
+          "binary_sha256": "da01ddf0e31d7b5eba762b279a69c5ed76598fd0a1ea7d552cdada2ca7205a1f",
+          "child_cpu_s": 0.01649299999999998,
+          "command": [
+            "/home/user/tools/oracle-bin/gcc",
+            "-fno-lto",
+            "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/before/benchmark.driver.o",
+            "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/before/benchmark.kernel.o",
+            "-o",
+            "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/before/benchmark.bin"
+          ],
+          "commands": [
+            [
+              "/home/user/artifacts/campaign250/before/lccc",
+              "-I/home/user/tools/gcc/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+              "-O2",
+              "-msse2",
+              "-msse2",
+              "-DONLY128",
+              "-DMASK_KERNELS_ONLY",
+              "-c",
+              "/home/user/lccc/tests/regression/packed_mask_shifts.c",
+              "-o",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/before/benchmark.kernel.o"
+            ],
+            [
+              "/home/user/tools/oracle-bin/gcc",
+              "-O2",
+              "-msse2",
+              "-fno-lto",
+              "-DCASE=3",
+              "-DITERATIONS=134217728",
+              "-c",
+              "/home/user/lccc/tests/benchmark/programs/packed_mask_shifts_driver.c",
+              "-o",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/before/benchmark.driver.o"
+            ],
+            [
+              "/home/user/tools/oracle-bin/gcc",
+              "-fno-lto",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/before/benchmark.driver.o",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/before/benchmark.kernel.o",
+              "-o",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/before/benchmark.bin"
+            ]
+          ],
+          "driver_compiler": "/home/user/tools/oracle-bin/gcc",
+          "driver_sha256": "9e576fa4f1eaf4b591434757a81d0a0ec4d1af2cbcf556ebabbcfb9340714255",
+          "error": "",
+          "iterations": 134217728,
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "461de6cc1954b58b49d7401b0b73f0dfc058955982dd520798a2831e38965a0a",
+          "stderr": "",
+          "stdout": "",
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "text_bytes": 3973,
+          "wall_s": 0.016799852
+        },
+        "clang": {
+          "binary_bytes": 17208,
+          "binary_sha256": "de4b9f6976dbccc6ed3efaf173f731c4bb88847a9ad44b4ae7e5644e38a6df58",
+          "child_cpu_s": 0.017015000000000002,
+          "command": [
+            "/home/user/tools/oracle-bin/gcc",
+            "-fno-lto",
+            "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/clang/benchmark.driver.o",
+            "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/clang/benchmark.kernel.o",
+            "-o",
+            "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/clang/benchmark.bin"
+          ],
+          "commands": [
+            [
+              "/home/user/tools/oracle-bin/clang-23",
+              "-O2",
+              "-msse2",
+              "-msse2",
+              "-DONLY128",
+              "-DMASK_KERNELS_ONLY",
+              "-c",
+              "/home/user/lccc/tests/regression/packed_mask_shifts.c",
+              "-o",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/clang/benchmark.kernel.o"
+            ],
+            [
+              "/home/user/tools/oracle-bin/gcc",
+              "-O2",
+              "-msse2",
+              "-fno-lto",
+              "-DCASE=3",
+              "-DITERATIONS=134217728",
+              "-c",
+              "/home/user/lccc/tests/benchmark/programs/packed_mask_shifts_driver.c",
+              "-o",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/clang/benchmark.driver.o"
+            ],
+            [
+              "/home/user/tools/oracle-bin/gcc",
+              "-fno-lto",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/clang/benchmark.driver.o",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/clang/benchmark.kernel.o",
+              "-o",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/clang/benchmark.bin"
+            ]
+          ],
+          "driver_compiler": "/home/user/tools/oracle-bin/gcc",
+          "driver_sha256": "9e576fa4f1eaf4b591434757a81d0a0ec4d1af2cbcf556ebabbcfb9340714255",
+          "error": "",
+          "iterations": 134217728,
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "461de6cc1954b58b49d7401b0b73f0dfc058955982dd520798a2831e38965a0a",
+          "stderr": "",
+          "stdout": "",
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "text_bytes": 3077,
+          "wall_s": 0.017590021
+        },
+        "gcc": {
+          "binary_bytes": 17112,
+          "binary_sha256": "84b081d1cb97ddaf4868bc97726cea7fe021a5201cf8cb0ec3b5440a38f1ceb9",
+          "child_cpu_s": 0.016075000000000006,
+          "command": [
+            "/home/user/tools/oracle-bin/gcc",
+            "-fno-lto",
+            "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/gcc/benchmark.driver.o",
+            "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/gcc/benchmark.kernel.o",
+            "-o",
+            "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/gcc/benchmark.bin"
+          ],
+          "commands": [
+            [
+              "/home/user/tools/gcc/bin/gcc-16",
+              "-O2",
+              "-msse2",
+              "-msse2",
+              "-DONLY128",
+              "-DMASK_KERNELS_ONLY",
+              "-c",
+              "/home/user/lccc/tests/regression/packed_mask_shifts.c",
+              "-o",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/gcc/benchmark.kernel.o"
+            ],
+            [
+              "/home/user/tools/oracle-bin/gcc",
+              "-O2",
+              "-msse2",
+              "-fno-lto",
+              "-DCASE=3",
+              "-DITERATIONS=134217728",
+              "-c",
+              "/home/user/lccc/tests/benchmark/programs/packed_mask_shifts_driver.c",
+              "-o",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/gcc/benchmark.driver.o"
+            ],
+            [
+              "/home/user/tools/oracle-bin/gcc",
+              "-fno-lto",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/gcc/benchmark.driver.o",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/gcc/benchmark.kernel.o",
+              "-o",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/gcc/benchmark.bin"
+            ]
+          ],
+          "driver_compiler": "/home/user/tools/oracle-bin/gcc",
+          "driver_sha256": "9e576fa4f1eaf4b591434757a81d0a0ec4d1af2cbcf556ebabbcfb9340714255",
+          "error": "",
+          "iterations": 134217728,
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "461de6cc1954b58b49d7401b0b73f0dfc058955982dd520798a2831e38965a0a",
+          "stderr": "",
+          "stdout": "",
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "text_bytes": 2950,
+          "wall_s": 0.016419407
+        },
+        "lccc": {
+          "binary_bytes": 17064,
+          "binary_sha256": "2fdba1a6385612b9319d709873c8e4d01d903bd231f30f1f8e6f0948dd9bdc30",
+          "child_cpu_s": 0.019835999999999965,
+          "command": [
+            "/home/user/tools/oracle-bin/gcc",
+            "-fno-lto",
+            "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/lccc/benchmark.driver.o",
+            "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/lccc/benchmark.kernel.o",
+            "-o",
+            "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/lccc/benchmark.bin"
+          ],
+          "commands": [
+            [
+              "/home/user/lccc/target/fastbuild/lccc",
+              "-I/home/user/tools/gcc/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+              "-O2",
+              "-msse2",
+              "-msse2",
+              "-DONLY128",
+              "-DMASK_KERNELS_ONLY",
+              "-c",
+              "/home/user/lccc/tests/regression/packed_mask_shifts.c",
+              "-o",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/lccc/benchmark.kernel.o"
+            ],
+            [
+              "/home/user/tools/oracle-bin/gcc",
+              "-O2",
+              "-msse2",
+              "-fno-lto",
+              "-DCASE=3",
+              "-DITERATIONS=134217728",
+              "-c",
+              "/home/user/lccc/tests/benchmark/programs/packed_mask_shifts_driver.c",
+              "-o",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/lccc/benchmark.driver.o"
+            ],
+            [
+              "/home/user/tools/oracle-bin/gcc",
+              "-fno-lto",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/lccc/benchmark.driver.o",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/lccc/benchmark.kernel.o",
+              "-o",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/lccc/benchmark.bin"
+            ]
+          ],
+          "driver_compiler": "/home/user/tools/oracle-bin/gcc",
+          "driver_sha256": "9e576fa4f1eaf4b591434757a81d0a0ec4d1af2cbcf556ebabbcfb9340714255",
+          "error": "",
+          "iterations": 134217728,
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "461de6cc1954b58b49d7401b0b73f0dfc058955982dd520798a2831e38965a0a",
+          "stderr": "",
+          "stdout": "",
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "text_bytes": 3820,
+          "wall_s": 0.022523674
+        }
+      },
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "00000000 ffffffff ffffffff ffffffff\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "00000000 ffffffff ffffffff ffffffff\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "00000000 ffffffff ffffffff ffffffff\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "00000000 ffffffff ffffffff ffffffff\n",
+          "stable_within_compiler": true
+        }
+      },
+      "description": "Dependent SSE2 map including call/memory cost",
+      "name": "packed_tree32",
+      "ratios_from_lccc": {
+        "before": {
+          "cv": 0.04111632469441351,
+          "interpretation": "numerator/denominator; <1 means numerator faster",
+          "mad": 0.02675834654047149,
+          "max": 0.9675741026600362,
+          "mean": 0.9247890681341836,
+          "median": 0.9379672745167904,
+          "median_ci95_bootstrap": [
+            0.9036194634391189,
+            0.9585439505375247
+          ],
+          "min": 0.8451491156815697,
+          "n": 15,
+          "outlier_count_mad": 0,
+          "raw": [
+            {
+              "ratio": 0.9585439505375247,
+              "round": 0
+            },
+            {
+              "ratio": 0.9647256210572619,
+              "round": 1
+            },
+            {
+              "ratio": 0.938672555051567,
+              "round": 2
+            },
+            {
+              "ratio": 0.9675741026600362,
+              "round": 3
+            },
+            {
+              "ratio": 0.8451491156815697,
+              "round": 4
+            },
+            {
+              "ratio": 0.9036194634391189,
+              "round": 5
+            },
+            {
+              "ratio": 0.8738177748497207,
+              "round": 6
+            },
+            {
+              "ratio": 0.9122713217937461,
+              "round": 7
+            },
+            {
+              "ratio": 0.8775127425178081,
+              "round": 8
+            },
+            {
+              "ratio": 0.9431390485410363,
+              "round": 9
+            },
+            {
+              "ratio": 0.953892179901081,
+              "round": 10
+            },
+            {
+              "ratio": 0.9379672745167904,
+              "round": 11
+            },
+            {
+              "ratio": 0.9297001600985499,
+              "round": 12
+            },
+            {
+              "ratio": 0.8994663996308987,
+              "round": 13
+            },
+            {
+              "ratio": 0.9657843117360456,
+              "round": 14
+            }
+          ],
+          "stdev": 0.03802392759924919
+        },
+        "clang": {
+          "cv": 0.06706902934889283,
+          "interpretation": "numerator/denominator; <1 means numerator faster",
+          "mad": 0.049005295143133676,
+          "max": 1.1009196260099559,
+          "mean": 0.980062808732009,
+          "median": 0.9962238503943331,
+          "median_ci95_bootstrap": [
+            0.9160122992799398,
+            1.0171810979285436
+          ],
+          "min": 0.8898707491413396,
+          "n": 15,
+          "outlier_count_mad": 0,
+          "raw": [
+            {
+              "ratio": 0.8898707491413396,
+              "round": 0
+            },
+            {
+              "ratio": 1.1009196260099559,
+              "round": 1
+            },
+            {
+              "ratio": 1.0335303246948215,
+              "round": 2
+            },
+            {
+              "ratio": 0.9014828878894202,
+              "round": 3
+            },
+            {
+              "ratio": 0.9003935604498362,
+              "round": 4
+            },
+            {
+              "ratio": 1.0163838942166126,
+              "round": 5
+            },
+            {
+              "ratio": 1.0171810979285436,
+              "round": 6
+            },
+            {
+              "ratio": 0.9095282063078249,
+              "round": 7
+            },
+            {
+              "ratio": 0.9962238503943331,
+              "round": 8
+            },
+            {
+              "ratio": 1.0095077709858902,
+              "round": 9
+            },
+            {
+              "ratio": 0.9472185552511995,
+              "round": 10
+            },
+            {
+              "ratio": 1.0671508464894488,
+              "round": 11
+            },
+            {
+              "ratio": 0.9884187687023898,
+              "round": 12
+            },
+            {
+              "ratio": 1.0071196932385797,
+              "round": 13
+            },
+            {
+              "ratio": 0.9160122992799398,
+              "round": 14
+            }
+          ],
+          "stdev": 0.06573186128260546
+        },
+        "gcc": {
+          "cv": 0.055082166077584975,
+          "interpretation": "numerator/denominator; <1 means numerator faster",
+          "mad": 0.022794345046397657,
+          "max": 1.1743621965567694,
+          "mean": 1.0422461237669463,
+          "median": 1.0440444373609317,
+          "median_ci95_bootstrap": [
+            1.015630921480028,
+            1.0668387824073293
+          ],
+          "min": 0.9397064629356051,
+          "n": 15,
+          "outlier_count_mad": 1,
+          "raw": [
+            {
+              "ratio": 0.9620345997073666,
+              "round": 0
+            },
+            {
+              "ratio": 1.1124833085826695,
+              "round": 1
+            },
+            {
+              "ratio": 1.0571737145156097,
+              "round": 2
+            },
+            {
+              "ratio": 0.9397064629356051,
+              "round": 3
+            },
+            {
+              "ratio": 0.984610683243712,
+              "round": 4
+            },
+            {
+              "ratio": 1.0589290771572788,
+              "round": 5
+            },
+            {
+              "ratio": 1.021962766489801,
+              "round": 6
+            },
+            {
+              "ratio": 1.015630921480028,
+              "round": 7
+            },
+            {
+              "ratio": 1.0440444373609317,
+              "round": 8
+            },
+            {
+              "ratio": 1.0352943325254982,
+              "round": 9
+            },
+            {
+              "ratio": 1.0488176284982706,
+              "round": 10
+            },
+            {
+              "ratio": 1.0668387824073293,
+              "round": 11
+            },
+            {
+              "ratio": 1.1743621965567694,
+              "round": 12
+            },
+            {
+              "ratio": 1.0757752349253265,
+              "round": 13
+            },
+            {
+              "ratio": 1.0360277101179975,
+              "round": 14
+            }
+          ],
+          "stdev": 0.057409174083050116
+        }
+      },
+      "ratios_to_gcc": {
+        "before": {
+          "cv": 0.06591966568207566,
+          "interpretation": "numerator/denominator; <1 means numerator faster",
+          "mad": 0.03788064714503414,
+          "max": 1.263162304320013,
+          "mean": 1.1286850252043057,
+          "median": 1.1373944607576307,
+          "median_ci95_bootstrap": [
+            1.097711237942082,
+            1.169537626612778
+          ],
+          "min": 0.971198443976727,
+          "n": 15,
+          "outlier_count_mad": 0,
+          "raw": [
+            {
+              "ratio": 1.0036416161907697,
+              "round": 0
+            },
+            {
+              "ratio": 1.1531603227905123,
+              "round": 1
+            },
+            {
+              "ratio": 1.1262433410099357,
+              "round": 2
+            },
+            {
+              "ratio": 0.971198443976727,
+              "round": 3
+            },
+            {
+              "ratio": 1.1650141554602158,
+              "round": 4
+            },
+            {
+              "ratio": 1.1718750204063346,
+              "round": 5
+            },
+            {
+              "ratio": 1.169537626612778,
+              "round": 6
+            },
+            {
+              "ratio": 1.1132991876616838,
+              "round": 7
+            },
+            {
+              "ratio": 1.189776953398194,
+              "round": 8
+            },
+            {
+              "ratio": 1.097711237942082,
+              "round": 9
+            },
+            {
+              "ratio": 1.0995138136125966,
+              "round": 10
+            },
+            {
+              "ratio": 1.1373944607576307,
+              "round": 11
+            },
+            {
+              "ratio": 1.263162304320013,
+              "round": 12
+            },
+            {
+              "ratio": 1.1960149210318218,
+              "round": 13
+            },
+            {
+              "ratio": 1.0727319728932911,
+              "round": 14
+            }
+          ],
+          "stdev": 0.07440253952183297
+        },
+        "clang": {
+          "cv": 0.050536902452912875,
+          "interpretation": "numerator/denominator; <1 means numerator faster",
+          "mad": 0.03749819173374269,
+          "max": 1.1881221135637567,
+          "mean": 1.0654301089893388,
+          "median": 1.048001849130263,
+          "median_ci95_bootstrap": [
+            1.0255436979097494,
+            1.09353367959651
+          ],
+          "min": 0.9997075726612166,
+          "n": 15,
+          "outlier_count_mad": 0,
+          "raw": [
+            {
+              "ratio": 1.0810947552053598,
+              "round": 0
+            },
+            {
+              "ratio": 1.0105036573965203,
+              "round": 1
+            },
+            {
+              "ratio": 1.0228763387545203,
+              "round": 2
+            },
+            {
+              "ratio": 1.0424007771635855,
+              "round": 3
+            },
+            {
+              "ratio": 1.09353367959651,
+              "round": 4
+            },
+            {
+              "ratio": 1.0418593635561868,
+              "round": 5
+            },
+            {
+              "ratio": 1.0047009019052706,
+              "round": 6
+            },
+            {
+              "ratio": 1.1166568715916143,
+              "round": 7
+            },
+            {
+              "ratio": 1.048001849130263,
+              "round": 8
+            },
+            {
+              "ratio": 1.0255436979097494,
+              "round": 9
+            },
+            {
+              "ratio": 1.107260433913404,
+              "round": 10
+            },
+            {
+              "ratio": 0.9997075726612166,
+              "round": 11
+            },
+            {
+              "ratio": 1.1881221135637567,
+              "round": 12
+            },
+            {
+              "ratio": 1.0681701908399508,
+              "round": 13
+            },
+            {
+              "ratio": 1.131019431652173,
+              "round": 14
+            }
+          ],
+          "stdev": 0.05384353748839055
+        },
+        "lccc": {
+          "cv": 0.055082166077584975,
+          "interpretation": "numerator/denominator; <1 means numerator faster",
+          "mad": 0.022794345046397657,
+          "max": 1.1743621965567694,
+          "mean": 1.0422461237669463,
+          "median": 1.0440444373609317,
+          "median_ci95_bootstrap": [
+            1.015630921480028,
+            1.0668387824073293
+          ],
+          "min": 0.9397064629356051,
+          "n": 15,
+          "outlier_count_mad": 1,
+          "raw": [
+            {
+              "ratio": 0.9620345997073666,
+              "round": 0
+            },
+            {
+              "ratio": 1.1124833085826695,
+              "round": 1
+            },
+            {
+              "ratio": 1.0571737145156097,
+              "round": 2
+            },
+            {
+              "ratio": 0.9397064629356051,
+              "round": 3
+            },
+            {
+              "ratio": 0.984610683243712,
+              "round": 4
+            },
+            {
+              "ratio": 1.0589290771572788,
+              "round": 5
+            },
+            {
+              "ratio": 1.021962766489801,
+              "round": 6
+            },
+            {
+              "ratio": 1.015630921480028,
+              "round": 7
+            },
+            {
+              "ratio": 1.0440444373609317,
+              "round": 8
+            },
+            {
+              "ratio": 1.0352943325254982,
+              "round": 9
+            },
+            {
+              "ratio": 1.0488176284982706,
+              "round": 10
+            },
+            {
+              "ratio": 1.0668387824073293,
+              "round": 11
+            },
+            {
+              "ratio": 1.1743621965567694,
+              "round": 12
+            },
+            {
+              "ratio": 1.0757752349253265,
+              "round": 13
+            },
+            {
+              "ratio": 1.0360277101179975,
+              "round": 14
+            }
+          ],
+          "stdev": 0.057409174083050116
+        }
+      },
+      "rounds": [
+        {
+          "order": [
+            "gcc",
+            "clang",
+            "lccc",
+            "before"
+          ],
+          "round": 0,
+          "runs": {
+            "before": {
+              "child_cpu_s": 0.7403929999999992,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/before/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.741166305
+            },
+            "clang": {
+              "child_cpu_s": 0.7978189999999996,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.798363671
+            },
+            "gcc": {
+              "child_cpu_s": 0.7276660000000001,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.738477055
+            },
+            "lccc": {
+              "child_cpu_s": 0.7096940000000007,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.710440478
+            }
+          }
+        },
+        {
+          "order": [
+            "clang",
+            "gcc",
+            "lccc",
+            "before"
+          ],
+          "round": 1,
+          "runs": {
+            "before": {
+              "child_cpu_s": 0.7723969999999998,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/before/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.772950788
+            },
+            "clang": {
+              "child_cpu_s": 0.676950999999999,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.677329581
+            },
+            "gcc": {
+              "child_cpu_s": 0.669690000000001,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.670289094
+            },
+            "lccc": {
+              "child_cpu_s": 0.7451930000000004,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.745685429
+            }
+          }
+        },
+        {
+          "order": [
+            "before",
+            "gcc",
+            "lccc",
+            "clang"
+          ],
+          "round": 2,
+          "runs": {
+            "before": {
+              "child_cpu_s": 0.8295890000000004,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/before/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.830333402
+            },
+            "clang": {
+              "child_cpu_s": 0.753525999999999,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.754125116
+            },
+            "gcc": {
+              "child_cpu_s": 0.736815,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.737259322
+            },
+            "lccc": {
+              "child_cpu_s": 0.7787059999999997,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.779411176
+            }
+          }
+        },
+        {
+          "order": [
+            "clang",
+            "gcc",
+            "lccc",
+            "before"
+          ],
+          "round": 3,
+          "runs": {
+            "before": {
+              "child_cpu_s": 0.7137270000000022,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/before/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.714612606
+            },
+            "clang": {
+              "child_cpu_s": 0.7657050000000041,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.767003634
+            },
+            "gcc": {
+              "child_cpu_s": 0.7350789999999989,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.735804933
+            },
+            "lccc": {
+              "child_cpu_s": 0.690649999999998,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.691440651
+            }
+          }
+        },
+        {
+          "order": [
+            "clang",
+            "before",
+            "gcc",
+            "lccc"
+          ],
+          "round": 4,
+          "runs": {
+            "before": {
+              "child_cpu_s": 0.8380550000000007,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/before/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.838817076
+            },
+            "clang": {
+              "child_cpu_s": 0.7866229999999987,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.787350711
+            },
+            "gcc": {
+              "child_cpu_s": 0.7193189999999987,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.720005909
+            },
+            "lccc": {
+              "child_cpu_s": 0.7082610000000003,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.70892551
+            }
+          }
+        },
+        {
+          "order": [
+            "lccc",
+            "clang",
+            "gcc",
+            "before"
+          ],
+          "round": 5,
+          "runs": {
+            "before": {
+              "child_cpu_s": 0.804070000000003,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/before/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.804875598
+            },
+            "clang": {
+              "child_cpu_s": 0.714891999999999,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.715577313
+            },
+            "gcc": {
+              "child_cpu_s": 0.6861579999999989,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.686827165
+            },
+            "lccc": {
+              "child_cpu_s": 0.7266200000000005,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.727301256
+            }
+          }
+        },
+        {
+          "order": [
+            "gcc",
+            "before",
+            "clang",
+            "lccc"
+          ],
+          "round": 6,
+          "runs": {
+            "before": {
+              "child_cpu_s": 0.7951910000000026,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/before/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.796019692
+            },
+            "clang": {
+              "child_cpu_s": 0.6831979999999973,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.683827253
+            },
+            "gcc": {
+              "child_cpu_s": 0.6799069999999965,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.680627689
+            },
+            "lccc": {
+              "child_cpu_s": 0.6951490000000007,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.695576156
+            }
+          }
+        },
+        {
+          "order": [
+            "before",
+            "lccc",
+            "gcc",
+            "clang"
+          ],
+          "round": 7,
+          "runs": {
+            "before": {
+              "child_cpu_s": 0.7246249999999996,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/before/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.726128061
+            },
+            "clang": {
+              "child_cpu_s": 0.7277249999999995,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.728318046
+            },
+            "gcc": {
+              "child_cpu_s": 0.6517520000000019,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.652230837
+            },
+            "lccc": {
+              "child_cpu_s": 0.6619969999999995,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.662425806
+            }
+          }
+        },
+        {
+          "order": [
+            "lccc",
+            "before",
+            "gcc",
+            "clang"
+          ],
+          "round": 8,
+          "runs": {
+            "before": {
+              "child_cpu_s": 0.7945250000000001,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/before/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.795083056
+            },
+            "clang": {
+              "child_cpu_s": 0.681640999999999,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.700340102
+            },
+            "gcc": {
+              "child_cpu_s": 0.6677130000000027,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.668262277
+            },
+            "lccc": {
+              "child_cpu_s": 0.6970719999999986,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.697695513
+            }
+          }
+        },
+        {
+          "order": [
+            "clang",
+            "before",
+            "gcc",
+            "lccc"
+          ],
+          "round": 9,
+          "runs": {
+            "before": {
+              "child_cpu_s": 0.7543660000000045,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/before/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.754799153
+            },
+            "clang": {
+              "child_cpu_s": 0.704704999999997,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.705175904
+            },
+            "gcc": {
+              "child_cpu_s": 0.6870820000000037,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.687611757
+            },
+            "lccc": {
+              "child_cpu_s": 0.7113899999999944,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.711880555
+            }
+          }
+        },
+        {
+          "order": [
+            "clang",
+            "gcc",
+            "lccc",
+            "before"
+          ],
+          "round": 10,
+          "runs": {
+            "before": {
+              "child_cpu_s": 0.7366600000000005,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/before/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.737242618
+            },
+            "clang": {
+              "child_cpu_s": 0.7419459999999987,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.742436858
+            },
+            "gcc": {
+              "child_cpu_s": 0.6700520000000054,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.670516922
+            },
+            "lccc": {
+              "child_cpu_s": 0.7027289999999979,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.703249968
+            }
+          }
+        },
+        {
+          "order": [
+            "clang",
+            "gcc",
+            "before",
+            "lccc"
+          ],
+          "round": 11,
+          "runs": {
+            "before": {
+              "child_cpu_s": 0.7918790000000016,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/before/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.792500017
+            },
+            "clang": {
+              "child_cpu_s": 0.6961019999999962,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.696564205
+            },
+            "gcc": {
+              "child_cpu_s": 0.6962040000000016,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.696767959
+            },
+            "lccc": {
+              "child_cpu_s": 0.7426400000000015,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.743339081
+            }
+          }
+        },
+        {
+          "order": [
+            "before",
+            "clang",
+            "gcc",
+            "lccc"
+          ],
+          "round": 12,
+          "runs": {
+            "before": {
+              "child_cpu_s": 0.7837850000000017,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/before/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.784534276
+            },
+            "clang": {
+              "child_cpu_s": 0.7370419999999953,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.737927754
+            },
+            "gcc": {
+              "child_cpu_s": 0.6202030000000036,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.621087467
+            },
+            "lccc": {
+              "child_cpu_s": 0.7285289999999947,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.729381642
+            }
+          }
+        },
+        {
+          "order": [
+            "gcc",
+            "lccc",
+            "clang",
+            "before"
+          ],
+          "round": 13,
+          "runs": {
+            "before": {
+              "child_cpu_s": 0.7869519999999994,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/before/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.787618833
+            },
+            "clang": {
+              "child_cpu_s": 0.7028819999999953,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.703428481
+            },
+            "gcc": {
+              "child_cpu_s": 0.6580420000000018,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.658535959
+            },
+            "lccc": {
+              "child_cpu_s": 0.7077810000000042,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.708436676
+            }
+          }
+        },
+        {
+          "order": [
+            "clang",
+            "gcc",
+            "lccc",
+            "before"
+          ],
+          "round": 14,
+          "runs": {
+            "before": {
+              "child_cpu_s": 0.697966000000001,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/before/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.698342521
+            },
+            "clang": {
+              "child_cpu_s": 0.7357210000000052,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/clang/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.736287331
+            },
+            "gcc": {
+              "child_cpu_s": 0.6505169999999936,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/gcc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.650994413
+            },
+            "lccc": {
+              "child_cpu_s": 0.6739370000000022,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/lccc/benchmark.bin"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+              "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+              "wall_s": 0.674448251
+            }
+          }
+        }
+      ],
+      "runs": {
+        "before": [
+          {
+            "child_cpu_s": 0.7403929999999992,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/before/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.741166305
+          },
+          {
+            "child_cpu_s": 0.7723969999999998,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/before/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.772950788
+          },
+          {
+            "child_cpu_s": 0.8295890000000004,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/before/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.830333402
+          },
+          {
+            "child_cpu_s": 0.7137270000000022,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/before/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.714612606
+          },
+          {
+            "child_cpu_s": 0.8380550000000007,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/before/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.838817076
+          },
+          {
+            "child_cpu_s": 0.804070000000003,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/before/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.804875598
+          },
+          {
+            "child_cpu_s": 0.7951910000000026,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/before/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.796019692
+          },
+          {
+            "child_cpu_s": 0.7246249999999996,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/before/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.726128061
+          },
+          {
+            "child_cpu_s": 0.7945250000000001,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/before/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.795083056
+          },
+          {
+            "child_cpu_s": 0.7543660000000045,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/before/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.754799153
+          },
+          {
+            "child_cpu_s": 0.7366600000000005,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/before/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.737242618
+          },
+          {
+            "child_cpu_s": 0.7918790000000016,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/before/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.792500017
+          },
+          {
+            "child_cpu_s": 0.7837850000000017,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/before/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.784534276
+          },
+          {
+            "child_cpu_s": 0.7869519999999994,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/before/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.787618833
+          },
+          {
+            "child_cpu_s": 0.697966000000001,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/before/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.698342521
+          }
+        ],
+        "clang": [
+          {
+            "child_cpu_s": 0.7978189999999996,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.798363671
+          },
+          {
+            "child_cpu_s": 0.676950999999999,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.677329581
+          },
+          {
+            "child_cpu_s": 0.753525999999999,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.754125116
+          },
+          {
+            "child_cpu_s": 0.7657050000000041,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.767003634
+          },
+          {
+            "child_cpu_s": 0.7866229999999987,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.787350711
+          },
+          {
+            "child_cpu_s": 0.714891999999999,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.715577313
+          },
+          {
+            "child_cpu_s": 0.6831979999999973,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.683827253
+          },
+          {
+            "child_cpu_s": 0.7277249999999995,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.728318046
+          },
+          {
+            "child_cpu_s": 0.681640999999999,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.700340102
+          },
+          {
+            "child_cpu_s": 0.704704999999997,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.705175904
+          },
+          {
+            "child_cpu_s": 0.7419459999999987,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.742436858
+          },
+          {
+            "child_cpu_s": 0.6961019999999962,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.696564205
+          },
+          {
+            "child_cpu_s": 0.7370419999999953,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.737927754
+          },
+          {
+            "child_cpu_s": 0.7028819999999953,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.703428481
+          },
+          {
+            "child_cpu_s": 0.7357210000000052,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.736287331
+          }
+        ],
+        "gcc": [
+          {
+            "child_cpu_s": 0.7276660000000001,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.738477055
+          },
+          {
+            "child_cpu_s": 0.669690000000001,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.670289094
+          },
+          {
+            "child_cpu_s": 0.736815,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.737259322
+          },
+          {
+            "child_cpu_s": 0.7350789999999989,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.735804933
+          },
+          {
+            "child_cpu_s": 0.7193189999999987,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.720005909
+          },
+          {
+            "child_cpu_s": 0.6861579999999989,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.686827165
+          },
+          {
+            "child_cpu_s": 0.6799069999999965,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.680627689
+          },
+          {
+            "child_cpu_s": 0.6517520000000019,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.652230837
+          },
+          {
+            "child_cpu_s": 0.6677130000000027,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.668262277
+          },
+          {
+            "child_cpu_s": 0.6870820000000037,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.687611757
+          },
+          {
+            "child_cpu_s": 0.6700520000000054,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.670516922
+          },
+          {
+            "child_cpu_s": 0.6962040000000016,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.696767959
+          },
+          {
+            "child_cpu_s": 0.6202030000000036,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.621087467
+          },
+          {
+            "child_cpu_s": 0.6580420000000018,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.658535959
+          },
+          {
+            "child_cpu_s": 0.6505169999999936,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.650994413
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 0.7096940000000007,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.710440478
+          },
+          {
+            "child_cpu_s": 0.7451930000000004,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.745685429
+          },
+          {
+            "child_cpu_s": 0.7787059999999997,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.779411176
+          },
+          {
+            "child_cpu_s": 0.690649999999998,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.691440651
+          },
+          {
+            "child_cpu_s": 0.7082610000000003,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.70892551
+          },
+          {
+            "child_cpu_s": 0.7266200000000005,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.727301256
+          },
+          {
+            "child_cpu_s": 0.6951490000000007,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.695576156
+          },
+          {
+            "child_cpu_s": 0.6619969999999995,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.662425806
+          },
+          {
+            "child_cpu_s": 0.6970719999999986,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.697695513
+          },
+          {
+            "child_cpu_s": 0.7113899999999944,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.711880555
+          },
+          {
+            "child_cpu_s": 0.7027289999999979,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.703249968
+          },
+          {
+            "child_cpu_s": 0.7426400000000015,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.743339081
+          },
+          {
+            "child_cpu_s": 0.7285289999999947,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.729381642
+          },
+          {
+            "child_cpu_s": 0.7077810000000042,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.708436676
+          },
+          {
+            "child_cpu_s": 0.6739370000000022,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.674448251
+          }
+        ]
+      },
+      "runtime": {
+        "before": {
+          "child_cpu": {
+            "cv": 0.053900381867314884,
+            "mad": 0.029418999999997197,
+            "max": 0.8380550000000007,
+            "mean": 0.7709453333333344,
+            "median": 0.7837850000000017,
+            "median_ci95_bootstrap": [
+              0.7403929999999992,
+              0.7945250000000001
+            ],
+            "min": 0.697966000000001,
+            "n": 15,
+            "outlier_count_mad": 0,
+            "stdev": 0.041554247865491084
+          },
+          "quality_warnings": [
+            "wall-clock coefficient of variation is 5.4% (>5%)"
+          ],
+          "raw_wall_s": [
+            0.741166305,
+            0.772950788,
+            0.830333402,
+            0.714612606,
+            0.838817076,
+            0.804875598,
+            0.796019692,
+            0.726128061,
+            0.795083056,
+            0.754799153,
+            0.737242618,
+            0.792500017,
+            0.784534276,
+            0.787618833,
+            0.698342521
+          ],
+          "wall": {
+            "cv": 0.053829278786238076,
+            "mad": 0.02973512300000003,
+            "max": 0.838817076,
+            "mean": 0.7716682668,
+            "median": 0.784534276,
+            "median_ci95_bootstrap": [
+              0.737242618,
+              0.796019692
+            ],
+            "min": 0.698342521,
+            "n": 15,
+            "outlier_count_mad": 0,
+            "stdev": 0.041538346264070346
+          }
+        },
+        "clang": {
+          "child_cpu": {
+            "cv": 0.05176585432357555,
+            "mad": 0.02580099999999952,
+            "max": 0.7978189999999996,
+            "mean": 0.7270985333333322,
+            "median": 0.7277249999999995,
+            "median_ci95_bootstrap": [
+              0.7028819999999953,
+              0.753525999999999
+            ],
+            "min": 0.676950999999999,
+            "n": 15,
+            "outlier_count_mad": 0,
+            "stdev": 0.037638876755418715
+          },
+          "quality_warnings": [],
+          "raw_wall_s": [
+            0.798363671,
+            0.677329581,
+            0.754125116,
+            0.767003634,
+            0.787350711,
+            0.715577313,
+            0.683827253,
+            0.728318046,
+            0.700340102,
+            0.705175904,
+            0.742436858,
+            0.696564205,
+            0.737927754,
+            0.703428481,
+            0.736287331
+          ],
+          "wall": {
+            "cv": 0.049991599831447325,
+            "mad": 0.025807069999999932,
+            "max": 0.798363671,
+            "mean": 0.728937064,
+            "median": 0.728318046,
+            "median_ci95_bootstrap": [
+              0.703428481,
+              0.754125116
+            ],
+            "min": 0.677329581,
+            "n": 15,
+            "outlier_count_mad": 0,
+            "stdev": 0.03644073000579811
+          }
+        },
+        "gcc": {
+          "child_cpu": {
+            "cv": 0.04990549248690268,
+            "mad": 0.021864999999994694,
+            "max": 0.736815,
+            "mean": 0.6837466000000006,
+            "median": 0.6799069999999965,
+            "median_ci95_bootstrap": [
+              0.6677130000000027,
+              0.7193189999999987
+            ],
+            "min": 0.6202030000000036,
+            "n": 15,
+            "outlier_count_mad": 0,
+            "stdev": 0.03412271080924528
+          },
+          "quality_warnings": [
+            "wall-clock coefficient of variation is 5.1% (>5%)"
+          ],
+          "raw_wall_s": [
+            0.738477055,
+            0.670289094,
+            0.737259322,
+            0.735804933,
+            0.720005909,
+            0.686827165,
+            0.680627689,
+            0.652230837,
+            0.668262277,
+            0.687611757,
+            0.670516922,
+            0.696767959,
+            0.621087467,
+            0.658535959,
+            0.650994413
+          ],
+          "wall": {
+            "cv": 0.05129680739019108,
+            "mad": 0.022091730000000087,
+            "max": 0.738477055,
+            "mean": 0.6850199172,
+            "median": 0.680627689,
+            "median_ci95_bootstrap": [
+              0.668262277,
+              0.720005909
+            ],
+            "min": 0.621087467,
+            "n": 15,
+            "outlier_count_mad": 0,
+            "stdev": 0.03513933475105304
+          }
+        },
+        "lccc": {
+          "child_cpu": {
+            "cv": 0.04113920977214045,
+            "mad": 0.017611000000002264,
+            "max": 0.7787059999999997,
+            "mean": 0.7120231999999995,
+            "median": 0.7082610000000003,
+            "median_ci95_bootstrap": [
+              0.6951490000000007,
+              0.7266200000000005
+            ],
+            "min": 0.6619969999999995,
+            "n": 15,
+            "outlier_count_mad": 0,
+            "stdev": 0.029292071787430696
+          },
+          "quality_warnings": [],
+          "raw_wall_s": [
+            0.710440478,
+            0.745685429,
+            0.779411176,
+            0.691440651,
+            0.70892551,
+            0.727301256,
+            0.695576156,
+            0.662425806,
+            0.697695513,
+            0.711880555,
+            0.703249968,
+            0.743339081,
+            0.729381642,
+            0.708436676,
+            0.674448251
+          ],
+          "wall": {
+            "cv": 0.041179955500749134,
+            "mad": 0.017484859000000075,
+            "max": 0.779411176,
+            "mean": 0.7126425432,
+            "median": 0.70892551,
+            "median_ci95_bootstrap": [
+              0.695576156,
+              0.729381642
+            ],
+            "min": 0.662425806,
+            "n": 15,
+            "outlier_count_mad": 0,
+            "stdev": 0.029346588216916693
+          }
+        }
+      },
+      "source": "/home/user/lccc/tests/benchmark/programs/packed_mask_shifts_driver.c",
+      "source_sha256": "9e576fa4f1eaf4b591434757a81d0a0ec4d1af2cbcf556ebabbcfb9340714255",
+      "tags": [
+        "simd",
+        "sse2",
+        "micro"
+      ],
+      "warmups": {
+        "before": [
+          {
+            "child_cpu_s": 0.8621559999999999,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/before/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.862678366
+          },
+          {
+            "child_cpu_s": 0.8216589999999995,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/before/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.82225509
+          }
+        ],
+        "clang": [
+          {
+            "child_cpu_s": 0.778019,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.778501692
+          },
+          {
+            "child_cpu_s": 0.7713860000000001,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/clang/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.771931624
+          }
+        ],
+        "gcc": [
+          {
+            "child_cpu_s": 0.7335299999999998,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.734044028
+          },
+          {
+            "child_cpu_s": 0.7271670000000006,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/gcc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.727845483
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 0.782025,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.78252857
+          },
+          {
+            "child_cpu_s": 0.7584629999999999,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/artifacts/campaign250/perf-tree-amplified-artifacts/packed_tree32/lccc/benchmark.bin"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "00000000 ffffffff ffffffff ffffffff\n",
+            "stdout_sha256": "54b727608d1661d09888af5d461679b6dd9355660928e0b8606b30be3954a3c4",
+            "wall_s": 0.759303227
+          }
+        ]
+      },
+      "warnings": []
+    }
+  ],
+  "compilers": [
+    {
+      "binary_sha256": "32eb399972f9a01291ee5b6c7fe742845fd570705765b3e15775811932d3b161",
+      "executable": "/home/user/lccc/target/fastbuild/lccc",
+      "flags": [
+        "-I/home/user/tools/gcc/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+        "-O2",
+        "-msse2"
+      ],
+      "key": "lccc",
+      "label": "LCCC"
+    },
+    {
+      "binary_sha256": "67ed99639f746b8e83e4e685a7189ae1172fb9c23a3e83aa9b09a1d68f3fb1c2",
+      "executable": "/home/user/tools/gcc/bin/gcc-16",
+      "flags": [
+        "-O2",
+        "-msse2"
+      ],
+      "key": "gcc",
+      "label": "GCC"
+    },
+    {
+      "binary_sha256": "c9adcf76fff8b5e5275f4a0edf0bd2727ec49603e35a939a75e36edfd6c275d8",
+      "executable": "/home/user/tools/oracle-bin/clang-23",
+      "flags": [
+        "-O2",
+        "-msse2"
+      ],
+      "key": "clang",
+      "label": "Clang"
+    },
+    {
+      "binary_sha256": "ece27addeefb8ce91c9382a993d897afafb056fcb2e6a038d7f2985d23c0b135",
+      "executable": "/home/user/artifacts/campaign250/before/lccc",
+      "flags": [
+        "-I/home/user/tools/gcc/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+        "-O2",
+        "-msse2"
+      ],
+      "key": "before",
+      "label": "LCCC candidate: before"
+    }
+  ],
+  "complete": true,
+  "metadata": {
+    "compiler_versions": {
+      "before": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0",
+      "clang": "clang version 23.1.3 (https://github.com/llvm/llvm-project 0d261d1ca552c95a8f007e061c787ac7132fbcbc)",
+      "gcc": "gcc-16 (GCC) 16.2.0",
+      "lccc": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0"
+    },
+    "cpu_governors": {},
+    "cpu_models": [
+      "Intel(R) Xeon(R) Processor @ 2.60GHz"
+    ],
+    "git": {
+      "repo": "/home/user/lccc",
+      "revision": "b345dba6a6b2453117f31a3ac5640bc0336d3753\n",
+      "status": " M src/passes/vec_mask_shifts.rs\n M tests/regression/bench_packed_mask_shifts.py\n"
+    },
+    "hypervisor_detected": true,
+    "meminfo": "MemTotal:        4034452 kB\nMemFree:         2686560 kB\nMemAvailable:    3723684 kB\nBuffers:            6232 kB\nCached:          1198512 kB\nSwapCached:         1000 kB\nActive:           564680 kB\nInactive:         665948 kB\nActive(anon):       5060 kB\nInactive(anon):    21440 kB\nActive(file):     559620 kB\nInactive(file):   644508 kB\nUnevictable:           8 kB\nMlocked:               4 kB\nSwapTotal:       8388604 kB\nSwapFree:        8385196 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:            124444 kB\nWriteback:             0 kB\nAnonPages:         25180 kB\nMapped:            20800 kB\nShmem:               804 kB\nKReclaimable:      75228 kB\nSlab:              93420 kB\nSReclaimable:      75228 kB\nSUnreclaim:        18192 kB\nKernelStack:        1288 kB\nPageTables:          984 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    10405828 kB\nCommitted_AS:     143612 kB\nVmallocTotal:   34359738367 kB\nVmallocUsed:        6440 kB\nVmallocChunk:          0 kB\nPercpu:              592 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:       2048 kB\nHugetlb:               0 kB\nDirectMap4k:       36864 kB\nDirectMap2M:     2060288 kB\nDirectMap1G:     4194304 kB",
+    "pinning": {
+      "allowed_cpus": [
+        0,
+        1
+      ],
+      "applied": true,
+      "cpu": 0,
+      "reason": "taskset pinning",
+      "requested": "auto"
+    },
+    "platform": "Linux-6.1.158+-x86_64-with-glibc2.36",
+    "pmu": {
+      "available": false,
+      "perf_event_paranoid": "2",
+      "perf_path": null,
+      "probed": false,
+      "reason": "not probed"
+    },
+    "python": "3.11.2 (main, Apr  8 2026, 01:58:00) [GCC 12.2.0]",
+    "swap": "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n/swapfile                               file\t\t8388604\t\t3408\t\t-2",
+    "timestamp_utc": "2026-10-25T11:07:52.076904+00:00",
+    "uname": [
+      "Linux",
+      "e2b.local",
+      "6.1.158+",
+      "#1 SMP PREEMPT_DYNAMIC Mon May 11 18:48:24 UTC 2026",
+      "x86_64"
+    ],
+    "work_root": {
+      "candidates": [
+        {
+          "free_bytes": 4600164352,
+          "path": "/home/user/lccc"
+        },
+        {
+          "free_bytes": 4600164352,
+          "path": "/var/tmp"
+        },
+        {
+          "free_bytes": 4600164352,
+          "path": "/tmp"
+        }
+      ],
+      "free_bytes": 4600164352,
+      "reason": "largest writable candidate among repository, /var/tmp, /tmp",
+      "selected": "/home/user/lccc"
+    }
+  },
+  "runner_warnings": [],
+  "schema": "lccc-bench-v2",
+  "settings": {
+    "common_cflags": [
+      "-msse2"
+    ],
+    "compiler_order_policy": "randomized independently in every paired round",
+    "opt": "-O2",
+    "outlier_policy": "MAD outliers counted and reported; none are removed",
+    "reps": 15,
+    "seed": 20260810,
+    "skip_perf": false,
+    "timer": "time.perf_counter_ns wall-clock plus resource.RUSAGE_CHILDREN CPU time",
+    "warmup": 2
+  },
+  "unavailable_compilers": {}
+}
