@@ -70,3 +70,44 @@ class MarkdownTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LegacySchemaTests(unittest.TestCase):
+    """The 2026-08/09 producer wrote flat medians, not the nested schema."""
+
+    REPORT = (Path(__file__).resolve().parents[1] / "engineering" / "evidence"
+              / "benchmarks" / "2026-09-27-s13-685da054" / "results.json")
+
+    def test_checked_in_legacy_report_is_ranked_not_written_off_as_failed(self):
+        rows, document = rank.load_rows(self.REPORT)
+        self.assertGreaterEqual(len(rows), 8)
+        self.assertEqual(document["benchmarks"][0]["name"], "arith_loop")
+        self.assertTrue(all(row["correct"] for row in rows))
+        self.assertEqual(len(rank.classify(rows, 0.01)["unknown"]), 0)
+        table = rank.render_table(rows, show_size=False, reference="gcc")
+        self.assertNotIn("INCORRECT/FAILED", table)
+        self.assertIn("nbody", table)
+        # The legacy record carries a paired interval and a sample count, so the
+        # significance policy must still apply rather than being bypassed.
+        nbody = next(row for row in rows if row["name"] == "nbody")
+        self.assertIs(nbody["significant"], True)
+        self.assertAlmostEqual(nbody["ratio"], 1.4140922617686313, places=9)
+
+    def test_low_sample_legacy_row_is_not_a_verdict(self):
+        row = {"name": "kernel", "correct": True, "lccc_median_s": 2.0,
+               "gcc_median_s": 1.0, "ratio": 2.0, "ci95": [1.9, 2.1], "n": 3}
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "report.json"
+            path.write_text(json.dumps({"benchmarks": [row]}))
+            rows, _ = rank.load_rows(path)
+        self.assertIsNone(rows[0]["significant"])
+        self.assertIn(rows[0], rank.classify(rows, 0.01)["unknown"])
+
+    def test_unreadable_schema_is_an_error_not_a_failed_workload(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "report.json"
+            path.write_text(json.dumps({"benchmarks": [{"name": "mystery", "value": 1}]}))
+            with self.assertRaises(ValueError) as raised:
+                rank.load_rows(path)
+        self.assertIn("no known evidence schema", str(raised.exception))
+        self.assertIn("mystery", str(raised.exception))

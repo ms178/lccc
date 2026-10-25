@@ -49,11 +49,91 @@ def _median(stats: dict[str, Any] | None) -> float | None:
     return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) else None
 
 
+def _significant_from_ci(ci: Any, sample_count: Any) -> bool | None:
+    """A bootstrap interval excluding parity is a verdict only with samples.
+
+    A three-pair screening interval can exclude 1.0 yet have very poor coverage,
+    so the producer's own minimum sample policy decides whether the interval is
+    allowed to become a claim.
+    """
+    if not isinstance(ci, (list, tuple)) or len(ci) != 2:
+        return None
+    verdict = not (float(ci[0]) <= 1.0 <= float(ci[1]))
+    if not isinstance(sample_count, int) or sample_count < 7:
+        return None
+    return verdict
+
+
+def _is_legacy_row(bench: dict[str, Any]) -> bool:
+    """Whether this row is the pre-`runtime` evidence schema.
+
+    The 2026-08/09 producer wrote one flat record per workload
+    (`lccc_median_s`, `gcc_median_s`, `ratio`, `ci95`, `n`, `correct`) instead of
+    the nested `runtime`/`ratios_to_<reference>`/`correctness` document that
+    today's `run_benchmarks.py` emits.  Five of the six reports checked in under
+    `engineering/evidence/benchmarks/` are in the older shape, so refusing it
+    made the ranking tool unable to read the project's own recorded corpus --
+    and, worse, it labelled every workload "INCORRECT/FAILED" instead of saying
+    it could not read the file.
+    """
+    return (
+        "runtime" not in bench
+        and isinstance(bench.get("ratio"), (int, float))
+        and not isinstance(bench.get("ratio"), bool)
+        and ("lccc_median_s" in bench or "gcc_median_s" in bench)
+    )
+
+
+def _legacy_row(bench: dict[str, Any]) -> dict[str, Any]:
+    """Normalise one pre-`runtime` record into the internal row shape."""
+    ratio = bench.get("ratio")
+    if not isinstance(ratio, (int, float)) or isinstance(ratio, bool) or not math.isfinite(ratio):
+        ratio = None
+    ci = bench.get("ci95")
+    sample_count = bench.get("n")
+    significant = _significant_from_ci(ci, sample_count)
+    correct = bool(bench.get("correct"))
+    return {
+        "name": bench.get("name", "?"),
+        "description": bench.get("description", ""),
+        "ratio": float(ratio) if ratio is not None else None,
+        "significant": significant,
+        "bootstrap_excludes_parity": significant,
+        "sample_count": sample_count,
+        "ci": ci,
+        # The legacy producer recorded no coefficient of variation and no
+        # per-compiler .text size, so those columns stay empty rather than being
+        # filled with an invented zero.
+        "cv": None,
+        "lccc_s": bench.get("lccc_median_s"),
+        "ref_s": bench.get("gcc_median_s"),
+        "reference": "gcc",
+        "lccc_text": None,
+        "ref_text": None,
+        # One verdict for the pair is all the old producer recorded; reporting it
+        # as both compilers' status would claim more than the data says.
+        "correct": correct,
+        "lccc_ok": correct,
+        "ref_ok": correct,
+        "warnings": list(bench.get("warnings") or []),
+    }
+
+
 def load_rows(path: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Flatten one evidence JSON into per-workload comparison rows."""
     document = json.loads(path.read_text(encoding="utf-8"))
     rows: list[dict[str, Any]] = []
+    unreadable: list[str] = []
     for bench in document.get("benchmarks", []):
+        if _is_legacy_row(bench):
+            rows.append(_legacy_row(bench))
+            continue
+        if "runtime" not in bench and not any(k.startswith("ratios_to_") for k in bench):
+            # Neither schema: this is not a workload we failed to measure, it is
+            # a workload we failed to *read*. Saying so is the whole difference
+            # between "the corpus regressed" and "the parser is out of date".
+            unreadable.append(bench.get("name", "?"))
+            continue
         runtime = bench.get("runtime", {})
         reference = bench.get("baseline_compiler") or "gcc"
         lccc_wall = _median((runtime.get("lccc") or {}).get("wall"))
@@ -111,6 +191,13 @@ def load_rows(path: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
             "ref_ok": (compile_info.get(reference) or {}).get("ok", False),
             "warnings": warnings,
         })
+    if unreadable:
+        shown = ", ".join(unreadable[:5]) + (" ..." if len(unreadable) > 5 else "")
+        raise ValueError(
+            f"{path}: {len(unreadable)} benchmark row(s) match no known evidence "
+            f"schema (no `runtime` and no `ratios_to_*` key): {shown}; refusing to "
+            "report them as failed workloads"
+        )
     return rows, document
 
 
