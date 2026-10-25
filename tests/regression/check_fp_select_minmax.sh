@@ -51,7 +51,7 @@ if [ "$icx_only" = 1 ]; then
 else
     "$gcc" --version 2>/dev/null | grep -c '16\.2' >/dev/null \
         || { echo "SKIP: gcc-16.2 oracle not on PATH" >&2; exit 0; }
-    "$clang" --version 2>/dev/null | grep -c '23\.1\.3' >/dev/null \
+    "$clang" --version 2>/dev/null | grep -c '23\.1\.4' >/dev/null \
         || { echo "SKIP: clang-23.1.4 oracle not on PATH" >&2; exit 0; }
 fi
 

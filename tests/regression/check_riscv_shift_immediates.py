@@ -50,7 +50,7 @@ def main() -> None:
              for key, value in tools.items()}
     # Do not resolve compiler symlinks: argv[0] selects the backend.
     version = subprocess.check_output([tools["clang"], "--version"], text=True)
-    if not re.search(r"\bclang version 23\.1\.3(?:\s|$)", version.splitlines()[0]):
+    if not re.search(r"\bclang version 23\.1\.4(?:\s|$)", version.splitlines()[0]):
         parser.error("this oracle pins Clang 23.1.4")
     report = {"scope": "RV64 assembler acceptance and exact bytes, not runtime",
               "tools": tools, "clang_version": version.splitlines()[0],

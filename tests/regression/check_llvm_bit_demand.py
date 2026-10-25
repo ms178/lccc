@@ -38,7 +38,7 @@ def main():
     report_gcc_oracle(args.gcc, gcc_version,
                       gcc_oracle_identity(gcc_version, args.allow_gcc16_snapshot))
     if args.clang and not re.search(
-        r"\b23\.1\.3\b", run([args.clang, "--version"]).decode()
+        r"\b23\.1\.4\b", run([args.clang, "--version"]).decode()
     ):
         raise ValueError("exact Clang 23.1.4 required")
     for source in (SOURCE, SOURCE.with_name("llvm_bit_demand_wide.c")):

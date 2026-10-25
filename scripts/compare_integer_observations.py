@@ -37,7 +37,7 @@ def main():
         for name, tool in (("gcc", args.gcc), ("clang", args.clang))
     }
     if not re.search(r"\b16\.2(?:\.0)?\b", versions["gcc"]) or not re.search(
-        r"\b23\.1\.3\b", versions["clang"]
+        r"\b23\.1\.4\b", versions["clang"]
     ):
         raise ValueError("requires GCC 16.2 and Clang 23.1.4")
     if args.wide and args.suite != "bit-demand":

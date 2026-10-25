@@ -40,7 +40,7 @@ def main():
     if not re.search(r"\b16\.2(?:\.0)?\b", run([args.gcc, "--version"]).decode()):
         raise ValueError("GCC 16.2 required")
     if args.clang and not re.search(
-        r"\b23\.1\.3\b", run([args.clang, "--version"]).decode()
+        r"\b23\.1\.4\b", run([args.clang, "--version"]).decode()
     ):
         raise ValueError("Clang 23.1.4 required")
     env = os.environ | {"CCC_VERIFY_IR": "abort", "CCC_VERIFY_REGALLOC": "1"}

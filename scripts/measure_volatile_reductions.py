@@ -68,7 +68,7 @@ def provenance(compilers, env):
     tools = {}
     requirements = {
         "gcc": r"\b16\.2(?:\.0)?\b",
-        "clang": r"\b23\.1\.3\b",
+        "clang": r"\b23\.1\.4\b",
         "icx": r"\b2026\.2(?:\.0)?\b",
     }
     for name, compiler in compilers.items():
