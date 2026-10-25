@@ -531,10 +531,13 @@ impl super::InstructionEncoder {
         }
         check_movext_register_sizes(ops, src_size, dst_size)?;
 
-        let opcode = match (src_size, dst_size) {
-            (1, _) => vec![0x0F, 0xBE], // movsbq/movsbl/movsbw
-            (2, _) => vec![0x0F, 0xBF], // movswq/movswl
-            (4, 8) => vec![0x63],       // movslq (movsxd)
+        // `&'static [u8]` and not `Vec<u8>`: this is the hot path of every
+        // sign-extending move the code generator emits, and a `vec!` here heap-
+        // allocates two bytes per instruction.
+        let opcode: &'static [u8] = match (src_size, dst_size) {
+            (1, _) => &[0x0F, 0xBE], // movsbq/movsbl/movsbw
+            (2, _) => &[0x0F, 0xBF], // movswq/movswl
+            (4, 8) => &[0x63],       // movslq (movsxd)
             _ => {
                 return Err(format!(
                     "unsupported movsx combination: {} -> {}",
@@ -552,7 +555,7 @@ impl super::InstructionEncoder {
                     self.bytes.push(0x66);
                 }
                 self.emit_rex_rr(dst_size, &dst.name, &src.name);
-                self.bytes.extend_from_slice(&opcode);
+                self.bytes.extend_from_slice(opcode);
                 self.bytes.push(self.modrm(3, dst_num, src_num));
             }
             (Operand::Memory(mem), Operand::Register(dst)) => {
@@ -561,7 +564,7 @@ impl super::InstructionEncoder {
                     self.bytes.push(0x66);
                 }
                 self.emit_rex_rm(dst_size, &dst.name, mem);
-                self.bytes.extend_from_slice(&opcode);
+                self.bytes.extend_from_slice(opcode);
                 self.encode_modrm_mem(dst_num, mem)?;
             }
             _ => return Err("unsupported movsx operands".to_string()),
@@ -580,9 +583,10 @@ impl super::InstructionEncoder {
         }
         check_movext_register_sizes(ops, src_size, dst_size)?;
 
-        let opcode = match src_size {
-            1 => vec![0x0F, 0xB6], // movzbl/movzbq/movzbw
-            2 => vec![0x0F, 0xB7], // movzwl/movzwq
+        // No allocation: see the note in `encode_movsx`.
+        let opcode: &'static [u8] = match src_size {
+            1 => &[0x0F, 0xB6], // movzbl/movzbq/movzbw
+            2 => &[0x0F, 0xB7], // movzwl/movzwq
             _ => return Err(format!("unsupported movzx src size: {}", src_size)),
         };
 
@@ -599,7 +603,7 @@ impl super::InstructionEncoder {
                     self.bytes.push(0x66);
                 }
                 self.emit_rex_rr(rex_size, &dst.name, &src.name);
-                self.bytes.extend_from_slice(&opcode);
+                self.bytes.extend_from_slice(opcode);
                 self.bytes.push(self.modrm(3, dst_num, src_num));
             }
             (Operand::Memory(mem), Operand::Register(dst)) => {
@@ -608,7 +612,7 @@ impl super::InstructionEncoder {
                     self.bytes.push(0x66);
                 }
                 self.emit_rex_rm(rex_size, &dst.name, mem);
-                self.bytes.extend_from_slice(&opcode);
+                self.bytes.extend_from_slice(opcode);
                 self.encode_modrm_mem(dst_num, mem)?;
             }
             // Absolute address given as a bare label: `movzwl sym, %eax`.
@@ -632,7 +636,7 @@ impl super::InstructionEncoder {
                     self.bytes.push(0x66);
                 }
                 self.emit_rex_rm(rex_size, &dst.name, &mem);
-                self.bytes.extend_from_slice(&opcode);
+                self.bytes.extend_from_slice(opcode);
                 self.encode_modrm_mem(dst_num, &mem)?;
             }
             _ => return Err("unsupported movzx operands".to_string()),

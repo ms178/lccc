@@ -895,6 +895,26 @@ rather than adding a parallel tool; keep a machine-readable result file and a
 checked-in expectation table; each MB item above flips its rows from GAP to OK as it
 lands. This makes "Maybach progress" a number instead of an opinion.
 
+### MB-43 · P1 · S — keep the SDM cross-reference exhaustive (it now is)
+`scripts/sdm_isa_crossref.py --backend all --strict` verifies every declarative
+row of both encoders against Intel's ISA descriptions: 2595 rows, 1436 classes,
+4992 encodings from 39 XED datafiles, **zero findings and zero unmodelled rows**
+(i686 1081, x86 1514). `tests/corpus/test_sdm_isa_crossref.py` pins the parsing
+(`0b1011_0 SRM[rrr]` opcodes, `+rd`/`+cc`, EVEX `EVV`/`W0/W1`, maps 4..7), the
+modelling rules (group digits, operand-size agreement, x87 base-byte digits,
+VEX/EVEX family and prefix of every helper) and the reference provenance.
+Two invariants must not decay: a row the model cannot read is a *defect*, not
+noise (`--strict` fails on UNMODELLED), and a class XED does not model goes into
+`SDM_ONLY_CLASSES` with a provenance comment **and** a byte-level assertion in
+`tests/asm-diff/` — `PREFETCHW` (`0F 0D /1`) is the only entry today. Known
+reference gap: the as-2.47 snapshot has no entry for `andn`, `blsi`, `blsr`,
+`blsmsk` or `setcc`, because the distiller cannot expand those
+`i386-opc.tbl` template forms; they are reported as UNCOVERED rather than as
+findings. Rebuild the snapshot with template expansion of those five and
+re-check `gas_encoding_crossref.py --verify --strict --backend all`. Accept:
+both gates exit 0 on a clean tree, and adding a row with a wrong opcode,
+prefix, map or `/digit` makes exactly that row fail.
+
 ---
 
 ## 10. Carried over from the superseded live queue (full text in the archives)

@@ -682,8 +682,16 @@ impl super::InstructionEncoder {
             7 => "cmp",
             _ => "?",
         };
-        let mnemonic = format!("{}{}", op_name, suffix);
-        self.encode_alu(ops, &mnemonic, alu_op)
+        // `format!` allocated a `String` for every suffix-less ALU row -- the
+        // most common row in compiled code -- only to hand the encoder a
+        // three-character mnemonic and drop it again.  Build it on the stack.
+        let mut buf = [0u8; 8];
+        let n = op_name.len();
+        buf[..n].copy_from_slice(op_name.as_bytes());
+        buf[n] = suffix.as_bytes()[0];
+        let mnemonic = core::str::from_utf8(&buf[..n + 1])
+            .map_err(|_| "internal: non-ASCII mnemonic".to_string())?;
+        self.encode_alu(ops, mnemonic, alu_op)
     }
 
     pub(crate) fn encode_suffixless_test(&mut self, ops: &[Operand]) -> Result<(), String> {
@@ -697,8 +705,13 @@ impl super::InstructionEncoder {
             4 => "l",
             _ => "q",
         };
-        let mnemonic = format!("test{}", suffix);
-        self.encode_test(ops, &mnemonic)
+        // Stack-built for the same reason as in `encode_suffixless_alu`.
+        let mut buf = [0u8; 8];
+        buf[..4].copy_from_slice(b"test");
+        buf[4] = suffix.as_bytes()[0];
+        let mnemonic = core::str::from_utf8(&buf[..5])
+            .map_err(|_| "internal: non-ASCII mnemonic".to_string())?;
+        self.encode_test(ops, mnemonic)
     }
 
     pub(crate) fn encode_suffixless_shift(
@@ -737,8 +750,14 @@ impl super::InstructionEncoder {
             4 => "l",
             _ => "q",
         };
-        let mnemonic = format!("{}{}", op_name, suffix);
-        self.encode_shift(ops, &mnemonic, shift_op)
+        // Stack-built for the same reason as in `encode_suffixless_alu`.
+        let mut buf = [0u8; 8];
+        let n = op_name.len();
+        buf[..n].copy_from_slice(op_name.as_bytes());
+        buf[n] = suffix.as_bytes()[0];
+        let mnemonic = core::str::from_utf8(&buf[..n + 1])
+            .map_err(|_| "internal: non-ASCII mnemonic".to_string())?;
+        self.encode_shift(ops, mnemonic, shift_op)
     }
 
     pub(crate) fn encode_suffixless_unary(
