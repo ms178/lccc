@@ -95,3 +95,28 @@ frozen pre-change binaries, separate kernel/driver translation units, no LTO,
 pinned execution, two warmups and alternating paired samples. Calls and memory
 overhead are included. Only measured kernels on this host support speed claims;
 fewer instructions are not a claim of universally optimal or “godlike” runtime.
+
+### Measured runtime receipt
+
+[Raw paired samples](shuffle-composition-runtime.json) use 67,108,864 iterations,
+2 warmups and 15 alternating pairs per kernel on this Intel(R) Xeon(R) Processor @ 2.60GHz VM,
+pinned to one allowed CPU. Baseline and candidate compiler hashes, source hash,
+compiler identities, checksums, all samples and paired bootstrap intervals are
+in the receipt. The frozen baseline also independently passed the full native
+fixture with checksum `d03014c622561964 425984`.
+
+| Kernel | Median paired baseline/candidate | Paired bootstrap 95% interval | GCC/candidate median | Clang/candidate median |
+| --- | ---: | ---: | ---: | ---: |
+| Inverse permutations | 1.026x | 1.007–1.045 | 0.994x | 1.002x |
+| Composed permutations | 1.319x | 1.313–1.343 | 1.017x | 1.007x |
+| Private ADD | 1.019x | 1.015–1.026 | 0.997x | 0.983x |
+| Private SUB | 1.028x | 0.989–1.031 | 1.091x | 1.042x |
+| Shared-producer control | 1.428x | 1.416–1.482 | 0.825x | 0.884x |
+
+Ratios above one favor the candidate. SUB's interval includes one, so these
+samples **do not establish a SUB speedup**. Private-binop shuffle removal gives
+only small runtime gains in this call/memory-bound test; the larger composition
+and shared-control gains primarily reflect copy removal by the typed bridge.
+The shared-control gain is not evidence of relaxing the private-producer rule.
+The candidate remains slower than modern vendors on that control, and these
+microkernels do not establish whole-program, every-CPU or “godlike” performance.
