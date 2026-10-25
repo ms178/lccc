@@ -172,6 +172,9 @@ pub(crate) fn mnemonic_size_suffix(mnemonic: &str) -> Option<u8> {
         | "fadd" | "fmul" | "fsub" | "fdiv" | "fsubr" | "fdivr" | "fcom" | "fcomp"
         | "fcompp"
         | "fcomip" | "fucom" | "fucomp" | "fucomi" | "fucomip" | "fucompp"
+        | "fcomi" | "ffreep"
+        | "fcmovb" | "fcmove" | "fcmovbe" | "fcmovu"
+        | "fcmovnb" | "fcmovne" | "fcmovnbe" | "fcmovnu"
         | "fnstenv" | "fstenv" | "fldenv" | "fnsave" | "fsave" | "frstor"
         | "fnstsw" | "fstsw" => return None,
         _ => {}

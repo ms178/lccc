@@ -1,0 +1,695 @@
+#!/usr/bin/env python3
+"""Cross-reference the i686 encoder against GNU as 2.47's own instruction table.
+
+Why a second reference
+----------------------
+`sdm_isa_crossref.py` checks the encoder against the Intel SDM through XED's
+ISA description.  The SDM is the authority on what an encoding *means*; it is
+not an authority on what the AT&T mnemonic for it is, and it does not tell us
+which spellings the assembler we are diff-tested against actually accepts.  The
+differential harness compares LCCC against `as` 2.47, so the exact question
+"would `as` 2.47 assemble this mnemonic to these bytes?" needs `as` 2.47's own
+table.
+
+That table is `opcodes/i386-opc.tbl` in binutils-gdb at `binutils-2_47-branch`.
+It is not a mnemonic list: every row is
+`mnemonic, <opcode expression>, <cpu>, <attributes>, { operands }`, where the
+opcode expression packs the legacy prefixes, the opcode-map escapes, the opcode
+byte and the `/digit` ModR/M extension into one integer, and where rows are
+generated from *templates* that expand into the families (`<alu2>` -> add, or,
+adc, sbb, and, sub, xor; `<sd>` -> the single/double pairs; `<bw>` -> the
+byte/word pairs; ...).  Parsing it without expanding the templates loses the
+largest families, so this tool expands them.
+
+What it answers, all offline and from a vendored snapshot
+---------------------------------------------------------
+* ``--verify``   every declarative encoder row is a legal `as` 2.47 encoding of
+                 that mnemonic (LCCC-EXTRA pinpoints a wrong opcode/prefix/digit),
+                 or an invented mnemonic (LCCC-UNKNOWN).
+* ``--missing``  every (mnemonic, encoding) `as` 2.47 accepts that the encoder
+                 has no row for, grouped by mnemonic: the implementation
+                 worklist, with no alias guessing anywhere.
+* ``--summary``  counts per family/map, and the template-expansion statistics.
+
+Provenance
+----------
+The vendored snapshot ``scripts/isa/gas-2.47.json`` is *derived* from the table
+above; ``scripts/isa/gas-2.47.manifest.json`` records the exact upstream path,
+ref, blob digest and the command that regenerates it.  As with the SDM
+catalogue, the snapshot is what makes the gate hermetic: a check that needs the
+network is a check that gets skipped.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import re
+import sys
+from itertools import product
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+ISA_DIR = REPO / "scripts" / "isa"
+SNAPSHOT = ISA_DIR / "gas-2.47.json"
+MANIFEST = ISA_DIR / "gas-2.47.manifest.json"
+
+UPSTREAM_REPO = "RTEMS/sourceware-mirror-binutils-gdb"
+UPSTREAM_PATH = "opcodes/i386-opc.tbl"
+UPSTREAM_REF = "binutils-2_47-branch"
+
+LEGACY_PREFIXES = (0x66, 0xF2, 0xF3)
+
+# Opcodes whose store direction is 0x10 above the load form (SDM Vol. 2B).
+SSE_INT_MOVE = {0x6E, 0x6F, 0x7E, 0x7F}
+
+
+# --------------------------------------------------------------------------
+# A very small expression evaluator for the opcode field.
+#
+# The field is C-like arithmetic over byte-packed opcodes: `0x83/<alu2:opc>`,
+# `0x04 | (<alu2:opc> << 3)`, `0x660f3a0c | <sd:opc>`.  Supporting `|`, `<<`,
+# `+`, parentheses and integer literals covers every row in the table; anything
+# else raises and the row is reported instead of being guessed at.
+# --------------------------------------------------------------------------
+class ExprError(ValueError):
+    pass
+
+
+_TOKEN = re.compile(r"\s*(0x[0-9A-Fa-f]+|\d+|<<|\||\+|\*|\(|\))")
+
+
+def _tokens(text: str) -> list[str]:
+    out, pos = [], 0
+    while pos < len(text):
+        if text[pos].isspace():
+            pos += 1
+            continue
+        m = _TOKEN.match(text, pos)
+        if not m:
+            raise ExprError(f"cannot tokenise {text!r} at {pos}")
+        out.append(m.group(1))
+        pos = m.end()
+    return out
+
+
+def eval_expr(text: str) -> int:
+    """Evaluate an opcode expression with C precedence: `|` < `+` < `*` < `<<`."""
+    toks = _tokens(text)
+    if not toks:
+        raise ExprError("empty expression")
+    pos = 0
+
+    def peek() -> str | None:
+        return toks[pos] if pos < len(toks) else None
+
+    def primary() -> int:
+        nonlocal pos
+        tok = peek()
+        if tok is None:
+            raise ExprError("unexpected end")
+        if tok == "(":
+            pos += 1
+            val = bitor()
+            if peek() != ")":
+                raise ExprError("unbalanced parentheses")
+            pos += 1
+            return val
+        pos += 1
+        try:
+            return int(tok, 0)
+        except ValueError as exc:  # pragma: no cover - token regex prevents it
+            raise ExprError(f"not a number: {tok}") from exc
+
+    def shift() -> int:
+        nonlocal pos
+        val = primary()
+        while peek() == "<<":
+            pos += 1
+            val <<= primary()
+        return val
+
+    def mul() -> int:
+        nonlocal pos
+        val = shift()
+        while peek() == "*":
+            pos += 1
+            val *= shift()
+        return val
+
+    def add() -> int:
+        nonlocal pos
+        val = mul()
+        while peek() == "+":
+            pos += 1
+            val += mul()
+        return val
+
+    def bitor() -> int:
+        nonlocal pos
+        val = add()
+        while peek() == "|":
+            pos += 1
+            val |= add()
+        return val
+
+    val = bitor()
+    if pos != len(toks):
+        raise ExprError(f"trailing tokens in {text!r}")
+    return val
+
+
+def opcode_bytes(value: int) -> list[int]:
+    """`0x660f3a0c` -> [0x66, 0x0f, 0x3a, 0x0c]; `0xf0f` -> [0x0f, 0x0f]."""
+    if value < 0:
+        raise ExprError("negative opcode")
+    width = max(1, (value.bit_length() + 7) // 8)
+    if value < 0x100:
+        width = 1
+    return [(value >> (8 * (width - 1 - i))) & 0xFF for i in range(width)]
+
+
+# --------------------------------------------------------------------------
+# Table parsing: plain rows, template declarations, template instantiations.
+# --------------------------------------------------------------------------
+DECL_NAME = re.compile(r"^<([A-Za-z_][A-Za-z0-9_]*):")
+TEMPLATE_HOLE = re.compile(r"<[A-Za-z_]")
+
+
+def _split_top(text: str, sep: str = ",") -> list[str]:
+    """Split on `sep` outside `<>`, `{}` and parentheses."""
+    out, depth_angle, depth_brace, depth_paren, start = [], 0, 0, 0, 0
+    for i, ch in enumerate(text):
+        # `<` opens a template reference only when it is followed by a name;
+        # the opcode language also uses `<<` (shift), and counting those two
+        # as brackets silently swallows every following field separator.
+        if ch == "<" and i + 1 < len(text) and (text[i + 1].isalpha() or text[i + 1] == "_"):
+            depth_angle += 1
+        elif ch == ">" and depth_angle:
+            depth_angle -= 1
+        elif ch == "{":
+            depth_brace += 1
+        elif ch == "}":
+            depth_brace -= 1
+        elif ch == "(":
+            depth_paren += 1
+        elif ch == ")":
+            depth_paren -= 1
+        elif ch == sep and depth_angle == 0 and depth_brace == 0 and depth_paren == 0:
+            out.append(text[start:i])
+            start = i + 1
+    out.append(text[start:])
+    return out
+
+
+def _logical_lines(text: str) -> list[str]:
+    """Join lines continued with a trailing `+` (the table's template blocks)."""
+    out, buf = [], ""
+    for raw in text.splitlines():
+        if not raw.strip():
+            continue
+        line = raw.rstrip()
+        stripped = line.strip()
+        if stripped.startswith("//") or stripped.startswith("#"):
+            continue
+        continued = stripped.endswith("+")
+        if continued:
+            # Drop only the continuation marker: the trailing comma is part of
+            # the list being continued, not part of the marker.
+            stripped = stripped[:-1].rstrip()
+        buf = f"{buf} {stripped}".strip() if buf else stripped
+        if not continued:
+            out.append(buf)
+            buf = ""
+    if buf:
+        out.append(buf)
+    return out
+
+
+def parse_table(text: str) -> tuple[list[dict], dict[str, list[dict]], dict[str, int]]:
+    """Return (rows, templates, stats).  Rows are fully expanded."""
+    templates: dict[str, list[dict]] = {}
+    raw_rows: list[str] = []
+    stats = {"declarations": 0, "instantiations": 0, "literal_rows": 0, "skipped": 0}
+
+    for line in _logical_lines(text):
+        m = DECL_NAME.match(line)
+        if m and line.endswith(">"):
+            name = m.group(1)
+            body = line[line.index(":") + 1 : line.rindex(">")]
+            # The declaration is `<NAME:field:field, inst, inst, ...>`; the first
+            # element is the field list, whose element 0 is the implicit name.
+            parts = _split_top(body)
+            fields = ["name"] + [f.strip() for f in parts[0].split(":") if f.strip()]
+            instances = []
+            for item in parts[1:]:
+                if not item.strip():
+                    continue
+                vals = [v.strip() for v in item.split(":")]
+                inst = {f: (vals[i] if i < len(vals) else "") for i, f in enumerate(fields)}
+                instances.append(inst)
+            templates[name] = instances
+            stats["declarations"] += 1
+            continue
+        if line.startswith("{"):
+            # `{<pseudopfx>}, ...` builds the lock/rep pseudo-prefix rows, which
+            # have no opcode of their own beyond the prefix byte.
+            stats["skipped"] += 1
+            continue
+        raw_rows.append(line)
+
+    rows: list[dict] = []
+    for line in raw_rows:
+        refs = list(dict.fromkeys(re.findall(r"<([A-Za-z_][A-Za-z0-9_]*)", line)))
+        if refs:
+            stats["instantiations"] += 1
+            unknown = [r for r in refs if r not in templates]
+            if unknown:
+                stats["skipped"] += 1
+                continue
+            choices = [templates[r] for r in refs]
+            for combo in product(*choices):
+                expansion = dict(zip(refs, combo))
+                expanded = _substitute(line, expansion)
+                parsed = _parse_row(expanded)
+                if not parsed:
+                    stats["skipped"] += 1
+                    continue
+                rows.extend(parsed)
+        else:
+            stats["literal_rows"] += 1
+            parsed = _parse_row(line)
+            if not parsed:
+                stats["skipped"] += 1
+                continue
+            rows.extend(parsed)
+    return rows, templates, stats
+
+
+def _substitute(text: str, expansion: dict[str, dict]) -> str:
+    def repl(m: re.Match) -> str:
+        name, field = m.group(1), m.group(2)
+        inst = expansion[name]
+        if field is None:
+            # A first field that starts with `$` is a *selector* (`$avx`, `$sse`,
+            # `$apx`): it chooses between alternative cpu/attribute spellings of
+            # the same mnemonic and contributes no text to it.
+            value = inst.get("name", "")
+            return "" if value.startswith("$") else value
+        return inst.get(field, "")
+
+    return re.sub(r"<([A-Za-z_][A-Za-z0-9_]*)(?::([A-Za-z_][A-Za-z0-9_]*))?>", repl, text)
+
+
+def _parse_row(line: str) -> dict | None:
+    parts = _split_top(line)
+    if len(parts) < 4:
+        return None
+    mnemonic = parts[0].strip()
+    if not mnemonic or not re.fullmatch(r"[a-z][a-z0-9]*", mnemonic):
+        return None
+    opcode_field = parts[1].strip()
+    attrs = parts[3].strip()
+    # Pseudo rows and anything still carrying an unexpanded template hole.
+    # `<` alone is not a hole: `<<` is the shift operator of the opcode language.
+    if TEMPLATE_HOLE.search(opcode_field) or TEMPLATE_HOLE.search(attrs):
+        return None
+    byte_expr, _, ext_expr = opcode_field.partition("/")
+    try:
+        value = eval_expr(byte_expr)
+    except ExprError:
+        return None
+    ext = None
+    if ext_expr:
+        try:
+            ext = eval_expr(ext_expr)
+        except ExprError:
+            # 3DNow! rows carry an immediate suffix (`0xf0f/0x9e`); the suffix is
+            # an opcode byte, not a ModR/M digit, so it is not comparable here.
+            return None
+    built = _canonical(value, ext, attrs)
+    if built is None:
+        return None
+    enc, fams = built
+    out = []
+    for fam in fams:
+        one = dict(enc, family=fam)
+        # GAS writes every AVX/EVEX mnemonic as the legacy mnemonic with a `v`
+        # prefix and carries one row per template; the letter is added by the
+        # front end, not spelled out in the table.
+        one["mnemonic"] = mnemonic if fam == "legacy" or mnemonic.startswith("v") \
+            else "v" + mnemonic
+        one["directions"] = _directions(one, attrs)
+        out.extend(one["directions"])
+    return out
+
+
+def _canonical(value: int, ext: int | None, attrs: str) -> dict | None:
+    try:
+        arr = opcode_bytes(value)
+    except ExprError:
+        return None
+    # A row carrying both `Vex` and `EVex` is dual-encoded: `as` emits the VEX
+    # form for 128/256-bit operands and the EVEX form where a mask or zmm
+    # register requires it.  Both have to be admitted here.
+    if "EVex" in attrs and "Vex" in attrs:
+        family = "vexevex"
+    elif "EVex" in attrs:
+        family = "evex"
+    elif "Vex" in attrs:
+        family = "vex"
+    else:
+        family = "legacy"
+    w = None
+    if "VexW1" in attrs:
+        w = 1
+    elif "VexW0" in attrs:
+        w = 0
+    map_ = None
+    if "Space0F38" in attrs:
+        map_ = "0f38"
+    elif "Space0F3A" in attrs:
+        map_ = "0f3a"
+    elif "Space0F" in attrs:
+        map_ = "0f"
+    pp = "none"
+    if family == "legacy":
+        seen_66 = False
+        while arr and arr[0] in LEGACY_PREFIXES:
+            if arr[0] == 0x66:
+                seen_66 = True
+            else:
+                pp = {0xF2: "f2", 0xF3: "f3"}[arr[0]]
+            arr = arr[1:]
+        if pp == "none" and seen_66:
+            pp = "66"
+    else:
+        # VEX/EVEX rows carry the mandatory prefix as a `0x66` byte only in a few
+        # SSE2AVX rows; pp comes from the prefix byte when present.
+        while arr and arr[0] in (0x66,):
+            pp = "66"
+            arr = arr[1:]
+    if map_ is None:
+        if arr and arr[0] == 0x0F:
+            arr = arr[1:]
+            map_ = "0f"
+            if arr and arr[0] in (0x38, 0x3A):
+                map_ = "0f" + hex(arr[0])[2:]
+                arr = arr[1:]
+        else:
+            map_ = "none"
+    if len(arr) != 1:
+        return None
+    fams = ["vex", "evex"] if family == "vexevex" else [family]
+    imm_ext = "ImmExt" in attrs
+    enc = {
+        "family": family,
+        "map": map_,
+        "pp": pp,
+        "w": w,
+        "opcode": arr[0],
+        "reg": None if imm_ext else ext,
+        "imm_ext": ext if imm_ext else None,
+        "vector": 256 if "Vex256" in attrs else (128 if "Vex128" in attrs else None),
+    }
+    return enc, fams
+
+
+def _directions(enc: dict, attrs: str) -> list[dict]:
+    """Expand the `D` attribute into the two opcode directions GAS really emits.
+
+    `D` marks an instruction whose register/memory operands may appear in either
+    order: `movups %xmm0,(%rax)` is `0f 11 00`, one byte above the `0f 10` load
+    form in the table.  Without this expansion every store form in the encoder
+    looks like an illegal encoding, which is exactly the false positive that
+    makes a cross-reference tool untrustworthy.
+    """
+    base = {k: v for k, v in enc.items() if k != "directions"}
+    tokens = set(attrs.split("|"))
+    opcode, map_ = base["opcode"], base["map"]
+    deltas: list[int] = []
+    if "D" in tokens:
+        if map_ == "none" and 0xD8 <= opcode <= 0xDF:
+            # x87: the operand-order pair is the neighbouring arithmetic block
+            # (D8 <-> DC, D9 <-> DD, DA <-> DE, DB <-> DF).
+            deltas.append(0x04)
+        else:
+            deltas.append(0x01)
+            if opcode in SSE_INT_MOVE:
+                # MOVD/MOVQ/MOVDQA/MOVDQU: the store form is 0x10 above the load.
+                deltas.append(0x10)
+    if "W" in tokens:            # byte operand: base opcode; wider: base|1
+        deltas.append(0x01)
+    if "FloatMF" in tokens:      # x87 float memory form: dword as listed, qword ^4
+        deltas.append(0x04)
+    if not deltas:
+        return [base]
+    out = [base]
+    for delta in deltas:
+        paired = dict(base, opcode=base["opcode"] ^ delta)
+        if paired["opcode"] not in {e["opcode"] for e in out}:
+            out.append(paired)
+    return out
+def build_snapshot(tbl: Path) -> int:
+    raw = tbl.read_bytes()
+    text = raw.decode("utf-8", errors="replace")
+    rows, templates, stats = parse_table(text)
+    by_mnemonic: dict[str, list[dict]] = {}
+    for row in rows:
+        mnemonic = row["mnemonic"]
+        by_mnemonic.setdefault(mnemonic, []).append(
+            {k: v for k, v in row.items() if k != "mnemonic"}
+        )
+    for name, encodings in by_mnemonic.items():
+        seen, unique = set(), []
+        for enc in encodings:
+            key = json.dumps(enc, sort_keys=True)
+            if key not in seen:
+                seen.add(key)
+                unique.append(enc)
+        by_mnemonic[name] = unique
+    for encodings in by_mnemonic.values():
+        encodings.sort(key=lambda e: (e["family"], e["map"], e["pp"], e["opcode"],
+                                       -1 if e["reg"] is None else e["reg"]))
+    SNAPSHOT.parent.mkdir(parents=True, exist_ok=True)
+    SNAPSHOT.write_text(json.dumps(by_mnemonic, indent=0, sort_keys=True) + "\n")
+    MANIFEST.write_text(json.dumps({
+        "note": (
+            "Encodings declared by GNU as's own instruction table, expanded from "
+            "its template blocks.  Factual encoding data used as a test oracle; "
+            "regenerate with scripts/gas_encoding_crossref.py --build <path to "
+            "opcodes/i386-opc.tbl>.  Do not hand-edit."
+        ),
+        "upstream": {
+            "repo": UPSTREAM_REPO,
+            "path": UPSTREAM_PATH,
+            "ref": UPSTREAM_REF,
+            "implementation": "GNU as 2.47",
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "bytes": len(raw),
+            "license": "GPL-3.0-or-later (source file); only derived encoding "
+                       "facts are stored here",
+        },
+        "templates": {name: len(inst) for name, inst in sorted(templates.items())},
+        "stats": stats,
+        "mnemonics": len(by_mnemonic),
+        "encodings": sum(len(v) for v in by_mnemonic.values()),
+    }, indent=2, sort_keys=True) + "\n")
+    print(f"{len(by_mnemonic)} mnemonics, {sum(len(v) for v in by_mnemonic.values())} "
+          f"encodings, {stats['declarations']} templates expanded")
+    return 0
+
+
+def load_snapshot() -> dict[str, list[dict]]:
+    return json.loads(SNAPSHOT.read_text())
+
+
+# --------------------------------------------------------------------------
+# Comparison against the encoder.
+# --------------------------------------------------------------------------
+SIZE_SUFFIX = re.compile(r"^(.*?)(b|w|l|q|s|t)$")
+
+# Tokens the encoder uses to *compose* a mnemonic (the `cmp<ps|pd>`, `push %fs`
+# tables) rather than as mnemonics of their own.  They are not rows to verify.
+MNEMONIC_FRAGMENTS = {"ps", "pd", "ss", "sd", "fs", "gs", "es", "cs", "ds", "b", "w", "l", "q"}
+
+
+def gas_name(mnemonic: str) -> str:
+    """AT&T spelled the operand size as a suffix; the table does not.
+
+    `addl` and `add` are one row in `i386-opc.tbl`, distinguished by operand
+    type, so the encoder's suffixed spelling has to be folded back.  Some real
+    mnemonics end in those letters (`call`, `mul`, `pop`), so the exact spelling
+    is tried first by the caller.
+    """
+    m = SIZE_SUFFIX.match(mnemonic)
+    return m.group(1) if m else mnemonic
+
+
+VEX_PAIR = {frozenset(("vex", "legacy")), frozenset(("evex", "legacy"))}
+
+
+def _same(want: dict, have: dict) -> bool:
+    if want.get("family") != have.get("family"):
+        # A VEX/EVEX row and its legacy spelling share map, prefix and opcode;
+        # which of the two families a row belongs to is a property of the
+        # template attribute the row references, and `i386-opc.tbl` does not
+        # always reference it (the `sqrt*` and `*dup` rows do not).  Comparing
+        # them as one form is exact for the encoding and avoids a false report.
+        if frozenset((want.get("family"), have.get("family"))) not in VEX_PAIR:
+            return False
+    for key in ("map", "pp", "opcode"):
+        if want.get(key) != have.get(key):
+            return False
+    if want.get("reg") is not None and have.get("reg") is not None:
+        return want["reg"] == have["reg"]
+    if want.get("w") is not None and have.get("w") is not None:
+        return want["w"] == have["w"]
+    return True
+
+
+def verify(rows: list[dict], table: dict[str, list[dict]], model) -> tuple[list, list, int]:
+    findings, unmodeLLed, checked = [], [], 0
+    for row in rows:
+        encs = model(row)
+        if encs is None:
+            unmodeLLed.append(row)
+            continue
+        for name in row["names"]:
+            if name in MNEMONIC_FRAGMENTS:
+                continue
+            prefixes = [name]
+            base = gas_name(name)
+            if base != name:
+                prefixes.append(base)
+            if name.startswith("v"):
+                # Symmetric to the `v` synthesis: an AVX mnemonic whose row is
+                # spelled without the letter is still that row.
+                prefixes.append(name[1:])
+            known = next((table[p] for p in prefixes if p in table), None)
+            if known is None:
+                findings.append({"kind": "LCCC-UNKNOWN", "name": name,
+                                 "file": row["file"], "line": row["line"],
+                                 "body": row["body"], "want": None})
+                continue
+            checked += 1
+            for enc in encs:
+                if not any(_same(enc, have) for have in known):
+                    findings.append({"kind": "LCCC-EXTRA", "name": name,
+                                     "file": row["file"], "line": row["line"],
+                                     "body": row["body"], "want": enc})
+    return findings, unmodeLLed, checked
+
+
+def missing(rows: list[dict], table: dict[str, list[dict]], model) -> dict[str, list[dict]]:
+    """Encodings `as` accepts for mnemonics the encoder already knows."""
+    have: dict[str, list[dict]] = {}
+    for row in rows:
+        encs = model(row)
+        if encs is None:
+            continue
+        for name in row["names"]:
+            base = gas_name(name)
+            have.setdefault(name, []).extend(encs)
+            have.setdefault(base, []).extend(encs)
+    gaps: dict[str, list[dict]] = {}
+    for name, encs in table.items():
+        if name not in have:
+            continue
+        mine = have[name]
+        for enc in encs:
+            if not any(_same(enc, m) for m in mine):
+                gaps.setdefault(name, []).append(enc)
+    return gaps
+
+
+def unimplemented_mnemonics(rows: list[dict], table: dict[str, list[dict]]) -> list[str]:
+    named = set()
+    for row in rows:
+        for name in row["names"]:
+            named.add(name)
+            named.add(gas_name(name))
+    return sorted(n for n in table if n not in named)
+
+
+def _fmt(enc: dict) -> str:
+    parts = [enc["family"], enc.get("map") or "-", enc.get("pp") or "-"]
+    if enc.get("w") is not None:
+        parts.append(f"W{enc['w']}")
+    parts.append(f"{enc['opcode']:02x}")
+    if enc.get("reg") is not None:
+        parts.append(f"/{enc['reg']}")
+    return " ".join(parts)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--build", metavar="TBL",
+                    help="regenerate the snapshot from an i386-opc.tbl")
+    ap.add_argument("--verify", action="store_true", help="check every encoder row")
+    ap.add_argument("--missing", action="store_true", help="encodings the encoder lacks")
+    ap.add_argument("--absent", action="store_true", help="mnemonics with no row at all")
+    ap.add_argument("--summary", action="store_true")
+    ap.add_argument("--strict", action="store_true", help="non-zero exit on findings")
+    ap.add_argument("--limit", type=int, default=0)
+    args = ap.parse_args()
+
+    if args.build:
+        return build_snapshot(Path(args.build))
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import sdm_isa_crossref as sdm  # local sibling module
+
+    table = load_snapshot()
+    rows = []
+    for path in sdm.ENCODER_FILES:
+        rows.extend(sdm.extract_rows(Path(path).resolve()))
+
+    if args.summary or not (args.verify or args.missing or args.absent):
+        manifest = json.loads(MANIFEST.read_text())
+        print(f"as 2.47 table: {manifest['mnemonics']} mnemonics, "
+              f"{manifest['encodings']} encodings, "
+              f"{manifest['stats']['declarations']} templates, "
+              f"{manifest['stats']['instantiations']} instantiation rows, "
+              f"{manifest['stats']['skipped']} skipped")
+        print(f"encoder rows:  {len(rows)} in {len(sdm.ENCODER_FILES)} files")
+
+    if args.verify:
+        findings, unmodeLLed, checked = verify(rows, table, sdm.model_row)
+        print(f"\nrows checked against as 2.47: {checked}")
+        print(f"findings: {len(findings)}   unmodeLLed rows: {len(unmodeLLed)}")
+        shown = 0
+        for f in findings:
+            if args.limit and shown >= args.limit:
+                print(f"  ... {len(findings) - shown} more")
+                break
+            shown += 1
+            want = f" [{_fmt(f['want'])}]" if f["want"] else ""
+            print(f"  {f['kind']:13s} {f['name']:14s} {f['file']}:{f['line']}{want}")
+            print(f"                {f['body'][:110]}")
+        for row in unmodeLLed[: args.limit or len(unmodeLLed)]:
+            print(f"  UNMODELLED    {row['names'][0]:14s} {row['file']}:{row['line']}")
+            print(f"                {row['body'][:110]}")
+        if args.strict and findings:
+            return 1
+
+    if args.missing:
+        gaps = missing(rows, table, sdm.model_row)
+        total = sum(len(v) for v in gaps.values())
+        print(f"\nencodings as 2.47 accepts that the encoder has no row for: {total} "
+              f"across {len(gaps)} mnemonics already implemented")
+        for name in sorted(gaps):
+            forms = ", ".join(_fmt(e) for e in gaps[name])
+            print(f"  {name:14s} {forms}")
+
+    if args.absent:
+        absent = unimplemented_mnemonics(rows, table)
+        print(f"\nmnemonics as 2.47 knows with no encoder row: {len(absent)}")
+        print("  " + " ".join(absent))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

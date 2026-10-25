@@ -36,6 +36,18 @@ The families, and why each admits a choice:
   inc_dec         inc/dec via 0xFE/0xFF vs the (invalid in 64-bit) 0x40+r.
   xchg_acc        xchg with the accumulator has the one-byte 0x90+r form.
   lea_strength    LEA forms that a smarter assembler can shorten.
+  imul_imm        `imul $imm,src,dst` has an imm8 form (0x6B) that is three
+                  bytes shorter than the imm32 form (0x69). A multiply is
+                  never cold, so this is the largest per-instruction saving in
+                  the whole family list.
+  jcc_rel         Every conditional branch has a rel8 and a rel32 form. The
+                  encoder always reserves the long one and the assembler's
+                  relaxation pass shrinks it, so this family belongs here as
+                  the CONTROL that the two mechanisms agree.
+
+The list is not maintained by hand alone: `scripts/sdm_choice_families.py` holds
+the same families as data, derived from and re-checkable against the Intel SDM,
+and fails when one of them has no group here. Add a family to both or CI stops.
 
 Output is one instruction per line, ready for `encdiff.py --file`.
 """
@@ -202,6 +214,36 @@ def shift_one(out):
         out.append(f"{op}w $1, %ax")
 
 
+def imul_imm(out):
+    """imul's imm8 form, on both immediate sides of the sign-extension edge."""
+    for imm in (-129, -128, -1, 0, 1, 127, 128, 255, 256, 32767, 65535):
+        # two-operand: dst is also the source
+        out.append(f"imul ${imm}, %ecx")
+        out.append(f"imul ${imm}, %r9d")
+        out.append(f"imul ${imm}, %rcx")
+        # three-operand, register and memory sources
+        out.append(f"imul ${imm}, %edx, %ecx")
+        out.append(f"imul ${imm}, %rdx, %rcx")
+        out.append(f"imul ${imm}, (%rdi), %ecx")
+        out.append(f"imul ${imm}, 8(%rsi), %rcx")
+        # 16-bit: the imm8 form must still sign-extend to the operand width
+        out.append(f"imul ${imm & 0xffff}, %dx")
+    # The unsigned spelling of a negative imm8 must still take the short form.
+    out.append("imul $0xffffffff, %ecx")
+    out.append("imul $0xffffffff, %rdx, %rcx")
+
+
+def jcc_rel(out):
+    """Branch displacement choice: the relaxation control family."""
+    for cc in ("e", "ne", "l", "le", "g", "ge", "b", "be", "a", "ae",
+               "s", "ns", "o", "no", "p", "np"):
+        # A backward branch by one instruction: definitely rel8-able.
+        out.append(f"j{cc} .+2")
+        out.append(f"j{cc} .-126")
+    out.append("jmp .+2")
+    out.append("jmp .-126")
+
+
 def inc_dec(out):
     for r32, r64 in zip(GP32, GP64):
         out.append(f"incl %{r32}")
@@ -348,6 +390,8 @@ GROUPS = {
     "shift_one": shift_one,
     "inc_dec": inc_dec,
     "xchg_acc": xchg_acc,
+    "imul_imm": imul_imm,
+    "jcc_rel": jcc_rel,
     "lea_strength": lea_strength,
     "movzx_sx": movzx_sx,
     "setcc_cmov": setcc_cmov,

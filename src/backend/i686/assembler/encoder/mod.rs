@@ -2607,9 +2607,9 @@ impl InstructionEncoder {
                 self.bytes.extend_from_slice(&[0xD9, 0xF6]);
                 Ok(())
             }
-            "fcomip" => self.encode_fcomip(ops),
-            "fucomip" => self.encode_fucomip(ops),
-            "fucomi" => self.encode_fucomi(ops),
+            "fcomip" => self.encode_x87_st0_sti(ops, 0xDF, 0xF0, Some(1), "fcomip"),
+            "fucomip" => self.encode_x87_st0_sti(ops, 0xDF, 0xE8, Some(1), "fucomip"),
+            "fucomi" => self.encode_x87_st0_sti(ops, 0xDB, 0xE8, Some(1), "fucomi"),
             "fucomp" => self.encode_fucomp(ops),
             "fucom" => self.encode_fucom(ops),
             "fld" => self.encode_fld_st(ops),
@@ -2668,6 +2668,42 @@ impl InstructionEncoder {
             "fistl" => self.encode_x87_mem(ops, &[0xDB], 2),
             "fists" => self.encode_x87_mem(ops, &[0xDF], 2),
             "fistps" => self.encode_x87_mem(ops, &[0xDF], 3),
+            // x87 integer arithmetic and comparison on integer memory
+            // operands.  The 16-bit form is the DE /digit block, the 32-bit
+            // form the DA /digit block (SDM Vol. 2A, Table 3-8); the digit is
+            // the same for both, which is why the two rows differ only in the
+            // opcode byte.
+            "fiadds" => self.encode_x87_mem(ops, &[0xDE], 0),
+            "fiaddl" => self.encode_x87_mem(ops, &[0xDA], 0),
+            "fimuls" => self.encode_x87_mem(ops, &[0xDE], 1),
+            "fimull" => self.encode_x87_mem(ops, &[0xDA], 1),
+            "ficoms" => self.encode_x87_mem(ops, &[0xDE], 2),
+            "ficoml" => self.encode_x87_mem(ops, &[0xDA], 2),
+            "ficomps" => self.encode_x87_mem(ops, &[0xDE], 3),
+            "ficompl" => self.encode_x87_mem(ops, &[0xDA], 3),
+            "fisubs" => self.encode_x87_mem(ops, &[0xDE], 4),
+            "fisubl" => self.encode_x87_mem(ops, &[0xDA], 4),
+            "fisubrs" => self.encode_x87_mem(ops, &[0xDE], 5),
+            "fisubrl" => self.encode_x87_mem(ops, &[0xDA], 5),
+            "fidivs" => self.encode_x87_mem(ops, &[0xDE], 6),
+            "fidivl" => self.encode_x87_mem(ops, &[0xDA], 6),
+            "fidivrs" => self.encode_x87_mem(ops, &[0xDE], 7),
+            "fidivrl" => self.encode_x87_mem(ops, &[0xDA], 7),
+            // x87 conditional moves and the SSE-era compare-into-flags forms.
+            "fcmovb" => self.encode_x87_st0_sti(ops, 0xDA, 0xC0, None, "fcmovb"),
+            "fcmove" => self.encode_x87_st0_sti(ops, 0xDA, 0xC8, None, "fcmove"),
+            "fcmovbe" => self.encode_x87_st0_sti(ops, 0xDA, 0xD0, None, "fcmovbe"),
+            "fcmovu" => self.encode_x87_st0_sti(ops, 0xDA, 0xD8, None, "fcmovu"),
+            "fcmovnb" => self.encode_x87_st0_sti(ops, 0xDB, 0xC0, None, "fcmovnb"),
+            "fcmovne" => self.encode_x87_st0_sti(ops, 0xDB, 0xC8, None, "fcmovne"),
+            "fcmovnbe" => self.encode_x87_st0_sti(ops, 0xDB, 0xD0, None, "fcmovnbe"),
+            "fcmovnu" => self.encode_x87_st0_sti(ops, 0xDB, 0xD8, None, "fcmovnu"),
+            "fcomi" => self.encode_x87_st0_sti(ops, 0xDB, 0xF0, Some(1), "fcomi"),
+            "ffreep" => self.encode_x87_st0_sti(ops, 0xDF, 0xC0, None, "ffreep"),
+            // `fisttp` without a suffix is the 64-bit form: AT&T only spells
+            // the `q` suffix for `fildq`/`fistpq`, and GAS accepts the bare
+            // mnemonic for the quadword `fisttp` (gas/doc/c-i386.texi).
+            "fisttp" => self.encode_x87_mem(ops, &[0xDD], 1),
             "fisttps" => self.encode_x87_mem(ops, &[0xDF], 1),
             "fildll" => self.encode_x87_mem(ops, &[0xDF], 5),
             "fisttpll" => self.encode_x87_mem(ops, &[0xDD], 1),
@@ -4094,5 +4130,227 @@ mod vector_modifier_relocation_tests {
                 }
             }
         }
+    }
+}
+
+/// Encoding minimality, pinned at the boundaries where the choice flips.
+///
+/// The Intel SDM defines more than one legal encoding for these families, so
+/// an assembler can be *correct* and still wasteful. `scripts/
+/// sdm_choice_families.py` holds the complete family list as data and checks
+/// it against the SDM; this module checks that the encoder actually picks the
+/// short side at the value where it stops being legal.
+///
+/// The accumulator forms are a genuine crossover, not a fixed preference:
+/// `addl $1,%eax` is 3 bytes as `83 c0 01` and 5 as `05 01 00 00 00`, while
+/// `addl $1000,%eax` is 5 bytes as `05 e8 03 00 00` and 6 as `81 c0 e8 03 00
+/// 00`. An encoder that always prefers either one is wrong on half the range.
+#[cfg(test)]
+mod encoding_choice_minimality_tests {
+    use super::*;
+
+    fn assemble(line: &str) -> Result<String, String> {
+        let mut encoder = InstructionEncoder::new();
+        for item in parse_asm(line)? {
+            if let AsmItem::Instruction(instr) = item {
+                encoder.encode(&instr)?;
+            }
+        }
+        Ok(encoder
+            .bytes
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(" "))
+    }
+
+    /// Every family, on both sides of its sign-extension edge. Bytes are GNU
+    /// as 2.47's for the same line.
+    #[test]
+    fn shortest_encoding_is_chosen_across_every_choice_family() {
+        for (line, hex) in [
+            // imm8 sign-extended (0x83) beats imm32 (0x81) up to 127.
+            ("addl $1, %eax", "83 c0 01"),
+            ("addl $-1, %eax", "83 c0 ff"),
+            ("addl $127, %ecx", "83 c1 7f"),
+            ("addl $-128, %ecx", "83 c1 80"),
+            // ... and stops being legal at 128 / -129.
+            ("addl $128, %ecx", "81 c1 80 00 00 00"),
+            ("addl $-129, %ecx", "81 c1 7f ff ff ff"),
+            // The accumulator form skips ModR/M but is wider than imm8, so it
+            // only wins once the immediate no longer fits a signed byte.
+            ("addl $1000, %eax", "05 e8 03 00 00"),
+            ("addl $2147483647, %eax", "05 ff ff ff 7f"),
+            ("addl $1000, %ecx", "81 c1 e8 03 00 00"),
+            // A memory destination takes the same imm8 row.
+            ("addl $1, (%esp)", "83 04 24 01"),
+            // 16-bit: the imm8 still sign-extends, so the unsigned spelling of
+            // -1 takes the short form.
+            ("addw $65535, %ax", "66 83 c0 ff"),
+            // Byte operands have no imm8 choice: one immediate width only.
+            ("addb $-1, %al", "04 ff"),
+            ("addb $1, %cl", "80 c1 01"),
+            // imul: 0x6B is the same instruction with the immediate narrowed.
+            ("imull $5, %ecx", "6b c9 05"),
+            ("imull $-1, %ecx", "6b c9 ff"),
+            ("imull $0xffffffff, %ecx", "6b c9 ff"),
+            ("imull $1, %eax", "6b c0 01"),
+            ("imull $1000, %ecx", "69 c9 e8 03 00 00"),
+            ("imull $5, (%edi), %ecx", "6b 0f 05"),
+            // test: the accumulator form drops ModR/M.
+            ("testl $1, %eax", "a9 01 00 00 00"),
+            ("testl $1, %ecx", "f7 c1 01 00 00 00"),
+            // push: imm8 vs imm32.
+            ("pushl $1", "6a 01"),
+            ("pushl $1000", "68 e8 03 00 00"),
+            // 32-bit-mode register short forms; 0x40-0x4F is not REX here.
+            ("incl %eax", "40"),
+            ("decl %ecx", "49"),
+            // xchg with the accumulator: one byte, and 0x90 is the NOP.
+            ("xchgl %eax, %edx", "92"),
+            // Shift by one has no immediate field at all.
+            ("shll $1, %eax", "d1 e0"),
+            // mov: the register form needs no ModR/M for any register.
+            ("movl $1, %eax", "b8 01 00 00 00"),
+            ("movl $1, %ecx", "b9 01 00 00 00"),
+        ] {
+            assert_eq!(assemble(line).as_deref(), Ok(hex), "{line}");
+        }
+    }
+
+    /// The short form must never be taken when it would change the value: an
+    /// unsigned immediate above the signed range that is NOT the truncated
+    /// spelling of a negative stays wide.
+    #[test]
+    fn imm8_is_only_taken_when_it_sign_extends_back() {
+        // 0x80 is +128 as an unsigned byte but -128 sign-extended, so the
+        // byte form cannot represent it.
+        assert_eq!(
+            assemble("addl $128, %ecx").as_deref(),
+            Ok("81 c1 80 00 00 00")
+        );
+        // 0xffffff80 IS -128 truncated, so it takes the short form.
+        assert_eq!(
+            assemble("addl $0xffffff80, %ecx").as_deref(),
+            Ok("83 c1 80")
+        );
+    }
+}
+
+#[cfg(test)]
+mod x87_integer_and_conditional_tests {
+    use super::*;
+
+    fn assemble(line: &str) -> Result<String, String> {
+        let mut encoder = InstructionEncoder::new();
+        for item in parse_asm(line)? {
+            if let AsmItem::Instruction(instr) = item {
+                encoder.encode(&instr)?;
+            }
+        }
+        Ok(encoder
+            .bytes
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(" "))
+    }
+
+    /// Golden bytes for the integer arithmetic forms come from GNU as 2.47's
+    /// own encoding test: `gas/testsuite/gas/i386/float.s`, whose expected
+    /// listing `float.l` records `fiadds (%ebx)` as `DE 03` and `fiaddl
+    /// (%ebx)` as `DA 03`, with the same `/digit` in both blocks.
+    #[test]
+    fn x87_integer_arithmetic_matches_gnu_as_2_47() {
+        for (line, hex) in [
+            ("fiadds (%ebx)", "de 03"),
+            ("fiaddl (%ebx)", "da 03"),
+            ("fimuls (%ebx)", "de 0b"),
+            ("fimull (%ebx)", "da 0b"),
+            ("fisubs (%ebx)", "de 23"),
+            ("fisubl (%ebx)", "da 23"),
+            ("fisubrs (%ebx)", "de 2b"),
+            ("fisubrl (%ebx)", "da 2b"),
+            ("fidivs (%ebx)", "de 33"),
+            ("fidivl (%ebx)", "da 33"),
+            ("fidivrs (%ebx)", "de 3b"),
+            ("fidivrl (%ebx)", "da 3b"),
+        ] {
+            assert_eq!(assemble(line).as_deref(), Ok(hex), "{line}");
+        }
+    }
+
+    /// `ficom`/`ficomp` follow the same two-block layout at `/2` and `/3`
+    /// (SDM Vol. 2A `FICOM`/`FICOMP`: `DE /2`, `DE /3` for m16int and `DA /2`,
+    /// `DA /3` for m32int).
+    #[test]
+    fn x87_integer_compare_uses_the_sdm_digits() {
+        for (line, hex) in [
+            ("ficoms (%ebx)", "de 13"),
+            ("ficoml (%ebx)", "da 13"),
+            ("ficomps (%ebx)", "de 1b"),
+            ("ficompl (%ebx)", "da 1b"),
+        ] {
+            assert_eq!(assemble(line).as_deref(), Ok(hex), "{line}");
+        }
+    }
+
+    #[test]
+    fn x87_compare_into_flags_matches_gnu_as_2_47() {
+        // `float.l`: `fcomi %st(2)` = DB F2, `fcomip %st(3)` = DF F3,
+        // `fucomi %st(4)` = DB EC, `fucomip %st(5)` = DF ED.
+        for (line, hex) in [
+            ("fcomi %st(2)", "db f2"),
+            ("fcomi %st(2),%st", "db f2"),
+            ("fcomi", "db f1"),
+            ("fcomip %st(3)", "df f3"),
+            ("fcomip %st(3),%st", "df f3"),
+            ("fucomi %st(4)", "db ec"),
+            ("fucomip %st(5)", "df ed"),
+            // The i686 cast path emits this spelling for x87 -> u64; it has to
+            // keep assembling to the same two bytes.
+            ("fucomip %st(1), %st", "df e9"),
+        ] {
+            assert_eq!(assemble(line).as_deref(), Ok(hex), "{line}");
+        }
+        // The implicit `st(0)` is the *second* operand; this order names a
+        // different comparison and must not be encoded as `fcomi %st(2)`.
+        assert!(assemble("fcomi %st,%st(2)").is_err());
+    }
+
+    /// `FCMOVcc`/`FFREEP` take `ST(0)` as their implicit first operand and the
+    /// register number in ModR/M.r/m, with the condition in the reg field
+    /// (SDM Vol. 2A: `DA C0+i`, `DA C8+i`, `DA D0+i`, `DA D8+i`, `DB C0+i`,
+    /// `DB C8+i`, `DB D0+i`, `DB D8+i`; `FFREEP` is `DF C0+i`).
+    #[test]
+    fn x87_conditional_moves_and_ffreep() {
+        for (line, hex) in [
+            ("fcmovb %st(1)", "da c1"),
+            ("fcmove %st(2)", "da ca"),
+            ("fcmovbe %st(3)", "da d3"),
+            ("fcmovu %st(4)", "da dc"),
+            ("fcmovnb %st(5)", "db c5"),
+            ("fcmovne %st(6)", "db ce"),
+            ("fcmovnbe %st(7)", "db d7"),
+            ("fcmovnu %st(1)", "db d9"),
+            ("fcmovb %st(1),%st", "da c1"),
+            ("ffreep %st(3)", "df c3"),
+            ("ffreep %st", "df c0"),
+        ] {
+            assert_eq!(assemble(line).as_deref(), Ok(hex), "{line}");
+        }
+        // The condition is part of the mnemonic, not of the register: the
+        // implicit `st(0)` has to be last, as the table's `{ FloatReg, FloatAcc }`
+        // operand order says.
+        assert!(assemble("fcmovb %st,%st(1)").is_err());
+    }
+
+    #[test]
+    fn bare_fisttp_is_the_quadword_form() {
+        // GAS spells the 64-bit integer store `fisttp` (the `q` suffix is only
+        // sanctioned for `fildq`/`fistpq`), and `fisttpq` is accepted as an
+        // alias by this assembler.
+        assert_eq!(assemble("fisttp 8(%esp)").as_deref(), Ok("dd 4c 24 08"));
+        assert_eq!(assemble("fisttpq 8(%esp)").as_deref(), Ok("dd 4c 24 08"));
     }
 }

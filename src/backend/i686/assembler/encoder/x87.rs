@@ -49,42 +49,6 @@ impl super::InstructionEncoder {
         self.encode_x87_mem_raw(ops, opcode, ext)
     }
 
-    pub(super) fn encode_fcomip(&mut self, ops: &[Operand]) -> Result<(), String> {
-        if ops.len() == 2 {
-            match &ops[0] {
-                Operand::Register(reg) => {
-                    let n = parse_st_num(&reg.name)?;
-                    self.bytes.extend_from_slice(&[0xDF, 0xF0 + n]);
-                    Ok(())
-                }
-                _ => Err("fcomip requires st register".to_string()),
-            }
-        } else if ops.is_empty() {
-            self.bytes.extend_from_slice(&[0xDF, 0xF1]);
-            Ok(())
-        } else {
-            Err("fcomip requires 0 or 2 operands".to_string())
-        }
-    }
-
-    pub(super) fn encode_fucomip(&mut self, ops: &[Operand]) -> Result<(), String> {
-        if ops.len() == 2 {
-            match &ops[0] {
-                Operand::Register(reg) => {
-                    let n = parse_st_num(&reg.name)?;
-                    self.bytes.extend_from_slice(&[0xDF, 0xE8 + n]);
-                    Ok(())
-                }
-                _ => Err("fucomip requires st register".to_string()),
-            }
-        } else if ops.is_empty() {
-            self.bytes.extend_from_slice(&[0xDF, 0xE9]);
-            Ok(())
-        } else {
-            Err("fucomip requires 0 or 2 operands".to_string())
-        }
-    }
-
     pub(super) fn encode_fld_st(&mut self, ops: &[Operand]) -> Result<(), String> {
         if ops.len() != 1 {
             return Err("fld requires 1 operand".to_string());
@@ -191,6 +155,38 @@ impl super::InstructionEncoder {
         }
     }
 
+    /// Encode the x87 forms whose ModR/M byte is `base + i` over an implicit
+    /// `st(0)`: `fcomi`, `fcomip`, `fucomi`, `fucomip`, `fcmovcc` and `ffreep`.
+    ///
+    /// Both spellings the assembler accepts are handled — `fcomip %st(3)` and
+    /// `fcomip %st(3),%st` — plus the bare `fcomi`, which GAS defines as
+    /// `%st(1)`.  The AT&T operand order for these rows is `%st(i),%st` (the
+    /// table's `{ FloatReg, FloatAcc }`), so it is the *second* operand that
+    /// has to be the implicit `st(0)`: `fcomip %st,%st(3)` names a different
+    /// comparison and is rejected rather than silently encoded as `%st(3)`.
+    pub(super) fn encode_x87_st0_sti(
+        &mut self,
+        ops: &[Operand],
+        opcode: u8,
+        base: u8,
+        default_reg: Option<u8>,
+        name: &str,
+    ) -> Result<(), String> {
+        let n = match ops {
+            [] => default_reg.ok_or_else(|| format!("`{name}' requires an st register operand"))?,
+            [Operand::Register(reg)] => parse_st_num(&reg.name)?,
+            [Operand::Register(first), Operand::Register(second)] => {
+                if parse_st_num(&second.name)? != 0 {
+                    return Err(format!("`{name}' requires %st as its second operand"));
+                }
+                parse_st_num(&first.name)?
+            }
+            _ => return Err(format!("`{name}' requires an st register operand")),
+        };
+        self.bytes.extend_from_slice(&[opcode, base + n]);
+        Ok(())
+    }
+
     pub(super) fn encode_fcom(&mut self, ops: &[Operand]) -> Result<(), String> {
         if ops.len() == 1 || ops.len() == 2 {
             match &ops[0] {
@@ -228,24 +224,6 @@ impl super::InstructionEncoder {
     }
 
     /// Encode fucomi (unordered compare and set EFLAGS).
-    pub(super) fn encode_fucomi(&mut self, ops: &[Operand]) -> Result<(), String> {
-        if ops.len() == 2 {
-            match &ops[0] {
-                Operand::Register(reg) => {
-                    let n = parse_st_num(&reg.name)?;
-                    self.bytes.extend_from_slice(&[0xDB, 0xE8 + n]);
-                    Ok(())
-                }
-                _ => Err("fucomi requires st register".to_string()),
-            }
-        } else if ops.is_empty() {
-            self.bytes.extend_from_slice(&[0xDB, 0xE9]);
-            Ok(())
-        } else {
-            Err("fucomi requires 0 or 2 operands".to_string())
-        }
-    }
-
     /// Encode fucomp (unordered compare and pop, sets FPU status word).
     pub(super) fn encode_fucomp(&mut self, ops: &[Operand]) -> Result<(), String> {
         if ops.len() == 1 {
