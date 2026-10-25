@@ -2981,21 +2981,7 @@ impl X86Codegen {
             | IntrinsicOp::Psignd128
             | IntrinsicOp::Pmulhrsw128
             | IntrinsicOp::Palignr128 => {
-                if let Some(dptr) = dest_ptr {
-                    let inst = match op {
-                        IntrinsicOp::Phaddw128 => "phaddw",
-                        IntrinsicOp::Phaddd128 => "phaddd",
-                        IntrinsicOp::Phsubw128 => "phsubw",
-                        IntrinsicOp::Phsubd128 => "phsubd",
-                        IntrinsicOp::Phaddsw128 => "phaddsw",
-                        IntrinsicOp::Phsubsw128 => "phsubsw",
-                        IntrinsicOp::Psignb128 => "psignb",
-                        IntrinsicOp::Psignw128 => "psignw",
-                        IntrinsicOp::Psignd128 => "psignd",
-                        IntrinsicOp::Pmulhrsw128 => "pmulhrsw",
-                        IntrinsicOp::Palignr128 => "palignr",
-                        _ => unreachable!(),
-                    };
+                if let (Some(dptr), Some(inst)) = (dest_ptr, op.ssse3_binary_mnemonic()) {
                     self.sse_load_arg(&args[0], "xmm0");
                     self.sse_load_arg(&args[1], "xmm1");
                     if matches!(op, IntrinsicOp::Palignr128) {

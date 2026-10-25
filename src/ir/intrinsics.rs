@@ -1921,6 +1921,24 @@ pub(crate) const VECTOR_STORES: [IntrinsicOp; 13] = [
 ];
 
 impl IntrinsicOp {
+    /// Native legacy/VEX SSSE3 binary mnemonic shared by both x86 emitters.
+    pub(crate) fn ssse3_binary_mnemonic(self) -> Option<&'static str> {
+        Some(match self {
+            Self::Phaddw128 => "phaddw",
+            Self::Phaddd128 => "phaddd",
+            Self::Phsubw128 => "phsubw",
+            Self::Phsubd128 => "phsubd",
+            Self::Phaddsw128 => "phaddsw",
+            Self::Phsubsw128 => "phsubsw",
+            Self::Psignb128 => "psignb",
+            Self::Psignw128 => "psignw",
+            Self::Psignd128 => "psignd",
+            Self::Pmulhrsw128 => "pmulhrsw",
+            Self::Palignr128 => "palignr",
+            _ => return None,
+        })
+    }
+
     /// 128-bit FP ops with the *destructive* two-operand legacy-SSE encoding
     /// `dst = args[0] op args[1]`: two 16-byte vector operands, one 16-byte
     /// vector result, and — the property this predicate exists for — the
@@ -3434,6 +3452,27 @@ mod memory_classification_tests {
 #[cfg(test)]
 mod ssse3_native_contract_tests {
     use super::IntrinsicOp::*;
+    #[test]
+    fn shared_ssse3_mnemonics_cover_the_exact_legacy_family() {
+        use super::IntrinsicOp as O;
+        for (op, mnemonic) in [
+            (O::Phaddw128, "phaddw"),
+            (O::Phaddd128, "phaddd"),
+            (O::Phsubw128, "phsubw"),
+            (O::Phsubd128, "phsubd"),
+            (O::Phaddsw128, "phaddsw"),
+            (O::Phsubsw128, "phsubsw"),
+            (O::Psignb128, "psignb"),
+            (O::Psignw128, "psignw"),
+            (O::Psignd128, "psignd"),
+            (O::Pmulhrsw128, "pmulhrsw"),
+            (O::Palignr128, "palignr"),
+        ] {
+            assert_eq!(op.ssse3_binary_mnemonic(), Some(mnemonic));
+        }
+        assert_eq!(O::Pmulld128.ssse3_binary_mnemonic(), None);
+    }
+
     #[test]
     fn native_binary_results_have_full_vector_homes() {
         for op in [

@@ -1044,20 +1044,7 @@ impl I686Codegen {
             | IntrinsicOp::Psignw128
             | IntrinsicOp::Psignd128
             | IntrinsicOp::Pmulhrsw128 => {
-                if let Some(dptr) = dest_ptr {
-                    let inst = match op {
-                        IntrinsicOp::Phaddw128 => "phaddw",
-                        IntrinsicOp::Phaddd128 => "phaddd",
-                        IntrinsicOp::Phsubw128 => "phsubw",
-                        IntrinsicOp::Phsubd128 => "phsubd",
-                        IntrinsicOp::Phaddsw128 => "phaddsw",
-                        IntrinsicOp::Phsubsw128 => "phsubsw",
-                        IntrinsicOp::Psignb128 => "psignb",
-                        IntrinsicOp::Psignw128 => "psignw",
-                        IntrinsicOp::Psignd128 => "psignd",
-                        IntrinsicOp::Pmulhrsw128 => "pmulhrsw",
-                        _ => unreachable!(),
-                    };
+                if let (Some(dptr), Some(inst)) = (dest_ptr, op.ssse3_binary_mnemonic()) {
                     self.operand_to_eax(&args[0]);
                     self.state.emit("    movdqu (%eax), %xmm0");
                     self.operand_to_eax(&args[1]);

@@ -117,6 +117,31 @@ architecture". Retain VPMULHRSW EVEX and add a positive assembler witness.
     pass, with 350 names pinned across 21 headers; both-mode native runtime
     and feature-permission checks pass again after regeneration.
 
+12. **Speculative CFI metadata leakage.** Hosted CFI checks exposed a genuine
+    i686 unwind-analysis bug: dual-layout measurement discarded its assembly
+    but retained indirect-call pop records. The new native fixture shipped two
+    indirect calls with six recorded sites; synthesis correctly refused that
+    mismatch and reported conflicting frame states. Record call-pop facts
+    only for committed emission, including direct-site agreement metadata.
+    Preserve the synthesizer's mismatch refusal. A state unit checks that
+    exploratory facts cannot append phantom sites or poison a direct callee.
+    The complete CFI gate with 32-bit libc headers now passes 15,146 functions
+    and 15,598 returns, including the original failing fixture; no CFI tests
+    or expectations were removed.
+13. **Maintainability ratchet.** Share the exact SSSE3 mnemonic table between
+    both emitters instead of adding another unreachable panic. Lift the exact
+    vector-prefix classifier out of the oversized collector; token comparison
+    confirms the extracted classification is unchanged. The existing unknown
+    writer/non-16-byte rejection units and the new mnemonic contract pass.
+    The unchanged audit baseline holds, with fewer panic sites and fewer
+    functions over 300 lines; no threshold was raised.
+
+The REX.W CRC counterexample also has independent hardware evidence: the
+architectural byte sequence `F2 48 0F 38 F0 C0` matches a scalar Castagnoli
+polynomial update, including clearing the high half of RAX, with GCC 16.2
+and LCCC at O0/O1/O2/O3. GAS's rejection of a redundant textual prefix is
+therefore not treated as an architectural rejection.
+
 ## Evidence discipline and remaining scope
 
 The new scalar expectations avoid signed overflow. They include unsigned
