@@ -1611,6 +1611,16 @@ impl Lowerer {
                 Some(I386ExtVectorCarrier::Lanes) => {
                     self.lower_i386_va_arg_ext_vector_lanes(ap_expr, ctype)
                 }
+                // 16-byte SIMD class on a baseline without the XMM carrier
+                // (pre-SSE `-march`, `-mno-sse`): the va ABI (GCC 4.6)
+                // 16-byte-aligns it in the va area on ANY baseline — read
+                // one 16-byte slot from the aligned cursor. Pure GP loads
+                // (no XMM needed); GCC 16.2 and Clang 23.1.3 agree on this
+                // read (measured: both realign the cursor and take 16
+                // bytes, then advance 16).
+                _ if ctype.is_i386_16b_simd_vector() => {
+                    self.lower_i386_va_arg_ext_vector_xmm(ap_expr, ctype, 1)
+                }
                 _ => self.lower_va_arg_struct(ap_expr, type_spec, ctype),
             },
             _ => self.lower_va_arg_struct(ap_expr, type_spec, ctype),

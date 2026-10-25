@@ -1936,7 +1936,7 @@ mod tests {
     }
 
     #[test]
-    fn i386_vector_alignment_requires_the_explicit_vector_marker() {
+   fn i386_vector_alignment_requires_the_explicit_vector_marker() {
         let config = i686_regparm3();
         let vector = [EightbyteClass::Memory, EightbyteClass::NoClass];
         let ordinary_memory = [EightbyteClass::Memory];
@@ -1998,6 +1998,7 @@ mod tests {
     }
 
     #[test]
+
     fn scalar_f128_overflow_uses_the_value_stack_class_on_x86() {
         let f128 = || ArgInfo {
             struct_size: Some(16),

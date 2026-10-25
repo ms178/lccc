@@ -386,11 +386,12 @@ fix alone. This is an instruction-count result, not a universal timing claim.
 
 Regressions include all 65,536 immediate-pair compositions, barrier and
 skip-control checks, a native original/optimized/independent-integer-model
-comparison including observable YMM upper lanes, and a 20,480-check typed C
+
+comparison including observable YMM upper lanes, and an 18,432-check typed C
 fixture. The latter supports separate compiler/driver translation units and
 covers nesting, function arguments/returns, conditional struct members,
-floating bit patterns, finite floating lanes, sizeof, _Generic and operand
-side effects. Differential
+floating bit patterns, sizeof, _Generic and operand side effects. Differential
+
 runs use only the cached GCC 16.2, Clang 23.1.3 and binutils 2.47 tools.
 
 ### i686 GNU vector ABI follow-up
@@ -401,56 +402,25 @@ struct stack/sret objects instead of XMM vectors when SSE was enabled. The
 baseline native witness terminates with SIGSEGV. These GNU vector shapes now
 reuse the already modeled single-XMM carrier, including signature CType
 retention, direct/indirect calls, argument decomposition and return packing.
-Explicit `-mno-sse` instead retains the generic stack/sret convention. LCCC's
-existing i686 backend and macro contract have an SSE2 baseline, so the default
-ABI remains XMM; an independent `-mno-sse2` denial produces SSE-only carriers,
-and `-mno-sse -msse` restores baseline SSE2 unless a direct SSE2 denial is
-also present. The effective-feature mirror now publishes those baseline and
-denial states to this classifier. Prefetch retains its narrower positive-
-grant predicate instead of inheriting the backend's baseline. The separate
-32/64-byte GNU-vector MEMORY defect is now addressed in the i686 backend:
-explicit target-local vector metadata drives natural caller/callee offsets,
-call-site dynamic stack realignment, and a single aligned variadic cursor/copy.
-Ordinary over-aligned records retain their measured four-byte layout;
-memory-passed GNU vectors use natural alignment, including no-SSE v16.
-The alignment-ABI gate now requires every i386 v16/v32/v64 LCCC/GCC pairing to
-exit zero, including both stack residues and O0/O2; the former divergence
-latch is removed. Hosted run 40124172080 accepted the complete matrix at
-28f179894. This is an ABI finding from current compiler differential evidence,
-not a calling-convention claim derived from the SDM.
+
+Pre-SSE i686 and explicit `-mno-sse` instead retain the generic stack/sret
+convention: GCC 16.2 assembly distinguishes that ABI, and the initial
+SSE-unconditional predicate did not. The driver now publishes its resolved
+i686 SSE grant through the effective-feature mirror used by this classifier;
+the same resolved predicate remains shared with SSE prefetch selection. Other
+GNU vector widths are not changed. This is an ABI finding from current
+compiler differential evidence, not a calling-convention claim derived from
+the SDM.
 
 `check_i686_gnu_vector_abi.sh` requires GCC 16.2.0, Clang 23.1.3 and GNU as
 2.47. It links freestanding ELF32 programs with lccc-ld, requiring no 32-bit
-libc headers/runtime. Across default, explicit SSE2, SSE-only, SSE2-denied,
-profile-denied, SSE-restored and no-SSE modes, it exercises **88 complete
-cross-TU configurations** at O0/O2/O3/Os, each retaining all 16,384 vector-ABI
-and 20,480 typed-shuffle checks. Default and SSE2 run all 24 mixed-compiler
-rows. The other five modes run eight GCC/LCCC-family rows; reduced-ISA Clang
-self-oracle rows are explicitly excluded because Clang 23.1.3 failed its own
-SSE-only `pick_variadic` probe with exit 8 and, after that probe was removed,
-its own `iddouble` probe with exit 4. These are recorded upstream-oracle
-incompatibilities, not LCCC passes or LCCC failures; no LCCC/GCC probe is
-omitted. LLVM 23.1.3's `X86CallingConv.td` passes only `v4f32` in XMM with
-SSE1 but no SSE2, whereas GCC/LCCC also use XMM for the tested integer/double
-vectors, and Clang's no-SSE vector return rule differs from GCC stack/sret.
-The earlier source-only inference that Clang's `-mno-sse -msse` remains
-SSE-only was disproved by the hosted 23.1.3 executable probe: it defines
-`__SSE2__` after that ordered sequence, so the gate now expects SSE2 for all
-three compiler families in `sse-restored`. Linking incompatible families is
-not a valid differential test; all compatible mixed rows and all GCC/LCCC
-reduced-ISA rows remain mandatory.
-Compile-time `__SSE__`/`__SSE2__`/`__SSE3__` checks and non-vacuous PSHUFD/XMM
-assembly ceilings cover states that a host runtime cannot observe.
-Integer element widths 8/16/32/64, double bit patterns, indirect calls,
-register exhaustion, 16-byte stack alignment and variadic named/unnamed
-vectors are covered. GCC 16.2's no-SSE O0 direct `v4f` shuffle uses x87
-`flds`/`fstps` and lost a random NaN payload (typed exit 2). The fixture now
-keeps that direct floating shuffle as an exactly representable finite-lane
-probe and adds a separate integer-union bit-carrier shuffle for arbitrary NaN
-payloads; no probe or compiler row was deleted. The original fixture fails
-locally with exit 2 and the split fixture passes all 28 GCC mode/optimization
-combinations plus native O0/O2/O3/Os. The hosted matrix completed 88/88 rows,
-3,244,032 total checks, with no-SSE object-level XMM ceilings in run
-40124172080. Only libc includes are replaced by freestanding declarations.
-The unsharded differential workflow runs this gate after a swap-enabled
-fastbuild with the pinned compiler and assembler oracles.
+libc headers/runtime. Across explicit SSE2, `-march=i686`, and `-mno-sse`
+modes, both driver compilers, and all three function compilers at
+O0/O2/O3/Os, it exercises 72 cross-TU configurations, each with 16,384
+vector-ABI checks and 18,432 typed-shuffle checks. Integer element widths
+8/16/32/64, double bit patterns, indirect calls, register exhaustion, 16-byte
+stack alignment and variadic named/unnamed vectors are covered. The shared
+typed fixture keeps its original checks; only its libc includes are replaced
+by freestanding declarations. Backend contract CI runs this gate with the
+pinned compiler and assembler oracles.
+

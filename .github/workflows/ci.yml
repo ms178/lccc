@@ -2286,6 +2286,7 @@ jobs:
         fast_contracts() {
         trap 'rc=$?; printf "::error title=Fast contract failed::%s (exit %s)\n" "$BASH_COMMAND" "$rc"; exit "$rc"' ERR
         bash tests/regression/check_i686_atomics.sh
+        env LCCC_TEST_ASSEMBLER="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" bash tests/regression/check_i686_gnu_vector_abi.sh
         bash tests/regression/check_gvn_cross_block_mul_dot.sh
         bash tests/regression/check_volatile_access_semantics.sh
         python3 scripts/test_godbolt_cache.py
@@ -2776,6 +2777,7 @@ jobs:
         intel-evidence/sse1-f32-icx > intel-evidence/sse1-f32-icx.txt
         intel-evidence/sse1-f32-lccc > intel-evidence/sse1-f32-lccc.txt
         diff -u intel-evidence/sse1-f32-icx.txt intel-evidence/sse1-f32-lccc.txt
+
     - name: Incoming MEMORY parameter ABI against ICX
       run: env CCC=target/fastbuild/lccc ORACLE_CC="$LCCC_ICX_BIN" bash tests/regression/check_incoming_byval_homes.sh
     - name: FP select min/max matrix against ICX
