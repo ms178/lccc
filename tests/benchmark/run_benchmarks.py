@@ -1062,10 +1062,15 @@ def render_markdown(report: dict[str, Any]) -> str:
     compiler_metadata = {compiler["key"]: compiler for compiler in report.get("compilers", [])}
     reference_keys = [compiler["key"] for compiler in report.get("compilers", [])
                       if compiler["key"] != "lccc"]
+    shard_cpus = {shard["report"]: "; ".join(shard.get("metadata", {}).get("cpu_models", []))
+                  for shard in report.get("shards", [])}
     header = ["Benchmark", "LCCC median"]
     header.extend(f"{compiler_labels.get(key, key).upper()} median" for key in reference_keys)
     header.extend(["Best reference", "LCCC/best paired (95% bootstrap CI)", "Correct"])
     separator = ["---", "---:"] + ["---:" for _ in reference_keys] + ["---", "---:", ":---:"]
+    if shard_cpus:
+        header.append("Measurement CPU / shard")
+        separator.append("---")
 
     lines = [
         "# LCCC benchmark report",
@@ -1077,6 +1082,8 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- **PMU:** `{metadata['pmu']['reason']}`",
         f"- **LCCC revision:** `{metadata['git'].get('revision', 'unknown')}`",
         f"- **LCCC binary SHA-256:** `{compiler_metadata.get('lccc', {}).get('binary_sha256', 'unknown')}`",
+        f"- **Optimization:** `{report['settings']['opt']}`; common flags: `{report['settings'].get('common_cflags', [])}`",
+        f"- **Rounds / excluded warm-ups:** `{report['settings']['reps']} / {report['settings']['warmup']}`",
         f"- **Method:** {method}.",
         "",
         "| " + " | ".join(header) + " |",
@@ -1104,8 +1111,13 @@ def render_markdown(report: dict[str, Any]) -> str:
         correct = entry.get("correctness", {}).get("lccc", {}).get("matches_baseline")
         correct_text = "pass" if correct is True else ("FAIL" if correct is False else "—")
         row.extend([best_text, ratio_text, correct_text])
+        if shard_cpus:
+            shard = entry.get("measurement_shard", "unknown")
+            row.append(f"{shard_cpus.get(shard, 'unknown')} / `{shard}`")
         lines.append("| " + " | ".join(row) + " |")
 
+    if report.get("shards"):
+        lines.extend(["", "Sharded measurements: rows retain their runner identity; aggregates describe workload/host pairs, not one CPU."])
     aggregate = report.get("aggregate_lccc_vs_gcc")
     if aggregate:
         lines.extend([
@@ -1188,15 +1200,33 @@ def merge_reports(paths: list[Path]) -> dict[str, Any]:
                 raise SystemExit(f"{path}: benchmark {name!r} also appears in {seen[name]}")
             seen[name] = path.name
             names.append(name)
-            entries.append(entry)
+            entries.append(dict(entry, measurement_shard=path.name))
         shards.append({"report": path.name, "benchmarks": names,
-                       "settings": report["settings"]})
+                       "settings": report["settings"], "metadata": report["metadata"]})
 
     merged = json.loads(json.dumps(base))
     merged["benchmarks"] = entries
     merged["complete"] = True
     merged["shards"] = shards
     merged["metadata"] = dict(base["metadata"], merged_from=[p.name for p in paths])
+    merged["metadata"]["cpu_models"] = sorted({
+        model for _, report in reports for model in report["metadata"]["cpu_models"]
+    })
+    merged["metadata"]["hypervisor_detected"] = any(
+        report["metadata"]["hypervisor_detected"] for _, report in reports
+    )
+    merged["metadata"]["pinning"] = {
+        "per_shard": {path.name: report["metadata"]["pinning"] for path, report in reports}
+    }
+    merged["metadata"]["pmu"] = {
+        "available": all(report["metadata"]["pmu"]["available"] for _, report in reports),
+        "reason": "per-shard PMU evidence; see shard metadata",
+    }
+    merged["runner_warnings"] = [warning for _, report in reports
+                                 for warning in report.get("runner_warnings", [])]
+    if len({tuple(report["metadata"]["cpu_models"]) for _, report in reports}) > 1:
+        merged["runner_warnings"].append(
+            "Mixed-CPU shards: aggregate describes workload/host pairs, not performance on one CPU.")
     merged["aggregate_lccc_vs_gcc"] = aggregate_lccc_vs_gcc(entries)
     merged["aggregate_lccc_vs_best_reference"] = aggregate_lccc_vs_best_reference(entries)
     return merged
