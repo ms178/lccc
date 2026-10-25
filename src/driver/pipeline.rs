@@ -1704,13 +1704,20 @@ impl Driver {
                 (!self.march_pre_sse || sse) && !self.general_regs_only,
             )
         } else {
-            // x86-64: the SSE/SSE2 pair and MMX all ride the x86-64 baseline;
-            // `-mno-sse` (which, post-normalization, covers `-mno-sse2`)
-            // drops the SSE pair but keeps __MMX__ (MMX is independent).
+            // x86-64: the SSE pair and MMX ride the x86-64 baseline, and the
+            // order-sensitive raw denial bits already carry the exact GCC
+            // 16.2 matrix (measured on 16.2.0): `-mno-sse2` drops ONLY
+            // __SSE2__ (and __SSE2_MATH__); `__SSE__` and `__MMX__` stay.
+            // `-mno-sse` drops the SSE pair but keeps `__MMX__` (MMX is
+            // independent of the vector level). A later `-msse` re-opens the
+            // SSE level: its handler clears `no_sse2` only when no EXPLICIT
+            // SSE2 denial is pending, so `-mno-sse -msse` restores baseline
+            // SSE2 while `-mno-sse2 -msse` must not. `-mgeneral-regs-only`
+            // drops all three, including `__MMX__`.
             (
                 self.target == Target::X86_64 && !self.no_sse,
-                self.target == Target::X86_64 && !self.no_sse,
-                self.target == Target::X86_64,
+                self.target == Target::X86_64 && !self.no_sse2,
+                self.target == Target::X86_64 && !self.general_regs_only,
             )
         };
         preprocessor.set_sse_macros(sse_on, sse2_on, mmx_on);
@@ -3483,8 +3490,24 @@ impl Driver {
         // carrier, `__SSE__`/`__SSE2__` and friends) tracks the codegen:
         // only an explicit pre-SSE `-march=` / `-mno-sse` / `-mno-sse2`
         // drops to the pre-SSE stack/sret convention.
+        //
+        // The SSE2 bit rides the order-sensitive `no_sse2` denial, NOT the
+        // SSE1 level (mirrors `x86_isa()`, whose NONE arm covers
+        // `no_sse || no_sse2 || general_regs_only`): an explicit `-mno-sse2`
+        // keeps `F::Sse` (scalar SSE1 and the typed SSE1 F32 maps stay
+        // legal) while dropping `F::Sse2`, and a later `-msse` must not
+        // reopen it — the `-msse` handler clears `no_sse2` only when no
+        // explicit SSE2 denial is pending. Publishing Sse2 under an SSE1-only
+        // target let the `__builtin_shufflevector` i32x4 lowering take the
+        // `pshufd` path and emit an illegal instruction (or hit the
+        // fail-closed SSE2 scan as a hard error); with the bit dropped the
+        // lowering keeps its portable scalar gather, exactly what GCC 16.2
+        // does for `-mno-sse2 -msse` (measured: scalar oracle, no shuffles).
         set.insert_if(simd && (x86_64 || self.resolved_i686_sse()), F::Sse);
-        set.insert_if(simd && (x86_64 || self.resolved_i686_sse2()), F::Sse2);
+        set.insert_if(
+            simd && !self.no_sse2 && (x86_64 || self.resolved_i686_sse2()),
+            F::Sse2,
+        );
 
         // The SSE3..SSE4.2 ladder.  `x86_isa()` carries only the 128-bit
         // SSE4.1 class, so SSE3/SSSE3/SSE4.2 have no codegen bit of their

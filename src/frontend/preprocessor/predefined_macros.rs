@@ -702,7 +702,8 @@ impl Preprocessor {
     /// pre-SSE `-march=` spellings) drops `__SSE__`, `__SSE2__` AND `__MMX__`;
     /// `-mno-sse` never touches `__MMX__` (MMX is independent of SSE).
     /// `__MMX_WITH_SSE__` is x86-64-only (neither oracle defines it for
-    /// i386).
+    /// i386) and follows the SSE2 level, not the SSE1 level (GCC 16.2,
+    /// measured: `-m32 -mno-sse2` keeps `__SSE__` but drops it).
     pub fn set_sse_macros(&mut self, sse_on: bool, sse2_on: bool, mmx_on: bool) {
         let is_x86_64 = self.macros.is_defined("__x86_64__");
 
@@ -1377,7 +1378,7 @@ impl Preprocessor {
 /// family at all. The four level macros plus the Clang-style `_MATH` pair
 /// follow their levels exactly (see `set_sse_macros` for the oracle
 /// provenance); `__MMX_WITH_SSE__` is granted only on x86-64, following
-/// the SSE level.
+/// the SSE2 level (GCC 16.2, measured).
 pub(crate) fn apply_sse_macro_levels(
     macros: &mut MacroTable,
     is_x86_64: bool,
@@ -1408,8 +1409,12 @@ pub(crate) fn apply_sse_macro_levels(
     set("__MMX__", mmx_on);
     set("__SSE_MATH__", sse_on);
     set("__SSE2_MATH__", sse2_on);
+    // GCC 16.2, measured: x86-64-only, and it tracks the SSE2 level, NOT
+    // the SSE1 level — `-mno-sse2` (SSE1 still granted) drops it, exactly
+    // like `__SSE2__`; i386 never gets it, even at the x86-64 baseline
+    // (`-m32` defines `__SSE2__` but not `__MMX_WITH_SSE__`).
     if is_x86_64 {
-        set("__MMX_WITH_SSE__", sse_on);
+        set("__MMX_WITH_SSE__", mmx_on && sse2_on);
     }
 }
 
@@ -1522,8 +1527,16 @@ mod sse_macro_tests {
         pp.set_sse_macros(true, false, true); // -mno-sse2 on x86-64
         assert!(pp.macros.is_defined("__SSE__"));
         assert!(pp.macros.is_defined("__SSE_MATH__"));
-        assert!(pp.macros.is_defined("__MMX_WITH_SSE__"));
+        assert!(pp.macros.is_defined("__MMX__"));
+        // GCC 16.2 (measured): `__MMX_WITH_SSE__` tracks the SSE2 level, so
+        // the explicit SSE2 denial drops it even though SSE1 is preserved.
+        assert!(!pp.macros.is_defined("__MMX_WITH_SSE__"));
         assert!(!pp.macros.is_defined("__SSE2__"));
         assert!(!pp.macros.is_defined("__SSE2_MATH__"));
+
+        pp.set_sse_macros(true, true, true); // baseline again
+        assert!(pp.macros.is_defined("__MMX_WITH_SSE__"));
+        pp.set_sse_macros(true, false, true); // denial again clears it
+        assert!(!pp.macros.is_defined("__MMX_WITH_SSE__"));
     }
 }

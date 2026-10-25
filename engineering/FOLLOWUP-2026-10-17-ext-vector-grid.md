@@ -673,3 +673,16 @@ applies. `scripts/measure_i686_stack_copy.py` needs no Rust toolchain, so it
 runs in environments where the compiler cannot be built — the tests are the
 only place the emitted instruction stream is checked, and they are checked in
 CI, not locally.
+
+## x86-64 `-march=k10`: GCC's own `__MMX__` gap (measured, pre-existing)
+
+While rebuilding the x86-64 SSE macro matrix against GCC 16.2.0 (the
+`-mno-sse2` denial work), the oracle showed `gcc -march=k10 -E -dM` defines
+neither `__MMX__` nor `__SSE2__` — the k10 entry in GCC's march table
+disables both (pre-dating the x86-64 baseline, kept for legacy AMD K8
+tuning). lccc defines the baseline pair there (its x86-64 macro triple
+follows the order-sensitive denial bits, not the `-march=` table), so a
+`#ifdef __SSE2__` path compiles under `-march=k10` on lccc but not on GCC.
+No gate exercises k10 macro state; recorded rather than silently aligned,
+because "matching GCC's table exactly" for a pre-SSE2-era AMD CPU is a
+policy decision (lccc's stance: x86-64 baseline is always at least SSE2).
