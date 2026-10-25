@@ -65,7 +65,7 @@ def canonical_commutative(text):
     semantic change."""
     mnemonic, _, operands = text.partition(' ')
     parts = operands.split(',')
-    if COMMUTATIVE.match(mnemonic) and len(parts) == 3 and all(p.startswith('%') for p in parts):
+    if (COMMUTATIVE.match(mnemonic) or mnemonic == 'vpmaddwd') and len(parts) == 3 and all(p.startswith('%') for p in parts):
         parts[:2] = sorted(parts[:2])
         return mnemonic + ' ' + ','.join(parts)
     return text

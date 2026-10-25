@@ -142,3 +142,15 @@ of a source speedup. Assembly confirms the intended mechanism: F64 map
 arithmetic uses XMM3/XMM4 instead of XMM14/XMM15, removing four REX bytes per
 unrolled hot loop without changing the operations or widening the ISA. Native
 and hosted measurements remain pending. Do not advertise runtime gains yet.
+
+## CI red-team correction
+
+The low-XMM tie experiment was rejected after hosted code-quality contracts
+caught extra copies in `nine4` and `fma_chain`. Restore the allocator unchanged;
+do not raise either ceiling. The targeted vector-extension matrix now passes
+all eleven host-supported runtime configurations and the existing ceilings.
+Direct/assembly parity also passes all four witnesses after narrowly admitting
+VPMADDWD source normalization (signed word products and their pairwise sum are
+symmetric). VPMADDUBSW remains asymmetric and is explicitly not normalized.
+The research-layout contract now asserts the exact workflow-file-only PR path
+and main-branch filter, instead of the superseded manual-only assumption.

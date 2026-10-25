@@ -8923,29 +8923,16 @@ fn allocate_vector_registers_destructive(
                 }
             }
         }
-        // Preserve handoff reservations and reuse recency. On a true tie,
-        // prefer a low XMM number: legacy SSE avoids REX, and register-source
-        // VEX forms may use the shorter two-byte prefix. Register availability
-        // and all interference/call-spanning proofs remain unchanged.
         let chosen = if let Some(rn) = preference {
             pool.iter().find(|r| r.0 == rn).copied()
         } else {
             let free: Vec<PhysReg> = pool.iter().filter(|r| fits(r.0)).copied().collect();
             free.iter()
                 .filter(|r| !reserved.contains(&r.0))
-                .max_by_key(|r| {
-                    (
-                        lru_end.get(&r.0).copied().unwrap_or(0),
-                        std::cmp::Reverse(r.0),
-                    )
-                })
+                .max_by_key(|r| lru_end.get(&r.0).copied().unwrap_or(0))
                 .or_else(|| {
-                    free.iter().max_by_key(|r| {
-                        (
-                            lru_end.get(&r.0).copied().unwrap_or(0),
-                            std::cmp::Reverse(r.0),
-                        )
-                    })
+                    free.iter()
+                        .max_by_key(|r| lru_end.get(&r.0).copied().unwrap_or(0))
                 })
                 .copied()
         };
@@ -18158,24 +18145,6 @@ mod sse_destructive_tests {
         allocate_vector_registers_destructive(func, &candidates, pool, &|_| false, &liveness)
             .into_iter()
             .collect()
-    }
-
-    #[test]
-    fn encoding_ties_prefer_low_xmm_independent_of_pool_order() {
-        let func = mkfunc(vec![block(
-            0,
-            vec![root(1), root(2), chain(3, O::VecAddI32x4, 1, 2)],
-            Terminator::Return(Some(v(3))),
-        )]);
-        for pool in [
-            vec![PhysReg(21), PhysReg(33)],
-            vec![PhysReg(33), PhysReg(21)],
-        ] {
-            let homes = run(&func, &pool);
-            assert_eq!(homes[&1], PhysReg(21));
-            assert_eq!(homes[&2], PhysReg(33));
-            assert_eq!(homes[&3], homes[&1]);
-        }
     }
 
     #[test]
