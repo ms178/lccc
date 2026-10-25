@@ -1184,29 +1184,44 @@ impl super::InstructionEncoder {
         let needs_sib = index_num.is_some() || base_num.is_some_and(|b| (b & 7) == 4);
         let rbp_like = base_num.is_some_and(|b| (b & 7) == 5);
 
-        let mut sib_bytes: Vec<u8> = Vec::new();
+        // The SIB byte and the displacement are one and four bytes wide, so they
+        // are built in fixed buffers.  They used to be `Vec<u8>`, i.e. up to
+        // three heap allocations for every EVEX memory operand.
+        let mut sib_bytes = [0u8; 1];
+        let mut sib_len = 0usize;
         if needs_sib {
             let base7 = base_num.map(|b| b & 7).unwrap_or(5); // SIB base=5 => no base
             let idx7 = index_num.map(|i| i & 7).unwrap_or(4); // SIB index=4 => no index
-            sib_bytes.push(scale_bits << 6 | idx7 << 3 | base7);
+            sib_bytes[0] = scale_bits << 6 | idx7 << 3 | base7;
+            sib_len = 1;
         }
 
-        let (mod_, rm, disp_bytes) = match (base_num, index_num) {
+        let mut disp_bytes = [0u8; 4];
+        let mut disp_len = 0usize;
+        let (mod_, rm) = match (base_num, index_num) {
             (Some(b), _) => {
                 let rm = if needs_sib { 4 } else { b & 7 };
                 if has_symbol {
-                    (2u8, rm, (disp as i32).to_le_bytes().to_vec())
+                    disp_bytes = (disp as i32).to_le_bytes();
+                    disp_len = 4;
+                    (2u8, rm)
                 } else if disp == 0 && !rbp_like {
-                    (0u8, rm, Vec::new())
+                    (0u8, rm)
                 } else if d8_ok {
-                    (1u8, rm, vec![(disp / i64::from(scale_n)) as u8])
+                    disp_bytes[0] = (disp / i64::from(scale_n)) as u8;
+                    disp_len = 1;
+                    (1u8, rm)
                 } else {
-                    (2u8, rm, (disp as i32).to_le_bytes().to_vec())
+                    disp_bytes = (disp as i32).to_le_bytes();
+                    disp_len = 4;
+                    (2u8, rm)
                 }
             }
             (None, Some(_)) => {
                 // no base: mod=00, rm=100 (SIB, base=5), disp32
-                (0u8, 4u8, (disp as i32).to_le_bytes().to_vec())
+                disp_bytes = (disp as i32).to_le_bytes();
+                disp_len = 4;
+                (0u8, 4u8)
             }
             (None, None) => {
                 unreachable!("EVEX absolute takes the SIB-absolute arm above")
@@ -1214,14 +1229,14 @@ impl super::InstructionEncoder {
         };
 
         self.bytes.push(self.modrm(mod_, reg_field, rm));
-        self.bytes.extend_from_slice(&sib_bytes);
+        self.bytes.extend_from_slice(&sib_bytes[..sib_len]);
         if let Some((sym, reloc_type, addend)) = deferred_reloc {
             match &diff_sym {
                 Some(d) => self.add_diff_relocation(&sym, d, reloc_type, addend),
                 None => self.add_relocation(&sym, reloc_type, addend),
             }
         }
-        self.bytes.extend_from_slice(&disp_bytes);
+        self.bytes.extend_from_slice(&disp_bytes[..disp_len]);
         Ok(())
     }
 

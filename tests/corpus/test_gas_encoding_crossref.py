@@ -73,7 +73,10 @@ class GasEncodingCrossrefTests(unittest.TestCase):
         self.assertGreater(manifest["encodings"], 3000)
 
     def test_every_row_is_a_legal_encoding(self):
-        findings, _, checked = self.gas.verify(self.rows, self.table, self.sdm.model_row)
+        findings, unmodeLLed, checked, _ = self.gas.verify(
+            self.rows, self.table,
+            lambda row, name=None: self.sdm.model_row(row, False, name))
+        self.assertEqual([r["body"] for r in unmodeLLed], [])
         self.assertGreater(checked, 400)
         self.assertEqual(
             findings,
@@ -88,7 +91,8 @@ class GasEncodingCrossrefTests(unittest.TestCase):
         rows = []
         for path in self.sdm.encoder_files("all"):
             rows.extend(self.sdm.extract_rows(Path(path).resolve()))
-        findings, unmodeLLed, checked = self.gas.verify(rows, self.table, self.sdm.model_any)
+        findings, unmodeLLed, checked, _ = self.gas.verify(
+            rows, self.table, self.sdm.model_any)
         self.assertGreater(checked, 900)
         self.assertLess(len(unmodeLLed), len(rows))
         self.assertEqual(

@@ -520,9 +520,11 @@ impl super::InstructionEncoder {
             self.bytes.push(0x66);
         }
 
-        let opcode = match src_size {
-            1 => vec![0x0F, 0xBE],
-            2 => vec![0x0F, 0xBF],
+        // `&'static [u8]` and not `Vec<u8>`: a `vec!` here allocates two bytes
+        // per sign-extending move, and this is the path every such move takes.
+        let opcode: &'static [u8] = match src_size {
+            1 => &[0x0F, 0xBE],
+            2 => &[0x0F, 0xBF],
             _ => return Err(format!("unsupported movsx src size: {}", src_size)),
         };
 
@@ -530,18 +532,18 @@ impl super::InstructionEncoder {
             (Operand::Register(src), Operand::Register(dst)) => {
                 let src_num = reg_num(&src.name).ok_or("bad src register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
-                self.bytes.extend_from_slice(&opcode);
+                self.bytes.extend_from_slice(opcode);
                 self.bytes.push(self.modrm(3, dst_num, src_num));
             }
             (Operand::Memory(mem), Operand::Register(dst)) => {
                 let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
-                self.bytes.extend_from_slice(&opcode);
+                self.bytes.extend_from_slice(opcode);
                 self.encode_modrm_mem(dst_num, mem)?;
             }
             // Absolute address as a bare label: `movswl sym, %eax`.
             (Operand::Label(label), Operand::Register(dst)) => {
                 let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
-                self.bytes.extend_from_slice(&opcode);
+                self.bytes.extend_from_slice(opcode);
                 self.encode_abs_addr_modrm(dst_num, label)?;
             }
             _ => return Err("unsupported movsx operands".to_string()),
@@ -569,9 +571,10 @@ impl super::InstructionEncoder {
             self.bytes.push(0x66);
         }
 
-        let opcode = match src_size {
-            1 => vec![0x0F, 0xB6],
-            2 => vec![0x0F, 0xB7],
+        // No allocation: see the note in `encode_movsx`.
+        let opcode: &'static [u8] = match src_size {
+            1 => &[0x0F, 0xB6],
+            2 => &[0x0F, 0xB7],
             _ => return Err(format!("unsupported movzx src size: {}", src_size)),
         };
 
@@ -579,12 +582,12 @@ impl super::InstructionEncoder {
             (Operand::Register(src), Operand::Register(dst)) => {
                 let src_num = reg_num(&src.name).ok_or("bad src register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
-                self.bytes.extend_from_slice(&opcode);
+                self.bytes.extend_from_slice(opcode);
                 self.bytes.push(self.modrm(3, dst_num, src_num));
             }
             (Operand::Memory(mem), Operand::Register(dst)) => {
                 let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
-                self.bytes.extend_from_slice(&opcode);
+                self.bytes.extend_from_slice(opcode);
                 self.encode_modrm_mem(dst_num, mem)?;
             }
             // Absolute address given as a bare label: `movzwl sym, %eax`.
@@ -594,7 +597,7 @@ impl super::InstructionEncoder {
             // `.code16` (rm=110 + disp16 instead of rm=101 + disp32).
             (Operand::Label(label), Operand::Register(dst)) => {
                 let dst_num = reg_num(&dst.name).ok_or("bad dst register")?;
-                self.bytes.extend_from_slice(&opcode);
+                self.bytes.extend_from_slice(opcode);
                 self.encode_abs_addr_modrm(dst_num, label)?;
             }
             _ => return Err("unsupported movzx operands".to_string()),

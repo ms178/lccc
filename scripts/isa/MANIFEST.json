@@ -73,8 +73,264 @@
       "sha256": "745bf4b6fcf73ac078a90583adaeadfe6e045876bff679a3d93c2ff9e507b754",
       "bytes": 13701,
       "license": "Apache-2.0"
+    },
+    {
+      "repo": "intelxed/xed",
+      "path": "datafiles/vnni/vnni-isa.xed.txt",
+      "role": "VNNI dot products (EVEX)",
+      "sha256": "f91129774f2bfd8dd081279f8eb5d38ec0aa40cb8dcdc957e6222d313fd1321f",
+      "bytes": 13037,
+      "license": "Apache-2.0"
+    },
+    {
+      "repo": "intelxed/xed",
+      "path": "datafiles/avx-vnni/avx-vnni-isa.xed.txt",
+      "role": "VNNI dot products (VEX)",
+      "sha256": "f128b8ee02061a5a9b7e5051273c0b663843315bebfa2ae651c5e17089667c41",
+      "bytes": 6672,
+      "license": "Apache-2.0"
+    },
+    {
+      "repo": "intelxed/xed",
+      "path": "datafiles/avx-vnni-int8/avx-vnni-int8-isa.xed.txt",
+      "role": "VNNI int8 mixed-sign (VEX)",
+      "sha256": "1ea4bc49d18591cd489b1f070b0d7df03eecb5665d24028a9636311aa10116ef",
+      "bytes": 9656,
+      "license": "Apache-2.0"
+    },
+    {
+      "repo": "intelxed/xed",
+      "path": "datafiles/avx-vnni-int16/avx-vnni-int16-isa.xed.txt",
+      "role": "VNNI int16 mixed-sign (VEX)",
+      "sha256": "bb2b94a0509705678695eaa37a6399ff1a2cac0b80b784693cd414fb2583c4c6",
+      "bytes": 9800,
+      "license": "Apache-2.0"
+    },
+    {
+      "repo": "intelxed/xed",
+      "path": "datafiles/hswavx/hsw-vshift-isa.txt",
+      "role": "AVX2 variable shifts (VPSLLV*)",
+      "sha256": "0564fe8ba214d09ca73ff7427330c712d05d76f7a6d32579f80158e4aa75a863",
+      "bytes": 3905,
+      "license": "Apache-2.0"
+    },
+    {
+      "repo": "intelxed/xed",
+      "path": "datafiles/sm4/sm4-isa.xed.txt",
+      "role": "SM4 key/rnds (VEX)",
+      "sha256": "2922b248498d4a5994947fe352f2bb7d5c60aba721895912f3c1e766e1baa845",
+      "bytes": 3584,
+      "license": "Apache-2.0"
+    },
+    {
+      "repo": "intelxed/xed",
+      "path": "datafiles/sm4-evex/sm4-evex-isa.xed.txt",
+      "role": "SM4 (EVEX)",
+      "sha256": "a58d637a4d9d397ef3c966dd7ef0106c02196e829259500fc2124cd72266d36b",
+      "bytes": 5959,
+      "license": "Apache-2.0"
+    },
+    {
+      "repo": "intelxed/xed",
+      "path": "datafiles/xsaveopt/xsaveopt-isa.txt",
+      "role": "XSAVEOPT",
+      "sha256": "36d8c6c802036f1d9dd7ec6d0a0c0d2c3ae67ceaba21c3af8f200e97e9ae8f7d",
+      "bytes": 1678,
+      "license": "Apache-2.0"
+    },
+    {
+      "repo": "intelxed/xed",
+      "path": "datafiles/xsavec/xsavec-isa.txt",
+      "role": "XSAVEC",
+      "sha256": "5dfd8e6c50583b3edaeb0022e64689c8fda5cc18e248c71cf42da89cf0e3e1a6",
+      "bytes": 1555,
+      "license": "Apache-2.0"
+    },
+    {
+      "repo": "intelxed/xed",
+      "path": "datafiles/xsaves/xsaves-isa.txt",
+      "role": "XSAVES/XRSTORS",
+      "sha256": "812956cca894b57d1e4f95b05ce9fc9102ea6ffb0ea20218def7f21a52ad9842",
+      "bytes": 2452,
+      "license": "Apache-2.0"
+    },
+    {
+      "repo": "intelxed/xed",
+      "path": "datafiles/cldemote/cldemote-isa.xed.txt",
+      "role": "CLDEMOTE",
+      "sha256": "aa4ac8139c5aead8e9456bdacc0674ca3df30f98d6499cc8606107386099e1ae",
+      "bytes": 1111,
+      "license": "Apache-2.0"
+    },
+    {
+      "repo": "intelxed/xed",
+      "path": "datafiles/movdir/movdir-isa.xed.txt",
+      "role": "MOVDIRI/MOVDIR64B",
+      "sha256": "940c755ac247f8b310d9cdf094e2697943b66ad0cb24f380c4176d01fe75d9fe",
+      "bytes": 2142,
+      "license": "Apache-2.0"
+    },
+    {
+      "repo": "intelxed/xed",
+      "path": "datafiles/avx/avx-aes-isa.txt",
+      "role": "VAESIMC",
+      "sha256": "f0e5b09c11716b1bd738de6fe9119aac529a6191bd63a460bda39e57a773bfcd",
+      "bytes": 2858,
+      "license": "Apache-2.0"
+    },
+    {
+      "repo": "intelxed/xed",
+      "path": "datafiles/amd/amdxop/amd-xop-isa.txt",
+      "role": "XOP",
+      "sha256": "7332a1ac2a67d1bfc5be35099b8dbef8b709c31b2508348242088aff3c1202b2",
+      "bytes": 36503,
+      "license": "Apache-2.0"
+    },
+    {
+      "repo": "intelxed/xed",
+      "path": "datafiles/amd/amdxop/amd-vpermil2-isa.txt",
+      "role": "VPERMIL2",
+      "sha256": "cc5e8d4d06ced04dd80697e352d9f96463c433d01ec4d878a8d64cf899df6dcb",
+      "bytes": 4053,
+      "license": "Apache-2.0"
+    },
+    {
+      "repo": "intelxed/xed",
+      "path": "datafiles/amd/amdxop/amd-fma4-isa.txt",
+      "role": "FMA4",
+      "sha256": "6e1469690741bcbc2192e59d9b6e049a52140d60fd1e0b3ed96b1fe8aea968ff",
+      "bytes": 25576,
+      "license": "Apache-2.0"
+    },
+    {
+      "repo": "intelxed/xed",
+      "path": "datafiles/amd/xed-amd-3dnow.txt",
+      "role": "3DNow!/MMX extensions",
+      "sha256": "eb29b459d38e2648f4035710a078cea83f38c215e46880b248ef6ce1f3cc8058",
+      "bytes": 10410,
+      "license": "Apache-2.0"
+    },
+    {
+      "repo": "intelxed/xed",
+      "path": "datafiles/avx512f/avx512-foundation-isa.xed.txt",
+      "role": "AVX-512 F (+ EVEX encodings)",
+      "sha256": "e9bc0522be4c1a3a3d938eab334c47e306fe759cccf376b9dfb2b9cf7aee0038",
+      "bytes": 458470,
+      "license": "Apache-2.0"
+    },
+    {
+      "repo": "intelxed/xed",
+      "path": "datafiles/hswavx/gather-isa.txt",
+      "role": "VGATHER* (VEX/VSIB)",
+      "sha256": "6423c45bdc01aef80dcdee42d4a409f5f791ef3f6d1030fb6f27c60c2485ef1d",
+      "bytes": 7720,
+      "license": "Apache-2.0"
+    },
+    {
+      "repo": "intelxed/xed",
+      "path": "datafiles/hswavx/movnt-load-isa.txt",
+      "role": "VMOVNTDQA",
+      "sha256": "a223db12a759cafc003c1dd92abd96b9b8ec93be27acd7ae88f6db6097c6343e",
+      "bytes": 925,
+      "license": "Apache-2.0"
+    },
+    {
+      "repo": "intelxed/xed",
+      "path": "datafiles/hsw/lzcnt-isa.xed.txt",
+      "role": "LZCNT",
+      "sha256": "f4e46b329cee34c129b63ec0978eaec9099ff64f8e021c321ea0dc7f93bfffa0",
+      "bytes": 2065,
+      "license": "Apache-2.0"
+    },
+    {
+      "repo": "intelxed/xed",
+      "path": "datafiles/hswbmi/tzcnt-isa.xed.txt",
+      "role": "TZCNT",
+      "sha256": "f5a4c03e13b868e5c989be92070d70170aefc34e93d363c4b95e419bf1031f54",
+      "bytes": 1769,
+      "license": "Apache-2.0"
+    },
+    {
+      "repo": "intelxed/xed",
+      "path": "datafiles/bdw/adox-adcx-isa.xed.txt",
+      "role": "ADCX/ADOX",
+      "sha256": "1eb4afdcd9dd4770f23bb204cc948bec1f70e5f63fc31b68c9049169d4c9dc05",
+      "bytes": 2156,
+      "license": "Apache-2.0"
+    },
+    {
+      "repo": "intelxed/xed",
+      "path": "datafiles/cet/cet-isa.xed.txt",
+      "role": "SHSTK/CET: WRSS/WRUSS/RSTORSSP/CLRSSBSY",
+      "sha256": "318b2d8c05bd9a1f9687452a3c64b7f9cbcc1ef23c6a63b137ac5ac2ba0a7470",
+      "bytes": 5429,
+      "license": "Apache-2.0"
+    },
+    {
+      "repo": "intelxed/xed",
+      "path": "datafiles/rdrand/rdrand-isa.xed.txt",
+      "role": "RDRAND/RDSEED",
+      "sha256": "cb32bdec6ab3195c12b2fbf36273b7fdfb507fbf05ee52b73b88750c2cf91517",
+      "bytes": 888,
+      "license": "Apache-2.0"
+    },
+    {
+      "repo": "intelxed/xed",
+      "path": "datafiles/apx-f/apx-f-isa.xed.txt",
+      "role": "APX: PUSH2/POP2/JMPABS/CCMP + NF/ND forms",
+      "sha256": "3eba05d4eb5fa35d49fa32b72dde2370927350891a3dafc5282e5f778647a458",
+      "bytes": 1081709,
+      "license": "Apache-2.0"
+    },
+    {
+      "repo": "intelxed/xed",
+      "path": "datafiles/rdseed/rdseed-isa.xed.txt",
+      "role": "RDSEED",
+      "sha256": "6573edb375ca232a2a07c6a1aa6547bf205bfd4615e261071089021b3ceebe5c",
+      "bytes": 888,
+      "license": "Apache-2.0"
+    },
+    {
+      "repo": "intelxed/xed",
+      "path": "datafiles/hsw/invpcid-isa.xed.txt",
+      "role": "INVPCID (legacy 66 0F 38 82)",
+      "sha256": "adce98b91ea93c09cafaa33ab387939d6c072dd32a13c476afae6bf7d7a26ce1",
+      "bytes": 1090,
+      "license": "Apache-2.0"
+    },
+    {
+      "repo": "intelxed/xed",
+      "path": "datafiles/ivbavx/fp16-isa.txt",
+      "role": "F16C: VCVTPH2PS / VCVTPS2PH (VEX)",
+      "sha256": "738306fc6aa86db224e1b1c3d2c57a9341e211d1b18514607c098ab2fcde6721",
+      "bytes": 2175,
+      "license": "Apache-2.0"
+    },
+    {
+      "repo": "intelxed/xed",
+      "path": "datafiles/wrmsrns/wrmsrns-isa.xed.txt",
+      "role": "WRMSRNS",
+      "sha256": "05009df2acf8b399b281ecbd72703bbde2a869ae6f5fd3613d030da83da88033",
+      "bytes": 1205,
+      "license": "Apache-2.0"
+    },
+    {
+      "repo": "intelxed/xed",
+      "path": "datafiles/user-msr/user-msr-isa.xed.txt",
+      "role": "URDMSR/UWRMSR (VEX map 7)",
+      "sha256": "a61b7a9e404308944d8628799a97a093330e3aa3d73e1c710c4a1f9d21ea47b8",
+      "bytes": 2465,
+      "license": "Apache-2.0"
+    },
+    {
+      "repo": "intelxed/xed",
+      "path": "datafiles/avx-ifma/avx-ifma-isa.xed.txt",
+      "role": "VPMADD52* (IFMA, VEX 0F38 W1)",
+      "sha256": "df3a516b00846483331151696bd7f6c20239960791707ff65d2d95c7896266c6",
+      "bytes": 3836,
+      "license": "Apache-2.0"
     }
   ],
-  "classes": 1024,
-  "encodings": 1590
+  "classes": 1435,
+  "encodings": 4991
 }
