@@ -43,6 +43,7 @@
 #     --no-shims        install under --prefix only; print the env file path
 #     --with-binutils   also build+install binutils 2.47 (slow)
 #     --verify-only     check an existing install and exit
+#     --offline         verify an existing install; never materialise or download
 #     -h, --help        this text
 #
 # EXIT STATUS
@@ -55,6 +56,12 @@
 # The script is idempotent: an existing install whose tools answer with the
 # pinned versions is left untouched (and reported as reused), so calling it on
 # every session start costs one `--version` per tool.
+#
+# Offline is explicit, not inferred from a failed download.  `--offline`
+# performs only local version probes against --prefix and exits with a named
+# missing-oracle error; it never reads a tag payload and never invokes the
+# official Clang installer.  An online run may still reuse local payloads, but
+# is allowed to materialise missing files and download Clang 23.1.4.
 # ============================================================================
 set -euo pipefail
 
@@ -65,6 +72,7 @@ BIN_DIR=/usr/local/bin
 WITH_SHIMS=1
 WITH_BINUTILS=0
 VERIFY_ONLY=0
+OFFLINE=0
 
 # The pins. These are the versions the gates name; a tag that carries a
 # different version is a provisioning error, not a new default.
@@ -80,17 +88,14 @@ while [ $# -gt 0 ]; do
         --no-shims) WITH_SHIMS=0; shift ;;
         --with-binutils) WITH_BINUTILS=1; shift ;;
         --verify-only) VERIFY_ONLY=1; shift ;;
-        -h|--help) sed -n '2,70p' "$0"; exit 0 ;;
+        --offline) OFFLINE=1; shift ;;
+        -h|--help) sed -n '2,80p' "$0"; exit 0 ;;
         *) echo "oracle_toolchains_from_tags: unknown argument: $1" >&2; exit 2 ;;
     esac
 done
 
 log() { printf '[oracles] %s\n' "$*"; }
 die() { printf '[oracles] FATAL: %s\n' "$*" >&2; exit 1; }
-
-for tool in git sha256sum tar xz; do
-    command -v "$tool" >/dev/null 2>&1 || die "required host tool missing: $tool"
-done
 
 # ---- tag payload table ------------------------------------------------------
 # tag:member:sha256-of-the-member. The digest is repeated here rather than read
@@ -152,12 +157,8 @@ manifest_crosscheck() {  # manifest_crosscheck <tag> <member> <sha>
 }
 
 # ---- install layout ---------------------------------------------------------
-mkdir -p "$PREFIX" || die "cannot create prefix $PREFIX (use --prefix DIR)"
-DL=$PREFIX/dl
 GCC_ROOT=$PREFIX/gcc-$GCC_VERSION
 CLANG_ROOT=$PREFIX/clang-$CLANG_VERSION
-mkdir -p "$DL"
-
 gcc_bin=$GCC_ROOT/bin/gcc-16
 clang_bin=$CLANG_ROOT/bin/clang-23
 
@@ -170,6 +171,29 @@ probe_version() {  # probe_version <binary> <pattern> <label> ; prints the line
         *) die "$label at $bin reports '$out', expected to contain '$pattern'" ;;
     esac
 }
+
+# ============================================================================
+# Explicit offline path: probes only the existing prefix.  Do this before
+# requiring git, tar, xz, or curl so a disconnected/minimal verification host
+# gets the real missing-oracle diagnostic rather than a misleading transport
+# prerequisite failure.
+# ============================================================================
+if [ "$OFFLINE" = 1 ]; then
+    log "offline mode: refusing tag materialisation and Clang downloads"
+    probe_version "$gcc_bin" "GCC) $GCC_VERSION" "gcc-16" >/dev/null
+    probe_version "$clang_bin" "version $CLANG_VERSION" "clang-23" >/dev/null
+    probe_version "$PREFIX/bin/mold" "$MOLD_VERSION" "mold" >/dev/null
+    log "offline verification: gcc-16 $GCC_VERSION, clang-23 $CLANG_VERSION, mold $MOLD_VERSION all present"
+    exit 0
+fi
+
+for tool in git sha256sum tar xz; do
+    command -v "$tool" >/dev/null 2>&1 || die "required host tool missing: $tool"
+done
+
+mkdir -p "$PREFIX" || die "cannot create prefix $PREFIX (use --prefix DIR)"
+DL=$PREFIX/dl
+mkdir -p "$DL"
 
 # ============================================================================
 # Path 1: verify-only

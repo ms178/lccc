@@ -68,7 +68,10 @@
 //! replay remains the fail-safe, but it is now the exception it was always
 //! meant to be, not the cliff every spilled pointer fell off.
 
-use super::machinst::{MACHINST_ALLOCATABLE_GPRS, MachInst, MachOperand, MachReg, OpSize, RBP};
+use super::machinst::{
+    CallTarget, MACHINST_ALLOCATABLE_GPRS, MachInst, MachOperand, MachReg, OpSize, R10, R11, R8,
+    R9, RAX, RBP, RCX, RDI, RDX, RSI,
+};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
 
@@ -424,8 +427,9 @@ impl<'a> Scan<'a> {
     }
 }
 
-/// Physical registers referenced by an instruction's operands (read or
-/// write alike — for interference both directions matter equally).
+/// Physical registers observed by an instruction (explicit operands plus
+/// implicit architectural reads/writes; for interference both directions
+/// matter equally).
 pub(super) fn touched_phys_regs(inst: &MachInst) -> Vec<u8> {
     fn reg_of(r: &MachReg, out: &mut Vec<u8>) {
         if let MachReg::Phys(p) = r {
@@ -449,32 +453,43 @@ pub(super) fn touched_phys_regs(inst: &MachInst) -> Vec<u8> {
             op_of(src, &mut v);
             op_of(dst, &mut v);
         }
-        MachInst::FAlu { src2, .. } => op_of(src2, &mut v),
+        MachInst::FAlu {
+            src2, src1, dst, ..
+        } => {
+            op_of(src2, &mut v);
+            reg_of(src1, &mut v);
+            reg_of(dst, &mut v);
+        }
         MachInst::Mov128 { src, dst } => {
             op_of(src, &mut v);
             op_of(dst, &mut v);
         }
-        MachInst::Movzx { src, .. } | MachInst::Movsx { src, .. } => op_of(src, &mut v),
-        MachInst::Alu { src, .. } => op_of(src, &mut v),
-        MachInst::Shift { amount, .. } => op_of(amount, &mut v),
-        MachInst::Div { divisor, .. } => op_of(divisor, &mut v),
+        MachInst::Movzx { src, dst, .. } | MachInst::Movsx { src, dst, .. } => {
+            op_of(src, &mut v);
+            reg_of(dst, &mut v);
+        }
+        MachInst::Alu { src, dst, .. } => {
+            op_of(src, &mut v);
+            reg_of(dst, &mut v);
+        }
+        MachInst::Imul3 { src, dst, .. } => {
+            reg_of(src, &mut v);
+            reg_of(dst, &mut v);
+        }
+        MachInst::Shift { amount, dst, .. } => {
+            op_of(amount, &mut v);
+            reg_of(dst, &mut v);
+        }
+        MachInst::Div { divisor, .. } => {
+            op_of(divisor, &mut v);
+            v.push(RAX.0);
+            v.push(RDX.0);
+        }
         MachInst::Cmp { lhs, rhs, .. } | MachInst::Test { lhs, rhs, .. } => {
             op_of(lhs, &mut v);
             op_of(rhs, &mut v);
         }
-        MachInst::Cmov { src, .. } => op_of(src, &mut v),
-        MachInst::CallTyped { args, ret, .. } => {
-            for m in args {
-                op_of(&m.src, &mut v);
-                // dst_reg is a PhysReg by construction.
-                v.push(m.dst_reg.0);
-            }
-            if let Some(r) = ret {
-                op_of(&r.dst, &mut v);
-            }
-        }
         MachInst::LeaSym { dst, .. } | MachInst::LeaSlot { dst, .. } => reg_of(dst, &mut v),
-        MachInst::Imul3 { src, .. } => reg_of(src, &mut v),
         MachInst::ShiftX {
             count, src, dst, ..
         } => {
@@ -497,8 +512,58 @@ pub(super) fn touched_phys_regs(inst: &MachInst) -> Vec<u8> {
         }
         MachInst::Neg { dst, .. } | MachInst::Not { dst, .. } => reg_of(dst, &mut v),
         MachInst::SetCC { dst, .. } => reg_of(dst, &mut v),
+        MachInst::Cmov { src, dst, .. } => {
+            op_of(src, &mut v);
+            reg_of(dst, &mut v);
+        }
         MachInst::Jcc { .. } | MachInst::Jmp { .. } | MachInst::Label(_) => {}
-        MachInst::Cqto { .. } | MachInst::XorRdx | MachInst::Ret | MachInst::Call { .. } => {}
+        // These instructions have architectural register effects that are not
+        // represented by an explicit MachOperand.  Keep this helper complete:
+        // the emitter uses it to decide whether a source home may be renamed
+        // away by a later LEA, while the allocator uses the same observation
+        // set for physical interference.  A false negative here can turn an
+        // otherwise harmless peephole into a silent stale-register read.
+        MachInst::Cqto { .. } => {
+            v.push(RAX.0);
+            v.push(RDX.0);
+        }
+        MachInst::XorRdx => v.push(RDX.0),
+        MachInst::Ret => v.push(RAX.0),
+        MachInst::Call { .. } => {
+            // A direct call has no explicit target operand, but it destroys
+            // the SysV caller-save integer homes.  The set is intentionally
+            // conservative here; a caller-save value that is actually
+            // preserved by a surrounding lowering is still safe to leave
+            // unfused, whereas omitting a clobber would be unsound.
+            v.extend([RAX.0, RCX.0, RDX.0, RDI.0, RSI.0, R8.0, R9.0, R10.0, R11.0]);
+        }
+        MachInst::CallTyped {
+            caller_saves,
+            args,
+            target,
+            ret,
+            ..
+        } => {
+            for m in args {
+                op_of(&m.src, &mut v);
+                // dst_reg is a PhysReg by construction.
+                v.push(m.dst_reg.0);
+            }
+            if let Some(r) = ret {
+                op_of(&r.dst, &mut v);
+            }
+            // The call itself consumes rax/rdx and the SysV caller-save set;
+            // the typed save/restore list is also observed explicitly before
+            // and after the call.  An indirect target is an additional
+            // architectural read that is not present in args or ret.
+            v.extend([RAX.0, RCX.0, RDX.0, RDI.0, RSI.0, R8.0, R9.0, R10.0, R11.0]);
+            for (reg, _) in caller_saves {
+                v.push(reg.0);
+            }
+            if let CallTarget::Indirect(reg) = target {
+                v.push(reg.0);
+            }
+        }
         MachInst::Raw(_) => {}
     }
     v

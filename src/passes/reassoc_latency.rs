@@ -490,7 +490,7 @@ pub(crate) fn run_function(func: &mut IrFunction) -> usize {
 }
 
 /// Run the loop recurrence transform and, when enabled by the x86-64 pipeline,
-/// a narrow wrapping-Add reduction in terminal return blocks.
+/// a narrow wrapping-Add reduction in every eligible terminal return block.
 pub(crate) fn run_function_with_straightline(
     func: &mut IrFunction,
     straightline_enabled: bool,
@@ -539,24 +539,10 @@ fn run_round(func: &mut IrFunction) -> usize {
             .for_each_used_value(|v| *uses.entry(v).or_insert(0) += 1);
     }
 
-    // Value types for the residency weights (a Copy takes its source's).
-    let mut types: FxHashMap<u32, IrType> = FxHashMap::default();
-    for block in &func.blocks {
-        for inst in &block.instructions {
-            if let Some(d) = inst.dest() {
-                if let Some(t) = inst.result_type() {
-                    types.insert(d.0, t);
-                } else if let Instruction::Copy {
-                    src: Operand::Value(s),
-                    ..
-                } = inst
-                    && let Some(&t) = types.get(&s.0)
-                {
-                    types.insert(d.0, t);
-                }
-            }
-        }
-    }
+    // Value types for the residency weights.  Use the same target-aware
+    // collector as the terminal-return gate so ParamRef and Copy values do
+    // not silently fall back to one word on i686.
+    let types = collect_value_types(func);
     let mut next_id = func.sound_next_value_id();
     let mut facts_cache: FxHashMap<usize, LoopFacts> = FxHashMap::default();
     let mut rewrites = 0usize;
@@ -1048,14 +1034,6 @@ fn integer_constant_for(bits: u64, ty: IrType) -> Option<IrConst> {
     }
 }
 
-fn type_gpr_weight(ty: Option<IrType>) -> u32 {
-    match ty {
-        Some(t) if t.is_float() || t == IrType::Void => 0,
-        Some(t) => t.size().div_ceil(8).max(1) as u32,
-        None => 1,
-    }
-}
-
 /// Conservative block-local live-GPR peak. Values used by the terminator are
 /// live at block exit; reverse transfer then models each instruction's uses
 /// and definition. Unknown value types count as one GPR so this check fails
@@ -1065,7 +1043,11 @@ fn block_gpr_peak(
     terminator: &Terminator,
     types: &FxHashMap<u32, IrType>,
 ) -> u32 {
-    let weight = |v: u32| type_gpr_weight(types.get(&v).copied());
+    // Keep the terminal-return pressure gate on the same target-aware word
+    // accounting as the loop-residency gate above.  In particular, an I64
+    // occupies two GPRs on i686 and one on x86-64; a fixed eight-byte divisor
+    // silently grants the wrong headroom to the former.
+    let weight = |v: u32| gpr_weight(types.get(&v).copied());
     let mut live = FxHashSet::default();
     terminator.for_each_used_value(|v| {
         live.insert(v);
@@ -1090,11 +1072,46 @@ fn block_gpr_peak(
 
 fn collect_value_types(func: &IrFunction) -> FxHashMap<u32, IrType> {
     let mut types = FxHashMap::default();
+    // First collect every typed definition, independent of block order.  CFG
+    // block order is not a dominance guarantee, so a Copy may name a value
+    // whose defining block appears later in the function vector.
     for block in &func.blocks {
         for inst in &block.instructions {
-            if let Some(dest) = inst.dest() {
-                if let Some(ty) = inst.result_type() {
-                    types.insert(dest.0, ty);
+            match inst {
+                Instruction::ParamRef { dest, ty, .. } => {
+                    types.insert(dest.0, *ty);
+                }
+                Instruction::Copy { .. } => {}
+                _ => {
+                    if let Some(dest) = inst.dest()
+                        && let Some(ty) = inst.result_type()
+                    {
+                        types.insert(dest.0, ty);
+                    }
+                }
+            }
+        }
+    }
+    // Then resolve pure SSA Copy chains to a fixed point.  The cycle guard is
+    // implicit in the `changed` test: malformed copy cycles remain unknown and
+    // therefore receive the conservative one-word weight.
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                let Instruction::Copy {
+                    dest,
+                    src: Operand::Value(source),
+                } = inst
+                else {
+                    continue;
+                };
+                let Some(&ty) = types.get(&source.0) else {
+                    continue;
+                };
+                if types.insert(dest.0, ty) != Some(ty) {
+                    changed = true;
                 }
             }
         }
@@ -1159,6 +1176,94 @@ fn flatten_single_use_add_tree(
     (leaves.len() >= 3).then_some((nodes, leaves))
 }
 
+/// Critical-path depth of the original single-use Add tree.  Counting nodes
+/// would price a balanced tree like a source-order chain and could make an
+/// `imul` replacement look profitable when it is only equal (or slower) on
+/// the actual dependency path.  The multiplication policy below compares this
+/// depth with the target's scalar multiply latency instead.
+fn add_tree_depth(instructions: &[Instruction], root: usize, nodes: &[usize]) -> u32 {
+    let node_set: FxHashSet<usize> = nodes.iter().copied().collect();
+    let mut defs = FxHashMap::default();
+    for &index in nodes {
+        if let Some(dest) = instructions[index].dest() {
+            defs.insert(dest.0, index);
+        }
+    }
+
+    fn visit(
+        instructions: &[Instruction],
+        index: usize,
+        node_set: &FxHashSet<usize>,
+        defs: &FxHashMap<u32, usize>,
+    ) -> u32 {
+        let Instruction::BinOp { lhs, rhs, .. } = &instructions[index] else {
+            return 0;
+        };
+        let child = |operand: &Operand| match operand {
+            Operand::Value(value) => defs
+                .get(&value.0)
+                .copied()
+                .filter(|index| node_set.contains(index))
+                .map_or(0, |index| visit(instructions, index, node_set, defs)),
+            Operand::Const(_) => 0,
+        };
+        1 + child(lhs).max(child(rhs))
+    }
+
+    visit(instructions, root, &node_set, &defs)
+}
+
+/// Latency policy for the scalar multiply introduced by the terminal-return
+/// reduction.  The pass does not have a microarchitecture scheduler model, so
+/// it uses the conservative generic scalar cost (three cycles) and only adds
+/// an architecture-specific refusal where the target cannot express an
+/// efficient native width: an i686 I64/U64 multiply may lower to a helper or
+/// a multiword sequence.  The policy is deliberately target-aware rather than
+/// a blanket "more than N copies" rule; 32-bit and 64-bit output widths are
+/// also weighted by the target word in the pressure gate above.
+fn scalar_mul_latency(ty: IrType) -> Option<u32> {
+    match crate::common::types::target_elf_machine() {
+        EM_386 if ty.size() > 4 => None,
+        EM_386 | EM_AARCH64 | EM_RISCV => Some(3),
+        _ if ty.size() <= 8 => Some(3),
+        _ => None,
+    }
+}
+
+fn profitable_scalar_mul(ty: IrType, original_depth: u32, has_add_constant: bool) -> bool {
+    let Some(mul_latency) = scalar_mul_latency(ty) else {
+        return false;
+    };
+    let replacement_depth = mul_latency + u32::from(has_add_constant);
+    replacement_depth < original_depth
+}
+
+/// Follow pure SSA copies while classifying terminal-reduction leaves.  The
+/// generated multiply may use the original source directly: a Copy has no
+/// observable effect, and retaining the now-dead copy instructions is safe for
+/// the later DCE pass.  Cycles are malformed IR, but fail closed here rather
+/// than looping if a test or an earlier pass presents one.
+fn canonical_copy_operand(instructions: &[Instruction], operand: &Operand) -> Operand {
+    let mut current = operand.clone();
+    let mut seen = FxHashSet::default();
+    loop {
+        let value = match &current {
+            Operand::Value(value) => *value,
+            _ => return current,
+        };
+        if !seen.insert(value.0) {
+            return Operand::Value(value);
+        }
+        let Some(Instruction::Copy { src, .. }) = instructions
+            .iter()
+            .find(|inst| inst.dest() == Some(value))
+        else {
+            return Operand::Value(value);
+        };
+        current = src.clone();
+    }
+}
+
 /// Reduce a return-only, repeated-base wrapping Add tree to `base * count + c`.
 /// No intermediate result is observable: every removed node is single-use,
 /// all operations have one integer type, and the IR has no signed-overflow
@@ -1182,6 +1287,8 @@ fn rewrite_terminal_add_return(func: &mut IrFunction) -> usize {
         }
     };
 
+    let mut next_id = func.sound_next_value_id();
+    let mut changed = 0usize;
     for bi in 0..func.blocks.len() {
         let (return_value, root_index) = match &func.blocks[bi].terminator {
             Terminator::Return(Some(Operand::Value(value))) => {
@@ -1218,7 +1325,8 @@ fn rewrite_terminal_add_return(func: &mut IrFunction) -> usize {
         let mut constant_sum = 0u64;
         let mut valid = true;
         for leaf in &leaves {
-            match leaf {
+            let leaf = canonical_copy_operand(&func.blocks[bi].instructions, leaf);
+            match &leaf {
                 Operand::Const(value) => {
                     let Some(bits) = integer_constant_bits(*value) else {
                         valid = false;
@@ -1227,7 +1335,11 @@ fn rewrite_terminal_add_return(func: &mut IrFunction) -> usize {
                     constant_sum = constant_sum.wrapping_add(bits) & mask;
                 }
                 Operand::Value(value) => {
-                    if types.get(&value.0).is_some_and(|leaf_ty| *leaf_ty != ty) {
+                    if types.get(&value.0) != Some(&ty) {
+                        // A terminal rewrite must prove that every value leaf
+                        // has the same integer width.  Unknown types are not a
+                        // license to proceed: fail closed rather than relying
+                        // on the verifier to repair a malformed fixture.
                         valid = false;
                         break;
                     }
@@ -1236,7 +1348,7 @@ fn rewrite_terminal_add_return(func: &mut IrFunction) -> usize {
                             base = Some(leaf.clone());
                             base_count = 1;
                         }
-                        Some(existing) if existing == leaf => {
+                        Some(existing) if existing == &leaf => {
                             base_count = base_count.saturating_add(1);
                         }
                         Some(_) => {
@@ -1257,8 +1369,11 @@ fn rewrite_terminal_add_return(func: &mut IrFunction) -> usize {
         let Some(sum_constant) = integer_constant_for(constant_sum, ty) else {
             continue;
         };
+        let original_depth = add_tree_depth(&func.blocks[bi].instructions, root_index, &nodes);
+        if !profitable_scalar_mul(ty, original_depth, constant_sum != 0) {
+            continue;
+        }
         let root_dest = return_value;
-        let mut next_id = func.sound_next_value_id();
         let multiply_dest = if constant_sum == 0 {
             root_dest
         } else {
@@ -1308,7 +1423,9 @@ fn rewrite_terminal_add_return(func: &mut IrFunction) -> usize {
             }
         }
         let before_peak = block_gpr_peak(&block.instructions, &block.terminator, &types);
-        let after_peak = block_gpr_peak(&replacement, &block.terminator, &types);
+        let mut after_types = types.clone();
+        after_types.insert(multiply_dest.0, ty);
+        let after_peak = block_gpr_peak(&replacement, &block.terminator, &after_types);
         if after_peak > before_peak || after_peak > gpr_budget() {
             continue;
         }
@@ -1317,10 +1434,12 @@ fn rewrite_terminal_add_return(func: &mut IrFunction) -> usize {
         if !block.source_spans.is_empty() {
             block.source_spans = replacement_spans;
         }
-        func.next_value_id = next_id;
-        return 1;
+        changed += 1;
     }
-    0
+    if changed > 0 {
+        func.next_value_id = next_id;
+    }
+    changed
 }
 
 #[cfg(test)]
@@ -1602,6 +1721,316 @@ mod tests {
         f.next_value_id = next;
         f.next_label = 1;
         f
+    }
+
+    fn repeated_base_tree(ty: IrType, copies: u32, trailing_constant: Option<i64>) -> IrFunction {
+        assert!(copies >= 2);
+        let mut f = IrFunction::new("repeated".to_string(), ty, vec![scalar_param(ty)], false);
+        let mut instructions = vec![Instruction::ParamRef {
+            dest: Value(0),
+            param_idx: 0,
+            ty,
+        }];
+        let mut last = Value(0);
+        let mut next = 1;
+        for _ in 1..copies {
+            instructions.push(bin(next, IrBinOp::Add, v(last.0), v(0), ty));
+            last = Value(next);
+            next += 1;
+        }
+        if let Some(value) = trailing_constant {
+            let constant = match ty {
+                IrType::I32 | IrType::U32 => IrConst::I32(value as i32),
+                IrType::I64 | IrType::U64 => IrConst::I64(value),
+                _ => panic!("test helper only supports the terminal integer widths"),
+            };
+            instructions.push(bin(
+                next,
+                IrBinOp::Add,
+                v(last.0),
+                Operand::Const(constant),
+                ty,
+            ));
+            last = Value(next);
+            next += 1;
+        }
+        f.blocks = vec![blk(0, instructions, Terminator::Return(Some(v(last.0))))];
+        f.next_value_id = next;
+        f.next_label = 1;
+        f
+    }
+
+    fn repeated_copy_tree() -> IrFunction {
+        let ty = IrType::U32;
+        let mut f = IrFunction::new("repeated_copy".to_string(), ty, vec![scalar_param(ty)], false);
+        let mut instructions = vec![
+            Instruction::ParamRef {
+                dest: Value(0),
+                param_idx: 0,
+                ty,
+            },
+            Instruction::Copy {
+                dest: Value(1),
+                src: v(0),
+            },
+        ];
+        let mut last = Value(1);
+        let mut next = 2;
+        for _ in 1..5 {
+            instructions.push(bin(next, IrBinOp::Add, v(last.0), v(1), ty));
+            last = Value(next);
+            next += 1;
+        }
+        f.blocks = vec![blk(0, instructions, Terminator::Return(Some(v(last.0))))];
+        f.next_value_id = next;
+        f.next_label = 1;
+        f
+    }
+
+    fn separately_copied_base_tree() -> IrFunction {
+        let ty = IrType::U32;
+        let mut f = IrFunction::new("separate_copies".to_string(), ty, vec![scalar_param(ty)], false);
+        let instructions = vec![
+            Instruction::ParamRef {
+                dest: Value(0),
+                param_idx: 0,
+                ty,
+            },
+            Instruction::Copy {
+                dest: Value(1),
+                src: v(0),
+            },
+            Instruction::Copy {
+                dest: Value(2),
+                src: v(0),
+            },
+            bin(3, IrBinOp::Add, v(1), v(2), ty),
+            bin(4, IrBinOp::Add, v(3), v(1), ty),
+            bin(5, IrBinOp::Add, v(4), v(2), ty),
+            bin(6, IrBinOp::Add, v(5), v(1), ty),
+        ];
+        f.blocks = vec![blk(0, instructions, Terminator::Return(Some(v(6))))];
+        f.next_value_id = 7;
+        f.next_label = 1;
+        f
+    }
+
+    #[test]
+    fn terminal_reduction_covers_all_native_integer_widths() {
+        let _target = Target::set(62, 8);
+        for ty in [IrType::I32, IrType::U32, IrType::I64, IrType::U64] {
+            let mut f = repeated_base_tree(ty, 5, None);
+            assert_eq!(run_function_with_straightline(&mut f, true), 1, "{ty:?}");
+            assert_valid(&f);
+            assert!(
+                f.blocks[0].instructions.iter().any(|inst| matches!(
+                    inst,
+                    Instruction::BinOp {
+                        op: IrBinOp::Mul,
+                        ty: actual,
+                        ..
+                    } if *actual == ty
+                )),
+                "{ty:?} must use the target-approved native multiply"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_reduction_preserves_negative_constants_and_source_spans() {
+        let _target = Target::set(62, 8);
+        let mut f = repeated_base_tree(IrType::I32, 5, Some(-7));
+        let root_span = crate::common::source::Span::new(50, 55, 9);
+        f.blocks[0].source_spans = (0..f.blocks[0].instructions.len())
+            .map(|i| crate::common::source::Span::new(i as u32, i as u32 + 1, 9))
+            .collect();
+        // Keep a non-dummy span in the fixture so the test checks the actual
+        // root mapping rather than only vector length preservation.
+        let root_index = f.blocks[0].source_spans.len() - 1;
+        f.blocks[0].source_spans[root_index] = root_span;
+        let original_root = root_span;
+        assert_eq!(run_function_with_straightline(&mut f, true), 1);
+        assert_valid(&f);
+        assert_eq!(f.blocks[0].source_spans.len(), f.blocks[0].instructions.len());
+        let mut saw_mul = false;
+        let mut saw_add = false;
+        for (inst, span) in f.blocks[0]
+            .instructions
+            .iter()
+            .zip(&f.blocks[0].source_spans)
+        {
+            if let Instruction::BinOp { op: IrBinOp::Mul, rhs, .. } = inst {
+                saw_mul = true;
+                assert_eq!(*rhs, Operand::Const(IrConst::I32(5)));
+                assert_eq!(*span, original_root);
+            }
+            if let Instruction::BinOp { op: IrBinOp::Add, rhs, .. } = inst
+                && *rhs == Operand::Const(IrConst::I32(-7))
+            {
+                saw_add = true;
+                assert_eq!(*span, original_root);
+            }
+        }
+        assert!(saw_mul && saw_add, "negative constant reduction disappeared");
+    }
+
+    #[test]
+    fn terminal_reduction_prices_the_multiply_against_tree_depth() {
+        {
+            let _target = Target::set(EM_386, 4);
+            let mut f = repeated_base_tree(IrType::I64, 8, None);
+            assert_eq!(
+                run_function_with_straightline(&mut f, true),
+                0,
+                "i686 must not synthesize a multiword I64 multiply"
+            );
+        }
+        let _target = Target::set(62, 8);
+        for copies in [3, 4] {
+            let mut f = repeated_base_tree(IrType::U32, copies, None);
+            let before = format!("{:?}", f.blocks);
+            assert_eq!(run_function_with_straightline(&mut f, true), 0, "copies={copies}");
+            assert_eq!(format!("{:?}", f.blocks), before);
+        }
+        let mut f = repeated_base_tree(IrType::U32, 5, None);
+        assert_eq!(run_function_with_straightline(&mut f, true), 1);
+    }
+
+    #[test]
+    fn terminal_reduction_looks_through_a_shared_copy() {
+        let _target = Target::set(62, 8);
+        let mut f = repeated_copy_tree();
+        assert_eq!(run_function_with_straightline(&mut f, true), 1);
+        assert!(f.blocks[0].instructions.iter().any(|inst| matches!(
+            inst,
+            Instruction::BinOp {
+                op: IrBinOp::Mul,
+                lhs: Operand::Value(Value(1)),
+                ..
+            }
+        )));
+        assert_valid(&f);
+
+        let mut separately_copied = separately_copied_base_tree();
+        assert_eq!(run_function_with_straightline(&mut separately_copied, true), 1);
+        assert!(separately_copied.blocks[0].instructions.iter().any(|inst| matches!(
+            inst,
+            Instruction::BinOp {
+                op: IrBinOp::Mul,
+                lhs: Operand::Value(Value(0)),
+                ..
+            }
+        )));
+        assert_valid(&separately_copied);
+    }
+
+    #[test]
+    fn terminal_reduction_handles_all_return_blocks() {
+        let ty = IrType::U32;
+        let mut f = IrFunction::new(
+            "multi_return".to_string(),
+            ty,
+            vec![scalar_param(ty), scalar_param(ty)],
+            false,
+        );
+        let make_block = |label: u32, param: u32, start: u32| {
+            let mut instructions = vec![Instruction::ParamRef {
+                dest: Value(param),
+                param_idx: param as usize,
+                ty,
+            }];
+            let mut last = Value(param);
+            let mut next = start;
+            for _ in 1..5 {
+                instructions.push(bin(next, IrBinOp::Add, v(last.0), v(param), ty));
+                last = Value(next);
+                next += 1;
+            }
+            blk(label, instructions, Terminator::Return(Some(v(last.0))))
+        };
+        f.blocks = vec![make_block(0, 0, 10), make_block(1, 1, 20)];
+        f.next_value_id = 25;
+        f.next_label = 2;
+        assert_eq!(run_function_with_straightline(&mut f, true), 2);
+        assert_eq!(
+            f.blocks
+                .iter()
+                .flat_map(|b| b.instructions.iter())
+                .filter(|inst| matches!(inst, Instruction::BinOp { op: IrBinOp::Mul, .. }))
+                .count(),
+            2
+        );
+        assert_valid(&f);
+    }
+
+    #[test]
+    fn terminal_reduction_rejects_distinct_variables() {
+        let ty = IrType::U32;
+        let mut f = IrFunction::new(
+            "distinct".to_string(),
+            ty,
+            vec![scalar_param(ty), scalar_param(ty)],
+            false,
+        );
+        let instructions = vec![
+            Instruction::ParamRef {
+                dest: Value(0),
+                param_idx: 0,
+                ty,
+            },
+            Instruction::ParamRef {
+                dest: Value(1),
+                param_idx: 1,
+                ty,
+            },
+            bin(2, IrBinOp::Add, v(0), v(0), ty),
+            bin(3, IrBinOp::Add, v(2), v(1), ty),
+            bin(4, IrBinOp::Add, v(3), v(0), ty),
+        ];
+        f.blocks = vec![blk(0, instructions, Terminator::Return(Some(v(4))))];
+        f.next_value_id = 5;
+        f.next_label = 1;
+        let before = format!("{:?}", f.blocks);
+        assert_eq!(run_function_with_straightline(&mut f, true), 0);
+        assert_eq!(format!("{:?}", f.blocks), before);
+    }
+
+    #[test]
+    fn terminal_reduction_rejects_pressure_above_the_i686_budget() {
+        let _target = Target::set(EM_386, 4);
+        let ty = IrType::U32;
+        let params = (0..7).map(|_| scalar_param(ty)).collect();
+        let mut f = IrFunction::new("pressure".to_string(), ty, params, false);
+        let mut instructions: Vec<Instruction> = (0..7)
+            .map(|id| Instruction::ParamRef {
+                dest: Value(id),
+                param_idx: id as usize,
+                ty,
+            })
+            .collect();
+        let mut last = Value(0);
+        let mut next = 7;
+        for _ in 1..5 {
+            instructions.push(bin(next, IrBinOp::Add, v(last.0), v(0), ty));
+            last = Value(next);
+            next += 1;
+        }
+        instructions.push(Instruction::Call {
+            func: "pressure_sink".into(),
+            info: crate::ir::reexports::CallInfo {
+                args: (0..7).map(v).collect(),
+                arg_types: vec![ty; 7],
+                return_type: IrType::Void,
+                num_fixed_args: 7,
+                ..Default::default()
+            },
+        });
+        f.blocks = vec![blk(0, instructions, Terminator::Return(Some(v(last.0))))];
+        f.next_value_id = next;
+        f.next_label = 1;
+        let before = format!("{:?}", f.blocks);
+        assert_eq!(run_function_with_straightline(&mut f, true), 0);
+        assert_eq!(format!("{:?}", f.blocks), before);
     }
 
     #[test]

@@ -5198,6 +5198,127 @@ fn shift_add_fusion_refuses_flags_live_through_neutral_or_unknown_ops() {
 }
 
 #[test]
+fn physical_register_observation_includes_implicit_and_indirect_operands() {
+    let cases = [
+        (MachInst::Ret, &[RAX.0][..]),
+        (MachInst::Cqto { size: OpSize::S64 }, &[RAX.0, RDX.0][..]),
+        (MachInst::XorRdx, &[RDX.0][..]),
+        (
+            MachInst::Div {
+                divisor: reg(RCX),
+                signed: true,
+                size: OpSize::S64,
+            },
+            &[RAX.0, RDX.0, RCX.0][..],
+        ),
+        (
+            MachInst::CallTyped {
+                caller_saves: vec![],
+                args: vec![],
+                target: CallTarget::Indirect(R14),
+                ret: None,
+                gp_arg_count: None,
+                ipa_keep: 0,
+            },
+            &[RAX.0, RCX.0, RDX.0, RDI.0, RSI.0, R8.0, R9.0, R10.0, R11.0, R14.0][..],
+        ),
+    ];
+    for (inst, expected) in cases {
+        let touched = super::machinst_alloc::touched_phys_regs(&inst);
+        for &reg in expected {
+            assert!(
+                touched.contains(&reg),
+                "{inst:?} must observe physical register {reg}, got {touched:?}"
+            );
+        }
+    }
+}
+
+/// The three-instruction shift/add/move fold must not discard the original
+/// source home when a later instruction observes an implicit register effect.
+/// The two-instruction shift/add LEA is still legal (it updates the source
+/// home), so the witness is the surviving move into the final destination.
+#[test]
+fn dead_shift_add_move_refuses_each_implicit_source_witness() {
+    let cases = [
+        (
+            RAX,
+            vec![MachInst::Ret],
+            "%eax",
+            "ret reads the integer return home",
+        ),
+        (
+            RAX,
+            vec![MachInst::Cqto { size: OpSize::S64 }],
+            "%eax",
+            "cqto reads rax and writes rdx",
+        ),
+        (
+            RAX,
+            vec![
+                MachInst::Div {
+                    divisor: reg(RCX),
+                    signed: true,
+                    size: OpSize::S64,
+                },
+            ],
+            "%eax",
+            "div reads the rdx:rax dividend",
+        ),
+        (
+            R14,
+            vec![MachInst::CallTyped {
+                caller_saves: vec![],
+                args: vec![],
+                target: CallTarget::Indirect(R14),
+                ret: None,
+                gp_arg_count: None,
+                ipa_keep: 0,
+            }],
+            "%r14d",
+            "an indirect call reads its target register",
+        ),
+    ];
+    for (base, tail, base_name, reason) in cases {
+        let shift = MachInst::Shift {
+            op: ShiftOp::Shl,
+            amount: MachOperand::Imm(3),
+            dst: MachReg::Phys(base),
+            size: OpSize::S32,
+        };
+        let add = MachInst::Alu {
+            op: AluOp::Add,
+            src: MachOperand::Imm(36),
+            dst: MachReg::Phys(base),
+            size: OpSize::S32,
+        };
+        let mov = MachInst::Mov {
+            src: reg(base),
+            dst: reg(RDI),
+            size: OpSize::S32,
+        };
+        let mut insts = vec![shift, add, mov];
+        insts.extend(tail);
+        let mut out = AsmOutput::new();
+        emit_machinsts(&insts, &mut out);
+        let compact: String = out.buf.chars().filter(|ch| !ch.is_whitespace()).collect();
+        assert!(
+            compact.contains(&format!("leal36(,%{base_name},8),%{base_name}")),
+            "{reason}: the safe two-instruction LEA must update the source home: {out:?}"
+        );
+        assert!(
+            compact.contains(&format!("movl%{base_name},%edi")),
+            "{reason}: the source-to-destination move must survive: {out:?}"
+        );
+        assert!(
+            !compact.contains("leal36(,%rax,8),%edi")
+                && !compact.contains("leal36(,%r10,8),%edi"),
+            "{reason}: the three-instruction fold discarded a live source: {out:?}"
+        );
+    }
+}
+
+#[test]
 fn shift_add_fusion_preserves_live_source_home() {
     let base = MachReg::Phys(PhysReg(14)); // rdi
     let shift = MachInst::Shift {

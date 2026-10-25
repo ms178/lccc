@@ -73,11 +73,6 @@ impl ObjectSet {
         }
     }
 
-    fn insert(&mut self, object: Object) -> bool {
-        let plan = self.plan_insert(object);
-        self.insert_at(object, plan)
-    }
-
     fn insert_at(&mut self, object: Object, plan: InsertPlan) -> bool {
         if plan.already_present {
             return false;

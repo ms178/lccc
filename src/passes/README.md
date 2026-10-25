@@ -939,11 +939,13 @@ behavior across iterations.
 
 `reassoc_lat` normally changes only loop-carried associative integer trees.
 Its optional straight-line extension is narrower: on x86-64 it can fold a
-single-use, same-type `Add` tree in a terminal return block into
+single-use, same-type `Add` tree in each eligible terminal return block into
 `base * count + constant` for wrapping I32/U32/I64/U64 arithmetic. The rewrite
 requires one repeated non-constant base, preserves source evaluation of all
-leaves, and is rejected if block-local live-GPR peak would exceed either the
-original peak or the target budget. It never reshapes straight-line XOR/AND/OR
+leaves, and is rejected unless the target-aware scalar-multiply cost beats the
+original tree's dependency depth. Block-local live-GPR peak must also stay
+within both the original peak and the target budget (including two-word I64
+values on i686). It never reshapes straight-line XOR/AND/OR
 trees. Set `CCC_NO_REASSOC_STRAIGHTLINE=1` to bisect this extension, or disable
 the full pass with `CCC_DISABLE_PASSES=reassoc_lat`.
 
