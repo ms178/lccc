@@ -1,0 +1,70 @@
+;;; encoding_choice_alu_imm8_sext
+# SDM group-1 ALU immediates: 0x83 carries a sign-extended imm8, 0x81 a full
+# imm. The boundary is what decides, so both sides of 127/128 and -128/-129
+# are here: an assembler that always takes one row is wrong on half the range.
+.text
+addl $1, %eax
+addl $-1, %eax
+addl $127, %ecx
+addl $128, %ecx
+addl $-128, %ecx
+addl $-129, %ecx
+addl $0xffffff80, %ecx
+addl $0x7fffffff, %eax
+addl $1000, %eax
+addl $1000, %ecx
+addl $1, (%esp)
+addl $-1, 4(%esp)
+addw $65535, %ax
+addw $128, %ax
+addb $-1, %al
+addb $1, %cl
+orl $1, %edx
+xorl $128, %edx
+andl $-1, (%ebx)
+cmpl $127, %esi
+cmpl $128, %esi
+;;; encoding_choice_test_and_imul
+# TEST has an accumulator row (A8/A9) that drops ModR/M; IMUL has 0x6B, the
+# same multiply with the immediate narrowed to a sign-extended byte.
+.text
+testl $1, %eax
+testl $1, %ecx
+testl $0x7fffffff, %eax
+testb $1, %al
+testb $1, %bl
+imull $5, %ecx
+imull $-1, %ecx
+imull $1, %eax
+imull $127, %edx
+imull $128, %edx
+imull $1000, %ecx
+imull $5, (%edi), %ecx
+imull $1000, (%edi), %ecx
+imull $127, %edx, %ecx
+imull $128, %edx, %ecx
+;;; encoding_choice_stack_and_reg_short_forms
+# In 32-bit mode 0x40+r is inc, 0x48+r is dec, 0x50+r is push and 0x58+r is
+# pop; all four are one byte where the r/m rows need a ModR/M byte. 0x90+r is
+# xchg with the accumulator, and its 0x90 row is the canonical NOP.
+.text
+incl %eax
+decl %ecx
+incl %esp
+pushl %eax
+pushl %ecx
+popl %edx
+pushl $1
+pushl $1000
+pushl $127
+pushl $128
+xchgl %eax, %edx
+xchgl %edx, %eax
+xchgl %eax, %eax
+shll $1, %eax
+shrl $1, %ebx
+sarl $1, (%esp)
+roll $1, %edx
+movl $1, %eax
+movl $1, %ecx
+movl $0x12345678, %eax

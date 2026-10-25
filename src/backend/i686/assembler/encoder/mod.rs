@@ -4096,3 +4096,107 @@ mod vector_modifier_relocation_tests {
         }
     }
 }
+
+/// Encoding minimality, pinned at the boundaries where the choice flips.
+///
+/// The Intel SDM defines more than one legal encoding for these families, so
+/// an assembler can be *correct* and still wasteful. `scripts/
+/// sdm_choice_families.py` holds the complete family list as data and checks
+/// it against the SDM; this module checks that the encoder actually picks the
+/// short side at the value where it stops being legal.
+///
+/// The accumulator forms are a genuine crossover, not a fixed preference:
+/// `addl $1,%eax` is 3 bytes as `83 c0 01` and 5 as `05 01 00 00 00`, while
+/// `addl $1000,%eax` is 5 bytes as `05 e8 03 00 00` and 6 as `81 c0 e8 03 00
+/// 00`. An encoder that always prefers either one is wrong on half the range.
+#[cfg(test)]
+mod encoding_choice_minimality_tests {
+    use super::*;
+
+    fn assemble(line: &str) -> Result<String, String> {
+        let mut encoder = InstructionEncoder::new();
+        for item in parse_asm(line)? {
+            if let AsmItem::Instruction(instr) = item {
+                encoder.encode(&instr)?;
+            }
+        }
+        Ok(encoder
+            .bytes
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(" "))
+    }
+
+    /// Every family, on both sides of its sign-extension edge. Bytes are GNU
+    /// as 2.47's for the same line.
+    #[test]
+    fn shortest_encoding_is_chosen_across_every_choice_family() {
+        for (line, hex) in [
+            // imm8 sign-extended (0x83) beats imm32 (0x81) up to 127.
+            ("addl $1, %eax", "83 c0 01"),
+            ("addl $-1, %eax", "83 c0 ff"),
+            ("addl $127, %ecx", "83 c1 7f"),
+            ("addl $-128, %ecx", "83 c1 80"),
+            // ... and stops being legal at 128 / -129.
+            ("addl $128, %ecx", "81 c1 80 00 00 00"),
+            ("addl $-129, %ecx", "81 c1 7f ff ff ff"),
+            // The accumulator form skips ModR/M but is wider than imm8, so it
+            // only wins once the immediate no longer fits a signed byte.
+            ("addl $1000, %eax", "05 e8 03 00 00"),
+            ("addl $2147483647, %eax", "05 ff ff ff 7f"),
+            ("addl $1000, %ecx", "81 c1 e8 03 00 00"),
+            // A memory destination takes the same imm8 row.
+            ("addl $1, (%esp)", "83 04 24 01"),
+            // 16-bit: the imm8 still sign-extends, so the unsigned spelling of
+            // -1 takes the short form.
+            ("addw $65535, %ax", "66 83 c0 ff"),
+            // Byte operands have no imm8 choice: one immediate width only.
+            ("addb $-1, %al", "04 ff"),
+            ("addb $1, %cl", "80 c1 01"),
+            // imul: 0x6B is the same instruction with the immediate narrowed.
+            ("imull $5, %ecx", "6b c9 05"),
+            ("imull $-1, %ecx", "6b c9 ff"),
+            ("imull $0xffffffff, %ecx", "6b c9 ff"),
+            ("imull $1, %eax", "6b c0 01"),
+            ("imull $1000, %ecx", "69 c9 e8 03 00 00"),
+            ("imull $5, (%edi), %ecx", "6b 0f 05"),
+            // test: the accumulator form drops ModR/M.
+            ("testl $1, %eax", "a9 01 00 00 00"),
+            ("testl $1, %ecx", "f7 c1 01 00 00 00"),
+            // push: imm8 vs imm32.
+            ("pushl $1", "6a 01"),
+            ("pushl $1000", "68 e8 03 00 00"),
+            // 32-bit-mode register short forms; 0x40-0x4F is not REX here.
+            ("incl %eax", "40"),
+            ("decl %ecx", "49"),
+            // xchg with the accumulator: one byte, and 0x90 is the NOP.
+            ("xchgl %eax, %edx", "92"),
+            // Shift by one has no immediate field at all.
+            ("shll $1, %eax", "d1 e0"),
+            // mov: the register form needs no ModR/M for any register.
+            ("movl $1, %eax", "b8 01 00 00 00"),
+            ("movl $1, %ecx", "b9 01 00 00 00"),
+        ] {
+            assert_eq!(assemble(line).as_deref(), Ok(hex), "{line}");
+        }
+    }
+
+    /// The short form must never be taken when it would change the value: an
+    /// unsigned immediate above the signed range that is NOT the truncated
+    /// spelling of a negative stays wide.
+    #[test]
+    fn imm8_is_only_taken_when_it_sign_extends_back() {
+        // 0x80 is +128 as an unsigned byte but -128 sign-extended, so the
+        // byte form cannot represent it.
+        assert_eq!(
+            assemble("addl $128, %ecx").as_deref(),
+            Ok("81 c1 80 00 00 00")
+        );
+        // 0xffffff80 IS -128 truncated, so it takes the short form.
+        assert_eq!(
+            assemble("addl $0xffffff80, %ecx").as_deref(),
+            Ok("83 c1 80")
+        );
+    }
+}
