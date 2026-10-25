@@ -72,6 +72,24 @@ class GasEncodingCrossrefTests(unittest.TestCase):
         self.assertGreater(manifest["mnemonics"], 1500)
         self.assertGreater(manifest["encodings"], 3000)
 
+    def test_snapshot_pins_the_upstream_table_it_was_built_from(self):
+        """The snapshot is only an oracle if it came from *that* table.
+
+        `upstream.sha256` is the digest of `opcodes/i386-opc.tbl` at
+        `binutils-2_47-branch`; a regeneration from another branch or a docored
+        copy would change it.  The digest below was re-fetched from upstream and
+        a rebuild from those bytes reproduces `scripts/isa/gas-2.47.json`
+        byte-for-byte.
+        """
+        manifest = json.loads(
+            (ROOT / "scripts" / "isa" / "gas-2.47.manifest.json").read_text())
+        upstream = manifest["upstream"]
+        self.assertEqual(upstream["repo"], "RTEMS/sourceware-mirror-binutils-gdb")
+        self.assertEqual(
+            upstream["sha256"],
+            "a48171c05930cbe120a26fdf802689a4865607b3fe42eca784541dbf7ba81179")
+        self.assertEqual(upstream["bytes"], 288187)
+
     def test_every_row_is_a_legal_encoding(self):
         findings, unmodeLLed, checked, _ = self.gas.verify(
             self.rows, self.table,
@@ -128,6 +146,61 @@ class GasEncodingCrossrefTests(unittest.TestCase):
         rows = [{"file": "x", "line": 1, "names": ["addl"],
                  "body": "self.encode_alu(ops)", "arrays": []}]
         self.assertEqual(sorted(self.gas.coverage(rows, table)), ["vmptrld"])
+
+    def test_single_byte_opcodes_are_not_read_as_prefixes(self):
+        """The BMI rows spell their opcode as a lone `F2`/`F3` byte.
+
+        `opcodes/i386-opc.tbl` packs `[mandatory prefix] opcode` into one field,
+        and a three-byte VEX or EVEX row leaves the opcode alone in it: `andn
+        0xf2` is VEX.NDS.LZ.0F38.W0 F2, `blsi 0xf3/3` is ...F3 /3.  A distiller
+        that reads that byte as a prefix has no opcode left and silently drops
+        the row, which is how `andn`/`blsi`/`blsr`/`blsmsk` used to be missing
+        from the snapshot while being perfectly legal encodings.
+        """
+
+        def encs(name):
+            return {(e["family"], e["map"], e["pp"], e["opcode"], e["reg"])
+                    for e in self.table.get(name, [])}
+
+        self.assertIn(("vex", "0f38", "none", 0xF2, None), encs("andn"))
+        self.assertIn(("vex", "0f38", "none", 0xF3, 3), encs("blsi"))
+        self.assertIn(("vex", "0f38", "none", 0xF3, 1), encs("blsr"))
+        self.assertIn(("vex", "0f38", "none", 0xF3, 2), encs("blsmsk"))
+        # Same shape, EVEX-only encoding: EVEX.66.0F3A.W0 66 /r ib.
+        self.assertIn(("vex", "0f3a", "66", 0x66, None), encs("vfpclassps"))
+
+    def test_prefix_and_opcode_in_one_field_still_split(self):
+        """`shrx` is `0xf2f7`: mandatory prefix F2, opcode F7."""
+        forms = {(e["family"], e["map"], e["pp"], e["opcode"], e["reg"])
+                 for e in self.table["shrx"]}
+        self.assertIn(("vex", "0f38", "f2", 0xF7, None), forms)
+
+    def test_no_encoder_row_is_uncovered(self):
+        """The gate's worklist must stay empty (MB-43).
+
+        `andn`, `blsi`, `blsr`, `blsmsk` and the parameterised `setcc` used to
+        appear here; the first four are now distilled from the table and
+        `setcc` resolves through `SNAPSHOT_ALIASES` to the `setc` row it emits.
+        """
+        rows = []
+        for path in self.sdm.encoder_files("all"):
+            rows.extend(self.sdm.extract_rows(Path(path).resolve()))
+        findings, _, checked, uncovered = self.gas.verify(
+            rows, self.table, self.sdm.model_any)
+        self.assertEqual(uncovered, [])
+        self.assertEqual(findings, [])
+        self.assertGreater(checked, 1600)
+
+    def test_setcc_alias_resolves_to_the_row_it_encodes(self):
+        row = {"file": "src/backend/x86/assembler/encoder/mod.rs", "line": 1,
+               "names": ["setcc"], "body": 'self.encode_setcc(ops, "setc")',
+               "arrays": []}
+        setc = {"family": "legacy", "map": "0f", "pp": "none", "opcode": 0x92,
+                "reg": 0, "w": None}
+        findings, unmodeLLed, checked, uncovered = self.gas.verify(
+            [row], self.table, lambda r, name=None: [dict(setc)])
+        self.assertEqual((findings, unmodeLLed, uncovered), ([], [], []))
+        self.assertEqual(checked, 1)
 
     def test_core_isa_encodings_are_pinned(self):
         """A spot check so a snapshot regenerated from the wrong branch fails."""

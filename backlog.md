@@ -906,14 +906,18 @@ VEX/EVEX family and prefix of every helper) and the reference provenance.
 Two invariants must not decay: a row the model cannot read is a *defect*, not
 noise (`--strict` fails on UNMODELLED), and a class XED does not model goes into
 `SDM_ONLY_CLASSES` with a provenance comment **and** a byte-level assertion in
-`tests/asm-diff/` — `PREFETCHW` (`0F 0D /1`) is the only entry today. Known
-reference gap: the as-2.47 snapshot has no entry for `andn`, `blsi`, `blsr`,
-`blsmsk` or `setcc`, because the distiller cannot expand those
-`i386-opc.tbl` template forms; they are reported as UNCOVERED rather than as
-findings. Rebuild the snapshot with template expansion of those five and
-re-check `gas_encoding_crossref.py --verify --strict --backend all`. Accept:
-both gates exit 0 on a clean tree, and adding a row with a wrong opcode,
-prefix, map or `/digit` makes exactly that row fail.
+`tests/asm-diff/` — `PREFETCHW` (`0F 0D /1`) is the only entry today. The
+as-2.47 reference gap is closed: the distiller used to read a lone `f2`/`f3`
+opcode byte as a mandatory prefix and drop the whole row, which is why `andn`,
+`blsi`, `blsr` and `blsmsk` were reported as UNCOVERED; the opcode is now taken
+as the *last* byte of the field, and the parameterised `setcc` resolves through
+`SNAPSHOT_ALIASES` to the `setc` row it encodes. `gas_encoding_crossref.py
+--verify --strict --backend all` therefore checks 1637 rows with 0 findings, 0
+unmodelled rows and an **empty** UNCOVERED list — a ratchet that
+`tests/corpus/test_gas_encoding_crossref.py` pins by asserting both lists are
+empty and that the four BMI rows carry `VEX.NDS.LZ.0F38 F2/F3 /digit` in the
+snapshot. Accept: both gates exit 0 on a clean tree, and adding a row with a
+wrong opcode, prefix, map or `/digit` makes exactly that row fail.
 
 ### MB-44 · P0 · R — close the runtime gaps the ranker can now report
 The corpus ranking tool could not read five of the six checked-in evidence

@@ -19,7 +19,12 @@ byte and the `/digit` ModR/M extension into one integer, and where rows are
 generated from *templates* that expand into the families (`<alu2>` -> add, or,
 adc, sbb, and, sub, xor; `<sd>` -> the single/double pairs; `<bw>` -> the
 byte/word pairs; ...).  Parsing it without expanding the templates loses the
-largest families, so this tool expands them.
+largest families, so this tool expands them.  Two details of that field
+matter and are pinned by ``tests/corpus/test_gas_encoding_crossref.py``: the
+*last* byte of the opcode field is the opcode, so a lone `f2`/`f3`/`66` is an
+opcode and not a prefix (`andn`, `blsi`, `blsr`, `blsmsk` are exactly this
+shape), and the APX `EVexMap4..7` rows carry only a prefix there and are left
+to the SDM gate, which models those maps exactly.
 
 What it answers, all offline and from a vendored snapshot
 ---------------------------------------------------------
@@ -390,13 +395,29 @@ def _canonical(value: int, ext: int | None, attrs: str) -> dict | None:
         if pp == "none" and seen_66:
             pp = "66"
     else:
-        # VEX/EVEX rows carry the mandatory prefix as a `0x66` byte only in a few
-        # SSE2AVX rows; pp comes from the prefix byte when present.
-        while arr and arr[0] in LEGACY_PREFIXES:
-            # GAS packs the mandatory prefix into the opcode field for the
-            # vector rows too (`shrx` is `0xf2f7`, `shlxl` `0x66f7`).
+        # VEX/EVEX rows spell the instruction as `[mandatory prefix] opcode` in
+        # one field: `shrx` is `0xf2f7` (VEX.F2.0F38.W0 F7), `shlxl` `0x66f7`.
+        # The *last* byte is always the opcode; a leading byte in the prefix set
+        # is the mandatory prefix.
+        #
+        # A single byte therefore has no mandatory prefix at all — the BMI rows
+        # are exactly this shape, not a prefix with a missing opcode: `andn
+        # 0xf2` is VEX.NDS.LZ.0F38.W0 F2, `blsi 0xf3/3` is VEX.NDS.LZ.0F38.W0
+        # F3 /3, `vfpclassph 0x66` is EVEX.66.0F3A.W0 66.  The old loop treated
+        # that lone byte as a prefix, left no opcode behind, and `len(arr) != 1`
+        # below then dropped the row, which is why GNU as "had no entry" for
+        # `andn`/`blsi`/`blsr`/`blsmsk` and the gate reported them as uncovered
+        # instead of checked.
+        while len(arr) > 1 and arr[0] in LEGACY_PREFIXES:
             pp = PP_FOR_BYTE[arr[0]]
             arr = arr[1:]
+        if len(arr) == 1 and arr[0] in LEGACY_PREFIXES and "EVexMap" in attrs:
+            # The APX `EVexMap4..7` promoted-legacy rows carry *only* a prefix
+            # in the opcode field and take the opcode from the legacy row of the
+            # same name (`wrssd, 0x66, ...|EVexMap4`).  There is nothing to
+            # compare, and the maps themselves have no notation in this
+            # snapshot: APX is modelled exactly by the SDM/XED gate.
+            return None
     if map_ is None:
         if arr and arr[0] == 0x0F:
             arr = arr[1:]
@@ -538,6 +559,13 @@ def gas_name(mnemonic: str) -> str:
     return m.group(1) if m else mnemonic
 
 
+# Encoder spellings that are aliases of a differently named table row.  The
+# alias is resolved *before* the mnemonic is looked up, so the comparison is
+# still exact: `setcc` is the encoder's generic spelling and it emits the row
+# `setc` encodes (`0F 92`, SETC), which the snapshot holds under that name.
+SNAPSHOT_ALIASES = {"setcc": "setc"}
+
+
 # `i386-opc.tbl` spells a VEX and an EVEX instruction with the same template
 # fields; which prefix family a row uses is not visible in the snapshot, so the
 # three families compare as one when map, prefix and opcode agree.
@@ -623,7 +651,7 @@ def verify(rows: list[dict], table: dict[str, list[dict]],
                 unmodeLLed.append(row)
                 continue
             prefixes = [name]
-            base = gas_name(name)
+            base = SNAPSHOT_ALIASES.get(name, gas_name(name))
             if base != name:
                 prefixes.append(base)
             if name.startswith("v"):
@@ -632,13 +660,12 @@ def verify(rows: list[dict], table: dict[str, list[dict]],
                 prefixes.append(name[1:])
             known = next((table[p] for p in prefixes if p in table), None)
             if known is None:
-                # The snapshot is a transcription of `opcodes/i386-opc.tbl`, and
-                # a few templates (`blsi`, `blsr`, `blsmsk`, `andn`, the
-                # parameterised `setcc` ...) are spelled there in a form the
-                # distiller cannot enumerate, so they have no entry at all.  That
-                # is a gap in the *reference*, not an encoding defect, and the
-                # SDM gate covers those classes with XED's descriptions, so it is
-                # reported separately instead of failing `--strict`.
+                # No entry under any spelling of the name.  This list is a
+                # ratchet and is empty today: the BMI rows (`andn`, `blsi`,
+                # `blsr`, `blsmsk`) used to be dropped by the distiller's
+                # prefix handling, and `setcc` is an alias resolved through
+                # `SNAPSHOT_ALIASES`.  Anything that reappears here is a
+                # reference gap to close, not noise — `--strict` reports it.
                 uncovered.append({"name": name, "file": row["file"],
                                   "line": row["line"]})
                 continue
