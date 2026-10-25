@@ -1376,6 +1376,13 @@ gate "seg-pointer-declarators" fast \
 gate "compound-literal-element" fast \
     env GCC="${GCC:-gcc-16}" CCC="$LCCC" python3 tests/regression/check_compound_literal_element.py
 
+gate "asm-char-and-macro-defaults" fast \
+    env CCC="$LCCC" \
+    CCC_I686=target/fastbuild/lccc-i686 \
+    CCC_ARM=target/fastbuild/lccc-arm \
+    CCC_RISCV=target/fastbuild/lccc-riscv \
+    python3 tests/regression/check_asm_char_and_macro_defaults.py
+
 # The debug knobs this series documents (`CCC_DEBUG_VOLRED`,
 # `CCC_DEBUG_STATIC_INIT`, `CCC_DEBUG_TYPES_COMPATIBLE`) may explain a decision
 # but must never change emitted code: a knob left exported in a benchmark or

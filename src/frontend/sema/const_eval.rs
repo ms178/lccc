@@ -24,7 +24,6 @@ use crate::common::const_arith;
 use crate::common::const_eval as shared_const_eval;
 use crate::common::fx_hash::FxHashMap;
 use crate::common::symbol_table::{FoldedValue, SymbolTable};
-use crate::common::types::AddressSpace;
 use crate::common::types::{CType, ExtVectorLayout};
 use crate::frontend::parser::ast::{
     BinOp, DerivedDeclarator, Expr, ExprId, SizeofArg, StructFieldDecl, TypeSpecifier, UnaryOp,
@@ -899,15 +898,8 @@ impl<'a> SemaConstEval<'a> {
         }
     }
 
-    /// Convert a TypeSpecifier to CType using sema's type resolution.
+    /// Convert a TypeSpecifier to CType using sema's canonical type resolution.
     fn type_spec_to_ctype(&self, spec: &TypeSpecifier) -> CType {
-        // Handle typeof(expr) which requires expression type inference - the
-        // standalone ctype_from_type_spec function can't handle this because it
-        // lacks access to the symbol table and expression type checker.
-        if let TypeSpecifier::Typeof(expr, _) = spec {
-            return self.infer_expr_ctype(expr).unwrap_or(CType::Int);
-        }
-        // Delegate to a simple inline conversion for all other cases.
         self.ctype_from_type_spec(spec)
     }
 
@@ -1632,217 +1624,32 @@ impl<'a> SemaConstEval<'a> {
     }
 
     /// Convert a TypeSpecifier to CType using the TypeContext for typedef/struct resolution.
-    /// This is a standalone function that doesn't need the full TypeConvertContext trait.
+    /// Convert a TypeSpecifier to CType via `ExprTypeChecker::resolve_type_spec`
+    /// so constant evaluation (`_Static_assert`, enum/bitfield bounds, array sizes,
+    /// `__builtin_types_compatible_p`) never diverges from expression type checking
+    /// or IR lowering on function-pointer parameters, constant array bounds,
+    /// nested `typeof(expr)`, address spaces, or inline record definitions.
     fn ctype_from_type_spec(&self, spec: &TypeSpecifier) -> CType {
-        match spec {
-            TypeSpecifier::Void => CType::Void,
-            TypeSpecifier::Bool => CType::Bool,
-            TypeSpecifier::Char => CType::Char,
-            TypeSpecifier::SignedChar => CType::SChar,
-            TypeSpecifier::UnsignedChar => CType::UChar,
-            TypeSpecifier::PlainUnsignedChar => CType::PlainUChar,
-            TypeSpecifier::Short => CType::Short,
-            TypeSpecifier::UnsignedShort => CType::UShort,
-            TypeSpecifier::Int | TypeSpecifier::Signed => CType::Int,
-            TypeSpecifier::UnsignedInt | TypeSpecifier::Unsigned => CType::UInt,
-            TypeSpecifier::Long => CType::Long,
-            TypeSpecifier::UnsignedLong => CType::ULong,
-            TypeSpecifier::LongLong => CType::LongLong,
-            TypeSpecifier::UnsignedLongLong => CType::ULongLong,
-            TypeSpecifier::Int128 => CType::Int128,
-            TypeSpecifier::UnsignedInt128 => CType::UInt128,
-            TypeSpecifier::Float => CType::Float,
-            TypeSpecifier::Double => CType::Double,
-            TypeSpecifier::LongDouble => CType::LongDouble,
-            TypeSpecifier::Pointer(inner, addr_space) => {
-                // Iterative pointer spine -- see type_checker::resolve_type_spec
-                // and type_builder::resolve_type_spec_to_ctype for why.
-                if !matches!(**inner, TypeSpecifier::Pointer(_, _)) {
-                    CType::Pointer(Box::new(self.ctype_from_type_spec(inner)), *addr_space)
-                } else {
-                    let mut spaces = Vec::with_capacity(8);
-                    spaces.push(*addr_space);
-                    let mut cur: &TypeSpecifier = inner;
-                    let mut ty = loop {
-                        match cur {
-                            TypeSpecifier::Pointer(i, s) => {
-                                spaces.push(*s);
-                                cur = i;
-                            }
-                            other => break self.ctype_from_type_spec(other),
-                        }
-                    };
-                    for space in spaces.iter().rev() {
-                        ty = CType::Pointer(Box::new(ty), *space);
-                    }
-                    ty
-                }
-            }
-            TypeSpecifier::Array(elem, size) => {
-                let elem_ty = self.ctype_from_type_spec(elem);
-                // TODO: evaluate array size expression when available
-                let array_size = size.as_ref().and_then(|s| {
-                    // Try simple literal evaluation for array sizes
-                    match s.as_ref() {
-                        Expr::IntLiteral(n, _)
-                        | Expr::LongLiteral(n, _)
-                        | Expr::LongLongLiteral(n, _) => Some(*n as usize),
-                        Expr::UIntLiteral(n, _)
-                        | Expr::ULongLiteral(n, _)
-                        | Expr::ULongLongLiteral(n, _) => Some(*n as usize),
-                        _ => None,
-                    }
-                });
-                CType::Array(Box::new(elem_ty), array_size)
-            }
-            TypeSpecifier::TypedefName(name) => {
-                if let Some(resolved) = self.types.typedefs.get(name) {
-                    resolved.clone()
-                } else {
-                    CType::Int // fallback
-                }
-            }
-            TypeSpecifier::Struct(tag, ..) => {
-                if let Some(tag) = tag {
-                    CType::Struct(
-                        self.types
-                            .resolve_record_key(&format!("struct.{}", tag))
-                            .into(),
-                    )
-                } else {
-                    CType::Int // anonymous struct without context
-                }
-            }
-            TypeSpecifier::Union(tag, ..) => {
-                if let Some(tag) = tag {
-                    CType::Union(
-                        self.types
-                            .resolve_record_key(&format!("union.{}", tag))
-                            .into(),
-                    )
-                } else {
-                    CType::Int // anonymous union without context
-                }
-            }
-            TypeSpecifier::Enum(name, variants, is_packed, underlying) => CType::Enum(
-                self.resolve_enum_type(name, variants, *is_packed, underlying.as_deref()),
-            ),
-            TypeSpecifier::TypeofType(inner) => self.ctype_from_type_spec(inner),
-            // A function pointer is a POINTER TO A FUNCTION TYPE, and the two
-            // are not interchangeable with `void *`: GCC answers 0 for
-            // `__builtin_types_compatible_p(void (*)(int), void *)` and 1 for
-            // `__builtin_types_compatible_p(void (*)(int), void (*)(int))`, and
-            // the kernel asserts that answer (`assert_function_type()` in
-            // arch/x86/include/asm/irq_stack.h is
-            // `static_assert(__builtin_types_compatible_p(typeof(&func), proto))`).
-            // Collapsing the type to `void *` -- "function pointers are
-            // pointer-sized", which is true of its SIZE and false of its TYPE --
-            // made every such comparison answer 0, including the one that
-            // rejected arch/x86/kernel/irq.c.  Sizes are unaffected: the result
-            // is still one pointer wide.  A parameter may itself be a function
-            // pointer, so this recurses.
-            TypeSpecifier::FunctionPointer(ret, params, variadic) => {
-                let param_types = params
-                    .iter()
-                    .map(|param| {
-                        (
-                            self.ctype_from_type_spec(&param.type_spec),
-                            param.name.clone(),
-                        )
-                    })
-                    .collect();
-                CType::Pointer(
-                    Box::new(CType::Function(Box::new(
-                        crate::common::types::FunctionType {
-                            return_type: self.ctype_from_type_spec(ret),
-                            params: param_types,
-                            variadic: *variadic,
-                        },
-                    ))),
-                    AddressSpace::Default,
-                )
-            }
-            // A bare function type, the type name of `void (int)` (C23 6.7.8,
-            // also reachable through `typeof(f)` and `_Generic` association type
-            // names).  It is a function type, NOT a pointer and NOT `int`: with
-            // no arm here the conversion fell through to the `_ => CType::Int`
-            // recovery, so `__builtin_types_compatible_p(typeof(f), void (int))`
-            // compared a function type against `int` and answered 0 where GCC
-            // answers 1.
-            TypeSpecifier::BareFunction(ret, params, variadic) => {
-                let param_types = params
-                    .iter()
-                    .map(|param| {
-                        (
-                            self.ctype_from_type_spec(&param.type_spec),
-                            param.name.clone(),
-                        )
-                    })
-                    .collect();
-                CType::Function(Box::new(crate::common::types::FunctionType {
-                    return_type: self.ctype_from_type_spec(ret),
-                    params: param_types,
-                    variadic: *variadic,
-                }))
-            }
-            TypeSpecifier::Vector(inner, total_bytes) => {
-                let elem_ctype = self.ctype_from_type_spec(inner);
-                CType::Vector(Box::new(elem_ctype), *total_bytes)
-            }
-            TypeSpecifier::ExtVector(inner, lanes) => {
-                let elem_ctype = self.ctype_from_type_spec(inner);
-                match ExtVectorLayout::new(&elem_ctype, *lanes) {
-                    Some(layout) => CType::ExtVector(Box::new(elem_ctype), layout),
-                    // Malformed recovery: drop the attribute, keep the scalar.
-                    None => elem_ctype,
-                }
-            }
-            _ => CType::Int, // fallback
-        }
+        self.type_checker().resolve_type_spec(spec)
     }
 
-    /// Convert a TypeSpecifier with derived declarators to CType.
+    /// Convert a TypeSpecifier with derived declarators to CType via the shared
+    /// `type_builder` implementation.
     fn ctype_from_type_spec_with_derived(
         &self,
         spec: &TypeSpecifier,
         derived: &[DerivedDeclarator],
     ) -> CType {
-        let mut ty = self.ctype_from_type_spec(spec);
+        let base = self.ctype_from_type_spec(spec);
         if derived.is_empty() {
-            return ty;
+            return base;
         }
-        // pointee_space_before mapping (see fold_simple_derived): the wrapper
-        // built at step i takes the space stored at derived[i-1].
-        let mut pending_space = AddressSpace::Default;
-        for d in derived {
-            match d {
-                DerivedDeclarator::Pointer(space) => {
-                    ty = CType::Pointer(Box::new(ty), pending_space);
-                    pending_space = *space;
-                }
-                DerivedDeclarator::Array(Some(size_expr)) => {
-                    let expr: &Expr = size_expr;
-                    let size = match expr {
-                        Expr::IntLiteral(n, _)
-                        | Expr::LongLiteral(n, _)
-                        | Expr::LongLongLiteral(n, _) => Some(*n as usize),
-                        Expr::UIntLiteral(n, _)
-                        | Expr::ULongLiteral(n, _)
-                        | Expr::ULongLongLiteral(n, _) => Some(*n as usize),
-                        _ => None,
-                    };
-                    ty = CType::Array(Box::new(ty), size);
-                }
-                DerivedDeclarator::Array(None) => {
-                    ty = CType::Array(Box::new(ty), None);
-                }
-                DerivedDeclarator::Function(_, _) | DerivedDeclarator::FunctionPointer(_, _) => {
-                    ty = CType::Pointer(Box::new(CType::Void), AddressSpace::Default);
-                    // function -> pointer
-                }
-            }
-        }
-        ty
+        crate::common::type_builder::build_full_ctype_with_callbacks(
+            base,
+            derived,
+            &|ts| self.ctype_from_type_spec(ts),
+            &|e, _| self.eval_const_expr(e).and_then(|c| c.to_usize()),
+        )
     }
 }
 

@@ -4,6 +4,7 @@
 use super::emit::RiscvCodegen;
 use super::inline_asm::{RvConstraintKind, classify_rv_constraint};
 use crate::backend::inline_asm::{AsmOperand, AsmOperandKind, InlineAsmEmitter};
+use crate::backend::regalloc::PhysReg;
 use crate::backend::state::CodegenState;
 use crate::common::types::IrType;
 use crate::ir::reexports::{BlockId, IrConst, Operand, Value};
@@ -129,134 +130,176 @@ impl InlineAsmEmitter for RiscvCodegen {
         }
     }
 
+    fn fallback_scratch_reg(&mut self, kind: &AsmOperandKind) -> String {
+        match kind {
+            AsmOperandKind::FpReg => "ft0".to_string(),
+            _ => "t0".to_string(),
+        }
+    }
+
     fn resolve_memory_operand(
         &mut self,
         op: &mut AsmOperand,
         val: &Operand,
         excluded: &[String],
-    ) -> bool {
-        // For alloca memory operands with large offsets (>2047), the direct
-        // `{offset}(s0)` format doesn't fit RISC-V's 12-bit signed immediate.
-        // Compute the address into a scratch register instead.
+    ) -> Option<String> {
+        let alloc_gp_tmp = |this: &mut Self| -> String {
+            let mut r = this.assign_scratch_reg(&AsmOperandKind::GpReg, excluded);
+            if r.is_empty() {
+                r = this.fallback_scratch_reg(&AsmOperandKind::GpReg);
+            }
+            if r == "a0" {
+                this.state.reg_cache.invalidate_acc();
+            }
+            r
+        };
+        // Compute the address into a scratch register if the s0 offset exceeds 12 bits.
         if op.mem_offset != 0 && !(op.mem_offset >= -2048 && op.mem_offset <= 2047) {
-            let tmp_reg = self.assign_scratch_reg(&AsmOperandKind::GpReg, excluded);
+            let tmp_reg = alloc_gp_tmp(self);
             self.emit_addi_s0(&tmp_reg, op.mem_offset);
             op.mem_addr = format!("0({})", tmp_reg);
             op.mem_offset = 0;
-            return true;
+            return Some(tmp_reg);
         }
         // If mem_addr is set or mem_offset is non-zero (alloca case), nothing to do
         if !op.mem_addr.is_empty() || op.mem_offset != 0 {
-            return false;
+            return None;
         }
         // Each memory operand gets its own unique register via assign_scratch_reg,
         // so multiple "=m" outputs don't overwrite each other's addresses.
         match val {
             Operand::Value(v) => {
-                // Check register allocation first: if the pointer value lives
-                // in a callee-saved register, copy from there instead of the
-                // stack (which may be stale for register-allocated values).
                 if let Some(&phys) = self.reg_assignments.get(&v.0) {
-                    let tmp_reg = self.assign_scratch_reg(&AsmOperandKind::GpReg, excluded);
+                    let tmp_reg = alloc_gp_tmp(self);
                     let src_name = super::emit::callee_saved_name(phys);
-                    self.state
-                        .emit_fmt(format_args!("    mv {}, {}", tmp_reg, src_name));
+                    if src_name != tmp_reg {
+                        self.state
+                            .emit_fmt(format_args!("    mv {}, {}", tmp_reg, src_name));
+                    }
                     op.mem_addr = format!("0({})", tmp_reg);
-                    return true;
+                    return Some(tmp_reg);
                 }
                 if let Some(slot) = self.state.get_slot(v.0) {
-                    let tmp_reg = self.assign_scratch_reg(&AsmOperandKind::GpReg, excluded);
-                    // Use emit_load_from_s0 to handle large stack offsets (>2047)
-                    // that don't fit in RISC-V's 12-bit signed immediate range.
-                    self.emit_load_from_s0(&tmp_reg, slot.0, "ld");
+                    let tmp_reg = alloc_gp_tmp(self);
+                    if self.state.is_alloca(v.0) {
+                        self.emit_alloca_addr(&tmp_reg, v.0, slot.0);
+                    } else {
+                        self.emit_load_from_s0(&tmp_reg, slot.0, "ld");
+                    }
                     op.mem_addr = format!("0({})", tmp_reg);
-                    return true;
+                    return Some(tmp_reg);
                 }
+                if self.state.reg_cache.acc_has(v.0, false) {
+                    let tmp_reg = alloc_gp_tmp(self);
+                    if tmp_reg != "a0" {
+                        self.state.emit_fmt(format_args!("    mv {}, a0", tmp_reg));
+                    }
+                    op.mem_addr = format!("0({})", tmp_reg);
+                    return Some(tmp_reg);
+                }
+                assert!(
+                    !op.mem_addr.is_empty(),
+                    "riscv codegen: inline-asm memory operand value {} has neither \
+                     stack slot nor register assignment",
+                    v.0
+                );
             }
             Operand::Const(c) => {
-                // Constant address (e.g., from MMIO reads at compile-time constant addresses).
-                // Load the constant into a scratch register for indirect addressing.
                 if let Some(addr) = c.to_i64() {
-                    let tmp_reg = self.assign_scratch_reg(&AsmOperandKind::GpReg, excluded);
+                    let tmp_reg = alloc_gp_tmp(self);
                     self.state
                         .emit_fmt(format_args!("    li {}, {}", tmp_reg, addr));
                     op.mem_addr = format!("0({})", tmp_reg);
-                    return true;
+                    return Some(tmp_reg);
                 }
             }
         }
-        false
+        None
     }
 
     fn assign_scratch_reg(&mut self, kind: &AsmOperandKind, excluded: &[String]) -> String {
         match kind {
             AsmOperandKind::FpReg => {
-                let idx = self.asm_fp_scratch_idx;
-                self.asm_fp_scratch_idx += 1;
-                if idx < RISCV_FP_SCRATCH.len() {
-                    RISCV_FP_SCRATCH[idx].to_string()
-                } else {
-                    format!("fs{}", idx - RISCV_FP_SCRATCH.len())
+                const RISCV_FP_ALL: &[&str] = &[
+                    "ft0", "ft1", "ft2", "ft3", "ft4", "ft5", "ft6", "ft7", "ft8", "ft9", "ft10",
+                    "ft11", "fa0", "fa1", "fa2", "fa3", "fa4", "fa5", "fa6", "fa7",
+                ];
+                while self.asm_fp_scratch_idx < RISCV_FP_ALL.len() {
+                    let reg = RISCV_FP_ALL[self.asm_fp_scratch_idx];
+                    self.asm_fp_scratch_idx += 1;
+                    if !excluded.iter().any(|e| e == reg) {
+                        return reg.to_string();
+                    }
                 }
+                String::new()
             }
             _ => {
-                // Collect callee-saved registers already allocated by the register
-                // allocator. When the scratch pool overflows to s2, s3, ... we must
-                // skip any that hold live values to avoid clobbering them.
                 let allocated_callee_saved: Vec<String> = self
                     .reg_assignments
                     .values()
                     .map(|phys| super::emit::callee_saved_name(*phys).to_string())
                     .collect();
+                let record_callee_saved = |used: &mut Vec<PhysReg>, name: &str| {
+                    if let Some(n) = name.strip_prefix('s').and_then(|s| s.parse::<u8>().ok()) {
+                        if (1..=11).contains(&n) {
+                            let phys = PhysReg(n);
+                            if !used.contains(&phys) {
+                                used.push(phys);
+                                used.sort_by_key(|r| r.0);
+                            }
+                        }
+                    }
+                };
                 loop {
                     let idx = self.asm_gp_scratch_idx;
                     self.asm_gp_scratch_idx += 1;
-                    let reg = if idx < RISCV_GP_SCRATCH.len() {
-                        RISCV_GP_SCRATCH[idx].to_string()
-                    } else {
-                        // Overflow into callee-saved registers s2-s11.
-                        // First try unallocated callee-saved registers.
-                        let overflow_idx = idx - RISCV_GP_SCRATCH.len();
-                        let mut available = Vec::new();
-                        for n in 2..=11u32 {
-                            let name = format!("s{}", n);
-                            if !allocated_callee_saved.contains(&name)
-                                && !excluded.iter().any(|e| e == &name)
-                            {
-                                available.push(name);
-                            }
+                    if idx < RISCV_GP_SCRATCH.len() {
+                        let reg = RISCV_GP_SCRATCH[idx];
+                        if !excluded.iter().any(|e| e == reg)
+                            && !allocated_callee_saved.iter().any(|a| a == reg)
+                        {
+                            return reg.to_string();
                         }
-                        if overflow_idx < available.len() {
-                            return available.into_iter().nth(overflow_idx).unwrap();
-                        }
-                        // All unallocated callee-saved exhausted. Borrow one that IS
-                        // allocated — we'll save/restore it around the inline asm.
-                        // Pick from least-likely-to-conflict candidates.
-                        let borrow_candidates = [
-                            "s7", "s6", "s1", "s2", "s3", "s4", "s5", "s8", "s9", "s10", "s11",
-                        ];
-                        for &bc in &borrow_candidates {
-                            if !excluded.iter().any(|e| e == bc)
-                                && !self.asm_borrowed_callee_saved.iter().any(|e| e == bc)
-                            {
-                                self.asm_borrowed_callee_saved.push(bc.to_string());
-                                return bc.to_string();
-                            }
-                        }
-                        // TODO: all borrow candidates exhausted, this may generate
-                        // incorrect code if s7 is in use. This requires 26+ operands
-                        // to trigger (15 caller-saved + 11 callee-saved) so it's
-                        // extremely unlikely in practice.
-                        return "s7".to_string();
-                    };
-                    if !excluded.iter().any(|e| e == &reg) && !allocated_callee_saved.contains(&reg)
-                    {
-                        return reg;
+                        continue;
                     }
-                    // Safety bail: avoid infinite loops
-                    if idx > 30 {
-                        return reg;
+                    // Overflow into unallocated callee-saved registers s1..s11.
+                    let overflow_idx = idx - RISCV_GP_SCRATCH.len();
+                    let mut available = Vec::new();
+                    for n in 1..=11u8 {
+                        let name = format!("s{}", n);
+                        if !allocated_callee_saved.contains(&name)
+                            && !excluded.iter().any(|e| e == &name)
+                        {
+                            available.push(name);
+                        }
                     }
+                    if overflow_idx < available.len() {
+                        let chosen = available[overflow_idx].clone();
+                        record_callee_saved(&mut self.used_callee_saved, &chosen);
+                        return chosen;
+                    }
+                    // All unallocated callee-saved exhausted: borrow an allocated one
+                    // and spill it to the stack immediately so output, memory-operand,
+                    // and input uses are all balanced by the post-asm restore.
+                    let borrow_candidates = [
+                        "s7", "s6", "s1", "s2", "s3", "s4", "s5", "s8", "s9", "s10", "s11",
+                    ];
+                    for &bc in &borrow_candidates {
+                        let saved_tag = format!("saved:{}", bc);
+                        if !excluded.iter().any(|e| e == bc)
+                            && !self
+                                .asm_borrowed_callee_saved
+                                .iter()
+                                .any(|e| e == bc || e == &saved_tag)
+                        {
+                            record_callee_saved(&mut self.used_callee_saved, bc);
+                            self.state.emit("    addi sp, sp, -16");
+                            self.state.emit_fmt(format_args!("    sd {}, 0(sp)", bc));
+                            self.asm_borrowed_callee_saved.push(saved_tag);
+                            return bc.to_string();
+                        }
+                    }
+                    return String::new();
                 }
             }
         }
@@ -272,18 +315,9 @@ impl InlineAsmEmitter for RiscvCodegen {
         let reg = &op.reg;
         let is_fp = matches!(op.kind, AsmOperandKind::FpReg);
 
-        // If this register was borrowed from the register allocator (it's a
-        // callee-saved register already holding a live value), save that value
-        // to the stack before we overwrite it. The restore happens after
-        // emit_inline_asm_common returns (in emit_inline_asm).
-        // TODO: if a borrowed register is allocated during resolve_memory_operand
-        // (not for an input), this save won't be reached. Currently only input
-        // operands trigger overflow in practice.
         if let Some(pos) = self.asm_borrowed_callee_saved.iter().position(|r| r == reg) {
             self.state.emit("    addi sp, sp, -16");
             self.state.emit_fmt(format_args!("    sd {}, 0(sp)", reg));
-            // Move from "pending save" to "saved" by marking with a prefix
-            // so we don't save again but still know to restore.
             self.asm_borrowed_callee_saved[pos] = format!("saved:{}", reg);
         }
         let is_addr = matches!(op.kind, AsmOperandKind::Address);

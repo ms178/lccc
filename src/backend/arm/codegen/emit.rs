@@ -533,6 +533,23 @@ impl ArmCodegen {
         func: &IrFunction,
         used_callee_saved: &mut Vec<PhysReg>,
     ) {
+        fn maybe_push_callee_saved(reg_name: &str, used: &mut Vec<PhysReg>) {
+            let clean = crate::backend::inline_asm::normalize_inline_asm_reg_name(reg_name);
+            let num_opt = clean
+                .strip_prefix('x')
+                .or_else(|| clean.strip_prefix('w'))
+                .or_else(|| clean.strip_prefix('r'))
+                .and_then(|s| s.parse::<u8>().ok());
+            if let Some(n) = num_opt {
+                if (19..=28).contains(&n) {
+                    let phys = PhysReg(n);
+                    if !used.contains(&phys) {
+                        used.push(phys);
+                    }
+                }
+            }
+        }
+
         for block in &func.blocks {
             for instr in &block.instructions {
                 if let Instruction::InlineAsm {
@@ -545,21 +562,22 @@ impl ArmCodegen {
                     // Build excluded set: clobber registers + specific constraint regs
                     let mut excluded: Vec<String> = Vec::new();
                     for clobber in clobbers {
-                        if clobber == "cc" || clobber == "memory" {
+                        let clean =
+                            crate::backend::inline_asm::normalize_inline_asm_reg_name(clobber);
+                        if clean == "cc" || clean == "memory" {
                             continue;
                         }
-                        excluded.push(clobber.clone());
-                        // Also exclude the alternate width alias (wN <-> xN)
-                        // and normalize rN (GCC AArch64 alias for xN)
-                        if let Some(suffix) = clobber.strip_prefix('w') {
+                        maybe_push_callee_saved(clean, used_callee_saved);
+                        excluded.push(clean.to_string());
+                        if let Some(suffix) = clean.strip_prefix('w') {
                             if suffix.chars().all(|c| c.is_ascii_digit()) {
                                 excluded.push(format!("x{}", suffix));
                             }
-                        } else if let Some(suffix) = clobber.strip_prefix('x') {
+                        } else if let Some(suffix) = clean.strip_prefix('x') {
                             if suffix.chars().all(|c| c.is_ascii_digit()) {
                                 excluded.push(format!("w{}", suffix));
                             }
-                        } else if let Some(suffix) = clobber.strip_prefix('r') {
+                        } else if let Some(suffix) = clean.strip_prefix('r') {
                             if suffix.chars().all(|c| c.is_ascii_digit()) {
                                 if let Ok(n) = suffix.parse::<u32>() {
                                     if n <= 30 {
@@ -580,118 +598,93 @@ impl ArmCodegen {
                         let c = constraint.trim_start_matches(['=', '+', '&', '%']);
                         if c.starts_with('{') && c.ends_with('}') {
                             let reg_name = &c[1..c.len() - 1];
-                            // Normalize rN -> xN (GCC AArch64 alias)
                             let normalized =
                                 super::asm_emitter::normalize_aarch64_register(reg_name);
+                            maybe_push_callee_saved(&normalized, used_callee_saved);
                             excluded.push(normalized);
                         } else if c == "m" || c == "Q" || c.contains('Q') || c.contains('m') {
-                            // Memory operands may need a scratch reg for indirection.
-                            // Conservatively count each one.
                             gp_scratch_needed += 1;
-                        } else if c == "w" {
-                            // FP register, doesn't consume GP scratch
+                        } else if c == "w" || c.starts_with("@cc") {
+                            // FP register or condition flag, doesn't consume GP scratch
                         } else if !c.is_empty() && c.chars().all(|ch| ch.is_ascii_digit()) {
                             // Tied operand, doesn't need its own scratch
                         } else {
-                            // GpReg
                             gp_scratch_needed += 1;
                         }
                     }
 
                     // Count "+" read-write outputs that generate synthetic inputs.
-                    // Synthetic inputs from "+r" have constraint "r" and consume a
-                    // GP scratch slot in phase 1 (even though the register is later
-                    // overwritten by copy_metadata_from). We must count these too.
                     let num_plus = outputs.iter().filter(|(c, _, _)| c.contains('+')).count();
-                    {
-                        let mut plus_idx = 0;
-                        for (constraint, _, _) in outputs.iter() {
-                            if constraint.contains('+') {
-                                let c = constraint.trim_start_matches(['=', '+', '&', '%']);
-                                // Synthetic input inherits constraint with '+' stripped
-                                // "+r" → "r" (GpReg, consumes scratch), "+m" → "m" (Memory, skip)
-                                if c != "m"
-                                    && c != "Q"
-                                    && !c.contains('Q')
-                                    && !c.contains('m')
-                                    && c != "w"
-                                    && !(c.starts_with('{') && c.ends_with('}'))
-                                    && (!c.chars().all(|ch| ch.is_ascii_digit()) || c.is_empty())
-                                {
-                                    gp_scratch_needed += 1;
-                                }
-                                plus_idx += 1;
+                    for (constraint, _, _) in outputs.iter() {
+                        if constraint.contains('+') {
+                            let c = constraint.trim_start_matches(['=', '+', '&', '%']);
+                            if c != "m"
+                                && c != "Q"
+                                && !c.contains('Q')
+                                && !c.contains('m')
+                                && c != "w"
+                                && !c.starts_with("@cc")
+                                && !(c.starts_with('{') && c.ends_with('}'))
+                                && (!c.chars().all(|ch| ch.is_ascii_digit()) || c.is_empty())
+                            {
+                                gp_scratch_needed += 1;
                             }
                         }
-                        let _ = plus_idx;
                     }
 
                     for (i, (constraint, val, _)) in inputs.iter().enumerate() {
-                        // Skip synthetic inputs (they're already counted above)
                         if i < num_plus {
                             continue;
                         }
                         let c = constraint.trim_start_matches(['=', '+', '&', '%']);
                         if c.starts_with('{') && c.ends_with('}') {
                             let reg_name = &c[1..c.len() - 1];
-                            // Normalize rN -> xN (GCC AArch64 alias)
                             let normalized =
                                 super::asm_emitter::normalize_aarch64_register(reg_name);
+                            maybe_push_callee_saved(&normalized, used_callee_saved);
                             excluded.push(normalized);
                         } else if c == "m" || c == "Q" || c.contains('Q') || c.contains('m') {
                             gp_scratch_needed += 1;
-                        } else if c == "w" {
-                            // FP register
+                        } else if c == "w" || c.starts_with("@cc") {
+                            // FP register or condition flag
                         } else if !c.is_empty() && c.chars().all(|ch| ch.is_ascii_digit()) {
                             // Tied operand
                         } else {
-                            // Check if constant input with immediate-capable constraint
-                            // would be promoted to Immediate (no scratch needed)
                             let is_const = matches!(val, Operand::Const(_));
                             let has_imm_alt = c.contains('i') || c.contains('I') || c.contains('n');
-                            if is_const && has_imm_alt {
-                                // Would be promoted to Immediate, no GP scratch needed
-                            } else {
+                            if !(is_const && has_imm_alt) {
                                 gp_scratch_needed += 1;
                             }
                         }
                     }
 
-                    // Simulate walking through ARM_GP_SCRATCH, skipping excluded regs
+                    // Simulate walking through ARM_GP_SCRATCH, skipping excluded regs.
+                    // If scratch demand reaches callee-saved x19..x28, mark all x19..x28
+                    // so RA withholds them and prologue/epilogue saves/restores them.
                     let mut scratch_idx = 0;
                     let mut assigned = 0;
+                    let mut overflowed_into_callee_saved = false;
                     while assigned < gp_scratch_needed && scratch_idx < ARM_GP_SCRATCH.len() {
                         let reg = ARM_GP_SCRATCH[scratch_idx];
                         scratch_idx += 1;
-                        if excluded.iter().any(|e| e == reg) {
+                        if excluded.iter().any(|e| {
+                            e == reg
+                                || reg
+                                    .strip_prefix('x')
+                                    .is_some_and(|n| e.strip_prefix('w') == Some(n))
+                        }) {
                             continue;
                         }
                         assigned += 1;
-                        // Check if this is a callee-saved register
-                        if let Some(num_str) = reg.strip_prefix('x') {
-                            if let Ok(n) = num_str.parse::<u8>() {
-                                if (19..=28).contains(&n) {
-                                    let phys = PhysReg(n);
-                                    if !used_callee_saved.contains(&phys) {
-                                        used_callee_saved.push(phys);
-                                    }
-                                }
+                        if let Some(n) = reg.strip_prefix('x').and_then(|s| s.parse::<u8>().ok()) {
+                            if (19..=28).contains(&n) {
+                                overflowed_into_callee_saved = true;
                             }
                         }
                     }
-
-                    // Also handle overflow beyond ARM_GP_SCRATCH (format!("x{}", 9 + idx))
-                    while assigned < gp_scratch_needed {
-                        let idx = scratch_idx;
-                        scratch_idx += 1;
-                        let reg_num = 9 + idx;
-                        let reg_name = format!("x{}", reg_num);
-                        if excluded.iter().any(|e| e == &reg_name) {
-                            continue;
-                        }
-                        assigned += 1;
-                        if (19..=28).contains(&reg_num) {
-                            let phys = PhysReg(reg_num as u8);
+                    if overflowed_into_callee_saved || assigned < gp_scratch_needed {
+                        for n in 19u8..=28 {
+                            let phys = PhysReg(n);
                             if !used_callee_saved.contains(&phys) {
                                 used_callee_saved.push(phys);
                             }

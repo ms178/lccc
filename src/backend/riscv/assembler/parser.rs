@@ -256,7 +256,7 @@ pub fn parse_asm(text: &str) -> Result<Vec<AsmStatement>, String> {
     // Each entry is true if the current block is active (emitting code).
     let mut if_stack: Vec<bool> = Vec::new();
     for (line_num, line) in expanded_lines.iter().enumerate() {
-        let line = line.trim();
+        let line = asm_expr::trim_asm_line(line);
 
         // Skip empty lines
         if line.is_empty() {
@@ -266,7 +266,7 @@ pub fn parse_asm(text: &str) -> Result<Vec<AsmStatement>, String> {
 
         // Strip comments
         let line = strip_comment(line);
-        let line = line.trim();
+        let line = asm_expr::trim_asm_line(line);
         if line.is_empty() {
             statements.push(AsmStatement::Empty);
             continue;
@@ -310,7 +310,7 @@ pub fn parse_asm(text: &str) -> Result<Vec<AsmStatement>, String> {
         // Split the line on ';' and parse each part independently.
         let parts = asm_preprocess::split_on_semicolons(line);
         for part in parts {
-            let part = part.trim();
+            let part = asm_expr::trim_asm_line(part);
             if part.is_empty() {
                 continue;
             }
@@ -357,7 +357,7 @@ fn parse_line(line: &str) -> Result<Vec<AsmStatement>, String> {
         }
     }
 
-    let trimmed = line.trim();
+    let trimmed = asm_expr::trim_asm_line(line);
 
     // Handle quoted instructions from macro expansion (e.g. "nop" or "j label")
     if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2 {
@@ -381,7 +381,7 @@ fn parse_line(line: &str) -> Result<Vec<AsmStatement>, String> {
 fn parse_directive(line: &str) -> Result<AsmStatement, String> {
     let (name, args) = if let Some(space_pos) = line.find([' ', '\t']) {
         let name = &line[..space_pos];
-        let args = line[space_pos..].trim();
+        let args = asm_expr::trim_asm_line(&line[space_pos..]);
         (name, args)
     } else {
         (line, "")
@@ -774,8 +774,8 @@ fn parse_size_directive(args: &str) -> Directive {
 /// Each value can be an integer, a symbol reference, or a symbol difference.
 fn parse_data_values(args: &str) -> Result<Vec<DataValue>, String> {
     let mut values = Vec::new();
-    for part in args.split(',') {
-        let trimmed = part.trim();
+    for part in asm_expr::split_comma_args(args) {
+        let trimmed = asm_expr::trim_data_arg(part);
         if trimmed.is_empty() {
             continue;
         }
@@ -786,7 +786,7 @@ fn parse_data_values(args: &str) -> Result<Vec<DataValue>, String> {
 
 /// Parse a single data value: an integer, or an expression naming symbols.
 fn parse_single_data_value(s: &str) -> Result<DataValue, String> {
-    let s = s.trim();
+    let s = asm_expr::trim_data_arg(s);
     if s.is_empty() {
         return Ok(DataValue::Integer(0));
     }
@@ -798,7 +798,7 @@ fn parse_single_data_value(s: &str) -> Result<DataValue, String> {
 
 /// Parse a data value as a plain integer (used by .byte, .zero fill, etc).
 fn parse_data_value_int(s: &str) -> Result<i64, String> {
-    let s = s.trim();
+    let s = asm_expr::trim_data_arg(s);
     if s.is_empty() {
         return Ok(0);
     }

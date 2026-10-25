@@ -520,6 +520,32 @@ pub(super) fn cmp_secondary_reg(ty: IrType) -> &'static str {
 /// conservatively mark all callee-saved registers as clobbered only when
 /// overflow is likely, avoiding unnecessary save/restore in common cases.
 pub(super) fn collect_inline_asm_callee_saved_x86(func: &IrFunction, used: &mut Vec<PhysReg>) {
+    fn caller_scratch_slot_by_name(name: &str) -> Option<usize> {
+        let name = crate::backend::inline_asm::normalize_inline_asm_reg_name(name);
+        match name {
+            "rcx" | "ecx" | "cx" | "cl" | "ch" => Some(0),
+            "rdx" | "edx" | "dx" | "dl" | "dh" => Some(1),
+            "rsi" | "esi" | "si" | "sil" => Some(2),
+            "rdi" | "edi" | "di" | "dil" => Some(3),
+            "r8" | "r8d" | "r8w" | "r8b" => Some(4),
+            "r9" | "r9d" | "r9w" | "r9b" => Some(5),
+            "r10" | "r10d" | "r10w" | "r10b" => Some(6),
+            "r11" | "r11d" | "r11w" | "r11b" => Some(7),
+            _ => None,
+        }
+    }
+    fn constraint_to_caller_scratch(c: &str) -> Option<usize> {
+        if c.starts_with('{') && c.ends_with('}') {
+            return caller_scratch_slot_by_name(&c[1..c.len() - 1]);
+        }
+        match c {
+            "c" => Some(0),
+            "d" => Some(1),
+            "S" => Some(2),
+            "D" => Some(3),
+            _ => None,
+        }
+    }
     fn clobber_to_phys(name: &str) -> Option<PhysReg> {
         let name = crate::backend::inline_asm::normalize_inline_asm_reg_name(name);
         match name {
@@ -536,6 +562,9 @@ pub(super) fn collect_inline_asm_callee_saved_x86(func: &IrFunction, used: &mut 
         used,
         constraint_to_callee_saved_x86,
         clobber_to_phys,
+        constraint_to_caller_scratch,
+        caller_scratch_slot_by_name,
+        |c| c == "a" || c == "A",
         &X86_CALLEE_SAVED,
         8,
     );
@@ -2169,7 +2198,7 @@ impl X86Codegen {
                 eprintln!("[INS] fn={} v={}", self.state.current_func_name, dest_id);
             }
             self.home_fresh.insert(dest_id);
-            self.home_clobbered.remove(&dest_id);
+            self.clear_home_clobbered(dest_id);
             // Write-state law: this definition is the register's last write.
             self.home_write_state
                 .insert(home.0, HomeWrite::Def(dest_id));
@@ -2279,7 +2308,7 @@ impl X86Codegen {
             if e.point == point {
                 return true;
             }
-            self.home_clobbered.remove(&e.value);
+            self.clear_home_clobbered(e.value);
             if e.was_fresh {
                 self.home_fresh.insert(e.value);
             }
@@ -2302,7 +2331,7 @@ impl X86Codegen {
                 .is_some_and(|r| r.0 == target.0)
             {
                 self.home_fresh.insert(v.0);
-                self.home_clobbered.remove(&v.0);
+                self.clear_home_clobbered(v.0);
                 // The staging write re-establishes this value's own home.
                 self.home_write_state.insert(target.0, HomeWrite::Def(v.0));
                 return;
@@ -5208,8 +5237,7 @@ impl X86Codegen {
         if let Some(&home) = self.reg_assignments.get(&dest_id) {
             if home.0 == written.0 {
                 self.home_fresh.insert(dest_id);
-                self.home_clobbered.remove(&dest_id);
-                self.home_clobber_cause.remove(&dest_id);
+                self.clear_home_clobbered(dest_id);
                 // The in-place write IS this definition (the chain-update
                 // freshen the alias law blesses through).
                 self.home_write_state
@@ -7650,6 +7678,12 @@ impl X86Codegen {
             .insert(v, (self.state.current_program_point, site));
     }
 
+    #[inline]
+    pub(super) fn clear_home_clobbered(&mut self, v: u32) {
+        self.home_clobbered.remove(&v);
+        self.home_clobber_cause.remove(&v);
+    }
+
     /// Print the `CCC_DEBUG_NOHOME` forensics for a value whose home cannot
     /// be recovered: its home register, its mark, the exact site that
     /// destroyed the home ([`Self::mark_home_clobbered`]), its hole-aware
@@ -7791,23 +7825,70 @@ impl X86Codegen {
     /// the `operand_to_rax` refusal that ended the translation unit.
     fn value_home_is_expendable(&self, v: u32) -> bool {
         let point = self.state.current_program_point;
-        let live_after = self
-            .value_live_segments
-            .get(&v)
-            .is_some_and(|live| live.0.iter().any(|&(_start, end)| end > point));
-        if !live_after {
+        // Fail closed when live-segment metadata is absent: without it we
+        // cannot prove the home has no future readers.
+        let Some(live) = self.value_live_segments.get(&v) else {
+            return false;
+        };
+        if !live.0.iter().any(|&(_start, end)| end > point) {
             return true;
         }
         if self.state.get_slot(v).is_some() {
             return true;
         }
-        match self.get_defining_instruction(v) {
-            Some(Instruction::Copy { .. }) | Some(Instruction::GlobalAddr { .. }) => true,
-            Some(Instruction::Cast { from_ty, to_ty, .. }) => {
-                IrType::cast_is_bitidentical_nop(*from_ty, *to_ty)
+        // Boundedly walk Copy / bit-identical Cast chains (matching
+        // `rematerialize_stale_into_rax`'s 3-hop bound) and accept ONLY when
+        // an ancestor has a clobber-immune recovery source: a stack slot, a
+        // Constant, or a `GlobalAddr` rematerialisation. An unslotted source
+        // value whose own home already died (or was coalesced into the very
+        // register we are about to destroy) would fail `operand_to_rax` at
+        // `v`'s later read.
+        let mut cur = v;
+        for _ in 0..3 {
+            match self.get_defining_instruction(cur) {
+                Some(Instruction::GlobalAddr { .. })
+                | Some(Instruction::Copy {
+                    src: Operand::Const(_),
+                    ..
+                }) => return true,
+                Some(Instruction::Cast {
+                    src: Operand::Const(_),
+                    from_ty,
+                    to_ty,
+                    ..
+                }) if IrType::cast_is_bitidentical_nop(*from_ty, *to_ty) => {
+                    return true;
+                }
+                Some(Instruction::Copy {
+                    src: Operand::Value(sv),
+                    ..
+                }) => {
+                    if self.state.get_slot(sv.0).is_some() {
+                        return true;
+                    }
+                    if sv.0 == cur {
+                        return false;
+                    }
+                    cur = sv.0;
+                }
+                Some(Instruction::Cast {
+                    src: Operand::Value(sv),
+                    from_ty,
+                    to_ty,
+                    ..
+                }) if IrType::cast_is_bitidentical_nop(*from_ty, *to_ty) => {
+                    if self.state.get_slot(sv.0).is_some() {
+                        return true;
+                    }
+                    if sv.0 == cur {
+                        return false;
+                    }
+                    cur = sv.0;
+                }
+                _ => return false,
             }
-            _ => false,
         }
+        false
     }
 }
 
@@ -9191,8 +9272,7 @@ impl ArchCodegen for X86Codegen {
         // Values whose registers were saved and restored are fresh again.
         for v in snapshot {
             self.home_fresh.insert(v);
-            self.home_clobbered.remove(&v);
-            self.home_clobber_cause.remove(&v);
+            self.clear_home_clobbered(v);
             // The restore's pop/mov is a real definition write.
             if let Some(&home) = self.reg_assignments.get(&v) {
                 self.home_write_state.insert(home.0, HomeWrite::Def(v));
@@ -11793,6 +11873,74 @@ mod switch_bound_emitter_tests {
     fn switch_fast_path_accepts_a_slotted_home_that_is_live_later() {
         let out = emit_direct32_from_home(vec![(7, 9), (23, 23), (119, 127)], 23, true);
         assert!(out.contains("subl $2, %r14d"), "{out}");
+    }
+
+    #[test]
+    fn value_home_is_expendable_fails_closed_and_verifies_copy_cast_sources() {
+        use crate::ir::reexports::{BasicBlock, Terminator};
+
+        let mut func = IrFunction::new("expendable_test".into(), IrType::I32, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Value(Value(5)),
+                },
+                Instruction::Cast {
+                    dest: Value(2),
+                    src: Operand::Value(Value(1)),
+                    from_ty: IrType::U32,
+                    to_ty: IrType::I32,
+                },
+                Instruction::Copy {
+                    dest: Value(3),
+                    src: Operand::Const(IrConst::I32(7)),
+                },
+            ],
+            terminator: Terminator::Return(None),
+            source_spans: vec![],
+        });
+        func.next_value_id = 6;
+
+        let mut cg = X86Codegen::new();
+        cg.current_func = Some(&func as *const IrFunction);
+        cg.state.current_program_point = 10;
+
+        // Missing live segments must fail closed.
+        assert!(!cg.value_home_is_expendable(2));
+
+        // Live past `point`, chained through unslotted `Value(5)` -> NOT expendable.
+        cg.value_live_segments
+            .insert(2, LiveSpans::from_ranges(vec![(5, 10), (20, 25)]));
+        assert!(!cg.value_home_is_expendable(2));
+
+        // Once ancestor `Value(5)` has a stack slot, recovery is guaranteed -> expendable.
+        cg.state.value_locations.insert(5, StackSlot(-16));
+        assert!(cg.value_home_is_expendable(2));
+
+        // Constant-backed Copy is always rematerialisable -> expendable.
+        cg.value_live_segments
+            .insert(3, LiveSpans::from_ranges(vec![(5, 30)]));
+        assert!(cg.value_home_is_expendable(3));
+    }
+
+    #[test]
+    fn home_clobber_cause_tracks_and_clears_with_home_clobbered() {
+        let mut cg = X86Codegen::new();
+        cg.reg_assignments.insert(7, PhysReg(2));
+        cg.state.current_program_point = 42;
+        cg.mark_home_clobbered(7, "switch_jt_direct32");
+        assert!(cg.home_clobbered.contains(&7));
+        assert_eq!(
+            cg.home_clobber_cause.get(&7),
+            Some(&(42, "switch_jt_direct32"))
+        );
+
+        // Re-defining the home must purge both the clobber flag and its cause.
+        cg.note_home_written(7);
+        assert!(!cg.home_clobbered.contains(&7));
+        assert!(!cg.home_clobber_cause.contains_key(&7));
     }
 
     #[test]

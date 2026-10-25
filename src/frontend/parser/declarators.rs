@@ -12,25 +12,78 @@ use crate::common::source::Span;
 use crate::common::types::AddressSpace;
 use crate::frontend::lexer::token::TokenKind;
 
-/// Result of parsing a parenthesized abstract declarator.
-pub(super) enum ParenAbstractDecl {
-    /// Simple pointer/array grouping: (*), (**), (*[3][4])
-    Simple {
-        ptr_depth: u32,
-        array_dims: Vec<Option<Box<Expr>>>,
-    },
-    /// Nested function pointer inside outer parens: (*(*)(params))
-    /// Used for types like void(*(*)(void*))(void) - pointer to function
-    /// returning a function pointer.
-    NestedFnPtr {
-        /// Outer pointer depth (the * before the inner fn ptr group)
-        outer_ptr_depth: u32,
-        /// Inner pointer depth (the * in the inner-most (*) group)
-        inner_ptr_depth: u32,
-        /// Parameter list of the inner function pointer
-        inner_params: Vec<ParamDecl>,
-        inner_variadic: bool,
-    },
+/// One parenthesized/top-level grammar production of an abstract declarator:
+/// `stars  ( inner_level )?  suffixes*`.
+///
+/// Walking from the outermost level inward (`level -> level.core -> ...`) visits
+/// type modifiers from the base type specifier inward toward the omitted identifier,
+/// matching C11 6.7.7's inside-out abstract-declarator semantics at arbitrary
+/// nesting depth while preserving per-star address-space and CVR qualifiers.
+pub(super) struct AbstractDeclaratorLevel {
+    /// Leading `*` (or `^`) qualifiers in left-to-right written order: `(address_space, cvr_bits)`.
+    pub stars: Vec<(AddressSpace, u8)>,
+    /// Optional grouped `( abstract-declarator )` core.
+    pub core: Option<Box<AbstractDeclaratorLevel>>,
+    /// Direct postfix `[size]` and `(params)` suffixes in left-to-right written order.
+    pub suffixes: Vec<AbstractDeclSuffix>,
+}
+
+pub(super) enum AbstractDeclSuffix {
+    Array(Option<Box<Expr>>),
+    Function(Vec<ParamDecl>, bool),
+}
+
+impl AbstractDeclaratorLevel {
+    pub(super) fn is_empty(&self) -> bool {
+        self.stars.is_empty() && self.core.is_none() && self.suffixes.is_empty()
+    }
+
+    /// Fold this abstract declarator tree onto `(base, base_space)`, optionally
+    /// recording per-layer CVR qualifier bitmasks for `__builtin_types_compatible_p`.
+    pub(super) fn apply_to(
+        &self,
+        mut ty: TypeSpecifier,
+        mut space: AddressSpace,
+        mut quals: Option<&mut Vec<u8>>,
+    ) -> TypeSpecifier {
+        let mut cur = Some(self);
+        while let Some(level) = cur {
+            for &(star_space, star_cvr) in &level.stars {
+                ty = match ty {
+                    TypeSpecifier::BareFunction(ret, params, variadic)
+                        if space == AddressSpace::Default =>
+                    {
+                        TypeSpecifier::FunctionPointer(ret, params, variadic)
+                    }
+                    other => TypeSpecifier::Pointer(Box::new(other), space),
+                };
+                if let Some(q) = quals.as_deref_mut() {
+                    q.push(star_cvr);
+                }
+                space = star_space;
+            }
+            for suffix in level.suffixes.iter().rev() {
+                match suffix {
+                    AbstractDeclSuffix::Array(dim) => {
+                        ty = TypeSpecifier::Array(Box::new(ty), dim.clone());
+                        if let Some(q) = quals.as_deref_mut() {
+                            q.push(0);
+                        }
+                    }
+                    AbstractDeclSuffix::Function(params, variadic) => {
+                        ty = TypeSpecifier::BareFunction(Box::new(ty), params.clone(), *variadic);
+                        if let Some(q) = quals.as_deref_mut() {
+                            q.clear();
+                            q.push(0);
+                        }
+                        space = AddressSpace::Default;
+                    }
+                }
+            }
+            cur = level.core.as_deref();
+        }
+        ty
+    }
 }
 
 impl Parser {
@@ -563,62 +616,92 @@ impl Parser {
         // mis-encoded). This accepts arbitrary nesting depth, since each
         // recursive combine emits `[Pointer, FunctionPointer, ...]` chains in
         // which every Pointer is immediately consumed by a FunctionPointer.
-        let inner_has_function = inner_derived
+        // When the parenthesized inner declarator already contains a `Function`
+        // or `FunctionPointer` core (e.g. `*g(int)`, `*(*p)(int)`, `**f(int)`,
+        // `*(*p[3])(int)`, `*get_arr(int)`, `*(*fp)(int)`), split `inner_derived`
+        // at that FIRST function/function-pointer core (including its preceding
+        // syntax-marker `Pointer`):
+        //   inner_prefix = &inner_derived[..fn_core_idx]
+        //   inner_rest   = &inner_derived[fn_core_idx..]
+        // `inner_prefix` holds the return-type modifiers of the inner callable
+        // that were written inside the current `(...)` group, so outer `[N]` or
+        // `(params)` suffixes bind to `inner_prefix` in exact inside-out order
+        // before `inner_rest` (the inner callable's own core and outer modifiers).
+        let first_fn_core_idx = inner_derived
             .iter()
-            .any(|d| matches!(d, DerivedDeclarator::Function(_, _)));
-        let remainder_ptr_binds_function = inner_derived[1..].windows(2).any(|w| {
-            matches!(w[0], DerivedDeclarator::Pointer(_))
-                && matches!(w[1], DerivedDeclarator::Function(_, _))
-        });
-        if inner_has_function
-            && outer_starts_with_function
-            && outer_suffixes.len() == 1
-            && matches!(inner_derived.first(), Some(DerivedDeclarator::Pointer(_)))
-            && matches!(
-                inner_derived.last(),
-                Some(DerivedDeclarator::Function(_, _))
-            )
-            && !remainder_ptr_binds_function
-        {
-            let mut result = outer_pointers;
-            result.push(DerivedDeclarator::Pointer(AddressSpace::Default));
-            if let Some(DerivedDeclarator::Function(params, variadic)) =
-                outer_suffixes.into_iter().next()
-            {
-                result.push(DerivedDeclarator::FunctionPointer(params, variadic));
-            }
-            result.extend(inner_derived.into_iter().skip(1));
-            return result;
-        }
-
-        // Handle nested function pointer variables like `int (*(*p)(int a, int b))(int c, int d)`.
-        // The inner declarator produces [Pointer, Pointer, FunctionPointer(...)], and the
-        // outer adds Function(...). We keep inner_derived intact and convert the outer
-        // Function to Pointer + FunctionPointer, yielding:
-        //   [Pointer, Pointer, FunctionPointer([int,int]), Pointer, FunctionPointer([int,int])]
-        //
-        // This does NOT match function definitions returning function pointers like
-        // `int (*g(int))(int)`, where inner has Function (not FunctionPointer).
-        let inner_starts_with_pointer =
-            matches!(inner_derived.first(), Some(DerivedDeclarator::Pointer(_)));
-        let inner_has_fptr = inner_derived
-            .iter()
-            .any(|d| matches!(d, DerivedDeclarator::FunctionPointer(_, _)));
-        if inner_starts_with_pointer && inner_has_fptr && outer_starts_with_function {
-            let mut result = outer_pointers;
-            // Keep inner_derived in its existing order
-            result.extend(inner_derived);
-            // The outer Function becomes a Pointer + FunctionPointer pair
-            for suffix in outer_suffixes {
-                match suffix {
-                    DerivedDeclarator::Function(params, variadic) => {
-                        result.push(DerivedDeclarator::Pointer(AddressSpace::Default));
-                        result.push(DerivedDeclarator::FunctionPointer(params, variadic));
-                    }
-                    other => result.push(other),
+            .position(|d| {
+                matches!(
+                    d,
+                    DerivedDeclarator::Function(_, _) | DerivedDeclarator::FunctionPointer(_, _)
+                )
+            })
+            .map(|pos| {
+                if matches!(inner_derived[pos], DerivedDeclarator::FunctionPointer(_, _))
+                    && pos > 0
+                    && matches!(inner_derived[pos - 1], DerivedDeclarator::Pointer(_))
+                {
+                    pos - 1
+                } else {
+                    pos
                 }
+            });
+
+        if let Some(fn_core_idx) = first_fn_core_idx {
+            let inner_prefix = &inner_derived[..fn_core_idx];
+            let inner_rest = &inner_derived[fn_core_idx..];
+
+            if !outer_suffixes.is_empty()
+                && outer_only_arrays
+                && let Some(last_ptr_idx) = inner_prefix
+                    .iter()
+                    .rposition(|d| matches!(d, DerivedDeclarator::Pointer(_)))
+            {
+                // Callable returning pointer-to-array:
+                //   `int (*get_arr(int))[4]` -> [Array(4), Pointer, Function([int])]
+                //   `int (*(*fp)(int))[4]`   -> [Array(4), Pointer, Pointer, FunctionPointer([int])]
+                let mut result = outer_pointers;
+                for d in &inner_prefix[..last_ptr_idx] {
+                    if matches!(d, DerivedDeclarator::Array(_)) {
+                        result.push(d.clone());
+                    }
+                }
+                result.extend(outer_suffixes);
+                for d in &inner_prefix[..=last_ptr_idx] {
+                    if matches!(d, DerivedDeclarator::Pointer(_)) {
+                        result.push(d.clone());
+                    }
+                }
+                result.extend_from_slice(&inner_prefix[last_ptr_idx + 1..]);
+                result.extend_from_slice(inner_rest);
+                return result;
             }
-            return result;
+
+            if outer_starts_with_function
+                && outer_suffixes.len() == 1
+                && let Some(first_ptr_idx) = inner_prefix
+                    .iter()
+                    .position(|d| matches!(d, DerivedDeclarator::Pointer(_)))
+            {
+                // Callable (function, N-level function pointer, or array/pointer
+                // of function pointers) returning a function pointer (or pointer
+                // to function pointer):
+                //   `int (*g(int))(char)`          -> [Pointer, FP([char]), Function([int])]
+                //   `void (*(*p)(int))(char)`      -> [Pointer, FP([char]), Pointer, FP([int])]
+                //   `int (*(*(*p)(int))(long))(c)` -> [Pointer, FP([c]), Pointer, FP([long]), Pointer, FP([int])]
+                //   `int (**f(int))(char)`         -> [Pointer, FP([char]), Pointer, Function([int])]
+                //   `int (*(*p[3])(int))(char)`    -> [Pointer, FP([char]), Pointer, FP([int]), Array(3)]
+                let mut result = outer_pointers;
+                result.extend_from_slice(&inner_prefix[..first_ptr_idx]);
+                result.push(inner_prefix[first_ptr_idx].clone());
+                if let Some(DerivedDeclarator::Function(params, variadic)) =
+                    outer_suffixes.into_iter().next()
+                {
+                    result.push(DerivedDeclarator::FunctionPointer(params, variadic));
+                }
+                result.extend_from_slice(&inner_prefix[first_ptr_idx + 1..]);
+                result.extend_from_slice(inner_rest);
+                return result;
+            }
         }
 
         // General case: outer_pointers ++ outer_suffixes ++ inner_derived
@@ -761,6 +844,7 @@ impl Parser {
                     param_is_restrict,
                     paren_ptr_total,
                     star_spaces,
+                    outer_fn_returns,
                 ) = self.parse_param_declarator_full();
                 // C11 6.7.6.3p2: `register` is a parameter's only storage
                 // class (GCC 16.2 wording).
@@ -861,6 +945,20 @@ impl Parser {
                     type_spec = TypeSpecifier::Pointer(Box::new(type_spec), AddressSpace::Default);
                 }
 
+                // Wrap any outer return-type function-pointer layers (from outermost
+                // to innermost) before decaying the parameter's own function/array core.
+                for (ret_params, ret_variadic, extra_ptrs) in outer_fn_returns.into_iter().rev() {
+                    type_spec = TypeSpecifier::FunctionPointer(
+                        Box::new(type_spec),
+                        ret_params,
+                        ret_variadic,
+                    );
+                    for _ in 0..extra_ptrs {
+                        type_spec =
+                            TypeSpecifier::Pointer(Box::new(type_spec), AddressSpace::Default);
+                    }
+                }
+
                 // Array params: outermost dimension decays to pointer.
                 // Preserve the outermost dimension expression (if any) so side effects
                 // like `a++` in `int b[a++]` can be evaluated during IR lowering.
@@ -943,6 +1041,7 @@ impl Parser {
 
     /// Parse a parameter declarator with full type information.
     /// Returns (name, pointer_depth, array_dims, is_func_ptr, ptr_to_array_dims, fptr_params, fptr_inner_ptr_depth).
+    #[allow(clippy::type_complexity)]
     pub(super) fn parse_param_declarator_full(
         &mut self,
     ) -> (
@@ -962,6 +1061,7 @@ impl Parser {
         // inside (see the construction in parse_param_list).
         u32,
         Vec<AddressSpace>,
+        Vec<(Vec<ParamDecl>, bool, u32)>,
     ) {
         let param_start = self.peek_span();
         let mut pointer_depth: u32 = 0;
@@ -1006,8 +1106,10 @@ impl Parser {
         let mut fptr_variadic = false;
         let mut fptr_inner_ptr_depth: u32 = 0;
         let mut paren_ptr_total: u32 = 0;
+        let mut outer_fn_returns: Vec<(Vec<ParamDecl>, bool, u32)> = Vec::new();
 
-        let name = if matches!(self.peek(), TokenKind::LParen) && self.is_paren_declarator() {
+        let had_paren_decl = matches!(self.peek(), TokenKind::LParen) && self.is_paren_declarator();
+        let name = if had_paren_decl {
             self.parse_paren_param_declarator(
                 &mut pointer_depth,
                 &mut array_dims,
@@ -1017,6 +1119,7 @@ impl Parser {
                 &mut fptr_variadic,
                 &mut fptr_inner_ptr_depth,
                 &mut paren_ptr_total,
+                &mut outer_fn_returns,
             )
         } else if let TokenKind::Identifier(n) = self.peek() {
             let n = n.clone();
@@ -1025,22 +1128,6 @@ impl Parser {
         } else {
             None
         };
-
-        // The last `*` qualifier names the parameter object itself
-        // (`long *__seg_gs p`), which GCC rejects. A qualifier on an earlier
-        // `*` or on the base type belongs to the pointee and is accepted.
-        if let Some(&object_space) = star_spaces.last() {
-            if object_space != AddressSpace::Default {
-                self.emit_error(
-                    format!(
-                        "'{}' specified for parameter '{}'",
-                        object_space,
-                        name.as_deref().unwrap_or("")
-                    ),
-                    param_start,
-                );
-            }
-        }
 
         // Parse trailing array dimensions
         while matches!(self.peek(), TokenKind::LBracket) {
@@ -1076,6 +1163,26 @@ impl Parser {
             fptr_variadic = variadic;
         }
 
+        // The last leading `*` qualifier names the parameter object itself
+        // (`long *__seg_gs p`), which GCC rejects, ONLY when no parenthesized
+        // pointer/function-pointer or trailing array/function layer makes that
+        // leading `*` a pointee/return-type pointer (e.g. `int * __seg_gs (*p)[4]`
+        // or `int * __seg_gs *p[4]`, where the parameter itself is ordinary).
+        if !had_paren_decl && !is_func_ptr && array_dims.is_empty() {
+            if let Some(&object_space) = star_spaces.last() {
+                if object_space != AddressSpace::Default {
+                    self.emit_error(
+                        format!(
+                            "'{}' specified for parameter '{}'",
+                            object_space,
+                            name.as_deref().unwrap_or("")
+                        ),
+                        param_start,
+                    );
+                }
+            }
+        }
+
         (
             name,
             pointer_depth,
@@ -1088,6 +1195,7 @@ impl Parser {
             is_restrict,
             paren_ptr_total,
             star_spaces,
+            outer_fn_returns,
         )
     }
 
@@ -1103,6 +1211,7 @@ impl Parser {
         fptr_variadic: &mut bool,
         fptr_inner_ptr_depth: &mut u32,
         paren_ptr_total: &mut u32,
+        outer_fn_returns: &mut Vec<(Vec<ParamDecl>, bool, u32)>,
     ) -> Option<String> {
         let save = self.pos;
         self.advance(); // consume '('
@@ -1153,6 +1262,49 @@ impl Parser {
                 // Also skip __attribute__(...) after pointer qualifiers.
                 // E.g., `void (*__attribute__((unused)) fp)(int)` is valid GNU C.
                 self.skip_gcc_extensions();
+            }
+            if matches!(self.peek(), TokenKind::LParen) && self.is_paren_declarator() {
+                let inner_save = self.pos;
+                let inner_attrs = self.attrs.clone();
+                let mut nested_ptr_depth = 0u32;
+                let mut nested_array_dims = Vec::new();
+                let mut nested_is_func_ptr = false;
+                let mut nested_ptr_to_array_dims = Vec::new();
+                let mut nested_fptr_params = None;
+                let mut nested_fptr_variadic = false;
+                let mut nested_inner_ptr_depth = 0u32;
+                let mut nested_paren_ptr_total = 0u32;
+                let mut nested_outer_fn_returns = Vec::new();
+                let nested_name = self.parse_paren_param_declarator(
+                    &mut nested_ptr_depth,
+                    &mut nested_array_dims,
+                    &mut nested_is_func_ptr,
+                    &mut nested_ptr_to_array_dims,
+                    &mut nested_fptr_params,
+                    &mut nested_fptr_variadic,
+                    &mut nested_inner_ptr_depth,
+                    &mut nested_paren_ptr_total,
+                    &mut nested_outer_fn_returns,
+                );
+                if nested_is_func_ptr && self.consume_if(&TokenKind::RParen) {
+                    if matches!(self.peek(), TokenKind::LParen) {
+                        let (ret_params, ret_variadic) = self.parse_param_list();
+                        outer_fn_returns.extend(nested_outer_fn_returns);
+                        outer_fn_returns.push((
+                            ret_params,
+                            ret_variadic,
+                            inner_ptr_depth.saturating_sub(1),
+                        ));
+                        *is_func_ptr = true;
+                        *fptr_params = nested_fptr_params;
+                        *fptr_variadic = nested_fptr_variadic;
+                        *fptr_inner_ptr_depth = nested_inner_ptr_depth;
+                        *array_dims = nested_array_dims;
+                        return nested_name;
+                    }
+                }
+                self.pos = inner_save;
+                self.attrs = inner_attrs;
             }
             let name = if let TokenKind::Identifier(n) = self.peek() {
                 let n = n.clone();
@@ -1349,129 +1501,166 @@ impl Parser {
         name
     }
 
-    /// Try to parse a parenthesized abstract declarator: (*), ((*)), (**), (*[3][4])
-    /// Also handles nested function pointers: (*(*)(params))
-    /// Returns a ParenAbstractDecl if successful, None otherwise.
-    /// Restores position on failure.
-    pub(super) fn try_parse_paren_abstract_declarator(&mut self) -> Option<ParenAbstractDecl> {
+    /// Parse one grammar level of an abstract declarator (`stars (inner)? suffixes*`),
+    /// tracking cumulative pointer depth against `POINTER_DEPTH_BUDGET` and
+    /// preserving `attrs.{parsing_const, parsing_volatile, parsing_address_space}`.
+    pub(super) fn parse_abstract_declarator_level(
+        &mut self,
+        ptr_budget: &mut u32,
+    ) -> AbstractDeclaratorLevel {
+        let mut stars = Vec::new();
+        loop {
+            let star_span = self.peek_span();
+            let is_caret =
+                !matches!(self.peek(), TokenKind::Star) && matches!(self.peek(), TokenKind::Caret);
+            if !self.consume_if(&TokenKind::Star) && !self.consume_if(&TokenKind::Caret) {
+                break;
+            }
+            *ptr_budget += 1;
+            if !self.enter_pointer_level(*ptr_budget, star_span) {
+                break;
+            }
+            let saved_const = self.attrs.parsing_const();
+            let saved_volatile = self.attrs.parsing_volatile();
+            let saved_space = self.attrs.parsing_address_space;
+            self.attrs.set_const(false);
+            self.attrs.set_volatile(false);
+            self.attrs.parsing_address_space = AddressSpace::Default;
+
+            let q_start = self.pos;
+            self.skip_cv_qualifiers();
+            let restrict_bit = u8::from(
+                self.tokens[q_start..self.pos]
+                    .iter()
+                    .any(|tok| matches!(tok.kind, TokenKind::Restrict)),
+            ) << 2;
+            let star_cvr = u8::from(self.attrs.parsing_const())
+                | (u8::from(self.attrs.parsing_volatile()) << 1)
+                | restrict_bit;
+            let star_space = self.attrs.parsing_address_space;
+
+            self.attrs.set_const(saved_const);
+            self.attrs.set_volatile(saved_volatile);
+            self.attrs.parsing_address_space = saved_space;
+
+            self.skip_gcc_extensions();
+            if is_caret {
+                // Apple block pointer inside type-name may optionally carry an unused name
+                if matches!(self.peek(), TokenKind::Identifier(_)) {
+                    self.advance();
+                }
+            }
+            stars.push((star_space, star_cvr));
+        }
+
+        let core = self
+            .try_parse_grouped_abstract_declarator(ptr_budget)
+            .map(Box::new);
+
+        let mut suffixes = Vec::new();
+        let mut prev_suffix_is_function: Option<bool> = None;
+        loop {
+            match self.peek() {
+                TokenKind::LBracket => {
+                    let open_bracket = self.peek_span();
+                    self.check_suffix_composition(
+                        prev_suffix_is_function,
+                        false,
+                        None,
+                        open_bracket,
+                    );
+                    prev_suffix_is_function = Some(false);
+                    self.advance();
+                    self.skip_array_qualifiers();
+                    let size = if matches!(self.peek(), TokenKind::RBracket) {
+                        None
+                    } else if matches!(self.peek(), TokenKind::Star)
+                        && self.pos + 1 < self.tokens.len()
+                        && matches!(self.tokens[self.pos + 1].kind, TokenKind::RBracket)
+                    {
+                        self.advance();
+                        None
+                    } else {
+                        Some(Box::new(self.parse_expr()))
+                    };
+                    self.expect_closing(&TokenKind::RBracket, open_bracket);
+                    suffixes.push(AbstractDeclSuffix::Array(size));
+                }
+                TokenKind::LParen => {
+                    // When no grouped core preceded `(`, distinguish a bare-function
+                    // parameter list (`void (int)`, `int (void)`, `int ()`) from an
+                    // expression call argument list (`(T(x))`) during speculative
+                    // cast lookahead by requiring `)`, `...`, or a type specifier.
+                    let save = self.pos;
+                    let saved_attrs = self.attrs.clone();
+                    self.advance();
+                    let looks_like_param_list = core.is_some()
+                        || matches!(self.peek(), TokenKind::RParen | TokenKind::Ellipsis)
+                        || self.is_type_specifier();
+                    self.pos = save;
+                    self.attrs = saved_attrs;
+                    if !looks_like_param_list {
+                        break;
+                    }
+                    let open_paren = self.peek_span();
+                    self.check_suffix_composition(prev_suffix_is_function, true, None, open_paren);
+                    prev_suffix_is_function = Some(true);
+                    let (params, variadic) = self.parse_param_list();
+                    suffixes.push(AbstractDeclSuffix::Function(params, variadic));
+                }
+                _ => break,
+            }
+        }
+
+        AbstractDeclaratorLevel {
+            stars,
+            core,
+            suffixes,
+        }
+    }
+
+    /// Try to parse a parenthesized abstract declarator `( abstract-declarator )`
+    /// as opposed to a function parameter list `( parameter-type-list )`.
+    /// Restores parser position and attribute state if not a grouped abstract declarator.
+    fn try_parse_grouped_abstract_declarator(
+        &mut self,
+        ptr_budget: &mut u32,
+    ) -> Option<AbstractDeclaratorLevel> {
         if !matches!(self.peek(), TokenKind::LParen) {
             return None;
         }
-        let save = self.pos;
+        let open_span = self.peek_span();
+        if !self.enter_record_frame(open_span) {
+            return None;
+        }
+        let save_pos = self.pos;
+        let save_attrs = self.attrs.clone();
+        let save_budget = *ptr_budget;
+
         self.advance(); // consume '('
-
-        let mut total_ptrs = 0u32;
-
-        // Skip __attribute__ / __extension__ before pointer declarator
-        // e.g. (int(__attribute__((noinline)) *)(void)) function_pointer
         self.skip_gcc_extensions();
 
-        loop {
-            let star_span = self.peek_span();
-            if !self.consume_if(&TokenKind::Star) {
-                break;
-            }
-            total_ptrs += 1;
-            if !self.enter_pointer_level(total_ptrs, star_span) {
-                break;
-            }
-            self.skip_cv_qualifiers();
-            // Also skip attributes after each pointer star, e.g. (* __attribute__((unused)))
-            self.skip_gcc_extensions();
+        // A parameter list begins with `)`, `...`, or a declaration-specifier
+        // (`void`, `int`, typedef name, qualifier, etc.), whereas a grouped
+        // abstract declarator begins with `*`, `^`, `[`, or a nested grouped `(`.
+        if matches!(self.peek(), TokenKind::RParen | TokenKind::Ellipsis)
+            || self.is_type_specifier()
+        {
+            self.pos = save_pos;
+            self.attrs = save_attrs;
+            self.exit_parser_frame();
+            return None;
         }
 
-        // Check for nested: (* (...))
-        if matches!(self.peek(), TokenKind::LParen) {
-            if let Some(inner) = self.try_parse_paren_abstract_declarator() {
-                match inner {
-                    ParenAbstractDecl::Simple {
-                        ptr_depth: inner_ptrs,
-                        array_dims: inner_dims,
-                    } => {
-                        // After inner (*), check if a parameter list follows — making this
-                        // a nested function pointer: (*(*)(params))
-                        if matches!(self.peek(), TokenKind::LParen) {
-                            // This is a function pointer inside the outer parens
-                            // e.g., (*(*)(void*)) — inner (*) + (void*) forms a fn ptr
-                            let (params, variadic) = self.parse_param_list();
-                            // Now expect the closing ')' of the outer group
-                            if self.consume_if(&TokenKind::RParen) {
-                                return Some(ParenAbstractDecl::NestedFnPtr {
-                                    outer_ptr_depth: total_ptrs,
-                                    inner_ptr_depth: inner_ptrs,
-                                    inner_params: params,
-                                    inner_variadic: variadic,
-                                });
-                            } else {
-                                self.pos = save;
-                                return None;
-                            }
-                        }
-                        // Otherwise, handle as before: simple nested grouping
-                        let combined_ptrs = total_ptrs + inner_ptrs;
-                        let mut array_dims = inner_dims;
-                        while matches!(self.peek(), TokenKind::LBracket) {
-                            self.advance();
-                            let size = if matches!(self.peek(), TokenKind::RBracket) {
-                                None
-                            } else {
-                                Some(Box::new(self.parse_expr()))
-                            };
-                            self.expect(&TokenKind::RBracket);
-                            array_dims.push(size);
-                        }
-                        if self.consume_if(&TokenKind::RParen) {
-                            return Some(ParenAbstractDecl::Simple {
-                                ptr_depth: combined_ptrs,
-                                array_dims,
-                            });
-                        } else {
-                            self.pos = save;
-                            return None;
-                        }
-                    }
-                    ParenAbstractDecl::NestedFnPtr { .. } => {
-                        // Deeply nested fn ptrs: just close the outer group
-                        // TODO: support deeper nesting if needed
-                        if self.consume_if(&TokenKind::RParen) {
-                            return Some(inner);
-                        } else {
-                            self.pos = save;
-                            return None;
-                        }
-                    }
-                }
-            } else {
-                self.pos = save;
-                return None;
-            }
-        }
-
-        // Parse array dimensions after pointer(s): (*[3][4])
-        let mut array_dims = Vec::with_capacity(8);
-        while matches!(self.peek(), TokenKind::LBracket) {
-            self.advance();
-            let size = if matches!(self.peek(), TokenKind::RBracket) {
-                None
-            } else {
-                Some(Box::new(self.parse_expr()))
-            };
-            self.expect(&TokenKind::RBracket);
-            array_dims.push(size);
-        }
-
-        if self.consume_if(&TokenKind::RParen) {
-            if total_ptrs > 0 || !array_dims.is_empty() {
-                Some(ParenAbstractDecl::Simple {
-                    ptr_depth: total_ptrs,
-                    array_dims,
-                })
-            } else {
-                self.pos = save;
-                None
-            }
+        let inner = self.parse_abstract_declarator_level(ptr_budget);
+        if !inner.is_empty() && self.consume_if(&TokenKind::RParen) {
+            self.exit_parser_frame();
+            Some(inner)
         } else {
-            self.pos = save;
+            self.pos = save_pos;
+            self.attrs = save_attrs;
+            *ptr_budget = save_budget;
+            self.exit_parser_frame();
             None
         }
     }

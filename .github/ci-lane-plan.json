@@ -1169,7 +1169,7 @@
     "frontend-b": {
       "group": "frontend",
       "mode": "steps",
-      "predicted_gate_seconds": 348.41,
+      "predicted_gate_seconds": 348.59,
       "shards": 2,
       "steps": [
         {
@@ -1423,6 +1423,10 @@
         {
           "measured_s": 0.92,
           "name": "Compound literal as a designated aggregate element"
+        },
+        {
+          "measured_s": 0.18,
+          "name": "GAS character literals and quoted macro defaults across assemblers"
         },
         {
           "measured_s": 0.34,

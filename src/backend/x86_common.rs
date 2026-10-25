@@ -385,14 +385,14 @@ pub(crate) fn substitute_x86_asm_operands(
 /// phase 1f, where an empty address is always a bug.
 pub(crate) fn assert_memory_operands_resolved(operands: &[AsmOperand], arch: &str) {
     for (i, op) in operands.iter().enumerate() {
-        if matches!(op.kind, AsmOperandKind::Memory) && op.mem_addr.is_empty() {
-            panic!(
-                "{arch} inline asm: memory operand {i} (name {:?}, constraint {:?}) still has \
-                 no address after operand resolution; substituting it would print an empty \
-                 operand and emit a truncated instruction",
-                op.name, op.constraint,
-            );
-        }
+        assert!(
+            !matches!(op.kind, AsmOperandKind::Memory) || !op.mem_addr.is_empty(),
+            "{arch} inline asm: memory operand {i} (name {:?}, constraint {:?}) still has \
+             no address after operand resolution; substituting it would print an empty \
+             operand and emit a truncated instruction",
+            op.name,
+            op.constraint,
+        );
     }
 }
 

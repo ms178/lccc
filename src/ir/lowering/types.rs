@@ -863,9 +863,18 @@ impl Lowerer {
                     if !after_dims.is_empty() {
                         after_dims
                     } else if has_func_ptr {
-                        // For function pointer arrays, array dims come BEFORE the
-                        // Pointer+FunctionPointer group (e.g., [Array(3), Pointer, FuncPtr])
-                        derived[..lpp]
+                        // For legacy `[Array(3), Pointer, FuncPtr]` encodings, outer
+                        // array dims sit immediately before the syntax-marker `Pointer`
+                        // with NO return-type `Pointer` after them. In contrast, for
+                        // `int (*(*fp)(int))[4]` (`[Array(4), Pointer(ret), Pointer(syntax), FuncPtr]`),
+                        // `Array(4)` precedes `Pointer(ret)` and belongs to the return
+                        // type, not the variable's own array dimensions.
+                        let prefix = &derived[..lpp];
+                        let outer_start = prefix
+                            .iter()
+                            .rposition(|d| matches!(d, DerivedDeclarator::Pointer(_)))
+                            .map_or(0, |p| p + 1);
+                        prefix[outer_start..]
                             .iter()
                             .filter_map(|d| {
                                 if let DerivedDeclarator::Array(size_expr) = d {
@@ -888,6 +897,9 @@ impl Lowerer {
                     // the variable's own dimensions.
                     self.collect_derived_array_dims(derived)
                 };
+                if array_dims.is_empty() {
+                    return (ptr_sz, ptr_sz, false, true, vec![]);
+                }
                 let resolved_dims: Vec<usize> =
                     array_dims.iter().map(|d| d.unwrap_or(256)).collect();
                 let total_size: usize = resolved_dims.iter().product::<usize>() * ptr_sz;

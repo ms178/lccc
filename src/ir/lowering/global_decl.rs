@@ -186,9 +186,10 @@ impl Lowerer {
                 continue;
             }
             let mut resolved_ctype = self.build_full_ctype(&decl.type_spec, &declarator.derived);
-            crate::common::type_builder::apply_declaration_address_space(
+            crate::common::type_builder::apply_declaration_address_space_for_object(
                 &mut resolved_ctype,
                 self.declaration_address_space(decl.address_space, &decl.type_spec),
+                &declarator.derived,
             );
             if !resolved_ctype.is_vector() {
                 if let Some(vector_ctype) = decl.resolve_vector_ctype(resolved_ctype.clone()) {

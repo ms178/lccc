@@ -68,18 +68,65 @@ pub(super) fn callee_saved_name(reg: PhysReg) -> &'static str {
 }
 
 /// Scan inline asm instructions in a function and collect any callee-saved
-/// registers that are used via specific constraints or listed in clobbers.
+/// registers that are used via specific constraints, listed in clobbers, or
+/// reachable when GP/memory scratch demand overflows `RISCV_GP_SCRATCH`.
 pub(super) fn collect_inline_asm_callee_saved_riscv(func: &IrFunction, used: &mut Vec<PhysReg>) {
-    crate::backend::generation::collect_inline_asm_callee_saved(
+    const ALL_RISCV_CALLEE_SAVED: [PhysReg; 11] = [
+        PhysReg(1),
+        PhysReg(2),
+        PhysReg(3),
+        PhysReg(4),
+        PhysReg(5),
+        PhysReg(6),
+        PhysReg(7),
+        PhysReg(8),
+        PhysReg(9),
+        PhysReg(10),
+        PhysReg(11),
+    ];
+    fn caller_scratch_slot_by_name(name: &str) -> Option<usize> {
+        let name = crate::backend::inline_asm::normalize_inline_asm_reg_name(name);
+        match name {
+            "t0" | "x5" => Some(0),
+            "t1" | "x6" => Some(1),
+            "t2" | "x7" => Some(2),
+            "t3" | "x28" => Some(3),
+            "t4" | "x29" => Some(4),
+            "t5" | "x30" => Some(5),
+            "t6" | "x31" => Some(6),
+            "a2" | "x12" => Some(7),
+            "a3" | "x13" => Some(8),
+            "a4" | "x14" => Some(9),
+            "a5" | "x15" => Some(10),
+            "a6" | "x16" => Some(11),
+            "a7" | "x17" => Some(12),
+            "a0" | "x10" => Some(13),
+            "a1" | "x11" => Some(14),
+            _ => None,
+        }
+    }
+    fn constraint_to_caller_scratch(c: &str) -> Option<usize> {
+        if c.starts_with('{') && c.ends_with('}') {
+            return caller_scratch_slot_by_name(&c[1..c.len() - 1]);
+        }
+        caller_scratch_slot_by_name(c)
+    }
+    crate::backend::stack_layout::collect_inline_asm_callee_saved_with_overflow(
         func,
         used,
         constraint_to_callee_saved_riscv,
         riscv_reg_to_callee_saved,
+        constraint_to_caller_scratch,
+        caller_scratch_slot_by_name,
+        |_| false,
+        &ALL_RISCV_CALLEE_SAVED,
+        15,
     );
 }
 
 /// Map a RISC-V register name to its PhysReg index, if it is callee-saved.
 fn riscv_reg_to_callee_saved(name: &str) -> Option<PhysReg> {
+    let name = crate::backend::inline_asm::normalize_inline_asm_reg_name(name);
     match name {
         "s1" | "x9" => Some(PhysReg(1)),
         "s2" | "x18" => Some(PhysReg(2)),

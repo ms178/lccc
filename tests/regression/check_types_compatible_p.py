@@ -102,16 +102,29 @@ def expand(text):
     return text
 
 
-def answer(cc, tmp, rid, prefix, left, right, extra_decls=""):
+def answer(cc, tmp, rid, prefix, left, right, extra_decls="", check_sema_expect=None):
     """Compile and run one row; return the printed answer or raise."""
     src = tmp / f"{rid}.c"
     decls = "" if prefix.strip() == "-" else expand(prefix) + "\n"
     body = PRELUDE + expand(extra_decls) + decls
     if decls:
         body += "\n"
+    exp_left = expand(left)
+    exp_right = expand(right)
+    static_assert_line = (
+        f"    _Static_assert(__builtin_types_compatible_p({exp_left}, {exp_right}) "
+        f"== {check_sema_expect}, \"sema const_eval mismatch\");\n"
+        if check_sema_expect is not None
+        else ""
+    )
     body += (
-        "int main(void)\n{\n    printf(\"%d\\n\",\n        "
-        f"__builtin_types_compatible_p({expand(left)}, {expand(right)}));\n"
+        "int main(void)\n{\n"
+        + static_assert_line
+        + f"    int sema_arr[__builtin_types_compatible_p({exp_left}, {exp_right}) ? 2 : 1];\n"
+        "    int sema_ans = (int)(sizeof(sema_arr) / sizeof(int)) - 1;\n"
+        f"    int rt_ans = __builtin_types_compatible_p({exp_left}, {exp_right});\n"
+        "    if (sema_ans != rt_ans) return 3;\n"
+        "    printf(\"%d\\n\", rt_ans);\n"
         "    return 0;\n}\n"
     )
     src.write_text(body)
@@ -145,7 +158,9 @@ def main():
         for rid, expect, prefix, left, right in cases:
             got = {}
             for name, cc in (("oracle", args.gcc), ("lccc", args.compiler)):
-                value, err = answer(cc, tmp, f"{rid}.{name}", prefix, left, right)
+                value, err = answer(
+                    cc, tmp, f"{rid}.{name}", prefix, left, right, check_sema_expect=expect
+                )
                 if err is not None:
                     failures.append(f"{rid}: {name} {value}: {err}")
                     got[name] = None

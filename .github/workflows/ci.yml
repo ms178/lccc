@@ -896,6 +896,13 @@ jobs:
       run: env GCC=gcc-16 CCC=target/fastbuild/lccc python3 tests/regression/check_types_compatible_p.py
     - name: Compound literal as a designated aggregate element
       run: env GCC=gcc-16 CCC=target/fastbuild/lccc python3 tests/regression/check_compound_literal_element.py
+    - name: GAS character literals and quoted macro defaults across assemblers
+      run: |
+        env CCC=target/fastbuild/lccc \
+            CCC_I686=target/fastbuild/lccc-i686 \
+            CCC_ARM=target/fastbuild/lccc-arm \
+            CCC_RISCV=target/fastbuild/lccc-riscv \
+            python3 tests/regression/check_asm_char_and_macro_defaults.py
     - name: Debug knobs are neutral
       run: env CCC=target/fastbuild/lccc python3 tests/regression/check_debug_knobs_neutral.py
     - name: Verify binary-equivalence attribution contracts

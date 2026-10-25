@@ -4987,13 +4987,23 @@ fn inline_call_site(
         .map(|block| block.label.0)
         .max()
         .unwrap_or(0);
-    let label_base = (*global_max_block_id)
-        .max(caller_max_label)
-        .saturating_add(1);
-    if label_base == u32::MAX {
-        // Fail closed: an inline that cannot mint labels must not clone blocks.
-        // (Dense assignment makes this unreachable in practice -- labels grow by
-        // the number of cloned blocks, not by the label value.)
+    // Reserve `label_base` plus at least `callee.blocks.len() + 1` dense slots
+    // (every callee block + the post-call merge block) strictly below `u32::MAX`
+    // so `caller.next_label` can still advance past `merge_block_id` without
+    // saturating at `u32::MAX`. `LabelMap` also checks every individual mint
+    // in case a callee terminator names an undefined block label.
+    let Some(label_base) = (*global_max_block_id).max(caller_max_label).checked_add(1) else {
+        return false;
+    };
+    let min_labels_needed = u32::try_from(callee.blocks.len())
+        .ok()
+        .and_then(|n| n.checked_add(1));
+    if min_labels_needed
+        .and_then(|n| label_base.checked_add(n))
+        .is_none()
+    {
+        // Fail closed: an inline that cannot mint collision-free labels and
+        // leave headroom for `caller.next_label` must not clone blocks.
         return false;
     }
 
@@ -5175,6 +5185,9 @@ fn inline_call_site(
     // the clone minted and above anything the caller already had — including the
     // labels of any later clone in this caller that mints from `next_label`.
     let merge_block_id = labels.assign_fresh();
+    if labels.overflowed {
+        return false;
+    }
 
     // Collect return values from all return blocks to build a Phi node.
     // Each Return(Some(val)) becomes a branch to the merge block, and
@@ -5790,6 +5803,7 @@ fn remap_value(v: Value, offset: u32) -> Value {
 /// still gets its own fresh label rather than aliasing a live block.
 struct LabelMap {
     next: u32,
+    overflowed: bool,
     map: FxHashMap<u32, BlockId>,
 }
 
@@ -5797,6 +5811,7 @@ impl LabelMap {
     fn new(base: u32) -> Self {
         Self {
             next: base,
+            overflowed: false,
             map: FxHashMap::default(),
         }
     }
@@ -5819,9 +5834,14 @@ impl LabelMap {
     }
 
     /// A brand-new label, which is above every label the clone will use.
+    /// Records `overflowed` instead of panicking/wrapping if `u32::MAX` is
+    /// reached so the caller can abort before mutating the CFG.
     fn assign_fresh(&mut self) -> BlockId {
         let id = BlockId(self.next);
-        self.next += 1;
+        match self.next.checked_add(1) {
+            Some(next) => self.next = next,
+            None => self.overflowed = true,
+        }
         id
     }
 }
@@ -9674,5 +9694,16 @@ mod sroa_unlock_tests {
             }],
         );
         assert!(!admitted(&used));
+    }
+
+    #[test]
+    fn label_map_records_overflow_at_u32_max_without_wrapping() {
+        let mut lm = LabelMap::new(u32::MAX - 1);
+        assert_eq!(lm.assign(BlockId(10)), BlockId(u32::MAX - 1));
+        assert!(!lm.overflowed);
+        assert_eq!(lm.get(BlockId(10)), BlockId(u32::MAX - 1));
+        assert!(!lm.overflowed);
+        assert_eq!(lm.assign_fresh(), BlockId(u32::MAX));
+        assert!(lm.overflowed);
     }
 }

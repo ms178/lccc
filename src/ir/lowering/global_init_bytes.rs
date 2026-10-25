@@ -425,8 +425,25 @@ impl Lowerer {
         }
     }
 
-    /// The braced list inside a compound literal value, with any enclosing
-    /// cast removed, or `None` when `init` is not a compound literal.
+    /// Byte offset contributed by the designator indices AFTER the first one,
+    /// walking the still-nested array dimensions.  `strides[i]` is the stride of
+    /// the dimension being entered; once the dimensions run out the innermost
+    /// stride is the struct size itself.
+    pub(super) fn sub_element_byte_offset(
+        sub_indices: &[usize],
+        strides: &[usize],
+        struct_size: usize,
+    ) -> usize {
+        let mut offset = 0usize;
+        for (i, &idx) in sub_indices.iter().enumerate() {
+            let stride = strides.get(i).copied().unwrap_or(struct_size);
+            offset += idx * stride;
+        }
+        offset
+    }
+
+    /// The braced list inside a compound literal value, or `None` when `init`
+    /// is not a compound literal with a braced initializer list.
     ///
     /// `(T){ a, b }` is an lvalue of type `T` (C11 6.5.2.5p5), and in a static
     /// initializer it names exactly the bytes the braced list `{ a, b }` names,
@@ -453,36 +470,6 @@ impl Lowerer {
     /// in tests/regression/compound_literal_element/).  A qualified literal
     /// `(const T){ ... }` is still a compound literal -- the qualifier is part
     /// of the literal's type, not a cast around it.
-    /// The `Field` designator of an initializer item, if it carries one
-    /// (`[idx].field = value`), cloned so the caller can keep borrowing the
-    /// layout while it looks the field up.
-    fn field_designator_name(item: &InitializerItem) -> Option<String> {
-        item.designators.iter().find_map(|d| {
-            if let Designator::Field(name) = d {
-                Some(name.clone())
-            } else {
-                None
-            }
-        })
-    }
-
-    /// Byte offset contributed by the designator indices AFTER the first one,
-    /// walking the still-nested array dimensions.  `strides[i]` is the stride of
-    /// the dimension being entered; once the dimensions run out the innermost
-    /// stride is the struct size itself.
-    fn sub_element_byte_offset(
-        sub_indices: &[usize],
-        strides: &[usize],
-        struct_size: usize,
-    ) -> usize {
-        let mut offset = 0usize;
-        for (i, &idx) in sub_indices.iter().enumerate() {
-            let stride = strides.get(i).copied().unwrap_or(struct_size);
-            offset += idx * stride;
-        }
-        offset
-    }
-
     pub(super) fn compound_literal_items<'a>(
         &self,
         init: &'a Initializer,
@@ -501,10 +488,11 @@ impl Lowerer {
         }
     }
 
-    /// The inner expression of a scalar compound literal (`(T)value`), with any
-    /// enclosing cast removed, or `None`.  The aggregate paths treat `(T)value`
-    /// as a positional value for the object's first member; `(T){ ... }` is a
-    /// braced list and is answered by [`Self::compound_literal_items`].
+    /// The inner expression of a scalar compound literal (`(T){ value }`), or
+    /// `None` when `init` is not a single-expression compound literal.  The
+    /// aggregate paths treat `(T){ value }` as a positional value for the
+    /// object's first member; `(T){ a, b }` is a braced list and is answered
+    /// by [`Self::compound_literal_items`].
     pub(super) fn compound_literal_expr<'a>(&self, init: &'a Initializer) -> Option<&'a Expr> {
         let Initializer::Expr(expr) = init else {
             return None;
@@ -757,17 +745,30 @@ impl Lowerer {
         bytes: &mut [u8],
         field_offset: usize,
     ) -> usize {
+        let zero_subobject = |bytes: &mut [u8]| {
+            let end = field_offset
+                .saturating_add(sub_layout.size)
+                .min(bytes.len());
+            if field_offset < end {
+                bytes[field_offset..end].fill(0);
+            }
+        };
         match &items[0].init {
             Initializer::List(sub_items) => {
+                // C11 6.7.9p19: a braced initializer for a composite subobject
+                // replaces any earlier initializer for that subobject, implicitly
+                // zeroing fields omitted from the new list.
+                zero_subobject(bytes);
                 self.fill_struct_global_bytes(sub_items, sub_layout, bytes, field_offset);
                 1
             }
             Initializer::Expr(_) => {
-                // Unwrap compound literal: (type){ init_list } -> use inner
-                // init_list.  `compound_literal_items` is used rather than a
-                // direct match so a cast around the literal (`(const T){ ... }`,
-                // `(T)(T){ ... }`) names the same bytes.
+                // Unwrap compound literal: `(T){ init_list }` names the same
+                // subobject image as `{ init_list }` (C11 6.5.2.5p5, 6.7.9p19).
+                // Qualified literals `(const T){ ... }` are still `CompoundLiteral`;
+                // cast expressions `(T)(T){ ... }` are deliberately excluded.
                 if let Some(cl_items) = self.compound_literal_items(&items[0].init) {
+                    zero_subobject(bytes);
                     self.fill_struct_global_bytes(cl_items, sub_layout, bytes, field_offset);
                     return 1;
                 }
@@ -1521,142 +1522,33 @@ impl Lowerer {
         while item_idx < items.len() {
             let item = &items[item_idx];
 
-            // Check for multi-dimensional index designators: [i][j]...
-            // Collect all Index designators to compute the correct element index at this level
-            let index_designators: Vec<usize> = item
+            // Split designators into leading array indices (`[i][j]...`) and any
+            // trailing member/sub-array designators (`.field`, `.arr[k]`, `.n.x`).
+            // Taking only the leading `Index` prefix avoids conflating a nested
+            // array-field index like `[1].arr[2]` with a second outer dimension.
+            let leading_index_count = item
                 .designators
                 .iter()
-                .filter_map(|d| {
-                    if let Designator::Index(idx_expr) = d {
-                        self.eval_const_expr(idx_expr).and_then(|c| c.to_usize())
-                    } else {
-                        None
+                .take_while(|d| matches!(d, Designator::Index(_)))
+                .count();
+            let mut index_designators = Vec::with_capacity(leading_index_count);
+            for d in &item.designators[..leading_index_count] {
+                if let Designator::Index(idx_expr) = d {
+                    if let Some(idx) = self.eval_const_expr(idx_expr).and_then(|c| c.to_usize()) {
+                        index_designators.push(idx);
                     }
-                })
-                .collect();
+                }
+            }
+            let trailing_designators = &item.designators[leading_index_count..];
 
             let has_index_designator = !index_designators.is_empty();
             if has_index_designator {
-                // For multi-dim designators like [i][j], the first index selects at this level,
-                // and remaining indices drill into sub-dimensions.
                 current_idx = index_designators[0];
-
-                // If there are extra index designators beyond the first, we need to compute
-                // a byte offset within this_stride and recurse or write directly.
-                if index_designators.len() > 1 && !remaining_strides.is_empty() {
-                    let elem_offset = base_offset + current_idx * this_stride;
-                    // `[i][j]...`: the first index selected at this level, so the
-                    // sub-offset and the remaining strides come from the rest.
-                    let sub_byte_offset = Self::sub_element_byte_offset(
-                        &index_designators[1..],
-                        remaining_strides,
-                        struct_size,
-                    );
-                    let sub_strides = &remaining_strides
-                        [(index_designators.len() - 1).min(remaining_strides.len())..];
-
-                    // Handle field designator for [i][j].field = val
-                    let field_designator_name = Self::field_designator_name(item);
-
-                    // `[i][j] = (T){ ... }`: the compound literal names the
-                    // element's bytes (C11 6.5.2.5p5), so fill the element from
-                    // its braced list.  Handing the literal to the scalar
-                    // evaluator below either rejects the program or writes it
-                    // into the element's first member (see
-                    // `compound_literal_items`).
-                    if let Some(cl_items) = self.compound_literal_items(&item.init) {
-                        self.fill_struct_global_bytes(
-                            cl_items,
-                            layout,
-                            bytes,
-                            elem_offset + sub_byte_offset,
-                        );
-                        item_idx += 1;
-                        current_idx += 1;
-                        continue;
-                    }
-
-                    match &item.init {
-                        Initializer::Expr(expr) => {
-                            if let Some(ref fname) = field_designator_name {
-                                if let Some(val) = self.eval_const_expr(expr) {
-                                    if let Some(field) =
-                                        layout.fields.iter().find(|f| &f.name == fname)
-                                    {
-                                        let field_ir_ty = IrType::from_ctype(&field.ty);
-                                        let write_offset =
-                                            elem_offset + sub_byte_offset + field.offset;
-                                        if let (Some(bo), Some(bw)) =
-                                            (field.bit_offset, field.bit_width)
-                                        {
-                                            self.write_bitfield_to_bytes(
-                                                bytes,
-                                                write_offset,
-                                                &val,
-                                                field_ir_ty,
-                                                bo,
-                                                bw,
-                                            );
-                                        } else if write_offset + field_ir_ty.size() <= bytes.len() {
-                                            self.write_const_to_bytes(
-                                                bytes,
-                                                write_offset,
-                                                &val,
-                                                field_ir_ty,
-                                            );
-                                        }
-                                    }
-                                }
-                            } else {
-                                // Scalar value at the computed sub-position
-                                if let Some(_val) = self.eval_const_expr(expr) {
-                                    let write_offset = elem_offset + sub_byte_offset;
-                                    // Write struct fields sequentially from this position
-                                    self.fill_struct_global_bytes(
-                                        std::slice::from_ref(item),
-                                        layout,
-                                        bytes,
-                                        write_offset,
-                                    );
-                                }
-                            }
-                        }
-                        Initializer::List(sub_items) => {
-                            let write_offset = elem_offset + sub_byte_offset;
-                            // Recurse whenever there are still array dimensions left.
-                            // Do not require sub-stride > struct_size: dimensions of
-                            // extent [1] have sub-stride == struct_size and still need
-                            // one extra brace level peeled (Regehr yarpgen
-                            // *_singleton_inner_dim_* tests).
-                            if !sub_strides.is_empty() {
-                                self.fill_multidim_struct_array_bytes(
-                                    sub_items,
-                                    layout,
-                                    struct_size,
-                                    sub_strides,
-                                    bytes,
-                                    write_offset,
-                                    sub_strides[0],
-                                );
-                            } else {
-                                self.fill_struct_global_bytes(
-                                    sub_items,
-                                    layout,
-                                    bytes,
-                                    write_offset,
-                                );
-                            }
-                        }
-                    }
-                    item_idx += 1;
-                    current_idx += 1;
-                    continue;
-                }
             }
 
             if current_idx >= num_elems {
                 // Only skip items without a designator that would reset the index;
-                // designated items explicitly set current_idx above
+                // designated items explicitly set current_idx above.
                 if !has_index_designator {
                     break;
                 }
@@ -1664,16 +1556,134 @@ impl Lowerer {
                 continue;
             }
 
-            // Check for field designator: [idx].field = val
-            let field_designator_name = Self::field_designator_name(item);
+            if index_designators.len() > 1 && !remaining_strides.is_empty() {
+                let elem_offset = base_offset + current_idx * this_stride;
+                // `[i][j]...`: the first index selected at this level, so the
+                // sub-offset and the remaining strides come from the rest.
+                let sub_byte_offset = Self::sub_element_byte_offset(
+                    &index_designators[1..],
+                    remaining_strides,
+                    struct_size,
+                );
+                let sub_strides = &remaining_strides
+                    [(index_designators.len() - 1).min(remaining_strides.len())..];
+                let write_offset = elem_offset + sub_byte_offset;
+
+                if sub_byte_offset >= this_stride || write_offset >= bytes.len() {
+                    item_idx += 1;
+                    continue;
+                }
+
+                // `[i][j].field = ...` (scalar, braced list, or compound literal):
+                // forward the trailing member designator chain to the leaf struct
+                // filler so sub-members are updated in place without overwriting
+                // sibling fields of element `[i][j]`.
+                if !trailing_designators.is_empty() {
+                    let sub_item = InitializerItem {
+                        designators: trailing_designators.to_vec(),
+                        init: item.init.clone(),
+                    };
+                    self.fill_struct_global_bytes(
+                        std::slice::from_ref(&sub_item),
+                        layout,
+                        bytes,
+                        write_offset,
+                    );
+                    item_idx += 1;
+                    continue;
+                }
+
+                let target_size = if index_designators.len() - 1 <= remaining_strides.len() {
+                    remaining_strides
+                        .get(index_designators.len() - 2)
+                        .copied()
+                        .unwrap_or(struct_size)
+                } else {
+                    struct_size
+                };
+
+                // `[i][j] = (T){ ... }`: whole-element compound literal (C11 6.5.2.5p5).
+                // Zero the replaced element image first per C11 6.7.9p19.
+                if let Some(cl_items) = self.compound_literal_items(&item.init) {
+                    let clear_end = write_offset.saturating_add(struct_size).min(bytes.len());
+                    bytes[write_offset..clear_end].fill(0);
+                    self.fill_struct_global_bytes(cl_items, layout, bytes, write_offset);
+                    item_idx += 1;
+                    current_idx += 1;
+                    continue;
+                }
+
+                match &item.init {
+                    Initializer::Expr(expr) => {
+                        if self.eval_const_expr(expr).is_some() {
+                            let stripped = InitializerItem {
+                                designators: vec![],
+                                init: item.init.clone(),
+                            };
+                            self.fill_struct_global_bytes(
+                                std::slice::from_ref(&stripped),
+                                layout,
+                                bytes,
+                                write_offset,
+                            );
+                        }
+                    }
+                    Initializer::List(sub_items) => {
+                        let clear_end = write_offset.saturating_add(target_size).min(bytes.len());
+                        bytes[write_offset..clear_end].fill(0);
+                        // Recurse whenever there are still array dimensions left.
+                        // Do not require sub-stride > struct_size: dimensions of
+                        // extent [1] have sub-stride == struct_size and still need
+                        // one extra brace level peeled (Regehr yarpgen
+                        // *_singleton_inner_dim_* tests).
+                        if !sub_strides.is_empty() {
+                            self.fill_multidim_struct_array_bytes(
+                                sub_items,
+                                layout,
+                                struct_size,
+                                sub_strides,
+                                bytes,
+                                write_offset,
+                                sub_strides[0],
+                            );
+                        } else {
+                            self.fill_struct_global_bytes(sub_items, layout, bytes, write_offset);
+                        }
+                    }
+                }
+                item_idx += 1;
+                current_idx += 1;
+                continue;
+            }
 
             let elem_offset = base_offset + current_idx * this_stride;
 
-            // `[i] = (T){ ... }`: same rule as the multi-index case above --
-            // the compound literal names the element's bytes, so fill the
-            // element from its braced list instead of asking the scalar
-            // evaluator to fold the literal.
+            // `[idx].field = ...` (scalar, braced list, or compound literal):
+            // delegate trailing designators to `fill_struct_global_bytes` so a
+            // sub-member compound literal like `[1].n = (pair_t){ 11, 22 }`
+            // initializes `.n` rather than replacing the entire element `[1]`.
+            if !trailing_designators.is_empty() {
+                let sub_item = InitializerItem {
+                    designators: trailing_designators.to_vec(),
+                    init: item.init.clone(),
+                };
+                self.fill_struct_global_bytes(
+                    std::slice::from_ref(&sub_item),
+                    layout,
+                    bytes,
+                    elem_offset,
+                );
+                item_idx += 1;
+                continue;
+            }
+
+            // `[i] = (T){ ... }`: whole-element compound literal (C11 6.5.2.5p5).
+            // Zero the replaced element image first per C11 6.7.9p19.
             if let Some(cl_items) = self.compound_literal_items(&item.init) {
+                let clear_end = elem_offset.saturating_add(struct_size).min(bytes.len());
+                if elem_offset < clear_end {
+                    bytes[elem_offset..clear_end].fill(0);
+                }
                 self.fill_struct_global_bytes(cl_items, layout, bytes, elem_offset);
                 item_idx += 1;
                 current_idx += 1;
@@ -1682,6 +1692,10 @@ impl Lowerer {
 
             match &item.init {
                 Initializer::List(sub_items) => {
+                    let clear_end = elem_offset.saturating_add(this_stride).min(bytes.len());
+                    if elem_offset < clear_end {
+                        bytes[elem_offset..clear_end].fill(0);
+                    }
                     // Recurse whenever we're not at the innermost dimension yet.
                     // For inner extent 1, stride equals struct_size but brace nesting
                     // still corresponds to a sub-array level.
@@ -1703,72 +1717,42 @@ impl Lowerer {
                     }
                     item_idx += 1;
                 }
-                Initializer::Expr(expr) => {
-                    if let Some(ref fname) = field_designator_name {
-                        // [idx].field = val: write to specific field
-                        if let Some(val) = self.eval_const_expr(expr) {
-                            if let Some(field) = layout.fields.iter().find(|f| &f.name == fname) {
-                                let field_ir_ty = IrType::from_ctype(&field.ty);
-                                if let (Some(bo), Some(bw)) = (field.bit_offset, field.bit_width) {
-                                    self.write_bitfield_to_bytes(
-                                        bytes,
-                                        elem_offset + field.offset,
-                                        &val,
-                                        field_ir_ty,
-                                        bo,
-                                        bw,
-                                    );
-                                } else {
-                                    self.write_const_to_bytes(
-                                        bytes,
-                                        elem_offset + field.offset,
-                                        &val,
-                                        field_ir_ty,
-                                    );
-                                }
-                            }
-                        }
-                        item_idx += 1;
+                Initializer::Expr(_) => {
+                    // Flat init: consume items for struct fields sequentially.
+                    // Fill structs one by one across the entire region.
+                    let max_structs = if struct_size > 0 {
+                        region_size / struct_size
                     } else {
-                        // Flat init: consume items for struct fields sequentially.
-                        // Fill structs one by one across the entire region.
-                        let max_structs = if struct_size > 0 {
-                            region_size / struct_size
-                        } else {
-                            0
-                        };
-                        let flat_struct_base = (elem_offset - base_offset) / struct_size;
-                        let mut fi = flat_struct_base;
-                        while item_idx < items.len() && fi < max_structs {
-                            let byte_off = base_offset + fi * struct_size;
-                            if byte_off + struct_size > bytes.len() {
-                                break;
-                            }
-                            let consumed = self.fill_struct_global_bytes(
-                                &items[item_idx..],
-                                layout,
-                                bytes,
-                                byte_off,
-                            );
-                            item_idx += consumed.max(1);
-                            fi += 1;
+                        0
+                    };
+                    let flat_struct_base = (elem_offset - base_offset) / struct_size;
+                    let mut fi = flat_struct_base;
+                    while item_idx < items.len() && fi < max_structs {
+                        let byte_off = base_offset + fi * struct_size;
+                        if byte_off + struct_size > bytes.len() {
+                            break;
                         }
-                        // Keep array position in sync with the flat walk. Without
-                        // this, excess trailing scalar initializers are reprocessed
-                        // at the previous index and overwrite the last valid element
-                        // (Regehr yarpgen regress_struct_array_excess_scalar_init:
-                        // struct s a[3] = {{}, {}, 4, 6} must keep a[2] == 4, the
-                        // trailing 6 is excess and must be skipped).
-                        current_idx = fi;
-                        // Skip the normal current_idx increment since we consumed everything
-                        continue;
+                        let consumed = self.fill_struct_global_bytes(
+                            &items[item_idx..],
+                            layout,
+                            bytes,
+                            byte_off,
+                        );
+                        item_idx += consumed.max(1);
+                        fi += 1;
                     }
+                    // Keep array position in sync with the flat walk. Without
+                    // this, excess trailing scalar initializers are reprocessed
+                    // at the previous index and overwrite the last valid element
+                    // (Regehr yarpgen regress_struct_array_excess_scalar_init:
+                    // struct s a[3] = {{}, {}, 4, 6} must keep a[2] == 4, the
+                    // trailing 6 is excess and must be skipped).
+                    current_idx = fi;
+                    // Skip the normal current_idx increment since we consumed everything
+                    continue;
                 }
             }
-            // Only advance current_idx if no field designator (sequential init)
-            if field_designator_name.is_none() {
-                current_idx += 1;
-            }
+            current_idx += 1;
         }
     }
 

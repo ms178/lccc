@@ -8,9 +8,14 @@ use crate::backend::state::CodegenState;
 use crate::common::types::IrType;
 use crate::ir::reexports::{BlockId, IrConst, Operand, Value};
 
-/// AArch64 scratch registers for inline asm (caller-saved temporaries).
+/// AArch64 GP scratch registers for inline asm:
+/// - 17 caller-saved registers first (`x9..x15`, `x0..x8`, `x16`; `x17` stays reserved
+///   for 128-bit vector pointer staging, and `x18` [platform register], `x29` [FP],
+///   `x30` [LR] are never touched),
+/// - followed by 10 callee-saved registers (`x19..x28`) for extreme-pressure overflow.
 pub(super) const ARM_GP_SCRATCH: &[&str] = &[
-    "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x19", "x20", "x21",
+    "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7",
+    "x8", "x16", "x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x27", "x28",
 ];
 /// AArch64 FP/SIMD scratch registers for inline asm (d8-d15 are callee-saved,
 /// d16-d31 are caller-saved; we use v16+ as scratch to avoid save/restore).
@@ -129,83 +134,149 @@ impl InlineAsmEmitter for ArmCodegen {
         }
     }
 
+    fn fallback_scratch_reg(&mut self, kind: &AsmOperandKind) -> String {
+        match kind {
+            AsmOperandKind::FpReg => "v16".to_string(),
+            _ => "x9".to_string(),
+        }
+    }
+
     fn resolve_memory_operand(
         &mut self,
         op: &mut AsmOperand,
         val: &Operand,
         excluded: &[String],
-    ) -> bool {
+    ) -> Option<String> {
         if !op.mem_addr.is_empty() || op.mem_offset != 0 {
-            return false;
+            return None;
         }
+        let alloc_gp_tmp = |this: &mut Self| -> String {
+            let mut r = this.assign_scratch_reg(&AsmOperandKind::GpReg, excluded);
+            if r.is_empty() {
+                r = this.fallback_scratch_reg(&AsmOperandKind::GpReg);
+            }
+            if r == "x0" {
+                this.state.reg_cache.invalidate_acc();
+            }
+            r
+        };
         // Each memory operand gets its own unique register via assign_scratch_reg,
         // so multiple "=m" outputs don't overwrite each other's addresses.
         match val {
             Operand::Value(v) => {
                 if let Some(slot) = self.state.get_slot(v.0) {
-                    let tmp_reg = self.assign_scratch_reg(&AsmOperandKind::GpReg, excluded);
-                    self.emit_load_from_sp(&tmp_reg, slot.0, "ldr");
+                    let tmp_reg = alloc_gp_tmp(self);
+                    if self.state.is_alloca(v.0) {
+                        self.emit_alloca_addr(&tmp_reg, v.0, slot.0);
+                    } else if let Some(&phys) = self.reg_assignments.get(&v.0) {
+                        if !super::emit::is_arm_fp_phys(phys) {
+                            let src = super::emit::callee_saved_name(phys);
+                            if src != tmp_reg {
+                                self.state
+                                    .emit_fmt(format_args!("    mov {}, {}", tmp_reg, src));
+                            }
+                        } else {
+                            self.emit_load_from_sp(&tmp_reg, slot.0, "ldr");
+                        }
+                    } else {
+                        self.emit_load_from_sp(&tmp_reg, slot.0, "ldr");
+                    }
                     op.mem_addr = format!("[{}]", tmp_reg);
-                    return true;
+                    return Some(tmp_reg);
+                } else if let Some(&phys) = self.reg_assignments.get(&v.0) {
+                    let tmp_reg = alloc_gp_tmp(self);
+                    let src = super::emit::callee_saved_name(phys);
+                    if src != tmp_reg {
+                        self.state
+                            .emit_fmt(format_args!("    mov {}, {}", tmp_reg, src));
+                    }
+                    op.mem_addr = format!("[{}]", tmp_reg);
+                    return Some(tmp_reg);
+                } else if self.state.reg_cache.acc_has(v.0, false) {
+                    let tmp_reg = alloc_gp_tmp(self);
+                    if tmp_reg != "x0" {
+                        self.state.emit_fmt(format_args!("    mov {}, x0", tmp_reg));
+                    }
+                    op.mem_addr = format!("[{}]", tmp_reg);
+                    return Some(tmp_reg);
+                } else {
+                    assert!(
+                        !op.mem_addr.is_empty(),
+                        "aarch64 codegen: inline-asm memory operand value {} has neither \
+                         stack slot nor register assignment",
+                        v.0
+                    );
                 }
             }
             Operand::Const(c) => {
-                // Constant address (e.g., from MMIO reads at compile-time constant addresses).
-                // Copy propagation can replace Value operands with Const in inline asm inputs.
-                // Load the constant into a scratch register for indirect addressing.
                 if let Some(addr) = c.to_i64() {
-                    let tmp_reg = self.assign_scratch_reg(&AsmOperandKind::GpReg, excluded);
+                    let tmp_reg = alloc_gp_tmp(self);
                     self.emit_load_imm64(&tmp_reg, addr);
                     op.mem_addr = format!("[{}]", tmp_reg);
-                    return true;
+                    return Some(tmp_reg);
                 }
             }
         }
-        false
+        None
     }
 
     fn assign_scratch_reg(&mut self, kind: &AsmOperandKind, excluded: &[String]) -> String {
         if matches!(kind, AsmOperandKind::FpReg) {
-            // Safety: limit iterations to avoid infinite loop if all regs are excluded
-            for _ in 0..32 {
-                let idx = self.asm_fp_scratch_idx;
+            // Caller-saved SIMD scratch v16..v31 only (never v32+!).
+            const ARM_FP_ALL: &[&str] = &[
+                "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27",
+                "v28", "v29", "v30", "v31",
+            ];
+            while self.asm_fp_scratch_idx < ARM_FP_ALL.len() {
+                let reg = ARM_FP_ALL[self.asm_fp_scratch_idx];
                 self.asm_fp_scratch_idx += 1;
-                let reg = if idx < ARM_FP_SCRATCH.len() {
-                    ARM_FP_SCRATCH[idx].to_string()
-                } else {
-                    format!("v{}", 16 + idx)
-                };
-                if !excluded.iter().any(|e| e == &reg) {
-                    return reg;
+                if !excluded.iter().any(|e| e == reg) {
+                    return reg.to_string();
                 }
             }
-            // Fallback: return next register even if excluded
-            format!("v{}", 16 + self.asm_fp_scratch_idx)
+            for &r in ARM_FP_SCRATCH {
+                if !excluded.iter().any(|e| e == r) {
+                    return r.to_string();
+                }
+            }
+            String::new()
         } else {
-            loop {
+            // Walk ARM_GP_SCRATCH (17 caller-saved + 10 callee-saved x19..x28;
+            // never x18, x29, x30, or x31+), skipping live RA homes on the first pass.
+            while self.asm_scratch_idx < ARM_GP_SCRATCH.len() * 2 {
                 let idx = self.asm_scratch_idx;
                 self.asm_scratch_idx += 1;
-                let reg = if idx < ARM_GP_SCRATCH.len() {
-                    ARM_GP_SCRATCH[idx].to_string()
-                } else {
-                    format!("x{}", 9 + idx)
-                };
-                if !excluded.iter().any(|e| e == &reg) {
-                    // If this is a callee-saved register (x19-x28), ensure it is
-                    // saved/restored in the prologue/epilogue.
-                    let reg_num = reg.strip_prefix('x').and_then(|s| s.parse::<u8>().ok());
-                    if let Some(n) = reg_num {
-                        if (19..=28).contains(&n) {
-                            let phys = PhysReg(n);
-                            if !self.used_callee_saved.contains(&phys) {
-                                self.used_callee_saved.push(phys);
-                                self.used_callee_saved.sort_by_key(|r| r.0);
-                            }
+                let allow_ra_home = idx >= ARM_GP_SCRATCH.len();
+                let reg_name = ARM_GP_SCRATCH[idx % ARM_GP_SCRATCH.len()];
+                if excluded.iter().any(|e| {
+                    e == reg_name
+                        || reg_name
+                            .strip_prefix('x')
+                            .is_some_and(|n| e.strip_prefix('w') == Some(n))
+                }) {
+                    continue;
+                }
+                let in_ra = self.reg_assignments.values().any(|&p| {
+                    !super::emit::is_arm_fp_phys(p) && super::emit::callee_saved_name(p) == reg_name
+                });
+                if in_ra != allow_ra_home {
+                    continue;
+                }
+                if let Some(n) = reg_name
+                    .strip_prefix('x')
+                    .and_then(|s| s.parse::<u8>().ok())
+                {
+                    if (19..=28).contains(&n) {
+                        let phys = PhysReg(n);
+                        if !self.used_callee_saved.contains(&phys) {
+                            self.used_callee_saved.push(phys);
+                            self.used_callee_saved.sort_by_key(|r| r.0);
                         }
                     }
-                    return reg;
                 }
+                return reg_name.to_string();
             }
+            String::new()
         }
     }
 

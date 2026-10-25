@@ -97,7 +97,13 @@ pub fn strip_comment<'a>(line: &'a str, style: &CommentStyle) -> &'a str {
     while i < bytes.len() {
         if in_string {
             if bytes[i] == b'\\' {
-                i += 2; // skip escaped character
+                i += 1;
+                if i < bytes.len() {
+                    i += std::str::from_utf8(&bytes[i..])
+                        .ok()
+                        .and_then(|rest| rest.chars().next())
+                        .map_or(1, char::len_utf8);
+                }
                 continue;
             }
             if bytes[i] == b'"' {
@@ -110,6 +116,10 @@ pub fn strip_comment<'a>(line: &'a str, style: &CommentStyle) -> &'a str {
         if bytes[i] == b'"' {
             in_string = true;
             i += 1;
+            continue;
+        }
+        if bytes[i] == b'\'' {
+            i = crate::backend::asm_expr::skip_gas_char_literal(bytes, i);
             continue;
         }
         match style {
@@ -151,41 +161,52 @@ pub fn strip_comment<'a>(line: &'a str, style: &CommentStyle) -> &'a str {
     line
 }
 
-/// Split a line on `;` characters, respecting string literals and comments.
+/// Split a line on `;` characters, respecting string literals, GAS character
+/// literals, and comments.
 /// In GAS syntax, `;` separates multiple statements on the same line.
 /// Stops splitting once a line comment (`#` or `//`) is encountered outside strings,
 /// so semicolons inside comments are not treated as statement separators.
 pub fn split_on_semicolons(line: &str) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut in_string = false;
-    let mut escape = false;
-    let mut start = 0;
+    let mut start = 0usize;
     let bytes = line.as_bytes();
-    for (i, c) in line.char_indices() {
-        if escape {
-            escape = false;
-            continue;
-        }
-        if c == '\\' && in_string {
-            escape = true;
-            continue;
-        }
-        if c == '"' {
-            in_string = !in_string;
-            continue;
-        }
-        if !in_string {
-            // Stop splitting at # comment start
-            if c == '#' {
-                break;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if in_string {
+            if bytes[i] == b'\\' {
+                i += 1;
+                if i < bytes.len() {
+                    i += std::str::from_utf8(&bytes[i..])
+                        .ok()
+                        .and_then(|rest| rest.chars().next())
+                        .map_or(1, char::len_utf8);
+                }
+                continue;
             }
-            // Stop splitting at // comment start
-            if c == '/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
-                break;
+            if bytes[i] == b'"' {
+                in_string = false;
             }
-            if c == ';' {
+            i += 1;
+            continue;
+        }
+        match bytes[i] {
+            b'"' => {
+                in_string = true;
+                i += 1;
+            }
+            b'\'' => {
+                i = crate::backend::asm_expr::skip_gas_char_literal(bytes, i);
+            }
+            b'#' => break,
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'/' => break,
+            b';' => {
                 parts.push(&line[start..i]);
-                start = i + 1;
+                i += 1;
+                start = i;
+            }
+            _ => {
+                i += 1;
             }
         }
     }
@@ -778,6 +799,28 @@ fn is_macro_param_name(s: &str) -> bool {
 
 fn strip_arg_quotes(s: &str) -> &str {
     if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
+        let bytes = s.as_bytes();
+        let mut i = 1usize;
+        while i + 1 < bytes.len() {
+            if bytes[i] == b'\\' {
+                i += 1;
+                if i + 1 < bytes.len() {
+                    i += std::str::from_utf8(&bytes[i..])
+                        .ok()
+                        .and_then(|rest| rest.chars().next())
+                        .map_or(1, char::len_utf8);
+                } else {
+                    // Trailing backslash escapes the closing quote (`"foo\"`): not balanced.
+                    return s;
+                }
+                continue;
+            }
+            if bytes[i] == b'"' {
+                // Quote closed before end of token (e.g. `"a" + "b"`): keep both quotes.
+                return s;
+            }
+            i += 1;
+        }
         &s[1..s.len() - 1]
     } else {
         s
@@ -786,14 +829,42 @@ fn strip_arg_quotes(s: &str) -> &str {
 
 /// Index of the first `=` that separates a parameter name from its default.
 ///
-/// Ignores `=` inside parentheses and skips the comparison operators `==`,
-/// `!=`, `<=` and `>=` so an expression default is never split mid-operator.
+/// Ignores `=` inside parentheses, quoted strings, or character literals, and
+/// skips the comparison operators `==`, `!=`, `<=` and `>=` so an expression
+/// default or quoted positional argument is never split mid-token.
 fn find_toplevel_eq(s: &str) -> Option<usize> {
     let b = s.as_bytes();
     let mut depth = 0i32;
+    let mut in_string = false;
     let mut i = 0;
     while i < b.len() {
+        if in_string {
+            if b[i] == b'\\' {
+                i += 1;
+                if i < b.len() {
+                    i += std::str::from_utf8(&s.as_bytes()[i..])
+                        .ok()
+                        .and_then(|rest| rest.chars().next())
+                        .map_or(1, char::len_utf8);
+                }
+                continue;
+            }
+            if b[i] == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
         match b[i] {
+            b'"' => {
+                in_string = true;
+                i += 1;
+                continue;
+            }
+            b'\'' => {
+                i = crate::backend::asm_expr::skip_gas_char_literal(b, i);
+                continue;
+            }
             b'(' => depth += 1,
             b')' => depth -= 1,
             b'=' if depth == 0 => {
@@ -917,18 +988,79 @@ fn parse_macro_params(params_str: &str) -> Vec<MacroParam> {
             while look < bytes.len() && matches!(bytes[look], b' ' | b'\t') {
                 look += 1;
             }
-            let default_start = look;
+            let mut default_buf = String::new();
             let mut depth = 0i32;
+            let mut in_string = false;
             while look < bytes.len() {
-                match bytes[look] {
-                    b'(' | b'[' | b'{' => depth += 1,
-                    b')' | b']' | b'}' => depth -= 1,
-                    b' ' | b'\t' | b',' if depth == 0 => break,
-                    _ => {}
+                if in_string {
+                    let Some(ch) = params_str[look..].chars().next() else {
+                        break;
+                    };
+                    default_buf.push(ch);
+                    look += ch.len_utf8();
+                    if ch == '\\' {
+                        if let Some(esc) = params_str[look..].chars().next() {
+                            default_buf.push(esc);
+                            look += esc.len_utf8();
+                        }
+                    } else if ch == '"' {
+                        in_string = false;
+                    }
+                    continue;
                 }
-                look += 1;
+                match bytes[look] {
+                    b'"' => {
+                        in_string = true;
+                        default_buf.push('"');
+                        look += 1;
+                    }
+                    b'\'' => {
+                        // GAS's input scrubber turns an ASCII character literal
+                        // `'x` / `'\n'` into its decimal value before `.macro`
+                        // parses the header (matching `split_macro_arg_fields`).
+                        let next_end = crate::backend::asm_expr::skip_gas_char_literal(bytes, look);
+                        let raw_lit = &params_str[look..next_end];
+                        let mut lit_chars = raw_lit[1..].chars();
+                        let val_opt = match lit_chars.next() {
+                            Some('\\') => lit_chars.next().map(|e| match e {
+                                'b' => '\u{8}',
+                                'f' => '\u{c}',
+                                'n' => '\n',
+                                'r' => '\r',
+                                't' => '\t',
+                                other => other,
+                            }),
+                            other => other,
+                        };
+                        match val_opt {
+                            Some(v) if v.is_ascii() => {
+                                default_buf.push_str(&u32::from(v).to_string());
+                            }
+                            _ => default_buf.push_str(raw_lit),
+                        }
+                        look = next_end;
+                    }
+                    b'(' | b'[' | b'{' => {
+                        depth += 1;
+                        default_buf.push(bytes[look] as char);
+                        look += 1;
+                    }
+                    b')' | b']' | b'}' => {
+                        depth -= 1;
+                        default_buf.push(bytes[look] as char);
+                        look += 1;
+                    }
+                    b' ' | b'\t' | b',' if depth == 0 => break,
+                    _ => {
+                        let Some(ch) = params_str[look..].chars().next() else {
+                            break;
+                        };
+                        default_buf.push(ch);
+                        look += ch.len_utf8();
+                    }
+                }
             }
-            param.default = Some(params_str[default_start..look].to_string());
+            param.default = Some(strip_arg_quotes(&default_buf).to_string());
             i = look;
         }
         params.push(param);
@@ -1224,18 +1356,44 @@ fn split_statements<'l>(lines: &[&'l str], style: &CommentStyle) -> Vec<std::bor
     let mut out = Vec::with_capacity(lines.len());
     for &line in lines {
         let code = strip_comment(line, style);
+        let bytes = code.as_bytes();
         let mut parts = Vec::new();
-        let (mut start, mut in_str, mut escaped) = (0, false, false);
-        for (i, c) in code.char_indices() {
-            match c {
-                _ if escaped => escaped = false,
-                '\\' if in_str => escaped = true,
-                '"' => in_str = !in_str,
-                ';' if !in_str => {
-                    parts.push(&code[start..i]);
-                    start = i + 1;
+        let (mut start, mut in_str) = (0usize, false);
+        let mut i = 0usize;
+        while i < bytes.len() {
+            if in_str {
+                if bytes[i] == b'\\' {
+                    i += 1;
+                    if i < bytes.len() {
+                        i += std::str::from_utf8(&bytes[i..])
+                            .ok()
+                            .and_then(|rest| rest.chars().next())
+                            .map_or(1, char::len_utf8);
+                    }
+                    continue;
                 }
-                _ => {}
+                if bytes[i] == b'"' {
+                    in_str = false;
+                }
+                i += 1;
+                continue;
+            }
+            match bytes[i] {
+                b'"' => {
+                    in_str = true;
+                    i += 1;
+                }
+                b'\'' => {
+                    i = crate::backend::asm_expr::skip_gas_char_literal(bytes, i);
+                }
+                b';' => {
+                    parts.push(&code[start..i]);
+                    i += 1;
+                    start = i;
+                }
+                _ => {
+                    i += 1;
+                }
             }
         }
         if parts.is_empty() {
@@ -1246,7 +1404,7 @@ fn split_statements<'l>(lines: &[&'l str], style: &CommentStyle) -> Vec<std::bor
         out.extend(
             parts
                 .into_iter()
-                .map(str::trim)
+                .map(crate::backend::asm_expr::trim_asm_line)
                 .filter(|s| !s.is_empty())
                 .map(|s| std::borrow::Cow::Owned(s.to_string())),
         );
@@ -2586,5 +2744,26 @@ mod tests {
                 ("b".to_string(), Some("3".into())),
             ]
         );
+        // Quoted and character-literal defaults keep commas, spaces, `:req`,
+        // and escaped quotes inside a single parameter default, stripping only
+        // balanced outer quotes (matching GAS 2.47).
+        assert_eq!(
+            names(r#"p="1, 2" q="x y:req" r="ab\"cd" s=',', t=' '"#),
+            vec![
+                ("p".to_string(), Some("1, 2".into())),
+                ("q".to_string(), Some("x y:req".into())),
+                ("r".to_string(), Some(r#"ab\"cd"#.into())),
+                ("s".to_string(), Some("44".into())),
+                ("t".to_string(), Some("32".into())),
+            ]
+        );
+    }
+
+    #[test]
+    fn strip_comment_and_split_semicolons_preserve_gas_char_literals() {
+        let line = ".byte 'A', ' ', ',', ';', '#' # trailing ; comment";
+        let stripped = strip_comment(line, &CommentStyle::Hash);
+        assert_eq!(stripped.trim(), ".byte 'A', ' ', ',', ';', '#'");
+        assert_eq!(split_on_semicolons(stripped).len(), 1);
     }
 }

@@ -505,13 +505,13 @@ pub fn param_decl_to_ctype_with(
     }
 }
 
-fn convert_param_decls_to_ctypes(
-    ctx: &dyn TypeConvertContext,
+fn convert_param_decls_to_ctypes_with(
+    resolve: &dyn Fn(&TypeSpecifier) -> CType,
     params: &[ParamDecl],
 ) -> Vec<(CType, Option<String>)> {
     params
         .iter()
-        .map(|p| (param_decl_to_ctype(ctx, p), p.name.clone()))
+        .map(|p| (param_decl_to_ctype_with(resolve, p), p.name.clone()))
         .collect()
 }
 
@@ -547,22 +547,63 @@ pub fn build_full_ctype_with_base(
     base: CType,
     derived: &[DerivedDeclarator],
 ) -> CType {
+    build_full_ctype_with_callbacks(
+        base,
+        derived,
+        &|ts| ctx.resolve_type_spec_to_ctype(ts),
+        &|e, elem| ctx.eval_array_bound_len(e, elem),
+    )
+}
+
+/// Build a full CType using caller-supplied `TypeSpecifier` and array-bound resolvers.
+/// Shared by `TypeConvertContext` implementors and expression/constant-evaluator
+/// sub-contexts (`ExprTypeChecker`, `SemaConstEval`) so derived declarators
+/// (including function pointers and pointers to arrays) never diverge.
+pub fn build_full_ctype_with_callbacks(
+    base: CType,
+    derived: &[DerivedDeclarator],
+    resolve: &dyn Fn(&TypeSpecifier) -> CType,
+    eval_bound: &dyn Fn(&Expr, &CType) -> Option<usize>,
+) -> CType {
     let fptr_idx = find_function_pointer_core(derived);
 
     if let Some(fp_start) = fptr_idx {
-        // Build the function pointer type.
-        // Pointer declarators in the prefix (before fp_start) are part of the
-        // return type, not outer wrappers. E.g. for `Page *(*xFetch)(int)`:
-        //   derived = [Pointer, Pointer, FunctionPointer([int])]
-        //   prefix  = [Pointer]  — the `*` on return type `Page *`
-        //   core    = [Pointer, FunctionPointer] — the `(*)(int)` syntax
-        // We fold prefix Pointer declarators into the base to form the return type.
+        // Build the function/function-pointer return type from `prefix = &derived[..fp_start]`.
+        // Pointer declarators in `prefix` (and any `Array` dimensions that sit BEFORE a
+        // return-type `Pointer` in `prefix`, such as `int (*get_arr(int))[4]` or
+        // `int (*(*fp)(int))[4]` where `prefix = [Array(4), Pointer]`) belong to the
+        // return type. Only trailing `Array` entries in `prefix` with no `Pointer`
+        // after them in `prefix` (e.g. `[Array(10), Pointer, FunctionPointer]`, where
+        // `prefix = [Array(10)]`) are outer array-of-function-pointers wrappers.
+        let prefix = &derived[..fp_start];
+        let last_prefix_ptr = prefix
+            .iter()
+            .rposition(|d| matches!(d, DerivedDeclarator::Pointer(_)));
+        let return_prefix_end = last_prefix_ptr.map_or(0, |p| p + 1);
+
         let mut result = base;
-        for (i, d) in derived[..fp_start].iter().enumerate() {
-            if matches!(d, DerivedDeclarator::Pointer(_)) {
-                result = CType::Pointer(Box::new(result), pointee_space_before(derived, i));
+        let mut p = 0;
+        while p < return_prefix_end {
+            match &prefix[p] {
+                DerivedDeclarator::Pointer(_) => {
+                    result = CType::Pointer(Box::new(result), pointee_space_before(derived, p));
+                    p += 1;
+                }
+                DerivedDeclarator::Array(_) => {
+                    let start = p;
+                    while p < return_prefix_end && matches!(&prefix[p], DerivedDeclarator::Array(_))
+                    {
+                        p += 1;
+                    }
+                    for j in (start..p).rev() {
+                        if let DerivedDeclarator::Array(size_expr) = &prefix[j] {
+                            let size = size_expr.as_ref().and_then(|e| eval_bound(e, &result));
+                            result = CType::Array(Box::new(result), size);
+                        }
+                    }
+                }
+                _ => p += 1,
             }
-            // Array declarators in prefix are outer wrappers, handled after the core.
         }
 
         // Process from fp_start to end (the function pointer core and any
@@ -571,25 +612,14 @@ pub fn build_full_ctype_with_base(
         while i < derived.len() {
             match &derived[i] {
                 DerivedDeclarator::Pointer(_) => {
-                    if i + 1 < derived.len()
-                        && matches!(
-                            &derived[i + 1],
-                            DerivedDeclarator::FunctionPointer(_, _)
-                                | DerivedDeclarator::Function(_, _)
-                        )
+                    if let Some(DerivedDeclarator::FunctionPointer(params, variadic)) =
+                        derived.get(i + 1)
                     {
-                        let (params, variadic) = match &derived[i + 1] {
-                            DerivedDeclarator::FunctionPointer(p, v)
-                            | DerivedDeclarator::Function(p, v) => (p, *v),
-                            _ => unreachable!(
-                                "expected FunctionPointer/Function declarator after Pointer"
-                            ),
-                        };
-                        let param_types = convert_param_decls_to_ctypes(ctx, params);
+                        let param_types = convert_param_decls_to_ctypes_with(resolve, params);
                         let func_type = CType::Function(Box::new(FunctionType {
                             return_type: result,
                             params: param_types,
-                            variadic,
+                            variadic: *variadic,
                         }));
                         result = CType::Pointer(Box::new(func_type), AddressSpace::Default);
                         i += 2;
@@ -599,7 +629,7 @@ pub fn build_full_ctype_with_base(
                     }
                 }
                 DerivedDeclarator::FunctionPointer(params, variadic) => {
-                    let param_types = convert_param_decls_to_ctypes(ctx, params);
+                    let param_types = convert_param_decls_to_ctypes_with(resolve, params);
                     let func_type = CType::Function(Box::new(FunctionType {
                         return_type: result,
                         params: param_types,
@@ -609,7 +639,7 @@ pub fn build_full_ctype_with_base(
                     i += 1;
                 }
                 DerivedDeclarator::Function(params, variadic) => {
-                    let param_types = convert_param_decls_to_ctypes(ctx, params);
+                    let param_types = convert_param_decls_to_ctypes_with(resolve, params);
                     let func_type = CType::Function(Box::new(FunctionType {
                         return_type: result,
                         params: param_types,
@@ -623,25 +653,17 @@ pub fn build_full_ctype_with_base(
                     // wrappers (e.g., array-of-function-pointers when inner_derived
                     // had [Pointer, Array(N)] which the parser emits as
                     // [Pointer, FunctionPointer, Array(N)]).
-                    let size = size_expr
-                        .as_ref()
-                        .and_then(|e| ctx.eval_array_bound_len(e, &result));
+                    let size = size_expr.as_ref().and_then(|e| eval_bound(e, &result));
                     result = CType::Array(Box::new(result), size);
                     i += 1;
                 }
             }
         }
 
-        // Apply outer wrappers from the prefix (before fp_start).
-        // Only Array declarators in the prefix are true outer wrappers
-        // (e.g., `int (*fp[10])(void)` = array of function pointers).
-        // Pointer declarators in the prefix were already folded into the return type.
-        let prefix = &derived[..fp_start];
-        for d in prefix.iter().rev() {
+        // Apply any remaining outer Array wrappers from `prefix[return_prefix_end..]`.
+        for d in prefix[return_prefix_end..].iter().rev() {
             if let DerivedDeclarator::Array(size_expr) = d {
-                let size = size_expr
-                    .as_ref()
-                    .and_then(|e| ctx.eval_array_bound_len(e, &result));
+                let size = size_expr.as_ref().and_then(|e| eval_bound(e, &result));
                 result = CType::Array(Box::new(result), size);
             }
         }
@@ -666,9 +688,7 @@ pub fn build_full_ctype_with_base(
                     // Apply in reverse: innermost (rightmost) dimension wraps first
                     for j in (start..i).rev() {
                         if let DerivedDeclarator::Array(size_expr) = &derived[j] {
-                            let size = size_expr
-                                .as_ref()
-                                .and_then(|e| ctx.eval_array_bound_len(e, &result));
+                            let size = size_expr.as_ref().and_then(|e| eval_bound(e, &result));
                             result = CType::Array(Box::new(result), size);
                         }
                     }
@@ -790,6 +810,70 @@ pub fn declarator_supplies_pointer(derived: &[DerivedDeclarator]) -> bool {
 /// Returns whether the type absorbed the space (pointee placement). Callers
 /// that declare objects must use the result to set the object's storage space
 /// (see sema's `object_address_space` / the lowerer's `var.address_space`).
+/// Count how many `CType::Pointer` layers `derived` itself constructs on top
+/// of the base type specifier (excluding pointers already inside a typedef or
+/// `typeof` specifier).
+fn declarator_pointer_levels(derived: &[DerivedDeclarator]) -> usize {
+    let mut count = 0usize;
+    let mut i = 0usize;
+    while i < derived.len() {
+        match &derived[i] {
+            DerivedDeclarator::Pointer(_) => {
+                count += 1;
+                if matches!(
+                    derived.get(i + 1),
+                    Some(DerivedDeclarator::FunctionPointer(_, _))
+                ) {
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            DerivedDeclarator::FunctionPointer(_, _) => {
+                count += 1;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    count
+}
+
+fn apply_declaration_address_space_bounded(
+    ty: &mut CType,
+    space: AddressSpace,
+    remaining_ptr_levels: usize,
+) -> bool {
+    if space == AddressSpace::Default || remaining_ptr_levels == 0 {
+        return false;
+    }
+    match ty {
+        CType::Pointer(inner, sp) => {
+            if remaining_ptr_levels > 1 && pointee_reaches_pointer_level(inner) {
+                apply_declaration_address_space_bounded(inner, space, remaining_ptr_levels - 1)
+            } else if let CType::Function(ft) = inner.as_mut() {
+                apply_declaration_address_space_bounded(
+                    &mut ft.return_type,
+                    space,
+                    remaining_ptr_levels - 1,
+                )
+            } else {
+                *sp = space;
+                true
+            }
+        }
+        CType::Array(elem, _) => {
+            apply_declaration_address_space_bounded(elem, space, remaining_ptr_levels)
+        }
+        CType::Function(ft) => apply_declaration_address_space_bounded(
+            &mut ft.return_type,
+            space,
+            remaining_ptr_levels,
+        ),
+        _ => false,
+    }
+}
+
 pub fn apply_declaration_address_space_for_object(
     ty: &mut CType,
     space: AddressSpace,
@@ -798,12 +882,13 @@ pub fn apply_declaration_address_space_for_object(
     if space == AddressSpace::Default {
         return false;
     }
-    if !declarator_supplies_pointer(derived) {
+    let ptr_levels = declarator_pointer_levels(derived);
+    if ptr_levels == 0 {
         // The pointer level (if any) came from the specifier: the space is the
         // object's storage and the value's type is left alone.
         return false;
     }
-    apply_declaration_address_space(ty, space)
+    apply_declaration_address_space_bounded(ty, space, ptr_levels)
 }
 
 /// The object's OWN storage space for a declaration — the exact complement of
@@ -1125,7 +1210,7 @@ pub fn place_declared_space(
         }
         Some(ct) => {
             if !whole_type {
-                apply_declaration_address_space(ct, space);
+                apply_declaration_address_space_for_object(ct, space, derived);
             }
             // A named space after the declarator's last `*` (`long *__seg_gs p`)
             // is the object's own space; it does not reach the pointee.

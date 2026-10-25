@@ -735,27 +735,18 @@ impl SemanticAnalyzer {
                 // mistaken for function-pointer typedefs merely because the
                 // return type contains a FunctionPointer declarator.
                 let has_func_derived = DerivedDeclarator::declares_function(&declarator.derived);
-                let has_fptr_derived = !has_func_derived
-                    && declarator
-                        .derived
-                        .iter()
-                        .any(|d| matches!(d, DerivedDeclarator::FunctionPointer(_, _)));
-
                 if has_func_derived {
-                    // Function typedef like: typedef int func_t(int x);
-                    // The typedef's own parameter list is the LAST derived.
+                    // Function typedef like `typedef int func_t(int x);` or
+                    // `typedef int (*fn_t(int))(char);`. The typedef's own
+                    // parameter list is the LAST derived.
                     if let Some(DerivedDeclarator::Function(params, variadic)) =
                         declarator.derived.last()
                     {
-                        let ptr_count =
-                            DerivedDeclarator::return_pointer_depth(&declarator.derived);
-                        let mut return_type = decl.type_spec.clone();
-                        for _ in 0..ptr_count {
-                            return_type = TypeSpecifier::Pointer(
-                                Box::new(return_type),
-                                AddressSpace::Default,
-                            );
-                        }
+                        let return_type = super::type_context::build_prefix_return_type_spec(
+                            &decl.type_spec,
+                            &declarator.derived,
+                            declarator.derived.len() - 1,
+                        );
                         self.result.type_context.function_typedefs.insert(
                             declarator.name.clone(),
                             FunctionTypedefInfo {
@@ -765,41 +756,19 @@ impl SemanticAnalyzer {
                             },
                         );
                     }
-                }
-
-                // Function pointer typedef (e.g., typedef void *(*lua_Alloc)(void *, ...))
-                if has_fptr_derived {
-                    if let Some(DerivedDeclarator::FunctionPointer(params, variadic)) = declarator
-                        .derived
-                        .iter()
-                        .find(|d| matches!(d, DerivedDeclarator::FunctionPointer(_, _)))
-                    {
-                        // The entity is itself one pointer: the return
-                        // type's depth is the canonical depth minus that
-                        // one indirection.
-                        let ret_ptr_count =
-                            DerivedDeclarator::return_pointer_depth(&declarator.derived)
-                                .saturating_sub(1);
-                        let mut return_type = decl.type_spec.clone();
-                        for _ in 0..ret_ptr_count {
-                            return_type = TypeSpecifier::Pointer(
-                                Box::new(return_type),
-                                AddressSpace::Default,
-                            );
-                        }
-                        self.result
-                            .type_context
-                            .func_ptr_typedefs
-                            .insert(declarator.name.clone());
-                        self.result.type_context.func_ptr_typedef_info.insert(
-                            declarator.name.clone(),
-                            FunctionTypedefInfo {
-                                return_type,
-                                params: params.clone(),
-                                variadic: *variadic,
-                            },
-                        );
-                    }
+                } else if let Some(fti) = super::type_context::extract_fptr_typedef_info(
+                    &decl.type_spec,
+                    &declarator.derived,
+                ) {
+                    // Function pointer typedef (e.g., `typedef void *(*lua_Alloc)(void *, ...)`)
+                    self.result
+                        .type_context
+                        .func_ptr_typedefs
+                        .insert(declarator.name.clone());
+                    self.result
+                        .type_context
+                        .func_ptr_typedef_info
+                        .insert(declarator.name.clone(), fti);
                 }
 
                 // Store resolved CType for the typedef.
@@ -817,9 +786,10 @@ impl SemanticAnalyzer {
                 // Same declaration-level address space rule as variables
                 // (see analyze_declaration); lowering applies it to typedefs
                 // too (stmt.rs lower_local_typedef).
-                type_builder::apply_declaration_address_space(
+                type_builder::apply_declaration_address_space_for_object(
                     &mut resolved_ctype,
                     decl.address_space,
+                    &declarator.derived,
                 );
                 // Mirror lowering's vector-attribute handling: without the
                 // vector wrap, sema records `typedef float xmm_t
