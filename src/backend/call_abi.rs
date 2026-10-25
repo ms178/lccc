@@ -1936,7 +1936,7 @@ mod tests {
     }
 
     #[test]
-   fn i386_vector_alignment_requires_the_explicit_vector_marker() {
+    fn i386_vector_alignment_requires_the_explicit_vector_marker() {
         let config = i686_regparm3();
         let vector = [EightbyteClass::Memory, EightbyteClass::NoClass];
         let ordinary_memory = [EightbyteClass::Memory];

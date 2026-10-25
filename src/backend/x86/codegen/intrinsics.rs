@@ -442,13 +442,7 @@ impl X86Codegen {
     /// I64x2 accumulator, which may live in an XMM home (xmm3..xmm15 — the
     /// pool never homes xmm0/xmm1/xmm2 here, see `clobbers_xmm2`), in a
     /// stack slot, or be dead. `acc`/`dest` are the intrinsic operands.
-    fn widen_value_fold_acc_i64x2(
-        &mut self,
-        dest: &Value,
-        acc: &Operand,
-        lo: &str,
-        hi: &str,
-    ) {
+    fn widen_value_fold_acc_i64x2(&mut self, dest: &Value, acc: &Operand, lo: &str, hi: &str) {
         if let (Some(d), Operand::Value(acc)) = (Some(*dest), acc) {
             let acc_reg = self
                 .reg_assignments
@@ -491,11 +485,9 @@ impl X86Codegen {
                         self.state
                             .emit_fmt(format_args!("    paddq %{}, %xmm1", hi));
                         if let Some(dslot) = self.state.get_slot(d.0) {
-                            self.state.out.emit_instr_reg_rbp(
-                                "    movdqa",
-                                "xmm1",
-                                dslot.0,
-                            );
+                            self.state
+                                .out
+                                .emit_instr_reg_rbp("    movdqa", "xmm1", dslot.0);
                         }
                     } else {
                         // Dead accumulator: xmm1 is dead, seed it with the
@@ -507,11 +499,9 @@ impl X86Codegen {
                         self.state
                             .emit_fmt(format_args!("    paddq %{}, %xmm1", hi));
                         if let Some(dslot) = self.state.get_slot(d.0) {
-                            self.state.out.emit_instr_reg_rbp(
-                                "    movdqa",
-                                "xmm1",
-                                dslot.0,
-                            );
+                            self.state
+                                .out
+                                .emit_instr_reg_rbp("    movdqa", "xmm1", dslot.0);
                         }
                     }
                 }
@@ -7280,7 +7270,6 @@ impl X86Codegen {
             }
             IntrinsicOp::VecMulI32x4 => {
                 if let Some(d) = dest {
-
                     // ISA-gated: `pmulld` only under SSE4.1, the bit-identical
                     // `pmuludq` pair on the SSE2 baseline. (This arm used to
                     // emit `pmulld` unconditionally, shipping an SSE4.1

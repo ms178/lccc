@@ -325,7 +325,6 @@ pub(crate) fn check_packed_shift_shape(mnemonic: &str, ops: &[Operand]) -> Resul
     // PSLLDQ/PSRLDQ have no MMX or GP form. Their ModRM register
     // number alone cannot distinguish those illegal names from XMM.
     if matches!(mnemonic, "pslldq" | "psrldq") {
-
         // GAS 2.47 (byte-probed, both modes): a same-family vector of the
         // wrong size is an *operand size* mismatch; MMX/GP/anything else is
         // an operand type mismatch.
@@ -374,7 +373,6 @@ pub(crate) fn check_packed_shift_shape(mnemonic: &str, ops: &[Operand]) -> Resul
                 Some(src_width) if src_width == width => {}
                 Some(_) => return Err(reg_error()),
                 None => return Err(type_error()),
-
             }
         }
         // Memory data is available only for immediate counts. Variable

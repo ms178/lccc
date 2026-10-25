@@ -253,7 +253,6 @@ pub struct Driver {
     /// only matters after an explicit pre-SSE `-march=` or `-mno-sse2`
     /// denial. Every higher SSE/AVX grant is visible through its own
     /// `enable_*` bit.
-
     pub(super) enable_sse: bool,
     /// Explicit `-msse2` only (the SSE2 level, above `-msse`). i686 resolves
     /// its SSE2 baseline through this bit, the SSE-family `enable_*` bits
@@ -3486,7 +3485,6 @@ impl Driver {
         // drops to the pre-SSE stack/sret convention.
         set.insert_if(simd && (x86_64 || self.resolved_i686_sse()), F::Sse);
         set.insert_if(simd && (x86_64 || self.resolved_i686_sse2()), F::Sse2);
-
 
         // The SSE3..SSE4.2 ladder.  `x86_isa()` carries only the 128-bit
         // SSE4.1 class, so SSE3/SSSE3/SSE4.2 have no codegen bit of their

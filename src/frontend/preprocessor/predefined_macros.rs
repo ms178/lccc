@@ -1369,7 +1369,6 @@ impl Preprocessor {
     }
 }
 
-
 /// Apply the granular SSE/SSE2/MMX macro state to a preprocessor macro
 /// table — the core of [`Preprocessor::set_sse_macros`], factored free so
 /// the oracle-verified matrix is testable without a full preprocessor.

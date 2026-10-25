@@ -959,12 +959,10 @@ fn vectorize_with_analysis_mode(
             // not on structure.
             if late_minmax_only()
                 && !matches!(red_pattern.kind, ReductionKind::Min | ReductionKind::Max)
-                && !(
-                    red_pattern.kind == ReductionKind::Sum
-                        && red_pattern.element_type == IrType::I32
-                        && red_pattern.accumulator_type == IrType::I64
-                        && red_pattern.guard_cond.is_some()
-                )
+                && !(red_pattern.kind == ReductionKind::Sum
+                    && red_pattern.element_type == IrType::I32
+                    && red_pattern.accumulator_type == IrType::I64
+                    && red_pattern.guard_cond.is_some())
             {
                 if debug {
                     eprintln!(
@@ -28365,11 +28363,9 @@ fn transform_reduction_sse2(
     // NEON keeps its own audited paths.
     if !neon
         && pattern.guard_cond.is_some()
-        && !(
-            pattern.kind == ReductionKind::Sum
-                && pattern.element_type == IrType::I32
-                && pattern.accumulator_type == IrType::I64
-        )
+        && !(pattern.kind == ReductionKind::Sum
+            && pattern.element_type == IrType::I32
+            && pattern.accumulator_type == IrType::I64)
     {
         if debug {
             eprintln!("[VEC-RED] SSE2 path cannot express a guarded reduction; staying scalar");
@@ -28449,16 +28445,19 @@ fn transform_reduction_sse2(
             // paddq×2; guarded sums take the masked sibling). Sum only:
             // Max/Min/DotProduct keep the 2-lane arm below (no SSE2
             // 4-lane form exists for them).
-            IrType::I32 if pattern.accumulator_type == IrType::I64
-                && pattern.kind == ReductionKind::Sum
-                && !neon =>
-            (
-                4u64,
-                IntrinsicOp::VecLoadI32x4,
-                IntrinsicOp::VecWidenAddValueI32x4ToI64x2,
-                None,
-                IntrinsicOp::VecHorizontalAddI64x2,
-            ),
+            IrType::I32
+                if pattern.accumulator_type == IrType::I64
+                    && pattern.kind == ReductionKind::Sum
+                    && !neon =>
+            {
+                (
+                    4u64,
+                    IntrinsicOp::VecLoadI32x4,
+                    IntrinsicOp::VecWidenAddValueI32x4ToI64x2,
+                    None,
+                    IntrinsicOp::VecHorizontalAddI64x2,
+                )
+            }
             IrType::I32 if pattern.accumulator_type == IrType::I64 => (
                 2u64,
                 IntrinsicOp::VecLoadWidenI32ToI64x2,

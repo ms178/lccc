@@ -8590,7 +8590,6 @@ mod packed_shift_audit_tests {
         }
     }
 
-
     /// Exact GAS diagnostic texts, byte-probed on binutils 2.40 (both
     /// modes; identical on 2.47 for these rows): a wrong-width VECTOR
     /// register in a data slot is a `register type mismatch`, a GP
@@ -8695,7 +8694,6 @@ mod packed_shift_audit_tests {
             }
         }
     }
-
 
     #[test]
     fn packed_shift_audit_memory_roles_and_forced_evex() {
