@@ -201,8 +201,12 @@ impl X86Codegen {
                         self.flush_pending_vec_store_impl();
                     }
                     if name != xmm {
-                        self.state
-                            .emit_fmt(format_args!("    movdqa %{}, %{}", name, xmm));
+                        self.state.emit_fmt(format_args!(
+                            "    {} %{}, %{}",
+                            self.xmm_move(true),
+                            name,
+                            xmm
+                        ));
                         // The home->scratch copy overwrites `xmm`: every
                         // OTHER value's claim on that bank just died.
                         self.state.vec_evict_bank_except(xmm, v.0);
@@ -214,8 +218,12 @@ impl X86Codegen {
             // CCC_ENABLE_VECREG: value provably in its allocated XMM register.
             if let Some(&held) = self.state.vec_live_regs.get(&v.0) {
                 if held != xmm {
-                    self.state
-                        .emit_fmt(format_args!("    movdqa %{}, %{}", held, xmm));
+                    self.state.emit_fmt(format_args!(
+                        "    {} %{}, %{}",
+                        self.xmm_move(true),
+                        held,
+                        xmm
+                    ));
                     // The move-aside overwrites `xmm`: every OTHER value's
                     // claim on that bank just died.
                     self.state.vec_evict_bank_except(xmm, v.0);
@@ -232,8 +240,12 @@ impl X86Codegen {
             if self.state.sse_last_store_reg && self.state.sse_last_store_val == Some(v.0) {
                 let held = self.state.sse_last_store_reg_name.unwrap_or("xmm0");
                 if held != xmm {
-                    self.state
-                        .emit_fmt(format_args!("    movdqa %{}, %{}", held, xmm));
+                    self.state.emit_fmt(format_args!(
+                        "    {} %{}, %{}",
+                        self.xmm_move(true),
+                        held,
+                        xmm
+                    ));
                     self.state.vec_evict_bank_except(xmm, v.0);
                     self.state.sse_last_store_reg_name = Some(xmm);
                 } else {
@@ -253,8 +265,12 @@ impl X86Codegen {
             // GPR-base / direct-slot addressing: single memory operand, no
             // `movq %r10, %rax` round trip (the v5 compare-chain win).
             if let Some(mem) = self.value_ptr_mem_operand(v.0) {
-                self.state
-                    .emit_fmt(format_args!("    movdqu {}, %{}", mem, xmm));
+                self.state.emit_fmt(format_args!(
+                    "    {} {}, %{}",
+                    self.xmm_move(false),
+                    mem,
+                    xmm
+                ));
                 // The load overwrites `xmm` with `v`'s data: every OTHER
                 // value's claim on that bank is now stale.
                 self.state.vec_evict_bank_except(xmm, v.0);
@@ -264,8 +280,11 @@ impl X86Codegen {
         }
         self.flush_pending_vec_store_impl();
         self.operand_to_reg(arg, "rax");
-        self.state
-            .emit_fmt(format_args!("    movdqu (%rax), %{}", xmm));
+        self.state.emit_fmt(format_args!(
+            "    {} (%rax), %{}",
+            self.xmm_move(false),
+            xmm
+        ));
         if let Operand::Value(v) = arg {
             self.state.vec_evict_bank_except(xmm, v.0);
         }
@@ -280,8 +299,12 @@ impl X86Codegen {
             if is_xmm_reg(reg) {
                 let name = phys_reg_name(reg);
                 if name != xmm {
-                    self.state
-                        .emit_fmt(format_args!("    movdqa %{}, %{}", xmm, name));
+                    self.state.emit_fmt(format_args!(
+                        "    {} %{}, %{}",
+                        self.xmm_move(true),
+                        xmm,
+                        name
+                    ));
                 }
                 self.state.vec_claim_live_reg(dest_ptr.0, name);
                 self.state.sse_last_store_val = Some(dest_ptr.0);
@@ -302,7 +325,8 @@ impl X86Codegen {
             if let SlotAddr::Direct(slot) = addr {
                 if !deferred {
                     self.state.emit_fmt(format_args!(
-                        "    movdqu %{}, {}",
+                        "    {} %{}, {}",
+                        self.xmm_move(false),
                         xmm,
                         self.slot_ref(slot.0)
                     ));
@@ -326,8 +350,11 @@ impl X86Codegen {
         }
         if !deferred {
             self.value_to_reg(dest_ptr, "rax");
-            self.state
-                .emit_fmt(format_args!("    movdqu %{}, (%rax)", xmm));
+            self.state.emit_fmt(format_args!(
+                "    {} %{}, (%rax)",
+                self.xmm_move(false),
+                xmm
+            ));
         } else {
             self.state.pending_vec_store = Some((dest_ptr.0, xmm, false));
         }
@@ -608,7 +635,11 @@ impl X86Codegen {
         }
         let val = Value(val_id);
         use crate::backend::state::SlotAddr;
-        let inst = if is_256 { "vmovdqu" } else { "movdqu" };
+        let inst = if is_256 {
+            "vmovdqu"
+        } else {
+            self.xmm_move(false)
+        };
         if let Some(addr) = self.state.resolve_slot_addr(val_id) {
             if let SlotAddr::Direct(slot) = addr {
                 self.state.emit_fmt(format_args!(

@@ -72,6 +72,9 @@ class Benchmark:
 # Keep historical synthetic tests, then add workload-derived kernels.  Sources
 # may live in the legacy numbered directory until they are migrated.
 BENCHMARKS: tuple[Benchmark, ...] = (
+    Benchmark("f32_sse1_map", "strict cache-resident F32 maps without SSE2",
+              ("f32_sse1_map.c",), ("synthetic", "simd", "fp", "map", "sse1"),
+              extra_flags=("-mno-sse2", "-msse", "-ffp-contract=off")),
     Benchmark("fp32_product_map", "strict cache-resident F32 multiply/add maps",
               ("fp_product_map.c",), ("synthetic", "simd", "fp", "map"),
               extra_flags=("-ffp-contract=off",)),

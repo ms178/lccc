@@ -2056,6 +2056,9 @@ impl Driver {
                     && !self.no_sse,
             );
         }
+        crate::passes::vectorize::set_x86_sse1_available(
+            self.target == Target::X86_64 && !self.no_sse && !self.general_regs_only,
+        );
         let lowerer = Lowerer::with_type_context(
             self.target,
             sema_result.type_context,
@@ -2271,6 +2274,7 @@ impl Driver {
             // never vectorizes (verified: 0 xmm refs at -O2/-O3, with and
             // without -ffast-math).
             self.x86_isa(),
+            self.target == Target::X86_64 && !self.no_sse && !self.general_regs_only,
             self.target == Target::X86_64
                 && self.enable_avx
                 && !self.no_sse
@@ -3499,9 +3503,9 @@ impl Driver {
     /// handling through `no_sse` and never reaches the x86-64 emitters.
     pub(crate) fn x86_isa(&self) -> crate::backend::x86::isa::X86Isa {
         use crate::backend::x86::isa::X86Isa;
-        // The packed x86-64 classes require SSE2, not merely SSE1. A later
-        // -msse may re-enable scalar SSE1 after -mno-sse2, but must not reopen
-        // vector lowering or allocation while that SSE2 denial is sticky.
+        // The generic integer/F64 vector classes require SSE2. SSE1 F32 maps
+        // have a separate typed permission: never reopen this wider class
+        // merely because -msse follows an explicit SSE2 denial.
         if self.target != Target::X86_64 || self.no_sse || self.no_sse2 || self.general_regs_only {
             return X86Isa {
                 cx16: self.resolved_cx16(),

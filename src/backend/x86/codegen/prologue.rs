@@ -3870,7 +3870,19 @@ impl X86Codegen {
                     self.emit_capture_store_qword(dst, X86_ARG_REGS[reg_idx], 0);
                 }
                 ParamClass::FloatReg { reg_idx } => {
-                    if ty == IrType::F32 || ty == IrType::D32 {
+                    if (ty == IrType::F32 || ty == IrType::D32) && !self.isa.simd {
+                        // SSE1 has no XMM->GPR MOVD. Capture the low word
+                        // directly, preserving the existing zero-extended
+                        // eight-byte home contract without touching another
+                        // incoming FP argument register.
+                        let (low, high) = match dst {
+                            CaptureDst::Raw(b) => (self.slot_ref(b), self.slot_ref(b + 4)),
+                            CaptureDst::Aligned => ("(%r11)".into(), "4(%r11)".into()),
+                        };
+                        self.state
+                            .emit_fmt(format_args!("    movss %{}, {}", xmm_regs[reg_idx], low));
+                        self.state.emit_fmt(format_args!("    movl $0, {}", high));
+                    } else if ty == IrType::F32 || ty == IrType::D32 {
                         self.state
                             .out
                             .emit_instr_reg_reg("    movd", xmm_regs[reg_idx], "eax");

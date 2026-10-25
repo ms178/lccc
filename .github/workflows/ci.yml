@@ -963,6 +963,7 @@ jobs:
         env CCC=target/fastbuild/lccc GCC=gcc-16 python3 tests/regression/check_sse2_i32_product.py
         env CCC=target/fastbuild/lccc GCC=gcc-16 python3 tests/regression/check_i32_map_unroll.py
         env CCC=target/fastbuild/lccc GCC=gcc-16 python3 tests/regression/check_fp_map_unroll.py
+        env CCC=target/fastbuild/lccc GCC=gcc-16 python3 tests/regression/check_sse1_f32_map.py
     # The two-wide matmul arm and its guards arrived with the synthesized
     # SIMD work; each gate below pins one property that a scalar fallback
     # would otherwise hide (see the gate headers for the measured costs).
@@ -2599,6 +2600,7 @@ jobs:
       # The bounded F32 map extends this shard; F64 extends shard b.
       only: >-
           fp32_product_map,
+          f32_sse1_map,
           ackermann,
           arith_loop,
           ascii_case_fold,

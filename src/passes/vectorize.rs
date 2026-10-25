@@ -172,6 +172,9 @@ thread_local! {
     // Default is FALSE - the driver opts in per TU, so a forgotten
     // `set_x86_simd_isa` call fails closed instead of emitting illegal code.
     static X86_SIMD_AVAILABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    // Separate permission: SSE1 packs F32, but cannot lower integer/F64
+    // vectors. Never widen X86_SIMD_AVAILABLE to express this subset.
+    static X86_SSE1_AVAILABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     // AVX2 (256-bit ymm) availability, distinct from `X86_SIMD_AVAILABLE`:
     // the 256-bit class is opt-in, so its absence must downgrade the
     // vectorizer to 128-bit forms rather than disable it — `-mno-avx2` (or no
@@ -292,6 +295,7 @@ fn no_fixed_slp() -> bool {
 /// baseline ISA for every supported ARMv8/v9 target.
 pub(crate) fn set_x86_simd_isa(simd: bool, avx2: bool, sse41: bool, avx512vl: bool) {
     X86_SIMD_AVAILABLE.with(|available| available.set(simd));
+    X86_SSE1_AVAILABLE.with(|available| available.set(simd));
     // AVX2 is a subset of "SIMD at all"; never let a caller assert AVX2 while
     // SIMD itself is forbidden.
     X86_AVX2_AVAILABLE.with(|available| available.set(avx2 && simd));
@@ -320,6 +324,14 @@ pub(crate) fn x86_sse41_available_pub() -> bool {
 
 fn x86_sse41_available() -> bool {
     X86_SSE41_AVAILABLE.with(|available| available.get())
+}
+
+pub(crate) fn set_x86_sse1_available(available: bool) {
+    X86_SSE1_AVAILABLE.with(|cell| cell.set(available));
+}
+
+fn x86_sse1_available() -> bool {
+    X86_SSE1_AVAILABLE.with(std::cell::Cell::get)
 }
 
 fn x86_simd_available() -> bool {
@@ -581,7 +593,7 @@ fn vectorize_with_analysis_mode(
     // pre-hoist compiler across all five environment combinations, and pinned
     // going forward by section 6 of
     // tests/regression/check_vectorize_isa_gate.sh.
-    let simd_ok = neon || x86_simd_available();
+    let simd_ok = neon || x86_simd_available() || x86_sse1_available();
     if !simd_ok && !debug {
         if why_not {
             report_simd_disabled(&func.name);
@@ -666,6 +678,21 @@ fn vectorize_with_analysis_mode(
                     "[VEC] Loop {} (header block {}) not vectorized: PGO trip/body cost veto",
                     idx, loop_info.header
                 );
+            }
+            continue;
+        }
+
+        // SSE1 is a typed subset, not permission for the reduction, integer,
+        // stencil or matmul families below. Reuse map legality/alias/tail
+        // construction only after proving every node has an SSE1 lowering.
+        if !neon && !x86_simd_available() {
+            if !late_minmax_only()
+                && !no_map_vec()
+                && let Some(pattern) = analyze_map_pattern(func, loop_info, false, symbol_facts)
+                && pattern.elem_ty == IrType::F32
+                && pattern.expr.sse1_f32_legal()
+            {
+                total_changes += transform_map_vector(func, &pattern, false, false, fp_contract);
             }
             continue;
         }
@@ -6489,6 +6516,19 @@ enum MapExpr {
 }
 
 impl MapExpr {
+    /// Exact SSE1 packed-F32 vocabulary. In particular, ROUND, integer mask
+    /// blends and fused arithmetic must not leak through an SSE1 grant.
+    fn sse1_f32_legal(&self) -> bool {
+        match self {
+            Self::Load(_) | Self::Invariant(_) => true,
+            Self::BinOp(IrBinOp::Add | IrBinOp::Sub | IrBinOp::Mul | IrBinOp::SDiv, l, r) => {
+                l.sse1_f32_legal() && r.sse1_f32_legal()
+            }
+            Self::Sqrt(x) => x.sse1_f32_legal(),
+            _ => false,
+        }
+    }
+
     /// Only short unfused arithmetic trees get the FP two-copy policy.
     /// Exclude selects, comparisons, rounding, sqrt, division and explicit
     /// FMA: their lowering/pressure is not described by this small budget.
@@ -29789,6 +29829,40 @@ mod map_unroll_policy_tests {
     }
 
     #[test]
+    fn sse1_admission_is_typed_and_excludes_sse2_trees() {
+        let divide = MapExpr::BinOp(
+            IrBinOp::SDiv,
+            Box::new(MapExpr::Load(0)),
+            Box::new(MapExpr::Load(1)),
+        );
+        assert!(divide.sse1_f32_legal());
+        assert!(MapExpr::Sqrt(Box::new(MapExpr::Load(0))).sse1_f32_legal());
+        assert!(!MapExpr::Round(0, Box::new(MapExpr::Load(0))).sse1_f32_legal());
+        let masked = MapExpr::BinOp(
+            IrBinOp::And,
+            Box::new(MapExpr::Load(0)),
+            Box::new(MapExpr::Load(1)),
+        );
+        assert!(!masked.sse1_f32_legal());
+    }
+
+    #[test]
+    fn sse1_permission_resets_without_reopening_sse2() {
+        let previous = x86_sse1_available();
+        set_x86_sse1_available(true);
+        assert!(x86_sse1_available());
+        // The ordinary setter is also used by tests/worker reuse; fail closed.
+        let simd = x86_simd_available();
+        let avx2 = x86_avx2_available();
+        let sse41 = x86_sse41_available();
+        let vl = x86_avx512vl_available_pub();
+        set_x86_simd_isa(false, false, false, false);
+        assert!(!x86_sse1_available() && !x86_simd_available());
+        set_x86_simd_isa(simd, avx2, sse41, vl);
+        set_x86_sse1_available(previous);
+    }
+
+    #[test]
     fn unroll_policy_refreshes_on_the_same_worker() {
         let previous = no_map_i64_unroll();
         set_no_map_i64_unroll(true);
@@ -32424,7 +32498,7 @@ pub(crate) fn vectorize_const_trip_map_loops(
     // The caller snapshots CCC_NO_MAP_VEC once per compilation and passes it
     // here, so this early entry and the main vectorizer cannot disagree.
     // All four guards are pure `return 0`, so the ordering is semantic-free.
-    if !x86_simd_available() {
+    if !x86_simd_available() && !x86_sse1_available() {
         return 0;
     }
     // Same scoped legality gates as the main vectorizer: a DynAlloca breaks
@@ -32466,6 +32540,11 @@ pub(crate) fn vectorize_const_trip_map_loops(
             let Some(pattern) = analyze_map_pattern(func, lp, false, symbol_facts) else {
                 continue;
             };
+            if !x86_simd_available()
+                && (pattern.elem_ty != IrType::F32 || !pattern.expr.sse1_f32_legal())
+            {
+                continue;
+            }
             if !matches!(&pattern.limit, Operand::Const(c)
                 if c.to_i64().is_some_and(|t| (5..=16).contains(&t)))
             {

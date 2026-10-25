@@ -258,6 +258,8 @@ gate "i32-map-unroll" fast \
     env CCC="$LCCC" python3 tests/regression/check_i32_map_unroll.py
 gate "fp-map-unroll" fast \
     env CCC="$LCCC" python3 tests/regression/check_fp_map_unroll.py
+gate "sse1-f32-map" fast \
+    env CCC="$LCCC" python3 tests/regression/check_sse1_f32_map.py
 # Fixed-distance SLP: complete 256-bit F32x8/F64x4 distance expressions pack
 # under fast FP semantics; strict FP, partial widths, an intervening call,
 # and the no-AVX baseline all keep scalar code. The CCC_NO_FIXED_SLP leg is

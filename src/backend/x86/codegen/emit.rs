@@ -2493,6 +2493,17 @@ impl X86Codegen {
     /// arg, alias store, sret copy) sees the data. The register still holds
     /// the value afterwards (nothing clobbers the xmm3-xmm7 pool except the
     /// value's own producer), so `vec_live_regs` is intentionally KEPT.
+    /// Bit-preserving 128-bit moves. SSE1 has MOVAPS/MOVUPS, not MOVDQA/U.
+    /// Keep the established SSE2 spelling when that class is available.
+    pub(super) fn xmm_move(&self, aligned: bool) -> &'static str {
+        match (self.isa.simd, aligned) {
+            (true, true) => "movdqa",
+            (true, false) => "movdqu",
+            (false, true) => "movaps",
+            (false, false) => "movups",
+        }
+    }
+
     pub(super) fn flush_vecreg_liveout_impl(&mut self) {
         if self.state.vec_live_regs.is_empty() {
             return;
@@ -2534,7 +2545,7 @@ impl X86Codegen {
                 } else if reg_name.starts_with("ymm") {
                     "vmovdqu"
                 } else {
-                    "movdqu"
+                    self.xmm_move(false)
                 };
                 self.state
                     .emit_fmt(format_args!("    {} %{}, (%rax)", mov, reg_name));
@@ -3595,8 +3606,12 @@ impl X86Codegen {
                     // preserve the destination's upper bits, creating a false
                     // dependency on its old value. movapd copies all 128 bits
                     // (dead above bit 63 for scalars) with no false dependency.
-                    self.state
-                        .emit_fmt(format_args!("    movapd %{}, %{}", src_xmm, reg_name));
+                    self.state.emit_fmt(format_args!(
+                        "    {} %{}, %{}",
+                        if self.isa.simd { "movapd" } else { "movaps" },
+                        src_xmm,
+                        reg_name
+                    ));
                 }
             } else if ty == IrType::F32 || ty == IrType::D32 {
                 self.state.emit_fmt(format_args!(
@@ -9621,7 +9636,11 @@ impl ArchCodegen for X86Codegen {
                         phys_reg_name_256(d)
                     };
                     if s != d {
-                        let mov = if is_128 { "movdqa" } else { "vmovdqa" };
+                        let mov = if is_128 {
+                            self.xmm_move(true)
+                        } else {
+                            "vmovdqa"
+                        };
                         self.state
                             .emit_fmt(format_args!("    {} %{}, %{}", mov, held, target));
                     }
@@ -9680,8 +9699,12 @@ impl ArchCodegen for X86Codegen {
                         // are dead for scalar F64/F32) without the reg-reg
                         // movsd merge form's false dependency on the old
                         // destination value.
-                        self.state
-                            .emit_fmt(format_args!("    movapd %{}, %{}", s_name, d_name));
+                        self.state.emit_fmt(format_args!(
+                            "    {} %{}, %{}",
+                            if self.isa.simd { "movapd" } else { "movaps" },
+                            s_name,
+                            d_name
+                        ));
                     } else {
                         self.state
                             .out

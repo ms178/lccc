@@ -57,7 +57,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 pub struct X86Isa {
     /// SSE2 vector-codegen permission (`-mno-sse`, `-mno-sse2` and
     /// `-mgeneral-regs-only` clear it). A later independent SSE1 grant does
-    /// not reopen this ceiling; scalar SSE1 follows the driver's `no_sse`.
+    /// not reopen this ceiling; SSE1 F32 maps have separate typed permission.
     pub simd: bool,
     /// SSE4.1 (`pmulld`, `roundsd`, `blendvpd`, `pmovsx*`, `pinsr*` …).
     pub sse41: bool,

@@ -107,8 +107,12 @@ impl X86Codegen {
                         self.state
                             .emit_fmt(format_args!("    v{} {}, %{}, %{}", insn, sreg, other, dst));
                     } else {
-                        self.state
-                            .emit_fmt(format_args!("    pxor %{}, %{}", dst, dst));
+                        self.state.emit_fmt(format_args!(
+                            "    {} %{}, %{}",
+                            if self.isa.simd { "pxor" } else { "xorps" },
+                            dst,
+                            dst
+                        ));
                         self.state
                             .emit_fmt(format_args!("    {} {}, %{}", insn, sreg, dst));
                     }
@@ -159,8 +163,12 @@ impl X86Codegen {
                 (false, true) => ("cvtsi2ssl", "%eax"),
                 (false, false) => ("cvtsi2ssq", "%rax"),
             };
-            self.state
-                .emit_fmt(format_args!("    pxor %{}, %{}", dst, dst));
+            self.state.emit_fmt(format_args!(
+                "    {} %{}, %{}",
+                if self.isa.simd { "pxor" } else { "xorps" },
+                dst,
+                dst
+            ));
             self.state
                 .emit_fmt(format_args!("    {} {}, %{}", insn, src, dst));
         }
