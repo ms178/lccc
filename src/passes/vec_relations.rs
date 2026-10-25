@@ -9,6 +9,9 @@ use crate::ir::reexports::{
     Instruction, IntrinsicOp, IrBinOp, IrFunction, IrModule, Operand, Value,
 };
 
+#[path = "vec_shuffle.rs"]
+mod shuffle;
+
 #[derive(Clone, Copy)]
 struct Family {
     and: IntrinsicOp,
@@ -274,6 +277,9 @@ fn fold(
     else {
         return None;
     };
+    if let Some(replacement) = shuffle::fold(inst, defs, uses, families, fresh) {
+        return Some(replacement);
+    }
     // Packed blends select register bits, not scalar Boolean values. Keep
     // the opcode (including its lane/sign-bit policy) exactly unchanged.
     let blend = matches!(

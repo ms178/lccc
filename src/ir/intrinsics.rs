@@ -421,7 +421,7 @@ pub enum IntrinsicOp {
     /// (`passes::vec_arx`) from ChaCha20/Salsa-style quarter-rounds.
     VecRotlI32x4,
     /// Vector lane shuffle: %dest_vec = pshufd(%src_vec, imm) — the
-    /// destination lane `l` reads source lane `(l + imm_selector(l)) % 4`
+    /// destination lane `l` reads source lane `(imm >> (2*l)) & 3`
     /// per the SSE2 pshufd immediate encoding (bits [2l+1:2l]). Used by
     /// the ARX pass to materialize lane-rotated frames for diagonal
     /// rounds; args[1] is the CONSTANT immediate (0..=255).

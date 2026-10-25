@@ -2513,6 +2513,32 @@ impl Lowerer {
                 .iter()
                 .enumerate()
                 .fold(0i32, |imm, (lane, &i)| imm | ((i as i32 & 3) << (lane * 2)));
+            // Canonical typed homes let vecssa expose a register permutation
+            // web. Keep volatile and named-address-space accesses on their
+            // existing memory path, and do not mix F32 and I32 home families.
+            let shape = self
+                .get_expr_ctype(&args[0])
+                .and_then(|ct| super::vector_simd::simd_shape(&ct));
+            if let Some(shape) = shape.filter(|_| {
+                !self.expr_access_is_volatile(&args[0])
+                    && !self.expr_access_is_volatile(&args[1])
+                    && self.aggregate_lvalue_space(&args[0]) == AddressSpace::Default
+                    && self.aggregate_lvalue_space(&args[1]) == AddressSpace::Default
+            }) {
+                let input = self.emit_vec_load(&shape, if first_only { v1p } else { v2p });
+                let shuffled = self.fresh_value();
+                self.emit(Instruction::Intrinsic {
+                    dest: Some(shuffled),
+                    op: IntrinsicOp::VecShufdI32x4,
+                    dest_ptr: None,
+                    args: vec![
+                        Operand::Value(input),
+                        Operand::Const(IrConst::I32(immediate)),
+                    ],
+                });
+                self.emit_vec_store(&shape, shuffled, result);
+                return Some(Operand::Value(result));
+            }
             self.emit(Instruction::Intrinsic {
                 dest: None,
                 op: IntrinsicOp::Pshufd128,
