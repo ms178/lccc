@@ -34,3 +34,26 @@ native GNU vector types, establish the wider per-function AVX ABI, complete
 remaining SSE4 APIs, or complete AVX1/AVX2 coverage. It makes no performance or
 independent expert-approval claim. Current toolchain restoration is workspace-
 private; no multilib packages are extracted over the sandbox runtime.
+
+## Native AVX2 widening family
+
+All twelve signed/unsigned 128-to-256-bit widening conversions have typed
+native lowering in both modes. Six previously missing public conversions to
+64-bit lanes are supplied; six scalar-loop implementations are replaced.
+Input loads are explicitly XMM-sized, independently of the YMM result, and
+pointer-promotion metadata records that asymmetry. GNU builtin results carry
+the correct signed native vector element type, including the PMOVZX carriers.
+The private header ABI returns a pointer; it is not confused with the GNU
+native-vector result contract. Public/raw/private spellings share one registry.
+
+Native builtin operand geometry is checked before lowering. VTEST header
+wrappers likewise use an explicitly declared private ABI, keeping GNU-native
+vector arguments separate from the current struct-based compatibility headers.
+
+The widening regression covers all 65,536 16-bit seed patterns, lane-distinct
+payloads, all public and native builtin results, sign extension boundaries and
+a 16-byte input immediately before an inaccessible page. Both standalone
+VTEST and widening witnesses passed with GCC 16.2.0, GAS 2.47.20260726 and
+mold 2.42.1 locally. Candidate acceptance and latest-stable Rust formatting are
+tracked by hosted CI; oracle success is not candidate acceptance. No runtime
+speedup has been measured or claimed.

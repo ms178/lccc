@@ -450,4 +450,46 @@ EOF
     done
 done
 
+# Widening instructions are AVX2, unlike floating-point VTEST. Even when
+# only four low source bytes participate, the C input remains a 128-bit value.
+for sign in sx zx; do
+    for shape in bw bd bq wd wq dq; do
+        input=char
+        output=short
+        case "$shape" in
+            wd|wq) input=short ;;
+            dq) input=int ;;
+        esac
+        case "$shape" in
+            bd|wd) output=int ;;
+            bq|wq|dq) output='long long' ;;
+        esac
+        src=widen-$sign-$shape.c
+        cat >"$tmp/$src" <<EOF
+typedef $input source __attribute__((vector_size(16)));
+typedef $output result __attribute__((vector_size(32)));
+result widen(source a) { return __builtin_ia32_pmov$sign${shape}256(a); }
+EOF
+        for mode in -m64 -m32; do
+            reject "$src" -mavx2 "$mode" -mavx -mno-avx2
+            accept "$src" "vpmov$sign$shape" "$mode" -mavx2
+        done
+    done
+done
+
+# Native builtins must reject scalar or wrong-width operands before codegen.
+cat >"$tmp/vtest_wrong_shape.c" <<'EOF'
+typedef float v4sf __attribute__((vector_size(16)));
+int wrong(v4sf a) { return __builtin_ia32_vtestzps256(a, a); }
+EOF
+cat >"$tmp/widen_wrong_shape.c" <<'EOF'
+typedef char v32qi __attribute__((vector_size(32)));
+typedef short v16hi __attribute__((vector_size(32)));
+v16hi wrong(v32qi a) { return __builtin_ia32_pmovsxbw256(a); }
+EOF
+for mode in -m64 -m32; do
+    reject vtest_wrong_shape.c 'requires two' "$mode" -mavx
+    reject widen_wrong_shape.c 'requires a 128-bit vector' "$mode" -mavx2
+done
+
 echo "PASS: ISA-sensitive intrinsics are gated on the permitted feature set, oracle-checked"

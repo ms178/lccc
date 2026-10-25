@@ -616,6 +616,73 @@ impl Lowerer {
         Operand::Value(result)
     }
 
+    /// Preserve the 16-byte source / 32-byte destination contract across
+    /// public struct wrappers and GCC native-vector builtin expressions.
+    fn lower_avx_widen(
+        &mut self,
+        op: crate::common::avx_widen::AvxWiden,
+        name: &str,
+        args: &[Expr],
+    ) -> Option<Operand> {
+        self.check_x86_intrinsic_feature(&BuiltinIntrinsic::X86AvxWiden(op), name, args);
+        if args.len() != 1 {
+            return self.reject_builtin_call(
+                format!("'{}' requires 1 argument", name),
+                args,
+                32,
+            );
+        }
+        if !matches!(
+            self.target,
+            crate::backend::Target::X86_64 | crate::backend::Target::I686
+        ) {
+            return self.reject_builtin_call(
+                format!("'{}' is not available on {}", name, self.target.triple()),
+                args,
+                32,
+            );
+        }
+        if name.starts_with("__builtin_ia32_") {
+            let valid = self.get_expr_ctype(&args[0]).is_some_and(|ctype| {
+                ctype.vector_info().is_some_and(|(element, lanes)| {
+                    element.is_integer()
+                        && !matches!(element, CType::Bool)
+                        && element.size() * 8 == op.source_bits()
+                        && lanes == 128 / op.source_bits()
+                })
+            });
+            if !valid {
+                return self.reject_builtin_call(
+                    format!(
+                        "'{}' requires a 128-bit vector of {}-bit integers",
+                        name,
+                        op.source_bits()
+                    ),
+                    args,
+                    32,
+                );
+            }
+        }
+        let input = self.vec128_arg_ptr(&args[0]);
+        let result = self.fresh_value();
+        self.emit(Instruction::Alloca {
+            dest: result,
+            ty: IrType::Ptr,
+            size: 32,
+            align: 32,
+            volatile: false,
+            semantic_volatile: false,
+        });
+        let dest = self.fresh_value();
+        self.emit(Instruction::Intrinsic {
+            dest: Some(dest),
+            op: IntrinsicOp::AvxWiden(op),
+            dest_ptr: Some(result),
+            args: vec![input],
+        });
+        Some(Operand::Value(result))
+    }
+
     /// VTEST returns scalar flags from native vector operands. In particular,
     /// it must not be lowered to PTEST, which observes every payload bit.
     fn lower_avx_test(
@@ -641,6 +708,31 @@ impl Lowerer {
                 args,
                 test.width(),
             );
+        }
+        if name.starts_with("__builtin_ia32_") {
+            let expected = if test.double {
+                CType::Double
+            } else {
+                CType::Float
+            };
+            let valid = args.iter().all(|arg| {
+                self.get_expr_ctype(arg).is_some_and(|ctype| {
+                    ctype.vector_info().is_some_and(|(element, lanes)| {
+                        *element == expected && lanes * element.size() == test.width()
+                    })
+                })
+            });
+            if !valid {
+                return self.reject_builtin_call(
+                    format!(
+                        "'{}' requires two {}-bit floating-point vectors",
+                        name,
+                        test.width() * 8
+                    ),
+                    args,
+                    test.width(),
+                );
+            }
         }
         let operands = args
             .iter()
@@ -1437,6 +1529,7 @@ impl Lowerer {
             // width, any power-of-two-or-not lane count.
             BuiltinIntrinsic::Shuffle => self.lower_shuffle(args),
             // Generic SIMD family: __lccc_simd{128|256|512}_{i|ps|pd}_{mnemonic}
+            BuiltinIntrinsic::X86AvxWiden(op) => self.lower_avx_widen(*op, name, args),
             BuiltinIntrinsic::X86AvxTest(test) => self.lower_avx_test(*test, name, args),
             BuiltinIntrinsic::LcccSimd => self.lower_lccc_simd(name, args),
             // __builtin___*_chk: fortification builtins forward to unchecked libc equivalents.
@@ -2705,6 +2798,7 @@ impl Lowerer {
         // it into another function or claiming per-function wider-vector support.
         use crate::common::x86_features::X86Feature as F;
         let needed = match requirement.feature {
+            F::Avx2 => Some(7),
             F::Avx => Some(6),
             F::Ssse3 => Some(3),
             F::Sse41 => Some(4),
@@ -2723,7 +2817,8 @@ impl Lowerer {
                     "ssse3" => 3,
                     "sse4.1" => 4,
                     "sse4.2" => 5,
-                    "avx" | "avx2" => 6,
+                    "avx" => 6,
+                    "avx2" => 7,
                     _ => continue,
                 };
                 if enabled && level >= needed {
@@ -3432,6 +3527,11 @@ fn x86_intrinsic_required_feature(intrinsic: &BuiltinIntrinsic) -> Option<Intrin
     use crate::common::x86_features::X86Feature as F;
     use BuiltinIntrinsic as B;
     Some(match intrinsic {
+        B::X86AvxWiden(_) => IntrinsicRequirement {
+            feature: F::Avx2,
+            flag: "-mavx2",
+            also: None,
+        },
         B::X86AvxTest(_) => IntrinsicRequirement {
             feature: F::Avx,
             flag: "-mavx",

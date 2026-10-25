@@ -1,6 +1,7 @@
 pub(crate) mod asm_constraints;
 pub(crate) mod asm_scan;
 pub(crate) mod avx_test;
+pub(crate) mod avx_widen;
 pub(crate) mod const_arith;
 pub(crate) mod const_eval;
 pub(crate) mod cpu_probe;

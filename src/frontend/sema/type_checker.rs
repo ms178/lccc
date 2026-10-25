@@ -1185,6 +1185,9 @@ impl<'a> ExprTypeChecker<'a> {
     /// This is the CType-level equivalent of the lowerer's builtin_return_type (IrType).
     /// TODO: consolidate with sema/builtins.rs BuiltinInfo to avoid duplication.
     pub(crate) fn builtin_return_ctype(name: &str) -> Option<CType> {
+        if let Some(op) = crate::common::avx_widen::AvxWiden::raw_builtin(name) {
+            return Some(CType::Vector(Box::new(op.result_element()), 32));
+        }
         match name {
             // BMI2 BZHI returns its operand type.
             "__builtin_ia32_bzhi_si" => Some(CType::UInt),

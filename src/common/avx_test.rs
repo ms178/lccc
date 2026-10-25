@@ -16,19 +16,11 @@ pub struct AvxTest {
 
 impl AvxTest {
     pub fn width(self) -> usize {
-        if self.wide {
-            32
-        } else {
-            16
-        }
+        if self.wide { 32 } else { 16 }
     }
 
     pub fn mnemonic(self) -> &'static str {
-        if self.double {
-            "vtestpd"
-        } else {
-            "vtestps"
-        }
+        if self.double { "vtestpd" } else { "vtestps" }
     }
 
     pub fn setcc(self) -> &'static str {
@@ -41,10 +33,11 @@ impl AvxTest {
 }
 
 /// Public API and GCC builtin spellings share one typed operand contract.
-pub const AVX_TESTS: &[(&str, &str, AvxTest)] = &[
+pub const AVX_TESTS: &[(&str, &str, &str, AvxTest)] = &[
     (
         "_mm_testz_ps",
         "__builtin_ia32_vtestzps",
+        "__lccc_avx_testzps128",
         AvxTest {
             double: false,
             wide: false,
@@ -54,6 +47,7 @@ pub const AVX_TESTS: &[(&str, &str, AvxTest)] = &[
     (
         "_mm_testc_ps",
         "__builtin_ia32_vtestcps",
+        "__lccc_avx_testcps128",
         AvxTest {
             double: false,
             wide: false,
@@ -63,6 +57,7 @@ pub const AVX_TESTS: &[(&str, &str, AvxTest)] = &[
     (
         "_mm_testnzc_ps",
         "__builtin_ia32_vtestnzcps",
+        "__lccc_avx_testnzcps128",
         AvxTest {
             double: false,
             wide: false,
@@ -72,6 +67,7 @@ pub const AVX_TESTS: &[(&str, &str, AvxTest)] = &[
     (
         "_mm_testz_pd",
         "__builtin_ia32_vtestzpd",
+        "__lccc_avx_testzpd128",
         AvxTest {
             double: true,
             wide: false,
@@ -81,6 +77,7 @@ pub const AVX_TESTS: &[(&str, &str, AvxTest)] = &[
     (
         "_mm_testc_pd",
         "__builtin_ia32_vtestcpd",
+        "__lccc_avx_testcpd128",
         AvxTest {
             double: true,
             wide: false,
@@ -90,6 +87,7 @@ pub const AVX_TESTS: &[(&str, &str, AvxTest)] = &[
     (
         "_mm_testnzc_pd",
         "__builtin_ia32_vtestnzcpd",
+        "__lccc_avx_testnzcpd128",
         AvxTest {
             double: true,
             wide: false,
@@ -99,6 +97,7 @@ pub const AVX_TESTS: &[(&str, &str, AvxTest)] = &[
     (
         "_mm256_testz_ps",
         "__builtin_ia32_vtestzps256",
+        "__lccc_avx_testzps256",
         AvxTest {
             double: false,
             wide: true,
@@ -108,6 +107,7 @@ pub const AVX_TESTS: &[(&str, &str, AvxTest)] = &[
     (
         "_mm256_testc_ps",
         "__builtin_ia32_vtestcps256",
+        "__lccc_avx_testcps256",
         AvxTest {
             double: false,
             wide: true,
@@ -117,6 +117,7 @@ pub const AVX_TESTS: &[(&str, &str, AvxTest)] = &[
     (
         "_mm256_testnzc_ps",
         "__builtin_ia32_vtestnzcps256",
+        "__lccc_avx_testnzcps256",
         AvxTest {
             double: false,
             wide: true,
@@ -126,6 +127,7 @@ pub const AVX_TESTS: &[(&str, &str, AvxTest)] = &[
     (
         "_mm256_testz_pd",
         "__builtin_ia32_vtestzpd256",
+        "__lccc_avx_testzpd256",
         AvxTest {
             double: true,
             wide: true,
@@ -135,6 +137,7 @@ pub const AVX_TESTS: &[(&str, &str, AvxTest)] = &[
     (
         "_mm256_testc_pd",
         "__builtin_ia32_vtestcpd256",
+        "__lccc_avx_testcpd256",
         AvxTest {
             double: true,
             wide: true,
@@ -144,6 +147,7 @@ pub const AVX_TESTS: &[(&str, &str, AvxTest)] = &[
     (
         "_mm256_testnzc_pd",
         "__builtin_ia32_vtestnzcpd256",
+        "__lccc_avx_testnzcpd256",
         AvxTest {
             double: true,
             wide: true,
@@ -159,15 +163,16 @@ mod tests {
     #[test]
     fn complete_cartesian_product_and_unique_spellings() {
         assert_eq!(AVX_TESTS.len(), 12);
-        for (index, &(public, raw, test)) in AVX_TESTS.iter().enumerate() {
+        for (index, &(public, raw, private, test)) in AVX_TESTS.iter().enumerate() {
             assert_eq!(test.width(), if test.wide { 32 } else { 16 });
             assert_eq!(
                 test.mnemonic(),
                 if test.double { "vtestpd" } else { "vtestps" }
             );
-            for &(other_public, other_raw, other_test) in &AVX_TESTS[index + 1..] {
+            for &(other_public, other_raw, other_private, other_test) in &AVX_TESTS[index + 1..] {
                 assert_ne!(public, other_public);
                 assert_ne!(raw, other_raw);
+                assert_ne!(private, other_private);
                 assert_ne!(test, other_test);
             }
         }

@@ -819,78 +819,90 @@ _mm256_srli_si256(__m256i __a, int __imm)
     return __r;
 }
 
-/* === Conversion / Sign Extension === */
+/* === Native AVX2 Sign / Zero Extension === */
 
-/* _mm256_cvtepi8_epi16: sign-extend 16 packed 8-bit to 16 packed 16-bit (VPMOVSXBW) */
-static __inline__ __m256i __attribute__((__always_inline__))
+void *__lccc_avx2_pmovsxbw256(__m128i);
+static __inline__ __m256i __attribute__((__always_inline__, __target__("avx2")))
 _mm256_cvtepi8_epi16(__m128i __a)
 {
-    signed char *__pa = (signed char *)&__a;
-    __m256i __r;
-    short *__pr = (short *)&__r;
-    for (int __i = 0; __i < 16; __i++)
-        __pr[__i] = (short)__pa[__i];
-    return __r;
+    return __CCC_M256I_FROM_BUILTIN(__lccc_avx2_pmovsxbw256(__a));
 }
 
-/* _mm256_cvtepi8_epi32: sign-extend 8 packed 8-bit to 8 packed 32-bit (VPMOVSXBD) */
-static __inline__ __m256i __attribute__((__always_inline__))
+void *__lccc_avx2_pmovsxbd256(__m128i);
+static __inline__ __m256i __attribute__((__always_inline__, __target__("avx2")))
 _mm256_cvtepi8_epi32(__m128i __a)
 {
-    signed char *__pa = (signed char *)&__a;
-    __m256i __r;
-    int *__pr = (int *)&__r;
-    for (int __i = 0; __i < 8; __i++)
-        __pr[__i] = (int)__pa[__i];
-    return __r;
+    return __CCC_M256I_FROM_BUILTIN(__lccc_avx2_pmovsxbd256(__a));
 }
 
-/* _mm256_cvtepi16_epi32: sign-extend 8 packed 16-bit to 8 packed 32-bit (VPMOVSXWD) */
-static __inline__ __m256i __attribute__((__always_inline__))
+void *__lccc_avx2_pmovsxbq256(__m128i);
+static __inline__ __m256i __attribute__((__always_inline__, __target__("avx2")))
+_mm256_cvtepi8_epi64(__m128i __a)
+{
+    return __CCC_M256I_FROM_BUILTIN(__lccc_avx2_pmovsxbq256(__a));
+}
+
+void *__lccc_avx2_pmovsxwd256(__m128i);
+static __inline__ __m256i __attribute__((__always_inline__, __target__("avx2")))
 _mm256_cvtepi16_epi32(__m128i __a)
 {
-    short *__pa = (short *)&__a;
-    __m256i __r;
-    int *__pr = (int *)&__r;
-    for (int __i = 0; __i < 8; __i++)
-        __pr[__i] = (int)__pa[__i];
-    return __r;
+    return __CCC_M256I_FROM_BUILTIN(__lccc_avx2_pmovsxwd256(__a));
 }
 
-/* _mm256_cvtepu8_epi16: zero-extend 16 packed 8-bit to 16 packed 16-bit (VPMOVZXBW) */
-static __inline__ __m256i __attribute__((__always_inline__))
+void *__lccc_avx2_pmovsxwq256(__m128i);
+static __inline__ __m256i __attribute__((__always_inline__, __target__("avx2")))
+_mm256_cvtepi16_epi64(__m128i __a)
+{
+    return __CCC_M256I_FROM_BUILTIN(__lccc_avx2_pmovsxwq256(__a));
+}
+
+void *__lccc_avx2_pmovsxdq256(__m128i);
+static __inline__ __m256i __attribute__((__always_inline__, __target__("avx2")))
+_mm256_cvtepi32_epi64(__m128i __a)
+{
+    return __CCC_M256I_FROM_BUILTIN(__lccc_avx2_pmovsxdq256(__a));
+}
+
+void *__lccc_avx2_pmovzxbw256(__m128i);
+static __inline__ __m256i __attribute__((__always_inline__, __target__("avx2")))
 _mm256_cvtepu8_epi16(__m128i __a)
 {
-    unsigned char *__pa = (unsigned char *)&__a;
-    __m256i __r;
-    short *__pr = (short *)&__r;
-    for (int __i = 0; __i < 16; __i++)
-        __pr[__i] = (short)(unsigned short)__pa[__i];
-    return __r;
+    return __CCC_M256I_FROM_BUILTIN(__lccc_avx2_pmovzxbw256(__a));
 }
 
-/* _mm256_cvtepu8_epi32: zero-extend 8 packed 8-bit to 8 packed 32-bit (VPMOVZXBD) */
-static __inline__ __m256i __attribute__((__always_inline__))
+void *__lccc_avx2_pmovzxbd256(__m128i);
+static __inline__ __m256i __attribute__((__always_inline__, __target__("avx2")))
 _mm256_cvtepu8_epi32(__m128i __a)
 {
-    unsigned char *__pa = (unsigned char *)&__a;
-    __m256i __r;
-    int *__pr = (int *)&__r;
-    for (int __i = 0; __i < 8; __i++)
-        __pr[__i] = (int)(unsigned int)__pa[__i];
-    return __r;
+    return __CCC_M256I_FROM_BUILTIN(__lccc_avx2_pmovzxbd256(__a));
 }
 
-/* _mm256_cvtepu16_epi32: zero-extend 8 packed 16-bit to 8 packed 32-bit (VPMOVZXWD) */
-static __inline__ __m256i __attribute__((__always_inline__))
+void *__lccc_avx2_pmovzxbq256(__m128i);
+static __inline__ __m256i __attribute__((__always_inline__, __target__("avx2")))
+_mm256_cvtepu8_epi64(__m128i __a)
+{
+    return __CCC_M256I_FROM_BUILTIN(__lccc_avx2_pmovzxbq256(__a));
+}
+
+void *__lccc_avx2_pmovzxwd256(__m128i);
+static __inline__ __m256i __attribute__((__always_inline__, __target__("avx2")))
 _mm256_cvtepu16_epi32(__m128i __a)
 {
-    unsigned short *__pa = (unsigned short *)&__a;
-    __m256i __r;
-    int *__pr = (int *)&__r;
-    for (int __i = 0; __i < 8; __i++)
-        __pr[__i] = (int)(unsigned int)__pa[__i];
-    return __r;
+    return __CCC_M256I_FROM_BUILTIN(__lccc_avx2_pmovzxwd256(__a));
+}
+
+void *__lccc_avx2_pmovzxwq256(__m128i);
+static __inline__ __m256i __attribute__((__always_inline__, __target__("avx2")))
+_mm256_cvtepu16_epi64(__m128i __a)
+{
+    return __CCC_M256I_FROM_BUILTIN(__lccc_avx2_pmovzxwq256(__a));
+}
+
+void *__lccc_avx2_pmovzxdq256(__m128i);
+static __inline__ __m256i __attribute__((__always_inline__, __target__("avx2")))
+_mm256_cvtepu32_epi64(__m128i __a)
+{
+    return __CCC_M256I_FROM_BUILTIN(__lccc_avx2_pmovzxdq256(__a));
 }
 
 /* === Multiply-Add === */

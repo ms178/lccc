@@ -18,6 +18,7 @@
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IntrinsicOp {
+    AvxWiden(crate::common::avx_widen::AvxWiden),
     AvxTest(crate::common::avx_test::AvxTest),
     /// Memory fence operations (no dest, no args beyond optional ptr)
     Lfence,
@@ -2051,6 +2052,9 @@ impl IntrinsicOp {
     /// slot protection without pretending that stores return vector values.
     /// Scalar reductions/extracts are excluded even if their inputs are SIMD.
     pub fn vector_home_width(&self) -> Option<u32> {
+        if matches!(self, Self::AvxWiden(_)) {
+            return Some(32);
+        }
         use IntrinsicOp::*;
         match self {
             // ---- 256-bit AVX/AVX2 results ----
@@ -2430,7 +2434,7 @@ impl IntrinsicOp {
     /// store-interval and load-interval legality rules) need this; writes
     /// are covered by [`Instruction::may_write_memory`].
     pub fn may_read_memory(&self) -> bool {
-        if matches!(self, Self::AvxTest(_)) {
+        if matches!(self, Self::AvxTest(_) | Self::AvxWiden(_)) {
             return true;
         }
         matches!(

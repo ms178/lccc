@@ -708,10 +708,10 @@ for bits in (128, 256):
     for suffix in ("ps", "pd"):
         vty = f"__m{bits}" + ("d" if suffix == "pd" else "")
         prefix = "_mm256" if bits == 256 else "_mm"
-        raw_width = "256" if bits == 256 else ""
         for flag in ("z", "c", "nzc"):
             name = f"{prefix}_test{flag}_{suffix}"
-            builtin = f"__builtin_ia32_vtest{flag}{suffix}{raw_width}"
+            builtin = f"__lccc_avx_test{flag}{suffix}{bits}"
+            w(f"int {builtin}({vty}, {vty});")
             w(f"static __inline__ int __attribute__((__always_inline__, __artificial__, __target__(\"avx\")))")
             w(f"{name}({vty} __a, {vty} __b)")
             w(f"{{ return {builtin}(__a, __b); }}")

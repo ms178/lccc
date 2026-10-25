@@ -3062,12 +3062,21 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Loadu256),
     );
 
-    for &(public, raw, test) in crate::common::avx_test::AVX_TESTS {
-        m.insert(
-            public,
-            BuiltinInfo::intrinsic(BuiltinIntrinsic::X86AvxTest(test)),
-        );
-        m.insert(raw, BuiltinInfo::intrinsic(BuiltinIntrinsic::X86AvxTest(test)));
+    for &(public, raw, private, test) in crate::common::avx_test::AVX_TESTS {
+        for name in [public, raw, private] {
+            m.insert(
+                name,
+                BuiltinInfo::intrinsic(BuiltinIntrinsic::X86AvxTest(test)),
+            );
+        }
+    }
+    for &(public, raw, private, op) in crate::common::avx_widen::AVX_WIDEN {
+        for name in [public, raw, private] {
+            m.insert(
+                name,
+                BuiltinInfo::intrinsic(BuiltinIntrinsic::X86AvxWiden(op)),
+            );
+        }
     }
     m
 });
@@ -3097,6 +3106,7 @@ pub enum BuiltinKind {
 /// Intrinsics that need target-specific codegen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuiltinIntrinsic {
+    X86AvxWiden(crate::common::avx_widen::AvxWiden),
     X86AvxTest(crate::common::avx_test::AvxTest),
     Clz,
     Ctz,

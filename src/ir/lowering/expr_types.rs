@@ -430,6 +430,9 @@ impl Lowerer {
     /// Return the IR type for known builtins that return float or specific types.
     /// Returns None for builtins without special return type handling.
     pub(super) fn builtin_return_type(&self, name: &str) -> Option<IrType> {
+        if crate::common::avx_widen::AvxWiden::raw_builtin(name).is_some() {
+            return Some(IrType::Ptr);
+        }
         match name {
             "__builtin_shufflevector" => Some(IrType::Ptr),
             // x86 vector scalar extractions with 64-bit results (long long /

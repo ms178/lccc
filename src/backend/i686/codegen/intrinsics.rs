@@ -39,6 +39,14 @@ impl I686Codegen {
         args: &[Operand],
     ) {
         match op {
+            IntrinsicOp::AvxWiden(op) => {
+                if let Some(ptr) = dest_ptr {
+                    self.emit_avx_load128(&args[0], "xmm0");
+                    self.state
+                        .emit_fmt(format_args!("    {} %xmm0, %ymm0", op.mnemonic()));
+                    self.emit_avx_store_dest(ptr);
+                }
+            }
             IntrinsicOp::AvxTest(test) => {
                 let (lhs, rhs) = if test.wide {
                     ("ymm0", "ymm1")
@@ -47,10 +55,8 @@ impl I686Codegen {
                 };
                 self.emit_avx_load(&args[0], lhs);
                 self.emit_avx_load(&args[1], rhs);
-                self.state.emit_fmt(format_args!(
-                    "    {} %{}, %{}",
-                    test.mnemonic(), rhs, lhs
-                ));
+                self.state
+                    .emit_fmt(format_args!("    {} %{}, %{}", test.mnemonic(), rhs, lhs));
                 self.state
                     .emit_fmt(format_args!("    {} %al", test.setcc()));
                 self.state.emit("    movzbl %al, %eax");

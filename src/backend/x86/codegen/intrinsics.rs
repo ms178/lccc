@@ -2156,6 +2156,14 @@ impl X86Codegen {
             _ => self.service_pending_vec_store(op, args),
         }
         match op {
+            IntrinsicOp::AvxWiden(op) => {
+                if let Some(ptr) = dest_ptr {
+                    self.sse_load_arg(&args[0], "xmm0");
+                    self.state
+                        .emit_fmt(format_args!("    {} %xmm0, %ymm0", op.mnemonic()));
+                    self.avx_store_dest(ptr);
+                }
+            }
             IntrinsicOp::AvxTest(test) => {
                 let (lhs, rhs) = if test.wide {
                     ("ymm0", "ymm1")
@@ -2164,10 +2172,8 @@ impl X86Codegen {
                 };
                 self.simd_load_arg_to(&args[0], lhs);
                 self.simd_load_arg_to(&args[1], rhs);
-                self.state.emit_fmt(format_args!(
-                    "    {} %{}, %{}",
-                    test.mnemonic(), rhs, lhs
-                ));
+                self.state
+                    .emit_fmt(format_args!("    {} %{}, %{}", test.mnemonic(), rhs, lhs));
                 self.state
                     .emit_fmt(format_args!("    {} %al", test.setcc()));
                 self.state.emit("    movzbl %al, %eax");
