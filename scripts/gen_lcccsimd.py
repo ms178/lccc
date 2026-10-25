@@ -292,7 +292,6 @@ FP256_UNI = [
 FP256_SCALAR = [
     ("movemask_ps", "vmovmskps256", "int", "M256"),
     ("movemask_pd", "vmovmskpd256", "int", "M256D"),
-    ("testz_ps", "vtestps256", "int", "M256"),
 ]
 FP256_UIMM = [
     ("round_ps", "vroundps256", "__m256", "M256"),
@@ -700,11 +699,23 @@ for name, mn in FP256_VAR:
          f"{{ return __CCC_{m}_FROM_BUILTIN(__lccc_simd256_ps_{mn}(0, __a, __b)); }}")
 for name, mn, rty, m in FP256_SCALAR:
     vty = "__" + m.lower()
-    params = f"{vty} __a" + (f", {vty} __b" if name == "testz_ps" else "")
-    operands = "__a, __b" if name == "testz_ps" else "__a"
-    w(f"{rty} __lccc_simd256_ps_{mn}(long, {params});")
-    wrap(f"{rty} _mm256_{name}({params})",
-         f"{{ return __lccc_simd256_ps_{mn}(0, {operands}); }}")
+    w(f"{rty} __lccc_simd256_ps_{mn}(long, {vty} __a);")
+    wrap(f"{rty} _mm256_{name}({vty} __a)",
+         f"{{ return __lccc_simd256_ps_{mn}(0, __a); }}")
+# VTEST is a two-vector sign-bit reduction, not an integer PTEST or a
+# floating-point comparison. Keep every width/type/flag API on the raw builtin.
+for bits in (128, 256):
+    for suffix in ("ps", "pd"):
+        vty = f"__m{bits}" + ("d" if suffix == "pd" else "")
+        prefix = "_mm256" if bits == 256 else "_mm"
+        raw_width = "256" if bits == 256 else ""
+        for flag in ("z", "c", "nzc"):
+            name = f"{prefix}_test{flag}_{suffix}"
+            builtin = f"__builtin_ia32_vtest{flag}{suffix}{raw_width}"
+            w(f"static __inline__ int __attribute__((__always_inline__, __artificial__, __target__(\"avx\")))")
+            w(f"{name}({vty} __a, {vty} __b)")
+            w(f"{{ return {builtin}(__a, __b); }}")
+            w("")
 for name, mn, rty, m in FP256_UIMM:
     proto(f"256_ps_{mn}", rty[2:], ["long", rty + " __a"])
     macro(f"_mm256_{name}(__a, __imm)",

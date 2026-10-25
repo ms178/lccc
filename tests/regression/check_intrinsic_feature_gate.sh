@@ -428,4 +428,26 @@ debt_ymm i686_ymm_float.c addps -m32
 debt_ymm i686_ymm_float.c addps -m32 -mno-avx
 debt_ymm i686_ymm_int.c paddd -m32 -mno-avx2
 
+# All VTEST scalar flags require AVX even at 128 bits; none require AVX2.
+# Compile-only raw vector sources need no target libc headers in either mode.
+for bits in 128 256; do
+    for kind in ps pd; do
+        element=float
+        [ "$kind" = pd ] && element=double
+        suffix=
+        [ "$bits" = 256 ] && suffix=256
+        for flag in z c nzc; do
+            src=vtest-$bits-$kind-$flag.c
+            cat >"$tmp/$src" <<EOF
+typedef $element vec __attribute__((vector_size($((bits / 8)))));
+int test(vec a, vec b) { return __builtin_ia32_vtest$flag$kind$suffix(a, b); }
+EOF
+            for mode in -m64 -m32; do
+                reject "$src" -mavx "$mode" -mavx -mno-avx
+                accept "$src" "vtest$kind" "$mode" -mavx -mno-avx2
+            done
+        done
+    done
+done
+
 echo "PASS: ISA-sensitive intrinsics are gated on the permitted feature set, oracle-checked"

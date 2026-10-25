@@ -2156,6 +2156,26 @@ impl X86Codegen {
             _ => self.service_pending_vec_store(op, args),
         }
         match op {
+            IntrinsicOp::AvxTest(test) => {
+                let (lhs, rhs) = if test.wide {
+                    ("ymm0", "ymm1")
+                } else {
+                    ("xmm0", "xmm1")
+                };
+                self.simd_load_arg_to(&args[0], lhs);
+                self.simd_load_arg_to(&args[1], rhs);
+                self.state.emit_fmt(format_args!(
+                    "    {} %{}, %{}",
+                    test.mnemonic(), rhs, lhs
+                ));
+                self.state
+                    .emit_fmt(format_args!("    {} %al", test.setcc()));
+                self.state.emit("    movzbl %al, %eax");
+                self.state.reg_cache.invalidate_acc();
+                if let Some(dest) = dest {
+                    self.store_rax_to(dest);
+                }
+            }
             IntrinsicOp::Lfence => {
                 self.state.emit("    lfence");
             }

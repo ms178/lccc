@@ -123,6 +123,9 @@ fn direct_vector_load_width(op: IntrinsicOp) -> Option<usize> {
 /// deliberately not vector-value operands even though the backend also reads
 /// memory through them.  Scalar/immediate positions are likewise excluded.
 fn pointer_vector_arg_width(op: IntrinsicOp, index: usize) -> Option<usize> {
+    if let IntrinsicOp::AvxTest(test) = op {
+        return (index < 2).then_some(test.width());
+    }
     use IntrinsicOp as O;
 
     // Load256 is a valid full-width producer, but its source carries a 32-byte

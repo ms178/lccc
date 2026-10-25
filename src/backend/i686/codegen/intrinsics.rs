@@ -39,6 +39,26 @@ impl I686Codegen {
         args: &[Operand],
     ) {
         match op {
+            IntrinsicOp::AvxTest(test) => {
+                let (lhs, rhs) = if test.wide {
+                    ("ymm0", "ymm1")
+                } else {
+                    ("xmm0", "xmm1")
+                };
+                self.emit_avx_load(&args[0], lhs);
+                self.emit_avx_load(&args[1], rhs);
+                self.state.emit_fmt(format_args!(
+                    "    {} %{}, %{}",
+                    test.mnemonic(), rhs, lhs
+                ));
+                self.state
+                    .emit_fmt(format_args!("    {} %al", test.setcc()));
+                self.state.emit("    movzbl %al, %eax");
+                self.state.reg_cache.invalidate_acc();
+                if let Some(dest) = dest {
+                    self.store_eax_to(dest);
+                }
+            }
             // --- Memory fences (same x86 instructions as x86-64) ---
             IntrinsicOp::Lfence => {
                 self.state.emit("    lfence");

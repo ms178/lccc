@@ -1272,9 +1272,53 @@ int __lccc_simd256_ps_vmovmskpd256(long, __m256d __a);
 static __inline__ int _mm256_movemask_pd(__m256d __a) __attribute__((__always_inline__, __artificial__))
 { return __lccc_simd256_ps_vmovmskpd256(0, __a); }
 
-int __lccc_simd256_ps_vtestps256(long, __m256 __a, __m256 __b);
-static __inline__ int _mm256_testz_ps(__m256 __a, __m256 __b) __attribute__((__always_inline__, __artificial__))
-{ return __lccc_simd256_ps_vtestps256(0, __a, __b); }
+static __inline__ int __attribute__((__always_inline__, __artificial__, __target__("avx")))
+_mm_testz_ps(__m128 __a, __m128 __b)
+{ return __builtin_ia32_vtestzps(__a, __b); }
+
+static __inline__ int __attribute__((__always_inline__, __artificial__, __target__("avx")))
+_mm_testc_ps(__m128 __a, __m128 __b)
+{ return __builtin_ia32_vtestcps(__a, __b); }
+
+static __inline__ int __attribute__((__always_inline__, __artificial__, __target__("avx")))
+_mm_testnzc_ps(__m128 __a, __m128 __b)
+{ return __builtin_ia32_vtestnzcps(__a, __b); }
+
+static __inline__ int __attribute__((__always_inline__, __artificial__, __target__("avx")))
+_mm_testz_pd(__m128d __a, __m128d __b)
+{ return __builtin_ia32_vtestzpd(__a, __b); }
+
+static __inline__ int __attribute__((__always_inline__, __artificial__, __target__("avx")))
+_mm_testc_pd(__m128d __a, __m128d __b)
+{ return __builtin_ia32_vtestcpd(__a, __b); }
+
+static __inline__ int __attribute__((__always_inline__, __artificial__, __target__("avx")))
+_mm_testnzc_pd(__m128d __a, __m128d __b)
+{ return __builtin_ia32_vtestnzcpd(__a, __b); }
+
+static __inline__ int __attribute__((__always_inline__, __artificial__, __target__("avx")))
+_mm256_testz_ps(__m256 __a, __m256 __b)
+{ return __builtin_ia32_vtestzps256(__a, __b); }
+
+static __inline__ int __attribute__((__always_inline__, __artificial__, __target__("avx")))
+_mm256_testc_ps(__m256 __a, __m256 __b)
+{ return __builtin_ia32_vtestcps256(__a, __b); }
+
+static __inline__ int __attribute__((__always_inline__, __artificial__, __target__("avx")))
+_mm256_testnzc_ps(__m256 __a, __m256 __b)
+{ return __builtin_ia32_vtestnzcps256(__a, __b); }
+
+static __inline__ int __attribute__((__always_inline__, __artificial__, __target__("avx")))
+_mm256_testz_pd(__m256d __a, __m256d __b)
+{ return __builtin_ia32_vtestzpd256(__a, __b); }
+
+static __inline__ int __attribute__((__always_inline__, __artificial__, __target__("avx")))
+_mm256_testc_pd(__m256d __a, __m256d __b)
+{ return __builtin_ia32_vtestcpd256(__a, __b); }
+
+static __inline__ int __attribute__((__always_inline__, __artificial__, __target__("avx")))
+_mm256_testnzc_pd(__m256d __a, __m256d __b)
+{ return __builtin_ia32_vtestnzcpd256(__a, __b); }
 
 __m256 __lccc_simd256_ps_vroundps256(long, __m256 __a);
 #define _mm256_round_ps(__a, __imm) __CCC_M256_FROM_BUILTIN(__lccc_simd256_ps_vroundps256(__imm, __a))

@@ -616,6 +616,52 @@ impl Lowerer {
         Operand::Value(result)
     }
 
+    /// VTEST returns scalar flags from native vector operands. In particular,
+    /// it must not be lowered to PTEST, which observes every payload bit.
+    fn lower_avx_test(
+        &mut self,
+        test: crate::common::avx_test::AvxTest,
+        name: &str,
+        args: &[Expr],
+    ) -> Option<Operand> {
+        self.check_x86_intrinsic_feature(&BuiltinIntrinsic::X86AvxTest(test), name, args);
+        if args.len() != 2 {
+            return self.reject_builtin_call(
+                format!("'{}' requires 2 arguments", name),
+                args,
+                test.width(),
+            );
+        }
+        if !matches!(
+            self.target,
+            crate::backend::Target::X86_64 | crate::backend::Target::I686
+        ) {
+            return self.reject_builtin_call(
+                format!("'{}' is not available on {}", name, self.target.triple()),
+                args,
+                test.width(),
+            );
+        }
+        let operands = args
+            .iter()
+            .map(|arg| {
+                if test.wide {
+                    self.lower_expr(arg)
+                } else {
+                    self.vec128_arg_ptr(arg)
+                }
+            })
+            .collect();
+        let dest = self.fresh_value();
+        self.emit(Instruction::Intrinsic {
+            dest: Some(dest),
+            op: IntrinsicOp::AvxTest(test),
+            dest_ptr: None,
+            args: operands,
+        });
+        Some(Operand::Value(dest))
+    }
+
     /// Reject a builtin call, lower the arguments for their side effects, and
     /// return a placeholder of `bytes` bytes.
     fn reject_builtin_call(
@@ -1391,6 +1437,7 @@ impl Lowerer {
             // width, any power-of-two-or-not lane count.
             BuiltinIntrinsic::Shuffle => self.lower_shuffle(args),
             // Generic SIMD family: __lccc_simd{128|256|512}_{i|ps|pd}_{mnemonic}
+            BuiltinIntrinsic::X86AvxTest(test) => self.lower_avx_test(*test, name, args),
             BuiltinIntrinsic::LcccSimd => self.lower_lccc_simd(name, args),
             // __builtin___*_chk: fortification builtins forward to unchecked libc equivalents.
             // Each __builtin___X_chk(args..., extra_check_args...) becomes X(args...).
@@ -2658,6 +2705,7 @@ impl Lowerer {
         // it into another function or claiming per-function wider-vector support.
         use crate::common::x86_features::X86Feature as F;
         let needed = match requirement.feature {
+            F::Avx => Some(6),
             F::Ssse3 => Some(3),
             F::Sse41 => Some(4),
             F::Sse42 => Some(5),
@@ -3384,6 +3432,11 @@ fn x86_intrinsic_required_feature(intrinsic: &BuiltinIntrinsic) -> Option<Intrin
     use crate::common::x86_features::X86Feature as F;
     use BuiltinIntrinsic as B;
     Some(match intrinsic {
+        B::X86AvxTest(_) => IntrinsicRequirement {
+            feature: F::Avx,
+            flag: "-mavx",
+            also: None,
+        },
         // Public headers must not silently introduce SSSE3 above a declared
         // SSE2 ceiling. Include the raw builtin aliases in this same gate.
         B::X86Pmaddubsw128

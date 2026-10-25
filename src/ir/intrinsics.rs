@@ -18,6 +18,7 @@
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IntrinsicOp {
+    AvxTest(crate::common::avx_test::AvxTest),
     /// Memory fence operations (no dest, no args beyond optional ptr)
     Lfence,
     Mfence,
@@ -2429,6 +2430,9 @@ impl IntrinsicOp {
     /// store-interval and load-interval legality rules) need this; writes
     /// are covered by [`Instruction::may_write_memory`].
     pub fn may_read_memory(&self) -> bool {
+        if matches!(self, Self::AvxTest(_)) {
+            return true;
+        }
         matches!(
             self,
             IntrinsicOp::FmaF64x2
