@@ -1078,6 +1078,36 @@ def missing(rows: list[dict], table: dict[str, list[dict]], model,
             encs = model(row, name)
             if encs is None:
                 continue
+            # XED's catalogue models a `+rd` opcode as one canonical base byte;
+            # GAS's row gap report must account for every concrete opcode the
+            # encoder can select. Keep this expansion in the GAS comparison
+            # layer so it does not distort XED's canonical-row verifier.
+            helper = re.findall(r"self\.(encode_[a-z0-9_]+)\(", row["body"])
+            helper = helper[-1] if helper else ""
+            ranges = {
+                "encode_push": (0x50, "none"), "encode_push16": (0x50, "none"),
+                "encode_pop": (0x58, "none"), "encode_pop16": (0x58, "none"),
+                "encode_bswap": (0xC8, "0f"), "encode_movabs": (0xB8, "none"),
+                "encode_pushp": (0x50, "none"), "encode_popp": (0x58, "none"),
+            }
+            if helper in ranges:
+                opcode, map_ = ranges[helper]
+                encs = [e for e in encs if not (e["opcode"] == opcode and e["map"] == map_)] + [
+                    dict(e, opcode=opcode | rd) for e in encs
+                    if e["opcode"] == opcode and e["map"] == map_ for rd in range(8)]
+            elif helper == "encode_xchg":
+                encs = [e for e in encs if e["opcode"] != 0x90] + [
+                    dict(e, opcode=0x90 | rd) for e in encs if e["opcode"] == 0x90
+                    for rd in range(8)]
+            elif helper == "encode_mov":
+                encs = [e for e in encs if e["opcode"] not in (0xB0, 0xB8)] + [
+                    dict(e, opcode=e["opcode"] | rd) for e in encs
+                    if e["opcode"] in (0xB0, 0xB8) for rd in range(8)]
+            elif helper == "encode_inc_dec" and "/i686/" in row["file"]:
+                args = re.search(r"encode_inc_dec\(ops,\s*([01]),\s*(\d+)\)", row["body"])
+                if args and int(args.group(2)) in (2, 4):
+                    opbase = 0x40 if args.group(1) == "0" else 0x48
+                    encs.extend(_enc(opbase | rd) for rd in range(8))
             base = gas_name(name)
             have.setdefault(name, []).extend(encs)
             have.setdefault(base, []).extend(encs)

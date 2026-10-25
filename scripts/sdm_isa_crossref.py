@@ -438,7 +438,7 @@ LEGACY_SPECS = {
     # `push`/`pop` short forms are `50+rd`/`58+rd`: one opcode, the register in
     # the low three bits.  The immediate and r/m forms are their own opcodes.
     "encode_push": [{"family": "legacy", "map": ("const", "none"),
-                     "pp": ("const", "none"), "opcode": 0x50, "opreg": True},
+                     "pp": ("const", "none"), "opcode": 0x50},
                     {"family": "legacy", "map": ("const", "none"),
                      "pp": ("const", "none"), "opcode": 0x6A},
                     {"family": "legacy", "map": ("const", "none"),
@@ -453,7 +453,7 @@ LEGACY_SPECS = {
                     {"family": "legacy", "map": ("const", "0f"),
                      "pp": ("const", "none"), "opcode": 0xA8}],
     "encode_pop": [{"family": "legacy", "map": ("const", "none"),
-                    "pp": ("const", "none"), "opcode": 0x58, "opreg": True},
+                    "pp": ("const", "none"), "opcode": 0x58},
                    {"family": "legacy", "map": ("const", "none"),
                     "pp": ("const", "none"), "opcode": 0x8F,
                     "reg": ("const", 0)},
@@ -462,14 +462,14 @@ LEGACY_SPECS = {
                    {"family": "legacy", "map": ("const", "0f"),
                     "pp": ("const", "none"), "opcode": 0xA9}],
     "encode_push16": [{"family": "legacy", "map": ("const", "none"),
-                       "pp": ("const", "none"), "opcode": 0x50, "opreg": True},
+                       "pp": ("const", "none"), "opcode": 0x50},
                       {"family": "legacy", "map": ("const", "none"),
                        "pp": ("const", "none"), "opcode": 0x68},
                       {"family": "legacy", "map": ("const", "none"),
                        "pp": ("const", "none"), "opcode": 0xFF,
                        "reg": ("const", 6)}],
     "encode_pop16": [{"family": "legacy", "map": ("const", "none"),
-                      "pp": ("const", "none"), "opcode": 0x58, "opreg": True},
+                      "pp": ("const", "none"), "opcode": 0x58},
                      {"family": "legacy", "map": ("const", "none"),
                       "pp": ("const", "none"), "opcode": 0x8F,
                       "reg": ("const", 0)}],
@@ -480,7 +480,7 @@ LEGACY_SPECS = {
                       "pp": ("const", "none"), "opcode": 0x1F,
                       "reg": ("const", 0)},
     "encode_bswap": {"family": "legacy", "map": ("const", "0f"),
-                     "pp": ("const", "none"), "opcode": 0xC8, "opreg": True},
+                     "pp": ("const", "none"), "opcode": 0xC8},
     # Far call/jump: `FF /3` and `FF /5` plus the immediate far pointers 9A/EA.
     "encode_lcall": [{"family": "legacy", "map": ("const", "none"),
                       "pp": ("const", "none"), "opcode": 0xFF,
@@ -1156,19 +1156,6 @@ def _model_spec_helper(name: str, body: str, b64: bool = False) -> list[dict] | 
             return None
         if enc["map"] is None or enc["pp"] is None or enc["opcode"] is None:
             return None
-        if spec.get("opreg"):
-            # `50+rd`: one row, eight encodings, the register in the low three
-            # bits of the opcode (SDM Vol. 2 `PUSH r16/32/64`).  The helper
-            # really can emit all eight -- `push %rcx` is `51` -- so all eight
-            # are claims, and `--verify` checks each one against the snapshot.
-            base = enc["opcode"]
-            encs.extend(dict(enc, opcode=base | rd) for rd in range(8))
-            continue
-        if spec.get("opreg2"):
-            # `0F C8+rd` (`BSWAP`) and friends in an extended map.
-            base = enc["opcode"]
-            encs.extend(dict(enc, opcode=base | rd) for rd in range(8))
-            continue
         encs.append(enc)
     return encs or None
 
@@ -1436,21 +1423,15 @@ def _model_unary_rm(args, name, b64) -> list[dict] | None:
 
 
 def _model_inc_dec(args, name, b64) -> list[dict] | None:
-    """`encode_inc_dec(ops, digit, size)` - Group 5, plus the 32-bit short forms.
+    """`encode_inc_dec(ops, digit, size)` - Group 5; XED's canonical form.
 
-    Outside 64-bit mode `inc`/`dec` also have the one-byte `40+rd`/`48+rd`
-    forms, which the i686 backend emits for a register operand and which the
-    reference table carries as `No64` rows.  In 64-bit mode those bytes are REX
-    prefixes, so the short range is a claim about the i686 backend only.
+    The 32-bit `40+rd`/`48+rd` register range is expanded by the GAS snapshot
+    gap-report layer; it is not a single opcode in XED's canonical model.
     """
     digit, size = arg_int(args, 1), arg_int(args, 2)
     if digit is None or size is None:
         return None
-    forms = _sized({1: 0xFE, 2: 0xFF, 4: 0xFF, 8: 0xFF}, size, digit)
-    if not b64 and size in (2, 4):
-        base = 0x40 if digit == 0 else 0x48
-        forms.extend(form(base | rd) for rd in range(8))
-    return forms
+    return _sized({1: 0xFE, 2: 0xFF, 4: 0xFF, 8: 0xFF}, size, digit)
 
 
 def _model_div_idiv(args, name, b64) -> list[dict] | None:
@@ -1678,10 +1659,7 @@ def _model_mov(args, name, b64) -> list[dict] | None:
     sizes = [size] if size in MOV_RD_OPCODE else model_sizes(name, b64)
     encs = []
     for s in sizes:
-        # `B0+rb`/`B8+rd`: the destination register is the low three bits of the
-        # opcode, so one row covers eight encodings (`mov $1,%ecx` is `B9`).
-        base = MOV_RD_OPCODE[s]
-        encs.extend(form(base | rd) for rd in range(8))
+        encs.append(form(MOV_RD_OPCODE[s]))
         encs.append(form(MOV_RM_OPCODE[s]))
         encs.append(form(MOV_MR_OPCODE[s]))
         encs.append(form(MOV_IMM_OPCODE[s], reg=0))

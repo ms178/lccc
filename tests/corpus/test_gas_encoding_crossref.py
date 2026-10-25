@@ -633,12 +633,11 @@ class GasGapModelTests(unittest.TestCase):
 
     def test_register_in_opcode_rows_claim_the_whole_range(self):
         row = self._row("pushq")  # x86 dispatches pushq/pushl to one arm
-        opcodes = {e["opcode"] for e in self.sdm.model_any(row, "pushq")}
-        self.assertLessEqual(set(range(0x50, 0x58)), opcodes)
+        gaps = self.gas.missing(self.rows, self.table, self.sdm.model_any)
+        opcodes = {e["opcode"] for e in gaps.get("push", [])}
+        self.assertTrue(set(range(0x50, 0x58)).isdisjoint(opcodes))
         for opcode in range(0x50, 0x58):
-            self.assertTrue(
-                any(e["opcode"] == opcode for e in self.table["push"]),
-                f"push {opcode:02x} is claimed but not in the snapshot")
+            self.assertTrue(any(e["opcode"] == opcode for e in self.table["push"]))
 
     def test_the_gap_report_does_not_count_prefixes_or_mm_x_twins(self):
         gaps = self.gas.missing(self.rows, self.table, self.sdm.model_any,

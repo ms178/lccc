@@ -1018,7 +1018,7 @@ share helpers.  Measured on the current tree with ``--backend all``:
 | invocation | count (re-derived 2026-10-25) | what it actually is |
 |---|---|---|
 | ``--verify --strict`` | 1638 rows + 224 code-model encodings, 0 findings | every *row* and every code-derived family is a legal encoding (sound) |
-| ``--missing`` | **813** encodings / 439 mnemonics | forms `as` accepts that no row model covers after per-spelling model expansion |
+| ``--missing`` | **806** encodings / 438 mnemonics | forms `as` accepts that no row model covers after per-spelling model expansion |
 | ``--absent`` | 1354 mnemonics | names with no row; includes APX/AVX-512 spellings and the alias spellings |
 | ``--absent --triage`` | 740 UNMENTIONED / 614 MENTIONED | spelling census, not coverage |
 
@@ -1116,7 +1116,7 @@ watch the row count fall), plus ``--verify`` staying at 0 findings.
 
 **Accept.** ``--missing`` reaches 0 for both backends with ``--strict`` and the
 code-driven families modelled; no count in this file is quoted as coverage
-until then.  Current distance after per-spelling expansion and opcode-register ranges: 813 encodings over 439 mnemonics. The current list still includes extension encodings, alias/schema collisions and model gaps; it is not yet a validated count of missing compiler functionality. Treat 813 as a report output, not a completion claim.  **Effort** M (the families are the work).  **ROI** 3.0 — it buys no
+until then.  Current distance after per-spelling expansion and opcode-register ranges: 806 encodings over 438 mnemonics. The current list still includes extension encodings, alias/schema collisions and model gaps; it is not yet a validated count of missing compiler functionality. Treat 813 as a report output, not a completion claim.  **Effort** M (the families are the work).  **ROI** 3.0 — it buys no
 runtime, but it is the difference between a gate and a rumour, and three
 sessions have now spent time re-deriving that these numbers are not gaps.
 

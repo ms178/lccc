@@ -26,7 +26,7 @@ latest released LLVM toolchain.
 ## Re-derived state
 
 `python3 scripts/gas_encoding_crossref.py --missing --backend all` now reports
-**813 encodings / 439 mnemonics**, down from 896 / 454. This is a report count,
+**806 encodings / 438 mnemonics**, down from 896 / 454. This is a report count,
 not evidence that all 813 are missing executable functionality: the analysis
 still mixes legacy, VEX/EVEX, APX, operand-class variants and aliases. A complete
 implementation claim requires separating those classes with provenance and
