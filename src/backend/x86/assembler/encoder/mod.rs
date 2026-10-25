@@ -4369,6 +4369,7 @@ impl InstructionEncoder {
             "pmaddubsw" => self.encode_sse_op_38(ops, 0x04),
             "phaddw" => self.encode_sse_op_38(ops, 0x01),
             "phaddd" => self.encode_sse_op_38(ops, 0x02),
+            "phaddsw" => self.encode_sse_op_38(ops, 0x03),
             "pabsb" => self.encode_sse_op_38(ops, 0x1C),
             "pabsw" => self.encode_sse_op_38(ops, 0x1D),
             "pabsd" => self.encode_sse_op_38(ops, 0x1E),
@@ -4504,6 +4505,10 @@ impl InstructionEncoder {
             "crc32q" => self.encode_crc32(ops, 8),
             // Suffix-less crc32: source register width decides the form
             // (kernel crc32c-3way.S writes `crc32 %rax, %rdi`).
+            "pcmpestrm" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x60]),
+            "pcmpestri" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x61]),
+            "pcmpistrm" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x62]),
+            "pcmpistri" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x63]),
             "crc32" => {
                 let size = match ops.first() {
                     Some(Operand::Register(r)) => infer_reg_size(&r.name),
@@ -5049,6 +5054,7 @@ impl InstructionEncoder {
             "psignd" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x0A]),
             "phsubw" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x05]),
             "phsubd" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x06]),
+            "phsubsw" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x07]),
             "pmulhrsw" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x0B]),
 
             // ---- AVX instructions (VEX-encoded) ----

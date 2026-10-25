@@ -2320,6 +2320,10 @@ impl InstructionEncoder {
             // SSE convention used here: ops = [src, dst]. Byte form F0 takes
             // r/m8; word form prefixes 66+F2; the 64-bit form (crc32q) needs
             // REX.W and is unavailable on i686.
+            "pcmpestrm" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x60]),
+            "pcmpestri" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x61]),
+            "pcmpistrm" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x62]),
+            "pcmpistri" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x63]),
             "crc32b" => self.encode_sse_op(ops, &[0xF2, 0x0F, 0x38, 0xF0]),
             "crc32w" => self.encode_sse_op(ops, &[0x66, 0xF2, 0x0F, 0x38, 0xF1]),
             "crc32l" => self.encode_sse_op(ops, &[0xF2, 0x0F, 0x38, 0xF1]),
@@ -2836,8 +2840,10 @@ impl InstructionEncoder {
             "pshufb" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x00]),
             "phaddw" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x01]),
             "phaddd" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x02]),
+            "phaddsw" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x03]),
             "phsubw" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x05]),
             "phsubd" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x06]),
+            "phsubsw" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x07]),
             "pmulhrsw" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x0B]),
 
             // SSE4.1 blend
