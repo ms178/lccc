@@ -39,6 +39,8 @@ gcc_driver=$(bash scripts/ci_install_gcc_oracle.sh --version 16.2 --print-bin) |
 export PATH="$(dirname "$gcc_driver"):$PATH"
 test "$(gcc-16 -dumpfullversion)" = 16.2.0
 gcc-16 --version
+# Built-in lccc linking must find the same private native/multilib runtime.
+bash scripts/ci_export_gcc_runtime.sh
 valgrind_bin=$(CC=gcc-16 CXX=g++-16 bash scripts/ci_install_valgrind_current.sh --print-bin)
 export PATH="$valgrind_bin:$PATH"
 valgrind --version

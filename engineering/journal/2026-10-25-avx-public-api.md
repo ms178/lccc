@@ -128,3 +128,14 @@ families' default-O2 exhaustive fixtures and their i686 entries, requires
 exactly two passes per family with zero skips, and publishes those counts as
 check annotations. This does not claim all optimization levels or complete
 public SIMD ABI migration.
+
+The new exact-tool API step caught a genuine integration failure before any
+performance claims: the i686 VTEST link could not find `-lgcc`. GCC 16.2 can
+link its own multilib, but lccc's built-in linker probes FHS/sysroot runtime
+locations, not the cache prefix. Export the authenticated native and 32/
+`crtbegin.o`/`libgcc.a` pair through the existing additive `LCCC_SYSROOT`
+mechanism. A private symlink tree preserves the runtime bytes without root
+writes or old compiler packages; a hash receipt travels with research outputs.
+Four isolated tests cover coherent export (including paths with spaces),
+missing i386 runtime, wrong GCC version and refusal to overwrite a sysroot.
+Real candidate dual-mode linking still needs the next hosted acceptance run.

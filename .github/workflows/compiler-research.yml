@@ -56,6 +56,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p results/research "$RUNNER_TEMP/research-main"
+          cp "$LCCC_SYSROOT/runtime.json" results/research/gcc-runtime.json
           git fetch --no-tags -- origin "$BASELINE_REF"
           git rev-parse FETCH_HEAD > results/research/baseline.sha
           git rev-parse HEAD > results/research/candidate.sha
