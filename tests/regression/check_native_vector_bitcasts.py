@@ -43,6 +43,12 @@ def main():
                 text = assembly.read_text()
                 for symbol in ('cast128',) + (('cast256',) if profile == 'avx2' else ()):
                     body = text.split(symbol + ':', 1)[1].split('.size ' + symbol, 1)[0]
+                    if mode == '-m64' and profile == 'sse2' and symbol == 'cast128':
+                        instructions = [line for line in body.splitlines()
+                                        if re.match(r'\s+[a-z][a-z0-9]*\s', line)]
+                        if (len(instructions) > 3 or any('%rsp' in line or '%rbp' in line
+                                                         for line in instructions)):
+                            raise RuntimeError(f'{symbol}/{profile}: expected one XMM load/store and ret, got {instructions}')
                     # Reinterpretation must not become FP arithmetic or an
                     # out-of-line memcpy. The independent executable checks
                     # all bits, including SNaN/NaN payload and signed zero.
