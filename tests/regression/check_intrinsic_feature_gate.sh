@@ -597,12 +597,16 @@ EOF
 reject local_bw_denied.c -mavx512bw -march=x86-64 -mavx512bw -mavx512vl
 cat >"$tmp/local_bmm_implies_bw.c" <<'EOF'
 #include <immintrin.h>
-__attribute__((target("avx512bmm"))) __m512i f(__m512i a, __m512i b) { return _mm512_add_epi8(a,b); }
+__attribute__((target("avx512bmm"))) __m512i f(__m512i a, __m512i b) {
+    return *(__m512i *)__lccc_simd512_i_vpaddb512(0, a, b);
+}
 EOF
 accept local_bmm_implies_bw.c vpaddb -march=x86-64
 cat >"$tmp/local_bmm_no_bw.c" <<'EOF'
 #include <immintrin.h>
-__attribute__((target("avx512bmm,no-avx512bw"))) __m512i f(__m512i a, __m512i b) { return _mm512_add_epi8(a,b); }
+__attribute__((target("avx512bmm,no-avx512bw"))) __m512i f(__m512i a, __m512i b) {
+    return *(__m512i *)__lccc_simd512_i_vpaddb512(0, a, b);
+}
 EOF
 reject local_bmm_no_bw.c -mavx512bw -march=x86-64
 cat >"$tmp/local_fma_no_leak.c" <<'EOF'
