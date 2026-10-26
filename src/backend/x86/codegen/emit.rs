@@ -280,12 +280,21 @@ pub(super) enum HomeWrite {
 #[inline]
 pub(super) fn phys_reg_name(reg: PhysReg) -> &'static str {
     match reg.0 {
+        // Function scratch, NOT allocatable homes in the accumulator model —
+        // but the MachInst window allocator's pool contains them (see
+        // `MACHINST_ALLOCATABLE_GPRS`), and every consumer that maps a
+        // `reg_assignments` entry through this function must be total over the
+        // ids that can appear there. 0/7 are spelled out here rather than left
+        // to the catch-all so a name query can never turn into a compiler
+        // abort on a pool this table does not own.
+        0 => "rax",
         1 => "rbx",
         2 => "r12",
         3 => "r13",
         4 => "r14",
         5 => "r15",
         6 => "rbp",
+        7 => "rcx",
         10 => "r11",
         11 => "r10",
         12 => "r8",
@@ -11096,13 +11105,10 @@ mod machinst_resolution_tests {
             assert_not_egpr(phys_reg_name(*r));
         }
         assert_eq!(phys_reg_name(PhysReg(16)), "rdx");
+        // The pool lookup is total now: every id the MachInst allocator can
+        // hand out has a name, rax/rcx included.
         for r in super::super::machinst::MACHINST_ALLOCATABLE_GPRS {
-            let n = match r.0 {
-                0 => "rax",
-                7 => "rcx",
-                _ => phys_reg_name(*r),
-            };
-            assert_not_egpr(n);
+            assert_not_egpr(phys_reg_name(*r));
         }
         // The extra file exists for the gated path only.
         assert_eq!(X86_APX_EGPRS[0], PhysReg(40));

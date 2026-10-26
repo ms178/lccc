@@ -29,7 +29,7 @@ Fourteen conflict hunks in seven files. Resolution, per hunk, with the reason:
 | `src/frontend/parser/types.rs` | main | main's abstract-declarator path builds the level through `parse_abstract_declarator_level`, which is the same fix with the named-address-space wrapper resolved once |
 | `src/frontend/sema/const_eval.rs` | main | main delegates to `type_checker().resolve_type_spec`; my local re-implementation of the same mapping is strictly worse (two copies to keep in sync) |
 | `src/ir/lowering/global_init_compound_ptrs.rs` | main | main diagnoses a failed address constant (`diagnose_non_constant`) where mine `expect`ed; a rejected initializer with a real diagnostic beats an ICE reached from user input |
-| `src/passes/inline.rs` | main | main's `LabelMap` records `overflowed` instead of asserting, so the caller can abort *before* mutating the CFG |
+| `src/passes/inline.rs` | main, then **re-decided** | main's `LabelMap` recorded `overflowed` and aborted *after* the merge block was minted. The shipped code instead proves the capacity at the base (`base + blocks + LABEL_MAP_RESERVED <= u32::MAX`, in `u64`) and asserts the precondition at each mint, so there is no flag to propagate and no mid-mutation abort. `overflowed` was a symptom, not a policy — see §1a |
 | `src/common/types.rs`, `src/frontend/parser/types.rs` | main | formatting / superset as above |
 | `src/backend/inline_asm.rs` | **merged by hand** | main has `push_busy_reg` (32-bit alias + `reg_hi` normalisation) which mine lacks; mine has `reserved_home_regs`. Final hunk keeps main's normalisation over specific/operand/`reg_hi` registers **and** adds the reserved homes. This is the one file where neither side was sufficient |
 | `src/backend/x86/codegen/asm_emitter.rs`, `i686/…` | main + one method re-added | main's `assign_scratch_reg` refuses RA-assigned callee-saved registers when overflowing the GP pool; mine mapped to a fixed `r12..r15` walk. main wins. I re-added only `reserved_home_regs`, which main does not have at all |
@@ -37,15 +37,35 @@ Fourteen conflict hunks in seven files. Resolution, per hunk, with the reason:
 | `.github/*`, `scripts/ci_local.sh`, `ci-lane-plan.json` | main | main already registers the gates (`asm-char-and-macro-defaults`, `debug-knobs-neutral`) that my commit was adding |
 | `src/ir/lowering/global_init_bytes.rs` | main, then **re-ported by hand** (§2) | main rewrote the initializer around a scalar-array planner and a trailing-designator delegate; my whole-file version would have reverted that rewrite |
 
-**Do I agree with the other team?** On every one of these, yes, and in three
-cases their version is better than mine in a way I could not have argued with:
-(a) `diagnose_non_constant` instead of `expect` at a user-reachable path,
-(b) `LabelMap::overflowed` instead of an assertion, (c) the `assign_scratch_reg`
-overflow that avoids RA-assigned callee-saved registers. The one place I
+**Do I agree with the other team?** On the resolutions above, yes: (a) `diagnose_non_constant`
+instead of `expect` at a user-reachable path and (c) the `assign_scratch_reg` overflow that
+avoids RA-assigned callee-saved registers are both better than what I had. On (b) I do not:
+an `overflowed` flag that is only consulted *after* `merge_block_id` has been minted cannot
+abort "before mutating the CFG", and it leaves the collision possible in exactly the case it
+was added for. The shipped code replaces it with a capacity proof at the base plus a
+precondition assert — see §1a. The one place I
 disagree with the merge result is that `reserved_home_regs` was not carried
 over at all — and that is a real hole, because phase 1f materialises a memory
 operand's address **before** phase 2 loads the inputs, so a register-homed
 input is invisible to the scratch allocator. It is back in this patch.
+
+### 1a. The label-capacity decision, stated once
+
+An inline must mint labels that collide with nothing the caller already holds, and it must
+know that *before* it clones a block. The shipped rule is:
+
+```text
+label_base = max(global_max_block_id, caller_max_label) + 1        (checked, u32)
+need       = callee.blocks.len() + LABEL_MAP_RESERVED              (u64 arithmetic)
+accept  iff  label_base + need <= u32::MAX                         (else: keep the call)
+```
+
+`LABEL_MAP_RESERVED` is 4: the post-call merge block, plus the up-to-three labels
+`LabelMap::get` mints for references that no block defines (an asm `goto` target, a
+terminator-only reference, a stale phi predecessor). Because the whole budget is proven at
+the base, `assign_fresh` cannot overflow and needs no failure channel; its assert documents
+the precondition rather than testing a bound at runtime. A refused inline is never a
+correctness event: the caller simply keeps the call.
 
 ---
 
@@ -83,7 +103,7 @@ of why the port had to be re-measured rather than transplanted.
 
 ---
 
-## 3. `reserved_home_regs` — kept, and why
+## 3. Register-homed inputs — reserved, and why
 
 `inline_asm` materialises each `"m"` operand's address in phase 1f, then loads
 the operands' values in phase 2. The scratch allocator sees only the registers
@@ -91,6 +111,14 @@ an operand has *claimed*; a value that is **register-homed** (a parameter, a
 forwarded value) is loaded later into its home, so the address staging could
 destroy an input before the asm body ran. The backend now reports those homes
 and `inline_asm` adds them to the busy set. Main has no equivalent.
+
+The shipped shape of that hook is `InlineAsmEmitter::home_reg_name(value)`, one value at a
+time, because the consumer already dedupes: `push_busy_reg` records the name *and* its
+32-bit alias, so a per-site `Vec<String>` plus a second dedupe pass was measurable overhead
+on the hot path for no information. x86-64 answers through `fresh_home_of` (a stale home
+answers `None`, which is correct — the operand is reloaded from its slot); i686 answers
+from `reg_assignments` and reports every assigned home, since that backend tracks no
+per-value freshness: fail-closed, because the worst case is a different scratch register.
 
 Cost: one `fresh_home_of` call per input/output value per asm site, and the
 register set is tiny. This is fail-closed by construction: reserving an extra

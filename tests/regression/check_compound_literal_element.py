@@ -205,6 +205,24 @@ def main():
                         f"{rid}: run-time value {values['lccc']} (lccc) != "
                         f"{values['oracle']} (oracle)"
                     )
+                # The recorded value is part of the specification, not a
+                # comment: without this check a row whose `# probe:` number was
+                # transcribed wrong still passes as long as both compilers
+                # agree, and the wrong number is then a later reader's
+                # "expected" behaviour. Comparing the oracle against the record
+                # is what mutation-verifies the table itself. A row may record
+                # an expression instead of a literal (`want` is then emitted
+                # verbatim into the print), so only plain integers are compared.
+                recorded = want.strip()
+                if (
+                    len(values) == 2
+                    and recorded.lstrip("-").isdigit()
+                    and values["oracle"] != recorded
+                ):
+                    failures.append(
+                        f"{rid}: cases.tsv records probe {recorded}, the oracle prints "
+                        f"{values['oracle']}"
+                    )
 
             want_relocs = relocation_triples(tmp / f"{rid}.oracle.o")
             got_relocs = relocation_triples(tmp / f"{rid}.lccc.o")

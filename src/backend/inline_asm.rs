@@ -133,18 +133,27 @@ pub trait InlineAsmEmitter {
     /// constraints (e.g., "rcx" from "c" constraint) and must not be reused.
     fn assign_scratch_reg(&mut self, kind: &AsmOperandKind, excluded: &[String]) -> String;
 
-    /// The registers that currently HOLD one of `values` and must not be
-    /// handed out as scratch.
+    /// The asm name of the register that currently HOLDS `value`, when this
+    /// backend models register homes.
     ///
     /// Phase 1f materialises a memory operand's address BEFORE phase 2 loads
     /// the operands' values into their registers, so a scratch register chosen
-    /// here can still be overwritten by a later load — or, worse, the address
-    /// computation can destroy a value the asm body is about to read.  The
-    /// default is empty because a backend whose register file is modelled
-    /// elsewhere has nothing to reserve; see the x86-64 implementation.
-    fn reserved_home_regs(&self, values: &[u32]) -> Vec<String> {
-        let _ = values;
-        Vec::new()
+    /// for that staging can overwrite a value the asm body is about to read.
+    /// The busy set only knows the registers an operand has already CLAIMED; a
+    /// register-homed input — a parameter, or a value forwarded from the
+    /// surrounding code — is loaded into its home later, in phase 2, and is
+    /// therefore invisible to it.
+    ///
+    /// One name per value, deliberately: the caller feeds each answer through
+    /// `push_busy_reg`, which already dedupes and registers the 32-bit alias,
+    /// so a `Vec<String>` per operand and a second dedupe pass would be pure
+    /// overhead on the hottest part of asm emission.
+    ///
+    /// A backend whose register file is not home-modelled answers `None`; see
+    /// the x86-64 and i686 implementations.
+    fn home_reg_name(&self, value: u32) -> Option<String> {
+        let _ = value;
+        None
     }
 
     /// Load an input value into its assigned register. Called during Phase 2.
@@ -1172,27 +1181,6 @@ fn finalize_operands_and_build_gcc_map(
     // or operand scratch allocations (including `reg_hi` register pairs), and
     // dynamically append each scratch register allocated for `"m"` address staging
     // so multiple memory operands never overwrite one another's base registers.
-    //
-    // The operand registers are not the whole answer: an input whose value is
-    // REGISTER-HOMED (no explicit constraint, a parameter, or a value forwarded
-    // from the surrounding code) is loaded into that home by phase 2, i.e. it is
-    // not in `operands[].reg` yet.  Phase 1f materialises the memory-operand
-    // ADDRESSES before phase 2 loads the inputs, so without the homes below the
-    // address staging can land on top of a live input and destroy it before the
-    // asm body runs (`reserved_home_regs` asks the backend which physical
-    // registers those values already own).
-    let pending_values: Vec<u32> = {
-        let mut vals = Vec::with_capacity(inputs.len() + outputs.len());
-        for (_, val, _) in inputs {
-            if let Operand::Value(v) = val {
-                vals.push(v.0);
-            }
-        }
-        for (_, ptr, _) in outputs {
-            vals.push(ptr.0);
-        }
-        vals
-    };
     let mut busy_regs: Vec<String> = Vec::new();
     for r in specific_regs {
         push_busy_reg(&mut busy_regs, r);
@@ -1201,8 +1189,24 @@ fn finalize_operands_and_build_gcc_map(
         push_busy_reg(&mut busy_regs, &op.reg);
         push_busy_reg(&mut busy_regs, &op.reg_hi);
     }
-    for reg in emitter.reserved_home_regs(&pending_values) {
-        push_busy_reg(&mut busy_regs, &reg);
+    // The operand registers are not the whole answer: an input whose value is
+    // REGISTER-HOMED (no explicit constraint, a parameter, or a value forwarded
+    // from the surrounding code) is loaded into that home by phase 2, so it is
+    // not in `operands[].reg` yet.  Phase 1f materialises the memory-operand
+    // ADDRESSES before phase 2 loads the inputs, so without the homes below the
+    // address staging can land on top of a live input and destroy it before the
+    // asm body runs.
+    for (_, val, _) in inputs {
+        if let Operand::Value(v) = val {
+            if let Some(reg) = emitter.home_reg_name(v.0) {
+                push_busy_reg(&mut busy_regs, &reg);
+            }
+        }
+    }
+    for (_, ptr, _) in outputs {
+        if let Some(reg) = emitter.home_reg_name(ptr.0) {
+            push_busy_reg(&mut busy_regs, &reg);
+        }
     }
 
     // Resolve memory operand addresses for outputs

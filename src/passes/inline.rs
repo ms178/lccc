@@ -5840,20 +5840,16 @@ impl LabelMap {
 
     /// A brand-new label, which is above every label the clone will use.
     ///
-    /// The capacity is pre-checked at the base (see [`LABEL_MAP_RESERVED`]), so
-    /// the increment cannot overflow; `checked_add` keeps that a hard
-    /// invariant instead of a silent wraparound if the reservation is ever
-    /// reduced below what a clone needs.
-    /// The capacity contract is checked at the base
-    /// ([`LABEL_MAP_RESERVED`]), so the counter cannot overflow; the assert
-    /// keeps that a contract rather than a silent wraparound in a release
-    /// build, where a repeated label would be a miscompile.
+    /// The capacity is pre-checked at the base (see [`LABEL_MAP_RESERVED`]):
+    /// `base + blocks + reserved <= u32::MAX` is a precondition of every mint in
+    /// this map. The assert turns that precondition into a loud failure instead
+    /// of a bounds test: a release build that wrapped here would mint a label
+    /// that already exists, which is a miscompile, so aborting is the
+    /// least-bad outcome if the reservation is ever reduced below what a clone
+    /// actually mints.
     fn assign_fresh(&mut self) -> BlockId {
         let id = BlockId(self.next);
-        assert!(
-            self.next < u32::MAX,
-            "inline label capacity was pre-checked"
-        );
+        assert!(self.next < u32::MAX, "inline label capacity was pre-checked");
         self.next += 1;
         id
     }

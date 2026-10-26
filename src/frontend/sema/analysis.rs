@@ -1167,33 +1167,43 @@ impl SemanticAnalyzer {
                 }
             }
 
-            // An AUTOMATIC array cannot be initialized from an array-typed
-            // expression.  An array is neither an assignable value
-            // (6.3.2.1p3) nor an acceptable array initializer (6.7.9p13), so
-            // the only expression that can appear here is a compound literal
-            // -- and GCC rejects exactly that, for automatic storage only: a
-            // static or file-scope object is initialized by copying the
-            // literal's bytes, which GCC accepts.  A string literal stays
-            // legal (6.7.9p14).  lccc used to accept the automatic form and
-            // leave the array uninitialized, so `nm_t l[2] = (nm_t[2]){ ... }`
+            // An array with AUTOMATIC storage duration cannot be initialized
+            // from an array-typed expression.  An array is neither an
+            // assignable value (6.3.2.1p3) nor an acceptable array initializer
+            // (6.7.9p13), so the only expression that can stand here is a
+            // compound literal -- and GCC rejects exactly that shape for
+            // automatic storage, while a static-storage object is initialized
+            // by copying the literal's bytes, which GCC accepts.  A string
+            // literal stays legal (6.7.9p14) and must not be caught here: it
+            // is an ARRAY-typed expression too.
+            //
+            // `static` and `links` (file scope or `extern`) are the whole set
+            // of static-duration spellings that can reach this point, and the
+            // narrowness is deliberate rather than an oversight:
+            // `_Thread_local` needs no separate arm: C11 6.7.1p3 does not allow
+            // a block-scope `_Thread_local` declaration without `static` or
+            // `extern`, and GCC diagnoses such a statement as
+            // "function-scope 'a' implicitly auto and declared '_Thread_local'"
+            // in addition to this very array-expression error (gcc 14.2,
+            // -std=gnu11, verified). An arm for it would therefore only teach
+            // lccc to accept a statement GCC refuses; `static _Thread_local` is
+            // already covered by `is_static()` and `extern _Thread_local` by
+            // `links`. lccc used to accept the automatic form as well and then
+            // leave the array uninitialised, so `nm_t l[2] = (nm_t[2]){ ... }`
             // in a function silently read garbage.
-            if let (Some(Initializer::Expr(expr)), false) =
-                (&init_decl.init, decl.is_static() || links)
-            {
+            let static_duration = decl.is_static() || links;
+            if let (Some(Initializer::Expr(expr)), false) = (&init_decl.init, static_duration) {
                 let array_target = self
                     .symbol_table
                     .lookup(&init_decl.name)
                     .is_some_and(|s| matches!(s.ty, CType::Array(..)));
-                let array_source = !matches!(
-                    expr,
-                    Expr::StringLiteral(..)
-                        | Expr::WideStringLiteral(..)
-                        | Expr::Char16StringLiteral(..)
-                ) && self
-                    .expr_type_checker()
-                    .infer_expr_ctype(expr)
-                    .is_some_and(|t| matches!(t, CType::Array(..)));
-                if array_target && array_source {
+                // Conjunction order is the cost model: `array_target` is a hash
+                // lookup on a name we just inserted, while `infer_expr_ctype`
+                // walks the initializer (its memo is cold here — the sema walk
+                // runs later in this same function). Short-circuit on the
+                // structural test so the walk happens only for array targets.
+                let array_source = array_target && self.initializer_is_array_valued(expr);
+                if array_source {
                     // GCC's wording depends on the expression: a compound
                     // literal is the array-expression case it names; any other
                     // array-typed expression (`int b[3] = a;`) is a plain
@@ -4967,6 +4977,26 @@ impl SemanticAnalyzer {
             explicit,
             &self.expr_type_checker(),
         )
+    }
+
+    /// Whether `expr` is an ARRAY-typed expression, i.e. the shape 6.7.9p13
+    /// forbids as an automatic array's initializer. String literals are
+    /// expressly allowed (6.7.9p14) even though their type is an array, so they
+    /// are excluded before any inference happens; the inference itself is
+    /// deliberately last, because its memo is cold at this point in the walk
+    /// and it costs a traversal of the initializer.
+    fn initializer_is_array_valued(&self, expr: &Expr) -> bool {
+        if matches!(
+            expr,
+            Expr::StringLiteral(..)
+                | Expr::WideStringLiteral(..)
+                | Expr::Char16StringLiteral(..)
+        ) {
+            return false;
+        }
+        self.expr_type_checker()
+            .infer_expr_ctype(expr)
+            .is_some_and(|t| matches!(t, CType::Array(..)))
     }
 
     fn expr_type_checker(&self) -> super::type_checker::ExprTypeChecker<'_> {

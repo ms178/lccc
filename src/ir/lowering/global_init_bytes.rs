@@ -458,34 +458,6 @@ impl Lowerer {
         offset
     }
 
-    /// The braced list inside a compound literal value, or `None` when `init`
-    /// is not a compound literal with a braced initializer list.
-    ///
-    /// `(T){ a, b }` is an lvalue of type `T` (C11 6.5.2.5p5), and in a static
-    /// initializer it names exactly the bytes the braced list `{ a, b }` names,
-    /// so a designated aggregate element may be written that way:
-    ///
-    /// ```c
-    /// typedef struct { unsigned long bits[2]; } nodemask_t;
-    /// nodemask_t node_states[3] = { [1] = (nodemask_t){ { [0] = 1UL } } };
-    /// ```
-    ///
-    /// which is how Linux 6.18's `NODE_MASK_ALL` initializes `node_states`
-    /// (mm/page_alloc.c).  Every aggregate path below used to hand that
-    /// expression to the *scalar* evaluator, which cannot fold a compound
-    /// literal, so the object was rejected with "initializer element is not
-    /// constant" (bytes image) — or, worse, the expression was accepted as a
-    /// scalar and written into the element's FIRST member, so the designated
-    /// element silently lost its value.  GCC 16.2, Clang 23.1.3 and ICX 2026.2
-    /// all accept the shape (tests/regression/compound_literal_element/).
-    ///
-    /// The literal is matched directly, NOT through a cast: `(T)(T){ ... }` is
-    /// a cast expression, and a cast is not an integer/address constant
-    /// expression (C11 6.6p6), so GCC 16.2 rejects it and lccc must too
-    /// ("initializer element is not constant" is the oracle's answer, checked
-    /// in tests/regression/compound_literal_element/).  A qualified literal
-    /// `(const T){ ... }` is still a compound literal -- the qualifier is part
-    /// of the literal's type, not a cast around it.
     /// The payload list of a compound literal that initializes the whole
     /// ARRAY `ty`, or `None` when `init` is something else.
     ///
@@ -542,6 +514,34 @@ impl Lowerer {
         std::borrow::Cow::Owned(rewritten)
     }
 
+    /// The braced list inside a compound literal value, or `None` when `init`
+    /// is not a compound literal with a braced initializer list.
+    ///
+    /// `(T){ a, b }` is an lvalue of type `T` (C11 6.5.2.5p5), and in a static
+    /// initializer it names exactly the bytes the braced list `{ a, b }` names,
+    /// so a designated aggregate element may be written that way:
+    ///
+    /// ```c
+    /// typedef struct { unsigned long bits[2]; } nodemask_t;
+    /// nodemask_t node_states[3] = { [1] = (nodemask_t){ { [0] = 1UL } } };
+    /// ```
+    ///
+    /// which is how Linux 6.18's `NODE_MASK_ALL` initializes `node_states`
+    /// (mm/page_alloc.c).  Every aggregate path below used to hand that
+    /// expression to the *scalar* evaluator, which cannot fold a compound
+    /// literal, so the object was rejected with "initializer element is not
+    /// constant" (bytes image) — or, worse, the expression was accepted as a
+    /// scalar and written into the element's FIRST member, so the designated
+    /// element silently lost its value.  GCC 16.2, Clang 23.1.3 and ICX 2026.2
+    /// all accept the shape (tests/regression/compound_literal_element/).
+    ///
+    /// The literal is matched directly, NOT through a cast: `(T)(T){ ... }` is
+    /// a cast expression, and a cast is not an integer/address constant
+    /// expression (C11 6.6p6), so GCC 16.2 rejects it and lccc must too
+    /// ("initializer element is not constant" is the oracle's answer, checked
+    /// in tests/regression/compound_literal_element/).  A qualified literal
+    /// `(const T){ ... }` is still a compound literal -- the qualifier is part
+    /// of the literal's type, not a cast around it.
     pub(super) fn compound_literal_items<'a>(
         &self,
         init: &'a Initializer,

@@ -1,8 +1,8 @@
 # S11 red-team audit — 2026-10-25
 
-Scope: every change in `/home/user/ms178-1.patch` (base `abe67eaa`, head as recorded in the session snapshot ledger kept
-outside the repo), the earlier S09/S10 work it is
-rebased onto, and the claims the earlier team made about both.
+Scope: every change in the patch series against base `abe67eaa` (the series that becomes
+`ms178-1.patch`), the earlier S09/S10 work it is rebased onto, and the claims the earlier
+team made about both.
 
 The rule applied throughout: **a claim counts only if it is reproducible from
 this tree with the tools that are actually installed.** Where the pinned oracle
@@ -154,7 +154,7 @@ half only looked fixed because the sample they used had no nested parameter.
   non-excluded scratch register.
 * `busy_regs` reserved only "specific registers + operand registers", but
   phase 1f materialises memory addresses **before** phase 2 loads inputs, so a
-  register-homed input was invisible. `reserved_home_regs` closes it.
+  register-homed input was invisible. `home_reg_name` closes it.
 * `LABEL_MAP_RESERVED` 2 is wrong: a merge block plus the on-demand
   `LabelMap::get` mints (asm goto, terminator-only references) is up to 4. And
   the base check compared against `u32::MAX` *without* the clone's own block
