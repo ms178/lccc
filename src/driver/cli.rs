@@ -322,11 +322,57 @@ impl Driver {
             _ => return false,
         };
         *slot = true;
+        match flag {
+            // GCC 16.2's VBMI, VBMI2, BITALG, BF16, FP16 and BMM option
+            // handlers all grant BW as well as the AVX512F prerequisite.
+            "-mavx512vbmi"
+            | "-mavx512vbmi2"
+            | "-mavx512bitalg"
+            | "-mavx512bf16"
+            | "-mavx512fp16"
+            | "-mavx512bmm" => self.enable_avx512bw = true,
+            // VP2INTERSECT's GCC option handler grants AVX512DQ and F.
+            "-mavx512vp2intersect" => self.enable_avx512dq = true,
+            _ => {}
+        }
         if flag != "-mavxvnni" {
             self.enable_avx512f = true;
         }
         self.grant_avx2_class();
         true
+    }
+
+    /// GCC's AVX512BW option family also carries the dependent subset flags
+    /// for BF16, FP16, BMM, VBMI, VBMI2 and BITALG. A negative BW option
+    /// clears those options; a later positive subset option grants BW again.
+    fn clear_avx512bw_dependents(&mut self) {
+        self.enable_avx512vbmi = false;
+        self.enable_avx512vbmi2 = false;
+        self.enable_avx512bitalg = false;
+        self.enable_avx512bf16 = false;
+        self.enable_avx512fp16 = false;
+        self.enable_avx512bmm = false;
+        self.enable_avx10_1 = false;
+        self.enable_avx10_2 = false;
+    }
+
+    /// GCC's AVX512F denial clears its dependent AVX512 subsets; their
+    /// individual positive flags can grant the prerequisites again later.
+    fn clear_avx512f_dependents(&mut self) {
+        self.enable_avx512f = false;
+        self.enable_avx512cd = false;
+        self.enable_avx512dq = false;
+        self.enable_avx512bw = false;
+        self.clear_avx512bw_dependents();
+        self.enable_avx512vl = false;
+        self.enable_avx512vnni = false;
+        self.enable_avx512ifma = false;
+        self.enable_avx512vpopcntdq = false;
+        self.enable_avx512er = false;
+        self.enable_avx512pf = false;
+        self.enable_avx512vp2intersect = false;
+        self.enable_avx10_1 = false;
+        self.enable_avx10_2 = false;
     }
 
     /// Apply one explicit x86 ISA `-m`/`-mno-` flag.  Returns `true` when
@@ -573,10 +619,13 @@ impl Driver {
                 self.movbe_explicitly_disabled = true;
             }
             "-mno-rdrnd" => self.enable_rdrnd = false,
-            "-mno-avx512f" => self.enable_avx512f = false,
+            "-mno-avx512f" => self.clear_avx512f_dependents(),
             "-mno-avx512cd" => self.enable_avx512cd = false,
             "-mno-avx512dq" => self.enable_avx512dq = false,
-            "-mno-avx512bw" => self.enable_avx512bw = false,
+            "-mno-avx512bw" => {
+                self.enable_avx512bw = false;
+                self.clear_avx512bw_dependents();
+            },
             "-mno-avx512vl" => self.enable_avx512vl = false,
             "-mno-avx512vnni" => self.enable_avx512vnni = false,
             "-mno-avx512ifma" => self.enable_avx512ifma = false,

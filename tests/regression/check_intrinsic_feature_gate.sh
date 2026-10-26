@@ -601,6 +601,29 @@ reject local_fma_no_leak.c -mfma -march=x86-64
 # independent subset and its VL conjunction. Older system GCC is not used as
 # an AVX-512 semantic oracle; run the exact compiler when the script is given.
 if "$gcc_bin" -dumpfullversion 2>/dev/null | grep -x '16.2.0' >/dev/null; then
+    # The scalar target flags are a dependency graph, not independent bits.
+    # Compare the complete AVX512 macro set for subset grants, prerequisite
+    # revocation, and re-grant order against the pinned GCC 16.2 oracle.
+    compare_avx512_macros() {
+        "$ccc" "$@" -dM -E -x c /dev/null | grep '^#define __AVX512' | sort >"$tmp/lccc-avx512-macros"
+        "$gcc_bin" "$@" -dM -E -x c /dev/null | grep '^#define __AVX512' | sort >"$tmp/gcc-avx512-macros"
+        diff -u "$tmp/gcc-avx512-macros" "$tmp/lccc-avx512-macros" ||
+            fail "AVX-512 predefined macros differ from GCC for flags: $*"
+    }
+    compare_avx512_macros -march=x86-64 -mavx512bmm
+    compare_avx512_macros -march=x86-64 -mavx512bmm -mno-avx512bmm
+    compare_avx512_macros -march=x86-64 -mavx512bmm -mno-avx512bw
+    compare_avx512_macros -march=x86-64 -mavx512vbmi -mno-avx512bw
+    compare_avx512_macros -march=x86-64 -mavx512bf16
+    compare_avx512_macros -march=x86-64 -mavx512fp16
+    compare_avx512_macros -march=x86-64 -mavx512vbmi
+    compare_avx512_macros -march=x86-64 -mavx512vbmi2
+    compare_avx512_macros -march=x86-64 -mavx512bitalg
+    compare_avx512_macros -march=x86-64 -mavx512vp2intersect
+    compare_avx512_macros -march=x86-64 -mavx512vp2intersect -mno-avx512dq
+    compare_avx512_macros -march=x86-64 -mavx512vbmi -mno-avx512f
+    compare_avx512_macros -march=x86-64 -mavx512vbmi -mno-avx512f -mavx512vbmi
+
     for src in avx512_bw_vl.c avx512_ternlog_vl.c avx512_maskload_bw_vl.c avx512_f_qword.c avx512_bitalg.c avx512_vpopcnt.c avx512_vnni.c avx512_fma.c; do
         compare "$src" -march=x86-64
         compare "$src" -march=x86-64 -mavx512f -mavx512bw -mavx512dq -mavx512vl -mavx512bitalg -mavx512vpopcntdq -mavx512vnni

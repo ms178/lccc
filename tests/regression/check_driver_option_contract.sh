@@ -90,6 +90,7 @@ EOF
 "$CCC" -dM -E -mavx512bmm -x c /dev/null >"$td/bmm-on.macros"
 grep -q '^#define __AVX512BMM__ 1$' "$td/bmm-on.macros"
 grep -q '^#define __AVX512F__ 1$' "$td/bmm-on.macros"
+grep -q '^#define __AVX512BW__ 1$' "$td/bmm-on.macros"
 "$CCC" -dM -E -mavx512bmm -mno-avx512bmm -x c /dev/null >"$td/bmm-off.macros"
 if grep -q '^#define __AVX512BMM__ ' "$td/bmm-off.macros"; then
     echo "FAIL: -mno-avx512bmm did not revoke only the BMM permission" >&2
