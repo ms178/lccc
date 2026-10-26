@@ -3045,10 +3045,18 @@ impl SemanticAnalyzer {
             };
             let width = if actual.is_vector() { actual.size() } else { 0 };
             if width != *expected {
+                let required = if *expected == 0 {
+                    "scalar or address operand".to_string()
+                } else {
+                    format!("{}-bit vector", expected * 8)
+                };
                 self.diagnostics.borrow_mut().error(
                     format!(
-                        "incompatible vector argument {} to '{}': expected {} vector bytes, have {}",
-                        index + 1, name, expected, width
+                        "argument {} to '{}' requires a {}; have '{}'",
+                        index + 1,
+                        name,
+                        required,
+                        actual
                     ),
                     arg.span(),
                 );

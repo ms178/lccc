@@ -68,3 +68,45 @@ access is unavailable in this sandbox, and the latest AMD revision was not
 independently retrieved. No exhaustive latest-2026 manual verification, full
 remaining SSE/AVX API completion, new measured runtime speedup or independent
 expert approval is claimed. Full acceptance belongs to the fresh hosted runs.
+
+## Scalar conversion and permission defects found during follow-up
+
+A live wrong-code witness, `__builtin_ia32_crc32si(0, 1.0)`, returned zero instead
+of GCC's 3712330424: builtin dispatch bypassed normal call parameter conversion
+and read the double's bits as an integer. Generated static scalar-parameter
+contracts now drive numeric conversions in ordinary x86 builtin dispatch;
+prototype CTypes supply the public/private helper cases. Generic SIMD dispatch
+uses the same conversion entry point. Vector/address operands avoid redundant
+type inference and signature-map probes when canonical metadata describes them.
+Constant floating immediates fold during conversion even at O0; byte-count
+validation also converts to the builtin's C `int` before checking range/units.
+
+The new executable oracle covers volatile floating inputs to raw/public CRC,
+BZHI, public/private scalar-to-vector conversion, and floating shift/shuffle
+immediates. It matches current GCC/GAS/mold on both x86 modes at O0 and O2.
+It is a mandatory zero-skip dual-mode hosted research family, not just a local
+witness. It also exposed a pre-existing i686 BMI2 permission mismatch: 32-bit
+BZHI had a defined lowering but the global x86-64-only optimization grant was
+incorrectly its sole permission. Builtin/header permission is now separate from
+optimizer permission, with last-option-order unit cases; unsupported i686 BMI2
+optimization is not enabled.
+
+Fresh hosted frontend CI found that early shape validation changed the existing
+widening diagnostic wording. The unified message now states the required vector
+bit width, preserving the established 128-bit source contract; no rejection was
+weakened. The targeted ISA feature gate now passes in full against GCC 16.2.
+
+That gate had intentionally asserted live AUD-CPU-4 debt: YMM floating/integer
+intrinsics emitted instructions even when AVX/AVX2 was denied. Explicit
+permissions now cover the packed YMM floating arithmetic/load/store/raw mask
+families (AVX) and packed integer add/sub/multiply families (AVX2), on both x86
+ABIs. The former debt witnesses are actual rejection/native-emission assertions
+with GCC verdict comparisons. AVX-only floating operations remain accepted
+without AVX2. This closes those witnesses, not an unmeasured assertion that
+every remaining opcode permission has been audited.
+
+Final focused checks retain 198-vector output agreement after scalar lowering,
+45 negative cases per compiler, unchanged audit budgets and invocation parity.
+The local full CI suite was not run. The hardware conversion witness establishes
+a wrong-code repair, not a benchmark speedup. Latest SDM verification and the
+other remaining scope boundaries above are still not claimed complete.

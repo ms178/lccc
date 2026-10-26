@@ -2918,6 +2918,53 @@ impl Lowerer {
         Some(Operand::Value(dest))
     }
 
+    /// Builtins bypass ordinary call marshalling, but still require C parameter
+    /// conversions. Retain vector/address operands as object carriers.
+    pub(super) fn lower_typed_x86_builtin_argument(
+        &mut self,
+        name: &str,
+        arg: &Expr,
+        index: usize,
+    ) -> Operand {
+        let target = match crate::common::x86_builtin_types::argument_scalar_types(name) {
+            Some(types) => types.get(index).copied().flatten(),
+            None => self
+                .func_meta
+                .sigs
+                .get(name)
+                .and_then(|signature| signature.param_ctypes.get(index))
+                .filter(|ty| ty.is_integer() || ty.is_floating())
+                .map(IrType::from_ctype),
+        };
+        match target {
+            Some(target) => {
+                let source = self.get_expr_type(arg);
+                let value = self.lower_expr(arg);
+                // Preserve constant immediates even at O0: a numeric C
+                // conversion must not turn a valid immediate into an SSA value.
+                let folded = match &value {
+                    Operand::Const(IrConst::F32(value)) => {
+                        IrConst::cast_float_to_target(*value as f64, target)
+                    }
+                    Operand::Const(IrConst::F64(value)) => {
+                        IrConst::cast_float_to_target(*value, target)
+                    }
+                    Operand::Const(IrConst::LongDouble(_, bytes)) => {
+                        IrConst::cast_long_double_to_target(bytes, target)
+                    }
+                    _ => None,
+                };
+                match folded {
+                    Some(value) => Operand::Const(value),
+                    None => self.emit_implicit_cast(value, source, target),
+                }
+            }
+            // No redundant type inference or signature-map probe for native
+            // vector/address operands already described by canonical metadata.
+            None => self.lower_expr(arg),
+        }
+    }
+
     fn lower_x86_intrinsic(
         &mut self,
         intrinsic: &BuiltinIntrinsic,
@@ -2965,7 +3012,11 @@ impl Lowerer {
                 Some(Operand::Const(IrConst::I64(0)))
             }
             X86IntrinsicKind::VoidArgs => {
-                let arg_ops: Vec<Operand> = args.iter().map(|a| self.lower_expr(a)).collect();
+                let arg_ops: Vec<Operand> = args
+                    .iter()
+                    .enumerate()
+                    .map(|(index, arg)| self.lower_typed_x86_builtin_argument(name, arg, index))
+                    .collect();
                 self.emit(Instruction::Intrinsic {
                     dest: None,
                     op,
@@ -2982,7 +3033,11 @@ impl Lowerer {
                     }
                     return Some(Operand::Const(IrConst::I64(0)));
                 }
-                let arg_ops: Vec<Operand> = args.iter().map(|a| self.lower_expr(a)).collect();
+                let arg_ops: Vec<Operand> = args
+                    .iter()
+                    .enumerate()
+                    .map(|(index, arg)| self.lower_typed_x86_builtin_argument(name, arg, index))
+                    .collect();
                 let ptr_val = self.operand_to_value(arg_ops[0].clone());
                 self.emit(Instruction::Intrinsic {
                     dest: None,
@@ -3008,6 +3063,18 @@ impl Lowerer {
                     let count = args
                         .last()
                         .and_then(|arg| self.eval_const_expr(arg))
+                        .and_then(|value| match value {
+                            IrConst::F32(value) => {
+                                IrConst::cast_float_to_target(value as f64, IrType::I32)
+                            }
+                            IrConst::F64(value) => {
+                                IrConst::cast_float_to_target(value, IrType::I32)
+                            }
+                            IrConst::LongDouble(_, bytes) => {
+                                IrConst::cast_long_double_to_target(&bytes, IrType::I32)
+                            }
+                            other => Some(other.narrowed_to(IrType::I32)),
+                        })
                         .and_then(|value| value.to_i64());
                     let Some(count) =
                         count.filter(|count| (0..=2040).contains(count) && count % 8 == 0)
@@ -3022,7 +3089,11 @@ impl Lowerer {
                 } else {
                     None
                 };
-                let mut arg_ops: Vec<Operand> = args.iter().map(|a| self.lower_expr(a)).collect();
+                let mut arg_ops: Vec<Operand> = args
+                    .iter()
+                    .enumerate()
+                    .map(|(index, arg)| self.lower_typed_x86_builtin_argument(name, arg, index))
+                    .collect();
                 if let (Some(count), Some(last)) = (normalized_count, arg_ops.last_mut()) {
                     *last = Operand::Const(IrConst::I64(count));
                 }
@@ -3054,7 +3125,11 @@ impl Lowerer {
                 Some(Operand::Value(result_alloca))
             }
             X86IntrinsicKind::Scalar => {
-                let arg_ops: Vec<Operand> = args.iter().map(|a| self.lower_expr(a)).collect();
+                let arg_ops: Vec<Operand> = args
+                    .iter()
+                    .enumerate()
+                    .map(|(index, arg)| self.lower_typed_x86_builtin_argument(name, arg, index))
+                    .collect();
                 let dest_val = self.fresh_value();
                 self.emit(Instruction::Intrinsic {
                     dest: Some(dest_val),
@@ -3402,6 +3477,42 @@ fn x86_intrinsic_required_feature(intrinsic: &BuiltinIntrinsic) -> Option<Intrin
     use crate::common::x86_features::X86Feature as F;
     use BuiltinIntrinsic as B;
     Some(match intrinsic {
+        // Packed floating-point YMM operations are AVX, not AVX2, on both
+        // x86 ABIs. Never let an absent permission fall through to emission.
+        B::X86AddPs256
+        | B::X86SubPs256
+        | B::X86MulPs256
+        | B::X86AddPd256
+        | B::X86SubPd256
+        | B::X86MulPd256
+        | B::X86LoaduPs256
+        | B::X86StoreuPs256
+        | B::X86LoaduPd256
+        | B::X86StoreuPd256
+        | B::X86MaxPs256V
+        | B::X86MinPs256V
+        | B::X86AndPs256V
+        | B::X86CmpPs256V => IntrinsicRequirement {
+            feature: F::Avx,
+            flag: "-mavx",
+            also: None,
+        },
+        B::X86Paddb256
+        | B::X86Paddw256
+        | B::X86Paddd256
+        | B::X86Paddq256
+        | B::X86Psubb256
+        | B::X86Psubw256
+        | B::X86Psubd256
+        | B::X86Psubq256
+        | B::X86Pmulld256
+        | B::X86Pmullw256
+        | B::X86Pmulhw256
+        | B::X86Pmuludq256 => IntrinsicRequirement {
+            feature: F::Avx2,
+            flag: "-mavx2",
+            also: None,
+        },
         B::X86AvxWiden(_) => IntrinsicRequirement {
             feature: F::Avx2,
             flag: "-mavx2",

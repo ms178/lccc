@@ -17,7 +17,7 @@ class NativeBuiltinTypes(unittest.TestCase):
         self.assertEqual(generator.CONTRACT.read_text(), generator.contract_source())
 
     def test_hosted_dual_mode_fixtures_have_real_i686_entries(self):
-        for family in ('gnu_native_builtin_types', 'gnu_byte_shift_counts', 'public_simd_native_types'):
+        for family in ('gnu_native_builtin_types', 'gnu_byte_shift_counts', 'public_simd_native_types', 'gnu_builtin_scalar_conversions'):
             with self.subTest(family=family):
                 directory = ROOT / 'tests/regression'
                 entry = (directory / f'{family}_i686.c').read_text()
@@ -40,6 +40,11 @@ class NativeBuiltinTypes(unittest.TestCase):
         self.assertEqual(generator.argument_vector_widths('UINT64_FTYPE_VOID'), ())
         with self.assertRaises(ValueError):
             generator.argument_vector_widths('INT_FTYPE_UNRECOGNIZED')
+
+    def test_scalar_parameter_conversions_are_separate_from_vector_carriers(self):
+        self.assertEqual(generator.argument_scalar_types('UINT_FTYPE_UINT_UINT'), ('U32', 'U32'))
+        self.assertEqual(generator.argument_scalar_types('V4SI_FTYPE_V4SI_SI_COUNT'), (None, 'I32'))
+        self.assertEqual(generator.argument_scalar_types('VOID_FTYPE_PCHAR_V16QI'), (None, None))
 
     def test_unknown_result_and_argument_are_errors(self):
         with self.assertRaises(ValueError):

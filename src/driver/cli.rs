@@ -4510,6 +4510,26 @@ mod cli_tests {
         assert!(d.enable_avx);
     }
 
+    #[test]
+    fn i686_bmi2_builtin_permission_does_not_enable_unsupported_codegen() {
+        for (flags, permitted) in [
+            (vec!["-mbmi2"], true),
+            (vec!["-mbmi2", "-mno-bmi2"], false),
+            (vec!["-mno-bmi2", "-mbmi2"], true),
+        ] {
+            let mut driver = Driver::new();
+            let args: Vec<String> = ["ccc", "-m32"]
+                .into_iter()
+                .chain(flags)
+                .chain(["x.c"])
+                .map(str::to_string)
+                .collect();
+            assert!(driver.parse_cli_args(&args).is_ok());
+            assert_eq!(driver.resolved_builtin_bmi2(), permitted);
+            assert!(!driver.resolved_bmi2());
+        }
+    }
+
     /// The absent-`-march` baseline is plain x86-64 with no BMI1/BMI2, so a
     /// default build must NOT emit ANDN/RORX-class code.  BMI1/BMI2 are v3
     /// members and are granted only by an explicit `-march=x86-64-v3` or `-mbmi*`.

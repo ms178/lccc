@@ -1759,7 +1759,7 @@ impl Driver {
             // or an #ifdef-guarded intrinsic path could disagree with
             // the scalar codegen contract.
             self.resolved_bmi1(),
-            self.resolved_bmi2(),
+            self.resolved_builtin_bmi2(),
             self.resolved_lzcnt(),
             self.resolved_popcnt(),
             self.resolved_movbe(),
@@ -3287,6 +3287,15 @@ impl Driver {
         self.target == Target::X86_64 && !self.bmi2_explicitly_disabled && self.enable_bmi2
     }
 
+    /// Intrinsic/header permission is distinct from BMI2 instruction selection:
+    /// i686 supports the 32-bit BZHI builtin through a defined lowering, while
+    /// its optimizer must not receive the x86-64-only BMI2 codegen grant.
+    pub(super) fn resolved_builtin_bmi2(&self) -> bool {
+        matches!(self.target, Target::X86_64 | Target::I686)
+            && !self.bmi2_explicitly_disabled
+            && self.enable_bmi2
+    }
+
     /// LZCNT/ABM permission (Clz only; TZCNT is BMI1, see
     /// `resolved_codegen_bmi1`). Granted on x86-64 and i686 only by
     /// `-mlzcnt` or an ABM-implying `-march=`, always under the
@@ -3635,7 +3644,7 @@ impl Driver {
         // grant, the `-march` ceiling and the sticky denials — the same
         // predicates `__BMI__`/`__BMI2__`/`__LZCNT__`/`__MOVBE__` use.
         set.insert_if(self.resolved_bmi1(), F::Bmi);
-        set.insert_if(self.resolved_bmi2(), F::Bmi2);
+        set.insert_if(self.resolved_builtin_bmi2(), F::Bmi2);
         set.insert_if(self.resolved_lzcnt(), F::Lzcnt);
         set.insert_if(self.resolved_movbe(), F::Movbe);
         // RDRAND has no resolved predicate and no explicit-denial bit; the

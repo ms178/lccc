@@ -386,24 +386,7 @@ compare o_gfni.c -march=alderlake
 compare o_gfni.c -maes
 compare o_gfni.c -march=alderlake -mno-gfni
 
-# ---------------------------------------------------------------------------
-# RECORDED DEBT (AUD-CPU-4), asserted rather than fixed here: the i686
-# *vector-op* path emits 256-bit VEX code with no permission at all.  Measured
-# before this row was written:
-#
-#   lccc -O2 -m32            -S f256.c   ->  vaddps %ymm1, %ymm0, %ymm0
-#   lccc -O2 -m32 -mno-avx   -S f256.c   ->  vaddps %ymm1, %ymm0, %ymm0
-#   lccc -O2 -m32 -mno-avx   -S i256.c   ->  vpaddd %ymm1, %ymm0, %ymm0
-#
-# So on the 32-bit target a `__m256` operand is lowered to AVX instructions
-# regardless of `-mno-avx`, while the intrinsic table refuses the same class of
-# instruction there.  Both halves are the SIGILL class AUD-CPU-3 closed on
-# x86-64; they need one model, which is a change of its own.  These rows fail
-# the moment the behaviour changes in EITHER direction, so the fix cannot land
-# without updating them in the same commit.
-# (The debt is in the *intrinsic* 256-bit path: a bare `vector_size(32)`
-#  operator addition on i686 is lowered scalar-wise and correctly -- measured
-#  `addss` per lane, no `%ymm` -- so the probe has to name the intrinsic.)
+# AUD-CPU-4: YMM intrinsic permission must agree with GCC on both ABIs.
 cat >"$tmp/i686_ymm_float.c" <<'EOF'
 #include <immintrin.h>
 __m256 add256(__m256 a, __m256 b) { return _mm256_add_ps(a, b); }
@@ -412,21 +395,18 @@ cat >"$tmp/i686_ymm_int.c" <<'EOF'
 #include <immintrin.h>
 __m256i addi256(__m256i a, __m256i b) { return _mm256_add_epi32(a, b); }
 EOF
-debt_ymm() {
-    local src=$1 want=$2
-    shift 2
-    local asm=$tmp/debt-${src%.c}-$(echo "$@" | tr -c 'a-z0-9' '_').s
-    "$ccc" -O2 "$@" -S "$tmp/$src" -o "$asm" ||
-        fail "$src with $*: the recorded AUD-CPU-4 debt no longer reproduces (lccc now refuses); flip this row to a rejection assertion"
-    grep -qE "%ymm" "$asm" ||
-        fail "$src with $*: no %ymm operand any more (AUD-CPU-4 may be fixed); flip this row"
-    grep -qE "^[[:space:]]+v?$want" "$asm" ||
-        fail "$src with $*: expected $want"
-    echo "ok: AUD-CPU-4 debt still reproduces: $src $* emits $want on %ymm"
-}
-debt_ymm i686_ymm_float.c addps -m32
-debt_ymm i686_ymm_float.c addps -m32 -mno-avx
-debt_ymm i686_ymm_int.c paddd -m32 -mno-avx2
+# Regression for the former AUD-CPU-4 SIGILL debt: require the same
+# rejection and permitted native forms as GCC in both x86 modes.
+for mode in -m32 -m64; do
+    reject i686_ymm_float.c -mavx "$mode" -mno-avx
+    reject i686_ymm_int.c -mavx2 "$mode" -mavx -mno-avx2
+    accept i686_ymm_float.c vaddps "$mode" -mavx -mno-avx2
+    accept i686_ymm_int.c vpaddd "$mode" -mavx2
+    compare i686_ymm_float.c "$mode" -mno-avx
+    compare i686_ymm_int.c "$mode" -mavx -mno-avx2
+    compare i686_ymm_float.c "$mode" -mavx -mno-avx2
+    compare i686_ymm_int.c "$mode" -mavx2
+done
 
 # All VTEST scalar flags require AVX even at 128 bits; none require AVX2.
 # Compile-only raw vector sources need no target libc headers in either mode.

@@ -78,7 +78,7 @@ jobs:
           set -euo pipefail
           test "$(gcc-16 -dumpfullversion)" = 16.2.0
           python3 tests/regression/check_gnu_builtin_diagnostics.py --lccc target/fastbuild/lccc --gcc gcc-16
-          for family in avx_vtest_sign_bits avx2_widen_native gnu_native_builtin_types gnu_byte_shift_counts; do
+          for family in avx_vtest_sign_bits avx2_widen_native gnu_native_builtin_types gnu_byte_shift_counts gnu_builtin_scalar_conversions; do
             python3 scripts/ci_test_report.py -- \
               python3 tests/regression/run_regression.py \
                 --lccc target/fastbuild/lccc --gcc gcc-16 -j 2 \
@@ -87,7 +87,7 @@ jobs:
           python3 - <<'PYCONTRACT'
           import json
           from pathlib import Path
-          for family in ('avx_vtest_sign_bits', 'avx2_widen_native', 'gnu_native_builtin_types', 'gnu_byte_shift_counts'):
+          for family in ('avx_vtest_sign_bits', 'avx2_widen_native', 'gnu_native_builtin_types', 'gnu_byte_shift_counts', 'gnu_builtin_scalar_conversions'):
               report = json.loads(Path(f'results/research/{family}.json').read_text())
               expected = {'total': 2, 'passed': 2, 'failed': 0, 'skipped_compare': 0, 'skipped_run': 0}
               actual = {key: report[key] for key in expected}
