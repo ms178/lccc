@@ -2820,10 +2820,7 @@ impl Lowerer {
                     permitted = enabled;
                     continue;
                 }
-                if enabled
-                    && requirement.feature == F::Avx512F
-                    && avx512_feature
-                {
+                if enabled && requirement.feature == F::Avx512F && avx512_feature {
                     permitted = true;
                     continue;
                 }
@@ -2842,10 +2839,7 @@ impl Lowerer {
                     permitted = true;
                     continue;
                 }
-                if enabled
-                    && requirement.feature == F::Avx512Dq
-                    && feature == "avx512vp2intersect"
-                {
+                if enabled && requirement.feature == F::Avx512Dq && feature == "avx512vp2intersect" {
                     permitted = true;
                     continue;
                 }

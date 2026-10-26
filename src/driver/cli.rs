@@ -325,12 +325,8 @@ impl Driver {
         match flag {
             // GCC 16.2's VBMI, VBMI2, BITALG, BF16, FP16 and BMM option
             // handlers all grant BW as well as the AVX512F prerequisite.
-            "-mavx512vbmi"
-            | "-mavx512vbmi2"
-            | "-mavx512bitalg"
-            | "-mavx512bf16"
-            | "-mavx512fp16"
-            | "-mavx512bmm" => self.enable_avx512bw = true,
+            "-mavx512vbmi" | "-mavx512vbmi2" | "-mavx512bitalg" | "-mavx512bf16"
+            | "-mavx512fp16" | "-mavx512bmm" => self.enable_avx512bw = true,
             // VP2INTERSECT's GCC option handler grants AVX512DQ and F.
             "-mavx512vp2intersect" => self.enable_avx512dq = true,
             _ => {}
@@ -625,7 +621,7 @@ impl Driver {
             "-mno-avx512bw" => {
                 self.enable_avx512bw = false;
                 self.clear_avx512bw_dependents();
-            },
+            }
             "-mno-avx512vl" => self.enable_avx512vl = false,
             "-mno-avx512vnni" => self.enable_avx512vnni = false,
             "-mno-avx512ifma" => self.enable_avx512ifma = false,
