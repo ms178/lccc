@@ -260,3 +260,29 @@ during extraction/probes; successful installation publishes a traversable 0755
 root before atomic rename. Parent-prefix permissions still protect private
 installs. The ninth focused test checks private verification, target absence
 before publication, installed permissions and the verified digest marker.
+
+## Second current-main integration
+
+The hosted CI workflow completed successfully on `917213e` (run 40253482423),
+including the previously failing extraction-safety shard. Independent IPA-PTA,
+Debian exact-version oracle, and relocation/PGO red-team workflows also passed.
+The earlier merged compiler's same-host runtime/Callgrind job completed
+successfully; its measurements have not yet been interpreted as performance
+improvements.
+
+While those checks ran, main advanced to `fdbaeb5`. The resulting builtin-map
+conflict consists of independent registrations: this branch's GNU/native SIMD
+aliases and AVX tables versus main's C23/C2y bit, counted-by, association-barrier,
+and padding builtins. Preserve both sets rather than choosing either side. The
+incoming i686 inline-assembly home-register protection also complements, rather
+than replaces, the existing live-EBX/GOT scratch protection.
+
+The combined tree built all binaries with fastbuild, locked dependencies, two
+jobs and swap in 2m34s without warnings. Targeted checks passed: ten GNU type
+contract tests, nine cache tests, the 558-intrinsic arity contract, census, and
+400-command/27-contract workflow parity. At O2, GNU native types, GNU scalar
+conversions, packed scalar shift counts, and PIC scalar BMI/LZCNT each matched
+GCC 16.2 output on both x86-64 and i686 (eight executable comparisons). No local
+CI suite was run. The new merge needs its own hosted acceptance; the preceding
+head's green result is not a claim about that new head. Exhaustive manual-entry
+and public-header feature-permission work remains unfinished.

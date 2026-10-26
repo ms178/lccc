@@ -1684,7 +1684,9 @@ impl ElfWriterBase {
         if depth > 64 {
             return Err(format!("symbol `{name}' is defined in terms of itself"));
         }
-        if self.labels.contains_key(name) && self.is_global_or_weak(name) {
+        if (self.labels.contains_key(name) && self.is_global_or_weak(name))
+            || self.symbol_types.get(name) == Some(&STT_GNU_IFUNC)
+        {
             return Ok(SectionExpr::term(ExprBase::Sym(name.to_string()), 1));
         }
         match self.sets.get(name) {
@@ -2022,10 +2024,14 @@ impl ElfWriterBase {
                     i += 1;
                 }
                 let sym = &expr[start..i];
-                // Chase alias chain
+                // Chase alias chain, keeping STT_GNU_IFUNC aliases intact so
+                // branch/data relocations bind through the IFUNC symbol rather
+                // than calling or storing the resolver directly.
                 let mut resolved = sym;
                 let mut seen = 0;
-                while let Some(target) = self.aliases.get(resolved) {
+                while self.symbol_types.get(resolved) != Some(&STT_GNU_IFUNC)
+                    && let Some(target) = self.aliases.get(resolved)
+                {
                     resolved = target.as_str();
                     seen += 1;
                     if seen > 20 {

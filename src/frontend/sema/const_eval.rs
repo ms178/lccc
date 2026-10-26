@@ -458,6 +458,15 @@ impl<'a> SemaConstEval<'a> {
                 size.map(|s| IrConst::I64(s as i64))
             }
 
+            // _Countof (C2y 6.5.3.5 / GCC 16)
+            Expr::Countof(arg, _) => {
+                let count = match arg.as_ref() {
+                    SizeofArg::Type(ts) => self.countof_type_spec(ts),
+                    SizeofArg::Expr(e) => self.countof_expr(e),
+                };
+                count.map(|c| IrConst::I64(c as i64))
+            }
+
             // _Alignof - C11 standard: GCC's min_align_of_type (TYPE_ALIGN
             // capped at BIGGEST_ALIGNMENT for non-user-aligned types).
             Expr::Alignof(ts, _) => {
@@ -472,48 +481,9 @@ impl<'a> SemaConstEval<'a> {
                 Some(IrConst::I64(align as i64))
             }
 
-            // __alignof__(expr) - GCC extension: alignment of expression's type.
-            // Per C11 6.2.8p3, if the expression names a variable declared with
-            // _Alignas or __attribute__((aligned(N))), the result reflects the
-            // declared alignment (max of natural and explicit).
-            Expr::AlignofExpr(inner_expr, _) => {
-                // Check for explicit alignment on a variable identifier
-                if let Expr::Identifier(name, _) = inner_expr.as_ref() {
-                    if let Some(sym) = self.symbols.lookup(name) {
-                        // A typedef-level `aligned` replaces the natural
-                        // alignment; a declaration-level request only raises.
-                        let natural = sym.type_align.unwrap_or_else(|| {
-                            sym.ty.align_ctx(&*self.types.borrow_struct_layouts())
-                        });
-                        if sym.type_align.is_some() || sym.explicit_alignment.is_some() {
-                            let explicit = sym.explicit_alignment.unwrap_or(0);
-                            return Some(IrConst::I64(natural.max(explicit) as i64));
-                        }
-                    }
-                }
-                let ctype = self.infer_expr_ctype(inner_expr)?;
-                let align = ctype.align_ctx(&*self.types.borrow_struct_layouts());
-                Some(IrConst::I64(align as i64))
-            }
-
-            // __alignof__(expr) via GnuAlignof path - returns preferred alignment
-            Expr::GnuAlignofExpr(inner_expr, _) => {
-                if let Expr::Identifier(name, _) = inner_expr.as_ref() {
-                    if let Some(sym) = self.symbols.lookup(name) {
-                        let natural = sym.type_align.unwrap_or_else(|| {
-                            sym.ty
-                                .preferred_align_ctx(&*self.types.borrow_struct_layouts())
-                        });
-                        if sym.type_align.is_some() || sym.explicit_alignment.is_some() {
-                            let explicit = sym.explicit_alignment.unwrap_or(0);
-                            return Some(IrConst::I64(natural.max(explicit) as i64));
-                        }
-                    }
-                }
-                let ctype = self.infer_expr_ctype(inner_expr)?;
-                let align = ctype.preferred_align_ctx(&*self.types.borrow_struct_layouts());
-                Some(IrConst::I64(align as i64))
-            }
+            // __alignof__(expr) / _Alignof(expr) - alignment of expression's type.
+            Expr::AlignofExpr(inner_expr, _) => self.eval_alignof_expr_const(inner_expr, false),
+            Expr::GnuAlignofExpr(inner_expr, _) => self.eval_alignof_expr_const(inner_expr, true),
 
             // A generic selection is a constant expression when the selected
             // association is (C11 6.5.1.1p4); the controlling expression is
@@ -625,6 +595,21 @@ impl<'a> SemaConstEval<'a> {
                 })
             }
             "__builtin_constant_p" => self.eval_builtin_constant_p(args.first()?),
+            "__builtin_assoc_barrier" if args.len() == 1 => self.eval_const_expr(&args[0]),
+            "__builtin_counted_by_ref" if args.len() == 1 => {
+                if self
+                    .type_checker()
+                    .infer_counted_by_target(&args[0])
+                    .is_none()
+                {
+                    Some(IrConst::I64(0))
+                } else {
+                    None
+                }
+            }
+            name if crate::frontend::sema::stdbit::is_stdc_bit_builtin(name) => {
+                self.eval_stdc_bit_const(name, args)
+            }
             _ => {
                 if !self.fold_as_library_function(name) {
                     return None;
@@ -636,6 +621,71 @@ impl<'a> SemaConstEval<'a> {
                     self.builtin_policy.may_assume(name.as_str()),
                 )
             }
+        }
+    }
+
+    fn eval_alignof_expr_const(&self, inner_expr: &Expr, preferred: bool) -> Option<IrConst> {
+        if let Expr::Identifier(name, _) = inner_expr {
+            if let Some(sym) = self.symbols.lookup(name) {
+                let layouts = self.types.borrow_struct_layouts();
+                let natural = sym.type_align.unwrap_or_else(|| {
+                    if preferred {
+                        sym.ty.preferred_align_ctx(&*layouts)
+                    } else {
+                        sym.ty.align_ctx(&*layouts)
+                    }
+                });
+                if sym.type_align.is_some() || sym.explicit_alignment.is_some() {
+                    let explicit = sym.explicit_alignment.unwrap_or(0);
+                    return Some(IrConst::I64(natural.max(explicit) as i64));
+                }
+            }
+        }
+        let ctype = self.infer_expr_ctype(inner_expr)?;
+        let layouts = self.types.borrow_struct_layouts();
+        let align = if preferred {
+            ctype.preferred_align_ctx(&*layouts)
+        } else {
+            ctype.align_ctx(&*layouts)
+        };
+        Some(IrConst::I64(align as i64))
+    }
+
+    fn eval_stdc_bit_const(&self, name: &str, args: &[Expr]) -> Option<IrConst> {
+        use crate::frontend::sema::stdbit;
+        let expected_arity = stdbit::stdc_bit_arity(name)?;
+        if args.len() != expected_arity {
+            return None;
+        }
+        let arg0_ct = self
+            .lookup_expr_type(&args[0])
+            .or_else(|| self.infer_expr_ctype(&args[0]))?;
+        let width = stdbit::stdc_bit_width_of_ctype(&arg0_ct)?;
+        let c0 = self.eval_const_expr(&args[0])?;
+        let raw_val = match c0 {
+            IrConst::I128(v) => v as u128,
+            other => other.to_u64()? as u128,
+        };
+        let rotate_cnt = if expected_arity == 2 {
+            let c1 = self.eval_const_expr(&args[1])?;
+            let arg1_unsigned = self
+                .lookup_expr_type(&args[1])
+                .or_else(|| self.infer_expr_ctype(&args[1]))
+                .is_some_and(|ct| ct.is_unsigned());
+            Some(match (c1, arg1_unsigned) {
+                (IrConst::I128(v), true) => (v as u128) as i128,
+                (IrConst::I128(v), false) => v,
+                (other, true) => other.to_u64()? as i128,
+                (other, false) => other.to_i64()? as i128,
+            })
+        } else {
+            None
+        };
+        let res = stdbit::eval_stdc_bit_builtin(name, raw_val, rotate_cnt, width)?;
+        if width > 64 && stdbit::stdc_bit_returns_arg_type(name) {
+            Some(IrConst::I128(res as i128))
+        } else {
+            Some(IrConst::I64(res as i64))
         }
     }
 
@@ -1318,6 +1368,51 @@ impl<'a> SemaConstEval<'a> {
         Some(ctype.size_ctx(&*self.types.borrow_struct_layouts()))
     }
 
+    fn countof_type_spec(&self, spec: &TypeSpecifier) -> Option<usize> {
+        if let TypeSpecifier::Array(_, Some(bound_expr)) = spec {
+            return self
+                .eval_const_expr(bound_expr)
+                .and_then(|c| c.to_i64())
+                .and_then(|n| usize::try_from(n).ok());
+        }
+        match self.ctype_from_type_spec(spec) {
+            CType::Array(_, Some(n)) => Some(n),
+            _ => None,
+        }
+    }
+
+    fn countof_expr(&self, expr: &Expr) -> Option<usize> {
+        match expr {
+            Expr::StringLiteral(s, _) | Expr::WideStringLiteral(s, _) => {
+                return Some(s.chars().count() + 1);
+            }
+            Expr::Char16StringLiteral(s, _) => return Some(s.encode_utf16().count() + 1),
+            Expr::Comma(..) | Expr::Conditional(..) | Expr::GnuConditional(..) => return None,
+            Expr::CompoundLiteral(TypeSpecifier::Array(_, None), init, _) => {
+                return match init.as_ref() {
+                    crate::frontend::parser::ast::Initializer::List(items)
+                        if items.iter().all(|it| it.designators.is_empty()) =>
+                    {
+                        Some(items.len())
+                    }
+                    crate::frontend::parser::ast::Initializer::Expr(
+                        Expr::StringLiteral(s, _) | Expr::WideStringLiteral(s, _),
+                    ) => Some(s.chars().count() + 1),
+                    crate::frontend::parser::ast::Initializer::Expr(Expr::Char16StringLiteral(
+                        s,
+                        _,
+                    )) => Some(s.encode_utf16().count() + 1),
+                    _ => None,
+                };
+            }
+            _ => {}
+        }
+        match self.infer_expr_ctype(expr)? {
+            CType::Array(_, Some(n)) => Some(n),
+            _ => None,
+        }
+    }
+
     /// Compute alignof for a type specifier.
     /// C11 `_Alignof(type-name)`: `alignof_type_spec` (GCC TYPE_ALIGN) capped
     /// at `BIGGEST_ALIGNMENT` unless the type is user-aligned — GCC's
@@ -1604,6 +1699,7 @@ impl<'a> SemaConstEval<'a> {
                     is_packed: f.is_packed,
                     base_volatile: f.base_volatile,
                     object_volatile: f.object_volatile,
+                    counted_by: f.counted_by.clone(),
                 })
             })
             .collect()

@@ -102,6 +102,22 @@ impl Lowerer {
                 h::is_anon_member_designator(designator_name, &field_layout.name, &field_layout.ty);
             let has_nested = h::has_nested_field_designator(item);
 
+            // `.{member} = (T[N]){ ... }`: the compound literal names an object
+            // of the member's own ARRAY type, so its payload list IS the
+            // member's initializer -- exactly what `.{member} = { ... }` says
+            // (C11 6.7.9p9 with 6.5.2.5p5).  Substituting the payload FIRST is
+            // what keeps every array flavour below (scalars of any rank,
+            // character arrays, multi-dimensional arrays, arrays of
+            // aggregates) from reading the literal as a single scalar
+            // expression of the member: `struct { unsigned long pad;
+            // int m[2][3]; } x = { .m = (int[2][3]){ {1, 2, 3}, {4, 5, 6} } }`
+            // left `m` all zero, and the array-of-aggregates flavour recursed
+            // forever (the literal re-entered this loop for the same item).
+            let items =
+                self.substitute_array_literal_items(&items, item_idx, item, &field_layout.ty);
+            let items: &[InitializerItem] = &items;
+            let item = &items[item_idx];
+
             // Arrays of scalars of any rank: the array planner resolves the
             // member's initializer (its own list or string, or a brace-elided
             // run of this list, possibly designated into the member).
@@ -440,6 +456,62 @@ impl Lowerer {
             offset += idx * stride;
         }
         offset
+    }
+
+    /// The payload list of a compound literal that initializes the whole
+    /// ARRAY `ty`, or `None` when `init` is something else.
+    ///
+    /// A compound literal names an object of its type (C11 6.5.2.5p5) and an
+    /// array cannot be initialized from an array *expression* (6.7.9p13), so a
+    /// literal of the array's own type is the written-out braced list for that
+    /// array.  The object level (`lower_global_init`) and the member level
+    /// (`substitute_array_literal_items`) both route through this predicate,
+    /// which is what keeps the two levels agreeing on what a literal means.
+    pub(super) fn array_initializer_payload<'a>(
+        &self,
+        init: &'a Initializer,
+        ty: &CType,
+    ) -> Option<&'a [InitializerItem]> {
+        let Initializer::Expr(expr) = init else {
+            return None;
+        };
+        if !matches!(ty, CType::Array(_, Some(_))) || !self.expr_initializes_array(expr, ty) {
+            return None;
+        }
+        self.compound_literal_items(init)
+    }
+
+    /// `items`, with the item at `item_idx` rewritten from
+    /// `.{member} = (T[N]){ ... }` to `.{member} = { ... }` when the literal
+    /// has the member's own array type; `items` unchanged otherwise.
+    ///
+    /// The rewrite is exact because a compound literal names an object of its
+    /// type (6.5.2.5p5) and a designated initializer initializes the subobject
+    /// the designator names (6.7.9p9): for an array member `m`, the literal
+    /// `(T[N]){ a, b }` and the braced list `{ a, b }` initialize `m`
+    /// identically, down to brace elision (p20) and sub-designators.
+    ///
+    /// Only the single-field designator `.{member} = ...` is rewritten: in
+    /// `.{a}.b = (T[N]){ ... }` the literal belongs to `b`, not to `a`, and
+    /// `.{member}[i] = ...` designates an element rather than the whole array.
+    /// The returned slice keeps every index of `items` valid, so the caller's
+    /// loop needs no renumbering.
+    fn substitute_array_literal_items<'a>(
+        &self,
+        items: &'a [InitializerItem],
+        item_idx: usize,
+        item: &InitializerItem,
+        field_ty: &CType,
+    ) -> std::borrow::Cow<'a, [InitializerItem]> {
+        if !matches!(item.designators.as_slice(), [Designator::Field(_)]) {
+            return std::borrow::Cow::Borrowed(items);
+        }
+        let Some(payload) = self.array_initializer_payload(&item.init, field_ty) else {
+            return std::borrow::Cow::Borrowed(items);
+        };
+        let mut rewritten = items.to_vec();
+        rewritten[item_idx].init = Initializer::List(payload.to_vec());
+        std::borrow::Cow::Owned(rewritten)
     }
 
     /// The braced list inside a compound literal value, or `None` when `init`

@@ -353,8 +353,9 @@ impl Lowerer {
             // Array subscript: element type size
             Expr::ArraySubscript(base, index, _) => self.sizeof_subscript(base, index),
 
-            // sizeof(sizeof(...)) or sizeof(_Alignof(...)) -> size_t
+            // sizeof(sizeof(...)) or sizeof(_Countof(...)) or sizeof(_Alignof(...)) -> size_t
             Expr::Sizeof(_, _)
+            | Expr::Countof(_, _)
             | Expr::Alignof(_, _)
             | Expr::AlignofExpr(_, _)
             | Expr::GnuAlignof(_, _)

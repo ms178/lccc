@@ -1143,6 +1143,7 @@ impl Parser {
         // The members' `volatile` qualifiers must not outlive the body:
         // `struct S { volatile int a; } s;` leaves `s` non-volatile.
         let outer_volatile = self.attrs.parsing_volatile();
+        let outer_counted_by = self.attrs.parsing_counted_by.take();
         self.expect_context(&TokenKind::LBrace, "for struct/union body");
         while !matches!(self.peek(), TokenKind::RBrace | TokenKind::Eof) {
             // Budget termination guarantee: once the nesting budget is
@@ -1153,6 +1154,7 @@ impl Parser {
                 break;
             }
             let pos_before = self.pos;
+            self.attrs.parsing_counted_by = None;
             let (pre_spec_packed, pre_spec_align, _, _, _) = self.parse_gcc_attributes();
             if let Some(a) = pre_spec_align {
                 self.attrs.parsed_alignas =
@@ -1204,6 +1206,7 @@ impl Parser {
                         is_packed: pre_spec_packed,
                         base_volatile: false,
                         object_volatile: false,
+                        counted_by: None,
                     });
                 } else {
                     self.parse_struct_field_declarators(&type_spec, &mut fields, pre_spec_packed);
@@ -1222,6 +1225,7 @@ impl Parser {
         }
         self.expect_closing(&TokenKind::RBrace, open);
         self.attrs.set_volatile(outer_volatile);
+        self.attrs.parsing_counted_by = outer_counted_by;
         fields
     }
 
@@ -1339,6 +1343,7 @@ impl Parser {
                     is_packed: packed_from_type || extra_packed,
                     base_volatile: false,
                     object_volatile: false,
+                    counted_by: None,
                 });
                 if !self.consume_if(&TokenKind::Comma) {
                     break;
@@ -1352,6 +1357,7 @@ impl Parser {
             // parse_declarator_with_attrs also consumes trailing __attribute__ and
             // returns the aligned value from __attribute__((aligned(N))).
             let declarator_span = self.peek_span();
+            let pre_decl_counted_by = self.attrs.parsing_counted_by.take();
             self.attrs.declarator_object_space = AddressSpace::Default;
             let (name, derived, _, _, decl_aligned, decl_packed) =
                 self.parse_declarator_with_attrs();
@@ -1372,6 +1378,7 @@ impl Parser {
 
             // Parse any additional trailing GCC __attribute__ (e.g., after bitfield width)
             let (extra_packed, extra_aligned, _, _, _) = self.parse_gcc_attributes();
+            let counted_by = self.attrs.parsing_counted_by.take().or(pre_decl_counted_by);
 
             // The strictest of every alignment source applies (C11 6.7.5p6;
             // GCC's `aligned` attribute on a member only ever raises it).
@@ -1416,6 +1423,7 @@ impl Parser {
                 is_packed,
                 base_volatile: decl_base_volatile,
                 object_volatile: decl_object_volatile,
+                counted_by,
             });
 
             if !self.consume_if(&TokenKind::Comma) {

@@ -1807,7 +1807,39 @@ fn peephole_optimize_inner(
     if global_changed && !skip_phase3 {
         let mut changed2 = true;
         let mut pass_count2 = 0;
-        while changed2 && pass_count2 < MAX_POST_GLOBAL_ITERATIONS {
+        // Phase 2b: ONE second store-forwarding round, taken only after the
+        // local fixpoint above has gone quiet.
+        //
+        // Phase 2 runs the forwarder once, and it has to answer "may this slot
+        // load be replaced by the register that was just stored into it?"
+        // against the text it was handed. The blocker it most often finds is a
+        // register write between store and load -- but that write is very often
+        // itself removed later in this same function, by phase 2's copy
+        // propagation and by phase 3's folds (`movzbl (%r9,%rsi), %eax;
+        // movzbl %al, %esi` retires into `movzbl (%r9,%rsi), %esi`, and the
+        // `%eax` write that blocked forwarding is gone). Nothing re-asks the
+        // forwarding question afterwards, so the pair survives into the final
+        // assembly: gzip's longest_match kept `movl %eax, 12(%rsp)` /
+        // `movl 12(%rsp), %eax` around its byte compare for exactly this
+        // reason (`lm.raw.s` -> `lm.s`, one store and one load per surviving
+        // candidate in the hottest branch of the program).
+        //
+        // Bounded deliberately: one extra round only, and only if the first
+        // round changed something (i.e. there is a fixpoint to re-reach). A
+        // forwarder that keeps finding work would otherwise re-scan the
+        // function until MAX_POST_GLOBAL_ITERATIONS with no new information.
+        let mut phase2b_pending = !sk("phase2b");
+        while pass_count2 < MAX_POST_GLOBAL_ITERATIONS && (changed2 || phase2b_pending) {
+            if !changed2 {
+                phase2b_pending = false;
+                let mut refed = store_forwarding::global_store_forwarding(&mut store, &mut infos);
+                if !sk("dead_pure_writes") {
+                    refed |= retire_dead_pure_writes(&store, &mut infos, !sk("dead_flag_writes"));
+                }
+                if !refed {
+                    break;
+                }
+            }
             changed2 = false;
             // Gated: previously combined_local_pass ran UNGATED here, so it
             // executed even when the user skipped `combined` — this caused

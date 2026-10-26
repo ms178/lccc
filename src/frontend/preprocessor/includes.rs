@@ -664,6 +664,68 @@ impl Preprocessor {
                     // Preprocess the included content
                     result.push_str(&self.preprocess_included(&content));
 
+                    // Re-apply LCCC C23 compiler-header guarantees after preprocessing
+                    // older host GCC headers (e.g., GCC 12's stdarg.h defines 2-arg
+                    // `va_start(v,l)` unconditionally and GCC 12's stddef.h predates
+                    // C23 `nullptr_t` and `unreachable()`).
+                    if include_path == "stdarg.h" {
+                        self.macros.define(MacroDef {
+                            name: "va_start".to_string(),
+                            is_function_like: true,
+                            params: vec!["ap".to_string()],
+                            is_variadic: true,
+                            has_named_variadic: false,
+                            body: "__builtin_va_start(ap)".to_string(),
+                        });
+                        if super::utils::c23_dialect()
+                            && !self.macros.is_defined("__STDC_VERSION_STDARG_H__")
+                        {
+                            self.macros.define(MacroDef {
+                                name: "__STDC_VERSION_STDARG_H__".to_string(),
+                                is_function_like: false,
+                                params: Vec::new(),
+                                is_variadic: false,
+                                has_named_variadic: false,
+                                body: "202311L".to_string(),
+                            });
+                        }
+                    } else if include_path == "stddef.h"
+                        && super::utils::c23_dialect()
+                        && self.macros.is_defined("_STDDEF_H")
+                    {
+                        if !self.macros.is_defined("unreachable") {
+                            self.macros.define(MacroDef {
+                                name: "unreachable".to_string(),
+                                is_function_like: true,
+                                params: Vec::new(),
+                                is_variadic: false,
+                                has_named_variadic: false,
+                                body: "(__builtin_unreachable())".to_string(),
+                            });
+                        }
+                        if !self.macros.is_defined("__STDC_VERSION_STDDEF_H__") {
+                            self.macros.define(MacroDef {
+                                name: "__STDC_VERSION_STDDEF_H__".to_string(),
+                                is_function_like: false,
+                                params: Vec::new(),
+                                is_variadic: false,
+                                has_named_variadic: false,
+                                body: "202311L".to_string(),
+                            });
+                        }
+                        if !self.macros.is_defined("_GCC_NULLPTR_T") {
+                            self.macros.define(MacroDef {
+                                name: "_GCC_NULLPTR_T".to_string(),
+                                is_function_like: false,
+                                params: Vec::new(),
+                                is_variadic: false,
+                                has_named_variadic: false,
+                                body: String::new(),
+                            });
+                            result.push_str("\ntypedef __typeof__(nullptr) nullptr_t;\n");
+                        }
+                    }
+
                     // Restore __FILE__
                     if let Some(old) = old_file {
                         self.macros.set_file(old);
@@ -1562,6 +1624,92 @@ impl Preprocessor {
                 });
                 // __gnuc_va_list is also handled natively by the parser/sema/lowerer
                 // (see comment above about not injecting typedef text).
+            }
+            "stdcountof.h" => {
+                self.macros.define(MacroDef {
+                    name: "countof".to_string(),
+                    is_function_like: false,
+                    params: Vec::new(),
+                    is_variadic: false,
+                    has_named_variadic: false,
+                    body: "_Countof".to_string(),
+                });
+            }
+            "stdckdint.h" => {
+                self.macros.define(MacroDef {
+                    name: "__STDC_VERSION_STDCKDINT_H__".to_string(),
+                    is_function_like: false,
+                    params: Vec::new(),
+                    is_variadic: false,
+                    has_named_variadic: false,
+                    body: "202311L".to_string(),
+                });
+                for (name, builtin) in [
+                    ("ckd_add", "__builtin_add_overflow"),
+                    ("ckd_sub", "__builtin_sub_overflow"),
+                    ("ckd_mul", "__builtin_mul_overflow"),
+                ] {
+                    self.macros.define(MacroDef {
+                        name: name.to_string(),
+                        is_function_like: true,
+                        params: vec!["r".to_string(), "a".to_string(), "b".to_string()],
+                        is_variadic: false,
+                        has_named_variadic: false,
+                        body: format!("((_Bool){builtin}((a), (b), (r)))"),
+                    });
+                }
+            }
+            "stdbit.h" => {
+                for (name, body) in [
+                    ("__STDC_VERSION_STDBIT_H__", "202311L"),
+                    ("__STDC_ENDIAN_LITTLE__", "1234"),
+                    ("__STDC_ENDIAN_BIG__", "4321"),
+                    ("__STDC_ENDIAN_NATIVE__", "__BYTE_ORDER__"),
+                ] {
+                    self.macros.define(MacroDef {
+                        name: name.to_string(),
+                        is_function_like: false,
+                        params: Vec::new(),
+                        is_variadic: false,
+                        has_named_variadic: false,
+                        body: body.to_string(),
+                    });
+                }
+                for base in [
+                    "stdc_leading_zeros",
+                    "stdc_leading_ones",
+                    "stdc_trailing_zeros",
+                    "stdc_trailing_ones",
+                    "stdc_first_leading_zero",
+                    "stdc_first_leading_one",
+                    "stdc_first_trailing_zero",
+                    "stdc_first_trailing_one",
+                    "stdc_count_zeros",
+                    "stdc_count_ones",
+                    "stdc_has_single_bit",
+                    "stdc_bit_width",
+                    "stdc_bit_floor",
+                    "stdc_bit_ceil",
+                ] {
+                    self.macros.define(MacroDef {
+                        name: base.to_string(),
+                        is_function_like: true,
+                        params: vec!["x".to_string()],
+                        is_variadic: false,
+                        has_named_variadic: false,
+                        body: format!("__builtin_{base}(x)"),
+                    });
+                }
+                for base in ["stdc_rotate_left", "stdc_rotate_right"] {
+                    self.macros.define(MacroDef {
+                        name: base.to_string(),
+                        is_function_like: true,
+                        params: vec!["x".to_string(), "c".to_string()],
+                        is_variadic: false,
+                        has_named_variadic: false,
+                        body: format!("__builtin_{base}((x), (c))"),
+                    });
+                }
             }
             _ => {}
         }

@@ -1631,8 +1631,8 @@ impl Lowerer {
             // Leaf statements: no labels inside
             Stmt::Expr(_)
             | Stmt::Return(_, _)
-            | Stmt::Break(_)
-            | Stmt::Continue(_)
+            | Stmt::Break(..)
+            | Stmt::Continue(..)
             | Stmt::Goto(_, _)
             | Stmt::GotoIndirect(_, _)
             | Stmt::Declaration(_)

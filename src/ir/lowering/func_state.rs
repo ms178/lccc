@@ -118,14 +118,12 @@ pub(super) struct FunctionBuildState {
     pub cpu_probe_init: bool,
     /// Variable -> alloca mapping with metadata
     pub locals: FxHashMap<String, LocalInfo>,
-    /// Loop context: (label, scope_depth) to jump to on `break`.
-    /// scope_depth records the scope_stack length when the loop was entered,
-    /// so break can emit cleanup calls for scopes being exited.
-    pub break_labels: Vec<(BlockId, usize)>,
-    /// Loop context: (label, scope_depth) to jump to on `continue`.
-    /// scope_depth records the scope_stack length when the loop was entered,
-    /// so continue can emit cleanup calls for scopes being exited.
-    pub continue_labels: Vec<(BlockId, usize)>,
+    /// Loop/switch context: `(label, scope_depth, loop_names)` to jump to on `break`.
+    pub break_labels: Vec<(BlockId, usize, Vec<String>)>,
+    /// Loop context: `(label, scope_depth, loop_names)` to jump to on `continue`.
+    pub continue_labels: Vec<(BlockId, usize, Vec<String>)>,
+    /// Label names immediately preceding the loop or switch being lowered (C2y named loops).
+    pub pending_loop_labels: Vec<String>,
     /// Stack of switch statement contexts
     pub switch_stack: Vec<SwitchFrame>,
     /// User-defined goto labels -> unique IR labels
@@ -307,6 +305,7 @@ impl FunctionBuildState {
             locals: FxHashMap::default(),
             break_labels: Vec::new(),
             continue_labels: Vec::new(),
+            pending_loop_labels: Vec::new(),
             switch_stack: Vec::new(),
             user_labels: FxHashMap::default(),
             defined_user_labels: FxHashSet::default(),

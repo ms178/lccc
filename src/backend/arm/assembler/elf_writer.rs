@@ -17,8 +17,8 @@ use super::parser::{AsmDirective, AsmStatement, DataValue, Operand, SizeExpr, Sy
 use crate::backend::cfi_lower;
 use crate::backend::elf::SetValue;
 use crate::backend::elf::{
-    self, DataFixup, ELFCLASS64, EM_AARCH64, ElfWriterBase, ObjReloc, STT_FUNC, STT_NOTYPE,
-    STT_OBJECT, STT_TLS, STV_HIDDEN, STV_INTERNAL, STV_PROTECTED,
+    self, DataFixup, ELFCLASS64, EM_AARCH64, ElfWriterBase, ObjReloc, STT_FUNC, STT_GNU_IFUNC,
+    STT_NOTYPE, STT_OBJECT, STT_TLS, STV_HIDDEN, STV_INTERNAL, STV_PROTECTED,
 };
 
 /// AArch64 NOP instruction: `d503201f` in little-endian
@@ -602,6 +602,7 @@ impl ElfWriter {
                     SymbolKind::Function => STT_FUNC,
                     SymbolKind::Object => STT_OBJECT,
                     SymbolKind::TlsObject => STT_TLS,
+                    SymbolKind::GnuIndirectFunction => STT_GNU_IFUNC,
                     SymbolKind::NoType => STT_NOTYPE,
                 };
                 self.base.set_symbol_type(sym, st);

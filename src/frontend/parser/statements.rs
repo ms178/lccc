@@ -19,6 +19,7 @@ impl Parser {
             return CompoundStmt {
                 items: Vec::new(),
                 local_labels: Vec::new(),
+                is_synthetic_init_scope: false,
             };
         }
         self.expect(&TokenKind::LBrace);
@@ -157,6 +158,7 @@ impl Parser {
         CompoundStmt {
             items,
             local_labels,
+            is_synthetic_init_scope: false,
         }
     }
 
@@ -210,7 +212,9 @@ impl Parser {
                 self.advance();
                 let open = self.peek_span();
                 self.expect_context(&TokenKind::LParen, "after 'if'");
-                let cond = self.parse_expr();
+                let saved_shadowed = self.shadowed_typedefs.clone();
+                let enum_mark = self.enum_scope_log.len();
+                let (init_item, cond) = self.parse_selection_header();
                 self.expect_closing(&TokenKind::RParen, open);
                 let then_stmt = self.parse_stmt();
                 let else_stmt = if self.consume_if(&TokenKind::Else) {
@@ -218,7 +222,18 @@ impl Parser {
                 } else {
                     None
                 };
-                Stmt::If(cond, Box::new(then_stmt), else_stmt, span)
+                self.shadowed_typedefs = saved_shadowed;
+                self.restore_enum_scope(enum_mark);
+                let if_stmt = Stmt::If(cond, Box::new(then_stmt), else_stmt, span);
+                if let Some(init) = init_item {
+                    Stmt::Compound(CompoundStmt {
+                        items: vec![init, BlockItem::Statement(if_stmt)],
+                        local_labels: Vec::new(),
+                        is_synthetic_init_scope: true,
+                    })
+                } else {
+                    if_stmt
+                }
             }
             TokenKind::While => {
                 let span = self.peek_span();
@@ -250,24 +265,51 @@ impl Parser {
             TokenKind::Break => {
                 let span = self.peek_span();
                 self.advance();
+                let label = if let TokenKind::Identifier(name) = self.peek() {
+                    let name = name.clone();
+                    self.advance();
+                    Some(name)
+                } else {
+                    None
+                };
                 self.expect_after(&TokenKind::Semicolon, "after break statement");
-                Stmt::Break(span)
+                Stmt::Break(label, span)
             }
             TokenKind::Continue => {
                 let span = self.peek_span();
                 self.advance();
+                let label = if let TokenKind::Identifier(name) = self.peek() {
+                    let name = name.clone();
+                    self.advance();
+                    Some(name)
+                } else {
+                    None
+                };
                 self.expect_after(&TokenKind::Semicolon, "after continue statement");
-                Stmt::Continue(span)
+                Stmt::Continue(label, span)
             }
             TokenKind::Switch => {
                 let span = self.peek_span();
                 self.advance();
                 let open = self.peek_span();
                 self.expect_context(&TokenKind::LParen, "after 'switch'");
-                let expr = self.parse_expr();
+                let saved_shadowed = self.shadowed_typedefs.clone();
+                let enum_mark = self.enum_scope_log.len();
+                let (init_item, expr) = self.parse_selection_header();
                 self.expect_closing(&TokenKind::RParen, open);
                 let body = self.parse_stmt();
-                Stmt::Switch(expr, Box::new(body), span)
+                self.shadowed_typedefs = saved_shadowed;
+                self.restore_enum_scope(enum_mark);
+                let sw_stmt = Stmt::Switch(expr, Box::new(body), span);
+                if let Some(init) = init_item {
+                    Stmt::Compound(CompoundStmt {
+                        items: vec![init, BlockItem::Statement(sw_stmt)],
+                        local_labels: Vec::new(),
+                        is_synthetic_init_scope: true,
+                    })
+                } else {
+                    sw_stmt
+                }
             }
             TokenKind::Case => {
                 let span = self.peek_span();
@@ -369,6 +411,33 @@ impl Parser {
         self.parse_stmt()
     }
 
+    /// Parse `(cond)` or C2y/GCC 15+ `(init; cond)` inside `if` / `switch`.
+    fn parse_selection_header(&mut self) -> (Option<BlockItem>, Expr) {
+        if self.consume_if(&TokenKind::Semicolon) {
+            return (
+                Some(BlockItem::Statement(Stmt::Expr(None))),
+                self.parse_expr(),
+            );
+        }
+        // Optional leading C23 attribute `[[maybe_unused]] int x = f();` or type specifier.
+        let starts_decl = self.is_type_specifier() || self.is_c23_attr_start();
+        if starts_decl {
+            let decl = self.parse_local_declaration();
+            let cond = self.parse_expr();
+            let item = decl
+                .map(BlockItem::Declaration)
+                .unwrap_or(BlockItem::Statement(Stmt::Expr(None)));
+            return (Some(item), cond);
+        }
+        let first = self.parse_expr();
+        if self.consume_if(&TokenKind::Semicolon) {
+            let cond = self.parse_expr();
+            (Some(BlockItem::Statement(Stmt::Expr(Some(first)))), cond)
+        } else {
+            (None, first)
+        }
+    }
+
     /// Parse a for statement: for (init; cond; inc) body
     fn parse_for_stmt(&mut self) -> Stmt {
         let span = self.peek_span();
@@ -376,10 +445,13 @@ impl Parser {
         let open = self.peek_span();
         self.expect_context(&TokenKind::LParen, "after 'for'");
 
+        let saved_shadowed = self.shadowed_typedefs.clone();
+        let enum_mark = self.enum_scope_log.len();
+
         let init = if matches!(self.peek(), TokenKind::Semicolon) {
             self.advance();
             None
-        } else if self.is_type_specifier() {
+        } else if self.is_type_specifier() || self.is_c23_attr_start() {
             let decl = self.parse_local_declaration();
             decl.map(|d| Box::new(ForInit::Declaration(d)))
         } else {
@@ -403,6 +475,8 @@ impl Parser {
         self.expect_closing(&TokenKind::RParen, open);
 
         let body = self.parse_stmt();
+        self.shadowed_typedefs = saved_shadowed;
+        self.restore_enum_scope(enum_mark);
         Stmt::For(init, cond, inc, Box::new(body), span)
     }
 

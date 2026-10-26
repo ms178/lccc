@@ -35,7 +35,7 @@ impl Lowerer {
     /// be recomputed by the lowerer.
     pub(super) fn expr_contains_sizeof(expr: &Expr) -> bool {
         match expr {
-            Expr::Sizeof(_, _) => true,
+            Expr::Sizeof(_, _) | Expr::Countof(_, _) => true,
             Expr::BinaryOp(_, lhs, rhs, _) => {
                 Self::expr_contains_sizeof(lhs) || Self::expr_contains_sizeof(rhs)
             }
@@ -361,6 +361,10 @@ impl Lowerer {
                 };
                 Some(IrConst::I64(size as i64))
             }
+            Expr::Countof(arg, _) => {
+                let count = self.static_countof_arg(arg)?;
+                Some(IrConst::I64(count as i64))
+            }
             Expr::Alignof(ts, _) => {
                 let align = self.c11_alignof_type(ts);
                 Some(IrConst::I64(align as i64))
@@ -422,6 +426,18 @@ impl Lowerer {
                     }
                     if name == "__builtin_classify_type" {
                         return Some(IrConst::I64(self.classify_type_of(args.first())));
+                    }
+                    if name == "__builtin_assoc_barrier" && args.len() == 1 {
+                        return self.eval_const_expr(&args[0]);
+                    }
+                    if name == "__builtin_counted_by_ref" && args.len() == 1 {
+                        if self.resolve_counted_by_member_expr(&args[0]).is_none() {
+                            return Some(IrConst::I64(0));
+                        }
+                        return None;
+                    }
+                    if crate::frontend::sema::stdbit::is_stdc_bit_builtin(name) {
+                        return self.eval_stdc_bit_const(name, args);
                     }
                     // The bare-name fold table speaks for the library function of
                     // this name, so it stays silent when the identifier denotes
@@ -1519,6 +1535,41 @@ impl Lowerer {
             }
         }
         self.type_spec_is_vla(&field.type_spec)
+    }
+
+    pub(super) fn eval_stdc_bit_const(&self, name: &str, args: &[Expr]) -> Option<IrConst> {
+        use crate::frontend::sema::stdbit;
+        let expected_arity = stdbit::stdc_bit_arity(name)?;
+        if args.len() != expected_arity {
+            return None;
+        }
+        let arg0_ct = self.get_expr_ctype(&args[0])?;
+        let width = stdbit::stdc_bit_width_of_ctype(&arg0_ct)?;
+        let c0 = self.eval_const_expr(&args[0])?;
+        let raw_val = match c0 {
+            IrConst::I128(v) => v as u128,
+            other => other.to_u64()? as u128,
+        };
+        let rotate_cnt = if expected_arity == 2 {
+            let c1 = self.eval_const_expr(&args[1])?;
+            let arg1_unsigned = self
+                .get_expr_ctype(&args[1])
+                .is_some_and(|ct| ct.is_unsigned());
+            Some(match (c1, arg1_unsigned) {
+                (IrConst::I128(v), true) => (v as u128) as i128,
+                (IrConst::I128(v), false) => v,
+                (other, true) => other.to_u64()? as i128,
+                (other, false) => other.to_i64()? as i128,
+            })
+        } else {
+            None
+        };
+        let res = stdbit::eval_stdc_bit_builtin(name, raw_val, rotate_cnt, width)?;
+        if width > 64 && stdbit::stdc_bit_returns_arg_type(name) {
+            Some(IrConst::I128(res as i128))
+        } else {
+            Some(IrConst::I64(res as i64))
+        }
     }
 }
 

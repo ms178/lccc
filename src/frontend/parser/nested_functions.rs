@@ -256,6 +256,7 @@ impl Parser {
         def_attrs.set_cold(self.attrs.parsing_cold());
         def_attrs.set_error_attr(self.attrs.parsing_error_attr());
         def_attrs.alias_target = self.attrs.parsing_alias_target.take();
+        def_attrs.ifunc_target = self.attrs.parsing_ifunc_target.take();
         def_attrs.visibility = self.attrs.parsing_visibility.take();
         def_attrs.section = self.attrs.parsing_section.take();
         def_attrs.tls_model = self.attrs.parsing_tls_model.take();

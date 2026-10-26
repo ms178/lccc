@@ -45,10 +45,13 @@ impl Lowerer {
         let end_label = self.fresh_label();
 
         let scope_depth = self.func().scope_stack.len();
-        self.func_mut().break_labels.push((end_label, scope_depth));
+        let names = std::mem::take(&mut self.func_mut().pending_loop_labels);
+        self.func_mut()
+            .break_labels
+            .push((end_label, scope_depth, names.clone()));
         self.func_mut()
             .continue_labels
-            .push((cond_label, scope_depth));
+            .push((cond_label, scope_depth, names));
 
         self.terminate(Terminator::Branch(cond_label));
 
@@ -78,6 +81,7 @@ impl Lowerer {
         inc: &Option<Expr>,
         body: &Stmt,
     ) {
+        let names = std::mem::take(&mut self.func_mut().pending_loop_labels);
         // C99: for-init declarations have their own scope.
         let has_decl_init = init
             .as_ref()
@@ -103,10 +107,12 @@ impl Lowerer {
         let end_label = self.fresh_label();
 
         let scope_depth = self.func().scope_stack.len();
-        self.func_mut().break_labels.push((end_label, scope_depth));
+        self.func_mut()
+            .break_labels
+            .push((end_label, scope_depth, names.clone()));
         self.func_mut()
             .continue_labels
-            .push((inc_label, scope_depth));
+            .push((inc_label, scope_depth, names));
 
         self.terminate(Terminator::Branch(cond_label));
 
@@ -148,10 +154,13 @@ impl Lowerer {
         let end_label = self.fresh_label();
 
         let scope_depth = self.func().scope_stack.len();
-        self.func_mut().break_labels.push((end_label, scope_depth));
+        let names = std::mem::take(&mut self.func_mut().pending_loop_labels);
+        self.func_mut()
+            .break_labels
+            .push((end_label, scope_depth, names.clone()));
         self.func_mut()
             .continue_labels
-            .push((cond_label, scope_depth));
+            .push((cond_label, scope_depth, names));
 
         self.terminate(Terminator::Branch(body_label));
 
@@ -168,11 +177,21 @@ impl Lowerer {
         self.start_block(end_label);
     }
 
-    pub(super) fn lower_break_stmt(&mut self) {
-        if let Some(&(label, scope_depth)) = self.func().break_labels.last() {
+    pub(super) fn lower_break_stmt(&mut self, target: Option<&str>) {
+        let resolved = match target {
+            None => self.func().break_labels.last().map(|&(l, d, _)| (l, d)),
+            Some(lbl) => self
+                .func()
+                .break_labels
+                .iter()
+                .rev()
+                .find(|(_, _, names)| names.iter().any(|n| n == lbl))
+                .map(|&(l, d, _)| (l, d)),
+        };
+        if let Some((label, scope_depth)) = resolved {
             // Emit cleanup calls for all scopes being exited by break
             let cleanups = self.collect_scope_cleanup_vars_above_depth(scope_depth);
-            self.emit_cleanup_calls(&cleanups);
+            self.emit_collected_cleanup_calls(&cleanups);
             // Restore the stack pointer for VLA deallocation when breaking out
             // of scopes that contain VLAs. Without this, VLA stack space leaks.
             self.emit_vla_restore_for_scope_exit(scope_depth);
@@ -182,11 +201,21 @@ impl Lowerer {
         }
     }
 
-    pub(super) fn lower_continue_stmt(&mut self) {
-        if let Some(&(label, scope_depth)) = self.func().continue_labels.last() {
+    pub(super) fn lower_continue_stmt(&mut self, target: Option<&str>) {
+        let resolved = match target {
+            None => self.func().continue_labels.last().map(|&(l, d, _)| (l, d)),
+            Some(lbl) => self
+                .func()
+                .continue_labels
+                .iter()
+                .rev()
+                .find(|(_, _, names)| names.iter().any(|n| n == lbl))
+                .map(|&(l, d, _)| (l, d)),
+        };
+        if let Some((label, scope_depth)) = resolved {
             // Emit cleanup calls for all scopes being exited by continue
             let cleanups = self.collect_scope_cleanup_vars_above_depth(scope_depth);
-            self.emit_cleanup_calls(&cleanups);
+            self.emit_collected_cleanup_calls(&cleanups);
             // Restore the stack pointer for VLA deallocation when continuing
             // past scopes that contain VLAs. Without this, VLA stack space leaks
             // on each loop iteration, causing stack overflow.
@@ -259,7 +288,7 @@ impl Lowerer {
         // needed. If jumping out to a shallower scope, clean up the exited scopes.
         let cleanup_depth = target_depth.min(current_depth);
         let cleanups = self.collect_scope_cleanup_vars_above_depth(cleanup_depth);
-        self.emit_cleanup_calls(&cleanups);
+        self.emit_collected_cleanup_calls(&cleanups);
 
         // Restore the stack pointer for VLA deallocation when needed.
         //
@@ -293,7 +322,7 @@ impl Lowerer {
     pub(super) fn lower_goto_indirect_stmt(&mut self, expr: &Expr) {
         // Emit cleanup calls for all active scopes before indirect jump (same as goto).
         let all_cleanups = self.collect_all_scope_cleanup_vars();
-        self.emit_cleanup_calls(&all_cleanups);
+        self.emit_collected_cleanup_calls(&all_cleanups);
         // If the function has VLA declarations, restore the saved stack pointer before
         // indirect jumps too (computed gotos).
         if let Some(save_val) = self.func().vla_stack_save {
@@ -344,6 +373,12 @@ impl Lowerer {
                 seg_overrides: Vec::new(),
             });
         }
+        if stmt.labels_loop_or_switch() {
+            self.func_mut().pending_loop_labels.push(name.to_string());
+        } else {
+            self.func_mut().pending_loop_labels.clear();
+        }
         self.lower_stmt(stmt);
+        self.func_mut().pending_loop_labels.clear();
     }
 }

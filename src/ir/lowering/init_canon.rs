@@ -151,6 +151,30 @@ impl Lowerer {
         ty.is_vector() && self.get_expr_ctype(e).is_some_and(|ct| ct.is_vector())
     }
 
+    /// Whether `e` initializes a whole ARRAY of type `ty` (p13).
+    ///
+    /// An array expression is not a value here (6.3.2.1p3) and a braced list
+    /// cannot appear inside an expression, so the only expression that can
+    /// stand for the array itself is a compound literal of that very type,
+    /// which names an object whose payload is the array's initializer
+    /// (6.5.2.5p5).  Without this arm such an expression fell through to brace
+    /// elision (p20) and initialized the array's FIRST SCALAR instead: the
+    /// literal landed inside `a[0].b[0]`, so `struct { unsigned long pad; nm_t
+    /// a[2]; } w = { .a = (nm_t[2]){ ... } }` left `a[1]` and `a[0].b[0]`
+    /// zero.
+    pub(super) fn expr_initializes_array(&self, e: &Expr, ty: &CType) -> bool {
+        match (self.get_expr_ctype(e), ty) {
+            (Some(CType::Array(a, an)), CType::Array(b, bn)) => {
+                let same_len = match (an, *bn) {
+                    (Some(x), Some(y)) => x == y,
+                    _ => true,
+                };
+                a == *b && same_len
+            }
+            _ => false,
+        }
+    }
+
     /// Whether `e` initializes a whole struct/union of type `ty` (p13).
     fn expr_initializes_record(&self, e: &Expr, ty: &CType) -> bool {
         match (self.get_expr_ctype(e), ty) {
@@ -575,23 +599,41 @@ impl Lowerer {
                     Self::store(root, frames, Some(Node::Expr(e.clone())));
                 }
                 (Initializer::Expr(e), Kind::Scalars(geo)) => {
-                    let whole_string = match &sub_ty {
-                        CType::Array(elem, _) => {
-                            geo.strides.len() == 1 && StringInit::for_elem_ctype(e, elem).is_some()
-                        }
-                        _ => false,
-                    };
-                    if !whole_string {
+                    // An expression of the subobject's own ARRAY type is the
+                    // whole array (it can only be a compound literal; see
+                    // `expr_initializes_array`), so it must not be taken for
+                    // its first lane.  `.{m} = (int[2][3]){ ... }` used to be
+                    // stored as a one-element scalar run, which left the member
+                    // all zero.
+                    let whole_array = self.expr_initializes_array(e, &sub_ty);
+                    let whole_string = !whole_array
+                        && match &sub_ty {
+                            CType::Array(elem, _) => {
+                                geo.strides.len() == 1
+                                    && StringInit::for_elem_ctype(e, elem).is_some()
+                            }
+                            _ => false,
+                        };
+                    if !whole_array && !whole_string {
                         return self.place_scalar_run(root, frames, &sub_ty, &geo, &[], item, rest);
                     }
-                    let string = InitializerItem {
-                        designators: Vec::new(),
-                        init: item.init.clone(),
-                    };
-                    Self::store(root, frames, Some(Node::Scalars(vec![string])));
+                    if whole_array {
+                        Self::store(root, frames, Some(Node::Expr(e.clone())));
+                    } else {
+                        let string = InitializerItem {
+                            designators: Vec::new(),
+                            init: item.init.clone(),
+                        };
+                        Self::store(root, frames, Some(Node::Scalars(vec![string])));
+                    }
                 }
                 (Initializer::Expr(e), Kind::Record(_))
                     if self.expr_initializes_record(e, &sub_ty) =>
+                {
+                    Self::store(root, frames, Some(Node::Expr(e.clone())));
+                }
+                (Initializer::Expr(e), Kind::Array { .. })
+                    if self.expr_initializes_array(e, &sub_ty) =>
                 {
                     Self::store(root, frames, Some(Node::Expr(e.clone())));
                 }

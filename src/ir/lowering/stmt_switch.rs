@@ -75,7 +75,10 @@ impl Lowerer {
             expr_type: switch_expr_ty,
         });
         let scope_depth = self.func().scope_stack.len();
-        self.func_mut().break_labels.push((end_label, scope_depth));
+        let names = std::mem::take(&mut self.func_mut().pending_loop_labels);
+        self.func_mut()
+            .break_labels
+            .push((end_label, scope_depth, names));
 
         self.terminate(Terminator::Branch(dispatch_label));
 

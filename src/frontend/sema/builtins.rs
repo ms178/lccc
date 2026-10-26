@@ -3448,6 +3448,23 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
             );
         }
     }
+    // C23 / C2y <stdbit.h> type-generic bit and rotate builtins + GCC 15/16 C2y builtins
+    for &name in &super::stdbit::STDC_BIT_BUILTINS {
+        m.insert(name, BuiltinInfo::intrinsic(BuiltinIntrinsic::StdcBit));
+    }
+    m.insert(
+        "__builtin_counted_by_ref",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::CountedByRef),
+    );
+    m.insert(
+        "__builtin_assoc_barrier",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::AssocBarrier),
+    );
+    m.insert(
+        "__builtin_clear_padding",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::ClearPadding),
+    );
+
     m
 });
 
@@ -3524,6 +3541,14 @@ pub enum BuiltinIntrinsic {
     ObjectSize,
     /// __builtin_classify_type(expr) -> integer type class of the expression's type
     ClassifyType,
+    /// C23 / C2y `__builtin_stdc_*` type-generic bit and rotate builtins
+    StdcBit,
+    /// GCC 15/16 `__builtin_counted_by_ref(p->fam)`
+    CountedByRef,
+    /// GCC `__builtin_assoc_barrier(expr)`
+    AssocBarrier,
+    /// C23 / GCC `__builtin_clear_padding(ptr)`
+    ClearPadding,
     /// No-op builtin (evaluates args, returns 0)
     Nop,
     /// __builtin_cpu_init() - no-op, glibc handles CPU feature detection init

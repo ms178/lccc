@@ -115,6 +115,34 @@ impl<'s> StaticInitChecker<'s> {
         out
     }
 
+    /// [`Self::non_constant_leaves`] for an initializer whose OBJECT type is
+    /// known.
+    ///
+    /// The object type separates the two meanings of an array-typed compound
+    /// literal in initializer position.  When the literal has the object's own
+    /// array type it IS that object's braced list -- `static int a[3] =
+    /// (int[3]){ 1, 2, 3 };` initializes `a` from three constants, exactly like
+    /// `= { 1, 2, 3 }` -- so its payload leaves are the ones to check.  Any
+    /// other array literal decays to the address of an automatic object
+    /// (6.3.2.1p3), which is not an address constant: `static int *p =
+    /// (int[]){ 1, 2 };` is rejected by GCC and stays rejected here.
+    ///
+    /// A literal that initializes a MEMBER of the object is still treated as
+    /// its decayed address (the member's type is not available to this walk);
+    /// see the note on `leaf_kind`.
+    pub(super) fn non_constant_leaves_for(&self, init: &Initializer, target: &CType) -> Vec<Span> {
+        if let (Initializer::Expr(expr @ Expr::CompoundLiteral(_, payload, _)), CType::Array(..)) =
+            (init, target)
+        {
+            if (self.ctype)(expr).is_some_and(|t| t == *target) {
+                let mut out = Vec::new();
+                self.collect_bad(payload, &mut out);
+                return out;
+            }
+        }
+        self.non_constant_leaves(init)
+    }
+
     /// The kind of an expression that is the WHOLE initializer of an object.
     /// GCC 16.2 folds a cast of a vector compound literal to its own type
     /// there (`T g = (T)(T){ 1, 2 };`) but not as a member's initializer
@@ -188,9 +216,10 @@ impl<'s> StaticInitChecker<'s> {
     /// initializers are constant — the Linux kernel's RATELIMIT_STATE_INIT
     /// depends on this). An ARRAY-typed literal is treated conservatively as
     /// its decayed address (the common `(int[]){1,2}` -> static-pointer shape
-    /// is exactly that, and GCC rejects it); the rarer array-literal-
-    /// initializes-array-object form is then rejected too — safe direction,
-    /// tracked as a known deviation.
+    /// is exactly that, and GCC rejects it). The array-literal-initializes-
+    /// array-OBJECT form is constant, and `non_constant_leaves_for` accepts it
+    /// when the caller knows the object's type; a literal that initializes a
+    /// MEMBER array is still rejected, which is the remaining deviation.
     ///
     /// Any other use of a block-scope compound literal — an operand of
     /// arithmetic, a cast, or `&(T){...}` — references the automatic object
@@ -323,6 +352,7 @@ impl<'s> StaticInitChecker<'s> {
             // A file-scope compound literal has static storage: an address constant.
             Expr::CompoundLiteral(..) => self.compound_literal_kind(),
             Expr::Sizeof(..)
+            | Expr::Countof(..)
             | Expr::Alignof(..)
             | Expr::AlignofExpr(..)
             | Expr::GnuAlignof(..)

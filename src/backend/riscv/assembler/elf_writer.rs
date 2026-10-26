@@ -22,8 +22,8 @@ use super::parser::{
 use crate::backend::cfi_lower;
 use crate::backend::elf::{
     self, DataFixup, ELFCLASS32, ELFCLASS64, EM_RISCV, ElfWriterBase, ObjReloc, SHF_ALLOC,
-    SHF_EXECINSTR, SHF_WRITE, SHT_NOBITS, SHT_PROGBITS, STT_FUNC, STT_NOTYPE, STT_OBJECT, STT_TLS,
-    STV_HIDDEN, STV_INTERNAL, STV_PROTECTED, SetValue,
+    SHF_EXECINSTR, SHF_WRITE, SHT_NOBITS, SHT_PROGBITS, STT_FUNC, STT_GNU_IFUNC, STT_NOTYPE,
+    STT_OBJECT, STT_TLS, STV_HIDDEN, STV_INTERNAL, STV_PROTECTED, SetValue,
 };
 use crate::backend::elf_writer_common::{uleb128_fixed, uleb128_len};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
@@ -750,6 +750,7 @@ impl ElfWriter {
                     SymbolType::Function => STT_FUNC,
                     SymbolType::Object => STT_OBJECT,
                     SymbolType::TlsObject => STT_TLS,
+                    SymbolType::GnuIndirectFunction => STT_GNU_IFUNC,
                     SymbolType::NoType => STT_NOTYPE,
                 };
                 self.base.set_symbol_type(sym, elf_type);

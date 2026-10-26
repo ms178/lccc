@@ -225,15 +225,24 @@ impl Lowerer {
             self.track_fptr_sig(declarator, type_spec);
 
             if let Some(ref init) = declarator.init {
-                self.lower_local_var_init(
-                    init,
-                    decl,
-                    declarator,
-                    &da,
-                    alloca,
-                    is_complex,
-                    &complex_elem_ctype,
-                );
+                if let Some(vla_size_val) = vla_size {
+                    // C23 6.7.10p7: a VLA initialized with `{}` is zero-filled over its
+                    // exact runtime byte count (never `da.alloc_size`, which is a fixed
+                    // fallback placeholder).
+                    if matches!(init, Initializer::List(items) if items.is_empty()) {
+                        self.emit_memset_zero_dynamic(alloca, vla_size_val);
+                    }
+                } else {
+                    self.lower_local_var_init(
+                        init,
+                        decl,
+                        declarator,
+                        &da,
+                        alloca,
+                        is_complex,
+                        &complex_elem_ctype,
+                    );
+                }
             }
         }
     }
@@ -1623,7 +1632,7 @@ impl Lowerer {
                 };
                 // Emit cleanup calls for all active scopes before returning
                 let all_cleanups = self.collect_all_scope_cleanup_vars();
-                self.emit_cleanup_calls(&all_cleanups);
+                self.emit_collected_cleanup_calls(&all_cleanups);
                 self.terminate(Terminator::Return(op));
                 let label = self.fresh_label();
                 self.start_block(label);
@@ -1636,15 +1645,20 @@ impl Lowerer {
                 self.lower_expr_discard(expr);
             }
             Stmt::Expr(None) => {}
-            Stmt::Compound(compound) => self.lower_compound_stmt(compound),
+            Stmt::Compound(compound) => {
+                if !compound.is_synthetic_init_scope {
+                    self.func_mut().pending_loop_labels.clear();
+                }
+                self.lower_compound_stmt(compound);
+            }
             Stmt::If(cond, then_stmt, else_stmt, _span) => {
                 self.lower_if_stmt(cond, then_stmt, else_stmt.as_deref())
             }
             Stmt::While(cond, body, _span) => self.lower_while_stmt(cond, body),
             Stmt::For(init, cond, inc, body, _span) => self.lower_for_stmt(init, cond, inc, body),
             Stmt::DoWhile(body, cond, _span) => self.lower_do_while_stmt(body, cond),
-            Stmt::Break(_span) => self.lower_break_stmt(),
-            Stmt::Continue(_span) => self.lower_continue_stmt(),
+            Stmt::Break(target, _span) => self.lower_break_stmt(target.as_deref()),
+            Stmt::Continue(target, _span) => self.lower_continue_stmt(target.as_deref()),
             Stmt::Switch(expr, body, _span) => self.lower_switch_stmt(expr, body),
             Stmt::Case(expr, stmt, _span) => self.lower_case_stmt(expr, stmt),
             Stmt::CaseRange(low_expr, high_expr, stmt, _span) => {
