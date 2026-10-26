@@ -147,7 +147,6 @@ in [`llvm-batch4-audit.json`](llvm-batch4-audit.json).
 | #74433 | `if (x) return 1; return 0;` | 6 / 4 | 6 / 4 | branch-to-`setcc` control flow |
 | #74976 | `__builtin_ctz(~x)` | 5 / 4 | 5 / 4 | count-trailing-ones recognition |
 | #85844 | `a > -1 ? 0 : (a \| 3)` | 7 / 6 | 7 / 6 | range-based select canonicalisation |
-| #117436 | see above | | | |
 | #72512 | `(a + 1) - b == 1` | 6 / 4 | 6 / 4 | reassociation across a wrapping add |
 | #107228 | `((a - 1) & ~a) >> 63` | 6 / 5 | 6 / 5 | known-bits analysis |
 | #157370 | `(x % 10) % 5` | 15 / 14 | 20 / 19 | **regressed by count, see below** |
@@ -157,14 +156,21 @@ Two rows are worth their own paragraph.
 
 **`(x % 10) % 5` and `(x % 100) / 10`.** With the division-strength pass off,
 these compile to two `idiv` instructions — 10 and 9 instructions. With it on,
-each division becomes a magic multiply, and the pair costs 20 and 17. The magic
-multiply is the better *latency* choice for one division, but for a chain the
-right answer is a divisor/quotient decomposition: `(x % 100) / 10` is
-`(x - 100 * (x / 100)) / 10` only if the second division is rebuilt, whereas the
-quotient chain `x / 100 → t`, `x / 10 = 10 * t + (x / 10) % 10` reuses the first
-magic constant. That is a real, sizeable follow-up and it is recorded as such
-rather than papered over: the current behaviour is a net loss on instruction
-count for chained division and a win on latency, and the ledger says so.
+each division becomes a magic multiply, and the pair costs 20 and 17 against
+GCC's 19 and 14. So the pass costs *length* on both chains and almost all of the
+gap to GCC is shared: GCC also pays a magic multiply for both divisions, and is
+one instruction shorter only because of the return copy. The remaining three
+instructions on `(x % 100) / 10` are the real lccc deficit and the real
+follow-up: the second division should be decomposed against the first instead of
+strength-reduced independently. With `q = x / 100` and `r = x - 100 * q` — so
+`|r| < 100` and `x = 100 * q + r` — the truncating quotient satisfies
+`x / 10 = 10 * q + r / 10`, because a multiple of ten can be moved through the
+truncating division unchanged. The inner quotient divides a value already
+bounded by 100, so it is one multiply on a small range instead of a second
+64-bit magic constant.
+That decomposition is a
+batch of its own; the ledger records the counts and the shape rather than
+pretending the current code is at the oracle.
 
 **Rows that moved without a fold.** #86171, #193898, #156898, #63149 and #71533
 are at or better than the oracle in the re-transcription while batch 3 recorded
@@ -178,7 +184,7 @@ counts that show it.
 
 ## Differential red team
 
-`research/fuzz_identities.py` draws random programs from the idiom families —
+`scripts/fuzz_identities.py` draws random programs from the idiom families —
 remainder windows at every width, sign-mask shifts in both mask forms with
 runtime counts, complements of negation, saturated bounds, zero-test selects in
 all four arm orders, or-chains, nested boolean selects, boolean products, and
@@ -193,7 +199,9 @@ With those constraints removed, all eight seed programs "failed" — against
 GCC, with the two lccc builds agreeing — which is the expected signature of
 undefined behaviour and the reason the matrix is constrained.
 
-150 random programs, 0 mismatches.
+Cumulative: **310 random programs, 0 mismatches** — 150 with the batch-3 fold
+set, then 60 and 100 after the boolean lattice and the power-of-two repricing
+landed, each program executed against all three builds.
 
 ## Residual gap that is not a fold
 
