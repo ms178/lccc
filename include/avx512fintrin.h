@@ -93,19 +93,11 @@ _mm512_mul_ps(__m512 __a, __m512 __b)
 void *__lccc_simd512_ps_vfmadd132ps512(long, __m512, __m512, __m512);
 void *__lccc_simd512_pd_vfmadd132pd512(long, __m512d, __m512d, __m512d);
 
-static __inline__ __m512 __attribute__((__always_inline__, __target__("avx512f")))
-_mm512_fmadd_ps(__m512 __a, __m512 __b, __m512 __c)
-{
-    return __CCC_M512_FROM_BUILTIN(
-        __lccc_simd512_ps_vfmadd132ps512(0, __a, __b, __c));
-}
+#define _mm512_fmadd_ps(__a, __b, __c) \
+    __CCC_M512_FROM_BUILTIN(__lccc_simd512_ps_vfmadd132ps512(0, __a, __b, __c))
 
-static __inline__ __m512d __attribute__((__always_inline__, __target__("avx512f")))
-_mm512_fmadd_pd(__m512d __a, __m512d __b, __m512d __c)
-{
-    return __CCC_M512D_FROM_BUILTIN(
-        __lccc_simd512_pd_vfmadd132pd512(0, __a, __b, __c));
-}
+#define _mm512_fmadd_pd(__a, __b, __c) \
+    __CCC_M512D_FROM_BUILTIN(__lccc_simd512_pd_vfmadd132pd512(0, __a, __b, __c))
 
 /* === Float Reduce === */
 

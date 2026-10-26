@@ -7305,7 +7305,7 @@
       "canonical_override": false,
       "definitions": 1,
       "forms": [
-        "function"
+        "macro"
       ],
       "generic_helpers": [
         "__lccc_simd512_pd_vfmadd132pd512"
@@ -7322,7 +7322,7 @@
       "canonical_override": false,
       "definitions": 1,
       "forms": [
-        "function"
+        "macro"
       ],
       "generic_helpers": [
         "__lccc_simd512_ps_vfmadd132ps512"
@@ -8201,7 +8201,7 @@
       "canonical_override": false,
       "definitions": 1,
       "forms": [
-        "function"
+        "macro"
       ],
       "generic_helpers": [
         "__lccc_simd256_ps_vfmadd132pd256"
@@ -8218,7 +8218,7 @@
       "canonical_override": false,
       "definitions": 1,
       "forms": [
-        "function"
+        "macro"
       ],
       "generic_helpers": [
         "__lccc_simd256_ps_vfmadd132ps256"
@@ -12643,7 +12643,7 @@
       "canonical_override": false,
       "definitions": 1,
       "forms": [
-        "function"
+        "macro"
       ],
       "generic_helpers": [
         "__lccc_simd128_ps_fmadd132pd128"
@@ -12660,7 +12660,7 @@
       "canonical_override": false,
       "definitions": 1,
       "forms": [
-        "function"
+        "macro"
       ],
       "generic_helpers": [
         "__lccc_simd128_ps_fmadd132ps128"

@@ -1142,12 +1142,10 @@ static __inline__ __attribute__((__always_inline__, __artificial__)) __m128d _mm
 { return __CCC_M128D_FROM_NATIVE(__lccc_simd128_ps_blendvpd128(0, __mask, __a, __b)); }
 
 __m128 __lccc_simd128_ps_fmadd132ps128(long, __m128 __a, __m128 __b, __m128 __c);
-static __inline__ __attribute__((__always_inline__, __artificial__, __target__("fma"))) __m128 _mm_fmadd_ps(__m128 __a, __m128 __b, __m128 __c)
-{ return __CCC_M128_FROM_NATIVE(__lccc_simd128_ps_fmadd132ps128(0, __a, __b, __c)); }
+#define _mm_fmadd_ps(__a, __b, __c) __CCC_M128_FROM_NATIVE(__lccc_simd128_ps_fmadd132ps128(0, __a, __b, __c))
 
 __m128d __lccc_simd128_ps_fmadd132pd128(long, __m128d __a, __m128d __b, __m128d __c);
-static __inline__ __attribute__((__always_inline__, __artificial__, __target__("fma"))) __m128d _mm_fmadd_pd(__m128d __a, __m128d __b, __m128d __c)
-{ return __CCC_M128D_FROM_NATIVE(__lccc_simd128_ps_fmadd132pd128(0, __a, __b, __c)); }
+#define _mm_fmadd_pd(__a, __b, __c) __CCC_M128D_FROM_NATIVE(__lccc_simd128_ps_fmadd132pd128(0, __a, __b, __c))
 
 __m128 __lccc_simd128_ps_movss128(long, __m128 __a, __m128 __b);
 static __inline__ __attribute__((__always_inline__, __artificial__)) __m128 _mm_move_ss(__m128 __a, __m128 __b)
@@ -1398,12 +1396,10 @@ static __inline__ __attribute__((__always_inline__, __artificial__)) __m256d _mm
 { return __CCC_M256D_FROM_BUILTIN(__lccc_simd256_ps_vblendvpd256(0, __mask, __a, __b)); }
 
 void * __lccc_simd256_ps_vfmadd132ps256(long, __m256 __a, __m256 __b, __m256 __c);
-static __inline__ __attribute__((__always_inline__, __artificial__, __target__("fma"))) __m256 _mm256_fmadd_ps(__m256 __a, __m256 __b, __m256 __c)
-{ return __CCC_M256_FROM_BUILTIN(__lccc_simd256_ps_vfmadd132ps256(0, __a, __b, __c)); }
+#define _mm256_fmadd_ps(__a, __b, __c) __CCC_M256_FROM_BUILTIN(__lccc_simd256_ps_vfmadd132ps256(0, __a, __b, __c))
 
 void * __lccc_simd256_ps_vfmadd132pd256(long, __m256d __a, __m256d __b, __m256d __c);
-static __inline__ __attribute__((__always_inline__, __artificial__, __target__("fma"))) __m256d _mm256_fmadd_pd(__m256d __a, __m256d __b, __m256d __c)
-{ return __CCC_M256D_FROM_BUILTIN(__lccc_simd256_ps_vfmadd132pd256(0, __a, __b, __c)); }
+#define _mm256_fmadd_pd(__a, __b, __c) __CCC_M256D_FROM_BUILTIN(__lccc_simd256_ps_vfmadd132pd256(0, __a, __b, __c))
 
 void * __lccc_simd256_ps_vperm2f128(long, __m256 __a, __m256 __b);
 #define _mm256_permute2f128_ps(__a, __b, __imm) __CCC_M256_FROM_BUILTIN(__lccc_simd256_ps_vperm2f128(__imm, __a, __b))
