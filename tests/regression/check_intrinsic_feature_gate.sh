@@ -676,17 +676,19 @@ if "$gcc_bin" -dumpfullversion 2>/dev/null | grep -x '16.2.0' >/dev/null; then
 
     "$ccc" -O2 -mavx512f -ffp-contract=off "$tmp/avx512_fma_runtime.c" -o "$tmp/lccc-avx512-fma"
     "$gcc_bin" -O2 -mavx512f -ffp-contract=off "$tmp/avx512_fma_runtime.c" -o "$tmp/gcc-avx512-fma"
-    set +e
-    "$tmp/lccc-avx512-fma"
-    lccc_rc=$?
-    set -e
+    if "$tmp/lccc-avx512-fma"; then
+        lccc_rc=0
+    else
+        lccc_rc=$?
+    fi
     if [ "$lccc_rc" -eq 77 ]; then
         echo "SKIP: host CPU does not advertise AVX512F; FMA runtime fixture compiled with both compilers"
     else
-        set +e
-        "$tmp/gcc-avx512-fma"
-        gcc_rc=$?
-        set -e
+        if "$tmp/gcc-avx512-fma"; then
+            gcc_rc=0
+        else
+            gcc_rc=$?
+        fi
         [ "$lccc_rc" -eq 0 ] && [ "$gcc_rc" -eq 0 ] ||
             fail "AVX512F fused multiply-add exact-rounding runtime: lccc=$lccc_rc gcc=$gcc_rc"
     fi
