@@ -3,7 +3,13 @@ name: Targeted compiler research
 on:
   pull_request:
     branches: [main]
-    paths: ['.github/workflows/compiler-research.yml']
+    paths:
+      - '.github/workflows/compiler-research.yml'
+      - 'src/passes/vec_ssa.rs'
+      - 'include/emmintrin.h'
+      - 'include/avxintrin.h'
+      - 'tests/regression/native_vector_bitcasts.c'
+      - 'tests/regression/check_native_vector_bitcasts.py'
   workflow_dispatch:
     inputs:
       refresh_toolchain_cache:
@@ -76,8 +82,8 @@ jobs:
       CARGO_BUILD_JOBS: "2"
       RUSTFLAGS: -D warnings
       BASELINE_REF: ${{ inputs.baseline_ref || github.event.pull_request.base.sha || 'main' }}
-      RESEARCH_CASES: ${{ inputs.cases || 'nbody,hot_web_loop,byte_load_reassembly,expat_siphash24,double_reduction,spectral_norm,matmul,binary_trees,expat_xml_scan,zstd_count,f32_sse1_map,fp32_product_map' }}
-      RESEARCH_ROUNDS: ${{ inputs.rounds || '31' }}
+      RESEARCH_CASES: ${{ inputs.cases || (github.event_name == 'pull_request' && 'f32_sse1_map,fp32_product_map,fp64_product_map' || 'nbody,hot_web_loop,byte_load_reassembly,expat_siphash24,double_reduction,spectral_norm,matmul,binary_trees,expat_xml_scan,zstd_count,f32_sse1_map,fp32_product_map') }}
+      RESEARCH_ROUNDS: ${{ inputs.rounds || (github.event_name == 'pull_request' && '9' || '31') }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
