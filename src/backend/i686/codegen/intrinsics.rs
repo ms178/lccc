@@ -2,7 +2,7 @@
 //!
 //! Handles the `emit_intrinsic` trait method for the i686 backend, covering:
 //! - Memory fences (lfence, mfence, sfence, pause)
-//! - Non-temporal stores (movnti, movntdq, movntpd)
+//! - Non-temporal stores (movnti, movntdq, movntpd, movntps)
 //! - SSE/SSE2 128-bit packed operations
 //! - AES-NI encryption/decryption
 //! - CRC32 instructions
@@ -101,25 +101,27 @@ impl I686Codegen {
             IntrinsicOp::Movnti
             | IntrinsicOp::Movnti64
             | IntrinsicOp::Movntdq
-            | IntrinsicOp::Movntpd => {
+            | IntrinsicOp::Movntpd
+            | IntrinsicOp::Movntps => {
                 self.emit_nontemporal_store(op, dest_ptr, args);
             }
 
             // --- SSE 128-bit load/store ---
-            IntrinsicOp::Loaddqu => {
+            IntrinsicOp::Loaddqu | IntrinsicOp::Storedqu => {
+                // A 16-byte copy through %xmm0.  `_mm_load{,u}_ps` and
+                // `_mm_store{,u}_ps` reach here on SSE1-only targets, which
+                // have MOVUPS but not the SSE2 MOVDQU; the x86-64 backend
+                // makes the same choice through `xmm_move`.
                 if let Some(dptr) = dest_ptr {
+                    let mov = if self.sse2_scalar_enabled {
+                        "movdqu"
+                    } else {
+                        "movups"
+                    };
                     self.operand_to_eax(&args[0]);
-                    self.state.emit("    movdqu (%eax), %xmm0");
+                    emit!(self.state, "    {} (%eax), %xmm0", mov);
                     self.operand_to_eax(&Operand::Value(*dptr));
-                    self.state.emit("    movdqu %xmm0, (%eax)");
-                }
-            }
-            IntrinsicOp::Storedqu => {
-                if let Some(ptr) = dest_ptr {
-                    self.operand_to_eax(&args[0]);
-                    self.state.emit("    movdqu (%eax), %xmm0");
-                    self.operand_to_eax(&Operand::Value(*ptr));
-                    self.state.emit("    movdqu %xmm0, (%eax)");
+                    emit!(self.state, "    {} %xmm0, (%eax)", mov);
                 }
             }
 
@@ -2161,28 +2163,15 @@ impl I686Codegen {
                 self.state.emit("    movnti %ecx, (%eax)");
             }
             IntrinsicOp::Movnti64 => {
+                // The shared pair loader knows every 64-bit operand form
+                // (wide slot, narrow slot, register, both halves of a
+                // constant); hand-rolling it here zeroed the high word of
+                // negative and >= 2^32 constants.
                 self.operand_to_eax(&Operand::Value(*ptr));
                 self.state.emit("    movl %eax, %ecx");
-                if let Operand::Value(v) = &args[0] {
-                    if let Some(slot) = self.state.get_slot(v.0) {
-                        let sr0 = self.slot_ref(slot);
-                        let sr4 = self.slot_ref_offset(slot, 4);
-                        emit!(self.state, "    movl {}, %eax", sr0);
-                        self.state.emit("    movnti %eax, (%ecx)");
-                        emit!(self.state, "    movl {}, %eax", sr4);
-                        self.state.emit("    movnti %eax, 4(%ecx)");
-                    } else {
-                        self.operand_to_eax(&args[0]);
-                        self.state.emit("    movnti %eax, (%ecx)");
-                        self.state.emit("    xorl %eax, %eax");
-                        self.state.emit("    movnti %eax, 4(%ecx)");
-                    }
-                } else {
-                    self.operand_to_eax(&args[0]);
-                    self.state.emit("    movnti %eax, (%ecx)");
-                    self.state.emit("    xorl %eax, %eax");
-                    self.state.emit("    movnti %eax, 4(%ecx)");
-                }
+                self.emit_load_acc_pair(&args[0]);
+                self.state.emit("    movnti %eax, (%ecx)");
+                self.state.emit("    movnti %edx, 4(%ecx)");
             }
             IntrinsicOp::Movntdq => {
                 self.operand_to_eax(&args[0]);
@@ -2195,6 +2184,14 @@ impl I686Codegen {
                 self.state.emit("    movupd (%eax), %xmm0");
                 self.operand_to_eax(&Operand::Value(*ptr));
                 self.state.emit("    movntpd %xmm0, (%eax)");
+            }
+            IntrinsicOp::Movntps => {
+                // SSE1 throughout: an SSE1-only i686 target has MOVUPS and
+                // MOVNTPS but neither MOVDQU nor MOVUPD.
+                self.operand_to_eax(&args[0]);
+                self.state.emit("    movups (%eax), %xmm0");
+                self.operand_to_eax(&Operand::Value(*ptr));
+                self.state.emit("    movntps %xmm0, (%eax)");
             }
             _ => {}
         }
@@ -2397,6 +2394,11 @@ impl I686Codegen {
         self.operand_to_eax(arg);
         self.state
             .emit_fmt(format_args!("    vmovdqu (%eax), %{}", ymm));
+        // Every 256-bit operation stages its operands here (or leaves through
+        // `emit_avx_store_dest`): arm the epilogue vzeroupper, as GCC does.
+        if ymm.starts_with('y') {
+            self.state.dirty_upper_ymm = true;
+        }
     }
 
     /// Load a 128-bit operand (an alloca pointer) into an XMM register via
@@ -2412,6 +2414,7 @@ impl I686Codegen {
     fn emit_avx_store_dest(&mut self, dptr: &Value) {
         self.operand_to_eax(&Operand::Value(*dptr));
         self.state.emit("    vmovdqu %ymm0, (%eax)");
+        self.state.dirty_upper_ymm = true;
         self.state.reg_cache.invalidate_acc();
     }
 
@@ -2483,9 +2486,15 @@ impl I686Codegen {
     }
 
     /// Load an F32 operand onto the x87 FPU stack.
-    fn emit_f32_load_to_x87(&mut self, op: &Operand) {
+    pub(super) fn emit_f32_load_to_x87(&mut self, op: &Operand) {
         match op {
-            Operand::Value(v) if self.state.get_slot(v.0).is_some() => {
+            // A register home is authoritative over any reserved slot (the
+            // `operand_to_eax` priority), so only slot-homed values load
+            // straight from memory.
+            Operand::Value(v)
+                if !self.reg_assignments.contains_key(&v.0)
+                    && self.state.get_slot(v.0).is_some() =>
+            {
                 let slot = self
                     .state
                     .get_slot(v.0)
@@ -2494,8 +2503,10 @@ impl I686Codegen {
                 emit!(self.state, "    flds {}", sr);
             }
             Operand::Const(IrConst::F32(fval)) => {
-                emit!(self.state, "    movl ${}, %eax", fval.to_bits() as i32);
-                self.state.emit("    pushl %eax");
+                // Push the bits directly: no GPR is written, so the
+                // accumulator cache stays truthful for a following load
+                // (two-operand users such as the x87 F32 compare).
+                emit!(self.state, "    pushl ${}", fval.to_bits() as i32);
                 self.state.emit("    flds (%esp)");
                 self.state.emit("    addl $4, %esp");
             }

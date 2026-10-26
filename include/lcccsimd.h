@@ -1315,6 +1315,21 @@ static __inline__ int __attribute__((__always_inline__, __artificial__, __target
 _mm256_testnzc_pd(__m256d __a, __m256d __b)
 { return __lccc_avx_testnzcpd256(__a, __b); }
 
+int __lccc_avx_testzsi256(__m256i, __m256i);
+static __inline__ int __attribute__((__always_inline__, __artificial__, __target__("avx")))
+_mm256_testz_si256(__m256i __a, __m256i __b)
+{ return __lccc_avx_testzsi256(__a, __b); }
+
+int __lccc_avx_testcsi256(__m256i, __m256i);
+static __inline__ int __attribute__((__always_inline__, __artificial__, __target__("avx")))
+_mm256_testc_si256(__m256i __a, __m256i __b)
+{ return __lccc_avx_testcsi256(__a, __b); }
+
+int __lccc_avx_testnzcsi256(__m256i, __m256i);
+static __inline__ int __attribute__((__always_inline__, __artificial__, __target__("avx")))
+_mm256_testnzc_si256(__m256i __a, __m256i __b)
+{ return __lccc_avx_testnzcsi256(__a, __b); }
+
 void * __lccc_simd256_ps_vroundps256(long, __m256 __a);
 #define _mm256_round_ps(__a, __imm) __CCC_M256_FROM_BUILTIN(__lccc_simd256_ps_vroundps256(__imm, __a))
 

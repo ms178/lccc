@@ -522,6 +522,12 @@ struct Section {
     jumps: Vec<JumpInfo>,
     align_markers: Vec<AlignMarker>,
     comdat_group: Option<String>,
+    /// Whether the most recent byte-emitting item in THIS section was a
+    /// complete instruction (GAS keeps `last_insn` per segment in
+    /// `tc_segment_info_data`). Drives the leading plain-NOP rule for
+    /// executable alignment padding. Starts `true`: GNU as 2.47 pads a fresh
+    /// `.text` after `.org 3` with `0f 1f 44 00 00`, no leading `0x90`.
+    last_item_was_insn: bool,
 }
 
 impl Section {
@@ -1356,10 +1362,6 @@ pub struct ElfWriterCore<A: X86Arch> {
     /// Current code mode (16, 32, or 64). Affects instruction encoding.
     /// Set by `.code16`, `.code32`, `.code64` directives.
     code_mode: u8,
-    /// Whether the most recently emitted item in the current section was a
-    /// complete instruction (as opposed to raw data). Drives the leading
-    /// plain-NOP rule for executable alignment padding.
-    last_item_was_insn: bool,
     /// Scaled symbol differences awaiting label resolution.
     deferred_data_exprs: Vec<DataExpr>,
     /// CFA location advances awaiting the final code layout.
@@ -1408,7 +1410,6 @@ impl<A: X86Arch> ElfWriterCore<A> {
             deferred_byte_diffs: Vec::new(),
             deferred_leb_diffs: Vec::new(),
             code_mode: A::default_code_mode(),
-            last_item_was_insn: false,
             deferred_data_exprs: Vec::new(),
             deferred_cfa_advances: Vec::new(),
             seq: 0,
@@ -1502,6 +1503,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 jumps: Vec::new(),
                 align_markers: Vec::new(),
                 comdat_group: None,
+                last_item_was_insn: true,
             });
             self.section_map.insert(name.to_string(), idx);
         }
@@ -1571,6 +1573,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
             jumps: Vec::new(),
             align_markers: Vec::new(),
             comdat_group,
+            last_item_was_insn: true,
         });
         self.section_map.insert(name.to_string(), idx);
         Ok(idx)
@@ -1605,15 +1608,32 @@ impl<A: X86Arch> ElfWriterCore<A> {
         Ok(())
     }
 
+    /// The current section's "last item was a complete instruction" state
+    /// (`true` before any section exists: GAS's fresh-segment default).
+    fn last_item_was_insn(&self) -> bool {
+        self.current_section
+            .is_none_or(|idx| self.sections[idx].last_item_was_insn)
+    }
+
     fn process_item(&mut self, item: &AsmItem) -> Result<(), String> {
         let result = self.process_item_inner(item);
-        // Maintain the "previous item was a real instruction" state that
-        // executable alignment padding depends on. Labels and pure metadata
-        // directives are transparent: they emit no bytes, so they must not
-        // clear a preceding instruction's status.
+        // Maintain the per-section "previous item was a real instruction"
+        // state that executable alignment padding depends on. Labels, pure
+        // metadata and section switches are transparent: they emit no bytes,
+        // so they must not clear a preceding instruction's status — neither
+        // in the section left nor in the one entered (a `.rodata` constant
+        // pool between two functions must not change `.text`'s padding).
+        let Some(idx) = self.current_section else {
+            return result;
+        };
+        let state = &mut self.sections[idx].last_item_was_insn;
         match item {
-            AsmItem::Instruction(_) => self.last_item_was_insn = true,
-            AsmItem::Label(_)
+            AsmItem::Instruction(_) => *state = true,
+            AsmItem::Section(_)
+            | AsmItem::PushSection(_)
+            | AsmItem::PopSection
+            | AsmItem::Previous
+            | AsmItem::Label(_)
             | AsmItem::Global(_)
             | AsmItem::Weak(_)
             | AsmItem::Hidden(_)
@@ -1629,7 +1649,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
             | AsmItem::Empty
             | AsmItem::Align { .. }
             | AsmItem::Org(_, _, _) => {}
-            _ => self.last_item_was_insn = false,
+            _ => *state = false,
         }
         result
     }
@@ -1735,7 +1755,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 // inside `fixup_alignment_markers` once the branch
                 // relaxation fixed point knows every encoded length and
                 // label offset. No bytes are emitted here.
-                let after_insn = self.last_item_was_insn;
+                let after_insn = self.last_item_was_insn();
                 let seq = self.seq;
                 if let Some(sec_idx) = self.current_section {
                     let is_exec = self.sections[sec_idx].flags & SHF_EXECINSTR != 0;
@@ -1760,7 +1780,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 fill,
                 max_skip,
             } => {
-                let after_insn = self.last_item_was_insn;
+                let after_insn = self.last_item_was_insn();
                 let seq = self.seq;
                 // GAS: a bare `.p2align` creates the default `.text` and
                 // records the alignment (measured: bare `.p2align 4` ->
@@ -2212,7 +2232,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
     }
 
     fn process_org(&mut self, sym: &str, offset: i64, fill: u8) -> Result<(), String> {
-        let after_insn = self.last_item_was_insn;
+        let after_insn = self.last_item_was_insn();
         // GAS: `.org` before any section directive positions within `.text`;
         // returning early here dropped it and shifted everything after it.
         self.ensure_section()?;
@@ -6445,6 +6465,38 @@ mod tests {
     fn assemble_text(asm: &str) -> Vec<u8> {
         let data = assemble_object(asm);
         section_bytes(&data, ".text").expect(".text present")
+    }
+
+    /// GAS keeps the "last insn was normal" padding state per segment. Each
+    /// expected `.text` image was produced by GNU as 2.47 from the same
+    /// source: a data-only `.rodata` excursion between two functions (the
+    /// per-function vector-constant pool) must not turn `.text`'s 3-byte
+    /// inter-function pad into `nop` + `xchg %ax,%ax`, while data emitted
+    /// IN `.text` still forces the leading plain NOP.
+    #[test]
+    fn alignment_padding_state_is_tracked_per_section_like_gas() {
+        let tail = [0x66, 0x66, 0x2e, 0x0f, 0x1f, 0x84, 0, 0, 0, 0, 0, 0xc3];
+        let with = |head: &[u8]| [head, &tail[..]].concat();
+        for (src, want) in [
+            (
+                "f:\n jmp f\n.section .rodata\n.long 1\n.text\n.p2align 4\ng:\n ret\n",
+                with(&[0xeb, 0xfe, 0x0f, 0x1f, 0x00]),
+            ),
+            (
+                "f:\n jmp f\n.pushsection .rodata\n.long 1\n.popsection\n.p2align 4\ng:\n ret\n",
+                with(&[0xeb, 0xfe, 0x0f, 0x1f, 0x00]),
+            ),
+            (
+                "f:\n jmp f\n.byte 0x90\n.p2align 4\ng:\n ret\n",
+                with(&[0xeb, 0xfe, 0x90, 0x90, 0x90]),
+            ),
+            (
+                ".org 3\n.p2align 3\nret\n",
+                vec![0, 0, 0, 0x0f, 0x1f, 0x44, 0, 0, 0xc3],
+            ),
+        ] {
+            assert_eq!(assemble_text(&format!(".text\n{src}")), want, "{src}");
+        }
     }
 
     /// `sh_addralign` of `name` from an ELF64 object written by this module.

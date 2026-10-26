@@ -3,7 +3,7 @@
     "backend-contracts-a": {
       "group": "backend-contracts",
       "mode": "shell",
-      "predicted_gate_seconds": 411.43,
+      "predicted_gate_seconds": 412.13,
       "shards": 2,
       "step": "Verify remaining fast local contracts (shard a of 2)",
       "steps": [
@@ -18,6 +18,10 @@
         {
           "measured_s": 0.32,
           "name": "env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_sibcall_shapes.sh"
+        },
+        {
+          "measured_s": 0.7,
+          "name": "env CCC=target/fastbuild/lccc bash tests/regression/check_ipa_ra_interposition.sh"
         },
         {
           "measured_s": 0.66,
@@ -1454,8 +1458,8 @@
   "provenance": {
     "backend-contracts": {
       "costs": "/tmp/audit/backend_contracts_costs.tsv",
-      "measured_seconds_total": 829.218,
-      "source": "measured: scripts/ci_gate_costs.py (previous plan measured_s); iabs-cmp-fold 0.40 s measured fresh by scripts/ci_gate_costs.py --only iabs_cmp; arithmetic-test-sign-cmov 2 s measured fresh by scripts/ci_local.sh --only arithmetic-test-sign-cmov (2026-10-24); count-observations 8.908 s measured with both pinned vendors and extra frozen-baseline mechanism leg (conservative hosted scheduling estimate, 2026-10-25)"
+      "measured_seconds_total": 829.918,
+      "source": "measured: scripts/ci_gate_costs.py (previous plan measured_s); iabs-cmp-fold 0.40 s measured fresh by scripts/ci_gate_costs.py --only iabs_cmp; arithmetic-test-sign-cmov 2 s measured fresh by scripts/ci_local.sh --only arithmetic-test-sign-cmov (2026-10-24); count-observations 8.908 s measured with both pinned vendors and extra frozen-baseline mechanism leg (conservative hosted scheduling estimate, 2026-10-25); ipa-ra-interposition 0.7 s measured fresh by a timed run of tests/regression/check_ipa_ra_interposition.sh (2026-10-24)"
     },
     "codegen": {
       "costs": "/home/user/.cache/tmp/codegen.tsv",

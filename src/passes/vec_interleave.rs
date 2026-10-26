@@ -113,8 +113,10 @@ struct AccOp {
 
 fn acc_op_info(op: IntrinsicOp) -> Option<AccOp> {
     use IntrinsicOp as O;
-    // Note: `VecAddI64x4` is deliberately absent — the x86 emitter has no
-    // lowering for it (unimplemented no-op), so nothing may ever select it.
+    // `VecAddI64x4` is not a root here (its producers -- the byte-count
+    // `vpsadbw` reductions -- have their own exit rewrite), but it is the
+    // combine of the I64x4 widening steps below and has a real `vpaddq`
+    // lowering.
     use ReductionOp as R;
     let (kind, combine, zero, is_fp, red_op, bits) = match op {
         O::VecFmaF64x4 => (
@@ -181,7 +183,48 @@ fn acc_op_info(op: IntrinsicOp) -> Option<AccOp> {
             R::IntAdd,
             128,
         ),
-        O::VecAddI64x2 | O::VecWidenAddI32x4ToI64x2 => (
+        O::VecAddI64x2 => (
+            AccKind::Add,
+            O::VecAddI64x2,
+            Some(O::VecZeroI64x2),
+            false,
+            R::IntAdd,
+            128,
+        ),
+        // AVX2 widening steps fold into an I64x4 accumulator (`vpaddq %ymm`).
+        // The masked form's guard rhs is loop-invariant (the recogniser
+        // refuses a variant rhs), so every slice reuses it unchanged.
+        O::VecWidenAddI32x4ToI64x4 | O::VecWidenMaskedAddI32x4ToI64x4 => (
+            AccKind::Add,
+            O::VecAddI64x4,
+            Some(O::VecZeroI64x4),
+            false,
+            R::IntAdd,
+            256,
+        ),
+        // Guarded equal-width sum (late rerun only): I32x8 accumulator.
+        O::VecMaskedAddI32x8 => (
+            AccKind::Add,
+            O::VecAddI32x8,
+            Some(O::VecZeroI32x8),
+            false,
+            R::IntAdd,
+            256,
+        ),
+        // SSE2 value-shaped sums: the 4-lane masked equal-width step keeps
+        // an I32x4 accumulator, the widening ones an I64x2 accumulator. The
+        // masked forms come from the late rerun only (slices reuse the
+        // loop-invariant guard, or its hoisted preheader splat, unchanged);
+        // the unguarded widening step is an early-vectorizer product.
+        O::VecMaskedAddValueI32x4 => (
+            AccKind::Add,
+            O::VecAddI32x4,
+            Some(O::VecZeroI32x4),
+            false,
+            R::IntAdd,
+            128,
+        ),
+        O::VecWidenAddValueI32x4ToI64x2 | O::VecWidenMaskedAddValueI32x4ToI64x2 => (
             AccKind::Add,
             O::VecAddI64x2,
             Some(O::VecZeroI64x2),
@@ -209,7 +252,14 @@ fn acc_arg_index(op: IntrinsicOp, args: &[Operand], acc: Value) -> Option<usize>
     let is_acc = |o: &Operand| matches!(o, Operand::Value(v) if *v == acc);
     match op {
         O::VecFmaF64x4 | O::VecFmaF32x8 => (args.len() >= 5 && is_acc(&args[0])).then_some(0),
-        O::VecWidenAddI32x4ToI64x2 => (0..args.len()).find(|&i| is_acc(&args[i])),
+        // The accumulator is args[0]; base/offset/rhs/displacement are never
+        // the phi.
+        O::VecWidenAddI32x4ToI64x4
+        | O::VecWidenMaskedAddI32x4ToI64x4
+        | O::VecMaskedAddI32x8
+        | O::VecMaskedAddValueI32x4
+        | O::VecWidenAddValueI32x4ToI64x2
+        | O::VecWidenMaskedAddValueI32x4ToI64x2 => args.first().is_some_and(is_acc).then_some(0),
         _ => {
             if args.len() != 2 {
                 return None;
@@ -271,7 +321,10 @@ fn disp_slots(op: IntrinsicOp) -> Option<&'static [(usize, usize)]> {
         | O::VecLoadI32x4
         | O::VecLoadI64x2 => Some(LOAD),
         O::VecFmaF64x4 | O::VecFmaF32x8 => Some(FMA),
-        O::VecWidenAddI32x4ToI64x2 => Some(&[(2, 3)]),
+        O::VecWidenAddI32x4ToI64x4 => Some(&[(2, 3)]),
+        // [acc, base, offset, guard_rhs, disp]: the x86 emitter folds the
+        // displacement into the 128-bit lane load.
+        O::VecWidenMaskedAddI32x4ToI64x4 | O::VecMaskedAddI32x8 => Some(&[(2, 4)]),
         _ => None,
     }
 }
@@ -727,12 +780,54 @@ fn set_dest(inst: &mut Instruction, new: Value) {
     }
 }
 
+/// A signed I32 IV whose only body uses (besides its increment) are sign
+/// extensions to 64 bits can run the interleaved loop as an I64 IV: every
+/// slice then addresses with the IV register itself instead of re-extending
+/// it each iteration (`movslq %r11d, %r10`). Exact: the main loop's IV takes
+/// only multiples of `group` in `[0, limit_main]` (a non-negative I32), so
+/// `sext` is the identity on its range and the signed compare against
+/// `sext(limit_main)` decides exactly like the I32 one. The transform forms
+/// that bound as `sext(limit) & sext(mask)`, the same bits.
+fn widen_main_iv(body: &[Instruction], c: &Candidate) -> bool {
+    if c.iv_ty != IrType::I32 || c.cmp_op != IrCmpOp::Slt {
+        return false;
+    }
+    let mut any_cast = false;
+    for (idx, inst) in body.iter().enumerate() {
+        if idx == c.iv_inc_idx {
+            continue;
+        }
+        if let Instruction::Cast {
+            src: Operand::Value(sv),
+            from_ty: IrType::I32,
+            to_ty: IrType::I64 | IrType::U64,
+            ..
+        } = inst
+        {
+            if *sv == c.iv {
+                any_cast = true;
+                continue;
+            }
+        }
+        let mut uses_iv = false;
+        let mut probe = inst.clone();
+        probe.for_each_operand_mut(|o| uses_iv |= matches!(o, Operand::Value(v) if *v == c.iv));
+        probe.for_each_value_use_mut(|v| uses_iv |= *v == c.iv);
+        if uses_iv {
+            return false;
+        }
+    }
+    any_cast
+}
+
 fn transform(func: &mut IrFunction, c: &Candidate, factor: u32, debug: bool) -> bool {
     let group = factor as i64 * c.step;
+    let wide_iv = widen_main_iv(&func.blocks[c.body].instructions, c);
+    let ivm_ty = if wide_iv { IrType::I64 } else { c.iv_ty };
     let (Some(mask_const), Some(zero_const), Some(group_const)) = (
-        int_const(c.iv_ty, !(group - 1)),
-        int_const(c.iv_ty, 0),
-        int_const(c.iv_ty, group),
+        int_const(ivm_ty, !(group - 1)),
+        int_const(ivm_ty, 0),
+        int_const(ivm_ty, group),
     ) else {
         return false;
     };
@@ -759,13 +854,29 @@ fn transform(func: &mut IrFunction, c: &Candidate, factor: u32, debug: bool) -> 
         .iter()
         .map(|&idx| func.blocks[c.header].instructions[idx].clone())
         .collect();
-    let limit_main = fresh();
+    // Wide IV: mask the sign-extended limit, `sext(limit) & sext(mask)`,
+    // which equals `sext(limit & mask)` bit for bit (AND commutes with sign
+    // extension) and reuses the `sext(limit)` the scalar remainder's own
+    // bound already needs instead of re-extending a masked copy.
+    let limit_src = if wide_iv {
+        let l64 = fresh();
+        np.push(Instruction::Cast {
+            dest: l64,
+            src: c.limit.clone(),
+            from_ty: c.iv_ty,
+            to_ty: IrType::I64,
+        });
+        Operand::Value(l64)
+    } else {
+        c.limit.clone()
+    };
+    let limit_cmp = fresh();
     np.push(Instruction::BinOp {
-        dest: limit_main,
+        dest: limit_cmp,
         op: IrBinOp::And,
-        lhs: c.limit.clone(),
+        lhs: limit_src,
         rhs: Operand::Const(mask_const),
-        ty: c.iv_ty,
+        ty: ivm_ty,
     });
     let mut acc_init: Vec<Vec<Operand>> = Vec::new();
     for a in &c.accs {
@@ -815,7 +926,7 @@ fn transform(func: &mut IrFunction, c: &Candidate, factor: u32, debug: bool) -> 
     }
     mh.push(Instruction::Phi {
         dest: ivm,
-        ty: c.iv_ty,
+        ty: ivm_ty,
         incoming: vec![
             (Operand::Const(zero_const), np_label),
             (Operand::Value(ivm_next), mb_label),
@@ -826,8 +937,8 @@ fn transform(func: &mut IrFunction, c: &Candidate, factor: u32, debug: bool) -> 
         dest: cmp_m,
         op: c.cmp_op,
         lhs: Operand::Value(ivm),
-        rhs: Operand::Value(limit_main),
-        ty: c.iv_ty,
+        rhs: Operand::Value(limit_cmp),
+        ty: ivm_ty,
     });
     // ---- MB: IF slices of the body -------------------------------------
     let body_insts = func.blocks[c.body].instructions.clone();
@@ -860,11 +971,19 @@ fn transform(func: &mut IrFunction, c: &Candidate, factor: u32, debug: bool) -> 
                     let nd = fresh();
                     rename.insert(dest.0, nd);
                     if k == 0 {
-                        mb.push(Instruction::Cast {
-                            dest: nd,
-                            src: Operand::Value(ivm),
-                            from_ty: *from_ty,
-                            to_ty: *to_ty,
+                        mb.push(if wide_iv {
+                            // `widen_main_iv` admitted only sign extensions.
+                            Instruction::Copy {
+                                dest: nd,
+                                src: Operand::Value(ivm),
+                            }
+                        } else {
+                            Instruction::Cast {
+                                dest: nd,
+                                src: Operand::Value(ivm),
+                                from_ty: *from_ty,
+                                to_ty: *to_ty,
+                            }
                         });
                         iv_cast64 = Some(nd);
                     } else if let Some(c0) = iv_cast64 {
@@ -940,7 +1059,7 @@ fn transform(func: &mut IrFunction, c: &Candidate, factor: u32, debug: bool) -> 
         op: IrBinOp::Add,
         lhs: Operand::Value(ivm),
         rhs: Operand::Const(group_const),
-        ty: c.iv_ty,
+        ty: ivm_ty,
     });
     // Displacement folding: `VecLoad(base, add(x, C))` -> `VecLoad(base, x, C)`.
     {
@@ -991,6 +1110,20 @@ fn transform(func: &mut IrFunction, c: &Candidate, factor: u32, debug: bool) -> 
     }
     // ---- C: tree-combine the partial accumulators ----------------------
     let mut cb = Vec::new();
+    // The scalar/vector remainder resumes from the main loop's IV in the
+    // source type (exact truncation: the value is at most `limit_main`).
+    let ivm_exit = if wide_iv {
+        let t = fresh();
+        cb.push(Instruction::Cast {
+            dest: t,
+            src: Operand::Value(ivm),
+            from_ty: IrType::I64,
+            to_ty: c.iv_ty,
+        });
+        t
+    } else {
+        ivm
+    };
     let mut combined: Vec<Value> = Vec::new();
     for (ai, a) in c.accs.iter().enumerate() {
         let mut level: Vec<Value> = acc_phis[ai].clone();
@@ -1041,7 +1174,7 @@ fn transform(func: &mut IrFunction, c: &Candidate, factor: u32, debug: bool) -> 
                 }
                 *lbl = cb_label;
                 if *dest == c.iv {
-                    *val = Operand::Value(ivm);
+                    *val = Operand::Value(ivm_exit);
                 } else if let Some(ai) = c.accs.iter().position(|a| a.phi == *dest) {
                     *val = Operand::Value(combined[ai]);
                 }
@@ -1170,13 +1303,43 @@ fn set_interleave_enabled(enabled: bool) {
 /// Interleave every canonical vector reduction loop in `func`.  Returns the
 /// number of loops transformed.
 pub(crate) fn run(func: &mut IrFunction, fp_reassoc: bool) -> usize {
+    run_filtered(func, fp_reassoc, &|_| true)
+}
+
+/// The accumulator steps only the LATE vectorizer rerun (after if_convert)
+/// produces: the early run structurally refuses guarded reductions, and the
+/// late rerun admits nothing else that is an interleave root here.
+fn late_only_step(op: IntrinsicOp) -> bool {
+    matches!(
+        op,
+        IntrinsicOp::VecWidenMaskedAddI32x4ToI64x4
+            | IntrinsicOp::VecMaskedAddI32x8
+            | IntrinsicOp::VecMaskedAddValueI32x4
+            | IntrinsicOp::VecWidenMaskedAddValueI32x4ToI64x2
+    )
+}
+
+/// Interleave the loops the late vectorizer rerun produced. It runs after the
+/// early `run` has already sliced the early loops and left each one's
+/// original loop verbatim as its epilogue; this pass has no idempotence
+/// marker, so the late entry admits only loops whose every accumulator step
+/// is late-only -- disjoint from anything the early run touched.
+pub(crate) fn run_late(func: &mut IrFunction, fp_reassoc: bool) -> usize {
+    run_filtered(func, fp_reassoc, &late_only_step)
+}
+
+fn run_filtered(
+    func: &mut IrFunction,
+    fp_reassoc: bool,
+    admit: &dyn Fn(IntrinsicOp) -> bool,
+) -> usize {
     if func.blocks.is_empty() || !vec_interleave_enabled() {
         return 0;
     }
     let has_vec_acc = func.blocks.iter().any(|b| {
-        b.instructions
-            .iter()
-            .any(|i| matches!(i, Instruction::Intrinsic { op, .. } if acc_op_info(*op).is_some()))
+        b.instructions.iter().any(
+            |i| matches!(i, Instruction::Intrinsic { op, .. } if acc_op_info(*op).is_some() && admit(*op)),
+        )
     });
     if !has_vec_acc {
         return 0;
@@ -1188,7 +1351,15 @@ pub(crate) fn run(func: &mut IrFunction, fp_reassoc: bool) -> usize {
     let mut cands = Vec::new();
     for lp in &loops {
         if let Some(c) = analyze(func, &cfg, lp, fp_reassoc, debug) {
-            cands.push(c);
+            let admitted = c.accs.iter().all(|a| {
+                matches!(
+                    func.blocks[c.body].instructions.get(a.op_idx),
+                    Some(Instruction::Intrinsic { op, .. }) if admit(*op)
+                )
+            });
+            if admitted {
+                cands.push(c);
+            }
         }
     }
     // Candidates are disjoint 2-block loops; transforming one only appends
@@ -1340,17 +1511,75 @@ mod tests {
             IntrinsicOp::VecAddF32x8,
             IntrinsicOp::VecAddI32x8,
             IntrinsicOp::VecAddI64x2,
-            IntrinsicOp::VecWidenAddI32x4ToI64x2,
+            IntrinsicOp::VecWidenAddI32x4ToI64x4,
+            IntrinsicOp::VecWidenMaskedAddI32x4ToI64x4,
+            IntrinsicOp::VecMaskedAddI32x8,
         ] {
             let info = acc_op_info(op).unwrap();
             assert_eq!(info.kind, AccKind::Add);
             assert!(info.zero.is_some());
         }
+        let m = acc_op_info(IntrinsicOp::VecMaskedAddI32x8).unwrap();
+        assert_eq!(
+            (m.combine, m.zero, m.bits),
+            (
+                IntrinsicOp::VecAddI32x8,
+                Some(IntrinsicOp::VecZeroI32x8),
+                256
+            )
+        );
+        assert_eq!(
+            disp_slots(IntrinsicOp::VecMaskedAddI32x8),
+            Some(&[(2, 4)][..])
+        );
+        // The late entry admits the masked steps only: an early loop's
+        // verbatim epilogue (unmasked step) is never re-sliced.
+        assert!(late_only_step(IntrinsicOp::VecWidenMaskedAddI32x4ToI64x4));
+        assert!(late_only_step(IntrinsicOp::VecMaskedAddI32x8));
+        for op in [
+            IntrinsicOp::VecWidenAddI32x4ToI64x4,
+            IntrinsicOp::VecAddI32x8,
+            IntrinsicOp::VecMaxI32x8,
+            IntrinsicOp::VecFmaF64x4,
+        ] {
+            assert!(!late_only_step(op), "{op:?}");
+        }
+        // The widening steps carry an I64x4 accumulator: a 128-bit combine
+        // or zero would freeze the upper lanes (legacy `movdqa %xmm`).
+        for op in [
+            IntrinsicOp::VecWidenAddI32x4ToI64x4,
+            IntrinsicOp::VecWidenMaskedAddI32x4ToI64x4,
+        ] {
+            let info = acc_op_info(op).unwrap();
+            assert_eq!(
+                (info.combine, info.zero, info.bits),
+                (
+                    IntrinsicOp::VecAddI64x4,
+                    Some(IntrinsicOp::VecZeroI64x4),
+                    256
+                ),
+                "{op:?}"
+            );
+            assert_eq!(info.combine.vector_home_width(), op.vector_home_width());
+            assert_eq!(disp_slots(op).map(|s| s[0].0), Some(2), "{op:?}");
+        }
+        let acc = Value(7);
+        let masked = [
+            Operand::Value(acc),
+            Operand::Value(Value(1)),
+            Operand::Value(Value(2)),
+            Operand::Value(acc),
+        ];
+        // Only slot 0 is the accumulator, even if an rhs aliases the phi.
+        assert_eq!(
+            acc_arg_index(IntrinsicOp::VecWidenMaskedAddI32x4ToI64x4, &masked, acc),
+            Some(0)
+        );
         let mx = acc_op_info(IntrinsicOp::VecMaxI32x8).unwrap();
         assert_eq!(mx.kind, AccKind::Max);
         assert!(mx.zero.is_none());
         assert!(acc_op_info(IntrinsicOp::VecMulF64x4).is_none());
-        // VecAddI64x4 must stay out: the x86 emitter has no lowering for it.
+        // VecAddI64x4 is a combine only, never an interleave root.
         assert!(acc_op_info(IntrinsicOp::VecAddI64x4).is_none());
     }
 
@@ -1445,11 +1674,178 @@ mod tests {
         );
     }
 
+    /// A signed I32 IV used only through sign extensions runs the main loop
+    /// as I64 (no per-iteration `movslq`), hands the remainder its value
+    /// through one exact truncation, and keeps I32 whenever the body reads
+    /// the IV directly.
+    #[test]
+    fn main_loop_iv_is_widened_only_when_every_use_is_a_sext() {
+        let main_iv = |f: &IrFunction| -> (IrType, usize, usize, Option<Operand>) {
+            let mh = &f.blocks[5];
+            let ty = mh
+                .instructions
+                .iter()
+                .find_map(|i| match i {
+                    Instruction::Phi { ty, incoming, .. }
+                        if matches!(incoming[0].0, Operand::Const(_)) && ty.is_integer() =>
+                    {
+                        Some(*ty)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            let casts = |b: &BasicBlock| {
+                b.instructions
+                    .iter()
+                    .filter(|i| matches!(i, Instruction::Cast { .. }))
+                    .count()
+            };
+            let iv_init = f.blocks[1].instructions.iter().find_map(|i| match i {
+                Instruction::Phi { dest, incoming, .. } if *dest == Value(6) => {
+                    Some(incoming[0].0.clone())
+                }
+                _ => None,
+            });
+            (ty, casts(&f.blocks[6]), casts(&f.blocks[7]), iv_init)
+        };
+
+        let (mut f, _) = build_dot_func();
+        assert_eq!(run(&mut f, true), 1);
+        let mut viol = Vec::new();
+        crate::passes::verify::verify_function(&f, "vec_interleave", &mut viol);
+        assert!(viol.is_empty(), "{viol:?}");
+        let (ty, body_casts, combine_casts, iv_init) = main_iv(&f);
+        assert_eq!(ty, IrType::I64, "sext-only IV must widen");
+        assert_eq!(body_casts, 0, "slices address with the I64 IV itself");
+        assert_eq!(combine_casts, 1, "one truncation feeds the remainder");
+        let Some(Operand::Value(t)) = iv_init else {
+            panic!("remainder IV must be seeded from the truncation");
+        };
+        assert!(f.blocks[7].instructions.iter().any(|i| matches!(
+            i,
+            Instruction::Cast { dest, from_ty: IrType::I64, to_ty: IrType::I32, .. } if *dest == t
+        )));
+        // The limit is compared in I64 as the sign extension of the I32 mask.
+        assert!(f.blocks[4].instructions.iter().any(|i| matches!(
+            i,
+            Instruction::Cast {
+                from_ty: IrType::I32,
+                to_ty: IrType::I64,
+                ..
+            }
+        )));
+
+        // A direct I32 read of the IV (here: a scalar copy) keeps the I32 IV.
+        let (mut f, _) = build_dot_func();
+        f.blocks[2].instructions.insert(
+            1,
+            Instruction::BinOp {
+                dest: Value(40),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(6)),
+                rhs: Operand::Const(IrConst::I32(1)),
+                ty: IrType::I32,
+            },
+        );
+        assert_eq!(run(&mut f, true), 1);
+        let (ty, body_casts, combine_casts, _) = main_iv(&f);
+        assert_eq!(ty, IrType::I32, "a direct IV use blocks widening");
+        assert_eq!(body_casts, 1, "slice 0 re-extends the I32 IV");
+        assert_eq!(combine_casts, 0);
+    }
+
     #[test]
     fn fp_interleave_requires_reassoc() {
         let (mut f, _base) = build_dot_func();
         let n = run(&mut f, false);
         assert_eq!(n, 0, "FP interleave without -fassociative-math must bail");
+    }
+
+    /// The SSE2 value-shaped guarded sums (late-only roots, accumulator in
+    /// args[0] of a 3-argument step): `run_late` interleaves them, and every
+    /// slice reads the SAME loop-invariant guard (here the hoisted preheader
+    /// splat) — slices never re-materialize or re-hoist it.
+    #[test]
+    fn sse2_masked_value_steps_interleave_late_sharing_one_guard() {
+        for (step, zero) in [
+            (
+                IntrinsicOp::VecMaskedAddValueI32x4,
+                IntrinsicOp::VecZeroI32x4,
+            ),
+            (
+                IntrinsicOp::VecWidenMaskedAddValueI32x4ToI64x2,
+                IntrinsicOp::VecZeroI64x2,
+            ),
+        ] {
+            let (mut f, _base) = build_dot_func();
+            let splat = Value(20);
+            f.blocks[0].instructions[3] = Instruction::Intrinsic {
+                dest: Some(Value(4)),
+                op: zero,
+                dest_ptr: None,
+                args: vec![],
+            };
+            f.blocks[0].instructions.push(Instruction::Intrinsic {
+                dest: Some(splat),
+                op: IntrinsicOp::VecBroadcastI32x4,
+                dest_ptr: None,
+                args: vec![Operand::Value(Value(3))],
+            });
+            // body: v12 = load4×I32(a, byte iv); v9 = step(acc, v12, splat)
+            f.blocks[2].instructions[1] = Instruction::Intrinsic {
+                dest: Some(Value(12)),
+                op: IntrinsicOp::VecLoadI32x4,
+                dest_ptr: None,
+                args: vec![Operand::Value(Value(1)), Operand::Value(Value(8))],
+            };
+            f.blocks[2].instructions.insert(
+                2,
+                Instruction::Intrinsic {
+                    dest: Some(Value(9)),
+                    op: step,
+                    dest_ptr: None,
+                    args: vec![
+                        Operand::Value(Value(5)),
+                        Operand::Value(Value(12)),
+                        Operand::Value(splat),
+                    ],
+                },
+            );
+            if let Instruction::BinOp { rhs, .. } = &mut f.blocks[2].instructions[3] {
+                *rhs = Operand::Const(IrConst::I32(16));
+            }
+            f.next_value_id = f.next_value_id.max(64);
+
+            assert_eq!(run_late(&mut f, false), 1, "{step:?} is a late-only root");
+            let guards: Vec<Operand> = f
+                .blocks
+                .iter()
+                .flat_map(|b| &b.instructions)
+                .filter_map(|i| match i {
+                    Instruction::Intrinsic { op, args, .. } if *op == step => Some(args[2]),
+                    _ => None,
+                })
+                .collect();
+            assert!(guards.len() > 2, "{step:?}: slices plus the epilogue step");
+            assert!(
+                guards.iter().all(|g| *g == Operand::Value(splat)),
+                "{step:?}: every slice reads the hoisted splat, got {guards:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn late_entry_never_reslices_early_loops_or_their_epilogues() {
+        // An early (unmasked FMA) loop is not the late entry's business ...
+        let (mut f, _base) = build_dot_func();
+        assert_eq!(run_late(&mut f, true), 0);
+        assert_eq!(f.blocks.len(), 4);
+        // ... and after the early interleave, neither is the verbatim
+        // epilogue it leaves behind (still a single-accumulator loop).
+        assert_eq!(run(&mut f, true), 1);
+        let blocks = f.blocks.len();
+        assert_eq!(run_late(&mut f, true), 0);
+        assert_eq!(f.blocks.len(), blocks);
     }
 
     #[test]

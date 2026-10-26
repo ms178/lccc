@@ -30,6 +30,10 @@
 //!   the shifted operand, terminators, ...) demands all bits.
 //! * `x & m` with `m` covering the demanded low bits is `x` on those bits:
 //!   its users are rewired to `x` and the dead `and` is deleted.
+//! * Low-bit-closed arithmetic passes demand through: `+ - * | ^ &`, `-x`
+//!   and `~x` read only the low `D` bits of their operands; `x << k` reads
+//!   `D - k` bits of `x`, and `x * c` reads `D - tz(c)` bits (zstd_count's
+//!   `v << ((q & 7) * 8)` loses its `and`, as with Clang/ICX).
 //! * `C - x` is `-x` when `C ≡ 0` and `~x` when `C ≡ -1` modulo `2^D`. The
 //!   unary form needs no immediate register and can update `x` in place.
 //!
@@ -130,7 +134,66 @@ fn operand_demand(inst: &Instruction, v: u32, dest_demand: impl Fn(Value) -> u8)
             // result are the low bits of the source for zext, sext and trunc.
             dest_demand(*dest)
         }
+        // `x << k` (constant `k` below the width): result bit `i` is operand
+        // bit `i - k`, so the low `D` bits read only the low `D - k` bits
+        // (none when `k >= D`).
+        Instruction::BinOp {
+            dest,
+            op: IrBinOp::Shl,
+            lhs,
+            rhs,
+            ty,
+        } if is_v(lhs) && !is_v(rhs) => match (const_bits(rhs), scalar_int_bits(*ty)) {
+            (Some(k), Some(w)) if k < u64::from(w) => {
+                low_closed(dest_demand(*dest), k.min(u64::from(u8::MAX)) as u8)
+            }
+            _ => FULL,
+        },
+        // Low-bit-closed arithmetic: the low `D` bits of `a + b`, `a - b`,
+        // `a * b`, `a | b`, `a ^ b`, `a & b`, `-a` and `~a` are a function of
+        // the low `D` bits of the operands alone (carries and borrows only
+        // move upward). A constant multiplier with `t` trailing zeros is a
+        // left shift by `t` of an odd product: its other operand needs only
+        // `D - t` bits (`(q & 7) * 8` feeding a 6-bit count reads 3 bits).
+        Instruction::BinOp {
+            dest,
+            op:
+                op @ (IrBinOp::Add
+                | IrBinOp::Sub
+                | IrBinOp::Mul
+                | IrBinOp::Or
+                | IrBinOp::Xor
+                | IrBinOp::And),
+            lhs,
+            rhs,
+            ty,
+        } if scalar_int_bits(*ty).is_some() => {
+            let d = dest_demand(*dest);
+            let other = if is_v(lhs) { rhs } else { lhs };
+            match (op, const_bits(other)) {
+                (IrBinOp::Mul, Some(m)) if !(is_v(lhs) && is_v(rhs)) => {
+                    low_closed(d, m.trailing_zeros().min(u32::from(u8::MAX)) as u8)
+                }
+                _ => d,
+            }
+        }
+        Instruction::UnaryOp {
+            dest,
+            op: IrUnaryOp::Neg | IrUnaryOp::Not,
+            ty,
+            ..
+        } if scalar_int_bits(*ty).is_some() => dest_demand(*dest),
         _ => FULL,
+    }
+}
+
+/// Operand demand when the result's low `d` bits read operand bits shifted
+/// up by `shift`: `d - shift`, saturating at none; "everything" stays so.
+fn low_closed(d: u8, shift: u8) -> u8 {
+    if d == FULL {
+        FULL
+    } else {
+        d.saturating_sub(shift)
     }
 }
 
@@ -177,7 +240,8 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
     }
 
     // Least fixpoint of D over the use graph. Demand only flows backwards
-    // through and/sub/cast chains, which cannot form a cycle without a phi
+    // through and/sub/cast and low-bit-closed arithmetic chains (SSA: no
+    // cycle without a phi, and a phi is a full-demand use)
     // (a full-demand use), and the walk visits users before definitions
     // (reverse order), so a straight-line chain settles in one sweep plus the
     // confirming one. The bound is a defensive cap that falls back to "no
@@ -472,7 +536,11 @@ mod tests {
                     };
                     let r = match op {
                         IrBinOp::And => a & b,
+                        IrBinOp::Or => a | b,
+                        IrBinOp::Xor => a ^ b,
+                        IrBinOp::Add => a.wrapping_add(b),
                         IrBinOp::Sub => a.wrapping_sub(b),
+                        IrBinOp::Mul => a.wrapping_mul(b),
                         IrBinOp::Shl => trunc(*ty, a).wrapping_shl((b & hw) as u32),
                         IrBinOp::LShr => trunc(*ty, a).wrapping_shr((b & hw) as u32),
                         IrBinOp::AShr => (sext(*ty, a) as i64).wrapping_shr((b & hw) as u32) as u64,
@@ -641,6 +709,86 @@ mod tests {
             let g = rewrite_and_check(&f);
             assert_eq!(!has_and(&g), removable, "{ty:?} & {mask}");
         }
+    }
+
+    /// zstd_count's checksum lane `v << ((q & 7) * 8)`: the low 6 count
+    /// bits of `(q & 7) << 3` are `q << 3`, so the mask goes (Clang 23.1.3 /
+    /// ICX 2026.2 emit `leal (,%q,8), %ecx`). Demand flows through `shl`,
+    /// a power-of-two `mul`, `add`/`xor`, and a 32-bit (5-bit) consumer.
+    #[test]
+    fn mask_drops_through_low_bit_closed_arithmetic() {
+        let shapes: [(IrBinOp, Operand, u64); 4] = [
+            (IrBinOp::Shl, c(3), 7),
+            (IrBinOp::Mul, c(8), 7),
+            (IrBinOp::Add, v(2), 63),
+            (IrBinOp::Xor, v(2), 63),
+        ];
+        for (op, rhs, m) in shapes {
+            let f = func(
+                vec![
+                    param(0, 0, IrType::U64),
+                    param(1, 1, IrType::U64),
+                    param(2, 2, IrType::U64),
+                    bin(3, IrBinOp::And, v(1), c(m as i64), IrType::U64),
+                    bin(4, op, v(3), rhs.clone(), IrType::U64),
+                    bin(5, IrBinOp::Shl, v(0), v(4), IrType::U64),
+                ],
+                5,
+            );
+            assert!(!has_and(&rewrite_and_check(&f)), "{op:?}");
+        }
+        // 32-bit shift: 5 count bits; `(n & 3) << 3` supplies bits 3..4.
+        let f = func(
+            vec![
+                param(0, 0, IrType::U32),
+                param(1, 1, IrType::U32),
+                bin(2, IrBinOp::And, v(1), c(3), IrType::U32),
+                bin(3, IrBinOp::Shl, v(2), c(3), IrType::U32),
+                bin(4, IrBinOp::LShr, v(0), v(3), IrType::U32),
+            ],
+            4,
+        );
+        assert!(!has_and(&rewrite_and_check(&f)));
+    }
+
+    /// The transfer functions never over-claim: each mask below clears a bit
+    /// the count still reads, or the chain leaves the low-bit-closed set.
+    #[test]
+    fn mask_stays_when_arithmetic_still_reads_cleared_bits() {
+        let shapes: [(IrBinOp, Operand, u64); 5] = [
+            (IrBinOp::Shl, c(3), 3),   // needs q bit 2
+            (IrBinOp::Mul, c(12), 7),  // tz(12) = 2: needs q bit 3
+            (IrBinOp::Add, v(2), 31),  // carry into bit 5 reads n bit 5
+            (IrBinOp::LShr, c(1), 63), // right shifts pull high bits down
+            (IrBinOp::Mul, v(2), 31),  // variable factor: all 6 low bits
+        ];
+        for (op, rhs, m) in shapes {
+            let f = func(
+                vec![
+                    param(0, 0, IrType::U64),
+                    param(1, 1, IrType::U64),
+                    param(2, 2, IrType::U64),
+                    bin(3, IrBinOp::And, v(1), c(m as i64), IrType::U64),
+                    bin(4, op, v(3), rhs.clone(), IrType::U64),
+                    bin(5, IrBinOp::Shl, v(0), v(4), IrType::U64),
+                ],
+                5,
+            );
+            assert!(has_and(&rewrite_and_check(&f)), "{op:?} mask {m}");
+        }
+        // The scaled value also escapes (returned through a subtract).
+        let f = func(
+            vec![
+                param(0, 0, IrType::U64),
+                param(1, 1, IrType::U64),
+                bin(2, IrBinOp::And, v(1), c(7), IrType::U64),
+                bin(3, IrBinOp::Shl, v(2), c(3), IrType::U64),
+                bin(4, IrBinOp::Shl, v(0), v(3), IrType::U64),
+                bin(5, IrBinOp::Sub, v(4), v(3), IrType::U64),
+            ],
+            5,
+        );
+        assert!(has_and(&rewrite_and_check(&f)));
     }
 
     #[test]

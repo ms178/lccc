@@ -182,15 +182,22 @@ impl RegCache {
     }
 }
 
-/// Shared codegen state, used by all backends.
-/// True while the backend emits an exploratory (metric-only) copy of a
-/// function for the dual-layout selection. Debug traces fire per emission;
-/// count-based assertions over those traces (`check_demorgan_branch_split`
-/// expects exactly one fire per site) would double under exploration, so
-/// the load-bearing debug helpers stay silent while this is set. The
-/// exploratory text never leaves the compiler.
-pub(crate) static EXPLORATORY_EMISSION: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+thread_local! {
+    /// True while the backend emits an exploratory (metric-only) copy of a
+    /// function for the dual-layout selection. Debug traces fire per
+    /// emission; count-based assertions over those traces
+    /// (`check_demorgan_branch_split` expects exactly one fire per site)
+    /// would double under exploration, so the load-bearing debug helpers stay
+    /// silent while this is set. The exploratory text never leaves the
+    /// compiler.
+    ///
+    /// Thread-local: emission is single-threaded per translation unit, but
+    /// unit tests emit concurrently on one process's thread pool, and a
+    /// process-wide flag let one test's exploratory phase suppress another's
+    /// committed facts.
+    pub(crate) static EXPLORATORY_EMISSION: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
 
 /// A VLFOLD-elided vector load awaiting its consumer.
 /// See `CodegenState::pending_vec_memfold` for the width contract.
@@ -513,6 +520,16 @@ pub struct CodegenState {
     /// when the callee is variadic; for a prototyped non-variadic callee the
     /// `xorl %eax,%eax` is pure waste. GCC omits it there.
     pub call_is_variadic: bool,
+    /// Does the call being emitted pass a 256/512-bit vector in a YMM/ZMM
+    /// register (`CallArgClass::StructXmmReg` wider than 16 bytes)?
+    ///
+    /// Set by the generic `emit_call` from the authoritative classification.
+    /// A function with dirty upper YMM state cleans it with `vzeroupper`
+    /// before an ordinary call (GCC 16.2 / Clang 23.1.4 do the same), except
+    /// at such a call: `vzeroupper` would zero the argument's upper lanes.
+    /// The sibcall exit applies the identical test
+    /// (`SibcallPending::preserve_upper_vector_lanes`).
+    pub call_passes_wide_vector: bool,
     /// Was a `SetStaticChain` emitted since the last call/transfer emission?
     ///
     /// The nested-call lowering stages the static chain into %r10 directly
@@ -751,7 +768,7 @@ impl CodegenState {
         self.record_call_pop_for_emission(
             direct,
             pops,
-            EXPLORATORY_EMISSION.load(std::sync::atomic::Ordering::Relaxed),
+            EXPLORATORY_EMISSION.with(std::cell::Cell::get),
         );
     }
 
@@ -868,6 +885,7 @@ impl CodegenState {
             indirect_branch_thunk: false,
             indirect_branch_thunk_inline: false,
             call_is_variadic: false,
+            call_passes_wide_vector: false,
             chain_call: false,
             call_gp_arg_count: 6,
             call_fp_arg_count: None,
@@ -1122,6 +1140,7 @@ impl CodegenState {
         // Reset both per function; value ids are already function-local.
         self.chain_call = false;
         self.call_is_variadic = false;
+        self.call_passes_wide_vector = false;
         self.call_gp_arg_count = 6;
         self.call_fp_arg_count = None;
         self.value_locations.clear();

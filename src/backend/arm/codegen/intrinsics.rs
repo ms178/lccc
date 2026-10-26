@@ -278,7 +278,7 @@ impl ArmCodegen {
             IntrinsicOp::Movnti64 => {
                 self.emit_nontemporal_store(dest_ptr, args, "x9", "x0");
             }
-            IntrinsicOp::Movntdq | IntrinsicOp::Movntpd => {
+            IntrinsicOp::Movntdq | IntrinsicOp::Movntpd | IntrinsicOp::Movntps => {
                 // Non-temporal 128-bit store: dest_ptr = target, args[0] = source ptr
                 if let Some(ptr) = dest_ptr {
                     self.operand_to_x0(&args[0]);
@@ -1225,10 +1225,11 @@ impl ArmCodegen {
             | IntrinsicOp::VecStoreF32x8
             | IntrinsicOp::VecStoreF64x4
             | IntrinsicOp::VecStoreI32x8
-            | IntrinsicOp::VecWidenAddI32x4ToI64x2
-            | IntrinsicOp::VecWidenMaskedAddI32x4ToI64x2
+            | IntrinsicOp::VecWidenAddI32x4ToI64x4
+            | IntrinsicOp::VecWidenMaskedAddI32x4ToI64x4
             | IntrinsicOp::VecWidenAddValueI32x4ToI64x2
-            | IntrinsicOp::VecWidenMaskedAddValueI32x4ToI64x2 => {
+            | IntrinsicOp::VecWidenMaskedAddValueI32x4ToI64x2
+            | IntrinsicOp::VecMaskedAddValueI32x4 => {
                 // An x86-shaped 256-bit op reached the AArch64 emitter: the
                 // vectorizer's target gate is the invariant that prevents this,
                 // and `unimplemented!` used to turn that invariant into a

@@ -168,6 +168,62 @@ fn find_count_reduction(
     reduction
 }
 
+/// The IV itself plus every exact widening cast of it in the body, and the
+/// cast sites.  Only exact widening address casts are admitted: the finite
+/// nonnegative trajectory makes sign- and zero-extension identical, while a
+/// truncation or arbitrary arithmetic index is not an alias of the rebased
+/// IV.
+fn widening_index_casts(
+    func: &IrFunction,
+    lp: &loop_analysis::NaturalLoop,
+    iv: Value,
+    ty: IrType,
+) -> (FxHashSet<Value>, FxHashSet<(usize, usize)>) {
+    let mut indices = FxHashSet::from_iter([iv]);
+    let mut cast_sites = FxHashSet::default();
+    for &bi in &lp.body {
+        for (ii, inst) in func.blocks[bi].instructions.iter().enumerate() {
+            if let Instruction::Cast {
+                dest,
+                src: Operand::Value(src),
+                from_ty,
+                to_ty,
+            } = inst
+            {
+                if *src == iv
+                    && *from_ty == ty
+                    && matches!(ty, IrType::I32 | IrType::U32)
+                    && matches!(to_ty, IrType::I64 | IrType::U64)
+                {
+                    indices.insert(*dest);
+                    cast_sites.insert((bi, ii));
+                }
+            }
+        }
+    }
+    (indices, cast_sites)
+}
+
+/// The symbol a body-local `GlobalAddr` base names.  `arr[i]` lowers to a
+/// `GlobalAddr arr` INSIDE the body and LICM runs after this pass, so
+/// without rematerialisation every count over a global array stayed scalar
+/// unless an earlier use (a memset, say) had already put the address in the
+/// entry block.  The symbol address is pure and loop-invariant.
+fn body_symbol_name(
+    func: &IrFunction,
+    lp: &loop_analysis::NaturalLoop,
+    base: Value,
+) -> Option<String> {
+    let (db, di) = definition_site(func, base)?;
+    if !lp.contains(db) {
+        return None;
+    }
+    match &func.blocks[db].instructions[di] {
+        Instruction::GlobalAddr { name, .. } => Some(name.clone()),
+        _ => None,
+    }
+}
+
 /// Canonicalization is deliberately restricted to direct, nonnegative 32/64-bit
 /// IVs (including exact 32-to-64-bit address casts) and constant bounds. Runtime starts, truncating index casts, zero-trip
 /// cases, escaping IVs and overflowing inclusive endpoints fail closed.
@@ -287,31 +343,7 @@ fn normalize(
         return None;
     }
 
-    // Only exact widening address casts are admitted. The finite nonnegative
-    // trajectory makes sign- and zero-extension identical; a truncation or
-    // arbitrary arithmetic index is not an alias of this rebased IV.
-    let mut indices = FxHashSet::from_iter([iv]);
-    let mut cast_sites = FxHashSet::default();
-    for &bi in &lp.body {
-        for (ii, inst) in func.blocks[bi].instructions.iter().enumerate() {
-            if let Instruction::Cast {
-                dest,
-                src: Operand::Value(src),
-                from_ty,
-                to_ty,
-            } = inst
-            {
-                if *src == iv
-                    && *from_ty == ty
-                    && matches!(ty, IrType::I32 | IrType::U32)
-                    && matches!(to_ty, IrType::I64 | IrType::U64)
-                {
-                    indices.insert(*dest);
-                    cast_sites.insert((bi, ii));
-                }
-            }
-        }
-    }
+    let (indices, cast_sites) = widening_index_casts(func, lp, iv, ty);
     let mut geps = Vec::new();
     for (bi, block) in func.blocks.iter().enumerate() {
         for (ii, inst) in block.instructions.iter().enumerate() {
@@ -337,13 +369,20 @@ fn normalize(
             else {
                 return None;
             };
+            // `arr[i]` lowers to a `GlobalAddr arr` INSIDE the body, and
+            // LICM runs after this pass: without rematerialisation every
+            // count over a global array stayed scalar unless an earlier use
+            // (a memset, say) had already put the address in the entry
+            // block.  The symbol address is pure and loop-invariant.
+            let global = body_symbol_name(func, lp, *base);
             if !indices.contains(index)
                 || !lp.contains(bi)
-                || !strict_external_value_available(func, cfg, &lp.body, pre, *base)
+                || (global.is_none()
+                    && !strict_external_value_available(func, cfg, &lp.body, pre, *base))
             {
                 return None;
             }
-            geps.push((bi, ii, *base));
+            geps.push((bi, ii, *base, global));
         }
         let mut escapes = false;
         block
@@ -386,30 +425,46 @@ fn normalize(
             IrCmpOp::Ult
         };
     }
-    for (bi, ii, base) in geps {
-        if start == 0 {
-            continue;
-        }
-        let shifted = fresh(&mut next);
-        let block = &mut candidate.blocks[pre];
-        if !block.source_spans.is_empty() {
-            if block.source_spans.len() == block.instructions.len() {
-                block
-                    .source_spans
-                    .push(crate::common::source::Span::dummy());
-            } else {
-                block.source_spans.clear();
-            }
-        }
-        block.instructions.push(Instruction::GetElementPtr {
-            dest: shifted,
-            base,
-            offset: Operand::Const(IrConst::I64(start)),
-            ty: IrType::Ptr,
-        });
+    // One preheader `GlobalAddr` per symbol, then (for a nonzero start) one
+    // rebased GEP per stream.
+    let mut hoisted: FxHashMap<String, Value> = FxHashMap::default();
+    for (bi, ii, base, global) in geps {
+        let base = match global {
+            Some(name) => match hoisted.get(&name) {
+                Some(v) => *v,
+                None => {
+                    let dest = fresh(&mut next);
+                    push_preheader_inst(
+                        &mut candidate.blocks[pre],
+                        Instruction::GlobalAddr {
+                            dest,
+                            name: name.clone(),
+                        },
+                    );
+                    hoisted.insert(name, dest);
+                    dest
+                }
+            },
+            None => base,
+        };
+        let new_base = if start == 0 {
+            base
+        } else {
+            let shifted = fresh(&mut next);
+            push_preheader_inst(
+                &mut candidate.blocks[pre],
+                Instruction::GetElementPtr {
+                    dest: shifted,
+                    base,
+                    offset: Operand::Const(IrConst::I64(start)),
+                    ty: IrType::Ptr,
+                },
+            );
+            shifted
+        };
         if let Instruction::GetElementPtr { base, .. } = &mut candidate.blocks[bi].instructions[ii]
         {
-            *base = shifted;
+            *base = new_base;
         }
     }
     let truth = fresh(&mut next);
@@ -462,6 +517,23 @@ fn normalize(
     }
     candidate.next_value_id = next;
     Some(candidate)
+}
+
+/// Append to the preheader, keeping a complete span table complete (and
+/// dropping a partial one, as every other preheader edit here does).
+fn push_preheader_inst(block: &mut BasicBlock, inst: Instruction) {
+    // A span table is either in step with the instructions or absent.  The
+    // test is the LENGTH, not emptiness: an empty block's empty table is in
+    // step and must gain an entry with its first instruction (testing
+    // `is_empty()` left a hoist into an empty preheader one span short).
+    if block.source_spans.len() == block.instructions.len() {
+        block
+            .source_spans
+            .push(crate::common::source::Span::dummy());
+    } else {
+        block.source_spans.clear();
+    }
+    block.instructions.push(inst);
 }
 
 pub(super) fn transform(
@@ -753,6 +825,91 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `arr[i]` as lowered: the symbol address is materialised at the top
+    /// of the BODY (LICM runs after this pass), not in the preheader.
+    fn in_body_global_fixture(start: i64, length: i64, inclusive: bool) -> IrFunction {
+        let mut f = fixture(start, length, inclusive, false, 5);
+        let addr = f.blocks[0].instructions.remove(0);
+        f.blocks[0].source_spans.remove(0);
+        f.blocks[2].instructions.insert(0, addr);
+        f.blocks[2].source_spans.insert(0, Span::dummy());
+        f
+    }
+
+    #[test]
+    fn in_body_global_stream_base_is_rematerialised_in_the_preheader() {
+        for start in [0, 1, 2, 31] {
+            for length in [1, 32, 33, 65] {
+                for inclusive in [false, true] {
+                    let f = in_body_global_fixture(start, length, inclusive);
+                    let before = format!("{f:?}");
+                    let ctx = format!("start={start} length={length} inclusive={inclusive}");
+                    let n = normalize(&f, &lp(), &CfgAnalysis::build(&f))
+                        .unwrap_or_else(|| panic!("{ctx}: refused an in-body GlobalAddr base"));
+                    assert_eq!(format!("{f:?}"), before, "{ctx}: input mutated");
+                    assert!(
+                        n.blocks
+                            .iter()
+                            .all(|b| b.source_spans.len() == b.instructions.len()),
+                        "{ctx}: span table out of step"
+                    );
+                    let pre_defs: FxHashSet<Value> = n.blocks[0]
+                        .instructions
+                        .iter()
+                        .filter_map(|i| i.dest())
+                        .collect();
+                    let hoisted = n.blocks[0]
+                        .instructions
+                        .iter()
+                        .filter(|i| matches!(i, Instruction::GlobalAddr { name, .. } if name == "bytes"))
+                        .count();
+                    assert_eq!(hoisted, 1, "{ctx}: one preheader GlobalAddr per symbol");
+                    let gep_bases: Vec<Value> = n.blocks[2]
+                        .instructions
+                        .iter()
+                        .filter_map(|i| match i {
+                            Instruction::GetElementPtr { base, .. } => Some(*base),
+                            _ => None,
+                        })
+                        .collect();
+                    assert_eq!(gep_bases.len(), 1, "{ctx}");
+                    assert!(
+                        pre_defs.contains(&gep_bases[0]),
+                        "{ctx}: the stream GEP must be based in the preheader"
+                    );
+                    for data in [
+                        vec![0; 128],
+                        vec![255; 128],
+                        (0..128).map(|i| [0, 1, 128, 255][i % 4]).collect(),
+                    ] {
+                        assert_eq!(interpret(&f, &data), interpret(&n, &data), "{ctx}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Only a symbol address is rematerialised: any other base defined in
+    /// the loop (here a `Copy`, which reads no index and so reaches exactly
+    /// the base-availability check) still refuses the rewrite.
+    #[test]
+    fn in_body_non_global_stream_base_is_refused() {
+        let mut f = in_body_global_fixture(0, 64, false);
+        f.blocks[2].instructions[0] = Instruction::Copy {
+            dest: Value(20),
+            src: Operand::Const(IrConst::I64(0x1000)),
+        };
+        assert!(normalize(&f, &lp(), &CfgAnalysis::build(&f)).is_none());
+        // The same function with the base back in the preheader is admitted
+        // (so the refusal above is the base, not the fixture).
+        let mut ok = fixture(0, 64, false, false, 5);
+        ok.blocks[0].instructions[0] = Instruction::Copy {
+            dest: Value(20),
+            src: Operand::Const(IrConst::I64(0x1000)),
+        };
+        assert!(normalize(&ok, &lp(), &CfgAnalysis::build(&ok)).is_some());
     }
 
     #[test]

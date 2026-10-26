@@ -356,36 +356,43 @@ fn reg_id_to_name_q(reg: RegId) -> &'static str {
     }
 }
 
-/// Remove a never-referenced constant leaf frame outright, or shrink it to
-/// the alignment minimum when the function makes calls.
+/// Remove a never-referenced constant frame outright, or shrink it to the
+/// alignment minimum when the function makes calls.
 ///
-/// Shape: a function whose prologue is exactly `subq $N, %rsp` (no
-/// `pushq %rbp`, no callee-saved pushes) whose body never names `%rsp`,
-/// and whose every `ret` is immediately preceded (modulo directives/NOPs)
-/// by the matching `addq $N, %rsp` — and, symmetrically, every collected
-/// `addq $N, %rsp` is immediately FOLLOWED (modulo directives/NOPs) by a
-/// `ret`. Epilogues are classified by this bidirectional ret-pairing, not
-/// by string identity: a mid-body stack readjustment that happens to
-/// spell `addq $N, %rsp` sets the decline flag instead of being NOP'd.
-/// The frame exists because slots the register allocator reserved were
-/// retired by later peephole passes; nothing observes it.
+/// Shape (frame pointer omitted): `k ≥ 0` callee-saved pushes directly
+/// after the function label, then `subq $N, %rsp`; a body that never names
+/// `%rsp`; and every `ret` reached through `addq $N, %rsp` followed by
+/// exactly `k` pops. Epilogues are classified by bidirectional ret-pairing,
+/// not by string identity: an `addq $N, %rsp` is an epilogue only when the
+/// next real lines (modulo directives/NOPs) are `k` pops and a `ret`, and
+/// every `ret` must reach such an `addq` backwards through those pops. A
+/// mid-body stack readjustment that happens to spell `addq $N, %rsp`, any
+/// other push/pop, inline asm or `%rsp` mention declines the fold. The
+/// frame exists because slots the register allocator reserved were retired
+/// by later peephole passes (or the allocator homed every value in a
+/// register after the frame size was fixed); nothing observes it.
 ///
-/// * **Leaf** (no `call`): delete the `subq` and every matched `addq`. At
-///   entry `%rsp ≡ 8 (mod 16)`; a leaf that never addresses through
-///   `%rsp` and never calls has no alignment or address observation of
-///   the adjustment at all, and every return site executes the matching
-///   `addq` on the way out, so deleting the pair keeps `%rsp` exact on
-///   every path.
-/// * **Calls present**: the ABI requires `%rsp ≡ 0 (mod 16)` at every
-///   call site — the entry value is ≡ 8, so the frame is (at least
-///   partly) an alignment frame. When `N ≡ 8 (mod 16)` and `N > 8`,
-///   shrink to `subq $8, %rsp` (the smallest alignment-preserving
-///   adjustment); any other residue means the frame also carries an
-///   outbound-argument or spill area that would have referenced `%rsp`
-///   and cannot appear here.
+/// Soundness: on every entry→ret path the prologue `subq` is matched by
+/// exactly one collected `addq` (each collected `addq` is followed only by
+/// pops and a `ret`, so no path crosses two), and the pushes and pops are
+/// untouched, so deleting or resizing the pair keeps `%rsp` exact at every
+/// `ret`, and nothing in the body depends on the absolute `%rsp` value.
 ///
-/// The `.cfi_def_cfa_offset` that follows the `subq` is rewritten to the
-/// new offset so unwind info stays truthful.
+/// * **Leaf** (no `call`): delete the `subq` and every matched `addq`. A
+///   call-free body that never addresses through `%rsp` observes neither
+///   the address nor the alignment of the adjustment.
+/// * **Calls present**: the ABI requires `%rsp ≡ 0 (mod 16)` at every call
+///   site, i.e. `8 + 8k + N ≡ 0 (mod 16)`. Shrink `N` to the smallest value
+///   with the same residue (`8` for even `k`, `0` for odd `k`, deleting the
+///   pair); a misaligned original frame declines.
+///
+/// CFI stays exact for every row, not only the prologue's: the codegen
+/// restates the full-frame CFA after each mid-body `ret`, so EVERY
+/// `.cfi_def_cfa_offset` equal to the frame total `8 + 8k + N` is rewritten
+/// to `8 + 8k + N'`; values inside the push region (`≤ 8 + 8k`) are kept and
+/// any other value, `.cfi_def_cfa`, `.cfi_def_cfa_register` or
+/// `.cfi_adjust_cfa_offset` declines before anything is changed. Rows that
+/// then restate the current CFA are dropped.
 pub(super) fn remove_dead_leaf_frame(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
     if len == 0 {
@@ -398,25 +405,24 @@ pub(super) fn remove_dead_leaf_frame(store: &mut LineStore, infos: &mut [LineInf
             i += 1;
             continue;
         }
-        // Prologue: subq $N, %rsp as the FIRST real instruction of the
-        // function (the preceding lines are the label/CFI directives, so
-        // no pushq %rbp and no callee-save pushes precede it).
         let line = infos[i].trimmed(store.get(i));
-        let Some(n) = parse_subq_rsp(&line) else {
+        let Some(n) = parse_subq_rsp(line) else {
             i += 1;
             continue;
         };
-        if !prologue_precedes_label(store, infos, i) {
+        let Some((func_start, pushes)) = fpo_prologue_pushes(store, infos, i) else {
             i += 1;
             continue;
-        }
-        // Audit the whole function body: collect the epilogue `addq`s,
-        // require every ret to be paired with one, reject any other
-        // reference to the stack pointer or opaque/stack-shaping line.
+        };
+        // Audit the whole function body: collect the epilogue `addq`s and
+        // the CFA rows, require every ret to be paired with an epilogue,
+        // reject any other reference to the stack pointer or opaque/stack-
+        // shaping line.
         let mut epilogues: Vec<usize> = Vec::new();
+        let mut epilogue_pops: Vec<usize> = Vec::new();
+        let mut cfa_rows: Vec<(usize, i64)> = Vec::new();
         let mut has_call = false;
-        let mut rsp_named = false;
-        let mut unpaired_ret = false;
+        let mut decline = false;
         let mut func_end = len;
         let mut j = i + 1;
         while j < len {
@@ -426,46 +432,48 @@ pub(super) fn remove_dead_leaf_frame(store: &mut LineStore, infos: &mut [LineInf
                     func_end = j + 1;
                     break;
                 }
+                if let Some(v) = dj.strip_prefix(".cfi_def_cfa_offset ") {
+                    match v.trim().parse::<i64>() {
+                        Ok(v) => cfa_rows.push((j, v)),
+                        Err(_) => decline = true,
+                    }
+                } else if dj.starts_with(".cfi_def_cfa") || dj.starts_with(".cfi_adjust_cfa_offset")
+                {
+                    decline = true;
+                }
                 j += 1;
                 continue;
             }
             let body = infos[j].trimmed(store.get(j));
             if body == format!("addq ${}, %rsp", n) {
                 // WO-1 (red-team audit, 2026-09-18): string identity alone
-                // does not make an epilogue. Classify by what FOLLOWS: the
-                // addq is an epilogue only when the next real line (skipping
-                // exactly the line classes the ret-pairing backward scan
-                // skips — NOPs and directives) is a `ret`. A mid-body stack
-                // readjustment that merely SPELLS the same `addq $N, %rsp`
-                // (e.g. a future emitter's alloca cleanup or manual stack
-                // ping-pong) would otherwise be NOP'd without a matching
-                // prologue deletion on its path — an unbalanced stack.
-                // Anything else that names %rsp declines the fold
-                // (fail-closed), which is the pass's contract for shapes it
-                // cannot classify.
-                //
-                // Soundness of the ret-paired rule: deleting the prologue
-                // subq and every ret-paired addq preserves %rsp on every
-                // entry→ret path because (a) every ret is preceded by a
-                // collected addq (checked below), (b) every collected addq
-                // is immediately followed by a ret, so a path crossing it
-                // terminates there — no path crosses two collected addqs,
-                // and each path's single prologue subq is matched by its
-                // single terminal addq.
+                // does not make an epilogue. The addq is one only when what
+                // FOLLOWS (skipping exactly the line classes the backward
+                // ret-pairing scan skips) is the full pop sequence and a
+                // `ret`; a mid-body readjustment that merely spells the same
+                // `addq $N, %rsp` would otherwise be deleted without a
+                // matching prologue deletion on its path.
                 let mut q = j + 1;
+                let mut pops: Vec<usize> = Vec::new();
                 let mut ret_paired = false;
                 while q < len {
                     if super::helpers::steps_over_line(&infos[q], infos[q].trimmed(store.get(q))) {
                         q += 1;
                         continue;
                     }
-                    ret_paired = matches!(infos[q].kind, LineKind::Ret);
+                    if matches!(infos[q].kind, LineKind::Pop { .. }) && pops.len() < pushes {
+                        pops.push(q);
+                        q += 1;
+                        continue;
+                    }
+                    ret_paired = pops.len() == pushes && matches!(infos[q].kind, LineKind::Ret);
                     break;
                 }
                 if ret_paired {
                     epilogues.push(j);
+                    epilogue_pops.extend(pops);
                 } else {
-                    rsp_named = true;
+                    decline = true;
                 }
                 j += 1;
                 continue;
@@ -487,9 +495,10 @@ pub(super) fn remove_dead_leaf_frame(store: &mut LineStore, infos: &mut [LineInf
                     continue;
                 }
                 LineKind::Ret => {
-                    // A ret must be preceded (modulo directives/NOPs) by a
-                    // collected epilogue addq, or this path would return
-                    // with an unbalanced stack under the fold.
+                    // A ret must be reached (modulo directives/NOPs and the
+                    // epilogue's own pops) from a collected epilogue addq,
+                    // or this path would return with an unbalanced stack
+                    // under the fold.
                     let mut p = j;
                     let mut paired = false;
                     while p > i {
@@ -497,22 +506,25 @@ pub(super) fn remove_dead_leaf_frame(store: &mut LineStore, infos: &mut [LineInf
                         if super::helpers::steps_over_line(
                             &infos[p],
                             infos[p].trimmed(store.get(p)),
-                        ) {
+                        ) || epilogue_pops.contains(&p)
+                        {
                             continue;
                         }
                         paired = epilogues.contains(&p);
                         break;
                     }
-                    if !paired {
-                        unpaired_ret = true;
-                    }
+                    decline |= !paired;
+                    j += 1;
+                    continue;
+                }
+                LineKind::Pop { .. } if epilogue_pops.contains(&j) => {
                     j += 1;
                     continue;
                 }
                 LineKind::Push { .. } | LineKind::Pop { .. } | LineKind::InlineAsm => {
-                    // push/pop shift the frame offsets; inline asm is
+                    // Body push/pop shift the frame offsets; inline asm is
                     // opaque to the %rsp audit.
-                    rsp_named = true;
+                    decline = true;
                     j += 1;
                     continue;
                 }
@@ -521,81 +533,113 @@ pub(super) fn remove_dead_leaf_frame(store: &mut LineStore, infos: &mut [LineInf
             if body.contains("%rsp") || body.contains("%esp") {
                 // Any other explicit reference to the stack pointer — a
                 // memory operand, register read, or address computation.
-                rsp_named = true;
+                decline = true;
             }
             j += 1;
         }
-        if epilogues.is_empty() || rsp_named || unpaired_ret {
-            i = func_end.min(len - 1) + 1;
+        let next = func_end.min(len - 1) + 1;
+        let push_top = 8 + 8 * pushes as i64;
+        let total = push_top + n;
+        let new_n = if !has_call {
+            0
+        } else if total % 16 == 0 {
+            8 * (pushes as i64 % 2 == 0) as i64
+        } else {
+            n
+        };
+        let cfa_ok = cfa_rows.iter().all(|&(_, v)| v == total || v <= push_top);
+        if epilogues.is_empty() || decline || new_n >= n || !cfa_ok {
+            i = next;
             continue;
         }
 
-        if !has_call {
-            // Leaf: delete the subq and every matched addq. Rewrite the
-            // CFA-offset directive that follows the subq (if present) to
-            // the entry offset 8.
+        if new_n == 0 {
             mark_nop(&mut infos[i]);
             for &ep in &epilogues {
                 mark_nop(&mut infos[ep]);
             }
-            rewrite_cfa_after(store, infos, i, 8);
-            changed = true;
-        } else if n % 16 == 8 && n > 8 {
-            // Alignment frame with calls: shrink to the minimum.
-            replace_line(store, &mut infos[i], i, "    subq $8, %rsp".to_string());
+        } else {
+            replace_line(store, &mut infos[i], i, format!("    subq ${new_n}, %rsp"));
             for &ep in &epilogues {
-                replace_line(store, &mut infos[ep], ep, "    addq $8, %rsp".to_string());
+                replace_line(
+                    store,
+                    &mut infos[ep],
+                    ep,
+                    format!("    addq ${new_n}, %rsp"),
+                );
             }
-            rewrite_cfa_after(store, infos, i, 16);
-            changed = true;
         }
-        i = func_end.min(len - 1) + 1;
+        for &(k, v) in &cfa_rows {
+            if v == total {
+                let row = format!("    .cfi_def_cfa_offset {}", push_top + new_n);
+                replace_line(store, &mut infos[k], k, row);
+            }
+        }
+        drop_restated_cfa(store, infos, func_start, func_end);
+        changed = true;
+        i = next;
     }
     changed
 }
 
-/// Rewrite the first `.cfi_def_cfa_offset` directive at or after `at` to
-/// `new_offset` (the CFA distance from %rsp after the adjustment).
-fn rewrite_cfa_after(store: &mut LineStore, infos: &mut [LineInfo], at: usize, new_offset: i64) {
-    let len = store.len();
-    let mut d = at + 1;
-    // DIRECTIVE-LAW: selecting -- the walk is hunting the `.cfi_def_cfa_offset`
-    // lines of one prologue to rewrite them in place; it neither deletes nor moves
-    // a line, so the opacity rule for fold windows does not apply.
-    while d < len && matches!(infos[d].kind, LineKind::Directive) {
-        let dl = infos[d].trimmed(store.get(d));
-        if dl.starts_with(".cfi_def_cfa_offset ") {
-            replace_line(
-                store,
-                &mut infos[d],
-                d,
-                format!(".cfi_def_cfa_offset {}", new_offset),
-            );
-            return;
-        }
-        if dl.starts_with(".cfi_startproc") || dl.starts_with(".size ") {
-            return;
-        }
-        d += 1;
-    }
-}
-
-/// True when the nearest non-directive line before `at` is a function
-/// label or `.cfi_startproc` — i.e. `at` is the first real instruction of
-/// a function.
-fn prologue_precedes_label(store: &LineStore, infos: &[LineInfo], at: usize) -> bool {
+/// `(function start, push count)` when the real instructions before the
+/// `subq` at `at` are only callee-saved pushes back to the function label
+/// or `.cfi_startproc`. In frame-pointer-omitted code `%rbp` is an ordinary
+/// callee-saved register; a frame-pointer prologue has `movq %rsp, %rbp`
+/// between its push and the `subq` and is refused here.
+fn fpo_prologue_pushes(store: &LineStore, infos: &[LineInfo], at: usize) -> Option<(usize, usize)> {
+    let mut pushes = 0;
     let mut p = at;
     while p > 0 {
         p -= 1;
-        if super::helpers::steps_over_line(&infos[p], infos[p].trimmed(store.get(p))) {
-            if infos[p].trimmed(store.get(p)).starts_with(".cfi_startproc") {
-                return true;
+        let line = infos[p].trimmed(store.get(p));
+        if super::helpers::steps_over_line(&infos[p], line) {
+            if line.starts_with(".cfi_startproc") {
+                return Some((p, pushes));
             }
             continue;
         }
-        return infos[p].trimmed(store.get(p)).ends_with(':');
+        match infos[p].kind {
+            LineKind::Push { reg } if is_callee_saved_reg(reg) || reg == REG_RBP => pushes += 1,
+            _ => return line.ends_with(':').then_some((p, pushes)),
+        }
     }
-    false
+    None
+}
+
+/// Drop `.cfi_def_cfa_offset` rows that restate the CFA offset already in
+/// effect. CFI rows apply from their address onward in address order, so a
+/// row equal to the running value (starting from the CIE's `rsp+8`) is a
+/// no-op. `.cfi_remember_state`/`.cfi_restore_state` make the running value
+/// non-linear; such functions are left alone.
+fn drop_restated_cfa(store: &LineStore, infos: &mut [LineInfo], start: usize, end: usize) {
+    let lines = start..end.min(infos.len());
+    if lines.clone().any(|k| {
+        let l = infos[k].trimmed(store.get(k));
+        !infos[k].is_nop()
+            && (l.starts_with(".cfi_remember_state") || l.starts_with(".cfi_restore_state"))
+    }) {
+        return;
+    }
+    let mut current = 8;
+    for k in lines {
+        if infos[k].is_nop() {
+            continue;
+        }
+        let Some(v) = infos[k]
+            .trimmed(store.get(k))
+            .strip_prefix(".cfi_def_cfa_offset ")
+        else {
+            continue;
+        };
+        let Ok(v) = v.trim().parse::<i64>() else {
+            return;
+        };
+        if v == current {
+            mark_nop(&mut infos[k]);
+        }
+        current = v;
+    }
 }
 
 /// Parse `subq $N, %rsp` (constant adjustment only).

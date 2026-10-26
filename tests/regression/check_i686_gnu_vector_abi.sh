@@ -166,5 +166,60 @@ for mode in sse2 i686 no-sse; do
         done
     done
 done
+# fastcall with native vectors: GCC 16.2 passes them in %xmm/%ymm0-2 exactly
+# as cdecl does, without touching the ECX/EDX chain (the 4th vector goes to
+# the stack in argument order), and the callee pops only the stack bytes.
+# Each prototype weighs every argument differently, and the driver checks a
+# stack guard after 64 calls, so a misplaced argument or a wrong `ret $N`
+# both change the exit status. Every driver x callee pairing must agree.
+cat > "$tmp/fc_callee.c" <<'EOF'
+typedef int v2 __attribute__((vector_size(16)));
+typedef long long v4 __attribute__((vector_size(32)));
+int __attribute__((fastcall)) fc1(v2 a, int b) { return a[0] + a[3] * 3 + b * 7; }
+int __attribute__((fastcall)) fc2(int a, v2 x, v2 y, v2 z, v2 w, int b, int c)
+{ return a + x[1] + y[2] * 2 + z[3] * 3 + w[0] * 5 + b * 11 + c * 13; }
+int __attribute__((fastcall)) fc3(int a, v4 v, int b) { return a + (int)v[3] * 17 + b * 19; }
+EOF
+cat > "$tmp/fc_driver.c" <<'EOF'
+typedef int v2 __attribute__((vector_size(16)));
+typedef long long v4 __attribute__((vector_size(32)));
+int __attribute__((fastcall)) fc1(v2 a, int b);
+int __attribute__((fastcall)) fc2(int a, v2 x, v2 y, v2 z, v2 w, int b, int c);
+int __attribute__((fastcall)) fc3(int a, v4 v, int b);
+int main(void) {
+    volatile int guard = 0x5a5a1234;
+    volatile int k = 1;
+    for (int i = 0; i < 64; i++) {
+        v2 a = {k, 2, 3, 4 + i}, x = {5, 6 + i, 7, 8}, y = {9, 10, 11 + i, 12};
+        v2 z = {13, 14, 15, 16 + i}, w = {17 + i, 18, 19, 20};
+        v4 v = {21, 22, 23, 24 + i};
+        if (fc1(a, 25 + i) != 1 + (4 + i) * 3 + (25 + i) * 7) return 2;
+        if (fc2(26, x, y, z, w, 27, 28 + i)
+            != 26 + (6 + i) + (11 + i) * 2 + (16 + i) * 3 + (17 + i) * 5 + 27 * 11 + (28 + i) * 13)
+            return 3;
+        if (fc3(29 + i, v, 30) != 29 + i + (24 + i) * 17 + 30 * 19) return 4;
+    }
+    return guard == 0x5a5a1234 ? 0 : 5;
+}
+EOF
+fc_flags=(-m32 -mavx2 -fno-pic -fno-pie -fno-stack-protector -Wno-psabi)
+for driver in "$GCC_ORACLE_BIN" "$ccc"; do
+    for callee in "$GCC_ORACLE_BIN" "$ccc"; do
+        [[ $driver == "$GCC_ORACLE_BIN" && $callee == "$GCC_ORACLE_BIN" ]] && continue
+        for opt in O0 O2; do
+            dx=(); [[ $driver == "$ccc" ]] || dx=(-B"$as_dir/")
+            cx=(); [[ $callee == "$ccc" ]] || cx=(-B"$as_dir/")
+            "$driver" "${fc_flags[@]}" "${dx[@]}" -$opt -c "$tmp/fc_driver.c" -o "$tmp/fc_driver.o"
+            "$callee" "${fc_flags[@]}" "${cx[@]}" -$opt -c "$tmp/fc_callee.c" -o "$tmp/fc_callee.o"
+            "$linker" -m elf_i386 -static -e _start "$tmp/start.o" "$tmp/fc_driver.o" "$tmp/fc_callee.o" -o "$tmp/fc"
+            rc=0; "$tmp/fc" || rc=$?
+            [[ $rc -eq 0 ]] || {
+                echo "FAIL: fastcall vector ABI driver=$(basename "$driver") callee=$(basename "$callee") -$opt: rc=$rc" >&2
+                exit 1
+            }
+        done
+    done
+done
+echo 'ok: fastcall native-vector ABI, GCC/lccc driver x callee at -O0/-O2'
 echo 'PASS: i686 GNU vector SSE XMM ABI (strict) and pre-SSE/no-SSE stack/sret ABI, indirect calls, stack overflow, variadics and typed shuffles (latched forks)'
 

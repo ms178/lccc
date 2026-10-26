@@ -819,7 +819,7 @@ impl I686Codegen {
         // flds); F64 sources are 8 bytes and MUST be loaded with fldl -
         // the historical flds path read only half the double and produced
         // garbage (GLM audit BUG-3). Unsigned sources beyond i64 range
-        // still saturate per fisttpq semantics; the i686 frontend rejects
+        // still saturate per the 64-bit truncating store; the i686 frontend rejects
         // __int128 so this path is only reachable from internal IR.
         if from_ty == IrType::F64 {
             self.state.emit("    subl $8, %esp");
@@ -843,7 +843,7 @@ impl I686Codegen {
                 }
             }
             self.state.emit("    fldl (%esp)");
-            self.state.emit("    fisttpq (%esp)");
+            self.emit_x87_truncating_store('q');
             self.state.emit("    movl (%esp), %eax");
             self.state.emit("    movl 4(%esp), %edx");
             self.state.emit("    addl $8, %esp");
@@ -852,7 +852,7 @@ impl I686Codegen {
             self.state.emit("    subl $8, %esp");
             self.state.emit("    movl %eax, (%esp)");
             self.state.emit("    flds (%esp)");
-            self.state.emit("    fisttpq (%esp)");
+            self.emit_x87_truncating_store('q');
             self.state.emit("    movl (%esp), %eax");
             self.state.emit("    movl 4(%esp), %edx");
             self.state.emit("    addl $8, %esp");

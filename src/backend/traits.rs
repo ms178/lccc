@@ -1351,6 +1351,9 @@ pub trait ArchCodegen {
         // Publish the callee's variadic-ness so the argument emitter knows
         // whether the %al SSE-count setup is architecturally required.
         self.state().call_is_variadic = is_variadic;
+        self.state().call_passes_wide_vector = arg_classes
+            .iter()
+            .any(|class| matches!(class, CallArgClass::StructXmmReg { size, .. } if *size > 16));
         self.emit_call_reg_args(
             args,
             &arg_classes,

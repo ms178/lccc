@@ -30,8 +30,13 @@ def main():
         tmp = Path(tmp)
         for mode in args.target or ('m64', 'm32'):
             target = '-' + mode
-            for bits, isa in ((128, ['-msse4.2']), (256, ['-mavx', '-mno-avx2']), (256, ['-mavx2'])):
-                for kind in range(3):
+            # __m64 (BITS=64) is one type. On i686, GCC passes it in MMX
+            # registers unless -mno-mmx; lccc never enables MMX, so both
+            # compilers get -mno-mmx there (GCC's documented psABI variant).
+            mmx = ['-mno-mmx'] if mode == 'm32' else []
+            for bits, isa, kinds in ((64, ['-msse4.2', *mmx], 1), (128, ['-msse4.2'], 3),
+                                     (256, ['-mavx', '-mno-avx2'], 3), (256, ['-mavx2'], 3)):
+                for kind in range(kinds):
                     for opt in ('-O0', '-O2'):
                         flags = [target, opt, *isa, f'-DBITS={bits}', f'-DKIND={kind}']
                         objects = {}

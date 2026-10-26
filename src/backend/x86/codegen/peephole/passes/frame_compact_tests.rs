@@ -259,3 +259,228 @@ fn a_tls_descriptor_call_keeps_the_alignment_frame_and_its_live_values() {
         assert_eq!(count(&out, line), 1, "{line}\n{out}");
     }
 }
+
+// ── D. callee-saved pushes before the frame, and exact CFI on every row ────
+
+/// The CFA rows of `out`, in order.
+fn cfa_rows(out: &str) -> Vec<i64> {
+    out.lines()
+        .filter_map(|l| l.trim().strip_prefix(".cfi_def_cfa_offset "))
+        .map(|v| v.trim().parse().unwrap())
+        .collect()
+}
+
+/// A pointer walk that keeps `%rbx` live (the FPO dead-save pass must not
+/// remove the push these tests are about).
+const RBX_LOOP: &str = concat!(
+    "    movq %rdi, %rbx\n",
+    "    xorl %eax, %eax\n",
+    ".Lloop:\n",
+    "    addq (%rbx), %rax\n",
+    "    addq $8, %rbx\n",
+    "    decq %rsi\n",
+    "    jne .Lloop\n",
+);
+
+#[test]
+fn a_dead_frame_in_a_multi_exit_leaf_rewrites_the_post_ret_cfa_row() {
+    // The codegen restates the full-frame CFA after a mid-body `ret` for
+    // the block that follows. Rewriting only the prologue's row left
+    // `.cfi_def_cfa_offset 24` there while %rsp sat at CFA-8: an unwinder
+    // (gdb, perf, -fexceptions) read the return address from the wrong slot.
+    let out = run(&f(concat!(
+        "    subq $16, %rsp\n",
+        "    .cfi_def_cfa_offset 24\n",
+        "    testl %edi, %edi\n",
+        "    je .Lzero\n",
+        "    movl %edi, %eax\n",
+        "    addq $16, %rsp\n",
+        "    .cfi_def_cfa_offset 8\n",
+        "    ret\n",
+        "    .cfi_def_cfa_offset 24\n",
+        ".Lzero:\n",
+        "    movl %esi, %eax\n",
+        "    addq $16, %rsp\n",
+        "    .cfi_def_cfa_offset 8\n",
+        "    ret",
+    )));
+    assert_eq!(count(&out, "subq $16, %rsp"), 0, "{}", out);
+    assert_eq!(count(&out, "addq $16, %rsp"), 0, "{}", out);
+    assert!(
+        cfa_rows(&out).iter().all(|&v| v == 8),
+        "stale CFA row:\n{}",
+        out
+    );
+}
+
+#[test]
+fn a_dead_frame_under_live_pushes_folds_with_exact_cfi() {
+    // `wsum`/`utf8_scan` shape: a live callee-saved push, then a frame no
+    // line references, two exits.
+    let out = run(&f(&format!(
+        "{}{}{}",
+        concat!(
+            "    pushq %rbx\n",
+            "    .cfi_def_cfa_offset 16\n",
+            "    .cfi_offset %rbx, -16\n",
+            "    subq $16, %rsp\n",
+            "    .cfi_def_cfa_offset 32\n",
+            "    testq %rsi, %rsi\n",
+            "    je .Lnone\n",
+        ),
+        RBX_LOOP,
+        concat!(
+            "    addq $16, %rsp\n",
+            "    .cfi_def_cfa_offset 16\n",
+            "    popq %rbx\n",
+            "    .cfi_def_cfa_offset 8\n",
+            "    ret\n",
+            "    .cfi_def_cfa_offset 32\n",
+            ".Lnone:\n",
+            "    xorl %eax, %eax\n",
+            "    addq $16, %rsp\n",
+            "    .cfi_def_cfa_offset 16\n",
+            "    popq %rbx\n",
+            "    .cfi_def_cfa_offset 8\n",
+            "    ret",
+        ),
+    )));
+    assert_eq!(count(&out, "subq $16, %rsp"), 0, "{}", out);
+    assert_eq!(count(&out, "addq $16, %rsp"), 0, "{}", out);
+    assert_eq!(count(&out, "pushq %rbx"), 1, "{}", out);
+    assert_eq!(count(&out, "popq %rbx"), 2, "{}", out);
+    assert_eq!(count(&out, ".cfi_offset %rbx, -16"), 1, "{}", out);
+    // push → 16; first exit pops → 8; the second block restates 16 and
+    // pops → 8. No 32 survives and no row restates the value in effect.
+    assert_eq!(cfa_rows(&out), vec![16, 8, 16, 8], "{}", out);
+}
+
+#[test]
+fn a_calling_frame_under_one_push_is_deleted_when_the_push_aligns() {
+    // 8 (return address) + 8 (push) ≡ 0 (mod 16): the 16-byte frame is pure
+    // padding even with a call.
+    let out = run(&f(concat!(
+        "    pushq %rbx\n",
+        "    .cfi_def_cfa_offset 16\n",
+        "    .cfi_offset %rbx, -16\n",
+        "    subq $16, %rsp\n",
+        "    .cfi_def_cfa_offset 32\n",
+        "    movq %rdi, %rbx\n",
+        "    call g\n",
+        "    addq %rbx, %rax\n",
+        "    addq $16, %rsp\n",
+        "    .cfi_def_cfa_offset 16\n",
+        "    popq %rbx\n",
+        "    .cfi_def_cfa_offset 8\n",
+        "    ret",
+    )));
+    assert_eq!(count(&out, "subq $16, %rsp"), 0, "{}", out);
+    assert_eq!(count(&out, "addq $16, %rsp"), 0, "{}", out);
+    assert_eq!(cfa_rows(&out), vec![16, 8], "{}", out);
+}
+
+#[test]
+fn a_calling_frame_under_two_pushes_shrinks_to_the_alignment_slot() {
+    // 8 + 16 + 24 = 48 ≡ 0 (mod 16); the minimum with that residue is 8.
+    let out = run(&f(concat!(
+        "    pushq %rbx\n",
+        "    .cfi_def_cfa_offset 16\n",
+        "    .cfi_offset %rbx, -16\n",
+        "    pushq %r12\n",
+        "    .cfi_def_cfa_offset 24\n",
+        "    .cfi_offset %r12, -24\n",
+        "    subq $24, %rsp\n",
+        "    .cfi_def_cfa_offset 48\n",
+        "    movq %rdi, %rbx\n",
+        "    movq %rsi, %r12\n",
+        "    call g\n",
+        "    addq %rbx, %rax\n",
+        "    addq %r12, %rax\n",
+        "    addq $24, %rsp\n",
+        "    .cfi_def_cfa_offset 24\n",
+        "    popq %r12\n",
+        "    .cfi_def_cfa_offset 16\n",
+        "    popq %rbx\n",
+        "    .cfi_def_cfa_offset 8\n",
+        "    ret",
+    )));
+    assert_eq!(count(&out, "subq $8, %rsp"), 1, "{}", out);
+    assert_eq!(count(&out, "addq $8, %rsp"), 1, "{}", out);
+    assert_eq!(count(&out, "$24, %rsp"), 0, "{}", out);
+    assert_eq!(cfa_rows(&out), vec![16, 24, 32, 24, 16, 8], "{}", out);
+}
+
+#[test]
+fn pushed_frame_refusals() {
+    let framed = |prologue: &str, epilogue: &str| f(&format!("{prologue}{RBX_LOOP}{epilogue}"));
+    let push_sub = concat!(
+        "    pushq %rbx\n",
+        "    .cfi_def_cfa_offset 16\n",
+        "    .cfi_offset %rbx, -16\n",
+        "    subq $16, %rsp\n",
+        "    .cfi_def_cfa_offset 32\n",
+    );
+    let exit = concat!(
+        "    addq $16, %rsp\n",
+        "    .cfi_def_cfa_offset 16\n",
+        "    popq %rbx\n",
+        "    .cfi_def_cfa_offset 8\n",
+        "    ret",
+    );
+    let cases = [
+        (
+            "misaligned call frame (8 + 8 + 8 is not a multiple of 16)",
+            framed(
+                concat!(
+                    "    pushq %rbx\n",
+                    "    .cfi_def_cfa_offset 16\n",
+                    "    .cfi_offset %rbx, -16\n",
+                    "    subq $8, %rsp\n",
+                    "    .cfi_def_cfa_offset 24\n",
+                    "    call g\n",
+                ),
+                concat!(
+                    "    addq $8, %rsp\n",
+                    "    .cfi_def_cfa_offset 16\n",
+                    "    popq %rbx\n",
+                    "    .cfi_def_cfa_offset 8\n",
+                    "    ret",
+                ),
+            ),
+            "$8, %rsp",
+        ),
+        (
+            "an epilogue that pops fewer registers than were pushed",
+            framed(push_sub, "    addq $16, %rsp\n    ret"),
+            "$16, %rsp",
+        ),
+        (
+            "a body pop outside any epilogue",
+            framed(push_sub, &format!("    pushq %rax\n    popq %rcx\n{exit}")),
+            "$16, %rsp",
+        ),
+        (
+            "a frame-pointer prologue",
+            framed(
+                concat!(
+                    "    pushq %rbp\n",
+                    "    movq %rsp, %rbp\n",
+                    "    pushq %rbx\n",
+                    "    subq $16, %rsp\n",
+                ),
+                "    addq $16, %rsp\n    popq %rbx\n    popq %rbp\n    ret",
+            ),
+            "$16, %rsp",
+        ),
+        (
+            "a CFA row between the push region and the frame total",
+            framed(push_sub, &format!("    .cfi_def_cfa_offset 24\n{exit}")),
+            "$16, %rsp",
+        ),
+    ];
+    for (why, input, kept) in cases {
+        let out = run(&input);
+        assert_eq!(count(&out, &format!("subq {kept}")), 1, "{why}:\n{out}");
+        assert_eq!(count(&out, &format!("addq {kept}")), 1, "{why}:\n{out}");
+    }
+}

@@ -402,6 +402,9 @@ impl I686Codegen {
                     _ => unreachable!("invalid native vector argument width"),
                 };
                 emit!(self.state, "    {} (%eax), %{}", instruction, register);
+                if *size > 16 {
+                    self.state.dirty_upper_ymm = true;
+                }
             }
         }
         if self.current_call_regparm == 0 {
@@ -593,6 +596,14 @@ impl I686Codegen {
     ) {
         // x87 registers are caller-saved: drop any cached st(0) copy first.
         self.flush_x87_pending_copy();
+        // Clean dirty upper YMM state before the call, as GCC 16.2 does on
+        // i386 too; a YMM/ZMM argument (`call_passes_wide_vector`) is the
+        // one live upper half and suppresses it. The x86-64 twin
+        // (`emit_vzeroupper_before_call`) documents the soundness argument
+        // and why the flag stays set after the call.
+        if self.state.dirty_upper_ymm && !self.state.call_passes_wide_vector {
+            self.state.emit("    vzeroupper");
+        }
         if let Some(name) = direct_name {
             if self.state.needs_got_call(name) {
                 let n = name.split('@').next().unwrap_or(name);

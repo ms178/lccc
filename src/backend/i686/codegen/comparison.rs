@@ -564,22 +564,36 @@ impl I686Codegen {
             self.store_eax_to(dest);
             return;
         }
-        // F32: Use SSE for float comparisons
         let swap_operands = matches!(
             op,
             IrCmpOp::Slt | IrCmpOp::Ult | IrCmpOp::Sle | IrCmpOp::Ule
         );
-        let (first, second) = if swap_operands {
-            (rhs, lhs)
+        if self.sse2_scalar_enabled {
+            // F32 with SSE2: UCOMISS on the `movd`-transferred bits.
+            let (first, second) = if swap_operands {
+                (rhs, lhs)
+            } else {
+                (lhs, rhs)
+            };
+            self.operand_to_eax(first);
+            self.state.emit("    movd %eax, %xmm0");
+            self.operand_to_ecx(second);
+            self.state.emit("    movd %ecx, %xmm1");
+            self.state.emit("    ucomiss %xmm1, %xmm0");
         } else {
-            (lhs, rhs)
-        };
-
-        self.operand_to_eax(first);
-        self.state.emit("    movd %eax, %xmm0");
-        self.operand_to_ecx(second);
-        self.state.emit("    movd %ecx, %xmm1");
-        self.state.emit("    ucomiss %xmm1, %xmm0");
+            // F32 without SSE2: the F64 x87 shape. FLDS widens exactly,
+            // so FUCOMIP orders the F32 values identically to UCOMISS
+            // (unordered sets ZF=PF=CF=1, quiet NaNs raise nothing).
+            let (first, second) = if swap_operands {
+                (lhs, rhs)
+            } else {
+                (rhs, lhs)
+            };
+            self.emit_f32_load_to_x87(first);
+            self.emit_f32_load_to_x87(second);
+            self.state.emit("    fucomip %st(1), %st");
+            self.state.emit("    fstp %st(0)");
+        }
 
         match op {
             IrCmpOp::Eq => {

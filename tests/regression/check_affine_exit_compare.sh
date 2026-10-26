@@ -97,10 +97,17 @@ grep -qF '[ROT] candidate:' "$work/bothkilled.dbg" \
     || bad "rotation did not run with both fold owners disabled"
 
 # ---------------------------------------------------------------- contract 3
+# The SCALAR folded loop: with the vectorizer unscheduled (which also
+# unschedules the pre-vectorizer fold) the late fold and the compare-branch
+# fusion own f_const's shape.
 note "contract 3: f_const is the folded loop rotated and unrotated"
 body() { awk -v sym="^$2:" ' $0 ~ sym { inside=1 } inside { print } inside && /\.size/ { exit }' "$1"; }
-rot_body=$(body "$work/rot.s" f_const)
-norot_body=$(body "$work/norot.s" f_const)
+CCC_DISABLE_PASSES=vectorize CCC_LOOP_ROTATE=1 "$CCC" -O2 -march=x86-64-v3 -S "$corpus" \
+    -o "$work/rot3.s" || bad "rotated scalar -S build failed"
+CCC_DISABLE_PASSES=vectorize "$CCC" -O2 -march=x86-64-v3 -S "$corpus" \
+    -o "$work/norot3.s" || bad "unrotated scalar -S build failed"
+rot_body=$(body "$work/rot3.s" f_const)
+norot_body=$(body "$work/norot3.s" f_const)
 
 grep -qE "cmpq \\\$2044, %rdx" <<< "$rot_body" \
     || bad "rotated f_const: no folded compare (\`cmpq \$2044, %rdx\`)"
@@ -128,8 +135,29 @@ grep -q "2048" <<< "$norot_body" \
 grep -qE "cmpq \\\$2044, %rdx" <<< "$norot_body" \
     || bad "unrotated f_const: no folded compare (\`cmpq \$2044, %rdx\`)"
 
+# ---------------------------------------------------------------- contract 4
+# The default pipeline folds BEFORE the vectorizer, so the folded bound is
+# what the byte-sum vectorizer sees: f_const runs ⌊2044/32⌋·32 = 2016 bytes
+# packed (x86-64-v3: 32 lanes) and its remainder stops at the folded 2044.
+# The unfolded `i + 4 < 2048` would have stayed scalar (the vectorizer needs
+# a bare-IV bound), so this also pins the reason the early run exists.
+note "contract 4: the folded bound reaches the vectorizer (rotated and unrotated)"
+for which in rot norot; do
+    vec_body=$(body "$work/$which.s" f_const)
+    grep -qE "vpsadbw" <<< "$vec_body" \
+        || bad "$which f_const: not vectorized (no vpsadbw) — the early fold did not reach the vectorizer"
+    grep -qE "cmpq \\\$2016, %r" <<< "$vec_body" \
+        || bad "$which f_const: no packed bound \$2016 = floor(2044/32)*32"
+    grep -qE "cmpq \\\$2044, %r" <<< "$vec_body" \
+        || bad "$which f_const: the remainder does not stop at the folded bound \$2044"
+    grep -q "2048" <<< "$vec_body" \
+        && bad "$which f_const: the unfolded bound (\$2048) survived"
+    grep -qE "leaq 4\(" <<< "$vec_body" \
+        && bad "$which f_const: the offset materialisation (\`leaq 4(...)\`) survived"
+done
+
 if [[ $fail -ne 0 ]]; then
     echo "check_affine_exit_compare: FAILED" >&2
     exit 1
 fi
-echo "check_affine_exit_compare: PASS (oracle parity, counted proof-based fold, f_const folded rotated and unrotated)"
+echo "check_affine_exit_compare: PASS (oracle parity, counted proof-based fold, f_const folded rotated and unrotated, folded bound vectorized)"

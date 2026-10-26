@@ -56,7 +56,7 @@
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
-use crate::ir::reexports::{CallInfo, Instruction, IrFunction};
+use crate::ir::reexports::{CallInfo, Instruction, IrFunction, IrModule};
 
 // Canonical GP family bits (the peephole numbering, `REG_NAMES`).
 const RAX: u16 = 1 << 0;
@@ -150,6 +150,48 @@ pub(crate) struct IpaRaState {
     trace: bool,
     /// Caller -> (keep families, callee symbols its calls name).
     records: FxHashMap<String, (u16, Vec<String>)>,
+    /// Symbols whose final binding the `IrFunction` does not decide (see
+    /// [`module_opaque_symbols`]); never summarized.
+    opaque_symbols: FxHashSet<String>,
+}
+
+/// Symbols whose link-time binding is decided outside their `IrFunction`,
+/// so the emitted body need not be what a direct call reaches:
+/// - `#pragma weak f` and a weak redeclaration after the definition land in
+///   `symbol_attrs` (emitted as `.weak f`), not in `IrFunction::is_weak`; a
+///   strong definition elsewhere then replaces the body at link time;
+/// - a `symbol_attrs` visibility that is not hidden/internal/protected;
+/// - any identifier named by top-level asm (`asm(".weak f")`, `.set`, ...),
+///   matched under its C name and its asm label.
+pub(crate) fn module_opaque_symbols(module: &IrModule) -> FxHashSet<String> {
+    let mut out: FxHashSet<String> = module
+        .symbol_attrs
+        .iter()
+        .filter(|(_, is_weak, vis)| {
+            *is_weak
+                || !matches!(
+                    vis.as_deref(),
+                    None | Some("hidden" | "internal" | "protected")
+                )
+        })
+        .map(|(name, _, _)| name.clone())
+        .collect();
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '$');
+    let tokens: FxHashSet<&str> = module
+        .toplevel_asm
+        .iter()
+        .flat_map(|a| a.split(|c: char| !is_ident(c)))
+        .filter(|t| !t.is_empty())
+        .collect();
+    out.extend(tokens.iter().map(|t| (*t).to_string()));
+    out.extend(
+        module
+            .asm_labels
+            .iter()
+            .filter(|(_, label)| tokens.contains(label.as_str()))
+            .map(|(name, _)| name.clone()),
+    );
+    out
 }
 
 /// Whether a direct call made BY the module being emitted is guaranteed
@@ -238,6 +280,12 @@ impl IpaRaState {
         self.enabled
     }
 
+    /// Exclude `symbols` from summarization ([`module_opaque_symbols`]).
+    pub(crate) fn with_opaque_symbols(mut self, symbols: FxHashSet<String>) -> Self {
+        self.opaque_symbols = symbols;
+        self
+    }
+
     /// Record the summary of a function whose final emission is `text`.
     pub(crate) fn note_function_emitted(
         &mut self,
@@ -248,6 +296,7 @@ impl IpaRaState {
         if !self.enabled
             || !summarizable(func, binds_locally)
             || self.poisoned_callees.contains(&func.name)
+            || self.opaque_symbols.contains(&func.name)
         {
             return;
         }
@@ -1145,6 +1194,44 @@ mod tests {
         let mut s = info(&[IrType::Ptr], IrType::Void);
         s.struct_arg_sizes = vec![Some(24)];
         assert_eq!(call_staging(&s), None);
+    }
+
+    /// Every route by which a symbol's link-time binding escapes its
+    /// `IrFunction` makes it opaque; a local visibility does not.
+    #[test]
+    fn opaque_symbols_cover_every_out_of_function_binding() {
+        let mut m = IrModule::new();
+        m.symbol_attrs.push(("pw".into(), true, None));
+        m.symbol_attrs
+            .push(("hid".into(), false, Some("hidden".into())));
+        m.symbol_attrs
+            .push(("prot".into(), false, Some("protected".into())));
+        m.symbol_attrs
+            .push(("dflt".into(), false, Some("default".into())));
+        m.toplevel_asm.push(".weak ta\n.set alias_x, other".into());
+        m.toplevel_asm.push("\t.weak\tasm_cname".into());
+        m.asm_labels.insert("cname".into(), "asm_cname".into());
+        m.asm_labels.insert("quiet".into(), "asm_quiet".into());
+        let o = module_opaque_symbols(&m);
+        for s in ["pw", "dflt", "ta", "alias_x", "other", "asm_cname", "cname"] {
+            assert!(o.contains(s), "{s} must be opaque: {o:?}");
+        }
+        for s in ["hid", "prot", "quiet", "asm_quiet"] {
+            assert!(!o.contains(s), "{s} must stay summarizable: {o:?}");
+        }
+    }
+
+    #[test]
+    fn opaque_symbol_is_never_summarized() {
+        let f = IrFunction::new("leaf".into(), IrType::I64, Vec::new(), false);
+        let text = "leaf:\n    movq %rdi, %rax\n    ret\n";
+        let mut st = IpaRaState::new(true, FxHashSet::default(), FxHashSet::default(), false);
+        st.note_function_emitted(&f, true, text);
+        assert!(st.summaries.contains_key("leaf"), "control must summarize");
+        let mut st = IpaRaState::new(true, FxHashSet::default(), FxHashSet::default(), false)
+            .with_opaque_symbols(std::iter::once("leaf".to_string()).collect());
+        st.note_function_emitted(&f, true, text);
+        assert_eq!(st.summaries.get("leaf"), None);
     }
 
     #[test]

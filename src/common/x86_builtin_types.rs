@@ -242,6 +242,8 @@ pub(crate) fn result_type(name: &str) -> Option<CType> {
         | "__builtin_ia32_movnti"
         | "__builtin_ia32_movnti64"
         | "__builtin_ia32_movntpd"
+        | "__builtin_ia32_movntps"
+        | "__builtin_ia32_movntq"
         | "__builtin_ia32_pause"
         | "__builtin_ia32_sfence"
         | "__builtin_ia32_storedqu"
@@ -283,9 +285,11 @@ pub(crate) fn argument_vector_widths(name: &str) -> Option<&'static [usize]> {
         | "__builtin_ia32_crc32qi"
         | "__builtin_ia32_crc32si"
         | "__builtin_ia32_movnti"
-        | "__builtin_ia32_movnti64" => &[0, 0],
+        | "__builtin_ia32_movnti64"
+        | "__builtin_ia32_movntq" => &[0, 0],
         "__builtin_ia32_movntdq"
         | "__builtin_ia32_movntpd"
+        | "__builtin_ia32_movntps"
         | "__builtin_ia32_storedqu" => &[0, 16],
         "__builtin_ia32_storedqu256" => &[0, 32],
         "__builtin_ia32_aesimc128"
@@ -553,6 +557,7 @@ pub(crate) fn argument_scalar_types(name: &str) -> Option<&'static [Option<IrTyp
         | "__builtin_ia32_psrlwi256"
         | "__builtin_ia32_vextractf128_ps256" => &[None, Some(IrType::I32)],
         "__builtin_ia32_movnti64" => &[None, Some(IrType::I64)],
+        "__builtin_ia32_movntq" => &[None, Some(IrType::U64)],
         "__builtin_ia32_addpd"
         | "__builtin_ia32_addpd256"
         | "__builtin_ia32_addps"
@@ -580,6 +585,7 @@ pub(crate) fn argument_scalar_types(name: &str) -> Option<&'static [Option<IrTyp
         | "__builtin_ia32_minss"
         | "__builtin_ia32_movntdq"
         | "__builtin_ia32_movntpd"
+        | "__builtin_ia32_movntps"
         | "__builtin_ia32_mulpd"
         | "__builtin_ia32_mulpd256"
         | "__builtin_ia32_mulps"

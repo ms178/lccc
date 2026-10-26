@@ -805,11 +805,18 @@ impl X86Codegen {
     /// staged.  `dest`'s unspecified bytes keep whatever the temp held, which the
     /// psABI allows and `rep movsb`-style copies never promised either.
     fn emit_small_aggregate_eightbyte_load(&mut self, off: usize, len: usize, dest: &str) {
+        // MOVQ m64->xmm is SSE2; MOVLPS loads the same eight bytes with SSE1
+        // (`-mno-sse2 -msse`; the upper lanes are not part of the eightbyte).
+        let load = if !self.isa.simd && dest.starts_with("xmm") {
+            "    movlps"
+        } else {
+            "    movq"
+        };
         if len >= 8 {
             // Whole eightbyte: in bounds by construction, and one instruction.
             self.state
                 .out
-                .emit_instr_mem_reg("    movq", off as i64, "rax", dest);
+                .emit_instr_mem_reg(load, off as i64, "rax", dest);
             return;
         }
         debug_assert!(
@@ -838,9 +845,7 @@ impl X86Codegen {
             self.state
                 .emit_fmt(format_args!("    {mn} {ferry}, {}(%rsp)", offset as i64));
         }
-        self.state
-            .out
-            .emit_instr_mem_reg("    movq", 0, "rsp", dest);
+        self.state.out.emit_instr_mem_reg(load, 0, "rsp", dest);
         self.state.emit("    movq 8(%rsp), %rax");
         // The reload above restores the parked %rax value verbatim, but it is
         // still a %rax write to the epoch analyzer; re-sync the park epoch so
@@ -1063,8 +1068,10 @@ impl X86Codegen {
                 hazard_slot.insert(*arg_i, off);
                 let name = super::emit::phys_reg_name(*phys);
                 if *is_fp {
+                    // 8-byte FP spill; MOVLPS is the SSE1 form of MOVSD here.
+                    let mov = if self.isa.simd { "movsd" } else { "movlps" };
                     self.state
-                        .emit_fmt(format_args!("    movsd %{}, {}(%rsp)", name, off));
+                        .emit_fmt(format_args!("    {mov} %{}, {}(%rsp)", name, off));
                 } else {
                     self.state
                         .emit_fmt(format_args!("    movq %{}, {}(%rsp)", name, off));
@@ -1103,8 +1110,9 @@ impl X86Codegen {
             if let Some(&off) = hazard_slot.get(&i) {
                 match &arg_classes[i] {
                     CallArgClass::FloatReg { reg_idx } => {
+                        let mov = if self.isa.simd { "movsd" } else { "movlps" };
                         self.state.emit_fmt(format_args!(
-                            "    movsd {}(%rsp), %{}",
+                            "    {mov} {}(%rsp), %{}",
                             off, xmm_regs[*reg_idx]
                         ));
                         float_count += 1;
@@ -1306,7 +1314,12 @@ impl X86Codegen {
                                             // but eliminated at rename
                                             // instead of a port-5 shuffle.
                                             // D32 is a 4-byte datum like F32.
-                                            let f32ish = matches!(ty, IrType::F32 | IrType::D32);
+                                            // MOVAPD is SSE2: without it
+                                            // (`-mno-sse2 -msse`, an 8-byte
+                                            // vector argument) MOVAPS copies
+                                            // the same 128 bits.
+                                            let f32ish = matches!(ty, IrType::F32 | IrType::D32)
+                                                || !self.isa.simd;
                                             let mv = match (f32ish, self.isa.avx) {
                                                 (true, true) => "vmovaps",
                                                 (true, false) => "movaps",
@@ -1513,6 +1526,26 @@ impl X86Codegen {
         }
     }
 
+    /// Clean dirty upper YMM state before an ordinary call, as GCC 16.2 and
+    /// Clang 23.1.4 do: a legacy-SSE callee otherwise runs every XMM write
+    /// with a merge and a false dependency on the upper half (Skylake and
+    /// later, including the Raptor Lake target) or pays a ~70-cycle state
+    /// transition (Haswell/Broadwell). Sound because SysV keeps no vector
+    /// value in a register across a call: every XMM/YMM register is
+    /// caller-saved and the allocator refuses call-spanning vector homes
+    /// (`spans_any_call`). A YMM/ZMM argument is the one live upper half and
+    /// suppresses it (`call_passes_wide_vector`).
+    ///
+    /// `dirty_upper_ymm` stays set after the call. It is tracked in emission
+    /// order, not per path, so clearing it here would let a path that
+    /// bypasses this call return dirty; the epilogue `vzeroupper` that may
+    /// follow is cheap and never wrong.
+    fn emit_vzeroupper_before_call(&mut self) {
+        if self.state.dirty_upper_ymm && !self.state.call_passes_wide_vector {
+            self.state.emit("    vzeroupper");
+        }
+    }
+
     pub(super) fn emit_call_instruction_impl(
         &mut self,
         direct_name: Option<&str>,
@@ -1540,6 +1573,10 @@ impl X86Codegen {
             }) => Some(*preserve_upper_vector_lanes),
             _ => None,
         };
+        // A sibcall cleans at its `jmp` (returns.rs), not here.
+        if preserve_upper_vector_lanes.is_none() {
+            self.emit_vzeroupper_before_call();
+        }
         if let Some(preserve_upper_vector_lanes) = preserve_upper_vector_lanes {
             let target = if let Some(name) = direct_name {
                 if self.state.needs_got_call(name) {
@@ -2023,6 +2060,13 @@ impl X86Codegen {
         }
         if is_i128_type(return_type) {
             use crate::common::types::EightbyteClass;
+            // MOVQ xmm->m64 is SSE2; MOVLPS stores the same eight bytes with
+            // SSE1 (`-mno-sse2 -msse`).
+            let xmm_store = if self.isa.simd {
+                "    movq"
+            } else {
+                "    movlps"
+            };
             if self.call_ret_classes.len() == 2 {
                 let (c0, c1) = (self.call_ret_classes[0], self.call_ret_classes[1]);
                 match (c0, c1) {
@@ -2034,7 +2078,7 @@ impl X86Codegen {
                             // was an FP-domain round-trip for no reason.
                             self.state
                                 .out
-                                .emit_instr_reg_rbp("    movq", "xmm0", slot.0 + 8);
+                                .emit_instr_reg_rbp(xmm_store, "xmm0", slot.0 + 8);
                         }
                         self.state.reg_cache.invalidate_all();
                         self.flush_pending_vec_store_impl();
@@ -2044,9 +2088,7 @@ impl X86Codegen {
                         if let Some(slot) = self.state.get_slot(dest.0) {
                             // Direct xmm0→slot store (baseline SSE2 movq);
                             // no GPR relay.
-                            self.state
-                                .out
-                                .emit_instr_reg_rbp("    movq", "xmm0", slot.0);
+                            self.state.out.emit_instr_reg_rbp(xmm_store, "xmm0", slot.0);
                             self.state
                                 .out
                                 .emit_instr_reg_rbp("    movq", "rax", slot.0 + 8);
@@ -2060,12 +2102,10 @@ impl X86Codegen {
                             // Both halves are SSE: two direct xmm stores,
                             // replacing the double movq→rax relay (2 extra
                             // insns and two false GPR dependencies).
+                            self.state.out.emit_instr_reg_rbp(xmm_store, "xmm0", slot.0);
                             self.state
                                 .out
-                                .emit_instr_reg_rbp("    movq", "xmm0", slot.0);
-                            self.state
-                                .out
-                                .emit_instr_reg_rbp("    movq", "xmm1", slot.0 + 8);
+                                .emit_instr_reg_rbp(xmm_store, "xmm1", slot.0 + 8);
                         }
                         self.state.reg_cache.invalidate_all();
                         self.flush_pending_vec_store_impl();
@@ -2107,11 +2147,11 @@ impl X86Codegen {
     }
 
     pub(super) fn emit_call_move_f32_to_acc_impl(&mut self) {
-        self.state.emit("    movd %xmm0, %eax");
+        self.emit_scalar_xmm_to_gpr("xmm0", "rax", Some("eax"));
     }
 
     pub(super) fn emit_call_move_f64_to_acc_impl(&mut self) {
-        self.state.emit("    movq %xmm0, %rax");
+        self.emit_scalar_xmm_to_gpr("xmm0", "rax", None);
     }
 }
 

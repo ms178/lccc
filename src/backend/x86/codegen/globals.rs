@@ -99,6 +99,34 @@ impl X86Codegen {
             }
         }
 
+        // Non-PIC: the symbol is a sign-extended disp32 (small and kernel
+        // code models), so `leaq sym(%off), %dst` adds the offset in the
+        // same instruction (one LEA instead of LEA+ADD, and no aliasing
+        // hazard between the offset and the result). The I64 derivation's
+        // offset register already holds the full 64-bit value, exactly what
+        // the `addq` form below reads.
+        if !self.state.pic_mode && !subtract {
+            if let Some(off_reg) = self.operand_reg(offset).filter(|r| !is_xmm_reg(*r)) {
+                let target = self
+                    .dest_reg(dest)
+                    .filter(|r| !is_xmm_reg(*r))
+                    .map(phys_reg_name)
+                    .unwrap_or("rax");
+                self.state.out.emit_instr_sym_base_reg(
+                    "    leaq",
+                    name,
+                    phys_reg_name(off_reg),
+                    target,
+                );
+                if target == "rax" {
+                    self.store_rax_to(dest);
+                } else {
+                    self.state.reg_cache.invalidate_acc();
+                }
+                return true;
+            }
+        }
+
         // The common case has both the offset and result in allocated GPRs.
         // Materialize the base straight into the result and consume the offset
         // there, unless the two homes alias (which would destroy the offset).

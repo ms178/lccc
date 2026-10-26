@@ -320,10 +320,14 @@ pub struct Driver {
     /// consulted at resolve time and survive the reset untouched.
     pub(super) x86_explicit_isa_args: Vec<String>,
     pub(super) skip_rax_setup: bool,
-    /// -mno-80387/-mno-fp-ret-in-387: no x87 instructions or x87 FP returns.
-    /// Recorded so FP codegen can fail closed on long-double paths.
-    #[allow(dead_code)]
+    /// GCC's MASK_80387 cleared (`-mno-80387`, `-msoft-float`,
+    /// `-mgeneral-regs-only`; last-wins against `-m80387`/`-mhard-float`):
+    /// x87 instructions are fenced out of the final text.
     pub(super) no_x87: bool,
+    /// `-mno-fp-ret-in-387`: x87 arithmetic stays legal, but FP values are
+    /// not returned in `%st(0)`. lccc does not implement the GPR return
+    /// convention, so every function boundary that would need it is refused.
+    pub(super) no_fp_ret_in_387: bool,
     /// -mindirect-branch=thunk-inline: expand the full retpoline at each
     /// indirect branch site (kernel vDSO: userspace code, no kernel thunks).
     pub(super) indirect_branch_thunk_inline: bool,
@@ -669,6 +673,7 @@ impl Driver {
             x86_explicit_isa_args: Vec::new(),
             skip_rax_setup: false,
             no_x87: false,
+            no_fp_ret_in_387: false,
             indirect_branch_thunk_inline: false,
             indirect_branch_cs_prefix: false,
             enable_sse3: false,
@@ -3355,7 +3360,13 @@ impl Driver {
             // Legacy bulk-memory/vararg helpers use SSE2 integer moves.
             // Keep those paths off after an SSE2 denial, independently of
             // the SSE1 scalar operations permitted by the driver flags.
-            no_sse: self.no_sse || self.no_sse2,
+            no_sse: self.no_sse
+                || self.no_sse2
+                || (self.target == Target::I686 && !self.resolved_i686_sse()),
+            i686_no_sse2: self.target == Target::I686
+                && (self.general_regs_only || !self.resolved_i686_sse2()),
+            i686_no_sse3: self.target == Target::I686
+                && (self.general_regs_only || !self.resolved_i686_sse3()),
             general_regs_only: self.general_regs_only,
             code_model_kernel: self.code_model_kernel,
             no_jump_tables: self.no_jump_tables,
@@ -3447,6 +3458,96 @@ impl Driver {
                      but SSE2 is disabled (-mno-sse2); x86-64 lccc has no \
                      SSE1/x87 lowering for it (offending instruction: `{}`)",
                     line.trim()
+                ));
+            }
+        }
+        // A function's own `__attribute__((target("...")))` can deny what the
+        // TU allows. x86-64 codegen applies the denial to its vector ISA but
+        // still lowers FP values through SSE (and long double through x87),
+        // and i686 ignores per-function targets altogether, so the same
+        // final-text choke point enforces them per function. GCC 16.2
+        // refuses such functions ("SSE register return with SSE disabled",
+        // "x87 register return with x87 disabled").
+        if matches!(self.target, Target::X86_64 | Target::I686) {
+            if let Some((func, line, unit, attr)) = first_target_attribute_leak(&module, &asm) {
+                return Err(format!(
+                    "{input_file}: in function '{func}': {unit} is disabled by \
+                     __attribute__((target(\"{attr}\"))) and lccc has no lowering of this \
+                     operation without it (offending instruction: `{}`)",
+                    line.trim()
+                ));
+            }
+        }
+        // i686 has x87 lowerings for every scalar FP operation, so the
+        // resolved ISA is a hard contract: a leak of a higher SSE level is a
+        // backend bug that would be #UD on the silicon the user targeted
+        // (`-march=i686`, `-mno-sse*`, or the default `-m32` = x86-64-v1,
+        // which has SSE2 but not SSE3). Fail closed instead.
+        if self.target == Target::I686 {
+            // Keyed on the resolved ISA, not on codegen policy: a later
+            // grant revives a level after `-mgeneral-regs-only` (GCC
+            // semantics), and user intrinsics may then use it even though
+            // lccc's own scalar lowering conservatively stays on x87.
+            // A function's own target() grant lifts the floor for that
+            // function only (GCC accepts `target("sse2")` under `-mno-sse2`);
+            // its neighbours stay checked, and denials remain the job of
+            // first_target_attribute_leak above.
+            let grants: std::collections::HashMap<&str, [bool; 3]> = module
+                .functions
+                .iter()
+                .filter(|f| !f.target_features.is_empty())
+                .map(|f| (f.name.as_str(), i686_target_sse_grants(&f.target_features)))
+                .collect();
+            let granted = |func: &str, level: usize| grants.get(func).is_some_and(|g| g[level]);
+            let leak = (!self.resolved_i686_sse())
+                .then(|| first_xmm_reference_if(&asm, |func, _| !granted(func, 0)))
+                .flatten()
+                .map(|hit| (hit, "SSE"))
+                .or_else(|| {
+                    (!self.resolved_i686_sse2())
+                        .then(|| first_sse2_reference_unless(&asm, |func| granted(func, 1)))
+                        .flatten()
+                        .map(|hit| (hit, "SSE2"))
+                })
+                .or_else(|| {
+                    (!self.resolved_i686_sse3())
+                        .then(|| first_sse3_reference_unless(&asm, |func| granted(func, 2)))
+                        .flatten()
+                        .map(|hit| (hit, "SSE3"))
+                });
+            if let Some(((func, line), level)) = leak {
+                return Err(format!(
+                    "{input_file}: in function '{func}': instruction requires {level}, \
+                     which the target ISA (-march=/-m flags) does not include \
+                     (offending instruction: `{}`)",
+                    line.trim()
+                ));
+            }
+        }
+        // x87 permission (GCC's MASK_80387). Every x87 instruction lccc
+        // emits carries an FP value (64-bit atomics use cmpxchg8b), so
+        // integer-only translation units — the kernel's `-msoft-float` /
+        // `-mgeneral-regs-only` objects — are unaffected, while FP code is
+        // refused instead of silently using a disabled register file.
+        if matches!(self.target, Target::I686 | Target::X86_64) && self.no_x87 {
+            if let Some((func, line)) = first_x87_reference(&asm) {
+                return Err(format!(
+                    "{input_file}: in function '{func}': floating-point operation requires \
+                     the x87 FPU, which is disabled (-mno-80387 / -msoft-float / \
+                     -mgeneral-regs-only); lccc has no soft-float lowering \
+                     (offending instruction: `{}`)",
+                    line.trim()
+                ));
+            }
+        }
+        if matches!(self.target, Target::I686 | Target::X86_64) && self.no_fp_ret_in_387 {
+            if let Some((func, what)) =
+                first_x87_return_boundary(&module, &asm, self.target == Target::I686)
+            {
+                return Err(format!(
+                    "{input_file}: in function '{func}': {what} uses the x87 \
+                     return register, which -mno-fp-ret-in-387 disables; lccc does \
+                     not implement the general-register FP return convention"
                 ));
             }
         }
@@ -3701,6 +3802,24 @@ impl Driver {
                 || self.enable_avx2
                 || self.enable_avx512f
                 || !self.march_pre_sse)
+    }
+
+    /// Whether this i686 invocation enables the SSE3 level (FISTTP and the
+    /// SSE3 vector forms). SSE3 needs the SSE2 level, and every grant at or
+    /// above it implies it; the denials (`-mno-sse3` and up, `-mno-sse2`,
+    /// `-mno-sse`) clear the grant bits themselves. The default `-m32`
+    /// baseline (`-march=x86-64`, GCC 16.2) has no SSE3, so neither does
+    /// lccc's: FISTTP there is a #UD on SSE2-only silicon (Pentium 4
+    /// Willamette/Northwood, Athlon 64 before revision E).
+    pub(crate) fn resolved_i686_sse3(&self) -> bool {
+        self.resolved_i686_sse2()
+            && (self.enable_sse3
+                || self.enable_ssse3
+                || self.enable_sse4_1
+                || self.enable_sse4_2
+                || self.enable_avx
+                || self.enable_avx2
+                || self.enable_avx512f)
     }
 
     /// Whether the SSE prefetch family (`prefetchnta/t0/t1/t2`, `0F 18
@@ -4164,6 +4283,83 @@ mod arm_simd_reference_tests {
     }
 }
 
+/// The first compiler-generated instruction a function's own
+/// `target("...")` attribute forbids, as `(function, line, unit, entry)`:
+/// `general-regs-only` / `no-sse` deny every XMM/YMM/ZMM form, `no-sse2` the
+/// SSE2 vocabulary (SSE1 stays legal: GCC 16.2 keeps `mulss` there), and
+/// `general-regs-only` / `no-80387` every x87 form. A denial wins over a grant
+/// in the same attribute, as in `X86Isa::with_target_features`, so the fence
+/// and codegen read the attribute alike. Functions absent from the final
+/// text are skipped.
+fn first_target_attribute_leak(
+    module: &crate::ir::module::IrModule,
+    asm: &str,
+) -> Option<(String, String, &'static str, &'static str)> {
+    type Scan = fn(&str) -> Option<(String, String)>;
+    const RULES: [(&[&str], &str, Scan); 3] = [
+        (&["general-regs-only", "no-sse"], "SSE", first_sse_reference),
+        (&["no-sse2"], "SSE2", first_sse2_reference),
+        (
+            &["general-regs-only", "no-80387"],
+            "x87",
+            first_x87_reference,
+        ),
+    ];
+    for func in module
+        .functions
+        .iter()
+        .filter(|f| !f.is_declaration && !f.target_features.is_empty())
+    {
+        let denial = |names: &[&'static str]| {
+            names
+                .iter()
+                .copied()
+                .find(|n| func.target_features.iter().any(|f| f == n))
+        };
+        let mut text = None;
+        let mut sse_denied = false;
+        for (names, unit, scan) in RULES {
+            let Some(entry) = denial(names) else {
+                continue;
+            };
+            // SSE2 is a subset of SSE: a full SSE denial already covers it.
+            if unit == "SSE2" && sse_denied {
+                continue;
+            }
+            sse_denied |= unit == "SSE";
+            let body = text.get_or_insert_with(|| function_text(asm, &func.name));
+            if let Some((name, line)) = scan(body) {
+                return Some((name, line, unit, entry));
+            }
+        }
+    }
+    None
+}
+
+/// The text of function `name`: from its `.type name, @function` line up to
+/// the next function's, empty when it was not emitted.
+fn function_text(asm: &str, name: &str) -> String {
+    fn function_of(line: &str) -> Option<&str> {
+        line.trim_start()
+            .strip_prefix(".type ")
+            .filter(|rest| rest.trim_end().ends_with("@function"))
+            .and_then(|rest| rest.split(',').next())
+            .map(str::trim)
+    }
+    let mut out = String::new();
+    let mut inside = false;
+    for line in asm.lines() {
+        if let Some(f) = function_of(line) {
+            inside = f == name;
+        }
+        if inside {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
 fn first_sse_reference(asm: &str) -> Option<(String, String)> {
     first_xmm_reference_if(asm, |_, _| true)
 }
@@ -4257,6 +4453,150 @@ fn first_xmm_reference_if(
     asm: &str,
     forbidden: impl Fn(&str, &str) -> bool,
 ) -> Option<(String, String)> {
+    first_instruction_if(asm, |function, op, code| {
+        (code.contains("%xmm") || code.contains("%ymm") || code.contains("%zmm"))
+            && forbidden(function, op)
+    })
+}
+
+/// SSE3's vocabulary (the level above SSE2): FISTTP and the horizontal /
+/// duplicate / unaligned-load vector forms. MONITOR/MWAIT are never
+/// compiler-chosen.
+fn first_sse3_reference(asm: &str) -> Option<(String, String)> {
+    first_sse3_reference_unless(asm, |_| false)
+}
+
+fn first_sse3_reference_unless(
+    asm: &str,
+    permitted: impl Fn(&str) -> bool,
+) -> Option<(String, String)> {
+    first_instruction_if(asm, |function, op, _| {
+        !permitted(function)
+            && (op.starts_with("fisttp")
+                || matches!(
+                    op,
+                    "addsubps"
+                        | "addsubpd"
+                        | "haddps"
+                        | "haddpd"
+                        | "hsubps"
+                        | "hsubpd"
+                        | "movddup"
+                        | "movshdup"
+                        | "movsldup"
+                        | "lddqu"
+                ))
+    })
+}
+
+/// `[SSE, SSE2, SSE3]` that a function's own `target()` attribute grants on
+/// i686, on top of the translation unit's resolved floor. Grants imply the
+/// levels below them; `no-sse*` / `general-regs-only` win over grants (the
+/// feature list is sorted, so source order is gone; this matches
+/// `X86Isa::with_target_features`). `arch=` grants only for CPUs
+/// `X86Isa::arch_level` models: its fallback for unknown names is the
+/// x86-64 baseline, a superset of i386/pentium, so such names grant
+/// nothing and the TU floor stays in force. Unmodelled features grant
+/// nothing (fail closed).
+fn i686_target_sse_grants(features: &[String]) -> [bool; 3] {
+    let has = |name: &str| features.iter().any(|f| f == name);
+    if has("no-sse") || has("general-regs-only") {
+        return [false; 3];
+    }
+    let mut grant = [false; 3];
+    if let Some(arch) = features
+        .iter()
+        .filter_map(|f| f.strip_prefix("arch="))
+        .next_back()
+    {
+        let isa = crate::backend::x86::isa::X86Isa::arch_level(arch);
+        if arch == "x86-64" || isa.sse41 {
+            grant = [true, true, isa.sse41];
+        }
+    }
+    for feature in features {
+        match feature.as_str() {
+            "sse" => grant[0] = true,
+            "sse2" => grant[..2].fill(true),
+            "sse3" | "ssse3" | "sse4" | "sse4.1" | "sse4.2" | "avx" | "avx2" | "avx512f"
+            | "avx512bw" | "avx512dq" | "avx512vl" | "fma" => grant = [true; 3],
+            _ => {}
+        }
+    }
+    if has("no-sse2") {
+        grant[1] = false;
+        grant[2] = false;
+    }
+    if has("no-sse3") {
+        grant[2] = false;
+    }
+    grant
+}
+
+/// Any x87 instruction. Every x87 mnemonic (SDM Vol. 2, AT&T suffixes
+/// included) begins with `f`; the only other x86 mnemonics that do are the
+/// FXSAVE/FXRSTOR state images and 3DNow!'s FEMMS, which compute nothing.
+fn first_x87_reference(asm: &str) -> Option<(String, String)> {
+    first_instruction_if(asm, |_, op, _| {
+        op.starts_with('f')
+            && !op.starts_with("fxsave")
+            && !op.starts_with("fxrstor")
+            && op != "femms"
+    })
+}
+
+/// The first EMITTED function whose definition, or one of whose calls,
+/// returns a value in `%st(0)`: long double everywhere, and on i686 also
+/// `float`/`double`. Functions absent from the final text (unused statics)
+/// are skipped, like GCC, which only diagnoses what it emits.
+fn first_x87_return_boundary(
+    module: &crate::ir::module::IrModule,
+    asm: &str,
+    i686: bool,
+) -> Option<(String, String)> {
+    use crate::common::types::IrType;
+    use crate::ir::instruction::Instruction;
+    let in_st0 =
+        |ty: &IrType| ty.is_long_double() || (i686 && matches!(ty, IrType::F32 | IrType::F64));
+    let emitted = |name: &str| {
+        asm.lines().any(|l| {
+            l.strip_suffix(':')
+                .is_some_and(|label| label.trim() == name)
+        })
+    };
+    for func in module.functions.iter().filter(|f| !f.is_declaration) {
+        if !emitted(&func.name) {
+            continue;
+        }
+        if in_st0(&func.return_type) {
+            return Some((
+                func.name.clone(),
+                format!("its {:?} return value", func.return_type),
+            ));
+        }
+        for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+            let what = match inst {
+                Instruction::Call { func: callee, info } if in_st0(&info.return_type) => {
+                    format!("the call to '{callee}' ({:?} result)", info.return_type)
+                }
+                Instruction::CallIndirect { info, .. } if in_st0(&info.return_type) => {
+                    format!("an indirect call ({:?} result)", info.return_type)
+                }
+                _ => continue,
+            };
+            return Some((func.name.clone(), what));
+        }
+    }
+    None
+}
+
+/// First compiler-generated instruction line for which `forbidden(function,
+/// mnemonic, code)` holds, with its enclosing function. User inline assembly (`#APP`
+/// ... `#NO_APP`), comments, directives and labels never count.
+fn first_instruction_if(
+    asm: &str,
+    forbidden: impl Fn(&str, &str, &str) -> bool,
+) -> Option<(String, String)> {
     let mut func = String::from("<toplevel>");
     let mut in_app = false;
     for line in asm.lines() {
@@ -4290,9 +4630,7 @@ fn first_xmm_reference_if(
         }
         let code = t.split('#').next().unwrap_or("");
         let op = code.split_ascii_whitespace().next().unwrap_or("");
-        if (code.contains("%xmm") || code.contains("%ymm") || code.contains("%zmm"))
-            && forbidden(&func, op)
-        {
+        if forbidden(&func, op, code) {
             return Some((func, line.to_string()));
         }
     }
@@ -4301,7 +4639,183 @@ fn first_xmm_reference_if(
 
 #[cfg(test)]
 mod sse_reference_tests {
-    use super::{first_sse_reference, first_sse2_reference};
+    use super::{
+        first_sse_reference, first_sse2_reference, first_sse3_reference, first_x87_reference,
+        first_x87_return_boundary,
+    };
+
+    #[test]
+    fn x87_fence_names_every_x87_form_and_nothing_else() {
+        let prefix = ".type f, @function\nf:\n";
+        for op in [
+            "fldl 4(%esp)",
+            "fstps (%esp)",
+            "fildll (%esp)",
+            "fistpq 8(%esp)",
+            "fnstcw (%esp)",
+            "fucomip %st(1), %st",
+            "fxch %st(1)",
+            "fld1",
+            "fldt (%ecx)",
+            "fcmovbe %st(1), %st",
+        ] {
+            let (func, line) = first_x87_reference(&format!("{prefix}    {op}\n")).unwrap();
+            assert_eq!((func.as_str(), line.trim()), ("f", op));
+        }
+        // Integer code, FP state images, FEMMS, SSE scalar FP, symbols named
+        // like x87 mnemonics, labels and user inline assembly never count.
+        let clean = ".type fldl, @function\nfldl:\n    movl 4(%esp), %eax\n\
+                     fxsave (%eax)\n    fxrstor64 (%rax)\n    femms\n\
+                     addsd %xmm1, %xmm0\n    call fabs\n    lock cmpxchg8b (%esi)\n\
+                     #APP\n    fldz\n#NO_APP\n    # fstp in a comment\n    ret\n";
+        assert!(first_x87_reference(clean).is_none());
+    }
+
+    #[test]
+    fn target_attribute_denials_are_enforced_on_their_own_function_only() {
+        use super::first_target_attribute_leak;
+        use crate::common::types::IrType;
+        use crate::ir::module::{IrFunction, IrModule};
+        let asm = concat!(
+            ".type ints, @function\nints:\n    movq %rdi, %rax\n    ret\n",
+            ".type flt, @function\nflt:\n    mulss %xmm1, %xmm0\n    ret\n",
+            ".type dbl, @function\ndbl:\n    mulsd %xmm1, %xmm0\n    ret\n",
+            ".type ld, @function\nld:\n    fmulp %st, %st(1)\n    ret\n",
+            ".type user, @function\nuser:\n#APP\n    movaps %xmm0, %xmm1\n#NO_APP\n    ret\n",
+        );
+        let check = |name: &str, features: &[&str]| {
+            let mut f = IrFunction::new(name.into(), IrType::I32, vec![], false);
+            f.target_features = features.iter().map(|s| (*s).to_string()).collect();
+            let mut module = IrModule::new();
+            module.functions = vec![f];
+            first_target_attribute_leak(&module, asm)
+                .map(|(func, line, unit, entry)| (func, line.trim().to_string(), unit, entry))
+        };
+        assert_eq!(
+            check("flt", &["general-regs-only"]),
+            Some((
+                "flt".into(),
+                "mulss %xmm1, %xmm0".into(),
+                "SSE",
+                "general-regs-only"
+            ))
+        );
+        assert_eq!(check("flt", &["no-sse"]).map(|h| h.2), Some("SSE"));
+        // GCC 16.2 keeps SSE1 `mulss` under `target("no-sse2")`.
+        assert_eq!(check("flt", &["no-sse2"]), None);
+        assert_eq!(
+            check("dbl", &["no-sse2"]).map(|h| (h.2, h.3)),
+            Some(("SSE2", "no-sse2"))
+        );
+        // A denial wins over a grant in the same attribute.
+        assert_eq!(check("dbl", &["avx2", "no-sse"]).map(|h| h.2), Some("SSE"));
+        assert_eq!(
+            check("ld", &["no-80387"]).map(|h| (h.2, h.3)),
+            Some(("x87", "no-80387"))
+        );
+        assert_eq!(
+            check("ld", &["general-regs-only"]).map(|h| h.2),
+            Some("x87")
+        );
+        assert_eq!(check("ld", &["no-sse"]), None);
+        // Integer code, other functions' SSE, user asm and unemitted
+        // functions are never attributed.
+        assert_eq!(check("ints", &["general-regs-only"]), None);
+        assert_eq!(check("user", &["general-regs-only"]), None);
+        assert_eq!(check("gone", &["general-regs-only"]), None);
+        assert_eq!(check("flt", &["avx2"]), None);
+    }
+
+    #[test]
+    fn x87_return_boundary_counts_emitted_definitions_and_calls_only() {
+        use crate::common::types::IrType;
+        use crate::ir::instruction::{BasicBlock, CallInfo, Instruction, Terminator};
+        use crate::ir::module::{IrFunction, IrModule};
+        use crate::ir::reexports::BlockId;
+        let func = |name: &str, ret: IrType, calls: &[(&str, IrType)]| {
+            let mut f = IrFunction::new(name.into(), ret, vec![], false);
+            f.blocks.push(BasicBlock {
+                label: BlockId(0),
+                instructions: calls
+                    .iter()
+                    .map(|(callee, ty)| Instruction::Call {
+                        func: (*callee).into(),
+                        info: CallInfo {
+                            return_type: *ty,
+                            ..CallInfo::default()
+                        },
+                    })
+                    .collect(),
+                terminator: Terminator::Unreachable,
+                source_spans: Vec::new(),
+            });
+            f
+        };
+        let check = |funcs: Vec<IrFunction>, asm: &str, i686: bool| {
+            let mut module = IrModule::new();
+            module.functions = funcs;
+            first_x87_return_boundary(&module, asm, i686)
+                .map(|(f, what)| (f, what.contains("call")))
+        };
+        let asm = "ints:\n    ret\ndbl:\n    ret\nuser:\n    ret\n";
+        // i686: float/double/long double all return in %st(0).
+        for ty in [IrType::F32, IrType::F64, IrType::F128] {
+            assert_eq!(
+                check(vec![func("dbl", ty, &[])], asm, true),
+                Some(("dbl".into(), false))
+            );
+            assert_eq!(
+                check(vec![func("user", IrType::I32, &[("ext", ty)])], asm, true),
+                Some(("user".into(), true))
+            );
+        }
+        // x86-64: only long double does.
+        assert_eq!(check(vec![func("dbl", IrType::F64, &[])], asm, false), None);
+        assert_eq!(
+            check(
+                vec![func("user", IrType::I32, &[("ext", IrType::F128)])],
+                asm,
+                false
+            ),
+            Some(("user".into(), true))
+        );
+        // Integer boundaries, and FP functions never emitted (unused statics).
+        assert_eq!(
+            check(
+                vec![
+                    func("ints", IrType::I64, &[("ext", IrType::I32)]),
+                    func("unused", IrType::F64, &[("ext", IrType::F64)]),
+                ],
+                asm,
+                true
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn sse3_fence_names_fisttp_and_the_sse3_vector_forms_only() {
+        let prefix = ".type f, @function\nf:\n";
+        for op in [
+            "fisttpl (%esp)",
+            "fisttpq 4(%esp)",
+            "fisttps (%esp)",
+            "haddps %xmm1, %xmm0",
+            "movddup (%eax), %xmm0",
+            "lddqu (%eax), %xmm1",
+        ] {
+            let (func, line) = first_sse3_reference(&format!("{prefix}    {op}\n")).unwrap();
+            assert_eq!(func, "f");
+            assert_eq!(line.trim(), op);
+        }
+        // The SSE3-free equivalents, SSE2 forms, symbols that merely
+        // contain the mnemonic, and user inline assembly never count.
+        let clean = ".type fisttp, @function\nfisttp:\n    fistpl 4(%esp)\n\
+                     fnstcw (%esp)\n    cvttsd2sil 4(%esp), %eax\n\
+                     addps %xmm1, %xmm0\n    call fisttp\n#APP\n    fisttpl (%esp)\n\
+                     #NO_APP\n    # fisttpl in a comment\n    ret\n";
+        assert!(first_sse3_reference(clean).is_none());
+    }
 
     #[test]
     fn sse1_fence_keeps_legal_memory_arithmetic_and_rejects_sse2() {
@@ -4409,5 +4923,53 @@ mod scoped_sse2_fence_tests {
                 .0,
             "<toplevel>"
         );
+    }
+}
+
+#[cfg(test)]
+mod i686_target_grant_tests {
+    use super::{first_sse3_reference_unless, i686_target_sse_grants};
+
+    fn grants(features: &[&str]) -> [bool; 3] {
+        let owned: Vec<String> = features.iter().map(|f| (*f).to_string()).collect();
+        i686_target_sse_grants(&owned)
+    }
+
+    #[test]
+    fn grants_imply_lower_levels_and_denials_win() {
+        assert_eq!(grants(&[]), [false; 3]);
+        assert_eq!(grants(&["sse"]), [true, false, false]);
+        assert_eq!(grants(&["sse2"]), [true, true, false]);
+        assert_eq!(grants(&["ssse3"]), [true; 3]);
+        assert_eq!(grants(&["avx2"]), [true; 3]);
+        assert_eq!(grants(&["no-sse3", "sse4.1"]), [true, true, false]);
+        assert_eq!(grants(&["no-sse2", "sse4.1"]), [true, false, false]);
+        assert_eq!(grants(&["avx", "no-sse"]), [false; 3]);
+        assert_eq!(grants(&["general-regs-only", "sse2"]), [false; 3]);
+        // Unmodelled features grant nothing.
+        assert_eq!(grants(&["popcnt", "bmi2"]), [false; 3]);
+    }
+
+    #[test]
+    fn arch_grants_only_for_modelled_cpus() {
+        assert_eq!(grants(&["arch=x86-64"]), [true, true, false]);
+        assert_eq!(grants(&["arch=nehalem"]), [true; 3]);
+        assert_eq!(grants(&["arch=haswell"]), [true; 3]);
+        // arch_level's fallback is the x86-64 baseline; on i686 that would
+        // invent SSE2 for a Pentium, so unknown names keep the TU floor.
+        assert_eq!(grants(&["arch=pentium"]), [false; 3]);
+        assert_eq!(grants(&["arch=i686"]), [false; 3]);
+        assert_eq!(grants(&["arch=haswell", "no-sse3"]), [true, true, false]);
+    }
+
+    #[test]
+    fn sse3_grant_is_function_scoped() {
+        let asm = ".type ok, @function\nok:\n haddps %xmm1, %xmm0\n.size ok, .-ok\n\
+                   .type bad, @function\nbad:\n fisttpl (%esp)\n";
+        assert_eq!(
+            first_sse3_reference_unless(asm, |f| f == "ok").unwrap().0,
+            "bad"
+        );
+        assert!(first_sse3_reference_unless(asm, |f| f == "ok" || f == "bad").is_none());
     }
 }

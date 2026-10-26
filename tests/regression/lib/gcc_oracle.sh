@@ -132,6 +132,30 @@ C
     return 0
 }
 
+# gcc_oracle_require_m32_sse2 <gate> -> 0 if $GCC_ORACLE_BIN's DEFAULT -m32
+# target has SSE2, else prints a configuration FAIL and returns 1. Contracts
+# that compare lccc's default i686 ABI (SSE2: 16-byte vectors in %xmm, the
+# Clang 23.1.4 `pentium4` default and the pinned tag-cache GCC 16.2 build's)
+# against the oracle's default need an oracle whose `-m32` default agrees. A
+# distribution GCC configured --with-arch-32=i686 (Debian, Ubuntu) passes
+# those vectors on the stack; its verdict measures the packaging, not lccc.
+gcc_oracle_require_m32_sse2() {
+    local gate=$1 macros
+    [ -n "${GCC_ORACLE_BIN:-}" ] || { echo "FAIL: $gate: gcc_oracle_require_m32_sse2 called before require_gcc_oracle" >&2; return 1; }
+    macros=$("$GCC_ORACLE_BIN" -m32 -dM -E - </dev/null 2>&1) || {
+        echo "FAIL: $gate: $GCC_ORACLE_BIN -m32 -dM -E failed" >&2
+        return 1
+    }
+    case $macros in
+        *"#define __SSE2__ 1"*) return 0 ;;
+    esac
+    echo "FAIL: $gate: the GCC oracle ($GCC_ORACLE_BIN) defaults -m32 to a pre-SSE2 target" >&2
+    echo "      (configured --with-arch-32=i686, as distribution packages are). The i386" >&2
+    echo "      default-mode contracts compare against an SSE2 -m32 default: use the pinned" >&2
+    echo "      GCC 16.2 prefix (scripts/ci_install_gcc_oracle.sh), as hosted CI does." >&2
+    return 1
+}
+
 # gcc_oracle_require_m32 <gate> -> 0 if $GCC_ORACLE_BIN can link AND run an
 # i686 program, else prints a configuration FAIL and returns 1. Gates that use
 # the oracle as an i686 reference (`"$ref" -m32`) need the 32-bit crt objects

@@ -3171,6 +3171,55 @@ impl CType {
     /// For a vector type, returns (element_type, logical lane count).
     /// Returns None for non-vector types. Ext-vector lane count is never
     /// inferred from padded object storage.
+    /// The vector type of the same kind and element type with `lanes` lanes
+    /// (a GNU `vector_size` vector or a Clang ext vector): the result type of
+    /// `__builtin_shufflevector`, which has one lane per index.
+    pub fn with_lane_count(&self, lanes: usize) -> Option<CType> {
+        match self {
+            CType::Vector(elem, _) => {
+                let bytes = elem.size().checked_mul(lanes)?;
+                (bytes > 0).then(|| CType::Vector(elem.clone(), bytes))
+            }
+            CType::ExtVector(elem, _) => ExtVectorLayout::new(elem, lanes)
+                .map(|layout| CType::ExtVector(elem.clone(), layout)),
+            _ => None,
+        }
+    }
+
+    /// `__builtin_shufflevector`'s result for `lanes` indices, or `None` for
+    /// an invalid count. GNU vectors need a power of two (GCC 16.2; a
+    /// `vector_size` type has no other shape). Clang ext vectors take any
+    /// count, as in Clang: three indices on a `float4` give a `float3`.
+    pub fn shufflevector_result(&self, lanes: usize) -> Option<CType> {
+        match self {
+            CType::Vector(..) if !lanes.is_power_of_two() => None,
+            _ if lanes == 0 => None,
+            _ => self.with_lane_count(lanes),
+        }
+    }
+
+    /// Result type of a call to GCC's vector shuffle builtins, given the type
+    /// of the first argument and the argument count: `__builtin_shuffle`
+    /// returns the first vector's type, `__builtin_shufflevector` that element
+    /// type with one lane per index. An invalid index count keeps the first
+    /// vector's type, so the lowering's diagnostic for it
+    /// is the one reported. Sema and the lowerer (which types `typeof`
+    /// operands) both use this, so the two cannot disagree.
+    pub fn shuffle_builtin_result(name: &str, first: &CType, args: usize) -> Option<CType> {
+        if !first.is_vector() {
+            return None;
+        }
+        match name {
+            "__builtin_shuffle" => Some(first.clone()),
+            "__builtin_shufflevector" => Some(
+                args.checked_sub(2)
+                    .and_then(|lanes| first.shufflevector_result(lanes))
+                    .unwrap_or_else(|| first.clone()),
+            ),
+            _ => None,
+        }
+    }
+
     pub fn vector_info(&self) -> Option<(&CType, usize)> {
         match self {
             CType::Vector(elem, total_size) => {

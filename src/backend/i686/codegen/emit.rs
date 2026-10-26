@@ -36,6 +36,10 @@ pub(super) enum I686FastcallSlot {
     /// area (callee reference: 8(%ebp) / entry ESP+4), occupying `size`
     /// bytes.
     Stack { offset: i64, size: usize },
+    /// A native vector passed in `%xmm`/`%ymm`/`%zmm{reg_idx}` (`size` =
+    /// 16/32/64), assigned exactly as for cdecl
+    /// (`call_abi::i386_vector_reg_bytes`).
+    Vector { reg_idx: usize, size: usize },
 }
 
 /// Where the bytes of an outgoing by-value argument are read from.
@@ -240,6 +244,13 @@ pub struct I686Codegen {
     /// Final TU permission for SSE1 `movups` copies. This is independent of
     /// SSE2/AVX: no-SSE targets retain the scalar bit-exact copy loops.
     pub(super) sse_enabled: bool,
+    /// The resolved ISA has SSE2: scalar F32 arithmetic, compares and
+    /// int<->F32 casts may use the `movd`-based SSE forms. Otherwise they
+    /// use x87 (see `CodegenOptions::i686_no_sse2`).
+    pub(super) sse2_scalar_enabled: bool,
+    /// The resolved ISA has SSE3, so FISTTP is available for truncating
+    /// x87 stores (see [`Self::emit_x87_truncating_store`]).
+    pub(super) fisttp_enabled: bool,
     /// Same-block div/rem pair analysis (see backend::regalloc::
     /// compute_i686_divrem_pairs). Recomputed per function; the emitter uses
     /// tail_dests/head_partners to fuse URem+UDiv couples into one divl.
@@ -635,6 +646,8 @@ impl I686Codegen {
             popcnt_enabled: false,
             prefetch_isa: None,
             sse_enabled: false,
+            sse2_scalar_enabled: true,
+            fisttp_enabled: true,
         }
     }
 
@@ -675,6 +688,36 @@ impl I686Codegen {
         // i686 is NOT SSE-baseline: the driver decides (SSE or PRFCHW).
         self.prefetch_isa = (!opts.no_prefetch).then_some(opts.x86_prefetch);
         self.sse_enabled = !opts.no_sse && !opts.general_regs_only;
+        self.sse2_scalar_enabled = !opts.i686_no_sse2 && !opts.general_regs_only;
+        self.fisttp_enabled = self.sse2_scalar_enabled && !opts.i686_no_sse3;
+    }
+
+    /// Pop st(0) into the `suffix`-sized integer at `(%esp)`, truncating
+    /// toward zero (`suffix`: `s` = 16, `l` = 32, `q` = 64 bits).
+    ///
+    /// With SSE3 this is FISTTP. Without it the x87 rounding control is
+    /// switched to round-toward-zero around a plain FIST(P) and then
+    /// restored, which is GCC's non-SSE3 lowering: FISTP under RC=11 has
+    /// FISTTP's exact semantics (truncation, the integer-indefinite result
+    /// and FE_INVALID for NaN/out-of-range, FE_INEXACT for fractions). Only
+    /// the RC field changes, so the caller's precision control and exception
+    /// masks are preserved. Both control words live in a 4-byte scratch
+    /// below the caller's slot, so no GPR is touched; the `orw` clobbers
+    /// EFLAGS, which no caller has live across the conversion.
+    pub(super) fn emit_x87_truncating_store(&mut self, suffix: char) {
+        debug_assert!(matches!(suffix, 's' | 'l' | 'q'));
+        if self.fisttp_enabled {
+            emit!(self.state, "    fisttp{} (%esp)", suffix);
+            return;
+        }
+        self.state.emit("    subl $4, %esp");
+        self.state.emit("    fnstcw (%esp)");
+        self.state.emit("    fnstcw 2(%esp)");
+        self.state.emit("    orw $0x0c00, 2(%esp)");
+        self.state.emit("    fldcw 2(%esp)");
+        emit!(self.state, "    fistp{} 4(%esp)", suffix);
+        self.state.emit("    fldcw (%esp)");
+        self.state.emit("    addl $4, %esp");
     }
 
     // --- i686 helper methods ---
@@ -1223,6 +1266,8 @@ impl I686Codegen {
         let mut regs_free = [true, true];
         let mut chain_broken = is_variadic;
         let mut cursor: i64 = 0;
+        let abi = self.call_abi_config_impl();
+        let mut vector_regs_used = 0usize;
         let vector_align = |i: usize| {
             let align = struct_aligns.get(i).copied().flatten().unwrap_or(4);
             let classes = struct_classes.get(i).map(Vec::as_slice).unwrap_or(&[]);
@@ -1246,6 +1291,41 @@ impl I686Codegen {
                 _ if is_i128_type(*ty) => 16,
                 _ => 4,
             });
+
+            // A native vector takes the next SSE argument register as in
+            // cdecl (GCC 16.2: `t1(v2, int)` passes the vector in %xmm0 and
+            // the int in %ecx; the 4th vector goes to the stack in argument
+            // order). In a register or on the stack, it neither consumes nor
+            // breaks the ECX/EDX chain. Variadic calls keep every vector on
+            // the stack, like cdecl.
+            let classes = struct_classes.get(i).map(Vec::as_slice).unwrap_or(&[]);
+            let native_vector = !force_stack.get(i).copied().unwrap_or(false)
+                && crate::backend::call_abi::i386_vector_reg_bytes(
+                    &abi,
+                    classes,
+                    struct_sizes.get(i).copied().flatten(),
+                )
+                .is_some();
+            if native_vector {
+                if !is_variadic && vector_regs_used < abi.vector_xmm_regs {
+                    slots.push(I686FastcallSlot::Vector {
+                        reg_idx: vector_regs_used,
+                        size,
+                    });
+                    vector_regs_used += 1;
+                    continue;
+                }
+                if let Some(align) = vector_align(i) {
+                    let a = align as i64;
+                    cursor = (cursor + a - 1) & !(a - 1);
+                }
+                slots.push(I686FastcallSlot::Stack {
+                    offset: cursor,
+                    size,
+                });
+                cursor += size as i64;
+                continue;
+            }
 
             // Clang i686 ExtVector lanes are scalar values in their own stack
             // slots, but unlike aggregates they do not break fastcall's
@@ -1479,24 +1559,36 @@ impl I686Codegen {
     pub(super) fn emit_f64_load_to_x87(&mut self, op: &Operand) {
         match op {
             Operand::Value(v) => {
-                if let Some(slot) = self.state.get_slot(v.0) {
-                    let sr = self.slot_ref(slot);
-                    emit!(self.state, "    fldl {}", sr);
-                }
+                // Floats are never GPR-allocated (`is_non_gpr_type`), so a
+                // materialized F64 always has a slot. Emitting nothing here
+                // used to leave the x87 stack one short and the consumer
+                // reading garbage; fail closed instead.
+                let slot = self.state.get_slot(v.0).unwrap_or_else(|| {
+                    panic!("i686 x87 F64 load of v{} which has no stack slot", v.0)
+                });
+                let sr = self.slot_ref(slot);
+                emit!(self.state, "    fldl {}", sr);
+            }
+            // Exact bit patterns only: -0.0 must not become `fldz`.
+            Operand::Const(IrConst::F64(fval)) if fval.to_bits() == 0 => {
+                self.state.emit("    fldz");
+            }
+            Operand::Const(IrConst::F64(fval)) if fval.to_bits() == 1.0f64.to_bits() => {
+                self.state.emit("    fld1");
             }
             Operand::Const(IrConst::F64(fval)) => {
+                // Push the halves (high first, so the low word lands at the
+                // lower address): no GPR is written, so neither %eax nor the
+                // accumulator cache is disturbed for a following load.
                 let bits = fval.to_bits();
-                let low = (bits & 0xFFFFFFFF) as i32;
-                let high = ((bits >> 32) & 0xFFFFFFFF) as i32;
-                self.state.emit("    subl $8, %esp");
-                emit!(self.state, "    movl ${}, (%esp)", low);
-                emit!(self.state, "    movl ${}, 4(%esp)", high);
+                emit!(self.state, "    pushl ${}", (bits >> 32) as u32 as i32);
+                emit!(self.state, "    pushl ${}", bits as u32 as i32);
                 self.state.emit("    fldl (%esp)");
                 self.state.emit("    addl $8, %esp");
             }
             Operand::Const(IrConst::F32(fval)) => {
-                emit!(self.state, "    movl ${}, %eax", fval.to_bits() as i32);
-                self.state.emit("    pushl %eax");
+                // Same contract as `emit_f32_load_to_x87`: no GPR clobber.
+                emit!(self.state, "    pushl ${}", fval.to_bits() as i32);
                 self.state.emit("    flds (%esp)");
                 self.state.emit("    addl $4, %esp");
             }
@@ -1840,19 +1932,21 @@ impl I686Codegen {
             struct_arg_classes,
         );
 
-        let dyn_align_a =
-            struct_arg_aligns
-                .iter()
-                .enumerate()
-                .fold(16usize, |max_align, (i, align)| {
-                    let classes = struct_arg_classes.get(i).map(Vec::as_slice).unwrap_or(&[]);
-                    crate::backend::call_abi::i386_gnu_vector_stack_align(
-                        &self.call_abi_config_impl(),
-                        classes,
-                        align.unwrap_or(4),
-                    )
-                    .map_or(max_align, |a| max_align.max(a))
-                });
+        // Only stack-resident arguments constrain the outgoing area: a
+        // vector in %xmm/%ymm needs no ESP boundary.
+        let dyn_align_a = struct_arg_aligns
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| matches!(slots.get(*i), Some(I686FastcallSlot::Stack { .. })))
+            .fold(16usize, |max_align, (i, align)| {
+                let classes = struct_arg_classes.get(i).map(Vec::as_slice).unwrap_or(&[]);
+                crate::backend::call_abi::i386_gnu_vector_stack_align(
+                    &self.call_abi_config_impl(),
+                    classes,
+                    align.unwrap_or(4),
+                )
+                .map_or(max_align, |a| max_align.max(a))
+            });
         let dyn_align = dyn_align_a > 16;
         debug_assert!(!dyn_align || !self.omit_frame_pointer);
         // The callee pops exactly `stack_bytes`; alignment padding is
@@ -1920,6 +2014,27 @@ impl I686Codegen {
                     self.emit_load_operand(arg);
                     emit!(self.state, "    movl %eax, {}(%esp)", offset);
                 }
+            }
+        }
+
+        // Phase 1.5: vector register arguments. After the stack writes (the
+        // by-value copier uses %xmm0 as scratch) and before the GP
+        // registers (the operand -- the vector object's address -- is
+        // staged through %eax, and %ecx/%edx must be the last writes).
+        for (i, slot) in slots.iter().enumerate() {
+            let I686FastcallSlot::Vector { reg_idx, size } = *slot else {
+                continue;
+            };
+            self.operand_to_eax(&args[i]);
+            let (instruction, register) = match size {
+                16 => ("movups", format!("xmm{reg_idx}")),
+                32 => ("vmovups", format!("ymm{reg_idx}")),
+                64 => ("vmovups", format!("zmm{reg_idx}")),
+                _ => unreachable!("invalid native vector argument width"),
+            };
+            emit!(self.state, "    {} (%eax), %{}", instruction, register);
+            if size > 16 {
+                self.state.dirty_upper_ymm = true;
             }
         }
 
@@ -3041,6 +3156,16 @@ impl ArchCodegen for I686Codegen {
                     crate::common::types::EightbyteClass::Sse,
                     crate::common::types::EightbyteClass::SseUp,
                 ];
+        // `call_passes_wide_vector` gates the pre-call vzeroupper
+        // (calls.rs). This override bypasses the generic `emit_call` that
+        // publishes it, so set it here: conservatively first (any by-value
+        // aggregate wider than 16 bytes, a superset of %ymm/%zmm vectors;
+        // fastcall keeps this), exactly below once the standard path has
+        // classified. A spurious `true` only skips the cleanup; a stale
+        // `false` would zero a YMM argument.
+        self.state.call_passes_wide_vector = struct_arg_sizes
+            .iter()
+            .any(|size| size.is_some_and(|bytes| bytes > 16));
         if is_fastcall {
             let gp3_dest = returns_i686_ext_vector_gp3.then(|| dest.clone()).flatten();
             let xmm_dest = returns_i686_xmm.then(|| dest.clone()).flatten();
@@ -3100,6 +3225,9 @@ impl ArchCodegen for I686Codegen {
         if skip == 1 {
             arg_classes_vec.insert(0, CallArgClass::ZeroSizeSkip);
         }
+        self.state.call_passes_wide_vector = arg_classes_vec
+            .iter()
+            .any(|class| matches!(class, CallArgClass::StructXmmReg { size, .. } if *size > 16));
         let indirect = func_ptr.is_some() && direct_name.is_none();
         if indirect {
             self.emit_call_spill_fptr(func_ptr.expect("indirect call requires func_ptr"));
@@ -3619,12 +3747,29 @@ impl ArchCodegen for I686Codegen {
         }
     }
 
+    /// F32 `%ecx <op> %eax` -> `%eax` (`mnemonic`: add/sub/mul/div).
     fn emit_float_binop_impl(&mut self, mnemonic: &str, ty: IrType) {
         if ty == IrType::F32 {
-            self.state.emit("    movd %ecx, %xmm0");
-            self.state.emit("    movd %eax, %xmm1");
-            emit!(self.state, "    {}ss %xmm1, %xmm0", mnemonic);
-            self.state.emit("    movd %xmm0, %eax");
+            if self.sse2_scalar_enabled {
+                self.state.emit("    movd %ecx, %xmm0");
+                self.state.emit("    movd %eax, %xmm1");
+                emit!(self.state, "    {}ss %xmm1, %xmm0", mnemonic);
+                self.state.emit("    movd %xmm0, %eax");
+            } else {
+                // x87 with F32 memory operands. The extended-precision
+                // intermediate is innocuous: x87 rounds to its 64-bit (or
+                // a user-selected 53-bit) significand, >= 2*24+2 bits, so
+                // the FSTPS rounding to F32 gives the correctly rounded
+                // single-precision +,-,*,/ result. FSTPS also performs the
+                // F32 overflow/underflow. `%ecx` (lhs) is left intact.
+                self.state.emit("    pushl %eax");
+                self.state.emit("    pushl %ecx");
+                self.state.emit("    flds (%esp)");
+                emit!(self.state, "    f{}s 4(%esp)", mnemonic);
+                self.state.emit("    fstps 4(%esp)");
+                self.state.emit("    movl 4(%esp), %eax");
+                self.state.emit("    addl $8, %esp");
+            }
         }
         self.state.reg_cache.invalidate_acc();
     }
@@ -4545,6 +4690,119 @@ mod tests {
         }
     }
 
+    /// Native vectors take %xmm/%ymm registers as in cdecl and never touch
+    /// the ECX/EDX chain. Expected layouts are GCC 16.2 `-m32 -mavx2`
+    /// output for the same prototypes.
+    #[test]
+    fn fastcall_native_vectors_use_sse_registers_like_gcc() {
+        use crate::common::types::EightbyteClass::{Sse, SseUp};
+        use I686FastcallSlot::{Reg, Stack, Vector};
+        let cg = I686Codegen::new();
+        let v16 = vec![Sse, SseUp];
+        let v32 = vec![Sse, SseUp, SseUp, SseUp];
+        let int = Vec::new();
+        let ptr = IrType::Ptr;
+        let i32t = IrType::I32;
+
+        // t1(v2 a, int b): a in %xmm0, b in %ecx.
+        let (slots, bytes) = cg.fastcall_layout_with_abi(
+            &[ptr, i32t],
+            &[Some(16), None],
+            &[false, false],
+            false,
+            &[Some(16), None],
+            &[v16.clone(), int.clone()],
+        );
+        assert_eq!(
+            slots,
+            vec![
+                Vector {
+                    reg_idx: 0,
+                    size: 16
+                },
+                Reg(0)
+            ]
+        );
+        assert_eq!(bytes, 0);
+
+        // t2(int, v2 x, y, z, w, int, int): three vectors in registers, the
+        // fourth on the stack first, and the chain still gives %edx.
+        let tys = [i32t, ptr, ptr, ptr, ptr, i32t, i32t];
+        let sizes = [None, Some(16), Some(16), Some(16), Some(16), None, None];
+        let classes = [
+            int.clone(),
+            v16.clone(),
+            v16.clone(),
+            v16.clone(),
+            v16.clone(),
+            int.clone(),
+            int.clone(),
+        ];
+        let (slots, bytes) =
+            cg.fastcall_layout_with_abi(&tys, &sizes, &[false; 7], false, &sizes, &classes);
+        assert_eq!(
+            slots,
+            vec![
+                Reg(0),
+                Vector {
+                    reg_idx: 0,
+                    size: 16
+                },
+                Vector {
+                    reg_idx: 1,
+                    size: 16
+                },
+                Vector {
+                    reg_idx: 2,
+                    size: 16
+                },
+                Stack {
+                    offset: 0,
+                    size: 16
+                },
+                Reg(1),
+                Stack {
+                    offset: 16,
+                    size: 4
+                },
+            ]
+        );
+        assert_eq!(bytes, 20);
+
+        // callee(int a, v4 v, int b): %ecx, %ymm0, %edx; nothing to pop.
+        let (slots, bytes) = cg.fastcall_layout_with_abi(
+            &[i32t, ptr, i32t],
+            &[None, Some(32), None],
+            &[false; 3],
+            false,
+            &[None, Some(32), None],
+            &[int.clone(), v32, int.clone()],
+        );
+        assert_eq!(
+            slots,
+            vec![
+                Reg(0),
+                Vector {
+                    reg_idx: 0,
+                    size: 32
+                },
+                Reg(1)
+            ]
+        );
+        assert_eq!(bytes, 0);
+
+        // Variadic: vectors stay on the stack, as in cdecl.
+        let (slots, _) =
+            cg.fastcall_layout_with_abi(&[ptr], &[Some(16)], &[false], true, &[Some(16)], &[v16]);
+        assert_eq!(
+            slots,
+            vec![Stack {
+                offset: 0,
+                size: 16
+            }]
+        );
+    }
+
     #[test]
     fn fastcall_zero_aggregate_keeps_register_chain() {
         use I686FastcallSlot::{Reg, Stack};
@@ -4931,6 +5189,142 @@ mod tests {
         assert!(!cg.sse_enabled);
         let gp_only_lines = copy_lines_with(&opts, 32);
         assert!(gp_only_lines.iter().all(|l| !l.contains("xmm")), "gp-only");
+    }
+
+    fn emitted(cg: &I686Codegen) -> Vec<String> {
+        cg.state
+            .out
+            .buf
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn scalar_fp_permissions_follow_the_resolved_isa() {
+        let mut opts = crate::backend::CodegenOptions::default();
+        let mut cg = I686Codegen::new();
+        cg.apply_options(&opts);
+        assert!(cg.sse2_scalar_enabled && cg.fisttp_enabled);
+        // The default -m32 baseline: SSE2 without SSE3.
+        opts.i686_no_sse3 = true;
+        cg.apply_options(&opts);
+        assert!(cg.sse2_scalar_enabled && !cg.fisttp_enabled);
+        // No SSE2 implies no SSE3 even if the SSE3 bit were left clear.
+        opts.i686_no_sse3 = false;
+        opts.i686_no_sse2 = true;
+        cg.apply_options(&opts);
+        assert!(!cg.sse2_scalar_enabled && !cg.fisttp_enabled);
+        opts.i686_no_sse2 = false;
+        opts.general_regs_only = true;
+        cg.apply_options(&opts);
+        assert!(!cg.sse2_scalar_enabled && !cg.fisttp_enabled);
+    }
+
+    #[test]
+    fn x87_f64_constant_loads_write_no_gpr() {
+        let load = |c: IrConst| {
+            let mut cg = I686Codegen::new();
+            cg.emit_f64_load_to_x87(&Operand::Const(c));
+            emitted(&cg)
+        };
+        assert_eq!(load(IrConst::F64(0.0)), ["fldz"]);
+        assert_eq!(load(IrConst::F64(1.0)), ["fld1"]);
+        // -0.0 is not +0.0: it must keep its sign bit (no `fldz`/`fchs`).
+        assert_eq!(
+            load(IrConst::F64(-0.0)),
+            [
+                "pushl $-2147483648",
+                "pushl $0",
+                "fldl (%esp)",
+                "addl $8, %esp"
+            ]
+        );
+        // 0.1 = 0x3FB999999999999A: high word pushed first so the low word
+        // sits at (%esp), the little-endian layout `fldl` reads.
+        assert_eq!(
+            load(IrConst::F64(0.1)),
+            [
+                "pushl $1069128089",
+                "pushl $-1717986918",
+                "fldl (%esp)",
+                "addl $8, %esp"
+            ]
+        );
+        assert_eq!(
+            load(IrConst::F32(1.5)),
+            ["pushl $1069547520", "flds (%esp)", "addl $4, %esp"]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "has no stack slot")]
+    fn x87_f64_load_of_an_unhomed_value_fails_closed() {
+        I686Codegen::new().emit_f64_load_to_x87(&Operand::Value(Value(7)));
+    }
+
+    #[test]
+    fn truncating_store_switches_rounding_control_without_sse3() {
+        let mut opts = crate::backend::CodegenOptions::default();
+        let mut cg = I686Codegen::new();
+        cg.apply_options(&opts);
+        cg.emit_x87_truncating_store('q');
+        assert_eq!(emitted(&cg), ["fisttpq (%esp)"]);
+
+        opts.i686_no_sse3 = true;
+        let mut cg = I686Codegen::new();
+        cg.apply_options(&opts);
+        cg.emit_x87_truncating_store('l');
+        // The caller's `(%esp)` slot is `4(%esp)` inside the 4-byte
+        // control-word scratch; only RC (bits 10-11) is changed, and the
+        // saved word is restored before the scratch is released.
+        assert_eq!(
+            emitted(&cg),
+            [
+                "subl $4, %esp",
+                "fnstcw (%esp)",
+                "fnstcw 2(%esp)",
+                "orw $0x0c00, 2(%esp)",
+                "fldcw 2(%esp)",
+                "fistpl 4(%esp)",
+                "fldcw (%esp)",
+                "addl $4, %esp",
+            ]
+        );
+    }
+
+    #[test]
+    fn f32_binop_without_sse2_is_x87_and_preserves_ecx() {
+        let mut opts = crate::backend::CodegenOptions::default();
+        opts.i686_no_sse2 = true;
+        for (mnemonic, x87) in [
+            ("add", "fadds 4(%esp)"),
+            ("sub", "fsubs 4(%esp)"),
+            ("mul", "fmuls 4(%esp)"),
+            ("div", "fdivs 4(%esp)"),
+        ] {
+            let mut cg = I686Codegen::new();
+            cg.apply_options(&opts);
+            cg.emit_float_binop_impl(mnemonic, IrType::F32);
+            let lines = emitted(&cg);
+            assert!(lines.iter().all(|l| !l.contains("xmm")), "{lines:?}");
+            // lhs (%ecx) is loaded first, so `fsubs`/`fdivs` compute
+            // lhs - rhs and lhs / rhs, not the reverse.
+            assert_eq!(lines[..3], ["pushl %eax", "pushl %ecx", "flds (%esp)"]);
+            assert_eq!(lines[3], x87);
+            assert!(
+                lines
+                    .iter()
+                    .all(|l| !l.ends_with("%ecx") || l == "pushl %ecx")
+            );
+        }
+        // With SSE2 the movd/*ss form is kept.
+        let mut cg = I686Codegen::new();
+        cg.apply_options(&crate::backend::CodegenOptions::default());
+        cg.emit_float_binop_impl("sub", IrType::F32);
+        assert!(emitted(&cg).contains(&"subss %xmm1, %xmm0".to_string()));
     }
 
     /// The copy policy's instruction stream for `size` bytes at

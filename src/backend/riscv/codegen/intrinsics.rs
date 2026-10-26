@@ -55,7 +55,7 @@ impl RiscvCodegen {
                     self.state.emit("    sd t1, 0(t0)");
                 }
             }
-            IntrinsicOp::Movntdq | IntrinsicOp::Movntpd => {
+            IntrinsicOp::Movntdq | IntrinsicOp::Movntpd | IntrinsicOp::Movntps => {
                 // Non-temporal 128-bit store: dest_ptr = target, args[0] = source ptr
                 if let Some(ptr) = dest_ptr {
                     self.operand_to_t0(&args[0]);

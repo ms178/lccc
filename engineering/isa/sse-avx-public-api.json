@@ -524,7 +524,10 @@
       "header": "xmmintrin.h",
       "name": "_mm_cvtps_pi16",
       "raw_builtins": [],
-      "wrapper_dependencies": []
+      "wrapper_dependencies": [
+        "_mm_cvtss_si32",
+        "_mm_shuffle_ps"
+      ]
     },
     {
       "arities": [
@@ -539,7 +542,10 @@
       "header": "xmmintrin.h",
       "name": "_mm_cvtps_pi32",
       "raw_builtins": [],
-      "wrapper_dependencies": []
+      "wrapper_dependencies": [
+        "_mm_cvtss_si32",
+        "_mm_shuffle_ps"
+      ]
     },
     {
       "arities": [
@@ -554,7 +560,10 @@
       "header": "xmmintrin.h",
       "name": "_mm_cvtps_pi8",
       "raw_builtins": [],
-      "wrapper_dependencies": []
+      "wrapper_dependencies": [
+        "_mm_cvtss_si32",
+        "_mm_shuffle_ps"
+      ]
     },
     {
       "arities": [
@@ -633,7 +642,12 @@
       "raw_builtins": [
         "__builtin_ia32_cvtss2si64"
       ],
-      "wrapper_dependencies": []
+      "wrapper_dependencies": [
+        "_mm_add_ss",
+        "_mm_cvtss_f32",
+        "_mm_set_ss",
+        "_mm_sub_ss"
+      ]
     },
     {
       "arities": [
@@ -1392,7 +1406,7 @@
       "arities": [
         2
       ],
-      "canonical_override": false,
+      "canonical_override": true,
       "definitions": 1,
       "forms": [
         "function"
@@ -1400,14 +1414,16 @@
       "generic_helpers": [],
       "header": "xmmintrin.h",
       "name": "_mm_stream_pi",
-      "raw_builtins": [],
+      "raw_builtins": [
+        "__builtin_ia32_movntq"
+      ],
       "wrapper_dependencies": []
     },
     {
       "arities": [
         2
       ],
-      "canonical_override": false,
+      "canonical_override": true,
       "definitions": 1,
       "forms": [
         "function"
@@ -1415,7 +1431,9 @@
       "generic_helpers": [],
       "header": "xmmintrin.h",
       "name": "_mm_stream_ps",
-      "raw_builtins": [],
+      "raw_builtins": [
+        "__builtin_ia32_movntps"
+      ],
       "wrapper_dependencies": []
     },
     {
@@ -2241,7 +2259,12 @@
       "raw_builtins": [
         "__builtin_ia32_cvtsd2si64"
       ],
-      "wrapper_dependencies": []
+      "wrapper_dependencies": [
+        "_mm_add_sd",
+        "_mm_cvtsd_f64",
+        "_mm_set_sd",
+        "_mm_sub_sd"
+      ]
     },
     {
       "arities": [
@@ -8728,6 +8751,21 @@
       ],
       "generic_helpers": [],
       "header": "lcccsimd.h",
+      "name": "_mm256_testc_si256",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "lcccsimd.h",
       "name": "_mm256_testnzc_pd",
       "raw_builtins": [],
       "wrapper_dependencies": []
@@ -8758,6 +8796,21 @@
       ],
       "generic_helpers": [],
       "header": "lcccsimd.h",
+      "name": "_mm256_testnzc_si256",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "lcccsimd.h",
       "name": "_mm256_testz_pd",
       "raw_builtins": [],
       "wrapper_dependencies": []
@@ -8774,6 +8827,21 @@
       "generic_helpers": [],
       "header": "lcccsimd.h",
       "name": "_mm256_testz_ps",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        2
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "lcccsimd.h",
+      "name": "_mm256_testz_si256",
       "raw_builtins": [],
       "wrapper_dependencies": []
     },
@@ -13626,7 +13694,7 @@
     "_mm_malloc",
     "_mm_movddup"
   ],
-  "declarations": 834,
+  "declarations": 837,
   "missing_reference_names": [
     "_mm128_bitrev_epi8",
     "_mm128_mask_bitrev_epi8",
@@ -15120,13 +15188,10 @@
     "_mm256_test_epi32_mask",
     "_mm256_test_epi64_mask",
     "_mm256_test_epi8_mask",
-    "_mm256_testc_si256",
     "_mm256_testn_epi16_mask",
     "_mm256_testn_epi32_mask",
     "_mm256_testn_epi64_mask",
     "_mm256_testn_epi8_mask",
-    "_mm256_testnzc_si256",
-    "_mm256_testz_si256",
     "_mm256_undefined_pd",
     "_mm256_undefined_ph",
     "_mm256_undefined_ps",
@@ -19012,5 +19077,5 @@
     "lcccsimd.h"
   ],
   "status": "inventory-only; no instruction/manual/runtime sign-off implied",
-  "unique_names": 834
+  "unique_names": 837
 }

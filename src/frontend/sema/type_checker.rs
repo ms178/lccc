@@ -363,17 +363,19 @@ impl<'a> ExprTypeChecker<'a> {
                     // expected the 16 bytes of data.
                     //
                     // Both shuffle builtins use the ordinary pointer-backed
-                    // vector value convention. Their result type follows the
-                    // first vector rather than a name-only builtin signature.
+                    // vector value convention. `__builtin_shuffle` returns
+                    // the first vector's type; `__builtin_shufflevector`
+                    // returns that element type with one lane per index
+                    // (GCC 16.2: `(v8si, v8si, 0, 2, 4, 6)` is a `v4si`).
                     if matches!(
                         name.as_str(),
                         "__builtin_shuffle" | "__builtin_shufflevector"
                     ) && !args.is_empty()
                     {
-                        if let Some(ct @ (CType::Vector(_, _) | CType::ExtVector(_, _))) =
-                            self.infer_expr_ctype(&args[0])
-                        {
-                            return Some(ct);
+                        if let Some(result) = self.infer_expr_ctype(&args[0]).and_then(|first| {
+                            CType::shuffle_builtin_result(name, &first, args.len())
+                        }) {
+                            return Some(result);
                         }
                     }
 

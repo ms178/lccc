@@ -361,12 +361,46 @@ pub(super) fn dead_in_block_after(
             n += 1;
             continue;
         }
-        if is_full_write(&infos[n], t, fam) {
+        if is_full_write(&infos[n], t, fam) || setcc_zext_kills(store, infos, n, t, fam) {
             return true;
         }
         return false; // read (or read-modify-write) reaches the value
     }
     false
+}
+
+/// `set<cc> %Xb` immediately followed (same block) by `movzb{l,q} %Xb,
+/// %X{d,}`: the pair is a full write of the family that never observes its
+/// old value.  The `setcc` writes bits 0-7 only and reads no register; the
+/// zero-extension reads exactly those bits and overwrites all 64.  The
+/// per-line model has to treat the partial write as preserving (reading)
+/// the upper bits, which kept every materialised boolean "live" around a
+/// loop; this recognises the idiom the backend emits for every one of them.
+fn setcc_zext_kills(store: &LineStore, infos: &[LineInfo], n: usize, t: &str, fam: RegId) -> bool {
+    let low = REG_NAMES[3][fam as usize];
+    let Some((mnem, dst)) = t.split_once(' ') else {
+        return false;
+    };
+    if !mnem.starts_with("set") || dst.trim() != low {
+        return false;
+    }
+    let mut m = n + 1;
+    while m < store.len() && infos[m].is_nop() {
+        m += 1;
+    }
+    if m >= store.len() || infos[m].is_barrier() {
+        return false;
+    }
+    let Some((zx, args)) = infos[m].trimmed(store.get(m)).split_once(' ') else {
+        return false;
+    };
+    let wide = match zx {
+        "movzbl" => 1,
+        "movzbq" => 0,
+        _ => return false,
+    };
+    split_two_operands(args)
+        .is_some_and(|(src, dst)| src == low && dst == REG_NAMES[wide][fam as usize])
 }
 
 /// Half-open `[start, end)` line range of the function containing `idx`,
@@ -2388,6 +2422,36 @@ const PURE_PRODUCERS: &[&str] = &[
     "movslq ", "movl ", "movq ", "leal ", "leaq ",
 ];
 
+/// The 32-bit form, writing `%<d>d`, of the 64-bit producer `op src` whose
+/// result is consumed only through a `movl` copy (the low half, zero-
+/// extended). Each form yields exactly the low 32 bits the copy would take
+/// and keeps the memory access width: `leaq` -> `leal` (no access; the
+/// 32-bit LEA truncates its address and zero-extends), `movq %rS` ->
+/// `movl %eS` (register sources only: narrowing an 8-byte load is not a
+/// peephole's call), `movz{b,w}q`/`movs{b,w}q` -> the `l` forms (same low
+/// half, same load), `movslq` -> `movl` (low half is the source; both
+/// forms load 4 bytes).
+fn narrowed_producer(op: &str, src: &str, d_fam: RegId) -> Option<String> {
+    let d32 = REG_NAMES[1][d_fam as usize];
+    let narrow_op = match op.trim_end() {
+        "leaq" => "leal",
+        "movq" => {
+            let s = plain_gp_operand(src)?;
+            if dest_width(src) != Some(64) {
+                return None;
+            }
+            return Some(format!("    movl {}, {d32}", REG_NAMES[1][s as usize]));
+        }
+        "movzbq" => "movzbl",
+        "movzwq" => "movzwl",
+        "movsbq" => "movsbl",
+        "movswq" => "movswl",
+        "movslq" => "movl",
+        _ => return None,
+    };
+    Some(format!("    {narrow_op} {src}, {d32}"))
+}
+
 /// Width of the register a producer writes, from its destination operand text.
 /// Only the 32- and 64-bit forms take part in retargeting.
 fn dest_width(name: &str) -> Option<u8> {
@@ -2568,11 +2632,19 @@ fn retarget_producer_into_copy_impl(
             i += 1;
             continue;
         }
-        // A 64-bit producer under a 32-bit copy would keep the upper half.
-        if prod_w == 64 && copy_w == 32 {
-            i += 1;
-            continue;
-        }
+        // A 64-bit producer under a 32-bit copy would keep the upper half,
+        // unless it has an exact 32-bit form (no RMW chain in between).
+        let narrowed = if prod_w == 64 && copy_w == 32 {
+            match narrowed_producer(op, prod_src, d_fam) {
+                Some(line) if rmws.is_empty() => Some(line),
+                _ => {
+                    i += 1;
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
         if !rmws.iter().all(|(_, _, r_src, rw)| {
             *rw == prod_w && *rw == copy_w && !line_refs_family(r_src, d_fam)
         }) {
@@ -2602,7 +2674,7 @@ fn retarget_producer_into_copy_impl(
         } else {
             REG_NAMES[1][d_fam as usize]
         };
-        let new_line = format!("    {}{}, {}", op, prod_src, new_dst);
+        let new_line = narrowed.unwrap_or_else(|| format!("    {}{}, {}", op, prod_src, new_dst));
         if !aliasing && line_refs_family(&new_line, a_fam) {
             i += 1;
             continue;
@@ -2695,6 +2767,7 @@ fn names_family_narrow(line: &str, fam: RegId) -> bool {
 pub(super) fn rename_chain_into_copy(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
     let mut lv = FileLiveness::new(store, infos);
+    let mut rbp_roles = RbpRoles::default();
     let mut changed = false;
     let mut i = 0;
     while i < len {
@@ -2796,10 +2869,29 @@ pub(super) fn rename_chain_into_copy(store: &mut LineStore, infos: &mut [LineInf
             i += 1;
             continue;
         };
+        // `%rbp` is a destination only where the function uses it as a
+        // plain GPR (frame-pointer-omitted code), as in the sibling
+        // `retarget_producer_into_copy`.
+        let rbp_gpr = d == REG_RBP && rbp_roles.is_gpr(&lv, store, infos, i);
+        // 64-bit producer, 32-bit copy: only an exact 32-bit form of a
+        // producer that is the window's sole mention of T qualifies.
+        let narrowed = if last_w == 64 && copy_w == 32 {
+            let sole = !window[1..]
+                .iter()
+                .any(|&w| line_refs_family(infos[w].trimmed(store.get(w)), t));
+            match narrowed_producer(op, prod_src, d) {
+                Some(line) if sole => Some(line),
+                _ => {
+                    i += 1;
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
         if real < 2
-            || matches!(d, 4 | 5)
-            || !is_writable_family_gpr(d, false)
-            || (last_w == 64 && copy_w == 32)
+            || d == 4
+            || !is_writable_family_gpr(d, rbp_gpr)
             || window[1..]
                 .iter()
                 .any(|&w| line_refs_family(infos[w].trimmed(store.get(w)), d))
@@ -2811,6 +2903,15 @@ pub(super) fn rename_chain_into_copy(store: &mut LineStore, infos: &mut [LineInf
         owned.push(j);
         if !provably_dead_lv(&lv, store, infos, j, t, &owned) {
             i += 1;
+            continue;
+        }
+        if let Some(line) = narrowed {
+            replace_line(store, &mut infos[i], i, line);
+            mark_nop(&mut infos[j]);
+            lv.refresh_span(store, infos, i, j);
+            rbp_roles.edited(&lv, store, infos, i);
+            changed = true;
+            i = j + 1;
             continue;
         }
         for &w in &window {
@@ -2831,6 +2932,7 @@ pub(super) fn rename_chain_into_copy(store: &mut LineStore, infos: &mut [LineInf
         }
         mark_nop(&mut infos[j]);
         lv.refresh_span(store, infos, i, j);
+        rbp_roles.edited(&lv, store, infos, i);
         changed = true;
         i = j + 1;
     }
@@ -3915,7 +4017,7 @@ fn dest_operand_text(t: &str) -> &str {
 /// immediate (`movq $imm`: GAS sign-extends imm32, so only nonnegative
 /// counts — `$0xFFFFFFFF` is -1, NOT small; `movabsq $imm64`: only low
 /// 32 bits set). Callers guarantee lowercase text (see `upper32_zero_at`).
-fn s_write_proves_upper_zero(t: &str, fam: RegId) -> bool {
+pub(super) fn s_write_proves_upper_zero(t: &str, fam: RegId) -> bool {
     if dest_operand_text(t) == REG_NAMES[1][fam as usize] {
         // ...except conditional writers: `cmov*`/`cfcmov*`/`cmpxchg*`/`bsf`/`bsr`/
         // `rdrand`/`rdseed` leave the dest unchanged on the untaken/failed
@@ -3979,7 +4081,9 @@ fn s_write_proves_upper_zero(t: &str, fam: RegId) -> bool {
 /// NEAREST S-family write: a proving write (see `s_write_proves_upper_zero`)
 /// proves it; any other write — a wider write, a partial write — refuses,
 /// as does reaching a barrier/call/pinned line, an implicit-register line,
-/// or an odd-case line first. Entry values (parameters) carry garbage upper
+/// or an odd-case line first. Reaching the block's label hands over to
+/// `FileLiveness::upper32_zero_into_label`, the same step run forwards as a
+/// CFG must-dataflow (every predecessor path must prove it). Entry values (parameters) carry garbage upper
 /// halves per SysV, so "no definer found" correctly refuses; reads of S
 /// between the definer and the copy are fine (they change nothing). The
 /// uniform stops (calls even for callee-saved S, implicit lines even for
@@ -4003,6 +4107,12 @@ pub(super) fn upper32_zero_at(
         }
         // (`ret` needs no stop here: a fold below an earlier `ret` rewrites
         // dead code, which is effect-free.)
+        // The block's label: no S-family write and no stop sits between it
+        // and the copy, so the proof is exactly "zero upper half on every
+        // path into the label" -- the CFG dataflow answers that.
+        if infos[n].kind == LineKind::Label && !infos[n].pinned {
+            return super::liveness::FileLiveness::upper32_zero_into_label(store, infos, n, s_fam);
+        }
         if infos[n].pinned || infos[n].is_barrier() {
             return false;
         }
@@ -5170,6 +5280,72 @@ mod tests {
             .filter(|l| !l.starts_with('.') && !l.ends_with(':'))
             .collect();
         (out, changed)
+    }
+
+    /// byte_load_reassembly's hot loop: a 64-bit LEA whose result only
+    /// reaches a 32-bit copy becomes the 32-bit LEA into the copy's
+    /// destination (the low half, zero-extended, either way).
+    #[test]
+    fn chain_rename_narrows_a_64_bit_lea_under_a_32_bit_copy() {
+        let (out, changed) = run_chain_rename(concat!(
+            "    leaq 24(%rdi), %r12\n",
+            "    movl (%r8, %rdi), %r15d\n",
+            "    xorl 8(%r8, %rdi), %r13d\n",
+            "    movl %r12d, %ebp\n",
+            "    xorl 24(%r8, %rdi), %ebp\n",
+            "    addl %ebp, %r15d\n",
+            "    movl %r15d, %eax\n",
+            "    ret\n",
+        ));
+        assert!(changed);
+        assert_eq!(out[0], "leal 24(%rdi), %ebp", "{out:?}");
+        assert!(!out.iter().any(|l| l.contains("r12")), "{out:?}");
+    }
+
+    /// Refusals: narrowing an 8-byte load to 4 bytes changes the access, a
+    /// window line reading the 64-bit T needs its upper half, and a frame
+    /// pointer is never a destination.
+    #[test]
+    fn chain_rename_keeps_wide_producers_without_an_exact_narrow_form() {
+        for body in [
+            concat!(
+                "    movq (%rsi), %r12\n",
+                "    addl $1, %r15d\n",
+                "    movl %r12d, %ebp\n",
+            ),
+            concat!(
+                "    leaq 24(%rdi), %r12\n",
+                "    movq %r12, (%rsi)\n",
+                "    movl %r12d, %ebp\n",
+            ),
+            // %rbp is the frame pointer here: never a retarget destination.
+            concat!(
+                "    pushq %rbp\n",
+                "    movq %rsp, %rbp\n",
+                "    leaq 24(%rdi), %r12\n",
+                "    addl $1, %r15d\n",
+                "    movl %r12d, %ebp\n",
+            ),
+        ] {
+            let body = format!("{body}    addl %ebp, %r15d\n    movl %r15d, %eax\n    ret\n");
+            let (out, _) = run_chain_rename(&body);
+            assert!(out.iter().any(|l| l == "movl %r12d, %ebp"), "{out:?}");
+        }
+    }
+
+    /// The adjacent pair goes through `retarget_producer_into_copy`, which
+    /// shares the narrowing rule (register-source `movq` -> `movl`).
+    #[test]
+    fn adjacent_wide_copy_under_a_32_bit_copy_is_narrowed() {
+        let out = run(concat!(
+            "f:\n.cfi_startproc\n",
+            "    leaq 7(%rdi,%rsi), %r9\n",
+            "    movl %r9d, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("leal 7(%rdi,%rsi), %eax"), "{out}");
+        assert!(!out.contains("%r9"), "{out}");
     }
 
     /// The chain's producer copies the copy's own destination: renaming the
@@ -9171,6 +9347,57 @@ mod rbp_role_and_span_tests {
             // Drain any queued re-analysis the way a query does.
             dead.dead_after(&store, &infos, j, 1, &[j]);
             assert_matches_fresh(&dead, &store, &infos);
+        }
+    }
+}
+
+#[cfg(test)]
+mod setcc_zext_kill_tests {
+    use super::*;
+
+    fn dead_after_first(body: &str, fam: RegId) -> bool {
+        let text = format!("foo:\n.cfi_startproc\n    nop\n{body}\n.cfi_endproc\n");
+        let store = LineStore::new(text);
+        let infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        dead_in_block_after(&store, &infos, 3, fam)
+    }
+
+    #[test]
+    fn boolean_materialisation_kills_the_family() {
+        for zx in ["movzbl %r11b, %r11d", "movzbq %r11b, %r11"] {
+            assert!(dead_after_first(
+                &format!("    setl %r11b\n    {zx}\n    ret"),
+                11
+            ));
+        }
+        // %spl-style low bytes of the REX-only spellings.
+        assert!(dead_after_first(
+            "    sete %sil\n    movzbl %sil, %esi\n    ret",
+            6
+        ));
+    }
+
+    #[test]
+    fn anything_but_the_exact_pair_still_observes_the_old_value() {
+        for body in [
+            // A lone partial write preserves bits 8-63.
+            "    setl %r11b\n    ret",
+            // The widening reads another register or writes another family.
+            "    setl %r11b\n    movzbl %r10b, %r11d\n    ret",
+            "    setl %r11b\n    movzbl %r11b, %r10d\n    movq %r11, %rax\n    ret",
+            // A 16-bit widening keeps bits 16-63.
+            "    setl %r11b\n    movzbw %r11b, %r11w\n    ret",
+            // Not adjacent within the block.
+            "    setl %r11b\n.Lx:\n    movzbl %r11b, %r11d\n    ret",
+            "    setl %r11b\n    addq %r11, %rax\n    movzbl %r11b, %r11d\n    ret",
+            // A high-byte write is not the low-byte idiom.
+            "    setl %ah\n    movzbl %ah, %eax\n    ret",
+        ] {
+            // Family 11 is %r11 (REG_NAMES order).
+            let fam = if body.contains("%ah") { 0 } else { 11 };
+            assert!(!dead_after_first(body, fam), "{body}");
         }
     }
 }

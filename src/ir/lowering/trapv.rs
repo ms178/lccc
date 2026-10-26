@@ -138,6 +138,22 @@ impl Lowerer {
                     self.emit_trapv_guard(ovf);
                     res
                 }
+                IrBinOp::Mul if crate::common::types::target_is_32bit() => {
+                    // I128 is not an arithmetic type on ILP32 targets (no
+                    // `__int128` in GCC; the i686 backend carries only its
+                    // low 64 bits), so the I128 product below made every
+                    // i686 `long long` multiply trap, `0 * 0` included.
+                    // Take the 64-bit-pair lowering that
+                    // `__builtin_mul_overflow` uses on these targets.
+                    let (res, ovf) = self.lower_overflow_u64_pair(
+                        IrBinOp::Mul,
+                        (lhs, IrType::I64),
+                        (rhs, IrType::I64),
+                        IrType::I64,
+                    );
+                    self.emit_trapv_guard(ovf);
+                    res
+                }
                 IrBinOp::Mul => {
                     // Exact product in I128; overflows I64 iff sext64(trunc64(p)) != p.
                     let lhs128 = self.emit_cast_val(lhs, IrType::I64, IrType::I128);

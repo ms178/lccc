@@ -3893,9 +3893,9 @@ impl X86Codegen {
                 self.state.emit("    vmovdqu %ymm1, 32(%rdi)");
             }
             self.state.emit("    vzeroupper");
-            // The upper halves are clean again right here; any later 256-bit
-            // op re-arms the epilogue vzeroupper via dirty_upper_ymm.
-            self.state.dirty_upper_ymm = false;
+            // This copy cleans only its own YMM writes. `dirty_upper_ymm` is
+            // tracked in emission order, not per path, so it must keep any
+            // dirt an earlier-emitted block left on a path that bypasses it.
             self.state.reg_cache.invalidate_all();
             return;
         }

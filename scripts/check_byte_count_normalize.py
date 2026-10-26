@@ -50,6 +50,8 @@ def main():
         ('normalized', cc, {}, common),
         ('disabled', cc, {'CCC_DISABLE_PASSES': 'byte_count_normalize'}, common),
         ('baseline-isa', cc, {}, ['-O2', '-march=x86-64', '-fwrapv']),
+        ('disabled-baseline-isa', cc, {'CCC_DISABLE_PASSES': 'byte_count_normalize'},
+         ['-O2', '-march=x86-64', '-fwrapv']),
         ('no-avx', cc, {}, [*common, '-mno-avx']),
         ('O3', cc, {}, ['-O3', '-march=x86-64-v3', '-fwrapv']),
     ])
@@ -72,23 +74,31 @@ def main():
                 raise ValueError('output mismatch: '+label)
             run([compiler, *flags, SOURCE, '-S', '-o', assembly], env)
             text = assembly.read_text()
+            # AVX2 counts with VEX `vpsadbw` on ymm; below the AVX ceiling the
+            # same reduction is the legacy-SSE2 `psadbw` on xmm (16 lanes).
             packed = 'vpsadbw' in text
-            focused = None
+            legacy = re.compile(r'(?m)^\s*psadbw\s')
+            focused = focused_sse2 = None
             if compiler == cc:
                 begin = re.search(r'(?m)^count_2_4097:\s*$', text)
                 end = re.search(r'(?m)^\s*\.size\s+count_2_4097\s*,', text)
                 if begin is None or end is None or end.start() <= begin.end():
                     raise ValueError('missing focused count function: '+label)
-                focused = 'vpsadbw' in text[begin.end():end.start()]
+                body = text[begin.end():end.start()]
+                focused = 'vpsadbw' in body
+                focused_sse2 = legacy.search(body) is not None
             if label == 'normalized' and not focused:
                 raise ValueError('positive arm did not exercise normalized packed counting')
-            if label == 'disabled' and focused:
+            if label in ('disabled', 'disabled-baseline-isa') and (focused or focused_sse2):
                 raise ValueError('normalization kill switch did not preserve the scalar witness')
-            if label in ('baseline-isa', 'no-avx') and packed:
+            if label in ('baseline-isa', 'disabled-baseline-isa', 'no-avx') and packed:
                 raise ValueError('AVX2 instruction escaped the ISA ceiling')
+            if label in ('baseline-isa', 'no-avx') and not focused_sse2:
+                raise ValueError('SSE2 arm did not exercise normalized psadbw counting: '+label)
             row = {'arm': label, 'command': [str(x) for x in cmd], 'environment': extra,
                    'compiler_version': run([compiler, '--version'], env), 'stdout': output,
-                   'packed_count_present': packed, 'focused_count_packed': focused, 'assembly_sha256': hashlib.sha256(assembly.read_bytes()).hexdigest()}
+                   'packed_count_present': packed, 'focused_count_packed': focused,
+                   'focused_count_packed_sse2': focused_sse2, 'assembly_sha256': hashlib.sha256(assembly.read_bytes()).hexdigest()}
             if a.memcheck:
                 log = a.output / (label+'.memcheck')
                 checked = run(['valgrind', '--error-exitcode=97', '--leak-check=full', f'--log-file={log}', binary], env)

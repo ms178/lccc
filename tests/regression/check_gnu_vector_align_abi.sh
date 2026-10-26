@@ -191,7 +191,9 @@ for lanes in 8 16; do
 done
 
 # Part 3: i386. Every vector width and every compiler pairing must agree.
-if [ "$i386_ok" = yes ]; then
+if [ "$i386_ok" = yes ] && ! gcc_oracle_require_m32_sse2 "$gate"; then
+    bad "i386 oracle default target (see above)"
+elif [ "$i386_ok" = yes ]; then
     for lanes in 4 8 16; do
         for opt in -O0 -O2; do
             if ! build 32 "$opt" "$lanes"; then bad "i386 build v$((lanes * 4)) $opt"; continue; fi
