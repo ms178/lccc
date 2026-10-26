@@ -672,8 +672,8 @@ for name, mn, rty, m in FP128_BLENDV:
          f"{{ return __CCC_{m}_FROM_BUILTIN(__lccc_simd128_ps_{mn}(0, __mask, __a, __b)); }}")
 for name, mn, rty, m in FP128_FMA:
     proto(f"128_ps_{mn}", rty[2:], ["long", rty + " __a", rty + " __b", rty + " __c"])
-    wrap(f"{rty} _mm_{name}({rty} __a, {rty} __b, {rty} __c)",
-         f"{{ return __CCC_{m}_FROM_BUILTIN(__lccc_simd128_ps_{mn}(0, __a, __b, __c)); }}")
+    macro(f"_mm_{name}(__a, __b, __c)",
+          f"__CCC_{m}_FROM_BUILTIN(__lccc_simd128_ps_{mn}(0, __a, __b, __c))")
 for name, mn, rty, m in FP128_MOV:
     proto(f"128_ps_{mn}", rty[2:], ["long", rty + " __a", rty + " __b"])
     wrap(f"{rty} _mm_{name}({rty} __a, {rty} __b)",
@@ -752,8 +752,8 @@ for name, mn, rty, m in FP256_BLENDV:
          f"{{ return __CCC_{m}_FROM_BUILTIN(__lccc_simd256_ps_{mn}(0, __mask, __a, __b)); }}")
 for name, mn, rty, m in FP256_FMA:
     proto(f"256_ps_{mn}", rty[2:], ["long", rty + " __a", rty + " __b", rty + " __c"])
-    wrap(f"{rty} _mm256_{name}({rty} __a, {rty} __b, {rty} __c)",
-         f"{{ return __CCC_{m}_FROM_BUILTIN(__lccc_simd256_ps_{mn}(0, __a, __b, __c)); }}")
+    macro(f"_mm256_{name}(__a, __b, __c)",
+          f"__CCC_{m}_FROM_BUILTIN(__lccc_simd256_ps_{mn}(0, __a, __b, __c))")
 for name, mn, rty, m in FP256_MISC:
     family = "pd" if name.endswith("_pd") else "ps"
     if name.startswith("extract"):

@@ -17,14 +17,35 @@ import re
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = ROOT / 'engineering/isa/sse-avx-public-api.json'
 REFERENCE = ROOT / 'engineering/isa/gcc16-sse-avx-reference.json'
-HEADERS = ('xmmintrin.h', 'emmintrin.h', 'pmmintrin.h', 'tmmintrin.h',
-           'smmintrin.h', 'nmmintrin.h', 'avxintrin.h', 'avx2intrin.h')
+BUNDLE_HEADERS = (
+    'xmmintrin.h', 'emmintrin.h', 'pmmintrin.h', 'tmmintrin.h',
+    'smmintrin.h', 'nmmintrin.h', 'avxintrin.h', 'avx2intrin.h',
+    'wmmintrin.h', 'shaintrin.h', 'fmaintrin.h', 'avx512fintrin.h',
+)
+REFERENCE_HEADERS = (
+    'xmmintrin.h', 'emmintrin.h', 'pmmintrin.h', 'tmmintrin.h',
+    'smmintrin.h', 'nmmintrin.h', 'avxintrin.h', 'avx2intrin.h',
+    'wmmintrin.h', 'shaintrin.h', 'fmaintrin.h', 'fma4intrin.h',
+    'avx5124fmapsintrin.h', 'avx5124vnniwintrin.h', 'avx512bf16intrin.h',
+    'avx512bf16vlintrin.h', 'avx512bitalgintrin.h', 'avx512bitalgvlintrin.h',
+    'avx512bmmintrin.h', 'avx512bmmvlintrin.h', 'avx512bwintrin.h',
+    'avx512cdintrin.h', 'avx512dqintrin.h', 'avx512erintrin.h',
+    'avx512fintrin.h', 'avx512fp16intrin.h', 'avx512fp16vlintrin.h',
+    'avx512ifmaintrin.h', 'avx512ifmavlintrin.h', 'avx512pfintrin.h',
+    'avx512vbmi2intrin.h', 'avx512vbmi2vlintrin.h', 'avx512vbmiintrin.h',
+    'avx512vbmivlintrin.h', 'avx512vlbwintrin.h', 'avx512vldqintrin.h',
+    'avx512vlintrin.h', 'avx512vnniintrin.h', 'avx512vnnivlintrin.h',
+    'avx512vp2intersectintrin.h', 'avx512vp2intersectvlintrin.h',
+    'avx512vpopcntdqintrin.h', 'avx512vpopcntdqvlintrin.h',
+    'gfniintrin.h', 'vaesintrin.h', 'vpclmulqdqintrin.h',
+    'avxvnniintrin.h', 'avxvnniint8intrin.h', 'avxvnniint16intrin.h',
+)
 COMMENT = re.compile(r'/\*.*?\*/|//[^\n]*', re.S)
-DEFINITION = re.compile(r'^[^\n;#={}]*?\b(_mm(?:256)?_\w+)\s*\(', re.M)
-MACRO = re.compile(r'^\s*#\s*define\s+(_mm(?:256)?_\w+)\(', re.M)
-OBJECT_ALIAS = re.compile(r'^\s*#\s*define\s+(_mm(?:256)?_\w+)[ \t]+(_mm(?:256)?_\w+)\s*$', re.M)
-CALL = re.compile(r'\b((?:__builtin_ia32_|__lccc_simd|_mm(?:256)?_)\w*)\s*\(')
-CANONICAL = re.compile(r'm\.insert\(\s*"(_mm(?:256)?_\w+)"\s*,\s*BuiltinInfo::intrinsic\(', re.S)
+DEFINITION = re.compile(r'^[^\n;#={}]*?\b(_mm(?:128|256|512)?_\w+)\s*\(', re.M)
+MACRO = re.compile(r'^\s*#\s*define\s+(_mm(?:128|256|512)?_\w+)\(', re.M)
+OBJECT_ALIAS = re.compile(r'^\s*#\s*define\s+(_mm(?:128|256|512)?_\w+)[ \t]+(_mm(?:128|256|512)?_\w+)\s*$', re.M)
+CALL = re.compile(r'\b((?:__builtin_ia32_|__lccc_simd|_mm(?:128|256|512)?_)\w*)\s*\(')
+CANONICAL = re.compile(r'm\.insert\(\s*"(_mm(?:128|256|512)?_\w+)"\s*,\s*BuiltinInfo::intrinsic\(', re.S)
 
 
 def closing(text, start, left='(', right=')'):
@@ -62,7 +83,7 @@ def self_test():
         (root / 'src/frontend/sema').mkdir(parents=True)
         (root / 'src/frontend/sema/builtins.rs').write_text('')
         (root / 'include').mkdir()
-        for h in HEADERS:
+        for h in BUNDLE_HEADERS:
             (root / 'include' / h).write_text('')
         (root / 'include/xmmintrin.h').write_text(r'''/* _mm_fake(void) { } */
 static inline V _mm_test(V a,
@@ -93,10 +114,12 @@ static inline V _mm_callback(void (*f)(int, int), V a) __attribute__((unused)) {
 
 
 def inventory(root=ROOT, header_root=None):
+    reference_mode = header_root is not None
     header_root = header_root or root / 'include'
     aliases = set(CANONICAL.findall((root / 'src/frontend/sema/builtins.rs').read_text()))
     rows = []
-    headers = HEADERS + (('lcccsimd.h',) if (header_root / 'lcccsimd.h').exists() else ())
+    headers = (REFERENCE_HEADERS if reference_mode else BUNDLE_HEADERS)
+    headers += (('lcccsimd.h',) if (header_root / 'lcccsimd.h').exists() else ())
     for header in headers:
         path = header_root / header
         raw = path.read_text()
@@ -161,11 +184,23 @@ def main():
     group.add_argument('--check', action='store_true')
     group.add_argument('--json', action='store_true')
     group.add_argument('--write-reference', action='store_true')
+    group.add_argument('--write-reference-source', metavar='HEADER_DIR', help='inventory pinned GCC 16.2 source headers')
     group.add_argument('--self-test', action='store_true')
     parser.add_argument('--gcc', default='gcc-16')
     args = parser.parse_args()
     if args.self_test:
         self_test()
+        return
+    if args.write_reference_source:
+        header_dir = Path(args.write_reference_source)
+        reference = inventory(header_root=header_dir)
+        data = {'schema': 1, 'compiler': 'GCC 16.2.0 source headers',
+                'source': 'gcc-mirror/gcc tag releases/gcc-16.2.0',
+                'revision': '78d4ac73dd391005b895a6148cd9831e28e1208b',
+                'headers_sha256': {h: hashlib.sha256((header_dir / h).read_bytes()).hexdigest() for h in REFERENCE_HEADERS},
+                'names': sorted({r['name'] for r in reference['apis']})}
+        REFERENCE.write_text(json.dumps(data, indent=2, sort_keys=True) + '\n')
+        print(f"GCC 16.2.0 source reference: {len(data['names'])} public names")
         return
     if args.write_reference:
         def gcc(*flags):
@@ -175,7 +210,7 @@ def main():
         include = Path(gcc('-print-file-name=include'))
         reference = inventory(header_root=include)
         data = {'schema': 1, 'compiler': gcc('--version').splitlines()[0],
-                'headers_sha256': {h: hashlib.sha256((include / h).read_bytes()).hexdigest() for h in HEADERS},
+                'headers_sha256': {h: hashlib.sha256((include / h).read_bytes()).hexdigest() for h in REFERENCE_HEADERS},
                 'names': sorted({r['name'] for r in reference['apis']})}
         REFERENCE.write_text(json.dumps(data, indent=2, sort_keys=True) + '\n')
         print(f"GCC reference: {len(data['names'])} public names")

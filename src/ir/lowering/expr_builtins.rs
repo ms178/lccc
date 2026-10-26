@@ -2779,11 +2779,91 @@ impl Lowerer {
             F::Sse42 => Some(5),
             _ => None,
         };
-        if let (Some(needed), Some(function)) = (needed, self.func_state.as_ref()) {
+        if let Some(function) = self.func_state.as_ref() {
             for request in &function.target_features {
                 let (enabled, feature) = request
                     .strip_prefix("no-")
                     .map_or((true, request.as_str()), |f| (false, f));
+                // Exact target-feature grants also cover FMA and AVX-512
+                // subsets, which are independent features rather than rungs
+                // in the legacy SSE/AVX level ladder. An enabled AVX-512
+                // subset implies its F base; disabling one subset does not
+                // revoke the independent F capability.
+                let avx512_feature = matches!(
+                    feature,
+                    "avx512f"
+                        | "avx512bw"
+                        | "avx512dq"
+                        | "avx512vl"
+                        | "avx512cd"
+                        | "avx512ifma"
+                        | "avx512vbmi"
+                        | "avx512vbmi2"
+                        | "avx512vnni"
+                        | "avx512bitalg"
+                        | "avx512vpopcntdq"
+                        | "avx512bf16"
+                        | "avx512fp16"
+                        | "avx512er"
+                        | "avx512pf"
+                        | "avx512vp2intersect"
+                        | "avx512bmm"
+                );
+                let avx512_bw_dependent = matches!(
+                    requirement.feature,
+                    F::Avx512Vbmi
+                        | F::Avx512Vbmi2
+                        | F::Avx512BitAlg
+                        | F::Avx512Bf16
+                        | F::Avx512Fp16
+                        | F::Avx512Bmm
+                );
+                if feature == "avx512f" {
+                    if avx512_feature {
+                        permitted = enabled;
+                    }
+                    continue;
+                }
+                if !enabled && feature == "avx512bw" && avx512_bw_dependent {
+                    permitted = false;
+                    continue;
+                }
+                if feature == requirement.feature.name() {
+                    permitted = enabled;
+                    continue;
+                }
+                if enabled && requirement.feature == F::Avx512F && avx512_feature {
+                    permitted = true;
+                    continue;
+                }
+                if enabled
+                    && requirement.feature == F::Avx512Bw
+                    && matches!(
+                        feature,
+                        "avx512vbmi" | "avx512vbmi2" | "avx512bitalg" | "avx512bf16" | "avx512fp16"
+                    )
+                {
+                    permitted = true;
+                    continue;
+                }
+                if enabled && requirement.feature == F::Avx512Dq && feature == "avx512vp2intersect"
+                {
+                    permitted = true;
+                    continue;
+                }
+                if !enabled
+                    && requirement.feature == F::Fma
+                    && matches!(
+                        feature,
+                        "sse" | "sse2" | "sse3" | "ssse3" | "sse4.1" | "sse4.2" | "avx"
+                    )
+                {
+                    permitted = false;
+                    continue;
+                }
+                let Some(needed) = needed else {
+                    continue;
+                };
                 let level = match feature {
                     "sse" => 0,
                     "sse2" => 1,

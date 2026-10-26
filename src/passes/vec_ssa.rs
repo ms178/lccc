@@ -15,9 +15,11 @@
 //!
 //! Eligibility is fail-closed.  An alloca is promoted only when EVERY
 //! mention of it in the function is a full-width, zero-offset load or store
-//! of one family whose width equals the alloca size.  Any other use — a GEP
+//! of full-register families whose width equals the alloca size. These loads
+//! and stores copy register images: changing the lane interpretation is a
+//! bitcast, not a numeric conversion (Intel SDM Vol. 1 §4.6.2). Any other use — a GEP
 //! (lane access), a `Memcpy`, a scalar `Load`/`Store`, an address escape
-//! into a call, a terminator operand, a different family — keeps the object
+//! into a call, a terminator operand, a different byte width — keeps the object
 //! in memory.  Parameter allocas take part too: their initial contents are
 //! written by the backend prologue capture (no IR producer), so a read not
 //! dominated by a store is seeded with ONE entry-prefix `VecLoad` of the
@@ -252,8 +254,12 @@ fn find_candidates(func: &IrFunction, table: &FxHashMap<IntrinsicOp, Family>) ->
                         };
                         let shape_ok = uses_of(inst, a) == expected
                             && fam.bytes == sizes.get(&a).copied().unwrap_or(0)
-                            && (cand.family.bytes == 0 || cand.family == fam);
+                            && (cand.family.bytes == 0 || cand.family.bytes == fam.bytes);
                         if shape_ok {
+                            // Every admitted endpoint copies ALL bytes, without
+                            // a numeric conversion or an alignment promise.
+                            // FP/integer lane labels do not change the image;
+                            // retain a concrete family only for seeds/phis.
                             cand.family = fam;
                             if matches!(access, Some(Access::Store { .. })) {
                                 cand.def_blocks.insert(bi);
@@ -1243,6 +1249,142 @@ mod tests {
             &insts[1],
             Instruction::Intrinsic { args, .. } if args[0] == Operand::Value(x)
         ));
+    }
+
+    #[test]
+    fn equal_width_bitcast_families_forward_the_exact_register_image() {
+        crate::passes::vectorize::set_x86_simd_isa(true, true, true, false);
+        let table = family_table();
+        for bytes in [16usize, 32] {
+            for source_ty in [
+                IrType::I8,
+                IrType::I16,
+                IrType::I32,
+                IrType::I64,
+                IrType::F32,
+                IrType::F64,
+            ] {
+                for result_ty in [
+                    IrType::I8,
+                    IrType::I16,
+                    IrType::I32,
+                    IrType::I64,
+                    IrType::F32,
+                    IrType::F64,
+                ] {
+                    let source = family_for(source_ty, bytes / source_ty.size()).unwrap();
+                    let result = family_for(result_ty, bytes / result_ty.size()).unwrap();
+                    let mut f = func_with_blocks(vec![block(
+                        0,
+                        vec![
+                            Instruction::Alloca {
+                                dest: Value(0),
+                                ty: IrType::Ptr,
+                                size: bytes,
+                                align: bytes,
+                                volatile: false,
+                                semantic_volatile: false,
+                            },
+                            intr(
+                                1,
+                                source.load,
+                                vec![
+                                    val(9),
+                                    Operand::Const(crate::ir::reexports::IrConst::I64(0)),
+                                ],
+                            ),
+                            Instruction::Intrinsic {
+                                dest: None,
+                                op: source.store,
+                                dest_ptr: Some(Value(0)),
+                                args: vec![
+                                    val(1),
+                                    val(0),
+                                    Operand::Const(crate::ir::reexports::IrConst::I64(0)),
+                                ],
+                            },
+                            intr(
+                                2,
+                                result.load,
+                                vec![
+                                    val(0),
+                                    Operand::Const(crate::ir::reexports::IrConst::I64(0)),
+                                ],
+                            ),
+                        ],
+                        Terminator::Return(Some(val(2))),
+                    )]);
+                    f.next_value_id = 10;
+                    assert_eq!(
+                        promote_function(&mut f, &table),
+                        1,
+                        "{bytes}/{source_ty:?}/{result_ty:?}"
+                    );
+                    assert_eq!(
+                        f.blocks[0].instructions.len(),
+                        1,
+                        "no bit conversion or memory bridge"
+                    );
+                    assert_eq!(returned(&f), 1, "must preserve the producer's exact bits");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn different_width_bitcast_and_volatile_images_stay_in_memory() {
+        crate::passes::vectorize::set_x86_simd_isa(true, false, true, false);
+        let table = family_table();
+        for (load, volatile, semantic_volatile, offset) in [
+            (IntrinsicOp::VecLoadF64x4, false, false, 0),
+            (IntrinsicOp::VecLoadF64x2, true, false, 0),
+            (IntrinsicOp::VecLoadF64x2, false, true, 0),
+            (IntrinsicOp::VecLoadF64x2, false, false, 8),
+        ] {
+            let mut f = func_with_blocks(vec![block(
+                0,
+                vec![
+                    Instruction::Alloca {
+                        dest: Value(0),
+                        ty: IrType::Ptr,
+                        size: 16,
+                        align: 16,
+                        volatile,
+                        semantic_volatile,
+                    },
+                    intr(
+                        1,
+                        IntrinsicOp::VecLoadI64x2,
+                        vec![
+                            val(9),
+                            Operand::Const(crate::ir::reexports::IrConst::I64(0)),
+                        ],
+                    ),
+                    Instruction::Intrinsic {
+                        dest: None,
+                        op: IntrinsicOp::VecStoreI64x2,
+                        dest_ptr: Some(Value(0)),
+                        args: vec![
+                            val(1),
+                            val(0),
+                            Operand::Const(crate::ir::reexports::IrConst::I64(0)),
+                        ],
+                    },
+                    intr(
+                        2,
+                        load,
+                        vec![
+                            val(0),
+                            Operand::Const(crate::ir::reexports::IrConst::I64(offset)),
+                        ],
+                    ),
+                ],
+                Terminator::Return(Some(val(2))),
+            )]);
+            f.next_value_id = 10;
+            assert_eq!(promote_function(&mut f, &table), 0);
+            assert_eq!(f.blocks[0].instructions.len(), 4);
+        }
     }
 
     #[test]

@@ -826,6 +826,7 @@ impl Preprocessor {
         avx512er: bool,
         avx512pf: bool,
         avx512vp2intersect: bool,
+        avx512bmm: bool,
         avxvnni: bool,
         avxifma: bool,
         avxneconvert: bool,
@@ -950,6 +951,9 @@ impl Preprocessor {
         }
         if avx512vp2intersect {
             self.define_simple_macro("__AVX512VP2INTERSECT__", "1");
+        }
+        if avx512bmm {
+            self.define_simple_macro("__AVX512BMM__", "1");
         }
         // AVX-VNNI / AVX10 / GFNI / VAES / VPCLMULQDQ macros.
         if avxvnni {

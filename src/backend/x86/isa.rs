@@ -162,7 +162,10 @@ impl X86Isa {
                     self.sse41 = true;
                     self.avx = true;
                 }
-                "avx2" | "avx512f" | "avx512bw" | "avx512dq" | "avx512vl" => {
+                "avx2" | "avx512f" | "avx512cd" | "avx512dq" | "avx512bw" | "avx512vl"
+                | "avx512ifma" | "avx512vbmi" | "avx512vbmi2" | "avx512vnni" | "avx512bitalg"
+                | "avx512vpopcntdq" | "avx512bf16" | "avx512fp16" | "avx512er" | "avx512pf"
+                | "avx512vp2intersect" | "avx512bmm" => {
                     self.simd = true;
                     self.sse41 = true;
                     self.avx = true;
@@ -224,8 +227,11 @@ impl X86Isa {
                 "general-regs-only" | "no-sse" | "no-sse2" => {
                     self.simd = false;
                 }
-                "no-sse4" | "no-sse4.1" => {
+                "no-sse3" | "no-ssse3" | "no-sse4" | "no-sse4.1" => {
                     self.sse41 = false;
+                }
+                "no-sse4.2" => {
+                    self.avx = false;
                 }
                 "no-avx" => {
                     self.avx = false;
@@ -333,6 +339,21 @@ mod tests {
         };
         let n = no_vex_fma.normalized();
         assert!(n.simd && n.sse41 && !n.avx && !n.ymm && !n.fma);
+    }
+
+    #[test]
+    fn local_sse_and_avx_denials_revoke_fma_prerequisites() {
+        for denied in ["no-sse3", "no-ssse3", "no-sse4.1", "no-sse4.2", "no-avx"] {
+            let features = vec!["fma".to_string(), denied.to_string()];
+            let isa = X86Isa::SSE2.with_target_features(&features);
+            assert!(
+                !isa.avx && !isa.fma,
+                "{denied} left VEX FMA enabled: {isa:?}"
+            );
+        }
+        let denied_after_grant =
+            X86Isa::SSE2.with_target_features(&["no-avx".to_string(), "fma".to_string()]);
+        assert!(!denied_after_grant.avx && !denied_after_grant.fma);
     }
 
     #[test]

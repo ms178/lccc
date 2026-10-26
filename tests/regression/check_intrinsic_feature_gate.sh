@@ -11,6 +11,7 @@
 # verdicts below are checked against GCC wherever GCC has the intrinsic --
 # the gate cannot pass by rejecting more than the oracle does.
 set -euo pipefail
+trap 'status=$?; printf "FAIL: %s:%d command failed (status %d): %s\n" "${BASH_SOURCE[0]}" "$LINENO" "$status" "$BASH_COMMAND" >&2; exit "$status"' ERR
 
 repo=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 ccc=${CCC:-$repo/target/fastbuild/lccc}
@@ -71,7 +72,13 @@ accept() {
     local src=$1 want=$2
     shift 2
     local asm=$tmp/accept-${src%.c}-$(echo "$@" | tr -c 'a-z0-9' '_').s
-    "$ccc" -O2 "$@" -S "$tmp/$src" -o "$asm"
+    if "$ccc" -O2 "$@" -S "$tmp/$src" -o "$asm"; then
+        :
+    else
+        local rc=$?
+        printf 'FAIL: accept witness %s with %s: compiler exited %d\n' "$src" "$*" "$rc" >&2
+        return "$rc"
+    fi
     grep -qE "^[[:space:]]+v?$want" "$asm" ||
         { printf '%s\n' "$(cat "$asm")" >&2;
           fail "$src with $*: expected $want to be emitted"; }
@@ -429,6 +436,7 @@ for mode in -m32 -m64; do
     compare shift256.c "$mode" -mavx2
 done
 
+echo "CHECK: VTEST scalar flags and XMM/YMM encodings"
 # All VTEST scalar flags require AVX even at 128 bits; none require AVX2.
 # Compile-only raw vector sources need no target libc headers in either mode.
 for bits in 128 256; do
@@ -451,6 +459,7 @@ EOF
     done
 done
 
+echo "CHECK: AVX2 widening permissions"
 # Widening instructions are AVX2, unlike floating-point VTEST. Even when
 # only four low source bytes participate, the C input remains a 128-bit value.
 for sign in sx zx; do
@@ -478,6 +487,7 @@ EOF
     done
 done
 
+echo "CHECK: malformed SIMD builtin operands"
 # Native builtins must reject scalar or wrong-width operands before codegen.
 cat >"$tmp/vtest_wrong_shape.c" <<'EOF'
 typedef float v4sf __attribute__((vector_size(16)));
@@ -492,6 +502,197 @@ for mode in -m64 -m32; do
     reject vtest_wrong_shape.c 'requires two' "$mode" -mavx
     reject widen_wrong_shape.c 'requires a 128-bit vector' "$mode" -mavx2
 done
+
+echo "CHECK: AVX-512 subset and function-local gates"
+# AVX-512 permissions follow the architectural subset conjunction, including
+# EVEX.128/256 VL encodings. The test operations are public wrappers so this
+# checks the same generic builtin path real headers use.
+cat >"$tmp/avx512_bw_vl.c" <<'EOF'
+#include <immintrin.h>
+__mmask16 cmp_u8(__m128i a, __m128i b) { return _mm_cmp_epu8_mask(a, b, _MM_CMPINT_EQ); }
+EOF
+cat >"$tmp/avx512_ternlog_vl.c" <<'EOF'
+#include <immintrin.h>
+__m128i tern(__m128i a, __m128i b, __m128i c) { return _mm_ternarylogic_epi32(a, b, c, 0x96); }
+EOF
+cat >"$tmp/avx512_maskload_bw_vl.c" <<'EOF'
+#include <immintrin.h>
+__m256i load(const void *p, __mmask32 k) { return _mm256_maskz_loadu_epi8(k, p); }
+EOF
+cat >"$tmp/avx512_f_qword.c" <<'EOF'
+#include <immintrin.h>
+__m512i absq(__m512i a) { return _mm512_abs_epi64(a); }
+EOF
+cat >"$tmp/avx512_bitalg.c" <<'EOF'
+#include <immintrin.h>
+__m512i pop8(__m512i a) { return _mm512_popcnt_epi8(a); }
+EOF
+cat >"$tmp/avx512_vpopcnt.c" <<'EOF'
+#include <immintrin.h>
+__m512i pop32(__m512i a) { return _mm512_popcnt_epi32(a); }
+EOF
+cat >"$tmp/avx512_vnni.c" <<'EOF'
+#include <immintrin.h>
+__m512i dot(__m512i a, __m512i b, __m512i c) { return _mm512_dpbusd_epi32(c, a, b); }
+EOF
+cat >"$tmp/avx512_fma.c" <<'EOF'
+#include <immintrin.h>
+__m512 fma512f(__m512 a, __m512 b, __m512 c) { return _mm512_fmadd_ps(a, b, c); }
+__m512d fma512d(__m512d a, __m512d b, __m512d c) { return _mm512_fmadd_pd(a, b, c); }
+EOF
+cat >"$tmp/avx512_fma_runtime.c" <<'EOF'
+#include <immintrin.h>
+__attribute__((noinline)) static float f32(float a, float b, float c) {
+    /* Use vector initializers: the feature-gate test should depend only on
+       the FMA helpers under test, not on optional broadcast helper coverage. */
+    __m512 x = {a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a};
+    __m512 y = {b,b,b,b,b,b,b,b,b,b,b,b,b,b,b,b};
+    __m512 z = {c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c};
+    return _mm512_fmadd_ps(x, y, z)[0];
+}
+__attribute__((noinline)) static double f64(double a, double b, double c) {
+    __m512d x = {a,a,a,a,a,a,a,a};
+    __m512d y = {b,b,b,b,b,b,b,b};
+    __m512d z = {c,c,c,c,c,c,c,c};
+    return _mm512_fmadd_pd(x, y, z)[0];
+}
+int main(void) {
+    if (!__builtin_cpu_supports("avx512f")) return 77;
+    volatile float a = 0x1.000002p0f, b = 0x1.fffffcp-1f, c = -1.0f;
+    volatile double x = 0x1.0000000000001p0, y = 0x1.ffffffffffffep-1, z = -1.0;
+    return f32(a, b, c) == -0x1p-46f && f64(x, y, z) == -0x1p-104 ? 0 : 1;
+}
+EOF
+reject avx512_bw_vl.c -mavx512bw -mno-avx512vl -march=x86-64
+reject avx512_bw_vl.c -mavx512vl -mno-avx512bw -march=x86-64
+accept avx512_bw_vl.c vpcmpub -mavx512bw -mavx512vl
+accept avx512_bw_vl.c vpcmpub -mavx512bw -mavx512vl -mno-avx512bw -mavx512bw
+reject avx512_bw_vl.c 'not implemented for i686' -m32 -mavx512bw -mavx512vl
+reject avx512_ternlog_vl.c -mavx512f -mno-avx512vl -march=x86-64
+accept avx512_ternlog_vl.c vpternlogd -mavx512f -mavx512vl
+reject avx512_maskload_bw_vl.c -mavx512bw -mno-avx512vl -march=x86-64
+accept avx512_maskload_bw_vl.c vmovdqu8 -mavx512bw -mavx512vl
+reject avx512_f_qword.c -mavx512f -march=x86-64
+accept avx512_f_qword.c vpabsq -march=x86-64 -mavx512f -mno-avx512dq
+reject avx512_bitalg.c -mavx512f -mno-avx512bitalg
+accept avx512_bitalg.c vpopcntb -mavx512bitalg
+reject avx512_vpopcnt.c -mavx512f -mno-avx512vpopcntdq
+accept avx512_vpopcnt.c vpopcntd -mavx512vpopcntdq
+reject avx512_vnni.c -mavx512f -mno-avx512vnni
+accept avx512_vnni.c vpdpbusd -mavx512vnni
+# EVEX FMA belongs to AVX512F; VEX FMA remains FMA3 and is not conflated.
+reject avx512_fma.c -mavx512f -march=x86-64
+accept avx512_fma.c vfmadd -mavx512f
+
+# Function-local FMA permission is independent of -ffp-contract; local AVX-512
+# subset grants must work without leaking into a neighboring baseline function.
+cat >"$tmp/local_fma.c" <<'EOF'
+#include <immintrin.h>
+__attribute__((target("fma"))) __m256 f(__m256 a, __m256 b, __m256 c) { return _mm256_fmadd_ps(a, b, c); }
+EOF
+accept local_fma.c vfmadd -march=x86-64
+cat >"$tmp/local_fma_no_avx.c" <<'EOF'
+#include <immintrin.h>
+__attribute__((target("fma,no-avx"))) __m256 f(__m256 a, __m256 b, __m256 c) { return _mm256_fmadd_ps(a, b, c); }
+EOF
+reject local_fma_no_avx.c -mfma -march=x86-64
+cat >"$tmp/local_bw_vl.c" <<'EOF'
+#include <immintrin.h>
+__attribute__((target("avx512bw,avx512vl"))) __mmask16 f(__m128i a, __m128i b) { return _mm_cmp_epu8_mask(a,b,_MM_CMPINT_EQ); }
+EOF
+accept local_bw_vl.c vpcmpub -march=x86-64
+cat >"$tmp/local_bw_denied.c" <<'EOF'
+#include <immintrin.h>
+__attribute__((target("no-avx512bw"))) __mmask16 f(__m128i a, __m128i b) { return _mm_cmp_epu8_mask(a,b,_MM_CMPINT_EQ); }
+EOF
+reject local_bw_denied.c -mavx512bw -march=x86-64 -mavx512bw -mavx512vl
+# A function-local BMM target alone does not grant BW, unlike the -m option.
+cat >"$tmp/local_bmm_no_implicit_bw.c" <<'EOF'
+#include <immintrin.h>
+__attribute__((target("avx512bmm"))) __m512i f(__m512i a, __m512i b) {
+    return *(__m512i *)__lccc_simd512_i_vpaddb512(0, a, b);
+}
+EOF
+reject local_bmm_no_implicit_bw.c -mavx512bw -march=x86-64
+cat >"$tmp/local_bmm_no_bw.c" <<'EOF'
+#include <immintrin.h>
+__attribute__((target("avx512bmm,no-avx512bw"))) __m512i f(__m512i a, __m512i b) {
+    return *(__m512i *)__lccc_simd512_i_vpaddb512(0, a, b);
+}
+EOF
+reject local_bmm_no_bw.c -mavx512bw -march=x86-64
+cat >"$tmp/local_fma_no_leak.c" <<'EOF'
+#include <immintrin.h>
+__attribute__((target("fma"))) __m256 f(__m256 a, __m256 b, __m256 c) { return _mm256_fmadd_ps(a,b,c); }
+__m256 g(__m256 a, __m256 b, __m256 c) { return _mm256_fmadd_ps(a,b,c); }
+EOF
+reject local_fma_no_leak.c -mfma -march=x86-64
+
+# GCC 16.2 is the authoritative verdict for feature flags, including each
+# independent subset and its VL conjunction. Older system GCC is not used as
+# an AVX-512 semantic oracle; run the exact compiler when the script is given.
+if "$gcc_bin" -dumpfullversion 2>/dev/null | grep -x '16.2.0' >/dev/null; then
+    # The scalar target flags are a dependency graph, not independent bits.
+    # Compare the complete AVX512 macro set for subset grants, prerequisite
+    # revocation, and re-grant order against the pinned GCC 16.2 oracle.
+    compare_avx512_macros() {
+        "$ccc" "$@" -dM -E -x c /dev/null | awk '/^#define __AVX512/ { print }' | sort >"$tmp/lccc-avx512-macros"
+        "$gcc_bin" "$@" -dM -E -x c /dev/null | awk '/^#define __AVX512/ { print }' | sort >"$tmp/gcc-avx512-macros"
+        diff -u "$tmp/gcc-avx512-macros" "$tmp/lccc-avx512-macros" ||
+            fail "AVX-512 predefined macros differ from GCC for flags: $*"
+    }
+    compare_avx512_macros -march=x86-64 -mavx512bmm
+    compare_avx512_macros -march=x86-64 -mavx512bmm -mno-avx512bmm
+    compare_avx512_macros -march=x86-64 -mavx512f -mavx512bmm -mno-avx512bmm
+    compare_avx512_macros -march=x86-64 -mavx512bw -mavx512bmm -mno-avx512bmm
+    compare_avx512_macros -march=x86-64 -mavx512bmm -mno-avx512bw
+    compare_avx512_macros -march=x86-64 -mavx512vbmi -mno-avx512bw
+    compare_avx512_macros -march=x86-64 -mavx512bf16
+    compare_avx512_macros -march=x86-64 -mavx512fp16
+    compare_avx512_macros -march=x86-64 -mavx512vbmi
+    compare_avx512_macros -march=x86-64 -mavx512vbmi2
+    compare_avx512_macros -march=x86-64 -mavx512bitalg
+    compare_avx512_macros -march=x86-64 -mavx512vp2intersect
+    compare_avx512_macros -march=x86-64 -mavx512vp2intersect -mno-avx512dq
+    compare_avx512_macros -march=x86-64 -mavx512vbmi -mno-avx512f
+    compare_avx512_macros -march=x86-64 -mavx512vbmi -mno-avx512f -mavx512vbmi
+
+    for src in avx512_bw_vl.c avx512_ternlog_vl.c avx512_maskload_bw_vl.c avx512_f_qword.c avx512_bitalg.c avx512_vpopcnt.c avx512_vnni.c avx512_fma.c; do
+        compare "$src" -march=x86-64
+        compare "$src" -march=x86-64 -mavx512f -mavx512bw -mavx512dq -mavx512vl -mavx512bitalg -mavx512vpopcntdq -mavx512vnni
+    done
+    compare avx512_bw_vl.c -march=x86-64 -mavx512f -mavx512vl
+    compare avx512_bw_vl.c -march=x86-64 -mavx512f -mavx512bw
+    compare avx512_bw_vl.c -march=x86-64 -mavx512bw -mavx512vl
+    compare avx512_f_qword.c -march=x86-64 -mavx512f -mno-avx512dq
+    compare avx512_vnni.c -march=x86-64 -mavx512f -mno-avx512vnni
+    compare local_fma.c -march=x86-64
+    compare local_fma_no_avx.c -march=x86-64
+    compare local_fma_no_leak.c -march=x86-64
+    compare local_bw_vl.c -march=x86-64
+    compare local_bw_denied.c -march=x86-64 -mavx512bw -mavx512vl
+    compare local_bmm_no_implicit_bw.c -march=x86-64
+    compare local_bmm_no_bw.c -march=x86-64
+
+    "$ccc" -O2 -mavx512f -ffp-contract=off "$tmp/avx512_fma_runtime.c" -o "$tmp/lccc-avx512-fma"
+    "$gcc_bin" -O2 -mavx512f -ffp-contract=off "$tmp/avx512_fma_runtime.c" -o "$tmp/gcc-avx512-fma"
+    if "$tmp/lccc-avx512-fma"; then
+        lccc_rc=0
+    else
+        lccc_rc=$?
+    fi
+    if [ "$lccc_rc" -eq 77 ]; then
+        echo "SKIP: host CPU does not advertise AVX512F; FMA runtime fixture compiled with both compilers"
+    else
+        if "$tmp/gcc-avx512-fma"; then
+            gcc_rc=0
+        else
+            gcc_rc=$?
+        fi
+        [ "$lccc_rc" -eq 0 ] && [ "$gcc_rc" -eq 0 ] ||
+            fail "AVX512F fused multiply-add exact-rounding runtime: lccc=$lccc_rc gcc=$gcc_rc"
+    fi
+fi
 
 echo "PASS: ISA-sensitive intrinsics are gated on the permitted feature set, oracle-checked"
 

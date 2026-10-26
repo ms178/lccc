@@ -415,15 +415,20 @@ pub(super) fn lccc_simd_lookup(
 
 /// Legacy native helper permissions follow the encoded instruction, not the
 /// result carrier: AVX conversions can return 128 bits, and 128-bit VPERMIL
-/// is still AVX. AVX-512 has separate subset requirements outside this audit.
-fn legacy_simd_feature(
-    mnemonic: &str,
-) -> Option<(crate::common::x86_features::X86Feature, &'static str)> {
+/// is still AVX. EVEX helpers use per-instruction subset requirements; a
+/// ZMM-width result is not itself evidence that AVX-512F is the only feature.
+type SimdFeatureRequirement = (crate::common::x86_features::X86Feature, &'static str);
+
+fn legacy_simd_feature(mnemonic: &str) -> Option<SimdFeatureRequirement> {
     use crate::common::x86_features::X86Feature as F;
     if mnemonic.ends_with("512") {
         return None;
     }
-    Some(if mnemonic.contains("fmadd") {
+    let fma_stem = mnemonic.strip_prefix('v').unwrap_or(mnemonic);
+    let is_fma3 = ["fmadd", "fmsub", "fnmadd", "fnmsub", "fmaddsub", "fmsubadd"]
+        .iter()
+        .any(|stem| fma_stem.starts_with(stem));
+    Some(if is_fma3 {
         (F::Fma, "-mfma")
     } else if mnemonic.starts_with('v') {
         (F::Avx, "-mavx")
@@ -444,6 +449,149 @@ fn legacy_simd_feature(
             _ => (F::Sse2, "-msse2"),
         }
     })
+}
+
+/// Required subsets for the EVEX instructions actually exposed by this
+/// builtin family. Keep this list instruction-based: AVX-512F does not imply
+/// BW/DQ, and the 128/256-bit EVEX forms additionally require AVX512VL.
+fn simd_feature_requirements(mnemonic: &str) -> Vec<SimdFeatureRequirement> {
+    use crate::common::x86_features::X86Feature as F;
+    let is_512 = mnemonic.ends_with("512") || mnemonic.ends_with("_512");
+    let mut req = Vec::new();
+
+    let evex = is_512
+        || mnemonic.starts_with("vpternlog")
+        || mnemonic.starts_with("vpcmpb")
+        || mnemonic.starts_with("vpcmpub")
+        || mnemonic.starts_with("vmovdqu8_mask")
+        || matches!(
+            mnemonic,
+            "vpshufb_maskz128" | "vpshufb_mask128" | "vcastsi512_256"
+        );
+    if evex {
+        push_feature(&mut req, F::Avx512F, "-mavx512f");
+    }
+
+    // Byte/word integer operations are AVX512BW, including the explicit
+    // low-width EVEX forms. The list follows the helper's encoded mnemonic,
+    // not its C carrier or signedness suffix.
+    let bw = [
+        "vpaddb",
+        "vpaddw",
+        "vpsubb",
+        "vpsubw",
+        "vpaddsb",
+        "vpaddsw",
+        "vpaddusb",
+        "vpaddusw",
+        "vpsubsb",
+        "vpsubsw",
+        "vpsubusb",
+        "vpsubusw",
+        "vpavgb",
+        "vpavgw",
+        "vpmaxub",
+        "vpminub",
+        "vpmaxuw",
+        "vpminuw",
+        "vpmaxsb",
+        "vpminsb",
+        "vpmaxsw",
+        "vpminsw",
+        "vpsadbw",
+        "vpmaddubsw",
+        "vpmaddwd",
+        "vpmullw",
+        "vpmulhw",
+        "vpmulhuw",
+        "vpshufb",
+        "vpabsb",
+        "vpabsw",
+        "vpunpcklbw",
+        "vpunpcklwd",
+        "vpunpckhbw",
+        "vpunpckhwd",
+        "vpacksswb",
+        "vpackuswb",
+        "vpackssdw",
+        "vpackusdw",
+        "vpsllw",
+        "vpsrlw",
+        "vpsraw",
+        "vpalignr",
+        "vpmovzxbw",
+        "vpmovzxbd",
+        "vpmovzxbq",
+        "vpmovzxwd",
+        "vpmovzxwq",
+        "vpmovsxbw",
+        "vpmovsxbd",
+        "vpmovsxbq",
+        "vpmovsxwd",
+        "vpmovsxwq",
+        "vpbroadcastb",
+        "vpbroadcastw",
+        "vpcmpb",
+        "vpcmpub",
+        "vpcmpw",
+        "vpcmpuw",
+        "vpcmpeqb",
+        "vpcmpeqw",
+        "vpcmpgtb",
+        "vpcmpgtw",
+        "vmovdqu8_mask",
+        "vpshufb_mask",
+    ];
+    if bw.iter().any(|stem| mnemonic.starts_with(stem)) {
+        push_feature(&mut req, F::Avx512Bw, "-mavx512bw");
+    }
+
+    // The qword absolute/min/max operations exposed here are AVX512F (the
+    // `q` describes lane width, not the AVX512DQ subset). Keep DQ distinct
+    // for future helpers whose instruction pages actually require that bit.
+
+    if mnemonic.starts_with("vpopcntb") || mnemonic.starts_with("vpopcntw") {
+        push_feature(&mut req, F::Avx512BitAlg, "-mavx512bitalg");
+    }
+    if mnemonic.starts_with("vpopcntd") || mnemonic.starts_with("vpopcntq") {
+        push_feature(&mut req, F::Avx512Vpopcntdq, "-mavx512vpopcntdq");
+    }
+    if mnemonic.starts_with("vpdpbusd") {
+        push_feature(&mut req, F::Avx512Vnni, "-mavx512vnni");
+    }
+    if mnemonic.starts_with("vpternlog")
+        || mnemonic.starts_with("vpcmpb")
+        || mnemonic.starts_with("vpcmpub")
+        || mnemonic.starts_with("vpcmpw")
+        || mnemonic.starts_with("vpcmpuw")
+        || mnemonic.starts_with("vmovdqu8_mask")
+        || matches!(mnemonic, "vpshufb_maskz128" | "vpshufb_mask128")
+    {
+        if !is_512 {
+            push_feature(&mut req, F::Avx512Vl, "-mavx512vl");
+        }
+    }
+
+    // These EVEX encodings use the VPCLMULQDQ extension in addition to F.
+    if mnemonic == "vpclmulqdq512" {
+        push_feature(&mut req, F::Vpclmulqdq, "-mvpclmulqdq");
+    }
+
+    if evex {
+        req
+    } else {
+        legacy_simd_feature(mnemonic).into_iter().collect()
+    }
+}
+
+fn push_feature(
+    req: &mut Vec<SimdFeatureRequirement>,
+    feature: crate::common::x86_features::X86Feature,
+    flag: &'static str,
+) {
+    if !req.iter().any(|(seen, _)| *seen == feature) {
+        req.push((feature, flag));
+    }
 }
 
 impl Lowerer {
@@ -568,7 +716,37 @@ impl Lowerer {
                 width.max(16),
             );
         }
-        if let Some((feature, flag)) = legacy_simd_feature(canonical) {
+        let feature_requirements = simd_feature_requirements(canonical);
+        let uses_avx512 = feature_requirements.iter().any(|(feature, _)| {
+            matches!(
+                feature,
+                crate::common::x86_features::X86Feature::Avx512F
+                    | crate::common::x86_features::X86Feature::Avx512Bw
+                    | crate::common::x86_features::X86Feature::Avx512Dq
+                    | crate::common::x86_features::X86Feature::Avx512Vl
+                    | crate::common::x86_features::X86Feature::Avx512Vnni
+                    | crate::common::x86_features::X86Feature::Avx512BitAlg
+                    | crate::common::x86_features::X86Feature::Avx512Vpopcntdq
+                    | crate::common::x86_features::X86Feature::Avx512Cd
+                    | crate::common::x86_features::X86Feature::Avx512Ifma
+                    | crate::common::x86_features::X86Feature::Avx512Vbmi
+                    | crate::common::x86_features::X86Feature::Avx512Vbmi2
+                    | crate::common::x86_features::X86Feature::Avx512Bf16
+                    | crate::common::x86_features::X86Feature::Avx512Fp16
+                    | crate::common::x86_features::X86Feature::Avx512Bmm
+                    | crate::common::x86_features::X86Feature::Avx512Vp2intersect
+                    | crate::common::x86_features::X86Feature::Avx512Er
+                    | crate::common::x86_features::X86Feature::Avx512Pf
+            )
+        });
+        if self.target == crate::backend::Target::I686 && uses_avx512 {
+            return self.reject_builtin_call(
+                format!("'{name}' uses an AVX-512 encoding not implemented for i686"),
+                args,
+                width.max(16),
+            );
+        }
+        for (feature, flag) in feature_requirements {
             self.check_x86_simd_feature(feature, flag, name, args);
         }
         if let Some(result) = self.try_native_packed_fp_helper(op, &args[1..]) {
@@ -676,12 +854,21 @@ mod legacy_permission_tests {
             let width = fields.next().expect("width");
             let _kind = fields.next().expect("kind");
             let mnemonic = fields.next().expect("mnemonic");
-            let Some((_, _, _, operands)) = super::lccc_simd_lookup(mnemonic)
-                .or_else(|| super::lccc_simd_lookup(&format!("{mnemonic}{width}")))
-            else {
+            let suffixed = format!("{mnemonic}{width}");
+            let canonical = if super::lccc_simd_lookup(mnemonic).is_some() {
+                mnemonic
+            } else {
+                suffixed.as_str()
+            };
+            let Some((_, _, _, operands)) = super::lccc_simd_lookup(canonical) else {
                 unmapped.insert(name);
                 continue;
             };
+            let features = super::simd_feature_requirements(canonical);
+            assert!(
+                !features.is_empty(),
+                "{name} has no ISA permission metadata"
+            );
             assert_eq!(parameters.split(',').count(), operands + 1, "{name}");
             checked += 1;
         }
@@ -693,6 +880,46 @@ mod legacy_permission_tests {
             unmapped,
             std::collections::BTreeSet::from(["512_i_vpcmpeqb512", "512_i_vpcmpeqw512",])
         );
+    }
+
+    #[test]
+    fn avx512_permissions_are_subset_and_encoding_specific() {
+        use crate::common::x86_features::X86Feature as F;
+        let cases: &[(&str, &[F])] = &[
+            ("vpcmpub128", &[F::Avx512F, F::Avx512Bw, F::Avx512Vl]),
+            ("vpternlogq256", &[F::Avx512F, F::Avx512Vl]),
+            ("vpternlogd512", &[F::Avx512F]),
+            (
+                "vmovdqu8_maskz_load256",
+                &[F::Avx512F, F::Avx512Bw, F::Avx512Vl],
+            ),
+            ("vmovdqu8_mask_store512", &[F::Avx512F, F::Avx512Bw]),
+            ("vpmaxsq512", &[F::Avx512F]),
+            ("vpabsq512", &[F::Avx512F]),
+            ("vpcmpeqb512", &[F::Avx512F, F::Avx512Bw]),
+            ("vpcmpeqw512", &[F::Avx512F, F::Avx512Bw]),
+            ("vpcmpgtb512", &[F::Avx512F, F::Avx512Bw]),
+            ("vpcmpgtw512", &[F::Avx512F, F::Avx512Bw]),
+            ("vpopcntw512", &[F::Avx512F, F::Avx512BitAlg]),
+            ("vpopcntq512", &[F::Avx512F, F::Avx512Vpopcntdq]),
+            ("vpdpbusd512", &[F::Avx512F, F::Avx512Vnni]),
+            ("vfmadd231ps512", &[F::Avx512F]),
+            ("vcastsi512_256", &[F::Avx512F]),
+            ("vfmadd231ps256", &[F::Fma]),
+            ("vfmsub231ps256", &[F::Fma]),
+            ("vfnmadd231pd256", &[F::Fma]),
+            ("vfnmsub231pd256", &[F::Fma]),
+            ("vfmaddsub231ps256", &[F::Fma]),
+            ("vfmsubadd231ps256", &[F::Fma]),
+            ("vcvtpd2ps256", &[F::Avx]),
+        ];
+        for (mnemonic, want) in cases {
+            let got: Vec<_> = super::simd_feature_requirements(mnemonic)
+                .into_iter()
+                .map(|(feature, _)| feature)
+                .collect();
+            assert_eq!(got.as_slice(), *want, "{mnemonic}");
+        }
     }
 
     #[test]

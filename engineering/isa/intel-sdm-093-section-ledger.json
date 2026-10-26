@@ -1,0 +1,14 @@
+{
+  "edition": "325462-093",
+  "requested_document_id": "671200",
+  "source_sha256": "a4a62e6a7ba11a76c7753a195b825087306812aac39b930973f9168ee599f321",
+  "pdf_pages": 5364,
+  "outline_entries": 4106,
+  "candidate_sections": 105,
+  "status": "bounded selected excerpts and locator only; not full manual semantic review",
+  "section_selection_script": "scripts/audit_intel_sdm.py",
+  "hosted_check_id": 121574848503,
+  "source_url": "https://cdrdv2-public.intel.com/929349/325462-093-sdm-vol-1-2abcd-3abcd-4.pdf",
+  "extraction_caps": "instructions 16 pages, architecture excerpts 4 pages; capped excerpts carry explicit excerpt_only markers",
+  "notes": "No manual page text or PDF is included. See intel-sdm-093-compiler-audit.md for compiler subsystem mapping, specific cross-references and limits."
+}

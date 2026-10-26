@@ -246,8 +246,18 @@ class ParallelLayout(unittest.TestCase):
         self.assertEqual(set(research['on']), {'workflow_dispatch', 'pull_request'})
         self.assertEqual(research['on']['pull_request'], {
             'branches': ['main'],
-            'paths': ['.github/workflows/compiler-research.yml'],
+            'paths': [
+                '.github/workflows/compiler-research.yml',
+                'src/passes/vec_ssa.rs',
+                'include/emmintrin.h',
+                'include/avxintrin.h',
+                'tests/regression/native_vector_bitcasts.c',
+                'tests/regression/check_native_vector_bitcasts.py',
+            ],
         })
+        self.assertIn('f32_sse1_map,fp32_product_map,fp64_product_map',
+                      research['jobs']['evidence']['env']['RESEARCH_CASES'])
+        self.assertIn('&& \'9\'', research['jobs']['evidence']['env']['RESEARCH_ROUNDS'])
         self.assertTrue(research['jobs'])
         for job in research['jobs'].values():
             self.assertNotIn('continue-on-error', job)

@@ -370,6 +370,7 @@ pub struct Driver {
     pub(super) enable_avx512er: bool,
     pub(super) enable_avx512pf: bool,
     pub(super) enable_avx512vp2intersect: bool,
+    pub(super) enable_avx512bmm: bool,
     // AVX-VNNI / AVX10 / AVX-IFMA / AVX-NE-CONVERT / GFNI / VAES / VPCLMULQDQ
     pub(super) enable_avxvnni: bool,
     pub(super) enable_avxifma: bool,
@@ -703,6 +704,7 @@ impl Driver {
             enable_avx512er: false,
             enable_avx512pf: false,
             enable_avx512vp2intersect: false,
+            enable_avx512bmm: false,
             enable_avxvnni: false,
             enable_avxifma: false,
             enable_avxneconvert: false,
@@ -1847,6 +1849,7 @@ impl Driver {
             simd_macros_enabled && self.enable_avx512er,
             simd_macros_enabled && self.enable_avx512pf,
             simd_macros_enabled && self.enable_avx512vp2intersect,
+            simd_macros_enabled && self.enable_avx512bmm,
             simd_macros_enabled && self.enable_avxvnni,
             simd_macros_enabled && self.enable_avxifma,
             simd_macros_enabled && self.enable_avxneconvert,
@@ -3938,6 +3941,36 @@ impl Driver {
         // the same SIGILL class as the VNNI case, on an instruction whose
         // *legacy* encoding makes `-mno-avx` useless as a defence.
         set.insert_if(simd && self.enable_gfni, F::Gfni);
+
+        // AVX-512 helpers are instruction-level capabilities, not a blanket
+        // consequence of the 512-bit result carrier. Publish only explicitly
+        // granted subsets, and require the F base for every subset bit. `-mavx512bw`
+        // etc. imply F in argument processing, but retaining the conjunction
+        // here keeps a later `-mno-avx512f` denial fail closed.
+        let avx512_base = simd && self.enable_avx512f;
+        set.insert_if(avx512_base, F::Avx512F);
+        set.insert_if(avx512_base && self.enable_avx512bw, F::Avx512Bw);
+        set.insert_if(avx512_base && self.enable_avx512dq, F::Avx512Dq);
+        set.insert_if(avx512_base && self.enable_avx512vl, F::Avx512Vl);
+        set.insert_if(avx512_base && self.enable_avx512vnni, F::Avx512Vnni);
+        set.insert_if(avx512_base && self.enable_avx512bitalg, F::Avx512BitAlg);
+        set.insert_if(
+            avx512_base && self.enable_avx512vpopcntdq,
+            F::Avx512Vpopcntdq,
+        );
+        set.insert_if(avx512_base && self.enable_avx512cd, F::Avx512Cd);
+        set.insert_if(avx512_base && self.enable_avx512ifma, F::Avx512Ifma);
+        set.insert_if(avx512_base && self.enable_avx512vbmi, F::Avx512Vbmi);
+        set.insert_if(avx512_base && self.enable_avx512vbmi2, F::Avx512Vbmi2);
+        set.insert_if(avx512_base && self.enable_avx512bf16, F::Avx512Bf16);
+        set.insert_if(avx512_base && self.enable_avx512fp16, F::Avx512Fp16);
+        set.insert_if(
+            avx512_base && self.enable_avx512vp2intersect,
+            F::Avx512Vp2intersect,
+        );
+        set.insert_if(avx512_base && self.enable_avx512er, F::Avx512Er);
+        set.insert_if(avx512_base && self.enable_avx512pf, F::Avx512Pf);
+        set.insert_if(avx512_base && self.enable_avx512bmm, F::Avx512Bmm);
 
         // Integer ISA: the resolved predicates already encode the default
         // grant, the `-march` ceiling and the sticky denials — the same

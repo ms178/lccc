@@ -87,15 +87,17 @@ _mm512_mul_ps(__m512 __a, __m512 __b)
     return __r;
 }
 
-/* _mm512_fmadd_ps: a*b + c (single-precision, 512-bit) */
-static __inline__ __m512 __attribute__((__always_inline__))
-_mm512_fmadd_ps(__m512 __a, __m512 __b, __m512 __c)
-{
-    __m512 __r;
-    for (int __i = 0; __i < 16; __i++)
-        __r[__i] = __a[__i] * __b[__i] + __c[__i];
-    return __r;
-}
+/* AVX-512F FMA3 helpers are single-rounding operations regardless of
+ * -ffp-contract. Route through the native EVEX helper rather than a C lane
+ * loop, which could become separate multiply/add operations. */
+void *__lccc_simd512_ps_vfmadd132ps512(long, __m512, __m512, __m512);
+void *__lccc_simd512_pd_vfmadd132pd512(long, __m512d, __m512d, __m512d);
+
+#define _mm512_fmadd_ps(__a, __b, __c) \
+    __CCC_M512_FROM_BUILTIN(__lccc_simd512_ps_vfmadd132ps512(0, __a, __b, __c))
+
+#define _mm512_fmadd_pd(__a, __b, __c) \
+    __CCC_M512D_FROM_BUILTIN(__lccc_simd512_pd_vfmadd132pd512(0, __a, __b, __c))
 
 /* === Float Reduce === */
 
