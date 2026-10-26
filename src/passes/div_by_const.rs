@@ -209,6 +209,53 @@ pub(crate) fn div_by_const_function(func: &mut IrFunction) -> usize {
     };
 
     for block in &mut func.blocks {
+        // Chained remainder decomposition: `(x % a) % b` is `x % b` whenever
+        // `b` divides `a` — both are truncating remainders of the same sign
+        // domain, and a value that differs from `x` by a multiple of `b` has
+        // the same truncating remainder modulo `b` (the results live in the
+        // same strict `(-|b|, |b|)` window, so equal congruence is equal
+        // truncation, negatives included).  The inner remainder goes dead
+        // when the outer was its only reader and the text-level dead sweep
+        // retires the orphaned magic.  Pre-pass: operand retarget only, the
+        // expansion loop below still sees and expands the outer remainder.
+        {
+            let mut last_def: std::collections::HashMap<Value, (usize, IrBinOp, Operand, i64, IrType)> =
+                std::collections::HashMap::new();
+            let mut rewrites: Vec<(usize, Operand)> = Vec::new();
+            for (idx, inst) in block.instructions.iter().enumerate() {
+                if let Instruction::BinOp { dest, op, lhs, rhs, ty } = inst {
+                    let outer_const = match rhs {
+                        Operand::Const(c) => c.to_i64(),
+                        _ => None,
+                    };
+                    if matches!(op, IrBinOp::SRem | IrBinOp::URem) {
+                        if let (Some(b), Operand::Value(inner)) = (outer_const, lhs) {
+                            if let Some((_, inner_op, inner_lhs, a, inner_ty)) = last_def.get(&inner) {
+                                if *inner_op == *op
+                                    && *inner_ty == *ty
+                                    && matches!(inner_ty, IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64)
+                                    && *a > 0
+                                    && b > 0
+                                    && *a % b == 0
+                                {
+                                    rewrites.push((idx, inner_lhs.clone()));
+                                }
+                            }
+                        }
+                    }
+                    if matches!(op, IrBinOp::SRem | IrBinOp::URem) {
+                        if let (Some(a), Operand::Const(_)) = (outer_const, rhs) {
+                            last_def.insert(*dest, (idx, *op, lhs.clone(), a, *ty));
+                        }
+                    }
+                }
+            }
+            for (idx, new_lhs) in rewrites {
+                if let Instruction::BinOp { lhs, .. } = &mut block.instructions[idx] {
+                    *lhs = new_lhs;
+                }
+            }
+        }
         let mut new_insts: Vec<Instruction> = Vec::new();
         let has_spans = !block.source_spans.is_empty();
         let mut new_spans: Vec<crate::common::source::Span> = Vec::new();
@@ -2548,6 +2595,175 @@ mod tests {
                     d
                 );
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod nested_remainder_tests {
+    use super::*;
+    use crate::common::fx_hash::FxHashMap;
+    use crate::ir::reexports::{BasicBlock, BlockId, Terminator};
+
+    fn func_with(insts: Vec<Instruction>) -> IrFunction {
+        let mut f = IrFunction::new("t".to_string(), IrType::Void, Vec::new(), false);
+        f.params = vec![crate::ir::reexports::IrParam {
+            ty: IrType::I32,
+            noalias: false,
+            struct_size: None,
+            struct_align: None,
+            param_align: None,
+            struct_eightbyte_classes: Vec::new(),
+            is_f128_sse: false,
+            riscv_float_class: None,
+        }];
+        f.next_value_id = 256;
+        f.blocks = vec![BasicBlock {
+            label: BlockId(0),
+            instructions: insts,
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        }];
+        f
+    }
+
+    /// Interpret a post-pass instruction list: 32-bit ops in wrapping `i32`
+    /// arithmetic, wider ops through `eval_i64`, `Cast` as two's-complement
+    /// extend/truncate — the union both expansion families emit.
+    fn run_mixed(insts: &[Instruction], seed: (Value, i32), dest: Value) -> i32 {
+        let mut env: FxHashMap<u32, i64> = FxHashMap::default();
+        env.insert(seed.0.0, i64::from(seed.1));
+        let fit = |v: i64, ty: IrType| -> i64 {
+            match ty {
+                IrType::I32 | IrType::U32 => v as i32 as i64,
+                IrType::I64 | IrType::U64 => v,
+                other => panic!("unexpected type {other:?}"),
+            }
+        };
+        let read = |env: &FxHashMap<u32, i64>, op: &Operand| match op {
+            Operand::Value(v) => env[&v.0],
+            Operand::Const(c) => c.to_i64().unwrap_or(0),
+        };
+        for inst in insts {
+            let (d, v) = match inst {
+                Instruction::BinOp { dest, op, lhs, rhs, ty } => {
+                    let (a, b) = (read(&env, lhs), read(&env, rhs));
+                    let raw = match ty {
+                        IrType::I32 | IrType::U32 => {
+                            let a32 = a as i32;
+                            let b32 = b as i32;
+                            let r = match op {
+                                IrBinOp::Add => a32.wrapping_add(b32),
+                                IrBinOp::Sub => a32.wrapping_sub(b32),
+                                IrBinOp::Mul => a32.wrapping_mul(b32),
+                                IrBinOp::And => a32 & b32,
+                                IrBinOp::Or => a32 | b32,
+                                IrBinOp::Xor => a32 ^ b32,
+                                IrBinOp::Shl => a32.wrapping_shl(b32 as u32 & 31),
+                                IrBinOp::LShr => ((a32 as u32) >> (b32 as u32 & 31)) as i32,
+                                IrBinOp::AShr => a32.wrapping_shr(b32 as u32 & 31),
+                                other => panic!("unexpected i32 op {other:?} in {insts:?}"),
+                            };
+                            i64::from(r)
+                        }
+                        _ => op.eval_i64(a, b).unwrap_or(0),
+                    };
+                    (*dest, fit(raw, *ty))
+                }
+                Instruction::Cast { dest, src, to_ty, .. } => {
+                    (*dest, fit(read(&env, src), *to_ty))
+                }
+                Instruction::Copy { dest, src } => (*dest, read(&env, src)),
+                other => panic!("unexpected instruction in mixed expansion: {other:?}"),
+            };
+            env.insert(d.0, v);
+        }
+        env[&dest.0] as i32
+    }
+
+    #[test]
+    fn the_nested_remainder_identity_holds_over_the_truncating_domain() {
+        // (x % a) % b == x % b whenever b | a — truncating remainders on
+        // both sides, negatives included.
+        for a in [5i32, 10, 12, 100, 1000] {
+            for b in 1..=a {
+                if a % b != 0 {
+                    continue;
+                }
+                for x in -2500..=2500 {
+                    assert_eq!((x % a) % b, x % b, "a={a} b={b} x={x}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nested_remainder_retarges_the_outer_rem_to_the_dividend() {
+        // (x % 10) % 5  →  x % 5 : the pass retargets the outer remainder
+        // and the expansion interprets to the collapsed value.
+        let x = Value(1);
+        let inner = Value(2);
+        let outer = Value(3);
+        let mut f = func_with(vec![
+            Instruction::BinOp {
+                dest: inner,
+                op: IrBinOp::SRem,
+                lhs: Operand::Value(x),
+                rhs: Operand::Const(IrConst::I32(10)),
+                ty: IrType::I32,
+            },
+            Instruction::BinOp {
+                dest: outer,
+                op: IrBinOp::SRem,
+                lhs: Operand::Value(inner),
+                rhs: Operand::Const(IrConst::I32(5)),
+                ty: IrType::I32,
+            },
+        ]);
+        div_by_const_function(&mut f);
+        let insts = &f.blocks[0].instructions;
+        for &v in &[-1000i32, -101, -99, -10, -5, -1, 0, 1, 5, 10, 99, 101, 1000] {
+            assert_eq!(
+                run_mixed(insts, (x, v), outer),
+                v % 5,
+                "(x % 10) % 5 collapsed for x={v}: {insts:?}"
+            );
+            // The orphaned inner magic still computes its value; it is the
+            // text-level dead sweep that removes it after lowering.
+            assert_eq!(run_mixed(insts, (x, v), inner), v % 10, "x={v}");
+        }
+    }
+
+    #[test]
+    fn a_non_divisible_pair_is_left_alone() {
+        // (x % 7) % 3 keeps its nesting: 3 does not divide 7.
+        let x = Value(1);
+        let inner = Value(2);
+        let outer = Value(3);
+        let mut f = func_with(vec![
+            Instruction::BinOp {
+                dest: inner,
+                op: IrBinOp::SRem,
+                lhs: Operand::Value(x),
+                rhs: Operand::Const(IrConst::I32(7)),
+                ty: IrType::I32,
+            },
+            Instruction::BinOp {
+                dest: outer,
+                op: IrBinOp::SRem,
+                lhs: Operand::Value(inner),
+                rhs: Operand::Const(IrConst::I32(3)),
+                ty: IrType::I32,
+            },
+        ]);
+        div_by_const_function(&mut f);
+        let insts = &f.blocks[0].instructions;
+        for &v in &[-500i32, -7, -3, -1, 0, 1, 3, 7, 500] {
+            assert_eq!(
+                run_mixed(insts, (x, v), outer),
+                (v % 7) % 3,
+                "nesting kept for x={v}: {insts:?}"
+            );
         }
     }
 }

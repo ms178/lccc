@@ -1,0 +1,919 @@
+{
+ "tool": "lccc fastbuild -O2 -S; counts over non-directive function body",
+ "oracle": "GCC 16.2.0 -O2",
+ "note": "Batch-5 probe: 32 deferred idioms re-transcribed from the FOLLOWUP table's idiom column and measured four ways after the return-home, pow2-cmov, nested-remainder, width-down, lea-add-fuse and shift-into-SIB work. Probe sources /tmp/audit/audit32.c (counter /tmp/audit/count.py); the batch-5-open column records the same probes before this work. Transcriptions follow the idiom text, so absolute counts may differ from the batch-4 probes where the prose idiom admits several C spellings; each row's four columns are internally consistent.",
+ "columns": {
+  "lccc": "folds on",
+  "lccc_folds_off": "CCC_NO_RING_IDENTITIES=1",
+  "lccc_passes_off": "CCC_DISABLE_PASSES=bit_idioms,divconst",
+  "gcc": "GCC 16.2.0 -O2"
+ },
+ "rows": [
+  {
+   "issue": "#92074",
+   "lccc": 3,
+   "lccc_folds_off": 3,
+   "lccc_passes_off": 3,
+   "gcc": 3,
+   "batch5_open_lccc": 3,
+   "status": "at-oracle",
+   "lccc_body": [
+    "andl $15, %edi",
+    "movl %edi, %eax",
+    "ret"
+   ],
+   "gcc_body": [
+    "movl\t%edi, %eax",
+    "andl\t$15, %eax",
+    "ret"
+   ],
+   "batch4_lccc": 8,
+   "batch4_gcc": 7
+  },
+  {
+   "issue": "#72512",
+   "lccc": 6,
+   "lccc_folds_off": 6,
+   "lccc_passes_off": 6,
+   "gcc": 4,
+   "batch5_open_lccc": 6,
+   "status": "gap",
+   "lccc_body": [
+    "addl $1, %edi",
+    "subl %esi, %edi",
+    "xorl %eax, %eax",
+    "cmpl $1, %edi",
+    "sete %al",
+    "ret"
+   ],
+   "gcc_body": [
+    "xorl\t%eax, %eax",
+    "cmpl\t%esi, %edi",
+    "sete\t%al",
+    "ret"
+   ],
+   "batch4_lccc": 6,
+   "batch4_gcc": 4
+  },
+  {
+   "issue": "#107228",
+   "lccc": 6,
+   "lccc_folds_off": 6,
+   "lccc_passes_off": 6,
+   "gcc": 5,
+   "batch5_open_lccc": 6,
+   "status": "gap",
+   "lccc_body": [
+    "leaq -1(%rdi), %rsi",
+    "notq %rdi",
+    "andq %rdi, %rsi",
+    "shrq $63, %rsi",
+    "movl %esi, %eax",
+    "ret"
+   ],
+   "gcc_body": [
+    "leaq\t-1(%rdi), %rax",
+    "notq\t%rdi",
+    "andq\t%rdi, %rax",
+    "shrq\t$63, %rax",
+    "ret"
+   ],
+   "batch4_lccc": 6,
+   "batch4_gcc": 5
+  },
+  {
+   "issue": "#200538",
+   "lccc": 7,
+   "lccc_folds_off": 7,
+   "lccc_passes_off": 8,
+   "gcc": 4,
+   "batch5_open_lccc": 7,
+   "status": "gap",
+   "lccc_body": [
+    "movl $1, %edi",
+    "movl %esi, %ecx",
+    "shrl %cl, %edi",
+    "xorl %eax, %eax",
+    "testl %edi, %edi",
+    "setne %al",
+    "ret"
+   ],
+   "gcc_body": [
+    "xorl\t%eax, %eax",
+    "andl\t$31, %esi",
+    "sete\t%al",
+    "ret"
+   ],
+   "batch4_lccc": 7,
+   "batch4_gcc": 4
+  },
+  {
+   "issue": "#157370",
+   "lccc": 11,
+   "lccc_folds_off": 11,
+   "lccc_passes_off": 10,
+   "gcc": 19,
+   "batch5_open_lccc": 20,
+   "status": "at-oracle",
+   "lccc_body": [
+    "movslq %edi, %rsi",
+    "imulq $1717986919, %rsi, %rsi",
+    "sarq $33, %rsi",
+    "movq %rsi, %rdx",
+    "shrq $63, %rdx",
+    "addq %rdx, %rsi",
+    "movslq %esi, %r8",
+    "leal (%r8, %r8, 4), %r8d",
+    "subl %r8d, %edi",
+    "movl %edi, %eax",
+    "ret"
+   ],
+   "gcc_body": [
+    "movslq\t%edi, %rax",
+    "movl\t%edi, %edx",
+    "imulq\t$1717986919, %rax, %rax",
+    "sarl\t$31, %edx",
+    "sarq\t$34, %rax",
+    "subl\t%edx, %eax",
+    "leal\t(%rax,%rax,4), %eax",
+    "addl\t%eax, %eax",
+    "subl\t%eax, %edi",
+    "movslq\t%edi, %rax",
+    "movl\t%edi, %edx",
+    "imulq\t$1717986919, %rax, %rax",
+    "sarl\t$31, %edx",
+    "sarq\t$33, %rax",
+    "subl\t%edx, %eax",
+    "leal\t(%rax,%rax,4), %edx",
+    "movl\t%edi, %eax",
+    "subl\t%edx, %eax",
+    "ret"
+   ],
+   "batch4_lccc": 20,
+   "batch4_gcc": 19
+  },
+  {
+   "issue": "#122442",
+   "lccc": 16,
+   "lccc_folds_off": 16,
+   "lccc_passes_off": 9,
+   "gcc": 14,
+   "batch5_open_lccc": 17,
+   "status": "gap",
+   "lccc_body": [
+    "movslq %edi, %rsi",
+    "imulq $1374389535, %rsi, %rsi",
+    "sarq $37, %rsi",
+    "movq %rsi, %rdx",
+    "shrq $63, %rdx",
+    "addq %rdx, %rsi",
+    "movl %esi, %r8d",
+    "imull $100, %r8d, %r8d",
+    "subl %r8d, %edi",
+    "movslq %edi, %r9",
+    "imulq $1717986919, %r9, %r9",
+    "sarq $34, %r9",
+    "movq %r9, %r11",
+    "shrq $63, %r11",
+    "leal (%r9,%r11), %eax",
+    "ret"
+   ],
+   "gcc_body": [
+    "movslq\t%edi, %rax",
+    "movl\t%edi, %edx",
+    "imulq\t$1374389535, %rax, %rax",
+    "sarl\t$31, %edx",
+    "sarq\t$37, %rax",
+    "subl\t%edx, %eax",
+    "imull\t$100, %eax, %eax",
+    "subl\t%eax, %edi",
+    "movslq\t%edi, %rax",
+    "sarl\t$31, %edi",
+    "imulq\t$1717986919, %rax, %rax",
+    "sarq\t$34, %rax",
+    "subl\t%edi, %eax",
+    "ret"
+   ],
+   "batch4_lccc": 17,
+   "batch4_gcc": 14
+  },
+  {
+   "issue": "#157524",
+   "lccc": 9,
+   "lccc_folds_off": 9,
+   "lccc_passes_off": 9,
+   "gcc": 4,
+   "batch5_open_lccc": 9,
+   "status": "gap",
+   "lccc_body": [
+    "movl %edi, %edx",
+    "subl %esi, %edx",
+    "cmpl %esi, %edi",
+    "setl %r9b",
+    "movzbl %r9b, %r9d",
+    "testl %edx, %edx",
+    "movl $0, %eax",
+    "cmovlq %r9, %rax",
+    "ret"
+   ],
+   "gcc_body": [
+    "xorl\t%eax, %eax",
+    "cmpl\t%esi, %edi",
+    "setl\t%al",
+    "ret"
+   ],
+   "batch4_lccc": 9,
+   "batch4_gcc": 4
+  },
+  {
+   "issue": "#85844",
+   "lccc": 7,
+   "lccc_folds_off": 7,
+   "lccc_passes_off": 7,
+   "gcc": 6,
+   "batch5_open_lccc": 7,
+   "status": "gap",
+   "lccc_body": [
+    "movl %edi, %r8d",
+    "orl $3, %r8d",
+    "cmpl $-1, %edi",
+    "movl $0, %ecx",
+    "movl %ecx, %eax",
+    "cmovlel %r8d, %eax",
+    "ret"
+   ],
+   "gcc_body": [
+    "movl\t%edi, %eax",
+    "xorl\t%edx, %edx",
+    "orl\t$3, %eax",
+    "testl\t%edi, %edi",
+    "cmovns\t%edx, %eax",
+    "ret"
+   ],
+   "batch4_lccc": 7,
+   "batch4_gcc": 6
+  },
+  {
+   "issue": "#117436",
+   "lccc": 8,
+   "lccc_folds_off": 8,
+   "lccc_passes_off": 8,
+   "gcc": 7,
+   "batch5_open_lccc": 8,
+   "status": "gap",
+   "lccc_body": [
+    "movl %edi, %r8d",
+    "orl %esi, %r8d",
+    "setne %r9b",
+    "movzbl %r9b, %r9d",
+    "cmpl %esi, %edi",
+    "movl $0, %eax",
+    "cmovnel %r9d, %eax",
+    "ret"
+   ],
+   "gcc_body": [
+    "xorl\t%eax, %eax",
+    "cmpl\t%esi, %edi",
+    "je\t.L12",
+    "xorl\t%eax, %eax",
+    "orl\t%esi, %edi",
+    "setne\t%al",
+    "ret"
+   ],
+   "batch4_lccc": 8,
+   "batch4_gcc": 7
+  },
+  {
+   "issue": "#200556",
+   "lccc": 6,
+   "lccc_folds_off": 6,
+   "lccc_passes_off": 6,
+   "gcc": 4,
+   "batch5_open_lccc": 6,
+   "status": "gap",
+   "lccc_body": [
+    "movl %edi, %esi",
+    "andl $1, %esi",
+    "movl $0, %ecx",
+    "movq %rdi, %rax",
+    "cmovnel %ecx, %eax",
+    "ret"
+   ],
+   "gcc_body": [
+    "xorl\t%eax, %eax",
+    "testb\t$1, %dil",
+    "cmove\t%edi, %eax",
+    "ret"
+   ],
+   "batch4_lccc": 6,
+   "batch4_gcc": 4
+  },
+  {
+   "issue": "#74976",
+   "lccc": 5,
+   "lccc_folds_off": 5,
+   "lccc_passes_off": 5,
+   "gcc": 4,
+   "batch5_open_lccc": 5,
+   "status": "gap",
+   "lccc_body": [
+    "movq %rdi, %rax",
+    "notl %eax",
+    "btsq $32, %rax",
+    "bsfq %rax, %rax",
+    "ret"
+   ],
+   "gcc_body": [
+    "notl\t%edi",
+    "xorl\t%eax, %eax",
+    "rep bsfl\t%edi, %eax",
+    "ret"
+   ],
+   "batch4_lccc": 5,
+   "batch4_gcc": 4
+  },
+  {
+   "issue": "#86171",
+   "lccc": 4,
+   "lccc_folds_off": 4,
+   "lccc_passes_off": 9,
+   "gcc": 4,
+   "batch5_open_lccc": 4,
+   "status": "at-oracle",
+   "lccc_body": [
+    "movl %esi, %ecx",
+    "roll %cl, %edi",
+    "movl %edi, %eax",
+    "ret"
+   ],
+   "gcc_body": [
+    "movl\t%edi, %eax",
+    "movl\t%esi, %ecx",
+    "roll\t%cl, %eax",
+    "ret"
+   ],
+   "batch4_lccc": 4,
+   "batch4_gcc": 4
+  },
+  {
+   "issue": "#74433",
+   "lccc": 6,
+   "lccc_folds_off": 6,
+   "lccc_passes_off": 6,
+   "gcc": 4,
+   "batch5_open_lccc": 6,
+   "status": "gap",
+   "lccc_body": [
+    "testl %edi, %edi",
+    "je .LBB14",
+    "movl $1, %eax",
+    "ret",
+    "xorl %eax, %eax",
+    "ret"
+   ],
+   "gcc_body": [
+    "xorl\t%eax, %eax",
+    "testl\t%edi, %edi",
+    "setne\t%al",
+    "ret"
+   ],
+   "batch4_lccc": 6,
+   "batch4_gcc": 4
+  },
+  {
+   "issue": "#84432",
+   "lccc": 15,
+   "lccc_folds_off": 14,
+   "lccc_passes_off": 14,
+   "gcc": 2,
+   "batch5_open_lccc": 15,
+   "status": "gap",
+   "lccc_body": [
+    "movzbl %dil, %r8d",
+    "testb %dl, %dl",
+    "setne %al",
+    "movzbl %al, %r11d",
+    "testb %sil, %sil",
+    "movl $0, %eax",
+    "cmovneq %r11, %rax",
+    "movzbl %al, %r10d",
+    "testb %dil, %dil",
+    "movl $1, %r11d",
+    "cmovneq %r11, %r10",
+    "testq %r10, %r10",
+    "movl $0, %eax",
+    "cmovnel %r8d, %eax",
+    "ret"
+   ],
+   "gcc_body": [
+    "movzbl\t%dil, %eax",
+    "ret"
+   ],
+   "batch4_lccc": 2,
+   "batch4_gcc": 2
+  },
+  {
+   "issue": "#163084",
+   "lccc": 17,
+   "lccc_folds_off": 17,
+   "lccc_passes_off": 17,
+   "gcc": 7,
+   "batch5_open_lccc": 17,
+   "status": "gap",
+   "lccc_body": [
+    "movl %edi, %esi",
+    "sarl $31, %esi",
+    "movl %esi, %edx",
+    "andl $3, %edx",
+    "leal (%rdi, %rdx, 1), %r8d",
+    "andl $3, %r8d",
+    "subl %edx, %r8d",
+    "shrl $30, %esi",
+    "addl %esi, %edi",
+    "sarl $2, %edi",
+    "cmpl $3, %edi",
+    "setg %r11b",
+    "movzbl %r11b, %r11d",
+    "testl %r8d, %r8d",
+    "movl $0, %eax",
+    "cmoveq %r11, %rax",
+    "ret"
+   ],
+   "gcc_body": [
+    "testb\t$3, %dil",
+    "sete\t%dl",
+    "xorl\t%eax, %eax",
+    "cmpl\t$15, %edi",
+    "setg\t%al",
+    "andl\t%edx, %eax",
+    "ret"
+   ],
+   "batch4_lccc": 10,
+   "batch4_gcc": 7
+  },
+  {
+   "issue": "#92966",
+   "lccc": 9,
+   "lccc_folds_off": 9,
+   "lccc_passes_off": 9,
+   "gcc": 7,
+   "batch5_open_lccc": 9,
+   "status": "gap",
+   "lccc_body": [
+    "cmpl %esi, %edi",
+    "setl %r9b",
+    "movzbl %r9b, %r9d",
+    "cmpl %ecx, %edx",
+    "setl %r11b",
+    "movzbl %r11b, %r11d",
+    "xorl %r11d, %r9d",
+    "movl %r9d, %eax",
+    "ret"
+   ],
+   "gcc_body": [
+    "cmpl\t%esi, %edi",
+    "setl\t%al",
+    "cmpl\t%ecx, %edx",
+    "setl\t%dl",
+    "xorl\t%edx, %eax",
+    "movzbl\t%al, %eax",
+    "ret"
+   ],
+   "batch4_lccc": 9,
+   "batch4_gcc": 7
+  },
+  {
+   "issue": "#154025",
+   "lccc": 2,
+   "lccc_folds_off": 5,
+   "lccc_passes_off": 5,
+   "gcc": 2,
+   "batch5_open_lccc": 2,
+   "status": "at-oracle",
+   "lccc_body": [
+    "movl %edi, %eax",
+    "ret"
+   ],
+   "gcc_body": [
+    "movl\t%edi, %eax",
+    "ret"
+   ],
+   "batch4_lccc": 2,
+   "batch4_gcc": 2
+  },
+  {
+   "issue": "#141479",
+   "lccc": 11,
+   "lccc_folds_off": 11,
+   "lccc_passes_off": 11,
+   "gcc": 9,
+   "batch5_open_lccc": 11,
+   "status": "gap",
+   "lccc_body": [
+    "movl %edi, %edx",
+    "notl %edx",
+    "movl %esi, %r9d",
+    "notl %r9d",
+    "cmpl %r9d, %edi",
+    "seta %r11b",
+    "movzbl %r11b, %r11d",
+    "cmpl %edx, %esi",
+    "movl $0, %eax",
+    "cmovbeq %r11, %rax",
+    "ret"
+   ],
+   "gcc_body": [
+    "movl\t%edi, %eax",
+    "addl\t%esi, %eax",
+    "jc\t.L27",
+    "xorl\t%eax, %eax",
+    "addl\t%edi, %esi",
+    "setc\t%al",
+    "ret",
+    "xorl\t%eax, %eax",
+    "ret"
+   ],
+   "batch4_lccc": 11,
+   "batch4_gcc": 10
+  },
+  {
+   "issue": "#86176",
+   "lccc": 6,
+   "lccc_folds_off": 6,
+   "lccc_passes_off": 6,
+   "gcc": 4,
+   "batch5_open_lccc": 6,
+   "status": "gap",
+   "lccc_body": [
+    "testl %esi, %esi",
+    "movl $1, %ecx",
+    "movl $2, %edx",
+    "cmovnel %ecx, %edx",
+    "leal (%rdi,%rdx), %eax",
+    "ret"
+   ],
+   "gcc_body": [
+    "cmpl\t$1, %esi",
+    "movl\t%edi, %eax",
+    "adcl\t$1, %eax",
+    "ret"
+   ],
+   "batch4_lccc": 7,
+   "batch4_gcc": 4
+  },
+  {
+   "issue": "#108451",
+   "lccc": 4,
+   "lccc_folds_off": 4,
+   "lccc_passes_off": 4,
+   "gcc": 4,
+   "batch5_open_lccc": 4,
+   "status": "at-oracle",
+   "lccc_body": [
+    "subl %esi, %edi",
+    "imull %edx, %esi",
+    "leal (%rdi,%rsi), %eax",
+    "ret"
+   ],
+   "gcc_body": [
+    "subl\t%esi, %edi",
+    "imull\t%edx, %esi",
+    "leal\t(%rdi,%rsi), %eax",
+    "ret"
+   ],
+   "batch4_lccc": 5,
+   "batch4_gcc": 4
+  },
+  {
+   "issue": "#71948",
+   "lccc": 5,
+   "lccc_folds_off": 5,
+   "lccc_passes_off": 5,
+   "gcc": 5,
+   "batch5_open_lccc": 6,
+   "status": "at-oracle",
+   "lccc_body": [
+    "leal (%rsi, %rdi, 2), %eax",
+    "leal (%rdi, %rsi, 1), %r8d",
+    "andl %edi, %r8d",
+    "subl %r8d, %eax",
+    "ret"
+   ],
+   "gcc_body": [
+    "leal\t(%rsi,%rdi,2), %eax",
+    "addl\t%edi, %esi",
+    "andl\t%edi, %esi",
+    "subl\t%esi, %eax",
+    "ret"
+   ],
+   "batch4_lccc": 6,
+   "batch4_gcc": 5
+  },
+  {
+   "issue": "#193898",
+   "lccc": 4,
+   "lccc_folds_off": 4,
+   "lccc_passes_off": 4,
+   "gcc": 4,
+   "batch5_open_lccc": 6,
+   "status": "at-oracle",
+   "lccc_body": [
+    "leal (%rsi, %rdi, 4), %eax",
+    "leal (%rsi, %rdi, 8), %edi",
+    "orl %edi, %eax",
+    "ret"
+   ],
+   "gcc_body": [
+    "leal\t(%rsi,%rdi,4), %eax",
+    "leal\t(%rsi,%rdi,8), %edx",
+    "orl\t%edx, %eax",
+    "ret"
+   ],
+   "batch4_lccc": 4,
+   "batch4_gcc": 4
+  },
+  {
+   "issue": "#187057",
+   "lccc": 9,
+   "lccc_folds_off": 9,
+   "lccc_passes_off": 9,
+   "gcc": 9,
+   "batch5_open_lccc": 9,
+   "status": "at-oracle",
+   "lccc_body": [
+    "testl %esi, %esi",
+    "movl $0, %edx",
+    "cmovll %esi, %edx",
+    "addl %edx, %edi",
+    "testl %esi, %esi",
+    "movl $0, %r8d",
+    "cmovgl %esi, %r8d",
+    "leal (%rdi,%r8), %eax",
+    "ret"
+   ],
+   "gcc_body": [
+    "xorl\t%eax, %eax",
+    "testl\t%esi, %esi",
+    "cmovle\t%esi, %eax",
+    "xorl\t%edx, %edx",
+    "addl\t%edi, %eax",
+    "testl\t%esi, %esi",
+    "cmovs\t%edx, %esi",
+    "addl\t%esi, %eax",
+    "ret"
+   ],
+   "batch4_lccc": 10,
+   "batch4_gcc": 9
+  },
+  {
+   "issue": "#156898",
+   "lccc": 5,
+   "lccc_folds_off": 5,
+   "lccc_passes_off": 5,
+   "gcc": 5,
+   "batch5_open_lccc": 5,
+   "status": "at-oracle",
+   "lccc_body": [
+    "movl $4, %eax",
+    "movl %esi, %ecx",
+    "shrl %cl, %eax",
+    "shrl $1, %eax",
+    "ret"
+   ],
+   "gcc_body": [
+    "movl\t%esi, %ecx",
+    "movl\t$4, %eax",
+    "shrl\t%cl, %eax",
+    "shrl\t%eax",
+    "ret"
+   ],
+   "batch4_lccc": 4,
+   "batch4_gcc": 4
+  },
+  {
+   "issue": "#95629",
+   "lccc": 11,
+   "lccc_folds_off": 11,
+   "lccc_passes_off": 11,
+   "gcc": 10,
+   "batch5_open_lccc": 11,
+   "status": "gap",
+   "lccc_body": [
+    "testl %edx, %edx",
+    "setne %r8b",
+    "movzbl %r8b, %r8d",
+    "testl %esi, %esi",
+    "movq %r8, %rax",
+    "movl $1, %ecx",
+    "cmovneq %rcx, %rax",
+    "xorl %eax, %edi",
+    "movl $0, %eax",
+    "cmovneq %r8, %rax",
+    "ret"
+   ],
+   "gcc_body": [
+    "xorl\t%eax, %eax",
+    "orl\t%edx, %esi",
+    "setne\t%al",
+    "cmpl\t%edi, %eax",
+    "setne\t%cl",
+    "xorl\t%eax, %eax",
+    "testl\t%edx, %edx",
+    "setne\t%al",
+    "andl\t%ecx, %eax",
+    "ret"
+   ],
+   "batch4_lccc": 11,
+   "batch4_gcc": 10
+  },
+  {
+   "issue": "#64305",
+   "lccc": 10,
+   "lccc_folds_off": 10,
+   "lccc_passes_off": 10,
+   "gcc": 8,
+   "batch5_open_lccc": 10,
+   "status": "gap",
+   "lccc_body": [
+    "cmpl %esi, %edi",
+    "jge .LBB29",
+    "movq %rdi, %rsi",
+    "jmp .LBB30",
+    "movl %edi, %eax",
+    "cltd",
+    "idivl %esi",
+    "movl %edx, %esi",
+    "movl %esi, %eax",
+    "ret"
+   ],
+   "gcc_body": [
+    "cmpl\t%esi, %edi",
+    "jl\t.L42",
+    "movl\t%edi, %eax",
+    "cltd",
+    "idivl\t%esi",
+    "movl\t%edx, %edi",
+    "movl\t%edi, %eax",
+    "ret"
+   ],
+   "batch4_lccc": 10,
+   "batch4_gcc": 8
+  },
+  {
+   "issue": "#63149",
+   "lccc": 6,
+   "lccc_folds_off": 6,
+   "lccc_passes_off": 6,
+   "gcc": 6,
+   "batch5_open_lccc": 6,
+   "status": "at-oracle",
+   "lccc_body": [
+    "andl $2147483647, %edi",
+    "andl $2147483647, %esi",
+    "xorl %eax, %eax",
+    "cmpl %esi, %edi",
+    "setb %al",
+    "ret"
+   ],
+   "gcc_body": [
+    "andl\t$2147483647, %edi",
+    "andl\t$2147483647, %esi",
+    "xorl\t%eax, %eax",
+    "cmpl\t%esi, %edi",
+    "setb\t%al",
+    "ret"
+   ],
+   "batch4_lccc": 6,
+   "batch4_gcc": 6
+  },
+  {
+   "issue": "#85830",
+   "lccc": 5,
+   "lccc_folds_off": 5,
+   "lccc_passes_off": 5,
+   "gcc": 5,
+   "batch5_open_lccc": 5,
+   "status": "at-oracle",
+   "lccc_body": [
+    "andq $32767, %rdi",
+    "xorl %eax, %eax",
+    "cmpl $1234, %edi",
+    "sete %al",
+    "ret"
+   ],
+   "gcc_body": [
+    "andl\t$32767, %edi",
+    "xorl\t%eax, %eax",
+    "cmpl\t$1234, %edi",
+    "sete\t%al",
+    "ret"
+   ],
+   "batch4_lccc": 6,
+   "batch4_gcc": 4
+  },
+  {
+   "issue": "#85939",
+   "lccc": 4,
+   "lccc_folds_off": 4,
+   "lccc_passes_off": 4,
+   "gcc": 4,
+   "batch5_open_lccc": 4,
+   "status": "at-oracle",
+   "lccc_body": [
+    "movzwl %di, %eax",
+    "movq %rsi, %rcx",
+    "shll %cl, %eax",
+    "ret"
+   ],
+   "gcc_body": [
+    "movzwl\t%di, %eax",
+    "movl\t%esi, %ecx",
+    "sall\t%cl, %eax",
+    "ret"
+   ],
+   "batch4_lccc": 4,
+   "batch4_gcc": 3
+  },
+  {
+   "issue": "#150954",
+   "lccc": 3,
+   "lccc_folds_off": 3,
+   "lccc_passes_off": 3,
+   "gcc": 2,
+   "batch5_open_lccc": 3,
+   "status": "gap",
+   "lccc_body": [
+    "movl $63, %eax",
+    "bsrl %edi, %eax",
+    "ret"
+   ],
+   "gcc_body": [
+    "bsrl\t%edi, %eax",
+    "ret"
+   ],
+   "batch4_lccc": 3,
+   "batch4_gcc": 2
+  },
+  {
+   "issue": "#190907",
+   "lccc": 8,
+   "lccc_folds_off": 8,
+   "lccc_passes_off": 8,
+   "gcc": 7,
+   "batch5_open_lccc": 8,
+   "status": "gap",
+   "lccc_body": [
+    "shll $1, %edi",
+    "testl %esi, %esi",
+    "movl $2, %ecx",
+    "movl $0, %edx",
+    "cmovnel %ecx, %edx",
+    "imull %edx, %edi",
+    "movl %edi, %eax",
+    "ret"
+   ],
+   "gcc_body": [
+    "xorl\t%eax, %eax",
+    "testl\t%esi, %esi",
+    "setne\t%al",
+    "addl\t%edi, %edi",
+    "addl\t%eax, %eax",
+    "imull\t%edi, %eax",
+    "ret"
+   ],
+   "batch4_lccc": 8,
+   "batch4_gcc": 7
+  },
+  {
+   "issue": "#71533",
+   "lccc": 11,
+   "lccc_folds_off": 11,
+   "lccc_passes_off": 9,
+   "gcc": 5,
+   "batch5_open_lccc": 11,
+   "status": "gap",
+   "lccc_body": [
+    "btl $31, %edi",
+    "setc %dl",
+    "movzbl %dl, %edx",
+    "leal (%rdi, %rdx, 1), %r8d",
+    "andl $1, %r8d",
+    "subl %edx, %r8d",
+    "imull %esi, %esi",
+    "testl %r8d, %r8d",
+    "movl %esi, %eax",
+    "cmovel %edi, %eax",
+    "ret"
+   ],
+   "gcc_body": [
+    "imull\t%esi, %esi",
+    "movl\t%edi, %eax",
+    "testb\t$1, %dil",
+    "cmovne\t%esi, %eax",
+    "ret"
+   ],
+   "batch4_lccc": 5,
+   "batch4_gcc": 6
+  }
+ ]
+}

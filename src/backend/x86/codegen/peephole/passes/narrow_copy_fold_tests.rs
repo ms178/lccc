@@ -82,6 +82,11 @@ fn a_32_bit_self_move_survives_when_the_upper_half_is_unknown() {
 
 #[test]
 fn a_32_bit_self_move_survives_across_a_label() {
+    // The late `return_home` copy-fusion legitimately recomputes this
+    // shape into the return register; pin the narrow-copy decision alone.
+    let _skip = crate::backend::x86::codegen::peephole::passes::test_skips::skip_passes(
+        &["return_home"],
+    );
     // The upper half may be nonzero on another incoming path.
     let out = run(&f(concat!(
         "    movl %edi, %ebx\n",
@@ -446,6 +451,11 @@ fn a_high_byte_alias_blocks_the_rename() {
 
 #[test]
 fn renaming_r15_does_not_clip_the_width_suffix() {
+    // The late `return_home` copy-fusion legitimately recomputes this
+    // shape into the return register; pin the narrow-copy decision alone.
+    let _skip = crate::backend::x86::codegen::peephole::passes::test_skips::skip_passes(
+        &["return_home"],
+    );
     // Guards the reverse direction of the prefix hazard: rewriting *into*
     // r8..r15 must produce `%r15d`, never `%r15` followed by a stray `d`.
     let out = run(&f(concat!(

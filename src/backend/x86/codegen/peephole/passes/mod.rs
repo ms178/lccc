@@ -37,6 +37,7 @@ mod frame_compact;
 mod helpers;
 mod identical_blocks;
 mod jump_thread;
+mod lea_add_fuse;
 mod lea_narrow;
 mod liveness;
 mod load_bswap_movbe;
@@ -45,11 +46,13 @@ mod local_patterns;
 mod loop_trampoline;
 mod memory_fold;
 mod narrow_copy_fold;
+mod pow2_cmov;
 mod push_pop;
 mod pushf_elim;
 mod redundant_ext;
 mod relay_and_lea;
 mod return_bool;
+mod return_home;
 mod self_zext;
 mod spill_deref;
 mod store_forwarding;
@@ -2231,6 +2234,31 @@ fn peephole_optimize_inner(
     // leaves the peephole.
     if !sk("dead_pure_writes") {
         let _ = retire_dead_pure_writes(&store, &mut infos, !sk("dead_flag_writes"));
+    }
+
+    // Phase 8b: index-only lea + add fused into one SIB address, so the
+    // terminal window the next phase walks already sees the shorter chain.
+    // `CCC_PEEPHOLE_SKIP=lea_add_fuse` disables it for bisection.
+    if !sk("lea_add_fuse") {
+        lea_add_fuse::run(&mut store, &mut infos);
+    }
+
+    // Phase 8c: terminal return-home coalescing.  Runs after every rewrite
+    // that can still grow or shrink the tail (epilogue cross-jump, final dead
+    // sweep) and before `return_bool`, whose cmp/setcc shapes never carry a
+    // return copy for it to fold anyway.  `CCC_PEEPHOLE_SKIP=return_home`
+    // disables it for bisection.
+    if !sk("return_home") {
+        return_home::run(&mut store, &mut infos);
+    }
+
+    // Phase 8d: the signed power-of-two division bias-add identity into the
+    // conditional-add/cmov machine idiom — four instructions, no sign
+    // scratch, and the arms land directly in the return register on terminal
+    // paths because `return_home` already ran.  `CCC_PEEPHOLE_SKIP=pow2_cmov`
+    // disables it for bisection.
+    if !sk("pow2_cmov") {
+        pow2_cmov::run(&mut store, &mut infos);
     }
 
     if !sk("return_bool") {
