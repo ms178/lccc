@@ -7059,8 +7059,13 @@ def _crossarch_gnu_hash_relro_test(args, oracles):
                     m32_why = pr.stderr.decode(errors="replace")[-200:]
                     continue
             so = os.path.join(td, drv + ".so")
-            r = sh([path, "-O1", "-shared", "-fPIC", src, "-o", so],
-                   timeout=120)
+            # This case measures the linker's .gnu.hash and PT_GNU_RELRO
+            # layout, not its default CRT/libc selection. Keep its input set
+            # self-contained: newer cross sysroots can add hidden loader-only
+            # symbols from runtime objects (for example, RISC-V's
+            # _dl_tls_static_surplus_init), before the layout checks run.
+            r = sh([path, "-O1", "-shared", "-fPIC", "-nostdlib", src,
+                    "-o", so], timeout=120)
             if r.returncode != 0:
                 return Result(name, "FAIL", "%s -shared failed: %s"
                               % (drv, r.stderr.decode(errors="replace")[-200:]))
