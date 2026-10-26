@@ -1529,7 +1529,10 @@ impl X86Codegen {
         };
         if let Some(preserve_upper_vector_lanes) = preserve_upper_vector_lanes {
             let target = if let Some(name) = direct_name {
-                if self.state.needs_plt(name) {
+                if self.state.needs_got_call(name) {
+                    let n = name.split('@').next().unwrap_or(name);
+                    SibcallTarget::RipSlot(format!("{}@GOTPCREL", n))
+                } else if self.state.needs_plt(name) {
                     let n = name.split('@').next().unwrap_or(name);
                     SibcallTarget::Direct(format!("{}@PLT", n))
                 } else {
@@ -1548,7 +1551,9 @@ impl X86Codegen {
                         SibcallTarget::RipSlot(sym_str)
                     }
                     Some(ResolvedIndirectCall::Direct(sym, off)) => {
-                        if off == 0 && self.state.needs_plt(&sym) {
+                        if off == 0 && self.state.needs_got_call(&sym) {
+                            SibcallTarget::RipSlot(format!("{}@GOTPCREL", sym))
+                        } else if off == 0 && self.state.needs_plt(&sym) {
                             SibcallTarget::Direct(format!("{}@PLT", sym))
                         } else if off == 0 {
                             SibcallTarget::Direct(sym.clone())
@@ -1575,7 +1580,11 @@ impl X86Codegen {
                 preserve_upper_vector_lanes,
             });
         } else if let Some(name) = direct_name {
-            if self.state.needs_plt(name) {
+            if self.state.needs_got_call(name) {
+                let n = name.split('@').next().unwrap_or(name);
+                self.state
+                    .emit_fmt(format_args!("    call *{}@GOTPCREL(%rip)", n));
+            } else if self.state.needs_plt(name) {
                 // Versioned symbols (`printf@GLIBC_2.2.5`, bound by .symver)
                 // must use the base name in @PLT references — GAS 2.47 rejects
                 // `sym@ver@PLT` (GAS-oracle). The linker resolves the version.
@@ -1622,7 +1631,10 @@ impl X86Codegen {
                     // try_resolve_indirect_call_global and fall back to the
                     // value-based call, which preserves the .symver binding.)
                     ResolvedIndirectCall::Direct(..) => {
-                        if off == 0 && self.state.needs_plt(&sym) {
+                        if off == 0 && self.state.needs_got_call(&sym) {
+                            self.state
+                                .emit_fmt(format_args!("    call *{}@GOTPCREL(%rip)", sym));
+                        } else if off == 0 && self.state.needs_plt(&sym) {
                             self.state.emit_fmt(format_args!("    call {}@PLT", sym));
                         } else {
                             self.state.out.emit_call(&sym_str);

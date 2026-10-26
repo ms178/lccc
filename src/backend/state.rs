@@ -393,6 +393,8 @@ pub struct CodegenState {
     /// Position-independent executable mode. x86-64 may address ordinary
     /// executable data directly; full PIC and weak extern data still use GOT.
     pub pie_mode: bool,
+    /// `-fno-plt`: call external/interposable functions indirectly via GOT.
+    pub no_plt: bool,
     /// Shared-object output (`-shared`).
     pub shared_lib: bool,
     /// Driver-confirmed position-fixed ET_EXEC final link for this
@@ -409,6 +411,9 @@ pub struct CodegenState {
     /// Set of symbol names that are locally defined (not extern) and have internal
     /// linkage (static) — these can use direct addressing even in PIC mode.
     pub local_symbols: FxHashSet<String>,
+    /// Set of symbol names defined in this translation unit (functions, globals,
+    /// aliases, IFUNCs) — non-preemptible in `-fPIE` / `-fno-pic` executables.
+    pub defined_symbols: FxHashSet<String>,
     /// Extern function linker names. Their addresses cannot use ELF data copy
     /// relocations, so default-visibility function pointers remain GOT-based
     /// in PIE even though ordinary extern data addresses may be direct.
@@ -813,7 +818,9 @@ impl CodegenState {
             tls_policy: crate::common::tls::TlsPolicy::default(),
             tls_models: FxHashMap::default(),
             pie_mode: false,
+            no_plt: false,
             local_symbols: FxHashSet::default(),
+            defined_symbols: FxHashSet::default(),
             extern_function_symbols: FxHashSet::default(),
             cmp_replay: FxHashMap::default(),
             absolute_symbols: FxHashSet::default(),
@@ -1417,9 +1424,26 @@ impl CodegenState {
         self.pic_mode
     }
 
+    /// Returns true if a function call should dispatch indirectly through the
+    /// GOT under `-fno-plt` (`call *sym@GOTPCREL(%rip)` on x86-64,
+    /// `call *sym@GOT[(%ebx)]` on i686).
+    pub fn needs_got_call(&self, name: &str) -> bool {
+        if !self.no_plt || self.code_model_kernel || name.starts_with('.') {
+            return false;
+        }
+        let base = name.split('@').next().unwrap_or(name);
+        if self.local_symbols.contains(base) {
+            return false;
+        }
+        if self.pic_mode {
+            return true;
+        }
+        !self.defined_symbols.contains(base) || self.weak_extern_symbols.contains(base)
+    }
+
     /// Returns true if a function call needs PLT indirection in PIC mode.
     pub fn needs_plt(&self, name: &str) -> bool {
-        self.needs_got(name)
+        !self.no_plt && self.needs_got(name)
     }
 
     /// Returns true if a symbol needs GOT indirection on AArch64.

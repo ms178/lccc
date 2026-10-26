@@ -95,7 +95,9 @@ impl I686Codegen {
                     // PIC-relevant construct is an external call (verified:
                     // gcc -m32 -fPIC on `return helper(x)+1;` emits
                     // get_pc_thunk.bx + call helper@PLT).
-                    Instruction::Call { func: callee, .. } if self.state.needs_plt(callee) => {
+                    Instruction::Call { func: callee, .. }
+                        if self.state.needs_plt(callee) || self.state.needs_got_call(callee) =>
+                    {
                         return true;
                     }
                     // 64-bit div/mod lowers to __{u}divdi3/__{u}moddi3 calls

@@ -265,7 +265,7 @@ impl Lowerer {
                     None
                 }
             }
-            Expr::CompoundLiteral(type_spec, _, _) => {
+            Expr::CompoundLiteral(type_spec, _, _, _) | Expr::BitCast(type_spec, _, _) => {
                 let ctype = self.type_spec_to_ctype(type_spec);
                 if ctype.is_struct_or_union() || ctype.is_vector() {
                     Some(self.sizeof_type(type_spec))
@@ -1352,7 +1352,9 @@ impl Lowerer {
                 }
                 target_int_ir_type()
             }
-            Expr::CompoundLiteral(type_name, _, _) => self.type_spec_to_ir(type_name),
+            Expr::CompoundLiteral(type_name, _, _, _) | Expr::BitCast(type_name, _, _) => {
+                self.type_spec_to_ir(type_name)
+            }
             _ => target_int_ir_type(),
         }
     }
@@ -1932,7 +1934,8 @@ impl Lowerer {
             }
             Expr::VaArg(_, type_spec, _)
             | Expr::ConvertVector(_, type_spec, _)
-            | Expr::CompoundLiteral(type_spec, _, _) => Some(self.type_spec_to_ctype(type_spec)),
+            | Expr::BitCast(type_spec, _, _)
+            | Expr::CompoundLiteral(type_spec, _, _, _) => Some(self.type_spec_to_ctype(type_spec)),
             Expr::GenericSelection(controlling, associations, _) => {
                 self.resolve_generic_selection_ctype(controlling, associations)
             }
@@ -2296,13 +2299,20 @@ impl Lowerer {
     }
 
     pub(super) fn get_c2y_builtin_ctype(&self, name: &str, args: &[Expr]) -> Option<CType> {
-        use crate::frontend::sema::stdbit;
+        use crate::frontend::sema::{gcc16_builtins, stdbit};
         if stdbit::is_stdc_bit_builtin(name) {
             let arg0_ct = args
                 .first()
                 .and_then(|a| self.get_expr_ctype(a))
                 .map(|ct| ct.decayed_value_ctype());
             return stdbit::stdc_bit_return_ctype(name, arg0_ct.as_ref());
+        }
+        if gcc16_builtins::is_gcc16_extra_builtin(name) {
+            let arg0_ct = args
+                .first()
+                .and_then(|a| self.get_expr_ctype(a))
+                .map(|ct| ct.decayed_value_ctype());
+            return gcc16_builtins::gcc16_builtin_return_ctype(name, arg0_ct.as_ref());
         }
         match name {
             "__builtin_counted_by_ref" => {

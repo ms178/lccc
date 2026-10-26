@@ -148,7 +148,15 @@ impl Lowerer {
                 || self.expr_ctype(lhs).is_decimal();
             let rhs_no_fold = matches!(self.expr_ctype(rhs), CType::Float128)
                 || self.expr_ctype(rhs).is_decimal();
-            if !lhs_ty.is_float() && !rhs_ty.is_float() && !lhs_no_fold && !rhs_no_fold {
+            let trapv_active = self.trapv
+                && self.func_state.is_some()
+                && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul);
+            if !trapv_active
+                && !lhs_ty.is_float()
+                && !rhs_ty.is_float()
+                && !lhs_no_fold
+                && !rhs_no_fold
+            {
                 if let Some(val) = self.eval_const_expr_from_parts(op, lhs, rhs) {
                     return Operand::Const(val);
                 }
@@ -561,6 +569,16 @@ impl Lowerer {
             }
             _ => {
                 let ir_op = Self::binop_to_ir(*op, is_unsigned);
+                if self.trapv
+                    && self.func_state.is_some()
+                    && !is_unsigned
+                    && common_ty.is_signed()
+                    && matches!(ir_op, IrBinOp::Add | IrBinOp::Sub | IrBinOp::Mul)
+                {
+                    let checked =
+                        self.emit_trapv_signed_binop(ir_op, lhs_val, rhs_val, common_ty, op_ty);
+                    return self.maybe_narrow_binop_result(checked, op, common_ty);
+                }
                 self.emit(Instruction::BinOp {
                     dest,
                     op: ir_op,
@@ -827,15 +845,24 @@ impl Lowerer {
                 } else {
                     val
                 };
-                let dest = self.fresh_value();
-                self.emit(Instruction::UnaryOp {
-                    dest,
-                    op: IrUnaryOp::Neg,
-                    src: val,
-                    ty: neg_ty,
-                });
+                let promoted_ty = Self::integer_promote(inner_ty);
+                let dest = if self.trapv
+                    && self.func_state.is_some()
+                    && !neg_ty.is_float()
+                    && promoted_ty.is_signed()
+                {
+                    self.emit_trapv_signed_neg(val, promoted_ty, neg_ty)
+                } else {
+                    let d = self.fresh_value();
+                    self.emit(Instruction::UnaryOp {
+                        dest: d,
+                        op: IrUnaryOp::Neg,
+                        src: val,
+                        ty: neg_ty,
+                    });
+                    d
+                };
                 if !neg_ty.is_float() {
-                    let promoted_ty = Self::integer_promote(inner_ty);
                     self.maybe_narrow(dest, promoted_ty)
                 } else {
                     Operand::Value(dest)
@@ -1798,7 +1825,23 @@ impl Lowerer {
             // and generated a store/load pair on every loop iteration.
             let (step, binop_ty) = self.inc_dec_step_and_type(ty, inner);
             let ir_op = if is_inc { IrBinOp::Add } else { IrBinOp::Sub };
-            let result = self.emit_binop_val(ir_op, Operand::Value(loaded_val), step, binop_ty);
+            let promoted_ty = Self::integer_promote(ty);
+            let result = if self.trapv
+                && self.func_state.is_some()
+                && !self.is_bool_lvalue(inner)
+                && ty != IrType::Ptr
+                && ty.size() >= 4
+                && promoted_ty.is_signed()
+            {
+                let lhs_op = if ty.size() < binop_ty.size() {
+                    Operand::Value(self.emit_cast_val(Operand::Value(loaded_val), ty, binop_ty))
+                } else {
+                    Operand::Value(loaded_val)
+                };
+                self.emit_trapv_signed_binop(ir_op, lhs_op, step, promoted_ty, binop_ty)
+            } else {
+                self.emit_binop_val(ir_op, Operand::Value(loaded_val), step, binop_ty)
+            };
             let store_op = if self.is_bool_lvalue(inner) {
                 self.emit_bool_normalize_typed(Operand::Value(result), binop_ty)
             } else if ty != binop_ty && ty.is_integer() && binop_ty.is_integer() {

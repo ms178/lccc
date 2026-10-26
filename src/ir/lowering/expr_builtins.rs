@@ -874,7 +874,7 @@ impl Lowerer {
     /// symbol the driver defines in this same translation unit, so it needs no
     /// relocation model support beyond an ordinary global and is CSE-able by
     /// later passes when the answer is re-used.
-    fn emit_cpu_probe_read(&mut self, probe: crate::common::cpu_probe::Probe) -> Value {
+    pub(super) fn emit_cpu_probe_read(&mut self, probe: crate::common::cpu_probe::Probe) -> Value {
         let addr = self.fresh_value();
         self.emit(Instruction::GlobalAddr {
             dest: addr,
@@ -963,6 +963,12 @@ impl Lowerer {
             BuiltinIntrinsic::CountedByRef => self.lower_counted_by_ref(args),
             BuiltinIntrinsic::AssocBarrier => self.lower_assoc_barrier(args),
             BuiltinIntrinsic::ClearPadding => self.lower_clear_padding(args),
+            BuiltinIntrinsic::Gcc16GenericBit => self.lower_gcc16_generic_bit_builtin(name, args),
+            BuiltinIntrinsic::Gcc16Carry => self.lower_gcc16_carry_builtin(name, args),
+            BuiltinIntrinsic::Gcc16BswapBitrev => self.lower_gcc16_bswap_bitrev_builtin(name, args),
+            BuiltinIntrinsic::IsSignaling => self.lower_gcc16_issignaling(args),
+            BuiltinIntrinsic::IsEqSig => self.lower_gcc16_iseqsig(args),
+            BuiltinIntrinsic::SpeculationSafeValue => self.lower_gcc16_speculation_safe(args),
             // __builtin_classify_type(expr) -> GCC type class integer
             BuiltinIntrinsic::ClassifyType => Some(Operand::Const(IrConst::I64(
                 self.classify_type_of(args.first()),

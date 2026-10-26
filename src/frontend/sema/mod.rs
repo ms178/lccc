@@ -1,6 +1,7 @@
 pub(crate) mod analysis;
 pub(crate) mod builtins;
 pub(crate) mod const_eval;
+pub(crate) mod gcc16_builtins;
 pub(crate) mod ice;
 mod init_cursor;
 pub(crate) mod intrinsic_arity;

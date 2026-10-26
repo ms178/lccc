@@ -81,6 +81,12 @@ fn walk<'a>(
 ) {
     match init {
         Initializer::Expr(expr) => {
+            if let Expr::CompoundLiteral(_, cl_init, _, _) = expr {
+                if is_aggregate(ty) && initializes_whole(cx, ty, expr) {
+                    walk(cx, ty, path, bit_width, cl_init, out);
+                    return;
+                }
+            }
             if is_aggregate(ty) && !initializes_whole(cx, ty, expr) {
                 // `int a[2] = 1;`-like: the expression initializes the first
                 // scalar (an error for arrays elsewhere; harmless here).

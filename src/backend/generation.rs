@@ -4303,6 +4303,9 @@ fn collect_symbol_sets(cg: &mut dyn ArchCodegen, module: &IrModule) {
         .extern_function_symbols
         .extend(module.extern_function_symbols.iter().cloned());
     for func in &module.functions {
+        if !func.is_declaration {
+            state.defined_symbols.insert(func.name.clone());
+        }
         if func.is_static
             || matches!(
                 func.visibility.as_deref(),
@@ -4310,6 +4313,15 @@ fn collect_symbol_sets(cg: &mut dyn ArchCodegen, module: &IrModule) {
             )
         {
             state.local_symbols.insert(func.name.clone());
+        }
+    }
+    for (alias_name, _, _) in &module.aliases {
+        state.defined_symbols.insert(alias_name.clone());
+    }
+    for (ifunc_name, _, is_local, vis) in &module.ifuncs {
+        state.defined_symbols.insert(ifunc_name.clone());
+        if *is_local || matches!(vis.as_deref(), Some("hidden" | "internal" | "protected")) {
+            state.local_symbols.insert(ifunc_name.clone());
         }
     }
     for global in &module.globals {

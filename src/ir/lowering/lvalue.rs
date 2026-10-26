@@ -282,6 +282,23 @@ impl Lowerer {
                 Some(selected) => self.lower_lvalue(selected),
                 None => None,
             },
+            Expr::CompoundLiteral(type_spec, init, _, storage) => {
+                if storage.is_static {
+                    let label =
+                        self.ensure_static_compound_literal_global(expr, type_spec, init, storage);
+                    let addr = self.fresh_value();
+                    self.emit(Instruction::GlobalAddr {
+                        dest: addr,
+                        name: label,
+                    });
+                    Some(LValue::address(addr, AddressSpace::Default, vol))
+                } else {
+                    let ty = self.type_spec_to_ir(type_spec);
+                    let size = self.compound_literal_size(type_spec, init);
+                    let alloca = self.alloc_and_init_compound_literal(type_spec, init, ty, size);
+                    Some(LValue::variable(alloca, vol))
+                }
+            }
             _ => None,
         }
     }

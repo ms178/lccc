@@ -439,6 +439,12 @@ impl Lowerer {
                     if crate::frontend::sema::stdbit::is_stdc_bit_builtin(name) {
                         return self.eval_stdc_bit_const(name, args);
                     }
+                    if crate::frontend::sema::gcc16_builtins::is_gcc16_generic_bit_builtin(name) {
+                        return self.eval_gcc16_generic_bit_const(name, args);
+                    }
+                    if crate::frontend::sema::gcc16_builtins::is_gcc16_bswap_bitrev_builtin(name) {
+                        return self.eval_gcc16_bswap_bitrev_const(name, args);
+                    }
                     // The bare-name fold table speaks for the library function of
                     // this name, so it stays silent when the identifier denotes
                     // something else that shares the basename: the same decision
@@ -466,8 +472,19 @@ impl Lowerer {
                     None
                 }
             }
-            Expr::CompoundLiteral(type_spec, init, _) => {
+            Expr::CompoundLiteral(type_spec, init, _, st) => {
+                if st.is_constexpr {
+                    if let Some(val) = self.types.constexpr_compound_literals.get(&(
+                        crate::frontend::parser::ast::ExprId::of(expr),
+                        String::new(),
+                    )) {
+                        return Some(val.to_ir_const());
+                    }
+                }
                 self.eval_const_compound_literal(type_spec, init)
+            }
+            Expr::BitCast(target_spec, src_expr, _) => {
+                self.eval_bit_cast_const(target_spec, src_expr)
             }
             Expr::GenericSelection(controlling, associations, _) => {
                 let selected = self.resolve_generic_selection_expr(controlling, associations)?;
@@ -872,6 +889,21 @@ impl Lowerer {
                 Expr::Identifier(name, _) => {
                     let image = self.const_object_images.get(name.as_str())?;
                     return self.read_const_object(image, &selectors);
+                }
+                Expr::CompoundLiteral(_, _, _, st) if st.is_constexpr => {
+                    let mut path = String::new();
+                    for sel in selectors.iter().rev() {
+                        let Expr::MemberAccess(_, field, _) = sel else {
+                            return None;
+                        };
+                        path.push('.');
+                        path.push_str(field);
+                    }
+                    return self
+                        .types
+                        .constexpr_compound_literals
+                        .get(&(crate::frontend::parser::ast::ExprId::of(cursor), path))
+                        .map(|v| v.to_ir_const());
                 }
                 _ => return None,
             }

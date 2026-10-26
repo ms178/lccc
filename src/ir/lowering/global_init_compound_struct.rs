@@ -680,9 +680,13 @@ impl Lowerer {
                         push_string_as_elements(elements, s, field_size);
                     }
                 } else if let Expr::AddressOf(inner, _) = expr {
-                    if let Expr::CompoundLiteral(cl_type_spec, cl_init, _) = inner.as_ref() {
+                    if let Expr::CompoundLiteral(cl_type_spec, cl_init, _, cl_st) = inner.as_ref() {
                         // &(compound_literal) at file scope: create anonymous global
-                        let addr_init = self.create_compound_literal_global(cl_type_spec, cl_init);
+                        let addr_init = self.create_compound_literal_global_with_storage(
+                            cl_type_spec,
+                            cl_init,
+                            cl_st,
+                        );
                         elements.push(addr_init);
                     } else if let Some(addr_init) = self.eval_string_literal_addr_expr(expr) {
                         elements.push(addr_init);
@@ -692,11 +696,15 @@ impl Lowerer {
                         self.diagnose_non_constant(expr);
                         push_zero_bytes(elements, field_size);
                     }
-                } else if let Expr::CompoundLiteral(cl_type_spec, cl_init, _) = expr {
+                } else if let Expr::CompoundLiteral(cl_type_spec, cl_init, _, cl_st) = expr {
                     if field_is_pointer {
                         // Compound literal initializing a pointer field (array-to-pointer decay):
                         // create anonymous global storage and emit its address
-                        let addr_init = self.create_compound_literal_global(cl_type_spec, cl_init);
+                        let addr_init = self.create_compound_literal_global_with_storage(
+                            cl_type_spec,
+                            cl_init,
+                            cl_st,
+                        );
                         elements.push(addr_init);
                     } else {
                         // Non-pointer compound literal: unwrap and use inner initializer

@@ -132,7 +132,7 @@ fn expr_might_be_addr(
             expr_might_be_addr(lhs, enum_constants) || expr_might_be_addr(rhs, enum_constants)
         }
         // Compound literals may contain addresses
-        Expr::CompoundLiteral(_, _, _) => true,
+        Expr::CompoundLiteral(..) => true,
         // Either operand of `?:` may be the selected address.
         Expr::Conditional(_, then, els, _) => {
             expr_might_be_addr(then, enum_constants) || expr_might_be_addr(els, enum_constants)

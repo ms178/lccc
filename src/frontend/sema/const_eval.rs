@@ -405,8 +405,8 @@ impl<'a> SemaConstEval<'a> {
                 self.bits_to_irconst(truncated, &target_ctype, target_signed)
             }
 
-            // A member of a C23 `constexpr` structure or union object, reached
-            // by `.` from the object (`s.a.b`), is a named constant (6.6p7).
+            // A member of a C23 `constexpr` structure or union object (or a
+            // `(constexpr T){...}` compound literal), reached by `.`, is a named constant.
             Expr::MemberAccess(..) => {
                 let mut path = String::new();
                 let mut cur = expr;
@@ -415,10 +415,36 @@ impl<'a> SemaConstEval<'a> {
                     path.insert(0, '.');
                     cur = base;
                 }
-                let Expr::Identifier(name, _) = cur else {
-                    return None;
-                };
-                Some(self.symbols.constexpr_member(name, &path)?.to_ir_const())
+                match cur {
+                    Expr::Identifier(name, _) => {
+                        Some(self.symbols.constexpr_member(name, &path)?.to_ir_const())
+                    }
+                    Expr::CompoundLiteral(ts, init, _, st) if st.is_constexpr => {
+                        if let Some(val) = self
+                            .types
+                            .constexpr_compound_literals
+                            .get(&(crate::frontend::parser::ast::ExprId::of(cur), path.clone()))
+                        {
+                            return Some(val.to_ir_const());
+                        }
+                        self.eval_constexpr_cl_path(ts, init, &path)
+                    }
+                    _ => None,
+                }
+            }
+
+            Expr::CompoundLiteral(ts, init, _, st) if st.is_constexpr => {
+                if let Some(val) = self.types.constexpr_compound_literals.get(&(
+                    crate::frontend::parser::ast::ExprId::of(expr),
+                    String::new(),
+                )) {
+                    return Some(val.to_ir_const());
+                }
+                self.eval_constexpr_cl_path(ts, init, "")
+            }
+
+            Expr::BitCast(target_spec, src_expr, _) => {
+                self.eval_bit_cast_const(target_spec, src_expr)
             }
 
             // Identifier: enum constants
@@ -610,6 +636,12 @@ impl<'a> SemaConstEval<'a> {
             name if crate::frontend::sema::stdbit::is_stdc_bit_builtin(name) => {
                 self.eval_stdc_bit_const(name, args)
             }
+            name if crate::frontend::sema::gcc16_builtins::is_gcc16_generic_bit_builtin(name) => {
+                self.eval_gcc16_generic_bit_const(name, args)
+            }
+            name if crate::frontend::sema::gcc16_builtins::is_gcc16_bswap_bitrev_builtin(name) => {
+                self.eval_gcc16_bswap_bitrev_const(name, args)
+            }
             _ => {
                 if !self.fold_as_library_function(name) {
                     return None;
@@ -686,6 +718,197 @@ impl<'a> SemaConstEval<'a> {
             Some(IrConst::I128(res as i128))
         } else {
             Some(IrConst::I64(res as i64))
+        }
+    }
+
+    fn eval_gcc16_generic_bit_const(&self, name: &str, args: &[Expr]) -> Option<IrConst> {
+        use crate::frontend::sema::gcc16_builtins;
+        if args.is_empty()
+            || args.len() > 2
+            || (args.len() == 2 && !gcc16_builtins::generic_bit_allows_fallback(name))
+        {
+            return None;
+        }
+        let arg0_ct = self
+            .lookup_expr_type(&args[0])
+            .or_else(|| self.infer_expr_ctype(&args[0]))?
+            .decayed_value_ctype();
+        let width = gcc16_builtins::validate_generic_bit_arg0(name, &arg0_ct).ok()?;
+        let c0 = self.eval_const_expr(&args[0])?;
+        let raw_val = match c0 {
+            IrConst::I128(v) => v as u128,
+            other => other.to_u64()? as u128,
+        };
+        let fb = if args.len() == 2 {
+            let arg1_ct = self
+                .lookup_expr_type(&args[1])
+                .or_else(|| self.infer_expr_ctype(&args[1]))?
+                .decayed_value_ctype();
+            gcc16_builtins::validate_generic_bit_fallback_arg(name, &arg1_ct).ok()?;
+            Some(self.eval_const_expr(&args[1])?.to_i64()?)
+        } else {
+            None
+        };
+        let res = gcc16_builtins::eval_generic_bit_builtin(name, raw_val, fb, width)?;
+        Some(IrConst::I64(res))
+    }
+
+    fn eval_gcc16_bswap_bitrev_const(&self, name: &str, args: &[Expr]) -> Option<IrConst> {
+        use crate::frontend::sema::gcc16_builtins;
+        if gcc16_builtins::rotate_builtin_info(name).is_some() {
+            if args.len() != 2 {
+                return None;
+            }
+            let v0 = self.eval_const_expr(&args[0])?.to_u64()?;
+            let v1 = self.eval_const_expr(&args[1])?.to_u64()?;
+            let out = gcc16_builtins::eval_fixed_rotate(name, v0, v1)?;
+            return Some(IrConst::I64(out as i64));
+        }
+        if args.len() != 1 {
+            return None;
+        }
+        let c0 = self.eval_const_expr(&args[0])?;
+        let raw_val = match c0 {
+            IrConst::I128(v) => v as u128,
+            other => other.to_u64()? as u128,
+        };
+        let out = gcc16_builtins::eval_bswap_or_bitrev(name, raw_val)?;
+        if name == "__builtin_bswap128" {
+            Some(IrConst::I128(out as i128))
+        } else {
+            Some(IrConst::I64(out as i64))
+        }
+    }
+
+    fn eval_bit_cast_const(&self, target_spec: &TypeSpecifier, src_expr: &Expr) -> Option<IrConst> {
+        let dst_ct = self.type_spec_to_ctype(target_spec);
+        let src_ct = self
+            .lookup_expr_type(src_expr)
+            .or_else(|| self.infer_expr_ctype(src_expr))?
+            .decayed_value_ctype();
+        let sz = {
+            let layouts = self.types.borrow_struct_layouts();
+            let d_sz = dst_ct.size_ctx(&*layouts);
+            let s_sz = src_ct.size_ctx(&*layouts);
+            if d_sz == 0 || d_sz > 16 || d_sz != s_sz {
+                return None;
+            }
+            d_sz
+        };
+        let c = self.eval_const_expr(src_expr)?;
+        let mut bytes = [0u8; 16];
+        match (&src_ct, c) {
+            (CType::Float, IrConst::F32(f)) => {
+                bytes[..4].copy_from_slice(&f.to_bits().to_le_bytes())
+            }
+            (CType::Float, IrConst::F64(d)) => {
+                bytes[..4].copy_from_slice(&(d as f32).to_bits().to_le_bytes());
+            }
+            (CType::Double, IrConst::F64(d)) => {
+                bytes[..8].copy_from_slice(&d.to_bits().to_le_bytes())
+            }
+            (CType::Double, IrConst::F32(f)) => {
+                bytes[..8].copy_from_slice(&(f as f64).to_bits().to_le_bytes());
+            }
+            (ct, IrConst::I128(v)) if ct.is_integer() => bytes.copy_from_slice(&v.to_le_bytes()),
+            (ct, other) if ct.is_integer() => {
+                bytes.copy_from_slice(&(other.to_u64()? as u128).to_le_bytes());
+            }
+            _ => return None,
+        }
+        match dst_ct {
+            CType::Float => Some(IrConst::F32(f32::from_bits(u32::from_le_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3],
+            ])))),
+            CType::Double => Some(IrConst::F64(f64::from_bits(u64::from_le_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+            ])))),
+            CType::Bool => None,
+            ct if ct.is_integer() => {
+                let raw = u128::from_le_bytes(bytes);
+                if sz == 16 {
+                    Some(IrConst::I128(raw as i128))
+                } else if ct.is_signed() {
+                    let shift = 64 - (sz * 8);
+                    let sext = ((raw as u64 as i64) << shift) >> shift;
+                    Some(IrConst::I64(sext))
+                } else {
+                    let mask = if sz == 8 {
+                        u64::MAX
+                    } else {
+                        (1u64 << (sz * 8)) - 1
+                    };
+                    Some(IrConst::I64(((raw as u64) & mask) as i64))
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn eval_constexpr_cl_path(
+        &self,
+        ts: &TypeSpecifier,
+        init: &crate::frontend::parser::ast::Initializer,
+        path: &str,
+    ) -> Option<IrConst> {
+        use crate::frontend::parser::ast::{Designator, Initializer};
+        let ct = self.type_spec_to_ctype(ts);
+        if path.is_empty() {
+            return match init {
+                Initializer::Expr(e) => self.eval_const_expr(e),
+                Initializer::List(items) => match items.first() {
+                    Some(it) if it.designators.is_empty() => match &it.init {
+                        Initializer::Expr(e) => self.eval_const_expr(e),
+                        _ => None,
+                    },
+                    None => Some(IrConst::I64(0)),
+                    _ => None,
+                },
+            };
+        }
+        let mut cur_ct = ct;
+        let mut cur_init = init;
+        for seg in path.trim_start_matches('.').split('.') {
+            let (CType::Struct(key) | CType::Union(key)) = &cur_ct else {
+                return None;
+            };
+            let field_info = {
+                let layouts = self.types.borrow_struct_layouts();
+                let layout = layouts.get(key.as_ref())?;
+                let pos = layout.fields.iter().position(|f| f.name == seg)?;
+                (pos, layout.fields[pos].ty.clone())
+            };
+            let Initializer::List(items) = cur_init else {
+                return None;
+            };
+            let mut cursor = 0usize;
+            let mut matched: Option<&Initializer> = None;
+            for item in items {
+                if let Some(Designator::Field(fname)) = item.designators.first() {
+                    let layouts = self.types.borrow_struct_layouts();
+                    if let Some(layout) = layouts.get(key.as_ref()) {
+                        if let Some(p) = layout.fields.iter().position(|f| f.name == *fname) {
+                            cursor = p;
+                        }
+                    }
+                }
+                if cursor == field_info.0 {
+                    matched = Some(&item.init);
+                }
+                cursor += 1;
+            }
+            match matched {
+                Some(next_init) => {
+                    cur_ct = field_info.1;
+                    cur_init = next_init;
+                }
+                None => return Some(IrConst::I64(0)),
+            }
+        }
+        match cur_init {
+            Initializer::Expr(e) => self.eval_const_expr(e),
+            Initializer::List(items) if items.is_empty() => Some(IrConst::I64(0)),
+            _ => None,
         }
     }
 
@@ -1388,7 +1611,7 @@ impl<'a> SemaConstEval<'a> {
             }
             Expr::Char16StringLiteral(s, _) => return Some(s.encode_utf16().count() + 1),
             Expr::Comma(..) | Expr::Conditional(..) | Expr::GnuConditional(..) => return None,
-            Expr::CompoundLiteral(TypeSpecifier::Array(_, None), init, _) => {
+            Expr::CompoundLiteral(TypeSpecifier::Array(_, None), init, _, _) => {
                 return match init.as_ref() {
                     crate::frontend::parser::ast::Initializer::List(items)
                         if items.iter().all(|it| it.designators.is_empty()) =>

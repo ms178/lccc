@@ -1044,6 +1044,14 @@ pub struct X86Codegen {
     /// `target("...")` features are OR-ed onto this and the live
     /// `*_enabled` bits are restored from it after every function.
     module_scalar_isa: ScalarIsa,
+    /// The TU's vector/SIMD ISA (`opts.isa`), captured by `apply_options`
+    /// and restored after every per-function `target("...")` override.
+    module_isa: super::super::isa::X86Isa,
+    /// The TU's baseline `no_sse`, `avx512`, and `avx512vl` bits for restoring
+    /// per-function `target("...")` overrides.
+    module_no_sse: bool,
+    module_avx512: bool,
+    module_avx512vl: bool,
     /// True when the target has LZCNT/ABM (-mlzcnt or an enabling -march).
     /// When false, Clz lowers to a BSR sequence with an explicit zero fixup:
     /// F3-prefixed LZCNT decodes as BSR on CPUs without the feature and
@@ -1628,6 +1636,10 @@ impl X86Codegen {
             lane_const_labels: crate::common::fx_hash::FxHashMap::default(),
             bmi1_enabled: false,
             module_scalar_isa: ScalarIsa::default(),
+            module_isa: super::super::isa::X86Isa::default(),
+            module_no_sse: false,
+            module_avx512: false,
+            module_avx512vl: false,
             lzcnt_enabled: false,
             popcnt_enabled: false,
             prefetch_isa: None,
@@ -1749,6 +1761,7 @@ impl X86Codegen {
         self.state.apply_tls_options(opts);
         self.set_pic(opts.pic || opts.pie);
         self.state.pie_mode = opts.pie;
+        self.state.no_plt = opts.no_plt;
         self.state.fixed_exec_link = opts.fixed_exec_link;
         self.set_function_return_thunk(opts.function_return_thunk);
         self.set_indirect_branch_thunk(opts.indirect_branch_thunk);
@@ -1798,6 +1811,10 @@ impl X86Codegen {
         // encodes the F base (GCC semantics).  Keep the single gate.
         self.avx512vl_enabled = opts.avx512vl && opts.isa.ymm;
         self.isa = opts.isa;
+        self.module_isa = opts.isa;
+        self.module_no_sse = self.no_sse;
+        self.module_avx512 = self.avx512_enabled;
+        self.module_avx512vl = self.avx512vl_enabled;
         // Publish for the emitters without `&self` (MachInst, peepholes).
         super::super::isa::set_current(opts.isa);
         self.state.emit_cfi = opts.emit_cfi;
@@ -7129,6 +7146,9 @@ impl X86Codegen {
         // machinery rewrites at boot.
         let (plan, target): (super::isel::TypedCallPlan, CallTarget) = if let Some(sym) = direct_sym
         {
+            if self.state.needs_got_call(sym) {
+                return false;
+            }
             let target = if self.state.needs_plt(sym) {
                 let n = sym.split('@').next().unwrap_or(sym);
                 CallTarget::Direct(format!("{}@PLT", n))
@@ -7647,10 +7667,55 @@ impl ScalarIsa {
                 "bmi" => self.bmi1 = true,
                 "bmi2" => self.bmi2 = true,
                 "lzcnt" => self.lzcnt = true,
-                "popcnt" => self.popcnt = true,
+                "popcnt" | "sse4.2" => self.popcnt = true,
                 "abm" => {
                     self.lzcnt = true;
                     self.popcnt = true;
+                }
+                "arch=x86-64-v2" | "arch=nehalem" | "arch=westmere" | "arch=sandybridge"
+                | "arch=ivybridge" | "arch=silvermont" | "arch=goldmont" | "arch=tremont" => {
+                    self.popcnt = true;
+                }
+                "arch=x86-64-v3"
+                | "arch=x86-64-v4"
+                | "arch=haswell"
+                | "arch=broadwell"
+                | "arch=skylake"
+                | "arch=skylake-avx512"
+                | "arch=cascadelake"
+                | "arch=cooperlake"
+                | "arch=icelake-client"
+                | "arch=icelake-server"
+                | "arch=tigerlake"
+                | "arch=sapphirerapids"
+                | "arch=emeraldrapids"
+                | "arch=graniterapids"
+                | "arch=alderlake"
+                | "arch=raptorlake"
+                | "arch=meteorlake"
+                | "arch=arrowlake"
+                | "arch=znver1"
+                | "arch=znver2"
+                | "arch=znver3"
+                | "arch=znver4"
+                | "arch=znver5" => {
+                    self.bmi1 = true;
+                    self.bmi2 = true;
+                    self.lzcnt = true;
+                    self.popcnt = true;
+                }
+                _ => {}
+            }
+        }
+        for feature in features {
+            match feature.as_str() {
+                "no-bmi" => self.bmi1 = false,
+                "no-bmi2" => self.bmi2 = false,
+                "no-lzcnt" => self.lzcnt = false,
+                "no-popcnt" => self.popcnt = false,
+                "no-abm" => {
+                    self.lzcnt = false;
+                    self.popcnt = false;
                 }
                 _ => {}
             }
@@ -7903,21 +7968,82 @@ impl X86Codegen {
 
 impl ArchCodegen for X86Codegen {
     fn set_function_target_features(&mut self, features: &[String]) {
-        let isa = self.module_scalar_isa.with_target_features(features);
-        let live = ScalarIsa {
+        let scalar_isa = self.module_scalar_isa.with_target_features(features);
+        let live_scalar = ScalarIsa {
             bmi1: self.bmi1_enabled,
             bmi2: self.bmi2_enabled,
             lzcnt: self.lzcnt_enabled,
             popcnt: self.popcnt_enabled,
         };
-        if isa == live {
-            return;
+        if scalar_isa != live_scalar {
+            self.bmi1_enabled = scalar_isa.bmi1;
+            self.bmi2_enabled = scalar_isa.bmi2;
+            self.lzcnt_enabled = scalar_isa.lzcnt;
+            self.popcnt_enabled = scalar_isa.popcnt;
+            self.publish_shlx_mode();
         }
-        self.bmi1_enabled = isa.bmi1;
-        self.bmi2_enabled = isa.bmi2;
-        self.lzcnt_enabled = isa.lzcnt;
-        self.popcnt_enabled = isa.popcnt;
-        self.publish_shlx_mode();
+        let vec_isa = self.module_isa.with_target_features(features);
+        let want_avx512 = (self.module_avx512
+            || features.iter().any(|f| {
+                matches!(
+                    f.as_str(),
+                    "avx512f"
+                        | "avx512vl"
+                        | "arch=x86-64-v4"
+                        | "arch=skylake-avx512"
+                        | "arch=cascadelake"
+                        | "arch=cooperlake"
+                        | "arch=icelake-client"
+                        | "arch=icelake-server"
+                        | "arch=tigerlake"
+                        | "arch=sapphirerapids"
+                        | "arch=emeraldrapids"
+                        | "arch=graniterapids"
+                        | "arch=znver4"
+                        | "arch=znver5"
+                )
+            }))
+            && vec_isa.ymm
+            && !features.iter().any(|f| f == "no-avx512f");
+        let want_avx512vl = (self.module_avx512vl
+            || features.iter().any(|f| {
+                matches!(
+                    f.as_str(),
+                    "avx512vl"
+                        | "arch=x86-64-v4"
+                        | "arch=skylake-avx512"
+                        | "arch=cascadelake"
+                        | "arch=cooperlake"
+                        | "arch=icelake-client"
+                        | "arch=icelake-server"
+                        | "arch=tigerlake"
+                        | "arch=sapphirerapids"
+                        | "arch=emeraldrapids"
+                        | "arch=graniterapids"
+                        | "arch=znver4"
+                        | "arch=znver5"
+                )
+            }))
+            && want_avx512
+            && !features.iter().any(|f| f == "no-avx512vl");
+        let want_no_sse = if features.is_empty() {
+            self.module_no_sse
+        } else {
+            !vec_isa.simd
+        };
+        if vec_isa != self.isa
+            || want_avx512 != self.avx512_enabled
+            || want_avx512vl != self.avx512vl_enabled
+            || want_no_sse != self.no_sse
+        {
+            self.isa = vec_isa;
+            self.no_sse = want_no_sse;
+            self.avx2_enabled = vec_isa.ymm;
+            self.fma_enabled = vec_isa.fma;
+            self.avx512_enabled = want_avx512;
+            self.avx512vl_enabled = want_avx512vl;
+            super::super::isa::set_current(vec_isa);
+        }
     }
 
     /// Provenance markers for user inline-asm bodies: `#APP`/`#NO_APP`.

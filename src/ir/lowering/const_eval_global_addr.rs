@@ -92,7 +92,7 @@ impl Lowerer {
                         self.resolve_pointer_member_access_addr(base, field)
                     }
                     // &(compound_literal) - look up previously materialized compound literal
-                    Expr::CompoundLiteral(_, _, _) => {
+                    Expr::CompoundLiteral(_, _, _, _) => {
                         let key = inner.as_ref() as *const Expr as usize;
                         self.materialized_compound_literals
                             .get(&key)
@@ -153,7 +153,7 @@ impl Lowerer {
             // The initializer path handles patterns like:
             //   ((struct Wrap) {func_ptr})
             // where the compound literal wraps a function pointer.
-            Expr::CompoundLiteral(_, init, _) => {
+            Expr::CompoundLiteral(_, init, _, _) => {
                 // Check if this compound literal was pre-materialized as an anonymous global
                 let key = expr as *const Expr as usize;
                 if let Some(label) = self.materialized_compound_literals.get(&key) {

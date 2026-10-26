@@ -215,6 +215,13 @@ pub struct Lowerer {
     /// as an inline-only definition (no external def emitted), matching the behaviour
     /// of GCC in GNU89 mode. The default (false) uses C99 inline semantics.
     pub(super) gnu89_inline: bool,
+    /// `-ftrapv`: emit runtime signed-overflow checks on signed integer operations.
+    pub(super) trapv: bool,
+    /// `-ftrivial-auto-var-init={uninitialized,zero,pattern}` mode.
+    pub(super) trivial_auto_var_init: super::trapv::TrivialAutoVarInit,
+    /// `-fvisibility={default,hidden,internal,protected}` CLI default visibility for
+    /// non-static definitions in this translation unit.
+    pub(super) default_visibility: Option<String>,
 }
 
 /// Largest zero-initialised aggregate region lowered as an explicit store
@@ -246,6 +253,49 @@ impl Lowerer {
     pub fn with_enumerator_refs(mut self, refs: FxHashMap<ExprId, i64>) -> Self {
         self.sema_enumerator_refs = refs;
         self
+    }
+
+    pub(crate) fn with_trapv(mut self, trapv: bool) -> Self {
+        self.trapv = trapv;
+        self
+    }
+
+    pub(crate) fn with_trivial_auto_var_init(
+        mut self,
+        mode: super::trapv::TrivialAutoVarInit,
+    ) -> Self {
+        self.trivial_auto_var_init = mode;
+        self
+    }
+
+    pub(crate) fn with_default_visibility(mut self, vis: Option<String>) -> Self {
+        self.default_visibility = vis;
+        self
+    }
+
+    /// Resolve effective ELF visibility for a symbol defined in this TU,
+    /// honoring explicit `visibility("...")` / `#pragma GCC visibility` over
+    /// `-fvisibility=...`, and normalizing `"default"` to `None` (`STV_DEFAULT`).
+    pub(super) fn effective_def_visibility(
+        &self,
+        is_static: bool,
+        explicit: &Option<String>,
+    ) -> Option<String> {
+        Self::resolve_def_visibility(self.default_visibility.as_deref(), is_static, explicit)
+    }
+
+    fn resolve_def_visibility(
+        default_vis: Option<&str>,
+        is_static: bool,
+        explicit: &Option<String>,
+    ) -> Option<String> {
+        let raw = explicit
+            .as_deref()
+            .or_else(|| (!is_static).then_some(default_vis).flatten());
+        match raw {
+            None | Some("default") => None,
+            Some(v) => Some(v.to_string()),
+        }
     }
 
     /// Create a new Lowerer with pre-populated state from semantic analysis.
@@ -326,6 +376,9 @@ impl Lowerer {
             diagnostics: RefCell::new(diagnostics),
             materialized_compound_literals: FxHashMap::default(),
             gnu89_inline,
+            trapv: false,
+            trivial_auto_var_init: super::trapv::TrivialAutoVarInit::Uninitialized,
+            default_visibility: None,
         }
     }
 
@@ -1185,7 +1238,11 @@ impl Lowerer {
                     if self.may_skip_unreferenced_internal(func, &referenced_statics) {
                         continue;
                     }
-                    self.lower_function(func);
+                    if let Some(ref tc) = func.attrs.target_clones {
+                        self.lower_target_clones_function(func, tc);
+                    } else {
+                        self.lower_function(func);
+                    }
                 }
                 ExternalDecl::Declaration(decl) => {
                     self.lower_global_decl(decl);
@@ -1213,10 +1270,42 @@ impl Lowerer {
             .extern_function_symbols
             .extend(extern_function_symbols);
 
+        self.finalize_module_visibility();
+        (self.module, self.diagnostics.into_inner())
+    }
+
+    fn finalize_module_visibility(&mut self) {
+        let default_vis = self.default_visibility.as_deref();
         for function in &mut self.module.functions {
             function.pass_policy = self.pass_policy;
+            if !function.is_declaration {
+                function.visibility = Self::resolve_def_visibility(
+                    default_vis,
+                    function.is_static,
+                    &function.visibility,
+                );
+            } else if function.visibility.as_deref() == Some("default") {
+                function.visibility = None;
+            }
         }
-        (self.module, self.diagnostics.into_inner())
+        for global in &mut self.module.globals {
+            if !global.is_extern {
+                global.visibility =
+                    Self::resolve_def_visibility(default_vis, global.is_static, &global.visibility);
+            } else if global.visibility.as_deref() == Some("default") {
+                global.visibility = None;
+            }
+        }
+        for (_, _, vis) in &mut self.module.symbol_attrs {
+            if vis.as_deref() == Some("default") {
+                *vis = None;
+            }
+        }
+        for (_, _, _, vis) in &mut self.module.ifuncs {
+            if vis.as_deref() == Some("default") {
+                *vis = None;
+            }
+        }
     }
 
     /// Resolve a symbol reference: versioned .symver references first (glibc

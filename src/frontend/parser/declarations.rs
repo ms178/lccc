@@ -246,6 +246,9 @@ impl Parser {
         let cleanup_fn = self.attrs.parsing_cleanup_fn.take();
         let symver = self.attrs.parsing_symver.take();
         let target = self.attrs.parsing_target.take();
+        let target_clones = self.attrs.parsing_target_clones.take();
+        let is_uninitialized = self.attrs.parsing_uninitialized();
+        self.attrs.set_uninitialized(false);
         let diagnose_as = self.attrs.parsing_diagnose_as.take();
         let is_used = self.attrs.parsing_used();
         let is_fastcall = self.attrs.parsing_fastcall();
@@ -275,6 +278,7 @@ impl Parser {
         decl_attrs.set_pure(is_pure);
         decl_attrs.set_const_attr(is_const_attr);
         decl_attrs.set_cold(is_cold);
+        decl_attrs.set_uninitialized(is_uninitialized);
         decl_attrs.set_nested_fn(self.attrs.parsing_nested_fn());
         decl_attrs.alias_target = alias_target;
         decl_attrs.ifunc_target = ifunc_target;
@@ -286,6 +290,7 @@ impl Parser {
         decl_attrs.cleanup_fn = cleanup_fn;
         decl_attrs.symver = symver;
         decl_attrs.target = target;
+        decl_attrs.target_clones = target_clones;
         decl_attrs.diagnose_as = diagnose_as;
 
         // Apply __attribute__((mode(...))): transform type to specified bit-width
@@ -756,6 +761,12 @@ impl Parser {
         if let Some(ref target) = self.attrs.parsing_ifunc_target {
             last_decl.attrs.ifunc_target = Some(target.clone());
         }
+        if let Some(ref tc) = self.attrs.parsing_target_clones {
+            last_decl.attrs.target_clones = Some(tc.clone());
+        }
+        if self.attrs.parsing_uninitialized() {
+            last_decl.attrs.set_uninitialized(true);
+        }
         if let Some(ref vis) = self.attrs.parsing_visibility {
             last_decl.attrs.visibility = Some(vis.clone());
         }
@@ -815,6 +826,8 @@ impl Parser {
         self.attrs.set_weak(false);
         self.attrs.parsing_alias_target = None;
         self.attrs.parsing_ifunc_target = None;
+        self.attrs.parsing_target_clones = None;
+        self.attrs.set_uninitialized(false);
         self.attrs.parsing_visibility = None;
         self.attrs.parsing_tls_model = None;
         self.attrs.parsing_section = None;
@@ -1007,6 +1020,8 @@ impl Parser {
         // through a link-time offset that does not belong to it.
         let spec_visibility = self.attrs.parsing_visibility.take();
         let spec_tls_model = self.attrs.parsing_tls_model.take();
+        let spec_uninitialized = self.attrs.parsing_uninitialized();
+        self.attrs.set_uninitialized(false);
 
         // Snapshot the declaration's address space NOW: initializer parsing
         // can contain casts to segment-qualified pointers, and the abstract-
@@ -1068,6 +1083,8 @@ impl Parser {
             );
             let l_base_volatile = self.attrs.declarator_base_volatile;
             let (skip_mode, skip_aligned, skip_asm_reg) = self.skip_asm_and_attributes();
+            let local_uninitialized = spec_uninitialized || self.attrs.parsing_uninitialized();
+            self.attrs.set_uninitialized(false);
             let local_cleanup_fn = self.attrs.parsing_cleanup_fn.take();
             let local_section = self.attrs.parsing_section.take();
             let local_visibility = self
@@ -1100,6 +1117,7 @@ impl Parser {
                     da.tls_model = local_tls_model;
                     da.asm_register = skip_asm_reg;
                     da.cleanup_fn = local_cleanup_fn;
+                    da.set_uninitialized(local_uninitialized);
                     da.set_used(self.attrs.parsing_used());
                     da.set_nested_fn(self.attrs.parsing_nested_fn());
                     da.set_noreturn(self.attrs.parsing_noreturn());

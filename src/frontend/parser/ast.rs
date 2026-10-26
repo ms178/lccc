@@ -48,6 +48,8 @@ pub struct FunctionAttributes {
     pub symver: Option<String>,
     /// __attribute__((target("..."))) - comma-joined per-function ISA features
     pub target: Option<String>,
+    /// __attribute__((target_clones("..."))) - comma-joined multiversion clone targets
+    pub target_clones: Option<String>,
     /// __attribute__((__diagnose_as(__builtin_NAME, ...))) - builtin alias
     /// (mirrored from DeclAttributes for definitions; see expr_calls.rs).
     pub diagnose_as: Option<String>,
@@ -158,6 +160,7 @@ impl FunctionAttributes {
         attrs.visibility = decl.visibility.clone();
         attrs.symver = decl.symver.clone();
         attrs.target = decl.target.clone();
+        attrs.target_clones = decl.target_clones.clone();
         attrs.diagnose_as = decl.diagnose_as.clone();
         attrs
     }
@@ -745,6 +748,8 @@ pub struct DeclAttributes {
     pub symver: Option<String>,
     /// __attribute__((target("..."))) - comma-joined per-function ISA features
     pub target: Option<String>,
+    /// __attribute__((target_clones("..."))) - comma-joined multiversion clone targets
+    pub target_clones: Option<String>,
     /// __attribute__((__diagnose_as(__builtin_NAME, ...))) - the declared
     /// function is an analyzer alias of builtin NAME; calls that survive
     /// inlining fold to the builtin (kernel fortify-string family).
@@ -784,6 +789,9 @@ pub mod decl_attr_flag {
     /// `parsed_attr_flag::NESTED_FN`). Not an attribute spelling: there is no
     /// `__attribute__((auto))`, only the storage-class keyword.
     pub const NESTED_FN: u16 = 1 << 12;
+    /// `__attribute__((uninitialized))` — opt an automatic variable out of
+    /// `-ftrivial-auto-var-init={zero,pattern}`.
+    pub const UNINITIALIZED: u16 = 1 << 13;
 }
 
 impl DeclAttributes {
@@ -841,6 +849,10 @@ impl DeclAttributes {
     pub fn is_cold(&self) -> bool {
         self.flags & decl_attr_flag::COLD != 0
     }
+    #[inline]
+    pub fn is_uninitialized(&self) -> bool {
+        self.flags & decl_attr_flag::UNINITIALIZED != 0
+    }
 
     // --- flag setters ---
 
@@ -895,6 +907,10 @@ impl DeclAttributes {
     #[inline]
     pub fn set_cold(&mut self, v: bool) {
         self.set_flag(decl_attr_flag::COLD, v)
+    }
+    #[inline]
+    pub fn set_uninitialized(&mut self, v: bool) {
+        self.set_flag(decl_attr_flag::UNINITIALIZED, v)
     }
 
     #[inline]
@@ -1482,6 +1498,17 @@ impl ExprId {
     }
 }
 
+/// Storage-class and top-level const qualifiers on a C23 compound literal
+/// `(storage-class-specifiers_opt type-name){ ... }` (C23 §6.5.2.5).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct CompoundLiteralStorage {
+    pub is_static: bool,
+    pub is_constexpr: bool,
+    pub is_register: bool,
+    pub is_thread_local: bool,
+    pub is_const: bool,
+}
+
 /// Qualifiers of a cast's type name, read from its tokens by the parser.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct CastQualifiers {
@@ -1547,7 +1574,15 @@ pub enum Expr {
     /// cast as a null pointer constant, so that form is not one even when its
     /// operand is `0`. `pointee_volatile` makes `*(volatile T *)p` volatile.
     Cast(TypeSpecifier, Box<Expr>, Span, CastQualifiers),
-    CompoundLiteral(TypeSpecifier, Box<Initializer>, Span),
+    /// `(storage-class-specifiers_opt type-name){ initializer-list }`.
+    /// C23 §6.5.2.5 allows `constexpr`, `static`, `register`, and `thread_local`
+    /// storage-class specifiers on compound literals.
+    CompoundLiteral(
+        TypeSpecifier,
+        Box<Initializer>,
+        Span,
+        CompoundLiteralStorage,
+    ),
     StmtExpr(CompoundStmt, Span),
     Sizeof(Box<SizeofArg>, Span),
     /// C2y / GCC 16 `_Countof` operator: element count of an array type or expression.
@@ -1558,6 +1593,9 @@ pub enum Expr {
     /// (int<->float lanes). Second argument is a TYPE, so it needs its own
     /// AST node like VaArg.
     ConvertVector(Box<Expr>, TypeSpecifier, Span),
+    /// __builtin_bit_cast(type, expr): C23 / GCC / Clang value-reinterpreting
+    /// bit-cast between equal-sized trivially-copyable types.
+    BitCast(TypeSpecifier, Box<Expr>, Span),
     /// _Alignof(type) - C11 standard, returns minimum ABI alignment
     Alignof(TypeSpecifier, Span),
     /// _Alignof(expr) - alignment of expression's type (via _Alignof macro path)
@@ -1891,6 +1929,7 @@ impl Expr {
             | Expr::Cast(_, e, ..)
             | Expr::VaArg(e, ..)
             | Expr::ConvertVector(e, ..)
+            | Expr::BitCast(_, e, _)
             | Expr::AlignofExpr(e, _)
             | Expr::GnuAlignofExpr(e, _)
             | Expr::AddressOf(e, _)
@@ -1908,7 +1947,7 @@ impl Expr {
                 f(callee);
                 args.iter().for_each(&mut *f);
             }
-            Expr::CompoundLiteral(_, init, _) => init.for_each_expr(f),
+            Expr::CompoundLiteral(_, init, _, _) => init.for_each_expr(f),
             Expr::Sizeof(arg, _) | Expr::Countof(arg, _) => {
                 if let SizeofArg::Expr(e) = arg.as_ref() {
                     f(e);
@@ -1931,6 +1970,7 @@ impl Expr {
             | Expr::CompoundLiteral(ts, ..)
             | Expr::VaArg(_, ts, _)
             | Expr::ConvertVector(_, ts, _)
+            | Expr::BitCast(ts, _, _)
             | Expr::Alignof(ts, _)
             | Expr::GnuAlignof(ts, _) => f(ts),
             Expr::Sizeof(arg, _) | Expr::Countof(arg, _) => {
@@ -2051,12 +2091,13 @@ impl Expr {
             | Expr::MemberAccess(_, _, s)
             | Expr::PointerMemberAccess(_, _, s)
             | Expr::Cast(_, _, s, _)
-            | Expr::CompoundLiteral(_, _, s)
+            | Expr::CompoundLiteral(_, _, s, _)
             | Expr::StmtExpr(_, s)
             | Expr::Sizeof(_, s)
             | Expr::Countof(_, s)
             | Expr::VaArg(_, _, s)
             | Expr::ConvertVector(_, _, s)
+            | Expr::BitCast(_, _, s)
             | Expr::Alignof(_, s)
             | Expr::AlignofExpr(_, s)
             | Expr::GnuAlignof(_, s)
