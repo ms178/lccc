@@ -2828,11 +2828,7 @@ impl Lowerer {
                     && requirement.feature == F::Avx512Bw
                     && matches!(
                         feature,
-                        "avx512vbmi"
-                            | "avx512vbmi2"
-                            | "avx512bitalg"
-                            | "avx512bf16"
-                            | "avx512fp16"
+                        "avx512vbmi" | "avx512vbmi2" | "avx512bitalg" | "avx512bf16" | "avx512fp16"
                     )
                 {
                     permitted = true;
