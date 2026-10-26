@@ -227,8 +227,11 @@ impl X86Isa {
                 "general-regs-only" | "no-sse" | "no-sse2" => {
                     self.simd = false;
                 }
-                "no-sse4" | "no-sse4.1" => {
+                "no-sse3" | "no-ssse3" | "no-sse4" | "no-sse4.1" => {
                     self.sse41 = false;
+                }
+                "no-sse4.2" => {
+                    self.avx = false;
                 }
                 "no-avx" => {
                     self.avx = false;
@@ -336,6 +339,20 @@ mod tests {
         };
         let n = no_vex_fma.normalized();
         assert!(n.simd && n.sse41 && !n.avx && !n.ymm && !n.fma);
+    }
+
+    #[test]
+    fn local_sse_and_avx_denials_revoke_fma_prerequisites() {
+        for denied in ["no-sse3", "no-ssse3", "no-sse4.1", "no-sse4.2", "no-avx"] {
+            let features = vec!["fma".to_string(), denied.to_string()];
+            let isa = X86Isa::SSE2.with_target_features(&features);
+            assert!(!isa.avx && !isa.fma, "{denied} left VEX FMA enabled: {isa:?}");
+        }
+        let restored = X86Isa::SSE2.with_target_features(&[
+            "no-avx".to_string(),
+            "fma".to_string(),
+        ]);
+        assert!(restored.avx && restored.fma);
     }
 
     #[test]
