@@ -1269,7 +1269,7 @@ impl Lowerer {
             Expr::Comma(_, rhs, _) => self.get_expr_type(rhs),
             Expr::PostfixOp(_, inner, _) => self.get_expr_type(inner),
             Expr::AddressOf(_, _) => IrType::Ptr,
-            Expr::Sizeof(_, _) => {
+            Expr::Sizeof(_, _) | Expr::Countof(_, _) => {
                 if is_32bit {
                     IrType::U32
                 } else {
@@ -1290,6 +1290,9 @@ impl Lowerer {
                         {
                             return pointee_ty;
                         }
+                    }
+                    if let Some(ct) = self.get_c2y_builtin_ctype(name, args) {
+                        return IrType::from_ctype(&ct);
                     }
                 }
                 self.get_call_return_type(func)
@@ -1465,7 +1468,7 @@ impl Lowerer {
     /// Resolve a potentially stale (forward-declared) struct/union CType by looking
     /// up the latest complete definition from the ctype_cache.
     /// If the struct has no fields but has a name, the cache may have the full definition.
-    fn resolve_forward_declared_ctype(&self, ctype: CType) -> CType {
+    pub(super) fn resolve_forward_declared_ctype(&self, ctype: CType) -> CType {
         match &ctype {
             CType::Struct(key) | CType::Union(key) => {
                 // Check if the layout for this key is a forward-declaration stub (size 0, no fields)
@@ -1865,6 +1868,9 @@ impl Lowerer {
                             }
                         }
                     }
+                    if let Some(ct) = self.get_c2y_builtin_ctype(name, args) {
+                        return Some(ct);
+                    }
                     // Same rule as the IrType path above: a call to a visible
                     // nested function is typed by the nested entity's record.
                     let sig_key = self.callee_signature_key(name.as_str());
@@ -1927,6 +1933,7 @@ impl Lowerer {
             // unsigned int on 32-bit). This is needed so typeof(sizeof(...)) resolves
             // correctly in kernel macros.
             Expr::Sizeof(_, _)
+            | Expr::Countof(_, _)
             | Expr::Alignof(_, _)
             | Expr::AlignofExpr(_, _)
             | Expr::GnuAlignof(_, _)
@@ -2275,6 +2282,49 @@ impl Lowerer {
                     }
                 }
                 None
+            }
+            _ => None,
+        }
+    }
+
+    pub(super) fn get_c2y_builtin_ctype(&self, name: &str, args: &[Expr]) -> Option<CType> {
+        use crate::frontend::sema::stdbit;
+        if stdbit::is_stdc_bit_builtin(name) {
+            let arg0_ct = args
+                .first()
+                .and_then(|a| self.get_expr_ctype(a))
+                .map(|ct| ct.decayed_value_ctype());
+            return stdbit::stdc_bit_return_ctype(name, arg0_ct.as_ref());
+        }
+        match name {
+            "__builtin_counted_by_ref" => {
+                if let Some(arg0) = args.first() {
+                    if let Some((_, cnt_ty, _)) = self.resolve_counted_by_member_expr(arg0) {
+                        let space = match arg0 {
+                            Expr::PointerMemberAccess(base, _, _) => {
+                                match self.get_expr_ctype(base) {
+                                    Some(CType::Pointer(_, sp)) => sp,
+                                    _ => AddressSpace::Default,
+                                }
+                            }
+                            _ => AddressSpace::Default,
+                        };
+                        return Some(CType::Pointer(Box::new(cnt_ty), space));
+                    }
+                }
+                Some(CType::Pointer(Box::new(CType::Void), AddressSpace::Default))
+            }
+            "__builtin_assoc_barrier" => args
+                .first()
+                .and_then(|a| self.get_expr_ctype(a))
+                .map(|ct| ct.decayed_value_ctype()),
+            "__builtin_clear_padding" => Some(CType::Void),
+            "__builtin_object_size" | "__builtin_dynamic_object_size" => {
+                Some(if crate::common::types::target_is_32bit() {
+                    CType::UInt
+                } else {
+                    CType::ULong
+                })
             }
             _ => None,
         }

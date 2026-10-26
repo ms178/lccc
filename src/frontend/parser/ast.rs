@@ -728,6 +728,8 @@ pub struct DeclAttributes {
     pub base_volatile: bool,
     /// __attribute__((alias("target"))) - this symbol is an alias for target
     pub alias_target: Option<String>,
+    /// __attribute__((ifunc("resolver"))) / [[gnu::ifunc("resolver")]] - GNU indirect function
+    pub ifunc_target: Option<String>,
     /// __attribute__((visibility("hidden"))) etc.
     pub visibility: Option<String>,
     /// __attribute__((tls_model("..."))) - requested TLS access model
@@ -915,6 +917,7 @@ impl std::fmt::Debug for DeclAttributes {
             .field("is_noreturn", &self.is_noreturn())
             .field("is_used", &self.is_used())
             .field("alias_target", &self.alias_target)
+            .field("ifunc_target", &self.ifunc_target)
             .field("regparm", &self.regparm)
             .field("visibility", &self.visibility)
             .field("section", &self.section)
@@ -1281,6 +1284,9 @@ pub struct StructFieldDecl {
     /// `volatile` on the field object itself (`int *volatile p`). Mirrors
     /// `DeclAttributes::object_volatile`.
     pub object_volatile: bool,
+    /// GCC 15/16 `__attribute__((counted_by(member)))` / `[[gnu::counted_by(member)]]`:
+    /// names the sibling integer field storing this flexible array's element count.
+    pub counted_by: Option<String>,
 }
 
 /// An enum variant.
@@ -1300,6 +1306,8 @@ pub struct CompoundStmt {
     /// When non-empty, label definitions and gotos within this block use
     /// scope-qualified names to avoid collisions (e.g., in statement expressions).
     pub local_labels: Vec<String>,
+    /// True when synthesized by `if (init; cond)` or `switch (init; expr)` (C2y 6.8.5).
+    pub is_synthetic_init_scope: bool,
 }
 
 /// Items within a block.
@@ -1332,8 +1340,8 @@ pub enum Stmt {
         Span,
     ),
     Compound(CompoundStmt),
-    Break(Span),
-    Continue(Span),
+    Break(Option<String>, Span),
+    Continue(Option<String>, Span),
     Switch(Expr, Box<Stmt>, Span),
     Case(Expr, Box<Stmt>, Span),
     /// GNU case range: `case low ... high:` (GCC extension)
@@ -1387,12 +1395,25 @@ impl Stmt {
             Stmt::Expr(None)
             | Stmt::Return(None, _)
             | Stmt::Compound(_)
-            | Stmt::Break(_)
-            | Stmt::Continue(_)
+            | Stmt::Break(..)
+            | Stmt::Continue(..)
             | Stmt::Default(..)
             | Stmt::Goto(..)
             | Stmt::Label(..)
             | Stmt::Declaration(_) => {}
+        }
+    }
+
+    /// True if this statement (possibly after stacked labels or a synthetic
+    /// `switch (init; expr)` scope) is a loop or `switch` statement (C2y named loops).
+    pub fn labels_loop_or_switch(&self) -> bool {
+        match self {
+            Stmt::While(..) | Stmt::DoWhile(..) | Stmt::For(..) | Stmt::Switch(..) => true,
+            Stmt::Label(_, inner, _) => inner.labels_loop_or_switch(),
+            Stmt::Compound(c) if c.is_synthetic_init_scope => c.items.last().is_some_and(
+                |it| matches!(it, BlockItem::Statement(s) if s.labels_loop_or_switch()),
+            ),
+            _ => false,
         }
     }
 
@@ -1405,8 +1426,8 @@ impl Stmt {
             | Stmt::While(_, _, span)
             | Stmt::DoWhile(_, _, span)
             | Stmt::For(_, _, _, _, span)
-            | Stmt::Break(span)
-            | Stmt::Continue(span)
+            | Stmt::Break(_, span)
+            | Stmt::Continue(_, span)
             | Stmt::Switch(_, _, span)
             | Stmt::Case(_, _, span)
             | Stmt::CaseRange(_, _, _, span)
@@ -1529,6 +1550,8 @@ pub enum Expr {
     CompoundLiteral(TypeSpecifier, Box<Initializer>, Span),
     StmtExpr(CompoundStmt, Span),
     Sizeof(Box<SizeofArg>, Span),
+    /// C2y / GCC 16 `_Countof` operator: element count of an array type or expression.
+    Countof(Box<SizeofArg>, Span),
     /// __builtin_va_arg(ap, type): extract next variadic argument of given type
     VaArg(Box<Expr>, TypeSpecifier, Span),
     /// __builtin_convertvector(expr, type): element-wise vector conversion
@@ -1886,7 +1909,7 @@ impl Expr {
                 args.iter().for_each(&mut *f);
             }
             Expr::CompoundLiteral(_, init, _) => init.for_each_expr(f),
-            Expr::Sizeof(arg, _) => {
+            Expr::Sizeof(arg, _) | Expr::Countof(arg, _) => {
                 if let SizeofArg::Expr(e) = arg.as_ref() {
                     f(e);
                 }
@@ -1910,7 +1933,7 @@ impl Expr {
             | Expr::ConvertVector(_, ts, _)
             | Expr::Alignof(ts, _)
             | Expr::GnuAlignof(ts, _) => f(ts),
-            Expr::Sizeof(arg, _) => {
+            Expr::Sizeof(arg, _) | Expr::Countof(arg, _) => {
                 if let SizeofArg::Type(ts) = arg.as_ref() {
                     f(ts);
                 }
@@ -2031,6 +2054,7 @@ impl Expr {
             | Expr::CompoundLiteral(_, _, s)
             | Expr::StmtExpr(_, s)
             | Expr::Sizeof(_, s)
+            | Expr::Countof(_, s)
             | Expr::VaArg(_, _, s)
             | Expr::ConvertVector(_, _, s)
             | Expr::Alignof(_, s)

@@ -3899,6 +3899,10 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 let is_foldable_local = self.label_positions.contains_key(&reloc.symbol)
                     && !self.pending_globals.contains(&reloc.symbol)
                     && !self.pending_weaks.contains(&reloc.symbol)
+                    && !matches!(
+                        self.pending_types.get(&reloc.symbol),
+                        Some(SymbolKind::GnuIndirectFunction)
+                    )
                     && !A::is_tls_reloc(reloc.reloc_type)
                     && !A::is_got_slot_reloc(reloc.reloc_type);
                 let (sym_name, mut addend) = if is_foldable_local {
@@ -5450,7 +5454,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
         if let Some(&v) = self.set_values.get(name) {
             return SectionExpr::absolute(v);
         }
-        if !self.is_global_or_weak(name) {
+        if !self.is_nonfoldable_symbol(name) {
             if let Some(v) = self.set_exprs.get(name) {
                 return v.clone();
             }
@@ -5466,6 +5470,14 @@ impl<A: X86Arch> ElfWriterCore<A> {
     fn is_global_or_weak(&self, name: &str) -> bool {
         self.pending_globals.iter().any(|g| g == name)
             || self.pending_weaks.iter().any(|w| w == name)
+    }
+
+    fn is_nonfoldable_symbol(&self, name: &str) -> bool {
+        self.is_global_or_weak(name)
+            || matches!(
+                self.pending_types.get(name),
+                Some(SymbolKind::GnuIndirectFunction)
+            )
     }
 
     /// The final value of a captured `.set` value after layout, in terms of
@@ -5505,7 +5517,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
             return self.final_set_name(target, depth + 1);
         }
         if let Some(&(sec, off)) = self.label_positions.get(name) {
-            return Ok(if self.is_global_or_weak(name) {
+            return Ok(if self.is_nonfoldable_symbol(name) {
                 SectionExpr::term(SetBase::Sym(name.to_string()), 1)
             } else {
                 SectionExpr::at(SetBase::Sec(sec), off as i64)
@@ -5522,7 +5534,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
     /// relocates the first `.long` against v0), so substitute it here:
     /// `Some((symbol, minus-symbol, addend))`, or `None` for anything else.
     fn set_operand_at_use(&self, sym: &str) -> Option<(String, Option<String>, i64)> {
-        if self.is_global_or_weak(sym) {
+        if self.is_nonfoldable_symbol(sym) {
             return None;
         }
         let v = match (self.set_exprs.get(sym), self.aliases.get(sym)) {

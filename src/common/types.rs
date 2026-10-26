@@ -762,6 +762,8 @@ pub struct StructField {
     pub base_volatile: bool,
     /// Volatile field object itself (`int *volatile p`). See `StructFieldDecl`.
     pub object_volatile: bool,
+    /// Optional sibling count member from `__attribute__((counted_by(member)))`.
+    pub counted_by: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1055,6 +1057,7 @@ impl StructLayoutBuilder {
             name: field.name.clone(),
             base_volatile: field.base_volatile,
             object_volatile: field.object_volatile,
+            counted_by: field.counted_by.clone(),
             offset: storage_offset,
             ty: storage_ty,
             bit_offset: Some(bit_offset_in_storage),
@@ -1146,6 +1149,7 @@ impl StructLayoutBuilder {
             name: field.name.clone(),
             base_volatile: field.base_volatile,
             object_volatile: field.object_volatile,
+            counted_by: field.counted_by.clone(),
             offset: field_storage_offset,
             ty: field.ty.clone(),
             bit_offset: Some(field_bit_in_storage),
@@ -1194,6 +1198,7 @@ impl StructLayoutBuilder {
             name: field.name.clone(),
             base_volatile: field.base_volatile,
             object_volatile: field.object_volatile,
+            counted_by: field.counted_by.clone(),
             offset: self.offset,
             ty: field.ty.clone(),
             bit_offset: None,
@@ -1363,6 +1368,8 @@ pub struct StructFieldLayout {
     pub base_volatile: bool,
     /// Volatile field object itself (`int *volatile p`).
     pub object_volatile: bool,
+    /// Optional sibling count member from `__attribute__((counted_by(member)))`.
+    pub counted_by: Option<String>,
 }
 
 impl StructLayout {
@@ -1513,6 +1520,7 @@ impl StructLayout {
                 name: field.name.clone(),
                 base_volatile: field.base_volatile,
                 object_volatile: field.object_volatile,
+                counted_by: field.counted_by.clone(),
                 offset: 0, // All union fields start at offset 0
                 ty: field.ty.clone(),
                 bit_offset: bf_offset,
@@ -1912,6 +1920,36 @@ impl StructLayout {
     /// Look up a field by name, returning full layout info including bitfield details.
     pub fn field_layout(&self, name: &str) -> Option<&StructFieldLayout> {
         self.fields.iter().find(|f| f.name == name)
+    }
+
+    /// Resolve a field's `counted_by` attribute, returning
+    /// `(count_member_name, count_member_ctype, fam_field_ctype)` when the
+    /// named field carries `counted_by` and its sibling count field exists.
+    pub fn field_counted_by(
+        &self,
+        name: &str,
+        ctx: &dyn StructLayoutProvider,
+    ) -> Option<(String, CType, CType)> {
+        if let Some(f) = self.fields.iter().find(|f| f.name == name) {
+            let cnt_name = f.counted_by.as_ref()?;
+            let (_, cnt_ty) = self.field_offset(cnt_name, ctx)?;
+            return Some((cnt_name.clone(), cnt_ty, f.ty.clone()));
+        }
+        for f in &self.fields {
+            if !f.name.is_empty() {
+                continue;
+            }
+            if let CType::Struct(key) | CType::Union(key) = &f.ty {
+                if let Some(anon) = ctx.get_struct_layout(key) {
+                    if let Some((cnt_name, _, fam_ty)) = anon.field_counted_by(name, ctx) {
+                        if let Some((_, cnt_ty)) = self.field_offset(&cnt_name, ctx) {
+                            return Some((cnt_name, cnt_ty, fam_ty));
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Look up a field's volatile qualifiers and type, searching anonymous
@@ -4455,6 +4493,7 @@ mod conditional_type_tests {
                 is_packed: false,
                 base_volatile: false,
                 object_volatile: false,
+                counted_by: None,
             },
             super::StructField {
                 name: "d".into(),
@@ -4465,6 +4504,7 @@ mod conditional_type_tests {
                 is_packed: true,
                 base_volatile: false,
                 object_volatile: false,
+                counted_by: None,
             },
         ];
         let layout = super::StructLayout::for_struct_with_packing(&fields, None, &ctx, false);
@@ -4486,6 +4526,7 @@ mod conditional_type_tests {
             is_packed: true,
             base_volatile: false,
             object_volatile: false,
+            counted_by: None,
         }];
         let l1 = super::StructLayout::for_struct_with_packing(&packed_bf, None, &ctx, false);
         assert_eq!(l1.align, 1);
@@ -4500,6 +4541,7 @@ mod conditional_type_tests {
             is_packed: false,
             base_volatile: false,
             object_volatile: false,
+            counted_by: None,
         }];
         let l2 = super::StructLayout::for_struct_with_packing(&pack2_bf, Some(2), &ctx, false);
         assert_eq!(l2.align, 2);

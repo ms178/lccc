@@ -699,6 +699,10 @@ impl Preprocessor {
                 | "__weak__"
                 | "alias"
                 | "__alias__"
+                | "ifunc"
+                | "__ifunc__"
+                | "counted_by"
+                | "__counted_by__"
                 | "section"
                 | "__section__"
                 | "visibility"
@@ -907,6 +911,7 @@ mod has_attribute_tests {
             "scalar_storage_order",
             "common",
             "weakref",
+            "ifunc",
             "symver",
             "gnu_inline",
             "fastcall",

@@ -277,6 +277,164 @@ enum ExprToken {
 }
 
 /// Tokenize a preprocessor expression, operating on byte slices for performance.
+/// Scan a pp-number in `#if` / `#elif` and return `(token, next_index)`.
+fn scan_pp_number_token(bytes: &[u8], start: usize) -> (ExprToken, usize) {
+    let end = ppnumber_end(bytes, start);
+    let spelling: String = bytes_to_str(bytes, start, end)
+        .chars()
+        .filter(|&c| c != '\'')
+        .collect();
+    let digits_end = spelling
+        .find(|c: char| matches!(c, 'u' | 'U' | 'l' | 'L' | 'w' | 'W'))
+        .unwrap_or(spelling.len());
+    let (digits, suffix) = spelling.split_at(digits_end);
+    let (raw_val, is_hex_or_oct) = if let Some(h) = digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
+    {
+        (u64::from_str_radix(h, 16).unwrap_or(0), true)
+    } else if let Some(bin) = digits
+        .strip_prefix("0b")
+        .or_else(|| digits.strip_prefix("0B"))
+    {
+        (u64::from_str_radix(bin, 2).unwrap_or(0), true)
+    } else if let Some(oct) = digits
+        .strip_prefix("0o")
+        .or_else(|| digits.strip_prefix("0O"))
+    {
+        (u64::from_str_radix(oct, 8).unwrap_or(0), true)
+    } else if digits.len() > 1 && digits.starts_with('0') {
+        (u64::from_str_radix(&digits[1..], 8).unwrap_or(0), true)
+    } else {
+        (digits.parse::<u64>().unwrap_or(0), false)
+    };
+    let mut is_unsigned = suffix
+        .bytes()
+        .take_while(|b| matches!(b, b'u' | b'U' | b'l' | b'L' | b'w' | b'W' | b'b' | b'B'))
+        .any(|b| b == b'u' || b == b'U');
+    if !is_unsigned && raw_val > i64::MAX as u64 {
+        is_unsigned = true;
+    }
+    let _ = is_hex_or_oct;
+    (ExprToken::Num(raw_val as i64, is_unsigned), end)
+}
+
+/// Scan a character constant in `#if` / `#elif` and return `(token, next_index)`.
+fn scan_pp_char_token(bytes: &[u8], start: usize) -> (ExprToken, usize) {
+    let len = bytes.len();
+    let mut i = start + 1;
+    let val = if i < len && bytes[i] == b'\\' {
+        i += 1;
+        if i < len {
+            let esc = bytes[i];
+            i += 1;
+            match esc {
+                b'n' => b'\n' as i64,
+                b't' => b'\t' as i64,
+                b'r' => b'\r' as i64,
+                b'\\' => b'\\' as i64,
+                b'\'' => b'\'' as i64,
+                b'"' => b'"' as i64,
+                b'a' => 0x07,
+                b'b' => 0x08,
+                b'e' | b'E' => 0x1B,
+                b'f' => 0x0C,
+                b'v' => 0x0B,
+                b'o' if i < len && bytes[i] == b'{' => {
+                    i += 1;
+                    let mut v = 0i64;
+                    while i < len && bytes[i] != b'}' {
+                        if (b'0'..=b'7').contains(&bytes[i]) {
+                            v = v * 8 + (bytes[i] - b'0') as i64;
+                        }
+                        i += 1;
+                    }
+                    if i < len && bytes[i] == b'}' {
+                        i += 1;
+                    }
+                    v & 0xFF
+                }
+                b'x' => {
+                    let mut v = 0i64;
+                    if i < len && bytes[i] == b'{' {
+                        i += 1;
+                        while i < len && bytes[i] != b'}' {
+                            if let Some(d) = (bytes[i] as char).to_digit(16) {
+                                v = v * 16 + d as i64;
+                            }
+                            i += 1;
+                        }
+                        if i < len && bytes[i] == b'}' {
+                            i += 1;
+                        }
+                    } else {
+                        while i < len && bytes[i].is_ascii_hexdigit() {
+                            if let Some(d) = (bytes[i] as char).to_digit(16) {
+                                v = v * 16 + d as i64;
+                            }
+                            i += 1;
+                        }
+                    }
+                    v & 0xFF
+                }
+                b'u' | b'U' => {
+                    let mut v = 0i64;
+                    if esc == b'u' && i < len && bytes[i] == b'{' {
+                        i += 1;
+                        while i < len && bytes[i] != b'}' {
+                            if let Some(d) = (bytes[i] as char).to_digit(16) {
+                                v = v * 16 + d as i64;
+                            }
+                            i += 1;
+                        }
+                        if i < len && bytes[i] == b'}' {
+                            i += 1;
+                        }
+                    } else {
+                        let count = if esc == b'u' { 4 } else { 8 };
+                        for _ in 0..count {
+                            if i < len && bytes[i].is_ascii_hexdigit() {
+                                if let Some(d) = (bytes[i] as char).to_digit(16) {
+                                    v = v * 16 + d as i64;
+                                }
+                                i += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    v
+                }
+                b'0'..=b'7' => {
+                    let mut v = (esc - b'0') as i64;
+                    for _ in 0..2 {
+                        if i < len && (b'0'..=b'7').contains(&bytes[i]) {
+                            v = v * 8 + (bytes[i] - b'0') as i64;
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    v & 0xFF
+                }
+                other => other as i64,
+            }
+        } else {
+            0
+        }
+    } else if i < len {
+        let c = bytes[i] as i64;
+        i += 1;
+        c
+    } else {
+        0
+    };
+    if i < len && bytes[i] == b'\'' {
+        i += 1;
+    }
+    (ExprToken::Num(val, false), i)
+}
+
 /// Avoids allocating Vec<char>; numbers are parsed directly from byte spans.
 fn tokenize_expr(expr: &str) -> Vec<ExprToken> {
     let mut tokens = Vec::with_capacity(16);
@@ -296,97 +454,17 @@ fn tokenize_expr(expr: &str) -> Vec<ExprToken> {
         // Number: the whole pp-number (C23 digit separators included) is one
         // token; its value comes from the separator-free spelling.
         if b.is_ascii_digit() {
-            let end = ppnumber_end(bytes, i);
-            let spelling: String = bytes_to_str(bytes, i, end)
-                .chars()
-                .filter(|&c| c != '\'')
-                .collect();
-            // No digit of any base is u/U/l/L, so the first one starts the suffix.
-            let digits_end = spelling
-                .find(|c: char| matches!(c, 'u' | 'U' | 'l' | 'L'))
-                .unwrap_or(spelling.len());
-            let (digits, suffix) = spelling.split_at(digits_end);
-            let (raw_val, is_hex_or_oct) = if let Some(h) = digits
-                .strip_prefix("0x")
-                .or_else(|| digits.strip_prefix("0X"))
-            {
-                (u64::from_str_radix(h, 16).unwrap_or(0), true)
-            } else if let Some(bin) = digits
-                .strip_prefix("0b")
-                .or_else(|| digits.strip_prefix("0B"))
-            {
-                (u64::from_str_radix(bin, 2).unwrap_or(0), true)
-            } else if digits.len() > 1 && digits.starts_with('0') {
-                (u64::from_str_radix(&digits[1..], 8).unwrap_or(0), true)
-            } else {
-                (digits.parse::<u64>().unwrap_or(0), false)
-            };
-            i = end;
-            let suffix_bytes = suffix.as_bytes();
-            let mut k = 0;
-            // Parse suffixes (U, L, UL, LL, ULL) - track unsigned
-            let mut is_unsigned = false;
-            while k < suffix_bytes.len() && matches!(suffix_bytes[k], b'u' | b'U' | b'l' | b'L') {
-                if suffix_bytes[k] == b'u' || suffix_bytes[k] == b'U' {
-                    is_unsigned = true;
-                }
-                k += 1;
-            }
-            // Per C99: decimal without U suffix: int -> long -> long long
-            // Hex/octal without U suffix: int -> unsigned int -> long -> unsigned long -> long long -> unsigned long long
-            // With U suffix: always unsigned
-            if !is_unsigned && is_hex_or_oct {
-                // Hex/octal: unsigned if value exceeds signed range
-                if raw_val > i64::MAX as u64 {
-                    is_unsigned = true;
-                }
-            }
-            // Decimal without suffix: stays signed even for large values (they become long long)
-            // But if value > i64::MAX (can't happen for decimal u64 parse unless really huge), treat as unsigned
-            if !is_unsigned && !is_hex_or_oct && raw_val > i64::MAX as u64 {
-                is_unsigned = true;
-            }
-            tokens.push(ExprToken::Num(raw_val as i64, is_unsigned));
+            let (tok, next) = scan_pp_number_token(bytes, i);
+            i = next;
+            tokens.push(tok);
             continue;
         }
 
         // Character literal
         if b == b'\'' && !is_digit_separator(bytes, i) {
-            i += 1;
-            let val = if i < len && bytes[i] == b'\\' {
-                i += 1;
-                let c = if i < len {
-                    let c = match bytes[i] {
-                        b'n' => b'\n',
-                        b't' => b'\t',
-                        b'r' => b'\r',
-                        b'0' => b'\0',
-                        b'\\' => b'\\',
-                        b'\'' => b'\'',
-                        b'a' => 0x07,
-                        b'b' => 0x08,
-                        b'f' => 0x0C,
-                        b'v' => 0x0B,
-                        other => other,
-                    };
-                    i += 1;
-                    c
-                } else {
-                    0
-                };
-                c as i64
-            } else if i < len {
-                let c = bytes[i] as i64;
-                i += 1;
-                c
-            } else {
-                0
-            };
-            // Skip closing quote
-            if i < len && bytes[i] == b'\'' {
-                i += 1;
-            }
-            tokens.push(ExprToken::Num(val, false));
+            let (tok, next) = scan_pp_char_token(bytes, i);
+            i = next;
+            tokens.push(tok);
             continue;
         }
 

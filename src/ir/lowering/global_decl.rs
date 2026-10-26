@@ -162,8 +162,8 @@ impl Lowerer {
                 ginfo.var.type_align = type_align;
             }
 
-            // Skip emitting storage for alias/weakref declarations.
-            if declarator.attrs.alias_target.is_some() {
+            // Skip emitting storage for alias/weakref/ifunc declarations.
+            if declarator.attrs.alias_target.is_some() || declarator.attrs.ifunc_target.is_some() {
                 continue;
             }
 

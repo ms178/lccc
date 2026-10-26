@@ -178,6 +178,9 @@ pub struct SemanticAnalyzer {
     /// The dialect predates C99 (`-std=c90`/`gnu89`/`iso9899:199409`): GCC
     /// then still treats an overflowing signed left shift as a constant.
     pre_c99: bool,
+    pending_loop_labels: Vec<String>,
+    active_break_targets: Vec<Vec<String>>,
+    active_continue_targets: Vec<Vec<String>>,
 }
 
 impl SemanticAnalyzer {
@@ -192,6 +195,9 @@ impl SemanticAnalyzer {
             no_builtins: false,
             builtin_policy: crate::common::pass_policy::BuiltinFlags::default(),
             pre_c99: false,
+            pending_loop_labels: Vec::new(),
+            active_break_targets: Vec::new(),
+            active_continue_targets: Vec::new(),
         };
         // Pre-populate with common implicit declarations
         analyzer.declare_implicit_functions();
@@ -216,6 +222,74 @@ impl SemanticAnalyzer {
                 ExternalDecl::StaticAssert(assertion) => self.check_static_assert(assertion),
             }
         }
+        // Validate `__attribute__((ifunc("resolver")))` / `[[gnu::ifunc("resolver")]]`
+        // resolver targets across the translation unit (GCC 16.2 parity).
+        let has_toplevel_asm = tu
+            .decls
+            .iter()
+            .any(|d| matches!(d, ExternalDecl::TopLevelAsm(_)));
+        if !has_toplevel_asm {
+            let mut defined_resolvers = crate::common::fx_hash::FxHashSet::default();
+            for d in &tu.decls {
+                match d {
+                    ExternalDecl::FunctionDef(f) => {
+                        defined_resolvers.insert(f.name.as_str());
+                    }
+                    ExternalDecl::Declaration(decl) => {
+                        for init_decl in &decl.declarators {
+                            if (init_decl.attrs.alias_target.is_some()
+                                || init_decl.attrs.ifunc_target.is_some())
+                                && !init_decl.name.is_empty()
+                            {
+                                defined_resolvers.insert(init_decl.name.as_str());
+                            }
+                            if let Some(ref reg) = init_decl.attrs.asm_register
+                                && (init_decl.attrs.alias_target.is_some()
+                                    || init_decl.attrs.ifunc_target.is_some())
+                            {
+                                defined_resolvers.insert(reg.as_str());
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // Also register `__asm__("label")` names attached to defined functions.
+            for d in &tu.decls {
+                if let ExternalDecl::Declaration(decl) = d {
+                    for init_decl in &decl.declarators {
+                        if let Some(ref reg) = init_decl.attrs.asm_register
+                            && defined_resolvers.contains(init_decl.name.as_str())
+                        {
+                            defined_resolvers.insert(reg.as_str());
+                        }
+                    }
+                }
+            }
+            for d in &tu.decls {
+                if let ExternalDecl::Declaration(decl) = d {
+                    if decl.is_typedef() {
+                        continue;
+                    }
+                    for init_decl in &decl.declarators {
+                        if let Some(ref resolver) = init_decl.attrs.ifunc_target
+                            && !init_decl.name.is_empty()
+                            && self.result.functions.contains_key(&init_decl.name)
+                            && !defined_resolvers.contains(resolver.as_str())
+                        {
+                            self.diagnostics.borrow_mut().error(
+                                format!(
+                                    "'{}' aliased to undefined symbol '{}'",
+                                    init_decl.name, resolver
+                                ),
+                                init_decl.span,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         let diag = self.diagnostics.borrow();
         if diag.has_errors() {
             Err(diag.error_count())
@@ -651,6 +725,8 @@ impl SemanticAnalyzer {
         match ts {
             TypeSpecifier::Struct(_, Some(fields), ..)
             | TypeSpecifier::Union(_, Some(fields), ..) => {
+                let is_union = matches!(ts, TypeSpecifier::Union(..));
+                self.check_counted_by_members(fields, is_union, span);
                 for f in fields {
                     if let Some(name) = f.name.as_deref() {
                         self.report_void_declarator(
@@ -701,19 +777,50 @@ impl SemanticAnalyzer {
         }
         self.check_void_declaration(decl, is_global);
 
-        // Handle __auto_type: the type of the first declarator's initializer
-        // after array and function decay (as GCC, and C23 `auto` 6.7.10).
+        // Handle __auto_type / C23 `auto` (6.7.10): requires a single plain-identifier
+        // declarator with an expression initializer.
         let base_type = if matches!(&decl.type_spec, TypeSpecifier::AutoType) {
+            if decl.declarators.len() > 1 {
+                self.diagnostics.borrow_mut().error(
+                    "'auto' can only be specified for single declarations".to_string(),
+                    decl.span,
+                );
+            }
             if let Some(first) = decl.declarators.first() {
-                if let Some(Initializer::Expr(ref init_expr)) = first.init {
-                    let checker = self.expr_type_checker();
-                    checker
-                        .infer_expr_ctype(init_expr)
-                        .map_or(CType::Int, |ct| ct.decayed_value_ctype())
-                } else {
-                    CType::Int
+                if !first.derived.is_empty() {
+                    self.diagnostics.borrow_mut().error(
+                        "'auto' requires a plain identifier, possibly with attributes, as declarator"
+                            .to_string(),
+                        first.span,
+                    );
+                }
+                match first.init {
+                    Some(Initializer::Expr(ref init_expr)) => {
+                        let checker = self.expr_type_checker();
+                        checker
+                            .infer_expr_ctype(init_expr)
+                            .map_or(CType::Int, |ct| ct.decayed_value_ctype())
+                    }
+                    Some(Initializer::List(_)) => {
+                        self.diagnostics.borrow_mut().error(
+                            "expected expression before '{' token".to_string(),
+                            first.span,
+                        );
+                        CType::Int
+                    }
+                    None => {
+                        self.diagnostics.borrow_mut().error(
+                            "'auto' requires an initialized data declaration".to_string(),
+                            first.span,
+                        );
+                        CType::Int
+                    }
                 }
             } else {
+                self.diagnostics.borrow_mut().error(
+                    "'auto' requires an initialized data declaration".to_string(),
+                    decl.span,
+                );
                 CType::Int
             }
         } else {
@@ -928,6 +1035,19 @@ impl SemanticAnalyzer {
                     if let Some(count) = self.count_initializer_elements(init, elem) {
                         full_type = CType::Array(elem.clone(), Some(count));
                     }
+                }
+            }
+
+            if init_decl.attrs.ifunc_target.is_some() {
+                if !matches!(full_type, CType::Function(_)) {
+                    self.diagnostics
+                        .borrow_mut()
+                        .warning("'ifunc' attribute ignored", init_decl.span);
+                } else if init_decl.attrs.is_weak() {
+                    self.diagnostics.borrow_mut().error(
+                        format!("weak '{}' cannot be defined 'ifunc'", init_decl.name),
+                        init_decl.span,
+                    );
                 }
             }
 
@@ -1161,9 +1281,33 @@ impl SemanticAnalyzer {
 
             // Analyze array size expressions in derived declarators
             // (catches undeclared identifiers in e.g. `int arr[UNDECLARED];`)
+            let mut has_vla_bound = false;
+            let is_direct_array_object = !decl.is_typedef()
+                && !init_decl.derived.iter().any(|d| {
+                    matches!(
+                        d,
+                        DerivedDeclarator::Pointer(_)
+                            | DerivedDeclarator::Function(..)
+                            | DerivedDeclarator::FunctionPointer(..)
+                    )
+                });
             for derived in &init_decl.derived {
                 if let DerivedDeclarator::Array(Some(size_expr)) = derived {
                     self.analyze_expr(size_expr);
+                    if is_direct_array_object && self.eval_const_expr_value(size_expr).is_none() {
+                        has_vla_bound = true;
+                    }
+                }
+            }
+            if has_vla_bound {
+                if let Some(init) = &init_decl.init {
+                    if !matches!(init, Initializer::List(items) if items.is_empty()) {
+                        self.diagnostics.borrow_mut().error(
+                            "variable-sized object may not be initialized except with an empty initializer"
+                                .to_string(),
+                            init_decl.span,
+                        );
+                    }
                 }
             }
 
@@ -2068,16 +2212,29 @@ impl SemanticAnalyzer {
                 }
             }
             Stmt::While(cond, body, _) => {
+                let names = std::mem::take(&mut self.pending_loop_labels);
+                self.active_break_targets.push(names.clone());
+                self.active_continue_targets.push(names);
                 self.analyze_expr(cond);
                 self.check_scalar_condition(cond);
                 self.analyze_substatement(body);
+                self.active_continue_targets.pop();
+                self.active_break_targets.pop();
             }
             Stmt::DoWhile(body, cond, _) => {
+                let names = std::mem::take(&mut self.pending_loop_labels);
+                self.active_break_targets.push(names.clone());
+                self.active_continue_targets.push(names);
                 self.analyze_substatement(body);
                 self.analyze_expr(cond);
                 self.check_scalar_condition(cond);
+                self.active_continue_targets.pop();
+                self.active_break_targets.pop();
             }
             Stmt::For(init, cond, inc, body, _) => {
+                let names = std::mem::take(&mut self.pending_loop_labels);
+                self.active_break_targets.push(names.clone());
+                self.active_continue_targets.push(names);
                 self.symbol_table.push_scope();
                 self.result.type_context.push_scope();
                 if let Some(init) = init {
@@ -2100,11 +2257,18 @@ impl SemanticAnalyzer {
                 self.analyze_substatement(body);
                 self.result.type_context.pop_scope();
                 self.symbol_table.pop_scope();
+                self.active_continue_targets.pop();
+                self.active_break_targets.pop();
             }
             Stmt::Compound(compound) => {
+                if !compound.is_synthetic_init_scope {
+                    self.pending_loop_labels.clear();
+                }
                 self.analyze_compound_stmt(compound);
             }
             Stmt::Switch(expr, body, _) => {
+                let names = std::mem::take(&mut self.pending_loop_labels);
+                self.active_break_targets.push(names);
                 self.analyze_expr(expr);
                 // C11 6.8.4.2: The controlling expression of a switch statement
                 // shall have integer type.
@@ -2125,6 +2289,7 @@ impl SemanticAnalyzer {
                     }
                 }
                 self.analyze_substatement(body);
+                self.active_break_targets.pop();
             }
             Stmt::Case(expr, body, _) => {
                 self.analyze_expr(expr);
@@ -2138,13 +2303,53 @@ impl SemanticAnalyzer {
             Stmt::Default(body, _) => {
                 self.analyze_stmt(body);
             }
-            Stmt::Label(_, body, _) => {
+            Stmt::Label(name, body, _) => {
+                if body.labels_loop_or_switch() {
+                    self.pending_loop_labels.push(name.clone());
+                } else {
+                    self.pending_loop_labels.clear();
+                }
                 self.analyze_stmt(body);
+                self.pending_loop_labels.clear();
             }
             Stmt::Declaration(decl) => {
                 self.analyze_declaration(decl, /* is_global */ false);
             }
-            Stmt::Break(_) | Stmt::Continue(_) | Stmt::Goto(_, _) => {}
+            Stmt::Break(target, span) => {
+                if let Some(lbl) = target {
+                    let ok = self
+                        .active_break_targets
+                        .iter()
+                        .any(|names| names.iter().any(|n| n == lbl));
+                    if !ok {
+                        self.diagnostics.borrow_mut().error(
+                            format!(
+                                "break statement label '{}' does not name an enclosing loop or switch",
+                                lbl
+                            ),
+                            *span,
+                        );
+                    }
+                }
+            }
+            Stmt::Continue(target, span) => {
+                if let Some(lbl) = target {
+                    let ok = self
+                        .active_continue_targets
+                        .iter()
+                        .any(|names| names.iter().any(|n| n == lbl));
+                    if !ok {
+                        self.diagnostics.borrow_mut().error(
+                            format!(
+                                "continue statement label '{}' does not name an enclosing loop",
+                                lbl
+                            ),
+                            *span,
+                        );
+                    }
+                }
+            }
+            Stmt::Goto(_, _) => {}
             Stmt::GotoIndirect(expr, _) => {
                 self.analyze_expr(expr);
             }
@@ -2200,7 +2405,7 @@ impl SemanticAnalyzer {
 
             // break/continue diverge from the current construct
             // (conservative for our purposes: they exit the current statement)
-            Stmt::Break(_) | Stmt::Continue(_) => false,
+            Stmt::Break(..) | Stmt::Continue(..) => false,
 
             // if/else: falls through only if either branch can fall through
             // if without else: can fall through unless the condition is constant true
@@ -2368,8 +2573,8 @@ impl SemanticAnalyzer {
             Stmt::Return(_, _) | Stmt::Goto(_, _) | Stmt::GotoIndirect(_, _) => {
                 SwitchSegmentOutcome::Returns
             }
-            Stmt::Break(_) => SwitchSegmentOutcome::Breaks,
-            Stmt::Continue(_) => SwitchSegmentOutcome::Returns,
+            Stmt::Break(..) => SwitchSegmentOutcome::Breaks,
+            Stmt::Continue(..) => SwitchSegmentOutcome::Returns,
 
             Stmt::Compound(compound) => {
                 // Walk items sequentially: if an item diverges (returns/breaks),
@@ -2815,6 +3020,92 @@ impl SemanticAnalyzer {
                     }
                 }
             }
+            Expr::Countof(arg, span) => match arg.as_ref() {
+                SizeofArg::Expr(inner) => {
+                    self.analyze_expr(inner);
+                    let is_string_lit = matches!(
+                        inner,
+                        Expr::StringLiteral(..)
+                            | Expr::WideStringLiteral(..)
+                            | Expr::Char16StringLiteral(..)
+                    ) || matches!(
+                        inner,
+                        Expr::Identifier(name, _)
+                            if crate::frontend::parser::ast::is_function_name_builtin(name)
+                                && self.symbol_table.lookup(name).is_none()
+                    );
+                    if !is_string_lit {
+                        if matches!(
+                            inner,
+                            Expr::Comma(..) | Expr::Conditional(..) | Expr::GnuConditional(..)
+                        ) {
+                            self.diagnostics.borrow_mut().error(
+                                "invalid application of '_Countof' to non-array type".to_string(),
+                                *span,
+                            );
+                        } else {
+                            let ct = self.expr_type_checker().infer_expr_ctype(inner);
+                            match ct {
+                                Some(CType::Array(_, Some(_))) => {}
+                                Some(CType::Array(_, None)) => {
+                                    let is_complete_or_vla = match inner {
+                                        Expr::CompoundLiteral(_, init, _) => {
+                                            matches!(
+                                                &**init,
+                                                Initializer::List(_) | Initializer::Expr(_)
+                                            )
+                                        }
+                                        Expr::Identifier(name, _) => {
+                                            self.symbol_table.is_automatic_object(name)
+                                        }
+                                        _ => true,
+                                    };
+                                    if !is_complete_or_vla {
+                                        self.diagnostics.borrow_mut().error(
+                                                "invalid application of '_Countof' to incomplete array type"
+                                                    .to_string(),
+                                                *span,
+                                            );
+                                    }
+                                }
+                                Some(_) => {
+                                    self.diagnostics.borrow_mut().error(
+                                        "invalid application of '_Countof' to non-array type"
+                                            .to_string(),
+                                        *span,
+                                    );
+                                }
+                                None => {}
+                            }
+                        }
+                    }
+                }
+                SizeofArg::Type(ts) => {
+                    self.check_void_type_name(ts, *span);
+                    if let TypeSpecifier::Array(_, Some(bound)) = ts {
+                        self.analyze_expr(bound);
+                    }
+                    let ct = self.type_spec_to_ctype(ts);
+                    match ct {
+                        CType::Array(_, Some(_)) => {}
+                        CType::Array(_, None) => {
+                            if matches!(ts, TypeSpecifier::Array(_, None)) {
+                                self.diagnostics.borrow_mut().error(
+                                    "invalid application of '_Countof' to incomplete array type"
+                                        .to_string(),
+                                    *span,
+                                );
+                            }
+                        }
+                        _ => {
+                            self.diagnostics.borrow_mut().error(
+                                "invalid application of '_Countof' to non-array type".to_string(),
+                                *span,
+                            );
+                        }
+                    }
+                }
+            },
             Expr::Alignof(ts, span) | Expr::GnuAlignof(ts, span) => {
                 self.check_void_type_name(ts, *span);
             }
@@ -2960,6 +3251,7 @@ impl SemanticAnalyzer {
                             );
                         }
                     }
+                    self.check_c2y_builtin_call(name, args, *callee_span);
                 }
             } else if !self.result.functions.contains_key(name)
                 && self.symbol_table.lookup(name).is_none()
@@ -3483,6 +3775,7 @@ impl SemanticAnalyzer {
             | Expr::GnuConditional(..)
             | Expr::Cast(..)
             | Expr::Sizeof(..)
+            | Expr::Countof(..)
             | Expr::VaArg(..)
             | Expr::ConvertVector(..)
             | Expr::Alignof(..)
@@ -4890,9 +5183,236 @@ impl SemanticAnalyzer {
                     is_packed: f.is_packed,
                     base_volatile: f.base_volatile,
                     object_volatile: f.object_volatile,
+                    counted_by: f.counted_by.clone(),
                 })
             })
             .collect()
+    }
+
+    fn find_sibling_field_ctype<'a>(
+        &self,
+        fields: &'a [StructFieldDecl],
+        target: &str,
+    ) -> Option<CType> {
+        for f in fields {
+            if f.name.as_deref() == Some(target) {
+                let ty = if f.derived.is_empty() {
+                    self.type_spec_to_ctype(&f.type_spec)
+                } else {
+                    type_builder::build_full_ctype(self, &f.type_spec, &f.derived)
+                };
+                return Some(ty);
+            }
+            if f.name.is_none() {
+                if let TypeSpecifier::Struct(_, Some(sub), ..)
+                | TypeSpecifier::Union(_, Some(sub), ..) = &f.type_spec
+                {
+                    if let Some(ty) = self.find_sibling_field_ctype(sub, target) {
+                        return Some(ty);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn check_c2y_builtin_call(&mut self, name: &str, args: &[Expr], span: Span) {
+        use crate::frontend::sema::stdbit;
+        if let Some(expected) = stdbit::stdc_bit_arity(name) {
+            if args.len() != expected {
+                self.diagnostics.borrow_mut().error(
+                    format!(
+                        "{} arguments to function '{}' (expected {}, have {})",
+                        if args.len() < expected {
+                            "too few"
+                        } else {
+                            "too many"
+                        },
+                        name,
+                        expected,
+                        args.len()
+                    ),
+                    span,
+                );
+                return;
+            }
+            if let Some(arg0_ct) = self.expr_type_checker().infer_expr_ctype(&args[0]) {
+                let decayed = arg0_ct.decayed_value_ctype();
+                if !stdbit::is_valid_stdc_bit_arg_ctype(&decayed) {
+                    self.diagnostics.borrow_mut().error(
+                        format!(
+                            "argument 1 in call to function '{}' has type '{}', expected unsigned integer type (not '_Bool' or 'char')",
+                            name, decayed
+                        ),
+                        args[0].span(),
+                    );
+                }
+            }
+            if expected == 2 {
+                if let Some(arg1_ct) = self.expr_type_checker().infer_expr_ctype(&args[1]) {
+                    let decayed = arg1_ct.decayed_value_ctype();
+                    if !decayed.is_integer() || matches!(decayed, CType::Bool) {
+                        self.diagnostics.borrow_mut().error(
+                            format!(
+                                "argument 2 in call to function '{}' must have non-boolean integer type",
+                                name
+                            ),
+                            args[1].span(),
+                        );
+                    }
+                }
+            }
+            return;
+        }
+        match name {
+            "__builtin_counted_by_ref" => {
+                if args.len() != 1 {
+                    self.diagnostics.borrow_mut().error(
+                        format!(
+                            "wrong number of arguments to '{}' (expected 1, have {})",
+                            name,
+                            args.len()
+                        ),
+                        span,
+                    );
+                    return;
+                }
+                if !matches!(
+                    args[0],
+                    Expr::MemberAccess(..) | Expr::PointerMemberAccess(..)
+                ) {
+                    self.diagnostics.borrow_mut().error(
+                        "argument to '__builtin_counted_by_ref' must be a structure member access"
+                            .to_string(),
+                        args[0].span(),
+                    );
+                } else if let Some(ct) = self.expr_type_checker().infer_expr_ctype(&args[0]) {
+                    let ok = matches!(ct, CType::Array(..) | CType::Pointer(..));
+                    if !ok {
+                        self.diagnostics.borrow_mut().error(
+                            "argument to '__builtin_counted_by_ref' must be an array or pointer member"
+                                .to_string(),
+                            args[0].span(),
+                        );
+                    }
+                }
+            }
+            "__builtin_assoc_barrier" => {
+                if args.len() != 1 {
+                    self.diagnostics.borrow_mut().error(
+                        format!(
+                            "wrong number of arguments to '{}' (expected 1, have {})",
+                            name,
+                            args.len()
+                        ),
+                        span,
+                    );
+                }
+            }
+            "__builtin_clear_padding" => {
+                if args.len() != 1 {
+                    self.diagnostics.borrow_mut().error(
+                        format!(
+                            "wrong number of arguments to '{}' (expected 1, have {})",
+                            name,
+                            args.len()
+                        ),
+                        span,
+                    );
+                    return;
+                }
+                let tc = self.expr_type_checker();
+                if let Some(ct) = tc.infer_expr_ctype(&args[0]) {
+                    match ct.decayed_value_ctype() {
+                        CType::Pointer(pointee, _) => {
+                            if crate::common::qualifiers::expr_const_base(&args[0], &tc) {
+                                self.diagnostics.borrow_mut().error(
+                                    "argument 1 in call to '__builtin_clear_padding' has pointer to 'const' type"
+                                        .to_string(),
+                                    args[0].span(),
+                                );
+                            } else {
+                                let incomplete = match pointee.as_ref() {
+                                    CType::Void | CType::Array(_, None) => true,
+                                    CType::Struct(k) | CType::Union(k) => {
+                                        !self.defined_structs.borrow().contains(&**k)
+                                    }
+                                    _ => false,
+                                };
+                                if incomplete {
+                                    self.diagnostics.borrow_mut().error(
+                                        "argument 1 in call to '__builtin_clear_padding' points to incomplete type"
+                                            .to_string(),
+                                        args[0].span(),
+                                    );
+                                }
+                            }
+                        }
+                        _ => {
+                            self.diagnostics.borrow_mut().error(
+                                "argument 1 in call to '__builtin_clear_padding' must be a pointer"
+                                    .to_string(),
+                                args[0].span(),
+                            );
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn check_counted_by_members(&self, fields: &[StructFieldDecl], is_union: bool, span: Span) {
+        for f in fields {
+            let Some(ref count_member) = f.counted_by else {
+                continue;
+            };
+            if is_union {
+                self.diagnostics.borrow_mut().error(
+                    "'counted_by' attribute is not allowed for a union member".to_string(),
+                    span,
+                );
+                continue;
+            }
+            let field_ct = if f.derived.is_empty() {
+                self.type_spec_to_ctype(&f.type_spec)
+            } else {
+                type_builder::build_full_ctype(self, &f.type_spec, &f.derived)
+            };
+            let valid_target = matches!(field_ct, CType::Array(_, None))
+                || matches!(
+                    field_ct,
+                    CType::Pointer(ref elem, _)
+                        if !matches!(elem.as_ref(), CType::Void | CType::Function(_))
+                );
+            if !valid_target {
+                self.diagnostics.borrow_mut().error(
+                    "'counted_by' attribute is not allowed for a non-flexible array member field"
+                        .to_string(),
+                    span,
+                );
+                continue;
+            }
+            match self.find_sibling_field_ctype(fields, count_member) {
+                None => {
+                    self.diagnostics.borrow_mut().error(
+                        format!(
+                            "'counted_by' argument '{count_member}' is not a field of the same structure"
+                        ),
+                        span,
+                    );
+                }
+                Some(ct) if !ct.is_integer() || matches!(ct, CType::Bool) => {
+                    self.diagnostics.borrow_mut().error(
+                        format!(
+                            "'counted_by' argument '{count_member}' must have non-boolean integer type"
+                        ),
+                        span,
+                    );
+                }
+                Some(_) => {}
+            }
+        }
     }
 
     /// Resolve the alignment override carried by a typedef, if any.
@@ -5836,6 +6356,7 @@ mod record_layouts_correspond_tests {
             sso_storage_ty: None,
             base_volatile: false,
             object_volatile: false,
+            counted_by: None,
         }
     }
 

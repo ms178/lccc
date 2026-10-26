@@ -6,6 +6,7 @@ mod init_cursor;
 pub(crate) mod intrinsic_arity;
 mod operand_constraints;
 pub(crate) mod static_init;
+pub(crate) mod stdbit;
 pub(crate) mod type_checker;
 pub(crate) mod type_context;
 pub(crate) mod void_declarators;

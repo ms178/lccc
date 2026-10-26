@@ -530,37 +530,49 @@ impl Lowerer {
         }
     }
 
-    /// Emit cleanup function calls for variables with __attribute__((cleanup(func))).
-    /// Calls func(&var) for each cleanup variable, in reverse declaration order.
+    /// Emit cleanup function calls for variables with __attribute__((cleanup(func)))
+    /// stored in declaration order (`pop_scope`), calling `func(&var)` in reverse order.
     pub(super) fn emit_cleanup_calls(&mut self, cleanup_vars: &[(String, Value)]) {
         for (func_name, alloca_val) in cleanup_vars.iter().rev() {
-            let dest = Some(self.fresh_value());
-            self.emit(Instruction::Call {
-                func: func_name.clone(),
-                info: CallInfo {
-                    dest,
-                    args: vec![Operand::Value(*alloca_val)],
-                    arg_types: vec![IrType::Ptr],
-                    return_type: IrType::Void,
-                    is_variadic: false,
-                    num_fixed_args: 1,
-                    struct_arg_sizes: vec![None],
-                    struct_arg_aligns: vec![],
-                    struct_arg_classes: Vec::new(),
-                    struct_arg_riscv_float_classes: Vec::new(),
-                    struct_arg_is_f128_sse: Vec::new(),
-                    is_sret: false,
-                    is_fastcall: false,
-                    regparm: None,
-                    is_pure: false,
-                    is_const: false,
-                    assume_library: false,
-                    ret_eightbyte_classes: Vec::new(),
-                    ret_is_f128_sse: false,
-                    cold: false,
-                },
-            });
+            self.emit_single_cleanup_call(func_name, *alloca_val);
         }
+    }
+
+    /// Emit cleanup function calls already ordered from innermost last-declared
+    /// variable to outermost first-declared variable (`collect_scope_cleanup_vars_above_depth`).
+    pub(super) fn emit_collected_cleanup_calls(&mut self, cleanup_vars: &[(String, Value)]) {
+        for (func_name, alloca_val) in cleanup_vars {
+            self.emit_single_cleanup_call(func_name, *alloca_val);
+        }
+    }
+
+    fn emit_single_cleanup_call(&mut self, func_name: &str, alloca_val: Value) {
+        let dest = Some(self.fresh_value());
+        self.emit(Instruction::Call {
+            func: func_name.to_string(),
+            info: CallInfo {
+                dest,
+                args: vec![Operand::Value(alloca_val)],
+                arg_types: vec![IrType::Ptr],
+                return_type: IrType::Void,
+                is_variadic: false,
+                num_fixed_args: 1,
+                struct_arg_sizes: vec![None],
+                struct_arg_aligns: vec![],
+                struct_arg_classes: Vec::new(),
+                struct_arg_riscv_float_classes: Vec::new(),
+                struct_arg_is_f128_sse: Vec::new(),
+                is_sret: false,
+                is_fastcall: false,
+                regparm: None,
+                is_pure: false,
+                is_const: false,
+                assume_library: false,
+                ret_eightbyte_classes: Vec::new(),
+                ret_is_f128_sse: false,
+                cold: false,
+            },
+        });
     }
 
     /// Collect all cleanup variables from all active scopes (for return statements).
@@ -961,7 +973,8 @@ impl Lowerer {
                         if !declarator.name.is_empty()
                             && (declarator.init.is_some()
                                 || !decl.is_extern()
-                                || declarator.attrs.alias_target.is_some())
+                                || declarator.attrs.alias_target.is_some()
+                                || declarator.attrs.ifunc_target.is_some())
                         {
                             defined.insert(declarator.name.clone());
                         }
@@ -1058,6 +1071,24 @@ impl Lowerer {
                                 ));
                             }
                         }
+                        if let Some(ref resolver) = declarator.attrs.ifunc_target {
+                            if !declarator.name.is_empty()
+                                && self.known_functions.contains(&declarator.name)
+                                && !declarator.attrs.is_weak()
+                            {
+                                let asm_name = self
+                                    .asm_label_map
+                                    .get(&declarator.name)
+                                    .cloned()
+                                    .unwrap_or_else(|| declarator.name.clone());
+                                self.module.ifuncs.push((
+                                    asm_name,
+                                    resolver.clone(),
+                                    decl.is_static(),
+                                    declarator.attrs.visibility.clone(),
+                                ));
+                            }
+                        }
                         // Collect __attribute__((__diagnose_as(__builtin_X)))
                         // declarations (kernel fortify-string family).
                         if let Some(ref da) = declarator.attrs.diagnose_as {
@@ -1107,6 +1138,7 @@ impl Lowerer {
                         // otherwise emit .hidden for thousands of typedef names.
                         if !decl.is_typedef()
                             && declarator.attrs.alias_target.is_none()
+                            && declarator.attrs.ifunc_target.is_none()
                             && !declarator.name.is_empty()
                             && (declarator.attrs.is_weak() || declarator.attrs.visibility.is_some())
                         {
@@ -2821,6 +2853,43 @@ impl Lowerer {
                 is_pure: false,
                 is_const: false,
                 // Compiler-generated aggregate copy/clear: GCC's freestanding contract requires memcpy/memset to exist with library semantics.
+                assume_library: true,
+                ret_eightbyte_classes: Vec::new(),
+                ret_is_f128_sse: false,
+                cold: false,
+            },
+        });
+        ret
+    }
+
+    /// Emit `memset(dest, 0, size_val)` for a dynamically-sized VLA `= {}` initializer (C23 6.7.10).
+    pub(super) fn emit_memset_zero_dynamic(&mut self, dest: Value, size_val: Value) -> Value {
+        let ret = self.fresh_value();
+        let ptr_ty = IrType::Ptr;
+        let size_ty = crate::common::types::target_int_ir_type();
+        self.emit(Instruction::Call {
+            func: "memset".to_string(),
+            info: CallInfo {
+                dest: Some(ret),
+                args: vec![
+                    Operand::Value(dest),
+                    Operand::Const(IrConst::I32(0)),
+                    Operand::Value(size_val),
+                ],
+                arg_types: vec![ptr_ty, IrType::I32, size_ty],
+                return_type: ptr_ty,
+                is_variadic: false,
+                num_fixed_args: 3,
+                struct_arg_sizes: vec![None, None, None],
+                struct_arg_aligns: vec![None, None, None],
+                struct_arg_classes: vec![Vec::new(), Vec::new(), Vec::new()],
+                struct_arg_riscv_float_classes: Vec::new(),
+                struct_arg_is_f128_sse: vec![false, false, false],
+                is_sret: false,
+                is_fastcall: false,
+                regparm: None,
+                is_pure: false,
+                is_const: false,
                 assume_library: true,
                 ret_eightbyte_classes: Vec::new(),
                 ret_is_f128_sse: false,

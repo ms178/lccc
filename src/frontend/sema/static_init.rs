@@ -323,6 +323,7 @@ impl<'s> StaticInitChecker<'s> {
             // A file-scope compound literal has static storage: an address constant.
             Expr::CompoundLiteral(..) => self.compound_literal_kind(),
             Expr::Sizeof(..)
+            | Expr::Countof(..)
             | Expr::Alignof(..)
             | Expr::AlignofExpr(..)
             | Expr::GnuAlignof(..)

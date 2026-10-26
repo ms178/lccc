@@ -570,6 +570,145 @@ impl Lowerer {
         Operand::Const(IrConst::ptr_int(size as i64))
     }
 
+    pub(super) fn static_countof_type(&self, ts: &TypeSpecifier) -> Option<usize> {
+        if let TypeSpecifier::Array(_, Some(bound_expr)) = ts {
+            return self
+                .expr_as_array_size(bound_expr)
+                .and_then(|n| usize::try_from(n).ok());
+        }
+        if let TypeSpecifier::TypedefName(name) = ts {
+            if self
+                .func_state
+                .as_ref()
+                .is_some_and(|fs| fs.vla_typedef_sizes.contains_key(name))
+            {
+                if let CType::Array(_, Some(n)) = self.type_spec_to_ctype(ts) {
+                    return Some(n);
+                }
+                return None;
+            }
+        }
+        match self.type_spec_to_ctype(ts) {
+            CType::Array(_, Some(n)) => Some(n),
+            _ => None,
+        }
+    }
+
+    pub(super) fn static_countof_arg(&self, arg: &SizeofArg) -> Option<usize> {
+        match arg {
+            SizeofArg::Type(ts) => self.static_countof_type(ts),
+            SizeofArg::Expr(expr) => match expr {
+                Expr::StringLiteral(s, _) | Expr::WideStringLiteral(s, _) => {
+                    Some(s.chars().count() + 1)
+                }
+                Expr::Char16StringLiteral(s, _) => Some(s.encode_utf16().count() + 1),
+                Expr::Identifier(name, _)
+                    if crate::frontend::parser::ast::is_function_name_builtin(name)
+                        && self
+                            .func_state
+                            .as_ref()
+                            .is_none_or(|fs| !fs.locals.contains_key(name)) =>
+                {
+                    let text = crate::frontend::parser::ast::function_name_builtin_text(
+                        name,
+                        self.func_state.as_ref().map(|fs| fs.source_name()),
+                    );
+                    Some(text.len() + 1)
+                }
+                Expr::CompoundLiteral(ts, init, _) => {
+                    if let TypeSpecifier::Array(elem_ts, None) = ts {
+                        let elem_sz = self.sizeof_type(elem_ts).max(1);
+                        Some(self.compound_literal_size(ts, init) / elem_sz)
+                    } else {
+                        self.static_countof_type(ts)
+                    }
+                }
+                Expr::Identifier(name, _) => {
+                    if let Some(info) = self.func_state.as_ref().and_then(|fs| fs.locals.get(name))
+                    {
+                        if let Some(CType::Array(_, Some(n))) = info.c_type.as_ref() {
+                            return Some(*n);
+                        }
+                        if info.vla_size.is_some() {
+                            return None;
+                        }
+                        if info.is_array {
+                            if let Some(CType::Array(elem, None)) = info.c_type.as_ref() {
+                                let elem_sz = self.ctype_size(elem).max(1);
+                                return Some(info.alloc_size / elem_sz);
+                            }
+                        }
+                    }
+                    if let Some(ginfo) = self.globals.get(name) {
+                        if let Some(CType::Array(_, Some(n))) = ginfo.c_type.as_ref() {
+                            return Some(*n);
+                        }
+                        if ginfo.is_array {
+                            if let Some(CType::Array(elem, None)) = ginfo.c_type.as_ref() {
+                                let elem_sz = self.ctype_size(elem).max(1);
+                                for g in &self.module.globals {
+                                    if g.name == *name {
+                                        return Some(g.size / elem_sz);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    match self.get_expr_ctype(expr)? {
+                        CType::Array(_, Some(n)) => Some(n),
+                        _ => None,
+                    }
+                }
+                _ => match self.get_expr_ctype(expr)? {
+                    CType::Array(_, Some(n)) => Some(n),
+                    _ => None,
+                },
+            },
+        }
+    }
+
+    pub(super) fn lower_countof(&mut self, arg: &SizeofArg) -> Operand {
+        if let Some(count) = self.static_countof_arg(arg) {
+            return Operand::Const(IrConst::ptr_int(count as i64));
+        }
+        // Outermost dimension is a VLA: total_bytes / elem_bytes.
+        let total = self.lower_sizeof(arg);
+        let elem = match arg {
+            SizeofArg::Type(TypeSpecifier::Array(elem_ts, _)) => {
+                self.lower_sizeof(&SizeofArg::Type((**elem_ts).clone()))
+            }
+            SizeofArg::Type(ts) => {
+                if let CType::Array(elem_ct, _) = self.type_spec_to_ctype(ts) {
+                    Operand::Const(IrConst::ptr_int(self.ctype_size(&elem_ct).max(1) as i64))
+                } else {
+                    Operand::Const(IrConst::ptr_int(1))
+                }
+            }
+            SizeofArg::Expr(expr) => {
+                if let Some(stride) = self.get_vla_stride_for_subscript(expr) {
+                    Operand::Value(stride)
+                } else if let Some(CType::Array(elem_ct, _)) = self.get_expr_ctype(expr) {
+                    Operand::Const(IrConst::ptr_int(self.ctype_size(&elem_ct).max(1) as i64))
+                } else {
+                    Operand::Const(IrConst::ptr_int(1))
+                }
+            }
+        };
+        if matches!(elem, Operand::Const(IrConst::I64(1) | IrConst::I32(1))) {
+            return total;
+        }
+        let size_ty = crate::common::types::target_int_ir_type();
+        let dest = self.fresh_value();
+        self.emit(Instruction::BinOp {
+            dest,
+            op: crate::ir::reexports::IrBinOp::UDiv,
+            lhs: total,
+            rhs: elem,
+            ty: size_ty,
+        });
+        Operand::Value(dest)
+    }
+
     fn get_vla_sizeof(&self, arg: &SizeofArg) -> Option<Value> {
         match arg {
             SizeofArg::Expr(expr) => self.vla_sizeof_of_expr(expr),

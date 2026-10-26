@@ -78,9 +78,12 @@ impl Lowerer {
                 ExternalDecl::Declaration(decl) => {
                     self.collect_refs_from_declaration(decl, &mut referenced);
                     for declarator in &decl.declarators {
-                        // Alias targets reference the aliased function
+                        // Alias and ifunc resolver targets reference the target function
                         if let Some(ref target) = declarator.attrs.alias_target {
                             referenced.insert(target.clone());
+                        }
+                        if let Some(ref resolver) = declarator.attrs.ifunc_target {
+                            referenced.insert(resolver.clone());
                         }
                     }
                 }
@@ -209,8 +212,8 @@ impl Lowerer {
             Stmt::Declaration(decl) => self.collect_refs_from_declaration(decl, refs),
             Stmt::Expr(_)
             | Stmt::Return(..)
-            | Stmt::Break(_)
-            | Stmt::Continue(_)
+            | Stmt::Break(..)
+            | Stmt::Continue(..)
             | Stmt::Goto(..)
             | Stmt::GotoIndirect(..)
             | Stmt::InlineAsm { .. } => {}

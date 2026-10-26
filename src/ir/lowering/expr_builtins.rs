@@ -958,45 +958,11 @@ impl Lowerer {
                 unreachable!("va builtins handled earlier by name match")
             }
             BuiltinIntrinsic::ConstantP => self.lower_constant_p(args),
-            // __builtin_object_size(ptr, type) -> compile-time object size, or unknown
-            // For types 0 and 1: return (size_t)-1 when size is unknown
-            // For types 2 and 3: return 0 when size is unknown
-            // We conservatively return "unknown" since we don't do points-to analysis.
-            BuiltinIntrinsic::ObjectSize => {
-                let obj_type = if args.len() >= 2 {
-                    match self.eval_const_expr(&args[1]) {
-                        Some(IrConst::I64(v)) => v,
-                        Some(IrConst::I32(v)) => v as i64,
-                        _ => 0,
-                    }
-                } else {
-                    0
-                };
-                // Fast path: string literal. Size is strlen+1 (NUL included).
-                // Highest-ROI object_size case for fortify; every serious C
-                // compiler folds this without full points-to analysis.
-                if let Some(arg0) = args.first() {
-                    if let Expr::StringLiteral(s, _) = arg0 {
-                        let sz = (s.len() + 1) as i64;
-                        if args.len() >= 2 {
-                            let _ = self.lower_expr(&args[1]);
-                        }
-                        return Some(Operand::Const(IrConst::I64(sz)));
-                    }
-                }
-                // Conservative unknown: evaluate args for side effects.
-                for arg in args {
-                    let _ = self.lower_expr(arg);
-                }
-                // Types 0 and 1: maximum estimate -> -1 (unknown)
-                // Types 2 and 3: minimum estimate -> 0 (unknown)
-                let result = if obj_type == 2 || obj_type == 3 {
-                    0i64
-                } else {
-                    -1i64
-                };
-                Some(Operand::Const(IrConst::I64(result)))
-            }
+            BuiltinIntrinsic::ObjectSize => self.lower_object_size_builtin(name, args),
+            BuiltinIntrinsic::StdcBit => self.lower_stdc_bit_builtin(name, args),
+            BuiltinIntrinsic::CountedByRef => self.lower_counted_by_ref(args),
+            BuiltinIntrinsic::AssocBarrier => self.lower_assoc_barrier(args),
+            BuiltinIntrinsic::ClearPadding => self.lower_clear_padding(args),
             // __builtin_classify_type(expr) -> GCC type class integer
             BuiltinIntrinsic::ClassifyType => Some(Operand::Const(IrConst::I64(
                 self.classify_type_of(args.first()),

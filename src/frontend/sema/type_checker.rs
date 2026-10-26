@@ -200,8 +200,9 @@ impl<'a> ExprTypeChecker<'a> {
             // Cast: type is the target type
             Expr::Cast(type_spec, _, _, _) => Some(self.resolve_type_spec(type_spec)),
 
-            // Sizeof and Alignof always produce size_t (unsigned long on 64-bit)
+            // Sizeof, Countof, and Alignof always produce size_t (unsigned long on 64-bit)
             Expr::Sizeof(_, _)
+            | Expr::Countof(_, _)
             | Expr::Alignof(_, _)
             | Expr::AlignofExpr(_, _)
             | Expr::GnuAlignof(_, _)
@@ -369,6 +370,10 @@ impl<'a> ExprTypeChecker<'a> {
                         {
                             return Some(ct);
                         }
+                    }
+
+                    if let Some(ct) = self.infer_c2y_builtin_ctype(name, args) {
+                        return Some(ct);
                     }
                 }
                 self.infer_call_return_ctype(func)
@@ -1135,6 +1140,7 @@ impl<'a> ExprTypeChecker<'a> {
                     is_packed: f.is_packed,
                     base_volatile: f.base_volatile,
                     object_volatile: f.object_volatile,
+                    counted_by: f.counted_by.clone(),
                 })
             })
             .collect();
@@ -1659,5 +1665,64 @@ impl<'a> ExprTypeChecker<'a> {
             Expr::AddressOf(inner, _) => self.lvalue_address_space(inner),
             _ => AddressSpace::Default,
         }
+    }
+
+    fn infer_c2y_builtin_ctype(&self, name: &str, args: &[Expr]) -> Option<CType> {
+        use crate::frontend::sema::stdbit;
+        if stdbit::is_stdc_bit_builtin(name) {
+            let arg0_ct = args
+                .first()
+                .and_then(|a| self.infer_expr_ctype(a))
+                .map(|ct| ct.decayed_value_ctype());
+            return stdbit::stdc_bit_return_ctype(name, arg0_ct.as_ref());
+        }
+        match name {
+            "__builtin_counted_by_ref" => {
+                if let Some(arg0) = args.first() {
+                    if let Some((cnt_ty, space)) = self.infer_counted_by_target(arg0) {
+                        return Some(CType::Pointer(Box::new(cnt_ty), space));
+                    }
+                }
+                Some(CType::Pointer(Box::new(CType::Void), AddressSpace::Default))
+            }
+            "__builtin_assoc_barrier" => args
+                .first()
+                .and_then(|a| self.infer_expr_ctype(a))
+                .map(|ct| ct.decayed_value_ctype()),
+            "__builtin_clear_padding" => Some(CType::Void),
+            "__builtin_object_size" | "__builtin_dynamic_object_size" => {
+                Some(if crate::common::types::target_is_32bit() {
+                    CType::UInt
+                } else {
+                    CType::ULong
+                })
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn infer_counted_by_target(&self, expr: &Expr) -> Option<(CType, AddressSpace)> {
+        let (base_expr, field_name, is_ptr) = match expr {
+            Expr::MemberAccess(b, f, _) => (b.as_ref(), f.as_str(), false),
+            Expr::PointerMemberAccess(b, f, _) => (b.as_ref(), f.as_str(), true),
+            _ => return None,
+        };
+        let base_ct = self.infer_expr_ctype(base_expr)?;
+        let (record_ct, space) = if is_ptr {
+            match base_ct.decayed_value_ctype() {
+                CType::Pointer(inner, sp) => (*inner, sp),
+                _ => return None,
+            }
+        } else {
+            (base_ct, self.lvalue_address_space(base_expr))
+        };
+        let key = match &record_ct {
+            CType::Struct(k) => k,
+            _ => return None,
+        };
+        let layouts = self.types.borrow_struct_layouts();
+        let layout = layouts.get(&**key)?;
+        let (_, cnt_ty, _) = layout.field_counted_by(field_name, &*layouts)?;
+        Some((cnt_ty, space))
     }
 }

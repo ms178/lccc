@@ -209,6 +209,8 @@ pub(super) fn emit_shared_library(
     requested_dyn_flags: (u64, u64),
     // `-z relro` (the default) / `-z norelro`.
     z_relro: bool,
+    // `-z pack-relative-relocs` / `-z nopack-relative-relocs`.
+    z_pack_relative_relocs: bool,
     // `-z now`: the lazy-binding `.got.plt` joins the RELRO window.
     z_now: bool,
     // `-z text` / `-z notext`: what a relocation into code does.
@@ -1012,6 +1014,12 @@ pub(super) fn emit_shared_library(
     } else {
         0
     };
+    if z_pack_relative_relocs
+        && let Some(libc_vers) = needed_versions.get_mut("libc.so.6")
+        && libc_vers.iter().any(|v| v.starts_with("GLIBC_"))
+    {
+        libc_vers.insert("GLIBC_ABI_DT_RELR".to_string());
+    }
     let first_verneed_index = if provider_verdef_count > 0 {
         provider_verdef_count + 1
     } else {
@@ -1356,6 +1364,9 @@ pub(super) fn emit_shared_library(
     }
     if verneed_count > 0 {
         dyn_count += 2; // DT_VERNEED, DT_VERNEEDNUM
+    }
+    if z_pack_relative_relocs {
+        dyn_count += 3; // DT_RELR, DT_RELRSZ, DT_RELRENT
     }
 
     let has_tls_sections = output_sections
@@ -2580,9 +2591,8 @@ pub(super) fn emit_shared_library(
         // section symbol is shared by every local in its section, so the
         // addend is what keeps those addresses in separate slots.
         let v = local_sym_addr((obj_idx, si)).wrapping_add(addr_addend as u64);
-        if objects[obj_idx].symbols[si].shndx == SHN_ABS {
-            w64(&mut out, (got_offset + off) as usize, v);
-        } else {
+        w64(&mut out, (got_offset + off) as usize, v);
+        if objects[obj_idx].symbols[si].shndx != SHN_ABS {
             rela_dyn_entries.push((got_addr + off, v));
         }
     }
@@ -3206,6 +3216,15 @@ pub(super) fn emit_shared_library(
     } else {
         dt_flags
     };
+    let (rela_dyn_entries, relr_bytes) = if z_pack_relative_relocs {
+        let (relr_addrs, leftovers) = linker_common::relr::partition_relative_64(&rela_dyn_entries);
+        (
+            leftovers,
+            linker_common::relr::encode_relr_64_bytes(&relr_addrs),
+        )
+    } else {
+        (rela_dyn_entries, Vec::new())
+    };
     let relative_count = rela_dyn_entries.len();
     let total_rela_count = relative_count
         + glob_dat_entries.len()
@@ -3216,6 +3235,12 @@ pub(super) fn emit_shared_library(
         + dtpmod64_entries.len()
         + dtpoff64_entries.len();
     let rela_dyn_size = total_rela_count as u64 * 24;
+    let relr_dyn_offset = rela_dyn_offset + rela_dyn_size;
+    let relr_dyn_addr = rela_dyn_addr + rela_dyn_size;
+    let relr_dyn_size = relr_bytes.len() as u64;
+    if !relr_bytes.is_empty() {
+        write_bytes(&mut out, relr_dyn_offset as usize, &relr_bytes);
+    }
     let mut rd = rela_dyn_offset as usize;
     // First: R_X86_64_RELATIVE entries (type 8, no symbol)
     for (rel_offset, rel_value) in &rela_dyn_entries {
@@ -3400,6 +3425,17 @@ pub(super) fn emit_shared_library(
         w64(&mut out, dd + 8, verneed_count);
         dd += 16;
     }
+    if relr_dyn_size > 0 {
+        w64(&mut out, dd, DT_RELR as u64);
+        w64(&mut out, dd + 8, relr_dyn_addr);
+        dd += 16;
+        w64(&mut out, dd, DT_RELRSZ as u64);
+        w64(&mut out, dd + 8, relr_dyn_size);
+        dd += 16;
+        w64(&mut out, dd, DT_RELRENT as u64);
+        w64(&mut out, dd + 8, 8);
+        dd += 16;
+    }
     if has_init_array {
         w64(&mut out, dd, DT_INIT_ARRAY as u64);
         w64(&mut out, dd + 8, init_array_addr);
@@ -3457,6 +3493,7 @@ pub(super) fn emit_shared_library(
         ".gnu.version_d",
         ".gnu.version_r",
         ".rela.dyn",
+        ".relr.dyn",
         ".rela.plt",
         ".plt",
         ".eh_frame_hdr",
@@ -3520,6 +3557,9 @@ pub(super) fn emit_shared_library(
         next_hdr += 1;
     }
     if rela_dyn_size > 0 {
+        next_hdr += 1;
+    }
+    if relr_dyn_size > 0 {
         next_hdr += 1;
     }
     if rela_plt_size > 0 {
@@ -3769,6 +3809,9 @@ pub(super) fn emit_shared_library(
     if rela_dyn_size > 0 {
         sh_count += 1;
     }
+    if relr_dyn_size > 0 {
+        sh_count += 1;
+    }
     if rela_plt_size > 0 {
         sh_count += 1;
     }
@@ -3979,6 +4022,22 @@ pub(super) fn emit_shared_library(
             0,
             8,
             24,
+        );
+    }
+    // .relr.dyn
+    if relr_dyn_size > 0 {
+        write_shdr_so(
+            &mut out,
+            get_shname(".relr.dyn"),
+            SHT_RELR,
+            SHF_ALLOC,
+            relr_dyn_addr,
+            relr_dyn_offset,
+            relr_dyn_size,
+            0,
+            0,
+            8,
+            8,
         );
     }
     // .rela.plt

@@ -463,7 +463,8 @@ impl Parser {
                 let expr = self.parse_cast_expr();
                 Expr::Deref(Box::new(expr), span)
             }
-            TokenKind::Sizeof => self.parse_sizeof_expr(),
+            TokenKind::Sizeof => self.parse_sizeof_or_countof_expr(false),
+            TokenKind::Countof => self.parse_sizeof_or_countof_expr(true),
             TokenKind::Alignof => {
                 let span = self.peek_span();
                 self.advance();
@@ -501,10 +502,17 @@ impl Parser {
         }
     }
 
-    /// Parse sizeof expression. Handles both sizeof(type-name) and sizeof expr.
-    fn parse_sizeof_expr(&mut self) -> Expr {
+    /// Parse `sizeof` or `_Countof` expression. Handles both `op(type-name)` and `op expr`.
+    fn parse_sizeof_or_countof_expr(&mut self, is_countof: bool) -> Expr {
         let span = self.peek_span();
-        self.advance(); // consume 'sizeof'
+        self.advance(); // consume 'sizeof' or '_Countof'
+        let wrap = |arg: SizeofArg| {
+            if is_countof {
+                Expr::Countof(Box::new(arg), span)
+            } else {
+                Expr::Sizeof(Box::new(arg), span)
+            }
+        };
         if matches!(self.peek(), TokenKind::LParen) {
             let save = self.pos;
             let save_typedef = self.attrs.parsing_typedef();
@@ -537,7 +545,7 @@ impl Parser {
                         // Restore outer vector attrs so the enclosing declaration can use them
                         self.attrs.parsing_vector_size = save_vector_size;
                         self.attrs.parsing_ext_vector_nelem = save_ext_vector;
-                        return Expr::Sizeof(Box::new(arg), span);
+                        return wrap(arg);
                     }
                 }
             }
@@ -548,7 +556,7 @@ impl Parser {
             self.attrs.parsing_ext_vector_nelem = save_ext_vector;
         }
         let expr = self.parse_unary_expr();
-        Expr::Sizeof(Box::new(SizeofArg::Expr(expr)), span)
+        wrap(SizeofArg::Expr(expr))
     }
 
     fn parse_postfix_expr(&mut self) -> Expr {
@@ -857,20 +865,8 @@ impl Parser {
                 let name = name.clone();
                 let span = self.peek_span();
                 self.advance();
-                // __builtin_convertvector(expr, TYPE): the second argument is
-                // a type name, which the generic call-argument parser cannot
-                // handle — intercept here (same pattern as __builtin_va_arg).
                 if name == "__builtin_convertvector" && matches!(self.peek(), TokenKind::LParen) {
-                    let open = self.peek_span();
-                    self.advance();
-                    let src_expr = self.parse_assignment_expr();
-                    self.expect_context(
-                        &TokenKind::Comma,
-                        "between '__builtin_convertvector' arguments",
-                    );
-                    let type_spec = self.parse_va_arg_type();
-                    self.expect_closing(&TokenKind::RParen, open);
-                    return Expr::ConvertVector(Box::new(src_expr), type_spec, span);
+                    return self.parse_convertvector_expr(span);
                 }
                 Expr::Identifier(name, span)
             }
@@ -900,33 +896,8 @@ impl Parser {
                 }
                 Expr::IntLiteral(0, span)
             }
-            TokenKind::BuiltinVaArg => {
-                let span = self.peek_span();
-                self.advance();
-                let open = self.peek_span();
-                self.expect_context(&TokenKind::LParen, "after '__builtin_va_arg'");
-                let ap_expr = self.parse_assignment_expr();
-                self.expect_context(&TokenKind::Comma, "between '__builtin_va_arg' arguments");
-                let type_spec = self.parse_va_arg_type();
-                self.expect_closing(&TokenKind::RParen, open);
-                Expr::VaArg(Box::new(ap_expr), type_spec, span)
-            }
-            TokenKind::BuiltinTypesCompatibleP => {
-                // __builtin_types_compatible_p(type1, type2)
-                // Compile-time: 1 if types are compatible (ignoring qualifiers), 0 otherwise.
-                let span = self.peek_span();
-                self.advance();
-                let open = self.peek_span();
-                self.expect_context(&TokenKind::LParen, "after '__builtin_types_compatible_p'");
-                let (type1, qualifiers1) = self.parse_compatible_type();
-                self.expect_context(
-                    &TokenKind::Comma,
-                    "between '__builtin_types_compatible_p' arguments",
-                );
-                let (type2, qualifiers2) = self.parse_compatible_type();
-                self.expect_closing(&TokenKind::RParen, open);
-                Expr::BuiltinTypesCompatibleP(type1, type2, qualifiers1, qualifiers2, span)
-            }
+            TokenKind::BuiltinVaArg => self.parse_va_arg_expr(),
+            TokenKind::BuiltinTypesCompatibleP => self.parse_types_compatible_expr(),
             TokenKind::Typeof | TokenKind::TypeofUnqual => {
                 let span = self.peek_span();
                 self.advance();
@@ -951,6 +922,46 @@ impl Parser {
                 Expr::IntLiteral(0, span)
             }
         }
+    }
+
+    fn parse_convertvector_expr(&mut self, span: Span) -> Expr {
+        let open = self.peek_span();
+        self.advance();
+        let src_expr = self.parse_assignment_expr();
+        self.expect_context(
+            &TokenKind::Comma,
+            "between '__builtin_convertvector' arguments",
+        );
+        let type_spec = self.parse_va_arg_type();
+        self.expect_closing(&TokenKind::RParen, open);
+        Expr::ConvertVector(Box::new(src_expr), type_spec, span)
+    }
+
+    fn parse_va_arg_expr(&mut self) -> Expr {
+        let span = self.peek_span();
+        self.advance();
+        let open = self.peek_span();
+        self.expect_context(&TokenKind::LParen, "after '__builtin_va_arg'");
+        let ap_expr = self.parse_assignment_expr();
+        self.expect_context(&TokenKind::Comma, "between '__builtin_va_arg' arguments");
+        let type_spec = self.parse_va_arg_type();
+        self.expect_closing(&TokenKind::RParen, open);
+        Expr::VaArg(Box::new(ap_expr), type_spec, span)
+    }
+
+    fn parse_types_compatible_expr(&mut self) -> Expr {
+        let span = self.peek_span();
+        self.advance();
+        let open = self.peek_span();
+        self.expect_context(&TokenKind::LParen, "after '__builtin_types_compatible_p'");
+        let (type1, qualifiers1) = self.parse_compatible_type();
+        self.expect_context(
+            &TokenKind::Comma,
+            "between '__builtin_types_compatible_p' arguments",
+        );
+        let (type2, qualifiers2) = self.parse_compatible_type();
+        self.expect_closing(&TokenKind::RParen, open);
+        Expr::BuiltinTypesCompatibleP(type1, type2, qualifiers1, qualifiers2, span)
     }
 
     /// Parse _Generic(controlling_expr, type: expr, ..., default: expr)
