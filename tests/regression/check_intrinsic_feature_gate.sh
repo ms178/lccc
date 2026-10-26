@@ -590,6 +590,16 @@ cat >"$tmp/local_bw_denied.c" <<'EOF'
 __attribute__((target("no-avx512bw"))) __mmask16 f(__m128i a, __m128i b) { return _mm_cmp_epu8_mask(a,b,_MM_CMPINT_EQ); }
 EOF
 reject local_bw_denied.c -mavx512bw -march=x86-64 -mavx512bw -mavx512vl
+cat >"$tmp/local_bmm_implies_bw.c" <<'EOF'
+#include <immintrin.h>
+__attribute__((target("avx512bmm"))) __m512i f(__m512i a, __m512i b) { return _mm512_add_epi8(a,b); }
+EOF
+accept local_bmm_implies_bw.c vpaddb -march=x86-64
+cat >"$tmp/local_bmm_no_bw.c" <<'EOF'
+#include <immintrin.h>
+__attribute__((target("avx512bmm,no-avx512bw"))) __m512i f(__m512i a, __m512i b) { return _mm512_add_epi8(a,b); }
+EOF
+reject local_bmm_no_bw.c -mavx512bw -march=x86-64
 cat >"$tmp/local_fma_no_leak.c" <<'EOF'
 #include <immintrin.h>
 __attribute__((target("fma"))) __m256 f(__m256 a, __m256 b, __m256 c) { return _mm256_fmadd_ps(a,b,c); }
@@ -637,6 +647,8 @@ if "$gcc_bin" -dumpfullversion 2>/dev/null | grep -x '16.2.0' >/dev/null; then
     compare local_fma_no_leak.c -march=x86-64
     compare local_bw_vl.c -march=x86-64
     compare local_bw_denied.c -march=x86-64 -mavx512bw -mavx512vl
+    compare local_bmm_implies_bw.c -march=x86-64
+    compare local_bmm_no_bw.c -march=x86-64
 
     "$ccc" -O2 -mavx512f -ffp-contract=off "$tmp/avx512_fma_runtime.c" -o "$tmp/lccc-avx512-fma"
     "$gcc_bin" -O2 -mavx512f -ffp-contract=off "$tmp/avx512_fma_runtime.c" -o "$tmp/gcc-avx512-fma"
