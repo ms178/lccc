@@ -2843,6 +2843,16 @@ impl Lowerer {
                     permitted = true;
                     continue;
                 }
+                if !enabled
+                    && requirement.feature == F::Fma
+                    && matches!(
+                        feature,
+                        "sse" | "sse2" | "sse3" | "ssse3" | "sse4.1" | "sse4.2" | "avx"
+                    )
+                {
+                    permitted = false;
+                    continue;
+                }
                 let Some(needed) = needed else {
                     continue;
                 };

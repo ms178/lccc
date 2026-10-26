@@ -580,6 +580,11 @@ cat >"$tmp/local_fma.c" <<'EOF'
 __attribute__((target("fma"))) __m256 f(__m256 a, __m256 b, __m256 c) { return _mm256_fmadd_ps(a, b, c); }
 EOF
 accept local_fma.c vfmadd -march=x86-64
+cat >"$tmp/local_fma_no_avx.c" <<'EOF'
+#include <immintrin.h>
+__attribute__((target("fma,no-avx"))) __m256 f(__m256 a, __m256 b, __m256 c) { return _mm256_fmadd_ps(a, b, c); }
+EOF
+reject local_fma_no_avx.c -mfma -march=x86-64
 cat >"$tmp/local_bw_vl.c" <<'EOF'
 #include <immintrin.h>
 __attribute__((target("avx512bw,avx512vl"))) __mmask16 f(__m128i a, __m128i b) { return _mm_cmp_epu8_mask(a,b,_MM_CMPINT_EQ); }
@@ -644,6 +649,7 @@ if "$gcc_bin" -dumpfullversion 2>/dev/null | grep -x '16.2.0' >/dev/null; then
     compare avx512_f_qword.c -march=x86-64 -mavx512f -mno-avx512dq
     compare avx512_vnni.c -march=x86-64 -mavx512f -mno-avx512vnni
     compare local_fma.c -march=x86-64
+    compare local_fma_no_avx.c -march=x86-64
     compare local_fma_no_leak.c -march=x86-64
     compare local_bw_vl.c -march=x86-64
     compare local_bw_denied.c -march=x86-64 -mavx512bw -mavx512vl
