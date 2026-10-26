@@ -1,12 +1,23 @@
 //! RiscvCodegen: return value handling.
 
 use super::emit::RiscvCodegen;
+use crate::common::types::IrType;
 use crate::ir::reexports::{IrConst, Operand, Value};
 
 impl RiscvCodegen {
     pub(super) fn emit_return_impl(&mut self, val: Option<&Operand>, frame_size: i64) {
         if let Some(val) = val {
             let ret_ty = self.current_return_type;
+            if ret_ty == IrType::U16 && self.func_ret_is_f128_sse {
+                self.operand_to_t0(val);
+                self.state.emit("    slli t0, t0, 48");
+                self.state.emit("    srli t0, t0, 48");
+                self.state.emit("    lui t1, 0xffff0");
+                self.state.emit("    or t0, t0, t1");
+                self.state.emit("    fmv.w.x fa0, t0");
+                self.emit_epilogue_and_ret_impl(frame_size);
+                return;
+            }
             if ret_ty.is_long_double() {
                 // Full-precision F128 return: load the full 128-bit value into a0:a1
                 self.emit_f128_operand_to_a0_a1(val);

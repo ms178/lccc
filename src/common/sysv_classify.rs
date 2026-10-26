@@ -360,6 +360,7 @@ fn cleanup(mut classes: Vec<Class>) -> Option<Vec<Class>> {
 fn leaf(ty: &CType) -> Option<(Vec<Class>, usize)> {
     use Class::*;
     Some(match ty {
+        CType::Float16 | CType::BFloat16 => (vec![Sse], 16),
         CType::Float | CType::Decimal32 => (vec![Sse], 32),
         CType::Double | CType::Decimal64 => (vec![Sse], 64),
         CType::LongDouble => (vec![X87, X87Up], 128),

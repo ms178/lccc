@@ -298,7 +298,16 @@ impl RiscvCodegen {
                     } else {
                         None
                     };
-                    if arg_ty == Some(IrType::F32) {
+                    if arg_ty == Some(IrType::U16) {
+                        // 16-bit NaN-boxing in fa{reg_idx}: bits [63:16] = 1 (`fmv.w.x` boxes [63:32],
+                        // `lui t1, 0xffff0; or` boxes [31:16]).
+                        self.state.emit("    slli t0, t0, 48");
+                        self.state.emit("    srli t0, t0, 48");
+                        self.state.emit("    lui t1, 0xffff0");
+                        self.state.emit("    or t0, t0, t1");
+                        self.state
+                            .emit_fmt(format_args!("    fmv.w.x {}, t0", float_arg_regs[reg_idx]));
+                    } else if arg_ty == Some(IrType::F32) {
                         self.state
                             .emit_fmt(format_args!("    fmv.w.x {}, t0", float_arg_regs[reg_idx]));
                     } else {
@@ -523,36 +532,24 @@ impl RiscvCodegen {
                     hi_fp_idx,
                     size,
                 } => {
-                    let (lo_is_double, hi_is_double) = match rv_class {
-                        Some(crate::common::types::RiscvFloatClass::OneFloat { is_double }) => {
-                            (is_double, false)
+                    let (lo_sz, hi_sz, hi_offset) = match rv_class {
+                        Some(crate::common::types::RiscvFloatClass::OneFloat { size }) => {
+                            (size, 4, 0)
                         }
                         Some(crate::common::types::RiscvFloatClass::TwoFloats {
-                            lo_is_double,
-                            hi_is_double,
-                        }) => (lo_is_double, hi_is_double),
-                        _ => (size > 4, true),
+                            lo_size,
+                            hi_size,
+                            hi_offset,
+                        }) => (lo_size, hi_size, hi_offset),
+                        _ => (
+                            if size > 4 { 8 } else { 4 },
+                            8,
+                            if size > 4 { 8 } else { 4 },
+                        ),
                     };
-                    if lo_is_double {
-                        self.state
-                            .emit_fmt(format_args!("    fld {}, 0(t0)", float_arg_regs[lo_fp_idx]));
-                    } else {
-                        self.state
-                            .emit_fmt(format_args!("    flw {}, 0(t0)", float_arg_regs[lo_fp_idx]));
-                    }
+                    self.emit_load_riscv_fp_field(float_arg_regs[lo_fp_idx], 0, lo_sz);
                     if let Some(hi_idx) = hi_fp_idx {
-                        let hi_offset = if lo_is_double { 8 } else { 4 };
-                        if hi_is_double {
-                            self.state.emit_fmt(format_args!(
-                                "    fld {}, {}(t0)",
-                                float_arg_regs[hi_idx], hi_offset
-                            ));
-                        } else {
-                            self.state.emit_fmt(format_args!(
-                                "    flw {}, {}(t0)",
-                                float_arg_regs[hi_idx], hi_offset
-                            ));
-                        }
+                        self.emit_load_riscv_fp_field(float_arg_regs[hi_idx], hi_offset, hi_sz);
                     }
                 }
                 CallArgClass::StructMixedIntSseReg {
@@ -560,57 +557,41 @@ impl RiscvCodegen {
                     fp_reg_idx,
                     size: _,
                 } => {
-                    let (float_is_double, int_size, float_offset) = match rv_class {
+                    let (float_sz, int_size, float_offset) = match rv_class {
                         Some(crate::common::types::RiscvFloatClass::IntAndFloat {
-                            float_is_double,
+                            float_size,
                             int_size,
                             float_offset,
                             ..
-                        }) => (float_is_double, int_size, float_offset),
-                        _ => (true, 8, 8),
+                        }) => (float_size, int_size, float_offset),
+                        _ => (8, 8, 8),
                     };
                     let int_load = if int_size <= 4 { "lw" } else { "ld" };
                     self.state.emit_fmt(format_args!(
                         "    {} {}, 0(t0)",
                         int_load, RISCV_ARG_REGS[int_reg_idx]
                     ));
-                    if float_is_double {
-                        self.state.emit_fmt(format_args!(
-                            "    fld {}, {}(t0)",
-                            float_arg_regs[fp_reg_idx], float_offset
-                        ));
-                    } else {
-                        self.state.emit_fmt(format_args!(
-                            "    flw {}, {}(t0)",
-                            float_arg_regs[fp_reg_idx], float_offset
-                        ));
-                    }
+                    self.emit_load_riscv_fp_field(
+                        float_arg_regs[fp_reg_idx],
+                        float_offset,
+                        float_sz,
+                    );
                 }
                 CallArgClass::StructMixedSseIntReg {
                     fp_reg_idx,
                     int_reg_idx,
                     size: _,
                 } => {
-                    let (float_is_double, int_offset, int_size) = match rv_class {
+                    let (float_sz, int_offset, int_size) = match rv_class {
                         Some(crate::common::types::RiscvFloatClass::FloatAndInt {
-                            float_is_double,
+                            float_size,
                             int_offset,
                             int_size,
                             ..
-                        }) => (float_is_double, int_offset, int_size),
-                        _ => (true, 8, 8),
+                        }) => (float_size, int_offset, int_size),
+                        _ => (8, 8, 8),
                     };
-                    if float_is_double {
-                        self.state.emit_fmt(format_args!(
-                            "    fld {}, 0(t0)",
-                            float_arg_regs[fp_reg_idx]
-                        ));
-                    } else {
-                        self.state.emit_fmt(format_args!(
-                            "    flw {}, 0(t0)",
-                            float_arg_regs[fp_reg_idx]
-                        ));
-                    }
+                    self.emit_load_riscv_fp_field(float_arg_regs[fp_reg_idx], 0, float_sz);
                     let int_load = if int_size <= 4 { "lw" } else { "ld" };
                     self.state.emit_fmt(format_args!(
                         "    {} {}, {}(t0)",
@@ -653,8 +634,36 @@ impl RiscvCodegen {
         }
     }
 
+    fn emit_load_riscv_fp_field(&mut self, freg: &str, offset: usize, size: u8) {
+        match size {
+            8 => {
+                self.state
+                    .emit_fmt(format_args!("    fld {}, {}(t0)", freg, offset));
+            }
+            2 => {
+                self.state
+                    .emit_fmt(format_args!("    lhu t1, {}(t0)", offset));
+                self.state.emit("    lui t2, 0xffff0");
+                self.state.emit("    or t1, t1, t2");
+                self.state
+                    .emit_fmt(format_args!("    fmv.w.x {}, t1", freg));
+            }
+            _ => {
+                self.state
+                    .emit_fmt(format_args!("    flw {}, {}(t0)", freg, offset));
+            }
+        }
+    }
+
     pub(super) fn emit_call_store_result_impl(&mut self, dest: &Value, return_type: IrType) {
         if return_type == IrType::Void {
+            return;
+        }
+        if self.call_ret_is_f128_sse && return_type == IrType::U16 {
+            self.state.emit("    fmv.x.w t0, fa0");
+            self.state.emit("    slli t0, t0, 48");
+            self.state.emit("    srli t0, t0, 48");
+            self.store_t0_to(dest);
             return;
         }
         if is_i128_type(return_type) {

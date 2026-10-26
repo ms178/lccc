@@ -1412,7 +1412,26 @@ impl I686Codegen {
     }
 
     pub(super) fn emit_sub_sp_by_acc_impl(&mut self) {
-        self.state.emit("    subl %eax, %esp");
+        if self.state.stack_clash_protection {
+            let loop_lbl = self.state.fresh_label("dalloca_probe");
+            let rem_lbl = self.state.fresh_label("dalloca_rem");
+            let done_lbl = self.state.fresh_label("dalloca_done");
+            self.state.emit_fmt(format_args!("{}:", loop_lbl));
+            self.state.emit("    cmpl $4096, %eax");
+            self.state.emit_fmt(format_args!("    jb {}", rem_lbl));
+            self.state.emit("    subl $4096, %esp");
+            self.state.emit("    orl $0, (%esp)");
+            self.state.emit("    subl $4096, %eax");
+            self.state.emit_fmt(format_args!("    jmp {}", loop_lbl));
+            self.state.emit_fmt(format_args!("{}:", rem_lbl));
+            self.state.emit("    testl %eax, %eax");
+            self.state.emit_fmt(format_args!("    jz {}", done_lbl));
+            self.state.emit("    subl %eax, %esp");
+            self.state.emit("    orl $0, (%esp)");
+            self.state.emit_fmt(format_args!("{}:", done_lbl));
+        } else {
+            self.state.emit("    subl %eax, %esp");
+        }
     }
 
     pub(super) fn emit_mov_sp_to_acc_impl(&mut self) {

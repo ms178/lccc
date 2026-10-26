@@ -57,6 +57,7 @@ pub fn eval_literal(expr: &Expr) -> Option<IrConst> {
             // carried bit-exact in an I128 constant.
             Some(IrConst::I128(u128::from_le_bytes(*bytes) as i128))
         }
+        Expr::FloatLiteralHalf(_, bits, _) => Some(IrConst::I16(*bits as i16)),
         _ => None,
     }
 }
@@ -664,6 +665,184 @@ pub fn eval_builtin_call_with_mode(
         | "__builtin_infq"
         | "__builtin_huge_valf128"
         | "__builtin_huge_valq" => Some(IrConst::I128((0x7FFFu128 << 112) as i128)),
+        "__builtin_inff16" | "__builtin_huge_valf16" => Some(IrConst::I16(0x7c00u16 as i16)),
+        "__builtin_nanf16" | "nanf16" => {
+            let sig = nan_significand(nan_payload(args)?, false, 10) as u16;
+            Some(IrConst::I16((0x7c00u16 | sig) as i16))
+        }
+        "__builtin_nansf16" => {
+            let sig = nan_significand(nan_payload(args)?, true, 10) as u16;
+            Some(IrConst::I16((0x7c00u16 | sig) as i16))
+        }
+        "__builtin_nansf16b" => {
+            let sig = nan_significand(nan_payload(args)?, true, 7) as u16;
+            Some(IrConst::I16((0x7f80u16 | sig) as i16))
+        }
+        _ => eval_half_builtin_call(name, args, eval_fn),
+    }
+}
+
+/// Evaluate type-generic floating-point classification builtins (`isnan`,
+/// `isinf`, `isinf_sign`, `isfinite`, `isnormal`, `issignaling`, `signbit`,
+/// `fpclassify`) directly on the exact 16-bit IEEE `_Float16` / `__bf16`
+/// representation so subnormals (`0x1p-15f16`) and signaling NaNs are never
+/// distorted by widening to `f32`/`f64`.
+pub fn eval_half_fpclassify_builtin(
+    name: &str,
+    args: &[Expr],
+    arg_ct: &CType,
+    eval_fn: &dyn Fn(&Expr) -> Option<IrConst>,
+) -> Option<IrConst> {
+    let target_arg = if name == "__builtin_fpclassify" {
+        args.get(5)?
+    } else {
+        args.first()?
+    };
+    let bits = half_bits_of(&eval_fn(target_arg)?)?;
+    let (exp_mask, frac_mask, quiet_bit): (u16, u16, u16) = match arg_ct {
+        CType::Float16 => (0x7c00, 0x03ff, 0x0200),
+        CType::BFloat16 => (0x7f80, 0x007f, 0x0040),
+        _ => return None,
+    };
+    let abs = bits & 0x7fff;
+    let exp = abs & exp_mask;
+    let frac = abs & frac_mask;
+    let neg = (bits & 0x8000) != 0;
+    let is_nan = exp == exp_mask && frac != 0;
+    let is_inf = exp == exp_mask && frac == 0;
+    let is_finite = exp != exp_mask;
+    let is_normal = exp != 0 && exp != exp_mask;
+    let is_subnormal = exp == 0 && frac != 0;
+    let is_signaling = is_nan && (frac & quiet_bit) == 0;
+    match name {
+        "__builtin_isnan" | "isnan" => Some(IrConst::I32(i32::from(is_nan))),
+        "__builtin_isinf" | "isinf" => Some(IrConst::I32(i32::from(is_inf))),
+        "__builtin_isinf_sign" => Some(IrConst::I32(if !is_inf {
+            0
+        } else if neg {
+            -1
+        } else {
+            1
+        })),
+        "__builtin_isfinite" | "isfinite" => Some(IrConst::I32(i32::from(is_finite))),
+        "__builtin_isnormal" | "isnormal" => Some(IrConst::I32(i32::from(is_normal))),
+        "__builtin_issignaling" => Some(IrConst::I32(i32::from(is_signaling))),
+        "__builtin_signbit" | "signbit" => {
+            if !is_finite && nonfinite_from_arithmetic(target_arg, eval_fn) {
+                return None;
+            }
+            Some(IrConst::I32(i32::from(neg)))
+        }
+        "__builtin_fpclassify" if args.len() >= 6 => {
+            let idx = if is_nan {
+                0
+            } else if is_inf {
+                1
+            } else if is_normal {
+                2
+            } else if is_subnormal {
+                3
+            } else {
+                4
+            };
+            eval_fn(&args[idx])
+        }
+        _ => None,
+    }
+}
+
+/// Widen a constant `_Float16` / `__bf16` value (`IrConst::I16(bits)`) to
+/// `IrConst::F32` before passing it into generic `f32`/`f64` builtin folders
+/// (which treat `IrConst::I16` as `short`), while leaving `*f16*` builtins
+/// untouched so raw signaling-NaN bits stay intact.
+pub fn widen_half_const_for_builtin(
+    builtin_name: &str,
+    val: IrConst,
+    ct: Option<&CType>,
+) -> IrConst {
+    if builtin_name.ends_with("f16") || builtin_name.ends_with("f16b") {
+        return val;
+    }
+    match ct {
+        Some(CType::Float16) => half_bits_of(&val)
+            .map(|b| IrConst::F32(super::half_float::f16_bits_to_f32(b)))
+            .unwrap_or(val),
+        Some(CType::BFloat16) => half_bits_of(&val)
+            .map(|b| IrConst::F32(super::half_float::bf16_bits_to_f32(b)))
+            .unwrap_or(val),
+        _ => val,
+    }
+}
+
+fn eval_half_builtin_call(
+    name: &str,
+    args: &[Expr],
+    eval_fn: &dyn Fn(&Expr) -> Option<IrConst>,
+) -> Option<IrConst> {
+    use super::half_float as hf;
+    let arg_bits = |idx: usize| -> Option<u16> {
+        let e = args.get(idx)?;
+        let v = eval_fn(e)?;
+        match v {
+            IrConst::I16(b) => Some(b as u16),
+            IrConst::F32(f) => Some(hf::f32_to_f16_bits(f)),
+            IrConst::F64(f) => Some(hf::f64_to_f16_bits(f)),
+            IrConst::I32(i) => Some(hf::i128_to_f16_bits(i128::from(i))),
+            IrConst::I64(i) => Some(hf::i128_to_f16_bits(i128::from(i))),
+            IrConst::Zero => Some(0),
+            _ => None,
+        }
+    };
+    let pack = |f: f32| IrConst::I16(hf::f32_to_f16_bits(f) as i16);
+    let unary_integral = |op: fn(f32) -> f32| -> Option<IrConst> {
+        let f = hf::f16_bits_to_f32(arg_bits(0)?);
+        if !f.is_finite() && nonfinite_from_arithmetic(args.first()?, eval_fn) {
+            return None;
+        }
+        Some(pack(op(f)))
+    };
+    let unary_finite = |op: fn(f32) -> f32| -> Option<IrConst> {
+        let f = hf::f16_bits_to_f32(arg_bits(0)?);
+        let r = op(f);
+        (f.is_finite() && r.is_finite()).then(|| pack(r))
+    };
+    match name {
+        "__builtin_fabsf16" => Some(IrConst::I16((arg_bits(0)? & 0x7fff) as i16)),
+        "__builtin_copysignf16" => {
+            let x = arg_bits(0)?;
+            let y = arg_bits(1)?;
+            Some(IrConst::I16(((x & 0x7fff) | (y & 0x8000)) as i16))
+        }
+        "__builtin_ceilf16" => unary_integral(f32::ceil),
+        "__builtin_floorf16" => unary_integral(f32::floor),
+        "__builtin_truncf16" => unary_integral(f32::trunc),
+        "__builtin_roundf16" => unary_finite(f32::round),
+        "__builtin_roundevenf16" => unary_finite(f32::round_ties_even),
+        "__builtin_sqrtf16" => unary_finite(f32::sqrt),
+        "__builtin_fmaxf16" => {
+            let a = hf::f16_bits_to_f32(arg_bits(0)?);
+            let b = hf::f16_bits_to_f32(arg_bits(1)?);
+            (a.is_finite() && b.is_finite()).then(|| pack(a.max(b)))
+        }
+        "__builtin_fminf16" => {
+            let a = hf::f16_bits_to_f32(arg_bits(0)?);
+            let b = hf::f16_bits_to_f32(arg_bits(1)?);
+            (a.is_finite() && b.is_finite()).then(|| pack(a.min(b)))
+        }
+        "__builtin_fmaf16" => {
+            let a = hf::f16_bits_to_f32(arg_bits(0)?);
+            let b = hf::f16_bits_to_f32(arg_bits(1)?);
+            let c = hf::f16_bits_to_f32(arg_bits(2)?);
+            let r = (a as f64).mul_add(b as f64, c as f64);
+            (a.is_finite() && b.is_finite() && c.is_finite() && r.is_finite())
+                .then(|| IrConst::I16(hf::f64_to_f16_bits(r) as i16))
+        }
+        "__builtin_nextafterf16" => {
+            let x = arg_bits(0)?;
+            let y = arg_bits(1)?;
+            ((x & 0x7fff) < 0x7c00 && (y & 0x7fff) <= 0x7c00)
+                .then(|| IrConst::I16(hf::nextafterf16_bits(x, y) as i16))
+        }
         _ => None,
     }
 }
@@ -1354,6 +1533,15 @@ pub fn eval_binop_with_types(
 pub fn const_truth(val: &IrConst, ct: Option<&CType>) -> bool {
     use super::decimal;
     match (ct, val) {
+        (Some(CType::Float16 | CType::BFloat16), IrConst::I16(bits)) => {
+            (*bits as u16) & 0x7fff != 0
+        }
+        (Some(CType::Float16 | CType::BFloat16), IrConst::I32(bits)) => {
+            (*bits as u16) & 0x7fff != 0
+        }
+        (Some(CType::Float16 | CType::BFloat16), IrConst::I64(bits)) => {
+            (*bits as u16) & 0x7fff != 0
+        }
         (Some(CType::Float128), IrConst::I128(bits)) => (*bits as u128) & !(1u128 << 127) != 0,
         (Some(CType::Decimal128), IrConst::I128(bits)) => {
             let b = *bits as u128;
@@ -1386,6 +1574,18 @@ pub fn f128_bytes_of(val: &IrConst, ct: Option<&CType>) -> Option<[u8; 16]> {
         }
     };
     match ct {
+        CType::Float16 => {
+            let bits = half_bits_of(val)?;
+            Some(ld::f64_to_f128_bytes_lossless(
+                super::half_float::f16_bits_to_f64(bits),
+            ))
+        }
+        CType::BFloat16 => {
+            let bits = half_bits_of(val)?;
+            Some(ld::f64_to_f128_bytes_lossless(
+                super::half_float::bf16_bits_to_f64(bits),
+            ))
+        }
         CType::Float128 => match val {
             IrConst::I128(bits) => Some((*bits as u128).to_le_bytes()),
             IrConst::Zero => Some([0; 16]),
@@ -1492,6 +1692,24 @@ pub fn f128_to_ctype(bytes: &[u8; 16], target: &CType) -> Option<IrConst> {
         }
         CType::Double => IrConst::F64(ld::f128_bytes_to_f64(bytes)),
         CType::Float => IrConst::F32(ld::f128_bytes_to_f32(bytes)),
+        CType::Float16 => {
+            let rto = if ((raw >> 112) & 0x7fff) != 0x7fff && (raw & ((1u128 << 60) - 1)) != 0 {
+                (raw & !((1u128 << 60) - 1)) | (1u128 << 60)
+            } else {
+                raw
+            };
+            let f = ld::f128_bytes_to_f64(&rto.to_le_bytes());
+            IrConst::I16(super::half_float::f64_to_f16_bits(f) as i16)
+        }
+        CType::BFloat16 => {
+            let rto = if ((raw >> 112) & 0x7fff) != 0x7fff && (raw & ((1u128 << 60) - 1)) != 0 {
+                (raw & !((1u128 << 60) - 1)) | (1u128 << 60)
+            } else {
+                raw
+            };
+            let f = ld::f128_bytes_to_f64(&rto.to_le_bytes());
+            IrConst::I16(super::half_float::f64_to_bf16_bits(f) as i16)
+        }
         CType::Bool => IrConst::I8(i8::from(raw & !(1u128 << 127) != 0)),
         t if t.is_integer() => {
             let size = t.size();
@@ -1532,6 +1750,223 @@ pub fn f128_to_ctype(bytes: &[u8; 16], target: &CType) -> Option<IrConst> {
                 _ => return None,
             }
         }
+        _ => return None,
+    })
+}
+
+/// Extract the raw 16-bit IEEE carrier image of a `_Float16` / `__bf16` constant.
+pub fn half_bits_of(val: &IrConst) -> Option<u16> {
+    match val {
+        IrConst::I16(v) => Some(*v as u16),
+        IrConst::I32(v) => Some(*v as u16),
+        IrConst::I64(v) => Some(*v as u16),
+        IrConst::Zero => Some(0),
+        _ => None,
+    }
+}
+
+/// Value-preserving constant conversion where either `src_ct` or `dst_ct` is
+/// `_Float16` or `__bf16`.
+pub fn cast_half_const(val: &IrConst, src_ct: Option<&CType>, dst_ct: &CType) -> Option<IrConst> {
+    use super::half_float as hf;
+    if let CType::Enum(e) = dst_ct {
+        return cast_half_const(val, src_ct, &e.compatible_ctype());
+    }
+    if dst_ct.is_half_float() {
+        let is_bf16 = *dst_ct == CType::BFloat16;
+        let to_half = |f: f64| -> IrConst {
+            let bits = if is_bf16 {
+                hf::f64_to_bf16_bits(f)
+            } else {
+                hf::f64_to_f16_bits(f)
+            };
+            IrConst::I16(bits as i16)
+        };
+        if let Some(sct) = src_ct {
+            match sct {
+                CType::Float16 => {
+                    let b = half_bits_of(val)?;
+                    return Some(if is_bf16 {
+                        IrConst::I16(hf::f32_to_bf16_bits(hf::f16_bits_to_f32(b)) as i16)
+                    } else {
+                        IrConst::I16(b as i16)
+                    });
+                }
+                CType::BFloat16 => {
+                    let b = half_bits_of(val)?;
+                    return Some(if is_bf16 {
+                        IrConst::I16(b as i16)
+                    } else {
+                        IrConst::I16(hf::f32_to_f16_bits(hf::bf16_bits_to_f32(b)) as i16)
+                    });
+                }
+                CType::Float128 => {
+                    let bytes = f128_bytes_of(val, Some(sct))?;
+                    return f128_to_ctype(&bytes, dst_ct);
+                }
+                t if t.is_decimal() => {
+                    let bytes = f128_bytes_of(val, Some(sct))?;
+                    return f128_to_ctype(&bytes, dst_ct);
+                }
+                CType::Int128 => {
+                    let IrConst::I128(v) = val else { return None };
+                    let bits = if is_bf16 {
+                        hf::i128_to_bf16_bits(*v)
+                    } else {
+                        hf::i128_to_f16_bits(*v)
+                    };
+                    return Some(IrConst::I16(bits as i16));
+                }
+                CType::UInt128 => {
+                    let IrConst::I128(v) = val else { return None };
+                    let bits = if is_bf16 {
+                        hf::u128_to_bf16_bits(*v as u128)
+                    } else {
+                        hf::u128_to_f16_bits(*v as u128)
+                    };
+                    return Some(IrConst::I16(bits as i16));
+                }
+                _ => {}
+            }
+        }
+        return match val {
+            IrConst::F32(f) => Some(IrConst::I16(if is_bf16 {
+                hf::f32_to_bf16_bits(*f) as i16
+            } else {
+                hf::f32_to_f16_bits(*f) as i16
+            })),
+            IrConst::F64(f) => Some(to_half(*f)),
+            IrConst::LongDouble(_, bytes) => {
+                let v = super::long_double::long_double_value_bytes(bytes);
+                f128_to_ctype(&v, dst_ct)
+            }
+            IrConst::Zero => Some(IrConst::I16(0)),
+            IrConst::I8(v) => {
+                let i = if src_ct.is_some_and(CType::is_unsigned) {
+                    i128::from(*v as u8)
+                } else {
+                    i128::from(*v)
+                };
+                Some(IrConst::I16(if is_bf16 {
+                    hf::i128_to_bf16_bits(i) as i16
+                } else {
+                    hf::i128_to_f16_bits(i) as i16
+                }))
+            }
+            IrConst::I16(v) => {
+                let i = if src_ct.is_some_and(CType::is_unsigned) {
+                    i128::from(*v as u16)
+                } else {
+                    i128::from(*v)
+                };
+                Some(IrConst::I16(if is_bf16 {
+                    hf::i128_to_bf16_bits(i) as i16
+                } else {
+                    hf::i128_to_f16_bits(i) as i16
+                }))
+            }
+            IrConst::I32(v) => {
+                let i = if src_ct.is_some_and(CType::is_unsigned) {
+                    i128::from(*v as u32)
+                } else {
+                    i128::from(*v)
+                };
+                Some(IrConst::I16(if is_bf16 {
+                    hf::i128_to_bf16_bits(i) as i16
+                } else {
+                    hf::i128_to_f16_bits(i) as i16
+                }))
+            }
+            IrConst::I64(v) => {
+                if src_ct.is_some_and(CType::is_unsigned) {
+                    let u = u128::from(*v as u64);
+                    Some(IrConst::I16(if is_bf16 {
+                        hf::u128_to_bf16_bits(u) as i16
+                    } else {
+                        hf::u128_to_f16_bits(u) as i16
+                    }))
+                } else {
+                    let i = i128::from(*v);
+                    Some(IrConst::I16(if is_bf16 {
+                        hf::i128_to_bf16_bits(i) as i16
+                    } else {
+                        hf::i128_to_f16_bits(i) as i16
+                    }))
+                }
+            }
+            _ => None,
+        };
+    }
+
+    let sct = src_ct?;
+    if !sct.is_half_float() {
+        return None;
+    }
+    let bits = half_bits_of(val)?;
+    let f64_val = if *sct == CType::BFloat16 {
+        hf::bf16_bits_to_f64(bits)
+    } else {
+        hf::f16_bits_to_f64(bits)
+    };
+    let bytes = super::long_double::f64_to_f128_bytes_lossless(f64_val);
+    f128_to_ctype(&bytes, dst_ct)
+}
+
+/// Constant-fold a binary operation whose common real type is `_Float16` or
+/// `__bf16` (or a comparison/logical operation with a half-float operand and
+/// no wider floating operand).
+pub fn fold_half_binop(
+    op: &BinOp,
+    lv: &IrConst,
+    l_ct: Option<&CType>,
+    rv: &IrConst,
+    r_ct: Option<&CType>,
+) -> Option<IrConst> {
+    use super::half_float as hf;
+    let lct = l_ct?;
+    let rct = r_ct?;
+    if !lct.is_arithmetic() || !rct.is_arithmetic() || lct.is_complex() || rct.is_complex() {
+        return None;
+    }
+    let common = CType::usual_arithmetic_conversion(lct, rct);
+    if !common.is_half_float() {
+        return None;
+    }
+    let is_bf16 = common == CType::BFloat16;
+    let lb = half_bits_of(&cast_half_const(lv, Some(lct), &common)?)?;
+    let rb = half_bits_of(&cast_half_const(rv, Some(rct), &common)?)?;
+    let lf = if is_bf16 {
+        hf::bf16_bits_to_f32(lb)
+    } else {
+        hf::f16_bits_to_f32(lb)
+    };
+    let rf = if is_bf16 {
+        hf::bf16_bits_to_f32(rb)
+    } else {
+        hf::f16_bits_to_f32(rb)
+    };
+    let pack = |res: f32| -> IrConst {
+        let b = if is_bf16 {
+            hf::f32_to_bf16_bits(res)
+        } else {
+            hf::f32_to_f16_bits(res)
+        };
+        IrConst::I16(b as i16)
+    };
+    let truth = |b: bool| IrConst::I64(i64::from(b));
+    Some(match op {
+        BinOp::Add => pack(lf + rf),
+        BinOp::Sub => pack(lf - rf),
+        BinOp::Mul => pack(lf * rf),
+        BinOp::Div => pack(lf / rf),
+        BinOp::Lt => truth(lf < rf),
+        BinOp::Le => truth(lf <= rf),
+        BinOp::Gt => truth(lf > rf),
+        BinOp::Ge => truth(lf >= rf),
+        BinOp::Eq => truth(lf == rf),
+        BinOp::Ne => truth(lf != rf),
+        BinOp::LogicalAnd => truth((lb & 0x7fff != 0) && (rb & 0x7fff != 0)),
+        BinOp::LogicalOr => truth((lb & 0x7fff != 0) || (rb & 0x7fff != 0)),
         _ => return None,
     })
 }

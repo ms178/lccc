@@ -40,6 +40,7 @@ pub fn link_builtin(
 ) -> Result<(), String> {
     // Parse user arguments using shared infrastructure
     let parsed_args = linker_common::parse_linker_args(user_args);
+    let trace = parsed_args.trace_files;
     let rpath = linker_common::rpath_dyn_entry(&parsed_args);
     let is_static = parsed_args.is_static;
     let defsym_defs = parsed_args.defsym_defs;
@@ -110,6 +111,15 @@ pub fn link_builtin(
             &mut shared_lib_syms,
             &mut actual_needed_libs,
         );
+    }
+
+    if trace {
+        for (name, _) in &input_objs {
+            println!("{name}");
+        }
+        for lib in &actual_needed_libs {
+            println!("{lib}");
+        }
     }
 
     // Treat symbols available from shared libs as "defined" for archive resolution

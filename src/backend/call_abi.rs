@@ -1238,12 +1238,15 @@ pub fn classify_call_args(
             } else {
                 None
             };
+            let raw_f128_sse = struct_arg_is_f128_sse.get(i).copied().unwrap_or(false);
+            let is_half_fp = arg_ty == Some(IrType::U16) && raw_f128_sse;
             ArgInfo {
-                is_float: if let Some(ty) = arg_ty {
-                    ty.is_float()
-                } else {
-                    matches!(arg, Operand::Const(IrConst::F32(_) | IrConst::F64(_)))
-                },
+                is_float: is_half_fp
+                    || if let Some(ty) = arg_ty {
+                        ty.is_float()
+                    } else {
+                        matches!(arg, Operand::Const(IrConst::F32(_) | IrConst::F64(_)))
+                    },
                 is_i128: arg_ty.map(is_i128_type).unwrap_or(false),
                 is_long_double: arg_ty.map(|t| t.is_long_double()).unwrap_or(false),
                 struct_size: struct_arg_sizes.get(i).copied().flatten(),
@@ -1253,7 +1256,7 @@ pub fn classify_call_args(
                     .map(|v| v.as_slice())
                     .unwrap_or(&[]),
                 riscv_float_class: struct_arg_riscv_float_classes.get(i).copied().flatten(),
-                is_f128_sse: struct_arg_is_f128_sse.get(i).copied().unwrap_or(false),
+                is_f128_sse: !is_half_fp && raw_f128_sse,
                 is_i64_pair: arg_ty
                     .map(|t| matches!(t, IrType::I64 | IrType::U64))
                     .unwrap_or(false),
@@ -1381,6 +1384,21 @@ pub fn classify_params_full(func: &IrFunction, config: &CallAbiConfig) -> ParamC
     )
 }
 
+fn param_to_arg_info(param: &crate::ir::module::IrParam) -> ArgInfo<'_> {
+    let is_half_fp = param.ty == IrType::U16 && param.is_f128_sse;
+    ArgInfo {
+        is_float: param.ty.is_float() || is_half_fp,
+        is_i128: is_i128_type(param.ty),
+        is_long_double: param.ty.is_long_double(),
+        struct_size: param.struct_size,
+        struct_align: param.struct_align,
+        eightbyte_classes: &param.struct_eightbyte_classes,
+        riscv_float_class: param.riscv_float_class,
+        is_f128_sse: !is_half_fp && param.is_f128_sse,
+        is_i64_pair: matches!(param.ty, IrType::I64 | IrType::U64),
+    }
+}
+
 /// `classify_params_full` over an explicit parameter list.
 fn classify_param_slice(
     func_name: &str,
@@ -1389,21 +1407,7 @@ fn classify_param_slice(
     is_variadic: bool,
     config: &CallAbiConfig,
 ) -> ParamClassification {
-    // Build ArgInfo slice from function parameters.
-    let arg_infos: Vec<ArgInfo<'_>> = params
-        .iter()
-        .map(|param| ArgInfo {
-            is_float: param.ty.is_float(),
-            is_i128: is_i128_type(param.ty),
-            is_long_double: param.ty.is_long_double(),
-            struct_size: param.struct_size,
-            struct_align: param.struct_align,
-            eightbyte_classes: &param.struct_eightbyte_classes,
-            riscv_float_class: param.riscv_float_class,
-            is_f128_sse: param.is_f128_sse,
-            is_i64_pair: matches!(param.ty, IrType::I64 | IrType::U64),
-        })
-        .collect();
+    let arg_infos: Vec<ArgInfo<'_>> = params.iter().map(param_to_arg_info).collect();
 
     // Pass is_variadic=true here because the callee side encodes variadic behavior
     // directly in config.variadic_floats_in_gp (set by the caller based on is_variadic).
@@ -1632,7 +1636,9 @@ fn classify_param_slice(
             }
             CoreArgClass::Stack => {
                 let off = stack_offset;
-                let is_float = param_ty.map(|t| t.is_float()).unwrap_or(false);
+                let is_float = params
+                    .get(i)
+                    .is_some_and(|p| p.ty.is_float() || (p.ty == IrType::U16 && p.is_f128_sse));
                 if is_float {
                     // Float that overflowed FP registers
                     if slot_size == 4 {

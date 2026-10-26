@@ -597,10 +597,28 @@ def case_options_and_tags(e):
         if r.stdout != b"42\n":
             raise Fail(f"--export-dynamic: {r.stdout!r} {r.stderr.decode()[:200]!r}")
 
+    # PIE and -z max-page-size: both land in the image and run identically to GNU ld.
+    for sub, lccc in (("ref", False), ("new", True)):
+        _ok(e.gcc("-pie", "-fPIE", "rm.c", "-Llib", "-lrl", "-Wl,-rpath,$ORIGIN/lib",
+                  "-o", f"pie_{sub}", lccc=lccc), f"{sub} -pie link")
+    pie_new = Elf32(e.path("pie_new"))
+    if pie_new.e_type != 3 or not (pie_new.flags_1() & 0x08000000) or pie_new.phdr(3) is None:
+        raise Fail(f"-pie: expected ET_DYN + DF_1_PIE + PT_INTERP, got e_type={pie_new.e_type} "
+                   f"flags_1={pie_new.flags_1():#x}")
+    _expect_same_runs(e, e.path("pie_ref"), e.path("pie_new"), None, None, "-pie")
+
+    _ok(e.gcc("-no-pie", "rm.c", "-Llib", "-lrl", "-Wl,-rpath,$ORIGIN/lib",
+              "-Wl,-z,max-page-size=0x200000", "-o", "mps_new"), "-z max-page-size=0x200000 link")
+    mps_loads = [p for p in Elf32(e.path("mps_new")).phdrs if p[0] == PT_LOAD]
+    if not mps_loads or any(p[7] != 0x200000 for p in mps_loads):
+        raise Fail(f"-z max-page-size=0x200000: PT_LOAD alignments {[hex(p[7]) for p in mps_loads]}")
+    _expect_same_runs(e, e.path("rp_ref"), e.path("mps_new"), None, None, "-z max-page-size=0x200000")
+
     # Refusals must be diagnostics, never silently different output.
-    for flags, needle in ((["-pie", "-fPIE"], "-pie"),
+    for flags, needle in ((["-static-pie", "-fPIE"], "static-pie"),
                           (["-no-pie", "-Wl,-z,nocopyreloc"], "nocopyreloc"),
-                          (["-no-pie", "-Wl,-z,max-page-size=0x200000"], "max-page-size")):
+                          (["-no-pie", "-Wl,-z,max-page-size=0x3000"], "page size"),
+                          (["-no-pie", "-Wl,--emit-relocs"], "--emit-relocs")):
         r = e.gcc(*flags, "rm.c", "-Llib", "-lrl", "-o", "refused")
         err = r.stderr.decode()
         if r.returncode == 0 or needle not in err:

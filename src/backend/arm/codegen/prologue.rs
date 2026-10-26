@@ -28,9 +28,11 @@ fn conditional_increment_leaf_plan(
     if func.blocks.len() != 1
         || func.is_variadic
         || func.uses_sret
+        || func.ret_is_f128_sse
         || func.params.len() > 8
         || func.params.iter().any(|param| {
             param.struct_size.is_some()
+                || param.is_f128_sse
                 || param.ty.is_float()
                 || param.ty.is_long_double()
                 || param.ty.is_128bit()
@@ -751,7 +753,11 @@ impl ArmCodegen {
                 self.store_x0_to(dest);
             }
             ParamClass::FloatReg { reg_idx } => {
-                if ty == IrType::F32 {
+                if ty == IrType::U16 {
+                    self.state
+                        .emit_fmt(format_args!("    fmov w0, s{}", reg_idx));
+                    self.state.emit("    and w0, w0, #0xffff");
+                } else if ty == IrType::F32 {
                     self.state
                         .emit_fmt(format_args!("    fmov w0, s{}", reg_idx));
                 } else {

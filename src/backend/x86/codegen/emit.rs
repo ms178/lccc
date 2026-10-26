@@ -7117,6 +7117,7 @@ impl X86Codegen {
         // one-XMM / x87 result has its own staging; those stay on the mature
         // path, which honours `ret_eightbyte_classes`.
         if info.ret_is_f128_sse
+            || info.struct_arg_is_f128_sse.iter().any(|&b| b)
             || info
                 .ret_eightbyte_classes
                 .iter()

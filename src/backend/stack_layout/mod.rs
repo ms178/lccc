@@ -381,6 +381,7 @@ pub fn calculate_stack_space_common(
 
     // Phase 2: Classify all instructions into the three tiers.
     let mut non_local_space = initial_offset;
+    slot_assignment::place_stack_guard_early(state, func, &assign_slot, &mut non_local_space);
     let mut deferred_slots: Vec<DeferredSlot> = Vec::new();
     let mut multi_block_values: Vec<MultiBlockValue> = Vec::new();
     let mut block_local_values: Vec<BlockLocalValue> = Vec::new();
@@ -460,6 +461,8 @@ pub fn calculate_stack_space_common(
         max_block_local_space,
         &assign_slot,
     );
+    let total_space =
+        slot_assignment::place_stack_guard_late(state, func, &assign_slot, total_space);
 
     // Phase 6: Resolve copy aliases (propagate slots from root to aliased values).
     // Uses liveness information to avoid sharing slots between values with
@@ -623,40 +626,38 @@ pub fn calculate_stack_space_common(
         state.frame_offset_aliases.extend(aliases);
     }
 
-    // Diagnostic: dump the full value→slot map (and the vector/defer sets) so
-    // slot aliasing miscompiles can be root-caused from the layout alone.
-    // Usage: CCC_DEBUG_SLOTS=1 lccc -O2 -c file.c
-    if std::env::var("CCC_DEBUG_SLOTS").is_ok() {
-        eprintln!("[SLOTS] fn={} total_space={}", func.name, total_space);
-        let mut ids: Vec<u32> = state.value_locations.keys().copied().collect();
-        ids.sort_unstable();
-        for id in ids {
-            let slot = state.value_locations[&id].0;
-            let tags: Vec<&str> = {
-                let mut t = Vec::new();
-                if state.vector_values.contains(&id) {
-                    t.push(if state.vector128_values.contains(&id) {
-                        "v128"
-                    } else {
-                        "v256"
-                    });
-                }
-                if state.protected_slot_values.contains(&id) {
-                    t.push("prot");
-                }
-                if state.vector_defer_values.contains(&id) {
-                    t.push("defer");
-                }
-                if state.alloca_values.contains(&id) {
-                    t.push("alloca");
-                }
-                t
-            };
-            eprintln!("[SLOTS]   v{:<5} slot={:<5} {}", id, slot, tags.join(","));
-        }
-    }
-
+    dump_debug_slots(state, func, total_space);
     total_space
+}
+
+fn dump_debug_slots(state: &super::state::CodegenState, func: &IrFunction, total_space: i64) {
+    if std::env::var("CCC_DEBUG_SLOTS").is_err() {
+        return;
+    }
+    eprintln!("[SLOTS] fn={} total_space={}", func.name, total_space);
+    let mut ids: Vec<u32> = state.value_locations.keys().copied().collect();
+    ids.sort_unstable();
+    for id in ids {
+        let slot = state.value_locations[&id].0;
+        let mut t = Vec::new();
+        if state.vector_values.contains(&id) {
+            t.push(if state.vector128_values.contains(&id) {
+                "v128"
+            } else {
+                "v256"
+            });
+        }
+        if state.protected_slot_values.contains(&id) {
+            t.push("prot");
+        }
+        if state.vector_defer_values.contains(&id) {
+            t.push("defer");
+        }
+        if state.alloca_values.contains(&id) {
+            t.push("alloca");
+        }
+        eprintln!("[SLOTS]   v{:<5} slot={:<5} {}", id, slot, t.join(","));
+    }
 }
 
 // ── Phase 1: Build analysis context ───────────────────────────────────────

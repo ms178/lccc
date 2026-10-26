@@ -57,11 +57,12 @@ pub(super) fn preemptible_tls_names(
     export_dynamic: bool,
     dso_names: &crate::common::fx_hash::FxHashSet<String>,
     version_script_path: Option<&str>,
+    dynamic_list: Option<&linker_common::DynamicList>,
 ) -> crate::common::fx_hash::FxHashSet<String> {
     if !is_pie || is_static {
         return crate::common::fx_hash::FxHashSet::default();
     }
-    ExecExports::new(export_dynamic, dso_names, version_script_path)
+    ExecExports::new(export_dynamic, dso_names, version_script_path, dynamic_list)
         .map(|exports| {
             globals
                 .iter()
@@ -86,6 +87,7 @@ pub(super) struct ExecExports<'a> {
     export_dynamic: bool,
     dso_names: &'a crate::common::fx_hash::FxHashSet<String>,
     version_script: Option<linker_common::VersionScript>,
+    dynamic_list: Option<&'a linker_common::DynamicList>,
 }
 
 impl<'a> ExecExports<'a> {
@@ -94,17 +96,21 @@ impl<'a> ExecExports<'a> {
         export_dynamic: bool,
         dso_names: &'a crate::common::fx_hash::FxHashSet<String>,
         version_script_path: Option<&str>,
+        dynamic_list: Option<&'a linker_common::DynamicList>,
     ) -> Option<Self> {
-        (export_dynamic || !dso_names.is_empty()).then(|| Self {
+        (export_dynamic || !dso_names.is_empty() || dynamic_list.is_some()).then(|| Self {
             export_dynamic,
             dso_names,
             version_script: version_script_path.and_then(linker_common::VersionScript::parse),
+            dynamic_list,
         })
     }
 
     pub(super) fn exports(&self, name: &str, g: &GlobalSymbol) -> bool {
         linker_common::is_exported_dynamic_symbol(g)
-            && (self.export_dynamic || self.dso_names.contains(dynsym_emit_name(name)))
+            && (self.export_dynamic
+                || self.dso_names.contains(dynsym_emit_name(name))
+                || self.dynamic_list.is_some_and(|dl| dl.matches(name)))
             && !self
                 .version_script
                 .as_ref()
@@ -192,7 +198,9 @@ pub(super) fn emit_executable(
     // Global TLS definitions this PIE exports (see
     // `preemptible_tls_names`): they keep the dynamic TLS model.
     preemptible_tls: &crate::common::fx_hash::FxHashSet<String>,
+    layout_opts: &super::types::EmitLayoutOpts,
 ) -> Result<(), String> {
+    let page_size = layout_opts.page_size.max(PAGE_SIZE);
     let ld_time = std::env::var("LCCC_LD_TIME").is_ok();
     // Without DF_1_PIE an ET_DYN is treated as a shared object: ld.so would
     // let the global scope interpose its symbols and would not apply the
@@ -284,7 +292,12 @@ pub(super) fn emit_executable(
     }
 
     // Exported definitions (see `ExecExports`).
-    if let Some(exports) = ExecExports::new(export_dynamic, dso_names, version_script_path) {
+    if let Some(exports) = ExecExports::new(
+        export_dynamic,
+        dso_names,
+        version_script_path,
+        layout_opts.dynamic_list.as_ref(),
+    ) {
         let mut exported: Vec<String> = globals
             .iter()
             .filter(|(name, g)| exports.exports(name, g))
@@ -868,8 +881,10 @@ pub(super) fn emit_executable(
     // from whatever base the kernel picks, and R_X86_64_RELATIVE tells ld.so
     // which stored values need that base added.  A non-PIE keeps the
     // traditional fixed base.
-    let base_addr = if is_pie { 0 } else { BASE_ADDR };
-    let mut packer = super::layout_plan::SegmentPacker::new(base_addr, PAGE_SIZE);
+    let base_addr = layout_opts
+        .image_base
+        .unwrap_or(if is_pie { 0 } else { BASE_ADDR });
+    let mut packer = super::layout_plan::SegmentPacker::new(base_addr, page_size);
     macro_rules! vaddr {
         ($off:expr_2021) => {
             packer.vaddr($off)
@@ -1947,7 +1962,7 @@ pub(super) fn emit_executable(
     }
     let ro_seg_end = rela_plt_offset + rela_plt_size;
     wphdr(
-        &mut out, ph, PT_LOAD, PF_R, 0, base_addr, ro_seg_end, ro_seg_end, PAGE_SIZE,
+        &mut out, ph, PT_LOAD, PF_R, 0, base_addr, ro_seg_end, ro_seg_end, page_size,
     );
     ph += 56;
     wphdr(
@@ -1959,7 +1974,7 @@ pub(super) fn emit_executable(
         text_page_addr,
         text_total_size,
         text_total_size,
-        PAGE_SIZE,
+        page_size,
     );
     ph += 56;
     wphdr(
@@ -1971,7 +1986,7 @@ pub(super) fn emit_executable(
         rodata_page_addr,
         rodata_total_size,
         rodata_total_size,
-        PAGE_SIZE,
+        page_size,
     );
     ph += 56;
     if has_relro {
@@ -1987,7 +2002,7 @@ pub(super) fn emit_executable(
             rw_page_addr,
             relro_file_end - rw_page_offset,
             relro_size,
-            PAGE_SIZE,
+            page_size,
         );
         ph += 56;
         if split_relro_load {
@@ -2009,7 +2024,7 @@ pub(super) fn emit_executable(
                 rw2_addr,
                 rw2_filesz,
                 rw2_memsz,
-                PAGE_SIZE,
+                page_size,
             );
             ph += 56;
         }
@@ -2029,7 +2044,7 @@ pub(super) fn emit_executable(
             rw_page_addr,
             rw_filesz,
             rw_memsz,
-            PAGE_SIZE,
+            page_size,
         );
         ph += 56;
     }
@@ -4238,7 +4253,11 @@ pub(super) fn emit_executable(
         .iter()
         .find(|s| s.name == ".note.gnu.build-id" && s.mem_size > 0)
         .map(|s| s.file_offset);
-    linker_common::build_id::patch_output_build_id(&mut out, build_id_offset);
+    linker_common::build_id::patch_output_build_id_styled(
+        &mut out,
+        build_id_offset,
+        &layout_opts.build_id_style,
+    );
 
     std::fs::write(output_path, &out)
         .map_err(|e| format!("failed to write '{}': {}", output_path, e))?;

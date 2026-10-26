@@ -19,16 +19,6 @@ pub(super) const CONTRACTS: &[Contract] = &[
         rationale: "Changing the aggregate return ABI is not implemented.",
     },
     Contract {
-        spelling: "-fno-stack-protector",
-        class: Class::BenignNoop,
-        rationale: "No stack canaries are emitted.",
-    },
-    Contract {
-        spelling: "-fno-stack-clash-protection",
-        class: Class::BenignNoop,
-        rationale: "No stack probing instrumentation is emitted.",
-    },
-    Contract {
         spelling: "-fno-lto",
         class: Class::BenignNoop,
         rationale: "Objects contain native code, not LTO IR.",
@@ -42,11 +32,6 @@ pub(super) const CONTRACTS: &[Contract] = &[
         spelling: "-fno-strict-aliasing",
         class: Class::BenignNoop,
         rationale: "Alias analysis does not use type-based alias exclusions.",
-    },
-    Contract {
-        spelling: "-fstack-clash-protection",
-        class: Class::Refused,
-        rationale: "Stack probing is not implemented.",
     },
     Contract {
         spelling: "-fsemantic-interposition",
@@ -72,11 +57,6 @@ pub(super) const CONTRACTS: &[Contract] = &[
         spelling: "-fsplit-stack",
         class: Class::Refused,
         rationale: "Split-stack instrumentation is not implemented.",
-    },
-    Contract {
-        spelling: "-fwhole-program",
-        class: Class::Refused,
-        rationale: "Whole-program module merging is not implemented.",
     },
 ];
 

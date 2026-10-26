@@ -254,6 +254,10 @@ impl Parser {
         def_attrs.set_pure(self.attrs.parsing_pure());
         def_attrs.set_const_attr(self.attrs.parsing_const_attr());
         def_attrs.set_cold(self.attrs.parsing_cold());
+        def_attrs.set_stack_protect(self.attrs.parsing_stack_protect);
+        def_attrs.set_no_stack_protector(self.attrs.parsing_no_stack_protector);
+        self.attrs.parsing_stack_protect = false;
+        self.attrs.parsing_no_stack_protector = false;
         def_attrs.set_error_attr(self.attrs.parsing_error_attr());
         def_attrs.alias_target = self.attrs.parsing_alias_target.take();
         def_attrs.ifunc_target = self.attrs.parsing_ifunc_target.take();
@@ -264,6 +268,10 @@ impl Parser {
         def_attrs.target = self.attrs.parsing_target.take();
         def_attrs.diagnose_as = self.attrs.parsing_diagnose_as.take();
         def_attrs.cleanup_fn = self.attrs.parsing_cleanup_fn.take();
+        def_attrs.externally_visible = self.attrs.parsing_externally_visible;
+        self.attrs.parsing_externally_visible = false;
+        def_attrs.zero_call_used_regs = self.attrs.parsing_zero_call_used_regs.take();
+        def_attrs.no_sanitize = self.attrs.parsing_no_sanitize.take();
 
         // Shadow typedef names used as parameter names (same as file scope).
         let mut shadowed_added: Vec<String> = Vec::new();

@@ -101,6 +101,16 @@ pub struct Driver {
     pub(super) wrap_signed_overflow: bool,
     /// -ftrapv emits runtime traps on signed integer overflow.
     pub(super) trapv: bool,
+    /// -fwhole-program internalizes non-root symbols and merges multi-TU C builds.
+    pub(super) whole_program: bool,
+    /// -fzero-call-used-regs=<mode> caller-saved register zeroing policy.
+    pub(super) zero_call_used_regs: crate::backend::zero_call_used_regs::ZeroCallUsedRegs,
+    /// Enabled UBSan checks from -fsanitize= / -fno-sanitize=.
+    pub(super) sanitize_enabled: crate::ir::lowering::ubsan::UbsanFlags,
+    /// Last enabling `-fsanitize=...` CLI token for untrapped diagnostics.
+    pub(super) last_sanitize_arg: Option<String>,
+    /// Trap-mode UBSan mask from -fsanitize-trap= / -fsanitize-undefined-trap-on-error.
+    pub(super) sanitize_trap: crate::ir::lowering::ubsan::UbsanFlags,
     /// -fno-plt emits GOT-indirect external function calls instead of PLT stubs.
     pub(super) no_plt: bool,
     /// -fvisibility={default,hidden,internal,protected} default visibility for TU definitions.
@@ -194,6 +204,14 @@ pub struct Driver {
     /// GCC __CET__ macro value derived from -fcf-protection
     /// (None = flag absent or =none; "1" branch, "2" return, "3" full).
     pub(super) cf_protection_value: Option<&'static str>,
+    /// `-fstack-clash-protection`: probe 4096-byte pages of static/dynamic frames.
+    pub(super) stack_clash_protection: bool,
+    /// `-fstack-protector{,-strong,-all,-explicit}` mode.
+    pub(super) stack_protector_mode: crate::backend::stack_protector::StackProtectorMode,
+    /// `--param=ssp-buffer-size=N` threshold for `-fstack-protector` (default 8).
+    pub(super) ssp_buffer_size: usize,
+    /// `-mstack-protector-guard*` configuration.
+    pub(super) stack_protector_guard: crate::backend::stack_protector::StackProtectorGuard,
     /// Whether SSE is disabled (-mno-sse). When true, the compiler must not emit
     /// any SSE/SSE2/AVX instructions (movdqu, movss, movsd, etc.).
     /// The Linux kernel uses -mno-sse to avoid FPU state in kernel code.
@@ -580,6 +598,11 @@ impl Driver {
             fast_math: false,
             wrap_signed_overflow: false,
             trapv: false,
+            whole_program: false,
+            zero_call_used_regs: crate::backend::zero_call_used_regs::ZeroCallUsedRegs::Skip,
+            sanitize_enabled: crate::ir::lowering::ubsan::UbsanFlags::NONE,
+            last_sanitize_arg: None,
+            sanitize_trap: crate::ir::lowering::ubsan::UbsanFlags::NONE,
             no_plt: false,
             default_visibility: None,
             trivial_auto_var_init: crate::ir::lowering::trapv::TrivialAutoVarInit::Uninitialized,
@@ -619,6 +642,10 @@ impl Driver {
             instrument_functions: false,
             cf_protection_branch: false,
             cf_protection_value: None,
+            stack_clash_protection: false,
+            stack_protector_mode: crate::backend::stack_protector::StackProtectorMode::None,
+            ssp_buffer_size: 8,
+            stack_protector_guard: crate::backend::stack_protector::StackProtectorGuard::default(),
             no_sse: false,
             no_sse2: false,
             sse2_explicitly_disabled: false,
@@ -1464,6 +1491,9 @@ impl Driver {
         let mut temp_guards: Vec<TempFile> = Vec::new();
 
         let mut extra_passthrough: Vec<String> = Vec::new();
+        let mut whole_program_c_files: Vec<&str> = Vec::new();
+        let can_merge_whole_program =
+            self.whole_program && !self.relocatable && !self.debug_info && !self.code16gcc;
 
         for input_file in &self.input_files {
             if Self::is_object_or_archive(input_file) {
@@ -1503,6 +1533,10 @@ impl Driver {
                     temp_guards.push(tmp);
                     continue;
                 }
+                if can_merge_whole_program {
+                    whole_program_c_files.push(input_file.as_str());
+                    continue;
+                }
                 // Compile .c files to .o (handles .code16gcc prepend via internal codegen)
                 let asm = self.compile_to_assembly(input_file)?;
 
@@ -1521,6 +1555,26 @@ impl Driver {
                 self.write_dep_file(input_file, &self.output_path, &self.output_path)?;
                 temp_guards.push(tmp);
             }
+        }
+
+        if !whole_program_c_files.is_empty() {
+            let asm = if whole_program_c_files.len() == 1 {
+                let single = whole_program_c_files[0];
+                let asm = self.compile_to_assembly(single)?;
+                self.write_dep_file(single, &self.output_path, &self.output_path)?;
+                asm
+            } else {
+                self.compile_whole_program_c_files(&whole_program_c_files)?
+            };
+            let stem = Self::input_stem(whole_program_c_files[0]);
+            let tmp = TempFile::try_new("ccc", stem, "o").map_err(|error| error.to_string())?;
+            let extra = self.build_asm_extra_args();
+            self.target.assemble_with_extra(
+                &asm,
+                tmp.to_str().map_err(|error| error.to_string())?,
+                &extra,
+            )?;
+            temp_guards.push(tmp);
         }
 
         // Compiled temp objects go first (order relative to linker flags doesn't matter
@@ -1690,6 +1744,7 @@ impl Driver {
         preprocessor.set_pic(self.pic || self.pie || self.shared_lib);
         // __CET__ mirrors -fcf-protection exactly (GCC never predefines it).
         preprocessor.set_cet(self.cf_protection_value);
+        preprocessor.set_ssp(self.stack_protector_mode.predefined_macro());
         preprocessor.set_pie(self.pie && !self.pic && !self.shared_lib);
         // Set SSE/SSE2/MMX predefined macros for x86 targets.
         // GCC/Clang always define __SSE__, __SSE2__, __MMX__ for x86_64 (baseline ISA).
@@ -1918,7 +1973,36 @@ impl Driver {
 
     // ---- Core compilation pipeline ----
 
-    fn compile_to_assembly(&self, input_file: &str) -> Result<String, String> {
+    pub(super) fn effective_ubsan_trap(&self) -> crate::ir::lowering::ubsan::UbsanFlags {
+        self.sanitize_enabled.intersection(self.sanitize_trap)
+    }
+
+    pub(super) fn effective_wrap_signed_overflow(&self) -> bool {
+        use crate::ir::lowering::ubsan::UbsanFlags;
+        self.wrap_signed_overflow
+            || self.trapv
+            || !self
+                .effective_ubsan_trap()
+                .intersection(UbsanFlags::SIGNED_OVERFLOW.union(UbsanFlags::SHIFT_BASE))
+                .is_empty()
+    }
+
+    pub(super) fn resolved_zero_call_used_regs_fp_simd(&self) -> bool {
+        match self.target {
+            Target::X86_64 => !self.no_sse && !self.general_regs_only,
+            Target::I686 => self.resolved_i686_sse() && !self.general_regs_only,
+            Target::Aarch64 => !self.general_regs_only,
+            Target::Riscv64 => self.riscv_abi.as_deref() != Some("lp64") && !self.general_regs_only,
+        }
+    }
+
+    fn init_compilation_session(
+        &self,
+    ) -> (
+        std::sync::Arc<crate::backend::regalloc::RaConfig>,
+        crate::backend::x86::cpu_model::X86Tune,
+        bool,
+    ) {
         // Capture RA/codegen bisection policy once, before this compilation
         // reaches any function-level backend path.  The Arc is threaded via
         // CodegenOptions rather than re-reading process environment there.
@@ -1950,9 +2034,71 @@ impl Driver {
         if self.verbose {
             eprintln!("lccc: note: x86 tuning row '{}'", tune.name);
         }
-        let source = Self::read_source(input_file)?;
-
         let time_phases = std::env::var("CCC_TIME_PHASES").is_ok();
+        (ra_config, tune, time_phases)
+    }
+
+    fn compile_to_assembly(&self, input_file: &str) -> Result<String, String> {
+        let (ra_config, tune, time_phases) = self.init_compilation_session();
+        let t0 = std::time::Instant::now();
+        let (mut module, source_manager, fp_environment_observable) =
+            self.lower_c_tu_to_ir(input_file, time_phases)?;
+        if self.whole_program && !self.relocatable {
+            crate::ir::whole_program::internalize_module(&mut module, false);
+        }
+        self.compile_ir_module_to_assembly(
+            module,
+            source_manager.as_deref(),
+            input_file,
+            fp_environment_observable,
+            ra_config,
+            tune,
+            time_phases,
+            t0,
+        )
+    }
+
+    fn compile_whole_program_c_files(&self, input_files: &[&str]) -> Result<String, String> {
+        let (ra_config, tune, time_phases) = self.init_compilation_session();
+        let t0 = std::time::Instant::now();
+        let mut modules = Vec::with_capacity(input_files.len());
+        let mut any_fp_observable = false;
+        for &input_file in input_files {
+            let (module, _sm, fp_obs) = self.lower_c_tu_to_ir(input_file, time_phases)?;
+            any_fp_observable |= fp_obs;
+            self.write_dep_file(input_file, &self.output_path, &self.output_path)?;
+            modules.push(module);
+        }
+        let mut merged = crate::ir::whole_program::merge_modules(modules)?;
+        crate::ir::whole_program::internalize_module(&mut merged, false);
+        self.compile_ir_module_to_assembly(
+            merged,
+            None,
+            input_files[0],
+            any_fp_observable,
+            ra_config,
+            tune,
+            time_phases,
+            t0,
+        )
+    }
+
+    fn parse_and_analyze_c_tu(
+        &self,
+        input_file: &str,
+        time_phases: bool,
+    ) -> Result<
+        (
+            crate::frontend::parser::ast::TranslationUnit,
+            crate::frontend::sema::analysis::SemaResult,
+            DiagnosticEngine,
+            Vec<(String, Option<String>)>,
+            Vec<(String, String)>,
+            bool,
+        ),
+        String,
+    > {
+        let source = Self::read_source(input_file)?;
         let t0 = std::time::Instant::now();
 
         // Preprocess
@@ -2099,6 +2245,37 @@ impl Driver {
             eprintln!("{} warning(s) generated", diagnostics.warning_count());
         }
 
+        Ok((
+            ast,
+            sema_result,
+            diagnostics,
+            preprocessor.weak_pragmas,
+            preprocessor.redefine_extname_pragmas,
+            fp_environment_observable,
+        ))
+    }
+
+    fn lower_c_tu_to_ir(
+        &self,
+        input_file: &str,
+        time_phases: bool,
+    ) -> Result<
+        (
+            crate::ir::module::IrModule,
+            Option<std::rc::Rc<SourceManager>>,
+            bool,
+        ),
+        String,
+    > {
+        let (
+            ast,
+            sema_result,
+            diagnostics,
+            weak_pragmas,
+            redefine_extname_pragmas,
+            fp_environment_observable,
+        ) = self.parse_and_analyze_c_tu(input_file, time_phases)?;
+
         // Lower to IR (target-aware for ABI-specific lowering decisions)
         // Pass sema's TypeContext, function signatures, and expression type annotations
         // to the lowerer so it has pre-populated type info upfront.
@@ -2145,10 +2322,12 @@ impl Driver {
             self.gnu89_inline,
         )
         .with_pass_policy(crate::common::pass_policy::PassPolicy::new(
-            self.wrap_signed_overflow || self.trapv,
+            self.effective_wrap_signed_overflow(),
             fp_environment_observable,
         ))
+        .with_wrapv(self.wrap_signed_overflow)
         .with_trapv(self.trapv)
+        .with_ubsan_trap(self.effective_ubsan_trap())
         .with_trivial_auto_var_init(self.trivial_auto_var_init)
         .with_default_visibility(self.default_visibility.clone())
         .with_builtin_policy(self.builtin_policy.clone())
@@ -2165,7 +2344,7 @@ impl Driver {
         let source_manager = diagnostics.take_source_manager();
 
         // Apply #pragma weak directives from the preprocessor.
-        for (symbol, target) in &preprocessor.weak_pragmas {
+        for (symbol, target) in &weak_pragmas {
             if let Some(alias_target) = target {
                 // #pragma weak symbol = alias -> create weak alias
                 module
@@ -2181,7 +2360,7 @@ impl Driver {
         // TODO: This uses .set aliases which works when both symbols are defined
         // locally, but a proper implementation would rename symbol references
         // during lowering/codegen for the case where new_name is external.
-        for (old_name, new_name) in &preprocessor.redefine_extname_pragmas {
+        for (old_name, new_name) in &redefine_extname_pragmas {
             module
                 .aliases
                 .push((old_name.clone(), new_name.clone(), false));
@@ -2234,6 +2413,51 @@ impl Driver {
             eprintln!("Lowered to {} IR functions", module.functions.len());
         }
 
+        Ok((module, source_manager, fp_environment_observable))
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    fn compile_ir_module_to_assembly(
+        &self,
+        module: crate::ir::module::IrModule,
+        source_manager: Option<&SourceManager>,
+        input_file: &str,
+        fp_environment_observable: bool,
+        ra_config: std::sync::Arc<crate::backend::regalloc::RaConfig>,
+        tune: crate::backend::x86::cpu_model::X86Tune,
+        time_phases: bool,
+        t0: std::time::Instant,
+    ) -> Result<String, String> {
+        let (module, pgo_unit) = self.optimize_ir_module(
+            module,
+            input_file,
+            fp_environment_observable,
+            ra_config.as_ref(),
+            time_phases,
+        );
+        let mut module = self.split_and_layout_blocks(module, time_phases);
+        self.renumber_module_labels(&mut module);
+        let module = self.finalize_module_for_codegen(module, &pgo_unit);
+        self.emit_target_assembly(
+            &module,
+            source_manager,
+            input_file,
+            fp_environment_observable,
+            ra_config,
+            tune,
+            time_phases,
+            t0,
+        )
+    }
+
+    fn optimize_ir_module(
+        &self,
+        mut module: crate::ir::module::IrModule,
+        input_file: &str,
+        fp_environment_observable: bool,
+        ra_config: &crate::backend::regalloc::RaConfig,
+        time_phases: bool,
+    ) -> (crate::ir::module::IrModule, String) {
         // PGO use side: load the profile directory (once per process —
         // per-TU lookups are unit-keyed) and activate it for THIS unit before
         // any optimization pass runs, so PGO-guided inlining, loop unrolling
@@ -2342,7 +2566,7 @@ impl Driver {
                 native_popcount: self.resolved_fast_popcount(),
             },
             self.code16gcc,
-            self.wrap_signed_overflow || self.trapv,
+            self.effective_wrap_signed_overflow(),
             fp_environment_observable,
             self.fp_reassoc,
             self.resolved_fp_contract(),
@@ -2377,7 +2601,7 @@ impl Driver {
                 && self.enable_avx512vl
                 && !self.no_sse,
             self.disable_tree_vectorize,
-            ra_config.as_ref(),
+            ra_config,
             // `-fPIC`/`-shared` units keep calls to their own external
             // definitions (semantic interposition, GCC -fPIC default).
             self.pic || self.shared_lib,
@@ -2465,7 +2689,14 @@ impl Driver {
                 floor: self.tls_model_floor,
             },
         ));
+        (module, pgo_unit)
+    }
 
+    fn split_and_layout_blocks(
+        &self,
+        mut module: crate::ir::module::IrModule,
+        time_phases: bool,
+    ) -> crate::ir::module::IrModule {
         // Live range splitting: split call-spanning values, then clean up
         if std::env::var("CCC_NO_SPLIT_RANGES").is_err() {
             let max_splits = std::env::var("CCC_SPLIT_MAX")
@@ -2745,7 +2976,10 @@ impl Driver {
                 }
             }
         }
+        module
+    }
 
+    fn renumber_module_labels(&self, module: &mut crate::ir::module::IrModule) {
         // CRITICAL FIX: Renumber all block labels to ensure global uniqueness across all functions
         // This fixes a bug where optimization passes can create duplicate labels
         {
@@ -2907,17 +3141,23 @@ impl Driver {
                 rewrite_init_labels(&mut global.init, &renumber_map);
             }
         }
+    }
 
+    fn finalize_module_for_codegen(
+        &self,
+        mut module: crate::ir::module::IrModule,
+        pgo_unit: &str,
+    ) -> crate::ir::module::IrModule {
         // PGO is post-optimization and post-label-renumber; profiles are
         // keyed by the PRE-pass fingerprint (stable across gen/use).
         if self.pgo_use.is_some() || std::env::var("LCCC_PGO_USE").is_ok() {
-            crate::pgo::propagate_profile(&mut module, &pgo_unit);
+            crate::pgo::propagate_profile(&mut module, pgo_unit);
         }
         if let Some(ref pgo_dir) = self.pgo_generate {
             crate::pgo::instrument::instrument_module(
                 &mut module,
                 pgo_dir,
-                &pgo_unit,
+                pgo_unit,
                 self.pgo_update.as_deref(),
                 self.target,
                 &crate::pgo::pre_hashes(),
@@ -2927,7 +3167,7 @@ impl Driver {
             crate::pgo::instrument::instrument_module(
                 &mut module,
                 &dir,
-                &pgo_unit,
+                pgo_unit,
                 None,
                 self.target,
                 &crate::pgo::pre_hashes(),
@@ -2935,7 +3175,7 @@ impl Driver {
             );
         }
         if let Some(profile) = crate::pgo::get_pgo_profile() {
-            crate::pgo::layout::layout_module(&mut module, profile, &pgo_unit);
+            crate::pgo::layout::layout_module(&mut module, profile, pgo_unit);
         }
 
         // Hot-loop alignment is decided here: post-optimization,
@@ -3033,7 +3273,28 @@ impl Driver {
         // Unreachable code has no observable semantics — removal is
         // always sound and touches no reachable instruction.
         crate::passes::cfg_simplify::for_each_function_eliminate_unreachable(&mut module);
+        crate::backend::stack_protector::instrument_module(
+            &mut module,
+            self.target,
+            self.stack_protector_mode,
+            self.ssp_buffer_size,
+            &self.stack_protector_guard,
+        );
+        module
+    }
 
+    #[expect(clippy::too_many_arguments)]
+    fn emit_target_assembly(
+        &self,
+        module: &crate::ir::module::IrModule,
+        source_manager: Option<&SourceManager>,
+        input_file: &str,
+        fp_environment_observable: bool,
+        ra_config: std::sync::Arc<crate::backend::regalloc::RaConfig>,
+        tune: crate::backend::x86::cpu_model::X86Tune,
+        time_phases: bool,
+        t0: std::time::Instant,
+    ) -> Result<String, String> {
         // Generate assembly using target-specific codegen
         let t8 = std::time::Instant::now();
         let opts = crate::backend::CodegenOptions {
@@ -3067,6 +3328,10 @@ impl Driver {
                 None
             },
             cf_protection_branch: self.cf_protection_branch,
+            stack_clash_protection: self.stack_clash_protection,
+            stack_protector_guard: (self.stack_protector_mode
+                != crate::backend::stack_protector::StackProtectorMode::None)
+                .then(|| self.stack_protector_guard.resolve(self.target)),
             // GCC/Clang align function entries to 16 bytes at -O1..-O3 and
             // leave them unaligned at -Os/-Oz. Emitted as a real `.p2align` so
             // section alignment keeps following GNU as semantics.
@@ -3124,12 +3389,12 @@ impl Driver {
             // = optimize for size. Codegen uses this to pick the shorter
             // sequence (idiv/imul) over the faster one (magic mul, LEA chains).
             optimize_for_size: self.opt_level >= 4,
+            zero_call_used_regs: self.zero_call_used_regs,
+            zero_call_used_regs_fp_simd: self.resolved_zero_call_used_regs_fp_simd(),
         };
-        let asm = self.target.generate_assembly_with_opts_and_debug(
-            &module,
-            &opts,
-            source_manager.as_deref(),
-        );
+        let asm = self
+            .target
+            .generate_assembly_with_opts_and_debug(module, &opts, source_manager);
         // `-mno-sse` / `-mgeneral-regs-only` (x86-64): the xmm register file
         // is architecturally off-limits — the kernel runs with CR4.OSFXSR
         // clear and every SSE instruction is #UD.  lccc's FP lowering has no

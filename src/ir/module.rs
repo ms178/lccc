@@ -52,6 +52,14 @@ pub struct IrModule {
     /// plain (GCC 16.2; see `record_tls_model_attr`). Consumed only through
     /// `common::tls::model_table`.
     pub tls_model_attrs: crate::common::fx_hash::FxHashMap<String, crate::common::tls::TlsModel>,
+    /// Symbols marked `__attribute__((externally_visible))` on any declaration
+    /// or definition; kept externally visible under `-fwhole-program`.
+    pub externally_visible_symbols: crate::common::fx_hash::FxHashSet<String>,
+    /// Per-function `__attribute__((zero_call_used_regs("...")))` mode overrides.
+    pub zero_call_used_regs_attrs: crate::common::fx_hash::FxHashMap<
+        String,
+        crate::backend::zero_call_used_regs::ZeroCallUsedRegs,
+    >,
 }
 
 /// The ELF TLS access model (one enum for the whole compiler; the policy that
@@ -298,6 +306,36 @@ pub struct IrFunction {
     /// Backends may give these values dedicated FP registers without enabling
     /// broad register allocation for every phi-elimination Copy chain.
     pub loop_promoted_f64_values: Vec<Value>,
+    /// Stack-smashing protection metadata (`-fstack-protector*` + function attrs).
+    pub ssp: SspInfo,
+}
+
+/// Per-function stack-protector attributes and local-variable classification.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SspInfo {
+    /// `__attribute__((stack_protect))` present on declaration or definition.
+    pub stack_protect: bool,
+    /// `__attribute__((no_stack_protector))` or `optimize("no-stack-protector")`.
+    pub no_stack_protector: bool,
+    /// Function declares at least one local array (or aggregate containing an array).
+    pub has_array: bool,
+    /// Largest byte size of any local `char`/`signed char`/`unsigned char` array
+    /// (including char arrays nested inside local structs/unions).
+    pub max_char_array_bytes: u32,
+    /// Dedicated canary `Alloca` inserted by `backend::stack_protector`, placed
+    /// at the highest-address local slot by `calculate_stack_space_common`.
+    pub stack_guard_alloca: Option<Value>,
+}
+
+impl SspInfo {
+    /// Merge local-frame triggers from an inlined callee into its caller.
+    pub fn merge_inlined(&mut self, callee: SspInfo) {
+        self.stack_protect |= callee.stack_protect;
+        self.has_array |= callee.has_array;
+        if callee.max_char_array_bytes > self.max_char_array_bytes {
+            self.max_char_array_bytes = callee.max_char_array_bytes;
+        }
+    }
 }
 
 /// A function parameter.
@@ -352,6 +390,8 @@ impl IrModule {
             asm_labels: crate::common::fx_hash::FxHashMap::default(),
             symver_directives: Vec::new(),
             tls_model_attrs: crate::common::fx_hash::FxHashMap::default(),
+            externally_visible_symbols: crate::common::fx_hash::FxHashSet::default(),
+            zero_call_used_regs_attrs: crate::common::fx_hash::FxHashMap::default(),
         }
     }
 
@@ -412,6 +452,7 @@ impl IrFunction {
             ret_is_f128_sse: false,
             is_gnu_inline_def: false,
             loop_promoted_f64_values: Vec::new(),
+            ssp: SspInfo::default(),
         }
     }
 

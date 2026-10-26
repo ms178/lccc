@@ -259,6 +259,69 @@ impl Preprocessor {
             ("__FLT128_HAS_INFINITY__", "1"),
             ("__FLT128_HAS_QUIET_NAN__", "1"),
             ("__FLT128_HAS_DENORM__", "1"),
+            // ISO C23 _Float16 & GCC/Clang __bf16 characteristics (exact GCC 16.2 values).
+            ("__FLT16_MANT_DIG__", "11"),
+            ("__FLT16_DIG__", "3"),
+            ("__FLT16_MIN_EXP__", "(-13)"),
+            ("__FLT16_MIN_10_EXP__", "(-4)"),
+            ("__FLT16_MAX_EXP__", "16"),
+            ("__FLT16_MAX_10_EXP__", "4"),
+            ("__FLT16_DECIMAL_DIG__", "5"),
+            (
+                "__FLT16_MAX__",
+                "6.55040000000000000000000000000000000e+4F16",
+            ),
+            (
+                "__FLT16_NORM_MAX__",
+                "6.55040000000000000000000000000000000e+4F16",
+            ),
+            (
+                "__FLT16_EPSILON__",
+                "9.76562500000000000000000000000000000e-4F16",
+            ),
+            (
+                "__FLT16_MIN__",
+                "6.10351562500000000000000000000000000e-5F16",
+            ),
+            (
+                "__FLT16_DENORM_MIN__",
+                "5.96046447753906250000000000000000000e-8F16",
+            ),
+            ("__FLT16_HAS_INFINITY__", "1"),
+            ("__FLT16_HAS_QUIET_NAN__", "1"),
+            ("__FLT16_HAS_DENORM__", "1"),
+            ("__FLT16_IS_IEC_60559__", "1"),
+            ("__BFLT16_MANT_DIG__", "8"),
+            ("__BFLT16_DIG__", "2"),
+            ("__BFLT16_MIN_EXP__", "(-125)"),
+            ("__BFLT16_MIN_10_EXP__", "(-37)"),
+            ("__BFLT16_MAX_EXP__", "128"),
+            ("__BFLT16_MAX_10_EXP__", "38"),
+            ("__BFLT16_DECIMAL_DIG__", "4"),
+            (
+                "__BFLT16_MAX__",
+                "3.38953138925153547590470800371487867e+38BF16",
+            ),
+            (
+                "__BFLT16_NORM_MAX__",
+                "3.38953138925153547590470800371487867e+38BF16",
+            ),
+            (
+                "__BFLT16_EPSILON__",
+                "7.81250000000000000000000000000000000e-3BF16",
+            ),
+            (
+                "__BFLT16_MIN__",
+                "1.17549435082228750796873653722224568e-38BF16",
+            ),
+            (
+                "__BFLT16_DENORM_MIN__",
+                "9.18354961579912115600575419704879436e-41BF16",
+            ),
+            ("__BFLT16_HAS_INFINITY__", "1"),
+            ("__BFLT16_HAS_QUIET_NAN__", "1"),
+            ("__BFLT16_HAS_DENORM__", "1"),
+            ("__BFLT16_IS_IEC_60559__", "0"),
             // C23 decimal floating point (_Decimal32/64/128, IEEE 754-2008
             // BID). GCC defines the __DEC*_*__ family and __STDC_DEC_FP__
             // whenever DFP is enabled.
@@ -647,6 +710,21 @@ impl Preprocessor {
         }
     }
 
+    /// Define or undefine GCC stack-protector feature macros (`__SSP*__`).
+    pub fn set_ssp(&mut self, mac: Option<(&str, &str)>) {
+        for name in [
+            "__SSP__",
+            "__SSP_ALL__",
+            "__SSP_STRONG__",
+            "__SSP_EXPLICIT__",
+        ] {
+            self.macros.undefine(name);
+        }
+        if let Some((name, val)) = mac {
+            self.define_simple_macro(name, val);
+        }
+    }
+
     /// Define or undefine __PIC__/__pic__ based on whether PIC mode is active.
     /// GCC defines these to 1 for -fpic and 2 for -fPIC; we always use 2.
     /// When PIC is disabled (e.g. -fno-PIC), these must not be defined, as
@@ -934,20 +1012,27 @@ impl Preprocessor {
     }
 
     /// Set the target architecture, updating predefined macros and include paths.
+    fn undefine_x86_baseline_macros(&mut self) {
+        for m in [
+            "__x86_64__",
+            "__x86_64",
+            "__amd64__",
+            "__amd64",
+            "__CET__",
+            "__SSE__",
+            "__SSE2__",
+            "__MMX__",
+            "__SSE_MATH__",
+            "__SSE2_MATH__",
+        ] {
+            self.macros.undefine(m);
+        }
+    }
+
     pub fn set_target(&mut self, target: &str) {
         match target {
             "aarch64" => {
-                // Remove x86 macros
-                self.macros.undefine("__x86_64__");
-                self.macros.undefine("__x86_64");
-                self.macros.undefine("__amd64__");
-                self.macros.undefine("__amd64");
-                self.macros.undefine("__CET__");
-                self.macros.undefine("__SSE__");
-                self.macros.undefine("__SSE2__");
-                self.macros.undefine("__MMX__");
-                self.macros.undefine("__SSE_MATH__");
-                self.macros.undefine("__SSE2_MATH__");
+                self.undefine_x86_baseline_macros();
                 // Define aarch64 macros
                 self.define_simple_macro("__aarch64__", "1");
                 self.define_simple_macro("__ARM_64BIT_STATE", "1");

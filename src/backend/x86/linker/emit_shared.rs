@@ -225,8 +225,10 @@ pub(super) fn emit_shared_library(
     // once section addresses and the linker-provided symbols are final, so the
     // shared path and the executable path agree (see `link::evaluate_pending_defsyms`).
     pending_defsyms: &super::link::PendingDefsyms,
+    layout_opts: &super::types::EmitLayoutOpts,
 ) -> Result<(), String> {
-    let base_addr: u64 = 0;
+    let base_addr: u64 = layout_opts.image_base.unwrap_or(0);
+    let page_size: u64 = layout_opts.page_size.max(PAGE_SIZE);
     // Option-derived dynamic flags, fixed up front: the `.dynamic` sizing
     // and the writer below read these same three values, so the entry count
     // and the bytes cannot disagree.
@@ -249,7 +251,7 @@ pub(super) fn emit_shared_library(
     // .so versus 7 792 B from mold and 5 974 B from wild.
     // Shared with emit_exec.rs via layout_plan::SegmentPacker so the invariant
     // is stated and tested exactly once (see that type's documentation).
-    let mut packer = super::layout_plan::SegmentPacker::new(base_addr, PAGE_SIZE);
+    let mut packer = super::layout_plan::SegmentPacker::new(base_addr, page_size);
     macro_rules! vaddr {
         ($off:expr_2021) => {
             packer.vaddr($off)
@@ -375,7 +377,11 @@ pub(super) fn emit_shared_library(
     let preemptible_def = |name: &str, g: &GlobalSymbol| -> bool {
         exports_def(name, g)
             && g.visibility == STV_DEFAULT
-            && !symbolic.binds_locally(g.info & 0xf)
+            && (!symbolic.binds_locally(g.info & 0xf)
+                || layout_opts
+                    .dynamic_list
+                    .as_ref()
+                    .is_some_and(|dl| dl.matches(&sym_base(name))))
             && !linker_provided.contains(name)
     };
     // An undefined, non-DSO symbol is imported through `.dynsym` unless its
@@ -2006,7 +2012,7 @@ pub(super) fn emit_shared_library(
         dynstr_offset + dynstr_size
     };
     wphdr(
-        &mut out, ph, PT_LOAD, PF_R, 0, base_addr, ro_seg_end, ro_seg_end, PAGE_SIZE,
+        &mut out, ph, PT_LOAD, PF_R, 0, base_addr, ro_seg_end, ro_seg_end, page_size,
     );
     ph += 56;
     if text_total_size > 0 {
@@ -2019,7 +2025,7 @@ pub(super) fn emit_shared_library(
             text_page_addr,
             text_total_size,
             text_total_size,
-            PAGE_SIZE,
+            page_size,
         );
         ph += 56;
     } else {
@@ -2032,7 +2038,7 @@ pub(super) fn emit_shared_library(
             text_page_addr,
             0,
             0,
-            PAGE_SIZE,
+            page_size,
         );
         ph += 56;
     }
@@ -2045,7 +2051,7 @@ pub(super) fn emit_shared_library(
         rodata_page_addr,
         rodata_total_size,
         rodata_total_size,
-        PAGE_SIZE,
+        page_size,
     );
     ph += 56;
     if has_relro {
@@ -2061,7 +2067,7 @@ pub(super) fn emit_shared_library(
             rw_page_addr,
             relro_file_end - rw_page_offset,
             relro_mem_size,
-            PAGE_SIZE,
+            page_size,
         );
         ph += 56;
         if split_relro_load {
@@ -2080,7 +2086,7 @@ pub(super) fn emit_shared_library(
                 rw2_addr,
                 rw2_filesz,
                 rw2_memsz,
-                PAGE_SIZE,
+                page_size,
             );
             ph += 56;
         }
@@ -2100,7 +2106,7 @@ pub(super) fn emit_shared_library(
             rw_page_addr,
             rw_filesz,
             rw_memsz,
-            PAGE_SIZE,
+            page_size,
         );
         ph += 56;
     }
@@ -4341,6 +4347,16 @@ pub(super) fn emit_shared_library(
         lm.write_to_path(std::path::Path::new(mp))
             .map_err(|e| format!("failed to write map file '{}': {}", mp, e))?;
     }
+
+    let build_id_offset = output_sections
+        .iter()
+        .find(|s| s.name == ".note.gnu.build-id" && s.mem_size > 0)
+        .map(|s| s.file_offset);
+    linker_common::build_id::patch_output_build_id_styled(
+        &mut out,
+        build_id_offset,
+        &layout_opts.build_id_style,
+    );
 
     std::fs::write(output_path, &out)
         .map_err(|e| format!("failed to write '{}': {}", output_path, e))?;

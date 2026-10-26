@@ -58,6 +58,12 @@ pub struct FunctionAttributes {
     /// bare `regparm` means N = 3; the global -mregparm flag applies only
     /// when the attribute is absent).
     pub regparm: Option<u8>,
+    /// `__attribute__((externally_visible))` — keep external under `-fwhole-program`.
+    pub externally_visible: bool,
+    /// `__attribute__((zero_call_used_regs("...")))` — per-function register zeroing mode.
+    pub zero_call_used_regs: Option<String>,
+    /// `__attribute__((no_sanitize("...")))` / `no_sanitize_undefined` list.
+    pub no_sanitize: Option<String>,
 }
 
 /// Bit masks for boolean flags in `FunctionAttributes::flags`.
@@ -99,6 +105,11 @@ pub mod func_attr_flag {
     /// lowerer places it in `.text.unlikely` unless `section(...)` says
     /// otherwise, and the loop-alignment pass skips its loops.
     pub const COLD: u32 = 1 << 16;
+    /// `__attribute__((stack_protect))` — force stack-protector canary under
+    /// `-fstack-protector{,-strong,-explicit}`.
+    pub const STACK_PROTECT: u32 = 1 << 17;
+    /// `__attribute__((no_stack_protector))` — suppress stack-protector canary.
+    pub const NO_STACK_PROTECTOR: u32 = 1 << 18;
 }
 
 /// The declaration *specifiers* of a function definition: the part of its
@@ -156,12 +167,17 @@ impl FunctionAttributes {
         attrs.set_pure(decl.is_pure());
         attrs.set_const_attr(decl.is_const_attr());
         attrs.set_cold(decl.is_cold());
+        attrs.set_stack_protect(decl.is_stack_protect());
+        attrs.set_no_stack_protector(decl.is_no_stack_protector());
         attrs.section = decl.section.clone();
         attrs.visibility = decl.visibility.clone();
         attrs.symver = decl.symver.clone();
         attrs.target = decl.target.clone();
         attrs.target_clones = decl.target_clones.clone();
         attrs.diagnose_as = decl.diagnose_as.clone();
+        attrs.externally_visible = decl.externally_visible;
+        attrs.zero_call_used_regs = decl.zero_call_used_regs.clone();
+        attrs.no_sanitize = decl.no_sanitize.clone();
         attrs
     }
 
@@ -235,6 +251,14 @@ impl FunctionAttributes {
     pub fn is_cold(&self) -> bool {
         self.flags & func_attr_flag::COLD != 0
     }
+    #[inline]
+    pub fn is_stack_protect(&self) -> bool {
+        self.flags & func_attr_flag::STACK_PROTECT != 0
+    }
+    #[inline]
+    pub fn is_no_stack_protector(&self) -> bool {
+        self.flags & func_attr_flag::NO_STACK_PROTECTOR != 0
+    }
 
     // --- flag setters ---
 
@@ -305,6 +329,14 @@ impl FunctionAttributes {
     #[inline]
     pub fn set_cold(&mut self, v: bool) {
         self.set_flag(func_attr_flag::COLD, v)
+    }
+    #[inline]
+    pub fn set_stack_protect(&mut self, v: bool) {
+        self.set_flag(func_attr_flag::STACK_PROTECT, v)
+    }
+    #[inline]
+    pub fn set_no_stack_protector(&mut self, v: bool) {
+        self.set_flag(func_attr_flag::NO_STACK_PROTECTOR, v)
     }
 
     #[inline]
@@ -756,6 +788,12 @@ pub struct DeclAttributes {
     pub diagnose_as: Option<String>,
     /// __attribute__((regparm(N))) on a function declaration.
     pub regparm: Option<u8>,
+    /// `__attribute__((externally_visible))` on a declaration.
+    pub externally_visible: bool,
+    /// `__attribute__((zero_call_used_regs("...")))` on a function declaration.
+    pub zero_call_used_regs: Option<String>,
+    /// `__attribute__((no_sanitize("...")))` / `no_sanitize_undefined`.
+    pub no_sanitize: Option<String>,
 }
 
 /// Bit masks for boolean flags in `DeclAttributes::flags`.
@@ -792,6 +830,10 @@ pub mod decl_attr_flag {
     /// `__attribute__((uninitialized))` — opt an automatic variable out of
     /// `-ftrivial-auto-var-init={zero,pattern}`.
     pub const UNINITIALIZED: u16 = 1 << 13;
+    /// `__attribute__((stack_protect))` — force stack-protector canary.
+    pub const STACK_PROTECT: u16 = 1 << 14;
+    /// `__attribute__((no_stack_protector))` — disable stack-protector canary.
+    pub const NO_STACK_PROTECTOR: u16 = 1 << 15;
 }
 
 impl DeclAttributes {
@@ -853,6 +895,14 @@ impl DeclAttributes {
     pub fn is_uninitialized(&self) -> bool {
         self.flags & decl_attr_flag::UNINITIALIZED != 0
     }
+    #[inline]
+    pub fn is_stack_protect(&self) -> bool {
+        self.flags & decl_attr_flag::STACK_PROTECT != 0
+    }
+    #[inline]
+    pub fn is_no_stack_protector(&self) -> bool {
+        self.flags & decl_attr_flag::NO_STACK_PROTECTOR != 0
+    }
 
     // --- flag setters ---
 
@@ -911,6 +961,14 @@ impl DeclAttributes {
     #[inline]
     pub fn set_uninitialized(&mut self, v: bool) {
         self.set_flag(decl_attr_flag::UNINITIALIZED, v)
+    }
+    #[inline]
+    pub fn set_stack_protect(&mut self, v: bool) {
+        self.set_flag(decl_attr_flag::STACK_PROTECT, v)
+    }
+    #[inline]
+    pub fn set_no_stack_protector(&mut self, v: bool) {
+        self.set_flag(decl_attr_flag::NO_STACK_PROTECTOR, v)
     }
 
     #[inline]
@@ -1198,6 +1256,10 @@ pub enum TypeSpecifier {
     Float,
     Double,
     LongDouble,
+    /// ISO C23 `_Float16` / `__fp16` (IEEE binary16, 2 bytes).
+    Float16,
+    /// GCC/Clang `__bf16` (brain float16, 2 bytes).
+    BFloat16,
     /// _Float128 / __float128 (IEEE binary128, distinct from long double).
     Float128,
     /// C23 decimal floating point (_Decimal32/64/128, BID encoding).
@@ -1543,6 +1605,9 @@ pub enum Expr {
     /// little-endian, span). Unary minus is applied as a separate expression
     /// and folded by const evaluation (BID sign flip).
     FloatLiteralDecimal(u8, [u8; 16], Span),
+    /// `_Float16` (`is_bf16 = false`) or `__bf16` (`is_bf16 = true`) literal:
+    /// `(is_bf16, raw_u16_bits, span)`.
+    FloatLiteralHalf(bool, u16, Span),
     /// Imaginary literal: value * I (double imaginary, e.g. 1.0i)
     ImaginaryLiteral(f64, Span),
     /// Float imaginary literal (e.g. 1.0fi)
@@ -1756,6 +1821,8 @@ impl TypeSpecifier {
             | TypeSpecifier::Float
             | TypeSpecifier::Double
             | TypeSpecifier::LongDouble
+            | TypeSpecifier::Float16
+            | TypeSpecifier::BFloat16
             | TypeSpecifier::Float128
             | TypeSpecifier::Decimal32
             | TypeSpecifier::Decimal64
@@ -1900,6 +1967,7 @@ impl Expr {
             | Expr::FloatLiteralLongDouble(..)
             | Expr::FloatLiteralF128(..)
             | Expr::FloatLiteralDecimal(..)
+            | Expr::FloatLiteralHalf(..)
             | Expr::ImaginaryLiteral(..)
             | Expr::ImaginaryLiteralF32(..)
             | Expr::ImaginaryLiteralLongDouble(..)
@@ -2000,6 +2068,7 @@ impl Expr {
             | Expr::FloatLiteralLongDouble(..)
             | Expr::FloatLiteralF128(..)
             | Expr::FloatLiteralDecimal(..)
+            | Expr::FloatLiteralHalf(..)
             | Expr::ImaginaryLiteral(..)
             | Expr::ImaginaryLiteralF32(..)
             | Expr::ImaginaryLiteralLongDouble(..)
@@ -2071,6 +2140,7 @@ impl Expr {
             | Expr::FloatLiteralLongDouble(_, _, s)
             | Expr::FloatLiteralF128(_, _, s)
             | Expr::FloatLiteralDecimal(_, _, s)
+            | Expr::FloatLiteralHalf(_, _, s)
             | Expr::ImaginaryLiteral(_, s)
             | Expr::ImaginaryLiteralF32(_, s)
             | Expr::ImaginaryLiteralLongDouble(_, _, s)

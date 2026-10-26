@@ -917,6 +917,10 @@ fn build_outlined_function(
         uses_sret: false,
         is_gnu_inline_def: false,
         loop_promoted_f64_values: Vec::new(),
+        ssp: crate::ir::module::SspInfo {
+            stack_guard_alloca: None,
+            ..func.ssp
+        },
         global_init_label_blocks: Vec::new(),
         ret_eightbyte_classes: Vec::new(),
         ret_is_f128_sse: false,
@@ -1340,7 +1344,7 @@ fn remap_call_info(info: &CallInfo, remap_op: &dyn Fn(&Operand) -> Operand) -> C
         struct_arg_is_f128_sse: info.struct_arg_is_f128_sse.clone(),
         is_sret: info.is_sret,
         is_fastcall: info.is_fastcall,
-        regparm: None,
+        regparm: info.regparm,
         is_pure: info.is_pure,
         is_const: info.is_const,
         // A remapped call is the same call: it still reaches (or not) the

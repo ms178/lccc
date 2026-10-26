@@ -190,6 +190,10 @@ impl Lowerer {
                     let size = self.resolve_ctype_size(&ct);
                     self.aggregate_return(&ct, size)
                 }
+                Some(ct) if ct.is_half_float() => AggregateReturn {
+                    one_xmm: true,
+                    ..AggregateReturn::default()
+                },
                 _ => AggregateReturn::default(),
             },
         }

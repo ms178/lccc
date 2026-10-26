@@ -281,6 +281,51 @@ fn parse_one_node_body(body: &str) -> VersionNode {
     node
 }
 
+/// Parsed GNU `--dynamic-list=FILE` symbol glob list (`{ sym1; prefix_*; };`).
+///
+/// In executables, matching defined globals are exported into `.dynsym` (a
+/// selective `--export-dynamic`). In shared libraries under `-Bsymbolic`,
+/// matching defined globals remain preemptible.
+#[derive(Debug, Clone, Default)]
+pub struct DynamicList {
+    pub patterns: Vec<String>,
+}
+
+impl DynamicList {
+    pub fn parse_files(paths: &[String]) -> Result<Option<Self>, String> {
+        if paths.is_empty() {
+            return Ok(None);
+        }
+        let mut combined = Self::default();
+        for path in paths {
+            let text = std::fs::read_to_string(path)
+                .map_err(|e| format!("cannot read dynamic-list '{}': {}", path, e))?;
+            combined.extend_from_text(&text);
+        }
+        Ok(Some(combined))
+    }
+
+    pub fn extend_from_text(&mut self, input: &str) {
+        let stripped = strip_version_script_comments(input);
+        for raw in stripped.split(['{', '}', ';']) {
+            let tok = raw.trim();
+            if tok.is_empty() || tok.starts_with("extern") {
+                continue;
+            }
+            for pat in tok.split_whitespace() {
+                let pat = pat.trim_matches('"').trim();
+                if !pat.is_empty() && pat != "C" && pat != "C++" {
+                    self.patterns.push(pat.to_string());
+                }
+            }
+        }
+    }
+
+    pub fn matches(&self, sym: &str) -> bool {
+        self.patterns.iter().any(|p| wildcard_match_pattern(p, sym))
+    }
+}
+
 pub(crate) fn strip_version_script_comments(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let bytes = input.as_bytes();

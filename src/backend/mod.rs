@@ -21,9 +21,11 @@ mod global_alignment;
 pub(crate) mod inline_asm; // InlineAsmEmitter trait and shared framework
 mod label_identity;
 pub(crate) mod stack_layout; // Stack layout: slot assignment, alloca coalescing, regalloc helpers
+pub mod stack_protector; // -fstack-protector* IR instrumentation & -mstack-protector-guard*
 pub(crate) mod state; // CodegenState, StackSlot, SlotAddr
 pub(crate) mod traits; // ArchCodegen trait with default implementations
 pub(crate) mod x86_common; // Shared x86/i686 register names, condition codes, asm template parsing
+pub mod zero_call_used_regs; // -fzero-call-used-regs=* post-peephole return-site zeroing
 
 // Register allocation and liveness analysis
 pub(crate) mod live_range; // Linear scan data structures (LiveRange, LinearScanAllocator)
@@ -134,6 +136,11 @@ pub(crate) struct CodegenOptions {
     /// Whether to emit endbr64 at function entry points (-fcf-protection=branch).
     /// Required for Intel CET/IBT (Indirect Branch Tracking).
     pub(crate) cf_protection_branch: bool,
+    /// `-fstack-clash-protection`: probe every 4096-byte page of static and
+    /// dynamic stack allocations so a frame cannot jump across a guard page.
+    pub(crate) stack_clash_protection: bool,
+    /// Resolved target stack-protector guard configuration (`-mstack-protector-guard*`).
+    pub(crate) stack_protector_guard: Option<stack_protector::EffectiveStackGuard>,
     /// Whether SSE is disabled (-mno-sse). When true, the x86 codegen avoids
     /// SSE/XMM instructions in variadic prologues (XMM register saving) and
     /// va_start sets fp_offset to overflow so va_arg never uses XMM regs.
@@ -284,6 +291,11 @@ pub(crate) struct CodegenOptions {
     /// chain). When false (-O1/-O2/-O3), codegen uses the fastest sequence
     /// even if it is a few bytes longer. Mirrors GCC/Clang's -Os behaviour.
     pub(crate) optimize_for_size: bool,
+    /// `-fzero-call-used-regs=<mode>` default mode for functions in this TU.
+    pub(crate) zero_call_used_regs: zero_call_used_regs::ZeroCallUsedRegs,
+    /// Whether FP/SIMD caller-saved registers exist and may be touched by
+    /// `-fzero-call-used-regs=` on this target/ISA invocation.
+    pub(crate) zero_call_used_regs_fp_simd: bool,
 }
 
 /// Target architecture.
@@ -588,6 +600,17 @@ impl Target {
                     && opts.mcount.is_none()
                     && opts.patchable_function_entry.is_none();
                 let mut poisoned_callees = crate::common::fx_hash::FxHashSet::default();
+                for func in &module.functions {
+                    if !func.is_declaration
+                        && zero_call_used_regs::effective_func_mode(
+                            func,
+                            module,
+                            opts.zero_call_used_regs,
+                        ) != zero_call_used_regs::ZeroCallUsedRegs::Skip
+                    {
+                        poisoned_callees.insert(func.name.clone());
+                    }
+                }
                 let mut poisoned_callers = crate::common::fx_hash::FxHashSet::default();
                 let mut round = 0usize;
                 loop {
@@ -620,6 +643,18 @@ impl Target {
                         )
                     };
                     let asm = x86::codegen::peephole::lower_tls_call_markers(asm);
+                    let asm = zero_call_used_regs::apply_zero_call_used_regs(
+                        asm,
+                        Target::X86_64,
+                        module,
+                        zero_call_used_regs::ZeroRegsConfig {
+                            default_mode: opts.zero_call_used_regs,
+                            avx: opts.isa.ymm,
+                            apx: opts.apx,
+                            fp_simd_allowed: opts.zero_call_used_regs_fp_simd,
+                            global_regparm: opts.regparm,
+                        },
+                    );
                     let violations = x86::codegen::ipa_ra::verify(&asm, &cg.ipa);
                     if violations.is_empty() {
                         break finish_fn_boundaries(
@@ -659,6 +694,18 @@ impl Target {
                     i686::codegen::peephole::peephole_optimize(raw)
                 };
                 let optimized = i686::codegen::peephole::lower_tls_call_markers(optimized);
+                let optimized = zero_call_used_regs::apply_zero_call_used_regs(
+                    optimized,
+                    Target::I686,
+                    module,
+                    zero_call_used_regs::ZeroRegsConfig {
+                        default_mode: opts.zero_call_used_regs,
+                        avx: opts.isa.ymm,
+                        apx: false,
+                        fp_simd_allowed: opts.zero_call_used_regs_fp_simd,
+                        global_regparm: opts.regparm,
+                    },
+                );
                 let optimized = finish_fn_boundaries(
                     &optimized,
                     &cg.state,
@@ -683,7 +730,19 @@ impl Target {
                     opts.debug_info,
                     source_mgr,
                 );
-                arm::codegen::peephole::peephole_optimize(raw)
+                let optimized = arm::codegen::peephole::peephole_optimize(raw);
+                zero_call_used_regs::apply_zero_call_used_regs(
+                    optimized,
+                    Target::Aarch64,
+                    module,
+                    zero_call_used_regs::ZeroRegsConfig {
+                        default_mode: opts.zero_call_used_regs,
+                        avx: false,
+                        apx: false,
+                        fp_simd_allowed: opts.zero_call_used_regs_fp_simd,
+                        global_regparm: 0,
+                    },
+                )
             }
             Target::Riscv64 => {
                 let mut cg = riscv::RiscvCodegen::new_with_ra_config(opts.ra_config.clone());
@@ -698,7 +757,19 @@ impl Target {
                     opts.debug_info,
                     source_mgr,
                 );
-                riscv::codegen::peephole::peephole_optimize(raw)
+                let optimized = riscv::codegen::peephole::peephole_optimize(raw);
+                zero_call_used_regs::apply_zero_call_used_regs(
+                    optimized,
+                    Target::Riscv64,
+                    module,
+                    zero_call_used_regs::ZeroRegsConfig {
+                        default_mode: opts.zero_call_used_regs,
+                        avx: false,
+                        apx: false,
+                        fp_simd_allowed: opts.zero_call_used_regs_fp_simd,
+                        global_regparm: 0,
+                    },
+                )
             }
         }
     }

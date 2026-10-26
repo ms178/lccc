@@ -53,6 +53,8 @@ pub(super) struct DynamicDesc {
     pub plt: Option<(u32, u32, u32)>,
     /// (`DT_REL`, `DT_RELSZ`).
     pub rel: Option<(u32, u32)>,
+    /// (`DT_RELR`, `DT_RELRSZ`).
+    pub relr: Option<(u32, u32)>,
     /// `DT_RELCOUNT`: leading `R_386_RELATIVE` entries of `.rel.dyn`.
     pub relcount: Option<u32>,
     /// (`DT_VERSYM`, `DT_VERNEED`, `DT_VERNEEDNUM`).
@@ -116,6 +118,11 @@ impl DynamicDesc {
         // able to decode a PLT-only executable), and never emit it twice.
         if self.rel.is_some() || self.plt.is_some() {
             v.push((DT_RELENT, 8));
+        }
+        if let Some((a, s)) = self.relr {
+            v.push((DT_RELR, a));
+            v.push((DT_RELRSZ, s));
+            v.push((DT_RELRENT, 4));
         }
         if let Some(n) = self.relcount {
             v.push((DT_RELCOUNT, n));

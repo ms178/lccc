@@ -38,7 +38,7 @@ impl Lowerer {
         })
     }
 
-    fn emit_select_val(
+    pub(super) fn emit_select_val(
         &mut self,
         cond: Operand,
         true_val: Operand,
@@ -1078,6 +1078,7 @@ impl Lowerer {
             | Expr::FloatLiteralF32(..)
             | Expr::FloatLiteralLongDouble(..)
             | Expr::FloatLiteralF128(..)
+            | Expr::FloatLiteralHalf(..)
             | Expr::FloatLiteralDecimal(..)
             | Expr::CharLiteral(..)
             | Expr::StringLiteral(..)

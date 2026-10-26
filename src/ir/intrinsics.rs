@@ -139,6 +139,8 @@ pub enum IntrinsicOp {
     RestoreApplyResult,
     /// __builtin_thread_pointer() - returns thread pointer (TLS base address)
     ThreadPointer,
+    /// Load target stack-protector guard word (`%fs:40`, `%gs:20`, sysreg, etc.)
+    LoadStackGuard,
     /// Scalar square root: sqrtsd/sqrtss on x86, fsqrt on ARM/RISC-V
     /// args[0] = input float value; dest = sqrt result
     SqrtF32,
@@ -208,6 +210,10 @@ pub enum IntrinsicOp {
     F128Neg,
     /// _Float128 copysign: x magnitude combined with y sign bit 127.
     F128Copysign,
+    /// Hardware IEEE binary16 -> binary32 conversion (`vcvtph2ps` on x86 F16C, `fcvt` on AArch64).
+    F16ToF32,
+    /// Hardware IEEE binary32 -> binary16 RNE conversion (`vcvtps2ph` on x86 F16C, `fcvt` on AArch64).
+    F32ToF16,
     /// long double (80-bit x87) fabs: clear bit 79 in the 10-byte slot.
     LDFabs,
     /// long double (80-bit x87) copysign: x magnitude with y sign bit 79.
@@ -2266,6 +2272,7 @@ impl IntrinsicOp {
             IntrinsicOp::RoundScalarF32(_) | IntrinsicOp::RoundScalarF64(_) |
             IntrinsicOp::CopysignF32 | IntrinsicOp::CopysignF64 |
             IntrinsicOp::F128Fabs | IntrinsicOp::F128Neg | IntrinsicOp::F128Copysign |
+            IntrinsicOp::F16ToF32 | IntrinsicOp::F32ToF16 |
             IntrinsicOp::VecWidenAddI32x4ToI64x2
             | IntrinsicOp::VecWidenMaskedAddI32x4ToI64x2
             | IntrinsicOp::VecMaskedAddI32x8 |

@@ -76,7 +76,8 @@ impl Lowerer {
             let result = self.emit_cmp_val(IrCmpOp::Ne, val, zero, ty);
             return Operand::Value(result);
         }
-        let (abs_mask, _, _, _, _) = Self::fp_masks(float_ty);
+        let (abs_mask, _, _, _, _) =
+            Self::fp_masks_for(float_ty, &crate::common::types::CType::Double);
         let masked = self.emit_binop_val(
             IrBinOp::And,
             val,
@@ -289,6 +290,7 @@ impl Lowerer {
                 let v = u128::from_le_bytes(*bytes);
                 Operand::Const(IrConst::I128(v as i128))
             }
+            Expr::FloatLiteralHalf(_, bits, _) => Operand::Const(IrConst::I16(*bits as i16)),
             Expr::FloatLiteralDecimal(width, bytes, _) => {
                 // C23 decimal FP literal: the 16 bytes are the raw BID bit
                 // pattern (little-endian). D32/D64 use dedicated IR constant
@@ -538,6 +540,9 @@ impl Lowerer {
             ty: ginfo.ty,
             seg_override: ginfo.address_space,
         });
+        if ginfo.c_type.as_ref().is_some_and(|ct| *ct == CType::Bool) {
+            self.emit_ubsan_bool_load_check(Operand::Value(dest), ginfo.ty);
+        }
         Operand::Value(dest)
     }
 
@@ -562,6 +567,7 @@ impl Lowerer {
             let ty = info.ty;
             let is_array = info.is_array;
             let is_struct = info.is_struct;
+            let is_bool = info.is_bool;
             let is_complex = info.c_type.as_ref().is_some_and(|ct| ct.is_complex());
             let is_vector = info.c_type.as_ref().is_some_and(|ct| ct.is_vector());
             let is_vol = super::definitions::object_access_is_volatile(
@@ -607,6 +613,9 @@ impl Lowerer {
                     ty,
                     seg_override: AddressSpace::Default,
                 });
+                if is_bool {
+                    self.emit_ubsan_bool_load_check(Operand::Value(dest), ty);
+                }
                 return Operand::Value(dest);
             }
             if is_array || is_struct {
@@ -623,6 +632,9 @@ impl Lowerer {
                 ty,
                 seg_override: AddressSpace::Default,
             });
+            if is_bool {
+                self.emit_ubsan_bool_load_check(Operand::Value(dest), ty);
+            }
             return Operand::Value(dest);
         }
 

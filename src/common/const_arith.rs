@@ -610,13 +610,16 @@ pub fn const_to_bid(val: &IrConst, src_ct: &CType, width: u8) -> Option<IrConst>
                 int_src(v.unsigned_abs() as u128, *v < 0)
             }
         }
-        IrConst::I16(v) => {
-            if src_ct.is_unsigned() {
-                int_src(*v as u16 as u128, false)
-            } else {
-                int_src(v.unsigned_abs() as u128, *v < 0)
-            }
-        }
+        IrConst::I16(v) => match src_ct {
+            CType::Float16 => enc_binary(decode_f32_bits(
+                super::half_float::f16_bits_to_f32(*v as u16).to_bits(),
+            )),
+            CType::BFloat16 => enc_binary(decode_f32_bits(
+                super::half_float::bf16_bits_to_f32(*v as u16).to_bits(),
+            )),
+            _ if src_ct.is_unsigned() => int_src(*v as u16 as u128, false),
+            _ => int_src(v.unsigned_abs() as u128, *v < 0),
+        },
         IrConst::I32(v) => {
             if src_ct.is_unsigned() {
                 int_src(*v as u32 as u128, false)

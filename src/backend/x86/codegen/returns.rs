@@ -94,6 +94,12 @@ impl X86Codegen {
             }
             // _Float128 (IEEE binary128): the 16-byte value returns in xmm0.
             if self.func_ret_is_f128_sse {
+                if ret_ty == IrType::U16 {
+                    self.operand_to_rax_i32(val);
+                    self.emit_scalar_gpr_to_xmm("rax", "eax", "xmm0", true);
+                    self.emit_epilogue_and_ret_impl(frame_size);
+                    return;
+                }
                 self.emit_f128_sse_operand_to_xmm(val, "xmm0");
                 self.emit_epilogue_and_ret_impl(frame_size);
                 return;

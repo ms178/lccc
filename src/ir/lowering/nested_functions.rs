@@ -429,6 +429,7 @@ impl Lowerer {
             | Expr::FloatLiteralF32(..)
             | Expr::FloatLiteralLongDouble(..)
             | Expr::FloatLiteralF128(..)
+            | Expr::FloatLiteralHalf(..)
             | Expr::FloatLiteralDecimal(..)
             | Expr::ImaginaryLiteral(..)
             | Expr::ImaginaryLiteralF32(..)
@@ -1175,6 +1176,13 @@ impl Lowerer {
             ret_is_f128_sse,
             is_gnu_inline_def: false,
             loop_promoted_f64_values: Vec::new(),
+            ssp: crate::ir::module::SspInfo {
+                stack_protect: nf.attrs.is_stack_protect(),
+                no_stack_protector: nf.attrs.is_no_stack_protector(),
+                has_array: self.func().ssp_has_array,
+                max_char_array_bytes: self.func().ssp_max_char_array_bytes,
+                stack_guard_alloca: None,
+            },
         };
         self.module.functions.push(ir_func);
         // Note: the module field is accessed via self.module — verify the

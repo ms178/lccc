@@ -2523,6 +2523,7 @@ impl X86Codegen {
                     self.store_rax_to(d);
                 }
             }
+            IntrinsicOp::LoadStackGuard => emit_load_stack_guard_x86(self, dest),
             IntrinsicOp::FmaScalarF64 => {
                 // dest = args[0]*args[1] + args[2], single rounding.
                 // vfmadd231 form: dest_reg preloaded with the addend, then
@@ -2588,6 +2589,25 @@ impl X86Codegen {
             }
             IntrinsicOp::SqrtF32 => {
                 self.emit_fp_scalar_unary(dest, &args[0], IrType::F32, "vsqrtss");
+            }
+            IntrinsicOp::F16ToF32 => {
+                self.operand_to_rax_i32(&args[0]);
+                self.state.emit("    vmovd %eax, %xmm0");
+                self.state.emit("    vcvtph2ps %xmm0, %xmm0");
+                self.state.reg_cache.invalidate_acc();
+                if let Some(d) = dest {
+                    self.store_xmm_to(d, "xmm0", IrType::F32);
+                }
+            }
+            IntrinsicOp::F32ToF16 => {
+                self.emit_fp_operand_to_xmm(&args[0], IrType::F32, "xmm0");
+                self.state.emit("    vcvtps2ph $4, %xmm0, %xmm0");
+                self.state.emit("    vmovd %xmm0, %eax");
+                self.state.emit("    movzwl %ax, %eax");
+                self.state.reg_cache.invalidate_acc();
+                if let Some(d) = dest {
+                    self.store_rax_to(d);
+                }
             }
             IntrinsicOp::FabsF64 => {
                 // single andpd against a rodata mask, honoring the
@@ -12054,5 +12074,36 @@ mod strict_recip_sse2_tests {
         assert_eq!(text.matches("movd %xmm0,").count(), 4, "{text}");
         assert!(!text.contains("%rdx") && !text.contains("%ymm"), "{text}");
         assert_eq!(text.matches("    addsd").count(), 4, "{text}");
+    }
+}
+
+fn emit_load_stack_guard_x86(cg: &mut X86Codegen, dest: &Option<Value>) {
+    use crate::backend::stack_protector::EffectiveStackGuard;
+    let guard = cg.state.stack_protector_guard.clone();
+    match guard.as_ref() {
+        Some(EffectiveStackGuard::Tls {
+            reg,
+            offset,
+            symbol: Some(sym),
+        }) => {
+            cg.state
+                .emit_fmt(format_args!("    movq %{}:{}(%rip), %rax", reg, sym));
+            let _ = offset;
+        }
+        Some(EffectiveStackGuard::Tls {
+            reg,
+            offset,
+            symbol: None,
+        }) => {
+            cg.state
+                .emit_fmt(format_args!("    movq %{}:{}, %rax", reg, offset));
+        }
+        _ => {
+            cg.state.emit("    movq %fs:40, %rax");
+        }
+    }
+    cg.state.reg_cache.invalidate_acc();
+    if let Some(d) = dest {
+        cg.store_rax_to(d);
     }
 }

@@ -593,7 +593,7 @@ pub fn peephole_optimize(asm: String) -> String {
     }
     let mut lines: Vec<String> = asm.lines().map(String::from).collect();
     let mut kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
-    let n = lines.len();
+    let mut n = lines.len();
 
     if n == 0 {
         return asm;
@@ -627,7 +627,7 @@ pub fn peephole_optimize(asm: String) -> String {
         changed |= eliminate_repeated_slot_loads(&mut lines, &mut kinds, n);
         changed |= thread_spill_slots(&mut lines, &mut kinds, n);
         changed |= hoist_loop_invariant_remats(&mut lines, &mut kinds, n);
-        let n = lines.len();
+        n = lines.len();
         changed |= cse_adrp_remat_pairs(&mut lines, &mut kinds, n);
         changed |= fold_destructive_pointer_updates(&mut lines, &mut kinds, n);
         changed |= fold_zero_stores(&mut lines, &mut kinds, n);
@@ -689,7 +689,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= eliminate_repeated_slot_loads(&mut lines, &mut kinds, n);
             changed2 |= thread_spill_slots(&mut lines, &mut kinds, n);
             changed2 |= hoist_loop_invariant_remats(&mut lines, &mut kinds, n);
-            let n = lines.len();
+            n = lines.len();
             changed2 |= cse_adrp_remat_pairs(&mut lines, &mut kinds, n);
             changed2 |= fold_destructive_pointer_updates(&mut lines, &mut kinds, n);
             changed2 |= fold_zero_stores(&mut lines, &mut kinds, n);
@@ -700,8 +700,9 @@ pub fn peephole_optimize(asm: String) -> String {
     }
 
     // Build result, filtering out Nop lines
+    debug_assert_eq!(lines.len(), kinds.len());
     let mut result = String::with_capacity(asm.len());
-    for i in 0..n {
+    for i in 0..lines.len() {
         if kinds[i] != LineKind::Nop {
             result.push_str(&lines[i]);
             result.push('\n');
@@ -8469,6 +8470,41 @@ f:
         assert!(
             result.contains("str x9, [x1], #8"),
             "the writeback base must keep the copy's destination:\n{result}"
+        );
+    }
+
+    #[test]
+    fn loop_hoist_line_insertion_never_truncates_trailing_rodata() {
+        // When hoist_loop_invariant_remats duplicates a loop-invariant ADRP+ADD
+        // across both a fallthrough preheader and a second entry branch, `lines`
+        // grows past its initial length. `peephole_optimize` must refresh `n`
+        // so trailing `.rodata` pool constants are never sliced off.
+        let asm = concat!(
+            "f:\n",
+            "    cbz x0, .Lentry2\n",
+            "    mov x1, #0\n",
+            "    b .Lloop\n",
+            ".Lentry2:\n",
+            "    mov x1, #1\n",
+            ".Lloop:\n",
+            "    adrp x9, sym\n",
+            "    add x9, x9, :lo12:sym\n",
+            "    ldr w2, [x9]\n",
+            "    add x1, x1, x2\n",
+            "    subs x0, x0, #1\n",
+            "    b.ne .Lloop\n",
+            "    mov x0, x1\n",
+            "    ret\n",
+            ".section .rodata\n",
+            ".p2align 4\n",
+            ".LCFP_2:\n",
+            "    .quad 1073741824\n",
+            "    .quad 0\n",
+        );
+        let result = peephole_optimize(asm.to_string());
+        assert!(
+            result.contains(".LCFP_2:\n    .quad 1073741824\n    .quad 0\n"),
+            "trailing .rodata truncated after loop-hoist insertion:\n{result}"
         );
     }
 }

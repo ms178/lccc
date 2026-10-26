@@ -204,7 +204,9 @@ impl Lowerer {
         // _Float128 or decimal, whose rounding modes are all part of the
         // floating-point environment -- keeps the conversion at run time
         // when that environment is observable (FENV_ACCESS, -frounding-math).
-        let is_fp = |ct: &CType| ct.is_floating() || *ct == CType::Float128 || ct.is_decimal();
+        let is_fp = |ct: &CType| {
+            ct.is_floating() || *ct == CType::Float128 || ct.is_decimal() || ct.is_half_float()
+        };
         let observable_fp = self.pass_policy.fp_environment_observable
             && (is_fp(&inner_ctype) || is_fp(&target_ctype));
         if !observable_fp {
@@ -241,6 +243,14 @@ impl Lowerer {
             let src = self.lower_expr(inner);
             return self.convert_to_f128(src, &inner_ctype);
         }
+        if (inner_ctype.is_half_float() || target_ctype.is_half_float())
+            && target_ctype != CType::Bool
+            && target_ctype != CType::Void
+        {
+            let src = self.lower_expr(inner);
+            let src_ty = self.value_ir_type(inner);
+            return self.convert_scalar_ctype(src, src_ty, &inner_ctype, &target_ctype);
+        }
 
         let src = self.lower_expr(inner);
         // Use the VALUE type (the defining instruction's actual result width,
@@ -271,10 +281,8 @@ impl Lowerer {
         // C standard: conversion to _Bool yields 0 or 1
         if target_ctype == CType::Bool {
             if inner_ctype.is_soft_float() {
-                // decimal / _Float128 zero test: +0 == -0 compares equal (IEEE 754
-                // totalOrder semantics do NOT apply here; plain ==/!= does)
-                let dsrc = self.lower_expr(inner);
-                return self.lower_soft_float_truthiness(dsrc, &inner_ctype);
+                // decimal / _Float128 / half-float zero test: +0 == -0 compares equal
+                return self.lower_soft_float_truthiness(src, &inner_ctype);
             }
             if from_ty.is_float() {
                 let zero = match from_ty {
@@ -1017,7 +1025,10 @@ impl Lowerer {
             return Operand::Value(alloca);
         }
 
-        if let Some(lv) = self.lower_lvalue_for_mutation(inner) {
+        self.in_address_of_top_lvalue = true;
+        let maybe_lv = self.lower_lvalue_for_mutation(inner);
+        self.in_address_of_top_lvalue = false;
+        if let Some(lv) = maybe_lv {
             // GEP +0 is a no-op. Emitting it used to make a local look
             // address-taken through a derived pointer even after a helper
             // that took `&x` was inlined (`*p = v` stores through the GEP
@@ -1234,6 +1245,7 @@ impl Lowerer {
             .get_pointee_type_of_expr(inner)
             .unwrap_or(crate::common::types::target_int_ir_type());
         let ptr_val = self.operand_to_value(ptr);
+        self.emit_ubsan_null_check(ptr_val, addr_space);
         let is_vol = self.pointee_expr_is_volatile(inner);
         self.emit(Instruction::Load {
             volatile: is_vol,
@@ -1242,6 +1254,9 @@ impl Lowerer {
             ty: deref_ty,
             seg_override: addr_space,
         });
+        if matches!(self.expr_ctype(inner), CType::Pointer(ref p, _) if **p == CType::Bool) {
+            self.emit_ubsan_bool_load_check(Operand::Value(dest), deref_ty);
+        }
         Operand::Value(dest)
     }
 
@@ -1288,6 +1303,9 @@ impl Lowerer {
             ty: elem_ty,
             seg_override: addr_space,
         });
+        if self.expr_ctype(expr) == CType::Bool {
+            self.emit_ubsan_bool_load_check(Operand::Value(dest), elem_ty);
+        }
         Operand::Value(dest)
     }
 
@@ -1354,7 +1372,9 @@ impl Lowerer {
 
         let base_addr = if is_pointer {
             let ptr_val = self.lower_expr(base_expr);
-            self.operand_to_value(ptr_val)
+            let v = self.operand_to_value(ptr_val);
+            self.emit_ubsan_null_check(v, addr_space);
+            v
         } else {
             self.get_struct_base_addr(base_expr)
         };
@@ -1433,6 +1453,9 @@ impl Lowerer {
             ty: field_ty,
             seg_override: addr_space,
         });
+        if field_ctype.as_ref().is_some_and(|ct| *ct == CType::Bool) {
+            self.emit_ubsan_bool_load_check(Operand::Value(dest), field_ty);
+        }
         // Reverse scalar_storage_order: byte-fix-up the loaded scalar value.
         let sso = self.sso_mode_of_member(base_expr, is_pointer, field_name);
         self.emit_sso_load_fixup(Operand::Value(dest), field_ty, sso)
@@ -1722,6 +1745,34 @@ impl Lowerer {
             self.lower_expr(ap_expr)
         };
         let va_list_ptr = self.operand_to_value(ap_val);
+        if ctype.is_half_float() {
+            // Across all 4 psABIs (x86-64 XMM/overflow, i686 4B stack, AArch64 VR/stack,
+            // RISC-V LP64D GP/stack), variadic _Float16 / __bf16 occupies the exact low
+            // 16 bits of the same slot as `float`.
+            let f_dest = self.fresh_value();
+            self.emit(Instruction::VaArg {
+                dest: f_dest,
+                va_list_ptr,
+                result_ty: IrType::F32,
+            });
+            let slot = self.emit_entry_alloca(IrType::F32, 4, 4, false);
+            self.emit(Instruction::Store {
+                volatile: false,
+                val: Operand::Value(f_dest),
+                ptr: slot,
+                ty: IrType::F32,
+                seg_override: AddressSpace::Default,
+            });
+            let h_dest = self.fresh_value();
+            self.emit(Instruction::Load {
+                volatile: false,
+                dest: h_dest,
+                ptr: slot,
+                ty: IrType::U16,
+                seg_override: AddressSpace::Default,
+            });
+            return Operand::Value(h_dest);
+        }
         let result_ty = self.resolve_va_arg_type(type_spec);
         let dest = self.fresh_value();
         self.emit(Instruction::VaArg {

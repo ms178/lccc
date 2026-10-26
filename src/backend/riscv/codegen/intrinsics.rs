@@ -235,6 +235,7 @@ impl RiscvCodegen {
                     self.store_t0_to(d);
                 }
             }
+            IntrinsicOp::LoadStackGuard => emit_load_stack_guard_riscv(self, dest),
             IntrinsicOp::SqrtF64 => {
                 self.operand_to_t0(&args[0]);
                 self.state.emit("    fmv.d.x ft0, t0");
@@ -250,6 +251,13 @@ impl RiscvCodegen {
                 self.state.emit("    fsqrt.s ft0, ft0");
                 self.state.emit("    fmv.x.w t0, ft0");
                 if let Some(d) = dest {
+                    self.store_t0_to(d);
+                }
+            }
+            IntrinsicOp::F16ToF32 | IntrinsicOp::F32ToF16 => {
+                // RISC-V uses the branchless integer IR lowering unless Zfh is enabled.
+                if let Some(d) = dest {
+                    self.state.emit("    li t0, 0");
                     self.store_t0_to(d);
                 }
             }
@@ -916,5 +924,25 @@ impl RiscvCodegen {
         if let Some(d) = dest {
             self.store_t0_to(d);
         }
+    }
+}
+
+fn emit_load_stack_guard_riscv(cg: &mut RiscvCodegen, dest: &Option<Value>) {
+    use crate::backend::stack_protector::EffectiveStackGuard;
+    let guard = cg.state.stack_protector_guard.clone();
+    let (reg, offset) = match guard.as_ref() {
+        Some(EffectiveStackGuard::Tls { reg, offset, .. }) => (reg.as_str(), *offset),
+        _ => ("tp", 0),
+    };
+    if (-2048..=2047).contains(&offset) {
+        cg.state
+            .emit_fmt(format_args!("    ld t0, {}({})", offset, reg));
+    } else {
+        cg.state.emit_fmt(format_args!("    li t1, {}", offset));
+        cg.state.emit_fmt(format_args!("    add t1, {}, t1", reg));
+        cg.state.emit("    ld t0, 0(t1)");
+    }
+    if let Some(d) = dest {
+        cg.store_t0_to(d);
     }
 }

@@ -258,6 +258,14 @@ impl Parser {
         let is_pure = self.attrs.parsing_pure();
         let is_const_attr = self.attrs.parsing_const_attr();
         let is_cold = self.attrs.parsing_cold();
+        let is_stack_protect = self.attrs.parsing_stack_protect;
+        self.attrs.parsing_stack_protect = false;
+        let is_no_stack_protector = self.attrs.parsing_no_stack_protector;
+        self.attrs.parsing_no_stack_protector = false;
+        let externally_visible = self.attrs.parsing_externally_visible;
+        self.attrs.parsing_externally_visible = false;
+        let zero_call_used_regs = self.attrs.parsing_zero_call_used_regs.take();
+        let no_sanitize = self.attrs.parsing_no_sanitize.take();
 
         // Build per-declarator attributes struct from the collected flags
         let mut decl_attrs = DeclAttributes::default();
@@ -279,6 +287,8 @@ impl Parser {
         decl_attrs.set_const_attr(is_const_attr);
         decl_attrs.set_cold(is_cold);
         decl_attrs.set_uninitialized(is_uninitialized);
+        decl_attrs.set_stack_protect(is_stack_protect);
+        decl_attrs.set_no_stack_protector(is_no_stack_protector);
         decl_attrs.set_nested_fn(self.attrs.parsing_nested_fn());
         decl_attrs.alias_target = alias_target;
         decl_attrs.ifunc_target = ifunc_target;
@@ -292,6 +302,9 @@ impl Parser {
         decl_attrs.target = target;
         decl_attrs.target_clones = target_clones;
         decl_attrs.diagnose_as = diagnose_as;
+        decl_attrs.externally_visible = externally_visible;
+        decl_attrs.zero_call_used_regs = zero_call_used_regs;
+        decl_attrs.no_sanitize = no_sanitize;
 
         // Apply __attribute__((mode(...))): transform type to specified bit-width
         let type_spec = if let Some(mk) = mode_kind {
@@ -308,10 +321,16 @@ impl Parser {
         // S13: record file-scope function no_instrument_function
         // attributes so a later DEFINITION inherits them (GCC merges
         // declaration attributes into the definition).
-        if decl_attrs.is_no_instrument() {
-            if let Some(n) = &name {
-                if matches!(derived.last(), Some(DerivedDeclarator::Function(_, _))) {
+        if let Some(n) = &name {
+            if matches!(derived.last(), Some(DerivedDeclarator::Function(_, _))) {
+                if decl_attrs.is_no_instrument() {
                     self.func_decl_no_instrument.insert(n.clone());
+                }
+                if decl_attrs.is_stack_protect() {
+                    self.func_decl_stack_protect.insert(n.clone());
+                }
+                if decl_attrs.is_no_stack_protector() {
+                    self.func_decl_no_stack_protector.insert(n.clone());
                 }
             }
         }
@@ -401,6 +420,15 @@ impl Parser {
         // definition; no_instrument_function on a prior file-scope
         // declaration (e.g. `int main () NOCHK;`) must suppress
         // instrumentation even when the definition does not re-state it.
+        let mut decl_attrs = decl_attrs;
+        if let Some(n) = name.as_deref() {
+            if self.func_decl_stack_protect.contains(n) {
+                decl_attrs.set_stack_protect(true);
+            }
+            if self.func_decl_no_stack_protector.contains(n) {
+                decl_attrs.set_no_stack_protector(true);
+            }
+        }
         let no_instrument_merged = decl_attrs.is_no_instrument()
             || name
                 .as_deref()
@@ -764,6 +792,15 @@ impl Parser {
         if let Some(ref tc) = self.attrs.parsing_target_clones {
             last_decl.attrs.target_clones = Some(tc.clone());
         }
+        if self.attrs.parsing_externally_visible {
+            last_decl.attrs.externally_visible = true;
+        }
+        if let Some(ref zr) = self.attrs.parsing_zero_call_used_regs {
+            last_decl.attrs.zero_call_used_regs = Some(zr.clone());
+        }
+        if let Some(ref ns) = self.attrs.parsing_no_sanitize {
+            last_decl.attrs.no_sanitize = Some(ns.clone());
+        }
         if self.attrs.parsing_uninitialized() {
             last_decl.attrs.set_uninitialized(true);
         }
@@ -827,6 +864,9 @@ impl Parser {
         self.attrs.parsing_alias_target = None;
         self.attrs.parsing_ifunc_target = None;
         self.attrs.parsing_target_clones = None;
+        self.attrs.parsing_externally_visible = false;
+        self.attrs.parsing_zero_call_used_regs = None;
+        self.attrs.parsing_no_sanitize = None;
         self.attrs.set_uninitialized(false);
         self.attrs.parsing_visibility = None;
         self.attrs.parsing_tls_model = None;

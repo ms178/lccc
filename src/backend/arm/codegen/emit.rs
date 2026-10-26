@@ -2059,7 +2059,7 @@ impl ArmCodegen {
                 None
             };
             self.emit_load_arg_to_reg(&args[arg_i], "x0", slot_adjust, 0, needs_adjusted_load);
-            if arg_ty == Some(IrType::F32) {
+            if arg_ty == Some(IrType::F32) || arg_ty == Some(IrType::U16) {
                 self.state.emit_fmt(format_args!("    fmov s{}, w0", reg_i));
             } else {
                 self.state.emit_fmt(format_args!("    fmov d{}, x0", reg_i));
@@ -2534,7 +2534,12 @@ impl ArmCodegen {
                 self.emit_alloca_addr("x11", dest_val.0, slot.0);
             }
             let fp_reg_off = (reg_idx * 16) as i64;
-            if ty == IrType::F32 {
+            if ty == IrType::U16 {
+                self.state
+                    .emit_fmt(format_args!("    ldr s0, [sp, #{}]", fp_reg_off));
+                self.state.emit("    fmov w9, s0");
+                self.state.emit("    and w9, w9, #0xffff");
+            } else if ty == IrType::F32 {
                 self.state
                     .emit_fmt(format_args!("    ldr s0, [sp, #{}]", fp_reg_off));
                 self.state.emit("    fmov w9, s0");
@@ -2598,7 +2603,11 @@ impl ArmCodegen {
             if over_aligned {
                 self.emit_alloca_addr("x11", dest_val.0, slot.0);
             }
-            if ty == IrType::F32 {
+            if ty == IrType::U16 {
+                self.state
+                    .emit_fmt(format_args!("    fmov w9, s{}", reg_idx));
+                self.state.emit("    and w9, w9, #0xffff");
+            } else if ty == IrType::F32 {
                 self.state
                     .emit_fmt(format_args!("    fmov w9, s{}", reg_idx));
             } else {

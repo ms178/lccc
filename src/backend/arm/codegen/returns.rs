@@ -22,6 +22,12 @@ impl ArmCodegen {
             // tracker, so the tracker cannot vouch for the slot contents —
             // but the slot IS the value, 16 bytes, by construction.)
             if self.func_ret_is_f128_sse {
+                if ret_ty == IrType::U16 {
+                    self.operand_to_x0(val);
+                    self.state.emit("    fmov s0, w0");
+                    self.emit_epilogue_and_ret_impl(frame_size);
+                    return;
+                }
                 self.emit_f128_carrier_operand_to_q0(val);
                 self.emit_epilogue_and_ret_impl(frame_size);
                 return;

@@ -1,6 +1,8 @@
 //! Public entry points for the standalone `lccc-ld` linker driver.
 
 use crate::backend::linker_common::Elf64Object;
+pub use crate::backend::linker_common::{BuildIdStyle, convert_elf_file_to_flat_binary};
+pub use crate::backend::x86::linker::emit_script::ScriptLinkExtras;
 
 /// GNU property note flags, shared by every link path (built-in, shared
 /// object and linker-script links).
@@ -58,50 +60,14 @@ pub fn load_inputs_i386_script(
 /// section (36 bytes for SHA-1). The script engine places it via the usual
 /// `*(.note.*)` input patterns and patches the digest after layout.
 pub fn append_build_id_object(objects: &mut Vec<Elf64Object>) {
-    use crate::backend::linker_common::Elf64Section;
-    let sections = vec![
-        Elf64Section {
-            name_idx: 0,
-            name: String::new(),
-            sh_type: 0,
-            flags: 0,
-            addr: 0,
-            offset: 0,
-            size: 0,
-            link: 0,
-            info: 0,
-            addralign: 0,
-            entsize: 0,
-        },
-        Elf64Section {
-            name_idx: 0,
-            name: ".note.gnu.build-id".into(),
-            sh_type: 7, /* SHT_NOTE */
-            flags: 0x2, /* SHF_ALLOC */
-            addr: 0,
-            offset: 0,
-            size: crate::backend::linker_common::build_id::BUILD_ID_NOTE_SIZE,
-            link: 0,
-            info: 0,
-            addralign: 4,
-            entsize: 0,
-        },
-    ];
-    let section_data = vec![
-        crate::backend::linker_common::SectionData::empty(),
-        crate::backend::linker_common::SectionData::owned(vec![
-            0u8;
-            crate::backend::linker_common::build_id::BUILD_ID_NOTE_SIZE
-                as usize
-        ]),
-    ];
-    objects.push(Elf64Object {
-        sections,
-        symbols: Vec::new(),
-        section_data,
-        relocations: vec![Vec::new(); 2],
-        source_name: "<build-id>".into(),
-    });
+    append_build_id_object_styled(objects, &BuildIdStyle::Sha1);
+}
+
+/// Append a synthetic `.note.gnu.build-id` object sized for `style`.
+pub fn append_build_id_object_styled(objects: &mut Vec<Elf64Object>, style: &BuildIdStyle) {
+    if style.is_enabled() {
+        objects.push(crate::backend::linker_common::build_id::synthetic_note_object_styled(style));
+    }
 }
 
 /// Relocatable link (`ld -r`): merge objects into a single ET_REL (x86-64).
@@ -138,6 +104,37 @@ pub fn link_with_script_x86(
     )
 }
 
+/// Link pre-loaded objects with a full GNU linker script and extended options (x86-64).
+pub fn link_with_script_x86_extras(
+    objects: &mut [Elf64Object],
+    script_src: &str,
+    output: &str,
+    emit_symtab: bool,
+    is_pie: bool,
+    emit_relocs: bool,
+    gc_sections: bool,
+    soname: Option<&str>,
+    dt_symbolic: bool,
+    max_page_size: u64,
+    defsym_defs: &[(String, String)],
+    extras: &ScriptLinkExtras,
+) -> Result<(), String> {
+    crate::backend::x86::linker::emit_script::link_with_script_with_extras(
+        objects,
+        script_src,
+        output,
+        emit_symtab,
+        is_pie,
+        emit_relocs,
+        gc_sections,
+        soname,
+        dt_symbolic,
+        max_page_size,
+        defsym_defs,
+        extras,
+    )
+}
+
 /// Link pre-loaded ELF32/i386 objects with a full GNU linker script.
 pub fn link_with_script_i386(
     objects: &mut [Elf64Object],
@@ -164,6 +161,37 @@ pub fn link_with_script_i386(
         dt_symbolic,
         max_page_size,
         defsym_defs,
+    )
+}
+
+/// Link pre-loaded ELF32/i386 objects with a full GNU linker script and extended options.
+pub fn link_with_script_i386_extras(
+    objects: &mut [Elf64Object],
+    script_src: &str,
+    output: &str,
+    emit_symtab: bool,
+    is_pie: bool,
+    emit_relocs: bool,
+    gc_sections: bool,
+    soname: Option<&str>,
+    dt_symbolic: bool,
+    max_page_size: u64,
+    defsym_defs: &[(String, String)],
+    extras: &ScriptLinkExtras,
+) -> Result<(), String> {
+    crate::backend::x86::linker::emit_script::link_with_script_i386_with_extras(
+        objects,
+        script_src,
+        output,
+        emit_symtab,
+        is_pie,
+        emit_relocs,
+        gc_sections,
+        soname,
+        dt_symbolic,
+        max_page_size,
+        defsym_defs,
+        extras,
     )
 }
 
@@ -273,6 +301,102 @@ pub fn link_shared_i386(
     search_dirs: &[&str],
 ) -> Result<(), String> {
     crate::backend::i686::linker::link_shared(&[], output, user_args, search_dirs, &[], &[], &[])
+}
+
+pub const DEFAULT_SEARCH_DIRS_AARCH64: &[&str] = &[
+    "/usr/local/lib/aarch64-linux-gnu",
+    "/lib/aarch64-linux-gnu",
+    "/usr/lib/aarch64-linux-gnu",
+    "/usr/aarch64-linux-gnu/lib",
+    "/usr/local/lib64",
+    "/lib64",
+    "/usr/lib64",
+    "/usr/local/lib",
+    "/lib",
+    "/usr/lib",
+];
+
+pub const DEFAULT_SEARCH_DIRS_RISCV64: &[&str] = &[
+    "/usr/local/lib/riscv64-linux-gnu",
+    "/lib/riscv64-linux-gnu",
+    "/usr/lib/riscv64-linux-gnu",
+    "/usr/riscv64-linux-gnu/lib",
+    "/usr/local/lib64",
+    "/lib64",
+    "/usr/lib64",
+    "/usr/local/lib",
+    "/lib",
+    "/usr/lib",
+];
+
+pub fn link_builtin_aarch64(
+    object_files: &[&str],
+    output: &str,
+    user_args: &[String],
+    search_dirs: &[&str],
+    is_static: bool,
+) -> Result<(), String> {
+    crate::backend::arm::linker::link_builtin(
+        object_files,
+        output,
+        user_args,
+        search_dirs,
+        &[],
+        &[],
+        &[],
+        is_static,
+    )
+}
+
+pub fn link_shared_aarch64(
+    object_files: &[&str],
+    output: &str,
+    user_args: &[String],
+    search_dirs: &[&str],
+) -> Result<(), String> {
+    crate::backend::arm::linker::link_shared(
+        object_files,
+        output,
+        user_args,
+        search_dirs,
+        &[],
+        &[],
+        &[],
+    )
+}
+
+pub fn link_builtin_riscv64(
+    object_files: &[&str],
+    output: &str,
+    user_args: &[String],
+    search_dirs: &[&str],
+) -> Result<(), String> {
+    crate::backend::riscv::linker::link_builtin(
+        object_files,
+        output,
+        user_args,
+        search_dirs,
+        &[],
+        &[],
+        &[],
+    )
+}
+
+pub fn link_shared_riscv64(
+    object_files: &[&str],
+    output: &str,
+    user_args: &[String],
+    search_dirs: &[&str],
+) -> Result<(), String> {
+    crate::backend::riscv::linker::link_shared(
+        object_files,
+        output,
+        user_args,
+        search_dirs,
+        &[],
+        &[],
+        &[],
+    )
 }
 
 #[cfg(test)]

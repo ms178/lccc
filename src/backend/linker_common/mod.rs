@@ -115,7 +115,7 @@ pub use secdata::SectionData;
 pub use symstr::SymStr;
 
 // version_script.rs
-pub use version_script::{VersionNode, VersionScript, wildcard_match_pattern};
+pub use version_script::{DynamicList, VersionNode, VersionScript, wildcard_match_pattern};
 
 // mapfile.rs
 pub use mapfile::{LinkMap, MapArchiveMember, MapSectionContribution, build_link_map};
@@ -153,13 +153,17 @@ pub use resolve_lib::{
 };
 
 // write.rs
-pub use write::{align_up_64, pad_to, write_elf64_phdr, write_elf64_phdr_at, write_elf64_shdr};
+pub use write::{
+    align_up_64, convert_elf_file_to_flat_binary, extract_flat_binary_from_elf,
+    format_memory_usage_table, pad_to, write_elf64_phdr, write_elf64_phdr_at, write_elf64_shdr,
+};
 
 // args.rs
 pub use args::{
     HashStyle, InputItem, LinkerArgs, Symbolic, TextrelPolicy, dyn_flags, exclude_libs_matches,
     parse_linker_args, rpath_dyn_entry,
 };
+pub use build_id::BuildIdStyle;
 
 // check.rs
 pub use check::{check_undefined_symbols_elf64, check_undefined_symbols_elf64_verbose};

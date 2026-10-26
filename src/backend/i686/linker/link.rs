@@ -100,14 +100,157 @@ fn search_dirs(args: &LinkerArgs, lib_paths: &[&str]) -> Vec<String> {
 /// Parse and validate the arguments common to both entry points.
 fn prepare(user_args: &[String], is_shared: bool) -> Result<(LinkerArgs, LinkOptions), String> {
     let args = linker_common::parse_linker_args(user_args);
-    let opts = check_capabilities(&args, user_args, is_shared)?;
+    let mut opts = check_capabilities(&args, user_args, is_shared)?;
     if let Some(missing) = args.missing_inputs.first() {
         return Err(format!(
             "cannot find {}: No such file or directory",
             missing
         ));
     }
+    if !opts.dynamic_list_paths.is_empty() {
+        opts.dynamic_list =
+            linker_common::DynamicList::parse_files(&opts.dynamic_list_paths)?.unwrap_or_default();
+    }
     Ok((args, opts))
+}
+
+fn trace_inputs_32(inputs: &[InputObject], resolved: &super::input::ResolvedInputs, trace: bool) {
+    if !trace {
+        return;
+    }
+    for obj in inputs {
+        println!("{}", obj.filename);
+    }
+    for lib in &resolved.shared_libs {
+        println!("{}", lib.soname);
+    }
+}
+
+fn apply_visibility_controls_32(
+    inputs: &[InputObject],
+    global_symbols: &mut FxHashMap<String, LinkerSymbol>,
+    opts: &LinkOptions,
+) -> Result<(), String> {
+    if !opts.exclude_libs.is_empty() {
+        for obj in inputs {
+            if !linker_common::exclude_libs_matches(&opts.exclude_libs, &obj.filename) {
+                continue;
+            }
+            for sym in &obj.symbols {
+                if sym.section_index != SHN_UNDEF
+                    && sym.binding != STB_LOCAL
+                    && !sym.name.is_empty()
+                {
+                    if let Some(gs) = global_symbols.get_mut(&sym.name) {
+                        if gs.is_defined && !gs.is_dynamic && gs.visibility == STV_DEFAULT {
+                            gs.visibility = STV_HIDDEN;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(ref vs_path) = opts.version_script {
+        let vs = linker_common::VersionScript::parse(vs_path)
+            .ok_or_else(|| format!("failed to parse version script '{vs_path}'"))?;
+        for (name, gs) in global_symbols.iter_mut() {
+            if !gs.is_defined || gs.is_dynamic || gs.visibility != STV_DEFAULT {
+                continue;
+            }
+            let base = name.split('@').next().unwrap_or(name);
+            let is_local = (vs.any_local_star() && !vs.matches_global(base))
+                || vs.nodes.iter().any(|n| {
+                    n.local_patterns
+                        .iter()
+                        .any(|p| linker_common::wildcard_match_pattern(p, base))
+                });
+            if is_local {
+                gs.visibility = STV_HIDDEN;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_pie_32(
+    inputs: &[InputObject],
+    global_symbols: &mut FxHashMap<String, LinkerSymbol>,
+    output_sections: &mut Vec<OutputSection>,
+    section_name_to_idx: &FxHashMap<String, usize>,
+    section_map: &SectionMap,
+    resolved: &super::input::ResolvedInputs,
+    dso_refs: &FxHashSet<String>,
+    args: &LinkerArgs,
+    opts: &LinkOptions,
+    pending_defsyms: &PendingDefsyms,
+    output_path: &str,
+) -> Result<(), String> {
+    let mut referenced: FxHashSet<String> = FxHashSet::default();
+    let mut unresolved: Vec<&str> = Vec::new();
+    let mut seen: FxHashSet<&str> = FxHashSet::default();
+    for sym in inputs.iter().flat_map(|o| o.symbols.iter()) {
+        if sym.section_index != SHN_UNDEF
+            || sym.name.is_empty()
+            || sym.binding == STB_LOCAL
+            || global_symbols
+                .get(sym.name.as_str())
+                .is_some_and(|g| g.is_defined)
+            || !seen.insert(sym.name.as_str())
+        {
+            continue;
+        }
+        match resolved.dynlib_syms.get(sym.name.as_str()) {
+            Some(entry) => {
+                referenced.insert(entry.lib.clone());
+            }
+            None if sym.binding != STB_WEAK
+                && !super::shared::is_emitter_defined(&sym.name, section_name_to_idx) =>
+            {
+                unresolved.push(&sym.name);
+            }
+            None => {}
+        }
+    }
+    if !unresolved.is_empty() {
+        unresolved.sort_unstable();
+        return Err(unresolved
+            .iter()
+            .map(|n| format!("undefined reference to `{n}'"))
+            .collect::<Vec<_>>()
+            .join("\n"));
+    }
+    let needed_sonames = resolved.needed_sonames(&referenced);
+    let interp_buf: Option<Vec<u8>> =
+        if !resolved.shared_libs.is_empty() || args.dynamic_linker.is_some() {
+            Some(match args.dynamic_linker.as_deref() {
+                Some(path) => {
+                    if path.is_empty() || path.as_bytes().contains(&0) {
+                        return Err("invalid --dynamic-linker path".into());
+                    }
+                    let mut b = path.as_bytes().to_vec();
+                    b.push(0);
+                    b
+                }
+                None => INTERP.to_vec(),
+            })
+        } else {
+            None
+        };
+    emit_shared_library_32(
+        inputs,
+        global_symbols,
+        output_sections,
+        section_name_to_idx,
+        section_map,
+        &needed_sonames,
+        &resolved.dynlib_syms,
+        interp_buf.as_deref(),
+        dso_refs,
+        output_path,
+        opts,
+        pending_defsyms,
+    )
 }
 
 /// Sonames the resolved symbols bind to (for as-needed DT_NEEDED).
@@ -134,6 +277,9 @@ pub fn link_builtin(
     // (cli.rs: `"n" => self.static_link = true`) before the backend sees
     // it; accept both spellings.
     let user_static = args.is_static || user_args.iter().any(|a| a == "n" || a == "-n");
+    if opts.is_pie && user_static {
+        return Err("-static-pie is not supported by the elf_i386 userspace linker".into());
+    }
 
     let dirs = search_dirs(&args, lib_paths);
     let items = ordered_items(
@@ -162,6 +308,7 @@ pub fn link_builtin(
         resolved.dso_visible_names()
     };
     let mut inputs = std::mem::take(&mut resolved.objects);
+    trace_inputs_32(&inputs, &resolved, opts.trace);
 
     // Phase 4b: one merged GNU property note (CET / ISA level) in place of
     // the per-input copies; every object here is a real input.
@@ -171,12 +318,14 @@ pub fn link_builtin(
     let (mut output_sections, mut section_name_to_idx, section_map) = merge_sections(&mut inputs);
 
     // Phase 6: Resolve symbols
-    let (mut global_symbols, sym_resolution) = resolve_symbols(
-        &inputs,
-        &output_sections,
-        &section_map,
-        &resolved.dynlib_syms,
-    );
+    let no_dynlib_syms: DynlibSyms = FxHashMap::default();
+    let dynlib_for_resolve = if opts.is_pie {
+        &no_dynlib_syms
+    } else {
+        &resolved.dynlib_syms
+    };
+    let (mut global_symbols, sym_resolution) =
+        resolve_symbols(&inputs, &output_sections, &section_map, dynlib_for_resolve);
 
     // Phase 6b: Allocate COMMON symbols in .bss
     allocate_common_symbols(
@@ -197,6 +346,23 @@ pub fn link_builtin(
     // and the link silently emits a load from an unallocated slot.
     let pending_defsyms = apply_defsyms(&mut global_symbols, &args.defsym_defs)?;
     define_tls_module_base(&mut global_symbols, &output_sections);
+    apply_visibility_controls_32(&inputs, &mut global_symbols, &opts)?;
+
+    if opts.is_pie {
+        return finish_pie_32(
+            &inputs,
+            &mut global_symbols,
+            &mut output_sections,
+            &section_name_to_idx,
+            &section_map,
+            &resolved,
+            &dso_refs,
+            &args,
+            &opts,
+            &pending_defsyms,
+            output_path,
+        );
+    }
 
     // Phase 7: Mark PLT/GOT needs and check undefined
     mark_plt_got_needs(&inputs, &mut global_symbols, is_static);
@@ -428,6 +594,7 @@ pub fn link_shared(
         wrap: &opts.wrap,
     })?;
     let mut inputs = std::mem::take(&mut resolved.objects);
+    trace_inputs_32(&inputs, &resolved, opts.trace);
 
     // One merged GNU property note, as in executables.
     merge_gnu_properties(&mut inputs, &opts.properties);
@@ -454,6 +621,7 @@ pub fn link_shared(
     // after the layout in `emit_shared_library_32`).
     let pending_defsyms = apply_defsyms(&mut global_symbols, &args.defsym_defs)?;
     define_tls_module_base(&mut global_symbols, &output_sections);
+    apply_visibility_controls_32(&inputs, &mut global_symbols, &opts)?;
 
     // Undefined non-local references of the output, and which linked shared
     // object (first in command-line order) satisfies each.
@@ -501,6 +669,9 @@ pub fn link_shared(
         &section_name_to_idx,
         &section_map,
         &needed_sonames,
+        &resolved.dynlib_syms,
+        None,
+        &FxHashSet::default(),
         output_path,
         &opts,
         &pending_defsyms,

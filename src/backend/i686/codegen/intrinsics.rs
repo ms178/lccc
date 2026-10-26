@@ -209,6 +209,7 @@ impl I686Codegen {
                     self.store_eax_to(d);
                 }
             }
+            IntrinsicOp::LoadStackGuard => emit_load_stack_guard_i686(self, dest),
 
             // --- GCC local-frame setjmp/longjmp (mirrors the x86-64 lowering
             // in backend/x86/codegen/intrinsics.rs) ---
@@ -411,6 +412,27 @@ impl I686Codegen {
                 self.emit_f32_load_to_x87(&args[0]);
                 self.state.emit("    fsqrt");
                 self.emit_f32_store_from_x87(dest);
+            }
+            IntrinsicOp::F16ToF32 => {
+                self.operand_to_eax(&args[0]);
+                self.state.emit("    movzwl %ax, %eax");
+                self.state.emit("    vmovd %eax, %xmm0");
+                self.state.emit("    vcvtph2ps %xmm0, %xmm0");
+                self.state.emit("    vmovd %xmm0, %eax");
+                self.state.reg_cache.invalidate_acc();
+                if let Some(d) = dest {
+                    self.emit_store_result(d);
+                }
+            }
+            IntrinsicOp::F32ToF16 => {
+                self.emit_f32_scalar_bits_to_xmm(&args[0], "xmm0");
+                self.state.emit("    vcvtps2ph $4, %xmm0, %xmm0");
+                self.state.emit("    vmovd %xmm0, %eax");
+                self.state.emit("    movzwl %ax, %eax");
+                self.state.reg_cache.invalidate_acc();
+                if let Some(d) = dest {
+                    self.emit_store_result(d);
+                }
             }
             // S11: directed-rounding scalar intrinsics. simplify.rs
             // rewrites floor/ceil/trunc/rint/nearbyint/roundeven into
@@ -2870,5 +2892,35 @@ impl I686Codegen {
         }
         self.state.f128_direct_slots.insert(d.0);
         self.state.reg_cache.invalidate_all();
+    }
+}
+
+fn emit_load_stack_guard_i686(cg: &mut I686Codegen, dest: &Option<Value>) {
+    use crate::backend::stack_protector::EffectiveStackGuard;
+    let guard = cg.state.stack_protector_guard.clone();
+    match guard.as_ref() {
+        Some(EffectiveStackGuard::Tls {
+            reg,
+            offset: _,
+            symbol: Some(sym),
+        }) => {
+            cg.state
+                .emit_fmt(format_args!("    movl %{}:{}, %eax", reg, sym));
+        }
+        Some(EffectiveStackGuard::Tls {
+            reg,
+            offset,
+            symbol: None,
+        }) => {
+            cg.state
+                .emit_fmt(format_args!("    movl %{}:{}, %eax", reg, offset));
+        }
+        _ => {
+            cg.state.emit("    movl %gs:20, %eax");
+        }
+    }
+    cg.state.reg_cache.invalidate_acc();
+    if let Some(d) = dest {
+        cg.store_eax_to(d);
     }
 }

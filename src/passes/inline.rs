@@ -1743,6 +1743,7 @@ fn inline_run_with(
                                             ret_is_f128_sse: false,
                                             is_gnu_inline_def: false,
                                             loop_promoted_f64_values: Vec::new(),
+                                            ssp: Default::default(),
                                         };
                                         dummy
                                     },
@@ -2077,6 +2078,7 @@ fn inline_run_with(
                                             ret_is_f128_sse: false,
                                             is_gnu_inline_def: false,
                                             loop_promoted_f64_values: Vec::new(),
+                                            ssp: Default::default(),
                                         };
                                         dummy
                                     },
@@ -2808,6 +2810,7 @@ struct CalleeData {
     /// Builtin assumptions under which this body was formed. Cloning must
     /// conservatively merge these into the caller before later synthesis.
     builtin_policy: crate::common::pass_policy::BuiltinPolicy,
+    ssp: crate::ir::module::SspInfo,
     /// For each param, Some(size) if it's a struct-by-value parameter, None otherwise.
     param_struct_sizes: Vec<Option<usize>>,
     return_type: IrType,
@@ -3722,6 +3725,7 @@ fn callee_data_for(
             blocks: func.blocks.clone(),
             target_features: func.target_features.clone(),
             builtin_policy: func.pass_policy.builtins,
+            ssp: func.ssp,
             param_struct_sizes,
             return_type: func.return_type,
             num_params: func.params.len(),
@@ -4304,6 +4308,9 @@ fn find_inline_call_sites(
                             &func.target_features,
                             &callee_data.target_features,
                         ) {
+                            continue;
+                        }
+                        if func.ssp.no_stack_protector != callee_data.ssp.no_stack_protector {
                             continue;
                         }
                         // Skip callees that exceed normal limits unless the caller
@@ -5778,6 +5785,7 @@ fn inline_call_site(
         .pass_policy
         .builtins
         .conservative_merge(callee.builtin_policy);
+    caller.ssp.merge_inlined(callee.ssp);
 
     true
 }
@@ -5895,7 +5903,7 @@ fn remap_call_info(info: &CallInfo, vo: u32) -> CallInfo {
         struct_arg_is_f128_sse: info.struct_arg_is_f128_sse.clone(),
         is_sret: info.is_sret,
         is_fastcall: info.is_fastcall,
-        regparm: None,
+        regparm: info.regparm,
         is_pure: info.is_pure,
         is_const: info.is_const,
         // A remapped call is the same call: it still reaches (or not) the
@@ -6635,6 +6643,7 @@ mod inline_limit_tests {
         CalleeData {
             target_features: Vec::new(),
             builtin_policy: Default::default(),
+            ssp: Default::default(),
             blocks: (0..block_count)
                 .map(|index| BasicBlock {
                     label: BlockId(index as u32),
@@ -6889,6 +6898,7 @@ mod value_reference_tests {
             ret_is_f128_sse: false,
             is_gnu_inline_def: false,
             loop_promoted_f64_values: Vec::new(),
+            ssp: Default::default(),
         }
     }
 
@@ -7382,6 +7392,7 @@ mod const_trip_tests {
             ret_is_f128_sse: false,
             is_gnu_inline_def: false,
             loop_promoted_f64_values: Vec::new(),
+            ssp: Default::default(),
         }
     }
 
@@ -9512,6 +9523,7 @@ mod sroa_unlock_tests {
         CalleeData {
             target_features: Vec::new(),
             builtin_policy: Default::default(),
+            ssp: Default::default(),
             blocks: vec![BasicBlock {
                 label: BlockId(0),
                 instructions: (0..instructions)

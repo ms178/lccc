@@ -957,6 +957,34 @@ impl Lowerer {
         let ctype = self.get_expr_ctype(arg).unwrap_or(CType::Double);
         let ir_ty = self.get_expr_type(arg);
         let val = self.lower_expr(arg);
+        if ctype.is_half_float() {
+            let u = self.emit_cast_val(val, IrType::U16, IrType::U32);
+            let abs_b = self.emit_binop_val(
+                IrBinOp::And,
+                Operand::Value(u),
+                Operand::Const(IrConst::I32(0x7FFF)),
+                IrType::U32,
+            );
+            let (min_snan, span) = if ctype == CType::BFloat16 {
+                (0x7F81, 0x003F)
+            } else {
+                (0x7C01, 0x01FF)
+            };
+            let sub = self.emit_binop_val(
+                IrBinOp::Sub,
+                Operand::Value(abs_b),
+                Operand::Const(IrConst::I32(min_snan)),
+                IrType::U32,
+            );
+            let res_b = self.emit_cmp_val(
+                IrCmpOp::Ult,
+                Operand::Value(sub),
+                Operand::Const(IrConst::I32(span)),
+                IrType::U32,
+            );
+            let ext = self.emit_cast_val(Operand::Value(res_b), IrType::U8, IrType::I32);
+            return Some(Operand::Value(ext));
+        }
         let res_bool = match ir_ty {
             IrType::F32 => {
                 let slot = self.fresh_value();
@@ -1213,8 +1241,20 @@ impl Lowerer {
         if args.len() != 2 {
             return Some(Operand::Const(IrConst::I32(0)));
         }
-        let t0 = self.get_expr_type(&args[0]);
-        let t1 = self.get_expr_type(&args[1]);
+        let ct0 = self.expr_ctype(&args[0]);
+        let ct1 = self.expr_ctype(&args[1]);
+        let mut t0 = self.get_expr_type(&args[0]);
+        let mut t1 = self.get_expr_type(&args[1]);
+        let mut v0_raw = self.lower_expr(&args[0]);
+        let mut v1_raw = self.lower_expr(&args[1]);
+        if ct0.is_half_float() {
+            v0_raw = Operand::Value(self.emit_half_to_f32(v0_raw, &ct0));
+            t0 = IrType::F32;
+        }
+        if ct1.is_half_float() {
+            v1_raw = Operand::Value(self.emit_half_to_f32(v1_raw, &ct1));
+            t1 = IrType::F32;
+        }
         let cmp_ty = if t0 == IrType::F128 || t1 == IrType::F128 {
             IrType::F128
         } else if t0 == IrType::F64 || t1 == IrType::F64 {
@@ -1222,8 +1262,6 @@ impl Lowerer {
         } else {
             IrType::F32
         };
-        let v0_raw = self.lower_expr(&args[0]);
-        let v1_raw = self.lower_expr(&args[1]);
         let v0 = self.emit_cast_val(v0_raw, t0, cmp_ty);
         let v1 = self.emit_cast_val(v1_raw, t1, cmp_ty);
         // C23 / TS 18661-1 `iseqsig(x, y)` is equivalent to `(x <= y) && (x >= y)`

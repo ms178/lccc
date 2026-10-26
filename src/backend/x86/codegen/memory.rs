@@ -2993,7 +2993,26 @@ impl X86Codegen {
     }
 
     pub(super) fn emit_sub_sp_by_acc_impl(&mut self) {
-        self.state.emit("    subq %rax, %rsp");
+        if self.state.stack_clash_protection {
+            let loop_lbl = self.state.fresh_label("dalloca_probe");
+            let rem_lbl = self.state.fresh_label("dalloca_rem");
+            let done_lbl = self.state.fresh_label("dalloca_done");
+            self.state.out.emit_named_label(&loop_lbl);
+            self.state.out.emit_instr_imm_reg("    cmpq", 4096, "rax");
+            self.state.out.emit_jcc_label("    jb", &rem_lbl);
+            self.state.out.emit_instr_imm_reg("    subq", 4096, "rsp");
+            self.state.emit("    orl $0, (%rsp)");
+            self.state.out.emit_instr_imm_reg("    subq", 4096, "rax");
+            self.state.out.emit_jmp_label(&loop_lbl);
+            self.state.out.emit_named_label(&rem_lbl);
+            self.state.emit("    testq %rax, %rax");
+            self.state.out.emit_jcc_label("    jz", &done_lbl);
+            self.state.emit("    subq %rax, %rsp");
+            self.state.emit("    orl $0, (%rsp)");
+            self.state.out.emit_named_label(&done_lbl);
+        } else {
+            self.state.emit("    subq %rax, %rsp");
+        }
     }
 
     pub(super) fn emit_mov_sp_to_acc_impl(&mut self) {

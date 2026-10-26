@@ -167,6 +167,11 @@ pub(super) struct FunctionBuildState {
     /// Whether the function has any VLA declarations.
     /// Used to decide whether to emit StackSave/StackRestore around gotos.
     pub has_vla: bool,
+    /// Stack-protector classification: function declares at least one local array
+    /// (or aggregate containing an array).
+    pub ssp_has_array: bool,
+    /// Stack-protector classification: largest byte size of any local char array.
+    pub ssp_max_char_array_bytes: u32,
     /// Alloca instructions deferred to the entry block.
     /// Local variable allocas are collected here during lowering so that
     /// variables whose declarations are skipped by `goto` still have valid
@@ -321,6 +326,8 @@ impl FunctionBuildState {
             fp_expr_root: 0,
             vla_stack_save: None,
             has_vla: false,
+            ssp_has_array: false,
+            ssp_max_char_array_bytes: 0,
             entry_allocas: Vec::new(),
             param_alloca_values: Vec::new(),
             instr_spans: Vec::new(),

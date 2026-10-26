@@ -76,7 +76,28 @@ impl Lowerer {
                 continue;
             }
             let is_function_decl = DerivedDeclarator::declares_function(&declarator.derived);
+            let decl_ir_name = self.global_object_ir_name(declarator);
+            if declarator.attrs.externally_visible {
+                self.module
+                    .externally_visible_symbols
+                    .insert(decl_ir_name.clone());
+            }
             if is_function_decl {
+                if let Some(ref zr) = declarator.attrs.zero_call_used_regs
+                    && let Some(mode) =
+                        crate::backend::zero_call_used_regs::ZeroCallUsedRegs::parse(zr)
+                {
+                    self.module
+                        .zero_call_used_regs_attrs
+                        .insert(decl_ir_name, mode);
+                }
+                if let Some(ref ns) = declarator.attrs.no_sanitize {
+                    let parsed = super::ubsan::UbsanFlags::parse_no_sanitize_attr(ns);
+                    self.decl_no_sanitize_map
+                        .entry(declarator.name.clone())
+                        .and_modify(|m| *m = m.union(parsed))
+                        .or_insert(parsed);
+                }
                 if let Some(align) = decl.alignment {
                     self.module
                         .function_alignments
