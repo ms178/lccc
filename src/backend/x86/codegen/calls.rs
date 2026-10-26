@@ -1322,27 +1322,23 @@ impl X86Codegen {
                                     } else {
                                         let gpr = super::emit::phys_reg_name(home);
                                         let gpr32 = super::emit::phys_reg_name_32(home);
-                                        if matches!(ty, IrType::F32 | IrType::D32) {
-                                            self.state.emit_fmt(format_args!(
-                                                "    movd %{}, %{}",
-                                                gpr32, xmm_regs[reg_idx]
-                                            ));
-                                        } else {
-                                            self.state.emit_fmt(format_args!(
-                                                "    movq %{}, %{}",
-                                                gpr, xmm_regs[reg_idx]
-                                            ));
-                                        }
+                                        self.emit_scalar_gpr_to_xmm(
+                                            gpr,
+                                            gpr32,
+                                            xmm_regs[reg_idx],
+                                            matches!(ty, IrType::F32 | IrType::D32),
+                                        );
                                         staged = true;
                                     }
                                 }
                             }
                             if !staged {
                                 self.operand_to_rax(arg);
-                                self.state.out.emit_instr_reg_reg(
-                                    "    movq",
+                                self.emit_scalar_gpr_to_xmm(
                                     "rax",
+                                    "eax",
                                     xmm_regs[reg_idx],
+                                    matches!(ty, IrType::F32 | IrType::D32),
                                 );
                             }
                         }
@@ -1769,7 +1765,8 @@ impl X86Codegen {
         match op {
             Operand::Value(_) => {
                 self.emit_f128_sse_operand_to_xmm(op, "xmm0");
-                self.state.emit("    movdqu %xmm0, (%rsp)");
+                self.state
+                    .emit_fmt(format_args!("    {} %xmm0, (%rsp)", self.xmm_move(false)));
             }
             Operand::Const(c) => {
                 let bits = crate::backend::call_abi::f128_sse_const_image(*c);
@@ -1808,7 +1805,11 @@ impl X86Codegen {
                     self.state.get_slot(v.0),
                     v.0,
                 );
-                self.state.out.emit_instr_rbp_reg("    movdqu", slot.0, xmm);
+                self.state.out.emit_instr_rbp_reg(
+                    &format!("    {}", self.xmm_move(false)),
+                    slot.0,
+                    xmm,
+                );
                 return;
             }
             Operand::Const(c) => {
@@ -1816,7 +1817,9 @@ impl X86Codegen {
                 if bits == 0 {
                     // Do not use IrConst::is_zero here: -0.0 must retain its
                     // sign bit. Only the all-zero 16-byte image takes this arm.
-                    self.state.emit_fmt(format_args!("    pxor %{xmm}, %{xmm}"));
+                    let zero = if self.isa.simd { "pxor" } else { "xorps" };
+                    self.state
+                        .emit_fmt(format_args!("    {zero} %{xmm}, %{xmm}"));
                     return;
                 }
                 bits
@@ -1834,7 +1837,7 @@ impl X86Codegen {
             .emit_instr_imm_reg("    movabsq", hi as i64, "rax");
         self.state.emit("    movq %rax, 8(%rsp)");
         self.state
-            .emit_fmt(format_args!("    movdqu (%rsp), %{xmm}"));
+            .emit_fmt(format_args!("    {} (%rsp), %{xmm}", self.xmm_move(false)));
         // The two movabsq materializations destroyed %rax; the cache must
         // not claim the old value (debug-%rax epoch discipline).
         self.state.reg_cache.invalidate_acc();
@@ -1965,9 +1968,11 @@ impl X86Codegen {
             // DATA directly (resolve_slot_addr must answer Direct, and
             // copies/loads/stores must treat it as full 128-bit).
             if let Some(slot) = self.state.get_slot(dest.0) {
-                self.state
-                    .out
-                    .emit_instr_reg_rbp("    movdqu", "xmm0", slot.0);
+                self.state.out.emit_instr_reg_rbp(
+                    &format!("    {}", self.xmm_move(false)),
+                    "xmm0",
+                    slot.0,
+                );
                 self.state.i128_values.insert(dest.0);
                 self.state.f128_direct_slots.insert(dest.0);
             }
@@ -2093,6 +2098,18 @@ pub(super) fn vector_reg_move(size: usize, idx: usize) -> (&'static str, String)
     match size {
         32 => ("vmovdqu", format!("ymm{idx}")),
         64 => ("vmovdqu64", format!("zmm{idx}")),
-        _ => ("movdqu", format!("xmm{idx}")),
+        _ => {
+            // The psABI XMM carrier exists with SSE1 alone. Keep the SSE2
+            // spelling on normal targets, but never introduce MOVDQU merely
+            // to marshal a legal SSE1 float vector argument or return value.
+            let instruction = if crate::common::x86_features::effective()
+                .contains(crate::common::x86_features::X86Feature::Sse2)
+            {
+                "movdqu"
+            } else {
+                "movups"
+            };
+            (instruction, format!("xmm{idx}"))
+        }
     }
 }

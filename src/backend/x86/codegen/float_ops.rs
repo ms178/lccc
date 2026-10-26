@@ -164,11 +164,12 @@ impl X86Codegen {
             }
             _ => {
                 self.operand_to_rax(op);
-                if matches!(ty, IrType::F32 | IrType::D32) {
-                    self.state.emit("    movd %eax, %xmm0");
-                } else {
-                    self.state.emit("    movq %rax, %xmm0");
-                }
+                self.emit_scalar_gpr_to_xmm(
+                    "rax",
+                    "eax",
+                    "xmm0",
+                    matches!(ty, IrType::F32 | IrType::D32),
+                );
             }
         }
     }
@@ -1607,13 +1608,7 @@ impl X86Codegen {
                     } else {
                         let gpr = phys_reg_name(reg);
                         let gpr32 = phys_reg_name_32(reg);
-                        if ty == IrType::F32 {
-                            self.state
-                                .emit_fmt(format_args!("    movd %{}, %{}", gpr32, xmm));
-                        } else {
-                            self.state
-                                .emit_fmt(format_args!("    movq %{}, %{}", gpr, xmm));
-                        }
+                        self.emit_scalar_gpr_to_xmm(gpr, gpr32, xmm, ty == IrType::F32);
                     }
                     return;
                 }
@@ -1631,11 +1626,7 @@ impl X86Codegen {
                 // %rcx for an xmm1 target would load garbage. Fix: always
                 // source the accumulator.
                 if self.state.acc_has_verified(v.0, is_alloca) {
-                    if ty == IrType::F32 {
-                        self.state.emit_fmt(format_args!("    movd %eax, %{}", xmm));
-                    } else {
-                        self.state.emit_fmt(format_args!("    movq %rax, %{}", xmm));
-                    }
+                    self.emit_scalar_gpr_to_xmm("rax", "eax", xmm, ty == IrType::F32);
                     return;
                 }
                 // Fallback: GPR → XMM path (handles any other case not covered
@@ -1647,13 +1638,7 @@ impl X86Codegen {
                 } else {
                     self.operand_to_rcx(op);
                 }
-                if ty == IrType::F32 {
-                    self.state
-                        .emit_fmt(format_args!("    movd %{}, %{}", gpr32, xmm));
-                } else {
-                    self.state
-                        .emit_fmt(format_args!("    movq %{}, %{}", gpr, xmm));
-                }
+                self.emit_scalar_gpr_to_xmm(gpr, gpr32, xmm, ty == IrType::F32);
             }
             _ => {
                 // Other operand kinds (e.g. Const::I64 for bitcast): GPR → XMM
@@ -1664,13 +1649,7 @@ impl X86Codegen {
                 } else {
                     self.operand_to_rcx(op);
                 }
-                if ty == IrType::F32 {
-                    self.state
-                        .emit_fmt(format_args!("    movd %{}, %{}", gpr32, xmm));
-                } else {
-                    self.state
-                        .emit_fmt(format_args!("    movq %{}, %{}", gpr, xmm));
-                }
+                self.emit_scalar_gpr_to_xmm(gpr, gpr32, xmm, ty == IrType::F32);
             }
         }
     }

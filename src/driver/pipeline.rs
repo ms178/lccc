@@ -3155,7 +3155,25 @@ impl Driver {
         // available after an SSE2 denial, but fail closed on emitters that
         // still require SSE2 (notably F64: there is no x87 fallback here).
         if self.target == Target::X86_64 && self.no_sse2 && !self.no_sse {
-            if let Some((func, line)) = first_sse2_reference(&asm) {
+            // A local legacy-vector grant keeps the same XMM ABI as the
+            // SSE1 TU baseline. Check the actual function scope, not a TU-wide
+            // exemption that could hide an illegal neighboring function.
+            let sse2_functions: std::collections::HashSet<&str> = module
+                .functions
+                .iter()
+                .filter(|f| {
+                    let has = |name: &str| f.target_features.iter().any(|feature| feature == name);
+                    !has("no-sse")
+                        && !has("no-sse2")
+                        && ["sse2", "sse3", "ssse3", "sse4.1", "sse4.2", "avx", "avx2"]
+                            .iter()
+                            .any(|feature| has(feature))
+                })
+                .map(|f| f.name.as_str())
+                .collect();
+            if let Some((func, line)) =
+                first_sse2_reference_unless(&asm, |name| sse2_functions.contains(name))
+            {
                 return Err(format!(
                     "{input_file}: in function '{func}': operation requires SSE2, \
                      but SSE2 is disabled (-mno-sse2); x86-64 lccc has no \
@@ -3849,87 +3867,98 @@ mod arm_simd_reference_tests {
 }
 
 fn first_sse_reference(asm: &str) -> Option<(String, String)> {
-    first_xmm_reference_if(asm, |_| true)
+    first_xmm_reference_if(asm, |_, _| true)
 }
 
 /// SSE1's XMM vocabulary, including AT&T size-suffixed scalar conversions.
 /// User inline assembly remains an explicit escape hatch, as in the no-SSE
 /// fence. MMX-only instructions without an XMM operand are not SSE2 leaks.
 fn first_sse2_reference(asm: &str) -> Option<(String, String)> {
-    first_xmm_reference_if(asm, |op| {
-        !matches!(
-            op,
-            "movss"
-                | "movaps"
-                | "movups"
-                | "movhps"
-                | "movlps"
-                | "movhlps"
-                | "movlhps"
-                | "unpcklps"
-                | "unpckhps"
-                | "shufps"
-                | "movmskps"
-                | "movntps"
-                | "addss"
-                | "addps"
-                | "subss"
-                | "subps"
-                | "mulss"
-                | "mulps"
-                | "divss"
-                | "divps"
-                | "sqrtss"
-                | "sqrtps"
-                | "rcpss"
-                | "rcpps"
-                | "rsqrtss"
-                | "rsqrtps"
-                | "minss"
-                | "minps"
-                | "maxss"
-                | "maxps"
-                | "andps"
-                | "andnps"
-                | "orps"
-                | "xorps"
-                | "comiss"
-                | "ucomiss"
-                | "cmpps"
-                | "cmpss"
-                | "cmpeqps"
-                | "cmpeqss"
-                | "cmpltps"
-                | "cmpltss"
-                | "cmpleps"
-                | "cmpless"
-                | "cmpunordps"
-                | "cmpunordss"
-                | "cmpneqps"
-                | "cmpneqss"
-                | "cmpnltps"
-                | "cmpnltss"
-                | "cmpnleps"
-                | "cmpnless"
-                | "cmpordps"
-                | "cmpordss"
-                | "cvtpi2ps"
-                | "cvtps2pi"
-                | "cvttps2pi"
-                | "cvtsi2ss"
-                | "cvtsi2ssl"
-                | "cvtsi2ssq"
-                | "cvtss2si"
-                | "cvtss2sil"
-                | "cvtss2siq"
-                | "cvttss2si"
-                | "cvttss2sil"
-                | "cvttss2siq"
-        )
+    first_sse2_reference_unless(asm, |_| false)
+}
+
+fn first_sse2_reference_unless(
+    asm: &str,
+    permitted: impl Fn(&str) -> bool,
+) -> Option<(String, String)> {
+    first_xmm_reference_if(asm, |function, op| {
+        !permitted(function)
+            && !matches!(
+                op,
+                "movss"
+                    | "movaps"
+                    | "movups"
+                    | "movhps"
+                    | "movlps"
+                    | "movhlps"
+                    | "movlhps"
+                    | "unpcklps"
+                    | "unpckhps"
+                    | "shufps"
+                    | "movmskps"
+                    | "movntps"
+                    | "addss"
+                    | "addps"
+                    | "subss"
+                    | "subps"
+                    | "mulss"
+                    | "mulps"
+                    | "divss"
+                    | "divps"
+                    | "sqrtss"
+                    | "sqrtps"
+                    | "rcpss"
+                    | "rcpps"
+                    | "rsqrtss"
+                    | "rsqrtps"
+                    | "minss"
+                    | "minps"
+                    | "maxss"
+                    | "maxps"
+                    | "andps"
+                    | "andnps"
+                    | "orps"
+                    | "xorps"
+                    | "comiss"
+                    | "ucomiss"
+                    | "cmpps"
+                    | "cmpss"
+                    | "cmpeqps"
+                    | "cmpeqss"
+                    | "cmpltps"
+                    | "cmpltss"
+                    | "cmpleps"
+                    | "cmpless"
+                    | "cmpunordps"
+                    | "cmpunordss"
+                    | "cmpneqps"
+                    | "cmpneqss"
+                    | "cmpnltps"
+                    | "cmpnltss"
+                    | "cmpnleps"
+                    | "cmpnless"
+                    | "cmpordps"
+                    | "cmpordss"
+                    | "cvtpi2ps"
+                    | "cvtps2pi"
+                    | "cvttps2pi"
+                    | "cvtsi2ss"
+                    | "cvtsi2ssl"
+                    | "cvtsi2ssq"
+                    | "cvtss2si"
+                    | "cvtss2sil"
+                    | "cvtss2siq"
+                    | "cvttss2si"
+                    | "cvttss2sil"
+                    | "cvttss2siq"
+            )
     })
 }
 
-fn first_xmm_reference_if(asm: &str, forbidden: impl Fn(&str) -> bool) -> Option<(String, String)> {
+fn first_xmm_reference_if(
+    asm: &str,
+    forbidden: impl Fn(&str, &str) -> bool,
+) -> Option<(String, String)> {
     let mut func = String::from("<toplevel>");
     let mut in_app = false;
     for line in asm.lines() {
@@ -3946,6 +3975,9 @@ fn first_xmm_reference_if(asm: &str, forbidden: impl Fn(&str) -> bool) -> Option
             continue;
         }
         if t.starts_with('.') {
+            if t.starts_with(".size ") {
+                func = String::from("<toplevel>");
+            }
             if let Some(rest) = t.strip_prefix(".type ") {
                 if rest.trim_end().ends_with("@function") {
                     if let Some(name) = rest.split(',').next() {
@@ -3961,7 +3993,7 @@ fn first_xmm_reference_if(asm: &str, forbidden: impl Fn(&str) -> bool) -> Option
         let code = t.split('#').next().unwrap_or("");
         let op = code.split_ascii_whitespace().next().unwrap_or("");
         if (code.contains("%xmm") || code.contains("%ymm") || code.contains("%zmm"))
-            && forbidden(op)
+            && forbidden(&func, op)
         {
             return Some((func, line.to_string()));
         }
@@ -4053,5 +4085,31 @@ mod loop_idiom_capability_tests {
         driver.target = Target::Riscv64;
         driver.general_regs_only = false;
         assert!(!driver.resolved_fast_popcount());
+    }
+}
+
+#[cfg(test)]
+mod scoped_sse2_fence_tests {
+    use super::first_sse2_reference_unless;
+
+    #[test]
+    fn local_grant_does_not_exempt_a_neighbor_or_toplevel() {
+        let prefix =
+            ".type allowed, @function\nallowed:\n paddd %xmm1, %xmm0\n.size allowed, .-allowed\n";
+        assert!(first_sse2_reference_unless(prefix, |name| name == "allowed").is_none());
+        let neighbor = format!("{prefix}.type denied, @function\ndenied:\n paddd %xmm1, %xmm0\n");
+        assert_eq!(
+            first_sse2_reference_unless(&neighbor, |name| name == "allowed")
+                .unwrap()
+                .0,
+            "denied"
+        );
+        let outside = format!("{prefix} movdqu %xmm0, %xmm1\n");
+        assert_eq!(
+            first_sse2_reference_unless(&outside, |name| name == "allowed")
+                .unwrap()
+                .0,
+            "<toplevel>"
+        );
     }
 }

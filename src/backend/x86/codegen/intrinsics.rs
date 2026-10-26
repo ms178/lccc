@@ -3554,9 +3554,15 @@ impl X86Codegen {
                     self.emit_sse_binary_128(dptr, args, inst);
                 }
             }
-            IntrinsicOp::Setzero128 => {
+            IntrinsicOp::Setzero128 | IntrinsicOp::SetzeroPs128 => {
                 if let Some(dptr) = dest_ptr {
-                    self.state.emit("    pxor %xmm0, %xmm0");
+                    self.state.emit(
+                        if matches!(op, IntrinsicOp::SetzeroPs128) || !self.isa.simd {
+                            "    xorps %xmm0, %xmm0"
+                        } else {
+                            "    pxor %xmm0, %xmm0"
+                        },
+                    );
                     self.sse_store_dest(dptr, "xmm0");
                 }
             }
@@ -3645,7 +3651,8 @@ impl X86Codegen {
             }
             IntrinsicOp::Setzero256 => {
                 if let Some(dptr) = dest_ptr {
-                    self.state.emit("    vpxor %ymm0, %ymm0, %ymm0");
+                    // VEX.128 integer XOR is AVX1 and clears the upper YMM half.
+                    self.state.emit("    vpxor %xmm0, %xmm0, %xmm0");
                     self.avx_store_dest(dptr);
                 }
             }

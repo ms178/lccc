@@ -7876,7 +7876,7 @@ fn vecreg_compute_arg_count(op: &IntrinsicOp) -> Option<usize> {
     use IntrinsicOp as O;
     match op {
         // Full-width constants do not read a vector operand.
-        O::Setzero128 => Some(0),
+        O::Setzero128 | O::SetzeroPs128 => Some(0),
 
         // Unary vector input followed, for some ops, by scalar/immediate
         // operands. Inserts preserve the other lanes of args[0].

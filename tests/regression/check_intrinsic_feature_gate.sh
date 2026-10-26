@@ -494,3 +494,7 @@ for mode in -m64 -m32; do
 done
 
 echo "PASS: ISA-sensitive intrinsics are gated on the permitted feature set, oracle-checked"
+
+# Legacy SSE1 / SSE2 permission, exact instruction ceiling and native ABI legs.
+python3 "$repo/tests/regression/check_legacy_sse_permissions.py" --lccc "$ccc"
+python3 "$repo/tests/regression/check_legacy_sse_native.py" --lccc "$ccc"
