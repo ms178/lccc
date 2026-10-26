@@ -1155,6 +1155,25 @@ sessions have now spent time re-deriving that these numbers are not gaps.
 
 ---
 
+## 9a. SSE/AVX audit follow-through (2026-10-26)
+
+These are **open obligations**, not an ISA/manual sign-off. Start with
+`scripts/audit_sse_avx_public_api.py --check` and the pinned GCC 16.2 header
+name/reference sets in `engineering/isa/`. Name presence is not evidence that
+an implementation is correct. The initial scope is `_mm_*`/`_mm256_*` in the
+eight named SSE–AVX2 leaf headers plus bundled `lcccsimd.h`; uppercase control
+macros/constants, MMX aliases and other `immintrin.h` extension headers need
+separate inventories. Conditional alternatives are retained, not preprocessed.
+
+| ID | Reproducer / starting point | Acceptance criterion |
+|---|---|---|
+| SIMD-API-1 | `missing_reference_names` in `sse-avx-public-api.json`; compare against the SHA-pinned GCC resource headers, not just existing bundled wrappers | Classify every reference-only name as implemented, explicit supported-scope exclusion, alias or diagnosed gap; native typedef/layout and direct/indirect mixed-compiler ABI tests on i686/x86-64 at O0/O2; inventory control macros, constants and remaining headers separately. Bundled-only names are not automatically nonstandard (reference scope excludes FMA/AVX512VL headers). |
+| SIMD-PERM-1 | `legacy_simd_feature` in `expr_builtins_lcccsimd.rs`: broad `v*`/`*512` handling cannot express subset conjunctions; start with `vpcmpub128/256` (BW+VL), ternary logic (F+VL), DQ conversions and masked byte loads | Per-instruction all-required-feature metadata; independently deny each subset and AVX512VL with positive controls; oracle-check global and function-local targets, both option orders, x86/i686; unsupported architectures diagnose. No EVEX width shortcut or host-CPU inference. |
+| SIMD-FMA-1 | Current helper gate recognizes `fmadd` substrings, not every FMA form; inspect fmsub/fnmadd/fnmsub/addsub/subadd and current `check_x86_simd_feature` function-local FMA handling | Enumerate all exposed FMA helpers/raw builtins with exact FMA3/FMA4 distinction and AVX requirements; test global denial plus local enable, global enable plus local denial, both inlining directions and separate callers. Explicit intrinsic permission must not depend on `-ffp-contract`; arithmetic contraction must still respect its policy. |
+| SIMD-TYPE-1 | Header-derived arity table and generated-helper metadata test cover resolved prototypes; the exact unmapped ratchet contains `512_i_vpcmpeqb512` and `512_i_vpcmpeqw512` (valid calls now diagnose); operand class/type/width, malformed width/class prefixes and unknown mnemonic paths remain separate gaps | Generate positive and missing/extra-operand controls for every helper including aliases, scalar/store/zero-operand families; enforce vector lane/width, pointer constness and scalar/immediate ranges with precise diagnostics, never silent truncation/zero/ICE. Cover undeclared and forged prototypes and foreign targets. |
+| SIMD-MANUAL-1 | Intel combined SDM 325462-093; AMD 26568 rev 3.27 (July 2026), 24594 rev 3.38. Selected Intel 2B MIN/MAX instruction sections are reviewed; combined Intel/AMD retrieval established edition/front matter only. A 30-page extraction is **not full-manual coverage** | Obtain full primary instruction sections, retain hashes/edition/page or instruction anchors and extraction method; map every public API, raw builtin, lowering and assembler encoding to actual instruction requirements. Check register/memory/immediate forms, widths, destructive/upper-lane effects, masks, alignment, fault behavior, rounding/MXCSR, NaNs/signaling/signed-zero/subnormals, memory tails and numerical edge cases. Both x86 modes; GAS/LLVM cross-checks are not substitutes for manuals. Publish per-row reviewed/untested/unsupported status; never infer whole-family coverage from selected runtime legs. |
+| SIMD-PERF-1 | `legacy_sse_native_chain.c`, generic helper chains, and YMM ABI carrier frames; `aggregate_abi.rs` documents the hidden-pointer IR shape even for register returns | Remove carrier/copy bridges only with an IR/inliner/ABI proof. Compare exact outputs against GCC 16.2 in all four caller/provider directions; guard pages, volatile/address spaces and inline/noinline controls; paired output-checked SSE2/AVX/AVX2 corpus runtime plus Valgrind/Callgrind, instruction/frame receipts, O2 native host screening and hosted EPYC results. Static or Callgrind counts alone are not a runtime speed claim. |
+
 ## 10. Carried over from the superseded live queue (full text in the archives)
 
 Everything open in the 478-line queue that this file replaces is listed here with

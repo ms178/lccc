@@ -94,6 +94,8 @@ typedef unsigned char __v64qu __attribute__ ((__vector_size__ (64)));
 #define __CCC_M128_FROM_NATIVE(e) ((__m128)(e))
 #define __CCC_M128D_FROM_NATIVE(e) ((__m128d)(e))
 #define __CCC_M128I_FROM_NATIVE(e) ((__m128i)(e))
+#define __CCC_M256_FROM_NATIVE(e) ((__m256)(e))
+#define __CCC_M256D_FROM_NATIVE(e) ((__m256d)(e))
 
 #define __CCC_M128I_FROM_BUILTIN(e) (*(__m128i *)(e))
 #define __CCC_M128_FROM_BUILTIN(e)  (*(__m128 *)(e))
@@ -1179,17 +1181,17 @@ __m128d __lccc_simd128_ps_cvtsi2sd64_128(long, __m128d __a, long long __i);
 static __inline__ __attribute__((__always_inline__, __artificial__)) __m128d _mm_cvtsi64_sd(__m128d __a, long long __i)
 { return __CCC_M128D_FROM_NATIVE(__lccc_simd128_ps_cvtsi2sd64_128(0, __a, __i)); }
 
-void * __lccc_simd256_ps_vdivps256(long, __m256 __a, __m256 __b);
+__m256 __lccc_simd256_ps_vdivps256(long, __m256 __a, __m256 __b);
 static __inline__ __attribute__((__always_inline__, __artificial__)) __m256 _mm256_div_ps(__m256 __a, __m256 __b)
-{ return __CCC_M256_FROM_BUILTIN(__lccc_simd256_ps_vdivps256(0, __a, __b)); }
+{ return __CCC_M256_FROM_NATIVE(__lccc_simd256_ps_vdivps256(0, __a, __b)); }
 
-void * __lccc_simd256_ps_vminps256(long, __m256 __a, __m256 __b);
+__m256 __lccc_simd256_ps_vminps256(long, __m256 __a, __m256 __b);
 static __inline__ __attribute__((__always_inline__, __artificial__)) __m256 _mm256_min_ps(__m256 __a, __m256 __b)
-{ return __CCC_M256_FROM_BUILTIN(__lccc_simd256_ps_vminps256(0, __a, __b)); }
+{ return __CCC_M256_FROM_NATIVE(__lccc_simd256_ps_vminps256(0, __a, __b)); }
 
-void * __lccc_simd256_ps_vmaxps256(long, __m256 __a, __m256 __b);
+__m256 __lccc_simd256_ps_vmaxps256(long, __m256 __a, __m256 __b);
 static __inline__ __attribute__((__always_inline__, __artificial__)) __m256 _mm256_max_ps(__m256 __a, __m256 __b)
-{ return __CCC_M256_FROM_BUILTIN(__lccc_simd256_ps_vmaxps256(0, __a, __b)); }
+{ return __CCC_M256_FROM_NATIVE(__lccc_simd256_ps_vmaxps256(0, __a, __b)); }
 
 void * __lccc_simd256_ps_vunpcklps256(long, __m256 __a, __m256 __b);
 static __inline__ __attribute__((__always_inline__, __artificial__)) __m256 _mm256_unpacklo_ps(__m256 __a, __m256 __b)
@@ -1199,17 +1201,17 @@ void * __lccc_simd256_ps_vunpckhps256(long, __m256 __a, __m256 __b);
 static __inline__ __attribute__((__always_inline__, __artificial__)) __m256 _mm256_unpackhi_ps(__m256 __a, __m256 __b)
 { return __CCC_M256_FROM_BUILTIN(__lccc_simd256_ps_vunpckhps256(0, __a, __b)); }
 
-void * __lccc_simd256_ps_vdivpd256(long, __m256d __a, __m256d __b);
+__m256d __lccc_simd256_ps_vdivpd256(long, __m256d __a, __m256d __b);
 static __inline__ __attribute__((__always_inline__, __artificial__)) __m256d _mm256_div_pd(__m256d __a, __m256d __b)
-{ return __CCC_M256D_FROM_BUILTIN(__lccc_simd256_ps_vdivpd256(0, __a, __b)); }
+{ return __CCC_M256D_FROM_NATIVE(__lccc_simd256_ps_vdivpd256(0, __a, __b)); }
 
-void * __lccc_simd256_ps_vminpd256(long, __m256d __a, __m256d __b);
+__m256d __lccc_simd256_ps_vminpd256(long, __m256d __a, __m256d __b);
 static __inline__ __attribute__((__always_inline__, __artificial__)) __m256d _mm256_min_pd(__m256d __a, __m256d __b)
-{ return __CCC_M256D_FROM_BUILTIN(__lccc_simd256_ps_vminpd256(0, __a, __b)); }
+{ return __CCC_M256D_FROM_NATIVE(__lccc_simd256_ps_vminpd256(0, __a, __b)); }
 
-void * __lccc_simd256_ps_vmaxpd256(long, __m256d __a, __m256d __b);
+__m256d __lccc_simd256_ps_vmaxpd256(long, __m256d __a, __m256d __b);
 static __inline__ __attribute__((__always_inline__, __artificial__)) __m256d _mm256_max_pd(__m256d __a, __m256d __b)
-{ return __CCC_M256D_FROM_BUILTIN(__lccc_simd256_ps_vmaxpd256(0, __a, __b)); }
+{ return __CCC_M256D_FROM_NATIVE(__lccc_simd256_ps_vmaxpd256(0, __a, __b)); }
 
 void * __lccc_simd256_ps_vunpcklpd256(long, __m256d __a, __m256d __b);
 static __inline__ __attribute__((__always_inline__, __artificial__)) __m256d _mm256_unpacklo_pd(__m256d __a, __m256d __b)
@@ -1231,13 +1233,13 @@ void * __lccc_simd256_ps_vaddsubps256(long, __m256 __a, __m256 __b);
 static __inline__ __attribute__((__always_inline__, __artificial__)) __m256 _mm256_addsub_ps(__m256 __a, __m256 __b)
 { return __CCC_M256_FROM_BUILTIN(__lccc_simd256_ps_vaddsubps256(0, __a, __b)); }
 
-void * __lccc_simd256_ps_vsqrtps256(long, __m256 __a);
+__m256 __lccc_simd256_ps_vsqrtps256(long, __m256 __a);
 static __inline__ __attribute__((__always_inline__, __artificial__)) __m256 _mm256_sqrt_ps(__m256 __a)
-{ return __CCC_M256_FROM_BUILTIN(__lccc_simd256_ps_vsqrtps256(0, __a)); }
+{ return __CCC_M256_FROM_NATIVE(__lccc_simd256_ps_vsqrtps256(0, __a)); }
 
-void * __lccc_simd256_ps_vsqrtpd256(long, __m256d __a);
+__m256d __lccc_simd256_ps_vsqrtpd256(long, __m256d __a);
 static __inline__ __attribute__((__always_inline__, __artificial__)) __m256d _mm256_sqrt_pd(__m256d __a)
-{ return __CCC_M256D_FROM_BUILTIN(__lccc_simd256_ps_vsqrtpd256(0, __a)); }
+{ return __CCC_M256D_FROM_NATIVE(__lccc_simd256_ps_vsqrtpd256(0, __a)); }
 
 void * __lccc_simd256_ps_vpermilvarps256(long, __m256 __a, __m256i __b);
 static __inline__ __attribute__((__always_inline__, __artificial__)) __m256 _mm256_permutevar_ps(__m256 __a, __m256i __b)

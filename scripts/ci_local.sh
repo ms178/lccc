@@ -861,6 +861,14 @@ gate "ill-typed-builtins-selftest" fast \
 # AUD-ICE-1: the argument counts the front end enforces for builtins come from
 # include/*.h; the checked-in table is regenerated, never hand-edited, and this
 # gate fails if it stops matching the headers it was derived from.
+gate "sse-avx-public-api-selftest" fast \
+    python3 scripts/audit_sse_avx_public_api.py --self-test
+gate "sse-avx-public-api" fast \
+    python3 scripts/audit_sse_avx_public_api.py --check
+gate "simd-helper-contract" fast \
+    python3 tests/regression/check_simd_helper_contract.py --lccc "$LCCC"
+gate "native-packed-fp-helpers" fast \
+    python3 tests/regression/check_legacy_sse_native.py --lccc "$LCCC" --gcc gcc-16 --source tests/regression/native_packed_fp_helpers.c --check-codegen
 gate "intrinsic-arity-selftest" fast \
     python3 scripts/check_intrinsic_arity.py --self-test
 gate "intrinsic-arity" fast \

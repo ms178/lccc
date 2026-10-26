@@ -403,7 +403,7 @@ w(" * XMM/YMM/ZMM values between consecutive intrinsics (vec_live_regs cache).")
 w(" */")
 w("")
 # Native result adapters must never reinterpret a returned vector as an address.
-for kind in ("M128", "M128D", "M128I"):
+for kind in ("M128", "M128D", "M128I", "M256", "M256D"):
     w(f"#define __CCC_{kind}_FROM_NATIVE(e) ((__{kind.lower()})(e))")
 w("")
 w("#define __CCC_M128I_FROM_BUILTIN(e) (*(__m128i *)(e))")
@@ -419,9 +419,12 @@ w("")
 
 ALWAYS = "__attribute__((__always_inline__, __artificial__))"
 
+NATIVE_256_FP = {f"256_ps_v{op}{kind}256"
+                 for op in ("div", "min", "max", "sqrt") for kind in ("ps", "pd")}
+
 def proto(name, ret, params):
     assert ret == "void" or ret.startswith("m"), f"invalid vector builtin result: {name}: {ret}"
-    rt = "void" if ret == "void" else ("__" + ret if name.startswith("128_ps_") else "void *")
+    rt = "void" if ret == "void" else ("__" + ret if name.startswith("128_ps_") or name in NATIVE_256_FP else "void *")
     w(f"{rt} __lccc_simd{name}({', '.join(params)});")
 
 def wrap(decl, body):
@@ -778,6 +781,12 @@ w("#endif /* _LCCCSIMD_H_INCLUDED */")
 # pointer-result APIs until their own result-type contracts are migrated.
 L = [re.sub(r"__CCC_(M128[DI]?)_FROM_BUILTIN\((__lccc_simd128_ps_)",
             r"__CCC_\1_FROM_NATIVE(\2", line) for line in L]
+# The migrated wide FP helpers have native result prototypes too. Keep
+# unrelated pointer families separate: no width-wide mechanical conversion.
+for i, line in enumerate(L):
+    for name in NATIVE_256_FP:
+        if "__lccc_simd" + name + "(" in line:
+            L[i] = re.sub(r"__CCC_(M256D?)_FROM_BUILTIN", r"__CCC_\1_FROM_NATIVE", line)
 generated = "\n".join(L) + "\n"
 if _CHECK_ONLY:
     current = OUT.read_text() if OUT.exists() else ""
