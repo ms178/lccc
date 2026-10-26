@@ -85,18 +85,30 @@ EOF
 "$CCC" -ffreestanding -fsyntax-only "$td/freestanding.c"
 "$CCC" -fno-builtin -fsyntax-only "$td/hosted.c"
 
-# GCC 16.2 exposes the AVX512BMM subset; its feature macro must follow the
-# per-feature last-option-wins state without coupling to AVX512F denial.
+# GCC 16.2's positive BMM option implies BW and F. A subsequent negative
+# BMM option revokes those implied prerequisites when they have no other source.
 "$CCC" -dM -E -mavx512bmm -x c /dev/null >"$td/bmm-on.macros"
 grep -q '^#define __AVX512BMM__ 1$' "$td/bmm-on.macros"
 grep -q '^#define __AVX512F__ 1$' "$td/bmm-on.macros"
 grep -q '^#define __AVX512BW__ 1$' "$td/bmm-on.macros"
 "$CCC" -dM -E -mavx512bmm -mno-avx512bmm -x c /dev/null >"$td/bmm-off.macros"
-if grep -q '^#define __AVX512BMM__ ' "$td/bmm-off.macros"; then
-    echo "FAIL: -mno-avx512bmm did not revoke only the BMM permission" >&2
+if grep -q '^#define __AVX512' "$td/bmm-off.macros"; then
+    echo "FAIL: -mno-avx512bmm left BMM-only AVX-512 grants enabled" >&2
     exit 1
 fi
-grep -q '^#define __AVX512F__ 1$' "$td/bmm-off.macros"
+"$CCC" -dM -E -mavx512f -mavx512bmm -mno-avx512bmm -x c /dev/null >"$td/bmm-off-keep-f.macros"
+grep -q '^#define __AVX512F__ 1$' "$td/bmm-off-keep-f.macros"
+if grep -Eq '^#define __AVX512(BW|BMM)__' "$td/bmm-off-keep-f.macros"; then
+    echo "FAIL: BMM-only BW grant survived its revocation alongside independent AVX512F" >&2
+    exit 1
+fi
+"$CCC" -dM -E -mavx512bw -mavx512bmm -mno-avx512bmm -x c /dev/null >"$td/bmm-off-keep-bw.macros"
+grep -q '^#define __AVX512F__ 1$' "$td/bmm-off-keep-bw.macros"
+grep -q '^#define __AVX512BW__ 1$' "$td/bmm-off-keep-bw.macros"
+if grep -q '^#define __AVX512BMM__' "$td/bmm-off-keep-bw.macros"; then
+    echo "FAIL: -mno-avx512bmm did not revoke BMM beside independent BW" >&2
+    exit 1
+fi
 "$CCC" -dM -E -mavx512bmm -mno-avx512bmm -mavx512bmm -x c /dev/null >"$td/bmm-last-on.macros"
 grep -q '^#define __AVX512BMM__ 1$' "$td/bmm-last-on.macros"
 
