@@ -83,6 +83,7 @@ disables (they are presence checks unless noted).
 | `CCC_NO_ANDN_FUSION` | unset (fusion on) | Disables the BMI1 3-operand `andn` fusion (backend `detect_and_not_fusions` + `emit_and_not_impl`) AND the bool-mux algebra's defer-to-fusion prediction (`has_scalar_andn`), in one shared resolution. |
 | `CCC_NO_BOOL_ALGEBRA` | unset (pass on) | Disables the whole `bit_idioms` bool-mux algebra (CH mux fold, MAJ majority fold, distributive). |
 | `CCC_NO_RORX` | unset (emission on) | Independent kill switch for BMI2 `rorx` instruction selection (does not affect the ANDN/bool-algebra gates). |
+| `CCC_NO_RING_IDENTITIES` | unset (pass on) | Disables the `bit_idioms` ring-identity sub-pass: the `x % C` vs `x` window compare, the sign-mask shift to arithmetic shift, the saturated min/max select, the zero-test select and the complement-of-negation rewrite. A/B and bisection only; every fold is bit-exact in the operand ring. |
 | `CCC_IVSR_SCALAR_DERIVED` | **opt-in** (`=1` to enable) | Enables the scalar derived-IV flavor of IV strength reduction (`iv*C` without a GEP). Off by default: measured net runtime loss while latch phi-web parking exists (the PR #602 golden-workload regressions). |
 
 The `-mbmi`/`-mno-bmi`/`-march` front-end flags are the primary control;
@@ -156,6 +157,7 @@ them once per translation unit (never per function).
 | `CCC_IVSR_SCALAR_DERIVED` | unset (OFF) | Opt-in: arms the scalar derived-IV strength-reduction flavor (induction `i * stride` → a dedicated `+stride` recurrence).  Default OFF because it measured as a net loss on the current allocator (the extra recurrence raises register pressure past the win); revisit after the Unit-4 allocator work.  Pinned by `test_production_default_leaves_scalar_derived_ivs_off` (default) vs `test_scalar_derived_iv_hash_shape` (armed). |
 | `CCC_PEEPHOLE_SKIP` | unset (nothing skipped) | Comma-separated phase-2 peephole sub-pass names to disable for bisection (e.g. `store_alu_fold`).  All peephole passes are ENABLED by default. |
 | `CCC_NO_BOOL_ALGEBRA` | unset | Disables the boolean mux/majority algebra rewrites (bit_idioms Patterns B/C). |
+| `CCC_NO_RING_IDENTITIES` | unset | Disables the `bit_idioms` ring-identity sub-pass (remainder window compares, sign-mask shift, saturated bounds, zero-test select, complement of negation). |
 | `CCC_NO_TWO_BLOCK_UNROLL` | unset | Disables the two-block guard-free unroll (loop_unroll pass B). |
 | `CCC_UNROLL_LEGACY_PERSIST_GATE` | unset (fail-closed gate) | Restores the lenient persisting-inner-loop gate: unrecognized nested inner loops (multi-latch, non-Branch latch, no Add/Sub-IV, no exit on the found IV, no init) are skipped instead of vetoing the outer complete unroll. Bisection/A-B and emergency revert only — pinned by `persist_gate_legacy_restores_lenient` and `e2e_persist_gate_csv_nest_rolled_unless_legacy` in `src/passes/loop_unroll.rs`. Note: recognized-but-dynamic bounds still veto in both modes (no legacy skip on that arm). |
 | `CCC_UNROLL_GATE_TRACE` | unset | Prints `[UNROLL-GATE] veto fn=… outer=… inner=… arm=…` to stderr on every persist-gate veto (veto paths only; no cost when unset). |

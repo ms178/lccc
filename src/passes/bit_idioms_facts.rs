@@ -404,6 +404,9 @@ fn fold(
     if let Some(replacement) = complements::fold(inst, cx, fresh) {
         return Some(replacement);
     }
+    if let Some(replacement) = identities::fold(inst, cx, fresh) {
+        return Some(replacement);
+    }
     if let Some(replacement) = shift_observe::fold(inst, cx) {
         return Some(replacement);
     }
@@ -1022,6 +1025,9 @@ mod logic;
 
 #[path = "bit_idioms_complements.rs"]
 mod complements;
+
+#[path = "bit_idioms_identities.rs"]
+mod identities;
 
 #[path = "bit_idioms_shift_observe.rs"]
 mod shift_observe;
