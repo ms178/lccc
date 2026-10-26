@@ -174,3 +174,30 @@ it is used as a trust root. The normal research job remains enabled by default;
 cache-only dispatch does not run expensive compiler benchmarks. Historical
 red-team versioned commands now select Rust 1.99.1; the deliberate 1.97 MSRV
 compatibility lane is unchanged. Publication/restore outcomes remain pending.
+
+The cache publication job succeeded. Rust archive SHA-256 is
+2876570cf5dd56b3d101aa3321126d2bcb30a3e8c3b692b4c4d45f10cd95d190;
+Clang archive SHA-256 is
+373e20c398712e21bbfdbb401176f5057b0adc6ae28816cd11da049fc111ecf0.
+The reviewed lock records the successful hosted job and source commit; asset
+names and GitHub server-side digests agree. The normal Research gates remain
+unconditional, and publication is again explicit opt-in after this refresh.
+A separate read-only hosted job restores the lock and checks the actual tools;
+its orchestration is mirrored in the local slow lane, which was not run.
+The legacy installer no longer mislabels the older Clang payload. Secure
+extraction, hash-before-extraction, exact version/origin checks and refusal of
+corruption/traversal have five focused tests. The local sandbox blocks the
+GitHub release CDN redirect; local installation of these new payloads is not
+claimed. No tag/ref was moved and no archive entered Git.
+
+## PDEP/PEXT encoding matrix
+
+Generated assembly-only matrices now cover all operand-register triples on
+both ABIs (including aliases and stack-pointer encodings, never executed), plus
+systematic independent address-field and source/destination-register axes.
+GAS/objdump 2.47.20260726 byte comparison passes 5,632 i686 instructions and
+53,248 x86-64 instructions. The generator explicitly does not claim a complete
+Cartesian product of all memory fields. Two structural tests pin generation and
+register-triple completeness; existing hosted asm-diff lanes discover both new
+casefiles. This strengthens assembler coverage, not a new runtime speed claim
+or a completed latest-manual/exhaustive SSE–AVX2 audit.

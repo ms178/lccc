@@ -2739,6 +2739,10 @@ gate "generator-trace-selftest" fast \
 gate "local-oracles-selftest" fast \
     python3 scripts/test_local_oracles.py
 
+# Mirror the hosted cache integrity/identity contract; never a fast-lane download.
+gate "toolchain-cache-restoration" slow \
+    python3 scripts/restore_toolchain_cache.py --prefix "$HOME/.cache/lccc/reviewed-oracles"
+
 gate "icx-provision-selftest" fast \
     python3 scripts/test_icx_provision.py
 

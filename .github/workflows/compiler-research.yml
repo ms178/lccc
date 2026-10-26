@@ -32,8 +32,16 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  cache-contract:
+    name: Restore and verify the reviewed Rust and Clang cache
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Verify archive hashes, secure extraction and exact tool identities
+        run: python3 scripts/restore_toolchain_cache.py --prefix "$RUNNER_TEMP/reviewed-oracles"
   toolchain-cache:
-    if: inputs.refresh_toolchain_cache || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+    if: ${{ inputs.refresh_toolchain_cache }}
     name: Publish hash-verified Rust and Clang cache
     runs-on: ubuntu-24.04
     timeout-minutes: 30

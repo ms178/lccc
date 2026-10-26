@@ -1,0 +1,22 @@
+{
+  "provenance": {
+    "cache_job": 121341391429,
+    "commit": "5a86b1417f71c19dda32e9673561cac9f40c9ca2",
+    "workflow_run": "https://github.com/ms178/lccc/actions/runs/40250587171"
+  },
+  "repository": "ms178/lccc",
+  "schema": 1,
+  "tag": "harness-cache-4",
+  "tools": {
+    "clang": {
+      "sha256": "373e20c398712e21bbfdbb401176f5057b0adc6ae28816cd11da049fc111ecf0",
+      "url": "https://github.com/ms178/lccc/releases/download/harness-cache-4/clang-23.1.4-373e20c398712e21bbfdbb401176f5057b0adc6ae28816cd11da049fc111ecf0.tar.xz",
+      "version": "23.1.4"
+    },
+    "rust": {
+      "sha256": "2876570cf5dd56b3d101aa3321126d2bcb30a3e8c3b692b4c4d45f10cd95d190",
+      "url": "https://github.com/ms178/lccc/releases/download/harness-cache-4/rust-1.99.1-2876570cf5dd56b3d101aa3321126d2bcb30a3e8c3b692b4c4d45f10cd95d190.tar.xz",
+      "version": "1.99.1"
+    }
+  }
+}

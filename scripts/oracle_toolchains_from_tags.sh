@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ============================================================================
 # oracle_toolchains_from_tags.sh — restore the pinned reference-compiler
-# oracles from the repository's own transport tags, verified, with no network
-# access to a vendor.
+# oracles from the repository's transport tags and reviewed release-asset lock
+# (no vendor downloads; release assets require GitHub CDN access).
 #
 # WHY THIS EXISTS
 # ---------------
@@ -17,7 +17,7 @@
 #
 # The payloads are already in this repository: the transport tags
 # `harness-cache-1` (GCC 16 x86-64 prefix, mold, binutils sources) and
-# `harness-cache-4` (Clang 23.1.4 driver + resource headers) exist precisely to
+# the content-addressed Rust/Clang release assets exist precisely to
 # move these bytes to a constrained host. Each tag carries a `MANIFEST.sha256`,
 # so restoring from it is verifiable offline and end-to-end: the bytes that
 # leave the tag are checked against the digest committed beside them, and the
@@ -70,6 +70,7 @@ VERIFY_ONLY=0
 # different version is a provisioning error, not a new default.
 GCC_VERSION=16.2.0
 CLANG_VERSION=23.1.4
+RUST_VERSION=1.99.1
 MOLD_VERSION=2.42.1
 BINUTILS_VERSION=2.47
 
@@ -88,7 +89,7 @@ done
 log() { printf '[oracles] %s\n' "$*"; }
 die() { printf '[oracles] FATAL: %s\n' "$*" >&2; exit 1; }
 
-for tool in git sha256sum tar xz; do
+for tool in git sha256sum tar xz python3 curl; do
     command -v "$tool" >/dev/null 2>&1 || die "required host tool missing: $tool"
 done
 
@@ -99,14 +100,11 @@ done
 # the in-tree MANIFEST and this table agree, so a legitimate re-issue of a tag
 # fails loudly here (with both digests printed) instead of silently.
 TAG_GCC=harness-cache-1
-TAG_CLANG=harness-cache-4
 GCC_MEMBER=gcc-16-bookworm-x86_64.tar.xz
-CLANG_MEMBER=clang-23.1.4-linux-x64.tar.xz
 MOLD_MEMBER=mold-2.42.1-x86_64
 BINUTILS_MEMBER=binutils-2.47.tar.xz
 
 GCC_SHA=4fa6af4f6b29991e31631af18d83964a69caa9daf3f78546d4dc30f39880cd8a
-CLANG_SHA=e9cdb92b09a89840eb15fec382955cc920d9106fc8ecd4a2996ef25fd37b14d9
 MOLD_SHA=86b918f8af9444aed086ea73b593b88e910d49829d2cae979cbb84509b64dc76
 BINUTILS_SHA=154ab23b60070e8f27013c22977f1129425d67d1e8acd6e13010e617811e4cff
 
@@ -159,6 +157,7 @@ mkdir -p "$PREFIX" || die "cannot create prefix $PREFIX (use --prefix DIR)"
 DL=$PREFIX/dl
 GCC_ROOT=$PREFIX/gcc-$GCC_VERSION
 CLANG_ROOT=$PREFIX/clang-$CLANG_VERSION
+RUST_ROOT=$PREFIX/rust-$RUST_VERSION
 mkdir -p "$DL"
 
 gcc_bin=$GCC_ROOT/bin/gcc-16
@@ -179,9 +178,10 @@ probe_version() {  # probe_version <binary> <pattern> <label> ; prints the line
 # ============================================================================
 if [ "$VERIFY_ONLY" = 1 ]; then
     probe_version "$gcc_bin" "GCC) $GCC_VERSION" "gcc-16" >/dev/null
-    probe_version "$clang_bin" "version $CLANG_VERSION" "clang-23" >/dev/null
+    probe_version "$clang_bin" "version $CLANG_VERSION " "clang-23" >/dev/null
+    probe_version "$RUST_ROOT/bin/rustc" "rustc $RUST_VERSION " "rustc" >/dev/null
     probe_version "$PREFIX/bin/mold" "$MOLD_VERSION" "mold" >/dev/null
-    log "verify-only: gcc-16 $GCC_VERSION, clang-23 $CLANG_VERSION, mold $MOLD_VERSION all present"
+    log "verify-only: gcc-16 $GCC_VERSION, clang-23 $CLANG_VERSION, Rust $RUST_VERSION, mold $MOLD_VERSION all present"
     exit 0
 fi
 
@@ -209,7 +209,9 @@ restore_toolchain() {  # restore_toolchain <tag> <member> <sha> <root> <label>
 }
 
 restore_toolchain "$TAG_GCC" "$GCC_MEMBER" "$GCC_SHA" "$GCC_ROOT" "gcc-$GCC_VERSION"
-restore_toolchain "$TAG_CLANG" "$CLANG_MEMBER" "$CLANG_SHA" "$CLANG_ROOT" "clang-$CLANG_VERSION"
+# The historical Clang tag member is 23.1.3, not 23.1.4. Never relabel its
+# digest as the new release. The reviewed lock pins the exact new assets.
+python3 "$REPO/scripts/restore_toolchain_cache.py" --prefix "$PREFIX"
 
 # mold is a single static binary: verify it in place rather than extracting.
 mkdir -p "$PREFIX/bin"
@@ -276,6 +278,9 @@ if [ "$WITH_SHIMS" = 1 ]; then
         install_shim "$name" "$CLANG_ROOT/bin/$name"
     done
     install_shim clang++ "$CLANG_ROOT/bin/clang-23"
+    for name in rustc cargo rustfmt clippy-driver; do
+        install_shim "$name" "$RUST_ROOT/bin/$name"
+    done
     install_shim mold "$PREFIX/bin/mold"
     install_shim ld.mold "$PREFIX/bin/mold"
     if [ "$WITH_BINUTILS" = 1 ] && [ -x "$PREFIX/binutils-$BINUTILS_VERSION/bin/as" ]; then
@@ -317,6 +322,8 @@ envfile=$PREFIX/env.sh
     printf 'export CXX=%q\n' "$GCC_ROOT/bin/g++-16"
     printf 'export CLANG=%q\n' "$clang_bin"
     printf 'export MOLD=%q\n' "$PREFIX/bin/mold"
+    printf 'export RUSTC=%q\n' "$RUST_ROOT/bin/rustc"
+    printf 'export CARGO=%q\n' "$RUST_ROOT/bin/cargo"
     printf 'export PATH=%q:"$PATH"\n' "$BIN_DIR"
 } > "$envfile"
 log "env file: $envfile"
