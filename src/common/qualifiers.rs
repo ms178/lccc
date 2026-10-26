@@ -83,6 +83,9 @@ pub fn expr_const_base(expr: &Expr, lookup: &impl ConstLookup) -> bool {
             expr_const_base(a, lookup) || expr_const_base(b, lookup)
         }
         Expr::Cast(ts, _, _, qualifiers) => type_name_const_base(ts, qualifiers.base_const, lookup),
+        Expr::CompoundLiteral(ts, _, _, st) => {
+            type_name_const_base(ts, st.is_const || st.is_constexpr, lookup)
+        }
         _ => false,
     }
 }

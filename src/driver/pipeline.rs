@@ -99,6 +99,14 @@ pub struct Driver {
     pub(super) math_errno: bool,
     /// -fwrapv makes signed Add/Sub/Mul modular; never infer no-wrap from C UB.
     pub(super) wrap_signed_overflow: bool,
+    /// -ftrapv emits runtime traps on signed integer overflow.
+    pub(super) trapv: bool,
+    /// -fno-plt emits GOT-indirect external function calls instead of PLT stubs.
+    pub(super) no_plt: bool,
+    /// -fvisibility={default,hidden,internal,protected} default visibility for TU definitions.
+    pub(super) default_visibility: Option<String>,
+    /// -ftrivial-auto-var-init={uninitialized,zero,pattern} policy.
+    pub(super) trivial_auto_var_init: crate::ir::lowering::trapv::TrivialAutoVarInit,
     /// `-ffreestanding` / `-fno-hosted`: a freestanding implementation, so
     /// `__STDC_HOSTED__` is 0 (C17 6.10.8.1).  Independent of the builtin
     /// policy: `-ffreestanding -fbuiltin` stays freestanding (GCC 16.2).
@@ -571,6 +579,10 @@ impl Driver {
             fp_contract_explicit: false,
             fast_math: false,
             wrap_signed_overflow: false,
+            trapv: false,
+            no_plt: false,
+            default_visibility: None,
+            trivial_auto_var_init: crate::ir::lowering::trapv::TrivialAutoVarInit::Uninitialized,
             freestanding: false,
             builtin_policy: crate::common::pass_policy::BuiltinFlags::default(),
             fp_trapping_math: false,
@@ -2133,9 +2145,12 @@ impl Driver {
             self.gnu89_inline,
         )
         .with_pass_policy(crate::common::pass_policy::PassPolicy::new(
-            self.wrap_signed_overflow,
+            self.wrap_signed_overflow || self.trapv,
             fp_environment_observable,
         ))
+        .with_trapv(self.trapv)
+        .with_trivial_auto_var_init(self.trivial_auto_var_init)
+        .with_default_visibility(self.default_visibility.clone())
         .with_builtin_policy(self.builtin_policy.clone())
         .with_enumerator_refs(sema_result.enumerator_refs);
         let (mut module, mut diagnostics) = lowerer.lower(&ast);
@@ -2327,7 +2342,7 @@ impl Driver {
                 native_popcount: self.resolved_fast_popcount(),
             },
             self.code16gcc,
-            self.wrap_signed_overflow,
+            self.wrap_signed_overflow || self.trapv,
             fp_environment_observable,
             self.fp_reassoc,
             self.resolved_fp_contract(),
@@ -3030,6 +3045,7 @@ impl Driver {
             pic: self.pic || self.shared_lib,
             shared_lib: self.shared_lib,
             pie: self.pie && !self.pic && !self.shared_lib,
+            no_plt: self.no_plt,
             // Only a FULL invocation that final-links in position-fixed
             // ET_EXEC may emit the absolute switch-table form (its jump
             // instruction's R_X86_64_32S is unresolvable in ET_DYN). The

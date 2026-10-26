@@ -175,6 +175,8 @@ pub(super) mod parsed_attr_flag {
     /// `constexpr` came after `_Thread_local` or `auto`: GCC 16.2 names the
     /// later of the two first ("'constexpr' used with '_Thread_local'").
     pub const CONSTEXPR_LAST: u32 = 1 << 30;
+    /// `__attribute__((uninitialized))` encountered — skip `-ftrivial-auto-var-init`.
+    pub const UNINITIALIZED: u32 = 1 << 31;
     /// The storage-class specifiers a declaration carries (C11 6.7.1; GNU
     /// `auto` is NESTED_FN). `register` is not tracked.
     pub const STORAGE_CLASSES: u32 =
@@ -242,6 +244,8 @@ pub(super) struct ParsedDeclAttrs {
     pub parsing_symver: Option<String>,
     /// `__attribute__((target("...")))` feature list, comma-joined.
     pub parsing_target: Option<String>,
+    /// `__attribute__((target_clones("...")))` clone target list, comma-joined.
+    pub parsing_target_clones: Option<String>,
     /// `__attribute__((__diagnose_as(__builtin_NAME, ...)))` — the builtin
     /// the declared function is an alias of (the kernel's fortify-string
     /// family).  Calls that survive inlining must fold to the builtin, or
@@ -434,6 +438,10 @@ impl ParsedDeclAttrs {
     pub fn parsing_cold(&self) -> bool {
         self.flags & parsed_attr_flag::COLD != 0
     }
+    #[inline]
+    pub fn parsing_uninitialized(&self) -> bool {
+        self.flags & parsed_attr_flag::UNINITIALIZED != 0
+    }
 
     // --- flag setters ---
 
@@ -524,6 +532,10 @@ impl ParsedDeclAttrs {
     #[inline]
     pub fn set_fastcall(&mut self, v: bool) {
         self.set_flag(parsed_attr_flag::FASTCALL, v)
+    }
+    #[inline]
+    pub fn set_uninitialized(&mut self, v: bool) {
+        self.set_flag(parsed_attr_flag::UNINITIALIZED, v)
     }
     #[inline]
     pub fn set_naked(&mut self, v: bool) {
@@ -1932,6 +1944,15 @@ impl Parser {
                 self.advance();
                 self.attrs.parsing_target = self.parse_target_attr_arg();
             }
+            "target_clones" | "__target_clones__" => {
+                self.advance();
+                self.attrs.parsing_target_clones = self.parse_target_attr_arg();
+            }
+            "uninitialized" | "__uninitialized__" => {
+                self.attrs.set_uninitialized(true);
+                self.advance();
+                self.skip_optional_paren_arg();
+            }
             "symver" | "__symver__" => {
                 self.advance();
                 self.attrs.parsing_symver = self.parse_string_attr_arg();
@@ -2579,19 +2600,18 @@ impl Parser {
             TokenKind::PragmaVisibilityPush(vis) => {
                 let vis = vis.clone();
                 self.advance();
-                // Push current visibility and set new default
+                // Push current visibility and set new default. Keep `"default"`
+                // explicitly on `pragma_default_visibility` so `#pragma GCC
+                // visibility push(default)` overrides `-fvisibility=hidden`
+                // while active, and lowering strips `"default"` to ELF
+                // STV_DEFAULT afterwards.
                 if let Some(ref current) = self.pragma_default_visibility {
                     self.pragma_visibility_stack.push(current.clone());
                 } else {
                     // Push a sentinel for "no pragma active"
                     self.pragma_visibility_stack.push(String::new());
                 }
-                if vis == "default" {
-                    // "default" means no special visibility
-                    self.pragma_default_visibility = None;
-                } else {
-                    self.pragma_default_visibility = Some(vis);
-                }
+                self.pragma_default_visibility = Some(vis);
                 true
             }
             TokenKind::PragmaVisibilityPop => {

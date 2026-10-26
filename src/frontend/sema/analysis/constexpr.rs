@@ -210,6 +210,19 @@ impl SemanticAnalyzer {
                 }
                 continue;
             }
+            if matches!(leaf.ty, CType::Struct(..) | CType::Union(..)) {
+                if let Expr::Identifier(src_name, _) = leaf.expr {
+                    if self.symbol_table.is_constexpr(src_name) {
+                        for (sub_path, val) in self.symbol_table.constexpr_members_of(src_name) {
+                            let full_path = format!("{}{}", leaf.path, sub_path);
+                            if full_path.starts_with('.') && !full_path.contains('[') {
+                                members.push((full_path, val));
+                            }
+                        }
+                        continue;
+                    }
+                }
+            }
             match self.constexpr_leaf(&leaf) {
                 Err(message) => errors.push((message.into(), span)),
                 Ok(Some(value)) if leaf.path.starts_with('.') && !leaf.path.contains('[') => {
@@ -220,6 +233,92 @@ impl SemanticAnalyzer {
         }
         self.emit_constexpr_errors(errors);
         self.symbol_table.mark_constexpr(&init_decl.name, members);
+    }
+
+    /// Validate a C23 `(constexpr T){...}` compound literal and record its
+    /// folded scalar/member values on `TypeContext::constexpr_compound_literals`.
+    pub(super) fn check_constexpr_compound_literal(
+        &mut self,
+        cl_expr: &Expr,
+        ts: &TypeSpecifier,
+        init: &Initializer,
+        is_static: bool,
+    ) {
+        let ty = self.expr_type_checker().resolve_type_spec(ts);
+        let ty = match ty {
+            CType::Array(elem, None) => {
+                let n = match init {
+                    Initializer::List(items) => Some(items.len()),
+                    _ => None,
+                };
+                CType::Array(elem, n)
+            }
+            other => other,
+        };
+        let non_constant = {
+            let type_checker = self.expr_type_checker();
+            let eval = |e: &Expr| self.eval_initializer_value(e);
+            let ctype = |e: &Expr| type_checker.infer_expr_ctype(e);
+            let select = |controlling: &Expr, associations: &[GenericAssociation]| {
+                type_checker.generic_selection_index(controlling, associations)
+            };
+            super::super::static_init::StaticInitChecker::new(
+                &self.symbol_table,
+                &eval,
+                &ctype,
+                &select,
+            )
+            .non_constant_leaves(init)
+        };
+        let reported = is_static || self.symbol_table.at_file_scope();
+        let leaves = init_leaves(self, &ty, init);
+        let explicit: Vec<&str> = leaves.iter().map(|l| l.path.as_str()).collect();
+        let mut members = Vec::new();
+        if matches!(ty, CType::Struct(..) | CType::Union(..)) {
+            self.implicit_zero_members(&ty, "", &explicit, &mut members);
+        } else if leaves.is_empty() {
+            if let Some(zero) = fold_to_type(IrConst::I128(0), None, &ty) {
+                members.push((String::new(), zero));
+            }
+        }
+        let mut errors: Vec<(String, Span)> = Vec::new();
+        for leaf in leaves {
+            let span = leaf.expr.span();
+            if non_constant.contains(&span) {
+                if !reported {
+                    errors.push((NOT_CONSTANT.into(), span));
+                }
+                continue;
+            }
+            if matches!(leaf.ty, CType::Struct(..) | CType::Union(..)) {
+                if let Expr::Identifier(src_name, _) = leaf.expr {
+                    if self.symbol_table.is_constexpr(src_name) {
+                        for (sub_path, val) in self.symbol_table.constexpr_members_of(src_name) {
+                            let full_path = format!("{}{}", leaf.path, sub_path);
+                            if !full_path.contains('[') {
+                                members.push((full_path, val));
+                            }
+                        }
+                        continue;
+                    }
+                }
+            }
+            match self.constexpr_leaf(&leaf) {
+                Err(message) => errors.push((message.into(), span)),
+                Ok(Some(value)) if !leaf.path.contains('[') => {
+                    members.push((leaf.path.clone(), value));
+                }
+                Ok(_) => {}
+            }
+        }
+        self.emit_constexpr_errors(errors);
+        let expr_id = crate::frontend::parser::ast::ExprId::of(cl_expr);
+        for (path, val) in members {
+            self.result
+                .type_context
+                .constexpr_compound_literals
+                .insert((expr_id, path), val);
+        }
     }
 
     /// One initializer leaf of a `constexpr` object: its error, or its

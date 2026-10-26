@@ -243,6 +243,10 @@ impl Lowerer {
                         &complex_elem_ctype,
                     );
                 }
+            } else if !declarator.attrs.is_uninitialized() {
+                let scalar_ty = (!da.is_array && !da.is_struct && !is_complex)
+                    .then_some((da.var_ty, da.is_bool));
+                self.auto_init_local_var(alloca, scalar_ty, da.actual_alloc_size, vla_size);
             }
         }
     }

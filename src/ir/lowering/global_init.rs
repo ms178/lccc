@@ -283,8 +283,12 @@ impl Lowerer {
 
         // &(compound_literal) at file scope
         if let Expr::AddressOf(inner, _) = expr {
-            if let Expr::CompoundLiteral(cl_type_spec, cl_init, _) = inner.as_ref() {
-                return self.create_compound_literal_global(cl_type_spec, cl_init);
+            if let Expr::CompoundLiteral(cl_type_spec, cl_init, _, cl_st) = inner.as_ref() {
+                return self.create_compound_literal_global_with_storage(
+                    cl_type_spec,
+                    cl_init,
+                    cl_st,
+                );
             }
         }
 
@@ -293,21 +297,39 @@ impl Lowerer {
         {
             let stripped = Self::strip_casts(expr);
             if !std::ptr::eq(expr as *const _, stripped as *const _) {
-                if let Expr::CompoundLiteral(cl_type_spec, cl_init, _) = stripped {
-                    return self.create_compound_literal_global(cl_type_spec, cl_init);
+                if let Expr::CompoundLiteral(cl_type_spec, cl_init, _, cl_st) = stripped {
+                    return self.create_compound_literal_global_with_storage(
+                        cl_type_spec,
+                        cl_init,
+                        cl_st,
+                    );
                 }
                 // (void*) &(CompoundLiteral) – cast wrapping address-of compound literal
                 if let Expr::AddressOf(inner, _) = stripped {
-                    if let Expr::CompoundLiteral(cl_type_spec, cl_init, _) = inner.as_ref() {
-                        return self.create_compound_literal_global(cl_type_spec, cl_init);
+                    if let Expr::CompoundLiteral(cl_type_spec, cl_init, _, cl_st) = inner.as_ref() {
+                        return self.create_compound_literal_global_with_storage(
+                            cl_type_spec,
+                            cl_init,
+                            cl_st,
+                        );
                     }
                 }
             }
         }
 
         // Compound literal used directly as initializer value
-        if let Expr::CompoundLiteral(cl_type_spec, cl_init, _) = expr {
+        if let Expr::CompoundLiteral(cl_type_spec, cl_init, _, _) = expr {
             return self.lower_compound_literal_init(cl_type_spec, cl_init, base_ty, is_array);
+        }
+
+        // C23 constant aggregate copy (e.g. `constexpr struct Pair g2 = g1;`):
+        if let Expr::Identifier(src_name, _) = expr {
+            if let Some(img) = self.const_object_images.get(src_name.as_str()) {
+                if matches!(img.ctype, CType::Struct(..) | CType::Union(..)) {
+                    let vals = img.bytes.iter().map(|&b| IrConst::I8(b as i8)).collect();
+                    return GlobalInit::Array(vals);
+                }
+            }
         }
 
         // String literal with offset: "str" + N or "str" - N
@@ -505,11 +527,12 @@ impl Lowerer {
     /// anonymous global before the pointer arithmetic can be resolved.
     fn materialize_compound_literals_in_expr(&mut self, expr: &Expr) {
         match expr {
-            Expr::CompoundLiteral(type_spec, init, _) => {
+            Expr::CompoundLiteral(type_spec, init, _, st) => {
                 let key = expr as *const Expr as usize;
                 if !self.materialized_compound_literals.contains_key(&key) {
                     // Materialize this compound literal as an anonymous global
-                    let init_result = self.create_compound_literal_global(type_spec, init);
+                    let init_result =
+                        self.create_compound_literal_global_with_storage(type_spec, init, st);
                     // Extract the global name from the result
                     if let GlobalInit::GlobalAddr(label) = init_result {
                         self.materialized_compound_literals.insert(key, label);
@@ -549,8 +572,12 @@ impl Lowerer {
     fn try_address_of_compound_literal(&mut self, expr: &Expr) -> Option<GlobalInit> {
         let stripped = Self::strip_casts(expr);
         if let Expr::AddressOf(inner, _) = stripped {
-            if let Expr::CompoundLiteral(cl_type_spec, cl_init, _) = inner.as_ref() {
-                return Some(self.create_compound_literal_global(cl_type_spec, cl_init));
+            if let Expr::CompoundLiteral(cl_type_spec, cl_init, _, cl_st) = inner.as_ref() {
+                return Some(self.create_compound_literal_global_with_storage(
+                    cl_type_spec,
+                    cl_init,
+                    cl_st,
+                ));
             }
         }
         None
@@ -1484,7 +1511,7 @@ impl Lowerer {
     fn write_vector_expr_bytes(&self, e: &Expr, vec_ct: &CType, bytes: &mut [u8], offset: usize) {
         let size = self.resolve_ctype_size(vec_ct);
         match e {
-            Expr::CompoundLiteral(ts, init, _) if self.type_spec_to_ctype(ts) == *vec_ct => {
+            Expr::CompoundLiteral(ts, init, _, _) if self.type_spec_to_ctype(ts) == *vec_ct => {
                 self.write_vector_init_bytes(init, vec_ct, bytes, offset);
                 return;
             }
@@ -1710,13 +1737,51 @@ impl Lowerer {
 // =============================================================================
 
 impl Lowerer {
+    /// Materialize (or reuse) an anonymous static/TLS global for a C23
+    /// `(static [thread_local] [const] T){...}` compound literal.
+    pub(super) fn ensure_static_compound_literal_global(
+        &mut self,
+        cl_expr: &Expr,
+        type_spec: &TypeSpecifier,
+        init: &Initializer,
+        storage: &crate::frontend::parser::ast::CompoundLiteralStorage,
+    ) -> String {
+        let key = cl_expr as *const Expr as usize;
+        if let Some(existing) = self.materialized_compound_literals.get(&key) {
+            return existing.clone();
+        }
+        let init_res = self.create_compound_literal_global_with_storage(type_spec, init, storage);
+        match init_res {
+            GlobalInit::GlobalAddr(label) => {
+                self.materialized_compound_literals
+                    .insert(key, label.clone());
+                label
+            }
+            _ => String::new(),
+        }
+    }
+
     /// Create an anonymous global for a compound literal at file scope.
     pub(super) fn create_compound_literal_global(
         &mut self,
         type_spec: &TypeSpecifier,
         init: &Initializer,
     ) -> GlobalInit {
-        let label = format!(".Lcompound_lit_{}", self.next_anon_struct);
+        let default_st = crate::frontend::parser::ast::CompoundLiteralStorage::default();
+        self.create_compound_literal_global_with_storage(type_spec, init, &default_st)
+    }
+
+    pub(super) fn create_compound_literal_global_with_storage(
+        &mut self,
+        type_spec: &TypeSpecifier,
+        init: &Initializer,
+        storage: &crate::frontend::parser::ast::CompoundLiteralStorage,
+    ) -> GlobalInit {
+        let label = if storage.is_thread_local {
+            format!("__compound_lit_tls.{}", self.next_anon_struct)
+        } else {
+            format!(".Lcompound_lit_{}", self.next_anon_struct)
+        };
         self.next_anon_struct += 1;
 
         let is_array = matches!(type_spec, TypeSpecifier::Array(_, _));
@@ -1794,9 +1859,9 @@ impl Lowerer {
             is_weak: false,
             visibility: None,
             has_explicit_align: false,
-            is_const: false,
+            is_const: (storage.is_const || storage.is_constexpr) && !storage.is_thread_local,
             is_used: false,
-            is_thread_local: false,
+            is_thread_local: storage.is_thread_local,
         });
 
         GlobalInit::GlobalAddr(label)
@@ -2182,7 +2247,7 @@ impl Lowerer {
                         return true;
                     }
                 }
-                if let Expr::CompoundLiteral(_, cl_init, _) = expr {
+                if let Expr::CompoundLiteral(_, cl_init, _, _) = expr {
                     return self.init_has_addr_exprs(cl_init);
                 }
                 self.eval_const_expr(expr).is_none() && self.eval_global_addr_expr(expr).is_some()

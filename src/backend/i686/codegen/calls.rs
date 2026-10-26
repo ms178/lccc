@@ -594,7 +594,14 @@ impl I686Codegen {
         // x87 registers are caller-saved: drop any cached st(0) copy first.
         self.flush_x87_pending_copy();
         if let Some(name) = direct_name {
-            if self.state.needs_plt(name) {
+            if self.state.needs_got_call(name) {
+                let n = name.split('@').next().unwrap_or(name);
+                if self.state.pic_mode {
+                    emit!(self.state, "    call *{}@GOT(%ebx)", n);
+                } else {
+                    emit!(self.state, "    call *{}@GOT", n);
+                }
+            } else if self.state.needs_plt(name) {
                 emit!(self.state, "    call {}@PLT", name);
             } else {
                 emit!(self.state, "    call {}", name);

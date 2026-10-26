@@ -234,6 +234,25 @@ impl SymbolTable {
             .copied()
     }
 
+    /// All folded scalar `(path, value)` entries recorded on the `constexpr`
+    /// object `name` in its defining scope.
+    pub fn constexpr_members_of(&self, name: &str) -> Vec<(String, FoldedValue)> {
+        let Some(scope) = self
+            .scopes
+            .iter()
+            .rev()
+            .find(|scope| scope.symbols.contains_key(name))
+        else {
+            return Vec::new();
+        };
+        scope
+            .constexpr_members
+            .iter()
+            .filter(|((obj_name, _), _)| obj_name == name)
+            .map(|((_, path), &val)| (path.clone(), val))
+            .collect()
+    }
+
     /// Record that the innermost scope's `name` is an enumeration constant.
     pub fn mark_enumerator(&mut self, name: &str) {
         if let Some(scope) = self.scopes.last_mut() {

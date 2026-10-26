@@ -136,6 +136,118 @@ impl X86Isa {
         }
     }
 
+    /// Overlay normalized per-function `__attribute__((target("...")))` features
+    /// onto this translation-unit baseline ISA.
+    ///
+    /// Note that `features` is sorted lexicographically (`arch=...`, `avx*`,
+    /// `cx16`, `fma`, `movbe`, `no-*`, `sse*`), so positive grants are applied
+    /// in a first pass and explicit `no-*` denials in a second pass before
+    /// [`Self::normalized`] enforces the implication chain.
+    #[must_use]
+    pub fn with_target_features(mut self, features: &[String]) -> X86Isa {
+        if features.is_empty() {
+            return self;
+        }
+        for feat in features {
+            match feat.as_str() {
+                "sse2" | "sse3" | "ssse3" => {
+                    self.simd = true;
+                }
+                "sse4" | "sse4.1" | "sse4.2" => {
+                    self.simd = true;
+                    self.sse41 = true;
+                }
+                "avx" => {
+                    self.simd = true;
+                    self.sse41 = true;
+                    self.avx = true;
+                }
+                "avx2" | "avx512f" | "avx512bw" | "avx512dq" | "avx512vl" => {
+                    self.simd = true;
+                    self.sse41 = true;
+                    self.avx = true;
+                    self.ymm = true;
+                }
+                "fma" => {
+                    self.simd = true;
+                    self.sse41 = true;
+                    self.avx = true;
+                    self.fma = true;
+                }
+                "movbe" => self.movbe = true,
+                "cx16" => self.cx16 = true,
+                "arch=x86-64" => {
+                    self.simd = true;
+                }
+                "arch=x86-64-v2" | "arch=nehalem" | "arch=westmere" | "arch=silvermont"
+                | "arch=goldmont" | "arch=tremont" => {
+                    self.simd = true;
+                    self.sse41 = true;
+                    self.cx16 = true;
+                }
+                "arch=sandybridge" | "arch=ivybridge" => {
+                    self.simd = true;
+                    self.sse41 = true;
+                    self.avx = true;
+                    self.cx16 = true;
+                }
+                "arch=x86-64-v3"
+                | "arch=x86-64-v4"
+                | "arch=haswell"
+                | "arch=broadwell"
+                | "arch=skylake"
+                | "arch=skylake-avx512"
+                | "arch=cascadelake"
+                | "arch=cooperlake"
+                | "arch=icelake-client"
+                | "arch=icelake-server"
+                | "arch=tigerlake"
+                | "arch=sapphirerapids"
+                | "arch=emeraldrapids"
+                | "arch=graniterapids"
+                | "arch=alderlake"
+                | "arch=raptorlake"
+                | "arch=meteorlake"
+                | "arch=arrowlake"
+                | "arch=znver1"
+                | "arch=znver2"
+                | "arch=znver3"
+                | "arch=znver4"
+                | "arch=znver5" => {
+                    self = Self::V3;
+                }
+                _ => {}
+            }
+        }
+        for feat in features {
+            match feat.as_str() {
+                "general-regs-only" | "no-sse" | "no-sse2" => {
+                    self.simd = false;
+                }
+                "no-sse4" | "no-sse4.1" => {
+                    self.sse41 = false;
+                }
+                "no-avx" => {
+                    self.avx = false;
+                }
+                "no-avx2" => {
+                    self.ymm = false;
+                }
+                "no-fma" => {
+                    self.fma = false;
+                }
+                "no-movbe" => {
+                    self.movbe = false;
+                }
+                "no-cx16" => {
+                    self.cx16 = false;
+                }
+                _ => {}
+            }
+        }
+        self.normalized()
+    }
+
     const BIT_SIMD: u8 = 1 << 0;
     const BIT_SSE41: u8 = 1 << 1;
     const BIT_AVX: u8 = 1 << 2;

@@ -642,6 +642,7 @@ impl I686Codegen {
         self.state.apply_tls_options(opts);
         self.set_pic(opts.pic || opts.pie);
         self.state.pie_mode = opts.pie;
+        self.state.no_plt = opts.no_plt;
         self.set_no_jump_tables(opts.no_jump_tables);
         self.state.mcount = opts.mcount;
         self.base_regparm = opts.regparm;
@@ -1940,7 +1941,14 @@ impl I686Codegen {
             // exactly like cdecl calls (calls.rs); a bare `call name`
             // to an external symbol would create a text relocation or
             // resolve to the wrong address in a PIE.
-            if self.state.needs_plt(name) {
+            if self.state.needs_got_call(name) {
+                let n = name.split('@').next().unwrap_or(name);
+                if self.state.pic_mode {
+                    emit!(self.state, "    call *{}@GOT(%ebx)", n);
+                } else {
+                    emit!(self.state, "    call *{}@GOT", n);
+                }
+            } else if self.state.needs_plt(name) {
                 emit!(self.state, "    call {}@PLT", name);
             } else {
                 emit!(self.state, "    call {}", name);

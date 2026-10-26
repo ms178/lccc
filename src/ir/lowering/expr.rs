@@ -352,8 +352,8 @@ impl Lowerer {
             }
             Expr::GnuConditional(cond, else_expr, _) => self.lower_gnu_conditional(cond, else_expr),
             Expr::Cast(target_type, inner, _, _) => self.lower_cast(target_type, inner),
-            Expr::CompoundLiteral(type_spec, init, _) => {
-                self.lower_compound_literal(type_spec, init)
+            Expr::CompoundLiteral(type_spec, init, _, storage) => {
+                self.lower_compound_literal(expr, type_spec, init, storage)
             }
             Expr::Sizeof(arg, _) => self.lower_sizeof(arg),
             Expr::Countof(arg, _) => self.lower_countof(arg),
@@ -391,6 +391,7 @@ impl Lowerer {
             Expr::ConvertVector(src_expr, type_spec, _) => {
                 self.lower_convertvector(src_expr, type_spec)
             }
+            Expr::BitCast(type_spec, src_expr, _) => self.lower_bit_cast(type_spec, src_expr),
             Expr::GenericSelection(controlling, associations, _) => {
                 self.lower_generic_selection(controlling, associations)
             }

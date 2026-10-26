@@ -1066,7 +1066,7 @@ impl Lowerer {
         Some(self.lower_expr(&addr_expr))
     }
 
-    fn expr_may_have_side_effects(expr: &Expr) -> bool {
+    pub(super) fn expr_may_have_side_effects(expr: &Expr) -> bool {
         match expr {
             Expr::IntLiteral(..)
             | Expr::UIntLiteral(..)

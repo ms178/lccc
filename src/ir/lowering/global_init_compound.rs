@@ -386,29 +386,45 @@ impl Lowerer {
         // &(compound_literal) at file scope: create anonymous global and return its address.
         // e.g., .ptr = &(struct in6_addr){ { { 0xfc } } } in a static struct array initializer.
         if let Expr::AddressOf(inner, _) = expr {
-            if let Expr::CompoundLiteral(cl_type_spec, cl_init, _) = inner.as_ref() {
-                return Some(self.create_compound_literal_global(cl_type_spec, cl_init));
+            if let Expr::CompoundLiteral(cl_type_spec, cl_init, _, cl_st) = inner.as_ref() {
+                return Some(self.create_compound_literal_global_with_storage(
+                    cl_type_spec,
+                    cl_init,
+                    cl_st,
+                ));
             }
         }
         // Bare compound literal used as a pointer value (array-to-pointer decay).
         // e.g., .commands = (const u8 []){ ATA_CMD_ID_ATA, ATA_CMD_ID_ATAPI, 0 }
         // The array compound literal decays to a pointer to its first element.
-        if let Expr::CompoundLiteral(cl_type_spec, cl_init, _) = expr {
-            return Some(self.create_compound_literal_global(cl_type_spec, cl_init));
+        if let Expr::CompoundLiteral(cl_type_spec, cl_init, _, cl_st) = expr {
+            return Some(self.create_compound_literal_global_with_storage(
+                cl_type_spec,
+                cl_init,
+                cl_st,
+            ));
         }
         // Cast-wrapped compound literal used as a pointer value.
         // e.g., .arr = (char *)(unsigned char[]){ 0xFD, 0x01 }
         // Unwrap casts (arbitrary depth) to find the inner compound literal.
         {
             let stripped = Self::strip_casts(expr);
-            if let Expr::CompoundLiteral(cl_type_spec, cl_init, _) = stripped {
-                return Some(self.create_compound_literal_global(cl_type_spec, cl_init));
+            if let Expr::CompoundLiteral(cl_type_spec, cl_init, _, cl_st) = stripped {
+                return Some(self.create_compound_literal_global_with_storage(
+                    cl_type_spec,
+                    cl_init,
+                    cl_st,
+                ));
             }
             // (void*) &(CompoundLiteral) – cast wrapping address-of compound literal
             // e.g., (void*) &(PyABIInfo) { .major = 1, ... } in static struct initializers
             if let Expr::AddressOf(inner, _) = stripped {
-                if let Expr::CompoundLiteral(cl_type_spec, cl_init, _) = inner.as_ref() {
-                    return Some(self.create_compound_literal_global(cl_type_spec, cl_init));
+                if let Expr::CompoundLiteral(cl_type_spec, cl_init, _, cl_st) = inner.as_ref() {
+                    return Some(self.create_compound_literal_global_with_storage(
+                        cl_type_spec,
+                        cl_init,
+                        cl_st,
+                    ));
                 }
             }
         }

@@ -101,8 +101,11 @@ impl<'s> IceChecker<'s> {
             | Expr::LongLongLiteral(..)
             | Expr::ULongLongLiteral(..)
             | Expr::CharLiteral(..) => true,
-            Expr::Identifier(..) | Expr::MemberAccess(..) => {
+            Expr::Identifier(..) | Expr::MemberAccess(..) | Expr::CompoundLiteral(..) => {
                 (self.named_constant)(expr) == Some(NamedConstant::Integer)
+            }
+            Expr::BitCast(..) => {
+                (self.ctype)(expr).is_some_and(|t| t.is_integer()) && (self.eval)(expr).is_some()
             }
             Expr::UnaryOp(
                 UnaryOp::Plus

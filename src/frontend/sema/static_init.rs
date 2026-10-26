@@ -131,8 +131,10 @@ impl<'s> StaticInitChecker<'s> {
     /// its decayed address (the member's type is not available to this walk);
     /// see the note on `leaf_kind`.
     pub(super) fn non_constant_leaves_for(&self, init: &Initializer, target: &CType) -> Vec<Span> {
-        if let (Initializer::Expr(expr @ Expr::CompoundLiteral(_, payload, _)), CType::Array(..)) =
-            (init, target)
+        if let (
+            Initializer::Expr(expr @ Expr::CompoundLiteral(_, payload, _, _)),
+            CType::Array(..),
+        ) = (init, target)
         {
             if (self.ctype)(expr).is_some_and(|t| t == *target) {
                 let mut out = Vec::new();
@@ -226,7 +228,7 @@ impl<'s> StaticInitChecker<'s> {
     /// and stays non-constant (GCC 16.2 rejects `(int){5} + 1` and
     /// `&(T){...}` with "initializer element is not constant").
     fn leaf_kind<'e>(&self, e: &'e Expr) -> Kind<'e> {
-        if let Expr::CompoundLiteral(_, init, _) = e {
+        if let Expr::CompoundLiteral(_, init, _, _) = e {
             if !matches!((self.ctype)(e), Some(CType::Array(..))) {
                 let mut inner = Vec::new();
                 self.collect_bad(init, &mut inner);
@@ -349,8 +351,29 @@ impl<'s> StaticInitChecker<'s> {
                     None => Kind::Bad,
                 }
             }
-            // A file-scope compound literal has static storage: an address constant.
-            Expr::CompoundLiteral(..) => self.compound_literal_kind(),
+            // A file-scope or `static` (non-TLS) compound literal has static storage:
+            // an address constant. A C23 `constexpr` non-array compound literal is a
+            // value constant when its initializer is constant.
+            Expr::CompoundLiteral(_, init, _, st) => {
+                if st.is_constexpr && !matches!((self.ctype)(e), Some(CType::Array(..))) {
+                    let mut bad = Vec::new();
+                    self.collect_bad(init, &mut bad);
+                    if bad.is_empty() {
+                        Kind::Value
+                    } else {
+                        Kind::Bad
+                    }
+                } else {
+                    self.compound_literal_kind(st)
+                }
+            }
+            Expr::BitCast(_, inner, _) => {
+                if self.value(inner) == Kind::Value {
+                    Kind::Value
+                } else {
+                    Kind::Bad
+                }
+            }
             Expr::Sizeof(..)
             | Expr::Countof(..)
             | Expr::Alignof(..)
@@ -423,15 +446,20 @@ impl<'s> StaticInitChecker<'s> {
                 Kind::Address(root) => Kind::Address(root),
                 Kind::Value => Kind::Address(None),
             },
-            Expr::CompoundLiteral(..) => self.compound_literal_kind(),
+            Expr::CompoundLiteral(_, _, _, st) => self.compound_literal_kind(st),
             _ => Kind::Bad,
         }
     }
 
-    /// A compound literal has static storage at file scope (an address
-    /// constant). In block scope it is automatic, so it is not constant.
-    fn compound_literal_kind<'e>(&self) -> Kind<'e> {
-        if self.symbols.at_file_scope() {
+    /// A compound literal has static storage at file scope or when declared
+    /// `static` (without `thread_local`): an address constant.
+    fn compound_literal_kind<'e>(
+        &self,
+        st: &crate::frontend::parser::ast::CompoundLiteralStorage,
+    ) -> Kind<'e> {
+        if (self.symbols.at_file_scope() && !st.is_thread_local)
+            || (st.is_static && !st.is_thread_local)
+        {
             Kind::Address(None)
         } else {
             Kind::Bad
@@ -485,6 +513,11 @@ impl<'s> StaticInitChecker<'s> {
         match e {
             Expr::Identifier(name, _) => {
                 self.symbols.is_folded(name) || self.symbols.is_constexpr(name)
+            }
+            Expr::CompoundLiteral(_, init, _, st) if st.is_constexpr => {
+                let mut bad = Vec::new();
+                self.collect_bad(init, &mut bad);
+                bad.is_empty()
             }
             Expr::MemberAccess(base, _, _) => self.folded_object_read(base),
             Expr::ArraySubscript(base, index, _) => {

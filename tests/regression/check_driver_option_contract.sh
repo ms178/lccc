@@ -14,7 +14,7 @@ EOF
 for flag in \
     -flto -flto=auto \
     -fsanitize=address -fsanitize=undefined \
-    -fstack-clash-protection -ftrapv -fvisibility=hidden \
+    -fstack-clash-protection -fvisibility=bogus -ftrivial-auto-var-init=bogus \
     -fopenmp -freg-struct-return \
     -fno-profile-arcs -fno-test-coverage -fno-branch-probabilities -fno-auto-profile \
     -finstrument-functions-exclude-file-list=generated.c \
@@ -242,11 +242,74 @@ fi
 # Ignoring these yields correct (if differently-shaped or more conservative)
 # code, so they are inert no-ops rather than refusals: a refusal would break
 # the kernel/glibc builds that pass them unconditionally.
-for flag in -fno-plt -fsemantic-interposition -fno-semantic-interposition; do
+for flag in -fno-plt -fplt -fvisibility=hidden -fvisibility=default -ftrapv -fno-trapv \
+    -ftrivial-auto-var-init=zero -ftrivial-auto-var-init=pattern \
+    -fsemantic-interposition -fno-semantic-interposition; do
     "$CCC" -O2 "$flag" -S "$td/plain.c" -o "$td/noop.s" 2>/dev/null || {
-        echo "FAIL: $flag must be an accepted no-op (correct default behaviour)" >&2
+        echo "FAIL: $flag must be accepted" >&2
         exit 1
     }
 done
+
+# Verify -fvisibility=hidden emits .hidden on defined non-static symbols while
+# leaving extern symbols untouched.
+cat > "$td/vis.c" <<'EOF'
+extern int ext_fn(void);
+int def_fn(void) { return ext_fn(); }
+__attribute__((visibility("default"))) int pub_fn(void) { return 1; }
+EOF
+"$CCC" -O2 -fPIC -fvisibility=hidden -S "$td/vis.c" -o "$td/vis.s"
+grep -Eq '^\s*\.hidden\s+def_fn\b' "$td/vis.s" || {
+    echo "FAIL: -fvisibility=hidden did not emit .hidden def_fn" >&2
+    exit 1
+}
+if grep -Eq '^\s*\.hidden\s+(ext_fn|pub_fn)\b' "$td/vis.s"; then
+    echo "FAIL: -fvisibility=hidden marked extern or default-visibility symbol .hidden" >&2
+    exit 1
+fi
+
+# Verify -fno-plt emits GOT-indirect call (*ext_fn@GOTPCREL(%rip)) and -fplt restores @PLT.
+"$CCC" -O2 -fPIC -fno-plt -S "$td/vis.c" -o "$td/noplt.s"
+grep -Eq '(call|jmp)[q]?[[:space:]]+\*ext_fn@GOTPCREL\(%rip\)' "$td/noplt.s" || {
+    echo "FAIL: -fno-plt did not emit GOT-indirect call to ext_fn" >&2
+    exit 1
+}
+"$CCC" -O2 -fPIC -fno-plt -fplt -S "$td/vis.c" -o "$td/plt-restored.s"
+grep -Eq '(call|jmp)[q]?[[:space:]]+ext_fn@PLT' "$td/plt-restored.s" || {
+    echo "FAIL: -fplt after -fno-plt did not restore @PLT call" >&2
+    exit 1
+}
+
+# Verify -ftrapv aborts at runtime on signed overflow and -ftrivial-auto-var-init=pattern
+# initializes uninitialized automatic storage while honoring __attribute__((uninitialized)).
+cat > "$td/trapv_check.c" <<'EOF'
+#include <limits.h>
+__attribute__((noinline)) int ovf_add(int a, int b) { return a + b; }
+int main(void) { return ovf_add(INT_MAX, 1); }
+EOF
+"$CCC" -O2 -ftrapv "$td/trapv_check.c" -o "$td/trapv_check"
+set +e
+"$td/trapv_check" >/dev/null 2>&1
+trap_rc=$?
+set -e
+if [ "$trap_rc" -ne 134 ]; then
+    echo "FAIL: -ftrapv signed overflow exited with $trap_rc (expected 134 SIGABRT)" >&2
+    exit 1
+fi
+
+cat > "$td/autovar_check.c" <<'EOF'
+#include <stdint.h>
+__attribute__((noinline)) uint64_t read_pat(void) {
+    uint64_t v;
+    __asm__ __volatile__("" : "+r"(v));
+    return v;
+}
+int main(void) { return read_pat() == 0xFEFEFEFEFEFEFEFEULL ? 0 : 1; }
+EOF
+"$CCC" -O2 -ftrivial-auto-var-init=pattern "$td/autovar_check.c" -o "$td/autovar_check"
+"$td/autovar_check" || {
+    echo "FAIL: -ftrivial-auto-var-init=pattern did not fill automatic variable with 0xFE" >&2
+    exit 1
+}
 
 echo "driver option contract: PASS (hosted/freestanding macros, builtin gating, accepted/refused vectorizer and builtin flags)"

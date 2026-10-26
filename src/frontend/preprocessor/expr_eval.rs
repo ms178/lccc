@@ -676,6 +676,8 @@ impl Preprocessor {
             name,
             "__builtin_va_arg" |              // Special token (BuiltinVaArg)
             "__builtin_types_compatible_p" |  // Special AST node (BuiltinTypesCompatibleP)
+            "__builtin_convertvector" |       // Special AST node (ConvertVector)
+            "__builtin_bit_cast" |            // Special AST node (BitCast)
             "__builtin_offsetof" |            // Predefined macro
             "__builtin_LINE" |                // Expanded by the preprocessor
             "__builtin_FILE" |
@@ -782,6 +784,8 @@ impl Preprocessor {
                 | "__optimize__"
                 | "target"
                 | "__target__"
+                | "target_clones"
+                | "__target_clones__"
                 | "assume_aligned"
                 | "__assume_aligned__"
                 | "returns_nonnull"
