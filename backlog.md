@@ -516,9 +516,10 @@ prototype from either arm. The external GCC compatibility macros/version banner 
 at 14.2.0: this dialect change is not a full-parity claim.
 
 The historical per-function AVX2 vectorization candidate was remeasured with
-`tests/regression/per_function_target_avx2_reduction.c`: at `-O2` LCCC emits
-YMM instructions for the `target("avx2")` reduction without a TU-wide
-`-mavx2`, and the adjacent baseline function stays YMM-free. GCC 16.2 and
+`tests/regression/per_function_target_avx2_reduction/reduction.c`: at `-O2`
+LCCC emits YMM instructions for the `target("avx2")` reduction without a
+translation-unit-wide `-mavx2`; the adjacent baseline function stays YMM-free.
+GCC 16.2 and
 Clang 23.1.3 show the same function-level ISA boundary; the target function's
 results match the scalar reference for trip counts 0–35 on all three. The
 current regression is pinned in `check_vectorize_isa_gate.sh`. The earlier

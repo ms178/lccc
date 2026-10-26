@@ -1,5 +1,9 @@
 /* Regression gate for the per-function AVX2 middle-end ISA overlay.
  *
+ * This source lives in a subdirectory because the regression corpus runner
+ * compiles every top-level tests/regression/*.c as a complete executable.
+ * check_vectorize_isa_gate.sh supplies a separate driver for runtime checks.
+ *
  * The signed i32 sum is an ordinary vectorizable reduction. The target
  * function must receive AVX2 YMM vectorization without a translation-unit
  * -mavx2 flag, while the neighboring baseline function must not inherit that

@@ -102,7 +102,7 @@ check_gt0 "-march=x86-64-v3 nonzero clz uses LZCNT" "$(count_lzcnt $tmp/march-v3
 # Per-function target attributes raise the middle-end ISA only around that
 # function. GCC and Clang both vectorize this signed reduction at -O2 with a
 # function-level target("avx2") and no translation-unit -mavx2 flag.
-function_target_src="$repo/tests/regression/per_function_target_avx2_reduction.c"
+function_target_src="$repo/tests/regression/per_function_target_avx2_reduction/reduction.c"
 "$ccc" -O2 -S "$function_target_src" -o "$tmp/function-target.s"
 awk '/^sum_i32_avx2:/ { inside = 1 } /^sum_i32_baseline:/ { inside = 0 } inside' \
     "$tmp/function-target.s" > "$tmp/function-target-avx2.s"
