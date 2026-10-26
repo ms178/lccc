@@ -283,10 +283,11 @@ With those constraints removed, all eight seed programs "failed" — against
 GCC, with the two lccc builds agreeing — which is the expected signature of
 undefined behaviour and the reason the matrix is constrained.
 
-Cumulative: **370 random programs, 0 mismatches** — 150 with the batch-3 fold
+Cumulative: **430 random programs, 0 mismatches** — 150 with the batch-3 fold
 set, then 60 and 100 after the boolean lattice and the power-of-two repricing
-landed, then 60 more after the second red-team pass, each program executed
-against all three builds.
+landed, then 60 after the second red-team pass, then 60 on the branch as it
+stands after the merge of `main`, each program executed against all three
+builds.
 
 ## Residual gap that is not a fold
 
