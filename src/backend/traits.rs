@@ -2917,6 +2917,13 @@ pub trait ArchCodegen {
         false
     }
 
+    /// Whether module-level function emission may use a callee-first order to
+    /// feed interprocedural register-allocation summaries. Backends that do
+    /// not own such a summary state retain source order.
+    fn ipa_reorder_functions(&self) -> bool {
+        false
+    }
+
     fn function_type_directive(&self) -> &'static str {
         "@function"
     }

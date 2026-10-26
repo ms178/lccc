@@ -10231,6 +10231,10 @@ impl ArchCodegen for X86Codegen {
         self.optimize_for_size
     }
 
+    fn ipa_reorder_functions(&self) -> bool {
+        self.ipa.enabled()
+    }
+
     // All remaining methods delegate to self.method_name_impl(args...)
     delegate_to_impl! {
         // CCC_ENABLE_VECREG live-out flush (default no-op on other backends)
