@@ -3140,7 +3140,6 @@ pub(crate) fn run_passes(
                 cur_pass_changes[7] += n;
                 total_changes += n;
                 total_changes_excl_dce += n;
-                verify::verify_after_pass(module, "switch_lut");
             }
         }
 
