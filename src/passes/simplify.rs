@@ -1773,10 +1773,14 @@ fn rewrite_iabs_range_cmps(func: &mut IrFunction) -> usize {
 ///    both counts are constants) => single rotate by `a + b` / `b - a`: because
 ///    `W | 2^K` for every integer count width `K >= 8`, modular addition and
 ///    subtraction commute with `(count mod W)` with zero edge cases.
-/// 3. `Popcount(Not(x))` (single-use `Not` at full 32/64-bit width) =>
-///    `W - Popcount(x)`, enabling CSE with `Popcount(x)` and folding
-///    `popcount(x) + popcount(~x)` to constant `W`.
-fn collect_rotate_popcount_facts(
+/// Rewrite two algebraic rotate identities in `func`:
+/// 1. `Rot(Rot(x, a), b)` (same direction, single-use inner rotate) =>
+///    `Rot(x, a + b)`.
+/// 2. `RotL(RotR(x, a), b)` => `RotL(x, b - a)` and
+///    `RotR(RotL(x, a), b)` => `RotR(x, b - a)` (single-use inner rotate).
+///    Because `W = 8 / 16 / 32 / 64` is a power of two, modular addition and
+///    subtraction commute with `(count mod W)` with zero edge cases.
+fn collect_rotate_facts(
     func: &IrFunction,
     max: usize,
 ) -> (
@@ -1784,7 +1788,6 @@ fn collect_rotate_popcount_facts(
     Vec<Option<IrType>>,
     Vec<Option<BinOpDef>>,
     Vec<Option<CastDef>>,
-    Vec<Option<(Operand, IrType)>>,
 ) {
     let mut def_counts = vec![0u8; max];
     let mut use_counts = vec![0u32; max];
@@ -1824,7 +1827,6 @@ fn collect_rotate_popcount_facts(
     }
     let mut rot_defs: Vec<Option<BinOpDef>> = vec![None; max];
     let mut cast_defs: Vec<Option<CastDef>> = vec![None; max];
-    let mut not_defs: Vec<Option<(Operand, IrType)>> = vec![None; max];
     for block in &func.blocks {
         for inst in &block.instructions {
             match inst {
@@ -1862,25 +1864,16 @@ fn collect_rotate_popcount_facts(
                         },
                     );
                 }
-                Instruction::UnaryOp {
-                    dest,
-                    op: IrUnaryOp::Not,
-                    src,
-                    ty,
-                } if def_counts.get(dest.0 as usize).copied() == Some(1) => {
-                    set_def(&mut not_defs, dest.0, (*src, *ty));
-                }
                 _ => {}
             }
         }
     }
-    (use_counts, value_types, rot_defs, cast_defs, not_defs)
+    (use_counts, value_types, rot_defs, cast_defs)
 }
 
 fn rewrite_rotate_and_popcount_chains(func: &mut IrFunction) -> usize {
     let max = func.max_value_id() as usize + 1;
-    let (use_counts, value_types, rot_defs, cast_defs, not_defs) =
-        collect_rotate_popcount_facts(func, max);
+    let (use_counts, value_types, rot_defs, cast_defs) = collect_rotate_facts(func, max);
 
     let peel_rot_cnt = |mut op: Operand| -> Operand {
         for _ in 0..4 {
@@ -2016,66 +2009,6 @@ fn rewrite_rotate_and_popcount_chains(func: &mut IrFunction) -> usize {
                                 continue;
                             }
                         }
-                    }
-                }
-                Instruction::UnaryOp {
-                    dest,
-                    op: IrUnaryOp::Popcount,
-                    src: Operand::Value(not_v),
-                    ty,
-                } if matches!(ty, IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64)
-                    && use_counts.get(not_v.0 as usize).copied() == Some(1) =>
-                {
-                    if let Some(Some((orig_x, not_ty))) = not_defs.get(not_v.0 as usize).copied()
-                        && not_ty.size() == ty.size()
-                    {
-                        let pop_dest = Value(next_id);
-                        next_id += 1;
-                        let bits = (ty.size() * 8) as i128;
-                        let src_casted = if not_ty == ty {
-                            orig_x
-                        } else {
-                            let cast_dest = Value(next_id);
-                            next_id += 1;
-                            block.instructions.insert(
-                                i,
-                                Instruction::Cast {
-                                    dest: cast_dest,
-                                    src: orig_x,
-                                    from_ty: not_ty,
-                                    to_ty: ty,
-                                },
-                            );
-                            if !block.source_spans.is_empty() {
-                                let span = block.source_spans[i].clone();
-                                block.source_spans.insert(i, span);
-                            }
-                            i += 1;
-                            Operand::Value(cast_dest)
-                        };
-                        block.instructions.insert(
-                            i,
-                            Instruction::UnaryOp {
-                                dest: pop_dest,
-                                op: IrUnaryOp::Popcount,
-                                src: src_casted,
-                                ty,
-                            },
-                        );
-                        if !block.source_spans.is_empty() {
-                            let span = block.source_spans[i].clone();
-                            block.source_spans.insert(i, span);
-                        }
-                        block.instructions[i + 1] = Instruction::BinOp {
-                            dest,
-                            op: IrBinOp::Sub,
-                            lhs: Operand::Const(typed_int_const(ty, bits)),
-                            rhs: Operand::Value(pop_dest),
-                            ty,
-                        };
-                        changes += 1;
-                        i += 2;
-                        continue;
                     }
                 }
                 _ => {}
