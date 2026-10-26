@@ -504,7 +504,6 @@ for mode in -m64 -m32; do
 done
 
 echo "CHECK: AVX-512 subset and function-local gates"
-set -x
 # AVX-512 permissions follow the architectural subset conjunction, including
 # EVEX.128/256 VL encodings. The test operations are public wrappers so this
 # checks the same generic builtin path real headers use.
@@ -636,8 +635,8 @@ if "$gcc_bin" -dumpfullversion 2>/dev/null | grep -x '16.2.0' >/dev/null; then
     # Compare the complete AVX512 macro set for subset grants, prerequisite
     # revocation, and re-grant order against the pinned GCC 16.2 oracle.
     compare_avx512_macros() {
-        "$ccc" "$@" -dM -E -x c /dev/null | grep '^#define __AVX512' | sort >"$tmp/lccc-avx512-macros"
-        "$gcc_bin" "$@" -dM -E -x c /dev/null | grep '^#define __AVX512' | sort >"$tmp/gcc-avx512-macros"
+        "$ccc" "$@" -dM -E -x c /dev/null | awk '/^#define __AVX512/ { print }' | sort >"$tmp/lccc-avx512-macros"
+        "$gcc_bin" "$@" -dM -E -x c /dev/null | awk '/^#define __AVX512/ { print }' | sort >"$tmp/gcc-avx512-macros"
         diff -u "$tmp/gcc-avx512-macros" "$tmp/lccc-avx512-macros" ||
             fail "AVX-512 predefined macros differ from GCC for flags: $*"
     }
@@ -689,7 +688,6 @@ if "$gcc_bin" -dumpfullversion 2>/dev/null | grep -x '16.2.0' >/dev/null; then
             fail "AVX512F fused multiply-add exact-rounding runtime: lccc=$lccc_rc gcc=$gcc_rc"
     fi
 fi
-set +x
 
 echo "PASS: ISA-sensitive intrinsics are gated on the permitted feature set, oracle-checked"
 
