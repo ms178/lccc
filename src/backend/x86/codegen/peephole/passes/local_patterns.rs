@@ -14190,13 +14190,27 @@ pub(super) fn fold_shift_into_sib(store: &mut LineStore, infos: &mut [LineInfo])
         //   dead after the add.
         // Debug attribution does not consume the instruction budget. In
         // particular a .loc per instruction must not change -g codegen.
+        // Width pairing: a `shll` consumer is `addl` (32-bit), `shlq` is
+        // `addq`.  The 32-bit pair folds to `leal` — a 32-bit lea zero-extends
+        // exactly like `shll`+`addl` did, and scaled low-32 arithmetic is
+        // congruent mod 2^32 whatever the upper halves hold.
+        let mnem = ti.split_whitespace().next().unwrap_or("");
+        let shift_w = match mnem {
+            "shll" | "sall" => 'l',
+            "shlq" | "salq" => 'q',
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        let add_prefix = format!("add{shift_w} ");
         const WINDOW: usize = 6;
         let mut j = next_non_debug(store, infos, i + 1, len);
         let mut steps = 0usize;
         let mut add_rest: Option<String> = None;
         while j < len && steps <= WINDOW && !infos[j].is_barrier() && !infos[j].pinned {
             let t = infos[j].trimmed(store.get(j));
-            if let Some(rest) = t.strip_prefix("addq ") {
+            if let Some(rest) = t.strip_prefix(add_prefix.as_str()) {
                 if rest.contains(&shifted_reg) {
                     add_rest = Some(rest.to_string());
                 }
@@ -14234,21 +14248,7 @@ pub(super) fn fold_shift_into_sib(store: &mut LineStore, infos: &mut [LineInfo])
             i += 1;
             continue;
         };
-        // The source must be the shifted register itself; the destination is
-        // the base the scaled index is added into.
-        if src != shifted_reg || !dst.starts_with('%') || dst.contains('(') {
-            i += 1;
-            continue;
-        }
-        // `addq %rax, %rax` doubles -- that is the `parse_self_doubling` form
-        // and already carries its own scale.  For the `shl` form the base must
-        // be a different register, or the rewrite would compute
-        // `base + base*scale` instead of `base + shifted_source`.
-        if dst == shifted_reg && scale != 2 {
-            i += 1;
-            continue;
-        }
-        if dst == "%rsp" || dst == "%rbp" {
+        if !dst.starts_with('%') || dst.contains('(') {
             i += 1;
             continue;
         }
@@ -14257,13 +14257,42 @@ pub(super) fn fold_shift_into_sib(store: &mut LineStore, infos: &mut [LineInfo])
             i += 1;
             continue;
         }
+        // Two consumer shapes fold.  Their form: the add's SOURCE is the
+        // shifted register (`shl; add shifted, base`), the destination is the
+        // base.  In-place form: the add's DESTINATION is the shifted register
+        // (`shl; add src, shifted`), the source becomes the base.
+        let in_place = src != shifted_reg && dst == shifted_reg;
+        if src != shifted_reg && !in_place {
+            i += 1;
+            continue;
+        }
+        // `addq %rax, %rax` doubles -- that is the `parse_self_doubling` form
+        // and already carries its own scale.  For the `shl` form the base must
+        // be a different register, or the rewrite would compute
+        // `base + base*scale` instead of `base + shifted_source`.
+        if !in_place && dst == shifted_reg && scale != 2 {
+            i += 1;
+            continue;
+        }
+        if !in_place && (dst == "%rsp" || dst == "%rbp") {
+            i += 1;
+            continue;
+        }
+        if in_place && (shifted_reg == "%rsp" || shifted_reg == "%rbp") {
+            i += 1;
+            continue;
+        }
         if !all_editable(infos, &[i, j]) {
             i += 1;
             continue;
         }
-        // The deleted definition must have no other reader: `%R` is about to
-        // go back to holding its pre-shift value.
-        if !dead.dead_after(store, infos, j, shifted_fam, &[i, j]) {
+        // Their form deletes a definition whose register reverts to its
+        // pre-shift value, so no other reader may exist.  The in-place form
+        // keeps the register's post-add meaning (the lea writes the same
+        // destination), so nothing else can observe the deleted shift: the
+        // window already proved no line between the shift and the add touches
+        // the shifted register.
+        if !in_place && !dead.dead_after(store, infos, j, shifted_fam, &[i, j]) {
             i += 1;
             continue;
         }
@@ -14280,13 +14309,22 @@ pub(super) fn fold_shift_into_sib(store: &mut LineStore, infos: &mut [LineInfo])
         // it made `eliminate_dead_pure_writes` delete the copy that fed the
         // index (`movl %eax, %r11d`) and the kernel dereferenced `bins[i*8]`.
         // The differential fixture pins the operand spellings for this reason.
-        let new_line = format!(
-            "    leaq (%{}, %{}, {}), {}",
-            &dst[1..],
-            &shifted_reg[1..],
-            scale,
-            dst
-        );
+        // SIB register fields are spelled 64-bit with their `%`: the
+        // bookkeeping scans operands by full spelling, and a bare `r9` or a
+        // 32-bit `edi` in an address would assemble while the family oracle
+        // saw no read at all.
+        let sib = |fam: RegId| REG_NAMES[0][fam as usize].to_string();
+        let (base_reg, index_reg) = if in_place {
+            let src_fam = register_family_fast(&src);
+            if src_fam == REG_NONE || src_fam > REG_GP_MAX {
+                i += 1;
+                continue;
+            }
+            (sib(src_fam), sib(shifted_fam))
+        } else {
+            (sib(dst_fam), sib(shifted_fam))
+        };
+        let new_line = format!("    lea{shift_w} ({base_reg}, {index_reg}, {scale}), {dst}");
         replace_line(store, &mut infos[j], j, new_line);
         mark_nop(&mut infos[i]);
         dead.invalidate(store, infos, j);
@@ -14534,6 +14572,42 @@ mod shift_into_sib_tests {
             ]);
             assert!(out.contains("shlq $3, %rcx"), "{barrier}: {out}");
         }
+    }
+
+    #[test]
+    fn the_in_place_32_bit_pair_folds_into_a_leal() {
+        // `shll $3, %edi; addl %esi, %edi` — the shifted register is the
+        // add's destination.  `leal` zero-extends exactly like the pair did.
+        let out = run(&["shll $3, %edi", "addl %esi, %edi", "movl %edi, %eax", "ret"]);
+        assert!(flat(&out).contains("leal (%rsi,%rdi,8),%edi"), "{out}");
+        assert!(!out.contains("shll"), "{out}");
+    }
+
+    #[test]
+    fn the_in_place_64_bit_pair_folds_into_a_leaq() {
+        let out = run(&["shlq $2, %rdi", "addq %rsi, %rdi", "movq %rdi, %rax", "ret"]);
+        assert!(flat(&out).contains("leaq (%rsi,%rdi,4),%rdi"), "{out}");
+        assert!(!out.contains("shlq"), "{out}");
+    }
+
+    #[test]
+    fn the_32_bit_source_form_folds_into_a_leal() {
+        // Their form at 32 bits: the shifted register is the add's SOURCE,
+        // the destination is the base — `leal` carries the same zero-extension
+        // `shll`+`addl` produced.
+        let out = run(&["shll $3, %rcx", "addl %rcx, %r9d", "movl %r9d, %eax", "ret"]);
+        assert!(flat(&out).contains("leal (%r9,%rcx,8),%r9d"), "{out}");
+        assert!(!out.contains("shll"), "{out}");
+    }
+
+    #[test]
+    fn an_in_place_pair_still_refuses_a_live_shifted_reader() {
+        // The window may not cross a reader of the shifted register: after
+        // the fold the register holds the pre-shift value between the two
+        // original positions.
+        let out = run(&["shll $3, %edi", "movl %edi, %r8d", "addl %esi, %edi", "ret"]);
+        assert!(out.contains("shll $3, %edi"), "{out}");
+        assert!(!out.contains("leal"), "{out}");
     }
 }
 

@@ -13,6 +13,7 @@ fn context(insts: &[Instruction], f: impl FnOnce(&Context<'_>)) {
         uses: &[3; 32],
         visits: std::cell::Cell::new(512),
         disable_logic: false,
+        wrap_signed_overflow: true,
     });
 }
 fn unary(op: IrUnaryOp, ty: IrType) -> Instruction {
@@ -314,6 +315,7 @@ fn private_exact_observations_bridge_word_and_result_types() {
                     defs: shared.defs,
                     visits: std::cell::Cell::new(512),
                     disable_logic: false,
+                    wrap_signed_overflow: true,
                 };
                 for op in [IrCmpOp::Eq, IrCmpOp::Ne] {
                     for k in [0, width as u64] {

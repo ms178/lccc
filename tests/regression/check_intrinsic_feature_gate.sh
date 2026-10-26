@@ -137,7 +137,7 @@ EOF
 # 3. GCC oracle: where GCC ships the same intrinsic, its accept/reject verdict
 #    must match ours.  GCC's DEFAULT is x86-64 (v1) while this project's is
 #    x86-64-v3, so only the explicit cases are comparable.
-gcc_bin=${GCC:-gcc}
+gcc_bin=${GCC:-gcc-16}
 if ! command -v "$gcc_bin" >/dev/null 2>&1; then
     echo "SKIP: oracle unavailable ($gcc_bin not found); the contract above still ran" >&2
     echo "PASS: intrinsic feature gate (no oracle on this host)"

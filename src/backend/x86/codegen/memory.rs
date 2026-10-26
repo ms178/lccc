@@ -4993,6 +4993,7 @@ mod indexed_fold_contract_tests {
             disp: 0,
             orig_offset: Value(3),
             access_tys,
+            index_ty: IrType::I32,
             feeds_store,
         }
     }

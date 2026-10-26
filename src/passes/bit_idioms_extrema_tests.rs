@@ -31,6 +31,7 @@ fn rewrite(code: &[Instruction]) -> Option<Vec<Instruction>> {
         uses: &uses,
         visits: std::cell::Cell::new(512),
         disable_logic: false,
+        wrap_signed_overflow: true,
     };
     fold(code.last().unwrap(), &cx)
 }

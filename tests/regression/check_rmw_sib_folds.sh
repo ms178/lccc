@@ -117,11 +117,11 @@ fn() { awk -v fn="$1:" '$0 ~ "^" fn { inside=1 } inside { print } inside && /\.s
 u8body=$(fn rmw_bump_u8)
 u16body=$(fn rmw_bump_u16)
 grep -qE "^[[:space:]]+addb[[:space:]]+\\\$1," <<< "$u8body" \
-    || bad "rmw_bump_u8: no single \`addb $1, (mem)\` -- the narrow copy was not seen through"
+    || bad "rmw_bump_u8: no single \`addb \$1, (mem)\` -- the narrow copy was not seen through"
 grep -qE "^[[:space:]]+movb[[:space:]]" <<< "$u8body" \
     && bad "rmw_bump_u8: a byte store relay survived"
 grep -qE "^[[:space:]]+addw[[:space:]]+\\\$1," <<< "$u16body" \
-    || bad "rmw_bump_u16: no single \`addw $1, (mem)\`"
+    || bad "rmw_bump_u16: no single \`addw \$1, (mem)\`"
 grep -qE "^[[:space:]]+movw[[:space:]]" <<< "$u16body" \
     && bad "rmw_bump_u16: a word store relay survived"
 note "narrow counters: one addb/addw on memory, no store relay"

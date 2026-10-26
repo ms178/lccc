@@ -67,6 +67,7 @@ fn rewrite(source: &[Instruction], shared: Option<Value>) -> Option<Vec<Instruct
             uses: &uses,
             visits: std::cell::Cell::new(512),
             disable_logic: false,
+            wrap_signed_overflow: true,
         },
     )
 }

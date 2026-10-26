@@ -16,6 +16,13 @@
 //! * A product by a value that is only ever `0` or `1` is `x` when that
 //!   boolean is forced to `1` by a non-zero `x`, and the select `b ? x : 0`
 //!   otherwise, which removes the multiplier and the `setcc` that fed it.
+//! * `trunc_W(a op b)` for a ring op `op` (add/sub/mul/and/or/xor) is computed
+//!   at width `W` directly: the low `W` bits of a ring result depend only on
+//!   the low `W` bits of the operands, and the low `W` bits of either
+//!   extension are the source bits, so `trunc_W(op(ext(x), c))` is `op(x, c)`
+//!   in the ring of `2^W` residues. That removes the extension, the wide
+//!   operation and the final truncation in one edit — `(short)((int)x - 1)`
+//!   becomes a single narrow `sub` over the raw parameter.
 //!
 //! Each edit rewrites one consumer and leaves producers, memory and shared
 //! users untouched. Nothing here inspects a loop, a block order or a dominator
@@ -541,6 +548,45 @@ fn boolean_multiply(
     None
 }
 
+/// Re-express one wide ring operand at the truncating width `to_ty`.
+///
+/// An operand that is a widening `Cast` from `to_ty` collapses to its own
+/// source: both extensions preserve the low bits, so the inner value already
+/// *is* the operand at `to_ty`. A constant is re-typed to its low-`to_ty`
+/// residue. Anything else is explicitly truncated into `tmp` — the caller
+/// mints at most one such temporary, because `fold` receives exactly one
+/// fresh value per edit. Returns `None` only for non-integer constants.
+fn trunc_ring_operand(
+    op: Operand,
+    cx: &Context<'_>,
+    from_ty: IrType,
+    to_ty: IrType,
+    tmp: Value,
+) -> Option<(Operand, Option<Instruction>)> {
+    match op {
+        Operand::Const(c) => Some((constant(c.to_i128()? as u64, to_ty), None)),
+        Operand::Value(_) => match cx.def(op) {
+            // `to_ty` is strictly narrower than `from_ty` (the caller's law),
+            // so a def whose source is at `to_ty` is a widening cast — drop
+            // it in place; its low `to_ty` bits are the source's own bits.
+            Some(Instruction::Cast {
+                from_ty: f,
+                src: raw,
+                ..
+            }) if *f == to_ty => Some((*raw, None)),
+            _ => Some((
+                Operand::Value(tmp),
+                Some(Instruction::Cast {
+                    dest: tmp,
+                    src: op,
+                    from_ty,
+                    to_ty,
+                }),
+            )),
+        },
+    }
+}
+
 pub(super) fn fold(inst: &Instruction, cx: &Context<'_>, fresh: Value) -> Option<Vec<Instruction>> {
     if disabled() {
         return None;
@@ -558,32 +604,177 @@ pub(super) fn fold(inst: &Instruction, cx: &Context<'_>, fresh: Value) -> Option
             ty,
         } if scalar(*ty) => remainder_identity(*dest, *op, *lhs, *rhs, *ty, cx, fresh),
         Instruction::UnaryOp { dest, op, src, ty } if scalar(*ty) => {
-            let Instruction::UnaryOp {
-                op: inner,
-                src: operand,
-                ty: word,
+            if !matches!(src, Operand::Value(v) if cx.uses.get(v.0 as usize) == Some(&1)) {
+                return None;
+            }
+            // The inner negation may sit behind a cast that the outer `Not`
+            // commutes past: `~` is pure bitwise, so it commutes with
+            // truncation (the kept bits flip either way) and with sign
+            // extension (the sign the extension materialises is exactly the
+            // bit `~` flips).  An *unsigned* extension does not commute —
+            // `~` would have to flip the zero fill.  `Neg` never commutes
+            // through a widening cast (`INT_MIN` breaks the equality), so the
+            // peeled cast is rejected for the `(Neg, Not)` direction.
+            let mut cast: Option<(IrType, IrType)> = None;
+            let mut inner_src = *src;
+            if let Instruction::Cast {
+                from_ty,
+                to_ty,
+                src: mid,
                 ..
             } = cx.def(*src)?
-            else {
-                return None;
+            {
+                let from_bits = from_ty.size() * 8;
+                let to_bits = to_ty.size() * 8;
+                let narrows = from_bits > to_bits;
+                let signed_ext = from_bits < to_bits
+                    && matches!(
+                        from_ty,
+                        IrType::I8 | IrType::I16 | IrType::I32 | IrType::I64
+                    );
+                if *op != IrUnaryOp::Not || !(narrows || signed_ext) {
+                    return None;
+                }
+                cast = Some((*from_ty, *to_ty));
+                inner_src = *mid;
+            }
+            // The inner definition: a negation in either spelling — the
+            // `Neg` unary op or `0 - x` as the front end spells `0 - (int)x`.
+            let (inner_neg, operand, word) = match cx.def(inner_src)? {
+                Instruction::UnaryOp {
+                    op: IrUnaryOp::Neg,
+                    src: v,
+                    ty: w,
+                    ..
+                } => (true, *v, *w),
+                Instruction::BinOp {
+                    op: IrBinOp::Sub,
+                    lhs,
+                    rhs,
+                    ty: w,
+                    ..
+                } if matches!(lhs, Operand::Const(c) if c.to_i128() == Some(0)) => (true, *rhs, *w),
+                Instruction::UnaryOp {
+                    op: IrUnaryOp::Not,
+                    src: v,
+                    ty: w,
+                    ..
+                } => (false, *v, *w),
+                _ => return None,
             };
-            if *word != *ty
-                || !matches!(src, Operand::Value(v) if cx.uses.get(v.0 as usize) == Some(&1))
+            let offset = match (op, inner_neg) {
+                // `~(0 - x)` is `x - 1` in two's complement.
+                (IrUnaryOp::Not, true) => 1u64.wrapping_neg(),
+                // `0 - ~x` is `x + 1`; uncased only (see the peel above).
+                (IrUnaryOp::Neg, false) if cast.is_none() => 1,
+                _ => return None,
+            };
+            if word != cast.map(|(f, _)| f).unwrap_or(*ty) {
+                return None;
+            }
+            match cast {
+                None => Some(vec![bin(
+                    *dest,
+                    IrBinOp::Add,
+                    operand,
+                    constant(offset, *ty),
+                    *ty,
+                )]),
+                Some((from_ty, to_ty)) => Some(vec![
+                    bin(
+                        fresh,
+                        IrBinOp::Add,
+                        operand,
+                        constant(offset, from_ty),
+                        from_ty,
+                    ),
+                    Instruction::Cast {
+                        dest: *dest,
+                        src: Operand::Value(fresh),
+                        from_ty,
+                        to_ty,
+                    },
+                ]),
+            }
+        }
+        // ── Truncating ring consumer ────────────────────────────────────
+        // `trunc_W(a op b)` with a ring `op` depends only on the low `W`
+        // bits of both operands, and the low `W` bits of an extension are
+        // the source bits, so a wide ring op whose single consumer truncates
+        // computes at the narrow width directly: the extension and the wide
+        // op die together with this cast. The op set is exactly the ring of
+        // `2^W` residues — shifts and divides are NOT in it (the low bits of
+        // a shift/divide depend on high bits or on the width itself).
+        //
+        // Byte results are excluded on purpose: the byte-truncating cast is
+        // the pattern anchor of the byte-store vectorizers
+        // (`vectorize_generator_map` matches `dst[i] = (u8)F(i)` through that
+        // cast and packs the wide lanes), and consuming the anchor here
+        // silently declines those loops — the generator-map gate fails on the
+        // trace count while the runtime stays correct. No measured win needs
+        // the byte form (the 32-probe audit's improvements are 16/32/64-bit),
+        // so the cast stays for its vectorizer consumers.
+        Instruction::Cast {
+            dest,
+            from_ty,
+            to_ty,
+            src,
+        } if scalar(*from_ty)
+            && scalar(*to_ty)
+            && from_ty.size() > to_ty.size()
+            && !matches!(to_ty, IrType::I8 | IrType::U8) =>
+        {
+            // Single-consumer law, as in the UnaryOp arm: the wide BinOp must
+            // die with this truncation or the rewrite would duplicate it.
+            if !matches!(src, Operand::Value(v) if cx.uses.get(v.0 as usize) == Some(&1)) {
+                return None;
+            }
+            let (op, lhs, rhs) = match cx.def(*src)? {
+                Instruction::BinOp {
+                    op, lhs, rhs, ty, ..
+                } if *ty == *from_ty
+                    && matches!(
+                        op,
+                        IrBinOp::Add
+                            | IrBinOp::Sub
+                            | IrBinOp::Mul
+                            | IrBinOp::And
+                            | IrBinOp::Or
+                            | IrBinOp::Xor
+                    ) =>
+                {
+                    (*op, *lhs, *rhs)
+                }
+                _ => return None,
+            };
+            // Signed Add/Sub/Mul may move to the narrow type only under
+            // `-fwrapv`. The wide original is defined on inputs whose narrow
+            // evaluation overflows (e.g. `i16` 20000 + 20000 fits the `i32`
+            // promotion the C abstract machine computes first), so rewriting
+            // it to a wrapping-at-`to_ty` operation would introduce UB into a
+            // defined program -- and later no-wrap consumers (the GEP index
+            // peel's `scale_ring_is_linear`) actively exploit that assumption.
+            // Bitwise ops never overflow and unsigned types always wrap, so
+            // the guard is exactly this op/signedness/policy triple.
+            if matches!(op, IrBinOp::Add | IrBinOp::Sub | IrBinOp::Mul)
+                && !to_ty.is_unsigned()
+                && !cx.wrap_signed_overflow
             {
                 return None;
             }
-            let offset = match (op, inner) {
-                (IrUnaryOp::Not, IrUnaryOp::Neg) => 1u64.wrapping_neg(),
-                (IrUnaryOp::Neg, IrUnaryOp::Not) => 1,
-                _ => return None,
+            let (lhs, ltmp) = trunc_ring_operand(lhs, cx, *from_ty, *to_ty, fresh)?;
+            // Exactly one fresh value per edit: bail if both sides need a
+            // truncation temporary rather than minting a colliding Value.
+            let (rhs, rtmp) = match (ltmp.is_some(), rhs) {
+                (false, rhs) => trunc_ring_operand(rhs, cx, *from_ty, *to_ty, fresh)?,
+                (true, Operand::Const(_)) => trunc_ring_operand(rhs, cx, *from_ty, *to_ty, fresh)?,
+                (true, Operand::Value(_)) => return None,
             };
-            Some(vec![bin(
-                *dest,
-                IrBinOp::Add,
-                *operand,
-                constant(offset, *ty),
-                *ty,
-            )])
+            let mut out = Vec::with_capacity(2);
+            out.extend(ltmp);
+            out.extend(rtmp);
+            out.push(bin(*dest, op, lhs, rhs, *to_ty));
+            Some(out)
         }
         Instruction::BinOp { .. } => {
             signed_shift_through_mask(inst, cx).or_else(|| boolean_multiply(inst, cx, &budget))

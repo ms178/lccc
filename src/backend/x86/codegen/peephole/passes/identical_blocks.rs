@@ -174,7 +174,10 @@ fn sets_flags(store: &LineStore, infos: &[LineInfo], i: usize) -> bool {
 }
 
 /// Does this instruction consume (read) the EFLAGS?
-fn reads_flags(store: &LineStore, infos: &[LineInfo], i: usize) -> bool {
+///
+/// Shared with `return_home`: a rewrite that replaces a flag-writing root
+/// must know whether anything in its window consumes what the root wrote.
+pub(super) fn reads_flags(store: &LineStore, infos: &[LineInfo], i: usize) -> bool {
     match infos[i].kind {
         LineKind::CondJmp | LineKind::SetCC { .. } => true,
         _ => {

@@ -21,6 +21,7 @@ fn rewrite(source: &[Instruction], shared: Option<Value>) -> Option<Vec<Instruct
             uses: &uses,
             visits: std::cell::Cell::new(512),
             disable_logic: false,
+            wrap_signed_overflow: true,
         },
         Value(6),
     )
@@ -1143,4 +1144,403 @@ fn a_complement_of_a_compare_is_not_a_boolean() {
             }
         }
     }
+}
+
+// ── Truncating ring consumer (narrow-width elision) ─────────────────────────
+
+/// `[ext, wide ring op, trunc]` → one narrow ring op: the extension and the
+/// wide op both die with the truncation.
+#[test]
+fn truncating_ring_op_computes_at_the_narrow_width() {
+    let narrow = IrType::I16;
+    let wide = IrType::I32;
+    let source = vec![
+        Instruction::Cast {
+            dest: Value(2),
+            src: Operand::Value(Value(0)),
+            from_ty: narrow,
+            to_ty: wide,
+        },
+        bin(
+            Value(3),
+            IrBinOp::Sub,
+            Operand::Value(Value(2)),
+            constant(1, wide),
+            wide,
+        ),
+        Instruction::Cast {
+            dest: Value(4),
+            src: Operand::Value(Value(3)),
+            from_ty: wide,
+            to_ty: narrow,
+        },
+    ];
+    let replacement = rewrite(&source, None).expect("truncating consumer must fold");
+    assert_eq!(replacement.len(), 1, "single narrow op: {replacement:?}");
+    let Instruction::BinOp {
+        dest,
+        op,
+        lhs,
+        rhs,
+        ty,
+    } = &replacement[0]
+    else {
+        panic!("replacement is not the narrow ring op: {replacement:?}");
+    };
+    assert_eq!((*dest, *op, *ty), (Value(4), IrBinOp::Sub, narrow));
+    assert_eq!(*lhs, Operand::Value(Value(0)), "extension dropped in place");
+    assert_eq!(*rhs, constant(1, narrow));
+    // Same residues as the original for every 16-bit bit pattern.
+    for x in (0..=u16::MAX).map(|v| v as u64) {
+        let params = [(0, x)];
+        assert_eq!(
+            interpret(&replacement, &params, narrow),
+            interpret(&source, &params, narrow),
+            "x={x:#06x}"
+        );
+    }
+}
+
+/// The zero extension folds just like the sign extension: the low bits of
+/// either extension are the source's own bits.
+#[test]
+fn truncating_ring_op_drops_zero_extensions_too() {
+    let narrow = IrType::U16;
+    let wide = IrType::U32;
+    let source = vec![
+        Instruction::Cast {
+            dest: Value(2),
+            src: Operand::Value(Value(0)),
+            from_ty: narrow,
+            to_ty: wide,
+        },
+        bin(
+            Value(3),
+            IrBinOp::Add,
+            Operand::Value(Value(2)),
+            constant(u64::MAX, wide),
+            wide,
+        ),
+        Instruction::Cast {
+            dest: Value(4),
+            src: Operand::Value(Value(3)),
+            from_ty: wide,
+            to_ty: narrow,
+        },
+    ];
+    let replacement = rewrite(&source, None).expect("zext consumer must fold");
+    assert_eq!(replacement.len(), 1);
+    let Instruction::BinOp { lhs, rhs, ty, .. } = &replacement[0] else {
+        panic!("not a ring op: {replacement:?}");
+    };
+    assert_eq!(*ty, narrow);
+    assert_eq!(*lhs, Operand::Value(Value(0)));
+    assert_eq!(*rhs, constant(u64::MAX, narrow));
+    for x in (0..=u16::MAX).map(|v| v as u64) {
+        let params = [(0, x)];
+        assert_eq!(
+            interpret(&replacement, &params, narrow),
+            interpret(&source, &params, narrow),
+            "x={x:#06x}"
+        );
+    }
+}
+
+/// A wide op with a second consumer stays: the rewrite must not duplicate it.
+#[test]
+fn truncating_ring_op_refuses_a_shared_wide_op() {
+    let narrow = IrType::I16;
+    let wide = IrType::I32;
+    let source = vec![
+        Instruction::Cast {
+            dest: Value(2),
+            src: Operand::Value(Value(0)),
+            from_ty: narrow,
+            to_ty: wide,
+        },
+        bin(
+            Value(3),
+            IrBinOp::Xor,
+            Operand::Value(Value(2)),
+            constant(0x5A5A, wide),
+            wide,
+        ),
+        Instruction::Cast {
+            dest: Value(4),
+            src: Operand::Value(Value(3)),
+            from_ty: wide,
+            to_ty: narrow,
+        },
+    ];
+    assert!(
+        rewrite(&source, Some(Value(3))).is_none(),
+        "a second use of the wide result keeps the wide computation"
+    );
+}
+
+/// Shifts and divides are not ring ops at the truncating width: their low
+/// bits depend on high bits or on the width itself.
+#[test]
+fn truncating_ring_op_refuses_shifts_and_divides() {
+    let narrow = IrType::I16;
+    let wide = IrType::I32;
+    for op in [IrBinOp::LShr, IrBinOp::AShr, IrBinOp::Shl, IrBinOp::SRem] {
+        let source = vec![
+            bin(
+                Value(1),
+                op,
+                Operand::Value(Value(0)),
+                constant(3, wide),
+                wide,
+            ),
+            Instruction::Cast {
+                dest: Value(4),
+                src: Operand::Value(Value(1)),
+                from_ty: wide,
+                to_ty: narrow,
+            },
+        ];
+        assert!(
+            rewrite(&source, None).is_none(),
+            "{op:?} must not fold through the truncation"
+        );
+    }
+}
+
+/// An operand that is neither a constant nor a widening cast is truncated
+/// explicitly — correctness first; the extension removal is the common case.
+#[test]
+fn truncating_ring_op_truncates_plain_operands() {
+    let narrow = IrType::I16;
+    let wide = IrType::I32;
+    let source = vec![
+        bin(
+            Value(1),
+            IrBinOp::Add,
+            Operand::Value(Value(0)),
+            constant(7, wide),
+            wide,
+        ),
+        Instruction::Cast {
+            dest: Value(4),
+            src: Operand::Value(Value(1)),
+            from_ty: wide,
+            to_ty: narrow,
+        },
+    ];
+    let replacement = rewrite(&source, None).expect("plain operands must fold");
+    assert_eq!(replacement.len(), 2, "{replacement:?}");
+    for x in (0..=u16::MAX).map(|v| v as u64) {
+        let params = [(0, x)];
+        assert_eq!(
+            interpret(&replacement, &params, narrow),
+            interpret(&source, &params, narrow),
+            "x={x:#06x}"
+        );
+    }
+    assert!(
+        matches!(
+            replacement.as_slice(),
+            [
+                Instruction::Cast {
+                    dest: v,
+                    from_ty: f,
+                    to_ty: t,
+                    ..
+                },
+                Instruction::BinOp { dest: d, .. },
+            ] if *v == Value(6) && *f == wide && *t == narrow && *d == Value(4)
+        ),
+        "truncation of the plain operand feeds the narrow op: {replacement:?}"
+    );
+}
+
+/// `fold` receives exactly one fresh value per edit, so a rewrite that would
+/// need TWO truncation temporaries declines instead of minting a colliding
+/// Value. (Both operands plain — the shared-wide-op case is refused earlier.)
+#[test]
+fn truncating_ring_op_bails_when_both_operands_need_a_temporary() {
+    let narrow = IrType::I16;
+    let wide = IrType::I32;
+    let source = vec![
+        bin(
+            Value(1),
+            IrBinOp::Or,
+            Operand::Value(Value(0)),
+            Operand::Value(Value(2)),
+            wide,
+        ),
+        Instruction::Cast {
+            dest: Value(4),
+            src: Operand::Value(Value(1)),
+            from_ty: wide,
+            to_ty: narrow,
+        },
+    ];
+    assert!(
+        rewrite(&source, None).is_none(),
+        "one fresh value cannot name two temporaries"
+    );
+}
+
+/// Byte results stay: `(u8)F(i)` is the byte-store vectorizer's pattern
+/// anchor (vectorize_generator_map matches through that cast), so the ring
+/// fold must leave it in place even though the algebra is sound at 8 bits.
+#[test]
+fn truncating_ring_op_leaves_byte_casts_for_the_vectorizers() {
+    let wide = IrType::I32;
+    let source = vec![
+        bin(
+            Value(1),
+            IrBinOp::Mul,
+            Operand::Value(Value(0)),
+            constant(37, wide),
+            wide,
+        ),
+        Instruction::Cast {
+            dest: Value(4),
+            src: Operand::Value(Value(1)),
+            from_ty: wide,
+            to_ty: IrType::U8,
+        },
+    ];
+    assert!(
+        rewrite(&source, None).is_none(),
+        "the byte-truncating cast belongs to the byte vectorizers"
+    );
+}
+
+/// Same walk as [`rewrite`] under `-fno-wrapv`: the signed ring's narrow
+/// arithmetic is then UB on overflow, so the truncating-ring arm must refuse
+/// it (see the guard in `fold`).
+fn rewrite_nowrap(source: &[Instruction], shared: Option<Value>) -> Option<Vec<Instruction>> {
+    let mut defs = vec![None; 8];
+    let mut uses = vec![0; 8];
+    for inst in source {
+        defs[inst.dest()?.0 as usize] = Some(inst.clone());
+        crate::backend::liveness::for_each_operand_in_instruction(inst, |op| {
+            if let Operand::Value(v) = op {
+                uses[v.0 as usize] += 1;
+            }
+        });
+    }
+    if let Some(v) = shared {
+        uses[v.0 as usize] += 1;
+    }
+    fold(
+        source.last()?,
+        &Context {
+            defs: &defs,
+            uses: &uses,
+            visits: std::cell::Cell::new(512),
+            disable_logic: false,
+            wrap_signed_overflow: false,
+        },
+        Value(6),
+    )
+}
+
+fn truncating_sub_source(wide: IrType, narrow: IrType) -> Vec<Instruction> {
+    vec![
+        Instruction::Cast {
+            dest: Value(2),
+            src: Operand::Value(Value(0)),
+            from_ty: narrow,
+            to_ty: wide,
+        },
+        bin(
+            Value(3),
+            IrBinOp::Sub,
+            Operand::Value(Value(2)),
+            constant(1, wide),
+            wide,
+        ),
+        Instruction::Cast {
+            dest: Value(4),
+            src: Operand::Value(Value(3)),
+            from_ty: wide,
+            to_ty: narrow,
+        },
+    ]
+}
+
+/// The narrow signed op must not be materialised under `-fno-wrapv`: the wide
+/// original (`x - 1` at the promoted width) is defined for every narrow `x`,
+/// while the narrowed subtraction overflows at `INT*_MIN`. Under `-fwrapv`
+/// the same source folds (the existing compute-at-the-narrow-width test).
+#[test]
+fn truncating_ring_op_refuses_signed_narrow_arith_without_wrapv() {
+    let source = truncating_sub_source(IrType::I32, IrType::I16);
+    assert!(
+        rewrite_nowrap(&source, None).is_none(),
+        "signed narrow sub under -fno-wrapv would introduce UB"
+    );
+    assert!(
+        rewrite(&source, None).is_some(),
+        "-fwrapv keeps the modular ring fold enabled"
+    );
+}
+
+/// Unsigned narrow arithmetic always wraps, so the guard must not block it.
+#[test]
+fn truncating_ring_op_keeps_unsigned_narrow_arith_without_wrapv() {
+    let narrow = IrType::U16;
+    let wide = IrType::U32;
+    let source = vec![
+        Instruction::Cast {
+            dest: Value(2),
+            src: Operand::Value(Value(0)),
+            from_ty: narrow,
+            to_ty: wide,
+        },
+        bin(
+            Value(3),
+            IrBinOp::Add,
+            Operand::Value(Value(2)),
+            constant(7, wide),
+            wide,
+        ),
+        Instruction::Cast {
+            dest: Value(4),
+            src: Operand::Value(Value(3)),
+            from_ty: wide,
+            to_ty: narrow,
+        },
+    ];
+    assert!(
+        rewrite_nowrap(&source, None).is_some(),
+        "u16 add is modular under every overflow policy"
+    );
+}
+
+/// Bitwise ops never overflow: they keep folding without `-fwrapv`.
+#[test]
+fn truncating_ring_op_keeps_bitwise_narrow_ops_without_wrapv() {
+    let narrow = IrType::I16;
+    let wide = IrType::I32;
+    let source = vec![
+        Instruction::Cast {
+            dest: Value(2),
+            src: Operand::Value(Value(0)),
+            from_ty: narrow,
+            to_ty: wide,
+        },
+        bin(
+            Value(3),
+            IrBinOp::And,
+            Operand::Value(Value(2)),
+            constant(0x5555, wide),
+            wide,
+        ),
+        Instruction::Cast {
+            dest: Value(4),
+            src: Operand::Value(Value(3)),
+            from_ty: wide,
+            to_ty: narrow,
+        },
+    ];
+    assert!(
+        rewrite_nowrap(&source, None).is_some(),
+        "i16 and has no overflow semantics to preserve"
+    );
 }

@@ -2887,6 +2887,9 @@ mod tests {
 
     #[test]
     fn repeated_movzbl_load_still_uses_movl() {
+        // `return_home` may legitimately fuse the surviving copy into the
+        // return register afterwards; pin the dead-write decision alone.
+        let _skip = super::super::test_skips::skip_passes(&["return_home"]);
         // Zero-extending loads to 32 bits keep using `movl` — the upper
         // 32 bits of the family are zero in both the load and the copy.
         let out = run(concat!(

@@ -60,6 +60,7 @@ fn rewrite(insts: &[Instruction], extra: Option<Operand>) -> Option<Vec<Instruct
             uses: &counts,
             visits: std::cell::Cell::new(512),
             disable_logic: false,
+            wrap_signed_overflow: true,
         },
         &Facts(vec![]),
         Value(8),

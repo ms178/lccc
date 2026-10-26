@@ -1114,6 +1114,47 @@ impl I686Codegen {
         }
     }
 
+    /// i686 mirror of the x86-64 backend's `ensure_sib_index_form`. The GEP
+    /// peel delivers a POST-PEEL index whose IR type can be narrower than the
+    /// address -- `p[(int16_t)(i * 2)]` roots at `I16` after the widening
+    /// cast is peeled away -- while the producing instruction only maintains
+    /// the value's low `ty` bits (the 32-bit `addl %esi, %esi` leaves garbage
+    /// above bit 15). The SIB must therefore read the index's DEFINED
+    /// 32-bit form; extend the home in place before the access. This is
+    /// exactly what GCC emits for the shape (`addl %edx, %edx; movswl %dx,
+    /// %edx`) and what the x86-64 backend already does with `movswq`.
+
+    /// Unknown types take the conservative wide default -- the documented
+    /// rule of `compute_value_type_map`. `I8`/`U8` are refused: plain i386
+    /// has no byte sub-register for esi/edi/ebp, and `indexed_fold_ok`
+    /// refuses them on the deciding side, so this arm is only a defensive
+    /// backstop (it returns false WITHOUT emitting, so a contract break can
+    /// never leave a stray extension behind). The wide types need no work:
+    /// in 32-bit addressing their register form IS the defined form.
+    fn extend_sib_index_form(&mut self, index: &Value, reg: PhysReg) -> bool {
+        let ty = self
+            .value_types
+            .get(&index.0)
+            .copied()
+            .unwrap_or(IrType::I64);
+        let name = phys_reg_name(reg);
+        // Every i686 GPR name starts with `e`; stripping it yields the
+        // 16-bit sub-register (`esi` -> `si`, `eax` -> `ax`, ...).
+        let sub16 = &name[1..];
+        match ty {
+            IrType::I64 | IrType::U64 | IrType::Ptr | IrType::I32 | IrType::U32 => true,
+            IrType::I16 => {
+                emit!(self.state, "    movswl %{}, %{}", sub16, name);
+                true
+            }
+            IrType::U16 => {
+                emit!(self.state, "    movzwl %{}, %{}", sub16, name);
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub(super) fn emit_load_indexed_impl(
         &mut self,
         dest: &Value,
@@ -1142,6 +1183,11 @@ impl I686Codegen {
                 m
             }
         };
+        // Every refusal above has fired before the first instruction is
+        // emitted: the extension runs only once the access is guaranteed.
+        if !self.extend_sib_index_form(index, x) {
+            return false;
+        }
         let load_instr = self.load_instr_for_type(ty);
         // Single instruction — no staging, so dest may alias base/index
         // (x86 computes the address before writing the destination).
@@ -1197,17 +1243,25 @@ impl I686Codegen {
         // staging.  A register source equal to the index register can only
         // be the SAME value (`a[i] = i`) — the single instruction reads it
         // for the address and the data consistently.
-        if let Some(src) = self.direct_store_src(val, ty) {
+        let direct = self.direct_store_src(val, ty);
+        if direct.is_none() {
+            // Value must be staged through %eax: require every REGISTER
+            // member of the address to sit in a callee-saved GPR (PhysReg
+            // 0..=3 = ebx/esi/edi/ebp), which the staging paths never
+            // touch.  A frame-anchored base is immune by construction, so
+            // only the index register needs to qualify there.
+            if (!frame_base && !matches!(b.0, 0 | 1 | 2 | 3)) || !matches!(x.0, 0 | 1 | 2 | 3) {
+                return false;
+            }
+        }
+        // All refusals are behind us: extend the narrow index root in place
+        // (no instruction can fail after this point).
+        if !self.extend_sib_index_form(index, x) {
+            return false;
+        }
+        if let Some(src) = direct {
             emit!(self.state, "    {} {}, {}", store_instr, src, mem);
             return true;
-        }
-        // Value must be staged through %eax: require every REGISTER member
-        // of the address to sit in a callee-saved GPR (PhysReg 0..=3 =
-        // ebx/esi/edi/ebp), which the staging paths never touch.  A
-        // frame-anchored base is immune by construction, so only the index
-        // register needs to qualify there.
-        if (!frame_base && !matches!(b.0, 0 | 1 | 2 | 3)) || !matches!(x.0, 0 | 1 | 2 | 3) {
-            return false;
         }
         self.operand_to_eax(val);
         let src = self.eax_for_type(ty);
@@ -1232,6 +1286,9 @@ impl I686Codegen {
             return false;
         };
         let mem = Self::sib_mem_sym(sym, phys_reg_name(x), shift, disp);
+        if !self.extend_sib_index_form(index, x) {
+            return false;
+        }
         let load_instr = self.load_instr_for_type(ty);
         if let Some(&d) = self.reg_assignments.get(&dest.0) {
             emit!(
@@ -1267,13 +1324,17 @@ impl I686Codegen {
         };
         let mem = Self::sib_mem_sym(sym, phys_reg_name(x), shift, disp);
         let store_instr = self.store_instr_for_type(ty);
-        if let Some(src) = self.direct_store_src(val, ty) {
+        let direct = self.direct_store_src(val, ty);
+        if direct.is_none() && !matches!(x.0, 0 | 1 | 2 | 3) {
+            // Staging through %eax: the index must survive it.
+            return false;
+        }
+        if !self.extend_sib_index_form(index, x) {
+            return false;
+        }
+        if let Some(src) = direct {
             emit!(self.state, "    {} {}, {}", store_instr, src, mem);
             return true;
-        }
-        // Staging through %eax: the index must survive it.
-        if !matches!(x.0, 0 | 1 | 2 | 3) {
-            return false;
         }
         self.operand_to_eax(val);
         let src = self.eax_for_type(ty);
