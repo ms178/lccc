@@ -555,7 +555,6 @@ impl Driver {
             }
             _ => false,
         }
-
     }
 
     /// Whether `arg` is an x86 ISA flag owned by
