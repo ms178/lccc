@@ -679,9 +679,10 @@ fn expand_sdiv32(
         let mut insts = Vec::with_capacity(16);
 
         // Truncating division floors towards zero, so a negative dividend needs
-        // `2^k - 1` added before the arithmetic shift.  The bias is the sign
-        // broadcast shifted down; the *top* k bits of `x` are not the broadcast
-        // (0x80000001 has top bits 10), so the sign has to be materialised.
+        // `2^k - 1` added before the arithmetic shift.  That is the sign
+        // broadcast narrowed to k bits, and the sign has to be materialised
+        // first: the top k bits of `x` are not the broadcast (`0x80000001` has
+        // top bits `1000`, and rounding it needs `1111`).
         let sign = fresh_value(next_id);
         insts.push(Instruction::BinOp {
             dest: sign,
@@ -2403,6 +2404,19 @@ mod tests {
             let div = expand_sdiv32(q, &Operand::Value(x), d, IrType::I32, &mut next).unwrap();
             assert_eq!(rem.len(), 5, "k={k}: {rem:?}");
             assert_eq!(div.len(), 4, "k={k}: {div:?}");
+            // The bias is built by materialising the sign and then narrowing
+            // it: the top k bits of the dividend are not the rounding mask.
+            assert!(
+                matches!(
+                    rem[0],
+                    Instruction::BinOp {
+                        op: IrBinOp::AShr,
+                        rhs: Operand::Const(_),
+                        ..
+                    }
+                ),
+                "k={k}: {rem:?}"
+            );
             for &v in &cases {
                 assert_eq!(
                     run_expansion32(&rem, (x, v), q),
@@ -2447,6 +2461,19 @@ mod tests {
             let div = expand_sdiv64(q, &Operand::Value(x), d, &mut next).unwrap();
             assert_eq!(rem.len(), 5, "k={k}: {rem:?}");
             assert_eq!(div.len(), 4, "k={k}: {div:?}");
+            // The bias is built by materialising the sign and then narrowing
+            // it: the top k bits of the dividend are not the rounding mask.
+            assert!(
+                matches!(
+                    rem[0],
+                    Instruction::BinOp {
+                        op: IrBinOp::AShr,
+                        rhs: Operand::Const(_),
+                        ..
+                    }
+                ),
+                "k={k}: {rem:?}"
+            );
             for &v in &cases {
                 assert_eq!(
                     run_expansion(&rem, (x, v), q),

@@ -69,6 +69,7 @@ FORMS = {
     "ring_or_chain_value": "orchain",
     "ring_or_chain_zero": "orchain",
     "ring_nested_select": "orchain",
+    "ring_boolean_product": "orchain",
     "ring_bool_product_self": "orchain",
     "ring_bool_product_test": "boolmul",
     "ring_bool_product_cmp": "boolmul",

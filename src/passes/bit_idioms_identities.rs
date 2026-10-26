@@ -96,6 +96,8 @@ fn remainder_identity(
             ..
         }) = cx.def(value)
         else {
+            // A constant or a parameter has no definition: try the other
+            // operand order instead of abandoning the fold.
             continue;
         };
         if *word != ty || *dividend != other || !private(value) {
@@ -138,14 +140,16 @@ fn implied_condition_sense(
     value: Operand,
     ty: IrType,
     cx: &Context<'_>,
+    budget: &std::cell::Cell<u32>,
     depth: u8,
 ) -> Option<bool> {
-    if depth == 0 {
+    if depth == 0 || budget.get() == 0 {
         return None;
     }
+    budget.set(budget.get() - 1);
     let zero = |op: Operand| matches!(op, Operand::Const(c) if c.to_i128() == Some(0));
     let holds = |op: Operand, depth: u8| {
-        op == value || implied_condition_sense(op, value, ty, cx, depth).is_some()
+        op == value || implied_condition_sense(op, value, ty, cx, budget, depth).is_some()
     };
     match cx.def(node) {
         // An or-tree is non-zero as soon as one side is.
@@ -157,7 +161,7 @@ fn implied_condition_sense(
             ..
         }) if *word == ty => {
             for side in [*lhs, *rhs] {
-                match implied_condition_sense(side, value, ty, cx, depth - 1) {
+                match implied_condition_sense(side, value, ty, cx, budget, depth - 1) {
                     Some(true) => return Some(true),
                     // An or is non-zero whenever any side is, so a side forced
                     // false says nothing about the whole.
@@ -192,7 +196,7 @@ fn implied_condition_sense(
             false_val,
             ..
         }) => {
-            let arm = match implied_condition_sense(*cond, value, ty, cx, depth - 1)? {
+            let arm = match implied_condition_sense(*cond, value, ty, cx, budget, depth - 1)? {
                 true => *true_val,
                 false => *false_val,
             };
@@ -219,28 +223,32 @@ fn implied_condition_sense(
 /// preserve it for every width. A `not` does not — `~1` is all-ones — so it is
 /// deliberately absent here; the front end's `!(c)` reaches this pass as a
 /// compare with the opposite predicate.
-fn zero_or_one(node: Operand, cx: &Context<'_>, depth: u8) -> bool {
+fn zero_or_one(node: Operand, cx: &Context<'_>, budget: &std::cell::Cell<u32>, depth: u8) -> bool {
     if let Operand::Const(c) = node {
         return matches!(c.to_i128(), Some(0) | Some(1));
     }
-    if depth == 0 {
+    if depth == 0 || budget.get() == 0 {
         return false;
     }
+    budget.set(budget.get() - 1);
     match cx.def(node) {
         Some(Instruction::Cmp { .. }) => true,
-        Some(Instruction::Copy { src, .. }) => zero_or_one(*src, cx, depth - 1),
-        Some(Instruction::Cast { src, .. }) => zero_or_one(*src, cx, depth - 1),
+        Some(Instruction::Copy { src, .. }) => zero_or_one(*src, cx, budget, depth - 1),
+        Some(Instruction::Cast { src, .. }) => zero_or_one(*src, cx, budget, depth - 1),
         Some(Instruction::BinOp {
             op: IrBinOp::And | IrBinOp::Or | IrBinOp::Xor,
             lhs,
             rhs,
             ..
-        }) => zero_or_one(*lhs, cx, depth - 1) && zero_or_one(*rhs, cx, depth - 1),
+        }) => zero_or_one(*lhs, cx, budget, depth - 1) && zero_or_one(*rhs, cx, budget, depth - 1),
         Some(Instruction::Select {
             true_val,
             false_val,
             ..
-        }) => zero_or_one(*true_val, cx, depth - 1) && zero_or_one(*false_val, cx, depth - 1),
+        }) => {
+            zero_or_one(*true_val, cx, budget, depth - 1)
+                && zero_or_one(*false_val, cx, budget, depth - 1)
+        }
         _ => false,
     }
 }
@@ -251,14 +259,21 @@ fn zero_or_one(node: Operand, cx: &Context<'_>, depth: u8) -> bool {
 /// itself, and producers whose every zero input forces a zero output — a copy,
 /// any cast, a select over zero-forcing arms, an `and` or a `mul` with one
 /// zero-forcing side, and an `or`/`xor` with two.
-fn zero_when_zero(node: Operand, value: Operand, cx: &Context<'_>, depth: u8) -> bool {
+fn zero_when_zero(
+    node: Operand,
+    value: Operand,
+    cx: &Context<'_>,
+    budget: &std::cell::Cell<u32>,
+    depth: u8,
+) -> bool {
     if node == value || matches!(node, Operand::Const(c) if c.to_i128() == Some(0)) {
         return true;
     }
-    if depth == 0 {
+    if depth == 0 || budget.get() == 0 {
         return false;
     }
-    let side = |op: Operand| zero_when_zero(op, value, cx, depth - 1);
+    budget.set(budget.get() - 1);
+    let side = |op: Operand| zero_when_zero(op, value, cx, budget, depth - 1);
     match cx.def(node) {
         Some(Instruction::Copy { src, .. }) => side(*src),
         Some(Instruction::Cast { src, .. }) => side(*src),
@@ -297,7 +312,11 @@ fn saturating_extremum(min: bool, signed: bool, ty: IrType) -> u64 {
     }
 }
 
-fn saturated_bound(inst: &Instruction, cx: &Context<'_>) -> Option<Vec<Instruction>> {
+fn saturated_bound(
+    inst: &Instruction,
+    cx: &Context<'_>,
+    budget: &std::cell::Cell<u32>,
+) -> Option<Vec<Instruction>> {
     let Instruction::Select {
         dest,
         cond,
@@ -318,14 +337,14 @@ fn saturated_bound(inst: &Instruction, cx: &Context<'_>) -> Option<Vec<Instructi
         if matches!(arm, Operand::Const(c) if c.to_i128() == Some(0)) {
             continue;
         }
-        let Some(sense) = implied_condition_sense(*cond, arm, *ty, cx, 8) else {
+        let Some(sense) = implied_condition_sense(*cond, arm, *ty, cx, budget, 8) else {
             continue;
         };
         // The value selects itself only when the condition is the one a
         // non-zero value forces it to take. The other arm then has to be zero
         // whenever this one is, and the select is that value.
         if sense == (arm == *true_val) {
-            if zero_when_zero(other, arm, cx, 8) {
+            if zero_when_zero(other, arm, cx, budget, 8) {
                 return Some(copy(*dest, arm));
             }
         } else if matches!(other, Operand::Const(c) if c.to_i128() == Some(0)) {
@@ -348,27 +367,12 @@ fn saturated_bound(inst: &Instruction, cx: &Context<'_>) -> Option<Vec<Instructi
     if *word != *ty {
         return None;
     }
-    // A zero test is the canonical form a clamp against zero reaches after
-    // boolean canonicalisation: `x != 0 ? x : 0` and `x == 0 ? 0 : x` are both
-    // `x`, and the two reversed arm orders are real zeroing choices that must
-    // keep their compare.
+    // A zero test with a non-zero other arm is a real clamp (`x > 0 ? x : 0`),
+    // not an identity, so it falls through to the range rules below.
     if matches!(op, IrCmpOp::Eq | IrCmpOp::Ne) {
-        let zero_arm = |arm: Operand| matches!(arm, Operand::Const(c) if c.to_i128() == Some(0));
-        for (value, tested) in [(*lhs, *rhs), (*rhs, *lhs)] {
-            if !zero_arm(tested) {
-                continue;
-            }
-            let identity = match (op, *true_val == value, *false_val == value) {
-                (IrCmpOp::Ne, true, false) => zero_arm(*false_val),
-                (IrCmpOp::Eq, false, true) => zero_arm(*true_val),
-                _ => false,
-            };
-            if identity {
-                return Some(copy(*dest, value));
-            }
-        }
         return None;
     }
+
     let (less, signed) = match op {
         IrCmpOp::Ult | IrCmpOp::Ule => (true, false),
         IrCmpOp::Ugt | IrCmpOp::Uge => (false, false),
@@ -497,7 +501,11 @@ fn signed_shift_through_mask(inst: &Instruction, cx: &Context<'_>) -> Option<Vec
 /// Both need the boolean producer to disappear, so the factor must be private;
 /// a factor with other consumers would keep its `setcc` and only add the
 /// select.
-fn boolean_multiply(inst: &Instruction, cx: &Context<'_>) -> Option<Vec<Instruction>> {
+fn boolean_multiply(
+    inst: &Instruction,
+    cx: &Context<'_>,
+    budget: &std::cell::Cell<u32>,
+) -> Option<Vec<Instruction>> {
     let Instruction::BinOp {
         dest,
         op: IrBinOp::Mul,
@@ -513,10 +521,10 @@ fn boolean_multiply(inst: &Instruction, cx: &Context<'_>) -> Option<Vec<Instruct
     }
     let private = |x| matches!(x, Operand::Value(v) if cx.uses.get(v.0 as usize) == Some(&1));
     for (factor, value) in [(*lhs, *rhs), (*rhs, *lhs)] {
-        if !matches!(value, Operand::Value(_)) || !zero_or_one(factor, cx, 8) {
+        if !matches!(value, Operand::Value(_)) || !zero_or_one(factor, cx, budget, 8) {
             continue;
         }
-        if implied_condition_sense(factor, value, *ty, cx, 8) == Some(true) {
+        if implied_condition_sense(factor, value, *ty, cx, budget, 8) == Some(true) {
             return Some(copy(*dest, value));
         }
         if private(factor) {
@@ -536,6 +544,10 @@ pub(super) fn fold(inst: &Instruction, cx: &Context<'_>, fresh: Value) -> Option
     if disabled() {
         return None;
     }
+    // A private budget: the walks below are the only consumers, so a sibling
+    // family that exhausted the shared visit counter cannot silently disable a
+    // fold that a reader of this file expects to fire.
+    let budget = std::cell::Cell::new(4096u32);
     match inst {
         Instruction::Cmp {
             dest,
@@ -573,9 +585,9 @@ pub(super) fn fold(inst: &Instruction, cx: &Context<'_>, fresh: Value) -> Option
             )])
         }
         Instruction::BinOp { .. } => {
-            signed_shift_through_mask(inst, cx).or_else(|| boolean_multiply(inst, cx))
+            signed_shift_through_mask(inst, cx).or_else(|| boolean_multiply(inst, cx, &budget))
         }
-        _ => saturated_bound(inst, cx),
+        _ => saturated_bound(inst, cx, &budget),
     }
 }
 

@@ -110,15 +110,11 @@ def or_chain_case(ty, arm):
     return ("orchain", ty, f"{ty} f({ty} x, {ty} y, {ty} z)", body)
 
 
-def mul_bool_case(ty):
-    return ("mulbool", ty, f"{ty} f({ty} x, {ty} y)", "return (x * ((x != 0) | (y != 0)));")
-
-
 def nested_select_case(ty):
     """`(a != 0 || b) ? a : 0`, whose condition the front end flattens into
     selects: the surviving arm is the value and the other arm is zero."""
     return ("nselect", ty, f"{ty} f({ty} a, {ty} b)",
-            "return (ty_)((a != 0 || b) ? a : 0);".replace("ty_", ty))
+            f"return ({ty})((a != 0 || b) ? a : 0);")
 
 
 def bool_product_case(ty, shape):
@@ -129,6 +125,12 @@ def bool_product_case(ty, shape):
         "return (ty_)(x * ((x != 0) | ~(y < y + 1)));",
     ][shape].replace("ty_", ty)
     return ("boolmul", ty, f"{ty} f({ty} x, {ty} y)", body)
+
+
+def bool_product_and_case(ty):
+    """Three-operand product whose boolean factor is a nested and/or tree."""
+    return ("boolmul", ty, f"{ty} f({ty} x, {ty} y, {ty} z)",
+            f"return ({ty})(x * (x || (y && z)));")
 
 
 def pow2_case(ty, k, rem, negate):
@@ -155,7 +157,6 @@ def build(seed):
     for _ in range(2):
         cases.append(zero_test_case(rng.choice(SIGNED + UNSIGNED), rng.randrange(4)))
     cases.append(or_chain_case(rng.choice(SIGNED + UNSIGNED), rng.randrange(2)))
-    cases.append(mul_bool_case(rng.choice(UNSIGNED)))
     for _ in range(2):
         ty = rng.choice(SIGNED)
         cases.append(pow2_case(ty, rng.randrange(1, WIDTHS[ty] - 1),
@@ -166,6 +167,7 @@ def build(seed):
     for shape in range(4):
         ty = rng.choice(UNSIGNED if shape != 3 else SIGNED + UNSIGNED)
         cases.append(bool_product_case(ty, shape))
+    cases.append(bool_product_and_case(rng.choice(SIGNED + UNSIGNED)))
     return cases
 
 

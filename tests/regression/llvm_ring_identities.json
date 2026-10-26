@@ -1,5 +1,5 @@
 {
-  "forms": 27,
+  "forms": 32,
   "survivors": 1,
   "promotion_boundary": [
     "ring_srem_eq16",
@@ -265,6 +265,61 @@
       }
     },
     {
+      "name": "ring_nested_select",
+      "idiom": "orchain",
+      "divider_in_control": false,
+      "instructions": {
+        "enabled": 2,
+        "disabled-subpass": 7,
+        "disabled-pass": 7,
+        "disabled-div": 7
+      }
+    },
+    {
+      "name": "ring_boolean_product",
+      "idiom": "orchain",
+      "divider_in_control": false,
+      "instructions": {
+        "enabled": 2,
+        "disabled-subpass": 13,
+        "disabled-pass": 13,
+        "disabled-div": 13
+      }
+    },
+    {
+      "name": "ring_bool_product_self",
+      "idiom": "orchain",
+      "divider_in_control": false,
+      "instructions": {
+        "enabled": 2,
+        "disabled-subpass": 9,
+        "disabled-pass": 9,
+        "disabled-div": 9
+      }
+    },
+    {
+      "name": "ring_bool_product_test",
+      "idiom": "boolmul",
+      "divider_in_control": false,
+      "instructions": {
+        "enabled": 4,
+        "disabled-subpass": 6,
+        "disabled-pass": 6,
+        "disabled-div": 6
+      }
+    },
+    {
+      "name": "ring_bool_product_cmp",
+      "idiom": "boolmul",
+      "divider_in_control": false,
+      "instructions": {
+        "enabled": 4,
+        "disabled-subpass": 6,
+        "disabled-pass": 6,
+        "disabled-div": 6
+      }
+    },
+    {
       "name": "ring_srem_pow2_32",
       "idiom": "pow2rem",
       "divider_in_control": true,
@@ -309,6 +364,6 @@
       }
     }
   ],
-  "improved_vs_disabled": 27,
+  "improved_vs_disabled": 32,
   "note": "The disabled sub-pass control is a policy switch, not an immutable baseline."
 }

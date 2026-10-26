@@ -54,6 +54,9 @@ int32_t ring_srem_pow2_neg(int32_t x) { return x % -32; }
 int32_t ring_sdiv_pow2_32(int32_t x) { return x / 32; }
 uint32_t ring_urem_pow2(uint32_t x) { return x % 256; }
 int32_t ring_nested_select(int32_t a, int32_t b) { return (a != 0 || b) ? a : 0; }
+int32_t ring_boolean_product(int32_t x, int32_t b, int32_t c) {
+    return x * (x || (b && c));
+}
 int32_t ring_bool_product_self(int32_t x, int32_t y) { return x * (x || y); }
 int32_t ring_bool_product_test(int32_t x, uint32_t y) { return x * (y != 0); }
 uint32_t ring_bool_product_cmp(uint32_t x, uint32_t y) { return (x < y) * x; }
@@ -94,6 +97,8 @@ int main(void) {
         mix((unsigned)ring_zero_select(narrow[i]));
         mix((unsigned)ring_zero_constant_eq(narrow[i]));
         mix((unsigned)ring_nested_select(narrow[i], narrow[(i + 1) % NARROW]));
+        mix((unsigned)ring_boolean_product(narrow[i], narrow[(i + 2) % NARROW],
+                                           narrow[(i + 3) % NARROW]));
         mix((unsigned)ring_bool_product_self(narrow[i], narrow[(i + 2) % NARROW]));
         mix((unsigned)ring_bool_product_test(narrow[i], (uint32_t)narrow[(i + 3) % NARROW]));
         mix((unsigned)ring_srem_pow2_32(narrow[i]));

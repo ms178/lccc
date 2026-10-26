@@ -7,6 +7,11 @@ sub-pass can prove, and it re-examines the claims that batch 3 made about
 itself — one of which, the single-instruction power-of-two bias, was **wrong**
 and is recorded below with the counter-example that killed it.
 
+A second pass then re-derived every fold the batch ships against the emitted
+code, and that pass is what the last third of this document is about: it
+retired one claim, fixed four defects, and closed two suspicions in the
+compiler's favour.
+
 Everything below is a tool result on this machine: lccc built from this branch
 with the `fastbuild` profile, oracle `gcc-16` = GCC 16.2.0, `-O2` on both sides,
 instruction counts read from the emitted function body with the directive lines
@@ -44,6 +49,12 @@ drives the remainder.
 GCC's own power-of-two `srem` uses the identical shape
 (`movl %edi,%eax; sarl $31,%eax; shrl $28,%eax; ...`), which is the strongest
 available confirmation that the one-instruction form cannot exist.
+
+That is also why the two expanders spell the same broadcast differently: the
+quotient biases with `sign >>u (w-k)` and the remainder masks `sign` with
+`2^k - 1`. Each is one instruction and the two are equal on a broadcast, and
+each is the spelling GCC emits for that operation, so the emitted code matches
+the oracle instruction for instruction instead of merely counting the same.
 
 ```text
    x % 16, before the fix        x % 16, after the fix        GCC 16.2
@@ -109,6 +120,62 @@ x * (y != 0)                 /* → select */   /*  6 → 4 = GCC */
 The select form is chosen only when the boolean's producer is private (so its
 `setcc` really disappears) and the identity form only when the value is a plain
 operand; a shared producer keeps its `setcc` and the fold would add work.
+
+### What the second red-team pass changed
+
+Re-deriving every fold against the *emitted code* rather than the source idiom
+turned up four defects worth fixing, one claim worth retiring, and two
+suspicions that the source settles in the compiler's favour.
+
+**The one-instruction remainder bias does not exist (retired).** The natural
+way to shorten `((x + t) & mask) - t` is to read the rounding term straight out
+of the dividend instead of materialising the sign: `bias = x >>u (w-k)`. The
+top `k` bits of `x` are not the mask, though — for `x = 0x80000001` and `k = 4`
+they are `1000` (8), while truncating rounding needs `2^k - 1` = 15, and
+`srem32(-2147483647, 4)` came back `1` instead of `-3`. The exhaustive
+expansion test caught it, the edit was reverted, and the test now pins both the
+shape (`AShr` first) and the lengths (5 for the remainder, 4 for the quotient),
+so a future attempt to shorten the sequence fails in `cargo test` rather than in
+a program that ships.
+
+**A per-family visit budget.** `facts::fold` ran every fold family against one
+shared visit counter, so a family that walked a large boolean tree could leave
+the counter exhausted and the select rule that follows it would stop firing
+without any diagnostic. Each fold attempt now carries a private `Cell<u32>`
+budget of 4096 steps: still bounded, so adversarial IR cannot turn the walk
+quadratic, but no family can starve another.
+
+**An abandoned fold on a non-definition.** `remainder_identity` asked
+`cx.def(value)` for the computed operand and only tried the swapped operand
+order when the definition existed but did not match. A constant or a parameter
+has no definition at all, so `C == x % C` with the dividend on the right lost
+the fold. A `def` miss now falls through to the swapped order like any other
+miss.
+
+**One rule, one home.** `saturated_bound` still carried the batch-3 zero-test
+rule (`x != 0 ? x : 0`) that the implication lattice now proves in its general
+form. The block was unreachable and is gone: a rule with two implementations is
+a rule that drifts.
+
+**Signed folding of unsigned constants.** `constant_fold::fold_binop` evaluated
+`SDiv`, `SRem` and `AShr` on the stored `i64`, but `from_i64` stores an unsigned
+constant *zero*-extended, so a `u32` bit pattern of `-1` arrives as 4294967295
+and the signed operations read it as a positive four-billion. The folder now
+extends from the operand width first (`signed_operand`), which is a no-op for
+sign-extended signed constants and for 64-bit operands, and
+`signed_operations_extend_unsigned_operands_to_their_width` pins both the
+zero-extended and the sign-extended cases.
+
+**Two suspicions, closed with code evidence.** The standard-bit rotate lowering
+in `expr_builtins_c2y.rs` emits `SRem` on the count — but only under
+`cnt_signed`, and only when the operand width is not a power of two. Every C
+integer type lccc parses is 8, 16, 32, 64 or 128 bits, all powers of two, so the
+branch is unreachable from C source (`unsigned _BitInt(24)` is rejected at
+`expected ')'`), and it is correct by construction if a wide-integer type ever
+reaches it: the signed compare path is selected by the count's type, not by its
+value. The second suspicion — `SRem` at 32-bit width in `fold_binop` disagreeing
+with the backends' operand-width `idiv` — is the paragraph above: the widths
+disagreed only for zero-extended unsigned constants, and they no longer do.
 
 ## Re-audit of the 32 deferred rows
 
@@ -182,15 +249,32 @@ different mask constant). The re-transcription is the one in
 about a missed fold lccc lacks, and they are recorded as `at-oracle` with the
 counts that show it.
 
+## What the gate now pins
+
+The regression fixture grew from 27 to 32 folded forms: `ring_nested_select`
+(nested boolean condition), `ring_boolean_product` (`x * (x || (b && c))`),
+`ring_bool_product_self`, `ring_bool_product_test` and `ring_bool_product_cmp`.
+Each is checked four ways — the fold on, the ring-identity sub-pass off, the
+whole bit-idiom pass off, and the division strength reduction off where a
+divider is involved — against GCC 16.2 at `-O2`, for a mechanism that must be
+present and one that must not, and for the value the function returns.
+
 ## Differential red team
 
 `scripts/fuzz_identities.py` draws random programs from the idiom families —
 remainder windows at every width, sign-mask shifts in both mask forms with
 runtime counts, complements of negation, saturated bounds, zero-test selects in
-all four arm orders, or-chains, nested boolean selects, boolean products, and
-power-of-two division and remainder — and builds each program three ways: folds
-on, folds off (`CCC_NO_RING_IDENTITIES=1`, `CCC_DISABLE_PASSES=bit_idioms,divconst`),
-and GCC 16.2. Every program is executed and its digest compared.
+all four arm orders, or-chains, nested boolean selects, boolean products in four
+spellings plus the three-operand `x * (x || (y && z))` form, and power-of-two
+division and remainder — and builds each program three ways: folds on, folds off
+(`CCC_NO_RING_IDENTITIES=1`, `CCC_DISABLE_PASSES=bit_idioms,divconst`), and GCC
+16.2. Every program is executed and its digest compared.
+
+The case matrix grew with the folds: the boolean products now cover the plain
+`||` spelling, the `(x != 0) | (y != 0)` spelling the front end produces for the
+`|`-of-compares idiom, a product by a compare, and a product by an `or` of a
+compare and a constant, and the nested-select case is the same shape the
+regression fixture pins.
 
 The generator is deliberately UB-free, because a differential oracle is only an
 oracle for defined programs: signed negation, signed multiply and a `-1`
@@ -199,9 +283,10 @@ With those constraints removed, all eight seed programs "failed" — against
 GCC, with the two lccc builds agreeing — which is the expected signature of
 undefined behaviour and the reason the matrix is constrained.
 
-Cumulative: **310 random programs, 0 mismatches** — 150 with the batch-3 fold
+Cumulative: **370 random programs, 0 mismatches** — 150 with the batch-3 fold
 set, then 60 and 100 after the boolean lattice and the power-of-two repricing
-landed, each program executed against all three builds.
+landed, then 60 more after the second red-team pass, each program executed
+against all three builds.
 
 ## Residual gap that is not a fold
 

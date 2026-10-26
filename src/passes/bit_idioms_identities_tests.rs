@@ -954,8 +954,9 @@ fn nested_boolean_selects_collapse_to_the_surviving_value() {
             ..
         }]
     ));
-    for a in [0u64, 1, 2, 7, mask(ty)] {
-        for b in [0u64, 1, mask(ty)] {
+    // Exhaustive over the byte ring in both operands.
+    for a in 0..=mask(IrType::U8) {
+        for b in 0..=mask(IrType::U8) {
             assert_eq!(
                 interpret(&source, &[(0, a), (4, b)], ty),
                 interpret(&replacement, &[(0, a), (4, b)], ty),
