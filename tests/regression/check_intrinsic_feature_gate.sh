@@ -504,6 +504,7 @@ for mode in -m64 -m32; do
 done
 
 echo "CHECK: AVX-512 subset and function-local gates"
+set -x
 # AVX-512 permissions follow the architectural subset conjunction, including
 # EVEX.128/256 VL encodings. The test operations are public wrappers so this
 # checks the same generic builtin path real headers use.
@@ -688,6 +689,7 @@ if "$gcc_bin" -dumpfullversion 2>/dev/null | grep -x '16.2.0' >/dev/null; then
             fail "AVX512F fused multiply-add exact-rounding runtime: lccc=$lccc_rc gcc=$gcc_rc"
     fi
 fi
+set +x
 
 echo "PASS: ISA-sensitive intrinsics are gated on the permitted feature set, oracle-checked"
 
