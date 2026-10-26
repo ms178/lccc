@@ -18,6 +18,22 @@ const I686_XMM_SCRATCH: &[&str] = &[
 ];
 
 impl InlineAsmEmitter for I686Codegen {
+    /// The register that currently HOLDS `value`.
+    ///
+    /// i686 allocates the same way x86-64 does — ebx/esi/edi/ebp plus the
+    /// caller-saved ecx/edx/eax (see the pool in `prologue.rs`) — and inline
+    /// asm reaches phase 1f/phase 2 through the same `emit_inline_asm_common`,
+    /// so an address staged into a homed input's register destroys that input
+    /// before the body runs. Unlike x86-64 this backend tracks no per-value
+    /// home FRESHNESS, so it reports every assigned home: the over-approximation
+    /// is fail-closed, since the only consequence is that the staging picks a
+    /// different scratch register.
+    fn home_reg_name(&self, value: u32) -> Option<String> {
+        self.reg_assignments
+            .get(&value)
+            .map(|&reg| super::emit::phys_reg_name(reg).to_string())
+    }
+
     fn asm_state(&mut self) -> &mut CodegenState {
         &mut self.state
     }

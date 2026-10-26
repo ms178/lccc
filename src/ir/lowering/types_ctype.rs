@@ -164,34 +164,30 @@ impl Lowerer {
     /// DerivedDeclarator::FunctionPointer info stored in function_typedefs or
     /// by checking the original typedef declaration.
     pub(super) fn param_ctype(&self, param: &crate::frontend::parser::ast::ParamDecl) -> CType {
-        // Case 1: explicit function pointer syntax - fptr_params is set
-        if let Some(ref fptr_params) = param.fptr_params {
-            let inner_ptr = param.fptr_inner_ptr_depth;
-            let strip_count = if inner_ptr > 1 { inner_ptr } else { 1 };
-            let mut ret_spec = &param.type_spec;
-            for _ in 0..strip_count {
-                if let TypeSpecifier::Pointer(inner, _) = ret_spec {
-                    ret_spec = inner;
-                }
-            }
-            let actual_return = self.type_spec_to_ctype(ret_spec);
+        // The type-specifier resolver shared by every builder call below. A
+        // closure (not a method reference) because `param_decl_to_ctype_with`
+        // takes `&dyn Fn`, and one binding keeps both call sites identical.
+        let resolve = |ts: &TypeSpecifier| self.type_spec_to_ctype(ts);
 
-            let param_types: Vec<(CType, Option<String>)> = fptr_params
-                .iter()
-                .map(|p| (self.param_ctype(p), p.name.clone()))
-                .collect();
-            let func_type = CType::Function(Box::new(crate::common::types::FunctionType {
-                return_type: actual_return,
-                params: param_types,
-                variadic: param.fptr_variadic,
-            }));
-            let mut result = CType::Pointer(Box::new(func_type), AddressSpace::Default);
-            if inner_ptr > 1 {
-                for _ in 0..(inner_ptr - 1) {
-                    result = CType::Pointer(Box::new(result), AddressSpace::Default);
-                }
-            }
-            return result;
+        // Case 1: explicit function pointer syntax — the parser recorded the
+        // parenthesised declarator's parameter list in `fptr_params`.
+        //
+        // There is exactly ONE parameter builder: `param_decl_to_ctype_with`.
+        // It knows the parser's contract (type_spec carries one Pointer per
+        // declarator star — the parenthesised group's own stars AND any
+        // leading stars, which qualify the RETURN pointer), so it peels
+        // `fptr_inner_ptr_depth.max(1)` layers for the return type and
+        // re-wraps `1..depth` of them around the function type.
+        //
+        // This arm used to re-derive that arithmetic locally, and the two
+        // derivations disagreed at depth >= 2: `long (**op)(int)` (the
+        // `ahash_do_req_chain` shape) came out as a function RETURNING
+        // `long *` and lost the outer pointer. Resolving through the shared
+        // builder is what makes a parameter declared directly and the same
+        // parameter declared through a typedef the same CType — which is what
+        // `__builtin_types_compatible_p` and `_Generic` observe.
+        if param.fptr_params.is_some() {
+            return type_builder::param_decl_to_ctype_with(&resolve, param);
         }
 
         // Case 2: typedef'd function pointer (e.g., lua_Alloc f)
@@ -210,10 +206,17 @@ impl Lowerer {
             // function type is adjusted to pointer-to-function type.
             if let Some(fti) = self.types.function_typedefs.get(tname).cloned() {
                 let return_ctype = self.type_spec_to_ctype(&fti.return_type);
+                // Same builder as every other parameter position: a bare
+                // function typedef's parameters may themselves be function
+                // pointers or arrays, and those live in `ParamDecl::fptr_params`,
+                // not in `type_spec`.
                 let param_types: Vec<(CType, Option<String>)> = fti
                     .params
                     .iter()
-                    .map(|p| (self.param_ctype(p), p.name.clone()))
+                    .map(|p| {
+                        let ty = type_builder::param_decl_to_ctype_with(&resolve, p);
+                        (ty, p.name.clone())
+                    })
                     .collect();
                 let func_type = CType::Function(Box::new(crate::common::types::FunctionType {
                     return_type: return_ctype,
@@ -259,10 +262,28 @@ impl Lowerer {
         // Look up the stored function pointer typedef info
         if let Some(fti) = self.types.func_ptr_typedef_info.get(tname) {
             let return_ctype = self.type_spec_to_ctype(&fti.return_type);
+            // Each parameter resolves through the ONE parameter builder
+            // (`param_decl_to_ctype_with`), never through its type specifier
+            // alone.  A function-pointer typedef commonly has parameters that
+            // are themselves function pointers -- `typedef int (*fp_t)(int
+            // (*)(unsigned int), int[3])`, the shape every kernel callback
+            // table uses -- and their type lives in `ParamDecl::fptr_params`,
+            // not in `type_spec`.  Resolving the specifier alone typed such a
+            // parameter as its first token (`int *`), so
+            // `__builtin_types_compatible_p(fp_t, int (*)(int (*)(unsigned
+            // int), int *))` answered 0 for two identical types.
             let param_types: Vec<(CType, Option<String>)> = fti
                 .params
                 .iter()
-                .map(|p| (self.param_ctype(p), p.name.clone()))
+                .map(|p| {
+                    (
+                        crate::common::type_builder::param_decl_to_ctype_with(
+                            &|ts| self.type_spec_to_ctype(ts),
+                            p,
+                        ),
+                        p.name.clone(),
+                    )
+                })
                 .collect();
             let func_type = CType::Function(Box::new(crate::common::types::FunctionType {
                 return_type: return_ctype,

@@ -260,6 +260,20 @@ impl InlineAsmEmitter for X86Codegen {
         None
     }
 
+    /// The register that currently HOLDS `value`, when that register's content
+    /// is still the value.
+    ///
+    /// `fresh_home_of` is the same predicate phase 2's loads and the
+    /// accumulator's recovery consult, so a register it reports is one whose
+    /// content the asm body will read — and an address materialised into it
+    /// would destroy that input before the body runs. A stale home answers
+    /// `None`, which is exactly right: the operand is reloaded from its slot,
+    /// so no register of its own is live.
+    fn home_reg_name(&self, value: u32) -> Option<String> {
+        self.fresh_home_of(value)
+            .map(|reg| super::emit::phys_reg_name(reg).to_string())
+    }
+
     fn assign_scratch_reg(&mut self, kind: &AsmOperandKind, excluded: &[String]) -> String {
         if matches!(kind, AsmOperandKind::FpReg) {
             // Skip XMM registers that are claimed by clobbers or specific constraints.
