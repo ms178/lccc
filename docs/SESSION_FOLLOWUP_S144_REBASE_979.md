@@ -76,7 +76,7 @@ re-checked, not only the conflicting hunks) and the end of x86 `emit.rs`
   so legal programs would fail it; the compiler's own fence
   (`first_sse2_reference_unless`) already allowed them. Fixed, with new
   probes; each fails on the binary before its fix.
-* #982 `engineering/evidence/.../corpus-screen.json` (133 KB) is evidence
+* #982 `engineering/evidence/sse-avx-2026-10-26/corpus-screen.json` (133 KB) is evidence
   over the 100 KB policy; recorded, not changed (upstream's file).
 * **Retracted:** an earlier note in this session called
   `check_legacy_sse_permissions.py` a dead gate. It is not:
@@ -155,7 +155,7 @@ crossings per select that are gone. (GCC's and Clang's rows have no mca
 figure: their rounding helpers are out-of-line calls that mca cannot
 model.)
 
-**Whole-corpus effect (s158 -> s161, `artifacts/s81/cgsweep.py`, output
+**Whole-corpus effect (s158 -> s161, cgsweep.py, output
 checked against GCC 16.2 on every workload):**
 
 * -O2, 56 registered workloads: 55 assembly-identical; `libm_round_family`

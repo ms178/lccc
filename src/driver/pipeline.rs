@@ -3291,6 +3291,186 @@ impl Driver {
         module
     }
 
+    /// Enforce target-feature and debug-info contracts on the final emitted text.
+    /// Keeping this validation separate leaves assembly emission and timing
+    /// readable, while every emitter still passes through one choke point.
+    fn validate_target_assembly(
+        &self,
+        module: &crate::ir::module::IrModule,
+        asm: &str,
+        input_file: &str,
+    ) -> Result<(), String> {
+        // `-mno-sse` / `-mgeneral-regs-only` (x86-64): the xmm register file
+        // is architecturally off-limits — the kernel runs with CR4.OSFXSR
+        // clear and every SSE instruction is #UD.  lccc's FP lowering has no
+        // x87 fallback on x86-64, so any floating-point VALUE that reaches
+        // codegen in such a TU produces SSE code.  GCC refuses these TUs
+        // ("SSE register return/argument with SSE disabled"); silently
+        // emitting `movsd` into a -mno-sse kernel object is a boot-time #UD.
+        // The final text is the one choke point that sees every emitter
+        // (codegen, MachInst, peephole), so the check is made here.
+        if self.target == Target::X86_64 && (self.no_sse || self.general_regs_only) {
+            if let Some((func, line)) = first_sse_reference(asm) {
+                return Err(format!(
+                    "{}: in function '{}': floating-point operation requires SSE, \
+                     but SSE is disabled (-mno-sse / -mgeneral-regs-only); \
+                     x86-64 lccc has no x87 lowering for it (offending instruction: `{}`)",
+                    input_file,
+                    func,
+                    line.trim()
+                ));
+            }
+        }
+        // SSE1 and SSE2 permissions are independent. Keep legal scalar SSE1
+        // available after an SSE2 denial, but fail closed on emitters that
+        // still require SSE2 (notably F64: there is no x87 fallback here).
+        if self.target == Target::X86_64 && self.no_sse2 && !self.no_sse {
+            // A local legacy-vector grant keeps the same XMM ABI as the
+            // SSE1 TU baseline. Check the actual function scope, not a TU-wide
+            // exemption that could hide an illegal neighboring function.
+            let sse2_functions: std::collections::HashSet<&str> = module
+                .functions
+                .iter()
+                .filter(|f| {
+                    let has = |name: &str| f.target_features.iter().any(|feature| feature == name);
+                    !has("no-sse")
+                        && !has("no-sse2")
+                        && ["sse2", "sse3", "ssse3", "sse4.1", "sse4.2", "avx", "avx2"]
+                            .iter()
+                            .any(|feature| has(feature))
+                })
+                .map(|f| f.name.as_str())
+                .collect();
+            if let Some((func, line)) =
+                first_sse2_reference_unless(asm, |name| sse2_functions.contains(name))
+            {
+                return Err(format!(
+                    "{input_file}: in function '{func}': operation requires SSE2, \
+                     but SSE2 is disabled (-mno-sse2); x86-64 lccc has no \
+                     SSE1/x87 lowering for it (offending instruction: `{}`)",
+                    line.trim()
+                ));
+            }
+        }
+        // A function's own `__attribute__((target("...")))` can deny what the
+        // TU allows. x86-64 codegen applies the denial to its vector ISA but
+        // still lowers FP values through SSE (and long double through x87),
+        // and i686 ignores per-function targets altogether, so the same
+        // final-text choke point enforces them per function. GCC 16.2
+        // refuses such functions ("SSE register return with SSE disabled",
+        // "x87 register return with x87 disabled").
+        if matches!(self.target, Target::X86_64 | Target::I686) {
+            if let Some((func, line, unit, attr)) = first_target_attribute_leak(module, asm) {
+                return Err(format!(
+                    "{input_file}: in function '{func}': {unit} is disabled by \
+                     __attribute__((target(\"{attr}\"))) and lccc has no lowering of this \
+                     operation without it (offending instruction: `{}`)",
+                    line.trim()
+                ));
+            }
+        }
+        // i686 has x87 lowerings for every scalar FP operation, so the
+        // resolved ISA is a hard contract: a leak of a higher SSE level is a
+        // backend bug that would be #UD on the silicon the user targeted
+        // (`-march=i686`, `-mno-sse*`, or the default `-m32` = x86-64-v1,
+        // which has SSE2 but not SSE3). Fail closed instead.
+        if self.target == Target::I686 {
+            // Keyed on the resolved ISA, not on codegen policy: a later
+            // grant revives a level after `-mgeneral-regs-only` (GCC
+            // semantics), and user intrinsics may then use it even though
+            // lccc's own scalar lowering conservatively stays on x87.
+            // A function's own target() grant lifts the floor for that
+            // function only (GCC accepts `target("sse2")` under `-mno-sse2`);
+            // its neighbours stay checked, and denials remain the job of
+            // first_target_attribute_leak above.
+            let grants: std::collections::HashMap<&str, [bool; 3]> = module
+                .functions
+                .iter()
+                .filter(|f| !f.target_features.is_empty())
+                .map(|f| (f.name.as_str(), i686_target_sse_grants(&f.target_features)))
+                .collect();
+            let granted = |func: &str, level: usize| grants.get(func).is_some_and(|g| g[level]);
+            let leak = (!self.resolved_i686_sse())
+                .then(|| first_xmm_reference_if(asm, |func, _| !granted(func, 0)))
+                .flatten()
+                .map(|hit| (hit, "SSE"))
+                .or_else(|| {
+                    (!self.resolved_i686_sse2())
+                        .then(|| first_sse2_reference_unless(asm, |func| granted(func, 1)))
+                        .flatten()
+                        .map(|hit| (hit, "SSE2"))
+                })
+                .or_else(|| {
+                    (!self.resolved_i686_sse3())
+                        .then(|| first_sse3_reference_unless(asm, |func| granted(func, 2)))
+                        .flatten()
+                        .map(|hit| (hit, "SSE3"))
+                });
+            if let Some(((func, line), level)) = leak {
+                return Err(format!(
+                    "{input_file}: in function '{func}': instruction requires {level}, \
+                     which the target ISA (-march=/-m flags) does not include \
+                     (offending instruction: `{}`)",
+                    line.trim()
+                ));
+            }
+        }
+        // x87 permission (GCC's MASK_80387). Every x87 instruction lccc
+        // emits carries an FP value (64-bit atomics use cmpxchg8b), so
+        // integer-only translation units — the kernel's `-msoft-float` /
+        // `-mgeneral-regs-only` objects — are unaffected, while FP code is
+        // refused instead of silently using a disabled register file.
+        if matches!(self.target, Target::I686 | Target::X86_64) && self.no_x87 {
+            if let Some((func, line)) = first_x87_reference(asm) {
+                return Err(format!(
+                    "{input_file}: in function '{func}': floating-point operation requires \
+                     the x87 FPU, which is disabled (-mno-80387 / -msoft-float / \
+                     -mgeneral-regs-only); lccc has no soft-float lowering \
+                     (offending instruction: `{}`)",
+                    line.trim()
+                ));
+            }
+        }
+        if matches!(self.target, Target::I686 | Target::X86_64) && self.no_fp_ret_in_387 {
+            if let Some((func, what)) =
+                first_x87_return_boundary(module, asm, self.target == Target::I686)
+            {
+                return Err(format!(
+                    "{input_file}: in function '{func}': {what} uses the x87 \
+                     return register, which -mno-fp-ret-in-387 disables; lccc does \
+                     not implement the general-register FP return convention"
+                ));
+            }
+        }
+        if self.target == Target::Aarch64 && self.general_regs_only {
+            if let Some((func, line)) = first_arm_simd_reference(asm) {
+                return Err(format!(
+                    "{input_file}: in function '{func}': FP/SIMD register use is forbidden \
+                     by -mgeneral-regs-only (offending instruction: `{}`)",
+                    line.trim()
+                ));
+            }
+        }
+        // Debug-info honesty law: `-g` must never be silently dropped.
+        // lccc's debug support today is line tables (.file/.loc →
+        // .debug_line); it does not emit .debug_info (DIEs/types), and
+        // optimization may erase every source span a TU was lowered with,
+        // leaving objects with NO debug sections while -g was requested.
+        // Downstream consumers (the kernel build's pahole/BTF step,
+        // debuggers, addr2line) must be able to trust the toolchain to say
+        // so instead of failing later with an unrelated error — the same
+        // never-silently-wrong law that guards port-I/O and SSE lowering.
+        if self.debug_info && !asm_contains_debug_records(asm) {
+            eprintln!(
+                "{}: warning: -g requested but no debug information was \
+                 generated for this translation unit (lccc emits line tables \
+                 only; .debug_info/type info is not implemented)",
+                input_file
+            );
+        }
+        Ok(())
+    }
+
     #[expect(clippy::too_many_arguments)]
     fn emit_target_assembly(
         &self,
@@ -3409,174 +3589,7 @@ impl Driver {
         let asm = self
             .target
             .generate_assembly_with_opts_and_debug(module, &opts, source_manager);
-        // `-mno-sse` / `-mgeneral-regs-only` (x86-64): the xmm register file
-        // is architecturally off-limits — the kernel runs with CR4.OSFXSR
-        // clear and every SSE instruction is #UD.  lccc's FP lowering has no
-        // x87 fallback on x86-64, so any floating-point VALUE that reaches
-        // codegen in such a TU produces SSE code.  GCC refuses these TUs
-        // ("SSE register return/argument with SSE disabled"); silently
-        // emitting `movsd` into a -mno-sse kernel object is a boot-time #UD.
-        // The final text is the one choke point that sees every emitter
-        // (codegen, MachInst, peephole), so the check is made here.
-        if self.target == Target::X86_64 && (self.no_sse || self.general_regs_only) {
-            if let Some((func, line)) = first_sse_reference(&asm) {
-                return Err(format!(
-                    "{}: in function '{}': floating-point operation requires SSE, \
-                     but SSE is disabled (-mno-sse / -mgeneral-regs-only); \
-                     x86-64 lccc has no x87 lowering for it (offending instruction: `{}`)",
-                    input_file,
-                    func,
-                    line.trim()
-                ));
-            }
-        }
-        // SSE1 and SSE2 permissions are independent. Keep legal scalar SSE1
-        // available after an SSE2 denial, but fail closed on emitters that
-        // still require SSE2 (notably F64: there is no x87 fallback here).
-        if self.target == Target::X86_64 && self.no_sse2 && !self.no_sse {
-            // A local legacy-vector grant keeps the same XMM ABI as the
-            // SSE1 TU baseline. Check the actual function scope, not a TU-wide
-            // exemption that could hide an illegal neighboring function.
-            let sse2_functions: std::collections::HashSet<&str> = module
-                .functions
-                .iter()
-                .filter(|f| {
-                    let has = |name: &str| f.target_features.iter().any(|feature| feature == name);
-                    !has("no-sse")
-                        && !has("no-sse2")
-                        && ["sse2", "sse3", "ssse3", "sse4.1", "sse4.2", "avx", "avx2"]
-                            .iter()
-                            .any(|feature| has(feature))
-                })
-                .map(|f| f.name.as_str())
-                .collect();
-            if let Some((func, line)) =
-                first_sse2_reference_unless(&asm, |name| sse2_functions.contains(name))
-            {
-                return Err(format!(
-                    "{input_file}: in function '{func}': operation requires SSE2, \
-                     but SSE2 is disabled (-mno-sse2); x86-64 lccc has no \
-                     SSE1/x87 lowering for it (offending instruction: `{}`)",
-                    line.trim()
-                ));
-            }
-        }
-        // A function's own `__attribute__((target("...")))` can deny what the
-        // TU allows. x86-64 codegen applies the denial to its vector ISA but
-        // still lowers FP values through SSE (and long double through x87),
-        // and i686 ignores per-function targets altogether, so the same
-        // final-text choke point enforces them per function. GCC 16.2
-        // refuses such functions ("SSE register return with SSE disabled",
-        // "x87 register return with x87 disabled").
-        if matches!(self.target, Target::X86_64 | Target::I686) {
-            if let Some((func, line, unit, attr)) = first_target_attribute_leak(&module, &asm) {
-                return Err(format!(
-                    "{input_file}: in function '{func}': {unit} is disabled by \
-                     __attribute__((target(\"{attr}\"))) and lccc has no lowering of this \
-                     operation without it (offending instruction: `{}`)",
-                    line.trim()
-                ));
-            }
-        }
-        // i686 has x87 lowerings for every scalar FP operation, so the
-        // resolved ISA is a hard contract: a leak of a higher SSE level is a
-        // backend bug that would be #UD on the silicon the user targeted
-        // (`-march=i686`, `-mno-sse*`, or the default `-m32` = x86-64-v1,
-        // which has SSE2 but not SSE3). Fail closed instead.
-        if self.target == Target::I686 {
-            // Keyed on the resolved ISA, not on codegen policy: a later
-            // grant revives a level after `-mgeneral-regs-only` (GCC
-            // semantics), and user intrinsics may then use it even though
-            // lccc's own scalar lowering conservatively stays on x87.
-            // A function's own target() grant lifts the floor for that
-            // function only (GCC accepts `target("sse2")` under `-mno-sse2`);
-            // its neighbours stay checked, and denials remain the job of
-            // first_target_attribute_leak above.
-            let grants: std::collections::HashMap<&str, [bool; 3]> = module
-                .functions
-                .iter()
-                .filter(|f| !f.target_features.is_empty())
-                .map(|f| (f.name.as_str(), i686_target_sse_grants(&f.target_features)))
-                .collect();
-            let granted = |func: &str, level: usize| grants.get(func).is_some_and(|g| g[level]);
-            let leak = (!self.resolved_i686_sse())
-                .then(|| first_xmm_reference_if(&asm, |func, _| !granted(func, 0)))
-                .flatten()
-                .map(|hit| (hit, "SSE"))
-                .or_else(|| {
-                    (!self.resolved_i686_sse2())
-                        .then(|| first_sse2_reference_unless(&asm, |func| granted(func, 1)))
-                        .flatten()
-                        .map(|hit| (hit, "SSE2"))
-                })
-                .or_else(|| {
-                    (!self.resolved_i686_sse3())
-                        .then(|| first_sse3_reference_unless(&asm, |func| granted(func, 2)))
-                        .flatten()
-                        .map(|hit| (hit, "SSE3"))
-                });
-            if let Some(((func, line), level)) = leak {
-                return Err(format!(
-                    "{input_file}: in function '{func}': instruction requires {level}, \
-                     which the target ISA (-march=/-m flags) does not include \
-                     (offending instruction: `{}`)",
-                    line.trim()
-                ));
-            }
-        }
-        // x87 permission (GCC's MASK_80387). Every x87 instruction lccc
-        // emits carries an FP value (64-bit atomics use cmpxchg8b), so
-        // integer-only translation units — the kernel's `-msoft-float` /
-        // `-mgeneral-regs-only` objects — are unaffected, while FP code is
-        // refused instead of silently using a disabled register file.
-        if matches!(self.target, Target::I686 | Target::X86_64) && self.no_x87 {
-            if let Some((func, line)) = first_x87_reference(&asm) {
-                return Err(format!(
-                    "{input_file}: in function '{func}': floating-point operation requires \
-                     the x87 FPU, which is disabled (-mno-80387 / -msoft-float / \
-                     -mgeneral-regs-only); lccc has no soft-float lowering \
-                     (offending instruction: `{}`)",
-                    line.trim()
-                ));
-            }
-        }
-        if matches!(self.target, Target::I686 | Target::X86_64) && self.no_fp_ret_in_387 {
-            if let Some((func, what)) =
-                first_x87_return_boundary(&module, &asm, self.target == Target::I686)
-            {
-                return Err(format!(
-                    "{input_file}: in function '{func}': {what} uses the x87 \
-                     return register, which -mno-fp-ret-in-387 disables; lccc does \
-                     not implement the general-register FP return convention"
-                ));
-            }
-        }
-        if self.target == Target::Aarch64 && self.general_regs_only {
-            if let Some((func, line)) = first_arm_simd_reference(&asm) {
-                return Err(format!(
-                    "{input_file}: in function '{func}': FP/SIMD register use is forbidden \
-                     by -mgeneral-regs-only (offending instruction: `{}`)",
-                    line.trim()
-                ));
-            }
-        }
-        // Debug-info honesty law: `-g` must never be silently dropped.
-        // lccc's debug support today is line tables (.file/.loc →
-        // .debug_line); it does not emit .debug_info (DIEs/types), and
-        // optimization may erase every source span a TU was lowered with,
-        // leaving objects with NO debug sections while -g was requested.
-        // Downstream consumers (the kernel build's pahole/BTF step,
-        // debuggers, addr2line) must be able to trust the toolchain to say
-        // so instead of failing later with an unrelated error — the same
-        // never-silently-wrong law that guards port-I/O and SSE lowering.
-        if self.debug_info && !asm_contains_debug_records(&asm) {
-            eprintln!(
-                "{}: warning: -g requested but no debug information was \
-                 generated for this translation unit (lccc emits line tables \
-                 only; .debug_info/type info is not implemented)",
-                input_file
-            );
-        }
+        self.validate_target_assembly(module, &asm, input_file)?;
         if time_phases {
             eprintln!(
                 "[TIME] codegen: {:.3}s ({} bytes asm)",
