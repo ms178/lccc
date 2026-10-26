@@ -2833,7 +2833,6 @@ impl Lowerer {
                             | "avx512bitalg"
                             | "avx512bf16"
                             | "avx512fp16"
-                            | "avx512bmm"
                     )
                 {
                     permitted = true;
