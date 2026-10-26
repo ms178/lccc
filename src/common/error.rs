@@ -587,6 +587,12 @@ impl DiagnosticEngine {
         self.warning_config = config;
     }
 
+    /// Check whether a warning is enabled before doing optional, potentially
+    /// expensive analysis for that warning category.
+    pub fn warning_enabled(&self, kind: WarningKind) -> bool {
+        self.warning_config.is_enabled(kind)
+    }
+
     /// Set the source manager for span resolution and snippet display.
     pub fn set_source_manager(&mut self, sm: SourceManager) {
         self.source_manager = Some(std::rc::Rc::new(sm));

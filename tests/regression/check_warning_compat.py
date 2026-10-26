@@ -29,6 +29,20 @@ int warning_probe(int signed_value, unsigned int unsigned_value) {
 }
 '''
 
+SIGN_CONTROL_SOURCE = r'''
+int warning_suppression_probe(unsigned int u, int s) {
+    return (u == 0) + (u < 13) + (s == 0U)
+        + (u != (int)(s == 0))
+        + (u != (((int)(s == 0) | (u != 13)) & ((u & ~1u) == 42)));
+}
+'''
+
+SIGN_NEGATIVE_SOURCE = r'''
+int warning_negative_constant_probe(unsigned int u) {
+    return u < -1;
+}
+'''
+
 FEATURES = {
     "unused": "unused variable",
     "format": "format '%d'",
@@ -119,6 +133,20 @@ def main() -> int:
                 raise RuntimeError(
                     f"LCCC {label} {flags}: expected GCC warnings {sorted(gcc_found)}, "
                     f"got {sorted(lccc_found)}"
+                )
+            print(f"warning compatibility {label}: PASS ({', '.join(sorted(lccc_found)) or 'silent'})")
+
+        for label, fixture, expected in (
+            ("sign-suppression", SIGN_CONTROL_SOURCE, set()),
+            ("sign-negative-constant", SIGN_NEGATIVE_SOURCE, {"sign"}),
+        ):
+            source.write_text(fixture, encoding="utf-8")
+            gcc_found = run_case("GCC 16.2", gcc, ("-Wextra",), source)
+            lccc_found = run_case("LCCC", lccc, ("-Wextra",), source)
+            if gcc_found != expected or lccc_found != gcc_found:
+                raise RuntimeError(
+                    f"{label}: expected GCC/LCCC {sorted(expected)}, "
+                    f"got GCC {sorted(gcc_found)}, LCCC {sorted(lccc_found)}"
                 )
             print(f"warning compatibility {label}: PASS ({', '.join(sorted(lccc_found)) or 'silent'})")
 

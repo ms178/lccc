@@ -55,7 +55,9 @@ def run(argv: list[str], *, cwd: Path | None = None) -> str:
     if completed.stderr:
         # Compiler warnings are not fatal here; readelf warnings are, because
         # malformed offsets can otherwise be hidden by successful exit status.
-        if Path(argv[0]).name.startswith("readelf") and "warning:" in completed.stderr.lower():
+        if Path(argv[0]).name.startswith("readelf") and any(
+            marker in completed.stderr.lower() for marker in ("warning:", "error:")
+        ):
             raise GateFailure(
                 f"readelf reported malformed ELF/DWARF for {' '.join(argv)}:\n"
                 f"{completed.stderr}"
@@ -74,6 +76,17 @@ def section_listing(readelf: str, path: Path) -> str:
 
 def decoded_lines(readelf: str, path: Path) -> str:
     return run([readelf, "--debug-dump=decodedline", str(path)])
+
+
+def require_debug_not_loaded(readelf: str, path: Path) -> None:
+    program_headers = run([readelf, "-lW", str(path)])
+    require("LOAD" in program_headers, f"{path} has no PT_LOAD segments")
+    _, separator, mapping = program_headers.partition("Section to Segment mapping:")
+    require(separator, f"readelf omitted the section-to-segment mapping for {path}")
+    require(
+        ".debug" not in mapping and ".zdebug" not in mapping,
+        f"non-allocated debug sections were mapped into PT_LOAD in {path}",
+    )
 
 
 def line_rows(output: str, filename: str) -> list[tuple[int, int]]:
@@ -221,6 +234,7 @@ def main() -> int:
                 cwd=work,
             )
             require(".debug_line" in section_listing(readelf, lccc_exec), "linked LCCC output lost .debug_line")
+            require_debug_not_loaded(readelf, lccc_exec)
             require_line_address(readelf, lccc_exec, "unit_a.c", "dwarf_helper")
             require_line_address(readelf, lccc_exec, "unit_b.c", "dwarf_entry")
 
@@ -243,6 +257,7 @@ def main() -> int:
                 ".debug_line" not in section_listing(readelf, stripped_exec),
                 "--strip-all retained the LCCC .debug_line section",
             )
+            require_debug_not_loaded(readelf, stripped_exec)
 
             # GCC 16.2 emits full DWARF 5. LCCC's linker must retain and fix
             # up its cross-section references, not merely copy the line table.
@@ -263,6 +278,7 @@ def main() -> int:
             sections = section_listing(readelf, gcc_exec)
             for name in (".debug_info", ".debug_abbrev", ".debug_line", ".debug_str"):
                 require(name in sections, f"LCCC executable link dropped GCC's {name}")
+            require_debug_not_loaded(readelf, gcc_exec)
             info = run([readelf, "--debug-dump=info", str(gcc_exec)])
             require("dwarf_helper" in info and "dwarf_entry" in info, "GCC DWARF DIEs were not preserved")
             require_line_address(readelf, gcc_exec, "unit_a.c", "dwarf_helper")
@@ -282,6 +298,7 @@ def main() -> int:
                 cwd=work,
             )
             require(".debug_info" in section_listing(readelf, gcc_shared), "shared link dropped GCC .debug_info")
+            require_debug_not_loaded(readelf, gcc_shared)
             require_line_address(readelf, gcc_shared, "unit_a.c", "dwarf_helper")
             require_line_address(readelf, gcc_shared, "unit_b.c", "dwarf_entry")
 

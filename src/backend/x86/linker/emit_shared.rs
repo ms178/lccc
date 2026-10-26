@@ -1859,21 +1859,23 @@ pub(super) fn emit_shared_library(
         }
     }
 
-    // Place non-allocated debug data after the mapped image. It receives a
-    // file offset for static relocation and section-header emission, but no
-    // virtual address and no PT_LOAD membership.
+    // Place non-allocated debug data after the mapped image. Keep its file
+    // cursor separate from `offset`: the latter remains the load-image end
+    // used below for PT_LOAD extents, while debug sections get no virtual
+    // address and no PT_LOAD membership.
+    let mut nonalloc_file_end = offset;
     for sec in output_sections
         .iter_mut()
         .filter(|sec| sec.flags & SHF_ALLOC == 0)
     {
         let alignment = sec.alignment.max(1);
-        offset = offset
+        nonalloc_file_end = nonalloc_file_end
             .checked_add(alignment - 1)
             .ok_or_else(|| format!("output section '{}' offset overflow", sec.name))?
             & !(alignment - 1);
         sec.addr = 0;
-        sec.file_offset = offset;
-        offset = offset
+        sec.file_offset = nonalloc_file_end;
+        nonalloc_file_end = nonalloc_file_end
             .checked_add(sec.mem_size)
             .ok_or_else(|| format!("output section '{}' size overflow", sec.name))?;
     }
@@ -1970,7 +1972,7 @@ pub(super) fn emit_shared_library(
     super::link::evaluate_pending_defsyms(globals, pending_defsyms, &place)?;
 
     // === Build output buffer ===
-    let file_size = offset as usize;
+    let file_size = nonalloc_file_end as usize;
     let mut out = vec![0u8; file_size];
 
     // ELF header

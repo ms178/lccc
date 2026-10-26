@@ -1289,21 +1289,22 @@ pub(super) fn emit_executable(
     }
 
     // Non-allocated debug sections live after the load image: assign file
-    // offsets without advancing any virtual address or adding them to a
-    // PT_LOAD segment. This also gives the ordinary relocation pass a valid
-    // file location for DWARF references to code sections.
+    // offsets without advancing the load-image `offset`, which is still used
+    // below to compute PT_LOAD file/memory extents. This also gives the
+    // relocation pass a valid file location for DWARF references to code.
+    let mut nonalloc_file_end = offset;
     for sec in output_sections
         .iter_mut()
         .filter(|sec| sec.flags & SHF_ALLOC == 0)
     {
         let alignment = sec.alignment.max(1);
-        offset = offset
+        nonalloc_file_end = nonalloc_file_end
             .checked_add(alignment - 1)
             .ok_or_else(|| format!("output section '{}' offset overflow", sec.name))?
             & !(alignment - 1);
         sec.addr = 0;
-        sec.file_offset = offset;
-        offset = offset
+        sec.file_offset = nonalloc_file_end;
+        nonalloc_file_end = nonalloc_file_end
             .checked_add(sec.mem_size)
             .ok_or_else(|| format!("output section '{}' size overflow", sec.name))?;
     }
@@ -1918,7 +1919,7 @@ pub(super) fn emit_executable(
         .count();
     zone!("symtab");
     // === Build output buffer ===
-    let file_size = offset as usize;
+    let file_size = nonalloc_file_end as usize;
     // Defence in depth against malformed input driving a gigantic layout.
     // `parse_elf64_object` already rejects non-power-of-two sh_addralign (the
     // fuzzer-found path that demanded a 1 TiB buffer), but any future arithmetic

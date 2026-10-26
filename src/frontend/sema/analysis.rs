@@ -5149,13 +5149,47 @@ impl SemanticAnalyzer {
         self.check_address_space_conversion(&from, target, expr.span(), null_constant);
     }
 
-    /// GCC `-Wsign-compare`: integer comparisons between operands with
-    /// different signedness, after the usual integer promotions.
+    /// Whether an integer expression is structurally constrained to 0 or 1.
+    /// GCC's `-Wsign-compare` does not warn when one side is a boolean-valued
+    /// comparison (including casts/bitwise combinations of comparisons).
+    fn is_boolean_result_expr(expr: &Expr, ty: &CType) -> bool {
+        if matches!(ty, CType::Bool) {
+            return true;
+        }
+        match expr {
+            Expr::BinaryOp(op, ..) if op.is_comparison() => true,
+            Expr::UnaryOp(UnaryOp::LogicalNot, ..) => true,
+            Expr::Cast(_, inner, ..) => Self::is_boolean_result_expr(inner, ty),
+            Expr::BinaryOp(BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor, lhs, rhs, _) => {
+                Self::is_boolean_result_expr(lhs, ty) && Self::is_boolean_result_expr(rhs, ty)
+            }
+            Expr::Conditional(_, then_expr, else_expr, _) => {
+                Self::is_boolean_result_expr(then_expr, ty)
+                    && Self::is_boolean_result_expr(else_expr, ty)
+            }
+            Expr::GnuConditional(condition, else_expr, _) => {
+                Self::is_boolean_result_expr(condition, ty)
+                    && Self::is_boolean_result_expr(else_expr, ty)
+            }
+            Expr::Comma(_, rhs, _) => Self::is_boolean_result_expr(rhs, ty),
+            _ => false,
+        }
+    }
+
+    /// GCC `-Wsign-compare`: diagnose mixed-sign comparisons only when the
+    /// common arithmetic type is unsigned and neither a non-negative constant
+    /// nor a boolean-valued operand makes the comparison harmless. GCC
+    /// suppresses e.g. `unsigned_value < 13` and `signed_value == 0U`, but not
+    /// a negative signed constant or a signed variable.
     fn warn_sign_compare(&self, op: BinOp, lhs: &Expr, rhs: &Expr, span: Span) {
         if !matches!(
             op,
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
         ) {
+            return;
+        }
+        let warning_kind = crate::common::error::WarningKind::SignCompare;
+        if !self.diagnostics.borrow().warning_enabled(warning_kind) {
             return;
         }
         let checker = self.expr_type_checker();
@@ -5164,18 +5198,86 @@ impl SemanticAnalyzer {
         else {
             return;
         };
-        let lhs_type = lhs_type.integer_promoted();
-        let rhs_type = rhs_type.integer_promoted();
-        if lhs_type.is_integer()
-            && rhs_type.is_integer()
-            && lhs_type.is_signed() != rhs_type.is_signed()
-        {
-            self.diagnostics.borrow_mut().warning_with_kind(
-                "comparison of integer expressions of different signedness",
-                span,
-                crate::common::error::WarningKind::SignCompare,
-            );
+        if !lhs_type.is_integer() || !rhs_type.is_integer() {
+            return;
         }
+
+        let lhs_promoted = lhs_type.integer_promoted();
+        let rhs_promoted = rhs_type.integer_promoted();
+        if lhs_promoted.is_signed() == rhs_promoted.is_signed() {
+            return;
+        }
+        let common_type = CType::usual_arithmetic_conversion(&lhs_promoted, &rhs_promoted);
+        if !common_type.is_integer() || common_type.is_signed() {
+            return;
+        }
+
+        if Self::is_boolean_result_expr(lhs, &lhs_type)
+            || Self::is_boolean_result_expr(rhs, &rhs_type)
+        {
+            return;
+        }
+
+        let lhs_constant = checker
+            .is_integer_constant_expr(lhs)
+            .then(|| self.eval_const_expr_value(lhs))
+            .flatten()
+            .and_then(IrConst::to_i128);
+        let rhs_constant = checker
+            .is_integer_constant_expr(rhs)
+            .then(|| self.eval_const_expr_value(rhs))
+            .flatten()
+            .and_then(IrConst::to_i128);
+
+        let unsigned_mask = |ty: &CType| -> Option<u128> {
+            let bits = ty.size().checked_mul(8)?;
+            match bits {
+                0 => None,
+                128.. => Some(u128::MAX),
+                _ => Some((1u128 << bits) - 1),
+            }
+        };
+        let signed_max = |ty: &CType| -> Option<u128> {
+            let bits = ty.size().checked_mul(8)?;
+            match bits {
+                0 => None,
+                128.. => Some(i128::MAX as u128),
+                _ => Some((1u128 << (bits - 1)) - 1),
+            }
+        };
+
+        let nonnegative_signed_constant_fits = lhs_promoted.is_signed()
+            && lhs_constant.is_some_and(|value| {
+                value >= 0 && unsigned_mask(&rhs_promoted).is_some_and(|max| (value as u128) <= max)
+            })
+            || rhs_promoted.is_signed()
+                && rhs_constant.is_some_and(|value| {
+                    value >= 0
+                        && unsigned_mask(&lhs_promoted).is_some_and(|max| (value as u128) <= max)
+                });
+        let unsigned_constant_fits_signed = lhs_promoted.is_signed()
+            && rhs_promoted.is_unsigned()
+            && rhs_constant.is_some_and(|value| {
+                unsigned_mask(&rhs_type)
+                    .zip(signed_max(&lhs_promoted))
+                    .is_some_and(|(mask, max)| ((value as u128) & mask) <= max)
+            })
+            || rhs_promoted.is_signed()
+                && lhs_promoted.is_unsigned()
+                && lhs_constant.is_some_and(|value| {
+                    unsigned_mask(&lhs_type)
+                        .zip(signed_max(&rhs_promoted))
+                        .is_some_and(|(mask, max)| ((value as u128) & mask) <= max)
+                });
+        if nonnegative_signed_constant_fits || unsigned_constant_fits_signed {
+            return;
+        }
+
+        self.diagnostics.borrow_mut().warning_with_kind(
+            "comparison of integer expressions of different signedness",
+            span,
+            warning_kind,
+        );
     }
 
     /// `==`, `!=`, `<`, ... and `-` between pointers whose pointees live in
