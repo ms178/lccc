@@ -1054,13 +1054,16 @@ fn fold_cast_i128(src: &IrConst, from_ty: IrType, to_ty: IrType) -> Option<IrCon
 /// unsigned therefore has to extend from the operand width: reading the stored
 /// value directly would take `0xFFFF_FFFF` for 4294967295 instead of `-1`.
 fn signed_operand(val: i64, ty: IrType) -> i64 {
+    // Only the widths that have a representative in the i64 container are
+    // extended: a `Void` (0) has no signed value to read and a 128-bit operand
+    // is not folded here at all, and shifting either by 64 would panic in a
+    // debug build, so both are returned untouched.
     let bits = ty.size() * 8;
-    if bits >= 64 {
-        val
-    } else {
-        let shift = 64 - bits as u32;
-        (val << shift) >> shift
+    if !(8..=64).contains(&bits) {
+        return val;
     }
+    let shift = 64 - bits as u32;
+    (val << shift) >> shift
 }
 
 /// Evaluate a binary operation on two constant integers.
@@ -1424,6 +1427,11 @@ mod tests {
             fold_binop(IrBinOp::URem, 0xFFFF_FFFF, 2, IrType::U32),
             Some(1)
         );
+        // Widths with no i64 representative (a `Void`, a 128-bit operand) are
+        // returned untouched instead of being shifted by 64, which would panic
+        // under debug assertions.
+        assert_eq!(signed_operand(-1, IrType::Void), -1);
+        assert_eq!(signed_operand(0xFFFF_FFFF, IrType::I128), 0xFFFF_FFFF);
     }
 
     #[test]
