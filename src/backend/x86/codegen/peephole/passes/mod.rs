@@ -5796,6 +5796,30 @@ mod regression_tests {
         assert!(out.contains("popq %r13"), "{out}");
     }
 
+    /// A transient stack bridge must block the same FPO cleanup with CFI
+    /// disabled; otherwise `-fno-asynchronous-unwind-tables` changes the
+    /// prologue even though the CFI directives are the only option difference.
+    #[test]
+    fn fpo_dead_save_kept_across_transient_rsp_writes_without_cfi() {
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    pushq %r13\n",
+            "    subq $8, %rsp\n",
+            "    leaq -8(%rsp), %rsp\n",
+            "    movq %rax, (%rsp)\n",
+            "    leaq 8(%rsp), %rsp\n",
+            "    addq $8, %rsp\n",
+            "    popq %r13\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+            ".size f, .-f\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(out.contains("pushq %r13"), "{out}");
+        assert!(out.contains("popq %r13"), "{out}");
+    }
+
     /// chacha20_core as emitted: per-push CFI, a frame, an epilogue with
     /// its own CFA steps and the post-`ret` re-statement of the frame CFA.
     #[test]

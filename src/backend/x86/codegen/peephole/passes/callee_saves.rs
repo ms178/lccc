@@ -500,9 +500,19 @@ fn fpo_function(store: &mut LineStore, infos: &mut [LineInfo], start: usize, fun
         }
     }
 
-    // Body gates and the CFI directives to rewrite.
+    // Body gates and the CFI directives to rewrite. A transient %rsp write
+    // (for example the SSE1 scalar XMM/GPR bridge) carries
+    // `.cfi_adjust_cfa_offset` when unwind tables are enabled, which this
+    // pass refuses below. Detect the instruction as well so compiling the
+    // same function with `-fno-asynchronous-unwind-tables` makes the same
+    // optimization decision instead of changing machine code with CFI.
+    let epilogue_addqs: Vec<usize> = pops[p - 1]
+        .iter()
+        .filter_map(|&first| prev_insn(store, infos, first, body_start))
+        .collect();
     let mut has_call = false;
     let mut rsp_data = false;
+    let mut dynamic_rsp_write = false;
     let mut cfa_lines: Vec<(usize, i64)> = Vec::new();
     let mut offset_lines: Vec<(usize, usize)> = Vec::new();
     for k in start + 1..func_end {
@@ -541,6 +551,16 @@ fn fpo_function(store: &mut LineStore, infos: &mut [LineInfo], start: usize, fun
             }
             _ => {}
         }
+        let epilogue_pop = pops.iter().any(|indices| indices.contains(&k));
+        let writes_rsp = line.ends_with(", %rsp")
+            || line.ends_with(", %esp")
+            || matches!(infos[k].kind, LineKind::Push { .. } | LineKind::Pop { .. })
+            || matches!(line, "leave" | "leaveq");
+        let canonical_stack_adjust = (k == body_start && line.starts_with("subq $"))
+            || (epilogue_addqs.contains(&k) && line.starts_with("addq $"))
+            || epilogue_pop;
+        dynamic_rsp_write |= writes_rsp && !canonical_stack_adjust;
+
         if line.contains("%rsp") {
             if line.starts_with("and") {
                 return;
@@ -550,6 +570,9 @@ fn fpo_function(store: &mut LineStore, infos: &mut [LineInfo], start: usize, fun
                 || line.starts_with("addq $");
             rsp_data |= !adjust;
         }
+    }
+    if dynamic_rsp_write {
+        return;
     }
 
     // Strategy and epilogue `addq` sites.
