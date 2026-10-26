@@ -289,10 +289,22 @@ impl Driver {
     /// `-march=` still REPLACES the arch-implied set.  Recording happens in
     /// the main argument loop only, so a replay cannot duplicate entries.
     fn replay_x86_explicit_isa_flags(&mut self) {
-        let recorded = self.x86_explicit_isa_args.clone();
-        for arg in &recorded {
-            self.apply_x86_isa_mflag(arg);
+        let recorded = std::mem::take(&mut self.x86_explicit_isa_args);
+        for arg in recorded {
+            self.apply_x86_isa_mflag(&arg);
+            self.x86_explicit_isa_args.push(arg);
         }
+    }
+
+    /// Whether the most recent explicit spelling of an ISA option enabled it.
+    /// Replay builds this history incrementally, so the answer is independent
+    /// of flags that appear later on the command line.
+    fn x86_isa_flag_was_enabled(&self, enabled: &str, disabled: &str) -> bool {
+        self.x86_explicit_isa_args
+            .iter()
+            .rev()
+            .find(|arg| arg.as_str() == enabled || arg.as_str() == disabled)
+            .is_some_and(|arg| arg.as_str() == enabled)
     }
 
     /// The AVX-512 subsets and AVX-VNNI (AVX-512 / AVX10 feature flags;
@@ -442,6 +454,35 @@ impl Driver {
             }
             "-mno-avx512bmm" => {
                 self.enable_avx512bmm = false;
+                // BMM is enabled together with AVX512BW and AVX512F. GCC's
+                // option state drops those implied prerequisites when BMM
+                // was their only active source; retain them when another
+                // explicit subset or architecture grant still requires them.
+                let bw_needed = self.x86_isa_flag_was_enabled("-mavx512bw", "-mno-avx512bw")
+                    || self.enable_avx512vbmi
+                    || self.enable_avx512vbmi2
+                    || self.enable_avx512bitalg
+                    || self.enable_avx512bf16
+                    || self.enable_avx512fp16
+                    || self.enable_avx10_1
+                    || self.enable_avx10_2;
+                if !bw_needed {
+                    self.enable_avx512bw = false;
+                }
+                let f_needed = self.x86_isa_flag_was_enabled("-mavx512f", "-mno-avx512f")
+                    || self.enable_avx512bw
+                    || self.enable_avx512cd
+                    || self.enable_avx512dq
+                    || self.enable_avx512vl
+                    || self.enable_avx512ifma
+                    || self.enable_avx512vnni
+                    || self.enable_avx512vpopcntdq
+                    || self.enable_avx512er
+                    || self.enable_avx512pf
+                    || self.enable_avx512vp2intersect;
+                if !f_needed {
+                    self.enable_avx512f = false;
+                }
                 true
             }
             _ => false,

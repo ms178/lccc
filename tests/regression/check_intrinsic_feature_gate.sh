@@ -642,6 +642,8 @@ if "$gcc_bin" -dumpfullversion 2>/dev/null | grep -x '16.2.0' >/dev/null; then
     }
     compare_avx512_macros -march=x86-64 -mavx512bmm
     compare_avx512_macros -march=x86-64 -mavx512bmm -mno-avx512bmm
+    compare_avx512_macros -march=x86-64 -mavx512f -mavx512bmm -mno-avx512bmm
+    compare_avx512_macros -march=x86-64 -mavx512bw -mavx512bmm -mno-avx512bmm
     compare_avx512_macros -march=x86-64 -mavx512bmm -mno-avx512bw
     compare_avx512_macros -march=x86-64 -mavx512vbmi -mno-avx512bw
     compare_avx512_macros -march=x86-64 -mavx512bf16
