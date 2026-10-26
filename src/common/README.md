@@ -475,7 +475,8 @@ handles all shared cases:
 - 22 primitive C types (Void through ComplexLongDouble)
 - Pointer, Array, FunctionPointer, and BareFunction construction (BareFunction
   produces `CType::Function` directly, not wrapped in a Pointer -- this is
-  used for `typeof` on function names)
+  used for `typeof` on function names). Function types retain an explicit
+  `has_prototype` bit so empty `()` and `(void)` parameter lists remain distinct.
 - TypeofType and AutoType
 
 Only four cases differ between sema and lowering and must be implemented by

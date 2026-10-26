@@ -2888,7 +2888,7 @@ impl Parser {
                 Some(8)
             }
             TypeSpecifier::Pointer(_, _)
-            | TypeSpecifier::FunctionPointer(_, _, _)
+            | TypeSpecifier::FunctionPointer(..)
             | TypeSpecifier::NullPtrT => Some(ptr_sz),
             TypeSpecifier::Int128 | TypeSpecifier::UnsignedInt128 => Some(16),
             TypeSpecifier::LongDouble => Some(if ptr_sz == 4 { 12 } else { 16 }),
@@ -2963,7 +2963,7 @@ impl Parser {
                 }
             }
             TypeSpecifier::Pointer(_, _)
-            | TypeSpecifier::FunctionPointer(_, _, _)
+            | TypeSpecifier::FunctionPointer(..)
             | TypeSpecifier::NullPtrT => ptr_sz,
             TypeSpecifier::Int128 | TypeSpecifier::UnsignedInt128 => 16,
             // On i686, long double is 80-bit x87 but aligned to 4 bytes

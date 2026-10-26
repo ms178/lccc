@@ -33,6 +33,8 @@ pub struct FunctionTypedefInfo {
     pub params: Vec<ParamDecl>,
     /// Whether the function is variadic
     pub variadic: bool,
+    /// Whether the function type has a prototype.
+    pub has_prototype: bool,
 }
 
 /// Build the return `TypeSpecifier` encoded by `prefix` (the derived declarator
@@ -50,13 +52,14 @@ pub fn build_prefix_return_type_spec(
     while i < prefix.len() {
         match &prefix[i] {
             DerivedDeclarator::Pointer(_) => {
-                if let Some(DerivedDeclarator::FunctionPointer(params, variadic)) =
+                if let Some(DerivedDeclarator::FunctionPointer(params, variadic, has_prototype)) =
                     prefix.get(i + 1)
                 {
                     return_type = TypeSpecifier::FunctionPointer(
                         Box::new(return_type),
                         params.clone(),
                         *variadic,
+                        *has_prototype,
                     );
                     i += 2;
                 } else {
@@ -67,11 +70,12 @@ pub fn build_prefix_return_type_spec(
                     i += 1;
                 }
             }
-            DerivedDeclarator::FunctionPointer(params, variadic) => {
+            DerivedDeclarator::FunctionPointer(params, variadic, has_prototype) => {
                 return_type = TypeSpecifier::FunctionPointer(
                     Box::new(return_type),
                     params.clone(),
                     *variadic,
+                    *has_prototype,
                 );
                 i += 1;
             }
@@ -87,7 +91,7 @@ pub fn build_prefix_return_type_spec(
                     }
                 }
             }
-            DerivedDeclarator::Function(_, _) => {
+            DerivedDeclarator::Function(..) => {
                 i += 1;
             }
         }
@@ -108,7 +112,8 @@ pub fn extract_fptr_typedef_info(
     base_type: &TypeSpecifier,
     derived: &[DerivedDeclarator],
 ) -> Option<FunctionTypedefInfo> {
-    let Some(DerivedDeclarator::FunctionPointer(params, variadic)) = derived.last() else {
+    let Some(DerivedDeclarator::FunctionPointer(params, variadic, has_prototype)) = derived.last()
+    else {
         return None;
     };
     // Strip the entity's own `FunctionPointer` and its preceding syntax-marker `Pointer`.
@@ -124,6 +129,7 @@ pub fn extract_fptr_typedef_info(
         return_type,
         params: params.clone(),
         variadic: *variadic,
+        has_prototype: *has_prototype,
     })
 }
 

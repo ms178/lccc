@@ -95,9 +95,12 @@ the complete staged generation and fail without deleting the live generation.
   This is not a full native Clang/lit/SourceManager-equivalence certificate.
 * Repeated `-verify` policy, malformed no-diagnostics/count/prefix declarations,
   optional-error outcome ambiguity, unresolved external inputs/include graphs,
-  unestablished default dialect, unknown flags/capabilities, C++/other languages,
-  runtime/link/codegen/output oracles and FileCheck remain unsupported rather
-  than silently becoming a generic `-fsyntax-only` acceptance test.
+  compiler-family default dialects, unknown flags/capabilities, C++/other
+  languages, runtime/link/codegen/output oracles and FileCheck remain unsupported
+  rather than silently becoming a generic `-fsyntax-only` acceptance test.
+  LCCC's user-facing C default is GNU C23 and is tested against GCC 16 in the
+  first-party regression corpus; this does not make Clang-default RUN lines
+  comparable to GCC-default invocations.
 * `--arch` passes a prerequisite filter; it does **not** retarget unqualified
   commands or prove the compiler's default architecture. Target/default/m32
   translation evidence is separate. Unknown or different contracts are

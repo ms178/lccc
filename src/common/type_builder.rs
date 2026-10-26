@@ -195,7 +195,7 @@ pub trait TypeConvertContext {
                     .and_then(|e| self.eval_array_bound_len(e, &elem_ctype));
                 CType::Array(Box::new(elem_ctype), size)
             }
-            TypeSpecifier::FunctionPointer(return_type, params, variadic) => {
+            TypeSpecifier::FunctionPointer(return_type, params, variadic, has_prototype) => {
                 let ret_ctype = self.resolve_type_spec_to_ctype(return_type);
                 let param_ctypes: Vec<(CType, Option<String>)> = params
                     .iter()
@@ -211,11 +211,12 @@ pub trait TypeConvertContext {
                         return_type: ret_ctype,
                         params: param_ctypes,
                         variadic: *variadic,
+                        has_prototype: *has_prototype,
                     }))),
                     AddressSpace::Default,
                 )
             }
-            TypeSpecifier::BareFunction(return_type, params, variadic) => {
+            TypeSpecifier::BareFunction(return_type, params, variadic, has_prototype) => {
                 // Bare function type (no pointer wrapper) — produced by typeof on
                 // function names. Resolves to CType::Function, NOT Pointer(Function).
                 let ret_ctype = self.resolve_type_spec_to_ctype(return_type);
@@ -232,6 +233,7 @@ pub trait TypeConvertContext {
                     return_type: ret_ctype,
                     params: param_ctypes,
                     variadic: *variadic,
+                    has_prototype: *has_prototype,
                 }))
             }
             TypeSpecifier::TypeofType(inner) => self.resolve_type_spec_to_ctype(inner),
@@ -402,16 +404,16 @@ fn find_function_pointer_core(derived: &[DerivedDeclarator]) -> Option<usize> {
         // Look for Pointer followed by FunctionPointer
         if matches!(&derived[i], DerivedDeclarator::Pointer(_))
             && i + 1 < derived.len()
-            && matches!(&derived[i + 1], DerivedDeclarator::FunctionPointer(_, _))
+            && matches!(&derived[i + 1], DerivedDeclarator::FunctionPointer(..))
         {
             return Some(i);
         }
         // Standalone FunctionPointer
-        if matches!(&derived[i], DerivedDeclarator::FunctionPointer(_, _)) {
+        if matches!(&derived[i], DerivedDeclarator::FunctionPointer(..)) {
             return Some(i);
         }
         // Standalone Function (for function declarations)
-        if matches!(&derived[i], DerivedDeclarator::Function(_, _)) {
+        if matches!(&derived[i], DerivedDeclarator::Function(..)) {
             return Some(i);
         }
     }
@@ -488,6 +490,7 @@ pub fn param_decl_to_ctype_with(
             return_type: actual_return,
             params: param_types,
             variadic: param.fptr_variadic,
+            has_prototype: param.fptr_has_prototype,
         }));
         let mut result = CType::Pointer(Box::new(func_type), AddressSpace::Default);
         // `(**fpp)(int)` is a pointer to a function pointer; CType would
@@ -614,14 +617,18 @@ pub fn build_full_ctype_with_callbacks(
         while i < derived.len() {
             match &derived[i] {
                 DerivedDeclarator::Pointer(_) => {
-                    if let Some(DerivedDeclarator::FunctionPointer(params, variadic)) =
-                        derived.get(i + 1)
+                    if let Some(DerivedDeclarator::FunctionPointer(
+                        params,
+                        variadic,
+                        has_prototype,
+                    )) = derived.get(i + 1)
                     {
                         let param_types = convert_param_decls_to_ctypes_with(resolve, params);
                         let func_type = CType::Function(Box::new(FunctionType {
                             return_type: result,
                             params: param_types,
                             variadic: *variadic,
+                            has_prototype: *has_prototype,
                         }));
                         result = CType::Pointer(Box::new(func_type), AddressSpace::Default);
                         i += 2;
@@ -630,22 +637,24 @@ pub fn build_full_ctype_with_callbacks(
                         i += 1;
                     }
                 }
-                DerivedDeclarator::FunctionPointer(params, variadic) => {
+                DerivedDeclarator::FunctionPointer(params, variadic, has_prototype) => {
                     let param_types = convert_param_decls_to_ctypes_with(resolve, params);
                     let func_type = CType::Function(Box::new(FunctionType {
                         return_type: result,
                         params: param_types,
                         variadic: *variadic,
+                        has_prototype: *has_prototype,
                     }));
                     result = CType::Pointer(Box::new(func_type), AddressSpace::Default);
                     i += 1;
                 }
-                DerivedDeclarator::Function(params, variadic) => {
+                DerivedDeclarator::Function(params, variadic, has_prototype) => {
                     let param_types = convert_param_decls_to_ctypes_with(resolve, params);
                     let func_type = CType::Function(Box::new(FunctionType {
                         return_type: result,
                         params: param_types,
                         variadic: *variadic,
+                        has_prototype: *has_prototype,
                     }));
                     result = func_type;
                     i += 1;
@@ -775,7 +784,7 @@ pub fn declarator_supplies_pointer(derived: &[DerivedDeclarator]) -> bool {
     derived.iter().any(|d| {
         matches!(
             d,
-            DerivedDeclarator::Pointer(_) | DerivedDeclarator::FunctionPointer(_, _)
+            DerivedDeclarator::Pointer(_) | DerivedDeclarator::FunctionPointer(..)
         )
     })
 }
@@ -824,14 +833,14 @@ fn declarator_pointer_levels(derived: &[DerivedDeclarator]) -> usize {
                 count += 1;
                 if matches!(
                     derived.get(i + 1),
-                    Some(DerivedDeclarator::FunctionPointer(_, _))
+                    Some(DerivedDeclarator::FunctionPointer(..))
                 ) {
                     i += 2;
                 } else {
                     i += 1;
                 }
             }
-            DerivedDeclarator::FunctionPointer(_, _) => {
+            DerivedDeclarator::FunctionPointer(..) => {
                 count += 1;
                 i += 1;
             }
@@ -999,6 +1008,7 @@ mod address_space_tests {
             return_type: CType::Pointer(Box::new(CType::Int), AddressSpace::Default),
             params: Vec::new(),
             variadic: false,
+            has_prototype: true,
         }));
         assert!(apply_declaration_address_space(
             &mut ty,
@@ -1073,13 +1083,14 @@ mod address_space_tests {
             return_type: ptr.clone(),
             params: Vec::new(),
             variadic: false,
+            has_prototype: true,
         }));
         assert!(apply_declaration_address_space_for_object(
             &mut ty,
             AddressSpace::SegGs,
             &[
                 DerivedDeclarator::Pointer(AddressSpace::Default),
-                DerivedDeclarator::Function(Vec::new(), false)
+                DerivedDeclarator::Function(Vec::new(), false, true)
             ]
         ));
 
@@ -1132,11 +1143,11 @@ mod address_space_tests {
         // Function pointers count as declarator-supplied pointers.
         assert!(declarator_supplies_pointer(&[
             DerivedDeclarator::Pointer(AddressSpace::Default),
-            DerivedDeclarator::FunctionPointer(Vec::new(), false)
+            DerivedDeclarator::FunctionPointer(Vec::new(), false, true)
         ]));
         assert!(!declarator_supplies_pointer(&[
             DerivedDeclarator::Array(None),
-            DerivedDeclarator::Function(Vec::new(), false)
+            DerivedDeclarator::Function(Vec::new(), false, true)
         ]));
     }
 }
@@ -1279,6 +1290,7 @@ mod seg_placement_tests {
             return_type: ret,
             params: Vec::new(),
             variadic: false,
+            has_prototype: true,
         }))
     }
     /// Space of the pointer that directly points at the base struct, found by
@@ -1440,7 +1452,7 @@ mod seg_placement_tests {
         // typedef long L;  L __seg_gs (*fp)(void);  -> fp is generic
         assert!(!named_space_qualifies_whole_type(
             &td,
-            &[DerivedDeclarator::FunctionPointer(Vec::new(), false)]
+            &[DerivedDeclarator::FunctionPointer(Vec::new(), false, true)]
         ));
         // A plain base type never qualifies the whole object by itself.
         assert!(!named_space_qualifies_whole_type(&TypeSpecifier::Int, &[]));

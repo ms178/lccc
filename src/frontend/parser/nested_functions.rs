@@ -191,8 +191,7 @@ impl Parser {
         if !matches!(
             derived.last(),
             Some(crate::frontend::parser::ast::DerivedDeclarator::Function(
-                _,
-                _
+                ..
             ))
         ) {
             return None;
@@ -208,10 +207,12 @@ impl Parser {
             return None;
         }
 
-        let (params, variadic) = match derived.last() {
-            Some(crate::frontend::parser::ast::DerivedDeclarator::Function(p, v)) => {
-                (p.clone(), *v)
-            }
+        let (params, variadic, has_prototype) = match derived.last() {
+            Some(crate::frontend::parser::ast::DerivedDeclarator::Function(
+                p,
+                v,
+                has_prototype,
+            )) => (p.clone(), *v, *has_prototype),
             _ => unreachable!(),
         };
 
@@ -313,6 +314,7 @@ impl Parser {
             name,
             params: final_params,
             variadic,
+            has_prototype: has_prototype && !is_kr_style,
             body,
             attrs,
             is_kr: is_kr_style,

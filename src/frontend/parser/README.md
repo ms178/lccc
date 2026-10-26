@@ -596,7 +596,10 @@ TranslationUnit
 ### `FunctionDef`
 
 Represents a function definition: return type, name, parameter list, variadic
-flag, compound statement body, function attributes, K&R flag, and source span.
+flag, whether its declarator has a prototype, compound statement body, function
+attributes, K&R flag, and source span. The explicit prototype bit is necessary
+because `f()` is unprototyped before C23 but has zero parameters in C23; `f(void)`
+is a zero-parameter prototype in every C dialect.
 
 ### `Declaration`
 
@@ -618,7 +621,8 @@ A large enum covering all C type forms:
 - **Aggregate types:** `Struct(name, fields, packed, pragma_pack, aligned)`,
   `Union(...)`, `Enum(name, variants, packed)`
 - **Derived types:** `Pointer(inner, address_space)`, `Array(inner, size)`,
-  `FunctionPointer(ret, params, variadic)`, `BareFunction(ret, params, variadic)`
+  `FunctionPointer(ret, params, variadic, has_prototype)`,
+  `BareFunction(ret, params, variadic, has_prototype)`
 - **Name-based:** `TypedefName(String)`
 - **Deferred:** `Typeof(Expr)`, `TypeofType(TypeSpecifier)`, `AutoType`
 - **Vector:** `Vector(inner, total_bytes)` — wraps a base element type with
@@ -679,15 +683,19 @@ Describes type modifications applied by a declarator:
 enum DerivedDeclarator {
     Pointer,                                // *
     Array(Option<Box<Expr>>),               // [expr] or []
-    Function(Vec<ParamDecl>, bool),         // (params) with variadic flag
-    FunctionPointer(Vec<ParamDecl>, bool),  // (*)(params) -- pointer to function
+    Function(Vec<ParamDecl>, bool, bool),         // params, variadic, has_prototype
+    FunctionPointer(Vec<ParamDecl>, bool, bool),  // (*)(params), variadic, has_prototype
 }
 ```
 
 The distinction between `Function` and `FunctionPointer` is essential:
 `Function` appears in function definitions and prototypes, while
 `FunctionPointer` appears in declarators like `void (*fp)(int)` where the
-`(*...)` syntax introduces a pointer-to-function.
+`(*...)` syntax introduces a pointer-to-function. The third boolean on both
+variants is independent of the parameter vector: it is true for `(void)` and
+for typed/variadic parameter lists, true for `()` in C23, and false for `()` in
+pre-C23 dialects or for a K&R identifier list. This preserves the callable
+contract through function pointers and typedefs.
 
 ### Initializers
 

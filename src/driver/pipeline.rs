@@ -515,9 +515,10 @@ pub struct Driver {
     /// semantics, turning `extern __always_inline` into an external definition
     /// and causing "multiple definition" errors at partial-link time.
     pub(super) gnu89_inline_explicit: Option<bool>,
-    /// `__STDC_VERSION__` override selected by `-std=`.
-    /// `None` = keep the built-in default; `Some(None)` = the dialect defines
-    /// no `__STDC_VERSION__` (C89/C90); `Some(Some(v))` = define it as `v`.
+    /// `__STDC_VERSION__` selected by the active C dialect.
+    /// The default is GNU C23 (`202311L`); an explicit `-std=` replaces it.
+    /// `Some(None)` means the dialect predates the macro (C89/C90), while
+    /// `Some(Some(v))` defines it as `v`.
     pub(super) stdc_version: Option<Option<&'static str>>,
     /// `-fno-tree-vectorize` disables automatic vectorizer passes while
     /// retaining explicit vector types and intrinsics.
@@ -757,7 +758,7 @@ impl Driver {
             data_sections: false,
             gnu89_inline: false,
             gnu89_inline_explicit: None,
-            stdc_version: None,
+            stdc_version: Some(Some("202311L")), // GCC 16.2 default: -std=gnu23
             disable_tree_vectorize: false,
             ipa_pta: false,
             live_range_shrinkage: false,
@@ -4255,10 +4256,10 @@ impl Driver {
         matches!(self.stdc_version, Some(None) | Some(Some("199409L")))
     }
 
-    /// Whether `-std=` selected C23 or later (c23/gnu23/c2x/gnu2x/c2y/gnu2y).
-    /// The default dialect is gnu17 (`__STDC_VERSION__` 201710L), so this is
-    /// false unless requested. Lexer keywords, `#if true`, `auto` type
-    /// inference and the other C23-only meanings key off this one fact.
+    /// Whether the active dialect is C23 or later (c23/gnu23/c2x/gnu2x/c2y/gnu2y).
+    /// GCC 16.2's default is GNU C23 (`__STDC_VERSION__` 202311L); an explicit
+    /// older `-std=` selects its own mode. Lexer keywords, `#if true`, `auto`
+    /// type inference and the other C23-only meanings key off this one fact.
     pub(crate) fn c23_dialect(&self) -> bool {
         matches!(self.stdc_version, Some(Some(v))
             if v.trim_end_matches('L').parse::<u32>().is_ok_and(|n| n >= 202311))

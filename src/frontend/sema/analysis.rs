@@ -91,6 +91,7 @@ impl FunctionInfo {
             return_type: self.return_type.clone(),
             params: Vec::new(),
             variadic: self.variadic,
+            has_prototype: false,
         })
     }
 }
@@ -365,22 +366,23 @@ impl SemanticAnalyzer {
             .map(|p| (self.param_decl_ctype(p), p.name.clone()))
             .collect();
 
-        let prototype = if func.is_kr {
-            self.symbol_table
-                .lookup_current(&func.name)
-                .and_then(|symbol| {
-                    if let CType::Function(ft) = &symbol.ty {
-                        (!ft.params.is_empty()).then(|| ft.as_ref().clone())
-                    } else {
-                        None
-                    }
-                })
-        } else {
+        let prototype = if func.has_prototype {
             Some(FunctionType {
                 return_type: return_type.clone(),
                 params: params.clone(),
                 variadic: func.variadic,
+                has_prototype: true,
             })
+        } else {
+            self.symbol_table
+                .lookup_current(&func.name)
+                .and_then(|symbol| {
+                    if let CType::Function(ft) = &symbol.ty {
+                        ft.has_prototype.then(|| ft.as_ref().clone())
+                    } else {
+                        None
+                    }
+                })
         };
         let mut func_info = FunctionInfo {
             return_type: return_type.clone(),
@@ -471,17 +473,18 @@ impl SemanticAnalyzer {
             .functions
             .get(&func.name)
             .is_some_and(|fi| fi.is_noreturn);
-        let prototype = if func.is_kr {
-            self.result
-                .functions
-                .get(&func.name)
-                .and_then(|info| info.prototype.clone())
-        } else {
+        let prototype = if func.has_prototype {
             Some(FunctionType {
                 return_type: return_type.clone(),
                 params: params.clone(),
                 variadic: func.variadic,
+                has_prototype: true,
             })
+        } else {
+            self.result
+                .functions
+                .get(&func.name)
+                .and_then(|info| info.prototype.clone())
         };
         let func_info = FunctionInfo {
             return_type: return_type.clone(),
@@ -681,8 +684,8 @@ impl SemanticAnalyzer {
     /// The parameter lists inside a declarator's function derivations.
     fn check_void_derived_params(&self, derived: &[DerivedDeclarator], span: Span) {
         for d in derived {
-            if let DerivedDeclarator::Function(params, variadic)
-            | DerivedDeclarator::FunctionPointer(params, variadic) = d
+            if let DerivedDeclarator::Function(params, variadic, _)
+            | DerivedDeclarator::FunctionPointer(params, variadic, _) = d
             {
                 self.check_void_params(params, *variadic, span);
             }
@@ -846,7 +849,7 @@ impl SemanticAnalyzer {
                     // Function typedef like `typedef int func_t(int x);` or
                     // `typedef int (*fn_t(int))(char);`. The typedef's own
                     // parameter list is the LAST derived.
-                    if let Some(DerivedDeclarator::Function(params, variadic)) =
+                    if let Some(DerivedDeclarator::Function(params, variadic, has_prototype)) =
                         declarator.derived.last()
                     {
                         let return_type = super::type_context::build_prefix_return_type_spec(
@@ -860,6 +863,7 @@ impl SemanticAnalyzer {
                                 return_type,
                                 params: params.clone(),
                                 variadic: *variadic,
+                                has_prototype: *has_prototype,
                             },
                         );
                     }
@@ -1054,7 +1058,7 @@ impl SemanticAnalyzer {
             // Check if this is a function declaration (prototype)
             if let CType::Function(ref ft) = full_type {
                 let is_noreturn = init_decl.attrs.is_noreturn();
-                let prototype = (!ft.params.is_empty()).then(|| ft.as_ref().clone());
+                let prototype = ft.has_prototype.then(|| ft.as_ref().clone());
                 // A declaration inside a function body describes that body's view of
                 // the name, not the translation unit's. This matters because a GNU
                 // nested function is a *distinct entity* that merely shares a
@@ -3364,10 +3368,10 @@ impl SemanticAnalyzer {
             },
             _ => None,
         };
-        // Empty lists retain the existing unspecified-arguments
-        // convention; distinguishing f(void) from f() is independent
-        // of preserving a nonempty prototype vs a K&R body list.
-        if let Some(ft) = signature.filter(|ft| !ft.params.is_empty()) {
+        // An empty prototype (`f(void)` in every dialect, or `f()` in C23)
+        // still constrains calls to zero arguments. An unprototyped function
+        // retains the legacy default-argument-promotion behavior.
+        if let Some(ft) = signature.filter(|ft| ft.has_prototype) {
             let name = match callee {
                 Expr::Identifier(name, _) => name.as_str(),
                 _ => "function pointer",
@@ -6641,13 +6645,10 @@ fn same_scalar_modulo_sign(a: &CType, b: &CType) -> bool {
 /// `int dbl(int x)` against a parameter declared `int (*)(int)` has one named
 /// parameter and one unnamed, and every callback in C is written that way.
 fn function_types_compatible(a: &FunctionType, b: &FunctionType) -> bool {
-    a.variadic == b.variadic
-        && a.return_type == b.return_type
-        && a.params.len() == b.params.len()
-        && a.params
-            .iter()
-            .zip(&b.params)
-            .all(|((a_ty, _), (b_ty, _))| a_ty == b_ty)
+    crate::common::types::ctypes_compatible(
+        &CType::Function(Box::new(a.clone())),
+        &CType::Function(Box::new(b.clone())),
+    )
 }
 
 /// Compatibility of two pointed-to types (C23 6.7.6.1p2). Recurses through
@@ -7097,6 +7098,7 @@ mod pointer_argument_compat_tests {
                 .map(|(i, t)| (t, if named { Some(format!("p{i}")) } else { None }))
                 .collect(),
             variadic: false,
+            has_prototype: true,
         }))
     }
     fn record(key: &str) -> CType {

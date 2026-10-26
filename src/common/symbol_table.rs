@@ -375,6 +375,7 @@ mod binding_depth_tests {
                 return_type: CType::Int,
                 params: Vec::new(),
                 variadic: false,
+                has_prototype: true,
             })),
             explicit_alignment: None,
             type_align: None,
