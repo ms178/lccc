@@ -2767,11 +2767,37 @@ impl Lowerer {
             F::Sse42 => Some(5),
             _ => None,
         };
-        if let (Some(needed), Some(function)) = (needed, self.func_state.as_ref()) {
+        if let Some(function) = self.func_state.as_ref() {
             for request in &function.target_features {
                 let (enabled, feature) = request
                     .strip_prefix("no-")
                     .map_or((true, request.as_str()), |f| (false, f));
+                // Exact target-feature grants also cover FMA and AVX-512
+                // subsets, which are independent features rather than rungs
+                // in the legacy SSE/AVX level ladder. An enabled AVX-512
+                // subset implies its F base; disabling one subset does not
+                // revoke the independent F capability.
+                if feature == requirement.feature.name() {
+                    permitted = enabled;
+                    continue;
+                }
+                if enabled
+                    && requirement.feature == F::Avx512F
+                    && matches!(
+                        feature,
+                        "avx512bw" | "avx512dq" | "avx512vl" | "avx512cd"
+                            | "avx512ifma" | "avx512vbmi" | "avx512vbmi2"
+                            | "avx512vnni" | "avx512bitalg" | "avx512vpopcntdq"
+                            | "avx512bf16" | "avx512fp16" | "avx512er" | "avx512pf"
+                            | "avx512vp2intersect"
+                    )
+                {
+                    permitted = true;
+                    continue;
+                }
+                let Some(needed) = needed else {
+                    continue;
+                };
                 let level = match feature {
                     "sse" => 0,
                     "sse2" => 1,

@@ -3674,6 +3674,20 @@ impl Driver {
         // *legacy* encoding makes `-mno-avx` useless as a defence.
         set.insert_if(simd && self.enable_gfni, F::Gfni);
 
+        // AVX-512 helpers are instruction-level capabilities, not a blanket
+        // consequence of the 512-bit result carrier. Publish only explicitly
+        // granted subsets, and require the F base for every subset bit. `-mavx512bw`
+        // etc. imply F in argument processing, but retaining the conjunction
+        // here keeps a later `-mno-avx512f` denial fail closed.
+        let avx512_base = simd && self.enable_avx512f;
+        set.insert_if(avx512_base, F::Avx512F);
+        set.insert_if(avx512_base && self.enable_avx512bw, F::Avx512Bw);
+        set.insert_if(avx512_base && self.enable_avx512dq, F::Avx512Dq);
+        set.insert_if(avx512_base && self.enable_avx512vl, F::Avx512Vl);
+        set.insert_if(avx512_base && self.enable_avx512vnni, F::Avx512Vnni);
+        set.insert_if(avx512_base && self.enable_avx512bitalg, F::Avx512BitAlg);
+        set.insert_if(avx512_base && self.enable_avx512vpopcntdq, F::Avx512Vpopcntdq);
+
         // Integer ISA: the resolved predicates already encode the default
         // grant, the `-march` ceiling and the sticky denials — the same
         // predicates `__BMI__`/`__BMI2__`/`__LZCNT__`/`__MOVBE__` use.

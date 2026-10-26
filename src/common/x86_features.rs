@@ -66,8 +66,8 @@
 //!
 //! * Features with no codegen permission bit fold to `0` even for a Raptor
 //!   Lake profile: `sha`, `adx`, `rdseed`, `fsgsbase`, `xsave*`, `gfni`,
-//!   `avxvnni`, `avx512*`, `amx*`, `xop`, `sse4a`, `tbm`, ... A `1` for an
-//!   instruction the backend cannot promise is the bug being fixed here;
+//!   `avxvnni`, unmodeled AVX-512 subsets, `amx*`, `xop`, `sse4a`, `tbm`, ...
+//!   A `1` for an instruction the backend cannot promise is the bug being fixed here;
 //!   `-msha` is rejected outright for the same reason.
 //! * `vaes`/`vpclmulqdq` are tracked, but as the *256-bit* permission they
 //!   actually are: each requires the 256-bit vector class in addition to its
@@ -143,11 +143,25 @@ pub enum X86Feature {
     /// `-mno-avx` does not remove it, and a separate CPUID bit and flag
     /// (`-mgfni`) from the VNNI families.
     Gfni,
+    /// AVX-512 Foundation (EVEX/ZMM base instruction set).
+    Avx512F,
+    /// AVX-512 Byte and Word instructions.
+    Avx512Bw,
+    /// AVX-512 Doubleword and Quadword instructions.
+    Avx512Dq,
+    /// AVX-512 Vector Length (EVEX.128/256 forms).
+    Avx512Vl,
+    /// AVX-512 Vector Neural Network Instructions.
+    Avx512Vnni,
+    /// AVX-512 Bit Algorithms (byte/word population count and bit tests).
+    Avx512BitAlg,
+    /// AVX-512 Vector Population Count (dword/qword forms).
+    Avx512Vpopcntdq,
 }
 
 impl X86Feature {
     /// Every tracked feature, for table-driven tests.
-    pub const ALL: [X86Feature; 28] = [
+    pub const ALL: [X86Feature; 35] = [
         X86Feature::Cmov,
         X86Feature::Fxsr,
         X86Feature::Mmx,
@@ -176,6 +190,13 @@ impl X86Feature {
         X86Feature::AvxVnniInt8,
         X86Feature::AvxVnniInt16,
         X86Feature::Gfni,
+        X86Feature::Avx512F,
+        X86Feature::Avx512Bw,
+        X86Feature::Avx512Dq,
+        X86Feature::Avx512Vl,
+        X86Feature::Avx512Vnni,
+        X86Feature::Avx512BitAlg,
+        X86Feature::Avx512Vpopcntdq,
     ];
 
     /// Canonical GCC spelling of the feature (the one `-m` flags use).
@@ -209,6 +230,13 @@ impl X86Feature {
             X86Feature::AvxVnniInt8 => "avxvnniint8",
             X86Feature::AvxVnniInt16 => "avxvnniint16",
             X86Feature::Gfni => "gfni",
+            X86Feature::Avx512F => "avx512f",
+            X86Feature::Avx512Bw => "avx512bw",
+            X86Feature::Avx512Dq => "avx512dq",
+            X86Feature::Avx512Vl => "avx512vl",
+            X86Feature::Avx512Vnni => "avx512vnni",
+            X86Feature::Avx512BitAlg => "avx512bitalg",
+            X86Feature::Avx512Vpopcntdq => "avx512vpopcntdq",
         }
     }
 
@@ -249,6 +277,13 @@ impl X86Feature {
             "avxvnniint8" => X86Feature::AvxVnniInt8,
             "avxvnniint16" => X86Feature::AvxVnniInt16,
             "gfni" => X86Feature::Gfni,
+            "avx512f" => X86Feature::Avx512F,
+            "avx512bw" => X86Feature::Avx512Bw,
+            "avx512dq" => X86Feature::Avx512Dq,
+            "avx512vl" => X86Feature::Avx512Vl,
+            "avx512vnni" => X86Feature::Avx512Vnni,
+            "avx512bitalg" => X86Feature::Avx512BitAlg,
+            "avx512vpopcntdq" => X86Feature::Avx512Vpopcntdq,
             _ => return None,
         })
     }
@@ -259,7 +294,7 @@ impl X86Feature {
     }
 }
 
-/// A set of [`X86Feature`]s (bitmask; 28 tracked features fit in a `u64`).
+/// A set of [`X86Feature`]s (bitmask; all tracked features fit in a `u64`).
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct EffectiveFeatures(u64);
 
@@ -368,10 +403,9 @@ mod tests {
             "fsgsbase",
             "xsave",
             "xsaveopt",
-            "avx512vnni",
             "avx512gfni",
-            "avx512f",
-            "avx512bw",
+            "avx512ifma",
+            "avx512vbmi",
             "amx_tile",
             "xop",
             "sse4a",
@@ -380,6 +414,40 @@ mod tests {
             "",
         ] {
             assert_eq!(X86Feature::parse(name), None, "{name} must not be tracked");
+        }
+    }
+
+    /// AVX-512 features are separate bits, so granting one subset cannot
+    /// satisfy the gate for a different subset or vector-length encoding.
+    #[test]
+    fn avx512_subset_features_are_distinct() {
+        for (feature, name) in [
+            (X86Feature::Avx512F, "avx512f"),
+            (X86Feature::Avx512Bw, "avx512bw"),
+            (X86Feature::Avx512Dq, "avx512dq"),
+            (X86Feature::Avx512Vl, "avx512vl"),
+            (X86Feature::Avx512Vnni, "avx512vnni"),
+            (X86Feature::Avx512BitAlg, "avx512bitalg"),
+            (X86Feature::Avx512Vpopcntdq, "avx512vpopcntdq"),
+        ] {
+            assert_eq!(X86Feature::parse(name), Some(feature));
+            assert_eq!(feature.name(), name);
+            assert!(X86Feature::ALL.contains(&feature));
+            let set = EffectiveFeatures::EMPTY.with(feature);
+            assert!(set.contains(feature));
+            for other in [
+                X86Feature::Avx512F,
+                X86Feature::Avx512Bw,
+                X86Feature::Avx512Dq,
+                X86Feature::Avx512Vl,
+                X86Feature::Avx512Vnni,
+                X86Feature::Avx512BitAlg,
+                X86Feature::Avx512Vpopcntdq,
+            ] {
+                if other != feature {
+                    assert!(!set.contains(other), "{name} answered for {:?}", other);
+                }
+            }
         }
     }
 
