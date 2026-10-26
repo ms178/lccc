@@ -346,13 +346,14 @@ mod tests {
         for denied in ["no-sse3", "no-ssse3", "no-sse4.1", "no-sse4.2", "no-avx"] {
             let features = vec!["fma".to_string(), denied.to_string()];
             let isa = X86Isa::SSE2.with_target_features(&features);
-            assert!(!isa.avx && !isa.fma, "{denied} left VEX FMA enabled: {isa:?}");
+            assert!(
+                !isa.avx && !isa.fma,
+                "{denied} left VEX FMA enabled: {isa:?}"
+            );
         }
-        let restored = X86Isa::SSE2.with_target_features(&[
-            "no-avx".to_string(),
-            "fma".to_string(),
-        ]);
-        assert!(restored.avx && restored.fma);
+        let denied_after_grant =
+            X86Isa::SSE2.with_target_features(&["no-avx".to_string(), "fma".to_string()]);
+        assert!(!denied_after_grant.avx && !denied_after_grant.fma);
     }
 
     #[test]
