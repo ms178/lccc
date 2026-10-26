@@ -345,15 +345,11 @@ pub fn lower_binop(
     let size = OpSize::from_ir_type(ty);
     let dst = value_to_reg(dest, ra);
 
-    // Add is an address-generation operation regardless of whether the C
-    // source spells it as pointer arithmetic or integer arithmetic. Use LEA
+    // 64-bit Add is an address-generation operation regardless of whether the
+    // C source spells it as pointer arithmetic or integer arithmetic. Use LEA
     // whenever it replaces a `mov + add` pair (three distinct registers) or a
     // flags-clobbering add the consumer cannot afford: one uop, no flags
-    // dependency. `lea_size` picks the mnemonic width: S64 stays `leaq`, and
-    // every narrower result uses `leal` — the 32-bit lea computes the same
-    // low bits the narrow add would (a sum modulo 2^32 depends only on the
-    // operands' low 32 bits) and zero-extends, exactly like the `mov + add`
-    // pair it replaces. When the allocator COALESCED the dest with the base,
+    // dependency. When the allocator COALESCED the dest with the base,
     // though, the two-address `add src, dst` is strictly better than a
     // 2-register LEA: same 1-uop/1-cycle shape, but ADD executes on 4 ports
     // (p0156) vs LEA's 2 (p15) on every Intel P-core and the same 4-vs-2 on
@@ -363,7 +359,7 @@ pub fn lower_binop(
     // rule; the ADD form restores them). Prefer ADD whenever dst is already
     // the base register; the operand may even fold a spilled RHS as a memory
     // source, which LEA cannot.
-    if op == IrBinOp::Add && matches!(size, OpSize::S8 | OpSize::S16 | OpSize::S32 | OpSize::S64) {
+    if op == IrBinOp::Add && size == OpSize::S64 {
         match (lhs, rhs) {
             (Operand::Value(base), Operand::Value(index)) => {
                 let base_reg = value_to_reg(base, ra);
@@ -382,7 +378,7 @@ pub fn lower_binop(
                     index: Some((value_to_reg(index, ra), 1)),
                     offset: 0,
                     dst,
-                    size: lea_size(size),
+                    size: OpSize::S64,
                 });
                 return true;
             }
@@ -405,7 +401,7 @@ pub fn lower_binop(
                         index: None,
                         offset,
                         dst,
-                        size: lea_size(size),
+                        size: OpSize::S64,
                     });
                     return true;
                 }
@@ -427,7 +423,7 @@ pub fn lower_binop(
                         index: None,
                         offset,
                         dst,
-                        size: lea_size(size),
+                        size: OpSize::S64,
                     });
                     return true;
                 }

@@ -15,8 +15,12 @@
 # the fold is correct and the control probes pin zero memory references.
 #
 # The check counts, per function at -O2, the memory-operand references (loads
-# and stores). lccc must match GCC 16.2 on every probe, and each probe's GCC
-# count is pinned, so a fixture drift is reported as drift, not as a lccc bug.
+# and stores). `lea` is NOT one: it forms an address in a register and never
+# reads or writes memory, so `leal 1(%rdi), %eax` must not count (GCC's own
+# bodies contain no lea-form memory line on these probes, so the pins are
+# unaffected by the exclusion). lccc must match GCC 16.2 on every probe, and
+# each probe's GCC count is pinned, so a fixture drift is reported as drift,
+# not as a lccc bug.
 #
 # One documented exception: `f_field_twice` reads the `const volatile` member
 # `f` of a `const struct` global. GCC 16.2 folds that read to 2 (no memory
@@ -66,7 +70,7 @@ C
 count_mem_refs() {
     awk -v want="$2" '
         /^[A-Za-z_][A-Za-z0-9_]*:/ { fn = $0; sub(/:.*/, "", fn) }
-        /^[ \t]+[a-z][a-z0-9]*[ \t]/ && !/^[ \t]+\./ && fn == want && /\(%/ { n++ }
+        /^[ \t]+[a-z][a-z0-9]*[ \t]/ && !/^[ \t]+\./ && !/^[ \t]+lea[bwlq]?[ \t]/ && fn == want && /\(%/ { n++ }
         END { print n + 0 }' "$1"
 }
 # References to one global symbol inside one function (for -O0).

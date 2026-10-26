@@ -126,6 +126,12 @@ pub struct I686Codegen {
     pub(super) is_variadic: bool,
     /// Register allocation results (callee-saved registers: ebx, esi, edi)
     pub(super) reg_assignments: FxHashMap<u32, PhysReg>,
+    /// Per-value materialisation widths from
+    /// [`crate::backend::common::compute_value_type_map`] (populated once per
+    /// function in the prologue). The indexed SIB emitters consult it to
+    /// extend a narrow post-peel index root to its defined 32-bit form
+    /// (`extend_sib_index_form`).
+    pub(super) value_types: FxHashMap<u32, IrType>,
     /// Which callee-saved registers are used and need save/restore
     pub(super) used_callee_saved: Vec<PhysReg>,
     /// Total stack bytes consumed by named parameters (for va_start computation).
@@ -592,6 +598,7 @@ impl I686Codegen {
             vector_ret_buffer_offset: 0,
             is_variadic: false,
             reg_assignments: FxHashMap::default(),
+            value_types: FxHashMap::default(),
             narrow_images: FxHashMap::default(),
             divrem_tail_dests: FxHashSet::default(),
             divrem_head_partners: FxHashMap::default(),
@@ -3260,8 +3267,30 @@ impl ArchCodegen for I686Codegen {
     /// after rematerialisation (20080122-1, i64 local-array loops).
     fn indexed_fold_ok(&self, info: &crate::backend::generation::IndexedGepInfo) -> bool {
         let scalar = info.shift <= 3 && info.access_tys.iter().all(|t| Self::sib_scalar_ty(*t));
-        if !scalar || !info.feeds_store {
-            return scalar;
+        if !scalar {
+            return false;
+        }
+        // Index-root extension contract (the deciding half of
+        // `extend_sib_index_form`): `I16`/`U16` roots get their missing
+        // movswl/movzwl at the access; wide roots and the conservative `I64`
+        // default need no work. `I8`/`U8` are refused here so the emitter
+        // never refuses after this point: plain i386 has no byte
+        // sub-register for esi/edi/ebp, and byte-rooted SIBs are rare enough
+        // that the rematerialised GEP costs nothing.
+        if !matches!(
+            info.index_ty,
+            IrType::I16
+                | IrType::U16
+                | IrType::I32
+                | IrType::U32
+                | IrType::I64
+                | IrType::U64
+                | IrType::Ptr
+        ) {
+            return false;
+        }
+        if !info.feeds_store {
+            return true;
         }
         let idx_ok = self
             .reg_assignments

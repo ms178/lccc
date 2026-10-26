@@ -66,6 +66,7 @@ fn rewrite_with_policy(
             uses: &uses,
             visits: std::cell::Cell::new(512),
             disable_logic,
+            wrap_signed_overflow: true,
         },
         Value(80),
     )

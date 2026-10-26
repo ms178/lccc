@@ -24,6 +24,7 @@ fn context(code: &[Instruction], test: impl FnOnce(&Context<'_>)) {
         uses: &uses,
         visits: std::cell::Cell::new(512),
         disable_logic: false,
+        wrap_signed_overflow: true,
     });
 }
 fn eval(code: &[Instruction], x: u64, ty: IrType) -> u64 {

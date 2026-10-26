@@ -730,6 +730,11 @@ impl I686Codegen {
     // ---- emit_prologue ----
 
     pub(super) fn emit_prologue_impl(&mut self, func: &IrFunction, frame_size: i64) {
+        // Single source of truth for materialisation widths (and for the
+        // narrow-index extension in the SIB emitters) -- the same
+        // `compute_value_type_map` the x86-64 backend seeds in its prologue.
+        // Seeded here, before any instruction of the function is emitted.
+        self.value_types = crate::backend::common::compute_value_type_map(func);
         // Private codegen metadata consumed (and removed) by the i686 assembly
         // peephole.  Without the return type it must conservatively keep EDX
         // live at every ret for the i64 ABI, which preserves hundreds of dead

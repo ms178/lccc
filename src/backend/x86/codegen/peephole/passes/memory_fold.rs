@@ -4953,12 +4953,20 @@ fn parse_const_increment<'a>(
         parse_plain_imm(imm)?;
         return Some((reg, imm, op));
     }
-    let lea_want = match width {
-        RmwWidth::L => "leal",
-        RmwWidth::Q => "leaq",
-        _ => return None,
+    // A 32-bit-destination load accepts BOTH address-width spellings: the
+    // truncating-ring pass lowers a narrow unsigned add through the address
+    // width (`movzwl (%rdi,%rsi,2), %r9d; leaq 4464(%r9), %rax; movw`),
+    // and `leaq K(%r9)`'s low 32 bits equal `leal K(%r9)`'s for every `K`
+    // (mod 2^32 both compute `(r9 + K)`), so refusing the 64-bit mnemonic
+    // there would drop the fused form exactly on the byte/word RMW shapes
+    // this fold exists for. A 64-bit load stays `leaq`-only: `leal` would
+    // truncate the value the fused `addq` must produce.
+    let lea_ok = match width {
+        RmwWidth::L => mnemonic == "leal" || mnemonic == "leaq",
+        RmwWidth::Q => mnemonic == "leaq",
+        _ => false,
     };
-    if mnemonic == lea_want {
+    if lea_ok {
         let (src, dst) = split_two_operands(rest)?;
         let open = src.find('(')?;
         let imm = &src[..open];

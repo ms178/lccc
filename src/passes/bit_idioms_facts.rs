@@ -19,6 +19,11 @@ struct Context<'a> {
     uses: &'a [u32],
     visits: std::cell::Cell<usize>,
     disable_logic: bool,
+    /// `-fwrapv`: signed overflow wraps. A ring rewrite that moves a signed
+    /// Add/Sub/Mul to a narrower type may only fire under this policy --
+    /// otherwise the narrow operation would overflow on inputs whose wide
+    /// original was defined, introducing UB into a defined program.
+    wrap_signed_overflow: bool,
 }
 impl Context<'_> {
     fn def(&self, op: Operand) -> Option<&Instruction> {
@@ -925,6 +930,7 @@ pub(super) fn run(func: &mut IrFunction) -> usize {
         uses: &uses,
         visits: std::cell::Cell::new(512),
         disable_logic: bool_algebra_disabled(),
+        wrap_signed_overflow: func.pass_policy.wrap_signed_overflow,
     };
     let mut next = func
         .next_value_id

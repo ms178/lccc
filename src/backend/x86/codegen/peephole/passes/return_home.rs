@@ -214,6 +214,37 @@ fn reissue_root(text: &str, d_fam: RegId, force_32: bool) -> Option<String> {
         return Some(format!("    {out_mnem} {out_src}, {}", rax_alias(dst_tier)));
     }
 
+    // Trailing-zero count: a three-address bit-scan written fresh from the
+    // source and defined for every input (tzcnt answers the operand width
+    // when the source is 0), so relocating its destination to the return
+    // alias is the same operation -- `tzcntl %edi, %esi; movl %esi, %eax`
+    // becomes `tzcntl %edi, %eax`. `bsf` stays out: its destination is
+    // architecturally undefined for a zero source, so the destination
+    // register would be observable; `lzcnt`/`bsr` have no demand-gate
+    // evidence yet.
+    if matches!(mnem, "tzcntl" | "tzcntq") {
+        // Width-down (`force_32`) may relabel only the 32-bit count: a
+        // `tzcntq` answer is NOT the low 32 bits of itself (when the low
+        // half is zero the count lives in the upper half), so `tzcntq`
+        // declines instead of becoming a `tzcntl` of the low half. A
+        // `tzcntl` root already answers in [0, 32], which fits every
+        // truncating copy. Source spellings must agree with the mnemonic;
+        // native codegen always produces those, so a disagreement is a
+        // fail-closed decline rather than a rewrite.
+        if mnem == "tzcntq" {
+            if force_32 {
+                return None;
+            }
+            if plain_gp_operand(src).is_some_and(|f| width_tier(src, f) == Some(1)) {
+                return None;
+            }
+        } else if plain_gp_operand(src).is_some_and(|f| width_tier(src, f) == Some(0)) {
+            return None;
+        }
+        let out_mnem = if force_32 { "tzcntl" } else { mnem };
+        return Some(format!("    {out_mnem} {src}, {}", rax_alias(dst_tier)));
+    }
+
     // add: three-address lea.  Register sources join as the SIB index, the
     // destination family as the base; an immediate becomes the displacement.
     // lea_size law: a narrow result uses `leal` (a `leaw` would be a
@@ -384,12 +415,12 @@ fn try_fold_at_ret(store: &mut LineStore, infos: &mut [LineInfo], r: usize) -> b
             return false; // pathological: refuse rather than scan a function
         }
     }
-    if chain.is_empty() {
-        return false; // interleaved definition: the value is not a tail chain
-    }
     // `chain[0]` is the instruction nearest the copy; the root is the last
-    // collected one, i.e. the bottom of the run.
-    let root = *chain.last().expect("chain is non-empty");
+    // collected one, i.e. the bottom of the run. An empty chain (interleaved
+    // definition: the value is not a tail chain) declines without a panic.
+    let Some(&root) = chain.last() else {
+        return false;
+    };
     // Truncation law: `movl %D, %eax` drops bits 32..63 of the chain value.
     // A ONE-instruction chain answers with a width-down re-issue of that
     // instruction (the whitelisted root families all commute with low-32

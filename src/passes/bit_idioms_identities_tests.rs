@@ -21,6 +21,7 @@ fn rewrite(source: &[Instruction], shared: Option<Value>) -> Option<Vec<Instruct
             uses: &uses,
             visits: std::cell::Cell::new(512),
             disable_logic: false,
+            wrap_signed_overflow: true,
         },
         Value(6),
     )
@@ -1379,5 +1380,167 @@ fn truncating_ring_op_bails_when_both_operands_need_a_temporary() {
     assert!(
         rewrite(&source, None).is_none(),
         "one fresh value cannot name two temporaries"
+    );
+}
+
+/// Byte results stay: `(u8)F(i)` is the byte-store vectorizer's pattern
+/// anchor (vectorize_generator_map matches through that cast), so the ring
+/// fold must leave it in place even though the algebra is sound at 8 bits.
+#[test]
+fn truncating_ring_op_leaves_byte_casts_for_the_vectorizers() {
+    let wide = IrType::I32;
+    let source = vec![
+        bin(
+            Value(1),
+            IrBinOp::Mul,
+            Operand::Value(Value(0)),
+            constant(37, wide),
+            wide,
+        ),
+        Instruction::Cast {
+            dest: Value(4),
+            src: Operand::Value(Value(1)),
+            from_ty: wide,
+            to_ty: IrType::U8,
+        },
+    ];
+    assert!(
+        rewrite(&source, None).is_none(),
+        "the byte-truncating cast belongs to the byte vectorizers"
+    );
+}
+
+/// Same walk as [`rewrite`] under `-fno-wrapv`: the signed ring's narrow
+/// arithmetic is then UB on overflow, so the truncating-ring arm must refuse
+/// it (see the guard in `fold`).
+fn rewrite_nowrap(source: &[Instruction], shared: Option<Value>) -> Option<Vec<Instruction>> {
+    let mut defs = vec![None; 8];
+    let mut uses = vec![0; 8];
+    for inst in source {
+        defs[inst.dest()?.0 as usize] = Some(inst.clone());
+        crate::backend::liveness::for_each_operand_in_instruction(inst, |op| {
+            if let Operand::Value(v) = op {
+                uses[v.0 as usize] += 1;
+            }
+        });
+    }
+    if let Some(v) = shared {
+        uses[v.0 as usize] += 1;
+    }
+    fold(
+        source.last()?,
+        &Context {
+            defs: &defs,
+            uses: &uses,
+            visits: std::cell::Cell::new(512),
+            disable_logic: false,
+            wrap_signed_overflow: false,
+        },
+        Value(6),
+    )
+}
+
+fn truncating_sub_source(wide: IrType, narrow: IrType) -> Vec<Instruction> {
+    vec![
+        Instruction::Cast {
+            dest: Value(2),
+            src: Operand::Value(Value(0)),
+            from_ty: narrow,
+            to_ty: wide,
+        },
+        bin(
+            Value(3),
+            IrBinOp::Sub,
+            Operand::Value(Value(2)),
+            constant(1, wide),
+            wide,
+        ),
+        Instruction::Cast {
+            dest: Value(4),
+            src: Operand::Value(Value(3)),
+            from_ty: wide,
+            to_ty: narrow,
+        },
+    ]
+}
+
+/// The narrow signed op must not be materialised under `-fno-wrapv`: the wide
+/// original (`x - 1` at the promoted width) is defined for every narrow `x`,
+/// while the narrowed subtraction overflows at `INT*_MIN`. Under `-fwrapv`
+/// the same source folds (the existing compute-at-the-narrow-width test).
+#[test]
+fn truncating_ring_op_refuses_signed_narrow_arith_without_wrapv() {
+    let source = truncating_sub_source(IrType::I32, IrType::I16);
+    assert!(
+        rewrite_nowrap(&source, None).is_none(),
+        "signed narrow sub under -fno-wrapv would introduce UB"
+    );
+    assert!(
+        rewrite(&source, None).is_some(),
+        "-fwrapv keeps the modular ring fold enabled"
+    );
+}
+
+/// Unsigned narrow arithmetic always wraps, so the guard must not block it.
+#[test]
+fn truncating_ring_op_keeps_unsigned_narrow_arith_without_wrapv() {
+    let narrow = IrType::U16;
+    let wide = IrType::U32;
+    let source = vec![
+        Instruction::Cast {
+            dest: Value(2),
+            src: Operand::Value(Value(0)),
+            from_ty: narrow,
+            to_ty: wide,
+        },
+        bin(
+            Value(3),
+            IrBinOp::Add,
+            Operand::Value(Value(2)),
+            constant(7, wide),
+            wide,
+        ),
+        Instruction::Cast {
+            dest: Value(4),
+            src: Operand::Value(Value(3)),
+            from_ty: wide,
+            to_ty: narrow,
+        },
+    ];
+    assert!(
+        rewrite_nowrap(&source, None).is_some(),
+        "u16 add is modular under every overflow policy"
+    );
+}
+
+/// Bitwise ops never overflow: they keep folding without `-fwrapv`.
+#[test]
+fn truncating_ring_op_keeps_bitwise_narrow_ops_without_wrapv() {
+    let narrow = IrType::I16;
+    let wide = IrType::I32;
+    let source = vec![
+        Instruction::Cast {
+            dest: Value(2),
+            src: Operand::Value(Value(0)),
+            from_ty: narrow,
+            to_ty: wide,
+        },
+        bin(
+            Value(3),
+            IrBinOp::And,
+            Operand::Value(Value(2)),
+            constant(0x5555, wide),
+            wide,
+        ),
+        Instruction::Cast {
+            dest: Value(4),
+            src: Operand::Value(Value(3)),
+            from_ty: wide,
+            to_ty: narrow,
+        },
+    ];
+    assert!(
+        rewrite_nowrap(&source, None).is_some(),
+        "i16 and has no overflow semantics to preserve"
     );
 }

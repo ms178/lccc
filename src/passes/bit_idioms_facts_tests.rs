@@ -60,6 +60,7 @@ impl Builder {
                 uses: &uses,
                 visits: std::cell::Cell::new(512),
                 disable_logic: false,
+                wrap_signed_overflow: true,
             },
             &Facts(vec![]),
             Value(self.next),

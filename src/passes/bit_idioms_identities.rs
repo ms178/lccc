@@ -705,12 +705,25 @@ pub(super) fn fold(inst: &Instruction, cx: &Context<'_>, fresh: Value) -> Option
         // op die together with this cast. The op set is exactly the ring of
         // `2^W` residues — shifts and divides are NOT in it (the low bits of
         // a shift/divide depend on high bits or on the width itself).
+        //
+        // Byte results are excluded on purpose: the byte-truncating cast is
+        // the pattern anchor of the byte-store vectorizers
+        // (`vectorize_generator_map` matches `dst[i] = (u8)F(i)` through that
+        // cast and packs the wide lanes), and consuming the anchor here
+        // silently declines those loops — the generator-map gate fails on the
+        // trace count while the runtime stays correct. No measured win needs
+        // the byte form (the 32-probe audit's improvements are 16/32/64-bit),
+        // so the cast stays for its vectorizer consumers.
         Instruction::Cast {
             dest,
             from_ty,
             to_ty,
             src,
-        } if scalar(*from_ty) && scalar(*to_ty) && from_ty.size() > to_ty.size() => {
+        } if scalar(*from_ty)
+            && scalar(*to_ty)
+            && from_ty.size() > to_ty.size()
+            && !matches!(to_ty, IrType::I8 | IrType::U8) =>
+        {
             // Single-consumer law, as in the UnaryOp arm: the wide BinOp must
             // die with this truncation or the rewrite would duplicate it.
             if !matches!(src, Operand::Value(v) if cx.uses.get(v.0 as usize) == Some(&1)) {
@@ -734,6 +747,21 @@ pub(super) fn fold(inst: &Instruction, cx: &Context<'_>, fresh: Value) -> Option
                 }
                 _ => return None,
             };
+            // Signed Add/Sub/Mul may move to the narrow type only under
+            // `-fwrapv`. The wide original is defined on inputs whose narrow
+            // evaluation overflows (e.g. `i16` 20000 + 20000 fits the `i32`
+            // promotion the C abstract machine computes first), so rewriting
+            // it to a wrapping-at-`to_ty` operation would introduce UB into a
+            // defined program -- and later no-wrap consumers (the GEP index
+            // peel's `scale_ring_is_linear`) actively exploit that assumption.
+            // Bitwise ops never overflow and unsigned types always wrap, so
+            // the guard is exactly this op/signedness/policy triple.
+            if matches!(op, IrBinOp::Add | IrBinOp::Sub | IrBinOp::Mul)
+                && !to_ty.is_unsigned()
+                && !cx.wrap_signed_overflow
+            {
+                return None;
+            }
             let (lhs, ltmp) = trunc_ring_operand(lhs, cx, *from_ty, *to_ty, fresh)?;
             // Exactly one fresh value per edit: bail if both sides need a
             // truncation temporary rather than minting a colliding Value.

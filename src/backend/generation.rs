@@ -100,6 +100,15 @@ pub(super) struct GepFoldInfo {
 pub(crate) struct IndexedGepInfo {
     pub(super) base: Value,
     pub(super) index: Value,
+    /// IR type of the post-peel index root. Indexed emitters must materialise
+    /// the index at this type's defined form before it reaches the address
+    /// (x86-64 `ensure_sib_index_form`; the i686 mirror
+    /// `extend_sib_index_form`), because the peel drops intermediate widening
+    /// casts: `p[(int16_t)(i * 2)]` roots at `I16` while the producing
+    /// instruction only maintains that value's low 16 bits. Seeded from
+    /// `compute_value_type_map`; absent (unprovable) types default to `I64`,
+    /// the map's conservative wide default.
+    pub(crate) index_ty: IrType,
     /// Log2 scale in `0..=3`.
     pub(super) shift: u8,
     /// Constant byte displacement from `add(iv, const)` peeling
@@ -1590,6 +1599,12 @@ fn build_indexed_gep_map(
     }
 
     let defs = index_single_defs(func, stab);
+    // Full (Copy/Phi-propagated) types for the `index_ty` field of every
+    // info below; unlike `val_ty` this must cover values whose defining
+    // instruction carries no result type (the peel can root at a Copy/Phi).
+    // Missing entries mean "no evidence" and become the documented `I64`
+    // wide default at the construction sites.
+    let full_ty = crate::backend::common::compute_value_type_map(func);
     // Static type of every defined value (multi-def accumulator-flow values
     // included: all defs of one value share a type). The cast peel below
     // needs the SOURCE value's own type, not merely the cast's `from_ty`.
@@ -2029,6 +2044,7 @@ fn build_indexed_gep_map(
                                 IndexedGepInfo {
                                     base: *base,
                                     index: Value(ar),
+                                    index_ty: full_ty.get(&ar).copied().unwrap_or(IrType::I64),
                                     shift,
                                     disp: 0,
                                     orig_offset: *off,
@@ -2045,6 +2061,7 @@ fn build_indexed_gep_map(
                     IndexedGepInfo {
                         base: *base,
                         index,
+                        index_ty: full_ty.get(&index.0).copied().unwrap_or(IrType::I64),
                         shift,
                         disp,
                         orig_offset: *off,
