@@ -1610,9 +1610,17 @@ impl Lowerer {
         // typeof(*(type *)0) patterns (e.g., LIST_ELEM macro) reuse
         // Deref(Cast(...)) addresses.  Cast is also bypassed since
         // type_spec_to_ctype is cheap and always correct.
+        //
+        // A CompoundLiteral carries its own type_specifier, so
+        // type_spec_to_ctype answers exactly and in constant time; going
+        // through the address-keyed cache is both pointless and WRONG: two
+        // literals in one translation unit can share an address, and the cache
+        // then reports the other literal's type.  That is how
+        // `(int[2][3]){ ... }` once answered for `(char[4]){ "ab" }` and the
+        // character member it designated stayed zero.
         let bypass_cache = matches!(
             expr,
-            Expr::Identifier(..) | Expr::Deref(..) | Expr::Cast(..)
+            Expr::Identifier(..) | Expr::Deref(..) | Expr::Cast(..) | Expr::CompoundLiteral(..)
         );
         if bypass_cache {
             let result = self.get_expr_ctype_lowerer(expr);

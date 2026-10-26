@@ -63,6 +63,23 @@ impl Lowerer {
         let elem_ct = self.init_leaf_ctype(obj_ty, type_spec);
         let elem_ct = &elem_ct;
 
+        // An object of array type initialized by a compound literal of that
+        // same type is the object initialized by the literal's payload list:
+        // the literal names an array object (C11 6.5.2.5p5) and an array
+        // cannot be initialized from an array *expression* (6.7.9p13), so the
+        // two spellings must agree.  Synthesizing the list here keeps every
+        // array flavour -- scalars of any rank, character arrays, arrays of
+        // aggregates -- on the paths below, canonicalisation included.
+        let synthesized: Initializer;
+        let init: &Initializer = match obj_ty.and_then(|t| self.array_initializer_payload(init, t))
+        {
+            Some(payload) => {
+                synthesized = Initializer::List(payload.to_vec());
+                &synthesized
+            }
+            None => init,
+        };
+
         // GCC's `folding_initializer`: see `Lowerer::folding_initializer`.
         let outer = self.folding_initializer.replace(true);
         let lowered = match init {

@@ -4987,25 +4987,18 @@ fn inline_call_site(
         .map(|block| block.label.0)
         .max()
         .unwrap_or(0);
-    // Reserve `label_base` plus at least `callee.blocks.len() + 1` dense slots
-    // (every callee block + the post-call merge block) strictly below `u32::MAX`
-    // so `caller.next_label` can still advance past `merge_block_id` without
-    // saturating at `u32::MAX`. `LabelMap` also checks every individual mint
-    // in case a callee terminator names an undefined block label.
-    let Some(label_base) = (*global_max_block_id).max(caller_max_label).checked_add(1) else {
+    // Capacity: the clone mints one label per callee block plus the reserved
+    // extras, so that is what the base must leave room for. Checked before any
+    // block is cloned; an inline that cannot fit refuses (the caller keeps the
+    // call) instead of minting a label that already exists.
+    let label_need = (callee.blocks.len() as u64).saturating_add(LABEL_MAP_RESERVED as u64);
+    let Some(label_base) = (*global_max_block_id)
+        .max(caller_max_label)
+        .checked_add(1)
+        .filter(|base| u64::from(*base) + label_need <= u64::from(u32::MAX))
+    else {
         return false;
     };
-    let min_labels_needed = u32::try_from(callee.blocks.len())
-        .ok()
-        .and_then(|n| n.checked_add(1));
-    if min_labels_needed
-        .and_then(|n| label_base.checked_add(n))
-        .is_none()
-    {
-        // Fail closed: an inline that cannot mint collision-free labels and
-        // leave headroom for `caller.next_label` must not clone blocks.
-        return false;
-    }
 
     let debug_inline_detail = std::env::var("CCC_INLINE_DEBUG_DETAIL").is_ok();
     if debug_inline_detail {
@@ -5185,9 +5178,6 @@ fn inline_call_site(
     // the clone minted and above anything the caller already had — including the
     // labels of any later clone in this caller that mints from `next_label`.
     let merge_block_id = labels.assign_fresh();
-    if labels.overflowed {
-        return false;
-    }
 
     // Collect return values from all return blocks to build a Phi node.
     // Each Return(Some(val)) becomes a branch to the merge block, and
@@ -5801,9 +5791,25 @@ fn remap_value(v: Value, offset: u32) -> Value {
 /// clone site for the miscompile this replaced).  A label the callee references
 /// but does not define — a `possible_targets` entry or a stale phi predecessor —
 /// still gets its own fresh label rather than aliasing a live block.
+/// Label slots an inline needs ABOVE the counter's last minted label before
+/// the label space is exhausted.
+///
+/// The dense counter hands out one label per distinct callee label, but the
+/// clone also needs labels the callee never mentions:
+///
+/// * one for the merge block the inline branches to after the cloned body;
+/// * up to three more minted on demand by [`LabelMap::get`] for label
+///   references that no block defines — an asm `goto` target, or a terminator
+///   that names a label reached only through an indirect path.
+///
+/// Reserving them at the base instead of discovering the exhaustion one
+/// `u32::MAX` label later is what keeps the failure loud: an inline that
+/// cannot mint the labels it needs refuses to clone (its caller keeps the
+/// call), rather than minting a label that already exists.
+const LABEL_MAP_RESERVED: u32 = 4;
+
 struct LabelMap {
     next: u32,
-    overflowed: bool,
     map: FxHashMap<u32, BlockId>,
 }
 
@@ -5811,7 +5817,6 @@ impl LabelMap {
     fn new(base: u32) -> Self {
         Self {
             next: base,
-            overflowed: false,
             map: FxHashMap::default(),
         }
     }
@@ -5834,14 +5839,22 @@ impl LabelMap {
     }
 
     /// A brand-new label, which is above every label the clone will use.
-    /// Records `overflowed` instead of panicking/wrapping if `u32::MAX` is
-    /// reached so the caller can abort before mutating the CFG.
+    ///
+    /// The capacity is pre-checked at the base (see [`LABEL_MAP_RESERVED`]), so
+    /// the increment cannot overflow; `checked_add` keeps that a hard
+    /// invariant instead of a silent wraparound if the reservation is ever
+    /// reduced below what a clone needs.
+    /// The capacity contract is checked at the base
+    /// ([`LABEL_MAP_RESERVED`]), so the counter cannot overflow; the assert
+    /// keeps that a contract rather than a silent wraparound in a release
+    /// build, where a repeated label would be a miscompile.
     fn assign_fresh(&mut self) -> BlockId {
         let id = BlockId(self.next);
-        match self.next.checked_add(1) {
-            Some(next) => self.next = next,
-            None => self.overflowed = true,
-        }
+        assert!(
+            self.next < u32::MAX,
+            "inline label capacity was pre-checked"
+        );
+        self.next += 1;
         id
     }
 }
@@ -9694,16 +9707,5 @@ mod sroa_unlock_tests {
             }],
         );
         assert!(!admitted(&used));
-    }
-
-    #[test]
-    fn label_map_records_overflow_at_u32_max_without_wrapping() {
-        let mut lm = LabelMap::new(u32::MAX - 1);
-        assert_eq!(lm.assign(BlockId(10)), BlockId(u32::MAX - 1));
-        assert!(!lm.overflowed);
-        assert_eq!(lm.get(BlockId(10)), BlockId(u32::MAX - 1));
-        assert!(!lm.overflowed);
-        assert_eq!(lm.assign_fresh(), BlockId(u32::MAX));
-        assert!(lm.overflowed);
     }
 }

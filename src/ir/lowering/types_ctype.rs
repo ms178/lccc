@@ -166,31 +166,31 @@ impl Lowerer {
     pub(super) fn param_ctype(&self, param: &crate::frontend::parser::ast::ParamDecl) -> CType {
         // Case 1: explicit function pointer syntax - fptr_params is set
         if let Some(ref fptr_params) = param.fptr_params {
-            let inner_ptr = param.fptr_inner_ptr_depth;
-            let strip_count = if inner_ptr > 1 { inner_ptr } else { 1 };
-            let mut ret_spec = &param.type_spec;
-            for _ in 0..strip_count {
-                if let TypeSpecifier::Pointer(inner, _) = ret_spec {
-                    ret_spec = inner;
-                }
-            }
-            let actual_return = self.type_spec_to_ctype(ret_spec);
+            let return_ctype = self.type_spec_to_ctype(&param.type_spec);
+            // The parser's `is_func_ptr` flag adds exactly one Pointer layer for
+            // the (*name) indirection. Peel that single layer; any remaining
+            // Pointer layers belong to the actual return type.
+            //
+            // Examples (type_spec → peel 1 → return type):
+            //   int (*f)(...)           → Pointer(Int) → Int
+            //   int *(*f)(...)          → Pointer(Pointer(Int)) → Pointer(Int)
+            //   struct Node *(*f)(...) → Pointer(Pointer(Struct)) → Pointer(Struct)
+            let actual_return = if let CType::Pointer(inner, _) = return_ctype {
+                *inner
+            } else {
+                return_ctype
+            };
 
             let param_types: Vec<(CType, Option<String>)> = fptr_params
                 .iter()
-                .map(|p| (self.param_ctype(p), p.name.clone()))
+                .map(|p| (self.type_spec_to_ctype(&p.type_spec), p.name.clone()))
                 .collect();
             let func_type = CType::Function(Box::new(crate::common::types::FunctionType {
                 return_type: actual_return,
                 params: param_types,
                 variadic: param.fptr_variadic,
             }));
-            let mut result = CType::Pointer(Box::new(func_type), AddressSpace::Default);
-            if inner_ptr > 1 {
-                for _ in 0..(inner_ptr - 1) {
-                    result = CType::Pointer(Box::new(result), AddressSpace::Default);
-                }
-            }
+            let result = CType::Pointer(Box::new(func_type), AddressSpace::Default);
             return result;
         }
 
@@ -259,10 +259,28 @@ impl Lowerer {
         // Look up the stored function pointer typedef info
         if let Some(fti) = self.types.func_ptr_typedef_info.get(tname) {
             let return_ctype = self.type_spec_to_ctype(&fti.return_type);
+            // Each parameter resolves through the ONE parameter builder
+            // (`param_decl_to_ctype_with`), never through its type specifier
+            // alone.  A function-pointer typedef commonly has parameters that
+            // are themselves function pointers -- `typedef int (*fp_t)(int
+            // (*)(unsigned int), int[3])`, the shape every kernel callback
+            // table uses -- and their type lives in `ParamDecl::fptr_params`,
+            // not in `type_spec`.  Resolving the specifier alone typed such a
+            // parameter as its first token (`int *`), so
+            // `__builtin_types_compatible_p(fp_t, int (*)(int (*)(unsigned
+            // int), int *))` answered 0 for two identical types.
             let param_types: Vec<(CType, Option<String>)> = fti
                 .params
                 .iter()
-                .map(|p| (self.param_ctype(p), p.name.clone()))
+                .map(|p| {
+                    (
+                        crate::common::type_builder::param_decl_to_ctype_with(
+                            &|ts| self.type_spec_to_ctype(ts),
+                            p,
+                        ),
+                        p.name.clone(),
+                    )
+                })
                 .collect();
             let func_type = CType::Function(Box::new(crate::common::types::FunctionType {
                 return_type: return_ctype,

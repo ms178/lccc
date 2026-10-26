@@ -260,6 +260,33 @@ impl InlineAsmEmitter for X86Codegen {
         None
     }
 
+    /// The registers that currently HOLD one of `values` and must not be
+    /// handed out as scratch.
+    ///
+    /// Phase 1f materialises a memory operand's ADDRESS before phase 2 loads
+    /// the operands' values into their registers, and the scratch allocator
+    /// only knows the registers an operand has already claimed.  An input
+    /// whose value is register-homed (a parameter, or a value forwarded from
+    /// the surrounding code) is loaded into that home by phase 2, so it is
+    /// invisible to `excluded` — and an address materialised into it destroys
+    /// the input before the asm body reads it.
+    ///
+    /// `fresh_home_of` is the same predicate phase 2's loads and the
+    /// accumulator's recovery consult, so a register it reports is one whose
+    /// content the asm body will read.
+    fn reserved_home_regs(&self, values: &[u32]) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for &v in values {
+            if let Some(reg) = self.fresh_home_of(v) {
+                let name = super::emit::phys_reg_name(reg);
+                if !out.iter().any(|r| r == name) {
+                    out.push(name.to_string());
+                }
+            }
+        }
+        out
+    }
+
     fn assign_scratch_reg(&mut self, kind: &AsmOperandKind, excluded: &[String]) -> String {
         if matches!(kind, AsmOperandKind::FpReg) {
             // Skip XMM registers that are claimed by clobbers or specific constraints.

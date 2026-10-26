@@ -1167,6 +1167,48 @@ impl SemanticAnalyzer {
                 }
             }
 
+            // An AUTOMATIC array cannot be initialized from an array-typed
+            // expression.  An array is neither an assignable value
+            // (6.3.2.1p3) nor an acceptable array initializer (6.7.9p13), so
+            // the only expression that can appear here is a compound literal
+            // -- and GCC rejects exactly that, for automatic storage only: a
+            // static or file-scope object is initialized by copying the
+            // literal's bytes, which GCC accepts.  A string literal stays
+            // legal (6.7.9p14).  lccc used to accept the automatic form and
+            // leave the array uninitialized, so `nm_t l[2] = (nm_t[2]){ ... }`
+            // in a function silently read garbage.
+            if let (Some(Initializer::Expr(expr)), false) =
+                (&init_decl.init, decl.is_static() || links)
+            {
+                let array_target = self
+                    .symbol_table
+                    .lookup(&init_decl.name)
+                    .is_some_and(|s| matches!(s.ty, CType::Array(..)));
+                let array_source = !matches!(
+                    expr,
+                    Expr::StringLiteral(..)
+                        | Expr::WideStringLiteral(..)
+                        | Expr::Char16StringLiteral(..)
+                ) && self
+                    .expr_type_checker()
+                    .infer_expr_ctype(expr)
+                    .is_some_and(|t| matches!(t, CType::Array(..)));
+                if array_target && array_source {
+                    // GCC's wording depends on the expression: a compound
+                    // literal is the array-expression case it names; any other
+                    // array-typed expression (`int b[3] = a;`) is a plain
+                    // invalid initializer.
+                    let message = if matches!(expr, Expr::CompoundLiteral(..)) {
+                        "array initialized from non-constant array expression"
+                    } else {
+                        "invalid initializer"
+                    };
+                    self.diagnostics
+                        .borrow_mut()
+                        .error(message.to_string(), expr.span());
+                }
+            }
+
             // Analyze initializer expressions
             if let Some(init) = &init_decl.init {
                 self.analyze_initializer(init);
@@ -1406,7 +1448,11 @@ impl SemanticAnalyzer {
                 &select,
             );
             let non_constant = if static_storage {
-                checker.non_constant_leaves(init)
+                // The object's own type decides what an array-typed compound
+                // literal means here: its braced list, or a decayed address.
+                let object_ty =
+                    type_builder::build_full_ctype(self, &decl.type_spec, &init_decl.derived);
+                checker.non_constant_leaves_for(init, &object_ty)
             } else {
                 Vec::new()
             };
