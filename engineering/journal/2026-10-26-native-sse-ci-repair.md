@@ -201,3 +201,34 @@ Cartesian product of all memory fields. Two structural tests pin generation and
 register-triple completeness; existing hosted asm-diff lanes discover both new
 casefiles. This strengthens assembler coverage, not a new runtime speed claim
 or a completed latest-manual/exhaustive SSE–AVX2 audit.
+
+## Current-main integration and offline cache contract
+
+GitHub reported the branch unmergeable; newer pushes consequently had no new
+pull-request CI run. Merged current main (2728eb9) on the session branch,
+retaining its IPA-RA emission ordering, MachInst liveness and target-aware
+reassociation fixes. Resolved the actual installer conflict by combining the
+published exact-version Rust/Clang lock with main's explicit offline path.
+Both offline and verify-only modes now probe before transport prerequisites or
+prefix writes. A focused unit exercises both success and missing-Rust paths,
+with transport commands poisoned and prefix contents compared before/after.
+The generated environment also puts the actual restored prefixes on PATH,
+including --no-shims use. Six cache tests and invocation parity pass.
+
+The merged source fastbuild of all binaries completed without warnings using
+j2, active swap, GCC 16.2/mold, and the locally available Rust 1.97 MSRV/bootstrap
+cache. This is not claimed as a local Rust 1.99.1 restore or latest-stable
+acceptance; the release-CDN access restriction still applies. Merged native
+packed-count results match GCC 16.2 on both ABIs at O0/O2. Both PDEP/PEXT matrices
+remain byte-identical to GAS/objdump 2.47.20260726. No full local CI was run.
+
+Official-source access advanced: the Intel combined PDF at
+https://cdrdv2-public.intel.com/929349/325462-093-sdm-vol-1-2abcd-3abcd-4.pdf
+was fetched through the page tool (limited to its first 30 pages). AMD's
+https://docs.amd.com/v/u/en-US/26568_3.27_APM_Vol4_PUB identifies July 21, 2026,
+revision 3.27. Its actual PDF endpoint is
+https://docs.amd.com/api/khub/documents/OCw3Z61a0v0jKvHJl_Qmtg/content;
+its cover independently confirms publication 26568, revision 3.27, July 2026.
+The tool's page limit reaches contents rather than the individual instruction
+entries. Neither this source identification nor the encoding matrices are
+claimed as exhaustive instruction-semantic/manual verification.

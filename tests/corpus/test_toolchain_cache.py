@@ -1,5 +1,7 @@
 import io
 import json
+import os
+import subprocess
 from pathlib import Path
 import tempfile
 import unittest
@@ -67,3 +69,39 @@ class ToolchainCache(unittest.TestCase):
                 with self.assertRaises(tarfile.FilterError):
                     cache.unpack(archive, root / 'out')
                 self.assertFalse((root / 'escaped').exists())
+
+
+class OfflineCombinedInstaller(unittest.TestCase):
+    def test_verification_modes_never_transport_or_write(self):
+        script = cache.LOCK.parents[2] / 'scripts/oracle_toolchains_from_tags.sh'
+        for mode in ('--offline', '--verify-only'):
+            for missing_rust in (False, True):
+                with self.subTest(mode=mode, missing_rust=missing_rust), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    prefix, guard = root / 'prefix', root / 'guard'
+                    guard.mkdir()
+                    marker = root / 'unexpected-transport'
+                    for name in ('git', 'curl', 'tar', 'xz', 'python3'):
+                        command = guard / name
+                        command.write_text(f'#!/bin/sh\necho invoked > "{marker}"\nexit 99\n')
+                        command.chmod(0o755)
+                    identities = {'gcc-16.2.0/bin/gcc-16': 'gcc-16 (GCC) 16.2.0',
+                                  'clang-23.1.4/bin/clang-23': 'clang version 23.1.4 (fixture)',
+                                  'bin/mold': 'mold 2.42.1',
+                                  'rust-1.99.1/bin/rustc': 'rustc 1.99.1 (fixture)'}
+                    for name, identity in identities.items():
+                        if missing_rust and name.endswith('rustc'):
+                            continue
+                        command = prefix / name
+                        command.parent.mkdir(parents=True, exist_ok=True)
+                        command.write_text(f'#!/bin/sh\nprintf "%s\\n" "{identity}"\n')
+                        command.chmod(0o755)
+                    before = sorted(str(p.relative_to(prefix)) for p in prefix.rglob('*'))
+                    result = subprocess.run(['/bin/bash', str(script), mode, '--prefix', str(prefix)],
+                                            env={**os.environ, 'PATH': str(guard) + ':' + os.defpath},
+                                            text=True, capture_output=True)
+                    self.assertEqual(result.returncode, 1 if missing_rust else 0, result.stdout + result.stderr)
+                    if missing_rust:
+                        self.assertIn('rustc not executable', result.stdout + result.stderr)
+                    self.assertFalse(marker.exists())
+                    self.assertEqual(before, sorted(str(p.relative_to(prefix)) for p in prefix.rglob('*')))

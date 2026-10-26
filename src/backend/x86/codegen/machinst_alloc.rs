@@ -68,7 +68,10 @@
 //! replay remains the fail-safe, but it is now the exception it was always
 //! meant to be, not the cliff every spilled pointer fell off.
 
-use super::machinst::{MACHINST_ALLOCATABLE_GPRS, MachInst, MachOperand, MachReg, OpSize, RBP};
+use super::machinst::{
+    CallTarget, MACHINST_ALLOCATABLE_GPRS, MachInst, MachOperand, MachReg, OpSize, R8, R9, R10,
+    R11, RAX, RBP, RCX, RDI, RDX, RSI, SYSCALL_ARG_REGS,
+};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
 
@@ -424,9 +427,10 @@ impl<'a> Scan<'a> {
     }
 }
 
-/// Physical registers referenced by an instruction's operands (read or
-/// write alike — for interference both directions matter equally).
-fn touched_phys_regs(inst: &MachInst) -> Vec<u8> {
+/// Physical registers observed by an instruction (explicit operands plus
+/// implicit architectural reads/writes; for interference both directions
+/// matter equally).
+pub(super) fn touched_phys_regs(inst: &MachInst) -> Vec<u8> {
     fn reg_of(r: &MachReg, out: &mut Vec<u8>) {
         if let MachReg::Phys(p) = r {
             out.push(p.0);
@@ -449,32 +453,43 @@ fn touched_phys_regs(inst: &MachInst) -> Vec<u8> {
             op_of(src, &mut v);
             op_of(dst, &mut v);
         }
-        MachInst::FAlu { src2, .. } => op_of(src2, &mut v),
+        MachInst::FAlu {
+            src2, src1, dst, ..
+        } => {
+            op_of(src2, &mut v);
+            reg_of(src1, &mut v);
+            reg_of(dst, &mut v);
+        }
         MachInst::Mov128 { src, dst } => {
             op_of(src, &mut v);
             op_of(dst, &mut v);
         }
-        MachInst::Movzx { src, .. } | MachInst::Movsx { src, .. } => op_of(src, &mut v),
-        MachInst::Alu { src, .. } => op_of(src, &mut v),
-        MachInst::Shift { amount, .. } => op_of(amount, &mut v),
-        MachInst::Div { divisor, .. } => op_of(divisor, &mut v),
+        MachInst::Movzx { src, dst, .. } | MachInst::Movsx { src, dst, .. } => {
+            op_of(src, &mut v);
+            reg_of(dst, &mut v);
+        }
+        MachInst::Alu { src, dst, .. } => {
+            op_of(src, &mut v);
+            reg_of(dst, &mut v);
+        }
+        MachInst::Imul3 { src, dst, .. } => {
+            reg_of(src, &mut v);
+            reg_of(dst, &mut v);
+        }
+        MachInst::Shift { amount, dst, .. } => {
+            op_of(amount, &mut v);
+            reg_of(dst, &mut v);
+        }
+        MachInst::Div { divisor, .. } => {
+            op_of(divisor, &mut v);
+            v.push(RAX.0);
+            v.push(RDX.0);
+        }
         MachInst::Cmp { lhs, rhs, .. } | MachInst::Test { lhs, rhs, .. } => {
             op_of(lhs, &mut v);
             op_of(rhs, &mut v);
         }
-        MachInst::Cmov { src, .. } => op_of(src, &mut v),
-        MachInst::CallTyped { args, ret, .. } => {
-            for m in args {
-                op_of(&m.src, &mut v);
-                // dst_reg is a PhysReg by construction.
-                v.push(m.dst_reg.0);
-            }
-            if let Some(r) = ret {
-                op_of(&r.dst, &mut v);
-            }
-        }
         MachInst::LeaSym { dst, .. } | MachInst::LeaSlot { dst, .. } => reg_of(dst, &mut v),
-        MachInst::Imul3 { src, .. } => reg_of(src, &mut v),
         MachInst::ShiftX {
             count, src, dst, ..
         } => {
@@ -497,9 +512,236 @@ fn touched_phys_regs(inst: &MachInst) -> Vec<u8> {
         }
         MachInst::Neg { dst, .. } | MachInst::Not { dst, .. } => reg_of(dst, &mut v),
         MachInst::SetCC { dst, .. } => reg_of(dst, &mut v),
+        MachInst::Cmov { src, dst, .. } => {
+            op_of(src, &mut v);
+            reg_of(dst, &mut v);
+        }
         MachInst::Jcc { .. } | MachInst::Jmp { .. } | MachInst::Label(_) => {}
-        MachInst::Cqto { .. } | MachInst::XorRdx | MachInst::Ret | MachInst::Call { .. } => {}
+        // These instructions have architectural register effects that are not
+        // represented by an explicit MachOperand.  Keep this helper complete:
+        // the emitter uses it to decide whether a source home may be renamed
+        // away by a later LEA, while the allocator uses the same observation
+        // set for physical interference.  A false negative here can turn an
+        // otherwise harmless peephole into a silent stale-register read.
+        MachInst::Cqto { .. } => {
+            v.push(RAX.0);
+            v.push(RDX.0);
+        }
+        MachInst::XorRdx => v.push(RDX.0),
+        MachInst::Ret => v.push(RAX.0),
+        MachInst::Call { .. } => {
+            // A direct call has no explicit target operand, but it destroys
+            // the SysV caller-save integer homes.  The set is intentionally
+            // conservative here; a caller-save value that is actually
+            // preserved by a surrounding lowering is still safe to leave
+            // unfused, whereas omitting a clobber would be unsound.
+            v.extend([RAX.0, RCX.0, RDX.0, RDI.0, RSI.0, R8.0, R9.0, R10.0, R11.0]);
+        }
+        MachInst::CallTyped {
+            caller_saves,
+            args,
+            target,
+            ret,
+            ..
+        } => {
+            for m in args {
+                op_of(&m.src, &mut v);
+                // dst_reg is a PhysReg by construction.
+                v.push(m.dst_reg.0);
+            }
+            if let Some(r) = ret {
+                op_of(&r.dst, &mut v);
+            }
+            // The call itself consumes rax/rdx and the SysV caller-save set;
+            // the typed save/restore list is also observed explicitly before
+            // and after the call.  An indirect target is an additional
+            // architectural read that is not present in args or ret.
+            v.extend([RAX.0, RCX.0, RDX.0, RDI.0, RSI.0, R8.0, R9.0, R10.0, R11.0]);
+            for (reg, _) in caller_saves {
+                v.push(reg.0);
+            }
+            if let CallTarget::Indirect(reg) = target {
+                v.push(reg.0);
+            }
+        }
         MachInst::Raw(_) => {}
+    }
+    v
+}
+
+/// Physical registers an instruction actually reads, as opposed to merely
+/// defining. The allocator needs [`touched_phys_regs`] for interference, but
+/// the three-instruction LEA peephole only needs to reject a later read of the
+/// source home. Distinguishing pure overwrites lets it fold a dead source even
+/// when a later instruction reuses that register.
+pub(super) fn reads_phys_regs(inst: &MachInst) -> Vec<u8> {
+    fn reg_of(r: &MachReg, out: &mut Vec<u8>) {
+        if let MachReg::Phys(p) = r {
+            out.push(p.0);
+        }
+    }
+    fn op_of(o: &MachOperand, out: &mut Vec<u8>) {
+        match o {
+            MachOperand::Reg(r) => reg_of(r, out),
+            MachOperand::Mem { base, .. } => reg_of(base, out),
+            MachOperand::MemIndex { base, index, .. } => {
+                reg_of(base, out);
+                reg_of(index, out);
+            }
+            _ => {}
+        }
+    }
+    fn address_of(o: &MachOperand, out: &mut Vec<u8>) {
+        if matches!(o, MachOperand::Mem { .. } | MachOperand::MemIndex { .. }) {
+            op_of(o, out);
+        }
+    }
+    let mut v = Vec::new();
+    match inst {
+        MachInst::Mov { src, dst, size } => {
+            op_of(src, &mut v);
+            match dst {
+                MachOperand::Reg(r) if matches!(size, OpSize::S8 | OpSize::S16) => {
+                    // Byte/word writes preserve the rest of the destination
+                    // register, so the old value is still semantically live.
+                    reg_of(r, &mut v);
+                }
+                _ => address_of(dst, &mut v),
+            }
+        }
+        MachInst::FMov { src, dst, .. } => {
+            op_of(src, &mut v);
+            // A scalar SSE register move can preserve the upper lanes of its
+            // destination. This is not normally a GPR source-home, but keep
+            // the observation rule exact for pre-coloured mixed test shapes.
+            match dst {
+                MachOperand::Reg(r) => reg_of(r, &mut v),
+                _ => address_of(dst, &mut v),
+            }
+        }
+        MachInst::FAlu { src2, src1, .. } => {
+            op_of(src2, &mut v);
+            reg_of(src1, &mut v);
+        }
+        MachInst::Mov128 { src, dst } => {
+            op_of(src, &mut v);
+            address_of(dst, &mut v);
+        }
+        MachInst::Movzx { src, .. } => {
+            op_of(src, &mut v);
+        }
+        MachInst::Movsx {
+            src, dst, to_size, ..
+        } => {
+            op_of(src, &mut v);
+            if *to_size == OpSize::S16 {
+                // movsbw is a word write; bits above bit 15 retain the old
+                // destination value and must not be treated as dead.
+                reg_of(dst, &mut v);
+            }
+        }
+        MachInst::Alu { src, dst, .. } => {
+            op_of(src, &mut v);
+            reg_of(dst, &mut v);
+        }
+        MachInst::Imul3 {
+            imm,
+            src,
+            dst,
+            size,
+            ..
+        } => {
+            reg_of(src, &mut v);
+            // The emitter widens S8, and S16 with an imm32-only multiplier,
+            // to a 32-bit write. A representable S16 form is only a partial
+            // destination write and therefore carries the old register value.
+            if *size == OpSize::S16 && (*imm >= i16::MIN as i64 && *imm <= i16::MAX as i64) {
+                reg_of(dst, &mut v);
+            }
+        }
+        MachInst::Neg { dst, .. } | MachInst::Not { dst, .. } => reg_of(dst, &mut v),
+        MachInst::Shift { amount, dst, .. } => {
+            op_of(amount, &mut v);
+            reg_of(dst, &mut v);
+        }
+        MachInst::ShiftX { count, src, .. } => {
+            reg_of(count, &mut v);
+            reg_of(src, &mut v);
+        }
+        MachInst::Rorx { src, .. } => reg_of(src, &mut v),
+        MachInst::Lea { base, index, .. } => {
+            reg_of(base, &mut v);
+            if let Some((r, _)) = index {
+                reg_of(r, &mut v);
+            }
+        }
+        MachInst::LeaSym { .. } | MachInst::LeaSlot { .. } => {}
+        MachInst::Cqto { .. } => v.push(RAX.0),
+        MachInst::XorRdx => {}
+        MachInst::Div { divisor, .. } => {
+            op_of(divisor, &mut v);
+            v.push(RAX.0);
+            v.push(RDX.0);
+        }
+        MachInst::Cmp { lhs, rhs, .. } | MachInst::Test { lhs, rhs, .. } => {
+            op_of(lhs, &mut v);
+            op_of(rhs, &mut v);
+        }
+        MachInst::SetCC { dst, .. } => {
+            // setcc writes only the low byte; the remaining bits preserve the
+            // old register image.
+            reg_of(dst, &mut v);
+        }
+        MachInst::Cmov { src, dst, .. } => {
+            op_of(src, &mut v);
+            reg_of(dst, &mut v);
+        }
+        MachInst::Call { .. } => {
+            // The untyped call has no argument metadata. Its ABI-visible
+            // caller-save registers may carry arguments (including %al for a
+            // variadic call), so retain the conservative read set here.
+            v.extend([RAX.0, RCX.0, RDX.0, RDI.0, RSI.0, R8.0, R9.0, R10.0, R11.0]);
+        }
+        MachInst::CallTyped {
+            caller_saves,
+            args,
+            target,
+            gp_arg_count,
+            ret,
+            ..
+        } => {
+            for (reg, _) in caller_saves {
+                v.push(reg.0);
+            }
+            for arg in args {
+                op_of(&arg.src, &mut v);
+            }
+            let arg_count = gp_arg_count.unwrap_or(SYSCALL_ARG_REGS.len() as u8) as usize;
+            for &reg in SYSCALL_ARG_REGS.iter().take(arg_count) {
+                v.push(reg.0);
+            }
+            if let CallTarget::Indirect(reg) = target {
+                v.push(reg.0);
+            }
+            if let Some(ret) = ret {
+                match &ret.dst {
+                    MachOperand::Reg(reg) if matches!(ret.size, OpSize::S8 | OpSize::S16) => {
+                        // A narrow return move preserves the destination's
+                        // upper bits, so it is not a pure overwrite.
+                        reg_of(reg, &mut v);
+                    }
+                    _ => address_of(&ret.dst, &mut v),
+                }
+            }
+        }
+        MachInst::Ret => v.push(RAX.0),
+        MachInst::Raw(_) => {
+            // Raw text is intentionally opaque. Returning the whole physical
+            // namespace makes this helper fail closed if a future caller uses
+            // it without the flags barrier that currently rejects Raw.
+            v.extend(0..=55);
+        }
+        MachInst::Jcc { .. } | MachInst::Jmp { .. } | MachInst::Label(_) => {}
     }
     v
 }

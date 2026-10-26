@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ============================================================================
-# oracle_toolchains_from_tags.sh — restore the pinned reference-compiler
-# oracles from the repository's transport tags and reviewed release-asset lock
-# (no vendor downloads; release assets require GitHub CDN access).
+# oracle_toolchains_from_tags.sh — restore GCC/mold/binutils from the
+# repository's verified transport tags and install the pinned current Clang
+# and Rust from the reviewed content-addressed release-asset lock.
 #
 # WHY THIS EXISTS
 # ---------------
@@ -15,19 +15,18 @@
 # long time building one. Neither is acceptable when the point of the gate is
 # to be run.
 #
-# The payloads are already in this repository: the transport tags
-# `harness-cache-1` (GCC 16 x86-64 prefix, mold, binutils sources) and
-# the content-addressed Rust/Clang release assets exist precisely to
-# move these bytes to a constrained host. Each tag carries a `MANIFEST.sha256`,
-# so restoring from it is verifiable offline and end-to-end: the bytes that
-# leave the tag are checked against the digest committed beside them, and the
-# extracted tool is then *run* to print its version. A restore that produces a
-# binary of the right name and the wrong version is a failed restore.
+# `harness-cache-1` carries GCC/mold/binutils, verified against its manifest.
+# The historical harness-cache-4 source tree contains Clang 23.1.3, not 23.1.4.
+# Rust 1.99.1 and Clang 23.1.4 use engineering/toolchains/cache-lock.json,
+# whose reviewed hashes describe content-addressed release assets. No source
+# tag is relabelled. Online restoration needs GitHub's asset CDN; explicit
+# offline verification never invokes a transport or writes the prefix.
 #
 # WHAT IT DOES NOT DO
 # -------------------
-# * It never silently substitutes a different compiler for a missing one. A
-#   missing payload is an error with the tag and member named.
+# * It never silently substitutes a different compiler. Tag payloads must
+#   match their recorded digest; Clang must match the official installer hash
+#   and the requested version.
 # * It does not build binutils from `binutils-2.47.tar.xz` unless asked
 #   (--with-binutils), because a from-source binutils build is ~10 minutes on
 #   the two-core research host and almost no gate needs it. The tarball is
@@ -40,9 +39,10 @@
 #
 #     --prefix DIR      install root (default: ${LCCC_ORACLE_PREFIX:-/opt/oracles})
 #     --bin-dir DIR     where the PATH shims go (default: /usr/local/bin)
-#     --no-shims        extract into --prefix only; print the env file path
+#     --no-shims        install under --prefix only; print the env file path
 #     --with-binutils   also build+install binutils 2.47 (slow)
 #     --verify-only     check an existing install and exit
+#     --offline         verify an existing install; never materialise or download
 #     -h, --help        this text
 #
 # EXIT STATUS
@@ -55,6 +55,12 @@
 # The script is idempotent: an existing install whose tools answer with the
 # pinned versions is left untouched (and reported as reused), so calling it on
 # every session start costs one `--version` per tool.
+#
+# Offline is explicit, not inferred from a failed download.  `--offline`
+# performs only local version probes against --prefix and exits with a named
+# missing-oracle error; it never reads a tag payload and never invokes the
+# Rust/Clang restore helper. An online run may reuse verified local payloads
+# or download the exact locked Rust/Clang assets.
 # ============================================================================
 set -euo pipefail
 
@@ -65,6 +71,7 @@ BIN_DIR=/usr/local/bin
 WITH_SHIMS=1
 WITH_BINUTILS=0
 VERIFY_ONLY=0
+OFFLINE=0
 
 # The pins. These are the versions the gates name; a tag that carries a
 # different version is a provisioning error, not a new default.
@@ -81,17 +88,14 @@ while [ $# -gt 0 ]; do
         --no-shims) WITH_SHIMS=0; shift ;;
         --with-binutils) WITH_BINUTILS=1; shift ;;
         --verify-only) VERIFY_ONLY=1; shift ;;
-        -h|--help) sed -n '2,70p' "$0"; exit 0 ;;
+        --offline) OFFLINE=1; shift ;;
+        -h|--help) sed -n '2,80p' "$0"; exit 0 ;;
         *) echo "oracle_toolchains_from_tags: unknown argument: $1" >&2; exit 2 ;;
     esac
 done
 
 log() { printf '[oracles] %s\n' "$*"; }
 die() { printf '[oracles] FATAL: %s\n' "$*" >&2; exit 1; }
-
-for tool in git sha256sum tar xz python3 curl; do
-    command -v "$tool" >/dev/null 2>&1 || die "required host tool missing: $tool"
-done
 
 # ---- tag payload table ------------------------------------------------------
 # tag:member:sha256-of-the-member. The digest is repeated here rather than read
@@ -153,13 +157,9 @@ manifest_crosscheck() {  # manifest_crosscheck <tag> <member> <sha>
 }
 
 # ---- install layout ---------------------------------------------------------
-mkdir -p "$PREFIX" || die "cannot create prefix $PREFIX (use --prefix DIR)"
-DL=$PREFIX/dl
 GCC_ROOT=$PREFIX/gcc-$GCC_VERSION
 CLANG_ROOT=$PREFIX/clang-$CLANG_VERSION
 RUST_ROOT=$PREFIX/rust-$RUST_VERSION
-mkdir -p "$DL"
-
 gcc_bin=$GCC_ROOT/bin/gcc-16
 clang_bin=$CLANG_ROOT/bin/clang-23
 
@@ -174,16 +174,28 @@ probe_version() {  # probe_version <binary> <pattern> <label> ; prints the line
 }
 
 # ============================================================================
-# Path 1: verify-only
+# Explicit offline path: probes only the existing prefix.  Do this before
+# requiring git, tar, xz, or curl so a disconnected/minimal verification host
+# gets the real missing-oracle diagnostic rather than a misleading transport
+# prerequisite failure.
 # ============================================================================
-if [ "$VERIFY_ONLY" = 1 ]; then
+if [ "$OFFLINE" = 1 ] || [ "$VERIFY_ONLY" = 1 ]; then
+    log "verification mode: refusing tag materialisation and toolchain downloads"
     probe_version "$gcc_bin" "GCC) $GCC_VERSION" "gcc-16" >/dev/null
     probe_version "$clang_bin" "version $CLANG_VERSION " "clang-23" >/dev/null
     probe_version "$RUST_ROOT/bin/rustc" "rustc $RUST_VERSION " "rustc" >/dev/null
     probe_version "$PREFIX/bin/mold" "$MOLD_VERSION" "mold" >/dev/null
-    log "verify-only: gcc-16 $GCC_VERSION, clang-23 $CLANG_VERSION, Rust $RUST_VERSION, mold $MOLD_VERSION all present"
+    log "offline verification: gcc-16 $GCC_VERSION, clang-23 $CLANG_VERSION, Rust $RUST_VERSION, mold $MOLD_VERSION all present"
     exit 0
 fi
+
+for tool in git sha256sum tar xz python3 curl; do
+    command -v "$tool" >/dev/null 2>&1 || die "required host tool missing: $tool"
+done
+
+mkdir -p "$PREFIX" || die "cannot create prefix $PREFIX (use --prefix DIR)"
+DL=$PREFIX/dl
+mkdir -p "$DL"
 
 # ============================================================================
 # Path 2: restore
@@ -209,8 +221,7 @@ restore_toolchain() {  # restore_toolchain <tag> <member> <sha> <root> <label>
 }
 
 restore_toolchain "$TAG_GCC" "$GCC_MEMBER" "$GCC_SHA" "$GCC_ROOT" "gcc-$GCC_VERSION"
-# The historical Clang tag member is 23.1.3, not 23.1.4. Never relabel its
-# digest as the new release. The reviewed lock pins the exact new assets.
+# Restore only the published exact-version payloads after hash verification.
 python3 "$REPO/scripts/restore_toolchain_cache.py" --prefix "$PREFIX"
 
 # mold is a single static binary: verify it in place rather than extracting.
@@ -324,7 +335,7 @@ envfile=$PREFIX/env.sh
     printf 'export MOLD=%q\n' "$PREFIX/bin/mold"
     printf 'export RUSTC=%q\n' "$RUST_ROOT/bin/rustc"
     printf 'export CARGO=%q\n' "$RUST_ROOT/bin/cargo"
-    printf 'export PATH=%q:"$PATH"\n' "$BIN_DIR"
+    printf 'export PATH=%q:%q:%q:%q:%q:"$PATH"\n' "$RUST_ROOT/bin" "$CLANG_ROOT/bin" "$GCC_ROOT/bin" "$PREFIX/bin" "$BIN_DIR"
 } > "$envfile"
 log "env file: $envfile"
 log 'done.'

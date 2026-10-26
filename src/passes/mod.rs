@@ -3801,7 +3801,8 @@ pub(crate) fn run_passes(
     // inside loops (see reassoc_latency.rs): the operands of a single-use
     // Add/And/Or/Xor tree are recombined in order of availability, so the
     // loop-carried operand is added last (SHA-256's t1: 8 -> 5 ops on the
-    // e->e recurrence). ORDER: after every range/overflow-reasoning pass
+    // e->e recurrence). A separately gated x86-64 terminal-return extension
+    // handles only wrapping Add trees. ORDER: after every range/overflow-reasoning pass
     // (IV widening, CVP, SCCP) -- the soundness argument for signed sums --
     // and after the unroller and vectorizers, whose matchers expect source
     // shape; before the FMA peel, which stays the last IR transform. Pass
@@ -3811,7 +3812,14 @@ pub(crate) fn run_passes(
         verify::verify_after_pass(module, "pair_load_carry");
     }
     if !pass_disabled(&disabled, "reassoc_lat") {
-        module.for_each_function(reassoc_latency::run_function);
+        // The straight-line extension is intentionally narrow: only x86-64,
+        // terminal-return wrapping Add trees, with a block-local pressure gate.
+        // Resolve the bisection knob once per module, not in each function.
+        let straightline_enabled = target == crate::backend::Target::X86_64
+            && std::env::var_os("CCC_NO_REASSOC_STRAIGHTLINE").is_none();
+        module.for_each_function(|function| {
+            reassoc_latency::run_function_with_straightline(function, straightline_enabled)
+        });
         verify::verify_after_pass(module, "reassoc_lat");
     }
 

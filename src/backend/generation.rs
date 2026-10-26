@@ -4212,7 +4212,8 @@ pub fn generate_module(
 
     let referenced_symbols = collect_referenced_symbols(module);
     emit_extern_visibility_directives(cg, module, &referenced_symbols);
-    emit_functions_and_sections(cg, module, source_mgr, &file_table);
+    let ipa_reorder = cg.ipa_reorder_functions();
+    emit_functions_and_sections(cg, module, source_mgr, &file_table, ipa_reorder);
     emit_aliases(cg, module);
     emit_symver_directives(cg, module);
     emit_symbol_attrs(cg, module, &referenced_symbols);
@@ -4577,16 +4578,51 @@ fn emit_functions_and_sections(
     module: &IrModule,
     source_mgr: Option<&crate::common::source::SourceManager>,
     file_table: &FxHashMap<String, u32>,
+    ipa_reorder: bool,
 ) {
     let function_sections = cg.state().function_sections;
     if !function_sections {
         cg.state().emit(".text");
         cg.state().current_text_section = ".text".to_string();
     }
+    // Direct callees are emitted first when x86 IPA-RA is active.  This does
+    // not change the order of unrelated functions, but it turns the summary
+    // lookup from an emission-order lottery into a stable dependency order:
+    // every acyclic local callee is available before its caller's prologue is
+    // allocated. Recursive components remain fail-closed in ipa_ra.
+    let order = if ipa_reorder {
+        let mut by_name: FxHashMap<&str, usize> = FxHashMap::default();
+        for (index, func) in module.functions.iter().enumerate() {
+            if !func.is_declaration && !func.is_gnu_inline_def {
+                by_name.insert(func.name.as_str(), index);
+                if let Some(asm_name) = module.asm_labels.get(&func.name) {
+                    by_name.insert(asm_name.as_str(), index);
+                }
+            }
+        }
+        let mut deps = vec![Vec::new(); module.functions.len()];
+        for (index, func) in module.functions.iter().enumerate() {
+            for inst in func.blocks.iter().flat_map(|block| &block.instructions) {
+                let crate::ir::reexports::Instruction::Call { func: callee, .. } = inst else {
+                    continue;
+                };
+                let Some(&callee_index) = by_name.get(callee.as_str()) else {
+                    continue;
+                };
+                if callee_index != index && !deps[index].contains(&callee_index) {
+                    deps[index].push(callee_index);
+                }
+            }
+        }
+        crate::backend::x86::codegen::ipa_ra::callee_first_order(&deps)
+    } else {
+        (0..module.functions.len()).collect()
+    };
     // Dual-layout selection records are keyed by function name and CONSUMED
     // (taken) by the emission loop below, so the side channel drains as the
     // module is emitted and cannot leak into a later translation unit.
-    for func in &module.functions {
+    for function_index in order {
+        let func = &module.functions[function_index];
         // GNU89/gnu_inline: `extern inline __attribute__((gnu_inline))`
         // bodies exist ONLY for inlining. Match GCC: never emit a standalone
         // copy (glibc _FORTIFY_SOURCE wrappers lose va_arg_pack otherwise).
