@@ -352,6 +352,7 @@ pub struct Driver {
     pub(super) enable_avx512er: bool,
     pub(super) enable_avx512pf: bool,
     pub(super) enable_avx512vp2intersect: bool,
+    pub(super) enable_avx512bmm: bool,
     // AVX-VNNI / AVX10 / AVX-IFMA / AVX-NE-CONVERT / GFNI / VAES / VPCLMULQDQ
     pub(super) enable_avxvnni: bool,
     pub(super) enable_avxifma: bool,
@@ -676,6 +677,7 @@ impl Driver {
             enable_avx512er: false,
             enable_avx512pf: false,
             enable_avx512vp2intersect: false,
+            enable_avx512bmm: false,
             enable_avxvnni: false,
             enable_avxifma: false,
             enable_avxneconvert: false,
@@ -1792,6 +1794,7 @@ impl Driver {
             simd_macros_enabled && self.enable_avx512er,
             simd_macros_enabled && self.enable_avx512pf,
             simd_macros_enabled && self.enable_avx512vp2intersect,
+            simd_macros_enabled && self.enable_avx512bmm,
             simd_macros_enabled && self.enable_avxvnni,
             simd_macros_enabled && self.enable_avxifma,
             simd_macros_enabled && self.enable_avxneconvert,
@@ -3690,6 +3693,16 @@ impl Driver {
             avx512_base && self.enable_avx512vpopcntdq,
             F::Avx512Vpopcntdq,
         );
+        set.insert_if(avx512_base && self.enable_avx512cd, F::Avx512Cd);
+        set.insert_if(avx512_base && self.enable_avx512ifma, F::Avx512Ifma);
+        set.insert_if(avx512_base && self.enable_avx512vbmi, F::Avx512Vbmi);
+        set.insert_if(avx512_base && self.enable_avx512vbmi2, F::Avx512Vbmi2);
+        set.insert_if(avx512_base && self.enable_avx512bf16, F::Avx512Bf16);
+        set.insert_if(avx512_base && self.enable_avx512fp16, F::Avx512Fp16);
+        set.insert_if(avx512_base && self.enable_avx512vp2intersect, F::Avx512Vp2intersect);
+        set.insert_if(avx512_base && self.enable_avx512er, F::Avx512Er);
+        set.insert_if(avx512_base && self.enable_avx512pf, F::Avx512Pf);
+        set.insert_if(avx512_base && self.enable_avx512bmm, F::Avx512Bmm);
 
         // Integer ISA: the resolved predicates already encode the default
         // grant, the `-march` ceiling and the sticky denials — the same

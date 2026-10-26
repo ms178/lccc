@@ -258,6 +258,7 @@ impl Driver {
         self.enable_avx512er = false;
         self.enable_avx512pf = false;
         self.enable_avx512vp2intersect = false;
+        self.enable_avx512bmm = false;
         self.enable_avxvnni = false;
         self.enable_avxifma = false;
         self.enable_avxneconvert = false;
@@ -316,6 +317,7 @@ impl Driver {
             "-mavx512er" => &mut self.enable_avx512er,
             "-mavx512pf" => &mut self.enable_avx512pf,
             "-mavx512vp2intersect" => &mut self.enable_avx512vp2intersect,
+            "-mavx512bmm" => &mut self.enable_avx512bmm,
             "-mavxvnni" => &mut self.enable_avxvnni,
             _ => return false,
         };
@@ -587,6 +589,7 @@ impl Driver {
             "-mno-avx512er" => self.enable_avx512er = false,
             "-mno-avx512pf" => self.enable_avx512pf = false,
             "-mno-avx512vp2intersect" => self.enable_avx512vp2intersect = false,
+            "-mno-avx512bmm" => self.enable_avx512bmm = false,
             "-mno-avx10.1" => self.enable_avx10_1 = false,
             "-mno-avx10.2" => self.enable_avx10_2 = false,
             "-mno-gfni" => self.enable_gfni = false,

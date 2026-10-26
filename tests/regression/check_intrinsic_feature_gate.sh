@@ -532,11 +532,17 @@ EOF
 cat >"$tmp/avx512_fma_runtime.c" <<'EOF'
 #include <immintrin.h>
 __attribute__((noinline)) static float f32(float a, float b, float c) {
-    __m512 x = _mm512_set1_ps(a), y = _mm512_set1_ps(b), z = _mm512_set1_ps(c);
+    /* Use vector initializers: the feature-gate test should depend only on
+       the FMA helpers under test, not on optional broadcast helper coverage. */
+    __m512 x = {a,a,a,a,a,a,a,a,a,a,a,a,a,a,a,a};
+    __m512 y = {b,b,b,b,b,b,b,b,b,b,b,b,b,b,b,b};
+    __m512 z = {c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c};
     return _mm512_fmadd_ps(x, y, z)[0];
 }
 __attribute__((noinline)) static double f64(double a, double b, double c) {
-    __m512d x = _mm512_set1_pd(a), y = _mm512_set1_pd(b), z = _mm512_set1_pd(c);
+    __m512d x = {a,a,a,a,a,a,a,a};
+    __m512d y = {b,b,b,b,b,b,b,b};
+    __m512d z = {c,c,c,c,c,c,c,c};
     return _mm512_fmadd_pd(x, y, z)[0];
 }
 int main(void) {

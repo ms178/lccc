@@ -8072,6 +8072,7 @@ impl ArchCodegen for X86Codegen {
                         | "avx512er"
                         | "avx512pf"
                         | "avx512vp2intersect"
+                        | "avx512bmm"
                         | "arch=x86-64-v4"
                         | "arch=skylake-avx512"
                         | "arch=cascadelake"

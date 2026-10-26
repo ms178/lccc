@@ -84,6 +84,21 @@ EOF
 "$CCC" -fhosted -fsyntax-only "$td/hosted.c"
 "$CCC" -ffreestanding -fsyntax-only "$td/freestanding.c"
 "$CCC" -fno-builtin -fsyntax-only "$td/hosted.c"
+
+# GCC 16.2 exposes the AVX512BMM subset; its feature macro must follow the
+# per-feature last-option-wins state without coupling to AVX512F denial.
+"$CCC" -dM -E -mavx512bmm -x c /dev/null >"$td/bmm-on.macros"
+grep -q '^#define __AVX512BMM__ 1$' "$td/bmm-on.macros"
+grep -q '^#define __AVX512F__ 1$' "$td/bmm-on.macros"
+"$CCC" -dM -E -mavx512bmm -mno-avx512bmm -x c /dev/null >"$td/bmm-off.macros"
+if grep -q '^#define __AVX512BMM__ ' "$td/bmm-off.macros"; then
+    echo "FAIL: -mno-avx512bmm did not revoke only the BMM permission" >&2
+    exit 1
+fi
+grep -q '^#define __AVX512F__ 1$' "$td/bmm-off.macros"
+"$CCC" -dM -E -mavx512bmm -mno-avx512bmm -mavx512bmm -x c /dev/null >"$td/bmm-last-on.macros"
+grep -q '^#define __AVX512BMM__ 1$' "$td/bmm-last-on.macros"
+
 cat > "$td/hosted-override.c" <<'EOF'
 #if __STDC_HOSTED__ != 0
 #error "a user -D must override the predefined __STDC_HOSTED__ value"

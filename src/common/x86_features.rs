@@ -157,11 +157,31 @@ pub enum X86Feature {
     Avx512BitAlg,
     /// AVX-512 Vector Population Count (dword/qword forms).
     Avx512Vpopcntdq,
+    /// AVX-512 Conflict Detection.
+    Avx512Cd,
+    /// AVX-512 Integer Fused Multiply Add.
+    Avx512Ifma,
+    /// AVX-512 Vector Byte Manipulation Instructions.
+    Avx512Vbmi,
+    /// AVX-512 Vector Byte Manipulation Instructions 2.
+    Avx512Vbmi2,
+    /// AVX-512 Bfloat16 instructions.
+    Avx512Bf16,
+    /// AVX-512 FP16 instructions.
+    Avx512Fp16,
+    /// AVX-512 Bit Matrix Multiply (GCC 16.2 feature).
+    Avx512Bmm,
+    /// AVX-512 Vector Pair Intersection.
+    Avx512Vp2intersect,
+    /// AVX-512 Exponential and Reciprocal Approximation (legacy).
+    Avx512Er,
+    /// AVX-512 Prefetch Instructions (legacy).
+    Avx512Pf,
 }
 
 impl X86Feature {
     /// Every tracked feature, for table-driven tests.
-    pub const ALL: [X86Feature; 35] = [
+    pub const ALL: [X86Feature; 45] = [
         X86Feature::Cmov,
         X86Feature::Fxsr,
         X86Feature::Mmx,
@@ -197,6 +217,16 @@ impl X86Feature {
         X86Feature::Avx512Vnni,
         X86Feature::Avx512BitAlg,
         X86Feature::Avx512Vpopcntdq,
+        X86Feature::Avx512Cd,
+        X86Feature::Avx512Ifma,
+        X86Feature::Avx512Vbmi,
+        X86Feature::Avx512Vbmi2,
+        X86Feature::Avx512Bf16,
+        X86Feature::Avx512Fp16,
+        X86Feature::Avx512Bmm,
+        X86Feature::Avx512Vp2intersect,
+        X86Feature::Avx512Er,
+        X86Feature::Avx512Pf,
     ];
 
     /// Canonical GCC spelling of the feature (the one `-m` flags use).
@@ -237,6 +267,16 @@ impl X86Feature {
             X86Feature::Avx512Vnni => "avx512vnni",
             X86Feature::Avx512BitAlg => "avx512bitalg",
             X86Feature::Avx512Vpopcntdq => "avx512vpopcntdq",
+            X86Feature::Avx512Cd => "avx512cd",
+            X86Feature::Avx512Ifma => "avx512ifma",
+            X86Feature::Avx512Vbmi => "avx512vbmi",
+            X86Feature::Avx512Vbmi2 => "avx512vbmi2",
+            X86Feature::Avx512Bf16 => "avx512bf16",
+            X86Feature::Avx512Fp16 => "avx512fp16",
+            X86Feature::Avx512Bmm => "avx512bmm",
+            X86Feature::Avx512Vp2intersect => "avx512vp2intersect",
+            X86Feature::Avx512Er => "avx512er",
+            X86Feature::Avx512Pf => "avx512pf",
         }
     }
 
@@ -284,6 +324,16 @@ impl X86Feature {
             "avx512vnni" => X86Feature::Avx512Vnni,
             "avx512bitalg" => X86Feature::Avx512BitAlg,
             "avx512vpopcntdq" => X86Feature::Avx512Vpopcntdq,
+            "avx512cd" => X86Feature::Avx512Cd,
+            "avx512ifma" => X86Feature::Avx512Ifma,
+            "avx512vbmi" => X86Feature::Avx512Vbmi,
+            "avx512vbmi2" => X86Feature::Avx512Vbmi2,
+            "avx512bf16" => X86Feature::Avx512Bf16,
+            "avx512fp16" => X86Feature::Avx512Fp16,
+            "avx512bmm" => X86Feature::Avx512Bmm,
+            "avx512vp2intersect" => X86Feature::Avx512Vp2intersect,
+            "avx512er" => X86Feature::Avx512Er,
+            "avx512pf" => X86Feature::Avx512Pf,
             _ => return None,
         })
     }
@@ -404,8 +454,6 @@ mod tests {
             "xsave",
             "xsaveopt",
             "avx512gfni",
-            "avx512ifma",
-            "avx512vbmi",
             "amx_tile",
             "xop",
             "sse4a",
@@ -429,6 +477,16 @@ mod tests {
             (X86Feature::Avx512Vnni, "avx512vnni"),
             (X86Feature::Avx512BitAlg, "avx512bitalg"),
             (X86Feature::Avx512Vpopcntdq, "avx512vpopcntdq"),
+            (X86Feature::Avx512Cd, "avx512cd"),
+            (X86Feature::Avx512Ifma, "avx512ifma"),
+            (X86Feature::Avx512Vbmi, "avx512vbmi"),
+            (X86Feature::Avx512Vbmi2, "avx512vbmi2"),
+            (X86Feature::Avx512Bf16, "avx512bf16"),
+            (X86Feature::Avx512Fp16, "avx512fp16"),
+            (X86Feature::Avx512Bmm, "avx512bmm"),
+            (X86Feature::Avx512Vp2intersect, "avx512vp2intersect"),
+            (X86Feature::Avx512Er, "avx512er"),
+            (X86Feature::Avx512Pf, "avx512pf"),
         ] {
             assert_eq!(X86Feature::parse(name), Some(feature));
             assert_eq!(feature.name(), name);
@@ -443,6 +501,16 @@ mod tests {
                 X86Feature::Avx512Vnni,
                 X86Feature::Avx512BitAlg,
                 X86Feature::Avx512Vpopcntdq,
+                X86Feature::Avx512Cd,
+                X86Feature::Avx512Ifma,
+                X86Feature::Avx512Vbmi,
+                X86Feature::Avx512Vbmi2,
+                X86Feature::Avx512Bf16,
+                X86Feature::Avx512Fp16,
+                X86Feature::Avx512Bmm,
+                X86Feature::Avx512Vp2intersect,
+                X86Feature::Avx512Er,
+                X86Feature::Avx512Pf,
             ] {
                 if other != feature {
                     assert!(!set.contains(other), "{name} answered for {:?}", other);

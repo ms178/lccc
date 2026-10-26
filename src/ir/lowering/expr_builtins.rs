@@ -2800,6 +2800,7 @@ impl Lowerer {
                             | "avx512er"
                             | "avx512pf"
                             | "avx512vp2intersect"
+                            | "avx512bmm"
                     )
                 {
                     permitted = true;

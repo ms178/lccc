@@ -727,6 +727,16 @@ impl Lowerer {
                     | crate::common::x86_features::X86Feature::Avx512Vnni
                     | crate::common::x86_features::X86Feature::Avx512BitAlg
                     | crate::common::x86_features::X86Feature::Avx512Vpopcntdq
+                    | crate::common::x86_features::X86Feature::Avx512Cd
+                    | crate::common::x86_features::X86Feature::Avx512Ifma
+                    | crate::common::x86_features::X86Feature::Avx512Vbmi
+                    | crate::common::x86_features::X86Feature::Avx512Vbmi2
+                    | crate::common::x86_features::X86Feature::Avx512Bf16
+                    | crate::common::x86_features::X86Feature::Avx512Fp16
+                    | crate::common::x86_features::X86Feature::Avx512Bmm
+                    | crate::common::x86_features::X86Feature::Avx512Vp2intersect
+                    | crate::common::x86_features::X86Feature::Avx512Er
+                    | crate::common::x86_features::X86Feature::Avx512Pf
             )
         });
         if self.target == crate::backend::Target::I686 && uses_avx512 {

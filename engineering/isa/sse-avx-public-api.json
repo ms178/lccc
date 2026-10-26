@@ -19009,6 +19009,8 @@
     "shaintrin.h",
     "fmaintrin.h",
     "avx512fintrin.h",
+    "avx512bmmintrin.h",
+    "avx512bmmvlintrin.h",
     "lcccsimd.h"
   ],
   "status": "inventory-only; no instruction/manual/runtime sign-off implied",
