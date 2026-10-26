@@ -233,7 +233,10 @@ impl Block {
         let bias: i64 = (1i64 << self.k) - 1;
         let indent = "    ";
         let new_lines = [
-            format!("{indent}test{} {}, {}", self.width, self.x_spelling, self.x_spelling),
+            format!(
+                "{indent}test{} {}, {}",
+                self.width, self.x_spelling, self.x_spelling
+            ),
             format!(
                 "{indent}lea{} {bias}({}), {}",
                 self.width, self.base_spelling, self.t_spelling
@@ -527,7 +530,10 @@ mod tests {
             "    sarl $3, %edi\n",
             "    ret\n",
         )));
-        assert!(out.contains("leal (%rdi, %rsi), %edi"), "identity kept:\n{out}");
+        assert!(
+            out.contains("leal (%rdi, %rsi), %edi"),
+            "identity kept:\n{out}"
+        );
         assert!(!out.contains("cmovns"), "{out}");
     }
 

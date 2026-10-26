@@ -493,8 +493,14 @@ mod tests {
             "    movl %edi, %eax\n",
             "    ret\n",
         )));
-        assert!(!out.contains("movl %edi, %eax"), "return copy retired:\n{out}");
-        assert!(out.contains("leal (%rdi,%rsi), %eax"), "3-address root:\n{out}");
+        assert!(
+            !out.contains("movl %edi, %eax"),
+            "return copy retired:\n{out}"
+        );
+        assert!(
+            out.contains("leal (%rdi,%rsi), %eax"),
+            "3-address root:\n{out}"
+        );
         assert!(out.contains("sarl $3, %eax"), "chain renamed:\n{out}");
         // The sign materialisation above the root stays untouched.
         assert!(out.contains("movl %edi, %esi"), "{out}");
@@ -601,7 +607,10 @@ mod tests {
         assert!(!out.contains("movl %edi, %eax"), "copy retired:\n{out}");
         assert!(out.contains("setl %dil"), "setcc survives:\n{out}");
         assert!(out.contains("movzbl %dil, %eax"), "root re-issued:\n{out}");
-        assert!(out.contains("addl %esi, %edi"), "below-window add intact:\n{out}");
+        assert!(
+            out.contains("addl %esi, %edi"),
+            "below-window add intact:\n{out}"
+        );
     }
 
     #[test]
@@ -769,7 +778,10 @@ mod tests {
             "    ret\n",
         )));
         assert!(out.contains("movl %r11d, %eax"), "copy kept:\n{out}");
-        assert!(!out.contains("addq %rbx, %rax"), "no 64-bit re-issue:\n{out}");
+        assert!(
+            !out.contains("addq %rbx, %rax"),
+            "no 64-bit re-issue:\n{out}"
+        );
     }
 
     #[test]
@@ -797,7 +809,10 @@ mod tests {
             "    movq %rbx, %rax\n",
             "    ret\n",
         )));
-        assert!(out.contains("movzbl %al, %bl"), "extender untouched:\n{out}");
+        assert!(
+            out.contains("movzbl %al, %bl"),
+            "extender untouched:\n{out}"
+        );
         assert!(out.contains("movq %rbx, %rax"), "copy kept:\n{out}");
     }
 
@@ -811,7 +826,10 @@ mod tests {
             "    ret\n",
         )));
         assert!(!out.contains("movl %r9d, %eax"), "copy retired:\n{out}");
-        assert!(out.contains("leal (%r9,%r11), %eax"), "width-down lea:\n{out}");
+        assert!(
+            out.contains("leal (%r9,%r11), %eax"),
+            "width-down lea:\n{out}"
+        );
         assert!(!out.contains("leaq"), "no 64-bit re-issue:\n{out}");
     }
 

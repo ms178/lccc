@@ -219,21 +219,35 @@ pub(crate) fn div_by_const_function(func: &mut IrFunction) -> usize {
         // retires the orphaned magic.  Pre-pass: operand retarget only, the
         // expansion loop below still sees and expands the outer remainder.
         {
-            let mut last_def: std::collections::HashMap<Value, (usize, IrBinOp, Operand, i64, IrType)> =
-                std::collections::HashMap::new();
+            let mut last_def: std::collections::HashMap<
+                Value,
+                (usize, IrBinOp, Operand, i64, IrType),
+            > = std::collections::HashMap::new();
             let mut rewrites: Vec<(usize, Operand)> = Vec::new();
             for (idx, inst) in block.instructions.iter().enumerate() {
-                if let Instruction::BinOp { dest, op, lhs, rhs, ty } = inst {
+                if let Instruction::BinOp {
+                    dest,
+                    op,
+                    lhs,
+                    rhs,
+                    ty,
+                } = inst
+                {
                     let outer_const = match rhs {
                         Operand::Const(c) => c.to_i64(),
                         _ => None,
                     };
                     if matches!(op, IrBinOp::SRem | IrBinOp::URem) {
                         if let (Some(b), Operand::Value(inner)) = (outer_const, lhs) {
-                            if let Some((_, inner_op, inner_lhs, a, inner_ty)) = last_def.get(&inner) {
+                            if let Some((_, inner_op, inner_lhs, a, inner_ty)) =
+                                last_def.get(&inner)
+                            {
                                 if *inner_op == *op
                                     && *inner_ty == *ty
-                                    && matches!(inner_ty, IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64)
+                                    && matches!(
+                                        inner_ty,
+                                        IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64
+                                    )
                                     && *a > 0
                                     && b > 0
                                     && *a % b == 0
@@ -2646,7 +2660,13 @@ mod nested_remainder_tests {
         };
         for inst in insts {
             let (d, v) = match inst {
-                Instruction::BinOp { dest, op, lhs, rhs, ty } => {
+                Instruction::BinOp {
+                    dest,
+                    op,
+                    lhs,
+                    rhs,
+                    ty,
+                } => {
                     let (a, b) = (read(&env, lhs), read(&env, rhs));
                     let raw = match ty {
                         IrType::I32 | IrType::U32 => {
@@ -2670,9 +2690,9 @@ mod nested_remainder_tests {
                     };
                     (*dest, fit(raw, *ty))
                 }
-                Instruction::Cast { dest, src, to_ty, .. } => {
-                    (*dest, fit(read(&env, src), *to_ty))
-                }
+                Instruction::Cast {
+                    dest, src, to_ty, ..
+                } => (*dest, fit(read(&env, src), *to_ty)),
                 Instruction::Copy { dest, src } => (*dest, read(&env, src)),
                 other => panic!("unexpected instruction in mixed expansion: {other:?}"),
             };

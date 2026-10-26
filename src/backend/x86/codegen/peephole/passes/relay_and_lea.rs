@@ -7685,10 +7685,7 @@ mod tests {
 
     #[test]
     fn rmw_coalesce_refuses_shift_count_of_dest() {
-        let _skip = super::super::test_skips::skip_passes(&[
-            "chain_retarget",
-            "return_home",
-        ]);
+        let _skip = super::super::test_skips::skip_passes(&["chain_retarget", "return_home"]);
         // `shll %cl, %ecx`: the count register is FIXED by the ISA, so the
         // destination cannot be retargeted — renaming `%cl` emits invalid
         // x86 (`shll %r8b, ...`), and keeping it reads the stale pre-copy
@@ -7752,10 +7749,7 @@ mod tests {
     fn rmw_coalesce_refuses_source_read_by_consumer() {
         // Pins `coalesce_copy_into_rmw`'s refusal; the late chain rename
         // (own tests: `chain_rename_tests`) would rename the shape.
-        let _skip = super::super::test_skips::skip_passes(&[
-            "chain_retarget",
-            "return_home",
-        ]);
+        let _skip = super::super::test_skips::skip_passes(&["chain_retarget", "return_home"]);
         // The consumer reads the source (`andl %r8d, %r10d`): the source's
         // old value is live into the consumer, so the clobber cannot be
         // proven dead and the candidate must be refused. (The rename
@@ -7850,10 +7844,7 @@ mod tests {
     fn rmw_coalesce_refuses_zext_when_rdx_return_marker_set() {
         // Pins `coalesce_copy_into_rmw`'s refusal; the late chain rename
         // (own tests: `chain_rename_tests`) would rename the shape.
-        let _skip = super::super::test_skips::skip_passes(&[
-            "chain_retarget",
-            "return_home",
-        ]);
+        let _skip = super::super::test_skips::skip_passes(&["chain_retarget", "return_home"]);
         // The sound direction of the return-type fact: `# LCCC_RET_RDX 1`
         // (an i128 return) keeps `%rdx` live at `ret`, so the source's old
         // value cannot be proven dead and the pair must stay.
@@ -7875,10 +7866,7 @@ mod tests {
     fn rmw_coalesce_refuses_zext_copy_under_wide_mask() {
         // Pins `coalesce_copy_into_rmw`'s refusal; the late chain rename
         // (own tests: `chain_rename_tests`) would rename the shape.
-        let _skip = super::super::test_skips::skip_passes(&[
-            "chain_retarget",
-            "return_home",
-        ]);
+        let _skip = super::super::test_skips::skip_passes(&["chain_retarget", "return_home"]);
         // `$511` keeps bit 8, where the zero-extension (0) and the raw
         // source (garbage) disagree: folding would compute the wrong value.
         let out = run(concat!(
@@ -7898,10 +7886,7 @@ mod tests {
     fn rmw_coalesce_refuses_zext_copy_under_non_mask_consumer() {
         // Pins `coalesce_copy_into_rmw`'s refusal; the late chain rename
         // (own tests: `chain_rename_tests`) would rename the shape.
-        let _skip = super::super::test_skips::skip_passes(&[
-            "chain_retarget",
-            "return_home",
-        ]);
+        let _skip = super::super::test_skips::skip_passes(&["chain_retarget", "return_home"]);
         // `orl` does not kill the extension garbage (it ORs it in): only an
         // `andl` with a subsuming mask admits an extension copy.
         let out = run(concat!(

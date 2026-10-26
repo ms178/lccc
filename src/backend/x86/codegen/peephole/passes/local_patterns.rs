@@ -14324,9 +14324,7 @@ pub(super) fn fold_shift_into_sib(store: &mut LineStore, infos: &mut [LineInfo])
         } else {
             (sib(dst_fam), sib(shifted_fam))
         };
-        let new_line = format!(
-            "    lea{shift_w} ({base_reg}, {index_reg}, {scale}), {dst}"
-        );
+        let new_line = format!("    lea{shift_w} ({base_reg}, {index_reg}, {scale}), {dst}");
         replace_line(store, &mut infos[j], j, new_line);
         mark_nop(&mut infos[i]);
         dead.invalidate(store, infos, j);
@@ -14580,24 +14578,14 @@ mod shift_into_sib_tests {
     fn the_in_place_32_bit_pair_folds_into_a_leal() {
         // `shll $3, %edi; addl %esi, %edi` — the shifted register is the
         // add's destination.  `leal` zero-extends exactly like the pair did.
-        let out = run(&[
-            "shll $3, %edi",
-            "addl %esi, %edi",
-            "movl %edi, %eax",
-            "ret",
-        ]);
+        let out = run(&["shll $3, %edi", "addl %esi, %edi", "movl %edi, %eax", "ret"]);
         assert!(flat(&out).contains("leal (%rsi,%rdi,8),%edi"), "{out}");
         assert!(!out.contains("shll"), "{out}");
     }
 
     #[test]
     fn the_in_place_64_bit_pair_folds_into_a_leaq() {
-        let out = run(&[
-            "shlq $2, %rdi",
-            "addq %rsi, %rdi",
-            "movq %rdi, %rax",
-            "ret",
-        ]);
+        let out = run(&["shlq $2, %rdi", "addq %rsi, %rdi", "movq %rdi, %rax", "ret"]);
         assert!(flat(&out).contains("leaq (%rsi,%rdi,4),%rdi"), "{out}");
         assert!(!out.contains("shlq"), "{out}");
     }
@@ -14607,12 +14595,7 @@ mod shift_into_sib_tests {
         // Their form at 32 bits: the shifted register is the add's SOURCE,
         // the destination is the base — `leal` carries the same zero-extension
         // `shll`+`addl` produced.
-        let out = run(&[
-            "shll $3, %rcx",
-            "addl %rcx, %r9d",
-            "movl %r9d, %eax",
-            "ret",
-        ]);
+        let out = run(&["shll $3, %rcx", "addl %rcx, %r9d", "movl %r9d, %eax", "ret"]);
         assert!(flat(&out).contains("leal (%r9,%rcx,8),%r9d"), "{out}");
         assert!(!out.contains("shll"), "{out}");
     }
@@ -14622,12 +14605,7 @@ mod shift_into_sib_tests {
         // The window may not cross a reader of the shifted register: after
         // the fold the register holds the pre-shift value between the two
         // original positions.
-        let out = run(&[
-            "shll $3, %edi",
-            "movl %edi, %r8d",
-            "addl %esi, %edi",
-            "ret",
-        ]);
+        let out = run(&["shll $3, %edi", "movl %edi, %r8d", "addl %esi, %edi", "ret"]);
         assert!(out.contains("shll $3, %edi"), "{out}");
         assert!(!out.contains("leal"), "{out}");
     }

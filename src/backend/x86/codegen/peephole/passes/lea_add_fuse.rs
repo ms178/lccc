@@ -62,11 +62,7 @@ pub(super) fn run(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
 
 /// Detect the pair anchored at `lea_i`; returns the add's line index and the
 /// fused LEA text.
-fn fuse_pair(
-    store: &LineStore,
-    infos: &[LineInfo],
-    lea_i: usize,
-) -> Option<(usize, String)> {
+fn fuse_pair(store: &LineStore, infos: &[LineInfo], lea_i: usize) -> Option<(usize, String)> {
     if infos[lea_i].pinned || infos[lea_i].volatile_access {
         return None;
     }
