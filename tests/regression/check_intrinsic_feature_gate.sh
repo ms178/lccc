@@ -594,7 +594,7 @@ reject local_fma_no_leak.c -mfma -march=x86-64
 # GCC 16.2 is the authoritative verdict for feature flags, including each
 # independent subset and its VL conjunction. Older system GCC is not used as
 # an AVX-512 semantic oracle; run the exact compiler when the script is given.
-if "$gcc_bin" -dumpfullversion 2>/dev/null | grep -qx '16.2.0'; then
+if "$gcc_bin" -dumpfullversion 2>/dev/null | grep -x '16.2.0' >/dev/null; then
     for src in avx512_bw_vl.c avx512_ternlog_vl.c avx512_maskload_bw_vl.c avx512_dq.c avx512_bitalg.c avx512_vpopcnt.c avx512_vnni.c avx512_fma.c; do
         compare "$src" -march=x86-64
         compare "$src" -march=x86-64 -mavx512f -mavx512bw -mavx512dq -mavx512vl -mavx512bitalg -mavx512vpopcntdq -mavx512vnni
