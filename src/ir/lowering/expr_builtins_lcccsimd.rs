@@ -546,15 +546,9 @@ fn simd_feature_requirements(mnemonic: &str) -> Vec<SimdFeatureRequirement> {
         push_feature(&mut req, F::Avx512Bw, "-mavx512bw");
     }
 
-    // AVX512DQ is required for the qword absolute/min/max family. The other
-    // conversions present here are the AVX512F dword/float conversions; do
-    // not mistake the letters "dq" in their mnemonic for the DQ subset.
-    if ["vpabsq", "vpmaxsq", "vpminsq", "vpmaxuq", "vpminuq"]
-        .iter()
-        .any(|stem| mnemonic.starts_with(stem))
-    {
-        push_feature(&mut req, F::Avx512Dq, "-mavx512dq");
-    }
+    // The qword absolute/min/max operations exposed here are AVX512F (the
+    // `q` describes lane width, not the AVX512DQ subset). Keep DQ distinct
+    // for future helpers whose instruction pages actually require that bit.
 
     if mnemonic.starts_with("vpopcntb") || mnemonic.starts_with("vpopcntw") {
         push_feature(&mut req, F::Avx512BitAlg, "-mavx512bitalg");
@@ -890,7 +884,8 @@ mod legacy_permission_tests {
                 &[F::Avx512F, F::Avx512Bw, F::Avx512Vl],
             ),
             ("vmovdqu8_mask_store512", &[F::Avx512F, F::Avx512Bw]),
-            ("vpmaxsq512", &[F::Avx512F, F::Avx512Dq]),
+            ("vpmaxsq512", &[F::Avx512F]),
+            ("vpabsq512", &[F::Avx512F]),
             ("vpcmpeqb512", &[F::Avx512F, F::Avx512Bw]),
             ("vpcmpeqw512", &[F::Avx512F, F::Avx512Bw]),
             ("vpcmpgtb512", &[F::Avx512F, F::Avx512Bw]),

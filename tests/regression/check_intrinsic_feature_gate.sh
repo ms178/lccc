@@ -508,7 +508,7 @@ cat >"$tmp/avx512_maskload_bw_vl.c" <<'EOF'
 #include <immintrin.h>
 __m256i load(const void *p, __mmask32 k) { return _mm256_maskz_loadu_epi8(k, p); }
 EOF
-cat >"$tmp/avx512_dq.c" <<'EOF'
+cat >"$tmp/avx512_f_qword.c" <<'EOF'
 #include <immintrin.h>
 __m512i absq(__m512i a) { return _mm512_abs_epi64(a); }
 EOF
@@ -555,8 +555,8 @@ reject avx512_ternlog_vl.c -mavx512f -mno-avx512vl -march=x86-64
 accept avx512_ternlog_vl.c vpternlogd -mavx512f -mavx512vl
 reject avx512_maskload_bw_vl.c -mavx512bw -mno-avx512vl -march=x86-64
 accept avx512_maskload_bw_vl.c vmovdqu8 -mavx512bw -mavx512vl
-reject avx512_dq.c -mavx512f -mno-avx512dq
-accept avx512_dq.c vpabsq -mavx512dq
+reject avx512_f_qword.c -mavx512f -march=x86-64
+accept avx512_f_qword.c vpabsq -march=x86-64 -mavx512f -mno-avx512dq
 reject avx512_bitalg.c -mavx512f -mno-avx512bitalg
 accept avx512_bitalg.c vpopcntb -mavx512bitalg
 reject avx512_vpopcnt.c -mavx512f -mno-avx512vpopcntdq
@@ -595,14 +595,14 @@ reject local_fma_no_leak.c -mfma -march=x86-64
 # independent subset and its VL conjunction. Older system GCC is not used as
 # an AVX-512 semantic oracle; run the exact compiler when the script is given.
 if "$gcc_bin" -dumpfullversion 2>/dev/null | grep -x '16.2.0' >/dev/null; then
-    for src in avx512_bw_vl.c avx512_ternlog_vl.c avx512_maskload_bw_vl.c avx512_dq.c avx512_bitalg.c avx512_vpopcnt.c avx512_vnni.c avx512_fma.c; do
+    for src in avx512_bw_vl.c avx512_ternlog_vl.c avx512_maskload_bw_vl.c avx512_f_qword.c avx512_bitalg.c avx512_vpopcnt.c avx512_vnni.c avx512_fma.c; do
         compare "$src" -march=x86-64
         compare "$src" -march=x86-64 -mavx512f -mavx512bw -mavx512dq -mavx512vl -mavx512bitalg -mavx512vpopcntdq -mavx512vnni
     done
     compare avx512_bw_vl.c -march=x86-64 -mavx512f -mavx512vl
     compare avx512_bw_vl.c -march=x86-64 -mavx512f -mavx512bw
     compare avx512_bw_vl.c -march=x86-64 -mavx512bw -mavx512vl
-    compare avx512_dq.c -march=x86-64 -mavx512f -mno-avx512dq
+    compare avx512_f_qword.c -march=x86-64 -mavx512f -mno-avx512dq
     compare avx512_vnni.c -march=x86-64 -mavx512f -mno-avx512vnni
     compare local_fma.c -march=x86-64
     compare local_fma_no_leak.c -march=x86-64
