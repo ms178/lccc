@@ -9,6 +9,7 @@ extern int printf(const char *, ...);
 #define ADD_F _mm256_add_ps
 #define SUB_F _mm256_sub_ps
 #define MUL_F _mm256_mul_ps
+#define ZERO_F _mm256_setzero_ps
 #define ADD_D _mm256_add_pd
 #define SUB_D _mm256_sub_pd
 #define MUL_D _mm256_mul_pd
@@ -18,11 +19,13 @@ extern int printf(const char *, ...);
 #define ADD_F _mm_add_ps
 #define SUB_F _mm_sub_ps
 #define MUL_F _mm_mul_ps
+#define ZERO_F _mm_setzero_ps
 #define ADD_D _mm_add_pd
 #define SUB_D _mm_sub_pd
 #define MUL_D _mm_mul_pd
 #endif
 
+F packed_zero_f(void);
 unsigned packed_bits(float);
 float packed_from_bits(unsigned);
 F packed_f(F, F, F, F);
@@ -31,6 +34,7 @@ D packed_d(D, D, D, D);
 #endif
 
 #ifndef CALLER_ONLY
+__attribute__((noinline)) F packed_zero_f(void) { return ZERO_F(); }
 __attribute__((noinline)) unsigned packed_bits(float f) {
     union { float f; unsigned u; } a = { .f = f };
     return a.u;
@@ -51,6 +55,11 @@ __attribute__((noinline)) D packed_d(D a, D b, D c, D d) {
 
 #ifndef PROVIDER_ONLY
 int main(void) {
+    F zero = packed_zero_f();
+    unsigned zero_bits[sizeof(F) / 4];
+    __builtin_memcpy(zero_bits, &zero, sizeof(F));
+    for (unsigned j = 0; j < sizeof(F) / 4; ++j)
+        if (zero_bits[j] != 0) return 4;
     unsigned long long hash = 0x123456789abcdef0ULL;
     F (* volatile indirect_f)(F, F, F, F) = packed_f;
 #ifndef SSE1_ONLY

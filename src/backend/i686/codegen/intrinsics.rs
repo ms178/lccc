@@ -1169,6 +1169,15 @@ impl I686Codegen {
             IntrinsicOp::CvttSs2Si128 => self.emit_vec_low_to_si32(dest, &args[0], "cvttss2si"),
             IntrinsicOp::CvttSd2Si128 => self.emit_vec_low_to_si32(dest, &args[0], "cvttsd2si"),
 
+            // Packed-float zero is SSE1; the integer/double API remains SSE2.
+            IntrinsicOp::SetzeroPs128 => {
+                if let Some(dptr) = dest_ptr {
+                    self.state.emit("    xorps %xmm0, %xmm0");
+                    self.operand_to_eax(&Operand::Value(*dptr));
+                    self.state.emit("    movups %xmm0, (%eax)");
+                }
+            }
+
             // 128-bit zero: pxor is the canonical zeroing idiom.
             IntrinsicOp::Setzero128 => {
                 if let Some(dptr) = dest_ptr {
@@ -2018,7 +2027,8 @@ impl I686Codegen {
 
             IntrinsicOp::Setzero256 => {
                 if let Some(dptr) = dest_ptr {
-                    self.state.emit("    vpxor %ymm0, %ymm0, %ymm0");
+                    // VEX.128 integer XOR is AVX1 and clears the upper YMM half.
+                    self.state.emit("    vpxor %xmm0, %xmm0, %xmm0");
                     self.emit_avx_store_dest(dptr);
                 }
             }

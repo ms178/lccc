@@ -1409,6 +1409,7 @@ impl Lowerer {
             | BuiltinIntrinsic::X86Punpcklqdq128
             | BuiltinIntrinsic::X86Punpckhqdq128
             | BuiltinIntrinsic::X86Setzero128
+            | BuiltinIntrinsic::X86SetzeroPs128
             | BuiltinIntrinsic::X86Testz128
             | BuiltinIntrinsic::X86Pmulld256
             | BuiltinIntrinsic::X86Psubd256
@@ -3503,25 +3504,18 @@ pub(super) fn is_feature_checked_x86_builtin(name: &str) -> bool {
         Some(BuiltinKind::Intrinsic(intrinsic)) if x86_intrinsic_required_feature(intrinsic).is_some())
 }
 
-/// Map a BuiltinIntrinsic to its corresponding IntrinsicOp.
-/// AUD-CPU-3: the instruction-set extension an x86 intrinsic's instruction
-/// belongs to, for the families whose permission bit exists in
-/// [`crate::common::x86_features`].
-///
-/// Only *unambiguous* families are listed.  The 256-bit AES/CLMUL forms are
-/// VAES/VPCLMULQDQ and the three dot-product groups are AVX-VNNI,
-/// AVX-VNNI-INT8 and AVX-VNNI-INT16, whose permissions are the conjunction the
-/// fold already encodes (AVX class AND the extension's own request),
-/// so a single lookup covers both halves; the SHA/GFNI/AVX-512 families still
-/// have no bit -- see the follow-up document's AUD-CPU-3 entry.
-fn x86_intrinsic_required_feature(intrinsic: &BuiltinIntrinsic) -> Option<IntrinsicRequirement> {
+/// SSE1 and SSE2 share XMM carriers but must retain independent permissions.
+fn legacy_xmm_intrinsic_required_feature(
+    intrinsic: &BuiltinIntrinsic,
+) -> Option<IntrinsicRequirement> {
     use crate::common::x86_features::X86Feature as F;
     use BuiltinIntrinsic as B;
     Some(match intrinsic {
         // Public and raw spellings share an intrinsic identity. SSE1 floating
         // arithmetic must not bypass permission checks, nor imply SSE2 integer
         // or double arithmetic merely because the register class is the same.
-        B::X86XorPs
+        B::X86SetzeroPs128
+        | B::X86XorPs
         | B::X86AndPs
         | B::X86OrPs
         | B::X86AndnPs
@@ -3541,52 +3535,6 @@ fn x86_intrinsic_required_feature(intrinsic: &BuiltinIntrinsic) -> Option<Intrin
         | B::X86Cvtss2Si64 => IntrinsicRequirement {
             feature: F::Sse,
             flag: "-msse",
-            also: None,
-        },
-        // Packed floating-point YMM operations are AVX, not AVX2, on both
-        // x86 ABIs. Never let an absent permission fall through to emission.
-        B::X86AddPs256
-        | B::X86SubPs256
-        | B::X86MulPs256
-        | B::X86AddPd256
-        | B::X86SubPd256
-        | B::X86MulPd256
-        | B::X86LoaduPs256
-        | B::X86StoreuPs256
-        | B::X86LoaduPd256
-        | B::X86StoreuPd256
-        | B::X86MaxPs256V
-        | B::X86MinPs256V
-        | B::X86AndPs256V
-        | B::X86CmpPs256V => IntrinsicRequirement {
-            feature: F::Avx,
-            flag: "-mavx",
-            also: None,
-        },
-        B::X86Paddb256
-        | B::X86Paddw256
-        | B::X86Paddd256
-        | B::X86Paddq256
-        | B::X86Psubb256
-        | B::X86Psubw256
-        | B::X86Psubd256
-        | B::X86Psubq256
-        | B::X86Pmulld256
-        | B::X86Pmullw256
-        | B::X86Pmulhw256
-        | B::X86Pmuludq256
-        | B::X86Psllidi256
-        | B::X86Psrlidi256
-        | B::X86Psllwi256
-        | B::X86Psrlwi256
-        | B::X86Psllqi256
-        | B::X86Psrlqi256
-        | B::X86Psrawi256
-        | B::X86Psradi256
-        | B::X86Pslldqi256
-        | B::X86Psrldqi256 => IntrinsicRequirement {
-            feature: F::Avx2,
-            flag: "-mavx2",
             also: None,
         },
         // Legacy XMM integer, packed-double and scalar-double operations.
@@ -3694,6 +3642,75 @@ fn x86_intrinsic_required_feature(intrinsic: &BuiltinIntrinsic) -> Option<Intrin
         | B::X86Psrldi128 => IntrinsicRequirement {
             feature: F::Sse2,
             flag: "-msse2",
+            also: None,
+        },
+        _ => return None,
+    })
+}
+
+/// Map a BuiltinIntrinsic to its corresponding IntrinsicOp.
+/// AUD-CPU-3: the instruction-set extension an x86 intrinsic's instruction
+/// belongs to, for the families whose permission bit exists in
+/// [`crate::common::x86_features`].
+///
+/// Only *unambiguous* families are listed.  The 256-bit AES/CLMUL forms are
+/// VAES/VPCLMULQDQ and the three dot-product groups are AVX-VNNI,
+/// AVX-VNNI-INT8 and AVX-VNNI-INT16, whose permissions are the conjunction the
+/// fold already encodes (AVX class AND the extension's own request),
+/// so a single lookup covers both halves; the SHA/GFNI/AVX-512 families still
+/// have no bit -- see the follow-up document's AUD-CPU-3 entry.
+fn x86_intrinsic_required_feature(intrinsic: &BuiltinIntrinsic) -> Option<IntrinsicRequirement> {
+    use crate::common::x86_features::X86Feature as F;
+    use BuiltinIntrinsic as B;
+    if let Some(requirement) = legacy_xmm_intrinsic_required_feature(intrinsic) {
+        return Some(requirement);
+    }
+    Some(match intrinsic {
+        // Packed floating-point YMM operations are AVX, not AVX2, on both
+        // x86 ABIs. Never let an absent permission fall through to emission.
+        B::X86Setzero256
+        | B::X86AddPs256
+        | B::X86SubPs256
+        | B::X86MulPs256
+        | B::X86AddPd256
+        | B::X86SubPd256
+        | B::X86MulPd256
+        | B::X86LoaduPs256
+        | B::X86StoreuPs256
+        | B::X86LoaduPd256
+        | B::X86StoreuPd256
+        | B::X86MaxPs256V
+        | B::X86MinPs256V
+        | B::X86AndPs256V
+        | B::X86CmpPs256V => IntrinsicRequirement {
+            feature: F::Avx,
+            flag: "-mavx",
+            also: None,
+        },
+        B::X86Paddb256
+        | B::X86Paddw256
+        | B::X86Paddd256
+        | B::X86Paddq256
+        | B::X86Psubb256
+        | B::X86Psubw256
+        | B::X86Psubd256
+        | B::X86Psubq256
+        | B::X86Pmulld256
+        | B::X86Pmullw256
+        | B::X86Pmulhw256
+        | B::X86Pmuludq256
+        | B::X86Psllidi256
+        | B::X86Psrlidi256
+        | B::X86Psllwi256
+        | B::X86Psrlwi256
+        | B::X86Psllqi256
+        | B::X86Psrlqi256
+        | B::X86Psrawi256
+        | B::X86Psradi256
+        | B::X86Pslldqi256
+        | B::X86Psrldqi256 => IntrinsicRequirement {
+            feature: F::Avx2,
+            flag: "-mavx2",
             also: None,
         },
         B::X86AvxWiden(_) => IntrinsicRequirement {
@@ -4103,6 +4120,7 @@ fn x86_intrinsic_op(intrinsic: &BuiltinIntrinsic) -> IntrinsicOp {
         BuiltinIntrinsic::X86Punpcklqdq128 => IntrinsicOp::Punpcklqdq128,
         BuiltinIntrinsic::X86Punpckhqdq128 => IntrinsicOp::Punpckhqdq128,
         BuiltinIntrinsic::X86Setzero128 => IntrinsicOp::Setzero128,
+        BuiltinIntrinsic::X86SetzeroPs128 => IntrinsicOp::SetzeroPs128,
         BuiltinIntrinsic::X86Testz128 => IntrinsicOp::Testz128,
         BuiltinIntrinsic::X86Pmulld256 => IntrinsicOp::Pmulld256,
         BuiltinIntrinsic::X86Psubd256 => IntrinsicOp::Psubd256,
@@ -4285,6 +4303,34 @@ mod prefetch_hint_tests {
             let h = PrefetchHint::decode(p);
             assert!(h.locality <= 3);
             assert_eq!(h.encode(), p & 7);
+        }
+    }
+}
+
+#[cfg(test)]
+mod legacy_constructor_permission_tests {
+    use super::{BuiltinKind, builtins, x86_intrinsic_required_feature};
+    use crate::common::x86_features::X86Feature as F;
+
+    #[test]
+    fn zero_constructors_keep_their_api_feature_identity() {
+        for (name, expected) in [
+            ("_mm_setzero_ps", F::Sse),
+            ("_mm_setzero_pd", F::Sse2),
+            ("_mm_setzero_si128", F::Sse2),
+            ("_mm256_setzero_ps", F::Avx),
+            ("_mm256_setzero_pd", F::Avx),
+            ("_mm256_setzero_si256", F::Avx),
+        ] {
+            let info = builtins::resolve_builtin(name).expect("known zero constructor");
+            let BuiltinKind::Intrinsic(intrinsic) = &info.kind else {
+                panic!("{name} is not an intrinsic");
+            };
+            assert_eq!(
+                x86_intrinsic_required_feature(intrinsic).map(|r| r.feature),
+                Some(expected),
+                "{name}",
+            );
         }
     }
 }

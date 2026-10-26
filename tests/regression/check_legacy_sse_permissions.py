@@ -15,7 +15,7 @@ SSE1 = set(('movss movaps movups movhps movlps movhlps movlhps unpcklps unpckhps
             'comiss ucomiss cvtsi2ss cvtsi2ssl cvtsi2ssq').split())
 FLOAT = ('add_ps', 'sub_ps', 'mul_ps', 'and_ps', 'andnot_ps', 'or_ps', 'xor_ps',
          'add_ss', 'sub_ss', 'mul_ss', 'div_ss', 'min_ss', 'max_ss',
-         'sqrt_ss', 'max_ps', 'min_ps', 'shuffle_ps')
+         'sqrt_ss', 'max_ps', 'min_ps', 'shuffle_ps', 'setzero_ps')
 INTEGER = ('add_epi8', 'add_epi16', 'add_epi32', 'add_epi64', 'sub_epi8',
            'sub_epi16', 'sub_epi32', 'sub_epi64', 'and_si128', 'or_si128',
            'xor_si128', 'andnot_si128', 'mullo_epi16', 'mulhi_epi16',
@@ -58,7 +58,7 @@ def main():
         directory = Path(directory)
         source, assembly = directory / 'probe.c', directory / 'probe.s'
 
-        def probe(text, flags, accepted, feature=None, legal=False):
+        def probe(text, flags, accepted, feature=None, legal=False, avx1_zero=False):
             nonlocal count
             source.write_text(text)
             for compiler in (args.lccc, args.gcc):
@@ -71,6 +71,11 @@ def main():
                         raise RuntimeError('missing feature diagnostic or assembly emitted after rejection: ' + result.stderr)
                 if accepted and legal:
                     check_legal(assembly.read_text())
+                if accepted and avx1_zero:
+                    # VEX.128 PXOR clears the entire YMM register on AVX1;
+                    # VEX.256 integer PXOR would silently require AVX2.
+                    if re.search(r'\bvpxor\b[^\n]*%ymm', assembly.read_text()):
+                        raise RuntimeError('AVX1 zero constructor emitted AVX2 VPXOR')
                 count += 1
 
         for mode in ('-m32', '-m64'):
@@ -79,12 +84,21 @@ def main():
                 'float f(unsigned x) { union { float f; unsigned u; } a={.u=x}; return a.f; }',
             ):
                 probe(text, [mode, '-mno-sse2', '-msse'], True, legal=True)
+            for suffix, ty in (('ps', '__m256'), ('pd', '__m256d'), ('si256', '__m256i')):
+                text = f'#include <immintrin.h>\n{ty} f(void) {{ return _mm256_setzero_{suffix}(); }}\n'
+                probe(text, [mode, '-mno-avx', '-mno-avx2', '-msse2'], False, '-mavx')
+                probe(text, [mode, '-mavx', '-mno-avx2'], True, avx1_zero=True)
             for name in FLOAT:
-                operands = 'a' if name == 'sqrt_ss' else ('a,b,0x1b' if name == 'shuffle_ps' else 'a,b')
+                operands = '' if name == 'setzero_ps' else ('a' if name == 'sqrt_ss' else ('a,b,0x1b' if name == 'shuffle_ps' else 'a,b'))
                 text = f'#include <xmmintrin.h>\n__m128 f(__m128 a,__m128 b) {{ return _mm_{name}({operands}); }}\n'
                 probe(text, [mode, '-mno-sse', '-mno-sse2'], False, '-msse')
                 for flags in (['-mno-sse2', '-msse'], ['-msse', '-mno-sse2']):
                     probe(text, [mode, *flags], True, legal=True)
+            for suffix, ty in (('si128', '__m128i'), ('pd', '__m128d')):
+                text = f'#include <emmintrin.h>\n{ty} f(void) {{ return _mm_setzero_{suffix}(); }}\n'
+                for flags in (['-mno-sse2', '-msse'], ['-msse', '-mno-sse2']):
+                    probe(text, [mode, *flags], False, '-msse2')
+                probe(text, [mode, '-msse2'], True)
             for name in INTEGER + DOUBLE:
                 ty = '__m128i' if name in INTEGER else '__m128d'
                 text = f'#include <emmintrin.h>\n{ty} f({ty} a,{ty} b) {{ return _mm_{name}(a,b); }}\n'

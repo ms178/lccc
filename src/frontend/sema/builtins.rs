@@ -2766,7 +2766,7 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
     );
     m.insert(
         "_mm_setzero_ps",
-        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Setzero128),
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86SetzeroPs128),
     );
     m.insert(
         "_mm_setzero_pd",
@@ -3895,6 +3895,7 @@ pub enum BuiltinIntrinsic {
     X86Punpcklqdq128,
     X86Punpckhqdq128,
     X86Setzero128,
+    X86SetzeroPs128,
     X86Testz128,
     // AVX/AVX2 previously scalar
     X86Pmulld256,

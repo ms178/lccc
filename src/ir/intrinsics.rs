@@ -1419,6 +1419,7 @@ pub enum IntrinsicOp {
     Punpcklqdq128,
     Punpckhqdq128,
     Setzero128,
+    SetzeroPs128,
     Testz128,
 
     // --- AVX / AVX2 ops previously left as scalar header loops ---
@@ -2242,7 +2243,7 @@ impl IntrinsicOp {
             | Pandn128 | Pcmpeqw128 | Pcmpgtd128 | Pavgb128 | Pavgw128
             | Pminsw128 | Pmaxsw128 | Pmulhuw128 | Paddq128 | Psubq128
             | Punpckldq128 | Punpckhdq128 | Punpcklqdq128 | Punpckhqdq128
-            | Setzero128 | Extracti128
+            | Setzero128 | SetzeroPs128 | Extracti128
             // ARX lane family: 128-bit XMM results (pslld/pshufd/pshufb/
             // pack are x4-lane).
             | VecRotlI32x4 | VecShufdI32x4 | VecShufbI32x4 | VecPackI32x4
