@@ -78,7 +78,8 @@ def main():
     # Exercise the separate native type-punning/cross-family vector-SSA
     # contract in this already measured SIMD gate (no additional CI shard).
     checker = ROOT / 'tests/regression/check_native_vector_bitcasts.py'
-    env = dict(os.environ, CCC=str(Path(args.lccc).resolve()), GCC=str(Path(args.gcc).resolve()))
+    gcc_path = shutil.which(args.gcc) or str(Path(args.gcc).resolve())
+    env = dict(os.environ, CCC=str(Path(args.lccc).resolve()), GCC=gcc_path)
     result = subprocess.run([os.environ.get('PYTHON', 'python3'), str(checker)],
                             capture_output=True, text=True, env=env, timeout=180)
     if result.returncode:
