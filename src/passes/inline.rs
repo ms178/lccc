@@ -5849,7 +5849,10 @@ impl LabelMap {
     /// actually mints.
     fn assign_fresh(&mut self) -> BlockId {
         let id = BlockId(self.next);
-        assert!(self.next < u32::MAX, "inline label capacity was pre-checked");
+        assert!(
+            self.next < u32::MAX,
+            "inline label capacity was pre-checked"
+        );
         self.next += 1;
         id
     }

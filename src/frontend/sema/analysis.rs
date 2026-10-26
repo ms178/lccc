@@ -4988,9 +4988,7 @@ impl SemanticAnalyzer {
     fn initializer_is_array_valued(&self, expr: &Expr) -> bool {
         if matches!(
             expr,
-            Expr::StringLiteral(..)
-                | Expr::WideStringLiteral(..)
-                | Expr::Char16StringLiteral(..)
+            Expr::StringLiteral(..) | Expr::WideStringLiteral(..) | Expr::Char16StringLiteral(..)
         ) {
             return false;
         }
