@@ -72,7 +72,13 @@ accept() {
     local src=$1 want=$2
     shift 2
     local asm=$tmp/accept-${src%.c}-$(echo "$@" | tr -c 'a-z0-9' '_').s
-    "$ccc" -O2 "$@" -S "$tmp/$src" -o "$asm"
+    if "$ccc" -O2 "$@" -S "$tmp/$src" -o "$asm"; then
+        :
+    else
+        local rc=$?
+        printf 'FAIL: accept witness %s with %s: compiler exited %d\n' "$src" "$*" "$rc" >&2
+        return "$rc"
+    fi
     grep -qE "^[[:space:]]+v?$want" "$asm" ||
         { printf '%s\n' "$(cat "$asm")" >&2;
           fail "$src with $*: expected $want to be emitted"; }
@@ -430,6 +436,7 @@ for mode in -m32 -m64; do
     compare shift256.c "$mode" -mavx2
 done
 
+echo "CHECK: VTEST scalar flags and XMM/YMM encodings"
 # All VTEST scalar flags require AVX even at 128 bits; none require AVX2.
 # Compile-only raw vector sources need no target libc headers in either mode.
 for bits in 128 256; do
@@ -452,6 +459,7 @@ EOF
     done
 done
 
+echo "CHECK: AVX2 widening permissions"
 # Widening instructions are AVX2, unlike floating-point VTEST. Even when
 # only four low source bytes participate, the C input remains a 128-bit value.
 for sign in sx zx; do
@@ -479,6 +487,7 @@ EOF
     done
 done
 
+echo "CHECK: malformed SIMD builtin operands"
 # Native builtins must reject scalar or wrong-width operands before codegen.
 cat >"$tmp/vtest_wrong_shape.c" <<'EOF'
 typedef float v4sf __attribute__((vector_size(16)));
@@ -494,6 +503,7 @@ for mode in -m64 -m32; do
     reject widen_wrong_shape.c 'requires a 128-bit vector' "$mode" -mavx2
 done
 
+echo "CHECK: AVX-512 subset and function-local gates"
 # AVX-512 permissions follow the architectural subset conjunction, including
 # EVEX.128/256 VL encodings. The test operations are public wrappers so this
 # checks the same generic builtin path real headers use.
