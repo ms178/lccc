@@ -556,7 +556,9 @@ fn fpo_function(store: &mut LineStore, infos: &mut [LineInfo], start: usize, fun
             || line.ends_with(", %esp")
             || matches!(infos[k].kind, LineKind::Push { .. } | LineKind::Pop { .. })
             || matches!(line, "leave" | "leaveq");
-        let canonical_stack_adjust = (k == body_start && line.starts_with("subq $"))
+        let prologue_push = saves.iter().any(|&(_, push)| push == k);
+        let canonical_stack_adjust = prologue_push
+            || (k == body_start && line.starts_with("subq $"))
             || (epilogue_addqs.contains(&k) && line.starts_with("addq $"))
             || epilogue_pop;
         dynamic_rsp_write |= writes_rsp && !canonical_stack_adjust;
