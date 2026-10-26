@@ -56,14 +56,14 @@ def publish_check(manifest, toc, files):
         'output': {'title': 'Primary source acquisition, not semantic sign-off',
                    'summary': 'Edition 093 source hash and selected pages. PDF remains outside Git.',
                    'text': json.dumps(manifest)}}, 'POST')
-    annotations = []
+    annotations = [('intel-sdm/source-manifest.json', json.dumps(manifest, ensure_ascii=False))]
     for offset in range(0, len(toc), 200):
-        annotations.append(('intel-sdm/outline-' + str(offset) + '.json', json.dumps(toc[offset:offset + 200])))
+        annotations.append(('intel-sdm/outline-' + str(offset) + '.json', json.dumps(toc[offset:offset + 200], ensure_ascii=False)))
     for path in files:
         data = json.loads(path.read_text())
         for page in data['pages']:
             annotations.append((f'intel-sdm/page-{page["pdf_page"]}.json',
-                                json.dumps({'title': data['section']['title'], **page})))
+                                json.dumps({'title': data['section']['title'], **page}, ensure_ascii=False)))
     for offset in range(0, len(annotations), 50):
         batch = [{'path': path, 'start_line': 1, 'end_line': 1,
                   'annotation_level': 'notice', 'message': text}
@@ -72,7 +72,10 @@ def publish_check(manifest, toc, files):
             'title': 'Primary source acquisition, not semantic sign-off',
             'summary': 'Edition/hash-anchored source pages; review remains separate.',
             'annotations': batch}}, 'PATCH')
-    request(base + '/' + str(result['id']), {'status': 'completed', 'conclusion': 'success'}, 'PATCH')
+    request(base + '/' + str(result['id']), {'status': 'completed', 'conclusion': 'success', 'output': {
+        'title': 'Primary source acquisition, not semantic sign-off',
+        'summary': 'Edition/hash-anchored pages; semantic review remains separate.',
+        'text': json.dumps(manifest, ensure_ascii=False)}}, 'PATCH')
     print('SDM source check ID:', result['id'], flush=True)
 
 

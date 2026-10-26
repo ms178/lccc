@@ -803,49 +803,37 @@ _mm_stream_pd(double *__p, __m128d __a)
 static __inline__ __m128i __attribute__((__always_inline__))
 _mm_castps_si128(__m128 __a)
 {
-    __m128i __r;
-    __builtin_memcpy(&__r, &__a, sizeof(__r));
-    return __r;
+    return (__m128i)__a;
 }
 
 static __inline__ __m128 __attribute__((__always_inline__))
 _mm_castsi128_ps(__m128i __a)
 {
-    __m128 __r;
-    __builtin_memcpy(&__r, &__a, sizeof(__r));
-    return __r;
+    return (__m128)__a;
 }
 
 static __inline__ __m128d __attribute__((__always_inline__))
 _mm_castps_pd(__m128 __a)
 {
-    __m128d __r;
-    __builtin_memcpy(&__r, &__a, sizeof(__r));
-    return __r;
+    return (__m128d)__a;
 }
 
 static __inline__ __m128 __attribute__((__always_inline__))
 _mm_castpd_ps(__m128d __a)
 {
-    __m128 __r;
-    __builtin_memcpy(&__r, &__a, sizeof(__r));
-    return __r;
+    return (__m128)__a;
 }
 
 static __inline__ __m128i __attribute__((__always_inline__))
 _mm_castpd_si128(__m128d __a)
 {
-    __m128i __r;
-    __builtin_memcpy(&__r, &__a, sizeof(__r));
-    return __r;
+    return (__m128i)__a;
 }
 
 static __inline__ __m128d __attribute__((__always_inline__))
 _mm_castsi128_pd(__m128i __a)
 {
-    __m128d __r;
-    __builtin_memcpy(&__r, &__a, sizeof(__r));
-    return __r;
+    return (__m128d)__a;
 }
 
 /* ====================================================================

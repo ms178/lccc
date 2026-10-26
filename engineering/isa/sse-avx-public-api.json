@@ -4919,6 +4919,36 @@
       "arities": [
         1
       ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_castpd_ps",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        1
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_castpd_si256",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        1
+      ],
       "canonical_override": true,
       "definitions": 1,
       "forms": [
@@ -4934,6 +4964,36 @@
       "arities": [
         1
       ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_castps_pd",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        1
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_castps_si256",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        1
+      ],
       "canonical_override": true,
       "definitions": 1,
       "forms": [
@@ -4942,6 +5002,36 @@
       "generic_helpers": [],
       "header": "avxintrin.h",
       "name": "_mm256_castsi128_si256",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        1
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_castsi256_pd",
+      "raw_builtins": [],
+      "wrapper_dependencies": []
+    },
+    {
+      "arities": [
+        1
+      ],
+      "canonical_override": false,
+      "definitions": 1,
+      "forms": [
+        "function"
+      ],
+      "generic_helpers": [],
+      "header": "avxintrin.h",
+      "name": "_mm256_castsi256_ps",
       "raw_builtins": [],
       "wrapper_dependencies": []
     },
@@ -10121,7 +10211,7 @@
     "_mm_ternarylogic_epi32",
     "_mm_ternarylogic_epi64"
   ],
-  "declarations": 624,
+  "declarations": 630,
   "missing_reference_names": [
     "_mm256_adds_epi16",
     "_mm256_adds_epi8",
@@ -10147,13 +10237,7 @@
     "_mm256_broadcastw_epi16",
     "_mm256_bslli_epi128",
     "_mm256_bsrli_epi128",
-    "_mm256_castpd_ps",
-    "_mm256_castpd_si256",
     "_mm256_castps128_ps256",
-    "_mm256_castps_pd",
-    "_mm256_castps_si256",
-    "_mm256_castsi256_pd",
-    "_mm256_castsi256_ps",
     "_mm256_ceil_pd",
     "_mm256_ceil_ps",
     "_mm256_cmpeq_epi16",
@@ -10459,5 +10543,5 @@
     "lcccsimd.h"
   ],
   "status": "inventory-only; no instruction/manual/runtime sign-off implied",
-  "unique_names": 624
+  "unique_names": 630
 }

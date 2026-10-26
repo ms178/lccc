@@ -97,6 +97,45 @@ _mm256_setzero_pd(void)
     return (__m256d){  0.0, 0.0, 0.0, 0.0  };
 }
 
+/* Equal-width casts change only the lane interpretation. Native vector casts
+ * preserve all 256 bits, including NaN payloads, without FP arithmetic. */
+
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_castps_si256(__m256 __a)
+{
+    return (__m256i)__a;
+}
+
+static __inline__ __m256 __attribute__((__always_inline__))
+_mm256_castsi256_ps(__m256i __a)
+{
+    return (__m256)__a;
+}
+
+static __inline__ __m256d __attribute__((__always_inline__))
+_mm256_castps_pd(__m256 __a)
+{
+    return (__m256d)__a;
+}
+
+static __inline__ __m256 __attribute__((__always_inline__))
+_mm256_castpd_ps(__m256d __a)
+{
+    return (__m256)__a;
+}
+
+static __inline__ __m256i __attribute__((__always_inline__))
+_mm256_castpd_si256(__m256d __a)
+{
+    return (__m256i)__a;
+}
+
+static __inline__ __m256d __attribute__((__always_inline__))
+_mm256_castsi256_pd(__m256i __a)
+{
+    return (__m256d)__a;
+}
+
 /* === Cast between 256-bit and 128-bit === */
 
 /* Extract low 128 bits of __m256i as __m128i */
