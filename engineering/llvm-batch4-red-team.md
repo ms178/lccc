@@ -300,3 +300,20 @@ hint (`reg_hints` already exists for parameter homes) or an epilogue coalescing
 rule, both of which touch every function in the corpus. That is a batch of its
 own, with its own corpus measurement, and it is the single highest-value
 follow-up in this area: it is worth one instruction on every fold listed above.
+
+The same measurement pins the two shapes that make up the rest of the gap, and
+neither of them is a fold either:
+
+| form | lccc | GCC 16.2 | what the difference is |
+| --- | ---: | ---: | --- |
+| `x % 32` | 8 | 7 | the return-home copy |
+| `x / 32` | 7 | 5 | the return-home copy, plus GCC's `lea`-fused conditional add (`testl`, `leal 31(%rdi), %eax`, `cmovns`, `sarl`) where lccc pays a sign broadcast it cannot fold into the add |
+| `~(0 - x)` on a 16-bit value | 4 | 2 | the `movswq`/`movzwl` representation narrowing the backend emits for a narrow operand and result; GCC needs neither because the ABI truncates the returned value for it |
+
+The conditional-add quotient needs two backend pieces that are not there yet:
+`lower_binop` only considers `lea` for `OpSize::S64` in its `Add` fast path,
+even though `lea_size` already maps the narrow sizes onto `leal` with a
+documented rationale, and the allocator has to place the add's destination in a
+fresh register instead of coalescing it into a dead base. Both are corpus-wide
+changes, which is why they belong to the return-home batch rather than to this
+one.

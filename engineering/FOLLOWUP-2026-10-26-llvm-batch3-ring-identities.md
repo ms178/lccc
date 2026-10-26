@@ -141,39 +141,64 @@ this sub-pass cannot prove:
 
 ### Gate: `tests/regression/check_llvm_ring_identities.py`
 
-19 folded forms, each one smaller than the same form compiled with the sub-pass
-disabled, plus one clamp that must survive, plus three promotion-boundary
-refusals. Both disable controls (`CCC_NO_RING_IDENTITIES=1` and
-`CCC_DISABLE_PASSES=bit_idioms`) produce identical program output, and the
-native binary agrees with GCC 16.2 at `-O0`, `-O1`, `-O2`, `-O3`, `-Os`,
-`-O3 -g` and `-O2 -march=x86-64-v3`.
+32 folded forms, each one smaller than the same form compiled with the
+controlling pass disabled — the ring-identity sub-pass for the identity
+families, the division strength reduction for the four power-of-two forms,
+which are measured for divider removal rather than for length — plus one clamp
+that must survive, plus four documented promotion-boundary refusals. All three
+disable controls (`CCC_NO_RING_IDENTITIES=1`, `CCC_DISABLE_PASSES=bit_idioms`,
+`CCC_DISABLE_PASSES=divconst`) produce identical program output, and the native
+binary agrees with GCC 16.2 at `-O0`, `-O1`, `-O2`, `-O3`, `-Os`, `-O3 -g` and
+`-O2 -march=x86-64-v3`.
 
-| form | sub-pass off | on | idiom |
+| form | control off | fold on | idiom |
 | --- | ---: | ---: | --- |
 | `ring_srem_eq_250` | 14 | 5 | remainder window |
 | `ring_srem_ne_250` | 14 | 5 | remainder window |
-| `ring_srem_eq_min` | 8 | 6 | remainder window, `C = INT64_MIN` |
-| `ring_srem_ne_min` | 8 | 6 | remainder window, `C = INT64_MIN` |
-| `ring_srem_eq_neg7` | 14 | 5 | remainder window, negative divisor |
-| `ring_srem_eq32` | 14 | 5 | remainder window, 32-bit |
-| `ring_srem_ne32` | 14 | 5 | remainder window, 32-bit |
+| `ring_srem_eq_min` | 8 | 6 | remainder window |
+| `ring_srem_ne_min` | 8 | 6 | remainder window |
+| `ring_srem_eq_neg7` | 14 | 5 | remainder window |
+| `ring_srem_eq32` | 14 | 5 | remainder window |
+| `ring_srem_ne32` | 14 | 5 | remainder window |
 | `ring_sign_shift` | 9 | 4 | sign-mask shift |
-| `ring_sign_shift64` | 9 | 4 | sign-mask shift, 64-bit |
+| `ring_sign_shift64` | 9 | 4 | sign-mask shift |
 | `ring_not_neg` | 4 | 2 | complement of negation |
-| `ring_neg_not` | 4 | 2 | negation of complement |
-| `ring_not_neg16` | 5 | 4 | complement of negation, 16-bit |
-| `ring_neg_not64` | 4 | 2 | negation of complement, 64-bit |
-| `ring_min_imax` | 4 | 2 | saturated min |
-| `ring_max_imin` | 4 | 2 | saturated max |
-| `ring_min_umax` | 5 | 2 | saturated unsigned min |
-| `ring_max_u0` | 4 | 2 | zero-test select |
-| `ring_min_imax64` | 6 | 2 | saturated min, 64-bit |
-| `ring_max_imin64` | 6 | 2 | saturated max, 64-bit |
+| `ring_neg_not` | 4 | 2 | complement of negation |
+| `ring_not_neg16` | 5 | 4 | complement of negation |
+| `ring_neg_not64` | 4 | 2 | complement of negation |
+| `ring_min_imax` | 4 | 2 | saturated bound or zero test |
+| `ring_max_imin` | 4 | 2 | saturated bound or zero test |
+| `ring_min_umax` | 5 | 2 | saturated bound or zero test |
+| `ring_max_u0` | 4 | 2 | saturated bound or zero test |
+| `ring_min_imax64` | 6 | 2 | saturated bound or zero test |
+| `ring_max_imin64` | 6 | 2 | saturated bound or zero test |
+| `ring_zero_select` | 4 | 2 | saturated bound or zero test |
+| `ring_zero_constant_eq` | 5 | 2 | saturated bound or zero test |
+| `ring_or_chain_value` | 5 | 2 | implied-condition select |
+| `ring_or_chain_zero` | 6 | 2 | implied-condition select |
+| `ring_nested_select` | 7 | 2 | implied-condition select |
+| `ring_boolean_product` | 13 | 2 | implied-condition select |
+| `ring_bool_product_self` | 9 | 2 | implied-condition select |
+| `ring_bool_product_test` | 6 | 4 | boolean product |
+| `ring_bool_product_cmp` | 6 | 4 | boolean product |
+| `ring_srem_pow2_32` | 8 | 8 | power-of-two remainder (control: `divconst`) |
+| `ring_srem_pow2_64` | 8 | 8 | power-of-two remainder (control: `divconst`) |
+| `ring_srem_pow2_neg` | 8 | 8 | power-of-two remainder (control: `divconst`) |
+| `ring_sdiv_pow2_32` | 7 | 7 | power-of-two quotient (control: `divconst`) |
 
 Against the oracle on the same sources: the remainder window is 5 instructions
 where GCC 16.2 needs 13, the sign-mask shift is 4 where GCC needs 7, and the
-saturated bound and the unit-offset complement reach the same two instructions
-GCC emits.
+saturated bound, the zero-test select, the implied-condition select and the
+boolean product all reach the same two instructions GCC emits. The one narrow
+exception is `ring_not_neg16` at 4 against GCC's 2: the 16-bit form carries the
+ABI-mandated `movswq`/`movzwl` pair that narrows the operand to its
+representation and truncates the result, which GCC elides because it happens to
+need neither — a backend narrow-integer concern, not a fold concern. The four
+power-of-two forms are one to two instructions longer than GCC's (`8` against
+`7` for the remainder, `7` against `5` for the quotient) while carrying no
+`idiv`: the difference is the return-home copy plus, for the quotient, the
+`lea`-fused conditional add that GCC uses and the 32-bit `lea` this backend
+does not select yet.
 
 ### Differential A/B
 

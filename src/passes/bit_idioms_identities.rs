@@ -23,6 +23,7 @@
 //! is an equality in the ring of `2^w` residues, which is exactly the
 //! semantics the IR gives an integer type.
 use super::*;
+use std::cell::Cell;
 
 /// Same authority contract as the other fold families: the whole sub-pass can
 /// be switched off for A/B measurement and for bisecting a miscompile.
@@ -140,7 +141,7 @@ fn implied_condition_sense(
     value: Operand,
     ty: IrType,
     cx: &Context<'_>,
-    budget: &std::cell::Cell<u32>,
+    budget: &Cell<u32>,
     depth: u8,
 ) -> Option<bool> {
     if depth == 0 || budget.get() == 0 {
@@ -223,7 +224,7 @@ fn implied_condition_sense(
 /// preserve it for every width. A `not` does not — `~1` is all-ones — so it is
 /// deliberately absent here; the front end's `!(c)` reaches this pass as a
 /// compare with the opposite predicate.
-fn zero_or_one(node: Operand, cx: &Context<'_>, budget: &std::cell::Cell<u32>, depth: u8) -> bool {
+fn zero_or_one(node: Operand, cx: &Context<'_>, budget: &Cell<u32>, depth: u8) -> bool {
     if let Operand::Const(c) = node {
         return matches!(c.to_i128(), Some(0) | Some(1));
     }
@@ -263,7 +264,7 @@ fn zero_when_zero(
     node: Operand,
     value: Operand,
     cx: &Context<'_>,
-    budget: &std::cell::Cell<u32>,
+    budget: &Cell<u32>,
     depth: u8,
 ) -> bool {
     if node == value || matches!(node, Operand::Const(c) if c.to_i128() == Some(0)) {
@@ -315,7 +316,7 @@ fn saturating_extremum(min: bool, signed: bool, ty: IrType) -> u64 {
 fn saturated_bound(
     inst: &Instruction,
     cx: &Context<'_>,
-    budget: &std::cell::Cell<u32>,
+    budget: &Cell<u32>,
 ) -> Option<Vec<Instruction>> {
     let Instruction::Select {
         dest,
@@ -504,7 +505,7 @@ fn signed_shift_through_mask(inst: &Instruction, cx: &Context<'_>) -> Option<Vec
 fn boolean_multiply(
     inst: &Instruction,
     cx: &Context<'_>,
-    budget: &std::cell::Cell<u32>,
+    budget: &Cell<u32>,
 ) -> Option<Vec<Instruction>> {
     let Instruction::BinOp {
         dest,
@@ -547,7 +548,7 @@ pub(super) fn fold(inst: &Instruction, cx: &Context<'_>, fresh: Value) -> Option
     // A private budget: the walks below are the only consumers, so a sibling
     // family that exhausted the shared visit counter cannot silently disable a
     // fold that a reader of this file expects to fire.
-    let budget = std::cell::Cell::new(4096u32);
+    let budget = Cell::new(4096u32);
     match inst {
         Instruction::Cmp {
             dest,
