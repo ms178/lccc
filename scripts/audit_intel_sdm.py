@@ -7,6 +7,7 @@ are inaccessible. A section's presence is never a claim it has been reviewed.
 """
 import argparse
 import hashlib
+import os
 import json
 from pathlib import Path
 import re
@@ -19,16 +20,15 @@ ARCHITECTURE = re.compile(r'MXCSR|DATA TYPES|FLOATING.POINT EXCEPTION|MEMORY ORD
 
 def sections(toc):
     selected = []
-    architecture = 0
     for index, (level, title, page) in enumerate(toc):
         instruction = bool(INSTRUCTIONS.match(title.strip()))
-        if not instruction and (architecture >= 16 or not ARCHITECTURE.search(title)):
+        if not instruction and not ARCHITECTURE.search(title):
             continue
-        if not instruction:
-            architecture += 1
         stop = next((p - 1 for lev, _, p in toc[index + 1:] if lev <= level and p > page), page + 2)
         selected.append({'title': title, 'pdf_page_first': page,
-                         'pdf_page_last': min(stop, page + 3),
+                         'pdf_page_last': min(stop, page + (15 if instruction else 3)),
+                         'outline_section_last': stop,
+                         'excerpt_only': stop > page + (15 if instruction else 3),
                          'kind': 'instruction' if instruction else 'architecture',
                          'status': 'extracted-unreviewed'})
     return selected
@@ -40,13 +40,70 @@ def notice(title, message):
     print(f'::notice title={escape(title)}::{escape(message)}', flush=True)
 
 
+def publish_check(manifest, toc, files):
+    # Use the Checks API directly: runner notices truncate messages and retain
+    # only ten annotations per step. Never put a token or signed URL in output.
+    token = os.environ['GH_TOKEN']
+    base = 'https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY'] + '/check-runs'
+    def request(url, payload, method):
+        req = urllib.request.Request(url, json.dumps(payload).encode(), method=method,
+            headers={'Authorization': 'Bearer ' + token, 'Accept': 'application/vnd.github+json',
+                     'X-GitHub-Api-Version': '2022-11-28', 'Content-Type': 'application/json'})
+        with urllib.request.urlopen(req, timeout=60) as response:
+            return json.load(response)
+    result = request(base, {'name': 'Intel SDM source pages (unreviewed)',
+        'head_sha': os.environ['GITHUB_SHA'], 'status': 'in_progress',
+        'output': {'title': 'Primary source acquisition, not semantic sign-off',
+                   'summary': 'Edition 093 source hash and selected pages. PDF remains outside Git.',
+                   'text': json.dumps(manifest)}}, 'POST')
+    annotations = []
+    for offset in range(0, len(toc), 200):
+        annotations.append(('intel-sdm/outline-' + str(offset) + '.json', json.dumps(toc[offset:offset + 200])))
+    for path in files:
+        data = json.loads(path.read_text())
+        for page in data['pages']:
+            annotations.append((f'intel-sdm/page-{page["pdf_page"]}.json',
+                                json.dumps({'title': data['section']['title'], **page})))
+    for offset in range(0, len(annotations), 50):
+        batch = [{'path': path, 'start_line': 1, 'end_line': 1,
+                  'annotation_level': 'notice', 'message': text}
+                 for path, text in annotations[offset:offset + 50]]
+        request(base + '/' + str(result['id']), {'output': {
+            'title': 'Primary source acquisition, not semantic sign-off',
+            'summary': 'Edition/hash-anchored source pages; review remains separate.',
+            'annotations': batch}}, 'PATCH')
+    request(base + '/' + str(result['id']), {'status': 'completed', 'conclusion': 'success'}, 'PATCH')
+    print('SDM source check ID:', result['id'], flush=True)
+
+
+def self_test():
+    toc = [[1, 'Chapter 4 Data Types', 91], [2, '4.1 Fundamental Data Types', 91],
+           [1, 'DIVPD—Divide', 100], [1, 'DIVPS—Divide', 103],
+           [1, 'Other instruction', 110], [1, 'MAXPD—Maximum', 120],
+           [1, 'Other instruction', 150]]
+    rows = sections(toc)
+    assert [r['title'] for r in rows] == [r[1] for r in toc if r[1] != 'Other instruction']
+    assert rows[2]['pdf_page_first'] == 100 and rows[2]['pdf_page_last'] == 102
+    assert not rows[2]['excerpt_only']
+    assert rows[-1]['excerpt_only'] and rows[-1]['pdf_page_last'] == 135
+    assert all(r['status'] == 'extracted-unreviewed' for r in rows)
+    print('PASS: SDM selection boundaries, page caps and unreviewed status')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--output', type=Path)
+    parser.add_argument('--self-test', action='store_true')
+    parser.add_argument('--publish-check', action='store_true')
     parser.add_argument('--pdf', type=Path)
     parser.add_argument('--sha256', help='require the independently reviewed PDF hash')
     parser.add_argument('--notices', action='store_true')
     args = parser.parse_args()
+    if args.self_test:
+        self_test()
+        return
+    if args.output is None:
+        parser.error('--output is required for acquisition')
     args.output.mkdir(parents=True, exist_ok=True)
     pdf = args.pdf or args.output / 'intel-sdm-093.pdf'
     if not args.pdf:
@@ -84,6 +141,8 @@ def main():
             for page in pages:
                 notice(f'intel-sdm:{index:03d}:page-{page["pdf_page"]}',
                        json.dumps({'title': row['title'], **page}))
+    if args.publish_check:
+        publish_check(manifest, toc, sorted(args.output.glob('section-*.json')))
     print(f'Extracted {len(rows)} unreviewed sections from {len(document)} pages; SHA256 {digest}')
 
 
