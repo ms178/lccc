@@ -681,6 +681,13 @@ cat >"$tmp/local_fma_no_avx.c" <<'EOF'
 __attribute__((target("fma,no-avx"))) __m256 f(__m256 a, __m256 b, __m256 c) { return _mm256_fmadd_ps(a, b, c); }
 EOF
 reject local_fma_no_avx.c -mfma -march=x86-64
+# Disabling AVX-512F inside one function must not revoke unrelated SSE
+# permission from the translation unit.
+cat >"$tmp/local_no_avx512f_preserves_sse.c" <<'EOF'
+#include <xmmintrin.h>
+__attribute__((target("no-avx512f"))) __m128 f(__m128 a, __m128 b) { return _mm_add_ps(a, b); }
+EOF
+accept local_no_avx512f_preserves_sse.c addps -march=x86-64
 cat >"$tmp/local_bw_vl.c" <<'EOF'
 #include <immintrin.h>
 __attribute__((target("avx512bw,avx512vl"))) __mmask16 f(__m128i a, __m128i b) { return _mm_cmp_epu8_mask(a,b,_MM_CMPINT_EQ); }

@@ -2883,6 +2883,26 @@ impl Lowerer {
         use crate::common::x86_features::X86Feature as F;
 
         let mut permitted = crate::common::x86_features::effective().contains(feature);
+        let avx512_requirement = matches!(
+            feature,
+            F::Avx512F
+                | F::Avx512Bw
+                | F::Avx512Dq
+                | F::Avx512Vl
+                | F::Avx512Vnni
+                | F::Avx512BitAlg
+                | F::Avx512Vpopcntdq
+                | F::Avx512Cd
+                | F::Avx512Ifma
+                | F::Avx512Vbmi
+                | F::Avx512Vbmi2
+                | F::Avx512Bf16
+                | F::Avx512Fp16
+                | F::Avx512Bmm
+                | F::Avx512Vp2intersect
+                | F::Avx512Er
+                | F::Avx512Pf
+        );
         // Legacy 128-bit extensions keep the same register/ABI class under a
         // function target attribute. Honor that local permission without leaking
         // it into another function or claiming per-function wider-vector support.
@@ -2936,7 +2956,7 @@ impl Lowerer {
                 );
 
                 if requested_feature == "avx512f" {
-                    if avx512_feature {
+                    if avx512_requirement {
                         permitted = enabled;
                     }
                     continue;
