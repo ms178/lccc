@@ -1046,10 +1046,32 @@ fn fold_cast_i128(src: &IrConst, from_ty: IrType, to_ty: IrType) -> Option<IrCon
     }
 }
 
+/// Reinterpret a constant as the signed value its operand width denotes.
+///
+/// Constants are stored sign-extended for signed types but *zero*-extended for
+/// unsigned ones (`from_i64` keeps `U32` values as `I64(0xFFFF_FFFF)`, i.e.
+/// 4294967295).  A signed operation applied to an operand whose type is
+/// unsigned therefore has to extend from the operand width: reading the stored
+/// value directly would take `0xFFFF_FFFF` for 4294967295 instead of `-1`.
+fn signed_operand(val: i64, ty: IrType) -> i64 {
+    // Only the widths that have a representative in the i64 container are
+    // extended: a `Void` (0) has no signed value to read and a 128-bit operand
+    // is not folded here at all, and shifting either by 64 would panic in a
+    // debug build, so both are returned untouched.
+    let bits = ty.size() * 8;
+    if !(8..=64).contains(&bits) {
+        return val;
+    }
+    let shift = 64 - bits as u32;
+    (val << shift) >> shift
+}
+
 /// Evaluate a binary operation on two constant integers.
-/// `ty` is needed for width-sensitive unsigned operations (LShr, UDiv, URem)
-/// where operands stored as sign-extended i64 must be masked to the correct
-/// bit width to get the proper unsigned representation.
+/// `ty` is needed for width-sensitive operations (LShr, UDiv, URem) where
+/// operands stored as sign-extended i64 must be masked to the correct bit width
+/// to get the proper unsigned representation, and for the signed operations
+/// (AShr, SDiv, SRem) which must extend a zero-extended unsigned operand back to
+/// its signed representative first.
 fn fold_binop(op: IrBinOp, lhs: i64, rhs: i64, ty: IrType) -> Option<i64> {
     let is_32bit = ty == IrType::I32
         || ty == IrType::U32
@@ -1065,7 +1087,7 @@ fn fold_binop(op: IrBinOp, lhs: i64, rhs: i64, ty: IrType) -> Option<i64> {
             if rhs == 0 {
                 return None;
             } // division by zero is UB, don't fold
-            lhs.wrapping_div(rhs)
+            signed_operand(lhs, ty).wrapping_div(signed_operand(rhs, ty))
         }
         IrBinOp::UDiv => {
             if rhs == 0 {
@@ -1082,7 +1104,7 @@ fn fold_binop(op: IrBinOp, lhs: i64, rhs: i64, ty: IrType) -> Option<i64> {
             if rhs == 0 {
                 return None;
             }
-            lhs.wrapping_rem(rhs)
+            signed_operand(lhs, ty).wrapping_rem(signed_operand(rhs, ty))
         }
         IrBinOp::URem => {
             if rhs == 0 {
@@ -1099,6 +1121,7 @@ fn fold_binop(op: IrBinOp, lhs: i64, rhs: i64, ty: IrType) -> Option<i64> {
         IrBinOp::Xor => lhs ^ rhs,
         IrBinOp::Shl => lhs.wrapping_shl(rhs as u32),
         IrBinOp::AShr => {
+            let lhs = signed_operand(lhs, ty);
             if is_32bit {
                 // For 32-bit types, use i32 arithmetic shift to stay in 32-bit range
                 (lhs as i32).wrapping_shr(rhs as u32) as i64
@@ -1373,6 +1396,42 @@ mod tests {
     fn test_fold_binop_div() {
         assert_eq!(fold_binop(IrBinOp::SDiv, 10, 3, IrType::I64), Some(3));
         assert_eq!(fold_binop(IrBinOp::SDiv, -10, 3, IrType::I64), Some(-3));
+    }
+
+    #[test]
+    fn signed_operations_extend_unsigned_operands_to_their_width() {
+        // `from_i64` zero-extends unsigned constants, so these are the values
+        // the folder actually sees for a `u32` bit pattern standing for -1.
+        // The result is checked through the same round trip the pass applies,
+        // which is the bit pattern that reaches the generated code.
+        let pattern =
+            |op, a, b, ty| IrConst::from_i64(fold_binop(op, a, b, ty).unwrap(), ty).to_i64();
+        assert_eq!(
+            pattern(IrBinOp::SRem, 0xFFFF_FFFF, 2, IrType::U32),
+            Some(0xFFFF_FFFF)
+        );
+        assert_eq!(pattern(IrBinOp::SDiv, 0xFFFF_FFFF, 2, IrType::U32), Some(0));
+        assert_eq!(
+            pattern(IrBinOp::AShr, 0xFFFF_FFFF, 1, IrType::U32),
+            Some(0xFFFF_FFFF)
+        );
+        assert_eq!(pattern(IrBinOp::SRem, 0xFFFF, 2, IrType::U16), Some(0xFFFF));
+        // A 64-bit operand needs no extension at all.
+        assert_eq!(fold_binop(IrBinOp::SRem, -1, 2, IrType::U64), Some(-1));
+        // Values that are already sign-extended are unchanged.
+        assert_eq!(fold_binop(IrBinOp::SRem, -7, 3, IrType::I32), Some(-1));
+        assert_eq!(fold_binop(IrBinOp::SRem, -7, 3, IrType::I8), Some(-1));
+        assert_eq!(fold_binop(IrBinOp::AShr, -8, 1, IrType::I16), Some(-4));
+        // The unsigned forms keep their own reinterpretation.
+        assert_eq!(
+            fold_binop(IrBinOp::URem, 0xFFFF_FFFF, 2, IrType::U32),
+            Some(1)
+        );
+        // Widths with no i64 representative (a `Void`, a 128-bit operand) are
+        // returned untouched instead of being shifted by 64, which would panic
+        // under debug assertions.
+        assert_eq!(signed_operand(-1, IrType::Void), -1);
+        assert_eq!(signed_operand(0xFFFF_FFFF, IrType::I128), 0xFFFF_FFFF);
     }
 
     #[test]

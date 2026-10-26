@@ -678,6 +678,11 @@ fn expand_sdiv32(
         let k = d.trailing_zeros();
         let mut insts = Vec::with_capacity(16);
 
+        // Truncating division floors towards zero, so a negative dividend needs
+        // `2^k - 1` added before the arithmetic shift.  That is the sign
+        // broadcast narrowed to k bits, and the sign has to be materialised
+        // first: the top k bits of `x` are not the broadcast (`0x80000001` has
+        // top bits `1000`, and rounding it needs `1111`).
         let sign = fresh_value(next_id);
         insts.push(Instruction::BinOp {
             dest: sign,
@@ -835,6 +840,57 @@ fn expand_srem32(
 ) -> Option<Vec<Instruction>> {
     if d < 2 {
         return None;
+    }
+
+    if (d as u32).is_power_of_two() {
+        // `x % 2^k` truncating: add the top-`k`-bits bias, mask the low bits and
+        // take the bias back out.  `t` is 0 for a non-negative `x` and `2^k - 1`
+        // for a negative one, so the masked sum is `x mod 2^k` shifted by the
+        // bias, and subtracting it restores the truncating sign.  Four
+        // instructions, no quotient and no magic constant.
+        let k = (d as u32).trailing_zeros();
+        let mask = (1u32 << k) - 1;
+        let sign = fresh_value(next_id);
+        let bias = fresh_value(next_id);
+        let biased = fresh_value(next_id);
+        let masked = fresh_value(next_id);
+        return Some(vec![
+            Instruction::BinOp {
+                dest: sign,
+                op: IrBinOp::AShr,
+                lhs: *x,
+                rhs: Operand::Const(IrConst::I32(31)),
+                ty,
+            },
+            Instruction::BinOp {
+                dest: bias,
+                op: IrBinOp::And,
+                lhs: Operand::Value(sign),
+                rhs: Operand::Const(IrConst::I32(mask as i32)),
+                ty,
+            },
+            Instruction::BinOp {
+                dest: biased,
+                op: IrBinOp::Add,
+                lhs: *x,
+                rhs: Operand::Value(bias),
+                ty,
+            },
+            Instruction::BinOp {
+                dest: masked,
+                op: IrBinOp::And,
+                lhs: Operand::Value(biased),
+                rhs: Operand::Const(IrConst::I32(mask as i32)),
+                ty,
+            },
+            Instruction::BinOp {
+                dest,
+                op: IrBinOp::Sub,
+                lhs: Operand::Value(masked),
+                rhs: Operand::Value(bias),
+                ty,
+            },
+        ]);
     }
 
     let quotient = fresh_value(next_id);
@@ -1105,6 +1161,8 @@ fn expand_sdiv64(dest: Value, x: &Operand, d: i64, next_id: &mut u32) -> Option<
         let k = d.trailing_zeros();
         let mut insts = Vec::with_capacity(16);
 
+        // Same bias argument as the 32-bit path: the rounding correction is the
+        // sign broadcast narrowed to k bits, which needs the sign first.
         let sign = fresh_value(next_id);
         insts.push(Instruction::BinOp {
             dest: sign,
@@ -1268,6 +1326,53 @@ fn expand_urem64(
 fn expand_srem64(dest: Value, x: &Operand, d: i64, next_id: &mut u32) -> Option<Vec<Instruction>> {
     if d < 2 {
         return None;
+    }
+
+    if (d as u64).is_power_of_two() {
+        // Same four-instruction form as the 32-bit path, at 64 bits.
+        let k = (d as u64).trailing_zeros();
+        let mask = (1u64 << k) - 1;
+        let sign = fresh_value(next_id);
+        let bias = fresh_value(next_id);
+        let biased = fresh_value(next_id);
+        let masked = fresh_value(next_id);
+        return Some(vec![
+            Instruction::BinOp {
+                dest: sign,
+                op: IrBinOp::AShr,
+                lhs: *x,
+                rhs: Operand::Const(IrConst::I64(63)),
+                ty: IrType::I64,
+            },
+            Instruction::BinOp {
+                dest: bias,
+                op: IrBinOp::And,
+                lhs: Operand::Value(sign),
+                rhs: Operand::Const(IrConst::I64(mask as i64)),
+                ty: IrType::I64,
+            },
+            Instruction::BinOp {
+                dest: biased,
+                op: IrBinOp::Add,
+                lhs: *x,
+                rhs: Operand::Value(bias),
+                ty: IrType::I64,
+            },
+            Instruction::BinOp {
+                dest: masked,
+                op: IrBinOp::And,
+                lhs: Operand::Value(biased),
+                rhs: Operand::Const(IrConst::I64(mask as i64)),
+                ty: IrType::I64,
+            },
+            Instruction::BinOp {
+                dest,
+                op: IrBinOp::Sub,
+                lhs: Operand::Value(masked),
+                rhs: Operand::Value(bias),
+                ty: IrType::I64,
+            },
+        ]);
     }
 
     let quotient = fresh_value(next_id);
@@ -2209,6 +2314,176 @@ mod tests {
                     "Signed pow2 mod failed for x={} k={}",
                     x,
                     k
+                );
+            }
+        }
+    }
+
+    /// Evaluate a 32-bit expansion directly, since `run_expansion` only models
+    /// the wide sequences.
+    fn run_expansion32(insts: &[Instruction], x: (Value, i32), dest: Value) -> i32 {
+        let mut env: FxHashMap<u32, i32> = FxHashMap::default();
+        env.insert(x.0.0, x.1);
+        let read = |env: &FxHashMap<u32, i32>, op: &Operand| match op {
+            Operand::Value(v) => env[&v.0],
+            Operand::Const(c) => c.to_i128().unwrap() as i32,
+        };
+        for inst in insts {
+            let (d, v) = match inst {
+                Instruction::BinOp {
+                    dest, op, lhs, rhs, ..
+                } => {
+                    let (a, b) = (read(&env, lhs), read(&env, rhs));
+                    let value = match op {
+                        IrBinOp::Add => a.wrapping_add(b),
+                        IrBinOp::Sub => a.wrapping_sub(b),
+                        IrBinOp::Mul => a.wrapping_mul(b),
+                        IrBinOp::And => a & b,
+                        IrBinOp::Or => a | b,
+                        IrBinOp::Xor => a ^ b,
+                        IrBinOp::Shl => ((a as u32) << (b as u32 & 31)) as i32,
+                        IrBinOp::LShr => ((a as u32) >> (b as u32 & 31)) as i32,
+                        IrBinOp::AShr => a >> (b as u32 & 31),
+                        other => panic!("unexpected 32-bit operator {other:?} in {insts:?}"),
+                    };
+                    (*dest, value)
+                }
+                Instruction::Cmp {
+                    dest, op, lhs, rhs, ..
+                } => {
+                    let (a, b) = (read(&env, lhs), read(&env, rhs));
+                    let truth = match op {
+                        IrCmpOp::Eq => a == b,
+                        IrCmpOp::Ne => a != b,
+                        IrCmpOp::Ult => (a as u32) < (b as u32),
+                        IrCmpOp::Ule => (a as u32) <= (b as u32),
+                        IrCmpOp::Ugt => (a as u32) > (b as u32),
+                        IrCmpOp::Uge => (a as u32) >= (b as u32),
+                        IrCmpOp::Slt => a < b,
+                        IrCmpOp::Sle => a <= b,
+                        IrCmpOp::Sgt => a > b,
+                        IrCmpOp::Sge => a >= b,
+                    };
+                    (*dest, i32::from(truth))
+                }
+                Instruction::Copy { dest, src } => (*dest, read(&env, src)),
+                other => panic!("unexpected instruction in a 32-bit expansion: {other:?}"),
+            };
+            env.insert(d.0, v);
+        }
+        env[&dest.0]
+    }
+
+    #[test]
+    fn pow2_signed_expansions_match_truncating_semantics() {
+        let x = Value(1);
+        let q = Value(0);
+        for k in 1..=30 {
+            let d = 1i32 << k;
+            let mut cases = vec![
+                i32::MIN,
+                i32::MIN + 1,
+                i32::MAX,
+                -1,
+                0,
+                1,
+                -d - 1,
+                -d,
+                -d + 1,
+                d - 1,
+                d,
+                d + 1,
+                -12345,
+                12345,
+            ];
+            cases.sort_unstable();
+            cases.dedup();
+            let mut next = 10;
+            let rem = expand_srem32(q, &Operand::Value(x), d, IrType::I32, &mut next).unwrap();
+            let mut next = 10;
+            let div = expand_sdiv32(q, &Operand::Value(x), d, IrType::I32, &mut next).unwrap();
+            assert_eq!(rem.len(), 5, "k={k}: {rem:?}");
+            assert_eq!(div.len(), 4, "k={k}: {div:?}");
+            // The bias is built by materialising the sign and then narrowing
+            // it: the top k bits of the dividend are not the rounding mask.
+            assert!(
+                matches!(
+                    rem[0],
+                    Instruction::BinOp {
+                        op: IrBinOp::AShr,
+                        rhs: Operand::Const(_),
+                        ..
+                    }
+                ),
+                "k={k}: {rem:?}"
+            );
+            for &v in &cases {
+                assert_eq!(
+                    run_expansion32(&rem, (x, v), q),
+                    v % d,
+                    "srem32 {v} % {d}: {rem:?}"
+                );
+                assert_eq!(
+                    run_expansion32(&div, (x, v), q),
+                    v.wrapping_div(d),
+                    "sdiv32 {v} / {d}: {div:?}"
+                );
+            }
+        }
+        for k in 1..=62 {
+            let d = 1i64 << k;
+            let mut cases = vec![
+                i64::MIN,
+                i64::MIN + 1,
+                i64::MAX,
+                -1,
+                0,
+                1,
+                -d - 1,
+                -d,
+                -d + 1,
+                d - 1,
+                d,
+                d + 1,
+                -1234567890123,
+                1234567890123,
+            ];
+            if d > 2 {
+                cases.push(-(d / 2));
+                cases.push(d / 2);
+                cases.push(d / 2 - 1);
+            }
+            cases.sort_unstable();
+            cases.dedup();
+            let mut next = 10;
+            let rem = expand_srem64(q, &Operand::Value(x), d, &mut next).unwrap();
+            let mut next = 10;
+            let div = expand_sdiv64(q, &Operand::Value(x), d, &mut next).unwrap();
+            assert_eq!(rem.len(), 5, "k={k}: {rem:?}");
+            assert_eq!(div.len(), 4, "k={k}: {div:?}");
+            // The bias is built by materialising the sign and then narrowing
+            // it: the top k bits of the dividend are not the rounding mask.
+            assert!(
+                matches!(
+                    rem[0],
+                    Instruction::BinOp {
+                        op: IrBinOp::AShr,
+                        rhs: Operand::Const(_),
+                        ..
+                    }
+                ),
+                "k={k}: {rem:?}"
+            );
+            for &v in &cases {
+                assert_eq!(
+                    run_expansion(&rem, (x, v), q),
+                    v % d,
+                    "srem64 {v} % {d}: {rem:?}"
+                );
+                assert_eq!(
+                    run_expansion(&div, (x, v), q),
+                    v.wrapping_div(d),
+                    "sdiv64 {v} / {d}: {div:?}"
                 );
             }
         }

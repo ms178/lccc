@@ -1,0 +1,4248 @@
+{
+ "query": "repo:llvm/llvm-project is:issue \"missed optimization\" in:title",
+ "sampled": 500,
+ "oracle": "gcc-16 16.2.0 (-O2), plus the lccc build under test",
+ "verdicts": {
+  "already-at-oracle": 16,
+  "confirmed-gap-deferred": 30,
+  "folded-this-batch": 7,
+  "fp-semantics": 44,
+  "loop-or-cfg": 86,
+  "memory-or-abi": 44,
+  "needs-ub-premise": 108,
+  "non-x86-target": 27,
+  "other-language": 21,
+  "scalar-unprobed": 54,
+  "vector-or-simd": 53,
+  "x86-only-isa": 10
+ },
+ "reviewed": 58,
+ "rows": [
+  {
+   "issue": 233753,
+   "title": "Missed optimization about \"abs(x) == 0\" to \"x == 0\"",
+   "created": "2026-10-20T09:03:25Z",
+   "verdict": "already-at-oracle",
+   "evidence": "measured",
+   "reason": "measured parity or better against the GCC 16.2 oracle (lccc 4 vs GCC 4 instructions)"
+  },
+  {
+   "issue": 231062,
+   "title": "[MLIR] Missed Optimization: scf-for-loop-peeling skips front peeling due to floating-point rounding",
+   "created": "2026-10-12T04:11:00Z",
+   "verdict": "other-language",
+   "evidence": "text-rule",
+   "reason": "outside the C integer front end lccc compiles (matched 'mlir')"
+  },
+  {
+   "issue": 230763,
+   "title": "[InstCombine] Missed optimization concerning relationship between x and trunc(x)",
+   "created": "2026-10-10T09:01:00Z",
+   "verdict": "already-at-oracle",
+   "evidence": "measured",
+   "reason": "measured parity or better against the GCC 16.2 oracle (lccc 2 vs GCC 2 instructions)"
+  },
+  {
+   "issue": 230424,
+   "title": "Missed optimization about or == 0/or != 0",
+   "created": "2026-10-09T09:31:07Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'nsw')"
+  },
+  {
+   "issue": 230409,
+   "title": "Missed optimization about the sign of srem",
+   "created": "2026-10-09T08:41:23Z",
+   "verdict": "folded-this-batch",
+   "evidence": "measured",
+   "reason": "folded here: the quotient-zero window is the sign test for srem(x, C) (measured with the same window)"
+  },
+  {
+   "issue": 230347,
+   "title": "Missed optimization about intermediate expression reuse",
+   "created": "2026-10-09T03:24:46Z",
+   "verdict": "scalar-unprobed",
+   "evidence": "text-rule",
+   "reason": "scalar shape with no vector/FP/UB/CFG premise in the report text that a single-function probe can decide"
+  },
+  {
+   "issue": 228647,
+   "title": "[MLIR] Missed Optimization: Constants defined inside loops prevent loop range folding",
+   "created": "2026-10-03T03:28:58Z",
+   "verdict": "other-language",
+   "evidence": "text-rule",
+   "reason": "outside the C integer front end lccc compiles (matched 'mlir')"
+  },
+  {
+   "issue": 228644,
+   "title": "[MLIR] Missed Optimization: XeGPU reduction decomposition loses dimension mapping for nested slice layouts",
+   "created": "2026-10-03T03:17:43Z",
+   "verdict": "vector-or-simd",
+   "evidence": "text-rule",
+   "reason": "vector/SIMD shape: the scalar ring contract does not model lanes, shuffles or per-lane saturation (matched 'lane')"
+  },
+  {
+   "issue": 228474,
+   "title": "[MLIR] Missed Optimization: Self-addition of the induction variable is not folded into the loop range",
+   "created": "2026-10-02T14:58:36Z",
+   "verdict": "other-language",
+   "evidence": "text-rule",
+   "reason": "outside the C integer front end lccc compiles (matched 'mlir')"
+  },
+  {
+   "issue": 228470,
+   "title": "[MLIR] Missed Optimization: `scf-for-loop-specialization` ignores constant affine.min operands",
+   "created": "2026-10-02T14:52:57Z",
+   "verdict": "other-language",
+   "evidence": "text-rule",
+   "reason": "outside the C integer front end lccc compiles (matched 'mlir')"
+  },
+  {
+   "issue": 228463,
+   "title": "[MLIR] Missed Optimization: Inner loops are not revisited after outer-loop range folding",
+   "created": "2026-10-02T14:42:05Z",
+   "verdict": "other-language",
+   "evidence": "text-rule",
+   "reason": "outside the C integer front end lccc compiles (matched 'mlir')"
+  },
+  {
+   "issue": 228318,
+   "title": "[MLIR] Missed Optimization: XeGPU layout propagation misses redundant round-trip conversions with multiple users",
+   "created": "2026-10-02T04:22:54Z",
+   "verdict": "vector-or-simd",
+   "evidence": "text-rule",
+   "reason": "vector/SIMD shape: the scalar ring contract does not model lanes, shuffles or per-lane saturation (matched 'vector')"
+  },
+  {
+   "issue": 228315,
+   "title": "[MLIR] Missed Optimization: FP16 division expansion drops nnan",
+   "created": "2026-10-02T04:07:40Z",
+   "verdict": "other-language",
+   "evidence": "text-rule",
+   "reason": "outside the C integer front end lccc compiles (matched 'mlir')"
+  },
+  {
+   "issue": 228126,
+   "title": "[MLIR] Missed Optimization: Sparse vectorization rejects loop-invariant block arguments",
+   "created": "2026-10-01T16:15:43Z",
+   "verdict": "vector-or-simd",
+   "evidence": "text-rule",
+   "reason": "vector/SIMD shape: the scalar ring contract does not model lanes, shuffles or per-lane saturation (matched 'vectorization')"
+  },
+  {
+   "issue": 228123,
+   "title": "[MLIR] Missed Optimization: XeGPU layout propagation inserts duplicate conversions for repeated operands",
+   "created": "2026-10-01T16:08:44Z",
+   "verdict": "vector-or-simd",
+   "evidence": "text-rule",
+   "reason": "vector/SIMD shape: the scalar ring contract does not model lanes, shuffles or per-lane saturation (matched 'vector')"
+  },
+  {
+   "issue": 227996,
+   "title": "[MLIR] Missed Optimization: Partial ownership simplification leaves redundant deallocation candidates",
+   "created": "2026-10-01T08:49:46Z",
+   "verdict": "other-language",
+   "evidence": "text-rule",
+   "reason": "outside the C integer front end lccc compiles (matched 'mlir')"
+  },
+  {
+   "issue": 227993,
+   "title": "[MLIR] Missed Optimization: `fold-tensor-subset-ops` rejects in-bounds transfer reads with explicit masks",
+   "created": "2026-10-01T08:31:25Z",
+   "verdict": "vector-or-simd",
+   "evidence": "text-rule",
+   "reason": "vector/SIMD shape: the scalar ring contract does not model lanes, shuffles or per-lane saturation (matched 'vector')"
+  },
+  {
+   "issue": 227542,
+   "title": "[MLIR] Missed Optimization: Barrier retained because `memref.copy` is treated as capturing",
+   "created": "2026-09-30T02:58:13Z",
+   "verdict": "other-language",
+   "evidence": "text-rule",
+   "reason": "outside the C integer front end lccc compiles (matched 'mlir')"
+  },
+  {
+   "issue": 227366,
+   "title": "[MLIR] Missed Optimization: Disjoint stores prevent hoisting an invariant `affine.load`",
+   "created": "2026-09-29T16:10:24Z",
+   "verdict": "other-language",
+   "evidence": "text-rule",
+   "reason": "outside the C integer front end lccc compiles (matched 'mlir')"
+  },
+  {
+   "issue": 227363,
+   "title": "[MLIR] Missed Optimization: Deallocation is not moved immediately after an unused allocation",
+   "created": "2026-09-29T16:05:57Z",
+   "verdict": "other-language",
+   "evidence": "text-rule",
+   "reason": "outside the C integer front end lccc compiles (matched 'mlir')"
+  },
+  {
+   "issue": 226940,
+   "title": "[MLIR] Missed Optimization: Equivalent buffer result elimination depends on function order",
+   "created": "2026-09-28T10:02:41Z",
+   "verdict": "other-language",
+   "evidence": "text-rule",
+   "reason": "outside the C integer front end lccc compiles (matched 'mlir')"
+  },
+  {
+   "issue": 226878,
+   "title": "[MLIR] Missed Optimization: Loop-invariant arithmetic inside `affine.if` is not hoisted",
+   "created": "2026-09-28T03:56:15Z",
+   "verdict": "other-language",
+   "evidence": "text-rule",
+   "reason": "outside the C integer front end lccc compiles (matched 'mlir')"
+  },
+  {
+   "issue": 226767,
+   "title": "[MLIR] Missed Optimization: Incomplete elimination of a tensor.empty shared by conditional branches",
+   "created": "2026-09-27T07:51:57Z",
+   "verdict": "other-language",
+   "evidence": "text-rule",
+   "reason": "outside the C integer front end lccc compiles (matched 'mlir')"
+  },
+  {
+   "issue": 226271,
+   "title": "Missed optimization: member-wise copy of a 16-byte struct generates two 64-bit copies instead of a single 128-bit copy",
+   "created": "2026-09-24T18:56:02Z",
+   "verdict": "non-x86-target",
+   "evidence": "text-rule",
+   "reason": "target-specific lowering: instruction selection belongs to the backend, not to an IR fold (matched 'aarch64')"
+  },
+  {
+   "issue": 225578,
+   "title": "[GlobalISel][AArch64] Missed optimization for bitcast vector to scalar",
+   "created": "2026-09-23T02:58:28Z",
+   "verdict": "vector-or-simd",
+   "evidence": "text-rule",
+   "reason": "vector/SIMD shape: the scalar ring contract does not model lanes, shuffles or per-lane saturation (matched 'vector')"
+  },
+  {
+   "issue": 224927,
+   "title": "[MLIR] Missed Optimization: Mixed `index_cast` and `index_castui` round trips are not folded",
+   "created": "2026-09-20T13:00:36Z",
+   "verdict": "other-language",
+   "evidence": "text-rule",
+   "reason": "outside the C integer front end lccc compiles (matched 'mlir')"
+  },
+  {
+   "issue": 224892,
+   "title": "[MLIR] Missed Optimization: Loop hoisting blocked by nested `scf.execute_region`",
+   "created": "2026-09-20T08:09:37Z",
+   "verdict": "other-language",
+   "evidence": "text-rule",
+   "reason": "outside the C integer front end lccc compiles (matched 'mlir')"
+  },
+  {
+   "issue": 224630,
+   "title": "[MLIR] Missed Optimization: remui elimination with a sign-bit-set constant divisor",
+   "created": "2026-09-18T13:13:58Z",
+   "verdict": "other-language",
+   "evidence": "text-rule",
+   "reason": "outside the C integer front end lccc compiles (matched 'mlir')"
+  },
+  {
+   "issue": 224294,
+   "title": "[MLIR] Missed Optimization: `--gpu-eliminate-barriers` fails to eliminate redundant barrier across `memref.alloca_scope`",
+   "created": "2026-09-17T13:24:55Z",
+   "verdict": "other-language",
+   "evidence": "text-rule",
+   "reason": "outside the C integer front end lccc compiles (matched 'mlir')"
+  },
+  {
+   "issue": 223993,
+   "title": "[MLIR] Missed optimization: Redundant `gpu.barrier` between consecutive read operations",
+   "created": "2026-09-16T12:23:58Z",
+   "verdict": "other-language",
+   "evidence": "text-rule",
+   "reason": "outside the C integer front end lccc compiles (matched 'mlir')"
+  },
+  {
+   "issue": 223159,
+   "title": "[Missed Optimization][X86] Clang generates ~3x slower code with -march=bdver2 compared to generic x86-64 target (with possible solution)",
+   "created": "2026-09-12T16:00:19Z",
+   "verdict": "vector-or-simd",
+   "evidence": "text-rule",
+   "reason": "vector/SIMD shape: the scalar ring contract does not model lanes, shuffles or per-lane saturation (matched 'vector')"
+  },
+  {
+   "issue": 219479,
+   "title": "[x86] Missed optimization: `MEMBARRIER` pseudo-instruction prevents branch folding and elimination",
+   "created": "2026-08-28T14:01:37Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'nonnull')"
+  },
+  {
+   "issue": 219415,
+   "title": "Post comment on llvm:instcombine + missed-optimization issues",
+   "created": "2026-08-28T08:59:22Z",
+   "verdict": "scalar-unprobed",
+   "evidence": "text-rule",
+   "reason": "scalar shape with no vector/FP/UB/CFG premise in the report text that a single-function probe can decide"
+  },
+  {
+   "issue": 218553,
+   "title": "Missed optimization to or disjoint",
+   "created": "2026-08-24T23:42:17Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'assume')"
+  },
+  {
+   "issue": 218235,
+   "title": "Missed X86 optimization of or to use lea when x < CST and TYPE is u16",
+   "created": "2026-08-23T12:45:32Z",
+   "verdict": "scalar-unprobed",
+   "evidence": "text-rule",
+   "reason": "scalar shape with no vector/FP/UB/CFG premise in the report text that a single-function probe can decide"
+  },
+  {
+   "issue": 218231,
+   "title": "Missed optimization of ctzg when operating on less than C's int prec due to zext.",
+   "created": "2026-08-23T11:26:40Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'tail')"
+  },
+  {
+   "issue": 216391,
+   "title": "[Missed Optimization] Idiom recognition for contiguous interval membership tests",
+   "created": "2026-08-14T19:58:45Z",
+   "verdict": "fp-semantics",
+   "evidence": "text-rule",
+   "reason": "floating-point semantics: NaN, signed-zero and fast-math premises are outside the integer ring contract (matched 'double')"
+  },
+  {
+   "issue": 216390,
+   "title": "[Missed Optimization] Idiom recognition for C23 `memalignment` pointer alignment loops",
+   "created": "2026-08-14T19:58:33Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'loop')"
+  },
+  {
+   "issue": 215254,
+   "title": "[Regression][Clang 14] Missed optimization when combining adjacent extracted bit fields",
+   "created": "2026-08-10T11:56:55Z",
+   "verdict": "non-x86-target",
+   "evidence": "text-rule",
+   "reason": "target-specific lowering: instruction selection belongs to the backend, not to an IR fold (matched 'aarch64')"
+  },
+  {
+   "issue": 215060,
+   "title": "[InstCombine] Missed optimization: fold compare-only srem(x, C) vs x to signed range checks",
+   "created": "2026-08-09T06:22:05Z",
+   "verdict": "folded-this-batch",
+   "evidence": "measured",
+   "reason": "folded here: compare-only srem(x, C) vs x becomes one wrapping add plus one unsigned window compare (measured 14 -> 5 instructions)"
+  },
+  {
+   "issue": 214665,
+   "title": "[opt] Missed optimization: `loop-deletion` preserving ScalarEvolution leaves a stale, less precise SCEV; then `loop-reduce` missed its optimization",
+   "created": "2026-08-07T08:47:32Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'nsw')"
+  },
+  {
+   "issue": 213872,
+   "title": "[opt] Missed optimization in `constraint-elimination`: Preserving ScalarEvolution leaves a stale, less precise SCEV; `indvars` then fails to fold a guard",
+   "created": "2026-08-04T08:33:39Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'scev')"
+  },
+  {
+   "issue": 213517,
+   "title": "[InstCombine] Missed optimization for constant-LHS fsub of integer-to-float cast",
+   "created": "2026-08-02T09:24:27Z",
+   "verdict": "fp-semantics",
+   "evidence": "text-rule",
+   "reason": "floating-point semantics: NaN, signed-zero and fast-math premises are outside the integer ring contract (matched 'fsub')"
+  },
+  {
+   "issue": 212908,
+   "title": "Missed optimization: bit-scan loops are not folded to x & (x-1) and the three neighbouring identities",
+   "created": "2026-07-30T00:41:54Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'loop')"
+  },
+  {
+   "issue": 209276,
+   "title": "Missed optimization opportunity: collapsing jump table",
+   "created": "2026-07-13T19:23:27Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'jump table')"
+  },
+  {
+   "issue": 208549,
+   "title": "[RISCV] RV64 missed optimization? Narrow `trunc(load i64)` to `lbu`",
+   "created": "2026-07-09T20:11:54Z",
+   "verdict": "non-x86-target",
+   "evidence": "text-rule",
+   "reason": "target-specific lowering: instruction selection belongs to the backend, not to an IR fold (matched 'riscv')"
+  },
+  {
+   "issue": 207886,
+   "title": "[X86][APX] missed ccmp optimization",
+   "created": "2026-07-07T02:27:06Z",
+   "verdict": "x86-only-isa",
+   "evidence": "text-rule",
+   "reason": "x86 instruction-selection detail: owned by the x86 backend, not by an IR-level fold (matched 'ccmp')"
+  },
+  {
+   "issue": 207362,
+   "title": "missed optimization of some patterns of not-equal operation on x64 simd",
+   "created": "2026-07-03T09:59:27Z",
+   "verdict": "vector-or-simd",
+   "evidence": "text-rule",
+   "reason": "vector/SIMD shape: the scalar ring contract does not model lanes, shuffles or per-lane saturation (matched 'simd')"
+  },
+  {
+   "issue": 206963,
+   "title": "[X86] Missed code-size optimization: no pass promotes VEX\u2192EVEX when EVEX's `disp8*N` yields a shorter encoding",
+   "created": "2026-07-01T12:23:32Z",
+   "verdict": "vector-or-simd",
+   "evidence": "text-rule",
+   "reason": "vector/SIMD shape: the scalar ring contract does not model lanes, shuffles or per-lane saturation (matched 'vector')"
+  },
+  {
+   "issue": 206153,
+   "title": "Missed size optimization of MAX/MIN (x, -1)",
+   "created": "2026-06-26T18:55:43Z",
+   "verdict": "folded-this-batch",
+   "evidence": "measured",
+   "reason": "folded here: a min/max saturated at its own signedness extremum is the identity (measured 4 -> 2); a clamp one step inside the ring is kept"
+  },
+  {
+   "issue": 204851,
+   "title": "missed optimization: ((x ^ mask) >> n) ^ mask to arithmetic shift",
+   "created": "2026-06-19T16:00:03Z",
+   "verdict": "folded-this-batch",
+   "evidence": "measured",
+   "reason": "folded here: ((x ^ m) >> n) ^ m with m the sign broadcast of x becomes a single arithmetic shift (measured 9 -> 4)"
+  },
+  {
+   "issue": 204074,
+   "title": "Possible Missed Optimization at O3",
+   "created": "2026-06-16T07:21:06Z",
+   "verdict": "scalar-unprobed",
+   "evidence": "text-rule",
+   "reason": "scalar shape with no vector/FP/UB/CFG premise in the report text that a single-function probe can decide"
+  },
+  {
+   "issue": 204049,
+   "title": "[Regression] Missed Optimization at O3",
+   "created": "2026-06-16T03:48:33Z",
+   "verdict": "scalar-unprobed",
+   "evidence": "text-rule",
+   "reason": "scalar shape with no vector/FP/UB/CFG premise in the report text that a single-function probe can decide"
+  },
+  {
+   "issue": 204047,
+   "title": "Possible Missed Optimization in O3",
+   "created": "2026-06-16T02:53:48Z",
+   "verdict": "scalar-unprobed",
+   "evidence": "text-rule",
+   "reason": "scalar shape with no vector/FP/UB/CFG premise in the report text that a single-function probe can decide"
+  },
+  {
+   "issue": 202883,
+   "title": "[x86][clang] Missed optimization for memcpy/memmove on AVX512 targets when using [[assume(size <= 64)]]",
+   "created": "2026-06-10T08:12:01Z",
+   "verdict": "vector-or-simd",
+   "evidence": "text-rule",
+   "reason": "vector/SIMD shape: the scalar ring contract does not model lanes, shuffles or per-lane saturation (matched 'avx512')"
+  },
+  {
+   "issue": 202763,
+   "title": "[Control Flow][Missed Optimization][Bug] Duplicate jump instruction generated at O3",
+   "created": "2026-06-09T20:26:37Z",
+   "verdict": "scalar-unprobed",
+   "evidence": "text-rule",
+   "reason": "scalar shape with no vector/FP/UB/CFG premise in the report text that a single-function probe can decide"
+  },
+  {
+   "issue": 202695,
+   "title": "Possible Missed Optimization in O3",
+   "created": "2026-06-09T15:46:01Z",
+   "verdict": "scalar-unprobed",
+   "evidence": "text-rule",
+   "reason": "scalar shape with no vector/FP/UB/CFG premise in the report text that a single-function probe can decide"
+  },
+  {
+   "issue": 202467,
+   "title": "Missed optimization: `scmp(sext(x))` can be folded to `scmp(x)`",
+   "created": "2026-06-09T00:10:38Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'nonnull')"
+  },
+  {
+   "issue": 202245,
+   "title": "[missed-optimization] Missed optimization of ashr + or to smax",
+   "created": "2026-06-08T01:35:35Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'tail')"
+  },
+  {
+   "issue": 202239,
+   "title": "[X86] Missed optimization for SIMD `icmp uge 16xi8` when one of the paramters is known to be less than `0x80`",
+   "created": "2026-06-07T23:49:58Z",
+   "verdict": "vector-or-simd",
+   "evidence": "text-rule",
+   "reason": "vector/SIMD shape: the scalar ring contract does not model lanes, shuffles or per-lane saturation (matched 'simd')"
+  },
+  {
+   "issue": 201731,
+   "title": "[clang] missed optimization with libstdc++-16's `std::start_lifetime_as`",
+   "created": "2026-06-05T01:53:56Z",
+   "verdict": "memory-or-abi",
+   "evidence": "text-rule",
+   "reason": "memory or ABI lowering: not an integer-identity rewrite (matched 'struct')"
+  },
+  {
+   "issue": 201704,
+   "title": "Missed optimization: movaps initialization of repetitive data",
+   "created": "2026-06-04T21:50:00Z",
+   "verdict": "memory-or-abi",
+   "evidence": "text-rule",
+   "reason": "memory or ABI lowering: not an integer-identity rewrite (matched 'load')"
+  },
+  {
+   "issue": 201436,
+   "title": "Missed optimization with `sbb` (possible regression from clang 22)",
+   "created": "2026-06-03T19:14:42Z",
+   "verdict": "x86-only-isa",
+   "evidence": "text-rule",
+   "reason": "x86 instruction-selection detail: owned by the x86 backend, not by an IR-level fold (matched 'sbb')"
+  },
+  {
+   "issue": 201328,
+   "title": "missed optimization of and + csel + sub",
+   "created": "2026-06-03T11:44:58Z",
+   "verdict": "scalar-unprobed",
+   "evidence": "text-rule",
+   "reason": "scalar shape with no vector/FP/UB/CFG premise in the report text that a single-function probe can decide"
+  },
+  {
+   "issue": 200750,
+   "title": "[FMF] Missed optimization: Ordered FP clamp only lowers to fmaxnm/fminnm when no-NaN is explicit",
+   "created": "2026-06-01T08:20:01Z",
+   "verdict": "non-x86-target",
+   "evidence": "text-rule",
+   "reason": "target-specific lowering: instruction selection belongs to the backend, not to an IR fold (matched 'aarch64')"
+  },
+  {
+   "issue": 200713,
+   "title": "[InstSimplify] Missed optimization: fsub x, x -> 0 does not use computeKnownFPClass-proven no-NaN facts",
+   "created": "2026-06-01T04:39:02Z",
+   "verdict": "fp-semantics",
+   "evidence": "text-rule",
+   "reason": "floating-point semantics: NaN, signed-zero and fast-math premises are outside the integer ring contract (matched 'fsub')"
+  },
+  {
+   "issue": 200556,
+   "title": "[missed-optimization] `clmul(x, ~0)` is a special case",
+   "created": "2026-05-30T09:18:03Z",
+   "verdict": "confirmed-gap-deferred",
+   "evidence": "measured",
+   "reason": "measured gap (lccc 6 vs GCC 4 instructions): demanded-bits analysis on the low bit before the select",
+   "batch4": {
+    "lccc": 6,
+    "lccc_folds_off": 6,
+    "lccc_passes_off": 6,
+    "gcc": 4,
+    "status": "gap"
+   }
+  },
+  {
+   "issue": 200538,
+   "title": "[missed-optimization] 1 >> x to x == 0",
+   "created": "2026-05-30T01:27:25Z",
+   "verdict": "confirmed-gap-deferred",
+   "evidence": "measured",
+   "reason": "measured gap (lccc 7 vs GCC 4 instructions): needs a range fact on a runtime shift count (x < 1); lccc has no shift-count range analysis",
+   "batch4": {
+    "lccc": 7,
+    "lccc_folds_off": 7,
+    "lccc_passes_off": 7,
+    "gcc": 4,
+    "status": "gap"
+   }
+  },
+  {
+   "issue": 200511,
+   "title": "Missed optimization: Clang fails to prove local object data pointer cannot alias reference parameter",
+   "created": "2026-05-29T22:16:47Z",
+   "verdict": "fp-semantics",
+   "evidence": "text-rule",
+   "reason": "floating-point semantics: NaN, signed-zero and fast-math premises are outside the integer ring contract (matched 'double')"
+  },
+  {
+   "issue": 199893,
+   "title": "[FMF] Missed optimization: integer-derived no-NaN fact not used for ordered fcmp lowering",
+   "created": "2026-05-27T07:06:05Z",
+   "verdict": "fp-semantics",
+   "evidence": "text-rule",
+   "reason": "floating-point semantics: NaN, signed-zero and fast-math premises are outside the integer ring contract (matched 'fmf')"
+  },
+  {
+   "issue": 199813,
+   "title": "AArch64 missed optimization: 32-bit narrowing prevents shifted-register EOR selection",
+   "created": "2026-05-27T02:40:00Z",
+   "verdict": "non-x86-target",
+   "evidence": "text-rule",
+   "reason": "target-specific lowering: instruction selection belongs to the backend, not to an IR fold (matched 'aarch64')"
+  },
+  {
+   "issue": 199532,
+   "title": "[missed-optimization] `a != b` implies that a or b is also non-zero",
+   "created": "2026-05-25T14:01:55Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'switch')"
+  },
+  {
+   "issue": 198061,
+   "title": "[X86] Missed Optimization: Vector 8-bit `ashr(x, 1)` should be lowered as `pavgb(x, -1) ^ (~x & 0x80)`",
+   "created": "2026-05-16T04:26:57Z",
+   "verdict": "vector-or-simd",
+   "evidence": "text-rule",
+   "reason": "vector/SIMD shape: the scalar ring contract does not model lanes, shuffles or per-lane saturation (matched 'vector')"
+  },
+  {
+   "issue": 198060,
+   "title": "[X86] Missed Optimization: Vector 8-bit `rotr(x, 1)` should be lowered as `pavgb(x, -(x & 1))`",
+   "created": "2026-05-16T04:09:29Z",
+   "verdict": "vector-or-simd",
+   "evidence": "text-rule",
+   "reason": "vector/SIMD shape: the scalar ring contract does not model lanes, shuffles or per-lane saturation (matched 'vector')"
+  },
+  {
+   "issue": 198059,
+   "title": "[X86] Missed Optimization: Vector 8-bit `rotl(x, 1)` should be lowered as `(x + x) - (x < 0)`",
+   "created": "2026-05-16T04:09:00Z",
+   "verdict": "vector-or-simd",
+   "evidence": "text-rule",
+   "reason": "vector/SIMD shape: the scalar ring contract does not model lanes, shuffles or per-lane saturation (matched 'vector')"
+  },
+  {
+   "issue": 197671,
+   "title": "Missed optimization: unnecessary comparison with __builtin_add_overflow and duplicate addition on AArch64",
+   "created": "2026-05-14T12:45:31Z",
+   "verdict": "non-x86-target",
+   "evidence": "text-rule",
+   "reason": "target-specific lowering: instruction selection belongs to the backend, not to an IR fold (matched 'aarch64')"
+  },
+  {
+   "issue": 197515,
+   "title": "[InstCombine] Missed optimization: dead heap allocation not removed when captured into an alloca",
+   "created": "2026-05-13T17:17:23Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'inbounds')"
+  },
+  {
+   "issue": 196233,
+   "title": "[Missed Optimization] LLVM fails to pull square across cmp and into constant",
+   "created": "2026-05-07T04:09:32Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'nuw')"
+  },
+  {
+   "issue": 196180,
+   "title": "missed optimization: combine writes to atomics",
+   "created": "2026-05-06T21:01:02Z",
+   "verdict": "memory-or-abi",
+   "evidence": "text-rule",
+   "reason": "memory or ABI lowering: not an integer-identity rewrite (matched 'atomic')"
+  },
+  {
+   "issue": 195626,
+   "title": "Missed switch optimization",
+   "created": "2026-05-04T10:10:53Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'switch')"
+  },
+  {
+   "issue": 195078,
+   "title": "[AArch64] Missed optimization for sdiv by const",
+   "created": "2026-04-30T12:57:36Z",
+   "verdict": "non-x86-target",
+   "evidence": "text-rule",
+   "reason": "target-specific lowering: instruction selection belongs to the backend, not to an IR fold (matched 'aarch64')"
+  },
+  {
+   "issue": 195019,
+   "title": "Missed optimization: Fold (xor (xor %1, (and %2, -2)), 1) into (xor %1, (or %2, 1))",
+   "created": "2026-04-30T06:44:00Z",
+   "verdict": "memory-or-abi",
+   "evidence": "text-rule",
+   "reason": "memory or ABI lowering: not an integer-identity rewrite (matched 'store')"
+  },
+  {
+   "issue": 193898,
+   "title": "Missed optimization: Fold (or (or %0, (add (shl %1, 1), 2)), 1) into (or %0, (add (shl %1, 1), 3))",
+   "created": "2026-04-24T06:02:00Z",
+   "verdict": "confirmed-gap-deferred",
+   "evidence": "measured",
+   "reason": "measured gap (lccc 5 vs GCC 4 instructions): reassociation of an or-of-shift-add chain",
+   "batch4": {
+    "lccc": 4,
+    "lccc_folds_off": 4,
+    "lccc_passes_off": 4,
+    "gcc": 4,
+    "status": "at-or-better"
+   }
+  },
+  {
+   "issue": 192221,
+   "title": "[x86] Missed optimization: Conditional checks before vector bitshift instructions aren't folded into the bitshift instruction",
+   "created": "2026-04-15T09:28:19Z",
+   "verdict": "vector-or-simd",
+   "evidence": "text-rule",
+   "reason": "vector/SIMD shape: the scalar ring contract does not model lanes, shuffles or per-lane saturation (matched 'vector')"
+  },
+  {
+   "issue": 191205,
+   "title": "Missed optimization after SimplifyCFG sinks pointer load into conditional block, preventing LoopVectorize from emitting masked load",
+   "created": "2026-04-09T14:28:58Z",
+   "verdict": "vector-or-simd",
+   "evidence": "text-rule",
+   "reason": "vector/SIMD shape: the scalar ring contract does not model lanes, shuffles or per-lane saturation (matched 'vectorizer')"
+  },
+  {
+   "issue": 191193,
+   "title": "Missed optimization opportunity when setting bit fields",
+   "created": "2026-04-09T13:42:56Z",
+   "verdict": "memory-or-abi",
+   "evidence": "text-rule",
+   "reason": "memory or ABI lowering: not an integer-identity rewrite (matched 'struct')"
+  },
+  {
+   "issue": 191171,
+   "title": "Missed optimization: (x + 1) + (y & ~1) ==> x + (y | 1)",
+   "created": "2026-04-09T12:02:07Z",
+   "verdict": "non-x86-target",
+   "evidence": "text-rule",
+   "reason": "target-specific lowering: instruction selection belongs to the backend, not to an IR fold (matched 'powerpc')"
+  },
+  {
+   "issue": 190966,
+   "title": "Missed optimization: ( (%0 + 1) - %1 == 1 ) ==> ( %0 == %1 )",
+   "created": "2026-04-08T12:55:59Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'peel')"
+  },
+  {
+   "issue": 190907,
+   "title": "Missed optimization: (shl %0, 1) * (select %1, 2, 0) ==> %0 * (select %1, 4, 0)",
+   "created": "2026-04-08T04:37:24Z",
+   "verdict": "confirmed-gap-deferred",
+   "evidence": "measured",
+   "reason": "measured gap (lccc 8 vs GCC 7 instructions): multiply reassociation through a select",
+   "batch4": {
+    "lccc": 8,
+    "lccc_folds_off": 8,
+    "lccc_passes_off": 8,
+    "gcc": 7,
+    "status": "gap"
+   }
+  },
+  {
+   "issue": 189320,
+   "title": "Missed optimization: (%0 != 0) implies ((%1 | %0) == 0) ==> false",
+   "created": "2026-03-30T06:06:59Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'tail')"
+  },
+  {
+   "issue": 187968,
+   "title": "Missed optimization: inliner penalizes std::array vs std::span in lambda",
+   "created": "2026-03-23T04:38:06Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'inliner')"
+  },
+  {
+   "issue": 187434,
+   "title": "Missed optimization when `b - a` is known nonnegative inside `select` instruction",
+   "created": "2026-03-19T03:46:34Z",
+   "verdict": "scalar-unprobed",
+   "evidence": "text-rule",
+   "reason": "scalar shape with no vector/FP/UB/CFG premise in the report text that a single-function probe can decide"
+  },
+  {
+   "issue": 187088,
+   "title": "Missed optimization: fabs(uitofp(a) - uitofp(b)) < 1 -> a == b",
+   "created": "2026-03-17T18:32:49Z",
+   "verdict": "fp-semantics",
+   "evidence": "text-rule",
+   "reason": "floating-point semantics: NaN, signed-zero and fast-math premises are outside the integer ring contract (matched 'float')"
+  },
+  {
+   "issue": 187057,
+   "title": "Missed optimization: (x + smin(y, 0)) + smax(y, 0) -> x + y",
+   "created": "2026-03-17T16:52:04Z",
+   "verdict": "confirmed-gap-deferred",
+   "evidence": "measured",
+   "reason": "measured gap (lccc 10 vs GCC 9 instructions): reassociation across two saturating selects (smin + smax = identity needs both extremes proven from one compare)",
+   "batch4": {
+    "lccc": 10,
+    "lccc_folds_off": 10,
+    "lccc_passes_off": 10,
+    "gcc": 9,
+    "status": "gap"
+   }
+  },
+  {
+   "issue": 186559,
+   "title": "Missed optimization: fold gep i8 (gep double %ptr, %x), %x * 24 into gep double %ptr, %x * 4",
+   "created": "2026-03-14T04:22:45Z",
+   "verdict": "fp-semantics",
+   "evidence": "text-rule",
+   "reason": "floating-point semantics: NaN, signed-zero and fast-math premises are outside the integer ring contract (matched 'double')"
+  },
+  {
+   "issue": 186558,
+   "title": "missed optimization: fold fcmp une between two sign-extracting selects to xor",
+   "created": "2026-03-14T04:20:16Z",
+   "verdict": "fp-semantics",
+   "evidence": "text-rule",
+   "reason": "floating-point semantics: NaN, signed-zero and fast-math premises are outside the integer ring contract (matched 'fcmp')"
+  },
+  {
+   "issue": 186556,
+   "title": "Missed optimization: fold fcmp ogt (select x > 0.0, x, 0.0), 1.0 to fcmp ogt x, 1.0",
+   "created": "2026-03-14T04:17:26Z",
+   "verdict": "fp-semantics",
+   "evidence": "text-rule",
+   "reason": "floating-point semantics: NaN, signed-zero and fast-math premises are outside the integer ring contract (matched 'fcmp')"
+  },
+  {
+   "issue": 186554,
+   "title": "Missed optimization: fold frexp(x).exp < C to fabs(x) < 2^(C-1)",
+   "created": "2026-03-14T04:00:12Z",
+   "verdict": "fp-semantics",
+   "evidence": "text-rule",
+   "reason": "floating-point semantics: NaN, signed-zero and fast-math premises are outside the integer ring contract (matched 'float')"
+  },
+  {
+   "issue": 186553,
+   "title": "Missed optimization: fold fcmp (fmul x, C), 0.0 to fcmp x, 0.0 when C > 0.0",
+   "created": "2026-03-14T03:54:48Z",
+   "verdict": "fp-semantics",
+   "evidence": "text-rule",
+   "reason": "floating-point semantics: NaN, signed-zero and fast-math premises are outside the integer ring contract (matched 'fcmp')"
+  },
+  {
+   "issue": 186540,
+   "title": "KnownBits::lshr missed optimization when shifting unknown when the result is exact",
+   "created": "2026-03-14T00:16:57Z",
+   "verdict": "scalar-unprobed",
+   "evidence": "text-rule",
+   "reason": "scalar shape with no vector/FP/UB/CFG premise in the report text that a single-function probe can decide"
+  },
+  {
+   "issue": 186517,
+   "title": "Missed optimization: fold shl (sdiv X, C), log2(C) to and X, -C when X is provably non-negative",
+   "created": "2026-03-13T21:34:21Z",
+   "verdict": "fp-semantics",
+   "evidence": "text-rule",
+   "reason": "floating-point semantics: NaN, signed-zero and fast-math premises are outside the integer ring contract (matched 'float')"
+  },
+  {
+   "issue": 186509,
+   "title": "Missed optimization: fold icmp eq (or (select A, 256, 0), zext B), 257 to and A, B",
+   "created": "2026-03-13T20:45:00Z",
+   "verdict": "fp-semantics",
+   "evidence": "text-rule",
+   "reason": "floating-point semantics: NaN, signed-zero and fast-math premises are outside the integer ring contract (matched 'float')"
+  },
+  {
+   "issue": 186307,
+   "title": "Missed Optimization: failure to reduce chained sign flips to XOR of sign checks.",
+   "created": "2026-03-13T04:03:28Z",
+   "verdict": "fp-semantics",
+   "evidence": "text-rule",
+   "reason": "floating-point semantics: NaN, signed-zero and fast-math premises are outside the integer ring contract (matched 'double')"
+  },
+  {
+   "issue": 186306,
+   "title": "Missed Optimization: failure to simplify (|x| + |y|) == 0 into (x == 0) && (y == 0)",
+   "created": "2026-03-13T04:02:40Z",
+   "verdict": "fp-semantics",
+   "evidence": "text-rule",
+   "reason": "floating-point semantics: NaN, signed-zero and fast-math premises are outside the integer ring contract (matched 'double')"
+  },
+  {
+   "issue": 186300,
+   "title": "Missed Optimization: implemented using icmp and select and replace it with llvm.maxnum",
+   "created": "2026-03-13T03:09:15Z",
+   "verdict": "fp-semantics",
+   "evidence": "text-rule",
+   "reason": "floating-point semantics: NaN, signed-zero and fast-math premises are outside the integer ring contract (matched 'double')"
+  },
+  {
+   "issue": 186298,
+   "title": "Missed optimization: fold a chain of getelementptr operations with the same index into a single getelementptr with a multiplied index",
+   "created": "2026-03-13T03:02:43Z",
+   "verdict": "fp-semantics",
+   "evidence": "text-rule",
+   "reason": "floating-point semantics: NaN, signed-zero and fast-math premises are outside the integer ring contract (matched 'double')"
+  },
+  {
+   "issue": 185811,
+   "title": "Missed Optimization [WholeProgramDevirt] -O2 pass merges virtual dispatch sites, defeating WPD SingleImpl resolution",
+   "created": "2026-03-11T06:17:07Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'wholeprogramdevirt')"
+  },
+  {
+   "issue": 185734,
+   "title": "Missed Optimization: simplify fcmp of clamped value to direct comparison of original operand",
+   "created": "2026-03-10T19:34:15Z",
+   "verdict": "fp-semantics",
+   "evidence": "text-rule",
+   "reason": "floating-point semantics: NaN, signed-zero and fast-math premises are outside the integer ring contract (matched 'fcmp')"
+  },
+  {
+   "issue": 185698,
+   "title": "Missed optimization: fold fcmp uno/ord of fptrunc into fcmp of original operand",
+   "created": "2026-03-10T17:23:39Z",
+   "verdict": "fp-semantics",
+   "evidence": "text-rule",
+   "reason": "floating-point semantics: NaN, signed-zero and fast-math premises are outside the integer ring contract (matched 'fcmp')"
+  },
+  {
+   "issue": 185694,
+   "title": "Missed optimization: simplify splat-vector bitcast to scalar multiplication/masking",
+   "created": "2026-03-10T17:14:53Z",
+   "verdict": "vector-or-simd",
+   "evidence": "text-rule",
+   "reason": "vector/SIMD shape: the scalar ring contract does not model lanes, shuffles or per-lane saturation (matched 'splat')"
+  },
+  {
+   "issue": 185564,
+   "title": "Missed optimization: Eliminate redundant scalar multiplication by reusing vector multiplication results",
+   "created": "2026-03-10T03:20:21Z",
+   "verdict": "vector-or-simd",
+   "evidence": "text-rule",
+   "reason": "vector/SIMD shape: the scalar ring contract does not model lanes, shuffles or per-lane saturation (matched 'vector')"
+  },
+  {
+   "issue": 185561,
+   "title": "Missed optimization: Fold FP comparison of casted integer back to integer comparison",
+   "created": "2026-03-10T02:55:15Z",
+   "verdict": "fp-semantics",
+   "evidence": "text-rule",
+   "reason": "floating-point semantics: NaN, signed-zero and fast-math premises are outside the integer ring contract (matched 'float')"
+  },
+  {
+   "issue": 185560,
+   "title": "Missed optimization: Canonicalize scalarized vector fcmp + select back to vector operations",
+   "created": "2026-03-10T02:41:50Z",
+   "verdict": "vector-or-simd",
+   "evidence": "text-rule",
+   "reason": "vector/SIMD shape: the scalar ring contract does not model lanes, shuffles or per-lane saturation (matched 'vector')"
+  },
+  {
+   "issue": 185558,
+   "title": "Missed Optimization: Failure to vectorize scalar loads and comparisons into a single vector operation",
+   "created": "2026-03-10T02:35:48Z",
+   "verdict": "vector-or-simd",
+   "evidence": "text-rule",
+   "reason": "vector/SIMD shape: the scalar ring contract does not model lanes, shuffles or per-lane saturation (matched 'vectorize')"
+  },
+  {
+   "issue": 185556,
+   "title": "Missed Optimization: Failure to narrow a wide vector load and adjust GEP offset when only trailing elements are used.",
+   "created": "2026-03-10T02:24:11Z",
+   "verdict": "vector-or-simd",
+   "evidence": "text-rule",
+   "reason": "vector/SIMD shape: the scalar ring contract does not model lanes, shuffles or per-lane saturation (matched 'vector')"
+  },
+  {
+   "issue": 185554,
+   "title": "Missed Optimization: Failure to fold linear floating-point expressions into a single comparison constant.",
+   "created": "2026-03-10T02:09:08Z",
+   "verdict": "fp-semantics",
+   "evidence": "text-rule",
+   "reason": "floating-point semantics: NaN, signed-zero and fast-math premises are outside the integer ring contract (matched 'float')"
+  },
+  {
+   "issue": 185244,
+   "title": "[InstCombine] Missed optimization: `trunc(smax(zext(a) - zext(b), 0)) -> usub.sat(a, b)`",
+   "created": "2026-03-08T03:18:53Z",
+   "verdict": "vector-or-simd",
+   "evidence": "text-rule",
+   "reason": "vector/SIMD shape: the scalar ring contract does not model lanes, shuffles or per-lane saturation (matched 'vector')"
+  },
+  {
+   "issue": 183489,
+   "title": "Missed optimization: `uint64_t` shift/add-by-constant lowered to `__aeabi_lmul` on Cortex-M0",
+   "created": "2026-02-26T10:53:51Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'inline')"
+  },
+  {
+   "issue": 179678,
+   "title": "[X64] Missed optimization for 64/32-bit division (with a 64-bit or a 32-bit result)",
+   "created": "2026-02-04T14:48:24Z",
+   "verdict": "scalar-unprobed",
+   "evidence": "text-rule",
+   "reason": "scalar shape with no vector/FP/UB/CFG premise in the report text that a single-function probe can decide"
+  },
+  {
+   "issue": 174933,
+   "title": "Missed optimization x86-64 clang 21.1.0: lock xadd not replaced with lock add",
+   "created": "2026-01-08T09:24:40Z",
+   "verdict": "memory-or-abi",
+   "evidence": "text-rule",
+   "reason": "memory or ABI lowering: not an integer-identity rewrite (matched 'atomic')"
+  },
+  {
+   "issue": 174633,
+   "title": "Missed Optimization: For positive integers x and y, `x%y==0` implies `x>=y`.",
+   "created": "2026-01-06T18:56:09Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'nonnull')"
+  },
+  {
+   "issue": 172674,
+   "title": "Missed optimization: Avoidable masking for range check of top bits via shifting",
+   "created": "2025-12-17T15:06:00Z",
+   "verdict": "non-x86-target",
+   "evidence": "text-rule",
+   "reason": "target-specific lowering: instruction selection belongs to the backend, not to an IR fold (matched 'arm')"
+  },
+  {
+   "issue": 172460,
+   "title": "Missed optimization: sub-optimal std::string::size codegen",
+   "created": "2025-12-16T11:22:20Z",
+   "verdict": "other-language",
+   "evidence": "text-rule",
+   "reason": "outside the C integer front end lccc compiles (matched 'libcxx')"
+  },
+  {
+   "issue": 172011,
+   "title": "[LoopInterchange] Missed optimization for simple nested loop",
+   "created": "2025-12-12T13:51:48Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'inbounds')"
+  },
+  {
+   "issue": 171606,
+   "title": "Missed optimization: Clang keeps large fixed local array alive across recursive calls, wasting stack space",
+   "created": "2025-12-10T12:19:02Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'stack')"
+  },
+  {
+   "issue": 170071,
+   "title": "Missed Optimization: Unnecessary `icmp` for checking overflow of `add nsw` in `_M_check_len`",
+   "created": "2025-12-01T03:51:35Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'overflow')"
+  },
+  {
+   "issue": 170020,
+   "title": "Missed Optimization: Fold `(x < 2^32) & (trunc(x to i32) == 0)` into `x == 0`",
+   "created": "2025-11-30T03:03:58Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'inbounds')"
+  },
+  {
+   "issue": 169919,
+   "title": "Missed optimization for switches using getelementptr",
+   "created": "2025-11-28T13:46:56Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'switch')"
+  },
+  {
+   "issue": 169437,
+   "title": "Missed optimization: redundant calls to `test` around jumps/moves",
+   "created": "2025-11-25T01:07:35Z",
+   "verdict": "non-x86-target",
+   "evidence": "text-rule",
+   "reason": "target-specific lowering: instruction selection belongs to the backend, not to an IR fold (matched 'aarch64')"
+  },
+  {
+   "issue": 169433,
+   "title": "[flang] missed optimization of product intrinsic",
+   "created": "2025-11-25T00:41:39Z",
+   "verdict": "vector-or-simd",
+   "evidence": "text-rule",
+   "reason": "vector/SIMD shape: the scalar ring contract does not model lanes, shuffles or per-lane saturation (matched 'vector')"
+  },
+  {
+   "issue": 168749,
+   "title": "[DivRemPairs] Missed optimization when remainder is \"folded\" into icmp",
+   "created": "2025-11-19T18:30:15Z",
+   "verdict": "other-language",
+   "evidence": "text-rule",
+   "reason": "outside the C integer front end lccc compiles (matched 'libcxx')"
+  },
+  {
+   "issue": 168580,
+   "title": "Missed optimization with a loop that multiplies counter by 2 until overflow",
+   "created": "2025-11-18T18:03:33Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'overflow')"
+  },
+  {
+   "issue": 167256,
+   "title": "Missed optimization opportunity: flatten branches with function call into one function call that uses CMOV",
+   "created": "2025-11-09T23:16:54Z",
+   "verdict": "x86-only-isa",
+   "evidence": "text-rule",
+   "reason": "x86 instruction-selection detail: owned by the x86 backend, not by an IR-level fold (matched 'tzcnt')"
+  },
+  {
+   "issue": 167199,
+   "title": "Missed Optimization: Fold ((x & (1<<y)) != 0) || ((x & (4<<y)) != 0) to (x & (5<<y)) != 0",
+   "created": "2025-11-09T04:34:26Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'nuw')"
+  },
+  {
+   "issue": 167190,
+   "title": "Missed Optimization: Failure to simplify (x*C1) - ((y+x)*C2) to x*(C1-C2) - (y*C2)",
+   "created": "2025-11-08T23:23:30Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'nsw')"
+  },
+  {
+   "issue": 167183,
+   "title": "Missed Optimization: Failure to simplify ((x << 2) + 31) & -4 to (x << 2) + 28",
+   "created": "2025-11-08T21:46:00Z",
+   "verdict": "memory-or-abi",
+   "evidence": "text-rule",
+   "reason": "memory or ABI lowering: not an integer-identity rewrite (matched 'load')"
+  },
+  {
+   "issue": 167178,
+   "title": "Missed Optimization: simplify ((x lshr 9) + x) < 256 to x < 256",
+   "created": "2025-11-08T21:06:46Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'nuw')"
+  },
+  {
+   "issue": 167173,
+   "title": "Missed Optimization: Fold parity select (x&1 ? (x-1): (x|1) ) into x ^ 1",
+   "created": "2025-11-08T19:58:02Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'nsw')"
+  },
+  {
+   "issue": 167138,
+   "title": "[x86] Missed optimization for AVX2 truncating cast from v8i32 to v8i8",
+   "created": "2025-11-08T13:23:54Z",
+   "verdict": "vector-or-simd",
+   "evidence": "text-rule",
+   "reason": "vector/SIMD shape: the scalar ring contract does not model lanes, shuffles or per-lane saturation (matched 'avx2')"
+  },
+  {
+   "issue": 167117,
+   "title": "Missed Optimization: Missed Unlikely Optimization",
+   "created": "2025-11-08T10:12:02Z",
+   "verdict": "scalar-unprobed",
+   "evidence": "text-rule",
+   "reason": "scalar shape with no vector/FP/UB/CFG premise in the report text that a single-function probe can decide"
+  },
+  {
+   "issue": 167096,
+   "title": "Missed Optimization: Fold Trunc/ZExt around Unsigned Min",
+   "created": "2025-11-08T05:17:04Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'nuw')"
+  },
+  {
+   "issue": 167094,
+   "title": "Missed Optimization: Fold fcmp+select clamp to [-32000, 32000] into maxnum/ minnum pair",
+   "created": "2025-11-08T04:48:40Z",
+   "verdict": "fp-semantics",
+   "evidence": "text-rule",
+   "reason": "floating-point semantics: NaN, signed-zero and fast-math premises are outside the integer ring contract (matched 'fcmp')"
+  },
+  {
+   "issue": 167090,
+   "title": "Missed Optimization: Fold chained umin+add clamps into a single cap",
+   "created": "2025-11-08T04:20:48Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'nuw')"
+  },
+  {
+   "issue": 167079,
+   "title": "Missed Optimization: Rewrite sub(x, select(x<1 ? -1 : 1)) == 0 \u2192 (x == -1) || (x == 1)",
+   "created": "2025-11-08T03:15:03Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'nsw')"
+  },
+  {
+   "issue": 167059,
+   "title": "Missed Optimization: Fold smin(32 - a, b - a) > 0 \u2192 (a < 32) && (a < b)",
+   "created": "2025-11-08T00:13:49Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'nsw')"
+  },
+  {
+   "issue": 167055,
+   "title": "Missed Optimization: Fold  x - umin(x,13) < 2 into single compare x < 15",
+   "created": "2025-11-07T23:47:04Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'nsw')"
+  },
+  {
+   "issue": 167014,
+   "title": "Missed Optimization: Fold chained GEP with constant base into single GEP",
+   "created": "2025-11-07T20:23:26Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'inbounds')"
+  },
+  {
+   "issue": 167003,
+   "title": "Missed Optimization: Fold smin(-a, x - a) + a \u2192 smin(x, 0)",
+   "created": "2025-11-07T19:43:17Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'nsw')"
+  },
+  {
+   "issue": 166973,
+   "title": "Missed Optimization: fold icmp samesign ugt (x - 18), 7 (with nsw subtract) into icmp sgt x, 25",
+   "created": "2025-11-07T17:50:35Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'nsw')"
+  },
+  {
+   "issue": 166890,
+   "title": "Missed Optimization: fold (arg1 + 4095 + arg0) u< 4096 (with nuw/nsw + same-sign) into a zero-sum test icmp ult (arg0 + arg1), 1",
+   "created": "2025-11-07T04:47:14Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'nuw')"
+  },
+  {
+   "issue": 166887,
+   "title": "Missed Optimization: Fold sdiv exact(((trunc x)*24 - 24), 24) into sext(trunc x - 1)",
+   "created": "2025-11-07T03:41:36Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'nuw')"
+  },
+  {
+   "issue": 166885,
+   "title": "Missed Optimization: Fold smin(a - b, -1) + b into a clamp \u2014 select(b < 1, 0, smin(a, b - 1))",
+   "created": "2025-11-07T03:04:56Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'nsw')"
+  },
+  {
+   "issue": 166882,
+   "title": "Missed Optimization: Fold boolean-indexed array GEP into select of base vs. element pointer",
+   "created": "2025-11-07T02:22:55Z",
+   "verdict": "scalar-unprobed",
+   "evidence": "text-rule",
+   "reason": "scalar shape with no vector/FP/UB/CFG premise in the report text that a single-function probe can decide"
+  },
+  {
+   "issue": 166878,
+   "title": "Missed Optimization: fold smax(a, -b) + b into smax(a + b, 0)",
+   "created": "2025-11-07T01:35:48Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'nsw')"
+  },
+  {
+   "issue": 166666,
+   "title": "missed optimization: llvm fails to vectorize when dealing with bools",
+   "created": "2025-11-05T23:16:44Z",
+   "verdict": "vector-or-simd",
+   "evidence": "text-rule",
+   "reason": "vector/SIMD shape: the scalar ring contract does not model lanes, shuffles or per-lane saturation (matched 'vectorize')"
+  },
+  {
+   "issue": 165809,
+   "title": "[Flang][AArch64] Missed optimization opportunities with `unsafe-math-optimizations`",
+   "created": "2025-10-31T00:19:48Z",
+   "verdict": "vector-or-simd",
+   "evidence": "text-rule",
+   "reason": "vector/SIMD shape: the scalar ring contract does not model lanes, shuffles or per-lane saturation (matched 'vectorization')"
+  },
+  {
+   "issue": 165514,
+   "title": "[Flang][AArch64] Missed optimization opportunities with `unsafe-math-optimizations`",
+   "created": "2025-10-29T05:59:57Z",
+   "verdict": "vector-or-simd",
+   "evidence": "text-rule",
+   "reason": "vector/SIMD shape: the scalar ring contract does not model lanes, shuffles or per-lane saturation (matched 'vectorization')"
+  },
+  {
+   "issue": 165484,
+   "title": "Missed stack move optimization when either source or destination has its address captured",
+   "created": "2025-10-28T22:37:53Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'stack')"
+  },
+  {
+   "issue": 165179,
+   "title": "Missed optimization: failure to remove dead edge",
+   "created": "2025-10-26T22:59:40Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'overflow')"
+  },
+  {
+   "issue": 163811,
+   "title": "Missed tail call optimization in branch",
+   "created": "2025-10-16T16:08:27Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'tail')"
+  },
+  {
+   "issue": 163115,
+   "title": "Missed Optimization: fold shift+add then `ashr 1` into smaller shift + add",
+   "created": "2025-10-13T01:13:51Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'nsw')"
+  },
+  {
+   "issue": 163113,
+   "title": "Missed Optimization: eliminate redundant null-check after dereference",
+   "created": "2025-10-13T00:34:45Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'inbounds')"
+  },
+  {
+   "issue": 163112,
+   "title": "Missed Optimization: fold select(C, NonNullPtr, null) == null into !C",
+   "created": "2025-10-13T00:19:21Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'inbounds')"
+  },
+  {
+   "issue": 163110,
+   "title": "Missed Optimization: simplify scaled equality to direct +1 comparison",
+   "created": "2025-10-12T23:58:06Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'nsw')"
+  },
+  {
+   "issue": 163109,
+   "title": "Missed Optimization: hoist GEP out of select by selecting the offset",
+   "created": "2025-10-12T23:43:37Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'inbounds')"
+  },
+  {
+   "issue": 163108,
+   "title": "Missed Optimization: fold disjoint bitwise ORs (with select/zext i1) into a single constant select",
+   "created": "2025-10-12T23:12:35Z",
+   "verdict": "scalar-unprobed",
+   "evidence": "text-rule",
+   "reason": "scalar shape with no vector/FP/UB/CFG premise in the report text that a single-function probe can decide"
+  },
+  {
+   "issue": 163097,
+   "title": "[llvm:optimizations] [missed-optimization] Unable to hoist out call to readonly function in a loop",
+   "created": "2025-10-12T20:51:08Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'loop')"
+  },
+  {
+   "issue": 163093,
+   "title": "Missed Optimization: fold max(0, a-b) + (b-x) == 0 into select(a<0 ? b : a) == x",
+   "created": "2025-10-12T19:07:09Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'inbounds')"
+  },
+  {
+   "issue": 163084,
+   "title": "Missed optimization: fold sdiv exact by constant + icmp ugt into scaled unsigned bound check",
+   "created": "2025-10-12T17:57:37Z",
+   "verdict": "confirmed-gap-deferred",
+   "evidence": "measured",
+   "reason": "measured gap (lccc 13 vs GCC 7 instructions): divisibility test plus a scaled bound check",
+   "batch4": {
+    "lccc": 10,
+    "lccc_folds_off": 10,
+    "lccc_passes_off": 10,
+    "gcc": 7,
+    "status": "gap"
+   }
+  },
+  {
+   "issue": 162599,
+   "title": "[ARM] [Clang] Missed optimization for bool return val arithmetic operations",
+   "created": "2025-10-09T06:36:48Z",
+   "verdict": "non-x86-target",
+   "evidence": "text-rule",
+   "reason": "target-specific lowering: instruction selection belongs to the backend, not to an IR fold (matched 'arm')"
+  },
+  {
+   "issue": 161389,
+   "title": "[Clang] Missed optimization (flatten array access)",
+   "created": "2025-09-30T14:54:15Z",
+   "verdict": "scalar-unprobed",
+   "evidence": "text-rule",
+   "reason": "scalar shape with no vector/FP/UB/CFG premise in the report text that a single-function probe can decide"
+  },
+  {
+   "issue": 160066,
+   "title": "Missed optimization: (vector.reduce.add (splat %0, 4)) ==> shl i32 %0, 2",
+   "created": "2025-09-22T10:36:38Z",
+   "verdict": "vector-or-simd",
+   "evidence": "text-rule",
+   "reason": "vector/SIMD shape: the scalar ring contract does not model lanes, shuffles or per-lane saturation (matched 'vector')"
+  },
+  {
+   "issue": 160001,
+   "title": "Missed optimization: Unreachable branch not eliminated due to circular dependency",
+   "created": "2025-09-21T19:57:56Z",
+   "verdict": "vector-or-simd",
+   "evidence": "text-rule",
+   "reason": "vector/SIMD shape: the scalar ring contract does not model lanes, shuffles or per-lane saturation (matched 'vector')"
+  },
+  {
+   "issue": 158711,
+   "title": "Possible missed optimization on 32-bit platforms",
+   "created": "2025-09-15T18:48:38Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'nonnull')"
+  },
+  {
+   "issue": 158139,
+   "title": "Missed optimization: constant range analysis",
+   "created": "2025-09-11T19:32:19Z",
+   "verdict": "memory-or-abi",
+   "evidence": "text-rule",
+   "reason": "memory or ABI lowering: not an integer-identity rewrite (matched 'store')"
+  },
+  {
+   "issue": 157874,
+   "title": "x86 optimization: Missed merging comparison of isunordered() and islessgreater()",
+   "created": "2025-09-10T15:08:37Z",
+   "verdict": "fp-semantics",
+   "evidence": "text-rule",
+   "reason": "floating-point semantics: NaN, signed-zero and fast-math premises are outside the integer ring contract (matched 'double')"
+  },
+  {
+   "issue": 157524,
+   "title": "Missed Optimization: simplify smin difference to signed less-than",
+   "created": "2025-09-08T18:04:57Z",
+   "verdict": "confirmed-gap-deferred",
+   "evidence": "measured",
+   "reason": "measured gap (lccc 9 vs GCC 4 instructions): needs no-overflow reasoning on `a - b`, i.e. the sub-with-sign-flag family",
+   "batch4": {
+    "lccc": 9,
+    "lccc_folds_off": 9,
+    "lccc_passes_off": 9,
+    "gcc": 4,
+    "status": "gap"
+   }
+  },
+  {
+   "issue": 157486,
+   "title": "Missed Optimization: Convert float clamp pattern to llvm.minnum/llvm.maxnum",
+   "created": "2025-09-08T15:03:56Z",
+   "verdict": "fp-semantics",
+   "evidence": "text-rule",
+   "reason": "floating-point semantics: NaN, signed-zero and fast-math premises are outside the integer ring contract (matched 'float')"
+  },
+  {
+   "issue": 157465,
+   "title": "Missed Optimization: Eliminate manual abs to llvm.fabs intrinsic",
+   "created": "2025-09-08T13:47:22Z",
+   "verdict": "fp-semantics",
+   "evidence": "text-rule",
+   "reason": "floating-point semantics: NaN, signed-zero and fast-math premises are outside the integer ring contract (matched 'double')"
+  },
+  {
+   "issue": 157372,
+   "title": "Missed Optimization: redundant floating-point multiply in comparison",
+   "created": "2025-09-07T23:58:53Z",
+   "verdict": "fp-semantics",
+   "evidence": "text-rule",
+   "reason": "floating-point semantics: NaN, signed-zero and fast-math premises are outside the integer ring contract (matched 'float')"
+  },
+  {
+   "issue": 157371,
+   "title": "Missed Optimization: redundant floating-point comparison elimination",
+   "created": "2025-09-07T23:39:27Z",
+   "verdict": "fp-semantics",
+   "evidence": "text-rule",
+   "reason": "floating-point semantics: NaN, signed-zero and fast-math premises are outside the integer ring contract (matched 'double')"
+  },
+  {
+   "issue": 157370,
+   "title": "Missed Optimization: eliminate redundant modulus when divisor divides previous modulus",
+   "created": "2025-09-07T23:16:13Z",
+   "verdict": "confirmed-gap-deferred",
+   "evidence": "measured",
+   "reason": "measured gap (lccc 15 vs GCC 14 instructions): divisor divisibility reasoning across two remainders",
+   "batch4": {
+    "lccc": 20,
+    "lccc_folds_off": 20,
+    "lccc_passes_off": 10,
+    "gcc": 19,
+    "status": "gap"
+   }
+  },
+  {
+   "issue": 157316,
+   "title": "Missed optimization: fold smax/smin+icmp eq into range check",
+   "created": "2025-09-06T21:12:46Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'tail')"
+  },
+  {
+   "issue": 157315,
+   "title": "Missed Optimization: simplify smax/smin+icmp eq to unsigned bound check",
+   "created": "2025-09-06T21:07:56Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'tail')"
+  },
+  {
+   "issue": 156911,
+   "title": "Missed optimization for function pointer returned from function",
+   "created": "2025-09-04T15:29:53Z",
+   "verdict": "memory-or-abi",
+   "evidence": "text-rule",
+   "reason": "memory or ABI lowering: not an integer-identity rewrite (matched 'struct')"
+  },
+  {
+   "issue": 156898,
+   "title": "[InstCombine] Missed optimization for trunc (Pow2 >> X) to i1",
+   "created": "2025-09-04T14:50:38Z",
+   "verdict": "confirmed-gap-deferred",
+   "evidence": "measured",
+   "reason": "measured gap (lccc 5 vs GCC 4 instructions): needs a known-bits fact on the shifted mask before the truncation",
+   "batch4": {
+    "lccc": 4,
+    "lccc_folds_off": 4,
+    "lccc_passes_off": 4,
+    "gcc": 4,
+    "status": "at-or-better"
+   }
+  },
+  {
+   "issue": 154258,
+   "title": "Missed optimization: eliminate redundant 64-bit check in 16-bit-range test",
+   "created": "2025-08-19T03:30:18Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'nsw')"
+  },
+  {
+   "issue": 154246,
+   "title": "Missed optimization: fold (select C, (x | a), x) | b -> x | select C, (a | b), b",
+   "created": "2025-08-19T01:24:30Z",
+   "verdict": "already-at-oracle",
+   "evidence": "measured",
+   "reason": "measured parity or better against the GCC 16.2 oracle (lccc 7 vs GCC 7 instructions)"
+  },
+  {
+   "issue": 154242,
+   "title": "Missed optimization: fold icmp sgt (fptosi %x), -1 -> fcmp ogt %x, -1.0",
+   "created": "2025-08-19T01:00:06Z",
+   "verdict": "fp-semantics",
+   "evidence": "text-rule",
+   "reason": "floating-point semantics: NaN, signed-zero and fast-math premises are outside the integer ring contract (matched 'fcmp')"
+  },
+  {
+   "issue": 154238,
+   "title": "Missed optimization: fold away neutral fadd 0.0 before fabs",
+   "created": "2025-08-19T00:41:47Z",
+   "verdict": "fp-semantics",
+   "evidence": "text-rule",
+   "reason": "floating-point semantics: NaN, signed-zero and fast-math premises are outside the integer ring contract (matched 'fadd')"
+  },
+  {
+   "issue": 154035,
+   "title": "Missed optimization: fold (x & C1) == C2 to x == C2 when C1 & C2 == C2",
+   "created": "2025-08-17T21:19:08Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'inbounds')"
+  },
+  {
+   "issue": 154025,
+   "title": "Missed optimization: fold (x0 | x1 | x2 != 0 ? True : C) ? x0 : 0 -> x0",
+   "created": "2025-08-17T17:28:02Z",
+   "verdict": "folded-this-batch",
+   "evidence": "measured",
+   "reason": "batch 4: the select-implication lattice and the boolean product rule fold this idiom to the same instruction count GCC 16.2 emits",
+   "batch4": {
+    "lccc": 2,
+    "lccc_folds_off": 5,
+    "lccc_passes_off": 5,
+    "gcc": 2,
+    "status": "at-or-better"
+   }
+  },
+  {
+   "issue": 154022,
+   "title": "Missed optimization with `-fstrict-enums` for by-value parameters.",
+   "created": "2025-08-17T15:54:57Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'fstrict-enums')"
+  },
+  {
+   "issue": 154000,
+   "title": "Missed optimization: eliminate redundant range check",
+   "created": "2025-08-17T04:34:02Z",
+   "verdict": "memory-or-abi",
+   "evidence": "text-rule",
+   "reason": "memory or ABI lowering: not an integer-identity rewrite (matched 'load')"
+  },
+  {
+   "issue": 153999,
+   "title": "Missed optimization: eliminate redundant null pointer check",
+   "created": "2025-08-17T03:41:41Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'inbounds')"
+  },
+  {
+   "issue": 153991,
+   "title": "Missed optimization: fold x*a == b -> x == b/a",
+   "created": "2025-08-17T03:18:21Z",
+   "verdict": "fp-semantics",
+   "evidence": "text-rule",
+   "reason": "floating-point semantics: NaN, signed-zero and fast-math premises are outside the integer ring contract (matched 'float')"
+  },
+  {
+   "issue": 152992,
+   "title": "[AMDGPU] missed add-with-carry optimization",
+   "created": "2025-08-11T10:44:21Z",
+   "verdict": "non-x86-target",
+   "evidence": "text-rule",
+   "reason": "target-specific lowering: instruction selection belongs to the backend, not to an IR fold (matched 'amdgpu')"
+  },
+  {
+   "issue": 152804,
+   "title": "Missed optimization: (x & -2^C) -1 & -2^C + 2^C -> x & -2^C",
+   "created": "2025-08-08T21:36:42Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'nuw')"
+  },
+  {
+   "issue": 152797,
+   "title": "Missed optimization: (x + y) & (2^C) -> x & 2^C when y % 2^(C+1) == 0",
+   "created": "2025-08-08T21:21:01Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'inbounds')"
+  },
+  {
+   "issue": 152788,
+   "title": "Missed optimization: max(max(x<<C1, x+C2), C3) -> max(x<<C1, C3) when C2 <= (2^C1-1)/2^C1*C3",
+   "created": "2025-08-08T20:28:33Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'nsw')"
+  },
+  {
+   "issue": 152430,
+   "title": "Missed optimization and unexpected compilation difference when using inlined function to cast int32_t to uint8_t",
+   "created": "2025-08-07T02:55:41Z",
+   "verdict": "vector-or-simd",
+   "evidence": "text-rule",
+   "reason": "vector/SIMD shape: the scalar ring contract does not model lanes, shuffles or per-lane saturation (matched 'vectorization')"
+  },
+  {
+   "issue": 152325,
+   "title": "Missed Optimization: eliminate redundant pointer alignment",
+   "created": "2025-08-06T15:35:17Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'inbounds')"
+  },
+  {
+   "issue": 152237,
+   "title": "Missed optimization: fold (n*x-n)/n to x-1",
+   "created": "2025-08-06T01:57:39Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'nsw')"
+  },
+  {
+   "issue": 151994,
+   "title": "Missed optimization: Eager use of callee-saved registers pessimizes hot branch",
+   "created": "2025-08-04T16:22:58Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'branch')"
+  },
+  {
+   "issue": 151080,
+   "title": "[AVR] Induction variable not found (missed optimization)",
+   "created": "2025-07-29T05:03:18Z",
+   "verdict": "memory-or-abi",
+   "evidence": "text-rule",
+   "reason": "memory or ABI lowering: not an integer-identity rewrite (matched 'sizeof')"
+  },
+  {
+   "issue": 150954,
+   "title": "x86 missed optimization for __builtin_clz()^31",
+   "created": "2025-07-28T13:38:46Z",
+   "verdict": "confirmed-gap-deferred",
+   "evidence": "measured",
+   "reason": "measured gap (lccc 3 vs GCC 2 instructions): bit-count intrinsic recognition with the complement width",
+   "batch4": {
+    "lccc": 3,
+    "lccc_folds_off": 3,
+    "lccc_passes_off": 3,
+    "gcc": 2,
+    "status": "gap"
+   }
+  },
+  {
+   "issue": 150606,
+   "title": "Missed Optimization: Constant Store Not Folded in Nested Conditional Control Flow in the form of (C2 ? (C1 ? C1 : X) : (C1 ? C1 : Y))",
+   "created": "2025-07-25T11:43:07Z",
+   "verdict": "memory-or-abi",
+   "evidence": "text-rule",
+   "reason": "memory or ABI lowering: not an integer-identity rewrite (matched 'store')"
+  },
+  {
+   "issue": 150120,
+   "title": "Missed optimization: Lowering struct materialization into cold branches",
+   "created": "2025-07-22T21:49:57Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'stack')"
+  },
+  {
+   "issue": 149155,
+   "title": "Missed optimization when copying large object to multiple targets",
+   "created": "2025-07-16T18:05:04Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'restrict')"
+  },
+  {
+   "issue": 148380,
+   "title": "[clang] Missed optimization regression: coro.destroy not devirtualized even when possible",
+   "created": "2025-07-12T15:57:53Z",
+   "verdict": "memory-or-abi",
+   "evidence": "text-rule",
+   "reason": "memory or ABI lowering: not an integer-identity rewrite (matched 'struct')"
+  },
+  {
+   "issue": 147456,
+   "title": "Missed optimization: adjacent stores to memory not merged",
+   "created": "2025-07-08T03:44:57Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'inbounds')"
+  },
+  {
+   "issue": 146742,
+   "title": "Missed optimization of strdup to malloc + memcpy if argument is known at compile time",
+   "created": "2025-07-02T16:18:29Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'nonnull')"
+  },
+  {
+   "issue": 146642,
+   "title": "[InstCombine] Missed optimization for icmp of select with constants and invertible binop",
+   "created": "2025-07-02T07:21:42Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'nsw')"
+  },
+  {
+   "issue": 146483,
+   "title": "[Integer division]Optimization missed in looped division",
+   "created": "2025-07-01T08:07:39Z",
+   "verdict": "scalar-unprobed",
+   "evidence": "text-rule",
+   "reason": "scalar shape with no vector/FP/UB/CFG premise in the report text that a single-function probe can decide"
+  },
+  {
+   "issue": 146475,
+   "title": "[X86][GlobalIsel] Missed optimization for memory access",
+   "created": "2025-07-01T06:20:26Z",
+   "verdict": "fp-semantics",
+   "evidence": "text-rule",
+   "reason": "floating-point semantics: NaN, signed-zero and fast-math premises are outside the integer ring contract (matched 'float')"
+  },
+  {
+   "issue": 146442,
+   "title": "[SimplifyCFG] Optimization missed to reduce a conditional branch to unconditional",
+   "created": "2025-07-01T00:40:27Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'simplifycfg')"
+  },
+  {
+   "issue": 146263,
+   "title": "Missed optimization: unconditional ret i1 false not folded in simple control flow with icmp sgt and phi",
+   "created": "2025-06-29T07:54:44Z",
+   "verdict": "scalar-unprobed",
+   "evidence": "text-rule",
+   "reason": "scalar shape with no vector/FP/UB/CFG premise in the report text that a single-function probe can decide"
+  },
+  {
+   "issue": 146087,
+   "title": "Missed optimization when known bits would permit transforming an `and` into subtruction",
+   "created": "2025-06-27T14:28:38Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'nuw')"
+  },
+  {
+   "issue": 145177,
+   "title": "[WebAssembly] Missed optimization in any_true/all_true",
+   "created": "2025-06-21T16:45:17Z",
+   "verdict": "non-x86-target",
+   "evidence": "text-rule",
+   "reason": "target-specific lowering: instruction selection belongs to the backend, not to an IR fold (matched 'webassembly')"
+  },
+  {
+   "issue": 144208,
+   "title": "[AArch64] Missed optimization: Make full use of smaddl instruction in AArch64",
+   "created": "2025-06-14T07:04:53Z",
+   "verdict": "non-x86-target",
+   "evidence": "text-rule",
+   "reason": "target-specific lowering: instruction selection belongs to the backend, not to an IR fold (matched 'aarch64')"
+  },
+  {
+   "issue": 144020,
+   "title": "Missed optimization: eliminate redundant and+zext+or reconstruction in select arm",
+   "created": "2025-06-13T05:46:07Z",
+   "verdict": "non-x86-target",
+   "evidence": "text-rule",
+   "reason": "target-specific lowering: instruction selection belongs to the backend, not to an IR fold (matched 'arm')"
+  },
+  {
+   "issue": 143957,
+   "title": "Missed optimization: fold (icmp eq a, c1) | (icmp ult f(a), c2) to icmp ult f(a), c2",
+   "created": "2025-06-12T20:03:00Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'nuw')"
+  },
+  {
+   "issue": 143658,
+   "title": "Missed optimization: InstCombine is blocked by other uses",
+   "created": "2025-06-11T06:23:20Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'tail')"
+  },
+  {
+   "issue": 143649,
+   "title": "Missed optimization: fold fcmp ord + select before fcmp one (x, C) into a single fcmp one (x, C)",
+   "created": "2025-06-11T03:24:38Z",
+   "verdict": "fp-semantics",
+   "evidence": "text-rule",
+   "reason": "floating-point semantics: NaN, signed-zero and fast-math premises are outside the integer ring contract (matched 'fcmp')"
+  },
+  {
+   "issue": 143636,
+   "title": "Missed optimization: fold ceil(x/16) == 0 to x == 0",
+   "created": "2025-06-11T00:13:35Z",
+   "verdict": "already-at-oracle",
+   "evidence": "measured",
+   "reason": "measured parity or better against the GCC 16.2 oracle (lccc 5 vs GCC 5 instructions)"
+  },
+  {
+   "issue": 143630,
+   "title": "Missed optimization: fold icmp eq f(a), f(b) to icmp eq a, b where f(x) = xor(x, lshr(ashr(x, 31), 1))",
+   "created": "2025-06-10T23:31:39Z",
+   "verdict": "already-at-oracle",
+   "evidence": "measured",
+   "reason": "measured parity or better against the GCC 16.2 oracle (lccc 4 vs GCC 4 instructions)"
+  },
+  {
+   "issue": 143622,
+   "title": "Missed optimization: Reassociate multiplies by constants to shrink said constants",
+   "created": "2025-06-10T22:50:52Z",
+   "verdict": "non-x86-target",
+   "evidence": "text-rule",
+   "reason": "target-specific lowering: instruction selection belongs to the backend, not to an IR fold (matched 'arm')"
+  },
+  {
+   "issue": 143529,
+   "title": "Missed optimization: propagate not of `trunc nuw ... it1` equalities",
+   "created": "2025-06-10T13:09:00Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'nuw')"
+  },
+  {
+   "issue": 143511,
+   "title": "Missed Optimization: Constant Propagation of Store Value Due to the Endless Loop",
+   "created": "2025-06-10T11:47:11Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'inbounds')"
+  },
+  {
+   "issue": 143215,
+   "title": "[RISCV] missed optimization: use sh or sw when can infer the offset from alignment",
+   "created": "2025-06-06T22:53:09Z",
+   "verdict": "vector-or-simd",
+   "evidence": "text-rule",
+   "reason": "vector/SIMD shape: the scalar ring contract does not model lanes, shuffles or per-lane saturation (matched 'packed')"
+  },
+  {
+   "issue": 143211,
+   "title": "Missed optimization: fold a-b > a+b to b<0",
+   "created": "2025-06-06T22:16:19Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'nsw')"
+  },
+  {
+   "issue": 143030,
+   "title": "Missed optimization: fold add(umax(x, 1), x) < x ? C : y to y",
+   "created": "2025-06-05T20:28:20Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'nsw')"
+  },
+  {
+   "issue": 142765,
+   "title": "Missed optimization: equivalent expressions generate different assembly with extra load",
+   "created": "2025-06-04T10:48:14Z",
+   "verdict": "memory-or-abi",
+   "evidence": "text-rule",
+   "reason": "memory or ABI lowering: not an integer-identity rewrite (matched 'load')"
+  },
+  {
+   "issue": 142744,
+   "title": "Missed optimization of constant folding when using 'trunc nuw i64 %v to i1'",
+   "created": "2025-06-04T09:00:06Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'nuw')"
+  },
+  {
+   "issue": 142711,
+   "title": "Missed Optimization: fold fcmp ord + select before fcmp oeq (x, C) into a single fcmp oeq (x, C)",
+   "created": "2025-06-04T01:59:47Z",
+   "verdict": "fp-semantics",
+   "evidence": "text-rule",
+   "reason": "floating-point semantics: NaN, signed-zero and fast-math premises are outside the integer ring contract (matched 'fcmp')"
+  },
+  {
+   "issue": 142674,
+   "title": "Missed Optimization: umul.with.overflow(x, C0).overflow || (prod > C1) \u2014> x > C1 // C0",
+   "created": "2025-06-03T21:24:52Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'overflow')"
+  },
+  {
+   "issue": 142593,
+   "title": "Missed optimization: (xor (lshr i32 %0, 31), true) ? (%0 < 0) : false ==> false",
+   "created": "2025-06-03T12:24:02Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'nuw')"
+  },
+  {
+   "issue": 142497,
+   "title": "missed optimization for ceiling division with known ranges",
+   "created": "2025-06-02T22:50:36Z",
+   "verdict": "x86-only-isa",
+   "evidence": "text-rule",
+   "reason": "x86 instruction-selection detail: owned by the x86 backend, not by an IR-level fold (matched 'sbb')"
+  },
+  {
+   "issue": 142321,
+   "title": "Missed optimization: passing vectors with different (compatible) target features prevents inlining",
+   "created": "2025-06-01T21:06:16Z",
+   "verdict": "vector-or-simd",
+   "evidence": "text-rule",
+   "reason": "vector/SIMD shape: the scalar ring contract does not model lanes, shuffles or per-lane saturation (matched 'vectors')"
+  },
+  {
+   "issue": 142283,
+   "title": "Missed optimization (unnecessary sext): y >= x should imply y - x >= 0",
+   "created": "2025-05-31T19:19:16Z",
+   "verdict": "scalar-unprobed",
+   "evidence": "text-rule",
+   "reason": "scalar shape with no vector/FP/UB/CFG premise in the report text that a single-function probe can decide"
+  },
+  {
+   "issue": 141753,
+   "title": "[InstCombine] Missed optimization for add + and + icmp pattern",
+   "created": "2025-05-28T12:35:47Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'nsw')"
+  },
+  {
+   "issue": 141479,
+   "title": "Missed optimization: (%1 <= ~%0) && (%0 > ~%1) ==> false",
+   "created": "2025-05-26T11:39:48Z",
+   "verdict": "confirmed-gap-deferred",
+   "evidence": "measured",
+   "reason": "measured gap (lccc 11 vs GCC 9 instructions): contradiction detection between two complemented compares",
+   "batch4": {
+    "lccc": 11,
+    "lccc_folds_off": 11,
+    "lccc_passes_off": 11,
+    "gcc": 10,
+    "status": "gap"
+   }
+  },
+  {
+   "issue": 139810,
+   "title": "[missed optimization] Missed removing loop of setting zero when dereference pointer (memset)",
+   "created": "2025-05-13T23:36:17Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'loop')"
+  },
+  {
+   "issue": 139806,
+   "title": "[missed optimization] pushq/popq preamble with -fomit-frame-pointer if __builtin_frame_address is called",
+   "created": "2025-05-13T23:03:33Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'stack')"
+  },
+  {
+   "issue": 139786,
+   "title": "Missed Optimization: max(max(x, c1) << c2, c3) \u2014> max(x << c2, c3) when c3 >= c1 * 2 ^ c2",
+   "created": "2025-05-13T20:08:57Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'nuw')"
+  },
+  {
+   "issue": 139732,
+   "title": "Missed optimization: trunc not de-duplicated",
+   "created": "2025-05-13T13:47:50Z",
+   "verdict": "fp-semantics",
+   "evidence": "text-rule",
+   "reason": "floating-point semantics: NaN, signed-zero and fast-math premises are outside the integer ring contract (matched 'double')"
+  },
+  {
+   "issue": 139641,
+   "title": "Missed Optimization: -(x & c1) >> shamt | -(x & c1) \u2014> x & c1 ? -1 : 0 when 2^shamt > c1 and shamt \u2264 bitwidth(x)/2",
+   "created": "2025-05-12T23:14:06Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'nsw')"
+  },
+  {
+   "issue": 139538,
+   "title": "Missed optimization: Redundant loop retained after memset idiom recognized",
+   "created": "2025-05-12T11:55:24Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'inbounds')"
+  },
+  {
+   "issue": 139441,
+   "title": "Missed optimization for unaligned store via shifts",
+   "created": "2025-05-11T07:51:50Z",
+   "verdict": "non-x86-target",
+   "evidence": "text-rule",
+   "reason": "target-specific lowering: instruction selection belongs to the backend, not to an IR fold (matched 'aarch64')"
+  },
+  {
+   "issue": 139238,
+   "title": "Potential Missed IPSCCP Optimization Due to Range Metadata",
+   "created": "2025-05-09T10:01:18Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'range metadata')"
+  },
+  {
+   "issue": 138636,
+   "title": "Missed optimization: conditional store of zext(i1) not folded to constant zero when i1 is known false",
+   "created": "2025-05-06T06:05:53Z",
+   "verdict": "memory-or-abi",
+   "evidence": "text-rule",
+   "reason": "memory or ABI lowering: not an integer-identity rewrite (matched 'store')"
+  },
+  {
+   "issue": 138333,
+   "title": "Missed optimization: Rotation can be changed from left to right",
+   "created": "2025-05-02T20:14:22Z",
+   "verdict": "already-at-oracle",
+   "evidence": "measured",
+   "reason": "measured parity or better against the GCC 16.2 oracle (lccc 3 vs GCC 3 instructions)"
+  },
+  {
+   "issue": 137557,
+   "title": "Missed optimization: Switch on truncated select result not folded for certain constants",
+   "created": "2025-04-27T22:38:21Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'switch')"
+  },
+  {
+   "issue": 137514,
+   "title": "Missed optimization: Suboptimal div / rem for 128-bits int by constant lowering",
+   "created": "2025-04-27T12:55:57Z",
+   "verdict": "x86-only-isa",
+   "evidence": "text-rule",
+   "reason": "x86 instruction-selection detail: owned by the x86 backend, not by an IR-level fold (matched 'sbb')"
+  },
+  {
+   "issue": 137168,
+   "title": "Missed GEP Optimization for Constant Index",
+   "created": "2025-04-24T12:10:51Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'inbounds')"
+  },
+  {
+   "issue": 136536,
+   "title": "Missed Optimization: Store of Known Zero Not Folded in Conditional Path",
+   "created": "2025-04-21T05:10:37Z",
+   "verdict": "memory-or-abi",
+   "evidence": "text-rule",
+   "reason": "memory or ABI lowering: not an integer-identity rewrite (matched 'store')"
+  },
+  {
+   "issue": 136473,
+   "title": "Missed optimization: switch with GEP inside cannot generate lookup table",
+   "created": "2025-04-20T06:26:26Z",
+   "verdict": "fp-semantics",
+   "evidence": "text-rule",
+   "reason": "floating-point semantics: NaN, signed-zero and fast-math premises are outside the integer ring contract (matched 'float')"
+  },
+  {
+   "issue": 135860,
+   "title": "Missed optimization on in-order RISC-V",
+   "created": "2025-04-15T21:31:18Z",
+   "verdict": "scalar-unprobed",
+   "evidence": "text-rule",
+   "reason": "scalar shape with no vector/FP/UB/CFG premise in the report text that a single-function probe can decide"
+  },
+  {
+   "issue": 135411,
+   "title": "[InstCombine] Missed shl + add + and optimization",
+   "created": "2025-04-11T17:56:07Z",
+   "verdict": "already-at-oracle",
+   "evidence": "measured",
+   "reason": "measured parity or better against the GCC 16.2 oracle (lccc 3 vs GCC 3 instructions)"
+  },
+  {
+   "issue": 135377,
+   "title": "[clang] await_suspend() -> std::noop_coroutine() = missed optimization",
+   "created": "2025-04-11T14:27:53Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'inline')"
+  },
+  {
+   "issue": 134992,
+   "title": "Missed optimization with the `unreachable` information",
+   "created": "2025-04-09T11:18:25Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'assume')"
+  },
+  {
+   "issue": 134540,
+   "title": "Missed optimization when using `llvm.assume`, although scalar-evolution can use it to figure out the range.",
+   "created": "2025-04-06T13:57:14Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'assume')"
+  },
+  {
+   "issue": 134318,
+   "title": "Missed Optimization: Consecutive divisions can be merged into one with intermediate multiplication with sext/zext extention",
+   "created": "2025-04-03T23:25:13Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'nsw')"
+  },
+  {
+   "issue": 133367,
+   "title": "Missed Optimization: (f1 > 0 ? f1 : -f1) < (f2 > 0 ? f2 : -f2) \u2014> fabs(f1) < fabs(f2)",
+   "created": "2025-03-28T05:04:48Z",
+   "verdict": "fp-semantics",
+   "evidence": "text-rule",
+   "reason": "floating-point semantics: NaN, signed-zero and fast-math premises are outside the integer ring contract (matched 'double')"
+  },
+  {
+   "issue": 132908,
+   "title": "Missed Optimization: Consecutive divisions can be merged into one if intermediate multiplication doesn't overflow",
+   "created": "2025-03-25T10:04:34Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'overflow')"
+  },
+  {
+   "issue": 132628,
+   "title": "Missed Optimization: comparing the result of a disjoint or with a constant can be simplified",
+   "created": "2025-03-23T18:18:39Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'inbounds')"
+  },
+  {
+   "issue": 131097,
+   "title": "Missed Optimization: Failing to coalesce multiple stores from `memcpy()`",
+   "created": "2025-03-13T08:08:17Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'inbounds')"
+  },
+  {
+   "issue": 131056,
+   "title": "[Clang] Missed optimization within bitshift on bools",
+   "created": "2025-03-13T02:48:21Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'restrict')"
+  },
+  {
+   "issue": 131053,
+   "title": "Missed Optimization: bswap in big endian",
+   "created": "2025-03-13T01:40:02Z",
+   "verdict": "memory-or-abi",
+   "evidence": "text-rule",
+   "reason": "memory or ABI lowering: not an integer-identity rewrite (matched 'struct')"
+  },
+  {
+   "issue": 130954,
+   "title": "Missed Optimization: simplifying byte extraction after a load to a direct load of the byte",
+   "created": "2025-03-12T12:43:39Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'inbounds')"
+  },
+  {
+   "issue": 129947,
+   "title": "Missed optimization: `umax(1 << x, 1 << y) => 1 << umax(x, y)`",
+   "created": "2025-03-05T22:18:46Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'nuw')"
+  },
+  {
+   "issue": 129750,
+   "title": "Missed optimization: eager spills mess up hot path",
+   "created": "2025-03-04T17:41:40Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'stack')"
+  },
+  {
+   "issue": 129576,
+   "title": "s390x: missed optimization to `vec_unpackl`",
+   "created": "2025-03-03T19:32:32Z",
+   "verdict": "vector-or-simd",
+   "evidence": "text-rule",
+   "reason": "vector/SIMD shape: the scalar ring contract does not model lanes, shuffles or per-lane saturation (matched 'vector')"
+  },
+  {
+   "issue": 128587,
+   "title": "Missed optimization: malloc + memcpy + free => realloc",
+   "created": "2025-02-24T22:21:50Z",
+   "verdict": "memory-or-abi",
+   "evidence": "text-rule",
+   "reason": "memory or ABI lowering: not an integer-identity rewrite (matched 'memcpy')"
+  },
+  {
+   "issue": 128475,
+   "title": "[InstCombine] Missed optimization: `((X + LowMask) & LowMask) ^ LowMask -> (-X) & LowMask`",
+   "created": "2025-02-24T06:54:25Z",
+   "verdict": "already-at-oracle",
+   "evidence": "measured",
+   "reason": "measured parity or better against the GCC 16.2 oracle (lccc 5 vs GCC 5 instructions)"
+  },
+  {
+   "issue": 128460,
+   "title": "Missed Optimization: simplifying truncated shift-and-mask to direct masking and comparison",
+   "created": "2025-02-24T05:19:10Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'nsw')"
+  },
+  {
+   "issue": 128134,
+   "title": "Missed optimization: AggressiveInstCombine misses combining loads from consecutive addresses",
+   "created": "2025-02-21T05:42:06Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'inbounds')"
+  },
+  {
+   "issue": 127978,
+   "title": "Missed optimization: failed to optimize loads with restrict qualifiers (aliasing issue)",
+   "created": "2025-02-20T09:38:42Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'restrict')"
+  },
+  {
+   "issue": 125469,
+   "title": "Missed optimization: fold zext nneg + GEP into direct GEP with the nneg index",
+   "created": "2025-02-03T09:14:04Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'inbounds')"
+  },
+  {
+   "issue": 125003,
+   "title": "Missed optimization: unreachable branch could be pruned after taking into account the possible values of a constexpr lookup table",
+   "created": "2025-01-30T00:23:28Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'branch')"
+  },
+  {
+   "issue": 124714,
+   "title": "Missed optimization: inline functions, when operations can be done with smaller bit width",
+   "created": "2025-01-28T07:19:43Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'inline')"
+  },
+  {
+   "issue": 123456,
+   "title": "missed optimization to simple vptest when using libstdc++ std::experimental::simd to detect all-zero pattern on x86-64 avx",
+   "created": "2025-01-18T08:43:16Z",
+   "verdict": "vector-or-simd",
+   "evidence": "text-rule",
+   "reason": "vector/SIMD shape: the scalar ring contract does not model lanes, shuffles or per-lane saturation (matched 'vptest')"
+  },
+  {
+   "issue": 123278,
+   "title": "Missed optimization between `range` parameter metadata and `assume`s",
+   "created": "2025-01-17T03:39:50Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'assume')"
+  },
+  {
+   "issue": 123139,
+   "title": "Missed optimization(?): LLVM ignores carry flag after a 'shr'",
+   "created": "2025-01-15T23:22:39Z",
+   "verdict": "scalar-unprobed",
+   "evidence": "text-rule",
+   "reason": "scalar shape with no vector/FP/UB/CFG premise in the report text that a single-function probe can decide"
+  },
+  {
+   "issue": 122567,
+   "title": "[clang] Missed optimization: Failure to remove useless allocations / deallocations",
+   "created": "2025-01-11T03:32:37Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'undef')"
+  },
+  {
+   "issue": 122442,
+   "title": "Missed optimization: (x mod (C1 * C2) / C2) vs. ((x / C2) mod C1)",
+   "created": "2025-01-10T11:34:12Z",
+   "verdict": "confirmed-gap-deferred",
+   "evidence": "measured",
+   "reason": "measured gap (lccc 12 vs GCC 10 instructions): digit extraction: needs a combined div/rem decomposition of one divisor pair",
+   "batch4": {
+    "lccc": 17,
+    "lccc_folds_off": 17,
+    "lccc_passes_off": 9,
+    "gcc": 14,
+    "status": "gap"
+   }
+  },
+  {
+   "issue": 121853,
+   "title": "Missed optimization: while (len > 1) len -= 2;",
+   "created": "2025-01-06T22:54:15Z",
+   "verdict": "other-language",
+   "evidence": "text-rule",
+   "reason": "outside the C integer front end lccc compiles (matched 'libcxx')"
+  },
+  {
+   "issue": 120855,
+   "title": "Missed tysan violation with optimization",
+   "created": "2024-12-21T21:14:25Z",
+   "verdict": "memory-or-abi",
+   "evidence": "text-rule",
+   "reason": "memory or ABI lowering: not an integer-identity rewrite (matched 'struct')"
+  },
+  {
+   "issue": 117853,
+   "title": "Missed optimization: per-byte comparisons are not always combined",
+   "created": "2024-11-27T08:09:13Z",
+   "verdict": "memory-or-abi",
+   "evidence": "text-rule",
+   "reason": "memory or ABI lowering: not an integer-identity rewrite (matched 'byte')"
+  },
+  {
+   "issue": 117436,
+   "title": "[InstSimplify] Missed optimization: `X != Y` implies `X | Y != 0`",
+   "created": "2024-11-23T15:12:11Z",
+   "verdict": "confirmed-gap-deferred",
+   "evidence": "measured",
+   "reason": "measured gap (lccc 8 vs GCC 4 instructions): implication reasoning across two compares",
+   "batch4": {
+    "lccc": 8,
+    "lccc_folds_off": 8,
+    "lccc_passes_off": 8,
+    "gcc": 7,
+    "status": "gap"
+   }
+  },
+  {
+   "issue": 117332,
+   "title": "Possible missed optimization when calling memcpy or memmove in a loop",
+   "created": "2024-11-22T14:27:19Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'loop')"
+  },
+  {
+   "issue": 115683,
+   "title": "Missed optimization: (y != 0 && x > (unsigned)(-1) / y) (multiplication overflow check)",
+   "created": "2024-11-11T03:56:15Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'overflow')"
+  },
+  {
+   "issue": 115466,
+   "title": "[InstCombine] Missed optimization: icmp pred (ext X), (ext_inreg Y) -> icmp pred X, trunc nsw/nuw (ext_inreg Y)",
+   "created": "2024-11-08T11:31:13Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'nsw')"
+  },
+  {
+   "issue": 115341,
+   "title": "[DSE] Missed optimization",
+   "created": "2024-11-07T17:04:44Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'dse')"
+  },
+  {
+   "issue": 115252,
+   "title": "Missed strict aliasing optimization between structs with similar layouts",
+   "created": "2024-11-07T03:00:58Z",
+   "verdict": "memory-or-abi",
+   "evidence": "text-rule",
+   "reason": "memory or ABI lowering: not an integer-identity rewrite (matched 'struct')"
+  },
+  {
+   "issue": 115158,
+   "title": "Missed optimization: `udiv` and `urem` ignores assumptions, that can help to choose either 'DIV r/m32' or 'DIV r/m64' on x86-64.",
+   "created": "2024-11-06T13:48:04Z",
+   "verdict": "scalar-unprobed",
+   "evidence": "text-rule",
+   "reason": "scalar shape with no vector/FP/UB/CFG premise in the report text that a single-function probe can decide"
+  },
+  {
+   "issue": 112063,
+   "title": "Missed optimization: Imperfect optimization of straightforward std::find",
+   "created": "2024-10-12T00:20:13Z",
+   "verdict": "scalar-unprobed",
+   "evidence": "text-rule",
+   "reason": "scalar shape with no vector/FP/UB/CFG premise in the report text that a single-function probe can decide"
+  },
+  {
+   "issue": 111728,
+   "title": "Missed optimization: xor eax, eax is unnecessary on x86-64",
+   "created": "2024-10-09T17:45:16Z",
+   "verdict": "x86-only-isa",
+   "evidence": "text-rule",
+   "reason": "x86 instruction-selection detail: owned by the x86 backend, not by an IR-level fold (matched 'sbb')"
+  },
+  {
+   "issue": 111037,
+   "title": "Missed optimization (-O3): llvm doesn't transform a loop into a constant",
+   "created": "2024-10-03T18:09:46Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'loop')"
+  },
+  {
+   "issue": 109718,
+   "title": "[clang] Missed optimization: dead store to thread-local not optimized out",
+   "created": "2024-09-23T20:44:58Z",
+   "verdict": "memory-or-abi",
+   "evidence": "text-rule",
+   "reason": "memory or ABI lowering: not an integer-identity rewrite (matched 'store')"
+  },
+  {
+   "issue": 109471,
+   "title": "Missed optimization: `lshr(smax(x, 0), y)` can be transformed to `smax(ashr(x, y), 0)`",
+   "created": "2024-09-20T20:32:17Z",
+   "verdict": "vector-or-simd",
+   "evidence": "text-rule",
+   "reason": "vector/SIMD shape: the scalar ring contract does not model lanes, shuffles or per-lane saturation (matched 'vectorized')"
+  },
+  {
+   "issue": 108906,
+   "title": "Missed optimization for a loop with dead code",
+   "created": "2024-09-17T00:50:26Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'loop')"
+  },
+  {
+   "issue": 108451,
+   "title": "Missed optimization: X - Y  + Y * N = X + Y * (N -1)",
+   "created": "2024-09-12T20:50:21Z",
+   "verdict": "confirmed-gap-deferred",
+   "evidence": "measured",
+   "reason": "measured gap (lccc 5 vs GCC 4 instructions): reassociation of a subtract/add/multiply chain (needs a value-numbering view)",
+   "batch4": {
+    "lccc": 5,
+    "lccc_folds_off": 5,
+    "lccc_passes_off": 5,
+    "gcc": 4,
+    "status": "gap"
+   }
+  },
+  {
+   "issue": 108052,
+   "title": "Missed optimization, failure to remove residual empty loop",
+   "created": "2024-09-10T16:23:39Z",
+   "verdict": "non-x86-target",
+   "evidence": "text-rule",
+   "reason": "target-specific lowering: instruction selection belongs to the backend, not to an IR fold (matched 'aarch64')"
+  },
+  {
+   "issue": 107228,
+   "title": "[InstCombine] Missed optimization: `((A - 1) & (~A)) >> 63`  --> `A == 0`",
+   "created": "2024-09-04T12:19:07Z",
+   "verdict": "confirmed-gap-deferred",
+   "evidence": "measured",
+   "reason": "measured gap (lccc 6 vs GCC 5 instructions): needs known-bits/demanded-bits analysis: the identity holds only because the low bits are provably zero after `& ~a`",
+   "batch4": {
+    "lccc": 6,
+    "lccc_folds_off": 6,
+    "lccc_passes_off": 6,
+    "gcc": 5,
+    "status": "gap"
+   }
+  },
+  {
+   "issue": 106554,
+   "title": "[LV] missed optimization for loop with condition",
+   "created": "2024-08-29T13:22:26Z",
+   "verdict": "vector-or-simd",
+   "evidence": "text-rule",
+   "reason": "vector/SIMD shape: the scalar ring contract does not model lanes, shuffles or per-lane saturation (matched 'vectorize')"
+  },
+  {
+   "issue": 105632,
+   "title": "[SimplifyCFG] Missed optimization with [u|s]cmp+switch",
+   "created": "2024-08-22T08:45:55Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'simplifycfg')"
+  },
+  {
+   "issue": 104875,
+   "title": "Missed optimization with autovectorized saturating truncation (clamp)",
+   "created": "2024-08-19T22:15:49Z",
+   "verdict": "scalar-unprobed",
+   "evidence": "text-rule",
+   "reason": "scalar shape with no vector/FP/UB/CFG premise in the report text that a single-function probe can decide"
+  },
+  {
+   "issue": 102868,
+   "title": "[x86 / Clang] Pessimization: missed fusion of substraction/compare/cmov after -O1 optimization or extra caller.",
+   "created": "2024-08-12T09:39:30Z",
+   "verdict": "x86-only-isa",
+   "evidence": "text-rule",
+   "reason": "x86 instruction-selection detail: owned by the x86 backend, not by an IR-level fold (matched 'sbb')"
+  },
+  {
+   "issue": 102062,
+   "title": "[Aarch64] Missed optimization: substraction with borrow",
+   "created": "2024-08-05T21:20:00Z",
+   "verdict": "non-x86-target",
+   "evidence": "text-rule",
+   "reason": "target-specific lowering: instruction selection belongs to the backend, not to an IR fold (matched 'aarch64')"
+  },
+  {
+   "issue": 100293,
+   "title": "[InstCombine] Missed optimization after #84628",
+   "created": "2024-07-24T03:44:18Z",
+   "verdict": "vector-or-simd",
+   "evidence": "text-rule",
+   "reason": "vector/SIMD shape: the scalar ring contract does not model lanes, shuffles or per-lane saturation (matched 'vector')"
+  },
+  {
+   "issue": 100277,
+   "title": "Missed optimization combining saturating-add with min",
+   "created": "2024-07-23T23:15:12Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'tail')"
+  },
+  {
+   "issue": 99734,
+   "title": "[LV] missed optimization with pragma assume_safety",
+   "created": "2024-07-20T03:03:02Z",
+   "verdict": "vector-or-simd",
+   "evidence": "text-rule",
+   "reason": "vector/SIMD shape: the scalar ring contract does not model lanes, shuffles or per-lane saturation (matched 'vectorization')"
+  },
+  {
+   "issue": 99640,
+   "title": "(Missed optimization for clang) Redundant copies to the stack",
+   "created": "2024-07-19T11:59:10Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'stack')"
+  },
+  {
+   "issue": 99391,
+   "title": "Missed Optimization: saturating byte addition",
+   "created": "2024-07-17T21:30:57Z",
+   "verdict": "x86-only-isa",
+   "evidence": "text-rule",
+   "reason": "x86 instruction-selection detail: owned by the x86 backend, not by an IR-level fold (matched 'sbb')"
+  },
+  {
+   "issue": 98925,
+   "title": "Missed optimization: saturated adds are missed if the selections are flipped",
+   "created": "2024-07-15T16:15:09Z",
+   "verdict": "scalar-unprobed",
+   "evidence": "text-rule",
+   "reason": "scalar shape with no vector/FP/UB/CFG premise in the report text that a single-function probe can decide"
+  },
+  {
+   "issue": 98017,
+   "title": "[InstCombine] Missed optimization for `zext(trunc nuw(x))`",
+   "created": "2024-07-08T12:34:33Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'nuw')"
+  },
+  {
+   "issue": 97168,
+   "title": "Missed optimization for one-hot encoding",
+   "created": "2024-06-29T16:00:08Z",
+   "verdict": "scalar-unprobed",
+   "evidence": "text-rule",
+   "reason": "scalar shape with no vector/FP/UB/CFG premise in the report text that a single-function probe can decide"
+  },
+  {
+   "issue": 97136,
+   "title": "[ARM] LD4 optimization missed when operating on 64-byte vectors from the beginning",
+   "created": "2024-06-29T03:23:33Z",
+   "verdict": "vector-or-simd",
+   "evidence": "text-rule",
+   "reason": "vector/SIMD shape: the scalar ring contract does not model lanes, shuffles or per-lane saturation (matched 'vectors')"
+  },
+  {
+   "issue": 97044,
+   "title": "[LLVM] Missed optimization on boolean instructions.",
+   "created": "2024-06-28T11:59:07Z",
+   "verdict": "scalar-unprobed",
+   "evidence": "text-rule",
+   "reason": "scalar shape with no vector/FP/UB/CFG premise in the report text that a single-function probe can decide"
+  },
+  {
+   "issue": 97022,
+   "title": "[SimplifyCFG] Missed optimization with nested branches",
+   "created": "2024-06-28T07:59:49Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'simplifycfg')"
+  },
+  {
+   "issue": 96990,
+   "title": "Potential missed optimization opportunity: 8 byte std::array comparisons seem to be producing different assembly",
+   "created": "2024-06-28T01:12:03Z",
+   "verdict": "memory-or-abi",
+   "evidence": "text-rule",
+   "reason": "memory or ABI lowering: not an integer-identity rewrite (matched 'byte')"
+  },
+  {
+   "issue": 96861,
+   "title": "\"Number is within interval\" missed optimization when number is from a smaller int type",
+   "created": "2024-06-27T07:46:31Z",
+   "verdict": "non-x86-target",
+   "evidence": "text-rule",
+   "reason": "target-specific lowering: instruction selection belongs to the backend, not to an IR fold (matched 'arm')"
+  },
+  {
+   "issue": 95629,
+   "title": "Missed optimization: Fold (a ^ (b || c)) && c to (a ^ 1) && c",
+   "created": "2024-06-15T02:52:35Z",
+   "verdict": "confirmed-gap-deferred",
+   "evidence": "measured",
+   "reason": "measured gap (lccc 11 vs GCC 10 instructions): boolean algebra across a logical-and of a compare and a variable",
+   "batch4": {
+    "lccc": 11,
+    "lccc_folds_off": 11,
+    "lccc_passes_off": 11,
+    "gcc": 10,
+    "status": "gap"
+   }
+  },
+  {
+   "issue": 95255,
+   "title": "[Missed optimization] `has_single_bit` when the value is known to be non-zero",
+   "created": "2024-06-12T14:30:35Z",
+   "verdict": "x86-only-isa",
+   "evidence": "text-rule",
+   "reason": "x86 instruction-selection detail: owned by the x86 backend, not by an IR-level fold (matched 'popcnt')"
+  },
+  {
+   "issue": 94909,
+   "title": "[AArch64] Missed optimization converting vector fmul(sitofp(x), 0.5) -> scvtf(x, 2)",
+   "created": "2024-06-09T20:05:31Z",
+   "verdict": "vector-or-simd",
+   "evidence": "text-rule",
+   "reason": "vector/SIMD shape: the scalar ring contract does not model lanes, shuffles or per-lane saturation (matched 'vector')"
+  },
+  {
+   "issue": 93005,
+   "title": "Missed optimization for devirtualisation ",
+   "created": "2024-05-22T08:21:20Z",
+   "verdict": "memory-or-abi",
+   "evidence": "text-rule",
+   "reason": "memory or ABI lowering: not an integer-identity rewrite (matched 'struct')"
+  },
+  {
+   "issue": 92966,
+   "title": "Missed optimization for `(a == 0 && b != 0) || (a != 0 && b == 0))`",
+   "created": "2024-05-21T21:28:13Z",
+   "verdict": "confirmed-gap-deferred",
+   "evidence": "measured",
+   "reason": "measured gap (lccc 17 vs GCC 7 instructions): xor-of-predicates canonicalisation",
+   "batch4": {
+    "lccc": 9,
+    "lccc_folds_off": 9,
+    "lccc_passes_off": 9,
+    "gcc": 7,
+    "status": "gap"
+   }
+  },
+  {
+   "issue": 92554,
+   "title": "missed-optimization: std::reverse is not vectorized",
+   "created": "2024-05-17T14:19:28Z",
+   "verdict": "vector-or-simd",
+   "evidence": "text-rule",
+   "reason": "vector/SIMD shape: the scalar ring contract does not model lanes, shuffles or per-lane saturation (matched 'vectorized')"
+  },
+  {
+   "issue": 92074,
+   "title": "[ValueTracking] Missed optimization of modulo power-of-two",
+   "created": "2024-05-14T06:48:09Z",
+   "verdict": "confirmed-gap-deferred",
+   "evidence": "measured",
+   "reason": "measured gap (lccc 9 vs GCC 7 instructions): power-of-two remainder belongs to div_by_const's strength-reduction table, which currently routes it through the magic-multiply path",
+   "batch4": {
+    "lccc": 8,
+    "lccc_folds_off": 8,
+    "lccc_passes_off": 6,
+    "gcc": 7,
+    "status": "gap"
+   }
+  },
+  {
+   "issue": 91780,
+   "title": "[SLPVectorizer] Missed optimization: missed vectorization with stores outside unrolled loop",
+   "created": "2024-05-10T17:49:59Z",
+   "verdict": "vector-or-simd",
+   "evidence": "text-rule",
+   "reason": "vector/SIMD shape: the scalar ring contract does not model lanes, shuffles or per-lane saturation (matched 'vectorization')"
+  },
+  {
+   "issue": 91731,
+   "title": "Missed optimization for ``std::atomic_thread_fence(std::memory_order_seq_cst)``",
+   "created": "2024-05-10T11:42:32Z",
+   "verdict": "scalar-unprobed",
+   "evidence": "text-rule",
+   "reason": "scalar shape with no vector/FP/UB/CFG premise in the report text that a single-function probe can decide"
+  },
+  {
+   "issue": 91619,
+   "title": "Missed optimization in bounds analysis in unsigned arithmetic that cannot underflow",
+   "created": "2024-05-09T16:30:44Z",
+   "verdict": "scalar-unprobed",
+   "evidence": "text-rule",
+   "reason": "scalar shape with no vector/FP/UB/CFG premise in the report text that a single-function probe can decide"
+  },
+  {
+   "issue": 91569,
+   "title": "[AggressiveInstCombine] Missed optimization: a reversed chain of contiguous unsigned icmps could be merged",
+   "created": "2024-05-09T08:20:03Z",
+   "verdict": "memory-or-abi",
+   "evidence": "text-rule",
+   "reason": "memory or ABI lowering: not an integer-identity rewrite (matched 'struct')"
+  },
+  {
+   "issue": 91431,
+   "title": "Regression on trunk: missed optimization for dead code, work as expected on clang-18",
+   "created": "2024-05-08T04:10:05Z",
+   "verdict": "scalar-unprobed",
+   "evidence": "text-rule",
+   "reason": "scalar shape with no vector/FP/UB/CFG premise in the report text that a single-function probe can decide"
+  },
+  {
+   "issue": 90457,
+   "title": "Missed optimization for dead store of 'v1': v1=v2; result=arr[0]; v1=1;",
+   "created": "2024-04-29T11:30:59Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'tail')"
+  },
+  {
+   "issue": 89912,
+   "title": "Missed optimization: Redundant array assignment (array initialization)",
+   "created": "2024-04-24T10:50:51Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'loop')"
+  },
+  {
+   "issue": 88850,
+   "title": "Missed optimization : fail to optimize load with select clobber",
+   "created": "2024-04-16T07:49:00Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'inbounds')"
+  },
+  {
+   "issue": 88632,
+   "title": "[MemcpyOpt] Missed optimization : unrelated store clobber blocks elimination/merge of `memset`",
+   "created": "2024-04-13T19:01:25Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'inbounds')"
+  },
+  {
+   "issue": 88599,
+   "title": "Missed optimization: A <= x; usub.sat(x - A, B) => usub.sat(x, A + B)",
+   "created": "2024-04-13T06:35:29Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'assume')"
+  },
+  {
+   "issue": 88598,
+   "title": "Missed optimization: Arm32 uqsub{8, 16} not emit for u32s in range",
+   "created": "2024-04-13T06:14:49Z",
+   "verdict": "non-x86-target",
+   "evidence": "text-rule",
+   "reason": "target-specific lowering: instruction selection belongs to the backend, not to an IR fold (matched 'arm')"
+  },
+  {
+   "issue": 88345,
+   "title": "Missed optimization: fail to infer `c - b != a` under dominating condition `a + b == c`",
+   "created": "2024-04-11T03:04:33Z",
+   "verdict": "scalar-unprobed",
+   "evidence": "text-rule",
+   "reason": "scalar shape with no vector/FP/UB/CFG premise in the report text that a single-function probe can decide"
+  },
+  {
+   "issue": 88274,
+   "title": "Missed optimization: eliminate indirect load of global constant array",
+   "created": "2024-04-10T14:27:14Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'inbounds')"
+  },
+  {
+   "issue": 88263,
+   "title": "Missed optimization: more precise range for `and`",
+   "created": "2024-04-10T12:34:05Z",
+   "verdict": "scalar-unprobed",
+   "evidence": "text-rule",
+   "reason": "scalar shape with no vector/FP/UB/CFG premise in the report text that a single-function probe can decide"
+  },
+  {
+   "issue": 88168,
+   "title": "missed optimization, (x + 0.0) > y => x > y",
+   "created": "2024-04-09T17:49:17Z",
+   "verdict": "fp-semantics",
+   "evidence": "text-rule",
+   "reason": "floating-point semantics: NaN, signed-zero and fast-math premises are outside the integer ring contract (matched 'float')"
+  },
+  {
+   "issue": 88107,
+   "title": "[IPSCCP] Missed optimization: refine range of `select`",
+   "created": "2024-04-09T10:45:16Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'inliner')"
+  },
+  {
+   "issue": 86966,
+   "title": "[DSE] Missed optimization: eliminate `memset` of `alloca` if either `alloca` doesn't escape or `memset` is dead",
+   "created": "2024-03-28T16:10:10Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'dse')"
+  },
+  {
+   "issue": 86949,
+   "title": "Missed optimization (inline breaks knowledge about [[pure]])",
+   "created": "2024-03-28T13:26:04Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'inline')"
+  },
+  {
+   "issue": 86920,
+   "title": "[DSE] Missed optimization : eliminate `store C, ptr` if `load ptr` is known to be `C`",
+   "created": "2024-03-28T07:59:33Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'dse')"
+  },
+  {
+   "issue": 86180,
+   "title": "Missed optimization: imprecise range for `a u< C ? C - a : C1`",
+   "created": "2024-03-21T19:09:39Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'nuw')"
+  },
+  {
+   "issue": 86176,
+   "title": "[InstCombine] Missed optimization : fold `binop(select cond, C1, C2, zext(cond))`",
+   "created": "2024-03-21T18:53:34Z",
+   "verdict": "confirmed-gap-deferred",
+   "evidence": "measured",
+   "reason": "measured gap (lccc 7 vs GCC 4 instructions): outside the ring-identity contract",
+   "batch4": {
+    "lccc": 7,
+    "lccc_folds_off": 7,
+    "lccc_passes_off": 7,
+    "gcc": 4,
+    "status": "gap"
+   }
+  },
+  {
+   "issue": 86171,
+   "title": "[InstCombine] Missed optimization : fold rol pattern `(a * b) >> (BW - c) | (a * (b << c))` to `fshl(a * b, a * b, c)`",
+   "created": "2024-03-21T18:40:50Z",
+   "verdict": "confirmed-gap-deferred",
+   "evidence": "measured",
+   "reason": "measured gap (lccc 11 vs GCC 10 instructions): rotate/funnel-shift family combined with multiply reassociation",
+   "batch4": {
+    "lccc": 4,
+    "lccc_folds_off": 4,
+    "lccc_passes_off": 9,
+    "gcc": 4,
+    "status": "at-or-better"
+   }
+  },
+  {
+   "issue": 86161,
+   "title": "[InstCombine] Missed optimization : fold `switch(rol(a, c))`",
+   "created": "2024-03-21T17:58:05Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'switch')"
+  },
+  {
+   "issue": 85939,
+   "title": "Missed optimization: right shift (>>) with first operand up-cast to longer types",
+   "created": "2024-03-20T14:28:24Z",
+   "verdict": "confirmed-gap-deferred",
+   "evidence": "measured",
+   "reason": "measured gap (lccc 5 vs GCC 4 instructions): shift-operand narrowing across a widening cast",
+   "batch4": {
+    "lccc": 4,
+    "lccc_folds_off": 4,
+    "lccc_passes_off": 4,
+    "gcc": 3,
+    "status": "gap"
+   }
+  },
+  {
+   "issue": 85844,
+   "title": "[InstCombine] Missed optimization: fold `a s> -1 ? 0 : (a | 3)` to `smin(0, a | 3)`",
+   "created": "2024-03-19T18:38:37Z",
+   "verdict": "confirmed-gap-deferred",
+   "evidence": "measured",
+   "reason": "measured gap (lccc 7 vs GCC 6 instructions): range-based select canonicalisation to smin",
+   "batch4": {
+    "lccc": 7,
+    "lccc_folds_off": 7,
+    "lccc_passes_off": 7,
+    "gcc": 6,
+    "status": "gap"
+   }
+  },
+  {
+   "issue": 85836,
+   "title": "[InstCombine] Missed optimization: merge consecutive loads whose value merged by `or`",
+   "created": "2024-03-19T18:04:28Z",
+   "verdict": "vector-or-simd",
+   "evidence": "text-rule",
+   "reason": "vector/SIMD shape: the scalar ring contract does not model lanes, shuffles or per-lane saturation (matched 'vectorized')"
+  },
+  {
+   "issue": 85833,
+   "title": "[InstCombine] Missed optimization: fold chained selects with exclusive condition but one identical arm",
+   "created": "2024-03-19T17:45:53Z",
+   "verdict": "non-x86-target",
+   "evidence": "text-rule",
+   "reason": "target-specific lowering: instruction selection belongs to the backend, not to an IR fold (matched 'arm')"
+  },
+  {
+   "issue": 85830,
+   "title": "[InstCombine] Missed optimization: Fold `(sext(a) & sext(c1)) == c2` to `(a & c1) == c2` or `0`",
+   "created": "2024-03-19T17:27:27Z",
+   "verdict": "confirmed-gap-deferred",
+   "evidence": "measured",
+   "reason": "measured gap (lccc 6 vs GCC 4 instructions): needs the cast to be narrowed to the compared width",
+   "batch4": {
+    "lccc": 6,
+    "lccc_folds_off": 6,
+    "lccc_passes_off": 6,
+    "gcc": 4,
+    "status": "gap"
+   }
+  },
+  {
+   "issue": 85823,
+   "title": "[ValueTracking] Missed optimization: Infer known bits from `a & mask == 0`",
+   "created": "2024-03-19T17:00:53Z",
+   "verdict": "scalar-unprobed",
+   "evidence": "text-rule",
+   "reason": "scalar shape with no vector/FP/UB/CFG premise in the report text that a single-function probe can decide"
+  },
+  {
+   "issue": 85419,
+   "title": "Missed optimization: extractps optimizes better than pshufd+movd",
+   "created": "2024-03-15T15:53:25Z",
+   "verdict": "vector-or-simd",
+   "evidence": "text-rule",
+   "reason": "vector/SIMD shape: the scalar ring contract does not model lanes, shuffles or per-lane saturation (matched 'sse4')"
+  },
+  {
+   "issue": 85368,
+   "title": "[DSE] Missed optimization: skip `store(phi)` if the tautological value in phi is assigned ",
+   "created": "2024-03-15T07:18:54Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'dse')"
+  },
+  {
+   "issue": 85265,
+   "title": "missed optimization, fptrunc (x) >= C1 => x >= C2",
+   "created": "2024-03-14T16:59:06Z",
+   "verdict": "fp-semantics",
+   "evidence": "text-rule",
+   "reason": "floating-point semantics: NaN, signed-zero and fast-math premises are outside the integer ring contract (matched 'double')"
+  },
+  {
+   "issue": 85196,
+   "title": "[SimplifyCFG] Missed optimization: merge switch branches into default if they hold the same value in phi as the default branch",
+   "created": "2024-03-14T08:21:16Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'simplifycfg')"
+  },
+  {
+   "issue": 84937,
+   "title": "[ValueTracking] Missed optimization: indicate knownbits from dominating condition `switch(trunc(a))`",
+   "created": "2024-03-12T15:58:08Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'switch')"
+  },
+  {
+   "issue": 84605,
+   "title": "Missed optimization: redundant conversion to bool when the value is already in valid bool range",
+   "created": "2024-03-09T05:53:49Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'tail')"
+  },
+  {
+   "issue": 84432,
+   "title": "Missed optimization: x*(x||(b&&c)) => x",
+   "created": "2024-03-08T05:36:50Z",
+   "verdict": "folded-this-batch",
+   "evidence": "measured",
+   "reason": "batch 4: the select-implication lattice and the boolean product rule fold this idiom to the same instruction count GCC 16.2 emits",
+   "batch4": {
+    "lccc": 2,
+    "lccc_folds_off": 13,
+    "lccc_passes_off": 13,
+    "gcc": 2,
+    "status": "at-or-better"
+   }
+  },
+  {
+   "issue": 84401,
+   "title": "Missed Optimization: Aligned Pointer Optimizations Can't Happen With Prefered OR Instead of ADD",
+   "created": "2024-03-07T23:33:28Z",
+   "verdict": "memory-or-abi",
+   "evidence": "text-rule",
+   "reason": "memory or ABI lowering: not an integer-identity rewrite (matched 'aligned')"
+  },
+  {
+   "issue": 84342,
+   "title": "[InstCombine] Missed optimization: fold `min` in `phi`",
+   "created": "2024-03-07T16:57:50Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'loop')"
+  },
+  {
+   "issue": 84089,
+   "title": "Missed Optimization: Block Placement Reveals Missed Constant Propagation in Many Archs",
+   "created": "2024-03-05T22:50:50Z",
+   "verdict": "non-x86-target",
+   "evidence": "text-rule",
+   "reason": "target-specific lowering: instruction selection belongs to the backend, not to an IR fold (matched 'aarch64')"
+  },
+  {
+   "issue": 83812,
+   "title": "[missed optimization] repeat load operation of returned struct",
+   "created": "2024-03-04T09:59:17Z",
+   "verdict": "memory-or-abi",
+   "evidence": "text-rule",
+   "reason": "memory or ABI lowering: not an integer-identity rewrite (matched 'load')"
+  },
+  {
+   "issue": 83772,
+   "title": "[SimplifyCFG] Missed optimization: fold `is_power_of_2(A)` to `ctpop(A) == 1`",
+   "created": "2024-03-04T06:30:46Z",
+   "verdict": "already-at-oracle",
+   "evidence": "measured",
+   "reason": "measured parity or better against the GCC 16.2 oracle (lccc 8 vs GCC 8 instructions)"
+  },
+  {
+   "issue": 83724,
+   "title": "[IndVarSimplify] Missed optimization: fail to recognize `memset` pattern after vectorization",
+   "created": "2024-03-03T13:17:35Z",
+   "verdict": "vector-or-simd",
+   "evidence": "text-rule",
+   "reason": "vector/SIMD shape: the scalar ring contract does not model lanes, shuffles or per-lane saturation (matched 'vectorization')"
+  },
+  {
+   "issue": 83699,
+   "title": "Missed Optimization (InstCombine): Convert constant mask M: (x&~M)|((x&M)&~(y&M)) to x&~(y&M)",
+   "created": "2024-03-03T02:12:18Z",
+   "verdict": "already-at-oracle",
+   "evidence": "measured",
+   "reason": "measured parity or better against the GCC 16.2 oracle (lccc 5 vs GCC 10 instructions)"
+  },
+  {
+   "issue": 83430,
+   "title": "[InstCombine] Missed optimization: fail to fold `(A >> C1) Pred C2` if `shr` is used multiple times",
+   "created": "2024-02-29T14:21:13Z",
+   "verdict": "scalar-unprobed",
+   "evidence": "text-rule",
+   "reason": "scalar shape with no vector/FP/UB/CFG premise in the report text that a single-function probe can decide"
+  },
+  {
+   "issue": 83417,
+   "title": "[SimplifyCFG] Missed optimization: simplify if-else BBs that share common destinations",
+   "created": "2024-02-29T12:23:22Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'simplifycfg')"
+  },
+  {
+   "issue": 83225,
+   "title": "[InstCombine] Missed optimization: fold select if the user of its select user indicates the condition",
+   "created": "2024-02-28T05:50:44Z",
+   "verdict": "scalar-unprobed",
+   "evidence": "text-rule",
+   "reason": "scalar shape with no vector/FP/UB/CFG premise in the report text that a single-function probe can decide"
+  },
+  {
+   "issue": 82414,
+   "title": "[InstCombine] Missed optimization : fold `X > C2 ? X + C1 : C2 + C1` to `max(X, C2) + C1`",
+   "created": "2024-02-20T20:27:27Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'nsw')"
+  },
+  {
+   "issue": 82387,
+   "title": "Missed tail call optimization on undefined return value for all architectures",
+   "created": "2024-02-20T17:15:56Z",
+   "verdict": "non-x86-target",
+   "evidence": "text-rule",
+   "reason": "target-specific lowering: instruction selection belongs to the backend, not to an IR fold (matched 'arm')"
+  },
+  {
+   "issue": 82381,
+   "title": "Missed optimization: dead code is not eliminated based on possible floating-point values at any optimization level.",
+   "created": "2024-02-20T16:54:03Z",
+   "verdict": "fp-semantics",
+   "evidence": "text-rule",
+   "reason": "floating-point semantics: NaN, signed-zero and fast-math premises are outside the integer ring contract (matched 'float')"
+  },
+  {
+   "issue": 82271,
+   "title": "[ConstraintElimination] Missed optimization: fold `max(SExt(b), SExt(a) + 1)` to `SExt(b)` if `a s< b`",
+   "created": "2024-02-19T18:59:26Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'constraintelimination')"
+  },
+  {
+   "issue": 82183,
+   "title": "Missed optimization: 128-bit remainder `%` can be implemented in terms of `divq` directly",
+   "created": "2024-02-18T18:06:15Z",
+   "verdict": "scalar-unprobed",
+   "evidence": "text-rule",
+   "reason": "scalar shape with no vector/FP/UB/CFG premise in the report text that a single-function probe can decide"
+  },
+  {
+   "issue": 82177,
+   "title": "[InstCombine] Missed optimization: Fold `usub_sat((sub nuw C1, A), C2)` to `usub_sat(C1 - C2, A)` or `0`",
+   "created": "2024-02-18T17:02:00Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'nuw')"
+  },
+  {
+   "issue": 82169,
+   "title": "Missed optimization: `divq` never gets emitted directly for 128-bit division, even when safe",
+   "created": "2024-02-18T14:09:32Z",
+   "verdict": "scalar-unprobed",
+   "evidence": "text-rule",
+   "reason": "scalar shape with no vector/FP/UB/CFG premise in the report text that a single-function probe can decide"
+  },
+  {
+   "issue": 81883,
+   "title": "[X86] Possible missed optimization with truncating vector cast",
+   "created": "2024-02-15T17:35:05Z",
+   "verdict": "vector-or-simd",
+   "evidence": "text-rule",
+   "reason": "vector/SIMD shape: the scalar ring contract does not model lanes, shuffles or per-lane saturation (matched 'vector')"
+  },
+  {
+   "issue": 81371,
+   "title": "Missed optimization when partial memsets can be forwarded ",
+   "created": "2024-02-10T18:45:41Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'nonnull')"
+  },
+  {
+   "issue": 80616,
+   "title": "[LICM] Missed optimization due to missing alignment information",
+   "created": "2024-02-04T20:35:03Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'dereferenceable')"
+  },
+  {
+   "issue": 80528,
+   "title": "Missed optimization with inline assembly (chooses memory over register)",
+   "created": "2024-02-03T05:38:59Z",
+   "verdict": "vector-or-simd",
+   "evidence": "text-rule",
+   "reason": "vector/SIMD shape: the scalar ring contract does not model lanes, shuffles or per-lane saturation (matched 'packed')"
+  },
+  {
+   "issue": 80159,
+   "title": "[SCCP] Missed optimization : better range for overflow operators with `nuw`/`nsw`",
+   "created": "2024-01-31T16:35:38Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'overflow')"
+  },
+  {
+   "issue": 80149,
+   "title": "Compare result flags sometimes not reused. (Missed optimization)",
+   "created": "2024-01-31T15:15:59Z",
+   "verdict": "non-x86-target",
+   "evidence": "text-rule",
+   "reason": "target-specific lowering: instruction selection belongs to the backend, not to an IR fold (matched 'arm64')"
+  },
+  {
+   "issue": 80107,
+   "title": "Missed optimization: long conditional jump on hot path",
+   "created": "2024-01-31T07:01:13Z",
+   "verdict": "memory-or-abi",
+   "evidence": "text-rule",
+   "reason": "memory or ABI lowering: not an integer-identity rewrite (matched 'byte')"
+  },
+  {
+   "issue": 79757,
+   "title": "Missed optimization with a switch with more than 64 branches",
+   "created": "2024-01-28T16:01:13Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'switch')"
+  },
+  {
+   "issue": 79696,
+   "title": "[SCCP][ConstantRange] Missed optimization due to approximation of `xor` operation on ConstantRange",
+   "created": "2024-01-27T16:26:51Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'inline')"
+  },
+  {
+   "issue": 79266,
+   "title": "[InstCombine] Missed optimization: fold `((select C1, C2) | A) ^ C3` to `(select C1^C3, C2^C3) | A)`",
+   "created": "2024-01-24T09:02:04Z",
+   "verdict": "already-at-oracle",
+   "evidence": "measured",
+   "reason": "measured parity or better against the GCC 16.2 oracle (lccc 6 vs GCC 7 instructions)"
+  },
+  {
+   "issue": 78785,
+   "title": "Partially-inline-libcalls should probably issue a missed-optimization message if it inserts a branch",
+   "created": "2024-01-19T21:02:16Z",
+   "verdict": "fp-semantics",
+   "evidence": "text-rule",
+   "reason": "floating-point semantics: NaN, signed-zero and fast-math premises are outside the integer ring contract (matched 'double')"
+  },
+  {
+   "issue": 78596,
+   "title": "[BDCE] Missed optimization: simplify demanded bits on multi-use instructions",
+   "created": "2024-01-18T15:12:48Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'bdce')"
+  },
+  {
+   "issue": 78490,
+   "title": "Missed optimization in x86 codegen: `lea + lea` -> `lea + add` with ` -Xclang -target-feature -Xclang +slow-3ops-lea`",
+   "created": "2024-01-17T19:16:55Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'loop')"
+  },
+  {
+   "issue": 78438,
+   "title": "Missed optimization: (1/(y+1))/a => 0 because of missed constant propagation (a=2)",
+   "created": "2024-01-17T12:41:52Z",
+   "verdict": "memory-or-abi",
+   "evidence": "text-rule",
+   "reason": "memory or ABI lowering: not an integer-identity rewrite (matched 'load')"
+  },
+  {
+   "issue": 78271,
+   "title": "[missed optimization] AND-operation shortcut not taken; potential unnecessary load",
+   "created": "2024-01-16T13:12:56Z",
+   "verdict": "memory-or-abi",
+   "evidence": "text-rule",
+   "reason": "memory or ABI lowering: not an integer-identity rewrite (matched 'load')"
+  },
+  {
+   "issue": 78214,
+   "title": "missed optimization : `gep + gep -> add + gep` ",
+   "created": "2024-01-15T23:40:49Z",
+   "verdict": "non-x86-target",
+   "evidence": "text-rule",
+   "reason": "target-specific lowering: instruction selection belongs to the backend, not to an IR fold (matched 'aarch64')"
+  },
+  {
+   "issue": 77969,
+   "title": "missed-optimization: sum of two signed values greater than x is always greater than x",
+   "created": "2024-01-12T19:44:04Z",
+   "verdict": "scalar-unprobed",
+   "evidence": "text-rule",
+   "reason": "scalar shape with no vector/FP/UB/CFG premise in the report text that a single-function probe can decide"
+  },
+  {
+   "issue": 77962,
+   "title": "missed-optimization: Loads not combined for overlapping data",
+   "created": "2024-01-12T19:12:22Z",
+   "verdict": "scalar-unprobed",
+   "evidence": "text-rule",
+   "reason": "scalar shape with no vector/FP/UB/CFG premise in the report text that a single-function probe can decide"
+  },
+  {
+   "issue": 76951,
+   "title": "[clang] Missed optimization: clang doesn't skip not used evaluation",
+   "created": "2024-01-04T13:50:53Z",
+   "verdict": "scalar-unprobed",
+   "evidence": "text-rule",
+   "reason": "scalar shape with no vector/FP/UB/CFG premise in the report text that a single-function probe can decide"
+  },
+  {
+   "issue": 76623,
+   "title": "[InstCombine] Missed optimization: fold `other_cond && (a s> -1) && a s< b` to `other_cond && a u< b` when `b` is a specific constant",
+   "created": "2023-12-30T18:08:47Z",
+   "verdict": "already-at-oracle",
+   "evidence": "measured",
+   "reason": "measured parity or better against the GCC 16.2 oracle (lccc 10 vs GCC 10 instructions)"
+  },
+  {
+   "issue": 76598,
+   "title": "missed optimization: Signed constant division branch",
+   "created": "2023-12-30T02:24:40Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'branch')"
+  },
+  {
+   "issue": 76585,
+   "title": "[InstCombine] Missed optimization for `(x * z) % (y * z) == 0` => `x % y == 0`",
+   "created": "2023-12-29T20:11:42Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'overflow')"
+  },
+  {
+   "issue": 76559,
+   "title": "Missed optimization for `fdiv` followed by `fmul`",
+   "created": "2023-12-29T10:13:51Z",
+   "verdict": "fp-semantics",
+   "evidence": "text-rule",
+   "reason": "floating-point semantics: NaN, signed-zero and fast-math premises are outside the integer ring contract (matched 'fdiv')"
+  },
+  {
+   "issue": 76554,
+   "title": "missed optimization: `((a ^ b) & c) | a` -> `a | (b & c)`",
+   "created": "2023-12-29T08:00:21Z",
+   "verdict": "already-at-oracle",
+   "evidence": "measured",
+   "reason": "measured parity or better against the GCC 16.2 oracle (lccc 4 vs GCC 4 instructions)"
+  },
+  {
+   "issue": 76524,
+   "title": "missed optimization for trunc i32 to i16 or i8 when ConstantRange of source already fits in destination",
+   "created": "2023-12-28T18:34:54Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'tail')"
+  },
+  {
+   "issue": 76487,
+   "title": "missed optimization: redundant store is not optimized away (test case with struct)",
+   "created": "2023-12-28T05:08:16Z",
+   "verdict": "memory-or-abi",
+   "evidence": "text-rule",
+   "reason": "memory or ABI lowering: not an integer-identity rewrite (matched 'store')"
+  },
+  {
+   "issue": 76482,
+   "title": "Missed optimization for x86 when optimizing for size",
+   "created": "2023-12-28T02:49:17Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'stack')"
+  },
+  {
+   "issue": 76043,
+   "title": "missed optimization: Optimization based on the first of the two conditions",
+   "created": "2023-12-20T12:23:26Z",
+   "verdict": "scalar-unprobed",
+   "evidence": "text-rule",
+   "reason": "scalar shape with no vector/FP/UB/CFG premise in the report text that a single-function probe can decide"
+  },
+  {
+   "issue": 75786,
+   "title": "missed optimization around std::signbit(x)",
+   "created": "2023-12-18T11:58:52Z",
+   "verdict": "fp-semantics",
+   "evidence": "text-rule",
+   "reason": "floating-point semantics: NaN, signed-zero and fast-math premises are outside the integer ring contract (matched 'float')"
+  },
+  {
+   "issue": 75752,
+   "title": "Missed optimization: invert nested switches",
+   "created": "2023-12-17T21:33:54Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'simplifycfg')"
+  },
+  {
+   "issue": 75541,
+   "title": "[SimplifyCFG] Flowing off the end of the function results in missed optimization",
+   "created": "2023-12-14T23:43:52Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'simplifycfg')"
+  },
+  {
+   "issue": 75455,
+   "title": "Missed optimization: not tail calling memset",
+   "created": "2023-12-14T10:02:15Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'tail')"
+  },
+  {
+   "issue": 75360,
+   "title": "Missed optimization: unsigned ckd_add(&unused, a, 1) can be folded to (a == UINT_MAX)",
+   "created": "2023-12-13T17:13:19Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'overflow')"
+  },
+  {
+   "issue": 75331,
+   "title": "missed optimization: redundant operations in loop are not optimized away",
+   "created": "2023-12-13T12:42:24Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'loop')"
+  },
+  {
+   "issue": 74976,
+   "title": "Missed optimization for count trailing ones (miss `__builtin_ctz` detection)",
+   "created": "2023-12-10T06:20:15Z",
+   "verdict": "confirmed-gap-deferred",
+   "evidence": "measured",
+   "reason": "measured gap (lccc 5 vs GCC 4 instructions): count-trailing-ones intrinsic recognition",
+   "batch4": {
+    "lccc": 5,
+    "lccc_folds_off": 5,
+    "lccc_passes_off": 5,
+    "gcc": 4,
+    "status": "gap"
+   }
+  },
+  {
+   "issue": 74975,
+   "title": "missed optimization: redundant store is not optimized away",
+   "created": "2023-12-10T06:20:14Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'dse')"
+  },
+  {
+   "issue": 74914,
+   "title": "missed optimization for value range",
+   "created": "2023-12-09T05:08:32Z",
+   "verdict": "scalar-unprobed",
+   "evidence": "text-rule",
+   "reason": "scalar shape with no vector/FP/UB/CFG premise in the report text that a single-function probe can decide"
+  },
+  {
+   "issue": 74844,
+   "title": "Missed optimization: inefficient bitfield increment with saturation",
+   "created": "2023-12-08T14:44:03Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'overflow')"
+  },
+  {
+   "issue": 74583,
+   "title": "Missed optimization: inefficient register allocation",
+   "created": "2023-12-06T10:50:10Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'register allocation')"
+  },
+  {
+   "issue": 74577,
+   "title": "Missed optimization: duplicate address calculations",
+   "created": "2023-12-06T09:52:48Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'assume')"
+  },
+  {
+   "issue": 74433,
+   "title": "Missed optimization: JMP to RET",
+   "created": "2023-12-05T08:37:42Z",
+   "verdict": "confirmed-gap-deferred",
+   "evidence": "measured",
+   "reason": "measured gap (lccc 6 vs GCC 4 instructions): branch-to-setcc control-flow rewrite",
+   "batch4": {
+    "lccc": 6,
+    "lccc_folds_off": 6,
+    "lccc_passes_off": 6,
+    "gcc": 4,
+    "status": "gap"
+   }
+  },
+  {
+   "issue": 74432,
+   "title": "Missed optimization: unnecessary TLS address calculations",
+   "created": "2023-12-05T08:26:42Z",
+   "verdict": "memory-or-abi",
+   "evidence": "text-rule",
+   "reason": "memory or ABI lowering: not an integer-identity rewrite (matched 'tls')"
+  },
+  {
+   "issue": 74242,
+   "title": "missed optimization for `y / x` when the divisor has [0, 1] range",
+   "created": "2023-12-03T13:49:30Z",
+   "verdict": "already-at-oracle",
+   "evidence": "measured",
+   "reason": "measured parity or better against the GCC 16.2 oracle (lccc 4 vs GCC 4 instructions)"
+  },
+  {
+   "issue": 73422,
+   "title": "missed optimization under the condition that modulo (a % b) implies",
+   "created": "2023-11-26T03:44:02Z",
+   "verdict": "scalar-unprobed",
+   "evidence": "text-rule",
+   "reason": "scalar shape with no vector/FP/UB/CFG premise in the report text that a single-function probe can decide"
+  },
+  {
+   "issue": 73380,
+   "title": "[SimplifyCFG] Missed optimization: Fail to merge part of phi into one select",
+   "created": "2023-11-25T09:02:17Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'simplifycfg')"
+  },
+  {
+   "issue": 72651,
+   "title": "[InstCombine][EarlyCSE] Missed optimization for not canonicalizing `select uge/ult, A, B`",
+   "created": "2023-11-17T14:08:49Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'gvn')"
+  },
+  {
+   "issue": 72512,
+   "title": "[InstCombine] Missed optimization for `(a + 1) - b == 1`  --> `a == b`",
+   "created": "2023-11-16T13:12:49Z",
+   "verdict": "confirmed-gap-deferred",
+   "evidence": "measured",
+   "reason": "measured gap (lccc 6 vs GCC 4 instructions): reassociation across a wrapping add: the compare must be re-expressed in another operand order, which is the reassociation family's contract, not an identity closed over one operand set",
+   "batch4": {
+    "lccc": 6,
+    "lccc_folds_off": 6,
+    "lccc_passes_off": 6,
+    "gcc": 4,
+    "status": "gap"
+   }
+  },
+  {
+   "issue": 72378,
+   "title": "[CVP] Missed optimization for smax((a + 7) / 8, 1) where a s> 0",
+   "created": "2023-11-15T13:06:08Z",
+   "verdict": "scalar-unprobed",
+   "evidence": "text-rule",
+   "reason": "scalar shape with no vector/FP/UB/CFG premise in the report text that a single-function probe can decide"
+  },
+  {
+   "issue": 72293,
+   "title": "Missed optimization for unnecessary shl/ashr pair in loop body",
+   "created": "2023-11-14T18:13:15Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'loop')"
+  },
+  {
+   "issue": 72212,
+   "title": "[Loop][PointerAlias] Missed optimization due to wide.trip.count widening bitwidth",
+   "created": "2023-11-14T06:45:24Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'loop')"
+  },
+  {
+   "issue": 72100,
+   "title": "Missed optimization: 2 field loads instead of 1",
+   "created": "2023-11-13T10:42:08Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'assume')"
+  },
+  {
+   "issue": 71948,
+   "title": "[InstCombine] Missed optimization for the pattern `((a << 1) + b) - ((a+b) & a)`",
+   "created": "2023-11-10T15:05:01Z",
+   "verdict": "confirmed-gap-deferred",
+   "evidence": "measured",
+   "reason": "measured gap (lccc 6 vs GCC 5 instructions): reassociation of a shift/add/subtract chain",
+   "batch4": {
+    "lccc": 6,
+    "lccc_folds_off": 6,
+    "lccc_passes_off": 6,
+    "gcc": 5,
+    "status": "gap"
+   }
+  },
+  {
+   "issue": 71789,
+   "title": "[InstCombine] Missed optimization for (a ^ -1) < -a",
+   "created": "2023-11-09T09:43:43Z",
+   "verdict": "already-at-oracle",
+   "evidence": "measured",
+   "reason": "measured parity or better against the GCC 16.2 oracle (lccc 7 vs GCC 7 instructions)"
+  },
+  {
+   "issue": 71533,
+   "title": "[InstCombine] Missed optimization for select a%2==0, (a/2*2)*(a/2*2), 0",
+   "created": "2023-11-07T13:09:34Z",
+   "verdict": "confirmed-gap-deferred",
+   "evidence": "measured",
+   "reason": "measured gap (lccc 12 vs GCC 9 instructions): div/rem decomposition plus a parity test",
+   "batch4": {
+    "lccc": 5,
+    "lccc_folds_off": 5,
+    "lccc_passes_off": 5,
+    "gcc": 6,
+    "status": "at-or-better"
+   }
+  },
+  {
+   "issue": 71316,
+   "title": "Missed optimization: unnecessary register move",
+   "created": "2023-11-05T13:38:57Z",
+   "verdict": "memory-or-abi",
+   "evidence": "text-rule",
+   "reason": "memory or ABI lowering: not an integer-identity rewrite (matched 'struct')"
+  },
+  {
+   "issue": 71306,
+   "title": "Missed optimization: add+add instead of lea",
+   "created": "2023-11-05T07:37:45Z",
+   "verdict": "memory-or-abi",
+   "evidence": "text-rule",
+   "reason": "memory or ABI lowering: not an integer-identity rewrite (matched 'byte')"
+  },
+  {
+   "issue": 71130,
+   "title": "missed optimization for \"length\" of (a, b)",
+   "created": "2023-11-03T01:50:54Z",
+   "verdict": "scalar-unprobed",
+   "evidence": "text-rule",
+   "reason": "scalar shape with no vector/FP/UB/CFG premise in the report text that a single-function probe can decide"
+  },
+  {
+   "issue": 70985,
+   "title": "Missed optimization: inadequate float range propagation",
+   "created": "2023-11-01T21:08:03Z",
+   "verdict": "fp-semantics",
+   "evidence": "text-rule",
+   "reason": "floating-point semantics: NaN, signed-zero and fast-math premises are outside the integer ring contract (matched 'float')"
+  },
+  {
+   "issue": 70767,
+   "title": "[DFAJumpThreading] Missed optimization for invariant condition after first iteration",
+   "created": "2023-10-31T05:48:20Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'peel')"
+  },
+  {
+   "issue": 70597,
+   "title": "Missed optimization of loopDeletion probably because of a missing loopUnswitch",
+   "created": "2023-10-29T15:17:07Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'loop')"
+  },
+  {
+   "issue": 70596,
+   "title": "Missed optimization of useless instructions:   xor edi, edi    test edi, edi    je ",
+   "created": "2023-10-29T14:49:08Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'loop')"
+  },
+  {
+   "issue": 70374,
+   "title": "Missed optimization opportunity in (z >= 0) && (x >= y + z) && (x >= y);",
+   "created": "2023-10-26T20:19:55Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'overflow')"
+  },
+  {
+   "issue": 69938,
+   "title": "WASM: Odd choice of selected instruction, and subsequent missed optimization",
+   "created": "2023-10-23T16:09:20Z",
+   "verdict": "non-x86-target",
+   "evidence": "text-rule",
+   "reason": "target-specific lowering: instruction selection belongs to the backend, not to an IR fold (matched 'wasm')"
+  },
+  {
+   "issue": 69895,
+   "title": "Missed optimization: duplicate vector register initialization for __builtin_memset_inline",
+   "created": "2023-10-23T04:08:42Z",
+   "verdict": "vector-or-simd",
+   "evidence": "text-rule",
+   "reason": "vector/SIMD shape: the scalar ring contract does not model lanes, shuffles or per-lane saturation (matched 'vector')"
+  },
+  {
+   "issue": 69833,
+   "title": "Missed optimization of empty `for` loop function into just `ret`",
+   "created": "2023-10-21T10:22:35Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'loop')"
+  },
+  {
+   "issue": 69338,
+   "title": "Missed optimization: excessive register zeroing",
+   "created": "2023-10-17T14:35:23Z",
+   "verdict": "scalar-unprobed",
+   "evidence": "text-rule",
+   "reason": "scalar shape with no vector/FP/UB/CFG premise in the report text that a single-function probe can decide"
+  },
+  {
+   "issue": 68712,
+   "title": "Missed optimization: reuse of constant in a register",
+   "created": "2023-10-10T14:14:46Z",
+   "verdict": "scalar-unprobed",
+   "evidence": "text-rule",
+   "reason": "scalar shape with no vector/FP/UB/CFG premise in the report text that a single-function probe can decide"
+  },
+  {
+   "issue": 68365,
+   "title": "Missed optimization: Reorder deallocations before allocations of unrelated memory",
+   "created": "2023-10-05T23:17:43Z",
+   "verdict": "memory-or-abi",
+   "evidence": "text-rule",
+   "reason": "memory or ABI lowering: not an integer-identity rewrite (matched 'sizeof')"
+  },
+  {
+   "issue": 68099,
+   "title": "Missed optimization when emulating variable length array in struct",
+   "created": "2023-10-03T13:19:13Z",
+   "verdict": "memory-or-abi",
+   "evidence": "text-rule",
+   "reason": "memory or ABI lowering: not an integer-identity rewrite (matched 'struct')"
+  },
+  {
+   "issue": 67843,
+   "title": "Missed optimization of switch to arithmetic",
+   "created": "2023-09-29T18:33:20Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'switch')"
+  },
+  {
+   "issue": 67842,
+   "title": "Missed optimization of switch to arithmetic",
+   "created": "2023-09-29T18:33:18Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'switch')"
+  },
+  {
+   "issue": 67813,
+   "title": "Missed optimization of Loop Unswitch (could be a regression)",
+   "created": "2023-09-29T14:37:27Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'loop')"
+  },
+  {
+   "issue": 67582,
+   "title": "[C++20][Modules] Missed optimization: Unnecessary code emitted for empty module initializers",
+   "created": "2023-09-27T18:02:45Z",
+   "verdict": "vector-or-simd",
+   "evidence": "text-rule",
+   "reason": "vector/SIMD shape: the scalar ring contract does not model lanes, shuffles or per-lane saturation (matched 'vector')"
+  },
+  {
+   "issue": 67342,
+   "title": "Missed optimization",
+   "created": "2023-09-25T15:53:07Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'inbounds')"
+  },
+  {
+   "issue": 66417,
+   "title": "Missed optimization for 2^n euclidean division remainder operations on signed integers.",
+   "created": "2023-09-14T18:58:35Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'stack')"
+  },
+  {
+   "issue": 66159,
+   "title": "Missed optimization on aarch64: decompose 64 byte vector into 4 16 byte vectors automatically",
+   "created": "2023-09-12T23:54:29Z",
+   "verdict": "vector-or-simd",
+   "evidence": "text-rule",
+   "reason": "vector/SIMD shape: the scalar ring contract does not model lanes, shuffles or per-lane saturation (matched 'vector')"
+  },
+  {
+   "issue": 65120,
+   "title": "Missed optimization for bitset based equality",
+   "created": "2023-08-30T19:39:56Z",
+   "verdict": "scalar-unprobed",
+   "evidence": "text-rule",
+   "reason": "scalar shape with no vector/FP/UB/CFG premise in the report text that a single-function probe can decide"
+  },
+  {
+   "issue": 64762,
+   "title": "Missed optimization: -(var_9 + var_1 + var_9)  Clang16 vs Clang10",
+   "created": "2023-08-17T08:15:23Z",
+   "verdict": "scalar-unprobed",
+   "evidence": "text-rule",
+   "reason": "scalar shape with no vector/FP/UB/CFG premise in the report text that a single-function probe can decide"
+  },
+  {
+   "issue": 64535,
+   "title": "clang: missed optimization for an empty string",
+   "created": "2023-08-08T16:07:03Z",
+   "verdict": "scalar-unprobed",
+   "evidence": "text-rule",
+   "reason": "scalar shape with no vector/FP/UB/CFG premise in the report text that a single-function probe can decide"
+  },
+  {
+   "issue": 64437,
+   "title": "Missed optimization due to false aliasing of base class subobjects",
+   "created": "2023-08-04T19:00:46Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'nonnull')"
+  },
+  {
+   "issue": 64434,
+   "title": "Missed optimization due to aliasing of subobjects on transparent replacement",
+   "created": "2023-08-04T18:21:56Z",
+   "verdict": "memory-or-abi",
+   "evidence": "text-rule",
+   "reason": "memory or ABI lowering: not an integer-identity rewrite (matched 'struct')"
+  },
+  {
+   "issue": 64374,
+   "title": "[LICM] Missed optimization: var_9 ? (var_1 ? 1 : 2) : 2222 (Clang16 vs Clang10)",
+   "created": "2023-08-03T08:44:06Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'nsw')"
+  },
+  {
+   "issue": 64372,
+   "title": "[LICM] Missed optimization: var_1 + var_6 + var_5 / var_6",
+   "created": "2023-08-03T08:19:22Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'nsw')"
+  },
+  {
+   "issue": 64370,
+   "title": "[LICM] Missed optimization: var_6 + var_15 + var_15 + var_5  + var_6",
+   "created": "2023-08-03T07:54:53Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'licm')"
+  },
+  {
+   "issue": 64369,
+   "title": "[LICM]Missed optimization: loop invariants for global variables",
+   "created": "2023-08-03T07:34:07Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'nsw')"
+  },
+  {
+   "issue": 64368,
+   "title": "[LICM] Missed optimization in common code",
+   "created": "2023-08-03T07:15:12Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'licm')"
+  },
+  {
+   "issue": 64366,
+   "title": "[LICM] Missed optimization: It's affected by the negative sign",
+   "created": "2023-08-03T06:59:16Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'licm')"
+  },
+  {
+   "issue": 64305,
+   "title": "Missed optimization in Euclid Remainder",
+   "created": "2023-08-01T12:22:37Z",
+   "verdict": "confirmed-gap-deferred",
+   "evidence": "measured",
+   "reason": "measured gap (lccc 10 vs GCC 8 instructions): Euclid-remainder form needs the a < b guard to bound the remainder",
+   "batch4": {
+    "lccc": 10,
+    "lccc_folds_off": 10,
+    "lccc_passes_off": 10,
+    "gcc": 8,
+    "status": "gap"
+   }
+  },
+  {
+   "issue": 64240,
+   "title": "Missed optimization: failure to use div-by-zero UB to delete redundant select",
+   "created": "2023-07-30T18:04:04Z",
+   "verdict": "scalar-unprobed",
+   "evidence": "text-rule",
+   "reason": "scalar shape with no vector/FP/UB/CFG premise in the report text that a single-function probe can decide"
+  },
+  {
+   "issue": 64238,
+   "title": "[InstCombine] Missed optimization for icmp(constants[x]) when the range of x is implied",
+   "created": "2023-07-30T17:17:39Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'inbounds')"
+  },
+  {
+   "issue": 64174,
+   "title": "x86-32: missed zext folding optimization for cvtsi2ss",
+   "created": "2023-07-27T20:27:35Z",
+   "verdict": "fp-semantics",
+   "evidence": "text-rule",
+   "reason": "floating-point semantics: NaN, signed-zero and fast-math premises are outside the integer ring contract (matched 'float')"
+  },
+  {
+   "issue": 64059,
+   "title": "[SimplifyCFG] Missed lookup table optimization even for simple switch",
+   "created": "2023-07-24T07:04:17Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'simplifycfg')"
+  },
+  {
+   "issue": 64048,
+   "title": "aarch64 splits one NEON shift into two (missed optimization)",
+   "created": "2023-07-23T19:23:24Z",
+   "verdict": "vector-or-simd",
+   "evidence": "text-rule",
+   "reason": "vector/SIMD shape: the scalar ring contract does not model lanes, shuffles or per-lane saturation (matched 'neon')"
+  },
+  {
+   "issue": 64035,
+   "title": "[LICM] Missed optimization: 200/var_1",
+   "created": "2023-07-22T16:59:30Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'licm')"
+  },
+  {
+   "issue": 64021,
+   "title": "Missed optimization for a simple byteswap algorithm",
+   "created": "2023-07-22T01:57:55Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'loop')"
+  },
+  {
+   "issue": 64010,
+   "title": "Missed optimization: expressions in if-else statement",
+   "created": "2023-07-21T15:04:18Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'nsw')"
+  },
+  {
+   "issue": 64004,
+   "title": "Missed optimization: when the value of another variable can be used directly",
+   "created": "2023-07-21T10:19:26Z",
+   "verdict": "memory-or-abi",
+   "evidence": "text-rule",
+   "reason": "memory or ABI lowering: not an integer-identity rewrite (matched 'store')"
+  },
+  {
+   "issue": 64001,
+   "title": "Missed optimization of available expression",
+   "created": "2023-07-21T09:51:32Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'nsw')"
+  },
+  {
+   "issue": 63997,
+   "title": "[Reassociate] Missed optimization of expression of addition",
+   "created": "2023-07-21T07:09:23Z",
+   "verdict": "memory-or-abi",
+   "evidence": "text-rule",
+   "reason": "memory or ABI lowering: not an integer-identity rewrite (matched 'load')"
+  },
+  {
+   "issue": 63663,
+   "title": "llvm missed optimization: memcpy swap ",
+   "created": "2023-07-04T09:45:15Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'nonnull')"
+  },
+  {
+   "issue": 63535,
+   "title": "Missed compiler optimization with member wise initialization",
+   "created": "2023-06-26T23:50:19Z",
+   "verdict": "memory-or-abi",
+   "evidence": "text-rule",
+   "reason": "memory or ABI lowering: not an integer-identity rewrite (matched 'memcpy')"
+  },
+  {
+   "issue": 63419,
+   "title": "Missed optimization of tautological assignment of a global variable",
+   "created": "2023-06-21T00:03:37Z",
+   "verdict": "scalar-unprobed",
+   "evidence": "text-rule",
+   "reason": "scalar shape with no vector/FP/UB/CFG premise in the report text that a single-function probe can decide"
+  },
+  {
+   "issue": 63328,
+   "title": "Missed optimization of std::vector access",
+   "created": "2023-06-15T14:44:20Z",
+   "verdict": "vector-or-simd",
+   "evidence": "text-rule",
+   "reason": "vector/SIMD shape: the scalar ring contract does not model lanes, shuffles or per-lane saturation (matched 'vector')"
+  },
+  {
+   "issue": 63149,
+   "title": "Missed optimization: Compare ignoring top bit",
+   "created": "2023-06-06T15:31:32Z",
+   "verdict": "confirmed-gap-deferred",
+   "evidence": "measured",
+   "reason": "measured gap (lccc 6 vs GCC 5 instructions): masked-compare narrowing across two operands",
+   "batch4": {
+    "lccc": 6,
+    "lccc_folds_off": 6,
+    "lccc_passes_off": 6,
+    "gcc": 6,
+    "status": "at-or-better"
+   }
+  },
+  {
+   "issue": 62845,
+   "title": "Missed Simple Loop Optimization",
+   "created": "2023-05-21T22:47:54Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'loop')"
+  },
+  {
+   "issue": 62808,
+   "title": "Missed optimization opportunity: merging offset calculations for large objects",
+   "created": "2023-05-19T15:20:46Z",
+   "verdict": "memory-or-abi",
+   "evidence": "text-rule",
+   "reason": "memory or ABI lowering: not an integer-identity rewrite (matched 'struct')"
+  },
+  {
+   "issue": 62776,
+   "title": "missed-optimization: reduction builtins do not generate movmskps  and testps instructions",
+   "created": "2023-05-17T13:22:31Z",
+   "verdict": "scalar-unprobed",
+   "evidence": "text-rule",
+   "reason": "scalar shape with no vector/FP/UB/CFG premise in the report text that a single-function probe can decide"
+  },
+  {
+   "issue": 62514,
+   "title": "Missed optimization for C ? BSWAP(X) : 0",
+   "created": "2023-05-03T08:02:01Z",
+   "verdict": "already-at-oracle",
+   "evidence": "measured",
+   "reason": "measured parity or better against the GCC 16.2 oracle (lccc 5 vs GCC 5 instructions)"
+  },
+  {
+   "issue": 62093,
+   "title": "Missed optimization for `*(ptr << 2)`",
+   "created": "2023-04-12T14:27:07Z",
+   "verdict": "vector-or-simd",
+   "evidence": "text-rule",
+   "reason": "vector/SIMD shape: the scalar ring contract does not model lanes, shuffles or per-lane saturation (matched 'packed')"
+  },
+  {
+   "issue": 61958,
+   "title": "Missed optimization: Loop-invariant code motion",
+   "created": "2023-04-05T20:36:17Z",
+   "verdict": "loop-or-cfg",
+   "evidence": "text-rule",
+   "reason": "loop or control-flow restructuring: not a single-instruction rewrite, and lccc's pass order differs by design (matched 'loop')"
+  },
+  {
+   "issue": 61888,
+   "title": "[clang] X86 Missed optimization for unwrapping simple Optional passed as pointer",
+   "created": "2023-04-01T17:14:18Z",
+   "verdict": "x86-only-isa",
+   "evidence": "text-rule",
+   "reason": "x86 instruction-selection detail: owned by the x86 backend, not by an IR-level fold (matched 'sbb')"
+  },
+  {
+   "issue": 61868,
+   "title": "[clang] x86 Missed optimization for simple enum to string function",
+   "created": "2023-03-31T12:04:38Z",
+   "verdict": "needs-ub-premise",
+   "evidence": "text-rule",
+   "reason": "valid only under a no-wrap/poison/range premise; lccc synthesises none, so the rewrite would be unsound for wrapping programs (matched 'undef')"
+  },
+  {
+   "issue": 61760,
+   "title": "Missed optimization\u2014clang realigns VLA sizes when they're known to be already aligned",
+   "created": "2023-03-28T13:03:20Z",
+   "verdict": "memory-or-abi",
+   "evidence": "text-rule",
+   "reason": "memory or ABI lowering: not an integer-identity rewrite (matched 'aligned')"
+  },
+  {
+   "issue": 61615,
+   "title": "clang x86 missed optimization for 2 dimension array accessed through always zero enum class",
+   "created": "2023-03-22T10:50:39Z",
+   "verdict": "memory-or-abi",
+   "evidence": "text-rule",
+   "reason": "memory or ABI lowering: not an integer-identity rewrite (matched 'align')"
+  },
+  {
+   "issue": 60685,
+   "title": "PIE Default for Optimizing Table Loads (Was: \"Missed Optimization: Superfluous Addressing on Data Load\")",
+   "created": "2023-02-12T07:28:57Z",
+   "verdict": "memory-or-abi",
+   "evidence": "text-rule",
+   "reason": "memory or ABI lowering: not an integer-identity rewrite (matched 'load')"
+  },
+  {
+   "issue": 60403,
+   "title": "[x86_64] [Optimization] Maybe missed optimization: can't read/write a 32bit address directly",
+   "created": "2023-01-31T05:00:07Z",
+   "verdict": "scalar-unprobed",
+   "evidence": "text-rule",
+   "reason": "scalar shape with no vector/FP/UB/CFG premise in the report text that a single-function probe can decide"
+  },
+  {
+   "issue": 60173,
+   "title": "Missed optimization opportunity with -~n",
+   "created": "2023-01-20T19:26:46Z",
+   "verdict": "folded-this-batch",
+   "evidence": "measured",
+   "reason": "folded here: -(~n) is n + 1 by the complement-of-negation identity (measured 4 -> 2, at oracle parity)"
+  }
+ ],
+ "batch4_audit": "engineering/llvm-batch4-audit.json",
+ "batch4_note": "rows carrying a `batch4` object were re-transcribed and re-measured after the batch-4 folds"
+}

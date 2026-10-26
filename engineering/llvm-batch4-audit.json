@@ -1,0 +1,269 @@
+{
+  "tool": "measure_audit32",
+  "oracle": "gcc-16 = GCC 16.2.0",
+  "baseline_note": "lccc built from this branch with the fastbuild profile, -O2 both sides, instruction counts over the emitted function body (directives excluded)",
+  "columns": {
+    "lccc": "folds on",
+    "lccc_folds_off": "CCC_NO_RING_IDENTITIES=1",
+    "lccc_passes_off": "CCC_DISABLE_PASSES=bit_idioms,divconst",
+    "gcc": "GCC 16.2.0 -O2"
+  },
+  "rows": [
+    {
+      "issue": "#92074",
+      "lccc": 8,
+      "lccc_folds_off": 8,
+      "lccc_passes_off": 6,
+      "gcc": 7,
+      "status": "gap"
+    },
+    {
+      "issue": "#72512",
+      "lccc": 6,
+      "lccc_folds_off": 6,
+      "lccc_passes_off": 6,
+      "gcc": 4,
+      "status": "gap"
+    },
+    {
+      "issue": "#107228",
+      "lccc": 6,
+      "lccc_folds_off": 6,
+      "lccc_passes_off": 6,
+      "gcc": 5,
+      "status": "gap"
+    },
+    {
+      "issue": "#200538",
+      "lccc": 7,
+      "lccc_folds_off": 7,
+      "lccc_passes_off": 7,
+      "gcc": 4,
+      "status": "gap"
+    },
+    {
+      "issue": "#157370",
+      "lccc": 20,
+      "lccc_folds_off": 20,
+      "lccc_passes_off": 10,
+      "gcc": 19,
+      "status": "gap"
+    },
+    {
+      "issue": "#122442",
+      "lccc": 17,
+      "lccc_folds_off": 17,
+      "lccc_passes_off": 9,
+      "gcc": 14,
+      "status": "gap"
+    },
+    {
+      "issue": "#157524",
+      "lccc": 9,
+      "lccc_folds_off": 9,
+      "lccc_passes_off": 9,
+      "gcc": 4,
+      "status": "gap"
+    },
+    {
+      "issue": "#85844",
+      "lccc": 7,
+      "lccc_folds_off": 7,
+      "lccc_passes_off": 7,
+      "gcc": 6,
+      "status": "gap"
+    },
+    {
+      "issue": "#117436",
+      "lccc": 8,
+      "lccc_folds_off": 8,
+      "lccc_passes_off": 8,
+      "gcc": 7,
+      "status": "gap"
+    },
+    {
+      "issue": "#200556",
+      "lccc": 6,
+      "lccc_folds_off": 6,
+      "lccc_passes_off": 6,
+      "gcc": 4,
+      "status": "gap"
+    },
+    {
+      "issue": "#74976",
+      "lccc": 5,
+      "lccc_folds_off": 5,
+      "lccc_passes_off": 5,
+      "gcc": 4,
+      "status": "gap"
+    },
+    {
+      "issue": "#86171",
+      "lccc": 4,
+      "lccc_folds_off": 4,
+      "lccc_passes_off": 9,
+      "gcc": 4,
+      "status": "at-or-better"
+    },
+    {
+      "issue": "#74433",
+      "lccc": 6,
+      "lccc_folds_off": 6,
+      "lccc_passes_off": 6,
+      "gcc": 4,
+      "status": "gap"
+    },
+    {
+      "issue": "#84432",
+      "lccc": 2,
+      "lccc_folds_off": 13,
+      "lccc_passes_off": 13,
+      "gcc": 2,
+      "status": "at-or-better"
+    },
+    {
+      "issue": "#163084",
+      "lccc": 10,
+      "lccc_folds_off": 10,
+      "lccc_passes_off": 10,
+      "gcc": 7,
+      "status": "gap"
+    },
+    {
+      "issue": "#92966",
+      "lccc": 9,
+      "lccc_folds_off": 9,
+      "lccc_passes_off": 9,
+      "gcc": 7,
+      "status": "gap"
+    },
+    {
+      "issue": "#154025",
+      "lccc": 2,
+      "lccc_folds_off": 5,
+      "lccc_passes_off": 5,
+      "gcc": 2,
+      "status": "at-or-better"
+    },
+    {
+      "issue": "#141479",
+      "lccc": 11,
+      "lccc_folds_off": 11,
+      "lccc_passes_off": 11,
+      "gcc": 10,
+      "status": "gap"
+    },
+    {
+      "issue": "#86176",
+      "lccc": 7,
+      "lccc_folds_off": 7,
+      "lccc_passes_off": 7,
+      "gcc": 4,
+      "status": "gap"
+    },
+    {
+      "issue": "#108451",
+      "lccc": 5,
+      "lccc_folds_off": 5,
+      "lccc_passes_off": 5,
+      "gcc": 4,
+      "status": "gap"
+    },
+    {
+      "issue": "#71948",
+      "lccc": 6,
+      "lccc_folds_off": 6,
+      "lccc_passes_off": 6,
+      "gcc": 5,
+      "status": "gap"
+    },
+    {
+      "issue": "#193898",
+      "lccc": 4,
+      "lccc_folds_off": 4,
+      "lccc_passes_off": 4,
+      "gcc": 4,
+      "status": "at-or-better"
+    },
+    {
+      "issue": "#187057",
+      "lccc": 10,
+      "lccc_folds_off": 10,
+      "lccc_passes_off": 10,
+      "gcc": 9,
+      "status": "gap"
+    },
+    {
+      "issue": "#156898",
+      "lccc": 4,
+      "lccc_folds_off": 4,
+      "lccc_passes_off": 4,
+      "gcc": 4,
+      "status": "at-or-better"
+    },
+    {
+      "issue": "#95629",
+      "lccc": 11,
+      "lccc_folds_off": 11,
+      "lccc_passes_off": 11,
+      "gcc": 10,
+      "status": "gap"
+    },
+    {
+      "issue": "#64305",
+      "lccc": 10,
+      "lccc_folds_off": 10,
+      "lccc_passes_off": 10,
+      "gcc": 8,
+      "status": "gap"
+    },
+    {
+      "issue": "#63149",
+      "lccc": 6,
+      "lccc_folds_off": 6,
+      "lccc_passes_off": 6,
+      "gcc": 6,
+      "status": "at-or-better"
+    },
+    {
+      "issue": "#85830",
+      "lccc": 6,
+      "lccc_folds_off": 6,
+      "lccc_passes_off": 6,
+      "gcc": 4,
+      "status": "gap"
+    },
+    {
+      "issue": "#85939",
+      "lccc": 4,
+      "lccc_folds_off": 4,
+      "lccc_passes_off": 4,
+      "gcc": 3,
+      "status": "gap"
+    },
+    {
+      "issue": "#150954",
+      "lccc": 3,
+      "lccc_folds_off": 3,
+      "lccc_passes_off": 3,
+      "gcc": 2,
+      "status": "gap"
+    },
+    {
+      "issue": "#190907",
+      "lccc": 8,
+      "lccc_folds_off": 8,
+      "lccc_passes_off": 8,
+      "gcc": 7,
+      "status": "gap"
+    },
+    {
+      "issue": "#71533",
+      "lccc": 5,
+      "lccc_folds_off": 5,
+      "lccc_passes_off": 5,
+      "gcc": 6,
+      "status": "at-or-better"
+    }
+  ]
+}

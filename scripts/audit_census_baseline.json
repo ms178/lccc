@@ -3,7 +3,7 @@
   "fns_over_300": 228,
   "fns_over_500": 94,
   "ignored_tests": 10,
-  "knob_literals": 539,
+  "knob_literals": 540,
   "knob_names": [
     "CCC_AGGREGATE_SPLIT",
     "CCC_AGG_BYVAL_DEBUG",
@@ -327,6 +327,7 @@
     "CCC_NO_REG_OFF_SYM",
     "CCC_NO_REP_MOVSB",
     "CCC_NO_REUSE_STACK_LOADS",
+    "CCC_NO_RING_IDENTITIES",
     "CCC_NO_RISCV_CALLER_POOL",
     "CCC_NO_RORX",
     "CCC_NO_SAME_DST_RELOAD",
@@ -546,7 +547,7 @@
     "LCCC_WHY_NOT_VECTORIZE"
   ],
   "knobs_undocumented": 268,
-  "panic_sites": 835,
-  "panic_sites_hot": 105,
+  "panic_sites": 834,
+  "panic_sites_hot": 103,
   "unsafe_sites": 25
 }
