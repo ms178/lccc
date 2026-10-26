@@ -5242,6 +5242,41 @@ fn physical_register_observation_includes_implicit_and_indirect_operands() {
     }
 }
 
+#[test]
+fn physical_register_reads_reject_partial_writes_but_allow_full_overwrites() {
+    let base = R14;
+    let full_overwrite = MachInst::Mov {
+        src: MachOperand::Imm(7),
+        dst: reg(base),
+        size: OpSize::S64,
+    };
+    let narrow_overwrite = MachInst::Mov {
+        src: MachOperand::Imm(7),
+        dst: reg(base),
+        size: OpSize::S8,
+    };
+    let setcc = MachInst::SetCC {
+        cc: CondCode::E,
+        dst: MachReg::Phys(base),
+    };
+    let narrow_return = MachInst::CallTyped {
+        caller_saves: vec![],
+        args: vec![],
+        target: CallTarget::Direct("callee".to_string()),
+        ret: Some(CallRetMove {
+            dst: reg(base),
+            size: OpSize::S16,
+        }),
+        gp_arg_count: Some(0),
+        ipa_keep: 0,
+    };
+    let reads = |inst: &MachInst| super::machinst_alloc::reads_phys_regs(inst);
+    assert!(!reads(&full_overwrite).contains(&base.0));
+    assert!(reads(&narrow_overwrite).contains(&base.0));
+    assert!(reads(&setcc).contains(&base.0));
+    assert!(reads(&narrow_return).contains(&base.0));
+}
+
 /// The three-instruction shift/add/move fold must not discard the original
 /// source home when a later instruction observes an implicit register effect.
 /// The two-instruction shift/add LEA is still legal (it updates the source
@@ -5334,6 +5369,44 @@ fn dead_shift_add_move_refuses_each_implicit_source_witness() {
             "{reason}: the three-instruction fold discarded a live source: {compact}"
         );
     }
+}
+
+#[test]
+fn dead_shift_add_move_allows_a_later_pure_overwrite() {
+    let base = R14;
+    let shift = MachInst::Shift {
+        op: ShiftOp::Shl,
+        amount: MachOperand::Imm(3),
+        dst: MachReg::Phys(base),
+        size: OpSize::S32,
+    };
+    let add = MachInst::Alu {
+        op: AluOp::Add,
+        src: MachOperand::Imm(36),
+        dst: MachReg::Phys(base),
+        size: OpSize::S32,
+    };
+    let mov = MachInst::Mov {
+        src: reg(base),
+        dst: reg(RDI),
+        size: OpSize::S32,
+    };
+    let overwrite = MachInst::Mov {
+        src: MachOperand::Imm(7),
+        dst: MachOperand::Reg(MachReg::Phys(base)),
+        size: OpSize::S32,
+    };
+    let mut out = AsmOutput::new();
+    emit_machinsts(&[shift, add, mov, overwrite], &mut out);
+    let compact: String = out.buf.chars().filter(|ch| !ch.is_whitespace()).collect();
+    assert!(
+        compact.contains("leal36(,%r14,8),%edi"),
+        "a later pure overwrite must not block the dead-source fold: {compact}"
+    );
+    assert!(
+        compact.contains("movl$7,%r14d"),
+        "overwrite remains: {compact}"
+    );
 }
 
 #[test]

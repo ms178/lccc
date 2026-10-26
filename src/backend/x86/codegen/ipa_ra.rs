@@ -89,21 +89,58 @@ pub(crate) fn pool_families(pool: &[crate::backend::regalloc::PhysReg]) -> u16 {
         .fold(0, |m, (f, _)| m | f)
 }
 
+/// Return a stable callee-first order for a direct-call dependency graph.
+/// `deps[caller]` contains function indices that the caller invokes. A
+/// post-order DFS makes every acyclic callee available before its caller's
+/// prologue asks for an IPA-RA summary. Cycles are deliberately not broken
+/// with synthetic summaries: the DFS emits the strongly connected component
+/// in stable order, and the existing fail-closed summary lookup leaves its
+/// recursive members unsummarized.
+pub(crate) fn callee_first_order(deps: &[Vec<usize>]) -> Vec<usize> {
+    let mut state = vec![0u8; deps.len()];
+    let mut order = Vec::with_capacity(deps.len());
+    for root in 0..deps.len() {
+        if state[root] != 0 {
+            continue;
+        }
+        // Use an explicit stack rather than recursive Rust calls: generated
+        // modules can contain a very long helper chain, and ordering must not
+        // turn that valid input into a compiler stack overflow.
+        let mut stack = vec![(root, 0usize)];
+        state[root] = 1;
+        while let Some((index, next)) = stack.last_mut() {
+            if *next == deps[*index].len() {
+                state[*index] = 2;
+                order.push(*index);
+                stack.pop();
+                continue;
+            }
+            let callee = deps[*index][*next];
+            *next += 1;
+            if callee >= deps.len() || state[callee] != 0 {
+                // A state-1 edge is a recursive back edge. Do not recurse
+                // indefinitely; the first member encountered in the cycle
+                // remains the one whose missing summary poisons the chain.
+                continue;
+            }
+            state[callee] = 1;
+            stack.push((callee, 0));
+        }
+    }
+    order
+}
+
 /// Module-scoped IPA-RA state, owned by the x86-64 code generator.
 #[derive(Default)]
 pub(crate) struct IpaRaState {
     enabled: bool,
     /// Emitted symbol -> predicted caller-saved clobber families.
     summaries: FxHashMap<String, u16>,
-    /// Summarized symbols in emission order. One pass, no fixpoint: a
-    /// function is summarized only from the summaries already known when it
-    /// is emitted, so a function whose callee is emitted LATER is silently
-    /// not summarized (its keep set is likewise denied, `keep_set` being
-    /// fail-closed on a missing callee summary), and neither is any caller
-    /// of it that relies on its summary. The ordering therefore changes
-    /// which optimizations are realized, never correctness: a missing
-    /// summary degrades to the un-optimized allocation, and `verify` is
-    /// fail-closed over every record it is given.
+    /// Summarized symbols in callee-first emission order. The generator uses a
+    /// stable post-order over direct local calls, so acyclic dependencies are
+    /// normally available before the caller is allocated. Missing summaries
+    /// still degrade to the un-optimized allocation, and recursive, indirect,
+    /// escaped, external, or unclassified calls remain fail-closed.
     order: Vec<String>,
     /// Functions whose summaries a previous verification rejected.
     poisoned_callees: FxHashSet<String>,
@@ -904,6 +941,22 @@ pub(crate) fn verify(asm: &str, state: &IpaRaState) -> IpaViolations {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn callee_first_order_is_stable_and_transitive() {
+        // 0 calls 1, 1 calls 2; an unrelated fourth node keeps source order.
+        let order = callee_first_order(&[vec![1], vec![2], vec![], vec![]]);
+        assert_eq!(order, vec![2, 1, 0, 3]);
+    }
+
+    #[test]
+    fn recursive_components_terminate_without_duplicate_emission() {
+        let order = callee_first_order(&[vec![1], vec![0], vec![1]]);
+        assert_eq!(order.len(), 3);
+        let mut sorted = order.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, vec![0, 1, 2]);
+    }
 
     fn none(_: &str) -> Option<u16> {
         None

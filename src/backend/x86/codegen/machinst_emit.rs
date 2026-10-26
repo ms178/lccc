@@ -1513,8 +1513,8 @@ fn try_emit_shift_add_lea(
 /// Fuse a dead `shl; add-imm; mov` chain into an indexed LEA.
 ///
 /// The LEA writes the final move destination directly. This is sound only
-/// when the shifted home has no later mention (including a later overwrite,
-/// conservatively) and no consumer observes the Add flags.
+/// when the shifted home has no later read (a pure later overwrite is safe)
+/// and no consumer observes the Add flags.
 fn try_emit_shift_add_mov_lea(
     shift: &MachInst,
     add: &MachInst,
@@ -1565,7 +1565,7 @@ fn try_emit_shift_add_mov_lea(
     };
     if rest
         .iter()
-        .any(|inst| super::machinst_alloc::touched_phys_regs(inst).contains(&base_phys.0))
+        .any(|inst| super::machinst_alloc::reads_phys_regs(inst).contains(&base_phys.0))
     {
         return false;
     }
