@@ -1,0 +1,24 @@
+name: Intel SDM primary source acquisition
+on:
+  push:
+    paths: ['.github/workflows/intel-sdm-audit.yml', 'scripts/audit_intel_sdm.py']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  acquire:
+    name: Acquire and locate edition 093 primary sections
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the PDF text and outline reader
+        run: python3 -m pip install PyMuPDF==1.26.7
+      - name: Acquire primary PDF and expose edition-anchored sections
+        run: python3 scripts/audit_intel_sdm.py --output "$RUNNER_TEMP/intel-sdm" --notices
+      - uses: actions/upload-artifact@v6
+        with:
+          name: intel-sdm-093-section-source
+          path: |
+            ${{ runner.temp }}/intel-sdm/*.json
+          if-no-files-found: error
