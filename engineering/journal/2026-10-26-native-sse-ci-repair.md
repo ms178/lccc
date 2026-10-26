@@ -131,3 +131,32 @@ ISA gate passes its GCC-compared positive/negative and last-option cases on
 both ABIs. Metadata's ten contracts, census and CI invocation parity pass.
 This repairs semantics and native emission; it is not a measured speedup or an
 exhaustive API/signature/manual audit.
+
+## Hosted i686 BMI2 failure and PIC scratch wrong-code
+
+The latest hosted Frontend/ABI shard B failed the bundled scalar-intrinsics
+contract. Locally reproducing its i686 native-BMI2 leg found that the public
+header's PDEP/PEXT inline asm reached unhandled i686 encoder instructions after
+the builtin/header permission correction. The i686 assembler now delegates the
+legal W=0 BMI1/BMI2 rows through the existing shared encoder and i686
+memory/relocation adaptation. Explicit qword spellings and extended/narrow GP
+operands remain rejected. The shared VEX-hint classifier now recognizes scalar
+BMI's non-v-prefixed spellings and rejects EGPR data under a VEX request.
+
+After that encoding repair, the same O2 runtime leg exposed a second defect:
+the generic inline-asm scratch allocator selected EBX even while the backend
+owned it as the live PIC GOT base. Ptrace stopped the resulting SIGSEGV in
+libc; disassembly showed the mask loaded into EBX before later GOTOFF/PLT
+uses. Scratch allocation now respects the existing GOT reservation, rather
+than merely avoiding an unsupported header path. A dedicated PIC/i686 runtime
+entry imports the existing broad scalar-intrinsic oracle source.
+
+The native scalar witness now matches GCC 16.2.0 on i686/x86-64 at O0/O2 with
+PIC enabled. Both focused BMI asm-diff casefiles pass against GAS/objdump
+2.47.20260726 (six cases each), including i686 register/SIB-memory/absolute
+relocation forms, suffixless/VEX-hinted forms and mode/width rejection. The
+final fastbuild of both binaries completed without warnings, using j2 and the
+active 4-GiB swap. No full local CI was run. Latest hosted acceptance must be
+established on the new commit; the preceding run is genuinely red. This does
+not establish latest-2026 SDM coverage or solve every unrelated inline-asm
+constraint/backlog item.

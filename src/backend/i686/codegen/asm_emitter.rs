@@ -245,6 +245,12 @@ impl InlineAsmEmitter for I686Codegen {
                 self.asm_scratch_idx += 1;
                 let allow_ra_home = idx >= ALL_GP.len();
                 let reg_name = ALL_GP[idx % ALL_GP.len()];
+                // The GOT is a backend-owned live value, not an SSA RA home.
+                // Generic asm scratch must honor the same reservation as RA;
+                // otherwise an input silently destroys later GOTOFF/PLT uses.
+                if self.pic_got_live && reg_name == "ebx" {
+                    continue;
+                }
                 if excluded.iter().any(|e| e == reg_name) {
                     continue;
                 }

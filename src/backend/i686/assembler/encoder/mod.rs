@@ -23,6 +23,12 @@ use crate::backend::x86::assembler::encoder::{
 };
 use crate::backend::x86::assembler::parser::*;
 
+/// VEX scalar BMI rows whose 32-bit encodings are shared with long mode.
+/// Explicit q spellings deliberately do not enter this path.
+fn is_i686_bmi_mnemonic(stem: &str) -> bool {
+    !stem.ends_with('q') && crate::backend::x86::assembler::encoder::is_bmi_vex_mnemonic(stem)
+}
+
 /// The memory operand of an explicit-operand string op, or `None` when the
 /// operand is not memory (the register side of an accumulator spelling).
 fn string_mem_of(op: &Operand) -> Option<&MemoryOperand> {
@@ -1308,7 +1314,10 @@ impl InstructionEncoder {
         if self.vex_hint.is_some() {
             let raw = instr.mnemonic.to_ascii_lowercase();
             let stem = raw.strip_suffix(".s").unwrap_or(&raw);
-            if !stem.starts_with('v') && !X86InstructionEncoder::is_xop_mnemonic(stem) {
+            if !stem.starts_with('v')
+                && !X86InstructionEncoder::is_xop_mnemonic(stem)
+                && !is_i686_bmi_mnemonic(stem)
+            {
                 return Err(format!("no VEX/XOP encoding for `{stem}'"));
             }
         }
@@ -3282,6 +3291,12 @@ impl InstructionEncoder {
         // eax..edi (ids < 8). LWP on i686 would otherwise find no local
         // arm at all. (Note lwpins/lwpval do not carry the `v` prefix.)
         if X86InstructionEncoder::is_xop_mnemonic(stem) {
+            return Some(self.encode_via_x64(instr));
+        }
+        // The outer mode validator has already rejected 64-bit/extended GP
+        // registers. Reuse the established VEX W=0 rows and the same i686
+        // memory/relocation adaptation as vector delegation; never emit REX.
+        if is_i686_bmi_mnemonic(stem) {
             return Some(self.encode_via_x64(instr));
         }
         if !stem.starts_with('v') {

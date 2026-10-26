@@ -221,6 +221,30 @@ const LOCKABLE_STEMS: [&str; 19] = [
     "xchg",
 ];
 
+/// Scalar BMI instructions use VEX despite lacking the `v` mnemonic prefix.
+pub(crate) fn is_bmi_vex_mnemonic(stem: &str) -> bool {
+    let base = stem
+        .strip_suffix('l')
+        .or_else(|| stem.strip_suffix('q'))
+        .unwrap_or(stem);
+    matches!(
+        base,
+        "andn"
+            | "blsi"
+            | "blsr"
+            | "blsmsk"
+            | "bextr"
+            | "bzhi"
+            | "pdep"
+            | "pext"
+            | "mulx"
+            | "shlx"
+            | "shrx"
+            | "sarx"
+            | "rorx"
+    )
+}
+
 /// A `{vex*}` request must produce an actual VEX (C4/C5) or XOP (8F,
 /// map >= 8) instruction. A leading 8F with map < 8 is the legacy POP
 /// opcode, not XOP; checking the emitted prefix instead of a `v*` name
@@ -3536,8 +3560,13 @@ impl InstructionEncoder {
             let high_vec = ops
                 .iter()
                 .any(|op| matches!(op, Operand::Register(r) if needs_evex_rprime(&r.name)));
-            let vex_family = mnemonic.starts_with('v') && !matches!(mnemonic, "verr" | "verw");
-            if has_zmm || egpr_mem || high_vec {
+            let vex_family = (mnemonic.starts_with('v') && !matches!(mnemonic, "verr" | "verw"))
+                || is_bmi_vex_mnemonic(mnemonic);
+            let egpr_data = ops.iter().any(|op| {
+                matches!(op,
+                Operand::Register(r) if gp_id(&r.name).is_some_and(|id| id >= 16))
+            });
+            if has_zmm || egpr_mem || egpr_data || high_vec {
                 return Err(format!("unsupported instruction `{stem}'"));
             }
             let masked = ops.iter().any(|op| op_decor(op).0 || op_decor(op).1);

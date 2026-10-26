@@ -308,3 +308,13 @@ shlxl %ecx, %eax, %edx
 shrxq %rcx, %rax, %rdx
 sarxl %ecx, %eax, %edx
 bzhil %ecx, %eax, %edx
+
+;;; bmi-vex3-hints
+.text
+{vex3} pdepl %eax,%ecx,%edx
+{vex3} pextl %eax,%ecx,%edx
+{vex3} pdepq %rax,%rcx,%rdx
+{vex3} pextq %rax,%rcx,%rdx
+
+;;; bmi-vex-egpr reject
+{vex3} pdepq %r16,%rcx,%rdx
