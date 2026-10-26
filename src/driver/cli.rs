@@ -371,6 +371,83 @@ impl Driver {
         self.enable_avx10_2 = false;
     }
 
+    /// Handle negative AVX-512 flags as a group, keeping the general ISA
+    /// flag dispatcher below the audit-census function-size threshold.
+    fn apply_x86_avx512_mno_mflag(&mut self, arg: &str) -> bool {
+        match arg {
+            "-mno-avx512f" => {
+                self.clear_avx512f_dependents();
+                true
+            }
+            "-mno-avx512cd" => {
+                self.enable_avx512cd = false;
+                true
+            }
+            "-mno-avx512dq" => {
+                self.enable_avx512dq = false;
+                true
+            }
+            "-mno-avx512bw" => {
+                self.enable_avx512bw = false;
+                self.clear_avx512bw_dependents();
+                true
+            }
+            "-mno-avx512vl" => {
+                self.enable_avx512vl = false;
+                true
+            }
+            "-mno-avx512vnni" => {
+                self.enable_avx512vnni = false;
+                true
+            }
+            "-mno-avx512ifma" => {
+                self.enable_avx512ifma = false;
+                true
+            }
+            "-mno-avx512vbmi" => {
+                self.enable_avx512vbmi = false;
+                true
+            }
+            "-mno-avx512vbmi2" => {
+                self.enable_avx512vbmi2 = false;
+                true
+            }
+            "-mno-avx512bitalg" => {
+                self.enable_avx512bitalg = false;
+                true
+            }
+            "-mno-avx512vpopcntdq" => {
+                self.enable_avx512vpopcntdq = false;
+                true
+            }
+            "-mno-avx512bf16" => {
+                self.enable_avx512bf16 = false;
+                true
+            }
+            "-mno-avx512fp16" => {
+                self.enable_avx512fp16 = false;
+                true
+            }
+            "-mno-avx512er" => {
+                self.enable_avx512er = false;
+                true
+            }
+            "-mno-avx512pf" => {
+                self.enable_avx512pf = false;
+                true
+            }
+            "-mno-avx512vp2intersect" => {
+                self.enable_avx512vp2intersect = false;
+                true
+            }
+            "-mno-avx512bmm" => {
+                self.enable_avx512bmm = false;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Apply one explicit x86 ISA `-m`/`-mno-` flag.  Returns `true` when
     /// `arg` is one of the flags owned here; the caller (the main argument
     /// loop) then records it for [`Driver::replay_x86_explicit_isa_flags`].
@@ -383,7 +460,10 @@ impl Driver {
     /// ...) return `false` and stay with the main match: they have no
     /// arch-set interaction.
     fn apply_x86_isa_mflag(&mut self, arg: &str) -> bool {
-        if self.grant_avx512_family(arg) || self.apply_x86_sse_level_mflag(arg) {
+        if self.grant_avx512_family(arg)
+            || self.apply_x86_sse_level_mflag(arg)
+            || self.apply_x86_avx512_mno_mflag(arg)
+        {
             return true;
         }
         match arg {
@@ -615,26 +695,6 @@ impl Driver {
                 self.movbe_explicitly_disabled = true;
             }
             "-mno-rdrnd" => self.enable_rdrnd = false,
-            "-mno-avx512f" => self.clear_avx512f_dependents(),
-            "-mno-avx512cd" => self.enable_avx512cd = false,
-            "-mno-avx512dq" => self.enable_avx512dq = false,
-            "-mno-avx512bw" => {
-                self.enable_avx512bw = false;
-                self.clear_avx512bw_dependents();
-            }
-            "-mno-avx512vl" => self.enable_avx512vl = false,
-            "-mno-avx512vnni" => self.enable_avx512vnni = false,
-            "-mno-avx512ifma" => self.enable_avx512ifma = false,
-            "-mno-avx512vbmi" => self.enable_avx512vbmi = false,
-            "-mno-avx512vbmi2" => self.enable_avx512vbmi2 = false,
-            "-mno-avx512bitalg" => self.enable_avx512bitalg = false,
-            "-mno-avx512vpopcntdq" => self.enable_avx512vpopcntdq = false,
-            "-mno-avx512bf16" => self.enable_avx512bf16 = false,
-            "-mno-avx512fp16" => self.enable_avx512fp16 = false,
-            "-mno-avx512er" => self.enable_avx512er = false,
-            "-mno-avx512pf" => self.enable_avx512pf = false,
-            "-mno-avx512vp2intersect" => self.enable_avx512vp2intersect = false,
-            "-mno-avx512bmm" => self.enable_avx512bmm = false,
             "-mno-avx10.1" => self.enable_avx10_1 = false,
             "-mno-avx10.2" => self.enable_avx10_2 = false,
             "-mno-gfni" => self.enable_gfni = false,
