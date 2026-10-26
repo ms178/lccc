@@ -6,6 +6,10 @@ on:
     paths: ['.github/workflows/compiler-research.yml']
   workflow_dispatch:
     inputs:
+      refresh_toolchain_cache:
+        description: Publish Rust 1.99.1 and Clang 23.1.4 hash-cache assets instead of running benchmarks
+        type: boolean
+        default: false
       baseline_ref:
         description: Baseline commit or main ref to archive and build (never checked out over the candidate)
         required: true
@@ -28,7 +32,34 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  toolchain-cache:
+    if: ${{ inputs.refresh_toolchain_cache }}
+    name: Publish hash-verified Rust and Clang cache
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          components: rustfmt, clippy
+      - name: Install exact Clang release from its pinned upstream digest
+        env:
+          LCCC_CLANG_ORACLE_PREFIX: ${{ runner.temp }}/clang-23.1.4
+        run: bash scripts/ci_install_clang_oracle.sh
+      - name: Publish immutable assets without changing transport tags
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LCCC_CLANG_ORACLE_PREFIX: ${{ runner.temp }}/clang-23.1.4
+        run: python3 scripts/publish_toolchain_cache.py "$RUNNER_TEMP/toolchain-cache"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: toolchain-cache-lock
+          path: ${{ runner.temp }}/toolchain-cache/toolchain-cache.json
+          if-no-files-found: error
   evidence:
+    if: ${{ !inputs.refresh_toolchain_cache }}
     # Opt-in research: manual, or a PR explicitly changing this definition.
     name: Same-host portable/native runtime and Callgrind
     runs-on: ubuntu-24.04

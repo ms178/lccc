@@ -160,3 +160,17 @@ active 4-GiB swap. No full local CI was run. Latest hosted acceptance must be
 established on the new commit; the preceding run is genuinely red. This does
 not establish latest-2026 SDM coverage or solve every unrelated inline-asm
 constraint/backlog item.
+
+## Requested cache refresh
+
+The existing harness-cache-4 manifest really contains Clang 23.1.3, while the
+legacy restore script names a nonexistent 23.1.4 member with the older digest.
+The only published Rust transport tag contains 1.97.0. An opt-in hosted cache
+publisher now packages exact Rust 1.99.1 (including rustfmt/clippy) and the
+upstream-digest-verified Clang 23.1.4 installation into content-addressed release
+assets on the existing transport tag. It does not create/move any Git refs or
+commit large binary archives. Its resulting manifest must be committed before
+it is used as a trust root. The normal research job remains enabled by default;
+cache-only dispatch does not run expensive compiler benchmarks. Historical
+red-team versioned commands now select Rust 1.99.1; the deliberate 1.97 MSRV
+compatibility lane is unchanged. Publication/restore outcomes remain pending.
