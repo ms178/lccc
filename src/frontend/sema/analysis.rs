@@ -3105,7 +3105,7 @@ impl SemanticAnalyzer {
                                 Some(CType::Array(_, Some(_))) => {}
                                 Some(CType::Array(_, None)) => {
                                     let is_complete_or_vla = match inner {
-                                        Expr::CompoundLiteral(_, init, _) => {
+                                        Expr::CompoundLiteral(_, init, _, _) => {
                                             matches!(
                                                 &**init,
                                                 Initializer::List(_) | Initializer::Expr(_)
@@ -3174,6 +3174,7 @@ impl SemanticAnalyzer {
                 // address of an rvalue, `&v[0]` of a vector element.
                 if !self.check_address_of_rvalue(inner, *span) {
                     self.check_address_of_vector_element(inner, *span);
+                    self.check_address_of_register_compound_literal(inner, *span);
                 }
             }
             Expr::Deref(inner, _) => {
@@ -3183,14 +3184,8 @@ impl SemanticAnalyzer {
                 self.analyze_expr(lhs);
                 self.analyze_expr(rhs);
             }
-            Expr::CompoundLiteral(ts, init, span) => {
-                self.check_void_members(ts, *span);
-                let empty = matches!(&**init, Initializer::List(items) if items.is_empty());
-                let role = VoidRole::CompoundLiteral { empty };
-                self.report_void_declarator(ts, &[], None, role, *span);
-                self.analyze_initializer(init);
-                let ct = self.type_spec_to_ctype(ts);
-                self.check_initializer_element_spaces(&ct, init);
+            Expr::CompoundLiteral(ts, init, span, storage) => {
+                self.analyze_compound_literal_expr(expr, ts, init, *span, storage);
             }
             Expr::StmtExpr(compound, _) => {
                 self.analyze_compound_stmt(compound);
@@ -3201,6 +3196,9 @@ impl SemanticAnalyzer {
             }
             Expr::ConvertVector(src_expr, _, _) => {
                 self.analyze_expr(src_expr);
+            }
+            Expr::BitCast(dst_ts, src_expr, span) => {
+                self.analyze_bit_cast_expr(dst_ts, src_expr, *span);
             }
             Expr::GenericSelection(controlling, associations, span) => {
                 self.analyze_expr(controlling);
@@ -3872,6 +3870,7 @@ impl SemanticAnalyzer {
             | Expr::Countof(..)
             | Expr::VaArg(..)
             | Expr::ConvertVector(..)
+            | Expr::BitCast(..)
             | Expr::Alignof(..)
             | Expr::AlignofExpr(..)
             | Expr::GnuAlignof(..)
@@ -3949,6 +3948,7 @@ impl SemanticAnalyzer {
     /// nothing.
     fn check_lvalue_operand(&self, target: &Expr, op_span: Span) {
         if !self.is_known_rvalue(target, false) {
+            self.check_const_compound_literal_mutation(target, op_span);
             return;
         }
         let message = if matches!(target, Expr::Cast(..)) {
@@ -5452,7 +5452,411 @@ impl SemanticAnalyzer {
                     }
                 }
             }
+            _ => {
+                self.check_gcc16_builtin_call(name, args, span);
+            }
+        }
+    }
+
+    fn check_gcc16_builtin_call(&mut self, name: &str, args: &[Expr], span: Span) {
+        use crate::frontend::sema::gcc16_builtins;
+        if gcc16_builtins::is_gcc16_generic_bit_builtin(name) {
+            let max_args = if gcc16_builtins::generic_bit_allows_fallback(name) {
+                2
+            } else {
+                1
+            };
+            if args.is_empty() || args.len() > max_args {
+                self.diagnostics.borrow_mut().error(
+                    format!(
+                        "{} arguments to function '{}'",
+                        if args.is_empty() {
+                            "too few"
+                        } else {
+                            "too many"
+                        },
+                        name
+                    ),
+                    span,
+                );
+                return;
+            }
+            let tc = self.expr_type_checker();
+            if let Some(ct0) = tc.infer_expr_ctype(&args[0]) {
+                let d0 = ct0.decayed_value_ctype();
+                if let Err(msg) = gcc16_builtins::validate_generic_bit_arg0(name, &d0) {
+                    self.diagnostics.borrow_mut().error(msg, args[0].span());
+                    return;
+                }
+            }
+            if args.len() == 2 {
+                if let Some(ct1) = tc.infer_expr_ctype(&args[1]) {
+                    let d1 = ct1.decayed_value_ctype();
+                    if let Err(msg) = gcc16_builtins::validate_generic_bit_fallback_arg(name, &d1) {
+                        self.diagnostics.borrow_mut().error(msg, args[1].span());
+                    }
+                }
+            }
+            return;
+        }
+        if let Some((elem_ct, _, _)) = gcc16_builtins::carry_builtin_info(name) {
+            if args.len() != 4 {
+                self.diagnostics.borrow_mut().error(
+                    format!(
+                        "{} arguments to function '{}' (expected 4, have {})",
+                        if args.len() < 4 {
+                            "too few"
+                        } else {
+                            "too many"
+                        },
+                        name,
+                        args.len()
+                    ),
+                    span,
+                );
+                return;
+            }
+            let tc = self.expr_type_checker();
+            for (idx, arg) in args.iter().take(3).enumerate() {
+                if let Some(ct) = tc.infer_expr_ctype(arg) {
+                    if !ct.decayed_value_ctype().is_integer() {
+                        self.diagnostics.borrow_mut().error(
+                            format!(
+                                "argument {} in call to '{}' must have integer type",
+                                idx + 1,
+                                name
+                            ),
+                            arg.span(),
+                        );
+                    }
+                }
+            }
+            if let Some(ct3) = tc.infer_expr_ctype(&args[3]) {
+                match ct3.decayed_value_ctype() {
+                    CType::Pointer(pointee, _) => {
+                        if crate::common::qualifiers::expr_const_base(&args[3], &tc) {
+                            self.diagnostics.borrow_mut().error(
+                                format!(
+                                    "argument 4 in call to '{}' has pointer to 'const' type",
+                                    name
+                                ),
+                                args[3].span(),
+                            );
+                        } else if *pointee != elem_ct
+                            && !(matches!(*pointee, CType::PlainUChar)
+                                && matches!(elem_ct, CType::UChar))
+                        {
+                            self.diagnostics.borrow_mut().error(
+                                format!(
+                                    "incompatible pointer type '{}' for argument 4 of '{}' (expected '{} *')",
+                                    ct3, name, elem_ct
+                                ),
+                                args[3].span(),
+                            );
+                        }
+                    }
+                    _ => {
+                        self.diagnostics.borrow_mut().error(
+                            format!("argument 4 in call to '{}' must be a pointer", name),
+                            args[3].span(),
+                        );
+                    }
+                }
+            }
+            return;
+        }
+        if gcc16_builtins::is_gcc16_bswap_bitrev_builtin(name) {
+            let expected = if gcc16_builtins::rotate_builtin_info(name).is_some() {
+                2usize
+            } else {
+                1usize
+            };
+            if args.len() != expected {
+                self.diagnostics.borrow_mut().error(
+                    format!(
+                        "{} arguments to function '{}' (expected {}, have {})",
+                        if args.len() < expected {
+                            "too few"
+                        } else {
+                            "too many"
+                        },
+                        name,
+                        expected,
+                        args.len()
+                    ),
+                    span,
+                );
+                return;
+            }
+            for (idx, arg) in args.iter().enumerate() {
+                if let Some(ct) = self.expr_type_checker().infer_expr_ctype(arg) {
+                    if !ct.decayed_value_ctype().is_integer() {
+                        self.diagnostics.borrow_mut().error(
+                            format!(
+                                "argument {} in call to '{}' must have integer type",
+                                idx + 1,
+                                name
+                            ),
+                            arg.span(),
+                        );
+                    }
+                }
+            }
+            return;
+        }
+        match name {
+            "__builtin_issignaling" => {
+                if args.len() != 1 {
+                    self.diagnostics.borrow_mut().error(
+                        format!(
+                            "{} arguments to function '{}' (expected 1, have {})",
+                            if args.is_empty() {
+                                "too few"
+                            } else {
+                                "too many"
+                            },
+                            name,
+                            args.len()
+                        ),
+                        span,
+                    );
+                    return;
+                }
+                if let Some(ct) = self.expr_type_checker().infer_expr_ctype(&args[0]) {
+                    let d = ct.decayed_value_ctype();
+                    if !d.is_floating() || d.is_complex() {
+                        self.diagnostics.borrow_mut().error(
+                            "non-floating-point argument in call to function '__builtin_issignaling'"
+                                .to_string(),
+                            args[0].span(),
+                        );
+                    }
+                }
+            }
+            "__builtin_iseqsig" => {
+                if args.len() != 2 {
+                    self.diagnostics.borrow_mut().error(
+                        format!(
+                            "{} arguments to function '{}' (expected 2, have {})",
+                            if args.len() < 2 {
+                                "too few"
+                            } else {
+                                "too many"
+                            },
+                            name,
+                            args.len()
+                        ),
+                        span,
+                    );
+                    return;
+                }
+                let tc = self.expr_type_checker();
+                if let (Some(c0), Some(c1)) =
+                    (tc.infer_expr_ctype(&args[0]), tc.infer_expr_ctype(&args[1]))
+                {
+                    let d0 = c0.decayed_value_ctype();
+                    let d1 = c1.decayed_value_ctype();
+                    let real_arith =
+                        |t: &CType| t.is_integer() || (t.is_floating() && !t.is_complex());
+                    let any_real_fp = (d0.is_floating() && !d0.is_complex())
+                        || (d1.is_floating() && !d1.is_complex());
+                    if !real_arith(&d0) || !real_arith(&d1) || !any_real_fp {
+                        self.diagnostics.borrow_mut().error(
+                            "non-floating-point arguments in call to function '__builtin_iseqsig'"
+                                .to_string(),
+                            span,
+                        );
+                    }
+                }
+            }
+            "__builtin_speculation_safe_value" => {
+                if args.is_empty() || args.len() > 2 {
+                    self.diagnostics.borrow_mut().error(
+                        format!(
+                            "{} arguments to function '{}'",
+                            if args.is_empty() {
+                                "too few"
+                            } else {
+                                "too many"
+                            },
+                            name
+                        ),
+                        span,
+                    );
+                    return;
+                }
+                let tc = self.expr_type_checker();
+                if let Some(c0) = tc.infer_expr_ctype(&args[0]) {
+                    let d0 = c0.decayed_value_ctype();
+                    if !d0.is_integer() && !matches!(d0, CType::Pointer(..)) {
+                        self.diagnostics.borrow_mut().error(
+                            "operand of '__builtin_speculation_safe_value' must have integral or pointer type"
+                                .to_string(),
+                            args[0].span(),
+                        );
+                        return;
+                    }
+                    if args.len() == 2 {
+                        if let Some(c1) = tc.infer_expr_ctype(&args[1]) {
+                            let d1 = c1.decayed_value_ctype();
+                            let ok = if d0.is_integer() {
+                                d1.is_integer()
+                            } else {
+                                matches!(d1, CType::Pointer(..))
+                                    || tc.is_null_pointer_constant(&args[1])
+                            };
+                            if !ok {
+                                self.diagnostics.borrow_mut().error(
+                                    "incompatible second argument to '__builtin_speculation_safe_value'"
+                                        .to_string(),
+                                    args[1].span(),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
             _ => {}
+        }
+    }
+
+    fn analyze_compound_literal_expr(
+        &mut self,
+        cl_expr: &Expr,
+        ts: &TypeSpecifier,
+        init: &Initializer,
+        span: Span,
+        storage: &crate::frontend::parser::ast::CompoundLiteralStorage,
+    ) {
+        self.check_void_members(ts, span);
+        let empty = matches!(init, Initializer::List(items) if items.is_empty());
+        let role = VoidRole::CompoundLiteral { empty };
+        self.report_void_declarator(ts, &[], None, role, span);
+        if self.symbol_table.at_file_scope() && storage.is_register {
+            self.diagnostics.borrow_mut().error(
+                "file-scope compound literal cannot have 'register' storage class".to_string(),
+                span,
+            );
+        }
+        if !self.symbol_table.at_file_scope() && storage.is_thread_local && !storage.is_static {
+            self.diagnostics.borrow_mut().error(
+                "block-scope 'thread_local' compound literal requires 'static'".to_string(),
+                span,
+            );
+        }
+        self.analyze_initializer(init);
+        let ct = self.type_spec_to_ctype(ts);
+        self.check_initializer_element_spaces(&ct, init);
+        if storage.is_static && !self.symbol_table.at_file_scope() {
+            let bad = {
+                let tc = self.expr_type_checker();
+                let eval = |e: &Expr| self.eval_initializer_value(e);
+                let ctype = |e: &Expr| tc.infer_expr_ctype(e);
+                let select = |controlling: &Expr, associations: &[GenericAssociation]| {
+                    tc.generic_selection_index(controlling, associations)
+                };
+                super::static_init::StaticInitChecker::new(
+                    &self.symbol_table,
+                    &eval,
+                    &ctype,
+                    &select,
+                )
+                .non_constant_leaves_for(init, &ct)
+            };
+            for bad_span in bad {
+                self.diagnostics
+                    .borrow_mut()
+                    .error("initializer element is not constant".to_string(), bad_span);
+            }
+        }
+        if storage.is_constexpr {
+            self.check_constexpr_compound_literal(cl_expr, ts, init, storage.is_static);
+        }
+    }
+
+    fn check_address_of_register_compound_literal(&self, inner: &Expr, span: Span) {
+        let mut cur = inner;
+        while let Expr::MemberAccess(base, _, _) = cur {
+            cur = base;
+        }
+        if let Expr::CompoundLiteral(_, _, _, st) = cur {
+            if st.is_register {
+                self.diagnostics.borrow_mut().error(
+                    "address of register compound literal requested".to_string(),
+                    span,
+                );
+            }
+        }
+    }
+
+    fn check_const_compound_literal_mutation(&self, target: &Expr, span: Span) {
+        let mut cur = target;
+        while let Expr::MemberAccess(base, _, _) | Expr::ArraySubscript(base, _, _) = cur {
+            if let Expr::ArraySubscript(_, _, _) = cur {
+                if !matches!(
+                    self.expr_type_checker().infer_expr_ctype(base),
+                    Some(CType::Array(..))
+                ) {
+                    return;
+                }
+            }
+            cur = base;
+        }
+        if let Expr::CompoundLiteral(_, _, _, st) = cur {
+            if st.is_const || st.is_constexpr {
+                self.diagnostics
+                    .borrow_mut()
+                    .error("assignment of read-only compound literal".to_string(), span);
+            }
+        }
+    }
+
+    fn analyze_bit_cast_expr(&mut self, dst_ts: &TypeSpecifier, src_expr: &Expr, span: Span) {
+        self.check_void_type_name(dst_ts, span);
+        self.analyze_expr(src_expr);
+        let dst_ct = self.type_spec_to_ctype(dst_ts);
+        if matches!(dst_ct, CType::Void | CType::Function(_) | CType::Array(..)) {
+            self.diagnostics.borrow_mut().error(
+                format!(
+                    "'__builtin_bit_cast' destination type '{}' is not trivially copyable or is an array",
+                    dst_ct
+                ),
+                span,
+            );
+            return;
+        }
+        if let CType::Struct(k) | CType::Union(k) = &dst_ct {
+            if !self.defined_structs.borrow().contains(&**k) {
+                self.diagnostics.borrow_mut().error(
+                    format!(
+                        "'__builtin_bit_cast' destination type '{}' is incomplete",
+                        dst_ct
+                    ),
+                    span,
+                );
+                return;
+            }
+        }
+        let Some(src_raw) = self.expr_type_checker().infer_expr_ctype(src_expr) else {
+            return;
+        };
+        if matches!(src_raw, CType::Void | CType::Function(_)) {
+            self.diagnostics.borrow_mut().error(
+                "'__builtin_bit_cast' source must be a complete object".to_string(),
+                src_expr.span(),
+            );
+            return;
+        }
+        let layouts = self.result.type_context.borrow_struct_layouts();
+        let dst_sz = dst_ct.size_ctx(&*layouts);
+        let src_sz = src_raw.size_ctx(&*layouts);
+        if dst_sz == 0 || src_sz == 0 || dst_sz != src_sz {
+            self.diagnostics.borrow_mut().error(
+                format!(
+                    "'__builtin_bit_cast' source size ({src_sz}) does not match destination size ({dst_sz})"
+                ),
+                span,
+            );
         }
     }
 

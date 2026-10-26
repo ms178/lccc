@@ -1,0 +1,4011 @@
+{
+  "aggregate_lccc_vs_best_reference": {
+    "arithmetic_mean_ratio": 1.0689334602581657,
+    "best": {
+      "benchmark": "fp64_product_map",
+      "ratio": 0.9990353558423692,
+      "reference": "baseline"
+    },
+    "geometric_mean_ratio": 1.066583326095661,
+    "interpretation": "LCCC / fastest available reference paired median; <1 means LCCC faster",
+    "n_correct_benchmarks": 3,
+    "worst": {
+      "benchmark": "gzip_longest_match",
+      "ratio": 1.1674422648741754,
+      "reference": "gcc"
+    }
+  },
+  "aggregate_lccc_vs_gcc": {
+    "arithmetic_mean_ratio": 1.0577737969986736,
+    "best": {
+      "benchmark": "fp64_product_map",
+      "ratio": 0.9655563660638925
+    },
+    "geometric_mean_ratio": 1.054533501005233,
+    "interpretation": "LCCC/GCC paired median ratios; <1 means LCCC faster",
+    "n_correct_benchmarks": 3,
+    "worst": {
+      "benchmark": "gzip_longest_match",
+      "ratio": 1.1674422648741754
+    }
+  },
+  "benchmarks": [
+    {
+      "baseline_compiler": "gcc",
+      "compile": {
+        "baseline": {
+          "binary_bytes": 6968,
+          "binary_sha256": "ee52b44c97895266afc05164eb0a5fdd8ec7fe7e4a820b10af26d4642002f394",
+          "child_cpu_s": 0.065552,
+          "command": [
+            "/home/user/audit/baseline/lccc",
+            "-I/home/user/oracles/gcc-16.2.0/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+            "-O2",
+            "-msse2",
+            "-mno-avx",
+            "-o",
+            "/home/user/lccc/lccc_bench_nang8w61/fp32_product_map_baseline",
+            "/home/user/lccc/tests/benchmark/programs/fp_product_map.c",
+            "-ffp-contract=off"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "23cac871500a64294d66b2b9e74f3b5f140be8bd14071a5dd011418cb4616168",
+          "stderr": "",
+          "stdout": "",
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "text_bytes": 1728,
+          "wall_s": 0.059757004
+        },
+        "gcc": {
+          "binary_bytes": 8920,
+          "binary_sha256": "04f782413b45ea0a44db954ba2c364e7cd08d25af341ced574a5f5e94c432da5",
+          "child_cpu_s": 0.05894200000000001,
+          "command": [
+            "/home/user/bin/cc16",
+            "-O2",
+            "-msse2",
+            "-mno-avx",
+            "-o",
+            "/home/user/lccc/lccc_bench_nang8w61/fp32_product_map_gcc",
+            "/home/user/lccc/tests/benchmark/programs/fp_product_map.c",
+            "-ffp-contract=off"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "23cac871500a64294d66b2b9e74f3b5f140be8bd14071a5dd011418cb4616168",
+          "stderr": "",
+          "stdout": "",
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "text_bytes": 1755,
+          "wall_s": 0.070885925
+        },
+        "lccc": {
+          "binary_bytes": 6968,
+          "binary_sha256": "ee52b44c97895266afc05164eb0a5fdd8ec7fe7e4a820b10af26d4642002f394",
+          "child_cpu_s": 0.066734,
+          "command": [
+            "/home/user/lccc/target/fastbuild/lccc",
+            "-I/home/user/oracles/gcc-16.2.0/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+            "-O2",
+            "-msse2",
+            "-mno-avx",
+            "-o",
+            "/home/user/lccc/lccc_bench_nang8w61/fp32_product_map_lccc",
+            "/home/user/lccc/tests/benchmark/programs/fp_product_map.c",
+            "-ffp-contract=off"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "23cac871500a64294d66b2b9e74f3b5f140be8bd14071a5dd011418cb4616168",
+          "stderr": "",
+          "stdout": "",
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "text_bytes": 1728,
+          "wall_s": 0.09337057
+        }
+      },
+      "correctness": {
+        "baseline": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "c5365c4dc10cec83\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "c5365c4dc10cec83\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "c5365c4dc10cec83\n",
+          "stable_within_compiler": true
+        }
+      },
+      "description": "strict cache-resident F32 multiply/add maps",
+      "name": "fp32_product_map",
+      "ratios_from_lccc": {
+        "baseline": {
+          "cv": 0.05058378920416599,
+          "interpretation": "numerator/denominator; <1 means numerator faster",
+          "mad": 0.0030812985361917677,
+          "max": 1.13930529524897,
+          "mean": 1.0232393494410175,
+          "median": 1.0028702869188346,
+          "median_ci95_bootstrap": [
+            0.9997889883826429,
+            1.0200803312756896
+          ],
+          "min": 0.9955561932714029,
+          "n": 7,
+          "outlier_count_mad": 2,
+          "raw": [
+            {
+              "ratio": 1.0010293642955825,
+              "round": 0
+            },
+            {
+              "ratio": 1.0040449866940004,
+              "round": 1
+            },
+            {
+              "ratio": 0.9955561932714029,
+              "round": 2
+            },
+            {
+              "ratio": 0.9997889883826429,
+              "round": 3
+            },
+            {
+              "ratio": 1.0028702869188346,
+              "round": 4
+            },
+            {
+              "ratio": 1.13930529524897,
+              "round": 5
+            },
+            {
+              "ratio": 1.0200803312756896,
+              "round": 6
+            }
+          ],
+          "stdev": 0.05175932355753236
+        },
+        "gcc": {
+          "cv": 0.04903711387708354,
+          "interpretation": "numerator/denominator; <1 means numerator faster",
+          "mad": 0.0071655639904690815,
+          "max": 1.1767382760773923,
+          "mean": 1.060064414136644,
+          "median": 1.0403227600579525,
+          "median_ci95_bootstrap": [
+            1.0332641208406905,
+            1.0530535369293808
+          ],
+          "min": 1.0328430326275988,
+          "n": 7,
+          "outlier_count_mad": 1,
+          "raw": [
+            {
+              "ratio": 1.0474883240484216,
+              "round": 0
+            },
+            {
+              "ratio": 1.0403227600579525,
+              "round": 1
+            },
+            {
+              "ratio": 1.0367408483750717,
+              "round": 2
+            },
+            {
+              "ratio": 1.0332641208406905,
+              "round": 3
+            },
+            {
+              "ratio": 1.0328430326275988,
+              "round": 4
+            },
+            {
+              "ratio": 1.1767382760773923,
+              "round": 5
+            },
+            {
+              "ratio": 1.0530535369293808,
+              "round": 6
+            }
+          ],
+          "stdev": 0.05198249939306245
+        }
+      },
+      "ratios_to_gcc": {
+        "baseline": {
+          "cv": 0.0056321941994906324,
+          "interpretation": "numerator/denominator; <1 means numerator faster",
+          "mad": 0.002649423845296761,
+          "max": 1.0464111857353273,
+          "mean": 1.0360657930961152,
+          "median": 1.033482197590714,
+          "median_ci95_bootstrap": [
+            1.0323241264856617,
+            1.0413684886719814
+          ],
+          "min": 1.029886961553972,
+          "n": 7,
+          "outlier_count_mad": 0,
+          "raw": [
+            {
+              "ratio": 1.0464111857353273,
+              "round": 0
+            },
+            {
+              "ratio": 1.0361316214360108,
+              "round": 1
+            },
+            {
+              "ratio": 1.0413684886719814,
+              "round": 2
+            },
+            {
+              "ratio": 1.033482197590714,
+              "round": 3
+            },
+            {
+              "ratio": 1.029886961553972,
+              "round": 4
+            },
+            {
+              "ratio": 1.0328559701991398,
+              "round": 5
+            },
+            {
+              "ratio": 1.0323241264856617,
+              "round": 6
+            }
+          ],
+          "stdev": 0.005835323750166602
+        },
+        "lccc": {
+          "cv": 0.04903711387708354,
+          "interpretation": "numerator/denominator; <1 means numerator faster",
+          "mad": 0.0071655639904690815,
+          "max": 1.1767382760773923,
+          "mean": 1.060064414136644,
+          "median": 1.0403227600579525,
+          "median_ci95_bootstrap": [
+            1.0332641208406905,
+            1.0530535369293808
+          ],
+          "min": 1.0328430326275988,
+          "n": 7,
+          "outlier_count_mad": 1,
+          "raw": [
+            {
+              "ratio": 1.0474883240484216,
+              "round": 0
+            },
+            {
+              "ratio": 1.0403227600579525,
+              "round": 1
+            },
+            {
+              "ratio": 1.0367408483750717,
+              "round": 2
+            },
+            {
+              "ratio": 1.0332641208406905,
+              "round": 3
+            },
+            {
+              "ratio": 1.0328430326275988,
+              "round": 4
+            },
+            {
+              "ratio": 1.1767382760773923,
+              "round": 5
+            },
+            {
+              "ratio": 1.0530535369293808,
+              "round": 6
+            }
+          ],
+          "stdev": 0.05198249939306245
+        }
+      },
+      "rounds": [
+        {
+          "order": [
+            "baseline",
+            "lccc",
+            "gcc"
+          ],
+          "round": 0,
+          "runs": {
+            "baseline": {
+              "child_cpu_s": 0.2581200000000001,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/fp32_product_map_baseline"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "c5365c4dc10cec83\n",
+              "stdout_sha256": "39ec8b3bdfe6a4aba6b5c701eab73bd3adb14f9dd8ae30d69ba526b971d896d7",
+              "wall_s": 0.258598439
+            },
+            "gcc": {
+              "child_cpu_s": 0.24660499999999974,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/fp32_product_map_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "c5365c4dc10cec83\n",
+              "stdout_sha256": "39ec8b3bdfe6a4aba6b5c701eab73bd3adb14f9dd8ae30d69ba526b971d896d7",
+              "wall_s": 0.247128894
+            },
+            "lccc": {
+              "child_cpu_s": 0.258267,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/fp32_product_map_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "c5365c4dc10cec83\n",
+              "stdout_sha256": "39ec8b3bdfe6a4aba6b5c701eab73bd3adb14f9dd8ae30d69ba526b971d896d7",
+              "wall_s": 0.258864631
+            }
+          }
+        },
+        {
+          "order": [
+            "lccc",
+            "gcc",
+            "baseline"
+          ],
+          "round": 1,
+          "runs": {
+            "baseline": {
+              "child_cpu_s": 0.25580999999999987,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/fp32_product_map_baseline"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "c5365c4dc10cec83\n",
+              "stdout_sha256": "39ec8b3bdfe6a4aba6b5c701eab73bd3adb14f9dd8ae30d69ba526b971d896d7",
+              "wall_s": 0.256294539
+            },
+            "gcc": {
+              "child_cpu_s": 0.24701900000000032,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/fp32_product_map_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "c5365c4dc10cec83\n",
+              "stdout_sha256": "39ec8b3bdfe6a4aba6b5c701eab73bd3adb14f9dd8ae30d69ba526b971d896d7",
+              "wall_s": 0.247357125
+            },
+            "lccc": {
+              "child_cpu_s": 0.25696399999999997,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/fp32_product_map_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "c5365c4dc10cec83\n",
+              "stdout_sha256": "39ec8b3bdfe6a4aba6b5c701eab73bd3adb14f9dd8ae30d69ba526b971d896d7",
+              "wall_s": 0.257331247
+            }
+          }
+        },
+        {
+          "order": [
+            "gcc",
+            "baseline",
+            "lccc"
+          ],
+          "round": 2,
+          "runs": {
+            "baseline": {
+              "child_cpu_s": 0.25628300000000026,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/fp32_product_map_baseline"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "c5365c4dc10cec83\n",
+              "stdout_sha256": "39ec8b3bdfe6a4aba6b5c701eab73bd3adb14f9dd8ae30d69ba526b971d896d7",
+              "wall_s": 0.256728762
+            },
+            "gcc": {
+              "child_cpu_s": 0.2462139999999997,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/fp32_product_map_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "c5365c4dc10cec83\n",
+              "stdout_sha256": "39ec8b3bdfe6a4aba6b5c701eab73bd3adb14f9dd8ae30d69ba526b971d896d7",
+              "wall_s": 0.246530181
+            },
+            "lccc": {
+              "child_cpu_s": 0.25519899999999973,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/fp32_product_map_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "c5365c4dc10cec83\n",
+              "stdout_sha256": "39ec8b3bdfe6a4aba6b5c701eab73bd3adb14f9dd8ae30d69ba526b971d896d7",
+              "wall_s": 0.255587909
+            }
+          }
+        },
+        {
+          "order": [
+            "baseline",
+            "lccc",
+            "gcc"
+          ],
+          "round": 3,
+          "runs": {
+            "baseline": {
+              "child_cpu_s": 0.25516000000000005,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/fp32_product_map_baseline"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "c5365c4dc10cec83\n",
+              "stdout_sha256": "39ec8b3bdfe6a4aba6b5c701eab73bd3adb14f9dd8ae30d69ba526b971d896d7",
+              "wall_s": 0.255497781
+            },
+            "gcc": {
+              "child_cpu_s": 0.24689400000000017,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/fp32_product_map_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "c5365c4dc10cec83\n",
+              "stdout_sha256": "39ec8b3bdfe6a4aba6b5c701eab73bd3adb14f9dd8ae30d69ba526b971d896d7",
+              "wall_s": 0.247220302
+            },
+            "lccc": {
+              "child_cpu_s": 0.25500599999999984,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/fp32_product_map_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "c5365c4dc10cec83\n",
+              "stdout_sha256": "39ec8b3bdfe6a4aba6b5c701eab73bd3adb14f9dd8ae30d69ba526b971d896d7",
+              "wall_s": 0.255443868
+            }
+          }
+        },
+        {
+          "order": [
+            "lccc",
+            "baseline",
+            "gcc"
+          ],
+          "round": 4,
+          "runs": {
+            "baseline": {
+              "child_cpu_s": 0.2556439999999993,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/fp32_product_map_baseline"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "c5365c4dc10cec83\n",
+              "stdout_sha256": "39ec8b3bdfe6a4aba6b5c701eab73bd3adb14f9dd8ae30d69ba526b971d896d7",
+              "wall_s": 0.256150002
+            },
+            "gcc": {
+              "child_cpu_s": 0.248259,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/fp32_product_map_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "c5365c4dc10cec83\n",
+              "stdout_sha256": "39ec8b3bdfe6a4aba6b5c701eab73bd3adb14f9dd8ae30d69ba526b971d896d7",
+              "wall_s": 0.248716618
+            },
+            "lccc": {
+              "child_cpu_s": 0.25647800000000043,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/fp32_product_map_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "c5365c4dc10cec83\n",
+              "stdout_sha256": "39ec8b3bdfe6a4aba6b5c701eab73bd3adb14f9dd8ae30d69ba526b971d896d7",
+              "wall_s": 0.256885226
+            }
+          }
+        },
+        {
+          "order": [
+            "baseline",
+            "gcc",
+            "lccc"
+          ],
+          "round": 5,
+          "runs": {
+            "baseline": {
+              "child_cpu_s": 0.25527999999999995,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/fp32_product_map_baseline"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "c5365c4dc10cec83\n",
+              "stdout_sha256": "39ec8b3bdfe6a4aba6b5c701eab73bd3adb14f9dd8ae30d69ba526b971d896d7",
+              "wall_s": 0.255743839
+            },
+            "gcc": {
+              "child_cpu_s": 0.24710800000000077,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/fp32_product_map_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "c5365c4dc10cec83\n",
+              "stdout_sha256": "39ec8b3bdfe6a4aba6b5c701eab73bd3adb14f9dd8ae30d69ba526b971d896d7",
+              "wall_s": 0.247608424
+            },
+            "lccc": {
+              "child_cpu_s": 0.29087199999999935,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/fp32_product_map_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "c5365c4dc10cec83\n",
+              "stdout_sha256": "39ec8b3bdfe6a4aba6b5c701eab73bd3adb14f9dd8ae30d69ba526b971d896d7",
+              "wall_s": 0.29137031
+            }
+          }
+        },
+        {
+          "order": [
+            "lccc",
+            "gcc",
+            "baseline"
+          ],
+          "round": 6,
+          "runs": {
+            "baseline": {
+              "child_cpu_s": 0.2552650000000005,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/fp32_product_map_baseline"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "c5365c4dc10cec83\n",
+              "stdout_sha256": "39ec8b3bdfe6a4aba6b5c701eab73bd3adb14f9dd8ae30d69ba526b971d896d7",
+              "wall_s": 0.255663312
+            },
+            "gcc": {
+              "child_cpu_s": 0.24713899999999978,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/fp32_product_map_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "c5365c4dc10cec83\n",
+              "stdout_sha256": "39ec8b3bdfe6a4aba6b5c701eab73bd3adb14f9dd8ae30d69ba526b971d896d7",
+              "wall_s": 0.247657984
+            },
+            "lccc": {
+              "child_cpu_s": 0.26030700000000007,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/fp32_product_map_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "c5365c4dc10cec83\n",
+              "stdout_sha256": "39ec8b3bdfe6a4aba6b5c701eab73bd3adb14f9dd8ae30d69ba526b971d896d7",
+              "wall_s": 0.260797116
+            }
+          }
+        }
+      ],
+      "runs": {
+        "baseline": [
+          {
+            "child_cpu_s": 0.2581200000000001,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/fp32_product_map_baseline"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "c5365c4dc10cec83\n",
+            "stdout_sha256": "39ec8b3bdfe6a4aba6b5c701eab73bd3adb14f9dd8ae30d69ba526b971d896d7",
+            "wall_s": 0.258598439
+          },
+          {
+            "child_cpu_s": 0.25580999999999987,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/fp32_product_map_baseline"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "c5365c4dc10cec83\n",
+            "stdout_sha256": "39ec8b3bdfe6a4aba6b5c701eab73bd3adb14f9dd8ae30d69ba526b971d896d7",
+            "wall_s": 0.256294539
+          },
+          {
+            "child_cpu_s": 0.25628300000000026,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/fp32_product_map_baseline"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "c5365c4dc10cec83\n",
+            "stdout_sha256": "39ec8b3bdfe6a4aba6b5c701eab73bd3adb14f9dd8ae30d69ba526b971d896d7",
+            "wall_s": 0.256728762
+          },
+          {
+            "child_cpu_s": 0.25516000000000005,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/fp32_product_map_baseline"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "c5365c4dc10cec83\n",
+            "stdout_sha256": "39ec8b3bdfe6a4aba6b5c701eab73bd3adb14f9dd8ae30d69ba526b971d896d7",
+            "wall_s": 0.255497781
+          },
+          {
+            "child_cpu_s": 0.2556439999999993,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/fp32_product_map_baseline"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "c5365c4dc10cec83\n",
+            "stdout_sha256": "39ec8b3bdfe6a4aba6b5c701eab73bd3adb14f9dd8ae30d69ba526b971d896d7",
+            "wall_s": 0.256150002
+          },
+          {
+            "child_cpu_s": 0.25527999999999995,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/fp32_product_map_baseline"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "c5365c4dc10cec83\n",
+            "stdout_sha256": "39ec8b3bdfe6a4aba6b5c701eab73bd3adb14f9dd8ae30d69ba526b971d896d7",
+            "wall_s": 0.255743839
+          },
+          {
+            "child_cpu_s": 0.2552650000000005,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/fp32_product_map_baseline"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "c5365c4dc10cec83\n",
+            "stdout_sha256": "39ec8b3bdfe6a4aba6b5c701eab73bd3adb14f9dd8ae30d69ba526b971d896d7",
+            "wall_s": 0.255663312
+          }
+        ],
+        "gcc": [
+          {
+            "child_cpu_s": 0.24660499999999974,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/fp32_product_map_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "c5365c4dc10cec83\n",
+            "stdout_sha256": "39ec8b3bdfe6a4aba6b5c701eab73bd3adb14f9dd8ae30d69ba526b971d896d7",
+            "wall_s": 0.247128894
+          },
+          {
+            "child_cpu_s": 0.24701900000000032,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/fp32_product_map_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "c5365c4dc10cec83\n",
+            "stdout_sha256": "39ec8b3bdfe6a4aba6b5c701eab73bd3adb14f9dd8ae30d69ba526b971d896d7",
+            "wall_s": 0.247357125
+          },
+          {
+            "child_cpu_s": 0.2462139999999997,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/fp32_product_map_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "c5365c4dc10cec83\n",
+            "stdout_sha256": "39ec8b3bdfe6a4aba6b5c701eab73bd3adb14f9dd8ae30d69ba526b971d896d7",
+            "wall_s": 0.246530181
+          },
+          {
+            "child_cpu_s": 0.24689400000000017,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/fp32_product_map_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "c5365c4dc10cec83\n",
+            "stdout_sha256": "39ec8b3bdfe6a4aba6b5c701eab73bd3adb14f9dd8ae30d69ba526b971d896d7",
+            "wall_s": 0.247220302
+          },
+          {
+            "child_cpu_s": 0.248259,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/fp32_product_map_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "c5365c4dc10cec83\n",
+            "stdout_sha256": "39ec8b3bdfe6a4aba6b5c701eab73bd3adb14f9dd8ae30d69ba526b971d896d7",
+            "wall_s": 0.248716618
+          },
+          {
+            "child_cpu_s": 0.24710800000000077,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/fp32_product_map_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "c5365c4dc10cec83\n",
+            "stdout_sha256": "39ec8b3bdfe6a4aba6b5c701eab73bd3adb14f9dd8ae30d69ba526b971d896d7",
+            "wall_s": 0.247608424
+          },
+          {
+            "child_cpu_s": 0.24713899999999978,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/fp32_product_map_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "c5365c4dc10cec83\n",
+            "stdout_sha256": "39ec8b3bdfe6a4aba6b5c701eab73bd3adb14f9dd8ae30d69ba526b971d896d7",
+            "wall_s": 0.247657984
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 0.258267,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/fp32_product_map_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "c5365c4dc10cec83\n",
+            "stdout_sha256": "39ec8b3bdfe6a4aba6b5c701eab73bd3adb14f9dd8ae30d69ba526b971d896d7",
+            "wall_s": 0.258864631
+          },
+          {
+            "child_cpu_s": 0.25696399999999997,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/fp32_product_map_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "c5365c4dc10cec83\n",
+            "stdout_sha256": "39ec8b3bdfe6a4aba6b5c701eab73bd3adb14f9dd8ae30d69ba526b971d896d7",
+            "wall_s": 0.257331247
+          },
+          {
+            "child_cpu_s": 0.25519899999999973,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/fp32_product_map_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "c5365c4dc10cec83\n",
+            "stdout_sha256": "39ec8b3bdfe6a4aba6b5c701eab73bd3adb14f9dd8ae30d69ba526b971d896d7",
+            "wall_s": 0.255587909
+          },
+          {
+            "child_cpu_s": 0.25500599999999984,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/fp32_product_map_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "c5365c4dc10cec83\n",
+            "stdout_sha256": "39ec8b3bdfe6a4aba6b5c701eab73bd3adb14f9dd8ae30d69ba526b971d896d7",
+            "wall_s": 0.255443868
+          },
+          {
+            "child_cpu_s": 0.25647800000000043,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/fp32_product_map_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "c5365c4dc10cec83\n",
+            "stdout_sha256": "39ec8b3bdfe6a4aba6b5c701eab73bd3adb14f9dd8ae30d69ba526b971d896d7",
+            "wall_s": 0.256885226
+          },
+          {
+            "child_cpu_s": 0.29087199999999935,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/fp32_product_map_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "c5365c4dc10cec83\n",
+            "stdout_sha256": "39ec8b3bdfe6a4aba6b5c701eab73bd3adb14f9dd8ae30d69ba526b971d896d7",
+            "wall_s": 0.29137031
+          },
+          {
+            "child_cpu_s": 0.26030700000000007,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/fp32_product_map_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "c5365c4dc10cec83\n",
+            "stdout_sha256": "39ec8b3bdfe6a4aba6b5c701eab73bd3adb14f9dd8ae30d69ba526b971d896d7",
+            "wall_s": 0.260797116
+          }
+        ]
+      },
+      "runtime": {
+        "baseline": {
+          "child_cpu": {
+            "cv": 0.004058651300286764,
+            "mad": 0.00037899999999879697,
+            "max": 0.2581200000000001,
+            "mean": 0.2559374285714286,
+            "median": 0.2556439999999993,
+            "median_ci95_bootstrap": [
+              0.2552650000000005,
+              0.25628300000000026
+            ],
+            "min": 0.25516000000000005,
+            "n": 7,
+            "outlier_count_mad": 1,
+            "stdev": 0.0010387607772634794
+          },
+          "quality_warnings": [],
+          "raw_wall_s": [
+            0.258598439,
+            0.256294539,
+            0.256728762,
+            0.255497781,
+            0.256150002,
+            0.255743839,
+            0.255663312
+          ],
+          "wall": {
+            "cv": 0.004152294739960805,
+            "mad": 0.00048669000000001184,
+            "max": 0.258598439,
+            "mean": 0.256382382,
+            "median": 0.256150002,
+            "median_ci95_bootstrap": [
+              0.255663312,
+              0.256728762
+            ],
+            "min": 0.255497781,
+            "n": 7,
+            "outlier_count_mad": 0,
+            "stdev": 0.001064575216197222
+          }
+        },
+        "gcc": {
+          "child_cpu": {
+            "cv": 0.0025566693306986557,
+            "mad": 0.00012500000000015277,
+            "max": 0.248259,
+            "mean": 0.24703400000000006,
+            "median": 0.24701900000000032,
+            "median_ci95_bootstrap": [
+              0.24660499999999974,
+              0.24713899999999978
+            ],
+            "min": 0.2462139999999997,
+            "n": 7,
+            "outlier_count_mad": 2,
+            "stdev": 0.0006315842514398118
+          },
+          "quality_warnings": [
+            "1 MAD outlier(s) retained (never silently discarded)"
+          ],
+          "raw_wall_s": [
+            0.247128894,
+            0.247357125,
+            0.246530181,
+            0.247220302,
+            0.248716618,
+            0.247608424,
+            0.247657984
+          ],
+          "wall": {
+            "cv": 0.0027020496306730192,
+            "mad": 0.0002512989999999826,
+            "max": 0.248716618,
+            "mean": 0.24745993257142856,
+            "median": 0.247357125,
+            "median_ci95_bootstrap": [
+              0.247128894,
+              0.247657984
+            ],
+            "min": 0.246530181,
+            "n": 7,
+            "outlier_count_mad": 1,
+            "stdev": 0.0006686490194109987
+          }
+        },
+        "lccc": {
+          "child_cpu": {
+            "cv": 0.049331007400903404,
+            "mad": 0.0017650000000002386,
+            "max": 0.29087199999999935,
+            "mean": 0.2618704285714285,
+            "median": 0.25696399999999997,
+            "median_ci95_bootstrap": [
+              0.25519899999999973,
+              0.26030700000000007
+            ],
+            "min": 0.25500599999999984,
+            "n": 7,
+            "outlier_count_mad": 1,
+            "stdev": 0.012918332049934885
+          },
+          "quality_warnings": [
+            "1 MAD outlier(s) retained (never silently discarded)"
+          ],
+          "raw_wall_s": [
+            0.258864631,
+            0.257331247,
+            0.255587909,
+            0.255443868,
+            0.256885226,
+            0.29137031,
+            0.260797116
+          ],
+          "wall": {
+            "cv": 0.04934133642931502,
+            "mad": 0.0017433379999999832,
+            "max": 0.29137031,
+            "mean": 0.26232575814285714,
+            "median": 0.257331247,
+            "median_ci95_bootstrap": [
+              0.255587909,
+              0.260797116
+            ],
+            "min": 0.255443868,
+            "n": 7,
+            "outlier_count_mad": 1,
+            "stdev": 0.012943503486601839
+          }
+        }
+      },
+      "source": "/home/user/lccc/tests/benchmark/programs/fp_product_map.c",
+      "source_sha256": "23cac871500a64294d66b2b9e74f3b5f140be8bd14071a5dd011418cb4616168",
+      "tags": [
+        "synthetic",
+        "simd",
+        "fp",
+        "map"
+      ],
+      "warmups": {
+        "baseline": [
+          {
+            "child_cpu_s": 0.34038199999999996,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/fp32_product_map_baseline"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "c5365c4dc10cec83\n",
+            "stdout_sha256": "39ec8b3bdfe6a4aba6b5c701eab73bd3adb14f9dd8ae30d69ba526b971d896d7",
+            "wall_s": 0.340669596
+          },
+          {
+            "child_cpu_s": 0.255352,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/fp32_product_map_baseline"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "c5365c4dc10cec83\n",
+            "stdout_sha256": "39ec8b3bdfe6a4aba6b5c701eab73bd3adb14f9dd8ae30d69ba526b971d896d7",
+            "wall_s": 0.25580658
+          }
+        ],
+        "gcc": [
+          {
+            "child_cpu_s": 0.24712699999999999,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/fp32_product_map_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "c5365c4dc10cec83\n",
+            "stdout_sha256": "39ec8b3bdfe6a4aba6b5c701eab73bd3adb14f9dd8ae30d69ba526b971d896d7",
+            "wall_s": 0.247508108
+          },
+          {
+            "child_cpu_s": 0.24742299999999995,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/fp32_product_map_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "c5365c4dc10cec83\n",
+            "stdout_sha256": "39ec8b3bdfe6a4aba6b5c701eab73bd3adb14f9dd8ae30d69ba526b971d896d7",
+            "wall_s": 0.248016282
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 0.255185,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/fp32_product_map_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "c5365c4dc10cec83\n",
+            "stdout_sha256": "39ec8b3bdfe6a4aba6b5c701eab73bd3adb14f9dd8ae30d69ba526b971d896d7",
+            "wall_s": 0.255577646
+          },
+          {
+            "child_cpu_s": 0.2551669999999999,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/fp32_product_map_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "c5365c4dc10cec83\n",
+            "stdout_sha256": "39ec8b3bdfe6a4aba6b5c701eab73bd3adb14f9dd8ae30d69ba526b971d896d7",
+            "wall_s": 0.255519957
+          }
+        ]
+      },
+      "warnings": []
+    },
+    {
+      "baseline_compiler": "gcc",
+      "compile": {
+        "baseline": {
+          "binary_bytes": 6968,
+          "binary_sha256": "d989f0c2e09db84f02a5d250540c559f84706e9eb2b97cb0c17803a16fb7ff53",
+          "child_cpu_s": 0.06252299999999966,
+          "command": [
+            "/home/user/audit/baseline/lccc",
+            "-I/home/user/oracles/gcc-16.2.0/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+            "-O2",
+            "-msse2",
+            "-mno-avx",
+            "-o",
+            "/home/user/lccc/lccc_bench_nang8w61/fp64_product_map_baseline",
+            "/home/user/lccc/tests/benchmark/programs/fp_product_map.c",
+            "-DFP_MAP_DOUBLE",
+            "-ffp-contract=off"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "23cac871500a64294d66b2b9e74f3b5f140be8bd14071a5dd011418cb4616168",
+          "stderr": "",
+          "stdout": "",
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "text_bytes": 1726,
+          "wall_s": 0.057179449
+        },
+        "gcc": {
+          "binary_bytes": 9088,
+          "binary_sha256": "a34f328962c1f36073d9e26624d53bb7c345953f916cef858822a64f8da3e952",
+          "child_cpu_s": 0.051920000000000854,
+          "command": [
+            "/home/user/bin/cc16",
+            "-O2",
+            "-msse2",
+            "-mno-avx",
+            "-o",
+            "/home/user/lccc/lccc_bench_nang8w61/fp64_product_map_gcc",
+            "/home/user/lccc/tests/benchmark/programs/fp_product_map.c",
+            "-DFP_MAP_DOUBLE",
+            "-ffp-contract=off"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "23cac871500a64294d66b2b9e74f3b5f140be8bd14071a5dd011418cb4616168",
+          "stderr": "",
+          "stdout": "",
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "text_bytes": 1829,
+          "wall_s": 0.061730781
+        },
+        "lccc": {
+          "binary_bytes": 6968,
+          "binary_sha256": "d989f0c2e09db84f02a5d250540c559f84706e9eb2b97cb0c17803a16fb7ff53",
+          "child_cpu_s": 0.06217300000000048,
+          "command": [
+            "/home/user/lccc/target/fastbuild/lccc",
+            "-I/home/user/oracles/gcc-16.2.0/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+            "-O2",
+            "-msse2",
+            "-mno-avx",
+            "-o",
+            "/home/user/lccc/lccc_bench_nang8w61/fp64_product_map_lccc",
+            "/home/user/lccc/tests/benchmark/programs/fp_product_map.c",
+            "-DFP_MAP_DOUBLE",
+            "-ffp-contract=off"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "23cac871500a64294d66b2b9e74f3b5f140be8bd14071a5dd011418cb4616168",
+          "stderr": "",
+          "stdout": "",
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "text_bytes": 1726,
+          "wall_s": 0.056853375
+        }
+      },
+      "correctness": {
+        "baseline": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "8a2f24140d3f1b83\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "8a2f24140d3f1b83\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "8a2f24140d3f1b83\n",
+          "stable_within_compiler": true
+        }
+      },
+      "description": "strict cache-resident F64 multiply/add maps",
+      "name": "fp64_product_map",
+      "ratios_from_lccc": {
+        "baseline": {
+          "cv": 0.054905195646826936,
+          "interpretation": "numerator/denominator; <1 means numerator faster",
+          "mad": 0.007017348512982191,
+          "max": 1.015871304305513,
+          "mean": 0.9817272730423144,
+          "median": 0.9990353558423692,
+          "median_ci95_bootstrap": [
+            0.992018007329387,
+            1.0103867173515333
+          ],
+          "min": 0.8611179900703835,
+          "n": 7,
+          "outlier_count_mad": 1,
+          "raw": [
+            {
+              "ratio": 0.9990353558423692,
+              "round": 0
+            },
+            {
+              "ratio": 1.0103867173515333,
+              "round": 1
+            },
+            {
+              "ratio": 0.992018007329387,
+              "round": 2
+            },
+            {
+              "ratio": 1.015871304305513,
+              "round": 3
+            },
+            {
+              "ratio": 0.8611179900703835,
+              "round": 4
+            },
+            {
+              "ratio": 1.0011336288331427,
+              "round": 5
+            },
+            {
+              "ratio": 0.9925279075638723,
+              "round": 6
+            }
+          ],
+          "stdev": 0.05390192799821416
+        },
+        "gcc": {
+          "cv": 0.01382498777375375,
+          "interpretation": "numerator/denominator; <1 means numerator faster",
+          "mad": 0.004737943768019948,
+          "max": 0.9824361259862087,
+          "mean": 0.9635865990611815,
+          "median": 0.9655563660638925,
+          "median_ci95_bootstrap": [
+            0.95193488619572,
+            0.9702943098319124
+          ],
+          "min": 0.9414078916520935,
+          "n": 7,
+          "outlier_count_mad": 0,
+          "raw": [
+            {
+              "ratio": 0.9414078916520935,
+              "round": 0
+            },
+            {
+              "ratio": 0.9824361259862087,
+              "round": 1
+            },
+            {
+              "ratio": 0.9702943098319124,
+              "round": 2
+            },
+            {
+              "ratio": 0.9692960211807238,
+              "round": 3
+            },
+            {
+              "ratio": 0.95193488619572,
+              "round": 4
+            },
+            {
+              "ratio": 0.9655563660638925,
+              "round": 5
+            },
+            {
+              "ratio": 0.9641805925177199,
+              "round": 6
+            }
+          ],
+          "stdev": 0.013321572950973791
+        }
+      },
+      "ratios_to_gcc": {
+        "baseline": {
+          "cv": 0.055802911076010736,
+          "interpretation": "numerator/denominator; <1 means numerator faster",
+          "mad": 0.006976253615923134,
+          "max": 1.1054639401017665,
+          "mean": 0.984039108320299,
+          "median": 0.971439276588474,
+          "median_ci95_bootstrap": [
+            0.9541523784288504,
+            0.9781015089071246
+          ],
+          "min": 0.94231689213673,
+          "n": 7,
+          "outlier_count_mad": 1,
+          "raw": [
+            {
+              "ratio": 0.94231689213673,
+              "round": 0
+            },
+            {
+              "ratio": 0.9723367391065969,
+              "round": 1
+            },
+            {
+              "ratio": 0.9781015089071246,
+              "round": 2
+            },
+            {
+              "ratio": 0.9541523784288504,
+              "round": 3
+            },
+            {
+              "ratio": 1.1054639401017665,
+              "round": 4
+            },
+            {
+              "ratio": 0.9644630229725508,
+              "round": 5
+            },
+            {
+              "ratio": 0.971439276588474,
+              "round": 6
+            }
+          ],
+          "stdev": 0.05491224685691454
+        },
+        "lccc": {
+          "cv": 0.01382498777375375,
+          "interpretation": "numerator/denominator; <1 means numerator faster",
+          "mad": 0.004737943768019948,
+          "max": 0.9824361259862087,
+          "mean": 0.9635865990611815,
+          "median": 0.9655563660638925,
+          "median_ci95_bootstrap": [
+            0.95193488619572,
+            0.9702943098319124
+          ],
+          "min": 0.9414078916520935,
+          "n": 7,
+          "outlier_count_mad": 0,
+          "raw": [
+            {
+              "ratio": 0.9414078916520935,
+              "round": 0
+            },
+            {
+              "ratio": 0.9824361259862087,
+              "round": 1
+            },
+            {
+              "ratio": 0.9702943098319124,
+              "round": 2
+            },
+            {
+              "ratio": 0.9692960211807238,
+              "round": 3
+            },
+            {
+              "ratio": 0.95193488619572,
+              "round": 4
+            },
+            {
+              "ratio": 0.9655563660638925,
+              "round": 5
+            },
+            {
+              "ratio": 0.9641805925177199,
+              "round": 6
+            }
+          ],
+          "stdev": 0.013321572950973791
+        }
+      },
+      "rounds": [
+        {
+          "order": [
+            "gcc",
+            "lccc",
+            "baseline"
+          ],
+          "round": 0,
+          "runs": {
+            "baseline": {
+              "child_cpu_s": 0.5004670000000004,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/fp64_product_map_baseline"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "8a2f24140d3f1b83\n",
+              "stdout_sha256": "bfa8f2a3dccc7655b6d76ca8ef6ffcbc5ca2d92ce9a5f092d3dc5c8729f3410d",
+              "wall_s": 0.500920465
+            },
+            "gcc": {
+              "child_cpu_s": 0.5310300000000012,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/fp64_product_map_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "8a2f24140d3f1b83\n",
+              "stdout_sha256": "bfa8f2a3dccc7655b6d76ca8ef6ffcbc5ca2d92ce9a5f092d3dc5c8729f3410d",
+              "wall_s": 0.531583875
+            },
+            "lccc": {
+              "child_cpu_s": 0.49988799999999856,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/fp64_product_map_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "8a2f24140d3f1b83\n",
+              "stdout_sha256": "bfa8f2a3dccc7655b6d76ca8ef6ffcbc5ca2d92ce9a5f092d3dc5c8729f3410d",
+              "wall_s": 0.500437255
+            }
+          }
+        },
+        {
+          "order": [
+            "gcc",
+            "baseline",
+            "lccc"
+          ],
+          "round": 1,
+          "runs": {
+            "baseline": {
+              "child_cpu_s": 0.5013659999999991,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/fp64_product_map_baseline"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "8a2f24140d3f1b83\n",
+              "stdout_sha256": "bfa8f2a3dccc7655b6d76ca8ef6ffcbc5ca2d92ce9a5f092d3dc5c8729f3410d",
+              "wall_s": 0.501969951
+            },
+            "gcc": {
+              "child_cpu_s": 0.515721000000001,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/fp64_product_map_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "8a2f24140d3f1b83\n",
+              "stdout_sha256": "bfa8f2a3dccc7655b6d76ca8ef6ffcbc5ca2d92ce9a5f092d3dc5c8729f3410d",
+              "wall_s": 0.516251141
+            },
+            "lccc": {
+              "child_cpu_s": 0.5064970000000013,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/fp64_product_map_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "8a2f24140d3f1b83\n",
+              "stdout_sha256": "bfa8f2a3dccc7655b6d76ca8ef6ffcbc5ca2d92ce9a5f092d3dc5c8729f3410d",
+              "wall_s": 0.507183771
+            }
+          }
+        },
+        {
+          "order": [
+            "lccc",
+            "gcc",
+            "baseline"
+          ],
+          "round": 2,
+          "runs": {
+            "baseline": {
+              "child_cpu_s": 0.5046410000000012,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/fp64_product_map_baseline"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "8a2f24140d3f1b83\n",
+              "stdout_sha256": "bfa8f2a3dccc7655b6d76ca8ef6ffcbc5ca2d92ce9a5f092d3dc5c8729f3410d",
+              "wall_s": 0.505231609
+            },
+            "gcc": {
+              "child_cpu_s": 0.5159839999999996,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/fp64_product_map_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "8a2f24140d3f1b83\n",
+              "stdout_sha256": "bfa8f2a3dccc7655b6d76ca8ef6ffcbc5ca2d92ce9a5f092d3dc5c8729f3410d",
+              "wall_s": 0.516543124
+            },
+            "lccc": {
+              "child_cpu_s": 0.5006819999999994,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/fp64_product_map_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "8a2f24140d3f1b83\n",
+              "stdout_sha256": "bfa8f2a3dccc7655b6d76ca8ef6ffcbc5ca2d92ce9a5f092d3dc5c8729f3410d",
+              "wall_s": 0.501198854
+            }
+          }
+        },
+        {
+          "order": [
+            "lccc",
+            "baseline",
+            "gcc"
+          ],
+          "round": 3,
+          "runs": {
+            "baseline": {
+              "child_cpu_s": 0.5026890000000002,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/fp64_product_map_baseline"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "8a2f24140d3f1b83\n",
+              "stdout_sha256": "bfa8f2a3dccc7655b6d76ca8ef6ffcbc5ca2d92ce9a5f092d3dc5c8729f3410d",
+              "wall_s": 0.50308474
+            },
+            "gcc": {
+              "child_cpu_s": 0.5269280000000016,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/fp64_product_map_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "8a2f24140d3f1b83\n",
+              "stdout_sha256": "bfa8f2a3dccc7655b6d76ca8ef6ffcbc5ca2d92ce9a5f092d3dc5c8729f3410d",
+              "wall_s": 0.527258278
+            },
+            "lccc": {
+              "child_cpu_s": 0.5106979999999997,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/fp64_product_map_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "8a2f24140d3f1b83\n",
+              "stdout_sha256": "bfa8f2a3dccc7655b6d76ca8ef6ffcbc5ca2d92ce9a5f092d3dc5c8729f3410d",
+              "wall_s": 0.511069351
+            }
+          }
+        },
+        {
+          "order": [
+            "lccc",
+            "baseline",
+            "gcc"
+          ],
+          "round": 4,
+          "runs": {
+            "baseline": {
+              "child_cpu_s": 0.5847769999999954,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/fp64_product_map_baseline"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "8a2f24140d3f1b83\n",
+              "stdout_sha256": "bfa8f2a3dccc7655b6d76ca8ef6ffcbc5ca2d92ce9a5f092d3dc5c8729f3410d",
+              "wall_s": 0.585238722
+            },
+            "gcc": {
+              "child_cpu_s": 0.5277650000000023,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/fp64_product_map_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "8a2f24140d3f1b83\n",
+              "stdout_sha256": "bfa8f2a3dccc7655b6d76ca8ef6ffcbc5ca2d92ce9a5f092d3dc5c8729f3410d",
+              "wall_s": 0.529405529
+            },
+            "lccc": {
+              "child_cpu_s": 0.5035349999999994,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/fp64_product_map_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "8a2f24140d3f1b83\n",
+              "stdout_sha256": "bfa8f2a3dccc7655b6d76ca8ef6ffcbc5ca2d92ce9a5f092d3dc5c8729f3410d",
+              "wall_s": 0.503959592
+            }
+          }
+        },
+        {
+          "order": [
+            "baseline",
+            "lccc",
+            "gcc"
+          ],
+          "round": 5,
+          "runs": {
+            "baseline": {
+              "child_cpu_s": 0.5016120000000015,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/fp64_product_map_baseline"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "8a2f24140d3f1b83\n",
+              "stdout_sha256": "bfa8f2a3dccc7655b6d76ca8ef6ffcbc5ca2d92ce9a5f092d3dc5c8729f3410d",
+              "wall_s": 0.502155541
+            },
+            "gcc": {
+              "child_cpu_s": 0.5201389999999968,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/fp64_product_map_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "8a2f24140d3f1b83\n",
+              "stdout_sha256": "bfa8f2a3dccc7655b6d76ca8ef6ffcbc5ca2d92ce9a5f092d3dc5c8729f3410d",
+              "wall_s": 0.520658158
+            },
+            "lccc": {
+              "child_cpu_s": 0.5022720000000014,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/fp64_product_map_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "8a2f24140d3f1b83\n",
+              "stdout_sha256": "bfa8f2a3dccc7655b6d76ca8ef6ffcbc5ca2d92ce9a5f092d3dc5c8729f3410d",
+              "wall_s": 0.502724799
+            }
+          }
+        },
+        {
+          "order": [
+            "baseline",
+            "lccc",
+            "gcc"
+          ],
+          "round": 6,
+          "runs": {
+            "baseline": {
+              "child_cpu_s": 0.5058410000000002,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/fp64_product_map_baseline"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "8a2f24140d3f1b83\n",
+              "stdout_sha256": "bfa8f2a3dccc7655b6d76ca8ef6ffcbc5ca2d92ce9a5f092d3dc5c8729f3410d",
+              "wall_s": 0.506382788
+            },
+            "gcc": {
+              "child_cpu_s": 0.5208919999999999,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/fp64_product_map_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "8a2f24140d3f1b83\n",
+              "stdout_sha256": "bfa8f2a3dccc7655b6d76ca8ef6ffcbc5ca2d92ce9a5f092d3dc5c8729f3410d",
+              "wall_s": 0.521270655
+            },
+            "lccc": {
+              "child_cpu_s": 0.5021350000000027,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/fp64_product_map_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "8a2f24140d3f1b83\n",
+              "stdout_sha256": "bfa8f2a3dccc7655b6d76ca8ef6ffcbc5ca2d92ce9a5f092d3dc5c8729f3410d",
+              "wall_s": 0.502599049
+            }
+          }
+        }
+      ],
+      "runs": {
+        "baseline": [
+          {
+            "child_cpu_s": 0.5004670000000004,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/fp64_product_map_baseline"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "8a2f24140d3f1b83\n",
+            "stdout_sha256": "bfa8f2a3dccc7655b6d76ca8ef6ffcbc5ca2d92ce9a5f092d3dc5c8729f3410d",
+            "wall_s": 0.500920465
+          },
+          {
+            "child_cpu_s": 0.5013659999999991,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/fp64_product_map_baseline"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "8a2f24140d3f1b83\n",
+            "stdout_sha256": "bfa8f2a3dccc7655b6d76ca8ef6ffcbc5ca2d92ce9a5f092d3dc5c8729f3410d",
+            "wall_s": 0.501969951
+          },
+          {
+            "child_cpu_s": 0.5046410000000012,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/fp64_product_map_baseline"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "8a2f24140d3f1b83\n",
+            "stdout_sha256": "bfa8f2a3dccc7655b6d76ca8ef6ffcbc5ca2d92ce9a5f092d3dc5c8729f3410d",
+            "wall_s": 0.505231609
+          },
+          {
+            "child_cpu_s": 0.5026890000000002,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/fp64_product_map_baseline"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "8a2f24140d3f1b83\n",
+            "stdout_sha256": "bfa8f2a3dccc7655b6d76ca8ef6ffcbc5ca2d92ce9a5f092d3dc5c8729f3410d",
+            "wall_s": 0.50308474
+          },
+          {
+            "child_cpu_s": 0.5847769999999954,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/fp64_product_map_baseline"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "8a2f24140d3f1b83\n",
+            "stdout_sha256": "bfa8f2a3dccc7655b6d76ca8ef6ffcbc5ca2d92ce9a5f092d3dc5c8729f3410d",
+            "wall_s": 0.585238722
+          },
+          {
+            "child_cpu_s": 0.5016120000000015,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/fp64_product_map_baseline"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "8a2f24140d3f1b83\n",
+            "stdout_sha256": "bfa8f2a3dccc7655b6d76ca8ef6ffcbc5ca2d92ce9a5f092d3dc5c8729f3410d",
+            "wall_s": 0.502155541
+          },
+          {
+            "child_cpu_s": 0.5058410000000002,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/fp64_product_map_baseline"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "8a2f24140d3f1b83\n",
+            "stdout_sha256": "bfa8f2a3dccc7655b6d76ca8ef6ffcbc5ca2d92ce9a5f092d3dc5c8729f3410d",
+            "wall_s": 0.506382788
+          }
+        ],
+        "gcc": [
+          {
+            "child_cpu_s": 0.5310300000000012,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/fp64_product_map_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "8a2f24140d3f1b83\n",
+            "stdout_sha256": "bfa8f2a3dccc7655b6d76ca8ef6ffcbc5ca2d92ce9a5f092d3dc5c8729f3410d",
+            "wall_s": 0.531583875
+          },
+          {
+            "child_cpu_s": 0.515721000000001,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/fp64_product_map_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "8a2f24140d3f1b83\n",
+            "stdout_sha256": "bfa8f2a3dccc7655b6d76ca8ef6ffcbc5ca2d92ce9a5f092d3dc5c8729f3410d",
+            "wall_s": 0.516251141
+          },
+          {
+            "child_cpu_s": 0.5159839999999996,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/fp64_product_map_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "8a2f24140d3f1b83\n",
+            "stdout_sha256": "bfa8f2a3dccc7655b6d76ca8ef6ffcbc5ca2d92ce9a5f092d3dc5c8729f3410d",
+            "wall_s": 0.516543124
+          },
+          {
+            "child_cpu_s": 0.5269280000000016,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/fp64_product_map_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "8a2f24140d3f1b83\n",
+            "stdout_sha256": "bfa8f2a3dccc7655b6d76ca8ef6ffcbc5ca2d92ce9a5f092d3dc5c8729f3410d",
+            "wall_s": 0.527258278
+          },
+          {
+            "child_cpu_s": 0.5277650000000023,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/fp64_product_map_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "8a2f24140d3f1b83\n",
+            "stdout_sha256": "bfa8f2a3dccc7655b6d76ca8ef6ffcbc5ca2d92ce9a5f092d3dc5c8729f3410d",
+            "wall_s": 0.529405529
+          },
+          {
+            "child_cpu_s": 0.5201389999999968,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/fp64_product_map_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "8a2f24140d3f1b83\n",
+            "stdout_sha256": "bfa8f2a3dccc7655b6d76ca8ef6ffcbc5ca2d92ce9a5f092d3dc5c8729f3410d",
+            "wall_s": 0.520658158
+          },
+          {
+            "child_cpu_s": 0.5208919999999999,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/fp64_product_map_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "8a2f24140d3f1b83\n",
+            "stdout_sha256": "bfa8f2a3dccc7655b6d76ca8ef6ffcbc5ca2d92ce9a5f092d3dc5c8729f3410d",
+            "wall_s": 0.521270655
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 0.49988799999999856,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/fp64_product_map_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "8a2f24140d3f1b83\n",
+            "stdout_sha256": "bfa8f2a3dccc7655b6d76ca8ef6ffcbc5ca2d92ce9a5f092d3dc5c8729f3410d",
+            "wall_s": 0.500437255
+          },
+          {
+            "child_cpu_s": 0.5064970000000013,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/fp64_product_map_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "8a2f24140d3f1b83\n",
+            "stdout_sha256": "bfa8f2a3dccc7655b6d76ca8ef6ffcbc5ca2d92ce9a5f092d3dc5c8729f3410d",
+            "wall_s": 0.507183771
+          },
+          {
+            "child_cpu_s": 0.5006819999999994,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/fp64_product_map_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "8a2f24140d3f1b83\n",
+            "stdout_sha256": "bfa8f2a3dccc7655b6d76ca8ef6ffcbc5ca2d92ce9a5f092d3dc5c8729f3410d",
+            "wall_s": 0.501198854
+          },
+          {
+            "child_cpu_s": 0.5106979999999997,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/fp64_product_map_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "8a2f24140d3f1b83\n",
+            "stdout_sha256": "bfa8f2a3dccc7655b6d76ca8ef6ffcbc5ca2d92ce9a5f092d3dc5c8729f3410d",
+            "wall_s": 0.511069351
+          },
+          {
+            "child_cpu_s": 0.5035349999999994,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/fp64_product_map_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "8a2f24140d3f1b83\n",
+            "stdout_sha256": "bfa8f2a3dccc7655b6d76ca8ef6ffcbc5ca2d92ce9a5f092d3dc5c8729f3410d",
+            "wall_s": 0.503959592
+          },
+          {
+            "child_cpu_s": 0.5022720000000014,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/fp64_product_map_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "8a2f24140d3f1b83\n",
+            "stdout_sha256": "bfa8f2a3dccc7655b6d76ca8ef6ffcbc5ca2d92ce9a5f092d3dc5c8729f3410d",
+            "wall_s": 0.502724799
+          },
+          {
+            "child_cpu_s": 0.5021350000000027,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/fp64_product_map_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "8a2f24140d3f1b83\n",
+            "stdout_sha256": "bfa8f2a3dccc7655b6d76ca8ef6ffcbc5ca2d92ce9a5f092d3dc5c8729f3410d",
+            "wall_s": 0.502599049
+          }
+        ]
+      },
+      "runtime": {
+        "baseline": {
+          "child_cpu": {
+            "cv": 0.060359187681209986,
+            "mad": 0.001952000000001064,
+            "max": 0.5847769999999954,
+            "mean": 0.514484714285714,
+            "median": 0.5026890000000002,
+            "median_ci95_bootstrap": [
+              0.5013659999999991,
+              0.5058410000000002
+            ],
+            "min": 0.5004670000000004,
+            "n": 7,
+            "outlier_count_mad": 1,
+            "stdev": 0.031053879428685104
+          },
+          "quality_warnings": [
+            "wall-clock coefficient of variation is 6.0% (>5%)",
+            "1 MAD outlier(s) retained (never silently discarded)"
+          ],
+          "raw_wall_s": [
+            0.500920465,
+            0.501969951,
+            0.505231609,
+            0.50308474,
+            0.585238722,
+            0.502155541,
+            0.506382788
+          ],
+          "wall": {
+            "cv": 0.06025770082916917,
+            "mad": 0.00214686899999994,
+            "max": 0.585238722,
+            "mean": 0.514997688,
+            "median": 0.50308474,
+            "median_ci95_bootstrap": [
+              0.501969951,
+              0.506382788
+            ],
+            "min": 0.500920465,
+            "n": 7,
+            "outlier_count_mad": 1,
+            "stdev": 0.031032576611217805
+          }
+        },
+        "gcc": {
+          "child_cpu": {
+            "cv": 0.011494319598731114,
+            "mad": 0.0051709999999989265,
+            "max": 0.5310300000000012,
+            "mean": 0.5226370000000004,
+            "median": 0.5208919999999999,
+            "median_ci95_bootstrap": [
+              0.5159839999999996,
+              0.5277650000000023
+            ],
+            "min": 0.515721000000001,
+            "n": 7,
+            "outlier_count_mad": 0,
+            "stdev": 0.006007356712122038
+          },
+          "quality_warnings": [],
+          "raw_wall_s": [
+            0.531583875,
+            0.516251141,
+            0.516543124,
+            0.527258278,
+            0.529405529,
+            0.520658158,
+            0.521270655
+          ],
+          "wall": {
+            "cv": 0.011780430268027074,
+            "mad": 0.005019514000000003,
+            "max": 0.531583875,
+            "mean": 0.5232815371428572,
+            "median": 0.521270655,
+            "median_ci95_bootstrap": [
+              0.516543124,
+              0.529405529
+            ],
+            "min": 0.516251141,
+            "n": 7,
+            "outlier_count_mad": 0,
+            "stdev": 0.006164481658857449
+          }
+        },
+        "lccc": {
+          "child_cpu": {
+            "cv": 0.007470430031268896,
+            "mad": 0.0015900000000019787,
+            "max": 0.5106979999999997,
+            "mean": 0.5036724285714289,
+            "median": 0.5022720000000014,
+            "median_ci95_bootstrap": [
+              0.5006819999999994,
+              0.5064970000000013
+            ],
+            "min": 0.49988799999999856,
+            "n": 7,
+            "outlier_count_mad": 1,
+            "stdev": 0.0037626496363221402
+          },
+          "quality_warnings": [
+            "1 MAD outlier(s) retained (never silently discarded)"
+          ],
+          "raw_wall_s": [
+            0.500437255,
+            0.507183771,
+            0.501198854,
+            0.511069351,
+            0.503959592,
+            0.502724799,
+            0.502599049
+          ],
+          "wall": {
+            "cv": 0.007423474015871771,
+            "mad": 0.0015259450000000285,
+            "max": 0.511069351,
+            "mean": 0.5041675244285714,
+            "median": 0.502724799,
+            "median_ci95_bootstrap": [
+              0.501198854,
+              0.507183771
+            ],
+            "min": 0.500437255,
+            "n": 7,
+            "outlier_count_mad": 1,
+            "stdev": 0.003742674517241896
+          }
+        }
+      },
+      "source": "/home/user/lccc/tests/benchmark/programs/fp_product_map.c",
+      "source_sha256": "23cac871500a64294d66b2b9e74f3b5f140be8bd14071a5dd011418cb4616168",
+      "tags": [
+        "synthetic",
+        "simd",
+        "fp",
+        "map"
+      ],
+      "warmups": {
+        "baseline": [
+          {
+            "child_cpu_s": 0.5352930000000002,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/fp64_product_map_baseline"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "8a2f24140d3f1b83\n",
+            "stdout_sha256": "bfa8f2a3dccc7655b6d76ca8ef6ffcbc5ca2d92ce9a5f092d3dc5c8729f3410d",
+            "wall_s": 0.535719757
+          },
+          {
+            "child_cpu_s": 0.4998629999999995,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/fp64_product_map_baseline"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "8a2f24140d3f1b83\n",
+            "stdout_sha256": "bfa8f2a3dccc7655b6d76ca8ef6ffcbc5ca2d92ce9a5f092d3dc5c8729f3410d",
+            "wall_s": 0.500455381
+          }
+        ],
+        "gcc": [
+          {
+            "child_cpu_s": 0.5168039999999996,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/fp64_product_map_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "8a2f24140d3f1b83\n",
+            "stdout_sha256": "bfa8f2a3dccc7655b6d76ca8ef6ffcbc5ca2d92ce9a5f092d3dc5c8729f3410d",
+            "wall_s": 0.517281299
+          },
+          {
+            "child_cpu_s": 0.5168370000000007,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/fp64_product_map_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "8a2f24140d3f1b83\n",
+            "stdout_sha256": "bfa8f2a3dccc7655b6d76ca8ef6ffcbc5ca2d92ce9a5f092d3dc5c8729f3410d",
+            "wall_s": 0.517528576
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 0.500712,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/fp64_product_map_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "8a2f24140d3f1b83\n",
+            "stdout_sha256": "bfa8f2a3dccc7655b6d76ca8ef6ffcbc5ca2d92ce9a5f092d3dc5c8729f3410d",
+            "wall_s": 0.501320764
+          },
+          {
+            "child_cpu_s": 0.4994639999999997,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/fp64_product_map_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "8a2f24140d3f1b83\n",
+            "stdout_sha256": "bfa8f2a3dccc7655b6d76ca8ef6ffcbc5ca2d92ce9a5f092d3dc5c8729f3410d",
+            "wall_s": 0.499898768
+          }
+        ]
+      },
+      "warnings": []
+    },
+    {
+      "baseline_compiler": "gcc",
+      "compile": {
+        "baseline": {
+          "binary_bytes": 8152,
+          "binary_sha256": "4d3d2d682220ad43c3b870b48fceca0cfdffdd3b1041ee566cc9fa726b1143dc",
+          "child_cpu_s": 0.18943399999999855,
+          "command": [
+            "/home/user/audit/baseline/lccc",
+            "-I/home/user/oracles/gcc-16.2.0/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+            "-O2",
+            "-msse2",
+            "-mno-avx",
+            "-o",
+            "/home/user/lccc/lccc_bench_nang8w61/gzip_longest_match_baseline",
+            "/home/user/lccc/tests/benchmark/programs/gzip_longest_match.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "18a7a1d5dc782cbfe623ded7eb4d20bebcf75f3613b301f3306c3ec968a8db2b",
+          "stderr": "",
+          "stdout": "",
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "text_bytes": 2905,
+          "wall_s": 0.167289305
+        },
+        "gcc": {
+          "binary_bytes": 9688,
+          "binary_sha256": "b542294cd9522e371d450e0d882d58348af010e3ac1f2152c830bbd8b6c8338e",
+          "child_cpu_s": 0.11195000000000377,
+          "command": [
+            "/home/user/bin/cc16",
+            "-O2",
+            "-msse2",
+            "-mno-avx",
+            "-o",
+            "/home/user/lccc/lccc_bench_nang8w61/gzip_longest_match_gcc",
+            "/home/user/lccc/tests/benchmark/programs/gzip_longest_match.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "18a7a1d5dc782cbfe623ded7eb4d20bebcf75f3613b301f3306c3ec968a8db2b",
+          "stderr": "",
+          "stdout": "",
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "text_bytes": 2420,
+          "wall_s": 0.122683387
+        },
+        "lccc": {
+          "binary_bytes": 8152,
+          "binary_sha256": "4d3d2d682220ad43c3b870b48fceca0cfdffdd3b1041ee566cc9fa726b1143dc",
+          "child_cpu_s": 0.186715999999997,
+          "command": [
+            "/home/user/lccc/target/fastbuild/lccc",
+            "-I/home/user/oracles/gcc-16.2.0/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+            "-O2",
+            "-msse2",
+            "-mno-avx",
+            "-o",
+            "/home/user/lccc/lccc_bench_nang8w61/gzip_longest_match_lccc",
+            "/home/user/lccc/tests/benchmark/programs/gzip_longest_match.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "18a7a1d5dc782cbfe623ded7eb4d20bebcf75f3613b301f3306c3ec968a8db2b",
+          "stderr": "",
+          "stdout": "",
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "text_bytes": 2905,
+          "wall_s": 0.165675166
+        }
+      },
+      "correctness": {
+        "baseline": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "gzip_longest_match checksum=15308096299102938189 reference=15308096299102938189 OK\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "gzip_longest_match checksum=15308096299102938189 reference=15308096299102938189 OK\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "gzip_longest_match checksum=15308096299102938189 reference=15308096299102938189 OK\n",
+          "stable_within_compiler": true
+        }
+      },
+      "description": "GNU gzip longest_match / hash-chain match finder",
+      "name": "gzip_longest_match",
+      "ratios_from_lccc": {
+        "baseline": {
+          "cv": 0.025547710552085018,
+          "interpretation": "numerator/denominator; <1 means numerator faster",
+          "mad": 0.0065801999571115655,
+          "max": 1.0606254003119162,
+          "mean": 1.0068823663409479,
+          "median": 1.0021352450076393,
+          "median_ci95_bootstrap": [
+            0.9863063234131795,
+            1.0087154449647509
+          ],
+          "min": 0.982333951891028,
+          "n": 7,
+          "outlier_count_mad": 1,
+          "raw": [
+            {
+              "ratio": 1.0606254003119162,
+              "round": 0
+            },
+            {
+              "ratio": 1.0087154449647509,
+              "round": 1
+            },
+            {
+              "ratio": 0.982333951891028,
+              "round": 2
+            },
+            {
+              "ratio": 1.0014104864198374,
+              "round": 3
+            },
+            {
+              "ratio": 0.9863063234131795,
+              "round": 4
+            },
+            {
+              "ratio": 1.0066497123782836,
+              "round": 5
+            },
+            {
+              "ratio": 1.0021352450076393,
+              "round": 6
+            }
+          ],
+          "stdev": 0.025723539255276966
+        },
+        "gcc": {
+          "cv": 0.026212276629090873,
+          "interpretation": "numerator/denominator; <1 means numerator faster",
+          "mad": 0.0044140930446587845,
+          "max": 1.2407992424360916,
+          "mean": 1.173924576125177,
+          "median": 1.1674422648741754,
+          "median_ci95_bootstrap": [
+            1.1623055136507057,
+            1.1707267959253664
+          ],
+          "min": 1.144303083498859,
+          "n": 7,
+          "outlier_count_mad": 2,
+          "raw": [
+            {
+              "ratio": 1.2407992424360916,
+              "round": 0
+            },
+            {
+              "ratio": 1.144303083498859,
+              "round": 1
+            },
+            {
+              "ratio": 1.1623055136507057,
+              "round": 2
+            },
+            {
+              "ratio": 1.1674422648741754,
+              "round": 3
+            },
+            {
+              "ratio": 1.1630281718295166,
+              "round": 4
+            },
+            {
+              "ratio": 1.1688669606615252,
+              "round": 5
+            },
+            {
+              "ratio": 1.1707267959253664,
+              "round": 6
+            }
+          ],
+          "stdev": 0.030771235731081387
+        }
+      },
+      "ratios_to_gcc": {
+        "baseline": {
+          "cv": 0.013609585245923457,
+          "interpretation": "numerator/denominator; <1 means numerator faster",
+          "mad": 0.0070866577795556385,
+          "max": 1.183208125315455,
+          "mean": 1.1659786735293214,
+          "median": 1.1682323336671407,
+          "median_ci95_bootstrap": [
+            1.161145675887585,
+            1.1791754186516612
+          ],
+          "min": 1.1344161420457344,
+          "n": 7,
+          "outlier_count_mad": 0,
+          "raw": [
+            {
+              "ratio": 1.1698750964017914,
+              "round": 0
+            },
+            {
+              "ratio": 1.1344161420457344,
+              "round": 1
+            },
+            {
+              "ratio": 1.183208125315455,
+              "round": 2
+            },
+            {
+              "ratio": 1.1657979227358817,
+              "round": 3
+            },
+            {
+              "ratio": 1.1791754186516612,
+              "round": 4
+            },
+            {
+              "ratio": 1.161145675887585,
+              "round": 5
+            },
+            {
+              "ratio": 1.1682323336671407,
+              "round": 6
+            }
+          ],
+          "stdev": 0.015868486152326056
+        },
+        "lccc": {
+          "cv": 0.026212276629090873,
+          "interpretation": "numerator/denominator; <1 means numerator faster",
+          "mad": 0.0044140930446587845,
+          "max": 1.2407992424360916,
+          "mean": 1.173924576125177,
+          "median": 1.1674422648741754,
+          "median_ci95_bootstrap": [
+            1.1623055136507057,
+            1.1707267959253664
+          ],
+          "min": 1.144303083498859,
+          "n": 7,
+          "outlier_count_mad": 2,
+          "raw": [
+            {
+              "ratio": 1.2407992424360916,
+              "round": 0
+            },
+            {
+              "ratio": 1.144303083498859,
+              "round": 1
+            },
+            {
+              "ratio": 1.1623055136507057,
+              "round": 2
+            },
+            {
+              "ratio": 1.1674422648741754,
+              "round": 3
+            },
+            {
+              "ratio": 1.1630281718295166,
+              "round": 4
+            },
+            {
+              "ratio": 1.1688669606615252,
+              "round": 5
+            },
+            {
+              "ratio": 1.1707267959253664,
+              "round": 6
+            }
+          ],
+          "stdev": 0.030771235731081387
+        }
+      },
+      "rounds": [
+        {
+          "order": [
+            "gcc",
+            "baseline",
+            "lccc"
+          ],
+          "round": 0,
+          "runs": {
+            "baseline": {
+              "child_cpu_s": 0.17878200000000177,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/gzip_longest_match_baseline"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "gzip_longest_match checksum=15308096299102938189 reference=15308096299102938189 OK\n",
+              "stdout_sha256": "0c4b48f377a3b7587b93c08a50d4ac95d50f6481915349fa0e32a4998352f508",
+              "wall_s": 0.179135312
+            },
+            "gcc": {
+              "child_cpu_s": 0.15273600000000087,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/gzip_longest_match_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "gzip_longest_match checksum=15308096299102938189 reference=15308096299102938189 OK\n",
+              "stdout_sha256": "0c4b48f377a3b7587b93c08a50d4ac95d50f6481915349fa0e32a4998352f508",
+              "wall_s": 0.153123451
+            },
+            "lccc": {
+              "child_cpu_s": 0.18950900000000104,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/gzip_longest_match_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "gzip_longest_match checksum=15308096299102938189 reference=15308096299102938189 OK\n",
+              "stdout_sha256": "0c4b48f377a3b7587b93c08a50d4ac95d50f6481915349fa0e32a4998352f508",
+              "wall_s": 0.189995462
+            }
+          }
+        },
+        {
+          "order": [
+            "baseline",
+            "lccc",
+            "gcc"
+          ],
+          "round": 1,
+          "runs": {
+            "baseline": {
+              "child_cpu_s": 0.1763949999999994,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/gzip_longest_match_baseline"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "gzip_longest_match checksum=15308096299102938189 reference=15308096299102938189 OK\n",
+              "stdout_sha256": "0c4b48f377a3b7587b93c08a50d4ac95d50f6481915349fa0e32a4998352f508",
+              "wall_s": 0.176909384
+            },
+            "gcc": {
+              "child_cpu_s": 0.15559400000000068,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/gzip_longest_match_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "gzip_longest_match checksum=15308096299102938189 reference=15308096299102938189 OK\n",
+              "stdout_sha256": "0c4b48f377a3b7587b93c08a50d4ac95d50f6481915349fa0e32a4998352f508",
+              "wall_s": 0.15594752
+            },
+            "lccc": {
+              "child_cpu_s": 0.1780779999999993,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/gzip_longest_match_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "gzip_longest_match checksum=15308096299102938189 reference=15308096299102938189 OK\n",
+              "stdout_sha256": "0c4b48f377a3b7587b93c08a50d4ac95d50f6481915349fa0e32a4998352f508",
+              "wall_s": 0.178451228
+            }
+          }
+        },
+        {
+          "order": [
+            "lccc",
+            "gcc",
+            "baseline"
+          ],
+          "round": 2,
+          "runs": {
+            "baseline": {
+              "child_cpu_s": 0.18097600000000114,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/gzip_longest_match_baseline"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "gzip_longest_match checksum=15308096299102938189 reference=15308096299102938189 OK\n",
+              "stdout_sha256": "0c4b48f377a3b7587b93c08a50d4ac95d50f6481915349fa0e32a4998352f508",
+              "wall_s": 0.181421503
+            },
+            "gcc": {
+              "child_cpu_s": 0.1529859999999985,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/gzip_longest_match_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "gzip_longest_match checksum=15308096299102938189 reference=15308096299102938189 OK\n",
+              "stdout_sha256": "0c4b48f377a3b7587b93c08a50d4ac95d50f6481915349fa0e32a4998352f508",
+              "wall_s": 0.15333017
+            },
+            "lccc": {
+              "child_cpu_s": 0.17784200000000183,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/gzip_longest_match_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "gzip_longest_match checksum=15308096299102938189 reference=15308096299102938189 OK\n",
+              "stdout_sha256": "0c4b48f377a3b7587b93c08a50d4ac95d50f6481915349fa0e32a4998352f508",
+              "wall_s": 0.178216502
+            }
+          }
+        },
+        {
+          "order": [
+            "baseline",
+            "lccc",
+            "gcc"
+          ],
+          "round": 3,
+          "runs": {
+            "baseline": {
+              "child_cpu_s": 0.18191199999999697,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/gzip_longest_match_baseline"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "gzip_longest_match checksum=15308096299102938189 reference=15308096299102938189 OK\n",
+              "stdout_sha256": "0c4b48f377a3b7587b93c08a50d4ac95d50f6481915349fa0e32a4998352f508",
+              "wall_s": 0.182268327
+            },
+            "gcc": {
+              "child_cpu_s": 0.1559829999999991,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/gzip_longest_match_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "gzip_longest_match checksum=15308096299102938189 reference=15308096299102938189 OK\n",
+              "stdout_sha256": "0c4b48f377a3b7587b93c08a50d4ac95d50f6481915349fa0e32a4998352f508",
+              "wall_s": 0.156346416
+            },
+            "lccc": {
+              "child_cpu_s": 0.18214800000000153,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/gzip_longest_match_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "gzip_longest_match checksum=15308096299102938189 reference=15308096299102938189 OK\n",
+              "stdout_sha256": "0c4b48f377a3b7587b93c08a50d4ac95d50f6481915349fa0e32a4998352f508",
+              "wall_s": 0.182525414
+            }
+          }
+        },
+        {
+          "order": [
+            "baseline",
+            "lccc",
+            "gcc"
+          ],
+          "round": 4,
+          "runs": {
+            "baseline": {
+              "child_cpu_s": 0.1804060000000014,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/gzip_longest_match_baseline"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "gzip_longest_match checksum=15308096299102938189 reference=15308096299102938189 OK\n",
+              "stdout_sha256": "0c4b48f377a3b7587b93c08a50d4ac95d50f6481915349fa0e32a4998352f508",
+              "wall_s": 0.180802941
+            },
+            "gcc": {
+              "child_cpu_s": 0.1528950000000009,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/gzip_longest_match_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "gzip_longest_match checksum=15308096299102938189 reference=15308096299102938189 OK\n",
+              "stdout_sha256": "0c4b48f377a3b7587b93c08a50d4ac95d50f6481915349fa0e32a4998352f508",
+              "wall_s": 0.153329978
+            },
+            "lccc": {
+              "child_cpu_s": 0.17797399999999897,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/gzip_longest_match_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "gzip_longest_match checksum=15308096299102938189 reference=15308096299102938189 OK\n",
+              "stdout_sha256": "0c4b48f377a3b7587b93c08a50d4ac95d50f6481915349fa0e32a4998352f508",
+              "wall_s": 0.178327084
+            }
+          }
+        },
+        {
+          "order": [
+            "baseline",
+            "gcc",
+            "lccc"
+          ],
+          "round": 5,
+          "runs": {
+            "baseline": {
+              "child_cpu_s": 0.17677699999999774,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/gzip_longest_match_baseline"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "gzip_longest_match checksum=15308096299102938189 reference=15308096299102938189 OK\n",
+              "stdout_sha256": "0c4b48f377a3b7587b93c08a50d4ac95d50f6481915349fa0e32a4998352f508",
+              "wall_s": 0.177293984
+            },
+            "gcc": {
+              "child_cpu_s": 0.15231100000000097,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/gzip_longest_match_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "gzip_longest_match checksum=15308096299102938189 reference=15308096299102938189 OK\n",
+              "stdout_sha256": "0c4b48f377a3b7587b93c08a50d4ac95d50f6481915349fa0e32a4998352f508",
+              "wall_s": 0.152688838
+            },
+            "lccc": {
+              "child_cpu_s": 0.1779950000000028,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/gzip_longest_match_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "gzip_longest_match checksum=15308096299102938189 reference=15308096299102938189 OK\n",
+              "stdout_sha256": "0c4b48f377a3b7587b93c08a50d4ac95d50f6481915349fa0e32a4998352f508",
+              "wall_s": 0.178472938
+            }
+          }
+        },
+        {
+          "order": [
+            "lccc",
+            "baseline",
+            "gcc"
+          ],
+          "round": 6,
+          "runs": {
+            "baseline": {
+              "child_cpu_s": 0.17766299999999902,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/gzip_longest_match_baseline"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "gzip_longest_match checksum=15308096299102938189 reference=15308096299102938189 OK\n",
+              "stdout_sha256": "0c4b48f377a3b7587b93c08a50d4ac95d50f6481915349fa0e32a4998352f508",
+              "wall_s": 0.17805404
+            },
+            "gcc": {
+              "child_cpu_s": 0.15197599999999767,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/gzip_longest_match_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "gzip_longest_match checksum=15308096299102938189 reference=15308096299102938189 OK\n",
+              "stdout_sha256": "0c4b48f377a3b7587b93c08a50d4ac95d50f6481915349fa0e32a4998352f508",
+              "wall_s": 0.15241321
+            },
+            "lccc": {
+              "child_cpu_s": 0.17802700000000016,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/user/lccc/lccc_bench_nang8w61/gzip_longest_match_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "gzip_longest_match checksum=15308096299102938189 reference=15308096299102938189 OK\n",
+              "stdout_sha256": "0c4b48f377a3b7587b93c08a50d4ac95d50f6481915349fa0e32a4998352f508",
+              "wall_s": 0.178434229
+            }
+          }
+        }
+      ],
+      "runs": {
+        "baseline": [
+          {
+            "child_cpu_s": 0.17878200000000177,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/gzip_longest_match_baseline"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "gzip_longest_match checksum=15308096299102938189 reference=15308096299102938189 OK\n",
+            "stdout_sha256": "0c4b48f377a3b7587b93c08a50d4ac95d50f6481915349fa0e32a4998352f508",
+            "wall_s": 0.179135312
+          },
+          {
+            "child_cpu_s": 0.1763949999999994,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/gzip_longest_match_baseline"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "gzip_longest_match checksum=15308096299102938189 reference=15308096299102938189 OK\n",
+            "stdout_sha256": "0c4b48f377a3b7587b93c08a50d4ac95d50f6481915349fa0e32a4998352f508",
+            "wall_s": 0.176909384
+          },
+          {
+            "child_cpu_s": 0.18097600000000114,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/gzip_longest_match_baseline"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "gzip_longest_match checksum=15308096299102938189 reference=15308096299102938189 OK\n",
+            "stdout_sha256": "0c4b48f377a3b7587b93c08a50d4ac95d50f6481915349fa0e32a4998352f508",
+            "wall_s": 0.181421503
+          },
+          {
+            "child_cpu_s": 0.18191199999999697,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/gzip_longest_match_baseline"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "gzip_longest_match checksum=15308096299102938189 reference=15308096299102938189 OK\n",
+            "stdout_sha256": "0c4b48f377a3b7587b93c08a50d4ac95d50f6481915349fa0e32a4998352f508",
+            "wall_s": 0.182268327
+          },
+          {
+            "child_cpu_s": 0.1804060000000014,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/gzip_longest_match_baseline"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "gzip_longest_match checksum=15308096299102938189 reference=15308096299102938189 OK\n",
+            "stdout_sha256": "0c4b48f377a3b7587b93c08a50d4ac95d50f6481915349fa0e32a4998352f508",
+            "wall_s": 0.180802941
+          },
+          {
+            "child_cpu_s": 0.17677699999999774,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/gzip_longest_match_baseline"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "gzip_longest_match checksum=15308096299102938189 reference=15308096299102938189 OK\n",
+            "stdout_sha256": "0c4b48f377a3b7587b93c08a50d4ac95d50f6481915349fa0e32a4998352f508",
+            "wall_s": 0.177293984
+          },
+          {
+            "child_cpu_s": 0.17766299999999902,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/gzip_longest_match_baseline"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "gzip_longest_match checksum=15308096299102938189 reference=15308096299102938189 OK\n",
+            "stdout_sha256": "0c4b48f377a3b7587b93c08a50d4ac95d50f6481915349fa0e32a4998352f508",
+            "wall_s": 0.17805404
+          }
+        ],
+        "gcc": [
+          {
+            "child_cpu_s": 0.15273600000000087,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/gzip_longest_match_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "gzip_longest_match checksum=15308096299102938189 reference=15308096299102938189 OK\n",
+            "stdout_sha256": "0c4b48f377a3b7587b93c08a50d4ac95d50f6481915349fa0e32a4998352f508",
+            "wall_s": 0.153123451
+          },
+          {
+            "child_cpu_s": 0.15559400000000068,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/gzip_longest_match_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "gzip_longest_match checksum=15308096299102938189 reference=15308096299102938189 OK\n",
+            "stdout_sha256": "0c4b48f377a3b7587b93c08a50d4ac95d50f6481915349fa0e32a4998352f508",
+            "wall_s": 0.15594752
+          },
+          {
+            "child_cpu_s": 0.1529859999999985,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/gzip_longest_match_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "gzip_longest_match checksum=15308096299102938189 reference=15308096299102938189 OK\n",
+            "stdout_sha256": "0c4b48f377a3b7587b93c08a50d4ac95d50f6481915349fa0e32a4998352f508",
+            "wall_s": 0.15333017
+          },
+          {
+            "child_cpu_s": 0.1559829999999991,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/gzip_longest_match_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "gzip_longest_match checksum=15308096299102938189 reference=15308096299102938189 OK\n",
+            "stdout_sha256": "0c4b48f377a3b7587b93c08a50d4ac95d50f6481915349fa0e32a4998352f508",
+            "wall_s": 0.156346416
+          },
+          {
+            "child_cpu_s": 0.1528950000000009,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/gzip_longest_match_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "gzip_longest_match checksum=15308096299102938189 reference=15308096299102938189 OK\n",
+            "stdout_sha256": "0c4b48f377a3b7587b93c08a50d4ac95d50f6481915349fa0e32a4998352f508",
+            "wall_s": 0.153329978
+          },
+          {
+            "child_cpu_s": 0.15231100000000097,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/gzip_longest_match_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "gzip_longest_match checksum=15308096299102938189 reference=15308096299102938189 OK\n",
+            "stdout_sha256": "0c4b48f377a3b7587b93c08a50d4ac95d50f6481915349fa0e32a4998352f508",
+            "wall_s": 0.152688838
+          },
+          {
+            "child_cpu_s": 0.15197599999999767,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/gzip_longest_match_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "gzip_longest_match checksum=15308096299102938189 reference=15308096299102938189 OK\n",
+            "stdout_sha256": "0c4b48f377a3b7587b93c08a50d4ac95d50f6481915349fa0e32a4998352f508",
+            "wall_s": 0.15241321
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 0.18950900000000104,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/gzip_longest_match_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "gzip_longest_match checksum=15308096299102938189 reference=15308096299102938189 OK\n",
+            "stdout_sha256": "0c4b48f377a3b7587b93c08a50d4ac95d50f6481915349fa0e32a4998352f508",
+            "wall_s": 0.189995462
+          },
+          {
+            "child_cpu_s": 0.1780779999999993,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/gzip_longest_match_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "gzip_longest_match checksum=15308096299102938189 reference=15308096299102938189 OK\n",
+            "stdout_sha256": "0c4b48f377a3b7587b93c08a50d4ac95d50f6481915349fa0e32a4998352f508",
+            "wall_s": 0.178451228
+          },
+          {
+            "child_cpu_s": 0.17784200000000183,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/gzip_longest_match_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "gzip_longest_match checksum=15308096299102938189 reference=15308096299102938189 OK\n",
+            "stdout_sha256": "0c4b48f377a3b7587b93c08a50d4ac95d50f6481915349fa0e32a4998352f508",
+            "wall_s": 0.178216502
+          },
+          {
+            "child_cpu_s": 0.18214800000000153,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/gzip_longest_match_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "gzip_longest_match checksum=15308096299102938189 reference=15308096299102938189 OK\n",
+            "stdout_sha256": "0c4b48f377a3b7587b93c08a50d4ac95d50f6481915349fa0e32a4998352f508",
+            "wall_s": 0.182525414
+          },
+          {
+            "child_cpu_s": 0.17797399999999897,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/gzip_longest_match_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "gzip_longest_match checksum=15308096299102938189 reference=15308096299102938189 OK\n",
+            "stdout_sha256": "0c4b48f377a3b7587b93c08a50d4ac95d50f6481915349fa0e32a4998352f508",
+            "wall_s": 0.178327084
+          },
+          {
+            "child_cpu_s": 0.1779950000000028,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/gzip_longest_match_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "gzip_longest_match checksum=15308096299102938189 reference=15308096299102938189 OK\n",
+            "stdout_sha256": "0c4b48f377a3b7587b93c08a50d4ac95d50f6481915349fa0e32a4998352f508",
+            "wall_s": 0.178472938
+          },
+          {
+            "child_cpu_s": 0.17802700000000016,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/gzip_longest_match_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "gzip_longest_match checksum=15308096299102938189 reference=15308096299102938189 OK\n",
+            "stdout_sha256": "0c4b48f377a3b7587b93c08a50d4ac95d50f6481915349fa0e32a4998352f508",
+            "wall_s": 0.178434229
+          }
+        ]
+      },
+      "runtime": {
+        "baseline": {
+          "child_cpu": {
+            "cv": 0.012052641280427105,
+            "mad": 0.0020050000000040313,
+            "max": 0.18191199999999697,
+            "mean": 0.17898728571428535,
+            "median": 0.17878200000000177,
+            "median_ci95_bootstrap": [
+              0.17677699999999774,
+              0.18097600000000114
+            ],
+            "min": 0.1763949999999994,
+            "n": 7,
+            "outlier_count_mad": 0,
+            "stdev": 0.002157269548471596
+          },
+          "quality_warnings": [],
+          "raw_wall_s": [
+            0.179135312,
+            0.176909384,
+            0.181421503,
+            0.182268327,
+            0.180802941,
+            0.177293984,
+            0.17805404
+          ],
+          "wall": {
+            "cv": 0.011780094834969099,
+            "mad": 0.0018413280000000032,
+            "max": 0.182268327,
+            "mean": 0.179412213,
+            "median": 0.179135312,
+            "median_ci95_bootstrap": [
+              0.177293984,
+              0.181421503
+            ],
+            "min": 0.176909384,
+            "n": 7,
+            "outlier_count_mad": 0,
+            "stdev": 0.0021134928836916756
+          }
+        },
+        "gcc": {
+          "child_cpu": {
+            "cv": 0.010471129973152457,
+            "mad": 0.0005839999999999179,
+            "max": 0.1559829999999991,
+            "mean": 0.15349728571428553,
+            "median": 0.1528950000000009,
+            "median_ci95_bootstrap": [
+              0.15231100000000097,
+              0.15559400000000068
+            ],
+            "min": 0.15197599999999767,
+            "n": 7,
+            "outlier_count_mad": 1,
+            "stdev": 0.0016072900292404017
+          },
+          "quality_warnings": [],
+          "raw_wall_s": [
+            0.153123451,
+            0.15594752,
+            0.15333017,
+            0.156346416,
+            0.153329978,
+            0.152688838,
+            0.15241321
+          ],
+          "wall": {
+            "cv": 0.010310969193364957,
+            "mad": 0.0006411400000000123,
+            "max": 0.156346416,
+            "mean": 0.15388279757142856,
+            "median": 0.153329978,
+            "median_ci95_bootstrap": [
+              0.152688838,
+              0.15594752
+            ],
+            "min": 0.15241321,
+            "n": 7,
+            "outlier_count_mad": 0,
+            "stdev": 0.0015866807851478157
+          }
+        },
+        "lccc": {
+          "child_cpu": {
+            "cv": 0.02429703710324315,
+            "mad": 5.300000000119098e-05,
+            "max": 0.18950900000000104,
+            "mean": 0.1802247142857151,
+            "median": 0.17802700000000016,
+            "median_ci95_bootstrap": [
+              0.17797399999999897,
+              0.18214800000000153
+            ],
+            "min": 0.17784200000000183,
+            "n": 7,
+            "outlier_count_mad": 2,
+            "stdev": 0.004378926569921416
+          },
+          "quality_warnings": [
+            "2 MAD outlier(s) retained (never silently discarded)"
+          ],
+          "raw_wall_s": [
+            0.189995462,
+            0.178451228,
+            0.178216502,
+            0.182525414,
+            0.178327084,
+            0.178472938,
+            0.178434229
+          ],
+          "wall": {
+            "cv": 0.024410703750704026,
+            "mad": 0.0001241439999999927,
+            "max": 0.189995462,
+            "mean": 0.1806318367142857,
+            "median": 0.178451228,
+            "median_ci95_bootstrap": [
+              0.178327084,
+              0.182525414
+            ],
+            "min": 0.178216502,
+            "n": 7,
+            "outlier_count_mad": 2,
+            "stdev": 0.004409350253977971
+          }
+        }
+      },
+      "source": "/home/user/lccc/tests/benchmark/programs/gzip_longest_match.c",
+      "source_sha256": "18a7a1d5dc782cbfe623ded7eb4d20bebcf75f3613b301f3306c3ec968a8db2b",
+      "tags": [
+        "workload",
+        "gzip",
+        "compression",
+        "branch"
+      ],
+      "warmups": {
+        "baseline": [
+          {
+            "child_cpu_s": 0.1801499999999976,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/gzip_longest_match_baseline"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "gzip_longest_match checksum=15308096299102938189 reference=15308096299102938189 OK\n",
+            "stdout_sha256": "0c4b48f377a3b7587b93c08a50d4ac95d50f6481915349fa0e32a4998352f508",
+            "wall_s": 0.180502478
+          },
+          {
+            "child_cpu_s": 0.17727700000000013,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/gzip_longest_match_baseline"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "gzip_longest_match checksum=15308096299102938189 reference=15308096299102938189 OK\n",
+            "stdout_sha256": "0c4b48f377a3b7587b93c08a50d4ac95d50f6481915349fa0e32a4998352f508",
+            "wall_s": 0.17777031
+          }
+        ],
+        "gcc": [
+          {
+            "child_cpu_s": 0.15253099999999975,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/gzip_longest_match_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "gzip_longest_match checksum=15308096299102938189 reference=15308096299102938189 OK\n",
+            "stdout_sha256": "0c4b48f377a3b7587b93c08a50d4ac95d50f6481915349fa0e32a4998352f508",
+            "wall_s": 0.152843111
+          },
+          {
+            "child_cpu_s": 0.1524279999999969,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/gzip_longest_match_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "gzip_longest_match checksum=15308096299102938189 reference=15308096299102938189 OK\n",
+            "stdout_sha256": "0c4b48f377a3b7587b93c08a50d4ac95d50f6481915349fa0e32a4998352f508",
+            "wall_s": 0.152765001
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 0.17639200000000343,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/gzip_longest_match_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "gzip_longest_match checksum=15308096299102938189 reference=15308096299102938189 OK\n",
+            "stdout_sha256": "0c4b48f377a3b7587b93c08a50d4ac95d50f6481915349fa0e32a4998352f508",
+            "wall_s": 0.176765962
+          },
+          {
+            "child_cpu_s": 0.1829269999999994,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/user/lccc/lccc_bench_nang8w61/gzip_longest_match_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "gzip_longest_match checksum=15308096299102938189 reference=15308096299102938189 OK\n",
+            "stdout_sha256": "0c4b48f377a3b7587b93c08a50d4ac95d50f6481915349fa0e32a4998352f508",
+            "wall_s": 0.183286694
+          }
+        ]
+      },
+      "warnings": []
+    }
+  ],
+  "compilers": [
+    {
+      "binary_sha256": "8ee28891789ea832f8918e1b65afb618d62e299e065bd79a0dc94016764bc8c0",
+      "executable": "/home/user/lccc/target/fastbuild/lccc",
+      "flags": [
+        "-I/home/user/oracles/gcc-16.2.0/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+        "-O2",
+        "-msse2",
+        "-mno-avx"
+      ],
+      "key": "lccc",
+      "label": "LCCC"
+    },
+    {
+      "binary_sha256": "50b91ee7cde2892568ae366c2d87e49d45adafa35bd85dd6bbc404b1a9a9cc0a",
+      "executable": "/home/user/bin/cc16",
+      "flags": [
+        "-O2",
+        "-msse2",
+        "-mno-avx"
+      ],
+      "key": "gcc",
+      "label": "GCC"
+    },
+    {
+      "binary_sha256": "620fe69214c31439447b86eb38af657bbc6bd8f8631cd47cd2801a219d96572c",
+      "executable": "/home/user/audit/baseline/lccc",
+      "flags": [
+        "-I/home/user/oracles/gcc-16.2.0/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/include",
+        "-O2",
+        "-msse2",
+        "-mno-avx"
+      ],
+      "key": "baseline",
+      "label": "LCCC candidate: baseline"
+    }
+  ],
+  "complete": true,
+  "metadata": {
+    "compiler_versions": {
+      "baseline": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0",
+      "gcc": "gcc-16 (GCC) 16.2.0",
+      "lccc": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0"
+    },
+    "cpu_governors": {},
+    "cpu_models": [
+      "Intel(R) Xeon(R) Processor @ 2.60GHz"
+    ],
+    "git": {
+      "repo": "/home/user/lccc",
+      "revision": "69e2dc4dffc64b07031d2b7394c994343fd4093e\n",
+      "status": " M .github/workflows/ci.yml\n M backlog.md\n M include/lcccsimd.h\n M scripts/check_intrinsic_arity.py\n M scripts/ci_local.sh\n M scripts/gen_lcccsimd.py\n M src/frontend/sema/intrinsic_arity.rs\n M src/ir/lowering/expr_builtins_lcccsimd.rs\n M tests/regression/check_legacy_sse_native.py\n M tests/regression/check_legacy_sse_permissions.py\n?? engineering/isa/gcc16-sse-avx-reference.json\n?? engineering/isa/sse-avx-public-api.json\n?? scripts/audit_sse_avx_public_api.py\n?? tests/regression/check_simd_helper_contract.py\n?? tests/regression/native_packed_fp_helpers.c\n"
+    },
+    "hypervisor_detected": true,
+    "meminfo": "MemTotal:        4034452 kB\nMemFree:         1044000 kB\nMemAvailable:    3664328 kB\nBuffers:           18288 kB\nCached:          2754624 kB\nSwapCached:          980 kB\nActive:           770396 kB\nInactive:        2030424 kB\nActive(anon):       5288 kB\nInactive(anon):    23396 kB\nActive(file):     765108 kB\nInactive(file):  2007028 kB\nUnevictable:           8 kB\nMlocked:               4 kB\nSwapTotal:       4194300 kB\nSwapFree:        4189824 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:             11352 kB\nWriteback:             0 kB\nAnonPages:         27692 kB\nMapped:            19908 kB\nShmem:               672 kB\nKReclaimable:     105620 kB\nSlab:             126540 kB\nSReclaimable:     105620 kB\nSUnreclaim:        20920 kB\nKernelStack:        1284 kB\nPageTables:          936 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:     6211524 kB\nCommitted_AS:     146984 kB\nVmallocTotal:   34359738367 kB\nVmallocUsed:        5412 kB\nVmallocChunk:          0 kB\nPercpu:              592 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:       2048 kB\nHugetlb:               0 kB\nDirectMap4k:       36864 kB\nDirectMap2M:     2060288 kB\nDirectMap1G:     4194304 kB",
+    "pinning": {
+      "allowed_cpus": [
+        0,
+        1
+      ],
+      "applied": true,
+      "cpu": 0,
+      "reason": "taskset pinning",
+      "requested": "auto"
+    },
+    "platform": "Linux-6.1.158+-x86_64-with-glibc2.36",
+    "pmu": {
+      "available": false,
+      "perf_event_paranoid": "2",
+      "perf_path": null,
+      "probed": false,
+      "reason": "not probed"
+    },
+    "python": "3.11.2 (main, Apr  8 2026, 01:58:00) [GCC 12.2.0]",
+    "swap": "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n/home/user/swapfile                     file\t\t4194300\t\t4476\t\t-2",
+    "timestamp_utc": "2026-10-26T11:48:45.848728+00:00",
+    "uname": [
+      "Linux",
+      "e2b.local",
+      "6.1.158+",
+      "#1 SMP PREEMPT_DYNAMIC Mon May 11 18:48:24 UTC 2026",
+      "x86_64"
+    ],
+    "work_root": {
+      "candidates": [
+        {
+          "free_bytes": 8130387968,
+          "path": "/home/user/lccc"
+        },
+        {
+          "free_bytes": 8130387968,
+          "path": "/var/tmp"
+        },
+        {
+          "free_bytes": 8130387968,
+          "path": "/tmp"
+        }
+      ],
+      "free_bytes": 8130387968,
+      "reason": "largest writable candidate among repository, /var/tmp, /tmp",
+      "selected": "/home/user/lccc"
+    }
+  },
+  "runner_warnings": [],
+  "schema": "lccc-bench-v2",
+  "settings": {
+    "common_cflags": [
+      "-msse2",
+      "-mno-avx"
+    ],
+    "compiler_order_policy": "randomized independently in every paired round",
+    "opt": "-O2",
+    "outlier_policy": "MAD outliers counted and reported; none are removed",
+    "reps": 7,
+    "seed": 20260810,
+    "skip_perf": false,
+    "timer": "time.perf_counter_ns wall-clock plus resource.RUSAGE_CHILDREN CPU time",
+    "warmup": 2
+  },
+  "unavailable_compilers": {}
+}

@@ -869,13 +869,13 @@ impl I686Codegen {
                     };
                     let imm = Self::operand_to_imm_i64(&args[2]);
                     self.operand_to_eax(&args[0]);
-                    self.state.emit("    movdqu (%eax), %xmm0");
+                    self.state.emit("    movups (%eax), %xmm0");
                     self.operand_to_eax(&args[1]);
-                    self.state.emit("    movdqu (%eax), %xmm1");
+                    self.state.emit("    movups (%eax), %xmm1");
                     self.state
                         .emit_fmt(format_args!("    {} ${}, %xmm1, %xmm0", inst, imm));
                     self.operand_to_eax(&Operand::Value(*dptr));
-                    self.state.emit("    movdqu %xmm0, (%eax)");
+                    self.state.emit("    movups %xmm0, (%eax)");
                 }
             }
 
@@ -1014,11 +1014,11 @@ impl I686Codegen {
                         _ => unreachable!("unexpected SSE float unary op: {:?}", op),
                     };
                     self.operand_to_eax(&args[0]);
-                    self.state.emit("    movdqu (%eax), %xmm0");
+                    self.state.emit("    movups (%eax), %xmm0");
                     self.state
                         .emit_fmt(format_args!("    {} %xmm0, %xmm0", inst));
                     self.operand_to_eax(&Operand::Value(*dptr));
-                    self.state.emit("    movdqu %xmm0, (%eax)");
+                    self.state.emit("    movups %xmm0, (%eax)");
                 }
             }
 
@@ -1168,6 +1168,15 @@ impl I686Codegen {
             IntrinsicOp::CvtSd2Si128 => self.emit_vec_low_to_si32(dest, &args[0], "cvtsd2si"),
             IntrinsicOp::CvttSs2Si128 => self.emit_vec_low_to_si32(dest, &args[0], "cvttss2si"),
             IntrinsicOp::CvttSd2Si128 => self.emit_vec_low_to_si32(dest, &args[0], "cvttsd2si"),
+
+            // Packed-float zero is SSE1; the integer/double API remains SSE2.
+            IntrinsicOp::SetzeroPs128 => {
+                if let Some(dptr) = dest_ptr {
+                    self.state.emit("    xorps %xmm0, %xmm0");
+                    self.operand_to_eax(&Operand::Value(*dptr));
+                    self.state.emit("    movups %xmm0, (%eax)");
+                }
+            }
 
             // 128-bit zero: pxor is the canonical zeroing idiom.
             IntrinsicOp::Setzero128 => {
@@ -2018,7 +2027,8 @@ impl I686Codegen {
 
             IntrinsicOp::Setzero256 => {
                 if let Some(dptr) = dest_ptr {
-                    self.state.emit("    vpxor %ymm0, %ymm0, %ymm0");
+                    // VEX.128 integer XOR is AVX1 and clears the upper YMM half.
+                    self.state.emit("    vpxor %xmm0, %xmm0, %xmm0");
                     self.emit_avx_store_dest(dptr);
                 }
             }
@@ -2346,14 +2356,17 @@ impl I686Codegen {
     /// Emit a binary SSE 128-bit operation: load two 128-bit operands from
     /// pointers, apply the operation, and store the result to dest_ptr.
     fn emit_sse_binary_128(&mut self, dptr: &Value, args: &[Operand], sse_inst: &str) {
+        // MOVUPS preserves the complete register image for float, integer
+        // and double payloads and tolerates unaligned homes. Unlike MOVDQU,
+        // it is legal on SSE1-only CPUs; arithmetic permissions stay separate.
         self.operand_to_eax(&args[0]);
-        self.state.emit("    movdqu (%eax), %xmm0");
+        self.state.emit("    movups (%eax), %xmm0");
         self.operand_to_eax(&args[1]);
-        self.state.emit("    movdqu (%eax), %xmm1");
+        self.state.emit("    movups (%eax), %xmm1");
         self.state
             .emit_fmt(format_args!("    {} %xmm1, %xmm0", sse_inst));
         self.operand_to_eax(&Operand::Value(*dptr));
-        self.state.emit("    movdqu %xmm0, (%eax)");
+        self.state.emit("    movups %xmm0, (%eax)");
     }
 
     /// Load a 256-bit operand (an alloca pointer) into a YMM register via

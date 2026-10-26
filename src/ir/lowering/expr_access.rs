@@ -343,29 +343,43 @@ impl Lowerer {
 
     pub(super) fn lower_compound_literal(
         &mut self,
+        cl_expr: &Expr,
         type_spec: &TypeSpecifier,
         init: &Initializer,
+        storage: &crate::frontend::parser::ast::CompoundLiteralStorage,
     ) -> Operand {
         let ty = self.type_spec_to_ir(type_spec);
         let ctype = self.type_spec_to_ctype(type_spec);
-        let size = self.compound_literal_size(type_spec, init);
-        let alloca = self.alloc_and_init_compound_literal(type_spec, init, ty, size);
-
         let struct_layout = self.get_struct_layout_for_type(type_spec);
         let is_scalar =
             struct_layout.is_none() && !matches!(ctype, CType::Array(_, _)) && !ctype.is_vector();
+
+        let base_addr = if storage.is_static {
+            let label =
+                self.ensure_static_compound_literal_global(cl_expr, type_spec, init, storage);
+            let addr = self.fresh_value();
+            self.emit(Instruction::GlobalAddr {
+                dest: addr,
+                name: label,
+            });
+            addr
+        } else {
+            let size = self.compound_literal_size(type_spec, init);
+            self.alloc_and_init_compound_literal(type_spec, init, ty, size)
+        };
+
         if is_scalar {
             let loaded = self.fresh_value();
             self.emit(Instruction::Load {
                 volatile: false,
                 dest: loaded,
-                ptr: alloca,
+                ptr: base_addr,
                 ty,
                 seg_override: AddressSpace::Default,
             });
             Operand::Value(loaded)
         } else {
-            Operand::Value(alloca)
+            Operand::Value(base_addr)
         }
     }
 
@@ -615,7 +629,7 @@ impl Lowerer {
                     );
                     Some(text.len() + 1)
                 }
-                Expr::CompoundLiteral(ts, init, _) => {
+                Expr::CompoundLiteral(ts, init, _, _) => {
                     if let TypeSpecifier::Array(elem_ts, None) = ts {
                         let elem_sz = self.sizeof_type(elem_ts).max(1);
                         Some(self.compound_literal_size(ts, init) / elem_sz)
@@ -870,7 +884,7 @@ impl Lowerer {
     // Address-of, dereference, subscript, member access
     // -----------------------------------------------------------------------
 
-    fn alloc_and_init_compound_literal(
+    pub(super) fn alloc_and_init_compound_literal(
         &mut self,
         type_spec: &TypeSpecifier,
         init: &Initializer,
@@ -986,7 +1000,17 @@ impl Lowerer {
             return Operand::Const(constant);
         }
 
-        if let Expr::CompoundLiteral(type_spec, init, _) = inner {
+        if let Expr::CompoundLiteral(type_spec, init, _, storage) = inner {
+            if storage.is_static {
+                let label =
+                    self.ensure_static_compound_literal_global(inner, type_spec, init, storage);
+                let addr = self.fresh_value();
+                self.emit(Instruction::GlobalAddr {
+                    dest: addr,
+                    name: label,
+                });
+                return Operand::Value(addr);
+            }
             let ty = self.type_spec_to_ir(type_spec);
             let size = self.compound_literal_size(type_spec, init);
             let alloca = self.alloc_and_init_compound_literal(type_spec, init, ty, size);

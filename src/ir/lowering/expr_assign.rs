@@ -1339,7 +1339,18 @@ impl Lowerer {
                 rhs_val
             };
 
-            let result = self.emit_binop_val(ir_op, loaded_promoted, actual_rhs, op_ty);
+            let result = if self.trapv
+                && self.func_state.is_some()
+                && !self.is_bool_lvalue(lhs)
+                && ty != IrType::Ptr
+                && !is_unsigned
+                && common_ty.is_signed()
+                && matches!(ir_op, IrBinOp::Add | IrBinOp::Sub | IrBinOp::Mul)
+            {
+                self.emit_trapv_signed_binop(ir_op, loaded_promoted, actual_rhs, common_ty, op_ty)
+            } else {
+                self.emit_binop_val(ir_op, loaded_promoted, actual_rhs, op_ty)
+            };
 
             // Conversion to _Bool is `result != 0` in the operation type
             // (C11 6.3.1.2): normalizing after narrowing truncated first, so

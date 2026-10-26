@@ -2513,8 +2513,47 @@ impl Driver {
                 "-fno-rounding-math" => self.fp_rounding_math = false,
                 "-ftrapping-math" => self.fp_trapping_math = true,
                 "-fno-trapping-math" => self.fp_trapping_math = false,
-                "-fwrapv" => self.wrap_signed_overflow = true,
+                "-fwrapv" => {
+                    self.wrap_signed_overflow = true;
+                    self.trapv = false;
+                }
                 "-fno-wrapv" => self.wrap_signed_overflow = false,
+                "-ftrapv" => {
+                    self.trapv = true;
+                    self.wrap_signed_overflow = false;
+                }
+                "-fno-trapv" => self.trapv = false,
+                "-fno-plt" => self.no_plt = true,
+                "-fplt" => self.no_plt = false,
+                arg if arg.starts_with("-fvisibility=") => {
+                    let val = &arg["-fvisibility=".len()..];
+                    match val {
+                        "default" | "hidden" | "internal" | "protected" => {
+                            self.default_visibility = Some(val.to_string());
+                        }
+                        _ => {
+                            return Err(format!(
+                                "{}: unrecognized visibility '{}' (expected default, hidden, internal, or protected)",
+                                arg, val
+                            ));
+                        }
+                    }
+                }
+                arg if arg.starts_with("-ftrivial-auto-var-init=") => {
+                    use crate::ir::lowering::trapv::TrivialAutoVarInit;
+                    let val = &arg["-ftrivial-auto-var-init=".len()..];
+                    self.trivial_auto_var_init = match val {
+                        "uninitialized" => TrivialAutoVarInit::Uninitialized,
+                        "zero" => TrivialAutoVarInit::Zero,
+                        "pattern" => TrivialAutoVarInit::Pattern,
+                        _ => {
+                            return Err(format!(
+                                "{}: unrecognized initialization mode '{}' (expected uninitialized, pattern, or zero)",
+                                arg, val
+                            ));
+                        }
+                    };
+                }
                 // Builtin status and hosted-ness, with GCC 16.2's exact
                 // semantics (measured on the oracle; pinned by
                 // `builtin_flags_match_gcc`): the blanket flags are
@@ -2842,16 +2881,10 @@ impl Driver {
                 // unchecked binary that the caller will not re-verify in the
                 // field is the exact hazard this arm exists to prevent.
                 //
-                // `-fno-trapv` / `-fsanitize-recover=*` style *disable*
-                // requests stay accepted (see the `-mno-` arm) because a
-                // compiler that never emits the instrumentation already
-                // complies with a request to leave it out.
-                arg if arg == "-ftrapv" => {
-                    return Err("-ftrapv: LCCC does not emit signed-overflow traps; \
-                         build without it, or use -fwrapv to state the \
-                         wrapping contract explicitly"
-                        .to_string());
-                }
+                // `-fsanitize=*` promises a checked build; an unchecked binary
+                // that the caller will not re-verify in the field is the exact
+                // hazard this arm exists to prevent. (`-ftrapv` is implemented
+                // above and emits signed-overflow traps.)
                 arg if arg == "-fsanitize" || arg.starts_with("-fsanitize=") => {
                     return Err(format!(
                         "{}: LCCC does not implement sanitizer instrumentation; \
@@ -5079,8 +5112,9 @@ mod cli_tests {
         for arg in [
             "-fstack-protector",
             "-fstack-protector-strong",
-            "-ftrapv",
             "-fsanitize=address",
+            "-fvisibility=bogus",
+            "-ftrivial-auto-var-init=bogus",
             "-fshort-enums",
             "-fpack-struct",
             "-fpack-struct=1",
@@ -5088,8 +5122,8 @@ mod cli_tests {
         ] {
             assert!(try_flag(arg).is_err(), "{arg} must be refused");
         }
-        // ...while the *suppression* spellings of the same families are fine:
-        // LCCC already does not do what they ask to switch off.
+        // ...while the *suppression* spellings of the same families and genuinely
+        // implemented flags are accepted:
         for arg in [
             "-fno-stack-protector",
             "-fno-builtin-memcpy",
@@ -5101,6 +5135,14 @@ mod cli_tests {
             // `set_short_wchar` plumbs the 16-bit `wchar_t` request.
             "-funsigned-char",
             "-fshort-wchar",
+            "-ftrapv",
+            "-fno-trapv",
+            "-fno-plt",
+            "-fplt",
+            "-fvisibility=hidden",
+            "-fvisibility=default",
+            "-ftrivial-auto-var-init=zero",
+            "-ftrivial-auto-var-init=pattern",
         ] {
             assert!(try_flag(arg).is_ok(), "{arg}");
         }
@@ -5493,20 +5535,14 @@ mod cli_tests {
     /// have the same invisible-absence failure mode and must be refused too.
     #[test]
     fn instrumentation_requests_are_refused_not_ignored() {
-        for f in [
-            "-ftrapv",
-            "-fsanitize=address",
-            "-fsanitize=undefined",
-            "-fsanitize",
-        ] {
+        for f in ["-fsanitize=address", "-fsanitize=undefined", "-fsanitize"] {
             assert!(
                 try_flag(f).is_err(),
                 "{f} must be refused, not silently ignored"
             );
         }
-        // The matching *disable* requests stay accepted: a compiler that never
-        // emits the instrumentation already complies.
-        for f in ["-fno-trapv", "-fsanitize-recover=all"] {
+        // Implemented trapv and sanitizer-disable requests are accepted.
+        for f in ["-ftrapv", "-fno-trapv", "-fsanitize-recover=all"] {
             assert!(try_flag(f).is_ok(), "{f} must be accepted");
         }
     }

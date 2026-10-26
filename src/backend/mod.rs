@@ -92,6 +92,10 @@ pub(crate) struct CodegenOptions {
     /// `-fpie`). Unlike full PIC, ordinary data definitions in the executable
     /// are non-preemptible and may use direct RIP-relative references.
     pub(crate) pie: bool,
+    /// `-fno-plt`: call external/interposable functions indirectly through the
+    /// GOT (`call *sym@GOTPCREL(%rip)` on x86-64, `call *sym@GOT[(%ebx)]` on
+    /// i686) instead of emitting PLT stubs.
+    pub(crate) no_plt: bool,
     /// Whether the output is a SHARED OBJECT (`-shared`). Kept separate from
     /// `pic` on purpose: Local-Exec TLS (`%fs:sym@TPOFF`) is a link-time
     /// constant in every executable, PIE included, but the linker rejects

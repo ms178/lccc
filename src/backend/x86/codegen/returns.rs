@@ -215,7 +215,7 @@ impl X86Codegen {
                     self.load_bits64_to_xmm0(val);
                 } else {
                     self.operand_to_rax(val);
-                    self.state.emit("    movq %rax, %xmm0");
+                    self.emit_scalar_gpr_to_xmm("rax", "eax", "xmm0", false);
                 }
             }
             self.emit_epilogue_and_ret_impl(frame_size);
@@ -229,11 +229,11 @@ impl X86Codegen {
     }
 
     pub(super) fn emit_return_f32_to_reg_impl(&mut self) {
-        self.state.emit("    movd %eax, %xmm0");
+        self.emit_scalar_gpr_to_xmm("rax", "eax", "xmm0", true);
     }
 
     pub(super) fn emit_return_f64_to_reg_impl(&mut self) {
-        self.state.emit("    movq %rax, %xmm0");
+        self.emit_scalar_gpr_to_xmm("rax", "eax", "xmm0", false);
     }
 
     pub(super) fn emit_return_i128_to_regs_impl(&mut self) {
@@ -248,11 +248,11 @@ impl X86Codegen {
             match (c0, c1) {
                 (EightbyteClass::Integer, EightbyteClass::Sse) => {
                     // Second eightbyte is SSE: move rdx -> xmm0
-                    self.state.emit("    movq %rdx, %xmm0");
+                    self.emit_scalar_gpr_to_xmm("rdx", "edx", "xmm0", false);
                 }
                 (EightbyteClass::Sse, EightbyteClass::Integer) => {
                     // First eightbyte is SSE: rax -> xmm0, rdx -> rax
-                    self.state.emit("    movq %rax, %xmm0");
+                    self.emit_scalar_gpr_to_xmm("rax", "eax", "xmm0", false);
                     self.state.emit("    movq %rdx, %rax");
                 }
                 (EightbyteClass::Sse, EightbyteClass::Sse) => {
@@ -261,9 +261,9 @@ impl X86Codegen {
                     // SetReturnF64Second (IS-02 all-SSE struct returns),
                     // xmm1 already holds it and %rdx is zero — write xmm0
                     // only.
-                    self.state.emit("    movq %rax, %xmm0");
+                    self.emit_scalar_gpr_to_xmm("rax", "eax", "xmm0", false);
                     if !self.func_set_second_ret {
-                        self.state.emit("    movq %rdx, %xmm1");
+                        self.emit_scalar_gpr_to_xmm("rdx", "edx", "xmm1", false);
                     }
                 }
                 _ => {} // INTEGER+INTEGER: already correct

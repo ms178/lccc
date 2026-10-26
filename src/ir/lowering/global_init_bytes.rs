@@ -550,7 +550,7 @@ impl Lowerer {
             return None;
         };
         match expr {
-            Expr::CompoundLiteral(_, inner, _) => match inner.as_ref() {
+            Expr::CompoundLiteral(_, inner, _, _) => match inner.as_ref() {
                 Initializer::List(items) => Some(items),
                 // `(T)x` is a scalar compound literal; some paths already
                 // handle it, and none of them treats it as a braced list.
@@ -570,7 +570,7 @@ impl Lowerer {
             return None;
         };
         match expr {
-            Expr::CompoundLiteral(_, inner, _) => match inner.as_ref() {
+            Expr::CompoundLiteral(_, inner, _, _) => match inner.as_ref() {
                 Initializer::Expr(inner_expr) => Some(inner_expr),
                 Initializer::List(_) => None,
             },

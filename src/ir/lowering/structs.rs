@@ -666,8 +666,8 @@ impl Lowerer {
             return self.get_struct_base_addr(selected);
         }
         match expr {
-            Expr::ConvertVector(_, _, _) => {
-                // Lowering returns the 16-byte result alloca pointer.
+            Expr::ConvertVector(_, _, _) | Expr::BitCast(_, _, _) => {
+                // Lowering returns the result alloca pointer.
                 let op = self.lower_expr(expr);
                 return self.operand_to_value(op);
             }
@@ -1444,8 +1444,8 @@ impl Lowerer {
                 // Also try: base is a pointer to struct/union (for ptr[i] patterns)
                 self.get_pointed_struct_layout(base)
             }
-            Expr::CompoundLiteral(type_spec, _, _) => {
-                // Compound literal: (struct tag){...} - get layout from the type specifier
+            Expr::CompoundLiteral(type_spec, _, _, _) | Expr::BitCast(type_spec, _, _) => {
+                // Compound literal / bit_cast: get layout from the type specifier
                 self.get_struct_layout_for_type(type_spec)
             }
             Expr::Deref(inner, _) => {

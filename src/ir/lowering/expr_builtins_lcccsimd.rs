@@ -38,7 +38,6 @@ pub(super) fn lccc_simd_lookup(
     // emitters use a uniform "imm = args.last()" rule.
     let b = |c, o| Some((c, o, false, 2usize));
     let u = |c, o| Some((c, o, false, 1usize));
-    let bi = |c, o| Some((c, o, true, 2usize));
     let ui = |c, o| Some((c, o, true, 1usize));
     let t = |c, o| Some((c, o, true, 2usize));
     let t3 = |c, o| Some((c, o, true, 3usize));
@@ -127,15 +126,15 @@ pub(super) fn lccc_simd_lookup(
         "vpackssdw512" => b(Vec512, Packssdw512),
         "vpackusdw512" => b(Vec512, Packusdw512),
         // ---- shifts/shuffles with immediate ----
-        "vpsllw512" => bi(Vec512, Psllwi512),
-        "vpsrlw512" => bi(Vec512, Psrlwi512),
-        "vpsraw512" => bi(Vec512, Psrawi512),
-        "vpslld512" => bi(Vec512, Psllidi512),
-        "vpsrld512" => bi(Vec512, Psrlidi512),
-        "vpsrad512" => bi(Vec512, Psradi512),
-        "vpsllq512" => bi(Vec512, Psllqi512),
-        "vpsrlq512" => bi(Vec512, Psrlqi512),
-        "vpsraq512" => bi(Vec512, Psraqi512),
+        "vpsllw512" => ui(Vec512, Psllwi512),
+        "vpsrlw512" => ui(Vec512, Psrlwi512),
+        "vpsraw512" => ui(Vec512, Psrawi512),
+        "vpslld512" => ui(Vec512, Psllidi512),
+        "vpsrld512" => ui(Vec512, Psrlidi512),
+        "vpsrad512" => ui(Vec512, Psradi512),
+        "vpsllq512" => ui(Vec512, Psllqi512),
+        "vpsrlq512" => ui(Vec512, Psrlqi512),
+        "vpsraq512" => ui(Vec512, Psraqi512),
         "vpshufd512" => ui(Vec512, Pshufd512),
         "vpshuflw512" => ui(Vec512, Pshuflw512),
         "vpshufhw512" => ui(Vec512, Pshufhw512),
@@ -414,7 +413,109 @@ pub(super) fn lccc_simd_lookup(
     }
 }
 
+/// Legacy native helper permissions follow the encoded instruction, not the
+/// result carrier: AVX conversions can return 128 bits, and 128-bit VPERMIL
+/// is still AVX. AVX-512 has separate subset requirements outside this audit.
+fn legacy_simd_feature(
+    mnemonic: &str,
+) -> Option<(crate::common::x86_features::X86Feature, &'static str)> {
+    use crate::common::x86_features::X86Feature as F;
+    if mnemonic.ends_with("512") {
+        return None;
+    }
+    Some(if mnemonic.contains("fmadd") {
+        (F::Fma, "-mfma")
+    } else if mnemonic.starts_with('v') {
+        (F::Avx, "-mavx")
+    } else {
+        match mnemonic {
+            "divps128" | "minps128" | "maxps128" | "sqrtps128" | "rcpps128" | "rsqrtps128"
+            | "andps128" | "andnps128" | "orps128" | "xorps128" | "addss128" | "subss128"
+            | "mulss128" | "divss128" | "minss128" | "maxss128" | "sqrtss128" | "rcpss128"
+            | "rsqrtss128" | "cmpps128" | "shufps128" | "unpcklps128" | "unpckhps128"
+            | "movmskps128" | "movss128" | "cvtsi2ss128" | "cvtsi2ss64_128" | "cvtss2si128"
+            | "cvttss2si128" => (F::Sse, "-msse"),
+            "haddps128" | "hsubps128" | "addsubps128" | "haddpd128" | "hsubpd128"
+            | "addsubpd128" | "movddup128" | "movsldup128" | "movshdup128" => (F::Sse3, "-msse3"),
+            "roundps128" | "roundpd128" | "blendps128" | "blendpd128" | "blendvps128"
+            | "blendvpd128" | "dpps128" | "dppd128" | "insertps128" | "extractps128" => {
+                (F::Sse41, "-msse4.1")
+            }
+            _ => (F::Sse2, "-msse2"),
+        }
+    })
+}
+
 impl Lowerer {
+    /// Keep packed FP helpers in the same register-valued IR as native vector
+    /// arithmetic. The legacy address result remains an addressable object;
+    /// whole-vector stores/loads let vec_ssa eliminate it instead of hiding
+    /// the producer behind the pointer-result instruction family.
+    fn try_native_packed_fp_helper(&mut self, op: IntrinsicOp, args: &[Expr]) -> Option<Operand> {
+        use IntrinsicOp::*;
+        let (native, element, bytes) = match op {
+            DivPs128 => (VecDivF32x4, IrType::F32, 16),
+            MinPs128 => (VecMinF32x4, IrType::F32, 16),
+            MaxPs128 => (VecMaxF32x4, IrType::F32, 16),
+            SqrtPs128 => (VecSqrtF32x4, IrType::F32, 16),
+            DivPd128 => (VecDivF64x2, IrType::F64, 16),
+            MinPd128 => (VecMinF64x2, IrType::F64, 16),
+            MaxPd128 => (VecMaxF64x2, IrType::F64, 16),
+            SqrtPd128 => (VecSqrtF64x2, IrType::F64, 16),
+            DivPs256 => (VecDivF32x8, IrType::F32, 32),
+            MinPs256 => (VecMinF32x8, IrType::F32, 32),
+            MaxPs256 => (VecMaxF32x8, IrType::F32, 32),
+            SqrtPs256 => (VecSqrtF32x8, IrType::F32, 32),
+            DivPd256 => (VecDivF64x4, IrType::F64, 32),
+            MinPd256 => (VecMinF64x4, IrType::F64, 32),
+            MaxPd256 => (VecMaxF64x4, IrType::F64, 32),
+            SqrtPd256 => (VecSqrtF64x4, IrType::F64, 32),
+            _ => return None,
+        };
+        if self.target != crate::backend::Target::X86_64 {
+            return None;
+        }
+        // The 128-bit double wrapper still crosses an I128 carrier at inline
+        // returns. Until that bridge is native, this route adds spills (the
+        // ordered FP fixture measures 74 -> 89 provider instructions). Keep
+        // its established pointer emitter; wide doubles have no I128 bridge.
+        if bytes == 16 && element == IrType::F64 {
+            return None;
+        }
+        // Resolve the complete plan before evaluating any operand. Volatile,
+        // foreign address spaces and mismatched types retain the legacy path.
+        let types: Vec<_> = args.iter().map(|arg| self.expr_ctype(arg)).collect();
+        let shape = super::vector_simd::simd_shape(types.first()?)?;
+        if shape.bytes != bytes || shape.elem_ir != element {
+            return None;
+        }
+        for (arg, ty) in args.iter().zip(&types) {
+            let other = super::vector_simd::simd_shape(ty)?;
+            if other.bytes != bytes
+                || other.elem_ir != element
+                || self.expr_access_is_volatile(arg)
+                || self.aggregate_lvalue_space(arg) != crate::common::types::AddressSpace::Default
+            {
+                return None;
+            }
+        }
+        let mut operands = Vec::with_capacity(args.len());
+        for (arg, ty) in args.iter().zip(&types) {
+            let ptr = self.vector_operand_ptr(arg, ty);
+            operands.push(Operand::Value(self.emit_vec_load(&shape, ptr)));
+        }
+        let value = self.fresh_value();
+        self.emit(Instruction::Intrinsic {
+            dest: Some(value),
+            op: native,
+            dest_ptr: None,
+            args: operands,
+        });
+        let result = self.emit_entry_alloca(IrType::Ptr, bytes, bytes, false);
+        self.emit_vec_store(&shape, value, result);
+        Some(Operand::Value(result))
+    }
+
     /// Lower a call to the generic SIMD family.
     /// Name format: `__lccc_simd{128|256|512}_{i|ps|pd}_{mnemonic}`.
     pub(super) fn lower_lccc_simd(&mut self, name: &str, args: &[Expr]) -> Option<Operand> {
@@ -423,14 +524,56 @@ impl Lowerer {
         let (_class_s, mnemonic) = rest.split_once('_')?;
         // Table keys are "<insn><width>" (e.g. vpaddd512); some special forms
         // carry their own suffix (e.g. vinserti32x4_512). Try both.
-        let (class, op, has_imm, nargs) = lccc_simd_lookup(mnemonic)
-            .or_else(|| lccc_simd_lookup(&format!("{}{}", mnemonic, width_s)))?;
+        let suffixed;
+        let (canonical, (class, op, has_imm, nargs)) =
+            if let Some(spec) = lccc_simd_lookup(mnemonic) {
+                (mnemonic, spec)
+            } else {
+                suffixed = format!("{}{}", mnemonic, width_s);
+                let Some(spec) = lccc_simd_lookup(&suffixed) else {
+                    return self.reject_builtin_call(
+                        format!("unknown SIMD helper instruction '{mnemonic}' in '{name}'"),
+                        args,
+                        64,
+                    );
+                };
+                (suffixed.as_str(), spec)
+            };
+        // The table, not a caller-supplied prototype, owns this contract.
+        // Never silently truncate extra operands or hand too few to codegen.
+        if args.len() != nargs + 1 {
+            return self.reject_builtin_call(
+                format!(
+                    "'{name}' requires {} arguments including the leading control argument, but {} were provided",
+                    nargs + 1,
+                    args.len()
+                ),
+                args,
+                64,
+            );
+        }
         let width = match class {
             LcccSimdClass::Vec128 => 16usize,
             LcccSimdClass::Vec256 => 32,
             LcccSimdClass::Vec512 => 64,
             _ => 0,
         };
+        if !matches!(
+            self.target,
+            crate::backend::Target::X86_64 | crate::backend::Target::I686
+        ) {
+            return self.reject_builtin_call(
+                format!("'{name}' is not available on {}", self.target.triple()),
+                args,
+                width.max(16),
+            );
+        }
+        if let Some((feature, flag)) = legacy_simd_feature(canonical) {
+            self.check_x86_simd_feature(feature, flag, name, args);
+        }
+        if let Some(result) = self.try_native_packed_fp_helper(op, &args[1..]) {
+            return Some(result);
+        }
         // Drop the leading dummy/imm argument; keep exactly nargs real
         // operands; re-append the immediate (if any) as the LAST operand.
         let mut arg_ops: Vec<Operand> = args
@@ -508,5 +651,64 @@ fn _class_doc(c: LcccSimdClass) -> &'static str {
         LcccSimdClass::Vec512 => "64-byte vector result",
         LcccSimdClass::Scalar => "scalar GPR result",
         LcccSimdClass::PtrStore => "store through dest pointer",
+    }
+}
+
+#[cfg(test)]
+mod legacy_permission_tests {
+    use super::legacy_simd_feature;
+    use crate::common::x86_features::X86Feature as F;
+
+    #[test]
+    fn every_generated_helper_prototype_agrees_with_operand_metadata() {
+        let mut checked = 0;
+        let mut unmapped = std::collections::BTreeSet::new();
+        for line in include_str!("../../../include/lcccsimd.h").lines() {
+            let line = line.trim();
+            if !line.ends_with(");") || line.contains('{') {
+                continue;
+            }
+            let Some((_, rest)) = line.split_once("__lccc_simd") else {
+                continue;
+            };
+            let (name, parameters) = rest.split_once('(').expect("helper prototype");
+            let mut fields = name.splitn(3, '_');
+            let width = fields.next().expect("width");
+            let _kind = fields.next().expect("kind");
+            let mnemonic = fields.next().expect("mnemonic");
+            let Some((_, _, _, operands)) = super::lccc_simd_lookup(mnemonic)
+                .or_else(|| super::lccc_simd_lookup(&format!("{mnemonic}{width}")))
+            else {
+                unmapped.insert(name);
+                continue;
+            };
+            assert_eq!(parameters.split(',').count(), operands + 1, "{name}");
+            checked += 1;
+        }
+        assert!(checked > 250, "vacuous helper audit: {checked}");
+        // Explicit ratchet, not a blanket skip: these historical vector-result
+        // AVX512 declarations have no lowering. Valid calls now diagnose;
+        // SIMD-TYPE-1 records their removal or supported-contract replacement.
+        assert_eq!(
+            unmapped,
+            std::collections::BTreeSet::from(["512_i_vpcmpeqb512", "512_i_vpcmpeqw512",])
+        );
+    }
+
+    #[test]
+    fn source_instruction_not_result_width_owns_permission() {
+        for (mnemonic, feature) in [
+            ("minps128", F::Sse),
+            ("cvtpd2ps128", F::Sse2),
+            ("haddps128", F::Sse3),
+            ("roundps128", F::Sse41),
+            ("vcvtpd2ps256", F::Avx),
+            ("vextractf128", F::Avx),
+            ("vpermilps128", F::Avx),
+            ("fmadd132ps128", F::Fma),
+        ] {
+            assert_eq!(legacy_simd_feature(mnemonic).unwrap().0, feature);
+        }
+        assert!(legacy_simd_feature("vcvtpd2ps512").is_none());
     }
 }

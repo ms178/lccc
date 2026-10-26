@@ -284,6 +284,12 @@ pub struct TypeContext {
     anon_ctype_counter: std::cell::Cell<u32>,
     /// Counter for shadowing record definitions; see `next_struct_variant_id`.
     struct_variant_counter: std::cell::Cell<u64>,
+    /// Folded scalar and member values of C23 `(constexpr T){...}` compound literals,
+    /// keyed by `(ExprId::of(cl_expr), path)` (`""` for scalar, `".a.b"` for member).
+    pub constexpr_compound_literals: FxHashMap<
+        (crate::frontend::parser::ast::ExprId, String),
+        crate::common::symbol_table::FoldedValue,
+    >,
 }
 
 // We cannot directly implement `StructLayoutProvider` for `TypeContext` because
@@ -314,6 +320,7 @@ impl TypeContext {
             scope_stack: RefCell::new(Vec::new()),
             anon_ctype_counter: std::cell::Cell::new(0),
             struct_variant_counter: std::cell::Cell::new(0),
+            constexpr_compound_literals: FxHashMap::default(),
         };
         tc.seed_builtin_typedefs();
         tc

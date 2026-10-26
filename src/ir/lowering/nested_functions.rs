@@ -403,13 +403,13 @@ impl Lowerer {
             Expr::MemberAccess(a, _, _) | Expr::PointerMemberAccess(a, _, _) => {
                 self.capture_expr(a, visible, scopes, result);
             }
-            Expr::CompoundLiteral(_, init, _) => {
+            Expr::CompoundLiteral(_, init, _, _) => {
                 self.capture_initializer(init, visible, scopes, result);
             }
             Expr::StmtExpr(compound, _) => {
                 self.capture_compound(compound, visible, &FxHashSet::default(), scopes, result);
             }
-            Expr::VaArg(a, _, _) | Expr::ConvertVector(a, _, _) => {
+            Expr::VaArg(a, _, _) | Expr::ConvertVector(a, _, _) | Expr::BitCast(_, a, _) => {
                 self.capture_expr(a, visible, scopes, result);
             }
             Expr::GenericSelection(c, assoc, _) => {

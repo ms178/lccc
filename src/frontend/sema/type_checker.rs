@@ -379,10 +379,25 @@ impl<'a> ExprTypeChecker<'a> {
                 self.infer_call_return_ctype(func)
             }
 
-            // VaArg and CompoundLiteral: type from type specifier
+            // VaArg, ConvertVector, BitCast, and CompoundLiteral: type from type specifier
             Expr::VaArg(_, type_spec, _)
             | Expr::ConvertVector(_, type_spec, _)
-            | Expr::CompoundLiteral(type_spec, _, _) => Some(self.resolve_type_spec(type_spec)),
+            | Expr::BitCast(type_spec, _, _) => Some(self.resolve_type_spec(type_spec)),
+            Expr::CompoundLiteral(type_spec, init, _, _) => {
+                let ct = self.resolve_type_spec(type_spec);
+                match ct {
+                    CType::Array(elem, None) => {
+                        let count = match init.as_ref() {
+                            crate::frontend::parser::ast::Initializer::List(items) => {
+                                Some(items.len())
+                            }
+                            _ => None,
+                        };
+                        Some(CType::Array(elem, count))
+                    }
+                    other => Some(other),
+                }
+            }
 
             // Statement expression: type of the last expression statement
             Expr::StmtExpr(compound, _) => {
@@ -966,14 +981,17 @@ impl<'a> ExprTypeChecker<'a> {
         while let Expr::MemberAccess(base, _, _) = root {
             root = base;
         }
-        let Expr::Identifier(name, _) = root else {
-            return None;
-        };
-        if std::ptr::eq(root, expr) && self.symbols.is_enumerator(name) {
-            return Some(NamedConstant::Integer);
-        }
-        if !self.symbols.is_constexpr(name) {
-            return None;
+        match root {
+            Expr::CompoundLiteral(_, _, _, st) if st.is_constexpr => {}
+            Expr::Identifier(name, _) => {
+                if std::ptr::eq(root, expr) && self.symbols.is_enumerator(name) {
+                    return Some(NamedConstant::Integer);
+                }
+                if !self.symbols.is_constexpr(name) {
+                    return None;
+                }
+            }
+            _ => return None,
         }
         let ty = self.infer_expr_ctype(expr)?;
         if ty.is_integer() {
@@ -1674,13 +1692,20 @@ impl<'a> ExprTypeChecker<'a> {
     }
 
     fn infer_c2y_builtin_ctype(&self, name: &str, args: &[Expr]) -> Option<CType> {
-        use crate::frontend::sema::stdbit;
+        use crate::frontend::sema::{gcc16_builtins, stdbit};
         if stdbit::is_stdc_bit_builtin(name) {
             let arg0_ct = args
                 .first()
                 .and_then(|a| self.infer_expr_ctype(a))
                 .map(|ct| ct.decayed_value_ctype());
             return stdbit::stdc_bit_return_ctype(name, arg0_ct.as_ref());
+        }
+        if gcc16_builtins::is_gcc16_extra_builtin(name) {
+            let arg0_ct = args
+                .first()
+                .and_then(|a| self.infer_expr_ctype(a))
+                .map(|ct| ct.decayed_value_ctype());
+            return gcc16_builtins::gcc16_builtin_return_ctype(name, arg0_ct.as_ref());
         }
         match name {
             "__builtin_counted_by_ref" => {

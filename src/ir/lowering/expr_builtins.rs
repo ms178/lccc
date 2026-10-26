@@ -752,7 +752,7 @@ impl Lowerer {
 
     /// Reject a builtin call, lower the arguments for their side effects, and
     /// return a placeholder of `bytes` bytes.
-    fn reject_builtin_call(
+    pub(super) fn reject_builtin_call(
         &mut self,
         message: String,
         args: &[Expr],
@@ -1008,7 +1008,7 @@ impl Lowerer {
     /// symbol the driver defines in this same translation unit, so it needs no
     /// relocation model support beyond an ordinary global and is CSE-able by
     /// later passes when the answer is re-used.
-    fn emit_cpu_probe_read(&mut self, probe: crate::common::cpu_probe::Probe) -> Value {
+    pub(super) fn emit_cpu_probe_read(&mut self, probe: crate::common::cpu_probe::Probe) -> Value {
         let addr = self.fresh_value();
         self.emit(Instruction::GlobalAddr {
             dest: addr,
@@ -1097,6 +1097,12 @@ impl Lowerer {
             BuiltinIntrinsic::CountedByRef => self.lower_counted_by_ref(args),
             BuiltinIntrinsic::AssocBarrier => self.lower_assoc_barrier(args),
             BuiltinIntrinsic::ClearPadding => self.lower_clear_padding(args),
+            BuiltinIntrinsic::Gcc16GenericBit => self.lower_gcc16_generic_bit_builtin(name, args),
+            BuiltinIntrinsic::Gcc16Carry => self.lower_gcc16_carry_builtin(name, args),
+            BuiltinIntrinsic::Gcc16BswapBitrev => self.lower_gcc16_bswap_bitrev_builtin(name, args),
+            BuiltinIntrinsic::IsSignaling => self.lower_gcc16_issignaling(args),
+            BuiltinIntrinsic::IsEqSig => self.lower_gcc16_iseqsig(args),
+            BuiltinIntrinsic::SpeculationSafeValue => self.lower_gcc16_speculation_safe(args),
             // __builtin_classify_type(expr) -> GCC type class integer
             BuiltinIntrinsic::ClassifyType => Some(Operand::Const(IrConst::I64(
                 self.classify_type_of(args.first()),
@@ -1403,6 +1409,7 @@ impl Lowerer {
             | BuiltinIntrinsic::X86Punpcklqdq128
             | BuiltinIntrinsic::X86Punpckhqdq128
             | BuiltinIntrinsic::X86Setzero128
+            | BuiltinIntrinsic::X86SetzeroPs128
             | BuiltinIntrinsic::X86Testz128
             | BuiltinIntrinsic::X86Pmulld256
             | BuiltinIntrinsic::X86Psubd256
@@ -2701,6 +2708,35 @@ impl Lowerer {
         name: &str,
         args: &[Expr],
     ) {
+        if let Some(requirement) = x86_intrinsic_required_feature(intrinsic) {
+            self.check_x86_feature_requirement(requirement, name, args);
+        }
+    }
+
+    pub(super) fn check_x86_simd_feature(
+        &mut self,
+        feature: crate::common::x86_features::X86Feature,
+        flag: &'static str,
+        name: &str,
+        args: &[Expr],
+    ) {
+        self.check_x86_feature_requirement(
+            IntrinsicRequirement {
+                feature,
+                flag,
+                also: None,
+            },
+            name,
+            args,
+        );
+    }
+
+    fn check_x86_feature_requirement(
+        &mut self,
+        requirement: IntrinsicRequirement,
+        name: &str,
+        args: &[Expr],
+    ) {
         let span = args
             .first()
             .map(|a| a.span())
@@ -2715,16 +2751,15 @@ impl Lowerer {
         if !matches!(crate::common::types::target_elf_machine(), 3 | 62) {
             return;
         }
-        let Some(requirement) = x86_intrinsic_required_feature(intrinsic) else {
-            return;
-        };
         let mut permitted = crate::common::x86_features::effective().contains(requirement.feature);
         // Legacy 128-bit extensions keep the same register/ABI class under a
         // function target attribute. Honor that local permission without leaking
         // it into another function or claiming per-function wider-vector support.
         use crate::common::x86_features::X86Feature as F;
         let needed = match requirement.feature {
+            F::Sse => Some(0),
             F::Sse2 => Some(1),
+            F::Sse3 => Some(2),
             F::Avx2 => Some(7),
             F::Avx => Some(6),
             F::Ssse3 => Some(3),
@@ -2966,6 +3001,39 @@ impl Lowerer {
                 args,
                 16,
             );
+        }
+        // Native packed arithmetic belongs to the ordinary typed Vec* /
+        // vecSSA pipeline, rather than address-only legacy temporaries.
+        // Require the actual lane type and width: raw GNU arguments with a
+        // different register image must retain the legacy bit interpretation.
+        use crate::frontend::parser::ast::BinOp;
+        let packed = match intrinsic {
+            BuiltinIntrinsic::X86AddPs => Some((BinOp::Add, CType::Float, 16)),
+            BuiltinIntrinsic::X86SubPs => Some((BinOp::Sub, CType::Float, 16)),
+            BuiltinIntrinsic::X86MulPs => Some((BinOp::Mul, CType::Float, 16)),
+            BuiltinIntrinsic::X86AddPd => Some((BinOp::Add, CType::Double, 16)),
+            BuiltinIntrinsic::X86SubPd => Some((BinOp::Sub, CType::Double, 16)),
+            BuiltinIntrinsic::X86MulPd => Some((BinOp::Mul, CType::Double, 16)),
+            BuiltinIntrinsic::X86AddPs256 => Some((BinOp::Add, CType::Float, 32)),
+            BuiltinIntrinsic::X86SubPs256 => Some((BinOp::Sub, CType::Float, 32)),
+            BuiltinIntrinsic::X86MulPs256 => Some((BinOp::Mul, CType::Float, 32)),
+            BuiltinIntrinsic::X86AddPd256 => Some((BinOp::Add, CType::Double, 32)),
+            BuiltinIntrinsic::X86SubPd256 => Some((BinOp::Sub, CType::Double, 32)),
+            BuiltinIntrinsic::X86MulPd256 => Some((BinOp::Mul, CType::Double, 32)),
+            _ => None,
+        };
+        if let (Some((binary, element, width)), [lhs, rhs]) = (packed, args) {
+            if let Some(ct) = self.get_expr_ctype(lhs) {
+                let same_lanes = |ty: &CType| {
+                    ty.size() == width && ty.vector_info().is_some_and(|(e, _)| *e == element)
+                };
+                if same_lanes(&ct) && self.get_expr_ctype(rhs).is_some_and(|ty| same_lanes(&ty)) {
+                    if let Some(result) = self.try_lower_vector_binary_simd(&binary, lhs, rhs, &ct)
+                    {
+                        return Some(result);
+                    }
+                }
+            }
         }
         let op = x86_intrinsic_op(intrinsic);
         match x86_intrinsic_kind(intrinsic) {
@@ -3429,6 +3497,157 @@ struct IntrinsicRequirement {
     also: Option<&'static str>,
 }
 
+// Direct calls to these builtins are lowered at the call site, never by
+// calling the C wrapper body. Address-taken wrappers still need their body.
+pub(super) fn is_feature_checked_x86_builtin(name: &str) -> bool {
+    matches!(builtins::resolve_builtin(name).map(|info| &info.kind),
+        Some(BuiltinKind::Intrinsic(intrinsic)) if x86_intrinsic_required_feature(intrinsic).is_some())
+}
+
+/// SSE1 and SSE2 share XMM carriers but must retain independent permissions.
+fn legacy_xmm_intrinsic_required_feature(
+    intrinsic: &BuiltinIntrinsic,
+) -> Option<IntrinsicRequirement> {
+    use crate::common::x86_features::X86Feature as F;
+    use BuiltinIntrinsic as B;
+    Some(match intrinsic {
+        // Public and raw spellings share an intrinsic identity. SSE1 floating
+        // arithmetic must not bypass permission checks, nor imply SSE2 integer
+        // or double arithmetic merely because the register class is the same.
+        B::X86SetzeroPs128
+        | B::X86XorPs
+        | B::X86AndPs
+        | B::X86OrPs
+        | B::X86AndnPs
+        | B::X86AddPs
+        | B::X86SubPs
+        | B::X86MulPs
+        | B::X86AddSs
+        | B::X86SubSs
+        | B::X86MulSs
+        | B::X86DivSs
+        | B::X86MinSs
+        | B::X86MaxSs
+        | B::X86SqrtSs
+        | B::X86MaxPs128
+        | B::X86MinPs128
+        | B::X86ShufPsValue
+        | B::X86Cvtss2Si64 => IntrinsicRequirement {
+            feature: F::Sse,
+            flag: "-msse",
+            also: None,
+        },
+        // Legacy XMM integer, packed-double and scalar-double operations.
+        // An SSE1-only ABI does not grant these SSE2 APIs / instructions.
+        B::X86Setzero128
+        | B::X86CastReinterpret
+        | B::X86Lfence
+        | B::X86Mfence
+        | B::X86Movnti
+        | B::X86Movnti64
+        | B::X86Movntdq
+        | B::X86Movntpd
+        | B::X86Loaddqu
+        | B::X86Storedqu
+        | B::X86Pcmpeqb128
+        | B::X86Pcmpeqd128
+        | B::X86Psubusb128
+        | B::X86Psubsb128
+        | B::X86Psubusw128
+        | B::X86Por128
+        | B::X86Pand128
+        | B::X86Pxor128
+        | B::X86Pmovmskb128
+        | B::X86Set1Epi8
+        | B::X86Set1Epi32
+        | B::X86Pshufd128
+        | B::X86Loadldi128
+        | B::X86Paddw128
+        | B::X86Psubw128
+        | B::X86Pmulhw128
+        | B::X86Pmaddwd128
+        | B::X86Pcmpgtw128
+        | B::X86Pcmpgtb128
+        | B::X86Paddd128
+        | B::X86Psubd128
+        | B::X86Packssdw128
+        | B::X86Packsswb128
+        | B::X86Packuswb128
+        | B::X86Punpcklbw128
+        | B::X86Punpckhbw128
+        | B::X86Punpcklwd128
+        | B::X86Punpckhwd128
+        | B::X86Set1Epi16
+        | B::X86Pinsrw128
+        | B::X86Pextrw128
+        | B::X86Storeldi128
+        | B::X86Cvtsi128Si32
+        | B::X86Cvtsi32Si128
+        | B::X86Cvtsi128Si64
+        | B::X86Cvtsd2Si64
+        | B::X86Pshuflw128
+        | B::X86Pshufhw128
+        | B::X86Paddb128
+        | B::X86Psubb128
+        | B::X86Psadbw128
+        | B::X86Pmullw128
+        | B::X86Pmaxub128
+        | B::X86Pminub128
+        | B::X86CvtPd2PsValue
+        | B::X86Psllw128
+        | B::X86Psrlw128
+        | B::X86XorPd
+        | B::X86AndPd
+        | B::X86OrPd
+        | B::X86AndnPd
+        | B::X86AddPd
+        | B::X86SubPd
+        | B::X86MulPd
+        | B::X86AddSd
+        | B::X86SubSd
+        | B::X86MulSd
+        | B::X86DivSd
+        | B::X86MinSd
+        | B::X86MaxSd
+        | B::X86SqrtSd
+        | B::X86MulEpu32
+        | B::X86Paddusb128
+        | B::X86Paddsb128
+        | B::X86Paddusw128
+        | B::X86Paddsw128
+        | B::X86Psubsw128
+        | B::X86Pandn128
+        | B::X86Pcmpeqw128
+        | B::X86Pcmpgtd128
+        | B::X86Pavgb128
+        | B::X86Pavgw128
+        | B::X86Pminsw128
+        | B::X86Pmaxsw128
+        | B::X86Pmulhuw128
+        | B::X86Paddq128
+        | B::X86Psubq128
+        | B::X86Punpckldq128
+        | B::X86Punpckhdq128
+        | B::X86Punpcklqdq128
+        | B::X86Punpckhqdq128
+        | B::X86Pslldqi128
+        | B::X86Psrldqi128
+        | B::X86Psllqi128
+        | B::X86Psrlqi128
+        | B::X86Psllwi128
+        | B::X86Psrlwi128
+        | B::X86Psrawi128
+        | B::X86Psradi128
+        | B::X86Pslldi128
+        | B::X86Psrldi128 => IntrinsicRequirement {
+            feature: F::Sse2,
+            flag: "-msse2",
+            also: None,
+        },
+        _ => return None,
+    })
+}
+
 /// Map a BuiltinIntrinsic to its corresponding IntrinsicOp.
 /// AUD-CPU-3: the instruction-set extension an x86 intrinsic's instruction
 /// belongs to, for the families whose permission bit exists in
@@ -3443,10 +3662,14 @@ struct IntrinsicRequirement {
 fn x86_intrinsic_required_feature(intrinsic: &BuiltinIntrinsic) -> Option<IntrinsicRequirement> {
     use crate::common::x86_features::X86Feature as F;
     use BuiltinIntrinsic as B;
+    if let Some(requirement) = legacy_xmm_intrinsic_required_feature(intrinsic) {
+        return Some(requirement);
+    }
     Some(match intrinsic {
         // Packed floating-point YMM operations are AVX, not AVX2, on both
         // x86 ABIs. Never let an absent permission fall through to emission.
-        B::X86AddPs256
+        B::X86Setzero256
+        | B::X86AddPs256
         | B::X86SubPs256
         | B::X86MulPs256
         | B::X86AddPd256
@@ -3488,20 +3711,6 @@ fn x86_intrinsic_required_feature(intrinsic: &BuiltinIntrinsic) -> Option<Intrin
         | B::X86Psrldqi256 => IntrinsicRequirement {
             feature: F::Avx2,
             flag: "-mavx2",
-            also: None,
-        },
-        B::X86Pslldqi128
-        | B::X86Psrldqi128
-        | B::X86Psllqi128
-        | B::X86Psrlqi128
-        | B::X86Psllwi128
-        | B::X86Psrlwi128
-        | B::X86Psrawi128
-        | B::X86Psradi128
-        | B::X86Pslldi128
-        | B::X86Psrldi128 => IntrinsicRequirement {
-            feature: F::Sse2,
-            flag: "-msse2",
             also: None,
         },
         B::X86AvxWiden(_) => IntrinsicRequirement {
@@ -3911,6 +4120,7 @@ fn x86_intrinsic_op(intrinsic: &BuiltinIntrinsic) -> IntrinsicOp {
         BuiltinIntrinsic::X86Punpcklqdq128 => IntrinsicOp::Punpcklqdq128,
         BuiltinIntrinsic::X86Punpckhqdq128 => IntrinsicOp::Punpckhqdq128,
         BuiltinIntrinsic::X86Setzero128 => IntrinsicOp::Setzero128,
+        BuiltinIntrinsic::X86SetzeroPs128 => IntrinsicOp::SetzeroPs128,
         BuiltinIntrinsic::X86Testz128 => IntrinsicOp::Testz128,
         BuiltinIntrinsic::X86Pmulld256 => IntrinsicOp::Pmulld256,
         BuiltinIntrinsic::X86Psubd256 => IntrinsicOp::Psubd256,
@@ -4093,6 +4303,34 @@ mod prefetch_hint_tests {
             let h = PrefetchHint::decode(p);
             assert!(h.locality <= 3);
             assert_eq!(h.encode(), p & 7);
+        }
+    }
+}
+
+#[cfg(test)]
+mod legacy_constructor_permission_tests {
+    use super::{BuiltinKind, builtins, x86_intrinsic_required_feature};
+    use crate::common::x86_features::X86Feature as F;
+
+    #[test]
+    fn zero_constructors_keep_their_api_feature_identity() {
+        for (name, expected) in [
+            ("_mm_setzero_ps", F::Sse),
+            ("_mm_setzero_pd", F::Sse2),
+            ("_mm_setzero_si128", F::Sse2),
+            ("_mm256_setzero_ps", F::Avx),
+            ("_mm256_setzero_pd", F::Avx),
+            ("_mm256_setzero_si256", F::Avx),
+        ] {
+            let info = builtins::resolve_builtin(name).expect("known zero constructor");
+            let BuiltinKind::Intrinsic(intrinsic) = &info.kind else {
+                panic!("{name} is not an intrinsic");
+            };
+            assert_eq!(
+                x86_intrinsic_required_feature(intrinsic).map(|r| r.feature),
+                Some(expected),
+                "{name}",
+            );
         }
     }
 }

@@ -2766,7 +2766,7 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
     );
     m.insert(
         "_mm_setzero_ps",
-        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Setzero128),
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86SetzeroPs128),
     );
     m.insert(
         "_mm_setzero_pd",
@@ -3464,6 +3464,33 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
         "__builtin_clear_padding",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::ClearPadding),
     );
+    for &name in &super::gcc16_builtins::GCC16_GENERIC_BIT_BUILTINS {
+        m.insert(
+            name,
+            BuiltinInfo::intrinsic(BuiltinIntrinsic::Gcc16GenericBit),
+        );
+    }
+    for &name in &super::gcc16_builtins::GCC16_CARRY_BUILTINS {
+        m.insert(name, BuiltinInfo::intrinsic(BuiltinIntrinsic::Gcc16Carry));
+    }
+    for &name in &super::gcc16_builtins::GCC16_BSWAP_BITREV_BUILTINS {
+        m.insert(
+            name,
+            BuiltinInfo::intrinsic(BuiltinIntrinsic::Gcc16BswapBitrev),
+        );
+    }
+    m.insert(
+        "__builtin_issignaling",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::IsSignaling),
+    );
+    m.insert(
+        "__builtin_iseqsig",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::IsEqSig),
+    );
+    m.insert(
+        "__builtin_speculation_safe_value",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::SpeculationSafeValue),
+    );
 
     m
 });
@@ -3549,6 +3576,18 @@ pub enum BuiltinIntrinsic {
     AssocBarrier,
     /// C23 / GCC `__builtin_clear_padding(ptr)`
     ClearPadding,
+    /// GCC 16.2 type-generic bit builtins (`__builtin_{clzg,ctzg,popcountg,parityg,ffsg,clrsbg}`)
+    Gcc16GenericBit,
+    /// GCC / Clang unsigned carry/borrow chain builtins (`__builtin_{addc,subc}{b,s,,l,ll}`)
+    Gcc16Carry,
+    /// `__builtin_bswap128` and `__builtin_bitreverse{8,16,32,64}`
+    Gcc16BswapBitrev,
+    /// `__builtin_issignaling(x)`
+    IsSignaling,
+    /// `__builtin_iseqsig(x, y)`
+    IsEqSig,
+    /// `__builtin_speculation_safe_value(val [, failval])`
+    SpeculationSafeValue,
     /// No-op builtin (evaluates args, returns 0)
     Nop,
     /// __builtin_cpu_init() - no-op, glibc handles CPU feature detection init
@@ -3856,6 +3895,7 @@ pub enum BuiltinIntrinsic {
     X86Punpcklqdq128,
     X86Punpckhqdq128,
     X86Setzero128,
+    X86SetzeroPs128,
     X86Testz128,
     // AVX/AVX2 previously scalar
     X86Pmulld256,

@@ -99,6 +99,14 @@ pub struct Driver {
     pub(super) math_errno: bool,
     /// -fwrapv makes signed Add/Sub/Mul modular; never infer no-wrap from C UB.
     pub(super) wrap_signed_overflow: bool,
+    /// -ftrapv emits runtime traps on signed integer overflow.
+    pub(super) trapv: bool,
+    /// -fno-plt emits GOT-indirect external function calls instead of PLT stubs.
+    pub(super) no_plt: bool,
+    /// -fvisibility={default,hidden,internal,protected} default visibility for TU definitions.
+    pub(super) default_visibility: Option<String>,
+    /// -ftrivial-auto-var-init={uninitialized,zero,pattern} policy.
+    pub(super) trivial_auto_var_init: crate::ir::lowering::trapv::TrivialAutoVarInit,
     /// `-ffreestanding` / `-fno-hosted`: a freestanding implementation, so
     /// `__STDC_HOSTED__` is 0 (C17 6.10.8.1).  Independent of the builtin
     /// policy: `-ffreestanding -fbuiltin` stays freestanding (GCC 16.2).
@@ -571,6 +579,10 @@ impl Driver {
             fp_contract_explicit: false,
             fast_math: false,
             wrap_signed_overflow: false,
+            trapv: false,
+            no_plt: false,
+            default_visibility: None,
+            trivial_auto_var_init: crate::ir::lowering::trapv::TrivialAutoVarInit::Uninitialized,
             freestanding: false,
             builtin_policy: crate::common::pass_policy::BuiltinFlags::default(),
             fp_trapping_math: false,
@@ -2133,9 +2145,12 @@ impl Driver {
             self.gnu89_inline,
         )
         .with_pass_policy(crate::common::pass_policy::PassPolicy::new(
-            self.wrap_signed_overflow,
+            self.wrap_signed_overflow || self.trapv,
             fp_environment_observable,
         ))
+        .with_trapv(self.trapv)
+        .with_trivial_auto_var_init(self.trivial_auto_var_init)
+        .with_default_visibility(self.default_visibility.clone())
         .with_builtin_policy(self.builtin_policy.clone())
         .with_enumerator_refs(sema_result.enumerator_refs);
         let (mut module, mut diagnostics) = lowerer.lower(&ast);
@@ -2327,7 +2342,7 @@ impl Driver {
                 native_popcount: self.resolved_fast_popcount(),
             },
             self.code16gcc,
-            self.wrap_signed_overflow,
+            self.wrap_signed_overflow || self.trapv,
             fp_environment_observable,
             self.fp_reassoc,
             self.resolved_fp_contract(),
@@ -3030,6 +3045,7 @@ impl Driver {
             pic: self.pic || self.shared_lib,
             shared_lib: self.shared_lib,
             pie: self.pie && !self.pic && !self.shared_lib,
+            no_plt: self.no_plt,
             // Only a FULL invocation that final-links in position-fixed
             // ET_EXEC may emit the absolute switch-table form (its jump
             // instruction's R_X86_64_32S is unresolvable in ET_DYN). The
@@ -3139,7 +3155,25 @@ impl Driver {
         // available after an SSE2 denial, but fail closed on emitters that
         // still require SSE2 (notably F64: there is no x87 fallback here).
         if self.target == Target::X86_64 && self.no_sse2 && !self.no_sse {
-            if let Some((func, line)) = first_sse2_reference(&asm) {
+            // A local legacy-vector grant keeps the same XMM ABI as the
+            // SSE1 TU baseline. Check the actual function scope, not a TU-wide
+            // exemption that could hide an illegal neighboring function.
+            let sse2_functions: std::collections::HashSet<&str> = module
+                .functions
+                .iter()
+                .filter(|f| {
+                    let has = |name: &str| f.target_features.iter().any(|feature| feature == name);
+                    !has("no-sse")
+                        && !has("no-sse2")
+                        && ["sse2", "sse3", "ssse3", "sse4.1", "sse4.2", "avx", "avx2"]
+                            .iter()
+                            .any(|feature| has(feature))
+                })
+                .map(|f| f.name.as_str())
+                .collect();
+            if let Some((func, line)) =
+                first_sse2_reference_unless(&asm, |name| sse2_functions.contains(name))
+            {
                 return Err(format!(
                     "{input_file}: in function '{func}': operation requires SSE2, \
                      but SSE2 is disabled (-mno-sse2); x86-64 lccc has no \
@@ -3833,87 +3867,98 @@ mod arm_simd_reference_tests {
 }
 
 fn first_sse_reference(asm: &str) -> Option<(String, String)> {
-    first_xmm_reference_if(asm, |_| true)
+    first_xmm_reference_if(asm, |_, _| true)
 }
 
 /// SSE1's XMM vocabulary, including AT&T size-suffixed scalar conversions.
 /// User inline assembly remains an explicit escape hatch, as in the no-SSE
 /// fence. MMX-only instructions without an XMM operand are not SSE2 leaks.
 fn first_sse2_reference(asm: &str) -> Option<(String, String)> {
-    first_xmm_reference_if(asm, |op| {
-        !matches!(
-            op,
-            "movss"
-                | "movaps"
-                | "movups"
-                | "movhps"
-                | "movlps"
-                | "movhlps"
-                | "movlhps"
-                | "unpcklps"
-                | "unpckhps"
-                | "shufps"
-                | "movmskps"
-                | "movntps"
-                | "addss"
-                | "addps"
-                | "subss"
-                | "subps"
-                | "mulss"
-                | "mulps"
-                | "divss"
-                | "divps"
-                | "sqrtss"
-                | "sqrtps"
-                | "rcpss"
-                | "rcpps"
-                | "rsqrtss"
-                | "rsqrtps"
-                | "minss"
-                | "minps"
-                | "maxss"
-                | "maxps"
-                | "andps"
-                | "andnps"
-                | "orps"
-                | "xorps"
-                | "comiss"
-                | "ucomiss"
-                | "cmpps"
-                | "cmpss"
-                | "cmpeqps"
-                | "cmpeqss"
-                | "cmpltps"
-                | "cmpltss"
-                | "cmpleps"
-                | "cmpless"
-                | "cmpunordps"
-                | "cmpunordss"
-                | "cmpneqps"
-                | "cmpneqss"
-                | "cmpnltps"
-                | "cmpnltss"
-                | "cmpnleps"
-                | "cmpnless"
-                | "cmpordps"
-                | "cmpordss"
-                | "cvtpi2ps"
-                | "cvtps2pi"
-                | "cvttps2pi"
-                | "cvtsi2ss"
-                | "cvtsi2ssl"
-                | "cvtsi2ssq"
-                | "cvtss2si"
-                | "cvtss2sil"
-                | "cvtss2siq"
-                | "cvttss2si"
-                | "cvttss2sil"
-                | "cvttss2siq"
-        )
+    first_sse2_reference_unless(asm, |_| false)
+}
+
+fn first_sse2_reference_unless(
+    asm: &str,
+    permitted: impl Fn(&str) -> bool,
+) -> Option<(String, String)> {
+    first_xmm_reference_if(asm, |function, op| {
+        !permitted(function)
+            && !matches!(
+                op,
+                "movss"
+                    | "movaps"
+                    | "movups"
+                    | "movhps"
+                    | "movlps"
+                    | "movhlps"
+                    | "movlhps"
+                    | "unpcklps"
+                    | "unpckhps"
+                    | "shufps"
+                    | "movmskps"
+                    | "movntps"
+                    | "addss"
+                    | "addps"
+                    | "subss"
+                    | "subps"
+                    | "mulss"
+                    | "mulps"
+                    | "divss"
+                    | "divps"
+                    | "sqrtss"
+                    | "sqrtps"
+                    | "rcpss"
+                    | "rcpps"
+                    | "rsqrtss"
+                    | "rsqrtps"
+                    | "minss"
+                    | "minps"
+                    | "maxss"
+                    | "maxps"
+                    | "andps"
+                    | "andnps"
+                    | "orps"
+                    | "xorps"
+                    | "comiss"
+                    | "ucomiss"
+                    | "cmpps"
+                    | "cmpss"
+                    | "cmpeqps"
+                    | "cmpeqss"
+                    | "cmpltps"
+                    | "cmpltss"
+                    | "cmpleps"
+                    | "cmpless"
+                    | "cmpunordps"
+                    | "cmpunordss"
+                    | "cmpneqps"
+                    | "cmpneqss"
+                    | "cmpnltps"
+                    | "cmpnltss"
+                    | "cmpnleps"
+                    | "cmpnless"
+                    | "cmpordps"
+                    | "cmpordss"
+                    | "cvtpi2ps"
+                    | "cvtps2pi"
+                    | "cvttps2pi"
+                    | "cvtsi2ss"
+                    | "cvtsi2ssl"
+                    | "cvtsi2ssq"
+                    | "cvtss2si"
+                    | "cvtss2sil"
+                    | "cvtss2siq"
+                    | "cvttss2si"
+                    | "cvttss2sil"
+                    | "cvttss2siq"
+            )
     })
 }
 
-fn first_xmm_reference_if(asm: &str, forbidden: impl Fn(&str) -> bool) -> Option<(String, String)> {
+fn first_xmm_reference_if(
+    asm: &str,
+    forbidden: impl Fn(&str, &str) -> bool,
+) -> Option<(String, String)> {
     let mut func = String::from("<toplevel>");
     let mut in_app = false;
     for line in asm.lines() {
@@ -3930,6 +3975,9 @@ fn first_xmm_reference_if(asm: &str, forbidden: impl Fn(&str) -> bool) -> Option
             continue;
         }
         if t.starts_with('.') {
+            if t.starts_with(".size ") {
+                func = String::from("<toplevel>");
+            }
             if let Some(rest) = t.strip_prefix(".type ") {
                 if rest.trim_end().ends_with("@function") {
                     if let Some(name) = rest.split(',').next() {
@@ -3945,7 +3993,7 @@ fn first_xmm_reference_if(asm: &str, forbidden: impl Fn(&str) -> bool) -> Option
         let code = t.split('#').next().unwrap_or("");
         let op = code.split_ascii_whitespace().next().unwrap_or("");
         if (code.contains("%xmm") || code.contains("%ymm") || code.contains("%zmm"))
-            && forbidden(op)
+            && forbidden(&func, op)
         {
             return Some((func, line.to_string()));
         }
@@ -4037,5 +4085,31 @@ mod loop_idiom_capability_tests {
         driver.target = Target::Riscv64;
         driver.general_regs_only = false;
         assert!(!driver.resolved_fast_popcount());
+    }
+}
+
+#[cfg(test)]
+mod scoped_sse2_fence_tests {
+    use super::first_sse2_reference_unless;
+
+    #[test]
+    fn local_grant_does_not_exempt_a_neighbor_or_toplevel() {
+        let prefix =
+            ".type allowed, @function\nallowed:\n paddd %xmm1, %xmm0\n.size allowed, .-allowed\n";
+        assert!(first_sse2_reference_unless(prefix, |name| name == "allowed").is_none());
+        let neighbor = format!("{prefix}.type denied, @function\ndenied:\n paddd %xmm1, %xmm0\n");
+        assert_eq!(
+            first_sse2_reference_unless(&neighbor, |name| name == "allowed")
+                .unwrap()
+                .0,
+            "denied"
+        );
+        let outside = format!("{prefix} movdqu %xmm0, %xmm1\n");
+        assert_eq!(
+            first_sse2_reference_unless(&outside, |name| name == "allowed")
+                .unwrap()
+                .0,
+            "<toplevel>"
+        );
     }
 }

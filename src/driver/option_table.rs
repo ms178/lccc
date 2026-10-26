@@ -44,24 +44,9 @@ pub(super) const CONTRACTS: &[Contract] = &[
         rationale: "Alias analysis does not use type-based alias exclusions.",
     },
     Contract {
-        spelling: "-fno-trapv",
-        class: Class::BenignNoop,
-        rationale: "No signed overflow trap instrumentation is emitted.",
-    },
-    Contract {
         spelling: "-fstack-clash-protection",
         class: Class::Refused,
         rationale: "Stack probing is not implemented.",
-    },
-    Contract {
-        spelling: "-ftrapv",
-        class: Class::Refused,
-        rationale: "Signed overflow traps are not implemented.",
-    },
-    Contract {
-        spelling: "-fno-plt",
-        class: Class::BenignNoop,
-        rationale: "External calls keep the default PLT form: correct code, without the GOT-indirect selection.",
     },
     Contract {
         spelling: "-fsemantic-interposition",
@@ -134,8 +119,6 @@ pub(super) fn lookup(arg: &str) -> Option<Contract> {
         || arg.starts_with("-finstrument-functions-exclude-function-list")
     {
         "Function-instrumentation exclusion lists are not implemented."
-    } else if arg.starts_with("-fvisibility=") {
-        "Default symbol visibility selection is not implemented."
     } else {
         return None;
     };
@@ -159,7 +142,6 @@ mod tests {
             "-flto",
             "-flto=auto",
             "-fsanitize=address",
-            "-fvisibility=hidden",
             "-fno-profile-arcs",
             "-fno-test-coverage",
             "-fno-branch-probabilities",

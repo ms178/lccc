@@ -319,27 +319,114 @@ impl Parser {
         q
     }
 
+    /// Scan top-level storage-class and const specifiers inside `( ... )` before `)`.
+    /// Returns `(storage, has_any_storage_class, invalid_storage_class_name)`.
+    fn scan_compound_literal_storage(
+        &self,
+    ) -> (
+        crate::frontend::parser::ast::CompoundLiteralStorage,
+        bool,
+        Option<&'static str>,
+    ) {
+        let mut st = crate::frontend::parser::ast::CompoundLiteralStorage::default();
+        let mut any_sc = false;
+        let mut invalid_sc = None;
+        let mut depth = 0usize;
+        let mut stars = 0usize;
+        let mut const_before_star = false;
+        let mut const_after_last_star = false;
+        for n in 0..64 {
+            match self.peek_nth(n) {
+                TokenKind::LParen => depth += 1,
+                TokenKind::RParen => {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                }
+                TokenKind::Star if depth == 0 => {
+                    stars += 1;
+                    const_after_last_star = false;
+                }
+                TokenKind::Const if depth == 0 => {
+                    if stars == 0 {
+                        const_before_star = true;
+                    } else {
+                        const_after_last_star = true;
+                    }
+                }
+                TokenKind::Static if depth == 0 => {
+                    st.is_static = true;
+                    any_sc = true;
+                }
+                TokenKind::Constexpr if depth == 0 => {
+                    st.is_constexpr = true;
+                    st.is_const = true;
+                    any_sc = true;
+                }
+                TokenKind::Register if depth == 0 => {
+                    st.is_register = true;
+                    any_sc = true;
+                }
+                TokenKind::ThreadLocal if depth == 0 => {
+                    st.is_thread_local = true;
+                    any_sc = true;
+                }
+                TokenKind::Extern if depth == 0 => {
+                    any_sc = true;
+                    invalid_sc.get_or_insert("extern");
+                }
+                TokenKind::Typedef if depth == 0 => {
+                    any_sc = true;
+                    invalid_sc.get_or_insert("typedef");
+                }
+                TokenKind::Auto if depth == 0 => {
+                    any_sc = true;
+                    invalid_sc.get_or_insert("auto");
+                }
+                _ => {}
+            }
+        }
+        if (stars == 0 && const_before_star) || (stars > 0 && const_after_last_star) {
+            st.is_const = true;
+        }
+        (st, any_sc, invalid_sc)
+    }
+
+    fn validate_compound_literal_storage(
+        &mut self,
+        st: &crate::frontend::parser::ast::CompoundLiteralStorage,
+        invalid_sc: Option<&'static str>,
+        span: Span,
+    ) {
+        if let Some(bad) = invalid_sc {
+            self.emit_error(
+                format!("compound literal cannot have '{bad}' storage class"),
+                span,
+            );
+            return;
+        }
+        if (st.is_register && (st.is_static || st.is_thread_local))
+            || (st.is_thread_local && st.is_constexpr)
+        {
+            self.emit_error(
+                "conflicting storage-class specifiers in compound literal".to_string(),
+                span,
+            );
+        }
+    }
+
     #[inline(always)]
     fn parse_cast_expr_inner(&mut self) -> Expr {
         if matches!(self.peek(), TokenKind::LParen) {
             let save = self.pos;
-            let save_typedef = self.attrs.parsing_typedef();
-            let save_const = self.attrs.parsing_const();
-            let save_volatile = self.attrs.parsing_volatile();
+            let save_flags = self.attrs.flags;
             let save_vector_size = self.attrs.parsing_vector_size.take();
             let save_ext_vector = self.attrs.parsing_ext_vector_nelem.take();
             self.advance();
             if self.is_type_specifier() {
-                // parse_nested_type_name scopes the pending address-space
-                // qualifier around the cast's type-name: a qualifier the
-                // cast sets before its own base (`(__seg_fs unsigned long
-                // *)40`) still reaches its own `*` arm, an enclosing
-                // declaration's qualifier is restored untouched for its
-                // own declarator, and the restore runs before any of the
-                // exits below — including the `self.pos = save` backtrack.
-                // Read from the tokens, not the parsed flags: `parse_cast_expr`'s
-                // declarator path sets the flags for pointer-level qualifiers too.
                 let qualifiers = self.type_name_qualifiers();
+                let (cl_storage, any_sc, invalid_sc) = self.scan_compound_literal_storage();
                 if let Some(mut result_type) = self.parse_nested_type_name() {
                     // If __attribute__((vector_size(N))) was parsed, wrap the type
                     result_type = self.apply_pending_vector_attr(result_type);
@@ -348,29 +435,35 @@ impl Parser {
                         self.advance();
                         // Check for compound literal: (type){...}
                         if matches!(self.peek(), TokenKind::LBrace) {
-                            let init = self.parse_initializer();
-                            let lit = Expr::CompoundLiteral(result_type, Box::new(init), span);
-                            self.attrs.set_const(save_const);
-                            self.attrs.set_volatile(save_volatile);
-                            // Restore outer vector attrs so the enclosing declaration can use them
+                            self.validate_compound_literal_storage(&cl_storage, invalid_sc, span);
+                            self.attrs.flags = save_flags;
                             self.attrs.parsing_vector_size = save_vector_size;
                             self.attrs.parsing_ext_vector_nelem = save_ext_vector;
+                            let init = self.parse_initializer();
+                            let lit = Expr::CompoundLiteral(
+                                result_type,
+                                Box::new(init),
+                                span,
+                                cl_storage,
+                            );
                             return self.parse_postfix_ops(lit);
                         }
-                        let expr = self.parse_cast_expr();
-                        self.attrs.set_const(save_const);
-                        self.attrs.set_volatile(save_volatile);
-                        // Restore outer vector attrs so the enclosing declaration can use them
+                        if any_sc {
+                            self.emit_error(
+                                "storage class specified for type name".to_string(),
+                                span,
+                            );
+                        }
+                        self.attrs.flags = save_flags;
                         self.attrs.parsing_vector_size = save_vector_size;
                         self.attrs.parsing_ext_vector_nelem = save_ext_vector;
+                        let expr = self.parse_cast_expr();
                         return Expr::Cast(result_type, Box::new(expr), span, qualifiers);
                     }
                 }
             }
             self.pos = save;
-            self.attrs.set_typedef(save_typedef);
-            self.attrs.set_const(save_const);
-            self.attrs.set_volatile(save_volatile);
+            self.attrs.flags = save_flags;
             self.attrs.parsing_vector_size = save_vector_size;
             self.attrs.parsing_ext_vector_nelem = save_ext_vector;
         }
@@ -515,12 +608,12 @@ impl Parser {
         };
         if matches!(self.peek(), TokenKind::LParen) {
             let save = self.pos;
-            let save_typedef = self.attrs.parsing_typedef();
-            let save_const = self.attrs.parsing_const();
+            let save_flags = self.attrs.flags;
             let save_vector_size = self.attrs.parsing_vector_size.take();
             let save_ext_vector = self.attrs.parsing_ext_vector_nelem.take();
             self.advance();
             if self.is_type_specifier() {
+                let (cl_storage, any_sc, invalid_sc) = self.scan_compound_literal_storage();
                 // parse_nested_type_name scopes the pending address-space
                 // qualifier (see its doc comment); the sizeof(type-name)
                 // argument is a nested type-name exactly like a cast's.
@@ -534,24 +627,38 @@ impl Parser {
                         // applied to a compound literal (C11 6.5.3, 6.5.2.5),
                         // postfix operators included: `sizeof (T[]){1, 2}`
                         // is the literal's size, `sizeof (S){0}.m` a member's.
-                        let arg = if matches!(self.peek(), TokenKind::LBrace) {
-                            let init = self.parse_initializer();
-                            let lit = Expr::CompoundLiteral(result_type, Box::new(init), lit_span);
-                            SizeofArg::Expr(self.parse_postfix_ops(lit))
-                        } else {
-                            SizeofArg::Type(result_type)
-                        };
-                        self.attrs.set_const(save_const);
-                        // Restore outer vector attrs so the enclosing declaration can use them
+                        self.attrs.flags = save_flags;
                         self.attrs.parsing_vector_size = save_vector_size;
                         self.attrs.parsing_ext_vector_nelem = save_ext_vector;
+                        let arg = if matches!(self.peek(), TokenKind::LBrace) {
+                            self.validate_compound_literal_storage(
+                                &cl_storage,
+                                invalid_sc,
+                                lit_span,
+                            );
+                            let init = self.parse_initializer();
+                            let lit = Expr::CompoundLiteral(
+                                result_type,
+                                Box::new(init),
+                                lit_span,
+                                cl_storage,
+                            );
+                            SizeofArg::Expr(self.parse_postfix_ops(lit))
+                        } else {
+                            if any_sc {
+                                self.emit_error(
+                                    "storage class specified for type name".to_string(),
+                                    lit_span,
+                                );
+                            }
+                            SizeofArg::Type(result_type)
+                        };
                         return wrap(arg);
                     }
                 }
             }
             self.pos = save;
-            self.attrs.set_typedef(save_typedef);
-            self.attrs.set_const(save_const);
+            self.attrs.flags = save_flags;
             self.attrs.parsing_vector_size = save_vector_size;
             self.attrs.parsing_ext_vector_nelem = save_ext_vector;
         }
@@ -559,12 +666,55 @@ impl Parser {
         wrap(SizeofArg::Expr(expr))
     }
 
+    fn try_parse_compound_literal(&mut self) -> Option<Expr> {
+        if !matches!(self.peek(), TokenKind::LParen) {
+            return None;
+        }
+        let save = self.pos;
+        let save_flags = self.attrs.flags;
+        let save_vector_size = self.attrs.parsing_vector_size.take();
+        let save_ext_vector = self.attrs.parsing_ext_vector_nelem.take();
+        self.advance();
+        if self.is_type_specifier() {
+            let (cl_storage, _any_sc, invalid_sc) = self.scan_compound_literal_storage();
+            if let Some(mut result_type) = self.parse_nested_type_name() {
+                result_type = self.apply_pending_vector_attr(result_type);
+                if matches!(self.peek(), TokenKind::RParen) {
+                    let span = self.peek_span();
+                    self.advance();
+                    if matches!(self.peek(), TokenKind::LBrace) {
+                        self.validate_compound_literal_storage(&cl_storage, invalid_sc, span);
+                        self.attrs.flags = save_flags;
+                        self.attrs.parsing_vector_size = save_vector_size;
+                        self.attrs.parsing_ext_vector_nelem = save_ext_vector;
+                        let init = self.parse_initializer();
+                        return Some(Expr::CompoundLiteral(
+                            result_type,
+                            Box::new(init),
+                            span,
+                            cl_storage,
+                        ));
+                    }
+                }
+            }
+        }
+        self.pos = save;
+        self.attrs.flags = save_flags;
+        self.attrs.parsing_vector_size = save_vector_size;
+        self.attrs.parsing_ext_vector_nelem = save_ext_vector;
+        None
+    }
+
     fn parse_postfix_expr(&mut self) -> Expr {
         let span = self.peek_span();
         if !self.enter_expr_frame(span) {
             return Expr::IntLiteral(0, span);
         }
-        let expr = self.parse_primary_expr();
+        let expr = if let Some(cl) = self.try_parse_compound_literal() {
+            cl
+        } else {
+            self.parse_primary_expr()
+        };
         let r = self.parse_postfix_ops(expr);
         self.exit_parser_frame();
         r
@@ -868,6 +1018,9 @@ impl Parser {
                 if name == "__builtin_convertvector" && matches!(self.peek(), TokenKind::LParen) {
                     return self.parse_convertvector_expr(span);
                 }
+                if name == "__builtin_bit_cast" && matches!(self.peek(), TokenKind::LParen) {
+                    return self.parse_bit_cast_expr(span);
+                }
                 Expr::Identifier(name, span)
             }
             TokenKind::LParen => {
@@ -935,6 +1088,16 @@ impl Parser {
         let type_spec = self.parse_va_arg_type();
         self.expect_closing(&TokenKind::RParen, open);
         Expr::ConvertVector(Box::new(src_expr), type_spec, span)
+    }
+
+    fn parse_bit_cast_expr(&mut self, span: Span) -> Expr {
+        let open = self.peek_span();
+        self.advance();
+        let type_spec = self.parse_va_arg_type();
+        self.expect_context(&TokenKind::Comma, "between '__builtin_bit_cast' arguments");
+        let src_expr = self.parse_assignment_expr();
+        self.expect_closing(&TokenKind::RParen, open);
+        Expr::BitCast(type_spec, Box::new(src_expr), span)
     }
 
     fn parse_va_arg_expr(&mut self) -> Expr {

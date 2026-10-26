@@ -86,6 +86,7 @@ pub(crate) mod simplify;
 pub(crate) mod slp_vectorizer;
 pub(crate) mod sret_copy_elision;
 pub(crate) mod store_load_forward;
+pub(crate) mod switch_lut;
 pub(crate) mod tail_call_elim;
 pub(crate) mod univsr;
 pub(crate) mod use_def;
@@ -1372,6 +1373,53 @@ fn late_vectorize_entry(
     vectorize_entry(target, fp_reassoc, fp_contract, x86_avx)
 }
 
+/// Temporarily apply a function's `__attribute__((target("...")))` x86-64 SIMD
+/// capabilities around a middle-end vectorization callback, then restore the
+/// TU baseline immediately. Zero-cost when `target_features` is empty.
+fn with_function_x86_vec_isa<R>(
+    target: crate::backend::Target,
+    base_isa: crate::backend::x86::isa::X86Isa,
+    base_avx512vl: bool,
+    features: &[String],
+    body: impl FnOnce(crate::backend::x86::isa::X86Isa) -> R,
+) -> R {
+    if target != crate::backend::Target::X86_64 || features.is_empty() {
+        return body(base_isa);
+    }
+    let fn_isa = base_isa.with_target_features(features);
+    let fn_avx512vl = (base_avx512vl
+        || features.iter().any(|f| {
+            matches!(
+                f.as_str(),
+                "avx512vl"
+                    | "arch=x86-64-v4"
+                    | "arch=skylake-avx512"
+                    | "arch=cascadelake"
+                    | "arch=cooperlake"
+                    | "arch=icelake-client"
+                    | "arch=icelake-server"
+                    | "arch=tigerlake"
+                    | "arch=sapphirerapids"
+                    | "arch=emeraldrapids"
+                    | "arch=graniterapids"
+                    | "arch=znver4"
+                    | "arch=znver5"
+            )
+        }))
+        && fn_isa.ymm
+        && !features
+            .iter()
+            .any(|f| f == "no-avx512vl" || f == "no-avx512f");
+    vectorize::set_x86_simd_isa(fn_isa.simd, fn_isa.ymm, fn_isa.sse41, fn_avx512vl);
+    vectorize::set_x86_fma_enabled(fn_isa.fma);
+    vectorize::set_x86_strict_recip_avx2_enabled(fn_isa.ymm && fn_isa.sse41);
+    let result = body(fn_isa);
+    vectorize::set_x86_simd_isa(base_isa.simd, base_isa.ymm, base_isa.sse41, base_avx512vl);
+    vectorize::set_x86_fma_enabled(base_isa.fma);
+    vectorize::set_x86_strict_recip_avx2_enabled(base_isa.ymm && base_isa.sse41);
+    result
+}
+
 pub(crate) fn run_passes(
     module: &mut IrModule,
     opt_level: u32,
@@ -2236,12 +2284,15 @@ pub(crate) fn run_passes(
                     &dirty,
                     &mut changed,
                     |f: &mut crate::ir::reexports::IrFunction| {
-                        vectorize::vectorize_const_trip_map_loops(
-                            f,
-                            fp_contract,
-                            no_map_vec,
-                            &symbol_facts,
-                        )
+                        let feats = f.target_features.clone();
+                        with_function_x86_vec_isa(target, x86_isa, x86_avx512vl, &feats, |_| {
+                            vectorize::vectorize_const_trip_map_loops(
+                                f,
+                                fp_contract,
+                                no_map_vec,
+                                &symbol_facts,
+                            )
+                        })
                     }
                 )
             );
@@ -2334,16 +2385,16 @@ pub(crate) fn run_passes(
             )
             && !pass_disabled(&disabled, "vectorize")
         {
-            let vectorize_mode = vectorize_entry(target, fp_reassoc, fp_contract, x86_avx);
             let symbol_facts = module_symbol_facts::ModuleSymbolFacts::from_module(module, pic);
             let n = timed_pass!(
                 "vectorize",
                 run_on_visited(module, &dirty, &mut changed, |func| {
-                    vectorize::vectorize_function_with_symbol_facts(
-                        func,
-                        &symbol_facts,
-                        vectorize_mode,
-                    )
+                    let feats = func.target_features.clone();
+                    with_function_x86_vec_isa(target, x86_isa, x86_avx512vl, &feats, |fn_isa| {
+                        let mode =
+                            vectorize_entry(target, fp_reassoc, fp_contract, x86_avx || fn_isa.avx);
+                        vectorize::vectorize_function_with_symbol_facts(func, &symbol_facts, mode)
+                    })
                 })
             );
             total_changes += n;
@@ -2365,7 +2416,10 @@ pub(crate) fn run_passes(
                 let n = timed_pass!(
                     "vec_interleave",
                     run_on_visited(module, &dirty, &mut changed, |f| {
-                        vec_interleave::run(f, fp_reassoc)
+                        let feats = f.target_features.clone();
+                        with_function_x86_vec_isa(target, x86_isa, x86_avx512vl, &feats, |_| {
+                            vec_interleave::run(f, fp_reassoc)
+                        })
                     })
                 );
                 total_changes += n;
@@ -2391,7 +2445,12 @@ pub(crate) fn run_passes(
             {
                 let n = timed_pass!(
                     "arx_vectorize",
-                    run_on_visited(module, &dirty, &mut changed, arx_vectorize::run)
+                    run_on_visited(module, &dirty, &mut changed, |f| {
+                        let feats = f.target_features.clone();
+                        with_function_x86_vec_isa(target, x86_isa, x86_avx512vl, &feats, |_| {
+                            arx_vectorize::run(f)
+                        })
+                    })
                 );
                 total_changes += n;
                 total_changes_excl_dce += n;
@@ -3064,6 +3123,26 @@ pub(crate) fn run_passes(
             total_changes_excl_dce += n;
         }
 
+        // Register bit-packed switch lookup table: folds multi-arm constant-
+        // returning or constant-Phi-merging `Switch` terminators into a single
+        // range-checked bit-packed immediate shift (`1/2/4/8`-bit entries),
+        // eliminating jump tables and `.rodata` memory loads.
+        // Pass name for CCC_DISABLE_PASSES: "switch_lut".
+        if opt_level >= 2 && !pass_disabled(&disabled, "switch_lut") {
+            let is_32bit = target.is_32bit();
+            let n = timed_pass!(
+                "switch_lut",
+                run_on_visited(module, &dirty, &mut changed, |func| {
+                    switch_lut::run_function(func, is_32bit)
+                })
+            );
+            if n > 0 {
+                cur_pass_changes[7] += n;
+                total_changes += n;
+                total_changes_excl_dce += n;
+            }
+        }
+
         // Phase 8: Copy propagation again
         // Upstream: simplify (folded casts to copies), constfold (folded exprs to copies),
         //           gvn (produced copies), licm (hoisted code), if_convert (select values)
@@ -3246,7 +3325,6 @@ pub(crate) fn run_passes(
         // insn/byte, matching gcc 16.2 and icx) is attributable to that
         // pre-conversion and to the admission fixes, NOT to "opening" a
         // rerun that was already open.
-        let late_mode = late_vectorize_entry(target, fp_reassoc, fp_contract, x86_avx);
         let symbol_facts = module_symbol_facts::ModuleSymbolFacts::from_module(module, pic);
         // SCOPE: min/max reductions, plus the guarded I32→I64 widening
         // sum (`if (a[i] > k) s += a[i]`) — the only reduction the early
@@ -3267,7 +3345,16 @@ pub(crate) fn run_passes(
         let n = {
             let _scope = vectorize::LateMinMaxOnlyScope::enter();
             module.for_each_function(|func| {
-                vectorize::vectorize_function_with_symbol_facts(func, &symbol_facts, late_mode)
+                let feats = func.target_features.clone();
+                with_function_x86_vec_isa(target, x86_isa, x86_avx512vl, &feats, |fn_isa| {
+                    let mode = late_vectorize_entry(
+                        target,
+                        fp_reassoc,
+                        fp_contract,
+                        x86_avx || fn_isa.avx,
+                    );
+                    vectorize::vectorize_function_with_symbol_facts(func, &symbol_facts, mode)
+                })
             })
         };
         if n > 0 {
@@ -3377,7 +3464,10 @@ pub(crate) fn run_passes(
         let n = {
             let _scope = vectorize::LateMinMaxOnlyScope::enter();
             module.for_each_function(|func| {
-                vectorize::vectorize_function_late_with_symbol_facts(func, &symbol_facts)
+                let feats = func.target_features.clone();
+                with_function_x86_vec_isa(target, x86_isa, x86_avx512vl, &feats, |_| {
+                    vectorize::vectorize_function_late_with_symbol_facts(func, &symbol_facts)
+                })
             })
         };
         if n > 0 {

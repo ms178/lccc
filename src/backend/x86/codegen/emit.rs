@@ -1044,6 +1044,14 @@ pub struct X86Codegen {
     /// `target("...")` features are OR-ed onto this and the live
     /// `*_enabled` bits are restored from it after every function.
     module_scalar_isa: ScalarIsa,
+    /// The TU's vector/SIMD ISA (`opts.isa`), captured by `apply_options`
+    /// and restored after every per-function `target("...")` override.
+    module_isa: super::super::isa::X86Isa,
+    /// The TU's baseline `no_sse`, `avx512`, and `avx512vl` bits for restoring
+    /// per-function `target("...")` overrides.
+    module_no_sse: bool,
+    module_avx512: bool,
+    module_avx512vl: bool,
     /// True when the target has LZCNT/ABM (-mlzcnt or an enabling -march).
     /// When false, Clz lowers to a BSR sequence with an explicit zero fixup:
     /// F3-prefixed LZCNT decodes as BSR on CPUs without the feature and
@@ -1628,6 +1636,10 @@ impl X86Codegen {
             lane_const_labels: crate::common::fx_hash::FxHashMap::default(),
             bmi1_enabled: false,
             module_scalar_isa: ScalarIsa::default(),
+            module_isa: super::super::isa::X86Isa::default(),
+            module_no_sse: false,
+            module_avx512: false,
+            module_avx512vl: false,
             lzcnt_enabled: false,
             popcnt_enabled: false,
             prefetch_isa: None,
@@ -1749,6 +1761,7 @@ impl X86Codegen {
         self.state.apply_tls_options(opts);
         self.set_pic(opts.pic || opts.pie);
         self.state.pie_mode = opts.pie;
+        self.state.no_plt = opts.no_plt;
         self.state.fixed_exec_link = opts.fixed_exec_link;
         self.set_function_return_thunk(opts.function_return_thunk);
         self.set_indirect_branch_thunk(opts.indirect_branch_thunk);
@@ -1798,6 +1811,10 @@ impl X86Codegen {
         // encodes the F base (GCC semantics).  Keep the single gate.
         self.avx512vl_enabled = opts.avx512vl && opts.isa.ymm;
         self.isa = opts.isa;
+        self.module_isa = opts.isa;
+        self.module_no_sse = self.no_sse;
+        self.module_avx512 = self.avx512_enabled;
+        self.module_avx512vl = self.avx512vl_enabled;
         // Publish for the emitters without `&self` (MachInst, peepholes).
         super::super::isa::set_current(opts.isa);
         self.state.emit_cfi = opts.emit_cfi;
@@ -3291,8 +3308,7 @@ impl X86Codegen {
                 if let Some(reg) = self.fresh_home_of(v.0) {
                     if is_xmm_reg(reg) {
                         let reg_name = phys_reg_name(reg);
-                        self.state
-                            .emit_fmt(format_args!("    movq %{}, %rax", reg_name));
+                        self.emit_scalar_xmm_to_gpr(reg_name, "rax", None);
                     } else {
                         let reg_name = phys_reg_name(reg);
                         self.state
@@ -3466,7 +3482,7 @@ impl X86Codegen {
                 if let Some(&reg) = self.reg_assignments.get(&v.0) {
                     let name = phys_reg_name(reg);
                     if is_xmm_reg(reg) {
-                        self.state.emit_fmt(format_args!("    movq %{name}, %rax"));
+                        self.emit_scalar_xmm_to_gpr(name, "rax", Some("eax"));
                     } else if self.value_types.get(&v.0).is_some_and(|t| t.size() <= 4) {
                         let name32 = phys_reg_name_32(reg);
                         // Identity `movl %eax, %eax` is a 2-byte no-op (and a
@@ -3524,6 +3540,72 @@ impl X86Codegen {
         }
     }
 
+    /// Transfer scalar carrier bits without granting SSE2 to SSE1 code.
+    /// SSE1 has no GPR/XMM bit-move instruction. Use a balanced, flag-preserving
+    /// stack bridge; scalar consumers do not observe the upper XMM lanes.
+    pub(super) fn emit_scalar_gpr_to_xmm(
+        &mut self,
+        gpr64: &str,
+        gpr32: &str,
+        xmm: &str,
+        f32ish: bool,
+    ) {
+        if self.isa.simd {
+            self.state.emit_fmt(format_args!(
+                "    {} %{}, %{}",
+                if f32ish { "movd" } else { "movq" },
+                if f32ish { gpr32 } else { gpr64 },
+                xmm
+            ));
+        } else {
+            self.state.emit_fmt(format_args!("    pushq %{}", gpr64));
+            if self.state.emit_cfi && self.state.omit_frame_pointer {
+                self.state.emit("    .cfi_adjust_cfa_offset 8");
+            }
+            self.state.emit_fmt(format_args!(
+                "    {} (%rsp), %{}",
+                if f32ish { "movss" } else { "movlps" },
+                xmm
+            ));
+            self.state.emit("    leaq 8(%rsp), %rsp");
+            if self.state.emit_cfi && self.state.omit_frame_pointer {
+                self.state.emit("    .cfi_adjust_cfa_offset -8");
+            }
+        }
+    }
+
+    /// Reverse scalar bit bridge. A 32-bit destination must retain MOVD's
+    /// zero-extension; an eightbyte carrier preserves all of its low 64 bits.
+    pub(super) fn emit_scalar_xmm_to_gpr(&mut self, xmm: &str, gpr64: &str, gpr32: Option<&str>) {
+        if self.isa.simd {
+            self.state.emit_fmt(format_args!(
+                "    {} %{}, %{}",
+                if gpr32.is_some() { "movd" } else { "movq" },
+                xmm,
+                gpr32.unwrap_or(gpr64)
+            ));
+        } else {
+            self.state.emit("    leaq -8(%rsp), %rsp");
+            if self.state.emit_cfi && self.state.omit_frame_pointer {
+                self.state.emit("    .cfi_adjust_cfa_offset 8");
+            }
+            self.state.emit_fmt(format_args!(
+                "    {} %{}, (%rsp)",
+                if gpr32.is_some() { "movss" } else { "movlps" },
+                xmm
+            ));
+            self.state.emit_fmt(format_args!(
+                "    {} (%rsp), %{}",
+                if gpr32.is_some() { "movl" } else { "movq" },
+                gpr32.unwrap_or(gpr64)
+            ));
+            self.state.emit("    leaq 8(%rsp), %rsp");
+            if self.state.emit_cfi && self.state.omit_frame_pointer {
+                self.state.emit("    .cfi_adjust_cfa_offset -8");
+            }
+        }
+    }
+
     /// Store %rax to a value's location (register or stack slot).
     /// Register-only strategy: if the value has a register assignment (callee-saved or caller-saved),
     /// store ONLY to the register (skip the stack write). This eliminates redundant
@@ -3556,8 +3638,21 @@ impl X86Codegen {
         if let Some(&reg) = self.reg_assignments.get(&dest.0) {
             if is_xmm_reg(reg) {
                 let reg_name = phys_reg_name(reg);
-                self.state
-                    .emit_fmt(format_args!("    movq %rax, %{}", reg_name));
+                if self.isa.simd {
+                    self.emit_scalar_gpr_to_xmm("rax", "eax", reg_name, false);
+                } else if let Some(slot) = self.state.get_slot(dest.0) {
+                    // This SSA value owns the slot: refreshing it is cheaper
+                    // than reserving a temporary and cannot overwrite a peer.
+                    let (store, source, load) = if use_small {
+                        ("    movl", "eax", "    movss")
+                    } else {
+                        ("    movq", "rax", "    movlps")
+                    };
+                    self.state.out.emit_instr_reg_rbp(store, source, slot.0);
+                    self.state.out.emit_instr_rbp_reg(load, slot.0, reg_name);
+                } else {
+                    self.emit_scalar_gpr_to_xmm("rax", "eax", reg_name, use_small);
+                }
             } else {
                 // Always use movq for register stores, even for I32/U32 values.
                 // movl zero-extends the upper 32 bits, which corrupts negative I32
@@ -3613,14 +3708,9 @@ impl X86Codegen {
                     ));
                 }
             } else if ty == IrType::F32 || ty == IrType::D32 {
-                self.state.emit_fmt(format_args!(
-                    "    movd %{}, %{}",
-                    src_xmm,
-                    phys_reg_name_32(reg)
-                ));
+                self.emit_scalar_xmm_to_gpr(src_xmm, reg_name, Some(phys_reg_name_32(reg)));
             } else {
-                self.state
-                    .emit_fmt(format_args!("    movq %{}, %{}", src_xmm, reg_name));
+                self.emit_scalar_xmm_to_gpr(src_xmm, reg_name, None);
             }
             return;
         }
@@ -3636,13 +3726,11 @@ impl X86Codegen {
             }
         }
         // Fallback: route through %rax like store_rax_to does.
-        if ty == IrType::F32 || ty == IrType::D32 {
-            self.state
-                .emit_fmt(format_args!("    movd %{}, %eax", src_xmm));
-        } else {
-            self.state
-                .emit_fmt(format_args!("    movq %{}, %rax", src_xmm));
-        }
+        self.emit_scalar_xmm_to_gpr(
+            src_xmm,
+            "rax",
+            matches!(ty, IrType::F32 | IrType::D32).then_some("eax"),
+        );
         self.state.reg_cache.invalidate_acc();
         self.store_rax_to(dest);
     }
@@ -3693,8 +3781,7 @@ impl X86Codegen {
                 if let Some(&reg) = self.reg_assignments.get(&v.0) {
                     if is_xmm_reg(reg) {
                         let reg_name = phys_reg_name(reg);
-                        self.state
-                            .emit_fmt(format_args!("    movq %{}, %rax", reg_name));
+                        self.emit_scalar_xmm_to_gpr(reg_name, "rax", None);
                     } else {
                         // GPR: movl %regd, %eax (32-bit)
                         let reg_name_32 = phys_reg_name_32(reg);
@@ -4463,8 +4550,7 @@ impl X86Codegen {
             if is_xmm_reg(phys_reg) {
                 // XMM → GPR: movq %xmmN, %reg
                 let xmm_name = phys_reg_name(phys_reg);
-                self.state
-                    .emit_fmt(format_args!("    movq %{}, %{}", xmm_name, reg));
+                self.emit_scalar_xmm_to_gpr(xmm_name, reg, None);
                 return;
             }
             if !self.home_clobbered.contains(&val.0) || self.home_readable_via_alias(val.0) {
@@ -7129,6 +7215,9 @@ impl X86Codegen {
         // machinery rewrites at boot.
         let (plan, target): (super::isel::TypedCallPlan, CallTarget) = if let Some(sym) = direct_sym
         {
+            if self.state.needs_got_call(sym) {
+                return false;
+            }
             let target = if self.state.needs_plt(sym) {
                 let n = sym.split('@').next().unwrap_or(sym);
                 CallTarget::Direct(format!("{}@PLT", n))
@@ -7647,10 +7736,55 @@ impl ScalarIsa {
                 "bmi" => self.bmi1 = true,
                 "bmi2" => self.bmi2 = true,
                 "lzcnt" => self.lzcnt = true,
-                "popcnt" => self.popcnt = true,
+                "popcnt" | "sse4.2" => self.popcnt = true,
                 "abm" => {
                     self.lzcnt = true;
                     self.popcnt = true;
+                }
+                "arch=x86-64-v2" | "arch=nehalem" | "arch=westmere" | "arch=sandybridge"
+                | "arch=ivybridge" | "arch=silvermont" | "arch=goldmont" | "arch=tremont" => {
+                    self.popcnt = true;
+                }
+                "arch=x86-64-v3"
+                | "arch=x86-64-v4"
+                | "arch=haswell"
+                | "arch=broadwell"
+                | "arch=skylake"
+                | "arch=skylake-avx512"
+                | "arch=cascadelake"
+                | "arch=cooperlake"
+                | "arch=icelake-client"
+                | "arch=icelake-server"
+                | "arch=tigerlake"
+                | "arch=sapphirerapids"
+                | "arch=emeraldrapids"
+                | "arch=graniterapids"
+                | "arch=alderlake"
+                | "arch=raptorlake"
+                | "arch=meteorlake"
+                | "arch=arrowlake"
+                | "arch=znver1"
+                | "arch=znver2"
+                | "arch=znver3"
+                | "arch=znver4"
+                | "arch=znver5" => {
+                    self.bmi1 = true;
+                    self.bmi2 = true;
+                    self.lzcnt = true;
+                    self.popcnt = true;
+                }
+                _ => {}
+            }
+        }
+        for feature in features {
+            match feature.as_str() {
+                "no-bmi" => self.bmi1 = false,
+                "no-bmi2" => self.bmi2 = false,
+                "no-lzcnt" => self.lzcnt = false,
+                "no-popcnt" => self.popcnt = false,
+                "no-abm" => {
+                    self.lzcnt = false;
+                    self.popcnt = false;
                 }
                 _ => {}
             }
@@ -7903,21 +8037,82 @@ impl X86Codegen {
 
 impl ArchCodegen for X86Codegen {
     fn set_function_target_features(&mut self, features: &[String]) {
-        let isa = self.module_scalar_isa.with_target_features(features);
-        let live = ScalarIsa {
+        let scalar_isa = self.module_scalar_isa.with_target_features(features);
+        let live_scalar = ScalarIsa {
             bmi1: self.bmi1_enabled,
             bmi2: self.bmi2_enabled,
             lzcnt: self.lzcnt_enabled,
             popcnt: self.popcnt_enabled,
         };
-        if isa == live {
-            return;
+        if scalar_isa != live_scalar {
+            self.bmi1_enabled = scalar_isa.bmi1;
+            self.bmi2_enabled = scalar_isa.bmi2;
+            self.lzcnt_enabled = scalar_isa.lzcnt;
+            self.popcnt_enabled = scalar_isa.popcnt;
+            self.publish_shlx_mode();
         }
-        self.bmi1_enabled = isa.bmi1;
-        self.bmi2_enabled = isa.bmi2;
-        self.lzcnt_enabled = isa.lzcnt;
-        self.popcnt_enabled = isa.popcnt;
-        self.publish_shlx_mode();
+        let vec_isa = self.module_isa.with_target_features(features);
+        let want_avx512 = (self.module_avx512
+            || features.iter().any(|f| {
+                matches!(
+                    f.as_str(),
+                    "avx512f"
+                        | "avx512vl"
+                        | "arch=x86-64-v4"
+                        | "arch=skylake-avx512"
+                        | "arch=cascadelake"
+                        | "arch=cooperlake"
+                        | "arch=icelake-client"
+                        | "arch=icelake-server"
+                        | "arch=tigerlake"
+                        | "arch=sapphirerapids"
+                        | "arch=emeraldrapids"
+                        | "arch=graniterapids"
+                        | "arch=znver4"
+                        | "arch=znver5"
+                )
+            }))
+            && vec_isa.ymm
+            && !features.iter().any(|f| f == "no-avx512f");
+        let want_avx512vl = (self.module_avx512vl
+            || features.iter().any(|f| {
+                matches!(
+                    f.as_str(),
+                    "avx512vl"
+                        | "arch=x86-64-v4"
+                        | "arch=skylake-avx512"
+                        | "arch=cascadelake"
+                        | "arch=cooperlake"
+                        | "arch=icelake-client"
+                        | "arch=icelake-server"
+                        | "arch=tigerlake"
+                        | "arch=sapphirerapids"
+                        | "arch=emeraldrapids"
+                        | "arch=graniterapids"
+                        | "arch=znver4"
+                        | "arch=znver5"
+                )
+            }))
+            && want_avx512
+            && !features.iter().any(|f| f == "no-avx512vl");
+        let want_no_sse = if features.is_empty() {
+            self.module_no_sse
+        } else {
+            !vec_isa.simd
+        };
+        if vec_isa != self.isa
+            || want_avx512 != self.avx512_enabled
+            || want_avx512vl != self.avx512vl_enabled
+            || want_no_sse != self.no_sse
+        {
+            self.isa = vec_isa;
+            self.no_sse = want_no_sse;
+            self.avx2_enabled = vec_isa.ymm;
+            self.fma_enabled = vec_isa.fma;
+            self.avx512_enabled = want_avx512;
+            self.avx512vl_enabled = want_avx512vl;
+            super::super::isa::set_current(vec_isa);
+        }
     }
 
     /// Provenance markers for user inline-asm bodies: `#APP`/`#NO_APP`.
@@ -12075,6 +12270,61 @@ mod signed_result_boundary_tests {
                 machinst_result_needs_sext(&load, &needed),
                 ty == IrType::I32
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod scalar_sse1_bridge_tests {
+    use super::X86Codegen;
+
+    #[test]
+    fn scalar_bit_bridges_preserve_width_flags_and_cfa() {
+        for sse2 in [false, true] {
+            for f32ish in [false, true] {
+                for omit_frame_pointer in [false, true] {
+                    let mut cg = X86Codegen::new();
+                    cg.isa.simd = sse2;
+                    cg.state.emit_cfi = true;
+                    cg.state.omit_frame_pointer = omit_frame_pointer;
+                    cg.emit_scalar_gpr_to_xmm("rax", "eax", "xmm2", f32ish);
+                    cg.emit_scalar_xmm_to_gpr("xmm2", "rax", f32ish.then_some("eax"));
+                    let out = &cg.state.out.buf;
+                    if sse2 {
+                        let op = if f32ish { "movd" } else { "movq" };
+                        let reg = if f32ish { "eax" } else { "rax" };
+                        assert!(out.contains(&format!("{op} %{reg}, %xmm2")), "{out}");
+                        assert!(out.contains(&format!("{op} %xmm2, %{reg}")), "{out}");
+                        assert!(!out.contains("%rsp"), "{out}");
+                    } else {
+                        let op = if f32ish { "movss" } else { "movlps" };
+                        assert!(out.contains(&format!("{op} (%rsp), %xmm2")), "{out}");
+                        assert!(out.contains(&format!("{op} %xmm2, (%rsp)")), "{out}");
+                        assert!(
+                            out.contains(if f32ish {
+                                "movl (%rsp), %eax"
+                            } else {
+                                "movq (%rsp), %rax"
+                            }),
+                            "{out}"
+                        );
+                        assert_eq!(out.matches("leaq 8(%rsp), %rsp").count(), 2, "{out}");
+                        // ADD/SUB would destroy a pending comparison's flags.
+                        assert!(!out.contains("addq") && !out.contains("subq"), "{out}");
+                    }
+                    let cfa_pairs = usize::from(!sse2 && omit_frame_pointer) * 2;
+                    assert_eq!(
+                        out.matches(".cfi_adjust_cfa_offset 8\n").count(),
+                        cfa_pairs,
+                        "{out}"
+                    );
+                    assert_eq!(
+                        out.matches(".cfi_adjust_cfa_offset -8\n").count(),
+                        cfa_pairs,
+                        "{out}"
+                    );
+                }
+            }
         }
     }
 }
