@@ -110,3 +110,24 @@ Final focused checks retain 198-vector output agreement after scalar lowering,
 The local full CI suite was not run. The hardware conversion witness establishes
 a wrong-code repair, not a benchmark speedup. Latest SDM verification and the
 other remaining scope boundaries above are still not claimed complete.
+
+## Packed scalar shift counts
+
+The native SSE2/AVX2 emitters treated nonconstant scalar counts as immediate
+zero; encoding large constants modulo imm8 also made counts such as 256 act as
+identity operations. The new paired native packed-count fixture fails against
+GCC before the repair. Element shifts now use MOVD plus the register-count
+instruction for runtime C-int counts, and an equivalent saturated immediate
+(255) for negative or >255 constants. Byte-lane shifts retain their separate
+validated bit-count conversion contract. x86-64 scratch-bank claims and pending
+stores are handled before overwriting the count register.
+
+The fixture checks 384 vector-result hashes over all eight 16/32/64-bit logical
+and arithmetic shift operations at both vector widths, including 21 runtime
+counts and large/negative constants. It matches GCC 16.2.0 on i686/x86-64 at
+O0/O2. The hosted Research workflow requires both ABI companions without skips.
+Scalar packed shifts now require SSE2 (128-bit) or AVX2 (256-bit); the focused
+ISA gate passes its GCC-compared positive/negative and last-option cases on
+both ABIs. Metadata's ten contracts, census and CI invocation parity pass.
+This repairs semantics and native emission; it is not a measured speedup or an
+exhaustive API/signature/manual audit.

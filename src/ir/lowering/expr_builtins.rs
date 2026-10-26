@@ -2758,6 +2758,7 @@ impl Lowerer {
         // it into another function or claiming per-function wider-vector support.
         use crate::common::x86_features::X86Feature as F;
         let needed = match requirement.feature {
+            F::Sse2 => Some(1),
             F::Avx2 => Some(7),
             F::Avx => Some(6),
             F::Ssse3 => Some(3),
@@ -3508,9 +3509,33 @@ fn x86_intrinsic_required_feature(intrinsic: &BuiltinIntrinsic) -> Option<Intrin
         | B::X86Pmulld256
         | B::X86Pmullw256
         | B::X86Pmulhw256
-        | B::X86Pmuludq256 => IntrinsicRequirement {
+        | B::X86Pmuludq256
+        | B::X86Psllidi256
+        | B::X86Psrlidi256
+        | B::X86Psllwi256
+        | B::X86Psrlwi256
+        | B::X86Psllqi256
+        | B::X86Psrlqi256
+        | B::X86Psrawi256
+        | B::X86Psradi256
+        | B::X86Pslldqi256
+        | B::X86Psrldqi256 => IntrinsicRequirement {
             feature: F::Avx2,
             flag: "-mavx2",
+            also: None,
+        },
+        B::X86Pslldqi128
+        | B::X86Psrldqi128
+        | B::X86Psllqi128
+        | B::X86Psrlqi128
+        | B::X86Psllwi128
+        | B::X86Psrlwi128
+        | B::X86Psrawi128
+        | B::X86Psradi128
+        | B::X86Pslldi128
+        | B::X86Psrldi128 => IntrinsicRequirement {
+            feature: F::Sse2,
+            flag: "-msse2",
             also: None,
         },
         B::X86AvxWiden(_) => IntrinsicRequirement {

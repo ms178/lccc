@@ -408,6 +408,27 @@ for mode in -m32 -m64; do
     compare i686_ymm_int.c "$mode" -mavx2
 done
 
+# Scalar-count packed shifts retain their ISA requirement even though their
+# runtime count uses an XMM register rather than an immediate.
+cat >"$tmp/shift128.c" <<'EOF'
+#include <immintrin.h>
+__m128i shift(__m128i a, int n) { return _mm_slli_epi16(a, n); }
+EOF
+cat >"$tmp/shift256.c" <<'EOF'
+#include <immintrin.h>
+__m256i shift(__m256i a, int n) { return _mm256_slli_epi16(a, n); }
+EOF
+for mode in -m32 -m64; do
+    reject shift128.c -msse2 "$mode" -mno-sse2 -msse
+    accept shift128.c psllw "$mode" -msse2
+    reject shift256.c -mavx2 "$mode" -mavx -mno-avx2
+    accept shift256.c vpsllw "$mode" -mavx2
+    compare shift128.c "$mode" -mno-sse2 -msse
+    compare shift128.c "$mode" -msse2
+    compare shift256.c "$mode" -mavx -mno-avx2
+    compare shift256.c "$mode" -mavx2
+done
+
 # All VTEST scalar flags require AVX even at 128 bits; none require AVX2.
 # Compile-only raw vector sources need no target libc headers in either mode.
 for bits in 128 256; do

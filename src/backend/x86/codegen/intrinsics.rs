@@ -1179,11 +1179,52 @@ impl X86Codegen {
     /// Emit SSE unary 128-bit op with immediate: load xmm0 from arg0 ptr,
     /// apply `inst $imm, %xmm0`, store result xmm0 to dest_ptr.
     fn emit_sse_unary_imm_128(&mut self, dest_ptr: &Value, args: &[Operand], sse_inst: &str) {
-        self.sse_load_arg(&args[0], "xmm0");
-        let imm = self.operand_to_imm_i64(&args[1]);
-        self.state
-            .emit_fmt(format_args!("    {} ${}, %xmm0", sse_inst, imm));
+        let packed = crate::backend::x86_common::is_packed_element_shift(sse_inst);
+        let constant = match args[1] {
+            Operand::Const(value) => value.to_i64(),
+            _ => None,
+        };
+        if packed && constant.is_none() {
+            self.flush_pending_vec_store_impl();
+            self.sse_load_arg(&args[0], "xmm0");
+            self.operand_to_reg(&args[1], "rax");
+            self.state.vec_evict_bank_except("xmm1", u32::MAX);
+            self.state.emit("    movd %eax, %xmm1");
+            self.state
+                .emit_fmt(format_args!("    {} %xmm1, %xmm0", sse_inst));
+        } else {
+            self.sse_load_arg(&args[0], "xmm0");
+            let mut imm = self.operand_to_imm_i64(&args[1]);
+            if packed {
+                imm = crate::backend::x86_common::packed_shift_immediate(imm);
+            }
+            self.state
+                .emit_fmt(format_args!("    {} ${}, %xmm0", sse_inst, imm));
+        }
         self.sse_store_dest(dest_ptr, "xmm0");
+    }
+
+    fn emit_avx_packed_shift(&mut self, dptr: &Value, args: &[Operand], inst: &str) {
+        let constant = match args[1] {
+            Operand::Const(value) => value.to_i64(),
+            _ => None,
+        };
+        if constant.is_none() {
+            self.flush_pending_vec_store_impl();
+        }
+        self.avx_load_arg(&args[0]);
+        if let Some(count) = constant {
+            let count = crate::backend::x86_common::packed_shift_immediate(count);
+            self.state
+                .emit_fmt(format_args!("    {} ${}, %ymm0, %ymm0", inst, count));
+        } else {
+            self.operand_to_reg(&args[1], "rax");
+            self.state.vec_evict_bank_except("ymm1", u32::MAX);
+            self.state.emit("    vmovd %eax, %xmm1");
+            self.state
+                .emit_fmt(format_args!("    {} %xmm1, %ymm0, %ymm0", inst));
+        }
+        self.avx_store_dest(dptr);
     }
 
     /// Emit SSE shuffle with immediate: load xmm0, apply `inst $imm, %xmm0, %xmm0`,
@@ -3155,11 +3196,7 @@ impl X86Codegen {
                         IntrinsicOp::Psrlwi256 => "vpsrlw",
                         _ => unreachable!(),
                     };
-                    self.avx_load_arg(&args[0]);
-                    let imm = self.operand_to_imm_i64(&args[1]);
-                    self.state
-                        .emit_fmt(format_args!("    {} ${}, %ymm0, %ymm0", inst, imm));
-                    self.avx_store_dest(dptr);
+                    self.emit_avx_packed_shift(dptr, args, inst);
                 }
             }
             IntrinsicOp::Loadu256 | IntrinsicOp::Load256 => {
@@ -3690,8 +3727,6 @@ impl X86Codegen {
             | IntrinsicOp::Psrawi256
             | IntrinsicOp::Psradi256 => {
                 if let Some(dptr) = dest_ptr {
-                    self.avx_load_arg(&args[0]);
-                    let imm = self.operand_to_imm_i64(&args[1]);
                     let inst = match op {
                         IntrinsicOp::Psllqi256 => "vpsllq",
                         IntrinsicOp::Psrlqi256 => "vpsrlq",
@@ -3699,9 +3734,7 @@ impl X86Codegen {
                         IntrinsicOp::Psradi256 => "vpsrad",
                         _ => unreachable!(),
                     };
-                    self.state
-                        .emit_fmt(format_args!("    {} ${}, %ymm0, %ymm0", inst, imm));
-                    self.avx_store_dest(dptr);
+                    self.emit_avx_packed_shift(dptr, args, inst);
                 }
             }
             IntrinsicOp::Pmovzxbw256
