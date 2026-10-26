@@ -74,6 +74,11 @@ def main():
                 count += 1
 
         for mode in ('-m32', '-m64'):
+            for text in (
+                'unsigned f(float x) { union { float f; unsigned u; } a={.f=x}; return a.u; }',
+                'float f(unsigned x) { union { float f; unsigned u; } a={.u=x}; return a.f; }',
+            ):
+                probe(text, [mode, '-mno-sse2', '-msse'], True, legal=True)
             for name in FLOAT:
                 operands = 'a' if name == 'sqrt_ss' else ('a,b,0x1b' if name == 'shuffle_ps' else 'a,b')
                 text = f'#include <xmmintrin.h>\n__m128 f(__m128 a,__m128 b) {{ return _mm_{name}({operands}); }}\n'

@@ -23,12 +23,22 @@ extern int printf(const char *, ...);
 #define MUL_D _mm_mul_pd
 #endif
 
+unsigned packed_bits(float);
+float packed_from_bits(unsigned);
 F packed_f(F, F, F, F);
 #ifndef SSE1_ONLY
 D packed_d(D, D, D, D);
 #endif
 
 #ifndef CALLER_ONLY
+__attribute__((noinline)) unsigned packed_bits(float f) {
+    union { float f; unsigned u; } a = { .f = f };
+    return a.u;
+}
+__attribute__((noinline)) float packed_from_bits(unsigned u) {
+    union { float f; unsigned u; } a = { .u = u };
+    return a.f;
+}
 __attribute__((noinline)) F packed_f(F a, F b, F c, F d) {
     return ADD_F(SUB_F(MUL_F(a, b), c), d);
 }
@@ -50,6 +60,7 @@ int main(void) {
         F a, b, c, d;
         for (unsigned j = 0; j < sizeof(F) / sizeof(float); ++j) {
             unsigned raw = (i & 1 ? 0x80000000u : 0u) | ((i % 4 == 0) ? j : 0x3f000000u + 65537u * j);
+            if (packed_bits(packed_from_bits(raw)) != raw) return 3;
             __builtin_memcpy((unsigned char *)&a + 4 * j, &raw, 4);
             b[j] = (float)(i - 33) * 0.125f;
             c[j] = (float)j * 0.0625f;

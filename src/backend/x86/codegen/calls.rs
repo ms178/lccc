@@ -1322,27 +1322,23 @@ impl X86Codegen {
                                     } else {
                                         let gpr = super::emit::phys_reg_name(home);
                                         let gpr32 = super::emit::phys_reg_name_32(home);
-                                        if matches!(ty, IrType::F32 | IrType::D32) {
-                                            self.state.emit_fmt(format_args!(
-                                                "    movd %{}, %{}",
-                                                gpr32, xmm_regs[reg_idx]
-                                            ));
-                                        } else {
-                                            self.state.emit_fmt(format_args!(
-                                                "    movq %{}, %{}",
-                                                gpr, xmm_regs[reg_idx]
-                                            ));
-                                        }
+                                        self.emit_scalar_gpr_to_xmm(
+                                            gpr,
+                                            gpr32,
+                                            xmm_regs[reg_idx],
+                                            matches!(ty, IrType::F32 | IrType::D32),
+                                        );
                                         staged = true;
                                     }
                                 }
                             }
                             if !staged {
                                 self.operand_to_rax(arg);
-                                self.state.out.emit_instr_reg_reg(
-                                    "    movq",
+                                self.emit_scalar_gpr_to_xmm(
                                     "rax",
+                                    "eax",
                                     xmm_regs[reg_idx],
+                                    matches!(ty, IrType::F32 | IrType::D32),
                                 );
                             }
                         }
