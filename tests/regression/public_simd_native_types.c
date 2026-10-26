@@ -26,6 +26,17 @@ CONTRACT(__m512d_u, double, 64, 1);
 CONTRACT(__m512_u, float, 64, 1);
 #undef CONTRACT
 
+/* These implementation-private helpers are absent from vendor headers. */
+#ifdef _LCCCSIMD_H_INCLUDED
+#define NATIVE_RESULT(CALL, TYPE) \
+    _Static_assert(__builtin_types_compatible_p(__typeof__(CALL), TYPE), #CALL " native result")
+NATIVE_RESULT(__lccc_simd128_ps_addss128(0, (__m128){0}, (__m128){0}), __m128);
+NATIVE_RESULT(__lccc_simd128_ps_cvtps2dq128(0, (__m128){0}), __m128i);
+NATIVE_RESULT(__lccc_simd128_ps_cvtps2pd128(0, (__m128){0}), __m128d);
+NATIVE_RESULT(__lccc_simd128_ps_cvtpd2ps128(0, (__m128d){0}), __m128);
+#undef NATIVE_RESULT
+#endif
+
 __attribute__((noinline)) static __m256 sum(__m256 a, __m256 b)
 {
     return a + b;
@@ -50,5 +61,14 @@ int main(void)
     for (int i = 0; i < 8; ++i)
         if (z[i] != 9)
             return 2;
+    __m128 scalar = _mm_add_ss(a, _mm_mul_ss(a, a));
+    __m128 packed = _mm_cvtpd_ps(b) + a;
+    __m128d wide = _mm_cvtps_pd(a);
+    if (scalar[0] != 2 || scalar[1] != 2 || scalar[2] != 3 || scalar[3] != 4)
+        return 4;
+    if (packed[0] != 3 || packed[1] != 7 || packed[2] != 3 || packed[3] != 4)
+        return 5;
+    if (wide[0] != 1 || wide[1] != 2)
+        return 6;
     return 0;
 }

@@ -33,6 +33,14 @@ class NativeBuiltinTypes(unittest.TestCase):
         self.assertEqual(generator.result_expression('V4DI'), 'CType::Vector(Box::new(CType::LongLong), 32)')
         self.assertEqual(generator.result_expression('V8SF'), 'CType::Vector(Box::new(CType::Float), 32)')
 
+    def test_argument_shapes_use_source_width_not_result_width(self):
+        self.assertEqual(generator.argument_vector_widths('V16HI_FTYPE_V16QI'), (16,))
+        self.assertEqual(generator.argument_vector_widths('V4SI_FTYPE_V4SI_SI_COUNT'), (16, 0))
+        self.assertEqual(generator.argument_vector_widths('VOID_FTYPE_PCHAR_V16QI'), (0, 16))
+        self.assertEqual(generator.argument_vector_widths('UINT64_FTYPE_VOID'), ())
+        with self.assertRaises(ValueError):
+            generator.argument_vector_widths('INT_FTYPE_UNRECOGNIZED')
+
     def test_unknown_result_and_argument_are_errors(self):
         with self.assertRaises(ValueError):
             generator.result_expression('UNRECOGNIZED')

@@ -3,8 +3,8 @@
 
 Every entry is (gcc_name, mnemonic, kind, ...). The generator emits:
   1. `__lccc_simd*` builtin prototypes (exact arity per kind)
-  2. `_mm*` wrapper functions calling the builtins (struct deref via
-     __CCC_M*_FROM_BUILTIN)
+  2. `_mm*` wrappers calling the builtins (native 128-bit FP results;
+     legacy pointer-result adapters are kept separate for other families)
 
 Builtin arg convention: the FIRST argument is the instruction immediate
 (0 for non-immediate ops); lowering drops it and re-appends it as the LAST
@@ -13,6 +13,7 @@ IR operand.
 Regenerate: python3 scripts/gen_lcccsimd.py
 """
 import sys
+import re
 from pathlib import Path
 
 REPO = Path(__file__).parent.parent
@@ -396,10 +397,14 @@ w(" * Generic SIMD builtin family: __lccc_simd{128|256|512}_{i|ps|pd}_{mnemonic}
 w(" * First builtin argument = instruction immediate (0 for non-immediate ops);")
 w(" * the compiler drops it and re-appends it as the last IR operand.")
 w(" *")
-w(" * Public values are native GNU vectors. Private pointer-result builtins")
-w(" * materialize their result home; the backend keeps XMM/YMM/ZMM values between")
-w(" * consecutive intrinsics (vec_live_regs cache).")
+w(" * Public values and 128-bit FP/conversion helper results are native vectors.")
+w(" * Other private families retain pointer-result adapters. The backend keeps")
+w(" * XMM/YMM/ZMM values between consecutive intrinsics (vec_live_regs cache).")
 w(" */")
+w("")
+# Native result adapters must never reinterpret a returned vector as an address.
+for kind in ("M128", "M128D", "M128I"):
+    w(f"#define __CCC_{kind}_FROM_NATIVE(e) ((__{kind.lower()})(e))")
 w("")
 w("#define __CCC_M128I_FROM_BUILTIN(e) (*(__m128i *)(e))")
 w("#define __CCC_M128_FROM_BUILTIN(e)  (*(__m128 *)(e))")
@@ -415,8 +420,8 @@ w("")
 ALWAYS = "__attribute__((__always_inline__, __artificial__))"
 
 def proto(name, ret, params):
-    assert ret == "void" or ret.startswith("m"), f"not a pointer-result builtin: {name}: {ret}"
-    rt = "void" if ret == "void" else "void *"
+    assert ret == "void" or ret.startswith("m"), f"invalid vector builtin result: {name}: {ret}"
+    rt = "void" if ret == "void" else ("__" + ret if name.startswith("128_ps_") else "void *")
     w(f"{rt} __lccc_simd{name}({', '.join(params)});")
 
 def wrap(decl, body):
@@ -769,6 +774,10 @@ macro("_mm256_cmp_pd(__a, __b, __imm)",
       "__CCC_M256D_FROM_BUILTIN(__lccc_simd256_ps_vcmppd256(__imm, __a, __b))")
 
 w("#endif /* _LCCCSIMD_H_INCLUDED */")
+# Only this family has native result prototypes. Other legacy adapters remain
+# pointer-result APIs until their own result-type contracts are migrated.
+L = [re.sub(r"__CCC_(M128[DI]?)_FROM_BUILTIN\((__lccc_simd128_ps_)",
+            r"__CCC_\1_FROM_NATIVE(\2", line) for line in L]
 generated = "\n".join(L) + "\n"
 if _CHECK_ONLY:
     current = OUT.read_text() if OUT.exists() else ""

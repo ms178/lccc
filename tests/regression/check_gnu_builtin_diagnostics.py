@@ -20,6 +20,18 @@ def main():
                 source = (f'typedef long long V __attribute__((vector_size({size})));\n'
                           f'V f(V a) {{ return __builtin_ia32_{operation}({operands}{count}); }}\n')
                 cases.append((mode, operation + str(count), source))
+    declarations = ('typedef int V __attribute__((vector_size(16)));\n'
+                    'typedef int S __attribute__((vector_size(8)));\n'
+                    'typedef int W __attribute__((vector_size(32)));\n')
+    for mode in ('-m32', '-m64'):
+        for name, call in (
+            ('scalar_in_vector_position', '__builtin_ia32_paddd128(1, (V){0})'),
+            ('short_vector', '__builtin_ia32_paddd128((S){0}, (V){0})'),
+            ('wide_vector', '__builtin_ia32_paddd128((W){0}, (V){0})'),
+            ('vector_in_count_position', '__builtin_ia32_pslldi128((V){0}, (V){0})'),
+            ('widening_requires_narrow_source', '__builtin_ia32_pmovsxbw256((W){0})'),
+        ):
+            cases.append((mode, name, declarations + f'void f(void) {{ {call}; }}\n'))
     for name, operands in (
         ('bzhi_di', '1, 2'), ('crc32di', '1, 2'),
         ('cvtsd2si64', '(D){0}'), ('cvtss2si64', '(F){0}'),

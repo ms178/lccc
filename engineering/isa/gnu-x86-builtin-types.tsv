@@ -1,6 +1,7 @@
 # GNU x86 builtin type facts for explicitly registered canonical names.
 # Source: gcc-mirror/gcc releases/gcc-16.2.0 gcc/config/i386/i386-builtin.def
 # SHA256: 8eaa8802efdd64dd43271645e05ef796a2a390d124c4014ecf5f9d193f7e7c22
+# AES/PCLMUL unnamed BDESC entries are matched by enum and GCC 16.2 wmmintrin.h.
 # name\tGCC function type descriptor\tmode availability
 __builtin_ia32_addpd	V2DF_FTYPE_V2DF_V2DF	both
 __builtin_ia32_addpd256	V4DF_FTYPE_V4DF_V4DF	both
@@ -8,6 +9,12 @@ __builtin_ia32_addps	V4SF_FTYPE_V4SF_V4SF	both
 __builtin_ia32_addps256	V8SF_FTYPE_V8SF_V8SF	both
 __builtin_ia32_addsd	V2DF_FTYPE_V2DF_V2DF	both
 __builtin_ia32_addss	V4SF_FTYPE_V4SF_V4SF	both
+__builtin_ia32_aesdec128	V2DI_FTYPE_V2DI_V2DI	both
+__builtin_ia32_aesdeclast128	V2DI_FTYPE_V2DI_V2DI	both
+__builtin_ia32_aesenc128	V2DI_FTYPE_V2DI_V2DI	both
+__builtin_ia32_aesenclast128	V2DI_FTYPE_V2DI_V2DI	both
+__builtin_ia32_aesimc128	V2DI_FTYPE_V2DI	both
+__builtin_ia32_aeskeygenassist128	V2DI_FTYPE_V2DI_INT	both
 __builtin_ia32_andnpd	V2DF_FTYPE_V2DF_V2DF	both
 __builtin_ia32_andnps	V4SF_FTYPE_V4SF_V4SF	both
 __builtin_ia32_andpd	V2DF_FTYPE_V2DF_V2DF	both
@@ -81,6 +88,7 @@ __builtin_ia32_pavgb128	V16QI_FTYPE_V16QI_V16QI	both
 __builtin_ia32_pavgw128	V8HI_FTYPE_V8HI_V8HI	both
 __builtin_ia32_pblendvb128	V16QI_FTYPE_V16QI_V16QI_V16QI	both
 __builtin_ia32_pblendw128	V8HI_FTYPE_V8HI_V8HI_INT	both
+__builtin_ia32_pclmulqdq128	V2DI_FTYPE_V2DI_V2DI_INT	both
 __builtin_ia32_pcmpeqb128	V16QI_FTYPE_V16QI_V16QI	both
 __builtin_ia32_pcmpeqb256	V32QI_FTYPE_V32QI_V32QI	both
 __builtin_ia32_pcmpeqd128	V4SI_FTYPE_V4SI_V4SI	both

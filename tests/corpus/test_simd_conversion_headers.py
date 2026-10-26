@@ -20,7 +20,15 @@ class ConversionHeaders(unittest.TestCase):
                 self.assertIn(f'typedef {element} {name}_u __attribute__((__vector_size__({width // 8}), __aligned__(1), __may_alias__));', header)
         self.assertNotIn('__val[', header)
         self.assertIn('int __lccc_simd128_ps_extractps128(long, __m128 __a);', header)
-        self.assertIn('void * __lccc_simd128_ps_addss128(long, __m128 __a, __m128 __b);', header)
+        self.assertIn('__m128 __lccc_simd128_ps_addss128(long, __m128 __a, __m128 __b);', header)
+
+    def test_sse_helper_results_are_vectors_not_pointer_adapters(self):
+        header = (ROOT / 'include/lcccsimd.h').read_text()
+        self.assertNotIn('void * __lccc_simd128_ps_', header)
+        self.assertIn('#define __CCC_M128_FROM_NATIVE(e) ((__m128)(e))', header)
+        self.assertIn('__CCC_M128_FROM_NATIVE(__lccc_simd128_ps_addss128', header)
+        self.assertIn('__m128i __lccc_simd128_ps_cvtps2dq128', header)
+        self.assertIn('__m128d __lccc_simd128_ps_cvtps2pd128', header)
 
     def test_packed_signatures(self):
         header = (ROOT / 'include/lcccsimd.h').read_text()
