@@ -2,6 +2,7 @@
 """Restore the reviewed Rust/Clang cache lock, never a remote self-signed hash."""
 import argparse
 import hashlib
+import inspect
 import json
 from pathlib import Path
 import re
@@ -44,7 +45,25 @@ def verify(root, name):
             subprocess.run([str(root / 'bin' / binary), '--version'], check=True)
 
 
+def extractall_takes_filter():
+    """Probe the actual stdlib/backported implementation, not Python's version."""
+    try:
+        return 'filter' in inspect.signature(tarfile.TarFile.extractall).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with path.open('rb') as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def unpack(archive, destination):
+    if not extractall_takes_filter():
+        raise RuntimeError('Secure tar extraction needs a filter-capable Python or backports.tarfile')
     # One packaging directory is removed; data_filter rejects path traversal,
     # absolute symlinks and special devices, including links escaping the root.
     with tarfile.open(archive) as source:
@@ -82,8 +101,7 @@ def restore(entry, name, prefix, downloads):
             part.replace(archive)
         finally:
             part.unlink(missing_ok=True)
-    with archive.open('rb') as stream:
-        actual = hashlib.file_digest(stream, 'sha256').hexdigest()
+    actual = sha256_file(archive)
     if actual != entry['sha256']:
         raise ValueError(f'{archive}: SHA-256 mismatch; refusing extraction')
     temporary = Path(tempfile.mkdtemp(prefix=f'.{name}-', dir=prefix))

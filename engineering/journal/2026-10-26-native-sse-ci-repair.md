@@ -232,3 +232,23 @@ its cover independently confirms publication 26568, revision 3.27, July 2026.
 The tool's page limit reaches contents rather than the individual instruction
 entries. Neither this source identification nor the encoding matrices are
 claimed as exhaustive instruction-semantic/manual verification.
+
+## Hosted extraction-compatibility repair
+
+The merged hosted CI completed with one real failure: fast-contract shard B's
+corpus extraction-safety scanner rejected the new restore call site. All other
+independent CI lanes passed; the final aggregate correctly failed. The restorer
+had a module-level data_filter/backport requirement, but lacked a direct probe
+for the actual extractor's filter keyword. It now probes inspect.signature of
+the selected stdlib/backported implementation and raises before opening an
+archive if unavailable/unknown. No unfiltered fallback was added. The scanner
+recognizes this exact restorer site only when an unconditional first-statement
+negative capability guard raises; other unguarded callers remain rejected.
+The digest loop also avoids hashlib.file_digest, preserving the documented
+older-Python floor rather than merely working on hosted Python.
+
+Eight focused cache tests pass, including a legacy signature, an uninspectable
+callable and refusal before archive open. The extraction-safety suite passes
+27 tests (two interpreter-specific skips on the local bootstrap Python).
+Hosted acceptance must be rerun on this correction; prior successful lanes do
+not make the failed aggregate green.

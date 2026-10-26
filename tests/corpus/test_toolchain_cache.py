@@ -43,6 +43,22 @@ class ToolchainCache(unittest.TestCase):
                 unpack.assert_not_called()
                 verify.assert_not_called()
 
+    def test_filter_probe_checks_actual_signature_and_fails_closed(self):
+        def legacy_extractall(self, path, members=None):
+            pass
+        with patch.object(cache.tarfile.TarFile, 'extractall', legacy_extractall):
+            self.assertFalse(cache.extractall_takes_filter())
+        with patch.object(cache.inspect, 'signature', side_effect=ValueError('unknown callable')):
+            self.assertFalse(cache.extractall_takes_filter())
+
+    def test_unpack_fails_closed_without_filter_keyword(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(cache, 'extractall_takes_filter', return_value=False):
+                with self.assertRaisesRegex(RuntimeError, 'filter-capable'):
+                    cache.unpack(root / 'not-even-opened.tar', root / 'out')
+            self.assertFalse((root / 'out').exists())
+
     def test_unpack_removes_only_packaging_root(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
