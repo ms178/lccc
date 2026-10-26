@@ -3541,6 +3541,40 @@ impl X86Codegen {
         }
     }
 
+    /// Transfer scalar carrier bits without granting SSE2 to SSE1 code.
+    /// SSE1 has no GPR/XMM bit-move instruction. Use a balanced, flag-preserving
+    /// stack bridge; scalar consumers do not observe the upper XMM lanes.
+    pub(super) fn emit_scalar_gpr_to_xmm(
+        &mut self,
+        gpr64: &str,
+        gpr32: &str,
+        xmm: &str,
+        f32ish: bool,
+    ) {
+        if self.isa.simd {
+            self.state.emit_fmt(format_args!(
+                "    {} %{}, %{}",
+                if f32ish { "movd" } else { "movq" },
+                if f32ish { gpr32 } else { gpr64 },
+                xmm
+            ));
+        } else {
+            self.state.emit_fmt(format_args!("    pushq %{}", gpr64));
+            if self.state.emit_cfi && self.state.omit_frame_pointer {
+                self.state.emit("    .cfi_adjust_cfa_offset 8");
+            }
+            self.state.emit_fmt(format_args!(
+                "    {} (%rsp), %{}",
+                if f32ish { "movss" } else { "movlps" },
+                xmm
+            ));
+            self.state.emit("    leaq 8(%rsp), %rsp");
+            if self.state.emit_cfi && self.state.omit_frame_pointer {
+                self.state.emit("    .cfi_adjust_cfa_offset -8");
+            }
+        }
+    }
+
     /// Store %rax to a value's location (register or stack slot).
     /// Register-only strategy: if the value has a register assignment (callee-saved or caller-saved),
     /// store ONLY to the register (skip the stack write). This eliminates redundant
@@ -3573,8 +3607,21 @@ impl X86Codegen {
         if let Some(&reg) = self.reg_assignments.get(&dest.0) {
             if is_xmm_reg(reg) {
                 let reg_name = phys_reg_name(reg);
-                self.state
-                    .emit_fmt(format_args!("    movq %rax, %{}", reg_name));
+                if self.isa.simd {
+                    self.emit_scalar_gpr_to_xmm("rax", "eax", reg_name, false);
+                } else if let Some(slot) = self.state.get_slot(dest.0) {
+                    // This SSA value owns the slot: refreshing it is cheaper
+                    // than reserving a temporary and cannot overwrite a peer.
+                    let (store, source, load) = if use_small {
+                        ("    movl", "eax", "    movss")
+                    } else {
+                        ("    movq", "rax", "    movlps")
+                    };
+                    self.state.out.emit_instr_reg_rbp(store, source, slot.0);
+                    self.state.out.emit_instr_rbp_reg(load, slot.0, reg_name);
+                } else {
+                    self.emit_scalar_gpr_to_xmm("rax", "eax", reg_name, use_small);
+                }
             } else {
                 // Always use movq for register stores, even for I32/U32 values.
                 // movl zero-extends the upper 32 bits, which corrupts negative I32

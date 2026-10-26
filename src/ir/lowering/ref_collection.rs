@@ -234,6 +234,19 @@ impl Lowerer {
         let mut pending = vec![expr];
         while let Some(e) = pending.pop() {
             match e {
+                Expr::FunctionCall(callee, args, _)
+                    if matches!(callee.as_ref(), Expr::Identifier(name, _)
+                        if super::expr_builtins::is_feature_checked_x86_builtin(name)) =>
+                {
+                    // A direct intrinsic call expands in its caller's target
+                    // scope. Retaining the unused header wrapper would check
+                    // its body against the TU baseline instead and spuriously
+                    // reject a legal target("sse2") caller. Only skip this
+                    // direct callee: arguments and all address-taken references
+                    // still participate in reachability as usual.
+                    pending.extend(args.iter());
+                    continue;
+                }
                 Expr::Identifier(name, _) => {
                     if self.known_functions.contains(name) {
                         refs.insert(name.clone());

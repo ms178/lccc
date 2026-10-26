@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+"""Packed public arithmetic: exact bits and caller/provider ABI against GCC 16.2."""
+import argparse
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import tempfile
+
+ROOT = Path(__file__).resolve().parents[2]
+SOURCE = ROOT / 'tests/regression/legacy_sse_native_chain.c'
+
+
+def run(command):
+    result = subprocess.run([str(x) for x in command], capture_output=True, timeout=90)
+    if result.returncode:
+        raise RuntimeError(f'{command}: exit {result.returncode}\n{result.stderr.decode(errors="replace")}')
+    return result.stdout
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--lccc', default=os.environ.get('CCC', str(ROOT / 'target/fastbuild/lccc')))
+    parser.add_argument('--gcc', default=os.environ.get('GCC', shutil.which('gcc-16') or 'gcc-16'))
+    args = parser.parse_args()
+    if run([args.gcc, '-dumpfullversion']).strip() != b'16.2.0':
+        raise RuntimeError('GCC 16.2.0 is required')
+    profiles = {'sse1': ['-mno-sse2', '-msse', '-DSSE1_ONLY'],
+                'sse2': ['-msse2', '-mno-avx'],
+                'avx': ['-mavx', '-mno-avx2', '-DUSE_AVX'],
+                'avx2': ['-mavx2', '-DUSE_AVX']}
+    legs = 0
+    with tempfile.TemporaryDirectory(prefix='legacy-sse-native-') as directory:
+        directory = Path(directory)
+        for mode in ('-m32', '-m64'):
+            for opt in ('-O0', '-O2'):
+                for profile, flags in profiles.items():
+                    base = [mode, opt, '-ffp-contract=off', *flags]
+                    for label, compiler in [('gcc', args.gcc), ('lccc', args.lccc)]:
+                        for part in ('caller', 'provider'):
+                            obj = directory / f'{label}-{part}.o'
+                            define = '-DCALLER_ONLY' if part == 'caller' else '-DPROVIDER_ONLY'
+                            run([compiler, *base, define, '-c', SOURCE, '-o', obj])
+                    expected = None
+                    for caller, provider in [('gcc', 'gcc'), ('gcc', 'lccc'),
+                                             ('lccc', 'gcc'), ('lccc', 'lccc')]:
+                        binary = directory / 'probe'
+                        run([args.gcc, mode, directory / f'{caller}-caller.o',
+                             directory / f'{provider}-provider.o', '-o', binary])
+                        output = run([binary])
+                        if expected is None:
+                            expected = output
+                        if output != expected:
+                            raise RuntimeError(f'{mode}/{opt}/{profile}/{caller}->{provider}: '
+                                               f'{output!r} != GCC {expected!r}')
+                        legs += 1
+                    print(f'PASS {mode} {opt} {profile}: all four caller/provider directions', flush=True)
+    print(f'PASS: {legs} native packed arithmetic ABI/runtime legs, zero skips')
+
+
+if __name__ == '__main__':
+    main()

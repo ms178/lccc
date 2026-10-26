@@ -414,6 +414,39 @@ pub(super) fn lccc_simd_lookup(
     }
 }
 
+/// Legacy native helper permissions follow the encoded instruction, not the
+/// result carrier: AVX conversions can return 128 bits, and 128-bit VPERMIL
+/// is still AVX. AVX-512 has separate subset requirements outside this audit.
+fn legacy_simd_feature(
+    mnemonic: &str,
+) -> Option<(crate::common::x86_features::X86Feature, &'static str)> {
+    use crate::common::x86_features::X86Feature as F;
+    if mnemonic.ends_with("512") {
+        return None;
+    }
+    Some(if mnemonic.contains("fmadd") {
+        (F::Fma, "-mfma")
+    } else if mnemonic.starts_with('v') {
+        (F::Avx, "-mavx")
+    } else {
+        match mnemonic {
+            "divps128" | "minps128" | "maxps128" | "sqrtps128" | "rcpps128" | "rsqrtps128"
+            | "andps128" | "andnps128" | "orps128" | "xorps128" | "addss128" | "subss128"
+            | "mulss128" | "divss128" | "minss128" | "maxss128" | "sqrtss128" | "rcpss128"
+            | "rsqrtss128" | "cmpps128" | "shufps128" | "unpcklps128" | "unpckhps128"
+            | "movmskps128" | "movss128" | "cvtsi2ss128" | "cvtsi2ss64_128" | "cvtss2si128"
+            | "cvttss2si128" => (F::Sse, "-msse"),
+            "haddps128" | "hsubps128" | "addsubps128" | "haddpd128" | "hsubpd128"
+            | "addsubpd128" | "movddup128" | "movsldup128" | "movshdup128" => (F::Sse3, "-msse3"),
+            "roundps128" | "roundpd128" | "blendps128" | "blendpd128" | "blendvps128"
+            | "blendvpd128" | "dpps128" | "dppd128" | "insertps128" | "extractps128" => {
+                (F::Sse41, "-msse4.1")
+            }
+            _ => (F::Sse2, "-msse2"),
+        }
+    })
+}
+
 impl Lowerer {
     /// Lower a call to the generic SIMD family.
     /// Name format: `__lccc_simd{128|256|512}_{i|ps|pd}_{mnemonic}`.
@@ -431,6 +464,19 @@ impl Lowerer {
             LcccSimdClass::Vec512 => 64,
             _ => 0,
         };
+        if !matches!(
+            self.target,
+            crate::backend::Target::X86_64 | crate::backend::Target::I686
+        ) {
+            return self.reject_builtin_call(
+                format!("'{name}' is not available on {}", self.target.triple()),
+                args,
+                width.max(16),
+            );
+        }
+        if let Some((feature, flag)) = legacy_simd_feature(mnemonic) {
+            self.check_x86_simd_feature(feature, flag, name, args);
+        }
         // Drop the leading dummy/imm argument; keep exactly nargs real
         // operands; re-append the immediate (if any) as the LAST operand.
         let mut arg_ops: Vec<Operand> = args
@@ -508,5 +554,28 @@ fn _class_doc(c: LcccSimdClass) -> &'static str {
         LcccSimdClass::Vec512 => "64-byte vector result",
         LcccSimdClass::Scalar => "scalar GPR result",
         LcccSimdClass::PtrStore => "store through dest pointer",
+    }
+}
+
+#[cfg(test)]
+mod legacy_permission_tests {
+    use super::legacy_simd_feature;
+    use crate::common::x86_features::X86Feature as F;
+
+    #[test]
+    fn source_instruction_not_result_width_owns_permission() {
+        for (mnemonic, feature) in [
+            ("minps128", F::Sse),
+            ("cvtpd2ps128", F::Sse2),
+            ("haddps128", F::Sse3),
+            ("roundps128", F::Sse41),
+            ("vcvtpd2ps256", F::Avx),
+            ("vextractf128", F::Avx),
+            ("vpermilps128", F::Avx),
+            ("fmadd132ps128", F::Fma),
+        ] {
+            assert_eq!(legacy_simd_feature(mnemonic).unwrap().0, feature);
+        }
+        assert!(legacy_simd_feature("vcvtpd2ps512").is_none());
     }
 }
