@@ -162,22 +162,9 @@ impl X86Isa {
                     self.sse41 = true;
                     self.avx = true;
                 }
-                "avx2"
-                | "avx512f"
-                | "avx512cd"
-                | "avx512dq"
-                | "avx512bw"
-                | "avx512vl"
-                | "avx512ifma"
-                | "avx512vbmi"
-                | "avx512vbmi2"
-                | "avx512vnni"
-                | "avx512bitalg"
-                | "avx512vpopcntdq"
-                | "avx512bf16"
-                | "avx512fp16"
-                | "avx512er"
-                | "avx512pf"
+                "avx2" | "avx512f" | "avx512cd" | "avx512dq" | "avx512bw" | "avx512vl"
+                | "avx512ifma" | "avx512vbmi" | "avx512vbmi2" | "avx512vnni" | "avx512bitalg"
+                | "avx512vpopcntdq" | "avx512bf16" | "avx512fp16" | "avx512er" | "avx512pf"
                 | "avx512vp2intersect" => {
                     self.simd = true;
                     self.sse41 = true;

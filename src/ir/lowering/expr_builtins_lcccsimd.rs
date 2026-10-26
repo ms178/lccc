@@ -861,7 +861,10 @@ mod legacy_permission_tests {
                 continue;
             };
             let features = super::simd_feature_requirements(canonical);
-            assert!(!features.is_empty(), "{name} has no ISA permission metadata");
+            assert!(
+                !features.is_empty(),
+                "{name} has no ISA permission metadata"
+            );
             assert_eq!(parameters.split(',').count(), operands + 1, "{name}");
             checked += 1;
         }
@@ -882,7 +885,10 @@ mod legacy_permission_tests {
             ("vpcmpub128", &[F::Avx512F, F::Avx512Bw, F::Avx512Vl]),
             ("vpternlogq256", &[F::Avx512F, F::Avx512Vl]),
             ("vpternlogd512", &[F::Avx512F]),
-            ("vmovdqu8_maskz_load256", &[F::Avx512F, F::Avx512Bw, F::Avx512Vl]),
+            (
+                "vmovdqu8_maskz_load256",
+                &[F::Avx512F, F::Avx512Bw, F::Avx512Vl],
+            ),
             ("vmovdqu8_mask_store512", &[F::Avx512F, F::Avx512Bw]),
             ("vpmaxsq512", &[F::Avx512F, F::Avx512Dq]),
             ("vpcmpeqb512", &[F::Avx512F, F::Avx512Bw]),

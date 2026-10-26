@@ -3686,7 +3686,10 @@ impl Driver {
         set.insert_if(avx512_base && self.enable_avx512vl, F::Avx512Vl);
         set.insert_if(avx512_base && self.enable_avx512vnni, F::Avx512Vnni);
         set.insert_if(avx512_base && self.enable_avx512bitalg, F::Avx512BitAlg);
-        set.insert_if(avx512_base && self.enable_avx512vpopcntdq, F::Avx512Vpopcntdq);
+        set.insert_if(
+            avx512_base && self.enable_avx512vpopcntdq,
+            F::Avx512Vpopcntdq,
+        );
 
         // Integer ISA: the resolved predicates already encode the default
         // grant, the `-march` ceiling and the sticky denials — the same

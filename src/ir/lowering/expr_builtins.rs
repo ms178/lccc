@@ -2785,10 +2785,20 @@ impl Lowerer {
                     && requirement.feature == F::Avx512F
                     && matches!(
                         feature,
-                        "avx512bw" | "avx512dq" | "avx512vl" | "avx512cd"
-                            | "avx512ifma" | "avx512vbmi" | "avx512vbmi2"
-                            | "avx512vnni" | "avx512bitalg" | "avx512vpopcntdq"
-                            | "avx512bf16" | "avx512fp16" | "avx512er" | "avx512pf"
+                        "avx512bw"
+                            | "avx512dq"
+                            | "avx512vl"
+                            | "avx512cd"
+                            | "avx512ifma"
+                            | "avx512vbmi"
+                            | "avx512vbmi2"
+                            | "avx512vnni"
+                            | "avx512bitalg"
+                            | "avx512vpopcntdq"
+                            | "avx512bf16"
+                            | "avx512fp16"
+                            | "avx512er"
+                            | "avx512pf"
                             | "avx512vp2intersect"
                     )
                 {
