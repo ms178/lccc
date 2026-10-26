@@ -1322,23 +1322,40 @@ impl X86Codegen {
                                     } else {
                                         let gpr = super::emit::phys_reg_name(home);
                                         let gpr32 = super::emit::phys_reg_name_32(home);
-                                        self.emit_scalar_gpr_to_xmm(
-                                            gpr,
-                                            gpr32,
-                                            xmm_regs[reg_idx],
-                                            matches!(ty, IrType::F32 | IrType::D32),
-                                        );
+                                        if ty == IrType::U16 {
+                                            self.state.emit_fmt(format_args!(
+                                                "    movl %{}, %eax",
+                                                gpr32
+                                            ));
+                                            self.state.emit("    movzwl %ax, %eax");
+                                            self.emit_scalar_gpr_to_xmm(
+                                                "rax",
+                                                "eax",
+                                                xmm_regs[reg_idx],
+                                                true,
+                                            );
+                                        } else {
+                                            self.emit_scalar_gpr_to_xmm(
+                                                gpr,
+                                                gpr32,
+                                                xmm_regs[reg_idx],
+                                                matches!(ty, IrType::F32 | IrType::D32),
+                                            );
+                                        }
                                         staged = true;
                                     }
                                 }
                             }
                             if !staged {
                                 self.operand_to_rax(arg);
+                                if ty == IrType::U16 {
+                                    self.state.emit("    movzwl %ax, %eax");
+                                }
                                 self.emit_scalar_gpr_to_xmm(
                                     "rax",
                                     "eax",
                                     xmm_regs[reg_idx],
-                                    matches!(ty, IrType::F32 | IrType::D32),
+                                    matches!(ty, IrType::F32 | IrType::D32 | IrType::U16),
                                 );
                             }
                         }
@@ -1963,6 +1980,16 @@ impl X86Codegen {
             return;
         }
         if self.call_ret_is_f128_sse {
+            if return_type == IrType::U16 {
+                // _Float16 / __bf16 return in the low 16 bits of %xmm0.
+                self.emit_scalar_xmm_to_gpr("xmm0", "rax", Some("eax"));
+                self.state.emit("    movzwl %ax, %eax");
+                self.store_rax_to(dest);
+                self.state.reg_cache.invalidate_all();
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
+                return;
+            }
             // _Float128 returns come back in ONE XMM register (xmm0, 16 bytes).
             // Mark the dest as a 16-byte payload value: its slot holds the
             // DATA directly (resolve_slot_addr must answer Direct, and

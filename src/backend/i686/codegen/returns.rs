@@ -24,6 +24,13 @@ impl I686Codegen {
                 self.emit_epilogue_and_ret(frame_size);
                 return;
             }
+            if ret_ty == IrType::U16 && self.current_return_half_xmm {
+                self.operand_to_eax(val);
+                self.state.emit("    movzwl %ax, %eax");
+                self.state.emit("    movd %eax, %xmm0");
+                self.emit_epilogue_and_ret(frame_size);
+                return;
+            }
             if ret_ty == IrType::I128 && self.current_return_i686_xmm {
                 match val {
                     Operand::Value(value) => {

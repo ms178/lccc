@@ -352,6 +352,7 @@ pub(crate) fn call_staging(info: &CallInfo) -> Option<u16> {
         || info.is_fastcall
         || info.regparm.is_some()
         || info.ret_is_f128_sse
+        || info.struct_arg_is_f128_sse.iter().any(|&b| b)
         || info.arg_types.len() != info.args.len()
         || info.struct_arg_sizes.iter().any(Option::is_some)
     {

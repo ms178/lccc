@@ -36,6 +36,8 @@ impl Lowerer {
             CType::Double => TypeSpecifier::Double,
             CType::LongDouble => TypeSpecifier::LongDouble,
             CType::Float128 => TypeSpecifier::Float128,
+            CType::Float16 => TypeSpecifier::Float16,
+            CType::BFloat16 => TypeSpecifier::BFloat16,
             CType::Decimal32 => TypeSpecifier::Decimal32,
             CType::Decimal64 => TypeSpecifier::Decimal64,
             CType::Decimal128 => TypeSpecifier::Decimal128,

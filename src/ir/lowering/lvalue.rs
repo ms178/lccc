@@ -24,6 +24,7 @@ impl Lowerer {
         // Access volatility is a pure syntactic/type property of the lvalue
         // (see expr_access_is_volatile); computing it up front keeps every arm
         // below honest without re-walking the expression per arm.
+        let top_addr_of = std::mem::replace(&mut self.in_address_of_top_lvalue, false);
         let vol = self.expr_access_is_volatile(expr);
         match expr {
             Expr::Identifier(name, _) => {
@@ -105,15 +106,18 @@ impl Lowerer {
                 self.discard_expr_result = false;
                 let ptr_val = self.lower_expr(inner);
                 self.discard_expr_result = saved_discard;
-                match ptr_val {
-                    Operand::Value(v) => Some(LValue::address(v, addr_space, vol)),
+                let addr_val = match ptr_val {
+                    Operand::Value(v) => v,
                     Operand::Const(_) => {
-                        // Constant address - copy to a value
                         let dest = self.fresh_value();
                         self.emit(Instruction::Copy { dest, src: ptr_val });
-                        Some(LValue::address(dest, addr_space, vol))
+                        dest
                     }
+                };
+                if !top_addr_of {
+                    self.emit_ubsan_null_check(addr_val, addr_space);
                 }
+                Some(LValue::address(addr_val, addr_space, vol))
             }
             Expr::ArraySubscript(base, index, _) => {
                 let base_ct = self.expr_ctype(base);
@@ -152,7 +156,7 @@ impl Lowerer {
                 // The address space must be derived exactly like the LOAD path,
                 // including segment-qualified member arrays.
                 let addr_space = self.get_addr_space_of_struct_expr(expr);
-                let addr = self.compute_array_element_addr(base, index);
+                let addr = self.compute_array_element_addr_checked(base, index, top_addr_of);
                 if base_ct.is_x87_lane_vector() {
                     return Some(LValue {
                         kind: LValueKind::X87VectorLane(addr, addr_space),
@@ -214,6 +218,7 @@ impl Lowerer {
                         tmp
                     }
                 };
+                self.emit_ubsan_null_check(base_addr, addr_space);
                 let (field_offset, _field_ty) =
                     self.resolve_pointer_member_access(base_expr, field_name);
                 let sso = self.sso_mode_of_member(base_expr, true, field_name);
@@ -952,6 +957,15 @@ impl Lowerer {
     /// Handles reverse subscript (e.g., 3[arr]) by normalizing operands so that
     /// the pointer/array is always the base and the integer is the index.
     pub(super) fn compute_array_element_addr(&mut self, base: &Expr, index: &Expr) -> Value {
+        self.compute_array_element_addr_checked(base, index, false)
+    }
+
+    pub(super) fn compute_array_element_addr_checked(
+        &mut self,
+        base: &Expr,
+        index: &Expr,
+        allow_one_past_end: bool,
+    ) -> Value {
         // In C, a[i] == i[a] == *(a + i). The parser always puts the expression
         // before '[' as base and the one inside as index. We normalize so the
         // pointer/array is always the base. A vector operand plays the base
@@ -991,6 +1005,18 @@ impl Lowerer {
 
         // Get the base address - for nested subscripts (a[i][j]), don't load
         let base_addr = self.get_array_base_addr(actual_base);
+        self.emit_ubsan_subscript_bounds_check(
+            actual_base,
+            index_val,
+            vla_stride,
+            elem_size,
+            allow_one_past_end,
+        );
+        if !allow_one_past_end && self.expr_is_pointer(actual_base) {
+            let base_space = self.get_addr_space_of_ptr_expr(actual_base);
+            let bv = self.operand_to_value(base_addr);
+            self.emit_ubsan_null_check(bv, base_space);
+        }
 
         // Compute offset = index * stride (runtime VLA stride or compile-time elem_size)
         let offset = if let Some(stride_val) = vla_stride {

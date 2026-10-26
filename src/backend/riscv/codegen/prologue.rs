@@ -387,6 +387,7 @@ impl RiscvCodegen {
 
     pub(super) fn emit_prologue_impl(&mut self, func: &IrFunction, frame_size: i64) {
         self.current_return_type = func.return_type;
+        self.func_ret_is_f128_sse = func.ret_is_f128_sse;
         self.current_frame_size = frame_size;
         // Frameless leaf: the 16-byte frame is EXACTLY the ra/s0 save
         // reservation (no slots, no allocas, no callee saves) plus
@@ -630,7 +631,13 @@ impl RiscvCodegen {
                     if has_f128_reg_params && !func.is_variadic {
                         // FP regs were saved to stack; load from save area.
                         let fp_off = f128_save_offset + 64 + (reg_idx as i64) * 8;
-                        if ty == IrType::F32 {
+                        if ty == IrType::U16 {
+                            self.state
+                                .emit_fmt(format_args!("    flw ft0, {}(sp)", fp_off));
+                            self.state.emit("    fmv.x.w t0, ft0");
+                            self.state.emit("    slli t0, t0, 48");
+                            self.state.emit("    srli t0, t0, 48");
+                        } else if ty == IrType::F32 {
                             self.state
                                 .emit_fmt(format_args!("    flw ft0, {}(sp)", fp_off));
                             self.state.emit("    fmv.x.w t0, ft0");
@@ -639,6 +646,11 @@ impl RiscvCodegen {
                                 .emit_fmt(format_args!("    fld ft0, {}(sp)", fp_off));
                             self.state.emit("    fmv.x.d t0, ft0");
                         }
+                    } else if ty == IrType::U16 {
+                        self.state
+                            .emit_fmt(format_args!("    fmv.x.w t0, {}", float_arg_regs[reg_idx]));
+                        self.state.emit("    slli t0, t0, 48");
+                        self.state.emit("    srli t0, t0, 48");
                     } else if ty == IrType::F32 {
                         self.state
                             .emit_fmt(format_args!("    fmv.x.w t0, {}", float_arg_regs[reg_idx]));
@@ -877,56 +889,37 @@ impl RiscvCodegen {
                 } => {
                     let float_arg_regs_inner =
                         ["fa0", "fa1", "fa2", "fa3", "fa4", "fa5", "fa6", "fa7"];
-                    // Get the RISC-V float class to determine field sizes
                     let rv_class = func.params[i].riscv_float_class;
-                    let (lo_is_double, hi_is_double) = match rv_class {
-                        Some(crate::common::types::RiscvFloatClass::OneFloat { is_double }) => {
-                            (is_double, false)
+                    let (lo_sz, hi_sz, hi_offset) = match rv_class {
+                        Some(crate::common::types::RiscvFloatClass::OneFloat { size }) => {
+                            (size, 4, 0)
                         }
                         Some(crate::common::types::RiscvFloatClass::TwoFloats {
-                            lo_is_double,
-                            hi_is_double,
-                        }) => (lo_is_double, hi_is_double),
-                        _ => (size > 4, true), // fallback guess
+                            lo_size,
+                            hi_size,
+                            hi_offset,
+                        }) => (lo_size, hi_size, hi_offset),
+                        _ => (
+                            if size > 4 { 8 } else { 4 },
+                            8,
+                            if size > 4 { 8 } else { 4 },
+                        ),
                     };
-                    // Store first float/double field
-                    if lo_is_double {
-                        self.emit_param_home_store_impl(
-                            over_aligned,
-                            "fsd",
-                            float_arg_regs_inner[lo_fp_idx],
-                            slot,
-                            0,
-                        );
-                    } else {
-                        self.emit_param_home_store_impl(
-                            over_aligned,
-                            "fsw",
-                            float_arg_regs_inner[lo_fp_idx],
-                            slot,
-                            0,
-                        );
-                    }
-                    // Store second float/double field (if present)
+                    self.emit_store_riscv_fp_field(
+                        over_aligned,
+                        float_arg_regs_inner[lo_fp_idx],
+                        slot,
+                        0,
+                        lo_sz,
+                    );
                     if let Some(hi_idx) = hi_fp_idx {
-                        let hi_offset = if lo_is_double { 8 } else { 4 };
-                        if hi_is_double {
-                            self.emit_param_home_store_impl(
-                                over_aligned,
-                                "fsd",
-                                float_arg_regs_inner[hi_idx],
-                                slot,
-                                hi_offset,
-                            );
-                        } else {
-                            self.emit_param_home_store_impl(
-                                over_aligned,
-                                "fsw",
-                                float_arg_regs_inner[hi_idx],
-                                slot,
-                                hi_offset,
-                            );
-                        }
+                        self.emit_store_riscv_fp_field(
+                            over_aligned,
+                            float_arg_regs_inner[hi_idx],
+                            slot,
+                            hi_offset as i64,
+                            hi_sz,
+                        );
                     }
                 }
                 ParamClass::StructMixedIntSseReg {
@@ -934,20 +927,18 @@ impl RiscvCodegen {
                     fp_reg_idx,
                     size: _,
                 } => {
-                    // Integer first, float second (in memory layout)
                     let float_arg_regs_inner =
                         ["fa0", "fa1", "fa2", "fa3", "fa4", "fa5", "fa6", "fa7"];
                     let rv_class = func.params[i].riscv_float_class;
-                    let (float_is_double, int_size, float_offset) = match rv_class {
+                    let (float_sz, int_size, float_offset) = match rv_class {
                         Some(crate::common::types::RiscvFloatClass::IntAndFloat {
-                            float_is_double,
+                            float_size,
                             int_size,
                             float_offset,
                             ..
-                        }) => (float_is_double, int_size, float_offset),
-                        _ => (true, 8, 8), // fallback
+                        }) => (float_size, int_size, float_offset),
+                        _ => (8, 8, 8),
                     };
-                    // Store integer part at beginning of struct
                     let int_store = if int_size <= 4 { "sw" } else { "sd" };
                     self.emit_param_home_store_impl(
                         over_aligned,
@@ -956,61 +947,38 @@ impl RiscvCodegen {
                         slot,
                         0,
                     );
-                    // Store float part at its offset
-                    if float_is_double {
-                        self.emit_param_home_store_impl(
-                            over_aligned,
-                            "fsd",
-                            float_arg_regs_inner[fp_reg_idx],
-                            slot,
-                            float_offset as i64,
-                        );
-                    } else {
-                        self.emit_param_home_store_impl(
-                            over_aligned,
-                            "fsw",
-                            float_arg_regs_inner[fp_reg_idx],
-                            slot,
-                            float_offset as i64,
-                        );
-                    }
+                    self.emit_store_riscv_fp_field(
+                        over_aligned,
+                        float_arg_regs_inner[fp_reg_idx],
+                        slot,
+                        float_offset as i64,
+                        float_sz,
+                    );
                 }
                 ParamClass::StructMixedSseIntReg {
                     fp_reg_idx,
                     int_reg_idx,
                     size: _,
                 } => {
-                    // Float first, integer second (in memory layout)
                     let float_arg_regs_inner =
                         ["fa0", "fa1", "fa2", "fa3", "fa4", "fa5", "fa6", "fa7"];
                     let rv_class = func.params[i].riscv_float_class;
-                    let (float_is_double, int_offset, int_size) = match rv_class {
+                    let (float_sz, int_offset, int_size) = match rv_class {
                         Some(crate::common::types::RiscvFloatClass::FloatAndInt {
-                            float_is_double,
+                            float_size,
                             int_offset,
                             int_size,
                             ..
-                        }) => (float_is_double, int_offset, int_size),
-                        _ => (true, 8, 8), // fallback
+                        }) => (float_size, int_offset, int_size),
+                        _ => (8, 8, 8),
                     };
-                    // Store float part at beginning of struct
-                    if float_is_double {
-                        self.emit_param_home_store_impl(
-                            over_aligned,
-                            "fsd",
-                            float_arg_regs_inner[fp_reg_idx],
-                            slot,
-                            0,
-                        );
-                    } else {
-                        self.emit_param_home_store_impl(
-                            over_aligned,
-                            "fsw",
-                            float_arg_regs_inner[fp_reg_idx],
-                            slot,
-                            0,
-                        );
-                    }
+                    self.emit_store_riscv_fp_field(
+                        over_aligned,
+                        float_arg_regs_inner[fp_reg_idx],
+                        slot,
+                        0,
+                        float_sz,
+                    );
                     // Store integer part at its offset
                     let int_store = if int_size <= 4 { "sw" } else { "sd" };
                     self.emit_param_home_store_impl(
@@ -1078,6 +1046,25 @@ impl RiscvCodegen {
                     state.emit_fmt(format_args!("    mv {}, {}", dest, src));
                 }
             }
+        }
+    }
+
+    fn emit_store_riscv_fp_field(
+        &mut self,
+        over_aligned: bool,
+        freg: &str,
+        slot: crate::backend::state::StackSlot,
+        offset: i64,
+        size: u8,
+    ) {
+        match size {
+            8 => self.emit_param_home_store_impl(over_aligned, "fsd", freg, slot, offset),
+            2 => {
+                self.state
+                    .emit_fmt(format_args!("    fmv.x.w t0, {}", freg));
+                self.emit_param_home_store_impl(over_aligned, "sh", "t0", slot, offset);
+            }
+            _ => self.emit_param_home_store_impl(over_aligned, "fsw", freg, slot, offset),
         }
     }
 
@@ -1153,7 +1140,12 @@ impl RiscvCodegen {
             }
             ParamClass::FloatReg { reg_idx } => {
                 let float_arg_regs = ["fa0", "fa1", "fa2", "fa3", "fa4", "fa5", "fa6", "fa7"];
-                if ty == IrType::F32 {
+                if ty == IrType::U16 {
+                    self.state
+                        .emit_fmt(format_args!("    fmv.x.w t0, {}", float_arg_regs[reg_idx]));
+                    self.state.emit("    slli t0, t0, 48");
+                    self.state.emit("    srli t0, t0, 48");
+                } else if ty == IrType::F32 {
                     self.state
                         .emit_fmt(format_args!("    fmv.x.w t0, {}", float_arg_regs[reg_idx]));
                 } else {

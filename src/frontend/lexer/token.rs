@@ -20,6 +20,13 @@ pub enum TokenKind {
     /// C23 decimal FP literal (df/dd/dl suffix): (width 32|64|128, BID bits
     /// little-endian in 16 bytes). One variant keeps TokenKind matches small.
     FloatLiteralDecimal(u8, [u8; 16]),
+    /// C23 `_Float16` (`is_bf16 = false`) or GCC/Clang `__bf16` (`is_bf16 = true`)
+    /// floating literal (`f16`/`F16`/`bf16`/`BF16` suffix): raw 16-bit IEEE image.
+    FloatLiteralHalf(bool, u16),
+    /// `_Float16` / `__fp16` type keyword.
+    Float16,
+    /// `__bf16` type keyword.
+    BFloat16,
     /// _Float128 / __float128 type keyword.
     Float128,
     /// C23 decimal floating-point keywords (_Decimal32/64/128).
@@ -244,7 +251,8 @@ impl std::fmt::Display for TokenKind {
             | TokenKind::FloatLiteralF32(_)
             | TokenKind::FloatLiteralLongDouble(_, _)
             | TokenKind::FloatLiteralF128(_, _)
-            | TokenKind::FloatLiteralDecimal(_, _) => write!(f, "floating constant"),
+            | TokenKind::FloatLiteralDecimal(_, _)
+            | TokenKind::FloatLiteralHalf(_, _) => write!(f, "floating constant"),
             TokenKind::ImaginaryLiteral(_)
             | TokenKind::ImaginaryLiteralF32(_)
             | TokenKind::ImaginaryLiteralLongDouble(_, _) => write!(f, "imaginary constant"),
@@ -259,6 +267,8 @@ impl std::fmt::Display for TokenKind {
             TokenKind::Identifier(name) => write!(f, "'{}'", name),
 
             // Keywords - shown as quoted keyword text
+            TokenKind::Float16 => write!(f, "'_Float16'"),
+            TokenKind::BFloat16 => write!(f, "'__bf16'"),
             TokenKind::Float128 => write!(f, "'_Float128'"),
             TokenKind::Decimal32 => write!(f, "'_Decimal32'"),
             TokenKind::Decimal64 => write!(f, "'_Decimal64'"),
@@ -534,6 +544,8 @@ impl TokenKind {
             "__builtin_va_arg" => Some(TokenKind::BuiltinVaArg),
             "__builtin_types_compatible_p" => Some(TokenKind::BuiltinTypesCompatibleP),
             "__int128" | "__int128_t" => Some(TokenKind::Int128),
+            "_Float16" | "__fp16" => Some(TokenKind::Float16),
+            "__bf16" => Some(TokenKind::BFloat16),
             "_Float128" | "__float128" => Some(TokenKind::Float128),
             "_Decimal32" | "__decimal32" => Some(TokenKind::Decimal32),
             "_Decimal64" | "__decimal64" => Some(TokenKind::Decimal64),

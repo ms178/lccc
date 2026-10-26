@@ -146,9 +146,10 @@ impl I686Codegen {
                 .params
                 .iter()
                 .map(|param| {
-                    param.struct_eightbyte_classes.len() == 1
-                        && param.struct_eightbyte_classes[0]
-                            == crate::common::types::EightbyteClass::NoClass
+                    (param.ty == IrType::U16 && param.is_f128_sse)
+                        || (param.struct_eightbyte_classes.len() == 1
+                            && param.struct_eightbyte_classes[0]
+                                == crate::common::types::EightbyteClass::NoClass)
                 })
                 .collect();
             let (slots, stack_bytes) = self.fastcall_layout_with_abi(
@@ -172,6 +173,7 @@ impl I686Codegen {
         self.is_variadic = func.is_variadic;
         self.is_fastcall = func.is_fastcall;
         self.current_return_type = func.return_type;
+        self.current_return_half_xmm = func.return_type == IrType::U16 && func.ret_is_f128_sse;
         self.current_return_i686_xmm = func.return_type == IrType::I128
             && func.ret_eightbyte_classes
                 == [
@@ -249,6 +251,20 @@ impl I686Codegen {
         // since ESP changes by runtime-computed amounts.
         if self.state.has_dyn_alloca {
             self.omit_frame_pointer = false;
+        }
+        if self.state.stack_clash_protection {
+            let total_allocas = func
+                .blocks
+                .iter()
+                .flat_map(|b| &b.instructions)
+                .filter_map(|inst| match inst {
+                    crate::ir::reexports::Instruction::Alloca { size, .. } => Some(*size),
+                    _ => None,
+                })
+                .fold(0usize, |acc, s| acc.saturating_add(s));
+            if total_allocas > 12_288 {
+                self.omit_frame_pointer = false;
+            }
         }
 
         // Runtime ESP realignment requires EBP-relative local/param
@@ -748,7 +764,13 @@ impl I686Codegen {
         }
 
         if frame_size > 0 {
-            emit!(self.state, "    subl ${}, %esp", frame_size);
+            let callee_saved_bytes = self.used_callee_saved.len() as i64 * 4;
+            emit_stack_alloc_i686(
+                &mut self.state,
+                frame_size,
+                self.omit_frame_pointer,
+                callee_saved_bytes,
+            );
         }
 
         // Post-prologue %esp baseline (ebp-relative), valid in both frame
@@ -1911,5 +1933,51 @@ impl I686Codegen {
 
     pub(super) fn load_instr_for_type_impl(&self, ty: IrType) -> &'static str {
         self.mov_load_for_type(ty)
+    }
+}
+
+fn emit_stack_alloc_i686(
+    state: &mut crate::backend::state::CodegenState,
+    mut size: i64,
+    omit_fp: bool,
+    callee_saved_bytes: i64,
+) {
+    if size <= 0 {
+        return;
+    }
+    const PAGE_SIZE: i64 = 4096;
+    if !state.stack_clash_protection || size <= PAGE_SIZE {
+        state.emit_fmt(format_args!("    subl ${}, %esp", size));
+        return;
+    }
+    if omit_fp || size <= 4 * PAGE_SIZE {
+        while size > PAGE_SIZE {
+            state.emit_fmt(format_args!("    subl ${}, %esp", PAGE_SIZE));
+            state.emit("    orl $0, (%esp)");
+            size -= PAGE_SIZE;
+        }
+        if size > 0 {
+            state.emit_fmt(format_args!("    subl ${}, %esp", size));
+            state.emit("    orl $0, (%esp)");
+        }
+    } else {
+        // Frame pointer is active (`%ebp` established). Probe the first page by
+        // saving `%eax` into it so `regparm`/`fastcall` incoming `%eax` is
+        // preserved without touching unallocated memory below `%esp`.
+        let saved_eax_ebp_off = -(callee_saved_bytes + PAGE_SIZE);
+        state.emit_fmt(format_args!("    subl ${}, %esp", PAGE_SIZE));
+        state.emit("    movl %eax, (%esp)");
+        let rem_total = size - PAGE_SIZE;
+        let probe_label = state.fresh_label("stack_probe");
+        state.emit_fmt(format_args!("    movl ${}, %eax", rem_total));
+        state.emit_fmt(format_args!("{}:", probe_label));
+        state.emit_fmt(format_args!("    subl ${}, %esp", PAGE_SIZE));
+        state.emit("    orl $0, (%esp)");
+        state.emit_fmt(format_args!("    subl ${}, %eax", PAGE_SIZE));
+        state.emit_fmt(format_args!("    cmpl ${}, %eax", PAGE_SIZE));
+        state.emit_fmt(format_args!("    ja {}", probe_label));
+        state.emit("    subl %eax, %esp");
+        state.emit("    orl $0, (%esp)");
+        state.emit_fmt(format_args!("    movl {}(%ebp), %eax", saved_eax_ebp_off));
     }
 }

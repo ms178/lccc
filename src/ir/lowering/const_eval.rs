@@ -130,7 +130,8 @@ impl Lowerer {
             | Expr::FloatLiteral(..)
             | Expr::FloatLiteralF32(..)
             | Expr::FloatLiteralLongDouble(..)
-            | Expr::FloatLiteralF128(..) => shared_const_eval::eval_literal(expr),
+            | Expr::FloatLiteralF128(..)
+            | Expr::FloatLiteralHalf(..) => shared_const_eval::eval_literal(expr),
             // C23 decimal literal: the 16 bytes are the raw BID bit pattern
             // (little-endian), mirroring the lower_expr materialization.
             // Lowering-local (not shared): sema keeps declining decimal
@@ -194,6 +195,13 @@ impl Lowerer {
                         return Some(IrConst::I128(toggled as i128));
                     }
                 }
+                if inner_ct.as_ref().is_some_and(CType::is_half_float)
+                    || matches!(inner.as_ref(), Expr::FloatLiteralHalf(..))
+                {
+                    if let IrConst::I16(bits) = val {
+                        return Some(IrConst::I16(((bits as u16) ^ 0x8000) as i16));
+                    }
+                }
                 let is_unsigned = self.is_expr_unsigned_for_const(inner);
                 // C11 6.5.3.3p1 + 6.3.1.3p2: `-x` has the operand's promoted
                 // type, and an unsigned result reduces modulo 2^width of that
@@ -225,6 +233,8 @@ impl Lowerer {
                         matches!(
                             self.get_expr_ctype(e),
                             Some(CType::Float128)
+                                | Some(CType::Float16)
+                                | Some(CType::BFloat16)
                                 | Some(CType::Decimal32)
                                 | Some(CType::Decimal64)
                                 | Some(CType::Decimal128)
@@ -235,6 +245,8 @@ impl Lowerer {
                     // binary128, the common type (C23 6.3.1.8).
                     let (l_ct, r_ct) = (self.get_expr_ctype(lhs), self.get_expr_ctype(rhs));
                     let is_f128 = |ct: &Option<CType>| matches!(ct, Some(CType::Float128));
+                    let is_half =
+                        |ct: &Option<CType>| ct.as_ref().is_some_and(CType::is_half_float);
                     let is_dec = |ct: &Option<CType>| ct.as_ref().is_some_and(CType::is_decimal);
                     if (is_f128(&l_ct) || is_f128(&r_ct)) && !is_dec(&l_ct) && !is_dec(&r_ct) {
                         if let (Some(a), Some(b)) = (
@@ -245,6 +257,15 @@ impl Lowerer {
                                 return Some(v);
                             }
                         }
+                    }
+                    if (is_half(&l_ct) || is_half(&r_ct))
+                        && !is_dec(&l_ct)
+                        && !is_dec(&r_ct)
+                        && let (Some(lct), Some(rct)) = (l_ct.as_ref(), r_ct.as_ref())
+                        && let Some(v) =
+                            shared_const_eval::fold_half_binop(op, &l, Some(lct), &r, Some(rct))
+                    {
+                        return Some(v);
                     }
                     if !wide_float_side(lhs) && !wide_float_side(rhs) {
                         // Use infer_expr_type (C semantic types) for proper usual arithmetic
@@ -455,10 +476,35 @@ impl Lowerer {
                     if self.library_name_is_shadowed(name) {
                         return None;
                     }
+                    let class_arg = if name == "__builtin_fpclassify" {
+                        args.get(5)
+                    } else {
+                        args.first()
+                    };
+                    if let Some(arg) = class_arg
+                        && let Some(ct) = self.get_expr_ctype(arg)
+                        && ct.is_half_float()
+                        && let Some(res) = shared_const_eval::eval_half_fpclassify_builtin(
+                            name.as_str(),
+                            args,
+                            &ct,
+                            &|e| self.eval_const_expr(e),
+                        )
+                    {
+                        return Some(res);
+                    }
                     let folded = shared_const_eval::eval_builtin_call_with_mode(
                         name.as_str(),
                         args,
-                        &|e| self.eval_const_expr(e),
+                        &|e| {
+                            let v = self.eval_const_expr(e)?;
+                            let ct = self.get_expr_ctype(e);
+                            Some(shared_const_eval::widen_half_const_for_builtin(
+                                name.as_str(),
+                                v,
+                                ct.as_ref(),
+                            ))
+                        },
                         self.builtin_policy.may_assume(name.as_str()),
                     );
                     if folded.is_none()
@@ -556,6 +602,23 @@ impl Lowerer {
                 }
             }
             return None;
+        }
+
+        // _Float16 / __bf16 target or source: convert by value.
+        if target_ct.is_half_float() || src_ct.as_ref().is_some_and(CType::is_half_float) {
+            if src_ct.as_ref().is_some_and(CType::is_half_float) && target_ct.is_integer() {
+                let bits = shared_const_eval::half_bits_of(&src_val)?;
+                let nonfinite = if src_ct == Some(CType::BFloat16) {
+                    (bits & 0x7f80) == 0x7f80
+                } else {
+                    (bits & 0x7c00) == 0x7c00
+                };
+                if nonfinite {
+                    return None;
+                }
+            }
+            return shared_const_eval::cast_half_const(&src_val, src_ct.as_ref(), &target_ct)
+                .map(|c| c.coerce_to(target_ir_ty));
         }
 
         // _Float128 target: the exact binary128 value of the source.
@@ -1239,13 +1302,11 @@ impl Lowerer {
         // BinaryOp arm above: the shared folders would compute on
         // carrier BITS).
         for e in [lhs, rhs] {
-            if matches!(
-                self.get_expr_ctype(e),
-                Some(CType::Float128)
-                    | Some(CType::Decimal32)
-                    | Some(CType::Decimal64)
-                    | Some(CType::Decimal128)
-            ) {
+            if self
+                .get_expr_ctype(e)
+                .as_ref()
+                .is_some_and(CType::is_soft_float)
+            {
                 return None;
             }
         }
@@ -1387,6 +1448,10 @@ impl Lowerer {
         }
         if src_ct.is_some_and(CType::is_decimal) {
             return Self::cast_bid_to_ir_type(val, dst_ir, dst);
+        }
+        if dst.is_half_float() || src_ct.is_some_and(CType::is_half_float) {
+            return shared_const_eval::cast_half_const(val, src_ct, dst)
+                .map(|c| c.coerce_to(dst_ir));
         }
         None
     }

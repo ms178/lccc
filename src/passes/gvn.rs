@@ -2403,6 +2403,7 @@ mod tests {
             ret_is_f128_sse: false,
             is_gnu_inline_def: false,
             loop_promoted_f64_values: Vec::new(),
+            ssp: Default::default(),
         };
 
         let mut module = IrModule {
@@ -2422,6 +2423,7 @@ mod tests {
             symver_directives: vec![],
             asm_labels: crate::common::fx_hash::FxHashMap::default(),
             tls_model_attrs: crate::common::fx_hash::FxHashMap::default(),
+            ..IrModule::default()
         };
 
         let eliminated = module.for_each_function(run_gvn_function);
@@ -2495,6 +2497,7 @@ mod tests {
             is_gnu_inline_def: false,
             ret_is_f128_sse: false,
             loop_promoted_f64_values: Vec::new(),
+            ssp: Default::default(),
         };
 
         let mut module = IrModule {
@@ -2514,6 +2517,7 @@ mod tests {
             symver_directives: vec![],
             asm_labels: crate::common::fx_hash::FxHashMap::default(),
             tls_model_attrs: crate::common::fx_hash::FxHashMap::default(),
+            ..IrModule::default()
         };
 
         let eliminated = module.for_each_function(run_gvn_function);
@@ -2575,6 +2579,7 @@ mod tests {
             is_gnu_inline_def: false,
             ret_is_f128_sse: false,
             loop_promoted_f64_values: Vec::new(),
+            ssp: Default::default(),
         };
 
         let mut module = IrModule {
@@ -2594,6 +2599,7 @@ mod tests {
             symver_directives: vec![],
             asm_labels: crate::common::fx_hash::FxHashMap::default(),
             tls_model_attrs: crate::common::fx_hash::FxHashMap::default(),
+            ..IrModule::default()
         };
 
         let eliminated = module.for_each_function(run_gvn_function);
@@ -2661,6 +2667,7 @@ mod tests {
             is_gnu_inline_def: false,
             ret_is_f128_sse: false,
             loop_promoted_f64_values: Vec::new(),
+            ssp: Default::default(),
         };
 
         let mut module = IrModule {
@@ -2680,6 +2687,7 @@ mod tests {
             symver_directives: vec![],
             asm_labels: crate::common::fx_hash::FxHashMap::default(),
             tls_model_attrs: crate::common::fx_hash::FxHashMap::default(),
+            ..IrModule::default()
         };
 
         let eliminated = module.for_each_function(run_gvn_function);
@@ -2751,6 +2759,7 @@ mod tests {
             is_gnu_inline_def: false,
             ret_is_f128_sse: false,
             loop_promoted_f64_values: Vec::new(),
+            ssp: Default::default(),
         };
 
         let mut module = IrModule {
@@ -2770,6 +2779,7 @@ mod tests {
             symver_directives: vec![],
             asm_labels: crate::common::fx_hash::FxHashMap::default(),
             tls_model_attrs: crate::common::fx_hash::FxHashMap::default(),
+            ..IrModule::default()
         };
 
         let eliminated = module.for_each_function(run_gvn_function);
@@ -2854,6 +2864,7 @@ mod tests {
             is_gnu_inline_def: false,
             ret_is_f128_sse: false,
             loop_promoted_f64_values: Vec::new(),
+            ssp: Default::default(),
         };
 
         let mut module = IrModule {
@@ -2873,6 +2884,7 @@ mod tests {
             symver_directives: vec![],
             asm_labels: crate::common::fx_hash::FxHashMap::default(),
             tls_model_attrs: crate::common::fx_hash::FxHashMap::default(),
+            ..IrModule::default()
         };
 
         let eliminated = module.for_each_function(run_gvn_function);
@@ -2930,6 +2942,7 @@ mod tests {
             is_gnu_inline_def: false,
             ret_is_f128_sse: false,
             loop_promoted_f64_values: Vec::new(),
+            ssp: Default::default(),
         }
     }
 
@@ -2951,6 +2964,7 @@ mod tests {
             symver_directives: vec![],
             asm_labels: crate::common::fx_hash::FxHashMap::default(),
             tls_model_attrs: crate::common::fx_hash::FxHashMap::default(),
+            ..IrModule::default()
         }
     }
 
@@ -3720,6 +3734,7 @@ mod tests {
             is_gnu_inline_def: false,
             ret_is_f128_sse: false,
             loop_promoted_f64_values: Vec::new(),
+            ssp: Default::default(),
         };
 
         let mut module = IrModule {
@@ -3739,6 +3754,7 @@ mod tests {
             symver_directives: vec![],
             asm_labels: crate::common::fx_hash::FxHashMap::default(),
             tls_model_attrs: crate::common::fx_hash::FxHashMap::default(),
+            ..IrModule::default()
         };
 
         let eliminated = module.for_each_function(run_gvn_function);
@@ -3796,6 +3812,7 @@ mod tests {
             ret_is_f128_sse: false,
             is_gnu_inline_def: false,
             loop_promoted_f64_values: Vec::new(),
+            ssp: Default::default(),
         }
     }
 
@@ -3817,6 +3834,7 @@ mod tests {
             tls_model_attrs: crate::common::fx_hash::FxHashMap::default(),
             char16_string_literals: vec![],
             symver_directives: vec![],
+            ..IrModule::default()
         }
     }
 

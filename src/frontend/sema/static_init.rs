@@ -266,6 +266,7 @@ impl<'s> StaticInitChecker<'s> {
             | Expr::FloatLiteralLongDouble(..)
             | Expr::FloatLiteralF128(..)
             | Expr::FloatLiteralDecimal(..)
+            | Expr::FloatLiteralHalf(..)
             | Expr::ImaginaryLiteral(..)
             | Expr::ImaginaryLiteralF32(..)
             | Expr::ImaginaryLiteralLongDouble(..)

@@ -14,7 +14,7 @@ EOF
 for flag in \
     -flto -flto=auto \
     -fsanitize=address -fsanitize=undefined \
-    -fstack-clash-protection -fvisibility=bogus -ftrivial-auto-var-init=bogus \
+    -fvisibility=bogus -ftrivial-auto-var-init=bogus -fzero-call-used-regs=bogus \
     -fopenmp -freg-struct-return \
     -fno-profile-arcs -fno-test-coverage -fno-branch-probabilities -fno-auto-profile \
     -finstrument-functions-exclude-file-list=generated.c \
@@ -244,6 +244,8 @@ fi
 # the kernel/glibc builds that pass them unconditionally.
 for flag in -fno-plt -fplt -fvisibility=hidden -fvisibility=default -ftrapv -fno-trapv \
     -ftrivial-auto-var-init=zero -ftrivial-auto-var-init=pattern \
+    -fstack-clash-protection -fstack-protector-strong \
+    -fzero-call-used-regs=used -fwhole-program -fno-whole-program \
     -fsemantic-interposition -fno-semantic-interposition; do
     "$CCC" -O2 "$flag" -S "$td/plain.c" -o "$td/noop.s" 2>/dev/null || {
         echo "FAIL: $flag must be accepted" >&2
@@ -309,6 +311,27 @@ EOF
 "$CCC" -O2 -ftrivial-auto-var-init=pattern "$td/autovar_check.c" -o "$td/autovar_check"
 "$td/autovar_check" || {
     echo "FAIL: -ftrivial-auto-var-init=pattern did not fill automatic variable with 0xFE" >&2
+    exit 1
+}
+
+cat > "$td/clash_check.c" <<'EOF'
+__attribute__((noinline)) int touch_deep_frame(int idx) {
+    volatile char buf[16384];
+    buf[0] = 1;
+    buf[idx] = 2;
+    return buf[0] + buf[idx];
+}
+int main(void) { return touch_deep_frame(12000) == 3 ? 0 : 1; }
+EOF
+"$CCC" -O2 -fstack-clash-protection -S "$td/clash_check.c" -o "$td/clash_on.s"
+"$CCC" -O2 -fno-stack-clash-protection -S "$td/clash_check.c" -o "$td/clash_off.s"
+if cmp -s "$td/clash_on.s" "$td/clash_off.s"; then
+    echo "FAIL: -fstack-clash-protection emitted identical assembly to -fno-stack-clash-protection on a 16 KiB frame" >&2
+    exit 1
+fi
+"$CCC" -O2 -fstack-clash-protection "$td/clash_check.c" -o "$td/clash_check"
+"$td/clash_check" || {
+    echo "FAIL: -fstack-clash-protection binary failed at runtime" >&2
     exit 1
 }
 

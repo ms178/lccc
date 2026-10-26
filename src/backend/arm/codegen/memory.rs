@@ -804,7 +804,26 @@ impl ArmCodegen {
     }
 
     pub(super) fn emit_sub_sp_by_acc_impl(&mut self) {
-        self.state.emit("    sub sp, sp, x0");
+        if self.state.stack_clash_protection {
+            let loop_lbl = self.state.fresh_label("dalloca_probe");
+            let rem_lbl = self.state.fresh_label("dalloca_rem");
+            let done_lbl = self.state.fresh_label("dalloca_done");
+            self.state.emit_fmt(format_args!("{}:", loop_lbl));
+            self.state.emit("    cmp x0, #4096");
+            self.state.emit_fmt(format_args!("    b.lo {}", rem_lbl));
+            self.state.emit("    sub sp, sp, #4096");
+            self.state.emit("    str xzr, [sp]");
+            self.state.emit("    sub x0, x0, #4096");
+            self.state.emit_fmt(format_args!("    b {}", loop_lbl));
+            self.state.emit_fmt(format_args!("{}:", rem_lbl));
+            self.state
+                .emit_fmt(format_args!("    cbz x0, {}", done_lbl));
+            self.state.emit("    sub sp, sp, x0");
+            self.state.emit("    str xzr, [sp]");
+            self.state.emit_fmt(format_args!("{}:", done_lbl));
+        } else {
+            self.state.emit("    sub sp, sp, x0");
+        }
     }
 
     pub(super) fn emit_mov_sp_to_acc_impl(&mut self) {

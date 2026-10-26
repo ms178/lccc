@@ -123,7 +123,8 @@ impl<'a> SemaConstEval<'a> {
             | Expr::FloatLiteral(..)
             | Expr::FloatLiteralF32(..)
             | Expr::FloatLiteralLongDouble(..)
-            | Expr::FloatLiteralF128(..) => shared_const_eval::eval_literal(expr),
+            | Expr::FloatLiteralF128(..)
+            | Expr::FloatLiteralHalf(..) => shared_const_eval::eval_literal(expr),
 
             Expr::UnaryOp(UnaryOp::Plus, inner, _) => self.eval_const_expr(inner),
             // Of a real operand, `__real__` is the value and `__imag__` a zero
@@ -148,7 +149,12 @@ impl<'a> SemaConstEval<'a> {
             }
             Expr::UnaryOp(UnaryOp::Neg, inner, _) => {
                 let val = self.eval_const_expr(inner)?;
-                if matches!(self.const_ctype(inner), Some(CType::Float128)) {
+                let inner_ct = self.const_ctype(inner);
+                if matches!(inner_ct, Some(CType::Float16 | CType::BFloat16)) {
+                    let bits = shared_const_eval::half_bits_of(&val)?;
+                    return Some(IrConst::I16((bits ^ 0x8000) as i16));
+                }
+                if matches!(inner_ct, Some(CType::Float128)) {
                     // Negation flips the binary128 sign bit (-0.0Q, -NaN).
                     let IrConst::I128(bits) = val else {
                         return None;
@@ -233,6 +239,46 @@ impl<'a> SemaConstEval<'a> {
                         let r128 = shared_const_eval::f128_bytes_of(rv, rhs_ctype.as_ref())?;
                         return shared_const_eval::fold_f128_binop(op, &l128, &r128);
                     }
+                    let half_side =
+                        |ct: &Option<CType>| ct.as_ref().is_some_and(CType::is_half_float);
+                    if half_side(&lhs_ctype) || half_side(&rhs_ctype) {
+                        if let Some(res) = shared_const_eval::fold_half_binop(
+                            op,
+                            lv,
+                            lhs_ctype.as_ref(),
+                            rv,
+                            rhs_ctype.as_ref(),
+                        ) {
+                            return Some(res);
+                        }
+                        // Mixed with float/double/long double: widen the half side(s) to exact f64/f32!
+                        let widen = |v: &IrConst, ct: &Option<CType>| -> Option<IrConst> {
+                            match ct {
+                                Some(CType::Float16) => {
+                                    Some(IrConst::F32(crate::common::half_float::f16_bits_to_f32(
+                                        shared_const_eval::half_bits_of(v)?,
+                                    )))
+                                }
+                                Some(CType::BFloat16) => {
+                                    Some(IrConst::F32(crate::common::half_float::bf16_bits_to_f32(
+                                        shared_const_eval::half_bits_of(v)?,
+                                    )))
+                                }
+                                _ => Some(*v),
+                            }
+                        };
+                        let lv_w = widen(lv, &lhs_ctype)?;
+                        let rv_w = widen(rv, &rhs_ctype)?;
+                        return shared_const_eval::eval_binop_with_types(
+                            op,
+                            &lv_w,
+                            &rv_w,
+                            lhs_size.max(4),
+                            lhs_unsigned,
+                            rhs_size.max(4),
+                            rhs_unsigned,
+                        );
+                    }
                     let result = shared_const_eval::eval_binop_with_types(
                         op,
                         lv,
@@ -298,6 +344,15 @@ impl<'a> SemaConstEval<'a> {
                 // carrier is not an integer: `(int)2.75Q` is 2, and
                 // `(_Float128)3` is binary128 3.0, not the bit pattern 3).
                 let src_ctype = self.const_ctype(inner);
+                if target_ctype.is_half_float()
+                    || src_ctype.as_ref().is_some_and(CType::is_half_float)
+                {
+                    return shared_const_eval::cast_half_const(
+                        &src_val,
+                        src_ctype.as_ref(),
+                        &target_ctype,
+                    );
+                }
                 if target_ctype == CType::Float128 {
                     let bytes = shared_const_eval::f128_bytes_of(&src_val, src_ctype.as_ref())?;
                     return Some(IrConst::I128(u128::from_le_bytes(bytes) as i128));
@@ -646,10 +701,35 @@ impl<'a> SemaConstEval<'a> {
                 if !self.fold_as_library_function(name) {
                     return None;
                 }
+                let class_arg = if name == "__builtin_fpclassify" {
+                    args.get(5)
+                } else {
+                    args.first()
+                };
+                if let Some(arg) = class_arg
+                    && let Some(ct) = self.const_ctype(arg)
+                    && ct.is_half_float()
+                    && let Some(res) = shared_const_eval::eval_half_fpclassify_builtin(
+                        name.as_str(),
+                        args,
+                        &ct,
+                        &|e| self.eval_const_expr(e),
+                    )
+                {
+                    return Some(res);
+                }
                 shared_const_eval::eval_builtin_call_with_mode(
                     name.as_str(),
                     args,
-                    &|e| self.eval_const_expr(e),
+                    &|e| {
+                        let v = self.eval_const_expr(e)?;
+                        let ct = self.const_ctype(e);
+                        Some(shared_const_eval::widen_half_const_for_builtin(
+                            name.as_str(),
+                            v,
+                            ct.as_ref(),
+                        ))
+                    },
                     self.builtin_policy.may_assume(name.as_str()),
                 )
             }
@@ -1462,6 +1542,7 @@ impl<'a> SemaConstEval<'a> {
             TypeSpecifier::Long | TypeSpecifier::UnsignedLong => Some(ptr_sz),
             TypeSpecifier::LongLong | TypeSpecifier::UnsignedLongLong => Some(8),
             TypeSpecifier::Int128 | TypeSpecifier::UnsignedInt128 => Some(16),
+            TypeSpecifier::Float16 | TypeSpecifier::BFloat16 => Some(2),
             TypeSpecifier::Float => Some(4),
             TypeSpecifier::Double => Some(8),
             TypeSpecifier::LongDouble => Some(if ptr_sz == 4 { 12 } else { 16 }),
@@ -1678,6 +1759,7 @@ impl<'a> SemaConstEval<'a> {
                 }
             }
             TypeSpecifier::Int128 | TypeSpecifier::UnsignedInt128 => 16,
+            TypeSpecifier::Float16 | TypeSpecifier::BFloat16 => 2,
             TypeSpecifier::Float => 4,
             TypeSpecifier::Double => {
                 if ptr_sz == 4 {

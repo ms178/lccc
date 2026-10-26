@@ -944,6 +944,12 @@ impl ScriptDefsyms {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct ScriptLinkExtras {
+    pub build_id_style: linker_common::BuildIdStyle,
+    pub print_memory_usage: bool,
+}
+
 pub fn link_with_script(
     objects: &mut [Object],
     script_src: &str,
@@ -956,6 +962,39 @@ pub fn link_with_script(
     dt_symbolic: bool,
     max_page_size: u64,
     defsym_defs: &[(String, String)],
+) -> Result<(), String> {
+    link_with_script_with_extras(
+        objects,
+        script_src,
+        output_path,
+        emit_symtab,
+        is_pie,
+        emit_relocs,
+        gc_sections,
+        soname,
+        dt_symbolic,
+        max_page_size,
+        defsym_defs,
+        &ScriptLinkExtras {
+            build_id_style: linker_common::BuildIdStyle::Sha1,
+            print_memory_usage: false,
+        },
+    )
+}
+
+pub fn link_with_script_with_extras(
+    objects: &mut [Object],
+    script_src: &str,
+    output_path: &str,
+    emit_symtab: bool,
+    is_pie: bool,
+    emit_relocs: bool,
+    gc_sections: bool,
+    soname: Option<&str>,
+    dt_symbolic: bool,
+    max_page_size: u64,
+    defsym_defs: &[(String, String)],
+    extras: &ScriptLinkExtras,
 ) -> Result<(), String> {
     link_with_script_machine(
         objects,
@@ -970,6 +1009,7 @@ pub fn link_with_script(
         max_page_size,
         defsym_defs,
         ScriptMachine::X86_64,
+        extras,
     )
 }
 
@@ -989,6 +1029,39 @@ pub fn link_with_script_i386(
     max_page_size: u64,
     defsym_defs: &[(String, String)],
 ) -> Result<(), String> {
+    link_with_script_i386_with_extras(
+        objects,
+        script_src,
+        output_path,
+        emit_symtab,
+        is_pie,
+        emit_relocs,
+        gc_sections,
+        soname,
+        dt_symbolic,
+        max_page_size,
+        defsym_defs,
+        &ScriptLinkExtras {
+            build_id_style: linker_common::BuildIdStyle::Sha1,
+            print_memory_usage: false,
+        },
+    )
+}
+
+pub fn link_with_script_i386_with_extras(
+    objects: &mut [Object],
+    script_src: &str,
+    output_path: &str,
+    emit_symtab: bool,
+    is_pie: bool,
+    emit_relocs: bool,
+    gc_sections: bool,
+    soname: Option<&str>,
+    dt_symbolic: bool,
+    max_page_size: u64,
+    defsym_defs: &[(String, String)],
+    extras: &ScriptLinkExtras,
+) -> Result<(), String> {
     link_with_script_machine(
         objects,
         script_src,
@@ -1002,6 +1075,7 @@ pub fn link_with_script_i386(
         max_page_size,
         defsym_defs,
         ScriptMachine::I386,
+        extras,
     )
 }
 
@@ -1021,6 +1095,7 @@ fn link_with_script_machine(
     max_page_size: u64,
     defsym_defs: &[(String, String)],
     machine: ScriptMachine,
+    extras: &ScriptLinkExtras,
 ) -> Result<(), String> {
     let script: LinkerScript = linker_script::parse_linker_script(script_src)?;
 
@@ -4058,9 +4133,9 @@ fn link_with_script_machine(
         }
     }
 
-    // --build-id=sha1: the synthetic "<build-id>" object carries a
+    // --build-id: the synthetic "<build-id>" object carries a
     // .note.gnu.build-id section that the script's *(.note.*) pattern
-    // placed like any input. Fill the header now and hash the COMPLETE
+    // placed like any input. Fill the header now and hash/stamp the COMPLETE
     // image with a zeroed descriptor, then patch the digest in.
     {
         let bid = objects
@@ -4081,14 +4156,32 @@ fn link_with_script_machine(
             {
                 let os = &out_secs[owner];
                 if !os.nobits && os.is_alloc {
-                    let foff = (os.file_offset + (vaddr - os.vaddr)) as usize;
-                    if foff + linker_common::build_id::BUILD_ID_NOTE_SIZE as usize <= out.len() {
-                        linker_common::build_id::write_build_id_skeleton(&mut out, foff);
-                        linker_common::build_id::patch_build_id(&mut out, foff);
-                    }
+                    let foff = os.file_offset + (vaddr - os.vaddr);
+                    let _ = linker_common::build_id::patch_output_build_id_styled(
+                        &mut out,
+                        Some(foff),
+                        &extras.build_id_style,
+                    );
                 }
             }
         }
+    }
+
+    if extras.print_memory_usage && !script.memory.is_empty() {
+        let rows: Vec<(String, u64, u64)> = script
+            .memory
+            .iter()
+            .filter_map(|r| {
+                let &(origin, end) = region_bounds.get(&r.name)?;
+                let cursor = region_cursor.get(&r.name).copied().unwrap_or(origin);
+                Some((
+                    r.name.clone(),
+                    cursor.saturating_sub(origin),
+                    end.saturating_sub(origin),
+                ))
+            })
+            .collect();
+        print!("{}", linker_common::format_memory_usage_table(&rows));
     }
 
     std::fs::write(output_path, &out)

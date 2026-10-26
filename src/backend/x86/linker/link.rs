@@ -343,6 +343,14 @@ pub fn link_builtin(
     // parsed args, and an invalid `-z x86-64-*` level should fail the link
     // before any real work happens anyway.
     let cet_flags = parsed_args.property_link_flags()?;
+    parsed_args.validate_common_options()?;
+    let layout_opts = super::types::EmitLayoutOpts {
+        page_size: parsed_args.resolved_page_size(super::types::PAGE_SIZE)?,
+        image_base: parsed_args.image_base,
+        build_id_style: parsed_args.resolved_build_id_style()?,
+        dynamic_list: linker_common::DynamicList::parse_files(&parsed_args.dynamic_lists)?,
+    };
+    let trace_files = parsed_args.trace_files;
     let libs_to_load = parsed_args.libs_to_load;
     // Whether each `-l` in `libs_to_load` was written under `-Bstatic` (or
     // `-static`): its search then accepts only `libNAME.a`.  args.rs records
@@ -596,8 +604,17 @@ pub fn link_builtin(
     // content-derived, so it can only be computed once the image is final;
     // `emit_exec` overwrites the placeholder in place (see
     // `patch_output_build_id`).  Debian's gcc passes --build-id on every link.
-    if parsed_args.build_id {
-        objects.push(linker_common::build_id::synthetic_note_object());
+    if layout_opts.build_id_style.is_enabled() {
+        objects.push(linker_common::build_id::synthetic_note_object_styled(
+            &layout_opts.build_id_style,
+        ));
+    }
+    if trace_files {
+        for obj in objects.iter() {
+            if !obj.source_name.starts_with('<') {
+                println!("{}", obj.source_name);
+            }
+        }
     }
 
     define_tls_module_base(&mut globals, &objects);
@@ -705,6 +722,7 @@ pub fn link_builtin(
             export_dynamic,
             objects.dso_names(),
             parsed_args.version_script.as_deref(),
+            layout_opts.dynamic_list.as_ref(),
         ) {
             gc_roots.extend(
                 globals
@@ -910,6 +928,7 @@ pub fn link_builtin(
         export_dynamic,
         objects.dso_names(),
         parsed_args.version_script.as_deref(),
+        layout_opts.dynamic_list.as_ref(),
     );
     let (plt_names, got_entries, abs_dyn_relocs, pie_relative, local_got) =
         create_plt_got(&objects, &mut globals, is_pie, &preemptible_tls);
@@ -973,6 +992,7 @@ pub fn link_builtin(
         parsed_args.hash_style,
         &pending_defsyms,
         &preemptible_tls,
+        &layout_opts,
     );
     phase!("emit-exec");
     if ld_time {
@@ -1035,6 +1055,14 @@ pub fn link_shared(
     // CET/ISA flags up front, as in `link_builtin`: an invalid `-z
     // x86-64-*` level fails the link before any real work happens.
     let cet_flags = parsed.property_link_flags()?;
+    parsed.validate_common_options()?;
+    let layout_opts = super::types::EmitLayoutOpts {
+        page_size: parsed.resolved_page_size(super::types::PAGE_SIZE)?,
+        image_base: parsed.image_base,
+        build_id_style: parsed.resolved_build_id_style()?,
+        dynamic_list: linker_common::DynamicList::parse_files(&parsed.dynamic_lists)?,
+    };
+    let trace_files = parsed.trace_files;
 
     let extra_lib_paths: Vec<String> = parsed.extra_lib_paths.clone();
     let soname: Option<String> = parsed.soname.clone();
@@ -1235,6 +1263,18 @@ pub fn link_shared(
     // Nothing is synthesized before this point on the shared-library path,
     // so every object is a real input.
     let real_inputs = objects.len();
+    if layout_opts.build_id_style.is_enabled() {
+        objects.push(linker_common::build_id::synthetic_note_object_styled(
+            &layout_opts.build_id_style,
+        ));
+    }
+    if trace_files {
+        for obj in objects.iter() {
+            if !obj.source_name.starts_with('<') {
+                println!("{}", obj.source_name);
+            }
+        }
+    }
     if let Some(carrier) = linker_common::cet::merge_property_into_objects(
         &mut objects,
         real_inputs,
@@ -1321,5 +1361,6 @@ pub fn link_shared(
         &exclude_libs,
         parsed.map_path.as_deref(),
         &pending_defsyms,
+        &layout_opts,
     )
 }

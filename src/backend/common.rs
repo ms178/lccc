@@ -1128,15 +1128,28 @@ fn pic_crt_objects(objs: &[String], start: Option<&str>) -> Vec<String> {
 /// will end up in a position-fixed ET_EXEC (fast jump tables) or a
 /// position-dependent ET_DYN (portable jump tables).
 pub fn linker_pie_effective(linker_args: &[String]) -> bool {
-    linker_args
-        .iter()
-        .rev()
-        .find_map(|a| match a.as_str() {
-            "-pie" | "--pie" | "--pic-executable" => Some(true),
-            "-no-pie" | "--no-pie" | "--no-pic-executable" => Some(false),
-            _ => None,
-        })
-        .unwrap_or(false)
+    for a in linker_args.iter().rev() {
+        let mut pie_opt = None;
+        if let Some(wl) = a.strip_prefix("-Wl,") {
+            for tok in wl.split(',') {
+                match tok {
+                    "-pie" | "--pie" | "--pic-executable" => pie_opt = Some(true),
+                    "-no-pie" | "--no-pie" | "--no-pic-executable" => pie_opt = Some(false),
+                    _ => {}
+                }
+            }
+        } else {
+            match a.as_str() {
+                "-pie" | "--pie" | "--pic-executable" => pie_opt = Some(true),
+                "-no-pie" | "--no-pie" | "--no-pic-executable" => pie_opt = Some(false),
+                _ => {}
+            }
+        }
+        if let Some(v) = pie_opt {
+            return v;
+        }
+    }
+    false
 }
 
 #[cfg(not(feature = "gcc_linker"))]
@@ -1221,10 +1234,9 @@ fn link_builtin_native(
     let mut setup = resolve_builtin_link_setup(arch, user_args, is_nostdlib, is_static);
     add_arch_extra_libs(&mut setup, arch.elf_machine, is_static);
     // `-pie` (the last of `-pie`/`-no-pie` wins, as for the linker) takes
-    // gcc's PIE startfiles.  x86-64 only here: the i686 linker does not
-    // produce PIEs yet, and other backends own their own policy.
+    // gcc's PIE startfiles on both x86-64 and i686.
     let is_pie = linker_pie_effective(user_args);
-    if arch.elf_machine == EM_X86_64 && is_pie && !is_static {
+    if matches!(arch.elf_machine, EM_X86_64 | EM_386) && is_pie && !is_static {
         setup.crt_before = pic_crt_objects(&setup.crt_before, Some("Scrt1.o"));
         setup.crt_after = pic_crt_objects(&setup.crt_after, None);
     }

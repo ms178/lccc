@@ -11,6 +11,7 @@ pub(crate) mod error;
 pub(crate) mod forwarding;
 pub(crate) mod fp_contract;
 pub(crate) mod fx_hash;
+pub(crate) mod half_float;
 pub(crate) mod hex_float;
 pub(crate) mod isa_features;
 pub(crate) mod long_double;

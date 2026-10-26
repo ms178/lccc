@@ -46,9 +46,9 @@ pub fn link_builtin(
 
     let all_lib_paths: Vec<String> = lib_paths.iter().map(|s| s.to_string()).collect();
 
-    let rpath = linker_common::rpath_dyn_entry(&linker_common::parse_linker_args(user_args));
-    // Parse user args for export-dynamic flag
-    let mut export_dynamic = false;
+    let parsed_common = linker_common::parse_linker_args(user_args);
+    let rpath = linker_common::rpath_dyn_entry(&parsed_common);
+    let mut export_dynamic = parsed_common.export_dynamic;
     for arg in user_args {
         if arg == "-rdynamic" {
             export_dynamic = true;
@@ -267,6 +267,15 @@ pub fn link_builtin(
             &combined_lib_paths,
             &default_libs,
         )?;
+    }
+
+    if parsed_common.trace_files {
+        for obj in objects.iter() {
+            println!("{}", obj.source_name);
+        }
+        for soname in &needed_sonames {
+            println!("{soname}");
+        }
     }
 
     // Apply --defsym definitions: aliases are resolved here; constants and

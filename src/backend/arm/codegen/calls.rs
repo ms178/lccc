@@ -348,6 +348,12 @@ impl ArmCodegen {
     /// dispatch (I128 pair / long double / FP / integer).
     pub(super) fn emit_call_store_result_impl(&mut self, dest: &Value, return_type: IrType) {
         if self.call_ret_is_f128_sse {
+            if return_type == IrType::U16 {
+                self.state.emit("    fmov w0, s0");
+                self.state.emit("    and w0, w0, #0xffff");
+                self.emit_store_result(dest);
+                return;
+            }
             self.emit_call_store_f128_result_impl(dest);
             return;
         }

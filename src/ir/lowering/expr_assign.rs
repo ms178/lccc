@@ -1299,10 +1299,29 @@ impl Lowerer {
         let (common_ty, op_ty) =
             Self::usual_arithmetic_conversions(ty, rhs_ty, lhs_ir_ty, rhs_ir_ty);
 
-        let rhs_val = self.lower_expr_with_type(rhs, op_ty);
+        let is_shift = matches!(op, BinOp::Shl | BinOp::Shr);
+        let rhs_promoted_ty = Self::integer_promote(rhs_ir_ty);
+        let rhs_full_for_shift = if is_shift
+            && (self.ubsan_active(super::ubsan::UbsanFlags::SHIFT_EXPONENT)
+                || self.ubsan_active(super::ubsan::UbsanFlags::SHIFT_BASE))
+        {
+            let full_ty = crate::common::types::widened_op_type(rhs_promoted_ty);
+            let full_val = self.lower_expr_with_type(rhs, full_ty);
+            Some((full_val, full_ty))
+        } else {
+            None
+        };
+        let rhs_val = if let Some((full_val, full_ty)) = rhs_full_for_shift {
+            if full_ty != op_ty {
+                Operand::Value(self.emit_cast_val(full_val, full_ty, op_ty))
+            } else {
+                full_val
+            }
+        } else {
+            self.lower_expr_with_type(rhs, op_ty)
+        };
         if let Some(lv) = self.lower_lvalue_for_mutation(lhs) {
             let loaded = self.load_lvalue_typed(&lv, ty);
-            let is_shift = matches!(op, BinOp::Shl | BinOp::Shr);
             let loaded_promoted =
                 self.promote_for_op(loaded, ty, lhs_ir_ty, op_ty, common_ty, is_shift);
 
@@ -1339,8 +1358,36 @@ impl Lowerer {
                 rhs_val
             };
 
-            let result = if self.trapv
-                && self.func_state.is_some()
+            if let Some((full_val, full_ty)) = rhs_full_for_shift {
+                let promoted_lhs = Self::integer_promote(lhs_ir_ty);
+                let rhs_prom = if full_ty != rhs_promoted_ty {
+                    Operand::Value(self.emit_cast_val(full_val, full_ty, rhs_promoted_ty))
+                } else {
+                    full_val
+                };
+                self.emit_ubsan_shift_checks(
+                    *op == BinOp::Shl,
+                    loaded_promoted,
+                    op_ty,
+                    promoted_lhs,
+                    rhs_prom,
+                    rhs_promoted_ty,
+                );
+            } else if matches!(op, BinOp::Div | BinOp::Mod) && ty != IrType::Ptr {
+                if op_ty.is_float() {
+                    self.emit_ubsan_float_div_check(actual_rhs, op_ty);
+                } else {
+                    self.emit_ubsan_int_div_checks(
+                        loaded_promoted,
+                        actual_rhs,
+                        common_ty,
+                        op_ty,
+                        is_unsigned,
+                    );
+                }
+            }
+
+            let result = if self.signed_overflow_traps()
                 && !self.is_bool_lvalue(lhs)
                 && ty != IrType::Ptr
                 && !is_unsigned

@@ -575,6 +575,10 @@ pub struct CodegenState {
     pub mcount_unsupported_warned: bool,
     /// Whether to emit endbr64 at function entry points (-fcf-protection=branch).
     pub cf_protection_branch: bool,
+    /// `-fstack-clash-protection` enabled for this compilation unit.
+    pub stack_clash_protection: bool,
+    /// Resolved stack-protector guard configuration for `IntrinsicOp::LoadStackGuard`.
+    pub stack_protector_guard: Option<crate::backend::stack_protector::EffectiveStackGuard>,
     /// Current program point during codegen (incremented per instruction).
     /// Used by Phase 2b selective caller-save save/restore.
     pub current_program_point: u32,
@@ -872,6 +876,8 @@ impl CodegenState {
             pending_classic_mcount_label: None,
             mcount_unsupported_warned: false,
             cf_protection_branch: false,
+            stack_clash_protection: false,
+            stack_protector_guard: None,
             current_program_point: 0,
             f128_load_sources: FxHashMap::default(),
             f128_direct_slots: FxHashSet::default(),
@@ -1395,6 +1401,8 @@ impl CodegenState {
     /// every backend's `apply_options`).
     pub fn apply_tls_options(&mut self, opts: &crate::backend::CodegenOptions) {
         self.shared_lib = opts.shared_lib;
+        self.stack_clash_protection = opts.stack_clash_protection;
+        self.stack_protector_guard = opts.stack_protector_guard.clone();
         self.tls_policy = crate::common::tls::TlsPolicy {
             shlib: opts.pic,
             floor: opts.tls_model_floor,

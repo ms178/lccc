@@ -159,6 +159,10 @@ pub(super) const RISCV_ARG_REGS: [&str; 8] = ["a0", "a1", "a2", "a3", "a4", "a5"
 pub struct RiscvCodegen {
     pub(crate) state: CodegenState,
     pub(super) current_return_type: IrType,
+    /// True when the current function returns a 16-bit half-float (`_Float16`/`__bf16`) in `fa0`.
+    pub(super) func_ret_is_f128_sse: bool,
+    /// True when the call just emitted returns a 16-bit half-float (`_Float16`/`__bf16`) in `fa0`.
+    pub(super) call_ret_is_f128_sse: bool,
     /// Number of named integer params for current variadic function.
     pub(super) va_named_gp_count: usize,
     /// Total bytes of named params that overflow to the caller's stack.
@@ -216,6 +220,8 @@ impl RiscvCodegen {
         Self {
             state: CodegenState::new_with_ra_config(ra_config),
             current_return_type: IrType::I64,
+            func_ret_is_f128_sse: false,
+            call_ret_is_f128_sse: false,
             va_named_gp_count: 0,
             va_named_stack_bytes: 0,
             bitop_nonneg_values: FxHashSet::default(),
@@ -1058,6 +1064,9 @@ impl ArchCodegen for RiscvCodegen {
     }
     fn current_return_type(&self) -> IrType {
         self.current_return_type
+    }
+    fn set_call_ret_is_f128_sse(&mut self, is_f128: bool) {
+        self.call_ret_is_f128_sse = is_f128;
     }
     fn emit_get_return_f128_second(&mut self, _dest: &Value) {}
     fn emit_set_return_f128_second(&mut self, _src: &Operand) {}

@@ -111,14 +111,7 @@ impl Lowerer {
             // For _Bool return, normalize at the source type before any truncation.
             self.emit_expr_bool_conversion(val, expr_ty, e)
         } else if let Some(ret_ct) = self.func_mut().return_ctype.clone() {
-            if ret_ct == CType::Float128
-                || expr_ct == CType::Float128
-                || ret_ct.is_decimal()
-                || expr_ct.is_decimal()
-            {
-                // _Float128 return conversions route through the soft-float
-                // helpers (__extenddftf2/__trunctfdf2), not the bit-cast IR path.
-                // C23 decimals likewise route through libbid (__bid_float*).
+            if ret_ct.is_soft_float() || expr_ct.is_soft_float() {
                 self.convert_scalar_ctype(val, expr_ty, &expr_ct, &ret_ct)
             } else {
                 self.emit_implicit_cast(val, expr_ty, ret_ty)

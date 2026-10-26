@@ -317,6 +317,10 @@ impl Lowerer {
             ret_is_f128_sse: false,
             is_gnu_inline_def: false,
             loop_promoted_f64_values: Vec::new(),
+            ssp: crate::ir::module::SspInfo {
+                no_stack_protector: true,
+                ..Default::default()
+            },
         };
         self.defined_functions.insert(resolver_name.to_string());
         self.module.functions.push(ir_func);

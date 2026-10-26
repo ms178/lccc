@@ -117,6 +117,24 @@ impl Lowerer {
                     return Operand::Const(v);
                 }
             }
+            if (lct.is_half_float() || rct.is_half_float())
+                && lct != CType::Float128
+                && rct != CType::Float128
+                && real(&lct)
+                && real(&rct)
+                && !lct.is_decimal()
+                && !rct.is_decimal()
+            {
+                if let Some(v) = self
+                    .eval_const_expr(lhs)
+                    .zip(self.eval_const_expr(rhs))
+                    .and_then(|(l, r)| {
+                        shared_const_eval::fold_half_binop(op, &l, Some(&lct), &r, Some(&rct))
+                    })
+                {
+                    return Operand::Const(v);
+                }
+            }
         }
 
         // Fast path: constant-fold pure integer arithmetic at lowering time.
@@ -144,13 +162,18 @@ impl Lowerer {
             // _Float128 (carrier U128) is NOT an integer: folding its bit
             // pattern as an i128 would compute garbage (e.g. 1.5F128 * 3.125F128
             // multiplied as integers). F128 ops go through libgcc soft-float.
-            let lhs_no_fold = matches!(self.expr_ctype(lhs), CType::Float128)
-                || self.expr_ctype(lhs).is_decimal();
-            let rhs_no_fold = matches!(self.expr_ctype(rhs), CType::Float128)
-                || self.expr_ctype(rhs).is_decimal();
-            let trapv_active = self.trapv
-                && self.func_state.is_some()
-                && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul);
+            let lhs_no_fold = self.expr_ctype(lhs).is_soft_float();
+            let rhs_no_fold = self.expr_ctype(rhs).is_soft_float();
+            let trapv_active = (self.signed_overflow_traps()
+                && matches!(
+                    op,
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod
+                ))
+                || (self.ubsan_active(super::ubsan::UbsanFlags::INT_DIV_ZERO)
+                    && matches!(op, BinOp::Div | BinOp::Mod))
+                || ((self.ubsan_active(super::ubsan::UbsanFlags::SHIFT_EXPONENT)
+                    || self.ubsan_active(super::ubsan::UbsanFlags::SHIFT_BASE))
+                    && matches!(op, BinOp::Shl | BinOp::Shr));
             if !trapv_active
                 && !lhs_ty.is_float()
                 && !rhs_ty.is_float()
@@ -208,6 +231,12 @@ impl Lowerer {
         let rhs_ct = self.expr_ctype(rhs);
         if matches!(lhs_ct, CType::Float128) || matches!(rhs_ct, CType::Float128) {
             return self.lower_f128_binop(op, lhs, lhs_ct, rhs, rhs_ct);
+        }
+        if (lhs_ct.is_half_float() || rhs_ct.is_half_float())
+            && !lhs_ct.is_decimal()
+            && !rhs_ct.is_decimal()
+        {
+            return self.lower_half_binop(op, lhs, &lhs_ct, rhs, &rhs_ct);
         }
 
         let result = self.lower_arithmetic_binop(op, lhs, rhs);
@@ -520,10 +549,38 @@ impl Lowerer {
         let (lhs_val, rhs_val) = if is_shift {
             let shift_lhs_ty = widened_op_type(op_ty);
             let lhs_val = self.lower_expr_with_type(lhs, shift_lhs_ty);
-            // Shift amount is always small; use widened type for consistency
-            let shift_rhs_ty = widened_op_type(IrType::I32);
-            let rhs_val = self.lower_expr_with_type(rhs, shift_rhs_ty);
-            (lhs_val, rhs_val)
+            let rhs_promoted_ty = Self::integer_promote(rhs_ty);
+            if self.ubsan_active(super::ubsan::UbsanFlags::SHIFT_EXPONENT)
+                || self.ubsan_active(super::ubsan::UbsanFlags::SHIFT_BASE)
+            {
+                let rhs_full_ty = widened_op_type(rhs_promoted_ty);
+                let rhs_full = self.lower_expr_with_type(rhs, rhs_full_ty);
+                let rhs_prom = if rhs_full_ty != rhs_promoted_ty {
+                    Operand::Value(self.emit_cast_val(rhs_full, rhs_full_ty, rhs_promoted_ty))
+                } else {
+                    rhs_full
+                };
+                self.emit_ubsan_shift_checks(
+                    *op == BinOp::Shl,
+                    lhs_val,
+                    shift_lhs_ty,
+                    common_ty,
+                    rhs_prom,
+                    rhs_promoted_ty,
+                );
+                let shift_rhs_ty = widened_op_type(IrType::I32);
+                let rhs_cast = if rhs_full_ty != shift_rhs_ty {
+                    Operand::Value(self.emit_cast_val(rhs_full, rhs_full_ty, shift_rhs_ty))
+                } else {
+                    rhs_full
+                };
+                (lhs_val, rhs_cast)
+            } else {
+                // Shift amount is always small; use widened type for consistency
+                let shift_rhs_ty = widened_op_type(IrType::I32);
+                let rhs_val = self.lower_expr_with_type(rhs, shift_rhs_ty);
+                (lhs_val, rhs_val)
+            }
         } else {
             let mut lhs_val = self.lower_expr_with_type(lhs, op_ty);
             let mut rhs_val = self.lower_expr_with_type(rhs, op_ty);
@@ -569,8 +626,7 @@ impl Lowerer {
             }
             _ => {
                 let ir_op = Self::binop_to_ir(*op, is_unsigned);
-                if self.trapv
-                    && self.func_state.is_some()
+                if self.signed_overflow_traps()
                     && !is_unsigned
                     && common_ty.is_signed()
                     && matches!(ir_op, IrBinOp::Add | IrBinOp::Sub | IrBinOp::Mul)
@@ -578,6 +634,19 @@ impl Lowerer {
                     let checked =
                         self.emit_trapv_signed_binop(ir_op, lhs_val, rhs_val, common_ty, op_ty);
                     return self.maybe_narrow_binop_result(checked, op, common_ty);
+                }
+                if matches!(op, BinOp::Div | BinOp::Mod) {
+                    if op_ty.is_float() {
+                        self.emit_ubsan_float_div_check(rhs_val, op_ty);
+                    } else {
+                        self.emit_ubsan_int_div_checks(
+                            lhs_val,
+                            rhs_val,
+                            common_ty,
+                            op_ty,
+                            is_unsigned,
+                        );
+                    }
                 }
                 self.emit(Instruction::BinOp {
                     dest,
@@ -808,6 +877,19 @@ impl Lowerer {
                     });
                     return Operand::Value(res);
                 }
+                if inner_ct.is_half_float() {
+                    if let Expr::FloatLiteralHalf(_, bits, _) = inner {
+                        return Operand::Const(IrConst::I16((*bits ^ 0x8000) as i16));
+                    }
+                    let val = self.lower_expr(inner);
+                    let dst = self.emit_binop_val(
+                        IrBinOp::Xor,
+                        val,
+                        Operand::Const(IrConst::I16(0x8000u16 as i16)),
+                        IrType::U16,
+                    );
+                    return Operand::Value(dst);
+                }
                 if inner_ct == CType::Float128 {
                     // _Float128 negation = toggle sign bit 127. Constants fold
                     // directly; variables go through the F128Neg intrinsic
@@ -846,8 +928,7 @@ impl Lowerer {
                     val
                 };
                 let promoted_ty = Self::integer_promote(inner_ty);
-                let dest = if self.trapv
-                    && self.func_state.is_some()
+                let dest = if self.signed_overflow_traps()
                     && !neg_ty.is_float()
                     && promoted_ty.is_signed()
                 {
@@ -1053,7 +1134,10 @@ impl Lowerer {
         // for constant conditions. When the common type is a binary float
         // (the decimal-vs-binary UAC rule), convert_scalar_ctype performs
         // the decimal->binary conversion on each arm.
-        let float128_arms = (then_ct == CType::Float128 || else_ct == CType::Float128)
+        let float128_arms = (then_ct == CType::Float128
+            || else_ct == CType::Float128
+            || then_ct.is_half_float()
+            || else_ct.is_half_float())
             && then_ct.is_arithmetic()
             && else_ct.is_arithmetic();
         if then_ct.is_decimal() || else_ct.is_decimal() || float128_arms {
@@ -1790,6 +1874,27 @@ impl Lowerer {
         // _Float128 lives in an integer carrier: the step is binary128 1.0
         // through the soft-float helpers, never an integer add of 1 to the
         // bit pattern.
+        if inner_ct.is_half_float() {
+            if let Some(lv) = self.lower_lvalue_for_mutation(inner) {
+                let loaded = self.load_lvalue_typed(&lv, ty);
+                let loaded_val = self.operand_to_value(loaded);
+                let f = self.emit_half_to_f32(Operand::Value(loaded_val), &inner_ct);
+                let f_step = self.emit_binop_val(
+                    if is_inc { IrBinOp::Add } else { IrBinOp::Sub },
+                    Operand::Value(f),
+                    Operand::Const(IrConst::F32(1.0)),
+                    IrType::F32,
+                );
+                let result = self.emit_f32_to_half(Operand::Value(f_step), &inner_ct);
+                self.store_lvalue_typed(&lv, Operand::Value(result), ty);
+                return if return_new || discard {
+                    Operand::Value(result)
+                } else {
+                    Operand::Value(loaded_val)
+                };
+            }
+            return self.lower_expr(inner);
+        }
         if inner_ct == CType::Float128 {
             if let Some(lv) = self.lower_lvalue_for_mutation(inner) {
                 let loaded = self.load_lvalue_typed(&lv, ty);
@@ -1826,8 +1931,7 @@ impl Lowerer {
             let (step, binop_ty) = self.inc_dec_step_and_type(ty, inner);
             let ir_op = if is_inc { IrBinOp::Add } else { IrBinOp::Sub };
             let promoted_ty = Self::integer_promote(ty);
-            let result = if self.trapv
-                && self.func_state.is_some()
+            let result = if self.signed_overflow_traps()
                 && !self.is_bool_lvalue(inner)
                 && ty != IrType::Ptr
                 && ty.size() >= 4

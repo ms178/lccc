@@ -22,6 +22,8 @@ struct TypeSpecFlags {
     has_void: bool,
     has_bool: bool,
     has_float: bool,
+    has_float16: bool,
+    has_bfloat16: bool,
     has_double: bool,
     has_complex: bool,
     has_char: bool,
@@ -256,6 +258,18 @@ impl Parser {
                 TokenKind::Double => {
                     self.advance();
                     flags.has_double = true;
+                    any_base_specifier = true;
+                    break;
+                }
+                TokenKind::Float16 => {
+                    self.advance();
+                    flags.has_float16 = true;
+                    any_base_specifier = true;
+                    break;
+                }
+                TokenKind::BFloat16 => {
+                    self.advance();
+                    flags.has_bfloat16 = true;
                     any_base_specifier = true;
                     break;
                 }
@@ -564,11 +578,11 @@ impl Parser {
                     _ => break,
                 }
             }
-        } else if flags.has_float {
-            // "float" can be followed by "_Complex" and storage class / qualifiers
+        } else if flags.has_float || flags.has_float16 || flags.has_bfloat16 {
+            // "float" / "_Float16" / "__bf16" can be followed by qualifiers, storage class, and attributes
             loop {
                 match self.peek() {
-                    TokenKind::Complex => {
+                    TokenKind::Complex if flags.has_float => {
                         self.advance();
                         flags.has_complex = true;
                     }
@@ -705,6 +719,8 @@ impl Parser {
             has_void,
             has_bool,
             has_float,
+            has_float16,
+            has_bfloat16,
             has_double,
             has_complex,
             has_char,
@@ -724,6 +740,10 @@ impl Parser {
             TypeSpecifier::Void
         } else if has_bool {
             TypeSpecifier::Bool
+        } else if has_float16 {
+            TypeSpecifier::Float16
+        } else if has_bfloat16 {
+            TypeSpecifier::BFloat16
         } else if has_float {
             if has_complex {
                 TypeSpecifier::ComplexFloat

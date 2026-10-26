@@ -436,6 +436,20 @@ impl Lexer {
                 let value = crate::common::long_double::f128_bytes_to_f64(&f128_bytes);
                 Token::new(TokenKind::FloatLiteralF128(value, f128_bytes), span)
             }
+            7 => Token::new(
+                TokenKind::FloatLiteralHalf(
+                    false,
+                    crate::common::half_float::f64_to_f16_bits(value),
+                ),
+                span,
+            ),
+            8 => Token::new(
+                TokenKind::FloatLiteralHalf(
+                    true,
+                    crate::common::half_float::f64_to_bf16_bits(value),
+                ),
+                span,
+            ),
             _ => Token::new(TokenKind::FloatLiteral(value), span),
         }
     }
@@ -652,7 +666,7 @@ impl Lexer {
             if !suffix.is_empty() {
                 let suf = String::from_utf8_lossy(suffix).to_ascii_lowercase();
                 kind = match suf.as_str() {
-                    "16" => 1,
+                    "16" => 7,
                     "32" => 1,
                     "64" => 0,
                     "32x" => 0,
@@ -731,6 +745,14 @@ impl Lexer {
             } else {
                 0
             }
+        } else if self.pos + 4 <= self.input.len()
+            && self.input[self.pos..self.pos + 4].eq_ignore_ascii_case(b"bf16")
+            && (self.pos + 4 == self.input.len()
+                || (!self.input[self.pos + 4].is_ascii_alphanumeric()
+                    && self.input[self.pos + 4] != b'_'))
+        {
+            self.pos += 4;
+            return (8, false);
         } else {
             0
         };
@@ -840,6 +862,20 @@ impl Lexer {
                         .unwrap_or([0u8; 16]);
                     Token::new(TokenKind::FloatLiteralDecimal(width, bits), span)
                 }
+                7 => Token::new(
+                    TokenKind::FloatLiteralHalf(
+                        false,
+                        crate::common::half_float::f64_to_f16_bits(value),
+                    ),
+                    span,
+                ),
+                8 => Token::new(
+                    TokenKind::FloatLiteralHalf(
+                        true,
+                        crate::common::half_float::f64_to_bf16_bits(value),
+                    ),
+                    span,
+                ),
                 _ => Token::new(TokenKind::FloatLiteral(value), span),
             }
         }

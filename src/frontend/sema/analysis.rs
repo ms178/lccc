@@ -1414,11 +1414,13 @@ impl SemanticAnalyzer {
                             // whole-vector copy, faulting at runtime.
                             let scalar_side = init_ty.is_integer()
                                 || init_ty.is_floating()
+                                || init_ty.is_soft_float()
                                 || init_ty.is_complex();
                             let mismatched = (matches!(var_ty, CType::Vector(..)) && scalar_side)
                                 || (matches!(init_ty, CType::Vector(..) | CType::ExtVector(..))
                                     && (var_ty.is_integer()
                                         || var_ty.is_floating()
+                                        || var_ty.is_soft_float()
                                         || var_ty.is_complex()));
                             if mismatched {
                                 self.diagnostics.borrow_mut().error(
@@ -3219,6 +3221,7 @@ impl SemanticAnalyzer {
             | Expr::FloatLiteralLongDouble(_, _, _)
             | Expr::FloatLiteralF128(_, _, _)
             | Expr::FloatLiteralDecimal(_, _, _)
+            | Expr::FloatLiteralHalf(_, _, _)
             | Expr::ImaginaryLiteral(_, _)
             | Expr::ImaginaryLiteralF32(_, _)
             | Expr::ImaginaryLiteralLongDouble(_, _, _)
@@ -3855,6 +3858,7 @@ impl SemanticAnalyzer {
             | Expr::FloatLiteralLongDouble(..)
             | Expr::FloatLiteralF128(..)
             | Expr::FloatLiteralDecimal(..)
+            | Expr::FloatLiteralHalf(..)
             | Expr::ImaginaryLiteral(..)
             | Expr::ImaginaryLiteralF32(..)
             | Expr::ImaginaryLiteralLongDouble(..)
@@ -4313,6 +4317,7 @@ impl SemanticAnalyzer {
                 let fp_mode = first.ty.is_floating()
                     || first.ty.is_complex()
                     || first.ty.is_decimal()
+                    || first.ty.is_half_float()
                     || matches!(first.ty, CType::Float128)
                     || first.ty.is_vector();
                 !fp_mode && first.ty.size_ctx(&*layouts) == layout.size
@@ -5000,7 +5005,10 @@ impl SemanticAnalyzer {
             // ("Scalar right operand: Clang splats it over the named
             // lanes"). Stay accepted.
             (from, CType::ExtVector(..))
-                if from.is_integer() || from.is_floating() || from.is_complex() =>
+                if from.is_integer()
+                    || from.is_floating()
+                    || from.is_soft_float()
+                    || from.is_complex() =>
             {
                 false
             }
@@ -5011,7 +5019,10 @@ impl SemanticAnalyzer {
             // `b = i;` for `vector_size(4)` float emitted `movl (%rax)`
             // with %rax == 5 and faulted at runtime).
             (from, CType::Vector(..))
-                if from.is_integer() || from.is_floating() || from.is_complex() =>
+                if from.is_integer()
+                    || from.is_floating()
+                    || from.is_soft_float()
+                    || from.is_complex() =>
             {
                 true
             }
@@ -5019,7 +5030,11 @@ impl SemanticAnalyzer {
             // oracles at any size (only explicit equal-size casts are
             // legal: the GNU raw bit reinterpretation).
             (from, to)
-                if from.is_vector() && (to.is_integer() || to.is_floating() || to.is_complex()) =>
+                if from.is_vector()
+                    && (to.is_integer()
+                        || to.is_floating()
+                        || to.is_soft_float()
+                        || to.is_complex()) =>
             {
                 true
             }
@@ -5624,7 +5639,7 @@ impl SemanticAnalyzer {
                 }
                 if let Some(ct) = self.expr_type_checker().infer_expr_ctype(&args[0]) {
                     let d = ct.decayed_value_ctype();
-                    if !d.is_floating() || d.is_complex() {
+                    if !(d.is_floating() || d.is_soft_float()) || d.is_complex() {
                         self.diagnostics.borrow_mut().error(
                             "non-floating-point argument in call to function '__builtin_issignaling'"
                                 .to_string(),
@@ -5656,10 +5671,10 @@ impl SemanticAnalyzer {
                 {
                     let d0 = c0.decayed_value_ctype();
                     let d1 = c1.decayed_value_ctype();
-                    let real_arith =
-                        |t: &CType| t.is_integer() || (t.is_floating() && !t.is_complex());
-                    let any_real_fp = (d0.is_floating() && !d0.is_complex())
-                        || (d1.is_floating() && !d1.is_complex());
+                    let real_fp =
+                        |t: &CType| (t.is_floating() || t.is_soft_float()) && !t.is_complex();
+                    let real_arith = |t: &CType| t.is_integer() || real_fp(t);
+                    let any_real_fp = real_fp(&d0) || real_fp(&d1);
                     if !real_arith(&d0) || !real_arith(&d1) || !any_real_fp {
                         self.diagnostics.borrow_mut().error(
                             "non-floating-point arguments in call to function '__builtin_iseqsig'"

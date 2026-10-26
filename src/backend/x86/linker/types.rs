@@ -13,6 +13,26 @@ pub const PAGE_SIZE: u64 = 0x1000;
 /// Dynamic linker path
 pub const INTERP: &[u8] = b"/lib64/ld-linux-x86-64.so.2\0";
 
+/// Layout and export options shared by executable and shared-library emitters.
+#[derive(Clone, Debug)]
+pub struct EmitLayoutOpts {
+    pub page_size: u64,
+    pub image_base: Option<u64>,
+    pub build_id_style: linker_common::build_id::BuildIdStyle,
+    pub dynamic_list: Option<linker_common::DynamicList>,
+}
+
+impl Default for EmitLayoutOpts {
+    fn default() -> Self {
+        Self {
+            page_size: PAGE_SIZE,
+            image_base: None,
+            build_id_style: linker_common::build_id::BuildIdStyle::None,
+            dynamic_list: None,
+        }
+    }
+}
+
 /// A resolved global symbol.
 ///
 /// This struct has x86-specific dynamic linking fields (plt_idx, got_idx,

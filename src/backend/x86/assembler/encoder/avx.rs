@@ -5057,8 +5057,8 @@ impl super::InstructionEncoder {
         match &ops[2] {
             Operand::Register(dst) if is_xmm(&dst.name) => {
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                let r = needs_vex_ext(&dst.name);
-                let b = needs_vex_ext(&src.name);
+                let r = needs_vex_ext(&src.name);
+                let b = needs_vex_ext(&dst.name);
                 self.emit_vex(r, false, b, 3, 0, 0, l, 1);
                 self.bytes.push(0x1D);
                 // Byte-probed: ModRM.reg = the SOURCE, r/m = destination.

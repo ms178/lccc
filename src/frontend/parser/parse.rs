@@ -253,6 +253,16 @@ pub(super) struct ParsedDeclAttrs {
     pub parsing_diagnose_as: Option<String>,
     /// `__attribute__((regparm(N)))` register-argument count.
     pub parsing_regparm: Option<u8>,
+    /// `__attribute__((stack_protect))` encountered.
+    pub parsing_stack_protect: bool,
+    /// `__attribute__((no_stack_protector))` encountered.
+    pub parsing_no_stack_protector: bool,
+    /// `__attribute__((externally_visible))` encountered.
+    pub parsing_externally_visible: bool,
+    /// `__attribute__((zero_call_used_regs("...")))` mode string.
+    pub parsing_zero_call_used_regs: Option<String>,
+    /// `__attribute__((no_sanitize("...")))` / `no_sanitize_undefined` list.
+    pub parsing_no_sanitize: Option<String>,
     /// `__attribute__((vector_size(N)))` total vector size in bytes.
     pub parsing_vector_size: Option<usize>,
     /// `__attribute__((vector_size(EXPR)))` whose EXPR was not parse-time
@@ -677,6 +687,10 @@ pub struct Parser {
     /// `int main () NOCHK;` with a bare definition, and without the merge
     /// the definition instruments anyway.
     pub(super) func_decl_no_instrument: FxHashSet<String>,
+    /// File-scope function names whose prototype carried `stack_protect`.
+    pub(super) func_decl_stack_protect: FxHashSet<String>,
+    /// File-scope function names whose prototype carried `no_stack_protector`.
+    pub(super) func_decl_no_stack_protector: FxHashSet<String>,
     /// Count of parse errors encountered (invalid tokens at top level, etc.)
     pub error_count: usize,
     /// Number of currently-live expression-parse frames (E5 hardening).
@@ -766,6 +780,8 @@ impl Parser {
             pragma_visibility_stack: Vec::with_capacity(4),
             pragma_default_visibility: None,
             func_decl_no_instrument: FxHashSet::default(),
+            func_decl_stack_protect: FxHashSet::default(),
+            func_decl_no_stack_protector: FxHashSet::default(),
             error_count: 0,
             parser_frame_depth: 0,
             nesting_budget_diagnosed: false,
@@ -1393,6 +1409,8 @@ impl Parser {
             | TokenKind::Builtin
             | TokenKind::Int128
             | TokenKind::UInt128
+            | TokenKind::Float16
+            | TokenKind::BFloat16
             | TokenKind::Float128
             | TokenKind::Decimal32
             | TokenKind::Decimal64
@@ -2058,12 +2076,70 @@ impl Parser {
                 self.attrs.set_no_instrument(true);
                 self.advance();
             }
+            "stack_protect" | "__stack_protect__" => {
+                self.attrs.parsing_stack_protect = true;
+                self.advance();
+            }
+            "no_stack_protector" | "__no_stack_protector__" => {
+                self.attrs.parsing_no_stack_protector = true;
+                self.advance();
+            }
+            "externally_visible" | "__externally_visible__" => {
+                self.attrs.parsing_externally_visible = true;
+                self.advance();
+            }
+            "zero_call_used_regs" | "__zero_call_used_regs__" => {
+                let span = self.peek_span();
+                self.advance();
+                match self.parse_string_attr_arg() {
+                    Some(mode) => {
+                        if crate::backend::zero_call_used_regs::ZeroCallUsedRegs::parse(&mode)
+                            .is_some()
+                        {
+                            self.attrs.parsing_zero_call_used_regs = Some(mode);
+                        } else {
+                            self.emit_error(
+                                format!(
+                                    "unrecognized 'zero_call_used_regs' attribute argument '{mode}'"
+                                ),
+                                span,
+                            );
+                        }
+                    }
+                    None => {
+                        self.emit_error(
+                            "'zero_call_used_regs' attribute requires a string argument",
+                            span,
+                        );
+                    }
+                }
+            }
+            "no_sanitize" | "__no_sanitize__" => {
+                self.advance();
+                if let Some(arg) = self.parse_target_attr_arg() {
+                    match &mut self.attrs.parsing_no_sanitize {
+                        Some(prev) if !prev.is_empty() => {
+                            prev.push(',');
+                            prev.push_str(&arg);
+                        }
+                        slot => *slot = Some(arg),
+                    }
+                }
+            }
+            "no_sanitize_undefined" | "__no_sanitize_undefined__" => {
+                self.advance();
+                self.skip_optional_paren_arg();
+                match &mut self.attrs.parsing_no_sanitize {
+                    Some(prev) if !prev.is_empty() => prev.push_str(",undefined"),
+                    slot => *slot = Some("undefined".to_string()),
+                }
+            }
             "optimize" | "__optimize__" => {
                 self.advance();
-                // Recognize optimize("omit-frame-pointer") as equivalent to naked.
-                // GCC uses this attribute on functions like nlr_push whose inline asm
-                // assumes (%rsp) is the return address (no frame pointer push).
+                // Recognize optimize("omit-frame-pointer") as equivalent to naked,
+                // and optimize("no-stack-protector") as no_stack_protector.
                 let mut found_omit_fp = false;
+                let mut found_no_ssp = false;
                 if matches!(self.peek(), TokenKind::LParen) {
                     // Peek at the string argument inside parens without consuming
                     if self.pos + 1 < self.tokens.len() {
@@ -2071,12 +2147,18 @@ impl Parser {
                             if s.contains("omit-frame-pointer") {
                                 found_omit_fp = true;
                             }
+                            if s.contains("no-stack-protector") {
+                                found_no_ssp = true;
+                            }
                         }
                     }
                     self.skip_balanced_parens();
                 }
                 if found_omit_fp {
                     self.attrs.set_naked(true);
+                }
+                if found_no_ssp {
+                    self.attrs.parsing_no_stack_protector = true;
                 }
             }
             "address_space" | "__address_space__" => {

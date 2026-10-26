@@ -5436,8 +5436,20 @@ fn generate_function_body(
             _ => false,
         })
     });
+    let large_clash_frame = cg.state().stack_clash_protection
+        && func
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .filter_map(|inst| match inst {
+                Instruction::Alloca { size, .. } => Some(*size),
+                _ => None,
+            })
+            .fold(0usize, |acc, s| acc.saturating_add(s))
+            > 12_288;
     cg.state().omit_frame_pointer = cg.state().fpo_requested
         && !has_dyn_alloca
+        && !large_clash_frame
         && !has_inline_asm_fp
         && !has_frame_address
         && !has_vector_intrinsics

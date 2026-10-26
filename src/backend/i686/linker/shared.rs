@@ -303,6 +303,19 @@ fn binds_locally(gs: &LinkerSymbol, symbolic: Symbolic) -> bool {
     gs.binding == STB_LOCAL || gs.visibility != STV_DEFAULT || symbolic.binds_locally(gs.sym_type)
 }
 
+fn binds_locally_opts(name: &str, gs: &LinkerSymbol, opts: &LinkOptions) -> bool {
+    if gs.binding == STB_LOCAL || gs.visibility != STV_DEFAULT {
+        return true;
+    }
+    if opts.is_pie {
+        return true;
+    }
+    if opts.dynamic_list.matches(name) {
+        return false;
+    }
+    opts.symbolic.binds_locally(gs.sym_type)
+}
+
 fn classify(
     obj_idx: usize,
     sym_idx: usize,
@@ -310,7 +323,7 @@ fn classify(
     global_symbols: &FxHashMap<String, LinkerSymbol>,
     section_map: &SectionMap,
     sections: &FxHashMap<String, usize>,
-    symbolic: Symbolic,
+    opts: &LinkOptions,
 ) -> Target {
     let section_kept = |shndx: u16| section_map.contains_key(&(obj_idx, shndx as usize));
     if sym.sym_type == STT_SECTION || sym.binding == STB_LOCAL || sym.name.is_empty() {
@@ -328,7 +341,7 @@ fn classify(
         Some(gs) if gs.is_defined => Target {
             key,
             name: sym.name.clone(),
-            local: binds_locally(gs, symbolic),
+            local: binds_locally_opts(&sym.name, gs, opts),
             defined: true,
             abs: gs.output_section == usize::MAX && !is_emitter_defined(&sym.name, sections),
         },
@@ -409,7 +422,47 @@ fn write32(data: &mut [u8], off: usize, v: u32) -> Result<(), String> {
     }
 }
 
-/// Emit an ELF32 shared library (`ET_DYN`, base address 0).
+fn build_shared_verneed_32(
+    imports: &[String],
+    import_set: &FxHashSet<String>,
+    dynsym_names: &[String],
+    needed_sonames: &[String],
+    dynlib_syms: &super::input::DynlibSyms,
+    dynstr: &mut DynStrTab,
+) -> Result<(Vec<u8>, Vec<u8>, u32), String> {
+    let verneed_plan = linker_common::symver::VerneedPlan::new(
+        imports.iter().filter_map(|n| {
+            let d = dynlib_syms.get(n.as_str())?;
+            Some((d.lib.as_str(), d.version.as_deref()?))
+        }),
+        needed_sonames,
+        2,
+    )?;
+    if verneed_plan.is_empty() {
+        return Ok((Vec::new(), Vec::new(), 0));
+    }
+    for s in verneed_plan.strings() {
+        dynstr.add(s);
+    }
+    let verneed_data = verneed_plan.encode(|s| dynstr.get_offset(s));
+    let verneed_count = verneed_plan.file_count() as u32;
+    let mut versym_data: Vec<u8> = Vec::with_capacity((dynsym_names.len() + 1) * 2);
+    versym_data.extend_from_slice(&0u16.to_le_bytes());
+    for name in dynsym_names {
+        let idx = if import_set.contains(name) {
+            match dynlib_syms.get(name.as_str()) {
+                Some(d) => verneed_plan.index_of(&d.lib, d.version.as_deref()),
+                None => linker_common::symver::VER_NDX_GLOBAL,
+            }
+        } else {
+            linker_common::symver::VER_NDX_GLOBAL
+        };
+        versym_data.extend_from_slice(&idx.to_le_bytes());
+    }
+    Ok((versym_data, verneed_data, verneed_count))
+}
+
+/// Emit an ELF32 shared library or PIE executable (`ET_DYN`, default base 0).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_shared_library_32(
     inputs: &[InputObject],
@@ -418,11 +471,14 @@ pub(super) fn emit_shared_library_32(
     section_name_to_idx: &FxHashMap<String, usize>,
     section_map: &SectionMap,
     needed_sonames: &[String],
+    dynlib_syms: &super::input::DynlibSyms,
+    interp: Option<&[u8]>,
+    dso_refs: &FxHashSet<String>,
     output_path: &str,
     opts: &LinkOptions,
     pending_defsyms: &super::link::PendingDefsyms,
 ) -> Result<(), String> {
-    if section_name_to_idx.contains_key(".preinit_array") {
+    if !opts.is_pie && section_name_to_idx.contains_key(".preinit_array") {
         // The loader runs DT_PREINIT_ARRAY of the executable only (gABI).
         return Err("`.preinit_array' section is not allowed in a shared object".to_string());
     }
@@ -436,6 +492,7 @@ pub(super) fn emit_shared_library_32(
     let mut slot_target: FxHashMap<(SymKey, GotKind), Target> = FxHashMap::default();
     let mut needs_ldm = false;
     let mut num_relative = 0usize;
+    let mut num_relr_relocs = 0usize;
     let mut num_symbolic = 0usize;
     // First dynamic relocation into a read-only section (GNU's warning
     // names it); `Some` means the image needs DT_TEXTREL.
@@ -447,8 +504,10 @@ pub(super) fn emit_shared_library_32(
 
     for (obj_idx, obj) in inputs.iter().enumerate() {
         for sec in &obj.sections {
-            if sec.relocations.is_empty() || !section_map.contains_key(&(obj_idx, sec.input_index))
-            {
+            let Some(&(out_idx, sec_base)) = section_map.get(&(obj_idx, sec.input_index)) else {
+                continue;
+            };
+            if sec.relocations.is_empty() {
                 continue;
             }
             let writable = sec.flags & SHF_WRITE != 0;
@@ -463,7 +522,7 @@ pub(super) fn emit_shared_library_32(
                     global_symbols,
                     section_map,
                     sections,
-                    opts.symbolic,
+                    opts,
                 );
                 if !t.local && !t.defined {
                     if let SymKey::Global(n) = &t.key {
@@ -476,6 +535,12 @@ pub(super) fn emit_shared_library_32(
                 let mut site_dynrel = |relative: bool| {
                     if relative {
                         num_relative += 1;
+                        if opts.pack_relative_relocs {
+                            output_sections[out_idx].align = output_sections[out_idx].align.max(4);
+                            if ((sec_base + rel_offset) & 1) == 0 {
+                                num_relr_relocs += 1;
+                            }
+                        }
                     } else {
                         num_symbolic += 1;
                     }
@@ -575,12 +640,16 @@ pub(super) fn emit_shared_library_32(
     for k in &got_slots {
         let (r, s) = slot_dynrels(k);
         num_relative += r;
+        if opts.pack_relative_relocs {
+            num_relr_relocs += r;
+        }
         num_symbolic += s;
     }
     if needs_ldm {
         num_symbolic += 1;
     }
-    let num_rel_dyn = num_relative + num_symbolic;
+    let num_rel_relative = num_relative - num_relr_relocs;
+    let num_rel_dyn = num_rel_relative + num_symbolic;
 
     // GOT word offsets (from the start of .got; word 0 is reserved).
     let mut got_word: FxHashMap<(SymKey, GotKind), u32> = FxHashMap::default();
@@ -607,6 +676,10 @@ pub(super) fn emit_shared_library_32(
                 && gs.sym_type != STT_FILE
                 && name.as_str() != "_GLOBAL_OFFSET_TABLE_"
                 && !import_set.contains(name.as_str())
+                && (!opts.is_pie
+                    || opts.export_dynamic
+                    || opts.dynamic_list.matches(name)
+                    || dso_refs.contains(name.as_str()))
         })
         .map(|(n, _)| n.clone())
         .collect();
@@ -632,7 +705,7 @@ pub(super) fn emit_shared_library_32(
     for lib in needed_sonames {
         dynstr.add(lib);
     }
-    let option_tags = opts.extra_dynamic_tags(false, true, false);
+    let option_tags = opts.extra_dynamic_tags(false, !opts.is_pie, false);
     for (_, v) in &option_tags {
         if let super::options::DynValue::Str(s) = v {
             dynstr.add(s);
@@ -641,6 +714,14 @@ pub(super) fn emit_shared_library_32(
     for name in &dynsym_names {
         dynstr.add(name);
     }
+    let (versym_data, verneed_data, verneed_count) = build_shared_verneed_32(
+        &imports,
+        &import_set,
+        &dynsym_names,
+        needed_sonames,
+        dynlib_syms,
+        &mut dynstr,
+    )?;
     let dynstr_data = dynstr.as_bytes().to_vec();
 
     let sysv_hash = opts.hash_style.wants_sysv().then(|| {
@@ -649,16 +730,23 @@ pub(super) fn emit_shared_library_32(
     });
     let want_gnu_hash = opts.hash_style.wants_gnu();
 
+    let image_kind = if opts.is_pie {
+        "PIE object"
+    } else {
+        "shared object"
+    };
     let textrel = match &textrel_site {
         Some(site) => {
-            opts.textrel.apply(site, "shared object")?;
+            opts.textrel.apply(site, image_kind)?;
             true
         }
         None => false,
     };
 
     // ── Layout ────────────────────────────────────────────────────────────
-    let base_addr: u32 = 0;
+    let page_size = opts.effective_page_size();
+    let page_mask = page_size - 1;
+    let base_addr: u32 = opts.image_base.unwrap_or(0);
     let ehdr_size: u32 = 52;
     let phdr_size: u32 = 32;
     let has_tls = output_sections
@@ -666,11 +754,8 @@ pub(super) fn emit_shared_library_32(
         .any(|s| s.flags & SHF_TLS != 0 && s.flags & SHF_ALLOC != 0);
     let note_sec_idx = section_name_to_idx.get(".note").copied();
     let input_note_size = note_sec_idx.map_or(0, |i| output_sections[i].data.len() as u32);
-    let build_id_size = if opts.build_id {
-        linker_common::build_id::BUILD_ID_NOTE_SIZE as u32
-    } else {
-        0
-    };
+    let build_id_style = opts.effective_build_id_style();
+    let build_id_size = build_id_style.note_size() as u32;
     let has_notes = input_note_size + build_id_size > 0;
     // The merged GNU property note, covered by PT_GNU_PROPERTY too.
     let property_note = super::sections::property_note_extent(inputs, section_map, note_sec_idx);
@@ -684,9 +769,10 @@ pub(super) fn emit_shared_library_32(
         0
     };
 
-    // PHDR, LOAD x4, DYNAMIC, GNU_STACK
+    // PHDR, [INTERP], LOAD x4, DYNAMIC, GNU_STACK
     // [+ TLS, NOTE, GNU_PROPERTY, GNU_EH_FRAME, GNU_RELRO]
     let num_phdrs: u32 = 7
+        + u32::from(interp.is_some())
         + u32::from(has_tls)
         + u32::from(has_notes)
         + u32::from(property_note.is_some())
@@ -700,6 +786,12 @@ pub(super) fn emit_shared_library_32(
     let phdr_vaddr = vaddr;
     file_offset += phdrs_total_size;
     vaddr += phdrs_total_size;
+
+    let interp_offset = file_offset;
+    let interp_vaddr = vaddr;
+    let interp_size = interp.map_or(0, |b| b.len() as u32);
+    file_offset += interp_size;
+    vaddr += interp_size;
 
     // Notes: merged input `.note.*`, then the build-id note; one PT_NOTE.
     let note_align = note_sec_idx.map_or(4, |i| output_sections[i].align.max(4));
@@ -752,7 +844,29 @@ pub(super) fn emit_shared_library_32(
     file_offset += dynstr_size;
     vaddr += dynstr_size;
 
-    // .rel.dyn, .rel.plt
+    // .gnu.version, .gnu.version_r
+    let (versym_offset, versym_vaddr, versym_size) = if !versym_data.is_empty() {
+        file_offset = align_up(file_offset, 2);
+        vaddr = align_up(vaddr, 2);
+        let (o, a, s) = (file_offset, vaddr, versym_data.len() as u32);
+        file_offset += s;
+        vaddr += s;
+        (o, a, s)
+    } else {
+        (file_offset, vaddr, 0)
+    };
+    let (verneed_offset, verneed_vaddr, verneed_size) = if !verneed_data.is_empty() {
+        file_offset = align_up(file_offset, 4);
+        vaddr = align_up(vaddr, 4);
+        let (o, a, s) = (file_offset, vaddr, verneed_data.len() as u32);
+        file_offset += s;
+        vaddr += s;
+        (o, a, s)
+    } else {
+        (file_offset, vaddr, 0)
+    };
+
+    // .rel.dyn, .relr.dyn, .rel.plt
     file_offset = align_up(file_offset, 4);
     vaddr = align_up(vaddr, 4);
     let rel_dyn_offset = file_offset;
@@ -760,6 +874,11 @@ pub(super) fn emit_shared_library_32(
     let rel_dyn_size = num_rel_dyn as u32 * 8;
     file_offset += rel_dyn_size;
     vaddr += rel_dyn_size;
+    let relr_dyn_offset = file_offset;
+    let relr_dyn_vaddr = vaddr;
+    let relr_reserved_size = num_relr_relocs as u32 * 4;
+    file_offset += relr_reserved_size;
+    vaddr += relr_reserved_size;
     let rel_plt_offset = file_offset;
     let rel_plt_vaddr = vaddr;
     let rel_plt_size = num_plt as u32 * 8;
@@ -769,9 +888,12 @@ pub(super) fn emit_shared_library_32(
     let ro_headers_end = file_offset;
 
     // ── RX: .init .plt .text .fini <custom exec> ──
-    file_offset = align_up(file_offset, PAGE_SIZE);
-    vaddr = align_up(vaddr, PAGE_SIZE);
-    vaddr = (vaddr & !0xfff) | (file_offset & 0xfff);
+    file_offset = align_up(file_offset, page_size);
+    vaddr = align_up(vaddr, page_size);
+    vaddr = (vaddr & !page_mask) | (file_offset & page_mask);
+    if vaddr < base_addr + file_offset {
+        vaddr += page_size;
+    }
     let text_seg_file_start = file_offset;
     let text_seg_vaddr_start = vaddr;
     let _ = layout_section(
@@ -818,9 +940,12 @@ pub(super) fn emit_shared_library_32(
     let text_seg_vaddr_end = vaddr;
 
     // ── R: .rodata .eh_frame .eh_frame_hdr <custom ro> ──
-    file_offset = align_up(file_offset, PAGE_SIZE);
-    vaddr = align_up(vaddr, PAGE_SIZE);
-    vaddr = (vaddr & !0xfff) | (file_offset & 0xfff);
+    file_offset = align_up(file_offset, page_size);
+    vaddr = align_up(vaddr, page_size);
+    vaddr = (vaddr & !page_mask) | (file_offset & page_mask);
+    if vaddr <= text_seg_vaddr_end {
+        vaddr = align_up(text_seg_vaddr_end, page_size) | (file_offset & page_mask);
+    }
     let rodata_seg_file_start = file_offset;
     let rodata_seg_vaddr_start = vaddr;
     let _ = layout_section(
@@ -856,9 +981,12 @@ pub(super) fn emit_shared_library_32(
     let rodata_seg_vaddr_end = vaddr;
 
     // ── RW ──
-    file_offset = align_up(file_offset, PAGE_SIZE);
-    vaddr = align_up(vaddr, PAGE_SIZE);
-    vaddr = (vaddr & !0xfff) | (file_offset & 0xfff);
+    file_offset = align_up(file_offset, page_size);
+    vaddr = align_up(vaddr, page_size);
+    vaddr = (vaddr & !page_mask) | (file_offset & page_mask);
+    if vaddr <= rodata_seg_vaddr_end {
+        vaddr = align_up(rodata_seg_vaddr_end, page_size) | (file_offset & page_mask);
+    }
     let data_seg_file_start = file_offset;
     let data_seg_vaddr_start = vaddr;
 
@@ -870,7 +998,7 @@ pub(super) fn emit_shared_library_32(
             .map_or(0, |&i| output_sections[i].data.len() as u32)
     };
 
-    let mut dyn_numeric_tags = opts.extra_dynamic_tags(textrel, true, static_tls);
+    let mut dyn_numeric_tags = opts.extra_dynamic_tags(textrel, !opts.is_pie, static_tls);
     dyn_numeric_tags.retain(|(_, v)| matches!(v, super::options::DynValue::Num(_)));
     let (option_strings, _) = option_entries(&option_tags, |s| dynstr.get_offset(s));
     let (_, option_numeric) = option_entries(&dyn_numeric_tags, |s| dynstr.get_offset(s));
@@ -883,7 +1011,7 @@ pub(super) fn emit_shared_library_32(
         // Presence only; the addresses are filled with the array entries.
         init: image_function_addr(global_symbols, output_sections, "_init").map(|_| 0),
         fini: image_function_addr(global_symbols, output_sections, "_fini").map(|_| 0),
-        preinit_array: None,
+        preinit_array: (opts.is_pie && sec_len(".preinit_array") > 0).then_some((0, 0)),
         init_array: (sec_len(".init_array") > 0).then_some((0, 0)),
         fini_array: (sec_len(".fini_array") > 0).then_some((0, 0)),
         hash: sysv_hash.as_ref().map(|_| hash_vaddr),
@@ -891,11 +1019,12 @@ pub(super) fn emit_shared_library_32(
         strtab: dynstr_vaddr,
         symtab: dynsym_vaddr,
         strsz: dynstr_size,
-        debug: false,
+        debug: opts.is_pie,
         plt: (num_plt > 0).then_some((0, rel_plt_vaddr, rel_plt_size)),
         rel: (num_rel_dyn > 0).then_some((rel_dyn_vaddr, rel_dyn_size)),
-        relcount: (num_relative > 0).then_some(num_relative as u32),
-        verneed: None,
+        relr: (num_relr_relocs > 0).then_some((relr_dyn_vaddr, relr_reserved_size)),
+        relcount: (num_rel_relative > 0).then_some(num_rel_relative as u32),
+        verneed: (verneed_size > 0).then_some((versym_vaddr, verneed_vaddr, verneed_count)),
         numeric: option_numeric,
     };
     let dynamic_size = dyn_desc.byte_size();
@@ -917,17 +1046,21 @@ pub(super) fn emit_shared_library_32(
         for name in [
             ".tdata",
             ".tbss",
+            ".preinit_array",
             ".init_array",
             ".fini_array",
             ".data.rel.ro",
         ] {
+            if name == ".preinit_array" && !opts.is_pie {
+                continue;
+            }
             add(name, &mut len);
         }
         len = align_up(len, 4) + dynamic_size + got_size;
         if opts.bind_now {
             len += gotplt_size;
         }
-        let pad = (PAGE_SIZE - len % PAGE_SIZE) % PAGE_SIZE;
+        let pad = (page_size - len % page_size) % page_size;
         let pad = pad - pad % max_align;
         file_offset += pad;
         vaddr += pad;
@@ -941,6 +1074,18 @@ pub(super) fn emit_shared_library_32(
         &mut file_offset,
         &mut vaddr,
     );
+    let (preinit_array_vaddr, preinit_array_size) = if opts.is_pie {
+        layout_section(
+            ".preinit_array",
+            section_name_to_idx,
+            output_sections,
+            &mut file_offset,
+            &mut vaddr,
+            4,
+        )
+    } else {
+        (0, 0)
+    };
     let (init_array_vaddr, init_array_size) = layout_section(
         ".init_array",
         section_name_to_idx,
@@ -1001,6 +1146,14 @@ pub(super) fn emit_shared_library_32(
         &mut file_offset,
         &mut vaddr,
         16,
+    );
+    let _ = layout_section(
+        ".tm_clone_table",
+        section_name_to_idx,
+        output_sections,
+        &mut file_offset,
+        &mut vaddr,
+        4,
     );
     let data_seg_file_end = file_offset;
     if let Some(&idx) = section_name_to_idx.get(".bss") {
@@ -1070,7 +1223,7 @@ pub(super) fn emit_shared_library_32(
     }
     super::link::tls_module_base_address(global_symbols, tls_addr, tls_mem_size, false);
     let linker_addrs = LinkerSymbolAddresses {
-        base_addr: 0,
+        base_addr: base_addr as u64,
         got_addr: got_base as u64,
         dynamic_addr: dynamic_vaddr as u64,
         bss_addr: bss_addr as u64,
@@ -1081,8 +1234,8 @@ pub(super) fn emit_shared_library_32(
         init_array_size: init_array_size as u64,
         fini_array_start: fini_array_vaddr as u64,
         fini_array_size: fini_array_size as u64,
-        preinit_array_start: 0,
-        preinit_array_size: 0,
+        preinit_array_start: preinit_array_vaddr as u64,
+        preinit_array_size: preinit_array_size as u64,
         rela_iplt_start: 0,
         rela_iplt_size: 0,
     };
@@ -1142,7 +1295,7 @@ pub(super) fn emit_shared_library_32(
                     global_symbols,
                     section_map,
                     sections,
-                    opts.symbolic,
+                    opts,
                 );
                 let s = symbol_value(obj_idx, sym, global_symbols, section_map, output_sections);
                 if matches!(t.key, SymKey::Local(..)) || t.local {
@@ -1310,8 +1463,24 @@ pub(super) fn emit_shared_library_32(
     // RELATIVE first (DT_RELCOUNT), each group in address order.
     relative.sort_unstable();
     symbolic.sort_unstable();
+    let (relr_aligned, rel_leftovers) = if opts.pack_relative_relocs {
+        linker_common::relr::partition_relative_32(&relative)
+    } else {
+        (Vec::new(), relative)
+    };
+    let relr_dyn_data = linker_common::relr::encode_relr_32_bytes(&relr_aligned);
+    let relr_actual_size = relr_dyn_data.len() as u32;
+    if rel_leftovers.len() != num_rel_relative || relr_actual_size > relr_reserved_size {
+        return Err(format!(
+            "internal error: .relr.dyn sizing mismatch (leftovers {} vs {}, relr {} vs {})",
+            rel_leftovers.len(),
+            num_rel_relative,
+            relr_actual_size,
+            relr_reserved_size
+        ));
+    }
     let mut rel_dyn_data: Vec<u8> = Vec::with_capacity(rel_dyn_size as usize);
-    for &addr in &relative {
+    for &addr in &rel_leftovers {
         rel_dyn_data.extend_from_slice(&addr.to_le_bytes());
         rel_dyn_data.extend_from_slice(&R_386_RELATIVE.to_le_bytes());
     }
@@ -1356,6 +1525,9 @@ pub(super) fn emit_shared_library_32(
             *v = image_function_addr(global_symbols, output_sections, name).unwrap_or(*v);
         }
     }
+    if let Some(v) = dyn_desc.preinit_array.as_mut() {
+        *v = (preinit_array_vaddr, preinit_array_size);
+    }
     if let Some(v) = dyn_desc.init_array.as_mut() {
         *v = (init_array_vaddr, init_array_size);
     }
@@ -1364,6 +1536,9 @@ pub(super) fn emit_shared_library_32(
     }
     if let Some(v) = dyn_desc.plt.as_mut() {
         v.0 = gotplt_vaddr;
+    }
+    if let Some(v) = dyn_desc.relr.as_mut() {
+        *v = (relr_dyn_vaddr, relr_actual_size);
     }
     let dynamic_data = dyn_desc.serialize(dynamic_size)?;
 
@@ -1381,6 +1556,8 @@ pub(super) fn emit_shared_library_32(
     const SHT_DYNAMIC: u32 = 6;
     const SHT_HASH: u32 = 5;
     const SHT_GNU_HASH_: u32 = 0x6fff_fff6;
+    const SHT_GNU_VERNEED: u32 = 0x6fff_fffe;
+    const SHT_GNU_VERSYM: u32 = 0x6fff_ffff;
     const A: u32 = SHF_ALLOC;
     const AW: u32 = SHF_ALLOC | SHF_WRITE;
     let mut shdrs: Vec<Shdr32> = Vec::new();
@@ -1399,6 +1576,18 @@ pub(super) fn emit_shared_library_32(
             entsize,
         });
     };
+    if interp_size > 0 {
+        synth(
+            ".interp",
+            SHT_PROGBITS,
+            A,
+            interp_vaddr,
+            interp_offset,
+            interp_size,
+            1,
+            0,
+        );
+    }
     if sysv_hash.is_some() {
         synth(
             ".hash",
@@ -1443,6 +1632,30 @@ pub(super) fn emit_shared_library_32(
         1,
         0,
     );
+    if versym_size > 0 {
+        synth(
+            ".gnu.version",
+            SHT_GNU_VERSYM,
+            A,
+            versym_vaddr,
+            versym_offset,
+            versym_size,
+            2,
+            2,
+        );
+    }
+    if verneed_size > 0 {
+        synth(
+            ".gnu.version_r",
+            SHT_GNU_VERNEED,
+            A,
+            verneed_vaddr,
+            verneed_offset,
+            verneed_size,
+            4,
+            0,
+        );
+    }
     if rel_dyn_size > 0 {
         synth(
             ".rel.dyn",
@@ -1453,6 +1666,18 @@ pub(super) fn emit_shared_library_32(
             rel_dyn_size,
             4,
             8,
+        );
+    }
+    if relr_actual_size > 0 {
+        synth(
+            ".relr.dyn",
+            SHT_RELR,
+            A,
+            relr_dyn_vaddr,
+            relr_dyn_offset,
+            relr_actual_size,
+            4,
+            4,
         );
     }
     if rel_plt_size > 0 {
@@ -1564,7 +1789,11 @@ pub(super) fn emit_shared_library_32(
                 h.info = 1; // one local: the null symbol
             }
             ".dynamic" => h.link = dynstr_hdr,
-            ".hash" | ".gnu.hash" | ".rel.dyn" => h.link = dynsym_hdr,
+            ".hash" | ".gnu.hash" | ".gnu.version" | ".rel.dyn" => h.link = dynsym_hdr,
+            ".gnu.version_r" => {
+                h.link = dynstr_hdr;
+                h.info = verneed_count;
+            }
             ".rel.plt" => {
                 h.link = dynsym_hdr;
                 h.info = gotplt_hdr;
@@ -1719,6 +1948,18 @@ pub(super) fn emit_shared_library_32(
         4,
         0,
     ]);
+    if interp_size > 0 {
+        phdrs.push([
+            PT_INTERP,
+            interp_offset,
+            interp_vaddr,
+            interp_size,
+            interp_size,
+            PF_R,
+            1,
+            0,
+        ]);
+    }
     phdrs.push([
         PT_LOAD,
         0,
@@ -1726,7 +1967,7 @@ pub(super) fn emit_shared_library_32(
         ro_headers_end,
         ro_headers_end,
         PF_R,
-        PAGE_SIZE,
+        page_size,
         0,
     ]);
     phdrs.push([
@@ -1736,7 +1977,7 @@ pub(super) fn emit_shared_library_32(
         text_seg_file_end - text_seg_file_start,
         text_seg_vaddr_end - text_seg_vaddr_start,
         PF_R | PF_X,
-        PAGE_SIZE,
+        page_size,
         0,
     ]);
     phdrs.push([
@@ -1746,7 +1987,7 @@ pub(super) fn emit_shared_library_32(
         rodata_seg_file_end - rodata_seg_file_start,
         rodata_seg_vaddr_end - rodata_seg_vaddr_start,
         PF_R,
-        PAGE_SIZE,
+        page_size,
         0,
     ]);
     phdrs.push([
@@ -1756,7 +1997,7 @@ pub(super) fn emit_shared_library_32(
         data_seg_file_end - data_seg_file_start,
         data_seg_vaddr_end - data_seg_vaddr_start,
         PF_R | PF_W,
-        PAGE_SIZE,
+        page_size,
         0,
     ]);
     phdrs.push([
@@ -1840,6 +2081,9 @@ pub(super) fn emit_shared_library_32(
             output[off as usize..off as usize + bytes.len()].copy_from_slice(bytes);
         }
     };
+    if let Some(interp_bytes) = interp {
+        put(interp_offset, interp_bytes);
+    }
     if let Some(h) = &sysv_hash {
         let mut buf = vec![0u8; hash_size as usize];
         linker_common::write_sysv_hash(&mut buf, 0, h);
@@ -1850,7 +2094,10 @@ pub(super) fn emit_shared_library_32(
     }
     put(dynsym_offset, &dynsym_data);
     put(dynstr_offset, &dynstr_data);
+    put(versym_offset, &versym_data);
+    put(verneed_offset, &verneed_data);
     put(rel_dyn_offset, &rel_dyn_data);
+    put(relr_dyn_offset, &relr_dyn_data);
     put(rel_plt_offset, &rel_plt_data);
     put(plt_offset, &plt_data);
     put(eh_frame_hdr_offset, &eh_frame_hdr_data);
@@ -1898,9 +2145,19 @@ pub(super) fn emit_shared_library_32(
     put(shdr_table_off as u32, &table);
 
     if build_id_size > 0 {
-        linker_common::build_id::write_build_id_skeleton(&mut output, build_id_offset as usize);
-        linker_common::build_id::patch_build_id(&mut output, build_id_offset as usize);
+        linker_common::build_id::write_build_id_skeleton_styled(
+            &mut output,
+            build_id_offset as usize,
+            &build_id_style,
+        );
+        linker_common::build_id::patch_build_id_styled(
+            &mut output,
+            build_id_offset as usize,
+            &build_id_style,
+        );
     }
+
+    super::emit::write_link_map_32(opts, output_sections, global_symbols)?;
 
     std::fs::write(output_path, &output)
         .map_err(|e| format!("failed to write {}: {}", output_path, e))?;

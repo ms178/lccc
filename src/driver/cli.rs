@@ -93,6 +93,74 @@ fn check_tls_dialect(target: &Target, dialect: &str) -> Result<(), String> {
     }
 }
 
+fn parse_stack_protector_guard_flag(
+    guard: &mut crate::backend::stack_protector::StackProtectorGuard,
+    arg: &str,
+) -> Result<(), String> {
+    use crate::backend::stack_protector::StackProtectorGuardKind;
+    if let Some(val) = arg.strip_prefix("-mstack-protector-guard=") {
+        guard.kind = Some(match val {
+            "tls" => StackProtectorGuardKind::Tls,
+            "global" => StackProtectorGuardKind::Global,
+            "sysreg" => StackProtectorGuardKind::Sysreg,
+            _ => {
+                return Err(format!(
+                    "unrecognized argument in option '{arg}'; valid arguments to \
+                     '-mstack-protector-guard=' are: tls global sysreg"
+                ));
+            }
+        });
+        Ok(())
+    } else if let Some(val) = arg.strip_prefix("-mstack-protector-guard-reg=") {
+        if val.is_empty() {
+            return Err("missing register name after '-mstack-protector-guard-reg='".to_string());
+        }
+        guard.reg = Some(val.to_string());
+        Ok(())
+    } else if let Some(val) = arg.strip_prefix("-mstack-protector-guard-offset=") {
+        let parsed = if let Some(hex) = val.strip_prefix("-0x").or_else(|| val.strip_prefix("-0X"))
+        {
+            i64::from_str_radix(hex, 16).ok().and_then(i64::checked_neg)
+        } else if let Some(hex) = val.strip_prefix("0x").or_else(|| val.strip_prefix("0X")) {
+            i64::from_str_radix(hex, 16).ok()
+        } else {
+            val.parse::<i64>().ok()
+        };
+        let Some(off) = parsed else {
+            return Err(format!(
+                "invalid integer '{val}' in '-mstack-protector-guard-offset='"
+            ));
+        };
+        guard.offset = Some(off);
+        Ok(())
+    } else if let Some(val) = arg.strip_prefix("-mstack-protector-guard-symbol=") {
+        if val.is_empty() {
+            return Err("missing symbol name after '-mstack-protector-guard-symbol='".to_string());
+        }
+        guard.symbol = Some(val.to_string());
+        Ok(())
+    } else {
+        Err(format!("unrecognized command-line option '{arg}'"))
+    }
+}
+
+fn try_parse_ssp_param(ssp_buffer_size: &mut usize, kv: &str) -> Result<bool, String> {
+    if let Some(val) = kv.strip_prefix("ssp-buffer-size=") {
+        let Ok(n) = val.parse::<usize>() else {
+            return Err(format!(
+                "invalid '--param ssp-buffer-size={val}'; expected non-negative integer"
+            ));
+        };
+        if n == 0 {
+            return Err("invalid '--param ssp-buffer-size=0'; minimum value is 1".to_string());
+        }
+        *ssp_buffer_size = n;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
 /// Compare dotted version strings numerically ("16.1.1" > "9.5.0").
 ///
 /// A lexical sort orders "9.5.0" AFTER "16.1.1"/"12", so
@@ -2269,11 +2337,7 @@ impl Driver {
                     self.tls_dialect = Some(arg["-mtls-dialect=".len()..].to_string());
                 }
                 arg if arg.starts_with("-mstack-protector-guard") => {
-                    return Err(format!(
-                        "{}: LCCC does not implement stack-protector canaries; \
-                         build with -fno-stack-protector",
-                        arg
-                    ));
+                    parse_stack_protector_guard_flag(&mut self.stack_protector_guard, arg)?;
                 }
                 // `-mno-<feature>` for an ISA extension LCCC never emits.
                 //
@@ -2525,6 +2589,7 @@ impl Driver {
                 "-fno-trapv" => self.trapv = false,
                 "-fno-plt" => self.no_plt = true,
                 "-fplt" => self.no_plt = false,
+                arg if self.apply_hardening_or_ipa_fflag(arg)? => {}
                 arg if arg.starts_with("-fvisibility=") => {
                     let val = &arg["-fvisibility=".len()..];
                     match val {
@@ -2648,20 +2713,31 @@ impl Driver {
                 "-pg" => {
                     self.mcount_pg = true;
                 }
-                // Stack-protector request. LCCC does NOT emit canaries, so
-                // silently accepting these would hand the caller a binary it
-                // believes is hardened but is not -- the worst failure mode for
-                // a security feature. `-fno-stack-protector` is what LCCC
-                // already does and stays accepted.
-                a @ ("-fstack-protector"
-                | "-fstack-protector-all"
-                | "-fstack-protector-strong"
-                | "-fstack-protector-explicit") => {
-                    return Err(format!(
-                        "{}: LCCC does not implement stack-protector canaries; \
-                         build with -fno-stack-protector",
-                        a
-                    ));
+                "-fstack-protector" => {
+                    self.stack_protector_mode =
+                        crate::backend::stack_protector::StackProtectorMode::Standard;
+                }
+                "-fstack-protector-strong" => {
+                    self.stack_protector_mode =
+                        crate::backend::stack_protector::StackProtectorMode::Strong;
+                }
+                "-fstack-protector-all" => {
+                    self.stack_protector_mode =
+                        crate::backend::stack_protector::StackProtectorMode::All;
+                }
+                "-fstack-protector-explicit" => {
+                    self.stack_protector_mode =
+                        crate::backend::stack_protector::StackProtectorMode::Explicit;
+                }
+                "-fno-stack-protector" => {
+                    self.stack_protector_mode =
+                        crate::backend::stack_protector::StackProtectorMode::None;
+                }
+                "-fstack-clash-protection" => {
+                    self.stack_clash_protection = true;
+                }
+                "-fno-stack-clash-protection" => {
+                    self.stack_clash_protection = false;
                 }
                 // Data-model and ABI requests.  A *suppression* request can be
                 // satisfied by not doing the thing; these cannot: they ask for
@@ -2835,13 +2911,20 @@ impl Driver {
                 // probe must be able to see that lccc has no implementation
                 // for the name).
                 "--param" => {
-                    // Skip the next argument (the parameter value)
                     i += 1;
-                    unknown_option_tolerated("--param", strict_options)?;
+                    if let Some(kv) = args.get(i) {
+                        if !try_parse_ssp_param(&mut self.ssp_buffer_size, kv)? {
+                            unknown_option_tolerated("--param", strict_options)?;
+                        }
+                    } else {
+                        return Err("missing argument after '--param'".to_string());
+                    }
                 }
                 arg if arg.starts_with("--param=") => {
-                    // Single-argument form: --param=ssp-buffer-size=4
-                    unknown_option_tolerated(arg, strict_options)?;
+                    let kv = &arg["--param=".len()..];
+                    if !try_parse_ssp_param(&mut self.ssp_buffer_size, kv)? {
+                        unknown_option_tolerated(arg, strict_options)?;
+                    }
                 }
 
                 // Stdin input
@@ -2951,6 +3034,20 @@ impl Driver {
         if let Some(dialect) = self.tls_dialect.as_deref() {
             check_tls_dialect(&self.target, dialect)?;
         }
+        self.stack_protector_guard
+            .validate_for_target(self.target)?;
+        let untrapped = self.sanitize_enabled.difference(self.sanitize_trap);
+        if !untrapped.is_empty() {
+            let flag = self
+                .last_sanitize_arg
+                .as_deref()
+                .unwrap_or("-fsanitize=undefined");
+            return Err(format!(
+                "{flag} requires trap mode in LCCC (-fsanitize-trap=all, \
+                 -fsanitize-trap=undefined, or -fsanitize-undefined-trap-on-error); \
+                 runtime libubsan diagnostics are not implemented"
+            ));
+        }
 
         Ok(())
     }
@@ -3038,6 +3135,63 @@ impl Driver {
         }
         self.stdc_version = version;
         Ok(())
+    }
+
+    /// Parse `-fwhole-program`, `-fzero-call-used-regs=*`, and trap-mode UBSan
+    /// (`-fsanitize=*`, `-fno-sanitize=*`, `-fsanitize-trap[=*]`,
+    /// `-fno-sanitize-trap[=*]`, `-[no-]fsanitize-undefined-trap-on-error`).
+    fn apply_hardening_or_ipa_fflag(&mut self, arg: &str) -> Result<bool, String> {
+        use crate::ir::lowering::ubsan::UbsanFlags;
+        match arg {
+            "-fwhole-program" => self.whole_program = true,
+            "-fno-whole-program" => self.whole_program = false,
+            "-fsanitize" => {
+                return Err("missing argument to '-fsanitize=' option".to_string());
+            }
+            "-fsanitize=none" => {}
+            "-fno-sanitize" => {
+                self.sanitize_enabled = UbsanFlags::NONE;
+                self.last_sanitize_arg = None;
+            }
+            "-fsanitize-trap" | "-fsanitize-undefined-trap-on-error" => {
+                self.sanitize_trap = self.sanitize_trap.union(UbsanFlags::ALL_KNOWN);
+            }
+            "-fno-sanitize-trap" | "-fno-sanitize-undefined-trap-on-error" => {
+                self.sanitize_trap = UbsanFlags::NONE;
+            }
+            _ if arg.starts_with("-fzero-call-used-regs=") => {
+                let val = &arg["-fzero-call-used-regs=".len()..];
+                self.zero_call_used_regs =
+                    crate::backend::zero_call_used_regs::ZeroCallUsedRegs::parse(val).ok_or_else(
+                        || format!("unrecognized argument in option '-fzero-call-used-regs={val}'"),
+                    )?;
+            }
+            _ if arg.starts_with("-fsanitize=") => {
+                let val = &arg["-fsanitize=".len()..];
+                let flags = UbsanFlags::parse_list_mode(val, false, false)?;
+                self.sanitize_enabled = self.sanitize_enabled.union(flags);
+                if !flags.is_empty() {
+                    self.last_sanitize_arg = Some(arg.to_string());
+                }
+            }
+            _ if arg.starts_with("-fno-sanitize=") => {
+                let val = &arg["-fno-sanitize=".len()..];
+                let flags = UbsanFlags::parse_list_mode(val, true, true)?;
+                self.sanitize_enabled = self.sanitize_enabled.difference(flags);
+            }
+            _ if arg.starts_with("-fsanitize-trap=") => {
+                let val = &arg["-fsanitize-trap=".len()..];
+                let flags = UbsanFlags::parse_list_mode(val, true, true)?;
+                self.sanitize_trap = self.sanitize_trap.union(flags);
+            }
+            _ if arg.starts_with("-fno-sanitize-trap=") => {
+                let val = &arg["-fno-sanitize-trap=".len()..];
+                let flags = UbsanFlags::parse_list_mode(val, true, true)?;
+                self.sanitize_trap = self.sanitize_trap.difference(flags);
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
     }
 
     /// Add a -I include path from command line.
@@ -3736,34 +3890,36 @@ mod cli_tests {
         }
     }
 
-    /// LCCC emits no stack-protector canary. Accepting these silently would
-    /// hand the caller a binary it believes is hardened but is not -- the
-    /// worst failure mode for a security feature. The kernel then needs
-    /// CONFIG_STACKPROTECTOR=n, a decision the build system can only make if
-    /// we say so.
+    /// Stack-protector and stack-clash flags are genuinely implemented, while
+    /// invalid `-mstack-protector-guard*` arguments are rejected.
     #[test]
-    fn unimplemented_hardening_is_refused_not_ignored() {
+    fn stack_hardening_flags_parse_and_validate() {
         for f in [
             "-fstack-protector",
             "-fstack-protector-all",
             "-fstack-protector-strong",
             "-fstack-protector-explicit",
+            "-fno-stack-protector",
+            "-fstack-clash-protection",
+            "-fno-stack-clash-protection",
             "-mstack-protector-guard=global",
+            "-mstack-protector-guard=tls",
             "-mstack-protector-guard-reg=gs",
+            "-mstack-protector-guard-offset=40",
             "-mstack-protector-guard-symbol=__ref_stack_chk_guard",
+            "--param=ssp-buffer-size=4",
         ] {
-            // The specific diagnostic, not merely an error: the `-m` forms
-            // used to fall into the generic `-m` catch-all ("refuses to
-            // silently ignore target-affecting -m flags"), which also errors,
-            // so an `is_err()` check could not see their arm was dead.
-            let err = try_flag(f).expect_err(f);
-            assert!(
-                err.contains("does not implement stack-protector canaries"),
-                "{f}: wrong diagnostic: {err}"
-            );
+            assert!(try_flag(f).is_ok(), "{f} must be accepted");
         }
-        // The opposite request is exactly what LCCC already does.
-        assert!(try_flag("-fno-stack-protector").is_ok());
+        for bad in [
+            "-mstack-protector-guard=bogus",
+            "-mstack-protector-guard-reg=rax",
+            "-mstack-protector-guard-offset=xyz",
+            "-mstack-protector-guard-symbol=123bad",
+            "--param=ssp-buffer-size=0",
+        ] {
+            assert!(try_flag(bad).is_err(), "{bad} must be rejected");
+        }
     }
 
     /// `-ftls-model=` / `-mtls-dialect=` diagnostics follow GCC 16.2's
@@ -5084,7 +5240,6 @@ mod cli_tests {
             "-funroll-loops",
             "-ftree-vectorize",
             "-fno-tree-vectorize",
-            "-fno-stack-clash-protection",
             "-fuse-ld=bfd",
             "-Og",
             "-fdiagnostics-color=always",
@@ -5110,8 +5265,6 @@ mod cli_tests {
     #[test]
     fn meaning_changing_requests_are_refused_not_ignored() {
         for arg in [
-            "-fstack-protector",
-            "-fstack-protector-strong",
             "-fsanitize=address",
             "-fvisibility=bogus",
             "-ftrivial-auto-var-init=bogus",
@@ -5126,6 +5279,10 @@ mod cli_tests {
         // implemented flags are accepted:
         for arg in [
             "-fno-stack-protector",
+            "-fstack-protector",
+            "-fstack-protector-strong",
+            "-fstack-clash-protection",
+            "-fno-stack-clash-protection",
             "-fno-builtin-memcpy",
             "-fsigned-char",
             // Implemented, not merely tolerated (divergence from the closed

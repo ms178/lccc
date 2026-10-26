@@ -868,6 +868,13 @@ impl Parser {
                 self.advance();
                 Expr::FloatLiteralDecimal(width, bytes, span)
             }
+            TokenKind::FloatLiteralHalf(is_bf16, bits) => {
+                let is_bf16 = *is_bf16;
+                let bits = *bits;
+                let span = self.peek_span();
+                self.advance();
+                Expr::FloatLiteralHalf(is_bf16, bits, span)
+            }
             TokenKind::ImaginaryLiteral(val) => {
                 let val = *val;
                 let span = self.peek_span();

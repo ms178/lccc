@@ -187,6 +187,31 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
     );
     m.insert("__builtin_nanl", BuiltinInfo::constant_f64(f64::NAN));
     m.insert("__builtin_nansl", BuiltinInfo::constant_f64(f64::NAN));
+    // _Float16 / __bf16 builtins (GCC 16.2 / C23 TS 18661-3).
+    for name in [
+        "__builtin_inff16",
+        "__builtin_huge_valf16",
+        "__builtin_nanf16",
+        "__builtin_nansf16",
+        "__builtin_nansf16b",
+        "__builtin_fabsf16",
+        "__builtin_copysignf16",
+        "__builtin_ceilf16",
+        "__builtin_floorf16",
+        "__builtin_truncf16",
+        "__builtin_roundf16",
+        "__builtin_roundevenf16",
+        "__builtin_rintf16",
+        "__builtin_nearbyintf16",
+        "__builtin_sqrtf16",
+        "__builtin_fmaf16",
+        "__builtin_fminf16",
+        "__builtin_fmaxf16",
+        "__builtin_nextafterf16",
+    ] {
+        m.insert(name, BuiltinInfo::intrinsic(BuiltinIntrinsic::HalfFloat));
+    }
+
     // _Float128 variants (IEEE binary128): +Inf = 0x7FFF0000...0,
     // qNaN = 0x7FFF8000...0 (big-endian byte order in the 16-byte payload).
     m.insert(
@@ -3588,6 +3613,8 @@ pub enum BuiltinIntrinsic {
     IsEqSig,
     /// `__builtin_speculation_safe_value(val [, failval])`
     SpeculationSafeValue,
+    /// `_Float16` / `__bf16` math & constant builtins (`__builtin_*f16*`)
+    HalfFloat,
     /// No-op builtin (evaluates args, returns 0)
     Nop,
     /// __builtin_cpu_init() - no-op, glibc handles CPU feature detection init

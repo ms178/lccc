@@ -222,7 +222,9 @@ pub(super) fn emit_executable(
             .filter(|(n, s)| {
                 !dynsym_map.contains_key(n.as_str())
                     && is_exportable(n, s)
-                    && (opts.export_dynamic || dso_refs.contains(n.as_str()))
+                    && (opts.export_dynamic
+                        || opts.dynamic_list.matches(n)
+                        || dso_refs.contains(n.as_str()))
             })
             .map(|(n, _)| n.clone())
             .collect()
@@ -433,11 +435,11 @@ pub(super) fn emit_executable(
     let input_note_size = note_sec_idx
         .map(|i| output_sections[i].data.len() as u32)
         .unwrap_or(0);
-    let build_id_size = if opts.build_id {
-        linker_common::build_id::BUILD_ID_NOTE_SIZE as u32
-    } else {
-        0
-    };
+    let build_id_style = opts.effective_build_id_style();
+    let build_id_size = build_id_style.note_size() as u32;
+    let page_size = opts.effective_page_size();
+    let page_mask = page_size - 1;
+    let base_addr = opts.image_base.unwrap_or(BASE_ADDR);
     let has_notes = input_note_size + build_id_size > 0;
     // The merged GNU property note (`merge_gnu_properties`), covered by
     // PT_GNU_PROPERTY as well as PT_NOTE, like GNU ld does for elf_i386.
@@ -487,7 +489,7 @@ pub(super) fn emit_executable(
 
     // Section layout tracking
     let mut file_offset: u32 = ehdr_size;
-    let mut vaddr: u32 = BASE_ADDR + ehdr_size;
+    let mut vaddr: u32 = base_addr + ehdr_size;
 
     let phdr_offset = file_offset;
     let phdr_vaddr = vaddr;
@@ -618,11 +620,11 @@ pub(super) fn emit_executable(
     let ro_headers_end = file_offset;
 
     // ── Segment 1 (RX): .init + .plt + .text + .fini ──
-    file_offset = align_up(file_offset, PAGE_SIZE);
-    vaddr = align_up(vaddr, PAGE_SIZE);
-    vaddr = (vaddr & !0xfff) | (file_offset & 0xfff);
-    if vaddr < BASE_ADDR + file_offset {
-        vaddr += PAGE_SIZE;
+    file_offset = align_up(file_offset, page_size);
+    vaddr = align_up(vaddr, page_size);
+    vaddr = (vaddr & !page_mask) | (file_offset & page_mask);
+    if vaddr < base_addr + file_offset {
+        vaddr += page_size;
     }
 
     let text_seg_file_start = file_offset;
@@ -701,11 +703,11 @@ pub(super) fn emit_executable(
     let text_seg_vaddr_end = vaddr;
 
     // ── Segment 2 (RO): .rodata + .eh_frame ──
-    file_offset = align_up(file_offset, PAGE_SIZE);
-    vaddr = align_up(vaddr, PAGE_SIZE);
-    vaddr = (vaddr & !0xfff) | (file_offset & 0xfff);
+    file_offset = align_up(file_offset, page_size);
+    vaddr = align_up(vaddr, page_size);
+    vaddr = (vaddr & !page_mask) | (file_offset & page_mask);
     if vaddr <= text_seg_vaddr_end {
-        vaddr = align_up(text_seg_vaddr_end, PAGE_SIZE) | (file_offset & 0xfff);
+        vaddr = align_up(text_seg_vaddr_end, page_size) | (file_offset & page_mask);
     }
 
     let rodata_seg_file_start = file_offset;
@@ -762,11 +764,11 @@ pub(super) fn emit_executable(
     let rodata_seg_vaddr_end = vaddr;
 
     // ── Segment 3 (RW): .init_array + .fini_array + .dynamic + .got + .got.plt + .data + .bss ──
-    file_offset = align_up(file_offset, PAGE_SIZE);
-    vaddr = align_up(vaddr, PAGE_SIZE);
-    vaddr = (vaddr & !0xfff) | (file_offset & 0xfff);
+    file_offset = align_up(file_offset, page_size);
+    vaddr = align_up(vaddr, page_size);
+    vaddr = (vaddr & !page_mask) | (file_offset & page_mask);
     if vaddr <= rodata_seg_vaddr_end {
-        vaddr = align_up(rodata_seg_vaddr_end, PAGE_SIZE) | (file_offset & 0xfff);
+        vaddr = align_up(rodata_seg_vaddr_end, page_size) | (file_offset & page_mask);
     }
 
     let data_seg_file_start = file_offset;
@@ -813,6 +815,7 @@ pub(super) fn emit_executable(
         debug: true,
         plt: (num_plt > 0).then_some((0, rel_plt_vaddr, rel_plt_size)),
         rel: (num_rel_dyn > 0).then_some((rel_dyn_vaddr, rel_dyn_size)),
+        relr: None,
         relcount: None,
         verneed: (verneed_size > 0).then_some((versym_vaddr, verneed_vaddr, verneed_count)),
         numeric: option_numeric,
@@ -1018,6 +1021,7 @@ pub(super) fn emit_executable(
     assign_symbol_addresses(
         global_symbols,
         output_sections,
+        base_addr,
         got_base,
         plt_vaddr,
         plt_header_size,
@@ -1338,11 +1342,11 @@ pub(super) fn emit_executable(
         &mut phdr_pos,
         PT_LOAD,
         0,
-        BASE_ADDR,
+        base_addr,
         ro_headers_end,
         ro_headers_end,
         PF_R,
-        PAGE_SIZE,
+        page_size,
     );
     write_ph(
         &mut output,
@@ -1353,7 +1357,7 @@ pub(super) fn emit_executable(
         text_seg_file_end - text_seg_file_start,
         text_seg_vaddr_end - text_seg_vaddr_start,
         PF_R | PF_X,
-        PAGE_SIZE,
+        page_size,
     );
     if rodata_seg_file_end - rodata_seg_file_start > 0 {
         write_ph(
@@ -1365,7 +1369,7 @@ pub(super) fn emit_executable(
             rodata_seg_file_end - rodata_seg_file_start,
             rodata_seg_vaddr_end - rodata_seg_vaddr_start,
             PF_R,
-            PAGE_SIZE,
+            page_size,
         );
     }
     write_ph(
@@ -1377,7 +1381,7 @@ pub(super) fn emit_executable(
         data_seg_file_end - data_seg_file_start,
         data_seg_vaddr_end - data_seg_vaddr_start,
         PF_R | PF_W,
-        PAGE_SIZE,
+        page_size,
     );
     if !is_static {
         write_ph(
@@ -1530,9 +1534,19 @@ pub(super) fn emit_executable(
 
     // Build-id last: the digest covers the complete image.
     if build_id_size > 0 {
-        linker_common::build_id::write_build_id_skeleton(&mut output, build_id_offset as usize);
-        linker_common::build_id::patch_build_id(&mut output, build_id_offset as usize);
+        linker_common::build_id::write_build_id_skeleton_styled(
+            &mut output,
+            build_id_offset as usize,
+            &build_id_style,
+        );
+        linker_common::build_id::patch_build_id_styled(
+            &mut output,
+            build_id_offset as usize,
+            &build_id_style,
+        );
     }
+
+    write_link_map_32(opts, output_sections, global_symbols)?;
 
     // Write to file
     std::fs::write(output_path, &output).map_err(|e| format!("failed to write output: {}", e))?;
@@ -1774,9 +1788,61 @@ pub(super) fn resolve_entry_point(
     text_start
 }
 
+pub(super) fn write_link_map_32(
+    opts: &super::options::LinkOptions,
+    output_sections: &[OutputSection],
+    global_symbols: &FxHashMap<String, LinkerSymbol>,
+) -> Result<(), String> {
+    if !opts.print_map && opts.map_path.is_none() {
+        return Ok(());
+    }
+    use std::fmt::Write as _;
+    let mut map = String::from("Memory Configuration\n\nLinker script and memory map\n\n");
+    for sec in output_sections {
+        if sec.flags & SHF_ALLOC == 0 && sec.data.is_empty() {
+            continue;
+        }
+        let _ = writeln!(
+            map,
+            "{:<20} {:#010x} {:>#10x}",
+            sec.name,
+            sec.addr,
+            sec.data.len()
+        );
+        let mut syms: Vec<(&str, u32)> = global_symbols
+            .iter()
+            .filter(|(_, s)| {
+                s.is_defined
+                    && !s.is_dynamic
+                    && output_sections
+                        .get(s.output_section)
+                        .map(|os| std::ptr::eq(os, sec))
+                        .unwrap_or(false)
+            })
+            .map(|(n, s)| (n.as_str(), s.address))
+            .collect();
+        syms.sort_by_key(|&(n, a)| (a, n));
+        for (name, addr) in syms {
+            let _ = writeln!(
+                map,
+                "                     {:#010x}                {}",
+                addr, name
+            );
+        }
+    }
+    if opts.print_map {
+        print!("{map}");
+    }
+    if let Some(ref path) = opts.map_path {
+        std::fs::write(path, map).map_err(|e| format!("failed to write map {path}: {e}"))?;
+    }
+    Ok(())
+}
+
 fn assign_symbol_addresses(
     global_symbols: &mut FxHashMap<String, LinkerSymbol>,
     output_sections: &[OutputSection],
+    base_addr: u32,
     got_base: u32,
     plt_vaddr: u32,
     plt_header_size: u32,
@@ -1826,7 +1892,7 @@ fn assign_symbol_addresses(
     }
 
     let linker_addrs = LinkerSymbolAddresses {
-        base_addr: BASE_ADDR as u64,
+        base_addr: base_addr as u64,
         got_addr: got_base as u64,
         dynamic_addr: if is_static { 0 } else { dynamic_vaddr as u64 },
         bss_addr: bss_vaddr as u64,

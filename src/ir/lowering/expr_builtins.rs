@@ -1103,6 +1103,7 @@ impl Lowerer {
             BuiltinIntrinsic::IsSignaling => self.lower_gcc16_issignaling(args),
             BuiltinIntrinsic::IsEqSig => self.lower_gcc16_iseqsig(args),
             BuiltinIntrinsic::SpeculationSafeValue => self.lower_gcc16_speculation_safe(args),
+            BuiltinIntrinsic::HalfFloat => self.lower_half_float_builtin(name, args),
             // __builtin_classify_type(expr) -> GCC type class integer
             BuiltinIntrinsic::ClassifyType => Some(Operand::Const(IrConst::I64(
                 self.classify_type_of(args.first()),
@@ -1861,8 +1862,20 @@ impl Lowerer {
         if args.len() < 2 {
             return Some(Operand::Const(IrConst::I64(0)));
         }
-        let lhs_ty = self.get_expr_type(&args[0]);
-        let rhs_ty = self.get_expr_type(&args[1]);
+        let lhs_ct = self.expr_ctype(&args[0]);
+        let rhs_ct = self.expr_ctype(&args[1]);
+        let mut lhs_ty = self.get_expr_type(&args[0]);
+        let mut rhs_ty = self.get_expr_type(&args[1]);
+        let mut lhs = self.lower_expr(&args[0]);
+        let mut rhs = self.lower_expr(&args[1]);
+        if lhs_ct.is_half_float() {
+            lhs = Operand::Value(self.emit_half_to_f32(lhs, &lhs_ct));
+            lhs_ty = IrType::F32;
+        }
+        if rhs_ct.is_half_float() {
+            rhs = Operand::Value(self.emit_half_to_f32(rhs, &rhs_ct));
+            rhs_ty = IrType::F32;
+        }
         // Promote to the widest floating-point type among the two operands.
         let cmp_ty = if lhs_ty == IrType::F128 || rhs_ty == IrType::F128 {
             IrType::F128
@@ -1873,8 +1886,6 @@ impl Lowerer {
         } else {
             IrType::F64
         };
-        let mut lhs = self.lower_expr(&args[0]);
-        let mut rhs = self.lower_expr(&args[1]);
         if lhs_ty != cmp_ty {
             let conv = self.emit_cast_val(lhs, lhs_ty, cmp_ty);
             lhs = Operand::Value(conv);
@@ -1972,6 +1983,7 @@ impl Lowerer {
             | Expr::FloatLiteralF32(..)
             | Expr::FloatLiteralLongDouble(..)
             | Expr::FloatLiteralF128(..)
+            | Expr::FloatLiteralHalf(..)
             | Expr::CharLiteral(..)
             | Expr::StringLiteral(..)
             | Expr::WideStringLiteral(..)

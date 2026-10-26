@@ -438,6 +438,7 @@ mod tests {
             ret_is_f128_sse: false,
             is_gnu_inline_def: false,
             loop_promoted_f64_values: Vec::new(),
+            ssp: Default::default(),
         };
         let removed = run(&mut func);
         assert_eq!(removed, 0, "volatile loads must not merge");

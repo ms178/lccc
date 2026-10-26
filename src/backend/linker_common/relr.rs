@@ -89,6 +89,95 @@ pub fn encode_relr_64_words(addrs: &[u64]) -> Vec<u64> {
     out
 }
 
+/// Partition 32-bit `R_386_RELATIVE` relocation addresses into:
+/// - `relr_addrs`: sorted, deduplicated 4-byte-aligned addresses for `.relr.dyn`,
+/// - `rel_leftovers`: unaligned addresses that must stay in `.rel.dyn`.
+pub fn partition_relative_32(addrs: &[u32]) -> (Vec<u32>, Vec<u32>) {
+    let mut relr_addrs = Vec::with_capacity(addrs.len());
+    let mut rel_leftovers = Vec::new();
+    for &addr in addrs {
+        if addr & 3 == 0 {
+            relr_addrs.push(addr);
+        } else {
+            rel_leftovers.push(addr);
+        }
+    }
+    relr_addrs.sort_unstable();
+    relr_addrs.dedup();
+    (relr_addrs, rel_leftovers)
+}
+
+/// Encode sorted, deduplicated 4-byte-aligned addresses into `Elf32_Relr` words,
+/// serialized as little-endian bytes for `.relr.dyn`.
+pub fn encode_relr_32_bytes(sorted_aligned_addrs: &[u32]) -> Vec<u8> {
+    let words = encode_relr_32_words(sorted_aligned_addrs);
+    let mut bytes = Vec::with_capacity(words.len() * 4);
+    for w in words {
+        bytes.extend_from_slice(&w.to_le_bytes());
+    }
+    bytes
+}
+
+/// Encode sorted, deduplicated 4-byte-aligned addresses into `Elf32_Relr` words.
+///
+/// Each continuation bitmap word covers 31 consecutive 4-byte slots (`124` bytes).
+pub fn encode_relr_32_words(addrs: &[u32]) -> Vec<u32> {
+    const WORD_SIZE: u32 = 4;
+    const BITMAP_SLOTS: u32 = 31;
+    const WINDOW_BYTES: u32 = WORD_SIZE * BITMAP_SLOTS; // 124 bytes
+
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < addrs.len() {
+        let addr = addrs[i];
+        debug_assert_eq!(addr & 1, 0, "RELR address word must be even");
+        out.push(addr);
+        i += 1;
+        let mut cursor = addr + WORD_SIZE;
+
+        while i < addrs.len() {
+            let delta = addrs[i].saturating_sub(cursor);
+            if delta >= WINDOW_BYTES || delta % WORD_SIZE != 0 {
+                break;
+            }
+            let mut bitmap: u32 = 1;
+            while i < addrs.len() {
+                let d = addrs[i].saturating_sub(cursor);
+                if d >= WINDOW_BYTES || d % WORD_SIZE != 0 {
+                    break;
+                }
+                let bit = (d / WORD_SIZE) + 1;
+                bitmap |= 1u32 << bit;
+                i += 1;
+            }
+            out.push(bitmap);
+            cursor += WINDOW_BYTES;
+        }
+    }
+    out
+}
+
+/// Decode `Elf32_Relr` words back into relocated virtual addresses.
+#[cfg(test)]
+pub fn decode_relr_32_words(words: &[u32]) -> Vec<u32> {
+    let mut out = Vec::new();
+    let mut cursor = 0u32;
+    for &w in words {
+        if w & 1 == 0 {
+            out.push(w);
+            cursor = w + 4;
+        } else {
+            for bit in 1..32u32 {
+                if (w >> bit) & 1 != 0 {
+                    out.push(cursor + (bit - 1) * 4);
+                }
+            }
+            cursor += 31 * 4;
+        }
+    }
+    out
+}
+
 /// Decode `Elf64_Relr` words back into the exact sequence of relocated virtual
 /// addresses (matching glibc `elf_machine_lazy_rel` / `_dl_relocate_object`).
 #[cfg(test)]
@@ -157,6 +246,23 @@ mod tests {
         assert_eq!(
             decode_relr_64_words(&words),
             vec![0x3dc0, 0x3dc8, 0x5000, 0x5010]
+        );
+    }
+
+    #[test]
+    fn elf32_relr_dense_and_unaligned_roundtrip() {
+        let addrs32: Vec<u32> = (0..32).map(|k| 0x2000 + k * 4).collect();
+        let w32 = encode_relr_32_words(&addrs32);
+        assert_eq!(w32, vec![0x2000, u32::MAX]);
+        assert_eq!(decode_relr_32_words(&w32), addrs32);
+
+        let raw = vec![0x2000, 0x2004, 0x2005, 0x2100, 0x2108];
+        let (relr, rel) = partition_relative_32(&raw);
+        assert_eq!(rel, vec![0x2005]);
+        let words = encode_relr_32_words(&relr);
+        assert_eq!(
+            decode_relr_32_words(&words),
+            vec![0x2000, 0x2004, 0x2100, 0x2108]
         );
     }
 }

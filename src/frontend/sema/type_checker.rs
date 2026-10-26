@@ -144,6 +144,11 @@ impl<'a> ExprTypeChecker<'a> {
                 64 => Some(CType::Decimal64),
                 _ => Some(CType::Decimal128),
             },
+            Expr::FloatLiteralHalf(is_bf16, _, _) => Some(if *is_bf16 {
+                CType::BFloat16
+            } else {
+                CType::Float16
+            }),
             Expr::ImaginaryLiteral(_, _) => Some(CType::ComplexDouble),
             Expr::ImaginaryLiteralF32(_, _) => Some(CType::ComplexFloat),
             Expr::ImaginaryLiteralLongDouble(_, _, _) => Some(CType::ComplexLongDouble),
@@ -743,6 +748,8 @@ impl<'a> ExprTypeChecker<'a> {
             TypeSpecifier::Float => CType::Float,
             TypeSpecifier::Double => CType::Double,
             TypeSpecifier::LongDouble => CType::LongDouble,
+            TypeSpecifier::Float16 => CType::Float16,
+            TypeSpecifier::BFloat16 => CType::BFloat16,
             TypeSpecifier::Float128 => CType::Float128,
             TypeSpecifier::Decimal32 => CType::Decimal32,
             TypeSpecifier::Decimal64 => CType::Decimal64,
@@ -1273,6 +1280,27 @@ impl<'a> ExprTypeChecker<'a> {
             | "__builtin_nansl"
             | "__builtin_fabsl"
             | "__builtin_nextafterl" => Some(CType::LongDouble),
+
+            // _Float16 & __bf16 builtins (GCC 16.2 / C23 TS 18661-3).
+            "__builtin_inff16"
+            | "__builtin_huge_valf16"
+            | "__builtin_nanf16"
+            | "__builtin_nansf16"
+            | "__builtin_fabsf16"
+            | "__builtin_copysignf16"
+            | "__builtin_ceilf16"
+            | "__builtin_floorf16"
+            | "__builtin_truncf16"
+            | "__builtin_roundf16"
+            | "__builtin_roundevenf16"
+            | "__builtin_rintf16"
+            | "__builtin_nearbyintf16"
+            | "__builtin_sqrtf16"
+            | "__builtin_fmaf16"
+            | "__builtin_fminf16"
+            | "__builtin_fmaxf16"
+            | "__builtin_nextafterf16" => Some(CType::Float16),
+            "__builtin_nansf16b" => Some(CType::BFloat16),
 
             // _Float128 builtins (sema/builtins.rs): binary128 results.
             "__builtin_inff128"

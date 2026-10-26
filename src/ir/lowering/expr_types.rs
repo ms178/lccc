@@ -551,6 +551,25 @@ impl Lowerer {
             | "__builtin_fabsf128"
             | "__builtin_copysignq"
             | "__builtin_fabsq" => Some(IrType::U128),
+            "__builtin_inff16"
+            | "__builtin_huge_valf16"
+            | "__builtin_nanf16"
+            | "__builtin_nansf16"
+            | "__builtin_nansf16b"
+            | "__builtin_fabsf16"
+            | "__builtin_copysignf16"
+            | "__builtin_ceilf16"
+            | "__builtin_floorf16"
+            | "__builtin_truncf16"
+            | "__builtin_roundf16"
+            | "__builtin_roundevenf16"
+            | "__builtin_rintf16"
+            | "__builtin_nearbyintf16"
+            | "__builtin_sqrtf16"
+            | "__builtin_fmaf16"
+            | "__builtin_fminf16"
+            | "__builtin_fmaxf16"
+            | "__builtin_nextafterf16" => Some(IrType::U16),
             // Integer-returning classification builtins
             "__builtin_fpclassify"
             | "__builtin_isnan"
@@ -666,10 +685,9 @@ impl Lowerer {
             | "__builtin___printf_chk"
             | "__builtin___fprintf_chk"
             | "__builtin___vprintf_chk"
-            | "__builtin___vfprintf_chk" => Some(IrType::I32),
-            // __builtin_va_arg_pack / __builtin_va_arg_pack_len return int
-            "__builtin_va_arg_pack" | "__builtin_va_arg_pack_len" => Some(IrType::I32),
-            // __builtin_thread_pointer returns a void pointer (thread pointer / TLS base)
+            | "__builtin___vfprintf_chk"
+            | "__builtin_va_arg_pack"
+            | "__builtin_va_arg_pack_len" => Some(IrType::I32),
             "__builtin_thread_pointer" => Some(IrType::Ptr),
             _ => None,
         }
@@ -1176,6 +1194,7 @@ impl Lowerer {
             Expr::FloatLiteralF32(_, _) => IrType::F32,
             Expr::FloatLiteralLongDouble(_, _, _) => IrType::F128,
             Expr::FloatLiteralF128(_, _, _) => IrType::U128,
+            Expr::FloatLiteralHalf(_, _, _) => IrType::U16,
             Expr::FloatLiteralDecimal(width, _, _) => match width {
                 32 => IrType::D32,
                 64 => IrType::D64,
@@ -1808,6 +1827,11 @@ impl Lowerer {
             Expr::FloatLiteralF32(_, _) => Some(CType::Float),
             Expr::FloatLiteralLongDouble(_, _, _) => Some(CType::LongDouble),
             Expr::FloatLiteralF128(_, _, _) => Some(CType::Float128),
+            Expr::FloatLiteralHalf(is_bf16, _, _) => Some(if *is_bf16 {
+                CType::BFloat16
+            } else {
+                CType::Float16
+            }),
             Expr::FloatLiteralDecimal(width, _, _) => match width {
                 32 => Some(CType::Decimal32),
                 64 => Some(CType::Decimal64),

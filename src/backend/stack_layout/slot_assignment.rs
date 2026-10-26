@@ -16,6 +16,66 @@ use crate::ir::reexports::{Instruction, IrConst, IrFunction, Operand, Terminator
 
 use super::{BlockLocalValue, DeferredSlot, MultiBlockValue, StackLayoutContext};
 
+/// Place `func.ssp.stack_guard_alloca` at the start of `non_local_space` on
+/// negative-offset architectures (x86-64, i686, RISC-V), where smaller
+/// displacement from FP corresponds to the highest local stack address.
+pub(super) fn place_stack_guard_early(
+    state: &mut crate::backend::state::CodegenState,
+    func: &IrFunction,
+    assign_slot: &impl Fn(i64, i64, i64) -> (i64, i64),
+    non_local_space: &mut i64,
+) {
+    let Some(guard) = func.ssp.stack_guard_alloca else {
+        return;
+    };
+    let ptr_size = crate::common::types::target_ptr_size() as i64;
+    let (probe_slot, _) = assign_slot(*non_local_space, ptr_size, ptr_size);
+    if probe_slot < 0 {
+        let (slot, new_space) = assign_slot(*non_local_space, ptr_size, ptr_size);
+        let word_ty = if ptr_size == 4 {
+            IrType::U32
+        } else {
+            IrType::U64
+        };
+        state.alloca_values.insert(guard.0);
+        state.alloca_types.insert(guard.0, word_ty);
+        state.protected_slot_values.insert(guard.0);
+        state.volatile_alloca_values.insert(guard.0);
+        state.value_locations.insert(guard.0, StackSlot(slot));
+        *non_local_space = new_space;
+    }
+}
+
+/// Place `func.ssp.stack_guard_alloca` at the top of `total_space` on
+/// positive-offset architectures (AArch64), where larger offset from `x29`/`sp`
+/// corresponds to the highest local stack address.
+pub(super) fn place_stack_guard_late(
+    state: &mut crate::backend::state::CodegenState,
+    func: &IrFunction,
+    assign_slot: &impl Fn(i64, i64, i64) -> (i64, i64),
+    total_space: i64,
+) -> i64 {
+    let Some(guard) = func.ssp.stack_guard_alloca else {
+        return total_space;
+    };
+    if state.value_locations.contains_key(&guard.0) {
+        return total_space;
+    }
+    let ptr_size = crate::common::types::target_ptr_size() as i64;
+    let (slot, new_space) = assign_slot(total_space, ptr_size, ptr_size);
+    let word_ty = if ptr_size == 4 {
+        IrType::U32
+    } else {
+        IrType::U64
+    };
+    state.alloca_values.insert(guard.0);
+    state.alloca_types.insert(guard.0, word_ty);
+    state.protected_slot_values.insert(guard.0);
+    state.volatile_alloca_values.insert(guard.0);
+    state.value_locations.insert(guard.0, StackSlot(slot));
+    new_space
+}
+
 /// Whether `func` contains a `__builtin_setjmp` intrinsic (a returns-twice
 /// function).  Such functions must never rely on liveness models that only
 /// cover the ordinary CFG: the resume edge from any call that longjmps back
@@ -339,6 +399,19 @@ pub(super) fn classify_instructions(
         modified
     };
 
+    if func.ssp.stack_guard_alloca.is_some() {
+        classify_ssp_allocas(
+            state,
+            func,
+            ctx,
+            assign_slot,
+            non_local_space,
+            deferred_slots,
+            block_space,
+            max_block_local_space,
+        );
+    }
+
     for block in &func.blocks {
         for inst in &block.instructions {
             if let Instruction::Alloca {
@@ -350,6 +423,9 @@ pub(super) fn classify_instructions(
                 ..
             } = inst
             {
+                if func.ssp.stack_guard_alloca.is_some() {
+                    continue;
+                }
                 if *semantic_volatile {
                     state.volatile_alloca_values.insert(dest.0);
                 }
@@ -360,6 +436,7 @@ pub(super) fn classify_instructions(
                     *ty,
                     *align,
                     *semantic_volatile,
+                    false,
                     ctx,
                     assign_slot,
                     non_local_space,
@@ -548,7 +625,106 @@ pub(super) fn classify_instructions(
     }
 }
 
+/// ProPolice 2-tier local ordering for SSP-instrumented functions: place array,
+/// byte-buffer, and address-taken non-parameter allocas directly below the
+/// stack canary, and place scalar/pointer/parameter allocas below all buffers
+/// so an upward buffer overflow hits the canary before corrupting local
+/// pointers or loop bounds.
+#[allow(clippy::too_many_arguments)]
+fn classify_ssp_allocas(
+    state: &mut crate::backend::state::CodegenState,
+    func: &IrFunction,
+    ctx: &StackLayoutContext,
+    assign_slot: &impl Fn(i64, i64, i64) -> (i64, i64),
+    non_local_space: &mut i64,
+    deferred_slots: &mut Vec<DeferredSlot>,
+    block_space: &mut FxHashMap<usize, i64>,
+    max_block_local_space: &mut i64,
+) {
+    let param_set: FxHashSet<u32> = func.param_alloca_values.iter().map(|v| v.0).collect();
+    let mut addr_taken: FxHashSet<u32> = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            match inst {
+                Instruction::GetElementPtr { base, .. } => {
+                    addr_taken.insert(base.0);
+                }
+                Instruction::Store {
+                    val: Operand::Value(v),
+                    ..
+                } => {
+                    addr_taken.insert(v.0);
+                }
+                Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
+                    for arg in &info.args {
+                        if let Operand::Value(v) = arg {
+                            addr_taken.insert(v.0);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let ptr_size = crate::common::types::target_ptr_size();
+    let downward = assign_slot(0, 8, 8).0 < 0;
+    let pass_order = if downward {
+        [true, false]
+    } else {
+        [false, true]
+    };
+    for want_buffer in pass_order {
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                let Instruction::Alloca {
+                    dest,
+                    size,
+                    ty,
+                    align,
+                    semantic_volatile,
+                    ..
+                } = inst
+                else {
+                    continue;
+                };
+                if func.ssp.stack_guard_alloca == Some(*dest) {
+                    continue;
+                }
+                let is_buffer = !param_set.contains(&dest.0)
+                    && (*size > ptr_size
+                        || matches!(*ty, IrType::I8 | IrType::U8)
+                        || addr_taken.contains(&dest.0));
+                if is_buffer != want_buffer {
+                    continue;
+                }
+                if *semantic_volatile {
+                    state.volatile_alloca_values.insert(dest.0);
+                }
+                classify_alloca(
+                    state,
+                    dest,
+                    *size,
+                    *ty,
+                    *align,
+                    *semantic_volatile,
+                    is_buffer,
+                    ctx,
+                    assign_slot,
+                    non_local_space,
+                    deferred_slots,
+                    block_space,
+                    max_block_local_space,
+                );
+            }
+        }
+    }
+    if !downward {
+        *non_local_space = place_stack_guard_late(state, func, assign_slot, *non_local_space);
+    }
+}
+
 /// Classify a single Alloca instruction into Tier 1 (permanent) or Tier 3 (block-local).
+#[allow(clippy::too_many_arguments)]
 fn classify_alloca(
     state: &mut crate::backend::state::CodegenState,
     dest: &Value,
@@ -556,6 +732,7 @@ fn classify_alloca(
     ty: IrType,
     align: usize,
     semantic_volatile: bool,
+    pin_near_canary: bool,
     ctx: &StackLayoutContext,
     assign_slot: &impl Fn(i64, i64, i64) -> (i64, i64),
     non_local_space: &mut i64,
@@ -634,7 +811,7 @@ fn classify_alloca(
         .get(&dest.0)
         .map(|&ub| ctx.block_loop_depth.get(ub).copied().unwrap_or(1) != 0)
         .unwrap_or(false);
-    if effective_align <= 16 && !semantic_volatile && !use_block_in_loop {
+    if effective_align <= 16 && !semantic_volatile && !pin_near_canary && !use_block_in_loop {
         if let Some(&use_block) = ctx.coalescable_allocas.single_block.get(&dest.0) {
             let alloca_size = raw_size + extra as i64;
             let alloca_align = align as i64;

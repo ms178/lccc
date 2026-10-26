@@ -7590,6 +7590,11 @@ mod encoding_opt_tests {
         assert_eq!(hex("vcvtps2phx %xmm1, %xmm2"), "62 f5 7d 08 1d d1");
         assert_eq!(hex("vcvtps2phxy %ymm1, %xmm2"), "62 f5 7d 28 1d d1");
         assert_eq!(hex("vcvtph2psx %xmm1, %xmm2"), "62 f6 7d 08 13 d1");
+        // F16C VEX vcvtps2ph MR encoding with high XMM/YMM registers:
+        // VEX.R extends ModRM.reg (src) and VEX.B extends ModRM.rm (dst).
+        assert_eq!(hex("vcvtps2ph $4, %xmm9, %xmm0"), "c4 63 79 1d c8 04");
+        assert_eq!(hex("vcvtps2ph $4, %xmm0, %xmm9"), "c4 c3 79 1d c1 04");
+        assert_eq!(hex("vcvtps2ph $4, %ymm15, %xmm14"), "c4 43 7d 1d fe 04");
 
         // GAS defaults BF16 to EVEX, while {vex} selects its VEX.0F38 row.
         assert_eq!(hex("vcvtneps2bf16 %ymm1, %xmm2"), "62 f2 7e 28 72 d1");

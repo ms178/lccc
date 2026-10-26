@@ -140,8 +140,13 @@ cd "$work" || exit 1
 # The archive NAME apt would use for each package, resolved without a download.
 # `--print-uris` prints "<uri> <hash> <size> <filename>" per package; the
 # filename is the last field.
+apt_opts=(
+    -o Acquire::http::Timeout=15
+    -o Acquire::https::Timeout=15
+    -o Acquire::Retries=2
+)
 archive_name() {  # archive_name <package> -> basename, or empty
-    apt-get download --print-uris "$1" 2>/dev/null \
+    apt-get "${apt_opts[@]}" download --print-uris "$1" 2>/dev/null \
         | awk 'NR == 1 { print $NF }' \
         | sed -e "s/^'//" -e "s/'$//" -e 's|.*/||'
 }
@@ -151,28 +156,41 @@ missing=()
 cached=0
 fetched=0
 [[ -n $deb_cache ]] && { mkdir -p "$deb_cache" 2>/dev/null || deb_cache=""; }
+to_fetch=()
+declare -A pkg_archive=()
 for p in "${pkgs[@]}"; do
     name=$(archive_name "$p")
-    if [[ -n $deb_cache ]]; then
-        if [[ -n $name && -s $deb_cache/$name ]]; then
-            cached=$((cached + 1))
-        elif [[ -n $name ]]; then
-            # Download straight into the cache, so the first lane to run
-            # populates the key for every later lane, then unpack from here.
-            ( cd "$deb_cache" && apt-get download "$p" >/dev/null 2>&1 )
-            [[ -s $deb_cache/$name ]] && fetched=$((fetched + 1))
-        fi
-        if [[ -n $name && -s $deb_cache/$name ]]; then
-            # Hardlink when possible: the cache and the work tree are usually
-            # on one filesystem, and a link costs nothing while copying
-            # ~300 MB would hand the saving straight back to the unpack.
-            ln "$deb_cache/$name" "$work/$name" 2>/dev/null \
-                || cp "$deb_cache/$name" "$work/$name" 2>/dev/null \
-                || missing+=("$p")
-            continue
-        fi
+    pkg_archive["$p"]=$name
+    if [[ -n $deb_cache && -n $name && -s $deb_cache/$name ]]; then
+        cached=$((cached + 1))
+    else
+        to_fetch+=("$p")
     fi
-    apt-get download "$p" >/dev/null 2>&1 || missing+=("$p")
+done
+if ((${#to_fetch[@]} > 0)); then
+    dl_dir=${deb_cache:-$work}
+    if ! ( cd "$dl_dir" && timeout 180 apt-get "${apt_opts[@]}" download "${to_fetch[@]}" >/dev/null 2>&1 ); then
+        for p in "${to_fetch[@]}"; do
+            name=${pkg_archive["$p"]:-}
+            [[ -n $name && -s $dl_dir/$name ]] && continue
+            ( cd "$dl_dir" && timeout 45 apt-get "${apt_opts[@]}" download "$p" >/dev/null 2>&1 ) || true
+        done
+    fi
+fi
+for p in "${pkgs[@]}"; do
+    name=${pkg_archive["$p"]:-}
+    if [[ -n $deb_cache && -n $name && -s $deb_cache/$name ]]; then
+        if [[ " ${to_fetch[*]} " == *" $p "* ]]; then
+            fetched=$((fetched + 1))
+        fi
+        ln "$deb_cache/$name" "$work/$name" 2>/dev/null \
+            || cp "$deb_cache/$name" "$work/$name" 2>/dev/null \
+            || missing+=("$p")
+    elif [[ -z $deb_cache && -n $name && -s $work/$name ]]; then
+        fetched=$((fetched + 1))
+    else
+        timeout 45 apt-get "${apt_opts[@]}" download "$p" >/dev/null 2>&1 || missing+=("$p")
+    fi
 done
 echo "[cross] archives: $cached reused, $fetched fetched"
 if ((${#missing[@]})); then

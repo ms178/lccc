@@ -312,27 +312,28 @@ pub enum EightbyteClass {
 /// passed in FP registers rather than GP registers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RiscvFloatClass {
-    /// Struct with exactly one float/double member, no other data members.
-    /// Passed in a single FP register (fa0-fa7).
-    OneFloat { is_double: bool },
-    /// Struct with exactly two float/double members, no other data members.
+    /// Struct with exactly one float/double/_Float16/__bf16 member, no other data members.
+    /// Passed in a single FP register (fa0-fa7). `size` is 2, 4, or 8 bytes.
+    OneFloat { size: u8 },
+    /// Struct with exactly two FP members, no other data members.
     /// Passed in two FP registers (fa0-fa7).
     TwoFloats {
-        lo_is_double: bool,
-        hi_is_double: bool,
+        lo_size: u8,
+        hi_size: u8,
+        hi_offset: usize,
     },
-    /// Struct with one float/double + one integer, float comes first in memory.
-    /// Float in FP register, integer in GP register.
+    /// Struct with one FP member + one integer, FP comes first in memory.
+    /// FP in FP register, integer in GP register.
     FloatAndInt {
-        float_is_double: bool,
+        float_size: u8,
         float_offset: usize,
         int_offset: usize,
         int_size: usize,
     },
-    /// Struct with one integer + one float/double, integer comes first in memory.
-    /// Integer in GP register, float in FP register.
+    /// Struct with one integer + one FP member, integer comes first in memory.
+    /// Integer in GP register, FP in FP register.
     IntAndFloat {
-        float_is_double: bool,
+        float_size: u8,
         int_offset: usize,
         int_size: usize,
         float_offset: usize,
@@ -444,6 +445,12 @@ pub enum CType {
     Float,
     Double,
     LongDouble,
+    /// ISO C23 `_Float16` / `__fp16`: IEEE binary16, 2 bytes, 2-byte aligned.
+    /// Carried in IR as `U16` (with FP-register ABI flags on calls/params/returns).
+    Float16,
+    /// GCC/Clang `__bf16`: brain float16, 2 bytes, 2-byte aligned.
+    /// Carried in IR as `U16` (with FP-register ABI flags on calls/params/returns).
+    BFloat16,
     /// ISO C _Float128 / __float128: IEEE binary128, 16 bytes.
     /// Distinct from long double (80-bit x87 on x86-64).
     Float128,
@@ -1616,22 +1623,18 @@ impl StructLayout {
         // Apply RISC-V psABI rules:
         match (float_fields.len(), int_fields.len()) {
             // 1 float, no int: pass float in 1 FP reg
-            (1, 0) => {
-                let is_double = float_fields[0].1 == 8;
-                Some(RiscvFloatClass::OneFloat { is_double })
-            }
+            (1, 0) => Some(RiscvFloatClass::OneFloat {
+                size: float_fields[0].1 as u8,
+            }),
             // 2 floats, no int: pass both in FP regs
-            (2, 0) => {
-                let lo_is_double = float_fields[0].1 == 8;
-                let hi_is_double = float_fields[1].1 == 8;
-                Some(RiscvFloatClass::TwoFloats {
-                    lo_is_double,
-                    hi_is_double,
-                })
-            }
+            (2, 0) => Some(RiscvFloatClass::TwoFloats {
+                lo_size: float_fields[0].1 as u8,
+                hi_size: float_fields[1].1 as u8,
+                hi_offset: float_fields[1].0,
+            }),
             // 1 float + 1 int: pass float in FP reg, int in GP reg
             (1, 1) => {
-                let float_is_double = float_fields[0].1 == 8;
+                let float_size = float_fields[0].1 as u8;
                 let int_size = int_fields[0].1;
                 // Integer field must fit in one XLEN register
                 if int_size > xlen {
@@ -1640,14 +1643,14 @@ impl StructLayout {
                 // Determine which comes first in memory layout
                 if float_fields[0].0 < int_fields[0].0 {
                     Some(RiscvFloatClass::FloatAndInt {
-                        float_is_double,
+                        float_size,
                         float_offset: float_fields[0].0,
                         int_offset: int_fields[0].0,
                         int_size,
                     })
                 } else {
                     Some(RiscvFloatClass::IntAndFloat {
-                        float_is_double,
+                        float_size,
                         int_offset: int_fields[0].0,
                         int_size,
                         float_offset: float_fields[0].0,
@@ -1679,6 +1682,9 @@ impl StructLayout {
             }
             let offset = base_offset + field.offset;
             match &field.ty {
+                CType::Float16 | CType::BFloat16 => {
+                    float_fields.push((offset, 2));
+                }
                 CType::Float => {
                     float_fields.push((offset, 4));
                 }
@@ -1714,6 +1720,7 @@ impl StructLayout {
                     for i in 0..*count {
                         let elem_offset = offset + i * elem_size;
                         match elem_ty.as_ref() {
+                            CType::Float16 | CType::BFloat16 => float_fields.push((elem_offset, 2)),
                             CType::Float => float_fields.push((elem_offset, 4)),
                             CType::Double => float_fields.push((elem_offset, 8)),
                             CType::Struct(key) | CType::Union(key) => {
@@ -2076,6 +2083,8 @@ impl std::fmt::Display for CType {
             CType::Float => write!(f, "float"),
             CType::Double => write!(f, "double"),
             CType::LongDouble => write!(f, "long double"),
+            CType::Float16 => write!(f, "_Float16"),
+            CType::BFloat16 => write!(f, "__bf16"),
             CType::Float128 => write!(f, "_Float128"),
             CType::Decimal32 => write!(f, "_Decimal32"),
             CType::Decimal64 => write!(f, "_Decimal64"),
@@ -2333,6 +2342,7 @@ impl CType {
                     16
                 }
             }
+            CType::Float16 | CType::BFloat16 => 2,
             CType::Float128 => 16,
             // Decimal floating point (BID): same sizes as the binary types of
             // equal width (GCC: sizeof = 4/8/16 on both x86-64 and i386).
@@ -2410,6 +2420,7 @@ impl CType {
                     16
                 }
             }
+            CType::Float16 | CType::BFloat16 => 2,
             CType::Float128 => 16,
             // GCC aligns _Decimal64 to 8 and _Decimal128 to 16 on both
             // x86-64 and i386 (measured: alignof = 4/8/16 for D32/D64/D128).
@@ -2555,6 +2566,8 @@ impl CType {
             CType::Float
             | CType::Double
             | CType::LongDouble
+            | CType::Float16
+            | CType::BFloat16
             | CType::Float128
             | CType::Decimal32
             | CType::Decimal64
@@ -2641,21 +2654,27 @@ impl CType {
         }
     }
 
+    /// Whether this is `_Float16` (`__fp16`) or `__bf16` (16-bit floating point).
+    pub fn is_half_float(&self) -> bool {
+        matches!(self, CType::Float16 | CType::BFloat16)
+    }
+
     /// Whether values of this type live in an integer carrier and take
     /// their arithmetic, comparisons, conversions and truthiness from
-    /// library helpers: the decimal types (libbid) and _Float128 (libgcc
-    /// soft-float). Raw IR integer operations on such a carrier are wrong.
+    /// CType-level lowering: the decimal types (libbid), _Float128 (libgcc),
+    /// and _Float16 / __bf16 (hardware F16C/FCVT or inline IEEE-754 RNE).
     pub fn is_soft_float(&self) -> bool {
-        self.is_decimal() || matches!(self, CType::Float128)
+        self.is_decimal() || self.is_half_float() || matches!(self, CType::Float128)
     }
 
     /// Whether this is an arithmetic type (integer, real floating, or
-    /// complex). _Float128 is a real floating type (C23 6.2.5) and so
-    /// arithmetic, although `is_floating()` excludes it: that predicate
-    /// gates hardware FP codegen, which binary128 never reaches.
+    /// complex). _Float128, _Float16 and __bf16 are real floating types and so
+    /// arithmetic, although `is_floating()` excludes them: that predicate
+    /// gates direct F32/F64/F128 IR FP codegen.
     pub fn is_arithmetic(&self) -> bool {
         self.is_integer()
             || self.is_floating()
+            || self.is_half_float()
             || matches!(self, CType::Float128)
             || self.is_complex()
     }
@@ -3327,6 +3346,12 @@ impl CType {
         if matches!(&l, CType::Float) || matches!(&r, CType::Float) {
             return CType::Float;
         }
+        if matches!(&l, CType::Float16) || matches!(&r, CType::Float16) {
+            return CType::Float16;
+        }
+        if matches!(&l, CType::BFloat16) || matches!(&r, CType::BFloat16) {
+            return CType::BFloat16;
+        }
 
         // Both integer types after promotion: apply conversion rank rules
         let l_rank = l.integer_rank();
@@ -3433,6 +3458,8 @@ impl CType {
                     | CType::Float
                     | CType::Double
                     | CType::LongDouble
+                    | CType::Float16
+                    | CType::BFloat16
                     | CType::Float128
                     | CType::Decimal32
                     | CType::Decimal64
@@ -3978,6 +4005,7 @@ impl IrType {
             // IEEE binary128 representation intact (the F128 path is x87-based
             // and would round to 80-bit). Arithmetic/comparison/conversion on
             // Float128 is lowered to libgcc soft-float calls at the CType level.
+            CType::Float16 | CType::BFloat16 => IrType::U16,
             CType::Float128 => IrType::U128,
             // Decimal floating point (C23): D32/D64 are first-class SSE-class
             // bit containers (ABI-identical to F32/F64); D128 uses the U128

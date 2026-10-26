@@ -35,18 +35,20 @@ impl Lowerer {
             false_label: ok_label,
         });
         self.start_block(trap_label);
-        self.emit(Instruction::Call {
-            func: "abort".to_string(),
-            info: CallInfo {
-                dest: None,
-                args: Vec::new(),
-                arg_types: Vec::new(),
-                return_type: IrType::Void,
-                is_variadic: false,
-                num_fixed_args: 0,
-                ..Default::default()
-            },
-        });
+        if self.trapv {
+            self.emit(Instruction::Call {
+                func: "abort".to_string(),
+                info: CallInfo {
+                    dest: None,
+                    args: Vec::new(),
+                    arg_types: Vec::new(),
+                    return_type: IrType::Void,
+                    is_variadic: false,
+                    num_fixed_args: 0,
+                    ..Default::default()
+                },
+            });
+        }
         self.terminate(Terminator::Unreachable);
         self.start_block(ok_label);
     }
@@ -256,18 +258,20 @@ impl Lowerer {
                         false_label: done_bb,
                     });
                     self.start_block(trap_bb);
-                    self.emit(Instruction::Call {
-                        func: "abort".to_string(),
-                        info: CallInfo {
-                            dest: None,
-                            args: Vec::new(),
-                            arg_types: Vec::new(),
-                            return_type: IrType::Void,
-                            is_variadic: false,
-                            num_fixed_args: 0,
-                            ..Default::default()
-                        },
-                    });
+                    if self.trapv {
+                        self.emit(Instruction::Call {
+                            func: "abort".to_string(),
+                            info: CallInfo {
+                                dest: None,
+                                args: Vec::new(),
+                                arg_types: Vec::new(),
+                                return_type: IrType::Void,
+                                is_variadic: false,
+                                num_fixed_args: 0,
+                                ..Default::default()
+                            },
+                        });
+                    }
                     self.terminate(Terminator::Unreachable);
                     self.start_block(done_bb);
                     res

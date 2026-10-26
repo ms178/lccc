@@ -364,7 +364,27 @@ impl RiscvCodegen {
     }
 
     pub(super) fn emit_sub_sp_by_acc_impl(&mut self) {
-        self.state.emit("    sub sp, sp, t0");
+        if self.state.stack_clash_protection {
+            let loop_lbl = self.state.fresh_label("dalloca_probe");
+            let rem_lbl = self.state.fresh_label("dalloca_rem");
+            let done_lbl = self.state.fresh_label("dalloca_done");
+            self.state.emit("    li t1, 4096");
+            self.state.emit_fmt(format_args!("{}:", loop_lbl));
+            self.state
+                .emit_fmt(format_args!("    bltu t0, t1, {}", rem_lbl));
+            self.state.emit("    sub sp, sp, t1");
+            self.state.emit("    sd zero, 0(sp)");
+            self.state.emit("    sub t0, t0, t1");
+            self.state.emit_fmt(format_args!("    j {}", loop_lbl));
+            self.state.emit_fmt(format_args!("{}:", rem_lbl));
+            self.state
+                .emit_fmt(format_args!("    beqz t0, {}", done_lbl));
+            self.state.emit("    sub sp, sp, t0");
+            self.state.emit("    sd zero, 0(sp)");
+            self.state.emit_fmt(format_args!("{}:", done_lbl));
+        } else {
+            self.state.emit("    sub sp, sp, t0");
+        }
     }
 
     pub(super) fn emit_mov_sp_to_acc_impl(&mut self) {

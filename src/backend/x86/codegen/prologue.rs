@@ -3084,6 +3084,7 @@ impl X86Codegen {
         // the text (`splat_v32i`: 4 instructions, GCC 3).
         let ret_rax_live = func.is_naked
             || !vector_ret_in_xmm0
+                && !func.ret_is_f128_sse
                 && !matches!(
                     func.return_type,
                     IrType::Void
@@ -3134,17 +3135,9 @@ impl X86Codegen {
                     self.state.emit_fmt(format_args!("    pushq %{}", reg_name));
                 }
                 let local_size = frame_size - n_saves * 8;
-                if local_size > 0 {
-                    self.state
-                        .out
-                        .emit_instr_imm_reg("    subq", local_size, "rsp");
-                }
+                emit_fpo_stack_alloc_x86(&mut self.state, local_size);
             } else {
-                if frame_size > 0 {
-                    self.state
-                        .out
-                        .emit_instr_imm_reg("    subq", frame_size, "rsp");
-                }
+                emit_fpo_stack_alloc_x86(&mut self.state, frame_size);
                 for (i, &reg) in used_regs.iter().enumerate() {
                     let reg_name = phys_reg_name(reg);
                     let rsp_offset = frame_size - (i as i64 + 1) * 8;
@@ -3664,20 +3657,22 @@ impl X86Codegen {
                                         self.param_source_regs.insert(phys_reg.0, source);
                                     }
                                 } else if let ParamClass::FloatReg { reg_idx } = class {
-                                    // FP pre-store: DEFERRED (see above).
-                                    // Record the ABI register and home so the
-                                    // deferred pass can order them safely.
-                                    fp_prestores.push((
-                                        i,
-                                        reg_idx,
-                                        phys_reg,
-                                        dest_reg,
-                                        if func.params[i].ty == IrType::F32 {
-                                            FpPrestoreKind::F32
-                                        } else {
-                                            FpPrestoreKind::F64
-                                        },
-                                    ));
+                                    if is_xmm {
+                                        // FP pre-store: DEFERRED (see above).
+                                        // Record the ABI register and home so the
+                                        // deferred pass can order them safely.
+                                        fp_prestores.push((
+                                            i,
+                                            reg_idx,
+                                            phys_reg,
+                                            dest_reg,
+                                            if func.params[i].ty == IrType::F32 {
+                                                FpPrestoreKind::F32
+                                            } else {
+                                                FpPrestoreKind::F64
+                                            },
+                                        ));
+                                    }
                                 }
                             }
                         }
@@ -3871,7 +3866,11 @@ impl X86Codegen {
                     self.emit_capture_store_qword(dst, X86_ARG_REGS[reg_idx], 0);
                 }
                 ParamClass::FloatReg { reg_idx } => {
-                    if (ty == IrType::F32 || ty == IrType::D32) && !self.isa.simd {
+                    if ty == IrType::U16 {
+                        self.emit_scalar_xmm_to_gpr(xmm_regs[reg_idx], "rax", Some("eax"));
+                        self.state.emit("    movzwl %ax, %eax");
+                        self.emit_capture_store_qword(dst, "rax", 0);
+                    } else if (ty == IrType::F32 || ty == IrType::D32) && !self.isa.simd {
                         // SSE1 has no XMM->GPR MOVD. Capture the low word
                         // directly, preserving the existing zero-extended
                         // eight-byte home contract without touching another
@@ -4325,14 +4324,20 @@ impl X86Codegen {
             // and only falls back to %rax (invalidating the accumulator
             // cache) for a home that is neither register nor slot.
             ParamClass::FloatReg { reg_idx } => {
-                // Width as before: only F32 moved 4 bytes; every other
-                // SSE-class scalar (F64, D32/D64 images) moved all 8.
-                let width = if ty == IrType::F32 {
-                    IrType::F32
+                if ty == IrType::U16 {
+                    self.emit_scalar_xmm_to_gpr(xmm_regs[reg_idx], "rax", Some("eax"));
+                    self.state.emit("    movzwl %ax, %eax");
+                    self.store_rax_to(dest);
                 } else {
-                    IrType::F64
-                };
-                self.store_xmm_to(dest, xmm_regs[reg_idx], width);
+                    // Width as before: only F32 moved 4 bytes; every other
+                    // SSE-class scalar (F64, D32/D64 images) moved all 8.
+                    let width = if ty == IrType::F32 {
+                        IrType::F32
+                    } else {
+                        IrType::F64
+                    };
+                    self.store_xmm_to(dest, xmm_regs[reg_idx], width);
+                }
             }
             ParamClass::StackScalar { offset } => {
                 let src = stack_base + offset;
@@ -4659,7 +4664,7 @@ pub(super) fn ret_xmm_bits(
         return RET_XMM_BITS_UNKNOWN;
     }
     if ret_is_f128_sse {
-        return 128;
+        return if return_type == IrType::U16 { 16 } else { 128 };
     }
     if !ret_eightbyte_classes.is_empty() || two_registers {
         return 64;
@@ -5028,5 +5033,28 @@ mod incoming_byval_tests {
         state.incoming_byval_slots.insert(9, StackSlot(16));
         state.reset_for_function();
         assert!(state.incoming_byval_slots.is_empty());
+    }
+}
+
+/// Allocate `size` bytes on `%rsp` in an FPO prologue. When
+/// `-fstack-clash-protection` is active and `size > 4096`, unroll 4096-byte
+/// page probes so `cfi_synth` maintains an exact static `%rsp` CFA at every PC.
+fn emit_fpo_stack_alloc_x86(state: &mut crate::backend::state::CodegenState, mut size: i64) {
+    if size <= 0 {
+        return;
+    }
+    const PAGE_SIZE: i64 = 4096;
+    if state.stack_clash_protection {
+        while size > PAGE_SIZE {
+            state.out.emit_instr_imm_reg("    subq", PAGE_SIZE, "rsp");
+            state.emit("    orl $0, (%rsp)");
+            size -= PAGE_SIZE;
+        }
+        if size > 0 {
+            state.out.emit_instr_imm_reg("    subq", size, "rsp");
+            state.emit("    orl $0, (%rsp)");
+        }
+    } else {
+        state.out.emit_instr_imm_reg("    subq", size, "rsp");
     }
 }

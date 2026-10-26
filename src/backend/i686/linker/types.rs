@@ -109,6 +109,10 @@ pub(super) const DT_VERSYM: i32 = 0x6ffffff0_u32 as i32;
 pub(super) const DT_HASH: i32 = 4;
 pub(super) const DT_PREINIT_ARRAY: i32 = 32;
 pub(super) const DT_PREINIT_ARRAYSZ: i32 = 33;
+pub(super) const DT_RELRSZ: i32 = 35;
+pub(super) const DT_RELR: i32 = 36;
+pub(super) const DT_RELRENT: i32 = 37;
+pub(super) const SHT_RELR: u32 = 19;
 pub(super) const PT_GNU_RELRO: u32 = 0x6474_e552;
 pub(super) const PT_NOTE: u32 = 4;
 

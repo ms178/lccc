@@ -760,6 +760,7 @@ mod tests {
             ret_is_f128_sse: false,
             is_gnu_inline_def: false,
             loop_promoted_f64_values: vec![],
+            ssp: Default::default(),
         }
     }
 

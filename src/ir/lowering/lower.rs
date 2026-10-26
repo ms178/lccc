@@ -217,6 +217,16 @@ pub struct Lowerer {
     pub(super) gnu89_inline: bool,
     /// `-ftrapv`: emit runtime signed-overflow checks on signed integer operations.
     pub(super) trapv: bool,
+    /// `-fwrapv`: signed integer overflow wraps in two's complement.
+    pub(super) wrap_signed_overflow: bool,
+    /// Active trap-mode UBSan checks (`-fsanitize=... -fsanitize-trap=...`).
+    pub(super) ubsan_trap: super::ubsan::UbsanFlags,
+    /// Per-function `no_sanitize` suppression mask while lowering a function body.
+    pub(super) func_no_sanitize: super::ubsan::UbsanFlags,
+    /// Set for the immediate operand of unary `&` so `&*p` and `&a[N]` obey C11 6.5.3.2p3.
+    pub(super) in_address_of_top_lvalue: bool,
+    /// Map of prototype-declared `no_sanitize` masks keyed by C function name.
+    pub(super) decl_no_sanitize_map: FxHashMap<String, super::ubsan::UbsanFlags>,
     /// `-ftrivial-auto-var-init={uninitialized,zero,pattern}` mode.
     pub(super) trivial_auto_var_init: super::trapv::TrivialAutoVarInit,
     /// `-fvisibility={default,hidden,internal,protected}` CLI default visibility for
@@ -237,6 +247,7 @@ impl Lowerer {
         mut self,
         policy: crate::common::pass_policy::PassPolicy,
     ) -> Self {
+        self.wrap_signed_overflow = policy.wrap_signed_overflow;
         self.pass_policy = policy;
         self
     }
@@ -257,6 +268,16 @@ impl Lowerer {
 
     pub(crate) fn with_trapv(mut self, trapv: bool) -> Self {
         self.trapv = trapv;
+        self
+    }
+
+    pub(crate) fn with_wrapv(mut self, wrapv: bool) -> Self {
+        self.wrap_signed_overflow = wrapv;
+        self
+    }
+
+    pub(crate) fn with_ubsan_trap(mut self, flags: super::ubsan::UbsanFlags) -> Self {
+        self.ubsan_trap = flags;
         self
     }
 
@@ -377,6 +398,11 @@ impl Lowerer {
             materialized_compound_literals: FxHashMap::default(),
             gnu89_inline,
             trapv: false,
+            wrap_signed_overflow: false,
+            ubsan_trap: super::ubsan::UbsanFlags::NONE,
+            func_no_sanitize: super::ubsan::UbsanFlags::NONE,
+            in_address_of_top_lvalue: false,
+            decl_no_sanitize_map: FxHashMap::default(),
             trivial_auto_var_init: super::trapv::TrivialAutoVarInit::Uninitialized,
             default_visibility: None,
         }
@@ -1530,7 +1556,7 @@ impl Lowerer {
         // Compute SysV eightbyte classification for two-register struct returns.
         // _Float128 returns are 16-byte SSE-class values (SysV psABI): ONE XMM
         // register (xmm0).
-        let mut ret_is_f128_sse = false;
+        let mut ret_is_f128_sse = full_ret_ctype.is_half_float();
         let ret_eightbyte_classes =
             if matches!(full_ret_ctype, CType::Float128) || full_ret_ctype == CType::Decimal128 {
                 ret_is_f128_sse = true;
@@ -1706,13 +1732,12 @@ impl Lowerer {
         let param_is_f128_sse: Vec<bool> = params
             .iter()
             .map(|p| {
-                matches!(self.type_spec_to_ctype(&p.type_spec), CType::Float128)
-                    || self.type_spec_to_ctype(&p.type_spec) == CType::Decimal128
+                let ct = self.type_spec_to_ctype(&p.type_spec);
+                matches!(ct, CType::Float128 | CType::Decimal128)
+                    || ct.is_half_float()
                     // SSE + SSEUP aggregates (16-byte vectors, `struct {
                     // _Float128 }`, ...) ride in ONE xmm exactly like _Float128.
-                    || self
-                        .sysv_arg_abi(&self.type_spec_to_ctype(&p.type_spec))
-                        .is_some_and(|(_, one_xmm)| one_xmm)
+                    || self.sysv_arg_abi(&ct).is_some_and(|(_, one_xmm)| one_xmm)
             })
             .collect();
 
@@ -2543,7 +2568,20 @@ impl Lowerer {
         // is a genuine value conversion through the libbid helpers — bit-cast
         // machinery must never see decimal carriers.
         if target_ct.is_decimal() || src_ct.is_decimal() {
+            if src_ct.is_half_float() {
+                return self.convert_from_half(src, src_ct, target_ct);
+            }
+            if target_ct.is_half_float() {
+                let f = self.convert_decimal_scalar(src, src_ty, src_ct, &CType::Double);
+                return self.convert_to_half(f, IrType::F64, &CType::Double, target_ct);
+            }
             return self.convert_decimal_scalar(src, src_ty, src_ct, target_ct);
+        }
+        if target_ct.is_half_float() {
+            return self.convert_to_half(src, src_ty, src_ct, target_ct);
+        }
+        if src_ct.is_half_float() {
+            return self.convert_from_half(src, src_ct, target_ct);
         }
         if *target_ct == CType::Float128 {
             // The C type decides: a _Float128 source (a variable, a `1.5F128`
@@ -2569,7 +2607,7 @@ impl Lowerer {
     /// decimal types are BID encodings, not binary values.  A conversion
     /// touching one is a value conversion decided by the C types.
     pub(super) fn is_value_converted_ctype(ct: &CType) -> bool {
-        *ct == CType::Float128 || ct.is_decimal()
+        ct.is_soft_float()
     }
 
     /// Compile-time form of [`Self::convert_scalar_ctype`] for a constant
@@ -2596,6 +2634,17 @@ impl Lowerer {
         if *src_ct == CType::Float128 && target_ct.is_integer() {
             let bytes = crate::common::const_eval::f128_bytes_of(c, Some(src_ct))?;
             if (u128::from_le_bytes(bytes) >> 112) & 0x7FFF == 0x7FFF {
+                return None;
+            }
+        }
+        if src_ct.is_half_float() && target_ct.is_integer() {
+            let bits = crate::common::const_eval::half_bits_of(c)?;
+            let nonfinite = if *src_ct == CType::BFloat16 {
+                (bits & 0x7f80) == 0x7f80
+            } else {
+                (bits & 0x7c00) == 0x7c00
+            };
+            if nonfinite {
                 return None;
             }
         }
@@ -2659,6 +2708,9 @@ impl Lowerer {
             IrType,
             Option<(usize, usize, Vec<crate::common::types::EightbyteClass>)>,
         ) = match from_ct {
+            CType::Float16 | CType::BFloat16 => {
+                return self.convert_from_half(val, from_ct, &CType::Float128);
+            }
             CType::Float => ("__extendsftf2", IrType::F32, None),
             CType::Double => ("__extenddftf2", IrType::F64, None),
             // x87 long double: passed per SysV (16-byte stack slot, x87 class).
@@ -2740,6 +2792,9 @@ impl Lowerer {
             IrType,
             Vec<crate::common::types::EightbyteClass>,
         ) = match to_ct {
+            CType::Float16 | CType::BFloat16 => {
+                return self.convert_to_half(val, IrType::U128, &CType::Float128, to_ct);
+            }
             CType::Float => ("__trunctfsf2", IrType::F32, Vec::new()),
             CType::Double => ("__trunctfdf2", IrType::F64, Vec::new()),
             // x87 long double: returned in st(0) (the backend's F128 return path).
@@ -4017,11 +4072,29 @@ impl Lowerer {
             );
         }
         if *common_ct == CType::Float128 {
+            if *op == ast::BinOp::Div {
+                self.emit_ubsan_float_div_check(r, IrType::F128);
+            }
             let helper = format!("__{}tf3", soft_stem());
             return self.emit_f128_binop_call(&helper, l, r);
         }
+        if common_ct.is_half_float() {
+            let lf = self.emit_half_to_f32(l, common_ct);
+            let rf = self.emit_half_to_f32(r, common_ct);
+            if *op == ast::BinOp::Div {
+                self.emit_ubsan_float_div_check(Operand::Value(rf), IrType::F32);
+            }
+            let ir_op = Self::binop_to_ir(*op, false);
+            let res_f =
+                self.emit_binop_val(ir_op, Operand::Value(lf), Operand::Value(rf), IrType::F32);
+            return self.emit_f32_to_half(Operand::Value(res_f), common_ct);
+        }
+        let common_ir = IrType::from_ctype(common_ct);
+        if *op == ast::BinOp::Div && common_ir.is_float() {
+            self.emit_ubsan_float_div_check(r, common_ir);
+        }
         let ir_op = Self::binop_to_ir(*op, false);
-        self.emit_binop_val(ir_op, l, r, IrType::from_ctype(common_ct))
+        self.emit_binop_val(ir_op, l, r, common_ir)
     }
 
     /// Truthiness test for a decimal or _Float128 operand (`x != 0` under
@@ -4030,6 +4103,22 @@ impl Lowerer {
     /// Testing the integer carrier instead is wrong for -0 and, when the
     /// test narrows the carrier, for every value whose low bits are zero.
     pub(super) fn lower_soft_float_truthiness(&mut self, val: Operand, ct: &CType) -> Operand {
+        if ct.is_half_float() {
+            let u = self.emit_cast_val(val, IrType::U16, IrType::U32);
+            let mag = self.emit_binop_val(
+                IrBinOp::And,
+                Operand::Value(u),
+                Operand::Const(IrConst::I32(0x7fff)),
+                IrType::U32,
+            );
+            let nz = self.emit_cmp_val(
+                IrCmpOp::Ne,
+                Operand::Value(mag),
+                Operand::Const(IrConst::I32(0)),
+                IrType::U32,
+            );
+            return Operand::Value(nz);
+        }
         if *ct == CType::Float128 {
             let ne = self.emit_f128_cmp_call("__netf2", val, Operand::Const(IrConst::I128(0)));
             let z = self.emit_cmp_val(

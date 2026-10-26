@@ -520,6 +520,20 @@ impl Lowerer {
                 frame.cleanup_vars.push((cleanup_fn_name.clone(), alloca));
             }
         }
+        if local_info.asm_register.is_none() {
+            let (has_arr, max_char) = if let Some(ref ct) = local_info.var.c_type {
+                let layouts = self.types.borrow_struct_layouts();
+                classify_ssp_ctype(ct, &layouts, 0)
+            } else {
+                (da.is_array, 0)
+            };
+            if has_arr || da.is_array {
+                self.func_mut().ssp_has_array = true;
+            }
+            if max_char > self.func().ssp_max_char_array_bytes {
+                self.func_mut().ssp_max_char_array_bytes = max_char;
+            }
+        }
         self.insert_local_scoped(declarator.name.clone(), local_info);
     }
 
@@ -1783,6 +1797,7 @@ impl Lowerer {
             } else {
                 // Runtime dimension - emit multiplication
                 let dim_val = self.lower_expr(expr);
+                self.emit_ubsan_vla_bound_check(dim_val, expr);
                 let dim_value = self.operand_to_value(dim_val);
 
                 let ptr_int_ty = target_int_ir_type();
@@ -2376,5 +2391,46 @@ impl Lowerer {
             }
         }
         self.compute_vla_size_from_type_spec(&field.type_spec)
+    }
+}
+
+/// Classify a local variable's C type for `-fstack-protector{,-strong}`:
+/// returns `(has_any_array, max_char_array_bytes)`.
+fn classify_ssp_ctype(
+    ct: &CType,
+    layouts: &crate::common::fx_hash::FxHashMap<String, crate::common::types::RcLayout>,
+    depth: u8,
+) -> (bool, u32) {
+    if depth > 8 {
+        return (false, 0);
+    }
+    match ct {
+        CType::Array(elem, len_opt) => {
+            let mut max_char = 0u32;
+            if let Some(len) = len_opt {
+                if matches!(
+                    elem.as_ref(),
+                    CType::Char | CType::UChar | CType::SChar | CType::PlainUChar
+                ) {
+                    max_char = (*len).min(u32::MAX as usize) as u32;
+                }
+            }
+            let (_, nested_char) = classify_ssp_ctype(elem, layouts, depth + 1);
+            (true, max_char.max(nested_char))
+        }
+        CType::Struct(key) | CType::Union(key) => {
+            let Some(layout) = layouts.get(&**key) else {
+                return (false, 0);
+            };
+            let mut has_arr = false;
+            let mut max_char = 0u32;
+            for field in &layout.fields {
+                let (fa, fc) = classify_ssp_ctype(&field.ty, layouts, depth + 1);
+                has_arr |= fa;
+                max_char = max_char.max(fc);
+            }
+            (has_arr, max_char)
+        }
+        _ => (false, 0),
     }
 }

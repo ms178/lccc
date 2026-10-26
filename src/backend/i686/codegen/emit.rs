@@ -118,6 +118,8 @@ pub struct I686Codegen {
     /// Whether this function returns a 16-byte i386 vector piece in %xmm0
     /// (IR: I128 with `[Sse, SseUp]` return classes).
     pub(super) current_return_i686_xmm: bool,
+    /// Whether this function returns a 16-bit half-float (`_Float16`/`__bf16`) in `%xmm0`.
+    pub(super) current_return_half_xmm: bool,
     pub(super) vector_ret_buffer_bytes: usize,
     pub(super) vector_ret_buffer_offset: i64,
     /// Whether the current function is variadic
@@ -585,6 +587,7 @@ impl I686Codegen {
             current_return_type: IrType::I32,
             current_return_i686_ext_vector_gp3: false,
             current_return_i686_xmm: false,
+            current_return_half_xmm: false,
             vector_ret_buffer_bytes: 0,
             vector_ret_buffer_offset: 0,
             is_variadic: false,
@@ -1801,6 +1804,7 @@ impl I686Codegen {
         struct_arg_sizes: &[Option<usize>],
         struct_arg_aligns: &[Option<usize>],
         struct_arg_classes: &[Vec<crate::common::types::EightbyteClass>],
+        struct_arg_is_f128_sse: &[bool],
         direct_name: Option<&str>,
         func_ptr: Option<&Operand>,
         dest: Option<Value>,
@@ -1810,10 +1814,14 @@ impl I686Codegen {
         let indirect = func_ptr.is_some() && direct_name.is_none();
 
         // One authoritative layout, identical to the callee-side prologue.
-        let force_stack: Vec<bool> = struct_arg_classes
-            .iter()
-            .map(|classes| {
-                classes.len() == 1 && classes[0] == crate::common::types::EightbyteClass::NoClass
+        let force_stack: Vec<bool> = (0..arg_types.len())
+            .map(|i| {
+                let classes = struct_arg_classes.get(i).map(Vec::as_slice).unwrap_or(&[]);
+                let half_fp = arg_types[i] == IrType::U16
+                    && struct_arg_is_f128_sse.get(i).copied().unwrap_or(false);
+                half_fp
+                    || (classes.len() == 1
+                        && classes[0] == crate::common::types::EightbyteClass::NoClass)
             })
             .collect();
         let (slots, stack_bytes) = self.fastcall_layout_with_abi(
@@ -3012,8 +3020,9 @@ impl ArchCodegen for I686Codegen {
         is_fastcall: bool,
         is_regparm: Option<u8>,
         ret_eightbyte_classes: &[crate::common::types::EightbyteClass],
-        _ret_is_f128_sse: bool,
+        ret_is_f128_sse: bool,
     ) {
+        let returns_half_xmm = ret_is_f128_sse && return_type == IrType::U16;
         let returns_i686_ext_vector_gp3 = return_type == IrType::I128
             && ret_eightbyte_classes.len() == 3
             && ret_eightbyte_classes
@@ -3028,15 +3037,18 @@ impl ArchCodegen for I686Codegen {
         if is_fastcall {
             let gp3_dest = returns_i686_ext_vector_gp3.then(|| dest.clone()).flatten();
             let xmm_dest = returns_i686_xmm.then(|| dest.clone()).flatten();
+            let half_dest = returns_half_xmm.then(|| dest.clone()).flatten();
+            let fc_dest = if returns_half_xmm { None } else { dest };
             self.emit_fastcall(
                 args,
                 arg_types,
                 struct_arg_sizes,
                 struct_arg_aligns,
                 struct_arg_classes,
+                struct_arg_is_f128_sse,
                 direct_name,
                 func_ptr,
-                dest,
+                fc_dest,
                 return_type,
                 is_variadic,
             );
@@ -3045,6 +3057,11 @@ impl ArchCodegen for I686Codegen {
             }
             if let Some(dest) = xmm_dest {
                 self.emit_call_store_i686_xmm_result_impl(&dest);
+            }
+            if let Some(dest) = half_dest {
+                self.state.emit("    movd %xmm0, %eax");
+                self.state.emit("    movzwl %ax, %eax");
+                self.emit_store_result(&dest);
             }
             return;
         }
@@ -3069,7 +3086,7 @@ impl ArchCodegen for I686Codegen {
             struct_arg_aligns.get(skip..).unwrap_or(&[]),
             struct_arg_classes.get(skip..).unwrap_or(&[]),
             struct_arg_riscv_float_classes.get(skip..).unwrap_or(&[]),
-            &[],
+            struct_arg_is_f128_sse.get(skip..).unwrap_or(&[]),
             is_variadic,
             &config,
         );
@@ -3130,13 +3147,19 @@ impl ArchCodegen for I686Codegen {
         if let Some(bytes) = vector_return_bytes {
             self.emit_call_store_vector_return(&args[0], bytes, dest.as_ref());
         } else if let Some(dest) = dest {
-            self.set_call_ret_eightbyte_classes(ret_eightbyte_classes);
-            self.emit_call_store_result(&dest, return_type);
-            if returns_i686_ext_vector_gp3 {
-                self.emit_call_store_i686_ext_vector_gp3_result_impl(&dest);
-            }
-            if returns_i686_xmm {
-                self.emit_call_store_i686_xmm_result_impl(&dest);
+            if returns_half_xmm {
+                self.state.emit("    movd %xmm0, %eax");
+                self.state.emit("    movzwl %ax, %eax");
+                self.emit_store_result(&dest);
+            } else {
+                self.set_call_ret_eightbyte_classes(ret_eightbyte_classes);
+                self.emit_call_store_result(&dest, return_type);
+                if returns_i686_ext_vector_gp3 {
+                    self.emit_call_store_i686_ext_vector_gp3_result_impl(&dest);
+                }
+                if returns_i686_xmm {
+                    self.emit_call_store_i686_xmm_result_impl(&dest);
+                }
             }
         }
     }

@@ -322,6 +322,14 @@ fn ordered_args(passthrough: &[String], positional: &[(usize, String)]) -> Vec<S
     out
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Emulation {
+    X86_64,
+    I386,
+    Aarch64,
+    Riscv64,
+}
+
 fn run(args: &[String]) -> Result<(), String> {
     let mut output = "a.out".to_string();
     let mut script_path: Option<String> = None;
@@ -333,14 +341,19 @@ fn run(args: &[String]) -> Result<(), String> {
     let mut gc_sections = false;
     let mut is_pie = false;
     let mut is_static = false;
-    let mut build_id = false;
+    let mut build_id_style = lccc::linker_entry::BuildIdStyle::None;
     let mut entry_override: Option<String> = None;
     let mut shared = false;
     let mut soname: Option<String> = None;
     let mut dt_symbolic = false;
     let mut max_page_size = 0x200000u64;
     let mut max_page_size_explicit = false;
-    let mut elf_i386 = false;
+    let mut emulation = Emulation::X86_64;
+    let mut trace = false;
+    let mut fatal_warnings = false;
+    let mut print_memory_usage = false;
+    let mut oformat_binary = false;
+    let mut top_warnings: Vec<String> = Vec::new();
     // Arguments forwarded verbatim into the builtin userspace pipeline
     // (parse_linker_args understands the GNU spellings directly).
     let mut passthrough: Vec<String> = Vec::new();
@@ -372,17 +385,38 @@ fn run(args: &[String]) -> Result<(), String> {
             }
             "-m" => {
                 // Emulation selects both the input parser and output ELF
-                // class. ELF32 is currently supported for full script links,
-                // which is the path used by Linux's real-mode setup image.
+                // class/architecture.
                 i += 1;
                 match args.get(i).map(String::as_str) {
-                    Some("elf_x86_64") | Some("elf64_x86_64") => elf_i386 = false,
-                    Some("elf_i386") | Some("i386linux") => elf_i386 = true,
+                    Some("elf_x86_64") | Some("elf64_x86_64") => emulation = Emulation::X86_64,
+                    Some("elf_i386") | Some("i386linux") => emulation = Emulation::I386,
+                    Some("aarch64linux") | Some("aarch64elf") | Some("aarch64_elf64_le_vec") => {
+                        emulation = Emulation::Aarch64;
+                    }
+                    Some("elf64lriscv") | Some("elf64lriscv_lp64d") | Some("elf64lriscv_lp64") => {
+                        emulation = Emulation::Riscv64;
+                    }
                     None => return Err("-m needs an argument".into()),
                     Some(other) => {
                         return Err(format!("unsupported emulation '-m {other}'"));
                     }
                 }
+            }
+            "-t" | "--trace" => {
+                trace = true;
+                passthrough.push("-t".to_string());
+            }
+            "--fatal-warnings" => {
+                fatal_warnings = true;
+                passthrough.push("--fatal-warnings".to_string());
+            }
+            "--no-fatal-warnings" => {
+                fatal_warnings = false;
+                passthrough.push("--no-fatal-warnings".to_string());
+            }
+            "--print-memory-usage" => {
+                print_memory_usage = true;
+                passthrough.push("--print-memory-usage".to_string());
             }
             "-T" | "--script" => {
                 i += 1;
@@ -718,20 +752,45 @@ fn run(args: &[String]) -> Result<(), String> {
                         passthrough.push(format!("-Wl,-soname,{}", val));
                     }
                 } else if a.starts_with("--build-id") {
-                    // Two consumers: script links get a synthetic note object
-                    // here, and the userspace pipeline gets the flag through
-                    // the shared parser (it emits the note itself).  Previously
-                    // only the script path was wired, so every `gcc
-                    // -fuse-ld=lccc` build -- Debian's gcc passes --build-id on
-                    // every link -- produced a binary with no build-id, which
-                    // breaks debuginfod, distro debuginfo extraction and
-                    // coredump matching.
-                    build_id = !a.ends_with("=none") && !a.ends_with("=0");
+                    let style_opt = a.split_once('=').map(|(_, v)| v);
+                    build_id_style = lccc::linker_entry::BuildIdStyle::parse(true, style_opt)?;
                     passthrough.push(if let Some((_, v)) = a.split_once('=') {
                         format!("-Wl,--build-id={}", v)
                     } else {
                         "-Wl,--build-id".to_string()
                     });
+                } else if a.starts_with("--dynamic-list") {
+                    let val = two_arg(a, args, &mut i);
+                    if val.is_empty() {
+                        return Err("--dynamic-list needs a file path".into());
+                    }
+                    passthrough.push(format!("-Wl,--dynamic-list={val}"));
+                } else if a.starts_with("--image-base") {
+                    let val = two_arg(a, args, &mut i);
+                    if val.is_empty() {
+                        return Err("--image-base needs an address".into());
+                    }
+                    passthrough.push(format!("-Wl,--image-base={val}"));
+                } else if a.starts_with("--pack-dyn-relocs") {
+                    let val = two_arg(a, args, &mut i);
+                    if val.is_empty() {
+                        return Err("--pack-dyn-relocs needs a value".into());
+                    }
+                    passthrough.push(format!("-Wl,--pack-dyn-relocs={val}"));
+                } else if a.starts_with("--oformat") || a == "-b" {
+                    let val = two_arg(a, args, &mut i);
+                    match val.as_str() {
+                        "binary" => {
+                            oformat_binary = true;
+                            passthrough.push("-Wl,--oformat=binary".to_string());
+                        }
+                        v if v == "default" || v.starts_with("elf") => {
+                            oformat_binary = false;
+                        }
+                        other => {
+                            return Err(format!("unsupported --oformat='{other}'"));
+                        }
+                    }
                 } else if a.starts_with("--exclude-libs") {
                     // Forward to the shared pipeline, normalising the
                     // two-argument form to the joined one.
@@ -804,48 +863,24 @@ fn run(args: &[String]) -> Result<(), String> {
                     // --print-gc-sections listing and got none of them.  Warn
                     // once per distinct option rather than per invocation so a
                     // recursive make does not scroll them off the screen.
+                    if fatal_warnings {
+                        return Err(format!(
+                            "warning treated as error: '{a}' is not implemented"
+                        ));
+                    }
                     warn_unimplemented(a);
                 } else if is_benign_ignorable(a) {
                     // Options every GNU-compatible linker accepts and that do
-                    // not change the image we produce. bfd and mold accept
-                    // these silently; warning about them buried real
-                    // diagnostics under a dozen lines of noise on every single
-                    // `gcc -fuse-ld=lccc` invocation, because gcc's driver
-                    // always passes --push-state/--pop-state and the LTO
-                    // plugin triplet.
+                    // not change the image we produce.
                 } else if a == "-plugin" || a.starts_with("-plugin-opt") {
-                    // The LTO plugin is deliberately NOT silently ignored.
-                    //
-                    // gcc passes `-plugin liblto_plugin.so` unconditionally,
-                    // but it only *matters* when an input is LTO bytecode
-                    // rather than a real object. Ignoring it is correct for
-                    // ordinary objects and silently wrong for `-flto` builds
-                    // (the link would fail later with confusing "undefined
-                    // symbol" errors, or quietly drop code). So: accept it,
-                    // remember it, and let the object loader complain
-                    // precisely if it ever meets an IR member.
                     if a == "-plugin" {
                         i += 1;
                     } // skip the plugin path
                     saw_lto_plugin = true;
                 } else if a.starts_with('-') {
-                    // Unknown flag: warn (parity with ld's permissiveness would
-                    // be an error, but warn keeps us usable during bring-up).
-                    eprintln!("lccc-ld: warning: ignoring unknown option '{}'", a);
+                    // Unknown flag: warn (or error under --fatal-warnings).
+                    top_warnings.push(format!("ignoring unknown option '{a}'"));
                 } else {
-                    // Every positional input lands in `inputs` WITH its
-                    // --whole-archive state, in command-line order.  The
-                    // relocatable (-r) and script (-T) modes consume `inputs`
-                    // directly through `load_inputs_for_ld`, which force-loads
-                    // whole-archive members; routing a positional archive into
-                    // `passthrough` at parse time (the old behaviour) removed
-                    // it from those modes entirely — the kernel's
-                    //   lccc-ld -r -o vmlinux.o --whole-archive vmlinux.a \
-                    //     --no-whole-archive --start-group --end-group
-                    // failed with `no input files` and a lone archive under
-                    // -r silently produced an EMPTY relocatable object.
-                    // The userspace mode re-derives its passthrough sandwich
-                    // from this flag below.
                     inputs.push((a.to_string(), whole_archive));
                     positional_files.push((passthrough.len(), a.to_string()));
                 }
@@ -854,12 +889,17 @@ fn run(args: &[String]) -> Result<(), String> {
         i += 1;
     }
 
+    if fatal_warnings && !top_warnings.is_empty() {
+        return Err(format!("warning treated as error: {}", top_warnings[0]));
+    }
+    for w in &top_warnings {
+        eprintln!("lccc-ld: warning: {w}");
+    }
+
     if inputs.is_empty() {
         return Err("no input files".into());
     }
-    // i386's ABI maximum page size is 4 KiB. Preserve an explicit
-    // `-z max-page-size=` override, but do not inherit x86-64's 2 MiB default:
-    // doing so puts setup.elf's first 32 KiB section behind a 2 MiB file hole.
+    let elf_i386 = emulation == Emulation::I386;
     if elf_i386 && !max_page_size_explicit {
         max_page_size = 0x1000;
     }
@@ -868,29 +908,32 @@ fn run(args: &[String]) -> Result<(), String> {
     // Mode 1: relocatable link (ld -r).
     // ------------------------------------------------------------------
     if relocatable {
-        if elf_i386 {
-            return Err("ELF32/i386 relocatable (-r) output is not implemented; ELF32 is currently supported with -T/--script".into());
+        if emulation != Emulation::X86_64 {
+            return Err(
+                "relocatable (-r) output is currently implemented for elf_x86_64 only".into(),
+            );
         }
         if script_path.is_some() {
+            if fatal_warnings {
+                return Err(
+                    "warning treated as error: -r with a linker script: script ignored".into(),
+                );
+            }
             eprintln!("lccc-ld: warning: -r with a linker script: script ignored");
         }
         let ordered = ordered_args(&passthrough, &positional_files);
         let inputs = lccc::linker_entry::expand_file_mode_libs(&ordered, &inputs, &[], "-r")?;
-        // A positional input can itself be a linker script, and a script
-        // resolves its own `-l` against the `-L` path -- so the loader needs
-        // that path even though every command-line `-l` is already expanded.
         let lib_dirs = lccc::backend::linker_common::parse_linker_args(&ordered).extra_lib_paths;
         let mut objects = Vec::new();
         lccc::linker_entry::load_inputs_x86(&inputs, &mut objects, &undefined_symbols, &lib_dirs)?;
+        if trace {
+            for obj in &objects {
+                println!("{}", obj.source_name);
+            }
+        }
         return lccc::linker_entry::link_relocatable_x86(&objects, &output);
     }
 
-    // GCC/Clang hand every link the LTO plugin. That is harmless for ordinary
-    // objects, but if an input is actually LTO bytecode we cannot link it: the
-    // plugin is what turns IR back into machine code, and lccc does not load
-    // plugins. Detect it here and say so precisely, instead of letting the ELF
-    // parser reject the file with a generic "not an ELF object" or — worse —
-    // letting a `.o` that happens to parse produce a binary with missing code.
     if saw_lto_plugin
         && let Some(bad) = inputs
             .iter()
@@ -908,15 +951,18 @@ fn run(args: &[String]) -> Result<(), String> {
     // Mode 2: script-driven link (kernel-style -T).
     // ------------------------------------------------------------------
     if let Some(script_path) = script_path {
+        if !matches!(emulation, Emulation::X86_64 | Emulation::I386) {
+            return Err(
+                "linker-script (-T) mode is currently implemented for elf_x86_64 and elf_i386"
+                    .into(),
+            );
+        }
         let mut script_src = std::fs::read_to_string(&script_path)
             .map_err(|e| format!("cannot read script '{}': {}", script_path, e))?;
-        // `-l` resolves against `-L`, then the script's SEARCH_DIRs.
         let ordered = ordered_args(&passthrough, &positional_files);
         let search_dirs = lccc::linker_entry::script_search_dirs(&script_src)?;
         let inputs =
             lccc::linker_entry::expand_file_mode_libs(&ordered, &inputs, &search_dirs, "-T")?;
-        // Same order the `-l` expansion above uses: `-L` directories first,
-        // then the script's own `SEARCH_DIR`s.
         let mut lib_dirs =
             lccc::backend::linker_common::parse_linker_args(&ordered).extra_lib_paths;
         lib_dirs.extend(search_dirs.iter().cloned());
@@ -932,22 +978,25 @@ fn run(args: &[String]) -> Result<(), String> {
             )?;
             objects
         };
-        // Everything appended from here on is linker-synthesized and must
-        // stay out of the property merge's "real inputs" (an object without
-        // the note would veto every AND-class type).
-        let real_inputs = objects.len();
-        if build_id {
-            lccc::linker_entry::append_build_id_object(&mut objects);
+        if trace {
+            for obj in &objects {
+                println!("{}", obj.source_name);
+            }
         }
-        // GNU property note merge (CET/ISA) for script links.  The merged
-        // note then flows through the script layout like any other input
-        // section.
+        let real_inputs = objects.len();
+        if build_id_style.is_enabled() {
+            lccc::linker_entry::append_build_id_object_styled(&mut objects, &build_id_style);
+        }
         let (cet_flags, z_ignored) = passthrough_property_flags(&passthrough)?;
+        if fatal_warnings && !z_ignored.is_empty() {
+            return Err(format!(
+                "warning treated as error: -z {} ignored",
+                z_ignored[0]
+            ));
+        }
         for kw in z_ignored {
             eprintln!("lccc-ld: warning: -z {kw} ignored");
         }
-        // `elf_i386` selects the note's entry stride (12-byte entries on
-        // 32-bit targets, 16 on 64-bit ones — see `cet::parse_property_note`).
         if let Some(carrier) = lccc::linker_entry::merge_property_into_objects(
             &mut objects,
             real_inputs,
@@ -957,11 +1006,14 @@ fn run(args: &[String]) -> Result<(), String> {
             objects.push(carrier);
         }
         if let Some(e) = entry_override {
-            // command-line -e overrides ENTRY() in the script
             script_src = format!("ENTRY({})\n{}", e, script_src);
         }
-        if elf_i386 {
-            return lccc::linker_entry::link_with_script_i386(
+        let extras = lccc::linker_entry::ScriptLinkExtras {
+            build_id_style,
+            print_memory_usage,
+        };
+        let res = if elf_i386 {
+            lccc::linker_entry::link_with_script_i386_extras(
                 &mut objects,
                 &script_src,
                 &output,
@@ -973,66 +1025,61 @@ fn run(args: &[String]) -> Result<(), String> {
                 dt_symbolic,
                 max_page_size,
                 &defsyms,
-            );
+                &extras,
+            )
+        } else {
+            lccc::linker_entry::link_with_script_x86_extras(
+                &mut objects,
+                &script_src,
+                &output,
+                emit_symtab,
+                is_pie || shared,
+                emit_relocs,
+                gc_sections,
+                soname.as_deref(),
+                dt_symbolic,
+                max_page_size,
+                &defsyms,
+                &extras,
+            )
+        };
+        res?;
+        if oformat_binary {
+            lccc::linker_entry::convert_elf_file_to_flat_binary(&output)?;
         }
-        return lccc::linker_entry::link_with_script_x86(
-            &mut objects,
-            &script_src,
-            &output,
-            emit_symtab,
-            is_pie || shared,
-            emit_relocs,
-            gc_sections,
-            soname.as_deref(),
-            dt_symbolic,
-            max_page_size,
-            &defsyms,
-        );
+        return Ok(());
     }
 
     // ------------------------------------------------------------------
-    // Mode 3: standard userspace link — same pipeline as the compiler
-    // driver (`link_builtin`/`link_shared`). CRT objects arrive as
-    // positional inputs from the caller (gcc-style invocation), so no CRT
-    // injection happens here; whole-archive members are force-loaded.
+    // Mode 3: standard userspace link across x86-64, i386, AArch64, RISC-V.
     // ------------------------------------------------------------------
-    // The builtin userspace pipeline resolves archives itself through the
-    // shared argument parser, which needs the --whole-archive state spelled
-    // positionally around the archive (it does not read the `(path, wa)`
-    // pairs). Re-derive that sandwich HERE instead of at argument-parsing
-    // time, so the relocatable and script modes keep seeing the archive in
-    // `inputs`. The archive is deliberately NOT also added to object_files:
-    // that would load it twice (duplicate symbols).
-    // ELF32/i386 userspace links (`gcc -m32 -fuse-ld=…` spawns `ld -m
-    // elf_i386 … crt1.o crti.o crtbegin.o … -lc … crtend.o crtn.o`) drive
-    // the SAME i686 pipeline the `lccc-i686` compiler driver links with,
-    // with every file and library arriving positionally, in order.
-    // GNU ld's built-in search path follows the `-L`s, except under
-    // -nostdlib ("only search library directories explicitly specified").
+    if is_pie && is_static {
+        return Err("-static-pie is not implemented: lccc-ld cannot yet emit a \
+             position-independent static executable"
+            .to_string());
+    }
     let default_dirs: &[&str] = if args.iter().any(|a| a == "-nostdlib") {
         &[]
-    } else if elf_i386 {
-        lccc::linker_entry::DEFAULT_SEARCH_DIRS_I386
     } else {
-        lccc::linker_entry::DEFAULT_SEARCH_DIRS_X86_64
+        match emulation {
+            Emulation::X86_64 => lccc::linker_entry::DEFAULT_SEARCH_DIRS_X86_64,
+            Emulation::I386 => lccc::linker_entry::DEFAULT_SEARCH_DIRS_I386,
+            Emulation::Aarch64 => lccc::linker_entry::DEFAULT_SEARCH_DIRS_AARCH64,
+            Emulation::Riscv64 => lccc::linker_entry::DEFAULT_SEARCH_DIRS_RISCV64,
+        }
     };
-    if elf_i386 {
+    if emulation == Emulation::I386 {
         let i386_args = ordered_args(&passthrough, &positional_files);
-        if shared {
-            return lccc::linker_entry::link_shared_i386(&output, &i386_args, default_dirs);
+        let res = if shared {
+            lccc::linker_entry::link_shared_i386(&output, &i386_args, default_dirs)
+        } else {
+            lccc::linker_entry::link_builtin_i386(&output, &i386_args, default_dirs)
+        };
+        res?;
+        if oformat_binary {
+            lccc::linker_entry::convert_elf_file_to_flat_binary(&output)?;
         }
-        // The i686 executable emitter produces ET_EXEC at the ABI base
-        // address only.  A PIE needs a load-address-independent image plus
-        // R_386_RELATIVE for every absolute word; emitting ET_EXEC anyway
-        // would silently hand the caller a non-PIE (ASLR-less) binary it did
-        // not ask for, so refuse — exactly like the -static-pie refusal
-        // below.  (`gcc -m32` on PIE-default distributions: pass -no-pie.)
-        if is_pie {
-            return Err("ELF32/i386 -pie output is not implemented: lccc-ld emits \
-                 ET_EXEC for i386 (link with -no-pie)"
-                .to_string());
-        }
-        return lccc::linker_entry::link_builtin_i386(&output, &i386_args, default_dirs);
+        return Ok(());
     }
     let mut object_files: Vec<String> = Vec::new();
     for (path, wa) in &inputs {
@@ -1046,29 +1093,44 @@ fn run(args: &[String]) -> Result<(), String> {
     }
     let object_refs: Vec<&str> = object_files.iter().map(|s| s.as_str()).collect();
 
-    if shared {
-        return lccc::linker_entry::link_shared_x86(
+    let res = match (emulation, shared) {
+        (Emulation::X86_64 | Emulation::I386, true) => {
+            lccc::linker_entry::link_shared_x86(&object_refs, &output, &passthrough, default_dirs)
+        }
+        (Emulation::X86_64 | Emulation::I386, false) => {
+            lccc::linker_entry::link_builtin_x86(&object_refs, &output, &passthrough, default_dirs)
+        }
+        (Emulation::Aarch64, true) => lccc::linker_entry::link_shared_aarch64(
             &object_refs,
             &output,
             &passthrough,
             default_dirs,
-        );
+        ),
+        (Emulation::Aarch64, false) => lccc::linker_entry::link_builtin_aarch64(
+            &object_refs,
+            &output,
+            &passthrough,
+            default_dirs,
+            is_static,
+        ),
+        (Emulation::Riscv64, true) => lccc::linker_entry::link_shared_riscv64(
+            &object_refs,
+            &output,
+            &passthrough,
+            default_dirs,
+        ),
+        (Emulation::Riscv64, false) => lccc::linker_entry::link_builtin_riscv64(
+            &object_refs,
+            &output,
+            &passthrough,
+            default_dirs,
+        ),
+    };
+    res?;
+    if oformat_binary {
+        lccc::linker_entry::convert_elf_file_to_flat_binary(&output)?;
     }
-    // A plain -pie is honoured by the built-in emitter: ET_DYN based at 0,
-    // DF_1_PIE, and an R_X86_64_RELATIVE for every internal absolute address,
-    // so the kernel may map it anywhere and ld.so slides it correctly.
-    //
-    // -static-pie is still refused.  A static PIE needs the same RELATIVE
-    // table *plus* the rcrt1.o self-relocation protocol, and the static emitter
-    // produces no .rela.dyn at all; writing the image anyway yields something
-    // that faults in the CRT before main, which is worse than saying no.
-    if is_pie && is_static {
-        return Err("-static-pie is not implemented: lccc-ld cannot yet emit a \
-             position-independent static executable (refusing rather than \
-             producing an image that faults in the CRT self-relocation)"
-            .to_string());
-    }
-    lccc::linker_entry::link_builtin_x86(&object_refs, &output, &passthrough, default_dirs)
+    Ok(())
 }
 
 #[cfg(test)]

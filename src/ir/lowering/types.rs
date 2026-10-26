@@ -222,6 +222,7 @@ impl Lowerer {
             TypeSpecifier::Double => IrType::F64,
             TypeSpecifier::LongDouble => IrType::F128,
             TypeSpecifier::Float128 => IrType::U128,
+            TypeSpecifier::Float16 | TypeSpecifier::BFloat16 => IrType::U16,
             TypeSpecifier::Decimal32 => IrType::D32,
             TypeSpecifier::Decimal64 => IrType::D64,
             TypeSpecifier::Decimal128 => IrType::U128,
@@ -317,6 +318,7 @@ impl Lowerer {
             }
             // _Float128 (IEEE binary128): 16 bytes, 16-byte aligned (LP64).
             TypeSpecifier::Float128 => Some((16, 16)),
+            TypeSpecifier::Float16 | TypeSpecifier::BFloat16 => Some((2, 2)),
             // C23 decimals (BID): sizeof = 4/8/16 on both x86-64 and i386;
             // GCC aligns _Decimal64 to 8 and _Decimal128 to 16 even on
             // i386 (unlike the long-long align-4 rule), _Decimal32 to 4.

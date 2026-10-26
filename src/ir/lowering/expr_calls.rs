@@ -413,10 +413,11 @@ impl Lowerer {
             .enumerate()
             .map(|(i, a)| {
                 if let Some(p) = param_ctypes_for_decompose.as_ref().and_then(|v| v.get(i)) {
-                    return matches!(p, CType::Float128 | CType::Decimal128);
+                    return matches!(p, CType::Float128 | CType::Decimal128) || p.is_half_float();
                 }
-                self.get_expr_ctype(a)
-                    .is_some_and(|ct| matches!(ct, CType::Float128 | CType::Decimal128))
+                self.get_expr_ctype(a).is_some_and(|ct| {
+                    matches!(ct, CType::Float128 | CType::Decimal128) || ct.is_half_float()
+                })
             })
             .collect();
         let mut struct_arg_is_f128_sse = Vec::with_capacity(arg_vals.len());
@@ -1669,11 +1670,7 @@ impl Lowerer {
                         if let Some(ref pctypes) = param_ctypes {
                             if i < pctypes.len() {
                                 let arg_ct = self.expr_ctype(a);
-                                if pctypes[i].is_decimal()
-                                    || arg_ct.is_decimal()
-                                    || pctypes[i] == CType::Float128
-                                    || arg_ct == CType::Float128
-                                {
+                                if pctypes[i].is_soft_float() || arg_ct.is_soft_float() {
                                     return self.convert_scalar_ctype(
                                         val,
                                         arg_ty,
@@ -1687,11 +1684,11 @@ impl Lowerer {
                         return cast_val;
                     }
                 }
-                // Default argument promotions (C11 6.5.2.2p6): for variadic args,
-                // args beyond known params, or all args for unprototyped functions:
-                // - float -> double
-                // - char/short (signed or unsigned) -> int
-                let needs_promotion = pre_call_variadic || param_types.is_some() || is_unprototyped;
+                // Default argument promotions (C11 6.5.2.2p6 / ISO/IEC TS 18661-3):
+                // _Float16 and __bf16 do NOT undergo default argument promotion!
+                let needs_promotion =
+                    (pre_call_variadic || param_types.is_some() || is_unprototyped)
+                        && !self.expr_ctype(a).is_half_float();
                 if needs_promotion {
                     if arg_ty == IrType::F32 {
                         arg_types.push(IrType::F64);

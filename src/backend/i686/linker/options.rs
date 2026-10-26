@@ -30,7 +30,9 @@
 /// Shared with the x86-64 linker, which parses the options identically.
 pub(super) use crate::backend::linker_common::Symbolic;
 use crate::backend::linker_common::cet::PropertyLinkFlags;
-use crate::backend::linker_common::{HashStyle, LinkerArgs, TextrelPolicy};
+use crate::backend::linker_common::{
+    BuildIdStyle, DynamicList, HashStyle, LinkerArgs, TextrelPolicy,
+};
 
 // DT_FLAGS bits the emitters derive themselves; the keyword-requested ones
 // come from `LinkerArgs::requested_dyn_flags`.
@@ -40,6 +42,7 @@ pub(super) const DF_BIND_NOW: u32 = 0x8;
 pub(super) const DF_STATIC_TLS: u32 = 0x10;
 // DT_FLAGS_1 bits.
 pub(super) const DF_1_NOW: u32 = 0x1;
+pub(super) const DF_1_PIE: u32 = 0x0800_0000;
 
 /// Options the emitters act on.
 #[derive(Clone, Debug, Default)]
@@ -55,9 +58,30 @@ pub(super) struct LinkOptions {
     pub soname: Option<String>,
     pub exec_stack: Option<bool>,
     pub build_id: bool,
+    pub build_id_style: BuildIdStyle,
     pub hash_style: HashStyle,
     pub symbolic: Symbolic,
     pub no_undefined: bool,
+    /// `-pie`: emit an `ET_DYN` position-independent executable (`DF_1_PIE`).
+    pub is_pie: bool,
+    /// `-z pack-relative-relocs` / `--pack-dyn-relocs=relr`: emit `.relr.dyn`.
+    pub pack_relative_relocs: bool,
+    /// `-z max-page-size=N` (0 means default `PAGE_SIZE` = 4096).
+    pub page_size: u32,
+    /// `--image-base=ADDR`: override default image base address.
+    pub image_base: Option<u32>,
+    /// `--version-script=PATH`: symbol version / visibility script path.
+    pub version_script: Option<String>,
+    /// `--dynamic-list=PATH` paths and parsed symbol export/preemption list.
+    pub dynamic_list_paths: Vec<String>,
+    pub dynamic_list: DynamicList,
+    /// `--exclude-libs=LIB,...`: archive libraries whose globals become hidden.
+    pub exclude_libs: Vec<String>,
+    /// `-Map=FILE` / `--print-map`: link map output.
+    pub map_path: Option<String>,
+    pub print_map: bool,
+    /// `-t` / `--trace`: print each input object/archive member/DSO loaded.
+    pub trace: bool,
     /// `-z text` / `-z notext`: what a text relocation does.
     pub textrel: TextrelPolicy,
     /// DT_FLAGS / DT_FLAGS_1 bits requested by `-z` keywords (BIND_NOW,
@@ -72,6 +96,22 @@ pub(super) struct LinkOptions {
 }
 
 impl LinkOptions {
+    pub fn effective_page_size(&self) -> u32 {
+        if self.page_size == 0 {
+            super::types::PAGE_SIZE
+        } else {
+            self.page_size
+        }
+    }
+
+    pub fn effective_build_id_style(&self) -> BuildIdStyle {
+        if self.build_id && !self.build_id_style.is_enabled() {
+            BuildIdStyle::Sha1
+        } else {
+            self.build_id_style.clone()
+        }
+    }
+
     /// Final DT_FLAGS value.
     pub fn flags(&self, textrel: bool, static_tls: bool) -> u32 {
         let mut f = self.dt_flags;
@@ -95,6 +135,9 @@ impl LinkOptions {
         let mut f = self.dt_flags_1;
         if self.bind_now {
             f |= DF_1_NOW;
+        }
+        if self.is_pie {
+            f |= DF_1_PIE;
         }
         f
     }
@@ -195,7 +238,6 @@ fn rejected_option(t: &str) -> Option<&'static str> {
         ),
     ];
     const PREFIX: &[(&str, &str)] = &[
-        ("--dynamic-list", "--dynamic-list"),
         ("--export-dynamic-symbol=", "--export-dynamic-symbol"),
         (
             "--export-dynamic-symbol-list=",
@@ -205,7 +247,6 @@ fn rejected_option(t: &str) -> Option<&'static str> {
         ("-Tdata", "-Tdata"),
         ("-Tbss", "-Tbss"),
         ("--section-start", "--section-start"),
-        ("--image-base", "--image-base"),
         ("--unresolved-symbols", "--unresolved-symbols"),
     ];
     EXACT
@@ -222,42 +263,33 @@ pub(super) fn check_capabilities(
     user_args: &[String],
     is_shared: bool,
 ) -> Result<LinkOptions, String> {
-    if args.version_script.is_some() {
-        return unsupported("--version-script");
-    }
-    if !args.exclude_libs.is_empty() {
-        return unsupported("--exclude-libs");
-    }
-    if args.map_path.is_some() {
-        return unsupported("-Map/--print-map");
-    }
     if args.emit_relocs {
         return unsupported("--emit-relocs");
-    }
-    if args.is_pie {
-        return unsupported("PIE output (-pie; link with -no-pie)");
     }
     let toks = tokens(user_args);
     if let Some(what) = toks.iter().find_map(|t| rejected_option(t)) {
         return unsupported(what);
     }
-    // Optimisation-only options (--gc-sections, --icf, --sort-*, -O<n>) are
-    // accepted and ignored without a diagnostic, as GNU ld accepts them. The
-    // output is correct without them. Trade-off: the i686 userspace link keeps
-    // the sections that --gc-sections would discard, so the binary is larger
-    // than GNU ld's output for the same input.
+    args.validate_common_options()?;
 
-    if let Some(style) = args.build_id_style.as_deref() {
-        if !matches!(style, "sha1" | "tree" | "none" | "0") {
-            return unsupported(&format!("--build-id={style} (only sha1/tree)"));
-        }
-    }
+    let build_id_style = args.resolved_build_id_style()?;
+    let page_size_u64 = args.resolved_page_size(u64::from(super::types::PAGE_SIZE))?;
+    let page_size = u32::try_from(page_size_u64)
+        .map_err(|_| format!("-z max-page-size={page_size_u64:#x} exceeds 32-bit address space"))?;
+    let image_base = match args.image_base {
+        Some(addr) => Some(
+            u32::try_from(addr)
+                .map_err(|_| format!("--image-base={addr:#x} exceeds 32-bit address space"))?,
+        ),
+        None => None,
+    };
 
     // All DT_FLAGS / DT_FLAGS_1 bits are in the low 32 bits.
     let (dt_flags, dt_flags_1) = {
         let (f, f1) = args.requested_dyn_flags();
         (f as u32, f1 as u32)
     };
+    let mut warnings: Vec<String> = Vec::new();
     for kw in &args.z_other_keywords {
         let (key, val) = match kw.split_once('=') {
             Some((k, v)) => (k, Some(v)),
@@ -272,14 +304,9 @@ pub(super) fn check_capabilities(
             // Duplicate strong definitions resolve to the first one
             // (never diagnosed by this linker), which is exactly muldefs.
             ("muldefs", None) => {}
-            ("max-page-size" | "common-page-size", Some(v)) => {
-                let n = crate::backend::linker_common::defsym::parse_number(v);
-                if n != Some(u64::from(super::types::PAGE_SIZE)) {
-                    return unsupported(&format!("-z {key}={v} (the page size is fixed at 4096)"));
-                }
-            }
+            ("max-page-size" | "common-page-size", Some(_)) => {}
             ("nocopyreloc", None) => return unsupported("-z nocopyreloc"),
-            _ => eprintln!("lccc-ld: warning: -z {kw} ignored"),
+            _ => warnings.push(format!("-z {kw} ignored")),
         }
     }
     // GNU property note flags.  `elf_i386` sources binutils' `cet.sh` and
@@ -294,13 +321,19 @@ pub(super) fn check_capabilities(
         (properties.lam_u57, "lam-u57"),
     ] {
         if set {
-            eprintln!("lccc-ld: warning: -z {kw} ignored");
+            warnings.push(format!("-z {kw} ignored"));
         }
     }
     properties.lam_u48 = false;
     properties.lam_u57 = false;
     for kw in &args.z_ignored_keywords {
-        eprintln!("lccc-ld: warning: -z {kw} ignored");
+        warnings.push(format!("-z {kw} ignored"));
+    }
+    if args.fatal_warnings && !warnings.is_empty() {
+        return Err(format!("warning treated as error: {}", warnings[0]));
+    }
+    for w in &warnings {
+        eprintln!("lccc-ld: warning: {w}");
     }
 
     // The last of -Bsymbolic / -Bsymbolic-functions / -Bno-symbolic
@@ -321,10 +354,22 @@ pub(super) fn check_capabilities(
         export_dynamic: args.export_dynamic,
         soname: args.soname.clone(),
         exec_stack: args.z_execstack,
-        build_id: args.build_id,
+        build_id: build_id_style.is_enabled(),
+        build_id_style,
         hash_style: args.hash_style,
         symbolic,
         no_undefined: args.no_undefined,
+        is_pie: !is_shared && args.is_pie,
+        pack_relative_relocs: args.z_pack_relative_relocs,
+        page_size,
+        image_base,
+        version_script: args.version_script.clone(),
+        dynamic_list_paths: args.dynamic_lists.clone(),
+        dynamic_list: DynamicList::default(),
+        exclude_libs: args.exclude_libs.clone(),
+        map_path: args.map_path.clone().filter(|p| p != "-"),
+        print_map: args.map_path.as_deref() == Some("-"),
+        trace: args.trace_files,
         textrel: args.z_text,
         dt_flags,
         dt_flags_1,
@@ -422,21 +467,43 @@ mod tests {
     #[test]
     fn unimplemented_semantic_options_are_rejected() {
         for bad in [
-            &["-Wl,--version-script=v.map"][..],
-            &["-Wl,--exclude-libs,ALL"],
-            &["-Wl,-Map=x.map"],
-            &["-Wl,--emit-relocs"],
-            &["-pie"],
-            &["-Wl,--dynamic-list=x"],
-            &["-Wl,-z,max-page-size=0x200000"],
+            &["-Wl,--emit-relocs"][..],
             &["-Wl,-z,nocopyreloc"],
-            &["-Wl,--build-id=md5"],
             &["-Wl,-Ttext=0x1000"],
             &["-r"],
         ] {
             let e = check(bad, false).expect_err(&format!("{bad:?} must be rejected"));
             assert!(e.contains("not supported"), "{e}");
         }
+    }
+
+    #[test]
+    fn newly_supported_i686_options_map_cleanly() {
+        let o = check(
+            &[
+                "-pie",
+                "-Wl,--build-id=md5",
+                "-Wl,-z,max-page-size=0x10000",
+                "-Wl,-z,pack-relative-relocs",
+                "-Wl,--image-base=0x08100000",
+                "-Wl,--version-script=v.map",
+                "-Wl,--dynamic-list=d.list",
+                "-Wl,--exclude-libs,ALL",
+                "-Wl,-Map=x.map",
+            ],
+            false,
+        )
+        .unwrap();
+        assert!(o.is_pie);
+        assert_eq!(o.flags_1() & DF_1_PIE, DF_1_PIE);
+        assert_eq!(o.build_id_style, BuildIdStyle::Md5);
+        assert_eq!(o.effective_page_size(), 0x10000);
+        assert!(o.pack_relative_relocs);
+        assert_eq!(o.image_base, Some(0x0810_0000));
+        assert_eq!(o.version_script.as_deref(), Some("v.map"));
+        assert_eq!(o.dynamic_list_paths, vec!["d.list".to_string()]);
+        assert_eq!(o.exclude_libs, vec!["ALL".to_string()]);
+        assert_eq!(o.map_path.as_deref(), Some("x.map"));
     }
 
     #[test]

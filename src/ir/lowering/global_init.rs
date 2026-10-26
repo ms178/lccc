@@ -473,8 +473,8 @@ impl Lowerer {
                 let to = self.type_spec_to_ctype(ts);
                 let exact = to.is_integer()
                     || to.is_floating()
-                    || to.is_decimal()
-                    || matches!(to, CType::Float128 | CType::Pointer(..));
+                    || to.is_soft_float()
+                    || matches!(to, CType::Pointer(..));
                 if !exact {
                     return None;
                 }
@@ -813,13 +813,17 @@ impl Lowerer {
 
         // Scalar with braces: int x = { 1 }; or int x = {{{1}}};
         if !is_array && !items.is_empty() {
-            if let Some(init) = self.lower_scalar_with_braces(items, base_ty) {
+            if let Some(init) = self.lower_scalar_with_braces(items, base_ty, obj_ty) {
                 return init;
             }
         }
 
         // Fallback: array of constants coerced to base_ty
-        self.lower_fallback_array(items, base_ty)
+        let elem_ct = obj_ty.and_then(|t| match t {
+            CType::Array(elem, _) => Some(elem.as_ref()),
+            _ => Some(t),
+        });
+        self.lower_fallback_array(items, base_ty, elem_ct)
     }
 
     /// Serialize the selected vector-object initializers into a byte array.
@@ -875,24 +879,30 @@ impl Lowerer {
         &mut self,
         items: &[InitializerItem],
         base_ty: IrType,
+        dst_ct: Option<&CType>,
     ) -> Option<GlobalInit> {
         let expr = Self::unwrap_nested_init_expr(items)?;
         if let Some(val) = self.eval_const_expr(expr) {
             return Some(GlobalInit::Scalar(
-                self.coerce_init_const(val, expr, base_ty, None),
+                self.coerce_init_const(val, expr, base_ty, dst_ct),
             ));
         }
         self.eval_global_addr_expr(expr)
     }
 
     /// Fallback: emit all items as an array of constants.
-    fn lower_fallback_array(&self, items: &[InitializerItem], base_ty: IrType) -> GlobalInit {
+    fn lower_fallback_array(
+        &self,
+        items: &[InitializerItem],
+        base_ty: IrType,
+        elem_ct: Option<&CType>,
+    ) -> GlobalInit {
         let values: Vec<IrConst> = items
             .iter()
             .map(|item| {
                 if let Initializer::Expr(expr) = &item.init {
                     self.eval_const_expr(expr)
-                        .map(|v| self.coerce_init_const(v, expr, base_ty, None))
+                        .map(|v| self.coerce_init_const(v, expr, base_ty, elem_ct))
                         .unwrap_or_else(|| {
                             self.diagnose_non_constant(expr);
                             self.zero_const(base_ty)
@@ -1443,7 +1453,6 @@ impl Lowerer {
         // for a bit-packed `_Bool` ext-vector, whose lane `i` is bit `i % 8`
         // of byte `i / 8`.
         let lane_stride = vec_ct.vector_element_storage_size();
-        let is_bool = matches!(elem_ct, CType::Bool);
         let mut pos = 0usize;
         for item in items {
             if let Some(Designator::Index(idx)) = item.designators.first() {
@@ -1468,8 +1477,7 @@ impl Lowerer {
                     self.diagnose_non_constant(e);
                     IrConst::I64(0)
                 });
-                let val =
-                    self.coerce_init_const(val, e, elem_ir_ty, is_bool.then_some(&CType::Bool));
+                let val = self.coerce_init_const(val, e, elem_ir_ty, Some(elem_ct));
                 match lane_stride {
                     Some(stride) if vec_ct.is_x87_lane_vector() => {
                         // x87 lanes are 10 bytes apart: write the 16-byte

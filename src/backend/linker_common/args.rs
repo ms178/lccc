@@ -168,9 +168,61 @@ pub struct LinkerArgs {
     /// linker does not have yet.
     #[allow(dead_code)]
     pub no_undefined_version: bool,
+    /// `--dynamic-list=FILE`: symbol glob lists exported by PDE/PIE or kept
+    /// preemptible under `-Bsymbolic` in shared libraries.
+    pub dynamic_lists: Vec<String>,
+    /// `--image-base=ADDR`: explicit load base override.
+    pub image_base: Option<u64>,
+    pub image_base_invalid: Option<String>,
+    /// `-z max-page-size=N`: power-of-two segment page alignment (>= 4096).
+    pub max_page_size: Option<u64>,
+    pub max_page_size_invalid: Option<String>,
+    /// Invalid `--pack-dyn-relocs=` value, if any.
+    pub pack_dyn_relocs_invalid: Option<String>,
+    /// `-t` / `--trace`: print each input file / archive member as loaded.
+    pub trace_files: bool,
+    /// `--fatal-warnings` / `--no-fatal-warnings`.
+    pub fatal_warnings: bool,
+    /// `--print-memory-usage`: print MEMORY / segment usage summary.
+    pub print_memory_usage: bool,
+    /// `--oformat=FORMAT` (`binary`, `elf64-x86-64`, ...).
+    pub oformat: Option<String>,
 }
 
 impl LinkerArgs {
+    /// Validate common option values (`--build-id`, `--image-base`, `-z max-page-size`,
+    /// `--pack-dyn-relocs`).
+    pub fn validate_common_options(&self) -> Result<(), String> {
+        let _ = self.resolved_build_id_style()?;
+        if let Some(bad) = &self.image_base_invalid {
+            return Err(format!("invalid --image-base address '{bad}'"));
+        }
+        if let Some(bad) = &self.max_page_size_invalid {
+            return Err(format!(
+                "invalid page size '{bad}': must be a power of two >= 0x1000"
+            ));
+        }
+        if let Some(bad) = &self.pack_dyn_relocs_invalid {
+            return Err(format!(
+                "unknown --pack-dyn-relocs format '{bad}' (expected relr or none)"
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn resolved_build_id_style(&self) -> Result<super::build_id::BuildIdStyle, String> {
+        super::build_id::BuildIdStyle::parse(self.build_id, self.build_id_style.as_deref())
+    }
+
+    pub fn resolved_page_size(&self, default_page_size: u64) -> Result<u64, String> {
+        if let Some(bad) = &self.max_page_size_invalid {
+            return Err(format!(
+                "invalid page size '{bad}': must be a power of two >= 0x1000"
+            ));
+        }
+        Ok(self.max_page_size.unwrap_or(default_page_size))
+    }
+
     /// The GNU property-note merge flags (`linker_common::cet`) for this
     /// link: CET bits plus the `-z x86-64-*` ISA level.  Fails on an
     /// unparseable ISA level with GNU's message body (`invalid x86-64 ISA
@@ -377,9 +429,104 @@ fn apply_plain_flag(result: &mut LinkerArgs, tok: &str) -> bool {
         "-no-pie" | "--no-pie" | "--no-pic-executable" => result.is_pie = false,
         // Exact match only, so `-soname`/`-shared` are not shadowed.
         "-s" | "--strip-all" => result.strip_all = true,
+        "-t" | "--trace" => result.trace_files = true,
+        "--fatal-warnings" => result.fatal_warnings = true,
+        "--no-fatal-warnings" => result.fatal_warnings = false,
+        "--print-memory-usage" => result.print_memory_usage = true,
         _ => return false,
     }
     true
+}
+
+fn parse_u64_addr(raw: &str) -> Option<u64> {
+    let s = raw.trim();
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u64::from_str_radix(hex, 16).ok()
+    } else {
+        s.parse::<u64>().ok()
+    }
+}
+
+fn apply_kv_option(result: &mut LinkerArgs, tok: &str, next: Option<&str>) -> Option<bool> {
+    if let Some(v) = tok.strip_prefix("--dynamic-list=") {
+        if !v.is_empty() {
+            result.dynamic_lists.push(v.to_string());
+        }
+        return Some(false);
+    }
+    if tok == "--dynamic-list" {
+        if let Some(v) = next.filter(|s| !s.is_empty()) {
+            result.dynamic_lists.push(v.to_string());
+            return Some(true);
+        }
+        return Some(false);
+    }
+    if let Some(v) = tok.strip_prefix("--image-base=") {
+        match parse_u64_addr(v) {
+            Some(addr) => {
+                result.image_base = Some(addr);
+                result.image_base_invalid = None;
+            }
+            None => result.image_base_invalid = Some(v.to_string()),
+        }
+        return Some(false);
+    }
+    if tok == "--image-base" {
+        if let Some(v) = next {
+            match parse_u64_addr(v) {
+                Some(addr) => {
+                    result.image_base = Some(addr);
+                    result.image_base_invalid = None;
+                }
+                None => result.image_base_invalid = Some(v.to_string()),
+            }
+            return Some(true);
+        }
+        return Some(false);
+    }
+    if let Some(v) = tok.strip_prefix("--pack-dyn-relocs=") {
+        match v {
+            "relr" => {
+                result.z_pack_relative_relocs = true;
+                result.pack_dyn_relocs_invalid = None;
+            }
+            "none" => {
+                result.z_pack_relative_relocs = false;
+                result.pack_dyn_relocs_invalid = None;
+            }
+            other => result.pack_dyn_relocs_invalid = Some(other.to_string()),
+        }
+        return Some(false);
+    }
+    if tok == "--pack-dyn-relocs" {
+        if let Some(v) = next {
+            match v {
+                "relr" => {
+                    result.z_pack_relative_relocs = true;
+                    result.pack_dyn_relocs_invalid = None;
+                }
+                "none" => {
+                    result.z_pack_relative_relocs = false;
+                    result.pack_dyn_relocs_invalid = None;
+                }
+                other => result.pack_dyn_relocs_invalid = Some(other.to_string()),
+            }
+            return Some(true);
+        }
+        return Some(false);
+    }
+    if let Some(v) = tok.strip_prefix("--oformat=") {
+        result.oformat = Some(v.to_string());
+        return Some(false);
+    }
+    if tok == "--oformat" {
+        if let Some(v) = next {
+            result.oformat = Some(v.to_string());
+            return Some(true);
+        }
+        return Some(false);
+    }
+    None
 }
 
 /// Parse user linker arguments into a structured `LinkerArgs`.
@@ -445,6 +592,24 @@ fn apply_z_keyword(result: &mut LinkerArgs, kw: &str) {
         "noexecstack" => result.z_execstack = Some(false),
         "origin" | "nodelete" | "nodlopen" | "initfirst" | "interpose" | "nodefaultlib" => {
             result.z_dyn_flag_keywords.push(kw.to_string());
+        }
+        k if k.starts_with("max-page-size=") => {
+            let v = &k["max-page-size=".len()..];
+            match parse_u64_addr(v) {
+                Some(n) if n >= 0x1000 && n.is_power_of_two() => {
+                    result.max_page_size = Some(n);
+                    result.max_page_size_invalid = None;
+                }
+                _ => result.max_page_size_invalid = Some(v.to_string()),
+            }
+            result.z_other_keywords.push(kw.to_string());
+        }
+        k if k.starts_with("common-page-size=") => {
+            let v = &k["common-page-size=".len()..];
+            if !matches!(parse_u64_addr(v), Some(n) if n >= 0x1000 && n.is_power_of_two()) {
+                result.max_page_size_invalid = Some(v.to_string());
+            }
+            result.z_other_keywords.push(kw.to_string());
         }
         _ => result.z_other_keywords.push(kw.to_string()),
     }
@@ -651,7 +816,11 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
         "--icf",
         "-Map",
         "--version-script",
+        "--dynamic-list",
         "--exclude-libs",
+        "--image-base",
+        "--pack-dyn-relocs",
+        "--oformat",
         "-rpath",
         "-rpath-link",
         "--rpath-link",
@@ -943,6 +1112,12 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
                     if let Some(h) = parse_hash_style(parts[j]) {
                         result.hash_style = h;
                     }
+                } else if let Some(used_next) =
+                    apply_kv_option(&mut result, part, parts.get(j + 1).copied())
+                {
+                    if used_next {
+                        j += 1;
+                    }
                 } else if misc_option(&mut result, part) {
                     // consumed
                 } else if apply_plain_flag(&mut result, part) {
@@ -980,6 +1155,11 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
             // Lenient like GNU: a bad value is ignored, not fatal.  lccc
             // links single-threaded; the value is recorded, not acted on.
             result.threads = args[i].parse().ok();
+        } else if let Some(used_next) = apply_kv_option(&mut result, arg, args.get(i + 1).copied())
+        {
+            if used_next {
+                i += 1;
+            }
         } else if misc_option(&mut result, arg) {
             // consumed
         } else if apply_plain_flag(&mut result, arg) {

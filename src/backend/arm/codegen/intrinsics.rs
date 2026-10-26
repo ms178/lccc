@@ -431,8 +431,24 @@ impl ArmCodegen {
                 self.state.emit("    mrs x0, tpidr_el0");
                 self.store_scalar_dest(dest, "x0");
             }
+            IntrinsicOp::LoadStackGuard => emit_load_stack_guard_arm(self, dest),
             IntrinsicOp::SqrtF64 => self.emit_f64_unary_neon(dest, args, "fsqrt"),
             IntrinsicOp::SqrtF32 => self.emit_f32_unary_neon(dest, args, "fsqrt"),
+            IntrinsicOp::F16ToF32 => {
+                self.operand_to_x0(&args[0]);
+                self.state.emit("    fmov s0, w0");
+                self.state.emit("    fcvt s0, h0");
+                if let Some(d) = dest {
+                    self.store_float_reg(d, IrType::F32, "s0");
+                }
+            }
+            IntrinsicOp::F32ToF16 => {
+                self.float_operand_to_reg(&args[0], IrType::F32, "s0");
+                self.state.emit("    fcvt h0, s0");
+                self.state.emit("    fmov w0, s0");
+                self.state.emit("    and w0, w0, #0xffff");
+                self.store_scalar_dest(dest, "x0");
+            }
             IntrinsicOp::FabsF64 => self.emit_f64_unary_neon(dest, args, "fabs"),
             IntrinsicOp::FabsF32 => self.emit_f32_unary_neon(dest, args, "fabs"),
             // ── Scalar FP round/FMA/copysign ────────────────────────────────
@@ -1248,6 +1264,24 @@ pub(super) fn prefetch_prfop(payload: u8) -> &'static str {
     ];
     let hint = crate::ir::reexports::PrefetchHint::decode(payload);
     PFTYPE[usize::from(hint.write)][usize::from(hint.locality)]
+}
+
+fn emit_load_stack_guard_arm(cg: &mut ArmCodegen, dest: &Option<Value>) {
+    use crate::backend::stack_protector::EffectiveStackGuard;
+    let guard = cg.state.stack_protector_guard.clone();
+    let (reg, offset) = match guard.as_ref() {
+        Some(EffectiveStackGuard::Sysreg { reg, offset }) => (reg.as_str(), *offset),
+        _ => ("tpidr_el0", 40),
+    };
+    cg.state.emit_fmt(format_args!("    mrs x0, {}", reg));
+    if (-256..=255).contains(&offset) || (offset >= 0 && offset % 8 == 0 && offset <= 32760) {
+        cg.state
+            .emit_fmt(format_args!("    ldr x0, [x0, #{}]", offset));
+    } else {
+        cg.emit_load_imm64("x17", offset);
+        cg.state.emit("    ldr x0, [x0, x17]");
+    }
+    cg.store_scalar_dest(dest, "x0");
 }
 
 #[cfg(test)]

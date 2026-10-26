@@ -8,3 +8,4 @@ pub(crate) mod module;
 pub(crate) mod ops;
 pub(crate) mod provenance;
 pub(crate) mod reexports;
+pub(crate) mod whole_program;

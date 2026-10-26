@@ -70,6 +70,17 @@ impl Lowerer {
         }
         self.defined_functions.insert(func.name.clone());
 
+        let prev_no_sanitize = self.func_no_sanitize;
+        let mut func_no_san = self
+            .decl_no_sanitize_map
+            .get(&func.name)
+            .copied()
+            .unwrap_or_default();
+        if let Some(ref ns) = func.attrs.no_sanitize {
+            func_no_san = func_no_san.union(super::ubsan::UbsanFlags::parse_no_sanitize_attr(ns));
+        }
+        self.func_no_sanitize = func_no_san;
+
         let return_is_bool = self.is_type_bool(&func.return_type);
         let base_return_type = self.type_spec_to_ir(&func.return_type);
         self.fp_expr_tags.clear();
@@ -133,6 +144,7 @@ impl Lowerer {
         // Step 7: Finalize
         let uses_sret = param_info.uses_sret;
         self.finalize_function(func, return_type, param_info.params, uses_sret);
+        self.func_no_sanitize = prev_no_sanitize;
     }
 
     /// Compute the IR return type for a function, applying ABI overrides.
@@ -443,7 +455,8 @@ impl Lowerer {
             let ir_idx = params.len();
             let mut ty = self.type_spec_to_ir(&param.type_spec);
             // K&R default argument promotions: float->double, char/short->int
-            if func.is_kr {
+            // (_Float16 / __bf16 never promote!)
+            if func.is_kr && !param_ctype.is_half_float() {
                 ty = match ty {
                     IrType::F32 => IrType::F64,
                     IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 => IrType::I32,
@@ -477,7 +490,7 @@ impl Lowerer {
                 param_align,
                 struct_eightbyte_classes: Vec::new(),
                 riscv_float_class: None,
-                is_f128_sse: false,
+                is_f128_sse: param_ctype.is_half_float(),
             });
             param_kinds.push(ParamKind::Normal(ir_idx));
         }
@@ -1330,6 +1343,13 @@ impl Lowerer {
             ret_is_f128_sse,
             is_gnu_inline_def: is_gnu_inline_no_extern_def,
             loop_promoted_f64_values: Vec::new(),
+            ssp: crate::ir::module::SspInfo {
+                stack_protect: func.attrs.is_stack_protect(),
+                no_stack_protector: func.attrs.is_no_stack_protector(),
+                has_array: self.func().ssp_has_array,
+                max_char_array_bytes: self.func().ssp_max_char_array_bytes,
+                stack_guard_alloca: None,
+            },
         };
         // Collect __attribute__((symver("..."))) directives
         if let Some(ref sv) = func.attrs.symver {
@@ -1350,6 +1370,18 @@ impl Lowerer {
                 .entry(ir_func.name.clone())
                 .or_insert(align);
             *slot = (*slot).max(align);
+        }
+        if func.attrs.externally_visible {
+            self.module
+                .externally_visible_symbols
+                .insert(ir_func.name.clone());
+        }
+        if let Some(ref zr) = func.attrs.zero_call_used_regs
+            && let Some(mode) = crate::backend::zero_call_used_regs::ZeroCallUsedRegs::parse(zr)
+        {
+            self.module
+                .zero_call_used_regs_attrs
+                .insert(ir_func.name.clone(), mode);
         }
         self.module.functions.push(ir_func);
         self.pop_scope();
