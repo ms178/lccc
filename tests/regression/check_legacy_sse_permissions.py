@@ -15,7 +15,7 @@ SSE1 = set(('movss movaps movups movhps movlps movhlps movlhps unpcklps unpckhps
             'comiss ucomiss cvtsi2ss cvtsi2ssl cvtsi2ssq').split())
 FLOAT = ('add_ps', 'sub_ps', 'mul_ps', 'and_ps', 'andnot_ps', 'or_ps', 'xor_ps',
          'add_ss', 'sub_ss', 'mul_ss', 'div_ss', 'min_ss', 'max_ss',
-         'sqrt_ss', 'max_ps', 'min_ps', 'shuffle_ps', 'setzero_ps')
+         'sqrt_ss', 'sqrt_ps', 'div_ps', 'max_ps', 'min_ps', 'shuffle_ps', 'setzero_ps')
 INTEGER = ('add_epi8', 'add_epi16', 'add_epi32', 'add_epi64', 'sub_epi8',
            'sub_epi16', 'sub_epi32', 'sub_epi64', 'and_si128', 'or_si128',
            'xor_si128', 'andnot_si128', 'mullo_epi16', 'mulhi_epi16',
@@ -89,7 +89,7 @@ def main():
                 probe(text, [mode, '-mno-avx', '-mno-avx2', '-msse2'], False, '-mavx')
                 probe(text, [mode, '-mavx', '-mno-avx2'], True, avx1_zero=True)
             for name in FLOAT:
-                operands = '' if name == 'setzero_ps' else ('a' if name == 'sqrt_ss' else ('a,b,0x1b' if name == 'shuffle_ps' else 'a,b'))
+                operands = '' if name == 'setzero_ps' else ('a' if name in ('sqrt_ss', 'sqrt_ps') else ('a,b,0x1b' if name == 'shuffle_ps' else 'a,b'))
                 text = f'#include <xmmintrin.h>\n__m128 f(__m128 a,__m128 b) {{ return _mm_{name}({operands}); }}\n'
                 probe(text, [mode, '-mno-sse', '-mno-sse2'], False, '-msse')
                 for flags in (['-mno-sse2', '-msse'], ['-msse', '-mno-sse2']):

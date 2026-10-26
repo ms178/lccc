@@ -1,0 +1,43 @@
+{
+  "scope": "targeted screening; no runtime speed or exhaustive ISA claim",
+  "host": {
+    "system": "Linux",
+    "node": "e2b.local",
+    "release": "6.1.158+",
+    "version": "#1 SMP PREEMPT_DYNAMIC Mon May 11 18:48:24 UTC 2026",
+    "machine": "x86_64",
+    "processor": ""
+  },
+  "cpu": "Intel(R) Xeon(R) Processor @ 2.60GHz",
+  "source_sha256": "b7fc12278c42a45063e765362b219ac3d89cbc485b2c52fb435991e2c0e30c6f",
+  "callgrind": {
+    "baseline": {
+      "Ir": 38994190,
+      "stdout": "aa4d038cfc7ccd25 0",
+      "binary_sha256": "6f8374811b75a2a67279f3db6db658fdafc2d42016075a996ff846062f234ebd"
+    },
+    "baseline-avx2": {
+      "Ir": 77210489,
+      "stdout": "4b712826af276725 0",
+      "binary_sha256": "534c21700241eab2fc9db7ee83d0fbef79a595ac01b485d3d9f0c321b9709a60"
+    },
+    "final-sse2": {
+      "Ir": 38245394,
+      "stdout": "aa4d038cfc7ccd25 0",
+      "binary_sha256": "f3ea9c548161bbd4ede951089956cad531b49d9e3bb3d596e574995e00a22c62"
+    },
+    "final-avx2": {
+      "Ir": 69261689,
+      "stdout": "4b712826af276725 0",
+      "binary_sha256": "49a9df740da4d0fbdeedb3c96193a37e769cd16bdc70cd22976571e7a05446f3"
+    }
+  },
+  "memcheck": {
+    "final-sse2.mem.log": "==52896== Memcheck, a memory error detector\n==52896== Copyright (C) 2002-2022, and GNU GPL'd, by Julian Seward et al.\n==52896== Using Valgrind-3.19.0 and LibVEX; rerun with -h for copyright info\n==52896== Command: /home/user/audit/measure/final-sse2\n==52896== \n==52896== \n==52896== HEAP SUMMARY:\n==52896==     in use at exit: 0 bytes in 0 blocks\n==52896==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==52896== \n==52896== All heap blocks were freed -- no leaks are possible\n==52896== \n==52896== For lists of detected and suppressed errors, rerun with: -s\n==52896== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n",
+    "final-avx2.mem.log": "==53186== Memcheck, a memory error detector\n==53186== Copyright (C) 2002-2022, and GNU GPL'd, by Julian Seward et al.\n==53186== Using Valgrind-3.19.0 and LibVEX; rerun with -h for copyright info\n==53186== Command: /home/user/audit/measure/final-avx2\n==53186== \n==53186== \n==53186== HEAP SUMMARY:\n==53186==     in use at exit: 0 bytes in 0 blocks\n==53186==   total heap usage: 1 allocs, 1 frees, 4,096 bytes allocated\n==53186== \n==53186== All heap blocks were freed -- no leaks are possible\n==53186== \n==53186== For lists of detected and suppressed errors, rerun with: -s\n==53186== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)\n"
+  },
+  "compiler_binary_sha256": {
+    "/home/user/audit/baseline/lccc": "620fe69214c31439447b86eb38af657bbc6bd8f8631cd47cd2801a219d96572c",
+    "target/fastbuild/lccc": "8ee28891789ea832f8918e1b65afb618d62e299e065bd79a0dc94016764bc8c0"
+  }
+}

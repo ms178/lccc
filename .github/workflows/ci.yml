@@ -877,6 +877,14 @@ jobs:
       run: python3 tests/linker/test_riscv_shared_binding.py
     - name: ext_vector_type target widths and invalid element diagnostics
       run: env LCCC_REQUIRE_I686=1 CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_size.sh
+    - name: SSE AVX public API inventory and parser controls
+      run: |
+        python3 scripts/audit_sse_avx_public_api.py --self-test
+        python3 scripts/audit_sse_avx_public_api.py --check
+    - name: SIMD helper operand and alias permission contracts
+      run: python3 tests/regression/check_simd_helper_contract.py --lccc target/fastbuild/lccc
+    - name: Native packed FP helper runtime and mixed compiler ABI
+      run: python3 tests/regression/check_legacy_sse_native.py --lccc target/fastbuild/lccc --gcc gcc-16 --source tests/regression/native_packed_fp_helpers.c --check-codegen
     - name: Intrinsic arity table matches the headers
       run: |
         set -euo pipefail
