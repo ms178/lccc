@@ -801,6 +801,9 @@ pub struct DeclAttributes {
     pub zero_call_used_regs: Option<String>,
     /// `__attribute__((no_sanitize("...")))` / `no_sanitize_undefined`.
     pub no_sanitize: Option<String>,
+    /// C23 `[[maybe_unused]]` / GNU `unused`: suppress unused diagnostics
+    /// without implying `[[gnu::used]]` or affecting IR.
+    pub maybe_unused: bool,
 }
 
 /// Bit masks for boolean flags in `DeclAttributes::flags`.
@@ -875,6 +878,10 @@ impl DeclAttributes {
         self.flags & decl_attr_flag::USED != 0
     }
     #[inline]
+    pub fn is_maybe_unused(&self) -> bool {
+        self.maybe_unused
+    }
+    #[inline]
     pub fn is_fastcall(&self) -> bool {
         self.flags & decl_attr_flag::FASTCALL != 0
     }
@@ -942,6 +949,10 @@ impl DeclAttributes {
         self.set_flag(decl_attr_flag::USED, v)
     }
     #[inline]
+    pub fn set_maybe_unused(&mut self, v: bool) {
+        self.maybe_unused = v;
+    }
+    #[inline]
     pub fn set_fastcall(&mut self, v: bool) {
         self.set_flag(decl_attr_flag::FASTCALL, v)
     }
@@ -997,6 +1008,7 @@ impl std::fmt::Debug for DeclAttributes {
             .field("is_error_attr", &self.is_error_attr())
             .field("is_noreturn", &self.is_noreturn())
             .field("is_used", &self.is_used())
+            .field("maybe_unused", &self.is_maybe_unused())
             .field("alias_target", &self.alias_target)
             .field("ifunc_target", &self.ifunc_target)
             .field("regparm", &self.regparm)

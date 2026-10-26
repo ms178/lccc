@@ -251,6 +251,7 @@ impl Parser {
         self.attrs.set_uninitialized(false);
         let diagnose_as = self.attrs.parsing_diagnose_as.take();
         let is_used = self.attrs.parsing_used();
+        let is_maybe_unused = self.attrs.parsing_maybe_unused();
         let is_fastcall = self.attrs.parsing_fastcall();
         let regparm = self.attrs.parsing_regparm;
         let is_naked = self.attrs.parsing_naked();
@@ -279,6 +280,7 @@ impl Parser {
         decl_attrs.set_error_attr(is_error_attr);
         decl_attrs.set_noreturn(is_noreturn);
         decl_attrs.set_used(is_used);
+        decl_attrs.set_maybe_unused(is_maybe_unused);
         decl_attrs.set_fastcall(is_fastcall);
         decl_attrs.regparm = regparm;
         decl_attrs.set_naked(is_naked);
@@ -758,6 +760,7 @@ impl Parser {
         // casts to segment-qualified pointers clear parsing_address_space
         // before Declaration::new would read it.
         let decl_addr_space = self.attrs.decl_address_space;
+        let spec_maybe_unused = ctx.attrs.is_maybe_unused();
         let init = if self.consume_if(&TokenKind::Assign) {
             Some(self.parse_initializer())
         } else {
@@ -832,6 +835,9 @@ impl Parser {
         if self.attrs.parsing_used() {
             last_decl.attrs.set_used(true);
         }
+        if self.attrs.parsing_maybe_unused() {
+            last_decl.attrs.set_maybe_unused(true);
+        }
         if self.attrs.parsing_noreturn() {
             last_decl.attrs.set_noreturn(true);
         }
@@ -892,6 +898,7 @@ impl Parser {
         self.attrs.set_cold(false);
         self.attrs.parsing_cleanup_fn = None;
         self.attrs.set_used(false);
+        self.attrs.set_maybe_unused(false);
         self.attrs.set_fastcall(false);
         self.attrs.parsing_regparm = None;
         self.attrs.set_naked(false);
@@ -932,12 +939,14 @@ impl Parser {
                 .or_else(|| section.clone());
             let d_cleanup_fn = self.attrs.parsing_cleanup_fn.take();
             let d_used = self.attrs.parsing_used();
+            let d_maybe_unused = self.attrs.parsing_maybe_unused();
             let d_noreturn = self.attrs.parsing_noreturn();
             let d_pure = self.attrs.parsing_pure();
             let d_const_attr = self.attrs.parsing_const_attr();
             let d_error_attr = self.attrs.parsing_error_attr();
             self.attrs.set_weak(false);
             self.attrs.set_used(false);
+            self.attrs.set_maybe_unused(false);
             self.attrs.set_fastcall(false);
             self.attrs.set_naked(false);
             self.attrs.set_no_instrument(false);
@@ -967,6 +976,7 @@ impl Parser {
                     da.set_pure(d_pure);
                     da.set_const_attr(d_const_attr);
                     da.set_used(d_used);
+                    da.set_maybe_unused(d_maybe_unused || spec_maybe_unused);
                     da.set_fastcall(d_fastcall);
                     da.regparm = d_regparm;
                     da.alias_target = d_alias;
@@ -985,6 +995,14 @@ impl Parser {
                 span: start,
             });
             let (_, skip_aligned, skip_asm_reg) = self.skip_asm_and_attributes();
+            if self.attrs.parsing_maybe_unused() {
+                declarators
+                    .last_mut()
+                    .expect("declarator just pushed")
+                    .attrs
+                    .set_maybe_unused(true);
+                self.attrs.set_maybe_unused(false);
+            }
             if let Some(reg) = skip_asm_reg {
                 declarators
                     .last_mut()
@@ -1063,6 +1081,8 @@ impl Parser {
         self.attrs.set_pointer_const(false);
         self.attrs.parsing_address_space = AddressSpace::Default;
         let type_spec = self.parse_type_specifier()?;
+        let spec_maybe_unused = self.attrs.parsing_maybe_unused();
+        self.attrs.set_maybe_unused(false);
 
         self.consume_post_type_qualifiers();
         // Specifier-level visibility / TLS model apply to every declarator;
@@ -1136,6 +1156,8 @@ impl Parser {
             );
             let l_base_volatile = self.attrs.declarator_base_volatile;
             let (skip_mode, skip_aligned, skip_asm_reg) = self.skip_asm_and_attributes();
+            let local_maybe_unused = spec_maybe_unused || self.attrs.parsing_maybe_unused();
+            self.attrs.set_maybe_unused(false);
             let local_uninitialized = spec_uninitialized || self.attrs.parsing_uninitialized();
             self.attrs.set_uninitialized(false);
             let local_cleanup_fn = self.attrs.parsing_cleanup_fn.take();
@@ -1172,6 +1194,7 @@ impl Parser {
                     da.cleanup_fn = local_cleanup_fn;
                     da.set_uninitialized(local_uninitialized);
                     da.set_used(self.attrs.parsing_used());
+                    da.set_maybe_unused(local_maybe_unused);
                     da.set_nested_fn(self.attrs.parsing_nested_fn());
                     da.set_noreturn(self.attrs.parsing_noreturn());
                     da.set_pure(self.attrs.parsing_pure());
@@ -1197,6 +1220,14 @@ impl Parser {
                 span: start,
             });
             let (_, post_init_aligned, _post_asm_reg) = self.skip_asm_and_attributes();
+            if self.attrs.parsing_maybe_unused() {
+                declarators
+                    .last_mut()
+                    .expect("declarator just pushed")
+                    .attrs
+                    .set_maybe_unused(true);
+                self.attrs.set_maybe_unused(false);
+            }
             if let Some(a) = post_init_aligned {
                 alignment = Some(alignment.map_or(a, |prev| prev.max(a)));
             }

@@ -1347,6 +1347,9 @@ pub struct ElfWriterCore<A: X86Arch> {
     /// remove drops the plain symbol and rebinds intra-object references to
     /// the versioned alias).
     symver_flags: FxHashMap<String, (String, crate::backend::x86::assembler::parser::SymverFlag)>,
+    /// Source files and `.loc` rows for the generated DWARF v4 line table.
+    debug_files: Vec<(u32, String)>,
+    debug_line_locations: Vec<elf_mod::DwarfLineLocation>,
     section_stack: Vec<(Option<usize>, Option<usize>)>,
     /// Directive-generated fill materialized so far (bytes) — bounded by
     /// [`crate::backend::elf::MAX_TOTAL_DIRECTIVE_FILL`] (see there).
@@ -1404,6 +1407,8 @@ impl<A: X86Arch> ElfWriterCore<A> {
             set_exprs: FxHashMap::default(),
             symver_refs: FxHashMap::default(),
             symver_flags: FxHashMap::default(),
+            debug_files: Vec::new(),
+            debug_line_locations: Vec::new(),
             section_stack: Vec::new(),
             fill_budget_used: 0,
             deferred_skips: Vec::new(),
@@ -2222,11 +2227,31 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 // .code16gcc/.code32/.code64 across .text/.text32/.text64 sections).
                 self.code_mode = *bits;
             }
-            AsmItem::Cfi(_)
-            | AsmItem::File(_, _)
-            | AsmItem::Loc(_, _, _)
-            | AsmItem::OptionDirective(_)
-            | AsmItem::Empty => {}
+            AsmItem::File(number, filename) => {
+                if let Some((_, existing)) = self
+                    .debug_files
+                    .iter_mut()
+                    .find(|(existing_number, _)| existing_number == number)
+                {
+                    *existing = filename.clone();
+                } else {
+                    self.debug_files.push((*number, filename.clone()));
+                }
+            }
+            AsmItem::Loc(file_number, line, column) => {
+                self.ensure_section()?;
+                let section_index = self.current_section.ok_or("no active section for .loc")?;
+                let offset = self.sections[section_index].cursor();
+                self.debug_line_locations.push(elf_mod::DwarfLineLocation {
+                    section_index,
+                    offset,
+                    file_number: *file_number,
+                    line: *line,
+                    column: *column,
+                    sequence: self.seq,
+                });
+            }
+            AsmItem::Cfi(_) | AsmItem::OptionDirective(_) | AsmItem::Empty => {}
         }
         Ok(())
     }
@@ -3127,6 +3152,11 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 }
             }
         }
+        for location in self.debug_line_locations.iter_mut() {
+            if location.section_index == sec_idx {
+                location.offset = f(location.offset, Some(location.sequence));
+            }
+        }
         let map = |off: usize, seq: Option<u64>| f(off as u64, seq) as usize;
         let sec = &mut self.sections[sec_idx];
         for reloc in sec.relocations.iter_mut() {
@@ -3869,7 +3899,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
         self.resolve_internal_relocations()?;
 
         // Convert to shared ObjSection/ObjSymbol format
-        let section_names: Vec<String> = self.sections.iter().map(|s| s.name.clone()).collect();
+        let mut section_names: Vec<String> = self.sections.iter().map(|s| s.name.clone()).collect();
 
         let mut shared_sections: FxHashMap<String, ObjSection> = FxHashMap::default();
         for sec in &self.sections {
@@ -4011,6 +4041,32 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     comdat_group: sec.comdat_group.clone(),
                 },
             );
+        }
+
+        // Materialize the `.file`/`.loc` records emitted by `-g` as a
+        // relocatable DWARF v4 line table. The section/offset relocations are
+        // resolved by the final linker, after code layout is fixed.
+        if !shared_sections.contains_key(".debug_line") {
+            let section_info: Vec<elf_mod::DwarfSectionInfo<'_>> = self
+                .sections
+                .iter()
+                .map(|sec| elf_mod::DwarfSectionInfo {
+                    name: &sec.name,
+                    size: sec.cursor(),
+                    is_executable: sec.flags & SHF_EXECINSTR != 0,
+                })
+                .collect();
+            let address_size = if A::elf_class() == ELFCLASS32 { 4 } else { 8 };
+            if let Some(debug_line) = elf_mod::build_dwarf_line_section(
+                &self.debug_files,
+                &self.debug_line_locations,
+                &section_info,
+                address_size,
+                A::reloc_abs(address_size),
+            )? {
+                section_names.push(debug_line.name.clone());
+                shared_sections.insert(debug_line.name.clone(), debug_line);
+            }
         }
 
         // Convert label positions

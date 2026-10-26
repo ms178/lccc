@@ -1,4 +1,5 @@
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
+use crate::common::source::Span;
 use crate::common::types::{AddressSpace, CType};
 
 /// Information about a declared symbol.
@@ -31,6 +32,14 @@ pub struct Symbol {
     pub address_space: AddressSpace,
 }
 
+/// A block-scope object tracked for `-Wunused-variable`.
+#[derive(Debug, Clone)]
+struct LocalObject {
+    name: String,
+    span: Span,
+    suppress_warning: bool,
+}
+
 /// A scope in the symbol table.
 #[derive(Debug)]
 struct Scope {
@@ -41,6 +50,10 @@ struct Scope {
     /// Block-scope or parameter objects without linkage and without `static`
     /// (C11 6.2.4p5): their address is not a link-time constant.
     automatic: FxHashSet<String>,
+    /// Block-scope object declarations, in source order, for unused warnings.
+    local_objects: Vec<LocalObject>,
+    /// Names of local objects whose visible binding was referenced.
+    used_local_objects: FxHashSet<String>,
     /// Const-qualified objects whose initializer is a constant expression.
     /// GCC folds their value in constant contexts (`const int c = 5;
     /// static int v = c;` is accepted); their address is still not constant
@@ -95,6 +108,8 @@ impl Scope {
             symbols: FxHashMap::default(),
             linked: FxHashSet::default(),
             automatic: FxHashSet::default(),
+            local_objects: Vec::new(),
+            used_local_objects: FxHashSet::default(),
             folded: FxHashSet::default(),
             constexpr_objects: FxHashSet::default(),
             constexpr_members: FxHashMap::default(),
@@ -183,6 +198,53 @@ impl SymbolTable {
         if let Some(scope) = self.scopes.last_mut() {
             scope.automatic.insert(name.to_string());
         }
+    }
+
+    /// Track a non-linkage block object for `-Wunused-variable`. A repeated
+    /// compatible declaration in the same scope keeps one warning record.
+    pub fn mark_local_object(&mut self, name: &str, span: Span, suppress_warning: bool) {
+        if let Some(scope) = self.scopes.last_mut() {
+            if let Some(object) = scope.local_objects.iter_mut().find(|o| o.name == name) {
+                object.suppress_warning |= suppress_warning;
+            } else {
+                scope.local_objects.push(LocalObject {
+                    name: name.to_string(),
+                    span,
+                    suppress_warning,
+                });
+            }
+        }
+    }
+
+    /// Mark the innermost visible declaration used, respecting shadowing.
+    /// Only tracked block objects contribute to `-Wunused-variable`.
+    pub fn mark_used(&mut self, name: &str) {
+        for scope in self.scopes.iter_mut().rev() {
+            if scope.symbols.contains_key(name) {
+                if scope.local_objects.iter().any(|object| object.name == name) {
+                    scope.used_local_objects.insert(name.to_string());
+                }
+                // A parameter, typedef, function, or enum constant can hide
+                // an outer tracked object, so never continue past this binding.
+                break;
+            }
+        }
+    }
+
+    /// Return the unused, unsuppressed block objects of the current scope in
+    /// declaration order. Callers use this immediately before popping scope.
+    pub fn unused_local_objects(&self) -> Vec<(String, Span)> {
+        let Some(scope) = self.scopes.last() else {
+            return Vec::new();
+        };
+        scope
+            .local_objects
+            .iter()
+            .filter(|object| {
+                !object.suppress_warning && !scope.used_local_objects.contains(&object.name)
+            })
+            .map(|object| (object.name.clone(), object.span))
+            .collect()
     }
 
     /// Record that the innermost scope's const-qualified `name` has a

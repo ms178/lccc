@@ -738,13 +738,12 @@ and setters use `flags |= MASK` / `flags &= !MASK`.
 This design achieves three goals:
 
 - **Memory savings.**  13 booleans in `FunctionAttributes` collapse from 13
-  bytes to 2 bytes.  For `ParsedDeclAttrs`, 19 booleans collapse from 19 bytes
-  to 4 bytes.  Since AST nodes are allocated in large numbers, these savings
-  are meaningful.
+  bytes to 2 bytes. `ParsedDeclAttrs` stores its parser flags in a packed `u64`.
+  Since AST nodes are allocated in large numbers, these savings are meaningful.
 
 - **Bulk save/restore.**  `ParsedDeclAttrs::save_flags()` and
-  `restore_flags()` capture and restore all 19 boolean flags as a single `u32`,
-  used to prevent storage-class specifiers from leaking across compound
+  `restore_flags()` capture and restore the packed parser flags as a single
+  `u64`, used to prevent storage-class specifiers from leaking across compound
   statement scope boundaries.
 
 - **API ergonomics.**  Callers use named getter/setter methods

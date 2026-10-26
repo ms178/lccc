@@ -196,6 +196,81 @@ pub fn merge_sections_elf64_gc(
     }
 }
 
+/// Preserve non-allocated debug sections for x86-64 ELF links.
+///
+/// Ordinary section merging intentionally handles only the load image. Debug
+/// sections are different: they have file offsets but no virtual address or
+/// PT_LOAD membership, and they must retain their exact names so DWARF
+/// cross-section relocations remain meaningful. Call this after the
+/// allocatable sections have been sorted, so appended debug outputs do not
+/// participate in load-segment layout or section ordering.
+pub fn merge_debug_sections_elf64(
+    objects: &[Elf64Object],
+    output_sections: &mut Vec<OutputSection>,
+    section_map: &mut FxHashMap<(usize, usize), (usize, u64)>,
+    dead_sections: &FxHashSet<(usize, usize)>,
+) -> Result<(), String> {
+    let mut output_map: FxHashMap<String, usize> = FxHashMap::default();
+    for (obj_idx, object) in objects.iter().enumerate() {
+        for (section_idx, section) in object.sections.iter().enumerate() {
+            if section.flags & SHF_ALLOC != 0
+                || section.flags & SHF_EXCLUDE != 0
+                || section.sh_type != SHT_PROGBITS
+                || !is_debug_section_name(&section.name)
+                || dead_sections.contains(&(obj_idx, section_idx))
+            {
+                continue;
+            }
+
+            let alignment = section.addralign.max(1);
+            let output_idx = if let Some(&idx) = output_map.get(&section.name) {
+                idx
+            } else {
+                let idx = output_sections.len();
+                output_map.insert(section.name.clone(), idx);
+                output_sections.push(OutputSection {
+                    name: section.name.clone(),
+                    sh_type: section.sh_type,
+                    flags: section.flags,
+                    alignment,
+                    inputs: Vec::new(),
+                    data: Vec::new(),
+                    addr: 0,
+                    file_offset: 0,
+                    mem_size: 0,
+                });
+                idx
+            };
+            let output = &mut output_sections[output_idx];
+            output.alignment = output.alignment.max(alignment);
+            let aligned = output
+                .mem_size
+                .checked_add(alignment - 1)
+                .map(|n| n & !(alignment - 1))
+                .ok_or_else(|| format!("debug section '{}' size overflow", section.name))?;
+            let end = aligned
+                .checked_add(section.size)
+                .ok_or_else(|| format!("debug section '{}' size overflow", section.name))?;
+            output.inputs.push(InputSection {
+                object_idx: obj_idx,
+                section_idx,
+                output_offset: aligned,
+                size: section.size,
+            });
+            output.mem_size = end;
+            section_map.insert((obj_idx, section_idx), (output_idx, aligned));
+        }
+    }
+    Ok(())
+}
+
+fn is_debug_section_name(name: &str) -> bool {
+    name.starts_with(".debug_")
+        || name.starts_with(".zdebug_")
+        || name == ".gdb_index"
+        || name.starts_with(".gnu_debug")
+}
+
 /// Allocate SHN_COMMON symbols into the .bss output section.
 pub fn allocate_common_symbols_elf64<G: GlobalSymbolOps>(
     globals: &mut FxHashMap<String, G>,

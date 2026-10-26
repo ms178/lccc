@@ -117,13 +117,9 @@ pub enum AsmItem {
     /// CFI directive. `cfi::lower_cfi` replaces these by location labels and
     /// `.eh_frame` data before layout; the ELF writers never see one.
     Cfi(CfiDirective),
-    /// Debug file directive: `.file N "filename"`
-    #[cfg_attr(not(feature = "gcc_assembler"), expect(dead_code))]
-    // Parsed but skipped during encoding (debug info not yet emitted)
+    /// Debug file directive: `.file N "filename"`; retained for DWARF line emission.
     File(u32, String),
-    /// Debug location: `.loc filenum line column`
-    #[cfg_attr(not(feature = "gcc_assembler"), expect(dead_code))]
-    // Parsed but skipped during encoding (debug info not yet emitted)
+    /// Debug location: `.loc filenum line column`; retained for DWARF line emission.
     Loc(u32, u32, u32),
     /// x86-64 instruction
     Instruction(Instruction),

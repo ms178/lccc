@@ -1859,6 +1859,25 @@ pub(super) fn emit_shared_library(
         }
     }
 
+    // Place non-allocated debug data after the mapped image. It receives a
+    // file offset for static relocation and section-header emission, but no
+    // virtual address and no PT_LOAD membership.
+    for sec in output_sections
+        .iter_mut()
+        .filter(|sec| sec.flags & SHF_ALLOC == 0)
+    {
+        let alignment = sec.alignment.max(1);
+        offset = offset
+            .checked_add(alignment - 1)
+            .ok_or_else(|| format!("output section '{}' offset overflow", sec.name))?
+            & !(alignment - 1);
+        sec.addr = 0;
+        sec.file_offset = offset;
+        offset = offset
+            .checked_add(sec.mem_size)
+            .ok_or_else(|| format!("output section '{}' size overflow", sec.name))?;
+    }
+
     // Merge section data
     for sec in output_sections.iter_mut() {
         if sec.sh_type == SHT_NOBITS {
@@ -2737,8 +2756,13 @@ pub(super) fn emit_shared_library(
                                 Some(g) => g.absolute,
                                 None => sym.shndx == SHN_ABS,
                             };
-                        let dynamic = symbolic || (s != 0 && !absolute);
-                        if symbolic {
+                        // Relocations in DWARF and other non-allocated
+                        // sections are resolved to link-time values. They are
+                        // not present in a PT_LOAD segment, so a dynamic
+                        // relocation there would point into unmapped storage.
+                        let dynamic =
+                            in_sec.flags & SHF_ALLOC != 0 && (symbolic || (s != 0 && !absolute));
+                        if dynamic && symbolic {
                             abs64_entries.push((p, sym.name.to_string(), a));
                         } else if dynamic {
                             rela_dyn_entries.push((p, val));
@@ -3619,6 +3643,10 @@ pub(super) fn emit_shared_library(
             next_hdr += 1;
         }
     }
+    next_hdr += output_sections
+        .iter()
+        .filter(|sec| sec.flags & SHF_ALLOC == 0)
+        .count();
     // .comment sits before .symtab, as in bfd.
     if !comment_data.is_empty() {
         next_hdr += 1;
@@ -3868,6 +3896,10 @@ pub(super) fn emit_shared_library(
             sh_count += 1;
         }
     }
+    sh_count += output_sections
+        .iter()
+        .filter(|sec| sec.flags & SHF_ALLOC == 0)
+        .count() as u16;
     if !comment_data.is_empty() {
         sh_count += 1;
     } // .comment
@@ -4251,6 +4283,26 @@ pub(super) fn emit_shared_library(
                 0,
             );
         }
+    }
+    // Non-allocated DWARF/debug sections are not part of PT_LOAD. Their
+    // relocations have already been resolved to link-time addresses.
+    for sec in output_sections
+        .iter()
+        .filter(|sec| sec.flags & SHF_ALLOC == 0)
+    {
+        write_shdr_so(
+            &mut out,
+            get_shname(&sec.name),
+            sec.sh_type,
+            sec.flags,
+            0,
+            sec.file_offset,
+            sec.mem_size,
+            0,
+            0,
+            sec.alignment.max(1),
+            0,
+        );
     }
     // .comment (merged compiler version strings; non-alloc, addr 0).
     if !comment_data.is_empty() {

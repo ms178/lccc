@@ -1288,6 +1288,26 @@ pub(super) fn emit_executable(
         }
     }
 
+    // Non-allocated debug sections live after the load image: assign file
+    // offsets without advancing any virtual address or adding them to a
+    // PT_LOAD segment. This also gives the ordinary relocation pass a valid
+    // file location for DWARF references to code sections.
+    for sec in output_sections
+        .iter_mut()
+        .filter(|sec| sec.flags & SHF_ALLOC == 0)
+    {
+        let alignment = sec.alignment.max(1);
+        offset = offset
+            .checked_add(alignment - 1)
+            .ok_or_else(|| format!("output section '{}' offset overflow", sec.name))?
+            & !(alignment - 1);
+        sec.addr = 0;
+        sec.file_offset = offset;
+        offset = offset
+            .checked_add(sec.mem_size)
+            .ok_or_else(|| format!("output section '{}' size overflow", sec.name))?;
+    }
+
     // Merge section data
     for sec in output_sections.iter_mut() {
         if sec.sh_type == SHT_NOBITS {
@@ -1709,6 +1729,12 @@ pub(super) fn emit_executable(
             &mut h,
             &mut out_sec_to_hdr,
         );
+
+        // Non-allocated debug headers follow BSS and precede .comment.
+        h += output_sections
+            .iter()
+            .filter(|sec| sec.flags & SHF_ALLOC == 0)
+            .count();
 
         // .comment precedes .symtab (as in bfd), shifting both indices.
         if !comment_data.is_empty() {
@@ -2899,6 +2925,7 @@ pub(super) fn emit_executable(
                 // lld does, and say what works.  (A GOT reference -- -fPIC
                 // code -- reads the value from a slot and is correct.)
                 if is_pie
+                    && in_sec.flags & SHF_ALLOC != 0
                     && matches!(
                         rela.rela_type,
                         R_X86_64_PC32 | R_X86_64_PLT32 | R_X86_64_PC64
@@ -2937,6 +2964,7 @@ pub(super) fn emit_executable(
                 // refuses it with this text; only values that do not move
                 // (absolute symbols, an undefined weak's 0) fit.
                 if is_pie
+                    && in_sec.flags & SHF_ALLOC != 0
                     && matches!(
                         rela.rela_type,
                         R_X86_64_32 | R_X86_64_32S | R_X86_64_16 | R_X86_64_8
@@ -3684,6 +3712,11 @@ pub(super) fn emit_executable(
             sh_count += 1;
         }
     }
+    // Non-allocated DWARF/debug sections are file-backed but not mapped.
+    sh_count += output_sections
+        .iter()
+        .filter(|sec| sec.flags & SHF_ALLOC == 0)
+        .count() as u16;
     // .comment sits before .symtab, as in bfd.
     if !comment_data.is_empty() {
         sh_count += 1;
@@ -4130,6 +4163,26 @@ pub(super) fn emit_executable(
                 0,
             );
         }
+    }
+    // Non-allocated debug sections: kept outside PT_LOAD, with link-time
+    // relocations already applied to their file-backed contents.
+    for sec in output_sections
+        .iter()
+        .filter(|sec| sec.flags & SHF_ALLOC == 0)
+    {
+        write_shdr(
+            &mut out,
+            get_shname(&sec.name),
+            sec.sh_type,
+            sec.flags,
+            0,
+            sec.file_offset,
+            sec.mem_size,
+            0,
+            0,
+            sec.alignment.max(1),
+            0,
+        );
     }
     // .comment (merged compiler version strings; non-alloc, addr 0).
     if !comment_data.is_empty() {

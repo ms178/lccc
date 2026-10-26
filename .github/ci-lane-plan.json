@@ -169,6 +169,10 @@
         },
         {
           "measured_s": 0.25,
+          "name": "python3 tests/regression/check_dwarf_line_tables.py --lccc target/fastbuild/lccc --lccc-i686 target/fastbuild/lccc-i686 --gcc gcc-16"
+        },
+        {
+          "measured_s": 0.25,
           "name": "bash tests/regression/check_movabs_symdiff.sh"
         },
         {
@@ -1201,7 +1205,7 @@
     "frontend-b": {
       "group": "frontend",
       "mode": "steps",
-      "predicted_gate_seconds": 356.08,
+      "predicted_gate_seconds": 357.64,
       "shards": 2,
       "steps": [
         {
@@ -1211,6 +1215,10 @@
         {
           "measured_s": 2.02,
           "name": "LCCC vs GCC compatibility suite"
+        },
+        {
+          "measured_s": 1.56,
+          "name": "C23 inventory and warning parity against GCC 16.2"
         },
         {
           "measured_s": 0.25,
@@ -1468,8 +1476,8 @@
     },
     "frontend": {
       "costs": "/tmp/frontend.tsv",
-      "measured_seconds_total": 712.16,
-      "source": "Previous frontend plan costs retained (source: scripts/ci_gate_costs.py via the previous plan); Ring identities gate measured fresh at 4.62 s on 2026-10-26 by timing python3 tests/regression/check_llvm_ring_identities.py locally"
+      "measured_seconds_total": 713.72,
+      "source": "Previous frontend plan costs retained (source: scripts/ci_gate_costs.py via the previous plan); Ring identities gate measured fresh at 4.62 s on 2026-10-26 by timing python3 tests/regression/check_llvm_ring_identities.py locally; C23 inventory + GCC 16.2 warning parity measured at 1.56 s locally on 2026-10-26"
     }
   }
 }

@@ -758,6 +758,21 @@ gate "o-stdout" fast \
 # the strength-reduction pass on, off, and at -O3.
 gate "compat-suite" fast \
     env CCC="$LCCC" bash tests/regression/check_compat_suite.sh
+# C23 acceptance is inventoried feature-by-feature against the pinned GCC
+# oracle, with the current `_BitInt(17)` difference recorded explicitly.
+gate "c23-compatibility-inventory" fast \
+    python3 tests/regression/check_c23_inventory.py \
+        --lccc "$LCCC" --gcc "${GCC16:-gcc-16}" \
+        --json target/c23-inventory.json --markdown target/c23-inventory.md
+# GCC warning-group parity and DWARF line/link preservation are cheap focused
+# gates; keeping them in the local mirror prevents hosted-only drift.
+gate "warning-compatibility" fast \
+    python3 tests/regression/check_warning_compat.py \
+        --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"
+gate "dwarf-line-tables" fast \
+    python3 tests/regression/check_dwarf_line_tables.py \
+        --lccc "$LCCC" --lccc-i686 target/fastbuild/lccc-i686 \
+        --gcc "${GCC16:-gcc-16}"
 gate "ivsr-reproducers" fast \
     env CCC="$LCCC" bash tests/regression/check_ivsr_reproducers.sh
 

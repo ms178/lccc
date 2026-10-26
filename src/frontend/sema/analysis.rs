@@ -55,6 +55,81 @@ enum SwitchSegmentOutcome {
     FallsThrough,
 }
 
+#[derive(Clone, Copy)]
+enum FormatLength {
+    Default,
+    Hh,
+    H,
+    L,
+    Ll,
+    J,
+    Z,
+    T,
+    BigL,
+}
+
+#[derive(Clone)]
+enum FormatExpectation {
+    Exact(CType),
+    IntegerEither,
+    CharacterPointer,
+    AnyPointer,
+    PointerTo(CType),
+}
+
+fn gcc_format_type_name(ty: &CType) -> String {
+    match ty {
+        CType::Bool => "_Bool".to_string(),
+        CType::SChar => "signed char".to_string(),
+        CType::UChar => "unsigned char".to_string(),
+        CType::Short => "short int".to_string(),
+        CType::UShort => "short unsigned int".to_string(),
+        CType::Int => "int".to_string(),
+        CType::UInt => "unsigned int".to_string(),
+        CType::Long => "long int".to_string(),
+        CType::ULong => "long unsigned int".to_string(),
+        CType::LongLong => "long long int".to_string(),
+        CType::ULongLong => "long long unsigned int".to_string(),
+        CType::Int128 => "__int128".to_string(),
+        CType::UInt128 => "unsigned __int128".to_string(),
+        CType::Pointer(pointee, _) => format!("{} *", gcc_format_type_name(pointee)),
+        _ => ty.to_string(),
+    }
+}
+
+impl FormatExpectation {
+    fn description(&self) -> String {
+        match self {
+            Self::Exact(ty) => gcc_format_type_name(ty),
+            Self::IntegerEither => "int or unsigned int".to_string(),
+            Self::CharacterPointer => "char *".to_string(),
+            Self::AnyPointer => "void *".to_string(),
+            Self::PointerTo(ty) => format!("{} *", gcc_format_type_name(ty)),
+        }
+    }
+
+    fn accepts(&self, actual: &CType) -> bool {
+        let promoted = match actual {
+            CType::Float | CType::Float16 | CType::BFloat16 => CType::Double,
+            other => other.decayed_value_ctype().integer_promoted(),
+        };
+        match self {
+            Self::Exact(expected) => &promoted == expected,
+            Self::IntegerEither => matches!(promoted, CType::Int | CType::UInt),
+            Self::CharacterPointer => matches!(
+                promoted,
+                CType::Pointer(ref pointee, _) if matches!(pointee.as_ref(), CType::Char)
+            ),
+            Self::AnyPointer => matches!(promoted, CType::Pointer(..) | CType::NullPtr),
+            Self::PointerTo(pointee) => matches!(
+                promoted,
+                CType::Pointer(ref actual_pointee, _)
+                    if actual_pointee.as_ref() == pointee
+            ),
+        }
+    }
+}
+
 /// Map from AST expression node identity to its inferred CType.
 ///
 /// Keyed by [`ExprId`], a type-safe wrapper around each `Expr` node's identity.
@@ -223,6 +298,9 @@ impl SemanticAnalyzer {
                 ExternalDecl::StaticAssert(assertion) => self.check_static_assert(assertion),
             }
         }
+        // File-scope internal-linkage objects participate in -Wunused-variable
+        // too, and their uses can occur in declarations processed later.
+        self.warn_unused_scope();
         // Validate `__attribute__((ifunc("resolver")))` / `[[gnu::ifunc("resolver")]]`
         // resolver targets across the translation unit (GCC 16.2 parity).
         let has_toplevel_asm = tu
@@ -1282,6 +1360,16 @@ impl SemanticAnalyzer {
             } else if is_object && !decl.is_static() && !self.symbol_table.at_file_scope() {
                 self.symbol_table.mark_automatic(&init_decl.name);
             }
+            if is_object
+                && ((!links && !self.symbol_table.at_file_scope())
+                    || (is_global && decl.is_static()))
+            {
+                self.symbol_table.mark_local_object(
+                    &init_decl.name,
+                    init_decl.span,
+                    init_decl.attrs.is_maybe_unused() || init_decl.attrs.is_used(),
+                );
+            }
 
             // Analyze array size expressions in derived declarators
             // (catches undeclared identifiers in e.g. `int arr[UNDECLARED];`)
@@ -2102,6 +2190,16 @@ impl SemanticAnalyzer {
 
     // === Statement analysis ===
 
+    fn warn_unused_scope(&mut self) {
+        for (name, span) in self.symbol_table.unused_local_objects() {
+            self.diagnostics.borrow_mut().warning_with_kind(
+                format!("unused variable '{name}'"),
+                span,
+                crate::common::error::WarningKind::UnusedVariable,
+            );
+        }
+    }
+
     fn analyze_compound_stmt(&mut self, compound: &CompoundStmt) {
         self.symbol_table.push_scope();
         self.result.type_context.push_scope();
@@ -2119,6 +2217,7 @@ impl SemanticAnalyzer {
                 BlockItem::StaticAssert(assertion) => self.check_static_assert(assertion),
             }
         }
+        self.warn_unused_scope();
         self.result.type_context.pop_scope();
         self.symbol_table.pop_scope();
     }
@@ -2184,6 +2283,7 @@ impl SemanticAnalyzer {
             self.symbol_table.push_scope();
             self.result.type_context.push_scope();
             self.analyze_stmt_in_scope(stmt);
+            self.warn_unused_scope();
             self.result.type_context.pop_scope();
             self.symbol_table.pop_scope();
         } else {
@@ -2200,6 +2300,7 @@ impl SemanticAnalyzer {
             self.symbol_table.push_scope();
             self.result.type_context.push_scope();
             self.analyze_stmt(stmt);
+            self.warn_unused_scope();
             self.result.type_context.pop_scope();
             self.symbol_table.pop_scope();
         }
@@ -2317,6 +2418,7 @@ impl SemanticAnalyzer {
                     self.analyze_expr(inc);
                 }
                 self.analyze_substatement(body);
+                self.warn_unused_scope();
                 self.result.type_context.pop_scope();
                 self.symbol_table.pop_scope();
                 self.active_continue_targets.pop();
@@ -2909,6 +3011,7 @@ impl SemanticAnalyzer {
         self.declare_type_name_tags(expr);
         match expr {
             Expr::Identifier(name, span) => {
+                self.symbol_table.mark_used(name);
                 if name == "__func__" && self.symbol_table.lookup(name).is_none() {
                     self.diagnostics.borrow_mut().warning(
                         "'__func__' is not defined outside of function scope".to_string(),
@@ -2937,6 +3040,7 @@ impl SemanticAnalyzer {
                     self.check_pointer_subtraction_compat(lhs, rhs, *span);
                 }
                 self.check_pointer_comparison_spaces(op, lhs, rhs, *span);
+                self.warn_sign_compare(*op, lhs, rhs, *span);
                 self.check_binary_operands(*op, lhs, rhs, *span);
             }
             Expr::UnaryOp(op, operand, span) => {
@@ -3354,6 +3458,9 @@ impl SemanticAnalyzer {
         for arg in args {
             self.analyze_expr(arg);
         }
+        if let Expr::Identifier(name, _) = callee {
+            self.check_printf_format(name, args);
+        }
         // Resolve the callable through lexical scope, not through
         // the TU-wide body-metadata map. Local function pointers and
         // GNU nested functions both shadow a file-scope function.
@@ -3377,6 +3484,327 @@ impl SemanticAnalyzer {
                 _ => "function pointer",
             };
             self.check_call_arguments(name, args, &ft.params, ft.variadic, expr.span());
+        }
+    }
+
+    /// Check printf-family calls against a literal format string, matching
+    /// GCC's ordinary `-Wformat` argument checks. This intentionally stops at
+    /// compile-time literal formats; dynamic format validation belongs at run
+    /// time and custom `format` attributes are handled separately.
+    fn check_printf_format(&self, name: &str, args: &[Expr]) {
+        let format_index = match name {
+            "printf" | "__builtin_printf" => 0,
+            "fprintf" | "__builtin_fprintf" | "dprintf" | "__builtin_dprintf" | "sprintf"
+            | "__builtin_sprintf" | "asprintf" => 1,
+            "snprintf" | "__builtin_snprintf" => 2,
+            "__printf_chk" | "__builtin___printf_chk" => 1,
+            "__fprintf_chk" | "__builtin___fprintf_chk" => 2,
+            "__sprintf_chk" | "__builtin___sprintf_chk" => 3,
+            "__snprintf_chk" | "__builtin___snprintf_chk" => 4,
+            _ => return,
+        };
+        let Some(Expr::StringLiteral(format, format_span)) = args.get(format_index) else {
+            return;
+        };
+
+        fn positional_arg_index(
+            format_index: usize,
+            sequential: &mut usize,
+            position: Option<usize>,
+        ) -> Option<usize> {
+            if let Some(position) = position {
+                (position > 0).then_some(format_index + position)
+            } else {
+                let index = *sequential;
+                *sequential += 1;
+                Some(index)
+            }
+        }
+
+        fn parse_position(bytes: &[u8], cursor: &mut usize) -> Option<usize> {
+            let start = *cursor;
+            let mut value = 0usize;
+            while let Some(digit @ b'0'..=b'9') = bytes.get(*cursor).copied() {
+                value = value
+                    .saturating_mul(10)
+                    .saturating_add((digit - b'0') as usize);
+                *cursor += 1;
+            }
+            if *cursor > start && bytes.get(*cursor) == Some(&b'$') {
+                *cursor += 1;
+                Some(value)
+            } else {
+                *cursor = start;
+                None
+            }
+        }
+
+        let ptr_width = crate::common::types::target_ptr_size();
+        let signed_word = if ptr_width == 4 {
+            CType::Int
+        } else {
+            CType::Long
+        };
+        let unsigned_word = if ptr_width == 4 {
+            CType::UInt
+        } else {
+            CType::ULong
+        };
+        let signed_max = if ptr_width == 4 {
+            CType::LongLong
+        } else {
+            CType::Long
+        };
+        let unsigned_max = if ptr_width == 4 {
+            CType::ULongLong
+        } else {
+            CType::ULong
+        };
+
+        let mut cursor = 0usize;
+        let mut next_argument = format_index + 1;
+        let bytes = format.as_bytes();
+        while cursor < bytes.len() {
+            if bytes[cursor] != b'%' {
+                cursor += 1;
+                continue;
+            }
+            let directive_start = cursor;
+            cursor += 1;
+            if cursor >= bytes.len() {
+                break;
+            }
+            if bytes[cursor] == b'%' {
+                cursor += 1;
+                continue;
+            }
+
+            // POSIX positional argument: `%2$d`. A non-positional number is
+            // width, so rewind unless it is immediately followed by `$`.
+            let value_position = parse_position(bytes, &mut cursor);
+            while cursor < bytes.len() && b"#0- +'I".contains(&bytes[cursor]) {
+                cursor += 1;
+            }
+
+            // Field width. A star consumes an int argument, optionally in
+            // positional form (`%*3$d`).
+            if cursor < bytes.len() && bytes[cursor] == b'*' {
+                cursor += 1;
+                let width_position = parse_position(bytes, &mut cursor);
+                let arg_index =
+                    positional_arg_index(format_index, &mut next_argument, width_position);
+                self.check_format_argument(
+                    args,
+                    format_index,
+                    arg_index,
+                    FormatExpectation::Exact(CType::Int),
+                    "*",
+                    *format_span,
+                );
+            } else {
+                while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
+                    cursor += 1;
+                }
+            }
+
+            // Precision: a star also consumes an int argument.
+            if cursor < bytes.len() && bytes[cursor] == b'.' {
+                cursor += 1;
+                if cursor < bytes.len() && bytes[cursor] == b'*' {
+                    cursor += 1;
+                    let precision_position = parse_position(bytes, &mut cursor);
+                    let arg_index =
+                        positional_arg_index(format_index, &mut next_argument, precision_position);
+                    self.check_format_argument(
+                        args,
+                        format_index,
+                        arg_index,
+                        FormatExpectation::Exact(CType::Int),
+                        "*",
+                        *format_span,
+                    );
+                } else {
+                    while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
+                        cursor += 1;
+                    }
+                }
+            }
+
+            let length = match bytes.get(cursor).copied() {
+                Some(b'h') if bytes.get(cursor + 1) == Some(&b'h') => {
+                    cursor += 2;
+                    FormatLength::Hh
+                }
+                Some(b'h') => {
+                    cursor += 1;
+                    FormatLength::H
+                }
+                Some(b'l') if bytes.get(cursor + 1) == Some(&b'l') => {
+                    cursor += 2;
+                    FormatLength::Ll
+                }
+                Some(b'l') => {
+                    cursor += 1;
+                    FormatLength::L
+                }
+                Some(b'j') => {
+                    cursor += 1;
+                    FormatLength::J
+                }
+                Some(b'z') | Some(b'Z') => {
+                    cursor += 1;
+                    FormatLength::Z
+                }
+                Some(b't') => {
+                    cursor += 1;
+                    FormatLength::T
+                }
+                Some(b'L') => {
+                    cursor += 1;
+                    FormatLength::BigL
+                }
+                Some(b'q') => {
+                    cursor += 1;
+                    FormatLength::Ll
+                }
+                _ => FormatLength::Default,
+            };
+            let Some(&conversion) = bytes.get(cursor) else {
+                break;
+            };
+            cursor += 1;
+            let specifier = String::from_utf8_lossy(&bytes[directive_start..cursor]).into_owned();
+
+            let integer_expectation = |signed: bool| match length {
+                FormatLength::Default | FormatLength::Hh | FormatLength::H => {
+                    if matches!(length, FormatLength::Hh | FormatLength::H) {
+                        FormatExpectation::IntegerEither
+                    } else if signed {
+                        FormatExpectation::Exact(CType::Int)
+                    } else {
+                        FormatExpectation::Exact(CType::UInt)
+                    }
+                }
+                FormatLength::L => {
+                    FormatExpectation::Exact(if signed { CType::Long } else { CType::ULong })
+                }
+                FormatLength::Ll => FormatExpectation::Exact(if signed {
+                    CType::LongLong
+                } else {
+                    CType::ULongLong
+                }),
+                FormatLength::J => FormatExpectation::Exact(if signed {
+                    signed_max.clone()
+                } else {
+                    unsigned_max.clone()
+                }),
+                FormatLength::Z | FormatLength::T => FormatExpectation::Exact(if signed {
+                    signed_word.clone()
+                } else {
+                    unsigned_word.clone()
+                }),
+                FormatLength::BigL => {
+                    FormatExpectation::Exact(if signed { CType::Int } else { CType::UInt })
+                }
+            };
+            let expectation = match conversion {
+                b'd' | b'i' => Some(integer_expectation(true)),
+                b'o' | b'u' | b'x' | b'X' | b'b' | b'B' => Some(integer_expectation(false)),
+                b'D' => Some(FormatExpectation::Exact(CType::Long)),
+                b'O' | b'U' => Some(FormatExpectation::Exact(CType::ULong)),
+                b'c' => Some(FormatExpectation::Exact(
+                    if matches!(length, FormatLength::L) {
+                        CType::UInt
+                    } else {
+                        CType::Int
+                    },
+                )),
+                b's' if matches!(length, FormatLength::L) => {
+                    Some(FormatExpectation::PointerTo(CType::Int))
+                }
+                b's' => Some(FormatExpectation::CharacterPointer),
+                b'p' => Some(FormatExpectation::AnyPointer),
+                b'n' => {
+                    let pointee = match length {
+                        FormatLength::Hh => CType::SChar,
+                        FormatLength::H => CType::Short,
+                        FormatLength::Default => CType::Int,
+                        FormatLength::L => CType::Long,
+                        FormatLength::Ll => CType::LongLong,
+                        FormatLength::J => signed_max.clone(),
+                        FormatLength::Z | FormatLength::T => signed_word.clone(),
+                        FormatLength::BigL => CType::Int,
+                    };
+                    Some(FormatExpectation::PointerTo(pointee))
+                }
+                b'f' | b'F' | b'e' | b'E' | b'g' | b'G' | b'a' | b'A' => Some(
+                    FormatExpectation::Exact(if matches!(length, FormatLength::BigL) {
+                        CType::LongDouble
+                    } else {
+                        CType::Double
+                    }),
+                ),
+                // GNU `%m` consumes no argument. An unknown conversion is
+                // left to the compiler's ordinary format-string diagnostics.
+                b'm' | b'%' => None,
+                _ => None,
+            };
+
+            if let Some(expectation) = expectation {
+                let arg_index =
+                    positional_arg_index(format_index, &mut next_argument, value_position);
+                self.check_format_argument(
+                    args,
+                    format_index,
+                    arg_index,
+                    expectation,
+                    &specifier,
+                    *format_span,
+                );
+            }
+        }
+    }
+
+    fn check_format_argument(
+        &self,
+        args: &[Expr],
+        format_index: usize,
+        arg_index: Option<usize>,
+        expected: FormatExpectation,
+        specifier: &str,
+        format_span: Span,
+    ) {
+        let Some(arg_index) = arg_index else {
+            return;
+        };
+        let Some(arg) = args.get(arg_index) else {
+            self.diagnostics.borrow_mut().warning_with_kind(
+                format!(
+                    "format '{}' expects a matching '{}' argument",
+                    specifier,
+                    expected.description()
+                ),
+                format_span,
+                crate::common::error::WarningKind::Format,
+            );
+            return;
+        };
+        let Some(actual) = self.expr_type_checker().infer_expr_ctype(arg) else {
+            return;
+        };
+        if !expected.accepts(&actual) {
+            let format_arg = args.get(format_index).map_or(format_span, Expr::span);
+            self.diagnostics.borrow_mut().warning_with_kind(
+                format!(
+                    "format '{}' expects argument of type '{}', but argument {} has type '{}'",
+                    specifier,
+                    expected.description(),
+                    arg_index + 1,
+                    gcc_format_type_name(&actual.decayed_value_ctype())
+                ),
+                format_arg,
+                crate::common::error::WarningKind::Format,
+            );
         }
     }
 
@@ -4719,6 +5147,35 @@ impl SemanticAnalyzer {
         let from = self.conversion_source_ctype(expr, from);
         let null_constant = self.is_void_null_pointer_constant(expr);
         self.check_address_space_conversion(&from, target, expr.span(), null_constant);
+    }
+
+    /// GCC `-Wsign-compare`: integer comparisons between operands with
+    /// different signedness, after the usual integer promotions.
+    fn warn_sign_compare(&self, op: BinOp, lhs: &Expr, rhs: &Expr, span: Span) {
+        if !matches!(
+            op,
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+        ) {
+            return;
+        }
+        let checker = self.expr_type_checker();
+        let (Some(lhs_type), Some(rhs_type)) =
+            (checker.infer_expr_ctype(lhs), checker.infer_expr_ctype(rhs))
+        else {
+            return;
+        };
+        let lhs_type = lhs_type.integer_promoted();
+        let rhs_type = rhs_type.integer_promoted();
+        if lhs_type.is_integer()
+            && rhs_type.is_integer()
+            && lhs_type.is_signed() != rhs_type.is_signed()
+        {
+            self.diagnostics.borrow_mut().warning_with_kind(
+                "comparison of integer expressions of different signedness",
+                span,
+                crate::common::error::WarningKind::SignCompare,
+            );
+        }
     }
 
     /// `==`, `!=`, `<`, ... and `-` between pointers whose pointees live in
