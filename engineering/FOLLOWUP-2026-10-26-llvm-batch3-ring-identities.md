@@ -207,6 +207,13 @@ runtime-count acceptance, and each refusal listed above.
 
 ## Deferred: measured gaps
 
+> **Batch 4 update.** Every row below was re-transcribed, re-measured and
+> re-verdicted in [`llvm-batch4-red-team.md`](llvm-batch4-red-team.md), with the
+> raw counts in [`llvm-batch4-audit.json`](llvm-batch4-audit.json). #154025 and
+> #84432 are closed by the select-lattice and boolean-product rules, #92074's
+> divider is gone, and five rows turned out to be at the oracle once the idiom
+> is spelled canonically.
+
 These reports were probed, reproduced and measured, and are **not** in this
 batch. Each is a follow-up with its own prerequisite, recorded so the next
 batch starts from evidence rather than from a title.

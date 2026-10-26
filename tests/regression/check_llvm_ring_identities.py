@@ -15,6 +15,13 @@ SOURCE = ROOT / "tests/regression/llvm_ring_identities.c"
 
 # Assembly the fold must leave behind for each idiom, as (required, forbidden)
 # regular expressions over the function body.
+# Which control each form is compared against: the ring-identity sub-pass, or
+# the division strength reduction for the power-of-two forms.
+CONTROL = {
+    "pow2rem": "disabled-div",
+    "pow2div": "disabled-div",
+}
+
 MECHANISM = {
     # One wrapping add plus one unsigned compare; no division sequence.
     "srem": (r"\b(?:add|lea)[bwlq]?\b", r"\b(?:idiv|div|imul)[bwlq]?\b"),
@@ -25,6 +32,16 @@ MECHANISM = {
     "complement": (r"\b(?:lea|add|sub)[bwlq]?\b", r"\b(?:neg|not)[bwlq]?\b"),
     # A saturated bound selects the other arm for every pattern.
     "bound": (r"\bmov[bwlq]?\b", r"\bcmov\w*\b"),
+    # A provably constant arm collapses the whole select to that constant.
+    "constant": (r"\bxor[bwlq]?\b", r"\b(?:cmov|j\w+)\b"),
+    # An implied-condition select is the surviving arm, with no compare left.
+    "orchain": (r"\b(?:mov|xor)[bwlq]?\b", r"\bcmov\w*\b"),
+    # A boolean product is a conditional move, never a multiply.
+    "boolmul": (r"\bcmov\w*\b", r"\bimul\w*\b"),
+    # Power-of-two remainder keeps no magic constant and no multiply.
+    "pow2rem": (r"\b(?:sar|shr|and)[bwlq]?\b", r"\b(?:imul|idiv|div)\w*\b"),
+    # Power-of-two signed division is a bias add and an arithmetic shift.
+    "pow2div": (r"\bsar[bwlq]?\b", r"\b(?:imul|idiv|div)\w*\b"),
 }
 
 FORMS = {
@@ -47,17 +64,40 @@ FORMS = {
     "ring_max_u0": "bound",
     "ring_min_imax64": "bound",
     "ring_max_imin64": "bound",
+    "ring_zero_select": "bound",
+    "ring_zero_constant_eq": "bound",
+    "ring_or_chain_value": "orchain",
+    "ring_or_chain_zero": "orchain",
+    "ring_nested_select": "orchain",
+    "ring_bool_product_self": "orchain",
+    "ring_bool_product_test": "boolmul",
+    "ring_bool_product_cmp": "boolmul",
+    "ring_srem_pow2_32": "pow2rem",
+    "ring_srem_pow2_64": "pow2rem",
+    "ring_srem_pow2_neg": "pow2rem",
+    "ring_sdiv_pow2_32": "pow2div",
 }
 
 # Forms that must keep a real compare: the neighbouring clamp is not an
 # identity and the fold has to leave it alone.
+# The power-of-two forms trade a handful of ALU instructions for the hardware
+# divider, so the win is latency and port pressure rather than instruction count:
+# `idiv` is ~20-40 cycles and occupies the divider for many cycles, while the
+# five ALU ops retire in about two. They are measured on divider removal, not on
+# length, and the control must still contain the divider for that to mean
+# anything.
+NO_COUNT_REDUCTION = {"pow2rem", "pow2div"}
+DIVIDER = r"\b(?:idiv|div)[bwlq]?\b"
+
 SURVIVORS = {"ring_clamp_imax": r"\bcmov\w*\b"}
 
 # Narrow remainders are promoted to `int` before the remainder is formed, so the
 # dividend is a sign-extended copy and the compared value is not the same SSA
 # operand. The fold refuses that shape by construction; these forms only guard
 # that the refusal stays correct, they are not expected to shrink.
-PROMOTED = {"ring_srem_eq16", "ring_srem_ne16", "ring_srem_eq8"}
+# `x % 256u` is a mask in the backend's own strength reduction and never reaches
+# this pass, so it is a boundary rather than a fold of this batch.
+PROMOTED = {"ring_srem_eq16", "ring_srem_ne16", "ring_srem_eq8", "ring_urem_pow2"}
 
 
 def main():
@@ -97,6 +137,7 @@ def main():
         controls = {
             "disabled-subpass": env | {"CCC_NO_RING_IDENTITIES": "1"},
             "disabled-pass": env | {"CCC_DISABLE_PASSES": "bit_idioms"},
+            "disabled-div": env | {"CCC_DISABLE_PASSES": "bit_idioms,divconst"},
         }
         for label, settings in controls.items():
             run([args.compiler, "-O2", str(SOURCE), "-o", str(directory / label)], env=settings)
@@ -126,16 +167,21 @@ def main():
                 raise ValueError(f"{name}: expected {required!r} in {enabled}")
             if re.search(forbidden, probe):
                 raise ValueError(f"{name}: forbidden {forbidden!r} in {enabled}")
-            off = body(assembly["disabled-subpass"], name)
+            control = CONTROL.get(kind, "disabled-subpass")
+            off = body(assembly[control], name)
             if enabled == off:
-                raise ValueError(f"{name}: the sub-pass control changed nothing")
-            if len(enabled) >= len(off):
+                raise ValueError(f"{name}: the {control} control changed nothing")
+            if kind in NO_COUNT_REDUCTION:
+                if not re.search(DIVIDER, " ".join(off)):
+                    raise ValueError(f"{name}: control still has no divider to remove")
+            elif len(enabled) >= len(off):
                 raise ValueError(f"{name}: no instruction reduction ({len(enabled)} vs {len(off)})")
             improved.append(name)
             measurements.append(
                 {
                     "name": name,
                     "idiom": kind,
+                    "divider_in_control": bool(re.search(DIVIDER, " ".join(off))),
                     "instructions": {
                         label: len(body(text, name)) for label, text in assembly.items()
                     },
@@ -165,7 +211,7 @@ def main():
     print(
         f"PASS ring identities: {len(FORMS)} folded forms, {len(SURVIVORS)} survivor, "
         f"{len(PROMOTED)} documented promotion boundary, vendor agreement, IR/SSA/RA, "
-        "seven optimisation levels and two disable controls"
+        "seven optimisation levels and three disable controls"
     )
 
 

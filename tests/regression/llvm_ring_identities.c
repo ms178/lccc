@@ -44,6 +44,21 @@ uint32_t ring_max_u0(uint32_t x) { return x > 0u ? x : 0u; }
 int64_t ring_min_imax64(int64_t x) { return x <= INT64_MAX ? x : INT64_MAX; }
 int64_t ring_max_imin64(int64_t x) { return x >= INT64_MIN ? x : INT64_MIN; }
 int32_t ring_clamp_imax(int32_t x) { return x < INT32_MAX - 1 ? x : INT32_MAX - 1; }
+int32_t ring_zero_select(int32_t x) { return x != 0 ? x : 0; }
+int32_t ring_zero_constant_eq(int32_t x) { return x == 0 ? 0 : x; }
+int32_t ring_or_chain_value(int32_t a, int32_t b, int32_t c) { return (a | b | c) ? a : 0; }
+int32_t ring_or_chain_zero(int32_t a, int32_t b, int32_t c) { return (a | b | c) ? 0 : a; }
+int32_t ring_srem_pow2_32(int32_t x) { return x % 16; }
+int64_t ring_srem_pow2_64(int64_t x) { return x % 1024; }
+int32_t ring_srem_pow2_neg(int32_t x) { return x % -32; }
+int32_t ring_sdiv_pow2_32(int32_t x) { return x / 32; }
+uint32_t ring_urem_pow2(uint32_t x) { return x % 256; }
+int32_t ring_nested_select(int32_t a, int32_t b) { return (a != 0 || b) ? a : 0; }
+int32_t ring_bool_product_self(int32_t x, int32_t y) { return x * (x || y); }
+int32_t ring_bool_product_test(int32_t x, uint32_t y) { return x * (y != 0); }
+uint32_t ring_bool_product_cmp(uint32_t x, uint32_t y) { return (x < y) * x; }
+
+enum { WIDE = 23, NARROW = 14 };
 
 int main(void) {
     static const long wide[] = {
@@ -56,20 +71,37 @@ int main(void) {
         INT32_MAX, INT32_MIN, INT32_MIN + 1, 777,
     };
     static const int16_t small[] = {0, 1, -1, 249, 250, -250, 32767, -32768, -32767, 100, -100};
+    _Static_assert(sizeof wide / sizeof *wide == WIDE, "wide probe count");
+    _Static_assert(sizeof narrow / sizeof *narrow == NARROW, "narrow probe count");
 
-    for (unsigned i = 0; i < sizeof wide / sizeof *wide; i++) {
+    for (unsigned i = 0; i < WIDE; i++) {
         mix((unsigned)ring_srem_eq_250(wide[i]));
         mix((unsigned)ring_srem_ne_250(wide[i]));
         mix((unsigned)ring_srem_eq_min(wide[i]));
         mix((unsigned)ring_srem_ne_min(wide[i]));
         mix((unsigned)ring_srem_eq_neg7(wide[i]));
+        mix((unsigned)ring_or_chain_value((int32_t)wide[i], (int32_t)(wide[i] >> 3),
+                                          (int32_t)(wide[i] >> 7)));
+        mix((unsigned)ring_or_chain_zero((int32_t)wide[i], (int32_t)(wide[i] >> 3),
+                                         (int32_t)(wide[i] >> 7)));
     }
-    for (unsigned i = 0; i < sizeof narrow / sizeof *narrow; i++) {
+    for (unsigned i = 0; i < NARROW; i++) {
         mix((unsigned)ring_srem_eq32(narrow[i]));
         mix((unsigned)ring_srem_ne32(narrow[i]));
         mix((unsigned)ring_min_imax(narrow[i]));
         mix((unsigned)ring_max_imin(narrow[i]));
         mix((unsigned)ring_clamp_imax(narrow[i]));
+        mix((unsigned)ring_zero_select(narrow[i]));
+        mix((unsigned)ring_zero_constant_eq(narrow[i]));
+        mix((unsigned)ring_nested_select(narrow[i], narrow[(i + 1) % NARROW]));
+        mix((unsigned)ring_bool_product_self(narrow[i], narrow[(i + 2) % NARROW]));
+        mix((unsigned)ring_bool_product_test(narrow[i], (uint32_t)narrow[(i + 3) % NARROW]));
+        mix((unsigned)ring_srem_pow2_32(narrow[i]));
+        mix((unsigned)ring_srem_pow2_neg(narrow[i]));
+        mix((unsigned)ring_sdiv_pow2_32(narrow[i]));
+        mix((unsigned)ring_urem_pow2((uint32_t)narrow[i]));
+        mix(ring_bool_product_cmp((uint32_t)narrow[i], (uint32_t)narrow[(i + 5) % NARROW]));
+        mix((unsigned)ring_srem_pow2_64((int64_t)narrow[i] * 1000003));
         mix((unsigned)ring_neg_not(narrow[i]));
         mix((unsigned)ring_min_umax((uint32_t)narrow[i]));
         mix((unsigned)ring_max_u0((uint32_t)narrow[i]));

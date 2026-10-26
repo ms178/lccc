@@ -107,7 +107,11 @@ fn remainder_pattern(ty: IrType, cmp: IrCmpOp, divisor: u64, swapped: bool) -> V
 
 #[test]
 fn remainder_identity_exhausts_every_byte_ring_divisor() {
-    for ty in [IrType::I8, IrType::U8] {
+    // The identity is admitted for signed types only: the backend lowers
+    // `SRem` to `idiv` for every type while the constant folder evaluates
+    // `U32`/`U64` operands zero-extended, so an unsigned `SRem` is the one
+    // shape where the two disagree. The refusal is asserted below.
+    for ty in [IrType::I8] {
         let ring = mask(ty);
         for divisor in 0..=ring {
             if signed_value(divisor, ty) == 0 {
@@ -133,14 +137,23 @@ fn remainder_identity_exhausts_every_byte_ring_divisor() {
 }
 
 #[test]
+fn remainder_identity_is_refused_for_unsigned_word_types() {
+    for ty in [IrType::U8, IrType::U16, IrType::U32, IrType::U64] {
+        let ring = mask(ty);
+        for divisor in [1, 2, 3, 7, 250, ring] {
+            for cmp in [IrCmpOp::Eq, IrCmpOp::Ne] {
+                assert!(
+                    rewrite(&remainder_pattern(ty, cmp, divisor, false), None).is_none(),
+                    "ty={ty:?} c={divisor} op={cmp:?} must stay with the divider"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn remainder_identity_holds_at_extremal_divisors_and_widths() {
-    for ty in [
-        IrType::I8,
-        IrType::I16,
-        IrType::I32,
-        IrType::I64,
-        IrType::U32,
-    ] {
+    for ty in [IrType::I8, IrType::I16, IrType::I32, IrType::I64] {
         let ring = mask(ty);
         let w = ty.size() * 8;
         let sign = 1u64 << (w - 1);
@@ -576,12 +589,557 @@ fn zero_test_selects_keep_the_value_only_in_the_selecting_order() {
                 assert_eq!(selected, x, "{ty:?} {op:?} x={x}");
             }
         }
-        // The reversed orders are real zeroing choices, not identities.
+        // The reversed orders select a zero arm on both paths — `x != 0` fills
+        // the true arm with zero and `x == 0` leaves the false arm at zero — so
+        // they fold to the constant zero rather than being refused.
         for (op, zero_is_true) in [(IrCmpOp::Ne, true), (IrCmpOp::Eq, false)] {
-            assert!(
-                rewrite(&zero_test_select(ty, op, zero_is_true), None).is_none(),
-                "{ty:?} {op:?} zero_is_true={zero_is_true}"
+            let replacement = rewrite(&zero_test_select(ty, op, zero_is_true), None)
+                .unwrap_or_else(|| panic!("{ty:?} {op:?} zero_is_true={zero_is_true}"));
+            assert!(matches!(
+                replacement.as_slice(),
+                [Instruction::Copy {
+                    src: Operand::Const(c),
+                    ..
+                }] if c.to_i128() == Some(0)
+            ));
+        }
+    }
+}
+
+fn or_chain_select(ty: IrType, true_is_value: bool, chain_len: u8) -> Vec<Instruction> {
+    // v = Value(0); chain = v | Value(1) | Value(2) ...
+    let mut source = Vec::new();
+    let mut node = Value(0);
+    for step in 0..chain_len {
+        let dest = Value(3 + step as u32);
+        source.push(bin(
+            dest,
+            IrBinOp::Or,
+            Operand::Value(node),
+            Operand::Value(Value(1 + step as u32 % 2)),
+            ty,
+        ));
+        node = dest;
+    }
+    let zero = constant(0, ty);
+    let (true_val, false_val) = if true_is_value {
+        (Operand::Value(Value(0)), zero)
+    } else {
+        (zero, Operand::Value(Value(0)))
+    };
+    source.push(Instruction::Select {
+        dest: Value(7),
+        cond: Operand::Value(node),
+        true_val,
+        false_val,
+        ty,
+    });
+    source
+}
+
+#[test]
+fn or_chain_selects_keep_the_implied_arm_and_zero_the_other() {
+    for ty in [
+        IrType::I8,
+        IrType::U8,
+        IrType::I32,
+        IrType::U32,
+        IrType::I64,
+    ] {
+        let ring = mask(ty);
+        for chain_len in 1..=3u8 {
+            // `(v | ...) ? v : 0` is `v`.
+            let source = or_chain_select(ty, true, chain_len);
+            let replacement = rewrite(&source, None)
+                .unwrap_or_else(|| panic!("{ty:?} chain={chain_len} true-arm"));
+            assert!(matches!(
+                replacement.as_slice(),
+                [Instruction::Copy {
+                    src: Operand::Value(Value(0)),
+                    ..
+                }]
+            ));
+            // `(v | ...) ? 0 : v` is the constant zero.
+            let source = or_chain_select(ty, false, chain_len);
+            let replacement = rewrite(&source, None)
+                .unwrap_or_else(|| panic!("{ty:?} chain={chain_len} false-arm"));
+            assert!(matches!(
+                replacement.as_slice(),
+                [Instruction::Copy {
+                    src: Operand::Const(c),
+                    ..
+                }] if c.to_i128() == Some(0)
+            ));
+        }
+        // Exhaustive over the byte ring for the shortest chain: the two spellings
+        // agree with their folded forms for every pair of operands.
+        for v in 0..=255u64 {
+            for b in 0..=255u64 {
+                let v = v & ring;
+                let b = b & ring;
+                let cond = v | b;
+                let select_true = if cond != 0 { v } else { 0 };
+                let select_false = if cond != 0 { 0 } else { v };
+                assert_eq!(select_true, v, "{ty:?} v={v} b={b}");
+                assert_eq!(select_false, 0, "{ty:?} v={v} b={b}");
+            }
+        }
+    }
+}
+
+#[test]
+fn or_chain_selects_refuse_an_unrelated_condition() {
+    let ty = IrType::I32;
+    // The condition no longer mentions the surviving arm.
+    let mut source = or_chain_select(ty, true, 2);
+    let last = source.len() - 1;
+    if let Instruction::Select { cond, .. } = &mut source[last] {
+        *cond = Operand::Value(Value(2));
+    }
+    assert!(rewrite(&source, None).is_none());
+    // An `and` condition is not an implication: `v & b != 0` does not follow
+    // from `v != 0`.
+    let mut source = or_chain_select(ty, true, 1);
+    if let Instruction::BinOp { op, .. } = &mut source[0] {
+        *op = IrBinOp::And;
+    }
+    assert!(rewrite(&source, None).is_none());
+    // A different type on the condition chain is not the same ring.
+    let mut source = or_chain_select(ty, true, 1);
+    if let Instruction::BinOp { ty: t, .. } = &mut source[0] {
+        *t = IrType::I64;
+    }
+    assert!(rewrite(&source, None).is_none());
+}
+
+fn boolean_product(ty: IrType, factor_shape: u8) -> Vec<Instruction> {
+    // x = Value(0); b = a comparison or an or of comparisons; product = x * b.
+    let x = Operand::Value(Value(0));
+    let cmp_a = Instruction::Cmp {
+        dest: Value(1),
+        op: IrCmpOp::Ne,
+        lhs: x,
+        rhs: constant(0, ty),
+        ty,
+    };
+    let cmp_b = Instruction::Cmp {
+        dest: Value(2),
+        op: IrCmpOp::Ne,
+        lhs: Operand::Value(Value(1)),
+        rhs: constant(0, ty),
+        ty,
+    };
+    let factor = match factor_shape {
+        0 => Operand::Value(Value(1)),
+        _ => {
+            return vec![
+                cmp_a,
+                cmp_b,
+                bin(
+                    Value(3),
+                    IrBinOp::Or,
+                    Operand::Value(Value(1)),
+                    Operand::Value(Value(2)),
+                    ty,
+                ),
+                bin(Value(4), IrBinOp::Mul, x, Operand::Value(Value(3)), ty),
+            ];
+        }
+    };
+    vec![cmp_a, bin(Value(4), IrBinOp::Mul, x, factor, ty)]
+}
+
+#[test]
+fn multiply_by_an_implied_boolean_is_the_value() {
+    for ty in [IrType::I8, IrType::I32, IrType::U32] {
+        for shape in 0..2u8 {
+            let source = boolean_product(ty, shape);
+            let replacement =
+                rewrite(&source, None).unwrap_or_else(|| panic!("{ty:?} shape={shape}"));
+            assert!(matches!(
+                replacement.as_slice(),
+                [Instruction::Copy {
+                    src: Operand::Value(Value(0)),
+                    ..
+                }]
+            ));
+        }
+        // Exhaustive byte ring: `x * (x != 0)` is `x`, `x * (x != 0 | b != 0)`
+        // is `x`, for every pair.
+        for x in 0..=255u64 {
+            for b in 0..=255u64 {
+                let x = x & mask(ty);
+                let b = b & mask(ty);
+                let plain = (x != 0) as u64;
+                let chained = ((x != 0) | (b != 0)) as u64;
+                assert_eq!(x.wrapping_mul(plain), x, "{ty:?} x={x}");
+                assert_eq!(x.wrapping_mul(chained), x, "{ty:?} x={x} b={b}");
+            }
+        }
+    }
+}
+
+#[test]
+fn multiply_by_a_non_boolean_or_unrelated_factor_is_refused() {
+    let ty = IrType::I32;
+    // `x * (x + 1)` is not a boolean product.
+    let source = vec![
+        bin(
+            Value(1),
+            IrBinOp::Add,
+            Operand::Value(Value(0)),
+            constant(1, ty),
+            ty,
+        ),
+        bin(
+            Value(2),
+            IrBinOp::Mul,
+            Operand::Value(Value(0)),
+            Operand::Value(Value(1)),
+            ty,
+        ),
+    ];
+    assert!(rewrite(&source, None).is_none());
+    // A comparison against something else says nothing about `x`, but it does
+    // prove the factor is a boolean, so the product becomes a select.
+    let source = vec![
+        Instruction::Cmp {
+            dest: Value(1),
+            op: IrCmpOp::Ne,
+            lhs: Operand::Value(Value(2)),
+            rhs: constant(0, ty),
+            ty,
+        },
+        bin(
+            Value(3),
+            IrBinOp::Mul,
+            Operand::Value(Value(0)),
+            Operand::Value(Value(1)),
+            ty,
+        ),
+    ];
+    let replacement = rewrite(&source, None).expect("a boolean factor is a select");
+    assert!(matches!(
+        replacement.as_slice(),
+        [Instruction::Select {
+            dest: Value(3),
+            cond: Operand::Value(Value(1)),
+            true_val: Operand::Value(Value(0)),
+            false_val: Operand::Const(_),
+            ty: IrType::I32,
+        }]
+    ));
+    // The zero arm is what makes the select equal the product for both
+    // boolean values of the factor.
+    let Instruction::Select { false_val, .. } = &replacement[0] else {
+        unreachable!()
+    };
+    assert!(matches!(false_val, Operand::Const(c) if c.to_i128() == Some(0)));
+}
+
+// ── Select/boolean lattice ───────────────────────────────────────────────────
+//
+// `implied_condition_sense`, `zero_when_zero` and `zero_or_one` decide the
+// select and product folds, so the tests below drive whole straight-line
+// programs through a small interpreter and compare against the source-level
+// value of the same expression.
+
+/// Straight-line interpreter over the instruction subset the tests build.
+/// `params` maps a `Value` with no definition to its concrete value.
+fn interpret(program: &[Instruction], params: &[(u32, u64)], ty: IrType) -> u64 {
+    use std::collections::HashMap;
+    let ring = mask(ty);
+    let mut env: HashMap<u32, u64> = params.iter().map(|&(v, x)| (v, x & ring)).collect();
+    let pick = |env: &HashMap<u32, u64>, op: Operand| match op {
+        Operand::Value(v) => *env.get(&v.0).expect("defined before use"),
+        Operand::Const(c) => c.to_i128().expect("integer constant") as u64 & ring,
+    };
+    for inst in program {
+        let value = match inst {
+            Instruction::Copy { src, .. } => pick(&env, *src),
+            Instruction::Cast { src, .. } => pick(&env, *src),
+            Instruction::Cmp { op, lhs, rhs, .. } => {
+                let (a, b) = (pick(&env, *lhs), pick(&env, *rhs));
+                let signed = signed_value(a, ty);
+                let signed_b = signed_value(b, ty);
+                let held = match op {
+                    IrCmpOp::Eq => a == b,
+                    IrCmpOp::Ne => a != b,
+                    IrCmpOp::Ult => a < b,
+                    IrCmpOp::Ule => a <= b,
+                    IrCmpOp::Ugt => a > b,
+                    IrCmpOp::Uge => a >= b,
+                    IrCmpOp::Slt => signed < signed_b,
+                    IrCmpOp::Sle => signed <= signed_b,
+                    IrCmpOp::Sgt => signed > signed_b,
+                    IrCmpOp::Sge => signed >= signed_b,
+                };
+                u64::from(held)
+            }
+            Instruction::Select {
+                cond,
+                true_val,
+                false_val,
+                ..
+            } => {
+                if pick(&env, *cond) != 0 {
+                    pick(&env, *true_val)
+                } else {
+                    pick(&env, *false_val)
+                }
+            }
+            Instruction::BinOp { op, lhs, rhs, .. } => {
+                let (a, b) = (pick(&env, *lhs), pick(&env, *rhs));
+                let raw = match op {
+                    IrBinOp::And => a & b,
+                    IrBinOp::Or => a | b,
+                    IrBinOp::Xor => a ^ b,
+                    IrBinOp::Add => a.wrapping_add(b),
+                    IrBinOp::Sub => a.wrapping_sub(b),
+                    IrBinOp::Mul => a.wrapping_mul(b),
+                    _ => panic!("operator outside the tested subset"),
+                };
+                raw & ring
+            }
+            Instruction::UnaryOp { op, src, .. } => {
+                let a = pick(&env, *src);
+                match op {
+                    IrUnaryOp::Not => !a & ring,
+                    IrUnaryOp::Neg => a.wrapping_neg() & ring,
+                    _ => panic!("unary operator outside the tested subset"),
+                }
+            }
+            _ => panic!("instruction outside the tested subset"),
+        };
+        env.insert(inst.dest().expect("destination").0, value);
+    }
+    env[&program.last().expect("non-empty").dest().unwrap().0]
+}
+
+#[test]
+fn nested_boolean_selects_collapse_to_the_surviving_value() {
+    // `(a != 0 || b) ? a : 0`, whose `b && ...` arm the front end materialises
+    // as a select: the value arm wins whenever the condition is forced, and the
+    // other arm is zero whenever the value is.
+    let ty = IrType::I32;
+    let source = vec![
+        Instruction::Cmp {
+            dest: Value(1),
+            op: IrCmpOp::Ne,
+            lhs: Operand::Value(Value(0)),
+            rhs: constant(0, ty),
+            ty,
+        },
+        Instruction::Select {
+            dest: Value(2),
+            cond: Operand::Value(Value(4)),
+            true_val: Operand::Value(Value(0)),
+            false_val: constant(0, ty),
+            ty,
+        },
+        Instruction::Select {
+            dest: Value(3),
+            cond: Operand::Value(Value(1)),
+            true_val: Operand::Value(Value(0)),
+            false_val: Operand::Value(Value(2)),
+            ty,
+        },
+    ];
+    let replacement = rewrite(&source, None).expect("the nested select is the value");
+    assert!(matches!(
+        replacement.as_slice(),
+        [Instruction::Copy {
+            dest: Value(3),
+            src: Operand::Value(Value(0)),
+            ..
+        }]
+    ));
+    for a in [0u64, 1, 2, 7, mask(ty)] {
+        for b in [0u64, 1, mask(ty)] {
+            assert_eq!(
+                interpret(&source, &[(0, a), (4, b)], ty),
+                interpret(&replacement, &[(0, a), (4, b)], ty),
+                "a={a} b={b}"
             );
+        }
+    }
+}
+
+#[test]
+fn zero_arm_select_with_a_non_zero_other_arm_is_not_a_constant() {
+    // `x ? x : y` keeps `y` on zero `x`: only a zero other arm makes the select
+    // the value, so this shape must not fold.
+    let ty = IrType::I32;
+    let source = vec![Instruction::Select {
+        dest: Value(1),
+        cond: Operand::Value(Value(0)),
+        true_val: Operand::Value(Value(0)),
+        false_val: Operand::Value(Value(4)),
+        ty,
+    }];
+    assert!(rewrite(&source, None).is_none());
+}
+
+#[test]
+fn boolean_multiply_beats_the_multiplier_for_both_factor_shapes() {
+    let ty = IrType::I32;
+    // `x * ((x != 0) | (b && c))` in the shape the front end emits: the
+    // or/and layers arrive as selects over compares.
+    let source = vec![
+        Instruction::Cmp {
+            dest: Value(1),
+            op: IrCmpOp::Ne,
+            lhs: Operand::Value(Value(4)),
+            rhs: constant(0, ty),
+            ty,
+        },
+        Instruction::Select {
+            dest: Value(2),
+            cond: Operand::Value(Value(5)),
+            true_val: Operand::Value(Value(1)),
+            false_val: constant(0, ty),
+            ty,
+        },
+        Instruction::Select {
+            dest: Value(3),
+            cond: Operand::Value(Value(0)),
+            true_val: constant(1, ty),
+            false_val: Operand::Value(Value(2)),
+            ty,
+        },
+        bin(
+            Value(7),
+            IrBinOp::Mul,
+            Operand::Value(Value(0)),
+            Operand::Value(Value(3)),
+            ty,
+        ),
+    ];
+    let replacement = rewrite(&source, None).expect("the product is the value");
+    assert!(matches!(
+        replacement.as_slice(),
+        [Instruction::Copy {
+            dest: Value(7),
+            src: Operand::Value(Value(0)),
+            ..
+        }]
+    ));
+    let folded = [source[..source.len() - 1].to_vec(), replacement.clone()].concat();
+    for x in [0u64, 1, 3, mask(ty)] {
+        for b in [0u64, 1] {
+            for c in [0u64, 1] {
+                assert_eq!(
+                    interpret(&source, &[(0, x), (4, b), (5, c)], ty),
+                    interpret(&folded, &[(0, x), (4, b), (5, c)], ty),
+                    "x={x} b={b} c={c}"
+                );
+            }
+        }
+    }
+
+    // `(x < y) * x` is not the identity, but the factor is a boolean: the
+    // product becomes the select and the multiplier disappears.
+    let source = vec![
+        Instruction::Cmp {
+            dest: Value(1),
+            op: IrCmpOp::Ult,
+            lhs: Operand::Value(Value(0)),
+            rhs: Operand::Value(Value(4)),
+            ty,
+        },
+        bin(
+            Value(2),
+            IrBinOp::Mul,
+            Operand::Value(Value(1)),
+            Operand::Value(Value(0)),
+            ty,
+        ),
+    ];
+    let replacement = rewrite(&source, None).expect("a boolean factor is a select");
+    assert!(matches!(
+        replacement.as_slice(),
+        [Instruction::Select {
+            dest: Value(2),
+            cond: Operand::Value(Value(1)),
+            ..
+        }]
+    ));
+    let folded = [source[..source.len() - 1].to_vec(), replacement.clone()].concat();
+    for x in [0u64, 1, 5, mask(ty)] {
+        for y in [0u64, 1, 5, mask(ty)] {
+            assert_eq!(
+                interpret(&source, &[(0, x), (4, y)], ty),
+                interpret(&folded, &[(0, x), (4, y)], ty),
+                "x={x} y={y}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_complement_of_a_compare_is_not_a_boolean() {
+    // `~1` is not `0` or `1`, so `x * ((x != 0) | ~(y < z))` must not shrink to
+    // `x`: the bitwise-or of the test and the complement is all ones for a
+    // non-zero `x`, and the product is then `-x`.
+    let ty = IrType::I32;
+    for factor_producer in [true] {
+        let mut source = vec![
+            Instruction::Cmp {
+                dest: Value(1),
+                op: IrCmpOp::Slt,
+                lhs: Operand::Value(Value(4)),
+                rhs: Operand::Value(Value(5)),
+                ty,
+            },
+            Instruction::Cmp {
+                dest: Value(2),
+                op: IrCmpOp::Ne,
+                lhs: Operand::Value(Value(0)),
+                rhs: constant(0, ty),
+                ty,
+            },
+        ];
+        let complemented = if factor_producer { Value(3) } else { Value(2) };
+        source.extend([
+            Instruction::UnaryOp {
+                dest: Value(3),
+                op: IrUnaryOp::Not,
+                src: Operand::Value(Value(1)),
+                ty,
+            },
+            bin(
+                Value(6),
+                IrBinOp::Or,
+                Operand::Value(Value(2)),
+                Operand::Value(complemented),
+                ty,
+            ),
+            bin(
+                Value(7),
+                IrBinOp::Mul,
+                Operand::Value(Value(0)),
+                Operand::Value(Value(6)),
+                ty,
+            ),
+        ]);
+        assert!(
+            rewrite(&source, None).is_none(),
+            "a complement is not a boolean factor"
+        );
+        // The source-level product must be `x * ((x != 0) | ~(y < z))`.
+        for x in [0u64, 1, 3, mask(ty)] {
+            for y in [0u64, 1] {
+                for z in [0u64, 2] {
+                    let params = [(0, x), (4, y), (5, z)];
+                    let complement = !interpret(&source[..1], &params, ty) & mask(ty);
+                    let test = u64::from(x != 0);
+                    let factor = (test | complement) & mask(ty);
+                    assert_eq!(
+                        interpret(&source, &params, ty),
+                        x.wrapping_mul(factor) & mask(ty)
+                    );
+                }
+            }
         }
     }
 }

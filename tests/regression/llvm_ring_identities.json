@@ -1,10 +1,11 @@
 {
-  "forms": 19,
+  "forms": 27,
   "survivors": 1,
   "promotion_boundary": [
     "ring_srem_eq16",
     "ring_srem_eq8",
-    "ring_srem_ne16"
+    "ring_srem_ne16",
+    "ring_urem_pow2"
   ],
   "correct": true,
   "timing_claim": false,
@@ -13,175 +14,301 @@
     {
       "name": "ring_srem_eq_250",
       "idiom": "srem",
+      "divider_in_control": false,
       "instructions": {
         "enabled": 5,
         "disabled-subpass": 14,
-        "disabled-pass": 14
+        "disabled-pass": 14,
+        "disabled-div": 8
       }
     },
     {
       "name": "ring_srem_ne_250",
       "idiom": "srem",
+      "divider_in_control": false,
       "instructions": {
         "enabled": 5,
         "disabled-subpass": 14,
-        "disabled-pass": 14
+        "disabled-pass": 14,
+        "disabled-div": 8
       }
     },
     {
       "name": "ring_srem_eq_min",
       "idiom": "srem",
+      "divider_in_control": true,
       "instructions": {
         "enabled": 6,
         "disabled-subpass": 8,
-        "disabled-pass": 8
+        "disabled-pass": 8,
+        "disabled-div": 8
       }
     },
     {
       "name": "ring_srem_ne_min",
       "idiom": "srem",
+      "divider_in_control": true,
       "instructions": {
         "enabled": 6,
         "disabled-subpass": 8,
-        "disabled-pass": 8
+        "disabled-pass": 8,
+        "disabled-div": 8
       }
     },
     {
       "name": "ring_srem_eq_neg7",
       "idiom": "srem",
+      "divider_in_control": false,
       "instructions": {
         "enabled": 5,
         "disabled-subpass": 14,
-        "disabled-pass": 14
+        "disabled-pass": 14,
+        "disabled-div": 8
       }
     },
     {
       "name": "ring_srem_eq32",
       "idiom": "srem",
+      "divider_in_control": false,
       "instructions": {
         "enabled": 5,
         "disabled-subpass": 14,
-        "disabled-pass": 14
+        "disabled-pass": 14,
+        "disabled-div": 8
       }
     },
     {
       "name": "ring_srem_ne32",
       "idiom": "srem",
+      "divider_in_control": false,
       "instructions": {
         "enabled": 5,
         "disabled-subpass": 14,
-        "disabled-pass": 14
+        "disabled-pass": 14,
+        "disabled-div": 8
       }
     },
     {
       "name": "ring_sign_shift",
       "idiom": "shift",
+      "divider_in_control": false,
       "instructions": {
         "enabled": 4,
         "disabled-subpass": 9,
-        "disabled-pass": 9
+        "disabled-pass": 9,
+        "disabled-div": 9
       }
     },
     {
       "name": "ring_sign_shift64",
       "idiom": "shift",
+      "divider_in_control": false,
       "instructions": {
         "enabled": 4,
         "disabled-subpass": 9,
-        "disabled-pass": 9
+        "disabled-pass": 9,
+        "disabled-div": 9
       }
     },
     {
       "name": "ring_not_neg",
       "idiom": "complement",
+      "divider_in_control": false,
       "instructions": {
         "enabled": 2,
         "disabled-subpass": 4,
-        "disabled-pass": 4
+        "disabled-pass": 4,
+        "disabled-div": 4
       }
     },
     {
       "name": "ring_neg_not",
       "idiom": "complement",
+      "divider_in_control": false,
       "instructions": {
         "enabled": 2,
         "disabled-subpass": 4,
-        "disabled-pass": 4
+        "disabled-pass": 4,
+        "disabled-div": 4
       }
     },
     {
       "name": "ring_not_neg16",
       "idiom": "complement",
+      "divider_in_control": false,
       "instructions": {
         "enabled": 4,
         "disabled-subpass": 5,
-        "disabled-pass": 5
+        "disabled-pass": 5,
+        "disabled-div": 5
       }
     },
     {
       "name": "ring_neg_not64",
       "idiom": "complement",
+      "divider_in_control": false,
       "instructions": {
         "enabled": 2,
         "disabled-subpass": 4,
-        "disabled-pass": 4
+        "disabled-pass": 4,
+        "disabled-div": 4
       }
     },
     {
       "name": "ring_min_imax",
       "idiom": "bound",
+      "divider_in_control": false,
       "instructions": {
         "enabled": 2,
         "disabled-subpass": 4,
-        "disabled-pass": 4
+        "disabled-pass": 4,
+        "disabled-div": 4
       }
     },
     {
       "name": "ring_max_imin",
       "idiom": "bound",
+      "divider_in_control": false,
       "instructions": {
         "enabled": 2,
         "disabled-subpass": 4,
-        "disabled-pass": 4
+        "disabled-pass": 4,
+        "disabled-div": 4
       }
     },
     {
       "name": "ring_min_umax",
       "idiom": "bound",
+      "divider_in_control": false,
       "instructions": {
         "enabled": 2,
         "disabled-subpass": 5,
-        "disabled-pass": 5
+        "disabled-pass": 5,
+        "disabled-div": 5
       }
     },
     {
       "name": "ring_max_u0",
       "idiom": "bound",
+      "divider_in_control": false,
       "instructions": {
         "enabled": 2,
         "disabled-subpass": 4,
-        "disabled-pass": 4
+        "disabled-pass": 4,
+        "disabled-div": 4
       }
     },
     {
       "name": "ring_min_imax64",
       "idiom": "bound",
+      "divider_in_control": false,
       "instructions": {
         "enabled": 2,
         "disabled-subpass": 6,
-        "disabled-pass": 6
+        "disabled-pass": 6,
+        "disabled-div": 6
       }
     },
     {
       "name": "ring_max_imin64",
       "idiom": "bound",
+      "divider_in_control": false,
       "instructions": {
         "enabled": 2,
         "disabled-subpass": 6,
-        "disabled-pass": 6
+        "disabled-pass": 6,
+        "disabled-div": 6
+      }
+    },
+    {
+      "name": "ring_zero_select",
+      "idiom": "bound",
+      "divider_in_control": false,
+      "instructions": {
+        "enabled": 2,
+        "disabled-subpass": 4,
+        "disabled-pass": 4,
+        "disabled-div": 4
+      }
+    },
+    {
+      "name": "ring_zero_constant_eq",
+      "idiom": "bound",
+      "divider_in_control": false,
+      "instructions": {
+        "enabled": 2,
+        "disabled-subpass": 5,
+        "disabled-pass": 5,
+        "disabled-div": 5
+      }
+    },
+    {
+      "name": "ring_or_chain_value",
+      "idiom": "orchain",
+      "divider_in_control": false,
+      "instructions": {
+        "enabled": 2,
+        "disabled-subpass": 5,
+        "disabled-pass": 5,
+        "disabled-div": 5
+      }
+    },
+    {
+      "name": "ring_or_chain_zero",
+      "idiom": "orchain",
+      "divider_in_control": false,
+      "instructions": {
+        "enabled": 2,
+        "disabled-subpass": 6,
+        "disabled-pass": 6,
+        "disabled-div": 6
+      }
+    },
+    {
+      "name": "ring_srem_pow2_32",
+      "idiom": "pow2rem",
+      "divider_in_control": true,
+      "instructions": {
+        "enabled": 8,
+        "disabled-subpass": 8,
+        "disabled-pass": 8,
+        "disabled-div": 6
+      }
+    },
+    {
+      "name": "ring_srem_pow2_64",
+      "idiom": "pow2rem",
+      "divider_in_control": true,
+      "instructions": {
+        "enabled": 8,
+        "disabled-subpass": 8,
+        "disabled-pass": 8,
+        "disabled-div": 6
+      }
+    },
+    {
+      "name": "ring_srem_pow2_neg",
+      "idiom": "pow2rem",
+      "divider_in_control": true,
+      "instructions": {
+        "enabled": 8,
+        "disabled-subpass": 8,
+        "disabled-pass": 8,
+        "disabled-div": 6
+      }
+    },
+    {
+      "name": "ring_sdiv_pow2_32",
+      "idiom": "pow2div",
+      "divider_in_control": true,
+      "instructions": {
+        "enabled": 7,
+        "disabled-subpass": 7,
+        "disabled-pass": 7,
+        "disabled-div": 5
       }
     }
   ],
-  "improved_vs_disabled": 19,
+  "improved_vs_disabled": 27,
   "note": "The disabled sub-pass control is a policy switch, not an immutable baseline."
 }

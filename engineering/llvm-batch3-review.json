@@ -4,17 +4,17 @@
  "oracle": "gcc-16 16.2.0 (-O2), plus the lccc build under test",
  "verdicts": {
   "already-at-oracle": 16,
-  "other-language": 21,
+  "confirmed-gap-deferred": 30,
+  "folded-this-batch": 7,
+  "fp-semantics": 44,
+  "loop-or-cfg": 86,
+  "memory-or-abi": 44,
   "needs-ub-premise": 108,
-  "folded-this-batch": 5,
+  "non-x86-target": 27,
+  "other-language": 21,
   "scalar-unprobed": 54,
   "vector-or-simd": 53,
-  "non-x86-target": 27,
-  "loop-or-cfg": 86,
-  "fp-semantics": 44,
-  "x86-only-isa": 10,
-  "memory-or-abi": 44,
-  "confirmed-gap-deferred": 32
+  "x86-only-isa": 10
  },
  "reviewed": 58,
  "rows": [
@@ -552,7 +552,14 @@
    "created": "2026-05-30T09:18:03Z",
    "verdict": "confirmed-gap-deferred",
    "evidence": "measured",
-   "reason": "measured gap (lccc 6 vs GCC 4 instructions): demanded-bits analysis on the low bit before the select"
+   "reason": "measured gap (lccc 6 vs GCC 4 instructions): demanded-bits analysis on the low bit before the select",
+   "batch4": {
+    "lccc": 6,
+    "lccc_folds_off": 6,
+    "lccc_passes_off": 6,
+    "gcc": 4,
+    "status": "gap"
+   }
   },
   {
    "issue": 200538,
@@ -560,7 +567,14 @@
    "created": "2026-05-30T01:27:25Z",
    "verdict": "confirmed-gap-deferred",
    "evidence": "measured",
-   "reason": "measured gap (lccc 7 vs GCC 4 instructions): needs a range fact on a runtime shift count (x < 1); lccc has no shift-count range analysis"
+   "reason": "measured gap (lccc 7 vs GCC 4 instructions): needs a range fact on a runtime shift count (x < 1); lccc has no shift-count range analysis",
+   "batch4": {
+    "lccc": 7,
+    "lccc_folds_off": 7,
+    "lccc_passes_off": 7,
+    "gcc": 4,
+    "status": "gap"
+   }
   },
   {
    "issue": 200511,
@@ -680,7 +694,14 @@
    "created": "2026-04-24T06:02:00Z",
    "verdict": "confirmed-gap-deferred",
    "evidence": "measured",
-   "reason": "measured gap (lccc 5 vs GCC 4 instructions): reassociation of an or-of-shift-add chain"
+   "reason": "measured gap (lccc 5 vs GCC 4 instructions): reassociation of an or-of-shift-add chain",
+   "batch4": {
+    "lccc": 4,
+    "lccc_folds_off": 4,
+    "lccc_passes_off": 4,
+    "gcc": 4,
+    "status": "at-or-better"
+   }
   },
   {
    "issue": 192221,
@@ -728,7 +749,14 @@
    "created": "2026-04-08T04:37:24Z",
    "verdict": "confirmed-gap-deferred",
    "evidence": "measured",
-   "reason": "measured gap (lccc 8 vs GCC 7 instructions): multiply reassociation through a select"
+   "reason": "measured gap (lccc 8 vs GCC 7 instructions): multiply reassociation through a select",
+   "batch4": {
+    "lccc": 8,
+    "lccc_folds_off": 8,
+    "lccc_passes_off": 8,
+    "gcc": 7,
+    "status": "gap"
+   }
   },
   {
    "issue": 189320,
@@ -768,7 +796,14 @@
    "created": "2026-03-17T16:52:04Z",
    "verdict": "confirmed-gap-deferred",
    "evidence": "measured",
-   "reason": "measured gap (lccc 10 vs GCC 9 instructions): reassociation across two saturating selects (smin + smax = identity needs both extremes proven from one compare)"
+   "reason": "measured gap (lccc 10 vs GCC 9 instructions): reassociation across two saturating selects (smin + smax = identity needs both extremes proven from one compare)",
+   "batch4": {
+    "lccc": 10,
+    "lccc_folds_off": 10,
+    "lccc_passes_off": 10,
+    "gcc": 9,
+    "status": "gap"
+   }
   },
   {
    "issue": 186559,
@@ -1368,7 +1403,14 @@
    "created": "2025-10-12T17:57:37Z",
    "verdict": "confirmed-gap-deferred",
    "evidence": "measured",
-   "reason": "measured gap (lccc 13 vs GCC 7 instructions): divisibility test plus a scaled bound check"
+   "reason": "measured gap (lccc 13 vs GCC 7 instructions): divisibility test plus a scaled bound check",
+   "batch4": {
+    "lccc": 10,
+    "lccc_folds_off": 10,
+    "lccc_passes_off": 10,
+    "gcc": 7,
+    "status": "gap"
+   }
   },
   {
    "issue": 162599,
@@ -1432,7 +1474,14 @@
    "created": "2025-09-08T18:04:57Z",
    "verdict": "confirmed-gap-deferred",
    "evidence": "measured",
-   "reason": "measured gap (lccc 9 vs GCC 4 instructions): needs no-overflow reasoning on `a - b`, i.e. the sub-with-sign-flag family"
+   "reason": "measured gap (lccc 9 vs GCC 4 instructions): needs no-overflow reasoning on `a - b`, i.e. the sub-with-sign-flag family",
+   "batch4": {
+    "lccc": 9,
+    "lccc_folds_off": 9,
+    "lccc_passes_off": 9,
+    "gcc": 4,
+    "status": "gap"
+   }
   },
   {
    "issue": 157486,
@@ -1472,7 +1521,14 @@
    "created": "2025-09-07T23:16:13Z",
    "verdict": "confirmed-gap-deferred",
    "evidence": "measured",
-   "reason": "measured gap (lccc 15 vs GCC 14 instructions): divisor divisibility reasoning across two remainders"
+   "reason": "measured gap (lccc 15 vs GCC 14 instructions): divisor divisibility reasoning across two remainders",
+   "batch4": {
+    "lccc": 20,
+    "lccc_folds_off": 20,
+    "lccc_passes_off": 10,
+    "gcc": 19,
+    "status": "gap"
+   }
   },
   {
    "issue": 157316,
@@ -1504,7 +1560,14 @@
    "created": "2025-09-04T14:50:38Z",
    "verdict": "confirmed-gap-deferred",
    "evidence": "measured",
-   "reason": "measured gap (lccc 5 vs GCC 4 instructions): needs a known-bits fact on the shifted mask before the truncation"
+   "reason": "measured gap (lccc 5 vs GCC 4 instructions): needs a known-bits fact on the shifted mask before the truncation",
+   "batch4": {
+    "lccc": 4,
+    "lccc_folds_off": 4,
+    "lccc_passes_off": 4,
+    "gcc": 4,
+    "status": "at-or-better"
+   }
   },
   {
    "issue": 154258,
@@ -1550,9 +1613,16 @@
    "issue": 154025,
    "title": "Missed optimization: fold (x0 | x1 | x2 != 0 ? True : C) ? x0 : 0 -> x0",
    "created": "2025-08-17T17:28:02Z",
-   "verdict": "confirmed-gap-deferred",
+   "verdict": "folded-this-batch",
    "evidence": "measured",
-   "reason": "measured gap (lccc 5 vs GCC 2 instructions): boolean-structure canonicalisation across an or-chain feeding a select"
+   "reason": "batch 4: the select-implication lattice and the boolean product rule fold this idiom to the same instruction count GCC 16.2 emits",
+   "batch4": {
+    "lccc": 2,
+    "lccc_folds_off": 5,
+    "lccc_passes_off": 5,
+    "gcc": 2,
+    "status": "at-or-better"
+   }
   },
   {
    "issue": 154022,
@@ -1664,7 +1734,14 @@
    "created": "2025-07-28T13:38:46Z",
    "verdict": "confirmed-gap-deferred",
    "evidence": "measured",
-   "reason": "measured gap (lccc 3 vs GCC 2 instructions): bit-count intrinsic recognition with the complement width"
+   "reason": "measured gap (lccc 3 vs GCC 2 instructions): bit-count intrinsic recognition with the complement width",
+   "batch4": {
+    "lccc": 3,
+    "lccc_folds_off": 3,
+    "lccc_passes_off": 3,
+    "gcc": 2,
+    "status": "gap"
+   }
   },
   {
    "issue": 150606,
@@ -1952,7 +2029,14 @@
    "created": "2025-05-26T11:39:48Z",
    "verdict": "confirmed-gap-deferred",
    "evidence": "measured",
-   "reason": "measured gap (lccc 11 vs GCC 9 instructions): contradiction detection between two complemented compares"
+   "reason": "measured gap (lccc 11 vs GCC 9 instructions): contradiction detection between two complemented compares",
+   "batch4": {
+    "lccc": 11,
+    "lccc_folds_off": 11,
+    "lccc_passes_off": 11,
+    "gcc": 10,
+    "status": "gap"
+   }
   },
   {
    "issue": 139810,
@@ -2304,7 +2388,14 @@
    "created": "2025-01-10T11:34:12Z",
    "verdict": "confirmed-gap-deferred",
    "evidence": "measured",
-   "reason": "measured gap (lccc 12 vs GCC 10 instructions): digit extraction: needs a combined div/rem decomposition of one divisor pair"
+   "reason": "measured gap (lccc 12 vs GCC 10 instructions): digit extraction: needs a combined div/rem decomposition of one divisor pair",
+   "batch4": {
+    "lccc": 17,
+    "lccc_folds_off": 17,
+    "lccc_passes_off": 9,
+    "gcc": 14,
+    "status": "gap"
+   }
   },
   {
    "issue": 121853,
@@ -2336,7 +2427,14 @@
    "created": "2024-11-23T15:12:11Z",
    "verdict": "confirmed-gap-deferred",
    "evidence": "measured",
-   "reason": "measured gap (lccc 8 vs GCC 4 instructions): implication reasoning across two compares"
+   "reason": "measured gap (lccc 8 vs GCC 4 instructions): implication reasoning across two compares",
+   "batch4": {
+    "lccc": 8,
+    "lccc_folds_off": 8,
+    "lccc_passes_off": 8,
+    "gcc": 7,
+    "status": "gap"
+   }
   },
   {
    "issue": 117332,
@@ -2440,7 +2538,14 @@
    "created": "2024-09-12T20:50:21Z",
    "verdict": "confirmed-gap-deferred",
    "evidence": "measured",
-   "reason": "measured gap (lccc 5 vs GCC 4 instructions): reassociation of a subtract/add/multiply chain (needs a value-numbering view)"
+   "reason": "measured gap (lccc 5 vs GCC 4 instructions): reassociation of a subtract/add/multiply chain (needs a value-numbering view)",
+   "batch4": {
+    "lccc": 5,
+    "lccc_folds_off": 5,
+    "lccc_passes_off": 5,
+    "gcc": 4,
+    "status": "gap"
+   }
   },
   {
    "issue": 108052,
@@ -2456,7 +2561,14 @@
    "created": "2024-09-04T12:19:07Z",
    "verdict": "confirmed-gap-deferred",
    "evidence": "measured",
-   "reason": "measured gap (lccc 6 vs GCC 5 instructions): needs known-bits/demanded-bits analysis: the identity holds only because the low bits are provably zero after `& ~a`"
+   "reason": "measured gap (lccc 6 vs GCC 5 instructions): needs known-bits/demanded-bits analysis: the identity holds only because the low bits are provably zero after `& ~a`",
+   "batch4": {
+    "lccc": 6,
+    "lccc_folds_off": 6,
+    "lccc_passes_off": 6,
+    "gcc": 5,
+    "status": "gap"
+   }
   },
   {
    "issue": 106554,
@@ -2608,7 +2720,14 @@
    "created": "2024-06-15T02:52:35Z",
    "verdict": "confirmed-gap-deferred",
    "evidence": "measured",
-   "reason": "measured gap (lccc 11 vs GCC 10 instructions): boolean algebra across a logical-and of a compare and a variable"
+   "reason": "measured gap (lccc 11 vs GCC 10 instructions): boolean algebra across a logical-and of a compare and a variable",
+   "batch4": {
+    "lccc": 11,
+    "lccc_folds_off": 11,
+    "lccc_passes_off": 11,
+    "gcc": 10,
+    "status": "gap"
+   }
   },
   {
    "issue": 95255,
@@ -2640,7 +2759,14 @@
    "created": "2024-05-21T21:28:13Z",
    "verdict": "confirmed-gap-deferred",
    "evidence": "measured",
-   "reason": "measured gap (lccc 17 vs GCC 7 instructions): xor-of-predicates canonicalisation"
+   "reason": "measured gap (lccc 17 vs GCC 7 instructions): xor-of-predicates canonicalisation",
+   "batch4": {
+    "lccc": 9,
+    "lccc_folds_off": 9,
+    "lccc_passes_off": 9,
+    "gcc": 7,
+    "status": "gap"
+   }
   },
   {
    "issue": 92554,
@@ -2656,7 +2782,14 @@
    "created": "2024-05-14T06:48:09Z",
    "verdict": "confirmed-gap-deferred",
    "evidence": "measured",
-   "reason": "measured gap (lccc 9 vs GCC 7 instructions): power-of-two remainder belongs to div_by_const's strength-reduction table, which currently routes it through the magic-multiply path"
+   "reason": "measured gap (lccc 9 vs GCC 7 instructions): power-of-two remainder belongs to div_by_const's strength-reduction table, which currently routes it through the magic-multiply path",
+   "batch4": {
+    "lccc": 8,
+    "lccc_folds_off": 8,
+    "lccc_passes_off": 6,
+    "gcc": 7,
+    "status": "gap"
+   }
   },
   {
    "issue": 91780,
@@ -2824,7 +2957,14 @@
    "created": "2024-03-21T18:53:34Z",
    "verdict": "confirmed-gap-deferred",
    "evidence": "measured",
-   "reason": "measured gap (lccc 7 vs GCC 4 instructions): outside the ring-identity contract"
+   "reason": "measured gap (lccc 7 vs GCC 4 instructions): outside the ring-identity contract",
+   "batch4": {
+    "lccc": 7,
+    "lccc_folds_off": 7,
+    "lccc_passes_off": 7,
+    "gcc": 4,
+    "status": "gap"
+   }
   },
   {
    "issue": 86171,
@@ -2832,7 +2972,14 @@
    "created": "2024-03-21T18:40:50Z",
    "verdict": "confirmed-gap-deferred",
    "evidence": "measured",
-   "reason": "measured gap (lccc 11 vs GCC 10 instructions): rotate/funnel-shift family combined with multiply reassociation"
+   "reason": "measured gap (lccc 11 vs GCC 10 instructions): rotate/funnel-shift family combined with multiply reassociation",
+   "batch4": {
+    "lccc": 4,
+    "lccc_folds_off": 4,
+    "lccc_passes_off": 9,
+    "gcc": 4,
+    "status": "at-or-better"
+   }
   },
   {
    "issue": 86161,
@@ -2848,7 +2995,14 @@
    "created": "2024-03-20T14:28:24Z",
    "verdict": "confirmed-gap-deferred",
    "evidence": "measured",
-   "reason": "measured gap (lccc 5 vs GCC 4 instructions): shift-operand narrowing across a widening cast"
+   "reason": "measured gap (lccc 5 vs GCC 4 instructions): shift-operand narrowing across a widening cast",
+   "batch4": {
+    "lccc": 4,
+    "lccc_folds_off": 4,
+    "lccc_passes_off": 4,
+    "gcc": 3,
+    "status": "gap"
+   }
   },
   {
    "issue": 85844,
@@ -2856,7 +3010,14 @@
    "created": "2024-03-19T18:38:37Z",
    "verdict": "confirmed-gap-deferred",
    "evidence": "measured",
-   "reason": "measured gap (lccc 7 vs GCC 6 instructions): range-based select canonicalisation to smin"
+   "reason": "measured gap (lccc 7 vs GCC 6 instructions): range-based select canonicalisation to smin",
+   "batch4": {
+    "lccc": 7,
+    "lccc_folds_off": 7,
+    "lccc_passes_off": 7,
+    "gcc": 6,
+    "status": "gap"
+   }
   },
   {
    "issue": 85836,
@@ -2880,7 +3041,14 @@
    "created": "2024-03-19T17:27:27Z",
    "verdict": "confirmed-gap-deferred",
    "evidence": "measured",
-   "reason": "measured gap (lccc 6 vs GCC 4 instructions): needs the cast to be narrowed to the compared width"
+   "reason": "measured gap (lccc 6 vs GCC 4 instructions): needs the cast to be narrowed to the compared width",
+   "batch4": {
+    "lccc": 6,
+    "lccc_folds_off": 6,
+    "lccc_passes_off": 6,
+    "gcc": 4,
+    "status": "gap"
+   }
   },
   {
    "issue": 85823,
@@ -2942,9 +3110,16 @@
    "issue": 84432,
    "title": "Missed optimization: x*(x||(b&&c)) => x",
    "created": "2024-03-08T05:36:50Z",
-   "verdict": "confirmed-gap-deferred",
+   "verdict": "folded-this-batch",
    "evidence": "measured",
-   "reason": "measured gap (lccc 13 vs GCC 2 instructions): boolean algebra with a multiply: the fold needs the non-zero arm proven by the compare"
+   "reason": "batch 4: the select-implication lattice and the boolean product rule fold this idiom to the same instruction count GCC 16.2 emits",
+   "batch4": {
+    "lccc": 2,
+    "lccc_folds_off": 13,
+    "lccc_passes_off": 13,
+    "gcc": 2,
+    "status": "at-or-better"
+   }
   },
   {
    "issue": 84401,
@@ -3360,7 +3535,14 @@
    "created": "2023-12-10T06:20:15Z",
    "verdict": "confirmed-gap-deferred",
    "evidence": "measured",
-   "reason": "measured gap (lccc 5 vs GCC 4 instructions): count-trailing-ones intrinsic recognition"
+   "reason": "measured gap (lccc 5 vs GCC 4 instructions): count-trailing-ones intrinsic recognition",
+   "batch4": {
+    "lccc": 5,
+    "lccc_folds_off": 5,
+    "lccc_passes_off": 5,
+    "gcc": 4,
+    "status": "gap"
+   }
   },
   {
    "issue": 74975,
@@ -3408,7 +3590,14 @@
    "created": "2023-12-05T08:37:42Z",
    "verdict": "confirmed-gap-deferred",
    "evidence": "measured",
-   "reason": "measured gap (lccc 6 vs GCC 4 instructions): branch-to-setcc control-flow rewrite"
+   "reason": "measured gap (lccc 6 vs GCC 4 instructions): branch-to-setcc control-flow rewrite",
+   "batch4": {
+    "lccc": 6,
+    "lccc_folds_off": 6,
+    "lccc_passes_off": 6,
+    "gcc": 4,
+    "status": "gap"
+   }
   },
   {
    "issue": 74432,
@@ -3456,7 +3645,14 @@
    "created": "2023-11-16T13:12:49Z",
    "verdict": "confirmed-gap-deferred",
    "evidence": "measured",
-   "reason": "measured gap (lccc 6 vs GCC 4 instructions): reassociation across a wrapping add: the compare must be re-expressed in another operand order, which is the reassociation family's contract, not an identity closed over one operand set"
+   "reason": "measured gap (lccc 6 vs GCC 4 instructions): reassociation across a wrapping add: the compare must be re-expressed in another operand order, which is the reassociation family's contract, not an identity closed over one operand set",
+   "batch4": {
+    "lccc": 6,
+    "lccc_folds_off": 6,
+    "lccc_passes_off": 6,
+    "gcc": 4,
+    "status": "gap"
+   }
   },
   {
    "issue": 72378,
@@ -3496,7 +3692,14 @@
    "created": "2023-11-10T15:05:01Z",
    "verdict": "confirmed-gap-deferred",
    "evidence": "measured",
-   "reason": "measured gap (lccc 6 vs GCC 5 instructions): reassociation of a shift/add/subtract chain"
+   "reason": "measured gap (lccc 6 vs GCC 5 instructions): reassociation of a shift/add/subtract chain",
+   "batch4": {
+    "lccc": 6,
+    "lccc_folds_off": 6,
+    "lccc_passes_off": 6,
+    "gcc": 5,
+    "status": "gap"
+   }
   },
   {
    "issue": 71789,
@@ -3512,7 +3715,14 @@
    "created": "2023-11-07T13:09:34Z",
    "verdict": "confirmed-gap-deferred",
    "evidence": "measured",
-   "reason": "measured gap (lccc 12 vs GCC 9 instructions): div/rem decomposition plus a parity test"
+   "reason": "measured gap (lccc 12 vs GCC 9 instructions): div/rem decomposition plus a parity test",
+   "batch4": {
+    "lccc": 5,
+    "lccc_folds_off": 5,
+    "lccc_passes_off": 5,
+    "gcc": 6,
+    "status": "at-or-better"
+   }
   },
   {
    "issue": 71316,
@@ -3784,7 +3994,14 @@
    "created": "2023-08-01T12:22:37Z",
    "verdict": "confirmed-gap-deferred",
    "evidence": "measured",
-   "reason": "measured gap (lccc 10 vs GCC 8 instructions): Euclid-remainder form needs the a < b guard to bound the remainder"
+   "reason": "measured gap (lccc 10 vs GCC 8 instructions): Euclid-remainder form needs the a < b guard to bound the remainder",
+   "batch4": {
+    "lccc": 10,
+    "lccc_folds_off": 10,
+    "lccc_passes_off": 10,
+    "gcc": 8,
+    "status": "gap"
+   }
   },
   {
    "issue": 64240,
@@ -3912,7 +4129,14 @@
    "created": "2023-06-06T15:31:32Z",
    "verdict": "confirmed-gap-deferred",
    "evidence": "measured",
-   "reason": "measured gap (lccc 6 vs GCC 5 instructions): masked-compare narrowing across two operands"
+   "reason": "measured gap (lccc 6 vs GCC 5 instructions): masked-compare narrowing across two operands",
+   "batch4": {
+    "lccc": 6,
+    "lccc_folds_off": 6,
+    "lccc_passes_off": 6,
+    "gcc": 6,
+    "status": "at-or-better"
+   }
   },
   {
    "issue": 62845,
@@ -4018,5 +4242,7 @@
    "evidence": "measured",
    "reason": "folded here: -(~n) is n + 1 by the complement-of-negation identity (measured 4 -> 2, at oracle parity)"
   }
- ]
+ ],
+ "batch4_audit": "engineering/llvm-batch4-audit.json",
+ "batch4_note": "rows carrying a `batch4` object were re-transcribed and re-measured after the batch-4 folds"
 }
