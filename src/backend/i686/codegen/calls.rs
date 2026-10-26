@@ -393,9 +393,15 @@ impl I686Codegen {
         // GP argument registers; nothing after this point touches an XMM
         // register before the call.
         for (i, ac) in arg_classes.iter().enumerate() {
-            if let call_abi::CallArgClass::StructXmmReg { reg_idx, .. } = ac {
+            if let call_abi::CallArgClass::StructXmmReg { reg_idx, size } = ac {
                 self.operand_to_eax(&args[i]);
-                emit!(self.state, "    movups (%eax), %xmm{}", reg_idx);
+                let (instruction, register) = match size {
+                    16 => ("movups", format!("xmm{reg_idx}")),
+                    32 => ("vmovups", format!("ymm{reg_idx}")),
+                    64 => ("vmovups", format!("zmm{reg_idx}")),
+                    _ => unreachable!("invalid native vector argument width"),
+                };
+                emit!(self.state, "    {} (%eax), %{}", instruction, register);
             }
         }
         if self.current_call_regparm == 0 {
@@ -653,6 +659,28 @@ impl I686Codegen {
         if stack_arg_space > 0 {
             emit!(self.state, "    addl ${}, %esp", stack_arg_space);
             self.esp_adjust -= stack_arg_space as i64;
+        }
+    }
+
+    pub(super) fn emit_call_store_vector_return_impl(
+        &mut self,
+        buffer: &Operand,
+        bytes: usize,
+        dest: Option<&Value>,
+    ) {
+        // The call clobbered EAX, including a previously cached buffer
+        // address (particularly after an indirect call).
+        self.state.reg_cache.invalidate_all();
+        self.operand_to_eax(buffer);
+        let register = match bytes {
+            32 => "ymm0",
+            64 => "zmm0",
+            _ => unreachable!("invalid wide vector return width"),
+        };
+        emit!(self.state, "    vmovups %{}, (%eax)", register);
+        self.state.invalidate_vec_peephole();
+        if let Some(dest) = dest {
+            self.store_eax_to(dest);
         }
     }
 

@@ -621,7 +621,26 @@ class CallSiteWiringTests(unittest.TestCase):
                     continue
                 if not any(kw.arg == 'filter' for kw in node.keywords):
                     continue
-                if owner.get(id(node)) not in guarded:
+                if rel == 'scripts/restore_toolchain_cache.py' and owner.get(id(node)) == 'unpack':
+                    # This restorer deliberately refuses old extractors rather
+                    # than falling back to an unfiltered extraction. Require
+                    # its capability gate to dominate every body statement;
+                    # merely naming a function "unpack" grants no exemption.
+                    function = next(n for n in tree.body
+                                    if isinstance(n, ast.FunctionDef) and n.name == 'unpack')
+                    guard = function.body[0]
+                    safe = (isinstance(guard, ast.If)
+                            and isinstance(guard.test, ast.UnaryOp)
+                            and isinstance(guard.test.op, ast.Not)
+                            and isinstance(guard.test.operand, ast.Call)
+                            and isinstance(guard.test.operand.func, ast.Name)
+                            and guard.test.operand.func.id == 'extractall_takes_filter'
+                            and len(guard.body) == 1
+                            and isinstance(guard.body[0], ast.Raise)
+                            and not guard.orelse)
+                    if not safe:
+                        offenders.append(f'{rel}:{node.lineno}')
+                elif owner.get(id(node)) not in guarded:
                     offenders.append(f'{rel}:{node.lineno}')
         self.assertEqual(offenders, [],
                          'these pass filter= to extractall without a version '

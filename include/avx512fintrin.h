@@ -21,7 +21,7 @@ typedef unsigned long long __mmask64;
 static __inline__ __m512i __attribute__((__always_inline__))
 _mm512_setzero_si512(void)
 {
-    return (__m512i){ { 0LL, 0LL, 0LL, 0LL, 0LL, 0LL, 0LL, 0LL } };
+    return (__m512i){  0LL, 0LL, 0LL, 0LL, 0LL, 0LL, 0LL, 0LL  };
 }
 
 
@@ -44,7 +44,7 @@ _mm512_loadu_ps(void const *__p)
     __m512 __r;
     const float *__fp = (const float *)__p;
     for (int __i = 0; __i < 16; __i++)
-        __r.__val[__i] = __fp[__i];
+        __r[__i] = __fp[__i];
     return __r;
 }
 
@@ -53,7 +53,7 @@ _mm512_storeu_ps(void *__p, __m512 __a)
 {
     float *__fp = (float *)__p;
     for (int __i = 0; __i < 16; __i++)
-        __fp[__i] = __a.__val[__i];
+        __fp[__i] = __a[__i];
 }
 
 /* === Float Set === */
@@ -63,7 +63,7 @@ _mm512_setzero_ps(void)
 {
     __m512 __r;
     for (int __i = 0; __i < 16; __i++)
-        __r.__val[__i] = 0.0f;
+        __r[__i] = 0.0f;
     return __r;
 }
 
@@ -74,7 +74,7 @@ _mm512_add_ps(__m512 __a, __m512 __b)
 {
     __m512 __r;
     for (int __i = 0; __i < 16; __i++)
-        __r.__val[__i] = __a.__val[__i] + __b.__val[__i];
+        __r[__i] = __a[__i] + __b[__i];
     return __r;
 }
 
@@ -83,7 +83,7 @@ _mm512_mul_ps(__m512 __a, __m512 __b)
 {
     __m512 __r;
     for (int __i = 0; __i < 16; __i++)
-        __r.__val[__i] = __a.__val[__i] * __b.__val[__i];
+        __r[__i] = __a[__i] * __b[__i];
     return __r;
 }
 
@@ -93,7 +93,7 @@ _mm512_fmadd_ps(__m512 __a, __m512 __b, __m512 __c)
 {
     __m512 __r;
     for (int __i = 0; __i < 16; __i++)
-        __r.__val[__i] = __a.__val[__i] * __b.__val[__i] + __c.__val[__i];
+        __r[__i] = __a[__i] * __b[__i] + __c[__i];
     return __r;
 }
 
@@ -105,7 +105,7 @@ _mm512_reduce_add_ps(__m512 __a)
 {
     float __sum = 0.0f;
     for (int __i = 0; __i < 16; __i++)
-        __sum += __a.__val[__i];
+        __sum += __a[__i];
     return __sum;
 }
 
@@ -183,10 +183,10 @@ _mm512_reduce_add_ps(__m512 __a)
 static __inline__ __m512i __attribute__((__always_inline__))
 _mm512_broadcastsi128_si512(__m128i __a)
 {
-    return (__m512i){ { __a.__val[0], __a.__val[1],
-                        __a.__val[0], __a.__val[1],
-                        __a.__val[0], __a.__val[1],
-                        __a.__val[0], __a.__val[1] } };
+    return (__m512i){  __a[0], __a[1],
+                        __a[0], __a[1],
+                        __a[0], __a[1],
+                        __a[0], __a[1]  };
 }
 
 
@@ -201,7 +201,7 @@ static __inline__ __m512i __attribute__((__always_inline__))
 _mm512_set_epi64(long long __e7, long long __e6, long long __e5, long long __e4,
                  long long __e3, long long __e2, long long __e1, long long __e0)
 {
-    return (__m512i){ { __e0, __e1, __e2, __e3, __e4, __e5, __e6, __e7 } };
+    return (__m512i){  __e0, __e1, __e2, __e3, __e4, __e5, __e6, __e7  };
 }
 
 /* _mm512_set_epi32: 16 ints high-to-low */

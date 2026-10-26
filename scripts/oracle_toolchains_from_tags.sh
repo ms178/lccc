@@ -2,7 +2,7 @@
 # ============================================================================
 # oracle_toolchains_from_tags.sh — restore GCC/mold/binutils from the
 # repository's verified transport tags and install the pinned current Clang
-# from its checksum-pinned official release archive.
+# and Rust from the reviewed content-addressed release-asset lock.
 #
 # WHY THIS EXISTS
 # ---------------
@@ -15,13 +15,12 @@
 # long time building one. Neither is acceptable when the point of the gate is
 # to be run.
 #
-# `harness-cache-1` carries the GCC 16 x86-64 prefix, mold and binutils
-# sources. Its `MANIFEST.sha256` is cross-checked against these pins before any
-# payload is restored, then the extracted tools are run and their versions are
-# checked. The current `harness-cache-4` still contains Clang 23.1.3, not the
-# now-required 23.1.4. Do not relabel that payload or its digest: install 23.1.4
-# via `ci_install_clang_oracle.sh`, which pins the official LLVM archive by its
-# published SHA-256. A right-looking filename is never accepted as provenance.
+# `harness-cache-1` carries GCC/mold/binutils, verified against its manifest.
+# The historical harness-cache-4 source tree contains Clang 23.1.3, not 23.1.4.
+# Rust 1.99.1 and Clang 23.1.4 use engineering/toolchains/cache-lock.json,
+# whose reviewed hashes describe content-addressed release assets. No source
+# tag is relabelled. Online restoration needs GitHub's asset CDN; explicit
+# offline verification never invokes a transport or writes the prefix.
 #
 # WHAT IT DOES NOT DO
 # -------------------
@@ -60,8 +59,8 @@
 # Offline is explicit, not inferred from a failed download.  `--offline`
 # performs only local version probes against --prefix and exits with a named
 # missing-oracle error; it never reads a tag payload and never invokes the
-# official Clang installer.  An online run may still reuse local payloads, but
-# is allowed to materialise missing files and download Clang 23.1.4.
+# Rust/Clang restore helper. An online run may reuse verified local payloads
+# or download the exact locked Rust/Clang assets.
 # ============================================================================
 set -euo pipefail
 
@@ -78,6 +77,7 @@ OFFLINE=0
 # different version is a provisioning error, not a new default.
 GCC_VERSION=16.2.0
 CLANG_VERSION=23.1.4
+RUST_VERSION=1.99.1
 MOLD_VERSION=2.42.1
 BINUTILS_VERSION=2.47
 
@@ -159,6 +159,7 @@ manifest_crosscheck() {  # manifest_crosscheck <tag> <member> <sha>
 # ---- install layout ---------------------------------------------------------
 GCC_ROOT=$PREFIX/gcc-$GCC_VERSION
 CLANG_ROOT=$PREFIX/clang-$CLANG_VERSION
+RUST_ROOT=$PREFIX/rust-$RUST_VERSION
 gcc_bin=$GCC_ROOT/bin/gcc-16
 clang_bin=$CLANG_ROOT/bin/clang-23
 
@@ -178,33 +179,23 @@ probe_version() {  # probe_version <binary> <pattern> <label> ; prints the line
 # gets the real missing-oracle diagnostic rather than a misleading transport
 # prerequisite failure.
 # ============================================================================
-if [ "$OFFLINE" = 1 ]; then
-    log "offline mode: refusing tag materialisation and Clang downloads"
+if [ "$OFFLINE" = 1 ] || [ "$VERIFY_ONLY" = 1 ]; then
+    log "verification mode: refusing tag materialisation and toolchain downloads"
     probe_version "$gcc_bin" "GCC) $GCC_VERSION" "gcc-16" >/dev/null
-    probe_version "$clang_bin" "version $CLANG_VERSION" "clang-23" >/dev/null
+    probe_version "$clang_bin" "version $CLANG_VERSION " "clang-23" >/dev/null
+    probe_version "$RUST_ROOT/bin/rustc" "rustc $RUST_VERSION " "rustc" >/dev/null
     probe_version "$PREFIX/bin/mold" "$MOLD_VERSION" "mold" >/dev/null
-    log "offline verification: gcc-16 $GCC_VERSION, clang-23 $CLANG_VERSION, mold $MOLD_VERSION all present"
+    log "offline verification: gcc-16 $GCC_VERSION, clang-23 $CLANG_VERSION, Rust $RUST_VERSION, mold $MOLD_VERSION all present"
     exit 0
 fi
 
-for tool in git sha256sum tar xz; do
+for tool in git sha256sum tar xz python3 curl; do
     command -v "$tool" >/dev/null 2>&1 || die "required host tool missing: $tool"
 done
 
 mkdir -p "$PREFIX" || die "cannot create prefix $PREFIX (use --prefix DIR)"
 DL=$PREFIX/dl
 mkdir -p "$DL"
-
-# ============================================================================
-# Path 1: verify-only
-# ============================================================================
-if [ "$VERIFY_ONLY" = 1 ]; then
-    probe_version "$gcc_bin" "GCC) $GCC_VERSION" "gcc-16" >/dev/null
-    probe_version "$clang_bin" "version $CLANG_VERSION" "clang-23" >/dev/null
-    probe_version "$PREFIX/bin/mold" "$MOLD_VERSION" "mold" >/dev/null
-    log "verify-only: gcc-16 $GCC_VERSION, clang-23 $CLANG_VERSION, mold $MOLD_VERSION all present"
-    exit 0
-fi
 
 # ============================================================================
 # Path 2: restore
@@ -230,11 +221,8 @@ restore_toolchain() {  # restore_toolchain <tag> <member> <sha> <root> <label>
 }
 
 restore_toolchain "$TAG_GCC" "$GCC_MEMBER" "$GCC_SHA" "$GCC_ROOT" "gcc-$GCC_VERSION"
-# harness-cache-4 carries the old 23.1.3 payload. The current LLVM pin is
-# provisioned from the release asset with a separately verified SHA-256; never
-# relabel the old tag member or accept it as a 23.1.4 oracle.
-log "installing Clang $CLANG_VERSION from the official checksum-pinned release"
-"$REPO/scripts/ci_install_clang_oracle.sh" --prefix "$CLANG_ROOT" >/dev/null
+# Restore only the published exact-version payloads after hash verification.
+python3 "$REPO/scripts/restore_toolchain_cache.py" --prefix "$PREFIX"
 
 # mold is a single static binary: verify it in place rather than extracting.
 mkdir -p "$PREFIX/bin"
@@ -301,6 +289,9 @@ if [ "$WITH_SHIMS" = 1 ]; then
         install_shim "$name" "$CLANG_ROOT/bin/$name"
     done
     install_shim clang++ "$CLANG_ROOT/bin/clang-23"
+    for name in rustc cargo rustfmt clippy-driver; do
+        install_shim "$name" "$RUST_ROOT/bin/$name"
+    done
     install_shim mold "$PREFIX/bin/mold"
     install_shim ld.mold "$PREFIX/bin/mold"
     if [ "$WITH_BINUTILS" = 1 ] && [ -x "$PREFIX/binutils-$BINUTILS_VERSION/bin/as" ]; then
@@ -342,7 +333,9 @@ envfile=$PREFIX/env.sh
     printf 'export CXX=%q\n' "$GCC_ROOT/bin/g++-16"
     printf 'export CLANG=%q\n' "$clang_bin"
     printf 'export MOLD=%q\n' "$PREFIX/bin/mold"
-    printf 'export PATH=%q:"$PATH"\n' "$BIN_DIR"
+    printf 'export RUSTC=%q\n' "$RUST_ROOT/bin/rustc"
+    printf 'export CARGO=%q\n' "$RUST_ROOT/bin/cargo"
+    printf 'export PATH=%q:%q:%q:%q:%q:"$PATH"\n' "$RUST_ROOT/bin" "$CLANG_ROOT/bin" "$GCC_ROOT/bin" "$PREFIX/bin" "$BIN_DIR"
 } > "$envfile"
 log "env file: $envfile"
 log 'done.'

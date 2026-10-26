@@ -18,6 +18,8 @@
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IntrinsicOp {
+    AvxWiden(crate::common::avx_widen::AvxWiden),
+    AvxTest(crate::common::avx_test::AvxTest),
     /// Memory fence operations (no dest, no args beyond optional ptr)
     Lfence,
     Mfence,
@@ -1203,6 +1205,14 @@ pub enum IntrinsicOp {
     Phaddw128,
     /// Packed 32-bit horizontal add (PHADDD, SSSE3)
     Phaddd128,
+    Phsubw128,
+    Phsubd128,
+    Phaddsw128,
+    Phsubsw128,
+    Psignb128,
+    Psignw128,
+    Psignd128,
+    Pmulhrsw128,
     /// Packed byte shuffle (PSHUFB, SSSE3)
     Pshufb128,
     /// Packed absolute value bytes (PABSB, SSSE3)
@@ -1913,6 +1923,24 @@ pub(crate) const VECTOR_STORES: [IntrinsicOp; 13] = [
 ];
 
 impl IntrinsicOp {
+    /// Native legacy/VEX SSSE3 binary mnemonic shared by both x86 emitters.
+    pub(crate) fn ssse3_binary_mnemonic(self) -> Option<&'static str> {
+        Some(match self {
+            Self::Phaddw128 => "phaddw",
+            Self::Phaddd128 => "phaddd",
+            Self::Phsubw128 => "phsubw",
+            Self::Phsubd128 => "phsubd",
+            Self::Phaddsw128 => "phaddsw",
+            Self::Phsubsw128 => "phsubsw",
+            Self::Psignb128 => "psignb",
+            Self::Psignw128 => "psignw",
+            Self::Psignd128 => "psignd",
+            Self::Pmulhrsw128 => "pmulhrsw",
+            Self::Palignr128 => "palignr",
+            _ => return None,
+        })
+    }
+
     /// 128-bit FP ops with the *destructive* two-operand legacy-SSE encoding
     /// `dst = args[0] op args[1]`: two 16-byte vector operands, one 16-byte
     /// vector result, and — the property this predicate exists for — the
@@ -2024,6 +2052,9 @@ impl IntrinsicOp {
     /// slot protection without pretending that stores return vector values.
     /// Scalar reductions/extracts are excluded even if their inputs are SIMD.
     pub fn vector_home_width(&self) -> Option<u32> {
+        if matches!(self, Self::AvxWiden(_)) {
+            return Some(32);
+        }
         use IntrinsicOp::*;
         match self {
             // ---- 256-bit AVX/AVX2 results ----
@@ -2145,7 +2176,7 @@ impl IntrinsicOp {
             | SetEpi32 | Pslldqi128 | Psrldqi128 | Psllqi128 | Psrlqi128
             | Pshufd128 | Paddw128 | Psubw128 | Paddb128 | Psubb128
             | Psubusw128 | Psadbw128 | Pmullw128 | Pmaddubsw128 | Phaddw128
-            | Phaddd128 | Pshufb128 | Pabsb128 | Pabsw128 | Pabsd128
+            | Phaddd128 | Phsubw128 | Phsubd128 | Phaddsw128 | Phsubsw128 | Psignb128 | Psignw128 | Psignd128 | Pmulhrsw128 | Pshufb128 | Pabsb128 | Pabsw128 | Pabsd128
             | Palignr128 | Pmaxub128 | Pminub128 | Pblendvb128 | Pblendw128 | Pmovzxbw128
             | Pmovzxwd128 | Psllw128 | Psrlw128 | Pmulhw128 | Pmaddwd128
             | Pcmpgtw128 | Pcmpgtb128 | Psllwi128 | Psrlwi128 | Psrawi128
@@ -2403,6 +2434,9 @@ impl IntrinsicOp {
     /// store-interval and load-interval legality rules) need this; writes
     /// are covered by [`Instruction::may_write_memory`].
     pub fn may_read_memory(&self) -> bool {
+        if matches!(self, Self::AvxTest(_) | Self::AvxWiden(_)) {
+            return true;
+        }
         matches!(
             self,
             IntrinsicOp::FmaF64x2
@@ -3419,6 +3453,52 @@ mod memory_classification_tests {
                 !op.writes_memory_via_args() && !op.may_read_memory(),
                 "{op:?} is pure compute and must not look like a memory op"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod ssse3_native_contract_tests {
+    use super::IntrinsicOp::*;
+    #[test]
+    fn shared_ssse3_mnemonics_cover_the_exact_legacy_family() {
+        use super::IntrinsicOp as O;
+        for (op, mnemonic) in [
+            (O::Phaddw128, "phaddw"),
+            (O::Phaddd128, "phaddd"),
+            (O::Phsubw128, "phsubw"),
+            (O::Phsubd128, "phsubd"),
+            (O::Phaddsw128, "phaddsw"),
+            (O::Phsubsw128, "phsubsw"),
+            (O::Psignb128, "psignb"),
+            (O::Psignw128, "psignw"),
+            (O::Psignd128, "psignd"),
+            (O::Pmulhrsw128, "pmulhrsw"),
+            (O::Palignr128, "palignr"),
+        ] {
+            assert_eq!(op.ssse3_binary_mnemonic(), Some(mnemonic));
+        }
+        assert_eq!(O::Pmulld128.ssse3_binary_mnemonic(), None);
+    }
+
+    #[test]
+    fn native_binary_results_have_full_vector_homes() {
+        for op in [
+            Phsubw128,
+            Phsubd128,
+            Phaddsw128,
+            Phsubsw128,
+            Psignb128,
+            Psignw128,
+            Psignd128,
+            Pmulhrsw128,
+        ] {
+            assert_eq!(op.vector_result_width(), Some(16), "{op:?}");
+            assert_eq!(op.vector_home_width(), Some(16), "{op:?}");
+            // Explicit-SIMD nodes read argument pointers and write a
+            // destination slot; match the existing horizontal-add contract.
+            assert_eq!(op.is_pure(), Phaddd128.is_pure());
+            assert!(op.is_vector_op());
         }
     }
 }

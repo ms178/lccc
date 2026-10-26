@@ -3,8 +3,8 @@
 
 Every entry is (gcc_name, mnemonic, kind, ...). The generator emits:
   1. `__lccc_simd*` builtin prototypes (exact arity per kind)
-  2. `_mm*` wrapper functions calling the builtins (struct deref via
-     __CCC_M*_FROM_BUILTIN)
+  2. `_mm*` wrappers calling the builtins (native 128-bit FP results;
+     legacy pointer-result adapters are kept separate for other families)
 
 Builtin arg convention: the FIRST argument is the instruction immediate
 (0 for non-immediate ops); lowering drops it and re-appends it as the LAST
@@ -13,6 +13,7 @@ IR operand.
 Regenerate: python3 scripts/gen_lcccsimd.py
 """
 import sys
+import re
 from pathlib import Path
 
 REPO = Path(__file__).parent.parent
@@ -292,7 +293,6 @@ FP256_UNI = [
 FP256_SCALAR = [
     ("movemask_ps", "vmovmskps256", "int", "M256"),
     ("movemask_pd", "vmovmskpd256", "int", "M256D"),
-    ("testz_ps", "vtestps256", "int", "M256"),
 ]
 FP256_UIMM = [
     ("round_ps", "vroundps256", "__m256", "M256"),
@@ -347,17 +347,21 @@ w("/* ---- vector types (single definition point for ALL widths) ---- */")
 for align, elty, cnt, name in [
     (16, "float", 4, "__m128"), (16, "double", 2, "__m128d"),
     (16, "long long", 2, "__m128i"), (1, "long long", 2, "__m128i_u"),
-    (1, "double", 2, "__m128d_u"),
+    (1, "double", 2, "__m128d_u"), (1, "float", 4, "__m128_u"),
     (32, "float", 8, "__m256"), (32, "double", 4, "__m256d"),
     (32, "long long", 4, "__m256i"), (1, "long long", 4, "__m256i_u"),
     (1, "double", 4, "__m256d_u"), (1, "float", 8, "__m256_u"),
     (64, "float", 16, "__m512"), (64, "double", 8, "__m512d"),
     (64, "long long", 8, "__m512i"), (1, "long long", 8, "__m512i_u"),
+    (1, "double", 8, "__m512d_u"), (1, "float", 16, "__m512_u"),
 ]:
-    w(f"typedef struct __attribute__((__aligned__({align}))) {{")
-    w(f"    {elty} __val[{cnt}];")
-    w(f"}} {name};")
+    size = cnt * {"float": 4, "double": 8, "long long": 8}[elty]
+    alignment = ", __aligned__(1)" if align == 1 else ""
+    w(f"typedef {elty} {name} __attribute__((__vector_size__({size}){alignment}, __may_alias__));")
     w("")
+w("/* Vector elements are not addressable lvalues in GNU C. */")
+w("#define __CCC_LANE_ADDRESS(v, i) ((void *)((unsigned char *)&(v) + sizeof((v)[0]) * (i)))")
+w("")
 w("/* AVX-512 opmask types */")
 w("typedef unsigned char __mmask8;")
 w("typedef unsigned short __mmask16;")
@@ -393,10 +397,14 @@ w(" * Generic SIMD builtin family: __lccc_simd{128|256|512}_{i|ps|pd}_{mnemonic}
 w(" * First builtin argument = instruction immediate (0 for non-immediate ops);")
 w(" * the compiler drops it and re-appends it as the last IR operand.")
 w(" *")
-w(" * Values are struct-based (lccc model): wrappers dereference the builtin's")
-w(" * result pointer. The backend keeps values in XMM/YMM/ZMM registers between")
-w(" * consecutive intrinsics (vec_live_regs cache).")
+w(" * Public values and 128-bit FP/conversion helper results are native vectors.")
+w(" * Other private families retain pointer-result adapters. The backend keeps")
+w(" * XMM/YMM/ZMM values between consecutive intrinsics (vec_live_regs cache).")
 w(" */")
+w("")
+# Native result adapters must never reinterpret a returned vector as an address.
+for kind in ("M128", "M128D", "M128I"):
+    w(f"#define __CCC_{kind}_FROM_NATIVE(e) ((__{kind.lower()})(e))")
 w("")
 w("#define __CCC_M128I_FROM_BUILTIN(e) (*(__m128i *)(e))")
 w("#define __CCC_M128_FROM_BUILTIN(e)  (*(__m128 *)(e))")
@@ -412,11 +420,12 @@ w("")
 ALWAYS = "__attribute__((__always_inline__, __artificial__))"
 
 def proto(name, ret, params):
-    rt = "void" if ret == "void" else f"__{ret}"
+    assert ret == "void" or ret.startswith("m"), f"invalid vector builtin result: {name}: {ret}"
+    rt = "void" if ret == "void" else ("__" + ret if name.startswith("128_ps_") else "void *")
     w(f"{rt} __lccc_simd{name}({', '.join(params)});")
 
 def wrap(decl, body):
-    w(f"static __inline__ {decl} {ALWAYS}")
+    w(f"static __inline__ {ALWAYS} {decl}")
     w(body)
     w("")
 
@@ -500,7 +509,8 @@ for name, mn, srcty in INSERT512:
           f"__CCC_M512I_FROM_BUILTIN(__lccc_simd512_i_{mn}(__imm, __a, __b))")
 # ---- mask compares ----
 for name, mn, mty, has_imm in CMP_MASK:
-    proto(f"512_i_{mn}", "m512i", ["long", "__m512i __a", "__m512i __b"])
+    vty = "__m512i" if mn.endswith("512") else ("__m256i" if mn.endswith("256") else "__m128i")
+    w(f"{mty} __lccc_simd512_i_{mn}(long, {vty} __a, {vty} __b);")
 for name, mn, mty, has_imm in CMP_MASK:
     pfx, vty = ("_mm512_", "__m512i") if mn.endswith("512") else (
         ("_mm256_", "__m256i") if mn.endswith("256") else ("_mm_", "__m128i"))
@@ -633,7 +643,7 @@ for name, mn, rty, m in FP128_BIMM:
     macro(f"_mm_{name}(__a, __b, __imm)",
           f"__CCC_{m}_FROM_BUILTIN(__lccc_simd128_ps_{mn}(__imm, __a, __b))")
 # _mm_extract_ps(a, imm) -> int
-proto("128_ps_extractps128", "m128", ["long", "__m128 __a"])
+w("int __lccc_simd128_ps_extractps128(long, __m128 __a);")
 macro("_mm_extract_ps(__a, __imm)",
       "(int)__lccc_simd128_ps_extractps128(__imm, __a)")
 
@@ -700,11 +710,23 @@ for name, mn in FP256_VAR:
          f"{{ return __CCC_{m}_FROM_BUILTIN(__lccc_simd256_ps_{mn}(0, __a, __b)); }}")
 for name, mn, rty, m in FP256_SCALAR:
     vty = "__" + m.lower()
-    params = f"{vty} __a" + (f", {vty} __b" if name == "testz_ps" else "")
-    operands = "__a, __b" if name == "testz_ps" else "__a"
-    w(f"{rty} __lccc_simd256_ps_{mn}(long, {params});")
-    wrap(f"{rty} _mm256_{name}({params})",
-         f"{{ return __lccc_simd256_ps_{mn}(0, {operands}); }}")
+    w(f"{rty} __lccc_simd256_ps_{mn}(long, {vty} __a);")
+    wrap(f"{rty} _mm256_{name}({vty} __a)",
+         f"{{ return __lccc_simd256_ps_{mn}(0, __a); }}")
+# VTEST is a two-vector sign-bit reduction, not an integer PTEST or a
+# floating-point comparison. Keep every width/type/flag API on the raw builtin.
+for bits in (128, 256):
+    for suffix in ("ps", "pd"):
+        vty = f"__m{bits}" + ("d" if suffix == "pd" else "")
+        prefix = "_mm256" if bits == 256 else "_mm"
+        for flag in ("z", "c", "nzc"):
+            name = f"{prefix}_test{flag}_{suffix}"
+            builtin = f"__lccc_avx_test{flag}{suffix}{bits}"
+            w(f"int {builtin}({vty}, {vty});")
+            w(f"static __inline__ int __attribute__((__always_inline__, __artificial__, __target__(\"avx\")))")
+            w(f"{name}({vty} __a, {vty} __b)")
+            w(f"{{ return {builtin}(__a, __b); }}")
+            w("")
 for name, mn, rty, m in FP256_UIMM:
     proto(f"256_ps_{mn}", rty[2:], ["long", rty + " __a"])
     macro(f"_mm256_{name}(__a, __imm)",
@@ -730,18 +752,19 @@ for name, mn, rty, m in FP256_FMA:
     wrap(f"{rty} _mm256_{name}({rty} __a, {rty} __b, {rty} __c)",
          f"{{ return __CCC_{m}_FROM_BUILTIN(__lccc_simd256_ps_{mn}(0, __a, __b, __c)); }}")
 for name, mn, rty, m in FP256_MISC:
+    family = "pd" if name.endswith("_pd") else "ps"
     if name.startswith("extract"):
-        proto(f"256_ps_{mn}", rty[2:], ["long", ("__m256" if m == "M128" else "__m256d") + " __a"])
+        proto(f"256_{family}_{mn}", rty[2:], ["long", ("__m256" if m == "M128" else "__m256d") + " __a"])
         macro(f"_mm256_{name}(__a, __imm)",
-              f"__CCC_{m}_FROM_BUILTIN(__lccc_simd256_ps_{mn}(__imm, __a))")
+              f"__CCC_{m}_FROM_BUILTIN(__lccc_simd256_{family}_{mn}(__imm, __a))")
     elif name.startswith("insert"):
-        proto(f"256_ps_{mn}", rty[2:], ["long", rty + " __a", ("__m128" if m == "M256" else "__m128d") + " __b"])
+        proto(f"256_{family}_{mn}", rty[2:], ["long", rty + " __a", ("__m128" if m == "M256" else "__m128d") + " __b"])
         macro(f"_mm256_{name}(__a, __b, __imm)",
-              f"__CCC_{m}_FROM_BUILTIN(__lccc_simd256_ps_{mn}(__imm, __a, __b))")
+              f"__CCC_{m}_FROM_BUILTIN(__lccc_simd256_{family}_{mn}(__imm, __a, __b))")
     else:
-        proto(f"256_ps_{mn}", rty[2:], ["long", rty + " __a", rty + " __b"])
+        proto(f"256_{family}_{mn}", rty[2:], ["long", rty + " __a", rty + " __b"])
         macro(f"_mm256_{name}(__a, __b, __imm)",
-              f"__CCC_{m}_FROM_BUILTIN(__lccc_simd256_ps_{mn}(__imm, __a, __b))")
+              f"__CCC_{m}_FROM_BUILTIN(__lccc_simd256_{family}_{mn}(__imm, __a, __b))")
 # generic 256 cmp
 proto("256_ps_vcmpps256", "m256", ["long", "__m256 __a", "__m256 __b"])
 proto("256_ps_vcmppd256", "m256d", ["long", "__m256d __a", "__m256d __b"])
@@ -751,6 +774,10 @@ macro("_mm256_cmp_pd(__a, __b, __imm)",
       "__CCC_M256D_FROM_BUILTIN(__lccc_simd256_ps_vcmppd256(__imm, __a, __b))")
 
 w("#endif /* _LCCCSIMD_H_INCLUDED */")
+# Only this family has native result prototypes. Other legacy adapters remain
+# pointer-result APIs until their own result-type contracts are migrated.
+L = [re.sub(r"__CCC_(M128[DI]?)_FROM_BUILTIN\((__lccc_simd128_ps_)",
+            r"__CCC_\1_FROM_NATIVE(\2", line) for line in L]
 generated = "\n".join(L) + "\n"
 if _CHECK_ONLY:
     current = OUT.read_text() if OUT.exists() else ""

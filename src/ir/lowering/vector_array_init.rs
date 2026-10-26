@@ -1,4 +1,4 @@
-//! Shared planning for arrays whose leaf subobjects are Clang `ext_vector_type` objects.
+//! Shared planning for arrays whose leaf subobjects are native GNU or Clang vector objects.
 //!
 //! Vector objects are storage aggregates but their logical lanes belong to the
 //! vector initializer, not to the containing array. This planner resolves the
@@ -20,7 +20,7 @@ pub(super) struct VectorArrayInitPlan {
 
 fn vector_array_leaf_count(ty: &CType) -> Option<(bool, usize)> {
     match ty {
-        CType::ExtVector(..) => Some((false, 1)),
+        CType::Vector(..) | CType::ExtVector(..) => Some((false, 1)),
         CType::Array(element, Some(count)) => {
             let (_, child_count) = vector_array_leaf_count(element)?;
             Some((true, count.checked_mul(child_count)?))
@@ -31,7 +31,7 @@ fn vector_array_leaf_count(ty: &CType) -> Option<(bool, usize)> {
 
 fn vector_leaf_type(ty: &CType) -> Option<CType> {
     match ty {
-        CType::ExtVector(..) => Some(ty.clone()),
+        CType::Vector(..) | CType::ExtVector(..) => Some(ty.clone()),
         CType::Array(element, Some(_)) => vector_leaf_type(element),
         _ => None,
     }
@@ -90,7 +90,7 @@ impl Lowerer {
             let child_base = base.checked_add(index.checked_mul(leaves_per_element)?)?;
 
             match (element_type.as_ref(), &item.init) {
-                (CType::ExtVector(..), init) => {
+                (CType::Vector(..) | CType::ExtVector(..), init) => {
                     *elements.get_mut(child_base)? = Some(init.clone());
                 }
                 (CType::Array(..), Initializer::List(sub_items)) => {

@@ -739,6 +739,25 @@ impl CodegenState {
     /// sites must agree, and the indirect list must line up with the
     /// indirect calls of the final code.
     pub fn record_call_pop(&mut self, direct: Option<&str>, pops: Option<u32>) {
+        self.record_call_pop_for_emission(
+            direct,
+            pops,
+            EXPLORATORY_EMISSION.load(std::sync::atomic::Ordering::Relaxed),
+        );
+    }
+
+    fn record_call_pop_for_emission(
+        &mut self,
+        direct: Option<&str>,
+        pops: Option<u32>,
+        exploratory: bool,
+    ) {
+        // Dual-layout probes discard their assembly. Their call-site facts
+        // must be discarded too, or an indirect pop list describes three
+        // emitted bodies while the final stream contains only one.
+        if exploratory {
+            return;
+        }
         match direct {
             Some(name) => match self.callee_pops_direct.get_mut(name) {
                 Some(seen) => {
@@ -2030,6 +2049,17 @@ mod call_pop_tests {
         state.record_call_pop(None, Some(8));
         state.record_call_pop(None, None);
         assert_eq!(state.callee_pops_indirect["caller"], vec![Some(8), None]);
+        // Probes cannot poison a direct callee's agreement or append phantom
+        // indirect sites. No global flag mutation: other unit tests may emit.
+        state.record_call_pop_for_emission(Some("plain"), Some(4), true);
+        state.record_call_pop_for_emission(None, Some(4), true);
+        assert_eq!(state.callee_pops_direct["plain"], Some(0));
+        assert_eq!(state.callee_pops_indirect["caller"], vec![Some(8), None]);
+        state.record_call_pop_for_emission(None, Some(4), false);
+        assert_eq!(
+            state.callee_pops_indirect["caller"],
+            vec![Some(8), None, Some(4)]
+        );
     }
 }
 

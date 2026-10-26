@@ -135,6 +135,7 @@ SOURCES = [
     ("datafiles/amd/amdxop/amd-xop-isa.txt", "XOP"),
     ("datafiles/amd/amdxop/amd-vpermil2-isa.txt", "VPERMIL2"),
     ("datafiles/amd/amdxop/amd-fma4-isa.txt", "FMA4"),
+    ("datafiles/amd/xed-amd-sse4a.txt", "AMD SSE4a: EXTRQ/INSERTQ/MOVNTSD/MOVNTSS"),
     ("datafiles/amd/xed-amd-3dnow.txt", "3DNow!/MMX extensions"),
     # EVEX.  The encoder's EVEX rows are AVX-512 forms of instructions that also
     # have VEX rows (`vpxord`, `vprold`, `vmovdqa32`), so without the AVX-512
@@ -910,7 +911,7 @@ def parse_pattern(pattern: str) -> dict | None:
     pp = "none"
     w = None
     opcodes: list[int] = []
-    modrm = "MODRM()" in pattern
+    modrm = "MODRM()" in pattern or all(field in pattern for field in ("MOD[", "REG[", "RM["))
     for pos, tok in enumerate(toks):
         # XED spells "the opcode carries the register (or the condition code) in
         # its low three bits" as `0xB8+rd` / `0x90+cc` / `0x50+ro`.  The base
@@ -963,6 +964,10 @@ def parse_pattern(pattern: str) -> dict | None:
         "w": w,
         "opcode": opcodes[-1] if opcodes else None,
         "modrm": modrm,
+        # Preserve operand-form identity while correctly marking the ModR/M
+        # byte in register-only patterns that omit the MODRM() nonterminal.
+        "modrm_mode": ("register" if "MOD=3" in toks or "MOD[0b11]" in toks
+                       else "memory" if "MOD!=3" in toks else None),
         "reg": (lambda m: int(m.group(1), 2) if m else None)(
             re.search(r"REG\[0b([01]+)\]", pattern)),
     }
@@ -1211,6 +1216,26 @@ def model_row(row: dict, b64: bool = False, name: str | None = None) -> list[dic
         # silently reporting every mnemonic-driven row as unmodelled.
         name = row["names"][0] if row["names"] else None
     helper = row_helper(body)
+    if helper == "encode_via_x64" and not b64:
+        # Follow the actual shared dispatch, not an invented i686 opcode.
+        for target in extract_rows(REPO / "src/backend/x86/assembler/encoder/mod.rs"):
+            if (name in target["names"] or (name == "crc32" and "crc32b" in target["names"])) and row_helper(target["body"]) != helper:
+                if name == "crc32":
+                    # The suffix-less shared row infers the data-source size.
+                    # In i686 the possible source widths are 8/16/32, not 64.
+                    return [enc for suffix in ("b", "w", "l")
+                            for enc in model_row(target, False, name + suffix) or []] or None
+                return model_row(target, False, name)
+        return None
+    if helper == "encode_sse4a_bits":
+        args = call_args(body, helper)
+        if args is None or len(args) != 2 or args[1] not in ("true", "false"):
+            return None
+        insert = args[1] == "true"
+        return [dict(family="legacy", map="0f", pp="f2" if insert else "66",
+                     w=None, opcode=opcode, modrm=True,
+                     reg=0 if opcode == 0x78 and not insert else None)
+                for opcode in (0x78, 0x79)]
     if helper is not None:
         args = call_args(body, helper)
         if args is not None:

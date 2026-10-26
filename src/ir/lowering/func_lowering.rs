@@ -78,6 +78,12 @@ impl Lowerer {
             base_return_type,
             return_is_bool,
         ));
+        self.func_mut().target_features = func
+            .attrs
+            .target
+            .as_deref()
+            .map(crate::ir::module::normalize_target_features)
+            .unwrap_or_default();
         let return_ctype = self.type_spec_to_ctype(&func.return_type);
         if !func.attrs.is_static() && !self.is_internal_function(&func.name) {
             self.diagnose_unsupported_ext_vector_abi(&return_ctype, true, func.span);

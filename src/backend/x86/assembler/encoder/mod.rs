@@ -13,6 +13,8 @@ mod gp_integer;
 mod promoted;
 mod registers;
 mod sse;
+mod sse34;
+pub(crate) use sse34::check_sse34_operands;
 mod system;
 mod x87_misc;
 mod xop;
@@ -218,6 +220,30 @@ const LOCKABLE_STEMS: [&str; 19] = [
     "xadd",
     "xchg",
 ];
+
+/// Scalar BMI instructions use VEX despite lacking the `v` mnemonic prefix.
+pub(crate) fn is_bmi_vex_mnemonic(stem: &str) -> bool {
+    let base = stem
+        .strip_suffix('l')
+        .or_else(|| stem.strip_suffix('q'))
+        .unwrap_or(stem);
+    matches!(
+        base,
+        "andn"
+            | "blsi"
+            | "blsr"
+            | "blsmsk"
+            | "bextr"
+            | "bzhi"
+            | "pdep"
+            | "pext"
+            | "mulx"
+            | "shlx"
+            | "shrx"
+            | "sarx"
+            | "rorx"
+    )
+}
 
 /// A `{vex*}` request must produce an actual VEX (C4/C5) or XOP (8F,
 /// map >= 8) instruction. A leading 8F with map < 8 is the legacy POP
@@ -991,8 +1017,16 @@ impl InstructionEncoder {
                 "data32" => return Err("`data32' is not supported in 64-bit mode".to_string()),
                 "rex" => rex_floor |= 0x40,
                 "rex.x" => rex_floor |= 0x42,
+                "rex64" => rex_floor |= 0x48,
                 _ => {}
             }
+        }
+        // AH/BH/CH/DH do not exist under any REX prefix. Never silently
+        // change a named high-byte operand into SPL/BPL/SIL/DIL.
+        if rex_floor != 0 && instr.operands.iter().any(|o| {
+            matches!(o, Operand::Register(r) if matches!(r.name.as_str(), "ah" | "bh" | "ch" | "dh"))
+        }) {
+            return Err("high-byte register cannot be encoded with a REX prefix".into());
         }
         // The `addr32` word COALESCES with the body's address-size
         // override: GAS `addr32 mov %eax,(%eax)' = 67 89 00 (one byte,
@@ -1097,7 +1131,7 @@ impl InstructionEncoder {
                 // addr32 0x67 byte is appended to seg_pre AFTER the loop
                 // so segment overrides always precede it (GAS:
                 // `fs addr32 mov %eax,(%ebx)' = 64 67 89 03).
-                "addr32" | "data16" | "rex" | "rex.x" => {}
+                "addr32" | "data16" | "rex" | "rex.x" | "rex64" => {}
                 // Segment overrides used as standalone prefixes. The kernel's
                 // `ds wrmsr` relies on the byte being emitted so an
                 // ALTERNATIVE can patch the instruction in place.
@@ -1485,7 +1519,17 @@ impl InstructionEncoder {
             while at < self.bytes.len()
                 && matches!(
                     self.bytes[at],
-                    0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65 | 0x67 | 0x66 | 0x9B
+                    0x26 | 0x2E
+                        | 0x36
+                        | 0x3E
+                        | 0x64
+                        | 0x65
+                        | 0x67
+                        | 0x66
+                        | 0x9B
+                        | 0xF0
+                        | 0xF2
+                        | 0xF3
                 )
             {
                 at += 1;
@@ -1796,14 +1840,7 @@ impl InstructionEncoder {
             "vpackusdw" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x2B)),
             "vpmaddubsw" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x04)),
             "vpshufb" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x00)),
-            "vpsignb" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x08)),
-            "vpsignw" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x09)),
-            "vpsignd" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x0A)),
             "vpmulhrsw" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x0B)),
-            "vphaddw" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x01)),
-            "vphaddd" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x02)),
-            "vphsubw" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x05)),
-            "vphsubd" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x06)),
             // AVX-VNNI / AVX-VNNI-INT8 (EVEX.NDS.512.66.0F38)
             "vpdpbusd" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x50)),
             "vpdpbusds" => r(self.encode_evex_binary(ops, 2, 1, 0, 0x51)),
@@ -3420,6 +3457,7 @@ impl InstructionEncoder {
         let suffixed = infer_suffix(&mnemonic_raw, &instr.operands);
         let mnemonic = suffixed.as_str();
         let ops = &instr.operands;
+        check_sse34_operands(mnemonic, ops, true)?;
 
         // Validate role-specific widths before either forced or automatic
         // EVEX dispatch can reinterpret malformed register names.
@@ -3522,8 +3560,13 @@ impl InstructionEncoder {
             let high_vec = ops
                 .iter()
                 .any(|op| matches!(op, Operand::Register(r) if needs_evex_rprime(&r.name)));
-            let vex_family = mnemonic.starts_with('v') && !matches!(mnemonic, "verr" | "verw");
-            if has_zmm || egpr_mem || high_vec {
+            let vex_family = (mnemonic.starts_with('v') && !matches!(mnemonic, "verr" | "verw"))
+                || is_bmi_vex_mnemonic(mnemonic);
+            let egpr_data = ops.iter().any(|op| {
+                matches!(op,
+                Operand::Register(r) if gp_id(&r.name).is_some_and(|id| id >= 16))
+            });
+            if has_zmm || egpr_mem || egpr_data || high_vec {
                 return Err(format!("unsupported instruction `{stem}'"));
             }
             let masked = ops.iter().any(|op| op_decor(op).0 || op_decor(op).1);
@@ -4968,6 +5011,17 @@ impl InstructionEncoder {
             "movmskpd" => self.encode_sse_cvt_xmm_to_gp(ops, &[0x66, 0x0F, 0x50], 4),
             "movmskps" => self.encode_sse_cvt_xmm_to_gp(ops, &[0x0F, 0x50], 4),
             "movntps" => self.encode_sse_store(ops, &[0x0F, 0x2B]),
+
+            "phaddsw" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x03]),
+            "phsubsw" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x07]),
+            "pcmpestrm" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x60]),
+            "pcmpestri" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x61]),
+            "pcmpistrm" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x62]),
+            "pcmpistri" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x63]),
+            "extrq" => self.encode_sse4a_bits(ops, false),
+            "insertq" => self.encode_sse4a_bits(ops, true),
+            "movntsd" => self.encode_sse_store(ops, &[0xF2, 0x0F, 0x2B]),
+            "movntss" => self.encode_sse_store(ops, &[0xF3, 0x0F, 0x2B]),
 
             // ---- SSE4.1 ----
             // blendv instructions use xmm0 as implicit mask; 3-op form names it explicitly
@@ -6944,6 +6998,20 @@ mod encoding_opt_tests {
 
     #[test]
     fn ssse3_vex_arms() {
+        // SDM PHSUBW/PHSUBD and PSIGNB/W/D list no EVEX form. Reject
+        // ZMM/high-register/masked requests instead of inventing opcodes.
+        for m in [
+            "vphaddw", "vphaddd", "vphsubw", "vphsubd", "vpsignb", "vpsignw", "vpsignd",
+        ] {
+            for operands in [
+                "%zmm1,%zmm2,%zmm3",
+                "%xmm16,%xmm2,%xmm3",
+                "%xmm1,%xmm2,%xmm3 {%k1}",
+            ] {
+                assert!(fails(&format!("{m} {operands}")), "{m} {operands}");
+            }
+        }
+
         assert_eq!(hex("vphaddsw %xmm1, %xmm2, %xmm3"), "c4 e2 69 03 d9");
         assert_eq!(hex("vphsubw %xmm1, %xmm2, %xmm3"), "c4 e2 69 05 d9");
         assert_eq!(hex("vphsubd %xmm1, %xmm2, %xmm3"), "c4 e2 69 06 d9");

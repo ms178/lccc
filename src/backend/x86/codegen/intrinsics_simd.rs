@@ -44,7 +44,7 @@ impl X86Codegen {
     /// Width-dispatching vector load: picks the 16/32/64-byte loader from the
     /// target register name. NEVER load a 64-byte value into xmm/ymm scratch
     /// (overreads the source slot).
-    fn simd_load_arg_to(&mut self, arg: &Operand, reg: &'static str) {
+    pub(super) fn simd_load_arg_to(&mut self, arg: &Operand, reg: &'static str) {
         if reg.starts_with("zmm") {
             self.evex_load_arg_to(arg, reg);
         } else if reg.starts_with("ymm") {

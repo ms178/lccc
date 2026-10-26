@@ -13,6 +13,7 @@ import unittest
 
 SOURCE = Path(__file__).resolve().parents[2] / "src/ir/intrinsics.rs"
 IDENT = r"[A-Za-z_][A-Za-z_0-9]*"
+TYPE_PATH = rf"{IDENT}(?:::{IDENT})*"
 ENUM = r"^pub enum IntrinsicOp\s*\{(.*?)^\}"
 MATRIX = r"^pub\(crate\) const VECTOR_STORES: \[IntrinsicOp; (\d+)\] = \[(.*?)^\];"
 # Non-VecStore argument writers: private scratch and packed read/modify/write.
@@ -95,7 +96,7 @@ def enum_names(body):
     require(depth == 0 and not clean[start:].strip(), "unterminated enum entry")
     result = []
     for entry in entries:
-        match = re.fullmatch(f"({IDENT})(\\(\\s*{IDENT}(?:\\s*,\\s*{IDENT})*\\s*,?\\s*\\))?", entry)
+        match = re.fullmatch(rf"({IDENT})(\(\s*{TYPE_PATH}(?:\s*,\s*{TYPE_PATH})*\s*,?\s*\))?", entry)
         require(match is not None, f"unsupported inventory entry: {entry!r}")
         require(not (match[1].startswith("VecStore") and match[2]),
                 f"unsupported inventory entry: payload-bearing {match[1]}")
@@ -200,6 +201,20 @@ class IntrinsicStoreInventoryTests(unittest.TestCase):
                                      "pub enum IntrinsicOp {\n    VecStorePayload(u32),", 1)
         with self.assertRaisesRegex(AssertionError, "unsupported inventory entry"):
             inventory(source)
+
+    def test_qualified_non_store_payloads_preserve_inventory(self):
+        source = self.source.replace("pub enum IntrinsicOp {", """pub enum IntrinsicOp {
+    Future(crate::common::avx_test::AvxTest, u32),
+""", 1)
+        self.assertEqual(inventory(source), set(self.stores))
+
+    def test_qualified_store_payloads_and_malformed_paths_fail_closed(self):
+        for entry in ("VecStorePayload(crate::common::avx_test::AvxTest)",
+                      "Future(crate:::common::Thing)", "Future(crate::Thing<u32>)"):
+            source = self.source.replace("pub enum IntrinsicOp {",
+                                         f"pub enum IntrinsicOp {{\n    {entry},", 1)
+            with self.subTest(entry=entry), self.assertRaisesRegex(AssertionError, "unsupported inventory entry"):
+                inventory(source)
 
     def test_changed_write_expression_fails_closed(self):
         match = extract(WRITES, self.source)

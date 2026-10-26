@@ -1,32 +1,83 @@
 name: Targeted compiler research
 
 on:
+  pull_request:
+    branches: [main]
+    paths: ['.github/workflows/compiler-research.yml']
   workflow_dispatch:
     inputs:
+      refresh_toolchain_cache:
+        description: Also publish Rust 1.99.1 and Clang 23.1.4 hash-cache assets
+        type: boolean
+        default: false
       baseline_ref:
         description: Baseline commit or main ref to archive and build (never checked out over the candidate)
         required: true
         default: main
+      cases:
+        description: Comma-separated canonical workloads (all selects the full corpus)
+        required: false
+        default: "nbody,hot_web_loop,byte_load_reassembly,expat_siphash24,double_reduction,spectral_norm,matmul,binary_trees,expat_xml_scan,zstd_count,f32_sse1_map,fp32_product_map"
+      rounds:
+        description: Paired native rounds, excluding three warm-ups
+        required: true
+        default: "31"
 
 permissions:
   contents: read
 
+# Keep a running measurement experiment when a follow-up commit is pushed.
 concurrency:
-  group: compiler-research-${{ github.ref }}
+  group: compiler-research-${{ github.ref }}-${{ github.sha }}
   cancel-in-progress: true
 
 jobs:
-  evidence:
-    # Explicit research only: no duplicated compiler builds on ordinary PRs.
-    name: Targeted Callgrind main/candidate
+  cache-contract:
+    name: Restore and verify the reviewed Rust and Clang cache
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Verify archive hashes, secure extraction and exact tool identities
+        run: python3 scripts/restore_toolchain_cache.py --prefix "$RUNNER_TEMP/reviewed-oracles"
+  toolchain-cache:
+    if: ${{ inputs.refresh_toolchain_cache }}
+    name: Publish hash-verified Rust and Clang cache
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          components: rustfmt, clippy
+      - name: Install exact Clang release from its pinned upstream digest
+        env:
+          LCCC_CLANG_ORACLE_PREFIX: ${{ runner.temp }}/clang-23.1.4
+        run: bash scripts/ci_install_clang_oracle.sh
+      - name: Publish immutable assets without changing transport tags
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LCCC_CLANG_ORACLE_PREFIX: ${{ runner.temp }}/clang-23.1.4
+        run: python3 scripts/publish_toolchain_cache.py "$RUNNER_TEMP/toolchain-cache"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: toolchain-cache-lock
+          path: ${{ runner.temp }}/toolchain-cache/toolchain-cache.json
+          if-no-files-found: error
+  evidence:
+    # Opt-in research: manual, or a PR explicitly changing this definition.
+    name: Same-host portable/native runtime and Callgrind
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
     env:
       RUSTUP_TOOLCHAIN: stable
       CARGO_BUILD_JOBS: "2"
       RUSTFLAGS: -D warnings
-      BASELINE_REF: ${{ inputs.baseline_ref || 'main' }}
-      RESEARCH_CASES: sieve,nbody,libm_round_family,double_reduction,zlib_ng_adler32,linux_find_bit_scaled,lz4_match_extend
+      BASELINE_REF: ${{ inputs.baseline_ref || github.event.pull_request.base.sha || 'main' }}
+      RESEARCH_CASES: ${{ inputs.cases || 'nbody,hot_web_loop,byte_load_reassembly,expat_siphash24,double_reduction,spectral_norm,matmul,binary_trees,expat_xml_scan,zstd_count,f32_sse1_map,fp32_product_map' }}
+      RESEARCH_ROUNDS: ${{ inputs.rounds || '31' }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -36,49 +87,154 @@ jobs:
         run: bash scripts/ci_enable_swap.sh
       - name: Install and identify instrumentation tools
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends valgrind python3-yaml
-          bash scripts/ci_install_gcc16.sh --base
-          valgrind --version
-          gcc-16 --version
-          rustc -Vv
-          cargo --version
-          rustfmt --version
-          cargo clippy --version
+          python3 scripts/ci_test_report.py -- bash scripts/ci_prepare_research_tools.sh
       - name: Build candidate and independently archived main baseline
         timeout-minutes: 20
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p results/research "$RUNNER_TEMP/research-main"
+          cp "$LCCC_SYSROOT/runtime.json" results/research/gcc-runtime.json
           git fetch --no-tags -- origin "$BASELINE_REF"
           git rev-parse FETCH_HEAD > results/research/baseline.sha
           git rev-parse HEAD > results/research/candidate.sha
           git archive FETCH_HEAD | tar -x -C "$RUNNER_TEMP/research-main"
           cargo build --profile fastbuild --locked --bin lccc -j 2 \
-            --config 'target.x86_64-unknown-linux-gnu.linker="gcc"'
+            --config 'target.x86_64-unknown-linux-gnu.linker="gcc-16"'
           (
             cd "$RUNNER_TEMP/research-main"
             CARGO_TARGET_DIR="$RUNNER_TEMP/research-main-target" \
               cargo build --profile fastbuild --locked --bin lccc -j 2 \
-              --config 'target.x86_64-unknown-linux-gnu.linker="gcc"'
+              --config 'target.x86_64-unknown-linux-gnu.linker="gcc-16"'
           )
           sha256sum target/fastbuild/lccc "$RUNNER_TEMP/research-main-target/fastbuild/lccc" \
             > results/research/compiler-binaries.sha256
+      - name: Dual-mode native AVX API contracts with exact current tools
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(gcc-16 -dumpfullversion)" = 16.2.0
+          python3 tests/regression/check_gnu_builtin_diagnostics.py --lccc target/fastbuild/lccc --gcc gcc-16
+          for family in avx_vtest_sign_bits avx2_widen_native gnu_native_builtin_types gnu_byte_shift_counts gnu_builtin_scalar_conversions native_packed_scalar_shift_counts; do
+            python3 scripts/ci_test_report.py -- \
+              python3 tests/regression/run_regression.py \
+                --lccc target/fastbuild/lccc --gcc gcc-16 -j 2 \
+                --filter "$family" --json "results/research/$family.json"
+          done
+          python3 - <<'PYCONTRACT'
+          import json
+          from pathlib import Path
+          for family in ('avx_vtest_sign_bits', 'avx2_widen_native', 'gnu_native_builtin_types', 'gnu_byte_shift_counts', 'gnu_builtin_scalar_conversions', 'native_packed_scalar_shift_counts'):
+              report = json.loads(Path(f'results/research/{family}.json').read_text())
+              expected = {'total': 2, 'passed': 2, 'failed': 0, 'skipped_compare': 0, 'skipped_run': 0}
+              actual = {key: report[key] for key in expected}
+              if actual != expected:
+                  raise SystemExit(f'{family}: required real amd64+i686 execution, got {actual}')
+              print(f'::notice title=Native AVX dual-mode execution::{family}: {json.dumps(actual, sort_keys=True)}; GCC 16.2.0')
+          PYCONTRACT
+      - name: Public native SIMD type and cross-compiler ABI contracts
+        timeout-minutes: 15
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/ci_test_report.py -- \
+            python3 tests/regression/run_regression.py \
+              --lccc target/fastbuild/lccc --gcc gcc-16 -j 2 \
+              --filter public_simd_native_types --json results/research/public-simd-types.json
+          python3 - <<'PYTYPES'
+          import json
+          from pathlib import Path
+          report = json.loads(Path('results/research/public-simd-types.json').read_text())
+          expected = {'total': 2, 'passed': 2, 'failed': 0, 'skipped_compare': 0, 'skipped_run': 0}
+          actual = {key: report[key] for key in expected}
+          if actual != expected:
+              raise SystemExit(f'public SIMD types require real dual-mode execution: {actual}')
+          PYTYPES
+          python3 scripts/ci_test_report.py -- \
+            python3 tests/regression/check_public_simd_abi.py --gcc gcc-16
+      - name: Same-host before/after/vendor portable and native comparisons
+        timeout-minutes: 45
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$RESEARCH_CASES" == all ]]; then RESEARCH_CASES=""; fi
+          [[ "$RESEARCH_ROUNDS" =~ ^[0-9]+$ ]] && (( RESEARCH_ROUNDS >= 9 && RESEARCH_ROUNDS <= 101 ))
+          as --version | head -1
+          ld --version
+          for profile in portable native; do
+            flags=()
+            if [[ "$profile" == native ]]; then flags+=(--cflag=-march=native); fi
+            python3 tests/benchmark/run_benchmarks.py \
+              --lccc target/fastbuild/lccc --compilers lccc,gcc,clang \
+              --gcc gcc-16 --clang "$CLANG" \
+              --candidate "before=$RUNNER_TEMP/research-main-target/fastbuild/lccc" \
+              --opt=-O2 --cflag=-std=gnu17 "${flags[@]}" \
+              --only "$RESEARCH_CASES" --reps "$RESEARCH_ROUNDS" --warmup 3 \
+              --cpu auto --no-pmu-probe --strict \
+              --artifact-dir "results/research/$profile-artifacts" \
+              --json "results/research/$profile.json" \
+              --markdown "results/research/$profile.md"
+          done
+      - name: Publish CPU-specific paired results through the checks API
+        if: always()
+        run: python3 scripts/publish_cpu_runtime_evidence.py results/research
+      - name: Calibrated short-kernel entry timing without exec startup
+        timeout-minutes: 12
+        shell: bash
+        run: |
+          set -euo pipefail
+          for profile in portable native; do
+            flags="-O2 -std=gnu17"
+            if [[ "$profile" == native ]]; then flags+=" -march=native"; fi
+            python3 scripts/benchmark_native_batched.py \
+              --compiler lccc=target/fastbuild/lccc \
+              --compiler "before=$RUNNER_TEMP/research-main-target/fastbuild/lccc" \
+              --compiler gcc=gcc-16 --compiler "clang=$CLANG" --reference before \
+              --gcc gcc-16 --flags="$flags" --cpu auto \
+              --only byte_load_reassembly,matmul,zstd_count \
+              --rounds "$RESEARCH_ROUNDS" --seconds .2 \
+              --out "results/research/$profile-batched"
+          done
+      - name: Publish startup-excluded results and alias disclosure
+        if: always()
+        run: |
+          python3 - <<'PYCODE'
+          import json
+          from pathlib import Path
+          for profile in ('portable', 'native'):
+              path = Path('results/research') / (profile + '-batched') / 'results.json'
+              if path.exists():
+                  report = json.loads(path.read_text())
+                  for row in report['rows']:
+                      text = json.dumps({'profile': profile, 'name': row['name'],
+                                         'complete': report['complete'],
+                                         'measured_as': row['measured_as'],
+                                         'comparisons': row['comparisons']}, separators=(',', ':'))
+                      # Samples remain in the artifact; do not overflow annotation limits.
+                      value = json.loads(text)
+                      for result in value['comparisons'].values():
+                          result.pop('paired_ratios', None)
+                      text = json.dumps(value, separators=(',', ':'))
+                      text = text.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+                      print('::notice title=Startup-excluded CPU runtime::' + text)
+          PYCODE
       - name: Correctness-gated bounded Callgrind main/candidate A-B
         timeout-minutes: 8
         run: |
+          if [[ "$RESEARCH_CASES" == all ]]; then RESEARCH_CASES=""; fi
           python3 scripts/callgrind_corpus.py \
             --mine target/fastbuild/lccc \
             --ref "$RUNNER_TEMP/research-main-target/fastbuild/lccc" \
-            --gcc-include-command gcc-16 \
+            --gcc-include-command gcc-16 --target-flags="" \
             --only "$RESEARCH_CASES" --out results/research/callgrind-main
       - name: Supplementary Callgrind against identified native GCC
         timeout-minutes: 8
         # Identified native GCC16; this is not measured execution of CE binaries.
         run: |
+          if [[ "$RESEARCH_CASES" == all ]]; then RESEARCH_CASES=""; fi
           python3 scripts/callgrind_corpus.py \
-            --mine target/fastbuild/lccc --ref gcc-16 --gcc-include-command gcc-16 \
+            --mine target/fastbuild/lccc --ref gcc-16 --gcc-include-command gcc-16 --target-flags="" \
             --only "$RESEARCH_CASES" --out results/research/callgrind-gcc
       - name: Publish bounded measurement verdicts and full-report hashes
         if: always()
@@ -95,7 +251,9 @@ jobs:
                      'head': (root / 'candidate.sha').read_text().strip() if (root / 'candidate.sha').exists() else None,
                      'baseline': (root / 'baseline.sha').read_text().strip() if (root / 'baseline.sha').exists() else None,
                      'artifact': 'compiler-research', 'callgrind': {}}
-          selected = set(os.environ['RESEARCH_CASES'].split(','))
+          from tests.benchmark.run_benchmarks import BENCHMARKS
+          selected = (set(os.environ['RESEARCH_CASES'].split(','))
+                      if os.environ['RESEARCH_CASES'] not in ('', 'all') else {b.name for b in BENCHMARKS})
           for arm in ('main', 'gcc'):
               path = root / f'callgrind-{arm}' / 'index.json'
               if not path.exists():

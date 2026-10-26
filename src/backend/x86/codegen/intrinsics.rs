@@ -1179,11 +1179,52 @@ impl X86Codegen {
     /// Emit SSE unary 128-bit op with immediate: load xmm0 from arg0 ptr,
     /// apply `inst $imm, %xmm0`, store result xmm0 to dest_ptr.
     fn emit_sse_unary_imm_128(&mut self, dest_ptr: &Value, args: &[Operand], sse_inst: &str) {
-        self.sse_load_arg(&args[0], "xmm0");
-        let imm = self.operand_to_imm_i64(&args[1]);
-        self.state
-            .emit_fmt(format_args!("    {} ${}, %xmm0", sse_inst, imm));
+        let packed = crate::backend::x86_common::is_packed_element_shift(sse_inst);
+        let constant = match args[1] {
+            Operand::Const(value) => value.to_i64(),
+            _ => None,
+        };
+        if packed && constant.is_none() {
+            self.flush_pending_vec_store_impl();
+            self.sse_load_arg(&args[0], "xmm0");
+            self.operand_to_reg(&args[1], "rax");
+            self.state.vec_evict_bank_except("xmm1", u32::MAX);
+            self.state.emit("    movd %eax, %xmm1");
+            self.state
+                .emit_fmt(format_args!("    {} %xmm1, %xmm0", sse_inst));
+        } else {
+            self.sse_load_arg(&args[0], "xmm0");
+            let mut imm = self.operand_to_imm_i64(&args[1]);
+            if packed {
+                imm = crate::backend::x86_common::packed_shift_immediate(imm);
+            }
+            self.state
+                .emit_fmt(format_args!("    {} ${}, %xmm0", sse_inst, imm));
+        }
         self.sse_store_dest(dest_ptr, "xmm0");
+    }
+
+    fn emit_avx_packed_shift(&mut self, dptr: &Value, args: &[Operand], inst: &str) {
+        let constant = match args[1] {
+            Operand::Const(value) => value.to_i64(),
+            _ => None,
+        };
+        if constant.is_none() {
+            self.flush_pending_vec_store_impl();
+        }
+        self.avx_load_arg(&args[0]);
+        if let Some(count) = constant {
+            let count = crate::backend::x86_common::packed_shift_immediate(count);
+            self.state
+                .emit_fmt(format_args!("    {} ${}, %ymm0, %ymm0", inst, count));
+        } else {
+            self.operand_to_reg(&args[1], "rax");
+            self.state.vec_evict_bank_except("ymm1", u32::MAX);
+            self.state.emit("    vmovd %eax, %xmm1");
+            self.state
+                .emit_fmt(format_args!("    {} %xmm1, %ymm0, %ymm0", inst));
+        }
+        self.avx_store_dest(dptr);
     }
 
     /// Emit SSE shuffle with immediate: load xmm0, apply `inst $imm, %xmm0, %xmm0`,
@@ -2156,6 +2197,32 @@ impl X86Codegen {
             _ => self.service_pending_vec_store(op, args),
         }
         match op {
+            IntrinsicOp::AvxWiden(op) => {
+                if let Some(ptr) = dest_ptr {
+                    self.sse_load_arg(&args[0], "xmm0");
+                    self.state
+                        .emit_fmt(format_args!("    {} %xmm0, %ymm0", op.mnemonic()));
+                    self.avx_store_dest(ptr);
+                }
+            }
+            IntrinsicOp::AvxTest(test) => {
+                let (lhs, rhs) = if test.wide {
+                    ("ymm0", "ymm1")
+                } else {
+                    ("xmm0", "xmm1")
+                };
+                self.simd_load_arg_to(&args[0], lhs);
+                self.simd_load_arg_to(&args[1], rhs);
+                self.state
+                    .emit_fmt(format_args!("    {} %{}, %{}", test.mnemonic(), rhs, lhs));
+                self.state
+                    .emit_fmt(format_args!("    {} %al", test.setcc()));
+                self.state.emit("    movzbl %al, %eax");
+                self.state.reg_cache.invalidate_acc();
+                if let Some(dest) = dest {
+                    self.store_rax_to(dest);
+                }
+            }
             IntrinsicOp::Lfence => {
                 self.state.emit("    lfence");
             }
@@ -2970,20 +3037,36 @@ impl X86Codegen {
             }
 
             // SSSE3 horizontal add and alignr (imm arg in args[2] for alignr)
-            IntrinsicOp::Phaddw128 | IntrinsicOp::Phaddd128 | IntrinsicOp::Palignr128 => {
-                if let Some(dptr) = dest_ptr {
-                    let inst = match op {
-                        IntrinsicOp::Phaddw128 => "phaddw",
-                        IntrinsicOp::Phaddd128 => "phaddd",
-                        IntrinsicOp::Palignr128 => "palignr",
-                        _ => unreachable!(),
-                    };
+            IntrinsicOp::Phaddw128
+            | IntrinsicOp::Phaddd128
+            | IntrinsicOp::Phsubw128
+            | IntrinsicOp::Phsubd128
+            | IntrinsicOp::Phaddsw128
+            | IntrinsicOp::Phsubsw128
+            | IntrinsicOp::Psignb128
+            | IntrinsicOp::Psignw128
+            | IntrinsicOp::Psignd128
+            | IntrinsicOp::Pmulhrsw128
+            | IntrinsicOp::Palignr128 => {
+                if let (Some(dptr), Some(inst)) = (dest_ptr, op.ssse3_binary_mnemonic()) {
                     self.sse_load_arg(&args[0], "xmm0");
                     self.sse_load_arg(&args[1], "xmm1");
                     if matches!(op, IntrinsicOp::Palignr128) {
                         let imm = self.operand_to_imm_i64(&args[2]);
+                        if self.isa.avx {
+                            self.state.emit_fmt(format_args!(
+                                "    vpalignr ${}, %xmm1, %xmm0, %xmm0",
+                                imm
+                            ));
+                        } else {
+                            self.state
+                                .emit_fmt(format_args!("    palignr ${}, %xmm1, %xmm0", imm));
+                        }
+                    } else if self.isa.avx {
+                        // Keep AVX-enabled code in the VEX domain rather than
+                        // introducing a legacy SSE instruction between VEX loads.
                         self.state
-                            .emit_fmt(format_args!("    palignr ${}, %xmm1, %xmm0", imm));
+                            .emit_fmt(format_args!("    v{} %xmm1, %xmm0, %xmm0", inst));
                     } else {
                         self.state
                             .emit_fmt(format_args!("    {} %xmm1, %xmm0", inst));
@@ -3113,11 +3196,7 @@ impl X86Codegen {
                         IntrinsicOp::Psrlwi256 => "vpsrlw",
                         _ => unreachable!(),
                     };
-                    self.avx_load_arg(&args[0]);
-                    let imm = self.operand_to_imm_i64(&args[1]);
-                    self.state
-                        .emit_fmt(format_args!("    {} ${}, %ymm0, %ymm0", inst, imm));
-                    self.avx_store_dest(dptr);
+                    self.emit_avx_packed_shift(dptr, args, inst);
                 }
             }
             IntrinsicOp::Loadu256 | IntrinsicOp::Load256 => {
@@ -3648,8 +3727,6 @@ impl X86Codegen {
             | IntrinsicOp::Psrawi256
             | IntrinsicOp::Psradi256 => {
                 if let Some(dptr) = dest_ptr {
-                    self.avx_load_arg(&args[0]);
-                    let imm = self.operand_to_imm_i64(&args[1]);
                     let inst = match op {
                         IntrinsicOp::Psllqi256 => "vpsllq",
                         IntrinsicOp::Psrlqi256 => "vpsrlq",
@@ -3657,9 +3734,7 @@ impl X86Codegen {
                         IntrinsicOp::Psradi256 => "vpsrad",
                         _ => unreachable!(),
                     };
-                    self.state
-                        .emit_fmt(format_args!("    {} ${}, %ymm0, %ymm0", inst, imm));
-                    self.avx_store_dest(dptr);
+                    self.emit_avx_packed_shift(dptr, args, inst);
                 }
             }
             IntrinsicOp::Pmovzxbw256

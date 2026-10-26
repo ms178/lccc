@@ -120,36 +120,8 @@ impl I686Codegen {
         false
     }
 
-    // ---- calculate_stack_space ----
-
-    pub(super) fn calculate_stack_space_impl(&mut self, func: &IrFunction) -> i64 {
-        self.is_variadic = func.is_variadic;
-        self.is_fastcall = func.is_fastcall;
-        self.current_return_type = func.return_type;
-        self.current_return_i686_xmm = func.return_type == IrType::I128
-            && func.ret_eightbyte_classes
-                == [
-                    crate::common::types::EightbyteClass::Sse,
-                    crate::common::types::EightbyteClass::SseUp,
-                ];
-        self.current_return_i686_ext_vector_gp3 = func.return_type == IrType::I128
-            && func.ret_eightbyte_classes.len() == 3
-            && func
-                .ret_eightbyte_classes
-                .iter()
-                .all(|class| *class == crate::common::types::EightbyteClass::Integer);
-        // Effective regparm for this function: a function-level
-        // `__attribute__((regparm(N)))` overrides the global -mregparm
-        // flag; fastcall wins over both (GCC passes ECX/EDX and the two
-        // attributes together are rejected at parse time). The
-        // classification itself ignores regparm for variadic functions
-        // (GCC function_arg_32: all-stack).
-        self.regparm = if func.is_fastcall {
-            0
-        } else {
-            func.regparm.unwrap_or(self.base_regparm).min(3)
-        };
-
+    /// Resolve incoming parameter homes once, before conflict analysis and allocation.
+    fn prepare_parameter_layout(&mut self, func: &IrFunction) {
         // Fastcall layout: the single source of truth shared by parameter
         // capture, ParamRef and the return instruction. Computed here (not
         // in emit_store_params) because the conflict analysis below needs
@@ -190,6 +162,39 @@ impl I686Codegen {
         } else {
             self.fastcall_stack_cleanup = 0;
         }
+    }
+
+    // ---- calculate_stack_space ----
+
+    pub(super) fn calculate_stack_space_impl(&mut self, func: &IrFunction) -> i64 {
+        self.is_variadic = func.is_variadic;
+        self.is_fastcall = func.is_fastcall;
+        self.current_return_type = func.return_type;
+        self.current_return_i686_xmm = func.return_type == IrType::I128
+            && func.ret_eightbyte_classes
+                == [
+                    crate::common::types::EightbyteClass::Sse,
+                    crate::common::types::EightbyteClass::SseUp,
+                ];
+        self.current_return_i686_ext_vector_gp3 = func.return_type == IrType::I128
+            && func.ret_eightbyte_classes.len() == 3
+            && func
+                .ret_eightbyte_classes
+                .iter()
+                .all(|class| *class == crate::common::types::EightbyteClass::Integer);
+        // Effective regparm for this function: a function-level
+        // `__attribute__((regparm(N)))` overrides the global -mregparm
+        // flag; fastcall wins over both (GCC passes ECX/EDX and the two
+        // attributes together are rejected at parse time). The
+        // classification itself ignores regparm for variadic functions
+        // (GCC function_arg_32: all-stack).
+        self.regparm = if func.is_fastcall {
+            0
+        } else {
+            func.regparm.unwrap_or(self.base_regparm).min(3)
+        };
+
+        self.prepare_parameter_layout(func);
 
         // Same-block div/rem pair fusion table (one divl serves a
         // URem+UDiv couple with identical operands). Constant-RHS pairs
@@ -615,7 +620,17 @@ impl I686Codegen {
             self.conflict_param_slots
                 .insert(param_idx, StackSlot(offset));
         }
-        space + conflict_params.len() as i64 * 4
+        let mut space = space + conflict_params.len() as i64 * 4;
+        self.vector_ret_buffer_bytes = crate::backend::call_abi::hidden_vector_return_bytes(
+            func.uses_sret,
+            &func.ret_eightbyte_classes,
+        )
+        .unwrap_or(0);
+        if self.vector_ret_buffer_bytes > 0 {
+            space += self.vector_ret_buffer_bytes as i64;
+            self.vector_ret_buffer_offset = -space;
+        }
+        space
     }
 
     // ---- aligned_frame_size ----
@@ -1280,12 +1295,35 @@ impl I686Codegen {
             // CoreArgClass::StructXmmReg -> ParamClass::F128SseReg). Nothing
             // in the prologue uses an XMM register, so the store can sit in
             // parameter order; the parameter object is its 16-byte alloca.
-            if let ParamClass::F128SseReg { reg_idx, .. } = class {
+            if let ParamClass::VectorReturnBuffer { .. } = class {
                 if let Some(slot) =
                     find_param_alloca(func, i).and_then(|(dest, _)| self.state.get_slot(dest.0))
                 {
-                    let dst = self.slot_ref(slot);
-                    emit!(self.state, "    movups %xmm{}, {}", reg_idx, dst);
+                    let source = self.slot_ref(StackSlot(self.vector_ret_buffer_offset));
+                    let destination = self.slot_ref(slot);
+                    emit!(self.state, "    leal {}, %eax", source);
+                    emit!(self.state, "    movl %eax, {}", destination);
+                }
+                continue;
+            }
+            if let ParamClass::F128SseReg { reg_idx, size } = class {
+                if let Some((destination, _)) = find_param_alloca(func, i) {
+                    let Some(slot) = self.state.get_slot(destination.0) else {
+                        continue;
+                    };
+                    let dst = if self.state.alloca_over_align(destination.0).is_some() {
+                        self.emit_alloca_addr_to("eax", destination.0, slot);
+                        "(%eax)".to_string()
+                    } else {
+                        self.slot_ref(slot)
+                    };
+                    let (instruction, register) = match size {
+                        16 => ("movups", format!("xmm{reg_idx}")),
+                        32 => ("vmovups", format!("ymm{reg_idx}")),
+                        64 => ("vmovups", format!("zmm{reg_idx}")),
+                        _ => unreachable!("invalid native vector parameter width"),
+                    };
+                    emit!(self.state, "    {} %{}, {}", instruction, register, dst);
                 }
                 continue;
             }
@@ -1793,6 +1831,12 @@ impl I686Codegen {
                     );
                     return;
                 }
+                ParamClass::VectorReturnBuffer { .. } => {
+                    let source = self.slot_ref(StackSlot(self.vector_ret_buffer_offset));
+                    emit!(self.state, "    leal {}, %eax", source);
+                    self.store_eax_to(dest);
+                    return;
+                }
                 _ => stack_base + (param_idx as i64) * 4,
             }
         } else {
@@ -1843,7 +1887,7 @@ impl I686Codegen {
 
     pub(super) fn emit_epilogue_and_ret_impl(&mut self, frame_size: i64) {
         self.emit_epilogue(frame_size);
-        if self.state.uses_sret && self.regparm == 0 {
+        if self.state.uses_sret && self.vector_ret_buffer_bytes == 0 && self.regparm == 0 {
             // i386 SysV sret: callee pops the hidden pointer.
             // Under -mregparm>=1 the hidden pointer travels in %eax (GCC
             // function_value semantics) — nothing is on the stack to pop.

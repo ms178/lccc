@@ -4510,6 +4510,26 @@ mod cli_tests {
         assert!(d.enable_avx);
     }
 
+    #[test]
+    fn i686_bmi2_builtin_permission_does_not_enable_unsupported_codegen() {
+        for (flags, permitted) in [
+            (vec!["-mbmi2"], true),
+            (vec!["-mbmi2", "-mno-bmi2"], false),
+            (vec!["-mno-bmi2", "-mbmi2"], true),
+        ] {
+            let mut driver = Driver::new();
+            let args: Vec<String> = ["ccc", "-m32"]
+                .into_iter()
+                .chain(flags)
+                .chain(["x.c"])
+                .map(str::to_string)
+                .collect();
+            assert!(driver.parse_cli_args(&args).is_ok());
+            assert_eq!(driver.resolved_builtin_bmi2(), permitted);
+            assert!(!driver.resolved_bmi2());
+        }
+    }
+
     /// The absent-`-march` baseline is plain x86-64 with no BMI1/BMI2, so a
     /// default build must NOT emit ANDN/RORX-class code.  BMI1/BMI2 are v3
     /// members and are granted only by an explicit `-march=x86-64-v3` or `-mbmi*`.
@@ -5579,6 +5599,30 @@ mod prefetch_isa_tests {
     }
 
     #[test]
+    fn legacy_sse41_permission_is_not_the_x86_64_codegen_ceiling() {
+        use crate::common::x86_features::X86Feature as F;
+        for mode in ["-m32", "-m64"] {
+            for (flags, granted) in [
+                (&[][..], false),
+                (&["-msse4.1"][..], true),
+                (&["-march=nehalem"][..], true),
+                (&["-msse4.1", "-mno-sse4.1"][..], false),
+                (&["-mno-sse4.1", "-msse4.1"][..], true),
+                (&["-msse4.1", "-mno-sse2", "-msse"][..], false),
+                (&["-msse4.1", "-mno-sse"][..], false),
+            ] {
+                let mut args = vec![mode];
+                args.extend_from_slice(flags);
+                assert_eq!(
+                    parse(&args).effective_x86_features().contains(F::Sse41),
+                    granted,
+                    "{args:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn i686_sse_feature_mirror_tracks_abi_permission() {
         // The i386 default baseline is the x86-64 ISA level: `-m32` alone
         // resolves SSE AND SSE2 on (GCC 16.2 default `-m32` = `-march=x86-64`
@@ -5691,6 +5735,31 @@ mod prefetch_isa_tests {
                 .contains(crate::common::x86_features::X86Feature::Sse2)
         );
         assert!(!driver.resolved_prefetch_sse());
+    }
+
+    #[test]
+    fn i686_native_avx_permissions_keep_vectorizer_ceiling_closed() {
+        use crate::common::x86_features::X86Feature as F;
+
+        for (flags, avx, avx2) in [
+            (&["-m32"][..], false, false),
+            (&["-m32", "-mavx"][..], true, false),
+            (&["-m32", "-mavx2"][..], true, true),
+            (&["-m32", "-mavx2", "-mno-avx2"][..], true, false),
+            (&["-m32", "-mavx", "-mno-avx"][..], false, false),
+            (&["-m32", "-mno-avx", "-mavx"][..], true, false),
+            (&["-m32", "-mavx2", "-mno-avx2", "-mavx2"][..], true, true),
+            (&["-m32", "-mavx2", "-mno-sse2"][..], false, false),
+            (&["-m32", "-mavx2", "-mno-sse"][..], false, false),
+            (&["-m32", "-mavx2", "-mgeneral-regs-only"][..], false, false),
+        ] {
+            let driver = parse(flags);
+            let features = driver.effective_x86_features();
+            assert_eq!(features.contains(F::Avx), avx, "{flags:?}");
+            assert_eq!(features.contains(F::Avx2), avx2, "{flags:?}");
+            assert!(!driver.x86_isa().avx, "{flags:?}");
+            assert!(!driver.x86_isa().ymm, "{flags:?}");
+        }
     }
 
     #[test]

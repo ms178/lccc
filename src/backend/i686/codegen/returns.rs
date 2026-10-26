@@ -13,6 +13,17 @@ impl I686Codegen {
         self.flush_x87_pending_copy();
         if let Some(val) = val {
             let ret_ty = self.current_return_type;
+            if self.vector_ret_buffer_bytes > 0 {
+                self.operand_to_eax(val);
+                let register = match self.vector_ret_buffer_bytes {
+                    32 => "ymm0",
+                    64 => "zmm0",
+                    _ => unreachable!("invalid wide vector return width"),
+                };
+                emit!(self.state, "    vmovups (%eax), %{}", register);
+                self.emit_epilogue_and_ret(frame_size);
+                return;
+            }
             if ret_ty == IrType::I128 && self.current_return_i686_xmm {
                 match val {
                     Operand::Value(value) => {

@@ -1,5 +1,7 @@
 pub(crate) mod asm_constraints;
 pub(crate) mod asm_scan;
+pub(crate) mod avx_test;
+pub(crate) mod avx_widen;
 pub(crate) mod const_arith;
 pub(crate) mod const_eval;
 pub(crate) mod cpu_probe;
@@ -20,6 +22,7 @@ pub(crate) mod temp_files;
 pub(crate) mod tls;
 pub(crate) mod type_builder;
 pub(crate) mod types;
+pub(crate) mod x86_builtin_types;
 pub(crate) mod x86_features;
 
 pub(crate) mod pass_policy;

@@ -606,7 +606,7 @@ jobs:
     - name: RISC-V relocation rejection and positive controls
       run: python3 tests/linker/check_riscv_relocation_contract.py --lccc target/fastbuild/lccc-riscv
     - name: ISA-sensitive intrinsic feature gate
-      run: env CCC=target/fastbuild/lccc bash tests/regression/check_intrinsic_feature_gate.sh
+      run: python3 scripts/ci_test_report.py -- env CCC=target/fastbuild/lccc bash tests/regression/check_intrinsic_feature_gate.sh
     - name: Verify native VEX flag-read architectural controls
       run: bash tests/regression/check_vex_flag_reads.sh
     # The provisioner is the only thing between the differential harness
@@ -1546,8 +1546,15 @@ jobs:
       env:
         LCCC_CROSS_DEB_DIR: /home/runner/.cache/lccc-cross-debs
       run: bash scripts/ci_provision_cross.sh
+    - name: Cache Clang 23 oracle
+      uses: actions/cache@v6
+      with:
+        path: ~/.cache/lccc/clang-oracle
+        key: lccc-clang-oracle-${{ runner.os }}-${{ hashFiles('scripts/ci_install_clang_oracle.sh') }}
+    - name: Install Clang 23.1.4 oracle for SIMD encodings
+      run: bash scripts/ci_install_clang_oracle.sh
     - name: Verify the lane's oracle toolchain
-      run: bash scripts/ci_verify_oracles.sh
+      run: bash scripts/ci_verify_oracles.sh --clang-version 23.1.4
     - name: Select GCC 16 for legacy oracle invocations
       run: |
         mkdir -p "$RUNNER_TEMP/lccc-oracles"
@@ -1712,6 +1719,8 @@ jobs:
     - name: Verify i686 assembly differential vs GNU as 2.47
       run: python3 scripts/asmdiff.py --32 --jobs 2 --as "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" --objdump "$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump"
         --lccc target/fastbuild/lccc-i686
+    - name: Verify complete SSE3 SSSE3 SSE4 encodings vs Clang 23.1.4
+      run: python3 tests/regression/check_sse34_clang.py
     - name: Verify encdiff corpus vs GNU as 2.47 (offline)
       run: |
         python3 scripts/encdiff.py --offline --quiet \
@@ -2565,6 +2574,8 @@ jobs:
         submodules: recursive
     - name: Verify generated SIMD header matches its generator
       run: python3 scripts/gen_lcccsimd.py --check
+    - name: Canonical GNU builtin type contract synchronization
+      run: python3 scripts/gen_x86_builtin_types.py --check
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
       with:
@@ -2578,7 +2589,22 @@ jobs:
         rustfmt --version
         cargo clippy --version
     - name: Check Rust formatting
+      id: rust-format
       run: cargo fmt --all -- --check
+    - name: Surface Rust formatting diagnostics
+      if: ${{ failure() && steps.rust-format.outcome == 'failure' }}
+      run: |
+        python3 - <<'PYFMT'
+        import os
+        import subprocess
+        from pathlib import Path
+        result = subprocess.run(
+            ["cargo", "fmt", "--all", "--", "--check"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+        Path(os.environ["RUNNER_TEMP"], "rustfmt.log").write_text(result.stdout)
+        PYFMT
+        python3 scripts/ci_annotate_log.py --title "Rust formatting diff" --tail 600 --max 10 "$RUNNER_TEMP/rustfmt.log"
     - name: Run strict Clippy
       env:
         CARGO_BUILD_JOBS: '2'

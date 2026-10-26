@@ -1,0 +1,1 @@
+-mavx2 -msse4.2 -mbmi2

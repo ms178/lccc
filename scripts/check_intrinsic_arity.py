@@ -50,6 +50,7 @@ ENTRY = re.compile(
 BUILTIN_CALL = re.compile(r"\b(__builtin_ia32_\w+)\s*\(")
 # A `_mm*` wrapper declaration or definition: the name is preceded on its line
 # by nothing but a return type, and is not the callee of an assignment.
+WRAPPER_MACRO = re.compile(r"^\s*#\s*define\s+(_mm\w*)\(", re.M)
 WRAPPER_DECL = re.compile(r"^[^\n;#=]*?\b(_mm[\w]*)\s*\(", re.M)
 COMMENT = re.compile(r"/\*.*?\*/|//[^\n]*", re.S)
 
@@ -96,7 +97,12 @@ def count_args(text: str, open_paren: int) -> int:
 
 
 def intrinsic_names(repo: Path) -> set[str]:
-    return {n for n, _k in ENTRY.findall((repo / NAME_TABLE).read_text())}
+    names = {n for n, _k in ENTRY.findall((repo / NAME_TABLE).read_text())}
+    for module in ("avx_test", "avx_widen"):
+        path = repo / f"src/common/{module}.rs"
+        if path.exists():
+            names.update(re.findall(r'"((?:_mm|__builtin_ia32_|__lccc_)\w*)"', path.read_text()))
+    return names
 
 
 # Primitives the bundled headers never mention, so no derivation can see
@@ -125,8 +131,19 @@ def derive(repo: Path) -> dict[str, int]:
         text = COMMENT.sub(" ", header.read_text())
         for m in BUILTIN_CALL.finditer(text):
             counts.setdefault(m.group(1), set()).add(count_args(text, m.end() - 1))
-        for m in WRAPPER_DECL.finditer(text):
+        for m in (*WRAPPER_DECL.finditer(text), *WRAPPER_MACRO.finditer(text)):
             counts.setdefault(m.group(1), set()).add(count_args(text, m.end() - 1))
+    # Canonical GCC signatures also pin raw builtins not used by a wrapper.
+    # COUNT/CONVERT/PTEST are descriptor properties, not C parameters.
+    facts = repo / "engineering/isa/gnu-x86-builtin-types.tsv"
+    if facts.exists():
+        for line in facts.read_text().splitlines():
+            if not line or line.startswith("#"):
+                continue
+            name, descriptor, _mode = line.split("\t")
+            parameters = descriptor.split("_FTYPE_", 1)[1].split("_")
+            arity = len([p for p in parameters if p not in ("VOID", "COUNT", "CONVERT", "PTEST")])
+            counts.setdefault(name, set()).add(arity)
     known = intrinsic_names(repo)
     table = {}
     for name, n in counts.items():

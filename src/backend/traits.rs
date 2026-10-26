@@ -1372,7 +1372,7 @@ pub trait ArchCodegen {
         // Phase 5: Clean up stack.
         // On i386 SysV, sret calls have the callee pop the hidden pointer with `ret $4`,
         // so we subtract those bytes from the caller's cleanup.
-        let callee_pops = self.callee_pops_bytes_for_sret(is_sret);
+        let callee_pops = self.callee_pops_bytes_for_sret(is_sret && vector_return_bytes.is_none());
         let effective_stack_cleanup = stack_arg_space.saturating_sub(callee_pops);
         self.emit_call_cleanup(effective_stack_cleanup, f128_temp_space, indirect);
 

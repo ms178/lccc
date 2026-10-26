@@ -13,26 +13,26 @@ jobs:
     - uses: actions/checkout@v7
     - uses: dtolnay/rust-toolchain@stable
       with:
-        toolchain: 1.99.0
+        toolchain: 1.99.1
         components: rustfmt, clippy
     - name: Ubuntu reference harness (different libc/compiler environment)
       run: python3 tests/linker/test_pr826_redteam.py
     - name: Test the production module independently
       run: |
         set -euo pipefail
-        rustc +1.99.0 --version
-        cargo +1.99.0 --version
-        rustfmt +1.99.0 --version
-        rustup run 1.99.0 clippy-driver --version
+        rustc +1.99.1 --version
+        cargo +1.99.1 --version
+        rustfmt +1.99.1 --version
+        rustup run 1.99.1 clippy-driver --version
         mkdir -p target/redteam
-        python3 scripts/ci_test_report.py -- rustc +1.99.0 --edition=2024 --test tests/linker/riscv_uleb128_unit.rs -D warnings -C opt-level=1 -C debug-assertions=true -o target/redteam/uleb-tests
+        python3 scripts/ci_test_report.py -- rustc +1.99.1 --edition=2024 --test tests/linker/riscv_uleb128_unit.rs -D warnings -C opt-level=1 -C debug-assertions=true -o target/redteam/uleb-tests
         python3 scripts/ci_test_report.py -- target/redteam/uleb-tests
     - name: Check formatting with API-visible failure detail
       run: |
         python3 - <<'PY'
         import subprocess
         import sys
-        result = subprocess.run(["cargo", "+1.99.0", "fmt", "--all", "--", "--check"], capture_output=True, text=True)
+        result = subprocess.run(["cargo", "+1.99.1", "fmt", "--all", "--", "--check"], capture_output=True, text=True)
         output = result.stdout + result.stderr
         print(output)
         if result.returncode:
@@ -59,13 +59,13 @@ jobs:
     - uses: actions/checkout@v7
     - uses: dtolnay/rust-toolchain@stable
       with:
-        toolchain: 1.99.0
+        toolchain: 1.99.1
         components: rustfmt, clippy
     - name: Require exact versions, never silently substitute
       run: |
         set -eu
         test "$(gcc-16 -dumpfullversion)" = 16.2.0
-        rustc +1.99.0 --version | grep '^rustc 1\.99\.0 '
+        rustc +1.99.1 --version | grep '^rustc 1\.99\.1 '
         gcc-16 --version
         clang --version
         ld.lld --version
@@ -76,8 +76,8 @@ jobs:
         python3 tests/linker/check_riscv_relocation_contract.py --oracle-only --oracle ld.lld --only valid- --json target/redteam/valid-oracle.json
     - name: Build the changed compiler and run Rust contract tests
       run: |
-        cargo +1.99.0 build --profile fastbuild --locked -j 2 --bin lccc --bin lccc-riscv --bin lccc-arm --bin lccc-i686
-        cargo +1.99.0 test --profile fastbuild --locked -j 2 backend::riscv::linker
+        cargo +1.99.1 build --profile fastbuild --locked -j 2 --bin lccc --bin lccc-riscv --bin lccc-arm --bin lccc-i686
+        cargo +1.99.1 test --profile fastbuild --locked -j 2 backend::riscv::linker
     - name: Execute changed runtime and relocation contracts
       run: |
         python3 tests/regression/check_pgo_io.py --lccc target/fastbuild/lccc --cc gcc-16 --json target/redteam/pgo.json

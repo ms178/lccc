@@ -168,6 +168,45 @@ compare() {
     echo "ok: $src $* -> $ours (gcc agrees)"
 }
 
+# Native packed integer operations are not baseline SSE2 merely because
+# their C arguments fit in 128 bits. Raw and public names share permission.
+cat >"$tmp/o_ssse3.c" <<'EOF'
+#include <tmmintrin.h>
+__m128i sub(__m128i a,__m128i b) { return _mm_hsub_epi32(a,b); }
+EOF
+cat >"$tmp/o_sse41.c" <<'EOF'
+#include <smmintrin.h>
+__m128i mul(__m128i a,__m128i b) { return _mm_mullo_epi32(a,b); }
+EOF
+reject o_ssse3.c -mssse3 -march=x86-64
+reject o_ssse3.c -mssse3 -mssse3 -mno-ssse3
+accept o_ssse3.c phsubd -march=x86-64 -mssse3
+accept o_ssse3.c phsubd -mno-ssse3 -mssse3
+reject o_sse41.c -msse4.1 -march=x86-64
+accept o_sse41.c pmulld -march=x86-64 -msse4.1
+cat >"$tmp/o_local_ssse3.c" <<'EOF'
+#include <tmmintrin.h>
+__attribute__((target("ssse3"))) __m128i f(__m128i a,__m128i b) { return _mm_hsub_epi32(a,b); }
+EOF
+cat >"$tmp/o_local_sse41.c" <<'EOF'
+#include <smmintrin.h>
+__attribute__((target("sse4.1"))) __m128i f(__m128i a,__m128i b) { return _mm_mullo_epi32(a,b); }
+EOF
+accept o_local_ssse3.c phsubd -march=x86-64
+accept o_local_sse41.c pmulld -march=x86-64
+compare o_local_ssse3.c -march=x86-64
+compare o_local_sse41.c -march=x86-64
+# A local grant must not make an unrelated baseline function legal.
+cat "$tmp/o_local_ssse3.c" > "$tmp/o_local_no_leak.c"
+printf '%s\n' '__m128i g(__m128i a,__m128i b) { return _mm_hsub_epi32(a,b); }' >> "$tmp/o_local_no_leak.c"
+reject o_local_no_leak.c -mssse3 -march=x86-64
+compare o_local_no_leak.c -march=x86-64
+compare o_ssse3.c -march=x86-64
+compare o_ssse3.c -march=x86-64 -mssse3
+compare o_ssse3.c -mssse3 -mno-ssse3
+compare o_sse41.c -march=x86-64
+compare o_sse41.c -march=x86-64 -msse4.1
+
 compare o_crc.c -march=x86-64
 compare o_crc.c -msse4.2
 compare o_crc.c -march=x86-64-v2
@@ -347,24 +386,7 @@ compare o_gfni.c -march=alderlake
 compare o_gfni.c -maes
 compare o_gfni.c -march=alderlake -mno-gfni
 
-# ---------------------------------------------------------------------------
-# RECORDED DEBT (AUD-CPU-4), asserted rather than fixed here: the i686
-# *vector-op* path emits 256-bit VEX code with no permission at all.  Measured
-# before this row was written:
-#
-#   lccc -O2 -m32            -S f256.c   ->  vaddps %ymm1, %ymm0, %ymm0
-#   lccc -O2 -m32 -mno-avx   -S f256.c   ->  vaddps %ymm1, %ymm0, %ymm0
-#   lccc -O2 -m32 -mno-avx   -S i256.c   ->  vpaddd %ymm1, %ymm0, %ymm0
-#
-# So on the 32-bit target a `__m256` operand is lowered to AVX instructions
-# regardless of `-mno-avx`, while the intrinsic table refuses the same class of
-# instruction there.  Both halves are the SIGILL class AUD-CPU-3 closed on
-# x86-64; they need one model, which is a change of its own.  These rows fail
-# the moment the behaviour changes in EITHER direction, so the fix cannot land
-# without updating them in the same commit.
-# (The debt is in the *intrinsic* 256-bit path: a bare `vector_size(32)`
-#  operator addition on i686 is lowered scalar-wise and correctly -- measured
-#  `addss` per lane, no `%ymm` -- so the probe has to name the intrinsic.)
+# AUD-CPU-4: YMM intrinsic permission must agree with GCC on both ABIs.
 cat >"$tmp/i686_ymm_float.c" <<'EOF'
 #include <immintrin.h>
 __m256 add256(__m256 a, __m256 b) { return _mm256_add_ps(a, b); }
@@ -373,20 +395,102 @@ cat >"$tmp/i686_ymm_int.c" <<'EOF'
 #include <immintrin.h>
 __m256i addi256(__m256i a, __m256i b) { return _mm256_add_epi32(a, b); }
 EOF
-debt_ymm() {
-    local src=$1 want=$2
-    shift 2
-    local asm=$tmp/debt-${src%.c}-$(echo "$@" | tr -c 'a-z0-9' '_').s
-    "$ccc" -O2 "$@" -S "$tmp/$src" -o "$asm" ||
-        fail "$src with $*: the recorded AUD-CPU-4 debt no longer reproduces (lccc now refuses); flip this row to a rejection assertion"
-    grep -qE "%ymm" "$asm" ||
-        fail "$src with $*: no %ymm operand any more (AUD-CPU-4 may be fixed); flip this row"
-    grep -qE "^[[:space:]]+v?$want" "$asm" ||
-        fail "$src with $*: expected $want"
-    echo "ok: AUD-CPU-4 debt still reproduces: $src $* emits $want on %ymm"
-}
-debt_ymm i686_ymm_float.c addps -m32
-debt_ymm i686_ymm_float.c addps -m32 -mno-avx
-debt_ymm i686_ymm_int.c paddd -m32 -mno-avx2
+# Regression for the former AUD-CPU-4 SIGILL debt: require the same
+# rejection and permitted native forms as GCC in both x86 modes.
+for mode in -m32 -m64; do
+    reject i686_ymm_float.c -mavx "$mode" -mno-avx
+    reject i686_ymm_int.c -mavx2 "$mode" -mavx -mno-avx2
+    accept i686_ymm_float.c vaddps "$mode" -mavx -mno-avx2
+    accept i686_ymm_int.c vpaddd "$mode" -mavx2
+    compare i686_ymm_float.c "$mode" -mno-avx
+    compare i686_ymm_int.c "$mode" -mavx -mno-avx2
+    compare i686_ymm_float.c "$mode" -mavx -mno-avx2
+    compare i686_ymm_int.c "$mode" -mavx2
+done
+
+# Scalar-count packed shifts retain their ISA requirement even though their
+# runtime count uses an XMM register rather than an immediate.
+cat >"$tmp/shift128.c" <<'EOF'
+#include <immintrin.h>
+__m128i shift(__m128i a, int n) { return _mm_slli_epi16(a, n); }
+EOF
+cat >"$tmp/shift256.c" <<'EOF'
+#include <immintrin.h>
+__m256i shift(__m256i a, int n) { return _mm256_slli_epi16(a, n); }
+EOF
+for mode in -m32 -m64; do
+    reject shift128.c -msse2 "$mode" -mno-sse2 -msse
+    accept shift128.c psllw "$mode" -msse2
+    reject shift256.c -mavx2 "$mode" -mavx -mno-avx2
+    accept shift256.c vpsllw "$mode" -mavx2
+    compare shift128.c "$mode" -mno-sse2 -msse
+    compare shift128.c "$mode" -msse2
+    compare shift256.c "$mode" -mavx -mno-avx2
+    compare shift256.c "$mode" -mavx2
+done
+
+# All VTEST scalar flags require AVX even at 128 bits; none require AVX2.
+# Compile-only raw vector sources need no target libc headers in either mode.
+for bits in 128 256; do
+    for kind in ps pd; do
+        element=float
+        [ "$kind" = pd ] && element=double
+        suffix=
+        [ "$bits" = 256 ] && suffix=256
+        for flag in z c nzc; do
+            src=vtest-$bits-$kind-$flag.c
+            cat >"$tmp/$src" <<EOF
+typedef $element vec __attribute__((vector_size($((bits / 8)))));
+int test(vec a, vec b) { return __builtin_ia32_vtest$flag$kind$suffix(a, b); }
+EOF
+            for mode in -m64 -m32; do
+                reject "$src" -mavx "$mode" -mavx -mno-avx
+                accept "$src" "vtest$kind" "$mode" -mavx -mno-avx2
+            done
+        done
+    done
+done
+
+# Widening instructions are AVX2, unlike floating-point VTEST. Even when
+# only four low source bytes participate, the C input remains a 128-bit value.
+for sign in sx zx; do
+    for shape in bw bd bq wd wq dq; do
+        input=char
+        output=short
+        case "$shape" in
+            wd|wq) input=short ;;
+            dq) input=int ;;
+        esac
+        case "$shape" in
+            bd|wd) output=int ;;
+            bq|wq|dq) output='long long' ;;
+        esac
+        src=widen-$sign-$shape.c
+        cat >"$tmp/$src" <<EOF
+typedef $input source __attribute__((vector_size(16)));
+typedef $output result __attribute__((vector_size(32)));
+result widen(source a) { return __builtin_ia32_pmov$sign${shape}256(a); }
+EOF
+        for mode in -m64 -m32; do
+            reject "$src" -mavx2 "$mode" -mavx -mno-avx2
+            accept "$src" "vpmov$sign$shape" "$mode" -mavx2
+        done
+    done
+done
+
+# Native builtins must reject scalar or wrong-width operands before codegen.
+cat >"$tmp/vtest_wrong_shape.c" <<'EOF'
+typedef float v4sf __attribute__((vector_size(16)));
+int wrong(v4sf a) { return __builtin_ia32_vtestzps256(a, a); }
+EOF
+cat >"$tmp/widen_wrong_shape.c" <<'EOF'
+typedef char v32qi __attribute__((vector_size(32)));
+typedef short v16hi __attribute__((vector_size(32)));
+v16hi wrong(v32qi a) { return __builtin_ia32_pmovsxbw256(a); }
+EOF
+for mode in -m64 -m32; do
+    reject vtest_wrong_shape.c 'requires two' "$mode" -mavx
+    reject widen_wrong_shape.c 'requires a 128-bit vector' "$mode" -mavx2
+done
 
 echo "PASS: ISA-sensitive intrinsics are gated on the permitted feature set, oracle-checked"

@@ -848,13 +848,15 @@ impl Driver {
         // (`__m256` in one `%ymm` under `-mavx`, `__m512` in one `%zmm`
         // under `-mavx512f`, MEMORY otherwise) follows the same requested
         // ISA state, exactly like GCC's `TARGET_AVX`/`TARGET_AVX512F` and
-        // Clang's `AVXLevel`. x86-64 only: the i386 psABI has no AVX
-        // register convention (`sysv_classify` is not consulted there).
-        crate::common::types::set_target_vector_abi_bytes(if self.target == Target::X86_64 {
-            x86_isa_width
-        } else {
-            16
-        });
+        // Clang's `AVXLevel`. Both x86 ABIs use native wide registers
+        // for explicitly enabled GNU vectors.
+        crate::common::types::set_target_vector_abi_bytes(
+            if matches!(self.target, Target::X86_64 | Target::I686) {
+                x86_isa_width
+            } else {
+                16
+            },
+        );
         // 4-byte width-partitioned spill slots are only enabled where the
         // backend's store/load paths are proven width-consistent.  x86-64
         // narrows ≤32-bit spills; i686 naturally accesses every non-wide
@@ -1757,7 +1759,7 @@ impl Driver {
             // or an #ifdef-guarded intrinsic path could disagree with
             // the scalar codegen contract.
             self.resolved_bmi1(),
-            self.resolved_bmi2(),
+            self.resolved_builtin_bmi2(),
             self.resolved_lzcnt(),
             self.resolved_popcnt(),
             self.resolved_movbe(),
@@ -3285,6 +3287,15 @@ impl Driver {
         self.target == Target::X86_64 && !self.bmi2_explicitly_disabled && self.enable_bmi2
     }
 
+    /// Intrinsic/header permission is distinct from BMI2 instruction selection:
+    /// i686 supports the 32-bit BZHI builtin through a defined lowering, while
+    /// its optimizer must not receive the x86-64-only BMI2 codegen grant.
+    pub(super) fn resolved_builtin_bmi2(&self) -> bool {
+        matches!(self.target, Target::X86_64 | Target::I686)
+            && !self.bmi2_explicitly_disabled
+            && self.enable_bmi2
+    }
+
     /// LZCNT/ABM permission (Clz only; TZCNT is BMI1, see
     /// `resolved_codegen_bmi1`). Granted on x86-64 and i686 only by
     /// `-mlzcnt` or an ABM-implying `-march=`, always under the
@@ -3515,7 +3526,12 @@ impl Driver {
         // profile that sets it): the default x86-64 baseline has none of them.
         set.insert_if(simd && self.enable_sse3, F::Sse3);
         set.insert_if(simd && self.enable_ssse3, F::Ssse3);
-        set.insert_if(self.x86_isa().sse41, F::Sse41);
+        // The x86-64 codegen ceiling is deliberately NONE for i686, but
+        // i686 still has explicit 128-bit SSE4.1 intrinsic emitters. Publish
+        // that request from its real SSE2 prerequisite, not the other backend.
+        let legacy_sse41 =
+            set.contains(F::Sse2) && self.enable_sse4_1 && !self.sse41_explicitly_disabled;
+        set.insert_if(legacy_sse41, F::Sse41);
         set.insert_if(simd && self.enable_sse4_2, F::Sse42);
         set.insert_if(self.resolved_popcnt(), F::Popcnt);
         // CMPXCHG16B: granted only by `-mcx16` or a v2+ `-march` profile.
@@ -3523,8 +3539,17 @@ impl Driver {
 
         // SIMD classes straight from the codegen ceiling.
         let isa = self.x86_isa();
-        set.insert_if(isa.avx, F::Avx);
-        set.insert_if(isa.ymm, F::Avx2);
+        // The i686 native intrinsic emitters support VEX even though the
+        // x86-64-only vectorizer ceiling above deliberately remains NONE.
+        // Do not borrow that backend policy to reject explicitly requested
+        // i686 instructions, or widen the vectorizer ceiling to admit them.
+        let i686_avx =
+            !x86_64 && set.contains(F::Sse2) && self.enable_avx && !self.avx_explicitly_disabled;
+        set.insert_if(isa.avx || i686_avx, F::Avx);
+        set.insert_if(
+            isa.ymm || (i686_avx && self.enable_avx2 && !self.avx2_explicitly_disabled),
+            F::Avx2,
+        );
         set.insert_if(isa.fma, F::Fma);
         // F16C is VEX-encoded: `-mno-avx` removes it even when a `-march=`
         // profile asked for it (GCC undefines `__F16C__` for the same
@@ -3619,7 +3644,7 @@ impl Driver {
         // grant, the `-march` ceiling and the sticky denials — the same
         // predicates `__BMI__`/`__BMI2__`/`__LZCNT__`/`__MOVBE__` use.
         set.insert_if(self.resolved_bmi1(), F::Bmi);
-        set.insert_if(self.resolved_bmi2(), F::Bmi2);
+        set.insert_if(self.resolved_builtin_bmi2(), F::Bmi2);
         set.insert_if(self.resolved_lzcnt(), F::Lzcnt);
         set.insert_if(self.resolved_movbe(), F::Movbe);
         // RDRAND has no resolved predicate and no explicit-denial bit; the

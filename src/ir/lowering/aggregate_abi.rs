@@ -33,6 +33,18 @@ impl Lowerer {
     /// x86-64 psABI convention of a by-value struct, union or vector;
     /// `None` on other targets and for anything else.
     pub(super) fn sysv_passing(&self, ct: &CType) -> Option<SysvPassing> {
+        if self.target == crate::backend::Target::I686 {
+            if let CType::Vector(element, bytes @ (32 | 64)) = ct {
+                if *bytes <= crate::common::types::target_vector_abi_bytes()
+                    && (element.is_integer() || matches!(**element, CType::Float | CType::Double))
+                {
+                    let mut classes = vec![EightbyteClass::SseUp; bytes / 8];
+                    classes[0] = EightbyteClass::Sse;
+                    return Some(SysvPassing::Regs(classes));
+                }
+            }
+            return None;
+        }
         if crate::common::types::target_elf_machine() != 62 {
             return None;
         }
@@ -41,6 +53,9 @@ impl Lowerer {
 
     /// The return-position counterpart of `sysv_passing`.
     pub(super) fn sysv_return_passing(&self, ct: &CType) -> Option<SysvPassing> {
+        if self.target == crate::backend::Target::I686 {
+            return self.sysv_passing(ct);
+        }
         if crate::common::types::target_elf_machine() != 62 {
             return None;
         }

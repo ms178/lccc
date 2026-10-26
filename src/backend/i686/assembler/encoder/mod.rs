@@ -23,6 +23,12 @@ use crate::backend::x86::assembler::encoder::{
 };
 use crate::backend::x86::assembler::parser::*;
 
+/// VEX scalar BMI rows whose 32-bit encodings are shared with long mode.
+/// Explicit q spellings deliberately do not enter this path.
+fn is_i686_bmi_mnemonic(stem: &str) -> bool {
+    !stem.ends_with('q') && crate::backend::x86::assembler::encoder::is_bmi_vex_mnemonic(stem)
+}
+
 /// The memory operand of an explicit-operand string op, or `None` when the
 /// operand is not memory (the register side of an accumulator spelling).
 fn string_mem_of(op: &Operand) -> Option<&MemoryOperand> {
@@ -419,7 +425,9 @@ impl InstructionEncoder {
                     self.explicit_data16 = true;
                 }
                 "data32" => return Err("redundant data32 prefix".to_string()),
-                "rex" | "rex.x" => return Err("`rex' is not supported in 32-bit mode".to_string()),
+                "rex" | "rex.x" | "rex64" => {
+                    return Err("`rex' is not supported in 32-bit mode".to_string());
+                }
                 _ => return Err(format!("unknown prefix: {}", prefix)),
             }
         }
@@ -1306,7 +1314,10 @@ impl InstructionEncoder {
         if self.vex_hint.is_some() {
             let raw = instr.mnemonic.to_ascii_lowercase();
             let stem = raw.strip_suffix(".s").unwrap_or(&raw);
-            if !stem.starts_with('v') && !X86InstructionEncoder::is_xop_mnemonic(stem) {
+            if !stem.starts_with('v')
+                && !X86InstructionEncoder::is_xop_mnemonic(stem)
+                && !is_i686_bmi_mnemonic(stem)
+            {
                 return Err(format!("no VEX/XOP encoding for `{stem}'"));
             }
         }
@@ -1357,6 +1368,7 @@ impl InstructionEncoder {
             }
         };
         let ops = &instr.operands;
+        crate::backend::x86::assembler::encoder::check_sse34_operands(mnemonic, ops, false)?;
 
         // Malformed GP data operands do not delegate to the shared vector
         // encoder. Apply the same role check before the local VEX path can
@@ -1619,7 +1631,11 @@ impl InstructionEncoder {
             "bswapl" | "bswap" => self.encode_bswap(ops),
 
             // Bit operations
-            "lzcntl" | "tzcntl" | "popcntl" => self.encode_bit_count(ops, mnemonic),
+            "lzcntl" | "tzcntl" => self.encode_bit_count(ops, mnemonic),
+            "popcnt" | "popcntw" | "popcntl" => {
+                self.sized_op = true;
+                self.encode_via_x64(instr)
+            }
             "bsrl" | "bsfl" | "bsr" | "bsf" => self.encode_bsr_bsf(ops, mnemonic),
             "bsrw" | "bsfw" => self.encode_bsr_bsf_16(ops, mnemonic),
             "btl" | "btsl" | "btrl" | "btcl" | "bt" | "bts" | "btr" | "btc" => {
@@ -2320,9 +2336,9 @@ impl InstructionEncoder {
             // SSE convention used here: ops = [src, dst]. Byte form F0 takes
             // r/m8; word form prefixes 66+F2; the 64-bit form (crc32q) needs
             // REX.W and is unavailable on i686.
-            "crc32b" => self.encode_sse_op(ops, &[0xF2, 0x0F, 0x38, 0xF0]),
-            "crc32w" => self.encode_sse_op(ops, &[0x66, 0xF2, 0x0F, 0x38, 0xF1]),
-            "crc32l" => self.encode_sse_op(ops, &[0xF2, 0x0F, 0x38, 0xF1]),
+            "crc32b" => self.encode_via_x64(instr),
+            "crc32w" => self.encode_via_x64(instr),
+            "crc32l" => self.encode_via_x64(instr),
             "aesimc" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0xDB]),
             "aeskeygenassist" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0xDF]),
 
@@ -2823,6 +2839,18 @@ impl InstructionEncoder {
             "mulps" => self.encode_sse_op(ops, &[0x0F, 0x59]),
             "divps" => self.encode_sse_op(ops, &[0x0F, 0x5E]),
 
+            "phaddsw" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x03]),
+            "phsubsw" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x07]),
+            "pcmpestrm" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x60]),
+            "pcmpestri" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x61]),
+            "pcmpistrm" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x62]),
+            "pcmpistri" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x63]),
+            "lddqu" => self.encode_sse_op(ops, &[0xF2, 0x0F, 0xF0]),
+            "movntdqa" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x2A]),
+            "extrq" | "insertq" | "crc32" => self.encode_via_x64(instr),
+            "movntsd" => self.encode_sse_store_only(ops, &[0xF2, 0x0F, 0x2B]),
+            "movntss" => self.encode_sse_store_only(ops, &[0xF3, 0x0F, 0x2B]),
+
             // SSE3 horizontal operations
             "haddpd" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x7C]),
             "hsubpd" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x7D]),
@@ -2884,6 +2912,7 @@ impl InstructionEncoder {
             "pextrb" => self.encode_sse_extract(ops, &[0x66, 0x0F, 0x3A, 0x14]),
 
             // SSE4.1/SSE4.2 packed integer extensions
+            "pcmpeqq" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x29]),
             "pcmpgtq" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x37]),
 
             // SSE4.1 zero/sign extend
@@ -3262,6 +3291,12 @@ impl InstructionEncoder {
         // eax..edi (ids < 8). LWP on i686 would otherwise find no local
         // arm at all. (Note lwpins/lwpval do not carry the `v` prefix.)
         if X86InstructionEncoder::is_xop_mnemonic(stem) {
+            return Some(self.encode_via_x64(instr));
+        }
+        // The outer mode validator has already rejected 64-bit/extended GP
+        // registers. Reuse the established VEX W=0 rows and the same i686
+        // memory/relocation adaptation as vector delegation; never emit REX.
+        if is_i686_bmi_mnemonic(stem) {
             return Some(self.encode_via_x64(instr));
         }
         if !stem.starts_with('v') {
@@ -4397,5 +4432,38 @@ mod symbol_offset_tests {
         assert_eq!(split_label_offset("a-b"), ("a-b", 0));
         // Whitespace around the sign is allowed, as in `pa_tr_efer + 4`.
         assert_eq!(split_label_offset("pa_tr_efer + 4"), ("pa_tr_efer", 4));
+    }
+}
+
+#[cfg(test)]
+mod sse34_completeness_tests {
+    use super::*;
+    #[test]
+    fn missing_legacy_forms_have_mode_correct_bytes() {
+        for (source, expected) in [
+            ("phaddsw %mm1,%mm2", "0f3803d1"),
+            ("pcmpeqq %xmm1,%xmm2", "660f3829d1"),
+            ("pcmpestri $255,%xmm1,%xmm2", "660f3a61d1ff"),
+            ("lddqu (%eax),%xmm2", "f20ff010"),
+            ("movntdqa (%eax),%xmm2", "660f382a10"),
+            ("extrq $7,$9,%xmm2", "660f78c20907"),
+            ("crc32w 128(%eax),%edx", "66f20f38f19080000000"),
+            ("popcntw (%eax),%dx", "66f30fb810"),
+        ] {
+            let mut e = InstructionEncoder::new();
+            for item in parse_asm(source).unwrap() {
+                if let AsmItem::Instruction(i) = item {
+                    e.encode(&i).unwrap();
+                }
+            }
+            assert_eq!(
+                e.bytes
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>(),
+                expected,
+                "{source}"
+            );
+        }
     }
 }

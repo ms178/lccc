@@ -240,10 +240,14 @@ class ParallelLayout(unittest.TestCase):
         with self.assertRaises(AssertionError):
             validate(changed, self.benchmark)
 
-    def test_research_does_not_add_automatic_pr_builds(self):
+    def test_research_only_explicit_workflow_changes_opt_in(self):
         research = yaml.load((ROOT / '.github/workflows/compiler-research.yml').read_text(),
                              Loader=yaml.BaseLoader)
-        self.assertEqual(set(research['on']), {'workflow_dispatch'})
+        self.assertEqual(set(research['on']), {'workflow_dispatch', 'pull_request'})
+        self.assertEqual(research['on']['pull_request'], {
+            'branches': ['main'],
+            'paths': ['.github/workflows/compiler-research.yml'],
+        })
         self.assertTrue(research['jobs'])
         for job in research['jobs'].values():
             self.assertNotIn('continue-on-error', job)

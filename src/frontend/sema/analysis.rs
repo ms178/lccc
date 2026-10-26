@@ -3271,6 +3271,7 @@ impl SemanticAnalyzer {
                 );
             }
             if builtins::is_builtin(name) {
+                self.check_builtin_vector_arguments(name, args);
                 // A builtin under its own name carries no prototype, so
                 // nothing below could check the call and lowering used
                 // to pass whatever the user wrote straight through to
@@ -3371,6 +3372,43 @@ impl SemanticAnalyzer {
                 _ => "function pointer",
             };
             self.check_call_arguments(name, args, &ft.params, ft.variadic, expr.span());
+        }
+    }
+
+    /// Keep native vector arguments out of scalar/address positions and require
+    /// each vector source's own width (not the destination width for widening).
+    /// This prevents malformed raw calls reaching pointer-backed SIMD emission.
+    fn check_builtin_vector_arguments(&self, name: &str, args: &[Expr]) {
+        let Some(widths) = crate::common::x86_builtin_types::argument_vector_widths(name) else {
+            return;
+        };
+        for (index, (arg, expected)) in args.iter().zip(widths).enumerate() {
+            let inferred;
+            let actual = if let Some(ty) = self.result.expr_types.get(&arg.id()) {
+                ty
+            } else {
+                inferred = self.expr_type_checker().infer_expr_ctype(arg);
+                let Some(ref ty) = inferred else { continue };
+                ty
+            };
+            let width = if actual.is_vector() { actual.size() } else { 0 };
+            if width != *expected {
+                let required = if *expected == 0 {
+                    "scalar or address operand".to_string()
+                } else {
+                    format!("{}-bit vector", expected * 8)
+                };
+                self.diagnostics.borrow_mut().error(
+                    format!(
+                        "argument {} to '{}' requires a {}; have '{}'",
+                        index + 1,
+                        name,
+                        required,
+                        actual
+                    ),
+                    arg.span(),
+                );
+            }
         }
     }
 

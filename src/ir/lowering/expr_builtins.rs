@@ -616,6 +616,140 @@ impl Lowerer {
         Operand::Value(result)
     }
 
+    /// Preserve the 16-byte source / 32-byte destination contract across
+    /// public struct wrappers and GCC native-vector builtin expressions.
+    fn lower_avx_widen(
+        &mut self,
+        op: crate::common::avx_widen::AvxWiden,
+        name: &str,
+        args: &[Expr],
+    ) -> Option<Operand> {
+        self.check_x86_intrinsic_feature(&BuiltinIntrinsic::X86AvxWiden(op), name, args);
+        if args.len() != 1 {
+            return self.reject_builtin_call(format!("'{}' requires 1 argument", name), args, 32);
+        }
+        if !matches!(
+            self.target,
+            crate::backend::Target::X86_64 | crate::backend::Target::I686
+        ) {
+            return self.reject_builtin_call(
+                format!("'{}' is not available on {}", name, self.target.triple()),
+                args,
+                32,
+            );
+        }
+        if name.starts_with("__builtin_ia32_") {
+            let valid = self.get_expr_ctype(&args[0]).is_some_and(|ctype| {
+                ctype.vector_info().is_some_and(|(element, lanes)| {
+                    element.is_integer()
+                        && !matches!(element, CType::Bool)
+                        && element.size() * 8 == op.source_bits()
+                        && lanes == 128 / op.source_bits()
+                })
+            });
+            if !valid {
+                return self.reject_builtin_call(
+                    format!(
+                        "'{}' requires a 128-bit vector of {}-bit integers",
+                        name,
+                        op.source_bits()
+                    ),
+                    args,
+                    32,
+                );
+            }
+        }
+        let input = self.vec128_arg_ptr(&args[0]);
+        let result = self.fresh_value();
+        self.emit(Instruction::Alloca {
+            dest: result,
+            ty: IrType::Ptr,
+            size: 32,
+            align: 32,
+            volatile: false,
+            semantic_volatile: false,
+        });
+        let dest = self.fresh_value();
+        self.emit(Instruction::Intrinsic {
+            dest: Some(dest),
+            op: IntrinsicOp::AvxWiden(op),
+            dest_ptr: Some(result),
+            args: vec![input],
+        });
+        Some(Operand::Value(result))
+    }
+
+    /// VTEST returns scalar flags from native vector operands. In particular,
+    /// it must not be lowered to PTEST, which observes every payload bit.
+    fn lower_avx_test(
+        &mut self,
+        test: crate::common::avx_test::AvxTest,
+        name: &str,
+        args: &[Expr],
+    ) -> Option<Operand> {
+        self.check_x86_intrinsic_feature(&BuiltinIntrinsic::X86AvxTest(test), name, args);
+        if args.len() != 2 {
+            return self.reject_builtin_call(
+                format!("'{}' requires 2 arguments", name),
+                args,
+                test.width(),
+            );
+        }
+        if !matches!(
+            self.target,
+            crate::backend::Target::X86_64 | crate::backend::Target::I686
+        ) {
+            return self.reject_builtin_call(
+                format!("'{}' is not available on {}", name, self.target.triple()),
+                args,
+                test.width(),
+            );
+        }
+        if name.starts_with("__builtin_ia32_") {
+            let expected = if test.double {
+                CType::Double
+            } else {
+                CType::Float
+            };
+            let valid = args.iter().all(|arg| {
+                self.get_expr_ctype(arg).is_some_and(|ctype| {
+                    ctype.vector_info().is_some_and(|(element, lanes)| {
+                        *element == expected && lanes * element.size() == test.width()
+                    })
+                })
+            });
+            if !valid {
+                return self.reject_builtin_call(
+                    format!(
+                        "'{}' requires two {}-bit floating-point vectors",
+                        name,
+                        test.width() * 8
+                    ),
+                    args,
+                    test.width(),
+                );
+            }
+        }
+        let operands = args
+            .iter()
+            .map(|arg| {
+                if test.wide {
+                    self.lower_expr(arg)
+                } else {
+                    self.vec128_arg_ptr(arg)
+                }
+            })
+            .collect();
+        let dest = self.fresh_value();
+        self.emit(Instruction::Intrinsic {
+            dest: Some(dest),
+            op: IntrinsicOp::AvxTest(test),
+            dest_ptr: None,
+            args: operands,
+        });
+        Some(Operand::Value(dest))
+    }
+
     /// Reject a builtin call, lower the arguments for their side effects, and
     /// return a placeholder of `bytes` bytes.
     fn reject_builtin_call(
@@ -1147,6 +1281,14 @@ impl Lowerer {
             | BuiltinIntrinsic::X86Pmaddubsw128
             | BuiltinIntrinsic::X86Phaddw128
             | BuiltinIntrinsic::X86Phaddd128
+            | BuiltinIntrinsic::X86Phsubw128
+            | BuiltinIntrinsic::X86Phsubd128
+            | BuiltinIntrinsic::X86Phaddsw128
+            | BuiltinIntrinsic::X86Phsubsw128
+            | BuiltinIntrinsic::X86Psignb128
+            | BuiltinIntrinsic::X86Psignw128
+            | BuiltinIntrinsic::X86Psignd128
+            | BuiltinIntrinsic::X86Pmulhrsw128
             | BuiltinIntrinsic::X86Pshufb128
             | BuiltinIntrinsic::X86Pabsb128
             | BuiltinIntrinsic::X86Pabsw128
@@ -1349,6 +1491,8 @@ impl Lowerer {
             // width, any power-of-two-or-not lane count.
             BuiltinIntrinsic::Shuffle => self.lower_shuffle(args),
             // Generic SIMD family: __lccc_simd{128|256|512}_{i|ps|pd}_{mnemonic}
+            BuiltinIntrinsic::X86AvxWiden(op) => self.lower_avx_widen(*op, name, args),
+            BuiltinIntrinsic::X86AvxTest(test) => self.lower_avx_test(*test, name, args),
             BuiltinIntrinsic::LcccSimd => self.lower_lccc_simd(name, args),
             // __builtin___*_chk: fortification builtins forward to unchecked libc equivalents.
             // Each __builtin___X_chk(args..., extra_check_args...) becomes X(args...).
@@ -1961,46 +2105,10 @@ impl Lowerer {
         Some(Operand::Value(alloca))
     }
 
-    /// Lower a 128-bit vector ARGUMENT expression to a pointer at its
-    /// 16 data bytes. Vector lvalues already lower to their alloca POINTER;
-    /// a nested raw builtin (Vec128Value) yields a packed I128 VALUE, which
-    /// must be spilled to a fresh slot first. Distinguishing via the C type
-    /// (is_vector => pointer convention) is the load-bearing check: spilling
-    /// a pointer, or passing an I128 through unspilled, both corrupt lanes.
+    /// Native vectors, including nested GNU builtin results and equal-width
+    /// casts, share the ordinary vector object-address IR representation.
     fn vec128_arg_ptr(&mut self, arg: &Expr) -> Operand {
-        // By-value producers are exactly the raw 128-bit builtins (they have
-        // no vector CType on purpose — see expr_types.rs). Everything else
-        // with 16-byte vector shape lowers to an alloca POINTER.
-        let is_by_value = matches!(arg,
-            Expr::FunctionCall(callee, _, _)
-                if matches!(&**callee, Expr::Identifier(n, _)
-                    if matches!(n.as_str(),
-                        "__builtin_ia32_maxps" | "__builtin_ia32_minps"
-                        | "__builtin_ia32_shufps"
-                        | "__builtin_ia32_vextractf128_ps256")));
-        let op = self.lower_expr(arg);
-        if !is_by_value {
-            return op; // alloca pointer convention
-        }
-        // By-value packed I128 (nested raw builtin): spill to a slot.
-        let slot = self.fresh_value();
-        self.emit(Instruction::Alloca {
-            dest: slot,
-            ty: IrType::Ptr,
-            size: 16,
-            align: 16,
-            volatile: false,
-            semantic_volatile: false,
-        });
-        let val = self.operand_to_value(op);
-        self.emit(Instruction::Store {
-            volatile: false,
-            val: Operand::Value(val),
-            ptr: slot,
-            ty: IrType::I128,
-            seg_override: AddressSpace::Default,
-        });
-        Operand::Value(slot)
+        self.lower_expr(arg)
     }
 
     /// Load the 16 bytes at `slot` and pack them into a by-value I128
@@ -2610,7 +2718,45 @@ impl Lowerer {
         let Some(requirement) = x86_intrinsic_required_feature(intrinsic) else {
             return;
         };
-        if crate::common::x86_features::effective().contains(requirement.feature) {
+        let mut permitted = crate::common::x86_features::effective().contains(requirement.feature);
+        // Legacy 128-bit extensions keep the same register/ABI class under a
+        // function target attribute. Honor that local permission without leaking
+        // it into another function or claiming per-function wider-vector support.
+        use crate::common::x86_features::X86Feature as F;
+        let needed = match requirement.feature {
+            F::Sse2 => Some(1),
+            F::Avx2 => Some(7),
+            F::Avx => Some(6),
+            F::Ssse3 => Some(3),
+            F::Sse41 => Some(4),
+            F::Sse42 => Some(5),
+            _ => None,
+        };
+        if let (Some(needed), Some(function)) = (needed, self.func_state.as_ref()) {
+            for request in &function.target_features {
+                let (enabled, feature) = request
+                    .strip_prefix("no-")
+                    .map_or((true, request.as_str()), |f| (false, f));
+                let level = match feature {
+                    "sse" => 0,
+                    "sse2" => 1,
+                    "sse3" => 2,
+                    "ssse3" => 3,
+                    "sse4.1" => 4,
+                    "sse4.2" => 5,
+                    "avx" => 6,
+                    "avx2" => 7,
+                    _ => continue,
+                };
+                if enabled && level >= needed {
+                    permitted = true;
+                }
+                if !enabled && level <= needed {
+                    permitted = false;
+                }
+            }
+        }
+        if permitted {
             return;
         }
         self.diagnostics.borrow_mut().error(
@@ -2739,6 +2885,53 @@ impl Lowerer {
         Some(Operand::Value(dest))
     }
 
+    /// Builtins bypass ordinary call marshalling, but still require C parameter
+    /// conversions. Retain vector/address operands as object carriers.
+    pub(super) fn lower_typed_x86_builtin_argument(
+        &mut self,
+        name: &str,
+        arg: &Expr,
+        index: usize,
+    ) -> Operand {
+        let target = match crate::common::x86_builtin_types::argument_scalar_types(name) {
+            Some(types) => types.get(index).copied().flatten(),
+            None => self
+                .func_meta
+                .sigs
+                .get(name)
+                .and_then(|signature| signature.param_ctypes.get(index))
+                .filter(|ty| ty.is_integer() || ty.is_floating())
+                .map(IrType::from_ctype),
+        };
+        match target {
+            Some(target) => {
+                let source = self.get_expr_type(arg);
+                let value = self.lower_expr(arg);
+                // Preserve constant immediates even at O0: a numeric C
+                // conversion must not turn a valid immediate into an SSA value.
+                let folded = match &value {
+                    Operand::Const(IrConst::F32(value)) => {
+                        IrConst::cast_float_to_target(*value as f64, target)
+                    }
+                    Operand::Const(IrConst::F64(value)) => {
+                        IrConst::cast_float_to_target(*value, target)
+                    }
+                    Operand::Const(IrConst::LongDouble(_, bytes)) => {
+                        IrConst::cast_long_double_to_target(bytes, target)
+                    }
+                    _ => None,
+                };
+                match folded {
+                    Some(value) => Operand::Const(value),
+                    None => self.emit_implicit_cast(value, source, target),
+                }
+            }
+            // No redundant type inference or signature-map probe for native
+            // vector/address operands already described by canonical metadata.
+            None => self.lower_expr(arg),
+        }
+    }
+
     fn lower_x86_intrinsic(
         &mut self,
         intrinsic: &BuiltinIntrinsic,
@@ -2765,6 +2958,15 @@ impl Lowerer {
                 16,
             );
         }
+        if self.target == crate::backend::Target::I686
+            && crate::common::x86_builtin_types::requires_64_bit(name)
+        {
+            return self.reject_builtin_call(
+                format!("'{name}' is only available in 64-bit x86 mode"),
+                args,
+                16,
+            );
+        }
         let op = x86_intrinsic_op(intrinsic);
         match x86_intrinsic_kind(intrinsic) {
             X86IntrinsicKind::Fence => {
@@ -2777,7 +2979,11 @@ impl Lowerer {
                 Some(Operand::Const(IrConst::I64(0)))
             }
             X86IntrinsicKind::VoidArgs => {
-                let arg_ops: Vec<Operand> = args.iter().map(|a| self.lower_expr(a)).collect();
+                let arg_ops: Vec<Operand> = args
+                    .iter()
+                    .enumerate()
+                    .map(|(index, arg)| self.lower_typed_x86_builtin_argument(name, arg, index))
+                    .collect();
                 self.emit(Instruction::Intrinsic {
                     dest: None,
                     op,
@@ -2794,7 +3000,11 @@ impl Lowerer {
                     }
                     return Some(Operand::Const(IrConst::I64(0)));
                 }
-                let arg_ops: Vec<Operand> = args.iter().map(|a| self.lower_expr(a)).collect();
+                let arg_ops: Vec<Operand> = args
+                    .iter()
+                    .enumerate()
+                    .map(|(index, arg)| self.lower_typed_x86_builtin_argument(name, arg, index))
+                    .collect();
                 let ptr_val = self.operand_to_value(arg_ops[0].clone());
                 self.emit(Instruction::Intrinsic {
                     dest: None,
@@ -2805,7 +3015,55 @@ impl Lowerer {
                 Some(Operand::Const(IrConst::I64(0)))
             }
             X86IntrinsicKind::Vec128 | X86IntrinsicKind::Vec256 => {
-                let arg_ops: Vec<Operand> = args.iter().map(|a| self.lower_expr(a)).collect();
+                // GNU's byte-lane shift/align builtins take BIT counts;
+                // the instruction IR and public _mm APIs take byte counts.
+                let bit_count = name.starts_with("__builtin_ia32_")
+                    && matches!(
+                        intrinsic,
+                        BuiltinIntrinsic::X86Pslldqi128
+                            | BuiltinIntrinsic::X86Psrldqi128
+                            | BuiltinIntrinsic::X86Pslldqi256
+                            | BuiltinIntrinsic::X86Psrldqi256
+                            | BuiltinIntrinsic::X86Palignr128
+                    );
+                let normalized_count = if bit_count {
+                    let count = args
+                        .last()
+                        .and_then(|arg| self.eval_const_expr(arg))
+                        .and_then(|value| match value {
+                            IrConst::F32(value) => {
+                                IrConst::cast_float_to_target(value as f64, IrType::I32)
+                            }
+                            IrConst::F64(value) => {
+                                IrConst::cast_float_to_target(value, IrType::I32)
+                            }
+                            IrConst::LongDouble(_, bytes) => {
+                                IrConst::cast_long_double_to_target(&bytes, IrType::I32)
+                            }
+                            other => Some(other.narrowed_to(IrType::I32)),
+                        })
+                        .and_then(|value| value.to_i64());
+                    let Some(count) =
+                        count.filter(|count| (0..=2040).contains(count) && count % 8 == 0)
+                    else {
+                        return self.reject_builtin_call(
+                            format!("'{name}' requires a constant bit count in 0..2040 divisible by eight"),
+                            args,
+                            16,
+                        );
+                    };
+                    Some(count / 8)
+                } else {
+                    None
+                };
+                let mut arg_ops: Vec<Operand> = args
+                    .iter()
+                    .enumerate()
+                    .map(|(index, arg)| self.lower_typed_x86_builtin_argument(name, arg, index))
+                    .collect();
+                if let (Some(count), Some(last)) = (normalized_count, arg_ops.last_mut()) {
+                    *last = Operand::Const(IrConst::I64(count));
+                }
                 let result_size = match x86_intrinsic_kind(intrinsic) {
                     X86IntrinsicKind::Vec128 => 16,
                     X86IntrinsicKind::Vec256 => 32,
@@ -2833,122 +3091,12 @@ impl Lowerer {
                 });
                 Some(Operand::Value(result_alloca))
             }
-            X86IntrinsicKind::Vec128Value => {
-                // GCC's __builtin_ia32_* return the vector BY VALUE — unlike
-                // the _mm_* wrappers, whose bundled-header definition routes
-                // through __lccc_simd* and dereferences the returned pointer
-                // itself (__CCC_M128_FROM_BUILTIN = *(__m128*)(e)). A caller
-                // of the raw builtin has no such deref: handing back the
-                // alloca POINTER made the function return `lea slot(%rsp)`
-                // + cqto — an address and sign-extension garbage instead of
-                // the 16 data bytes (kernel NAP governor's v4sf clamp
-                // produced -3e+34). Materialize the I128 value: two I64
-                // halves loaded from the result slot, widened and packed —
-                // the same representation ordinary v4sf loads lower to.
-                // Vector args go through vec128_arg_ptr: vector lvalues are
-                // already alloca pointers, nested raw-builtin results are
-                // packed I128 values that must be spilled to a slot first.
-                // Integer args (the imm8 of shufps/vextractf128) pass through.
+            X86IntrinsicKind::Scalar => {
                 let arg_ops: Vec<Operand> = args
                     .iter()
-                    .map(|a| {
-                        let is_int = self
-                            .get_expr_ctype(a)
-                            .map(|ct| ct.is_integer())
-                            .unwrap_or(false);
-                        if is_int {
-                            self.lower_expr(a)
-                        } else {
-                            self.vec128_arg_ptr(a)
-                        }
-                    })
+                    .enumerate()
+                    .map(|(index, arg)| self.lower_typed_x86_builtin_argument(name, arg, index))
                     .collect();
-
-                let result_alloca = self.fresh_value();
-                self.emit(Instruction::Alloca {
-                    dest: result_alloca,
-                    ty: IrType::Ptr,
-                    size: 16,
-                    align: 16,
-                    volatile: false,
-                    semantic_volatile: false,
-                });
-                let dest_val = self.fresh_value();
-                self.emit(Instruction::Intrinsic {
-                    dest: Some(dest_val),
-                    op,
-                    dest_ptr: Some(result_alloca),
-                    args: arg_ops,
-                });
-                // lo half
-                let lo = self.fresh_value();
-                self.emit(Instruction::Load {
-                    volatile: false,
-                    dest: lo,
-                    ptr: result_alloca,
-                    ty: IrType::I64,
-                    seg_override: crate::common::types::AddressSpace::Default,
-                });
-                // hi half: result_alloca + 8 (GEP so analyses see a proper derived pointer)
-                let hi_ptr = self.fresh_value();
-                self.emit(Instruction::GetElementPtr {
-                    dest: hi_ptr,
-                    base: result_alloca,
-                    offset: Operand::Const(IrConst::I64(8)),
-                    ty: IrType::I8,
-                });
-                let hi = self.fresh_value();
-                self.emit(Instruction::Load {
-                    volatile: false,
-                    dest: hi,
-                    ptr: hi_ptr,
-                    ty: IrType::I64,
-                    seg_override: crate::common::types::AddressSpace::Default,
-                });
-                // ILP32 targets have no I128 value representation (the i686
-                // backend's I128 arithmetic is a libgcc-helper shape for
-                // __int128, not a general 128-bit scalar), so the x86-64
-                // pack-into-I128 trick does not port. There the aggregate
-                // convention IS pointer-based: hand back the result alloca
-                // pointer and let the caller copy the 16 bytes like any other
-                // aggregate expression.
-                if self.target == crate::backend::Target::I686 {
-                    return Some(Operand::Value(result_alloca));
-                }
-                let lo128 = self.fresh_value();
-                self.emit(Instruction::Cast {
-                    dest: lo128,
-                    src: Operand::Value(lo),
-                    from_ty: IrType::U64,
-                    to_ty: IrType::I128,
-                });
-                let hi128 = self.fresh_value();
-                self.emit(Instruction::Cast {
-                    dest: hi128,
-                    src: Operand::Value(hi),
-                    from_ty: IrType::U64,
-                    to_ty: IrType::I128,
-                });
-                let shifted = self.fresh_value();
-                self.emit(Instruction::BinOp {
-                    dest: shifted,
-                    op: IrBinOp::Shl,
-                    lhs: Operand::Value(hi128),
-                    rhs: Operand::Const(IrConst::I64(64)),
-                    ty: IrType::I128,
-                });
-                let packed = self.fresh_value();
-                self.emit(Instruction::BinOp {
-                    dest: packed,
-                    op: IrBinOp::Or,
-                    lhs: Operand::Value(shifted),
-                    rhs: Operand::Value(lo128),
-                    ty: IrType::I128,
-                });
-                Some(Operand::Value(packed))
-            }
-            X86IntrinsicKind::Scalar => {
-                let arg_ops: Vec<Operand> = args.iter().map(|a| self.lower_expr(a)).collect();
                 let dest_val = self.fresh_value();
                 self.emit(Instruction::Intrinsic {
                     dest: Some(dest_val),
@@ -2981,9 +3129,6 @@ enum X86IntrinsicKind {
     PtrStore,
     /// 128-bit vector result allocated on stack, returns pointer.
     Vec128,
-    /// 128-bit vector returned BY VALUE as packed I128 (raw GCC
-    /// __builtin_ia32_* semantics — no header wrapper dereferences it).
-    Vec128Value,
     /// 256-bit vector result allocated on stack.
     Vec256,
     /// Scalar result in a dest register.
@@ -3255,20 +3400,11 @@ fn x86_intrinsic_kind(intrinsic: &BuiltinIntrinsic) -> X86IntrinsicKind {
         | BuiltinIntrinsic::X86Pabsd256
         | BuiltinIntrinsic::X86Pmuludq256 => X86IntrinsicKind::Vec256,
         BuiltinIntrinsic::X86CastReinterpret => X86IntrinsicKind::CastReinterpret,
-        // Raw GCC vector builtins (no _mm_ wrapper): value semantics.
-        BuiltinIntrinsic::X86MaxPs128 | BuiltinIntrinsic::X86MinPs128 => {
-            X86IntrinsicKind::Vec128Value
-        }
-        // __builtin_ia32_shufps returns BY VALUE (raw GCC builtin, no wrapper
-        // deref); the imm8 rides as the last argument, which is exactly the
-        // (a, b, imm) shape the ShufPs128 backend op consumes.
-        BuiltinIntrinsic::X86ShufPsValue => X86IntrinsicKind::Vec128Value,
-        // __builtin_ia32_cvtpd2ps returns v4sf BY VALUE (raw GCC builtin).
-        BuiltinIntrinsic::X86CvtPd2PsValue => X86IntrinsicKind::Vec128Value,
-        // vextractf128_ps256 returns a 16-byte vector BY VALUE from a ymm arg.
-        BuiltinIntrinsic::X86Vextractf128V => X86IntrinsicKind::Vec128Value,
-        // 256-bit raw builtins: v8sf is pointer/sret convention everywhere,
-        // so the Vec256 pointer-returning arm is already value-correct.
+        // Native C vectors share object-address IR carriers on both x86 modes.
+        BuiltinIntrinsic::X86MaxPs128 | BuiltinIntrinsic::X86MinPs128 => X86IntrinsicKind::Vec128,
+        BuiltinIntrinsic::X86ShufPsValue => X86IntrinsicKind::Vec128,
+        BuiltinIntrinsic::X86CvtPd2PsValue => X86IntrinsicKind::Vec128,
+        BuiltinIntrinsic::X86Vextractf128V => X86IntrinsicKind::Vec128,
         BuiltinIntrinsic::X86MaxPs256V
         | BuiltinIntrinsic::X86MinPs256V
         | BuiltinIntrinsic::X86AndPs256V
@@ -3308,6 +3444,115 @@ fn x86_intrinsic_required_feature(intrinsic: &BuiltinIntrinsic) -> Option<Intrin
     use crate::common::x86_features::X86Feature as F;
     use BuiltinIntrinsic as B;
     Some(match intrinsic {
+        // Packed floating-point YMM operations are AVX, not AVX2, on both
+        // x86 ABIs. Never let an absent permission fall through to emission.
+        B::X86AddPs256
+        | B::X86SubPs256
+        | B::X86MulPs256
+        | B::X86AddPd256
+        | B::X86SubPd256
+        | B::X86MulPd256
+        | B::X86LoaduPs256
+        | B::X86StoreuPs256
+        | B::X86LoaduPd256
+        | B::X86StoreuPd256
+        | B::X86MaxPs256V
+        | B::X86MinPs256V
+        | B::X86AndPs256V
+        | B::X86CmpPs256V => IntrinsicRequirement {
+            feature: F::Avx,
+            flag: "-mavx",
+            also: None,
+        },
+        B::X86Paddb256
+        | B::X86Paddw256
+        | B::X86Paddd256
+        | B::X86Paddq256
+        | B::X86Psubb256
+        | B::X86Psubw256
+        | B::X86Psubd256
+        | B::X86Psubq256
+        | B::X86Pmulld256
+        | B::X86Pmullw256
+        | B::X86Pmulhw256
+        | B::X86Pmuludq256
+        | B::X86Psllidi256
+        | B::X86Psrlidi256
+        | B::X86Psllwi256
+        | B::X86Psrlwi256
+        | B::X86Psllqi256
+        | B::X86Psrlqi256
+        | B::X86Psrawi256
+        | B::X86Psradi256
+        | B::X86Pslldqi256
+        | B::X86Psrldqi256 => IntrinsicRequirement {
+            feature: F::Avx2,
+            flag: "-mavx2",
+            also: None,
+        },
+        B::X86Pslldqi128
+        | B::X86Psrldqi128
+        | B::X86Psllqi128
+        | B::X86Psrlqi128
+        | B::X86Psllwi128
+        | B::X86Psrlwi128
+        | B::X86Psrawi128
+        | B::X86Psradi128
+        | B::X86Pslldi128
+        | B::X86Psrldi128 => IntrinsicRequirement {
+            feature: F::Sse2,
+            flag: "-msse2",
+            also: None,
+        },
+        B::X86AvxWiden(_) => IntrinsicRequirement {
+            feature: F::Avx2,
+            flag: "-mavx2",
+            also: None,
+        },
+        B::X86AvxTest(_) => IntrinsicRequirement {
+            feature: F::Avx,
+            flag: "-mavx",
+            also: None,
+        },
+        // Public headers must not silently introduce SSSE3 above a declared
+        // SSE2 ceiling. Include the raw builtin aliases in this same gate.
+        B::X86Pmaddubsw128
+        | B::X86Phaddw128
+        | B::X86Phaddd128
+        | B::X86Phsubw128
+        | B::X86Phsubd128
+        | B::X86Phaddsw128
+        | B::X86Phsubsw128
+        | B::X86Psignb128
+        | B::X86Psignw128
+        | B::X86Psignd128
+        | B::X86Pmulhrsw128
+        | B::X86Pshufb128
+        | B::X86Pabsb128
+        | B::X86Pabsw128
+        | B::X86Pabsd128
+        | B::X86Palignr128 => IntrinsicRequirement {
+            feature: F::Ssse3,
+            flag: "-mssse3",
+            also: None,
+        },
+        B::X86Pinsrd128
+        | B::X86Pextrd128
+        | B::X86Pinsrb128
+        | B::X86Pextrb128
+        | B::X86Pinsrq128
+        | B::X86Pextrq128
+        | B::X86Pblendvb128
+        | B::X86Pblendw128
+        | B::X86Pmovzxbw128
+        | B::X86Pmovzxwd128
+        | B::X86MulEpi32
+        | B::X86MulloEpi32
+        | B::X86Testz128 => IntrinsicRequirement {
+            feature: F::Sse41,
+            flag: "-msse4.1",
+            also: None,
+        },
         // SSE4.2 introduced CRC32: `_mm_crc32_u8` and its width siblings.
         B::X86Crc32_8 | B::X86Crc32_16 | B::X86Crc32_32 | B::X86Crc32_64 => IntrinsicRequirement {
             feature: F::Sse42,
@@ -3551,6 +3796,14 @@ fn x86_intrinsic_op(intrinsic: &BuiltinIntrinsic) -> IntrinsicOp {
         BuiltinIntrinsic::X86Pmaddubsw128 => IntrinsicOp::Pmaddubsw128,
         BuiltinIntrinsic::X86Phaddw128 => IntrinsicOp::Phaddw128,
         BuiltinIntrinsic::X86Phaddd128 => IntrinsicOp::Phaddd128,
+        BuiltinIntrinsic::X86Phsubw128 => IntrinsicOp::Phsubw128,
+        BuiltinIntrinsic::X86Phsubd128 => IntrinsicOp::Phsubd128,
+        BuiltinIntrinsic::X86Phaddsw128 => IntrinsicOp::Phaddsw128,
+        BuiltinIntrinsic::X86Phsubsw128 => IntrinsicOp::Phsubsw128,
+        BuiltinIntrinsic::X86Psignb128 => IntrinsicOp::Psignb128,
+        BuiltinIntrinsic::X86Psignw128 => IntrinsicOp::Psignw128,
+        BuiltinIntrinsic::X86Psignd128 => IntrinsicOp::Psignd128,
+        BuiltinIntrinsic::X86Pmulhrsw128 => IntrinsicOp::Pmulhrsw128,
         BuiltinIntrinsic::X86Pshufb128 => IntrinsicOp::Pshufb128,
         BuiltinIntrinsic::X86Pabsb128 => IntrinsicOp::Pabsb128,
         BuiltinIntrinsic::X86Pabsw128 => IntrinsicOp::Pabsw128,

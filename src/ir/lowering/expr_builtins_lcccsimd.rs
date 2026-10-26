@@ -435,9 +435,10 @@ impl Lowerer {
         // operands; re-append the immediate (if any) as the LAST operand.
         let mut arg_ops: Vec<Operand> = args
             .iter()
+            .enumerate()
             .skip(1)
             .take(nargs)
-            .map(|a| self.lower_expr(a))
+            .map(|(index, arg)| self.lower_typed_x86_builtin_argument(name, arg, index))
             .collect();
         if has_imm {
             if let Some(imm_expr) = args.first() {

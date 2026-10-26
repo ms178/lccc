@@ -81,6 +81,24 @@ class MergeReports(unittest.TestCase):
         self.assertEqual(merged["aggregate_lccc_vs_gcc"]["n_correct_benchmarks"], 3)
         self.assertEqual(len(merged["shards"]), 2)
 
+    def test_each_row_retains_its_actual_cpu_and_affinity(self):
+        intel = report(["a"])
+        amd = report(["b"])
+        intel["metadata"]["cpu_models"] = ["Intel test"]
+        amd["metadata"]["cpu_models"] = ["AMD test"]
+        amd["metadata"]["pinning"] = {"applied": True, "cpu": 3}
+        merged = self.merge(intel, amd)
+        self.assertEqual(merged["metadata"]["cpu_models"], ["AMD test", "Intel test"])
+        self.assertEqual(merged["shards"][1]["metadata"], amd["metadata"])
+        self.assertEqual(merged["benchmarks"][1]["measurement_shard"], "shard-1.json")
+        self.assertEqual(merged["metadata"]["pinning"]["per_shard"]["shard-1.json"]["cpu"], 3)
+        self.assertIn("Mixed-CPU", merged["runner_warnings"][0])
+        markdown = bench.render_markdown(merged)
+        self.assertIn("AMD test / `shard-1.json`", markdown)
+        self.assertIn("Intel test / `shard-0.json`", markdown)
+        self.assertIn("Optimization:", markdown)
+        self.assertIn("not one CPU", markdown)
+
     def test_incomplete_shard_is_refused(self):
         partial = report(["a"], complete=False)
         with self.assertRaises(SystemExit) as caught:

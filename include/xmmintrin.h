@@ -22,31 +22,31 @@
 static __inline__ __m128 __attribute__((__always_inline__))
 _mm_setzero_ps(void)
 {
-    return (__m128){ { 0.0f, 0.0f, 0.0f, 0.0f } };
+    return (__m128){  0.0f, 0.0f, 0.0f, 0.0f  };
 }
 
 static __inline__ __m128 __attribute__((__always_inline__))
 _mm_set1_ps(float __w)
 {
-    return (__m128){ { __w, __w, __w, __w } };
+    return (__m128){  __w, __w, __w, __w  };
 }
 
 static __inline__ __m128 __attribute__((__always_inline__))
 _mm_set_ps(float __z, float __y, float __x, float __w)
 {
-    return (__m128){ { __w, __x, __y, __z } };
+    return (__m128){  __w, __x, __y, __z  };
 }
 
 static __inline__ __m128 __attribute__((__always_inline__))
 _mm_setr_ps(float __w, float __x, float __y, float __z)
 {
-    return (__m128){ { __w, __x, __y, __z } };
+    return (__m128){  __w, __x, __y, __z  };
 }
 
 static __inline__ __m128 __attribute__((__always_inline__))
 _mm_set_ss(float __w)
 {
-    return (__m128){ { __w, 0.0f, 0.0f, 0.0f } };
+    return (__m128){  __w, 0.0f, 0.0f, 0.0f  };
 }
 
 /* _mm_set_ps1 is a standard alias for _mm_set1_ps */
@@ -71,14 +71,14 @@ _mm_load_ps(const float *__p)
 static __inline__ __m128 __attribute__((__always_inline__))
 _mm_load_ss(const float *__p)
 {
-    return (__m128){ { *__p, 0.0f, 0.0f, 0.0f } };
+    return (__m128){  *__p, 0.0f, 0.0f, 0.0f  };
 }
 
 static __inline__ __m128 __attribute__((__always_inline__))
 _mm_load1_ps(const float *__p)
 {
     float __v = *__p;
-    return (__m128){ { __v, __v, __v, __v } };
+    return (__m128){  __v, __v, __v, __v  };
 }
 
 #define _mm_load_ps1(p) _mm_load1_ps(p)
@@ -100,14 +100,14 @@ _mm_store_ps(float *__p, __m128 __a)
 static __inline__ void __attribute__((__always_inline__))
 _mm_store_ss(float *__p, __m128 __a)
 {
-    *__p = __a.__val[0];
+    *__p = __a[0];
 }
 
 static __inline__ void __attribute__((__always_inline__))
 _mm_store1_ps(float *__p, __m128 __a)
 {
-    __p[0] = __a.__val[0]; __p[1] = __a.__val[0];
-    __p[2] = __a.__val[0]; __p[3] = __a.__val[0];
+    __p[0] = __a[0]; __p[1] = __a[0];
+    __p[2] = __a[0]; __p[3] = __a[0];
 }
 
 #define _mm_store_ps1(p, a) _mm_store1_ps(p, a)
@@ -139,22 +139,22 @@ _mm_storeh_pi(__m64 *__p, __m128 __a)
 static __inline__ __m128 __attribute__((__always_inline__))
 _mm_add_ps(__m128 __a, __m128 __b)
 {
-    return (__m128){ { __a.__val[0] + __b.__val[0], __a.__val[1] + __b.__val[1],
-                       __a.__val[2] + __b.__val[2], __a.__val[3] + __b.__val[3] } };
+    return (__m128){  __a[0] + __b[0], __a[1] + __b[1],
+                       __a[2] + __b[2], __a[3] + __b[3]  };
 }
 
 static __inline__ __m128 __attribute__((__always_inline__))
 _mm_sub_ps(__m128 __a, __m128 __b)
 {
-    return (__m128){ { __a.__val[0] - __b.__val[0], __a.__val[1] - __b.__val[1],
-                       __a.__val[2] - __b.__val[2], __a.__val[3] - __b.__val[3] } };
+    return (__m128){  __a[0] - __b[0], __a[1] - __b[1],
+                       __a[2] - __b[2], __a[3] - __b[3]  };
 }
 
 static __inline__ __m128 __attribute__((__always_inline__))
 _mm_mul_ps(__m128 __a, __m128 __b)
 {
-    return (__m128){ { __a.__val[0] * __b.__val[0], __a.__val[1] * __b.__val[1],
-                       __a.__val[2] * __b.__val[2], __a.__val[3] * __b.__val[3] } };
+    return (__m128){  __a[0] * __b[0], __a[1] * __b[1],
+                       __a[2] * __b[2], __a[3] * __b[3]  };
 }
 
 
@@ -187,48 +187,48 @@ _mm_cmpge_ps(__m128 __a, __m128 __b)
 static __inline__ __m128 __attribute__((__always_inline__))
 _mm_cmpeq_ss(__m128 __a, __m128 __b)
 {
-    unsigned int __u = (__a.__val[0] == __b.__val[0]) ? 0xFFFFFFFFu : 0;
-    __builtin_memcpy(&__a.__val[0], &__u, 4);
+    unsigned int __u = (__a[0] == __b[0]) ? 0xFFFFFFFFu : 0;
+    __builtin_memcpy(__CCC_LANE_ADDRESS(__a, 0), &__u, 4);
     return __a;
 }
 
 static __inline__ __m128 __attribute__((__always_inline__))
 _mm_cmplt_ss(__m128 __a, __m128 __b)
 {
-    unsigned int __u = (__a.__val[0] < __b.__val[0]) ? 0xFFFFFFFFu : 0;
-    __builtin_memcpy(&__a.__val[0], &__u, 4);
+    unsigned int __u = (__a[0] < __b[0]) ? 0xFFFFFFFFu : 0;
+    __builtin_memcpy(__CCC_LANE_ADDRESS(__a, 0), &__u, 4);
     return __a;
 }
 
 static __inline__ __m128 __attribute__((__always_inline__))
 _mm_cmple_ss(__m128 __a, __m128 __b)
 {
-    unsigned int __u = (__a.__val[0] <= __b.__val[0]) ? 0xFFFFFFFFu : 0;
-    __builtin_memcpy(&__a.__val[0], &__u, 4);
+    unsigned int __u = (__a[0] <= __b[0]) ? 0xFFFFFFFFu : 0;
+    __builtin_memcpy(__CCC_LANE_ADDRESS(__a, 0), &__u, 4);
     return __a;
 }
 
 static __inline__ __m128 __attribute__((__always_inline__))
 _mm_cmpgt_ss(__m128 __a, __m128 __b)
 {
-    unsigned int __u = (__a.__val[0] > __b.__val[0]) ? 0xFFFFFFFFu : 0;
-    __builtin_memcpy(&__a.__val[0], &__u, 4);
+    unsigned int __u = (__a[0] > __b[0]) ? 0xFFFFFFFFu : 0;
+    __builtin_memcpy(__CCC_LANE_ADDRESS(__a, 0), &__u, 4);
     return __a;
 }
 
 static __inline__ __m128 __attribute__((__always_inline__))
 _mm_cmpge_ss(__m128 __a, __m128 __b)
 {
-    unsigned int __u = (__a.__val[0] >= __b.__val[0]) ? 0xFFFFFFFFu : 0;
-    __builtin_memcpy(&__a.__val[0], &__u, 4);
+    unsigned int __u = (__a[0] >= __b[0]) ? 0xFFFFFFFFu : 0;
+    __builtin_memcpy(__CCC_LANE_ADDRESS(__a, 0), &__u, 4);
     return __a;
 }
 
 static __inline__ __m128 __attribute__((__always_inline__))
 _mm_cmpneq_ss(__m128 __a, __m128 __b)
 {
-    unsigned int __u = (__a.__val[0] != __b.__val[0]) ? 0xFFFFFFFFu : 0;
-    __builtin_memcpy(&__a.__val[0], &__u, 4);
+    unsigned int __u = (__a[0] != __b[0]) ? 0xFFFFFFFFu : 0;
+    __builtin_memcpy(__CCC_LANE_ADDRESS(__a, 0), &__u, 4);
     return __a;
 }
 
@@ -264,19 +264,19 @@ _mm_cmpneq_ss(__m128 __a, __m128 __b)
 static __inline__ __m128 __attribute__((__always_inline__))
 _mm_movehl_ps(__m128 __a, __m128 __b)
 {
-    return (__m128){ { __b.__val[2], __b.__val[3], __a.__val[2], __a.__val[3] } };
+    return (__m128){  __b[2], __b[3], __a[2], __a[3]  };
 }
 
 static __inline__ __m128 __attribute__((__always_inline__))
 _mm_movelh_ps(__m128 __a, __m128 __b)
 {
-    return (__m128){ { __a.__val[0], __a.__val[1], __b.__val[0], __b.__val[1] } };
+    return (__m128){  __a[0], __a[1], __b[0], __b[1]  };
 }
 
 static __inline__ float __attribute__((__always_inline__))
 _mm_cvtss_f32(__m128 __a)
 {
-    return __a.__val[0];
+    return __a[0];
 }
 
 /* === Compare (packed) - return all-ones or all-zeros per lane === */
@@ -462,32 +462,32 @@ _mm_cmpnge_ps(__m128 __a, __m128 __b)
 static __inline__ __m128 __attribute__((__always_inline__))
 _mm_cmpnlt_ss(__m128 __a, __m128 __b)
 {
-    unsigned int __u = !(__a.__val[0] < __b.__val[0]) ? 0xFFFFFFFFu : 0;
-    __builtin_memcpy(&__a.__val[0], &__u, 4);
+    unsigned int __u = !(__a[0] < __b[0]) ? 0xFFFFFFFFu : 0;
+    __builtin_memcpy(__CCC_LANE_ADDRESS(__a, 0), &__u, 4);
     return __a;
 }
 
 static __inline__ __m128 __attribute__((__always_inline__))
 _mm_cmpnle_ss(__m128 __a, __m128 __b)
 {
-    unsigned int __u = !(__a.__val[0] <= __b.__val[0]) ? 0xFFFFFFFFu : 0;
-    __builtin_memcpy(&__a.__val[0], &__u, 4);
+    unsigned int __u = !(__a[0] <= __b[0]) ? 0xFFFFFFFFu : 0;
+    __builtin_memcpy(__CCC_LANE_ADDRESS(__a, 0), &__u, 4);
     return __a;
 }
 
 static __inline__ __m128 __attribute__((__always_inline__))
 _mm_cmpngt_ss(__m128 __a, __m128 __b)
 {
-    unsigned int __u = !(__a.__val[0] > __b.__val[0]) ? 0xFFFFFFFFu : 0;
-    __builtin_memcpy(&__a.__val[0], &__u, 4);
+    unsigned int __u = !(__a[0] > __b[0]) ? 0xFFFFFFFFu : 0;
+    __builtin_memcpy(__CCC_LANE_ADDRESS(__a, 0), &__u, 4);
     return __a;
 }
 
 static __inline__ __m128 __attribute__((__always_inline__))
 _mm_cmpnge_ss(__m128 __a, __m128 __b)
 {
-    unsigned int __u = !(__a.__val[0] >= __b.__val[0]) ? 0xFFFFFFFFu : 0;
-    __builtin_memcpy(&__a.__val[0], &__u, 4);
+    unsigned int __u = !(__a[0] >= __b[0]) ? 0xFFFFFFFFu : 0;
+    __builtin_memcpy(__CCC_LANE_ADDRESS(__a, 0), &__u, 4);
     return __a;
 }
 
@@ -496,16 +496,16 @@ _mm_cmpnge_ss(__m128 __a, __m128 __b)
 static __inline__ __m128 __attribute__((__always_inline__))
 _mm_cmpord_ss(__m128 __a, __m128 __b)
 {
-    unsigned int __u = (__a.__val[0] == __a.__val[0] && __b.__val[0] == __b.__val[0]) ? 0xFFFFFFFFu : 0;
-    __builtin_memcpy(&__a.__val[0], &__u, 4);
+    unsigned int __u = (__a[0] == __a[0] && __b[0] == __b[0]) ? 0xFFFFFFFFu : 0;
+    __builtin_memcpy(__CCC_LANE_ADDRESS(__a, 0), &__u, 4);
     return __a;
 }
 
 static __inline__ __m128 __attribute__((__always_inline__))
 _mm_cmpunord_ss(__m128 __a, __m128 __b)
 {
-    unsigned int __u = (__a.__val[0] != __a.__val[0] || __b.__val[0] != __b.__val[0]) ? 0xFFFFFFFFu : 0;
-    __builtin_memcpy(&__a.__val[0], &__u, 4);
+    unsigned int __u = (__a[0] != __a[0] || __b[0] != __b[0]) ? 0xFFFFFFFFu : 0;
+    __builtin_memcpy(__CCC_LANE_ADDRESS(__a, 0), &__u, 4);
     return __a;
 }
 
@@ -514,37 +514,37 @@ _mm_cmpunord_ss(__m128 __a, __m128 __b)
 static __inline__ int __attribute__((__always_inline__))
 _mm_comieq_ss(__m128 __a, __m128 __b)
 {
-    return __a.__val[0] == __b.__val[0];
+    return __a[0] == __b[0];
 }
 
 static __inline__ int __attribute__((__always_inline__))
 _mm_comilt_ss(__m128 __a, __m128 __b)
 {
-    return __a.__val[0] < __b.__val[0];
+    return __a[0] < __b[0];
 }
 
 static __inline__ int __attribute__((__always_inline__))
 _mm_comile_ss(__m128 __a, __m128 __b)
 {
-    return __a.__val[0] <= __b.__val[0];
+    return __a[0] <= __b[0];
 }
 
 static __inline__ int __attribute__((__always_inline__))
 _mm_comigt_ss(__m128 __a, __m128 __b)
 {
-    return __a.__val[0] > __b.__val[0];
+    return __a[0] > __b[0];
 }
 
 static __inline__ int __attribute__((__always_inline__))
 _mm_comige_ss(__m128 __a, __m128 __b)
 {
-    return __a.__val[0] >= __b.__val[0];
+    return __a[0] >= __b[0];
 }
 
 static __inline__ int __attribute__((__always_inline__))
 _mm_comineq_ss(__m128 __a, __m128 __b)
 {
-    return __a.__val[0] != __b.__val[0];
+    return __a[0] != __b[0];
 }
 
 /* === Unordered scalar comparison returning int (UCOMISS) === */
@@ -552,37 +552,37 @@ _mm_comineq_ss(__m128 __a, __m128 __b)
 static __inline__ int __attribute__((__always_inline__))
 _mm_ucomieq_ss(__m128 __a, __m128 __b)
 {
-    return __a.__val[0] == __b.__val[0];
+    return __a[0] == __b[0];
 }
 
 static __inline__ int __attribute__((__always_inline__))
 _mm_ucomilt_ss(__m128 __a, __m128 __b)
 {
-    return __a.__val[0] < __b.__val[0];
+    return __a[0] < __b[0];
 }
 
 static __inline__ int __attribute__((__always_inline__))
 _mm_ucomile_ss(__m128 __a, __m128 __b)
 {
-    return __a.__val[0] <= __b.__val[0];
+    return __a[0] <= __b[0];
 }
 
 static __inline__ int __attribute__((__always_inline__))
 _mm_ucomigt_ss(__m128 __a, __m128 __b)
 {
-    return __a.__val[0] > __b.__val[0];
+    return __a[0] > __b[0];
 }
 
 static __inline__ int __attribute__((__always_inline__))
 _mm_ucomige_ss(__m128 __a, __m128 __b)
 {
-    return __a.__val[0] >= __b.__val[0];
+    return __a[0] >= __b[0];
 }
 
 static __inline__ int __attribute__((__always_inline__))
 _mm_ucomineq_ss(__m128 __a, __m128 __b)
 {
-    return __a.__val[0] != __b.__val[0];
+    return __a[0] != __b[0];
 }
 
 /* === 64-bit integer conversion (SSE) === */
@@ -599,7 +599,7 @@ _mm_cvtss_si64(__m128 __a)
 #if defined(__x86_64__)
     return __builtin_ia32_cvtss2si64(__a);
 #else
-    return (long long)__a.__val[0];
+    return (long long)__a[0];
 #endif
 }
 
@@ -608,7 +608,7 @@ _mm_cvtss_si64(__m128 __a)
 static __inline__ long long __attribute__((__always_inline__))
 _mm_cvttss_si64(__m128 __a)
 {
-    return (long long)__a.__val[0];
+    return (long long)__a[0];
 }
 
 #define _mm_cvttss_si64x(a) _mm_cvttss_si64(a)
@@ -632,7 +632,7 @@ _mm_loadl_pi(__m128 __a, const __m64 *__p)
 static __inline__ __m128 __attribute__((__always_inline__))
 _mm_loadr_ps(const float *__p)
 {
-    return (__m128){ { __p[3], __p[2], __p[1], __p[0] } };
+    return (__m128){  __p[3], __p[2], __p[1], __p[0]  };
 }
 
 /* === Store (additional) === */
@@ -640,8 +640,8 @@ _mm_loadr_ps(const float *__p)
 static __inline__ void __attribute__((__always_inline__))
 _mm_storer_ps(float *__p, __m128 __a)
 {
-    __p[0] = __a.__val[3]; __p[1] = __a.__val[2];
-    __p[2] = __a.__val[1]; __p[3] = __a.__val[0];
+    __p[0] = __a[3]; __p[1] = __a[2];
+    __p[2] = __a[1]; __p[3] = __a[0];
 }
 
 /* === MMX<->float conversion (SSE additions that operate on __m64) === */
@@ -651,8 +651,8 @@ static __inline__ __m128 __attribute__((__always_inline__))
 _mm_cvtpi32_ps(__m128 __a, __m64 __b)
 {
     int *__bi = (int *)&__b.__val;
-    __a.__val[0] = (float)__bi[0];
-    __a.__val[1] = (float)__bi[1];
+    __a[0] = (float)__bi[0];
+    __a[1] = (float)__bi[1];
     return __a;
 }
 
@@ -664,8 +664,8 @@ _mm_cvtps_pi32(__m128 __a)
 {
     __m64 __r;
     int __rr[2];
-    __rr[0] = (int)__a.__val[0];
-    __rr[1] = (int)__a.__val[1];
+    __rr[0] = (int)__a[0];
+    __rr[1] = (int)__a[1];
     __builtin_memcpy(&__r.__val, __rr, 8);
     return __r;
 }
@@ -678,8 +678,8 @@ _mm_cvttps_pi32(__m128 __a)
 {
     __m64 __r;
     int __rr[2];
-    __rr[0] = (int)__a.__val[0];
-    __rr[1] = (int)__a.__val[1];
+    __rr[0] = (int)__a[0];
+    __rr[1] = (int)__a[1];
     __builtin_memcpy(&__r.__val, __rr, 8);
     return __r;
 }
@@ -691,7 +691,7 @@ static __inline__ __m128 __attribute__((__always_inline__))
 _mm_cvtpi16_ps(__m64 __a)
 {
     short *__as = (short *)&__a.__val;
-    return (__m128){ { (float)__as[0], (float)__as[1], (float)__as[2], (float)__as[3] } };
+    return (__m128){  (float)__as[0], (float)__as[1], (float)__as[2], (float)__as[3]  };
 }
 
 /* Convert packed 16-bit unsigned integers to packed floats */
@@ -699,7 +699,7 @@ static __inline__ __m128 __attribute__((__always_inline__))
 _mm_cvtpu16_ps(__m64 __a)
 {
     unsigned short *__as = (unsigned short *)&__a.__val;
-    return (__m128){ { (float)__as[0], (float)__as[1], (float)__as[2], (float)__as[3] } };
+    return (__m128){  (float)__as[0], (float)__as[1], (float)__as[2], (float)__as[3]  };
 }
 
 /* Convert packed 8-bit signed integers (low 4 bytes) to packed floats */
@@ -707,7 +707,7 @@ static __inline__ __m128 __attribute__((__always_inline__))
 _mm_cvtpi8_ps(__m64 __a)
 {
     signed char *__ab = (signed char *)&__a.__val;
-    return (__m128){ { (float)__ab[0], (float)__ab[1], (float)__ab[2], (float)__ab[3] } };
+    return (__m128){  (float)__ab[0], (float)__ab[1], (float)__ab[2], (float)__ab[3]  };
 }
 
 /* Convert packed 8-bit unsigned integers (low 4 bytes) to packed floats */
@@ -715,7 +715,7 @@ static __inline__ __m128 __attribute__((__always_inline__))
 _mm_cvtpu8_ps(__m64 __a)
 {
     unsigned char *__ab = (unsigned char *)&__a.__val;
-    return (__m128){ { (float)__ab[0], (float)__ab[1], (float)__ab[2], (float)__ab[3] } };
+    return (__m128){  (float)__ab[0], (float)__ab[1], (float)__ab[2], (float)__ab[3]  };
 }
 
 /* Convert two __m64 packed 32-bit integers to __m128 packed floats */
@@ -724,7 +724,7 @@ _mm_cvtpi32x2_ps(__m64 __a, __m64 __b)
 {
     int *__ai = (int *)&__a.__val;
     int *__bi = (int *)&__b.__val;
-    return (__m128){ { (float)__ai[0], (float)__ai[1], (float)__bi[0], (float)__bi[1] } };
+    return (__m128){  (float)__ai[0], (float)__ai[1], (float)__bi[0], (float)__bi[1]  };
 }
 
 /* Convert packed floats to packed 16-bit signed integers (with saturation) in __m64 */
@@ -734,7 +734,7 @@ _mm_cvtps_pi16(__m128 __a)
     __m64 __r;
     short __rr[4];
     for (int __i = 0; __i < 4; __i++) {
-        int __v = (int)__a.__val[__i];
+        int __v = (int)__a[__i];
         if (__v > 32767) __v = 32767;
         if (__v < -32768) __v = -32768;
         __rr[__i] = (short)__v;
@@ -750,7 +750,7 @@ _mm_cvtps_pi8(__m128 __a)
     __m64 __r;
     signed char __rr[8];
     for (int __i = 0; __i < 4; __i++) {
-        int __v = (int)__a.__val[__i];
+        int __v = (int)__a[__i];
         if (__v > 127) __v = 127;
         if (__v < -128) __v = -128;
         __rr[__i] = (signed char)__v;

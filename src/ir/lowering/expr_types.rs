@@ -149,52 +149,16 @@ impl Lowerer {
     /// by-value ABI convention as structs (small vectors packed into registers,
     /// large vectors via sret).
     pub(super) fn struct_value_size(&self, expr: &Expr) -> Option<usize> {
-        // Raw GCC vector builtins: the generic FunctionCall arm below resolves
-        // types via get_expr_ctype, which has no entry for these names.
+        // Native GNU vector results use object-address IR carriers on both modes.
         if let Expr::FunctionCall(callee, _, _) = expr {
             if let Expr::Identifier(name, _) = &**callee {
+                if let Some(result) = crate::common::x86_builtin_types::result_type(name) {
+                    if result.is_vector() {
+                        return Some(result.size());
+                    }
+                }
                 match name.as_str() {
                     "__builtin_shufflevector" => return Some(16),
-                    // ONLY the 256-bit builtins: v8sf results live behind a
-                    // pointer (sret convention). The 128-bit raw builtins
-                    // return packed I128 BY VALUE — reporting a size here
-                    // (or falling through to the generic arm, which now sees
-                    // their Vector CType) makes the return/assign path
-                    // dereference the packed value as a struct pointer.
-                    "__builtin_ia32_maxps256"
-                    | "__builtin_ia32_minps256"
-                    | "__builtin_ia32_andps256"
-                    | "__builtin_ia32_cmpps256" => return Some(32),
-                    // ILP32 has no I128 value representation: the 128-bit
-                    // raw builtins hand back a pointer to their 16-byte
-                    // result alloca (aggregate-as-pointer convention), so
-                    // the return/assign path MUST see a 16-byte aggregate
-                    // and memcpy it.
-                    "__builtin_ia32_maxps"
-                    | "__builtin_ia32_minps"
-                    | "__builtin_ia32_shufps"
-                    | "__builtin_shuffle"
-                    | "__builtin_ia32_vextractf128_ps256"
-                        if self.target == crate::backend::Target::I686 =>
-                    {
-                        return Some(16);
-                    }
-                    "__builtin_ia32_maxps"
-                    | "__builtin_ia32_minps"
-                    | "__builtin_ia32_shufps"
-                    | "__builtin_ia32_vextractf128_ps256" => return None,
-                    // __builtin_shuffle is the one raw vector builtin whose
-                    // value is NOT packed by value: its lowering hands back
-                    // the result alloca POINTER for every result wider than 8
-                    // bytes and only packs ≤8-byte results. Reporting None
-                    // here (the packed answer) made the consumers read that
-                    // POINTER as if it were the vector data —
-                    // `return __builtin_shuffle(v, m);` returned the alloca's
-                    // ADDRESS to a caller that stored it as the 16 bytes, and
-                    // a 32-byte result dereferenced the address as data and
-                    // faulted. The geometry is known because sema types the
-                    // call (see ExprTypeChecker::infer_expr_ctype), so the
-                    // size can be answered here instead of asserted.
                     "__builtin_shuffle" => {
                         let bytes = match self.get_expr_ctype(expr) {
                             Some(ct) if ct.is_vector() => ct.size(),
@@ -430,6 +394,12 @@ impl Lowerer {
     /// Return the IR type for known builtins that return float or specific types.
     /// Returns None for builtins without special return type handling.
     pub(super) fn builtin_return_type(&self, name: &str) -> Option<IrType> {
+        if let Some(result) = crate::common::x86_builtin_types::result_type(name) {
+            return Some(IrType::from_ctype(&result));
+        }
+        if crate::common::avx_widen::AvxWiden::raw_builtin(name).is_some() {
+            return Some(IrType::Ptr);
+        }
         match name {
             "__builtin_shufflevector" => Some(IrType::Ptr),
             // x86 vector scalar extractions with 64-bit results (long long /
@@ -1281,6 +1251,9 @@ impl Lowerer {
             }
             Expr::FunctionCall(func, args, _) => {
                 if let Expr::Identifier(name, _) = func.as_ref() {
+                    if let Some(result) = crate::common::x86_builtin_types::result_type(name) {
+                        return IrType::from_ctype(&result);
+                    }
                     if name == "__builtin_choose_expr" && args.len() >= 3 {
                         return self.get_expr_type(self.resolve_builtin_choose_expr(args));
                     }
@@ -1849,25 +1822,11 @@ impl Lowerer {
             )),
             Expr::FunctionCall(func, args, _) => {
                 if let Expr::Identifier(name, _) = func.as_ref() {
+                    if let Some(result) = crate::common::x86_builtin_types::result_type(name) {
+                        return Some(result);
+                    }
                     if name == "__builtin_choose_expr" && args.len() >= 3 {
                         return self.get_expr_ctype(self.resolve_builtin_choose_expr(args));
-                    }
-                    // Raw GCC 256-bit vector builtins have no declared
-                    // signature; report the vector CType (v8sf pointer/sret
-                    // convention everywhere, so downstream paths that treat
-                    // the operand as a pointer to 32 bytes are correct).
-                    // The 128-bit by-value builtins are deliberately NOT
-                    // listed: reporting a vector CType for them made the
-                    // return path treat the packed I128 VALUE as a pointer
-                    // and reload garbage lanes.
-                    match name.as_str() {
-                        "__builtin_ia32_maxps256"
-                        | "__builtin_ia32_minps256"
-                        | "__builtin_ia32_andps256"
-                        | "__builtin_ia32_cmpps256" => {
-                            return Some(CType::Vector(Box::new(CType::Float), 32));
-                        }
-                        _ => {}
                     }
                     if Self::is_polymorphic_atomic_builtin(name) {
                         if let Some(first_arg) = args.first() {

@@ -3,21 +3,12 @@
 
 One operand of `E1[E2]` must have pointer type (an array decays; GNU vectors
 are subscriptable) and the other integer type.  LCCC accepted every violation
-and lowered it as a pointer access: subscripting a struct loaded a pointer
-from the struct's first bytes, converted the stored value to an integer and
-stored through it, so
-
-    __m256 v = _mm256_loadu_ps(p); v[0] = s;
-
-(LCCC's `__m256` is a struct; GCC's is a vector) crashed at run time with no
-diagnostic.
+and lowered it as a pointer access. Public SIMD types are now native vectors,
+so their subscripts must execute correctly, not remain a rejection exception.
 
 Gates:
-  * each rejected input produces a `file:line:col: error:` diagnostic naming
-    the violated rule (no panic/ICE), and GCC rejects the same input
-    (oracle-checked verdict), except the struct-based `__m256` case, which
-    GCC accepts as a vector subscript; LCCC must reject it rather than
-    miscompile it (a documented gap, not an oracle match);
+  * every rejected input produces a located diagnostic (no panic/ICE),
+    and GCC rejects the same input;
   * the valid forms (array, pointer, reversed `i[a]`, character, enum, bool
     and `_Bool`-typed indices, string literals, GNU vectors read and written,
     pointer-to-array, function-pointer table, compound literal) compile and
@@ -66,17 +57,10 @@ REJECTED = {
                        'int f(int *p, struct S s) { return p[s]; }\n', NOT_INTEGER),
     'reversed_float_base.c': ('int f(int *p, float x) { return x[p]; }\n', NOT_INTEGER),
 }
-GCC_ACCEPTS = {
-    'm256_struct.c': ('#include <immintrin.h>\n'
-                      '__m256 f(const float *p, float s) {\n'
-                      '  __m256 v = _mm256_loadu_ps(p);\n'
-                      '  v[0] = s;\n'
-                      '  return v;\n'
-                      '}\n', NOT_ADDRESSABLE),
-}
 
 VALID = r'''
 #include <stdio.h>
+#include <immintrin.h>
 typedef int v4si __attribute__((vector_size(16)));
 typedef unsigned long long v2u __attribute__((vector_size(16)));
 enum E { ZERO, ONE, TWO };
@@ -108,6 +92,13 @@ int main(void) {
   __typeof__(f < 1) fm = f < 1;
   printf("%zu %zu %zu %zu %zu %llu %llu %d %d\n", sizeof m, sizeof(__typeof__(x < y)), sizeof t,
          sizeof u, sizeof fm, t[1], u[1], fm[1], fm[3]);
+  float lanes[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+  __m256 native = _mm256_loadu_ps(lanes);
+  native[0] = 23.0f;
+  native[7] += 11.0f;
+  __m128 small = _mm_setzero_ps();
+  small[2] = native[7];
+  printf("%.0f %.0f %.0f\n", (double)native[0], (double)native[7], (double)small[2]);
   return 0;
 }
 '''
@@ -127,7 +118,7 @@ def main():
     args = parser.parse_args()
     with tempfile.TemporaryDirectory() as work:
         work = Path(work)
-        for name, (source, message) in {**REJECTED, **GCC_ACCEPTS}.items():
+        for name, (source, message) in REJECTED.items():
             path = work / name
             path.write_text(source)
             mine = run([args.lccc, '-O2', '-mavx', '-S', path, '-o', work / 'out.s'], check=False)
@@ -138,22 +129,21 @@ def main():
             if not re.search(rf'{re.escape(name)}:\d+:\d+: error: {re.escape(message)}', mine.stderr):
                 sys.exit(f'FAIL: {name}: expected "{message}", got:\n{mine.stderr}')
             gcc = run([args.gcc, '-O2', '-mavx', '-S', path, '-o', work / 'gcc.s'], check=False)
-            expect_gcc_reject = name in REJECTED
-            if (gcc.returncode != 0) != expect_gcc_reject:
+            if gcc.returncode == 0:
                 verdict = 'accepts' if gcc.returncode == 0 else 'rejects'
                 sys.exit(f'FAIL: oracle drift: GCC now {verdict} {name}')
         valid = work / 'valid.c'
         valid.write_text(VALID)
-        run([args.gcc, '-O2', valid, '-o', work / 'gcc'])
+        run([args.gcc, '-O2', '-mavx', valid, '-o', work / 'gcc'])
         reference = run([work / 'gcc']).stdout
         for opt in ('-O0', '-O2'):
             exe = work / f'lccc{opt}'
-            run([args.lccc, opt, valid, '-o', exe])
+            run([args.lccc, opt, '-mavx', valid, '-o', exe])
             mine = run([exe]).stdout
             if mine != reference:
                 sys.exit(f'FAIL: valid subscripts at {opt}: {mine!r} != GCC {reference!r}')
-    print(f'check_subscript_diagnostics: PASS ({len(REJECTED) + len(GCC_ACCEPTS)} invalid subscripts '
-          'diagnosed (GCC agrees except the struct-based __m256); valid forms match GCC at -O0/-O2)')
+    print(f'check_subscript_diagnostics: PASS ({len(REJECTED)} invalid subscripts '
+          'diagnosed (GCC agrees); valid forms including native public vectors match GCC at -O0/-O2)')
 
 
 if __name__ == '__main__':

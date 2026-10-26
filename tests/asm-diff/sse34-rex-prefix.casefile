@@ -1,0 +1,15 @@
+;;; explicit-length64
+.text
+rex64 pcmpestri $0,%xmm1,%xmm2
+rex64 pcmpestrm $255,%xmm9,%xmm10
+rex64 pcmpestri $1,128(%r13,%r14,4),%xmm8
+;;; mandatory-prefix-before-rex
+.text
+rex movddup %xmm1,%xmm2
+rex crc32b %al,%eax
+# GAS 2.47 rejects redundant explicit REX.W here. The legal encoding
+# remains covered by the SDM-byte Rust golden, not a GAS rejection policy.
+rex cvtss2si %xmm9,%eax
+;;; retain-real-evex-form
+.text
+vpmulhrsw %zmm1,%zmm2,%zmm3

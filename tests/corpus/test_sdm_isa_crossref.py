@@ -97,6 +97,15 @@ class SdmCrossrefTests(unittest.TestCase):
 
     # -- the reference is parsed, not guessed ------------------------------
 
+    def test_register_only_modrm_is_not_a_missing_modrm_byte(self):
+        enc = self.sdm.parse_pattern("0x0F 0x78 osz_refining_prefix REFINING66() MOD[0b11] MOD=3 REG[0b000] RM[nnn] UIMM8() UIMM8_1()")
+        self.assertTrue(enc['modrm'])
+        self.assertEqual(enc['modrm_mode'], 'register')
+        self.assertEqual(enc['reg'], 0)
+        mem = self.sdm.parse_pattern("0x0F 0x2B f2_refining_prefix MOD[mm] MOD!=3 REG[rrr] RM[nnn] MODRM()")
+        self.assertTrue(mem['modrm'])
+        self.assertEqual(mem['modrm_mode'], 'memory')
+
     def test_one_iclass_can_carry_several_patterns(self):
         block = (
             "\n{\nICLASS    : MOVUPS\n"

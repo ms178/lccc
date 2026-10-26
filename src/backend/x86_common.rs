@@ -11,6 +11,25 @@ use crate::ir::reexports::BlockId;
 use std::borrow::Cow;
 use std::fmt::Write;
 
+/// Packed element shifts saturate by the full count, not its low byte.
+/// Encoding a large/negative C int modulo 256 would incorrectly make 256 an
+/// identity. 255 is an equivalent saturated count for every 16/32/64-bit
+/// logical/arithmetic packed shift. Byte-lane shifts have a separate contract.
+pub(super) fn packed_shift_immediate(count: i64) -> i64 {
+    if (0..=255).contains(&count) {
+        count
+    } else {
+        255
+    }
+}
+
+pub(super) fn is_packed_element_shift(mnemonic: &str) -> bool {
+    matches!(
+        mnemonic,
+        "psllw" | "pslld" | "psllq" | "psrlw" | "psrld" | "psrlq" | "psraw" | "psrad"
+    )
+}
+
 /// Resolve GCC inline asm dialect alternatives in a template string.
 ///
 /// GCC inline asm supports `{alt0|alt1}` syntax where `alt0` is the AT&T
@@ -626,6 +645,30 @@ mod prefetch_mnemonic_tests {
                 prefetch_mnemonic(payload, isa),
                 prefetch_mnemonic(payload & 7, isa)
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod packed_shift_count_tests {
+    use super::packed_shift_immediate;
+
+    #[test]
+    fn immediate_encoding_preserves_saturation_instead_of_wrapping() {
+        for count in [
+            -512,
+            -256,
+            -1,
+            256,
+            257,
+            512,
+            i32::MAX as i64,
+            i32::MIN as i64,
+        ] {
+            assert_eq!(packed_shift_immediate(count), 255);
+        }
+        for count in 0..=255 {
+            assert_eq!(packed_shift_immediate(count), count);
         }
     }
 }

@@ -11,6 +11,25 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class ConversionHeaders(unittest.TestCase):
+    def test_public_types_are_native_vectors_with_only_unaligned_overrides(self):
+        header = (ROOT / 'include/lcccsimd.h').read_text()
+        for width in (128, 256, 512):
+            for suffix, element in (('', 'float'), ('d', 'double'), ('i', 'long long')):
+                name = f'__m{width}{suffix}'
+                self.assertIn(f'typedef {element} {name} __attribute__((__vector_size__({width // 8}), __may_alias__));', header)
+                self.assertIn(f'typedef {element} {name}_u __attribute__((__vector_size__({width // 8}), __aligned__(1), __may_alias__));', header)
+        self.assertNotIn('__val[', header)
+        self.assertIn('int __lccc_simd128_ps_extractps128(long, __m128 __a);', header)
+        self.assertIn('__m128 __lccc_simd128_ps_addss128(long, __m128 __a, __m128 __b);', header)
+
+    def test_sse_helper_results_are_vectors_not_pointer_adapters(self):
+        header = (ROOT / 'include/lcccsimd.h').read_text()
+        self.assertNotIn('void * __lccc_simd128_ps_', header)
+        self.assertIn('#define __CCC_M128_FROM_NATIVE(e) ((__m128)(e))', header)
+        self.assertIn('__CCC_M128_FROM_NATIVE(__lccc_simd128_ps_addss128', header)
+        self.assertIn('__m128i __lccc_simd128_ps_cvtps2dq128', header)
+        self.assertIn('__m128d __lccc_simd128_ps_cvtps2pd128', header)
+
     def test_packed_signatures(self):
         header = (ROOT / 'include/lcccsimd.h').read_text()
         # Explicit ISA contracts, independent of the generator's inference.
@@ -40,13 +59,32 @@ class ConversionHeaders(unittest.TestCase):
             '__m128d _mm_cvtss_sd(__m128d __a, __m128 __b)',
             '__m128 _mm_cvtsd_ss(__m128 __a, __m128d __b)',
             '__m256i _mm512_castsi512_si256(__m512i __a)',
-            'int _mm256_testz_ps(__m256 __a, __m256 __b)',
             'int _mm256_movemask_pd(__m256d __a)',
             '__lccc_simd128_ps_cvttss2si128(0, __a)',
             '__lccc_simd128_ps_cvttsd2si128(0, __a)',
             '__lccc_simd128_ps_cvtsi2sd64_128(long, __m128d __a, long long __i)',
         ):
             self.assertIn(fragment, header)
+
+
+    def test_all_vtest_signatures_require_avx_and_preserve_private_dispatch(self):
+        header = (ROOT / 'include/lcccsimd.h').read_text()
+        for bits in (128, 256):
+            for suffix in ('ps', 'pd'):
+                ty = f'__m{bits}' + ('d' if suffix == 'pd' else '')
+                prefix = '_mm256' if bits == 256 else '_mm'
+                for flag in ('z', 'c', 'nzc'):
+                    public = f'{prefix}_test{flag}_{suffix}'
+                    private = f'__lccc_avx_test{flag}{suffix}{bits}'
+                    signature = (
+                        'static __inline__ int __attribute__((__always_inline__, '
+                        '__artificial__, __target__("avx")))\n'
+                        f'{public}({ty} __a, {ty} __b)\n'
+                        f'{{ return {private}(__a, __b); }}'
+                    )
+                    with self.subTest(public=public):
+                        self.assertEqual(header.count(signature), 1)
+                        self.assertEqual(header.count(f'int {private}({ty}, {ty});'), 1)
 
 
 class IntrinsicHarness(unittest.TestCase):
