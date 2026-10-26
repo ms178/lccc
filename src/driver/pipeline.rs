@@ -3699,7 +3699,10 @@ impl Driver {
         set.insert_if(avx512_base && self.enable_avx512vbmi2, F::Avx512Vbmi2);
         set.insert_if(avx512_base && self.enable_avx512bf16, F::Avx512Bf16);
         set.insert_if(avx512_base && self.enable_avx512fp16, F::Avx512Fp16);
-        set.insert_if(avx512_base && self.enable_avx512vp2intersect, F::Avx512Vp2intersect);
+        set.insert_if(
+            avx512_base && self.enable_avx512vp2intersect,
+            F::Avx512Vp2intersect,
+        );
         set.insert_if(avx512_base && self.enable_avx512er, F::Avx512Er);
         set.insert_if(avx512_base && self.enable_avx512pf, F::Avx512Pf);
         set.insert_if(avx512_base && self.enable_avx512bmm, F::Avx512Bmm);
