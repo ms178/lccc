@@ -39,5 +39,18 @@
   "compiler_binary_sha256": {
     "/home/user/audit/baseline/lccc": "620fe69214c31439447b86eb38af657bbc6bd8f8631cd47cd2801a219d96572c",
     "target/fastbuild/lccc": "8ee28891789ea832f8918e1b65afb618d62e299e065bd79a0dc94016764bc8c0"
-  }
+  },
+  "oracle_checks": {
+    "sse2": {
+      "native_gcc": "6ff3772e59d63a25 3f",
+      "native_candidate": "6ff3772e59d63a25 3f",
+      "callgrind_gcc": "aa4d038cfc7ccd25 0"
+    },
+    "avx2": {
+      "native_gcc": "3be387364d9e4325 3f",
+      "native_candidate": "3be387364d9e4325 3f",
+      "callgrind_gcc": "4b712826af276725 0"
+    }
+  },
+  "emulator_limit": "Valgrind hashes and MXCSR flags differ from native exceptional-value execution for GCC and both LCCC binaries; emulator-to-emulator outputs match. Instruction counts and memory checks do not establish hardware floating exception behavior."
 }

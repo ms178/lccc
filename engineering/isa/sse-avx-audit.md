@@ -96,6 +96,10 @@ retain NaN payloads, signaling encodings, infinities, signed zero and subnormals
 MXCSR exception flags are accumulated, **not checked individually per operation**.
 FTZ/DAZ combinations, unmasked traps and guard-page memory forms remain open.
 The original packed arithmetic ABI fixture remains a separate 64-leg control.
+A direct private-helper nesting probe also matched the public GCC oracle at
+O0/O2 for SSE2 and AVX2. An operand-order mutation changed the fixture checksum
+(`870dc3cb68e1a06d` to `1030d7f25b791009`), so the exceptional-value inputs are
+not indifferent to the noncommutative MIN/MAX contract.
 
 Provider instruction counts (`-m64 -O2 -DPROVIDER_ONLY`; branch/return instructions
 included) and whole-process Callgrind screening (`-DREPEATS=32`):
@@ -113,6 +117,21 @@ Exact repeat-32 outputs match: SSE2 `6ff3772e59d63a25 3f`, AVX2
 `3be387364d9e4325 3f`. Candidate SSE2 and AVX2 Memcheck: zero errors, no leaks.
 The provider-density gate fails the saved compiler (70 exceeds 69). These are
 mechanism/memory-safety receipts, **not a portable runtime speed claim**.
+
+Valgrind's exceptional-value execution does **not** reproduce the native hash
+or MXCSR flags: SSE2 gives `aa4d038cfc7ccd25 0`, AVX2 `4b712826af276725 0`.
+GCC and both LCCC binaries match one another under that emulator, as well as
+matching one another separately in native execution. Consequently Callgrind and
+Memcheck are not hardware floating-exception or numerical sign-off. The native
+mixed-compiler tests supply that separate, bounded evidence.
+
+The canonical paired runner screened FP32/FP64 product maps and gzip's match
+finder at O2/SSE2 with seven randomized, CPU-pinned rounds and two excluded
+warm-ups per arm. All outputs match; the candidate/pre-native medians are
+257.33/256.15 ms, 502.72/503.08 ms and 178.45/179.14 ms respectively. These
+unchanged-path controls do not establish a helper runtime gain; gzip's assembly
+is byte-identical. GCC is still faster on the gzip control (153.33 ms). Raw
+samples, identities and commands are retained in the adjacent evidence JSON.
 
 Environment: active 4 GiB swap; fastbuild, two jobs, no concurrent heavy build;
 GCC 16.2.0, GAS 2.47.20260726, mold 2.42.1. Exact bootstrap downloads failed;
