@@ -66,6 +66,7 @@ pub enum SymbolType {
     Function,
     Object,
     TlsObject,
+    GnuIndirectFunction,
     NoType,
 }
 
@@ -738,9 +739,12 @@ fn parse_type_directive(args: &str) -> Directive {
         let sym = parts[0].trim().to_string();
         let ty = parts[1].trim();
         let st = match ty {
-            "%function" | "@function" => SymbolType::Function,
-            "%object" | "@object" => SymbolType::Object,
-            "@tls_object" => SymbolType::TlsObject,
+            "%function" | "@function" | "STT_FUNC" => SymbolType::Function,
+            "%object" | "@object" | "STT_OBJECT" => SymbolType::Object,
+            "%tls_object" | "@tls_object" | "STT_TLS" => SymbolType::TlsObject,
+            "%gnu_indirect_function" | "@gnu_indirect_function" | "STT_GNU_IFUNC" => {
+                SymbolType::GnuIndirectFunction
+            }
             _ => SymbolType::NoType,
         };
         Directive::Type(sym, st)

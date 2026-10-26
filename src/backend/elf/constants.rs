@@ -20,6 +20,7 @@ pub const EV_CURRENT: u8 = 1;
 
 // OS/ABI
 pub const ELFOSABI_NONE: u8 = 0;
+pub const ELFOSABI_GNU: u8 = 3;
 
 // ── ELF object types ─────────────────────────────────────────────────────────
 
@@ -51,6 +52,7 @@ pub const SHT_INIT_ARRAY: u32 = 14;
 pub const SHT_FINI_ARRAY: u32 = 15;
 pub const SHT_PREINIT_ARRAY: u32 = 16;
 pub const SHT_GROUP: u32 = 17;
+pub const SHT_RELR: u32 = 19;
 
 /// COMDAT group flag: sections in this group are deduplicated by the linker.
 pub const GRP_COMDAT: u32 = 1;
@@ -160,6 +162,9 @@ pub const DF_TEXTREL: i64 = 4;
 pub const DF_BIND_NOW: i64 = 8;
 pub const DT_PREINIT_ARRAY: i64 = 32;
 pub const DT_PREINIT_ARRAYSZ: i64 = 33;
+pub const DT_RELRSZ: i64 = 35;
+pub const DT_RELR: i64 = 36;
+pub const DT_RELRENT: i64 = 37;
 pub const DT_RELACOUNT: i64 = 0x6fff_fff9;
 pub const DT_GNU_HASH: i64 = 0x6fff_fef5;
 pub const DT_VERSYM: i64 = 0x6fff_fff0;

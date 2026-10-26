@@ -204,7 +204,7 @@ impl Lowerer {
             Stmt::Expr(Some(e)) => {
                 self.capture_expr(e, visible, scopes, result);
             }
-            Stmt::Expr(None) | Stmt::Break(_) | Stmt::Continue(_) => {}
+            Stmt::Expr(None) | Stmt::Break(..) | Stmt::Continue(..) => {}
             Stmt::Return(Some(e), _) => self.capture_expr(e, visible, scopes, result),
             Stmt::Return(None, _) => {}
             Stmt::If(c, t, e, _) => {
@@ -380,7 +380,7 @@ impl Lowerer {
             | Expr::AlignofExpr(a, _) => {
                 self.capture_expr(a, visible, scopes, result);
             }
-            Expr::Sizeof(inner, _) => {
+            Expr::Sizeof(inner, _) | Expr::Countof(inner, _) => {
                 if let SizeofArg::Expr(a) = inner.as_ref() {
                     self.capture_expr(a, visible, scopes, result);
                 }

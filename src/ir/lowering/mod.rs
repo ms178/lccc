@@ -11,6 +11,7 @@ pub(crate) mod expr_access;
 pub(crate) mod expr_assign;
 pub(crate) mod expr_atomics;
 pub(crate) mod expr_builtins;
+mod expr_builtins_c2y;
 mod expr_builtins_fpclass;
 mod expr_builtins_intrin;
 mod expr_builtins_lcccsimd;

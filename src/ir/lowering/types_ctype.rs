@@ -387,6 +387,7 @@ impl Lowerer {
                         is_packed: f.is_packed,
                         base_volatile: f.base_volatile,
                         object_volatile: f.object_volatile,
+                        counted_by: f.counted_by.clone(),
                     })
                 })
                 .collect();

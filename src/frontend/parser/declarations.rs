@@ -228,9 +228,10 @@ impl Parser {
         // Merge all sources of constructor/destructor: type-level attrs, declarator-level attrs, post-declarator attrs
         let is_constructor = type_level_ctor || self.attrs.parsing_constructor() || post_ctor;
         let is_destructor = type_level_dtor || self.attrs.parsing_destructor() || post_dtor;
-        // Capture alias/weak/visibility/section/error attributes
+        // Capture alias/ifunc/weak/visibility/section/error attributes
         let is_weak = self.attrs.parsing_weak();
         let alias_target = self.attrs.parsing_alias_target.take();
+        let ifunc_target = self.attrs.parsing_ifunc_target.take();
         // Use explicit __attribute__((visibility(...))) if present, otherwise fall back
         // to the current #pragma GCC visibility default (if any).
         let visibility = self
@@ -276,6 +277,7 @@ impl Parser {
         decl_attrs.set_cold(is_cold);
         decl_attrs.set_nested_fn(self.attrs.parsing_nested_fn());
         decl_attrs.alias_target = alias_target;
+        decl_attrs.ifunc_target = ifunc_target;
         decl_attrs.visibility = visibility;
         decl_attrs.tls_model = tls_model;
         decl_attrs.section = section;
@@ -398,6 +400,15 @@ impl Parser {
             || name
                 .as_deref()
                 .is_some_and(|n| self.func_decl_no_instrument.contains(n));
+        if decl_attrs.ifunc_target.is_some() {
+            self.emit_error(
+                format!(
+                    "cannot define both an 'ifunc' resolver and a body for '{}'",
+                    name.as_deref().unwrap_or("<anonymous>")
+                ),
+                start,
+            );
+        }
         let body = self.parse_compound_stmt();
         for n in shadowed_added {
             self.shadowed_typedefs.remove(&n);
@@ -742,6 +753,9 @@ impl Parser {
         if let Some(ref target) = self.attrs.parsing_alias_target {
             last_decl.attrs.alias_target = Some(target.clone());
         }
+        if let Some(ref target) = self.attrs.parsing_ifunc_target {
+            last_decl.attrs.ifunc_target = Some(target.clone());
+        }
         if let Some(ref vis) = self.attrs.parsing_visibility {
             last_decl.attrs.visibility = Some(vis.clone());
         }
@@ -800,6 +814,7 @@ impl Parser {
         }
         self.attrs.set_weak(false);
         self.attrs.parsing_alias_target = None;
+        self.attrs.parsing_ifunc_target = None;
         self.attrs.parsing_visibility = None;
         self.attrs.parsing_tls_model = None;
         self.attrs.parsing_section = None;
@@ -834,6 +849,7 @@ impl Parser {
             ctx.is_common = ctx.is_common || d_common;
             let d_weak = self.attrs.parsing_weak();
             let d_alias = self.attrs.parsing_alias_target.take();
+            let d_ifunc = self.attrs.parsing_ifunc_target.take();
             let d_vis = self
                 .attrs
                 .parsing_visibility
@@ -888,6 +904,7 @@ impl Parser {
                     da.set_fastcall(d_fastcall);
                     da.regparm = d_regparm;
                     da.alias_target = d_alias;
+                    da.ifunc_target = d_ifunc;
                     da.visibility = d_vis;
                     da.tls_model = d_tls_model;
                     da.section = d_section;
@@ -1098,6 +1115,9 @@ impl Parser {
                     da.set_error_attr(self.attrs.parsing_error_attr());
                     if let Some(ref target) = self.attrs.parsing_alias_target {
                         da.alias_target = Some(target.clone());
+                    }
+                    if let Some(ref target) = self.attrs.parsing_ifunc_target {
+                        da.ifunc_target = Some(target.clone());
                     }
                     da.visibility = local_visibility;
                     da.tls_model = local_tls_model;
@@ -1479,6 +1499,18 @@ impl Parser {
                 SizeofArg::Type(ts) => Self::try_sizeof_type_spec(ts).map(|s| s as i64),
                 SizeofArg::Expr(_) => None,
             },
+            Expr::Countof(arg, _) => match arg.as_ref() {
+                SizeofArg::Type(TypeSpecifier::Array(_, Some(bound))) => {
+                    Self::eval_const_int_expr_with_enums(bound, enum_consts, tag_aligns)
+                }
+                SizeofArg::Expr(Expr::StringLiteral(s, _) | Expr::WideStringLiteral(s, _)) => {
+                    Some((s.chars().count() + 1) as i64)
+                }
+                SizeofArg::Expr(Expr::Char16StringLiteral(s, _)) => {
+                    Some((s.encode_utf16().count() + 1) as i64)
+                }
+                _ => None,
+            },
             // `None` when the parser cannot know the alignment exactly.
             Expr::Alignof(ts, _) => Self::alignof_type_spec(ts, tag_aligns).map(|a| a as i64),
             // __alignof(type) returns preferred alignment (8 for long long/double on i686)
@@ -1515,6 +1547,7 @@ impl Parser {
             // sizeof yields size_t (unsigned). _Alignof yields size_t (unsigned).
             // These are unsigned per C11 6.5.3.4 and 6.5.3.
             Expr::Sizeof(..)
+            | Expr::Countof(..)
             | Expr::Alignof(..)
             | Expr::GnuAlignof(..)
             | Expr::AlignofExpr(..)

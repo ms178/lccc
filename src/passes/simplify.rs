@@ -539,6 +539,9 @@ fn simplify_function_with_config(func: &mut IrFunction, fill_use_counts: bool) -
     if !simplify_skip("cmp") {
         total += rewrite_iabs_range_cmps(func);
     }
+    if !simplify_skip("rotate_chain") {
+        total += rewrite_rotate_and_popcount_chains(func);
+    }
 
     // A widening integer conversion preserves exactly the zero/nonzero
     // partition: for every source value x, widen(x) == 0 iff x == 0.  A
@@ -1759,6 +1762,261 @@ fn rewrite_iabs_range_cmps(func: &mut IrFunction) -> usize {
             }
         }
     }
+    changes
+}
+
+/// Fuse chained rotates and canonicalize `Popcount(Not(x))` -> `W - Popcount(x)`:
+///
+/// 1. `rotl(rotr(x, a), a) => x` and `rotr(rotl(x, a), a) => x` (exact inverse
+///    on every power-of-two width `W in {8, 16, 32, 64}`).
+/// 2. `rot{l,r}(rot{l,r}(x, a), b)` (when the inner rotate has a single use or
+///    both counts are constants) => single rotate by `a + b` / `b - a`: because
+///    `W | 2^K` for every integer count width `K >= 8`, modular addition and
+///    subtraction commute with `(count mod W)` with zero edge cases.
+/// Rewrite two algebraic rotate identities in `func`:
+/// 1. `Rot(Rot(x, a), b)` (same direction, single-use inner rotate) =>
+///    `Rot(x, a + b)`.
+/// 2. `RotL(RotR(x, a), b)` => `RotL(x, b - a)` and
+///    `RotR(RotL(x, a), b)` => `RotR(x, b - a)` (single-use inner rotate).
+///    Because `W = 8 / 16 / 32 / 64` is a power of two, modular addition and
+///    subtraction commute with `(count mod W)` with zero edge cases.
+fn collect_rotate_facts(
+    func: &IrFunction,
+    max: usize,
+) -> (
+    Vec<u32>,
+    Vec<Option<IrType>>,
+    Vec<Option<BinOpDef>>,
+    Vec<Option<CastDef>>,
+) {
+    let mut def_counts = vec![0u8; max];
+    let mut use_counts = vec![0u32; max];
+    let mut value_types: Vec<Option<IrType>> = vec![None; max];
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Some(d) = inst.dest() {
+                let idx = d.0 as usize;
+                if idx < max {
+                    def_counts[idx] = def_counts[idx].saturating_add(1);
+                }
+            }
+            match inst {
+                Instruction::BinOp { dest, ty, .. }
+                | Instruction::UnaryOp { dest, ty, .. }
+                | Instruction::Load { dest, ty, .. }
+                | Instruction::ParamRef { dest, ty, .. }
+                | Instruction::Select { dest, ty, .. }
+                | Instruction::Phi { dest, ty, .. } => set_def(&mut value_types, dest.0, *ty),
+                Instruction::Cast { dest, to_ty, .. } => set_def(&mut value_types, dest.0, *to_ty),
+                Instruction::Cmp { dest, .. } => set_def(&mut value_types, dest.0, IrType::I32),
+                _ => {}
+            }
+            inst.for_each_used_value(|v| {
+                let idx = v as usize;
+                if idx < max {
+                    use_counts[idx] = use_counts[idx].saturating_add(1);
+                }
+            });
+        }
+        block.terminator.for_each_used_value(|v| {
+            let idx = v as usize;
+            if idx < max {
+                use_counts[idx] = use_counts[idx].saturating_add(1);
+            }
+        });
+    }
+    let mut rot_defs: Vec<Option<BinOpDef>> = vec![None; max];
+    let mut cast_defs: Vec<Option<CastDef>> = vec![None; max];
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            match inst {
+                Instruction::BinOp {
+                    dest,
+                    op: op @ (IrBinOp::RotateLeft | IrBinOp::RotateRight),
+                    lhs,
+                    rhs,
+                    ty,
+                } if def_counts.get(dest.0 as usize).copied() == Some(1) => {
+                    set_def(
+                        &mut rot_defs,
+                        dest.0,
+                        BinOpDef {
+                            op: *op,
+                            lhs: *lhs,
+                            rhs: *rhs,
+                            ty: *ty,
+                        },
+                    );
+                }
+                Instruction::Cast {
+                    dest,
+                    src,
+                    from_ty,
+                    to_ty,
+                } if def_counts.get(dest.0 as usize).copied() == Some(1) => {
+                    set_def(
+                        &mut cast_defs,
+                        dest.0,
+                        CastDef {
+                            src: *src,
+                            from_ty: *from_ty,
+                            to_ty: *to_ty,
+                        },
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+    (use_counts, value_types, rot_defs, cast_defs)
+}
+
+fn rewrite_rotate_and_popcount_chains(func: &mut IrFunction) -> usize {
+    let max = func.max_value_id() as usize + 1;
+    let (use_counts, value_types, rot_defs, cast_defs) = collect_rotate_facts(func, max);
+
+    let peel_rot_cnt = |mut op: Operand| -> Operand {
+        for _ in 0..4 {
+            if let Operand::Value(v) = op
+                && let Some(Some(cd)) = cast_defs.get(v.0 as usize).copied()
+                && cd.from_ty.is_integer()
+                && cd.to_ty.is_integer()
+                && cd.from_ty.size() >= 1
+                && (cd.to_ty.size() >= cd.from_ty.size() || cd.to_ty.size() >= 1)
+                && (cd.from_ty.size() == cd.to_ty.size() || cd.to_ty.size() >= cd.from_ty.size())
+            {
+                op = cd.src;
+            } else {
+                break;
+            }
+        }
+        op
+    };
+
+    let operand_ty = |op: &Operand, fallback: IrType| -> Option<IrType> {
+        match op {
+            Operand::Value(v) => value_types.get(v.0 as usize).copied().flatten(),
+            Operand::Const(_) => Some(fallback),
+        }
+    };
+    let typed_int_const = |ty: IrType, v: i128| -> IrConst {
+        match ty {
+            IrType::I8 | IrType::U8 => IrConst::I8(v as i8),
+            IrType::I16 | IrType::U16 => IrConst::I16(v as i16),
+            IrType::I32 | IrType::U32 => IrConst::I32(v as i32),
+            _ => IrConst::I64(v as i64),
+        }
+    };
+
+    let mut next_id = func.next_value_id.max(max as u32);
+    let mut changes = 0usize;
+
+    for block in &mut func.blocks {
+        let mut i = 0;
+        while i < block.instructions.len() {
+            match block.instructions[i] {
+                Instruction::BinOp {
+                    dest,
+                    op: outer_op @ (IrBinOp::RotateLeft | IrBinOp::RotateRight),
+                    lhs: Operand::Value(inner_v),
+                    rhs: outer_cnt,
+                    ty,
+                } => {
+                    let bits = (ty.size() * 8) as i128;
+                    if matches!(bits, 8 | 16 | 32 | 64)
+                        && let Some(Some(inner)) = rot_defs.get(inner_v.0 as usize).copied()
+                        && inner.ty == ty
+                    {
+                        // 1. Exact inverse cancellation: rotl(rotr(x, a), a) == x.
+                        if inner.op != outer_op
+                            && peel_rot_cnt(inner.rhs) == peel_rot_cnt(outer_cnt)
+                        {
+                            block.instructions[i] = Instruction::Copy {
+                                dest,
+                                src: inner.lhs,
+                            };
+                            changes += 1;
+                            i += 1;
+                            continue;
+                        }
+                        // 2. Constant-count fusion (profitable regardless of use count).
+                        if let (Operand::Const(c1), Operand::Const(c2)) = (inner.rhs, outer_cnt)
+                            && let (Some(a), Some(b)) = (c1.to_i128(), c2.to_i128())
+                        {
+                            let combined = if inner.op == outer_op {
+                                (a + b).rem_euclid(bits)
+                            } else {
+                                (b - a).rem_euclid(bits)
+                            };
+                            block.instructions[i] = if combined == 0 {
+                                Instruction::Copy {
+                                    dest,
+                                    src: inner.lhs,
+                                }
+                            } else {
+                                Instruction::BinOp {
+                                    dest,
+                                    op: outer_op,
+                                    lhs: inner.lhs,
+                                    rhs: Operand::Const(typed_int_const(ty, combined)),
+                                    ty,
+                                }
+                            };
+                            changes += 1;
+                            i += 1;
+                            continue;
+                        }
+                        // 3. Variable-count fusion when inner rotate is single-use.
+                        if use_counts.get(inner_v.0 as usize).copied() == Some(1) {
+                            let t_a = operand_ty(&inner.rhs, ty);
+                            let t_b = operand_ty(&outer_cnt, ty);
+                            if let (Some(ta), Some(tb)) = (t_a, t_b)
+                                && ta == tb
+                                && ta.is_integer()
+                                && ta.size() >= 1
+                                && ta.size() <= 8
+                            {
+                                let cnt_dest = Value(next_id);
+                                next_id += 1;
+                                let (comb_op, comb_lhs, comb_rhs) = if inner.op == outer_op {
+                                    (IrBinOp::Add, inner.rhs, outer_cnt)
+                                } else {
+                                    (IrBinOp::Sub, outer_cnt, inner.rhs)
+                                };
+                                block.instructions.insert(
+                                    i,
+                                    Instruction::BinOp {
+                                        dest: cnt_dest,
+                                        op: comb_op,
+                                        lhs: comb_lhs,
+                                        rhs: comb_rhs,
+                                        ty: ta,
+                                    },
+                                );
+                                if !block.source_spans.is_empty() {
+                                    let span = block.source_spans[i].clone();
+                                    block.source_spans.insert(i, span);
+                                }
+                                block.instructions[i + 1] = Instruction::BinOp {
+                                    dest,
+                                    op: outer_op,
+                                    lhs: inner.lhs,
+                                    rhs: Operand::Value(cnt_dest),
+                                    ty,
+                                };
+                                changes += 1;
+                                i += 2;
+                                continue;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+    }
+    func.next_value_id = next_id;
     changes
 }
 
@@ -3759,45 +4017,29 @@ fn simplify_binop(
                     // 0 + x => x (integers only)
                     return Some(Instruction::Copy { dest, src: *rhs });
                 }
+                // Modular ring cancellation: `x + (y - x) => y`, `(y - x) + x => y`,
+                // `x + (-x) => 0`, `(-x) + x => 0`.
+                if let Some(inst) = try_cancel_add_sub(
+                    dest,
+                    IrBinOp::Add,
+                    lhs,
+                    rhs,
+                    ty,
+                    cast_defs,
+                    binop_defs,
+                    neg_defs,
+                ) {
+                    return Some(inst);
+                }
                 // Reassociation: (x + C1) + C2 => x + (C1 + C2)
                 if let Some(inst) = try_reassociate_add(dest, lhs, rhs, ty, binop_defs, use_counts)
                 {
                     return Some(inst);
                 }
             }
-            // Floats: x + (neg y) => x - y, plus the commuted spelling —
-            // the four-oracle consensus (GCC 16.2, Clang 23.1, ICX and
-            // local GCC 14.2 all emit the mirrored op; oracle-checked on
-            // add_neg/sub_neg/chain_pin and the MULTI-USE shapes, where
-            // GCC folds just the same — fold-const carries no use
-            // analysis). Exact for every numeric input and both zeros
-            // (IEEE 754 defines sub as the addition of the negation, and
-            // the zero-sign table is symmetric); the qNaN sign of the
-            // result may differ when y's NaN is the propagated one — the
-            // C11 6.5p8 latitude. ADJUDICATION: the house rule "take the
-            // latitude only when the materialisation dies" was derived
-            // when lccc was the conservative outlier; with every oracle
-            // folding unconditionally, NOT folding is what diverges from
-            // the competition on NaN-sign rows. The fold therefore fires
-            // unconditionally, like the oracles — bit-parity with GCC
-            // requires taking the latitude GCC takes.
             if is_float && !simplify_skip("addneg") {
-                if let Some(neg_src) = get_neg_def(rhs, neg_defs) {
-                    return Some(Instruction::BinOp {
-                        dest,
-                        op: IrBinOp::Sub,
-                        lhs: *lhs,
-                        rhs: neg_src,
-                        ty,
-                    });
-                } else if let Some(neg_src) = get_neg_def(lhs, neg_defs) {
-                    return Some(Instruction::BinOp {
-                        dest,
-                        op: IrBinOp::Sub,
-                        lhs: *rhs,
-                        rhs: neg_src,
-                        ty,
-                    });
+                if let Some(inst) = simplify_float_add_neg(dest, lhs, rhs, ty, neg_defs) {
+                    return Some(inst);
                 }
             }
         }
@@ -3814,6 +4056,20 @@ fn simplify_binop(
                 });
             }
             if !is_float {
+                // Modular ring cancellation: `(x + y) - x => y`, `(y + x) - x => y`,
+                // `x - (x - y) => y`.
+                if let Some(inst) = try_cancel_add_sub(
+                    dest,
+                    IrBinOp::Sub,
+                    lhs,
+                    rhs,
+                    ty,
+                    cast_defs,
+                    binop_defs,
+                    neg_defs,
+                ) {
+                    return Some(inst);
+                }
                 // Reassociation: (x + C1) - C2 => x + (C1 - C2)
                 // Also: (x - C1) - C2 => x - (C1 + C2)
                 if let Some(inst) = try_reassociate_sub(dest, lhs, rhs, ty, binop_defs, use_counts)
@@ -4388,6 +4644,179 @@ fn reassociation_unprofitable(intermediate: &Operand, use_counts: &[u32]) -> boo
     match intermediate {
         Operand::Value(v) => use_counts.get(v.0 as usize).copied().unwrap_or(0) > 1,
         _ => false,
+    }
+}
+
+/// Floats: `x + (-y) => x - y` and `(-x) + y => y - x` (four-oracle consensus:
+/// GCC 16.2, Clang 23.1, ICX).
+fn simplify_float_add_neg(
+    dest: Value,
+    lhs: &Operand,
+    rhs: &Operand,
+    ty: IrType,
+    neg_defs: &[Option<NegDef>],
+) -> Option<Instruction> {
+    if let Some(neg_src) = get_neg_def(rhs, neg_defs) {
+        Some(Instruction::BinOp {
+            dest,
+            op: IrBinOp::Sub,
+            lhs: *lhs,
+            rhs: neg_src,
+            ty,
+        })
+    } else {
+        get_neg_def(lhs, neg_defs).map(|neg_src| Instruction::BinOp {
+            dest,
+            op: IrBinOp::Sub,
+            lhs: *rhs,
+            rhs: neg_src,
+            ty,
+        })
+    }
+}
+
+/// Peel same-width integer casts (e.g., `I32 <-> U32`, `I64 <-> U64`), which
+/// preserve the full bit pattern under modular `Add` / `Sub`.
+fn peel_same_width_int_casts(
+    mut op: Operand,
+    width: usize,
+    cast_defs: &[Option<CastDef>],
+) -> Operand {
+    for _ in 0..4 {
+        if let Operand::Value(v) = op
+            && let Some(Some(cd)) = cast_defs.get(v.0 as usize).copied()
+            && cd.from_ty.is_integer()
+            && cd.to_ty.is_integer()
+            && cd.from_ty.size() == width
+            && cd.to_ty.size() == width
+        {
+            op = cd.src;
+        } else {
+            break;
+        }
+    }
+    op
+}
+
+fn coerce_same_width_int_result(
+    dest: Value,
+    src: Operand,
+    src_ty: IrType,
+    dest_ty: IrType,
+) -> Option<Instruction> {
+    if src_ty == dest_ty {
+        return Some(Instruction::Copy { dest, src });
+    }
+    if !src_ty.is_integer() || !dest_ty.is_integer() || src_ty.size() != dest_ty.size() {
+        return None;
+    }
+    match src {
+        Operand::Const(c) => {
+            let v = c.to_i64()?;
+            Some(Instruction::Copy {
+                dest,
+                src: Operand::Const(IrConst::from_i64(v, dest_ty)),
+            })
+        }
+        Operand::Value(_) => Some(Instruction::Cast {
+            dest,
+            src,
+            from_ty: src_ty,
+            to_ty: dest_ty,
+        }),
+    }
+}
+
+/// Modular integer ring cancellations across `Add` and `Sub` (peeling same-width
+/// signed/unsigned casts):
+/// - `x + (y - x) => y` and `(y - x) + x => y`
+/// - `x + (-x) => 0` and `(-x) + x => 0`
+/// - `(x + y) - x => y` and `(y + x) - x => y`
+/// - `x - (x - y) => y`
+fn try_cancel_add_sub(
+    dest: Value,
+    op: IrBinOp,
+    lhs: &Operand,
+    rhs: &Operand,
+    ty: IrType,
+    cast_defs: &[Option<CastDef>],
+    binop_defs: &[Option<BinOpDef>],
+    neg_defs: &[Option<NegDef>],
+) -> Option<Instruction> {
+    if !ty.is_integer() {
+        return None;
+    }
+    let w = ty.size();
+    if w == 0 || w > 8 {
+        return None;
+    }
+    let pl = peel_same_width_int_casts(*lhs, w, cast_defs);
+    let pr = peel_same_width_int_casts(*rhs, w, cast_defs);
+
+    let bin_of = |o: Operand| -> Option<BinOpDef> {
+        let Operand::Value(v) = o else {
+            return None;
+        };
+        let bd = (*binop_defs.get(v.0 as usize)?)?;
+        if bd.ty.is_integer() && bd.ty.size() == w {
+            Some(bd)
+        } else {
+            None
+        }
+    };
+
+    match op {
+        IrBinOp::Add => {
+            if let Some(neg_src) = get_neg_def(&pr, neg_defs)
+                && peel_same_width_int_casts(neg_src, w, cast_defs) == pl
+            {
+                return Some(Instruction::Copy {
+                    dest,
+                    src: Operand::Const(IrConst::zero(ty)),
+                });
+            }
+            if let Some(neg_src) = get_neg_def(&pl, neg_defs)
+                && peel_same_width_int_casts(neg_src, w, cast_defs) == pr
+            {
+                return Some(Instruction::Copy {
+                    dest,
+                    src: Operand::Const(IrConst::zero(ty)),
+                });
+            }
+            if let Some(bd) = bin_of(pr)
+                && bd.op == IrBinOp::Sub
+                && peel_same_width_int_casts(bd.rhs, w, cast_defs) == pl
+            {
+                return coerce_same_width_int_result(dest, bd.lhs, bd.ty, ty);
+            }
+            if let Some(bd) = bin_of(pl)
+                && bd.op == IrBinOp::Sub
+                && peel_same_width_int_casts(bd.rhs, w, cast_defs) == pr
+            {
+                return coerce_same_width_int_result(dest, bd.lhs, bd.ty, ty);
+            }
+            None
+        }
+        IrBinOp::Sub => {
+            if let Some(bd) = bin_of(pl)
+                && bd.op == IrBinOp::Add
+            {
+                if peel_same_width_int_casts(bd.lhs, w, cast_defs) == pr {
+                    return coerce_same_width_int_result(dest, bd.rhs, bd.ty, ty);
+                }
+                if peel_same_width_int_casts(bd.rhs, w, cast_defs) == pr {
+                    return coerce_same_width_int_result(dest, bd.lhs, bd.ty, ty);
+                }
+            }
+            if let Some(bd) = bin_of(pr)
+                && bd.op == IrBinOp::Sub
+                && peel_same_width_int_casts(bd.lhs, w, cast_defs) == pl
+            {
+                return coerce_same_width_int_result(dest, bd.rhs, bd.ty, ty);
+            }
+            None
+        }
+        _ => None,
     }
 }
 

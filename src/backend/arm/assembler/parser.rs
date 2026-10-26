@@ -94,6 +94,7 @@ pub enum SymbolKind {
     Function,
     Object,
     TlsObject,
+    GnuIndirectFunction,
     NoType,
 }
 
@@ -2376,7 +2377,10 @@ fn parse_type_directive(args: &str) -> Result<AsmDirective, String> {
     let kind = match kind_str {
         "%function" | "@function" | "STT_FUNC" => SymbolKind::Function,
         "%object" | "@object" | "STT_OBJECT" => SymbolKind::Object,
-        "@tls_object" => SymbolKind::TlsObject,
+        "%tls_object" | "@tls_object" | "STT_TLS" => SymbolKind::TlsObject,
+        "%gnu_indirect_function" | "@gnu_indirect_function" | "STT_GNU_IFUNC" => {
+            SymbolKind::GnuIndirectFunction
+        }
         _ => SymbolKind::NoType,
     };
     Ok(AsmDirective::SymbolType(sym.to_string(), kind))

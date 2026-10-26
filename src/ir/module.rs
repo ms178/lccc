@@ -32,6 +32,9 @@ pub struct IrModule {
     /// Symbol aliases: (alias_name, target_name, is_weak)
     /// From __attribute__((alias("target"))) and __attribute__((weak))
     pub aliases: Vec<(String, String, bool)>,
+    /// GNU indirect functions from `__attribute__((ifunc("resolver")))` /
+    /// `[[gnu::ifunc("resolver")]]`: (symbol_name, resolver_name, is_local, visibility).
+    pub ifuncs: Vec<(String, String, bool, Option<String>)>,
     /// Top-level asm("...") directives - emitted verbatim in assembly output
     pub toplevel_asm: Vec<String>,
     /// Symbol attribute directives for extern declarations:
@@ -343,6 +346,7 @@ impl IrModule {
             constructors: Vec::new(),
             destructors: Vec::new(),
             aliases: Vec::new(),
+            ifuncs: Vec::new(),
             toplevel_asm: Vec::new(),
             symbol_attrs: Vec::new(),
             asm_labels: crate::common::fx_hash::FxHashMap::default(),

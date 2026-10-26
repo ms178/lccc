@@ -144,6 +144,11 @@ impl<'s> IceChecker<'s> {
                 // it, which `is_ice` requires.
                 SizeofArg::Expr(_) => true,
             },
+            Expr::Countof(arg, _) => match arg.as_ref() {
+                SizeofArg::Type(TypeSpecifier::Array(_, Some(bound))) => self.is_ice(bound),
+                SizeofArg::Type(ts) => self.non_vla_type_name(ts),
+                SizeofArg::Expr(_) => true,
+            },
             Expr::Alignof(..)
             | Expr::AlignofExpr(..)
             | Expr::GnuAlignof(..)

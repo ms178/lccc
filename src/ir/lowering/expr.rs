@@ -356,6 +356,7 @@ impl Lowerer {
                 self.lower_compound_literal(type_spec, init)
             }
             Expr::Sizeof(arg, _) => self.lower_sizeof(arg),
+            Expr::Countof(arg, _) => self.lower_countof(arg),
             Expr::Alignof(type_spec, _) => {
                 let align = self.c11_alignof_type(type_spec);
                 Operand::Const(IrConst::I64(align as i64))

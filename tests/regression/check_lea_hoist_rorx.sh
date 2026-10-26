@@ -202,12 +202,18 @@ cat > "$work/rotx.c" <<'EOF_R'
 #include <stdio.h>
 unsigned rot_r(unsigned x) { return (x >> 11) | (x << 21); }
 unsigned rot_l(unsigned x) { return (x << 11) | (x >> 21); }
+unsigned sigma0(unsigned x) {
+    return ((x >> 6) | (x << 26)) ^ ((x >> 11) | (x << 21)) ^ ((x >> 25) | (x << 7));
+}
 unsigned chain(unsigned x) {
     unsigned a = (x >> 6) | (x << 26);
     unsigned b = (a >> 11) | (a << 21);
     return (b >> 25) | (b << 7);
 }
-int main(void) { printf("%u %u %u\n", rot_r(0x12345678u), rot_l(0x9abcdef0u), chain(0x0f0f0f0fu)); return 0; }
+int main(void) {
+    printf("%u %u %u %u\n", rot_r(0x12345678u), rot_l(0x9abcdef0u), sigma0(0x0f0f0f0fu), chain(0x0f0f0f0fu));
+    return 0;
+}
 EOF_R
 "$LCCC" -O2 -march=x86-64-v3 -S -o "$work/rotx.s" "$work/rotx.c" 2>/dev/null
 # No `movq %rA, %rB` immediately staging a same-register `rorxl $k, %rBd, %rBd`.

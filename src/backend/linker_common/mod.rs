@@ -73,6 +73,7 @@ mod merge;
 pub mod parse_object;
 mod parse_shared;
 pub mod reloc_field;
+pub mod relr;
 mod resolve_lib;
 mod secdata;
 mod section_map;

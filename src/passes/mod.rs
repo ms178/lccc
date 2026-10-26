@@ -2675,8 +2675,9 @@ pub(crate) fn run_passes(
         }
 
         // Phase 3: Algebraic simplification
-        // Upstream: copy_prop (propagated values), narrow (smaller types)
-        if !dis.simplify && should_run!(3, 1, 2) {
+        // Upstream: copy_prop1/copy_prop2 (propagated values from GVN/constfold/if_convert),
+        //           narrow (smaller types), constfold (folded constant operands)
+        if !dis.simplify && should_run!(3, 1, 2, 4, 8) {
             let n = timed_pass!(
                 "simplify",
                 run_on_visited(module, &dirty, &mut changed, |func| {

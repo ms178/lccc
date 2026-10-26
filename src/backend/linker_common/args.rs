@@ -53,6 +53,9 @@ pub struct LinkerArgs {
     pub z_now: bool,
     /// `-z relro` (default true, `-z norelro` clears): emit PT_GNU_RELRO.
     pub z_relro: bool,
+    /// `-z pack-relative-relocs` / `-z nopack-relative-relocs`: pack aligned
+    /// `R_*_RELATIVE` relocations into `.relr.dyn` (`SHT_RELR` / `DT_RELR`).
+    pub z_pack_relative_relocs: bool,
     /// `-z text` / `-z notext` / `-z textoff`: what to do when a dynamic
     /// relocation would have to patch a read-only segment (see
     /// [`TextrelPolicy`]).  Last spelling wins, as in GNU ld.
@@ -399,6 +402,8 @@ fn apply_z_keyword(result: &mut LinkerArgs, kw: &str) {
         "lazy" => result.z_now = false,
         "relro" => result.z_relro = true,
         "norelro" => result.z_relro = false,
+        "pack-relative-relocs" => result.z_pack_relative_relocs = true,
+        "nopack-relative-relocs" => result.z_pack_relative_relocs = false,
         "defs" => result.no_undefined = true,
         "undefs" => result.no_undefined = false,
         // CET property note bits (see linker_common::cet).

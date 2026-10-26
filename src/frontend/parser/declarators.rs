@@ -248,7 +248,7 @@ impl Parser {
         };
         loop {
             match self.peek() {
-                TokenKind::LBracket => {
+                TokenKind::LBracket if !self.is_c23_attr_start() => {
                     let open_bracket = self.peek_span();
                     self.check_suffix_composition(
                         innermost_suffix_is_function,
@@ -365,10 +365,37 @@ impl Parser {
 
     /// Determine if a '(' starts a parenthesized declarator vs. a parameter list.
     pub(super) fn is_paren_declarator(&self) -> bool {
-        if self.pos + 1 >= self.tokens.len() {
+        let mut idx = self.pos + 1;
+        while idx + 1 < self.tokens.len()
+            && matches!(self.tokens[idx].kind, TokenKind::LBracket)
+            && matches!(self.tokens[idx + 1].kind, TokenKind::LBracket)
+        {
+            idx += 2;
+            let mut depth = 1usize;
+            while idx < self.tokens.len() {
+                match self.tokens[idx].kind {
+                    TokenKind::LBracket => depth += 1,
+                    TokenKind::RBracket => {
+                        depth -= 1;
+                        if depth == 0 {
+                            idx += 1;
+                            if idx < self.tokens.len()
+                                && matches!(self.tokens[idx].kind, TokenKind::RBracket)
+                            {
+                                idx += 1;
+                            }
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                idx += 1;
+            }
+        }
+        if idx >= self.tokens.len() {
             return false;
         }
-        match &self.tokens[self.pos + 1].kind {
+        match &self.tokens[idx].kind {
             TokenKind::Star | TokenKind::Caret => true,
             TokenKind::LParen | TokenKind::LBracket => true,
             TokenKind::Attribute | TokenKind::Extension => true,
@@ -1130,7 +1157,7 @@ impl Parser {
         };
 
         // Parse trailing array dimensions
-        while matches!(self.peek(), TokenKind::LBracket) {
+        while matches!(self.peek(), TokenKind::LBracket) && !self.is_c23_attr_start() {
             self.advance();
             // Skip C99 array qualifiers (static, restrict, const, volatile)
             self.skip_array_qualifiers();
@@ -1220,10 +1247,10 @@ impl Parser {
         // e.g. void foo(void (__attribute__((ms_abi)) *handler)(int))
         self.skip_gcc_extensions();
 
-        if matches!(self.peek(), TokenKind::LBracket) {
+        if matches!(self.peek(), TokenKind::LBracket) && !self.is_c23_attr_start() {
             // Abstract array declarator in parens: ([4]) or ([])
             // E.g., `int f(int ([4]))` is equivalent to `int f(int *)`
-            while matches!(self.peek(), TokenKind::LBracket) {
+            while matches!(self.peek(), TokenKind::LBracket) && !self.is_c23_attr_start() {
                 self.advance();
                 self.skip_array_qualifiers();
                 if matches!(self.peek(), TokenKind::RBracket) {
@@ -1331,7 +1358,7 @@ impl Parser {
             // to the caller so array-to-pointer decay is properly applied.
             // E.g. int (*a[]) = array of ptr-to-int = int **a (after decay)
             let mut inner_array_dims = Vec::with_capacity(8);
-            while matches!(self.peek(), TokenKind::LBracket) {
+            while matches!(self.peek(), TokenKind::LBracket) && !self.is_c23_attr_start() {
                 self.advance();
                 self.skip_array_qualifiers();
                 if matches!(self.peek(), TokenKind::RBracket) {
@@ -1358,7 +1385,7 @@ impl Parser {
                 let (fp_params, variadic) = self.parse_param_list();
                 *fptr_params = Some(fp_params);
                 *fptr_variadic = variadic;
-            } else if matches!(self.peek(), TokenKind::LBracket) {
+            } else if matches!(self.peek(), TokenKind::LBracket) && !self.is_c23_attr_start() {
                 // Pointer-to-array: (*p)[N], (**p)[N]
                 //
                 // Every star counts: `(*p)[N]` has the syntax-marker star and
@@ -1369,7 +1396,7 @@ impl Parser {
                 // keeps the leading stars, which bind to the base from the
                 // inside).
                 *paren_ptr_total = inner_ptr_depth;
-                while matches!(self.peek(), TokenKind::LBracket) {
+                while matches!(self.peek(), TokenKind::LBracket) && !self.is_c23_attr_start() {
                     self.advance();
                     self.skip_array_qualifiers();
                     if matches!(self.peek(), TokenKind::RBracket) {
@@ -1561,7 +1588,7 @@ impl Parser {
         let mut prev_suffix_is_function: Option<bool> = None;
         loop {
             match self.peek() {
-                TokenKind::LBracket => {
+                TokenKind::LBracket if !self.is_c23_attr_start() => {
                     let open_bracket = self.peek_span();
                     self.check_suffix_composition(
                         prev_suffix_is_function,

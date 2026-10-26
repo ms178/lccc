@@ -125,11 +125,20 @@ pub fn build_elf_symbol_table(input: &SymbolTableInput) -> Vec<ObjSymbol> {
 
         if let Some(&idx) = defined_names.get(resolved) {
             let target_sym = &symbols[idx];
+            // `.set alias, target` alone creates an STB_LOCAL symbol unless an
+            // explicit `.globl`/`.weak` marks `alias` external (GAS 2.47).
+            // Versioned aliases from `.symver` (`foo@@VER` / `foo@VER`) inherit
+            // the target's binding so exported version definitions remain global.
+            let default_binding = if alias.contains('@') {
+                target_sym.binding
+            } else {
+                STB_LOCAL
+            };
             symbols.push(ObjSymbol {
                 name: alias.clone(),
                 value: target_sym.value,
                 size: target_sym.size,
-                binding: alias_binding.unwrap_or(target_sym.binding),
+                binding: alias_binding.unwrap_or(default_binding),
                 sym_type: alias_type.unwrap_or(target_sym.sym_type),
                 // Visibility comes only from an explicit .hidden/.protected
                 // directive on the alias itself (GNU as semantics). Copying the

@@ -3169,6 +3169,9 @@ fn collect_value_referenced_functions(module: &IrModule) -> (FxHashSet<String>, 
     for (_, target, _) in &module.aliases {
         names.insert(target.clone());
     }
+    for (_, resolver, _, _) in &module.ifuncs {
+        names.insert(resolver.clone());
+    }
     for ctor in &module.constructors {
         names.insert(ctor.clone());
     }

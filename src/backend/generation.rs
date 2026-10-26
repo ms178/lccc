@@ -4215,6 +4215,7 @@ pub fn generate_module(
     let ipa_reorder = cg.ipa_reorder_functions();
     emit_functions_and_sections(cg, module, source_mgr, &file_table, ipa_reorder);
     emit_aliases(cg, module);
+    emit_ifuncs(cg, module);
     emit_symver_directives(cg, module);
     emit_symbol_attrs(cg, module, &referenced_symbols);
     emit_init_fini_arrays(cg, module, ptr_dir);
@@ -4473,6 +4474,14 @@ fn collect_referenced_symbols(module: &IrModule) -> FxHashSet<String> {
         if !global.is_extern {
             refs.insert(global.name.clone());
         }
+    }
+    for (alias_name, target, _) in &module.aliases {
+        refs.insert(alias_name.clone());
+        refs.insert(target.clone());
+    }
+    for (ifunc_name, resolver, _, _) in &module.ifuncs {
+        refs.insert(ifunc_name.clone());
+        refs.insert(resolver.clone());
     }
     refs
 }
@@ -4823,6 +4832,34 @@ fn emit_aliases(cg: &mut dyn ArchCodegen, module: &IrModule) {
         }
         cg.state()
             .emit_fmt(format_args!(".set {},{}", alias_name, target_resolved));
+    }
+}
+
+/// Emit GNU indirect function declarations (`__attribute__((ifunc("resolver")))`
+/// / `[[gnu::ifunc("resolver")]]`).
+fn emit_ifuncs(cg: &mut dyn ArchCodegen, module: &IrModule) {
+    let ifunc_type_dir = if cg.function_type_directive().starts_with('%') {
+        "%gnu_indirect_function"
+    } else {
+        "@gnu_indirect_function"
+    };
+    for (ifunc_name, resolver_name, is_local, visibility) in &module.ifuncs {
+        let resolver_resolved = module
+            .asm_labels
+            .get(resolver_name)
+            .unwrap_or(resolver_name);
+        if ifunc_name.as_str() == resolver_resolved.as_str() {
+            continue;
+        }
+        cg.state().emit("");
+        if !*is_local {
+            cg.state().emit_fmt(format_args!(".globl {}", ifunc_name));
+            cg.state().emit_visibility(ifunc_name, visibility);
+        }
+        cg.state()
+            .emit_fmt(format_args!(".type {}, {}", ifunc_name, ifunc_type_dir));
+        cg.state()
+            .emit_fmt(format_args!(".set {},{}", ifunc_name, resolver_resolved));
     }
 }
 

@@ -401,11 +401,16 @@ pub fn write_relocatable_object(
     })?;
 
     // ELF header (e_ident)
+    let osabi = if symbols.iter().any(|s| s.sym_type == STT_GNU_IFUNC) {
+        ELFOSABI_GNU
+    } else {
+        ELFOSABI_NONE
+    };
     elf.extend_from_slice(&ELF_MAGIC);
     elf.push(config.elf_class);
     elf.push(ELFDATA2LSB);
     elf.push(EV_CURRENT);
-    elf.push(ELFOSABI_NONE);
+    elf.push(osabi);
     elf.extend_from_slice(&[0u8; 8]); // padding
 
     if is_32bit {

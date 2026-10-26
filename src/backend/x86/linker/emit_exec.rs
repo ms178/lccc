@@ -161,6 +161,7 @@ pub(super) fn emit_executable(
     entry_symbol: Option<&str>,
     z_now: bool,
     z_relro: bool,
+    z_pack_relative_relocs: bool,
     // `-z text` / `-z notext`: what a PIE relocation into code does.
     textrel_policy: linker_common::TextrelPolicy,
     // `(DT_FLAGS, DT_FLAGS_1)` bits the options request
@@ -312,8 +313,18 @@ pub(super) fn emit_executable(
         }
         Some((gs.from_lib.as_deref()?, gs.version.as_deref()?))
     };
+    let glibc_dt_relr = z_pack_relative_relocs
+        && is_pie
+        && !is_static
+        && dyn_sym_names
+            .iter()
+            .filter_map(import_version)
+            .any(|(lib, ver)| lib == "libc.so.6" && ver.starts_with("GLIBC_"));
     let verneed_plan = linker_common::symver::VerneedPlan::new(
-        dyn_sym_names.iter().filter_map(import_version),
+        dyn_sym_names
+            .iter()
+            .filter_map(import_version)
+            .chain(glibc_dt_relr.then_some(("libc.so.6", "GLIBC_ABI_DT_RELR"))),
         needed_sonames,
         2,
     )?;
@@ -709,6 +720,9 @@ pub(super) fn emit_executable(
         if verneed_size > 0 {
             dyn_count += 3;
         } // DT_VERSYM + DT_VERNEED + DT_VERNEEDNUM
+        if z_pack_relative_relocs && is_pie && pie_relative_count > 0 {
+            dyn_count += 3;
+        } // DT_RELR + DT_RELRSZ + DT_RELRENT
         dyn_count * 16
     };
     // Override other dynamic sizes for static linking
@@ -1470,6 +1484,81 @@ pub(super) fn emit_executable(
     // Computed up here because the header walk below must count it.
     let comment_data = linker_common::merge_comment_sections(objects);
 
+    // Finalize PIE relative relocations now that all output section, GOT, and
+    // local-IFUNC IPLT addresses exist. When `-z pack-relative-relocs` is
+    // active, 8-byte-aligned entries pack into `.relr.dyn` (`SHT_RELR`) while
+    // any unaligned entries stay in `.rela.dyn`.
+    let (rela_relative_entries, relr_bytes) = if !is_static && is_pie {
+        let mut all_relatives: Vec<(u64, u64)> =
+            Vec::with_capacity(pie_relative.len() + pie_got_relative.len());
+        for pr in &pie_relative {
+            let (out_idx, sec_off) = section_map[&(pr.obj_idx, pr.sec_idx)];
+            let obj = &objects[pr.obj_idx];
+            // Local IFUNCs resolve to their canonical IPLT stub so indirect
+            // calls through data pointers invoke the resolved implementation
+            // and compare equal to code-taken function pointers.
+            let s = local_ifunc_slots
+                .get(&(pr.obj_idx, pr.sym_idx))
+                .copied()
+                .unwrap_or_else(|| {
+                    resolve_sym(
+                        pr.obj_idx,
+                        &obj.symbols[pr.sym_idx],
+                        globals,
+                        section_map,
+                        output_sections,
+                        plt_addr,
+                    )
+                });
+            all_relatives.push((
+                output_sections[out_idx].addr + sec_off + pr.offset,
+                (s as i64 + pr.addend) as u64,
+            ));
+        }
+        let named_slots: Vec<&str> = got_entries
+            .iter()
+            .filter(|(n, p)| !n.is_empty() && !*p)
+            .map(|(n, _)| n.as_str())
+            .collect();
+        for &ord in &pie_got_relative {
+            let addend = match named_slots.get(ord) {
+                Some(name) => globals.get(*name).map(|g| g.value).unwrap_or(0),
+                None => local_got_values[ord - named_slots.len()],
+            };
+            all_relatives.push((got_addr + ord as u64 * 8, addend));
+        }
+        if z_pack_relative_relocs {
+            let (relr_addrs, leftovers) =
+                linker_common::relr::partition_relative_64(&all_relatives);
+            (
+                leftovers,
+                linker_common::relr::encode_relr_64_bytes(&relr_addrs),
+            )
+        } else {
+            (all_relatives, Vec::new())
+        }
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let relacount = rela_relative_entries.len();
+    let rela_dyn_size = if is_static {
+        0u64
+    } else {
+        (rela_dyn_glob_count
+            + copy_reloc_syms.len()
+            + dyn_irelative_count
+            + abs_dyn_count
+            + rela_relative_entries.len()) as u64
+            * 24
+    };
+    let relr_dyn_offset = rela_dyn_offset + rela_dyn_size;
+    let relr_dyn_addr = rela_dyn_addr + rela_dyn_size;
+    let relr_dyn_size = if is_static {
+        0u64
+    } else {
+        relr_bytes.len() as u64
+    };
+
     let mut out_sec_to_hdr: FxHashMap<usize, u16> = FxHashMap::default();
     // `-s` / `--strip-all`: no `.symtab`/`.strtab` at all.  Filtering the
     // builders below (rather than building and discarding) means a stripped
@@ -1513,6 +1602,9 @@ pub(super) fn emit_executable(
             h += 2;
         }
         if !is_static && rela_dyn_size > 0 {
+            h += 1;
+        }
+        if !is_static && relr_dyn_size > 0 {
             h += 1;
         }
         if !is_static && rela_plt_size > 0 {
@@ -2259,57 +2351,16 @@ pub(super) fn emit_executable(
             write_bytes(&mut out, verneed_offset as usize, &verneed_data);
         }
 
-        // .rela.dyn (GLOB_DAT for dynamic GOT symbols, R_X86_64_COPY for copy relocs)
+        // .rela.dyn (RELATIVE leftovers, GLOB_DAT, R_X86_64_COPY, IRELATIVE)
         let mut rd = rela_dyn_offset as usize;
-        // PIE slide entries first: ld.so's common case is a run of RELATIVE at
-        // the head of the table, and this is the order bfd and mold emit.
-        //
-        // Values come from the same `resolve_sym` the relocation applier below
-        // uses, so a target reached through a section symbol -- how the
-        // compiler points `const char *msgs[]` at merged string literals --
-        // resolves to its merged address rather than to 0.  Because
-        // `base_addr` is 0 for a PIE, that value is also what the applier
-        // stores in the file, so the addend and the stored bytes agree.
-        for pr in &pie_relative {
-            // Unwrap is safe: the list was filtered on exactly this key above.
-            let (out_idx, sec_off) = section_map[&(pr.obj_idx, pr.sec_idx)];
-            let obj = &objects[pr.obj_idx];
-            let s = resolve_sym(
-                pr.obj_idx,
-                &obj.symbols[pr.sym_idx],
-                globals,
-                section_map,
-                output_sections,
-                plt_addr,
-            );
-            w64(
-                &mut out,
-                rd,
-                output_sections[out_idx].addr + sec_off + pr.offset,
-            );
+        for &(rel_addr, rel_addend) in &rela_relative_entries {
+            w64(&mut out, rd, rel_addr);
             w64(&mut out, rd + 8, R_X86_64_RELATIVE as u64);
-            w64(&mut out, rd + 16, (s as i64 + pr.addend) as u64);
+            w64(&mut out, rd + 16, rel_addend);
             rd += 24;
         }
-        // ...then the GOT slots holding locally-defined addresses.  Slot N of
-        // the non-PLT range lives at got_addr + N*8, matching the numbering the
-        // GLOB_DAT writer below uses.
-        // (The named slots in ordinal order, collected once: looking each
-        // one up by a scan from the start was quadratic in the GOT size.)
-        let named_slots: Vec<&str> = got_entries
-            .iter()
-            .filter(|(n, p)| !n.is_empty() && !*p)
-            .map(|(n, _)| n.as_str())
-            .collect();
-        for &ord in &pie_got_relative {
-            let addend = match named_slots.get(ord) {
-                Some(name) => globals.get(*name).map(|g| g.value).unwrap_or(0),
-                None => local_got_values[ord - named_slots.len()],
-            };
-            w64(&mut out, rd, got_addr + ord as u64 * 8);
-            w64(&mut out, rd + 8, R_X86_64_RELATIVE as u64);
-            w64(&mut out, rd + 16, addend);
-            rd += 24;
+        if !relr_bytes.is_empty() {
+            write_bytes(&mut out, relr_dyn_offset as usize, &relr_bytes);
         }
         let mut gd_a = got_addr;
         for (name, is_plt) in got_entries {
@@ -2542,6 +2593,17 @@ pub(super) fn emit_executable(
             dd += 16;
             w64(&mut out, dd, DT_VERNEEDNUM as u64);
             w64(&mut out, dd + 8, verneed_count as u64);
+            dd += 16;
+        }
+        if relr_dyn_size > 0 {
+            w64(&mut out, dd, DT_RELR as u64);
+            w64(&mut out, dd + 8, relr_dyn_addr);
+            dd += 16;
+            w64(&mut out, dd, DT_RELRSZ as u64);
+            w64(&mut out, dd + 8, relr_dyn_size);
+            dd += 16;
+            w64(&mut out, dd, DT_RELRENT as u64);
+            w64(&mut out, dd + 8, 8);
             dd += 16;
         }
         if textrel {
@@ -3508,6 +3570,7 @@ pub(super) fn emit_executable(
         ".gnu.version",
         ".gnu.version_r",
         ".rela.dyn",
+        ".relr.dyn",
         ".rela.plt",
         ".plt",
         ".dynamic",
@@ -3774,6 +3837,22 @@ pub(super) fn emit_executable(
                 0,
                 8,
                 24,
+            );
+        }
+        // .relr.dyn
+        if relr_dyn_size > 0 {
+            write_shdr(
+                &mut out,
+                get_shname(".relr.dyn"),
+                SHT_RELR,
+                SHF_ALLOC,
+                relr_dyn_addr,
+                relr_dyn_offset,
+                relr_dyn_size,
+                0,
+                0,
+                8,
+                8,
             );
         }
         // .rela.plt

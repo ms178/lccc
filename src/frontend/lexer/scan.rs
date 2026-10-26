@@ -245,6 +245,13 @@ impl Lexer {
             return self.lex_binary_number(start);
         }
 
+        if self.pos + 1 < self.input.len()
+            && self.input[self.pos] == b'0'
+            && (self.input[self.pos + 1] == b'o' || self.input[self.pos + 1] == b'O')
+        {
+            return self.lex_prefixed_octal_number(start);
+        }
+
         if let Some(tok) = self.lex_octal_number(start) {
             return tok;
         }
@@ -286,6 +293,11 @@ impl Lexer {
         }
         let is_hex =
             input[self.pos] == b'0' && matches!(input.get(self.pos + 1), Some(b'x' | b'X'));
+        let is_prefixed_nondec = input[self.pos] == b'0'
+            && matches!(
+                input.get(self.pos + 1),
+                Some(b'x' | b'X' | b'b' | b'B' | b'o' | b'O')
+            );
         let is_digit = |c: u8| {
             if is_hex {
                 c.is_ascii_hexdigit()
@@ -298,8 +310,8 @@ impl Lexer {
         for k in self.pos..end {
             let c = input[k];
             if c == b'\'' {
-                // `0x'1`: the `'` follows the prefix, not a digit.
-                let prev_ok = is_digit(input[k - 1]) && !(is_hex && k == self.pos + 2);
+                // `0x'1`, `0b'1`, `0o'1`: the `'` follows the prefix, not a digit.
+                let prev_ok = is_digit(input[k - 1]) && !(is_prefixed_nondec && k == self.pos + 2);
                 if !(prev_ok && is_digit(input[k + 1])) {
                     misplaced.push(k);
                 }
@@ -313,6 +325,7 @@ impl Lexer {
         let text = String::from_utf8_lossy(&clean).into_owned();
         let mut sub = Lexer::new(&text, self.file_id);
         sub.set_gnu_extensions(self.gnu_extensions);
+        sub.set_c23(self.c23);
         let kind = sub.lex_number(0).kind;
         if sub.pos != text.len() {
             self.emit_lex_diag(
@@ -458,6 +471,40 @@ impl Lexer {
             self.emit_lex_diag(
                 "integer literal is too large to be represented",
                 bin_start,
+                self.pos,
+            );
+        }
+        self.finish_int_literal(value, true, start)
+    }
+
+    /// Lex a C2y/GCC 15+ prefixed octal integer literal (`0o` / `0O`).
+    fn lex_prefixed_octal_number(&mut self, start: usize) -> Token {
+        self.pos += 2;
+        let oct_start = self.pos;
+        while self.pos < self.input.len()
+            && self.input[self.pos] >= b'0'
+            && self.input[self.pos] <= b'7'
+        {
+            self.pos += 1;
+        }
+        if self.pos == oct_start {
+            self.emit_lex_diag(
+                "invalid octal constant: expected octal digit after '0o'",
+                start,
+                self.pos,
+            );
+        } else if self.pos < self.input.len() && matches!(self.input[self.pos], b'8' | b'9') {
+            let bad_start = self.pos;
+            while self.pos < self.input.len() && self.input[self.pos].is_ascii_digit() {
+                self.pos += 1;
+            }
+            self.emit_lex_diag("invalid digit in octal constant", bad_start, self.pos);
+        }
+        let (value, overflow) = Self::accumulate_digits(&self.input[oct_start..self.pos], 8);
+        if overflow {
+            self.emit_lex_diag(
+                "integer literal is too large to be represented",
+                oct_start,
                 self.pos,
             );
         }
@@ -844,6 +891,12 @@ impl Lexer {
                 } else {
                     is_long = true;
                 }
+            } else if self.pos + 1 < self.input.len()
+                && ((self.input[self.pos] == b'w' && self.input[self.pos + 1] == b'b')
+                    || (self.input[self.pos] == b'W' && self.input[self.pos + 1] == b'B'))
+            {
+                // C23 6.4.4.1: `wb`/`WB` (and `uwb`/`UWB`/`wbu`/`WBU`) _BitInt literal suffix.
+                self.pos += 2;
             } else {
                 break;
             }
@@ -1245,20 +1298,149 @@ impl Lexer {
             b'e' | b'E' => '\x1b', // GNU extension: ESC
             b'f' => '\x0c',
             b'v' => '\x0b',
-            b'x' => {
-                // Hex escape: \xNN - consumes all hex digits, value truncated to byte
+            b'o' if self.pos < self.input.len() && self.input[self.pos] == b'{' => {
+                // C2y / GCC 15+ delimited octal escape: \o{...}
+                let esc_start = self.pos.saturating_sub(2);
+                self.pos += 1; // consume '{'
                 let mut val = 0u32;
-                while self.pos < self.input.len() && self.input[self.pos].is_ascii_hexdigit() {
-                    val = val * 16 + hex_digit_val(self.input[self.pos]) as u32;
+                let mut got = 0usize;
+                while self.pos < self.input.len() && self.input[self.pos] != b'}' {
+                    let b = self.input[self.pos];
+                    if (b'0'..=b'7').contains(&b) {
+                        val = val.saturating_mul(8).saturating_add((b - b'0') as u32);
+                        got += 1;
+                    } else {
+                        self.emit_lex_diag(
+                            "invalid digit in delimited octal escape sequence",
+                            esc_start,
+                            self.pos + 1,
+                        );
+                    }
                     self.pos += 1;
                 }
-                // Truncate to byte value and use direct char mapping to avoid
-                // multi-byte UTF-8 encoding issues with values > 127
+                if self.pos < self.input.len() && self.input[self.pos] == b'}' {
+                    self.pos += 1;
+                } else {
+                    self.emit_lex_diag(
+                        "unterminated delimited octal escape sequence",
+                        esc_start,
+                        self.pos,
+                    );
+                }
+                if got == 0 {
+                    self.emit_lex_diag(
+                        "empty delimited octal escape sequence",
+                        esc_start,
+                        self.pos,
+                    );
+                }
                 (val as u8) as char
             }
+            b'x' => {
+                if self.pos < self.input.len() && self.input[self.pos] == b'{' {
+                    // C2y / GCC 15+ delimited hex escape: \x{...}
+                    let esc_start = self.pos.saturating_sub(2);
+                    self.pos += 1; // consume '{'
+                    let mut val = 0u32;
+                    let mut got = 0usize;
+                    while self.pos < self.input.len() && self.input[self.pos] != b'}' {
+                        let b = self.input[self.pos];
+                        if b.is_ascii_hexdigit() {
+                            val = val
+                                .saturating_mul(16)
+                                .saturating_add(hex_digit_val(b) as u32);
+                            got += 1;
+                        } else {
+                            self.emit_lex_diag(
+                                "invalid digit in delimited hex escape sequence",
+                                esc_start,
+                                self.pos + 1,
+                            );
+                        }
+                        self.pos += 1;
+                    }
+                    if self.pos < self.input.len() && self.input[self.pos] == b'}' {
+                        self.pos += 1;
+                    } else {
+                        self.emit_lex_diag(
+                            "unterminated delimited hex escape sequence",
+                            esc_start,
+                            self.pos,
+                        );
+                    }
+                    if got == 0 {
+                        self.emit_lex_diag(
+                            "empty delimited hex escape sequence",
+                            esc_start,
+                            self.pos,
+                        );
+                    }
+                    (val as u8) as char
+                } else {
+                    // Hex escape: \xNN - consumes all hex digits, value truncated to byte
+                    let mut val = 0u32;
+                    while self.pos < self.input.len() && self.input[self.pos].is_ascii_hexdigit() {
+                        val = val * 16 + hex_digit_val(self.input[self.pos]) as u32;
+                        self.pos += 1;
+                    }
+                    // Truncate to byte value and use direct char mapping to avoid
+                    // multi-byte UTF-8 encoding issues with values > 127
+                    (val as u8) as char
+                }
+            }
             b'u' => {
-                // Universal character name: \uNNNN (exactly 4 hex digits)
-                self.lex_unicode_escape(4)
+                if self.pos < self.input.len() && self.input[self.pos] == b'{' {
+                    // C2y / GCC 15+ delimited universal character name: \u{...}
+                    let esc_start = self.pos.saturating_sub(2);
+                    self.pos += 1; // consume '{'
+                    let mut val = 0u32;
+                    let mut got = 0usize;
+                    while self.pos < self.input.len() && self.input[self.pos] != b'}' {
+                        let b = self.input[self.pos];
+                        if b.is_ascii_hexdigit() {
+                            val = val
+                                .saturating_mul(16)
+                                .saturating_add(hex_digit_val(b) as u32);
+                            got += 1;
+                        } else {
+                            self.emit_lex_diag(
+                                "invalid digit in delimited universal character name",
+                                esc_start,
+                                self.pos + 1,
+                            );
+                        }
+                        self.pos += 1;
+                    }
+                    if self.pos < self.input.len() && self.input[self.pos] == b'}' {
+                        self.pos += 1;
+                    } else {
+                        self.emit_lex_diag(
+                            "unterminated delimited universal character name",
+                            esc_start,
+                            self.pos,
+                        );
+                    }
+                    if got == 0 {
+                        self.emit_lex_diag(
+                            "empty delimited universal character name",
+                            esc_start,
+                            self.pos,
+                        );
+                    }
+                    if (0xD800..=0xDFFF).contains(&val) || val > 0x10FFFF {
+                        self.emit_lex_diag(
+                            format!("invalid universal character name U+{:X}", val),
+                            esc_start,
+                            self.pos,
+                        );
+                        '\u{FFFD}'
+                    } else {
+                        char::from_u32(val).unwrap_or('\u{FFFD}')
+                    }
+                } else {
+                    // Universal character name: \uNNNN (exactly 4 hex digits)
+                    self.lex_unicode_escape(4)
+                }
             }
             b'U' => {
                 // Universal character name: \UNNNNNNNN (exactly 8 hex digits)

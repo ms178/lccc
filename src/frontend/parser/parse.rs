@@ -226,6 +226,8 @@ pub(super) struct ParsedDeclAttrs {
     // --- GCC attributes with values ---
     /// `__attribute__((alias("target")))` target symbol name.
     pub parsing_alias_target: Option<String>,
+    /// `__attribute__((ifunc("resolver")))` resolver symbol name.
+    pub parsing_ifunc_target: Option<String>,
     /// `__attribute__((visibility("...")))` visibility string.
     pub parsing_visibility: Option<String>,
     /// `__attribute__((tls_model("...")))`, validated at the attribute.
@@ -234,6 +236,8 @@ pub(super) struct ParsedDeclAttrs {
     pub parsing_section: Option<String>,
     /// `__attribute__((cleanup(func)))` cleanup function name.
     pub parsing_cleanup_fn: Option<String>,
+    /// `__attribute__((counted_by(member)))` sibling count field name.
+    pub parsing_counted_by: Option<String>,
     /// `__attribute__((symver("name@@VERSION")))` symbol version string.
     pub parsing_symver: Option<String>,
     /// `__attribute__((target("...")))` feature list, comma-joined.
@@ -595,6 +599,7 @@ impl std::fmt::Debug for ParsedDeclAttrs {
             .field("parsing_regparm", &self.parsing_regparm)
             .field("parsing_cold", &self.parsing_cold())
             .field("parsing_alias_target", &self.parsing_alias_target)
+            .field("parsing_ifunc_target", &self.parsing_ifunc_target)
             .field("parsing_visibility", &self.parsing_visibility)
             .field("parsing_tls_model", &self.parsing_tls_model)
             .field("parsing_section", &self.parsing_section)
@@ -1533,7 +1538,163 @@ impl Parser {
         }
     }
 
-    /// Parse __attribute__((...)) and __extension__, returning struct attribute flags.
+    #[inline]
+    pub(super) fn is_c23_attr_start(&self) -> bool {
+        matches!(self.peek(), TokenKind::LBracket)
+            && self.pos + 1 < self.tokens.len()
+            && matches!(self.peek_nth(1), TokenKind::LBracket)
+    }
+
+    /// Parse a single `[[ ... ]]` C23 attribute specifier list, honoring both
+    /// standard C23 attributes (`noreturn`, `unsequenced`, `reproducible`,
+    /// `maybe_unused`, `nodiscard`, `deprecated`, `fallthrough`) and `gnu::` /
+    /// `__gnu__::` scoped attributes (including `using gnu: ...`).
+    fn parse_c23_attribute_specifier(
+        &mut self,
+        is_packed: &mut bool,
+        aligned: &mut Option<usize>,
+        mode_kind: &mut Option<ModeKind>,
+        is_common: &mut bool,
+        scalar_storage_order: &mut Option<bool>,
+    ) {
+        self.advance(); // first '['
+        self.advance(); // second '['
+
+        // Optional C23 `using <ns> :` prefix
+        let mut default_ns: Option<String> = None;
+        if let TokenKind::Identifier(kw) = self.peek()
+            && kw == "using"
+            && self.pos + 2 < self.tokens.len()
+            && matches!(self.peek_nth(2), TokenKind::Colon)
+            && !(self.pos + 3 < self.tokens.len() && matches!(self.peek_nth(3), TokenKind::Colon))
+        {
+            self.advance(); // 'using'
+            if let TokenKind::Identifier(ns) = self.peek() {
+                default_ns = Some(ns.clone());
+                self.advance();
+            }
+            self.consume_if(&TokenKind::Colon);
+        }
+
+        while !self.at_eof() {
+            if matches!(self.peek(), TokenKind::Comma) {
+                self.advance();
+                continue;
+            }
+            if matches!(self.peek(), TokenKind::RBracket) {
+                self.advance();
+                self.consume_if(&TokenKind::RBracket);
+                break;
+            }
+
+            // Read optional `<scope> ::` prefix and attribute name (which may
+            // be tokenized as an identifier or keyword like `const` / `_Noreturn`).
+            let token_attr_name = |tk: &TokenKind| -> Option<String> {
+                match tk {
+                    TokenKind::Identifier(s) => Some(s.clone()),
+                    TokenKind::Const => Some("const".to_string()),
+                    TokenKind::Noreturn => Some("_Noreturn".to_string()),
+                    _ => None,
+                }
+            };
+
+            let Some(first_name) = token_attr_name(self.peek()) else {
+                // Unexpected token inside `[[ ... ]]`: skip balanced to `]]`.
+                let mut depth = 1usize;
+                while self.pos < self.tokens.len() {
+                    match self.tokens[self.pos].kind {
+                        TokenKind::LBracket => depth += 1,
+                        TokenKind::RBracket => {
+                            depth -= 1;
+                            if depth == 0 {
+                                self.advance();
+                                self.consume_if(&TokenKind::RBracket);
+                                return;
+                            }
+                        }
+                        _ => {}
+                    }
+                    self.advance();
+                }
+                return;
+            };
+
+            let (scope, attr_name) = if self.pos + 2 < self.tokens.len()
+                && matches!(self.peek_nth(1), TokenKind::Colon)
+                && matches!(self.peek_nth(2), TokenKind::Colon)
+            {
+                self.advance(); // scope
+                self.advance(); // ':'
+                self.advance(); // ':'
+                match token_attr_name(self.peek()) {
+                    Some(n) => (Some(first_name), n),
+                    None => continue,
+                }
+            } else {
+                (default_ns.clone(), first_name)
+            };
+
+            let norm_scope = scope.as_deref().map(|s| {
+                s.strip_prefix("__")
+                    .and_then(|r| r.strip_suffix("__"))
+                    .unwrap_or(s)
+            });
+            let norm_name = attr_name
+                .strip_prefix("__")
+                .and_then(|r| r.strip_suffix("__"))
+                .unwrap_or(attr_name.as_str());
+
+            match norm_scope {
+                None => match norm_name {
+                    "noreturn" | "_Noreturn" => {
+                        self.attrs.set_noreturn(true);
+                        self.advance();
+                        if matches!(self.peek(), TokenKind::LParen) {
+                            self.skip_balanced_parens();
+                        }
+                    }
+                    "unsequenced" => {
+                        self.attrs.set_const_attr(true);
+                        self.advance();
+                        if matches!(self.peek(), TokenKind::LParen) {
+                            self.skip_balanced_parens();
+                        }
+                    }
+                    "reproducible" => {
+                        self.attrs.set_pure(true);
+                        self.advance();
+                        if matches!(self.peek(), TokenKind::LParen) {
+                            self.skip_balanced_parens();
+                        }
+                    }
+                    _ => {
+                        self.advance();
+                        if matches!(self.peek(), TokenKind::LParen) {
+                            self.skip_balanced_parens();
+                        }
+                    }
+                },
+                Some("gnu") => {
+                    self.dispatch_gcc_attribute(
+                        &attr_name,
+                        is_packed,
+                        aligned,
+                        mode_kind,
+                        is_common,
+                        scalar_storage_order,
+                    );
+                }
+                Some(_) => {
+                    self.advance();
+                    if matches!(self.peek(), TokenKind::LParen) {
+                        self.skip_balanced_parens();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Parse __attribute__((...)), C23 [[...]], and __extension__, returning struct attribute flags.
     /// Returns (is_packed, aligned_value, mode_kind, is_common, scalar_storage_order).
     /// scalar_storage_order: Some(true) = big-endian, Some(false) = little-endian, None = unspecified.
     pub(super) fn parse_gcc_attributes(
@@ -1548,6 +1709,15 @@ impl Parser {
             match self.peek() {
                 TokenKind::Extension => {
                     self.advance();
+                }
+                TokenKind::LBracket if self.is_c23_attr_start() => {
+                    self.parse_c23_attribute_specifier(
+                        &mut is_packed,
+                        &mut aligned,
+                        &mut mode_kind,
+                        &mut is_common,
+                        &mut scalar_storage_order,
+                    );
                 }
                 TokenKind::Attribute => {
                     self.advance();
@@ -1705,6 +1875,17 @@ impl Parser {
                 self.advance();
                 self.attrs.parsing_alias_target = self.parse_string_attr_arg();
             }
+            "ifunc" | "__ifunc__" => {
+                let span = self.peek_span();
+                self.advance();
+                match self.parse_string_attr_arg() {
+                    Some(s) if !s.is_empty() => self.attrs.parsing_ifunc_target = Some(s),
+                    _ => self.emit_error(
+                        "'ifunc' attribute requires a non-empty string argument",
+                        span,
+                    ),
+                }
+            }
             "weakref" | "__weakref__" => {
                 self.attrs.set_weak(true);
                 self.advance();
@@ -1779,6 +1960,10 @@ impl Parser {
             "cleanup" | "__cleanup__" => {
                 self.advance();
                 self.parse_cleanup_attr();
+            }
+            "counted_by" | "__counted_by__" => {
+                self.advance();
+                self.parse_counted_by_attr();
             }
             "mode" | "__mode__" => {
                 self.advance();
@@ -2000,6 +2185,23 @@ impl Parser {
                 TokenKind::Eof => break,
                 _ => {}
             }
+            self.advance();
+        }
+    }
+
+    fn parse_counted_by_attr(&mut self) {
+        if !matches!(self.peek(), TokenKind::LParen) {
+            return;
+        }
+        self.advance();
+        if let TokenKind::Identifier(member) = self.peek() {
+            self.attrs.parsing_counted_by = Some(member.clone());
+            self.advance();
+        }
+        while !matches!(self.peek(), TokenKind::RParen | TokenKind::Eof) {
+            self.advance();
+        }
+        if matches!(self.peek(), TokenKind::RParen) {
             self.advance();
         }
     }

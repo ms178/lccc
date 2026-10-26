@@ -195,6 +195,10 @@ pub(crate) fn eliminate_dead_global_stores(module: &mut IrModule) {
         alias_named.insert(alias_name.to_string());
         alias_named.insert(target.to_string());
     }
+    for (ifunc_name, resolver, _, _) in &module.ifuncs {
+        alias_named.insert(ifunc_name.to_string());
+        alias_named.insert(resolver.to_string());
+    }
 
     // F6: collect GlobalAddr definitions once for all functions — O(F*I)
     // instead of O(G*F*I). Map from global name to list of (func_idx, value).
@@ -718,6 +722,20 @@ fn compute_reachability(
         );
         mark_named(target.as_ref(), name_to_ids, &mut reachable, &mut worklist);
     }
+    for (ifunc_name, resolver, _, _) in &module.ifuncs {
+        mark_named(
+            ifunc_name.as_ref(),
+            name_to_ids,
+            &mut reachable,
+            &mut worklist,
+        );
+        mark_named(
+            resolver.as_ref(),
+            name_to_ids,
+            &mut reachable,
+            &mut worklist,
+        );
+    }
 
     for ctor in &module.constructors {
         mark_named(ctor.as_ref(), name_to_ids, &mut reachable, &mut worklist);
@@ -901,6 +919,10 @@ fn filter_symbol_attrs(module: &mut IrModule) {
     for (alias_name, target, _) in &module.aliases {
         referenced.insert(alias_name.as_ref());
         referenced.insert(target.as_ref());
+    }
+    for (ifunc_name, resolver, _, _) in &module.ifuncs {
+        referenced.insert(ifunc_name.as_ref());
+        referenced.insert(resolver.as_ref());
     }
     for ctor in &module.constructors {
         referenced.insert(ctor.as_ref());
