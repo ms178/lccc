@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       refresh_toolchain_cache:
-        description: Publish Rust 1.99.1 and Clang 23.1.4 hash-cache assets instead of running benchmarks
+        description: Also publish Rust 1.99.1 and Clang 23.1.4 hash-cache assets
         type: boolean
         default: false
       baseline_ref:
@@ -33,7 +33,7 @@ concurrency:
 
 jobs:
   toolchain-cache:
-    if: ${{ inputs.refresh_toolchain_cache }}
+    if: inputs.refresh_toolchain_cache || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
     name: Publish hash-verified Rust and Clang cache
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -59,7 +59,6 @@ jobs:
           path: ${{ runner.temp }}/toolchain-cache/toolchain-cache.json
           if-no-files-found: error
   evidence:
-    if: ${{ !inputs.refresh_toolchain_cache }}
     # Opt-in research: manual, or a PR explicitly changing this definition.
     name: Same-host portable/native runtime and Callgrind
     runs-on: ubuntu-24.04
