@@ -2880,34 +2880,33 @@ impl Lowerer {
     /// `target(...)` requests (enabling a level grants it and everything
     /// below; `no-X` revokes X and everything above).
     fn x86_feature_permitted(&self, feature: crate::common::x86_features::X86Feature) -> bool {
+        use crate::common::x86_features::X86Feature as F;
+
         let mut permitted = crate::common::x86_features::effective().contains(feature);
         // Legacy 128-bit extensions keep the same register/ABI class under a
         // function target attribute. Honor that local permission without leaking
         // it into another function or claiming per-function wider-vector support.
-        use crate::common::x86_features::X86Feature as F;
         let needed = match feature {
             F::Sse => Some(0),
             F::Sse2 => Some(1),
             F::Sse3 => Some(2),
-            F::Avx2 => Some(7),
-            F::Avx => Some(6),
             F::Ssse3 => Some(3),
             F::Sse41 => Some(4),
             F::Sse42 => Some(5),
+            F::Avx => Some(6),
+            F::Avx2 => Some(7),
             _ => None,
         };
         if let Some(function) = self.func_state.as_ref() {
             for request in &function.target_features {
-                let (enabled, feature) = request
+                let (enabled, requested_feature) = request
                     .strip_prefix("no-")
                     .map_or((true, request.as_str()), |f| (false, f));
-                // Exact target-feature grants also cover FMA and AVX-512
-                // subsets, which are independent features rather than rungs
-                // in the legacy SSE/AVX level ladder. An enabled AVX-512
-                // subset implies its F base; disabling one subset does not
-                // revoke the independent F capability.
+                // AVX-512 subsets imply F; several BW subsets also imply BW,
+                // and VP2INTERSECT implies DQ (matching GCC's target-feature
+                // semantics). Negative prerequisites revoke their dependents.
                 let avx512_feature = matches!(
-                    feature,
+                    requested_feature,
                     "avx512f"
                         | "avx512bw"
                         | "avx512dq"
@@ -2927,7 +2926,7 @@ impl Lowerer {
                         | "avx512bmm"
                 );
                 let avx512_bw_dependent = matches!(
-                    requirement.feature,
+                    feature,
                     F::Avx512Vbmi
                         | F::Avx512Vbmi2
                         | F::Avx512BitAlg
@@ -2935,43 +2934,43 @@ impl Lowerer {
                         | F::Avx512Fp16
                         | F::Avx512Bmm
                 );
-                if feature == "avx512f" {
+
+                if requested_feature == "avx512f" {
                     if avx512_feature {
                         permitted = enabled;
                     }
                     continue;
                 }
-                if !enabled && feature == "avx512bw" && avx512_bw_dependent {
+                if !enabled && requested_feature == "avx512bw" && avx512_bw_dependent {
                     permitted = false;
                     continue;
                 }
-                if feature == requirement.feature.name() {
+                if requested_feature == feature.name() {
                     permitted = enabled;
                     continue;
                 }
-                if enabled && requirement.feature == F::Avx512F && avx512_feature {
+                if enabled && feature == F::Avx512F && avx512_feature {
                     permitted = true;
                     continue;
                 }
                 if enabled
-                    && requirement.feature == F::Avx512Bw
+                    && feature == F::Avx512Bw
                     && matches!(
-                        feature,
+                        requested_feature,
                         "avx512vbmi" | "avx512vbmi2" | "avx512bitalg" | "avx512bf16" | "avx512fp16"
                     )
                 {
                     permitted = true;
                     continue;
                 }
-                if enabled && requirement.feature == F::Avx512Dq && feature == "avx512vp2intersect"
-                {
+                if enabled && feature == F::Avx512Dq && requested_feature == "avx512vp2intersect" {
                     permitted = true;
                     continue;
                 }
                 if !enabled
-                    && requirement.feature == F::Fma
+                    && feature == F::Fma
                     && matches!(
-                        feature,
+                        requested_feature,
                         "sse" | "sse2" | "sse3" | "ssse3" | "sse4.1" | "sse4.2" | "avx"
                     )
                 {
@@ -2981,7 +2980,7 @@ impl Lowerer {
                 let Some(needed) = needed else {
                     continue;
                 };
-                let level = match feature {
+                let level = match requested_feature {
                     "sse" => 0,
                     "sse2" => 1,
                     "sse3" => 2,
