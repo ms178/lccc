@@ -109,6 +109,10 @@ def restore(entry, name, prefix, downloads):
         unpack(archive, temporary)
         verify(temporary, name)
         (temporary / '.archive-sha256').write_text(actual + '\n')
+        # mkdtemp is private while verifying. Installed tool prefixes must be
+        # traversable when root publishes shims for other users. The caller's
+        # parent-prefix permissions still control access to private installs.
+        temporary.chmod(0o755)
         temporary.rename(root)
     finally:
         if temporary.exists():

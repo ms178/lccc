@@ -1,5 +1,7 @@
 import io
 import json
+import hashlib
+import stat
 import os
 import subprocess
 from pathlib import Path
@@ -58,6 +60,32 @@ class ToolchainCache(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, 'filter-capable'):
                     cache.unpack(root / 'not-even-opened.tar', root / 'out')
             self.assertFalse((root / 'out').exists())
+
+    def test_verified_install_publishes_traversable_prefix_atomically(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            downloads = root / 'dl'
+            downloads.mkdir()
+            archive = downloads / 'source.tar.xz'
+            with tarfile.open(archive, 'w:xz') as output:
+                member = tarfile.TarInfo('pack/bin/rustc')
+                member.size = 2
+                member.mode = 0o755
+                output.addfile(member, io.BytesIO(b'ok'))
+            entry = self.entry()
+            entry['sha256'] = hashlib.sha256(archive.read_bytes()).hexdigest()
+            entry['url'] = (f'https://github.com/ms178/lccc/releases/download/harness-cache-4/'
+                            f'rust-1.99.1-{entry["sha256"]}.tar.xz')
+            archive.rename(downloads / entry['url'].rsplit('/', 1)[1])
+            target = root / 'rust-1.99.1'
+            def verify_staged(staging, name):
+                self.assertFalse(target.exists())
+                self.assertEqual(stat.S_IMODE(staging.stat().st_mode), 0o700)
+                self.assertEqual((staging / 'bin/rustc').read_bytes(), b'ok')
+            with patch.object(cache, 'verify', side_effect=verify_staged):
+                cache.restore(entry, 'rust', root, downloads)
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o755)
+            self.assertEqual((target / '.archive-sha256').read_text().strip(), entry['sha256'])
 
     def test_unpack_removes_only_packaging_root(self):
         with tempfile.TemporaryDirectory() as directory:

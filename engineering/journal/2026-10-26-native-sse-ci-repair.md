@@ -252,3 +252,11 @@ callable and refusal before archive open. The extraction-safety suite passes
 27 tests (two interpreter-specific skips on the local bootstrap Python).
 Hosted acceptance must be rerun on this correction; prior successful lanes do
 not make the failed aggregate green.
+
+The restore review also found that renaming a private mkdtemp directory left
+installed toolchain roots mode 0700. A root-run combined installer would then
+publish unusable /usr/local/bin shims for ordinary users. Staging stays private
+during extraction/probes; successful installation publishes a traversable 0755
+root before atomic rename. Parent-prefix permissions still protect private
+installs. The ninth focused test checks private verification, target absence
+before publication, installed permissions and the verified digest marker.
