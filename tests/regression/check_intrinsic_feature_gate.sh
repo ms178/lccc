@@ -10,7 +10,8 @@
 # ("target specific option mismatch" / "requires target feature"), so the
 # verdicts below are checked against GCC wherever GCC has the intrinsic --
 # the gate cannot pass by rejecting more than the oracle does.
-set -euo pipefail
+set -Eeuo pipefail
+trap 'status=$?; printf "FAIL: %s:%d command failed (status %d): %s\\n" "${BASH_SOURCE[0]}" "$LINENO" "$status" "$BASH_COMMAND" >&2; exit "$status"' ERR
 
 repo=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 ccc=${CCC:-$repo/target/fastbuild/lccc}
