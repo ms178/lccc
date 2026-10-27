@@ -872,8 +872,12 @@ pub struct StructField {
     pub is_packed: bool,
     /// Volatile base type of the field (element or pointee access). See `StructFieldDecl`.
     pub base_volatile: bool,
+    /// Const on the field's base type (element or innermost pointee).
+    pub base_const: bool,
     /// Volatile field object itself (`int *volatile p`). See `StructFieldDecl`.
     pub object_volatile: bool,
+    /// Const on the field object itself, independent of its pointee.
+    pub object_const: bool,
     /// Optional sibling count member from `__attribute__((counted_by(member)))`.
     pub counted_by: Option<String>,
 }
@@ -1168,7 +1172,9 @@ impl StructLayoutBuilder {
         self.field_layouts.push(StructFieldLayout {
             name: field.name.clone(),
             base_volatile: field.base_volatile,
+            base_const: field.base_const,
             object_volatile: field.object_volatile,
+            object_const: field.object_const,
             counted_by: field.counted_by.clone(),
             offset: storage_offset,
             ty: storage_ty,
@@ -1260,7 +1266,9 @@ impl StructLayoutBuilder {
         self.field_layouts.push(StructFieldLayout {
             name: field.name.clone(),
             base_volatile: field.base_volatile,
+            base_const: field.base_const,
             object_volatile: field.object_volatile,
+            object_const: field.object_const,
             counted_by: field.counted_by.clone(),
             offset: field_storage_offset,
             ty: field.ty.clone(),
@@ -1309,7 +1317,9 @@ impl StructLayoutBuilder {
         self.field_layouts.push(StructFieldLayout {
             name: field.name.clone(),
             base_volatile: field.base_volatile,
+            base_const: field.base_const,
             object_volatile: field.object_volatile,
+            object_const: field.object_const,
             counted_by: field.counted_by.clone(),
             offset: self.offset,
             ty: field.ty.clone(),
@@ -1478,8 +1488,12 @@ pub struct StructFieldLayout {
     /// Volatile base type of the field (element or pointee access). Set from the
     /// declaration, so `s.field` and `p->field` accesses are volatile when it is.
     pub base_volatile: bool,
+    /// Const on the field's base type (element or innermost pointee).
+    pub base_const: bool,
     /// Volatile field object itself (`int *volatile p`).
     pub object_volatile: bool,
+    /// Const on the field object itself, independent of its pointee.
+    pub object_const: bool,
     /// Optional sibling count member from `__attribute__((counted_by(member)))`.
     pub counted_by: Option<String>,
 }
@@ -1631,7 +1645,9 @@ impl StructLayout {
             field_layouts.push(StructFieldLayout {
                 name: field.name.clone(),
                 base_volatile: field.base_volatile,
+                base_const: field.base_const,
                 object_volatile: field.object_volatile,
+                object_const: field.object_const,
                 counted_by: field.counted_by.clone(),
                 offset: 0, // All union fields start at offset 0
                 ty: field.ty.clone(),
@@ -2089,6 +2105,36 @@ impl StructLayout {
             };
             if let Some(found) = anon_layout.field_volatility(name, ctx) {
                 return Some(found);
+            }
+        }
+        None
+    }
+
+    /// Look up a field's const qualifiers and type, searching anonymous
+    /// struct/union members recursively (like `field_offset_with_bitfield`).
+    /// Returns `(base_const, object_const, ty)`.
+    pub fn field_constness(
+        &self,
+        name: &str,
+        ctx: &dyn StructLayoutProvider,
+    ) -> Option<(bool, bool, CType)> {
+        if let Some(f) = self.fields.iter().find(|f| f.name == name) {
+            return Some((f.base_const, f.object_const, f.ty.clone()));
+        }
+        for f in &self.fields {
+            if !f.name.is_empty() {
+                continue;
+            }
+            let anon_key = match &f.ty {
+                CType::Struct(key) | CType::Union(key) => key.clone(),
+                _ => continue,
+            };
+            let anon_layout = match ctx.get_struct_layout(&anon_key) {
+                Some(layout) => layout.clone(),
+                None => continue,
+            };
+            if let Some(found) = anon_layout.field_constness(name, ctx) {
+                return Some((found.0, found.1 || f.object_const, found.2));
             }
         }
         None
@@ -4754,7 +4800,9 @@ mod conditional_type_tests {
                 type_align: None,
                 is_packed: false,
                 base_volatile: false,
+                base_const: false,
                 object_volatile: false,
+                object_const: false,
                 counted_by: None,
             },
             super::StructField {
@@ -4765,7 +4813,9 @@ mod conditional_type_tests {
                 type_align: None,
                 is_packed: true,
                 base_volatile: false,
+                base_const: false,
                 object_volatile: false,
+                object_const: false,
                 counted_by: None,
             },
         ];
@@ -4787,7 +4837,9 @@ mod conditional_type_tests {
             type_align: None,
             is_packed: true,
             base_volatile: false,
+            base_const: false,
             object_volatile: false,
+            object_const: false,
             counted_by: None,
         }];
         let l1 = super::StructLayout::for_struct_with_packing(&packed_bf, None, &ctx, false);
@@ -4802,7 +4854,9 @@ mod conditional_type_tests {
             type_align: None,
             is_packed: false,
             base_volatile: false,
+            base_const: false,
             object_volatile: false,
+            object_const: false,
             counted_by: None,
         }];
         let l2 = super::StructLayout::for_struct_with_packing(&pack2_bf, Some(2), &ctx, false);

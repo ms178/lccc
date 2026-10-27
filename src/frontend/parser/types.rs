@@ -1163,6 +1163,8 @@ impl Parser {
         // The members' `volatile` qualifiers must not outlive the body:
         // `struct S { volatile int a; } s;` leaves `s` non-volatile.
         let outer_volatile = self.attrs.parsing_volatile();
+        let outer_const = self.attrs.parsing_const();
+        let outer_pointer_const = self.attrs.parsing_pointer_const();
         let outer_counted_by = self.attrs.parsing_counted_by.take();
         self.expect_context(&TokenKind::LBrace, "for struct/union body");
         while !matches!(self.peek(), TokenKind::RBrace | TokenKind::Eof) {
@@ -1188,6 +1190,8 @@ impl Parser {
             // Likewise `volatile`: a previous member's qualifier must not
             // make this member volatile (`volatile int a; int b;`).
             self.attrs.set_volatile(false);
+            self.attrs.set_const(false);
+            self.attrs.set_pointer_const(false);
             if matches!(self.peek(), TokenKind::Semicolon) {
                 self.advance();
                 continue;
@@ -1225,7 +1229,9 @@ impl Parser {
                         alignas_type,
                         is_packed: pre_spec_packed,
                         base_volatile: false,
+                        base_const: self.attrs.parsing_const(),
                         object_volatile: false,
+                        object_const: self.attrs.parsing_const(),
                         counted_by: None,
                     });
                 } else {
@@ -1245,6 +1251,8 @@ impl Parser {
         }
         self.expect_closing(&TokenKind::RBrace, open);
         self.attrs.set_volatile(outer_volatile);
+        self.attrs.set_const(outer_const);
+        self.attrs.set_pointer_const(outer_pointer_const);
         self.attrs.parsing_counted_by = outer_counted_by;
         fields
     }
@@ -1305,6 +1313,7 @@ impl Parser {
         fields: &mut Vec<StructFieldDecl>,
         pre_spec_packed: bool,
     ) {
+        let field_spec_const = self.attrs.parsing_const();
         // Capture _Alignas value that was parsed during type specifier parsing
         let mut alignas_from_type = self.attrs.parsed_alignas.take();
         let mut packed_from_type = pre_spec_packed;
@@ -1362,7 +1371,9 @@ impl Parser {
                     alignas_type: alignas_type.clone(),
                     is_packed: packed_from_type || extra_packed,
                     base_volatile: false,
+                    base_const: false,
                     object_volatile: false,
+                    object_const: false,
                     counted_by: None,
                 });
                 if !self.consume_if(&TokenKind::Comma) {
@@ -1384,6 +1395,15 @@ impl Parser {
             // The declarator's volatile qualifiers (see `declarator_base_volatile`).
             let decl_base_volatile = self.attrs.declarator_base_volatile;
             let decl_object_volatile = self.attrs.declarator_object_volatile;
+            let field_base_const = field_spec_const;
+            let field_object_const = if derived
+                .iter()
+                .any(|d| matches!(d, DerivedDeclarator::Pointer(_)))
+            {
+                self.attrs.parsing_pointer_const()
+            } else {
+                field_spec_const
+            };
             let declarator_object_space = std::mem::replace(
                 &mut self.attrs.declarator_object_space,
                 AddressSpace::Default,
@@ -1442,7 +1462,9 @@ impl Parser {
                 alignas_type: alignas_type.clone(),
                 is_packed,
                 base_volatile: decl_base_volatile,
+                base_const: field_base_const,
                 object_volatile: decl_object_volatile,
+                object_const: field_object_const,
                 counted_by,
             });
 

@@ -1173,7 +1173,9 @@ impl<'a> ExprTypeChecker<'a> {
                     type_align,
                     is_packed: f.is_packed,
                     base_volatile: f.base_volatile,
+                    base_const: f.base_const,
                     object_volatile: f.object_volatile,
+                    object_const: f.object_const,
                     counted_by: f.counted_by.clone(),
                 })
             })

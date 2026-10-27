@@ -13,6 +13,13 @@ import tempfile
 
 # name, source, hard read-only error, warning class (None for legal controls).
 CASES = [
+    ('const_member', 'struct S{const int x;};void f(struct S*p){p->x=1;}', True, None),
+    ('mutable_member_after_const', 'struct S{const int x;int y;};void f(struct S*p){p->y=1;}', False, None),
+    ('const_member_pointer', 'struct S{int *const p;};void f(struct S*s){s->p=0;}', True, None),
+    ('mutable_member_pointee', 'struct S{int *const p;};void f(struct S*s){*s->p=1;}', False, None),
+    ('const_member_pointee', 'struct S{const int *p;};void f(struct S*s){*s->p=1;}', True, None),
+    ('mutable_member_pointer', 'struct S{const int *p;};void f(struct S*s){s->p=0;}', False, None),
+    ('const_anonymous_member', 'struct S{struct{const int x;};};void f(struct S*s){s->x=1;}', True, None),
     ('const_first_sibling', 'void f(void){int *const p=0,*q=0;p=0;(void)q;}', True, None),
     ('mutable_first_sibling', 'void f(void){int *p=0,*const q=0;p=0;(void)q;}', False, None),
     ('const_cast_initializer', 'void f(void){int *const p=(int*)0;p=0;}', True, None),

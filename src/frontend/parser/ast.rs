@@ -1390,9 +1390,13 @@ pub struct StructFieldDecl {
     /// `volatile` on the field's base type (`volatile u32 ctrl`, `volatile int a[4]`):
     /// the element or pointee access is volatile. Mirrors `DeclAttributes::base_volatile`.
     pub base_volatile: bool,
+    /// Const on the field's base type (element or innermost pointee).
+    pub base_const: bool,
     /// `volatile` on the field object itself (`int *volatile p`). Mirrors
     /// `DeclAttributes::object_volatile`.
     pub object_volatile: bool,
+    /// Const on the field object itself, independent of its pointee.
+    pub object_const: bool,
     /// GCC 15/16 `__attribute__((counted_by(member)))` / `[[gnu::counted_by(member)]]`:
     /// names the sibling integer field storing this flexible array's element count.
     pub counted_by: Option<String>,

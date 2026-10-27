@@ -6096,7 +6096,9 @@ impl SemanticAnalyzer {
                     type_align,
                     is_packed: f.is_packed,
                     base_volatile: f.base_volatile,
+                    base_const: f.base_const,
                     object_volatile: f.object_volatile,
+                    object_const: f.object_const,
                     counted_by: f.counted_by.clone(),
                 })
             })
@@ -6663,6 +6665,26 @@ impl SemanticAnalyzer {
         "<expr>".to_string()
     }
 
+    fn member_constness(&self, base: &Expr, field: &str, indirect: bool) -> (bool, bool) {
+        let Some(CType::Struct(key) | CType::Union(key)) = self.member_base_ctype(base, indirect)
+        else {
+            return (false, false);
+        };
+        let layouts = self.result.type_context.borrow_struct_layouts();
+        layouts
+            .get(key.as_ref())
+            .and_then(|layout| layout.field_constness(field, &*layouts))
+            .map_or((false, false), |(base, object, _)| (base, object))
+    }
+
+    fn readonly_base_qualifier(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::MemberAccess(base, field, _) => self.member_constness(base, field, false).0,
+            Expr::PointerMemberAccess(base, field, _) => self.member_constness(base, field, true).0,
+            _ => crate::common::qualifiers::expr_const_base(expr, &self.expr_type_checker()),
+        }
+    }
+
     /// Whether the POINTEE the pointer expression `ptr` designates is
     /// const-qualified (`const int *q` -> `*q` and `q->f` are read-only;
     /// `int *const p` -> the pointer is read-only but `*p` is writable).
@@ -6702,10 +6724,6 @@ impl SemanticAnalyzer {
             }
         }
         let k = derefs; // this call asks about `*^k root`'s successor
-        let root_name = match root {
-            Expr::Identifier(name, _) => Some(name.as_str()),
-            _ => None,
-        };
         let depth = match tc.infer_expr_ctype(root) {
             Some(CType::Pointer(mut inner, _)) => {
                 let mut d = 1u32;
@@ -6724,14 +6742,14 @@ impl SemanticAnalyzer {
                 if depth == 0 {
                     // `*a` of an array: the element, i.e. the array's own
                     // top-level const (`const int a[]`, `int *const ap[]`).
-                    root_name.is_some_and(|name| self.symbol_table.is_top_const(name))
+                    self.lvalue_readonly(root)
                 } else {
-                    crate::common::qualifiers::expr_const_base(root, &tc)
+                    self.readonly_base_qualifier(root)
                 }
             }
             // The chain consumes every star: the const is the base one.
             (k, depth) if depth > 0 && k + 1 == depth as usize => {
-                crate::common::qualifiers::expr_const_base(root, &tc)
+                self.readonly_base_qualifier(root)
             }
             // Middle-level const is unrecorded: do not guess (see above).
             _ => false,
@@ -6766,8 +6784,12 @@ impl SemanticAnalyzer {
                     self.pointee_readonly(base)
                 }
             }
-            Expr::MemberAccess(base, _, _) => self.lvalue_readonly(base),
-            Expr::PointerMemberAccess(base, _, _) => self.pointee_readonly(base),
+            Expr::MemberAccess(base, field, _) => {
+                self.lvalue_readonly(base) || self.member_constness(base, field, false).1
+            }
+            Expr::PointerMemberAccess(base, field, _) => {
+                self.pointee_readonly(base) || self.member_constness(base, field, true).1
+            }
             _ => false,
         }
     }
@@ -6783,8 +6805,19 @@ impl SemanticAnalyzer {
         }
         let message = match target {
             Expr::Identifier(name, _) => format!("{verb} of read-only variable '{name}'"),
-            Expr::MemberAccess(_, field, _) | Expr::PointerMemberAccess(_, field, _) => {
-                format!("{verb} of member '{field}' in read-only object")
+            Expr::MemberAccess(base, field, _) => {
+                if self.lvalue_readonly(base) {
+                    format!("{verb} of member '{field}' in read-only object")
+                } else {
+                    format!("{verb} of read-only member '{field}'")
+                }
+            }
+            Expr::PointerMemberAccess(base, field, _) => {
+                if self.pointee_readonly(base) {
+                    format!("{verb} of member '{field}' in read-only object")
+                } else {
+                    format!("{verb} of read-only member '{field}'")
+                }
             }
             _ => format!(
                 "{verb} of read-only location '{}'",
@@ -7873,7 +7906,9 @@ mod record_layouts_correspond_tests {
             sso: crate::common::types::SsoMode::None,
             sso_storage_ty: None,
             base_volatile: false,
+            base_const: false,
             object_volatile: false,
+            object_const: false,
             counted_by: None,
         }
     }
