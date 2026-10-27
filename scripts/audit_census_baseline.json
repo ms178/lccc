@@ -1,5 +1,5 @@
 {
-  "fns_over_1000": 27,
+  "fns_over_1000": 26,
   "fns_over_300": 228,
   "fns_over_500": 94,
   "ignored_tests": 10,
@@ -547,7 +547,7 @@
     "LCCC_WHY_NOT_VECTORIZE"
   ],
   "knobs_undocumented": 268,
-  "panic_sites": 836,
-  "panic_sites_hot": 103,
-  "unsafe_sites": 25
+  "panic_sites": 834,
+  "panic_sites_hot": 101,
+  "unsafe_sites": 36
 }
