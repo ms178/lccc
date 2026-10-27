@@ -9,6 +9,14 @@ Every open item of the superseded live queue is carried into §10 with its
 acceptance criteria; nothing was dropped, only demoted. Closed entries, session
 narratives and measurement journals live in the archives and in
 [`engineering/journal/`](engineering/journal/README.md).
+**GCC 16.2 parity register (added 2026-10-27, `dc878b3`).** §12 carries the
+measured conformance and compatibility gap list produced by
+[`docs/GCC16-PARITY-ASSESSMENT-2026-10-27.md`](docs/GCC16-PARITY-ASSESSMENT-2026-10-27.md)
+— 24 work items (`GP-01`…`GP-24`) covering attributes, macro environment,
+builtins, warnings, tooling flags, inline asm, debug info, coverage, LTO and
+sanitizers. Items that extend an existing MB entry are cross-referenced there;
+nothing in §4–§10 is superseded.
+
 Method doctrine: [`engineering/agent/RULES.md`](engineering/agent/RULES.md).
 Do-not-retry grounds: [`engineering/DECISIONS.md`](engineering/DECISIONS.md).
 Per-area knobs: [`engineering/subsystems/`](engineering/subsystems/README.md).
@@ -114,6 +122,31 @@ the built driver):
 | 300-function TU, `-O1`, `CCC_TIME_PEEPHOLE=1` | peephole 2.08 s of 2.81 s total (74 %); GCC `-O1` 0.77 s (ratio only: fastbuild compiler) | — |
 | `-O0` vs `-O1`/`-O2` compile latency (`e8ae10a`, 80 TUs, twice) | `-O0` slower: 7.4 s vs 5.8–6.5 s; `.text` 4049 vs 2705 B — **re-measure** before acting (MB-21) | — |
 
+**Re-measured 2026-10-27 on `dc878b3`** (this supersedes the stale rows above;
+method and raw data in
+[`docs/GCC16-PARITY-ASSESSMENT-2026-10-27.md`](docs/GCC16-PARITY-ASSESSMENT-2026-10-27.md)):
+
+| Probe | Result now | GCC 16.2 reference |
+|---|---|---|
+| `-Wall -Wextra` on ordinary code | `-Wformat`, `-Wsign-compare`, `-Wunused-variable`, `-Wformat-security`, `-Wint-conversion`, `-Wreturn-mismatch` present; `-Wuninitialized`, `-Wshadow`, `-Wconversion`, `-Wswitch`, `-Wvla`, `-Wreturn-local-addr`, `-Wmissing-prototypes`, `-Woverflow` absent | present |
+| `-g -O1 -c` | `.debug_line` only (DWARF **v4**, empty directory table); **no** `.debug_info` → no types, locals or parameters in gdb | DWARF 5 with `.debug_info`/`.debug_abbrev`/`.debug_str` |
+| `-ftest-coverage` / `-fprofile-arcs` (each alone) | accepted but **re-routed to the PGO path**: `lccc: PGO: instrumented N functions … into lccc-*.profraw`, **no `.gcno`/`.gcda`, no `__gcov_*`** — a coverage job gets a PGO profile | gcov data + `__gcov_*` runtime |
+| `-fprofile-generate` | works, own `.profraw` format (GCC cannot read it) | `.gcda` |
+| `_Float16`, `__bf16`, `_Decimal32/64`, `__float128`, `_Complex` | accepted (previously reported as rejected) | accepted |
+| `-pedantic`, `-Ofast`, `-Og`, `-static-pie` | accepted with "not implemented" warning, no effect | implemented |
+| `-O3` vs `-O2` | byte-identical output on the probe sample (no extra passes) | `-O3` adds unroll/vectorise |
+| unknown/ignored/misapplied `__attribute__` | **silent** (no `-Wattributes`), e.g. `__attribute__((frobnicate)) int y;` | `warning: 'frobnicate' attribute directive ignored [-Wattributes]` |
+| `__attribute__((ms_abi))` | silently ignored → **cross-compiler ABI break**: GCC caller + lccc callee prints `1216891234` instead of `47`; lccc caller + GCC callee segfaults | correct Microsoft ABI |
+| `__attribute__((retain/noinit/persistent))` | silently ignored; objects land in `.data`/`.bss` | `.data.retain`, `.persistent` |
+| `__has_builtin` differential | 607 visible vs 1 696 (`-march=x86-64-v3`: 607 vs 2 171); 129 names over-claimed | — |
+| `-W` option surface | 18 of 549 positive options accepted; 12 live warning kinds; 535 tolerated | 549 |
+| driver option surface (`--help=*` catalogue) | 157 accepted, 1 051 tolerated-no-op, 171 refused, 10 unrecognized (of 1 389) | — |
+| `-dumpversion` / `__GNUC__` | `14` / `14` (`__VERSION__ "14.2.0"`) | `16` |
+| `echo \| lccc -dM -E -x c -` | defines 211 **libc** macros GCC never defines (`BUFSIZ`, `EOF`, `NULL`, `CHAR_BIT`, `INT8_C(x)`, errno values) and `__STDC_NO_ATOMICS__`; misses 155 GCC macros | reference set |
+| inline-asm constraints | no validation: `"j"`, `"V"`, `=` on an input are all accepted | `impossible constraint in 'asm'` / `input operand constraint contains '='` |
+| digraphs / UCN identifiers | rejected (`%:`, `<:`, `int caf\u00e9`) | accepted |
+| `_BitInt(N)` | rejected (unchanged; MB-11) | accepted |
+
 What is **good** and must not regress: i686 code generation and ABI behaviour
 on the 14-program differential set; link speed; object determinism across build
 directories (R: identical objects from two directories with `-g`); the
@@ -147,6 +180,12 @@ ROI = (impact × confidence) ÷ effort, each 1–5; higher is better.
 | 18 | MB-33 | Linker differential oracle (bfd/lld/mold/lccc-ld) | 1 | M | 2.8 |
 | 19 | MB-30 | Raptor Lake cost-model calibration from published tables | 6 | L | 2.5 |
 | 20 | MB-41 | Backlog format gate + archive discipline | — | S | 2.5 |
+
+The GCC-16.2 conformance half of the programme is ranked separately in §12
+(new items `GP-01`…`GP-24`, measured 2026-10-27). Its first five in ROI order are
+GP-22 (option-effect ledger, 4.5), GP-01 (`-Wattributes` truth, 4.6 — but GP-22
+first because it makes every later item a ratchet), GP-05 (macro hygiene, 4.4),
+GP-23 (macro-diff gate, 4.0), GP-09 (warning registry, 4.0).
 
 Suggested start for a single agent with one session: MB-20 (hoist `LabelRefs`:
 a one-function change worth ~30 % of compile instructions) → MB-01 → MB-05; for two agents in parallel: [MB-01, MB-04, MB-13] on the driver/linker
@@ -1347,5 +1386,565 @@ and `addr2line` gates green on x86-64 and i686; the linker differential oracle
 (MB-33) green against bfd/lld/mold for the curated structural set; compile
 instructions at `-O1`/`-O2` within 2× of GCC's on the 300-function input
 (measured with a release build, MB-22); and the performance corpus gates of §8
-unchanged or better. Until then, report progress per row of §2, never as a
-single adjective.
+unchanged or better.
+
+Added 2026-10-27 for the §12 register (these are the conditions under which the
+phrase "GCC 16.2 compatible" is allowed in any document):
+
+* the option-effect ledger (GP-22) has no accepted-and-inert row in the priority
+  set, and the ledger gate runs in the fast lane;
+* the attribute inventory (GP-01) is a pinned list with zero *silently* ignored
+  attributes — every GCC 16.2 attribute is implemented or diagnosed;
+* the macro differential (GP-23) reports an empty forbidden list and an empty
+  missing list for the essential set, with `__GNUC__`/`-dumpversion` consistent;
+* the cross-compiler ABI matrix (GP-02) is green for every accepted calling
+  convention, and no ABI-selecting attribute is accepted unobserved;
+* `__has_builtin` has zero over-claims (GP-18), and inline-asm constraint
+  verdicts match GCC on the full matrix and `-pedantic` (GP-10) is load-bearing;
+  both are gate-enforced.
+
+Until then, report progress per row of §2 or per row of §12.1, never as a single
+adjective.
+
+---
+
+## 12. GCC 16.2 parity register (measured 2026-10-27, `dc878b3`)
+
+Source of every measurement below:
+[`docs/GCC16-PARITY-ASSESSMENT-2026-10-27.md`](docs/GCC16-PARITY-ASSESSMENT-2026-10-27.md)
+(oracle GCC 16.2.0, Clang 23.1.4). The report carries the raw numbers, the
+reproducer commands and the risk ranking; this section carries the work.
+
+Scope note: "parity" means **the GCC 16.2 C contract on x86-64 and i686** —
+language, diagnostics, attributes, builtin namespace, driver/warning surface,
+tooling flags, debug info and object ABI. GCC's other back-ends, C++, and
+Objective-C are out of scope and are not tracked here.
+
+Ordering note: the rank column is **execution order**, not raw ROI — GP-22 is
+sequenced ahead of GP-01 (4.6) because the ledger is what turns every later item
+into a permanent ratchet; where two items are interchangeable the higher ROI comes
+first.
+
+Class legend: **W** = wrong code / silent semantic change (highest priority),
+**S** = silent no-op (accepted, does nothing), **D** = missing diagnostics,
+**F** = missing feature, **T** = missing tooling substrate, **P** = process gate.
+
+### 12.1 Ranked register
+
+| Rank | ID | Item | Class | Effort | ROI |
+|---:|---|---|---|---|---:|
+| 1 | GP-22 | Option-effect ledger: accepted ⇒ proven effective | P | M | 4.5 |
+| 2 | GP-01 | Attribute registry + real `-Wattributes` | D/W | S | 4.6 |
+| 3 | GP-05 | Macro-environment hygiene (`__GNUC__`, libc predefines, missing macros) | W | S–M | 4.4 |
+| 4 | GP-02 | ABI attributes (`ms_abi` family) + cross-compiler ABI gate | W | L | 4.2 |
+| 5 | GP-23 | Macro-parity gate (`-dM` diff budget) | P | S | 4.0 |
+| 6 | GP-09 | Warning registry and group expansion | D | M | 4.0 |
+| 7 | GP-17 | Inline-asm constraint grammar and validation | W | M | 3.8 |
+| 8 | GP-18 | Builtin coverage + honest `__has_builtin` | F/W | L | 3.9 |
+| 9 | GP-03 | Object/section attributes (`retain`/`noinit`/`persistent`/`nocommon`/`no_icf`/`noplt`) | W | S–M | 3.8 |
+| 10 | GP-20 | Debug info DIEs, DWARF v5 lines, `-gdwarf-N`/`-gsplit-dwarf`/`-gz` | T | L | 3.8 |
+| 11 | GP-12 | Missing warning families (shadow/conversion/overflow/switch/vla/…) | D | L | 3.8 |
+| 12 | GP-04 | Codegen-contract attributes (`interrupt`, `nocf_check`, `musttail`, `assume`, …) | W/D | M–L | 3.6 |
+| 13 | GP-11 | `-Wuninitialized` / `-Wmaybe-uninitialized` | D | L | 3.6 |
+| 14 | GP-13 | Real gcov (`.gcno`/`.gcda` for `-ftest-coverage`/`-fprofile-arcs`) | S→T | M | 3.6 |
+| 15 | GP-19 | ISA option surface (retpoline, `-mstackrealign`, `-mfsgsbase`, AVX10 policy) | F | M–L | 3.5 |
+| 16 | GP-10 | `-pedantic` | D | M | 3.4 |
+| 17 | GP-07 | Digraphs and UCN identifiers | F | S | 3.4 |
+| 18 | GP-24 | Real-world adoption matrix (gzip/zlib-ng/expat/sqlite + kernel-style TUs) | P | M | 3.7 |
+| 19 | GP-06 | `_BitInt(N)` end-to-end (extends MB-11) | F | L | 3.2 |
+| 20 | GP-21 | Driver query parity (`-dumpfullversion`, `-print-multi*`, `-print-sysroot`) | F | S | 3.2 |
+| 21 | GP-14 | PGO interop and honesty | T | M | 3.0 |
+| 22 | GP-08 | C23 dialect strictness sweep (`()` prototype, `__fp16`, over-acceptances) | F | S | 3.0 |
+| 23 | GP-16 | LTO (extends MB-15) | T | L | 3.0 |
+| 24 | GP-15 | Sanitizer runtimes (extends MB-07) | T | L | 2.8 |
+
+### 12.2 Items
+
+#### GP-22 · P0 · P — option-effect ledger
+
+**Why.** 157 of 1 389 GCC options are accepted by lccc with no diagnostic, and at
+least three of those are provably inert: `-ftest-coverage`/`-fprofile-arcs` (no
+`.gcno`/`.gcda`, no `__gcov_*`), `-Wattributes` (never fires), and `-Ofast`/`-Og`
+beyond the tolerated tier. Pillar 1 forbids exactly this, and today only the
+`-flto`/`-fopenmp`/`-fsanitize` neighbourhood is covered by
+`tests/regression/check_driver_option_contract.sh`.
+**Where.** `src/driver/option_table.rs`, `src/driver/cli.rs`,
+`tests/regression/check_driver_option_contract.sh`, `scripts/ci_local.sh`.
+**Plan.**
+1. Extend the option contract table to a *ledger*: every accepted spelling carries
+   a probe id and an expected artifact/diagnostic delta.
+2. Generate the probe as a data-driven test (`option → source fixture → observable
+   (section list, symbol, diagnostic line, asm hash)`), one row per option.
+3. Fail closed: a newly accepted option with no ledger row fails the gate;
+   `LCCC_STRICT_OPTIONS=1` makes the tolerated tier an error.
+**Gates.** The ledger gate itself, plus a negative control (delete a row from an
+implemented option, watch the gate fail). **Accept:** zero accepted-and-inert
+options for the priority set (`-fprofile-arcs`, `-ftest-coverage`, `-Wattributes`,
+`-Ofast`, `-Og`, `-static-pie`, `-pedantic`); the gate runs in the fast lane.
+**Effort** M · **ROI** 4.5.
+
+#### GP-01 · P0 · D/W — attribute registry and a real `-Wattributes`
+
+**Why.** 62 of GCC 16.2's 142 C attributes are parsed and discarded in silence, and
+`-Wattributes` (accepted since forever) never fires — not for an unknown name
+(`__attribute__((frobnicate))`), not for a misapplied one (`packed` on an `int`),
+not for a nonsensical one (`noreturn` on an object). GCC warns in all three cases.
+This is the entry point for every other attribute item: until it exists, an
+unimplemented attribute is invisible.
+**Where.** `src/frontend/parser/parse.rs` (`dispatch_gcc_attribute`),
+`src/frontend/sema/analysis.rs`, `src/common/error.rs` (`WarningKind::Attributes`).
+**Plan.**
+1. Turn the dispatcher into a table `name → { applicability, handler, implemented }`.
+2. Emit `'<name>' attribute directive ignored [-Wattributes]` for unknown names and
+   `'<name>' attribute ignored [-Wattributes]` for known-but-inapplicable ones
+   (GCC's two phrasings, caretted at the attribute name).
+3. Route every not-yet-implemented semantic attribute through a single
+   `unimplemented-attribute` site so the audit list is generated, not maintained by
+   hand.
+**Gates.** `tests/regression/check_attribute_diagnostics.sh`: gcc-16 verbatim
+expectations for unknown / misapplied / accepted forms, plus the generated
+"known but unimplemented" inventory pinned by name (same ratchet pattern as the
+`verify_after_pass` inventory in `check_verify_ir_clean.sh`).
+**Accept:** lccc and gcc-16 agree line-for-line on the probe set; the inventory of
+still-unimplemented attributes is a pinned list that only shrinks.
+**Effort** S · **ROI** 4.6.
+
+#### GP-02 · P0 · W — ABI-selecting attributes
+
+**Why.** `ms_abi` is silently ignored; the measured consequence is cross-object
+garbage: GCC caller + lccc callee returns `1216891234` instead of `47`, and the
+reverse direction segfaults. `sysv_abi`, `stdcall`, `thiscall`, `cdecl`,
+`sseregparm`, `force_align_arg_pointer`, `callee_pop_aggregate_return`,
+`preserve_none`, `no_caller_saved_registers`, `no_callee_saved_registers`,
+`ms_struct`, `gcc_struct` are in the same silent state.
+**Where.** `src/frontend/parser/parse.rs`, `src/backend/call_abi.rs`,
+`src/backend/x86/`, `src/backend/i686/`, `src/frontend/sema/ast.rs`
+(`FunctionAttributes`).
+**Plan.**
+1. Add the calling-convention field to the function type/attribute set and thread it
+   through call lowering and definition emission (x86-64 first: argument registers
+   `rcx/rdx/r8/r9` for integer, `xmm0..xmm3` for float, 32-byte shadow space in the
+   caller, `rax` return).
+2. `ms_struct`/`gcc_struct` layout flag in `src/common/types.rs` (bit-field packing and
+   member alignment) with layout diff tests against GCC.
+3. For anything not implemented yet: hard error naming the attribute (pillar 1), never
+   silence.
+**Gates.** The decisive one is a **cross-compiler ABI matrix**: for each attribute and
+each signature class (int/float/mixed/aggregate/variadic), build callee with GCC and
+caller with lccc and vice versa, execute, and compare to GCC/GCC. Plus `readelf -s`
+layout checks for `ms_struct`.
+**Accept:** the matrix is green for the implemented set; everything else is refused
+with a named error and covered by GP-01's inventory.
+**Effort** L · **ROI** 4.2.
+
+#### GP-03 · P1 · W — object-placement attributes
+
+**Why.** `retain`, `noinit`, `persistent`, `nocommon`, `no_icf`,
+`nodirect_extern_access`, `noplt` are accepted and ignored. Measured: GCC places
+these objects in `.data.retain` / `.persistent`; lccc puts them in plain `.data`.
+`retain` is a *security* contract (the object must survive section garbage
+collection), so silence is a correctness bug for binaries built with `--gc-sections`.
+**Where.** `src/frontend/sema/ast.rs` (`DeclAttributes`), `src/backend/generation.rs`,
+`src/backend/elf_writer_common.rs`, `src/backend/linker_common/`.
+**Plan.** Model the flag per object; emit `SHF_GNU_RETAIN` and the `.noinit`/
+`.persistent` section names exactly as GCC does; diagnose misuse (GCC already warns
+for `persistent` on an uninitialized variable).
+**Gates.** `readelf -S`/`readelf -s` table vs GCC for each attribute, plus a
+`--gc-sections` link in which a `retain`ed unreferenced object must survive.
+**Accept:** section name, flag and survival match GCC for all seven.
+**Effort** S–M · **ROI** 3.8.
+
+#### GP-04 · P1 · W/D — codegen-contract attributes
+
+**Why.** `interrupt`, `nocf_check`, `cf_check`, `no_caller_saved_registers`,
+`no_callee_saved_registers`, `assume`/`assume_aligned`, `musttail`,
+`indirect_return`, `no_reorder`, `noipa`, `noclone`, `flatten`, `leaf`, `nothrow`,
+`strict_flex_array`, `warn_if_not_aligned`, `designated_init`, `flag_enum`,
+`unavailable`, `warn_unused`, `hardbool`, `signed_bool_precision`, `tainted_args`,
+`target_version`, `ms_hook_prologue`, `strub` are silent. The first six change
+guarantees a caller is entitled to rely on; `interrupt` changes the prologue of a
+function GCC refuses to treat as ordinary.
+**Where.** `src/frontend/parser/parse.rs`, `src/backend/cfi_synth.rs`,
+`src/backend/x86/`, `src/frontend/sema/analysis.rs`, `src/passes/`.
+**Plan.** Split by risk: (a) prologue/epilogue contracts (`interrupt`,
+`ms_hook_prologue`, `nocf_check`/`cf_check` with `-fcf-protection`, `strub`) —
+implement or refuse; (b) register-contract attributes — implement or refuse;
+(c) optimisation hints (`flatten`, `leaf`, `nothrow`, `noipa`, `noclone`,
+`no_reorder`, `assume`) — implementing as *no-ops* is acceptable only if GP-01
+reports them as ignored, which is GCC's own behaviour for several of them;
+(d) diagnostic/metadata attributes (`unavailable`, `warn_unused`, `designated_init`,
+`flag_enum`, `warn_if_not_aligned`, `strict_flex_array`) — small, self-contained
+diagnostics.
+**Gates.** Per-attribute positive/negative diagnostics (gcc-16 verbatim) and asm
+checks for the prologue contracts; `-fcf-protection` `endbr64` presence/absence for
+`nocf_check`/`cf_check`.
+**Accept:** no attribute in the list is both accepted and unobserved by a gate.
+**Effort** M–L · **ROI** 3.6.
+
+#### GP-05 · P0 · W — macro-environment hygiene
+
+**Why.** Three defects in one place: (1) 211 libc macros (`BUFSIZ`, `EOF`, `NULL`,
+`CHAR_BIT`, `INT8_C(x)`, errno values, …) are predefined, so `#ifdef` feature tests
+take the wrong branch (reproduced with `#ifdef EOF`); (2) `__STDC_NO_ATOMICS__` is
+predefined although `_Atomic` works — an autoconf capability denial; (3) 155 GCC
+macros are missing (`__BIGGEST_ALIGNMENT__`, `__BITINT_MAXWIDTH__`, the
+`__FLT32/64/128*` and `__DEC*` families, `__CHAR8_TYPE__`, `__FINITE_MATH_ONLY__`,
+`__FLOAT_WORD_ORDER__`, `_STDC_PREDEF_H`, `__ATOMIC_HLE_*`), and `__GNUC__`/`-dumpversion`
+say 14 while the compiler targets 16.2 parity.
+**Where.** `src/frontend/preprocessor/builtin_macros.rs` (the `def(macros, …)` block,
+lines 22–216), `src/driver/cli.rs` (`-dumpversion`, `--version`).
+**Plan.**
+1. Delete the libc-macro predefines; the real headers must provide them (they do —
+   lccc uses the system glibc headers). Where a header is missing, ship it in
+   `include/` instead of predefining its macros.
+2. Drop `__STDC_NO_ATOMICS__`; audit the other `__STDC_NO_*` claims against what the
+   compiler actually implements.
+3. Add the missing GCC macros with byte-identical spellings (hex vs decimal matters
+   for `-dM` diffs; `((double)…)` casts matter for `__builtin_types_compatible_p`).
+4. Decide the `__GNUC__` policy explicitly: claim 16 with a documented risk note, or
+   keep 14 and provide `-fgnuc-version=`; either way `-dumpversion` must agree.
+**Gates.** GP-23 (the `-dM` diff gate) plus a feature-detection test set
+(`#ifdef BUFSIZ`, `#ifdef EOF`, `#ifdef __STDC_NO_ATOMICS__` with `_Atomic` in use).
+**Accept:** zero lccc-only macros on an empty TU; the missing-macro list is empty for
+the essential set; `__GNUC__`/`__VERSION__`/`-dumpversion` are consistent and
+documented.
+**Effort** S–M · **ROI** 4.4.
+
+#### GP-06 · P2 · F — `_BitInt(N)` end-to-end
+
+**Why.** The last C23 hole (MB-11 keeps the row visible): `unsigned _BitInt(7)`,
+`_BitInt(17)`, `_BitInt(200)` and `1wb`-suffixed literals are rejected while GCC
+16.2 accepts them. Not a syntax patch: the fixed-width `CType` model cannot carry
+precision/signedness through conversions, constant evaluation, layout, ABI
+classification, codegen and debug info.
+**Where.** `src/common/types.rs` (new `CType::BitInt{bits, signed}`),
+`src/frontend/sema/` (conversions, promotions), `src/common/type_builder`,
+`src/backend/call_abi.rs`, `src/ir/`.
+**Plan.** (1) Type + spelling + `_Generic`/`typeof` identity; (2) conversions and
+usual arithmetic conversions with the exact C23 rules; (3) constant evaluation and
+layout (non-power-of-two widths, alignment rules); (4) ABI classification
+(≤64 bits in an integer register, >64 in memory/aggregate per the SysV rules GCC
+uses); (5) codegen for widths ≤64 via the existing integer paths, wider values via
+multi-word sequences; (6) debug metadata.
+**Gates.** Compiler-oracle differential (gcc-16 accept/reject + runtime values) per
+width class, ABI cross-link tests against GCC, and a layout table test.
+**Accept:** differential green up to `_BitInt(4096)`; no regression in the existing
+C23 census.
+**Effort** L · **ROI** 3.2.
+
+#### GP-07 · P1 · F — digraphs and universal character names
+
+**Why.** Two standard-C conformance holes that GCC has had for decades: digraph
+punctuators `%:` `<:` `:>` `<%` `%>` (C95) are rejected, and UCNs in identifiers
+(`int caf\u00e9;`, C99) are rejected while UCNs in string literals work.
+**Where.** `src/frontend/lexer/` (token spelling), `src/frontend/parser/`.
+**Plan.** Fold the six digraphs onto their primary tokens in the lexer (before
+parsing, so `%:include` and `a<:2:>` work), and accept `\uXXXX`/`\UXXXXXXXX` in
+identifiers by mapping to the identifier's identifier-charset form. Both are
+`-std=` independent, as in GCC.
+**Gates.** `tests/regression/check_digraph_ucn.sh` with gcc-16 verdicts for every
+digraph position (`#`, `{`, `}`, `[`, `]`) and UCN identifiers, plus `-pedantic`
+behaviour once GP-10 exists.
+**Accept:** the probe set compiles and executes identically to GCC.
+**Effort** S · **ROI** 3.4.
+
+#### GP-08 · P3 · F — C23 dialect strictness sweep
+
+**Why.** lccc is *more* permissive than GCC in at least two measured places: C23
+`int f();` stays an unspecified-prototype declaration (GCC rejects redeclaring it
+with parameters), and `__fp16` is accepted on x86-64 (a GCC AArch64 type). Over-
+acceptance is a compatibility risk of its own: code that only builds with lccc is
+code that cannot be merged upstream.
+**Where.** `src/frontend/sema/analysis.rs` (prototype handling),
+`src/common/types.rs` (`__fp16`).
+**Plan.** Run the C23 inventory as a *bidirectional* differential (accept *and*
+reject, per dialect) and fix every "lccc accepts, gcc rejects" row; keep a pinned
+allow-list for deliberate extensions.
+**Gates.** Extend `docs/C23-COMPATIBILITY-INVENTORY.md`'s generator to fail on any
+new over-acceptance row.
+**Accept:** zero unexplained over-acceptances across gnu90…gnu2y.
+**Effort** S · **ROI** 3.0.
+
+#### GP-09 · P1 · D — warning registry and group expansion
+
+**Why.** 18 of GCC's 549 positive `-W` options are accepted and 12 `WarningKind`s
+exist; `-Wall`/`-Wextra`/`-Werror=` work only for that handful. (MB-12 covers the
+first tranche; this item is the structural half.)
+**Where.** `src/common/error.rs`, `src/driver/cli.rs`,
+`tests/regression/check_warning_compat.py`.
+**Plan.** One table `(name, default_on, in_wall, in_wextra, in_pedantic,
+description)` generating `-W<name>`, `-Wno-<name>`, `-Werror=<name>`,
+`-Wno-error=<name>`, the `[-Wname]` suffix and group expansion; unknown names follow
+the MB-01 policy (diagnose, not silence); `-Wno-` prefix matching for GCC's
+`-Wno-unknown-warning` idiom.
+**Gates.** Per-warning positive/negative pairs, group-expansion matrix, and a
+precision gate: zero lccc-only warnings over `tests/benchmark/programs` + the
+workload sources (every lccc-only line is a bug).
+**Accept:** the registry drives every emitted warning; `-Wall`/`-Wextra`/`-pedantic`
+membership matches GCC for the implemented set.
+**Effort** M · **ROI** 4.0.
+
+#### GP-10 · P2 · D — `-pedantic`
+
+**Why.** `-pedantic` is accepted and does nothing; GCC diagnoses GNU extensions in
+strict `-std=cNN` modes (statement expressions, `typeof`, zero-length arrays,
+`asm`, nested functions, …). Projects that gate on `-pedantic` cannot use lccc.
+**Where.** `src/driver/cli.rs`, `src/frontend/sema/`, `src/frontend/parser/`.
+**Plan.** Mark every extension site with a `pedantic` diagnostic kind that is silent
+unless `-std=c*` (not `gnu*`) and `-pedantic`; take GCC's message per extension.
+**Gates.** Extension battery × {`c17`,`gnu17`,`c23`,`gnu23`} × {`-pedantic`,
+`-pedantic-errors`}, gcc-verbatim.
+**Accept:** verdict and message parity; no diagnostic in `gnu*` mode.
+**Effort** M · **ROI** 3.4.
+
+#### GP-11 · P1 · D — flow warnings
+
+**Why.** `-Wuninitialized` and `-Wmaybe-uninitialized` do not exist; measured: GCC
+warns on `int x; if (x > 0) …` at `-O2 -Wall`, lccc is silent. These two are the
+highest-value warnings in the catalogue and are in every distro flag set.
+**Where.** `src/frontend/sema/` (definite-assignment lattice), `src/passes/`
+(`mem2reg`, SSA availability), diagnostics in `src/common/error.rs`.
+**Plan.** A forward must-def / may-def dataflow over the CFG at `-O1+` with the
+"maybe" wording chosen by the same rule GCC uses; honour `(void)x`, unused
+attributes, `sizeof` operands, and `-Wno-` plumbing from GP-09.
+**Gates.** A curated positive/negative corpus (including the kernel's classic
+false-positive shapes), plus a zero-false-positive requirement over the workloads.
+**Accept:** parity on the curated corpus with no lccc-only warning on the workloads.
+**Effort** L · **ROI** 3.6.
+
+#### GP-12 · P2 · D — missing warning families
+
+**Why.** Measured absent on ordinary code: `-Wshadow`, `-Wconversion`,
+`-Wsign-conversion`, `-Woverflow` (constant conversion overflow), `-Wvla`,
+`-Wswitch`/`-Wswitch-enum`, `-Wmissing-prototypes`, `-Wstrict-prototypes`,
+`-Wreturn-local-addr`, `-Warray-bounds`, `-Wstringop-overflow`/`-truncation`,
+`-Wcast-qual`, `-Wdeprecated-declarations`, and the `-Wformat=2` extras.
+**Where.** `src/frontend/sema/` (most), `src/passes/` (bounds/stringop),
+`src/common/error.rs`.
+**Plan.** Land in cheapness order: (`-Woverflow`, `-Wvla`, `-Wswitch`,
+`-Wstrict-prototypes`, `-Wmissing-prototypes`, `-Wreturn-local-addr`) then
+(`-Wshadow`, `-Wconversion`, `-Wcast-qual`, `-Wdeprecated-declarations`), then the
+analysis-backed pair (`-Warray-bounds`, `-Wstringop-*`).
+**Gates.** Per-family positive/negative pairs against gcc-16; precision gate as in
+GP-09.
+**Accept:** each family matches GCC on its gate; no new lccc-only diagnostics on the
+workloads.
+**Effort** L · **ROI** 3.8.
+
+#### GP-13 · P1 · S→T — real gcov
+
+**Why.** `-ftest-coverage` and `-fprofile-arcs` are accepted but re-routed to the
+compiler's own PGO path: each flag alone prints `lccc: PGO: instrumented N
+functions … into ./lccc-*.profraw` and emits that profile, while no `.gcno`/
+`.gcda` and no `__gcov_*` symbols appear. A project's coverage job therefore
+reports 0 % (or fails) *and* gets a misleading indication that instrumentation
+happened. Re-measured 2026-10-27 on `dc878b3`, `-ftest-coverage` alone and
+`-fprofile-arcs` alone behave identically.
+**Where.** `src/driver/`, `src/ir/`, `src/backend/` (counter insertion),
+new `.gcno` writer; `src/pgo/` for the profile side.
+**Plan.** First remove the current alias so the flags stop pretending to be PGO.
+Then either (a) implement `-ftest-coverage`: note file emission in the gcov
+format `gcov-16` reads, per-block counters, `.gcda` writing via a small runtime
+shared with the existing PGO instrumentation; or (b) refuse both flags with a named
+error and document the supported `-fprofile-generate` alternative. (a) is the parity
+answer; (b) is the honest one if effort is unavailable. Never silence.
+**Gates.** `gcov-16` parses the emitted `.gcno`, runs the program, reads `.gcda`, and
+the reported line/branch percentages match GCC's for the same source.
+**Accept:** `gcov` round-trips and matches GCC within one counter of the same
+program, on x86-64 and i686.
+**Effort** M · **ROI** 3.6.
+
+#### GP-14 · P2 · T — PGO interop and honesty
+
+**Why.** lccc's PGO works but uses an incompatible `.profraw` scheme, accepts
+`-fauto-profile`/`-fprofile-use` silently when no profile exists, and does not
+document the format. Build systems that ship GCC `.gcda` files get no optimisation
+and no warning.
+**Where.** `src/pgo/`, `src/driver/cli.rs`.
+**Plan.** Version and document the profile format; warn (GCC's
+`-Wmissing-profile` equivalent) when `-fprofile-use` finds nothing; either import
+GCC `.gcda` or refuse it explicitly.
+**Gates.** `-fprofile-use` without a profile warns; a mismatched-version profile
+warns and is ignored; the documented format round-trips.
+**Accept:** no silent "used a profile" claim without a profile.
+**Effort** M · **ROI** 3.0.
+
+#### GP-15 · P3 · T — sanitizer runtimes
+
+**Why.** ASan/TSan/LSan/MSan are refused (honest) and UBSan only works in trap mode.
+Kernel-address, `-fsanitize=pointer-*` and `-fsanitize-coverage` are refused as well.
+Adoption in fuzzing/CI pipelines requires at least ASan+UBSan run modes.
+**Where.** `src/driver/`, `src/ir/` (instrumentation), runtime cooperation with
+`libasan`/`libubsan` from the host GCC or compiler-rt.
+**Plan.** Stage 1: UBSan run mode by emitting libubsan-compatible handler calls
+(reuse the trap-mode site list). Stage 2: ASan via the standard shadow-map protocol
+and host `libasan`. Stage 3: `-fsanitize-coverage=trace-pc-guard` for fuzzing.
+**Gates.** Each sanitizer: a positive (bug detected, correct report) and a negative
+(clean program, zero reports), plus ABI interop with GCC-compiled objects.
+**Accept:** UBSan and ASan usable in a real CI recipe; everything else refused by
+name.
+**Effort** L · **ROI** 2.8.
+
+#### GP-16 · P2 · T — LTO
+
+**Why.** `-flto` is refused (honest) and `-fwhole-program`/`-fno-lto` are accepted
+with no effect. Distro default flags include `-flto=auto` in several recipes, so this
+blocks "drop-in replacement" for those builds.
+**Where.** driver + IR serialisation + link-time pass driver.
+**Plan.** Either real LTO (serialise lccc IR, run the existing pass pipeline at link
+time) or a documented "no LTO" mode in which `-flto`/`-flto=auto` are *refused* and
+`-fno-lto`/`-ffat-lto-objects` are accepted as no-ops with a rationale (MB-15).
+**Gates.** `-flto` round-trip: two TUs, cross-TU inlining must be observable in the
+asm; refusal path must be gate-tested too.
+**Accept:** whichever branch is delivered, no option is silently inert.
+**Effort** L · **ROI** 3.0.
+
+#### GP-17 · P0 · W — inline-asm constraint grammar
+
+**Why.** lccc validates nothing: `"j"(i)`, `"V"(i)`, `"=f"(d)` as an *input* are all
+accepted; GCC rejects all three. 15 of 65 probe cases diverge, every one in the
+"lccc accepts what GCC rejects" direction. Hand-written SIMD and kernel code lives in
+this space.
+**Where.** `src/backend/inline_asm.rs`, `src/frontend/sema/` (operand binding).
+**Plan.**
+1. Per-target constraint table (letter → register class / immediate range / memory /
+   symbol) for x86-64 and i686: `r,m,i,n,g,X,o,V,p,a,b,c,d,S,D,A,f,t,u,x,v,y,q,Q,R,l,
+   I,J,K,L,M,N,O,e,Z,s,G,C,B,Yz` with GCC's target meanings.
+2. Validate placement prefixes (`=`, `+`, `&`, `%`) and reject `=` on inputs.
+3. `%`-modifier table (`%b,%h,%w,%k,%q,%c,%a,%A,%l,%P,%p,%z`) with GCC's arity rules.
+4. Diagnostics: `impossible constraint in 'asm'`, `input operand constraint contains
+   '='`, `'asm' operand N probably does not match constraints`,
+   `-Wasm-operand-widths`.
+**Gates.** The 65-case matrix as a gate with gcc-16 verdicts; plus a
+"matches-GCC-when-it-accepts" runtime set (assembled and executed).
+**Accept:** verdict parity on the matrix; zero accepted-impossible constraints.
+**Effort** M · **ROI** 3.8.
+
+#### GP-18 · P1 · F/W — builtin coverage and `__has_builtin` honesty
+
+**Why.** 607 visible builtins vs GCC's 1 696 (2 171 with `-march=x86-64-v3`), and
+129 of lccc's answers are *over-claims* — worse than missing, because portable code
+dispatches on `__has_builtin`.
+**Where.** `src/frontend/sema/gcc16_builtins.rs`, `src/frontend/sema/builtins.rs`,
+`scripts/check_intrinsic_arity.py`, `include/`.
+**Plan.**
+1. Make `__has_builtin` answer from the lowering table (a builtin is "there" only if
+   it lowers or is a declared intrinsic), never from the name list alone.
+2. Add the ~550 `floatN` math builtins (`__builtin_acosf16/f32/f64/f128/f32x/f64x/l`
+   and `…pi` forms) — they lower to the same libm calls with a type suffix.
+3. Add the generic families: `__builtin_object_size`/`__builtin_dynamic_object_size`
+   variants, `__builtin_*_overflow` gaps, `__builtin_stdc_*`, `__builtin_apply*`,
+   `__builtin_classify_type`, `__builtin_alloca_with_align_and_max`.
+4. x86 ISA naming follows `engineering/isa/gcc16-sse-avx-reference.json` (5 365
+   names absent today).
+**Gates.** The `__has_builtin` differential as a gate (bidirectional: no over-claims,
+missing-set pinned and shrinking), plus lowering tests for each added family.
+**Accept:** zero over-claims; missing set empty for the generic families; the ISA gap
+count only shrinks.
+**Effort** L · **ROI** 3.9.
+
+#### GP-19 · P2 · F — ISA option surface
+
+**Why.** 77 of 234 `-m` options are accepted; refusals include flags that hardening
+and kernel builds require: `-mindirect-branch=`, `-mfunction-return=` (retpoline),
+`-mstackrealign`, `-mfsgsbase`, `-msha`, `-mrdseed`, `-madx`, `-mclflushopt`,
+`-mwaitpkg`, and `-mavx10.1` (no AVX10 policy exists).
+**Where.** `src/driver/cli.rs`, `src/backend/x86/`, `src/backend/i686/`.
+**Plan.** Land the retpoline pair first (thunk + `lfence` variants, x86-64 and
+i686), then the instruction-enable flags that only gate existing encoders
+(`-mfsgsbase`, `-msha`, `-madx`, `-mrdseed`, `-mclflushopt`, `-mwaitpkg`,
+`-mstackrealign`), then decide AVX10 (refuse permanently with a rationale, or
+implement).
+**Gates.** Per-flag: asm shows the gated instruction appear/disappear; retpoline
+gates check `call __x86_indirect_thunk_*` and `lfence` placement.
+**Accept:** the mitigation flags work; the rest are either implemented or refused by
+name (never tolerated).
+**Effort** M–L · **ROI** 3.5.
+
+#### GP-20 · P1 · T — debug information (extends MB-10)
+
+**Why.** `-g` emits `.debug_line` only: DWARF **v4**, empty directory table, no
+`.debug_info`/`.debug_abbrev`/`.debug_str`. gdb shows no types, no locals, no
+parameters, no inlined frames; `addr2line` cannot resolve header lines.
+`-gdwarf-N`, `-gsplit-dwarf` and `-gz` do not exist as options.
+**Where.** `src/backend/cfi_lower.rs`, new DIE builder, `src/backend/elf_writer_common.rs`,
+`src/driver/cli.rs`.
+**Plan.** (1) CU DIE, `DW_TAG_subprogram`, `DW_TAG_formal_parameter`,
+`DW_TAG_variable`, `DW_TAG_base_type`/`pointer_type`/`structure_type` (bounded
+scope first), `DW_AT_location` from the existing live-range data. (2) Line tables
+→ DWARF v5 with directory/file tables so header lines resolve. (3) `-gdwarf-N`
+selection, `-gsplit-dwarf`, `-gz=zlib`.
+**Gates.** gdb batch scripts (`ptype`, `info locals`, `info args`, `bt`, `list` on a
+header line), `addr2line` on a known header call site, and a DIE-inventory diff
+against GCC for a fixture bounded by scope (not an "all of DWARF" claim).
+**Accept:** the gdb and addr2line gates are green on x86-64 and i686; the DIE
+inventory covers the gates' fixtures exactly.
+**Effort** L · **ROI** 3.8.
+
+#### GP-21 · P3 · F — driver query parity
+
+**Why.** `-dumpfullversion`, `-print-multiarch`, `-print-multi-lib`,
+`-print-sysroot` are hard errors; `-print-prog-name=cc1` prints a bare `cc1`;
+`-print-libgcc-file-name` resolves to an unrelated system `gcc-12` libgcc;
+`-dumpversion` prints `14`.
+**Where.** `src/driver/cli.rs`.
+**Plan.** Implement the queries with GCC's exact output shapes (paths, empty
+`-print-sysroot`), and make `-print-libgcc-file-name` either honest (the libgcc lccc
+actually links) or refuse.
+**Gates.** `tests/regression/check_driver_query_parity.sh`: shape comparison against
+gcc-16 for all nine queries.
+**Accept:** every query answers with the right shape and a truthful value.
+**Effort** S · **ROI** 3.2.
+
+#### GP-23 · P0 · P — macro-parity gate
+
+**Why.** The macro environment drifted silently (211 wrong predefines, 155 missing,
+`__GNUC__` 14) because nothing measured it. This is the gate that makes GP-05 a
+ratchet.
+**Where.** `tests/regression/`, `scripts/ci_local.sh`, `.github/workflows/ci.yml`.
+**Plan.** For each `(target, dialect)` pair (x86-64/i686 × gnu90…gnu2y), diff
+`lccc -dM -E` against `gcc-16 -dM -E`, with three pinned lists: *forbidden*
+(defined by lccc only), *missing* (GCC-only, shrinking), *spelling* (value
+differences, with an allow-list for numeric-synonym spellings).
+**Gates.** It is the gate. Positive control: re-add `BUFSIZ` and watch it fail.
+**Accept:** forbidden list empty; missing list empty for the essential set; spelling
+allow-list justified row by row.
+**Effort** S · **ROI** 4.0.
+
+#### GP-24 · P1 · P — real-world adoption matrix
+
+**Why.** The strongest parity statement is "these projects build and pass their
+tests", and today that evidence lives in four CI workloads (gzip, zlib-ng, expat,
+sqlite) plus the corpus. It does not cover kernel-style idioms (inline asm
+constraints, `__attribute__` coverage, retpoline, `-mno-red-zone`,
+`-fno-strict-aliasing`) where most of this register's findings live.
+**Where.** `tests/workloads/`, `tests/regression/`, `.github/workflows/`.
+**Plan.** Add a kernel-style TU corpus (extracted shapes, licence-checked) to the
+existing workload harness, and make the harness compare **diagnostics** as well as
+outputs against GCC (today it compares execution results).
+**Gates.** The matrix runs in the hosted CI lanes it already owns.
+**Accept:** every workload builds with zero lccc-only diagnostics and identical
+runtime output; every lccc-only diagnostic is triaged into an item of this register.
+**Effort** M · **ROI** 3.7.
+
+### 12.3 Mapping to existing entries
+
+| GP item | Extends / overlaps | Note |
+|---|---|---|
+| GP-01, GP-03, GP-04 | — (new) | attribute surface, not covered by MB-01's option contract |
+| GP-02 | MB-01 (ABI flags) | attributes, not flags; adds the cross-compiler ABI gate |
+| GP-05, GP-23 | — (new) | macro environment has no owner today |
+| GP-06 | MB-11 (`_BitInt` row) | same item, now with a plan and gates |
+| GP-09, GP-10, GP-11, GP-12 | MB-12 | MB-12 keeps the warning contract; GP-09 is its structural half |
+| GP-13, GP-14 | — (new) | coverage/PGO formats |
+| GP-15 | MB-07 | sanitizer run modes beyond trap mode |
+| GP-16 | MB-15 | LTO |
+| GP-17 | — (new) | inline-asm grammar |
+| GP-18 | §9a `SIMD-PERM-1`, `SIMD-MANUAL-1` | adds the generic builtin families and `__has_builtin` honesty |
+| GP-19 | §9a (`SIMD-PERM-1` i686 gaps) | adds the mitigation flags |
+| GP-20 | MB-10 | DWARF DIEs, v5 lines, split/gz |
+| GP-21, GP-22 | MB-01 | driver queries and the option-effect ledger |
+| GP-24 | MB-42 (probe set as gate) | adds diagnostics comparison to workloads |
+
+Nothing in §4–§11 loses priority status by appearing here; the register exists so
+that "GCC 16.2 compatible" is a measurable statement rather than an adjective.
