@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""LCCC linker regression suite with mold/wild as differential oracles.
+"""LCCC linker regression suite with GNU ld, LLD, mold, and wild as oracles.
 
 Strategy
 ========
@@ -7,12 +7,16 @@ The generated code is held constant: every fixture is compiled to .o with the
 SAME system compiler (gcc).  Only the *linker* varies:
 
     lccc builtin linker   (system under test)
-    mold                  (oracle 1, if installed)
-    wild                  (oracle 2, if installed)
-    GNU ld / bfd          (oracle 3, always present)
+    GNU ld / bfd          (baseline oracle)
+    LLD                   (when functional with the compiler driver)
+    mold                  (when functional with the compiler driver)
+    wild                  (when installed)
 
 Each produced executable is run; stdout + exit code must agree across all
-linkers that succeeded.  A test therefore fails when:
+linkers that produced a runnable image. A DT_RELR oracle output without the
+required GLIBC_ABI_DT_RELR version need is not runnable under glibc; that oracle
+is link-only for the affected case, and the omission is reported. A test fails
+when:
   * lccc's linker errors out while the oracles link fine  -> missing feature
   * lccc's binary crashes or produces different output    -> miscompiled link
   * lccc's linker accepts something all oracles reject    -> missing diagnostic
@@ -1320,6 +1324,9 @@ case("pack_relative_relocs_glibc_contract",
     tags=("dynamic", "relocations", "options"))
 
 case("pack_dyn_relocs_relr_alias",
+    # Some LLD releases accept the alias but omit GLIBC_ABI_DT_RELR from their
+    # output, which glibc rejects before main. The runner still links with LLD
+    # but skips runtime comparison for that non-loadable oracle image.
     {"a.c": "int global = 42; int *pointer = &global; "
             "int main(void) { return *pointer != 42; }"},
     ldflags=["-pie", "-Wl,--pack-dyn-relocs=relr"],
@@ -10306,6 +10313,28 @@ def run_bin(path, args, td, env=None):
     except subprocess.TimeoutExpired:
         return None, "<timeout>"
 
+def oracle_runtime_skip_reason(c, oracle_name, path, td):
+    """Avoid executing LLD's currently non-loadable DT_RELR output.
+
+    Some LLD releases accept --pack-dyn-relocs=relr and emit DT_RELR, but do
+    not add the GLIBC_ABI_DT_RELR version need required by glibc. The loader
+    rejects that image before main (exit 127), which is an oracle defect rather
+    than a difference in the program being linked. Keep the LLD link check, but
+    compare runtime behavior only once its image carries the required ABI need.
+    """
+    if oracle_name != "lld" or "GLIBC_ABI_DT_RELR" not in (c.expect_version_needs or []):
+        return None
+    tags, _ = dyn_tag_map(path)
+    if _DT_RELR not in tags:
+        return None
+    version = sh(["readelf", "-VW", path], cwd=td)
+    if version.returncode != 0:
+        return None
+    if "GLIBC_ABI_DT_RELR" not in version.stdout.decode(errors="replace"):
+        return ("lld runtime comparison omitted: its output has DT_RELR without "
+                "the GLIBC_ABI_DT_RELR version need; glibc rejects that image")
+    return None
+
 # field kind -> (assembly directive, symbol, in-range value, out-of-range value)
 # (relocation, directive, symbol, a value that fits, one that does not).
 # `.long sym` is always R_X86_64_32 to GAS, so R_X86_64_32S needs an explicit
@@ -12490,16 +12519,23 @@ def run_case(c, args, oracles):
             return Result(c.name, "PASS")
 
         mismatches = []
+        runtime_skips = []
+        runtime_oracle_count = 0
         for oname, oout in oracle_outs:
+            skip_reason = oracle_runtime_skip_reason(c, oname, oout, td)
+            if skip_reason:
+                runtime_skips.append(skip_reason)
+                continue
+            runtime_oracle_count += 1
             ocode, oo = run_bin(oout, c.run_args, td, c.run_env)
             if (code, out) != (ocode, oo):
                 mismatches.append(f"{oname}: {(ocode, oo)!r}")
         if mismatches:
             return Result(c.name, "FAIL",
                 f"lccc {(code, out)!r} != " + "; ".join(mismatches))
-        if not oracle_outs and code != 0:
+        if runtime_oracle_count == 0 and code != 0:
             return Result(c.name, "FAIL", f"binary exited {code}: {out!r}")
-        return Result(c.name, "PASS")
+        return Result(c.name, "PASS", "; ".join(runtime_skips))
     except Exception as e:
         return Result(c.name, "FAIL", f"harness exception: {e!r}")
     finally:
