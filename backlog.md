@@ -1501,7 +1501,7 @@ unimplemented attribute is invisible.
 3. Route every not-yet-implemented semantic attribute through a single
    `unimplemented-attribute` site so the audit list is generated, not maintained by
    hand.
-**Gates.** `tests/regression/check_attribute_diagnostics.sh`: gcc-16 verbatim
+**Gates.** the new regression gate `check_attribute_diagnostics` (added under `tests/regression/`): gcc-16 verbatim
 expectations for unknown / misapplied / accepted forms, plus the generated
 "known but unimplemented" inventory pinned by name (same ratchet pattern as the
 `verify_after_pass` inventory in `check_verify_ir_clean.sh`).
@@ -1518,7 +1518,7 @@ reverse direction segfaults. `sysv_abi`, `stdcall`, `thiscall`, `cdecl`,
 `preserve_none`, `no_caller_saved_registers`, `no_callee_saved_registers`,
 `ms_struct`, `gcc_struct` are in the same silent state.
 **Where.** `src/frontend/parser/parse.rs`, `src/backend/call_abi.rs`,
-`src/backend/x86/`, `src/backend/i686/`, `src/frontend/sema/ast.rs`
+`src/backend/x86/`, `src/backend/i686/`, `src/frontend/parser/ast.rs`
 (`FunctionAttributes`).
 **Plan.**
 1. Add the calling-convention field to the function type/attribute set and thread it
@@ -1544,7 +1544,7 @@ with a named error and covered by GP-01's inventory.
 these objects in `.data.retain` / `.persistent`; lccc puts them in plain `.data`.
 `retain` is a *security* contract (the object must survive section garbage
 collection), so silence is a correctness bug for binaries built with `--gc-sections`.
-**Where.** `src/frontend/sema/ast.rs` (`DeclAttributes`), `src/backend/generation.rs`,
+**Where.** `src/frontend/parser/ast.rs` (`DeclAttributes`), `src/backend/generation.rs`,
 `src/backend/elf_writer_common.rs`, `src/backend/linker_common/`.
 **Plan.** Model the flag per object; emit `SHF_GNU_RETAIN` and the `.noinit`/
 `.persistent` section names exactly as GCC does; diagnose misuse (GCC already warns
@@ -1642,7 +1642,7 @@ punctuators `%:` `<:` `:>` `<%` `%>` (C95) are rejected, and UCNs in identifiers
 parsing, so `%:include` and `a<:2:>` work), and accept `\uXXXX`/`\UXXXXXXXX` in
 identifiers by mapping to the identifier's identifier-charset form. Both are
 `-std=` independent, as in GCC.
-**Gates.** `tests/regression/check_digraph_ucn.sh` with gcc-16 verdicts for every
+**Gates.** the new regression gate `check_digraph_ucn` (added under `tests/regression/`) with gcc-16 verdicts for every
 digraph position (`#`, `{`, `}`, `[`, `]`) and UCN identifiers, plus `-pedantic`
 behaviour once GP-10 exists.
 **Accept:** the probe set compiles and executes identically to GCC.
@@ -1891,7 +1891,7 @@ inventory covers the gates' fixtures exactly.
 **Plan.** Implement the queries with GCC's exact output shapes (paths, empty
 `-print-sysroot`), and make `-print-libgcc-file-name` either honest (the libgcc lccc
 actually links) or refuse.
-**Gates.** `tests/regression/check_driver_query_parity.sh`: shape comparison against
+**Gates.** the new regression gate `check_driver_query_parity` (added under `tests/regression/`): shape comparison against
 gcc-16 for all nine queries.
 **Accept:** every query answers with the right shape and a truthful value.
 **Effort** S · **ROI** 3.2.
