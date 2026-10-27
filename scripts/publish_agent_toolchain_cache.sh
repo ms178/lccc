@@ -6,7 +6,7 @@
 # job); all bytes are verified before they enter the tag.
 set -Eeuo pipefail
 
-TAG=${TAG:-harness-cache-6}
+TAG=${TAG:-harness-cache-7}
 REMOTE=${REMOTE:-origin}
 WORK=${WORK:-${RUNNER_TEMP:-/tmp}/agent-toolchain-cache}
 REPO=${GITHUB_REPOSITORY:-ms178/lccc}
@@ -109,8 +109,8 @@ cd /work/build/obj
 "$src/configure" --prefix=/usr --disable-nls --disable-werror --disable-gdb \
     --disable-sim --disable-gprofng --disable-gprof --disable-plugins \
     --without-zstd --enable-host-shared=no CFLAGS='-O2' >/dev/null
-make -j2 MAKEINFO=true all-gas all-ld >/dev/null
-make MAKEINFO=true install-gas install-ld DESTDIR=/work/build/stage >/dev/null
+make -j2 MAKEINFO=true all-gas all-ld all-binutils >/dev/null
+make MAKEINFO=true install-gas install-ld install-binutils DESTDIR=/work/build/stage >/dev/null
 EOS
 chmod +x "$WORK/build-binutils.sh"
 docker run --rm -v "$WORK:/work" -w /work debian:bookworm bash /work/build-binutils.sh
@@ -206,6 +206,8 @@ ALL_LIBS=$(find "$EXTRACT/tools" -type d \( -name lib -o -name lib64 -o -path '*
 export LD_LIBRARY_PATH="$ALL_LIBS${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 "$BI/bin/as" --version | head -1
 "$BI/bin/ld" --version | head -1
+"$BI/bin/objdump" --version | head -1
+"$BI/bin/readelf" --version | head -1
 cat > "$TEST/probe.c" <<'C'
 int main(void) { return 42; }
 C

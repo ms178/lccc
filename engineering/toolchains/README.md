@@ -72,10 +72,10 @@ that permits the official GitHub asset redirect can restore this same lock.
 
 Arena-style agents often cannot reach the release-asset CDN, Debian mirrors,
 kernel.org or Arm's CDN.  `scripts/publish_agent_toolchain_cache.sh` therefore
-publishes an immutable orphan tag (default `harness-cache-6`) whose tree holds
+publishes an immutable orphan tag (default `harness-cache-7`) whose tree holds
 every current toolchain as `<name>.partNN` blobs.  The consumer,
 
-    python3 scripts/restore_agent_toolchain_cache.py --tag harness-cache-6 --prefix /path
+    python3 scripts/restore_agent_toolchain_cache.py --tag harness-cache-7 --prefix /path
 
 fetches that one ref from `origin`, reassembles the parts, verifies
 `MANIFEST.sha256` and the reviewed lock in `engineering/toolchains/`, extracts

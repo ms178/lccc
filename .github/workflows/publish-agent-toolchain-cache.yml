@@ -6,7 +6,7 @@ on:
       tag:
         description: Immutable orphan tag to create (must not already exist)
         required: true
-        default: harness-cache-6
+        default: harness-cache-7
 
 permissions:
   contents: write

@@ -1,6 +1,6 @@
 {
-  "cache_json_sha256": "e19a693232ec3c02dbb7900a003c577273eb1a3ffbd160bf4f36a8920744d2eb",
-  "commit_sha": "579003a922138f3c79fe690de55c6e0d5fdee129",
+  "cache_json_sha256": "e1fa6849f304aed100db7a7daa85be2c49e6927508ecc30ada9b723ec0a8e8a8",
+  "commit_sha": "80cf802ded92de33f31ccc68ab7e6f250b917b6e",
   "part_size": 94371840,
   "priority": [
     "rust",
@@ -16,15 +16,16 @@
     "rust-msrv"
   ],
   "provenance": {
+    "binutils": "one-time build from pinned 2.47 source in Debian bookworm container",
     "clang_rust": "harness-cache-4 release assets",
-    "debian_sid_packages": "debian-debs.sha256",
+    "debian_sid_packages": "debian-debs.sha256 (QEMU user)",
     "kernel": "v7.3 torvalds tree",
     "mold": "rui314/mold v3.0.0 release"
   },
   "repository": "ms178/lccc",
   "schema": 1,
-  "tag": "harness-cache-5",
-  "tag_sha": "a88c52e60e2af8bbacb6a111616f5c7aa44b821f",
+  "tag": "harness-cache-6",
+  "tag_sha": "1f3c5ea54885a62b2a3e8a5621b9d8927bc74b3d",
   "tools": {
     "arm-a64-xml": {
       "file": "ISA_A64_xml_A_profile-2026-09_md.tar.gz",
@@ -35,12 +36,12 @@
       "version": "2026-09"
     },
     "binutils": {
-      "file": "binutils-2.47-debian-sid-x86_64.tar.xz",
+      "file": "binutils-2.47-x86_64-linux.tar.xz",
       "kind": "tar.xz",
-      "root": "binutils-2.47-debian-sid-x86_64",
-      "sha256": "07a4a3a382c700077f0e83177b2a54f6d3d373143cb8886a5456795b9dc42e9a",
-      "size": 2140820,
-      "version": "2.47.50.20261021-1"
+      "root": "binutils-2.47-x86_64-linux",
+      "sha256": "63d4eab30871fe62dd02955048298be5c51066247cf66b3280f5724bf478131c",
+      "size": 1069544,
+      "version": "2.47"
     },
     "binutils-source": {
       "file": "binutils-2.47-source.tar.xz",
@@ -115,5 +116,5 @@
       "version": "1.97.0"
     }
   },
-  "tree_sha": "a190926d6ede128b92d4c247cd1ed7c4a22bc7b7"
+  "tree_sha": "aefbddae6394fbfe205fe7a541bb25e0c63f5fb3"
 }
