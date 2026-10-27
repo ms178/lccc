@@ -6879,6 +6879,19 @@ impl SemanticAnalyzer {
                 Expr::PointerMemberAccess(base, field, _) => {
                     self.member_pointer_quals(base, field, true)
                 }
+                // A cast type name keeps its own per-level `const`
+                // (`*(int *const *)p = 0`); `CType` cannot carry it.
+                Expr::Cast(_, _, _, quals) if quals.pointer_const_levels != 0 => Some(
+                    (0..32)
+                        .map(|level| {
+                            if quals.pointer_const_levels & (1 << level) != 0 {
+                                crate::frontend::parser::ast::CVR_CONST
+                            } else {
+                                0
+                            }
+                        })
+                        .collect(),
+                ),
                 _ => None,
             };
             if let Some(levels) = levels {
@@ -8960,6 +8973,9 @@ mod kr_prototype_tests {
             "void f(void){const int *a[2]={0};*a[0]=1;}",
             "void f(void){int *const a[2]={0};a[0]=0;}",
             "void f(void){int (*const fp)(void)=0;fp=0;}",
+            "void f(void*p){*(int *const *)p=0;}",
+            "void f(void*p){*(int *const *const *)p=0;}",
+            "void f(void*p){**(int *const **)p=0;}",
         ] {
             assert!(analyze(bad).1.is_err(), "{bad}");
         }
@@ -8979,6 +8995,8 @@ mod kr_prototype_tests {
             "void f(void){int *a[2]={0};*a[0]=1;}",
             "void f(void){int *a[2]={0};a[0]=0;}",
             "void f(void){int (*fp)(void)=0;fp=0;}",
+            "void f(void*p){**(int *const *)p=0;}",
+            "void f(void*p){*(int **)p=0;}",
         ] {
             assert!(analyze(good).1.is_ok(), "{good}");
         }

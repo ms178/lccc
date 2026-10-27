@@ -1650,6 +1650,11 @@ pub struct CastQualifiers {
     /// The type is a single-level pointer whose pointee is `volatile`
     /// (`(volatile u32 *)addr`, the MMIO idiom): `*cast` is a volatile access.
     pub pointee_volatile: bool,
+    /// `const` bits of the type name's pointer levels: bit `L-1` is set when
+    /// pointer level `L` (level 1 closest to the base type) is `const`.
+    /// `CType` erases qualifiers, so `*(int *const *)p = 0` can only be
+    /// diagnosed if the cast itself keeps the middle level's `const`.
+    pub pointer_const_levels: u32,
 }
 
 /// Expressions.

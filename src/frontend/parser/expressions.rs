@@ -425,11 +425,28 @@ impl Parser {
             let save_ext_vector = self.attrs.parsing_ext_vector_nelem.take();
             self.advance();
             if self.is_type_specifier() {
-                let qualifiers = self.type_name_qualifiers();
+                let mut qualifiers = self.type_name_qualifiers();
                 let (cl_storage, any_sc, invalid_sc) = self.scan_compound_literal_storage();
-                if let Some(mut result_type) = self.parse_nested_type_name() {
+                if let Some((mut result_type, pointer_quals)) =
+                    self.parse_nested_type_name_with_quals()
+                {
                     // If __attribute__((vector_size(N))) was parsed, wrap the type
                     result_type = self.apply_pending_vector_attr(result_type);
+                    // A cast type name keeps each star's own qualifier, so
+                    // `*(int *const *)p = 0` is a modification of a read-only
+                    // object (`CType` alone cannot carry that).
+                    qualifiers.pointer_const_levels =
+                        pointer_quals
+                            .iter()
+                            .enumerate()
+                            .fold(0u32, |mask, (level, cvr)| {
+                                if level < 32 && cvr & crate::frontend::parser::ast::CVR_CONST != 0
+                                {
+                                    mask | (1 << level)
+                                } else {
+                                    mask
+                                }
+                            });
                     if matches!(self.peek(), TokenKind::RParen) {
                         let span = self.peek_span();
                         // The cast expression's span covers the whole

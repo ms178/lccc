@@ -1833,6 +1833,20 @@ impl Parser {
     /// path including failure and caller-side backtracking (the restore
     /// happens before this function returns, so the caller rewinding
     /// `self.pos` cannot resurrect a clobbered slot).
+    /// `parse_nested_type_name`, also returning the per-pointer-level CVR bits
+    /// of the type name's abstract declarator (index `L-1` is pointer level
+    /// `L`). Callers that only need the type drop them.
+    pub(super) fn parse_nested_type_name_with_quals(&mut self) -> Option<(TypeSpecifier, Vec<u8>)> {
+        let enclosing_address_space = self.attrs.parsing_address_space;
+        self.attrs.parsing_address_space = AddressSpace::Default;
+        let result = self.parse_type_specifier().map(|base| {
+            let (ty, quals) = self.parse_abstract_declarator_suffix_quals(base);
+            (ty, quals)
+        });
+        self.attrs.parsing_address_space = enclosing_address_space;
+        result
+    }
+
     pub(super) fn parse_nested_type_name(&mut self) -> Option<TypeSpecifier> {
         let enclosing_address_space = self.attrs.parsing_address_space;
         self.attrs.parsing_address_space = AddressSpace::Default;
@@ -1860,6 +1874,25 @@ impl Parser {
     /// there. Entering with a qualifier set before this suffix's own base
     /// type (e.g. the cast `(__seg_fs unsigned long *)`) is legitimate —
     /// the leading `skip_cv_qualifiers`/`*` arms below capture it.
+    /// `parse_abstract_declarator_suffix`, also collecting each pointer star's
+    /// CVR bits in CType creation order (index `L-1` is pointer level `L`).
+    pub(super) fn parse_abstract_declarator_suffix_quals(
+        &mut self,
+        result_type: TypeSpecifier,
+    ) -> (TypeSpecifier, Vec<u8>) {
+        self.skip_cv_qualifiers();
+        let base_space = std::mem::take(&mut self.attrs.parsing_address_space);
+        let mut ptr_budget = 0u32;
+        let level = self.parse_abstract_declarator_level(&mut ptr_budget);
+        if level.is_empty() {
+            self.attrs.parsing_address_space = base_space;
+            return (result_type, Vec::new());
+        }
+        let mut quals = Vec::new();
+        let ty = level.apply_to(result_type, base_space, Some(&mut quals));
+        (ty, quals)
+    }
+
     pub(super) fn parse_abstract_declarator_suffix(
         &mut self,
         result_type: TypeSpecifier,

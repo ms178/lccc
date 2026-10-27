@@ -83,6 +83,13 @@ CASES = [
     ('const_array_of_const_pointers', 'void f(void){int *const a[2]={0};a[0]=0;}', True, None),
     ('const_function_pointer_object', 'void f(void){int (*const fp)(void)=0;fp=0;}', True, None),
     ('mutable_function_pointer_object', 'void f(void){int (*fp)(void)=0;fp=0;}', False, None),
+    # A cast type name keeps the qualifiers it spells; `CType` erases them, so
+    # the cast node carries the levels (`*(int *const *)p = 0`).
+    ('const_cast_middle_level', 'void f(void*p){*(int *const *)p=0;}', True, None),
+    ('mutable_cast_middle_pointee', 'void f(void*p){**(int *const *)p=0;}', False, None),
+    ('const_cast_three_levels', 'void f(void*p){*(int *const *const *)p=0;}', True, None),
+    ('const_cast_inner_level', 'void f(void*p){**(int *const **)p=0;}', True, None),
+    ('mutable_cast_plain', 'void f(void*p){*(int **)p=0;}', False, None),
 ]
 
 

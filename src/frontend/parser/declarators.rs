@@ -1658,7 +1658,11 @@ impl Parser {
                     .iter()
                     .any(|tok| matches!(tok.kind, TokenKind::Restrict)),
             ) << 2;
-            let star_cvr = u8::from(self.attrs.parsing_const())
+            // `skip_cv_qualifiers` records a star's `const` in
+            // `pointer_const` (see its doc), not in the base-specifier
+            // `const` flag: reading `parsing_const()` here silently dropped
+            // every type-name `*const`, so `*(int *const *)p = 0` passed.
+            let star_cvr = u8::from(self.attrs.parsing_pointer_const())
                 | (u8::from(self.attrs.parsing_volatile()) << 1)
                 | restrict_bit;
             let star_space = self.attrs.parsing_address_space;
