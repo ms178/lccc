@@ -242,30 +242,34 @@ fn parse_elf64_object_inner(
     };
 
     let mut section_data = Vec::with_capacity(e_shnum);
-    for sec in &sections {
+    for sec in sections.iter_mut() {
         if sec.sh_type == SHT_NOBITS || sec.size == 0 {
             section_data.push(SectionData::empty());
-        } else {
-            let start = sec.offset as usize;
-            let len = sec.size as usize;
-            // Validate against the object's own extent first, so a section
-            // that escapes this object but happens to land inside a larger
-            // shared buffer (an archive member reading its neighbour) is still
-            // rejected.
-            if slice_at(data, start, len).is_none() {
-                return Err(format!(
-                    "{}: section '{}' data out of bounds",
-                    source_name, sec.name
-                ));
-            }
-            let Some(sd) = SectionData::slice_backing(backing, origin + start, len) else {
-                return Err(format!(
-                    "{}: section '{}' data out of bounds",
-                    source_name, sec.name
-                ));
-            };
-            section_data.push(sd);
+            continue;
         }
+        let start = sec.offset as usize;
+        let len = sec.size as usize;
+        // Validate against the object's own extent first, so a section
+        // that escapes this object but happens to land inside a larger
+        // shared buffer (an archive member reading its neighbour) is still
+        // rejected.
+        if slice_at(data, start, len).is_none() {
+            return Err(format!(
+                "{}: section '{}' data out of bounds",
+                source_name, sec.name
+            ));
+        }
+        if sec.flags & SHF_COMPRESSED != 0 {
+            section_data.push(expand_compressed_section(data, start, len, sec)?);
+            continue;
+        }
+        let Some(sd) = SectionData::slice_backing(backing, origin + start, len) else {
+            return Err(format!(
+                "{}: section '{}' data out of bounds",
+                source_name, sec.name
+            ));
+        };
+        section_data.push(sd);
     }
 
     decompress_input_sections(source_name, &mut sections, &mut section_data)?;
@@ -405,4 +409,391 @@ fn parse_elf64_object_inner(
         relocations,
         source_name: source_name.to_string(),
     })
+}
+
+/// `sh_flags` bit for a section whose bytes are an `Elf64_Chdr` plus a
+/// compression stream (gABI).
+const SHF_COMPRESSED: u64 = 0x800;
+/// `ch_type` values we can decode: zlib (RFC 1950) and zstd.
+const ELFCOMPRESS_ZLIB: u32 = 1;
+const ELFCOMPRESS_ZSTD: u32 = 2;
+/// Upper bound on a declared uncompressed size. No legitimate debug section
+/// approaches 512 MiB; the cap stops a hostile `ch_size` from turning a
+/// 20-byte input into an unbounded allocation (the same malicious-input
+/// posture as the relocation offset checks).
+const MAX_DECOMPRESSED_SECTION: u64 = 1 << 29;
+
+/// Apply the `SHF_COMPRESSED` view adjustment for one section: decompress the
+/// body once, publish the logical size and alignment, and clear the flag so
+/// every downstream check sees one consistent view of the section.
+///
+/// `SHF_COMPRESSED` (measured): a GCC built with compressed debug defaults
+/// emits relocations against the UNCOMPRESSED content (`ch_size`) while the
+/// on-disk size holds the zlib/zstd stream. Comparing those offsets with the
+/// on-disk size rejected every such object with `relocation ... outside the
+/// section it patches`, where GNU ld links it fine.
+fn expand_compressed_section(
+    data: &[u8],
+    start: usize,
+    len: usize,
+    sec: &mut Elf64Section,
+) -> Result<SectionData, String> {
+    let raw = &data[start..start + len];
+    let logical = decompress_section(&sec.name, raw)?;
+    sec.size = logical.len() as u64;
+    sec.flags &= !SHF_COMPRESSED;
+    // The stored stream is 8-aligned (the chdr needs it); the LOGICAL
+    // content carries its own alignment (1 for GCC debug sections).
+    // Keeping the outer 8 here would make the writer pad every
+    // concatenated contribution to 8 and break DWARF's back-to-back
+    // CU chain, which GNU ld produces unpadded (measured).
+    // `decompress_section` validated the 24-byte header, so ch_addralign
+    // sits at 16..24; default to 1 if that ever stops holding.
+    let logical_align = raw
+        .get(16..24)
+        .and_then(|b| b.try_into().ok())
+        .map(u64::from_le_bytes)
+        .unwrap_or(1);
+    sec.addralign = logical_align.max(1);
+    Ok(SectionData::owned(logical))
+}
+
+/// Decode an `SHF_COMPRESSED` section body (`Elf64_Chdr` + stream) into its
+/// logical bytes.
+fn decompress_section(name: &str, raw: &[u8]) -> Result<Vec<u8>, String> {
+    let Some(hdr) = raw.get(..24) else {
+        return Err(format!(
+            "section '{name}' has a truncated SHF_COMPRESSED header"
+        ));
+    };
+    let Ok(ch_type) = <[u8; 4]>::try_from(&hdr[0..4]) else {
+        return Err(format!(
+            "section '{name}' has a malformed compression header"
+        ));
+    };
+    let ch_type = u32::from_le_bytes(ch_type);
+    let Ok(ch_size) = <[u8; 8]>::try_from(&hdr[8..16]) else {
+        return Err(format!(
+            "section '{name}' has a malformed compression header"
+        ));
+    };
+    let ch_size = u64::from_le_bytes(ch_size);
+    if ch_size > MAX_DECOMPRESSED_SECTION {
+        return Err(format!(
+            "section '{name}' declares a decompressed size of {ch_size} bytes (limit {MAX_DECOMPRESSED_SECTION})"
+        ));
+    }
+    let capacity = ch_size as usize;
+    let payload = &raw[24..];
+    match ch_type {
+        ELFCOMPRESS_ZLIB => zlib_inflate(name, payload, capacity),
+        ELFCOMPRESS_ZSTD => zstd_decompress(name, payload, capacity),
+        other => Err(format!(
+            "section '{name}' uses unknown compression type {other}"
+        )),
+    }
+}
+
+/// Dynamic-loader bindings for the system compression libraries. They are
+/// part of every distribution's base system (GNU ld itself links libz), and
+/// resolving them at runtime keeps the linker crate dependency-free.
+mod sysz {
+    use std::os::raw::{c_char, c_int, c_uint, c_void};
+
+    pub const RTLD_NOW: c_int = 2;
+
+    unsafe extern "C" {
+        pub fn dlopen(filename: *const c_char, flag: c_int) -> *mut c_void;
+        pub fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+    }
+
+    /// `z_stream` with the exact C layout on LP64 (112 bytes; zlib validates
+    /// that size in `inflateInit_`).
+    #[repr(C)]
+    #[derive(Default)]
+    pub struct ZStream {
+        pub next_in: *mut u8,
+        pub avail_in: c_uint,
+        pub total_in: std::os::raw::c_ulong,
+        pub next_out: *mut u8,
+        pub avail_out: c_uint,
+        pub total_out: std::os::raw::c_ulong,
+        pub msg: *mut c_char,
+        pub state: *mut c_void,
+        pub zalloc: *mut c_void,
+        pub zfree: *mut c_void,
+        pub opaque: *mut c_void,
+        pub data_type: c_int,
+        pub adler: std::os::raw::c_ulong,
+        pub reserved: std::os::raw::c_ulong,
+    }
+
+    pub type ZStreamPtr = *mut ZStream;
+
+    /// `dlopen` a library once and resolve the named symbols, cached for the
+    /// process lifetime.
+    pub fn open(lib: &str, symbols: &[&str]) -> Result<Vec<usize>, String> {
+        let lib_c = std::ffi::CString::new(lib)
+            .map_err(|_| format!("library name '{lib}' contains an interior NUL"))?;
+        let sym_c = symbols
+            .iter()
+            .map(|s| {
+                std::ffi::CString::new(*s)
+                    .map_err(|_| format!("symbol name '{s}' contains an interior NUL"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        // SAFETY: dlopen/dlsym are the documented libc entry points; both
+        // results are NULL-checked below before any use, and the CStrings
+        // keep their buffers alive across the calls.
+        unsafe {
+            let handle = dlopen(lib_c.as_ptr(), RTLD_NOW);
+            if handle.is_null() {
+                return Err(format!("{lib} is unavailable (dlopen failed)"));
+            }
+            let mut out = Vec::with_capacity(symbols.len());
+            for (i, sym) in sym_c.iter().enumerate() {
+                let ptr = dlsym(handle, sym.as_ptr());
+                if ptr.is_null() {
+                    return Err(format!("{lib} does not export {}", symbols[i]));
+                }
+                out.push(ptr as usize);
+            }
+            Ok(out)
+        }
+    }
+}
+
+/// Inflate `payload` (RFC 1950 zlib) into exactly `capacity` bytes.
+fn zlib_inflate(name: &str, payload: &[u8], capacity: usize) -> Result<Vec<u8>, String> {
+    use std::os::raw::c_char;
+    use sysz::{ZStream, ZStreamPtr};
+
+    type VersionFn = unsafe extern "C" fn() -> *const c_char;
+    type InitFn = unsafe extern "C" fn(ZStreamPtr, *const c_char, i32) -> i32;
+    type InflateFn = unsafe extern "C" fn(ZStreamPtr, i32) -> i32;
+    type EndFn = unsafe extern "C" fn(ZStreamPtr) -> i32;
+    // resolved once per process
+    static ZFUNCS: std::sync::OnceLock<Result<Vec<usize>, String>> = std::sync::OnceLock::new();
+    let fns = ZFUNCS
+        .get_or_init(|| {
+            sysz::open(
+                "libz.so.1",
+                &["zlibVersion", "inflateInit_", "inflate", "inflateEnd"],
+            )
+        })
+        .clone()
+        .map_err(|e| format!("section '{name}': {e}"))?;
+    let mut out = vec![0u8; capacity];
+    let mut stream = ZStream {
+        next_in: payload.as_ptr() as *mut u8,
+        avail_in: payload.len() as u32,
+        next_out: out.as_mut_ptr(),
+        avail_out: capacity as u32,
+        ..ZStream::default()
+    };
+    // SAFETY: `fns` holds addresses resolved by `dlsym` against libz.so.1
+    // with every symbol NULL-checked at resolution; the transmutes map each
+    // address to exactly the C signature zlib documents; the stream layout
+    // is zlib's validated LP64 `z_stream`; and both buffers outlive the
+    // whole inflate loop.
+    unsafe {
+        let (version, init, inflate, end): (VersionFn, InitFn, InflateFn, EndFn) = (
+            std::mem::transmute::<usize, VersionFn>(fns[0]),
+            std::mem::transmute::<usize, InitFn>(fns[1]),
+            std::mem::transmute::<usize, InflateFn>(fns[2]),
+            std::mem::transmute::<usize, EndFn>(fns[3]),
+        );
+        let ver = version();
+        let ver = std::ffi::CStr::from_ptr(ver).to_string_lossy().into_owned();
+        let ver = std::ffi::CString::new(ver)
+            .map_err(|_| format!("section '{name}': zlibVersion() contains an interior NUL"))?;
+        let rc = init(&mut stream, ver.as_ptr(), size_of::<ZStream>() as i32);
+        if rc != 0 {
+            return Err(format!("section '{name}': inflateInit_ failed ({rc})"));
+        }
+        const Z_OK: i32 = 0;
+        const Z_STREAM_END: i32 = 1;
+        let mut result = Ok(());
+        let mut prev_in = u64::MAX;
+        for _ in 0..=(payload.len() + capacity + 16) {
+            let rc = inflate(&mut stream, 0);
+            if rc == Z_STREAM_END {
+                break;
+            }
+            if rc != Z_OK {
+                result = Err(format!(
+                    "section '{name}': zlib inflate failed ({rc}){}",
+                    stream
+                        .msg
+                        .as_ref()
+                        .map(|_| "")
+                        .map_or_else(String::new, |_| {
+                            if stream.msg.is_null() {
+                                String::new()
+                            } else {
+                                format!(
+                                    ": {}",
+                                    std::ffi::CStr::from_ptr(stream.msg).to_string_lossy()
+                                )
+                            }
+                        })
+                ));
+                break;
+            }
+            if stream.total_in == prev_in {
+                result = Err(format!("section '{name}': zlib stream made no progress"));
+                break;
+            }
+            prev_in = stream.total_in;
+            if stream.avail_out == 0 {
+                break; // capacity filled; verified below
+            }
+            if stream.avail_in == 0 {
+                result = Err(format!(
+                    "section '{name}': zlib stream truncated before its declared size"
+                ));
+                break;
+            }
+        }
+        end(&mut stream);
+        if let Err(e) = result {
+            return Err(e);
+        }
+    }
+    if stream.total_out as usize != capacity {
+        return Err(format!(
+            "section '{name}': zlib stream produced {} bytes, header declared {capacity}",
+            stream.total_out
+        ));
+    }
+    Ok(out)
+}
+
+/// One-shot zstd decompression into exactly `capacity` bytes.
+fn zstd_decompress(name: &str, payload: &[u8], capacity: usize) -> Result<Vec<u8>, String> {
+    type DecompressFn = unsafe extern "C" fn(
+        *mut std::os::raw::c_void,
+        usize,
+        *const std::os::raw::c_void,
+        usize,
+    ) -> usize;
+    type IsErrorFn = unsafe extern "C" fn(usize) -> std::os::raw::c_uint;
+    type ErrorNameFn = unsafe extern "C" fn(usize) -> *const std::os::raw::c_char;
+    static ZSTD_FUNCS: std::sync::OnceLock<Result<Vec<usize>, String>> = std::sync::OnceLock::new();
+    let fns = ZSTD_FUNCS
+        .get_or_init(|| {
+            sysz::open(
+                "libzstd.so.1",
+                &["ZSTD_decompress", "ZSTD_isError", "ZSTD_getErrorName"],
+            )
+        })
+        .clone()
+        .map_err(|e| format!("section '{name}': {e}"))?;
+    let mut out = vec![0u8; capacity];
+    // SAFETY: `fns` holds addresses resolved by `dlsym` against
+    // libzstd.so.1 with every symbol NULL-checked at resolution; each
+    // transmute maps an address to exactly the C signature libzstd
+    // documents; the output buffer is `capacity` bytes; and the input
+    // slice outlives the one-shot call.
+    let written = unsafe {
+        let (decompress, is_error, error_name): (DecompressFn, IsErrorFn, ErrorNameFn) = (
+            std::mem::transmute::<usize, DecompressFn>(fns[0]),
+            std::mem::transmute::<usize, IsErrorFn>(fns[1]),
+            std::mem::transmute::<usize, ErrorNameFn>(fns[2]),
+        );
+        let written = decompress(
+            out.as_mut_ptr().cast(),
+            capacity,
+            payload.as_ptr().cast(),
+            payload.len(),
+        );
+        if is_error(written) != 0 {
+            let msg = error_name(written);
+            let msg = if msg.is_null() {
+                String::from("unknown zstd error")
+            } else {
+                std::ffi::CStr::from_ptr(msg).to_string_lossy().into_owned()
+            };
+            return Err(format!("section '{name}': zstd decompress failed: {msg}"));
+        }
+        written
+    };
+    if written != capacity {
+        return Err(format!(
+            "section '{name}': zstd stream produced {written} bytes, header declared {capacity}"
+        ));
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod compressed_section_tests {
+    use super::*;
+
+    /// A zlib stream built from one stored (uncompressed) block: header
+    /// `78 01`, BFINAL+stored block header, LEN/NLEN, payload, Adler-32.
+    fn stored_zlib(payload: &[u8]) -> Vec<u8> {
+        assert!(payload.len() < 65536);
+        let mut out = vec![0x78, 0x01, 0x01];
+        out.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(!(payload.len() as u16)).to_le_bytes());
+        out.extend_from_slice(payload);
+        // Adler-32 over the payload.
+        let (mut a, mut b) = (1u32, 0u32);
+        for &byte in payload {
+            a = (a + byte as u32) % 65521;
+            b = (b + a) % 65521;
+        }
+        out.extend_from_slice(&((b << 16) | a).to_be_bytes());
+        out
+    }
+
+    fn chdr(ch_type: u32, ch_size: u64, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&ch_type.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&ch_size.to_le_bytes());
+        out.extend_from_slice(&1u64.to_le_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    #[test]
+    fn stored_block_roundtrip_and_relocated_size() {
+        let logical = b"Compilation Unit header bytes";
+        let body = chdr(
+            ELFCOMPRESS_ZLIB,
+            logical.len() as u64,
+            &stored_zlib(logical),
+        );
+        let out = decompress_section(".debug_info", &body).expect("zlib roundtrip");
+        assert_eq!(out, logical);
+    }
+
+    #[test]
+    fn declared_size_mismatch_is_rejected() {
+        let body = chdr(ELFCOMPRESS_ZLIB, 64, &stored_zlib(b"short"));
+        let err = decompress_section(".debug_info", &body).expect_err("size mismatch");
+        assert!(err.contains("declared 64"), "{err}");
+    }
+
+    #[test]
+    fn oversized_declaration_is_rejected_before_allocating() {
+        let body = chdr(ELFCOMPRESS_ZLIB, MAX_DECOMPRESSED_SECTION + 1, &[]);
+        let err = decompress_section(".debug_info", &body).expect_err("cap");
+        assert!(err.contains("limit"), "{err}");
+    }
+
+    #[test]
+    fn unknown_compression_type_is_rejected() {
+        let body = chdr(9, 4, b"abcd");
+        let err = decompress_section(".debug_info", &body).expect_err("type");
+        assert!(err.contains("unknown compression type 9"), "{err}");
+    }
+
+    #[test]
+    fn truncated_header_is_rejected() {
+        let err = decompress_section(".debug_info", &[0u8; 8]).expect_err("trunc");
+        assert!(err.contains("truncated SHF_COMPRESSED"), "{err}");
+    }
 }
