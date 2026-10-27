@@ -64,21 +64,39 @@ def main():
             for std in ('gnu90', 'gnu17', 'gnu23'):
                 options = [[], ['-w']]
                 if kind:
-                    options += [['-Wno-error=' + kind], ['-Wno-' + kind]]
+                    options += [['-Wno-error=' + kind], ['-Wno-' + kind],
+                                ['-fpermissive'], ['-fpermissive', '-Werror'],
+                                ['-fpermissive', '-w', '-Werror'],
+                                ['-fpermissive', '-Werror=' + kind],
+                                ['-Werror=' + kind, '-fpermissive'],
+                                ['-fpermissive', '-fno-permissive']]
+                if kind in ('implicit-int', 'return-mismatch'):
+                    options += [['-Wall'], ['-Wreturn-type'], ['-Wall', '-Werror']]
                 for flags in options:
                     enabled = bool(kind and '-Wno-' + kind not in flags)
-                    default_error = enabled and std != 'gnu90' and not any(
+                    permissive_flag = next((f for f in reversed(flags) if f in ('-fpermissive', '-fno-permissive')), '')
+                    permissive = permissive_flag == '-fpermissive'
+                    legacy = kind in ('implicit-int', 'return-mismatch') and std == 'gnu90' and (
+                        '-Wall' in flags or '-Wreturn-type' in flags)
+                    explicitly_enabled = kind and '-Werror=' + kind in flags
+                    warn_live = enabled and (std != 'gnu90' or kind == 'int-conversion'
+                                             or name == 'void_return_value' or legacy or (explicitly_enabled and kind != 'return-mismatch'))
+                    default_error = warn_live and (std != 'gnu90' or permissive_flag == '-fno-permissive') and not permissive and not any(
                         flag.startswith('-Wno-error=') for flag in flags)
-                    expected = int(hard or default_error)
+                    promoted = warn_live and ('-Werror' in flags or explicitly_enabled) and '-w' not in flags
+                    expected = int(hard or default_error or promoted)
                     result = run(cc, path, std, flags)
                     assert result.returncode == expected, (name, std, flags, expected, result.stderr)
                     if oracle:
                         ref = run(oracle, path, std, flags)
                         assert ref.returncode == expected, ('oracle drift', name, std, flags, ref.stderr)
+                    if name.startswith('const_depth'):
+                        spelling = '**p' if name == 'const_depth2' else '***p'
+                        assert f"read-only location '{spelling}'" in result.stderr, result.stderr
                     # Each kind-aware conversion is diagnosed once, not once in
                     # the funnel and again in the old per-context checks.
-                    labels = re.findall(r'\[-W(?:error=)?' + str(kind) + r'\]', result.stderr) if kind else []
-                    warn_live = enabled and (std != 'gnu90' or kind == 'int-conversion')
+                    label_kind = 'return-type' if legacy and kind == 'implicit-int' else kind
+                    labels = re.findall(r'\[-W(?:error=)?' + str(label_kind) + r'\]', result.stderr) if kind else []
                     wanted_labels = int(warn_live and ('-w' not in flags or default_error))
                     assert len(labels) == wanted_labels, (name, std, flags, labels, result.stderr)
                     count += 1

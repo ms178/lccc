@@ -26,6 +26,7 @@
 #   * a valid translation unit still compiles (a gate that only asserted
 #     rejections would pass with every construct deleted).
 set -euo pipefail
+redteam_runner=$(cd "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/check_diagnostic_redteam.py
 
 CCC=${CCC:-./target/fastbuild/lccc}
 if [[ ! -x $CCC ]]; then
@@ -347,3 +348,8 @@ else
 fi
 
 echo "PASS: gcc-16.2 diagnostic severity, message and column parity"
+
+CCC="$CCC" GCC="$GCC" python3 "$redteam_runner"
+
+"$CCC" -O2 "${redteam_runner%/*}/diagnostic_const_legal_execute.c" -o "$tmp/const-legal"
+"$tmp/const-legal"

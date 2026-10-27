@@ -2386,9 +2386,9 @@ impl SemanticAnalyzer {
                         // function is accepted silently in GNU mode (glibc
                         // uses `return __set_errno(...)`/`return helper();`
                         // shims throughout malloc.c, qsort.c, libio).
-                        // Returning a real VALUE from a void function is a
-                        // default-on warning in GCC, not an error; the value
-                        // is discarded.
+                        // A non-void value uses the dialect-dependent
+                        // return-mismatch class, just like a bare return
+                        // in a non-void function.
                         let checker = self.expr_type_checker();
                         let expr_is_void =
                             matches!(checker.infer_expr_ctype(expr), Some(CType::Void) | None);
@@ -2432,11 +2432,7 @@ impl SemanticAnalyzer {
                     .as_ref()
                     .is_some_and(|t| !matches!(t, CType::Void))
                 {
-                    self.diagnostics.borrow_mut().warning_with_kind(
-                        "'return' with no value, in function returning non-void",
-                        *span,
-                        crate::common::error::WarningKind::ReturnMismatch,
-                    );
+                    self.diagnostics.borrow_mut().missing_return_value(*span);
                 }
             }
             Stmt::If(cond, then_br, else_br, _) => {
@@ -6622,18 +6618,22 @@ impl SemanticAnalyzer {
         // (the parser records `*` for `Deref` and `[` for subscripting),
         // so cover the operands too: `*q` is `*`+inner, `a[i]` is base+index.
         let mut span = expr.span();
-        let inner_spans: Vec<&Expr> = match expr {
-            Expr::Deref(inner, _) => vec![inner.as_ref()],
-            Expr::ArraySubscript(base, index, _) => vec![base.as_ref(), index.as_ref()],
-            _ => Vec::new(),
-        };
-        for inner in inner_spans {
-            let is = inner.span();
-            if is.file_id == span.file_id {
-                span.start = span.start.min(is.start);
-                span.end = span.end.max(is.end);
+        fn cover(expr: &Expr, span: &mut Span) {
+            let child = expr.span();
+            if child.file_id == span.file_id {
+                span.start = span.start.min(child.start);
+                span.end = span.end.max(child.end);
+            }
+            match expr {
+                Expr::Deref(inner, _) => cover(inner, span),
+                Expr::ArraySubscript(base, index, _) => {
+                    cover(base, span);
+                    cover(index, span);
+                }
+                _ => {}
             }
         }
+        cover(expr, &mut span);
         let Some(sm) = self.diagnostics.borrow().share_source_manager() else {
             return "<expr>".to_string();
         };
@@ -6670,7 +6670,7 @@ impl SemanticAnalyzer {
     /// `_Generic` selection already uses.
     fn pointee_readonly(&self, ptr: &Expr) -> bool {
         // Walk the dereference chain down to its root so the verdict can be
-        // exact: an object at `*^k root` is const exactly when `k` equals the
+        // exact: an object at `*^k root` is const exactly when `k + 1` equals the
         // root's pointer depth (the const then sits on the root's base
         // specifier -- `const int *q`, `*q` read-only) or when the root is a
         // non-pointer array whose elements are const (`*a` of `const int
