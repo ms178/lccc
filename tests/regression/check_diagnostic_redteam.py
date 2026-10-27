@@ -12,6 +12,8 @@ import subprocess
 import tempfile
 
 # name, source, hard read-only error, warning class (None for legal controls).
+# Each combo asserts: our exit code, our warning label count, and the VERBATIM
+# first diagnostic (message + location spelling) against exact GCC 16.2.0.
 CASES = [
     ('typeof_record_field', 'struct S{typeof((struct{int x;}){1}) a;};void f(struct S*p){p->a.x=2;}', False, None),
     ('typeof_empty_record_field', 'struct S{typeof((struct{}){}) a;};', False, None),
@@ -97,7 +99,60 @@ CASES = [
     ('mutable_function_return_pointee', 'int *const *g(void);void f(void){**g()=0;}', False, None),
     ('const_compound_literal_level', 'void f(void){*((int *const *){0})=0;}', True, None),
     ('mutable_compound_literal_level', 'void f(void){*((int **){0})=0;}', False, None),
+    # Pointer-to-integer casts: GCC 16.2 warns by default in EVERY dialect
+    # (never as a dialect default error) and only when the integer target's
+    # size differs from the pointer's; _Bool and enumerations never warn
+    # (measured).
+    ('pointer_to_int_cast', 'void f(int *p){int x=(int)p;(void)x;}', False, 'pointer-to-int-cast'),
+    ('pointer_to_int_cast_unsigned', 'void f(int *p){unsigned x=(unsigned)p;(void)x;}', False, 'pointer-to-int-cast'),
+    ('pointer_to_int_cast_short', 'void f(int *p){short x=(short)p;(void)x;}', False, 'pointer-to-int-cast'),
+    ('pointer_to_int_cast_array', 'void f(void){int a[1]={0};int x=(int)a;(void)x;}', False, 'pointer-to-int-cast'),
+    ('pointer_to_int_cast_wide', 'void f(int *p){long x=(long)p;(void)x;}', False, None),
+    ('pointer_to_int_cast_bool', '_Bool f(int *p){return (_Bool)p;}', False, None),
+    ('pointer_to_int_cast_int_literal', 'void f(void){int x=(int)0;(void)x;}', False, None),
+    # C11 6.5.4p2: a pointer converts only to an integer type (measured:
+    # -w does not silence the constraint).
+    ('pointer_float_constraint', 'void f(int *p){double d=(double)p;(void)d;}', True, None),
+    ('pointer_complex_constraint', 'void f(int *p){float _Complex c=(float _Complex)p;(void)c;}', True, None),
+    ('float_pointer_constraint', 'void f(void){char* a;double b;a=(char*)b;}', True, None),
+    # Scalar typedef base constness: `CI x` is a read-only object and
+    # `CI a[1]` has read-only elements, chains included.
+    ('typedef_const_object', 'typedef const int CI;void f(void){CI x=0;x=1;}', True, None),
+    ('typedef_const_parameter', 'typedef const int CI;void f(CI p){p=0;}', True, None),
+    ('typedef_const_array', 'typedef const int CI;void f(void){CI a[1]={0};*a=1;}', True, None),
+    ('typedef_star_object', 'typedef int *const PC;void f(void){PC q=0;q=0;}', True, None),
+    ('typedef_pointee_writable', 'typedef const int *IP;void f(void){IP p=0;p=0;}', False, None),
+    # Array transparency in the read-only walk: dims, stars and the
+    # element type decide the level (measured against GCC 16.2).
+    ('multidim_array_deref', 'void f(void){const int a[1][1]={{0}};**a=1;}', True, None),
+    ('array_of_pointers_deref', 'void f(void){const int *ap[1]={0};**ap=1;}', True, None),
+    ('pointer_to_array_param', 'void f(const int a[1][1]){**a=1;}', True, None),
+    ('const_pointer_element_array', 'void f(void){int *const a[1]={0};*a=1;}', True, None),
+    ('const_pointee_element_array', 'void f(void){const int *ap[1]={0};*ap=0;}', False, None),
+    ('typedef_pointee_element_array', 'typedef const int CI;void f(void){CI * const a[1]={0};*a=0;}', True, None),
+    # GCC's verbatim location spellings: parameter wording, byte-scaled
+    # offsets, completed source fragments, cast type names.
+    ('const_parameter_wording', 'void f(int *const p){p=0;}', True, None),
+    ('const_subscript_offset', 'void f(const int p[2]){p[1]=1;}', True, None),
+    ('local_array_subscript', 'void f(void){const int a[1]={0};a[0]=1;}', True, None),
+    ('const_volatile_array_deref', 'void f(void){volatile const int a[1]={0};*a=1;}', True, None),
+    ('const_member_pointee_field', 'struct S{const int *p;};void f(struct S*s){*s->p=1;}', True, None),
+    ('const_cast_star_space', 'void f(int *p){*(const int*)p=1;}', True, None),
+    ('const_cast_typedef', 'typedef const int CI;void f(int *p){*(CI*)p=1;}', True, None),
+    ('const_cast_two_star', 'void f(int *p){*(int * const*)p=1;}', True, None),
+    ('deref_offset_const', 'void f(const int *p){*(p+1)=1;}', True, None),
+    ('reversed_subscript_wording', 'void f(const int *p){p[0]=1;}', True, None),
+    ('mutable_written_p0', 'void f(int *p){p[0]=1;}', False, None),
 ]
+
+
+def first_diag(err):
+    """The first `error:`/`warning:` payload, or None when silent."""
+    for line in err.splitlines():
+        m = re.search(r'(?:error|warning): (.*)', line)
+        if m:
+            return m.group(1)
+    return None
 
 
 def run(cc, source, std, flags):
@@ -140,6 +195,11 @@ def main():
                                 ['-fpermissive', '-fno-permissive']]
                 if kind in ('implicit-int', 'return-mismatch'):
                     options += [['-Wall'], ['-Wreturn-type'], ['-Wall', '-Werror']]
+                if kind == 'pointer-to-int-cast':
+                    # The measured matrix: -fno-permissive never promotes
+                    # this warning; -Werror / -Werror= do; -Wno- silences.
+                    options += [['-fno-permissive'], ['-Werror'],
+                                ['-Wno-pointer-to-int-cast']]
                 for flags in options:
                     enabled = bool(kind and '-Wno-' + kind not in flags)
                     permissive_flag = next((f for f in reversed(flags) if f in ('-fpermissive', '-fno-permissive')), '')
@@ -147,9 +207,10 @@ def main():
                     legacy = kind in ('implicit-int', 'return-mismatch') and std == 'gnu90' and (
                         '-Wall' in flags or '-Wreturn-type' in flags)
                     explicitly_enabled = kind and '-Werror=' + kind in flags
-                    warn_live = enabled and (std != 'gnu90' or kind == 'int-conversion'
+                    warn_live = enabled and (std != 'gnu90' or kind in ('int-conversion', 'pointer-to-int-cast')
                                              or name == 'void_return_value' or legacy or (explicitly_enabled and kind != 'return-mismatch'))
-                    default_error = warn_live and (std != 'gnu90' or permissive_flag == '-fno-permissive') and not permissive and not any(
+                    default_error = warn_live and kind != 'pointer-to-int-cast' and (
+                        std != 'gnu90' or permissive_flag == '-fno-permissive') and not permissive and not any(
                         flag.startswith('-Wno-error=') for flag in flags)
                     promoted = warn_live and ('-Werror' in flags or explicitly_enabled) and '-w' not in flags
                     expected = int(hard or default_error or promoted)
@@ -158,6 +219,11 @@ def main():
                     if oracle:
                         ref = run(oracle, path, std, flags)
                         assert ref.returncode == expected, ('oracle drift', name, std, flags, ref.stderr)
+                        # Verbatim first-diagnostic parity: message and
+                        # location spelling must match GCC's own text.
+                        assert first_diag(ref.stderr) == first_diag(result.stderr), (
+                            'text drift', name, std, flags,
+                            first_diag(ref.stderr), first_diag(result.stderr))
                     if name.startswith('const_depth'):
                         spelling = '**p' if name == 'const_depth2' else '***p'
                         assert f"read-only location '{spelling}'" in result.stderr, result.stderr
