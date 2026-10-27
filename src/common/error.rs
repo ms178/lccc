@@ -106,6 +106,17 @@ pub enum WarningKind {
     /// An attribute that does not apply to its declaration is ignored
     /// (enabled by default, as in GCC). GCC flag: -Wattributes
     Attributes,
+    /// A declaration omitted its type specifier, defaulting to `int`.
+    /// GCC flag: -Wimplicit-int
+    ImplicitInt,
+    /// `return;` in a function returning non-void (or a missing return
+    /// value at the end of a non-void function's `return expr;`).
+    /// GCC flag: -Wreturn-mismatch
+    ReturnMismatch,
+    /// An integer initializer/assignment/argument was used where a pointer
+    /// is expected without a null-pointer constant or an explicit cast.
+    /// GCC flag: -Wint-conversion
+    IntConversion,
     // Future categories (add as warnings are implemented):
     // UnusedVariable,         // -Wunused-variable
     // UnusedFunction,         // -Wunused-function
@@ -127,6 +138,9 @@ impl WarningKind {
             WarningKind::ReturnType => "return-type",
             WarningKind::IncompatiblePointerTypes => "incompatible-pointer-types",
             WarningKind::Attributes => "attributes",
+            WarningKind::ImplicitInt => "implicit-int",
+            WarningKind::ReturnMismatch => "return-mismatch",
+            WarningKind::IntConversion => "int-conversion",
         }
     }
 
@@ -141,8 +155,27 @@ impl WarningKind {
             "return-type" => Some(WarningKind::ReturnType),
             "incompatible-pointer-types" => Some(WarningKind::IncompatiblePointerTypes),
             "attributes" => Some(WarningKind::Attributes),
+            "implicit-int" => Some(WarningKind::ImplicitInt),
+            "return-mismatch" => Some(WarningKind::ReturnMismatch),
+            "int-conversion" => Some(WarningKind::IntConversion),
             _ => None,
         }
+    }
+
+    /// The kinds GCC 16.2 makes default *errors* in every dialect from C99
+    /// onward (measured: `-std=gnu17` and `-std=gnu23` reject with exit 1,
+    /// `-std=gnu90` only warns with exit 0). The driver seeds these into
+    /// [`WarningConfig::errors`] after CLI parsing unless the user demoted
+    /// them explicitly (`-Wno-error=<name>` wins; a disabled warning is
+    /// suppressed before severity is consulted).
+    pub fn gcc162_c99_default_error_kinds() -> &'static [WarningKind] {
+        &[
+            WarningKind::ImplicitFunctionDeclaration,
+            WarningKind::ImplicitInt,
+            WarningKind::ReturnMismatch,
+            WarningKind::IntConversion,
+            WarningKind::IncompatiblePointerTypes,
+        ]
     }
 
     /// All warning kinds that are enabled by -Wall.
@@ -171,6 +204,9 @@ impl WarningKind {
             WarningKind::ReturnType,
             WarningKind::IncompatiblePointerTypes,
             WarningKind::Attributes,
+            WarningKind::ImplicitInt,
+            WarningKind::ReturnMismatch,
+            WarningKind::IntConversion,
         ]
     }
 }
@@ -189,6 +225,22 @@ pub struct WarningConfig {
     /// under a global `-Werror` given before or after it (GCC 16.2, measured).
     /// The last of `-Werror=<name>` / `-Wno-error=<name>` decides.
     not_errors: crate::common::fx_hash::FxHashSet<WarningKind>,
+    /// Kinds that are errors by GCC 16.2's *dialect default severity*
+    /// (`-Wimplicit-int` and friends from C99 on) rather than by an
+    /// explicit `-Werror=<name>` request. Kept separate because GCC
+    /// prints the plain `[-W<name>]` suffix for default-severity errors
+    /// but `[-Werror=<name>]` for an explicit promotion (measured), and
+    /// so `-Wno-error=<name>` can undo exactly this class at any point.
+    default_errors: crate::common::fx_hash::FxHashSet<WarningKind>,
+    /// Kinds the user explicitly requested with a positive `-W<name>` or
+    /// `-Werror=<name>` flag. GCC 16.2 (measured): in gnu90 an explicit
+    /// `-Wimplicit-int` or `-Wimplicit-function-declaration` still warns
+    /// while the diagnostic is silent by default, so default suppression
+    /// must not swallow an explicit request.
+    explicit_enable: crate::common::fx_hash::FxHashSet<WarningKind>,
+    /// Whether `-Wall`/`-Wextra` was requested (GCC 16.2, measured:
+    /// `-Wall -std=gnu90` still warns implicit function declarations).
+    wall_requested: bool,
     /// Global -Werror flag: promote ALL warnings to errors.
     pub werror_all: bool,
     /// Global `-w` flag: inhibit ALL warning messages.  Measured against
@@ -209,6 +261,9 @@ impl WarningConfig {
             enabled,
             errors: crate::common::fx_hash::FxHashSet::default(),
             not_errors: crate::common::fx_hash::FxHashSet::default(),
+            default_errors: crate::common::fx_hash::FxHashSet::default(),
+            explicit_enable: crate::common::fx_hash::FxHashSet::default(),
+            wall_requested: false,
             werror_all: false,
             inhibit_all: false,
         }
@@ -224,6 +279,7 @@ impl WarningConfig {
     /// Enable a specific warning.
     pub fn enable(&mut self, kind: WarningKind) {
         self.enabled.insert(kind);
+        self.explicit_enable.insert(kind);
     }
 
     /// Disable a specific warning (-Wno-<name>).
@@ -233,6 +289,7 @@ impl WarningConfig {
 
     /// Enable all -Wall warnings.
     pub fn enable_wall(&mut self) {
+        self.wall_requested = true;
         for &kind in WarningKind::wall_set() {
             self.enabled.insert(kind);
         }
@@ -250,14 +307,57 @@ impl WarningConfig {
     pub fn set_werror(&mut self, kind: WarningKind) {
         self.errors.insert(kind);
         self.not_errors.remove(&kind);
-        // -Werror=<name> also implicitly enables the warning
+        // -Werror=<name> also implicitly enables the warning, and counts
+        // as an explicit request for pre-C99 default suppression.
         self.enabled.insert(kind);
+        self.explicit_enable.insert(kind);
     }
 
     /// Demote a specific warning from error (-Wno-error=<name>).
     pub fn clear_werror(&mut self, kind: WarningKind) {
         self.errors.remove(&kind);
+        self.default_errors.remove(&kind);
         self.not_errors.insert(kind);
+    }
+
+    /// Seed the GCC 16.2 default-error kinds for a C99-or-later dialect
+    /// (see `WarningKind::gcc162_c99_default_error_kinds`), called once
+    /// after CLI parsing so every later flag order is already settled.
+    /// An explicit `-Wno-error=<name>` (recorded in `not_errors`) wins;
+    /// a warning disabled with `-Wno-<name>` stays suppressed before
+    /// severity is ever consulted, so only the error set changes here.
+    pub fn apply_gcc162_c99_default_errors(&mut self) {
+        for &kind in WarningKind::gcc162_c99_default_error_kinds() {
+            if !self.not_errors.contains(&kind) {
+                self.default_errors.insert(kind);
+            }
+        }
+    }
+
+    /// GCC 16.2's measured gnu90 posture for the C99-era warnings:
+    /// `-std=gnu90` is silent for implicit int, implicit function
+    /// declarations, and return mismatch even under `-Werror`; an
+    /// explicit `-Wimplicit-int` / `-Wimplicit-function-declaration`
+    /// still warns, but `-Wreturn-mismatch` stays silent even when
+    /// named, and `-Wint-conversion` warns regardless. `-Wall -std=gnu90`
+    /// keeps implicit declarations warned (measured). Called from the
+    /// pipeline for pre-C99 dialects only.
+    pub fn suppress_gcc162_pre_c99_defaults(&mut self) {
+        // Unconditionally off pre-C99 (silent even with an explicit
+        // -Werror=return-mismatch; measured).
+        self.disable(WarningKind::ReturnMismatch);
+        if !self.explicit_enable.contains(&WarningKind::ImplicitInt) {
+            self.disable(WarningKind::ImplicitInt);
+        }
+        if !self
+            .explicit_enable
+            .contains(&WarningKind::ImplicitFunctionDeclaration)
+            && !self.wall_requested
+        {
+            self.disable(WarningKind::ImplicitFunctionDeclaration);
+        }
+        // IntConversion stays enabled: measured warning-by-default in
+        // gnu90 as well.
     }
 
     /// Check if a warning of the given kind should be emitted at all.
@@ -267,7 +367,9 @@ impl WarningConfig {
 
     /// Check if a warning of the given kind should be promoted to an error.
     pub fn is_error(&self, kind: WarningKind) -> bool {
-        self.errors.contains(&kind) || (self.werror_all && !self.not_errors.contains(&kind))
+        ((self.errors.contains(&kind) || self.default_errors.contains(&kind))
+            && !self.not_errors.contains(&kind))
+            || (self.werror_all && !self.not_errors.contains(&kind))
     }
 
     /// Process a single -W flag argument (the part after -W).
@@ -624,9 +726,23 @@ impl DiagnosticEngine {
                     // Check if this warning should be promoted to an error
                     if self.warning_config.is_error(kind) {
                         // Promote: render as error with [-Werror=<name>] suffix
+                        // GCC 16.2 prints the plain `[-W<name>]` suffix when
+                        // the error comes from the dialect's default severity
+                        // but `[-Werror=<name>]` for an explicit promotion
+                        // (measured against gcc-16.2.0).
+                        let suffix = if self.warning_config.default_errors.contains(&kind) {
+                            // Default-severity error (dialect promotion):
+                            // GCC prints the plain flag label (measured).
+                            format!("[-W{}]", kind.flag_name())
+                        } else {
+                            // Explicit -Werror=<name> or global -Werror
+                            // promoting a live warning: GCC prints the
+                            // -Werror= label (measured).
+                            format!("[-Werror={}]", kind.flag_name())
+                        };
                         let promoted = Diagnostic {
                             severity: Severity::Error,
-                            message: format!("{} [-Werror={}]", diag.message, kind.flag_name()),
+                            message: format!("{} {}", diag.message, suffix),
                             span: diag.span,
                             warning_kind: diag.warning_kind,
                             notes: diag.notes.clone(),

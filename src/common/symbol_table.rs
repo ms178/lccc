@@ -49,6 +49,13 @@ struct Scope {
     /// Objects whose type's base specifier is `const` (see
     /// `common::qualifiers`).
     const_base: FxHashSet<String>,
+    /// Objects whose own (top-level) type is `const`: the declaration's
+    /// `const` with no pointer star (`const int x`), or the `const` on the
+    /// star closest to the name (`int *const p`). This is exactly the
+    /// qualifier C11 6.5.16p1 consults for assignment and `++`/`--`
+    /// (unlike `const_base`, which for a pointer object records its
+    /// POINTEE's constness).
+    top_const: FxHashSet<String>,
     /// The value of a folded const object, converted to its type, so that
     /// `int a = cc;` can be evaluated for `const int cc = 5;`.
     folded_values: FxHashMap<String, FoldedValue>,
@@ -99,6 +106,7 @@ impl Scope {
             constexpr_objects: FxHashSet::default(),
             constexpr_members: FxHashMap::default(),
             const_base: FxHashSet::default(),
+            top_const: FxHashSet::default(),
             folded_values: FxHashMap::default(),
             enumerators: FxHashSet::default(),
         }
@@ -294,6 +302,24 @@ impl SymbolTable {
             .rev()
             .find(|scope| scope.symbols.contains_key(name))
             .is_some_and(|scope| scope.const_base.contains(name))
+    }
+
+    /// Record that the innermost scope's object `name` has a top-level
+    /// `const` (see the `top_const` field on `Scope`).
+    pub fn mark_top_const(&mut self, name: &str) {
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.top_const.insert(name.to_string());
+        }
+    }
+
+    /// Whether the innermost visible declaration of `name` is an object
+    /// whose own type is `const` (see `mark_top_const`).
+    pub fn is_top_const(&self, name: &str) -> bool {
+        self.scopes
+            .iter()
+            .rev()
+            .find(|scope| scope.symbols.contains_key(name))
+            .is_some_and(|scope| scope.top_const.contains(name))
     }
 
     /// Whether the innermost visible declaration of `name` is a const object

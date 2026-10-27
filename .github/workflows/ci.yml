@@ -882,6 +882,8 @@ jobs:
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_ivsr_vecaddr_struct_walk.sh
     - name: Shuffle builtin diagnostics
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_shuffle_diagnostics.sh
+    - name: GCC 16.2 diagnostic severity parity
+      run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_gcc162_diagnostic_severity.sh
     # The oracle toolchain is a per-pipeline cache now, so its contract is
     # load-bearing: a bundle that restores without verifying its digest, or a
     # provisioning path that silently installs into a prefix, would turn into

@@ -1197,7 +1197,7 @@
     "frontend-b": {
       "group": "frontend",
       "mode": "steps",
-      "predicted_gate_seconds": 356.08,
+      "predicted_gate_seconds": 357.75,
       "shards": 2,
       "steps": [
         {
@@ -1447,6 +1447,10 @@
         {
           "measured_s": 0.25,
           "name": "Surface vector-extension codegen failures in annotations"
+        },
+        {
+          "measured_s": 1.67,
+          "name": "GCC 16.2 diagnostic severity parity"
         }
       ]
     }

@@ -68,6 +68,8 @@ impl Lowerer {
                             vla_size_exprs: Vec::new(),
                             decayed_array: false,
                             fptr_inner_ptr_depth: 0,
+                            pointer_depth: 0,
+                            pointer_const: false,
                         })
                         .collect();
                     TypeSpecifier::FunctionPointer(Box::new(ret_ts), param_decls, ft.variadic)
@@ -136,6 +138,8 @@ impl Lowerer {
                         vla_size_exprs: Vec::new(),
                         decayed_array: false,
                         fptr_inner_ptr_depth: 0,
+                        pointer_depth: 0,
+                        pointer_const: false,
                     })
                     .collect();
                 TypeSpecifier::BareFunction(Box::new(ret_ts), param_decls, ft.variadic)

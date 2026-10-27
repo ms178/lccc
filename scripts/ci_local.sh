@@ -736,7 +736,8 @@ gate "gnu-vector-align-abi" fast \
 # The hosted leg runs after a swap-enabled fastbuild with GNU as 2.47 and the
 # exact GCC 16.2 / Clang 23.1.4 oracles in the unsharded differential lane.
 gate "i686-gnu-vector-abi" fast \
-    env CCC="$LCCC" bash tests/regression/check_i686_gnu_vector_abi.sh
+    env LCCC_TEST_ASSEMBLER="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" \
+    CCC="$LCCC" bash tests/regression/check_i686_gnu_vector_abi.sh
 
 # AUD-TMP-1: temp files must be symlink-proof. Drives the pre-placed-symlink
 # reproducer (and its pre-placed-directory variant) against the built compiler
@@ -767,6 +768,15 @@ gate "ivsr-reproducers" fast \
 # GCC does.
 gate "shuffle-diagnostics" fast \
     env CCC="$LCCC" bash tests/regression/check_shuffle_diagnostics.sh
+
+# GCC 16.2's measured diagnostic-severity contract: the C99-era
+# default-error class (implicit int / implicit declaration / return
+# mismatch / int conversion / incompatible pointer types), the verbatim
+# read-only mutation messages, the dialect and -W flag override
+# behaviour, and GCC's columns -- all oracle-checked against gcc-16 when
+# present (39-entry exit table).
+gate "gcc162-diagnostic-severity" fast \
+    env CCC="$LCCC" GCC="${GCC16:-gcc-16}" bash tests/regression/check_gcc162_diagnostic_severity.sh
 
 # Clang ext_vector_type component access against the Clang 23.1.4 oracle:
 # LCCC's diagnostics for ext_vector_select/errors.c equal Clang's (line,

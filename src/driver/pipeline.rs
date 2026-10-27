@@ -1193,7 +1193,7 @@ impl Driver {
 
             // Parse.
             let mut diagnostics = DiagnosticEngine::new();
-            diagnostics.set_warning_config(self.warning_config.clone());
+            diagnostics.set_warning_config(self.effective_warning_config());
             diagnostics.set_color_mode(self.color_mode);
             diagnostics.set_source_manager(source_manager);
             for (msg, span) in lexer_diags {
@@ -2124,7 +2124,7 @@ impl Driver {
 
         // Create diagnostic engine for structured error/warning reporting
         let mut diagnostics = DiagnosticEngine::new();
-        diagnostics.set_warning_config(self.warning_config.clone());
+        diagnostics.set_warning_config(self.effective_warning_config());
         diagnostics.set_color_mode(self.color_mode);
 
         // Emit preprocessor warnings through diagnostic engine with Cpp kind
@@ -4121,6 +4121,25 @@ impl Driver {
     /// follows it where the dialects differ.
     pub(crate) fn pre_c99_dialect(&self) -> bool {
         matches!(self.stdc_version, Some(None) | Some(Some("199409L")))
+    }
+
+    /// The warning config every diagnostic engine in this pipeline should
+    /// run with: the user's `-Werror`/`-Wno-*` requests, plus GCC 16.2's
+    /// measured dialect severity policy for the C99 default-error warnings
+    /// (`-Wimplicit-int`, `-Wimplicit-function-declaration`,
+    /// `-Wreturn-mismatch`, `-Wint-conversion`): from C99 on (and by
+    /// default) they are errors, while pre-C99 dialects keep them as
+    /// warnings. Explicit `-Wno-error=`/`-Wno-<flag>` escapes always win
+    /// (`WarningConfig::apply_gcc162_c99_default_errors` skips them), so
+    /// the promotion is dialect-driven, never unconditional.
+    pub(crate) fn effective_warning_config(&self) -> crate::common::error::WarningConfig {
+        let mut config = self.warning_config.clone();
+        if self.pre_c99_dialect() {
+            config.suppress_gcc162_pre_c99_defaults();
+        } else {
+            config.apply_gcc162_c99_default_errors();
+        }
+        config
     }
 
     /// Whether `-std=` selected C23 or later (c23/gnu23/c2x/gnu2x/c2y/gnu2y).
