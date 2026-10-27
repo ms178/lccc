@@ -294,7 +294,7 @@ jobs:
   agent-cache-publish:
     if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.ref == 'arena/1f67deb1-lccc' }}
     name: Publish GitHub-only agent toolchain cache (one-time bridge)
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
       contents: write

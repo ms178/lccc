@@ -80,7 +80,7 @@ every current toolchain as `<name>.partNN` blobs.  The consumer,
 fetches that one ref from `origin`, reassembles the parts, verifies
 `MANIFEST.sha256` and the reviewed lock in `engineering/toolchains/`, extracts
 the toolchains, and writes `env.sh`.  The tag carries GCC 16.2.0, Clang 23.1.4,
-Rust 1.99.1, the 1.97.0 MSRV floor, mold 3.0.0, bookworm-compatible binutils 2.47 binaries built once from pinned sources, QEMU user 11.1.2, kernel relocs v7.3, Arm A64 ISA XML 2026-09,
+Rust 1.99.1, the 1.97.0 MSRV floor, mold 3.0.0, bookworm-compatible binutils 2.47 binaries built once from pinned sources in a Debian bookworm container, QEMU user 11.1.2, kernel relocs v7.3, Arm A64 ISA XML 2026-09,
 the bookworm runtime debs, and the binutils 2.47 source tarball.  Publishing is
 opt-in via the `Publish GitHub-only agent toolchain cache` workflow; no ordinary
 PR check downloads these bytes.

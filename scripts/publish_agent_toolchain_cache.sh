@@ -28,7 +28,7 @@ log() { printf '[agent-cache] %s\n' "$*" >&2; }
 die() { printf '[agent-cache] FATAL: %s\n' "$*" >&2; exit 1; }
 need() { for t in "$@"; do command -v "$t" >/dev/null 2>&1 || die "missing tool: $t"; done; }
 
-need git curl tar xz sha256sum split dpkg-deb python3 gh gcc cc make
+need git curl tar xz sha256sum split dpkg-deb python3 gh gcc cc make docker
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$ROOT"
 
@@ -92,18 +92,29 @@ fetch "$SRC/mold-3.0.0-x86_64-linux.tar.gz" https://github.com/rui314/mold/relea
 verify "$SRC/mold-3.0.0-x86_64-linux.tar.gz" "$MOLD_SHA"
 cp "$SRC/mold-3.0.0-x86_64-linux.tar.gz" "$FILES/mold-3.0.0-x86_64-linux.tar.gz"
 
-log "building bookworm-compatible binutils 2.47 binaries from the pinned source tarball"
+log "building bookworm-compatible binutils 2.47 binaries in a Debian bookworm container"
 BINUTILS_ROOT=binutils-2.47-x86_64-linux
 rm -rf "$WORK/build"; mkdir -p "$WORK/build/obj" "$WORK/build/stage" "$STAGE/$BINUTILS_ROOT"/{bin,lib,libexec}
 tar -xf "$FILES/binutils-2.47-source.tar.xz" -C "$WORK/build"
-BUSRC=$(find "$WORK/build" -maxdepth 1 -type d -name 'binutils-*' | head -1)
-[ -n "$BUSRC" ] || die "binutils 2.47 source tree missing"
-( cd "$WORK/build/obj" && \
-    "$BUSRC/configure" --prefix=/usr --disable-nls --disable-werror --disable-gdb \
-      --disable-sim --disable-gprofng --disable-gprof --disable-plugins \
-      --without-zstd --enable-host-shared=no CFLAGS='-O2' >/dev/null \
-    && make -j2 MAKEINFO=true all-gas all-ld >/dev/null \
-    && make MAKEINFO=true install-gas install-ld DESTDIR="$WORK/build/stage" >/dev/null )
+cat > "$WORK/build-binutils.sh" <<'EOS'
+#!/bin/bash
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get install -y --no-install-recommends build-essential xz-utils tar findutils sed coreutils >/dev/null
+src=$(find /work/build -maxdepth 1 -type d -name 'binutils-*' | head -1)
+[ -n "$src" ] || { echo 'binutils source tree missing' >&2; exit 1; }
+mkdir -p /work/build/obj /work/build/stage
+cd /work/build/obj
+"$src/configure" --prefix=/usr --disable-nls --disable-werror --disable-gdb \
+    --disable-sim --disable-gprofng --disable-gprof --disable-plugins \
+    --without-zstd --enable-host-shared=no CFLAGS='-O2' >/dev/null
+make -j2 MAKEINFO=true all-gas all-ld >/dev/null
+make MAKEINFO=true install-gas install-ld DESTDIR=/work/build/stage >/dev/null
+EOS
+chmod +x "$WORK/build-binutils.sh"
+docker run --rm -v "$WORK:/work" -w /work debian:bookworm bash /work/build-binutils.sh
+chown -R "$(id -u):$(id -g)" "$WORK/build/stage"
 cp -a "$WORK/build/stage/usr/bin/." "$STAGE/$BINUTILS_ROOT/libexec/"
 LDSCRIPTS=$(find "$WORK/build/stage/usr" -type d -name ldscripts -print -quit)
 [ -n "$LDSCRIPTS" ] || die "binutils ldscripts directory missing"
@@ -127,7 +138,7 @@ WRAP
 done
 cat > "$STAGE/$BINUTILS_ROOT/PIN" <<'PIN'
 binutils 2.47 (2.47.20260726) built once from the pinned GNU source tarball
-on ubuntu-22.04 (glibc 2.35) for bookworm-compatible consumption
+inside a Debian bookworm container (glibc 2.36) for broad Linux compatibility
 PIN
 tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -I 'xz -T2 -6' \
     -cf "$FILES/binutils-2.47-x86_64-linux.tar.xz" -C "$STAGE" "$BINUTILS_ROOT"
@@ -241,7 +252,7 @@ for name,ver,fn in [
     add(name,ver,fn,top(fn),'tar.gz' if fn.endswith('.gz') else 'tar.xz')
 cache={'schema':1,'repository':'ms178/lccc','tag':tag,'part_size':90*1024*1024,
        'tools':tools,'priority':['rust','clang','gcc','binutils','mold','qemu','kernel-relocs','arm-a64-xml','debs-bookworm','binutils-source','rust-msrv'],
-       'provenance':{'debian_sid_packages':'debian-debs.sha256 (QEMU user)','binutils':'one-time build from pinned 2.47 source on ubuntu-22.04','kernel':'v7.3 torvalds tree','mold':'rui314/mold v3.0.0 release','clang_rust':'harness-cache-4 release assets'}}
+       'provenance':{'debian_sid_packages':'debian-debs.sha256 (QEMU user)','binutils':'one-time build from pinned 2.47 source in Debian bookworm container','kernel':'v7.3 torvalds tree','mold':'rui314/mold v3.0.0 release','clang_rust':'harness-cache-4 release assets'}}
 (files/'CACHE.json').write_text(json.dumps(cache,indent=2,sort_keys=True)+'\n')
 (files/'MANIFEST.sha256').write_text(''.join(f"{v['sha256']}  {v['file']}\n" for _,v in sorted(tools.items())) + f"{digest(files/'CACHE.json')}  CACHE.json\n")
 (files/'README.md').write_text(f'''# {tag}\n\nGitHub-only toolchain cache for network-constrained agents.\n\n```\ngit fetch origin tag {tag}\npython3 scripts/restore_agent_toolchain_cache.py --tag {tag} --prefix /path/to/toolchains\n. /path/to/toolchains/env.sh\n```\n\nEvery file is split into <90 MiB parts and verified against MANIFEST.sha256.\nCACHE.json records the tool versions, roots, sizes and digests.\n''')
