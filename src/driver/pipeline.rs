@@ -752,7 +752,9 @@ impl Driver {
             data_sections: false,
             gnu89_inline: false,
             gnu89_inline_explicit: None,
-            stdc_version: None,
+            // GCC 16.2 defaults to GNU C23 (measured: no -std =>
+            // __STDC_VERSION__ == 202311L). An explicit -std= replaces this.
+            stdc_version: Some(Some("202311L")),
             disable_tree_vectorize: false,
             ipa_pta: false,
             live_range_shrinkage: false,
@@ -4142,10 +4144,11 @@ impl Driver {
         config
     }
 
-    /// Whether `-std=` selected C23 or later (c23/gnu23/c2x/gnu2x/c2y/gnu2y).
-    /// The default dialect is gnu17 (`__STDC_VERSION__` 201710L), so this is
-    /// false unless requested. Lexer keywords, `#if true`, `auto` type
-    /// inference and the other C23-only meanings key off this one fact.
+    /// Whether the active dialect is C23 or later (c23/gnu23/c2x/gnu2x/
+    /// c2y/gnu2y, or no -std at all: GCC 16.2 defaults to GNU C23,
+    /// `__STDC_VERSION__` 202311L, measured). Lexer keywords, `#if true`,
+    /// `auto` type inference and the other C23-only meanings key off this
+    /// one fact.
     pub(crate) fn c23_dialect(&self) -> bool {
         matches!(self.stdc_version, Some(Some(v))
             if v.trim_end_matches('L').parse::<u32>().is_ok_and(|n| n >= 202311))

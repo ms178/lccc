@@ -428,7 +428,7 @@ static table of `(name, body)` pairs. Categories include:
 
 | Category | Examples |
 |----------|----------|
-| **Standard C** | `__STDC__`, `__STDC_VERSION__` (201710L / C17), `__STDC_HOSTED__` |
+| **Standard C** | `__STDC__`, `__STDC_VERSION__` (202311L / GNU C23 by default — GCC 16.2's measured default; an explicit `-std=` selects its own value, e.g. 201710L for gnu17), `__STDC_HOSTED__` |
 | **Platform** | `__linux__`, `__unix__`, `__LP64__`, `__ELF__` |
 | **Architecture** | `__x86_64__`, `__amd64__` (default); `__aarch64__`, `__ARM_NEON` (via `set_target`) |
 | **GCC compat** | `__GNUC__` (14), `__GNUC_MINOR__` (2), `__VERSION__`, `__GNUC_STDC_INLINE__` |

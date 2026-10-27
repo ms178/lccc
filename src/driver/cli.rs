@@ -5464,6 +5464,16 @@ mod cli_tests {
         }
     }
 
+    /// GCC 16.2 defaults to GNU C23 (measured: no -std flag means
+    /// `__STDC_VERSION__` 202311L and C23 meanings are active).
+    #[test]
+    fn default_dialect_is_gnu23() {
+        let d = Driver::new();
+        assert!(d.gnu_extensions, "the default is GNU, not strict ISO C");
+        assert_eq!(d.stdc_version, Some(Some("202311L")));
+        assert!(d.c23_dialect());
+    }
+
     /// `-ansi` is `-std=c90`, not an ignorable spelling: a dialect request
     /// changes what the source is allowed to mean.
     #[test]
