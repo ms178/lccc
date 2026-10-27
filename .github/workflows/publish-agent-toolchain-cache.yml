@@ -1,0 +1,40 @@
+name: Publish GitHub-only agent toolchain cache
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Immutable orphan tag to create (must not already exist)
+        required: true
+        default: harness-cache-7
+
+permissions:
+  contents: write
+
+concurrency:
+  group: agent-toolchain-cache-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Assemble verified toolchains and publish an immutable tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Publish GitHub-only toolchain tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          bash scripts/publish_agent_toolchain_cache.sh \
+            --tag '${{ inputs.tag }}' \
+            --work "$RUNNER_TEMP/agent-toolchain-cache"
+      - name: Upload reviewed cache lock inputs
+        uses: actions/upload-artifact@v6
+        with:
+          name: agent-toolchain-cache-lock
+          path: ${{ runner.temp }}/agent-toolchain-cache/artifact/
+          if-no-files-found: error

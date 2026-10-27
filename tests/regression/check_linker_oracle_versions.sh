@@ -5,6 +5,10 @@ source tools/linker/oracle_versions.sh
 oracle_version_matches 'GNU ld (GNU Binutils) 2.47' 2.47
 oracle_version_matches 'GNU ld (GNU Binutils) 2.47.20260726' 2.47
 oracle_version_matches 'mold 2.42.1 (compatible with GNU ld)' 2.42.1
+oracle_version_matches 'mold 3.0.0 (8de38c35a2df16a25f7ff87ac3ad07156a925beb; compatible with GNU ld)' 3.0.0
+if oracle_version_matches 'mold 3.0.0 (compatible with GNU ld)' 2.42.1; then
+    echo "FAIL: mold 3.0.0 accepted as the superseded 2.42.1 pin"; exit 1
+fi
 for wrong in 'GNU ld 2.44' 'GNU ld 2.470' 'GNU ld 2.47.1' 'GNU ld x2.47' \
              'GNU ld 2.47.20260725' 'GNU ld 2.47.202607260' \
              'GNU ld 2.47.20260726-dirty' ''; do

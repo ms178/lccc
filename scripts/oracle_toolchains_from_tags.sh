@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ============================================================================
-# oracle_toolchains_from_tags.sh — restore GCC/mold/binutils from the
-# repository's verified transport tags and install the pinned current Clang
-# and Rust from the reviewed content-addressed release-asset lock.
+# oracle_toolchains_from_tags.sh — restore GCC/binutils from the
+# repository's verified transport tags and install the pinned current Clang,
+# Rust and mold from their reviewed upstream/cache-lock pins.
 #
 # WHY THIS EXISTS
 # ---------------
@@ -15,22 +15,24 @@
 # long time building one. Neither is acceptable when the point of the gate is
 # to be run.
 #
-# `harness-cache-1` carries GCC/mold/binutils, verified against its manifest.
+# `harness-cache-1` carries GCC/binutils, verified against its manifest.
 # The historical harness-cache-4 source tree contains Clang 23.1.3, not 23.1.4.
 # Rust 1.99.1 and Clang 23.1.4 use engineering/toolchains/cache-lock.json,
 # whose reviewed hashes describe content-addressed release assets. No source
-# tag is relabelled. Online restoration needs GitHub's asset CDN; explicit
-# offline verification never invokes a transport or writes the prefix.
+# tag is relabelled. mold 3.0.0 (2026-10-05) superseded the tag's 2.42.1
+# binary; it is installed by scripts/ci_install_mold_oracle.sh from the
+# digest-pinned upstream release instead of the stale tag payload. Online
+# restoration needs GitHub's asset CDN; explicit offline verification never
+# invokes a transport or writes the prefix.
 #
 # WHAT IT DOES NOT DO
 # -------------------
 # * It never silently substitutes a different compiler. Tag payloads must
 #   match their recorded digest; Clang must match the official installer hash
 #   and the requested version.
-# * It does not build binutils from `binutils-2.47.tar.xz` unless asked
-#   (--with-binutils), because a from-source binutils build is ~10 minutes on
-#   the two-core research host and almost no gate needs it. The tarball is
-#   verified either way.
+# * It does not build binutils from source. `--with-binutils` restores the
+#   reviewed 2.47 binary set from the GitHub-only agent cache; the source
+#   tarball is still verified as part of the tag promise.
 # * It does not touch the crate build. Provisioning the oracles must never
 #   change what `cargo build --profile fastbuild` compiles.
 #
@@ -78,7 +80,7 @@ OFFLINE=0
 GCC_VERSION=16.2.0
 CLANG_VERSION=23.1.4
 RUST_VERSION=1.99.1
-MOLD_VERSION=2.42.1
+MOLD_VERSION=3.0.0
 BINUTILS_VERSION=2.47
 
 while [ $# -gt 0 ]; do
@@ -105,11 +107,9 @@ die() { printf '[oracles] FATAL: %s\n' "$*" >&2; exit 1; }
 # fails loudly here (with both digests printed) instead of silently.
 TAG_GCC=harness-cache-1
 GCC_MEMBER=gcc-16-bookworm-x86_64.tar.xz
-MOLD_MEMBER=mold-2.42.1-x86_64
 BINUTILS_MEMBER=binutils-2.47.tar.xz
 
 GCC_SHA=4fa6af4f6b29991e31631af18d83964a69caa9daf3f78546d4dc30f39880cd8a
-MOLD_SHA=86b918f8af9444aed086ea73b593b88e910d49829d2cae979cbb84509b64dc76
 BINUTILS_SHA=154ab23b60070e8f27013c22977f1129425d67d1e8acd6e13010e617811e4cff
 
 cd "$REPO"
@@ -224,18 +224,16 @@ restore_toolchain "$TAG_GCC" "$GCC_MEMBER" "$GCC_SHA" "$GCC_ROOT" "gcc-$GCC_VERS
 # Restore only the published exact-version payloads after hash verification.
 python3 "$REPO/scripts/restore_toolchain_cache.py" --prefix "$PREFIX"
 
-# mold is a single static binary: verify it in place rather than extracting.
+# mold 3.0.0 no longer comes from the tag (the tag binary is 2.42.1):
+# the dedicated installer verifies the upstream release digest, refuses
+# a foreign/stale prefix, and proves a link.  An old 2.42.1 binary in
+# the prefix is therefore never silently reused -- it fails the probe
+# below and points at a fresh prefix instead of vouching for itself.
 mkdir -p "$PREFIX/bin"
-if [ -x "$PREFIX/bin/mold" ] && "$PREFIX/bin/mold" --version 2>/dev/null | grep -q "$MOLD_VERSION"; then
-    log "mold $MOLD_VERSION already installed (reused)"
-else
-    manifest_crosscheck "$TAG_GCC" "$MOLD_MEMBER" "$MOLD_SHA"
-    log "materialising mold from tag $TAG_GCC:$MOLD_MEMBER"
-    materialise "$TAG_GCC" "$MOLD_MEMBER" "$DL/$MOLD_MEMBER" \
-        || die "tag $TAG_GCC carries no $MOLD_MEMBER"
-    verify_digest "$DL/$MOLD_MEMBER" "$MOLD_SHA" "mold"
-    install -m 0755 "$DL/$MOLD_MEMBER" "$PREFIX/bin/mold"
-fi
+mold_prefix=$PREFIX/mold-$MOLD_VERSION
+bash "$REPO/scripts/ci_install_mold_oracle.sh" --prefix "$mold_prefix" \
+    || die "mold $MOLD_VERSION provisioning failed"
+ln -sfn "$mold_prefix/bin/mold" "$PREFIX/bin/mold"
 # The `ld.mold` spelling is what `-fuse-ld=mold` resolves when it looks for a
 # link-time backend by that name; keeping both names pointing at one binary
 # means a gate can request either without a second copy on disk.
@@ -253,18 +251,9 @@ if [ "$WITH_BINUTILS" = 1 ]; then
     if [ -x "$PREFIX/binutils-$BINUTILS_VERSION/bin/as" ]; then
         log "binutils $BINUTILS_VERSION already installed (reused)"
     else
-        log "building binutils $BINUTILS_VERSION (this is the slow path)"
-        src=$(mktemp -d)
-        tar -xf "$DL/$BINUTILS_MEMBER" -C "$src"
-        (
-            cd "$src"/binutils-*
-            ./configure --prefix="$PREFIX/binutils-$BINUTILS_VERSION" \
-                        --disable-nls --disable-werror --disable-gdb \
-                        --disable-gprofng --disable-sim >/dev/null
-            make -j"$(nproc)" >/dev/null
-            make install >/dev/null
-        ) || die "binutils build failed"
-        rm -rf "$src"
+        log "installing binutils $BINUTILS_VERSION from the reviewed binary cache"
+        bash "$REPO/scripts/ensure_binutils_247_binary.sh" --prefix "$PREFIX/binutils-$BINUTILS_VERSION" \
+            || die "binutils $BINUTILS_VERSION binary install failed"
     fi
 fi
 

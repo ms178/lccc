@@ -161,9 +161,10 @@ class FailureAnnotationContracts(unittest.TestCase):
         # here is a second, unreviewed path to the same cache entry.  The
         # sharded lanes are listed as shards, not as the lanes they were cut
         # from: each shard runs on its own runner and pays its own restore.
+        # The frontend lane has three measured shards after the trapv split.
         self.assertEqual(sorted(lanes), sorted([
             "build", "debug", "corpus",
-            "frontend-a", "frontend-b", "codegen-a", "codegen-b",
+            "frontend-a", "frontend-b", "frontend-c", "codegen-a", "codegen-b",
             "backend", "backend-contracts-a", "backend-contracts-b", "unit"]))
 
 
