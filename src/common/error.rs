@@ -129,6 +129,12 @@ pub enum WarningKind {
     /// is expected without a null-pointer constant or an explicit cast.
     /// GCC flag: -Wint-conversion
     IntConversion,
+    /// A pointer was cast to an integer type whose object size differs from
+    /// the pointer's (C11 6.5.4p2 permits the cast, GCC 16.2 warns by
+    /// default in EVERY dialect and never as a dialect default error —
+    /// measured; `_Bool` and enumeration targets never warn).
+    /// GCC flag: -Wpointer-to-int-cast
+    PointerToIntCast,
 }
 
 impl WarningKind {
@@ -148,6 +154,7 @@ impl WarningKind {
             WarningKind::ImplicitInt => "implicit-int",
             WarningKind::ReturnMismatch => "return-mismatch",
             WarningKind::IntConversion => "int-conversion",
+            WarningKind::PointerToIntCast => "pointer-to-int-cast",
         }
     }
 
@@ -169,6 +176,7 @@ impl WarningKind {
             "implicit-int" => Some(WarningKind::ImplicitInt),
             "return-mismatch" => Some(WarningKind::ReturnMismatch),
             "int-conversion" => Some(WarningKind::IntConversion),
+            "pointer-to-int-cast" => Some(WarningKind::PointerToIntCast),
             _ => None,
         }
     }
@@ -222,6 +230,7 @@ impl WarningKind {
             WarningKind::ImplicitInt,
             WarningKind::ReturnMismatch,
             WarningKind::IntConversion,
+            WarningKind::PointerToIntCast,
         ]
     }
 }

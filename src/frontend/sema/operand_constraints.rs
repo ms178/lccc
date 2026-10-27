@@ -478,6 +478,20 @@ pub(super) fn cast(
         }
         _ => {}
     }
+    // C11 6.5.4p2: a pointer converts only to an integer type. GCC 16.2
+    // rejects pointer-to-floating/complex casts with this exact wording,
+    // and `-w` does not silence a constraint (measured).
+    if fk == Kind::Pointer {
+        if to.is_floating() {
+            return Some("pointer value used where a floating-point was expected".into());
+        }
+        if to.is_complex() {
+            return Some("pointer value used where a complex was expected".into());
+        }
+    }
+    if kind(to) == Kind::Pointer && (from.ty.is_floating() || from.ty.is_complex()) {
+        return Some("cannot convert to a pointer type".into());
+    }
     let valid = match (fk, kind(to)) {
         // Only `nullptr_t` itself or a null pointer constant converts to it.
         (_, Kind::NullPtr) => fk == Kind::NullPtr || from.null_constant,
@@ -633,6 +647,17 @@ mod tests {
             "(union U)x, no int member"
         );
         assert!(cast(op(&void), &int, || false).is_some(), "(int)v()");
+        // C11 6.5.4p2, both directions (measured on GCC 16.2.0).
+        assert_eq!(
+            cast(op(&p), &CType::Double, || false).as_deref(),
+            Some("pointer value used where a floating-point was expected"),
+            "(double)p"
+        );
+        assert_eq!(
+            cast(op(&CType::Double), &p, || false).as_deref(),
+            Some("cannot convert to a pointer type"),
+            "(char *)b"
+        );
         assert!(cast(op(&s), &void, || false).is_none(), "(void)s");
         assert!(binary(BinOp::Add, op(&s), op(&int)).is_some(), "s + 1");
         assert!(
