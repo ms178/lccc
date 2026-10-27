@@ -28,7 +28,7 @@ log() { printf '[agent-cache] %s\n' "$*" >&2; }
 die() { printf '[agent-cache] FATAL: %s\n' "$*" >&2; exit 1; }
 need() { for t in "$@"; do command -v "$t" >/dev/null 2>&1 || die "missing tool: $t"; done; }
 
-need git curl tar xz sha256sum split dpkg-deb python3 gh gcc
+need git curl tar xz sha256sum split dpkg-deb python3 gh gcc cc make
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$ROOT"
 
@@ -92,95 +92,45 @@ fetch "$SRC/mold-3.0.0-x86_64-linux.tar.gz" https://github.com/rui314/mold/relea
 verify "$SRC/mold-3.0.0-x86_64-linux.tar.gz" "$MOLD_SHA"
 cp "$SRC/mold-3.0.0-x86_64-linux.tar.gz" "$FILES/mold-3.0.0-x86_64-linux.tar.gz"
 
-log "downloading Debian sid binutils 2.47 binaries and runtime dependencies"
-fetch "$SRC/Packages.xz" https://deb.debian.org/debian/dists/sid/main/binary-amd64/Packages.xz
-xz -dc "$SRC/Packages.xz" > "$SRC/Packages"
-python3 - "$SRC/Packages" "$SRC/deb-list.tsv" <<'PY'
-import sys
-from pathlib import Path
-text=Path(sys.argv[1]).read_text(errors='ignore').split('\n\n')
-want={'binutils-x86-64-linux-gnu':'2.47.50.20261021-1','binutils-common':'2.47.50.20261021-1',
-      'libbinutils':'2.47.50.20261021-1','libctf-nobfd0':None,'libctf0':None,
-      'libjansson4':None,'libsframe3':None,'libzstd1':None,'zlib1g':None,
-      'libc6':None,'libgcc-s1':None}
-best={}
-for stanza in text:
-    d={}
-    for line in stanza.splitlines():
-        if ':' in line and not line.startswith(' '):
-            k,v=line.split(':',1); d[k]=v.strip()
-    p=d.get('Package')
-    if p not in want or 'Filename' not in d or 'SHA256' not in d: continue
-    v=d.get('Version','')
-    if want[p] and v != want[p]: continue
-    key=(p,v)
-    best[p]=(v,d['Filename'],d['SHA256'])
-missing=set(want)-set(best)
-if missing: raise SystemExit(f'missing Debian packages: {sorted(missing)}')
-with open(sys.argv[2],'w') as out:
-    for p,(v,f,s) in sorted(best.items()): out.write(f'{p}\t{v}\t{f}\t{s}\n')
-PY
-rm -rf "$EXTRACT/binutils"; mkdir -p "$EXTRACT/binutils"
-: > "$FILES/debian-debs.sha256"
-while IFS=$'\t' read -r pkg ver filename sha; do
-    deb="$SRC/$(basename "$filename")"
-    fetch "$deb" "https://deb.debian.org/debian/$filename"
-    verify "$deb" "$sha"
-    printf '%s  %s (%s %s)\n' "$sha" "$(basename "$filename")" "$pkg" "$ver" >> "$FILES/debian-debs.sha256"
-    dpkg-deb -x "$deb" "$EXTRACT/binutils"
-done < "$SRC/deb-list.tsv"
-
-BINUTILS_ROOT=binutils-2.47-debian-sid-x86_64
-rm -rf "$STAGE/$BINUTILS_ROOT"; mkdir -p "$STAGE/$BINUTILS_ROOT"/{bin,lib,lib/x86_64-linux-gnu,lib64,usr/bin,usr/lib,usr/lib/x86_64-linux-gnu,usr/lib64}
-cp -a "$EXTRACT/binutils/usr/bin/." "$STAGE/$BINUTILS_ROOT/usr/bin/"
-cp -a "$EXTRACT/binutils/usr/lib/x86_64-linux-gnu/." "$STAGE/$BINUTILS_ROOT/usr/lib/x86_64-linux-gnu/" 2>/dev/null || true
-cp -a "$EXTRACT/binutils/usr/lib/." "$STAGE/$BINUTILS_ROOT/usr/lib/" 2>/dev/null || true
-# Sid binaries need GLIBC 2.38; bundle the matching loader and libc so the
-# archive also works on older bookworm-era hosts.
-cp -a "$EXTRACT/binutils/lib/x86_64-linux-gnu/." "$STAGE/$BINUTILS_ROOT/lib/x86_64-linux-gnu/" 2>/dev/null || true
-cp -a "$EXTRACT/binutils/lib64/." "$STAGE/$BINUTILS_ROOT/lib64/" 2>/dev/null || true
-cp -a "$EXTRACT/binutils/usr/lib64/." "$STAGE/$BINUTILS_ROOT/usr/lib64/" 2>/dev/null || true
-LOADER=$(readlink -f "$STAGE/$BINUTILS_ROOT/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2" 2>/dev/null || true)
-[ -n "$LOADER" ] && [ -f "$LOADER" ] || die "bundled glibc loader missing"
-cp -L "$LOADER" "$STAGE/$BINUTILS_ROOT/lib/ld-linux-x86-64.so.2"
-chmod 755 "$STAGE/$BINUTILS_ROOT/lib/ld-linux-x86-64.so.2"
-make_wrapper() {
-    local name=$1 target=$2 extra=${3:-} dest="$STAGE/$BINUTILS_ROOT/bin/$1"
-    rm -f "$dest"
-    cat > "$dest" <<'WRAP'
-#!/bin/sh
-here=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
-export LIBRARY_PATH="$here/usr/lib/x86_64-linux-gnu${LIBRARY_PATH:+:$LIBRARY_PATH}"
-export COMPILER_PATH="$here/usr/bin${COMPILER_PATH:+:$COMPILER_PATH}"
-exec "$here/lib/ld-linux-x86-64.so.2" \
-    --library-path "$here/usr/lib/x86_64-linux-gnu:$here/usr/lib64:$here/lib64:$here/lib/x86_64-linux-gnu:$here/usr/lib" \
-    "$here/usr/bin/__TARGET__" __EXTRA__ "$@"
-WRAP
-    sed -i "s|__TARGET__|$target|; s|__EXTRA__|$extra|" "$dest"
-    chmod 755 "$dest"
-}
-# Debian's real binaries are x86_64-linux-gnu-*; the unprefixed names are
-# alternatives symlinks that would otherwise point outside the extracted tree.
-for f in "$STAGE/$BINUTILS_ROOT/usr/bin/"*; do
+log "building bookworm-compatible binutils 2.47 binaries from the pinned source tarball"
+BINUTILS_ROOT=binutils-2.47-x86_64-linux
+rm -rf "$WORK/build"; mkdir -p "$WORK/build/obj" "$WORK/build/stage" "$STAGE/$BINUTILS_ROOT"/{bin,lib,libexec}
+tar -xf "$FILES/binutils-2.47-source.tar.xz" -C "$WORK/build"
+BUSRC=$(find "$WORK/build" -maxdepth 1 -type d -name 'binutils-*' | head -1)
+[ -n "$BUSRC" ] || die "binutils 2.47 source tree missing"
+( cd "$WORK/build/obj" && \
+    "$BUSRC/configure" --prefix=/usr --disable-nls --disable-werror --disable-gdb \
+      --disable-sim --disable-gprofng --disable-gprof --disable-plugins \
+      --without-zstd --enable-host-shared=no CFLAGS='-O2' >/dev/null \
+    && make -j2 MAKEINFO=true all-gas all-ld >/dev/null \
+    && make MAKEINFO=true install-gas install-ld DESTDIR="$WORK/build/stage" >/dev/null )
+cp -a "$WORK/build/stage/usr/bin/." "$STAGE/$BINUTILS_ROOT/libexec/"
+LDSCRIPTS=$(find "$WORK/build/stage/usr" -type d -name ldscripts -print -quit)
+[ -n "$LDSCRIPTS" ] || die "binutils ldscripts directory missing"
+cp -a "$LDSCRIPTS" "$STAGE/$BINUTILS_ROOT/lib/"
+for f in "$STAGE/$BINUTILS_ROOT/libexec/"*; do
     [ -f "$f" ] || continue
     name=$(basename "$f")
-    make_wrapper "$name" "$name" ""
-done
-for generic in as ld ld.bfd ar nm objcopy objdump ranlib readelf strip strings \
-               addr2line c++filt elfedit gprof size; do
-    target="x86_64-linux-gnu-$generic"
-    [ -f "$STAGE/$BINUTILS_ROOT/usr/bin/$target" ] || die "missing $target"
     extra=""
-    case $generic in
-        ld|ld.bfd) extra='-L"$here/usr/lib/x86_64-linux-gnu"' ;;
+    case $name in
+        ld|ld.bfd) extra='-L"$here/lib"' ;;
     esac
-    make_wrapper "$generic" "$target" "$extra"
+    cat > "$STAGE/$BINUTILS_ROOT/bin/$name" <<'WRAP'
+#!/bin/sh
+here=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
+export LIBRARY_PATH="$here/lib${LIBRARY_PATH:+:$LIBRARY_PATH}"
+export COMPILER_PATH="$here/libexec${COMPILER_PATH:+:$COMPILER_PATH}"
+exec "$here/libexec/__NAME__" __EXTRA__ "$@"
+WRAP
+    sed -i "s|__NAME__|$name|; s|__EXTRA__|$extra|" "$STAGE/$BINUTILS_ROOT/bin/$name"
+    chmod 755 "$STAGE/$BINUTILS_ROOT/bin/$name"
 done
 cat > "$STAGE/$BINUTILS_ROOT/PIN" <<'PIN'
-binutils 2.47.50.20261021-1 Debian sid x86_64-linux-gnu prebuilt binaries
+binutils 2.47 (2.47.20260726) built once from the pinned GNU source tarball
+on ubuntu-22.04 (glibc 2.35) for bookworm-compatible consumption
 PIN
 tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -I 'xz -T2 -6' \
-    -cf "$FILES/binutils-2.47-debian-sid-x86_64.tar.xz" -C "$STAGE" "$BINUTILS_ROOT"
+    -cf "$FILES/binutils-2.47-x86_64-linux.tar.xz" -C "$STAGE" "$BINUTILS_ROOT"
 
 log "downloading QEMU user 11.1.2 from Debian sid"
 QEMU_SHA=$(sed -n 's/^DEB_SHA256=\([0-9a-f]\{64\}\)$/\1/p' scripts/ensure_qemu_user.sh)
@@ -188,6 +138,8 @@ QEMU_DEB=qemu-user_11.1.2+ds-3_amd64.deb
 fetch "$SRC/$QEMU_DEB" "https://deb.debian.org/debian/pool/main/q/qemu/$QEMU_DEB" || \
     fetch "$SRC/$QEMU_DEB" "https://snapshot.debian.org/file/6067b061f3dd361d94e6c48a1044f79860c56c51"
 verify "$SRC/$QEMU_DEB" "$QEMU_SHA"
+: > "$FILES/debian-debs.sha256"
+printf '%s  %s (Debian qemu-user 11.1.2+ds-3)\n' "$QEMU_SHA" "$QEMU_DEB" >> "$FILES/debian-debs.sha256"
 rm -rf "$EXTRACT/qemu"; mkdir -p "$EXTRACT/qemu"
 dpkg-deb -x "$SRC/$QEMU_DEB" "$EXTRACT/qemu"
 QEMU_ROOT=qemu-user-11.1.2-x86_64
@@ -283,13 +235,13 @@ for name,ver,fn in [
  ('clang','23.1.4','clang-23.1.4-linux-x64.tar.xz'),
  ('rust','1.99.1','rust-1.99.1-x86_64-unknown-linux-gnu.tar.xz'),
  ('mold','3.0.0','mold-3.0.0-x86_64-linux.tar.gz'),
- ('binutils','2.47.50.20261021-1','binutils-2.47-debian-sid-x86_64.tar.xz'),
+ ('binutils','2.47','binutils-2.47-x86_64-linux.tar.xz'),
  ('qemu','11.1.2','qemu-user-11.1.2-x86_64.tar.xz'),
  ('kernel-relocs','7.3','kernel-relocs-v7.3-x86_64.tar.xz')]:
     add(name,ver,fn,top(fn),'tar.gz' if fn.endswith('.gz') else 'tar.xz')
 cache={'schema':1,'repository':'ms178/lccc','tag':tag,'part_size':90*1024*1024,
        'tools':tools,'priority':['rust','clang','gcc','binutils','mold','qemu','kernel-relocs','arm-a64-xml','debs-bookworm','binutils-source','rust-msrv'],
-       'provenance':{'debian_sid_packages':'debian-debs.sha256','kernel':'v7.3 torvalds tree','mold':'rui314/mold v3.0.0 release','clang_rust':'harness-cache-4 release assets'}}
+       'provenance':{'debian_sid_packages':'debian-debs.sha256 (QEMU user)','binutils':'one-time build from pinned 2.47 source on ubuntu-22.04','kernel':'v7.3 torvalds tree','mold':'rui314/mold v3.0.0 release','clang_rust':'harness-cache-4 release assets'}}
 (files/'CACHE.json').write_text(json.dumps(cache,indent=2,sort_keys=True)+'\n')
 (files/'MANIFEST.sha256').write_text(''.join(f"{v['sha256']}  {v['file']}\n" for _,v in sorted(tools.items())) + f"{digest(files/'CACHE.json')}  CACHE.json\n")
 (files/'README.md').write_text(f'''# {tag}\n\nGitHub-only toolchain cache for network-constrained agents.\n\n```\ngit fetch origin tag {tag}\npython3 scripts/restore_agent_toolchain_cache.py --tag {tag} --prefix /path/to/toolchains\n. /path/to/toolchains/env.sh\n```\n\nEvery file is split into <90 MiB parts and verified against MANIFEST.sha256.\nCACHE.json records the tool versions, roots, sizes and digests.\n''')

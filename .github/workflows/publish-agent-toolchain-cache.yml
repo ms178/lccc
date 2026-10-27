@@ -18,7 +18,7 @@ concurrency:
 jobs:
   publish:
     name: Assemble verified toolchains and publish an immutable tag
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
