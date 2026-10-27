@@ -553,7 +553,7 @@ impl Lowerer {
                 .filter(|d| {
                     matches!(
                         d,
-                        DerivedDeclarator::Pointer(_)
+                        DerivedDeclarator::Pointer(..)
                             | DerivedDeclarator::Array(_)
                             | DerivedDeclarator::FunctionPointer(..)
                     )
@@ -1930,7 +1930,7 @@ impl Lowerer {
         let mut i = 0;
         while i < derived.len() {
             match &derived[i] {
-                DerivedDeclarator::Pointer(_) => {
+                DerivedDeclarator::Pointer(..) => {
                     result = TypeSpecifier::Pointer(Box::new(result), AddressSpace::Default);
                     i += 1;
                 }
@@ -2081,7 +2081,7 @@ impl Lowerer {
     ) -> usize {
         let has_pointer = derived
             .iter()
-            .any(|d| matches!(d, DerivedDeclarator::Pointer(_)));
+            .any(|d| matches!(d, DerivedDeclarator::Pointer(..)));
         let has_func_ptr = derived.iter().any(|d| {
             matches!(
                 d,

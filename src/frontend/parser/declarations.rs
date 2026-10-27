@@ -76,6 +76,17 @@ fn apply_decl_address_space_to_spec(ts: &mut TypeSpecifier, space: AddressSpace)
 }
 
 impl Parser {
+    /// The declaration omitted a function return type. Classification and
+    /// dialect-dependent promotion are owned by the diagnostic engine.
+    fn implicit_function_return_type(&mut self, span: Span) -> TypeSpecifier {
+        self.diagnostics.warning_with_kind(
+            "return type defaults to 'int'",
+            span,
+            crate::common::error::WarningKind::ImplicitInt,
+        );
+        TypeSpecifier::Int
+    }
+
     pub(super) fn parse_external_decl(&mut self) -> Option<ExternalDecl> {
         // Reset all declaration-level flags before parsing the next declaration.
         self.attrs = ParsedDeclAttrs::default();
@@ -150,7 +161,7 @@ impl Parser {
                 if self.pos + 1 < self.tokens.len()
                     && matches!(self.tokens[self.pos + 1].kind, TokenKind::LParen)
                 {
-                    return Some(TypeSpecifier::Int);
+                    return Some(self.implicit_function_return_type(start));
                 }
             }
             None
@@ -210,6 +221,7 @@ impl Parser {
             self.parse_declarator_with_attrs();
         let declarator_object_space = self.attrs.declarator_object_space;
         let declarator_object_volatile = self.attrs.declarator_object_volatile;
+        let declarator_pointer_const = self.attrs.parsing_pointer_const();
         let declarator_object_quals = (
             self.attrs.declarator_object_restrict,
             self.attrs.declarator_object_atomic,
@@ -275,6 +287,7 @@ impl Parser {
         let mut decl_attrs = DeclAttributes::default();
         decl_attrs.object_space = declarator_object_space;
         decl_attrs.object_volatile = declarator_object_volatile;
+        decl_attrs.pointer_const = declarator_pointer_const;
         (decl_attrs.object_restrict, decl_attrs.object_atomic) = declarator_object_quals;
         decl_attrs.base_volatile = declarator_base_volatile;
         decl_attrs.set_constructor(is_constructor);
@@ -479,6 +492,10 @@ impl Parser {
 
         Some(ExternalDecl::FunctionDef(FunctionDef {
             alignment,
+            return_pointer_const_levels: crate::frontend::parser::ast::return_pointer_const_levels(
+                &return_type,
+                &derived,
+            ),
             return_type,
             name: name.unwrap_or_default(),
             params: final_params,
@@ -526,7 +543,7 @@ impl Parser {
                         return_type =
                             TypeSpecifier::Array(Box::new(return_type), size_expr.clone());
                     }
-                    DerivedDeclarator::Pointer(space) => {
+                    DerivedDeclarator::Pointer(space, _) => {
                         return_type = TypeSpecifier::Pointer(Box::new(return_type), pending_space);
                         pending_space = *space;
                     }
@@ -547,7 +564,7 @@ impl Parser {
             let mut i = 0;
             while i < prefix.len() {
                 match &prefix[i] {
-                    DerivedDeclarator::Pointer(_) => {
+                    DerivedDeclarator::Pointer(..) => {
                         if let Some(DerivedDeclarator::FunctionPointer(
                             params,
                             variadic,
@@ -603,7 +620,7 @@ impl Parser {
             let mut pending_space = AddressSpace::Default;
             for d in derived {
                 match d {
-                    DerivedDeclarator::Pointer(space) => {
+                    DerivedDeclarator::Pointer(space, _) => {
                         return_type = TypeSpecifier::Pointer(Box::new(return_type), pending_space);
                         pending_space = *space;
                     }
@@ -641,7 +658,7 @@ impl Parser {
                                     | DerivedDeclarator::Function(..) => {
                                         found_fptr = true;
                                     }
-                                    DerivedDeclarator::Pointer(_) if found_fptr => {
+                                    DerivedDeclarator::Pointer(..) if found_fptr => {
                                         ptrs_after += 1;
                                     }
                                     _ => {}
@@ -718,7 +735,7 @@ impl Parser {
             let mut star_spaces = pderived
                 .iter()
                 .filter_map(|d| match d {
-                    DerivedDeclarator::Pointer(space) => Some(*space),
+                    DerivedDeclarator::Pointer(space, _) => Some(*space),
                     _ => None,
                 })
                 .collect::<Vec<_>>();
@@ -740,7 +757,7 @@ impl Parser {
         // (`struct sd * __seg_gs *` declares a pointer whose pointee values
         // live in %gs — the kernel's percpu `T * __percpu *` members).
         for d in pderived {
-            if let DerivedDeclarator::Pointer(space) = d {
+            if let DerivedDeclarator::Pointer(space, _) = d {
                 full_type = TypeSpecifier::Pointer(Box::new(full_type), *space);
             }
         }
@@ -957,6 +974,7 @@ impl Parser {
             let (dname, dderived) = self.parse_declarator();
             let d_object_space = self.attrs.declarator_object_space;
             let d_object_volatile = self.attrs.declarator_object_volatile;
+            let d_pointer_const = self.attrs.parsing_pointer_const();
             let d_object_quals = (
                 self.attrs.declarator_object_restrict,
                 self.attrs.declarator_object_atomic,
@@ -1030,6 +1048,7 @@ impl Parser {
                     da.section = d_section;
                     da.object_space = d_object_space;
                     da.object_volatile = d_object_volatile;
+                    da.pointer_const = d_pointer_const;
                     (da.object_restrict, da.object_atomic) = d_object_quals;
                     da.base_volatile = d_base_volatile;
                     da.asm_register = d_asm_reg;
@@ -1195,6 +1214,7 @@ impl Parser {
             let (name, derived, decl_mode, _, decl_aligned, _) = self.parse_declarator_with_attrs();
             let l_object_space = self.attrs.declarator_object_space;
             let l_object_volatile = self.attrs.declarator_object_volatile;
+            let l_pointer_const = self.attrs.parsing_pointer_const();
             let l_object_quals = (
                 self.attrs.declarator_object_restrict,
                 self.attrs.declarator_object_atomic,
@@ -1231,6 +1251,7 @@ impl Parser {
                     let mut da = DeclAttributes::default();
                     da.object_space = l_object_space;
                     da.object_volatile = l_object_volatile;
+                    da.pointer_const = l_pointer_const;
                     (da.object_restrict, da.object_atomic) = l_object_quals;
                     da.base_volatile = l_base_volatile;
                     da.section = local_section;
@@ -1853,7 +1874,7 @@ impl Parser {
         let mut pending_space = AddressSpace::Default;
         for d in derived {
             match d {
-                DerivedDeclarator::Pointer(space) => {
+                DerivedDeclarator::Pointer(space, _) => {
                     spec = TypeSpecifier::Pointer(Box::new(spec), pending_space);
                     pending_space = *space;
                 }

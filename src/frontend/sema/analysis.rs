@@ -156,6 +156,11 @@ pub struct FunctionInfo {
     pub is_defined: bool,
     /// Whether the function is declared with __attribute__((noreturn)) or _Noreturn
     pub is_noreturn: bool,
+    /// `const` bits of the RETURN type's pointer levels (bit `L-1` is pointer
+    /// level `L`, level 1 closest to the base type). `CType` erases
+    /// qualifiers, so `*g() = 0` for `int *const *g(void)` is only
+    /// diagnosable if the record keeps the middle level's `const`.
+    pub return_pointer_const_levels: u32,
 }
 
 impl FunctionInfo {
@@ -257,6 +262,17 @@ pub struct SemanticAnalyzer {
     pending_loop_labels: Vec<String>,
     active_break_targets: Vec<Vec<String>>,
     active_continue_targets: Vec<Vec<String>>,
+}
+
+/// Where an implicit conversion occurs, for GCC 16.2's verbatim
+/// `-Wint-conversion` phrasing of each context (all four forms
+/// measured against gcc-16.2.0).
+#[derive(Clone, Copy)]
+enum IConvContext<'a> {
+    Initialization,
+    Assignment,
+    Returning,
+    Argument { index: usize, callee: &'a str },
 }
 
 impl SemanticAnalyzer {
@@ -469,6 +485,8 @@ impl SemanticAnalyzer {
             prototype,
             is_defined: true,
             is_noreturn: func.attrs.is_noreturn(),
+            return_pointer_const_levels: self
+                .combine_return_const_levels(&func.return_type, func.return_pointer_const_levels),
         };
         // A block-scope prototype may precede the definition and carry facts the
         // definition does not repeat; `noreturn` is one of them. The file-scope
@@ -511,6 +529,34 @@ impl SemanticAnalyzer {
                 self.symbol_table.mark_automatic(name);
                 if const_base {
                     self.symbol_table.mark_const_base(name);
+                }
+                // Top-level const for C11 6.5.16p1: a parameter with any
+                // star is read-only only when the `const` sits on the star
+                // closest to the name (`int *const p`); without a star the
+                // declaration's own `const` decides (`const int x`,
+                // `const P q`).
+                let top_const = if param.decayed_array {
+                    false
+                } else if param.pointer_depth > 0 {
+                    param.pointer_const
+                } else {
+                    param.is_const || self.base_typedef_is_top_const(&param.type_spec)
+                };
+                if top_const {
+                    self.symbol_table.mark_top_const(name);
+                }
+                // Middle levels of a multi-level pointer keep their `const`
+                // only here: `CType` has no qualifier slots, so `int *const
+                // *p` would otherwise look identical to `int **p` and `*p = 0`
+                // would be accepted (GCC rejects it, C11 6.5.16p1).
+                {
+                    // Levels inherited from a typedef the parameter is built on
+                    // come first: they are closer to the base type.
+                    let mut pointer_quals = self.base_typedef_pointer_quals(&param.type_spec);
+                    pointer_quals.extend(param.pointer_quals.iter().copied());
+                    if !pointer_quals.is_empty() {
+                        self.symbol_table.mark_pointer_quals(name, pointer_quals);
+                    }
                 }
             }
         }
@@ -571,6 +617,8 @@ impl SemanticAnalyzer {
             prototype,
             is_defined: true,
             is_noreturn: func.attrs.is_noreturn() || prior_noreturn,
+            return_pointer_const_levels: self
+                .combine_return_const_levels(&func.return_type, func.return_pointer_const_levels),
         };
         let func_ctype = CType::Function(Box::new(func_info.call_type()));
 
@@ -609,6 +657,34 @@ impl SemanticAnalyzer {
                 self.symbol_table.mark_automatic(name);
                 if const_base {
                     self.symbol_table.mark_const_base(name);
+                }
+                // Top-level const for C11 6.5.16p1: a parameter with any
+                // star is read-only only when the `const` sits on the star
+                // closest to the name (`int *const p`); without a star the
+                // declaration's own `const` decides (`const int x`,
+                // `const P q`).
+                let top_const = if param.decayed_array {
+                    false
+                } else if param.pointer_depth > 0 {
+                    param.pointer_const
+                } else {
+                    param.is_const || self.base_typedef_is_top_const(&param.type_spec)
+                };
+                if top_const {
+                    self.symbol_table.mark_top_const(name);
+                }
+                // Middle levels of a multi-level pointer keep their `const`
+                // only here: `CType` has no qualifier slots, so `int *const
+                // *p` would otherwise look identical to `int **p` and `*p = 0`
+                // would be accepted (GCC rejects it, C11 6.5.16p1).
+                {
+                    // Levels inherited from a typedef the parameter is built on
+                    // come first: they are closer to the base type.
+                    let mut pointer_quals = self.base_typedef_pointer_quals(&param.type_spec);
+                    pointer_quals.extend(param.pointer_quals.iter().copied());
+                    if !pointer_quals.is_empty() {
+                        self.symbol_table.mark_pointer_quals(name, pointer_quals);
+                    }
                 }
             }
         }
@@ -1010,6 +1086,26 @@ impl SemanticAnalyzer {
                 self.result
                     .type_context
                     .set_typedef_const_base(&declarator.name, const_base);
+                // An alias must keep the per-level qualifiers of the type it
+                // names: `typedef int *const cp;` used as `cp *p` declares a
+                // pointer to a const pointer, and `*p = 0` is a constraint
+                // violation (C11 6.5.16p1). Levels inherited from a typedef the
+                // alias is built on come first (they are closer to the base).
+                let typedef_quals = {
+                    let mut quals = self.base_typedef_pointer_quals(&decl.type_spec);
+                    quals.extend(type_builder::declarator_pointer_quals(&declarator.derived));
+                    quals
+                };
+                self.result
+                    .type_context
+                    .set_typedef_pointer_quals(&declarator.name, typedef_quals);
+                // `typedef int *const cp;` declares a read-only pointer
+                // object; every `cp x` is read-only like a written-out
+                // `int *const x`, and `x = 0` is a constraint violation.
+                self.result.type_context.set_typedef_top_const(
+                    &declarator.name,
+                    matches!(resolved_ctype, CType::Pointer(..)) && declarator.attrs.pointer_const,
+                );
                 self.result
                     .type_context
                     .typedefs
@@ -1195,6 +1291,14 @@ impl SemanticAnalyzer {
                                         prototype,
                                         is_defined: false,
                                         is_noreturn,
+                                        return_pointer_const_levels: self
+                                            .combine_return_const_levels(
+                                                &decl.type_spec,
+                                                declarator_return_const_levels(
+                                                    &init_decl.derived,
+                                                    &ft.return_type,
+                                                ),
+                                            ),
                                     },
                                 );
                             }
@@ -1225,8 +1329,16 @@ impl SemanticAnalyzer {
                     });
                     return;
                 }
+                // A later prototype may be the one that spells the return
+                // type's level qualifiers; keep what either declared. Computed
+                // before the table entry is borrowed.
+                let return_levels = self.combine_return_const_levels(
+                    &decl.type_spec,
+                    declarator_return_const_levels(&init_decl.derived, &ft.return_type),
+                );
                 if let Some(existing) = self.result.functions.get_mut(&init_decl.name) {
                     existing.is_noreturn |= is_noreturn;
+                    existing.return_pointer_const_levels |= return_levels;
                     if prototype.is_some() {
                         existing.prototype = prototype;
                         // A later prototype refines an implicit declaration;
@@ -1247,6 +1359,10 @@ impl SemanticAnalyzer {
                             prototype,
                             is_defined: false,
                             is_noreturn,
+                            return_pointer_const_levels: self.combine_return_const_levels(
+                                &decl.type_spec,
+                                declarator_return_const_levels(&init_decl.derived, &ft.return_type),
+                            ),
                         },
                     );
                 }
@@ -1355,6 +1471,40 @@ impl SemanticAnalyzer {
             if const_base {
                 self.symbol_table.mark_const_base(&init_decl.name);
             }
+            // Per-level pointer qualifiers (`int *const *p`): the middle levels
+            // are erased from `CType`, so the read-only check reads them from
+            // the symbol table. Recorded in CType creation order.
+            if is_object {
+                let mut pointer_quals = self.base_typedef_pointer_quals(&decl.type_spec);
+                pointer_quals.extend(type_builder::declarator_pointer_quals(&init_decl.derived));
+                if !pointer_quals.is_empty() {
+                    self.symbol_table
+                        .mark_pointer_quals(&init_decl.name, pointer_quals);
+                }
+            }
+            // Top-level const for assignment/`++`/`--` (C11 6.5.16p1): with
+            // any pointer star the `const` closest to the name decides
+            // (`int *const p` read-only, `const int *q` writable, `q`'s
+            // pointee constness already recorded above as `const_base`);
+            // without a star the declaration's own `const` does (`const int
+            // x`, `const int a[]`, `const P q` for `typedef int *P`).
+            if is_object {
+                let has_star = init_decl
+                    .derived
+                    .iter()
+                    .any(|d| matches!(d, DerivedDeclarator::Pointer(..)));
+                let top_const = if has_star {
+                    init_decl.attrs.pointer_const
+                } else {
+                    // Without a star the object's own qualifier comes from the
+                    // declaration's `const`, or from the alias it is declared
+                    // with (`typedef int *const cp; cp x;`).
+                    decl.is_const() || self.base_typedef_is_top_const(&decl.type_spec)
+                };
+                if top_const {
+                    self.symbol_table.mark_top_const(&init_decl.name);
+                }
+            }
             if links && !self.symbol_table.at_file_scope() {
                 self.symbol_table.mark_linked(&init_decl.name);
             } else if is_object && !decl.is_static() && !self.symbol_table.at_file_scope() {
@@ -1378,7 +1528,7 @@ impl SemanticAnalyzer {
                 && !init_decl.derived.iter().any(|d| {
                     matches!(
                         d,
-                        DerivedDeclarator::Pointer(_)
+                        DerivedDeclarator::Pointer(..)
                             | DerivedDeclarator::Function(..)
                             | DerivedDeclarator::FunctionPointer(..)
                     )
@@ -1479,7 +1629,12 @@ impl SemanticAnalyzer {
                         .map(|s| s.ty.clone());
                     if let Some(var_ty) = var_ty {
                         let checker = self.expr_type_checker();
-                        if self.check_assignment_operand(init_expr, &var_ty, init_expr.span()) {
+                        if self.check_assignment_operand(
+                            init_expr,
+                            &var_ty,
+                            init_expr.span(),
+                            IConvContext::Initialization,
+                        ) {
                             // Diagnosed; the checks below would only repeat it.
                         } else if let Some(init_ty) = checker.infer_expr_ctype(init_expr) {
                             self.check_pointer_float_conversion(
@@ -2320,21 +2475,27 @@ impl SemanticAnalyzer {
                         // function is accepted silently in GNU mode (glibc
                         // uses `return __set_errno(...)`/`return helper();`
                         // shims throughout malloc.c, qsort.c, libio).
-                        // Returning a real VALUE from a void function is a
-                        // default-on warning in GCC, not an error; the value
-                        // is discarded.
+                        // A non-void value uses the dialect-dependent
+                        // return-mismatch class, just like a bare return
+                        // in a non-void function.
                         let checker = self.expr_type_checker();
                         let expr_is_void =
                             matches!(checker.infer_expr_ctype(expr), Some(CType::Void) | None);
                         if !expr_is_void {
-                            self.diagnostics.borrow_mut().warning(
+                            self.diagnostics.borrow_mut().warning_with_kind(
                                 "'return' with a value, in function returning void",
-                                *span,
+                                expr.span(),
+                                crate::common::error::WarningKind::ReturnMismatch,
                             );
                         }
                     } else {
                         let checker = self.expr_type_checker();
-                        if self.check_assignment_operand(expr, &expected, *span) {
+                        if self.check_assignment_operand(
+                            expr,
+                            &expected,
+                            *span,
+                            IConvContext::Returning,
+                        ) {
                             // Diagnosed; the checks below would only repeat it.
                         } else if let Some(actual) = checker.infer_expr_ctype(expr) {
                             let actual = self.conversion_source_ctype(expr, actual);
@@ -2351,8 +2512,8 @@ impl SemanticAnalyzer {
                 }
             }
             Stmt::Return(None, span) => {
-                // GCC treats a bare `return;` in a non-void function as a
-                // WARNING (the return value is indeterminate), not an error
+                // The bare-return subcase has dialect-dependent severity
+                // and pre-C99 enablement, distinct from returning a value
                 // — gcc.c-torture/execute/920415-1.c relies on this in gnu89
                 // code. The lowered function returns an undefined value.
                 if self
@@ -2360,10 +2521,7 @@ impl SemanticAnalyzer {
                     .as_ref()
                     .is_some_and(|t| !matches!(t, CType::Void))
                 {
-                    self.diagnostics.borrow_mut().warning(
-                        "return with no value, in function returning non-void",
-                        *span,
-                    );
+                    self.diagnostics.borrow_mut().missing_return_value(*span);
                 }
             }
             Stmt::If(cond, then_br, else_br, _) => {
@@ -3058,6 +3216,12 @@ impl SemanticAnalyzer {
                         && !self.check_ext_vector_step(operand, *op == UnaryOp::PreInc, *span)
                     {
                         self.check_lvalue_operand(operand, *span);
+                        let verb = if *op == UnaryOp::PreInc {
+                            "increment"
+                        } else {
+                            "decrement"
+                        };
+                        self.check_readonly_mutation(operand, *span, verb);
                     }
                 }
             }
@@ -3071,6 +3235,12 @@ impl SemanticAnalyzer {
                     && !self.check_ext_vector_step(operand, *op == PostfixOp::PostInc, *span)
                 {
                     self.check_lvalue_operand(operand, *span);
+                    let verb = if *op == PostfixOp::PostInc {
+                        "increment"
+                    } else {
+                        "decrement"
+                    };
+                    self.check_readonly_mutation(operand, *span, verb);
                 }
             }
             Expr::Assign(lhs, rhs, span) => {
@@ -3079,6 +3249,7 @@ impl SemanticAnalyzer {
                 if !self.check_ext_vector_assignable(lhs, *span) {
                     self.check_lvalue_operand(lhs, *span);
                 }
+                self.check_readonly_mutation(lhs, *span, "assignment");
                 // Check for invalid pointer <-> float conversions in assignment
                 let checker = self.expr_type_checker();
                 if let (Some(lhs_ty), Some(rhs_ty)) =
@@ -3086,7 +3257,8 @@ impl SemanticAnalyzer {
                 {
                     // An operand-constraint error makes the checks below
                     // redundant (they would only repeat it).
-                    if !self.check_assignment_operand(rhs, &lhs_ty, *span) {
+                    if !self.check_assignment_operand(rhs, &lhs_ty, *span, IConvContext::Assignment)
+                    {
                         let rhs_ty = self.conversion_source_ctype(rhs, rhs_ty);
                         let null_constant = self.is_void_null_pointer_constant(rhs);
                         self.check_assignment_compatibility(
@@ -3107,6 +3279,8 @@ impl SemanticAnalyzer {
                 if !self.check_ext_vector_assignable(lhs, *span) {
                     self.check_lvalue_operand(lhs, *span);
                 }
+                // GCC phrases `op=` on a const operand as an assignment.
+                self.check_readonly_mutation(lhs, *span, "assignment");
             }
             Expr::Conditional(cond, then_expr, else_expr, span) => {
                 self.analyze_expr(cond);
@@ -3435,6 +3609,7 @@ impl SemanticAnalyzer {
                     prototype: None,
                     is_defined: false,
                     is_noreturn: false,
+                    return_pointer_const_levels: 0,
                 };
                 self.result.functions.insert(name.clone(), func_info);
             }
@@ -4076,10 +4251,139 @@ impl SemanticAnalyzer {
     /// Simple assignment and the conversions "as if by assignment"
     /// (initialization, argument passing, `return`; C23 6.5.16.1p1) for a
     /// record, `void` or `nullptr_t` operand. Whether it reported an error.
-    fn check_assignment_operand(&self, from: &Expr, to: &CType, span: Span) -> bool {
+    fn check_assignment_operand(
+        &self,
+        from: &Expr,
+        to: &CType,
+        span: Span,
+        ctx: IConvContext<'_>,
+    ) -> bool {
         let Some(from_ty) = self.constraint_operand(from) else {
             return false;
         };
+        // GCC 16.2: an integer that is not a null-pointer constant used
+        // where a pointer is expected (initialization, assignment, argument
+        // passing, `return`) is `-Wint-conversion`, a default error from
+        // C99 on and a warning in gnu90 (measured). Explicit casts take a
+        // different path and never reach this implicit conversion.
+        let integer_to_pointer = from_ty.is_integer()
+            && matches!(to, CType::Pointer(..))
+            && !self.expr_type_checker().is_null_pointer_constant(from);
+        let pointer_to_integer = to.is_integer()
+            && !matches!(to, CType::Bool)
+            && matches!(
+                from_ty,
+                CType::Pointer(..) | CType::Array(..) | CType::Function(..)
+            );
+        if integer_to_pointer || pointer_to_integer {
+            let context = match ctx {
+                IConvContext::Initialization => {
+                    format!("initialization of '{to}' from '{from_ty}'")
+                }
+                IConvContext::Assignment => {
+                    format!("assignment to '{to}' from '{from_ty}'")
+                }
+                IConvContext::Returning => {
+                    format!("returning '{from_ty}' from a function with return type '{to}'")
+                }
+                IConvContext::Argument { index, callee } => {
+                    format!("passing argument {} of '{}'", index + 1, callee)
+                }
+            };
+            // GCC's measured column policy: `return` points at the
+            // returned value, while initialization, assignment, and
+            // argument passing keep the surrounding conversion
+            // expression's span (which matches gcc's column in all
+            // three probe contexts).
+            let ic_span = match ctx {
+                IConvContext::Returning => from.span(),
+                _ => span,
+            };
+            self.diagnostics.borrow_mut().warning_with_kind(
+                format!(
+                    "{context} makes {} without a cast",
+                    if integer_to_pointer {
+                        "pointer from integer"
+                    } else {
+                        "integer from pointer"
+                    }
+                ),
+                ic_span,
+                crate::common::error::WarningKind::IntConversion,
+            );
+            return true;
+        }
+        // Pointer-shaped source against a pointer target with
+        // incompatible pointees: C11 6.5.16.1 constraint, GCC
+        // `-Wincompatible-pointer-types` (a default error from C99 on and a
+        // warning in gnu90; measured). The verdict comes from the very
+        // function the argument path uses, so void pointers, qualified
+        // pointees, arrays, function decay, and address spaces stay
+        // accepted exactly where GCC 16.2 accepts them. Reporting here
+        // also pre-emits the per-context checks below, replacing their
+        // plain error (which `-Wno-incompatible-pointer-types` could not
+        // disable) with the kind-aware, dialect-severity diagnostic.
+        // Two shapes belong to other owners and must fall through to them:
+        // a null-pointer constant spelled through `void` (`(void *)0` into
+        // an address-space pointer is accepted, measured with the
+        // `__seg_gs` conversion oracles), and a cross-address-space pair
+        // whose diagnostic is the address-space one, not the pointer one.
+        // The space gap may sit at ANY pointer level (`int **` against
+        // `__seg_gs int **` differs below the top), so the comparison
+        // mirrors `pointer_argument_compat`'s per-level space walk.
+        fn space_gap(a: &CType, b: &CType) -> bool {
+            match (a, b) {
+                (CType::Pointer(af, asp), CType::Pointer(bt, bsp)) => {
+                    asp != bsp || space_gap(af, bt)
+                }
+                (CType::Pointer(af, _), CType::Array(bt, _)) => space_gap(af, bt),
+                (CType::Array(af, _), CType::Pointer(bt, bsp)) => {
+                    let _ = bsp;
+                    space_gap(af, bt)
+                }
+                _ => false,
+            }
+        }
+        let space_ok = !space_gap(&from_ty, to);
+        if matches!(to, CType::Pointer(..))
+            && matches!(
+                from_ty,
+                CType::Pointer(..) | CType::Array(..) | CType::Function(..)
+            )
+            && space_ok
+            && !self.is_void_null_pointer_constant(from)
+            && pointer_argument_compat(&from_ty, to) == PtrCompat::Incompatible
+        {
+            // All four phrasings measured against gcc-16.2.0.
+            let message = match ctx {
+                IConvContext::Initialization => {
+                    format!("initialization of '{to}' from incompatible pointer type '{from_ty}'")
+                }
+                IConvContext::Assignment => {
+                    format!("assignment to '{to}' from incompatible pointer type '{from_ty}'")
+                }
+                IConvContext::Returning => format!(
+                    "returning '{from_ty}' from a function with incompatible return type '{to}'"
+                ),
+                IConvContext::Argument { index, callee } => format!(
+                    "passing argument {} of '{}' from incompatible pointer type",
+                    index + 1,
+                    callee
+                ),
+            };
+            // Same measured column policy as the integer case: `return`
+            // points at the returned value.
+            let ip_span = match ctx {
+                IConvContext::Returning => from.span(),
+                _ => span,
+            };
+            self.diagnostics.borrow_mut().warning_with_kind(
+                message,
+                ip_span,
+                crate::common::error::WarningKind::IncompatiblePointerTypes,
+            );
+            return true;
+        }
         if !operand_constraints::involved(&from_ty) && !operand_constraints::involved(to) {
             return false;
         }
@@ -4558,7 +4862,14 @@ impl SemanticAnalyzer {
                 // This happens with implicit struct references in casts like
                 // ((struct foo *)0)->bar where struct foo is never defined.
                 // C11 6.5.2.3: member access requires the struct to be complete.
-                if !self.defined_structs.borrow().contains(key.as_ref()) {
+                if !self.defined_structs.borrow().contains(key.as_ref())
+                    && !self
+                        .result
+                        .type_context
+                        .borrow_struct_layouts()
+                        .get(key.as_ref())
+                        .is_some_and(|layout| layout.is_complete)
+                {
                     let type_name = format!("{}", base_ctype);
                     self.diagnostics.borrow_mut().error(
                         format!("invalid use of undefined type '{}'", type_name),
@@ -4680,7 +4991,15 @@ impl SemanticAnalyzer {
                 }
                 continue;
             }
-            if self.check_assignment_operand(arg, param_ty, arg.span()) {
+            if self.check_assignment_operand(
+                arg,
+                param_ty,
+                arg.span(),
+                IConvContext::Argument {
+                    index,
+                    callee: name,
+                },
+            ) {
                 continue;
             }
             if let Some(arg_ty) = checker.infer_expr_ctype(arg) {
@@ -5835,6 +6154,33 @@ impl SemanticAnalyzer {
                     // Delegate to shared build_full_ctype for correct inside-out type construction
                     type_builder::build_full_ctype(self, &f.type_spec, &f.derived)
                 };
+                // A by-value record (including an array element) must be
+                // complete at this point. Pointers to incomplete records are
+                // legal and deliberately stop this walk. Do not install a
+                // self-referential layout after reporting the constraint.
+                let mut object = &ty;
+                while let CType::Array(inner, _) = object {
+                    object = inner;
+                }
+                if let CType::Struct(key) | CType::Union(key) = object {
+                    if !self.defined_structs.borrow().contains(key.as_ref())
+                        && !self
+                            .result
+                            .type_context
+                            .borrow_struct_layouts()
+                            .get(key.as_ref())
+                            .is_some_and(|layout| layout.is_complete)
+                    {
+                        self.diagnostics.borrow_mut().error(
+                            format!(
+                                "field '{}' has incomplete type",
+                                f.name.as_deref().unwrap_or("<anonymous>")
+                            ),
+                            f.span,
+                        );
+                        return None;
+                    }
+                }
                 let name = f.name.clone().unwrap_or_default();
                 let bit_width = f
                     .bit_width
@@ -5874,8 +6220,15 @@ impl SemanticAnalyzer {
                     type_align,
                     is_packed: f.is_packed,
                     base_volatile: f.base_volatile,
+                    base_const: f.base_const,
                     object_volatile: f.object_volatile,
+                    object_const: f.object_const,
                     counted_by: f.counted_by.clone(),
+                    pointer_quals: {
+                        let mut quals = self.base_typedef_pointer_quals(&f.type_spec);
+                        quals.extend(type_builder::declarator_pointer_quals(&f.derived));
+                        quals
+                    },
                 })
             })
             .collect()
@@ -6387,6 +6740,307 @@ impl SemanticAnalyzer {
         }
     }
 
+    /// Exact source spelling of `expr`, used for GCC-compatible
+    /// `read-only location '<expr>'` diagnostics. Falls back to a neutral
+    /// placeholder when no source manager is attached (synthetic spans in
+    /// unit tests) or the span does not resolve to a single-line slice.
+    fn expr_source_text(&self, expr: &Expr) -> String {
+        // `Expr::span()` stores the *operator* token for some composites
+        // (the parser records `*` for `Deref` and `[` for subscripting),
+        // so cover the operands too: `*q` is `*`+inner, `a[i]` is base+index.
+        let mut span = expr.span();
+        fn cover(expr: &Expr, span: &mut Span) {
+            let child = expr.span();
+            if child.file_id == span.file_id {
+                span.start = span.start.min(child.start);
+                span.end = span.end.max(child.end);
+            }
+            match expr {
+                Expr::Deref(inner, _) => cover(inner, span),
+                Expr::ArraySubscript(base, index, _) => {
+                    cover(base, span);
+                    cover(index, span);
+                }
+                _ => {}
+            }
+        }
+        cover(expr, &mut span);
+        let Some(sm) = self.diagnostics.borrow().share_source_manager() else {
+            return "<expr>".to_string();
+        };
+        let content = sm.get_content(span.file_id);
+        let (start, mut end) = (span.start as usize, span.end as usize);
+        // Subscript spans start at `[` and end at the index expression;
+        // include the closing `]` (skipping whitespace) when present.
+        if matches!(expr, Expr::ArraySubscript(..)) {
+            let mut probe = end;
+            while probe < content.len() && content.as_bytes()[probe].is_ascii_whitespace() {
+                probe += 1;
+            }
+            if content.as_bytes().get(probe) == Some(&b']') {
+                end = probe + 1;
+            }
+        }
+        if start <= end
+            && end <= content.len()
+            && content.is_char_boundary(start)
+            && content.is_char_boundary(end)
+        {
+            let text = &content[start..end];
+            if !text.is_empty() && !text.contains('\n') {
+                return text.to_string();
+            }
+        }
+        "<expr>".to_string()
+    }
+
+    fn member_constness(&self, base: &Expr, field: &str, indirect: bool) -> (bool, bool) {
+        let Some(CType::Struct(key) | CType::Union(key)) = self.member_base_ctype(base, indirect)
+        else {
+            return (false, false);
+        };
+        let layouts = self.result.type_context.borrow_struct_layouts();
+        layouts
+            .get(key.as_ref())
+            .and_then(|layout| layout.field_constness(field, &*layouts))
+            .map_or((false, false), |(base, object, _)| (base, object))
+    }
+
+    /// Per-level pointer qualifiers of the member `field` selected from `base`
+    /// (`base.field` when `indirect` is false, `base->field` otherwise).
+    fn member_pointer_quals(&self, base: &Expr, field: &str, indirect: bool) -> Option<Vec<u8>> {
+        let Some(CType::Struct(key) | CType::Union(key)) = self.member_base_ctype(base, indirect)
+        else {
+            return None;
+        };
+        self.result
+            .type_context
+            .borrow_struct_layouts()
+            .get(key.as_ref())
+            .and_then(|layout| {
+                layout
+                    .field_pointer_quals(field, &*self.result.type_context.borrow_struct_layouts())
+            })
+    }
+
+    fn readonly_base_qualifier(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::MemberAccess(base, field, _) => self.member_constness(base, field, false).0,
+            Expr::PointerMemberAccess(base, field, _) => self.member_constness(base, field, true).0,
+            _ => crate::common::qualifiers::expr_const_base(expr, &self.expr_type_checker()),
+        }
+    }
+
+    /// Whether the POINTEE the pointer expression `ptr` designates is
+    /// const-qualified (`const int *q` -> `*q` and `q->f` are read-only;
+    /// `int *const p` -> the pointer is read-only but `*p` is writable).
+    /// This is exactly `common::qualifiers`' base-constness model, the one
+    /// `_Generic` selection already uses.
+    fn pointee_readonly(&self, ptr: &Expr) -> bool {
+        // Walk the dereference chain down to its root so the verdict can be
+        // exact. `CType::Pointer` carries no qualifiers, so the per-level
+        // `const` bits come from the declaration that produced the root's
+        // type: symbols, members, cast type names, compound literals and
+        // function return types each record them (index `L-1` is pointer level
+        // `L`). With the root's pointer depth known, the object `*^k root`
+        // designates is level `depth - k`; level 0 is the base object, whose
+        // qualifier is the separate base-const record. An array-typed root
+        // (`const int *a[2]; *a[0] = 1`) supplies the ELEMENT's depth, since
+        // its subscript already consumed a dereference. When nothing recorded
+        // the levels the check stays silent rather than guessing: a missing
+        // diagnostic never breaks a legal program, a wrong one does.
+        let tc = self.expr_type_checker();
+        let mut derefs = 0usize;
+        let mut root = ptr;
+        loop {
+            match root {
+                Expr::Deref(inner, _) => {
+                    derefs += 1;
+                    root = inner;
+                }
+                Expr::ArraySubscript(base, index, _) => {
+                    derefs += 1;
+                    root = if tc.infer_expr_ctype(base).is_some_and(|ty| ty.is_integer()) {
+                        index
+                    } else {
+                        base
+                    };
+                }
+                // `*(p + i)` is the same lvalue `p[i]` names, but `p + i`
+                // itself still designates a POINTER: the dereference belongs to
+                // the enclosing `*`, so the chain only unwraps the offset.
+                Expr::BinaryOp(op, lhs, rhs, _) if matches!(op, BinOp::Add | BinOp::Sub) => {
+                    root = if tc.infer_expr_ctype(lhs).is_some_and(|ty| ty.is_integer()) {
+                        rhs
+                    } else {
+                        lhs
+                    };
+                }
+                _ => break,
+            }
+        }
+        let mut k = derefs; // this call asks about `*^k root`'s successor
+        let mut depth = pointer_depth_of(tc.infer_expr_ctype(root).as_ref());
+        if depth == 0 {
+            // An array-typed root (`const int *a[2]; *a[0] = 1`): the chain's
+            // subscript already consumed the array layer, so the ELEMENT type
+            // supplies the pointer depth and one dereference is accounted for.
+            if let Some(CType::Array(element, _)) = tc.infer_expr_ctype(root) {
+                if k >= 1 {
+                    depth = pointer_depth_of(Some(&element));
+                    k -= 1;
+                }
+            }
+        }
+        // A symbol that recorded its per-level qualifiers decides exactly:
+        // the k-th dereference of `root` designates pointer level `k + 1`, and
+        // only the level beyond every star (`k + 1 == depth`) designates the
+        // base object. Levels in between are invisible to `CType`
+        // (`int *const *p` has `const` on level 1, so `*p = 0` is a
+        // modification of a read-only object).
+        if depth > 0 {
+            // Where the per-level qualifiers of the root's type are recorded:
+            // objects in the symbol table, members in their layout.
+            let levels: Option<Vec<u8>> = match root {
+                Expr::Identifier(name, _) => {
+                    self.symbol_table.pointer_quals(name).map(<[u8]>::to_vec)
+                }
+                Expr::MemberAccess(base, field, _) => self.member_pointer_quals(base, field, false),
+                Expr::PointerMemberAccess(base, field, _) => {
+                    self.member_pointer_quals(base, field, true)
+                }
+                // A cast type name keeps its own per-level `const`
+                // (`*(int *const *)p = 0`); `CType` cannot carry it.
+                Expr::Cast(_, _, _, quals) if quals.pointer_const_levels != 0 => {
+                    Some(const_levels_to_cvr(quals.pointer_const_levels))
+                }
+                // A compound literal of such a type is an lvalue and records
+                // its levels the same way (`*((int *const *){0}) = 0`).
+                Expr::CompoundLiteral(_, _, _, storage) if storage.pointer_const_levels != 0 => {
+                    Some(const_levels_to_cvr(storage.pointer_const_levels))
+                }
+                // A function's return type keeps its own level qualifiers
+                // (`int *const *g(void)`), so `*g() = 0` is a modification of a
+                // read-only object.
+                Expr::FunctionCall(callee, _, _) => match &**callee {
+                    Expr::Identifier(name, _) => self
+                        .visible_function_info(name)
+                        .map(|info| info.return_pointer_const_levels)
+                        .filter(|mask| *mask != 0)
+                        .map(const_levels_to_cvr),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(levels) = levels {
+                // `root` has a `depth`-level pointer type, so `*root` names the
+                // object of level `depth - 1` and every further dereference
+                // drops one level; level 0 is the base object.
+                let Some(target) = (depth as usize).checked_sub(k + 1) else {
+                    return false;
+                };
+                if target == 0 {
+                    return self.readonly_base_qualifier(root);
+                }
+                if target < depth as usize {
+                    return levels
+                        .get(target - 1)
+                        .is_some_and(|&cvr| crate::frontend::parser::ast::cvr_is_const(cvr));
+                }
+                return false;
+            }
+        }
+        match (k, depth) {
+            // `*root` of a one-star root: the base specifier IS the pointee.
+            (0, 1) | (0, 0) => {
+                if depth == 0 {
+                    // `*a` of an array: the element, i.e. the array's own
+                    // top-level const (`const int a[]`, `int *const ap[]`).
+                    self.lvalue_readonly(root)
+                } else {
+                    self.readonly_base_qualifier(root)
+                }
+            }
+            // The chain consumes every star: the const is the base one.
+            (k, depth) if depth > 0 && k + 1 == depth as usize => {
+                self.readonly_base_qualifier(root)
+            }
+            // Middle-level const is unrecorded: do not guess (see above).
+            _ => false,
+        }
+    }
+
+    /// Whether assigning to (or `++`/`--` on) the lvalue `target` violates
+    /// C11 6.5.16p1: the left operand must not be const-qualified.
+    ///
+    /// The recursion mirrors GCC 16.2's diagnostic classes: a plain
+    /// identifier consults the object's TOP-LEVEL const (`const int x` and
+    /// `int *const p` are read-only; `const int *q` is a writable pointer);
+    /// `*e`/`e[i]` through a pointer consult the pointee (`q[i]` through
+    /// `const int *q`); an array's elements follow the array's own
+    /// top-level const (`const int a[]` and `int *const ap[]` have
+    /// read-only elements); a dot access recurses into the object; an
+    /// arrow access consults the pointee.
+    fn lvalue_readonly(&self, target: &Expr) -> bool {
+        let tc = self.expr_type_checker();
+        match target {
+            Expr::Identifier(name, _) => self.symbol_table.is_top_const(name),
+            Expr::Deref(inner, _) => self.pointee_readonly(inner),
+            Expr::ArraySubscript(base, index, _) => {
+                let base = if tc.infer_expr_ctype(base).is_some_and(|ty| ty.is_integer()) {
+                    index
+                } else {
+                    base
+                };
+                if matches!(tc.infer_expr_ctype(base), Some(CType::Array(..))) {
+                    self.lvalue_readonly(base)
+                } else {
+                    self.pointee_readonly(base)
+                }
+            }
+            Expr::MemberAccess(base, field, _) => {
+                self.lvalue_readonly(base) || self.member_constness(base, field, false).1
+            }
+            Expr::PointerMemberAccess(base, field, _) => {
+                self.pointee_readonly(base) || self.member_constness(base, field, true).1
+            }
+            _ => false,
+        }
+    }
+
+    /// Emit GCC 16.2's read-only diagnostic for a mutation whose operand
+    /// fails [`Self::lvalue_readonly`]. `verb` is the measured GCC word:
+    /// `assignment` for `=`/`op=`, `increment` for pre/postfix `++`, and
+    /// `decrement` for `--`, each pairing with one of the three operand
+    /// classes (variable / location / member in read-only object).
+    fn check_readonly_mutation(&self, target: &Expr, op_span: Span, verb: &str) {
+        if !self.lvalue_readonly(target) {
+            return;
+        }
+        let message = match target {
+            Expr::Identifier(name, _) => format!("{verb} of read-only variable '{name}'"),
+            Expr::MemberAccess(base, field, _) => {
+                if self.lvalue_readonly(base) {
+                    format!("{verb} of member '{field}' in read-only object")
+                } else {
+                    format!("{verb} of read-only member '{field}'")
+                }
+            }
+            Expr::PointerMemberAccess(base, field, _) => {
+                if self.pointee_readonly(base) {
+                    format!("{verb} of member '{field}' in read-only object")
+                } else {
+                    format!("{verb} of read-only member '{field}'")
+                }
+            }
+            _ => format!(
+                "{verb} of read-only location '{}'",
+                self.expr_source_text(target)
+            ),
+        };
+        self.diagnostics.borrow_mut().error(message, op_span);
+    }
+
     fn check_const_compound_literal_mutation(&self, target: &Expr, span: Span) {
         let mut cur = target;
         while let Expr::MemberAccess(base, _, _) | Expr::ArraySubscript(base, _, _) = cur {
@@ -6531,6 +7185,79 @@ impl SemanticAnalyzer {
 
     /// The expression type checker over this analyzer's state.
     /// Base constness of a declaration's type (see `common::qualifiers`).
+    /// CVR bits of each pointer level of a declarator, in CType creation
+    /// order: index `L-1` is pointer level `L`, counting the level closest to
+    /// the base type as 1 (`int *const *p` → level 1 is `const`).
+    ///
+    /// `CType::Pointer` carries no qualifiers, and this is the only place they
+    /// survive the parser. Function-pointer declarators are the one shape whose
+    /// entries the type builder may reorder around the `FunctionPointer` core;
+    /// a function type is never an assignment target, so its levels are not
+    /// consulted by the read-only check.
+    /// Combine the `const` levels an alias in the return type contributes with
+    /// those the declarator spells (`typedef int *const cp; cp *g(void)`).
+    fn combine_return_const_levels(&self, type_spec: &TypeSpecifier, declarator: u32) -> u32 {
+        let prefix = self.base_typedef_pointer_quals(type_spec);
+        let prefix_mask = prefix.iter().enumerate().fold(0u32, |mask, (level, cvr)| {
+            if level < 32 && crate::frontend::parser::ast::cvr_is_const(*cvr) {
+                mask | (1 << level)
+            } else {
+                mask
+            }
+        });
+        prefix_mask | shift_const_levels(declarator, prefix.len())
+    }
+
+    /// Whether the alias naming `type_spec`'s base declares a read-only object
+    /// (`typedef int *const cp;`), so a declaration with no star of its own is
+    /// read-only. See [`Self::base_typedef_pointer_quals`] for the leaf walk.
+    fn base_typedef_is_top_const(&self, type_spec: &TypeSpecifier) -> bool {
+        let mut leaf = type_spec;
+        loop {
+            match leaf {
+                TypeSpecifier::Pointer(inner, _)
+                | TypeSpecifier::Array(inner, _)
+                | TypeSpecifier::TypeofType(inner)
+                | TypeSpecifier::Vector(inner, _)
+                | TypeSpecifier::ExtVector(inner, _) => leaf = inner,
+                _ => break,
+            }
+        }
+        match leaf {
+            TypeSpecifier::TypedefName(name) => self.result.type_context.typedef_is_top_const(name),
+            _ => false,
+        }
+    }
+
+    /// Per-level pointer qualifiers inherited from the typedef named by
+    /// `type_spec` (empty for any other base). An alias keeps the qualifiers of
+    /// the type it names, so a declaration built on it starts with them.
+    fn base_typedef_pointer_quals(&self, type_spec: &TypeSpecifier) -> Vec<u8> {
+        // The type name may already be wrapped in pointers/arrays (the parser
+        // folds a simple declarator into the specifier), so follow the shape
+        // down to the leaf that carries the name.
+        let mut leaf = type_spec;
+        loop {
+            match leaf {
+                TypeSpecifier::Pointer(inner, _)
+                | TypeSpecifier::Array(inner, _)
+                | TypeSpecifier::TypeofType(inner)
+                | TypeSpecifier::Vector(inner, _)
+                | TypeSpecifier::ExtVector(inner, _) => leaf = inner,
+                _ => break,
+            }
+        }
+        match leaf {
+            TypeSpecifier::TypedefName(name) => self
+                .result
+                .type_context
+                .typedef_pointer_quals(name)
+                .map(<[u8]>::to_vec)
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+
     fn decl_const_base(&self, type_spec: &TypeSpecifier, explicit: bool) -> bool {
         crate::common::qualifiers::type_name_const_base(
             type_spec,
@@ -6685,6 +7412,7 @@ impl SemanticAnalyzer {
                 prototype: None,
                 is_defined: false,
                 is_noreturn,
+                return_pointer_const_levels: 0,
             };
             self.result.functions.insert(name.to_string(), func_info);
         }
@@ -6942,7 +7670,7 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
         };
         // The layout is computed BEFORE the key is settled, because deciding
         // whether this definition shadows a different one needs the members.
-        let defined_layout: Option<StructLayout> = if struct_fields.is_empty() {
+        let defined_layout: Option<StructLayout> = if fields.is_none() {
             None
         } else {
             let mut layout = if is_union {
@@ -7048,6 +7776,7 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
         {
             let align = struct_aligned.unwrap_or(1);
             let layout = StructLayout {
+                is_complete: fields.is_some(),
                 fields: Vec::new(),
                 size: 0,
                 align,
@@ -7446,6 +8175,7 @@ mod record_layouts_correspond_tests {
         fields: Vec<StructFieldLayout>,
     ) -> StructLayout {
         StructLayout {
+            is_complete: true,
             fields,
             size,
             align,
@@ -7466,8 +8196,11 @@ mod record_layouts_correspond_tests {
             sso: crate::common::types::SsoMode::None,
             sso_storage_ty: None,
             base_volatile: false,
+            base_const: false,
             object_volatile: false,
+            object_const: false,
             counted_by: None,
+            pointer_quals: Vec::new(),
         }
     }
 
@@ -7478,6 +8211,15 @@ mod record_layouts_correspond_tests {
         fields: Vec<StructFieldLayout>,
     ) -> (String, RcLayout) {
         (key.to_string(), Rc::new(layout(false, size, align, fields)))
+    }
+
+    #[test]
+    fn complete_empty_records_are_not_forward_placeholders() {
+        let layouts: FxHashMap<String, RcLayout> = FxHashMap::default();
+        assert!(!StructLayout::empty().is_complete);
+        assert!(!StructLayout::empty_union().is_complete);
+        assert!(StructLayout::for_struct_with_packing(&[], None, &layouts, false).is_complete);
+        assert!(StructLayout::for_union_with_packing(&[], None, &layouts, false).is_complete);
     }
 
     #[test]
@@ -8192,6 +8934,14 @@ mod kr_prototype_tests {
         let tu = parser.parse();
         assert_eq!(parser.error_count, 0, "fixture must parse");
         let mut sema = SemanticAnalyzer::new();
+        // Mirror the driver's GCC 16.2 dialect-default severity policy
+        // (`-Wint-conversion`, `-Wincompatible-pointer-types` and friends
+        // are errors from C99 on), so fixture verdicts equal what the
+        // compiler does under its default dialect instead of depending on
+        // whether a particular constraint already had a kind.
+        let mut config = crate::common::error::WarningConfig::new();
+        config.apply_gcc162_c99_default_errors();
+        sema.diagnostics.borrow_mut().set_warning_config(config);
         let result = sema.analyze(&tu);
         (sema, result)
     }
@@ -8250,6 +9000,65 @@ mod kr_prototype_tests {
             .1
             .is_err()
         );
+    }
+
+    /// The blocker the audit opened this PR for: a `const` on a middle pointer
+    /// level is invisible in `CType`, so the read-only check has to read it
+    /// from the declarator record. Everything below was measured with
+    /// gcc 16.2.0 and clang 23.1.4.
+    #[test]
+    fn middle_pointer_levels_keep_their_const() {
+        // `*p` designates a const pointer object: assigning to it is a
+        // constraint violation (C11 6.5.16p1).
+        for bad in [
+            "void f(int *const *p){*p=0;}",
+            "void f(int *const *p){(*p)++;}",
+            "void f(int *const *p){p[0]=0;}",
+            "void f(int *const *p){*(p+0)=0;}",
+            "void f(int **const *p){*p=0;}",
+            "void f(int *const **p){**p=0;}",
+            "void f(void){int *const *p=0;*p=0;}",
+            "struct S{int *const *p;};void f(struct S*s){*s->p=0;}",
+            "typedef int *const cp;void f(cp *p){*p=0;}",
+            "typedef int *const cp;void f(void){cp x=0;x=0;}",
+            "typedef int *const cp;void f(cp p){p=0;}",
+            "typedef int *const cp;typedef cp *cpp;void f(cpp p){*p=0;}",
+            "void f(void){const int *a[2]={0};*a[0]=1;}",
+            "void f(void){int *const a[2]={0};a[0]=0;}",
+            "void f(void){int (*const fp)(void)=0;fp=0;}",
+            "void f(void*p){*(int *const *)p=0;}",
+            "void f(void*p){*(int *const *const *)p=0;}",
+            "void f(void*p){**(int *const **)p=0;}",
+            "int *const *g(void);void f(void){*g()=0;}",
+            "typedef int *const cp;cp *g(void);void f(void){*g()=0;}",
+            "void f(void){*((int *const *){0})=0;}",
+        ] {
+            assert!(analyze(bad).1.is_err(), "{bad}");
+        }
+        // Legal forms stay legal: only the qualified level is read-only, and a
+        // `const` on a pointee does not make the pointer itself read-only.
+        for good in [
+            "void f(int *const *p){**p=1;}",
+            "void f(int *const *p){p=0;}",
+            "void f(int **const p){*p=0;}",
+            "void f(int *const **p){*p=0;}",
+            "void f(int *const p){*p=1;}",
+            "void f(const int **p){*p=0;}",
+            "void f(int *volatile *p){*p=0;}",
+            "typedef int *const cp;void f(cp p){*p=0;}",
+            "typedef int *const cp;void f(cp *p){**p=0;}",
+            "struct S{int *const *p;};void f(struct S*s){**s->p=1;}",
+            "void f(void){int *a[2]={0};*a[0]=1;}",
+            "void f(void){int *a[2]={0};a[0]=0;}",
+            "void f(void){int (*fp)(void)=0;fp=0;}",
+            "void f(void*p){**(int *const *)p=0;}",
+            "void f(void*p){*(int **)p=0;}",
+            "int **g(void);void f(void){*g()=0;}",
+            "int *const *g(void);void f(void){**g()=0;}",
+            "void f(void){*((int **){0})=0;}",
+        ] {
+            assert!(analyze(good).1.is_ok(), "{good}");
+        }
     }
 
     #[test]
@@ -8376,11 +9185,81 @@ mod kr_prototype_tests {
 /// Whether `init_decl` declares a const-qualified object (C11 6.7.3p5): the
 /// base type is const when the declarator has no pointer, and the outermost
 /// pointer is const when it has one (`const int *p` is not a const object).
+/// Shift a declarator's return-level mask past the pointer levels an alias in
+/// the return type contributes (`typedef int *const cp; cp *g(void)` has the
+/// alias's level below the declarator's star).
+fn shift_const_levels(mask: u32, by: usize) -> u32 {
+    if by >= 32 { 0 } else { mask << by }
+}
+
+/// `const` bits of a FUNCTION's return-type pointer levels, read from its
+/// declarator. The return type's levels are the pointer declarators before the
+/// function core, in creation order; `CType` cannot carry their qualifiers, so
+/// this is what lets `*g() = 0` for `int *const *g(void)` be rejected.
+/// Declarators that wrap the function in a function pointer reorder those
+/// layers and report nothing rather than a wrong level.
+fn declarator_return_const_levels(derived: &[DerivedDeclarator], return_type: &CType) -> u32 {
+    if derived
+        .iter()
+        .any(|d| matches!(d, DerivedDeclarator::FunctionPointer(..)))
+    {
+        return 0;
+    }
+    let depth = pointer_depth_of(Some(return_type));
+    let mut mask = 0u32;
+    let mut level = 0usize;
+    for d in derived {
+        match d {
+            DerivedDeclarator::Pointer(_, cvr) => {
+                if level >= depth {
+                    break;
+                }
+                if level < 32 && crate::frontend::parser::ast::cvr_is_const(*cvr) {
+                    mask |= 1 << level;
+                }
+                level += 1;
+            }
+            DerivedDeclarator::Array(_) => {}
+            _ => break,
+        }
+    }
+    mask
+}
+
+/// Expand a bitmask of `const` pointer levels into the per-level CVR vector the
+/// read-only check indexes (bit `L-1` set means level `L` is `const`).
+fn const_levels_to_cvr(mask: u32) -> Vec<u8> {
+    (0..32)
+        .map(|level| {
+            if mask & (1 << level) != 0 {
+                crate::frontend::parser::ast::CVR_CONST
+            } else {
+                0
+            }
+        })
+        .collect()
+}
+
+/// Number of consecutive pointer levels in `ty` (0 for anything that is not a
+/// pointer, including arrays and functions).
+fn pointer_depth_of(ty: Option<&CType>) -> usize {
+    let mut inner = match ty {
+        Some(CType::Pointer(inner, _)) => &**inner,
+        _ => return 0,
+    };
+    let mut depth = 1usize;
+    while let CType::Pointer(next, _) = inner {
+        depth += 1;
+        inner = next;
+    }
+    depth
+}
+
 fn declares_const_object(decl: &Declaration, init_decl: &InitDeclarator) -> bool {
     let has_pointer = init_decl
         .derived
         .iter()
-        .any(|d| matches!(d, DerivedDeclarator::Pointer(_)));
+        .any(|d| matches!(d, DerivedDeclarator::Pointer(..)));
     // A volatile object is never a folded constant: every read of it is an
     // access that must reach memory (C11 6.7.3p7), so `const volatile` objects
     // are not recorded here. For a pointer declarator only the object's own

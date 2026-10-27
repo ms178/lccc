@@ -192,9 +192,15 @@ impl Parser {
             self.attrs.set_restrict(false);
             self.attrs.set_atomic(spec_atomic);
             let star_space = std::mem::replace(&mut self.attrs.parsing_address_space, base_space);
-            // Each star keeps its own qualifier (see `DerivedDeclarator::Pointer`).
+            // Each star keeps its own qualifiers (see `DerivedDeclarator::Pointer`):
+            // the space and the CVR run written after it. A middle level's
+            // `const` (`int *const *p`) is invisible in `CType`, so it has to
+            // ride on the declarator or the read-only check cannot see it.
+            let star_cvr = u8::from(self.attrs.parsing_pointer_const())
+                | (u8::from(star_volatile) << 1)
+                | (u8::from(last_star_restrict) << 2);
             // The last star's is also the declared object's space.
-            derived.push(DerivedDeclarator::Pointer(star_space));
+            derived.push(DerivedDeclarator::Pointer(star_space, star_cvr));
             object_space = star_space;
             self.skip_gcc_extensions();
         }
@@ -237,11 +243,11 @@ impl Parser {
         // suffix the outer ones wrap directly.
         let inner_derived_has_pointer = inner_derived
             .iter()
-            .any(|d| matches!(d, DerivedDeclarator::Pointer(_)));
+            .any(|d| matches!(d, DerivedDeclarator::Pointer(..)));
         let mut outer_suffixes = Vec::with_capacity(4);
         let mut innermost_suffix_is_function = if inner_derived
             .iter()
-            .any(|d| matches!(d, DerivedDeclarator::Pointer(_)))
+            .any(|d| matches!(d, DerivedDeclarator::Pointer(..)))
         {
             None
         } else {
@@ -343,7 +349,7 @@ impl Parser {
             // qualifier (`spec_volatile` on a typedef use) is the pointee/element.
             None if typedef_use => typedef_object_volatile,
             None => spec_volatile,
-            Some(DerivedDeclarator::Pointer(_)) => last_star_volatile.unwrap_or(false),
+            Some(DerivedDeclarator::Pointer(..)) => last_star_volatile.unwrap_or(false),
             Some(_) => false,
         };
         let inner_has_pointer = inner_derived_has_pointer;
@@ -359,7 +365,7 @@ impl Parser {
         } else {
             match combined.last() {
                 None => (false, spec_atomic),
-                Some(DerivedDeclarator::Pointer(_)) => (last_star_restrict, last_star_atomic),
+                Some(DerivedDeclarator::Pointer(..)) => (last_star_restrict, last_star_atomic),
                 Some(_) if all_arrays => (false, spec_atomic),
                 Some(_) => (false, false),
             }
@@ -497,12 +503,12 @@ impl Parser {
         let inner_only_ptr_and_array = inner_derived.iter().all(|d| {
             matches!(
                 d,
-                DerivedDeclarator::Pointer(_) | DerivedDeclarator::Array(_)
+                DerivedDeclarator::Pointer(..) | DerivedDeclarator::Array(_)
             )
         });
         let inner_has_pointer = inner_derived
             .iter()
-            .any(|d| matches!(d, DerivedDeclarator::Pointer(_)));
+            .any(|d| matches!(d, DerivedDeclarator::Pointer(..)));
         let outer_starts_with_function = matches!(
             outer_suffixes.first(),
             Some(DerivedDeclarator::Function(..))
@@ -539,8 +545,20 @@ impl Parser {
             // All others are extra indirection levels placed AFTER the FunctionPointer.
             let inner_ptr_count = inner_derived
                 .iter()
-                .filter(|d| matches!(d, DerivedDeclarator::Pointer(_)))
+                .filter(|d| matches!(d, DerivedDeclarator::Pointer(..)))
                 .count();
+            // The syntax marker is the inner declarator's LAST `*`; it owns the
+            // qualifiers of that star (`int (*const fp)(void)` declares a
+            // const function-pointer object). The entry is rebuilt below, so
+            // carry the CVR run over instead of dropping it with the pointer.
+            let marker_cvr = inner_derived
+                .iter()
+                .rev()
+                .find_map(|d| match d {
+                    DerivedDeclarator::Pointer(_, cvr) => Some(*cvr),
+                    _ => None,
+                })
+                .unwrap_or(0);
             let extra_indirection_ptrs = if inner_ptr_count > 0 {
                 inner_ptr_count - 1
             } else {
@@ -548,7 +566,10 @@ impl Parser {
             };
 
             // Emit the function pointer syntax marker + FunctionPointer
-            result.push(DerivedDeclarator::Pointer(AddressSpace::Default));
+            result.push(DerivedDeclarator::Pointer(
+                AddressSpace::Default,
+                marker_cvr,
+            ));
             if let Some(DerivedDeclarator::Function(params, variadic, has_prototype)) =
                 outer_suffixes.into_iter().next()
             {
@@ -561,7 +582,7 @@ impl Parser {
 
             // Emit extra indirection Pointers (beyond the syntax marker)
             for _ in 0..extra_indirection_ptrs {
-                result.push(DerivedDeclarator::Pointer(AddressSpace::Default));
+                result.push(DerivedDeclarator::Pointer(AddressSpace::Default, 0));
             }
 
             // Emit inner arrays (for array of function pointers, e.g., `int (*fps[10])(int)`)
@@ -597,7 +618,7 @@ impl Parser {
             // - post_ptr_arrays: arrays after the last pointer (variable's own array dimensions)
             let last_ptr_idx = inner_derived
                 .iter()
-                .rposition(|d| matches!(d, DerivedDeclarator::Pointer(_)))
+                .rposition(|d| matches!(d, DerivedDeclarator::Pointer(..)))
                 .expect("inner_has_pointer is true, so a Pointer must exist");
             let mut result = outer_pointers;
             // 1. Arrays from inner that come before the pointer (pointee array dimensions)
@@ -610,7 +631,7 @@ impl Parser {
             result.extend(outer_suffixes);
             // 3. Pointer(s)
             for d in &inner_derived[..=last_ptr_idx] {
-                if matches!(d, DerivedDeclarator::Pointer(_)) {
+                if matches!(d, DerivedDeclarator::Pointer(..)) {
                     result.push(d.clone());
                 }
             }
@@ -678,7 +699,7 @@ impl Parser {
             .map(|pos| {
                 if matches!(inner_derived[pos], DerivedDeclarator::FunctionPointer(..))
                     && pos > 0
-                    && matches!(inner_derived[pos - 1], DerivedDeclarator::Pointer(_))
+                    && matches!(inner_derived[pos - 1], DerivedDeclarator::Pointer(..))
                 {
                     pos - 1
                 } else {
@@ -694,7 +715,7 @@ impl Parser {
                 && outer_only_arrays
                 && let Some(last_ptr_idx) = inner_prefix
                     .iter()
-                    .rposition(|d| matches!(d, DerivedDeclarator::Pointer(_)))
+                    .rposition(|d| matches!(d, DerivedDeclarator::Pointer(..)))
             {
                 // Callable returning pointer-to-array:
                 //   `int (*get_arr(int))[4]` -> [Array(4), Pointer, Function([int])]
@@ -707,7 +728,7 @@ impl Parser {
                 }
                 result.extend(outer_suffixes);
                 for d in &inner_prefix[..=last_ptr_idx] {
-                    if matches!(d, DerivedDeclarator::Pointer(_)) {
+                    if matches!(d, DerivedDeclarator::Pointer(..)) {
                         result.push(d.clone());
                     }
                 }
@@ -720,7 +741,7 @@ impl Parser {
                 && outer_suffixes.len() == 1
                 && let Some(first_ptr_idx) = inner_prefix
                     .iter()
-                    .position(|d| matches!(d, DerivedDeclarator::Pointer(_)))
+                    .position(|d| matches!(d, DerivedDeclarator::Pointer(..)))
             {
                 // Callable (function, N-level function pointer, or array/pointer
                 // of function pointers) returning a function pointer (or pointer
@@ -855,6 +876,12 @@ impl Parser {
             // Save and reset parsing_const to detect if this parameter's base type is const.
             let saved_const = self.attrs.parsing_const();
             self.attrs.set_const(false);
+            // The pointer-star `const` is per parameter too (`f(int a, int
+            // *const p)` must not leak p's star const into `a`'s declarator);
+            // save the enclosing declaration's state and restore it below
+            // alongside `saved_const`.
+            let saved_pointer_const = self.attrs.parsing_pointer_const();
+            self.attrs.set_pointer_const(false);
             // Each parameter's volatile and typedef qualifiers are its own
             // (`VI p, int y`: `y` is not volatile), so clear them before its
             // specifiers are parsed.
@@ -893,7 +920,7 @@ impl Parser {
                     inner_ptr_depth,
                     param_is_restrict,
                     paren_ptr_total,
-                    star_spaces,
+                    star_quals,
                     outer_fn_returns,
                 ) = self.parse_param_declarator_full();
                 // C11 6.7.6.3p2: `register` is a parameter's only storage
@@ -978,9 +1005,9 @@ impl Parser {
                     let space = if level == 0 {
                         param_addr_space
                     } else {
-                        star_spaces
+                        star_quals
                             .get(level as usize - 1)
-                            .copied()
+                            .map(|(space, _)| *space)
                             .unwrap_or(AddressSpace::Default)
                     };
                     type_spec = TypeSpecifier::Pointer(Box::new(type_spec), space);
@@ -989,6 +1016,17 @@ impl Parser {
                 if !ptr_to_array_dims.is_empty() {
                     for dim in ptr_to_array_dims.iter().rev() {
                         type_spec = TypeSpecifier::Array(Box::new(type_spec), dim.clone());
+                    }
+                }
+                // CVR of each pointer level in creation order: wrap `L` builds
+                // level `L+1`, and the star written at that position owns its
+                // qualifiers (`int *const *p`: level 1 is const). Stars inside
+                // the parenthesised group are counted separately and keep their
+                // own representation; unknown levels stay 0.
+                let mut pointer_quals = vec![0u8; pointer_depth as usize];
+                for (index, (_, cvr)) in star_quals.iter().enumerate() {
+                    if let Some(slot) = pointer_quals.get_mut(index) {
+                        *slot = *cvr;
                     }
                 }
                 for _ in 0..trailing_depth {
@@ -1033,7 +1071,9 @@ impl Parser {
                     type_spec = TypeSpecifier::Pointer(Box::new(type_spec), AddressSpace::Default);
                 }
 
+                let param_pointer_const = self.attrs.parsing_pointer_const();
                 self.attrs.set_const(saved_const);
+                self.attrs.set_pointer_const(saved_pointer_const);
                 self.attrs.set_noreturn(saved_noreturn);
                 params.push(ParamDecl {
                     type_spec,
@@ -1049,9 +1089,13 @@ impl Parser {
                     vla_size_exprs,
                     decayed_array: !array_dims.is_empty(),
                     fptr_inner_ptr_depth: inner_ptr_depth,
+                    pointer_depth,
+                    pointer_const: param_pointer_const,
+                    pointer_quals,
                 });
             } else {
                 self.attrs.set_const(saved_const);
+                self.attrs.set_pointer_const(saved_pointer_const);
                 self.attrs.set_noreturn(saved_noreturn);
                 break;
             }
@@ -1085,6 +1129,9 @@ impl Parser {
                 vla_size_exprs: Vec::new(),
                 decayed_array: false,
                 fptr_inner_ptr_depth: 0,
+                pointer_depth: 0,
+                pointer_const: false,
+                pointer_quals: Vec::new(),
             });
             if !self.consume_if(&TokenKind::Comma) {
                 break;
@@ -1117,7 +1164,7 @@ impl Parser {
         // OUTSIDE, while the leading stars bind to the base type from the
         // inside (see the construction in parse_param_list).
         u32,
-        Vec<AddressSpace>,
+        Vec<(AddressSpace, u8)>,
         Vec<(Vec<ParamDecl>, bool, bool, u32)>,
     ) {
         let param_start = self.peek_span();
@@ -1126,7 +1173,7 @@ impl Parser {
         // Space written after each leading `*`, in written order (see
         // `DerivedDeclarator::Pointer`): `star_spaces[k]` qualifies the pointee
         // of the pointer built by star k+2.
-        let mut star_spaces: Vec<AddressSpace> = Vec::new();
+        let mut star_quals: Vec<(AddressSpace, u8)> = Vec::new();
         loop {
             // Bounded: see POINTER_DEPTH_BUDGET. The span is taken before
             // consuming so the diagnostic points at the offending `*`.
@@ -1144,10 +1191,15 @@ impl Parser {
             let qualifier_start = self.pos;
             let base_space =
                 std::mem::replace(&mut self.attrs.parsing_address_space, AddressSpace::Default);
+            // Each star owns its qualifier run; an inner const pointer
+            // must not make the parameter object itself read-only.
+            self.attrs.set_pointer_const(false);
             self.skip_cv_qualifiers();
-            star_spaces.push(std::mem::replace(
-                &mut self.attrs.parsing_address_space,
-                base_space,
+            star_quals.push((
+                std::mem::replace(&mut self.attrs.parsing_address_space, base_space),
+                u8::from(self.attrs.parsing_pointer_const())
+                    | (u8::from(self.attrs.parsing_volatile()) << 1)
+                    | (u8::from(self.attrs.parsing_restrict()) << 2),
             ));
             is_restrict |= self.tokens[qualifier_start..self.pos]
                 .iter()
@@ -1229,7 +1281,7 @@ impl Parser {
         // leading `*` a pointee/return-type pointer (e.g. `int * __seg_gs (*p)[4]`
         // or `int * __seg_gs *p[4]`, where the parameter itself is ordinary).
         if !had_paren_decl && !is_func_ptr && array_dims.is_empty() {
-            if let Some(&object_space) = star_spaces.last() {
+            if let Some(&(object_space, _)) = star_quals.last() {
                 if object_space != AddressSpace::Default {
                     self.emit_error(
                         format!(
@@ -1255,7 +1307,7 @@ impl Parser {
             fptr_inner_ptr_depth,
             is_restrict,
             paren_ptr_total,
-            star_spaces,
+            star_quals,
             outer_fn_returns,
         )
     }
@@ -1318,6 +1370,7 @@ impl Parser {
                 }
                 let base_space =
                     std::mem::replace(&mut self.attrs.parsing_address_space, AddressSpace::Default);
+                self.attrs.set_pointer_const(false);
                 self.skip_cv_qualifiers();
                 object_space = std::mem::replace(&mut self.attrs.parsing_address_space, base_space);
                 object_span = star_span;
@@ -1605,7 +1658,11 @@ impl Parser {
                     .iter()
                     .any(|tok| matches!(tok.kind, TokenKind::Restrict)),
             ) << 2;
-            let star_cvr = u8::from(self.attrs.parsing_const())
+            // `skip_cv_qualifiers` records a star's `const` in
+            // `pointer_const` (see its doc), not in the base-specifier
+            // `const` flag: reading `parsing_const()` here silently dropped
+            // every type-name `*const`, so `*(int *const *)p = 0` passed.
+            let star_cvr = u8::from(self.attrs.parsing_pointer_const())
                 | (u8::from(self.attrs.parsing_volatile()) << 1)
                 | restrict_bit;
             let star_space = self.attrs.parsing_address_space;

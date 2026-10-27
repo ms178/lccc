@@ -877,7 +877,7 @@ impl Lowerer {
         let is_array_of_pointers = is_array && {
             let ptr_pos = derived
                 .iter()
-                .position(|d| matches!(d, DerivedDeclarator::Pointer(_)));
+                .position(|d| matches!(d, DerivedDeclarator::Pointer(..)));
             let last_arr_pos = derived
                 .iter()
                 .rposition(|d| matches!(d, DerivedDeclarator::Array(_)));
@@ -914,7 +914,7 @@ impl Lowerer {
 
         let has_derived_ptr = derived
             .iter()
-            .any(|d| matches!(d, DerivedDeclarator::Pointer(_)));
+            .any(|d| matches!(d, DerivedDeclarator::Pointer(..)));
         let is_bool = self.is_type_bool(type_spec) && !has_derived_ptr && !is_array;
 
         let struct_layout = self.get_struct_layout_for_type(type_spec).or_else(|| {
@@ -986,7 +986,7 @@ impl Lowerer {
                         | DerivedDeclarator::Function(..) => {
                             found_fptr = true;
                         }
-                        DerivedDeclarator::Pointer(_) if found_fptr => {
+                        DerivedDeclarator::Pointer(..) if found_fptr => {
                             ptrs_after_fptr += 1;
                         }
                         _ => {}

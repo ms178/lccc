@@ -69,6 +69,9 @@ impl Lowerer {
                             vla_size_exprs: Vec::new(),
                             decayed_array: false,
                             fptr_inner_ptr_depth: 0,
+                            pointer_depth: 0,
+                            pointer_const: false,
+                            pointer_quals: Vec::new(),
                         })
                         .collect();
                     TypeSpecifier::FunctionPointer(
@@ -143,6 +146,9 @@ impl Lowerer {
                         vla_size_exprs: Vec::new(),
                         decayed_array: false,
                         fptr_inner_ptr_depth: 0,
+                        pointer_depth: 0,
+                        pointer_const: false,
+                        pointer_quals: Vec::new(),
                     })
                     .collect();
                 TypeSpecifier::BareFunction(
@@ -402,8 +408,13 @@ impl Lowerer {
                         type_align,
                         is_packed: f.is_packed,
                         base_volatile: f.base_volatile,
+                        base_const: f.base_const,
                         object_volatile: f.object_volatile,
+                        object_const: f.object_const,
                         counted_by: f.counted_by.clone(),
+                        pointer_quals: crate::common::type_builder::declarator_pointer_quals(
+                            &f.derived,
+                        ),
                     })
                 })
                 .collect();
@@ -457,6 +468,7 @@ impl Lowerer {
             // Forward declaration: insert an empty layout if not already present
             if self.types.borrow_struct_layouts().get(&key).is_none() {
                 let empty_layout = StructLayout {
+                    is_complete: false,
                     fields: Vec::new(),
                     size: 0,
                     align: 1,
@@ -478,6 +490,7 @@ impl Lowerer {
             let id = self.types.next_anon_struct_id();
             let key = format!("__anon_struct_{}", id);
             let empty_layout = StructLayout {
+                is_complete: false,
                 fields: Vec::new(),
                 size: 0,
                 align: 1,

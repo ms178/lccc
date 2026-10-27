@@ -394,7 +394,7 @@ pub fn enum_type_of(
 /// unassignable in kernel/events/hw_breakpoint.c).
 pub fn pointee_space_before(derived: &[DerivedDeclarator], i: usize) -> AddressSpace {
     match i.checked_sub(1).map(|j| &derived[j]) {
-        Some(DerivedDeclarator::Pointer(space)) => *space,
+        Some(DerivedDeclarator::Pointer(space, _)) => *space,
         _ => AddressSpace::Default,
     }
 }
@@ -402,7 +402,7 @@ pub fn pointee_space_before(derived: &[DerivedDeclarator], i: usize) -> AddressS
 fn find_function_pointer_core(derived: &[DerivedDeclarator]) -> Option<usize> {
     for i in 0..derived.len() {
         // Look for Pointer followed by FunctionPointer
-        if matches!(&derived[i], DerivedDeclarator::Pointer(_))
+        if matches!(&derived[i], DerivedDeclarator::Pointer(..))
             && i + 1 < derived.len()
             && matches!(&derived[i + 1], DerivedDeclarator::FunctionPointer(..))
         {
@@ -520,6 +520,19 @@ fn convert_param_decls_to_ctypes_with(
         .collect()
 }
 
+/// CVR bits of each pointer level of `derived`, in CType creation order.
+/// Index `L-1` describes pointer level `L`; `CType` erases qualifiers, so this
+/// is the only record of a middle level's `const`.
+pub fn declarator_pointer_quals(derived: &[DerivedDeclarator]) -> Vec<u8> {
+    derived
+        .iter()
+        .filter_map(|d| match d {
+            DerivedDeclarator::Pointer(_, cvr) => Some(*cvr),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Build a full CType from a TypeSpecifier and DerivedDeclarator chain.
 ///
 /// The derived list is produced by the parser's declarator handling, which stores
@@ -583,14 +596,14 @@ pub fn build_full_ctype_with_callbacks(
         let prefix = &derived[..fp_start];
         let last_prefix_ptr = prefix
             .iter()
-            .rposition(|d| matches!(d, DerivedDeclarator::Pointer(_)));
+            .rposition(|d| matches!(d, DerivedDeclarator::Pointer(..)));
         let return_prefix_end = last_prefix_ptr.map_or(0, |p| p + 1);
 
         let mut result = base;
         let mut p = 0;
         while p < return_prefix_end {
             match &prefix[p] {
-                DerivedDeclarator::Pointer(_) => {
+                DerivedDeclarator::Pointer(..) => {
                     result = CType::Pointer(Box::new(result), pointee_space_before(derived, p));
                     p += 1;
                 }
@@ -616,7 +629,7 @@ pub fn build_full_ctype_with_callbacks(
         let mut i = fp_start;
         while i < derived.len() {
             match &derived[i] {
-                DerivedDeclarator::Pointer(_) => {
+                DerivedDeclarator::Pointer(..) => {
                     if let Some(DerivedDeclarator::FunctionPointer(
                         params,
                         variadic,
@@ -686,7 +699,7 @@ pub fn build_full_ctype_with_callbacks(
         let mut i = 0;
         while i < derived.len() {
             match &derived[i] {
-                DerivedDeclarator::Pointer(_) => {
+                DerivedDeclarator::Pointer(..) => {
                     result = CType::Pointer(Box::new(result), pointee_space_before(derived, i));
                     i += 1;
                 }
@@ -784,7 +797,7 @@ pub fn declarator_supplies_pointer(derived: &[DerivedDeclarator]) -> bool {
     derived.iter().any(|d| {
         matches!(
             d,
-            DerivedDeclarator::Pointer(_) | DerivedDeclarator::FunctionPointer(..)
+            DerivedDeclarator::Pointer(..) | DerivedDeclarator::FunctionPointer(..)
         )
     })
 }
@@ -829,7 +842,7 @@ fn declarator_pointer_levels(derived: &[DerivedDeclarator]) -> usize {
     let mut i = 0usize;
     while i < derived.len() {
         match &derived[i] {
-            DerivedDeclarator::Pointer(_) => {
+            DerivedDeclarator::Pointer(..) => {
                 count += 1;
                 if matches!(
                     derived.get(i + 1),
@@ -1038,7 +1051,7 @@ mod address_space_tests {
         assert!(apply_declaration_address_space_for_object(
             &mut ty,
             AddressSpace::SegGs,
-            &[DerivedDeclarator::Pointer(AddressSpace::Default)]
+            &[DerivedDeclarator::Pointer(AddressSpace::Default, 0)]
         ));
         assert_eq!(
             ty,
@@ -1065,8 +1078,8 @@ mod address_space_tests {
             &mut ty,
             AddressSpace::SegGs,
             &[
-                DerivedDeclarator::Pointer(AddressSpace::Default),
-                DerivedDeclarator::Pointer(AddressSpace::Default)
+                DerivedDeclarator::Pointer(AddressSpace::Default, 0),
+                DerivedDeclarator::Pointer(AddressSpace::Default, 0)
             ]
         ));
         assert_eq!(
@@ -1089,7 +1102,7 @@ mod address_space_tests {
             &mut ty,
             AddressSpace::SegGs,
             &[
-                DerivedDeclarator::Pointer(AddressSpace::Default),
+                DerivedDeclarator::Pointer(AddressSpace::Default, 0),
                 DerivedDeclarator::Function(Vec::new(), false, true)
             ]
         ));
@@ -1114,7 +1127,7 @@ mod address_space_tests {
             object_storage_address_space(
                 AddressSpace::SegGs,
                 &[
-                    DerivedDeclarator::Pointer(AddressSpace::Default),
+                    DerivedDeclarator::Pointer(AddressSpace::Default, 0),
                     DerivedDeclarator::Array(None)
                 ]
             ),
@@ -1131,7 +1144,7 @@ mod address_space_tests {
         assert_eq!(
             object_storage_address_space(
                 AddressSpace::SegFs,
-                &[DerivedDeclarator::Pointer(AddressSpace::Default)]
+                &[DerivedDeclarator::Pointer(AddressSpace::Default, 0)]
             ),
             AddressSpace::Default
         );
@@ -1142,7 +1155,7 @@ mod address_space_tests {
 
         // Function pointers count as declarator-supplied pointers.
         assert!(declarator_supplies_pointer(&[
-            DerivedDeclarator::Pointer(AddressSpace::Default),
+            DerivedDeclarator::Pointer(AddressSpace::Default, 0),
             DerivedDeclarator::FunctionPointer(Vec::new(), false, true)
         ]));
         assert!(!declarator_supplies_pointer(&[
@@ -1190,7 +1203,7 @@ pub fn named_space_qualifies_whole_type(
         && !derived.iter().any(|d| {
             matches!(
                 d,
-                DerivedDeclarator::Pointer(_) | DerivedDeclarator::FunctionPointer(..)
+                DerivedDeclarator::Pointer(..) | DerivedDeclarator::FunctionPointer(..)
             )
         })
 }
@@ -1447,7 +1460,7 @@ mod seg_placement_tests {
         // typedef long L;  L __seg_gs *p;  -> p is generic, *p is %gs
         assert!(!named_space_qualifies_whole_type(
             &td,
-            &[DerivedDeclarator::Pointer(AddressSpace::Default)]
+            &[DerivedDeclarator::Pointer(AddressSpace::Default, 0)]
         ));
         // typedef long L;  L __seg_gs (*fp)(void);  -> fp is generic
         assert!(!named_space_qualifies_whole_type(
@@ -1465,7 +1478,7 @@ mod seg_placement_tests {
         let td = TypeSpecifier::TypedefName("P".to_string());
         let whole = named_space_qualifies_whole_type(
             &td,
-            &[DerivedDeclarator::Pointer(AddressSpace::Default)],
+            &[DerivedDeclarator::Pointer(AddressSpace::Default, 0)],
         );
         assert!(!whole);
         assert_eq!(

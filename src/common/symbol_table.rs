@@ -62,6 +62,18 @@ struct Scope {
     /// Objects whose type's base specifier is `const` (see
     /// `common::qualifiers`).
     const_base: FxHashSet<String>,
+    /// CVR bits of each POINTER LEVEL of an object's type, in level order
+    /// (`[0]` is the level closest to the base type). `CType` erases
+    /// qualifiers, so a middle level's `const` (`int *const *p`) exists only
+    /// here; `pointee_readonly` consults it to reject `*p = 0`.
+    pointer_quals: FxHashMap<String, Vec<u8>>,
+    /// Objects whose own (top-level) type is `const`: the declaration's
+    /// `const` with no pointer star (`const int x`), or the `const` on the
+    /// star closest to the name (`int *const p`). This is exactly the
+    /// qualifier C11 6.5.16p1 consults for assignment and `++`/`--`
+    /// (unlike `const_base`, which for a pointer object records its
+    /// POINTEE's constness).
+    top_const: FxHashSet<String>,
     /// The value of a folded const object, converted to its type, so that
     /// `int a = cc;` can be evaluated for `const int cc = 5;`.
     folded_values: FxHashMap<String, FoldedValue>,
@@ -114,6 +126,8 @@ impl Scope {
             constexpr_objects: FxHashSet::default(),
             constexpr_members: FxHashMap::default(),
             const_base: FxHashSet::default(),
+            top_const: FxHashSet::default(),
+            pointer_quals: FxHashMap::default(),
             folded_values: FxHashMap::default(),
             enumerators: FxHashSet::default(),
         }
@@ -356,6 +370,46 @@ impl SymbolTable {
             .rev()
             .find(|scope| scope.symbols.contains_key(name))
             .is_some_and(|scope| scope.const_base.contains(name))
+    }
+
+    /// Record the per-pointer-level CVR bits of the object `name` declared in
+    /// the innermost scope. Levels the declaration did not spell keep bit 0.
+    pub fn mark_pointer_quals(&mut self, name: &str, quals: Vec<u8>) {
+        if let Some(scope) = self.scopes.last_mut() {
+            if !quals.iter().all(|&q| q == 0) {
+                scope.pointer_quals.insert(name.to_string(), quals);
+            }
+        }
+    }
+
+    /// Per-pointer-level CVR bits of the innermost visible declaration of
+    /// `name`, or `None` when no level carried a qualifier (or the name is not
+    /// a pointer object). Index `L-1` describes pointer level `L`.
+    pub fn pointer_quals(&self, name: &str) -> Option<&[u8]> {
+        self.scopes
+            .iter()
+            .rev()
+            .find(|scope| scope.symbols.contains_key(name))
+            .and_then(|scope| scope.pointer_quals.get(name))
+            .map(Vec::as_slice)
+    }
+
+    /// Record that the innermost scope's object `name` has a top-level
+    /// `const` (see the `top_const` field on `Scope`).
+    pub fn mark_top_const(&mut self, name: &str) {
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.top_const.insert(name.to_string());
+        }
+    }
+
+    /// Whether the innermost visible declaration of `name` is an object
+    /// whose own type is `const` (see `mark_top_const`).
+    pub fn is_top_const(&self, name: &str) -> bool {
+        self.scopes
+            .iter()
+            .rev()
+            .find(|scope| scope.symbols.contains_key(name))
+            .is_some_and(|scope| scope.top_const.contains(name))
     }
 
     /// Whether the innermost visible declaration of `name` is a const object

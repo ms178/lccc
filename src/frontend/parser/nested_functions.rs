@@ -310,6 +310,10 @@ impl Parser {
         // only known once the lowering side has built the `IrFunction`.
         Some(FunctionDef {
             alignment: None,
+            return_pointer_const_levels: crate::frontend::parser::ast::return_pointer_const_levels(
+                &return_type,
+                &derived,
+            ),
             return_type,
             name,
             params: final_params,

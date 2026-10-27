@@ -132,7 +132,7 @@ impl Lowerer {
         let mut i = 0;
         while i < derived.len() {
             match &derived[i] {
-                DerivedDeclarator::Pointer(_) => {
+                DerivedDeclarator::Pointer(..) => {
                     levels.push(Level::Pointer);
                     i += 1;
                 }

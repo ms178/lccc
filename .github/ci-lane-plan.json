@@ -1125,7 +1125,7 @@
     "frontend-b": {
       "group": "frontend",
       "mode": "steps",
-      "predicted_gate_seconds": 626.75,
+      "predicted_gate_seconds": 628.42,
       "shards": 3,
       "steps": [
         {
@@ -1283,6 +1283,10 @@
         {
           "measured_s": 1.0,
           "name": "Check 16-byte atomic load/store/RMW semantics (full 128 bits, vs GCC oracle)"
+        },
+        {
+          "measured_s": 1.67,
+          "name": "GCC 16.2 diagnostic severity parity"
         }
       ]
     },

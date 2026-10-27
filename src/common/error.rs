@@ -118,6 +118,17 @@ pub enum WarningKind {
     /// A printf-family call uses a non-literal format with no format arguments.
     /// GCC flag: -Wformat-security (must be combined with -Wformat).
     FormatSecurity,
+    /// A declaration omitted its type specifier, defaulting to `int`.
+    /// GCC flag: -Wimplicit-int
+    ImplicitInt,
+    /// `return;` in a function returning non-void (or a missing return
+    /// value at the end of a non-void function's `return expr;`).
+    /// GCC flag: -Wreturn-mismatch
+    ReturnMismatch,
+    /// An integer initializer/assignment/argument was used where a pointer
+    /// is expected without a null-pointer constant or an explicit cast.
+    /// GCC flag: -Wint-conversion
+    IntConversion,
 }
 
 impl WarningKind {
@@ -134,6 +145,9 @@ impl WarningKind {
             WarningKind::SignCompare => "sign-compare",
             WarningKind::Format => "format",
             WarningKind::FormatSecurity => "format-security",
+            WarningKind::ImplicitInt => "implicit-int",
+            WarningKind::ReturnMismatch => "return-mismatch",
+            WarningKind::IntConversion => "int-conversion",
         }
     }
 
@@ -152,8 +166,27 @@ impl WarningKind {
             "sign-compare" => Some(WarningKind::SignCompare),
             "format" => Some(WarningKind::Format),
             "format-security" => Some(WarningKind::FormatSecurity),
+            "implicit-int" => Some(WarningKind::ImplicitInt),
+            "return-mismatch" => Some(WarningKind::ReturnMismatch),
+            "int-conversion" => Some(WarningKind::IntConversion),
             _ => None,
         }
+    }
+
+    /// The kinds GCC 16.2 makes default *errors* in every dialect from C99
+    /// onward (measured: `-std=gnu17` and `-std=gnu23` reject with exit 1,
+    /// `-std=gnu90` only warns with exit 0). The driver seeds these into
+    /// [`WarningConfig::default_errors`] after CLI parsing unless the user demoted
+    /// them explicitly (`-Wno-error=<name>` wins; a disabled warning is
+    /// suppressed before severity is consulted).
+    pub fn gcc162_c99_default_error_kinds() -> &'static [WarningKind] {
+        &[
+            WarningKind::ImplicitFunctionDeclaration,
+            WarningKind::ImplicitInt,
+            WarningKind::ReturnMismatch,
+            WarningKind::IntConversion,
+            WarningKind::IncompatiblePointerTypes,
+        ]
     }
 
     /// All warning kinds that are enabled by -Wall.
@@ -186,6 +219,9 @@ impl WarningKind {
             WarningKind::ReturnType,
             WarningKind::IncompatiblePointerTypes,
             WarningKind::Attributes,
+            WarningKind::ImplicitInt,
+            WarningKind::ReturnMismatch,
+            WarningKind::IntConversion,
         ]
     }
 }
@@ -204,6 +240,30 @@ pub struct WarningConfig {
     /// under a global `-Werror` given before or after it (GCC 16.2, measured).
     /// The last of `-Werror=<name>` / `-Wno-error=<name>` decides.
     not_errors: crate::common::fx_hash::FxHashSet<WarningKind>,
+    /// Kinds that are errors by GCC 16.2's *dialect default severity*
+    /// (`-Wimplicit-int` and friends from C99 on) rather than by an
+    /// explicit `-Werror=<name>` request. Kept separate because GCC
+    /// prints the plain `[-W<name>]` suffix for default-severity errors
+    /// but `[-Werror=<name>]` for an explicit promotion (measured), and
+    /// so `-Wno-error=<name>` can undo exactly this class at any point.
+    default_errors: crate::common::fx_hash::FxHashSet<WarningKind>,
+    /// Kinds the user explicitly requested with a positive `-W<name>` or
+    /// `-Werror=<name>` flag. GCC 16.2 (measured): in gnu90 an explicit
+    /// `-Wimplicit-int` or `-Wimplicit-function-declaration` still warns
+    /// while the diagnostic is silent by default, so default suppression
+    /// must not swallow an explicit request.
+    explicit_enable: crate::common::fx_hash::FxHashSet<WarningKind>,
+    /// Whether `-Wall`/`-Wextra` was requested (GCC 16.2, measured:
+    /// `-Wall -std=gnu90` still warns implicit function declarations).
+    wall_requested: bool,
+    /// Pre-C99 implicit return types belong to -Wreturn-type under -Wall
+    /// or an explicit -Wreturn-type request, not to the C99 constraint class.
+    legacy_implicit_return_type: bool,
+    /// -fpermissive demotes dialect-default constraints, not explicit -Werror.
+    permissive: Option<bool>,
+    /// A bare return in a value-returning function is gated by -Wreturn-type
+    /// before C99; a value returned from void is independently default-on.
+    bare_return_enabled: bool,
     /// Global -Werror flag: promote ALL warnings to errors.
     pub werror_all: bool,
     /// Global `-w` flag: inhibit ALL warning messages.  Measured against
@@ -224,6 +284,12 @@ impl WarningConfig {
             enabled,
             errors: crate::common::fx_hash::FxHashSet::default(),
             not_errors: crate::common::fx_hash::FxHashSet::default(),
+            default_errors: crate::common::fx_hash::FxHashSet::default(),
+            explicit_enable: crate::common::fx_hash::FxHashSet::default(),
+            wall_requested: false,
+            legacy_implicit_return_type: false,
+            permissive: None,
+            bare_return_enabled: true,
             werror_all: false,
             inhibit_all: false,
         }
@@ -236,9 +302,15 @@ impl WarningConfig {
         self.inhibit_all = true;
     }
 
+    /// Select GCC's default-constraint demotion without changing explicit flags.
+    pub fn set_permissive(&mut self, enabled: bool) {
+        self.permissive = Some(enabled);
+    }
+
     /// Enable a specific warning.
     pub fn enable(&mut self, kind: WarningKind) {
         self.enabled.insert(kind);
+        self.explicit_enable.insert(kind);
     }
 
     /// Disable a specific warning (-Wno-<name>).
@@ -248,6 +320,7 @@ impl WarningConfig {
 
     /// Enable all -Wall warnings.
     pub fn enable_wall(&mut self) {
+        self.wall_requested = true;
         for &kind in WarningKind::wall_set() {
             self.enabled.insert(kind);
         }
@@ -265,24 +338,74 @@ impl WarningConfig {
     pub fn set_werror(&mut self, kind: WarningKind) {
         self.errors.insert(kind);
         self.not_errors.remove(&kind);
-        // -Werror=<name> also implicitly enables the warning
+        // -Werror=<name> also implicitly enables the warning, and counts
+        // as an explicit request for pre-C99 default suppression.
         self.enabled.insert(kind);
+        self.explicit_enable.insert(kind);
     }
 
     /// Demote a specific warning from error (-Wno-error=<name>).
     pub fn clear_werror(&mut self, kind: WarningKind) {
         self.errors.remove(&kind);
+        self.default_errors.remove(&kind);
         self.not_errors.insert(kind);
+    }
+
+    /// Seed the GCC 16.2 default-error kinds for a C99-or-later dialect
+    /// (see `WarningKind::gcc162_c99_default_error_kinds`), called once
+    /// after CLI parsing so every later flag order is already settled.
+    /// An explicit `-Wno-error=<name>` (recorded in `not_errors`) wins;
+    /// a warning disabled with `-Wno-<name>` stays suppressed before
+    /// severity is ever consulted, so only the error set changes here.
+    pub fn apply_gcc162_c99_default_errors(&mut self) {
+        for &kind in WarningKind::gcc162_c99_default_error_kinds() {
+            if self.permissive != Some(true) && !self.not_errors.contains(&kind) {
+                self.default_errors.insert(kind);
+            }
+        }
+    }
+
+    /// Pre-C99 enablement differs from severity: implicit int/declarations
+    /// need an explicit request (or -Wall for declarations). Bare returns
+    /// need -Wreturn-type, but returning a value from void stays default-on.
+    /// An explicit -fno-permissive promotes only live constraint diagnostics.
+    pub fn suppress_gcc162_pre_c99_defaults(&mut self) {
+        self.legacy_implicit_return_type =
+            self.wall_requested || self.explicit_enable.contains(&WarningKind::ReturnType);
+        // Naming -Wreturn-mismatch alone does not enable bare returns in
+        // pre-C99 modes; -Wreturn-type owns this subcase's enablement.
+        self.bare_return_enabled =
+            self.legacy_implicit_return_type && self.enabled.contains(&WarningKind::ReturnType);
+        if !self.explicit_enable.contains(&WarningKind::ImplicitInt) {
+            self.disable(WarningKind::ImplicitInt);
+        }
+        if !self
+            .explicit_enable
+            .contains(&WarningKind::ImplicitFunctionDeclaration)
+            && !self.wall_requested
+        {
+            self.disable(WarningKind::ImplicitFunctionDeclaration);
+        }
+        // IntConversion stays enabled: measured warning-by-default in
+        // gnu90 as well.
+        // An explicit -fno-permissive requests default errors even pre-C99,
+        // but must not enable a diagnostic whose subcase is otherwise silent.
+        if self.permissive == Some(false) {
+            self.apply_gcc162_c99_default_errors();
+        }
     }
 
     /// Check if a warning of the given kind should be emitted at all.
     pub fn is_enabled(&self, kind: WarningKind) -> bool {
-        !self.inhibit_all && self.enabled.contains(&kind)
+        self.enabled.contains(&kind)
+            && (!self.inhibit_all || (self.default_errors.contains(&kind) && self.is_error(kind)))
     }
 
     /// Check if a warning of the given kind should be promoted to an error.
     pub fn is_error(&self, kind: WarningKind) -> bool {
-        self.errors.contains(&kind) || (self.werror_all && !self.not_errors.contains(&kind))
+        ((self.errors.contains(&kind) || self.default_errors.contains(&kind))
+            && !self.not_errors.contains(&kind))
+            || (self.werror_all && !self.not_errors.contains(&kind))
     }
 
     /// Process a single -W flag argument (the part after -W).
@@ -636,7 +759,13 @@ impl DiagnosticEngine {
     pub fn emit(&mut self, diag: &Diagnostic) {
         match diag.severity {
             Severity::Warning => {
-                if let Some(kind) = diag.warning_kind {
+                if let Some(mut kind) = diag.warning_kind {
+                    if kind == WarningKind::ImplicitInt
+                        && self.warning_config.legacy_implicit_return_type
+                        && self.warning_config.is_enabled(WarningKind::ReturnType)
+                    {
+                        kind = WarningKind::ReturnType;
+                    }
                     // Check if this warning category is enabled
                     if !self.warning_config.is_enabled(kind) {
                         return; // suppressed by -Wno-<name>
@@ -645,9 +774,23 @@ impl DiagnosticEngine {
                     // Check if this warning should be promoted to an error
                     if self.warning_config.is_error(kind) {
                         // Promote: render as error with [-Werror=<name>] suffix
+                        // GCC 16.2 prints the plain `[-W<name>]` suffix when
+                        // the error comes from the dialect's default severity
+                        // but `[-Werror=<name>]` for an explicit promotion
+                        // (measured against gcc-16.2.0).
+                        let suffix = if self.warning_config.default_errors.contains(&kind) {
+                            // Default-severity error (dialect promotion):
+                            // GCC prints the plain flag label (measured).
+                            format!("[-W{}]", kind.flag_name())
+                        } else {
+                            // Explicit -Werror=<name> or global -Werror
+                            // promoting a live warning: GCC prints the
+                            // -Werror= label (measured).
+                            format!("[-Werror={}]", kind.flag_name())
+                        };
                         let promoted = Diagnostic {
                             severity: Severity::Error,
-                            message: format!("{} [-Werror={}]", diag.message, kind.flag_name()),
+                            message: format!("{} {}", diag.message, suffix),
                             span: diag.span,
                             warning_kind: diag.warning_kind,
                             notes: diag.notes.clone(),
@@ -718,6 +861,18 @@ impl DiagnosticEngine {
     pub fn warning_with_kind(&mut self, message: impl Into<String>, span: Span, kind: WarningKind) {
         let diag = Diagnostic::warning_with_kind(message, kind).with_span(span);
         self.emit(&diag);
+    }
+
+    /// Diagnose the bare-return subcase without suppressing the independent
+    /// return-from-void subcase of the same warning class in pre-C99 modes.
+    pub fn missing_return_value(&mut self, span: Span) {
+        if self.warning_config.bare_return_enabled {
+            self.warning_with_kind(
+                "'return' with no value, in function returning non-void",
+                span,
+                WarningKind::ReturnMismatch,
+            );
+        }
     }
 
     /// Returns true if any errors have been emitted (including promoted warnings).
@@ -1140,4 +1295,63 @@ fn is_uninteresting_macro(name: &str) -> bool {
             | "EXIT_SUCCESS"
             | "EXIT_FAILURE"
     )
+}
+
+#[cfg(test)]
+mod dialect_severity_redteam_tests {
+    use super::*;
+
+    #[test]
+    fn quiet_mode_preserves_default_errors_but_suppresses_promoted_warnings() {
+        let mut config = WarningConfig::new();
+        config.apply_gcc162_c99_default_errors();
+        config.set_inhibit_all();
+        assert!(config.is_enabled(WarningKind::IntConversion));
+        config.set_werror(WarningKind::Cpp);
+        assert!(!config.is_enabled(WarningKind::Cpp));
+        config.clear_werror(WarningKind::IntConversion);
+        assert!(!config.is_enabled(WarningKind::IntConversion));
+    }
+
+    #[test]
+    fn permissive_defaults_do_not_erase_specific_promotions() {
+        for explicit_first in [false, true] {
+            let mut config = WarningConfig::new();
+            if explicit_first {
+                config.set_werror(WarningKind::IntConversion);
+            }
+            config.set_permissive(true);
+            if !explicit_first {
+                config.set_werror(WarningKind::IntConversion);
+            }
+            config.apply_gcc162_c99_default_errors();
+            assert!(config.is_error(WarningKind::IntConversion));
+            assert!(!config.default_errors.contains(&WarningKind::IntConversion));
+            assert!(!config.is_error(WarningKind::ImplicitInt));
+        }
+    }
+
+    #[test]
+    fn pre_c99_return_subcases_have_independent_enablement() {
+        let mut config = WarningConfig::new();
+        config.suppress_gcc162_pre_c99_defaults();
+        assert!(config.is_enabled(WarningKind::ReturnMismatch));
+        assert!(!config.bare_return_enabled);
+        let mut config = WarningConfig::new();
+        config.enable_wall();
+        config.suppress_gcc162_pre_c99_defaults();
+        assert!(config.bare_return_enabled);
+        assert!(config.legacy_implicit_return_type);
+    }
+
+    #[test]
+    fn explicit_nonpermissive_policy_promotes_live_pre_c99_constraints_only() {
+        let mut config = WarningConfig::new();
+        config.set_permissive(false);
+        config.suppress_gcc162_pre_c99_defaults();
+        assert!(config.is_error(WarningKind::IntConversion));
+        assert!(config.is_enabled(WarningKind::IntConversion));
+        assert!(!config.is_enabled(WarningKind::ImplicitInt));
+        assert!(!config.bare_return_enabled);
+    }
 }

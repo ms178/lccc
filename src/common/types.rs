@@ -872,10 +872,18 @@ pub struct StructField {
     pub is_packed: bool,
     /// Volatile base type of the field (element or pointee access). See `StructFieldDecl`.
     pub base_volatile: bool,
+    /// Const on the field's base type (element or innermost pointee).
+    pub base_const: bool,
     /// Volatile field object itself (`int *volatile p`). See `StructFieldDecl`.
     pub object_volatile: bool,
+    /// Const on the field object itself, independent of its pointee.
+    pub object_const: bool,
     /// Optional sibling count member from `__attribute__((counted_by(member)))`.
     pub counted_by: Option<String>,
+    /// CVR bits of each pointer level of the field's type, in CType creation
+    /// order (index `L-1` is pointer level `L`). `CType` erases qualifiers, so
+    /// a middle level's `const` (`int *const *p` as a member) lives here.
+    pub pointer_quals: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1031,6 +1039,8 @@ impl EnumType {
 /// Computed layout for a struct or union, with field offsets and total size.
 #[derive(Debug, Clone)]
 pub struct StructLayout {
+    /// True for a record definition, including a GNU empty record; false for a forward placeholder.
+    pub is_complete: bool,
     /// Each field's (name, byte offset, CType).
     pub fields: Vec<StructFieldLayout>,
     /// Total size of the struct in bytes (including trailing padding).
@@ -1168,8 +1178,11 @@ impl StructLayoutBuilder {
         self.field_layouts.push(StructFieldLayout {
             name: field.name.clone(),
             base_volatile: field.base_volatile,
+            base_const: field.base_const,
             object_volatile: field.object_volatile,
+            object_const: field.object_const,
             counted_by: field.counted_by.clone(),
+            pointer_quals: field.pointer_quals.clone(),
             offset: storage_offset,
             ty: storage_ty,
             bit_offset: Some(bit_offset_in_storage),
@@ -1260,8 +1273,11 @@ impl StructLayoutBuilder {
         self.field_layouts.push(StructFieldLayout {
             name: field.name.clone(),
             base_volatile: field.base_volatile,
+            base_const: field.base_const,
             object_volatile: field.object_volatile,
+            object_const: field.object_const,
             counted_by: field.counted_by.clone(),
+            pointer_quals: field.pointer_quals.clone(),
             offset: field_storage_offset,
             ty: field.ty.clone(),
             bit_offset: Some(field_bit_in_storage),
@@ -1309,8 +1325,11 @@ impl StructLayoutBuilder {
         self.field_layouts.push(StructFieldLayout {
             name: field.name.clone(),
             base_volatile: field.base_volatile,
+            base_const: field.base_const,
             object_volatile: field.object_volatile,
+            object_const: field.object_const,
             counted_by: field.counted_by.clone(),
+            pointer_quals: field.pointer_quals.clone(),
             offset: self.offset,
             ty: field.ty.clone(),
             bit_offset: None,
@@ -1334,6 +1353,7 @@ impl StructLayoutBuilder {
 
         let size = align_up(self.offset, self.max_align);
         StructLayout {
+            is_complete: true,
             fields: self.field_layouts,
             size,
             align: self.max_align,
@@ -1371,6 +1391,7 @@ impl StructLayout {
     /// Used as a fallback when a struct/union layout is not found.
     pub fn empty() -> Self {
         StructLayout {
+            is_complete: false,
             fields: Vec::new(),
             size: 0,
             align: 1,
@@ -1384,6 +1405,7 @@ impl StructLayout {
     /// Create an empty union StructLayout (zero-size, no fields, is_union=true).
     pub fn empty_union() -> Self {
         StructLayout {
+            is_complete: false,
             fields: Vec::new(),
             size: 0,
             align: 1,
@@ -1478,10 +1500,17 @@ pub struct StructFieldLayout {
     /// Volatile base type of the field (element or pointee access). Set from the
     /// declaration, so `s.field` and `p->field` accesses are volatile when it is.
     pub base_volatile: bool,
+    /// Const on the field's base type (element or innermost pointee).
+    pub base_const: bool,
     /// Volatile field object itself (`int *volatile p`).
     pub object_volatile: bool,
+    /// Const on the field object itself, independent of its pointee.
+    pub object_const: bool,
     /// Optional sibling count member from `__attribute__((counted_by(member)))`.
     pub counted_by: Option<String>,
+    /// CVR bits of each pointer level of the field's type (see
+    /// [`StructField::pointer_quals`]).
+    pub pointer_quals: Vec<u8>,
 }
 
 impl StructLayout {
@@ -1631,8 +1660,11 @@ impl StructLayout {
             field_layouts.push(StructFieldLayout {
                 name: field.name.clone(),
                 base_volatile: field.base_volatile,
+                base_const: field.base_const,
                 object_volatile: field.object_volatile,
+                object_const: field.object_const,
                 counted_by: field.counted_by.clone(),
+                pointer_quals: field.pointer_quals.clone(),
                 offset: 0, // All union fields start at offset 0
                 ty: field.ty.clone(),
                 bit_offset: bf_offset,
@@ -1645,6 +1677,7 @@ impl StructLayout {
         let size = align_up(max_size, max_align);
 
         StructLayout {
+            is_complete: true,
             fields: field_layouts,
             size,
             align: max_align,
@@ -2088,6 +2121,65 @@ impl StructLayout {
                 None => continue,
             };
             if let Some(found) = anon_layout.field_volatility(name, ctx) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    /// Look up a field's const qualifiers and type, searching anonymous
+    /// struct/union members recursively (like `field_offset_with_bitfield`).
+    /// Returns `(base_const, object_const, ty)`.
+    pub fn field_constness(
+        &self,
+        name: &str,
+        ctx: &dyn StructLayoutProvider,
+    ) -> Option<(bool, bool, CType)> {
+        if let Some(f) = self.fields.iter().find(|f| f.name == name) {
+            return Some((f.base_const, f.object_const, f.ty.clone()));
+        }
+        for f in &self.fields {
+            if !f.name.is_empty() {
+                continue;
+            }
+            let anon_key = match &f.ty {
+                CType::Struct(key) | CType::Union(key) => key.clone(),
+                _ => continue,
+            };
+            let anon_layout = match ctx.get_struct_layout(&anon_key) {
+                Some(layout) => layout.clone(),
+                None => continue,
+            };
+            if let Some(found) = anon_layout.field_constness(name, ctx) {
+                return Some((found.0, found.1 || f.object_const, found.2));
+            }
+        }
+        None
+    }
+
+    /// Per-level CVR bits of member `name` (see [`StructField::pointer_quals`]),
+    /// searched through anonymous members. `None` when the member is unknown or
+    /// carried no pointer-level qualifier.
+    pub fn field_pointer_quals(
+        &self,
+        name: &str,
+        ctx: &dyn StructLayoutProvider,
+    ) -> Option<Vec<u8>> {
+        if let Some(f) = self.fields.iter().find(|f| f.name == name) {
+            return (!f.pointer_quals.is_empty()).then(|| f.pointer_quals.clone());
+        }
+        for f in &self.fields {
+            if !f.name.is_empty() {
+                continue;
+            }
+            let anon_key = match &f.ty {
+                CType::Struct(key) | CType::Union(key) => key.clone(),
+                _ => continue,
+            };
+            if let Some(found) = ctx
+                .get_struct_layout(&anon_key)
+                .and_then(|layout| layout.field_pointer_quals(name, ctx))
+            {
                 return Some(found);
             }
         }
@@ -4754,8 +4846,11 @@ mod conditional_type_tests {
                 type_align: None,
                 is_packed: false,
                 base_volatile: false,
+                base_const: false,
                 object_volatile: false,
+                object_const: false,
                 counted_by: None,
+                pointer_quals: Vec::new(),
             },
             super::StructField {
                 name: "d".into(),
@@ -4765,8 +4860,11 @@ mod conditional_type_tests {
                 type_align: None,
                 is_packed: true,
                 base_volatile: false,
+                base_const: false,
                 object_volatile: false,
+                object_const: false,
                 counted_by: None,
+                pointer_quals: Vec::new(),
             },
         ];
         let layout = super::StructLayout::for_struct_with_packing(&fields, None, &ctx, false);
@@ -4787,8 +4885,11 @@ mod conditional_type_tests {
             type_align: None,
             is_packed: true,
             base_volatile: false,
+            base_const: false,
             object_volatile: false,
+            object_const: false,
             counted_by: None,
+            pointer_quals: Vec::new(),
         }];
         let l1 = super::StructLayout::for_struct_with_packing(&packed_bf, None, &ctx, false);
         assert_eq!(l1.align, 1);
@@ -4802,8 +4903,11 @@ mod conditional_type_tests {
             type_align: None,
             is_packed: false,
             base_volatile: false,
+            base_const: false,
             object_volatile: false,
+            object_const: false,
             counted_by: None,
+            pointer_quals: Vec::new(),
         }];
         let l2 = super::StructLayout::for_struct_with_packing(&pack2_bf, Some(2), &ctx, false);
         assert_eq!(l2.align, 2);

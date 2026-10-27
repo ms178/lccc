@@ -802,6 +802,15 @@ gate "ivsr-reproducers" fast \
 gate "shuffle-diagnostics" fast \
     env CCC="$LCCC" bash tests/regression/check_shuffle_diagnostics.sh
 
+# GCC 16.2's measured diagnostic-severity contract: the C99-era
+# default-error class (implicit int / implicit declaration / return
+# mismatch / int conversion / incompatible pointer types), the verbatim
+# read-only mutation messages, the dialect and -W flag override
+# behaviour, and GCC's columns -- all oracle-checked against gcc-16 when
+# present (39-entry exit table).
+gate "gcc162-diagnostic-severity" fast \
+    env CCC="$LCCC" GCC="${GCC16:-gcc-16}" bash tests/regression/check_gcc162_diagnostic_severity.sh
+
 # Clang ext_vector_type component access against the Clang 23.1.4 oracle:
 # LCCC's diagnostics for ext_vector_select/errors.c equal Clang's (line,
 # column, message), LCCC accepts exactly the forms Clang accepts and puts the

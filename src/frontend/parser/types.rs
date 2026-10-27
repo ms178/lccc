@@ -1163,6 +1163,8 @@ impl Parser {
         // The members' `volatile` qualifiers must not outlive the body:
         // `struct S { volatile int a; } s;` leaves `s` non-volatile.
         let outer_volatile = self.attrs.parsing_volatile();
+        let outer_const = self.attrs.parsing_const();
+        let outer_pointer_const = self.attrs.parsing_pointer_const();
         let outer_counted_by = self.attrs.parsing_counted_by.take();
         self.expect_context(&TokenKind::LBrace, "for struct/union body");
         while !matches!(self.peek(), TokenKind::RBrace | TokenKind::Eof) {
@@ -1188,6 +1190,8 @@ impl Parser {
             // Likewise `volatile`: a previous member's qualifier must not
             // make this member volatile (`volatile int a; int b;`).
             self.attrs.set_volatile(false);
+            self.attrs.set_const(false);
+            self.attrs.set_pointer_const(false);
             if matches!(self.peek(), TokenKind::Semicolon) {
                 self.advance();
                 continue;
@@ -1213,10 +1217,25 @@ impl Parser {
             }
             if let Some(type_spec) = self.parse_type_specifier() {
                 if matches!(self.peek(), TokenKind::Semicolon) {
+                    // A tag reference without a declarator is not an anonymous
+                    // member (C11 6.7.2.1p13). Treating `struct S;` inside S
+                    // as a member constructs a cyclic layout and makes member
+                    // lookup recurse forever. The tag reference has no body
+                    // to register; retain the warning, not a synthetic field.
+                    if matches!(
+                        &type_spec,
+                        TypeSpecifier::Struct(Some(_), None, ..)
+                            | TypeSpecifier::Union(Some(_), None, ..)
+                    ) {
+                        self.diagnostics
+                            .warning("declaration does not declare anything", self.peek_span());
+                        continue;
+                    }
                     // Anonymous field (e.g., anonymous struct/union)
                     let alignment = self.attrs.parsed_alignas.take();
                     let alignas_type = self.attrs.parsed_alignas_type.take();
                     fields.push(StructFieldDecl {
+                        span: self.peek_span(),
                         type_spec,
                         name: None,
                         bit_width: None,
@@ -1225,7 +1244,9 @@ impl Parser {
                         alignas_type,
                         is_packed: pre_spec_packed,
                         base_volatile: false,
+                        base_const: self.attrs.parsing_const(),
                         object_volatile: false,
+                        object_const: self.attrs.parsing_const(),
                         counted_by: None,
                     });
                 } else {
@@ -1245,6 +1266,8 @@ impl Parser {
         }
         self.expect_closing(&TokenKind::RBrace, open);
         self.attrs.set_volatile(outer_volatile);
+        self.attrs.set_const(outer_const);
+        self.attrs.set_pointer_const(outer_pointer_const);
         self.attrs.parsing_counted_by = outer_counted_by;
         fields
     }
@@ -1276,7 +1299,7 @@ impl Parser {
         ) || derived.iter().any(|d| {
             matches!(
                 d,
-                DerivedDeclarator::Pointer(_)
+                DerivedDeclarator::Pointer(..)
                     | DerivedDeclarator::Function(..)
                     | DerivedDeclarator::FunctionPointer(..)
             )
@@ -1305,6 +1328,7 @@ impl Parser {
         fields: &mut Vec<StructFieldDecl>,
         pre_spec_packed: bool,
     ) {
+        let field_spec_const = self.attrs.parsing_const();
         // Capture _Alignas value that was parsed during type specifier parsing
         let mut alignas_from_type = self.attrs.parsed_alignas.take();
         let mut packed_from_type = pre_spec_packed;
@@ -1354,6 +1378,7 @@ impl Parser {
                     colon_span,
                 );
                 fields.push(StructFieldDecl {
+                    span: colon_span,
                     type_spec: type_spec.clone(),
                     name: None,
                     bit_width,
@@ -1362,7 +1387,9 @@ impl Parser {
                     alignas_type: alignas_type.clone(),
                     is_packed: packed_from_type || extra_packed,
                     base_volatile: false,
+                    base_const: false,
                     object_volatile: false,
+                    object_const: false,
                     counted_by: None,
                 });
                 if !self.consume_if(&TokenKind::Comma) {
@@ -1384,6 +1411,15 @@ impl Parser {
             // The declarator's volatile qualifiers (see `declarator_base_volatile`).
             let decl_base_volatile = self.attrs.declarator_base_volatile;
             let decl_object_volatile = self.attrs.declarator_object_volatile;
+            let field_base_const = field_spec_const;
+            let field_object_const = if derived
+                .iter()
+                .any(|d| matches!(d, DerivedDeclarator::Pointer(..)))
+            {
+                self.attrs.parsing_pointer_const()
+            } else {
+                field_spec_const
+            };
             let declarator_object_space = std::mem::replace(
                 &mut self.attrs.declarator_object_space,
                 AddressSpace::Default,
@@ -1434,6 +1470,7 @@ impl Parser {
             }
 
             fields.push(StructFieldDecl {
+                span: declarator_span,
                 type_spec: field_type,
                 name,
                 bit_width,
@@ -1442,7 +1479,9 @@ impl Parser {
                 alignas_type: alignas_type.clone(),
                 is_packed,
                 base_volatile: decl_base_volatile,
+                base_const: field_base_const,
                 object_volatile: decl_object_volatile,
+                object_const: field_object_const,
                 counted_by,
             });
 
@@ -1536,7 +1575,15 @@ impl Parser {
             )
         });
 
-        if has_function {
+        // A star's own CVR run has no representation in `TypeSpecifier::Pointer`
+        // (which carries only the space), so folding would silently drop a
+        // middle level's `const` (`int *const *p`) and accept `*p = 0`.
+        // Keep the declarator list, which carries it, for the general builder.
+        let has_star_qualifiers = derived
+            .iter()
+            .any(|d| matches!(d, DerivedDeclarator::Pointer(_, cvr) if *cvr != 0));
+
+        if has_function || has_star_qualifiers {
             return (base.clone(), derived.to_vec());
         }
 
@@ -1558,7 +1605,7 @@ impl Parser {
         let mut i = 0;
         while i < derived.len() {
             match &derived[i] {
-                DerivedDeclarator::Pointer(space) => {
+                DerivedDeclarator::Pointer(space, _) => {
                     result = TypeSpecifier::Pointer(Box::new(result), pending_space);
                     pending_space = *space;
                     i += 1;
@@ -1786,6 +1833,20 @@ impl Parser {
     /// path including failure and caller-side backtracking (the restore
     /// happens before this function returns, so the caller rewinding
     /// `self.pos` cannot resurrect a clobbered slot).
+    /// `parse_nested_type_name`, also returning the per-pointer-level CVR bits
+    /// of the type name's abstract declarator (index `L-1` is pointer level
+    /// `L`). Callers that only need the type drop them.
+    pub(super) fn parse_nested_type_name_with_quals(&mut self) -> Option<(TypeSpecifier, Vec<u8>)> {
+        let enclosing_address_space = self.attrs.parsing_address_space;
+        self.attrs.parsing_address_space = AddressSpace::Default;
+        let result = self.parse_type_specifier().map(|base| {
+            let (ty, quals) = self.parse_abstract_declarator_suffix_quals(base);
+            (ty, quals)
+        });
+        self.attrs.parsing_address_space = enclosing_address_space;
+        result
+    }
+
     pub(super) fn parse_nested_type_name(&mut self) -> Option<TypeSpecifier> {
         let enclosing_address_space = self.attrs.parsing_address_space;
         self.attrs.parsing_address_space = AddressSpace::Default;
@@ -1813,6 +1874,25 @@ impl Parser {
     /// there. Entering with a qualifier set before this suffix's own base
     /// type (e.g. the cast `(__seg_fs unsigned long *)`) is legitimate —
     /// the leading `skip_cv_qualifiers`/`*` arms below capture it.
+    /// `parse_abstract_declarator_suffix`, also collecting each pointer star's
+    /// CVR bits in CType creation order (index `L-1` is pointer level `L`).
+    pub(super) fn parse_abstract_declarator_suffix_quals(
+        &mut self,
+        result_type: TypeSpecifier,
+    ) -> (TypeSpecifier, Vec<u8>) {
+        self.skip_cv_qualifiers();
+        let base_space = std::mem::take(&mut self.attrs.parsing_address_space);
+        let mut ptr_budget = 0u32;
+        let level = self.parse_abstract_declarator_level(&mut ptr_budget);
+        if level.is_empty() {
+            self.attrs.parsing_address_space = base_space;
+            return (result_type, Vec::new());
+        }
+        let mut quals = Vec::new();
+        let ty = level.apply_to(result_type, base_space, Some(&mut quals));
+        (ty, quals)
+    }
+
     pub(super) fn parse_abstract_declarator_suffix(
         &mut self,
         result_type: TypeSpecifier,

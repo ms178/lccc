@@ -199,7 +199,7 @@ mod tests {
     }
 
     fn ptr() -> DerivedDeclarator {
-        DerivedDeclarator::Pointer(AddressSpace::Default)
+        DerivedDeclarator::Pointer(AddressSpace::Default, 0)
     }
 
     fn func() -> DerivedDeclarator {

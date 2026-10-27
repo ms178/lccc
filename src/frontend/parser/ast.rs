@@ -377,6 +377,10 @@ impl std::fmt::Debug for FunctionAttributes {
 #[derive(Debug, Clone)]
 pub struct FunctionDef {
     pub return_type: TypeSpecifier,
+    /// `const` bits of the RETURN type's pointer levels (bit `L-1` is pointer
+    /// level `L`). `CType` erases qualifiers, so `int *const *f(void)` would
+    /// otherwise look like `int **f(void)` and `*f() = 0` be accepted.
+    pub return_pointer_const_levels: u32,
     pub name: String,
     pub params: Vec<ParamDecl>,
     pub variadic: bool,
@@ -450,6 +454,19 @@ pub struct ParamDecl {
     /// pointer. This distinguishes `int (**fpp)(int)` from `void *(*fp)(size_t)` which
     /// otherwise have identical CType representations.
     pub fptr_inner_ptr_depth: u32,
+    /// Pointer stars in the parameter's declarator (`int *p` has 1). Distinguishes
+    /// top-level `const` on the parameter itself (`int *const p`: stars > 0 and
+    /// `pointer_const`) from `const` on the pointee (`const int *p`: `is_const`).
+    pub pointer_depth: u32,
+    /// True for `T *const p`: the pointer parameter object itself is read-only
+    /// (the `const` on the star closest to the name).
+    pub pointer_const: bool,
+    /// CVR bits of each pointer level, indexed by level (`[0]` is the level
+    /// closest to the base type, `[len-1]` the parameter object's own level).
+    /// `pointer_const` is the object's bit; this vector carries the *middle*
+    /// levels too, whose `const` `CType` erases (`int *const *p`: `[0]` has
+    /// [`CVR_CONST`], so `*p` is read-only).
+    pub pointer_quals: Vec<u8>,
 }
 
 /// Bit masks for boolean flags in `Declaration::flags`.
@@ -748,6 +765,8 @@ impl std::fmt::Debug for Declaration {
 /// `cleanup_fn`) remain as `Option<String>`.
 #[derive(Clone, Default)]
 pub struct DeclAttributes {
+    /// Const on this declarator's outermost star, captured before its initializer.
+    pub pointer_const: bool,
     /// Packed boolean flags — see `decl_attr_flag` constants.
     flags: u16,
     /// Named address space written after the declarator's last `*`
@@ -1032,15 +1051,83 @@ pub struct InitDeclarator {
     pub span: Span,
 }
 
+/// CVR qualifier bits carried by a pointer star (`DerivedDeclarator::Pointer`).
+/// The layout matches the abstract-declarator path (`AbstractDeclaratorLevel`),
+/// where `apply_to` pushes the same encoding per pointer level.
+pub const CVR_CONST: u8 = 1 << 0;
+pub const CVR_VOLATILE: u8 = 1 << 1;
+pub const CVR_RESTRICT: u8 = 1 << 2;
+
+/// `true` when the `const` bit is set in a CVR mask.
+pub fn cvr_is_const(cvr: u8) -> bool {
+    cvr & CVR_CONST != 0
+}
+
+/// `const` bits of a function's RETURN type pointer levels, read from the
+/// declarator that produced that return type (bit `L-1` is pointer level `L`,
+/// level 1 closest to the base type).
+///
+/// The return type's levels are the pointer declarators BEFORE the function
+/// core, in creation order; `CType` erases their qualifiers, so
+/// `int *const *f(void)` would otherwise be indistinguishable from
+/// `int **f(void)` and `*f() = 0` would be accepted. Declarators that wrap the
+/// function in a function pointer (`int (*f(void))(void)`) reorder those
+/// layers, so they report no bits rather than a wrong level.
+pub fn return_pointer_const_levels(
+    return_type: &TypeSpecifier,
+    derived: &[DerivedDeclarator],
+) -> u32 {
+    if derived
+        .iter()
+        .any(|d| matches!(d, DerivedDeclarator::FunctionPointer(..)))
+    {
+        return 0;
+    }
+    fn spec_depth(spec: &TypeSpecifier) -> usize {
+        match spec {
+            TypeSpecifier::Pointer(inner, _) => 1 + spec_depth(inner),
+            _ => 0,
+        }
+    }
+    let depth = spec_depth(return_type);
+    let mut mask = 0u32;
+    let mut level = 0usize;
+    for d in derived {
+        match d {
+            DerivedDeclarator::Pointer(_, cvr) => {
+                if level >= depth {
+                    break;
+                }
+                if level < 32 && cvr_is_const(*cvr) {
+                    mask |= 1 << level;
+                }
+                level += 1;
+            }
+            DerivedDeclarator::Array(_) => {}
+            _ => break,
+        }
+    }
+    mask
+}
+
 /// Derived parts of a declarator (pointers, arrays, function params).
 #[derive(Debug, Clone)]
 pub enum DerivedDeclarator {
-    /// A `*`. The address space is the qualifier written immediately after this
-    /// `*` (`long *__seg_gs *p`: the first star carries `__seg_gs`). It qualifies
-    /// the storage of the pointer that the NEXT pointer level points to, so
-    /// `p` points at a segment pointer. The last star's space is the declared
-    /// object's own space and is carried separately (`DeclAttributes::object_space`).
-    Pointer(AddressSpace),
+    /// A `*`, with the qualifiers written immediately after it: the address
+    /// space (`long *__seg_gs *p`: the first star carries `__seg_gs`) and the
+    /// CVR bits ([`CVR_CONST`], [`CVR_VOLATILE`], [`CVR_RESTRICT`]).
+    ///
+    /// The space qualifies the storage of the pointer that the NEXT pointer
+    /// level points to, so `p` points at a segment pointer. The last star's
+    /// space is the declared object's own space and is carried separately
+    /// (`DeclAttributes::object_space`).
+    ///
+    /// The CVR bits are the star's own qualifiers. They are not the CType:
+    /// `CType::Pointer` erases qualifiers, and a middle level's `const`
+    /// (`int *const *p`) is exactly what decides whether `*p = 0` is legal.
+    /// Type construction records each star's bits in the same order it wraps
+    /// pointer levels, so the collected vector is indexed by level.
+    Pointer(AddressSpace, u8),
     Array(Option<Box<Expr>>),
     Function(Vec<ParamDecl>, bool, bool), // params, variadic, has_prototype
     /// Function pointer: (*name)(params) - distinguishes from pointer-to-return-type
@@ -1096,7 +1183,7 @@ impl DerivedDeclarator {
         };
         slice
             .iter()
-            .filter(|d| matches!(d, DerivedDeclarator::Pointer(_)))
+            .filter(|d| matches!(d, DerivedDeclarator::Pointer(..)))
             .count()
     }
 }
@@ -1123,6 +1210,9 @@ mod declarator_law_tests {
             vla_size_exprs: Vec::new(),
             decayed_array: false,
             fptr_inner_ptr_depth: 0,
+            pointer_depth: 0,
+            pointer_const: false,
+            pointer_quals: Vec::new(),
         }
     }
 
@@ -1149,7 +1239,7 @@ mod declarator_law_tests {
             // int *f(int) — pointer return.
             (
                 vec![
-                    Pointer(crate::common::types::AddressSpace::Default),
+                    Pointer(crate::common::types::AddressSpace::Default, 0),
                     func(1),
                 ],
                 true,
@@ -1158,8 +1248,8 @@ mod declarator_law_tests {
             // int **f(int) — two indirections.
             (
                 vec![
-                    Pointer(crate::common::types::AddressSpace::Default),
-                    Pointer(crate::common::types::AddressSpace::Default),
+                    Pointer(crate::common::types::AddressSpace::Default, 0),
+                    Pointer(crate::common::types::AddressSpace::Default, 0),
                     func(1),
                 ],
                 true,
@@ -1169,7 +1259,7 @@ mod declarator_law_tests {
             // (SQLite's sqlite3OsDlSym shape): the prefix has ONE Pointer.
             (
                 vec![
-                    Pointer(crate::common::types::AddressSpace::Default),
+                    Pointer(crate::common::types::AddressSpace::Default, 0),
                     fnp(0),
                     func(1),
                 ],
@@ -1182,9 +1272,9 @@ mod declarator_law_tests {
             // leading-run count undercounts (1 instead of 2).
             (
                 vec![
-                    Pointer(crate::common::types::AddressSpace::Default),
+                    Pointer(crate::common::types::AddressSpace::Default, 0),
                     fnp(0),
-                    Pointer(crate::common::types::AddressSpace::Default),
+                    Pointer(crate::common::types::AddressSpace::Default, 0),
                     fnp(1),
                     func(1),
                 ],
@@ -1194,7 +1284,10 @@ mod declarator_law_tests {
             // int (*fp)(int) — function-pointer OBJECT: not a function,
             // whole-list depth 1 (the typedef return is depth-1 = 0: int).
             (
-                vec![Pointer(crate::common::types::AddressSpace::Default), fnp(1)],
+                vec![
+                    Pointer(crate::common::types::AddressSpace::Default, 0),
+                    fnp(1),
+                ],
                 false,
                 1,
             ),
@@ -1202,8 +1295,8 @@ mod declarator_law_tests {
             // typedef return depth 1.
             (
                 vec![
-                    Pointer(crate::common::types::AddressSpace::Default),
-                    Pointer(crate::common::types::AddressSpace::Default),
+                    Pointer(crate::common::types::AddressSpace::Default, 0),
+                    Pointer(crate::common::types::AddressSpace::Default, 0),
                     fnp(1),
                 ],
                 false,
@@ -1213,7 +1306,7 @@ mod declarator_law_tests {
             (vec![Array(None), fnp(1)], false, 0),
             // Plain pointer object.
             (
-                vec![Pointer(crate::common::types::AddressSpace::Default)],
+                vec![Pointer(crate::common::types::AddressSpace::Default, 0)],
                 false,
                 1,
             ),
@@ -1360,6 +1453,7 @@ pub enum TypeSpecifier {
 /// A field declaration in a struct/union.
 #[derive(Debug, Clone)]
 pub struct StructFieldDecl {
+    pub span: Span,
     pub type_spec: TypeSpecifier,
     pub name: Option<String>,
     pub bit_width: Option<Box<Expr>>,
@@ -1379,9 +1473,13 @@ pub struct StructFieldDecl {
     /// `volatile` on the field's base type (`volatile u32 ctrl`, `volatile int a[4]`):
     /// the element or pointee access is volatile. Mirrors `DeclAttributes::base_volatile`.
     pub base_volatile: bool,
+    /// Const on the field's base type (element or innermost pointee).
+    pub base_const: bool,
     /// `volatile` on the field object itself (`int *volatile p`). Mirrors
     /// `DeclAttributes::object_volatile`.
     pub object_volatile: bool,
+    /// Const on the field object itself, independent of its pointee.
+    pub object_const: bool,
     /// GCC 15/16 `__attribute__((counted_by(member)))` / `[[gnu::counted_by(member)]]`:
     /// names the sibling integer field storing this flexible array's element count.
     pub counted_by: Option<String>,
@@ -1589,6 +1687,11 @@ pub struct CompoundLiteralStorage {
     pub is_register: bool,
     pub is_thread_local: bool,
     pub is_const: bool,
+    /// `const` bits of the literal's pointer levels (bit `L-1` is pointer level
+    /// `L`), the same encoding as [`CastQualifiers::pointer_const_levels`].
+    /// A compound literal is an lvalue, so `*((int *const *){0}) = 0` modifies
+    /// a read-only object even though `CType` cannot say so.
+    pub pointer_const_levels: u32,
 }
 
 /// Qualifiers of a cast's type name, read from its tokens by the parser.
@@ -1603,6 +1706,11 @@ pub struct CastQualifiers {
     /// The type is a single-level pointer whose pointee is `volatile`
     /// (`(volatile u32 *)addr`, the MMIO idiom): `*cast` is a volatile access.
     pub pointee_volatile: bool,
+    /// `const` bits of the type name's pointer levels: bit `L-1` is set when
+    /// pointer level `L` (level 1 closest to the base type) is `const`.
+    /// `CType` erases qualifiers, so `*(int *const *)p = 0` can only be
+    /// diagnosed if the cast itself keeps the middle level's `const`.
+    pub pointer_const_levels: u32,
 }
 
 /// Expressions.
@@ -1915,7 +2023,7 @@ impl DerivedDeclarator {
     /// bound, or the expressions of its parameter types.
     pub fn for_each_expr<'a>(&'a self, f: &mut dyn FnMut(&'a Expr)) {
         match self {
-            DerivedDeclarator::Pointer(_) | DerivedDeclarator::Array(None) => {}
+            DerivedDeclarator::Pointer(..) | DerivedDeclarator::Array(None) => {}
             DerivedDeclarator::Array(Some(bound)) => f(bound),
             DerivedDeclarator::Function(params, _, _)
             | DerivedDeclarator::FunctionPointer(params, _, _) => {

@@ -1926,6 +1926,8 @@ impl Driver {
                 // unknown options, LCCC_STRICT_OPTIONS) are NOT user-code
                 // warnings and stay audible.
                 "-w" => self.warning_config.set_inhibit_all(),
+                "-fpermissive" => self.warning_config.set_permissive(true),
+                "-fno-permissive" => self.warning_config.set_permissive(false),
 
                 arg if arg.starts_with("-W") => {
                     let flag = &arg[2..];

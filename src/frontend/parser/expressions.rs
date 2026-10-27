@@ -425,13 +425,46 @@ impl Parser {
             let save_ext_vector = self.attrs.parsing_ext_vector_nelem.take();
             self.advance();
             if self.is_type_specifier() {
-                let qualifiers = self.type_name_qualifiers();
-                let (cl_storage, any_sc, invalid_sc) = self.scan_compound_literal_storage();
-                if let Some(mut result_type) = self.parse_nested_type_name() {
+                let mut qualifiers = self.type_name_qualifiers();
+                let (mut cl_storage, any_sc, invalid_sc) = self.scan_compound_literal_storage();
+                if let Some((mut result_type, pointer_quals)) =
+                    self.parse_nested_type_name_with_quals()
+                {
                     // If __attribute__((vector_size(N))) was parsed, wrap the type
                     result_type = self.apply_pending_vector_attr(result_type);
+                    // A cast type name keeps each star's own qualifier, so
+                    // `*(int *const *)p = 0` is a modification of a read-only
+                    // object (`CType` alone cannot carry that). A compound
+                    // literal of the same type name is an lvalue and needs the
+                    // same record (`*((int *const *){0}) = 0`).
+                    let levels_mask =
+                        pointer_quals
+                            .iter()
+                            .enumerate()
+                            .fold(0u32, |mask, (level, cvr)| {
+                                if level < 32 && cvr & crate::frontend::parser::ast::CVR_CONST != 0
+                                {
+                                    mask | (1 << level)
+                                } else {
+                                    mask
+                                }
+                            });
+                    cl_storage.pointer_const_levels = levels_mask;
+                    qualifiers.pointer_const_levels = levels_mask;
                     if matches!(self.peek(), TokenKind::RParen) {
                         let span = self.peek_span();
+                        // The cast expression's span covers the whole
+                        // `(type)expr` form, starting at the `(`: storing only
+                        // the closing paren put GCC-style diagnostics on the
+                        // `)` instead of the expression start (measured
+                        // against gcc-16.2.0 columns for
+                        // `g((double*)0)` and `return (char*)0`).
+                        let lparen_span = self.tokens[save].span;
+                        let cast_span = crate::common::source::Span::new(
+                            lparen_span.start,
+                            span.end,
+                            span.file_id,
+                        );
                         self.advance();
                         // Check for compound literal: (type){...}
                         if matches!(self.peek(), TokenKind::LBrace) {
@@ -458,7 +491,7 @@ impl Parser {
                         self.attrs.parsing_vector_size = save_vector_size;
                         self.attrs.parsing_ext_vector_nelem = save_ext_vector;
                         let expr = self.parse_cast_expr();
-                        return Expr::Cast(result_type, Box::new(expr), span, qualifiers);
+                        return Expr::Cast(result_type, Box::new(expr), cast_span, qualifiers);
                     }
                 }
             }
