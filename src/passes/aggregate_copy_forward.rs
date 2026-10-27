@@ -781,7 +781,14 @@ fn forward_store_only_temporaries(
                 };
                 let allowed = match inst {
                     Instruction::GetElementPtr { base, .. } => base.0 == value,
-                    Instruction::Store { ptr, ty, .. } => ptr.0 == value && within_copy(value, *ty),
+                    Instruction::Store { ptr, val, ty, .. } => {
+                        // Even `store root, root` escapes the address through
+                        // the eventual copy. Redirecting only the write would
+                        // leave a self-pointer naming the unconstructed alloca.
+                        ptr.0 == value
+                            && !matches!(val, Operand::Value(v) if paths.get(&v.0).is_some_and(|p| p.0 == *root))
+                            && within_copy(value, *ty)
+                    }
                     Instruction::Copy {
                         src: Operand::Value(v),
                         ..
@@ -1660,6 +1667,36 @@ mod tests {
             src: Operand::Value(Value(9)),
         });
         assert!(pointer_paths(&func).is_empty());
+    }
+
+    #[test]
+    fn self_pointer_construction_is_not_a_store_only_temporary() {
+        let mut func = IrFunction::new("self_pointer".into(), IrType::I32, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            source_spans: vec![],
+            instructions: vec![
+                Instruction::GlobalAddr {
+                    dest: Value(1),
+                    name: "out".into(),
+                },
+                alloca(0, 16),
+                Instruction::Store {
+                    volatile: false,
+                    ptr: Value(0),
+                    val: Operand::Value(Value(0)),
+                    ty: IrType::Ptr,
+                    seg_override: AddressSpace::Default,
+                },
+                Instruction::Memcpy {
+                    dest: Value(1),
+                    src: Value(0),
+                    size: 16,
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+        });
+        assert_eq!(forward_store_only_temporaries(&mut func, None), 0);
     }
 
     #[test]
