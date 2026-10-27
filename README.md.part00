@@ -1,0 +1,12 @@
+# harness-cache-7
+
+GitHub-only toolchain cache for network-constrained agents.
+
+```
+git fetch origin tag harness-cache-7
+python3 scripts/restore_agent_toolchain_cache.py --tag harness-cache-7 --prefix /path/to/toolchains
+. /path/to/toolchains/env.sh
+```
+
+Every file is split into <90 MiB parts and verified against MANIFEST.sha256.
+CACHE.json records the tool versions, roots, sizes and digests.
