@@ -755,6 +755,8 @@ impl std::fmt::Debug for Declaration {
 /// `cleanup_fn`) remain as `Option<String>`.
 #[derive(Clone, Default)]
 pub struct DeclAttributes {
+    /// Const on this declarator's outermost star, captured before its initializer.
+    pub pointer_const: bool,
     /// Packed boolean flags — see `decl_attr_flag` constants.
     flags: u16,
     /// Named address space written after the declarator's last `*`

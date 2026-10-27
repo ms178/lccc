@@ -1125,7 +1125,7 @@
     "frontend-b": {
       "group": "frontend",
       "mode": "steps",
-      "predicted_gate_seconds": 627.75,
+      "predicted_gate_seconds": 628.42,
       "shards": 3,
       "steps": [
         {
@@ -1285,7 +1285,7 @@
           "name": "Check 16-byte atomic load/store/RMW semantics (full 128 bits, vs GCC oracle)"
         },
         {
-          "measured_s": 1.0,
+          "measured_s": 1.67,
           "name": "GCC 16.2 diagnostic severity parity"
         }
       ]
@@ -1491,10 +1491,6 @@
         {
           "measured_s": 0.25,
           "name": "Surface vector-extension codegen failures in annotations"
-        },
-        {
-          "measured_s": 1.67,
-          "name": "GCC 16.2 diagnostic severity parity"
         }
       ]
     }

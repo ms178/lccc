@@ -365,19 +365,15 @@ impl WarningConfig {
         }
     }
 
-    /// GCC 16.2's measured gnu90 posture for the C99-era warnings:
-    /// `-std=gnu90` is silent for implicit int, implicit function
-    /// declarations, and return mismatch even under `-Werror`; an
-    /// explicit `-Wimplicit-int` / `-Wimplicit-function-declaration`
-    /// still warns, but `-Wreturn-mismatch` stays silent even when
-    /// named, and `-Wint-conversion` warns regardless. `-Wall -std=gnu90`
-    /// keeps implicit declarations warned (measured). Called from the
-    /// pipeline for pre-C99 dialects only.
+    /// Pre-C99 enablement differs from severity: implicit int/declarations
+    /// need an explicit request (or -Wall for declarations). Bare returns
+    /// need -Wreturn-type, but returning a value from void stays default-on.
+    /// An explicit -fno-permissive promotes only live constraint diagnostics.
     pub fn suppress_gcc162_pre_c99_defaults(&mut self) {
         self.legacy_implicit_return_type =
             self.wall_requested || self.explicit_enable.contains(&WarningKind::ReturnType);
-        // Unconditionally off pre-C99 (silent even with an explicit
-        // -Werror=return-mismatch; measured).
+        // Naming -Wreturn-mismatch alone does not enable bare returns in
+        // pre-C99 modes; -Wreturn-type owns this subcase's enablement.
         self.bare_return_enabled =
             self.legacy_implicit_return_type && self.enabled.contains(&WarningKind::ReturnType);
         if !self.explicit_enable.contains(&WarningKind::ImplicitInt) {

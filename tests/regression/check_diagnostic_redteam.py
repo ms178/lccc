@@ -13,6 +13,11 @@ import tempfile
 
 # name, source, hard read-only error, warning class (None for legal controls).
 CASES = [
+    ('const_first_sibling', 'void f(void){int *const p=0,*q=0;p=0;(void)q;}', True, None),
+    ('mutable_first_sibling', 'void f(void){int *p=0,*const q=0;p=0;(void)q;}', False, None),
+    ('const_cast_initializer', 'void f(void){int *const p=(int*)0;p=0;}', True, None),
+    ('const_reversed_subscript', 'void f(const int *p){0[p]=1;}', True, None),
+    ('mutable_reversed_subscript', 'void f(int *p){0[p]=1;}', False, None),
     ('const_depth2', 'void f(const int **p){**p=1;}', True, None),
     ('const_depth3', 'void f(const int ***p){***p=1;}', True, None),
     ('const_array_deref', 'void f(void){const int a[1]={0};*a=1;}', True, None),

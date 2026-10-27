@@ -1408,7 +1408,7 @@ impl SemanticAnalyzer {
                     .iter()
                     .any(|d| matches!(d, DerivedDeclarator::Pointer(_)));
                 let top_const = if has_star {
-                    decl.is_pointer_const()
+                    init_decl.attrs.pointer_const
                 } else {
                     decl.is_const()
                 };
@@ -2423,8 +2423,8 @@ impl SemanticAnalyzer {
                 }
             }
             Stmt::Return(None, span) => {
-                // GCC treats a bare `return;` in a non-void function as a
-                // WARNING (the return value is indeterminate), not an error
+                // The bare-return subcase has dialect-dependent severity
+                // and pre-C99 enablement, distinct from returning a value
                 // — gcc.c-torture/execute/920415-1.c relies on this in gnu89
                 // code. The lowered function returns an undefined value.
                 if self
@@ -6690,9 +6690,13 @@ impl SemanticAnalyzer {
                     derefs += 1;
                     root = inner;
                 }
-                Expr::ArraySubscript(base, _, _) => {
+                Expr::ArraySubscript(base, index, _) => {
                     derefs += 1;
-                    root = base;
+                    root = if tc.infer_expr_ctype(base).is_some_and(|ty| ty.is_integer()) {
+                        index
+                    } else {
+                        base
+                    };
                 }
                 _ => break,
             }
@@ -6750,7 +6754,12 @@ impl SemanticAnalyzer {
         match target {
             Expr::Identifier(name, _) => self.symbol_table.is_top_const(name),
             Expr::Deref(inner, _) => self.pointee_readonly(inner),
-            Expr::ArraySubscript(base, _, _) => {
+            Expr::ArraySubscript(base, index, _) => {
+                let base = if tc.infer_expr_ctype(base).is_some_and(|ty| ty.is_integer()) {
+                    index
+                } else {
+                    base
+                };
                 if matches!(tc.infer_expr_ctype(base), Some(CType::Array(..))) {
                     self.lvalue_readonly(base)
                 } else {
