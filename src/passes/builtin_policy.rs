@@ -146,6 +146,16 @@ impl SymbolInventory {
         inv
     }
 
+    /// A fortified definition relaxes only the body restriction, never an
+    /// independent alias/asm restriction. Keep these reasons separate: a name
+    /// can have a visible body AND be opaque through another symbol relation.
+    fn permits_fortified_definition(&self, name: &str, asm: &[String]) -> bool {
+        crate::common::pass_policy::is_fortified_stdio_builtin(name)
+            && self.bodies.contains(name)
+            && !self.opaque.contains(name)
+            && !crate::common::asm_scan::any_blob_mentions(asm, name)
+    }
+
     /// Does the TU answer calls to `name` itself (or send them elsewhere)?
     /// `asm` is the module's top-level assembly.
     pub(crate) fn blocks_library_assumption(&self, name: &str, asm: &[String]) -> bool {
@@ -210,9 +220,8 @@ pub(crate) fn apply(module: &mut IrModule, cli: &BuiltinFlags) {
             // distinguish that from plain printf.  Do not bypass aliases,
             // asm opacity, or a command-line withdrawal, and never extend
             // this exception to an ordinary library name.
-            let defined_fortified_stdio = blocks
-                && inventory.bodies.contains(callee)
-                && crate::common::pass_policy::is_fortified_stdio_builtin(callee);
+            let defined_fortified_stdio =
+                blocks && inventory.permits_fortified_definition(callee, asm);
             info.assume_library = cli.may_assume(callee) && (!blocks || defined_fortified_stdio);
         }
     }
@@ -650,6 +659,45 @@ mod tests {
                 apply(&mut m, &cli);
                 assert_eq!(assumed(&m, "main"), pairs(&[(name, false)]));
             }
+        }
+    }
+
+    #[test]
+    fn fortified_bodies_do_not_override_independent_opacity() {
+        for name in [
+            "__printf_chk",
+            "__vprintf_chk",
+            "__fprintf_chk",
+            "__vfprintf_chk",
+        ] {
+            // Test both ends of an alias and both C/assembler-name spellings.
+            // A body must not turn an independently blocked call into libc.
+            for kind in 0..5 {
+                let mut m = module(vec![func(name, true, &[]), func("main", true, &[name])]);
+                match kind {
+                    0 => m.aliases.push(("alias".into(), name.into(), false)),
+                    1 => m.aliases.push((name.into(), "impl".into(), false)),
+                    2 => m.toplevel_asm.push(format!(".weakref alias, {name}")),
+                    3 => {
+                        m.asm_labels.insert(name.into(), "impl".into());
+                    }
+                    4 => {
+                        m.functions.push(func("other", true, &[]));
+                        m.asm_labels.insert("other".into(), name.into());
+                    }
+                    _ => unreachable!(),
+                }
+                apply(&mut m, &BuiltinFlags::default());
+                assert_eq!(
+                    assumed(&m, "main"),
+                    pairs(&[(name, false)]),
+                    "{name}: {kind}"
+                );
+            }
+            let mut m = module(vec![func(name, true, &[]), func("main", true, &[name])]);
+            m.toplevel_asm.push(format!("call {name}_unrelated"));
+            apply(&mut m, &BuiltinFlags::default());
+            assert_eq!(assumed(&m, "main"), pairs(&[(name, true)]));
         }
     }
 
