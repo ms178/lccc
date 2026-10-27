@@ -78,7 +78,7 @@ def select_linker(arch, explicit=None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--lccc-dir", type=Path, default=ROOT / "target/fastbuild")
-    parser.add_argument("--clang", default="clang-23")
+    parser.add_argument("--clang", default=os.environ.get("CLANG", "clang-23"))
     parser.add_argument("--ld", help="optional GNU/LLD linker supporting both target emulations")
     parser.add_argument("--qemu-dir", type=Path, default=Path("/usr/bin"))
     args = parser.parse_args()

@@ -3,10 +3,26 @@
 import unittest
 from unittest.mock import patch
 
-from check_switch_cross_execute import select_linker
+from check_switch_cross_execute import main, select_linker
 
 
 class LinkerDiscoveryTests(unittest.TestCase):
+    @patch('check_switch_cross_execute.subprocess.check_output', side_effect=RuntimeError('probe'))
+    @patch('sys.argv', ['check_switch_cross_execute.py'])
+    @patch.dict('os.environ', {'CLANG': '/cached/clang-23.1.4'}, clear=True)
+    def test_honors_provisioned_clang_environment(self, output):
+        with self.assertRaisesRegex(RuntimeError, 'probe'):
+            main()
+        output.assert_called_once_with(['/cached/clang-23.1.4', '-dumpversion'], text=True)
+
+    @patch('check_switch_cross_execute.subprocess.check_output', side_effect=RuntimeError('probe'))
+    @patch('sys.argv', ['check_switch_cross_execute.py', '--clang', '/explicit/clang'])
+    @patch.dict('os.environ', {'CLANG': '/cached/clang-23.1.4'}, clear=True)
+    def test_explicit_clang_overrides_environment(self, output):
+        with self.assertRaisesRegex(RuntimeError, 'probe'):
+            main()
+        output.assert_called_once_with(['/explicit/clang', '-dumpversion'], text=True)
+
     def test_explicit_gnu(self):
         self.assertEqual(select_linker('aarch64', '/tool/ld'), ['/tool/ld'])
 
