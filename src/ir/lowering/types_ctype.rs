@@ -463,6 +463,7 @@ impl Lowerer {
             // Forward declaration: insert an empty layout if not already present
             if self.types.borrow_struct_layouts().get(&key).is_none() {
                 let empty_layout = StructLayout {
+                    is_complete: false,
                     fields: Vec::new(),
                     size: 0,
                     align: 1,
@@ -484,6 +485,7 @@ impl Lowerer {
             let id = self.types.next_anon_struct_id();
             let key = format!("__anon_struct_{}", id);
             let empty_layout = StructLayout {
+                is_complete: false,
                 fields: Vec::new(),
                 size: 0,
                 align: 1,

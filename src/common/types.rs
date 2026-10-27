@@ -1035,6 +1035,8 @@ impl EnumType {
 /// Computed layout for a struct or union, with field offsets and total size.
 #[derive(Debug, Clone)]
 pub struct StructLayout {
+    /// True for a record definition, including a GNU empty record; false for a forward placeholder.
+    pub is_complete: bool,
     /// Each field's (name, byte offset, CType).
     pub fields: Vec<StructFieldLayout>,
     /// Total size of the struct in bytes (including trailing padding).
@@ -1344,6 +1346,7 @@ impl StructLayoutBuilder {
 
         let size = align_up(self.offset, self.max_align);
         StructLayout {
+            is_complete: true,
             fields: self.field_layouts,
             size,
             align: self.max_align,
@@ -1381,6 +1384,7 @@ impl StructLayout {
     /// Used as a fallback when a struct/union layout is not found.
     pub fn empty() -> Self {
         StructLayout {
+            is_complete: false,
             fields: Vec::new(),
             size: 0,
             align: 1,
@@ -1394,6 +1398,7 @@ impl StructLayout {
     /// Create an empty union StructLayout (zero-size, no fields, is_union=true).
     pub fn empty_union() -> Self {
         StructLayout {
+            is_complete: false,
             fields: Vec::new(),
             size: 0,
             align: 1,
@@ -1661,6 +1666,7 @@ impl StructLayout {
         let size = align_up(max_size, max_align);
 
         StructLayout {
+            is_complete: true,
             fields: field_layouts,
             size,
             align: max_align,

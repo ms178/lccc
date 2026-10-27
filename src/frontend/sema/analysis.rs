@@ -4772,7 +4772,14 @@ impl SemanticAnalyzer {
                 // This happens with implicit struct references in casts like
                 // ((struct foo *)0)->bar where struct foo is never defined.
                 // C11 6.5.2.3: member access requires the struct to be complete.
-                if !self.defined_structs.borrow().contains(key.as_ref()) {
+                if !self.defined_structs.borrow().contains(key.as_ref())
+                    && !self
+                        .result
+                        .type_context
+                        .borrow_struct_layouts()
+                        .get(key.as_ref())
+                        .is_some_and(|layout| layout.is_complete)
+                {
                     let type_name = format!("{}", base_ctype);
                     self.diagnostics.borrow_mut().error(
                         format!("invalid use of undefined type '{}'", type_name),
@@ -6066,7 +6073,14 @@ impl SemanticAnalyzer {
                     object = inner;
                 }
                 if let CType::Struct(key) | CType::Union(key) = object {
-                    if !self.defined_structs.borrow().contains(key.as_ref()) {
+                    if !self.defined_structs.borrow().contains(key.as_ref())
+                        && !self
+                            .result
+                            .type_context
+                            .borrow_struct_layouts()
+                            .get(key.as_ref())
+                            .is_some_and(|layout| layout.is_complete)
+                    {
                         self.diagnostics.borrow_mut().error(
                             format!(
                                 "field '{}' has incomplete type",
@@ -7402,7 +7416,7 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
         };
         // The layout is computed BEFORE the key is settled, because deciding
         // whether this definition shadows a different one needs the members.
-        let defined_layout: Option<StructLayout> = if struct_fields.is_empty() {
+        let defined_layout: Option<StructLayout> = if fields.is_none() {
             None
         } else {
             let mut layout = if is_union {
@@ -7508,6 +7522,7 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
         {
             let align = struct_aligned.unwrap_or(1);
             let layout = StructLayout {
+                is_complete: fields.is_some(),
                 fields: Vec::new(),
                 size: 0,
                 align,
@@ -7906,6 +7921,7 @@ mod record_layouts_correspond_tests {
         fields: Vec<StructFieldLayout>,
     ) -> StructLayout {
         StructLayout {
+            is_complete: true,
             fields,
             size,
             align,
@@ -7940,6 +7956,15 @@ mod record_layouts_correspond_tests {
         fields: Vec<StructFieldLayout>,
     ) -> (String, RcLayout) {
         (key.to_string(), Rc::new(layout(false, size, align, fields)))
+    }
+
+    #[test]
+    fn complete_empty_records_are_not_forward_placeholders() {
+        let layouts: FxHashMap<String, RcLayout> = FxHashMap::default();
+        assert!(!StructLayout::empty().is_complete);
+        assert!(!StructLayout::empty_union().is_complete);
+        assert!(StructLayout::for_struct_with_packing(&[], None, &layouts, false).is_complete);
+        assert!(StructLayout::for_union_with_packing(&[], None, &layouts, false).is_complete);
     }
 
     #[test]

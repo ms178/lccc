@@ -13,6 +13,10 @@ import tempfile
 
 # name, source, hard read-only error, warning class (None for legal controls).
 CASES = [
+    ('typeof_record_field', 'struct S{typeof((struct{int x;}){1}) a;};void f(struct S*p){p->a.x=2;}', False, None),
+    ('typeof_empty_record_field', 'struct S{typeof((struct{}){}) a;};', False, None),
+    ('typeof_union_field', 'struct S{typeof((union{int x;}){1}) a;};void f(struct S*p){p->a.x=2;}', False, None),
+    ('typeof_empty_union_field', 'struct S{typeof((union{}){}) a;};', False, None),
     ('recursive_named_field', 'struct S{struct S a;};void f(struct S*p){(void)p;}', True, None),
     ('incomplete_array_field', 'struct S;struct T{struct S a[2];};', True, None),
     ('legal_recursive_pointer', 'struct S{struct S *p;};void f(struct S*p){p->p=p;}', False, None),
