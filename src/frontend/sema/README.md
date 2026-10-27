@@ -123,18 +123,31 @@ entry:
 ```rust
 pub struct FunctionInfo {
     pub return_type: CType,
-    pub params: Vec<(CType, Option<String>)>,
+    pub params: Vec<(CType, Option<String>)>, // body parameter types
     pub variadic: bool,
+    pub prototype: Option<FunctionType>, // visible call-site prototype, if any
     pub is_defined: bool,
     pub is_noreturn: bool,
 }
+
+pub struct FunctionType {
+    pub return_type: CType,
+    pub params: Vec<(CType, Option<String>)>,
+    pub variadic: bool,
+    pub has_prototype: bool,
+}
 ```
 
-The `is_noreturn` flag is sticky: if a prior declaration carries
-`__attribute__((noreturn))` or `_Noreturn`, the flag persists even when the
-function definition does not repeat the attribute. Implicitly declared functions
-(C89-style calls without prototypes) default to `return_type: CType::Int`,
-`variadic: true`, `is_defined: false`.
+`params` records the definition's body parameter types for lowering; it is not
+a call-site prototype. `prototype` carries the visible callable declaration,
+and may itself have an empty parameter list. `FunctionType::has_prototype`
+distinguishes `f(void)` from pre-C23 `f()`; C23 `f()` is a zero-parameter
+prototype. The lowerer must use the prototype for calls and the body parameter
+types for the function definition. The `is_noreturn` flag is sticky: if a prior
+declaration carries `__attribute__((noreturn))` or `_Noreturn`, the flag
+persists even when the function definition does not repeat the attribute.
+Implicitly declared functions (C89-style calls without prototypes) default to
+`return_type: CType::Int`, `variadic: true`, `is_defined: false`.
 
 ### `type_context: TypeContext`
 
@@ -189,6 +202,7 @@ pub struct FunctionTypedefInfo {
     pub return_type: TypeSpecifier,    // AST type, NOT resolved CType
     pub params: Vec<ParamDecl>,        // AST declarations, NOT resolved types
     pub variadic: bool,
+    pub has_prototype: bool,
 }
 ```
 

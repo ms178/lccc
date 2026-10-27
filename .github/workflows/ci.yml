@@ -555,9 +555,9 @@ jobs:
         tar -xzf lccc-fast.tar.gz
         test "$(cat target/ci-build.commit)" = "$(git rev-parse HEAD)"
         sha256sum -c target/ci-build.sha256
-    # lane-split: 60 of 122 gate steps of the `frontend` lane, assigned
+    # lane-split: 60 of 123 gate steps of the `frontend` lane, assigned
     # lane-split: by longest-processing-time over measured cost (356 s of
-    # lane-split: 712 s). The preamble above is byte-identical in every
+    # lane-split: 714 s). The preamble above is byte-identical in every
     # lane-split: shard; tests/regression/check_ci_lane_plan.py fails if a gate disappears,
     # lane-split: is duplicated, or a shard drifts from this record.
     - name: Packed vector relations against GCC 16 and Clang 23.1.4
@@ -838,15 +838,24 @@ jobs:
         tar -xzf lccc-fast.tar.gz
         test "$(cat target/ci-build.commit)" = "$(git rev-parse HEAD)"
         sha256sum -c target/ci-build.sha256
-    # lane-split: 62 of 122 gate steps of the `frontend` lane, assigned
-    # lane-split: by longest-processing-time over measured cost (356 s of
-    # lane-split: 712 s). The preamble above is byte-identical in every
+    # lane-split: 63 of 123 gate steps of the `frontend` lane, assigned
+    # lane-split: by longest-processing-time over measured cost (358 s of
+    # lane-split: 714 s). The preamble above is byte-identical in every
     # lane-split: shard; tests/regression/check_ci_lane_plan.py fails if a gate disappears,
     # lane-split: is duplicated, or a shard drifts from this record.
     - name: Ring identities against GCC 16 and Clang 23.1.4
       run: python3 tests/regression/check_llvm_ring_identities.py
     - name: LCCC vs GCC compatibility suite
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_compat_suite.sh
+    - name: C23 inventory and warning parity against GCC 16.2
+      run: |
+        set -euo pipefail
+        python3 tests/regression/check_c23_inventory.py \
+          --lccc target/fastbuild/lccc --gcc gcc-16 \
+          --json "$RUNNER_TEMP/c23-inventory.json" \
+          --markdown "$RUNNER_TEMP/c23-inventory.md"
+        python3 tests/regression/check_warning_compat.py \
+          --lccc target/fastbuild/lccc --gcc gcc-16
     - name: vector scalar conversion diagnostics
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_vector_scalar_conversions.sh
     - name: Verify W2 load->cast fold structure and runtime
@@ -2079,6 +2088,9 @@ jobs:
         bash tests/regression/check_decimal64_indexed_fold.sh
         bash tests/regression/check_fma_dest_coalesce_codegen.sh
         bash tests/regression/check_debug_info_flags.sh
+        # Compile and link LCCC line tables, then verify GCC 16.2 DWARF sections
+        # survive executable and shared links with relocated code addresses.
+        python3 tests/regression/check_dwarf_line_tables.py --lccc target/fastbuild/lccc --lccc-i686 target/fastbuild/lccc-i686 --gcc gcc-16
         bash tests/regression/check_movabs_symdiff.sh
         # TLS models against a real dlopen, x86-64/i686 with bfd, lccc-ld,
         # mold and lld, plus the AArch64/RISC-V legs: this shard's two

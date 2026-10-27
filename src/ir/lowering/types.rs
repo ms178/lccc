@@ -263,8 +263,8 @@ impl Lowerer {
                 }
             }
             TypeSpecifier::TypeofType(inner) => self.type_spec_to_ir(inner),
-            TypeSpecifier::FunctionPointer(_, _, _) => IrType::Ptr, // function pointer is a pointer
-            TypeSpecifier::BareFunction(_, _, _) => IrType::Ptr, // bare function type decays to pointer
+            TypeSpecifier::FunctionPointer(..) => IrType::Ptr, // function pointer is a pointer
+            TypeSpecifier::BareFunction(..) => IrType::Ptr, // bare function type decays to pointer
             // AutoType should be resolved before reaching here (in lower_local_decl)
             TypeSpecifier::AutoType => {
                 if is_32bit {
@@ -818,7 +818,7 @@ impl Lowerer {
             let has_func_ptr = derived.iter().any(|d| {
                 matches!(
                     d,
-                    DerivedDeclarator::FunctionPointer(_, _) | DerivedDeclarator::Function(_, _)
+                    DerivedDeclarator::FunctionPointer(..) | DerivedDeclarator::Function(..)
                 )
             });
 
@@ -1030,7 +1030,7 @@ impl Lowerer {
             let has_func_ptr = derived.iter().any(|d| {
                 matches!(
                     d,
-                    DerivedDeclarator::Function(_, _) | DerivedDeclarator::FunctionPointer(_, _)
+                    DerivedDeclarator::Function(..) | DerivedDeclarator::FunctionPointer(..)
                 )
             });
             // Account for array dimensions in the type specifier itself

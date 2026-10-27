@@ -30,7 +30,7 @@ pub(super) struct AbstractDeclaratorLevel {
 
 pub(super) enum AbstractDeclSuffix {
     Array(Option<Box<Expr>>),
-    Function(Vec<ParamDecl>, bool),
+    Function(Vec<ParamDecl>, bool, bool),
 }
 
 impl AbstractDeclaratorLevel {
@@ -50,10 +50,10 @@ impl AbstractDeclaratorLevel {
         while let Some(level) = cur {
             for &(star_space, star_cvr) in &level.stars {
                 ty = match ty {
-                    TypeSpecifier::BareFunction(ret, params, variadic)
+                    TypeSpecifier::BareFunction(ret, params, variadic, has_prototype)
                         if space == AddressSpace::Default =>
                     {
-                        TypeSpecifier::FunctionPointer(ret, params, variadic)
+                        TypeSpecifier::FunctionPointer(ret, params, variadic, has_prototype)
                     }
                     other => TypeSpecifier::Pointer(Box::new(other), space),
                 };
@@ -70,8 +70,13 @@ impl AbstractDeclaratorLevel {
                             q.push(0);
                         }
                     }
-                    AbstractDeclSuffix::Function(params, variadic) => {
-                        ty = TypeSpecifier::BareFunction(Box::new(ty), params.clone(), *variadic);
+                    AbstractDeclSuffix::Function(params, variadic, has_prototype) => {
+                        ty = TypeSpecifier::BareFunction(
+                            Box::new(ty),
+                            params.clone(),
+                            *variadic,
+                            *has_prototype,
+                        );
                         if let Some(q) = quals.as_deref_mut() {
                             q.clear();
                             q.push(0);
@@ -286,8 +291,12 @@ impl Parser {
                         open_paren,
                     );
                     innermost_suffix_is_function = Some(true);
-                    let (params, variadic) = self.parse_param_list();
-                    outer_suffixes.push(DerivedDeclarator::Function(params, variadic));
+                    let (params, variadic, has_prototype) = self.parse_param_list();
+                    outer_suffixes.push(DerivedDeclarator::Function(
+                        params,
+                        variadic,
+                        has_prototype,
+                    ));
                 }
                 _ => break,
             }
@@ -496,7 +505,7 @@ impl Parser {
             .any(|d| matches!(d, DerivedDeclarator::Pointer(_)));
         let outer_starts_with_function = matches!(
             outer_suffixes.first(),
-            Some(DerivedDeclarator::Function(_, _))
+            Some(DerivedDeclarator::Function(..))
         );
 
         if inner_only_ptr_and_array
@@ -540,10 +549,14 @@ impl Parser {
 
             // Emit the function pointer syntax marker + FunctionPointer
             result.push(DerivedDeclarator::Pointer(AddressSpace::Default));
-            if let Some(DerivedDeclarator::Function(params, variadic)) =
+            if let Some(DerivedDeclarator::Function(params, variadic, has_prototype)) =
                 outer_suffixes.into_iter().next()
             {
-                result.push(DerivedDeclarator::FunctionPointer(params, variadic));
+                result.push(DerivedDeclarator::FunctionPointer(
+                    params,
+                    variadic,
+                    has_prototype,
+                ));
             }
 
             // Emit extra indirection Pointers (beyond the syntax marker)
@@ -659,11 +672,11 @@ impl Parser {
             .position(|d| {
                 matches!(
                     d,
-                    DerivedDeclarator::Function(_, _) | DerivedDeclarator::FunctionPointer(_, _)
+                    DerivedDeclarator::Function(..) | DerivedDeclarator::FunctionPointer(..)
                 )
             })
             .map(|pos| {
-                if matches!(inner_derived[pos], DerivedDeclarator::FunctionPointer(_, _))
+                if matches!(inner_derived[pos], DerivedDeclarator::FunctionPointer(..))
                     && pos > 0
                     && matches!(inner_derived[pos - 1], DerivedDeclarator::Pointer(_))
                 {
@@ -720,10 +733,14 @@ impl Parser {
                 let mut result = outer_pointers;
                 result.extend_from_slice(&inner_prefix[..first_ptr_idx]);
                 result.push(inner_prefix[first_ptr_idx].clone());
-                if let Some(DerivedDeclarator::Function(params, variadic)) =
+                if let Some(DerivedDeclarator::Function(params, variadic, has_prototype)) =
                     outer_suffixes.into_iter().next()
                 {
-                    result.push(DerivedDeclarator::FunctionPointer(params, variadic));
+                    result.push(DerivedDeclarator::FunctionPointer(
+                        params,
+                        variadic,
+                        has_prototype,
+                    ));
                 }
                 result.extend_from_slice(&inner_prefix[first_ptr_idx + 1..]);
                 result.extend_from_slice(inner_rest);
@@ -754,7 +771,7 @@ impl Parser {
     /// per-parameter take then only ever sees a parameter's OWN attributes,
     /// which is also what removes the leak into the next parameter that the take
     /// exists to prevent.
-    pub(super) fn parse_param_list(&mut self) -> (Vec<ParamDecl>, bool) {
+    pub(super) fn parse_param_list(&mut self) -> (Vec<ParamDecl>, bool, bool) {
         let decl_alignas = self.attrs.parsed_alignas.take();
         let decl_alignas_type = self.attrs.parsed_alignas_type.take();
         // The enclosing declaration's volatile and typedef-use state is read
@@ -777,7 +794,7 @@ impl Parser {
         result
     }
 
-    fn parse_param_list_inner(&mut self) -> (Vec<ParamDecl>, bool) {
+    fn parse_param_list_inner(&mut self) -> (Vec<ParamDecl>, bool, bool) {
         let open = self.peek_span();
         self.expect_context(&TokenKind::LParen, "for parameter list");
         let mut params = Vec::with_capacity(8);
@@ -785,7 +802,10 @@ impl Parser {
 
         if matches!(self.peek(), TokenKind::RParen) {
             self.advance();
-            return (params, variadic);
+            // C23 changes an empty parameter list into a prototype with no
+            // parameters. Earlier dialects retain the historical unspecified
+            // parameter list; the dialect is selected before parsing.
+            return (params, variadic, self.c23);
         }
 
         // Handle (void)
@@ -794,7 +814,9 @@ impl Parser {
             self.advance();
             if matches!(self.peek(), TokenKind::RParen) {
                 self.advance();
-                return (params, variadic);
+                // `(void)` is an explicit zero-parameter prototype in every C
+                // dialect, including C90 and GNU17.
+                return (params, variadic, true);
             }
             self.pos = save;
         }
@@ -867,6 +889,7 @@ impl Parser {
                     ptr_to_array_dims,
                     fptr_param_decls,
                     fptr_variadic,
+                    fptr_has_prototype,
                     inner_ptr_depth,
                     param_is_restrict,
                     paren_ptr_total,
@@ -974,11 +997,14 @@ impl Parser {
 
                 // Wrap any outer return-type function-pointer layers (from outermost
                 // to innermost) before decaying the parameter's own function/array core.
-                for (ret_params, ret_variadic, extra_ptrs) in outer_fn_returns.into_iter().rev() {
+                for (ret_params, ret_variadic, ret_has_prototype, extra_ptrs) in
+                    outer_fn_returns.into_iter().rev()
+                {
                     type_spec = TypeSpecifier::FunctionPointer(
                         Box::new(type_spec),
                         ret_params,
                         ret_variadic,
+                        ret_has_prototype,
                     );
                     for _ in 0..extra_ptrs {
                         type_spec =
@@ -1016,6 +1042,7 @@ impl Parser {
                     alignas_type: param_alignas_type,
                     fptr_params: fptr_param_decls,
                     fptr_variadic,
+                    fptr_has_prototype,
                     is_const: param_is_const,
                     is_volatile: param_is_volatile,
                     is_restrict: param_is_restrict,
@@ -1035,11 +1062,11 @@ impl Parser {
         }
 
         self.expect_closing(&TokenKind::RParen, open);
-        (params, variadic)
+        (params, variadic, true)
     }
 
     /// Parse a K&R-style identifier list: foo(a, b, c)
-    fn parse_kr_identifier_list(&mut self) -> (Vec<ParamDecl>, bool) {
+    fn parse_kr_identifier_list(&mut self) -> (Vec<ParamDecl>, bool, bool) {
         let mut params = Vec::with_capacity(8);
         while let TokenKind::Identifier(n) = self.peek() {
             let n = n.clone();
@@ -1051,6 +1078,7 @@ impl Parser {
                 alignas_type: None,
                 fptr_params: None,
                 fptr_variadic: false,
+                fptr_has_prototype: false,
                 is_const: false,
                 is_volatile: false,
                 is_restrict: false,
@@ -1063,11 +1091,12 @@ impl Parser {
             }
         }
         self.expect(&TokenKind::RParen);
-        (params, false)
+        (params, false, false)
     }
 
     /// Parse a parameter declarator with full type information.
-    /// Returns (name, pointer_depth, array_dims, is_func_ptr, ptr_to_array_dims, fptr_params, fptr_inner_ptr_depth).
+    /// Returns (name, pointer_depth, array_dims, is_func_ptr, ptr_to_array_dims,
+    /// fptr_params, fptr_variadic, fptr_has_prototype, fptr_inner_ptr_depth).
     #[allow(clippy::type_complexity)]
     pub(super) fn parse_param_declarator_full(
         &mut self,
@@ -1079,6 +1108,7 @@ impl Parser {
         Vec<Option<Box<Expr>>>,
         Option<Vec<ParamDecl>>,
         bool,
+        bool,
         u32,
         bool,
         // Pointer levels contributed by a parenthesized pointer-to-array
@@ -1088,7 +1118,7 @@ impl Parser {
         // inside (see the construction in parse_param_list).
         u32,
         Vec<AddressSpace>,
-        Vec<(Vec<ParamDecl>, bool, u32)>,
+        Vec<(Vec<ParamDecl>, bool, bool, u32)>,
     ) {
         let param_start = self.peek_span();
         let mut pointer_depth: u32 = 0;
@@ -1131,9 +1161,10 @@ impl Parser {
         let mut ptr_to_array_dims: Vec<Option<Box<Expr>>> = Vec::new();
         let mut fptr_params: Option<Vec<ParamDecl>> = None;
         let mut fptr_variadic = false;
+        let mut fptr_has_prototype = false;
         let mut fptr_inner_ptr_depth: u32 = 0;
         let mut paren_ptr_total: u32 = 0;
-        let mut outer_fn_returns: Vec<(Vec<ParamDecl>, bool, u32)> = Vec::new();
+        let mut outer_fn_returns: Vec<(Vec<ParamDecl>, bool, bool, u32)> = Vec::new();
 
         let had_paren_decl = matches!(self.peek(), TokenKind::LParen) && self.is_paren_declarator();
         let name = if had_paren_decl {
@@ -1144,6 +1175,7 @@ impl Parser {
                 &mut ptr_to_array_dims,
                 &mut fptr_params,
                 &mut fptr_variadic,
+                &mut fptr_has_prototype,
                 &mut fptr_inner_ptr_depth,
                 &mut paren_ptr_total,
                 &mut outer_fn_returns,
@@ -1185,9 +1217,10 @@ impl Parser {
         // Also handles abstract declarators: `void (Dat *)` → function taking Dat*, returning void
         if matches!(self.peek(), TokenKind::LParen) {
             is_func_ptr = true;
-            let (fp_params, variadic) = self.parse_param_list();
+            let (fp_params, variadic, has_prototype) = self.parse_param_list();
             fptr_params = Some(fp_params);
             fptr_variadic = variadic;
+            fptr_has_prototype = has_prototype;
         }
 
         // The last leading `*` qualifier names the parameter object itself
@@ -1218,6 +1251,7 @@ impl Parser {
             ptr_to_array_dims,
             fptr_params,
             fptr_variadic,
+            fptr_has_prototype,
             fptr_inner_ptr_depth,
             is_restrict,
             paren_ptr_total,
@@ -1236,9 +1270,10 @@ impl Parser {
         ptr_to_array_dims: &mut Vec<Option<Box<Expr>>>,
         fptr_params: &mut Option<Vec<ParamDecl>>,
         fptr_variadic: &mut bool,
+        fptr_has_prototype: &mut bool,
         fptr_inner_ptr_depth: &mut u32,
         paren_ptr_total: &mut u32,
-        outer_fn_returns: &mut Vec<(Vec<ParamDecl>, bool, u32)>,
+        outer_fn_returns: &mut Vec<(Vec<ParamDecl>, bool, bool, u32)>,
     ) -> Option<String> {
         let save = self.pos;
         self.advance(); // consume '('
@@ -1299,6 +1334,7 @@ impl Parser {
                 let mut nested_ptr_to_array_dims = Vec::new();
                 let mut nested_fptr_params = None;
                 let mut nested_fptr_variadic = false;
+                let mut nested_fptr_has_prototype = false;
                 let mut nested_inner_ptr_depth = 0u32;
                 let mut nested_paren_ptr_total = 0u32;
                 let mut nested_outer_fn_returns = Vec::new();
@@ -1309,22 +1345,25 @@ impl Parser {
                     &mut nested_ptr_to_array_dims,
                     &mut nested_fptr_params,
                     &mut nested_fptr_variadic,
+                    &mut nested_fptr_has_prototype,
                     &mut nested_inner_ptr_depth,
                     &mut nested_paren_ptr_total,
                     &mut nested_outer_fn_returns,
                 );
                 if nested_is_func_ptr && self.consume_if(&TokenKind::RParen) {
                     if matches!(self.peek(), TokenKind::LParen) {
-                        let (ret_params, ret_variadic) = self.parse_param_list();
+                        let (ret_params, ret_variadic, ret_has_prototype) = self.parse_param_list();
                         outer_fn_returns.extend(nested_outer_fn_returns);
                         outer_fn_returns.push((
                             ret_params,
                             ret_variadic,
+                            ret_has_prototype,
                             inner_ptr_depth.saturating_sub(1),
                         ));
                         *is_func_ptr = true;
                         *fptr_params = nested_fptr_params;
                         *fptr_variadic = nested_fptr_variadic;
+                        *fptr_has_prototype = nested_fptr_has_prototype;
                         *fptr_inner_ptr_depth = nested_inner_ptr_depth;
                         *array_dims = nested_array_dims;
                         return nested_name;
@@ -1382,9 +1421,10 @@ impl Parser {
                 // Function pointer: (*fp)(params) or (*fp[])(params)
                 *is_func_ptr = true;
                 *fptr_inner_ptr_depth = inner_ptr_depth;
-                let (fp_params, variadic) = self.parse_param_list();
+                let (fp_params, variadic, has_prototype) = self.parse_param_list();
                 *fptr_params = Some(fp_params);
                 *fptr_variadic = variadic;
+                *fptr_has_prototype = has_prototype;
             } else if matches!(self.peek(), TokenKind::LBracket) && !self.is_c23_attr_start() {
                 // Pointer-to-array: (*p)[N], (**p)[N]
                 //
@@ -1442,9 +1482,10 @@ impl Parser {
             // pointer per C11 6.7.6.3p8.
             if matches!(self.peek(), TokenKind::LParen) {
                 *is_func_ptr = true;
-                let (fp_params, variadic) = self.parse_param_list();
+                let (fp_params, variadic, has_prototype) = self.parse_param_list();
                 *fptr_params = Some(fp_params);
                 *fptr_variadic = variadic;
+                *fptr_has_prototype = has_prototype;
             }
             self.expect(&TokenKind::RParen);
             self.skip_array_dimensions();
@@ -1453,9 +1494,10 @@ impl Parser {
             // Parse the param list to preserve function type information.
             if !*is_func_ptr && matches!(self.peek(), TokenKind::LParen) {
                 *is_func_ptr = true;
-                let (fp_params, variadic) = self.parse_param_list();
+                let (fp_params, variadic, has_prototype) = self.parse_param_list();
                 *fptr_params = Some(fp_params);
                 *fptr_variadic = variadic;
+                *fptr_has_prototype = has_prototype;
             }
             name
         } else if matches!(self.peek(), TokenKind::LParen) {
@@ -1471,9 +1513,10 @@ impl Parser {
                 // Parse the param list to preserve function type information.
                 if matches!(self.peek(), TokenKind::LParen) {
                     *is_func_ptr = true;
-                    let (fp_params, variadic) = self.parse_param_list();
+                    let (fp_params, variadic, has_prototype) = self.parse_param_list();
                     *fptr_params = Some(fp_params);
                     *fptr_variadic = variadic;
+                    *fptr_has_prototype = has_prototype;
                 }
             } else {
                 // extract_paren_name failed (e.g. ((int)) where inner content
@@ -1489,9 +1532,10 @@ impl Parser {
             // Parse the param list to preserve function type information.
             if matches!(self.peek(), TokenKind::LParen) {
                 *is_func_ptr = true;
-                let (fp_params, variadic) = self.parse_param_list();
+                let (fp_params, variadic, has_prototype) = self.parse_param_list();
                 *fptr_params = Some(fp_params);
                 *fptr_variadic = variadic;
+                *fptr_has_prototype = has_prototype;
             }
             name
         } else {
@@ -1632,8 +1676,12 @@ impl Parser {
                     let open_paren = self.peek_span();
                     self.check_suffix_composition(prev_suffix_is_function, true, None, open_paren);
                     prev_suffix_is_function = Some(true);
-                    let (params, variadic) = self.parse_param_list();
-                    suffixes.push(AbstractDeclSuffix::Function(params, variadic));
+                    let (params, variadic, has_prototype) = self.parse_param_list();
+                    suffixes.push(AbstractDeclSuffix::Function(
+                        params,
+                        variadic,
+                        has_prototype,
+                    ));
                 }
                 _ => break,
             }

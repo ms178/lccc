@@ -542,11 +542,11 @@ impl Lowerer {
         // `[Pointer, FunctionPointer([char]), Pointer, FunctionPointer([long])]`),
         // the LAST `FunctionPointer` is the entity's own call signature and any
         // earlier `Pointer`/`FunctionPointer` layer means its return value is a pointer.
-        if let Some((i, DerivedDeclarator::FunctionPointer(params, variadic))) = declarator
+        if let Some((i, DerivedDeclarator::FunctionPointer(params, variadic, _))) = declarator
             .derived
             .iter()
             .enumerate()
-            .rfind(|(_, d)| matches!(d, DerivedDeclarator::FunctionPointer(_, _)))
+            .rfind(|(_, d)| matches!(d, DerivedDeclarator::FunctionPointer(..)))
         {
             let ptr_count_before = declarator.derived[..i]
                 .iter()
@@ -555,7 +555,7 @@ impl Lowerer {
                         d,
                         DerivedDeclarator::Pointer(_)
                             | DerivedDeclarator::Array(_)
-                            | DerivedDeclarator::FunctionPointer(_, _)
+                            | DerivedDeclarator::FunctionPointer(..)
                     )
                 })
                 .count();
@@ -2085,7 +2085,7 @@ impl Lowerer {
         let has_func_ptr = derived.iter().any(|d| {
             matches!(
                 d,
-                DerivedDeclarator::FunctionPointer(_, _) | DerivedDeclarator::Function(_, _)
+                DerivedDeclarator::FunctionPointer(..) | DerivedDeclarator::Function(..)
             )
         });
         let has_array = derived

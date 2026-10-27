@@ -968,7 +968,7 @@ impl Lowerer {
                     for d in &declarator.derived {
                         match d {
                             DerivedDeclarator::Pointer(_) => ptr_count += 1,
-                            DerivedDeclarator::Function(p, v) => {
+                            DerivedDeclarator::Function(p, v, _) => {
                                 func_info = Some((p.clone(), *v));
                                 break;
                             }

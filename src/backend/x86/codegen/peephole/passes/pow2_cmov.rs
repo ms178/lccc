@@ -210,7 +210,7 @@ impl Block {
                 return None;
             }
             let text = infos[j].trimmed(store.get(j));
-            if writes_flags_text(text) {
+            if definitely_kills_any_flags_text(text) {
                 break;
             }
             j += 1;
@@ -360,57 +360,87 @@ fn prev_non_silence(store: &LineStore, infos: &[LineInfo], i: usize) -> Option<u
     }
 }
 
-/// Text-level flag-writer classification — the writer-side mirror of
-/// [`reads_flags`].  Shared with `lea_add_fuse`, whose fusion deletes an
-/// add's flag write and must prove nothing observed it.
-pub(super) fn writes_flags_text(text: &str) -> bool {
-    let m = match text.split_once(char::is_whitespace) {
-        Some((m, _)) => m,
-        None => text.trim(),
-    };
-    let v = m.strip_prefix('v').unwrap_or(m); // AVX forms also write flags
-    v.starts_with("add")
-        || v.starts_with("sub")
-        || v.starts_with("and")
-        || v.starts_with("or")
-        || v.starts_with("xor")
-        || v.starts_with("adc")
-        || v.starts_with("sbb")
-        || v.starts_with("cmp")
-        || v.starts_with("test")
-        || v.starts_with("neg")
-        || v.starts_with("inc")
-        || v.starts_with("dec")
-        || v.starts_with("shl")
-        || v.starts_with("shr")
-        || v.starts_with("sar")
-        || v.starts_with("rol")
-        || v.starts_with("ror")
-        || v.starts_with("rcl")
-        || v.starts_with("rcr")
-        || v.starts_with("mul")
-        || v.starts_with("div")
-        || v.starts_with("imul")
-        || v.starts_with("idiv")
-        || v.starts_with("bt")
+/// True when the shared flag mask proves that this instruction definitely
+/// kills at least one incoming arithmetic flag bit. A possible/partial write
+/// with no proven killed bits does not end the scan; readers are checked first.
+pub(super) fn definitely_kills_any_flags_text(text: &str) -> bool {
+    super::flag_peepholes::flags_written_mask(text) != 0
 }
 
-/// True when `%S` is read after `from` before it is redefined.
+/// True when `%S` is read after `from` before a proven full-register overwrite.
+///
+/// The scan is deliberately fail-closed: a two-operand mnemonic is not proof
+/// of a definition (`cmp` reads its last operand, arithmetic is read-modify-
+/// write, and a byte/word move preserves upper bits). Only full-width `mov`,
+/// `lea`, and `pop` writes with no source/address use of `%S` kill the old
+/// value. Comments are stripped rather than hiding the instruction, ABI return
+/// registers `%rax`/`%rdx` and the `%rsp` consumed by `ret` are live at that
+/// boundary, and an opaque control-flow edge or pinned region prevents a linear
+/// liveness claim.
 fn scratch_live_after(store: &LineStore, infos: &[LineInfo], from: usize, s: RegId) -> bool {
+    let mask = 1u16 << s;
     for j in (from + 1)..infos.len() {
         if infos[j].is_nop() {
             continue;
         }
         let raw = store.get(j);
-        if raw.contains('#') {
-            continue; // comments emit nothing
+        let code = raw
+            .split_once('#')
+            .map_or(raw, |(before, _)| before)
+            .trim_end();
+        if code.trim().is_empty() {
+            continue;
         }
-        let text = infos[j].trimmed(raw);
-        let defines_s = split_two_operands(text)
-            .and_then(|(_, dst)| plain_gp_operand(dst))
-            .is_some_and(|f| f == s);
-        if defines_s {
-            return false; // the chain's definition is what bounds the window
+        if infos[j].is_steppable() || infos[j].kind == LineKind::Empty {
+            continue;
+        }
+        let text = infos[j].trimmed(code);
+        if text.is_empty() {
+            continue;
+        }
+        if infos[j].pinned || infos[j].volatile_access {
+            return true;
+        }
+        if matches!(infos[j].kind, LineKind::Ret) {
+            const RET_OBSERVED_GPRS: u16 = (1 << 0) | (1 << 2) | (1 << 4);
+            // `%rax`/`%rdx` carry integer return values; `ret` also consumes `%rsp`.
+            return (implicit_reg_refs(text.as_bytes()) | RET_OBSERVED_GPRS) & mask != 0;
+        }
+        if super::is_opaque_control_transfer(text) {
+            return true;
+        }
+        if matches!(
+            infos[j].kind,
+            LineKind::Label
+                | LineKind::Jmp
+                | LineKind::JmpIndirect
+                | LineKind::CondJmp
+                | LineKind::Call
+                | LineKind::InlineAsm
+        ) || (infos[j].kind == LineKind::Directive && !infos[j].inert_dir)
+        {
+            return true;
+        }
+        if implicit_reg_refs(text.as_bytes()) & mask != 0 {
+            return true;
+        }
+        match infos[j].kind {
+            LineKind::Pop { reg } => {
+                if reg == s {
+                    return false; // pop writes the full register without reading it
+                }
+                continue;
+            }
+            LineKind::Push { reg } => {
+                if reg == s {
+                    return true; // push observes the old scratch value
+                }
+                continue;
+            }
+            _ => {}
+        }
+        if full_register_overwrite(text, s) {
+            return false;
         }
         if operand_mentions(text, s) {
             return true;
@@ -419,14 +449,51 @@ fn scratch_live_after(store: &LineStore, infos: &[LineInfo], from: usize, s: Reg
     false
 }
 
+/// A write which replaces every bit of the register family, without reading
+/// the previous value from either its source operand or a memory address.
+fn full_register_overwrite(text: &str, fam: RegId) -> bool {
+    let Some((mnem, rest)) = split_head(text) else {
+        return false;
+    };
+    if !matches!(
+        mnem.as_str(),
+        "movl"
+            | "movq"
+            | "movabsq"
+            | "movzbl"
+            | "movzwl"
+            | "movzbq"
+            | "movzwq"
+            | "movsbl"
+            | "movswl"
+            | "movsbq"
+            | "movswq"
+            | "movslq"
+            | "leal"
+            | "leaq"
+    ) {
+        return false;
+    }
+    let Some((src, dst)) = split_two_operands(rest) else {
+        return false;
+    };
+    plain_gp_operand(dst.trim()) == Some(fam) && !operand_fragment_mentions(src, fam)
+}
+
+/// Does any token in an operand fragment name family `fam` as a plain register?
+fn operand_fragment_mentions(fragment: &str, fam: RegId) -> bool {
+    fragment
+        .split([',', '(', ')', '\t', ' '])
+        .filter(|w| !w.is_empty())
+        .any(|w| plain_gp_operand(w) == Some(fam))
+}
+
 /// Does any operand of `text` name family `fam` as a plain register?
 fn operand_mentions(text: &str, fam: RegId) -> bool {
     let Some((_, rest)) = text.split_once(char::is_whitespace) else {
         return false;
     };
-    rest.split([',', '(', ')', '\t', ' '])
-        .filter(|w| !w.is_empty())
-        .any(|w| plain_gp_operand(w) == Some(fam))
+    operand_fragment_mentions(rest, fam)
 }
 
 #[cfg(test)]
@@ -449,6 +516,45 @@ mod tests {
 
     fn frame(body: &str) -> String {
         format!("f:\n.cfi_startproc\n{body}.cfi_endproc\n")
+    }
+
+    #[test]
+    fn definite_flag_mask_excludes_sse_avx_and_bmi2_nonwriters() {
+        for mnem in [
+            "addps %xmm0, %xmm1",
+            "andps %xmm0, %xmm1",
+            "cmpps $0, %xmm0, %xmm1",
+            "divsd %xmm0, %xmm1",
+            "mulsd %xmm0, %xmm1",
+            "vaddps %ymm0, %ymm1, %ymm2",
+            "vmulps %ymm0, %ymm1, %ymm2",
+            "mulx %r8, %r9, %r10",
+            "shrx %rcx, %r8, %r9",
+        ] {
+            assert!(
+                !definitely_kills_any_flags_text(mnem),
+                "{mnem} preserves EFLAGS"
+            );
+        }
+        for mnem in [
+            "addl %esi, %edi",
+            "incq %rcx",
+            "ucomiss %xmm0, %xmm1",
+            "vcomisd %xmm0, %xmm1",
+            "clc",
+            "sahf",
+        ] {
+            assert!(
+                definitely_kills_any_flags_text(mnem),
+                "{mnem} writes EFLAGS"
+            );
+        }
+    }
+
+    #[test]
+    fn a_zero_or_variable_count_shift_does_not_kill_flags_in_the_oracle() {
+        assert!(!definitely_kills_any_flags_text("shlq $0, %rax"));
+        assert!(!definitely_kills_any_flags_text("shlq %cl, %rax"));
     }
 
     #[test]
@@ -515,6 +621,119 @@ mod tests {
             "    ret\n",
         )));
         assert!(out.contains("shrl $29, %esi"), "identity kept:\n{out}");
+        assert!(!out.contains("cmovns"), "{out}");
+    }
+
+    #[test]
+    fn a_prefixed_branch_cannot_hide_a_scratch_use_after_a_physical_overwrite() {
+        let out = run_cmov(&frame(concat!(
+            "    movl %edi, %esi\n",
+            "    sarl $31, %esi\n",
+            "    shrl $29, %esi\n",
+            "    leal (%rdi, %rsi), %eax\n",
+            "    sarl $3, %eax\n",
+            "    xorl %ecx, %ecx\n", // full flag overwrite; isolates the scratch scan
+            "    notrack jmp *%rax\n",
+            "    movl $0, %esi\n", // only fall-through would see this overwrite
+            ".Luse_scratch:\n",
+            "    movl %esi, %r8d\n",
+            "    ret\n",
+        )));
+        assert!(
+            out.contains("shrl $29, %esi"),
+            "opaque branch keeps identity:\n{out}"
+        );
+        assert!(!out.contains("cmovns"), "{out}");
+    }
+
+    #[test]
+    fn a_scratch_in_an_abi_return_register_is_live_at_ret() {
+        for scratch in ["eax", "edx"] {
+            let body = format!(
+                concat!(
+                    "    movl %edi, %{0}\n",
+                    "    sarl $31, %{0}\n",
+                    "    shrl $29, %{0}\n",
+                    "    leal (%rdi, %{0}), %ecx\n",
+                    "    sarl $3, %ecx\n",
+                    "    ret\n",
+                ),
+                scratch
+            );
+            let asm = frame(&body);
+            let out = run_cmov(&asm);
+            assert!(out.contains(&format!("movl %edi, %{scratch}")), "{out}");
+            assert!(out.contains(&format!("shrl $29, %{scratch}")), "{out}");
+            assert!(
+                !out.contains("cmovns"),
+                "return-register scratch must stay live:\n{out}"
+            );
+        }
+    }
+
+    #[test]
+    fn ret_keeps_its_implicit_stack_pointer_live() {
+        let asm = frame("    xorl %ecx, %ecx\n    ret\n");
+        let store = LineStore::new(asm);
+        let infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        assert!(scratch_live_after(&store, &infos, 2, 4)); // family 4 is `%rsp`
+    }
+
+    #[test]
+    fn a_read_modify_write_of_the_scratch_after_the_block_blocks_the_rewrite() {
+        // The first two-operand instruction after the block reads and writes
+        // its destination; it cannot kill the old sign-chain value.
+        let out = run_cmov(&frame(concat!(
+            "    movl %edi, %esi\n",
+            "    sarl $31, %esi\n",
+            "    shrl $29, %esi\n",
+            "    leal (%rdi, %rsi), %eax\n",
+            "    sarl $3, %eax\n",
+            "    addl $1, %esi\n",
+            "    setne %cl\n",
+            "    movzbl %cl, %ecx\n",
+            "    ret\n",
+        )));
+        assert!(out.contains("shrl $29, %esi"), "identity kept:\\n{out}");
+        assert!(!out.contains("cmovns"), "{out}");
+    }
+
+    #[test]
+    fn a_compare_of_the_scratch_after_the_block_blocks_the_rewrite() {
+        // `cmp` reads its second operand; it is not a register definition even
+        // though the generic two-operand parser returns it as the destination.
+        // The setcc makes the stale scratch value observable after the block.
+        let out = run_cmov(&frame(concat!(
+            "    movl %edi, %esi\n",
+            "    sarl $31, %esi\n",
+            "    shrl $29, %esi\n",
+            "    leal (%rdi, %rsi), %eax\n",
+            "    sarl $3, %eax\n",
+            "    cmpl $0, %esi\n",
+            "    sete %cl\n",
+            "    movzbl %cl, %ecx\n",
+            "    ret\n",
+        )));
+        assert!(out.contains("shrl $29, %esi"), "identity kept:\\n{out}");
+        assert!(!out.contains("cmovns"), "{out}");
+    }
+
+    #[test]
+    fn a_trailing_comment_does_not_hide_a_scratch_read() {
+        let out = run_cmov(&frame(concat!(
+            "    movl %edi, %esi\n",
+            "    sarl $31, %esi\n",
+            "    shrl $29, %esi\n",
+            "    leal (%rdi, %rsi), %eax\n",
+            "    sarl $3, %eax\n",
+            "    cmpl $0, %esi # the compare observes the scratch\n",
+            "    sete %cl\n",
+            "    movzbl %cl, %ecx\n",
+            "    ret\n",
+        )));
+        assert!(out.contains("shrl $29, %esi"), "identity kept:\\n{out}");
         assert!(!out.contains("cmovns"), "{out}");
     }
 

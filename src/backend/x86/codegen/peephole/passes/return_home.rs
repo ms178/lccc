@@ -199,7 +199,16 @@ fn reissue_root(text: &str, d_fam: RegId, force_32: bool) -> Option<String> {
                 }
                 Some(f)
             }
-            None if src.starts_with('$') => None,
+            None if src.starts_with('$') => {
+                // A symbolic 64-bit immediate can use a 64-bit relocation;
+                // retargeting it as `movl` would require a truncating 32-bit
+                // relocation and can turn a linkable object into overflow.
+                // Numeric immediates have well-defined low-32-bit semantics.
+                if force_32 && mnem == "movq" && imm_disp(src).is_none() {
+                    return None;
+                }
+                None
+            }
             None => return None, // memory or other opaque source
         };
         // Width-down: `movq %rN, %D` truncated is `movl %rNd, %eax` — the
@@ -873,6 +882,37 @@ mod tests {
         )));
         assert!(!out.contains("movl %r9d, %eax"), "copy retired:\n{out}");
         assert!(out.contains("movl %r11d, %eax"), "width-down move:\n{out}");
+    }
+
+    #[test]
+    fn a_carry_reader_in_the_chain_keeps_the_flag_writing_root() {
+        // `rcl` consumes CF from the add root. Reissuing that root as LEA
+        // would leave stale CF, so this live-in chain is not retargetable.
+        let out = run_home(&frame(concat!(
+            "    addl %ecx, %edi\n",
+            "    rcll $1, %edi\n",
+            "    movl %edi, %eax\n",
+            "    ret\n",
+        )));
+        assert!(out.contains("addl %ecx, %edi"), "root kept:\\n{out}");
+        assert!(out.contains("movl %edi, %eax"), "copy kept:\\n{out}");
+    }
+
+    #[test]
+    fn a_symbolic_64_bit_immediate_is_not_width_down_relocated() {
+        // A full-width symbol relocation cannot always be represented by a
+        // 32-bit relocation. Keep the copy rather than silently requiring a
+        // truncating relocation at link time.
+        let out = run_home(&frame(concat!(
+            "    movq $global_object, %r9\n",
+            "    movl %r9d, %eax\n",
+            "    ret\n",
+        )));
+        assert!(
+            out.contains("movq $global_object, %r9"),
+            "root kept:\n{out}"
+        );
+        assert!(out.contains("movl %r9d, %eax"), "copy kept:\n{out}");
     }
 
     #[test]

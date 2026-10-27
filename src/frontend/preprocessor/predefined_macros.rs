@@ -40,7 +40,7 @@ impl Preprocessor {
         const PREDEFINED_OBJECT_MACROS: &[(&str, &str)] = &[
             // Standard C
             ("__STDC__", "1"),
-            ("__STDC_VERSION__", "201710L"), // C17
+            ("__STDC_VERSION__", "202311L"), // C23, GCC 16.2 default dialect
             ("__STDC_HOSTED__", "1"),
             // C23 #embed result constants (N3018). Defined unconditionally,
             // matching lccc's permissive-extension dialect policy (#embed is

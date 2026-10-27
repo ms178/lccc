@@ -891,7 +891,7 @@ impl Lowerer {
             && derived.iter().any(|d| {
                 matches!(
                     d,
-                    DerivedDeclarator::FunctionPointer(_, _) | DerivedDeclarator::Function(_, _)
+                    DerivedDeclarator::FunctionPointer(..) | DerivedDeclarator::Function(..)
                 )
             });
         let var_ty = if is_pointer || is_array_of_pointers || is_array_of_func_ptrs {
@@ -973,8 +973,7 @@ impl Lowerer {
                 .filter(|d| {
                     matches!(
                         d,
-                        DerivedDeclarator::FunctionPointer(_, _)
-                            | DerivedDeclarator::Function(_, _)
+                        DerivedDeclarator::FunctionPointer(..) | DerivedDeclarator::Function(..)
                     )
                 })
                 .count();
@@ -983,8 +982,8 @@ impl Lowerer {
                 let mut ptrs_after_fptr = 0usize;
                 for d in derived {
                     match d {
-                        DerivedDeclarator::FunctionPointer(_, _)
-                        | DerivedDeclarator::Function(_, _) => {
+                        DerivedDeclarator::FunctionPointer(..)
+                        | DerivedDeclarator::Function(..) => {
                             found_fptr = true;
                         }
                         DerivedDeclarator::Pointer(_) if found_fptr => {

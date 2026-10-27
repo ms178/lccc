@@ -137,7 +137,7 @@ ROI = (impact × confidence) ÷ effort, each 1–5; higher is better.
 | 8 | MB-13 | i686 linker parity (reuse `linker_common`) | 2 | M | 3.6 |
 | 9 | MB-06 | Stack protector canaries (incl. kernel guard options) | 2 | M | 3.5 |
 | 10 | MB-12 | Warnings: `-Wformat*`, unused, sign-compare | 4 | M–L | 3.4 |
-| 11 | MB-11 | C23 tail: `_Float16`, default `-std`, `target("avx2")` regression | 4 | S–M | 3.3 |
+| 11 | MB-11 | C23 conformance inventory and half-format edge cases | 4 | S–M | 3.3 |
 | 12 | MB-07 | `-fvisibility`, `-fno-plt`, `-ftrapv`, trap-mode UBSan | 2 | M | 3.2 |
 | 13 | MB-14 | x86-64 linker: DT_RELR, page-size, image-base | 2 | M | 3.2 |
 | 14 | MB-16 | `target_clones` / IFUNC multiversioning | 6 | M | 3.0 |
@@ -498,32 +498,61 @@ return the expected text at `-O0`; (d) the same on i686 via `gdb` + `-m32`;
 own acceptance on the benchmark corpus (≥ 90 % of parameters inspectable at
 `-O1`). **Effort** L · **ROI** 3.8.
 
-### MB-11 · P2 · R — C23 tail and a `target("avx2")` regression candidate
+### MB-11 · P2 · R — C23 conformance inventory and half-format edge cases
 
-**Status.** C23 coverage jumped upstream: 39 of 40 census snippets are accepted
-(`nullptr`, `constexpr`, keyword `bool`, `0b…'…`, `enum E : T`, `typeof` in
-`-std=c23` all pass now). Remaining:
+**Status (re-audited 2026-10-26).** The earlier 39/40 count and statement that
+`_Float16`/`__bf16` were rejected are stale. The current tree implements both
+half formats, their literals/conversions and ABI lowering, with targeted GCC 16
+regressions including `gcc16_half_bfloat16_abi.c`, `gcc16_half_f16c.c` and the
+half-math builtin tests. Those tests do not constitute the previously proposed
+exhaustive 2^16-pattern × rounding-mode proof; no exhaustive coverage claim is
+made. The default C dialect now follows GCC 16.2's `gnu23` (`__STDC_VERSION__`
+202311L); the no-flag fixture and explicit `-std=gnu17` override are checked by
+the regression corpus. Prototype status is preserved independently of an empty
+parameter vector: default GNU23 `f()` rejects extra arguments, GNU17 `f()` keeps
+its unspecified-parameter behavior, and `(void)` remains a zero-parameter
+prototype in both. Conditional function-pointer composites retain a compatible
+prototype from either arm. The external GCC compatibility macros/version banner remain
+at 14.2.0: this dialect change is not a full-parity claim.
 
-1. **`_Float16` / `__bf16`** — rejected (R). Plan: type, literals (`f16`/`F16`
-   suffix), conversions (F16C `vcvtph2ps`/`vcvtps2ph` when `-mf16c`/`-march`
-   has it, else a software helper), SysV x86-64 ABI (low 16 bits of an XMM
-   register), i686 software path, `<float.h>` `FLT16_*` macros, `_Generic`
-   distinctness. Gate: round-trip and ULP tests against GCC 16 for 2^16 bit
-   patterns × each rounding mode used by the conversion helpers.
-2. **Default dialect.** GCC 15+ defaults to `-std=gnu23`. Decide and record in
-   [`engineering/DECISIONS.md`](engineering/DECISIONS.md) whether lccc's default
-   follows; if yes, flip it only after the kernel (`-std=gnu11` pinned) and the
-   corpus pass, and keep an escape hatch environment variable for one release.
-3. **Regression candidate.** `__attribute__((target("avx2")))` on a reduction
-   loop emitted `ymm` on `e8ae10a` and emits only `xmm` at `-O2` on `2070d23f`
-   (R; `-mavx2` file-wide still gives `ymm`). Bisect the 546 commits (the
-   per-function ISA gating or a vectoriser cost-model change); add a gate that a
-   per-function `target("avx2")` is honoured by the vectoriser at `-O2`. If the
-   change was a deliberate cost-model decision, record it in DECISIONS.md and
-   change the probe row instead.
+The refreshed GCC 16.2 matrix has 24 probes and one C23 difference:
+`_BitInt(17)` (GCC accepts; LCCC rejects). This is an explicit, deferred feature
+gap, not a false expected result or a syntax-only acceptance target. The current
+fixed-width `CType` model cannot carry `_BitInt` precision and signedness through
+integer conversions, constants, layout, ABI lowering, codegen and debug metadata.
+The inventory documents the measured rejection and the end-to-end acceptance
+criteria; until that work lands, keep the row visible and do not publish a C23
+coverage percentage.
 
-**Gates.** The per-feature accept/reject table against GCC 16 for the C23 snippets
-(write them fresh); the bisect result recorded in the journal. **Effort** S–M ·
+The historical per-function AVX2 vectorization candidate was remeasured with
+`tests/regression/per_function_target_avx2_reduction/reduction.c`: at `-O2`
+LCCC emits YMM instructions for the `target("avx2")` reduction without a
+translation-unit-wide `-mavx2`; the adjacent baseline function stays YMM-free.
+GCC 16.2 and
+Clang 23.1.3 show the same function-level ISA boundary; the target function's
+results match the scalar reference for trip counts 0–35 on all three. The
+current regression is pinned in `check_vectorize_isa_gate.sh`. The earlier
+`2070d23f` no-YMM observation does not reproduce on this branch, so no bisect
+or performance claim is justified from that historical row.
+
+Remaining work:
+
+1. **Full `_BitInt` support** (deferred; see `docs/C23-COMPATIBILITY-INVENTORY.md`).
+   Add a width-bearing type that preserves signedness and precision through
+   integer promotions/conversions, constant evaluation, object/aggregate
+   layout, ABI classification, lowering/codegen, and debug output. Cover widths
+   around the built-in integer boundaries; arithmetic, shifts and conversions;
+   arrays, aggregates and bit-fields; and calls/returns on each supported ABI.
+   Keep `bitint-17` as the visible inventory difference until this end-to-end
+   contract is implemented and differentially tested.
+2. **Exhaustive half-format proof.** The existing targeted `_Float16`/`__bf16`
+   regressions do not cover all 2^16 encodings across rounding modes. Add that
+   proof before making exhaustive conversion claims.
+
+**Gates.** Keep the 24-probe GCC 16.2 accept/reject matrix, default/gnu17
+prototype differential, and the per-function AVX2 ISA-boundary/runtime test;
+new `_BitInt` support must add compiler-oracle differential and ABI/layout
+coverage rather than weakening the existing known-gap row. **Effort** M–L ·
 **ROI** 3.3.
 
 ### MB-12 · P1 · R — warnings that real builds rely on

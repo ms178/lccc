@@ -116,12 +116,15 @@ pragma semantics or overall quality. Zero failures in 65 bounded cases is not
 proof of exhaustive correctness or a performance result.
 
 Only this semantic stage completed: the job was cancelled during native timing.
-It also used compiler-default dialects. The acceptance measurements now explicitly
-select **GNU C17** for every arm in semantic, native, static and Callgrind inputs;
-GCC 16's newer GNU23 default must not silently differ from LCCC's GNU17 default.
-A local explicit-GNU17 replay again passes all 65 GCC 12 O0 controls and retains
-its four optimized-GCC failures and nonzero runner status. This does not replace
-the new hosted comparison or validate LCCC locally.
+It also used compiler-default dialects. The acceptance measurements then explicitly
+selected **GNU C17** for every arm in semantic, native, static and Callgrind inputs;
+that historical explicit-GNU17 replay passes all 65 GCC 12 O0 controls and retains
+its four optimized-GCC failures and nonzero runner status. On 2026-10-26 LCCC's
+user-facing default was changed from GNU C17 to GCC 16.2's GNU C23 default, with
+`-std=gnu17` retained as the explicit legacy mode. These older C17-controlled
+receipts are still useful for their original questions, but do not validate the
+new default; the separate default-dialect regression now compares against GCC 16.
+Neither receipt is a full compatibility or performance claim.
 
 ## Existing hosted screening: evidence, not a new timing experiment
 

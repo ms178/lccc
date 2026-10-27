@@ -70,6 +70,63 @@ const MAX_LOCAL_PASS_ITERATIONS: usize = 8;
 /// Post-global cleanup is shallow (mostly dead store + adjacent pairs), so 4 suffices.
 const MAX_POST_GLOBAL_ITERATIONS: usize = 4;
 
+/// True when an assembly line, after any textual instruction prefixes, is a
+/// control transfer or trap that makes a linear peephole scan unsafe.
+///
+/// `classify_line` recognizes the ordinary unprefixed spellings. This catches
+/// e.g. `notrack jmp *%rax` and `bnd call foo`, which otherwise look like an
+/// opaque `Other` line and can hide a path that skips a later physical write.
+fn is_opaque_control_transfer(text: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "lock", "rep", "repe", "repz", "repne", "repnz", "notrack", "bnd", "xacquire", "xrelease",
+        "cs", "ds", "es", "fs", "gs", "ss", "data16", "data32", "addr16", "addr32", "rex32",
+        "rex64",
+    ];
+    let end = crate::backend::peephole_common::line_len_without_trailing_comment(text.as_bytes());
+    let mut words = text[..end].split_ascii_whitespace();
+    let mut mnemonic = words.next().unwrap_or("");
+    while PREFIXES
+        .iter()
+        .any(|prefix| mnemonic.eq_ignore_ascii_case(prefix))
+    {
+        let Some(next) = words.next() else {
+            return true; // a dangling prefix is opaque too
+        };
+        mnemonic = next;
+    }
+    let starts = |prefix: &str| {
+        mnemonic
+            .get(..prefix.len())
+            .is_some_and(|word| word.eq_ignore_ascii_case(prefix))
+    };
+    starts("j")
+        || starts("loop")
+        || starts("call")
+        || starts("ret")
+        || starts("lret")
+        || starts("lcall")
+        || starts("ljmp")
+        || starts("iret")
+        || starts("int")
+        || starts("syscall")
+        || starts("sysenter")
+        || starts("sysexit")
+        || starts("sysret")
+        || starts("xbegin")
+        || starts("xabort")
+        || starts("ud0")
+        || starts("ud1")
+        || starts("ud2")
+        || starts("hlt")
+        || starts("icebp")
+        || starts("rsm")
+        || starts("bound")
+        || starts("vmcall")
+        || starts("vmmcall")
+        || starts("vmlaunch")
+        || starts("vmresume")
+}
+
 // ── Stack-address escape pinning ─────────────────────────────────────────────
 
 /// Parse a direct `OFFSET(%rsp)`/`OFFSET(%rbp)` operand.  Indexed addresses are

@@ -67,7 +67,7 @@ fn apply_decl_address_space_to_spec(ts: &mut TypeSpecifier, space: AddressSpace)
             }
         }
         TypeSpecifier::Array(elem, _) => apply_decl_address_space_to_spec(elem, space),
-        TypeSpecifier::FunctionPointer(ret, _, _) | TypeSpecifier::BareFunction(ret, _, _) => {
+        TypeSpecifier::FunctionPointer(ret, ..) | TypeSpecifier::BareFunction(ret, ..) => {
             apply_decl_address_space_to_spec(ret, space)
         }
         _ => {}
@@ -251,6 +251,7 @@ impl Parser {
         self.attrs.set_uninitialized(false);
         let diagnose_as = self.attrs.parsing_diagnose_as.take();
         let is_used = self.attrs.parsing_used();
+        let is_maybe_unused = self.attrs.parsing_maybe_unused();
         let is_fastcall = self.attrs.parsing_fastcall();
         let regparm = self.attrs.parsing_regparm;
         let is_naked = self.attrs.parsing_naked();
@@ -279,6 +280,7 @@ impl Parser {
         decl_attrs.set_error_attr(is_error_attr);
         decl_attrs.set_noreturn(is_noreturn);
         decl_attrs.set_used(is_used);
+        decl_attrs.set_maybe_unused(is_maybe_unused);
         decl_attrs.set_fastcall(is_fastcall);
         decl_attrs.regparm = regparm;
         decl_attrs.set_naked(is_naked);
@@ -315,14 +317,14 @@ impl Parser {
 
         // Determine if this is a function definition
         let is_funcdef = !derived.is_empty()
-            && matches!(derived.last(), Some(DerivedDeclarator::Function(_, _)))
+            && matches!(derived.last(), Some(DerivedDeclarator::Function(..)))
             && (matches!(self.peek(), TokenKind::LBrace) || self.is_type_specifier());
 
         // S13: record file-scope function no_instrument_function
         // attributes so a later DEFINITION inherits them (GCC merges
         // declaration attributes into the definition).
         if let Some(n) = &name {
-            if matches!(derived.last(), Some(DerivedDeclarator::Function(_, _))) {
+            if matches!(derived.last(), Some(DerivedDeclarator::Function(..))) {
                 if decl_attrs.is_no_instrument() {
                     self.func_decl_no_instrument.insert(n.clone());
                 }
@@ -369,11 +371,12 @@ impl Parser {
         alignment: Option<usize>,
     ) -> Option<ExternalDecl> {
         self.attrs.set_typedef(false); // function defs are never typedefs
-        let (params, variadic) = if let Some(DerivedDeclarator::Function(p, v)) = derived.last() {
-            (p.clone(), *v)
-        } else {
-            (vec![], false)
-        };
+        let (params, variadic, has_prototype) =
+            if let Some(DerivedDeclarator::Function(p, v, has_prototype)) = derived.last() {
+                (p.clone(), *v, *has_prototype)
+            } else {
+                (vec![], false, false)
+            };
 
         // Handle K&R-style parameter declarations
         let is_kr_style = !matches!(self.peek(), TokenKind::LBrace);
@@ -454,6 +457,7 @@ impl Parser {
             name: name.unwrap_or_default(),
             params: final_params,
             variadic,
+            has_prototype: has_prototype && !is_kr_style,
             body,
             attrs: FunctionAttributes::for_definition(
                 &decl_attrs,
@@ -482,7 +486,7 @@ impl Parser {
         let mut return_type = base_type;
         let func_pos = derived
             .iter()
-            .position(|d| matches!(d, DerivedDeclarator::Function(_, _)));
+            .position(|d| matches!(d, DerivedDeclarator::Function(..)));
 
         if let Some(fpos) = func_pos {
             // Apply post-Function derivations (Array/Pointer). Space mapping
@@ -518,13 +522,17 @@ impl Parser {
             while i < prefix.len() {
                 match &prefix[i] {
                     DerivedDeclarator::Pointer(_) => {
-                        if let Some(DerivedDeclarator::FunctionPointer(params, variadic)) =
-                            prefix.get(i + 1)
+                        if let Some(DerivedDeclarator::FunctionPointer(
+                            params,
+                            variadic,
+                            has_prototype,
+                        )) = prefix.get(i + 1)
                         {
                             return_type = TypeSpecifier::FunctionPointer(
                                 Box::new(return_type),
                                 params.clone(),
                                 *variadic,
+                                *has_prototype,
                             );
                             i += 2;
                         } else {
@@ -544,11 +552,12 @@ impl Parser {
                             i += 1;
                         }
                     }
-                    DerivedDeclarator::FunctionPointer(params, variadic) => {
+                    DerivedDeclarator::FunctionPointer(params, variadic, has_prototype) => {
                         return_type = TypeSpecifier::FunctionPointer(
                             Box::new(return_type),
                             params.clone(),
                             *variadic,
+                            *has_prototype,
                         );
                         i += 1;
                     }
@@ -587,8 +596,13 @@ impl Parser {
                 loop {
                     let (pname, pderived) = self.parse_declarator();
                     if let Some(ref name) = pname {
-                        let (full_type, fptr_params, fptr_variadic, decayed_array) =
-                            self.apply_kr_derivations(&type_spec, &pderived);
+                        let (
+                            full_type,
+                            fptr_params,
+                            fptr_variadic,
+                            fptr_has_prototype,
+                            decayed_array,
+                        ) = self.apply_kr_derivations(&type_spec, &pderived);
                         // Compute fptr_inner_ptr_depth for K&R function pointer params.
                         // Count Pointer entries AFTER FunctionPointer in derived list;
                         // these represent extra indirection (pointer-to-function-pointer).
@@ -597,8 +611,8 @@ impl Parser {
                             let mut ptrs_after = 0u32;
                             for d in &pderived {
                                 match d {
-                                    DerivedDeclarator::FunctionPointer(_, _)
-                                    | DerivedDeclarator::Function(_, _) => {
+                                    DerivedDeclarator::FunctionPointer(..)
+                                    | DerivedDeclarator::Function(..) => {
                                         found_fptr = true;
                                     }
                                     DerivedDeclarator::Pointer(_) if found_fptr => {
@@ -617,6 +631,7 @@ impl Parser {
                                 param.type_spec = full_type.clone();
                                 param.fptr_params = fptr_params.clone();
                                 param.fptr_variadic = fptr_variadic;
+                                param.fptr_has_prototype = fptr_has_prototype;
                                 param.fptr_inner_ptr_depth = inner_depth;
                                 param.decayed_array = decayed_array;
                                 break;
@@ -636,14 +651,14 @@ impl Parser {
     }
 
     /// Apply derived declarators to build a K&R parameter's full type.
-    /// Returns (type_specifier, optional_fptr_params, fptr_variadic).
+    /// Returns (type_specifier, optional_fptr_params, fptr_variadic, fptr_has_prototype).
     /// For function pointer parameters like `int (*fp)(int, ...)`, this retains
     /// both the fixed parameters and the variadic tail, matching modern syntax.
     fn apply_kr_derivations(
         &self,
         type_spec: &TypeSpecifier,
         pderived: &[DerivedDeclarator],
-    ) -> (TypeSpecifier, Option<Vec<ParamDecl>>, bool, bool) {
+    ) -> (TypeSpecifier, Option<Vec<ParamDecl>>, bool, bool, bool) {
         let mut full_type = type_spec.clone();
 
         // Check if this is a function pointer parameter.
@@ -652,14 +667,14 @@ impl Parser {
         // We need to: (1) not apply the syntax-marker Pointer, (2) extract the
         // FunctionPointer params, and (3) apply one Pointer wrap for decay.
         let fptr_info = pderived.iter().find_map(|d| {
-            if let DerivedDeclarator::FunctionPointer(params, variadic) = d {
-                Some((params.clone(), *variadic))
+            if let DerivedDeclarator::FunctionPointer(params, variadic, has_prototype) = d {
+                Some((params.clone(), *variadic, *has_prototype))
             } else {
                 None
             }
         });
 
-        if let Some((fptr_params, variadic)) = fptr_info {
+        if let Some((fptr_params, variadic, has_prototype)) = fptr_info {
             // Function pointer parameter in K&R style.
             // Count how many Pointer derivations exist. For `int (*fp)()`:
             //   pderived = [Pointer, FunctionPointer([], false)]
@@ -691,7 +706,7 @@ impl Parser {
             // wrapper: the syntax-marker star's own level, whose space is the
             // previous star's (see pointee_space_before).
             full_type = TypeSpecifier::Pointer(Box::new(full_type), pending);
-            return (full_type, Some(fptr_params), variadic, false);
+            return (full_type, Some(fptr_params), variadic, has_prototype, false);
         }
 
         // Not a function pointer - apply all derivations normally.
@@ -724,11 +739,11 @@ impl Parser {
         }
         // Function params (bare function names) decay to pointers
         for d in pderived {
-            if let DerivedDeclarator::Function(_, _) = d {
+            if let DerivedDeclarator::Function(..) = d {
                 full_type = TypeSpecifier::Pointer(Box::new(full_type), AddressSpace::Default);
             }
         }
-        (full_type, None, false, decayed_array)
+        (full_type, None, false, false, decayed_array)
     }
 
     /// Parse the rest of a declaration (not a function definition).
@@ -745,6 +760,7 @@ impl Parser {
         // casts to segment-qualified pointers clear parsing_address_space
         // before Declaration::new would read it.
         let decl_addr_space = self.attrs.decl_address_space;
+        let spec_maybe_unused = ctx.attrs.is_maybe_unused();
         let init = if self.consume_if(&TokenKind::Assign) {
             Some(self.parse_initializer())
         } else {
@@ -769,7 +785,9 @@ impl Parser {
         // declarator of the statement (`auto double f(double), h(double);`), not
         // just the last one.
         let nested_fn_decl_level = self.attrs.parsing_nested_fn();
-        let last_decl = declarators.last_mut().expect("declarator just pushed");
+        let Some(last_decl) = declarators.last_mut() else {
+            return None;
+        };
         if let Some(reg) = extra_asm_reg {
             last_decl.attrs.asm_register = Some(reg);
         }
@@ -818,6 +836,9 @@ impl Parser {
         }
         if self.attrs.parsing_used() {
             last_decl.attrs.set_used(true);
+        }
+        if self.attrs.parsing_maybe_unused() {
+            last_decl.attrs.set_maybe_unused(true);
         }
         if self.attrs.parsing_noreturn() {
             last_decl.attrs.set_noreturn(true);
@@ -879,6 +900,7 @@ impl Parser {
         self.attrs.set_cold(false);
         self.attrs.parsing_cleanup_fn = None;
         self.attrs.set_used(false);
+        self.attrs.set_maybe_unused(false);
         self.attrs.set_fastcall(false);
         self.attrs.parsing_regparm = None;
         self.attrs.set_naked(false);
@@ -919,12 +941,14 @@ impl Parser {
                 .or_else(|| section.clone());
             let d_cleanup_fn = self.attrs.parsing_cleanup_fn.take();
             let d_used = self.attrs.parsing_used();
+            let d_maybe_unused = self.attrs.parsing_maybe_unused();
             let d_noreturn = self.attrs.parsing_noreturn();
             let d_pure = self.attrs.parsing_pure();
             let d_const_attr = self.attrs.parsing_const_attr();
             let d_error_attr = self.attrs.parsing_error_attr();
             self.attrs.set_weak(false);
             self.attrs.set_used(false);
+            self.attrs.set_maybe_unused(false);
             self.attrs.set_fastcall(false);
             self.attrs.set_naked(false);
             self.attrs.set_no_instrument(false);
@@ -954,6 +978,7 @@ impl Parser {
                     da.set_pure(d_pure);
                     da.set_const_attr(d_const_attr);
                     da.set_used(d_used);
+                    da.set_maybe_unused(d_maybe_unused || spec_maybe_unused);
                     da.set_fastcall(d_fastcall);
                     da.regparm = d_regparm;
                     da.alias_target = d_alias;
@@ -972,12 +997,15 @@ impl Parser {
                 span: start,
             });
             let (_, skip_aligned, skip_asm_reg) = self.skip_asm_and_attributes();
+            let Some(last_decl) = declarators.last_mut() else {
+                return None;
+            };
+            if self.attrs.parsing_maybe_unused() {
+                last_decl.attrs.set_maybe_unused(true);
+                self.attrs.set_maybe_unused(false);
+            }
             if let Some(reg) = skip_asm_reg {
-                declarators
-                    .last_mut()
-                    .expect("declarator just pushed")
-                    .attrs
-                    .asm_register = Some(reg);
+                last_decl.attrs.asm_register = Some(reg);
             }
             if let Some(a) = skip_aligned {
                 ctx.alignment = Some(ctx.alignment.map_or(a, |prev| prev.max(a)));
@@ -1050,6 +1078,8 @@ impl Parser {
         self.attrs.set_pointer_const(false);
         self.attrs.parsing_address_space = AddressSpace::Default;
         let type_spec = self.parse_type_specifier()?;
+        let spec_maybe_unused = self.attrs.parsing_maybe_unused();
+        self.attrs.set_maybe_unused(false);
 
         self.consume_post_type_qualifiers();
         // Specifier-level visibility / TLS model apply to every declarator;
@@ -1123,6 +1153,8 @@ impl Parser {
             );
             let l_base_volatile = self.attrs.declarator_base_volatile;
             let (skip_mode, skip_aligned, skip_asm_reg) = self.skip_asm_and_attributes();
+            let local_maybe_unused = spec_maybe_unused || self.attrs.parsing_maybe_unused();
+            self.attrs.set_maybe_unused(false);
             let local_uninitialized = spec_uninitialized || self.attrs.parsing_uninitialized();
             self.attrs.set_uninitialized(false);
             let local_cleanup_fn = self.attrs.parsing_cleanup_fn.take();
@@ -1159,6 +1191,7 @@ impl Parser {
                     da.cleanup_fn = local_cleanup_fn;
                     da.set_uninitialized(local_uninitialized);
                     da.set_used(self.attrs.parsing_used());
+                    da.set_maybe_unused(local_maybe_unused);
                     da.set_nested_fn(self.attrs.parsing_nested_fn());
                     da.set_noreturn(self.attrs.parsing_noreturn());
                     da.set_pure(self.attrs.parsing_pure());
@@ -1184,6 +1217,13 @@ impl Parser {
                 span: start,
             });
             let (_, post_init_aligned, _post_asm_reg) = self.skip_asm_and_attributes();
+            let Some(last_decl) = declarators.last_mut() else {
+                return None;
+            };
+            if self.attrs.parsing_maybe_unused() {
+                last_decl.attrs.set_maybe_unused(true);
+                self.attrs.set_maybe_unused(false);
+            }
             if let Some(a) = post_init_aligned {
                 alignment = Some(alignment.map_or(a, |prev| prev.max(a)));
             }
@@ -1844,7 +1884,7 @@ mod seg_placement_tests {
                 _ => Some(*sp),
             },
             TypeSpecifier::Array(elem, _) => innermost_space(elem),
-            TypeSpecifier::FunctionPointer(ret, _, _) | TypeSpecifier::BareFunction(ret, _, _) => {
+            TypeSpecifier::FunctionPointer(ret, ..) | TypeSpecifier::BareFunction(ret, ..) => {
                 innermost_space(ret)
             }
             _ => None,
@@ -1875,7 +1915,7 @@ mod seg_placement_tests {
     #[test]
     fn function_pointer_qualifies_return_pointer_not_itself() {
         // struct c __seg_gs *(*fp)(void)
-        let mut t = TypeSpecifier::FunctionPointer(Box::new(ptr(base())), Vec::new(), false);
+        let mut t = TypeSpecifier::FunctionPointer(Box::new(ptr(base())), Vec::new(), false, true);
         apply_decl_address_space_to_spec(&mut t, AddressSpace::SegGs);
         assert_eq!(innermost_space(&t), Some(AddressSpace::SegGs));
     }
@@ -1883,7 +1923,7 @@ mod seg_placement_tests {
     #[test]
     fn bare_function_qualifies_return_pointer() {
         // struct c __seg_gs *f(void)
-        let mut t = TypeSpecifier::BareFunction(Box::new(ptr(base())), Vec::new(), false);
+        let mut t = TypeSpecifier::BareFunction(Box::new(ptr(base())), Vec::new(), false, true);
         apply_decl_address_space_to_spec(&mut t, AddressSpace::SegGs);
         assert_eq!(innermost_space(&t), Some(AddressSpace::SegGs));
     }

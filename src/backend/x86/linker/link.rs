@@ -886,6 +886,14 @@ pub fn link_builtin(
         &dead_sections,
     );
     linker_common::apply_cie_redirects(&mut objects, &section_map, &eh_packing)?;
+    if !parsed_args.strip_all {
+        linker_common::merge_debug_sections_elf64(
+            &objects,
+            &mut output_sections,
+            &mut section_map,
+            &dead_sections,
+        )?;
+    }
 
     // Point folded sections at the representative's placement. This must run
     // after the merge, when the survivor has a real (output, offset) pair, and
@@ -1325,6 +1333,12 @@ pub fn link_shared(
         &dead_sections,
     );
     linker_common::apply_cie_redirects(&mut objects, &section_map, &eh_packing)?;
+    linker_common::merge_debug_sections_elf64(
+        &objects,
+        &mut output_sections,
+        &mut section_map,
+        &dead_sections,
+    )?;
     // Point folded sections at the representative's placement: same order
     // as `link_builtin` (after the merge, before any address assignment).
     if !icf_plan.is_empty() {

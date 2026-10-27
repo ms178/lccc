@@ -1685,13 +1685,15 @@ impl Lowerer {
                 // Fall back to sema's function signatures for function-typed identifiers
                 // (e.g., taking address of a function: &func_name)
                 if let Some(func_info) = self.sema_functions.get(name.as_str()) {
-                    return Some(CType::Function(Box::new(
+                    let callable_type = func_info.prototype.clone().unwrap_or_else(|| {
                         crate::common::types::FunctionType {
                             return_type: func_info.return_type.clone(),
-                            params: func_info.params.clone(),
+                            params: Vec::new(),
                             variadic: func_info.variadic,
-                        },
-                    )));
+                            has_prototype: false,
+                        }
+                    });
+                    return Some(CType::Function(Box::new(callable_type)));
                 }
                 None
             }

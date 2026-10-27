@@ -99,6 +99,45 @@ check_gt0 "-march=x86-64-v3 AVX2 vectorization (ymm)" "$(count_ymm $tmp/march-v3
 check_gt0 "-march=x86-64-v3 nonzero ctz uses TZCNT" "$(count_tzcnt $tmp/march-v3.s)"
 check_gt0 "-march=x86-64-v3 nonzero clz uses LZCNT" "$(count_lzcnt $tmp/march-v3.s)"
 
+# Per-function target attributes raise the middle-end ISA only around that
+# function. GCC and Clang both vectorize this signed reduction at -O2 with a
+# function-level target("avx2") and no translation-unit -mavx2 flag.
+function_target_src="$repo/tests/regression/per_function_target_avx2_reduction/reduction.c"
+"$ccc" -O2 -S "$function_target_src" -o "$tmp/function-target.s"
+awk '/^sum_i32_avx2:/ { inside = 1 } /^sum_i32_baseline:/ { inside = 0 } inside' \
+    "$tmp/function-target.s" > "$tmp/function-target-avx2.s"
+awk '/^sum_i32_baseline:/ { inside = 1 } inside' \
+    "$tmp/function-target.s" > "$tmp/function-target-baseline.s"
+check_gt0 'target("avx2") function receives YMM vectorization' \
+    "$(count_ymm "$tmp/function-target-avx2.s")"
+check_eq 'target("avx2") does not leak into baseline function' \
+    "$(count_ymm "$tmp/function-target-baseline.s")" 0
+cat > "$tmp/function-target-main.c" <<'EOF'
+int sum_i32_avx2(const int *values, int count);
+int sum_i32_baseline(const int *values, int count);
+
+int main(void) {
+    int values[35];
+    for (int i = 0; i < 35; ++i)
+        values[i] = (i * 17 % 23) - 11;
+    for (int count = 0; count <= 35; ++count) {
+        int expected = 0;
+        for (int i = 0; i < count; ++i)
+            expected += values[i];
+        if (sum_i32_avx2(values, count) != expected ||
+            sum_i32_baseline(values, count) != expected)
+            return 1;
+    }
+    return 0;
+}
+EOF
+"$ccc" -O2 "$function_target_src" "$tmp/function-target-main.c" \
+    -o "$tmp/function-target.bin"
+if ! "$tmp/function-target.bin"; then
+    echo 'FAIL: target("avx2") reduction disagrees with its scalar reference' >&2
+    fail=1
+fi
+
 # ---- 2. -mno-avx: downgrade to SSE2, keep vectorizing ---------------------
 for flag in -mno-avx -mno-avx2 -mno-sse4.1; do
     lbl=${flag#-m}; lbl=n${lbl#no-}

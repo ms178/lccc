@@ -268,6 +268,7 @@ SIMD-optimized code paths.
 The `-std=` flag controls GNU extensions and inline semantics:
 
 - `gnu89`, `gnu99`, `gnu11`, `gnu17`, `gnu23`: GNU extensions enabled
+- With no `-std=` flag, the default is `gnu23`, matching GCC 16.2; pass `-std=gnu17` (or another explicit dialect) to select older semantics.
 - `c89`, `c99`, `c11`, `c17`, `c23`, `iso9899:*`: strict ISO C (GNU extensions
   disabled)
 - `gnu89`, `c89`, `gnu90`, `c90`, `iso9899:1990`, `iso9899:199409`: GNU89
