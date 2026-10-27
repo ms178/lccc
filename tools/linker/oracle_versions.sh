@@ -29,8 +29,9 @@ oracle_require_version() {
     fi
 }
 
-# A native bfd oracle also depends on its dynamic-tag and library-search
-# configuration. Missing/old cache stamps must not validate on version alone.
+# The cached BFD executable has upstream defaults; the native profile is
+# applied by the stable wrapper. This stamp fingerprints that wrapper's
+# dynamic-tag and library-search configuration, so version alone is not enough.
 oracle_native_layout_matches() {
     local stamp=$1 expected=$2
     [[ -f $stamp ]] && [[ $(cat "$stamp") == "$expected" ]]

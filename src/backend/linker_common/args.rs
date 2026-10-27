@@ -131,8 +131,9 @@ pub struct LinkerArgs {
     /// the link path can fail with GNU's `invalid x86-64 ISA level` fatal
     /// instead of silently ignoring the typo.
     pub z_isa_level_invalid: Option<String>,
-    /// `-z ibt=func` & co: keyword forms GNU ld accepts and ignores with a
-    /// warning.  Collected here so the driver can print the warning once.
+    /// Keyword forms accepted but not implemented and therefore warned about
+    /// (`-z ibt=func` & co, and a distinct `common-page-size=` granularity).
+    /// Collected here so the link path can apply `--fatal-warnings` too.
     pub z_ignored_keywords: Vec<String>,
     /// `--emit-relocs` / `-q`: keep the applied relocations in `.rela.*`
     /// sections (the kernel's arch/x86/tools/relocs pass consumes them).
@@ -143,10 +144,10 @@ pub struct LinkerArgs {
     /// `-z` keywords that only set `DF_1_*` / `DF_*` dynamic flags:
     /// origin, nodelete, nodlopen, initfirst, interpose, nodefaultlib.
     pub z_dyn_flag_keywords: Vec<String>,
-    /// Other `-z KEYWORD[=VALUE]` spellings the shared parser does not act
-    /// on (max-page-size=, common-page-size=, separate-code, text, ...),
-    /// kept verbatim so a backend can implement or reject them instead of
-    /// the keyword silently vanishing.
+    /// Other `-z KEYWORD[=VALUE]` spellings retained for backend-specific
+    /// handling (for example `separate-code`, `text`, and unknown keywords).
+    /// Any accepted-but-unimplemented diagnostic request belongs in
+    /// `z_ignored_keywords` so it cannot disappear silently.
     pub z_other_keywords: Vec<String>,
     /// Positional file operands that do not exist.  GNU ld reports
     /// `cannot find FILE: No such file or directory`; callers that resolve
@@ -177,10 +178,16 @@ pub struct LinkerArgs {
     /// `-z max-page-size=N`: power-of-two segment page alignment (>= 4096).
     pub max_page_size: Option<u64>,
     pub max_page_size_invalid: Option<String>,
+    /// Invalid `-z common-page-size=N` value, if any. The value is validated
+    /// against GNU ld, but its distinct layout effect is not implemented.
+    pub common_page_size_invalid: Option<String>,
     /// Invalid `--pack-dyn-relocs=` value, if any.
     pub pack_dyn_relocs_invalid: Option<String>,
     /// `-t` / `--trace`: print each input file / archive member as loaded.
     pub trace_files: bool,
+    /// `--warn-common` requests a duplicate-COMMON diagnostic that the
+    /// built-in linker does not yet implement; keep it visible for warnings.
+    pub warn_common: bool,
     /// `--fatal-warnings` / `--no-fatal-warnings`.
     pub fatal_warnings: bool,
     /// `--print-memory-usage`: print MEMORY / segment usage summary.
@@ -190,8 +197,8 @@ pub struct LinkerArgs {
 }
 
 impl LinkerArgs {
-    /// Validate common option values (`--build-id`, `--image-base`, `-z max-page-size`,
-    /// `--pack-dyn-relocs`).
+    /// Validate common option values (`--build-id`, `--image-base`, `-z max-page-size`
+    /// / `common-page-size`, and `--pack-dyn-relocs`).
     pub fn validate_common_options(&self) -> Result<(), String> {
         let _ = self.resolved_build_id_style()?;
         if let Some(bad) = &self.image_base_invalid {
@@ -202,10 +209,45 @@ impl LinkerArgs {
                 "invalid page size '{bad}': must be a power of two >= 0x1000"
             ));
         }
+        self.validate_common_page_size()?;
         if let Some(bad) = &self.pack_dyn_relocs_invalid {
             return Err(format!(
                 "unknown --pack-dyn-relocs format '{bad}' (expected relr or none)"
             ));
+        }
+        Ok(())
+    }
+
+    /// Validate the `-z common-page-size` argument without applying it. Linker
+    /// script mode does not use the ordinary backend option validator, but GNU
+    /// ld still rejects malformed/non-power-of-two values there.
+    pub fn validate_common_page_size(&self) -> Result<(), String> {
+        if let Some(bad) = &self.common_page_size_invalid {
+            return Err(format!("invalid common page size `{bad}`"));
+        }
+        Ok(())
+    }
+
+    /// Warn about accepted diagnostic/keyword options whose behavior the
+    /// built-in backend does not implement, honoring the final
+    /// `--fatal-warnings` state. Target-specific backends call this for the
+    /// shared `-z KEY=VALUE` warning set and `--warn-common` request.
+    pub fn warn_unimplemented_keyword_options(&self) -> Result<(), String> {
+        let mut warnings: Vec<String> = self
+            .z_ignored_keywords
+            .iter()
+            .map(|kw| format!("-z {kw} ignored"))
+            .collect();
+        if self.warn_common {
+            warnings.push(
+                "--warn-common ignored: common-symbol diagnostics are not implemented".to_string(),
+            );
+        }
+        if self.fatal_warnings && !warnings.is_empty() {
+            return Err(format!("warning treated as error: {}", warnings[0]));
+        }
+        for warning in &warnings {
+            eprintln!("lccc-ld: warning: {warning}");
         }
         Ok(())
     }
@@ -392,6 +434,9 @@ fn misc_option(result: &mut LinkerArgs, tok: &str) -> bool {
         "--no-sort-common" => {
             result.sort_common = false;
         }
+        "--warn-common" => {
+            result.warn_common = true;
+        }
         "--no-threads" => {
             result.threads = None;
         }
@@ -445,6 +490,37 @@ fn parse_u64_addr(raw: &str) -> Option<u64> {
     } else {
         s.parse::<u64>().ok()
     }
+}
+
+/// Parse the integer spelling used by GNU ld's `-z common-page-size`.
+/// `strtoul(..., 0)`-style inputs include decimal, hexadecimal, octal, and a
+/// leading plus; an empty value is accepted by BFD as zero.
+fn parse_common_page_size(raw: &str) -> Option<u64> {
+    let mut s = raw.trim();
+    if s.is_empty() {
+        return Some(0);
+    }
+    let negative = s.starts_with('-');
+    if negative || s.starts_with('+') {
+        s = &s[1..];
+    }
+    if s.is_empty() {
+        return None;
+    }
+    let value = if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u64::from_str_radix(hex, 16).ok()
+    } else if s.len() > 1 && s.starts_with('0') {
+        u64::from_str_radix(&s[1..], 8).ok()
+    } else {
+        s.parse::<u64>().ok()
+    }?;
+    // BFD uses an unsigned conversion: apply a negative sign modulo 2^64.
+    // Some unusual negative spellings therefore wrap to valid powers of two.
+    Some(if negative {
+        value.wrapping_neg()
+    } else {
+        value
+    })
 }
 
 fn apply_kv_option(result: &mut LinkerArgs, tok: &str, next: Option<&str>) -> Option<bool> {
@@ -604,12 +680,23 @@ fn apply_z_keyword(result: &mut LinkerArgs, kw: &str) {
             }
             result.z_other_keywords.push(kw.to_string());
         }
+        "common-page-size" => {
+            // BFD accepts the bare spelling but warns that it is ignored.
+            result.z_ignored_keywords.push(kw.to_string());
+        }
         k if k.starts_with("common-page-size=") => {
             let v = &k["common-page-size=".len()..];
-            if !matches!(parse_u64_addr(v), Some(n) if n >= 0x1000 && n.is_power_of_two()) {
-                result.max_page_size_invalid = Some(v.to_string());
+            match parse_common_page_size(v) {
+                Some(n) if n == 0 || n.is_power_of_two() => {
+                    result.common_page_size_invalid = None;
+                }
+                _ => result.common_page_size_invalid = Some(v.to_string()),
             }
-            result.z_other_keywords.push(kw.to_string());
+            // Layout currently has one page-granularity control. A distinct
+            // common-page-size is not implemented, so keep the request visible
+            // to the linker's warning/fatal-warning policy rather than storing
+            // it in the silently ignored generic keyword bucket.
+            result.z_ignored_keywords.push(kw.to_string());
         }
         _ => result.z_other_keywords.push(kw.to_string()),
     }
@@ -1641,6 +1728,107 @@ mod z_isa_level_tests {
         let r = parse_linker_args(&args(&["-Wl,-zx86-64-foo"]));
         assert_eq!(r.z_isa_level_invalid, None);
         assert!(r.z_ignored_keywords.iter().any(|k| k == "x86-64-foo"));
+    }
+
+    /// Common-page-size values are validated like GNU ld even though this
+    /// backend warns that the separate layout granularity is not implemented.
+    #[test]
+    fn common_page_size_values_are_validated_independently() {
+        for value in [
+            "",
+            "0",
+            "-0",
+            "1",
+            "2",
+            "0x800",
+            "010",
+            "+16",
+            "-18446744073709551614",
+            "-18446744073709551615",
+        ] {
+            let arg = format!("-Wl,-z,common-page-size={value}");
+            let r = parse_linker_args(&args(&[&arg]));
+            assert_eq!(r.common_page_size_invalid, None, "value {value:?}");
+            assert_eq!(r.max_page_size_invalid, None, "value {value:?}");
+            assert!(
+                r.z_ignored_keywords
+                    .iter()
+                    .any(|kw| kw == &format!("common-page-size={value}")),
+                "value {value:?} must remain visible to the warning policy"
+            );
+        }
+
+        for value in [
+            "bad",
+            "3",
+            "0x1800",
+            "08",
+            "+",
+            "-1",
+            "-18446744073709551616",
+        ] {
+            let arg = format!("-Wl,-z,common-page-size={value}");
+            let r = parse_linker_args(&args(&[&arg]));
+            assert_eq!(
+                r.common_page_size_invalid.as_deref(),
+                Some(value),
+                "value {value:?} must be rejected"
+            );
+            assert_eq!(r.max_page_size_invalid, None, "value {value:?}");
+            assert_eq!(
+                r.validate_common_page_size().unwrap_err(),
+                format!("invalid common page size `{value}`")
+            );
+        }
+
+        let bare = parse_linker_args(&args(&["-Wl,-z,common-page-size"]));
+        assert_eq!(bare.common_page_size_invalid, None);
+        assert!(
+            bare.z_ignored_keywords
+                .iter()
+                .any(|kw| kw == "common-page-size")
+        );
+
+        let common_bad = parse_linker_args(&args(&[
+            "-Wl,-z,common-page-size=3",
+            "-Wl,-z,max-page-size=0x1000",
+        ]));
+        assert_eq!(common_bad.common_page_size_invalid.as_deref(), Some("3"));
+        assert_eq!(common_bad.max_page_size_invalid, None);
+        let max_bad = parse_linker_args(&args(&[
+            "-Wl,-z,max-page-size=3",
+            "-Wl,-z,common-page-size=0x1000",
+        ]));
+        assert_eq!(max_bad.max_page_size_invalid.as_deref(), Some("3"));
+        assert_eq!(max_bad.common_page_size_invalid, None);
+    }
+
+    #[test]
+    fn warn_common_is_retained_for_driver_links() {
+        let plain = parse_linker_args(&args(&["--warn-common"]));
+        assert!(plain.warn_common);
+
+        let via_wl = parse_linker_args(&args(&["-Wl,--warn-common"]));
+        assert!(via_wl.warn_common);
+
+        let fatal = parse_linker_args(&args(&["-Wl,--fatal-warnings,--warn-common"]));
+        assert!(fatal.warn_common);
+        assert!(fatal.fatal_warnings);
+    }
+
+    #[test]
+    fn ignored_keyword_warnings_obey_fatal_state() {
+        let warning = parse_linker_args(&args(&["-Wl,-z,common-page-size=0x1000"]));
+        assert!(warning.warn_unimplemented_keyword_options().is_ok());
+
+        let fatal = parse_linker_args(&args(&[
+            "-Wl,-z,common-page-size=0x1000",
+            "-Wl,--fatal-warnings",
+        ]));
+        assert_eq!(
+            fatal.warn_unimplemented_keyword_options().unwrap_err(),
+            "warning treated as error: -z common-page-size=0x1000 ignored"
+        );
     }
 
     /// `--no-undefined-version` is a real GNU flag ("Disallow undefined

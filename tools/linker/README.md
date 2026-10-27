@@ -41,6 +41,14 @@ check accepts explicitly alongside `2.47`; it still rejects `2.470`, `2.47.1`,
 and other dated snapshots. This is not permission to substitute any version
 whose directory happens to contain `2.47`.
 
+The cache's raw BFD executable retains upstream defaults, so the stable
+`ld-2.47` wrapper supplies the declared native profile: `/` sysroot,
+`--enable-new-dtags`, and the host's multiarch library directories after
+caller-provided `-L` paths. Explicit linker options still override those
+defaults, and `-nostdlib` suppresses the injected native search paths. Use the
+wrapper in `$LINKDIR` for comparisons; the raw cache binary is not the native
+oracle interface.
+
 `WITH_WILD=0` removes wild from the oracle set
 for that run: no build, no `wild` wrapper (a stale one is deleted) and no
 inventory entry; an already-built binary stays cached for a later

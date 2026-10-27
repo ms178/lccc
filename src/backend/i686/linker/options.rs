@@ -304,7 +304,7 @@ pub(super) fn check_capabilities(
             // Duplicate strong definitions resolve to the first one
             // (never diagnosed by this linker), which is exactly muldefs.
             ("muldefs", None) => {}
-            ("max-page-size" | "common-page-size", Some(_)) => {}
+            ("max-page-size", Some(_)) => {}
             ("nocopyreloc", None) => return unsupported("-z nocopyreloc"),
             _ => warnings.push(format!("-z {kw} ignored")),
         }
@@ -328,6 +328,11 @@ pub(super) fn check_capabilities(
     properties.lam_u57 = false;
     for kw in &args.z_ignored_keywords {
         warnings.push(format!("-z {kw} ignored"));
+    }
+    if args.warn_common {
+        warnings.push(
+            "--warn-common ignored: common-symbol diagnostics are not implemented".to_string(),
+        );
     }
     if args.fatal_warnings && !warnings.is_empty() {
         return Err(format!("warning treated as error: {}", warnings[0]));

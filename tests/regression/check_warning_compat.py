@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check GCC-compatible warning groups and suppression for frontend warnings."""
+"""Check GCC-compatible warning groups, format security, and suppression."""
 
 from __future__ import annotations
 
@@ -43,10 +43,20 @@ int warning_negative_constant_probe(unsigned int u) {
 }
 '''
 
+FORMAT_SECURITY_SOURCE = r'''
+extern int printf(const char *, ...) __attribute__((format(printf, 1, 2)));
+void warning_format_security_probe(const char *user_format) {
+    printf(user_format);
+    printf(user_format, 1);
+    printf("%s", user_format);
+}
+'''
+
 FEATURES = {
     "unused": "unused variable",
     "format": "format '%d'",
     "sign": "different signedness",
+    "format-security": "format not a string literal and no format arguments",
 }
 CASES = {
     "default": ((), set()),
@@ -61,6 +71,27 @@ CASES = {
     "disable-sign": (("-Wextra", "-Wno-sign-compare"), set()),
     "disable-sign-wall-extra": (("-Wall", "-Wextra", "-Wno-sign-compare"), {"unused", "format"}),
 }
+
+FORMAT_SECURITY_CASES = (
+    ("format-security", ("-Wformat", "-Wformat-security"), {"format-security"}),
+    ("format-security-without-format", ("-Wformat-security",), set()),
+    (
+        "format-security-disabled",
+        ("-Wformat", "-Wformat-security", "-Wno-format-security"),
+        set(),
+    ),
+    (
+        "format-security-format-disabled",
+        ("-Wformat", "-Wformat-security", "-Wno-format"),
+        set(),
+    ),
+    (
+        "format-security-demoted",
+        ("-Wall", "-Wformat-security", "-Werror", "-Wno-error=format-security"),
+        {"format-security"},
+    ),
+)
+FORMAT_SECURITY_ERROR_FLAGS = ("-Wformat", "-Werror=format-security")
 
 
 def compiler_version(command: list[str]) -> str:
@@ -98,6 +129,24 @@ def run_case(label: str, command: list[str], flags: tuple[str, ...], source: Pat
     return found
 
 
+def run_format_security_error(
+    label: str, command: list[str], flags: tuple[str, ...], source: Path
+) -> None:
+    proc = subprocess.run(
+        command + ["-std=c23", "-fsyntax-only", *flags, str(source)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+    if proc.returncode == 0:
+        raise RuntimeError(f"{label} {flags} did not promote format-security to an error")
+    if "format not a string literal and no format arguments" not in proc.stderr:
+        raise RuntimeError(f"{label} {flags} failed without the expected diagnostic:\n{proc.stderr}")
+    if "[-Werror=format-security]" not in proc.stderr:
+        raise RuntimeError(f"{label} {flags} omitted the GCC-compatible error suffix:\n{proc.stderr}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--lccc", default="target/fastbuild/lccc")
@@ -108,6 +157,9 @@ def main() -> int:
         assert CASES["wextra"][1] == {"sign"}
         assert CASES["wall"][1] == {"unused", "format"}
         assert CASES["wall-extra"][1] == {"unused", "format", "sign"}
+        assert FORMAT_SECURITY_CASES[0][2] == {"format-security"}
+        assert FORMAT_SECURITY_CASES[2][2] == set()
+        assert FORMAT_SECURITY_ERROR_FLAGS == ("-Wformat", "-Werror=format-security")
         print("warning compatibility manifest self-test: PASS")
         return 0
 
@@ -149,6 +201,21 @@ def main() -> int:
                     f"got GCC {sorted(gcc_found)}, LCCC {sorted(lccc_found)}"
                 )
             print(f"warning compatibility {label}: PASS ({', '.join(sorted(lccc_found)) or 'silent'})")
+
+        source.write_text(FORMAT_SECURITY_SOURCE, encoding="utf-8")
+        for label, flags, expected in FORMAT_SECURITY_CASES:
+            gcc_found = run_case("GCC 16.2", gcc, flags, source)
+            lccc_found = run_case("LCCC", lccc, flags, source)
+            if gcc_found != expected or lccc_found != gcc_found:
+                raise RuntimeError(
+                    f"{label}: expected GCC/LCCC {sorted(expected)}, "
+                    f"got GCC {sorted(gcc_found)}, LCCC {sorted(lccc_found)}"
+                )
+            print(f"warning compatibility {label}: PASS ({', '.join(sorted(lccc_found)) or 'silent'})")
+
+        for label, compiler in (("GCC 16.2", gcc), ("LCCC", lccc)):
+            run_format_security_error(label, compiler, FORMAT_SECURITY_ERROR_FLAGS, source)
+        print("warning compatibility format-security-error: PASS (fatal in GCC and LCCC)")
 
     print(f"warning compatibility gate: PASS (GCC {version})")
     return 0

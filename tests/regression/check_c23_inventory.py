@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Iterable
 
 ROOT = Path(__file__).resolve().parents[2]
-INVENTORY_DATE = "2026-10-26"
+INVENTORY_DATE = "2026-10-27"
 MODES: dict[str, tuple[str, ...]] = {
     "c23": ("-std=c23",),
     "c17": ("-std=c17",),
@@ -392,6 +392,7 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, object], int]:
     results: list[dict[str, object]] = []
     gcc_expectation_failures: list[str] = []
     c23_differences: list[str] = []
+    c17_differences: list[str] = []
     source_hashes: dict[str, str] = {}
 
     with tempfile.TemporaryDirectory(prefix="lccc-c23-inventory-") as temp:
@@ -426,6 +427,8 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, object], int]:
                     )
                 if mode == "c23" and gcc_result["verdict"] != lccc_result["verdict"]:
                     c23_differences.append(probe.name)
+                if mode == "c17" and gcc_result["verdict"] != lccc_result["verdict"]:
+                    c17_differences.append(probe.name)
                 mode_results[mode] = {
                     "expected": expected,
                     "gcc": gcc_result,
@@ -451,6 +454,7 @@ def execute(args: argparse.Namespace) -> tuple[dict[str, object], int]:
         "results": results,
         "gcc_expectation_failures": gcc_expectation_failures,
         "lccc_gcc_c23_differences": sorted(set(c23_differences)),
+        "lccc_gcc_c17_differences": sorted(set(c17_differences)),
     }
     return report, len(gcc_expectation_failures)
 
@@ -512,6 +516,12 @@ def markdown(report: dict[str, object]) -> str:
     )
     if diffs:
         lines.extend(f"- `{name}`" for name in diffs)  # type: ignore[union-attr]
+    else:
+        lines.append("- None in this probe set.")
+    c17_diffs = report.get("lccc_gcc_c17_differences", [])
+    lines.extend(["", "## Measured C17 mode differences", ""])
+    if c17_diffs:
+        lines.extend(f"- `{name}`" for name in c17_diffs)  # type: ignore[union-attr]
     else:
         lines.append("- None in this probe set.")
     failures = report.get("gcc_expectation_failures", [])

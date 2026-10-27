@@ -1903,17 +1903,18 @@ impl Driver {
                 //   -Wno-error=<name> gcc: rc 1   clang/icc/icx: accept
                 //   -Wno-<name>       all four: accept, silently
                 //
-                // LCCC implements SIX warning names; GNU exposes 409
-                // (`gcc -Q --help=warnings | grep -c '^  -W'`, measured).  A
-                // driver with six names of a 409-name namespace cannot decide
-                // whether a name it does not implement is a typo or a warning
-                // added by a newer GNU -- so it must not guess in the
-                // direction that stops a build that GNU builds, and it must
-                // not guess "supported" either.  Both are avoided by
+                // WarningConfig models ten categories (including the
+                // compatibility-only `undeclared` switch); GNU exposes 409
+                // (`gcc -Q --help=warnings | grep -c '^  -W'`, measured). A
+                // driver with a small implemented subset of a 409-name
+                // namespace cannot decide whether an unimplemented name is a
+                // typo or a warning added by a newer GNU -- so it must not
+                // guess in the direction that stops a build GNU accepts, and
+                // it must not guess "supported" either. Both are avoided by
                 // diagnosing the name (which a `-Wno-` request does not need:
                 // LCCC emits no such warning, so "off" is already the state)
                 // and making it fatal under `LCCC_STRICT_OPTIONS=1`, which is
-                // what the capability probe exports.  The consequence of
+                // what the capability probe exports. The consequence of
                 // tolerating a name is a missing diagnostic, never different
                 // code -- which is why this namespace, unlike `-f`/`--`/`-g`,
                 // is not fail-closed by default.

@@ -497,8 +497,8 @@ def case_archive_semantics(e):
 
 
 def case_options_and_tags(e):
-    """Semantic options land in the image: -e, -rpath (RUNPATH vs RPATH as
-    the reference linker chooses), -soname, -z now/relro/norelro/execstack,
+    """Semantic options land in the image: -e, -rpath with explicit
+    --enable-new-dtags (RUNPATH), -soname, -z now/relro/norelro/execstack,
     --hash-style, --build-id, -Bsymbolic, --export-dynamic; unsupported
     ones are refused with a diagnostic instead of being ignored."""
     _w(e.td, "entry.c", r"""
@@ -525,7 +525,8 @@ def case_options_and_tags(e):
         raise Fail("-soname not recorded")
     for sub, lccc in (("ref", False), ("new", True)):
         _ok(e.gcc("-no-pie", "rm.c", "-Llib", "-lrl", "-Wl,-rpath,$ORIGIN/lib",
-                  "-o", f"rp_{sub}", lccc=lccc), f"{sub} -rpath link")
+                  "-Wl,--enable-new-dtags", "-o", f"rp_{sub}", lccc=lccc),
+            f"{sub} -rpath link")
     new, ref = Elf32(e.path("rp_new")), Elf32(e.path("rp_ref"))
     for kind in ("RPATH", "RUNPATH"):
         if new.strs(kind) != ref.strs(kind):
@@ -780,10 +781,11 @@ def case_text_relocations(e):
     """Text relocations in an i386 shared object follow GNU ld's policy.
 
     Absolute `R_386_32` fields in `.text` and `.rodata` of a non-PIC shared
-    object become dynamic relocations in read-only storage.  Differential
-    against GNU ld: by default both warn about the first site and that
-    DT_TEXTREL is created, and emit DT_TEXTREL + DF_TEXTREL; `-z text` is
-    refused with GNU's message; `-z notext` is silent.  lccc-ld used to
+    object become dynamic relocations in read-only storage. Differential
+    against GNU ld: by default both warn about the first site and identify
+    text relocations with DT_TEXTREL and/or DF_TEXTREL; BFD 2.47 can omit the
+    redundant DF_TEXTREL bit. `-z text` is refused with GNU's message;
+    `-z notext` is silent. lccc-ld used to
     emit the tags silently and reject `-z text` with a message of its own;
     the library must still run.
     """
@@ -800,8 +802,8 @@ def case_text_relocations(e):
                 or b"tr.o: warning: relocation in read-only section `." not in r.stderr):
             raise Fail(f"{who}: default link must warn like GNU ld: {r.stderr[:300]!r}")
         img = Elf32(e.path("libtr.so"))
-        if not img.has("TEXTREL") or not img.flags() & DF_TEXTREL:
-            raise Fail(f"{who}: DT_TEXTREL/DF_TEXTREL missing")
+        if not img.has("TEXTREL") and not img.flags() & DF_TEXTREL:
+            raise Fail(f"{who}: DT_TEXTREL/DF_TEXTREL marker missing")
         r = e.gcc("-shared", "tr.o", "-Wl,-z,text", "-o", "libtr_zt.so", lccc=lccc)
         if r.returncode == 0 or b"read-only segment has dynamic relocations" not in r.stderr:
             raise Fail(f"{who} -z text: rc={r.returncode} {r.stderr[:300]!r}")

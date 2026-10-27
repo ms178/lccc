@@ -115,6 +115,9 @@ pub enum WarningKind {
     /// A printf-family format string does not match its variadic arguments.
     /// GCC flag: -Wformat (enabled by -Wall).
     Format,
+    /// A printf-family call uses a non-literal format with no format arguments.
+    /// GCC flag: -Wformat-security (must be combined with -Wformat).
+    FormatSecurity,
 }
 
 impl WarningKind {
@@ -130,6 +133,7 @@ impl WarningKind {
             WarningKind::UnusedVariable => "unused-variable",
             WarningKind::SignCompare => "sign-compare",
             WarningKind::Format => "format",
+            WarningKind::FormatSecurity => "format-security",
         }
     }
 
@@ -147,6 +151,7 @@ impl WarningKind {
             "unused-variable" => Some(WarningKind::UnusedVariable),
             "sign-compare" => Some(WarningKind::SignCompare),
             "format" => Some(WarningKind::Format),
+            "format-security" => Some(WarningKind::FormatSecurity),
             _ => None,
         }
     }

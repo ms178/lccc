@@ -3459,7 +3459,7 @@ impl SemanticAnalyzer {
             self.analyze_expr(arg);
         }
         if let Expr::Identifier(name, _) = callee {
-            self.check_printf_format(name, args);
+            self.check_printf_format(name, args, expr.span());
         }
         // Resolve the callable through lexical scope, not through
         // the TU-wide body-metadata map. Local function pointers and
@@ -3488,10 +3488,11 @@ impl SemanticAnalyzer {
     }
 
     /// Check printf-family calls against a literal format string, matching
-    /// GCC's ordinary `-Wformat` argument checks. This intentionally stops at
-    /// compile-time literal formats; dynamic format validation belongs at run
-    /// time and custom `format` attributes are handled separately.
-    fn check_printf_format(&self, name: &str, args: &[Expr]) {
+    /// GCC's ordinary `-Wformat` argument checks. Dynamic formats are checked
+    /// only for the narrower `-Wformat-security` case: no variadic format
+    /// arguments were supplied. General nonliteral-format checking and custom
+    /// `format` attributes remain separate follow-up work.
+    fn check_printf_format(&self, name: &str, args: &[Expr], call_span: Span) {
         let format_index = match name {
             "printf" | "__builtin_printf" => 0,
             "fprintf" | "__builtin_fprintf" | "dprintf" | "__builtin_dprintf" | "sprintf"
@@ -3503,8 +3504,27 @@ impl SemanticAnalyzer {
             "__snprintf_chk" | "__builtin___snprintf_chk" => 4,
             _ => return,
         };
-        let Some(Expr::StringLiteral(format, format_span)) = args.get(format_index) else {
+        let Some(format_expr) = args.get(format_index) else {
             return;
+        };
+        let (format, format_span) = match format_expr {
+            Expr::StringLiteral(format, format_span) => (format, format_span),
+            _ => {
+                let security_enabled = {
+                    let diagnostics = self.diagnostics.borrow();
+                    diagnostics.warning_enabled(crate::common::error::WarningKind::Format)
+                        && diagnostics
+                            .warning_enabled(crate::common::error::WarningKind::FormatSecurity)
+                };
+                if args.len() == format_index + 1 && security_enabled {
+                    self.diagnostics.borrow_mut().warning_with_kind(
+                        "format not a string literal and no format arguments",
+                        call_span,
+                        crate::common::error::WarningKind::FormatSecurity,
+                    );
+                }
+                return;
+            }
         };
 
         fn positional_arg_index(

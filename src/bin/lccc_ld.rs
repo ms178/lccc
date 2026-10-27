@@ -249,6 +249,12 @@ fn passthrough_property_flags(
                 k if k.starts_with("x86-64-") => {
                     ignored.push(k.to_string());
                 }
+                "common-page-size" => ignored.push(kw.to_string()),
+                k if k.starts_with("common-page-size=") => {
+                    // Script layout currently has no separate common-page
+                    // granularity; warn (or fail under --fatal-warnings).
+                    ignored.push(k.to_string());
+                }
                 k if k.starts_with("ibt=") || k.starts_with("shstk=") || k.starts_with("lam-u") => {
                     ignored.push(k.to_string());
                 }
@@ -270,7 +276,7 @@ fn warn_unimplemented(a: &str) {
     {
         eprintln!(
             "lccc-ld: warning: '{}' is accepted but not implemented; \
-             the output image may differ from GNU ld",
+             the requested behavior is not applied",
             key
         );
     }
@@ -283,7 +289,6 @@ fn is_benign_ignorable(a: &str) -> bool {
         "--eh-frame-hdr"          // we always emit .eh_frame_hdr
         | "--no-add-needed"
         | "--no-copy-dt-needed-entries"
-        | "--warn-common"
         | "--no-warn-mismatch"
         | "--no-warn-search-mismatch"
         | "--no-warn-execstack"
@@ -291,8 +296,6 @@ fn is_benign_ignorable(a: &str) -> bool {
         // GNU's `--warn-textrel` turns the text-relocation check to "warn",
         // which is already lccc-ld's default (`TextrelPolicy::Warn`).
         | "--warn-textrel"
-        | "--fatal-warnings"
-        | "--no-fatal-warnings"
         | "--disable-linker-version"
         | "--no-relax"
         // Driver-level flags that reach a standalone linker when a build system
@@ -354,6 +357,9 @@ fn run(args: &[String]) -> Result<(), String> {
     let mut print_memory_usage = false;
     let mut oformat_binary = false;
     let mut top_warnings: Vec<String> = Vec::new();
+    // Options accepted but not implemented are diagnosed after parsing so
+    // --fatal-warnings applies regardless of their position in argv.
+    let mut unimplemented_warnings: Vec<String> = Vec::new();
     // Arguments forwarded verbatim into the builtin userspace pipeline
     // (parse_linker_args understands the GNU spellings directly).
     let mut passthrough: Vec<String> = Vec::new();
@@ -855,6 +861,9 @@ fn run(args: &[String]) -> Result<(), String> {
                     // missing strictness.  Warn once, like the other
                     // accepted-but-not-implemented diagnostics above.
                     || a == "--no-undefined-version"
+                    // `--warn-common` requests a duplicate-COMMON diagnostic;
+                    // until that analysis is implemented, do not swallow it.
+                    || a == "--warn-common"
                 {
                     // Accepted but NOT implemented.  These change the image
                     // (or a diagnostic the user asked for), so ignoring them
@@ -863,12 +872,7 @@ fn run(args: &[String]) -> Result<(), String> {
                     // --print-gc-sections listing and got none of them.  Warn
                     // once per distinct option rather than per invocation so a
                     // recursive make does not scroll them off the screen.
-                    if fatal_warnings {
-                        return Err(format!(
-                            "warning treated as error: '{a}' is not implemented"
-                        ));
-                    }
-                    warn_unimplemented(a);
+                    unimplemented_warnings.push(a.to_string());
                 } else if is_benign_ignorable(a) {
                     // Options every GNU-compatible linker accepts and that do
                     // not change the image we produce.
@@ -892,8 +896,17 @@ fn run(args: &[String]) -> Result<(), String> {
     if fatal_warnings && !top_warnings.is_empty() {
         return Err(format!("warning treated as error: {}", top_warnings[0]));
     }
+    if fatal_warnings && !unimplemented_warnings.is_empty() {
+        return Err(format!(
+            "warning treated as error: '{}' is not implemented",
+            unimplemented_warnings[0]
+        ));
+    }
     for w in &top_warnings {
         eprintln!("lccc-ld: warning: {w}");
+    }
+    for option in &unimplemented_warnings {
+        warn_unimplemented(option);
     }
 
     if inputs.is_empty() {
@@ -960,11 +973,12 @@ fn run(args: &[String]) -> Result<(), String> {
         let mut script_src = std::fs::read_to_string(&script_path)
             .map_err(|e| format!("cannot read script '{}': {}", script_path, e))?;
         let ordered = ordered_args(&passthrough, &positional_files);
+        let script_args = lccc::backend::linker_common::parse_linker_args(&ordered);
+        script_args.validate_common_page_size()?;
         let search_dirs = lccc::linker_entry::script_search_dirs(&script_src)?;
         let inputs =
             lccc::linker_entry::expand_file_mode_libs(&ordered, &inputs, &search_dirs, "-T")?;
-        let mut lib_dirs =
-            lccc::backend::linker_common::parse_linker_args(&ordered).extra_lib_paths;
+        let mut lib_dirs = script_args.extra_lib_paths;
         lib_dirs.extend(search_dirs.iter().cloned());
         let mut objects = if elf_i386 {
             lccc::linker_entry::load_inputs_i386_script(&inputs, &undefined_symbols)?

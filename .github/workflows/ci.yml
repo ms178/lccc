@@ -1960,6 +1960,10 @@ jobs:
       run: bash tests/linker/setup_kernel_tools.sh --prefix "$HOME/.cache/lccc-kernel-tools"
     - name: Linker harness process-wrapper self-test
       run: python3 tests/linker/test_run_linker_helpers.py
+    # GCC's -fuse-ld=bfd does not discover the triplet-prefixed ld.bfd in the
+    # GAS 2.47 prefix. gotpcrel_edges needs that newer BFD oracle as a fallback;
+    # pass it explicitly so --strict does not turn the unavailable comparison
+    # into a skip.
     - name: Linker test suite (lccc-ld vs GNU ld, x86-64 + i386)
       env:
         LCCC_I386_SCRATCH_ROOT: ${{ runner.temp }}/i386-linker-scratch
@@ -1968,6 +1972,7 @@ jobs:
         PATH="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin:$PATH" \
         LCCC_REQUIRE_I386=1 \
         LCCC_RELOCS_TOOL="$HOME/.cache/lccc-kernel-tools/bin/relocs" \
+        LCCC_BFD_LD="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/x86_64-linux-gnu-ld.bfd" \
           python3 tests/linker/run_linker_tests.py \
             --lccc target/fastbuild/lccc --strict -v \
             --json "$RUNNER_TEMP/linker-results.json"

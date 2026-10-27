@@ -289,6 +289,7 @@ pub fn link_builtin(
     // is read; parsing later left early inputs (CRT objects, user objects and
     // scripts) searching only the driver's default directories.
     let parsed_args = linker_common::parse_linker_args(user_args);
+    parsed_args.validate_common_page_size()?;
 
     // `-L` directories first, in command-line order, then the defaults -- the
     // order GNU ld searches in.
@@ -325,18 +326,34 @@ pub fn link_builtin(
     // Before the field moves below partially move `parsed_args`.
     let requested_dyn_flags = parsed_args.requested_dyn_flags();
     // `-z ibt=func` & co: accepted, ignored, and warned about — verbatim
-    // GNU ld wording.
-    for kw in &parsed_args.z_ignored_keywords {
-        eprintln!("lccc-ld: warning: -z {kw} ignored");
+    // GNU ld wording. Collect these together with the non-script
+    // `--emit-relocs` warning so the final --fatal-warnings state applies
+    // uniformly, independent of option order.
+    let mut option_warnings: Vec<String> = parsed_args
+        .z_ignored_keywords
+        .iter()
+        .map(|kw| format!("-z {kw} ignored"))
+        .collect();
+    if parsed_args.warn_common {
+        option_warnings.push(
+            "--warn-common ignored: common-symbol diagnostics are not implemented".to_string(),
+        );
     }
     // `--emit-relocs` is implemented only for `-T` script links
     // (`emit_script` retains the applied relocations there); on this path
     // the flag parses but the emitter cannot honour it, so say so rather
     // than silently producing an image without them.
     if parsed_args.emit_relocs {
-        eprintln!(
-            "lccc-ld: warning: --emit-relocs ignored: relocation retention is only implemented for -T script links"
+        option_warnings.push(
+            "--emit-relocs ignored: relocation retention is only implemented for -T script links"
+                .to_string(),
         );
+    }
+    if parsed_args.fatal_warnings && !option_warnings.is_empty() {
+        return Err(format!("warning treated as error: {}", option_warnings[0]));
+    }
+    for warning in &option_warnings {
+        eprintln!("lccc-ld: warning: {warning}");
     }
     // Computed here, before the field moves below: the CET merge itself
     // runs much later (see below), but `property_link_flags` borrows the
@@ -1048,17 +1065,32 @@ pub fn link_shared(
     // lccc did not). `LinkerArgs::inputs` now models the ordered, positional
     // input list -- the one thing that previously blocked the merge.
     let parsed = linker_common::parse_linker_args(user_args);
-    // `-z ibt=func` & co: accepted, ignored, and warned about — verbatim
-    // GNU ld wording.
-    for kw in &parsed.z_ignored_keywords {
-        eprintln!("lccc-ld: warning: -z {kw} ignored");
-    }
-    // As in `link_builtin` above: `--emit-relocs` only takes effect for
-    // `-T` script links; warn rather than silently drop it here.
-    if parsed.emit_relocs {
-        eprintln!(
-            "lccc-ld: warning: --emit-relocs ignored: relocation retention is only implemented for -T script links"
+    parsed.validate_common_page_size()?;
+    // The shared-object emitter cannot retain applied relocations, and the
+    // separate common-page-size granularity is not implemented. Defer these
+    // diagnostics until the final --fatal-warnings state is known, just as in
+    // the regular userspace link path.
+    let mut option_warnings: Vec<String> = parsed
+        .z_ignored_keywords
+        .iter()
+        .map(|kw| format!("-z {kw} ignored"))
+        .collect();
+    if parsed.warn_common {
+        option_warnings.push(
+            "--warn-common ignored: common-symbol diagnostics are not implemented".to_string(),
         );
+    }
+    if parsed.emit_relocs {
+        option_warnings.push(
+            "--emit-relocs ignored: relocation retention is only implemented for -T script links"
+                .to_string(),
+        );
+    }
+    if parsed.fatal_warnings && !option_warnings.is_empty() {
+        return Err(format!("warning treated as error: {}", option_warnings[0]));
+    }
+    for warning in &option_warnings {
+        eprintln!("lccc-ld: warning: {warning}");
     }
     // CET/ISA flags up front, as in `link_builtin`: an invalid `-z
     // x86-64-*` level fails the link before any real work happens.
