@@ -37,11 +37,11 @@ use crate::frontend::parser::ast::{
 };
 use crate::frontend::sema::builtins;
 use crate::frontend::sema::intrinsic_arity;
-use crate::frontend::sema::operand_constraints::{self, Operand};
+use crate::frontend::sema::operand_constraints::{self, AssignmentCtx, MemberOperand, Operand};
 use crate::ir::reexports::IrConst;
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 /// Outcome of a case segment in a switch statement for -Wreturn-type analysis.
@@ -262,6 +262,18 @@ pub struct SemanticAnalyzer {
     pending_loop_labels: Vec<String>,
     active_break_targets: Vec<Vec<String>>,
     active_continue_targets: Vec<Vec<String>>,
+    /// Nesting depth of unevaluated operands (`sizeof`, `_Countof`,
+    /// `_Alignof(expr)`, `__alignof__(expr)`). GCC suppresses its default-on
+    /// `dereferencing 'void *' pointer` warning there (`sizeof(*p)` on a
+    /// `void *` is silent) while the constraint errors still fire, so the
+    /// warning sites consult this. Measured on gcc-16.2.
+    unevaluated_depth: Cell<u32>,
+    /// Whether the expression currently being analyzed is the direct operand
+    /// of `&`. `&*p` is the one use of a pointer to an incomplete type that
+    /// does not compute a value (C23 6.5.3.2p4), so gcc-16.2 accepts it while
+    /// `*p` -- even as a discarded statement -- is "invalid use of undefined
+    /// type 'T'" (measured).
+    address_of_operand: Cell<bool>,
 }
 
 /// Where an implicit conversion occurs, for GCC 16.2's verbatim
@@ -290,6 +302,8 @@ impl SemanticAnalyzer {
             pending_loop_labels: Vec::new(),
             active_break_targets: Vec::new(),
             active_continue_targets: Vec::new(),
+            unevaluated_depth: Cell::new(0),
+            address_of_operand: Cell::new(false),
         };
         // Pre-populate with common implicit declarations
         analyzer.declare_implicit_functions();
@@ -2596,18 +2610,13 @@ impl SemanticAnalyzer {
                 // shall have integer type.
                 if let Some(ctype) = self.result.expr_types.get(&expr.id()) {
                     if !ctype.is_integer() {
-                        let diag = crate::common::error::Diagnostic::error(
-                            "switch quantity is not an integer",
-                        )
-                        .with_span(expr.span())
-                        .with_note(
-                            crate::common::error::Diagnostic::note(format!(
-                                "expression has type '{}'",
-                                ctype
-                            ))
-                            .with_span(expr.span()),
+                        // gcc-16.2's wording and caret (the start of the
+                        // controlling expression); lccc used to say "is not
+                        // an integer" and add a note GCC never prints.
+                        self.diagnostics.borrow_mut().error(
+                            "switch quantity not an integer".to_string(),
+                            self.expr_start_span(expr),
                         );
-                        self.diagnostics.borrow_mut().emit(&diag);
                     }
                 }
                 self.analyze_substatement(body);
@@ -3197,6 +3206,7 @@ impl SemanticAnalyzer {
                 if *op == BinOp::Sub {
                     self.check_pointer_subtraction_compat(lhs, rhs, *span);
                 }
+                self.check_incomplete_pointer_arithmetic(lhs, rhs, *op, *span);
                 self.check_pointer_comparison_spaces(op, lhs, rhs, *span);
                 self.warn_sign_compare(*op, lhs, rhs, *span);
                 self.check_binary_operands(*op, lhs, rhs, *span);
@@ -3212,6 +3222,10 @@ impl SemanticAnalyzer {
                     self.constraint_error(message, *span);
                 }
                 if matches!(op, UnaryOp::PreInc | UnaryOp::PreDec) {
+                    // `p++` on a pointer to an undefined record type steps by a
+                    // size that is not known: gcc-16.2's own wording, at the
+                    // operator.
+                    self.check_incomplete_pointer_step(operand, *span, *op == UnaryOp::PreInc);
                     if !self.check_ext_vector_assignable(operand, *span)
                         && !self.check_ext_vector_step(operand, *op == UnaryOp::PreInc, *span)
                     {
@@ -3231,6 +3245,7 @@ impl SemanticAnalyzer {
                     let message = operand_constraints::increment(*op == PostfixOp::PostInc, &ty);
                     self.constraint_error(message, *span);
                 }
+                self.check_incomplete_pointer_step(operand, *span, *op == PostfixOp::PostInc);
                 if !self.check_ext_vector_assignable(operand, *span)
                     && !self.check_ext_vector_step(operand, *op == PostfixOp::PostInc, *span)
                 {
@@ -3246,6 +3261,7 @@ impl SemanticAnalyzer {
             Expr::Assign(lhs, rhs, span) => {
                 self.analyze_expr(lhs);
                 self.analyze_expr(rhs);
+                self.check_void_assignment_target(lhs, *span);
                 if !self.check_ext_vector_assignable(lhs, *span) {
                     self.check_lvalue_operand(lhs, *span);
                 }
@@ -3274,8 +3290,25 @@ impl SemanticAnalyzer {
             Expr::CompoundAssign(op, lhs, rhs, span) => {
                 self.analyze_expr(lhs);
                 self.analyze_expr(rhs);
-                // `E1 op= E2` has the operand constraints of `E1 op E2`.
-                self.check_binary_operands(*op, lhs, rhs, *span);
+                // A `void` lvalue (`*p` on a `void *`) cannot be read and
+                // written back: GCC reports its "invalid use" form here, not
+                // the "void value not ignored" form the binary rules use.
+                let void_target = self
+                    .exact_operand_ctype(lhs)
+                    .is_some_and(|ty| matches!(ty, CType::Void));
+                if void_target {
+                    self.diagnostics
+                        .borrow_mut()
+                        .error("invalid use of void expression".to_string(), *span);
+                } else {
+                    // `E1 op= E2` has the operand constraints of `E1 op E2`.
+                    self.check_binary_operands(*op, lhs, rhs, *span);
+                }
+                if matches!(op, BinOp::Add | BinOp::Sub) {
+                    // `p += n` on a pointer to an undefined record type has the
+                    // same rule as `p + n` (measured on gcc-16.2).
+                    self.check_incomplete_pointer_arithmetic(lhs, rhs, *op, *span);
+                }
                 if !self.check_ext_vector_assignable(lhs, *span) {
                     self.check_lvalue_operand(lhs, *span);
                 }
@@ -3349,20 +3382,21 @@ impl SemanticAnalyzer {
                 // sizeof is unevaluated context, but identifiers must still be declared
                 match arg.as_ref() {
                     SizeofArg::Expr(inner) => {
-                        self.analyze_expr(inner);
+                        self.analyze_unevaluated(inner);
+                        self.check_sizeof_incomplete_expr(inner, *span);
                     }
                     SizeofArg::Type(ts) => {
                         self.check_void_type_name(ts, *span);
                         // Check for sizeof on incomplete struct/union types.
                         // sizeof(struct X) where struct X has no definition is an error.
                         // (Pointers to incomplete types are fine.)
-                        self.check_sizeof_incomplete_type(ts, *span);
+                        self.check_sizeof_incomplete_type(ts, *span, "sizeof");
                     }
                 }
             }
             Expr::Countof(arg, span) => match arg.as_ref() {
                 SizeofArg::Expr(inner) => {
-                    self.analyze_expr(inner);
+                    self.analyze_unevaluated(inner);
                     let is_string_lit = matches!(
                         inner,
                         Expr::StringLiteral(..)
@@ -3375,14 +3409,29 @@ impl SemanticAnalyzer {
                                 && self.symbol_table.lookup(name).is_none()
                     );
                     if !is_string_lit {
+                        // gcc-16.2 names the operand type and carets the start
+                        // of the operand: `_Countof(x)` on an `int` is
+                        // "invalid application of '_Countof' to type 'int'",
+                        // and a `void` operand (a `*void_ptr` dereference or
+                        // subscript) says `'void'`.
+                        let operand_span = self.keyword_paren_span(*span);
+                        let countof_type_error = |ty: &CType| {
+                            format!(
+                                "invalid application of '_Countof' to type '{}'",
+                                operand_constraints::type_name(ty)
+                            )
+                        };
                         if matches!(
                             inner,
                             Expr::Comma(..) | Expr::Conditional(..) | Expr::GnuConditional(..)
                         ) {
-                            self.diagnostics.borrow_mut().error(
-                                "invalid application of '_Countof' to non-array type".to_string(),
-                                *span,
-                            );
+                            let ty = self
+                                .expr_type_checker()
+                                .infer_expr_ctype(inner)
+                                .unwrap_or(CType::Int);
+                            self.diagnostics
+                                .borrow_mut()
+                                .error(countof_type_error(&ty), operand_span);
                         } else {
                             let ct = self.expr_type_checker().infer_expr_ctype(inner);
                             match ct {
@@ -3402,18 +3451,16 @@ impl SemanticAnalyzer {
                                     };
                                     if !is_complete_or_vla {
                                         self.diagnostics.borrow_mut().error(
-                                                "invalid application of '_Countof' to incomplete array type"
-                                                    .to_string(),
-                                                *span,
-                                            );
+                                            "invalid application of '_Countof' to incomplete array type"
+                                                .to_string(),
+                                            operand_span,
+                                        );
                                     }
                                 }
-                                Some(_) => {
-                                    self.diagnostics.borrow_mut().error(
-                                        "invalid application of '_Countof' to non-array type"
-                                            .to_string(),
-                                        *span,
-                                    );
+                                Some(ty) => {
+                                    self.diagnostics
+                                        .borrow_mut()
+                                        .error(countof_type_error(&ty), operand_span);
                                 }
                                 None => {}
                             }
@@ -3448,12 +3495,22 @@ impl SemanticAnalyzer {
             },
             Expr::Alignof(ts, span) | Expr::GnuAlignof(ts, span) => {
                 self.check_void_type_name(ts, *span);
+                // gcc-16.2 spells the operator `'__alignof__'` in the
+                // message for every spelling of the operator (measured).
+                self.check_sizeof_incomplete_type(ts, *span, "__alignof__");
             }
-            Expr::AlignofExpr(inner, _) | Expr::GnuAlignofExpr(inner, _) => {
-                self.analyze_expr(inner);
+            Expr::AlignofExpr(inner, span) | Expr::GnuAlignofExpr(inner, span) => {
+                self.analyze_unevaluated(inner);
+                self.check_alignof_incomplete_expr(inner, *span);
             }
             Expr::AddressOf(inner, span) => {
+                // `&*p` never computes the incomplete-typed value, so the
+                // indirect operand is exempt from the "invalid use of
+                // undefined type" rule below (measured on gcc-16.2).
+                let exempt = matches!(inner.as_ref(), Expr::Deref(..));
+                let previous = self.address_of_operand.replace(exempt);
                 self.analyze_expr(inner);
+                self.address_of_operand.set(previous);
                 // Clang checks the value category first: `&f()[0]` is the
                 // address of an rvalue, `&v[0]` of a vector element.
                 if !self.check_address_of_rvalue(inner, *span) {
@@ -3461,8 +3518,9 @@ impl SemanticAnalyzer {
                     self.check_address_of_register_compound_literal(inner, *span);
                 }
             }
-            Expr::Deref(inner, _) => {
+            Expr::Deref(inner, span) => {
                 self.analyze_expr(inner);
+                self.check_indirection_operand(inner, *span);
             }
             Expr::Comma(lhs, rhs, _) => {
                 self.analyze_expr(lhs);
@@ -3484,12 +3542,15 @@ impl SemanticAnalyzer {
             Expr::BitCast(dst_ts, src_expr, span) => {
                 self.analyze_bit_cast_expr(dst_ts, src_expr, *span);
             }
-            Expr::GenericSelection(controlling, associations, span) => {
-                self.analyze_expr(controlling);
+            Expr::GenericSelection(controlling, associations, _) => {
+                // A `_Generic` selector only names a type, and GCC does not
+                // warn about a GNU extension there (measured: `_Generic(p[0],
+                // int: 1)` on a `void *` is the selector error alone).
+                self.analyze_unevaluated(controlling);
                 for assoc in associations {
                     self.analyze_expr(&assoc.expr);
                 }
-                self.check_generic_selection(controlling, associations, *span);
+                self.check_generic_selection(controlling, associations);
             }
             // Literals don't need analysis
             Expr::IntLiteral(_, _)
@@ -4125,6 +4186,53 @@ impl SemanticAnalyzer {
         Some(ty)
     }
 
+    /// The type of `expr` for the expression-level constraints that inspect
+    /// the operand itself rather than a value of it (`.`/`->`/`*`), **without**
+    /// array-to-pointer decay: `int a[3]; a.x` is a member request on an
+    /// array, not on a pointer. `None` only where the inference cannot be
+    /// trusted: a builtin call (its declared return type is not the type
+    /// lowering gives it), an unresolved declaration, or a `void` that is not
+    /// stated outright. Everything else is the type lowering itself sees; a
+    /// differential scan of the repository's 3,100 C files (files gcc-16
+    /// accepts and lccc rejects) found no false rejection from these rules.
+    fn exact_operand_ctype(&self, expr: &Expr) -> Option<CType> {
+        // A builtin's declared return type is not the type lowering gives it;
+        // `__builtin_ia32_*` yields a pointer to the result slot although it
+        // is declared to return a vector struct.
+        if let Expr::FunctionCall(callee, ..) = expr {
+            if matches!(callee.as_ref(), Expr::Identifier(name, _) if builtins::is_builtin(name)) {
+                return None;
+            }
+        }
+        let ty = self.expr_type_checker().infer_expr_ctype(expr)?;
+        // A `void` type is exact only where the void-ness is stated outright;
+        // every other type inference is the one lowering also uses.
+        if matches!(ty, CType::Void) && !self.is_exact_void(expr) {
+            return None;
+        }
+        Some(ty)
+    }
+
+    /// The type spelling GCC uses in these operand messages: an unnamed record
+    /// is `struct <anonymous>`, and everything else is GCC's `type_to_string`
+    /// form (see `operand_constraints::type_name`), applied to the
+    /// integer-promoted operand type -- gcc-16.2 quotes `'int'` for a `char`
+    /// or `_Bool` operand and `'unsigned int'` for an enumeration. A typedef
+    /// name is not preserved: GCC would print `'T' {aka 'int'}`, and the
+    /// inferred type no longer carries the name a declaration used.
+    fn operand_type_spelling(&self, ty: &CType) -> String {
+        match ty {
+            CType::Struct(key) if Self::is_anonymous_record_key(key) => "struct <anonymous>".into(),
+            CType::Union(key) if Self::is_anonymous_record_key(key) => "union <anonymous>".into(),
+            _ => operand_constraints::type_name(&ty.integer_promoted()),
+        }
+    }
+
+    /// Whether `key` names a record declared without a tag.
+    fn is_anonymous_record_key(key: &str) -> bool {
+        key.starts_with("__anon_") || key.starts_with("<anonymous")
+    }
+
     /// `expr` has type `void` and that inference can be trusted (see
     /// `is_exact_void`, which alone says nothing about the type).
     fn is_trusted_void(&self, expr: &Expr) -> bool {
@@ -4140,6 +4248,12 @@ impl SemanticAnalyzer {
     fn is_exact_void(&self, expr: &Expr) -> bool {
         match expr {
             Expr::Cast(TypeSpecifier::Void, ..) => true,
+            // `*p` with `void *p`: the lvalue's type is `void` outright, and
+            // `check_indirection_operand` has already warned about the
+            // indirection itself, exactly as GCC does before judging the use.
+            Expr::Deref(inner, _) | Expr::ArraySubscript(inner, _, _) => self
+                .exact_operand_ctype(inner)
+                .is_some_and(|ty| operand_constraints::is_void_pointer(&ty)),
             Expr::Comma(_, rhs, _) => self.is_exact_void(rhs),
             Expr::FunctionCall(callee, _, _) => matches!(
                 callee.as_ref(),
@@ -4154,12 +4268,7 @@ impl SemanticAnalyzer {
     /// 6.5.1.1p2). Only an operand type inference gets exactly is judged:
     /// vector types and anonymous record keys are not exact (builtin headers
     /// give one anonymous type several `__anon_struct_N` keys).
-    fn check_generic_selection(
-        &self,
-        controlling: &Expr,
-        associations: &[GenericAssociation],
-        span: Span,
-    ) {
+    fn check_generic_selection(&self, controlling: &Expr, associations: &[GenericAssociation]) {
         if associations.iter().any(|a| a.type_spec.is_none()) {
             return;
         }
@@ -4191,7 +4300,9 @@ impl SemanticAnalyzer {
                 format!(
                     "'_Generic' selector of type '{ty}' is not compatible with any association"
                 ),
-                span,
+                // gcc-16.2 carets the selector expression, not the `_Generic`
+                // keyword (measured: column of `p[0]`, not of `_Generic`).
+                self.expr_start_span(controlling),
             );
         }
     }
@@ -4215,7 +4326,12 @@ impl SemanticAnalyzer {
     /// 6.8.4.1p1, 6.8.5p2) must have scalar type.
     fn check_scalar_condition(&self, cond: &Expr) {
         if let Some(ty) = self.constraint_operand(cond) {
-            self.constraint_error(operand_constraints::scalar_required(&ty), cond.span());
+            // GCC carets the whole operand: `if (g())`, `for (; g(); )`,
+            // `if (s)` all point at the first token of the condition.
+            self.constraint_error(
+                operand_constraints::scalar_required(&ty),
+                self.expr_start_span(cond),
+            );
         }
     }
 
@@ -4236,7 +4352,32 @@ impl SemanticAnalyzer {
             ty: &rt,
             null_constant: self.null_constant_if(nullptr, rhs),
         };
-        self.constraint_error(operand_constraints::binary(op, lhs_op, rhs_op), span);
+        let message = operand_constraints::binary(op, lhs_op, rhs_op);
+        // Only the `void` verdict is anchored at the operand ("void value not
+        // ignored as it ought to be" at `g` in `g() * 2`); "invalid operands
+        // to binary" stays on the operator, which both measurements confirm.
+        let is_record = |ty: &CType| matches!(ty, CType::Struct(_) | CType::Union(_));
+        let message_span = match message.as_deref() {
+            Some(operand_constraints::VOID_VALUE) if matches!(lt, CType::Void) => {
+                self.expr_start_span(lhs)
+            }
+            Some(operand_constraints::VOID_VALUE) if matches!(rt, CType::Void) => {
+                self.expr_start_span(rhs)
+            }
+            // `s && t`: the record verdict names the record operand.
+            Some(operand_constraints::STRUCT_VALUE | operand_constraints::UNION_VALUE)
+                if is_record(&lt) =>
+            {
+                self.expr_start_span(lhs)
+            }
+            Some(operand_constraints::STRUCT_VALUE | operand_constraints::UNION_VALUE)
+                if is_record(&rt) =>
+            {
+                self.expr_start_span(rhs)
+            }
+            _ => span,
+        };
+        self.constraint_error(message, message_span);
     }
 
     fn check_conditional_arms(&self, then_expr: &Expr, else_expr: &Expr, span: Span) {
@@ -4244,6 +4385,30 @@ impl SemanticAnalyzer {
             self.constraint_operand(then_expr),
             self.constraint_operand(else_expr),
         ) {
+            // Two pointer arms whose pointees are incompatible: GCC's
+            // `-Wincompatible-pointer-types`, a default error from C99 on and
+            // a warning in gnu90 (measured; Clang words it differently and
+            // only warns). `void *`, equal pointees and qualifier-only
+            // differences are accepted, so the verdict is the very function
+            // the argument path uses.
+            let both_pointers = matches!((&t, &e), (CType::Pointer(..), CType::Pointer(..)));
+            // C23 6.5.15p6: a null pointer constant arm takes the type of the
+            // other pointer arm, so `c ? gp : (void *)0` never converts between
+            // incompatible pointer types -- gcc-16.2 accepts it in every
+            // address space (tests/regression/seg_conv/parity_table.tsv).
+            let null_arm = self.expr_type_checker().is_null_pointer_constant(then_expr)
+                || self.expr_type_checker().is_null_pointer_constant(else_expr);
+            if both_pointers
+                && !null_arm
+                && pointer_argument_compat(&t, &e) == PtrCompat::Incompatible
+                && pointer_argument_compat(&e, &t) == PtrCompat::Incompatible
+            {
+                self.diagnostics.borrow_mut().warning_with_kind(
+                    "pointer type mismatch in conditional expression".to_string(),
+                    span,
+                    crate::common::error::WarningKind::IncompatiblePointerTypes,
+                );
+            }
             self.constraint_error(operand_constraints::conditional_arms(&t, &e), span);
         }
     }
@@ -4387,12 +4552,61 @@ impl SemanticAnalyzer {
         if !operand_constraints::involved(&from_ty) && !operand_constraints::involved(to) {
             return false;
         }
+        // A `?:` whose two record arms are different types has already been
+        // rejected by `check_conditional_arms`; the record-to-scalar message
+        // this funnel would add is GCC's only diagnostic for a *matching*
+        // record pair, so suppress it only for the rejected pair.
+        if self.record_conditional_mismatch(from) {
+            return false;
+        }
         let null_constant = self.null_constant_if(matches!(to, CType::NullPtr), from);
         let operand = Operand {
             ty: &from_ty,
             null_constant,
         };
-        self.constraint_error(operand_constraints::assignment(operand, to), span)
+        // A `void` value is reported at the start of the operand itself
+        // (`p[i]` on a `void *` is spelled `*(p + i)`, so it lands where `*p`
+        // does); the other conversions keep the surrounding expression's
+        // span, which is the measured column policy for them.
+        let assignment_ctx = match ctx {
+            IConvContext::Initialization => AssignmentCtx::Initialization,
+            IConvContext::Assignment => AssignmentCtx::Assignment,
+            IConvContext::Returning => AssignmentCtx::Returning,
+            IConvContext::Argument { index, callee } => AssignmentCtx::Argument { index, callee },
+        };
+        let conversion = operand_constraints::assignment(operand, to, assignment_ctx);
+        // The record and `void` verdicts are anchored at the operand; the
+        // one exception is `=` with a `void` source, whose "invalid use of
+        // void expression" sits on the operator (both measured).
+        let conversion_span = match ctx {
+            IConvContext::Assignment if matches!(from_ty, CType::Void) => span,
+            _ => self.expr_start_span(from),
+        };
+        self.constraint_error(conversion, conversion_span)
+    }
+
+    /// Whether `expr` is a `?:` whose two arms are records of different
+    /// types, the shape `check_conditional_arms` reports as a type mismatch.
+    fn record_conditional_mismatch(&self, expr: &Expr) -> bool {
+        let (then_expr, else_expr) = match expr {
+            Expr::Conditional(_, then_expr, else_expr, _) => (then_expr, else_expr),
+            Expr::GnuConditional(_, else_expr, _) => {
+                return self.record_conditional_mismatch(else_expr);
+            }
+            _ => return false,
+        };
+        let checker = self.expr_type_checker();
+        match (
+            checker.infer_expr_ctype(then_expr),
+            checker.infer_expr_ctype(else_expr),
+        ) {
+            (Some(a), Some(b)) => {
+                matches!(a, CType::Struct(_) | CType::Union(_))
+                    && matches!(b, CType::Struct(_) | CType::Union(_))
+                    && a != b
+            }
+            _ => false,
+        }
     }
 
     fn check_cast_operand(&self, ts: &TypeSpecifier, inner: &Expr, span: Span) {
@@ -4479,14 +4693,49 @@ impl SemanticAnalyzer {
                 )
         };
         let message = match (addressable(&base_ty), addressable(&index_ty)) {
-            (true, _) if index_ty.is_integer() => return,
+            (true, _) if index_ty.is_integer() => {
+                // `p[i]` is `*(p + i)`, and pointer arithmetic needs a
+                // complete type (C23 6.5.6p2): gcc-16.2 reports a pointer to
+                // an undefined record as "invalid use of undefined type" at
+                // the subscript.
+                // Unlike a bare `*p`, pointer arithmetic needs the size even
+                // under `sizeof` (`sizeof(p[0])` is ill-formed), so this
+                // reports in unevaluated operands too (measured on gcc-16.2).
+                if let Some(name) = self.incomplete_record_name(pointee_of(&base_ty)) {
+                    self.diagnostics
+                        .borrow_mut()
+                        .error(format!("invalid use of undefined type '{name}'"), span);
+                }
+                // `p[0]` on a `void *` is `*(p + 0)`: GCC's GNU extension
+                // warns once here, at the `[`, and the element lvalue then
+                // has type `void` (judged by the value rules). Like every
+                // `dereferencing 'void *' pointer` warning it is about the
+                // *evaluated* indirection, so `sizeof(p[0])` is silent.
+                if operand_constraints::is_void_pointer(&base_ty) && !self.in_unevaluated_operand()
+                {
+                    self.diagnostics
+                        .borrow_mut()
+                        .warning("dereferencing 'void *' pointer".to_string(), span);
+                }
+                return;
+            }
             // `0[v]`: subscript commutativity is pointer + integer (C11
             // 6.5.2.1p1); a vector is not a pointer, so GCC 16.2 and Clang
             // 23.1.3 both reject the reversed form for vectors.
             (false, true) if index_ty.is_vector() => {
                 "subscripted value is neither array nor pointer nor vector"
             }
-            (false, true) if base_ty.is_integer() => return,
+            (false, true) if base_ty.is_integer() => {
+                // `i[p]` is `*(p + i)` too, so the GNU `void *` extension is
+                // warned about on either side of the brackets.
+                if operand_constraints::is_void_pointer(&index_ty) && !self.in_unevaluated_operand()
+                {
+                    self.diagnostics
+                        .borrow_mut()
+                        .warning("dereferencing 'void *' pointer".to_string(), span);
+                }
+                return;
+            }
             (true, _) | (false, true) => "array subscript is not an integer",
             (false, false) => "subscripted value is neither array nor pointer nor vector",
         };
@@ -4705,7 +4954,7 @@ impl SemanticAnalyzer {
     /// "assignment to cast is illegal, lvalue casts are not supported",
     /// every other rvalue "expression is not assignable". Without this an
     /// assignment to `f()`, `x + 1`, `(a, b)` or `sf().m` compiled to
-    /// nothing.
+
     fn check_lvalue_operand(&self, target: &Expr, op_span: Span) {
         if !self.is_known_rvalue(target, false) {
             self.check_const_compound_literal_mutation(target, op_span);
@@ -4717,6 +4966,22 @@ impl SemanticAnalyzer {
             "expression is not assignable"
         };
         self.diagnostics.borrow_mut().error(message, op_span);
+    }
+
+    /// A `void` assignment target. `*p = 1` on a `void *p` is GCC's only
+    /// accepted spelling of "write nowhere", and its lvalue has type `void`,
+    /// so the store is `invalid use of void expression` (C23 6.3.2.2p1
+    /// requires a complete object type). The indirection itself is warned
+    /// about separately, by `check_indirection_operand`.
+    fn check_void_assignment_target(&self, target: &Expr, op_span: Span) {
+        if self
+            .exact_operand_ctype(target)
+            .is_some_and(|ty| matches!(ty, CType::Void))
+        {
+            self.diagnostics
+                .borrow_mut()
+                .error("invalid use of void expression".to_string(), op_span);
+        }
     }
 
     /// `&` needs an lvalue (C11 6.5.3.2p1): Clang 23.1.3's "cannot take the
@@ -4765,6 +5030,135 @@ impl SemanticAnalyzer {
         }
     }
 
+    /// Analyze the operand of an unevaluated operator (see
+    /// `unevaluated_depth`), so the default-on extension warnings stay quiet
+    /// exactly where GCC keeps them quiet while the constraint errors fire.
+    fn analyze_unevaluated(&mut self, expr: &Expr) {
+        self.unevaluated_depth.set(self.unevaluated_depth.get() + 1);
+        self.analyze_expr(expr);
+        self.unevaluated_depth
+            .set(self.unevaluated_depth.get().saturating_sub(1));
+    }
+
+    /// Whether the operand being judged is unevaluated (`sizeof` and friends).
+    fn in_unevaluated_operand(&self) -> bool {
+        self.unevaluated_depth.get() > 0
+    }
+
+    /// `*expr` (C23 6.5.3.2p2). The operand must have pointer type: a record,
+    /// arithmetic, vector or `nullptr_t` operand is GCC's
+    /// `invalid type argument of unary '*' (have 'T')`. A `void *` operand is
+    /// the GNU extension GCC accepts with the default-on warning
+    /// `dereferencing 'void *' pointer`; the lvalue it yields has type `void`,
+    /// which the value rules then judge (`void value not ignored as it ought to
+    /// be` when used, `invalid use of void expression` when written to).
+    fn check_indirection_operand(&self, operand: &Expr, op_span: Span) {
+        let Some(ty) = self.exact_operand_ctype(operand) else {
+            return; // Type not exact enough to judge
+        };
+        if operand_constraints::is_void_pointer(&ty) {
+            // GCC's extension warning is about evaluating the dereference, so
+            // `sizeof(*p)` on a `void *` is silent (measured).
+            if !self.in_unevaluated_operand() {
+                self.diagnostics
+                    .borrow_mut()
+                    .warning("dereferencing 'void *' pointer".to_string(), op_span);
+            }
+            return;
+        }
+        // `*p` where `p` points to an incomplete record: C23 6.5.3.2p4 allows
+        // the lvalue but forbids using it, and gcc-16.2 reports every such use
+        // -- including a discarded statement -- as "invalid use of undefined
+        // type 'struct f'" at the `*`. `&*p` is the one exception: it never
+        // computes the value (measured).
+        if let Some(name) = self.incomplete_record_name(pointee_of(&ty)) {
+            // `sizeof(*p)` and a `_Generic` selector replace the value rule
+            // with their own incomplete-type diagnostic (measured).
+            if !self.address_of_operand.get() && !self.in_unevaluated_operand() {
+                self.diagnostics
+                    .borrow_mut()
+                    .error(format!("invalid use of undefined type '{name}'"), op_span);
+            }
+            return;
+        }
+        if let Some(message) = operand_constraints::indirection(&ty) {
+            // `*g()` on a `void`-returning `g` quotes the value error at the
+            // operand (`g`), not at the `*` (measured on gcc-16.2).
+            let message_span = if matches!(ty, CType::Void) {
+                self.expr_start_span(operand)
+            } else {
+                op_span
+            };
+            self.diagnostics.borrow_mut().error(message, message_span);
+        }
+    }
+
+    /// The operand rules of `.` and `->` (C23 6.5.2.3p2-p3) that do not depend
+    /// on the member name: GCC's `invalid type argument of '->'` for a
+    /// non-pointer arrow operand, `'x' is a pointer; did you mean to use
+    /// '->'?` for a dot on a pointer, and the `dereferencing 'void *' pointer`
+    /// warning an arrow through `void *` earns first. Returns whether it
+    /// reported, in which case the member itself must not be looked up.
+    fn check_member_operand(
+        &self,
+        base_expr: &Expr,
+        field_name: &str,
+        is_pointer: bool,
+        span: Span,
+    ) -> bool {
+        let Some(base_ctype) = self.exact_operand_ctype(base_expr) else {
+            return false;
+        };
+        let not_a_member =
+            || format!("request for member '{field_name}' in something not a structure or union");
+        match operand_constraints::member_operand(&base_ctype, is_pointer) {
+            MemberOperand::Record => false,
+            MemberOperand::VoidPointer => {
+                // `sizeof(p->x)` on a `void *p`: GCC keeps the member error
+                // and drops the extension warning, which is about the
+                // evaluated indirection.
+                if !self.in_unevaluated_operand() {
+                    self.diagnostics
+                        .borrow_mut()
+                        .warning("dereferencing 'void *' pointer".to_string(), span);
+                }
+                self.diagnostics.borrow_mut().error(not_a_member(), span);
+                true
+            }
+            MemberOperand::NotRecord => {
+                self.diagnostics.borrow_mut().error(not_a_member(), span);
+                true
+            }
+            MemberOperand::NotPointer => {
+                let spelling = self.operand_type_spelling(&base_ctype);
+                self.diagnostics.borrow_mut().error(
+                    format!("invalid type argument of '->' (have '{spelling}')"),
+                    span,
+                );
+                true
+            }
+            MemberOperand::Pointer => {
+                let written = self.expr_source_text(base_expr);
+                self.diagnostics.borrow_mut().error(
+                    format!("'{written}' is a pointer; did you mean to use '->'?"),
+                    span,
+                );
+                true
+            }
+            MemberOperand::PointerToPointer => {
+                let written = self.expr_source_text(base_expr);
+                self.diagnostics.borrow_mut().error(
+                    format!(
+                        "'{written}' is a pointer to pointer; did you mean to \
+dereference it before applying '->' to it?"
+                    ),
+                    span,
+                );
+                true
+            }
+        }
+    }
+
     fn check_member_exists(
         &self,
         base_expr: &Expr,
@@ -4772,6 +5166,9 @@ impl SemanticAnalyzer {
         span: Span,
         is_pointer: bool,
     ) {
+        if self.check_member_operand(base_expr, field_name, is_pointer, span) {
+            return;
+        }
         let base_ctype = match self.member_base_ctype(base_expr, is_pointer) {
             Some(ct) => ct,
             None => return, // Can't determine base type; skip check
@@ -4807,40 +5204,10 @@ impl SemanticAnalyzer {
                 }
                 return;
             }
-            // A definite scalar base (arithmetic, pointer, a GNU vector):
-            // `x.y` on a float, `p->z` on an `int *`, `w.hi.y` on a two-lane
-            // ext vector whose `.hi` is already the scalar lane. Used to be
-            // accepted and lowered as field offset 0 (a miscompile with no
-            // diagnostic). Anything the checker cannot name (`None`,
-            // typeof, incomplete) still skips.
-            CType::Int
-            | CType::UInt
-            | CType::Char
-            | CType::SChar
-            | CType::UChar
-            | CType::PlainUChar
-            | CType::Short
-            | CType::UShort
-            | CType::Long
-            | CType::ULong
-            | CType::LongLong
-            | CType::ULongLong
-            | CType::Bool
-            | CType::Float
-            | CType::Double
-            | CType::LongDouble
-            | CType::Pointer(..)
-            | CType::Vector(..) => {
-                self.diagnostics.borrow_mut().error(
-                    format!(
-                        "request for member '{}' in something not a structure or union (base type '{}')",
-                        field_name, base_ctype
-                    ),
-                    span,
-                );
-                return;
-            }
-            _ => return, // Not a struct/union; skip check
+            // Every definite non-record base was already judged by
+            // `check_member_operand`, which returns before this point; what is
+            // left (a type the checker cannot name exactly) skips.
+            _ => return,
         };
 
         // If the struct tag has been redefined in an inner scope, the current layout
@@ -4856,6 +5223,17 @@ impl SemanticAnalyzer {
 
         let layouts = self.result.type_context.borrow_struct_layouts();
         let layout = match layouts.get(key.as_ref()) {
+            // A placeholder layout (a tag that is declared but never defined)
+            // has no members to look a name up in. gcc-16.2 and Clang 23.1.4
+            // both report the incompleteness itself, not a missing member:
+            // "invalid use of undefined type 'struct T'".
+            Some(l) if !l.is_complete => {
+                self.diagnostics.borrow_mut().error(
+                    format!("invalid use of undefined type '{}'", base_ctype),
+                    span,
+                );
+                return;
+            }
             Some(l) => l,
             None => {
                 // No layout at all - struct was never declared or defined.
@@ -6077,9 +6455,123 @@ impl SemanticAnalyzer {
         }
     }
 
-    /// Check if a sizeof type argument refers to an incomplete struct/union.
-    /// Reports an error like GCC: "invalid application of 'sizeof' to incomplete type"
-    fn check_sizeof_incomplete_type(&self, ts: &TypeSpecifier, span: Span) {
+    /// Whether `ty` is a record type an object cannot be formed of: a
+    /// declared-but-never-defined tag (a placeholder layout) or a key with no
+    /// layout at all. Returns the spelling gcc-16.2 uses in the message
+    /// (`struct f`, `union u`).
+    fn incomplete_record_name(&self, ty: &CType) -> Option<String> {
+        let key = match ty {
+            CType::Struct(key) | CType::Union(key) => key,
+            _ => return None,
+        };
+        if self.defined_structs.borrow().contains(&**key) {
+            return None;
+        }
+        let complete = self
+            .result
+            .type_context
+            .borrow_struct_layouts()
+            .get(&**key)
+            .is_some_and(|layout| layout.is_complete);
+        (!complete).then(|| ty.to_string())
+    }
+
+    /// The gcc-16.2 name of the record an expression's pointer operand points
+    /// at, when that record is declared but never defined.
+    fn incomplete_pointee_name(&self, expr: &Expr) -> Option<String> {
+        let ty = self.exact_operand_ctype(expr)?;
+        if !matches!(ty, CType::Pointer(..)) {
+            return None;
+        }
+        self.incomplete_record_name(pointee_of(&ty))
+    }
+
+    /// `p++` / `p--` on a pointer to an undefined record type (C23 6.5.2.4p1
+    /// needs the size of the pointed-to type). gcc-16.2: "increment of pointer
+    /// to an incomplete type 'struct S'" at the operator.
+    fn check_incomplete_pointer_step(&self, operand: &Expr, span: Span, increment: bool) {
+        let Some(name) = self.incomplete_pointee_name(operand) else {
+            return;
+        };
+        let verb = if increment { "increment" } else { "decrement" };
+        self.diagnostics.borrow_mut().error(
+            format!("{verb} of pointer to an incomplete type '{name}'"),
+            span,
+        );
+    }
+
+    /// `p + n`, `p - n`, `n + p`, `p += n`, `p -= n` and `p - p` on pointers to
+    /// undefined record types. gcc-16.2 spells the value-use rule ("invalid use
+    /// of undefined type 'struct S'") for the mixed forms and its own
+    /// "arithmetic on pointer to an incomplete type" -- with no type name and
+    /// no article -- when both operands are such pointers. Both are caretted at
+    /// the operator (measured).
+    fn check_incomplete_pointer_arithmetic(&self, lhs: &Expr, rhs: &Expr, op: BinOp, span: Span) {
+        if !matches!(op, BinOp::Add | BinOp::Sub) {
+            return;
+        }
+        let lhs_name = self.incomplete_pointee_name(lhs);
+        let rhs_name = self.incomplete_pointee_name(rhs);
+        let integer_operand = |e: &Expr| {
+            self.exact_operand_ctype(e)
+                .is_some_and(|ty| ty.is_integer())
+        };
+        let message = match (&lhs_name, &rhs_name) {
+            // `p - p` (and `p + p`, already an operand error of its own): the
+            // difference of two such pointers is the rule gcc names here.
+            (Some(_), Some(_)) if op == BinOp::Sub => {
+                "arithmetic on pointer to an incomplete type".to_string()
+            }
+            (Some(name), None) if integer_operand(rhs) => {
+                format!("invalid use of undefined type '{name}'")
+            }
+            (None, Some(name)) if integer_operand(lhs) && op == BinOp::Add => {
+                format!("invalid use of undefined type '{name}'")
+            }
+            _ => return,
+        };
+        self.diagnostics.borrow_mut().error(message, span);
+    }
+
+    /// `sizeof expr` on an incomplete record type: gcc-16.2's
+    /// "invalid application of 'sizeof' to incomplete type 'struct f'",
+    /// caretted at the operand's first token.
+    fn check_sizeof_incomplete_expr(&self, inner: &Expr, sizeof_span: Span) {
+        let Some(ty) = self.expr_type_checker().infer_expr_ctype(inner) else {
+            return;
+        };
+        if let Some(name) = self.incomplete_record_name(&ty) {
+            // The caret is computed before the engine is borrowed: the
+            // receiver of `error` is evaluated first, so a helper that reads
+            // the source manager through the same RefCell would panic.
+            let caret = self.keyword_paren_span(sizeof_span);
+            self.diagnostics.borrow_mut().error(
+                format!("invalid application of 'sizeof' to incomplete type '{name}'"),
+                caret,
+            );
+        }
+    }
+
+    /// `_Alignof(expr)` and friends: gcc-16.2 spells the operator
+    /// `'__alignof__'` in the message whichever spelling the source used
+    /// (measured with `_Alignof`, `alignof` and `__alignof__`).
+    fn check_alignof_incomplete_expr(&self, inner: &Expr, operator_span: Span) {
+        let Some(ty) = self.expr_type_checker().infer_expr_ctype(inner) else {
+            return;
+        };
+        if let Some(name) = self.incomplete_record_name(&ty) {
+            self.diagnostics.borrow_mut().error(
+                format!("invalid application of '__alignof__' to incomplete type '{name}'"),
+                operator_span,
+            );
+        }
+    }
+
+    /// Check if a sizeof/alignof type argument refers to an incomplete
+    /// struct/union. gcc-16.2 phrases both operators' operand rule the same
+    /// way: "invalid application of 'sizeof' to incomplete type 'struct f'"
+    /// (or `'__alignof__'`), caretted at the type's first token.
+    fn check_sizeof_incomplete_type(&self, ts: &TypeSpecifier, span: Span, operator: &str) {
         match ts {
             TypeSpecifier::Struct(Some(tag), None, ..) => {
                 // Reference to a named struct with no inline body.
@@ -6091,9 +6583,12 @@ impl SemanticAnalyzer {
                 // itself comes from const_eval's sizeof, which does resolve.
                 let key = format!("struct.{}", tag);
                 if !self.defined_structs.borrow().contains(key.as_str()) {
+                    let caret = self.type_operand_span(span);
                     self.diagnostics.borrow_mut().error(
-                        format!("storage size of 'struct {}' isn't known", tag),
-                        span,
+                        format!(
+                            "invalid application of '{operator}' to incomplete type 'struct {tag}'"
+                        ),
+                        caret,
                     );
                 }
             }
@@ -6101,16 +6596,20 @@ impl SemanticAnalyzer {
                 // Base key on purpose; see the struct arm above.
                 let key = format!("union.{}", tag);
                 if !self.defined_structs.borrow().contains(key.as_str()) {
-                    self.diagnostics
-                        .borrow_mut()
-                        .error(format!("storage size of 'union {}' isn't known", tag), span);
+                    let caret = self.type_operand_span(span);
+                    self.diagnostics.borrow_mut().error(
+                        format!(
+                            "invalid application of '{operator}' to incomplete type 'union {tag}'"
+                        ),
+                        caret,
+                    );
                 }
             }
             // Pointers to incomplete types are fine - sizeof gives pointer size
             TypeSpecifier::Pointer(_, _) => {}
             // Arrays of incomplete element types - check the element type
             TypeSpecifier::Array(elem, _) => {
-                self.check_sizeof_incomplete_type(elem, span);
+                self.check_sizeof_incomplete_type(elem, span, operator);
             }
             _ => {}
         }
@@ -6162,24 +6661,17 @@ impl SemanticAnalyzer {
                 while let CType::Array(inner, _) = object {
                     object = inner;
                 }
-                if let CType::Struct(key) | CType::Union(key) = object {
-                    if !self.defined_structs.borrow().contains(key.as_ref())
-                        && !self
-                            .result
-                            .type_context
-                            .borrow_struct_layouts()
-                            .get(key.as_ref())
-                            .is_some_and(|layout| layout.is_complete)
-                    {
-                        self.diagnostics.borrow_mut().error(
-                            format!(
-                                "field '{}' has incomplete type",
-                                f.name.as_deref().unwrap_or("<anonymous>")
-                            ),
-                            f.span,
-                        );
-                        return None;
-                    }
+                // One completeness predicate for records, shared with the
+                // `sizeof`/`*`/pointer-arithmetic rules.
+                if self.incomplete_record_name(object).is_some() {
+                    self.diagnostics.borrow_mut().error(
+                        format!(
+                            "field '{}' has incomplete type",
+                            f.name.as_deref().unwrap_or("<anonymous>")
+                        ),
+                        f.span,
+                    );
+                    return None;
                 }
                 let name = f.name.clone().unwrap_or_default();
                 let bit_width = f
@@ -6740,14 +7232,110 @@ impl SemanticAnalyzer {
         }
     }
 
+    /// The span of the first token of `expr`.
+    ///
+    /// The parser records some composites at their operator token (`[` for a
+    /// subscript, the member name for a selection, `(` for a call), while
+    /// gcc-16.2 points several operand diagnostics at the start of the whole
+    /// operand. This walks the leftmost subexpression and keeps the smallest
+    /// start, so `g()` and `p[i]` begin at `g` and `p`.
+    fn expr_start_span(&self, expr: &Expr) -> Span {
+        let mut span = expr.span();
+        let mut cursor = expr;
+        loop {
+            let next = match cursor {
+                Expr::FunctionCall(callee, _, _) => callee,
+                Expr::UnaryOp(_, inner, _) | Expr::PostfixOp(_, inner, _) => inner,
+                Expr::Deref(inner, _) => inner,
+                Expr::MemberAccess(base, _, _) | Expr::PointerMemberAccess(base, _, _) => base,
+                Expr::ArraySubscript(base, _, _) => base,
+                Expr::BinaryOp(_, lhs, _, _) => lhs,
+                Expr::Assign(lhs, _, _) | Expr::CompoundAssign(_, lhs, _, _) => lhs,
+                Expr::Conditional(cond, _, _, _) | Expr::GnuConditional(cond, _, _) => cond,
+                Expr::Comma(lhs, _, _) => lhs,
+                Expr::Cast(..) | Expr::CompoundLiteral(..) | Expr::StmtExpr(..) => break,
+                _ => break,
+            };
+            let child = next.span();
+            if child.file_id != span.file_id {
+                break;
+            }
+            span.start = span.start.min(child.start);
+            cursor = next;
+        }
+        span
+    }
+
+    /// The span gcc-16.2 carets for a `sizeof(Type)` / `_Alignof(Type)`
+    /// verdict: the first token of the type name, i.e. just past the `(` that
+    /// follows the keyword (measured: `sizeof(struct f)` carets `struct`).
+    fn type_operand_span(&self, keyword_span: Span) -> Span {
+        // `_Alignof` is 8 characters and `sizeof` 6; the keyword's own span
+        // gives the start, so scan forward for the type name instead of
+        // depending on its length: skip the keyword, spaces and one `(`.
+        let mut span = keyword_span;
+        let Some(sm) = self.diagnostics.borrow().share_source_manager() else {
+            return span;
+        };
+        let content = sm.get_content(span.file_id);
+        let bytes = content.as_bytes();
+        let mut probe = span.start as usize;
+        while probe < bytes.len() && (bytes[probe].is_ascii_alphanumeric() || bytes[probe] == b'_')
+        {
+            probe += 1;
+        }
+        while probe < bytes.len() && bytes[probe].is_ascii_whitespace() {
+            probe += 1;
+        }
+        if bytes.get(probe) == Some(&b'(') {
+            probe += 1;
+            while probe < bytes.len() && bytes[probe].is_ascii_whitespace() {
+                probe += 1;
+            }
+        }
+        if probe < bytes.len() {
+            span.start = probe as u32;
+        }
+        span
+    }
+
+    /// The span gcc-16.2 carets for a `_Countof` or `sizeof(expr)` operand
+    /// verdict: the first non-whitespace token after the keyword, i.e. the
+    /// `(` of the operand. Measured on `_Countof(x)`, `_Countof( x )`,
+    /// `_Countof(  (x) )`, `_Countof ( x )` and `sizeof(*p)` -- gcc points at
+    /// the same parenthesis in all of them.
+    fn keyword_paren_span(&self, keyword_span: Span) -> Span {
+        let mut span = keyword_span;
+        let Some(sm) = self.diagnostics.borrow().share_source_manager() else {
+            return span;
+        };
+        let content = sm.get_content(span.file_id);
+        let bytes = content.as_bytes();
+        // Skip the keyword by its own extent (`sizeof` and `_Countof` differ),
+        // so the caret never depends on the operator's spelling length.
+        let mut probe = span.start as usize;
+        while probe < bytes.len() && (bytes[probe].is_ascii_alphanumeric() || bytes[probe] == b'_')
+        {
+            probe += 1;
+        }
+        while probe < bytes.len() && bytes[probe].is_ascii_whitespace() {
+            probe += 1;
+        }
+        if probe < content.len() {
+            span.start = probe as u32;
+        }
+        span
+    }
+
     /// Exact source spelling of `expr`, used for GCC-compatible
     /// `read-only location '<expr>'` diagnostics. Falls back to a neutral
     /// placeholder when no source manager is attached (synthetic spans in
     /// unit tests) or the span does not resolve to a single-line slice.
     fn expr_source_text(&self, expr: &Expr) -> String {
         // `Expr::span()` stores the *operator* token for some composites
-        // (the parser records `*` for `Deref` and `[` for subscripting),
-        // so cover the operands too: `*q` is `*`+inner, `a[i]` is base+index.
+        // (the parser records `*` for `Deref`, `[` for subscripting and `(`
+        // for a call), so cover the operands too: `*q` is `*`+inner,
+        // `a[i]` is base+index and `f()` is the callee plus `)`.
         let mut span = expr.span();
         fn cover(expr: &Expr, span: &mut Span) {
             let child = expr.span();
@@ -6756,31 +7344,59 @@ impl SemanticAnalyzer {
                 span.end = span.end.max(child.end);
             }
             match expr {
-                Expr::Deref(inner, _) => cover(inner, span),
+                Expr::Deref(inner, _)
+                | Expr::UnaryOp(_, inner, _)
+                | Expr::PostfixOp(_, inner, _) => cover(inner, span),
+                Expr::FunctionCall(callee, args, _) => {
+                    cover(callee, span);
+                    for arg in args {
+                        cover(arg, span);
+                    }
+                }
+                Expr::MemberAccess(base, _, _) | Expr::PointerMemberAccess(base, _, _) => {
+                    cover(base, span)
+                }
                 Expr::ArraySubscript(base, index, _) => {
                     cover(base, span);
                     cover(index, span);
+                }
+                Expr::BinaryOp(_, lhs, rhs, _)
+                | Expr::Assign(lhs, rhs, _)
+                | Expr::Comma(lhs, rhs, _) => {
+                    cover(lhs, span);
+                    cover(rhs, span);
+                }
+                Expr::CompoundAssign(_, lhs, rhs, _) | Expr::Conditional(lhs, rhs, _, _) => {
+                    cover(lhs, span);
+                    cover(rhs, span);
                 }
                 _ => {}
             }
         }
         cover(expr, &mut span);
+        // The closing bracket is not part of any child: include it when the
+        // source has one where it belongs (`f(...)`, `a[...]`).
+        if matches!(expr, Expr::FunctionCall(..) | Expr::ArraySubscript(..)) {
+            if let Some(sm) = self.diagnostics.borrow().share_source_manager() {
+                let content = sm.get_content(span.file_id);
+                let mut probe = span.end as usize;
+                while probe < content.len() && content.as_bytes()[probe].is_ascii_whitespace() {
+                    probe += 1;
+                }
+                let close = match expr {
+                    Expr::FunctionCall(..) => Some(b')'),
+                    _ => Some(b']'),
+                };
+                if content.as_bytes().get(probe) == close.as_ref() {
+                    span.end = probe as u32 + 1;
+                }
+            }
+        }
         let Some(sm) = self.diagnostics.borrow().share_source_manager() else {
             return "<expr>".to_string();
         };
         let content = sm.get_content(span.file_id);
-        let (start, mut end) = (span.start as usize, span.end as usize);
-        // Subscript spans start at `[` and end at the index expression;
-        // include the closing `]` (skipping whitespace) when present.
-        if matches!(expr, Expr::ArraySubscript(..)) {
-            let mut probe = end;
-            while probe < content.len() && content.as_bytes()[probe].is_ascii_whitespace() {
-                probe += 1;
-            }
-            if content.as_bytes().get(probe) == Some(&b']') {
-                end = probe + 1;
-            }
-        }
+        let (start, end) = (span.start as usize, span.end as usize);
         if start <= end
             && end <= content.len()
             && content.is_char_boundary(start)
@@ -8037,6 +8653,15 @@ fn pointee_compat(from: &CType, to: &CType) -> PtrCompat {
         // `from == to` above already compared it, so anything reaching here is a
         // different type.
         _ => PtrCompat::Incompatible,
+    }
+}
+
+/// The type a pointer (or array) operand designates, else the operand itself.
+/// Borrowed, not cloned: this runs on every `*`, `.`, `->`, `[]` and `++`.
+fn pointee_of(ty: &CType) -> &CType {
+    match ty {
+        CType::Pointer(inner, _) | CType::Array(inner, _) => inner,
+        other => other,
     }
 }
 
