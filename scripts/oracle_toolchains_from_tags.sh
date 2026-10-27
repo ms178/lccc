@@ -30,10 +30,9 @@
 # * It never silently substitutes a different compiler. Tag payloads must
 #   match their recorded digest; Clang must match the official installer hash
 #   and the requested version.
-# * It does not build binutils from `binutils-2.47.tar.xz` unless asked
-#   (--with-binutils), because a from-source binutils build is ~10 minutes on
-#   the two-core research host and almost no gate needs it. The tarball is
-#   verified either way.
+# * It does not build binutils from source. `--with-binutils` restores the
+#   reviewed 2.47 binary set from the GitHub-only agent cache; the source
+#   tarball is still verified as part of the tag promise.
 # * It does not touch the crate build. Provisioning the oracles must never
 #   change what `cargo build --profile fastbuild` compiles.
 #
@@ -252,18 +251,9 @@ if [ "$WITH_BINUTILS" = 1 ]; then
     if [ -x "$PREFIX/binutils-$BINUTILS_VERSION/bin/as" ]; then
         log "binutils $BINUTILS_VERSION already installed (reused)"
     else
-        log "building binutils $BINUTILS_VERSION (this is the slow path)"
-        src=$(mktemp -d)
-        tar -xf "$DL/$BINUTILS_MEMBER" -C "$src"
-        (
-            cd "$src"/binutils-*
-            ./configure --prefix="$PREFIX/binutils-$BINUTILS_VERSION" \
-                        --disable-nls --disable-werror --disable-gdb \
-                        --disable-gprofng --disable-sim >/dev/null
-            make -j"$(nproc)" >/dev/null
-            make install >/dev/null
-        ) || die "binutils build failed"
-        rm -rf "$src"
+        log "installing binutils $BINUTILS_VERSION from the reviewed binary cache"
+        bash "$REPO/scripts/ensure_binutils_247_binary.sh" --prefix "$PREFIX/binutils-$BINUTILS_VERSION" \
+            || die "binutils $BINUTILS_VERSION binary install failed"
     fi
 fi
 

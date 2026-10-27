@@ -47,6 +47,7 @@
 # Afterwards add "$PREFIX/bin" to PATH.
 # ============================================================================
 set -euo pipefail
+REPO=$(CDPATH= cd -- "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 
 PREFIX=${LCCC_ORACLE_PREFIX:-/home/user/tools}
 FORCE=0
@@ -181,9 +182,8 @@ fi
 # ---------------------------------------------------------------------------
 # The codegen/oracle docs pin binutils 2.47 (scripts/README.md §"Oracles").
 # The system bfd can be any distro version, so when it is NOT already 2.47 we
-# build the pinned release from source (gas + bfd only — no gdb/gprof/plugins),
-# which is what the differential tools compare against. This honours the
-# "GAS / bfd 2.47" build preference instead of silently testing a stale oracle.
+# restore the pinned program set from the reviewed GitHub-only binary cache.
+# That honours the "GAS / bfd 2.47" preference without a per-run source build.
 BINUTILS_VERSION=2.47
 if ! want bfd; then
   :
@@ -194,23 +194,18 @@ elif command -v ld.bfd >/dev/null && ld.bfd --version | grep -q "$BINUTILS_VERSI
   install -m755 "$(command -v as)"  "$BIN/as-2.47"
   log "bfd 2.47 (system): $(ld.bfd --version | head -1)"
 else
-  log "building bfd 2.47 from source (gas + bfd only)"
-  if [[ ! -f "$SRC/binutils-$BINUTILS_VERSION.tar.xz" ]]; then
-    curl -fsSL -o "$SRC/binutils-$BINUTILS_VERSION.tar.xz" \
-      "https://ftp.gnu.org/gnu/binutils/binutils-$BINUTILS_VERSION.tar.xz"
-  fi
-  rm -rf "$SRC/binutils-$BINUTILS_VERSION" "$SRC/bu-$BINUTILS_VERSION"
-  tar -xf "$SRC/binutils-$BINUTILS_VERSION.tar.xz" -C "$SRC"
-  mkdir -p "$SRC/bu-$BINUTILS_VERSION"
-  ( cd "$SRC/bu-$BINUTILS_VERSION" && \
-    "$SRC/binutils-$BINUTILS_VERSION/configure" --prefix="$SRC/bu-$BINUTILS_VERSION/prefix" \
-      --disable-gdb --disable-gdbserver --disable-sim --disable-readline \
-      --disable-libdecnumber --disable-nls --disable-werror \
-      --disable-gprofng --disable-gprof --disable-plugins --with-system-zlib \
-    && make -j "$JOBS" MAKEINFO=true all-gas all-binutils all-ld \
-    && make MAKEINFO=true install-gas install-binutils install-ld )
-  install -m755 "$SRC/bu-$BINUTILS_VERSION/prefix/bin/ld"  "$BIN/ld.bfd-2.47"
-  install -m755 "$SRC/bu-$BINUTILS_VERSION/prefix/bin/as"  "$BIN/as-2.47"
+  log "installing bfd 2.47 from the reviewed GitHub-only binary cache"
+  bu_prefix="$SRC/bu-$BINUTILS_VERSION/prefix"
+  bash "$REPO/scripts/ensure_binutils_247_binary.sh" --prefix "$bu_prefix"
+  cat > "$BIN/ld.bfd-2.47" <<WRAP
+#!/bin/sh
+exec "$bu_prefix/bin/ld" "$@"
+WRAP
+  cat > "$BIN/as-2.47" <<WRAP
+#!/bin/sh
+exec "$bu_prefix/bin/as" "$@"
+WRAP
+  chmod 755 "$BIN/ld.bfd-2.47" "$BIN/as-2.47"
   log "bfd 2.47: $("$BIN/ld.bfd-2.47" --version | head -1)"
 fi
 

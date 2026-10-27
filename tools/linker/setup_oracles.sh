@@ -37,9 +37,8 @@
 #     restricting it to the two x86 ELF targets drops the other eighteen
 #     target crates from the build.  Then ./install-mold.sh installs bin/
 #     plus lib/mold/mold-wrapper.so and the libexec/mold/ld sibling.
-#   * binutils: only bfd + ld are configured/built (`all-ld`,
-#     `install-strip-ld`) — gas/binutils/gprof/gdb are not linker oracles
-#     (GNU as 2.47 has its own provisioner, scripts/ensure_gas_247.sh).
+#   * binutils: the pinned 2.47 program set is restored as a verified binary
+#     from the GitHub-only agent cache (no per-run configure/make).
 #   * lld: a source build of LLVM is hours on this host; the apt.llvm.org
 #     release build of the same 23.1 branch is used instead.
 #
@@ -58,6 +57,7 @@
 #
 # Idempotent: re-running verifies and skips whatever already checks out.
 set -euo pipefail
+REPO=$(CDPATH= cd -- "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 
 # Apply the same version proof to freshly built AND restored executables.
 # A stale binary in a directory named bfd-2.47 must never be published as 2.47.
@@ -113,8 +113,8 @@ cache_prefix() {    # <prefix dir>
     mv -f "$CACHE/$1.tar.xz.tmp" "$CACHE/$1.tar.xz"
 }
 
-need curl tar xz sha256sum
-restore_cached "bfd-$BINUTILS_VER" bin/ld || need make gcc g++
+need curl tar xz sha256sum git python3
+restore_cached "bfd-$BINUTILS_VER" bin/ld || need git python3
 # rustup installs cargo outside the default PATH; mold 3.x needs it (and a
 # C compiler for its two small C parts: mold-wrapper.so, lto-message).
 [ -d "$HOME/.cargo/bin" ] && PATH="$HOME/.cargo/bin:$PATH"
@@ -146,26 +146,13 @@ if [ -x "$PREFIX/bfd-$BINUTILS_VER/bin/ld" ] &&
    oracle_native_layout_matches "$bfd_layout_stamp" "$bfd_layout"; then
     note "ld    : $("$PREFIX/bfd-$BINUTILS_VER/bin/ld" --version | head -1) (restored from $ARTIFACTS)"
 else
-    TARBALL="$SRC/binutils-$BINUTILS_VER.tar.xz"
-    [ -f "$TARBALL" ] || { note "ld    : fetching binutils $BINUTILS_VER"; \
-        curl -fsSL -o "$TARBALL" "https://ftp.gnu.org/gnu/binutils/binutils-$BINUTILS_VER.tar.xz"; }
-    printf '%s  %s\n' "$BINUTILS_SHA256" "$TARBALL" | sha256sum -c - || {
-        note "ld    : binutils archive integrity failure; remove $TARBALL to refetch"
-        exit 1
-    }
-    BT="$SRC/binutils-$BINUTILS_VER"
-    rm -rf "$BT"; tar -xf "$TARBALL" -C "$SRC"
-    ( cd "$BT"
-      ./configure --prefix="$PREFIX/bfd-$BINUTILS_VER" \
-          --enable-new-dtags --with-sysroot=/ --with-lib-path="$native_lib_path" \
-          --disable-nls --disable-gdb --disable-gdbserver --disable-sim \
-          --disable-libquadmath --enable-64-bit-bfd --disable-werror \
-          CFLAGS='-O2 -g0' CXXFLAGS='-O2 -g0'
-      make -j"$JOBS" all-ld && make install-strip-ld )
-    rm -rf "$BT"
+    # The reviewed GitHub-only agent cache ships a bookworm-compatible 2.47
+    # binary set, so every consumer gets bytes instead of a 10-15 minute
+    # source build on each fresh runner.
+    bash "$REPO/scripts/ensure_binutils_247_binary.sh" --prefix "$PREFIX/bfd-$BINUTILS_VER"
     printf '%s\n' "$bfd_layout" > "$bfd_layout_stamp"
     cache_prefix "bfd-$BINUTILS_VER"
-    note "ld    : $("$PREFIX/bfd-$BINUTILS_VER/bin/ld" --version | head -1) (built)"
+    note "ld    : $("$PREFIX/bfd-$BINUTILS_VER/bin/ld" --version | head -1) (verified binary)"
 fi
 
 oracle_require_version "$PREFIX/bfd-$BINUTILS_VER/bin/ld" "$BINUTILS_VER"

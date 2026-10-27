@@ -61,6 +61,7 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+AGENT_LOCK = ROOT / 'engineering/toolchains/agent-cache-lock.json'
 UA = {"User-Agent": "lccc-toolchain-cache-freshness/1.0",
       "Accept": "application/vnd.github+json, application/json, text/plain, */*"}
 
@@ -164,6 +165,26 @@ def offline_problems(pins):
     gcc_sha = _one("scripts/oracle_toolchains_from_tags.sh", r"^GCC_SHA=([0-9a-f]{64})$", "GCC_SHA")
     if _one("scripts/ci_install_gcc_oracle.sh", r"^SHA256=([0-9a-f]{64})$", "SHA256") != gcc_sha:
         problems.append("gcc: ci_install_gcc_oracle.sh digest disagrees with oracle_toolchains_from_tags.sh")
+
+    # The GitHub-only agent cache is pinned by a reviewed lock; every tool in
+    # it must agree with the same enforcing files that drive hosted CI.
+    if not AGENT_LOCK.is_file():
+        problems.append('agent-cache-lock.json is missing')
+    else:
+        agent = json.loads(AGENT_LOCK.read_text())
+        if agent.get('tag') != 'harness-cache-7':
+            problems.append(f"agent-cache-lock.json names tag {agent.get('tag')!r}, expected 'harness-cache-7'")
+        tools = agent.get('tools', {})
+        for package in ('gcc', 'binutils', 'clang', 'rust', 'mold', 'qemu',
+                        'kernel-relocs', 'arm-a64-xml', 'rust-msrv'):
+            entry = tools.get(package)
+            if not entry:
+                problems.append(f'agent-cache-lock.json has no {package} entry')
+                continue
+            expect(package, entry.get('version', ''), 'agent-cache-lock.json')
+        for field in ('tag_sha', 'commit_sha', 'tree_sha', 'cache_json_sha256'):
+            if not agent.get(field):
+                problems.append(f'agent-cache-lock.json has no {field}')
 
     # Nothing may restore Clang from the historical 23.1.3 tag tree or
     # mold from the superseded 2.42.1 tag binary any more.

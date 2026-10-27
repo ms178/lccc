@@ -24,25 +24,7 @@ def digest(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-
-
-def _agent_cache_dispatch_hook():
-    """One-time bridge: a dispatch job on main can run this branch's publisher."""
-    marker = Path(__file__).resolve().parent.parent / 'engineering/toolchains/.agent-cache-dispatch'
-    if (os.environ.get('GITHUB_EVENT_NAME') != 'workflow_dispatch'
-            or os.environ.get('GITHUB_JOB') != 'toolchain-cache'
-            or not marker.is_file()):
-        return False
-    tag = marker.read_text().strip()
-    print(f'agent cache dispatch hook: publishing {tag}', flush=True)
-    work = Path(os.environ.get('RUNNER_TEMP', '/tmp')) / 'agent-toolchain-cache'
-    subprocess.run(['bash', str(Path(__file__).resolve().parent / 'publish_agent_toolchain_cache.sh'),
-                    '--tag', tag, '--work', str(work)], check=True)
-    return True
-
 def main():
-    if _agent_cache_dispatch_hook():
-        return
     output = Path(sys.argv[1]).resolve()
     output.mkdir(parents=True, exist_ok=True)
     # --verify-tag below never creates or moves a Git ref.

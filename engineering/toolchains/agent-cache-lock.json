@@ -1,6 +1,6 @@
 {
-  "cache_json_sha256": "e1fa6849f304aed100db7a7daa85be2c49e6927508ecc30ada9b723ec0a8e8a8",
-  "commit_sha": "80cf802ded92de33f31ccc68ab7e6f250b917b6e",
+  "cache_json_sha256": "74f131f0caaa625964b103736ff147cc2fea33325d1dc20e58328dec7ca6ded4",
+  "commit_sha": "9efdb4b53a9fe0c16327e5e96a87ab847d12bc99",
   "part_size": 94371840,
   "priority": [
     "rust",
@@ -24,8 +24,8 @@
   },
   "repository": "ms178/lccc",
   "schema": 1,
-  "tag": "harness-cache-6",
-  "tag_sha": "1f3c5ea54885a62b2a3e8a5621b9d8927bc74b3d",
+  "tag": "harness-cache-7",
+  "tag_sha": "84abc5ce3bf573610f571e8973d7a29ffd0aed39",
   "tools": {
     "arm-a64-xml": {
       "file": "ISA_A64_xml_A_profile-2026-09_md.tar.gz",
@@ -39,8 +39,8 @@
       "file": "binutils-2.47-x86_64-linux.tar.xz",
       "kind": "tar.xz",
       "root": "binutils-2.47-x86_64-linux",
-      "sha256": "63d4eab30871fe62dd02955048298be5c51066247cf66b3280f5724bf478131c",
-      "size": 1069544,
+      "sha256": "3619bf98f8afb9d2875d24a7cff61e908255209172c7942897b1022a6734da79",
+      "size": 2438416,
       "version": "2.47"
     },
     "binutils-source": {
@@ -116,5 +116,5 @@
       "version": "1.97.0"
     }
   },
-  "tree_sha": "aefbddae6394fbfe205fe7a541bb25e0c63f5fb3"
+  "tree_sha": "8ab6062075ae555a0c616c9abbbf858e4d000e57"
 }

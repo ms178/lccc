@@ -84,3 +84,9 @@ Rust 1.99.1, the 1.97.0 MSRV floor, mold 3.0.0, bookworm-compatible binutils 2.4
 the bookworm runtime debs, and the binutils 2.47 source tarball.  Publishing is
 opt-in via the `Publish GitHub-only agent toolchain cache` workflow; no ordinary
 PR check downloads these bytes.
+
+The reviewed lock `engineering/toolchains/agent-cache-lock.json` pins the
+immutable tag, its tag/commit/tree object IDs, the `CACHE.json` digest and the
+SHA-256 of every payload.  `scripts/ensure_binutils_247_binary.sh` restores
+just the binutils 2.47 program set from that lock, so fresh CI runners do not
+rebuild binutils from source.

@@ -221,3 +221,26 @@ class ToolchainCacheFreshness(unittest.TestCase):
         stale_rows.append(('mold', '99.0.0', 'canned newer mold'))
         with patch.object(fresh, 'upstream_latest', return_value=stale_rows):
             self.assertEqual(fresh.main([]), 1)
+
+    def test_agent_cache_lock_matches_canonical_pins(self):
+        fresh = self.freshness()
+        pins = fresh.read_pins()
+        lock = json.loads(fresh.AGENT_LOCK.read_text())
+        self.assertEqual(lock['tag'], 'harness-cache-7')
+        for package in ('gcc', 'binutils', 'clang', 'rust', 'mold', 'qemu',
+                        'kernel-relocs', 'arm-a64-xml', 'rust-msrv'):
+            self.assertEqual(lock['tools'][package]['version'], pins[package])
+            self.assertRegex(lock['tools'][package]['sha256'], r'^[0-9a-f]{64}$')
+        self.assertEqual(fresh.offline_problems(pins), [])
+
+    def test_agent_cache_lock_drift_is_detected(self):
+        fresh = self.freshness()
+        pins = fresh.read_pins()
+        lock = json.loads(fresh.AGENT_LOCK.read_text())
+        lock['tools']['mold']['version'] = '99.0.0'
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'lock.json'
+            path.write_text(json.dumps(lock))
+            with patch.object(fresh, 'AGENT_LOCK', path):
+                problems = fresh.offline_problems(pins)
+        self.assertTrue(any('agent-cache-lock.json' in problem for problem in problems))
