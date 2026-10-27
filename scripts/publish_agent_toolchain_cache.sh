@@ -134,17 +134,36 @@ rm -rf "$STAGE/$BINUTILS_ROOT"; mkdir -p "$STAGE/$BINUTILS_ROOT"/{bin,usr/bin,us
 cp -a "$EXTRACT/binutils/usr/bin/." "$STAGE/$BINUTILS_ROOT/usr/bin/"
 cp -a "$EXTRACT/binutils/usr/lib/x86_64-linux-gnu/." "$STAGE/$BINUTILS_ROOT/usr/lib/x86_64-linux-gnu/" 2>/dev/null || true
 cp -a "$EXTRACT/binutils/usr/lib/." "$STAGE/$BINUTILS_ROOT/usr/lib/" 2>/dev/null || true
-for f in "$STAGE/$BINUTILS_ROOT/usr/bin/"*; do
-    [ -e "$f" ] || continue
-    [ -d "$f" ] && continue
-    name=$(basename "$f")
-    cat > "$STAGE/$BINUTILS_ROOT/bin/$name" <<WRAP
+make_wrapper() {
+    local name=$1 target=$2 extra=${3:-} dest="$STAGE/$BINUTILS_ROOT/bin/$1"
+    rm -f "$dest"
+    cat > "$dest" <<'WRAP'
 #!/bin/sh
-here=\$(CDPATH= cd -- "\$(dirname "\$0")/.." && pwd)
-export LD_LIBRARY_PATH="\$here/usr/lib/x86_64-linux-gnu:\$here/usr/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
-exec "\$here/usr/bin/$name" "\$@"
+here=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
+export LD_LIBRARY_PATH="$here/usr/lib/x86_64-linux-gnu:$here/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LIBRARY_PATH="$here/usr/lib/x86_64-linux-gnu${LIBRARY_PATH:+:$LIBRARY_PATH}"
+export COMPILER_PATH="$here/usr/bin${COMPILER_PATH:+:$COMPILER_PATH}"
+exec "$here/usr/bin/__TARGET__" __EXTRA__ "$@"
 WRAP
-    chmod 755 "$STAGE/$BINUTILS_ROOT/bin/$name"
+    sed -i "s|__TARGET__|$target|; s|__EXTRA__|$extra|" "$dest"
+    chmod 755 "$dest"
+}
+# Debian's real binaries are x86_64-linux-gnu-*; the unprefixed names are
+# alternatives symlinks that would otherwise point outside the extracted tree.
+for f in "$STAGE/$BINUTILS_ROOT/usr/bin/"*; do
+    [ -f "$f" ] || continue
+    name=$(basename "$f")
+    make_wrapper "$name" "$name" ""
+done
+for generic in as ld ld.bfd ar nm objcopy objdump ranlib readelf strip strings \
+               addr2line c++filt elfedit gprof size; do
+    target="x86_64-linux-gnu-$generic"
+    [ -f "$STAGE/$BINUTILS_ROOT/usr/bin/$target" ] || die "missing $target"
+    extra=""
+    case $generic in
+        ld|ld.bfd) extra='-L"$here/usr/lib/x86_64-linux-gnu"' ;;
+    esac
+    make_wrapper "$generic" "$target" "$extra"
 done
 cat > "$STAGE/$BINUTILS_ROOT/PIN" <<'PIN'
 binutils 2.47.50.20261021-1 Debian sid x86_64-linux-gnu prebuilt binaries
@@ -211,8 +230,8 @@ MOLD_BIN=$(find "$EXTRACT/tools" -type f -name mold -perm -111 | head -1)
 BI="$EXTRACT/tools/$BINUTILS_ROOT"
 ALL_LIBS=$(find "$EXTRACT/tools" -type d \( -name lib -o -name lib64 -o -path '*/usr/lib/x86_64-linux-gnu' \) -print | paste -sd: -)
 export LD_LIBRARY_PATH="$ALL_LIBS${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-"$BI/usr/bin/as" --version | head -1
-"$BI/usr/bin/ld" --version | head -1
+"$BI/bin/as" --version | head -1
+"$BI/bin/ld" --version | head -1
 cat > "$TEST/probe.c" <<'C'
 int main(void) { return 42; }
 C
