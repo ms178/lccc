@@ -785,7 +785,9 @@ impl Parser {
         // declarator of the statement (`auto double f(double), h(double);`), not
         // just the last one.
         let nested_fn_decl_level = self.attrs.parsing_nested_fn();
-        let last_decl = declarators.last_mut().expect("declarator just pushed");
+        let Some(last_decl) = declarators.last_mut() else {
+            return None;
+        };
         if let Some(reg) = extra_asm_reg {
             last_decl.attrs.asm_register = Some(reg);
         }
@@ -995,20 +997,15 @@ impl Parser {
                 span: start,
             });
             let (_, skip_aligned, skip_asm_reg) = self.skip_asm_and_attributes();
+            let Some(last_decl) = declarators.last_mut() else {
+                return None;
+            };
             if self.attrs.parsing_maybe_unused() {
-                declarators
-                    .last_mut()
-                    .expect("declarator just pushed")
-                    .attrs
-                    .set_maybe_unused(true);
+                last_decl.attrs.set_maybe_unused(true);
                 self.attrs.set_maybe_unused(false);
             }
             if let Some(reg) = skip_asm_reg {
-                declarators
-                    .last_mut()
-                    .expect("declarator just pushed")
-                    .attrs
-                    .asm_register = Some(reg);
+                last_decl.attrs.asm_register = Some(reg);
             }
             if let Some(a) = skip_aligned {
                 ctx.alignment = Some(ctx.alignment.map_or(a, |prev| prev.max(a)));
@@ -1220,12 +1217,11 @@ impl Parser {
                 span: start,
             });
             let (_, post_init_aligned, _post_asm_reg) = self.skip_asm_and_attributes();
+            let Some(last_decl) = declarators.last_mut() else {
+                return None;
+            };
             if self.attrs.parsing_maybe_unused() {
-                declarators
-                    .last_mut()
-                    .expect("declarator just pushed")
-                    .attrs
-                    .set_maybe_unused(true);
+                last_decl.attrs.set_maybe_unused(true);
                 self.attrs.set_maybe_unused(false);
             }
             if let Some(a) = post_init_aligned {

@@ -476,6 +476,16 @@ anyway (the bullet carries the *why*).
 
 ## Frontend / sema
 
+- **[2026-10-26, C23 `_BitInt(17)` inventory gap]** The fresh 24-probe
+  GCC 16.2 inventory confirms one difference: GCC accepts the C23
+  `unsigned _BitInt(17)` probe and LCCC rejects it at parsing. **Defer**
+  `_BitInt` rather than adding a syntax-only or fixed-width alias. The closed
+  built-in `CType` model has no arbitrary precision/signedness carrier, so a
+  correct implementation must cover promotions and conversions, constant
+  evaluation, layout, ABI classification, lowering/codegen and debug metadata
+  together. Keep the mismatch explicit in the inventory and backlog; do not
+  change the oracle expectation or claim the gap is intentional C23 behavior.
+  Reopen only with end-to-end width, arithmetic, layout and ABI tests.
 - **[2026-10-26, GCC 16.2 default C dialect]** The default C mode follows
   GCC 16.2's `gnu23`: a pinned `gcc-16 -dM -E -x c /dev/null` reports
   `__STDC_VERSION__ 202311L`, and the default semantics treat `f()` as a

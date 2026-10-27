@@ -918,6 +918,58 @@ fn interpret(program: &[Instruction], params: &[(u32, u64)], ty: IrType) -> u64 
 }
 
 #[test]
+fn a_nested_zero_test_is_not_mistaken_for_a_nonzero_implied_boolean() {
+    // If x is non-zero, (x == 0) is forced to zero, so testing that result
+    // with != 0 is forced false — it must not make x * factor collapse to x.
+    let ty = IrType::I32;
+    let source = vec![
+        Instruction::Cmp {
+            dest: Value(1),
+            op: IrCmpOp::Eq,
+            lhs: Operand::Value(Value(0)),
+            rhs: constant(0, ty),
+            ty,
+        },
+        Instruction::Cmp {
+            dest: Value(2),
+            op: IrCmpOp::Ne,
+            lhs: Operand::Value(Value(1)),
+            rhs: constant(0, ty),
+            ty,
+        },
+        bin(
+            Value(3),
+            IrBinOp::Mul,
+            Operand::Value(Value(0)),
+            Operand::Value(Value(2)),
+            ty,
+        ),
+    ];
+    let replacement = rewrite(&source, None).expect("a boolean factor is a select");
+    assert!(
+        matches!(
+            replacement.as_slice(),
+            [Instruction::Select {
+                dest: Value(3),
+                cond: Operand::Value(Value(2)),
+                true_val: Operand::Value(Value(0)),
+                false_val: Operand::Const(c),
+                ty: IrType::I32,
+            }] if c.to_i128() == Some(0)
+        ),
+        "the nested boolean remains a condition, not an identity: {replacement:?}"
+    );
+    let folded = [source[..source.len() - 1].to_vec(), replacement].concat();
+    for x in [0, 1, 2, 0x7fff_ffff, 0x8000_0000, 0xffff_ffff] {
+        assert_eq!(
+            interpret(&source, &[(0, x)], ty),
+            interpret(&folded, &[(0, x)], ty),
+            "x={x:#010x}"
+        );
+    }
+}
+
+#[test]
 fn nested_boolean_selects_collapse_to_the_surviving_value() {
     // `(a != 0 || b) ? a : 0`, whose `b && ...` arm the front end materialises
     // as a select: the value arm wins whenever the condition is forced, and the

@@ -515,6 +515,15 @@ prototype in both. Conditional function-pointer composites retain a compatible
 prototype from either arm. The external GCC compatibility macros/version banner remain
 at 14.2.0: this dialect change is not a full-parity claim.
 
+The refreshed GCC 16.2 matrix has 24 probes and one C23 difference:
+`_BitInt(17)` (GCC accepts; LCCC rejects). This is an explicit, deferred feature
+gap, not a false expected result or a syntax-only acceptance target. The current
+fixed-width `CType` model cannot carry `_BitInt` precision and signedness through
+integer conversions, constants, layout, ABI lowering, codegen and debug metadata.
+The inventory documents the measured rejection and the end-to-end acceptance
+criteria; until that work lands, keep the row visible and do not publish a C23
+coverage percentage.
+
 The historical per-function AVX2 vectorization candidate was remeasured with
 `tests/regression/per_function_target_avx2_reduction/reduction.c`: at `-O2`
 LCCC emits YMM instructions for the `target("avx2")` reduction without a
@@ -528,14 +537,23 @@ or performance claim is justified from that historical row.
 
 Remaining work:
 
-1. **Fresh C23 conformance inventory.** The old 40-snippet census is not
-   checked in as an auditable current matrix. Rebuild a per-feature accept/
-   reject table against GCC 16, including `_Float16`/`__bf16` edge cases and
-   rounding, before publishing a C23 coverage percentage.
+1. **Full `_BitInt` support** (deferred; see `docs/C23-COMPATIBILITY-INVENTORY.md`).
+   Add a width-bearing type that preserves signedness and precision through
+   integer promotions/conversions, constant evaluation, object/aggregate
+   layout, ABI classification, lowering/codegen, and debug output. Cover widths
+   around the built-in integer boundaries; arithmetic, shifts and conversions;
+   arrays, aggregates and bit-fields; and calls/returns on each supported ABI.
+   Keep `bitint-17` as the visible inventory difference until this end-to-end
+   contract is implemented and differentially tested.
+2. **Exhaustive half-format proof.** The existing targeted `_Float16`/`__bf16`
+   regressions do not cover all 2^16 encodings across rounding modes. Add that
+   proof before making exhaustive conversion claims.
 
-**Gates.** Current per-feature GCC 16 accept/reject table for C23 (no inferred
-coverage from stale counts); default/gnu17 dialect differential; retain the
-per-function AVX2 ISA-boundary and runtime gate. **Effort** S–M · **ROI** 3.3.
+**Gates.** Keep the 24-probe GCC 16.2 accept/reject matrix, default/gnu17
+prototype differential, and the per-function AVX2 ISA-boundary/runtime test;
+new `_BitInt` support must add compiler-oracle differential and ABI/layout
+coverage rather than weakening the existing known-gap row. **Effort** M–L ·
+**ROI** 3.3.
 
 ### MB-12 · P1 · R — warnings that real builds rely on
 

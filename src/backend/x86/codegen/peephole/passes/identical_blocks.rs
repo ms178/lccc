@@ -83,140 +83,46 @@ fn line_is_identity_transparent(store: &LineStore, infos: &[LineInfo], j: usize)
     infos[j].kind == LineKind::Directive && is_alignment_directive(infos[j].trimmed(store.get(j)))
 }
 
-/// Does this instruction set the EFLAGS (condition flags)?
-fn sets_flags(store: &LineStore, infos: &[LineInfo], i: usize) -> bool {
-    match infos[i].kind {
-        LineKind::Cmp => true, // cmp/test/ucomis*
-        LineKind::Push { .. }
-        | LineKind::Pop { .. }
-        | LineKind::Label
-        | LineKind::Jmp
-        | LineKind::CondJmp
-        | LineKind::JmpIndirect
-        | LineKind::Call
-        | LineKind::Ret
-        | LineKind::Directive
-        | LineKind::SelfMove
-        | LineKind::SetCC { .. } => false,
-        _ => {
-            let t = infos[i].trimmed(store.get(i));
-            let mnem = t.split_whitespace().next().unwrap_or("");
-            matches!(
-                mnem,
-                "addl"
-                    | "addq"
-                    | "addw"
-                    | "addb"
-                    | "subl"
-                    | "subq"
-                    | "subw"
-                    | "subb"
-                    | "andl"
-                    | "andq"
-                    | "andw"
-                    | "andb"
-                    | "orl"
-                    | "orq"
-                    | "orw"
-                    | "orb"
-                    | "xorl"
-                    | "xorq"
-                    | "xorw"
-                    | "xorb"
-                    | "imull"
-                    | "imulq"
-                    | "imulw"
-                    | "mull"
-                    | "mulq"
-                    | "mulw"
-                    | "incl"
-                    | "incq"
-                    | "incw"
-                    | "decl"
-                    | "decq"
-                    | "decw"
-                    | "negl"
-                    | "negq"
-                    | "negw"
-                    | "notl"
-                    | "notq"
-                    | "notw"
-                    | "shll"
-                    | "shlq"
-                    | "shlw"
-                    | "shrl"
-                    | "shrq"
-                    | "shrw"
-                    | "sarl"
-                    | "sarq"
-                    | "sarw"
-                    | "roll"
-                    | "rolq"
-                    | "rolw"
-                    | "rorl"
-                    | "rorq"
-                    | "rorw"
-                    | "testl"
-                    | "testq"
-                    | "testw"
-                    | "testb"
-                    | "cmpl"
-                    | "cmpq"
-                    | "cmpw"
-                    | "cmpb"
-                    | "btl"
-                    | "btq"
-                    | "btw"
-                    | "btb"
-            )
-        }
-    }
-}
-
 /// Does this instruction consume (read) the EFLAGS?
 ///
 /// Shared with `return_home`: a rewrite that replaces a flag-writing root
 /// must know whether anything in its window consumes what the root wrote.
+/// The shared classifier treats unknown instructions as readers, so callers
+/// fail closed instead of silently assuming an unmodeled instruction is safe.
 pub(super) fn reads_flags(store: &LineStore, infos: &[LineInfo], i: usize) -> bool {
-    match infos[i].kind {
-        LineKind::CondJmp | LineKind::SetCC { .. } => true,
-        _ => {
-            let t = infos[i].trimmed(store.get(i));
-            let mnem = t.split_whitespace().next().unwrap_or("");
-            mnem.starts_with("cmov")
-                || mnem.starts_with("set")
-                || mnem == "adcl"
-                || mnem == "adcq"
-                || mnem == "adcw"
-                || mnem == "sbbl"
-                || mnem == "sbbq"
-                || mnem == "sbbw"
-        }
+    if infos[i].is_steppable() || infos[i].kind == LineKind::Empty {
+        return false;
     }
+    super::flag_peepholes::flags_effect(infos[i].trimmed(store.get(i)))
+        == super::flag_peepholes::FlagsEffect::Reads
 }
 
-/// True if the block reads EFLAGS *before* establishing them itself, i.e. it
-/// depends on the incoming (predecessor-set) flags.
+/// True if a block can observe any incoming arithmetic flag before that bit is
+/// definitely replaced. Partial writes (INC preserves CF, SAHF preserves OF,
+/// BT preserves ZF) and zero-count/unknown writers cannot kill the bits they
+/// leave live. Unknown/read-write instructions are treated as readers.
 fn block_is_flag_dependent(
     store: &LineStore,
     infos: &[LineInfo],
     start: usize,
     end: usize,
 ) -> bool {
-    let mut flags_set = false;
+    let mut incoming = super::flag_peepholes::F_ALL;
     for j in (start + 1)..end {
-        if infos[j].is_nop() {
+        if infos[j].is_steppable() || infos[j].kind == LineKind::Empty {
             continue;
         }
-        if infos[j].kind == LineKind::Directive
-            && is_alignment_directive(infos[j].trimmed(store.get(j)))
-        {
-            continue;
-        }
-        if sets_flags(store, infos, j) {
-            flags_set = true;
-        } else if reads_flags(store, infos, j) && !flags_set {
-            return true;
+        let text = infos[j].trimmed(store.get(j));
+        match super::flag_peepholes::flags_effect(text) {
+            super::flag_peepholes::FlagsEffect::Reads => {
+                if incoming != 0 {
+                    return true;
+                }
+            }
+            super::flag_peepholes::FlagsEffect::Writes => {
+                incoming &= !super::flag_peepholes::flags_written_mask(text);
+            }
+            super::flag_peepholes::FlagsEffect::Neutral => {}
         }
     }
     false
@@ -246,25 +152,6 @@ fn block_is_clean(store: &LineStore, infos: &[LineInfo], start: usize, end: usiz
         }
     }
     true
-}
-
-/// Whether the block contains any flag-consuming instruction at all (used to
-/// decide if EFLAGS matter for the merge).
-fn block_has_flag_use(store: &LineStore, infos: &[LineInfo], start: usize, end: usize) -> bool {
-    for j in (start + 1)..end {
-        if infos[j].is_nop() {
-            continue;
-        }
-        if infos[j].kind == LineKind::Directive
-            && is_alignment_directive(infos[j].trimmed(store.get(j)))
-        {
-            continue;
-        }
-        if reads_flags(store, infos, j) || sets_flags(store, infos, j) {
-            return true;
-        }
-    }
-    false
 }
 
 /// Merge identical basic blocks.
@@ -783,6 +670,54 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
 #[cfg(test)]
 mod tests {
     use super::super::super::peephole_optimize;
+
+    #[test]
+    fn flag_reader_oracle_covers_carry_and_flag_materialization() {
+        for text in [
+            "rcll $1, %edi",
+            "rcrq $1, %rdi",
+            "lahf",
+            "pushfq",
+            "cmc",
+            "loope .L1",
+            "loopnz .L2",
+            "adcxq %r8, %r9",
+            "adoxq %r8, %r9",
+            "fcmovb %st(1), %st",
+        ] {
+            let store = super::LineStore::new(format!("{text}\n"));
+            let info = super::classify_line(store.get(0));
+            assert!(
+                super::reads_flags(&store, &[info], 0),
+                "{text} consumes EFLAGS"
+            );
+        }
+    }
+
+    fn flag_dependent(body: &str) -> bool {
+        let asm = format!(".LBB0:\n{body}\n");
+        let store = super::LineStore::new(asm);
+        let infos: Vec<_> = (0..store.len())
+            .map(|i| super::classify_line(store.get(i)))
+            .collect();
+        super::block_is_flag_dependent(&store, &infos, 0, store.len())
+    }
+
+    #[test]
+    fn a_flag_neutral_not_does_not_kill_incoming_flags() {
+        assert!(flag_dependent("    notl %eax\n    setb %cl"));
+    }
+
+    #[test]
+    fn inc_and_zero_count_shift_do_not_kill_all_incoming_flags() {
+        assert!(flag_dependent("    incq %rax\n    setb %cl"));
+        assert!(flag_dependent("    shlq $0, %rax\n    setb %cl"));
+    }
+
+    #[test]
+    fn a_full_flag_writer_kills_incoming_flag_dependence() {
+        assert!(!flag_dependent("    addl $1, %eax\n    setb %cl"));
+    }
 
     fn run(asm: &str) -> String {
         peephole_optimize(asm.to_string())

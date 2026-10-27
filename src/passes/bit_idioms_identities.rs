@@ -156,8 +156,12 @@ fn implied_condition_sense(
     }
     budget.set(budget.get() - 1);
     let zero = |op: Operand| matches!(op, Operand::Const(c) if c.to_i128() == Some(0));
-    let holds = |op: Operand, depth: u8| {
-        op == value || implied_condition_sense(op, value, ty, cx, budget, depth).is_some()
+    let value_nonzero_sense = |op: Operand, depth: u8| {
+        if op == value {
+            Some(true)
+        } else {
+            implied_condition_sense(op, value, ty, cx, budget, depth)
+        }
     };
     match cx.def(node) {
         // An or-tree is non-zero as soon as one side is.
@@ -189,8 +193,12 @@ fn implied_condition_sense(
                 if !zero(other) {
                     continue;
                 }
-                if probe == value || holds(probe, depth - 1) {
-                    return Some(*op == IrCmpOp::Ne);
+                if let Some(probe_nonzero) = value_nonzero_sense(probe, depth - 1) {
+                    return Some(if *op == IrCmpOp::Ne {
+                        probe_nonzero
+                    } else {
+                        !probe_nonzero
+                    });
                 }
             }
             None
@@ -208,7 +216,7 @@ fn implied_condition_sense(
                 true => *true_val,
                 false => *false_val,
             };
-            if arm == value || holds(arm, depth - 1) {
+            if value_nonzero_sense(arm, depth - 1) == Some(true) {
                 Some(true)
             } else if matches!(arm, Operand::Const(c) if c.to_i128() != Some(0)) {
                 Some(true)

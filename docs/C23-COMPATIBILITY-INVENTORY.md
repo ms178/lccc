@@ -37,6 +37,13 @@ Every probe is compiled with `-fsyntax-only` in the listed mode. C17 outcomes ar
 
 ## Measured C23 differences
 
-- `bitint-17`
+- `bitint-17` is a confirmed implementation gap: GCC 16.2 accepts the C23
+  `unsigned _BitInt(17)` probe, while LCCC rejects it in both C23 and C17 modes.
+  This is deferred, not an intentional C23 rejection. Do not add syntax-only
+  acceptance or change the oracle expectation: the fixed-width `CType` model
+  cannot yet preserve arbitrary precision and signedness through conversions,
+  constants, layout, ABI lowering, code generation, and debug metadata. Keep
+  the probe visible until end-to-end support and differential ABI/layout tests
+  land; see `engineering/DECISIONS.md` and the live backlog.
 
 Source hashes, complete diagnostics, and argv are preserved when the same run is requested with `--json`.

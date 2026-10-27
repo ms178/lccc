@@ -56,6 +56,9 @@ work=${LCCC_XROOT:-/var/tmp/lccc-xroot}
 deb_cache=${LCCC_CROSS_DEB_DIR:-$HOME/.cache/lccc-cross-debs}
 
 have() { command -v "$1" >/dev/null 2>&1; }
+runnable() {
+    have "$1" && "$1" --version >/dev/null 2>&1
+}
 
 need_aarch64=0
 need_riscv64=0
@@ -72,22 +75,24 @@ check_aarch64=$need_aarch64
 check_riscv64=$need_riscv64
 
 if [[ $need_aarch64 == 1 ]] \
-    && have aarch64-linux-gnu-gcc \
-    && have aarch64-linux-gnu-as \
+    && runnable aarch64-linux-gnu-gcc \
+    && runnable aarch64-linux-gnu-as \
+    && runnable aarch64-linux-gnu-ld \
     && [[ -e /usr/aarch64-linux-gnu/lib/ld-linux-aarch64.so.1 ]]; then
     need_aarch64=0
 fi
 if [[ $need_riscv64 == 1 ]] \
-    && have riscv64-linux-gnu-gcc \
-    && have riscv64-linux-gnu-as \
+    && runnable riscv64-linux-gnu-gcc \
+    && runnable riscv64-linux-gnu-as \
+    && runnable riscv64-linux-gnu-ld \
     && [[ -e /usr/riscv64-linux-gnu/lib/ld-linux-riscv64-lp64d.so.1 ]]; then
     need_riscv64=0
 fi
 need_qemu=0
-if [[ $check_aarch64 == 1 ]] && ! have qemu-aarch64; then
+if [[ $check_aarch64 == 1 ]] && ! runnable qemu-aarch64; then
     need_qemu=1
 fi
-if [[ $check_riscv64 == 1 ]] && ! have qemu-riscv64; then
+if [[ $check_riscv64 == 1 ]] && ! runnable qemu-riscv64; then
     need_qemu=1
 fi
 if [[ $need_aarch64 == 0 && $need_riscv64 == 0 && $need_qemu == 0 ]]; then
@@ -220,6 +225,26 @@ if [[ -d "$work/usr" ]]; then
         || echo "[cross] FATAL: cannot write /usr" >&2
 fi
 
+# `dpkg -x` deliberately bypasses package maintainer scripts. Cross binutils
+# executables can therefore be present while their host-side shared libraries
+# (for example libopcodes-*-arm64.so) are absent from the dynamic-loader cache.
+# Rebuild it after grafting /usr; otherwise an `as --version` probe succeeds
+# only on machines where every library happens to be in a built-in search dir.
+loader_cache_failed=0
+if have ldconfig; then
+    if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+        ldconfig || loader_cache_failed=1
+    elif have sudo; then
+        sudo -n ldconfig || loader_cache_failed=1
+    else
+        echo "[cross] ERROR: ldconfig needs root after dpkg -x cross-toolchain restore" >&2
+        loader_cache_failed=1
+    fi
+else
+    echo "[cross] ERROR: ldconfig is required after dpkg -x cross-toolchain restore" >&2
+    loader_cache_failed=1
+fi
+
 # Versioned compiler packages intentionally omit the unversioned driver
 # symlinks supplied by the conflicting gcc-<triplet>-linux-gnu meta packages.
 # Recreate only missing links, pointing at the matching host-major tools.
@@ -240,8 +265,9 @@ for t in aarch64 riscv64; do
 done
 
 # A sysroot is not enough for qemu `-L`: both the emulator and dynamic loader
-# path must exist. Verify exactly the targets requested by this invocation.
-rc=0
+# path must exist. Verify exactly the targets requested by this invocation,
+# including that the cross binutils can actually load their shared libraries.
+rc=$loader_cache_failed
 for t in aarch64 riscv64; do
     if [[ $t == aarch64 && $check_aarch64 == 0 ]] \
         || [[ $t == riscv64 && $check_riscv64 == 0 ]]; then
@@ -254,13 +280,22 @@ for t in aarch64 riscv64; do
     else
         loader=/usr/riscv64-linux-gnu/lib/ld-linux-riscv64-lp64d.so.1
     fi
-    if have "$cc" && have "$qemu" && [[ -e $loader ]]; then
+    if runnable "$cc" && runnable "$qemu" && [[ -e $loader ]]; then
         echo "[cross] OK  $cc ($($cc --version | head -1)); $qemu; $loader"
     else
-        have "$cc" || echo "[cross] MISSING $cc"
-        have "$qemu" || echo "[cross] MISSING $qemu"
+        runnable "$cc" || echo "[cross] MISSING or not runnable $cc"
+        runnable "$qemu" || echo "[cross] MISSING or not runnable $qemu"
         [[ -e $loader ]] || echo "[cross] MISSING $loader"
         rc=1
     fi
+    for tool in as ld; do
+        host_tool="${t}-linux-gnu-${tool}"
+        if runnable "$host_tool"; then
+            echo "[cross] OK  $host_tool"
+        else
+            echo "[cross] MISSING or not runnable $host_tool" >&2
+            rc=1
+        fi
+    done
 done
 exit $rc
