@@ -1021,6 +1021,26 @@ impl Lowerer {
                 let size = self.struct_value_size(expr).unwrap_or(8);
                 self.call_result_is_packed(func_expr, size)
             }
+            // A vector-typed wrapper never yields its operand's packed carrier:
+            // `lower_expr` spills it (`spill_packed_vector_wrapper`), so it
+            // yields the vector's address, as every other vector rvalue does.
+            Expr::Conditional(..)
+            | Expr::GnuConditional(..)
+            | Expr::Comma(..)
+            | Expr::StmtExpr(..)
+                if self.get_expr_ctype(expr).is_some_and(|ct| ct.is_vector()) =>
+            {
+                false
+            }
+            _ => self.wrapper_forwards_packed_data(expr),
+        }
+    }
+
+    /// Whether a conditional, comma or statement expression, lowered as is,
+    /// yields the packed register carrier of one of its operands (a small
+    /// aggregate returned in registers) rather than an address.
+    pub(super) fn wrapper_forwards_packed_data(&self, expr: &Expr) -> bool {
+        match expr {
             Expr::Conditional(_, then_expr, else_expr, _) => {
                 // If either branch produces packed struct data, the ternary does too
                 self.expr_produces_packed_struct_data(then_expr)

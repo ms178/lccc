@@ -158,15 +158,17 @@ impl Lowerer {
                     }
                 }
                 match name.as_str() {
-                    "__builtin_shufflevector" => return Some(16),
-                    "__builtin_shuffle" => {
+                    "__builtin_shuffle" | "__builtin_shufflevector" => {
                         let bytes = match self.get_expr_ctype(expr) {
                             Some(ct) if ct.is_vector() => ct.size(),
                             // Not resolvable: keep the historical packed
                             // answer rather than inventing a size.
                             _ => return None,
                         };
-                        if bytes > 8 {
+                        // The lowering packs only results of at most 8 bytes
+                        // on x86-64 (`call_result_is_packed`); everything else,
+                        // every i686 result included, is the object's address.
+                        if bytes > 8 || crate::common::types::target_is_32bit() {
                             return Some(bytes);
                         }
                         return None;
@@ -401,7 +403,6 @@ impl Lowerer {
             return Some(IrType::Ptr);
         }
         match name {
-            "__builtin_shufflevector" => Some(IrType::Ptr),
             // x86 vector scalar extractions with 64-bit results (long long /
             // unsigned long long). Without these the call was typed with the
             // target int (I32 on i686): every consumer sign-extended the low
@@ -705,6 +706,12 @@ impl Lowerer {
             | BinOp::LogicalAnd
             | BinOp::LogicalOr => crate::common::types::target_int_ir_type(),
             BinOp::Shl | BinOp::Shr => {
+                // GNU vector shifts are element-wise when either operand is
+                // a vector.  A scalar lhs is splatted to the rhs vector type;
+                // the scalar-C "promoted lhs" rule applies only otherwise.
+                if self.get_expr_ctype(rhs).is_some_and(|ct| ct.is_vector()) {
+                    return self.get_expr_type(rhs);
+                }
                 let lty = self.get_expr_type(lhs);
                 promote_integer(lty)
             }
@@ -1371,8 +1378,14 @@ impl Lowerer {
             _ => {}
         }
 
-        // Shift operators: result type is the promoted type of the left operand
+        // GNU vector shifts produce the vector type even when its operand is
+        // on the right (`scalar << vector`); scalar shifts keep promoted-lhs.
         if matches!(op, BinOp::Shl | BinOp::Shr) {
+            if let Some(rct) = self.get_expr_ctype(rhs) {
+                if rct.is_vector() {
+                    return Some(rct);
+                }
+            }
             if let Some(lct) = self.get_expr_ctype(lhs) {
                 return Some(Self::integer_promote_ctype(&lct));
             }
@@ -1684,13 +1697,15 @@ impl Lowerer {
                 // Fall back to sema's function signatures for function-typed identifiers
                 // (e.g., taking address of a function: &func_name)
                 if let Some(func_info) = self.sema_functions.get(name.as_str()) {
-                    return Some(CType::Function(Box::new(
+                    let callable_type = func_info.prototype.clone().unwrap_or_else(|| {
                         crate::common::types::FunctionType {
                             return_type: func_info.return_type.clone(),
-                            params: func_info.params.clone(),
+                            params: Vec::new(),
                             variadic: func_info.variadic,
-                        },
-                    )));
+                            has_prototype: false,
+                        }
+                    });
+                    return Some(CType::Function(Box::new(callable_type)));
                 }
                 None
             }
@@ -1853,6 +1868,20 @@ impl Lowerer {
                     }
                     if name == "__builtin_choose_expr" && args.len() >= 3 {
                         return self.get_expr_ctype(self.resolve_builtin_choose_expr(args));
+                    }
+                    // Sema's cache does not cover `typeof` operands, which
+                    // reach here: without this, `typeof(__builtin_shuffle(a, m))`
+                    // fell back to `int` with only a warning.
+                    if matches!(
+                        name.as_str(),
+                        "__builtin_shuffle" | "__builtin_shufflevector"
+                    ) {
+                        if let Some(result) = args.first().and_then(|first| {
+                            let first = self.get_expr_ctype(first)?;
+                            CType::shuffle_builtin_result(name, &first, args.len())
+                        }) {
+                            return Some(result);
+                        }
                     }
                     if Self::is_polymorphic_atomic_builtin(name) {
                         if let Some(first_arg) = args.first() {

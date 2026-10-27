@@ -83,6 +83,16 @@ def execute(binary: Path, tools: Toolchain) -> tuple[int, bytes, bytes]:
     return result.returncode, result.stdout, result.stderr
 
 
+def execution_detail(label: str, result: tuple[int, bytes, bytes]) -> str:
+    """Bound and escape both output streams; equal exit codes can still disagree."""
+    return f"{label} rc={result[0]} out={text(result[1], 400)!r} err={text(result[2], 400)!r}"
+
+
+def exit_status(results: Sequence[Result]) -> int:
+    return int(any(result.status in {"FAIL", "HARNESS-ERROR", "ORACLE-DISAGREE"}
+                   for result in results))
+
+
 def dejagnu_flags(source: Path) -> tuple[str, ...]:
     """Extract unconditional dg-options/additional-options from one test.
 
@@ -173,8 +183,7 @@ def test_one(source: Path, tools: Toolchain, work_root: Path) -> Result:
         lccc_result = execute(binary, tools)
         if lccc_result != gcc_result:
             detail = (
-                f"lccc rc={lccc_result[0]} out={text(lccc_result[1], 400)!r} err={text(lccc_result[2], 400)!r}; "
-                f"gcc rc={gcc_result[0]} out={text(gcc_result[1], 400)!r} err={text(gcc_result[2], 400)!r}"
+                execution_detail("lccc", lccc_result) + "; " + execution_detail("gcc", gcc_result)
             )
             return Result(str(source), "FAIL", "execute-vs-gcc", time.monotonic() - started, detail)
 
@@ -183,16 +192,23 @@ def test_one(source: Path, tools: Toolchain, work_root: Path) -> Result:
             clang_compile = compile_reference(
                 tools.clang, source, clang_binary, tools, test_flags, clang=True
             )
-            if clang_compile.returncode == 0:
-                clang_result = execute(clang_binary, tools)
-                if clang_result != gcc_result:
-                    return Result(
-                        str(source),
-                        "ORACLE-DISAGREE",
-                        "clang-vs-gcc",
-                        time.monotonic() - started,
-                        f"clang rc={clang_result[0]} vs gcc rc={gcc_result[0]}",
-                    )
+            if clang_compile.returncode != 0:
+                return Result(
+                    str(source),
+                    "HARNESS-ERROR",
+                    "clang-compile",
+                    time.monotonic() - started,
+                    text(clang_compile.stderr),
+                )
+            clang_result = execute(clang_binary, tools)
+            if clang_result != gcc_result:
+                return Result(
+                    str(source),
+                    "ORACLE-DISAGREE",
+                    "clang-vs-gcc",
+                    time.monotonic() - started,
+                    execution_detail("clang", clang_result) + "; " + execution_detail("gcc", gcc_result),
+                )
 
         return Result(str(source), "PASS", "execute", time.monotonic() - started)
     except subprocess.TimeoutExpired as error:
@@ -309,7 +325,7 @@ def main() -> int:
         temporary_json.replace(args.json)
     if args.keep:
         print(f"WORKDIR {work_root}")
-    return 1 if any(result.status in {"FAIL", "HARNESS-ERROR"} for result in results) else 0
+    return exit_status(results)
 
 
 if __name__ == "__main__":

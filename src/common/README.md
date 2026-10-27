@@ -347,10 +347,14 @@ Diagnostic builder methods:
 - Chainable modifiers: `with_span(span)`, `with_note(diag)`,
   `with_fix_hint(text)`, `with_location(file, line, col)`.
 
-**WarningKind** -- Enumeration of warning categories matching GCC flag names:
-`Undeclared`, `ImplicitFunctionDeclaration`, `Cpp`, `ReturnType`. Each
-variant maps to a `-W<name>` flag (e.g., `-Wimplicit-function-declaration`).
-Supports `-Wall` and `-Wextra` groupings. The `Undeclared` variant is
+**WarningKind** -- Enumeration of implemented warning categories matching
+GCC flag names: `Undeclared`, `ImplicitFunctionDeclaration`, `Cpp`,
+`ReturnType`, `IncompatiblePointerTypes`, `Attributes`, `UnusedVariable`,
+`SignCompare`, `Format`, and `FormatSecurity`. Each variant maps to a
+`-W<name>` flag (for example, `-Wformat-security`). `FormatSecurity` checks
+nonliteral printf-family formats with no format arguments and requires
+`-Wformat`, matching GCC's option dependency. `-Wall` and `-Wextra` use
+separate groups; pass both to enable their union. The `Undeclared` variant is
 retained for CLI flag parsing compatibility but is no longer emitted as a
 warning (undeclared variables are now hard errors).
 
@@ -363,7 +367,7 @@ Processes CLI flags left-to-right so that later flags override earlier ones:
 - `-Werror=<name>` (per-warning promotion, which also implicitly enables it)
 - `-Wno-error=<name>` (demotion of a specific warning back from error)
 - `-Wall` (enable the standard warning set)
-- `-Wextra` (enable additional warnings, superset of `-Wall`)
+- `-Wextra` (enable its additional warning set; pass `-Wall -Wextra` for both groups)
 - `-W<name>` (enable a specific warning by name)
 - `-Wno-<name>` (disable a specific warning entirely)
 
@@ -475,7 +479,8 @@ handles all shared cases:
 - 22 primitive C types (Void through ComplexLongDouble)
 - Pointer, Array, FunctionPointer, and BareFunction construction (BareFunction
   produces `CType::Function` directly, not wrapped in a Pointer -- this is
-  used for `typeof` on function names)
+  used for `typeof` on function names). Function types retain an explicit
+  `has_prototype` bit so empty `()` and `(void)` parameter lists remain distinct.
 - TypeofType and AutoType
 
 Only four cases differ between sema and lowering and must be implemented by

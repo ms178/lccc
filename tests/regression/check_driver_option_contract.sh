@@ -7,6 +7,14 @@ repo=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)
 CCC=$(realpath "${CCC:-./target/fastbuild/lccc}")
 td=$(mktemp -d "${TMPDIR:-/tmp}/lccc-driver-options.XXXXXX")
 trap 'rm -rf "$td"' EXIT
+SKIP_MATRIX=${SKIP_TRAPV_MATRIX:-0}
+while [ $# -gt 0 ]; do
+    case $1 in
+        --skip-trapv-matrix) SKIP_MATRIX=1; shift ;;
+        -h|--help) echo "usage: $0 [--skip-trapv-matrix]"; exit 0 ;;
+        *) echo "$0: unknown argument: $1" >&2; exit 2 ;;
+    esac
+done
 
 cat > "$td/plain.c" <<'EOF'
 int f(void) { return 42; }
@@ -119,6 +127,68 @@ cat > "$td/hosted-override.c" <<'EOF'
 int hosted_override;
 EOF
 "$CCC" -fhosted -D__STDC_HOSTED__=0 -fsyntax-only "$td/hosted-override.c"
+
+# GCC 16.2 defaults to GNU C23: an empty parameter list is a prototype with
+# zero parameters. The explicit GNU17 escape hatch retains the older
+# unspecified-parameters meaning, for both direct and function-pointer calls.
+cat > "$td/empty-parameter-list.c" <<'EOF'
+static int no_args() { return 42; }
+int probe(void) { return no_args(1); }
+EOF
+cat > "$td/empty-declaration.c" <<'EOF'
+extern int no_args();
+int probe(void) { return no_args(1); }
+EOF
+cat > "$td/empty-function-pointer.c" <<'EOF'
+static int no_args() { return 42; }
+int probe(void) { int (*fp)() = no_args; return fp(1); }
+EOF
+cat > "$td/empty-function-pointer-typedef.c" <<'EOF'
+typedef int (*no_args_fn)();
+int probe(no_args_fn fn) { return fn(1); }
+EOF
+for source in \
+    "$td/empty-parameter-list.c" \
+    "$td/empty-declaration.c" \
+    "$td/empty-function-pointer.c" \
+    "$td/empty-function-pointer-typedef.c"; do
+    if "$CCC" -fsyntax-only "$source" 2>"$td/default-dialect.err"; then
+        echo "FAIL: default GNU C23 accepted an extra argument to an empty-list function" >&2
+        exit 1
+    fi
+done
+"$CCC" -std=gnu17 -fsyntax-only "$td/empty-parameter-list.c"
+"$CCC" -std=gnu17 -fsyntax-only "$td/empty-declaration.c"
+"$CCC" -std=gnu17 -fsyntax-only "$td/empty-function-pointer.c"
+"$CCC" -std=gnu17 -fsyntax-only "$td/empty-function-pointer-typedef.c"
+cat > "$td/void-parameter-list.c" <<'EOF'
+static int no_args(void) { return 42; }
+int probe(void) { return no_args(1); }
+EOF
+if "$CCC" -std=gnu17 -fsyntax-only "$td/void-parameter-list.c" 2>"$td/void-parameter-list.err"; then
+    echo "FAIL: GNU C17 failed to treat (void) as a zero-parameter prototype" >&2
+    exit 1
+fi
+
+# The conditional operator must form a composite function-pointer type. A
+# prototype arm refines an unprototyped arm even when it is the else operand.
+cat > "$td/conditional-function-pointer-valid.c" <<'EOF'
+extern int old_style();
+extern int prototype(void);
+int probe(int choose) { return (choose ? old_style : prototype)(); }
+EOF
+"$CCC" -std=gnu17 -fsyntax-only "$td/conditional-function-pointer-valid.c"
+cat > "$td/conditional-function-pointer-extra-argument.c" <<'EOF'
+extern int old_style();
+extern int prototype(void);
+int probe(int choose) { return (choose ? old_style : prototype)(1); }
+EOF
+if "$CCC" -std=gnu17 -fsyntax-only \
+    "$td/conditional-function-pointer-extra-argument.c" \
+    2>"$td/conditional-function-pointer.err"; then
+    echo "FAIL: GNU C17 conditional composite discarded its zero-parameter prototype" >&2
+    exit 1
+fi
 
 # The policy is wired to every automatic vectorizer, not merely accepted by
 # the argument parser. This fixture is independently required to emit AVX2 at
@@ -327,6 +397,29 @@ if [ "$trap_rc" -ne 134 ]; then
     exit 1
 fi
 
+# The 6,776-case boundary matrix is split into one script per ABI so hosted CI
+# can place -m64 and -m32 on different runners. Locally both legs run in
+# parallel; --skip-trapv-matrix is the hosted core-only half of the contract.
+if [[ $SKIP_MATRIX != 1 ]]; then
+    pids=()
+    for bits in -m64 -m32; do
+        bash "$repo/tests/regression/check_trapv_boundary_matrix.sh" --bits "$bits" \
+            > "$td/trapv-$bits.log" 2>&1 &
+        pids+=("$!")
+    done
+    matrix_rc=0
+    for pid in "${pids[@]}"; do
+        wait "$pid" || matrix_rc=1
+    done
+    for bits in -m64 -m32; do
+        cat "$td/trapv-$bits.log"
+    done
+    if [ "$matrix_rc" -ne 0 ]; then
+        echo "FAIL: -ftrapv boundary matrix failed on one or both ABIs" >&2
+        exit 1
+    fi
+fi
+
 cat > "$td/autovar_check.c" <<'EOF'
 #include <stdint.h>
 __attribute__((noinline)) uint64_t read_pat(void) {
@@ -363,4 +456,4 @@ fi
     exit 1
 }
 
-echo "driver option contract: PASS (hosted/freestanding macros, builtin gating, accepted/refused vectorizer and builtin flags)"
+echo "driver option contract: PASS (hosted/freestanding macros, builtin gating, accepted/refused vectorizer and builtin flags, -ftrapv m64/m32 overflow matrix, stack clash probes)"

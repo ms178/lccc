@@ -2,10 +2,11 @@
 # Build/restore the comparison linkers used by tests/linker/run_linker_tests.py
 # and the differential/ICF tooling.
 #
-# Pinning policy (user directive, refreshed 2026-09-27): the oracles are
+# Pinning policy (user directive, refreshed 2026-10-27): the oracles are
 #   * GNU ld (bfd) from binutils 2.47  (release tarball, ftp.gnu.org)
-#   * mold 2.42.1                      (release tarball, github.com/rui314/mold),
-#                                      built with -DMOLD_TARGETS='X86_64;I386'
+#   * mold 3.0.0                       (release tarball, github.com/rui314/mold),
+#                                      built with Cargo target features
+#                                      x86_64,i386 only (see below)
 #   * LLVM lld 23.1.x                  (apt.llvm.org llvm-toolchain-<codename>-23;
 #                                      the installed version is asserted to be
 #                                      23.1.* and recorded in ORACLES.lock)
@@ -28,14 +29,16 @@
 # Wrappers whose target is missing are likewise removed, never left dangling.
 #
 # Build-time preset (2-vCPU / 2 GB host, -j2 research policy):
-#   * mold: MOLD_TARGETS is mold's own CMake cache variable (CMakeLists.txt,
-#     v2.42.1: `set(MOLD_TARGETS X86_64 I386 ARM64LE ... CACHE STRING ...)`);
-#     every source file is instantiated once per listed target, so restricting
-#     it to the two x86 ELF targets cuts the template instantiation work by
-#     ~10x.  X86_64 must stay first (MOLD_FIRST_TARGET).
-#   * binutils: only bfd + ld are configured/built (`all-ld`,
-#     `install-strip-ld`) — gas/binutils/gprof/gdb are not linker oracles
-#     (GNU as 2.47 has its own provisioner, scripts/ensure_gas_247.sh).
+#   * mold: mold 3.x is a Rust program; the CMake build and its
+#     `-DMOLD_TARGETS=` preset were removed upstream.  The equivalent
+#     x86-only preset is Cargo's per-target feature set in cli/Cargo.toml:
+#     `cargo build --release -p mold-cli --no-default-features
+#      --features x86_64,i386`.  Each target is a separate crate, so
+#     restricting it to the two x86 ELF targets drops the other eighteen
+#     target crates from the build.  Then ./install-mold.sh installs bin/
+#     plus lib/mold/mold-wrapper.so and the libexec/mold/ld sibling.
+#   * binutils: the pinned 2.47 program set is restored as a verified binary
+#     from the GitHub-only agent cache (no per-run configure/make).
 #   * lld: a source build of LLVM is hours on this host; the apt.llvm.org
 #     release build of the same 23.1 branch is used instead.
 #
@@ -54,11 +57,14 @@
 #
 # Idempotent: re-running verifies and skips whatever already checks out.
 set -euo pipefail
+REPO=$(CDPATH= cd -- "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 
 # Apply the same version proof to freshly built AND restored executables.
 # A stale binary in a directory named bfd-2.47 must never be published as 2.47.
 # shellcheck source=oracle_versions.sh
 source "$(dirname "${BASH_SOURCE[0]}")/oracle_versions.sh"
+# shellcheck source=native_bfd_wrapper.sh
+source "$(dirname "${BASH_SOURCE[0]}")/native_bfd_wrapper.sh"
 
 JOBS="${JOBS:-2}"                      # research policy: -j2
 ARTIFACTS="${ARTIFACTS:-$HOME/artifacts/oracles}"
@@ -71,8 +77,8 @@ BINUTILS_VER=2.47
 # Same release bytes as scripts/ensure_gas_247.sh. This archive stamps its
 # binaries 2.47.20260726; oracle_versions.sh accepts that exact banner.
 BINUTILS_SHA256=154ab23b60070e8f27013c22977f1129425d67d1e8acd6e13010e617811e4cff
-MOLD_VER=2.42.1
-MOLD_TARGETS='X86_64;I386'
+MOLD_VER=3.0.0
+MOLD_FEATURES='x86_64,i386'
 LLD_MAJOR=23
 LLD_MINOR_PIN=23.1
 WITH_WILD="${WITH_WILD:-1}"
@@ -109,9 +115,12 @@ cache_prefix() {    # <prefix dir>
     mv -f "$CACHE/$1.tar.xz.tmp" "$CACHE/$1.tar.xz"
 }
 
-need curl tar xz sha256sum
-restore_cached "bfd-$BINUTILS_VER" bin/ld || need make gcc g++
-restore_cached "mold-$MOLD_VER" bin/mold || need cmake make g++
+need curl tar xz sha256sum git python3
+restore_cached "bfd-$BINUTILS_VER" bin/ld || need git python3
+# rustup installs cargo outside the default PATH; mold 3.x needs it (and a
+# C compiler for its two small C parts: mold-wrapper.so, lto-message).
+[ -d "$HOME/.cargo/bin" ] && PATH="$HOME/.cargo/bin:$PATH"
+restore_cached "mold-$MOLD_VER" bin/mold || need cargo cc
 if [ "$WITH_WILD" = 1 ]; then
     # rustup installs cargo outside the default PATH.
     [ -d "$HOME/.cargo/bin" ] && PATH="$HOME/.cargo/bin:$PATH"
@@ -120,9 +129,10 @@ fi
 
 # ── GNU ld 2.47 (primary oracle) ────────────────────────────────────────────
 
-# Match the native driver/runtime layout, not the upstream configure
-# defaults (which omit Debian multiarch libc and default to old dtags).
-# Version equality alone does not make that a usable native oracle.
+# Match the native driver/runtime layout, not the cached binary's upstream
+# configure defaults (which omit Debian multiarch libc and default to old
+# dtags). The stable ld-2.47 wrapper below supplies these defaults while
+# preserving caller overrides; version equality alone is not a usable oracle.
 native_multiarch=$(gcc -print-multiarch)
 native_lib_path=/usr/local/lib:/lib:/usr/lib:/lib64:/usr/lib64
 if [ -n "$native_multiarch" ] && [ -d "/lib/$native_multiarch" ]; then
@@ -133,37 +143,24 @@ fi
 for libdir in /lib32 /usr/lib32 /lib/i386-linux-gnu /usr/lib/i386-linux-gnu; do
     [ ! -d "$libdir" ] || native_lib_path="$native_lib_path:$libdir"
 done
-bfd_layout="new-dtags=1;sysroot=/;lib-path=$native_lib_path"
+bfd_layout="native-wrapper-v1;new-dtags=1;sysroot=/;lib-path=$native_lib_path"
 bfd_layout_stamp="$PREFIX/bfd-$BINUTILS_VER/.native-layout"
 if [ -x "$PREFIX/bfd-$BINUTILS_VER/bin/ld" ] &&
    oracle_native_layout_matches "$bfd_layout_stamp" "$bfd_layout"; then
     note "ld    : $("$PREFIX/bfd-$BINUTILS_VER/bin/ld" --version | head -1) (restored from $ARTIFACTS)"
 else
-    TARBALL="$SRC/binutils-$BINUTILS_VER.tar.xz"
-    [ -f "$TARBALL" ] || { note "ld    : fetching binutils $BINUTILS_VER"; \
-        curl -fsSL -o "$TARBALL" "https://ftp.gnu.org/gnu/binutils/binutils-$BINUTILS_VER.tar.xz"; }
-    printf '%s  %s\n' "$BINUTILS_SHA256" "$TARBALL" | sha256sum -c - || {
-        note "ld    : binutils archive integrity failure; remove $TARBALL to refetch"
-        exit 1
-    }
-    BT="$SRC/binutils-$BINUTILS_VER"
-    rm -rf "$BT"; tar -xf "$TARBALL" -C "$SRC"
-    ( cd "$BT"
-      ./configure --prefix="$PREFIX/bfd-$BINUTILS_VER" \
-          --enable-new-dtags --with-sysroot=/ --with-lib-path="$native_lib_path" \
-          --disable-nls --disable-gdb --disable-gdbserver --disable-sim \
-          --disable-libquadmath --enable-64-bit-bfd --disable-werror \
-          CFLAGS='-O2 -g0' CXXFLAGS='-O2 -g0'
-      make -j"$JOBS" all-ld && make install-strip-ld )
-    rm -rf "$BT"
+    # The reviewed GitHub-only agent cache ships a bookworm-compatible 2.47
+    # binary set, so every consumer gets bytes instead of a 10-15 minute
+    # source build on each fresh runner.
+    bash "$REPO/scripts/ensure_binutils_247_binary.sh" --prefix "$PREFIX/bfd-$BINUTILS_VER"
     printf '%s\n' "$bfd_layout" > "$bfd_layout_stamp"
     cache_prefix "bfd-$BINUTILS_VER"
-    note "ld    : $("$PREFIX/bfd-$BINUTILS_VER/bin/ld" --version | head -1) (built)"
+    note "ld    : $("$PREFIX/bfd-$BINUTILS_VER/bin/ld" --version | head -1) (verified binary)"
 fi
 
 oracle_require_version "$PREFIX/bfd-$BINUTILS_VER/bin/ld" "$BINUTILS_VER"
 
-# ── mold 2.42.1, MOLD_USE_SYSTEM_* defaults (self-contained binary) ─────────
+# ── mold 3.0.0 (Rust build; upstream defaults, self-contained binary) ──────
 if [ -x "$PREFIX/mold-$MOLD_VER/bin/mold" ]; then
     note "mold  : $("$PREFIX/mold-$MOLD_VER/bin/mold" --version) (restored from $ARTIFACTS)"
 else
@@ -173,16 +170,17 @@ else
     MT="$SRC/mold-$MOLD_VER"
     rm -rf "$MT"; tar -xzf "$TARBALL" -C "$SRC"
     ( cd "$MT"
-      cmake -B build -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
-            -DCMAKE_CXX_FLAGS='-march=native' \
-            -DMOLD_TARGETS="$MOLD_TARGETS" \
-            -DCMAKE_INSTALL_PREFIX="$PREFIX/mold-$MOLD_VER"
-      cmake --build build -j "$JOBS" && cmake --install build
+      # mold 3.x has no CMake/MOLD_TARGETS: one Cargo feature per target
+      # (cli/Cargo.toml).  -C target-cpu=native is the Rust spelling of
+      # the oracles' -march=native policy.
+      RUSTFLAGS='-C target-cpu=native' \
+      cargo build --release --locked -j "$JOBS" -p mold-cli \
+            --no-default-features --features "$MOLD_FEATURES"
+      PREFIX="$PREFIX/mold-$MOLD_VER" ./install-mold.sh
       strip "$PREFIX/mold-$MOLD_VER/bin/mold" 2>/dev/null || true )
     rm -rf "$MT"
     cache_prefix "mold-$MOLD_VER"
-    note "mold  : $("$PREFIX/mold-$MOLD_VER/bin/mold" --version) (built, targets $MOLD_TARGETS)"
+    note "mold  : $("$PREFIX/mold-$MOLD_VER/bin/mold" --version) (built, features $MOLD_FEATURES)"
 fi
 
 oracle_require_version "$PREFIX/mold-$MOLD_VER/bin/mold" "$MOLD_VER"
@@ -228,6 +226,14 @@ else
 fi
 
 # ── convenience wrappers (stable names on PATH) ─────────────────────────────
+# Versioned wrapper names embed their pin: after a mold pin bump the old
+# `mold-<oldver>` wrapper would otherwise keep vouching for the stale
+# oracle in $LINKDIR forever.  Remove versioned mold wrappers that are
+# not the current pin (this directory holds only script-written wrappers).
+for stale in "$LINKDIR"/mold-[0-9]*; do
+    [ -e "$stale" ] || continue
+    [ "$stale" = "$LINKDIR/mold-$MOLD_VER" ] || rm -f "$stale"
+done
 WILD_BIN="$PREFIX/wild-git/bin/wild"
 wild_enabled=0
 [ "$WITH_WILD" = 1 ] && [ -x "$WILD_BIN" ] && wild_enabled=1
@@ -240,8 +246,12 @@ for pair in "ld-$BINUTILS_VER:$PREFIX/bfd-$BINUTILS_VER/bin/ld" \
         rm -f "$LINKDIR/$name"
         continue
     fi
-    printf '#!/bin/sh\nexec %s "$@"\n' "$target" > "$LINKDIR/$name.tmp"
-    chmod +x "$LINKDIR/$name.tmp"
+    if [ "$name" = "ld-$BINUTILS_VER" ]; then
+        write_native_bfd_wrapper "$LINKDIR/$name.tmp" "$target" "$native_lib_path"
+    else
+        printf '#!/bin/sh\nexec %s "$@"\n' "$target" > "$LINKDIR/$name.tmp"
+        chmod +x "$LINKDIR/$name.tmp"
+    fi
     mv -f "$LINKDIR/$name.tmp" "$LINKDIR/$name"
 done
 
@@ -249,7 +259,7 @@ done
 {
     printf '# %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ) setup_oracles.sh"
     printf 'ld      %s\n' "$("$PREFIX/bfd-$BINUTILS_VER/bin/ld" --version | head -1)"
-    printf 'mold    %s (MOLD_TARGETS=%s)\n' "$("$PREFIX/mold-$MOLD_VER/bin/mold" --version)" "$MOLD_TARGETS"
+    printf 'mold    %s (cargo features %s)\n' "$("$PREFIX/mold-$MOLD_VER/bin/mold" --version)" "$MOLD_FEATURES"
     printf 'ld.lld  %s\n' "$lld_banner"
     if [ "$wild_enabled" = 1 ]; then
         printf 'wild    %s (rev %s)\n' "$("$WILD_BIN" --version 2>&1 | head -1)" \

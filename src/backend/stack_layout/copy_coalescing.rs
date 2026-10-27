@@ -1723,6 +1723,7 @@ fn is_two_operand_binary(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
             // ops — a deferred load in the scratch register folds into
             // the destination operand exactly like the twins above.
             | O::VecAddI64x2
+            | O::VecSadbwU8x16
             | O::VecSubI64x2
             | O::VecAndI64x2
             | O::VecOrI64x2
@@ -2017,6 +2018,7 @@ fn is_vec_ssa_producer(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
             // Counting-reduction producers (vpsadbw/vpaddq groups, the
             // horizontal exit's scalar is not a vector value).
             | O::VecSadbwU8x32
+            | O::VecSadbwU8x16
             | O::VecAddI64x4
             // Adler-32 epic producers: the two multiply-add results and the
             // .rodata constant table all define vector SSA values.
@@ -2201,7 +2203,13 @@ fn is_user_store_intrinsic(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
     use crate::ir::intrinsics::IntrinsicOp as O;
     matches!(
         op,
-        O::Storedqu | O::Storeu256 | O::Store256 | O::Storeldi128 | O::Movntdq | O::Movntpd
+        O::Storedqu
+            | O::Storeu256
+            | O::Store256
+            | O::Storeldi128
+            | O::Movntdq
+            | O::Movntpd
+            | O::Movntps
     )
 }
 
@@ -2447,6 +2455,7 @@ pub(crate) fn memfold_consumer_128(op: &crate::ir::intrinsics::IntrinsicOp) -> O
         | O::VecXorF64x2
         | O::VecXorF32x4
         | O::VecAddI64x2
+        | O::VecSadbwU8x16
         | O::VecAddI32x4
         | O::VecMulI32x4
         | O::VecMulI16x8

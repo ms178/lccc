@@ -476,6 +476,30 @@ anyway (the bullet carries the *why*).
 
 ## Frontend / sema
 
+- **[2026-10-26, C23 `_BitInt(17)` inventory gap]** The fresh 24-probe
+  GCC 16.2 inventory confirms one difference: GCC accepts the C23
+  `unsigned _BitInt(17)` probe and LCCC rejects it at parsing. **Defer**
+  `_BitInt` rather than adding a syntax-only or fixed-width alias. The closed
+  built-in `CType` model has no arbitrary precision/signedness carrier, so a
+  correct implementation must cover promotions and conversions, constant
+  evaluation, layout, ABI classification, lowering/codegen and debug metadata
+  together. Keep the mismatch explicit in the inventory and backlog; do not
+  change the oracle expectation or claim the gap is intentional C23 behavior.
+  Reopen only with end-to-end width, arithmetic, layout and ABI tests.
+- **[2026-10-26, GCC 16.2 default C dialect]** The default C mode follows
+  GCC 16.2's `gnu23`: a pinned `gcc-16 -dM -E -x c /dev/null` reports
+  `__STDC_VERSION__ 202311L`, and the default semantics treat `f()` as a
+  zero-parameter prototype. The AST/type system now preserves prototype status
+  separately from parameter count: `(void)` is a prototype in GNU17 as well,
+  while GNU17 `()` keeps its unspecified-parameter meaning; direct,
+  function-pointer and conditional-composite calls are covered in both modes.
+  The conditional composite retains a compatible prototype from either arm.
+  LCCC selects that version macro and C23 preprocessing/lexing/parsing by
+  default; `-std=gnu17` remains
+  the explicit rollback for older source. Keep GCC-compatibility version
+  macros and `--version` unchanged for now: matching this dialect facet is
+  not evidence for complete GCC 16.2 parity (the linker, DWARF, warning and
+  SIMD audits remain open).
 - **[history/session47-nrs]** Do NOT ship a naive `is_const`
   modifiable-lvalue check: the parser folds all declarator qualifiers into
   one flag (`const int *p` vs `int *const p` indistinguishable). Needs

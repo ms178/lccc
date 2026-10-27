@@ -363,6 +363,8 @@ thread_local! {
     pub(super) static LIVENESS_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static MEMO_HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static EFFECT_MEMO_HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Sweeps the last `solve_upper32_zero` needed (convergence-rate test).
+    static UPPER_SWEEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// `CCC_VERIFY_LIVENESS_SPAN` (see `FileLiveness::assert_matches_full_analysis`).
@@ -1379,7 +1381,7 @@ impl FileLiveness {
             let next = lines.get(pos + 1).copied();
             let rel = n - start;
             let first_edge = succ_flat.len();
-            let eff = match self.classify(
+            let eff = match Self::classify(
                 store,
                 infos,
                 n,
@@ -1480,6 +1482,272 @@ impl FileLiveness {
                 );
             });
         }
+    }
+
+    /// Whether GP family `fam` provably holds a zero upper half (bits 32..63)
+    /// on entry to line `label`, on EVERY path into it: the cross-block
+    /// continuation of `relay_and_lea::upper32_zero_at`, which stops at the
+    /// first label it meets.
+    ///
+    /// A forward must-dataflow over the CFG the liveness solver itself builds
+    /// (`classify` + `resolve_jump_tables`), so every control-flow shape it
+    /// refuses (an unresolved indirect jump, unanalysable lines) is refused
+    /// here too and the answer is "not known".  Lattice: one bit per family,
+    /// meet = AND over predecessors, function entry = 0 (SysV leaves the
+    /// upper halves of arguments unspecified), lines no path reaches = 0.
+    /// The transfer is `upper32_zero_at`'s scan step applied forwards: the
+    /// same stops (pinned, barrier other than label/jump, inline asm, odd
+    /// case, implicit-register line) clear every bit; a may-write of a family
+    /// (`writes_family`, explicit or implicit) sets its bit only when the
+    /// write itself proves a zero upper half.
+    ///
+    /// Computed from the CURRENT text (memoised by the liveness memo's
+    /// content key), so no peephole edit can leave a stale fact behind.
+    pub(super) fn upper32_zero_into_label(
+        store: &LineStore,
+        infos: &[LineInfo],
+        label: usize,
+        fam: RegId,
+    ) -> bool {
+        if fam > REG_GP_MAX
+            || label >= infos.len()
+            || infos[label].kind != LineKind::Label
+            || infos[label].pinned
+        {
+            return false;
+        }
+        if Self::fallthrough_path_refutes_upper32_zero(store, infos, label, fam) {
+            return false;
+        }
+        let Some((start, end)) = Self::enclosing_function(store, infos, label) else {
+            return false;
+        };
+        type UpperMemo = FxHashMap<(u64, u64), Option<Vec<u16>>>;
+        /// Same bounded two-generation policy as the liveness memo.
+        const UPPER_CACHE_CAP: usize = 64;
+        thread_local! {
+            static UPPER_CACHE: std::cell::RefCell<(UpperMemo, UpperMemo)> =
+                std::cell::RefCell::new((FxHashMap::default(), FxHashMap::default()));
+        }
+        let key = Self::hash_function(store, infos, start, end);
+        let rel = label - start;
+        let bit_of = |sol: &Option<Vec<u16>>| {
+            sol.as_ref()
+                .is_some_and(|v| v.get(rel).is_some_and(|m| m & (1u16 << fam) != 0))
+        };
+        if let Some(hit) = UPPER_CACHE.with(|c| {
+            let banks = c.borrow();
+            banks.0.get(&key).or_else(|| banks.1.get(&key)).map(bit_of)
+        }) {
+            return hit;
+        }
+        let solution = Self::solve_upper32_zero(store, infos, start, end);
+        let answer = bit_of(&solution);
+        UPPER_CACHE.with(|c| {
+            let mut banks = c.borrow_mut();
+            if banks.0.len() >= UPPER_CACHE_CAP {
+                banks.1 = std::mem::take(&mut banks.0);
+            }
+            banks.0.insert(key, solution);
+        });
+        answer
+    }
+
+    /// Exact early answer for the common failing query: in a must-analysis
+    /// ONE predecessor path that kills the fact decides it.  Walk the
+    /// straight-line run that falls into `label` backwards with the solver's
+    /// own transfer (labels and jumps transparent): a definite kill or the
+    /// function's entry refutes; a proving write, another label, or a
+    /// fallthrough-free predecessor (`jmp`/`ret`/indirect jump) is
+    /// inconclusive and the full solve decides.  Answers only `false`, which
+    /// is always sound; it differs from the solve at most on a run the solve
+    /// would find unreachable.
+    fn fallthrough_path_refutes_upper32_zero(
+        store: &LineStore,
+        infos: &[LineInfo],
+        label: usize,
+        fam: RegId,
+    ) -> bool {
+        let bit = 1u16 << fam;
+        for k in (0..label).rev() {
+            let info = &infos[k];
+            let t = info.trimmed(store.get(k));
+            if super::helpers::steps_over_line(info, t) {
+                if !info.is_nop() && t.starts_with(".cfi_startproc") {
+                    return true; // the entry: argument upper halves unspecified
+                }
+                continue;
+            }
+            // Another label, or a line that cannot fall through: this run
+            // is not (or not only) the label's fallthrough predecessor.
+            if matches!(
+                info.kind,
+                LineKind::Label | LineKind::Jmp | LineKind::JmpIndirect | LineKind::Ret
+            ) {
+                return false;
+            }
+            let (keep, proved) = upper32_zero_transfer(info, t);
+            if proved & bit != 0 {
+                return false;
+            }
+            if keep & bit == 0 {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// `(start, end)` of the function containing line `n`, delimited exactly
+    /// as `FileLiveness::new` delimits it (`.cfi_startproc` .. `.cfi_endproc`
+    /// or the end of the file); `None` outside every function.
+    fn enclosing_function(
+        store: &LineStore,
+        infos: &[LineInfo],
+        n: usize,
+    ) -> Option<(usize, usize)> {
+        // CFI lines classify as directives (leading '.'): test the kind first.
+        let is = |k: usize, d: &str| {
+            infos[k].kind == LineKind::Directive
+                && !infos[k].is_nop()
+                && infos[k].trimmed(store.get(k)).starts_with(d)
+        };
+        let mut start = None;
+        for k in (0..=n).rev() {
+            if k != n && is(k, ".cfi_endproc") {
+                return None;
+            }
+            if is(k, ".cfi_startproc") {
+                start = Some(k);
+                break;
+            }
+        }
+        let start = start?;
+        let end = (n + 1..infos.len())
+            .find(|&k| is(k, ".cfi_endproc"))
+            .unwrap_or(infos.len());
+        Some((start, end))
+    }
+
+    /// Per-line "upper half known zero on entry" masks (relative to `start`)
+    /// for one function, or `None` when its control flow is not analysable
+    /// or the solve does not converge.  See `upper32_zero_into_label`.
+    fn solve_upper32_zero(
+        store: &LineStore,
+        infos: &[LineInfo],
+        start: usize,
+        end: usize,
+    ) -> Option<Vec<u16>> {
+        let fn_len = end.saturating_sub(start);
+        let mut label_index: FxHashMap<&str, usize> = FxHashMap::default();
+        for n in start..end {
+            if infos[n].is_nop() || infos[n].kind != LineKind::Label {
+                continue;
+            }
+            if let Some(name) = infos[n].trimmed(store.get(n)).strip_suffix(':') {
+                label_index.entry(name).or_insert(n);
+            }
+        }
+        let resolve = |name: &str| -> Option<usize> { label_index.get(name).copied() };
+        let lines: Vec<usize> = (start..end)
+            .filter(|&n| {
+                !super::helpers::steps_over_line(&infos[n], infos[n].trimmed(store.get(n)))
+            })
+            .collect();
+        let entry = *lines.first()?;
+        let jump_table_succs =
+            Self::resolve_jump_tables(store, infos, &lines, &label_index, start, end);
+        let mut succ_flat: Vec<usize> = Vec::with_capacity(lines.len() + lines.len() / 4);
+        let mut succ_range: Vec<(usize, usize)> = vec![(0, 0); fn_len];
+        let mut transfer: Vec<(u16, u16)> = vec![(ALL, 0); fn_len];
+        for (pos, &n) in lines.iter().enumerate() {
+            let t = infos[n].trimmed(store.get(n));
+            let first = succ_flat.len();
+            Self::classify(
+                store,
+                infos,
+                n,
+                t,
+                &resolve,
+                lines.get(pos + 1).copied(),
+                RET_LIVE,
+                &jump_table_succs,
+                start,
+                &mut succ_flat,
+            )?;
+            succ_range[n - start] = (first, succ_flat.len());
+            transfer[n - start] = upper32_zero_transfer_cached(&infos[n], t);
+        }
+        // Predecessor lists (CSR over the successor edges), so each line's
+        // meet reads its predecessors' CURRENT out-sets.
+        let mut pred_start: Vec<u32> = vec![0; fn_len + 1];
+        for &n in &lines {
+            let (first, past) = succ_range[n - start];
+            for &succ in &succ_flat[first..past] {
+                pred_start[succ - start + 1] += 1;
+            }
+        }
+        for rel in 0..fn_len {
+            pred_start[rel + 1] += pred_start[rel];
+        }
+        let mut fill: Vec<u32> = pred_start[..fn_len].to_vec();
+        let mut preds: Vec<u32> = vec![0; succ_flat.len()];
+        for &n in &lines {
+            let (first, past) = succ_range[n - start];
+            for &succ in &succ_flat[first..past] {
+                let slot = &mut fill[succ - start];
+                preds[*slot as usize] = (n - start) as u32;
+                *slot += 1;
+            }
+        }
+        // Forward must-dataflow, Gauss-Seidel in program order: a fact
+        // crosses a whole straight-line run in one sweep, so the sweep count
+        // tracks loop nesting, not function length.  `out` starts at TOP and
+        // only descends (greatest fixed point); only `reached` lines -- some
+        // path from the entry gets there -- feed a meet.
+        let entry_rel = entry - start;
+        let mut inn: Vec<u16> = vec![0; fn_len];
+        let mut out: Vec<u16> = vec![ALL; fn_len];
+        let mut reached: Vec<bool> = vec![false; fn_len];
+        let mut changed = true;
+        let mut sweeps = 0;
+        while changed {
+            if sweeps == 64 {
+                return None; // did not converge (pathological CFG): unknown
+            }
+            sweeps += 1;
+            changed = false;
+            for &n in &lines {
+                let rel = n - start;
+                // SysV: argument upper halves are unspecified at the entry.
+                let mut any = rel == entry_rel;
+                let mut meet = if any { 0 } else { ALL };
+                for &p in &preds[pred_start[rel] as usize..pred_start[rel + 1] as usize] {
+                    if reached[p as usize] {
+                        any = true;
+                        meet &= out[p as usize];
+                    }
+                }
+                if !any {
+                    continue;
+                }
+                let (keep, proved) = transfer[rel];
+                let new_out = (meet & keep) | proved;
+                if !reached[rel] || meet != inn[rel] || new_out != out[rel] {
+                    reached[rel] = true;
+                    inn[rel] = meet;
+                    out[rel] = new_out;
+                    changed = true;
+                }
+            }
+        }
+        for (rel, slot) in inn.iter_mut().enumerate() {
+            if !reached[rel] {
+                *slot = 0;
+            }
+        }
+        #[cfg(test)]
+        UPPER_SWEEPS.with(|c| c.set(sweeps));
+        Some(inn)
     }
 
     /// Resolve the codegen's jump-table dispatch sites to their static
@@ -1627,7 +1895,6 @@ impl FileLiveness {
     /// or `None` when the control transfer cannot be resolved -- `edges` is
     /// then garbage, and the caller abandons the function.
     fn classify(
-        &self,
         store: &LineStore,
         infos: &[LineInfo],
         n: usize,
@@ -1917,6 +2184,132 @@ impl FileLiveness {
             }
         }
     }
+}
+
+/// `upper32_zero_transfer` through an exact cross-solve cache.  The transfer
+/// is a pure function of `(LineInfo, text)`, and the solves one function
+/// sees between rewrites differ in a handful of lines, so re-deriving every
+/// line's operand model per solve was most of the solver's cost.  A hit is
+/// verified against the full key (info and text), so a collision or a
+/// same-text line in another state only costs a recomputation, never a
+/// wrong answer.
+fn upper32_zero_transfer_cached(info: &LineInfo, t: &str) -> (u16, u16) {
+    use std::hash::{Hash, Hasher};
+    type Cache = std::collections::HashMap<
+        u64,
+        (LineInfo, Box<str>, (u16, u16)),
+        std::hash::BuildHasherDefault<crate::common::fx_hash::FxHasher>,
+    >;
+    // Bounded: a whole-cache reset is O(1) amortised and the working set
+    // of one translation unit's hot function is far below the cap.
+    const CAP: usize = 1 << 15;
+    thread_local! {
+        static CACHE: std::cell::RefCell<Cache> = std::cell::RefCell::new(Cache::default());
+    }
+    // Keyed on the text alone: the full-key check below keeps it exact, a
+    // same-text line in another state (pinned, nop) merely evicts, and not
+    // hashing `LineInfo` here keeps its `Hash` impl single-caller (inlined)
+    // in `hash_function`'s hot loop.
+    let mut h = crate::common::fx_hash::FxHasher::default();
+    t.hash(&mut h);
+    let key = h.finish();
+    CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        if let Some((i, s, r)) = c.get(&key)
+            && i == info
+            && **s == *t
+        {
+            return *r;
+        }
+        let r = upper32_zero_transfer(info, t);
+        if c.len() >= CAP {
+            c.clear();
+        }
+        c.insert(key, (*info, t.into(), r));
+        r
+    })
+}
+
+/// The GP families `writes_family` answers "may write" for, as one mask:
+/// its definition in closed form (architectural implicit writes, plus the
+/// classified destination unless the line only implicitly READS it), so a
+/// line's operand model is derived once instead of once per family.  The
+/// inline-asm arm (every family) is the caller's kill-all.
+fn may_write_families(info: &LineInfo, t: &str) -> u16 {
+    let bytes = t.as_bytes();
+    let mut written = implicit_write_refs(bytes);
+    let dest = super::helpers::get_dest_reg(info);
+    if dest <= REG_GP_MAX && implicit_read_refs(bytes) & (1u16 << dest) == 0 {
+        written |= 1u16 << dest;
+    }
+    written
+}
+
+/// Exact, cheap necessary condition for `s_write_proves_upper_zero`: that
+/// predicate proves only through a dword destination naming `fam` (so the
+/// line ends in that name after a separator) or one of the 64-bit idioms
+/// `xorq`/`subq` self, `movq $imm`, `movabs[q] $imm`.  Skips its operand
+/// parse on the common 64-bit and memory-destination writes.
+fn write_may_prove_upper_zero(t: &str, fam: RegId) -> bool {
+    let t = t.trim_end();
+    let dword = REG_NAMES[1][fam as usize];
+    if let Some(head) = t.strip_suffix(dword)
+        && head.ends_with([',', ' ', '\t'])
+    {
+        return true;
+    }
+    matches!(
+        t.split_whitespace().next(),
+        Some("xorq" | "subq" | "movq" | "movabs" | "movabsq")
+    )
+}
+
+/// `(keep, proved)` for the upper-half-zero dataflow at one line:
+/// `out = (in & keep) | proved`.  Mirrors one backward step of
+/// `relay_and_lea::upper32_zero_at` (see `upper32_zero_into_label`).
+fn upper32_zero_transfer(info: &LineInfo, t: &str) -> (u16, u16) {
+    const KILL_ALL: (u16, u16) = (0, 0);
+    if info.is_nop() {
+        return (ALL, 0);
+    }
+    if info.pinned || info.kind == LineKind::InlineAsm {
+        return KILL_ALL;
+    }
+    if info.is_barrier() {
+        // Labels and direct jumps write no register: the CFG carries the
+        // fact across them.  Every other barrier (call, push/pop, ret,
+        // non-inert directive, indirect jump) is a uniform stop.
+        return if matches!(
+            info.kind,
+            LineKind::Label | LineKind::Jmp | LineKind::CondJmp
+        ) {
+            (ALL, 0)
+        } else {
+            KILL_ALL
+        };
+    }
+    if t.bytes().any(|b| b.is_ascii_uppercase()) {
+        return KILL_ALL;
+    }
+    let t = t.strip_prefix("lock ").unwrap_or(t);
+    if super::helpers::has_implicit_reg_usage(t) {
+        return KILL_ALL;
+    }
+    let written = may_write_families(info, t);
+    let (mut keep, mut proved) = (ALL, 0u16);
+    for fam in 0..=REG_GP_MAX {
+        let bit = 1u16 << fam;
+        if written & bit == 0 {
+            continue; // not written: the fact flows through unchanged
+        }
+        keep &= !bit;
+        if write_may_prove_upper_zero(t, fam)
+            && super::relay_and_lea::s_write_proves_upper_zero(t, fam)
+        {
+            proved |= bit;
+        }
+    }
+    (keep, proved)
 }
 
 #[cfg(test)]
@@ -2671,6 +3064,259 @@ mod tests {
         let (store, _infos, lv) = build(asm);
         let idx = line_of(&store, "movq %rbx, %rdi");
         assert_eq!(lv.live_after(idx, 7), Some(true));
+    }
+
+    /// Families (REG_NAMES order): %r8 = 8, %r14 = 14, %rbx = 3.
+    fn upper0(asm: &str, label: &str, fam: RegId) -> bool {
+        let (store, infos, _lv) = build(asm);
+        FileLiveness::upper32_zero_into_label(&store, &infos, line_of(&store, label), fam)
+    }
+
+    /// A function with an early-exit diamond: `.Lj` is reached by
+    /// fallthrough after `{fall}` and by the jump after `{taken}`.
+    fn diamond(taken: &str, fall: &str) -> String {
+        format!(
+            "f:\n.cfi_startproc\n{taken}    testl %eax, %eax\n    je .Lj\n{fall}.Lj:\n    xorq %r14, %r8\n    ret\n.cfi_endproc\n"
+        )
+    }
+
+    #[test]
+    fn upper_zero_crosses_a_label_when_every_path_proves_it() {
+        // zstd_count's shape: the 32-bit definer sits in a predecessor.
+        let asm = diamond("    andl $1048319, %r14d\n", "    addl $1, %eax\n");
+        assert!(upper0(&asm, ".Lj:", 14));
+        // Both arms define it, each with a 32-bit write.
+        let asm = diamond("    movl %edi, %r14d\n", "    leal 1(%rsi), %r14d\n");
+        assert!(upper0(&asm, ".Lj:", 14));
+    }
+
+    #[test]
+    fn upper_zero_refuses_when_any_path_does_not_prove_it() {
+        // A 64-bit definer on the fallthrough arm.
+        let asm = diamond("    andl $255, %r14d\n", "    movq (%rdi), %r14\n");
+        assert!(!upper0(&asm, ".Lj:", 14));
+        // Never written: the SysV entry value has an unspecified upper half.
+        let asm = diamond("", "    addl $1, %eax\n");
+        assert!(!upper0(&asm, ".Lj:", 14));
+        // Conditional writers leave the old upper half on the untaken path.
+        let asm = diamond("    andl $255, %r14d\n", "    cmovneq %rsi, %r14\n");
+        assert!(!upper0(&asm, ".Lj:", 14));
+        let asm = diamond("    andl $255, %r14d\n", "    cmovnel %esi, %r14d\n");
+        assert!(!upper0(&asm, ".Lj:", 14));
+        // An implicit-register line is a uniform stop (xchg writes BOTH
+        // operands; the classified destination alone would miss %r14).
+        let asm = diamond("    andl $255, %r14d\n", "    xchgq %r14, %rsi\n");
+        assert!(!upper0(&asm, ".Lj:", 14));
+        // A call is a uniform stop, even for a callee-saved family.
+        let asm = diamond("    movl $1, %ebx\n", "    call g\n");
+        assert!(!upper0(&asm, ".Lj:", 3));
+        // A partial write leaves bits 8..63 as they were.
+        let asm = diamond("    movq %rdi, %r14\n", "    movb $1, %r14b\n");
+        assert!(!upper0(&asm, ".Lj:", 14));
+    }
+
+    #[test]
+    fn upper_zero_needs_the_back_edge_to_prove_it_too() {
+        // fill_buffer's shape: zeroed on entry, 32-bit increment on the latch.
+        let lp = |latch: &str| {
+            format!(
+                "f:\n.cfi_startproc\n    xorl %r8d, %r8d\n.Lh:\n    movb %al, (%r10,%r8)\n{latch}    cmpl $64, %r8d\n    jb .Lh\n    ret\n.cfi_endproc\n"
+            )
+        };
+        assert!(upper0(&lp("    addl $1, %r8d\n"), ".Lh:", 8));
+        assert!(!upper0(&lp("    addq $1, %r8\n"), ".Lh:", 8));
+    }
+
+    #[test]
+    fn upper_zero_converges_in_sweeps_bounded_by_loop_nesting() {
+        // 2000 straight-line lines between the definer and a loop header,
+        // then a latch: the solve must converge in a handful of sweeps (a
+        // Jacobi iteration would need ~2000 and give up at the cap).
+        let mut asm = String::from("f:\n.cfi_startproc\n    andl $255, %r14d\n");
+        for _ in 0..2000 {
+            asm.push_str("    addl $1, %eax\n");
+        }
+        asm.push_str(
+            ".Lh:\n    xorq %r14, %r8\n    subl $1, %ecx\n    jne .Lh\n    ret\n.cfi_endproc\n",
+        );
+        assert!(upper0(&asm, ".Lh:", 14));
+        let sweeps = UPPER_SWEEPS.with(|c| c.get());
+        assert!(sweeps <= 3, "{sweeps} sweeps");
+    }
+
+    #[test]
+    fn upper_zero_refuses_unanalysable_control_flow() {
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    andl $255, %r14d\n",
+            "    testl %eax, %eax\n",
+            "    je .Lj\n",
+            "    jmpq *%rdx\n",
+            ".Lj:\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        assert!(!upper0(asm, ".Lj:", 14));
+        // Outside every function (no CFI frame): no CFG, no answer.
+        assert!(!upper0("    andl $255, %r14d\n.Lj:\n    ret\n", ".Lj:", 14));
+    }
+
+    #[test]
+    fn fallthrough_fast_reject_is_exact_on_its_cases() {
+        let q = |asm: &str| {
+            let (store, infos, _lv) = build(asm);
+            let label = line_of(&store, ".Lj:");
+            FileLiveness::fallthrough_path_refutes_upper32_zero(&store, &infos, label, 14)
+        };
+        // Kill on the fallthrough run: refuted without a solve.
+        assert!(q(&diamond(
+            "    andl $255, %r14d\n",
+            "    movq (%rdi), %r14\n"
+        )));
+        assert!(q(&diamond("    andl $255, %r14d\n", "    call g\n")));
+        // The run reaches the function entry with no write: refuted.
+        assert!(q(&diamond("", "")));
+        // A proving write on the run, or another label first: inconclusive
+        // (the taken edge still has to be checked by the solve).
+        assert!(!q(&diamond(
+            "    movq (%rdi), %r14\n",
+            "    movl %esi, %r14d\n"
+        )));
+        assert!(!q(&diamond(
+            "    andl $255, %r14d\n",
+            ".Lm:\n    addl $1, %eax\n"
+        )));
+        // ... and the solve then refutes through the TAKEN edge.
+        assert!(!upper0(
+            &diamond("    movq (%rdi), %r14\n", "    movl %esi, %r14d\n"),
+            ".Lj:",
+            14
+        ));
+    }
+
+    #[test]
+    fn may_write_mask_equals_writes_family_per_family() {
+        for t in [
+            "movl %esi, %r14d",
+            "movq (%rdi), %r14",
+            "addq $1, %r14",
+            "movb $1, %r14b",
+            "cqto",
+            "idivq %r11",
+            "cltq",
+            "mulq %rcx",
+            "rep stosb",
+            "movsq",
+            "xchgq %r14, %rsi",
+            "cmpxchgq %rbx, (%rdi)",
+            "lock xaddl %eax, (%rdi)",
+            "setne %al",
+            "popq %rbx",
+            "cpuid",
+            "syscall",
+            "imull $3, %eax, %r9d",
+            "movl %eax, (%rdi)",
+            "testq %r14, %r14",
+            "shldq %cl, %rax, %rdx",
+            "rdtsc",
+        ] {
+            let info = classify_line(&format!("    {t}"));
+            let mut want = 0u16;
+            for fam in 0..=REG_GP_MAX {
+                if super::super::helpers::writes_family(&info, t, fam) {
+                    want |= 1 << fam;
+                }
+            }
+            assert_eq!(may_write_families(&info, t), want, "{t}");
+        }
+    }
+
+    #[test]
+    fn cached_transfer_is_keyed_on_the_whole_line_state() {
+        let t = "movl %esi, %r14d";
+        let live = classify_line(&format!("    {t}"));
+        let mut pinned = live;
+        pinned.pinned = true;
+        // Same text, different state: neither answer may leak into the other.
+        for _ in 0..2 {
+            assert_eq!(
+                upper32_zero_transfer_cached(&live, t),
+                upper32_zero_transfer(&live, t)
+            );
+            assert_eq!(upper32_zero_transfer_cached(&pinned, t), (0, 0));
+        }
+        assert_eq!(upper32_zero_transfer_cached(&live, t).1, 1 << 14);
+    }
+
+    #[test]
+    fn prove_prefilter_is_a_necessary_condition() {
+        // The implication the prefilter relies on, over proving and
+        // non-proving writes alike: s_write_proves => prefilter.
+        let lines = [
+            "movl %esi, %r14d",
+            "andl $255,%r14d",
+            "incl %r14d",
+            "cmovnel %esi, %r14d",
+            "xorq %r14, %r14",
+            "subq %r14, %r14",
+            "movq $5, %r14",
+            "movq $-1, %r14",
+            "movabsq $5, %r14",
+            "movq (%rdi), %r14",
+            "addq $1, %r14",
+            "movl %r14d, %esi",
+            "movw %si, %r14w",
+            "leal 1(%rsi,%rdi,2), %r14d",
+        ];
+        for t in lines {
+            let proves = super::super::relay_and_lea::s_write_proves_upper_zero(t, 14);
+            assert!(!proves || write_may_prove_upper_zero(t, 14), "{t}");
+        }
+        // The cheap rejections it exists for.
+        for t in [
+            "addq $1, %r14",
+            "movl %r14d, %esi",
+            "movw %si, %r14w",
+            "imulq %rax, %r14",
+        ] {
+            assert!(!write_may_prove_upper_zero(t, 14), "{t}");
+        }
+    }
+
+    #[test]
+    fn upper_zero_memo_cannot_serve_a_stale_fact() {
+        let asm = diamond("    andl $255, %r14d\n", "    addl $1, %eax\n");
+        let (mut store, mut infos, _lv) = build(&asm);
+        let label = line_of(&store, ".Lj:");
+        assert!(FileLiveness::upper32_zero_into_label(
+            &store, &infos, label, 14
+        ));
+        let n = line_of(&store, "addl $1, %eax");
+        edit(&mut store, &mut infos, n, "movq (%rdi), %r14");
+        assert!(!FileLiveness::upper32_zero_into_label(
+            &store, &infos, label, 14
+        ));
+    }
+
+    #[test]
+    fn relay_proof_uses_the_cross_block_fact() {
+        // End to end through `upper32_zero_at`, the P3 relay gate: the copy
+        // sits right after the label; the definer is a predecessor.
+        let ok = diamond("    andl $255, %r14d\n", "    addl $1, %eax\n")
+            .replace(".Lj:\n", ".Lj:\n    movl %r14d, %esi\n");
+        let (store, infos, _lv) = build(&ok);
+        let copy = line_of(&store, "movl %r14d, %esi");
+        assert!(super::super::relay_and_lea::upper32_zero_at(
+            &store, &infos, copy, 14
+        ));
+        let bad = diamond("    andl $255, %r14d\n", "    notq %r14\n")
+            .replace(".Lj:\n", ".Lj:\n    movl %r14d, %esi\n");
+        let (store, infos, _lv) = build(&bad);
+        let copy = line_of(&store, "movl %r14d, %esi");
+        assert!(!super::super::relay_and_lea::upper32_zero_at(
+            &store, &infos, copy, 14
+        ));
     }
 
     #[test]

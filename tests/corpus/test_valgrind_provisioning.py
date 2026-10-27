@@ -98,7 +98,7 @@ echo 'asm/types.h: missing mock i386 header' >&2
 exit 1
 """,
                 "as": "#!/bin/sh\necho 'GNU assembler 2.47'\n",
-                "ld": "#!/bin/sh\necho 'mold 2.42.1 (mock)'\n",
+                "ld": "#!/bin/sh\necho 'mold 3.0.0 (mock)'\n",
                 "curl": f"#!/bin/sh\ntouch '{marker}'\nexit 99\n",
             }
             for name, content in mocks.items():

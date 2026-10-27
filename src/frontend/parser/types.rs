@@ -1532,7 +1532,7 @@ impl Parser {
         let has_function = derived.iter().any(|d| {
             matches!(
                 d,
-                DerivedDeclarator::Function(_, _) | DerivedDeclarator::FunctionPointer(_, _)
+                DerivedDeclarator::Function(..) | DerivedDeclarator::FunctionPointer(..)
             )
         });
 

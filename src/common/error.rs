@@ -126,6 +126,18 @@ pub enum WarningKind {
     // SignCompare,            // -Wsign-compare
     // Parentheses,            // -Wparentheses
     // Pointer,                // -Wpointer-sign
+    /// A block-scope object is never referenced.
+    /// GCC flag: -Wunused-variable (enabled by -Wall).
+    UnusedVariable,
+    /// Integer operands of a comparison have different signedness.
+    /// GCC flag: -Wsign-compare (enabled by -Wextra for C).
+    SignCompare,
+    /// A printf-family format string does not match its variadic arguments.
+    /// GCC flag: -Wformat (enabled by -Wall).
+    Format,
+    /// A printf-family call uses a non-literal format with no format arguments.
+    /// GCC flag: -Wformat-security (must be combined with -Wformat).
+    FormatSecurity,
 }
 
 impl WarningKind {
@@ -141,6 +153,10 @@ impl WarningKind {
             WarningKind::ImplicitInt => "implicit-int",
             WarningKind::ReturnMismatch => "return-mismatch",
             WarningKind::IntConversion => "int-conversion",
+            WarningKind::UnusedVariable => "unused-variable",
+            WarningKind::SignCompare => "sign-compare",
+            WarningKind::Format => "format",
+            WarningKind::FormatSecurity => "format-security",
         }
     }
 
@@ -158,6 +174,10 @@ impl WarningKind {
             "implicit-int" => Some(WarningKind::ImplicitInt),
             "return-mismatch" => Some(WarningKind::ReturnMismatch),
             "int-conversion" => Some(WarningKind::IntConversion),
+            "unused-variable" => Some(WarningKind::UnusedVariable),
+            "sign-compare" => Some(WarningKind::SignCompare),
+            "format" => Some(WarningKind::Format),
+            "format-security" => Some(WarningKind::FormatSecurity),
             _ => None,
         }
     }
@@ -185,18 +205,22 @@ impl WarningKind {
             WarningKind::Cpp,
             WarningKind::ReturnType,
             WarningKind::IncompatiblePointerTypes,
+            WarningKind::UnusedVariable,
+            WarningKind::Format,
             // WarningKind::Undeclared is now a hard error, not a warning
         ]
     }
 
     /// All warning kinds that are enabled by -Wextra (in addition to -Wall).
     pub fn wextra_set() -> &'static [WarningKind] {
-        // Currently no extra warnings beyond -Wall.
-        &[]
+        // GCC enables -Wsign-compare in C with -Wextra.
+        &[WarningKind::SignCompare]
     }
 
-    /// All known warning kinds.
-    fn all() -> &'static [WarningKind] {
+    /// Warning kinds emitted without an enabling -W flag. Keep the existing
+    /// default diagnostics stable; new parity warnings are opt-in through
+    /// their GCC-compatible group or individual switch.
+    fn default_set() -> &'static [WarningKind] {
         &[
             WarningKind::Undeclared,
             WarningKind::ImplicitFunctionDeclaration,
@@ -251,10 +275,10 @@ pub struct WarningConfig {
 }
 
 impl WarningConfig {
-    /// Create a default config with all warnings enabled and none promoted to errors.
+    /// Create a default config with existing default diagnostics enabled and none promoted to errors.
     pub fn new() -> Self {
         let mut enabled = crate::common::fx_hash::FxHashSet::default();
-        for &kind in WarningKind::all() {
+        for &kind in WarningKind::default_set() {
             enabled.insert(kind);
         }
         Self {
@@ -295,9 +319,9 @@ impl WarningConfig {
         }
     }
 
-    /// Enable all -Wextra warnings (superset of -Wall).
+    /// Enable the warnings selected by -Wextra. GCC keeps this group
+    /// independent from -Wall; callers may pass both switches when desired.
     pub fn enable_wextra(&mut self) {
-        self.enable_wall();
         for &kind in WarningKind::wextra_set() {
             self.enabled.insert(kind);
         }
@@ -677,6 +701,12 @@ impl DiagnosticEngine {
     /// Set the warning configuration (parsed from CLI flags).
     pub fn set_warning_config(&mut self, config: WarningConfig) {
         self.warning_config = config;
+    }
+
+    /// Check whether a warning is enabled before doing optional, potentially
+    /// expensive analysis for that warning category.
+    pub fn warning_enabled(&self, kind: WarningKind) -> bool {
+        self.warning_config.is_enabled(kind)
     }
 
     /// Set the source manager for span resolution and snippet display.

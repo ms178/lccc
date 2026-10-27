@@ -139,14 +139,23 @@ impl X86Isa {
     /// Overlay normalized per-function `__attribute__((target("...")))` features
     /// onto this translation-unit baseline ISA.
     ///
-    /// Note that `features` is sorted lexicographically (`arch=...`, `avx*`,
-    /// `cx16`, `fma`, `movbe`, `no-*`, `sse*`), so positive grants are applied
-    /// in a first pass and explicit `no-*` denials in a second pass before
+    /// An `arch=` entry first REPLACES the baseline with that CPU's level
+    /// ([`Self::arch_level`]), as GCC does for the function. Note that
+    /// `features` is sorted lexicographically (`arch=...`, `avx*`, `cx16`,
+    /// `fma`, `movbe`, `no-*`, `sse*`), so positive grants are applied in a
+    /// second pass and explicit `no-*` denials in a third pass before
     /// [`Self::normalized`] enforces the implication chain.
     #[must_use]
     pub fn with_target_features(mut self, features: &[String]) -> X86Isa {
         if features.is_empty() {
             return self;
+        }
+        if let Some(arch) = features
+            .iter()
+            .filter_map(|f| f.strip_prefix("arch="))
+            .next_back()
+        {
+            self = Self::arch_level(arch);
         }
         for feat in features {
             match feat.as_str() {
@@ -179,46 +188,6 @@ impl X86Isa {
                 }
                 "movbe" => self.movbe = true,
                 "cx16" => self.cx16 = true,
-                "arch=x86-64" => {
-                    self.simd = true;
-                }
-                "arch=x86-64-v2" | "arch=nehalem" | "arch=westmere" | "arch=silvermont"
-                | "arch=goldmont" | "arch=tremont" => {
-                    self.simd = true;
-                    self.sse41 = true;
-                    self.cx16 = true;
-                }
-                "arch=sandybridge" | "arch=ivybridge" => {
-                    self.simd = true;
-                    self.sse41 = true;
-                    self.avx = true;
-                    self.cx16 = true;
-                }
-                "arch=x86-64-v3"
-                | "arch=x86-64-v4"
-                | "arch=haswell"
-                | "arch=broadwell"
-                | "arch=skylake"
-                | "arch=skylake-avx512"
-                | "arch=cascadelake"
-                | "arch=cooperlake"
-                | "arch=icelake-client"
-                | "arch=icelake-server"
-                | "arch=tigerlake"
-                | "arch=sapphirerapids"
-                | "arch=emeraldrapids"
-                | "arch=graniterapids"
-                | "arch=alderlake"
-                | "arch=raptorlake"
-                | "arch=meteorlake"
-                | "arch=arrowlake"
-                | "arch=znver1"
-                | "arch=znver2"
-                | "arch=znver3"
-                | "arch=znver4"
-                | "arch=znver5" => {
-                    self = Self::V3;
-                }
                 _ => {}
             }
         }
@@ -252,6 +221,53 @@ impl X86Isa {
             }
         }
         self.normalized()
+    }
+
+    /// The vector permission of the CPU an `arch=` target attribute names.
+    ///
+    /// GCC replaces the `-march`-derived ISA with the named CPU's for that
+    /// function: GCC 16.2 compiles `target("arch=x86-64")` under
+    /// `-march=haswell` to SSE2 only. Such a function is typically the
+    /// baseline path of a runtime dispatch, so keeping the TU's AVX2 there is
+    /// a SIGILL on the CPUs it exists for. GCC keeps explicit command-line
+    /// `-m` grants on top; they are not tracked apart from `-march` here and
+    /// are dropped too (fail-closed). An unmodelled name gets the x86-64
+    /// baseline, a subset of every x86-64 CPU.
+    #[must_use]
+    pub fn arch_level(arch: &str) -> X86Isa {
+        let v2 = X86Isa {
+            sse41: true,
+            cx16: true,
+            ..Self::SSE2
+        };
+        match arch {
+            "x86-64-v2" | "nehalem" | "westmere" | "silvermont" | "goldmont" | "tremont" => v2,
+            "sandybridge" | "ivybridge" => X86Isa { avx: true, ..v2 },
+            "x86-64-v3" | "x86-64-v4" | "haswell" | "broadwell" | "skylake" | "skylake-avx512"
+            | "cascadelake" | "cooperlake" | "icelake-client" | "icelake-server" | "tigerlake"
+            | "sapphirerapids" | "emeraldrapids" | "graniterapids" | "alderlake" | "raptorlake"
+            | "meteorlake" | "arrowlake" | "znver1" | "znver2" | "znver3" | "znver4" | "znver5" => {
+                Self::V3
+            }
+            _ => Self::SSE2,
+        }
+    }
+
+    /// The permission legal in BOTH `self` and `other` (field-wise AND): the
+    /// ISA under which text mixing functions of either permission may be
+    /// rewritten.
+    #[must_use]
+    pub const fn meet(self, other: X86Isa) -> X86Isa {
+        X86Isa {
+            simd: self.simd && other.simd,
+            sse41: self.sse41 && other.sse41,
+            avx: self.avx && other.avx,
+            ymm: self.ymm && other.ymm,
+            fma: self.fma && other.fma,
+            movbe: self.movbe && other.movbe,
+            cx16: self.cx16 && other.cx16,
+        }
+        .normalized()
     }
 
     const BIT_SIMD: u8 = 1 << 0;
@@ -315,6 +331,71 @@ pub fn current() -> X86Isa {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn feats(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn arch_target_entries_replace_the_baseline() {
+        // GCC 16.2 compiles `target("arch=x86-64")` under `-march=haswell`
+        // to SSE2 only: the entry replaces, it does not add.
+        assert_eq!(
+            X86Isa::V3.with_target_features(&feats(&["arch=x86-64"])),
+            X86Isa::SSE2
+        );
+        let v2 = X86Isa::V3.with_target_features(&feats(&["arch=x86-64-v2"]));
+        assert!(v2.simd && v2.sse41 && v2.cx16 && !v2.avx && !v2.movbe);
+        let snb = X86Isa::SSE2.with_target_features(&feats(&["arch=sandybridge"]));
+        assert!(snb.avx && !snb.ymm && !snb.fma);
+        assert_eq!(
+            X86Isa::SSE2.with_target_features(&feats(&["arch=znver5"])),
+            X86Isa::V3
+        );
+        // Unmodelled CPUs get the x86-64 baseline, a subset of all of them.
+        assert_eq!(
+            X86Isa::V3.with_target_features(&feats(&["arch=core2"])),
+            X86Isa::SSE2
+        );
+        // Grants and denials in the same attribute apply on top of the CPU.
+        let grant = X86Isa::V3.with_target_features(&feats(&["arch=x86-64", "avx2"]));
+        assert!(grant.ymm && !grant.movbe);
+        let deny = X86Isa::SSE2.with_target_features(&feats(&["arch=haswell", "no-movbe"]));
+        assert_eq!(
+            deny,
+            X86Isa {
+                movbe: false,
+                ..X86Isa::V3
+            }
+        );
+        // Without `arch=` the TU baseline stays.
+        assert_eq!(
+            X86Isa::V3.with_target_features(&feats(&["no-movbe"])),
+            X86Isa {
+                movbe: false,
+                ..X86Isa::V3
+            }
+        );
+    }
+
+    #[test]
+    fn meet_is_the_fieldwise_and_and_normalized() {
+        let no_movbe = X86Isa {
+            movbe: false,
+            ..X86Isa::V3
+        };
+        assert_eq!(X86Isa::V3.meet(no_movbe), no_movbe);
+        assert_eq!(X86Isa::V3.meet(X86Isa::SSE2), X86Isa::SSE2);
+        assert_eq!(X86Isa::V3.meet(X86Isa::NONE), X86Isa::NONE);
+        assert_eq!(X86Isa::SSE2.meet(X86Isa::V3), X86Isa::V3.meet(X86Isa::SSE2));
+        // Dropping AVX drops everything that implies it.
+        let no_avx = X86Isa {
+            avx: false,
+            ..X86Isa::V3
+        };
+        let m = X86Isa::V3.meet(no_avx);
+        assert!(!m.avx && !m.ymm && !m.fma && m.sse41 && m.movbe);
+    }
 
     #[test]
     fn normalization_enforces_implication_chain() {

@@ -475,12 +475,15 @@ ENCDIFF_SUITE_ENV = (
 # The linker suite's environment pins the GNU as 2.47 binary both explicitly
 # for fixtures where GCC would bypass PATH and first in PATH for direct calls
 # (the runner's distro gas lacks APX/MOVRS coverage), plus fail-closed i386
-# multilib and the kernel relocs tool.
+# multilib and the kernel relocs tool. GCC does not discover the triplet-
+# prefixed BFD 2.47 in the GAS prefix, so pass it explicitly for the
+# CODE_4_GOTPCRELX comparison that strict mode otherwise skips.
 LINKER_ENV = (
     "LCCC_TEST_ASSEMBLER=$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as",
     "PATH=$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin:$PATH",
     "LCCC_REQUIRE_I386=1",
     "LCCC_RELOCS_TOOL=$HOME/.cache/lccc-kernel-tools/bin/relocs",
+    "LCCC_BFD_LD=$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/x86_64-linux-gnu-ld.bfd",
 )
 
 INVOCATION_CONTRACTS: tuple[InvocationContract, ...] = (

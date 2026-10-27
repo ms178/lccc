@@ -167,7 +167,24 @@ impl Lowerer {
                 } else {
                     cb > lb.max(rb)
                 };
-                if !exact {
+                // On i686, compute_signed_overflow(I64 Mul) would introduce
+                // exactly the unsupported I128 operation that this path must
+                // avoid.  With at-most-32-bit operands and result, the
+                // round-trip already detects every possible I64 wrap.  The
+                // only product that can signed-wrap I64 is the nonnegative
+                // case in [2^63, (2^32-1)^2]; after wrapping it lies in
+                // [-2^63, -2^33+1], while extending any <=32-bit truncated
+                // result back to I64 stays within [-2^31, 2^32-1].
+                // The compared values therefore cannot compare equal.
+                // Wider-operand cases keep the separate compute-overflow
+                // guard: 10 * (INT64_MIN + 1) is the counterexample to
+                // dropping it generically.
+                let roundtrip_covers_compute_wrap = op == IrBinOp::Mul
+                    && compute_ty.size() == 8
+                    && result_ir_ty.size() <= 4
+                    && lhs_src_ir.size() <= 4
+                    && rhs_src_ir.size() <= 4;
+                if !exact && !roundtrip_covers_compute_wrap {
                     let signed_ov = self.compute_signed_overflow(
                         op,
                         lhs_compute,
@@ -580,7 +597,7 @@ impl Lowerer {
     /// directly: unsigned T fits iff `hi == 0` and `lo` survives the
     /// truncation round trip; signed T iff `hi` is `lo`'s sign fill and `lo`
     /// survives the round trip.  Returns (truncated result, overflow flag).
-    fn lower_overflow_u64_pair(
+    pub(super) fn lower_overflow_u64_pair(
         &mut self,
         op: IrBinOp,
         lhs: (Operand, IrType),

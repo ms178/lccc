@@ -70,6 +70,63 @@ const MAX_LOCAL_PASS_ITERATIONS: usize = 8;
 /// Post-global cleanup is shallow (mostly dead store + adjacent pairs), so 4 suffices.
 const MAX_POST_GLOBAL_ITERATIONS: usize = 4;
 
+/// True when an assembly line, after any textual instruction prefixes, is a
+/// control transfer or trap that makes a linear peephole scan unsafe.
+///
+/// `classify_line` recognizes the ordinary unprefixed spellings. This catches
+/// e.g. `notrack jmp *%rax` and `bnd call foo`, which otherwise look like an
+/// opaque `Other` line and can hide a path that skips a later physical write.
+fn is_opaque_control_transfer(text: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "lock", "rep", "repe", "repz", "repne", "repnz", "notrack", "bnd", "xacquire", "xrelease",
+        "cs", "ds", "es", "fs", "gs", "ss", "data16", "data32", "addr16", "addr32", "rex32",
+        "rex64",
+    ];
+    let end = crate::backend::peephole_common::line_len_without_trailing_comment(text.as_bytes());
+    let mut words = text[..end].split_ascii_whitespace();
+    let mut mnemonic = words.next().unwrap_or("");
+    while PREFIXES
+        .iter()
+        .any(|prefix| mnemonic.eq_ignore_ascii_case(prefix))
+    {
+        let Some(next) = words.next() else {
+            return true; // a dangling prefix is opaque too
+        };
+        mnemonic = next;
+    }
+    let starts = |prefix: &str| {
+        mnemonic
+            .get(..prefix.len())
+            .is_some_and(|word| word.eq_ignore_ascii_case(prefix))
+    };
+    starts("j")
+        || starts("loop")
+        || starts("call")
+        || starts("ret")
+        || starts("lret")
+        || starts("lcall")
+        || starts("ljmp")
+        || starts("iret")
+        || starts("int")
+        || starts("syscall")
+        || starts("sysenter")
+        || starts("sysexit")
+        || starts("sysret")
+        || starts("xbegin")
+        || starts("xabort")
+        || starts("ud0")
+        || starts("ud1")
+        || starts("ud2")
+        || starts("hlt")
+        || starts("icebp")
+        || starts("rsm")
+        || starts("bound")
+        || starts("vmcall")
+        || starts("vmmcall")
+        || starts("vmlaunch")
+        || starts("vmresume")
+}
+
 // ── Stack-address escape pinning ─────────────────────────────────────────────
 
 /// Parse a direct `OFFSET(%rsp)`/`OFFSET(%rbp)` operand.  Indexed addresses are
@@ -1389,6 +1446,14 @@ fn peephole_optimize_inner(
                 trace("fold_load_test_into_cmp", pass_count, c, &store, &infos);
                 changed |= c;
             }
+        }
+        // After the load/test fold, so `movsbq m, %r; testb; setne; movzbl;
+        // add` first becomes `cmpb $0, m` and then `cmpb $1, m; sbb $-1`
+        // (in the other order the register compare would strand the load).
+        if !sk("setcc_increment") {
+            let c = flag_peepholes::fold_setcc_increment(&mut store, &mut infos);
+            trace("fold_setcc_increment", pass_count, c, &store, &infos);
+            changed |= c;
         }
         if !sk("acc_roundtrip") {
             {
@@ -4020,6 +4085,38 @@ mod tests {
     }
 
     #[test]
+    fn test_redundant_cltq_after_narrow_sign_extensions() {
+        for producer in [
+            "movsbq %dil, %rax",
+            "movsbq %al, %rax",
+            "movsbq -8(%rbp), %rax",
+            "movswq %di, %rax",
+            "movswq %ax, %rax",
+            "movswq -8(%rbp), %rax",
+        ] {
+            let asm = format!("    {producer}\n    cltq\n");
+            let result = peephole_optimize(asm);
+            assert!(result.contains(producer), "lost producer: {result}");
+            assert!(
+                !result.contains("cltq"),
+                "{producer} already sign-extends to 64 bits: {result}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_narrow_sign_extension_does_not_hide_rax_clobber_from_cltq() {
+        for producer in ["movsbq %dil, %rax", "movswq %di, %rax"] {
+            let asm = format!("    {producer}\n    addl $1, %eax\n    cltq\n");
+            let result = peephole_optimize(asm);
+            assert!(
+                result.contains("cltq"),
+                "intervening eax write must retain cltq after {producer}: {result}"
+            );
+        }
+    }
+
+    #[test]
     fn test_dead_store_elimination() {
         let asm = [
             "    pushq %rbp",
@@ -5722,8 +5819,30 @@ mod regression_tests {
         assert!(out.contains(".cfi_def_cfa_offset 24"), "{out}");
     }
 
+    /// A save whose register is never NAMED is still live when an
+    /// instruction writes it implicitly (`cpuid` -> %ebx) or opaque inline
+    /// asm sits in the body; dropping it would corrupt the caller's %rbx.
     #[test]
-    fn fpo_dead_callee_save_kept_with_aligned_vector_stack_traffic() {
+    fn fpo_save_kept_for_implicit_and_inline_asm_writes() {
+        for body in ["    cpuid\n", "#APP\n    .byte 0x0f, 0xa2\n#NO_APP\n"] {
+            let asm = format!(
+                "f:\n.cfi_startproc\n    pushq %rbx\n    .cfi_def_cfa_offset 16\n    \
+                 .cfi_offset %rbx, -16\n    movl %edi, %eax\n    xorl %ecx, %ecx\n{body}    \
+                 popq %rbx\n    .cfi_def_cfa_offset 8\n    ret\n.cfi_endproc\n"
+            );
+            let out = peephole_optimize(asm);
+            assert!(
+                out.contains("pushq %rbx") && out.contains("popq %rbx"),
+                "{out}"
+            );
+            assert!(out.contains(".cfi_offset %rbx, -16"), "{out}");
+        }
+    }
+
+    /// With a prologue `subq` the frame-preserving form applies: the frame
+    /// total, and with it every `%rsp`-relative (aligned) slot, is unchanged.
+    #[test]
+    fn fpo_dead_callee_save_dropped_with_aligned_vector_stack_traffic() {
         let asm = concat!(
             "f:\n",
             ".cfi_startproc\n",
@@ -5739,7 +5858,203 @@ mod regression_tests {
             ".size f, .-f\n",
         );
         let out = peephole_optimize(asm.to_string());
+        assert!(!out.contains("%r13"), "{out}");
+        assert!(out.contains("subq $40, %rsp"), "{out}");
+        assert!(out.contains("addq $40, %rsp"), "{out}");
+        assert!(out.contains("vmovaps %ymm0, (%rsp)"), "{out}");
+    }
+
+    /// Without a `subq` the push must go outright, which moves `%rsp`:
+    /// `%rsp`-relative data refuses.
+    #[test]
+    fn fpo_dead_callee_save_kept_without_subq_when_rsp_addresses_data() {
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    pushq %r13\n",
+            "    .cfi_def_cfa_offset 16\n",
+            "    vmovaps %xmm0, -24(%rsp)\n",
+            "    vmovaps -24(%rsp), %xmm1\n",
+            "    popq %r13\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+            ".size f, .-f\n",
+        );
+        let out = peephole_optimize(asm.to_string());
         assert!(out.contains("pushq %r13"), "{out}");
+        assert!(out.contains("popq %r13"), "{out}");
+    }
+
+    /// A transient stack bridge must block the same FPO cleanup with CFI
+    /// disabled; otherwise `-fno-asynchronous-unwind-tables` changes the
+    /// prologue even though the CFI directives are the only option difference.
+    #[test]
+    fn fpo_dead_save_kept_across_transient_rsp_writes_without_cfi() {
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    pushq %r13\n",
+            "    subq $8, %rsp\n",
+            "    leaq -8(%rsp), %rsp\n",
+            "    movq %rax, (%rsp)\n",
+            "    leaq 8(%rsp), %rsp\n",
+            "    addq $8, %rsp\n",
+            "    popq %r13\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+            ".size f, .-f\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(out.contains("pushq %r13"), "{out}");
+        assert!(out.contains("popq %r13"), "{out}");
+    }
+
+    /// chacha20_core as emitted: per-push CFI, a frame, an epilogue with
+    /// its own CFA steps and the post-`ret` re-statement of the frame CFA.
+    #[test]
+    fn fpo_dead_saves_in_a_framed_leaf_keep_exact_cfi() {
+        let asm = concat!(
+            "chacha20_core:\n",
+            ".cfi_startproc\n",
+            "    pushq %rbx\n",
+            "    .cfi_def_cfa_offset 16\n",
+            "    .cfi_offset %rbx, -16\n",
+            "    pushq %r12\n",
+            "    .cfi_def_cfa_offset 24\n",
+            "    .cfi_offset %r12, -24\n",
+            "    subq $72, %rsp\n",
+            "    .cfi_def_cfa_offset 96\n",
+            "    movdqu %xmm0, 8(%rsp)\n",
+            "    testl %edi, %edi\n",
+            "    je .LBB2\n",
+            "    movdqu 8(%rsp), %xmm1\n",
+            "    movdqu %xmm1, (%rsi)\n",
+            "    addq $72, %rsp\n",
+            "    .cfi_def_cfa_offset 24\n",
+            "    popq %r12\n",
+            "    .cfi_def_cfa_offset 16\n",
+            "    popq %rbx\n",
+            "    .cfi_def_cfa_offset 8\n",
+            "    ret\n",
+            "    .cfi_def_cfa_offset 96\n",
+            ".LBB2:\n",
+            "    addq $72, %rsp\n",
+            "    .cfi_def_cfa_offset 24\n",
+            "    popq %r12\n",
+            "    .cfi_def_cfa_offset 16\n",
+            "    popq %rbx\n",
+            "    .cfi_def_cfa_offset 8\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+            ".size chacha20_core, .-chacha20_core\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(!out.contains("%rbx") && !out.contains("%r12"), "{out}");
+        assert_eq!(out.matches("subq $88, %rsp").count(), 1, "{out}");
+        assert_eq!(out.matches("addq $88, %rsp").count(), 2, "{out}");
+        // Frame CFA (96) is unchanged; each epilogue steps 96 -> 8 directly.
+        assert_eq!(out.matches(".cfi_def_cfa_offset 96").count(), 2, "{out}");
+        // One CFA step per epilogue (after the addq); the dead pops took
+        // their own directives with them.
+        assert_eq!(out.matches(".cfi_def_cfa_offset 8\n").count(), 2, "{out}");
+        for bad in ["offset 16", "offset 24", ".cfi_offset"] {
+            assert!(!out.contains(bad), "{bad}: {out}");
+        }
+        assert!(out.contains("movdqu %xmm0, 8(%rsp)"), "{out}");
+    }
+
+    /// zstd_count's `main`: a dead save between live ones, calls in the
+    /// body. `%rbp`'s slot and the CFA after its push move up by 8; the
+    /// frame CFA and every `%rsp` offset stay.
+    #[test]
+    fn fpo_dead_save_between_live_ones_in_a_calling_function() {
+        let asm = concat!(
+            "main:\n",
+            ".cfi_startproc\n",
+            "    pushq %rbx\n",
+            "    .cfi_def_cfa_offset 16\n",
+            "    .cfi_offset %rbx, -16\n",
+            "    pushq %r15\n",
+            "    .cfi_def_cfa_offset 24\n",
+            "    .cfi_offset %r15, -24\n",
+            "    pushq %rbp\n",
+            "    .cfi_def_cfa_offset 32\n",
+            "    .cfi_offset %rbp, -32\n",
+            "    subq $16, %rsp\n",
+            "    .cfi_def_cfa_offset 48\n",
+            "    movq %rdi, %rbx\n",
+            "    movq %rsi, %rbp\n",
+            "    movq %rax, 0(%rsp)\n",
+            "    call g\n",
+            "    addq 0(%rsp), %rbx\n",
+            "    leaq (%rbx,%rbp), %rax\n",
+            "    addq $16, %rsp\n",
+            "    .cfi_def_cfa_offset 32\n",
+            "    popq %rbp\n",
+            "    .cfi_def_cfa_offset 24\n",
+            "    popq %r15\n",
+            "    .cfi_def_cfa_offset 16\n",
+            "    popq %rbx\n",
+            "    .cfi_def_cfa_offset 8\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+            ".size main, .-main\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(!out.contains("%r15"), "{out}");
+        assert!(out.contains("subq $24, %rsp"), "{out}");
+        assert!(out.contains("addq $24, %rsp"), "{out}");
+        assert!(out.contains(".cfi_offset %rbx, -16"), "{out}");
+        assert!(out.contains(".cfi_offset %rbp, -24"), "{out}");
+        assert!(out.contains(".cfi_def_cfa_offset 48"), "{out}");
+        assert!(!out.contains(".cfi_def_cfa_offset 32"), "{out}");
+        assert!(
+            out.contains("movq %rax, 0(%rsp)") || out.contains("movq %rax, (%rsp)"),
+            "{out}"
+        );
+        let epi = &out[out.find("addq $24, %rsp").unwrap()..];
+        let order: Vec<&str> = epi
+            .lines()
+            .filter(|l| l.trim().starts_with("popq"))
+            .collect();
+        assert_eq!(order, ["    popq %rbp", "    popq %rbx"], "{out}");
+    }
+
+    /// Each gate of the frame-preserving form refuses on its own.
+    #[test]
+    fn fpo_frame_preserving_refusals() {
+        let shape = |subq: &str, addq: &str, extra_cfi: &str, pops: &str| {
+            format!(
+                "f:\n.cfi_startproc\n    pushq %rbx\n    .cfi_def_cfa_offset 16\n    .cfi_offset %rbx, -16\n    pushq %r13\n    .cfi_def_cfa_offset 24\n    .cfi_offset %r13, -24\n{extra_cfi}    {subq}\n    movq %rdi, %rbx\n    call g\n    movq %rbx, %rax\n    {addq}\n{pops}    ret\n.cfi_endproc\n.size f, .-f\n"
+            )
+        };
+        let mirror = "    popq %r13\n    popq %rbx\n";
+        let ok = shape("subq $8, %rsp", "addq $8, %rsp", "", mirror);
+        assert!(!peephole_optimize(ok).contains("%r13"), "control must fire");
+        let cases = [
+            // 4088 + 8 reaches a page: would need a stack-clash probe.
+            shape("subq $4088, %rsp", "addq $4088, %rsp", "", mirror),
+            // Epilogue does not restore through the matching addq.
+            shape("subq $8, %rsp", "leaq 8(%rsp), %rsp", "", mirror),
+            // CFI for a register outside the push set.
+            shape(
+                "subq $8, %rsp",
+                "addq $8, %rsp",
+                "    .cfi_offset %r14, -40\n",
+                mirror,
+            ),
+            // Pops not in mirror order.
+            shape(
+                "subq $8, %rsp",
+                "addq $8, %rsp",
+                "",
+                "    popq %rbx\n    popq %r13\n",
+            ),
+        ];
+        for (n, asm) in cases.into_iter().enumerate() {
+            let out = peephole_optimize(asm);
+            assert!(out.contains("pushq %r13"), "case {n}: {out}");
+        }
     }
 
     /// gcc.c-torture postmod-1.c at -O1: the prologue pinned

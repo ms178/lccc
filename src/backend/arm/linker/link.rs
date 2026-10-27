@@ -47,6 +47,8 @@ pub fn link_builtin(
     let all_lib_paths: Vec<String> = lib_paths.iter().map(|s| s.to_string()).collect();
 
     let parsed_common = linker_common::parse_linker_args(user_args);
+    parsed_common.validate_common_page_size()?;
+    parsed_common.warn_unimplemented_keyword_options()?;
     let rpath = linker_common::rpath_dyn_entry(&parsed_common);
     let mut export_dynamic = parsed_common.export_dynamic;
     for arg in user_args {
@@ -417,6 +419,8 @@ pub fn link_shared(
     let lib_path_strings: Vec<String> = lib_paths.iter().map(|s| s.to_string()).collect();
 
     let parsed_args = linker_common::parse_linker_args(user_args);
+    parsed_args.validate_common_page_size()?;
+    parsed_args.warn_unimplemented_keyword_options()?;
     let rpath = linker_common::rpath_dyn_entry(&parsed_args);
     let soname = parsed_args.soname.clone();
     let defsym_defs = parsed_args.defsym_defs.clone();

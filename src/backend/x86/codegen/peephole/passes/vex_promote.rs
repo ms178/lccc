@@ -6,8 +6,9 @@
 //! scalar remainder, the reduction epilogue and every other scalar FP
 //! instruction in the same function still come out of the text emitters in
 //! *legacy* SSE encoding (`movss`, `cvtsi2sdq`, `ucomisd`, …).  The function
-//! runs its `vzeroupper` only in the epilogue, so that scalar code executes
-//! with **dirty upper YMM state**.  Measured consequences (Intel ORM §15.3,
+//! runs `vzeroupper` only at its exits and before ordinary calls, so the
+//! scalar code between the vector code and those points executes with
+//! **dirty upper YMM state**.  Measured consequences (Intel ORM §15.3,
 //! Agner Fog "Mixing AVX and SSE"; uops.info):
 //!
 //! * Skylake and every later P-core (SKL/ICL/GLC/RPC, i.e. the Raptor Lake

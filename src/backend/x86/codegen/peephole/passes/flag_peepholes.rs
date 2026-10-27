@@ -16,6 +16,8 @@
 //!    and the `test` all disappear (three instructions).
 //! 3. [`fold_conditional_increment`] — count zero/nonzero using carry, after
 //!    proving the temporary and every changed flag dead.
+//!    [`fold_setcc_increment`] — the same identity for the materialised
+//!    boolean (`cmp $0; setne; movzbl; add` → `cmp $1; sbb $-1`).
 //! 4. [`fold_copy_and_mask_into_movz`] — `movl %A,%D; andl $255,%D` →
 //!    `movzbl %Al,%D` (likewise `$65535` → `movzwl`).
 //!
@@ -5225,6 +5227,261 @@ pub(super) fn fold_conditional_increment(store: &mut LineStore, infos: &mut [Lin
         changed = true;
     }
     changed
+}
+
+/// Fold the materialised-boolean form of a zero/nonzero count,
+/// `cmp $0, x; setne b; movzbl b, r; add r, acc` (or `test x, x` for a
+/// register `x`), to `cmp $1, x; sbb $-1, acc` (`sete` uses `adc $0`).
+///
+/// The select form is [`fold_conditional_increment`]; this is the shape a
+/// scalar `c += (x != 0)` lowers to directly (the byte-count remainder
+/// loops, every non-vectorised predicate count).  Same identity: for any x,
+/// unsigned `x < 1` iff `x == 0`, so `sbb $-1` adds `1 - CF = [x != 0]` and
+/// `adc $0` adds `CF = [x == 0]`, including modular wrap.  `x` is read once
+/// at the original width and address.  The boolean register and its
+/// widened copy must die at the add, and every flag the add wrote must be
+/// dead (`sbb`/`adc` produce the same value but different CF/OF).  The
+/// 32-bit forms zero-extend the accumulator exactly like `addl`.
+pub(super) fn fold_setcc_increment(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let mut changed = false;
+    let mut liveness = None;
+    for i in 0..store.len() {
+        if infos[i].is_nop() || infos[i].pinned {
+            continue;
+        }
+        let Some(j) = next_real(store, infos, i, store.len()) else {
+            continue;
+        };
+        let Some(k) = next_real(store, infos, j, store.len()) else {
+            continue;
+        };
+        let Some(l) = next_real(store, infos, k, store.len()) else {
+            continue;
+        };
+        if infos[j].pinned || infos[k].pinned || infos[l].pinned {
+            continue;
+        }
+        // The compare: `cmpW $0, x`, or `testW %r, %r` (a register x).
+        let Some((cmp_mnem, cmp_args)) = infos[i].trimmed(store.get(i)).split_once(' ') else {
+            continue;
+        };
+        let Some(cmp_width) = cmp_mnem
+            .strip_prefix("cmp")
+            .or_else(|| cmp_mnem.strip_prefix("test"))
+            .filter(|w| matches!(*w, "b" | "w" | "l" | "q"))
+        else {
+            continue;
+        };
+        let Some((lhs, operand)) = split_two_operands(cmp_args) else {
+            continue;
+        };
+        let compared_is_zero_test = if cmp_mnem.starts_with("cmp") {
+            lhs == "$0"
+        } else {
+            lhs == operand && plain_gp_operand(operand).is_some()
+        };
+        if !compared_is_zero_test {
+            continue;
+        }
+        // `setne b` / `sete b` on a plain low-byte register.
+        let Some((set_mnem, b)) = infos[j].trimmed(store.get(j)).split_once(' ') else {
+            continue;
+        };
+        let cc_ne = match set_mnem {
+            "setne" => true,
+            "sete" => false,
+            _ => continue,
+        };
+        let b = b.trim();
+        let Some(b_fam) = plain_gp_operand(b) else {
+            continue;
+        };
+        if b != REG_NAMES[3][b_fam as usize] {
+            continue;
+        }
+        // `movzbl b, r32` / `movzbq b, r64`.
+        let Some((zx_mnem, zx_args)) = infos[k].trimmed(store.get(k)).split_once(' ') else {
+            continue;
+        };
+        let Some((zx_src, zx_dst)) = split_two_operands(zx_args) else {
+            continue;
+        };
+        let zx_wide = match zx_mnem {
+            "movzbl" => false,
+            "movzbq" => true,
+            _ => continue,
+        };
+        let Some(r_fam) = plain_gp_operand(zx_dst) else {
+            continue;
+        };
+        if zx_src != b || !names_family_at_width(zx_dst, r_fam, zx_wide) {
+            continue;
+        }
+        // `addW r, acc` at the accumulator's width (the copy is zero-extended
+        // to 64 bits either way).
+        let Some((add_mnem, add_args)) = infos[l].trimmed(store.get(l)).split_once(' ') else {
+            continue;
+        };
+        let add_wide = match add_mnem {
+            "addl" => false,
+            "addq" => true,
+            _ => continue,
+        };
+        let Some((addend, acc)) = split_two_operands(add_args) else {
+            continue;
+        };
+        let Some(acc_fam) = plain_gp_operand(acc) else {
+            continue;
+        };
+        if !names_family_at_width(addend, r_fam, add_wide)
+            || !names_family_at_width(acc, acc_fam, add_wide)
+            || acc_fam == r_fam
+            || acc_fam == b_fam
+            || matches!(acc_fam, 4 | 5)
+            || !flags_dead_after(store, infos, l + 1)
+        {
+            continue;
+        }
+        let lv = liveness.get_or_insert_with(|| FileLiveness::new(store, infos));
+        let owned = [i, j, k, l];
+        if !super::relay_and_lea::provably_dead_lv(lv, store, infos, l, r_fam, &owned)
+            || (b_fam != r_fam
+                && !super::relay_and_lea::provably_dead_lv(lv, store, infos, l, b_fam, &owned))
+        {
+            continue;
+        }
+        let width = if add_wide { 'q' } else { 'l' };
+        let compare = format!("    cmp{cmp_width} $1, {operand}");
+        let update = if cc_ne {
+            format!("    sbb{width} $-1, {acc}")
+        } else {
+            format!("    adc{width} $0, {acc}")
+        };
+        replace_line(store, &mut infos[i], i, compare);
+        mark_nop(&mut infos[j]);
+        mark_nop(&mut infos[k]);
+        replace_line(store, &mut infos[l], l, update);
+        lv.refresh_at(store, infos, l);
+        changed = true;
+    }
+    changed
+}
+
+#[cfg(test)]
+mod setcc_increment_tests {
+    use super::*;
+
+    fn fold(body: &str) -> (bool, String) {
+        let text = format!("foo:\n.cfi_startproc\n{body}\n.cfi_endproc\n");
+        let mut store = LineStore::new(text);
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        let changed = fold_setcc_increment(&mut store, &mut infos);
+        let out = (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        (changed, out)
+    }
+
+    #[test]
+    fn folds_every_width_predicate_and_compare_form() {
+        for (aw, acc, addend) in [('l', "%eax", "%r10d"), ('q', "%rax", "%r10")] {
+            for cmp in [
+                "cmpb $0, (%rsi,%r9)",
+                "cmpw $0, (%rdi)",
+                "cmpl $0, 4(%rdi)",
+                "cmpq $0, %rdx",
+                "testb %cl, %cl",
+                "testl %ecx, %ecx",
+            ] {
+                for (cc, upd) in [
+                    ("setne", format!("sbb{aw} $-1, {acc}")),
+                    ("sete", format!("adc{aw} $0, {acc}")),
+                ] {
+                    for zx in ["movzbl %r10b, %r10d", "movzbq %r10b, %r10"] {
+                        let body = format!(
+                            "    {cmp}\n    {cc} %r10b\n    {zx}\n    add{aw} {addend}, {acc}\n    ret"
+                        );
+                        let (changed, out) = fold(&body);
+                        assert!(changed, "{body}\n=> {out}");
+                        assert!(out.contains(&upd), "{out}");
+                        assert!(!out.contains("set"), "{out}");
+                        assert!(!out.contains("movzb"), "{out}");
+                        let operand = cmp.split_once(", ").unwrap().1;
+                        let w = &cmp[cmp.find(' ').unwrap() - 1..cmp.find(' ').unwrap()];
+                        assert!(out.contains(&format!("cmp{w} $1, {operand}")), "{out}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn distinct_boolean_and_copy_registers_must_both_die() {
+        let valid = "    cmpb $0, (%rdi)\n    setne %cl\n    movzbl %cl, %r10d\n    addq %r10, %rax\n    ret";
+        assert!(fold(valid).0, "{valid}");
+        let live_b = valid.replace("    ret", "    movzbl %cl, %edx\n    ret");
+        assert!(!fold(&live_b).0, "{live_b}");
+        let live_r = valid.replace("    ret", "    movq %r10, %rdx\n    ret");
+        assert!(!fold(&live_r).0, "{live_r}");
+    }
+
+    #[test]
+    fn refuses_live_flags_aliases_and_unmodelled_shapes() {
+        let valid = "    cmpb $0, (%rsi)\n    setne %r10b\n    movzbl %r10b, %r10d\n    addq %r10, %rax\n    ret";
+        assert!(fold(valid).0);
+        for body in [
+            // The add's flags are read.
+            valid.replace("    ret", "    jo .Lx\n    ret\n.Lx:\n    ret"),
+            valid.replace("    ret", "    adcq $0, %rdx\n    ret"),
+            // Not a zero test / wrong predicate / non-boolean producer.
+            valid.replace("$0", "$1"),
+            valid.replace("setne", "setg"),
+            valid.replace("cmpb $0, (%rsi)", "testb %cl, %dl"),
+            // The accumulator aliases the boolean, or is a frame register.
+            valid.replace("%rax", "%r10"),
+            valid.replace("%rax", "%rsp"),
+            // Width mismatches between the copy and the add.
+            valid.replace("addq %r10, %rax", "addl %r10, %eax"),
+            valid.replace("addq %r10, %rax", "addq %r11, %rax"),
+            valid.replace("movzbl %r10b, %r10d", "movzbw %r10b, %r10w"),
+            valid.replace("movzbl %r10b, %r10d", "movzbl %r11b, %r10d"),
+            // A high-byte boolean, a label inside the window.
+            valid.replace("%r10b", "%ah"),
+            valid.replace("    setne", ".Ljoin:\n    setne"),
+        ] {
+            assert!(!fold(&body).0, "{body}");
+        }
+    }
+
+    #[test]
+    fn copy_live_around_the_backedge_is_not_dead() {
+        let (changed, _) = fold(
+            ".Lloop:\n    movl %r10d, (%rdi)\n    cmpb $0, (%rsi)\n    setne %r10b\n    movzbl %r10b, %r10d\n    addq %r10, %rax\n    decq %rcx\n    jne .Lloop\n    ret",
+        );
+        assert!(!changed);
+    }
+
+    #[test]
+    fn carry_identity_matches_the_boolean_add_for_every_byte_and_wrap() {
+        for x in 0u16..=255 {
+            for acc in [0u64, 1, 0x7FFF_FFFF, 0xFFFF_FFFF, u64::MAX - 1, u64::MAX] {
+                let cf = u64::from(x < 1);
+                let ne = acc.wrapping_add(u64::from(x != 0));
+                let eq = acc.wrapping_add(u64::from(x == 0));
+                assert_eq!(acc.wrapping_sub(u64::MAX).wrapping_sub(cf), ne);
+                assert_eq!(acc.wrapping_add(cf), eq);
+                let a32 = acc as u32;
+                assert_eq!(
+                    a32.wrapping_sub(u32::MAX).wrapping_sub(cf as u32),
+                    a32.wrapping_add(u32::from(x != 0))
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]

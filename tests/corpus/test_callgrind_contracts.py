@@ -351,6 +351,15 @@ class ArgumentVectorContract(unittest.TestCase):
         self.assertEqual(doc['opt_tokens'],['-O2','-march=x86-64-v3'])
         self.assertEqual(sorted(doc['results']),['fib','nbody'])
 
+    def test_vendor_libm_linkage_is_matched_and_visible(self):
+        for argv in (['gcc-a','clang-b','-O2','fib'],
+                     ['gcc-a','clang-b','-O2 -lm','fib']):
+            with self.subTest(argv=argv):
+                doc=self.manifest_for(argv)
+                self.assertEqual(doc['opt'],'-O2 -lm')
+                self.assertEqual(doc['opt_tokens'],['-O2','-lm'])
+                self.assertEqual(sorted(doc['results']),['fib'])
+
     def test_explicit_opt_option_is_not_rewritten(self):
         doc=self.manifest_for(['mock-mine','mock-ref','--opt=-O3','fib'])
         self.assertEqual(doc['opt'],'-O3')

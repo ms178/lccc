@@ -66,6 +66,13 @@ enum ExprKey {
         must_mat: bool,
         site_local: Option<u32>,
     },
+    /// Pure select: equal condition and arms compute the same value.
+    Select {
+        cond: VNOperand,
+        true_val: VNOperand,
+        false_val: VNOperand,
+        ty: IrType,
+    },
     /// Load CSE key: two loads from the same pointer with the same type
     /// produce the same value if no intervening memory modification occurs.
     Load { ptr: VNOperand, ty: IrType },
@@ -759,6 +766,32 @@ impl GvnState {
                     *dest,
                 ))
             }
+            // Pure. Inlining one helper several times (glibc's `rte` behind
+            // rint/nearbyint/roundeven) leaves identical selects behind once
+            // if-conversion has run; unnumbered, each paid its own compare
+            // materialisation and select lowering. 128-bit and x87 long
+            // double stay out, as for BinOp/Cast/Load (their Copy lowering).
+            Instruction::Select {
+                dest,
+                cond,
+                true_val,
+                false_val,
+                ty,
+            } => {
+                if ty.is_128bit() || ty.is_long_double() {
+                    self.assign_fresh_vn(*dest);
+                    return None;
+                }
+                Some((
+                    ExprKey::Select {
+                        cond: self.operand_to_vn(cond),
+                        true_val: self.operand_to_vn(true_val),
+                        false_val: self.operand_to_vn(false_val),
+                        ty: *ty,
+                    },
+                    *dest,
+                ))
+            }
             // Pure: a symbol's address is constant for the process lifetime.
             Instruction::GlobalAddr { dest, name } => Some((
                 ExprKey::GlobalAddr {
@@ -1104,6 +1137,37 @@ fn find_volatile_allocas(func: &IrFunction) -> FxHashSet<u32> {
         }
     }
     volatile
+}
+
+/// Instruction classes whose dominated duplicates are deleted and renamed
+/// onto the dominating value (see the inventory at the use site).
+///
+/// * INTEGER `Mul` -- the audited work-order class.
+/// * INTEGER `Sub` of two VALUES -- a distance such as `(u32)(ip - base)`,
+///   which zstd's double-fast probe recomputes in every dominated branch.
+///   It is shape-neutral for every structural consumer: an IV step or a
+///   constant-offset exit bound (`i - 1`, `n - 2`) has a CONSTANT operand
+///   and stays excluded, exactly like the measured `Add` hazard; a twin
+///   outside the loop makes the rename indistinguishable from the LICM
+///   hoist every matcher already accepts; and a loop-variant `a - b` over
+///   body loads cannot hit a dominator entry, because load value numbers
+///   are invalidated at the header merge (the dot-product argument).
+fn cross_block_renamable(inst: &Instruction) -> bool {
+    match inst {
+        Instruction::BinOp {
+            op: IrBinOp::Mul,
+            ty,
+            ..
+        } => !ty.is_float(),
+        Instruction::BinOp {
+            op: IrBinOp::Sub,
+            lhs: Operand::Value(_),
+            rhs: Operand::Value(_),
+            ty,
+            ..
+        } => !ty.is_float() && !ty.is_128bit(),
+        _ => false,
+    }
 }
 
 fn function_uses_128(func: &IrFunction) -> bool {
@@ -2018,13 +2082,7 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState) 
                 {
                     if block_defs.contains(&ev.0) {
                         Some((ev, None))
-                    } else if !matches!(
-                        inst,
-                        Instruction::BinOp {
-                            op: IrBinOp::Mul,
-                            ty: bin_ty, ..
-                        } if !bin_ty.is_float()
-                    ) {
+                    } else if !cross_block_renamable(&inst) {
                         // Cross-block RENAMING is scoped to INTEGER `Mul`
                         // — the audited work-order class ("redundant
                         // multiplications of induction variables"):
@@ -3140,6 +3198,67 @@ mod tests {
                 v.0, 2,
                 "the deepest duplicate reads the CANONICAL value, not a chain"
             ),
+            other => panic!("unexpected terminator {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cross_block_cse_value_distance_sub_only() {
+        // A value-value integer Sub (a pointer distance) renames across
+        // blocks; a Sub with a constant operand (IV step / exit-bound shape)
+        // and an Add (the measured loop-shape hazard) keep their dominated
+        // duplicates, as do float Subs.
+        let bin =
+            |dest: u32, op: IrBinOp, lhs: Operand, rhs: Operand, ty: IrType| Instruction::BinOp {
+                dest: Value(dest),
+                op,
+                lhs,
+                rhs,
+                ty,
+            };
+        let v = |n: u32| Operand::Value(Value(n));
+        let c = || Operand::Const(IrConst::I64(1));
+        let func = fn_of(
+            "distance",
+            vec![
+                blk(
+                    0,
+                    vec![
+                        bin(2, IrBinOp::Sub, v(0), v(1), IrType::I64),
+                        bin(3, IrBinOp::Sub, v(0), c(), IrType::I64),
+                        bin(4, IrBinOp::Add, v(0), v(1), IrType::I64),
+                        bin(5, IrBinOp::Sub, v(0), v(1), IrType::F64),
+                    ],
+                    Terminator::Branch(BlockId(1)),
+                    vec![],
+                ),
+                blk(
+                    1,
+                    vec![
+                        bin(6, IrBinOp::Sub, v(0), v(1), IrType::I64),
+                        bin(7, IrBinOp::Sub, v(0), c(), IrType::I64),
+                        bin(8, IrBinOp::Add, v(0), v(1), IrType::I64),
+                        bin(9, IrBinOp::Sub, v(0), v(1), IrType::F64),
+                        bin(10, IrBinOp::Sub, v(1), v(0), IrType::I64),
+                    ],
+                    Terminator::Return(Some(v(6))),
+                    vec![],
+                ),
+            ],
+            11,
+        );
+        let mut module = module_of(func);
+        let eliminated = module.for_each_function(run_gvn_function);
+        assert_eq!(eliminated, 1, "only the value-value integer Sub renames");
+        let kept: Vec<u32> = module.functions[0].blocks[1]
+            .instructions
+            .iter()
+            .filter_map(|i| i.dest().map(|d| d.0))
+            .collect();
+        // Sub is not commutative: `v1 - v0` is a distinct expression.
+        assert_eq!(kept, vec![7, 8, 9, 10]);
+        match &module.functions[0].blocks[1].terminator {
+            Terminator::Return(Some(Operand::Value(v))) => assert_eq!(v.0, 2),
             other => panic!("unexpected terminator {:?}", other),
         }
     }
@@ -4598,5 +4717,55 @@ mod tests {
             ),
             "GEP no longer reads the site-local base: {instrs:?}"
         );
+    }
+
+    #[test]
+    fn test_identical_selects_are_numbered_once() {
+        // Inlining one helper three times leaves identical selects; only
+        // the exact duplicate is numbered away. A different arm stays, and so do
+        // duplicate F128 selects (excluded like F128 loads).
+        let sel = |dest: u32, f: u32, ty: IrType| Instruction::Select {
+            dest: Value(dest),
+            cond: Operand::Value(Value(0)),
+            true_val: Operand::Value(Value(1)),
+            false_val: Operand::Value(Value(f)),
+            ty,
+        };
+        let func = fn_of(
+            "selects",
+            vec![blk(
+                0,
+                vec![
+                    sel(3, 2, IrType::F64),
+                    sel(4, 2, IrType::F64), // renamed -> v3
+                    sel(5, 1, IrType::F64), // different false arm
+                    sel(6, 2, IrType::F128),
+                    sel(7, 2, IrType::F128), // excluded type
+                ],
+                Terminator::Return(Some(Operand::Value(Value(4)))),
+                vec![],
+            )],
+            8,
+        );
+        let mut module = module_of(func);
+        let eliminated = module.for_each_function(run_gvn_function);
+        assert_eq!(
+            eliminated, 1,
+            "only the exact F64 duplicate is numbered away"
+        );
+        // Same-block hit: the duplicate becomes a Copy of the survivor
+        // (cross-block hits are deleted and renamed instead).
+        let insts = &module.functions[0].blocks[0].instructions;
+        assert!(insts.iter().any(|i| matches!(
+            i,
+            Instruction::Copy { dest, src: Operand::Value(v) } if dest.0 == 4 && v.0 == 3
+        )));
+        for kept in [5, 6, 7] {
+            assert!(
+                insts
+                    .iter()
+                    .any(|i| matches!(i, Instruction::Select { dest, .. } if dest.0 == kept))
+            );
+        }
     }
 }

@@ -383,8 +383,10 @@ impl std::fmt::Display for AddressSpace {
 ///     incompatible), which the kernel relies on for `__same_type`;
 ///   * arrays: compatible elements and either equal bounds or one unknown
 ///     bound (C17 6.2.7p3);
-///   * functions: same variadic-ness, same parameter count, compatible return
-///     and parameter types.  NAMES ARE IGNORED;
+///   * functions: compatible return types; two prototypes must agree in
+///     variadic-ness, parameter count and parameter types (names are ignored).
+///     A prototype is compatible with an unprototyped type only when it is
+///     non-variadic and its parameters are unchanged by default promotions;
 ///   * enums: compatible with the integer type their value range picks
 ///     (C11 6.7.2.2p4), so a body-less `enum tag` still matches `int` or
 ///     `unsigned int` exactly like GCC;
@@ -397,20 +399,116 @@ pub fn ctypes_compatible(t1: &CType, t2: &CType) -> bool {
         (CType::Array(a, sa), CType::Array(b, sb)) => {
             ctypes_compatible(a, b) && (sa == sb || sa.is_none() || sb.is_none())
         }
-        (CType::Function(a), CType::Function(b)) => {
-            a.variadic == b.variadic
-                && a.params.len() == b.params.len()
-                && ctypes_compatible(&a.return_type, &b.return_type)
-                && a.params
-                    .iter()
-                    .zip(b.params.iter())
-                    .all(|((x, _), (y, _))| ctypes_compatible(x, y))
-        }
+        (CType::Function(a), CType::Function(b)) => function_types_compatible(a, b),
         (CType::Enum(e), other) | (other, CType::Enum(e)) if other.is_integer() => {
             &e.compatible_ctype() == other
         }
         _ => t1 == t2,
     }
+}
+
+/// Type resulting from the default argument promotions (C 6.5.2.2p6).
+fn default_argument_promotion(ty: &CType) -> CType {
+    match ty {
+        CType::Float => CType::Double,
+        other => other.integer_promoted(),
+    }
+}
+
+/// Function-type compatibility (C 6.7.6.3p15). An unprototyped function type
+/// is compatible with a prototype only when that prototype is non-variadic
+/// and every parameter type is unchanged by the default argument promotions.
+/// The `params` stored on an unprototyped K&R definition describe its body,
+/// not its visible function type, so they are intentionally ignored here.
+fn function_types_compatible(a: &FunctionType, b: &FunctionType) -> bool {
+    if !ctypes_compatible(&a.return_type, &b.return_type) {
+        return false;
+    }
+
+    match (a.has_prototype, b.has_prototype) {
+        (true, true) => {
+            a.variadic == b.variadic
+                && a.params.len() == b.params.len()
+                && a.params
+                    .iter()
+                    .zip(&b.params)
+                    .all(|((x, _), (y, _))| ctypes_compatible(x, y))
+        }
+        (false, false) => !a.variadic && !b.variadic,
+        (true, false) => {
+            !a.variadic
+                && a.params
+                    .iter()
+                    .all(|(param, _)| ctypes_compatible(param, &default_argument_promotion(param)))
+        }
+        (false, true) => {
+            !b.variadic
+                && b.params
+                    .iter()
+                    .all(|(param, _)| ctypes_compatible(param, &default_argument_promotion(param)))
+        }
+    }
+}
+
+/// Build the composite type of two compatible types for a conditional
+/// expression. Unlike compatibility, this must retain information contributed
+/// by either operand: in particular, a prototype is the composite of a
+/// compatible prototype and an unprototyped function type.
+fn composite_compatible_type(a: &CType, b: &CType) -> Option<CType> {
+    if !ctypes_compatible(a, b) {
+        return None;
+    }
+
+    match (a, b) {
+        (CType::Pointer(a_inner, a_space), CType::Pointer(b_inner, _)) => Some(CType::Pointer(
+            Box::new(composite_compatible_type(a_inner, b_inner)?),
+            *a_space,
+        )),
+        (CType::Array(a_elem, a_len), CType::Array(b_elem, b_len)) => Some(CType::Array(
+            Box::new(composite_compatible_type(a_elem, b_elem)?),
+            a_len.or(*b_len),
+        )),
+        (CType::Function(a_fn), CType::Function(b_fn)) => Some(CType::Function(Box::new(
+            composite_function_type(a_fn, b_fn)?,
+        ))),
+        _ => Some(a.clone()),
+    }
+}
+
+fn composite_function_type(a: &FunctionType, b: &FunctionType) -> Option<FunctionType> {
+    if !function_types_compatible(a, b) {
+        return None;
+    }
+
+    let return_type = composite_compatible_type(&a.return_type, &b.return_type)?;
+    let (params, variadic, has_prototype) = match (a.has_prototype, b.has_prototype) {
+        (true, true) => {
+            let params = a
+                .params
+                .iter()
+                .zip(&b.params)
+                .map(|((a_ty, a_name), (b_ty, b_name))| {
+                    Some((
+                        composite_compatible_type(a_ty, b_ty)?,
+                        a_name.clone().or_else(|| b_name.clone()),
+                    ))
+                })
+                .collect::<Option<Vec<_>>>()?;
+            (params, a.variadic, true)
+        }
+        (true, false) => (a.params.clone(), a.variadic, true),
+        (false, true) => (b.params.clone(), b.variadic, true),
+        // Parameter names/types on an unprototyped K&R definition describe
+        // its body, not the composite function type.
+        (false, false) => (Vec::new(), false, false),
+    };
+
+    Some(FunctionType {
+        return_type,
+        params,
+        variadic,
+        has_prototype,
+    })
 }
 
 /// Represents C types in the compiler.
@@ -732,6 +830,13 @@ pub struct FunctionType {
     pub return_type: CType,
     pub params: Vec<(CType, Option<String>)>,
     pub variadic: bool,
+    /// Whether this type has a prototype. An empty parameter vector alone is
+    /// insufficient: `f()` is unprototyped before C23 but means zero parameters
+    /// in C23, while `f(void)` is a zero-parameter prototype in every dialect.
+    /// For K&R definitions, body parameters live in `FunctionInfo::params`; the
+    /// callable `FunctionType` remains unprototyped unless an earlier prototype
+    /// is visible.
+    pub has_prototype: bool,
 }
 
 /// StructField describes a single field in a struct or union declaration.
@@ -2108,6 +2213,9 @@ impl std::fmt::Display for CType {
                         }
                         write!(f, "{}", param_ty)?;
                     }
+                    if ft.params.is_empty() && ft.has_prototype && !ft.variadic {
+                        write!(f, "void")?;
+                    }
                     if ft.variadic {
                         if !ft.params.is_empty() {
                             write!(f, ", ")?;
@@ -2133,6 +2241,9 @@ impl std::fmt::Display for CType {
                         write!(f, ", ")?;
                     }
                     write!(f, "{}", param_ty)?;
+                }
+                if ft.params.is_empty() && ft.has_prototype && !ft.variadic {
+                    write!(f, "void")?;
                 }
                 if ft.variadic {
                     if !ft.params.is_empty() {
@@ -3171,6 +3282,55 @@ impl CType {
     /// For a vector type, returns (element_type, logical lane count).
     /// Returns None for non-vector types. Ext-vector lane count is never
     /// inferred from padded object storage.
+    /// The vector type of the same kind and element type with `lanes` lanes
+    /// (a GNU `vector_size` vector or a Clang ext vector): the result type of
+    /// `__builtin_shufflevector`, which has one lane per index.
+    pub fn with_lane_count(&self, lanes: usize) -> Option<CType> {
+        match self {
+            CType::Vector(elem, _) => {
+                let bytes = elem.size().checked_mul(lanes)?;
+                (bytes > 0).then(|| CType::Vector(elem.clone(), bytes))
+            }
+            CType::ExtVector(elem, _) => ExtVectorLayout::new(elem, lanes)
+                .map(|layout| CType::ExtVector(elem.clone(), layout)),
+            _ => None,
+        }
+    }
+
+    /// `__builtin_shufflevector`'s result for `lanes` indices, or `None` for
+    /// an invalid count. GNU vectors need a power of two (GCC 16.2; a
+    /// `vector_size` type has no other shape). Clang ext vectors take any
+    /// count, as in Clang: three indices on a `float4` give a `float3`.
+    pub fn shufflevector_result(&self, lanes: usize) -> Option<CType> {
+        match self {
+            CType::Vector(..) if !lanes.is_power_of_two() => None,
+            _ if lanes == 0 => None,
+            _ => self.with_lane_count(lanes),
+        }
+    }
+
+    /// Result type of a call to GCC's vector shuffle builtins, given the type
+    /// of the first argument and the argument count: `__builtin_shuffle`
+    /// returns the first vector's type, `__builtin_shufflevector` that element
+    /// type with one lane per index. An invalid index count keeps the first
+    /// vector's type, so the lowering's diagnostic for it
+    /// is the one reported. Sema and the lowerer (which types `typeof`
+    /// operands) both use this, so the two cannot disagree.
+    pub fn shuffle_builtin_result(name: &str, first: &CType, args: usize) -> Option<CType> {
+        if !first.is_vector() {
+            return None;
+        }
+        match name {
+            "__builtin_shuffle" => Some(first.clone()),
+            "__builtin_shufflevector" => Some(
+                args.checked_sub(2)
+                    .and_then(|lanes| first.shufflevector_result(lanes))
+                    .unwrap_or_else(|| first.clone()),
+            ),
+            _ => None,
+        }
+    }
+
     pub fn vector_info(&self) -> Option<(&CType, usize)> {
         match self {
             CType::Vector(elem, total_size) => {
@@ -3497,15 +3657,36 @@ impl CType {
             (CType::Array(a, la), CType::Array(b, lb)) => {
                 (la.is_none() || lb.is_none() || la == lb) && a.generic_association_matches(b)
             }
-            // Parameter names are not part of the type.
+            // Parameter names are not part of the type. A prototype and an
+            // unprototyped type use the same default-promotion compatibility
+            // rule as declarations (C 6.7.6.3p15).
             (CType::Function(a), CType::Function(b)) => {
-                a.variadic == b.variadic
-                    && a.params.len() == b.params.len()
-                    && a.return_type.generic_association_matches(&b.return_type)
-                    && a.params
-                        .iter()
-                        .zip(&b.params)
-                        .all(|((pa, _), (pb, _))| pa.generic_association_matches(pb))
+                let params_compatible = match (a.has_prototype, b.has_prototype) {
+                    (true, true) => {
+                        a.variadic == b.variadic
+                            && a.params.len() == b.params.len()
+                            && a.params
+                                .iter()
+                                .zip(&b.params)
+                                .all(|((pa, _), (pb, _))| pa.generic_association_matches(pb))
+                    }
+                    (false, false) => !a.variadic && !b.variadic,
+                    (true, false) => {
+                        !a.variadic
+                            && a.params.iter().all(|(param, _)| {
+                                param
+                                    .generic_association_matches(&default_argument_promotion(param))
+                            })
+                    }
+                    (false, true) => {
+                        !b.variadic
+                            && b.params.iter().all(|(param, _)| {
+                                param
+                                    .generic_association_matches(&default_argument_promotion(param))
+                            })
+                    }
+                };
+                params_compatible && a.return_type.generic_association_matches(&b.return_type)
             }
             _ => self == assoc,
         }
@@ -3544,6 +3725,15 @@ impl CType {
                     if e_is_void && !t_is_void {
                         // then=T*, else=void*: if else is NPC, result is T*; else void*
                         return if else_is_npc { Some(t) } else { Some(e) };
+                    }
+                    // Preserve the composite type contributed by either
+                    // compatible pointer operand. In particular, when one
+                    // function pointer has a prototype and the other is
+                    // unprototyped, the composite function type has that
+                    // prototype; choosing the then-arm alone can incorrectly
+                    // allow extra call arguments.
+                    if let Some(composite) = composite_compatible_type(&t, &e) {
+                        return Some(composite);
                     }
                     // Pointers to incompatible types: GCC diagnoses the
                     // mismatch (an error since GCC 14, a warning under
@@ -4387,7 +4577,7 @@ mod ext_vector_selector_tests {
 
 #[cfg(test)]
 mod conditional_type_tests {
-    use super::{AddressSpace, CType};
+    use super::{AddressSpace, CType, FunctionType};
 
     fn ptr(ct: CType) -> CType {
         CType::Pointer(Box::new(ct), AddressSpace::Default)
@@ -4466,6 +4656,50 @@ mod conditional_type_tests {
             Some(&CType::Int)
         ));
         assert!(!CType::conditional_arm_npc_matters(None, Some(&int_ptr)));
+    }
+
+    #[test]
+    fn function_pointer_composite_keeps_prototype_from_either_arm() {
+        let unprototyped = CType::Function(Box::new(FunctionType {
+            return_type: CType::Int,
+            // Body parameters on an unprototyped K&R definition are not a
+            // prototype and do not constrain calls through its function type.
+            params: vec![(CType::Int, Some("body_param".into()))],
+            variadic: false,
+            has_prototype: false,
+        }));
+        let prototype = CType::Function(Box::new(FunctionType {
+            return_type: CType::Int,
+            params: Vec::new(),
+            variadic: false,
+            has_prototype: true,
+        }));
+        let (unprototyped, prototype) = (ptr(unprototyped), ptr(prototype));
+
+        for (then_ty, else_ty) in [
+            (unprototyped.clone(), prototype.clone()),
+            (prototype.clone(), unprototyped.clone()),
+        ] {
+            assert_eq!(
+                CType::conditional_composite_type(Some(then_ty), Some(else_ty), false, false),
+                Some(prototype.clone())
+            );
+        }
+    }
+
+    #[test]
+    fn compatible_pointer_to_array_composite_keeps_known_bound() {
+        let complete = ptr(CType::Array(Box::new(CType::Int), Some(4)));
+        let incomplete = ptr(CType::Array(Box::new(CType::Int), None));
+        assert_eq!(
+            CType::conditional_composite_type(
+                Some(incomplete),
+                Some(complete.clone()),
+                false,
+                false
+            ),
+            Some(complete)
+        );
     }
 
     #[test]

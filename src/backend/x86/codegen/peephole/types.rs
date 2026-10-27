@@ -38,8 +38,8 @@ pub(super) const RBP_OFFSET_NONE: i32 = i32::MIN;
 /// Compact classification of a single assembly line.
 /// Stored in a parallel array alongside the raw text, so hot loops
 /// can check integer fields instead of re-parsing strings.
-#[derive(Clone, Copy, Hash)]
-#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+#[cfg_attr(test, derive(Debug))]
 pub(super) struct LineInfo {
     pub(super) kind: LineKind,
     /// Pre-parsed extension classification for redundant extension elimination.
@@ -179,6 +179,8 @@ pub(super) enum ExtKind {
     ProducerMovzwqToRax,
     /// Producer that writes to %rax with movsbq
     ProducerMovsbqToRax,
+    /// Producer that writes to %rax with movswq
+    ProducerMovswqToRax,
     /// Producer that writes to %rax with movslq
     ProducerMovslqToRax,
     /// Producer: movq $const, %rax
@@ -940,6 +942,9 @@ pub(super) fn classify_mov_ext(s: &str, sb: &[u8]) -> ExtKind {
     }
     if s.starts_with("movsbq ") && s.ends_with("%rax") {
         return ExtKind::ProducerMovsbqToRax;
+    }
+    if s.starts_with("movswq ") && s.ends_with("%rax") {
+        return ExtKind::ProducerMovswqToRax;
     }
 
     // Producers: movl ... %eax

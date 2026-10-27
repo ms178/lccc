@@ -86,6 +86,21 @@ class ConversionHeaders(unittest.TestCase):
                         self.assertEqual(header.count(signature), 1)
                         self.assertEqual(header.count(f'int {private}({ty}, {ty});'), 1)
 
+    def test_integer_ptest256_is_avx_and_distinct_from_vtest(self):
+        header = (ROOT / 'include/lcccsimd.h').read_text()
+        for flag in ('z', 'c', 'nzc'):
+            public = f'_mm256_test{flag}_si256'
+            private = f'__lccc_avx_test{flag}si256'
+            signature = (
+                'static __inline__ int __attribute__((__always_inline__, '
+                '__artificial__, __target__("avx")))\n'
+                f'{public}(__m256i __a, __m256i __b)\n'
+                f'{{ return {private}(__a, __b); }}'
+            )
+            with self.subTest(public=public):
+                self.assertEqual(header.count(signature), 1)
+                self.assertEqual(header.count(f'int {private}(__m256i, __m256i);'), 1)
+
 
 class IntrinsicHarness(unittest.TestCase):
     @classmethod

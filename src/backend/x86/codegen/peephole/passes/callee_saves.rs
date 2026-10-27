@@ -330,35 +330,35 @@ pub(super) fn eliminate_unused_callee_saves(store: &mut LineStore, infos: &mut [
 
 /// Frame-pointer-omitted variant of [`eliminate_unused_callee_saves`].
 ///
-/// Shape (as emitted for `-O2` leaves):
+/// Prologue: `pushq <callee-saved>…` right after `.cfi_startproc` (each
+/// optionally followed by its `.cfi_def_cfa_offset` / `.cfi_offset`), then
+/// optionally `subq $N, %rsp`; every epilogue mirrors it (`addq $N, %rsp`,
+/// the pops in reverse push order). A pushed register the body never
+/// references costs a push and a pop on every call (the RA assigned it,
+/// later passes retired every use: chacha20_core, glibc_memcmp_bytes and
+/// zstd_count's `main` carried such saves).
 ///
-/// ```text
-/// f:
-/// .cfi_startproc
-///     pushq %rbx
-///     pushq %r12
-///     pushq %r13            <- never referenced in the body
-///     .cfi_def_cfa_offset 32
-///     …
-///     popq %r13
-///     popq %r12
-///     popq %rbx
-///     ret
-/// .cfi_endproc
-/// ```
+/// Two exact strategies:
 ///
-/// Soundness gates (all must hold, otherwise the function is left alone):
+/// * **Frame-preserving** (a prologue `subq $N, %rsp` exists): drop the
+///   dead pushes and pops and grow the `subq` and every epilogue `addq` by
+///   `8·k`. The frame total is unchanged, so the post-prologue `%rsp` is
+///   identical: every `%rsp`-relative slot and incoming-argument offset,
+///   aligned vector spills and call-site alignment stay valid, and calls are
+///   fine. The grown frame stays below 4096 bytes: frames of a page or more
+///   are probed under stack-clash protection, which a plain `subq` is not.
+/// * **Shrinking** (no `subq`): drop the pushes outright; `%rsp` moves by
+///   `8·k`, so only call-free bodies with no `%rsp`-relative data qualify.
 ///
-/// * no `call` in the body — a removed push changes the 16-byte alignment of
-///   `%rsp` at call sites;
-/// * no `and… %rsp` realignment and no `xmm`/`ymm` operand together with an
-///   `(%rsp` memory operand — aligned spills would move by 8;
-/// * exactly one `.cfi_def_cfa_offset` in the function (the prologue's); it is
-///   rewritten to `old − 8·eliminated` so unwind info stays exact;
-/// * every restore is a `popq` of the same register on an epilogue path.
-///
-/// The kernel corpus `isort` saved `%r13` without a single body use after
-/// the RA's leaf policy moved its loop state into caller-saved registers.
+/// CFI stays exact. `.cfi_def_cfa_offset 8+8m` (the first `m` pushes done)
+/// becomes `8+8·(m − dead among them)`; offsets at or above the frame total
+/// (body, after `ret`) are kept by the frame-preserving form and lowered by
+/// `8·k` by the shrinking form; a value between the push region and the
+/// total refuses. Surviving pushes' `.cfi_offset` slots are recomputed the
+/// same way, and the dead registers' own directives go with them. Refused:
+/// `.cfi_def_cfa`, `.cfi_def_cfa_register`, `.cfi_adjust_cfa_offset`, a
+/// `.cfi_offset` outside the push set, `%rsp` realignment, an epilogue that
+/// does not restore the full set in mirror order.
 pub(super) fn eliminate_unused_callee_saves_fpo(store: &mut LineStore, infos: &mut [LineInfo]) {
     let len = store.len();
     let mut i = 0;
@@ -367,154 +367,339 @@ pub(super) fn eliminate_unused_callee_saves_fpo(store: &mut LineStore, infos: &m
             i += 1;
             continue;
         }
-        // Function extent: up to and including `.cfi_endproc`.
-        let mut func_end = len;
-        for k in i + 1..len {
-            if !infos[k].is_nop() && infos[k].trimmed(store.get(k)).starts_with(".cfi_endproc") {
-                func_end = k;
-                break;
-            }
-        }
-        // Leading callee-saved pushes (directives interleaved are allowed).
-        // In FPO prologues (`omit_fp`), `%rbp` (reg 5) is also pushed as an
-        // ordinary callee-saved register when NOT immediately followed by
-        // `movq %rsp, %rbp`.
-        let mut saves: Vec<(RegId, usize)> = Vec::new();
-        let mut j = i + 1;
-        while j < func_end {
-            if super::helpers::steps_over_line(&infos[j], infos[j].trimmed(store.get(j))) {
-                j += 1;
-                continue;
-            }
-            match infos[j].kind {
-                LineKind::Push { reg } if is_callee_saved_reg(reg) => {
-                    saves.push((reg, j));
-                    j += 1;
-                }
-                LineKind::Push { reg: REG_RBP } => {
-                    let mut next = j + 1;
-                    while next < func_end
-                        && super::helpers::steps_over_line(
-                            &infos[next],
-                            infos[next].trimmed(store.get(next)),
-                        )
-                    {
-                        next += 1;
-                    }
-                    if next < func_end && infos[next].trimmed(store.get(next)) == "movq %rsp, %rbp"
-                    {
-                        break;
-                    }
-                    saves.push((5, j));
-                    j += 1;
-                }
-                _ => break,
-            }
-        }
-        if saves.is_empty() {
-            i = func_end.max(i + 1);
-            continue;
-        }
-        let body_start = j;
+        let func_end = (i + 1..len)
+            .find(|&k| {
+                !infos[k].is_nop() && infos[k].trimmed(store.get(k)).starts_with(".cfi_endproc")
+            })
+            .unwrap_or(len);
+        fpo_function(store, infos, i, func_end);
+        i = func_end.max(i + 1);
+    }
+}
 
-        // Gates.
-        let mut cfa_directive: Option<(usize, i64)> = None;
-        let mut safe = true;
-        for k in i + 1..func_end {
+/// Page size below which a plain `subq` frame needs no stack-clash probe.
+const FPO_UNPROBED_FRAME_LIMIT: i64 = 4096;
+
+/// `N` of `<prefix>N, %rsp` (e.g. `subq $`), non-negative.
+fn rsp_imm(line: &str, prefix: &str) -> Option<i64> {
+    line.strip_prefix(prefix)?
+        .strip_suffix(", %rsp")?
+        .parse::<i64>()
+        .ok()
+        .filter(|n| *n >= 0)
+}
+
+/// `(%register, offset)` of `.cfi_offset %reg, -O`.
+fn cfi_offset_operands(line: &str) -> Option<(&str, i64)> {
+    let (reg, off) = line.strip_prefix(".cfi_offset ")?.split_once(',')?;
+    Some((reg.trim(), off.trim().parse::<i64>().ok()?))
+}
+
+fn next_insn(store: &LineStore, infos: &[LineInfo], from: usize, end: usize) -> usize {
+    let mut k = from;
+    while k < end && super::helpers::steps_over_line(&infos[k], infos[k].trimmed(store.get(k))) {
+        k += 1;
+    }
+    k
+}
+
+fn prev_insn(store: &LineStore, infos: &[LineInfo], from: usize, start: usize) -> Option<usize> {
+    let mut k = from;
+    while k > start {
+        k -= 1;
+        if !super::helpers::steps_over_line(&infos[k], infos[k].trimmed(store.get(k))) {
+            return Some(k);
+        }
+    }
+    None
+}
+
+/// `true` when only pops and bookkeeping (CFI, nops) separate the pop at
+/// `k` from a `ret`/`jmp` (tail call). Unlike [`is_near_epilogue`] this
+/// steps over the per-pop `.cfi_def_cfa_offset` every epilogue carries.
+fn fpo_epilogue_pop(store: &LineStore, infos: &[LineInfo], k: usize, end: usize) -> bool {
+    let mut j = k + 1;
+    loop {
+        j = next_insn(store, infos, j, end);
+        if j >= end {
+            return false;
+        }
+        match infos[j].kind {
+            LineKind::Pop { .. } => j += 1,
+            LineKind::Ret | LineKind::Jmp | LineKind::JmpIndirect => return true,
+            _ => return false,
+        }
+    }
+}
+
+fn fpo_function(store: &mut LineStore, infos: &mut [LineInfo], start: usize, func_end: usize) {
+    // Leading callee-saved pushes. In FPO code `%rbp` is an ordinary
+    // callee-saved register unless `movq %rsp, %rbp` follows its push.
+    let mut saves: Vec<(RegId, usize)> = Vec::new();
+    let mut j = next_insn(store, infos, start + 1, func_end);
+    while j < func_end {
+        match infos[j].kind {
+            LineKind::Push { reg } if is_callee_saved_reg(reg) => saves.push((reg, j)),
+            LineKind::Push { reg: REG_RBP } => {
+                let next = next_insn(store, infos, j + 1, func_end);
+                if next < func_end && infos[next].trimmed(store.get(next)) == "movq %rsp, %rbp" {
+                    break;
+                }
+                saves.push((REG_RBP, j));
+            }
+            _ => break,
+        }
+        j = next_insn(store, infos, j + 1, func_end);
+    }
+    let p = saves.len();
+    if p == 0 {
+        return;
+    }
+    let body_start = j;
+    let subq = (body_start < func_end)
+        .then(|| rsp_imm(infos[body_start].trimmed(store.get(body_start)), "subq $"))
+        .flatten();
+
+    // Epilogue pops per register (collected for live registers too: the
+    // mirror check below needs every epilogue); a register is live if
+    // anything else in the body names it, including a non-epilogue pop.
+    let mut pops: Vec<Vec<usize>> = vec![Vec::new(); p];
+    let mut live = vec![false; p];
+    for (t, &(reg, _)) in saves.iter().enumerate() {
+        for k in body_start..func_end {
             if infos[k].is_nop() {
                 continue;
             }
-            let line = infos[k].trimmed(store.get(k));
-            match infos[k].kind {
-                LineKind::Call => {
-                    safe = false;
-                    break;
-                }
-                LineKind::Directive => {
-                    if let Some(v) = line.strip_prefix(".cfi_def_cfa_offset ") {
-                        match (cfa_directive, v.trim().parse::<i64>()) {
-                            (None, Ok(n)) => cfa_directive = Some((k, n)),
-                            _ => {
-                                safe = false;
-                                break;
-                            }
-                        }
-                    } else if line.starts_with(".cfi_offset")
-                        || line.starts_with(".cfi_def_cfa ")
-                        || line.starts_with(".cfi_def_cfa_register")
-                    {
-                        safe = false;
-                        break;
-                    }
-                    continue;
-                }
-                _ => {}
-            }
-            if line.contains("%rsp") {
-                let is_stack_adjust =
-                    matches!(infos[k].kind, LineKind::Push { .. } | LineKind::Pop { .. })
-                        || line.starts_with("subq $")
-                        || line.starts_with("addq $");
-                // Removing a leading push changes the runtime %rsp by 8 bytes,
-                // so EVERY %rsp-relative data reference in the body (va-register
-                // save areas, `leaq N(%rsp)` overflow pointers, spill slots,
-                // return-address reads) would point 8 bytes off. Only stack
-                // adjustments are offset-independent; anything else addressing
-                // the stack makes the elimination unsafe.
-                if !is_stack_adjust {
-                    safe = false;
-                    break;
-                }
-            }
-        }
-        if !safe {
-            i = func_end.max(i + 1);
-            continue;
-        }
-
-        let mut eliminated = 0usize;
-        for &(reg, save_idx) in &saves {
-            let mut pops: Vec<usize> = Vec::new();
-            let mut referenced = false;
-            for k in body_start..func_end {
-                if infos[k].is_nop() {
-                    continue;
-                }
-                if let LineKind::Pop { reg: pop_reg } = infos[k].kind {
-                    if pop_reg == reg {
-                        if is_near_epilogue(infos, k) {
-                            pops.push(k);
-                            continue;
-                        }
-                        referenced = true;
-                        break;
-                    }
-                }
-                if line_references_reg_fast(&infos[k], reg) {
-                    referenced = true;
-                    break;
-                }
-            }
-            if referenced || pops.is_empty() {
+            if matches!(infos[k].kind, LineKind::Pop { reg: r } if r == reg)
+                && fpo_epilogue_pop(store, infos, k, func_end)
+            {
+                pops[t].push(k);
                 continue;
             }
-            mark_nop(&mut infos[save_idx]);
-            for &p in &pops {
-                mark_nop(&mut infos[p]);
-            }
-            eliminated += 1;
+            live[t] |= line_references_reg_fast(&infos[k], reg);
         }
-        if eliminated > 0 {
-            if let Some((k, old)) = cfa_directive {
-                let new = old - 8 * eliminated as i64;
-                replace_line(
-                    store,
-                    &mut infos[k],
-                    k,
-                    format!("    .cfi_def_cfa_offset {}", new),
-                );
+    }
+    let dead: Vec<bool> = (0..p).map(|t| !live[t] && !pops[t].is_empty()).collect();
+    let k_dead = dead.iter().filter(|&&d| d).count();
+    if k_dead == 0 {
+        return;
+    }
+    // Every epilogue restores the full set in mirror order: from each pop
+    // of the last-pushed register, the next pops are the earlier pushes.
+    if pops.iter().any(|v| v.len() != pops[p - 1].len()) {
+        return;
+    }
+    for &first in &pops[p - 1] {
+        let mut k = first;
+        for t in (0..p).rev() {
+            if k >= func_end || !matches!(infos[k].kind, LineKind::Pop { reg } if reg == saves[t].0)
+            {
+                return;
             }
+            k = next_insn(store, infos, k + 1, func_end);
         }
-        i = func_end.max(i + 1);
+    }
+
+    // Body gates and the CFI directives to rewrite. A transient %rsp write
+    // (for example the SSE1 scalar XMM/GPR bridge) carries
+    // `.cfi_adjust_cfa_offset` when unwind tables are enabled, which this
+    // pass refuses below. Detect the instruction as well so compiling the
+    // same function with `-fno-asynchronous-unwind-tables` makes the same
+    // optimization decision instead of changing machine code with CFI.
+    let epilogue_addqs: Vec<usize> = pops[p - 1]
+        .iter()
+        .filter_map(|&first| prev_insn(store, infos, first, body_start))
+        .collect();
+    let mut has_call = false;
+    let mut rsp_data = false;
+    let mut dynamic_rsp_write = false;
+    let mut cfa_lines: Vec<(usize, i64)> = Vec::new();
+    let mut offset_lines: Vec<(usize, usize)> = Vec::new();
+    for k in start + 1..func_end {
+        if infos[k].is_nop() {
+            continue;
+        }
+        let line = infos[k].trimmed(store.get(k));
+        match infos[k].kind {
+            LineKind::Call => has_call = true,
+            LineKind::Directive => {
+                if let Some(v) = line.strip_prefix(".cfi_def_cfa_offset ") {
+                    let Ok(v) = v.trim().parse::<i64>() else {
+                        return;
+                    };
+                    cfa_lines.push((k, v));
+                } else if line.starts_with(".cfi_offset") {
+                    let Some((name, off)) = cfi_offset_operands(line) else {
+                        return;
+                    };
+                    let Some(t) = saves
+                        .iter()
+                        .position(|&(r, _)| REG_NAMES[0][r as usize] == name)
+                    else {
+                        return;
+                    };
+                    if off != -(16 + 8 * t as i64) {
+                        return;
+                    }
+                    offset_lines.push((k, t));
+                } else if line.starts_with(".cfi_def_cfa")
+                    || line.starts_with(".cfi_adjust_cfa_offset")
+                {
+                    return;
+                }
+                continue;
+            }
+            _ => {}
+        }
+        let epilogue_pop = pops.iter().any(|indices| indices.contains(&k));
+        let writes_rsp = line.ends_with(", %rsp")
+            || line.ends_with(", %esp")
+            || matches!(infos[k].kind, LineKind::Push { .. } | LineKind::Pop { .. })
+            || matches!(line, "leave" | "leaveq");
+        let prologue_push = saves.iter().any(|&(_, push)| push == k);
+        let canonical_stack_adjust = prologue_push
+            || (k == body_start && line.starts_with("subq $"))
+            || (epilogue_addqs.contains(&k) && line.starts_with("addq $"))
+            || epilogue_pop;
+        dynamic_rsp_write |= writes_rsp && !canonical_stack_adjust;
+
+        if line.contains("%rsp") {
+            if line.starts_with("and") {
+                return;
+            }
+            let adjust = matches!(infos[k].kind, LineKind::Push { .. } | LineKind::Pop { .. })
+                || line.starts_with("subq $")
+                || line.starts_with("addq $");
+            rsp_data |= !adjust;
+        }
+    }
+    if dynamic_rsp_write {
+        return;
+    }
+
+    // Strategy and epilogue `addq` sites.
+    let push_top = 8 + 8 * p as i64;
+    let grow = 8 * k_dead as i64;
+    let mut addqs: Vec<usize> = Vec::new();
+    let (total, preserving) = match subq {
+        Some(n) => {
+            if n + grow >= FPO_UNPROBED_FRAME_LIMIT {
+                return;
+            }
+            for &first in &pops[p - 1] {
+                match prev_insn(store, infos, first, body_start) {
+                    Some(a) if rsp_imm(infos[a].trimmed(store.get(a)), "addq $") == Some(n) => {
+                        addqs.push(a)
+                    }
+                    _ => return,
+                }
+            }
+            (push_top + n, true)
+        }
+        None if !has_call && !rsp_data => (push_top, false),
+        None => return,
+    };
+    let dead_before = |m: usize| dead[..m.min(p)].iter().filter(|&&d| d).count() as i64;
+    let mut cfa_new: Vec<(usize, i64)> = Vec::with_capacity(cfa_lines.len());
+    for &(k, v) in &cfa_lines {
+        let new = if (8..=push_top).contains(&v) && v % 8 == 0 {
+            let m = ((v - 8) / 8) as usize;
+            8 + 8 * (m as i64 - dead_before(m))
+        } else if v >= total {
+            if preserving { v } else { v - grow }
+        } else {
+            return;
+        };
+        cfa_new.push((k, new));
+    }
+
+    // Commit: the dead saves, their restores and their `.cfi_offset`s.
+    // CFA lines are never dropped by position (a lone directive after the
+    // last push describes ALL pushes); every one is rewritten below and
+    // same-address duplicates are collapsed afterwards.
+    for t in (0..p).filter(|&t| dead[t]) {
+        mark_nop(&mut infos[saves[t].1]);
+        for &k in &pops[t] {
+            mark_nop(&mut infos[k]);
+        }
+    }
+    for &(k, t) in &offset_lines {
+        if dead[t] {
+            mark_nop(&mut infos[k]);
+        }
+    }
+    if let Some(n) = subq {
+        replace_line(
+            store,
+            &mut infos[body_start],
+            body_start,
+            format!("    subq ${}, %rsp", n + grow),
+        );
+        for &a in &addqs {
+            replace_line(
+                store,
+                &mut infos[a],
+                a,
+                format!("    addq ${}, %rsp", n + grow),
+            );
+        }
+    }
+    for (k, new) in cfa_new {
+        if !infos[k].is_nop() {
+            replace_line(
+                store,
+                &mut infos[k],
+                k,
+                format!("    .cfi_def_cfa_offset {new}"),
+            );
+        }
+    }
+    for (k, t) in offset_lines {
+        if !infos[k].is_nop() {
+            let slot = 16 + 8 * (t as i64 - dead_before(t));
+            let name = REG_NAMES[0][saves[t].0 as usize];
+            replace_line(
+                store,
+                &mut infos[k],
+                k,
+                format!("    .cfi_offset {name}, -{slot}"),
+            );
+        }
+    }
+    collapse_superseded_cfa(store, infos, start, func_end);
+}
+
+/// Drop `.cfi_def_cfa_offset` lines another one supersedes at the same
+/// address (only other `.cfi_*` lines between them), and a
+/// leading `8` that restates the x86-64 CIE's initial `rsp+8`.
+fn collapse_superseded_cfa(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+    start: usize,
+    end: usize,
+) {
+    let mut pending: Option<usize> = None;
+    let mut at_entry = true;
+    for k in start + 1..end {
+        if infos[k].is_nop() {
+            continue;
+        }
+        let line = infos[k].trimmed(store.get(k));
+        if let Some(v) = line.strip_prefix(".cfi_def_cfa_offset ") {
+            if let Some(prev) = pending.replace(k) {
+                mark_nop(&mut infos[prev]);
+            }
+            if at_entry && v.trim() == "8" {
+                mark_nop(&mut infos[k]);
+                pending = None;
+            }
+            continue;
+        }
+        // Only CFI bookkeeping is address-neutral: an alignment directive
+        // pads, so CFA lines on either side of it are distinct rows.
+        if !line.starts_with(".cfi_") {
+            pending = None;
+            at_entry = false;
+        }
     }
 }

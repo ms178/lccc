@@ -93,6 +93,74 @@ impl Lowerer {
         Some(Operand::Value(result))
     }
 
+    /// Map `floor(float)` to `floorf(float)` without changing the type of the
+    /// source expression. Every float is exactly representable as a double;
+    /// below 2^24 its integral result is in float's exact integer range, and
+    /// at or above 2^24 the input is already integral. Infinities, NaNs and
+    /// signed zero have the same operation at either width. The explicit
+    /// widening cast preserves the source expression's double type, after
+    /// which ordinary cast cleanup can cancel a surrounding float conversion.
+    ///
+    /// The explicit `__builtin_floor` spelling remains a library operation
+    /// even under `-fno-builtin`; for the plain spelling the caller has
+    /// already applied the command-line policy. In contrast, a
+    /// `-fno-builtin-floorf` withdrawal does NOT prohibit this replacement:
+    /// it is the enabled `floor` builtin whose contraction GCC and Clang
+    /// specify, not an independent assumption about a `floorf` call site.
+    fn try_lower_float_floor_builtin(&mut self, name: &str, args: &[Expr]) -> Option<Operand> {
+        let explicit_builtin = match name {
+            "floor" => false,
+            "__builtin_floor" => true,
+            _ => return None,
+        };
+        if args.len() != 1 {
+            return None;
+        }
+        // The explicit spelling `floor((double)x)` is the same widening when
+        // x is a float. Peel exactly that cast, never a general double
+        // argument (which could carry precision not representable as float).
+        let arg_expr = match &args[0] {
+            Expr::Cast(TypeSpecifier::Double, inner, ..)
+                if matches!(self.get_expr_ctype(inner), Some(CType::Float)) =>
+            {
+                inner.as_ref()
+            }
+            other => other,
+        };
+        if !matches!(self.get_expr_ctype(arg_expr), Some(CType::Float)) {
+            return None;
+        }
+
+        let arg = self.lower_expr_with_type(arg_expr, IrType::F32);
+        let narrowed = self.fresh_value();
+        self.emit(Instruction::Call {
+            func: "floorf".to_string(),
+            info: CallInfo {
+                dest: Some(narrowed),
+                args: vec![arg],
+                arg_types: vec![IrType::F32],
+                return_type: IrType::F32,
+                num_fixed_args: 1,
+                struct_arg_sizes: vec![None],
+                struct_arg_aligns: vec![None],
+                struct_arg_classes: vec![Vec::new()],
+                struct_arg_riscv_float_classes: vec![None],
+                struct_arg_is_f128_sse: vec![false],
+                assume_library: explicit_builtin,
+                ..CallInfo::default()
+            },
+        });
+
+        let widened = self.fresh_value();
+        self.emit(Instruction::Cast {
+            dest: widened,
+            src: Operand::Value(narrowed),
+            from_ty: IrType::F32,
+            to_ty: IrType::F64,
+        });
+        Some(Operand::Value(widened))
+    }
+
     /// Try to lower a __builtin_* call. Returns Some(result) if handled.
     pub(super) fn try_lower_builtin_call(&mut self, name: &str, args: &[Expr]) -> Option<Operand> {
         // -ffreestanding/-fno-builtin disables hosted-library aliases such as
@@ -117,6 +185,12 @@ impl Lowerer {
         // 20021127-1 defines `llabs` to abort() and requires the builtin.
         // This must run BEFORE the is_defined override below.
         if let Some(result) = self.try_lower_abs_builtin(name, args) {
+            return Some(result);
+        }
+
+        // Like abs/llabs, exact float narrowing precedes a later user
+        // definition. See the helper for the proof and withdrawal policy.
+        if let Some(result) = self.try_lower_float_floor_builtin(name, args) {
             return Some(result);
         }
 
@@ -679,8 +753,9 @@ impl Lowerer {
         Some(Operand::Value(result))
     }
 
-    /// VTEST returns scalar flags from native vector operands. In particular,
-    /// it must not be lowered to PTEST, which observes every payload bit.
+    /// VTEST/VPTEST return scalar flags from native vector operands. VTEST
+    /// must never be lowered to PTEST (which observes every payload bit);
+    /// the element kind in `AvxTest` keeps the two distinct.
     fn lower_avx_test(
         &mut self,
         test: crate::common::avx_test::AvxTest,
@@ -706,24 +781,32 @@ impl Lowerer {
             );
         }
         if name.starts_with("__builtin_ia32_") {
-            let expected = if test.double {
-                CType::Double
-            } else {
-                CType::Float
+            use crate::common::avx_test::AvxTestElem;
+            // GCC 16.2 prototypes: v8sf/v4sf, v4df/v2df, and v4di for PTEST
+            // (element signedness converts implicitly, as in GCC).
+            let element_ok = |element: &CType| match test.elem {
+                AvxTestElem::Ps => *element == CType::Float,
+                AvxTestElem::Pd => *element == CType::Double,
+                AvxTestElem::Int => element.is_integer() && element.size() == 8,
             };
             let valid = args.iter().all(|arg| {
                 self.get_expr_ctype(arg).is_some_and(|ctype| {
                     ctype.vector_info().is_some_and(|(element, lanes)| {
-                        *element == expected && lanes * element.size() == test.width()
+                        element_ok(element) && lanes * element.size() == test.width()
                     })
                 })
             });
             if !valid {
                 return self.reject_builtin_call(
                     format!(
-                        "'{}' requires two {}-bit floating-point vectors",
+                        "'{}' requires two {}-bit {} vectors",
                         name,
-                        test.width() * 8
+                        test.width() * 8,
+                        if test.elem == AvxTestElem::Int {
+                            "64-bit integer"
+                        } else {
+                            "floating-point"
+                        }
                     ),
                     args,
                     test.width(),
@@ -1186,6 +1269,7 @@ impl Lowerer {
             }
             BuiltinIntrinsic::X86Bzhi32 => self.lower_bzhi_builtin(intrinsic, false, name, args),
             BuiltinIntrinsic::X86Bzhi64 => self.lower_bzhi_builtin(intrinsic, true, name, args),
+            BuiltinIntrinsic::X86Movntq => self.lower_movntq_builtin(name, args),
             // X86 SSE/AES/CRC intrinsics - delegated to lower_x86_intrinsic
             BuiltinIntrinsic::X86Lfence
             | BuiltinIntrinsic::X86Mfence
@@ -1199,7 +1283,9 @@ impl Lowerer {
             | BuiltinIntrinsic::X86Movnti64
             | BuiltinIntrinsic::X86Movntdq
             | BuiltinIntrinsic::X86Movntpd
+            | BuiltinIntrinsic::X86Movntps
             | BuiltinIntrinsic::X86Loaddqu
+            | BuiltinIntrinsic::X86LoadPs
             | BuiltinIntrinsic::X86Pcmpeqb128
             | BuiltinIntrinsic::X86Pcmpeqd128
             | BuiltinIntrinsic::X86Psubusb128
@@ -1263,6 +1349,7 @@ impl Lowerer {
             | BuiltinIntrinsic::X86Pshuflw128
             | BuiltinIntrinsic::X86Pshufhw128
             | BuiltinIntrinsic::X86Storedqu
+            | BuiltinIntrinsic::X86StorePs
             | BuiltinIntrinsic::X86Storeldi128
             | BuiltinIntrinsic::X86Pmovmskb128
             | BuiltinIntrinsic::X86Pextrw128
@@ -1488,8 +1575,8 @@ impl Lowerer {
                 self.check_x86_intrinsic_feature(intrinsic, name, args);
                 self.lower_x86_intrinsic(intrinsic, name, args)
             }
-            // __builtin_shufflevector(v1, v2, i0, i1, i2, i3): 4-lane 32-bit
-            // lane gather with constant indices (Clang/GCC generic shuffle).
+            // __builtin_shufflevector(v1, v2, idx...): constant-index lane
+            // gather, one result lane per index (Clang/GCC generic shuffle).
             BuiltinIntrinsic::ShuffleVector => self.lower_shufflevector(args),
             // GCC vector extension: __builtin_shuffle(v, mask) |
             // __builtin_shuffle(v1, v2, mask). result[i] comes from
@@ -2190,12 +2277,6 @@ impl Lowerer {
         Operand::Value(packed)
     }
 
-    /// __builtin_shufflevector(v1, v2, i0, i1, i2, i3) for 4-lane 32-bit
-    /// vectors: gather each result lane from the concatenation v1||v2
-    /// (idx 0-3 = v1 lane idx, 4-7 = v2 lane idx-4; negative = don\'t-care,
-    /// we pick v1 lane 0). Indices must be integer constant expressions —
-    /// matching the C builtin\'s contract. Scalar 4x32 gather through slots:
-    /// correctness-first (a later peephole can fuse the shufps pattern).
     /// Lower __builtin_shuffle (GCC vector extension).
     ///
     /// result[i] = concat(v1, v2)[mask[i] mod N] where N is the element count
@@ -2495,11 +2576,14 @@ impl Lowerer {
                 seg_override: AddressSpace::Default,
             });
         }
-        // Return convention (must match lower_vector_assign /
-        // rhs_is_small_vector_call): vectors <= 8 bytes travel as packed
-        // register values (the consumer spills them back to memory);
-        // vectors > 8 bytes travel by memory — the result alloca pointer.
-        if total_bytes <= 8 {
+        // Return convention (must match `call_result_is_packed`, which every
+        // consumer asks): on x86-64, vectors <= 8 bytes travel as packed
+        // register values (the consumer spills them back to memory); larger
+        // vectors, and every vector on a 32-bit target, travel by memory as
+        // the result alloca's address. Packing on i686 too handed consumers
+        // the lane bits as an address: `T s = __builtin_shuffle(v, m);`
+        // segfaulted for every vector of at most 8 bytes.
+        if total_bytes <= 8 && !target_is_32bit() {
             let packed_ty = Self::packed_store_type(total_bytes);
             let packed = self.fresh_value();
             self.emit(Instruction::Load {
@@ -2515,44 +2599,63 @@ impl Lowerer {
         }
     }
 
+    /// `__builtin_shufflevector(v1, v2, idx...)`: result lane i is lane
+    /// `idx[i]` of the concatenation v1||v2. The 4 x 32-bit to 4-lane shape
+    /// keeps its PSHUFD / typed-home path; every other shape uses
+    /// `lower_shufflevector_gather`.
     fn lower_shufflevector(&mut self, args: &[Expr]) -> Option<Operand> {
-        if args.len() != 6 {
+        // GCC 16.2 contract (probed): two vectors with the same element type
+        // (their lane counts may differ; Clang demands one type), then one
+        // integer constant index per result lane into their concatenation, -1
+        // meaning "any lane". The index count must be a power of two for GNU
+        // vectors; Clang ext vectors take any count (`shufflevector_result`).
+        if args.len() < 3 {
             return self.reject_builtin_call(
-                "wrong number of arguments to '__builtin_shufflevector' (this implementation supports two vectors and four indices)".to_string(), args, 16,
+                "wrong number of arguments to '__builtin_shufflevector'".to_string(),
+                args,
+                16,
             );
         }
-        for arg in &args[..2] {
-            if let Some(ct) = self.get_expr_ctype(arg) {
-                if !ct
-                    .vector_info()
-                    .is_some_and(|(element, lanes)| element.size() == 4 && lanes == 4)
-                {
-                    return self.reject_builtin_call(
-                        "'__builtin_shufflevector' requires four-lane 32-bit vector operands"
-                            .to_string(),
-                        args,
-                        16,
-                    );
-                }
-            }
+        let (Some(first), Some(second)) = (
+            self.get_expr_ctype(&args[0]).filter(CType::is_vector),
+            self.get_expr_ctype(&args[1]).filter(CType::is_vector),
+        ) else {
+            return self.reject_builtin_call(
+                "'__builtin_shufflevector' arguments must be vectors".to_string(),
+                args,
+                16,
+            );
+        };
+        let (Some((first_elem, first_lanes)), Some((second_elem, second_lanes))) =
+            (first.vector_info(), second.vector_info())
+        else {
+            return self.reject_builtin_call(
+                "'__builtin_shufflevector' arguments must be vectors".to_string(),
+                args,
+                16,
+            );
+        };
+        if first_elem != second_elem {
+            return self.reject_builtin_call(
+                "'__builtin_shufflevector' argument vectors must have the same element type"
+                    .to_string(),
+                args,
+                16,
+            );
         }
-        if let (Some(first), Some(second)) =
-            (self.get_expr_ctype(&args[0]), self.get_expr_ctype(&args[1]))
-        {
-            if let (Some((a, _)), Some((b, _))) = (first.vector_info(), second.vector_info()) {
-                if a != b {
-                    return self.reject_builtin_call(
-                        "'__builtin_shufflevector' requires matching vector element types"
-                            .to_string(),
-                        args,
-                        16,
-                    );
-                }
-            }
-        }
-        let mut indices = [0i64; 4];
-        for (lane, index) in indices.iter_mut().enumerate() {
-            *index = match self.eval_const_expr(&args[2 + lane]) {
+        let result_lanes = args.len() - 2;
+        let Some(result_ct) = first.shufflevector_result(result_lanes) else {
+            return self.reject_builtin_call(
+                "'__builtin_shufflevector' must specify a result with a power of two number of elements"
+                    .to_string(),
+                args,
+                16,
+            );
+        };
+        let total_lanes = (first_lanes + second_lanes) as i64;
+        let mut indices = Vec::with_capacity(result_lanes);
+        for (lane, arg) in args[2..].iter().enumerate() {
+            let index = match self.eval_const_expr(arg) {
                 Some(IrConst::I64(v)) => v,
                 Some(IrConst::I32(v)) => v as i64,
                 Some(IrConst::I8(v)) => v as i64,
@@ -2561,20 +2664,29 @@ impl Lowerer {
                     format!("argument {} of '__builtin_shufflevector' must be an integer constant expression", 3 + lane), args, 16,
                 ),
             };
-            if !(-1..8).contains(index) {
+            if !(-1..total_lanes).contains(&index) {
                 return self.reject_builtin_call(
-                    format!(
-                        "invalid element index '{}' to '__builtin_shufflevector'",
-                        index
-                    ),
+                    format!("invalid element index '{index}' to '__builtin_shufflevector'"),
                     args,
                     16,
                 );
             }
             // -1 is an unspecified lane. Choose lane zero of the first input.
-            if *index == -1 {
-                *index = 0;
-            }
+            indices.push(index.max(0));
+        }
+        let four_by_32 = |ct: &CType| {
+            ct.size() == 16
+                && ct
+                    .vector_info()
+                    .is_some_and(|(e, lanes)| e.size() == 4 && lanes == 4)
+        };
+        if !(four_by_32(&first) && four_by_32(&second) && result_lanes == 4) {
+            return Some(self.lower_shufflevector_gather(
+                args,
+                (&first, &second),
+                &result_ct,
+                &indices,
+            ));
         }
         // Evaluate both operands once even if only one supplies output lanes.
         let v1 = self.vec128_arg_ptr(&args[0]);
@@ -2685,6 +2797,65 @@ impl Lowerer {
         Some(Operand::Value(result))
     }
 
+    /// `__builtin_shufflevector` for every shape but 4 x 32-bit to 4 lanes:
+    /// copy each result lane from the selected input lane, through the lane
+    /// helpers that know padded ext-vector strides, x87 lanes and bit-packed
+    /// bool lanes. Both operands are evaluated once, left to right. The
+    /// result follows `__builtin_shuffle`'s convention (`call_result_is_packed`):
+    /// at most 8 bytes on x86-64 is the packed register value, anything else
+    /// is the result object's address.
+    fn lower_shufflevector_gather(
+        &mut self,
+        args: &[Expr],
+        (first, second): (&CType, &CType),
+        result_ct: &CType,
+        indices: &[i64],
+    ) -> Operand {
+        let first_lanes = first.vector_info().map_or(0, |(_, lanes)| lanes);
+        let elem_ir = result_ct
+            .vector_info()
+            .map_or(IrType::I32, |(elem, _)| IrType::from_ctype(elem));
+        let v1 = self.vector_operand_ptr(&args[0], first);
+        let v2 = self.vector_operand_ptr(&args[1], second);
+        let result = self.emit_entry_alloca(
+            IrType::Ptr,
+            result_ct.size(),
+            self.ctype_align(result_ct),
+            false,
+        );
+        for (lane, &index) in indices.iter().enumerate() {
+            let index = index as usize;
+            let (src, src_ct, src_lane) = if index < first_lanes {
+                (v1, first, index)
+            } else {
+                (v2, second, index - first_lanes)
+            };
+            let value = self.load_vector_lane(src, src_ct, src_lane, AddressSpace::Default, false);
+            self.store_vector_lane(
+                result,
+                result_ct,
+                lane,
+                value,
+                elem_ir,
+                AddressSpace::Default,
+                false,
+            );
+        }
+        let bytes = result_ct.size();
+        if bytes <= 8 && !target_is_32bit() {
+            let packed = self.fresh_value();
+            self.emit(Instruction::Load {
+                volatile: false,
+                dest: packed,
+                ptr: result,
+                ty: Self::packed_store_type(bytes),
+                seg_override: AddressSpace::Default,
+            });
+            return Operand::Value(packed);
+        }
+        Operand::Value(result)
+    }
+
     /// Lower an X86 SSE/AES/CRC intrinsic to IR.
     ///
     /// Classifies the intrinsic into one of four emission patterns:
@@ -2763,34 +2934,73 @@ impl Lowerer {
         if !matches!(crate::common::types::target_elf_machine(), 3 | 62) {
             return;
         }
-        let mut permitted = crate::common::x86_features::effective().contains(requirement.feature);
+        if self.x86_feature_permitted(requirement.feature) {
+            return;
+        }
+        self.diagnostics.borrow_mut().error(
+            format!(
+                "`{}` requires the {} instruction-set extension ({}){}, which the requested target does not have",
+                name,
+                requirement.feature.name(),
+                requirement.flag,
+                requirement.also.unwrap_or("")
+            ),
+            span,
+        );
+    }
+
+    /// Whether the function being lowered may use `feature`: the TU's
+    /// effective ISA, overridden by the function's own legacy-SSE..AVX2
+    /// `target(...)` requests (enabling a level grants it and everything
+    /// below; `no-X` revokes X and everything above).
+    fn x86_feature_permitted(&self, feature: crate::common::x86_features::X86Feature) -> bool {
+        use crate::common::x86_features::X86Feature as F;
+
+        let mut permitted = crate::common::x86_features::effective().contains(feature);
+        let avx512_requirement = matches!(
+            feature,
+            F::Avx512F
+                | F::Avx512Bw
+                | F::Avx512Dq
+                | F::Avx512Vl
+                | F::Avx512Vnni
+                | F::Avx512BitAlg
+                | F::Avx512Vpopcntdq
+                | F::Avx512Cd
+                | F::Avx512Ifma
+                | F::Avx512Vbmi
+                | F::Avx512Vbmi2
+                | F::Avx512Bf16
+                | F::Avx512Fp16
+                | F::Avx512Bmm
+                | F::Avx512Vp2intersect
+                | F::Avx512Er
+                | F::Avx512Pf
+        );
         // Legacy 128-bit extensions keep the same register/ABI class under a
         // function target attribute. Honor that local permission without leaking
         // it into another function or claiming per-function wider-vector support.
-        use crate::common::x86_features::X86Feature as F;
-        let needed = match requirement.feature {
+        let needed = match feature {
             F::Sse => Some(0),
             F::Sse2 => Some(1),
             F::Sse3 => Some(2),
-            F::Avx2 => Some(7),
-            F::Avx => Some(6),
             F::Ssse3 => Some(3),
             F::Sse41 => Some(4),
             F::Sse42 => Some(5),
+            F::Avx => Some(6),
+            F::Avx2 => Some(7),
             _ => None,
         };
         if let Some(function) = self.func_state.as_ref() {
             for request in &function.target_features {
-                let (enabled, feature) = request
+                let (enabled, requested_feature) = request
                     .strip_prefix("no-")
                     .map_or((true, request.as_str()), |f| (false, f));
-                // Exact target-feature grants also cover FMA and AVX-512
-                // subsets, which are independent features rather than rungs
-                // in the legacy SSE/AVX level ladder. An enabled AVX-512
-                // subset implies its F base; disabling one subset does not
-                // revoke the independent F capability.
+                // AVX-512 subsets imply F; several BW subsets also imply BW,
+                // and VP2INTERSECT implies DQ (matching GCC's target-feature
+                // semantics). Negative prerequisites revoke their dependents.
                 let avx512_feature = matches!(
-                    feature,
+                    requested_feature,
                     "avx512f"
                         | "avx512bw"
                         | "avx512dq"
@@ -2810,7 +3020,7 @@ impl Lowerer {
                         | "avx512bmm"
                 );
                 let avx512_bw_dependent = matches!(
-                    requirement.feature,
+                    feature,
                     F::Avx512Vbmi
                         | F::Avx512Vbmi2
                         | F::Avx512BitAlg
@@ -2818,43 +3028,43 @@ impl Lowerer {
                         | F::Avx512Fp16
                         | F::Avx512Bmm
                 );
-                if feature == "avx512f" {
-                    if avx512_feature {
+
+                if requested_feature == "avx512f" {
+                    if avx512_requirement {
                         permitted = enabled;
                     }
                     continue;
                 }
-                if !enabled && feature == "avx512bw" && avx512_bw_dependent {
+                if !enabled && requested_feature == "avx512bw" && avx512_bw_dependent {
                     permitted = false;
                     continue;
                 }
-                if feature == requirement.feature.name() {
+                if requested_feature == feature.name() {
                     permitted = enabled;
                     continue;
                 }
-                if enabled && requirement.feature == F::Avx512F && avx512_feature {
+                if enabled && feature == F::Avx512F && avx512_feature {
                     permitted = true;
                     continue;
                 }
                 if enabled
-                    && requirement.feature == F::Avx512Bw
+                    && feature == F::Avx512Bw
                     && matches!(
-                        feature,
+                        requested_feature,
                         "avx512vbmi" | "avx512vbmi2" | "avx512bitalg" | "avx512bf16" | "avx512fp16"
                     )
                 {
                     permitted = true;
                     continue;
                 }
-                if enabled && requirement.feature == F::Avx512Dq && feature == "avx512vp2intersect"
-                {
+                if enabled && feature == F::Avx512Dq && requested_feature == "avx512vp2intersect" {
                     permitted = true;
                     continue;
                 }
                 if !enabled
-                    && requirement.feature == F::Fma
+                    && feature == F::Fma
                     && matches!(
-                        feature,
+                        requested_feature,
                         "sse" | "sse2" | "sse3" | "ssse3" | "sse4.1" | "sse4.2" | "avx"
                     )
                 {
@@ -2864,7 +3074,7 @@ impl Lowerer {
                 let Some(needed) = needed else {
                     continue;
                 };
-                let level = match feature {
+                let level = match requested_feature {
                     "sse" => 0,
                     "sse2" => 1,
                     "sse3" => 2,
@@ -2883,19 +3093,74 @@ impl Lowerer {
                 }
             }
         }
-        if permitted {
-            return;
+        permitted
+    }
+
+    /// `_mm_stream_pi` / `__builtin_ia32_movntq`: GCC's SSE1 8-byte
+    /// non-temporal store (OPTION_MASK_ISA_SSE, VOID_FTYPE_PULONGLONG_ULONGLONG).
+    ///
+    /// The permission is SSE1, as in GCC. The instruction is MOVNTI from a
+    /// GPR, never MOVNTQ: lccc's MMX emulation already works on the 64-bit
+    /// image in a GPR. MOVNTQ would need an MMX register, which aliases the
+    /// x87 stack and leaves the tag word full until an EMMS that lccc's x87
+    /// code never issues. GCC 16.2 itself uses `movq %xmm0,%rax; movnti` at
+    /// -m64. MOVNTI is SSE2, so it is emitted only where the function may
+    /// use SSE2: one `movnti %r64` on x86-64, two `movnti %r32` on i686, as
+    /// Clang does. An SSE1-only function gets a plain 8-byte store. That
+    /// keeps the stored value exactly and drops only the cache hint, which
+    /// no SSE1-only GPR instruction can express.
+    fn lower_movntq_builtin(&mut self, name: &str, args: &[Expr]) -> Option<Operand> {
+        use crate::common::x86_features::X86Feature as F;
+        if !matches!(
+            self.target,
+            crate::backend::Target::X86_64 | crate::backend::Target::I686
+        ) {
+            return self.lower_x86_intrinsic(&BuiltinIntrinsic::X86Movntq, name, args);
         }
-        self.diagnostics.borrow_mut().error(
-            format!(
-                "`{}` requires the {} instruction-set extension ({}){}, which the requested target does not have",
-                name,
-                requirement.feature.name(),
-                requirement.flag,
-                requirement.also.unwrap_or("")
-            ),
-            span,
-        );
+        self.check_x86_intrinsic_feature(&BuiltinIntrinsic::X86Movntq, name, args);
+        let [ptr, value] = args else {
+            return self.reject_builtin_call(
+                format!("'{name}' takes exactly two arguments, {} given", args.len()),
+                args,
+                8,
+            );
+        };
+        let ptr = self.lower_typed_x86_builtin_argument(name, ptr, 0);
+        let ptr = self.operand_to_value(ptr);
+        // The public spelling takes `__m64` (an 8-byte GNU vector, read from
+        // its storage; `vector_operand_ptr` spills a packed call result such
+        // as `_mm_add_pi8(a, b)`); the raw spelling takes `unsigned long long`.
+        let value = if let Some(vector_ct) = self.get_expr_ctype(value).filter(CType::is_vector) {
+            let storage = self.vector_operand_ptr(value, &vector_ct);
+            let bits = self.fresh_value();
+            self.emit(Instruction::Load {
+                dest: bits,
+                ptr: storage,
+                ty: IrType::I64,
+                seg_override: AddressSpace::Default,
+                volatile: false,
+            });
+            Operand::Value(bits)
+        } else {
+            self.lower_typed_x86_builtin_argument(name, value, 1)
+        };
+        if self.x86_feature_permitted(F::Sse2) {
+            self.emit(Instruction::Intrinsic {
+                dest: None,
+                op: IntrinsicOp::Movnti64,
+                dest_ptr: Some(ptr),
+                args: vec![value],
+            });
+        } else {
+            self.emit(Instruction::Store {
+                val: value,
+                ptr,
+                ty: IrType::I64,
+                seg_override: AddressSpace::Default,
+                volatile: false,
+            });
+        }
+        Some(Operand::Const(IrConst::I64(0)))
     }
 
     /// `__builtin_ia32_bzhi_si`/`_di`: BMI2 `bzhi` (see `IrBinOp::Bzhi` for
@@ -3431,7 +3696,9 @@ fn x86_intrinsic_kind(intrinsic: &BuiltinIntrinsic) -> X86IntrinsicKind {
         | BuiltinIntrinsic::X86Movnti64
         | BuiltinIntrinsic::X86Movntdq
         | BuiltinIntrinsic::X86Movntpd
+        | BuiltinIntrinsic::X86Movntps
         | BuiltinIntrinsic::X86Storedqu
+        | BuiltinIntrinsic::X86StorePs
         | BuiltinIntrinsic::X86Storeldi128
         | BuiltinIntrinsic::X86Storeu256
         | BuiltinIntrinsic::X86Store256
@@ -3624,6 +3891,11 @@ fn legacy_xmm_intrinsic_required_feature(
         | B::X86MaxPs128
         | B::X86MinPs128
         | B::X86ShufPsValue
+        | B::X86Movntps
+        | B::X86LoadPs
+        | B::X86StorePs
+        | B::X86Sfence
+        | B::X86Movntq
         | B::X86Cvtss2Si64 => IntrinsicRequirement {
             feature: F::Sse,
             flag: "-msse",
@@ -3635,6 +3907,9 @@ fn legacy_xmm_intrinsic_required_feature(
         | B::X86CastReinterpret
         | B::X86Lfence
         | B::X86Mfence
+        // CLFLUSH has its own CPUID bit, but GCC gates `_mm_clflush` on
+        // SSE2 (the first silicon with it) and a Pentium III lacks it.
+        | B::X86Clflush
         | B::X86Movnti
         | B::X86Movnti64
         | B::X86Movntdq
@@ -3989,7 +4264,8 @@ fn x86_intrinsic_op(intrinsic: &BuiltinIntrinsic) -> IntrinsicOp {
         BuiltinIntrinsic::X86Movnti64 => IntrinsicOp::Movnti64,
         BuiltinIntrinsic::X86Movntdq => IntrinsicOp::Movntdq,
         BuiltinIntrinsic::X86Movntpd => IntrinsicOp::Movntpd,
-        BuiltinIntrinsic::X86Loaddqu => IntrinsicOp::Loaddqu,
+        BuiltinIntrinsic::X86Movntps => IntrinsicOp::Movntps,
+        BuiltinIntrinsic::X86Loaddqu | BuiltinIntrinsic::X86LoadPs => IntrinsicOp::Loaddqu,
         BuiltinIntrinsic::X86Pcmpeqb128 => IntrinsicOp::Pcmpeqb128,
         BuiltinIntrinsic::X86Pcmpeqd128 => IntrinsicOp::Pcmpeqd128,
         BuiltinIntrinsic::X86Psubusb128 => IntrinsicOp::Psubusb128,
@@ -4071,7 +4347,7 @@ fn x86_intrinsic_op(intrinsic: &BuiltinIntrinsic) -> IntrinsicOp {
         BuiltinIntrinsic::X86Cvtsi32Si128 => IntrinsicOp::Cvtsi32Si128,
         BuiltinIntrinsic::X86Pshuflw128 => IntrinsicOp::Pshuflw128,
         BuiltinIntrinsic::X86Pshufhw128 => IntrinsicOp::Pshufhw128,
-        BuiltinIntrinsic::X86Storedqu => IntrinsicOp::Storedqu,
+        BuiltinIntrinsic::X86Storedqu | BuiltinIntrinsic::X86StorePs => IntrinsicOp::Storedqu,
         BuiltinIntrinsic::X86Storeldi128 => IntrinsicOp::Storeldi128,
         BuiltinIntrinsic::X86Pmovmskb128 => IntrinsicOp::Pmovmskb128,
         BuiltinIntrinsic::X86Pextrw128 => IntrinsicOp::Pextrw128,
@@ -4408,6 +4684,8 @@ mod legacy_constructor_permission_tests {
     fn zero_constructors_keep_their_api_feature_identity() {
         for (name, expected) in [
             ("_mm_setzero_ps", F::Sse),
+            ("_mm_stream_pi", F::Sse),
+            ("__builtin_ia32_movntq", F::Sse),
             ("_mm_setzero_pd", F::Sse2),
             ("_mm_setzero_si128", F::Sse2),
             ("_mm256_setzero_ps", F::Avx),

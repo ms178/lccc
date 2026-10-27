@@ -74,18 +74,22 @@ fn resolve_clone_spec(spec: &str) -> Result<(u32, Vec<Probe>), String> {
     ];
 
     match spec {
-        "arch=x86-64" => Ok((200, lookup_all(&["sse2"])?)),
-        "arch=x86-64-v2" | "arch=nehalem" | "arch=westmere" | "arch=silvermont"
-        | "arch=goldmont" | "arch=tremont" => Ok((500, lookup_all(V2_FEATS)?)),
+        "arch=x86-64" => Ok((gcc_prio::X86_64_BASELINE, lookup_all(&["sse2"])?)),
+        "arch=nehalem" | "arch=silvermont" | "arch=goldmont" | "arch=tremont" => {
+            Ok((gcc_prio::PROC_SSE4_2, lookup_all(V2_FEATS)?))
+        }
+        "arch=x86-64-v2" => Ok((gcc_prio::X86_64_V2, lookup_all(V2_FEATS)?)),
+        // GCC resolves `arch=westmere` (NEHALEM + PCLMUL) to P_PCLMUL.
+        "arch=westmere" => Ok((gcc_prio::PCLMUL, lookup_all(V2_FEATS)?)),
         "arch=sandybridge" | "arch=ivybridge" => Ok((
-            610,
+            gcc_prio::PROC_AVX,
             lookup_all(&["avx", "cx16", "popcnt", "sse4.1", "sse4.2"])?,
         )),
-        "arch=x86-64-v3" | "arch=haswell" | "arch=broadwell" | "arch=skylake"
-        | "arch=alderlake" | "arch=raptorlake" | "arch=meteorlake" | "arch=arrowlake"
-        | "arch=znver1" | "arch=znver2" | "arch=znver3" => Ok((800, lookup_all(V3_FEATS)?)),
-        "arch=x86-64-v4"
-        | "arch=skylake-avx512"
+        "arch=haswell" | "arch=broadwell" | "arch=skylake" | "arch=alderlake"
+        | "arch=raptorlake" | "arch=meteorlake" | "arch=arrowlake" | "arch=znver1"
+        | "arch=znver2" | "arch=znver3" => Ok((gcc_prio::PROC_AVX2, lookup_all(V3_FEATS)?)),
+        "arch=x86-64-v3" => Ok((gcc_prio::X86_64_V3, lookup_all(V3_FEATS)?)),
+        "arch=skylake-avx512"
         | "arch=cascadelake"
         | "arch=cooperlake"
         | "arch=icelake-client"
@@ -93,29 +97,71 @@ fn resolve_clone_spec(spec: &str) -> Result<(u32, Vec<Probe>), String> {
         | "arch=tigerlake"
         | "arch=sapphirerapids"
         | "arch=emeraldrapids"
-        | "arch=graniterapids"
         | "arch=znver4"
-        | "arch=znver5" => Ok((900, lookup_all(V4_FEATS)?)),
+        | "arch=znver5" => Ok((gcc_prio::PROC_AVX512F, lookup_all(V4_FEATS)?)),
+        "arch=x86-64-v4" => Ok((gcc_prio::X86_64_V4, lookup_all(V4_FEATS)?)),
+        "arch=graniterapids" => Ok((gcc_prio::PROC_AVX10_1, lookup_all(V4_FEATS)?)),
         other => {
             let probe = cpu_probe::lookup(other).ok_or_else(|| {
                 format!("ISA '{other}' is not supported in 'target_clones' attribute")
             })?;
-            let prio = match other {
-                s if s.starts_with("avx512") => 850,
-                "avx2" => 700,
-                "fma" => 650,
-                "avx" | "f16c" => 600,
-                "bmi2" => 550,
-                "sse4.2" | "sse4_2" => 490,
-                "sse4.1" | "sse4_1" | "sse4" => 450,
-                "popcnt" | "lzcnt" | "abm" | "bmi" | "movbe" | "cx16" => 420,
-                "ssse3" => 350,
-                "sse3" => 300,
-                "sse2" => 200,
-                "sse" | "mmx" => 150,
-                _ => 100,
-            };
-            Ok((prio, vec![probe]))
+            Ok((gcc_prio::feature(other), vec![probe]))
+        }
+    }
+}
+
+/// GCC 16.2's dispatch order (`enum feature_priority`,
+/// gcc/common/config/i386/i386-cpuinfo.h; values are the enumerator
+/// ordinals). Feature names take their `isa_names_table` priority
+/// (i386-isas.h) and `arch=` names their `processor_alias_table` one,
+/// with P_PROC_DYNAMIC and the `x86-64-v*` levels resolved as
+/// `get_builtin_code_for_version` does. Mirroring it makes the clone a
+/// CPU runs the one GCC would run whenever both are eligible.
+///
+/// One deliberate difference: GCC dispatches a named CPU (`arch=haswell`)
+/// with `__builtin_cpu_is`, lccc with the CPU's feature set. Every `arch=`
+/// clone is compiled with a subset of the features its resolver probes
+/// (`X86Isa::arch_level`), so this is safe, and it lets newer CPUs of the
+/// same level run the clone.
+mod gcc_prio {
+    pub(super) const NONE: u32 = 0;
+    pub(super) const X86_64_BASELINE: u32 = 4;
+    pub(super) const PROC_SSE4_2: u32 = 12;
+    pub(super) const X86_64_V2: u32 = 14;
+    pub(super) const PCLMUL: u32 = 16;
+    pub(super) const PROC_AVX: u32 = 18;
+    pub(super) const PROC_AVX2: u32 = 28;
+    pub(super) const X86_64_V3: u32 = 29;
+    pub(super) const PROC_AVX512F: u32 = 31;
+    pub(super) const X86_64_V4: u32 = 32;
+    pub(super) const PROC_AVX10_1: u32 = 35;
+
+    /// `isa_names_table` priority of a single feature name. Names GCC
+    /// lists as P_NONE (`lzcnt`, `movbe`, `cmpxchg16b`, `f16c`, the AVX-512
+    /// sub-features, ...) and spellings it does not list rank lowest; ties
+    /// keep the user's order.
+    pub(super) fn feature(name: &str) -> u32 {
+        match name {
+            "mmx" => 1,
+            "sse" => 2,
+            "sse2" => 3,
+            "sse3" => 5,
+            "ssse3" => 6,
+            "sse4a" => 8,
+            "sse4.1" | "sse4_1" => 10,
+            "sse4.2" | "sse4_2" => 11,
+            "popcnt" => 13,
+            "aes" => 15,
+            "pclmul" => PCLMUL,
+            "avx" => 17,
+            "bmi" => 19,
+            "fma4" => 21,
+            "xop" => 22,
+            "fma" => 24,
+            "bmi2" => 26,
+            "avx2" => 27,
+            "avx512f" => 30,
+            _ => NONE,
         }
     }
 }
@@ -300,7 +346,10 @@ impl Lowerer {
             target_features: Vec::new(),
             next_value_id: built.next_value,
             fp_expr_tags: Default::default(),
-            next_label: 0,
+            // Every label above came from the lowerer's global counter, as
+            // for ordinary and nested functions (`func_lowering.rs`). A 0
+            // here hands the next label-minting pass a live label.
+            next_label: self.next_label,
             section: None,
             visibility: None,
             is_weak: false,
@@ -324,5 +373,51 @@ impl Lowerer {
         };
         self.defined_functions.insert(resolver_name.to_string());
         self.module.functions.push(ir_func);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_clone_spec;
+
+    fn prio(spec: &str) -> u32 {
+        resolve_clone_spec(spec).expect(spec).0
+    }
+
+    #[test]
+    fn clone_priorities_follow_gcc_dispatch_order() {
+        // The orderings the previous table inverted.
+        assert!(prio("popcnt") > prio("sse4.2"));
+        assert!(prio("bmi") > prio("avx"));
+        assert!(prio("bmi2") > prio("fma"));
+        // GCC P_NONE features rank below every prioritised one.
+        for none in ["lzcnt", "movbe", "f16c", "avx512bw", "avx512vl"] {
+            assert!(prio(none) < prio("mmx"), "{none}");
+        }
+        // Levels outrank the CPUs of the same level; graniterapids is AVX10.1.
+        let chain = [
+            "sse2",
+            "arch=x86-64",
+            "sse4.2",
+            "arch=nehalem",
+            "popcnt",
+            "arch=x86-64-v2",
+            "arch=westmere",
+            "avx",
+            "arch=sandybridge",
+            "bmi",
+            "fma",
+            "bmi2",
+            "avx2",
+            "arch=haswell",
+            "arch=x86-64-v3",
+            "avx512f",
+            "arch=znver4",
+            "arch=x86-64-v4",
+            "arch=graniterapids",
+        ];
+        for pair in chain.windows(2) {
+            assert!(prio(pair[0]) < prio(pair[1]), "{} < {}", pair[0], pair[1]);
+        }
     }
 }

@@ -730,6 +730,15 @@ for bits in (128, 256):
             w(f"{name}({vty} __a, {vty} __b)")
             w(f"{{ return {builtin}(__a, __b); }}")
             w("")
+# 256-bit integer PTEST (AVX, not AVX2) observes every payload bit; it has its
+# own private builtin so it can never be confused with the sign-bit VTEST.
+for flag in ("z", "c", "nzc"):
+    builtin = f"__lccc_avx_test{flag}si256"
+    w(f"int {builtin}(__m256i, __m256i);")
+    w(f"static __inline__ int __attribute__((__always_inline__, __artificial__, __target__(\"avx\")))")
+    w(f"_mm256_test{flag}_si256(__m256i __a, __m256i __b)")
+    w(f"{{ return {builtin}(__a, __b); }}")
+    w("")
 for name, mn, rty, m in FP256_UIMM:
     proto(f"256_ps_{mn}", rty[2:], ["long", rty + " __a"])
     macro(f"_mm256_{name}(__a, __imm)",

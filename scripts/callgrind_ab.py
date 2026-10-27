@@ -26,7 +26,7 @@ import tempfile
 
 REPO=Path(__file__).resolve().parents[1];sys.path.insert(0,str(REPO))
 from tools.corpus import process,publication,schema
-from scripts.perf_ab import split_driver_flags
+from scripts.perf_ab import matched_link_flags, split_driver_flags
 
 CG_I1='32768,8,64';CG_D1='32768,8,64';CG_LL='33554432,16,64'
 REQUIRED_EVENTS={'Ir','I1mr','D1mr','D1mw','ILmr','DLmr','DLmw','Bcm','Bim'}
@@ -242,6 +242,8 @@ def tool_identity(command,option='--version'):
 
 
 def _measure(args,benches,outroot,manifest,cache):
+    matched_opt=matched_link_flags(manifest['opt_tokens'],args.mine,args.ref)
+    manifest['opt']=shlex.join(matched_opt);manifest['opt_tokens']=matched_opt
     mdir=outroot/'aa';rdir=outroot/'bb';mdir.mkdir(exist_ok=True);rdir.mkdir(exist_ok=True)
     if len(os.fsencode(mdir))!=len(os.fsencode(rdir)):raise ValueError('unequal A/B path byte lengths')
     manifest['paths']=dict(mine=str(mdir),ref=str(rdir),equal_byte_length=True)
@@ -255,7 +257,7 @@ def _measure(args,benches,outroot,manifest,cache):
         entry['compilation']={}
         err=None
         for side,compiler,binary in (('mine',args.mine,mbin),('ref',args.ref,rbin)):
-            err=compile_program(compiler,args.opt,source,binary,include=manifest['include'])
+            err=compile_program(compiler,matched_opt,source,binary,include=manifest['include'])
             entry['compilation'][side]=retain_process_receipt(str(binary)+'.compile',primary_error=err)
             if err:break
         if err:entry['detail']=err;failures[bench]=err;continue

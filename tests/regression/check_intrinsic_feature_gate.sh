@@ -460,6 +460,86 @@ EOF
 done
 
 echo "CHECK: AVX2 widening permissions"
+# 256-bit integer PTEST is AVX (VEX.256 66 0F38 17), not AVX2, like VTEST.
+for flag in z c nzc; do
+    src=ptest-256-$flag.c
+    cat >"$tmp/$src" <<EOF
+typedef long long vec __attribute__((vector_size(32)));
+int test(vec a, vec b) { return __builtin_ia32_ptest${flag}256(a, b); }
+EOF
+    for mode in -m64 -m32; do
+        reject "$src" -mavx "$mode" -mavx -mno-avx
+        accept "$src" vptest "$mode" -mavx -mno-avx2
+    done
+done
+
+# A function that wrote YMM state must clean it before every `ret` (IS-20;
+# GCC 16.2 does the same on both ABIs); a 128-bit-only function must not pay
+# for a vzeroupper it does not need.
+vzeroupper_before_each_ret() {
+    awk '/^[[:space:]]+vzeroupper/ { clean = 1 }
+         /^[[:space:]]+ret/ { if (!clean) bad = 1; clean = 0; rets++ }
+         END { exit (bad || !rets) }' "$1"
+}
+for mode in -m64 -m32; do
+    for src in vtest-256-ps-z.c vtest-256-pd-nzc.c ptest-256-z.c ptest-256-c.c; do
+        asm=$tmp/vzu-${src%.c}$mode.s
+        "$ccc" -O2 "$mode" -mavx -S "$tmp/$src" -o "$asm"
+        vzeroupper_before_each_ret "$asm" ||
+            { cat "$asm" >&2; fail "$src $mode: a return leaves dirty upper YMM state"; }
+    done
+    asm=$tmp/vzu-vtest-128$mode.s
+    "$ccc" -O2 "$mode" -mavx -S "$tmp/vtest-128-ps-z.c" -o "$asm"
+    ! grep -q vzeroupper "$asm" ||
+        { cat "$asm" >&2; fail "vtest-128-ps-z.c $mode: needless vzeroupper"; }
+done
+
+# The same discipline before an ordinary (non-tail) call, as GCC 16.2 and
+# Clang 23.1.4 do: a legacy-SSE callee must not inherit dirty upper halves.
+# A YMM argument is the exception -- vzeroupper there would destroy the
+# argument itself. 256-bit PTEST is used because i686 emits it natively
+# (GNU vector arithmetic is still per-lane there).
+# Match the ABI call itself: i686 PIC code calls __x86.get_pc_thunk first.
+cat >"$tmp/vzu-call.c" <<'EOF'
+typedef long long v4 __attribute__((vector_size(32)));
+extern void sink(int);
+extern void take(v4);
+int before_call(v4 *p, v4 *q) { sink(__builtin_ia32_ptestz256(*p, *q)); return 1; }
+int wide_arg(v4 *p) { take(*p); return 1; }
+EOF
+for mode in -m64 -m32; do
+    asm=$tmp/vzu-call$mode.s
+    "$ccc" -O2 "$mode" -mavx2 -S "$tmp/vzu-call.c" -o "$asm"
+    awk '/^before_call:/ { f = 1 } /^wide_arg:/ { f = 0 }
+         f && /%ymm/ { dirty = 1; seen = 1 }
+         f && /^[[:space:]]+vzeroupper/ { dirty = 0 }
+         f && /^[[:space:]]+call[[:space:]]+sink/ { calls++; if (dirty) bad = 1 }
+         END { exit (bad || !calls || !seen) }' "$asm" ||
+        { cat "$asm" >&2; fail "vzu-call.c $mode: before_call calls with dirty upper YMM state"; }
+    awk '/^wide_arg:/ { f = 1 } /^before_call:/ { f = 0 }
+         f && /%ymm0/ { arg = 1 }
+         f && /^[[:space:]]+vzeroupper/ && !called { bad = 1 }
+         f && /^[[:space:]]+call[[:space:]]+take/ { called = 1 }
+         END { exit (bad || !called || !arg) }' "$asm" ||
+        { cat "$asm" >&2; fail "vzu-call.c $mode: wide_arg zeroed its own YMM argument"; }
+done
+# i686 fastcall calls take their own emitter and classification.
+cat >"$tmp/vzu-fastcall.c" <<'EOF'
+typedef long long v4 __attribute__((vector_size(32)));
+extern void __attribute__((fastcall)) takef(int, v4);
+int wide_fastcall(v4 *p) { takef(7, *p); return 1; }
+EOF
+asm=$tmp/vzu-fastcall-m32.s
+"$ccc" -O2 -m32 -mavx2 -S "$tmp/vzu-fastcall.c" -o "$asm"
+# The vector travels in %ymm0, as in cdecl (GCC 16.2), so it must be loaded
+# there and not zeroed before the call.
+awk '/^[[:space:]]+vzeroupper/ && !called { bad = 1 }
+     /^[[:space:]]+vmov[a-z]*[[:space:]].*,[[:space:]]*%ymm0$/ && !called { loaded = 1 }
+     /^[[:space:]]+call[[:space:]]+takef/ { called = 1 }
+     END { exit (bad || !called || !loaded) }' "$asm" ||
+    { cat "$asm" >&2; fail "vzu-fastcall.c -m32: fastcall YMM argument not passed intact in %ymm0"; }
+
+
 # Widening instructions are AVX2, unlike floating-point VTEST. Even when
 # only four low source bytes participate, the C input remains a 128-bit value.
 for sign in sx zx; do
@@ -493,6 +573,10 @@ cat >"$tmp/vtest_wrong_shape.c" <<'EOF'
 typedef float v4sf __attribute__((vector_size(16)));
 int wrong(v4sf a) { return __builtin_ia32_vtestzps256(a, a); }
 EOF
+cat >"$tmp/ptest_wrong_shape.c" <<'EOF'
+typedef float v8sf __attribute__((vector_size(32)));
+int wrong(v8sf a) { return __builtin_ia32_ptestz256(a, a); }
+EOF
 cat >"$tmp/widen_wrong_shape.c" <<'EOF'
 typedef char v32qi __attribute__((vector_size(32)));
 typedef short v16hi __attribute__((vector_size(32)));
@@ -500,6 +584,7 @@ v16hi wrong(v32qi a) { return __builtin_ia32_pmovsxbw256(a); }
 EOF
 for mode in -m64 -m32; do
     reject vtest_wrong_shape.c 'requires two' "$mode" -mavx
+    reject ptest_wrong_shape.c 'requires two 256-bit 64-bit integer' "$mode" -mavx
     reject widen_wrong_shape.c 'requires a 128-bit vector' "$mode" -mavx2
 done
 
@@ -596,6 +681,13 @@ cat >"$tmp/local_fma_no_avx.c" <<'EOF'
 __attribute__((target("fma,no-avx"))) __m256 f(__m256 a, __m256 b, __m256 c) { return _mm256_fmadd_ps(a, b, c); }
 EOF
 reject local_fma_no_avx.c -mfma -march=x86-64
+# Disabling AVX-512F inside one function must not revoke unrelated SSE
+# permission from the translation unit.
+cat >"$tmp/local_no_avx512f_preserves_sse.c" <<'EOF'
+#include <xmmintrin.h>
+__attribute__((target("no-avx512f"))) __m128 f(__m128 a, __m128 b) { return _mm_add_ps(a, b); }
+EOF
+accept local_no_avx512f_preserves_sse.c addps -march=x86-64
 cat >"$tmp/local_bw_vl.c" <<'EOF'
 #include <immintrin.h>
 __attribute__((target("avx512bw,avx512vl"))) __mmask16 f(__m128i a, __m128i b) { return _mm_cmp_epu8_mask(a,b,_MM_CMPINT_EQ); }

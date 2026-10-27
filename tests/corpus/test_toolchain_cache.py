@@ -131,7 +131,7 @@ class OfflineCombinedInstaller(unittest.TestCase):
                         command.chmod(0o755)
                     identities = {'gcc-16.2.0/bin/gcc-16': 'gcc-16 (GCC) 16.2.0',
                                   'clang-23.1.4/bin/clang-23': 'clang version 23.1.4 (fixture)',
-                                  'bin/mold': 'mold 2.42.1',
+                                  'bin/mold': 'mold 3.0.0',
                                   'rust-1.99.1/bin/rustc': 'rustc 1.99.1 (fixture)'}
                     for name, identity in identities.items():
                         if missing_rust and name.endswith('rustc'):
@@ -149,3 +149,98 @@ class OfflineCombinedInstaller(unittest.TestCase):
                         self.assertIn('rustc not executable', result.stdout + result.stderr)
                     self.assertFalse(marker.exists())
                     self.assertEqual(before, sorted(str(p.relative_to(prefix)) for p in prefix.rglob('*')))
+
+
+class ToolchainCacheFreshness(unittest.TestCase):
+    """The freshness checker's offline half must stay green on this tree,
+    and its upstream parsers must pick the newest *release* out of
+    canned upstream answers (never an -rc, never a lookalike)."""
+
+    def freshness(self):
+        from scripts import check_toolchain_cache_freshness as fresh
+        return fresh
+
+    def test_offline_pins_are_internally_consistent(self):
+        fresh = self.freshness()
+        pins = fresh.read_pins()
+        self.assertEqual(fresh.offline_problems(pins), [])
+        # The packages this checker exists for (the 2026-10-27 refresh
+        # found mold/qemu/kernel-relocs stale precisely because no
+        # such list was asserted anywhere).
+        for package in ('gcc', 'binutils', 'clang', 'rust', 'mold', 'qemu',
+                        'kernel-relocs', 'arm-a64-xml', 'icx', 'valgrind'):
+            self.assertIn(package, pins)
+
+    def test_offline_main_never_touches_network(self):
+        fresh = self.freshness()
+        with patch.object(fresh, 'upstream_latest', side_effect=AssertionError('network')):
+            self.assertEqual(fresh.main(['--offline']), 0)
+
+    def test_version_ordering_rejects_lookalikes(self):
+        fresh = self.freshness()
+        self.assertGreater(fresh.vtuple('3.0.0'), fresh.vtuple('2.42.1'))
+        self.assertGreater(fresh.vtuple('11.1.2'), fresh.vtuple('8.2.2'))
+        self.assertGreater(fresh.vtuple('2.47'), fresh.vtuple('2.46.1'))
+        self.assertEqual(fresh.vtuple('23.1.4'), (23, 1, 4))
+
+    def test_listing_parsers_pick_newest_release(self):
+        fresh = self.freshness()
+        self.assertEqual(fresh.parse_gcc_listing(
+            'gcc-15.3.0/ gcc-16.1.0/ gcc-16.2.0/ gcc-9.5.0/'), '16.2.0')
+        self.assertEqual(fresh.parse_binutils_listing(
+            'binutils-2.46.1.tar.xz binutils-2.47.tar.xz binutils-2.45.tar.bz2'), '2.47')
+        self.assertEqual(fresh.parse_qemu_listing(
+            'qemu-10.2.4.tar.xz qemu-11.1.2.tar.xz qemu-11.0.5.tar.xz'), '11.1.2')
+        self.assertEqual(fresh.parse_valgrind_listing(
+            'valgrind-3.27.1.tar.bz2 valgrind-3.28.0.tar.bz2'), '3.28.0')
+
+    def test_llvm_parser_skips_prereleases(self):
+        fresh = self.freshness()
+        data = [{'tag_name': 'llvmorg-24.1.0-rc1', 'prerelease': True, 'draft': False},
+                {'tag_name': 'llvmorg-23.1.4', 'prerelease': False, 'draft': False, 'assets': []}]
+        version, _ = fresh.parse_llvm_releases(data)
+        self.assertEqual(version, '23.1.4')
+
+    def test_icx_and_madison_parsers(self):
+        fresh = self.freshness()
+        packages = ('Package: intel-oneapi-compiler-dpcpp-cpp-runtime-2026.1\n'
+                    'Package: intel-oneapi-compiler-dpcpp-cpp-runtime-2026.2\n'
+                    'Package: intel-oneapi-compiler-dpcpp-cpp-runtime\n')
+        self.assertEqual(fresh.parse_icx_packages(packages), '2026.2')
+        madison = (' libc6 | 2.36-9+deb12u7  | bookworm-security | amd64\n'
+                   ' libc6 | 2.36-9+deb12u14 | bookworm          | amd64\n'
+                   ' libc6 | 2.43-7          | sid               | amd64\n')
+        self.assertEqual(fresh.parse_madison(madison, 'bookworm'), '2.36-9+deb12u14')
+
+    def test_stale_pin_is_reported_by_main(self):
+        fresh = self.freshness()
+        pins = fresh.read_pins()
+        stale_rows = [(name, pins[name], 'canned') for name in
+                      ('gcc', 'binutils', 'clang', 'rust', 'qemu', 'kernel-relocs',
+                       'valgrind', 'icx', 'arm-a64-xml', 'debs-bookworm-libc', 'debs-bookworm-gcc12')]
+        stale_rows.append(('mold', '99.0.0', 'canned newer mold'))
+        with patch.object(fresh, 'upstream_latest', return_value=stale_rows):
+            self.assertEqual(fresh.main([]), 1)
+
+    def test_agent_cache_lock_matches_canonical_pins(self):
+        fresh = self.freshness()
+        pins = fresh.read_pins()
+        lock = json.loads(fresh.AGENT_LOCK.read_text())
+        self.assertEqual(lock['tag'], 'harness-cache-7')
+        for package in ('gcc', 'binutils', 'clang', 'rust', 'mold', 'qemu',
+                        'kernel-relocs', 'arm-a64-xml', 'rust-msrv'):
+            self.assertEqual(lock['tools'][package]['version'], pins[package])
+            self.assertRegex(lock['tools'][package]['sha256'], r'^[0-9a-f]{64}$')
+        self.assertEqual(fresh.offline_problems(pins), [])
+
+    def test_agent_cache_lock_drift_is_detected(self):
+        fresh = self.freshness()
+        pins = fresh.read_pins()
+        lock = json.loads(fresh.AGENT_LOCK.read_text())
+        lock['tools']['mold']['version'] = '99.0.0'
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'lock.json'
+            path.write_text(json.dumps(lock))
+            with patch.object(fresh, 'AGENT_LOCK', path):
+                problems = fresh.offline_problems(pins)
+        self.assertTrue(any('agent-cache-lock.json' in problem for problem in problems))

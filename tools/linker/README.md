@@ -29,14 +29,25 @@ reports divergences both in the accept/reject verdict and in the bytes written.
 ## `setup_oracles.sh` — build the corroborating linkers
 
 Pinned oracles (user directive): **GNU ld 2.47** (bfd + ld only), **mold
-2.42.1** built with `-DMOLD_TARGETS='X86_64;I386'` (mold's own CMake cache
-variable — the x86 preset cuts template instantiation ~10x on the 2-vCPU host),
+3.0.0** built with the mold-cli Cargo preset
+`--no-default-features --features x86_64,i386` (mold 3.x removed the CMake
+build and its `-DMOLD_TARGETS=` cache variable; one Cargo feature per target
+crate under `arch/` replaced it — the x86-only preset drops the other
+eighteen target crates on the 2-vCPU host),
 **LLVM lld 23.1.x** (apt.llvm.org release build; the script asserts the `23.1.`
 banner) and wild at git HEAD. The binutils release download is SHA-256-pinned
 like the GAS oracle. Its actual banner is `2.47.20260726`, which the version
 check accepts explicitly alongside `2.47`; it still rejects `2.470`, `2.47.1`,
 and other dated snapshots. This is not permission to substitute any version
 whose directory happens to contain `2.47`.
+
+The cache's raw BFD executable retains upstream defaults, so the stable
+`ld-2.47` wrapper supplies the declared native profile: `/` sysroot,
+`--enable-new-dtags`, and the host's multiarch library directories after
+caller-provided `-L` paths. Explicit linker options still override those
+defaults, and `-nostdlib` suppresses the injected native search paths. Use the
+wrapper in `$LINKDIR` for comparisons; the raw cache binary is not the native
+oracle interface.
 
 `WITH_WILD=0` removes wild from the oracle set
 for that run: no build, no `wild` wrapper (a stale one is deleted) and no

@@ -88,21 +88,20 @@ impl ModeKind {
 
 /// Bit masks for boolean flags in `ParsedDeclAttrs::flags`.
 ///
-/// Each flag occupies one bit of a `u32`, matching the pattern used by
-/// `FunctionAttributes`, `Declaration`, and `DeclAttributes` in ast.rs.
-/// New flags can be added by defining the next power-of-two constant.
+/// Each flag occupies one bit of a `u64`. A wider field keeps new parser-only
+/// metadata out of declaration attributes when it has no code-generation role.
 pub(super) mod parsed_attr_flag {
     // --- Storage-class specifiers ---
     /// `typedef` keyword encountered.
-    pub const TYPEDEF: u32 = 1 << 0;
+    pub const TYPEDEF: u64 = 1 << 0;
     /// `static` keyword encountered.
-    pub const STATIC: u32 = 1 << 1;
+    pub const STATIC: u64 = 1 << 1;
     /// `extern` keyword encountered.
-    pub const EXTERN: u32 = 1 << 2;
+    pub const EXTERN: u64 = 1 << 2;
     /// `_Thread_local` or `__thread` encountered.
-    pub const THREAD_LOCAL: u32 = 1 << 3;
+    pub const THREAD_LOCAL: u64 = 1 << 3;
     /// `inline` keyword encountered.
-    pub const INLINE: u32 = 1 << 4;
+    pub const INLINE: u64 = 1 << 4;
     /// GNU `auto` at block scope: introduces a *nested function*, a distinct
     /// entity that shares only a basename with any file-scope symbol. Carried as
     /// a flag because the distinction is a storage-class fact, and the two cases
@@ -110,76 +109,78 @@ pub(super) mod parsed_attr_flag {
     /// versus do not touch it). Nothing else in the tree can recover it later:
     /// the type may be identical, which is exactly what a basename collision looks
     /// like before any name lookup.
-    pub const NESTED_FN: u32 = 1 << 24;
+    pub const NESTED_FN: u64 = 1 << 24;
     /// The declaration's specifiers name a typedef (its qualifiers apply here).
-    pub const TYPEDEF_USE: u32 = 1 << 25;
+    pub const TYPEDEF_USE: u64 = 1 << 25;
     /// The typedef named by the specifiers has a volatile object qualifier
     /// (`typedef int *volatile P`): the object declared through it is volatile.
-    pub const TYPEDEF_OBJECT_VOLATILE: u32 = 1 << 26;
+    pub const TYPEDEF_OBJECT_VOLATILE: u64 = 1 << 26;
 
     // --- Type qualifiers ---
     /// `const` qualifier encountered.
-    pub const CONST: u32 = 1 << 5;
+    pub const CONST: u64 = 1 << 5;
     /// `volatile` qualifier encountered.
-    pub const VOLATILE: u32 = 1 << 6;
+    pub const VOLATILE: u64 = 1 << 6;
 
     // --- GCC function attributes ---
     /// `__attribute__((constructor))` encountered.
-    pub const CONSTRUCTOR: u32 = 1 << 7;
+    pub const CONSTRUCTOR: u64 = 1 << 7;
     /// `__attribute__((destructor))` encountered.
-    pub const DESTRUCTOR: u32 = 1 << 8;
+    pub const DESTRUCTOR: u64 = 1 << 8;
     /// `__attribute__((weak))` encountered.
-    pub const WEAK: u32 = 1 << 9;
+    pub const WEAK: u64 = 1 << 9;
     /// `__attribute__((used))` encountered.
-    pub const USED: u32 = 1 << 10;
+    pub const USED: u64 = 1 << 10;
     /// `__attribute__((gnu_inline))` encountered.
-    pub const GNU_INLINE: u32 = 1 << 11;
+    pub const GNU_INLINE: u64 = 1 << 11;
     /// `__attribute__((always_inline))` encountered.
-    pub const ALWAYS_INLINE: u32 = 1 << 12;
+    pub const ALWAYS_INLINE: u64 = 1 << 12;
     /// `__attribute__((noinline))` encountered.
-    pub const NOINLINE: u32 = 1 << 13;
+    pub const NOINLINE: u64 = 1 << 13;
     /// `__attribute__((noreturn))` or `_Noreturn` encountered.
-    pub const NORETURN: u32 = 1 << 14;
+    pub const NORETURN: u64 = 1 << 14;
     /// `__attribute__((error("...")))` encountered.
-    pub const ERROR_ATTR: u32 = 1 << 15;
+    pub const ERROR_ATTR: u64 = 1 << 15;
     /// `__attribute__((transparent_union))` encountered.
-    pub const TRANSPARENT_UNION: u32 = 1 << 16;
+    pub const TRANSPARENT_UNION: u64 = 1 << 16;
     /// `__attribute__((fastcall))` encountered (i386 fastcall calling convention).
-    pub const FASTCALL: u32 = 1 << 17;
+    pub const FASTCALL: u64 = 1 << 17;
     /// `__attribute__((naked))` encountered — emit no prologue/epilogue.
-    pub const NAKED: u32 = 1 << 18;
+    pub const NAKED: u64 = 1 << 18;
     /// `__attribute__((no_instrument_function))` encountered — skip the mcount
     /// / __fentry__ prologue emission. Critical for the Linux kernel's noinstr
     /// functions (early boot, NMI, RCU) where the tracer can't run.
-    pub const NO_INSTRUMENT: u32 = 1 << 19;
+    pub const NO_INSTRUMENT: u64 = 1 << 19;
     /// `__attribute__((pure))` encountered.
-    pub const PURE: u32 = 1 << 20;
+    pub const PURE: u64 = 1 << 20;
     /// `__attribute__((const))` encountered.
-    pub const CONST_ATTR: u32 = 1 << 21;
+    pub const CONST_ATTR: u64 = 1 << 21;
     /// A `const` qualifier appeared AFTER a `*` in the declarator, i.e. the
     /// POINTER itself is const (`T *const p`), not the pointee (`const T *p`).
     /// Tracked separately from `CONST` because `Declaration::is_const()`
     /// describes the pointee for pointer declarators.
-    pub const POINTER_CONST: u32 = 1 << 22;
+    pub const POINTER_CONST: u64 = 1 << 22;
     /// `__attribute__((cold))` encountered — the function is unlikely to
     /// execute (error paths, fatal handlers). Lowers to the `.text.unlikely`
     /// section unless an explicit `section(...)` overrides it.
-    pub const COLD: u32 = 1 << 23;
+    pub const COLD: u64 = 1 << 23;
     /// C23 `constexpr` storage-class specifier (6.7.1).
-    pub const CONSTEXPR: u32 = 1 << 27;
+    pub const CONSTEXPR: u64 = 1 << 27;
     /// `_Atomic` qualifier or `_Atomic(type-name)` specifier in the
     /// specifiers, or after the `*` being parsed (see `skip_cv_qualifiers`).
-    pub const ATOMIC: u32 = 1 << 28;
+    pub const ATOMIC: u64 = 1 << 28;
     /// `restrict` after the `*` being parsed.
-    pub const RESTRICT: u32 = 1 << 29;
+    pub const RESTRICT: u64 = 1 << 29;
     /// `constexpr` came after `_Thread_local` or `auto`: GCC 16.2 names the
     /// later of the two first ("'constexpr' used with '_Thread_local'").
-    pub const CONSTEXPR_LAST: u32 = 1 << 30;
+    pub const CONSTEXPR_LAST: u64 = 1 << 30;
     /// `__attribute__((uninitialized))` encountered — skip `-ftrivial-auto-var-init`.
-    pub const UNINITIALIZED: u32 = 1 << 31;
+    pub const UNINITIALIZED: u64 = 1 << 31;
+    /// C23 `[[maybe_unused]]` / GNU `unused` attribute.
+    pub const MAYBE_UNUSED: u64 = 1 << 32;
     /// The storage-class specifiers a declaration carries (C11 6.7.1; GNU
     /// `auto` is NESTED_FN). `register` is not tracked.
-    pub const STORAGE_CLASSES: u32 =
+    pub const STORAGE_CLASSES: u64 =
         TYPEDEF | STATIC | EXTERN | THREAD_LOCAL | NESTED_FN | CONSTEXPR | CONSTEXPR_LAST;
 }
 
@@ -193,12 +194,11 @@ pub(super) mod parsed_attr_flag {
 /// and making the "set then consume" lifecycle explicit.
 ///
 /// Boolean attributes are stored as a packed bitfield (`flags`) for memory
-/// efficiency — 19 booleans collapse from 19 bytes into 4 bytes. Accessor
-/// methods provide the same API as the old struct fields.
+/// efficiency. Accessor methods provide the same API as the old struct fields.
 #[derive(Default, Clone)]
 pub(super) struct ParsedDeclAttrs {
     /// Packed boolean flags — see `parsed_attr_flag` constants.
-    pub(super) flags: u32,
+    pub(super) flags: u64,
 
     /// `__seg_gs` or `__seg_fs` qualifier encountered.
     pub parsing_address_space: AddressSpace,
@@ -351,13 +351,13 @@ impl ParsedDeclAttrs {
     /// own, and must neither inherit nor leave behind the enclosing
     /// declaration's.
     #[inline]
-    pub fn take_storage_classes(&mut self) -> u32 {
+    pub fn take_storage_classes(&mut self) -> u64 {
         let bits = self.flags & parsed_attr_flag::STORAGE_CLASSES;
         self.flags &= !parsed_attr_flag::STORAGE_CLASSES;
         bits
     }
     #[inline]
-    pub fn restore_storage_classes(&mut self, bits: u32) {
+    pub fn restore_storage_classes(&mut self, bits: u64) {
         self.flags = (self.flags & !parsed_attr_flag::STORAGE_CLASSES) | bits;
     }
     #[inline]
@@ -399,6 +399,10 @@ impl ParsedDeclAttrs {
     #[inline]
     pub fn parsing_used(&self) -> bool {
         self.flags & parsed_attr_flag::USED != 0
+    }
+    #[inline]
+    pub fn parsing_maybe_unused(&self) -> bool {
+        self.flags & parsed_attr_flag::MAYBE_UNUSED != 0
     }
     #[inline]
     pub fn parsing_gnu_inline(&self) -> bool {
@@ -516,6 +520,10 @@ impl ParsedDeclAttrs {
         self.set_flag(parsed_attr_flag::USED, v)
     }
     #[inline]
+    pub fn set_maybe_unused(&mut self, v: bool) {
+        self.set_flag(parsed_attr_flag::MAYBE_UNUSED, v)
+    }
+    #[inline]
     pub fn set_gnu_inline(&mut self, v: bool) {
         self.set_flag(parsed_attr_flag::GNU_INLINE, v)
     }
@@ -569,7 +577,7 @@ impl ParsedDeclAttrs {
     }
 
     #[inline]
-    fn set_flag(&mut self, mask: u32, v: bool) {
+    fn set_flag(&mut self, mask: u64, v: bool) {
         if v {
             self.flags |= mask;
         } else {
@@ -581,13 +589,13 @@ impl ParsedDeclAttrs {
     /// Used to prevent storage-class flags from leaking out of compound
     /// statements and typeof expressions.
     #[inline]
-    pub fn save_flags(&self) -> u32 {
+    pub fn save_flags(&self) -> u64 {
         self.flags
     }
 
     /// Restore previously saved packed boolean flags.
     #[inline]
-    pub fn restore_flags(&mut self, saved: u32) {
+    pub fn restore_flags(&mut self, saved: u64) {
         self.flags = saved;
     }
 }
@@ -608,6 +616,7 @@ impl std::fmt::Debug for ParsedDeclAttrs {
             .field("parsing_destructor", &self.parsing_destructor())
             .field("parsing_weak", &self.parsing_weak())
             .field("parsing_used", &self.parsing_used())
+            .field("parsing_maybe_unused", &self.parsing_maybe_unused())
             .field("parsing_gnu_inline", &self.parsing_gnu_inline())
             .field("parsing_always_inline", &self.parsing_always_inline())
             .field("parsing_noinline", &self.parsing_noinline())
@@ -691,6 +700,10 @@ pub struct Parser {
     pub(super) func_decl_stack_protect: FxHashSet<String>,
     /// File-scope function names whose prototype carried `no_stack_protector`.
     pub(super) func_decl_no_stack_protector: FxHashSet<String>,
+    /// File-scope functions whose any declaration carried `noinline`.
+    /// Function attributes merge across redeclarations; a bare later
+    /// definition must not silently become inlinable (frame-address.c).
+    pub(super) func_decl_noinline: FxHashSet<String>,
     /// Count of parse errors encountered (invalid tokens at top level, etc.)
     pub error_count: usize,
     /// Number of currently-live expression-parse frames (E5 hardening).
@@ -782,6 +795,7 @@ impl Parser {
             func_decl_no_instrument: FxHashSet::default(),
             func_decl_stack_protect: FxHashSet::default(),
             func_decl_no_stack_protector: FxHashSet::default(),
+            func_decl_noinline: FxHashSet::default(),
             error_count: 0,
             parser_frame_depth: 0,
             nesting_budget_diagnosed: false,
@@ -1676,6 +1690,13 @@ impl Parser {
 
             match norm_scope {
                 None => match norm_name {
+                    "maybe_unused" => {
+                        self.attrs.set_maybe_unused(true);
+                        self.advance();
+                        if matches!(self.peek(), TokenKind::LParen) {
+                            self.skip_balanced_parens();
+                        }
+                    }
                     "noreturn" | "_Noreturn" => {
                         self.attrs.set_noreturn(true);
                         self.advance();
@@ -2019,6 +2040,11 @@ impl Parser {
             "used" | "__used__" => {
                 self.attrs.set_used(true);
                 self.advance();
+            }
+            "unused" | "__unused__" => {
+                self.attrs.set_maybe_unused(true);
+                self.advance();
+                self.skip_optional_paren_arg();
             }
             "fastcall" | "__fastcall__" => {
                 let span = self.peek_span();
@@ -2888,7 +2914,7 @@ impl Parser {
                 Some(8)
             }
             TypeSpecifier::Pointer(_, _)
-            | TypeSpecifier::FunctionPointer(_, _, _)
+            | TypeSpecifier::FunctionPointer(..)
             | TypeSpecifier::NullPtrT => Some(ptr_sz),
             TypeSpecifier::Int128 | TypeSpecifier::UnsignedInt128 => Some(16),
             TypeSpecifier::LongDouble => Some(if ptr_sz == 4 { 12 } else { 16 }),
@@ -2963,7 +2989,7 @@ impl Parser {
                 }
             }
             TypeSpecifier::Pointer(_, _)
-            | TypeSpecifier::FunctionPointer(_, _, _)
+            | TypeSpecifier::FunctionPointer(..)
             | TypeSpecifier::NullPtrT => ptr_sz,
             TypeSpecifier::Int128 | TypeSpecifier::UnsignedInt128 => 16,
             // On i686, long double is 80-bit x87 but aligned to 4 bytes

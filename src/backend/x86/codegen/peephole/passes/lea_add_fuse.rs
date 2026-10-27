@@ -27,15 +27,15 @@
 //!    LEA destination (the fused base is read before the write) and from
 //!    the index (a SIB cannot name one register twice).
 //! 3. **The flags the add wrote are not observed**: the fusion deletes the
-//!    add's flag write, so any flag reader before the next flag writer
-//!    declines — labels do not release the scan, because fall-through still
-//!    carries these flags.
+//!    add's flag write, so any flag reader before all those flags are
+//!    definitely replaced declines. Partial writers leave their preserved
+//!    flags live; labels preserve fall-through state; control-flow edges and
+//!    opaque lines stop the proof.
 //!
 //! `CCC_PEEPHOLE_SKIP=lea_add_fuse` disables the pass.
 
 use super::super::types::*;
-use super::identical_blocks::reads_flags;
-use super::pow2_cmov::writes_flags_text;
+use super::flag_peepholes::{F_ALL, FlagsEffect, flags_effect, flags_written_mask};
 use super::relay_and_lea::{is_relayable_family, plain_gp_operand, split_two_operands};
 
 /// Fuse every eligible index-only LEA + add pair.  Returns whether the text
@@ -128,22 +128,62 @@ fn fuse_pair(store: &LineStore, infos: &[LineInfo], lea_i: usize) -> Option<(usi
         format!("({base64}, {index64}, {scale})")
     };
 
-    // The add's flags must not be observed before the next flag writer;
-    // labels do not end the scan, fall-through carries them.
+    // ADD replaces every arithmetic flag. Keep the bits that can still carry
+    // its value: INC/DEC and BT-family instructions are partial writers, so
+    // neither can terminate this scan while a preserved flag remains live.
+    let mut pending_flags = flags_written_mask(add);
+    if pending_flags != F_ALL {
+        return None; // fail closed if the shared flag model changes
+    }
+    let mut flags_dead = false;
     let mut j = add_i + 1;
     while j < infos.len() {
-        if infos[j].is_nop() {
+        if infos[j].is_steppable() || infos[j].kind == LineKind::Empty {
             j += 1;
             continue;
         }
-        let text = infos[j].trimmed(store.get(j));
-        if reads_flags(store, infos, j) {
+        let raw = store.get(j);
+        let code_end =
+            crate::backend::peephole_common::line_len_without_trailing_comment(raw.as_bytes());
+        let text = infos[j].trimmed(&raw[..code_end]);
+        if infos[j].pinned || infos[j].volatile_access {
             return None;
         }
-        if writes_flags_text(text) {
-            break;
+        match infos[j].kind {
+            LineKind::Ret => {
+                flags_dead = true; // flags are not a function return value
+                break;
+            }
+            LineKind::Jmp
+            | LineKind::JmpIndirect
+            | LineKind::CondJmp
+            | LineKind::Call
+            | LineKind::InlineAsm => return None,
+            LineKind::Label => {
+                j += 1; // fall-through still carries any surviving ADD flags
+                continue;
+            }
+            LineKind::Directive => return None,
+            _ => {}
+        }
+        if super::is_opaque_control_transfer(text) {
+            return None;
+        }
+        match flags_effect(text) {
+            FlagsEffect::Reads => return None,
+            FlagsEffect::Writes => {
+                pending_flags &= !flags_written_mask(text);
+                if pending_flags == 0 {
+                    flags_dead = true;
+                    break;
+                }
+            }
+            FlagsEffect::Neutral => {}
         }
         j += 1;
+    }
+    if !flags_dead {
+        return None; // no proof of a later overwrite or function exit
     }
 
     if !all_editable(infos, &[lea_i, add_i]) {
@@ -266,6 +306,120 @@ mod tests {
         )));
         assert!(out.contains("addl %esi, %eax"), "{out}");
         assert!(!out.contains("leal (%rsi"), "{out}");
+    }
+
+    #[test]
+    fn a_branch_cannot_skip_a_fallthrough_flag_writer() {
+        // The jump skips the physical flag writer. The target's setcc still
+        // observes the add's flags, so deleting that add must be refused.
+        let out = run_fuse(&frame(concat!(
+            "    leal 0(,%rdi,4), %eax\n",
+            "    addl %esi, %eax\n",
+            "    jmp .Ltarget\n",
+            "    xorl %ecx, %ecx\n",
+            ".Ltarget:\n",
+            "    setl %cl\n",
+            "    ret\n",
+        )));
+        assert!(
+            out.contains("addl %esi, %eax"),
+            "add flags retained:\n{out}"
+        );
+        assert!(!out.contains("leal (%rsi"), "no fusion:\n{out}");
+    }
+
+    #[test]
+    fn flag_neutral_vector_and_bmi_instructions_do_not_hide_a_reader() {
+        for neutral in [
+            "    vaddps %ymm0, %ymm1, %ymm2\n",
+            "    mulsd %xmm0, %xmm1\n",
+            "    mulx %r8, %r9, %r10\n",
+        ] {
+            let out = run_fuse(&frame(format!(
+                "    leal 0(,%rdi,4), %eax\n    addl %esi, %eax\n{neutral}    setl %cl\n    ret\n"
+            ).as_str()));
+            assert!(out.contains("addl %esi, %eax"), "{neutral}{out}");
+            assert!(!out.contains("leal (%rsi"), "{neutral}{out}");
+        }
+    }
+
+    #[test]
+    fn lahf_observes_the_add_flags() {
+        let out = run_fuse(&frame(concat!(
+            "    leal 0(,%rdi,4), %eax\n",
+            "    addl %esi, %eax\n",
+            "    lahf\n",
+            "    ret\n",
+        )));
+        assert!(
+            out.contains("addl %esi, %eax"),
+            "add flags retained:\n{out}"
+        );
+        assert!(!out.contains("leal (%rsi"), "no fusion:\n{out}");
+    }
+
+    #[test]
+    fn an_increment_does_not_kill_the_adds_carry_flag() {
+        let out = run_fuse(&frame(concat!(
+            "    leal 0(,%rdi,4), %eax\n",
+            "    addl %esi, %eax\n",
+            "    incq %rcx\n", // preserves CF from the ADD
+            "    setb %r8b\n",
+            "    ret\n",
+        )));
+        assert!(
+            out.contains("addl %esi, %eax"),
+            "add CF must remain live:\n{out}"
+        );
+        assert!(!out.contains("leal (%rsi"), "no fusion:\n{out}");
+    }
+
+    #[test]
+    fn a_full_writer_after_a_partial_writer_kills_all_add_flags() {
+        let out = run_fuse(&frame(concat!(
+            "    leal 0(,%rdi,4), %eax\n",
+            "    addl %esi, %eax\n",
+            "    incq %rcx\n",
+            "    addl $1, %ecx\n",
+            "    setb %r8b\n",
+            "    ret\n",
+        )));
+        assert!(out.contains("leal (%rsi, %rdi, 4), %eax"), "{out}");
+        assert!(!out.contains("addl %esi, %eax"), "{out}");
+    }
+
+    #[test]
+    fn a_label_does_not_end_the_flag_liveness_scan() {
+        let out = run_fuse(&frame(concat!(
+            "    leal 0(,%rdi,4), %eax\n",
+            "    addl %esi, %eax\n",
+            ".Lflag_join:\n",
+            "    setl %cl\n",
+            "    ret\n",
+        )));
+        assert!(
+            out.contains("addl %esi, %eax"),
+            "add flags remain live:\n{out}"
+        );
+        assert!(!out.contains("leal (%rsi"), "no fusion:\n{out}");
+    }
+
+    #[test]
+    fn a_prefixed_indirect_branch_is_a_control_flow_barrier() {
+        let out = run_fuse(&frame(concat!(
+            "    leal 0(,%rdi,4), %eax\n",
+            "    addl %esi, %eax\n",
+            "    notrack jmp *%rax\n",
+            "    xorl %ecx, %ecx\n",
+            ".Lflag_join:\n",
+            "    setl %cl\n",
+            "    ret\n",
+        )));
+        assert!(
+            out.contains("addl %esi, %eax"),
+            "branch can bypass the writer:\n{out}"
+        );
+        assert!(!out.contains("leal (%rsi"), "no fusion:\n{out}");
     }
 
     #[test]

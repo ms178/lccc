@@ -4551,6 +4551,24 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                         eligible.insert(dest.0);
                     }
                 }
+                // x86-64 integer horizontal sums: scalar results that every
+                // emitter lands with the register-aware `store_rax_to`
+                // (scratch: %rax/%xmm0/%xmm1, none allocatable). A GPR home
+                // lets the reduction tail's accumulator web stay in a
+                // register instead of a stack slot (`addq %r10, 8(%rsp)`
+                // per remainder element). Other backends' lowerings are
+                // not audited for this contract.
+                Instruction::Intrinsic {
+                    dest: Some(dest),
+                    op:
+                        IntrinsicOp::VecHorizontalAddI32x4
+                        | IntrinsicOp::VecHorizontalAddI32x8
+                        | IntrinsicOp::VecHorizontalAddI64x2
+                        | IntrinsicOp::VecHorizontalAddI64x4,
+                    ..
+                } if x86_fp_pool && !is_32bit => {
+                    eligible.insert(dest.0);
+                }
                 // Session 28: PHI destinations are real values with real live
                 // intervals (loop-carried state: switch machines, running
                 // pointers).  Without a register home every use reloads them
@@ -6752,6 +6770,27 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     }
                 }
                 if counted >= 2 && start < end {
+                    // The leader receives the scan register, so it must be
+                    // scan-eligible itself. The union-find root need not be:
+                    // a call-spanning root (an F32 call result live across a
+                    // later call and copied into a phi web) took the
+                    // members' envelope, which does not cover its own call,
+                    // and was homed in a caller-saved XMM that the call
+                    // clobbered. Promote the smallest eligible member
+                    // instead; the root keeps its own home like any other
+                    // filtered member.
+                    let leader = if member_intervals.contains_key(leader) {
+                        leader
+                    } else {
+                        let Some(eligible) = members
+                            .iter()
+                            .filter(|m| member_intervals.contains_key(m))
+                            .min()
+                        else {
+                            continue;
+                        };
+                        eligible
+                    };
                     leaders.push(LiveInterval {
                         value_id: *leader,
                         start,
@@ -7655,6 +7694,7 @@ fn collect_vecreg_candidates(func: &IrFunction) -> FxHashSet<u32> {
                 | IntrinsicOp::Storeldi128
                 | IntrinsicOp::Movntdq
                 | IntrinsicOp::Movntpd
+                | IntrinsicOp::Movntps
         )
     };
     let is_raw_reader = |op: &IntrinsicOp| -> bool {
@@ -7926,10 +7966,12 @@ fn vecreg_compute_arg_count(op: &IntrinsicOp) -> Option<usize> {
         | O::VecLShrI64x2
         // Horizontal counting exit: one vector operand, scalar result.
         | O::VecHorizontalAddI64x4 => Some(1),
-        // Byte-predicate counting binaries: two vector operands each
-        // (`vpsadbw a, b`, `vpaddq a, b`).
+        // Byte-sum binaries, two vector operands each: `vpsadbw`/`vpaddq`
+        // and their SSE2 twins (`psadbw`/`paddq`, emit_sse_binary_128).
         | O::VecSadbwU8x32
-        | O::VecAddI64x4 => Some(2),
+        | O::VecAddI64x4
+        | O::VecSadbwU8x16
+        | O::VecAddI64x2 => Some(2),
         // Adler-32 epic binaries: `vpmaddubsw`/`vpmaddwd` each read two
         // vector operands.  The const-table producer reads none (its
         // 32 args are all constants).
@@ -8319,6 +8361,7 @@ fn is_sse128_chain_op(op: &IntrinsicOp) -> bool {
             | O::VecOrI32x4
             | O::VecXorI32x4
             | O::VecAddI64x2
+            | O::VecSadbwU8x16
             | O::VecSubI64x2
             | O::VecAddI8x16
             | O::VecSubI8x16
@@ -9268,9 +9311,13 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
             // Per-lane variable dword shifts (VEX.128 three-operand form,
             // `emit_vex_binary_128`): class 6 (I32x4 family).
             O::VecShlvI32x4 | O::VecLShrvI32x4 | O::VecAShrvI32x4 => Some(6),
-            O::VecZeroI64x2 | O::VecLoadI64x2 | O::VecAddI64x2 | O::VecMulI64x2 => Some(7),
-            // v12 Fix C: the widening reductions PRODUCE an I64x2 dest (the
-            // new accumulator). Classifying them as class 7 lets the Copy-web
+            O::VecZeroI64x2
+            | O::VecLoadI64x2
+            | O::VecAddI64x2
+            | O::VecMulI64x2
+            | O::VecSadbwU8x16 => Some(7),
+            // v12 Fix C: the SSE2 widening reductions PRODUCE an I64x2 dest
+            // (the new accumulator). Classifying them as class 7 lets the Copy-web
             // propagation connect the backedge Copy (dest=phi_acc,
             // src=widen_dest) so the phi-merge Copy does not strand the
             // accumulator (src_class=None → evicted as bad). Combined with
@@ -9278,25 +9325,28 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
             // web — VecZero → Copy(phi) → VecWiden → Copy(backedge) →
             // VecHorizontalAdd — stays classified and reaches the XMM
             // allocator (register-homed accumulator, no stack round-trip).
-            O::VecWidenAddI32x4ToI64x2
-            | O::VecWidenMaskedAddI32x4ToI64x2
-            // Value-shaped SSE2 siblings: same I64x2 accumulator contract;
-            // their lowering confines scratch to the reserved xmm0/xmm1/xmm2
+            // Their lowering confines scratch to the reserved xmm0/xmm1/xmm2
             // triple (xmm2 via the clobbers_xmm2 pool withhold), so a
-            // register-homed accumulator is safe exactly as for the memory
-            // forms.
-            | O::VecWidenAddValueI32x4ToI64x2
-            | O::VecWidenMaskedAddValueI32x4ToI64x2 => Some(7),
+            // register-homed accumulator is safe.
+            O::VecWidenAddValueI32x4ToI64x2 | O::VecWidenMaskedAddValueI32x4ToI64x2 => Some(7),
             // Equal-width masked add consumes an I32x8 accumulator exactly
             // like VecAddI32x8 (its lowering confines scratch to ymm0/ymm1,
             // mirroring the widening-masked path's xmm0/xmm1 discipline).
             O::VecMaskedAddI32x8 => Some(5),
+            // Its SSE2 4-lane sibling consumes and produces an I32x4
+            // accumulator exactly like VecAddI32x4 (class 6); scratch is
+            // xmm0/xmm1 (+ the pool-withheld xmm2).
+            O::VecMaskedAddValueI32x4 => Some(6),
             O::VecLoadWidenI32ToI64x2 => Some(7),
             // The byte-predicate counting reduction family (I64x4):
             // `vpsadbw` produces the four group counts, `vpaddq` updates
             // the u64x4 accumulator, and the zero seeds it.  Class 8 so
             // the Copy-web can home the loop-carried accumulator.
             O::VecSadbwU8x32 | O::VecAddI64x4 | O::VecZeroI64x4 => Some(8),
+            // AVX2 widening steps produce the new I64x4 accumulator
+            // (`vpaddq %ymm`); class 8 keeps the web zero -> phi -> step ->
+            // backedge -> VecHorizontalAddI64x4 in one YMM home.
+            O::VecWidenAddI32x4ToI64x4 | O::VecWidenMaskedAddI32x4ToI64x4 => Some(8),
             // Adler-32 epic: the maddubs result and the .rodata constant
             // tables (weights, ones, seed mask) are 256-bit YMM values kept
             // register-resident across the vector loop — class 8 (the
@@ -9429,6 +9479,10 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                 op,
                 O::StrictRecipMulAddPackedF64x4
                     | O::VecAddI32x4 | O::VecMulI32x4 | O::VecHorizontalAddI32x4
+                    // SSE2 masked equal-width step: reads the I32x4
+                    // accumulator home and writes its own destination
+                    // through the shared 128-bit fold (scratch xmm0/xmm1).
+                    | O::VecMaskedAddValueI32x4
                     // ARX lane ops: their emitters resolve a homed source
                     // through %xmm0/%xmm1 scratch without writing the home
                     // (movdqa in, shifts/por on scratch), so a register-homed
@@ -9461,19 +9515,13 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
             7 => matches!(
                 op,
                 O::VecAddI64x2
+                    | O::VecSadbwU8x16
                     | O::VecMulI64x2
                     | O::VecHorizontalAddI64x2
-                    // v12 Fix C: the widening reductions consume an I64x2
-                    // accumulator (read+write). Their lowerings (v12 Fix D)
-                    // confine scratch to xmm0/xmm1, so a register-homed
-                    // I64x2 accumulator is safe to keep across the widening
-                    // step — whitelist them as legal consumers so the
-                    // verification fixpoint does not evict the accumulator.
-                    | O::VecWidenAddI32x4ToI64x2
-                    | O::VecWidenMaskedAddI32x4ToI64x2
-                    // SSE2 value-shaped widening siblings: same
-                    // accumulator-consumer contract (scratch xmm0/xmm1/xmm2,
-                    // xmm2 pool-withheld).
+                    // v12 Fix C: the SSE2 value-shaped widening steps
+                    // consume an I64x2 accumulator (read+write) with scratch
+                    // confined to xmm0/xmm1/xmm2 (xmm2 pool-withheld), so a
+                    // register-homed accumulator survives them.
                     | O::VecWidenAddValueI32x4ToI64x2
                     | O::VecWidenMaskedAddValueI32x4ToI64x2
                     // BB-SLP sinks: 128-bit store (register-home source)
@@ -9501,6 +9549,11 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
             8 => matches!(
                 op,
                 O::VecAddI64x4 | O::VecHorizontalAddI64x4 | O::VecSadbwU8x32
+                    // AVX2 widening steps read+write the I64x4 accumulator;
+                    // scratch is confined to ymm0/ymm1, so a YMM home
+                    // (ymm2..ymm15) survives them.
+                    | O::VecWidenAddI32x4ToI64x4
+                    | O::VecWidenMaskedAddI32x4ToI64x4
                     // Adler-32 epic multiply-adds: both consume their
                     // 256-bit sources through `emit_avx_binary_256`'s
                     // home-aware paths (all-homed register form, slot r/m
@@ -9592,17 +9645,18 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                                 // stack every iteration).
                                 | O::VecHorizontalAddI64x4
                                 // v12 Fix C: widening reductions consume an
-                                // I64x2 accumulator (whitelisted above). Their
-                                // lowerings confine scratch to xmm0/xmm1 so an
-                                // XMM-homed accumulator is safe — do NOT let
+                                // I64x4 accumulator (whitelisted above). Their
+                                // lowerings confine scratch to ymm0/ymm1 so a
+                                // YMM-homed accumulator is safe — do NOT let
                                 // them poison the whole function.
-                                | O::VecWidenAddI32x4ToI64x2
-                                | O::VecWidenMaskedAddI32x4ToI64x2
+                                | O::VecWidenAddI32x4ToI64x4
+                                | O::VecWidenMaskedAddI32x4ToI64x4
                                 // SSE2 value-shaped widening siblings: same
                                 // reserved-triple scratch discipline, no
                                 // poisoning of unrelated webs.
                                 | O::VecWidenAddValueI32x4ToI64x2
                                 | O::VecWidenMaskedAddValueI32x4ToI64x2
+                                | O::VecMaskedAddValueI32x4
                                 // StrictRecipMulAddF64x4 owns only the
                                 // reserved xmm0/xmm1 scratch pair and has no
                                 // vector SSA result. It therefore cannot
@@ -9673,6 +9727,17 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                                 | O::VecMaxU8x32
                                 | O::VecMinI8x32
                                 | O::VecMaxI8x32
+                                // Their SSE2 twins (the Xmm16 byte-sum and
+                                // byte-map loops): `emit_int_cmp`'s legacy
+                                // branch, `emit_sse_binary_128`, and the
+                                // bitwise blend all confine scratch to the
+                                // xmm0/xmm1 pair the vector pool excludes.
+                                | O::VecCmpI8x16
+                                | O::VecAddI8x16
+                                | O::VecSubI8x16
+                                | O::VecBlendvI8x16
+                                | O::VecMinU8x16
+                                | O::VecMaxU8x16
                                 // 256-bit halfword map ops (OP-05g word
                                 // lanes): same scratch-pair discipline as
                                 // their byte twins — without the exemption
@@ -9930,6 +9995,11 @@ fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
                 op,
                 O::VecMulI32x8
                     | O::VecAddI32x8
+                    // Masked reduction step: the hoisted preheader splat is
+                    // its `lane > rhs` guard (guard slot only, enforced
+                    // below); the emitter reads it via `vec_home_256` or
+                    // stages it with `avx_load_arg_to`, never raw.
+                    | O::VecMaskedAddI32x8
                     // Conditional-map consumers: a broadcast invariant is
                     // the compare rhs / blend true-arm (clamp shapes).
                     | O::VecCmpI32x8
@@ -10020,6 +10090,12 @@ fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
                 O::StrictRecipMulAddPackedF64x4
                     | O::VecMulI32x4
                     | O::VecAddI32x4
+                    // 128-bit masked reduction steps: the hoisted splat is
+                    // the guard (guard slot only, enforced below), read via
+                    // `vec_home_128` or staged with `sse_load_arg`.
+                    | O::VecWidenMaskedAddI32x4ToI64x4
+                    | O::VecWidenMaskedAddValueI32x4ToI64x2
+                    | O::VecMaskedAddValueI32x4
                     | O::VecCmpI32x4
                     | O::VecCmpI64x2
                     | O::VecBlendvI32x4
@@ -10108,6 +10184,21 @@ fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
                     bad.insert(value.0);
                 }
             });
+            // A masked reduction step is a legal consumer ONLY through its
+            // guard slot: the emitter reads a vector-typed operand from that
+            // slot alone, so a broadcast anywhere else (accumulator, address,
+            // displacement) strands it. Fail-closed by construction.
+            if let Instruction::Intrinsic { op, args, .. } = inst {
+                if let Some(guard) = op.masked_guard_arg_index() {
+                    for (i, arg) in args.iter().enumerate() {
+                        if let Operand::Value(v) = arg {
+                            if i != guard && candidates.contains_key(&v.0) {
+                                bad.insert(v.0);
+                            }
+                        }
+                    }
+                }
+            }
             for_each_value_use_in_instruction(inst, |v| {
                 if candidates.contains_key(&v.0) {
                     // Address-side / pointer-only position (intrinsic
@@ -10417,6 +10508,7 @@ fn x86_map_intrinsic_class(op: &crate::ir::intrinsics::IntrinsicOp) -> Option<u8
         // diamond and dead-slot reasoning as the 256-bit arms above.
         | O::VecLoadI64x2
         | O::VecAddI64x2
+        | O::VecSadbwU8x16
         | O::VecSubI64x2
         | O::VecAndI64x2
         | O::VecOrI64x2
@@ -10675,6 +10767,7 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
                     // vec_store_source_128 — the I32x4 twins) and the
                     // SSE4.1 signed dword min/max (emit_sse_binary_128).
                     | O::VecAddI64x2
+                    | O::VecSadbwU8x16
                     | O::VecSubI64x2
                     | O::VecAndI64x2
                     | O::VecOrI64x2
@@ -10778,7 +10871,9 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
 }
 
 /// 128/256-bit vector SSA values for the AArch64 NEON pool (40..47 → v16..v23).
-fn collect_vector_values(func: &IrFunction) -> FxHashSet<u32> {
+/// Also the x86 emitter's static vector-operand test (copy-propagated, so a
+/// `Copy` of a vector value is a vector value).
+pub(crate) fn collect_vector_values(func: &IrFunction) -> FxHashSet<u32> {
     let mut vector_values: FxHashSet<u32> = FxHashSet::default();
     for block in &func.blocks {
         for inst in &block.instructions {
@@ -16465,7 +16560,7 @@ mod map_collector_tests {
 
     #[test]
     fn broadcast_still_stranded_by_unlisted_consumer() {
-        // Same web, but the broadcast also feeds VecWidenMaskedAddI32x4ToI64x2
+        // Same web, but the broadcast also feeds VecWidenMaskedAddI32x4ToI64x4
         // (never a packed FP consumer): fail-closed.
         let f = func(
             vec![
@@ -16476,7 +16571,7 @@ mod map_collector_tests {
                     vec![Operand::Value(Value(9)), Operand::Value(Value(1))],
                 ),
                 intrinsic(
-                    O::VecWidenMaskedAddI32x4ToI64x2,
+                    O::VecWidenMaskedAddI32x4ToI64x4,
                     3,
                     vec![
                         Operand::Value(Value(1)),
@@ -18427,6 +18522,51 @@ mod fp_phi_move_tests {
 mod scalar_lane_class_tests {
     use super::*;
     use crate::ir::reexports::{BasicBlock, BlockId, Value};
+
+    /// Integer horizontal sums yield scalars. `VecHorizontalAddI64x4` was
+    /// classified as a vector producer, which put its result and the whole
+    /// reduction-tail copy web (`s += x[i]` after an AVX2 widening loop) in
+    /// stack slots.
+    #[test]
+    fn integer_horizontal_sums_and_their_copy_webs_are_gpr_class() {
+        use IntrinsicOp as O;
+        let ops = [
+            O::VecHorizontalAddI32x4,
+            O::VecHorizontalAddI32x8,
+            O::VecHorizontalAddI64x2,
+            O::VecHorizontalAddI64x4,
+        ];
+        let mut f = IrFunction::new("hsum_classes".into(), IrType::I64, vec![], false);
+        let mut instructions: Vec<_> = ops
+            .into_iter()
+            .enumerate()
+            .map(|(i, op)| Instruction::Intrinsic {
+                dest: Some(Value(i as u32)),
+                op,
+                dest_ptr: None,
+                args: vec![Operand::Value(Value(20))],
+            })
+            .collect();
+        instructions.push(Instruction::Copy {
+            dest: Value(8),
+            src: Operand::Value(Value(3)),
+        });
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions,
+            terminator: Terminator::Return(Some(Operand::Value(Value(8)))),
+            source_spans: vec![],
+        });
+        let non_gpr = collect_non_gpr_values(&f, false);
+        let vectors = collect_vector_values(&f);
+        for id in [0, 1, 2, 3, 8] {
+            assert!(!non_gpr.contains(&id), "v{id} must stay GPR-class");
+            assert!(!vectors.contains(&id), "v{id} is not a vector value");
+        }
+        for op in ops {
+            assert!(!op.produces_vector_value(), "{op:?} yields a scalar");
+        }
+    }
 
     #[test]
     fn fp_lane_results_and_copies_are_scalar_but_integer_lanes_are_not() {

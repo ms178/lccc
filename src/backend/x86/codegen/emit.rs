@@ -1047,6 +1047,14 @@ pub struct X86Codegen {
     /// The TU's vector/SIMD ISA (`opts.isa`), captured by `apply_options`
     /// and restored after every per-function `target("...")` override.
     module_isa: super::super::isa::X86Isa,
+    /// The meet of `module_isa` and every emitted function's `target("...")`
+    /// ISA. The module-wide text peephole reads `isa::current()` for whole-
+    /// file rewrites (MOVBE fusion, SSE store forwarding); it must run under
+    /// a permission legal in EVERY function, or a `target("no-movbe")` /
+    /// `target("general-regs-only")` function in a `-march=haswell` TU is
+    /// rewritten with instructions it forbids. Published by
+    /// [`Self::publish_peephole_isa`] once emission is done.
+    peephole_isa: super::super::isa::X86Isa,
     /// The TU's baseline `no_sse`, `avx512`, and `avx512vl` bits for restoring
     /// per-function `target("...")` overrides.
     module_no_sse: bool,
@@ -1183,6 +1191,16 @@ pub struct X86Codegen {
     /// Storage-width type of each value, widened by consuming contexts.
     /// NOT the definition's semantic type; see signed_i32_defs.
     pub(super) value_types: FxHashMap<u32, IrType>,
+    /// Hoisted preheader guard splats: values defined by a
+    /// `VecBroadcastI32x4`/`VecBroadcastI32x8` that feed the guard slot
+    /// (`IntrinsicOp::masked_guard_arg_index`) of a masked reduction step.
+    /// The masked emitters read such a guard as a vector (home or slot);
+    /// every other guard operand is a scalar to splat. Per function.
+    pub(super) masked_guard_splats: FxHashSet<u32>,
+    /// The subset of `masked_guard_splats` defined by a broadcast of the
+    /// constant 0: a register-homed one lets the AVX masked steps fold their
+    /// lane load into `vpmaxsd MEM, %zero, %dst`.
+    pub(super) masked_guard_zero_splats: FxHashSet<u32>,
     /// Value ids whose 16-byte i128 slot home is written eagerly at their
     /// definition (i128 ParamRefs, 128-bit call results) — the only
     /// slot-homed i128 values the typed store route may read. See the
@@ -1637,6 +1655,7 @@ impl X86Codegen {
             bmi1_enabled: false,
             module_scalar_isa: ScalarIsa::default(),
             module_isa: super::super::isa::X86Isa::default(),
+            peephole_isa: super::super::isa::X86Isa::default(),
             module_no_sse: false,
             module_avx512: false,
             module_avx512vl: false,
@@ -1672,6 +1691,8 @@ impl X86Codegen {
             folded_cast_dests: FxHashSet::default(),
             fold_skip_cast: None,
             value_types: FxHashMap::default(),
+            masked_guard_splats: FxHashSet::default(),
+            masked_guard_zero_splats: FxHashSet::default(),
             coherent_i128_homes: crate::common::fx_hash::FxHashSet::default(),
             pending_cmp: None,
             pending_widen: [None, None],
@@ -1812,6 +1833,7 @@ impl X86Codegen {
         self.avx512vl_enabled = opts.avx512vl && opts.isa.ymm;
         self.isa = opts.isa;
         self.module_isa = opts.isa;
+        self.peephole_isa = opts.isa;
         self.module_no_sse = self.no_sse;
         self.module_avx512 = self.avx512_enabled;
         self.module_avx512vl = self.avx512vl_enabled;
@@ -2994,12 +3016,9 @@ impl X86Codegen {
                     if !self.home_clobbered.contains(&v.0) || self.home_readable_via_alias(v.0) {
                         if reg.0 != target.0 {
                             if is_xmm_reg(reg) {
-                                // XMM → GPR
+                                // XMM → GPR (SSE1-only code has no MOVQ form).
                                 let xmm_name = phys_reg_name(reg);
-                                self.state.emit_fmt(format_args!(
-                                    "    movq %{}, %{}",
-                                    xmm_name, target_name
-                                ));
+                                self.emit_scalar_xmm_to_gpr(xmm_name, target_name, None);
                             } else {
                                 let src_name = phys_reg_name(reg);
                                 self.state.out.emit_instr_reg_reg(
@@ -3138,11 +3157,9 @@ impl X86Codegen {
                     if !self.home_clobbered.contains(&v.0) || self.home_readable_via_alias(v.0) {
                         if reg.0 != target.0 {
                             if is_xmm_reg(reg) {
+                                // SSE1-only code has no MOVQ form.
                                 let xmm_name = phys_reg_name(reg);
-                                self.state.emit_fmt(format_args!(
-                                    "    movq %{}, %{}",
-                                    xmm_name, target_name
-                                ));
+                                self.emit_scalar_xmm_to_gpr(xmm_name, target_name, None);
                             } else {
                                 // Use movq for register-to-register to preserve sign bits.
                                 // movl zero-extends upper 32 bits, losing sign information
@@ -3716,10 +3733,15 @@ impl X86Codegen {
         }
         if !self.state.is_alloca(dest.0) && !self.state.vector_values.contains(&dest.0) {
             if let Some(slot) = self.state.get_slot(dest.0) {
+                // MOVSD xmm->m64 is SSE2; MOVLPS stores the same low eight
+                // bytes with SSE1 (an x86-64 8-byte vector call result under
+                // `-mno-sse2 -msse`).
                 let instr = if matches!(ty, IrType::F32 | IrType::D32) {
                     "    movss"
-                } else {
+                } else if self.isa.simd {
                     "    movsd"
+                } else {
+                    "    movlps"
                 };
                 self.state.out.emit_instr_reg_rbp(instr, src_xmm, slot.0);
                 return;
@@ -4436,9 +4458,14 @@ impl X86Codegen {
                 // (freshness-gated: a stale home falls to the slot path).
                 if let Some(reg) = self.fresh_home_of(v.0) {
                     let reg_name = phys_reg_name(reg);
-                    self.state
-                        .out
-                        .emit_instr_reg_reg("    movq", reg_name, "rcx");
+                    if is_xmm_reg(reg) {
+                        // SSE1-only code has no MOVQ form.
+                        self.emit_scalar_xmm_to_gpr(reg_name, "rcx", None);
+                    } else {
+                        self.state
+                            .out
+                            .emit_instr_reg_reg("    movq", reg_name, "rcx");
+                    }
                 } else if self.state.acc_has_verified(v.0, false)
                     || self.state.acc_has_verified(v.0, true)
                 {
@@ -6102,8 +6129,15 @@ impl X86Codegen {
                     let shift_amount = (imm as u32) & 31;
                     self.state
                         .emit_fmt(format_args!("    {} ${}, %eax", mnem32, shift_amount));
-                    if !is_unsigned && matches!(op, IrBinOp::Shl | IrBinOp::AShr) {
-                        self.state.emit("    cltq");
+                    // A 32-bit shift zero-fills the upper half; the canonical
+                    // sign-extended home is needed only when some consumer
+                    // reads it wide (`needs_sext_values`, as for the imul
+                    // path above).  The unconditional `cltq` here predated
+                    // that demand analysis and stacked onto every explicit
+                    // widening Cast of the result (`sarl; cltq; movslq`,
+                    // the byte-sum vector-end computation).
+                    if matches!(op, IrBinOp::Shl | IrBinOp::AShr) {
+                        self.emit_sext32_for_value("eax", "rax", is_unsigned, dest.0);
                     }
                 } else {
                     let shift_amount = (imm as u64) & 63;
@@ -7725,13 +7759,17 @@ pub(super) struct ScalarIsa {
 }
 
 impl ScalarIsa {
-    /// `self` plus every scalar extension `features` (normalized
-    /// `target("...")` names) enables. GCC spellings: `abm` = LZCNT+POPCNT.
-    /// Enable-only by design: a `no-*` entry or a vector/`arch=` feature
-    /// leaves the TU's selection untouched (the TU already requires any
-    /// extension it enables, so keeping it is never unsafe), and vector ISA
-    /// would additionally need type legality and RA-class changes.
+    /// The scalar extensions legal under `features` (normalized
+    /// `target("...")` names) on top of `self`, the TU's selection. GCC
+    /// spellings: `abm` = LZCNT+POPCNT, `sse4.2` implies POPCNT (GCC 16.2
+    /// defines `__POPCNT__` for `-msse4.2`). An `arch=` entry replaces the
+    /// TU's selection with that CPU's, as in GCC (`target("arch=x86-64")`
+    /// under `-march=haswell` is the baseline path of a runtime dispatch and
+    /// must not use BMI2); explicit `no-*` denials are applied last.
     pub(super) fn with_target_features(mut self, features: &[String]) -> Self {
+        if features.iter().any(|f| f.starts_with("arch=")) {
+            self = Self::default();
+        }
         for feature in features {
             match feature.as_str() {
                 "bmi" => self.bmi1 = true,
@@ -7805,6 +7843,15 @@ impl X86Codegen {
         } else {
             super::isel::ShlxMode::Never
         });
+    }
+
+    /// Publish the meet of the TU's and every emitted function's ISA for the
+    /// module-wide text peephole. Call once every function is emitted:
+    /// during emission each function's own ISA is current (MachInst picks
+    /// VEX vs legacy encodings from it, and mixing them inside an AVX
+    /// function would cost SSE/AVX transitions).
+    pub fn publish_peephole_isa(&self) {
+        super::super::isa::set_current(self.peephole_isa);
     }
 }
 
@@ -7910,10 +7957,10 @@ impl X86Codegen {
     /// Is the jump table indexed by the value's low 32 bits?
     ///
     /// `build_jump_table`'s index arithmetic is the switch type's own
-    /// wraparound, so every 32-bit (and narrower) class qualifies: a 32-bit
-    /// definition always leaves the full register equal to the value's low
-    /// word, which is why both the in-place and the `%rax` dispatchers may
-    /// use the unsigned 32-bit `(v - min) mod 2^32 < range` test.
+    /// wraparound, so every 32-bit (and narrower) class qualifies for the
+    /// unsigned 32-bit `(v - min) mod 2^32 < range` test. Any subsequent
+    /// 64-bit address use must first canonicalize the register home; the IR
+    /// type alone does not guarantee clean upper bits.
     fn switch_index_is_32bit(ty: IrType) -> bool {
         matches!(
             ty,
@@ -7921,8 +7968,8 @@ impl X86Codegen {
         )
     }
 
-    /// The `(value, 64-bit reg, 32-bit reg)` an in-place 32-bit switch
-    /// dispatch may use, or `None` for the canonical `%rax` path.
+    /// The `(value, physical reg, 64-bit reg, 32-bit reg)` an in-place 32-bit
+    /// switch dispatch may use, or `None` for the canonical `%rax` path.
     ///
     /// Only 32-bit switch types qualify — the table index is the value's low
     /// word — and only when the value is already resident in a GPR that can
@@ -7933,7 +7980,7 @@ impl X86Codegen {
         &mut self,
         val: &Operand,
         ty: IrType,
-    ) -> Option<(u32, &'static str, &'static str)> {
+    ) -> Option<(u32, PhysReg, &'static str, &'static str)> {
         let Operand::Value(v) = val else {
             return None;
         };
@@ -7943,7 +7990,7 @@ impl X86Codegen {
         self.fresh_home_of(v.0)
             .filter(|&reg| !is_xmm_reg(reg) && phys_reg_name(reg) != "rsp")
             .filter(|_| self.value_home_is_expendable(v.0))
-            .map(|reg| (v.0, phys_reg_name(reg), phys_reg_name_32(reg)))
+            .map(|reg| (v.0, reg, phys_reg_name(reg), phys_reg_name_32(reg)))
     }
 
     /// May [`Self::emit_switch_jump_table`]'s direct 32-bit path destroy the
@@ -8053,15 +8100,20 @@ impl ArchCodegen for X86Codegen {
             self.publish_shlx_mode();
         }
         let vec_isa = self.module_isa.with_target_features(features);
-        let want_avx512 = (self.module_avx512
+        // The TU's AVX-512 bits survive unless an `arch=` entry replaces
+        // the TU's ISA (`target("arch=haswell")` in a `-march=x86-64-v4` TU
+        // has no AVX-512, as in GCC). AVX512BW/DQ/CD imply AVX512F (GCC 16.2
+        // compiles `target("avx512bw")` loops to zmm); none implies VL.
+        let arch_reset = features.iter().any(|f| f.starts_with("arch="));
+        let want_avx512 = ((self.module_avx512 && !arch_reset)
             || features.iter().any(|f| {
                 matches!(
                     f.as_str(),
                     "avx512f"
-                        | "avx512vl"
                         | "avx512bw"
                         | "avx512dq"
                         | "avx512cd"
+                        | "avx512vl"
                         | "avx512ifma"
                         | "avx512vbmi"
                         | "avx512vbmi2"
@@ -8090,7 +8142,7 @@ impl ArchCodegen for X86Codegen {
             }))
             && vec_isa.ymm
             && !features.iter().any(|f| f == "no-avx512f");
-        let want_avx512vl = (self.module_avx512vl
+        let want_avx512vl = ((self.module_avx512vl && !arch_reset)
             || features.iter().any(|f| {
                 matches!(
                     f.as_str(),
@@ -8111,6 +8163,7 @@ impl ArchCodegen for X86Codegen {
             }))
             && want_avx512
             && !features.iter().any(|f| f == "no-avx512vl");
+        self.peephole_isa = self.peephole_isa.meet(vec_isa);
         let want_no_sse = if features.is_empty() {
             self.module_no_sse
         } else {
@@ -9672,10 +9725,11 @@ impl ArchCodegen for X86Codegen {
         // (b) DIRECT 32-BIT REGISTERS (fast path): when the switch value
         //     is already resident in a GPR, index the table from that
         //     register's 64-bit view and run the whole sub/cmp sequence
-        //     in 32-bit form. A 32-bit definition always leaves the full
-        //     64-bit register equal to the value's low word (32-bit ops
-        //     zero the upper word; 64-bit definitions store the value
-        //     itself), so no extend is needed; and the unsigned 32-bit
+        //     in 32-bit form. The emitter first establishes the defined
+        //     32-bit value: a plain 32-bit subtract clears the upper word,
+        //     while min == 0 and narrow sources need an explicit extension.
+        //     Without that step an ABI argument's arbitrary upper bits would
+        //     become part of the 64-bit SIB address. The unsigned 32-bit
         //     wraparound test
         //         (v - min) mod 2^32 < range   (jae when ≥)
         //     is exactly the in-range predicate for every i8..u32
@@ -9685,7 +9739,22 @@ impl ArchCodegen for X86Codegen {
         //     cmpl $range,%reg; jae` shape and drops the rax
         //     materialisation plus the zero/sign extend from the hot
         //     dispatch path.
-        let direct32 = self.direct32_switch_index(val, ty);
+        let direct32 = self
+            .direct32_switch_index(val, ty)
+            .and_then(|(v_id, reg, r64, r32)| {
+                // Select the extension before committing to the fast path.
+                // An unexpected type must use the canonical RAX sequence,
+                // not turn an emitter precondition into a panic.
+                let extend = match ty {
+                    IrType::I32 | IrType::U32 => None,
+                    IrType::U8 => Some("movzbl"),
+                    IrType::U16 => Some("movzwl"),
+                    IrType::I8 => Some("movsbl"),
+                    IrType::I16 => Some("movswl"),
+                    _ => return None,
+                };
+                Some((v_id, reg, r64, r32, extend))
+            });
 
         let in_range = match val {
             Operand::Value(v) => {
@@ -9700,7 +9769,24 @@ impl ArchCodegen for X86Codegen {
         };
 
         let index_reg: &'static str = match direct32 {
-            Some((v_id, r64, r32)) => {
+            Some((v_id, reg, r64, r32, extend)) => {
+                // A register home does not prove that bits above the IR
+                // value are canonical: external ABI arguments may have
+                // arbitrary upper bits, and narrow producers may only write
+                // their low byte/word. A 64-bit SIB index observes all of
+                // them. Establish the defined 32-bit value before the first
+                // compare/subtract; the subtract itself would otherwise
+                // consume dirty low-word bits for narrow sources.
+                if let Some(extend) = extend {
+                    let source = typed_phys_reg_name(reg, ty);
+                    self.state
+                        .emit_fmt(format_args!("    {} %{}, %{}", extend, source, r32));
+                } else if min_val == 0 {
+                    // Unlike subl, cmpl does not write its destination and
+                    // therefore cannot clear the upper half of the SIB index.
+                    self.state
+                        .emit_fmt(format_args!("    movl %{}, %{}", r32, r32));
+                }
                 if min_val != 0 {
                     // min_val fits i32: every 32-bit-class case value
                     // does. The 32-bit sub wraps mod 2^32 — exactly the
@@ -10229,6 +10315,25 @@ impl ArchCodegen for X86Codegen {
                             s_name,
                             d_name
                         ));
+                    } else if !self.isa.simd && (is_xmm_reg(d) || is_xmm_reg(s)) {
+                        // SSE1-only: GPR<->XMM MOVD/MOVQ are SSE2, so a mixed
+                        // copy goes through the memory bridge at the copy's
+                        // own width.
+                        let f32ish = matches!(
+                            self.value_types.get(&dest.0),
+                            Some(IrType::F32 | IrType::D32)
+                        );
+                        if is_xmm_reg(d) {
+                            self.emit_scalar_gpr_to_xmm(
+                                s_name,
+                                phys_reg_name_32(s),
+                                d_name,
+                                f32ish,
+                            );
+                        } else {
+                            let d32 = f32ish.then(|| phys_reg_name_32(d));
+                            self.emit_scalar_xmm_to_gpr(s_name, d_name, d32);
+                        }
                     } else {
                         self.state
                             .out
@@ -10262,9 +10367,21 @@ impl ArchCodegen for X86Codegen {
                 // instead of bouncing the bit pattern through %rax.
                 if is_xmm_reg(d) {
                     let d_name = phys_reg_name(d);
+                    // Width follows the copy's type, not just the constant
+                    // kind: an F32 Value read as F64 is an 8-byte `movsd`
+                    // over-read of its 4-byte slot (SSE2-only under
+                    // `-mno-sse2`) or a `movapd` register copy.
                     let ty = match src {
-                        Operand::Const(IrConst::F32(_)) => IrType::F32,
-                        _ => IrType::F64,
+                        Operand::Const(IrConst::F32(_) | IrConst::D32(_)) => IrType::F32,
+                        Operand::Const(_) => IrType::F64,
+                        Operand::Value(v) => match self
+                            .value_types
+                            .get(&dest.0)
+                            .or_else(|| self.value_types.get(&v.0))
+                        {
+                            Some(IrType::F32 | IrType::D32) => IrType::F32,
+                            _ => IrType::F64,
+                        },
                     };
                     self.emit_fp_operand_to_xmm(src, ty, d_name);
                     self.state.reg_cache.invalidate_acc();
@@ -12342,5 +12459,59 @@ mod scalar_sse1_bridge_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod target_feature_isa_tests {
+    use super::*;
+
+    fn feats(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn arch_entries_replace_the_scalar_selection() {
+        let haswell = ScalarIsa {
+            bmi1: true,
+            bmi2: true,
+            lzcnt: true,
+            popcnt: true,
+        };
+        let none = ScalarIsa::default();
+        // GCC 16.2: `target("arch=x86-64")` under `-march=haswell` is the
+        // baseline path of a dispatch; it keeps none of the TU's extensions.
+        assert_eq!(haswell.with_target_features(&feats(&["arch=x86-64"])), none);
+        assert_eq!(
+            haswell.with_target_features(&feats(&["arch=x86-64-v2"])),
+            ScalarIsa {
+                popcnt: true,
+                ..none
+            }
+        );
+        assert_eq!(
+            haswell.with_target_features(&feats(&["arch=x86-64", "bmi2"])),
+            ScalarIsa { bmi2: true, ..none }
+        );
+        assert_eq!(
+            none.with_target_features(&feats(&["arch=haswell"])),
+            haswell
+        );
+        // Without `arch=` the TU's selection stays; denials still apply.
+        assert_eq!(
+            haswell.with_target_features(&feats(&["no-bmi2"])),
+            ScalarIsa {
+                bmi2: false,
+                ..haswell
+            }
+        );
+        // GCC 16.2 defines `__POPCNT__` for `-msse4.2`.
+        assert_eq!(
+            none.with_target_features(&feats(&["sse4.2"])),
+            ScalarIsa {
+                popcnt: true,
+                ..none
+            }
+        );
     }
 }

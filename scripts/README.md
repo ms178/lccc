@@ -24,6 +24,12 @@ construction, reports the honest source fallback for that shape. See the
 | `ensure_swap.sh` | Idempotently verify swap or recreate/activate the disposable 8 GiB `/swapfile` after a constrained-harness root reset; both compiler build scripts invoke it. |
 | `ci_enable_swap.sh` | Create and verify an active 4 GiB swap file in the ephemeral GitHub runner temp directory before memory-heavy CI, Clippy, oracle, and benchmark jobs; `LCCC_CI_SWAP_SIZE` overrides the size. |
 | `ci_install_gcc16.sh` | Provision GCC/G++ 16 from the runner distribution or Ubuntu Toolchain PPA when needed; `--multilib` adds both GCC16 and system multilib runtimes for the i686 differential suite and fails closed when `gcc-16 -m32` cannot link. Success is defined by *exact package resolvability* (`apt-cache pkgnames`), not by `apt-get update`'s exit status, because apt exits 0 when a repository index 503s. Keeps apt's index (`Dir::State::lists`) beside the cached debs, so a warm runner resolves the toolchain without touching the PPA CDN, and retries a flapping edge over a bounded six-round window. When the index still cannot be refreshed, it installs the verified debs a previous run cached (dpkg needs no index) and requires the same version contract; a cache that does not cover every requested package fails closed. Publishes one bounded `::error` annotation on failure so every CI lane is diagnosable from the Checks API. |
+| `ci_install_mold_oracle.sh` | Provision mold **3.0.0** exactly (the latest public mold release; it superseded the `harness-cache-1` tag's 2.42.1 binary): downloads the official x86-64 release asset, requires the GitHub-published SHA-256, refuses a foreign/stale prefix, and earns exit 0 by linking and running a probe through it (`-fuse-ld=mold`), not by a version string. Building mold from source instead is `tools/linker/setup_oracles.sh` / `tests/linker/setup_oracles.sh` (mold 3.x has no CMake: the x86-only preset is the mold-cli Cargo features `x86_64,i386`). |
+| `ensure_qemu_user.sh` | (Re)provision the pinned QEMU user-mode emulators (`qemu-aarch64/arm/i386/riscv64`) at **11.1.2** — replacing the `harness-cache-3` tag's 8.2.2 binaries — from Debian sid's `qemu-user` 11.1.2+ds-3 `.deb`, pinned by the signed Packages-index SHA-256 with a snapshot.debian.org content-hash fallback. A warm prefix is reused only when every binary reports 11.1.2; a stale set is replaced. `--self-test` exercises the version probe offline. |
+| `publish_agent_toolchain_cache.sh` | Opt-in hosted publisher that assembles every current oracle/toolchain into a new immutable orphan tag whose parts are reachable over `github.com` only. It verifies the locked Clang/Rust assets, the pinned mold release, Debian sid QEMU packages and pinned binutils 2.47 sources, kernel relocs v7.3 sources, and the existing transport-tag payloads; it records `MANIFEST.sha256`, `CACHE.json`, and `PARTS.tsv` in the tag. |
+| `ensure_binutils_247_binary.sh` | Restore the reviewed bookworm-compatible binutils 2.47 program set from the immutable GitHub-only agent cache instead of compiling it on each runner. It verifies `as`, `ld`, `ld.bfd`, `objdump` and `readelf`, supports `--verify-only`/`--print-bin`/`--self-test`, and is used by the linker-oracle setup scripts and `--with-binutils` restoration. |
+| `restore_agent_toolchain_cache.py` | Consumer for that orphan tag. It reassembles `<name>.partNN` blobs with `git cat-file`, verifies every canonical file against `MANIFEST.sha256` and the reviewed in-tree lock, extracts the toolchains, writes wrappers plus `env.sh`, and supports `--only`, `--verify-only`, `--no-shims`, and `--self-test`. No non-GitHub download host is needed. |
+| `check_toolchain_cache_freshness.py` | Audits every package in the tag hash cache against its latest public release. `--offline` (unit-tested, no network) fails when any two files disagree about the same package's pin; online mode additionally queries upstream (GitHub releases, GNU/sourceware listings, kernel.org, Arm permalinks, Intel's APT index, Debian madison) and fails STALE on any pin that is no longer latest. Deliberate exceptions (the 1.97.0 MSRV floor, the historical 23.1.3 tag tree) are reported as INFO, never skipped silently. |
 | `arena_session_restore.sh` | Rehydrates swap, the manifest-selected current Rust/Cargo toolchain, host multilib/kernel packages, git metadata and fastbuild after an Arena reset. |
 | `kernel_version.sh` | Single source of truth for *which* Linux tree the kernel harness uses (explicit `KERNEL_DIR`/`KVER` > prepared tree on disk > package PKGBUILD > pinned fallback). Sourced by every kernel script; CLI via `--kver`/`--default-dir`. |
 | `prepare_kernel_tree.sh` | Recreate the linux-cachymod tree (version from the package PKGBUILD) with its patch series and generated boot headers after a harness wipe. |
@@ -310,6 +316,12 @@ python3 scripts/aarch64_execute_suite.py \
     --lccc target/fastbuild/lccc-arm \
     --assembler /path/to/binutils-2.47/aarch64-linux-gnu-as \
     --jobs 2 --flags=-O2 --json /tmp/aarch64-torture.json
+
+# With Debian's aarch64-linux-gnu cross GCC/glibc and static Clang references,
+# use --sysroot=/ (the cross driver layout is already target-qualified). Using
+# /usr/aarch64-linux-gnu as Clang's sysroot can double-prefix linker-script paths.
+# An explicitly requested Clang compile/link failure is HARNESS-ERROR, and an
+# ORACLE-DISAGREE is nonzero; neither can silently degrade to a GCC-only PASS.
 ```
 
 ## Contracts the gates now pin (2026-10-13 audit session)
@@ -423,3 +435,39 @@ The real probe test requires **both** `LCCC_TEST_REAL_ICX=1` and
 `LCCC_ICX_BIN`. An explicitly requested real probe fails on a wrong or unusable
 compiler instead of being converted to a skip. No compilation is performed
 by that probe, only predefined-macro preprocessing.
+
+### Switch lowering red-team contracts
+
+`python3 -m unittest scripts.test_aarch64_execute_suite` exercises oracle
+failure classification and bounded mismatch diagnostics without external tools.
+`tests/regression/check_builtin_floor_narrowing.sh` separates call-routing
+contracts from a numerical binary32 oracle: 42 signed boundary inputs and
+65,536 deterministic samples, each checked through three call forms, on both
+x86 ABIs at five optimization levels. It checks quiet-NaN classification and
+signed zero, not NaN payloads or floating-environment exception flags.
+
+`python3 tests/regression/check_switch_cross_execute.py` runs nine self-checking
+switch fixtures with LUT lowering on/off under AArch64 and RV64 QEMU (36 runs).
+It requires the fastbuild target drivers, Clang 23.1.4, GNU target linkers or LLD,
+QEMU user emulators, and host C declaration headers. The executable uses a
+minimal syscall startup and no cross libc; printf/puts are no-ops, so acceptance
+is based on each fixture's exit-code oracle, not its printed output. `--clang`,
+`--qemu-dir`, and `--lccc-dir` select tool locations; `--ld` selects one GNU/LLD
+linker supporting both target emulations. Discovery prefers GNU triplet linkers,
+then system LLD, then the building Rust toolchain's bundled `rust-lld`. These
+freestanding fixtures do not require cross GCC or cross libc packages.
+`python3 tests/regression/test_check_switch_cross_execute.py` tests discovery
+and its fail-closed missing-tool diagnostics.
+The assembler/linker CI lane runs this gate after cross-toolchain provisioning.
+
+For a compile-time lookup witness (not a timing threshold gate):
+
+```sh
+cargo test --profile fastbuild --lib switch_definition_index_scaling_witness \
+  -- --nocapture
+```
+
+The witness runs in the normal unit suite (no timing threshold) and asserts equality between linear-scan and indexed definition
+results, and reports both timings for 2,000 queries. Production indexes only
+original switch operands, rejects multiple definitions, and rebuilds return
+path memoization after each IR transformation.

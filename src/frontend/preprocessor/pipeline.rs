@@ -147,9 +147,9 @@ pub struct Preprocessor {
 
 impl Preprocessor {
     pub fn new() -> Self {
-        // A fresh preprocessor starts in the default dialect (gnu17); the
-        // driver selects C23 afterwards via `set_c23`.
-        super::utils::set_c23_dialect(false);
+        // A fresh preprocessor starts in the GCC 16.2 default dialect
+        // (gnu23); an explicit older `-std=` switches it via `set_c23`.
+        super::utils::set_c23_dialect(true);
         let mut pp = Self {
             macros: MacroTable::new(),
             conditionals: ConditionalStack::new(),

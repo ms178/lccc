@@ -1671,7 +1671,9 @@ impl Lowerer {
         Operand::Value(lhs_ptr_val)
     }
 
-    /// Check if an expression is a function call returning packed scalar vector data.
+    /// Check if an expression is a function call returning packed scalar vector
+    /// data. Only the bare call: conditional, comma and statement-expression
+    /// wrappers spill such a carrier themselves (`spill_packed_vector_wrapper`).
     pub(super) fn rhs_is_small_vector_call(&self, rhs: &Expr, vec_size: usize) -> bool {
         match rhs {
             Expr::FunctionCall(func_expr, _, _) => self.call_result_is_packed(func_expr, vec_size),

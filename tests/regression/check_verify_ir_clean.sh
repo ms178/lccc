@@ -46,11 +46,13 @@ WANT_LITERAL=$(sort -k2 <<'EOF'
 1 loop_carried_forward_late
 1 loop_idiom
 1 loop_preheader
+1 masked_guard_splat_hoist
 1 pair_load_carry
 1 reassoc_lat
 1 slp
 1 slp_late
 2 sret_copy_elision
+1 vec_interleave_late
 1 vecaddr
 1 vecfma
 1 vecrelations
@@ -80,7 +82,7 @@ for funnel in iphase_dump o1_checkpoint preloop_dump timed_pass; do
     grep -q "macro_rules! $funnel" src/passes/mod.rs \
         || { echo "FAIL: hook funnel $funnel is gone from src/passes/mod.rs" >&2; exit 1; }
 done
-WANT_HOOKS=30
+WANT_HOOKS=32
 if [ "$HOOKS" -ne "$WANT_HOOKS" ]; then
     echo "FAIL: $HOOKS verify::verify_after_pass hooks in src/passes/mod.rs, pinned at $WANT_HOOKS." >&2
     echo "      If a pass hook was added/removed on purpose, update WANT_HOOKS in this same change." >&2
@@ -108,7 +110,13 @@ while IFS= read -r src; do
         tail -n 5 "$tmp/err" >&2
         fail=1
     fi
-done < "$LIST"
+done < <(cat "$LIST" - <<'PINNED'
+# Pinned regressions, outside the regenerated sample: synthesized functions
+# the sampled sweep cannot reach. target_clones resolvers once carried
+# next_label=0 below their live labels ("stale label counter").
+tests/regression/target_clones_multiversion.c
+PINNED
+)
 
 if [ "$checked" -lt 50 ]; then
     echo "FAIL gate list too short ($checked files); regenerate it" >&2

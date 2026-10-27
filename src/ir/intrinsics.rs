@@ -60,11 +60,13 @@ pub enum IntrinsicOp {
     /// i686 baseline is pre-SSE silicon where `0F 18 /0-3` is #UD. RISC-V
     /// emits nothing without Zicbop (GCC parity for `rv64gc`).
     Prefetch(u8),
-    /// Non-temporal stores: movnti (32-bit), movnti64 (64-bit), movntdq (128-bit), movntpd (128-bit double)
+    /// Non-temporal stores: movnti (32-bit), movnti64 (64-bit), movntdq (128-bit), movntpd (128-bit double),
+    /// movntps (128-bit float; SSE1, so it is legal on an SSE1-only target)
     Movnti,
     Movnti64,
     Movntdq,
     Movntpd,
+    Movntps,
     /// Load/store 128-bit unaligned
     Loaddqu,
     Storedqu,
@@ -618,26 +620,28 @@ pub enum IntrinsicOp {
     VecOrI8x32,
     /// 32×I8/U8 lane bitwise — vpxor.
     VecXorI8x32,
-    /// Widening reduction step: dest(I64x2 accumulator) += sign-extend of
-    /// 4×I32 loaded from (base, byte_offset). One intrinsic = load 4 I32s,
-    /// widen lanes 0..1 and 2..3 to two I64x2 halves, add both into the
-    /// accumulator. x86 lowering: vmovdqu + vpmovsxdq×2 + vextracti128 +
-    /// paddq×2. Full I64 precision per lane — `long s += (long)int_arr[i]`
-    /// over 4 elements/iteration.
-    VecWidenAddI32x4ToI64x2,
-    /// Masked widening reduction step: dest(I64x2 accumulator) += sext of
-    /// 4×I32 loaded from (base, byte_offset) WHERE the lane satisfies
-    /// `lane > guard_rhs`. args = [accumulator, base, byte_offset,
-    /// guard_rhs]. The x86 lowering builds the per-lane I32 mask with
-    /// vpcmpgtd, sign-extends it through the same vpmovsxdq lane geometry
-    /// (all-ones/all-zeros I64 masks), and vpand zero-masks the widened
-    /// values before the paddq folds — exact lane-guarded I64 accumulation
-    /// (GCC's canonical conditional-reduction form).
-    VecWidenMaskedAddI32x4ToI64x2,
+    /// Widening reduction step (AVX2): dest(I64x4 accumulator) +=
+    /// sign-extend of 4×I32 loaded from (base, byte_offset). args =
+    /// [accumulator, base, byte_offset, (constant displacement — the
+    /// vec_interleave slices)]. x86 lowering: `vpmovsxdq m128, %ymm0;
+    /// vpaddq %ymm0, acc, dest` — the load, both widenings and the fold in
+    /// two instructions, `long s += (long)int_arr[i]` at 4 elements per
+    /// step. (The former I64x2 accumulator needed a 128-bit load, two
+    /// vpmovsxdq, a vpunpckhqdq and two paddq for the same four lanes.)
+    VecWidenAddI32x4ToI64x4,
+    /// Masked widening reduction step (AVX2): dest(I64x4 accumulator) +=
+    /// sext of the 4×I32 loaded from (base, byte_offset) WHERE the lane
+    /// satisfies `lane > guard_rhs` (signed). args = [accumulator, base,
+    /// byte_offset, guard_rhs, (constant displacement)]. The lowering masks
+    /// at I32 (`emit_guarded_i32_lanes`: vpcmpgtd + vpand, or one vpmaxsd for
+    /// rhs 0), then `vpmovsxdq %xmm0, %ymm0; vpaddq` — exact because
+    /// sext(a & m) == sext(a) & sext(m) for a 0/-1 mask m. This is the
+    /// per-4-lane body of Clang 23 and ICX 2026.2.
+    VecWidenMaskedAddI32x4ToI64x4,
     /// Widening reduction step over VALUE operands (SSE2 4-lane form):
     /// dest(I64x2 accumulator) += sign-extend of the 4×I32 VALUE in
     /// args[1]. args = [accumulator, vec]. Unlike the memory-shaped
-    /// VecWidenAddI32x4ToI64x2 (AVX2, load fused into the composite) the
+    /// VecWidenAddI32x4ToI64x4 (AVX2, load fused into the composite) the
     /// load is a separate VecLoadI32x4 — this op is the (acc, vec)
     /// widening add the 128-bit register-based transform builds, the same
     /// shape as NEON's VecSadalpI32x4. x86 lowering (SSE2-only ops):
@@ -653,17 +657,29 @@ pub enum IntrinsicOp {
     /// all-ones/zero I32 mask with pcmpgtd, pand zero-masks the I32 value
     /// BEFORE the dual sign-unpack (masking at I32 with a 0/-1 mask is
     /// exact: sext(a & m) == sext(a) & sext(m)), then folds both widened
-    /// halves into the accumulator — the value-shaped sibling of
-    /// VecWidenMaskedAddI32x4ToI64x2, same xmm0/xmm1/xmm2 scratch
-    /// discipline.
+    /// halves into the accumulator — the SSE2 value-shaped counterpart of
+    /// VecWidenMaskedAddI32x4ToI64x4, scratch confined to the reserved
+    /// xmm0/xmm1/xmm2 triple.
     VecWidenMaskedAddValueI32x4ToI64x2,
+    /// SSE2 4-lane MASKED equal-width sum step: dest(I32x4 accumulator) =
+    /// accumulator + (vec lane WHERE `lane > guard_rhs` (signed), else 0).
+    /// args = [accumulator, vec, guard_rhs]. The value-shaped 128-bit
+    /// counterpart of VecMaskedAddI32x8 for the default (SSE2) target:
+    /// pcmpgtd builds the all-ones/zero lane mask, pand zero-masks the
+    /// lanes, paddd folds them (`pmaxsd` against zero replaces all three
+    /// for `lane > 0` when SSE4.1 is available: max(lane, 0) is exactly the
+    /// masked lane for every signed value). `guard_rhs` is a constant, a
+    /// loop-invariant scalar, or the vectorizer's hoisted preheader splat
+    /// (a VecBroadcastI32x4 value). Scratch: xmm0/xmm1, plus xmm2 for a
+    /// slot-homed splat (pool-withheld, see `clobbers_xmm2`).
+    VecMaskedAddValueI32x4,
     /// Masked equal-width reduction step: dest(I32x8 accumulator) +=
     /// 8×I32 loaded from (base, byte_offset) WHERE the lane satisfies
     /// `lane > guard_rhs` (signed).  args = [accumulator, base,
     /// byte_offset, guard_rhs].  The x86 lowering builds the per-lane I32
     /// mask with vpcmpgtd (lanes > rhs), vpand zero-masks the loaded lanes
     /// and vpaddd folds them into the accumulator — the equal-width sibling
-    /// of VecWidenMaskedAddI32x4ToI64x2.  Without it the non-widening
+    /// of VecWidenMaskedAddI32x4ToI64x4.  Without it the non-widening
     /// conditional-sum transform silently DROPPED the Select guard
     /// (`if (a[i] > 0) s += a[i]` summed every element; regression:
     /// tests/regression/vector_guard_sum.c).
@@ -847,6 +863,11 @@ pub enum IntrinsicOp {
     /// loop epic uses it against the zero as the `vs1` partial-sum
     /// generator (bytes are non-negative, so `|b − 0| = b`).
     VecSadbwU8x32,
+    /// 128-bit twin of [`Self::VecSadbwU8x32`] (`psadbw`, SSE2 baseline):
+    /// two u64 group sums per XMM.  COMMUTATIVE.  The byte-sum and
+    /// byte-predicate counting reductions use it against an all-zero
+    /// vector on targets without 256-bit integer vectors.
+    VecSadbwU8x16,
     /// Packed byte×byte pair multiply-add (`vpmaddubsw`, SSSE3/AVX2):
     /// `dest = Maddubs(args[0], args[1])` — for each byte pair, the
     /// i16 sum `args[0][2i] * args[1][2i] + args[0][2i+1] * args[1][2i+1]`
@@ -2134,9 +2155,9 @@ impl IntrinsicOp {
             | Phaddw256 | Phaddd256 | Pabsd256 | Pmuludq256
             // `VecMaskedAddI32x8` folds eight I32 lanes into an I32x8
             // accumulator: a 256-bit result, emitted with `vpaddd %ymm`.
-            // It was grouped with its 128-bit WIDENING sibling
-            // (`VecWidenMaskedAddI32x4ToI64x2`, whose I64x2 result really is
-            // 128-bit), which made every copy of the accumulator a legacy
+            // It was grouped with its then-128-bit WIDENING sibling (an
+            // I64x2-accumulator step, since widened to
+            // `VecWidenMaskedAddI32x4ToI64x4`), which made every copy of the accumulator a legacy
             // `movdqa %xmm`. That preserves bits 255:128 of the destination,
             // so the upper four lanes of the accumulator never advanced and
             // the guarded sum silently dropped half its terms
@@ -2144,15 +2165,14 @@ impl IntrinsicOp {
             // also handed the value a 16-byte protected slot for 32 bytes of
             // data.
             | VecMaskedAddI32x8
-            // The `I64x4` family (4 x i64 = 32 bytes) was appended to the
-            // 128-bit list together with `VecHorizontalAddI64x4`. x86 has no
-            // lowering for them today (`intrinsics.rs` matches them to a
-            // no-op and `vec_interleave` keeps them out of the accumulator
-            // set), so the mistake is latent -- but a 256-bit shape declaring
-            // 16 bytes is a loaded gun: it hands the value a half-size
-            // protected slot and makes every copy a legacy `movdqa %xmm`
-            // that silently freezes the upper lanes. Classify by shape.
+            // The `I64x4` family (4 x i64 = 32 bytes) was once appended to
+            // the 128-bit list. A 256-bit shape declaring 16 bytes hands the
+            // value a half-size protected slot and makes every copy a legacy
+            // `movdqa %xmm` that silently freezes the upper lanes. Classify by
+            // shape -- including the widening steps, whose accumulator is
+            // I64x4.
             | VecLoadI64x4 | VecAddI64x4 | VecZeroI64x4 | VecSadbwU8x32
+            | VecWidenAddI32x4ToI64x4 | VecWidenMaskedAddI32x4ToI64x4
             // Adler-32 loop epic: the two packed multiply-add producers and
             // the .rodata constant-table producer are 256-bit results.
             | VecMaddubsU8x32 | VecMaddwdI16x16 | VecConstI8x32
@@ -2231,11 +2251,11 @@ impl IntrinsicOp {
             | VecAShrvI32x4
             | VecShlvI64x2
             | VecLShrvI64x2
-            | VecWidenAddI32x4ToI64x2
-            | VecWidenMaskedAddI32x4ToI64x2
             | VecWidenAddValueI32x4ToI64x2
             | VecWidenMaskedAddValueI32x4ToI64x2
+            | VecMaskedAddValueI32x4
             | VecLoadWidenI32ToI64x2 | VecLoadI64x2 | VecAddI64x2 | VecMulI64x2 | VecStoreI64x2 | VecBroadcastI64x2 | VecZeroI64x2
+            | VecSadbwU8x16
             | VecSubI32x4 | VecSubI64x2 | VecAndI32x4 | VecOrI32x4 | VecXorI32x4
             | VecMulI32x4 | VecBroadcastI32x4 | VecSmaxI32x4 | VecSminI32x4
             // BB-SLP 128-bit families: I64x2 bitwise, I16x8/I8x16
@@ -2273,8 +2293,8 @@ impl IntrinsicOp {
             IntrinsicOp::CopysignF32 | IntrinsicOp::CopysignF64 |
             IntrinsicOp::F128Fabs | IntrinsicOp::F128Neg | IntrinsicOp::F128Copysign |
             IntrinsicOp::F16ToF32 | IntrinsicOp::F32ToF16 |
-            IntrinsicOp::VecWidenAddI32x4ToI64x2
-            | IntrinsicOp::VecWidenMaskedAddI32x4ToI64x2
+            IntrinsicOp::VecWidenAddI32x4ToI64x4
+            | IntrinsicOp::VecWidenMaskedAddI32x4ToI64x4
             | IntrinsicOp::VecMaskedAddI32x8 |
             IntrinsicOp::LDFabs | IntrinsicOp::LDCopysign |
             IntrinsicOp::Aesenc128 | IntrinsicOp::Aesenclast128 |
@@ -2487,6 +2507,20 @@ impl IntrinsicOp {
     /// Returns true if this intrinsic produces a 128/256-bit vector value
     /// (as opposed to a scalar).  These values cannot live in a GPR; backends
     /// either home them on the stack or allocate SIMD registers for them.
+    /// Argument slot holding the `lane > rhs` guard of a masked reduction
+    /// step, or `None` for every other op. The ONE definition shared by the
+    /// vectorizer (which may place a hoisted preheader splat there), the
+    /// register allocator (which may home a broadcast only in that slot) and
+    /// the x86 emitter (which reads a vector-typed guard only from it).
+    pub fn masked_guard_arg_index(&self) -> Option<usize> {
+        match self {
+            IntrinsicOp::VecMaskedAddI32x8 | IntrinsicOp::VecWidenMaskedAddI32x4ToI64x4 => Some(3),
+            IntrinsicOp::VecWidenMaskedAddValueI32x4ToI64x2
+            | IntrinsicOp::VecMaskedAddValueI32x4 => Some(2),
+            _ => None,
+        }
+    }
+
     pub fn produces_vector_value(&self) -> bool {
         matches!(
             self,
@@ -2627,10 +2661,11 @@ impl IntrinsicOp {
                 | IntrinsicOp::VecRoundF32x4
                 | IntrinsicOp::VecXorF32x8
                 | IntrinsicOp::VecXorF32x4
-                | IntrinsicOp::VecWidenAddI32x4ToI64x2
-                | IntrinsicOp::VecWidenMaskedAddI32x4ToI64x2
+                | IntrinsicOp::VecWidenAddI32x4ToI64x4
+                | IntrinsicOp::VecWidenMaskedAddI32x4ToI64x4
                 | IntrinsicOp::VecWidenAddValueI32x4ToI64x2
                 | IntrinsicOp::VecWidenMaskedAddValueI32x4ToI64x2
+                | IntrinsicOp::VecMaskedAddValueI32x4
                 | IntrinsicOp::VecMaskedAddI32x8
                 | IntrinsicOp::VecBroadcastF32x8
                 | IntrinsicOp::VecBroadcastF32x4
@@ -2644,12 +2679,15 @@ impl IntrinsicOp {
                 | IntrinsicOp::VecLoadI64x2
                 | IntrinsicOp::VecLoadI32x4Pair
                 | IntrinsicOp::VecAddI64x2
+                | IntrinsicOp::VecSadbwU8x16
                 | IntrinsicOp::VecMulI64x2
                 | IntrinsicOp::VecBroadcastI64x2
                 | IntrinsicOp::VecZeroI64x2
                 | IntrinsicOp::VecLoadI64x4
                 | IntrinsicOp::VecAddI64x4
-                | IntrinsicOp::VecHorizontalAddI64x4
+                // Not `VecHorizontalAddI64x4`: like its I32x8/I32x4/I64x2
+                // siblings it yields a scalar (`movq %xmm0, %rax`); calling
+                // it a vector poisoned the reduction tail's scalar copy web.
                 | IntrinsicOp::VecZeroI64x4
                 | IntrinsicOp::VecSadbwU8x32
                 | IntrinsicOp::VecMaddubsU8x32
@@ -2723,8 +2761,8 @@ mod vector_width_tests {
     /// loop-carried 256-bit accumulator stops advancing in its upper lanes.
     ///
     /// `VecMaskedAddI32x8` (I32x8 accumulator, `vpaddd %ymm`) was grouped with
-    /// its 128-bit widening sibling `VecWidenMaskedAddI32x4ToI64x2` (I64x2
-    /// accumulator) and reported 16. A historical report recorded
+    /// its then-128-bit widening sibling (the I64x2-accumulator step that
+    /// `VecWidenMaskedAddI32x4ToI64x4` replaced) and reported 16. A historical report recorded
     /// `tests/regression/vector_guard_sum.c` summing 279 instead of 651
     /// (low four lanes plus scalar remainder). That runtime observation is
     /// not independently reproduced by this metadata test.
@@ -2732,9 +2770,10 @@ mod vector_width_tests {
     fn masked_reduction_steps_report_their_real_accumulator_width() {
         for (op, width) in [
             (IntrinsicOp::VecMaskedAddI32x8, 32),
-            (IntrinsicOp::VecWidenMaskedAddI32x4ToI64x2, 16),
-            (IntrinsicOp::VecWidenAddI32x4ToI64x2, 16),
+            (IntrinsicOp::VecWidenMaskedAddI32x4ToI64x4, 32),
+            (IntrinsicOp::VecWidenAddI32x4ToI64x4, 32),
             (IntrinsicOp::VecWidenMaskedAddValueI32x4ToI64x2, 16),
+            (IntrinsicOp::VecMaskedAddValueI32x4, 16),
             (IntrinsicOp::VecWidenAddValueI32x4ToI64x2, 16),
         ] {
             assert_eq!(op.vector_home_width(), Some(width), "{op:?} home");
@@ -2994,6 +3033,7 @@ mod vector_width_tests {
             "VecAddI64x2" => IntrinsicOp::VecAddI64x2,
             "VecAddI64x4" => IntrinsicOp::VecAddI64x4,
             "VecSadbwU8x32" => IntrinsicOp::VecSadbwU8x32,
+            "VecSadbwU8x16" => IntrinsicOp::VecSadbwU8x16,
             "VecMaddubsU8x32" => IntrinsicOp::VecMaddubsU8x32,
             "VecMaddwdI16x16" => IntrinsicOp::VecMaddwdI16x16,
             "VecConstI8x32" => IntrinsicOp::VecConstI8x32,
@@ -3174,10 +3214,11 @@ mod vector_width_tests {
             "VecShlvI64x2" => IntrinsicOp::VecShlvI64x2,
             "VecLShrvI64x2" => IntrinsicOp::VecLShrvI64x2,
             "VecSubI64x2" => IntrinsicOp::VecSubI64x2,
-            "VecWidenAddI32x4ToI64x2" => IntrinsicOp::VecWidenAddI32x4ToI64x2,
-            "VecWidenMaskedAddI32x4ToI64x2" => IntrinsicOp::VecWidenMaskedAddI32x4ToI64x2,
+            "VecWidenAddI32x4ToI64x4" => IntrinsicOp::VecWidenAddI32x4ToI64x4,
+            "VecWidenMaskedAddI32x4ToI64x4" => IntrinsicOp::VecWidenMaskedAddI32x4ToI64x4,
             "VecWidenAddValueI32x4ToI64x2" => IntrinsicOp::VecWidenAddValueI32x4ToI64x2,
             "VecWidenMaskedAddValueI32x4ToI64x2" => IntrinsicOp::VecWidenMaskedAddValueI32x4ToI64x2,
+            "VecMaskedAddValueI32x4" => IntrinsicOp::VecMaskedAddValueI32x4,
             "VecXorI32x4" => IntrinsicOp::VecXorI32x4,
             "VecXorI32x8" => IntrinsicOp::VecXorI32x8,
             "VecZeroF32x4" => IntrinsicOp::VecZeroF32x4,

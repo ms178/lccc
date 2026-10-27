@@ -18,24 +18,25 @@
 # GitHub CI runs the slow gates on every PR, so a full local run is not required.
 #
 #   ./scripts/ci_local.sh              # everything (test + bench + clippy)
-#   ./scripts/ci_local.sh --fast       # skip ONLY the six slow gates:
+#   ./scripts/ci_local.sh --fast       # skip ONLY the seven slow gates:
 #                                      #   cargo-test-debug-assertions,
 #                                      #   regression-corpus-ssa,
 #                                      #   benchmark-output-oracle,
 #                                      #   bounded-callgrind-corpus,
 #                                      #   peephole-whitespace-invariance,
-#                                      #   regression-corpus-debug-assertions
+#                                      #   regression-corpus-debug-assertions,
+#                                      #   switch-cross-execute (cross toolchains required)
 #                                      # rustfmt and clippy ALWAYS run — they
 #                                      # are the CI lint jobs, and skipping
 #                                      # them locally is how a red PR ships.
-#   ./scripts/ci_local.sh --slow       # ONLY the six slow gates (plus the
+#   ./scripts/ci_local.sh --slow       # ONLY the seven slow gates (plus the
 #                                      # build).  If a --fast stamp for the SAME
 #                                      # tree exists, a green --slow run upgrades
 #                                      # it to mode=full: fast + slow on one tree
 #                                      # is every gate GitHub runs.
 #   ./scripts/ci_local.sh --only NAME  # a single gate, substring match
 #
-# A --fast pass is NOT CI-equivalent: GitHub runs all six slow gates on every
+# A --fast pass is NOT CI-equivalent: GitHub runs all seven slow gates on every
 # PR.  PR #638 went red on check_peephole_whitespace.sh after a green
 # --fast run, because the snapshot gate accepted a fast stamp.  lccc-snapshot.sh
 # accepts a mode=fast stamp as its gate (owner decision: GitHub CI runs the
@@ -202,8 +203,16 @@ if [ ! -x "$LCCC" ]; then
     exit 1
 fi
 
-gate "driver-option-contract" fast \
-    env CCC="$LCCC" bash tests/regression/check_driver_option_contract.sh
+# The driver contract's 6,776-case -ftrapv matrix used to make one hosted
+# frontend shard ~19 minutes longer than its twin. Hosted CI runs the core
+# contract once and each ABI leg on a different shard; the local mirror keeps
+# the same three gates so a partial run cannot silently lose an ABI.
+gate "driver-option-contract-core" fast \
+    env CCC="$LCCC" bash tests/regression/check_driver_option_contract.sh --skip-trapv-matrix
+gate "trapv-boundary-matrix-m64" fast \
+    env CCC="$LCCC" bash tests/regression/check_trapv_boundary_matrix.sh --bits -m64
+gate "trapv-boundary-matrix-m32" fast \
+    env CCC="$LCCC" bash tests/regression/check_trapv_boundary_matrix.sh --bits -m32
 
 # Opt-in IPA-PTA/LRS must have a local mirror as well as the dedicated hosted
 # lane. Available pinned oracles are used; the dedicated lane additionally
@@ -236,6 +245,15 @@ gate "sibcall-shapes" fast \
     bash tests/regression/check_sibcall_shapes.sh
 gate "fno-builtin-fold-contract" fast \
     env CCC="$LCCC" bash tests/regression/check_fno_builtin_folds.sh
+gate "builtin-floor-float-narrowing" fast \
+    env CCC="$LCCC" CCC_I686=target/fastbuild/lccc-i686 \
+    bash tests/regression/check_builtin_floor_narrowing.sh
+gate "store-forwarding-dword-reload" fast \
+    env CCC="$LCCC" CCC_I686=target/fastbuild/lccc-i686 \
+    bash tests/regression/check_store_forwarding_dword_reload.sh
+gate "x86-execute-fixes" fast \
+    env CCC="$LCCC" CCC_I686=target/fastbuild/lccc-i686 \
+    bash tests/regression/check_x86_torture_execute_fixes.sh
 
 # --------------------------------------------------------------- job:test --
 # The ratchet that keeps the 2026-10-13 audit's debt numbers from growing:
@@ -566,6 +584,11 @@ gate "public-native-simd-abi" fast \
 # These were orphaned (not wired into any gate) until this entry.
 gate "ext-vector-callsite-abi" fast \
     env CCC="$LCCC" bash tests/regression/check_ext_vector_callsite_abi.sh
+# IPA-RA must not summarize a body another TU can replace at link time
+# (#pragma weak, late weak redeclaration, top-level asm .weak): a silent
+# miscompile class no single-TU corpus case can reach. Six tiny links.
+gate "ipa-ra-interposition" fast \
+    env CCC="$LCCC" bash tests/regression/check_ipa_ra_interposition.sh
 gate "ext-vector-lane1-abi" fast \
     env CCC="$LCCC" bash tests/regression/check_ext_vector_lane1_abi.sh
 gate "ext-vector-narrow-arith" fast \
@@ -731,13 +754,8 @@ gate "vector-abi-wide" fast \
 gate "gnu-vector-align-abi" fast \
     env CCC="$LCCC" bash tests/regression/check_gnu_vector_align_abi.sh
 
-# GCC-compatible 16-byte vector_size i686 carriers, including the SSE-only
-# and no-SSE boundaries, with typed shuffles across every compiler pairing.
-# The hosted leg runs after a swap-enabled fastbuild with GNU as 2.47 and the
-# exact GCC 16.2 / Clang 23.1.4 oracles in the unsharded differential lane.
-gate "i686-gnu-vector-abi" fast \
-    env LCCC_TEST_ASSEMBLER="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" \
-    CCC="$LCCC" bash tests/regression/check_i686_gnu_vector_abi.sh
+# i686-gnu-vector-abi runs after `asm-diff-oracle-gas-2.47` (below): it
+# needs that gate's pinned GNU as 2.47.
 
 # AUD-TMP-1: temp files must be symlink-proof. Drives the pre-placed-symlink
 # reproducer (and its pre-placed-directory variant) against the built compiler
@@ -758,6 +776,21 @@ gate "o-stdout" fast \
 # the strength-reduction pass on, off, and at -O3.
 gate "compat-suite" fast \
     env CCC="$LCCC" bash tests/regression/check_compat_suite.sh
+# C23 acceptance is inventoried feature-by-feature against the pinned GCC
+# oracle, with the current `_BitInt(17)` difference recorded explicitly.
+gate "c23-compatibility-inventory" fast \
+    python3 tests/regression/check_c23_inventory.py \
+        --lccc "$LCCC" --gcc "${GCC16:-gcc-16}" \
+        --json target/c23-inventory.json --markdown target/c23-inventory.md
+# GCC warning-group parity and DWARF line/link preservation are cheap focused
+# gates; keeping them in the local mirror prevents hosted-only drift.
+gate "warning-compatibility" fast \
+    python3 tests/regression/check_warning_compat.py \
+        --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"
+gate "dwarf-line-tables" fast \
+    python3 tests/regression/check_dwarf_line_tables.py \
+        --lccc "$LCCC" --lccc-i686 target/fastbuild/lccc-i686 \
+        --gcc "${GCC16:-gcc-16}"
 gate "ivsr-reproducers" fast \
     env CCC="$LCCC" bash tests/regression/check_ivsr_reproducers.sh
 
@@ -1133,7 +1166,7 @@ gate "addr-value-fuzz-smoke" fast \
 # / known-equivalent near-miss pairs in one TU, plus the harness's own
 # negative control (a fake optimiser must be caught) in the unit tests.
 gate "mutpair-harness-tests" fast \
-    sh -c 'python3 scripts/mutpair.py --self-test && python3 -m unittest scripts.test_mutpair -v'
+    sh -c 'python3 scripts/mutpair.py --self-test && python3 -m unittest scripts.test_mutpair scripts.test_aarch64_execute_suite -v'
 
 gate "mutpair-differential-smoke" fast \
     python3 scripts/fuzz_diff.py --engine mutpair --count 4 \
@@ -1360,6 +1393,12 @@ gate "tls-model-selection" fast \
 
 # Cross-architecture TLS model/relocation/runtime contract. This catches the
 # formerly hard-coded LE lowering in PIC/shared AArch64 and RISC-V objects.
+# The hosted assembler/linker lane provisions both cross toolchains. Keep
+# this in the full local run, not the fast x86-only shards: compiling/linking
+# the fixtures is quick, but those shards do not provision target linkers.
+gate "switch-cross-execute" slow \
+    python3 tests/regression/check_switch_cross_execute.py
+
 gate "tls-cross-models" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_tls_cross_models.sh
 
@@ -1440,6 +1479,7 @@ gate "integer-order-networks" fast python3 tests/regression/check_integer_order_
 # switch, host fallback and pair liveness. Mirrors the hosted step.
 gate "peephole-pair-parallel" fast python3 tests/regression/check_peephole_pair_parallel.py
 gate "oracle-diagnostics" fast python3 scripts/test_ci_oracle_diagnostics.py
+gate "cross-linker-discovery" fast python3 tests/regression/test_check_switch_cross_execute.py
 
 gate "tls-model-option" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_tls_model_option.sh
@@ -2031,6 +2071,15 @@ gate "inline-asm-utf8" fast \
 gate "asm-diff-oracle-gas-2.47" fast \
     bash scripts/ensure_gas_247.sh x86_64-linux-gnu
 
+# GCC-compatible 16-byte vector_size i686 carriers, including the SSE-only
+# and no-SSE boundaries, with typed shuffles across every compiler pairing.
+# Mirrors the hosted ipa-lrs.yml step: GNU as 2.47 from the pin the gate
+# above provisioned (the script refuses any other `as`), and the exact
+# GCC 16.2 / Clang 23.1.4 oracles.
+gate "i686-gnu-vector-abi" fast \
+    env PATH="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin:$PATH" CCC="$LCCC" \
+        bash tests/regression/check_i686_gnu_vector_abi.sh
+
 # The same provisioning for the AArch64 side, and it is load-bearing for
 # every aarch64 gate below: they take their verdicts FROM a 2.47 `as`, and
 # `$A64_AS` is resolved from the pinned prefix.  Without this gate the local
@@ -2513,11 +2562,14 @@ if [ -x target/fastbuild/lccc-ld ]; then
         bash tests/linker/setup_kernel_tools.sh --prefix "$HOME/.cache/lccc-kernel-tools"
     gate "linker-harness-selftest" fast \
         python3 tests/linker/test_run_linker_helpers.py
+    # GCC -fuse-ld=bfd does not discover the triplet-prefixed BFD 2.47 in the
+    # GAS prefix; gotpcrel_edges needs it as an explicit newer-linker fallback.
     gate "linker-suite" fast env \
         LCCC_TEST_ASSEMBLER="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" \
         PATH="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin:$PATH" \
         LCCC_REQUIRE_I386=1 \
         LCCC_RELOCS_TOOL="$HOME/.cache/lccc-kernel-tools/bin/relocs" \
+        LCCC_BFD_LD="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/x86_64-linux-gnu-ld.bfd" \
         python3 tests/linker/run_linker_tests.py --lccc target/fastbuild/lccc --strict
 else
     echo "SKIP  linker fuzz + linker suite (target/fastbuild/lccc-ld not built)"

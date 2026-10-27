@@ -506,6 +506,26 @@ pub struct CallAbiConfig {
 /// follow that target's own rules. Every memory-passed vector with natural
 /// alignment of at least 16 bytes uses that alignment, including no-SSE v16;
 /// XMM-register pieces never call this helper for stack placement.
+/// Width of an i386 argument that is a native SSE/AVX/AVX-512 vector
+/// (`[SSE, SSEUP...]`, exactly 16/32/64 bytes) and therefore travels in
+/// `%xmm`/`%ymm`/`%zmm{0..vector_xmm_regs}` while registers remain, or
+/// `None`. Such an argument never touches the GP sequence, so it neither
+/// consumes nor breaks the regparm/fastcall registers (GCC's
+/// `function_arg_advance_32` advances only the SSE counters for vector
+/// modes). The single rule for the cdecl/regparm classification and the
+/// fastcall layout (`I686Codegen::fastcall_layout_with_abi`).
+pub(crate) fn i386_vector_reg_bytes(
+    config: &CallAbiConfig,
+    classes: &[crate::common::types::EightbyteClass],
+    struct_size: Option<usize>,
+) -> Option<usize> {
+    if config.vector_xmm_regs == 0 {
+        return None;
+    }
+    let size = crate::common::sysv_classify::vector_reg_bytes_of(classes)?;
+    (struct_size == Some(size)).then_some(size)
+}
+
 pub(crate) fn i386_gnu_vector_stack_align(
     config: &CallAbiConfig,
     classes: &[crate::common::types::EightbyteClass],
@@ -793,10 +813,7 @@ fn classify_args_core(
         // An i386 XMM vector piece (`[SSE, SSEUP]`, 16 bytes). It never
         // touches the GP sequence, so regparm/fastcall registers stay
         // available for later arguments.
-        if config.vector_xmm_regs > 0
-            && let Some(size) =
-                crate::common::sysv_classify::vector_reg_bytes_of(info.eightbyte_classes)
-            && info.struct_size == Some(size)
+        if let Some(size) = i386_vector_reg_bytes(config, info.eightbyte_classes, info.struct_size)
         {
             if !real_variadic && vec_xmm_idx < config.vector_xmm_regs {
                 result.push(CoreArgClass::StructXmmReg {

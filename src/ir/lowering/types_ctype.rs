@@ -62,6 +62,7 @@ impl Lowerer {
                             alignas_type: None,
                             fptr_params: None,
                             fptr_variadic: false,
+                            fptr_has_prototype: false,
                             is_const: false,
                             is_volatile: false,
                             is_restrict: false,
@@ -72,7 +73,12 @@ impl Lowerer {
                             pointer_const: false,
                         })
                         .collect();
-                    TypeSpecifier::FunctionPointer(Box::new(ret_ts), param_decls, ft.variadic)
+                    TypeSpecifier::FunctionPointer(
+                        Box::new(ret_ts),
+                        param_decls,
+                        ft.variadic,
+                        ft.has_prototype,
+                    )
                 } else {
                     TypeSpecifier::Pointer(
                         Box::new(Self::ctype_to_type_spec(inner)),
@@ -132,6 +138,7 @@ impl Lowerer {
                         alignas_type: None,
                         fptr_params: None,
                         fptr_variadic: false,
+                        fptr_has_prototype: false,
                         is_const: false,
                         is_volatile: false,
                         is_restrict: false,
@@ -142,7 +149,12 @@ impl Lowerer {
                         pointer_const: false,
                     })
                     .collect();
-                TypeSpecifier::BareFunction(Box::new(ret_ts), param_decls, ft.variadic)
+                TypeSpecifier::BareFunction(
+                    Box::new(ret_ts),
+                    param_decls,
+                    ft.variadic,
+                    ft.has_prototype,
+                )
             }
             // Every caller resolves `typeof`, `__auto_type` or a typedef, so
             // a vector must round-trip as a vector: collapsing it to its lane
@@ -228,6 +240,7 @@ impl Lowerer {
                     return_type: return_ctype,
                     params: param_types,
                     variadic: fti.variadic,
+                    has_prototype: fti.has_prototype,
                 }));
                 return CType::Pointer(Box::new(func_type), AddressSpace::Default);
             }
@@ -295,6 +308,7 @@ impl Lowerer {
                 return_type: return_ctype,
                 params: param_types,
                 variadic: fti.variadic,
+                has_prototype: fti.has_prototype,
             }));
             return Some(CType::Pointer(Box::new(func_type), AddressSpace::Default));
         }

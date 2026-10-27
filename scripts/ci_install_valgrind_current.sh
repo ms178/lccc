@@ -57,7 +57,7 @@ done
 as_version=$(as --version | sed -n '1p')
 [[ $as_version =~ [[:space:]]2\.47(\.[0-9]+)?$ ]] || fail "GAS 2.47 is required: $as_version"
 ld_version=$(ld --version | sed -n '1p')
-[[ $ld_version = 'mold 2.42.1 '* ]] || fail "mold 2.42.1 is required: $ld_version"
+[[ $ld_version = 'mold 3.0.0 '* ]] || fail "mold 3.0.0 is required: $ld_version"
 # A successful -m32 libc link alone does not prove Linux UAPI headers exist.
 # Valgrind's i386 gdbserver includes linux/types.h -> asm/types.h: diagnose a
 # missing multiarch header package before downloading and compiling the tree.

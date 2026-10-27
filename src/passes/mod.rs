@@ -867,6 +867,7 @@ fn run_inline_phase(
     allow_inline: bool,
     size_profile: bool,
     target: crate::backend::Target,
+    pic: bool,
     ra_config: &crate::backend::regalloc::RaConfig,
 ) {
     let dump_pre =
@@ -1029,8 +1030,12 @@ fn run_inline_phase(
     // Copy forwarding can expose another temporary in a copy chain
     // (`object -> tmp1 -> tmp2 -> field load`), so run to a small fixed point.
     if !std::env::var("CCC_NO_AGG_COPY_FWD").is_ok() {
+        let symbol_facts = module_symbol_facts::ModuleSymbolFacts::from_module(module, pic);
         for _ in 0..8 {
-            if module.for_each_function(aggregate_copy_forward::run) == 0 {
+            if module.for_each_function(|func| {
+                aggregate_copy_forward::run_with_symbol_facts(func, &symbol_facts)
+            }) == 0
+            {
                 break;
             }
         }
@@ -1912,6 +1917,7 @@ pub(crate) fn run_passes(
         allow_inline,
         optimize_for_size,
         target,
+        pic,
         ra_config,
     );
     preloop_dump!("inline_phase");
@@ -2369,6 +2375,43 @@ pub(crate) fn run_passes(
 
         // Phase 2b-vec: x86-64 vectorization — iter 0 only, EARLY in pipeline.
         // Run before GVN/LICM/etc to catch IR in simpler state.
+        // Phase 2b-affold-pre: the affine exit-compare fold, once more right
+        // before the vectorizer.  Every vectorizer arm requires the IV itself
+        // on the left of the exit compare, so the unfolded `iv + C < N` of
+        // `for (i = 0; i + C < N; i++)` kept those loops scalar: the regular
+        // affold run sits after rotation (below), i.e. after the vectorizer.
+        // The fold is a value equivalence with its own domain certificate
+        // (constant seed and step, type bounds), so running it earlier needs
+        // nothing the later passes provide; the later run folds what the
+        // early run could not see (the compares rotation clones, loops the
+        // vectorizer refused).  `affold` kills both runs; `affold_prevec`
+        // only this one (the gates use it to keep the late clone fold's own
+        // mechanism under test: on their corpora the early run otherwise
+        // folds every loop before rotation clones it).
+        if iter == 0
+            && opt_level >= 2
+            && !optimize_for_size
+            && matches!(
+                target,
+                crate::backend::Target::X86_64 | crate::backend::Target::Aarch64
+            )
+            && !pass_disabled(&disabled, "affold")
+            && !pass_disabled(&disabled, "affold_prevec")
+            && !pass_disabled(&disabled, "vectorize")
+        {
+            let n = timed_pass!(
+                "affold_prevec",
+                run_on_visited(
+                    module,
+                    &dirty,
+                    &mut changed,
+                    loop_rotate::fold_affine_exit_compares
+                )
+            );
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
         // The vectorizer currently emits Vec* intrinsics backed by XMM/YMM
         // registers. Other backends deliberately reject those intrinsics, so
         // running this pass for them turns ordinary scalar loops into a compiler
@@ -3291,6 +3334,9 @@ pub(crate) fn run_passes(
         std::mem::swap(&mut dirty, &mut changed);
     }
 
+    // Loops the two late vectorizer entries below produced; both feed the
+    // single late interleave after the x86 twin.
+    let mut late_vectorized = 0usize;
     // Late vectorization (levkropp 8ef1978f concept, audited): Select-
     // shaped reductions (max, conditional sums) only exist after the main
     // loop's if_convert phase, so the early vectorizer never sees them.
@@ -3357,6 +3403,7 @@ pub(crate) fn run_passes(
                 })
             })
         };
+        late_vectorized += n;
         if n > 0 {
             // The vectorizer's block surgery does not maintain source_spans;
             // drop any that no longer align with their block's instructions
@@ -3470,6 +3517,7 @@ pub(crate) fn run_passes(
                 })
             })
         };
+        late_vectorized += n;
         if n > 0 {
             for func in &mut module.functions {
                 for block in &mut func.blocks {
@@ -3523,14 +3571,39 @@ pub(crate) fn run_passes(
             });
         }
     }
+
+    // Interleave the loops the late entries produced (the guarded sums'
+    // masked steps), exactly as the early pipeline interleaves the early
+    // vectorizer's loops. Hooked HERE, after both entries: the guarded sums
+    // come from the shared `late_vectorize_entry` rerun above, and the x86
+    // twin normally finds nothing left (n == 0), so a hook inside either
+    // block alone misses loops. Both blocks already ran DCE, so the dead
+    // Select/Cmp remnants are gone and the bodies are pure. `run_late`
+    // admits only late-only steps, so early loops and the verbatim
+    // epilogues their interleave left behind are never re-sliced (and on
+    // AArch64 nothing qualifies).
+    // Hoist the masked steps' run-time guard splats into their preheaders
+    // first, so the interleave slices below inherit one shared splat.
+    if late_vectorized > 0 {
+        module.for_each_function(vectorize::hoist_masked_guard_splats);
+        verify::verify_after_pass(module, "masked_guard_splat_hoist");
+    }
+    if late_vectorized > 0 && !pass_disabled(&disabled, "vec_interleave") {
+        module.for_each_function(|f| vec_interleave::run_late(f, fp_reassoc));
+        verify::verify_after_pass(module, "vec_interleave_late");
+    }
     // Pre-loop sret copy elision (see the earlier site for the rationale).
     if std::env::var_os("CCC_NO_SRET_COPY_ELISION").is_none() {
         module.for_each_function(sret_copy_elision::run);
     }
     verify::verify_after_pass(module, "sret_copy_elision");
     if !std::env::var("CCC_NO_AGG_COPY_FWD").is_ok() {
+        let symbol_facts = module_symbol_facts::ModuleSymbolFacts::from_module(module, pic);
         for _ in 0..8 {
-            if module.for_each_function(aggregate_copy_forward::run) == 0 {
+            if module.for_each_function(|func| {
+                aggregate_copy_forward::run_with_symbol_facts(func, &symbol_facts)
+            }) == 0
+            {
                 break;
             }
         }

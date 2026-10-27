@@ -557,6 +557,13 @@ impl Driver {
         }
     }
 
+    /// Whether `arg` is an x86 ISA flag owned by
+    /// [`Self::apply_x86_isa_mflag`], decided by that applicator itself on a
+    /// scratch driver so the recognised spellings have one source of truth.
+    fn is_x86_isa_mflag(arg: &str) -> bool {
+        arg.starts_with("-m") && Driver::new().apply_x86_isa_mflag(arg)
+    }
+
     /// Apply one explicit x86 ISA `-m`/`-mno-` flag.  Returns `true` when
     /// `arg` is one of the flags owned here; the caller (the main argument
     /// loop) then records it for [`Driver::replay_x86_explicit_isa_flags`].
@@ -605,13 +612,20 @@ impl Driver {
                 self.enable_vpclmulqdq = false;
             }
             "-mno-sse3" | "-mno-ssse3" | "-mno-sse4" | "-mno-sse4.1" => {
-                // SSE4.1 ⊃ SSSE3 ⊃ SSE3 and AVX ⊃ SSE4.2 ⊃ SSE4.1, so
-                // denying any of these denies SSE4.1 *and* AVX/FMA.
+                // AVX ⊃ SSE4.2 ⊃ SSE4.1 ⊃ SSSE3 ⊃ SSE3: a denial removes its
+                // level and every level above it (so SSE4.1 *and* AVX/FMA
+                // here), and keeps the levels below (GCC 16.2, measured:
+                // `-msse4.2 -mno-sse4.1` keeps __SSSE3__/__SSE3__,
+                // `-msse4.1 -mno-ssse3` keeps __SSE3__).
                 self.sse41_explicitly_disabled = true;
                 self.avx_explicitly_disabled = true;
                 self.fma_explicitly_disabled = true;
-                self.enable_sse3 = false;
-                self.enable_ssse3 = false;
+                if arg == "-mno-sse3" {
+                    self.enable_sse3 = false;
+                }
+                if arg == "-mno-sse3" || arg == "-mno-ssse3" {
+                    self.enable_ssse3 = false;
+                }
                 self.enable_sse4_1 = false;
                 self.enable_sse4_2 = false;
                 self.enable_avx = false;
@@ -911,6 +925,10 @@ impl Driver {
     /// immediate parse and post-profile replay so flag order cannot drift.
     fn deny_general_registers(&mut self) {
         self.general_regs_only = true;
+        // GCC 16.2: also clears MASK_80387 (-m32 FP becomes soft-float
+        // libcalls; -m64 long double is refused); a later `-msse2` revives
+        // the SSE levels but NOT the x87.
+        self.no_x87 = true;
         self.no_sse = true;
         self.no_sse2 = true;
         self.sse_explicitly_disabled = true;
@@ -1616,6 +1634,17 @@ impl Driver {
             // top of ANY later arch set), and recording here — the single
             // call site — keeps the replay log and the immediate effect
             // from ever drifting apart.
+            // GCC's option cancellation (`cancel_option`): `-mX` and
+            // `-mno-X` are one option, and a later occurrence deletes every
+            // earlier one before any is processed, together with what it
+            // implied. `-mssse3 -mno-ssse3` therefore leaves no SSE3, while
+            // `-msse4.1 -mno-ssse3` keeps it (GCC 16.2, measured). Only ISA
+            // flags are cancelled, so an unrecognised later spelling can
+            // never silently delete a recognised earlier flag.
+            if x86_isa_flag_cancelled_later(args, i) {
+                i += 1;
+                continue;
+            }
             if args[i].starts_with("-m") && self.apply_x86_isa_mflag(&args[i]) {
                 self.x86_explicit_isa_args.push(args[i].clone());
                 i += 1;
@@ -1874,17 +1903,18 @@ impl Driver {
                 //   -Wno-error=<name> gcc: rc 1   clang/icc/icx: accept
                 //   -Wno-<name>       all four: accept, silently
                 //
-                // LCCC implements SIX warning names; GNU exposes 409
-                // (`gcc -Q --help=warnings | grep -c '^  -W'`, measured).  A
-                // driver with six names of a 409-name namespace cannot decide
-                // whether a name it does not implement is a typo or a warning
-                // added by a newer GNU -- so it must not guess in the
-                // direction that stops a build that GNU builds, and it must
-                // not guess "supported" either.  Both are avoided by
+                // WarningConfig models ten categories (including the
+                // compatibility-only `undeclared` switch); GNU exposes 409
+                // (`gcc -Q --help=warnings | grep -c '^  -W'`, measured). A
+                // driver with a small implemented subset of a 409-name
+                // namespace cannot decide whether an unimplemented name is a
+                // typo or a warning added by a newer GNU -- so it must not
+                // guess in the direction that stops a build GNU accepts, and
+                // it must not guess "supported" either. Both are avoided by
                 // diagnosing the name (which a `-Wno-` request does not need:
                 // LCCC emits no such warning, so "off" is already the state)
                 // and making it fatal under `LCCC_STRICT_OPTIONS=1`, which is
-                // what the capability probe exports.  The consequence of
+                // what the capability probe exports. The consequence of
                 // tolerating a name is a missing diagnostic, never different
                 // code -- which is why this namespace, unlike `-f`/`--`/`-g`,
                 // is not fail-closed by default.
@@ -2115,19 +2145,25 @@ impl Driver {
                 // from a frame established by sub-rsp in the prologue, and leaf
                 // functions still allocate their frame explicitly.
                 "-mno-red-zone" => {}
-                // -mno-80387 / -mno-fp-ret-in-387: no x87 instructions, no x87
-                // FP returns. NOT vacuous — lccc's long-double path emits x87.
-                // Record it so FP codegen can reject long-double operations
-                // instead of silently emitting x87 in kernel objects.
-                "-mno-80387" | "-msoft-float" | "-mno-fp-ret-in-387" => self.no_x87 = true,
-                // -mhard-float: RE-ENABLE hardware FP after a global
-                // -msoft-float (kernel CC_FLAGS_FPU for kernel_fpu_begin()
-                // translation units, e.g. the NAP governor's nap_fpu.o).
-                // lccc's default codegen already uses SSE hardware FP, so
-                // this both clears the soft-float latch and is otherwise a
-                // no-op. Order matters: kbuild appends it AFTER the kill
-                // flags, and later-flag-wins is exactly GCC's semantics.
-                "-mhard-float" => self.no_x87 = false,
+                // -mred-zone (GCC's x86-64 default, e.g. undoing an earlier
+                // -mno-red-zone) only PERMITS leaf use of the 128 bytes below
+                // %rsp; lccc never uses it, which every ABI allows.
+                "-mred-zone" => {}
+                // GCC's MASK_80387 is one last-wins bit (measured on 16.2):
+                // `-mno-80387`, `-msoft-float` and `-mgeneral-regs-only`
+                // clear it, `-m80387` / `-mhard-float` set it again. NOT
+                // vacuous: lccc lowers i686 scalar FP and every long double
+                // to x87, so the driver fences x87 out of the final text
+                // (GCC would emit soft-float libcalls lccc does not have).
+                // `-mhard-float` is how kbuild re-enables FP for
+                // kernel_fpu_begin() units after a global `-msoft-float`.
+                "-mno-80387" | "-msoft-float" => self.no_x87 = true,
+                "-m80387" | "-mhard-float" => self.no_x87 = false,
+                // Only the RETURN convention: x87 arithmetic stays legal,
+                // but FP results travel in GPRs (i686) or are refused
+                // (x86-64 long double). Checked at the IR call boundary.
+                "-mno-fp-ret-in-387" => self.no_fp_ret_in_387 = true,
+                "-mfp-ret-in-387" => self.no_fp_ret_in_387 = false,
                 // -malign-data=abi|compat|cacheline: data alignment policy.
                 // lccc aligns to natural ABI alignment which satisfies abi and
                 // compat; cacheline only ever OVER-aligns (a performance
@@ -3673,6 +3709,29 @@ pub fn std_version_macro(std_value: &str) -> Option<Option<&'static str>> {
         _ => return None,
     };
     Some(v)
+}
+
+/// The option identity GCC's cancellation compares: `-mX` and `-mno-X` are
+/// the same boolean option `X`. Valued spellings (`-march=`, `-mtune=`, ...)
+/// are not boolean options and have no identity here.
+fn boolean_m_option_identity(arg: &str) -> Option<&str> {
+    if arg.contains('=') {
+        return None;
+    }
+    let rest = arg.strip_prefix("-m")?;
+    Some(rest.strip_prefix("no-").unwrap_or(rest))
+}
+
+/// `args[i]` is an x86 ISA flag that a later occurrence of the same option
+/// cancels (see the call site in `parse_main_args`).
+fn x86_isa_flag_cancelled_later(args: &[String], i: usize) -> bool {
+    let Some(identity) = boolean_m_option_identity(&args[i]) else {
+        return false;
+    };
+    args[i + 1..]
+        .iter()
+        .any(|later| boolean_m_option_identity(later) == Some(identity))
+        && Driver::is_x86_isa_mflag(&args[i])
 }
 
 #[cfg(test)]
@@ -5466,6 +5525,8 @@ mod cli_tests {
 
     /// GCC 16.2 defaults to GNU C23 (measured: no -std flag means
     /// `__STDC_VERSION__` 202311L and C23 meanings are active).
+    /// GCC 16.2 defaults to GNU C23. Keep the language semantics and
+    /// `__STDC_VERSION__` selection in sync before any explicit `-std=`.
     #[test]
     fn default_dialect_is_gnu23() {
         let d = Driver::new();
@@ -5985,6 +6046,108 @@ mod prefetch_isa_tests {
     }
 
     #[test]
+    fn x87_permission_and_fp_return_flags_follow_gcc_last_wins() {
+        // (flags, x87 disabled, FP returns kept out of %st(0)); every row
+        // measured with gcc-16 -O2 (soft-float libcalls vs x87 code).
+        for (flags, no_x87, no_ret) in [
+            (&["-m32"][..], false, false),
+            (&["-m32", "-mgeneral-regs-only"][..], true, false),
+            (&["-m32", "-mgeneral-regs-only", "-msse2"][..], true, false),
+            (
+                &["-m32", "-mgeneral-regs-only", "-m80387"][..],
+                false,
+                false,
+            ),
+            (&["-m32", "-m80387", "-mgeneral-regs-only"][..], true, false),
+            (&["-m32", "-mno-80387"][..], true, false),
+            (&["-m32", "-mno-80387", "-m80387"][..], false, false),
+            (&["-m32", "-msoft-float", "-mhard-float"][..], false, false),
+            (&["-m32", "-mno-fp-ret-in-387"][..], false, true),
+            (
+                &["-m32", "-mno-fp-ret-in-387", "-mfp-ret-in-387"][..],
+                false,
+                false,
+            ),
+            (&["-mno-80387", "-mno-fp-ret-in-387"][..], true, true),
+        ] {
+            let d = parse(flags);
+            assert_eq!(
+                (d.no_x87, d.no_fp_ret_in_387),
+                (no_x87, no_ret),
+                "{flags:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn i686_isa_levels_follow_gcc_cancellation_and_denial_order() {
+        // (flags, SSE2 SSE3 SSSE3 SSE4.1 AVX AVX2), every row measured as
+        // the GCC 16.2 `-m32 <flags> -dM -E` predefines. A later `-mX` or
+        // `-mno-X` deletes every earlier occurrence of the same option with
+        // what it implied (GCC `cancel_option`), and a denial removes its
+        // level and those above it only.
+        for (flags, want) in [
+            (&["-m32"][..], "100000"),
+            (&["-m32", "-msse3"][..], "110000"),
+            (&["-m32", "-march=i686", "-msse3"][..], "110000"),
+            (&["-m32", "-msse3", "-mno-sse2"][..], "000000"),
+            (&["-m32", "-mno-sse2", "-msse3"][..], "110000"),
+            (&["-m32", "-msse3", "-mno-ssse3"][..], "110000"),
+            (&["-m32", "-mssse3", "-mno-ssse3"][..], "100000"),
+            (&["-m32", "-msse3", "-mssse3", "-mno-ssse3"][..], "110000"),
+            (&["-m32", "-mssse3", "-msse3", "-mno-ssse3"][..], "110000"),
+            (&["-m32", "-msse4.1", "-mno-ssse3"][..], "110000"),
+            (&["-m32", "-march=nehalem", "-mno-ssse3"][..], "110000"),
+            (&["-m32", "-mssse3", "-mno-sse4.1"][..], "111000"),
+            (&["-m32", "-msse4.1", "-mno-sse4.1"][..], "100000"),
+            (&["-m32", "-msse4.2", "-mno-sse4.1"][..], "111000"),
+            (&["-m32", "-msse4.1", "-mno-sse4"][..], "111000"),
+            (&["-m32", "-mavx", "-mno-sse4.1"][..], "111000"),
+            (&["-m32", "-mavx", "-mno-sse3"][..], "100000"),
+            (&["-m32", "-mno-sse3", "-mavx"][..], "111110"),
+            (&["-m32", "-mavx2", "-mno-sse4.1", "-msse4.1"][..], "111111"),
+            (&["-m32", "-mavx2", "-mno-sse3", "-msse3"][..], "111111"),
+            (&["-m32", "-mavx2", "-mno-sse2", "-msse2"][..], "111111"),
+            (&["-m32", "-mavx2", "-mno-ssse3", "-mssse3"][..], "111111"),
+            (&["-m32", "-mavx2", "-mno-avx2"][..], "100000"),
+            (&["-m32", "-mavx2", "-mno-avx"][..], "111100"),
+            (&["-m32", "-msse4.2", "-mno-sse4.2"][..], "100000"),
+            (&["-m32", "-mno-sse2", "-msse2", "-mno-sse2"][..], "000000"),
+            (&["-m32", "-msse3", "-mgeneral-regs-only"][..], "000000"),
+            (&["-m32", "-mgeneral-regs-only", "-msse3"][..], "110000"),
+        ] {
+            let driver = parse(flags);
+            // The predefines are the GCC-observable answer. ISA permissions
+            // (`effective_x86_features`) are kept apart from the i686
+            // vectorizer ceiling; the resolved SSE3 level must agree with
+            // the predefines.
+            let mut pp = crate::frontend::preprocessor::Preprocessor::new();
+            driver.configure_preprocessor(&mut pp);
+            let probe: String = [
+                "__SSE2__",
+                "__SSE3__",
+                "__SSSE3__",
+                "__SSE4_1__",
+                "__AVX__",
+                "__AVX2__",
+            ]
+            .iter()
+            .map(|m| format!("#ifdef {m}\nB1\n#else\nB0\n#endif\n"))
+            .collect();
+            let got: String = pp
+                .preprocess(&probe)
+                .split_whitespace()
+                .filter_map(|t| t.strip_prefix('B'))
+                .collect();
+            assert_eq!(got, want, "{flags:?}");
+            assert_eq!(driver.resolved_i686_sse3(), &want[1..2] == "1", "{flags:?}");
+        }
+        // Valued and non-ISA spellings are never cancelled.
+        let driver = parse(&["-m32", "-mno-red-zone", "-mred-zone", "-march=i686"]);
+        assert!(!driver.resolved_i686_sse());
+    }
+
+    #[test]
     fn i686_sse_feature_mirror_tracks_abi_permission() {
         // The i386 default baseline is the x86-64 ISA level: `-m32` alone
         // resolves SSE AND SSE2 on (GCC 16.2 default `-m32` = `-march=x86-64`
@@ -6107,7 +6270,9 @@ mod prefetch_isa_tests {
             (&["-m32"][..], false, false),
             (&["-m32", "-mavx"][..], true, false),
             (&["-m32", "-mavx2"][..], true, true),
-            (&["-m32", "-mavx2", "-mno-avx2"][..], true, false),
+            // GCC 16.2 cancels `-mavx2` outright (same option, opposite
+            // sense), implied AVX included: only `__SSE2__` is predefined.
+            (&["-m32", "-mavx2", "-mno-avx2"][..], false, false),
             (&["-m32", "-mavx", "-mno-avx"][..], false, false),
             (&["-m32", "-mno-avx", "-mavx"][..], true, false),
             (&["-m32", "-mavx2", "-mno-avx2", "-mavx2"][..], true, true),

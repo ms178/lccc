@@ -541,6 +541,8 @@ enum CaptureDst {
 
 impl X86Codegen {
     pub(super) fn calculate_stack_space_impl(&mut self, func: &IrFunction) -> i64 {
+        self.masked_guard_splats = collect_masked_guard_splats(func);
+        self.masked_guard_zero_splats = collect_zero_splats(func, &self.masked_guard_splats);
         // ms178 debug: dump IR per function
         if self.state.ra_config.dump_ir {
             eprintln!("===== IR for {} =====", func.name);
@@ -3409,16 +3411,22 @@ impl X86Codegen {
     }
 
     /// Capture-store a 64-bit XMM payload into the parameter home slot.
+    /// MOVQ xmm->m64 is SSE2; under `-mno-sse2 -msse` (an x86-64 `__m64` or
+    /// other 8-byte vector parameter arrives in an XMM register) MOVLPS
+    /// stores the same eight bytes with SSE1, as GCC does.
     fn emit_capture_store_xmm(&mut self, dst: CaptureDst, src_reg: &str, off: i64) {
+        let mov = if self.isa.simd {
+            "    movq"
+        } else {
+            "    movlps"
+        };
         match dst {
             CaptureDst::Raw(b) => {
-                self.state
-                    .out
-                    .emit_instr_reg_rbp("    movq", src_reg, b + off);
+                self.state.out.emit_instr_reg_rbp(mov, src_reg, b + off);
             }
             CaptureDst::Aligned => self
                 .state
-                .emit_fmt(format_args!("    movq %{}, {}(%r11)", src_reg, off)),
+                .emit_fmt(format_args!("{} %{}, {}(%r11)", mov, src_reg, off)),
         }
     }
 
@@ -4378,7 +4386,9 @@ impl X86Codegen {
         // IS-20: a function that dirtied upper YMM halves must clean them
         // before returning, or every legacy-SSE instruction in the caller
         // pays the AVX-SSE transition penalty (~50-100 cycles on current
-        // Intel). GCC/Clang emit the same vzeroupper-before-ret.
+        // Intel). GCC/Clang emit the same vzeroupper-before-ret. The other
+        // two placements are sibcalls (`returns.rs`) and ordinary calls
+        // (`calls.rs`, `emit_vzeroupper_before_call`).
         if self.state.dirty_upper_ymm {
             self.state.emit("    vzeroupper");
         }
@@ -5057,4 +5067,61 @@ fn emit_fpo_stack_alloc_x86(state: &mut crate::backend::state::CodegenState, mut
     } else {
         state.out.emit_instr_imm_reg("    subq", size, "rsp");
     }
+}
+
+/// Vector-typed operands in the guard slot of a masked reduction step (the
+/// vectorizer's hoisted preheader splat, or a copy of it). A scalar guard —
+/// a constant or an I32 SSA value — is never a vector value, so membership in
+/// the copy-propagated vector-value set is the exact classification, robust
+/// to any later pass routing the splat through a `Copy`.
+fn collect_masked_guard_splats(func: &IrFunction) -> FxHashSet<u32> {
+    let guards: Vec<u32> = func
+        .blocks
+        .iter()
+        .flat_map(|b| &b.instructions)
+        .filter_map(|inst| match inst {
+            Instruction::Intrinsic { op, args, .. } => {
+                match op.masked_guard_arg_index().and_then(|i| args.get(i)) {
+                    Some(Operand::Value(v)) => Some(v.0),
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+        .collect();
+    if guards.is_empty() {
+        return FxHashSet::default();
+    }
+    let vector_values = crate::backend::regalloc::collect_vector_values(func);
+    guards
+        .into_iter()
+        .filter(|g| vector_values.contains(g))
+        .collect()
+}
+
+/// The guard splats defined directly by a 32-bit-lane broadcast of the
+/// constant 0. A copy of one is not recognised, which is fail-safe: the
+/// emitter then treats it as a general vector guard (compare + and).
+fn collect_zero_splats(func: &IrFunction, guards: &FxHashSet<u32>) -> FxHashSet<u32> {
+    use crate::ir::intrinsics::IntrinsicOp as O;
+    if guards.is_empty() {
+        return FxHashSet::default();
+    }
+    func.blocks
+        .iter()
+        .flat_map(|b| &b.instructions)
+        .filter_map(|inst| match inst {
+            Instruction::Intrinsic {
+                dest: Some(d),
+                op: O::VecBroadcastI32x4 | O::VecBroadcastI32x8,
+                args,
+                ..
+            } if guards.contains(&d.0)
+                && matches!(args.first(), Some(Operand::Const(c)) if c.to_i64() == Some(0)) =>
+            {
+                Some(d.0)
+            }
+            _ => None,
+        })
+        .collect()
 }

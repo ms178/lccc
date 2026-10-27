@@ -43,7 +43,7 @@ ROOT = Path(__file__).resolve().parents[2]
 # Lanes that restore the artifact instead of compiling their own compiler.
 CONSUMERS = {
     'corpus', 'unit', 'backend',
-    'frontend-a', 'frontend-b',
+    'frontend-a', 'frontend-b', 'frontend-c',
     'codegen-a', 'codegen-b',
     'backend-contracts-a', 'backend-contracts-b',
 }
@@ -182,7 +182,8 @@ class ParallelLayout(unittest.TestCase):
         validate(self.workflow, self.benchmark)
 
     def test_missing_lane_dependency_rejected(self):
-        for lane in ('debug', 'benchmark', 'frontend-b', 'backend-contracts-a'):
+        for lane in ('debug', 'benchmark', 'frontend-b', 'frontend-c',
+                     'backend-contracts-a'):
             with self.subTest(lane=lane):
                 changed = deepcopy(self.workflow)
                 changed['jobs']['test']['needs'] = [
@@ -191,7 +192,7 @@ class ParallelLayout(unittest.TestCase):
                     validate(changed, self.benchmark)
 
     def test_consumer_without_producer_rejected(self):
-        for lane in ('codegen-a', 'frontend-b', 'backend'):
+        for lane in ('codegen-a', 'frontend-b', 'frontend-c', 'backend'):
             with self.subTest(lane=lane):
                 changed = deepcopy(self.workflow)
                 changed['jobs'][lane]['needs'] = []
@@ -199,7 +200,8 @@ class ParallelLayout(unittest.TestCase):
                     validate(changed, self.benchmark)
 
     def test_unverified_artifact_rejected(self):
-        for lane in ('frontend-a', 'codegen-b', 'backend-contracts-a'):
+        for lane in ('frontend-a', 'frontend-c', 'codegen-b',
+                     'backend-contracts-a'):
             with self.subTest(lane=lane):
                 changed = deepcopy(self.workflow)
                 for step in changed['jobs'][lane]['steps']:

@@ -350,9 +350,13 @@ impl Lowerer {
             Expr::CompoundAssign(op, lhs, rhs, _) => self.lower_compound_assign(op, lhs, rhs),
             Expr::FunctionCall(func, args, _) => self.lower_function_call(func, args),
             Expr::Conditional(cond, then_expr, else_expr, _) => {
-                self.lower_conditional(cond, then_expr, else_expr)
+                let value = self.lower_conditional(cond, then_expr, else_expr);
+                self.spill_packed_vector_wrapper(expr, value)
             }
-            Expr::GnuConditional(cond, else_expr, _) => self.lower_gnu_conditional(cond, else_expr),
+            Expr::GnuConditional(cond, else_expr, _) => {
+                let value = self.lower_gnu_conditional(cond, else_expr);
+                self.spill_packed_vector_wrapper(expr, value)
+            }
             Expr::Cast(target_type, inner, _, _) => self.lower_cast(target_type, inner),
             Expr::CompoundLiteral(type_spec, init, _, storage) => {
                 self.lower_compound_literal(expr, type_spec, init, storage)
@@ -386,9 +390,13 @@ impl Lowerer {
             }
             Expr::Comma(lhs, rhs, _) => {
                 self.lower_expr(lhs);
-                self.lower_expr(rhs)
+                let value = self.lower_expr(rhs);
+                self.spill_packed_vector_wrapper(expr, value)
             }
-            Expr::StmtExpr(compound, _) => self.lower_stmt_expr(compound),
+            Expr::StmtExpr(compound, _) => {
+                let value = self.lower_stmt_expr(compound);
+                self.spill_packed_vector_wrapper(expr, value)
+            }
             Expr::VaArg(ap_expr, type_spec, _) => self.lower_va_arg(ap_expr, type_spec),
             Expr::ConvertVector(src_expr, type_spec, _) => {
                 self.lower_convertvector(src_expr, type_spec)
@@ -423,6 +431,36 @@ impl Lowerer {
                 Operand::Const(IrConst::I64(result as i64))
             }
         }
+    }
+
+    /// A vector rvalue is the address of its bytes, except a call whose small
+    /// vector comes back in a register: that yields the packed carrier, and
+    /// each consumer spills it (`rhs_is_small_vector_call`). A conditional,
+    /// comma or statement expression forwards such a carrier unchanged, but
+    /// the consumers recognise only the bare call, so `T r = c ? v : f();`,
+    /// `(c, f())` or `({ f(); })` was dereferenced as an address. Spill the
+    /// carrier here, once, so the wrapper yields an address like every other
+    /// vector rvalue; `expr_produces_packed_struct_data` reports vector-typed
+    /// wrappers as address-producing to match. Struct wrappers keep the
+    /// packed carrier: their consumers handle it.
+    fn spill_packed_vector_wrapper(&mut self, expr: &Expr, value: Operand) -> Operand {
+        let Some(vector_ct) = self.get_expr_ctype(expr).filter(CType::is_vector) else {
+            return value;
+        };
+        if !self.wrapper_forwards_packed_data(expr) {
+            return value;
+        }
+        let size = vector_ct.size();
+        let align = self.ctype_align(&vector_ct);
+        let alloca = self.emit_entry_alloca(IrType::Ptr, size, align, false);
+        self.emit(Instruction::Store {
+            volatile: false,
+            val: value,
+            ptr: alloca,
+            ty: Self::packed_store_type(size),
+            seg_override: AddressSpace::Default,
+        });
+        Operand::Value(alloca)
     }
 
     /// Lower an expression in a discarded-value context. Integer postfix

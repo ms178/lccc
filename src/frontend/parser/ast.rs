@@ -380,6 +380,10 @@ pub struct FunctionDef {
     pub name: String,
     pub params: Vec<ParamDecl>,
     pub variadic: bool,
+    /// Whether the declarator's parameter list is a prototype. In C23, `f()`
+    /// is a zero-parameter prototype; before C23 it leaves parameters
+    /// unspecified. K&R identifier-list definitions are never prototypes.
+    pub has_prototype: bool,
     pub body: CompoundStmt,
     /// Function attributes (storage class, inline hints, GCC __attribute__).
     pub attrs: FunctionAttributes,
@@ -417,6 +421,9 @@ pub struct ParamDecl {
     /// Whether the pointed-to function accepts a variadic tail. Kept separate
     /// because CType erases the parser's explicit function-pointer declarator.
     pub fptr_variadic: bool,
+    /// Whether the pointed-to function's parameter list is a prototype. This
+    /// distinguishes `int (*f)()` from `int (*f)(void)` in pre-C23 dialects.
+    pub fptr_has_prototype: bool,
     /// Whether this parameter's base type has a `const` qualifier.
     /// Used by _Generic matching to distinguish e.g. `const int *` from `int *`.
     pub is_const: bool,
@@ -801,6 +808,9 @@ pub struct DeclAttributes {
     pub zero_call_used_regs: Option<String>,
     /// `__attribute__((no_sanitize("...")))` / `no_sanitize_undefined`.
     pub no_sanitize: Option<String>,
+    /// C23 `[[maybe_unused]]` / GNU `unused`: suppress unused diagnostics
+    /// without implying `[[gnu::used]]` or affecting IR.
+    pub maybe_unused: bool,
 }
 
 /// Bit masks for boolean flags in `DeclAttributes::flags`.
@@ -875,6 +885,10 @@ impl DeclAttributes {
         self.flags & decl_attr_flag::USED != 0
     }
     #[inline]
+    pub fn is_maybe_unused(&self) -> bool {
+        self.maybe_unused
+    }
+    #[inline]
     pub fn is_fastcall(&self) -> bool {
         self.flags & decl_attr_flag::FASTCALL != 0
     }
@@ -942,6 +956,10 @@ impl DeclAttributes {
         self.set_flag(decl_attr_flag::USED, v)
     }
     #[inline]
+    pub fn set_maybe_unused(&mut self, v: bool) {
+        self.maybe_unused = v;
+    }
+    #[inline]
     pub fn set_fastcall(&mut self, v: bool) {
         self.set_flag(decl_attr_flag::FASTCALL, v)
     }
@@ -997,6 +1015,7 @@ impl std::fmt::Debug for DeclAttributes {
             .field("is_error_attr", &self.is_error_attr())
             .field("is_noreturn", &self.is_noreturn())
             .field("is_used", &self.is_used())
+            .field("maybe_unused", &self.is_maybe_unused())
             .field("alias_target", &self.alias_target)
             .field("ifunc_target", &self.ifunc_target)
             .field("regparm", &self.regparm)
@@ -1030,9 +1049,9 @@ pub enum DerivedDeclarator {
     /// object's own space and is carried separately (`DeclAttributes::object_space`).
     Pointer(AddressSpace),
     Array(Option<Box<Expr>>),
-    Function(Vec<ParamDecl>, bool), // params, variadic
+    Function(Vec<ParamDecl>, bool, bool), // params, variadic, has_prototype
     /// Function pointer: (*name)(params) - distinguishes from pointer-to-return-type
-    FunctionPointer(Vec<ParamDecl>, bool), // params, variadic
+    FunctionPointer(Vec<ParamDecl>, bool, bool), // params, variadic, has_prototype
 }
 
 impl DerivedDeclarator {
@@ -1056,7 +1075,7 @@ impl DerivedDeclarator {
     /// included it and the link failed with "multiple definition"
     /// (regression `fn_returning_fnptr_prototype.c`).
     pub fn declares_function(derived: &[DerivedDeclarator]) -> bool {
-        matches!(derived.last(), Some(DerivedDeclarator::Function(_, _)))
+        matches!(derived.last(), Some(DerivedDeclarator::Function(..)))
     }
 
     /// Pointer indirection depth of the RETURN type a derived list encodes.
@@ -1104,6 +1123,7 @@ mod declarator_law_tests {
             alignas_type: None,
             fptr_params: None,
             fptr_variadic: false,
+            fptr_has_prototype: false,
             is_const: false,
             is_volatile: false,
             is_restrict: false,
@@ -1116,11 +1136,11 @@ mod declarator_law_tests {
     }
 
     fn fnp(params: usize) -> DerivedDeclarator {
-        DerivedDeclarator::FunctionPointer(vec![param(); params], false)
+        DerivedDeclarator::FunctionPointer(vec![param(); params], false, true)
     }
 
     fn func(params: usize) -> DerivedDeclarator {
-        DerivedDeclarator::Function(vec![param(); params], false)
+        DerivedDeclarator::Function(vec![param(); params], false, true)
     }
 
     /// The canonical predicate pair: `declares_function` keys on the
@@ -1320,14 +1340,14 @@ pub enum TypeSpecifier {
     TypedefName(String),
     Pointer(Box<TypeSpecifier>, AddressSpace),
     Array(Box<TypeSpecifier>, Option<Box<Expr>>),
-    /// Function pointer type from cast/sizeof: return_type, params, variadic
-    /// E.g., `(jv (*)(void*, jv))` produces FunctionPointer(jv, [void*, jv], false)
-    FunctionPointer(Box<TypeSpecifier>, Vec<ParamDecl>, bool),
-    /// Bare function type (not a pointer): return_type, params, variadic
+    /// Function pointer type from cast/sizeof: return_type, params, variadic,
+    /// has_prototype. E.g., `(jv (*)(void*, jv))` produces FunctionPointer(..., true).
+    FunctionPointer(Box<TypeSpecifier>, Vec<ParamDecl>, bool, bool),
+    /// Bare function type (not a pointer): return_type, params, variadic, has_prototype
     /// This is produced by ctype_to_type_spec for CType::Function, used in typeof
     /// resolution. Unlike FunctionPointer which represents Pointer(Function(...)),
     /// this represents just Function(...) without the pointer wrapper.
-    BareFunction(Box<TypeSpecifier>, Vec<ParamDecl>, bool),
+    BareFunction(Box<TypeSpecifier>, Vec<ParamDecl>, bool, bool),
     /// typeof(expr) - GCC extension: type of an expression. The flag is true for
     /// `typeof_unqual`, which also drops the expression's named address space.
     Typeof(Box<Expr>, bool),
@@ -1887,8 +1907,8 @@ impl TypeSpecifier {
                     f(bound);
                 }
             }
-            TypeSpecifier::FunctionPointer(ret, params, _)
-            | TypeSpecifier::BareFunction(ret, params, _) => {
+            TypeSpecifier::FunctionPointer(ret, params, _, _)
+            | TypeSpecifier::BareFunction(ret, params, _, _) => {
                 ret.for_each_expr(f);
                 for param in params {
                     param.for_each_type_expr(f);
@@ -1906,8 +1926,8 @@ impl DerivedDeclarator {
         match self {
             DerivedDeclarator::Pointer(_) | DerivedDeclarator::Array(None) => {}
             DerivedDeclarator::Array(Some(bound)) => f(bound),
-            DerivedDeclarator::Function(params, _)
-            | DerivedDeclarator::FunctionPointer(params, _) => {
+            DerivedDeclarator::Function(params, _, _)
+            | DerivedDeclarator::FunctionPointer(params, _, _) => {
                 for param in params {
                     param.for_each_type_expr(f);
                 }

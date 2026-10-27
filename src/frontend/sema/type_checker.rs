@@ -363,17 +363,19 @@ impl<'a> ExprTypeChecker<'a> {
                     // expected the 16 bytes of data.
                     //
                     // Both shuffle builtins use the ordinary pointer-backed
-                    // vector value convention. Their result type follows the
-                    // first vector rather than a name-only builtin signature.
+                    // vector value convention. `__builtin_shuffle` returns
+                    // the first vector's type; `__builtin_shufflevector`
+                    // returns that element type with one lane per index
+                    // (GCC 16.2: `(v8si, v8si, 0, 2, 4, 6)` is a `v4si`).
                     if matches!(
                         name.as_str(),
                         "__builtin_shuffle" | "__builtin_shufflevector"
                     ) && !args.is_empty()
                     {
-                        if let Some(ct @ (CType::Vector(_, _) | CType::ExtVector(_, _))) =
-                            self.infer_expr_ctype(&args[0])
-                        {
-                            return Some(ct);
+                        if let Some(result) = self.infer_expr_ctype(&args[0]).and_then(|first| {
+                            CType::shuffle_builtin_result(name, &first, args.len())
+                        }) {
+                            return Some(result);
                         }
                     }
 
@@ -487,8 +489,13 @@ impl<'a> ExprTypeChecker<'a> {
         let lct = self.infer_expr_ctype(lhs);
         let rct = self.infer_expr_ctype(rhs);
 
-        // Shift operators: result type is the promoted type of the left operand
+        // GNU vector shifts are element-wise when either operand is a vector.
+        // For `scalar << vector` the scalar is splatted and the result has the
+        // RHS vector type; only scalar shifts use the promoted-lhs rule.
         if matches!(op, BinOp::Shl | BinOp::Shr) {
+            if rct.as_ref().is_some_and(CType::is_vector) {
+                return rct;
+            }
             if let Some(l) = lct {
                 return Some(l.integer_promoted());
             }
@@ -888,7 +895,7 @@ impl<'a> ExprTypeChecker<'a> {
                 // typeof(expr): try to infer the expression's type
                 self.infer_expr_ctype(expr).unwrap_or(CType::Int)
             }
-            TypeSpecifier::FunctionPointer(ret, params, variadic) => {
+            TypeSpecifier::FunctionPointer(ret, params, variadic, has_prototype) => {
                 let ret_ct = self.resolve_type_spec(ret);
                 // Full per-parameter conversion (param_decl_to_ctype_with): a
                 // nested function-pointer parameter inside the type name
@@ -913,11 +920,12 @@ impl<'a> ExprTypeChecker<'a> {
                         return_type: ret_ct,
                         params: param_cts,
                         variadic: *variadic,
+                        has_prototype: *has_prototype,
                     }))),
                     AddressSpace::Default,
                 )
             }
-            TypeSpecifier::BareFunction(ret, params, variadic) => {
+            TypeSpecifier::BareFunction(ret, params, variadic, has_prototype) => {
                 let ret_ct = self.resolve_type_spec(ret);
                 let param_cts: Vec<(CType, Option<String>)> = params
                     .iter()
@@ -935,6 +943,7 @@ impl<'a> ExprTypeChecker<'a> {
                     return_type: ret_ct,
                     params: param_cts,
                     variadic: *variadic,
+                    has_prototype: *has_prototype,
                 }))
             }
             TypeSpecifier::ExtVector(elem, lanes) => {

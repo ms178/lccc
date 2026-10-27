@@ -1551,7 +1551,7 @@ impl<'a> SemaConstEval<'a> {
             TypeSpecifier::ComplexDouble => Some(16),
             TypeSpecifier::ComplexLongDouble => Some(if ptr_sz == 4 { 24 } else { 32 }),
             TypeSpecifier::Pointer(_, _)
-            | TypeSpecifier::FunctionPointer(_, _, _)
+            | TypeSpecifier::FunctionPointer(..)
             | TypeSpecifier::NullPtrT => Some(ptr_sz),
             TypeSpecifier::Array(elem, Some(size)) => {
                 let elem_size = self.sizeof_type_spec(elem)?;
@@ -1792,7 +1792,7 @@ impl<'a> SemaConstEval<'a> {
                 }
             }
             TypeSpecifier::Pointer(_, _)
-            | TypeSpecifier::FunctionPointer(_, _, _)
+            | TypeSpecifier::FunctionPointer(..)
             | TypeSpecifier::NullPtrT => ptr_sz,
             TypeSpecifier::Array(elem, _) => self.alignof_type_spec(elem),
             TypeSpecifier::Struct(

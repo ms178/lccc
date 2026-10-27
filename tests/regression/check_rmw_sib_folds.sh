@@ -126,6 +126,32 @@ grep -qE "^[[:space:]]+movw[[:space:]]" <<< "$u16body" \
     && bad "rmw_bump_u16: a word store relay survived"
 note "narrow counters: one addb/addw on memory, no store relay"
 
+note "contract 2c: non-PIC absolute tables take the scale in the SIB"
+# Under -fno-pie the table is an absolute displacement and the shifted index
+# is the operand's bare base (`shlq $3,%r; addq $1,bins(%r)`); the fold's
+# memory-operand arm moves the scale into the index slot instead
+# (`addq $1, bins(, %r, 8)`, GCC's shape).  Parity first, at the same skip
+# matrix, then the shape, then the mutation arm proving the arm produced it.
+for envs in "" "CCC_PEEPHOLE_SKIP=shl_sib"; do
+    name=nopie$(echo "$envs" | tr -d '=,_ ')
+    if ! env $envs "$CCC" -O2 -fno-pie "$corpus" -o "$work/$name" > "$work/$name.build" 2>&1; then
+        bad "-fno-pie [$envs]: lccc failed to build"; continue
+    fi
+    got=$(timeout 300 "$work/$name") || { bad "-fno-pie [$envs]: non-zero exit"; continue; }
+    [[ $got == "$expected" ]] || bad "-fno-pie [$envs]: stdout differs from the oracle"
+done
+"$CCC" -O2 -fno-pie -S "$bench" -o "$work/bench_np.s" || bad "-S build failed (-fno-pie)"
+np=$(awk '/^main:/ { inside=1 } inside { print } inside && /\.size/ { exit }' "$work/bench_np.s")
+grep -qE "addq[[:space:]]+\\\$1,[[:space:]]*bins\(,[[:space:]]*%[a-z0-9]+,[[:space:]]*8\)" <<< "$np" \
+    || bad "-fno-pie: no \`addq \$1, bins(, %idx, 8)\` in main"
+grep -qE "^[[:space:]]+shl[a-z]*[[:space:]]" <<< "$np" \
+    && bad "-fno-pie: a \`shl\` survived in main"
+CCC_PEEPHOLE_SKIP=shl_sib "$CCC" -O2 -fno-pie -S "$bench" -o "$work/bench_np_nos.s" \
+    || bad "-S build failed (-fno-pie, no-sib)"
+grep -qE "^[[:space:]]+shl[a-z]*[[:space:]]" "$work/bench_np_nos.s" \
+    || bad "-fno-pie: skipping shl_sib left no shl: the arm is not what removed it"
+note "non-PIC: parity, absolute scaled SIB RMW, no shl; skip arm keeps the shl"
+
 note "contract 3: the index's definition survives"
 grep -qE "movzbl" <<< "$body" \
     || bad "the byte load vanished: a dead-write pass mistook the index for unread"

@@ -117,7 +117,7 @@ _mm_store1_ps(float *__p, __m128 __a)
 static __inline__ void __attribute__((__always_inline__))
 _mm_stream_ps(float *__p, __m128 __a)
 {
-    *((__m128 *)__p) = __a;
+    __builtin_ia32_movntps(__p, __a);
 }
 
 /* Store the lower 2 floats of __m128 to __m64* memory location. */
@@ -233,10 +233,6 @@ _mm_cmpneq_ss(__m128 __a, __m128 __b)
 }
 
 /* === Integer conversion === */
-
-/* TODO: _mm_cvtss_si32 should use current MXCSR rounding mode (round-to-nearest
-   by default), but we use C cast truncation for simplicity. This matches
-   _mm_cvttss_si32 behavior. */
 
 /* Alias: _mm_cvt_ss2si is standard alias for _mm_cvtss_si32 */
 #define _mm_cvt_ss2si(a) _mm_cvtss_si32(a)
@@ -599,7 +595,19 @@ _mm_cvtss_si64(__m128 __a)
 #if defined(__x86_64__)
     return __builtin_ia32_cvtss2si64(__a);
 #else
-    return (long long)__a[0];
+    /* i686 has no 64-bit CVTSS2SI. This emulation is exact under every
+     * MXCSR.RC. Below 2^23 one ADDSS/SUBSS pair with copysign(2^23, x)
+     * rounds x to an integer per MXCSR (the sum's ulp is exactly 1), so
+     * the cast is exact. From 2^23 to 2^63, x is already integral. NaN and
+     * |x| >= 2^63 give the integer indefinite, as the instruction does. */
+    float __x = __a[0];
+    if (__builtin_fabsf(__x) < 0x1p23f) {
+        __m128 __m = _mm_set_ss(__builtin_copysignf(0x1p23f, __x));
+        return (long long)_mm_cvtss_f32(_mm_sub_ss(_mm_add_ss(__a, __m), __m));
+    }
+    if (__x >= -0x1p63f && __x < 0x1p63f)
+        return (long long)__x;
+    return -0x7fffffffffffffffLL - 1;
 #endif
 }
 
@@ -650,7 +658,7 @@ _mm_storer_ps(float *__p, __m128 __a)
 static __inline__ __m128 __attribute__((__always_inline__))
 _mm_cvtpi32_ps(__m128 __a, __m64 __b)
 {
-    int *__bi = (int *)&__b.__val;
+    int *__bi = (int *)&__b;
     __a[0] = (float)__bi[0];
     __a[1] = (float)__bi[1];
     return __a;
@@ -664,9 +672,11 @@ _mm_cvtps_pi32(__m128 __a)
 {
     __m64 __r;
     int __rr[2];
-    __rr[0] = (int)__a[0];
-    __rr[1] = (int)__a[1];
-    __builtin_memcpy(&__r.__val, __rr, 8);
+    /* CVTPS2PI rounds per MXCSR.RC (round-to-nearest-even by default): a C
+     * cast truncates, which is _mm_cvttps_pi32's contract, not this one's. */
+    __rr[0] = _mm_cvtss_si32(__a);
+    __rr[1] = _mm_cvtss_si32(_mm_shuffle_ps(__a, __a, 1));
+    __builtin_memcpy(&__r, __rr, 8);
     return __r;
 }
 
@@ -680,7 +690,7 @@ _mm_cvttps_pi32(__m128 __a)
     int __rr[2];
     __rr[0] = (int)__a[0];
     __rr[1] = (int)__a[1];
-    __builtin_memcpy(&__r.__val, __rr, 8);
+    __builtin_memcpy(&__r, __rr, 8);
     return __r;
 }
 
@@ -690,7 +700,7 @@ _mm_cvttps_pi32(__m128 __a)
 static __inline__ __m128 __attribute__((__always_inline__))
 _mm_cvtpi16_ps(__m64 __a)
 {
-    short *__as = (short *)&__a.__val;
+    short *__as = (short *)&__a;
     return (__m128){  (float)__as[0], (float)__as[1], (float)__as[2], (float)__as[3]  };
 }
 
@@ -698,7 +708,7 @@ _mm_cvtpi16_ps(__m64 __a)
 static __inline__ __m128 __attribute__((__always_inline__))
 _mm_cvtpu16_ps(__m64 __a)
 {
-    unsigned short *__as = (unsigned short *)&__a.__val;
+    unsigned short *__as = (unsigned short *)&__a;
     return (__m128){  (float)__as[0], (float)__as[1], (float)__as[2], (float)__as[3]  };
 }
 
@@ -706,7 +716,7 @@ _mm_cvtpu16_ps(__m64 __a)
 static __inline__ __m128 __attribute__((__always_inline__))
 _mm_cvtpi8_ps(__m64 __a)
 {
-    signed char *__ab = (signed char *)&__a.__val;
+    signed char *__ab = (signed char *)&__a;
     return (__m128){  (float)__ab[0], (float)__ab[1], (float)__ab[2], (float)__ab[3]  };
 }
 
@@ -714,7 +724,7 @@ _mm_cvtpi8_ps(__m64 __a)
 static __inline__ __m128 __attribute__((__always_inline__))
 _mm_cvtpu8_ps(__m64 __a)
 {
-    unsigned char *__ab = (unsigned char *)&__a.__val;
+    unsigned char *__ab = (unsigned char *)&__a;
     return (__m128){  (float)__ab[0], (float)__ab[1], (float)__ab[2], (float)__ab[3]  };
 }
 
@@ -722,8 +732,8 @@ _mm_cvtpu8_ps(__m64 __a)
 static __inline__ __m128 __attribute__((__always_inline__))
 _mm_cvtpi32x2_ps(__m64 __a, __m64 __b)
 {
-    int *__ai = (int *)&__a.__val;
-    int *__bi = (int *)&__b.__val;
+    int *__ai = (int *)&__a;
+    int *__bi = (int *)&__b;
     return (__m128){  (float)__ai[0], (float)__ai[1], (float)__bi[0], (float)__bi[1]  };
 }
 
@@ -733,13 +743,18 @@ _mm_cvtps_pi16(__m128 __a)
 {
     __m64 __r;
     short __rr[4];
+    /* Rounded per MXCSR (CVTPS2PI), then saturated, as GCC's PACKSS form;
+     * NaN/overflow give the integer indefinite, which saturates to -32768. */
+    int __w[4] = { _mm_cvtss_si32(__a), _mm_cvtss_si32(_mm_shuffle_ps(__a, __a, 1)),
+                   _mm_cvtss_si32(_mm_shuffle_ps(__a, __a, 2)),
+                   _mm_cvtss_si32(_mm_shuffle_ps(__a, __a, 3)) };
     for (int __i = 0; __i < 4; __i++) {
-        int __v = (int)__a[__i];
+        int __v = __w[__i];
         if (__v > 32767) __v = 32767;
         if (__v < -32768) __v = -32768;
         __rr[__i] = (short)__v;
     }
-    __builtin_memcpy(&__r.__val, __rr, 8);
+    __builtin_memcpy(&__r, __rr, 8);
     return __r;
 }
 
@@ -749,29 +764,37 @@ _mm_cvtps_pi8(__m128 __a)
 {
     __m64 __r;
     signed char __rr[8];
+    /* Rounded per MXCSR (CVTPS2PI), then saturated, as GCC's PACKSS form;
+     * NaN/overflow give the integer indefinite, which saturates to -128. */
+    int __w[4] = { _mm_cvtss_si32(__a), _mm_cvtss_si32(_mm_shuffle_ps(__a, __a, 1)),
+                   _mm_cvtss_si32(_mm_shuffle_ps(__a, __a, 2)),
+                   _mm_cvtss_si32(_mm_shuffle_ps(__a, __a, 3)) };
     for (int __i = 0; __i < 4; __i++) {
-        int __v = (int)__a[__i];
+        int __v = __w[__i];
         if (__v > 127) __v = 127;
         if (__v < -128) __v = -128;
         __rr[__i] = (signed char)__v;
     }
     __rr[4] = __rr[5] = __rr[6] = __rr[7] = 0;
-    __builtin_memcpy(&__r.__val, __rr, 8);
+    __builtin_memcpy(&__r, __rr, 8);
     return __r;
 }
 
 /* === SSE intrinsics operating on __m64 (SSE additions to MMX) === */
 
 /* Extract a 16-bit integer from __m64 at position N */
+/* A pure expression on the 64-bit image, so A may be an rvalue (taking
+ * `&(A)` rejected `_mm_extract_pi16(_mm_add_pi16(a, b), 1)`, which GCC
+ * accepts). */
 #define _mm_extract_pi16(A, N) \
-    ((int)(unsigned short)(((unsigned short *)&(A).__val)[(N) & 3]))
+    ((int)(unsigned short)((unsigned long long)(long long)(__m64)(A) >> (16 * ((N) & 3))))
 
 #define _m_pextrw(A, N) _mm_extract_pi16(A, N)
 
 /* Insert a 16-bit integer into __m64 at position N */
 #define _mm_insert_pi16(A, D, N) __extension__ ({ \
     __m64 __tmp = (A); \
-    ((unsigned short *)&__tmp.__val)[(N) & 3] = (unsigned short)(D); \
+    ((unsigned short *)&__tmp)[(N) & 3] = (unsigned short)(D); \
     __tmp; \
 })
 
@@ -782,12 +805,12 @@ static __inline__ __m64 __attribute__((__always_inline__))
 _mm_max_pi16(__m64 __a, __m64 __b)
 {
     __m64 __r;
-    short *__ra = (short *)&__a.__val;
-    short *__rb = (short *)&__b.__val;
+    short *__ra = (short *)&__a;
+    short *__rb = (short *)&__b;
     short __rr[4];
     for (int __i = 0; __i < 4; __i++)
         __rr[__i] = __ra[__i] > __rb[__i] ? __ra[__i] : __rb[__i];
-    __builtin_memcpy(&__r.__val, __rr, 8);
+    __builtin_memcpy(&__r, __rr, 8);
     return __r;
 }
 
@@ -798,12 +821,12 @@ static __inline__ __m64 __attribute__((__always_inline__))
 _mm_max_pu8(__m64 __a, __m64 __b)
 {
     __m64 __r;
-    unsigned char *__ra = (unsigned char *)&__a.__val;
-    unsigned char *__rb = (unsigned char *)&__b.__val;
+    unsigned char *__ra = (unsigned char *)&__a;
+    unsigned char *__rb = (unsigned char *)&__b;
     unsigned char __rr[8];
     for (int __i = 0; __i < 8; __i++)
         __rr[__i] = __ra[__i] > __rb[__i] ? __ra[__i] : __rb[__i];
-    __builtin_memcpy(&__r.__val, __rr, 8);
+    __builtin_memcpy(&__r, __rr, 8);
     return __r;
 }
 
@@ -814,12 +837,12 @@ static __inline__ __m64 __attribute__((__always_inline__))
 _mm_min_pi16(__m64 __a, __m64 __b)
 {
     __m64 __r;
-    short *__ra = (short *)&__a.__val;
-    short *__rb = (short *)&__b.__val;
+    short *__ra = (short *)&__a;
+    short *__rb = (short *)&__b;
     short __rr[4];
     for (int __i = 0; __i < 4; __i++)
         __rr[__i] = __ra[__i] < __rb[__i] ? __ra[__i] : __rb[__i];
-    __builtin_memcpy(&__r.__val, __rr, 8);
+    __builtin_memcpy(&__r, __rr, 8);
     return __r;
 }
 
@@ -830,12 +853,12 @@ static __inline__ __m64 __attribute__((__always_inline__))
 _mm_min_pu8(__m64 __a, __m64 __b)
 {
     __m64 __r;
-    unsigned char *__ra = (unsigned char *)&__a.__val;
-    unsigned char *__rb = (unsigned char *)&__b.__val;
+    unsigned char *__ra = (unsigned char *)&__a;
+    unsigned char *__rb = (unsigned char *)&__b;
     unsigned char __rr[8];
     for (int __i = 0; __i < 8; __i++)
         __rr[__i] = __ra[__i] < __rb[__i] ? __ra[__i] : __rb[__i];
-    __builtin_memcpy(&__r.__val, __rr, 8);
+    __builtin_memcpy(&__r, __rr, 8);
     return __r;
 }
 
@@ -846,7 +869,7 @@ static __inline__ int __attribute__((__always_inline__))
 _mm_movemask_pi8(__m64 __a)
 {
     int __r = 0;
-    unsigned char *__ab = (unsigned char *)&__a.__val;
+    unsigned char *__ab = (unsigned char *)&__a;
     for (int __i = 0; __i < 8; __i++)
         __r |= ((__ab[__i] >> 7) & 1) << __i;
     return __r;
@@ -859,12 +882,12 @@ static __inline__ __m64 __attribute__((__always_inline__))
 _mm_mulhi_pu16(__m64 __a, __m64 __b)
 {
     __m64 __r;
-    unsigned short *__ra = (unsigned short *)&__a.__val;
-    unsigned short *__rb = (unsigned short *)&__b.__val;
+    unsigned short *__ra = (unsigned short *)&__a;
+    unsigned short *__rb = (unsigned short *)&__b;
     unsigned short __rr[4];
     for (int __i = 0; __i < 4; __i++)
         __rr[__i] = (unsigned short)(((unsigned int)__ra[__i] * (unsigned int)__rb[__i]) >> 16);
-    __builtin_memcpy(&__r.__val, __rr, 8);
+    __builtin_memcpy(&__r, __rr, 8);
     return __r;
 }
 
@@ -873,9 +896,9 @@ _mm_mulhi_pu16(__m64 __a, __m64 __b)
 /* Shuffle 16-bit integers in __m64 using immediate selector */
 #define _mm_shuffle_pi16(A, N) __extension__ ({ \
     __m64 __tmp_a = (A); \
-    unsigned short *__src = (unsigned short *)&__tmp_a.__val; \
+    unsigned short *__src = (unsigned short *)&__tmp_a; \
     __m64 __tmp_r; \
-    unsigned short *__dst = (unsigned short *)&__tmp_r.__val; \
+    unsigned short *__dst = (unsigned short *)&__tmp_r; \
     __dst[0] = __src[(N) & 3]; \
     __dst[1] = __src[((N) >> 2) & 3]; \
     __dst[2] = __src[((N) >> 4) & 3]; \
@@ -890,12 +913,12 @@ static __inline__ __m64 __attribute__((__always_inline__))
 _mm_avg_pu8(__m64 __a, __m64 __b)
 {
     __m64 __r;
-    unsigned char *__ra = (unsigned char *)&__a.__val;
-    unsigned char *__rb = (unsigned char *)&__b.__val;
+    unsigned char *__ra = (unsigned char *)&__a;
+    unsigned char *__rb = (unsigned char *)&__b;
     unsigned char __rr[8];
     for (int __i = 0; __i < 8; __i++)
         __rr[__i] = (unsigned char)(((unsigned int)__ra[__i] + (unsigned int)__rb[__i] + 1) >> 1);
-    __builtin_memcpy(&__r.__val, __rr, 8);
+    __builtin_memcpy(&__r, __rr, 8);
     return __r;
 }
 
@@ -906,12 +929,12 @@ static __inline__ __m64 __attribute__((__always_inline__))
 _mm_avg_pu16(__m64 __a, __m64 __b)
 {
     __m64 __r;
-    unsigned short *__ra = (unsigned short *)&__a.__val;
-    unsigned short *__rb = (unsigned short *)&__b.__val;
+    unsigned short *__ra = (unsigned short *)&__a;
+    unsigned short *__rb = (unsigned short *)&__b;
     unsigned short __rr[4];
     for (int __i = 0; __i < 4; __i++)
         __rr[__i] = (unsigned short)(((unsigned int)__ra[__i] + (unsigned int)__rb[__i] + 1) >> 1);
-    __builtin_memcpy(&__r.__val, __rr, 8);
+    __builtin_memcpy(&__r, __rr, 8);
     return __r;
 }
 
@@ -922,32 +945,34 @@ static __inline__ __m64 __attribute__((__always_inline__))
 _mm_sad_pu8(__m64 __a, __m64 __b)
 {
     __m64 __r;
-    unsigned char *__ra = (unsigned char *)&__a.__val;
-    unsigned char *__rb = (unsigned char *)&__b.__val;
+    unsigned char *__ra = (unsigned char *)&__a;
+    unsigned char *__rb = (unsigned char *)&__b;
     unsigned int __sum = 0;
     for (int __i = 0; __i < 8; __i++) {
         int __diff = (int)__ra[__i] - (int)__rb[__i];
         __sum += __diff < 0 ? -__diff : __diff;
     }
-    __r.__val = __sum;
+    __r = (__m64)(long long)(__sum);
     return __r;
 }
 
 #define _m_psadbw(a, b) _mm_sad_pu8(a, b)
 
-/* Non-temporal store of __m64 */
+/* Non-temporal store of __m64 (SSE1, as in GCC). Direct calls are lowered
+ * at the call site: MOVNTI from a GPR where SSE2 is usable, else a plain
+ * 8-byte store; MMX state is never touched. */
 static __inline__ void __attribute__((__always_inline__))
 _mm_stream_pi(__m64 *__p, __m64 __a)
 {
-    *__p = __a;
+    __builtin_ia32_movntq((unsigned long long *)__p, (unsigned long long)((long long)__a));
 }
 
 /* Conditional byte store from __m64 (MASKMOVQ) */
 static __inline__ void __attribute__((__always_inline__))
 _mm_maskmove_si64(__m64 __a, __m64 __n, char *__p)
 {
-    unsigned char *__da = (unsigned char *)&__a.__val;
-    unsigned char *__dn = (unsigned char *)&__n.__val;
+    unsigned char *__da = (unsigned char *)&__a;
+    unsigned char *__dn = (unsigned char *)&__n;
     for (int __i = 0; __i < 8; __i++) {
         if (__dn[__i] & 0x80)
             __p[__i] = __da[__i];

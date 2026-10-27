@@ -28,8 +28,22 @@ def compile(args, good=True):
         p.returncode > 0 and "-mgeneral-regs-only" in p.stderr), (args, p.returncode, p.stderr)
     return p
 
+
+def assembler_is_runnable(path):
+    """A PATH hit is not usable when a partial cross install lacks its .so deps."""
+    try:
+        p = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return p.returncode == 0
+
+
 def check_user_asm(w):
     """Real C emission: ordinary, naked, file-scope and mixed compiler/user text."""
+    gas = shutil.which("aarch64-linux-gnu-as")
+    if gas and not assembler_is_runnable(gas):
+        print(f"SKIP: {gas} is present but cannot run; cross assembler unavailable")
+        gas = None
     bodies = {
         "ordinary": 'void f(void) { __asm__ volatile("movi v0.16b, #0" ::: "v0"); }',
         "naked": '__attribute__((naked)) void f(void) { __asm__("movi v0.16b, #0\\nret"); }',
@@ -46,7 +60,6 @@ def check_user_asm(w):
             assert "#APP" in text and "#NO_APP" in text, (name, text)
             assert text.index("#APP") < text.index("movi v0.16b") < text.index("#NO_APP"), text
             compile(["-O2", *mode, "-c", source, "-o", w / "user.o"])
-            gas = shutil.which("aarch64-linux-gnu-as")
             if gas:
                 p = subprocess.run([gas, str(assembly), "-o", str(w / "gas.o")],
                                    capture_output=True, text=True, timeout=30)

@@ -223,6 +223,7 @@ fn pointer_vector_arg_width_consumer(op: IntrinsicOp, index: usize) -> Option<us
         | O::Storeldi128
         | O::Movntdq
         | O::Movntpd
+        | O::Movntps
         | O::Pmovmskb128
         | O::Cvtsi128Si32
         | O::Cvtsi128Si64
@@ -638,7 +639,7 @@ fn intrinsic_dest_required_alignment(
         // x86 non-temporal vector stores fault unless the destination is
         // 16-byte aligned.  Alignment 16 is still a direct stack slot and
         // therefore avoids the expensive runtime alignment sequence.
-        O::Movntdq | O::Movntpd => Some(16),
+        O::Movntdq | O::Movntpd | O::Movntps => Some(16),
         _ => None,
     }
 }
@@ -667,6 +668,7 @@ fn intrinsic_overwrites_full_result(op: IntrinsicOp) -> bool {
             | IntrinsicOp::StoreuPd256
             | IntrinsicOp::Movntdq
             | IntrinsicOp::Movntpd
+            | IntrinsicOp::Movntps
             | IntrinsicOp::VecStoreI64x2
     )
 }

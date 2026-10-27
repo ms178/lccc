@@ -1353,6 +1353,9 @@ impl I686Codegen {
                         _ => unreachable!("invalid native vector parameter width"),
                     };
                     emit!(self.state, "    {} %{}, {}", instruction, register, dst);
+                    if size > 16 {
+                        self.state.dirty_upper_ymm = true;
+                    }
                 }
                 continue;
             }
@@ -1490,7 +1493,11 @@ impl I686Codegen {
             let src_offset = if self.is_fastcall {
                 match self.fastcall_slots[i] {
                     I686FastcallSlot::Stack { offset, .. } => stack_base + offset,
-                    I686FastcallSlot::Reg(_) => unreachable!("handled above"),
+                    // Classified `F128SseReg` by the same rule and stored
+                    // from its register by the arm above.
+                    I686FastcallSlot::Reg(_) | I686FastcallSlot::Vector { .. } => {
+                        unreachable!("handled above")
+                    }
                 }
             } else {
                 match class {
@@ -1819,7 +1826,9 @@ impl I686Codegen {
         // home (param_pre_stored, or its alloca slot). It has no stack
         // location to read.
         if self.is_fastcall {
-            if let I686FastcallSlot::Reg(_) = self.fastcall_slots[param_idx] {
+            if let I686FastcallSlot::Reg(_) | I686FastcallSlot::Vector { .. } =
+                self.fastcall_slots[param_idx]
+            {
                 if let Some(Some((slot, _slot_ty, alloca_id))) =
                     self.state.param_alloca_slots.get(param_idx)
                 {
@@ -1835,7 +1844,9 @@ impl I686Codegen {
             // Exact compacted offset from the authoritative layout.
             match self.fastcall_slots[param_idx] {
                 I686FastcallSlot::Stack { offset, .. } => stack_base + offset,
-                I686FastcallSlot::Reg(_) => unreachable!("handled above"),
+                I686FastcallSlot::Reg(_) | I686FastcallSlot::Vector { .. } => {
+                    unreachable!("handled above")
+                }
             }
         } else if param_idx < self.state.param_classes.len() {
             match self.state.param_classes[param_idx] {
@@ -1915,6 +1926,12 @@ impl I686Codegen {
     // ---- emit_epilogue_and_ret ----
 
     pub(super) fn emit_epilogue_and_ret_impl(&mut self, frame_size: i64) {
+        // Same discipline as x86-64 (and GCC on i386): a function that wrote
+        // YMM/ZMM upper state cleans it before returning, or the caller's
+        // legacy-SSE code pays the AVX-SSE transition / false-dependency cost.
+        if self.state.dirty_upper_ymm {
+            self.state.emit("    vzeroupper");
+        }
         self.emit_epilogue(frame_size);
         if self.state.uses_sret && self.vector_ret_buffer_bytes == 0 && self.regparm == 0 {
             // i386 SysV sret: callee pops the hidden pointer.

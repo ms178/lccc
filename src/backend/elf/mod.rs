@@ -10,12 +10,14 @@
 //! - `section_flags`: Section flags parsing for `.section` directives
 //! - `parse_string`: String literal parser for assembler directives
 //! - `object_writer`: Shared relocatable ELF object (.o) writer
+//! - `dwarf`: DWARF v4 line-table emission from assembler `.file`/`.loc` records
 //! - `numeric_labels`: Numeric local label resolution (x86/i686)
 //! - `symbol_table`: Shared symbol table builder for assembler backends
 //! - `writer_base`: `ElfWriterBase` for ARM/RISC-V assembler backends
 
 mod archive;
 mod constants;
+mod dwarf;
 mod io;
 mod linker_symbols;
 mod numeric_labels;
@@ -64,6 +66,9 @@ pub use parse_string::parse_string_literal;
 
 // object_writer
 pub use object_writer::{ElfConfig, ObjReloc, ObjSection, write_relocatable_object};
+
+// DWARF line tables
+pub(crate) use dwarf::{DwarfLineLocation, DwarfSectionInfo, build_dwarf_line_section};
 
 // numeric_labels
 #[expect(unused_imports)]
