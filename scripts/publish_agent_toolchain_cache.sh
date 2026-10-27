@@ -200,7 +200,7 @@ tar -xf "$FILES/rust-1.99.1-x86_64-unknown-linux-gnu.tar.xz" -C "$EXTRACT/tools"
 tar -xf "$FILES/mold-3.0.0-x86_64-linux.tar.gz" -C "$EXTRACT/tools"
 tar -xf "$FILES/binutils-2.47-debian-sid-x86_64.tar.xz" -C "$EXTRACT/tools"
 GCC_BIN=$(find "$EXTRACT/tools" -type f -name gcc-16 -perm -111 | head -1)
-CLANG_BIN=$(find "$EXTRACT/tools" -type f -name 'clang-23*' -perm -111 | head -1)
+CLANG_BIN=$(find "$EXTRACT/tools" -type f \( -name 'clang-23*' -o -name 'clang' \) -perm -111 | head -1)
 RUSTC_BIN=$(find "$EXTRACT/tools" -type f -name rustc -perm -111 | head -1)
 MOLD_BIN=$(find "$EXTRACT/tools" -type f -name mold -perm -111 | head -1)
 [ -n "$GCC_BIN" ] && [ -n "$CLANG_BIN" ] && [ -n "$RUSTC_BIN" ] && [ -n "$MOLD_BIN" ] || die "tool binaries missing from archives"
@@ -209,7 +209,8 @@ MOLD_BIN=$(find "$EXTRACT/tools" -type f -name mold -perm -111 | head -1)
 "$RUSTC_BIN" --version
 "$MOLD_BIN" --version
 BI="$EXTRACT/tools/$BINUTILS_ROOT"
-export LD_LIBRARY_PATH="$BI/usr/lib/x86_64-linux-gnu:$BI/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+ALL_LIBS=$(find "$EXTRACT/tools" -type d \( -name lib -o -name lib64 -o -path '*/usr/lib/x86_64-linux-gnu' \) -print | paste -sd: -)
+export LD_LIBRARY_PATH="$ALL_LIBS${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 "$BI/usr/bin/as" --version | head -1
 "$BI/usr/bin/ld" --version | head -1
 cat > "$TEST/probe.c" <<'C'
