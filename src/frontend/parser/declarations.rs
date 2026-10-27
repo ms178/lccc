@@ -492,6 +492,10 @@ impl Parser {
 
         Some(ExternalDecl::FunctionDef(FunctionDef {
             alignment,
+            return_pointer_const_levels: crate::frontend::parser::ast::return_pointer_const_levels(
+                &return_type,
+                &derived,
+            ),
             return_type,
             name: name.unwrap_or_default(),
             params: final_params,

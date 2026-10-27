@@ -426,7 +426,7 @@ impl Parser {
             self.advance();
             if self.is_type_specifier() {
                 let mut qualifiers = self.type_name_qualifiers();
-                let (cl_storage, any_sc, invalid_sc) = self.scan_compound_literal_storage();
+                let (mut cl_storage, any_sc, invalid_sc) = self.scan_compound_literal_storage();
                 if let Some((mut result_type, pointer_quals)) =
                     self.parse_nested_type_name_with_quals()
                 {
@@ -434,8 +434,10 @@ impl Parser {
                     result_type = self.apply_pending_vector_attr(result_type);
                     // A cast type name keeps each star's own qualifier, so
                     // `*(int *const *)p = 0` is a modification of a read-only
-                    // object (`CType` alone cannot carry that).
-                    qualifiers.pointer_const_levels =
+                    // object (`CType` alone cannot carry that). A compound
+                    // literal of the same type name is an lvalue and needs the
+                    // same record (`*((int *const *){0}) = 0`).
+                    let levels_mask =
                         pointer_quals
                             .iter()
                             .enumerate()
@@ -447,6 +449,8 @@ impl Parser {
                                     mask
                                 }
                             });
+                    cl_storage.pointer_const_levels = levels_mask;
+                    qualifiers.pointer_const_levels = levels_mask;
                     if matches!(self.peek(), TokenKind::RParen) {
                         let span = self.peek_span();
                         // The cast expression's span covers the whole

@@ -377,6 +377,10 @@ impl std::fmt::Debug for FunctionAttributes {
 #[derive(Debug, Clone)]
 pub struct FunctionDef {
     pub return_type: TypeSpecifier,
+    /// `const` bits of the RETURN type's pointer levels (bit `L-1` is pointer
+    /// level `L`). `CType` erases qualifiers, so `int *const *f(void)` would
+    /// otherwise look like `int **f(void)` and `*f() = 0` be accepted.
+    pub return_pointer_const_levels: u32,
     pub name: String,
     pub params: Vec<ParamDecl>,
     pub variadic: bool,
@@ -1059,6 +1063,53 @@ pub fn cvr_is_const(cvr: u8) -> bool {
     cvr & CVR_CONST != 0
 }
 
+/// `const` bits of a function's RETURN type pointer levels, read from the
+/// declarator that produced that return type (bit `L-1` is pointer level `L`,
+/// level 1 closest to the base type).
+///
+/// The return type's levels are the pointer declarators BEFORE the function
+/// core, in creation order; `CType` erases their qualifiers, so
+/// `int *const *f(void)` would otherwise be indistinguishable from
+/// `int **f(void)` and `*f() = 0` would be accepted. Declarators that wrap the
+/// function in a function pointer (`int (*f(void))(void)`) reorder those
+/// layers, so they report no bits rather than a wrong level.
+pub fn return_pointer_const_levels(
+    return_type: &TypeSpecifier,
+    derived: &[DerivedDeclarator],
+) -> u32 {
+    if derived
+        .iter()
+        .any(|d| matches!(d, DerivedDeclarator::FunctionPointer(..)))
+    {
+        return 0;
+    }
+    fn spec_depth(spec: &TypeSpecifier) -> usize {
+        match spec {
+            TypeSpecifier::Pointer(inner, _) => 1 + spec_depth(inner),
+            _ => 0,
+        }
+    }
+    let depth = spec_depth(return_type);
+    let mut mask = 0u32;
+    let mut level = 0usize;
+    for d in derived {
+        match d {
+            DerivedDeclarator::Pointer(_, cvr) => {
+                if level >= depth {
+                    break;
+                }
+                if level < 32 && cvr_is_const(*cvr) {
+                    mask |= 1 << level;
+                }
+                level += 1;
+            }
+            DerivedDeclarator::Array(_) => {}
+            _ => break,
+        }
+    }
+    mask
+}
+
 /// Derived parts of a declarator (pointers, arrays, function params).
 #[derive(Debug, Clone)]
 pub enum DerivedDeclarator {
@@ -1636,6 +1687,11 @@ pub struct CompoundLiteralStorage {
     pub is_register: bool,
     pub is_thread_local: bool,
     pub is_const: bool,
+    /// `const` bits of the literal's pointer levels (bit `L-1` is pointer level
+    /// `L`), the same encoding as [`CastQualifiers::pointer_const_levels`].
+    /// A compound literal is an lvalue, so `*((int *const *){0}) = 0` modifies
+    /// a read-only object even though `CType` cannot say so.
+    pub pointer_const_levels: u32,
 }
 
 /// Qualifiers of a cast's type name, read from its tokens by the parser.

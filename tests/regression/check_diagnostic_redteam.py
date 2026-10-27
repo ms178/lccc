@@ -90,6 +90,13 @@ CASES = [
     ('const_cast_three_levels', 'void f(void*p){*(int *const *const *)p=0;}', True, None),
     ('const_cast_inner_level', 'void f(void*p){**(int *const **)p=0;}', True, None),
     ('mutable_cast_plain', 'void f(void*p){*(int **)p=0;}', False, None),
+    # A function's return type and a compound literal keep their own levels.
+    ('const_function_return_level', 'int *const *g(void);void f(void){*g()=0;}', True, None),
+    ('mutable_function_return_level', 'int **g(void);void f(void){*g()=0;}', False, None),
+    ('const_function_return_alias', 'typedef int *const cp;cp *g(void);void f(void){*g()=0;}', True, None),
+    ('mutable_function_return_pointee', 'int *const *g(void);void f(void){**g()=0;}', False, None),
+    ('const_compound_literal_level', 'void f(void){*((int *const *){0})=0;}', True, None),
+    ('mutable_compound_literal_level', 'void f(void){*((int **){0})=0;}', False, None),
 ]
 
 

@@ -156,6 +156,11 @@ pub struct FunctionInfo {
     pub is_defined: bool,
     /// Whether the function is declared with __attribute__((noreturn)) or _Noreturn
     pub is_noreturn: bool,
+    /// `const` bits of the RETURN type's pointer levels (bit `L-1` is pointer
+    /// level `L`, level 1 closest to the base type). `CType` erases
+    /// qualifiers, so `*g() = 0` for `int *const *g(void)` is only
+    /// diagnosable if the record keeps the middle level's `const`.
+    pub return_pointer_const_levels: u32,
 }
 
 impl FunctionInfo {
@@ -480,6 +485,8 @@ impl SemanticAnalyzer {
             prototype,
             is_defined: true,
             is_noreturn: func.attrs.is_noreturn(),
+            return_pointer_const_levels: self
+                .combine_return_const_levels(&func.return_type, func.return_pointer_const_levels),
         };
         // A block-scope prototype may precede the definition and carry facts the
         // definition does not repeat; `noreturn` is one of them. The file-scope
@@ -610,6 +617,8 @@ impl SemanticAnalyzer {
             prototype,
             is_defined: true,
             is_noreturn: func.attrs.is_noreturn() || prior_noreturn,
+            return_pointer_const_levels: self
+                .combine_return_const_levels(&func.return_type, func.return_pointer_const_levels),
         };
         let func_ctype = CType::Function(Box::new(func_info.call_type()));
 
@@ -1282,6 +1291,14 @@ impl SemanticAnalyzer {
                                         prototype,
                                         is_defined: false,
                                         is_noreturn,
+                                        return_pointer_const_levels: self
+                                            .combine_return_const_levels(
+                                                &decl.type_spec,
+                                                declarator_return_const_levels(
+                                                    &init_decl.derived,
+                                                    &ft.return_type,
+                                                ),
+                                            ),
                                     },
                                 );
                             }
@@ -1312,8 +1329,16 @@ impl SemanticAnalyzer {
                     });
                     return;
                 }
+                // A later prototype may be the one that spells the return
+                // type's level qualifiers; keep what either declared. Computed
+                // before the table entry is borrowed.
+                let return_levels = self.combine_return_const_levels(
+                    &decl.type_spec,
+                    declarator_return_const_levels(&init_decl.derived, &ft.return_type),
+                );
                 if let Some(existing) = self.result.functions.get_mut(&init_decl.name) {
                     existing.is_noreturn |= is_noreturn;
+                    existing.return_pointer_const_levels |= return_levels;
                     if prototype.is_some() {
                         existing.prototype = prototype;
                         // A later prototype refines an implicit declaration;
@@ -1334,6 +1359,10 @@ impl SemanticAnalyzer {
                             prototype,
                             is_defined: false,
                             is_noreturn,
+                            return_pointer_const_levels: self.combine_return_const_levels(
+                                &decl.type_spec,
+                                declarator_return_const_levels(&init_decl.derived, &ft.return_type),
+                            ),
                         },
                     );
                 }
@@ -3580,6 +3609,7 @@ impl SemanticAnalyzer {
                     prototype: None,
                     is_defined: false,
                     is_noreturn: false,
+                    return_pointer_const_levels: 0,
                 };
                 self.result.functions.insert(name.clone(), func_info);
             }
@@ -6881,17 +6911,25 @@ impl SemanticAnalyzer {
                 }
                 // A cast type name keeps its own per-level `const`
                 // (`*(int *const *)p = 0`); `CType` cannot carry it.
-                Expr::Cast(_, _, _, quals) if quals.pointer_const_levels != 0 => Some(
-                    (0..32)
-                        .map(|level| {
-                            if quals.pointer_const_levels & (1 << level) != 0 {
-                                crate::frontend::parser::ast::CVR_CONST
-                            } else {
-                                0
-                            }
-                        })
-                        .collect(),
-                ),
+                Expr::Cast(_, _, _, quals) if quals.pointer_const_levels != 0 => {
+                    Some(const_levels_to_cvr(quals.pointer_const_levels))
+                }
+                // A compound literal of such a type is an lvalue and records
+                // its levels the same way (`*((int *const *){0}) = 0`).
+                Expr::CompoundLiteral(_, _, _, storage) if storage.pointer_const_levels != 0 => {
+                    Some(const_levels_to_cvr(storage.pointer_const_levels))
+                }
+                // A function's return type keeps its own level qualifiers
+                // (`int *const *g(void)`), so `*g() = 0` is a modification of a
+                // read-only object.
+                Expr::FunctionCall(callee, _, _) => match &**callee {
+                    Expr::Identifier(name, _) => self
+                        .visible_function_info(name)
+                        .map(|info| info.return_pointer_const_levels)
+                        .filter(|mask| *mask != 0)
+                        .map(const_levels_to_cvr),
+                    _ => None,
+                },
                 _ => None,
             };
             if let Some(levels) = levels {
@@ -7156,6 +7194,20 @@ impl SemanticAnalyzer {
     /// entries the type builder may reorder around the `FunctionPointer` core;
     /// a function type is never an assignment target, so its levels are not
     /// consulted by the read-only check.
+    /// Combine the `const` levels an alias in the return type contributes with
+    /// those the declarator spells (`typedef int *const cp; cp *g(void)`).
+    fn combine_return_const_levels(&self, type_spec: &TypeSpecifier, declarator: u32) -> u32 {
+        let prefix = self.base_typedef_pointer_quals(type_spec);
+        let prefix_mask = prefix.iter().enumerate().fold(0u32, |mask, (level, cvr)| {
+            if level < 32 && crate::frontend::parser::ast::cvr_is_const(*cvr) {
+                mask | (1 << level)
+            } else {
+                mask
+            }
+        });
+        prefix_mask | shift_const_levels(declarator, prefix.len())
+    }
+
     /// Whether the alias naming `type_spec`'s base declares a read-only object
     /// (`typedef int *const cp;`), so a declaration with no star of its own is
     /// read-only. See [`Self::base_typedef_pointer_quals`] for the leaf walk.
@@ -7360,6 +7412,7 @@ impl SemanticAnalyzer {
                 prototype: None,
                 is_defined: false,
                 is_noreturn,
+                return_pointer_const_levels: 0,
             };
             self.result.functions.insert(name.to_string(), func_info);
         }
@@ -8976,6 +9029,9 @@ mod kr_prototype_tests {
             "void f(void*p){*(int *const *)p=0;}",
             "void f(void*p){*(int *const *const *)p=0;}",
             "void f(void*p){**(int *const **)p=0;}",
+            "int *const *g(void);void f(void){*g()=0;}",
+            "typedef int *const cp;cp *g(void);void f(void){*g()=0;}",
+            "void f(void){*((int *const *){0})=0;}",
         ] {
             assert!(analyze(bad).1.is_err(), "{bad}");
         }
@@ -8997,6 +9053,9 @@ mod kr_prototype_tests {
             "void f(void){int (*fp)(void)=0;fp=0;}",
             "void f(void*p){**(int *const *)p=0;}",
             "void f(void*p){*(int **)p=0;}",
+            "int **g(void);void f(void){*g()=0;}",
+            "int *const *g(void);void f(void){**g()=0;}",
+            "void f(void){*((int **){0})=0;}",
         ] {
             assert!(analyze(good).1.is_ok(), "{good}");
         }
@@ -9126,6 +9185,61 @@ mod kr_prototype_tests {
 /// Whether `init_decl` declares a const-qualified object (C11 6.7.3p5): the
 /// base type is const when the declarator has no pointer, and the outermost
 /// pointer is const when it has one (`const int *p` is not a const object).
+/// Shift a declarator's return-level mask past the pointer levels an alias in
+/// the return type contributes (`typedef int *const cp; cp *g(void)` has the
+/// alias's level below the declarator's star).
+fn shift_const_levels(mask: u32, by: usize) -> u32 {
+    if by >= 32 { 0 } else { mask << by }
+}
+
+/// `const` bits of a FUNCTION's return-type pointer levels, read from its
+/// declarator. The return type's levels are the pointer declarators before the
+/// function core, in creation order; `CType` cannot carry their qualifiers, so
+/// this is what lets `*g() = 0` for `int *const *g(void)` be rejected.
+/// Declarators that wrap the function in a function pointer reorder those
+/// layers and report nothing rather than a wrong level.
+fn declarator_return_const_levels(derived: &[DerivedDeclarator], return_type: &CType) -> u32 {
+    if derived
+        .iter()
+        .any(|d| matches!(d, DerivedDeclarator::FunctionPointer(..)))
+    {
+        return 0;
+    }
+    let depth = pointer_depth_of(Some(return_type));
+    let mut mask = 0u32;
+    let mut level = 0usize;
+    for d in derived {
+        match d {
+            DerivedDeclarator::Pointer(_, cvr) => {
+                if level >= depth {
+                    break;
+                }
+                if level < 32 && crate::frontend::parser::ast::cvr_is_const(*cvr) {
+                    mask |= 1 << level;
+                }
+                level += 1;
+            }
+            DerivedDeclarator::Array(_) => {}
+            _ => break,
+        }
+    }
+    mask
+}
+
+/// Expand a bitmask of `const` pointer levels into the per-level CVR vector the
+/// read-only check indexes (bit `L-1` set means level `L` is `const`).
+fn const_levels_to_cvr(mask: u32) -> Vec<u8> {
+    (0..32)
+        .map(|level| {
+            if mask & (1 << level) != 0 {
+                crate::frontend::parser::ast::CVR_CONST
+            } else {
+                0
+            }
+        })
+        .collect()
+}
+
 /// Number of consecutive pointer levels in `ty` (0 for anything that is not a
 /// pointer, including arrays and functions).
 fn pointer_depth_of(ty: Option<&CType>) -> usize {
