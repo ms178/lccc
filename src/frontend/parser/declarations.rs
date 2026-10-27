@@ -150,6 +150,14 @@ impl Parser {
                 if self.pos + 1 < self.tokens.len()
                     && matches!(self.tokens[self.pos + 1].kind, TokenKind::LParen)
                 {
+                    // GCC 16.2: `-Wimplicit-int` (measured: a default ERROR
+                    // from C99 on, a warning in gnu90). The dialect severity
+                    // policy lives in `WarningConfig`; this is the emission.
+                    self.diagnostics.warning_with_kind(
+                        "return type defaults to 'int'",
+                        start,
+                        crate::common::error::WarningKind::ImplicitInt,
+                    );
                     return Some(TypeSpecifier::Int);
                 }
             }

@@ -450,6 +450,13 @@ pub struct ParamDecl {
     /// pointer. This distinguishes `int (**fpp)(int)` from `void *(*fp)(size_t)` which
     /// otherwise have identical CType representations.
     pub fptr_inner_ptr_depth: u32,
+    /// Pointer stars in the parameter's declarator (`int *p` has 1). Distinguishes
+    /// top-level `const` on the parameter itself (`int *const p`: stars > 0 and
+    /// `pointer_const`) from `const` on the pointee (`const int *p`: `is_const`).
+    pub pointer_depth: u32,
+    /// True for `T *const p`: the pointer parameter object itself is read-only
+    /// (the `const` on the star closest to the name).
+    pub pointer_const: bool,
 }
 
 /// Bit masks for boolean flags in `Declaration::flags`.
@@ -1123,6 +1130,8 @@ mod declarator_law_tests {
             vla_size_exprs: Vec::new(),
             decayed_array: false,
             fptr_inner_ptr_depth: 0,
+            pointer_depth: 0,
+            pointer_const: false,
         }
     }
 

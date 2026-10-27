@@ -807,6 +807,8 @@ jobs:
         set -euo pipefail
         python3 scripts/check_ill_typed_builtins.py --self-test
         env CCC=target/fastbuild/lccc LCCC_REPO=. python3 scripts/check_ill_typed_builtins.py
+    - name: GCC 16.2 diagnostic severity parity
+      run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_gcc162_diagnostic_severity.sh
     - name: No merge conflict markers
       run: python3 scripts/check_no_conflict_markers.py
     - name: Check -ftrapv boundary matrix (m32)

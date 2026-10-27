@@ -855,6 +855,12 @@ impl Parser {
             // Save and reset parsing_const to detect if this parameter's base type is const.
             let saved_const = self.attrs.parsing_const();
             self.attrs.set_const(false);
+            // The pointer-star `const` is per parameter too (`f(int a, int
+            // *const p)` must not leak p's star const into `a`'s declarator);
+            // save the enclosing declaration's state and restore it below
+            // alongside `saved_const`.
+            let saved_pointer_const = self.attrs.parsing_pointer_const();
+            self.attrs.set_pointer_const(false);
             // Each parameter's volatile and typedef qualifiers are its own
             // (`VI p, int y`: `y` is not volatile), so clear them before its
             // specifiers are parsed.
@@ -1033,7 +1039,9 @@ impl Parser {
                     type_spec = TypeSpecifier::Pointer(Box::new(type_spec), AddressSpace::Default);
                 }
 
+                let param_pointer_const = self.attrs.parsing_pointer_const();
                 self.attrs.set_const(saved_const);
+                self.attrs.set_pointer_const(saved_pointer_const);
                 self.attrs.set_noreturn(saved_noreturn);
                 params.push(ParamDecl {
                     type_spec,
@@ -1049,9 +1057,12 @@ impl Parser {
                     vla_size_exprs,
                     decayed_array: !array_dims.is_empty(),
                     fptr_inner_ptr_depth: inner_ptr_depth,
+                    pointer_depth,
+                    pointer_const: param_pointer_const,
                 });
             } else {
                 self.attrs.set_const(saved_const);
+                self.attrs.set_pointer_const(saved_pointer_const);
                 self.attrs.set_noreturn(saved_noreturn);
                 break;
             }
@@ -1085,6 +1096,8 @@ impl Parser {
                 vla_size_exprs: Vec::new(),
                 decayed_array: false,
                 fptr_inner_ptr_depth: 0,
+                pointer_depth: 0,
+                pointer_const: false,
             });
             if !self.consume_if(&TokenKind::Comma) {
                 break;

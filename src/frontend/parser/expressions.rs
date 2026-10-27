@@ -432,6 +432,18 @@ impl Parser {
                     result_type = self.apply_pending_vector_attr(result_type);
                     if matches!(self.peek(), TokenKind::RParen) {
                         let span = self.peek_span();
+                        // The cast expression's span covers the whole
+                        // `(type)expr` form, starting at the `(`: storing only
+                        // the closing paren put GCC-style diagnostics on the
+                        // `)` instead of the expression start (measured
+                        // against gcc-16.2.0 columns for
+                        // `g((double*)0)` and `return (char*)0`).
+                        let lparen_span = self.tokens[save].span;
+                        let cast_span = crate::common::source::Span::new(
+                            lparen_span.start,
+                            span.end,
+                            span.file_id,
+                        );
                         self.advance();
                         // Check for compound literal: (type){...}
                         if matches!(self.peek(), TokenKind::LBrace) {
@@ -458,7 +470,7 @@ impl Parser {
                         self.attrs.parsing_vector_size = save_vector_size;
                         self.attrs.parsing_ext_vector_nelem = save_ext_vector;
                         let expr = self.parse_cast_expr();
-                        return Expr::Cast(result_type, Box::new(expr), span, qualifiers);
+                        return Expr::Cast(result_type, Box::new(expr), cast_span, qualifiers);
                     }
                 }
             }

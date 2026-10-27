@@ -938,7 +938,9 @@ pub(crate) fn parse_macro_header(rest: &str) -> (&str, Vec<MacroParam>) {
 /// then attached everything after the first `=` on a part to that parameter,
 /// so a header like the kernel's
 ///
-///     .macro UNWIND_HINT type:req sp_reg=0 sp_offset=0 signal=0
+/// ```text
+/// .macro UNWIND_HINT type:req sp_reg=0 sp_offset=0 signal=0
+/// ```
 ///
 /// (arch/x86/include/asm/objtool.h, reachable from arch/x86/entry/entry.S via
 /// <asm/unwind_hints.h>) became ONE parameter `type` with the default

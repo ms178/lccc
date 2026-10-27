@@ -259,6 +259,17 @@ pub struct SemanticAnalyzer {
     active_continue_targets: Vec<Vec<String>>,
 }
 
+/// Where an implicit conversion occurs, for GCC 16.2's verbatim
+/// `-Wint-conversion` phrasing of each context (all four forms
+/// measured against gcc-16.2.0).
+#[derive(Clone, Copy)]
+enum IConvContext<'a> {
+    Initialization,
+    Assignment,
+    Returning,
+    Argument { index: usize, callee: &'a str },
+}
+
 impl SemanticAnalyzer {
     pub fn new() -> Self {
         let mut analyzer = Self {
@@ -512,6 +523,19 @@ impl SemanticAnalyzer {
                 if const_base {
                     self.symbol_table.mark_const_base(name);
                 }
+                // Top-level const for C11 6.5.16p1: a parameter with any
+                // star is read-only only when the `const` sits on the star
+                // closest to the name (`int *const p`); without a star the
+                // declaration's own `const` decides (`const int x`,
+                // `const P q`).
+                let top_const = if param.pointer_depth > 0 {
+                    param.pointer_const
+                } else {
+                    param.is_const
+                };
+                if top_const {
+                    self.symbol_table.mark_top_const(name);
+                }
             }
         }
         let previous_return_type = self.current_return_type.replace(return_type.clone());
@@ -609,6 +633,19 @@ impl SemanticAnalyzer {
                 self.symbol_table.mark_automatic(name);
                 if const_base {
                     self.symbol_table.mark_const_base(name);
+                }
+                // Top-level const for C11 6.5.16p1: a parameter with any
+                // star is read-only only when the `const` sits on the star
+                // closest to the name (`int *const p`); without a star the
+                // declaration's own `const` decides (`const int x`,
+                // `const P q`).
+                let top_const = if param.pointer_depth > 0 {
+                    param.pointer_const
+                } else {
+                    param.is_const
+                };
+                if top_const {
+                    self.symbol_table.mark_top_const(name);
                 }
             }
         }
@@ -1355,6 +1392,26 @@ impl SemanticAnalyzer {
             if const_base {
                 self.symbol_table.mark_const_base(&init_decl.name);
             }
+            // Top-level const for assignment/`++`/`--` (C11 6.5.16p1): with
+            // any pointer star the `const` closest to the name decides
+            // (`int *const p` read-only, `const int *q` writable, `q`'s
+            // pointee constness already recorded above as `const_base`);
+            // without a star the declaration's own `const` does (`const int
+            // x`, `const int a[]`, `const P q` for `typedef int *P`).
+            if is_object {
+                let has_star = init_decl
+                    .derived
+                    .iter()
+                    .any(|d| matches!(d, DerivedDeclarator::Pointer(_)));
+                let top_const = if has_star {
+                    decl.is_pointer_const()
+                } else {
+                    decl.is_const()
+                };
+                if top_const {
+                    self.symbol_table.mark_top_const(&init_decl.name);
+                }
+            }
             if links && !self.symbol_table.at_file_scope() {
                 self.symbol_table.mark_linked(&init_decl.name);
             } else if is_object && !decl.is_static() && !self.symbol_table.at_file_scope() {
@@ -1479,7 +1536,12 @@ impl SemanticAnalyzer {
                         .map(|s| s.ty.clone());
                     if let Some(var_ty) = var_ty {
                         let checker = self.expr_type_checker();
-                        if self.check_assignment_operand(init_expr, &var_ty, init_expr.span()) {
+                        if self.check_assignment_operand(
+                            init_expr,
+                            &var_ty,
+                            init_expr.span(),
+                            IConvContext::Initialization,
+                        ) {
                             // Diagnosed; the checks below would only repeat it.
                         } else if let Some(init_ty) = checker.infer_expr_ctype(init_expr) {
                             self.check_pointer_float_conversion(
@@ -2334,7 +2396,12 @@ impl SemanticAnalyzer {
                         }
                     } else {
                         let checker = self.expr_type_checker();
-                        if self.check_assignment_operand(expr, &expected, *span) {
+                        if self.check_assignment_operand(
+                            expr,
+                            &expected,
+                            *span,
+                            IConvContext::Returning,
+                        ) {
                             // Diagnosed; the checks below would only repeat it.
                         } else if let Some(actual) = checker.infer_expr_ctype(expr) {
                             let actual = self.conversion_source_ctype(expr, actual);
@@ -2360,9 +2427,10 @@ impl SemanticAnalyzer {
                     .as_ref()
                     .is_some_and(|t| !matches!(t, CType::Void))
                 {
-                    self.diagnostics.borrow_mut().warning(
+                    self.diagnostics.borrow_mut().warning_with_kind(
                         "return with no value, in function returning non-void",
                         *span,
+                        crate::common::error::WarningKind::ReturnMismatch,
                     );
                 }
             }
@@ -3058,6 +3126,12 @@ impl SemanticAnalyzer {
                         && !self.check_ext_vector_step(operand, *op == UnaryOp::PreInc, *span)
                     {
                         self.check_lvalue_operand(operand, *span);
+                        let verb = if *op == UnaryOp::PreInc {
+                            "increment"
+                        } else {
+                            "decrement"
+                        };
+                        self.check_readonly_mutation(operand, *span, verb);
                     }
                 }
             }
@@ -3071,6 +3145,12 @@ impl SemanticAnalyzer {
                     && !self.check_ext_vector_step(operand, *op == PostfixOp::PostInc, *span)
                 {
                     self.check_lvalue_operand(operand, *span);
+                    let verb = if *op == PostfixOp::PostInc {
+                        "increment"
+                    } else {
+                        "decrement"
+                    };
+                    self.check_readonly_mutation(operand, *span, verb);
                 }
             }
             Expr::Assign(lhs, rhs, span) => {
@@ -3079,6 +3159,7 @@ impl SemanticAnalyzer {
                 if !self.check_ext_vector_assignable(lhs, *span) {
                     self.check_lvalue_operand(lhs, *span);
                 }
+                self.check_readonly_mutation(lhs, *span, "assignment");
                 // Check for invalid pointer <-> float conversions in assignment
                 let checker = self.expr_type_checker();
                 if let (Some(lhs_ty), Some(rhs_ty)) =
@@ -3086,7 +3167,8 @@ impl SemanticAnalyzer {
                 {
                     // An operand-constraint error makes the checks below
                     // redundant (they would only repeat it).
-                    if !self.check_assignment_operand(rhs, &lhs_ty, *span) {
+                    if !self.check_assignment_operand(rhs, &lhs_ty, *span, IConvContext::Assignment)
+                    {
                         let rhs_ty = self.conversion_source_ctype(rhs, rhs_ty);
                         let null_constant = self.is_void_null_pointer_constant(rhs);
                         self.check_assignment_compatibility(
@@ -3107,6 +3189,8 @@ impl SemanticAnalyzer {
                 if !self.check_ext_vector_assignable(lhs, *span) {
                     self.check_lvalue_operand(lhs, *span);
                 }
+                // GCC phrases `op=` on a const operand as an assignment.
+                self.check_readonly_mutation(lhs, *span, "assignment");
             }
             Expr::Conditional(cond, then_expr, else_expr, span) => {
                 self.analyze_expr(cond);
@@ -4076,10 +4160,125 @@ impl SemanticAnalyzer {
     /// Simple assignment and the conversions "as if by assignment"
     /// (initialization, argument passing, `return`; C23 6.5.16.1p1) for a
     /// record, `void` or `nullptr_t` operand. Whether it reported an error.
-    fn check_assignment_operand(&self, from: &Expr, to: &CType, span: Span) -> bool {
+    fn check_assignment_operand(
+        &self,
+        from: &Expr,
+        to: &CType,
+        span: Span,
+        ctx: IConvContext<'_>,
+    ) -> bool {
         let Some(from_ty) = self.constraint_operand(from) else {
             return false;
         };
+        // GCC 16.2: an integer that is not a null-pointer constant used
+        // where a pointer is expected (initialization, assignment, argument
+        // passing, `return`) is `-Wint-conversion`, a default error from
+        // C99 on and a warning in gnu90 (measured). Explicit casts take a
+        // different path and never reach this implicit conversion.
+        if from_ty.is_integer() && matches!(to, CType::Pointer(..)) {
+            let tc = self.expr_type_checker();
+            if !tc.is_null_pointer_constant(from) {
+                let context = match ctx {
+                    IConvContext::Initialization => {
+                        format!("initialization of '{to}' from '{from_ty}'")
+                    }
+                    IConvContext::Assignment => {
+                        format!("assignment to '{to}' from '{from_ty}'")
+                    }
+                    IConvContext::Returning => {
+                        format!("returning '{from_ty}' from a function with return type '{to}'")
+                    }
+                    IConvContext::Argument { index, callee } => {
+                        format!("passing argument {} of '{}'", index + 1, callee)
+                    }
+                };
+                // GCC's measured column policy: `return` points at the
+                // returned value, while initialization, assignment, and
+                // argument passing keep the surrounding conversion
+                // expression's span (which matches gcc's column in all
+                // three probe contexts).
+                let ic_span = match ctx {
+                    IConvContext::Returning => from.span(),
+                    _ => span,
+                };
+                self.diagnostics.borrow_mut().warning_with_kind(
+                    format!("{context} makes pointer from integer without a cast"),
+                    ic_span,
+                    crate::common::error::WarningKind::IntConversion,
+                );
+            }
+        }
+        // Pointer-shaped source against a pointer target with
+        // incompatible pointees: C11 6.5.16.1 constraint, GCC
+        // `-Wincompatible-pointer-types` (a default error from C99 on and a
+        // warning in gnu90; measured). The verdict comes from the very
+        // function the argument path uses, so void pointers, qualified
+        // pointees, arrays, function decay, and address spaces stay
+        // accepted exactly where GCC 16.2 accepts them. Reporting here
+        // also pre-emits the per-context checks below, replacing their
+        // plain error (which `-Wno-incompatible-pointer-types` could not
+        // disable) with the kind-aware, dialect-severity diagnostic.
+        // Two shapes belong to other owners and must fall through to them:
+        // a null-pointer constant spelled through `void` (`(void *)0` into
+        // an address-space pointer is accepted, measured with the
+        // `__seg_gs` conversion oracles), and a cross-address-space pair
+        // whose diagnostic is the address-space one, not the pointer one.
+        // The space gap may sit at ANY pointer level (`int **` against
+        // `__seg_gs int **` differs below the top), so the comparison
+        // mirrors `pointer_argument_compat`'s per-level space walk.
+        fn space_gap(a: &CType, b: &CType) -> bool {
+            match (a, b) {
+                (CType::Pointer(af, asp), CType::Pointer(bt, bsp)) => {
+                    asp != bsp || space_gap(af, bt)
+                }
+                (CType::Pointer(af, _), CType::Array(bt, _)) => space_gap(af, bt),
+                (CType::Array(af, _), CType::Pointer(bt, bsp)) => {
+                    let _ = bsp;
+                    space_gap(af, bt)
+                }
+                _ => false,
+            }
+        }
+        let space_ok = !space_gap(&from_ty, to);
+        if matches!(to, CType::Pointer(..))
+            && matches!(
+                from_ty,
+                CType::Pointer(..) | CType::Array(..) | CType::Function(..)
+            )
+            && space_ok
+            && !self.is_void_null_pointer_constant(from)
+            && pointer_argument_compat(&from_ty, to) == PtrCompat::Incompatible
+        {
+            // All four phrasings measured against gcc-16.2.0.
+            let message = match ctx {
+                IConvContext::Initialization => {
+                    format!("initialization of '{to}' from incompatible pointer type '{from_ty}'")
+                }
+                IConvContext::Assignment => {
+                    format!("assignment to '{to}' from incompatible pointer type '{from_ty}'")
+                }
+                IConvContext::Returning => format!(
+                    "returning '{from_ty}' from a function with incompatible return type '{to}'"
+                ),
+                IConvContext::Argument { index, callee } => format!(
+                    "passing argument {} of '{}' from incompatible pointer type",
+                    index + 1,
+                    callee
+                ),
+            };
+            // Same measured column policy as the integer case: `return`
+            // points at the returned value.
+            let ip_span = match ctx {
+                IConvContext::Returning => from.span(),
+                _ => span,
+            };
+            self.diagnostics.borrow_mut().warning_with_kind(
+                message,
+                ip_span,
+                crate::common::error::WarningKind::IncompatiblePointerTypes,
+            );
+            return true;
+        }
         if !operand_constraints::involved(&from_ty) && !operand_constraints::involved(to) {
             return false;
         }
@@ -4680,7 +4879,15 @@ impl SemanticAnalyzer {
                 }
                 continue;
             }
-            if self.check_assignment_operand(arg, param_ty, arg.span()) {
+            if self.check_assignment_operand(
+                arg,
+                param_ty,
+                arg.span(),
+                IConvContext::Argument {
+                    index,
+                    callee: name,
+                },
+            ) {
                 continue;
             }
             if let Some(arg_ty) = checker.infer_expr_ctype(arg) {
@@ -6385,6 +6592,178 @@ impl SemanticAnalyzer {
                 );
             }
         }
+    }
+
+    /// Exact source spelling of `expr`, used for GCC-compatible
+    /// `read-only location '<expr>'` diagnostics. Falls back to a neutral
+    /// placeholder when no source manager is attached (synthetic spans in
+    /// unit tests) or the span does not resolve to a single-line slice.
+    fn expr_source_text(&self, expr: &Expr) -> String {
+        // `Expr::span()` stores the *operator* token for some composites
+        // (the parser records `*` for `Deref` and `[` for subscripting),
+        // so cover the operands too: `*q` is `*`+inner, `a[i]` is base+index.
+        let mut span = expr.span();
+        let inner_spans: Vec<&Expr> = match expr {
+            Expr::Deref(inner, _) => vec![inner.as_ref()],
+            Expr::ArraySubscript(base, index, _) => vec![base.as_ref(), index.as_ref()],
+            _ => Vec::new(),
+        };
+        for inner in inner_spans {
+            let is = inner.span();
+            if is.file_id == span.file_id {
+                span.start = span.start.min(is.start);
+                span.end = span.end.max(is.end);
+            }
+        }
+        let Some(sm) = self.diagnostics.borrow().share_source_manager() else {
+            return "<expr>".to_string();
+        };
+        let content = sm.get_content(span.file_id);
+        let (start, mut end) = (span.start as usize, span.end as usize);
+        // Subscript spans start at `[` and end at the index expression;
+        // include the closing `]` (skipping whitespace) when present.
+        if matches!(expr, Expr::ArraySubscript(..)) {
+            let mut probe = end;
+            while probe < content.len() && content.as_bytes()[probe].is_ascii_whitespace() {
+                probe += 1;
+            }
+            if content.as_bytes().get(probe) == Some(&b']') {
+                end = probe + 1;
+            }
+        }
+        if start <= end
+            && end <= content.len()
+            && content.is_char_boundary(start)
+            && content.is_char_boundary(end)
+        {
+            let text = &content[start..end];
+            if !text.is_empty() && !text.contains('\n') {
+                return text.to_string();
+            }
+        }
+        "<expr>".to_string()
+    }
+
+    /// Whether the POINTEE the pointer expression `ptr` designates is
+    /// const-qualified (`const int *q` -> `*q` and `q->f` are read-only;
+    /// `int *const p` -> the pointer is read-only but `*p` is writable).
+    /// This is exactly `common::qualifiers`' base-constness model, the one
+    /// `_Generic` selection already uses.
+    fn pointee_readonly(&self, ptr: &Expr) -> bool {
+        // Walk the dereference chain down to its root so the verdict can be
+        // exact: an object at `*^k root` is const exactly when `k` equals the
+        // root's pointer depth (the const then sits on the root's base
+        // specifier -- `const int *q`, `*q` read-only) or when the root is a
+        // non-pointer array whose elements are const (`*a` of `const int
+        // a[]`).  Deeper constness (a const at a middle level of a multi-star
+        // type, or a base const not yet consumed by the chain) is *not*
+        // recorded anywhere qualifier-free `CType` can see, so it reports
+        // "not read-only" instead of guessing -- a missing diagnostic never
+        // breaks a legal program, while a wrong one does (GCC 16.2 accepts
+        // `b = *(*p)++;` for `p: const unsigned char **`, whose base const
+        // sits two levels below the incremented `*p`).
+        let tc = self.expr_type_checker();
+        let mut derefs = 0usize;
+        let mut root = ptr;
+        loop {
+            match root {
+                Expr::Deref(inner, _) => {
+                    derefs += 1;
+                    root = inner;
+                }
+                Expr::ArraySubscript(base, _, _) => {
+                    derefs += 1;
+                    root = base;
+                }
+                _ => break,
+            }
+        }
+        let k = derefs; // this call asks about `*^k root`'s successor
+        let root_name = match root {
+            Expr::Identifier(name, _) => Some(name.as_str()),
+            _ => None,
+        };
+        let depth = match tc.infer_expr_ctype(root) {
+            Some(CType::Pointer(mut inner, _)) => {
+                let mut d = 1u32;
+                while let CType::Pointer(next, _) = *inner {
+                    d += 1;
+                    inner = next;
+                }
+                d
+            }
+            Some(CType::Array(..)) => 0,
+            _ => return false, // unknown type: stay silent
+        };
+        match (k, depth) {
+            // `*root` of a one-star root: the base specifier IS the pointee.
+            (0, 1) | (1, 0) => {
+                if depth == 0 {
+                    // `*a` of an array: the element, i.e. the array's own
+                    // top-level const (`const int a[]`, `int *const ap[]`).
+                    root_name.is_some_and(|name| self.symbol_table.is_top_const(name))
+                } else {
+                    root_name.is_some_and(|name| self.symbol_table.is_const_base(name))
+                }
+            }
+            // The chain consumes every star: the const is the base one.
+            (k, depth) if depth > 0 && k as u32 == depth => {
+                root_name.is_some_and(|name| self.symbol_table.is_const_base(name))
+            }
+            // Middle-level const is unrecorded: do not guess (see above).
+            _ => false,
+        }
+    }
+
+    /// Whether assigning to (or `++`/`--` on) the lvalue `target` violates
+    /// C11 6.5.16p1: the left operand must not be const-qualified.
+    ///
+    /// The recursion mirrors GCC 16.2's diagnostic classes: a plain
+    /// identifier consults the object's TOP-LEVEL const (`const int x` and
+    /// `int *const p` are read-only; `const int *q` is a writable pointer);
+    /// `*e`/`e[i]` through a pointer consult the pointee (`q[i]` through
+    /// `const int *q`); an array's elements follow the array's own
+    /// top-level const (`const int a[]` and `int *const ap[]` have
+    /// read-only elements); a dot access recurses into the object; an
+    /// arrow access consults the pointee.
+    fn lvalue_readonly(&self, target: &Expr) -> bool {
+        let tc = self.expr_type_checker();
+        match target {
+            Expr::Identifier(name, _) => self.symbol_table.is_top_const(name),
+            Expr::Deref(inner, _) => self.pointee_readonly(inner),
+            Expr::ArraySubscript(base, _, _) => {
+                if matches!(tc.infer_expr_ctype(base), Some(CType::Array(..))) {
+                    self.lvalue_readonly(base)
+                } else {
+                    self.pointee_readonly(base)
+                }
+            }
+            Expr::MemberAccess(base, _, _) => self.lvalue_readonly(base),
+            Expr::PointerMemberAccess(base, _, _) => self.pointee_readonly(base),
+            _ => false,
+        }
+    }
+
+    /// Emit GCC 16.2's read-only diagnostic for a mutation whose operand
+    /// fails [`Self::lvalue_readonly`]. `verb` is the measured GCC word:
+    /// `assignment` for `=`/`op=`, `increment` for pre/postfix `++`, and
+    /// `decrement` for `--`, each pairing with one of the three operand
+    /// classes (variable / location / member in read-only object).
+    fn check_readonly_mutation(&self, target: &Expr, op_span: Span, verb: &str) {
+        if !self.lvalue_readonly(target) {
+            return;
+        }
+        let message = match target {
+            Expr::Identifier(name, _) => format!("{verb} of read-only variable '{name}'"),
+            Expr::MemberAccess(_, field, _) | Expr::PointerMemberAccess(_, field, _) => {
+                format!("{verb} of member '{field}' in read-only object")
+            }
+            _ => format!(
+                "{verb} of read-only location '{}'",
+                self.expr_source_text(target)
+            ),
+        };
+        self.diagnostics.borrow_mut().error(message, op_span);
     }
 
     fn check_const_compound_literal_mutation(&self, target: &Expr, span: Span) {
@@ -8192,6 +8571,14 @@ mod kr_prototype_tests {
         let tu = parser.parse();
         assert_eq!(parser.error_count, 0, "fixture must parse");
         let mut sema = SemanticAnalyzer::new();
+        // Mirror the driver's GCC 16.2 dialect-default severity policy
+        // (`-Wint-conversion`, `-Wincompatible-pointer-types` and friends
+        // are errors from C99 on), so fixture verdicts equal what the
+        // compiler does under its default dialect instead of depending on
+        // whether a particular constraint already had a kind.
+        let mut config = crate::common::error::WarningConfig::new();
+        config.apply_gcc162_c99_default_errors();
+        sema.diagnostics.borrow_mut().set_warning_config(config);
         let result = sema.analyze(&tu);
         (sema, result)
     }
