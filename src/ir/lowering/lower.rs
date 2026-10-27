@@ -3044,6 +3044,9 @@ impl Lowerer {
     }
 
     pub(super) fn terminate(&mut self, term: Terminator) {
+        let state = self.func_mut();
+        let (label, span) = (state.current_label, state.current_span);
+        state.term_spans.record(label, span, &term);
         let block = BasicBlock {
             label: self.func_mut().current_label,
             instructions: std::mem::take(&mut self.func_mut().instrs),

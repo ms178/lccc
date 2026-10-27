@@ -62,33 +62,41 @@ pub const OTHER: &[(&str, Probe)] = &[
 """
 
 
-def names_for(source: str) -> tuple[set[str], set[str]]:
+def names_for(source: str) -> set[str]:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td) / "src" / "common"
         root.mkdir(parents=True)
         (root / "cpu_probe.rs").write_text(source, encoding="utf-8")
-        (root / "isa_features.rs").write_text(
-            "pub const FEATURE_TABLE: &[&str] = &[\n    \"sse2\",\n];\n", encoding="utf-8"
-        )
         return census.lccc_names(Path(td))
 
 
 class CensusExtractionTest(unittest.TestCase):
     def test_inline_and_reflowed_sources_agree(self) -> None:
-        inline, _ = names_for(INLINE)
-        reflowed, _ = names_for(REFLOWED)
+        inline = names_for(INLINE)
+        reflowed = names_for(REFLOWED)
         self.assertEqual(inline, reflowed)
         self.assertEqual(inline, {"cmov", "avx512bw", "pni"})
 
     def test_reflowed_entry_is_not_lost(self) -> None:
-        reflowed, _ = names_for(REFLOWED)
+        reflowed = names_for(REFLOWED)
         self.assertIn("avx512bw", reflowed, "the rustfmt layout must not hide a name")
 
     def test_prose_and_other_tables_do_not_leak(self) -> None:
-        found, _ = names_for(DECOY)
+        found = names_for(DECOY)
         self.assertEqual(found, {"sse2"})
         self.assertNotIn("fictional", found)
         self.assertNotIn("decoy", found)
+
+    def test_gcc_isa_names_table_is_parsed(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            header = Path(td) / "i386-isas.h"
+            header.write_text(
+                'ISA_NAMES_TABLE_ENTRY("x86-64-v2", FEATURE_X86_64_V2, P_X86_64_V2, NULL)\n'
+                '  ISA_NAMES_TABLE_ENTRY ( "amx-fp8", FEATURE_AMX_FP8, P_NONE, "-mamx-fp8")\n'
+                '/* ISA_NAMES_TABLE_START */\n',
+                encoding="utf-8",
+            )
+            self.assertEqual(census.gcc_isa_names(header), ["x86-64-v2", "amx-fp8"])
 
 
 if __name__ == "__main__":

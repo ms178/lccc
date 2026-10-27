@@ -15,6 +15,7 @@ use super::cfi;
 use super::compress;
 use super::encoder::{
     EncodeResult, RelocType, encode_got_pseudo, encode_insn_directive, encode_instruction,
+    encode_li, li_rvc_aliases_match,
 };
 use super::parser::{
     AsmStatement, DataValue, Directive, Operand, SizeExpr, SymbolType, Visibility,
@@ -26,7 +27,7 @@ use crate::backend::elf::{
     STT_OBJECT, STT_TLS, STV_HIDDEN, STV_INTERNAL, STV_PROTECTED, SetValue,
 };
 use crate::backend::elf_writer_common::{uleb128_fixed, uleb128_len};
-use crate::common::fx_hash::{FxHashMap, FxHashSet};
+use crate::common::fx_hash::FxHashMap;
 
 // ELF flags for RISC-V
 pub(super) const EF_RISCV_RVC: u32 = 0x1;
@@ -82,6 +83,35 @@ pub struct ElfWriter {
     leb_retry: Option<Vec<usize>>,
     /// CFI location advances and PC-relative words resolved after layout.
     pending_cfi: Vec<PendingCfi>,
+    /// Branch relaxation (GNU as's `RELAX_BRANCH` frags): every branch and
+    /// jump to a symbol counts here, in source order.
+    branch_count: usize,
+    /// The ones assembled this pass, checked after layout.
+    relax_branches: Vec<RelaxBranch>,
+    /// Lengths a previous pass found necessary, by ordinal.  They only
+    /// grow, so the passes terminate.
+    branch_lengths: FxHashMap<usize, u8>,
+    /// Set when this pass lengthened a branch (assemble again).
+    branch_retry: bool,
+}
+
+const R_RISCV_RVC_BRANCH: u32 = 44;
+const R_RISCV_RVC_JUMP: u32 = 45;
+
+/// A branch or jump to a symbol (GNU as's `RELAX_BRANCH` frag), checked
+/// after layout and assembled again longer if its target needs it.
+struct RelaxBranch {
+    ordinal: usize,
+    section: String,
+    offset: u64,
+    symbol: String,
+    addend: i64,
+    /// `j`/`jal`: never longer than 4 bytes (GNU as assumes jumps reach).
+    jump: bool,
+    /// The spelling has a 2-byte form (`c.j`, `c.jal`, `c.beqz`, `c.bnez`).
+    rvc: bool,
+    /// The length assembled this pass: 2, 4, 6 or 8.
+    length: u8,
 }
 
 /// A `.eh_frame` field produced by the CFI lowering, written after layout.
@@ -422,6 +452,10 @@ impl ElfWriter {
             leb_widths: Vec::new(),
             leb_retry: None,
             pending_cfi: Vec::new(),
+            branch_count: 0,
+            relax_branches: Vec::new(),
+            branch_lengths: FxHashMap::default(),
+            branch_retry: false,
         };
         // Data values capture code labels symbolically; whether they end up
         // folded or relocated is decided by the relax state at the end
@@ -593,20 +627,24 @@ impl ElfWriter {
     /// whole input is assembled again with the widths the previous pass
     /// measured, which reaches the same layout.  Widths only grow (capped at
     /// 10, a u64's LEB128), so this terminates; inputs without such a value
-    /// assemble once.
+    /// assemble once.  Branches work the same way: they start at their
+    /// shortest form and a pass that finds one too short assembles again with
+    /// it longer (see [`Self::emit_relaxable_branch`]).
     pub fn process_statements(&mut self, statements: &[AsmStatement]) -> Result<(), String> {
         let (flags, class) = (self.elf_flags, self.elf_class);
         let ptr_size = if class == ELFCLASS32 { 4 } else { 8 };
         let statements = cfi_lower::lower_cfi(statements.to_vec(), &cfi::target(ptr_size))?;
         loop {
             self.process_statements_once(&statements)?;
-            let Some(widths) = self.leb_retry.take() else {
+            let widths = self.leb_retry.take();
+            if widths.is_none() && !self.branch_retry {
                 return Ok(());
-            };
+            }
             let mut fresh = ElfWriter::new();
             fresh.set_elf_flags(flags);
             fresh.set_elf_class(class);
-            fresh.leb_widths = widths;
+            fresh.leb_widths = widths.unwrap_or_else(|| std::mem::take(&mut self.leb_widths));
+            fresh.branch_lengths = std::mem::take(&mut self.branch_lengths);
             *self = fresh;
         }
     }
@@ -632,6 +670,16 @@ impl ElfWriter {
                     reloc.section = parent.clone();
                 }
             }
+            for branch in &mut self.relax_branches {
+                if let Some((parent, offset_adj)) = remap.get(&branch.section) {
+                    branch.offset += offset_adj;
+                    branch.section = parent.clone();
+                }
+            }
+        }
+        self.relax_branch_lengths();
+        if self.branch_retry {
+            return Ok(());
         }
         // GNU as (2.44, measured) relocates every data difference involving a
         // code label -- even one between labels of an `.option norelax`
@@ -646,10 +694,6 @@ impl ElfWriter {
         if self.leb_retry.is_some() {
             return Ok(());
         }
-        // Compression is disabled: the linker handles relaxation via
-        // R_RISCV_RELAX. Running our own compression would change code
-        // layout in ways the linker's relaxation pass doesn't expect.
-        // self.compress_executable_sections();
         self.resolve_local_branches()?;
         Ok(())
     }
@@ -889,6 +933,14 @@ impl ElfWriter {
             Directive::Attribute(_) => Ok(()),
 
             Directive::Org { expr, fill } => self.base.emit_org(expr, *fill),
+            Directive::File(number, name) => {
+                self.base.debug_file(*number, name.clone());
+                Ok(())
+            }
+            Directive::Loc(file, line, column) => {
+                self.base.debug_loc(*file, *line, *column);
+                Ok(())
+            }
             Directive::Ignored => Ok(()),
             Directive::Cfi(name, _) => Err(format!(
                 "internal: {name} reached the ELF writer without CFI lowering"
@@ -1244,7 +1296,9 @@ impl ElfWriter {
         // sh_addralign (data-only `.text` stays 1 — measured).
         self.base.note_instruction();
 
+        let rv64 = self.elf_class == ELFCLASS64;
         let encoded = match mnemonic {
+            "li" => encode_li(operands, rv64),
             "lga" | "la.tls.ie" | "la.tls.gd" => {
                 encode_got_pseudo(mnemonic, operands, self.elf_class == ELFCLASS64)
             }
@@ -1253,8 +1307,13 @@ impl ElfWriter {
         };
         match encoded {
             Ok(EncodeResult::Word(word)) => {
-                self.base.emit_u32_le(word)?;
-                Ok(())
+                let spelled_addi = mnemonic.eq_ignore_ascii_case("li") && word & 0x7F == 0b0010011;
+                let mnemonic = if spelled_addi && !li_rvc_aliases_match(operands, rv64) {
+                    "" // GNU as's `li d,j`: no 2-byte form
+                } else {
+                    mnemonic
+                };
+                self.emit_instruction_word(word, mnemonic, operands.len())
             }
             Ok(EncodeResult::Half(half)) => {
                 self.base.emit_u16_le(half)?;
@@ -1287,9 +1346,13 @@ impl ElfWriter {
                     }
                     self.base.emit_u32_le(word)?;
                 } else if is_branch_or_jal {
-                    self.base
-                        .add_reloc(elf_type, reloc.symbol.clone(), reloc.addend);
-                    self.base.emit_u32_le(word)?;
+                    self.emit_relaxable_branch(
+                        word,
+                        elf_type,
+                        (mnemonic, operands.len()),
+                        &reloc.symbol,
+                        reloc.addend,
+                    )?;
                 } else {
                     let is_local = reloc.symbol.starts_with(".L") || reloc.symbol.starts_with(".l");
 
@@ -1317,8 +1380,10 @@ impl ElfWriter {
                 Ok(())
             }
             Ok(EncodeResult::Words(words)) => {
+                // Only `li` expands to several relocation-free words, which
+                // GNU as assembles (`md_assemblef`) one by one as written.
                 for word in words {
-                    self.base.emit_u32_le(word)?;
+                    self.emit_instruction_word(word, compress::li_word_mnemonic(word), 3)?;
                 }
                 Ok(())
             }
@@ -1410,72 +1475,168 @@ impl ElfWriter {
         }
     }
 
-    /// Compress eligible 32-bit instructions in executable sections to 16-bit
-    /// RV64C equivalents.
-    fn compress_executable_sections(&mut self) {
-        let exec_sections: Vec<String> = self
-            .base
-            .sections
-            .iter()
-            .filter(|(_, s)| (s.sh_flags & SHF_EXECINSTR) != 0)
-            .map(|(name, _)| name.clone())
-            .collect();
+    /// A relocation-free instruction, in its 2-byte form when RVC is on and
+    /// the spelling has one, as GNU as does (see
+    /// [`compress::spelling_allows`]).  Linker relaxation never does this: it
+    /// only shrinks call, `lui`/`auipc` and alignment sequences.
+    fn emit_instruction_word(
+        &mut self,
+        word: u32,
+        mnemonic: &str,
+        operand_count: usize,
+    ) -> Result<(), String> {
+        if !self.rvc {
+            return self.base.emit_u32_le(word);
+        }
+        if mnemonic.eq_ignore_ascii_case("unimp") {
+            return self.base.emit_u16_le(0); // c.unimp
+        }
+        match compress::try_compress(word, self.elf_class == ELFCLASS64)
+            .filter(|&half| compress::spelling_allows(mnemonic, operand_count, half))
+        {
+            Some(half) => self.base.emit_u16_le(half),
+            None => self.base.emit_u32_le(word),
+        }
+    }
 
-        for sec_name in &exec_sections {
-            let mut reloc_offsets = FxHashSet::default();
-
-            for pr in &self.pending_branch_relocs {
-                if pr.section == *sec_name {
-                    reloc_offsets.insert(pr.offset);
-                    if pr.reloc_type == 19 {
-                        reloc_offsets.insert(pr.offset + 4);
-                    }
-                }
+    /// GNU as's branch relaxation (`relaxed_branch_length` and
+    /// `md_convert_frag_branch`, gas/config/tc-riscv.c).  A branch or jump to
+    /// a symbol starts at its shortest form -- 2 bytes when the spelling has
+    /// an RVC alias (`beqz`/`bnez` and `beq`/`bne rs, x0` on x8..x15, `j`,
+    /// RV32 `jal target`), else 4 -- and a pass that finds it too short
+    /// assembles again with it longer:
+    ///
+    /// * 2: `c.beqz`/`c.bnez`/`c.j`/`c.jal` + `R_RISCV_RVC_BRANCH`/`_JUMP`;
+    /// * 4: the instruction + `R_RISCV_BRANCH`/`R_RISCV_JAL`;
+    /// * 6 / 8: a conditional branch beyond +-4 KiB, or whose target is
+    ///   undefined, weak or in another section, is the inverted `c.b*` / `b*`
+    ///   over a `jal x0, target` (+-1 MiB), so it links wherever the target
+    ///   lands.  Jumps stop at 4: GNU as assumes they reach.
+    ///
+    /// Displacement fields under a relocation stay zero; the relocation
+    /// carries the target.  Linker relaxation only deletes bytes, so a branch
+    /// that reaches here still reaches after it.
+    fn emit_relaxable_branch(
+        &mut self,
+        word: u32,
+        elf_type: u32,
+        (mnemonic, operand_count): (&str, usize),
+        symbol: &str,
+        addend: i64,
+    ) -> Result<(), String> {
+        const R_RISCV_JAL: u32 = 17;
+        const JAL_X0: u32 = 0b1101111;
+        let jump = elf_type == R_RISCV_JAL;
+        let half = if self.rvc {
+            self.rvc_branch_form(word, jump, mnemonic, operand_count)
+        } else {
+            None
+        };
+        let ordinal = self.branch_count;
+        self.branch_count += 1;
+        let shortest = if half.is_some() { 2 } else { 4 };
+        let length = self
+            .branch_lengths
+            .get(&ordinal)
+            .copied()
+            .unwrap_or(shortest);
+        self.relax_branches.push(RelaxBranch {
+            ordinal,
+            section: self.base.current_section.clone(),
+            offset: self.base.current_offset(),
+            symbol: symbol.to_string(),
+            addend,
+            jump,
+            rvc: half.is_some(),
+            length,
+        });
+        let symbol = symbol.to_string();
+        match (length, half) {
+            (2, Some(half)) => {
+                let rvc_type = if jump {
+                    R_RISCV_RVC_JUMP
+                } else {
+                    R_RISCV_RVC_BRANCH
+                };
+                self.base.add_reloc(rvc_type, symbol, addend);
+                return self.base.emit_u16_le(half);
             }
-
-            if let Some(section) = self.base.sections.get(sec_name) {
-                for r in &section.relocs {
-                    reloc_offsets.insert(r.offset);
-                    if r.reloc_type == 19 {
-                        reloc_offsets.insert(r.offset + 4);
-                    }
-                }
+            (4, _) => {
+                self.base.add_reloc(elf_type, symbol, addend);
+                return self.base.emit_u32_le(word);
             }
+            // Inverted condition (funct3 bit 0 / c.beqz<->c.bnez), skipping
+            // the jump: B-type offset 8, CB-type offset 6.
+            (6, Some(half)) => self.base.emit_u16_le((half ^ 0x2000) | 0x18)?,
+            (8, _) if !jump => self.base.emit_u32_le((word ^ 0x1000) | 0x400)?,
+            _ => return Err(format!("internal: branch length {length} for `{mnemonic}`")),
+        }
+        self.base.add_reloc(R_RISCV_JAL, symbol, addend);
+        self.base.emit_u32_le(JAL_X0)
+    }
 
-            let section_data = match self.base.sections.get(sec_name) {
-                Some(s) => s.data.clone(),
-                None => continue,
+    /// The 2-byte form of a branch or jump whose spelling has an RVC alias
+    /// in GNU as's opcode table, displacement zero.
+    fn rvc_branch_form(
+        &self,
+        word: u32,
+        jump: bool,
+        mnemonic: &str,
+        operand_count: usize,
+    ) -> Option<u16> {
+        let rd = (word >> 7) & 0x1F;
+        let funct3 = (word >> 12) & 0x7;
+        let rs1 = (word >> 15) & 0x1F;
+        let rs2 = (word >> 20) & 0x1F;
+        let mnemonic = mnemonic.to_ascii_lowercase();
+        if jump {
+            return match (mnemonic.as_str(), operand_count, rd) {
+                ("j", 1, 0) => Some(0xA001),
+                ("jal", 1, 1) if self.elf_class == ELFCLASS32 => Some(0x2001),
+                _ => None,
             };
+        }
+        let spelled = matches!(
+            (mnemonic.as_str(), operand_count),
+            ("beqz" | "bnez", 2) | ("beq" | "bne", 3)
+        );
+        if !spelled || rs2 != 0 || funct3 > 1 || !(8..16).contains(&rs1) {
+            return None;
+        }
+        let base: u16 = if funct3 == 0 { 0xC001 } else { 0xE001 };
+        Some(base | (((rs1 - 8) as u16) << 7))
+    }
 
-            let (new_data, offset_map) = compress::compress_section(&section_data, &reloc_offsets);
-
-            if new_data.len() == section_data.len() {
-                continue;
-            }
-
-            if let Some(section) = self.base.sections.get_mut(sec_name) {
-                section.data = new_data;
-                for r in &mut section.relocs {
-                    r.offset = compress::remap_offset(r.offset, &offset_map);
+    /// After layout: give every branch the length its target needs (GNU as's
+    /// `relaxed_branch_length`), and ask for another pass if one grew.
+    fn relax_branch_lengths(&mut self) {
+        for branch in std::mem::take(&mut self.relax_branches) {
+            let target = self
+                .base
+                .labels
+                .get(&branch.symbol)
+                .filter(|(section, _)| *section == branch.section)
+                .filter(|_| !self.base.weak_symbols.contains_key(&branch.symbol));
+            let needed = match target {
+                None if branch.jump => 4,
+                None => 8,
+                Some((_, offset)) => {
+                    let distance = *offset as i64 + branch.addend - branch.offset as i64;
+                    let rvc_reach = if branch.jump { 2048 } else { 256 };
+                    if branch.rvc && (-rvc_reach..rvc_reach).contains(&distance) {
+                        2
+                    } else if branch.jump || (-4096..4096).contains(&distance) {
+                        4
+                    } else if branch.rvc {
+                        6
+                    } else {
+                        8
+                    }
                 }
-            }
-
-            for pr in &mut self.pending_branch_relocs {
-                if pr.section == *sec_name {
-                    pr.offset = compress::remap_offset(pr.offset, &offset_map);
-                }
-            }
-
-            for (_, (label_sec, label_offset)) in self.base.labels.iter_mut() {
-                if label_sec == sec_name {
-                    *label_offset = compress::remap_offset(*label_offset, &offset_map);
-                }
-            }
-
-            for sym in &mut self.base.extra_symbols {
-                if sym.section_name == *sec_name {
-                    sym.value = compress::remap_offset(sym.value, &offset_map);
-                }
+            };
+            if needed > branch.length {
+                self.branch_lengths.insert(branch.ordinal, needed);
+                self.branch_retry = true;
             }
         }
     }
@@ -1733,6 +1894,16 @@ impl ElfWriter {
             // RISC-V always uses RELA relocations, even in 32-bit mode
             force_rela: true,
         };
+        let (address_size, abs_addr) = if self.elf_class == ELFCLASS32 {
+            (4, RelocType::Abs32)
+        } else {
+            (8, RelocType::Abs64)
+        };
+        self.base.finish_debug_sections(
+            address_size,
+            RelocType::Abs32.elf_type(),
+            abs_addr.elf_type(),
+        )?;
         // RISC-V needs include_referenced_locals=true for pcrel_hi synthetic labels
         self.base.write_elf(output_path, &config, true)
     }
@@ -2057,12 +2228,21 @@ mod branch_range_tests {
         const R_RISCV_BRANCH: u32 = 16;
         const R_RISCV_JAL: u32 = 17;
 
-        for (asm, sym, want_type) in [
-            (".text\nbeq x1, x2, target\n", "target", R_RISCV_BRANCH),
-            (".text\nbne x1, x2, target\n", "target", R_RISCV_BRANCH),
-            (".text\njal x1, target\n", "target", R_RISCV_JAL),
-            (".text\njal target\n", "target", R_RISCV_JAL),
-            (".text\nj target\n", "target", R_RISCV_JAL),
+        // GNU as: a conditional branch to an undefined symbol is the inverted
+        // branch over `jal x0, target`, whose one relocation is the JAL at +4;
+        // in reach of a defined label it is the 4-byte branch.
+        for (asm, sym, want_type, want_offset) in [
+            (".text\nbeq x1, x2, target\n", "target", R_RISCV_JAL, 4),
+            (".text\nbne x1, x2, target\n", "target", R_RISCV_JAL, 4),
+            (
+                ".text\nbeq x1, x2, target\ntarget:\n",
+                "target",
+                R_RISCV_BRANCH,
+                0,
+            ),
+            (".text\njal x1, target\n", "target", R_RISCV_JAL, 0),
+            (".text\njal target\n", "target", R_RISCV_JAL, 0),
+            (".text\nj target\n", "target", R_RISCV_JAL, 0),
         ] {
             let w = assemble(asm).unwrap_or_else(|e| panic!("`{asm}` must assemble: {e}"));
             let relocs = &w.base.sections[".text"].relocs;
@@ -2079,6 +2259,7 @@ mod branch_range_tests {
                 relocs[0].reloc_type
             );
             assert_eq!(relocs[0].addend, 0, "wrong addend for `{asm}`");
+            assert_eq!(relocs[0].offset, want_offset, "wrong offset for `{asm}`");
         }
     }
 
@@ -2707,8 +2888,8 @@ mod reloc_kind_tests {
         assert_eq!(text[..8], [0x97, 0x07, 0x00, 0x00, 0x83, 0xb7, 0x07, 0x00]);
     }
 
-    /// `call foo@plt` is GAS's legacy spelling of `call foo`; the canonical
-    /// `mv` is `addi rd, rs, 0` (GAS 2.47 words, norvc).
+    /// `call foo@plt` is GAS's legacy spelling of `call foo`; `mv` is
+    /// `c.mv`, or `addi rd, rs, 0` under `.option norvc` (GAS 2.47 words).
     #[test]
     fn call_plt_suffix_and_mv_match_gas() {
         assert_eq!(
@@ -2724,10 +2905,15 @@ mod reloc_kind_tests {
             let mut w = ElfWriter::new();
             w.process_statements(&s).is_err()
         }));
-        let statements = parse_asm("mv a0, t0\n").unwrap();
-        let mut w = ElfWriter::new();
-        w.process_statements(&statements).unwrap();
-        assert_eq!(w.base.sections[".text"].data, [0x13, 0x85, 0x02, 0x00]);
+        for (asm, want) in [
+            ("mv a0, t0\n", &[0x16, 0x85][..]),
+            (".option norvc\nmv a0, t0\n", &[0x13, 0x85, 0x02, 0x00][..]),
+        ] {
+            let statements = parse_asm(asm).unwrap();
+            let mut w = ElfWriter::new();
+            w.process_statements(&statements).unwrap();
+            assert_eq!(w.base.sections[".text"].data, want, "{asm:?}");
+        }
     }
 
     /// A numeric reference with no definition is an error (GAS 2.47), not
@@ -2760,7 +2946,8 @@ mod reloc_kind_tests {
             .find(|r| r.reloc_type == 24)
             .expect("PCREL_LO12_I");
         assert!(lo.symbol_name.starts_with(".L"), "{}", lo.symbol_name);
-        assert_eq!(w.base.labels[&lo.symbol_name], (".text".to_string(), 4));
+        // After the 2-byte `nop` (`c.nop`), as GNU as rv64gc places it.
+        assert_eq!(w.base.labels[&lo.symbol_name], (".text".to_string(), 2));
     }
 }
 
@@ -2822,7 +3009,8 @@ mod relax_value_tests {
             .into_iter()
             .filter(|(_, t, _, _)| *t == ADD32 || *t == SUB32)
             .collect();
-        assert_eq!(text, [r(26, ADD32, "b", 0), r(26, SUB32, "a", 0)]);
+        // GNU as rv64gc: `b` at 0x16, the 2-byte `ret` ends at 0x18.
+        assert_eq!(text, [r(24, ADD32, "b", 0), r(24, SUB32, "a", 0)]);
         // A data label on the other side keeps its constant on the ADD.
         let w =
             assemble(".text\n.LBB1: ret\n.section .rodata\n.byte 0\n.Ljt: .word .LBB1 - .Ljt\n");
@@ -2918,11 +3106,12 @@ mod relax_value_tests {
             [r(0, SET_ULEB128, "b", 0), r(0, SUB_ULEB128, "a", 0)]
         );
         // A forward reference to a code label: GNU as writes the assembly-time
-        // value, -4 here, in its 10-byte LEB128 (`fcffffff ffffffff ff01`).
+        // value, -2 here (`ret` is `c.jr ra`), in its 10-byte LEB128
+        // (`feffffff ffffffff ff01`).
         let w = assemble(".text\nb: ret\n.section .rodata\n.uleb128 b - a\n.text\na: call foo\n");
         assert_eq!(
             w.base.sections[".rodata"].data,
-            [0xfc, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01]
+            [0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01]
         );
         assert_eq!(
             relocs(&w, ".rodata"),
@@ -2970,5 +3159,90 @@ mod relax_value_tests {
             assert_eq!(uleb128_len(v), canon.len(), "{v}");
             assert_eq!(uleb128_fixed(v, canon.len()), Some(canon));
         }
+    }
+}
+
+#[cfg(test)]
+mod debug_line_tests {
+    use super::super::parser::parse_asm;
+    use super::*;
+
+    fn assembled(asm: &str) -> ElfWriter {
+        let statements = parse_asm(asm).expect("must parse");
+        let mut w = ElfWriter::new();
+        w.process_statements(&statements).expect("must assemble");
+        w.base
+            .finish_debug_sections(8, 1, 2)
+            .expect("debug sections");
+        w
+    }
+
+    const SOURCE: &str = ".file 1 \"p.c\"\n.text\n.globl f\n.type f,@function\nf:\n\
+                          .loc 1 3 0\ncall g\n.loc 1 4 0\nret\n.size f, .-f\n";
+
+    /// Under linker relaxation (the `call` may become a `jal`) every code
+    /// address of the line table and the units is a label relocation -- the
+    /// linker moves labels with deleted bytes, never `.text`+offset.
+    #[test]
+    fn relaxable_code_is_addressed_through_labels() {
+        let w = assembled(SOURCE);
+        let line = &w.base.sections[".debug_line"];
+        assert_eq!(line.relocs.len(), 3, "first row, second row, sequence end");
+        assert!(
+            line.relocs
+                .iter()
+                .all(|r| r.reloc_type == 2 && r.addend == 0 && r.symbol_name.starts_with(".Lloc")),
+            "{:?}",
+            line.relocs
+                .iter()
+                .map(|r| (r.reloc_type, r.symbol_name.as_str(), r.addend))
+                .collect::<Vec<_>>()
+        );
+        let info = &w.base.sections[".debug_info"];
+        let code: Vec<_> = info
+            .relocs
+            .iter()
+            .filter(|r| r.reloc_type == 2)
+            .map(|r| (r.symbol_name.as_str(), r.addend))
+            .collect();
+        assert_eq!(
+            code.len(),
+            4,
+            "unit start and end, f's start and end: {code:?}"
+        );
+        assert_eq!(
+            code[0],
+            (".text", 0),
+            "the unit starts where its section does"
+        );
+        assert!(
+            code[1..]
+                .iter()
+                .all(|&(s, a)| s.starts_with(".Lloc") && a == 0),
+            "{code:?}"
+        );
+        for r in line.relocs.iter().chain(&info.relocs) {
+            if r.symbol_name.starts_with(".Lloc") {
+                assert!(
+                    w.base.labels.contains_key(&r.symbol_name),
+                    "{}",
+                    r.symbol_name
+                );
+            }
+        }
+    }
+
+    /// `.option norelax` at the end of the input: nothing moves, so section
+    /// offsets do, as for every other target.
+    #[test]
+    fn norelax_code_is_addressed_by_section_offsets() {
+        let w = assembled(&format!("{SOURCE}.option norelax\n"));
+        let line = &w.base.sections[".debug_line"];
+        let targets: Vec<_> = line
+            .relocs
+            .iter()
+            .map(|r| (r.symbol_name.as_str(), r.addend))
+            .collect();
+        assert_eq!(targets, [(".text", 0)]);
     }
 }

@@ -83,6 +83,12 @@ fn split_response_file(contents: &str) -> Vec<String> {
 fn main() {
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<String> = expand_response_files(&raw_args);
+    if let Some(root) = sysroot_arg(&args) {
+        // SAFETY: nothing has spawned a thread yet, so no other thread can
+        // be reading the environment.  The backends look the sysroot up in
+        // `LCCC_SYSROOT`, the variable the driver documents.
+        unsafe { std::env::set_var("LCCC_SYSROOT", root) };
+    }
 
     // Last line of defence against a panic on malformed input.
     //
@@ -309,6 +315,32 @@ fn is_benign_ignorable(a: &str) -> bool {
     ) || a.starts_with("-plugin-opt=")
 }
 
+/// GNU ld's `--sysroot=DIR` (the last one wins), unless it is the host root:
+/// `--sysroot=/`, which cross drivers pass, changes no path.
+fn sysroot_arg(args: &[String]) -> Option<&str> {
+    let mut root = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if let Some(dir) = a.strip_prefix("--sysroot=") {
+            root = Some(dir);
+        } else if a == "--sysroot" {
+            root = it.next().map(String::as_str);
+        }
+    }
+    root.filter(|dir| !dir.trim_end_matches('/').is_empty())
+}
+
+/// The emulation GNU ld's `-m NAME` selects.
+fn parse_emulation(name: &str) -> Result<Emulation, String> {
+    match name {
+        "elf_x86_64" | "elf64_x86_64" => Ok(Emulation::X86_64),
+        "elf_i386" | "i386linux" => Ok(Emulation::I386),
+        "aarch64linux" | "aarch64elf" | "aarch64_elf64_le_vec" => Ok(Emulation::Aarch64),
+        "elf64lriscv" | "elf64lriscv_lp64d" | "elf64lriscv_lp64" => Ok(Emulation::Riscv64),
+        other => Err(format!("unsupported emulation '-m {other}'")),
+    }
+}
+
 /// `passthrough` with the positional input files re-inserted where they
 /// appeared (see `positional_files` in `run`): the elf_i386 userspace argument
 /// list, and the order `-r`/`-T` links expand `-l` in.
@@ -339,6 +371,7 @@ fn run(args: &[String]) -> Result<(), String> {
     let mut inputs: Vec<(String, bool)> = Vec::new(); // (path, whole_archive)
     let mut whole_archive = false;
     let mut emit_symtab = true;
+    let mut strip_debug = false;
     let mut relocatable = false;
     let mut emit_relocs = false;
     let mut gc_sections = false;
@@ -389,29 +422,29 @@ fn run(args: &[String]) -> Result<(), String> {
                 i += 1;
                 output = args.get(i).cloned().ok_or("-o needs an argument")?;
             }
+            // Emulation selects both the input parser and output ELF
+            // class/architecture.  GNU ld takes it separate or attached:
+            // gcc passes `-m elf_x86_64`, the AArch64 and RISC-V cross
+            // drivers `-maarch64linux` / `-melf64lriscv`.
             "-m" => {
-                // Emulation selects both the input parser and output ELF
-                // class/architecture.
                 i += 1;
-                match args.get(i).map(String::as_str) {
-                    Some("elf_x86_64") | Some("elf64_x86_64") => emulation = Emulation::X86_64,
-                    Some("elf_i386") | Some("i386linux") => emulation = Emulation::I386,
-                    Some("aarch64linux") | Some("aarch64elf") | Some("aarch64_elf64_le_vec") => {
-                        emulation = Emulation::Aarch64;
-                    }
-                    Some("elf64lriscv") | Some("elf64lriscv_lp64d") | Some("elf64lriscv_lp64") => {
-                        emulation = Emulation::Riscv64;
-                    }
-                    None => return Err("-m needs an argument".into()),
-                    Some(other) => {
-                        return Err(format!("unsupported emulation '-m {other}'"));
-                    }
-                }
+                let name = args.get(i).ok_or("-m needs an argument")?;
+                emulation = parse_emulation(name)?;
             }
+            a if a.starts_with("-m") && a.len() > 2 => emulation = parse_emulation(&a[2..])?,
+            // Read before anything runs (`sysroot_arg`).
+            "--sysroot" => i += 1,
+            a if a.starts_with("--sysroot=") => {}
+            // Every emulation above is little-endian.
+            "-EL" => {}
+            "-EB" => return Err("big-endian output is not supported".into()),
             "-t" | "--trace" => {
                 trace = true;
                 passthrough.push("-t".to_string());
             }
+            // GNU ld's COMMON-symbol diagnostics, implemented by every
+            // backend (`linker_common::warn_common`).
+            "--warn-common" => passthrough.push("--warn-common".to_string()),
             "--fatal-warnings" => {
                 fatal_warnings = true;
                 passthrough.push("--fatal-warnings".to_string());
@@ -494,7 +527,12 @@ fn run(args: &[String]) -> Result<(), String> {
                 // Builtin archive loading already iterates to a fixpoint
                 // (global group semantics), which subsumes group regions.
             }
-            "--strip-debug" | "-S" => {}
+            // Forwarded like `-s` below: the built-in emitters read it out
+            // of `parse_linker_args`.
+            "--strip-debug" | "-S" => {
+                strip_debug = true;
+                passthrough.push("--strip-debug".to_string());
+            }
             // Recorded for the linker-script path AND forwarded: the built-in
             // emitter reads `strip_all` out of `parse_linker_args`, so without
             // the passthrough copy `-s` silently produced a fully-symbolled
@@ -819,9 +857,11 @@ fn run(args: &[String]) -> Result<(), String> {
                     if !val.is_empty() {
                         passthrough.push(format!("-Wl,--version-script={}", val));
                     }
-                } else if a.starts_with("--hash-style") {
+                } else if a.starts_with("--hash-style") || a.starts_with("-hash-style") {
                     // Implemented: `gnu`, `sysv` and `both` all produce the
                     // matching `.gnu.hash` / `.hash` sections and DT tags.
+                    // GNU ld takes the single-dash spelling too, which the
+                    // RISC-V gcc driver passes (`-hash-style=gnu`).
                     // Forwarded so `parse_linker_args` sees it; this used to be
                     // swallowed with a "not implemented" warning, which made
                     // `--hash-style` a no-op no matter what the emitter could do.
@@ -861,9 +901,6 @@ fn run(args: &[String]) -> Result<(), String> {
                     // missing strictness.  Warn once, like the other
                     // accepted-but-not-implemented diagnostics above.
                     || a == "--no-undefined-version"
-                    // `--warn-common` requests a duplicate-COMMON diagnostic;
-                    // until that analysis is implemented, do not swallow it.
-                    || a == "--warn-common"
                 {
                     // Accepted but NOT implemented.  These change the image
                     // (or a diagnostic the user asked for), so ignoring them
@@ -944,6 +981,9 @@ fn run(args: &[String]) -> Result<(), String> {
                 println!("{}", obj.source_name);
             }
         }
+        if strip_debug || !emit_symtab {
+            lccc::linker_entry::strip_debug_sections(&mut objects);
+        }
         return lccc::linker_entry::link_relocatable_x86(&objects, &output);
     }
 
@@ -996,6 +1036,9 @@ fn run(args: &[String]) -> Result<(), String> {
             for obj in &objects {
                 println!("{}", obj.source_name);
             }
+        }
+        if strip_debug || !emit_symtab {
+            lccc::linker_entry::strip_debug_sections(&mut objects);
         }
         let real_inputs = objects.len();
         if build_id_style.is_enabled() {
@@ -1095,33 +1138,51 @@ fn run(args: &[String]) -> Result<(), String> {
         }
         return Ok(());
     }
+    // GNU ld scopes `--as-needed` positionally; the backends load the files
+    // named here in command-line order, so each takes the state it was
+    // named under along (`inputs` and `positional_files` are pushed
+    // together, one entry per file).
+    let positions: Vec<usize> = positional_files.iter().map(|(at, _)| *at).collect();
+    let states = lccc::linker_entry::as_needed_states(&passthrough, &positions);
     let mut object_files: Vec<String> = Vec::new();
-    for (path, wa) in &inputs {
+    let mut object_as_needed: Vec<bool> = Vec::new();
+    for ((path, wa), as_needed) in inputs.iter().zip(states) {
         if *wa && path.ends_with(".a") {
             passthrough.push("--whole-archive".to_string());
             passthrough.push(path.clone());
             passthrough.push("--no-whole-archive".to_string());
         } else {
             object_files.push(path.clone());
+            object_as_needed.push(as_needed);
         }
     }
     let object_refs: Vec<&str> = object_files.iter().map(|s| s.as_str()).collect();
 
     let res = match (emulation, shared) {
-        (Emulation::X86_64 | Emulation::I386, true) => {
-            lccc::linker_entry::link_shared_x86(&object_refs, &output, &passthrough, default_dirs)
-        }
-        (Emulation::X86_64 | Emulation::I386, false) => {
-            lccc::linker_entry::link_builtin_x86(&object_refs, &output, &passthrough, default_dirs)
-        }
+        (Emulation::X86_64 | Emulation::I386, true) => lccc::linker_entry::link_shared_x86(
+            &object_refs,
+            &object_as_needed,
+            &output,
+            &passthrough,
+            default_dirs,
+        ),
+        (Emulation::X86_64 | Emulation::I386, false) => lccc::linker_entry::link_builtin_x86(
+            &object_refs,
+            &object_as_needed,
+            &output,
+            &passthrough,
+            default_dirs,
+        ),
         (Emulation::Aarch64, true) => lccc::linker_entry::link_shared_aarch64(
             &object_refs,
+            &object_as_needed,
             &output,
             &passthrough,
             default_dirs,
         ),
         (Emulation::Aarch64, false) => lccc::linker_entry::link_builtin_aarch64(
             &object_refs,
+            &object_as_needed,
             &output,
             &passthrough,
             default_dirs,
@@ -1129,12 +1190,14 @@ fn run(args: &[String]) -> Result<(), String> {
         ),
         (Emulation::Riscv64, true) => lccc::linker_entry::link_shared_riscv64(
             &object_refs,
+            &object_as_needed,
             &output,
             &passthrough,
             default_dirs,
         ),
         (Emulation::Riscv64, false) => lccc::linker_entry::link_builtin_riscv64(
             &object_refs,
+            &object_as_needed,
             &output,
             &passthrough,
             default_dirs,

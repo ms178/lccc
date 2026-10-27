@@ -407,6 +407,23 @@ pub fn effective() -> EffectiveFeatures {
     EffectiveFeatures::from_raw(EFFECTIVE.load(Ordering::Relaxed))
 }
 
+/// The features the command line set or cleared explicitly (GCC's
+/// `ix86_isa_flags_explicit`): GCC's option-override implications
+/// (`-msse4.2` brings POPCNT) leave them alone in every `target("...")`
+/// function without an `arch=`. See `backend::x86::isa::function_feature_bits`.
+static EXPLICIT: AtomicU64 = AtomicU64::new(0);
+
+/// Publish the explicit-feature mask for this compilation.
+pub fn set_explicit(mask: u64) {
+    EXPLICIT.store(mask, Ordering::Relaxed);
+}
+
+/// The explicit-feature mask published by the driver (empty until it runs).
+#[inline]
+pub fn explicit() -> u64 {
+    EXPLICIT.load(Ordering::Relaxed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

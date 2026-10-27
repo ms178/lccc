@@ -11,6 +11,9 @@ use super::elf::*;
 use super::types::{GlobalSymbol, arm_should_replace_extra};
 use crate::backend::linker_common;
 
+/// Load a startup object the driver supplies (`crt1.o` ... `crtn.o`).  A
+/// shared library reached this way is linked `--as-needed`: it gets a
+/// DT_NEEDED only when it resolves something.
 pub fn load_file(
     path: &str,
     objects: &mut linker_common::ObjectSet,
@@ -19,6 +22,30 @@ pub fn load_file(
     lib_paths: &[String],
     is_static: bool,
 ) -> Result<(), String> {
+    load_file_as_needed(
+        path,
+        objects,
+        globals,
+        needed_sonames,
+        lib_paths,
+        is_static,
+        true,
+    )
+}
+
+/// As [`load_file`], with the positional `--as-needed` state in effect for
+/// this input (GNU ld's default is `--no-as-needed`: a library named on the
+/// command line is recorded even when it resolves nothing, which is how a
+/// program links a library for its constructors alone).
+pub fn load_file_as_needed(
+    path: &str,
+    objects: &mut linker_common::ObjectSet,
+    globals: &mut FxHashMap<String, GlobalSymbol>,
+    needed_sonames: &mut Vec<String>,
+    lib_paths: &[String],
+    is_static: bool,
+    as_needed: bool,
+) -> Result<(), String> {
     load_file_depth(
         path,
         objects,
@@ -26,10 +53,40 @@ pub fn load_file(
         needed_sonames,
         lib_paths,
         is_static,
+        as_needed,
+        false,
         0,
     )
 }
 
+/// As [`load_file_as_needed`], for the library an `-l` search found at
+/// `path` (`linker_common::unsonamed_needed_name`).
+pub fn load_library_as_needed(
+    path: &str,
+    objects: &mut linker_common::ObjectSet,
+    globals: &mut FxHashMap<String, GlobalSymbol>,
+    needed_sonames: &mut Vec<String>,
+    lib_paths: &[String],
+    is_static: bool,
+    as_needed: bool,
+) -> Result<(), String> {
+    load_file_depth(
+        path,
+        objects,
+        globals,
+        needed_sonames,
+        lib_paths,
+        is_static,
+        as_needed,
+        true,
+        0,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one loader state tuple threaded through script recursion"
+)]
 fn load_file_depth(
     path: &str,
     objects: &mut linker_common::ObjectSet,
@@ -37,6 +94,8 @@ fn load_file_depth(
     needed_sonames: &mut Vec<String>,
     lib_paths: &[String],
     is_static: bool,
+    as_needed: bool,
+    by_search: bool,
     depth: usize,
 ) -> Result<(), String> {
     if std::env::var("LINKER_DEBUG").is_ok() {
@@ -108,13 +167,6 @@ fn load_file_depth(
                             path
                         )
                     })?;
-                    // `input.as_needed` has no effect here by construction:
-                    // this backend gives every loaded DSO a `DT_NEEDED` entry
-                    // (`load_shared_library_elf64` carries no as-needed
-                    // state), so an `AS_NEEDED` marker can only be accepted,
-                    // never acted on.  Keeping the entry — rather than
-                    // dropping it as the filtered accessor did — is what
-                    // makes such a script loadable at all.
                     load_file_depth(
                         &resolved,
                         objects,
@@ -122,6 +174,8 @@ fn load_file_depth(
                         needed_sonames,
                         lib_paths,
                         is_static,
+                        as_needed || input.as_needed,
+                        matches!(input.entry, LinkerScriptEntry::Lib(_)),
                         depth + 1,
                     )?;
                 }
@@ -138,11 +192,14 @@ fn load_file_depth(
             if is_static {
                 return Ok(()); // Skip .so in static linking
             }
-            return linker_common::load_shared_library_elf64(
+            return linker_common::load_shared_library_elf64_as_needed(
                 path,
+                objects,
                 globals,
                 needed_sonames,
                 lib_paths,
+                as_needed,
+                by_search,
             );
         }
     }

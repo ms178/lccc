@@ -23,13 +23,12 @@ pub(super) use crate::backend::elf::{
 // ── ELF32-specific constants ──────────────────────────────────────────────────
 // These either differ in type (i32 vs i64 for DT_*) or aren't in the shared module.
 
+pub(super) const SHT_HASH: u32 = 5;
+pub(super) const SHT_DYNAMIC: u32 = 6;
 pub(super) const SHT_NOTE: u32 = 7;
 pub(super) const SHT_PREINIT_ARRAY: u32 = 16;
-#[expect(dead_code)] // ELF standard section type, defined for reference
 pub(super) const SHT_GNU_HASH: u32 = 0x6ffffff6;
-#[expect(dead_code)] // ELF standard section type, defined for reference
-pub(super) const SHT_GNU_VERSYM_CONST: u32 = 0x6fffffff;
-#[expect(dead_code)] // ELF standard section type, defined for reference
+pub(super) const SHT_GNU_VERSYM: u32 = 0x6fffffff;
 pub(super) const SHT_GNU_VERNEED: u32 = 0x6ffffffe;
 
 // Section flags (i686 uses u32 instead of shared module's u64)

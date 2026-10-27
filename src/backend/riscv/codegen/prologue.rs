@@ -1168,6 +1168,7 @@ impl RiscvCodegen {
     // ---- emit_epilogue_and_ret ----
 
     pub(super) fn emit_epilogue_and_ret_impl(&mut self, frame_size: i64) {
+        self.state.flush_epilogue_loc();
         if self.frameless_leaf {
             self.state.emit("    ret");
             return;

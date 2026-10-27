@@ -404,6 +404,9 @@ pub struct FunctionDef {
     pub alignment: Option<usize>,
     pub is_kr: bool,
     pub span: Span,
+    /// The body from its opening brace (the function's first `-g` line
+    /// row) through its closing brace (the epilogue's row).
+    pub body_span: Span,
 }
 
 /// A parameter declaration.

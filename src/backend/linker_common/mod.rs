@@ -11,7 +11,7 @@
 //! - `symbols`: InputSection, OutputSection, GlobalSymbolOps trait, linker-defined symbols
 //! - `merge`: Section merging and common symbol allocation
 //! - `dynamic`: Dynamic symbol matching, library loading, and symbol registration
-//! - `archive`: Archive loading and generic file dispatch
+//! - `archive`: Archive loading
 //! - `resolve_lib`: Library name resolution helper
 //! - `write`: ELF64 binary emission helpers (section/program headers, alignment)
 //! - `args`: Shared linker argument parsing
@@ -27,7 +27,7 @@
 //! - **Shared library parser**: `parse_shared_library_symbols()` and `parse_soname()`
 //!   for extracting dynamic symbols from .so files.
 //! - **Dynamic symbol matching**: `match_shared_library_dynsyms()`,
-//!   `load_shared_library_elf64()`, and `resolve_dynamic_symbols_elf64()` for
+//!   `load_shared_library_elf64_as_needed()`, and `resolve_dynamic_symbols_elf64()` for
 //!   matching undefined globals against shared library exports with WEAK alias
 //!   detection and as-needed semantics.
 //! - **Linker-defined symbols**: `LINKER_DEFINED_SYMBOLS` constant and
@@ -66,6 +66,7 @@ mod eh_frame;
 pub mod filemap;
 mod gc_sections;
 mod hash;
+pub mod inflate;
 pub mod lap_timer;
 pub mod linker_script;
 mod mapfile;
@@ -83,7 +84,9 @@ mod symstr;
 pub mod symver;
 mod types;
 mod version_script;
+pub mod warn_common;
 mod write;
+pub mod zstd;
 
 // ── Re-exports ──────────────────────────────────────────────────────────
 //
@@ -125,19 +128,19 @@ pub use symbols::{
     GlobalSymbolOps, InputSection, OutputSection, image_init_fini, import_strong_refs,
     is_dynamic_visibility, is_exported_dynamic_symbol, is_layout_anchor_symbol,
     is_linker_defined_symbol, is_valid_c_identifier_for_section, merge_object_visibility,
-    most_constraining_visibility, resolve_start_stop_symbols,
+    most_constraining_visibility, resolve_start_stop_symbols, shared_def_overrides_common,
 };
 
 // merge.rs
 pub use merge::{
-    allocate_common_symbols_elf64, merge_comment_sections, merge_debug_sections_elf64,
-    merge_sections_elf64, merge_sections_elf64_gc,
+    allocate_common_symbols_elf64, is_debug_section_name, merge_comment_sections,
+    merge_debug_sections_elf64, merge_sections_elf64, merge_sections_elf64_gc,
 };
 
 // dynamic.rs
 pub use dynamic::{
-    load_shared_library_elf64, load_shared_library_elf64_as_needed, register_symbols_elf64,
-    resolve_dynamic_symbols_elf64,
+    copy_reloc_align, load_shared_library_elf64_as_needed, register_symbols_elf64,
+    resolve_dynamic_symbols_elf64, unsonamed_needed_name,
 };
 
 // archive.rs
@@ -160,8 +163,8 @@ pub use write::{
 
 // args.rs
 pub use args::{
-    HashStyle, InputItem, LinkerArgs, Symbolic, TextrelPolicy, dyn_flags, exclude_libs_matches,
-    parse_linker_args, rpath_dyn_entry,
+    HashStyle, InputItem, LinkerArgs, Symbolic, TextrelPolicy, as_needed_states, dyn_flags,
+    exclude_libs_matches, input_as_needed, object_as_needed, parse_linker_args, rpath_dyn_entry,
 };
 pub use build_id::BuildIdStyle;
 

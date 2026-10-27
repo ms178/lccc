@@ -79,7 +79,8 @@ accept() {
         printf 'FAIL: accept witness %s with %s: compiler exited %d\n' "$src" "$*" "$rc" >&2
         return "$rc"
     fi
-    grep -qE "^[[:space:]]+v?$want" "$asm" ||
+    # An encoding pseudo-prefix (`{vex} vpdpbusd`) precedes the mnemonic.
+    grep -qE "^[[:space:]]+(\{vex\} )?v?$want" "$asm" ||
         { printf '%s\n' "$(cat "$asm")" >&2;
           fail "$src with $*: expected $want to be emitted"; }
 }
@@ -310,6 +311,56 @@ accept vnni128.c vpdpbusd -mavxvnni -mno-avxvnni -mavxvnni  # re-enabled after d
 reject vnni128.c -mavxvnni -m32 -march=i686
 reject vnni128.c -mavxvnni -m32 -msse2 -mavx -mavxvnni
 
+# Encoding: the four AVX-VNNI forms are also AVX512-VNNI (EVEX) instructions,
+# and assemblers pick EVEX unless told `{vex}`. An AVX-VNNI CPU without
+# AVX-512 (Alder Lake, Raptor Lake, Arrow Lake, Sierra Forest) faults on the
+# EVEX form; a Cascade/Ice Lake (AVX512-VNNI, no AVX-VNNI) faults on the VEX
+# form. lccc emitted EVEX for `-march=alderlake`. Checked on both the
+# integrated assembler's object and GNU as's encoding of the `-S` output.
+cat >"$tmp/vnni_enc.c" <<'EOF'
+#include <immintrin.h>
+__m256i e0(__m256i a, __m256i b, __m256i c) { return _mm256_dpbusd_epi32(a, b, c); }
+__m256i e1(__m256i a, __m256i b, __m256i c) { return _mm256_dpbusds_epi32(a, b, c); }
+__m128i e2(__m128i a, __m128i b, __m128i c) { return _mm_dpwssd_epi32(a, b, c); }
+__m128i e3(__m128i a, __m128i b, __m128i c) { return _mm_dpwssds_epi32(a, b, c); }
+__attribute__((target("arch=alderlake"))) __m256i e4(__m256i a, __m256i b, __m256i c) {
+    return _mm256_dpbusd_epi32(a, b, c);
+}
+EOF
+# vnni_encoding <encoding of e0-e3: vex|evex> <encoding of e4> <flags...>
+vnni_encoding() {
+    local want=$1 want4=$2 obj fn got w
+    shift 2
+    if ! command -v objdump >/dev/null || ! command -v as >/dev/null; then
+        echo "SKIP: VNNI encoding (no binutils)"
+        return
+    fi
+    "$ccc" -O2 "$@" -c "$tmp/vnni_enc.c" -o "$tmp/enc_i.o"
+    "$ccc" -O2 "$@" -S "$tmp/vnni_enc.c" -o "$tmp/enc.s"
+    as --64 "$tmp/enc.s" -o "$tmp/enc_g.o"
+    for obj in enc_i enc_g; do
+        for fn in e0 e1 e2 e3 e4; do
+            got=$(objdump -d "$tmp/$obj.o" |
+                awk -v f="<$fn>:" '$2 == f { p = 1; next } /^$/ { p = 0 } p && /vpdp/' |
+                awk -F'\t' 'NR == 1 { print $2 }')
+            case $got in
+                62*) got=evex ;;
+                c4* | c5*) got=vex ;;
+                *) fail "VNNI encoding: no vpdp* in $fn ($obj, $*)" ;;
+            esac
+            w=$want
+            [ "$fn" != e4 ] || w=$want4
+            [ "$got" = "$w" ] || fail "VNNI encoding: $fn is $got, needs $w ($obj, $*)"
+        done
+    done
+}
+vnni_encoding vex vex -march=alderlake
+vnni_encoding vex vex -mavxvnni
+vnni_encoding vex vex -march=sapphirerapids
+vnni_encoding evex vex -march=cascadelake
+vnni_encoding evex vex -march=icelake-server
+vnni_encoding evex vex -mavx2 -mavx512vnni -mavx512vl
+
 # GCC oracle for the classic AVX-VNNI group (`-mavxvnni` exists in GCC 12).
 # The INT8/INT16 halves get no oracle on this toolchain and are declared as
 # such below rather than compared against a compiler that cannot express them.
@@ -459,7 +510,6 @@ EOF
     done
 done
 
-echo "CHECK: AVX2 widening permissions"
 # 256-bit integer PTEST is AVX (VEX.256 66 0F38 17), not AVX2, like VTEST.
 for flag in z c nzc; do
     src=ptest-256-$flag.c
@@ -539,7 +589,7 @@ awk '/^[[:space:]]+vzeroupper/ && !called { bad = 1 }
      END { exit (bad || !called || !loaded) }' "$asm" ||
     { cat "$asm" >&2; fail "vzu-fastcall.c -m32: fastcall YMM argument not passed intact in %ymm0"; }
 
-
+echo "CHECK: AVX2 widening permissions"
 # Widening instructions are AVX2, unlike floating-point VTEST. Even when
 # only four low source bytes participate, the C input remains a 128-bit value.
 for sign in sx zx; do
@@ -698,21 +748,86 @@ cat >"$tmp/local_bw_denied.c" <<'EOF'
 __attribute__((target("no-avx512bw"))) __mmask16 f(__m128i a, __m128i b) { return _mm_cmp_epu8_mask(a,b,_MM_CMPINT_EQ); }
 EOF
 reject local_bw_denied.c -mavx512bw -march=x86-64 -mavx512bw -mavx512vl
-# A function-local BMM target alone does not grant BW, unlike the -m option.
-cat >"$tmp/local_bmm_no_implicit_bw.c" <<'EOF'
+# A function's options apply in order through GCC 16.2's implication graph
+# (`isa::function_feature_bits`): AVX512BMM brings AVX512BW and AVX512F, a
+# later `no-avx512bw` takes BW away, and `no-avx2` every AVX-512 subset.
+# Public intrinsics only: an internal `__lccc_*` name would be refused by GCC
+# for being undeclared, a fake agreement.
+cat >"$tmp/local_bmm_implies_bw.c" <<'EOF'
 #include <immintrin.h>
-__attribute__((target("avx512bmm"))) __m512i f(__m512i a, __m512i b) {
-    return *(__m512i *)__lccc_simd512_i_vpaddb512(0, a, b);
-}
+__attribute__((target("avx512bmm"))) __m512i f(__m512i a, __m512i b) { return _mm512_add_epi8(a, b); }
 EOF
-reject local_bmm_no_implicit_bw.c -mavx512bw -march=x86-64
+accept local_bmm_implies_bw.c vpaddb -march=x86-64
+accept local_bmm_implies_bw.c vpaddb -march=x86-64 -O0
+# The 512-bit intrinsics are `always_inline` bodies (lcccsimd.h) that a
+# `-march=x86-64` unit cannot check where they are written: their requirement
+# is deferred to the function they inline into (`X86IsaNeeds`). A function
+# without the grant is GCC 16.2's "inlining failed in call to 'always_inline'
+# ...: target specific option mismatch" at every optimization level, and a
+# unit that merely includes the header compiles.
+cat >"$tmp/plain_512.c" <<'EOF'
+#include <immintrin.h>
+__m512i f(__m512i a, __m512i b) { return _mm512_add_epi8(a, b); }
+EOF
+reject plain_512.c "inlining failed in call to 'always_inline'" -march=x86-64
+reject plain_512.c "inlining failed in call to 'always_inline'" -march=x86-64 -O0
+accept plain_512.c vpaddb -march=x86-64 -mavx512bw
+cat >"$tmp/local_bw_512.c" <<'EOF'
+#include <immintrin.h>
+__attribute__((target("avx512bw"))) __m512i f(__m512i a, __m512i b) { return _mm512_add_epi8(a, b); }
+int g(int x) { return x + 1; }
+EOF
+accept local_bw_512.c vpaddb -march=x86-64
+accept local_bw_512.c vpaddb -march=x86-64 -O0
+# lccc extension (GCC refuses the helper itself): a plain `always_inline`
+# helper hands the requirement on, as lcccsimd.h's own wrappers do, and is
+# checked where it finally lands.
+cat >"$tmp/nested_512.c" <<'EOF'
+#include <immintrin.h>
+static inline __attribute__((always_inline)) __m512i h(__m512i a, __m512i b) { return _mm512_add_epi8(a, b); }
+__attribute__((target("avx512bw"))) __m512i f(__m512i a, __m512i b) { return h(a, b); }
+EOF
+accept nested_512.c vpaddb -march=x86-64
+accept nested_512.c vpaddb -march=x86-64 -O0
+cat >"$tmp/nested_512_plain.c" <<'EOF'
+#include <immintrin.h>
+static inline __attribute__((always_inline)) __m512i h(__m512i a, __m512i b) { return _mm512_add_epi8(a, b); }
+__m512i f(__m512i a, __m512i b) { return h(a, b); }
+EOF
+reject nested_512_plain.c "in function 'f'" -march=x86-64
+reject nested_512_plain.c "in function 'f'" -march=x86-64 -O0
 cat >"$tmp/local_bmm_no_bw.c" <<'EOF'
 #include <immintrin.h>
-__attribute__((target("avx512bmm,no-avx512bw"))) __m512i f(__m512i a, __m512i b) {
-    return *(__m512i *)__lccc_simd512_i_vpaddb512(0, a, b);
-}
+__attribute__((target("avx512bmm,no-avx512bw"))) __m512i f(__m512i a, __m512i b) { return _mm512_add_epi8(a, b); }
 EOF
 reject local_bmm_no_bw.c -mavx512bw -march=x86-64
+cat >"$tmp/local_bmm_undone.c" <<'EOF'
+#include <immintrin.h>
+__attribute__((target("avx512bmm,no-avx512bmm"))) __m512i f(__m512i a, __m512i b) { return _mm512_add_epi8(a, b); }
+EOF
+accept local_bmm_undone.c vpaddb -march=x86-64
+cat >"$tmp/local_f_no_avx2.c" <<'EOF'
+#include <immintrin.h>
+__attribute__((target("avx512f,no-avx2"))) __m512i f(__m512i a, __m512i b) { return _mm512_add_epi32(a, b); }
+EOF
+reject local_f_no_avx2.c -mavx512f -march=x86-64
+# AES, PCLMUL and GFNI keep their bit under a later `no-sse2` but GCC's
+# builtin masks also require SSE2; an `aes` after `no-sse2` grants it back.
+cat >"$tmp/local_aes_no_sse2.c" <<'EOF'
+#include <immintrin.h>
+__attribute__((target("aes,no-sse2"))) __m128i f(__m128i a, __m128i b) { return _mm_aesenc_si128(a, b); }
+EOF
+reject local_aes_no_sse2.c "SSE2 (-msse2)" -march=x86-64
+cat >"$tmp/local_no_sse2_aes.c" <<'EOF'
+#include <immintrin.h>
+__attribute__((target("no-sse2,aes"))) __m128i f(__m128i a, __m128i b) { return _mm_aesenc_si128(a, b); }
+EOF
+accept local_no_sse2_aes.c aesenc -march=x86-64
+cat >"$tmp/local_gfni_no_sse2.c" <<'EOF'
+#include <immintrin.h>
+__attribute__((target("gfni,no-sse2"))) __m128i f(__m128i a, __m128i b) { return _mm_gf2p8mul_epi8(a, b); }
+EOF
+reject local_gfni_no_sse2.c -mgfni -march=x86-64
 cat >"$tmp/local_fma_no_leak.c" <<'EOF'
 #include <immintrin.h>
 __attribute__((target("fma"))) __m256 f(__m256 a, __m256 b, __m256 c) { return _mm256_fmadd_ps(a,b,c); }
@@ -763,8 +878,10 @@ if "$gcc_bin" -dumpfullversion 2>/dev/null | grep -x '16.2.0' >/dev/null; then
     compare local_fma_no_leak.c -march=x86-64
     compare local_bw_vl.c -march=x86-64
     compare local_bw_denied.c -march=x86-64 -mavx512bw -mavx512vl
-    compare local_bmm_no_implicit_bw.c -march=x86-64
-    compare local_bmm_no_bw.c -march=x86-64
+    for src in local_bmm_implies_bw.c local_bmm_no_bw.c local_bmm_undone.c local_f_no_avx2.c \
+               local_aes_no_sse2.c local_no_sse2_aes.c local_gfni_no_sse2.c; do
+        compare "$src" -march=x86-64
+    done
 
     "$ccc" -O2 -mavx512f -ffp-contract=off "$tmp/avx512_fma_runtime.c" -o "$tmp/lccc-avx512-fma"
     "$gcc_bin" -O2 -mavx512f -ffp-contract=off "$tmp/avx512_fma_runtime.c" -o "$tmp/gcc-avx512-fma"

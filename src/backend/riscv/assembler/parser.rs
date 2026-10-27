@@ -194,7 +194,11 @@ pub enum Directive {
     /// 4-byte PC-relative reference (`R_RISCV_32_PCREL`), produced by the
     /// CFI lowering only (FDE initial location, pc-relative personality).
     Pcrel32(String),
-    /// Other ignorable directives: .file, .loc, .ident, etc.
+    /// `.file N "name"`: a DWARF line-table file.
+    File(u32, String),
+    /// `.loc FILE LINE COLUMN`: a line row at the current location.
+    Loc(u32, u32, u32),
+    /// Other ignorable directives: .ident, .addrsig, etc.
     Ignored,
     /// `.org new-lc [, fill]` -- resolved by `ElfWriterBase::emit_org`.
     Org { expr: String, fill: u8 },
@@ -692,8 +696,16 @@ fn parse_directive(line: &str) -> Result<AsmStatement, String> {
         // fully honest -- forgetting a macro removal lets a use GAS would reject
         // assemble -- but it cannot change the bytes of a file GAS accepts, so it is
         // a leniency on invalid input rather than a miscompile.  Recorded as open.
-        ".file" | ".loc" | ".ident" | ".addrsig" | ".addrsig_sym" | ".build_attributes"
-        | ".eabi_attribute" | ".end" | ".noaltmacro" | ".purgem" => Directive::Ignored,
+        ".file" => match crate::backend::elf::parse_file_directive(args)? {
+            Some((number, name)) => Directive::File(number, name),
+            None => Directive::Ignored,
+        },
+        ".loc" => {
+            let (file, line, column) = crate::backend::elf::parse_loc_directive(args)?;
+            Directive::Loc(file, line, column)
+        }
+        ".ident" | ".addrsig" | ".addrsig_sym" | ".build_attributes" | ".eabi_attribute"
+        | ".end" | ".noaltmacro" | ".purgem" => Directive::Ignored,
 
         _ => Directive::Unknown {
             name: name.to_string(),

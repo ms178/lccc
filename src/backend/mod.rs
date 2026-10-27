@@ -40,8 +40,9 @@ pub(crate) mod i686;
 pub(crate) mod riscv;
 pub mod x86;
 
-use crate::common::fx_hash::FxHashSet;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::ir::reexports::{IrModule, TlsModel};
+use std::fmt::Write as _;
 
 /// Function-entry mcount instrumentation, derived from `-pg` (and its `-m`
 /// sub-mode flags).
@@ -338,6 +339,38 @@ fn finish_fn_boundaries(
     } else {
         strip_fn_boundary_markers(asm, marked)
     }
+}
+
+/// Insert each function's `-g` entry row (`CodegenState::fn_entry_locs`)
+/// directly after its `NAME:` label, as GCC places `.loc` ahead of the
+/// prologue. Runs after the peephole, zero-call-used-regs and CFI
+/// finishing, whose entry matchers need the exact label/`.cfi_startproc`/
+/// prologue shape -- a `.loc` inside it disabled dead-store elimination
+/// and CFI synthesis. Only the first `NAME:` of each recorded function is
+/// taken, so a same-named label in later top-level asm is left alone.
+pub(crate) fn insert_fn_entry_locs(
+    asm: String,
+    locs: &FxHashMap<String, (u32, u32, u32)>,
+) -> String {
+    if locs.is_empty() {
+        return asm;
+    }
+    let mut pending: FxHashSet<&str> = locs.keys().map(String::as_str).collect();
+    let mut out = String::with_capacity(asm.len() + locs.len() * 16);
+    for line in asm.split_inclusive('\n') {
+        out.push_str(line);
+        let Some(name) = line.trim().strip_suffix(':') else {
+            continue;
+        };
+        if pending.remove(name) {
+            if !line.ends_with('\n') {
+                out.push('\n');
+            }
+            let (file, row, column) = locs[name];
+            let _ = writeln!(out, ".loc {file} {row} {column}");
+        }
+    }
+    out
 }
 
 /// Remove the `.cfi_startproc`/`.cfi_endproc` function delimiters that the
@@ -673,12 +706,13 @@ impl Target {
                     );
                     let violations = x86::codegen::ipa_ra::verify(&asm, &cg.ipa);
                     if violations.is_empty() {
-                        break finish_fn_boundaries(
+                        let asm = finish_fn_boundaries(
                             &asm,
                             &cg.state,
                             opts.emit_cfi,
                             cfi_synth::CfiArch::X86_64,
                         );
+                        break insert_fn_entry_locs(asm, &cg.state.fn_entry_locs);
                     }
                     if opts.ra_config.debug_ra {
                         eprintln!("[IPA-RA] round {round}: {violations:?}");
@@ -728,6 +762,7 @@ impl Target {
                     opts.emit_cfi,
                     cfi_synth::CfiArch::I386,
                 );
+                let optimized = insert_fn_entry_locs(optimized, &cg.state.fn_entry_locs);
                 if opts.code16gcc {
                     format!(".code16gcc\n{}", optimized)
                 } else {
@@ -747,7 +782,7 @@ impl Target {
                     source_mgr,
                 );
                 let optimized = arm::codegen::peephole::peephole_optimize(raw);
-                zero_call_used_regs::apply_zero_call_used_regs(
+                let optimized = zero_call_used_regs::apply_zero_call_used_regs(
                     optimized,
                     Target::Aarch64,
                     module,
@@ -758,7 +793,8 @@ impl Target {
                         fp_simd_allowed: opts.zero_call_used_regs_fp_simd,
                         global_regparm: 0,
                     },
-                )
+                );
+                insert_fn_entry_locs(optimized, &cg.state.fn_entry_locs)
             }
             Target::Riscv64 => {
                 let mut cg = riscv::RiscvCodegen::new_with_ra_config(opts.ra_config.clone());
@@ -774,7 +810,7 @@ impl Target {
                     source_mgr,
                 );
                 let optimized = riscv::codegen::peephole::peephole_optimize(raw);
-                zero_call_used_regs::apply_zero_call_used_regs(
+                let optimized = zero_call_used_regs::apply_zero_call_used_regs(
                     optimized,
                     Target::Riscv64,
                     module,
@@ -785,7 +821,8 @@ impl Target {
                         fp_simd_allowed: opts.zero_call_used_regs_fp_simd,
                         global_regparm: 0,
                     },
-                )
+                );
+                insert_fn_entry_locs(optimized, &cg.state.fn_entry_locs)
             }
         }
     }
@@ -879,6 +916,54 @@ mod fn_boundary_marker_tests {
             out,
             "g:\n.cfi_startproc\nnop\n.cfi_endproc\n.size g, .-g\n\
              f:\n.cfi_startproc\nnop\n.cfi_endproc\n    ret\n    .size f, .-f\n"
+        );
+    }
+}
+
+#[cfg(test)]
+mod fn_entry_loc_tests {
+    use super::insert_fn_entry_locs;
+    use crate::common::fx_hash::FxHashMap;
+
+    fn locs(entries: &[(&str, (u32, u32, u32))]) -> FxHashMap<String, (u32, u32, u32)> {
+        entries
+            .iter()
+            .map(|(n, l)| ((*n).to_string(), *l))
+            .collect()
+    }
+
+    /// The row goes right after the label, ahead of the CFI and prologue,
+    /// for every recorded function; unrecorded ones are untouched.
+    #[test]
+    fn entry_row_follows_each_recorded_label() {
+        let asm = ".type f, @function\nf:\n.cfi_startproc\n    pushq %rbp\n    ret\n\
+                   .cfi_endproc\ng:\n    ret\nh:\n    ret";
+        let out = insert_fn_entry_locs(
+            asm.to_string(),
+            &locs(&[("f", (1, 1, 25)), ("h", (2, 9, 3))]),
+        );
+        assert_eq!(
+            out,
+            ".type f, @function\nf:\n.loc 1 1 25\n.cfi_startproc\n    pushq %rbp\n    ret\n\
+             .cfi_endproc\ng:\n    ret\nh:\n.loc 2 9 3\n    ret"
+        );
+    }
+
+    /// Only the function's own (first) label: a same-named label in later
+    /// top-level asm must not get a second, bogus entry row.
+    #[test]
+    fn only_the_first_label_is_annotated() {
+        let out = insert_fn_entry_locs("f:\n    ret\nf:\n".to_string(), &locs(&[("f", (1, 2, 3))]));
+        assert_eq!(out.matches(".loc").count(), 1);
+        assert!(out.starts_with("f:\n.loc 1 2 3\n"));
+    }
+
+    #[test]
+    fn no_rows_leaves_text_unchanged() {
+        let asm = "f:\n    ret\n".to_string();
+        assert_eq!(
+            insert_fn_entry_locs(asm.clone(), &FxHashMap::default()),
+            asm
         );
     }
 }

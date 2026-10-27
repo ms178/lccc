@@ -13,7 +13,7 @@ use super::symbols::{GlobalSymbolOps, is_linker_defined_symbol};
 use super::types::{DynSymbol, Elf64Object};
 use crate::backend::elf::{
     ELF_MAGIC, LinkerScriptEntry, SHN_COMMON, SHN_UNDEF, STB_WEAK, STT_FILE, STT_OBJECT,
-    STT_SECTION, parse_linker_script_entries,
+    STT_SECTION, STV_DEFAULT, parse_linker_script_entries,
 };
 
 /// Match dynamic symbols from a shared library against undefined globals.
@@ -63,13 +63,22 @@ pub fn match_shared_library_dynsyms<G: GlobalSymbolOps>(
     // First pass: match undefined symbols against library exports
     for dsym in dyn_syms {
         if let Some(existing) = globals.get(&dsym.name) {
-            if !existing.is_defined() && !existing.is_dynamic() {
+            // A regular COMMON yields to a strong data definition (see
+            // `shared_def_overrides_common`); it becomes an import.
+            let binds_common = existing.section_idx() == SHN_COMMON
+                && !existing.is_dynamic()
+                && existing.visibility() == STV_DEFAULT
+                && super::symbols::shared_def_overrides_common(dsym.info);
+            if (!existing.is_defined() && !existing.is_dynamic()) || binds_common {
                 // An UNVERSIONED reference may only bind to the symbol's
                 // default version (@@), matching GNU ld. Non-default exports
                 // (memcpy@GLIBC_2.2.5) are reachable only via versioned refs.
                 if dsym.is_default_ver {
                     lib_needed = true;
-                    globals.insert(dsym.name.clone(), G::new_dynamic(dsym, soname));
+                    let vis = existing.visibility();
+                    let mut bound = G::new_dynamic(dsym, soname);
+                    bound.set_visibility(vis);
+                    globals.insert(dsym.name.clone(), bound);
                     // Track WEAK STT_OBJECT for alias detection
                     let bind = dsym.info >> 4;
                     let stype = dsym.info & 0xf;
@@ -117,19 +126,7 @@ pub fn match_shared_library_dynsyms<G: GlobalSymbolOps>(
 /// Load a shared library file and match its exports against undefined globals.
 ///
 /// Handles linker script indirection (e.g., libc.so may be a text file pointing
-/// to the real .so). Uses as-needed semantics: only adds DT_NEEDED if at least
-/// one symbol was actually resolved.
-pub fn load_shared_library_elf64<G: GlobalSymbolOps>(
-    path: &str,
-    globals: &mut FxHashMap<String, G>,
-    needed_sonames: &mut Vec<String>,
-    lib_paths: &[String],
-) -> Result<(), String> {
-    // Historical default: behave as if --as-needed were in effect.
-    load_shared_library_elf64_as_needed(path, globals, needed_sonames, lib_paths, true)
-}
-
-/// As [`load_shared_library_elf64`], but with explicit `--as-needed` state.
+/// to the real .so).
 ///
 /// `as_needed == false` (i.e. `--no-as-needed`, which is GNU ld's default)
 /// records `DT_NEEDED` even when the library resolves nothing. That is not a
@@ -138,10 +135,12 @@ pub fn load_shared_library_elf64<G: GlobalSymbolOps>(
 /// the entry silently changes program behaviour.
 pub fn load_shared_library_elf64_as_needed<G: GlobalSymbolOps>(
     path: &str,
+    objects: &mut super::ObjectSet,
     globals: &mut FxHashMap<String, G>,
     needed_sonames: &mut Vec<String>,
     lib_paths: &[String],
     as_needed: bool,
+    by_search: bool,
 ) -> Result<(), String> {
     let data = std::fs::read(path).map_err(|e| format!("failed to read '{}': {}", path, e))?;
 
@@ -170,6 +169,7 @@ pub fn load_shared_library_elf64_as_needed<G: GlobalSymbolOps>(
                         }
                         LinkerScriptEntry::Lib(lib_name) => resolve_lib(lib_name, lib_paths, false),
                     };
+                    let searched = matches!(entry, LinkerScriptEntry::Lib(_));
                     if let Some(resolved) = resolved_path {
                         let lib_data = std::fs::read(&resolved)
                             .map_err(|e| format!("failed to read '{}': {}", resolved, e))?;
@@ -180,10 +180,12 @@ pub fn load_shared_library_elf64_as_needed<G: GlobalSymbolOps>(
                         }
                         load_shared_library_elf64_as_needed(
                             &resolved,
+                            objects,
                             globals,
                             needed_sonames,
                             lib_paths,
                             as_needed,
+                            searched,
                         )?;
                     }
                 }
@@ -193,12 +195,7 @@ pub fn load_shared_library_elf64_as_needed<G: GlobalSymbolOps>(
         return Err(format!("{}: not a valid ELF shared library", path));
     }
 
-    let soname = parse_soname(&data).unwrap_or_else(|| {
-        Path::new(path)
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| path.to_string())
-    });
+    let soname = parse_soname(&data).unwrap_or_else(|| unsonamed_needed_name(path, by_search));
 
     let dyn_syms = parse_shared_library_symbols(&data, path)?;
     if std::env::var_os("CCC_DEBUG_LD_SYMS").is_some() {
@@ -210,21 +207,82 @@ pub fn load_shared_library_elf64_as_needed<G: GlobalSymbolOps>(
             dyn_syms.len()
         );
     }
-    let lib_needed = match_shared_library_dynsyms(&dyn_syms, &soname, globals);
+    // In the link iff `--no-as-needed`, already in the DT_NEEDED list by
+    // an earlier input, or needed here.  Decided before binding anything:
+    // a library `--as-needed` drops is unloaded, symbols included, so not
+    // even a weak reference may bind to it.
+    let in_link =
+        !as_needed || needed_sonames.contains(&soname) || shared_library_needed(&dyn_syms, globals);
     if std::env::var_os("CCC_DEBUG_LD_SYMS").is_some() {
-        eprintln!(
-            "[LD-SO]   -> lib_needed={} (fdopen defined? {:?})",
-            lib_needed,
-            globals
-                .get("fdopen")
-                .map(|g| (g.is_defined(), g.is_dynamic()))
-        );
+        eprintln!("[LD-SO]   -> in_link={in_link}");
     }
-
-    if (lib_needed || !as_needed) && !needed_sonames.contains(&soname) {
-        needed_sonames.push(soname);
+    if in_link {
+        match_shared_library_dynsyms(&dyn_syms, &soname, globals);
+        objects.note_linked_library(path, &soname, dyn_syms);
+        if !needed_sonames.contains(&soname) {
+            needed_sonames.push(soname);
+        }
     }
     Ok(())
+}
+
+/// Whether an `--as-needed` library with exports `dyn_syms` is needed where
+/// it is read: it defines what a regular object references -- by the
+/// binding rules of [`match_shared_library_dynsyms`] -- or strong data a
+/// common yields to.  Only a non-weak reference counts (bfd's
+/// `ref_regular_nonweak`): a weak one binds to a library in the link but
+/// never brings one in.
+fn shared_library_needed<G: GlobalSymbolOps>(
+    dyn_syms: &[DynSymbol],
+    globals: &FxHashMap<String, G>,
+) -> bool {
+    let strong_ref = |g: &G| !g.is_defined() && !g.is_dynamic() && g.info() >> 4 != STB_WEAK;
+    let takes = |dsym: &DynSymbol, g: &G| {
+        strong_ref(g)
+            || (g.section_idx() == SHN_COMMON
+                && !g.is_dynamic()
+                && g.visibility() == STV_DEFAULT
+                && super::symbols::shared_def_overrides_common(dsym.info))
+    };
+    if dyn_syms
+        .iter()
+        .filter(|dsym| dsym.is_default_ver)
+        .any(|dsym| globals.get(&dsym.name).is_some_and(|g| takes(dsym, g)))
+    {
+        return true;
+    }
+    // `name@VER` references, as the matcher pairs them with exports.
+    let versioned: Vec<(&str, &str)> = globals
+        .iter()
+        .filter(|(_, g)| strong_ref(g))
+        .filter_map(|(name, _)| {
+            let (base, ver) = name.split_once('@')?;
+            (!base.is_empty() && !ver.is_empty() && !ver.contains('@')).then_some((base, ver))
+        })
+        .collect();
+    !versioned.is_empty()
+        && dyn_syms.iter().any(|dsym| {
+            versioned
+                .iter()
+                .any(|&(base, ver)| dsym.name == base && dsym.version.as_deref() == Some(ver))
+        })
+}
+
+/// The `DT_NEEDED` name GNU ld records for the shared library at `path` when
+/// it has no `DT_SONAME`: the name it was given by -- the file name when an
+/// `-l` search found it (on the command line or in a linker script), else
+/// the path itself, as named on the command line or as a linker-script
+/// entry resolved (bfd, lld and mold agree; recording only the file name
+/// made `lccc m.c /opt/x/libfoo.so` need `libfoo.so` on the loader's search
+/// path, where the GNU-linked program finds it where it was linked).
+pub fn unsonamed_needed_name(path: &str, by_search: bool) -> String {
+    if !by_search {
+        return path.to_string();
+    }
+    Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string())
 }
 
 /// Resolve remaining undefined symbols by searching default system libraries.
@@ -281,6 +339,38 @@ pub fn resolve_dynamic_symbols_elf64<G: GlobalSymbolOps>(
     Ok(())
 }
 
+/// `*e = new`, keeping the visibility narrowed so far (see the end of the
+/// `register_symbols_elf64` loop).
+fn replace_keeping_visibility<G: GlobalSymbolOps>(e: &mut G, new: G) {
+    let vis = super::symbols::most_constraining_visibility(e.visibility(), new.visibility());
+    *e = new;
+    e.set_visibility(vis);
+}
+
+/// Bind `dsym`'s name to that export of `soname` as
+/// [`match_shared_library_dynsyms`] binds a reference: a WEAK object brings
+/// its same-address aliases (`environ` and `__environ`) along, so that a copy
+/// relocation moves them together.
+fn import_shared_data<G: GlobalSymbolOps>(
+    globals: &mut FxHashMap<String, G>,
+    soname: &str,
+    dsym: &DynSymbol,
+    exports: &[DynSymbol],
+) {
+    globals.insert(dsym.name.clone(), G::new_dynamic(dsym, soname));
+    if dsym.info >> 4 != STB_WEAK || dsym.info & 0xf != STT_OBJECT {
+        return;
+    }
+    for alias in exports {
+        if alias.info & 0xf == STT_OBJECT
+            && (alias.value, alias.size) == (dsym.value, dsym.size)
+            && !globals.contains_key(&alias.name)
+        {
+            globals.insert(alias.name.clone(), G::new_dynamic(alias, soname));
+        }
+    }
+}
+
 /// Register symbols from an object file into the global symbol table.
 ///
 /// `prior` holds the objects registered before `obj`, in link order; `obj`
@@ -333,9 +423,9 @@ pub fn register_symbols_elf64<G: GlobalSymbolOps>(
                     let discarded_copy =
                         || super::comdat::in_discarded_group(prior, obj, sym.shndx as usize);
                     if !e.is_defined() || should_replace_extra(e) {
-                        *e = G::new_defined(obj_idx, sym);
+                        replace_keeping_visibility(e, G::new_defined(obj_idx, sym));
                     } else if (e_common || (e_weak && sym.is_global())) && !discarded_copy() {
-                        *e = G::new_defined(obj_idx, sym);
+                        replace_keeping_visibility(e, G::new_defined(obj_idx, sym));
                     } else if sym.is_global()
                         && !e_weak
                         && !e.is_dynamic()
@@ -354,19 +444,48 @@ pub fn register_symbols_elf64<G: GlobalSymbolOps>(
                 }
             }
         } else if sym.shndx == SHN_COMMON {
+            // A strong data definition of a library linked before this
+            // object (`./lib.so c.o`) takes the name over, as one linked
+            // after it does; the common becomes an import
+            // (`shared_def_overrides_common`).
+            let earlier_dso = if sym.visibility() == STV_DEFAULT {
+                prior.linked_shared_data(sym.name.as_str())
+            } else {
+                None
+            };
+            let mut import = None;
             match globals.get_mut(sym.name.as_str()) {
+                None if earlier_dso.is_some() => import = earlier_dso,
                 None => {
                     globals.insert(sym.name.to_string(), G::new_common(obj_idx, sym));
                 }
                 Some(e) => {
-                    if !e.is_defined() {
-                        *e = G::new_common(obj_idx, sym);
+                    // A strong shared-library data definition bound earlier
+                    // keeps the name; a weak one yields to the common
+                    // (`shared_def_overrides_common`).
+                    let keeps = e.is_dynamic()
+                        && sym.visibility() == STV_DEFAULT
+                        && e.visibility() == STV_DEFAULT
+                        && super::symbols::shared_def_overrides_common(e.info());
+                    if !e.is_defined() && !keeps {
+                        // A reference registered since that library was
+                        // loaded is bound to it just the same; one already
+                        // bound to another export (a function) is not.
+                        if !e.is_dynamic() && e.visibility() == STV_DEFAULT && earlier_dso.is_some()
+                        {
+                            import = earlier_dso;
+                        } else {
+                            replace_keeping_visibility(e, G::new_common(obj_idx, sym));
+                        }
                     } else if e.section_idx() == SHN_COMMON && sym.size > e.size() {
                         // COMMON vs COMMON: the largest instance wins (GNU semantics).
-                        *e = G::new_common(obj_idx, sym);
+                        replace_keeping_visibility(e, G::new_common(obj_idx, sym));
                     }
                     // COMMON vs real definition: the real definition wins; ignore.
                 }
+            }
+            if let Some((soname, dsym, exports)) = import {
+                import_shared_data(globals, soname, dsym, exports);
             }
         } else {
             // Undefined reference (SHN_UNDEF, not COMMON). The first
@@ -378,16 +497,42 @@ pub fn register_symbols_elf64<G: GlobalSymbolOps>(
             // pull, strong ones always do.
             let weak_ref = sym.info >> 4 == STB_WEAK;
             match globals.get_mut(sym.name.as_str()) {
-                None => {
-                    globals.insert(sym.name.to_string(), G::new_undefined(sym));
-                }
+                // The first reference to a name a library linked earlier
+                // exports binds to it (`./lib.so main.o`): GNU ld enters a
+                // kept library's exports into the symbol table when it
+                // reads the library, so a later archive member defining the
+                // name is not extracted either.
+                None => match prior.linked_shared_export(sym.name.as_str()) {
+                    Some((soname, dsym, exports)) if dsym.name == sym.name.as_str() => {
+                        import_shared_data(globals, soname, dsym, exports);
+                    }
+                    Some((soname, dsym, _)) => {
+                        globals.insert(sym.name.to_string(), G::new_dynamic(dsym, soname));
+                    }
+                    None => {
+                        globals.insert(sym.name.to_string(), G::new_undefined(sym));
+                    }
+                },
                 Some(e)
                     if !weak_ref && e.section_idx() == SHN_UNDEF && e.info() >> 4 == STB_WEAK =>
                 {
-                    *e = G::new_undefined(sym);
+                    replace_keeping_visibility(e, G::new_undefined(sym));
                 }
                 _ => {}
             }
+        }
+        // Narrow the visibility now rather than only in the late
+        // `merge_object_visibility` pass (same result: the merge is
+        // commutative and idempotent), so binding a COMMON to a shared
+        // library can tell a hidden or protected one, which never binds.
+        let vis = sym.visibility();
+        if vis != STV_DEFAULT
+            && let Some(e) = globals.get_mut(sym.name.as_str())
+        {
+            e.set_visibility(super::symbols::most_constraining_visibility(
+                e.visibility(),
+                vis,
+            ));
         }
     }
 
@@ -433,4 +578,122 @@ pub fn register_symbols_elf64<G: GlobalSymbolOps>(
         }
     }
     Ok(())
+}
+
+/// Alignment for the executable's copy of a copy-relocated library object.
+///
+/// The object's alignment is not recorded anywhere, but it is bounded twice
+/// (lld's rule): the library's layout honoured it, so it divides the
+/// object's address there (`lib_value`), and an object's size is a multiple
+/// of its alignment. The smaller power of two satisfies both, so an
+/// `_Alignas(16)` or `_Atomic __int128` variable keeps the alignment that
+/// its `movaps`/`cmpxchg16b` accesses require. The result is capped at a
+/// page and is never below `floor`.
+pub fn copy_reloc_align(lib_value: u64, size: u64, floor: u64) -> u64 {
+    const MAX: u64 = 4096;
+    let by_value = if lib_value == 0 {
+        MAX
+    } else {
+        1u64 << lib_value.trailing_zeros().min(12)
+    };
+    let by_size = size.max(1).checked_next_power_of_two().unwrap_or(MAX);
+    by_value.min(by_size).min(MAX).max(floor)
+}
+
+#[cfg(test)]
+mod copy_align_tests {
+    use super::copy_reloc_align;
+
+    #[test]
+    fn copy_alignment_is_bounded_by_library_address_and_size() {
+        // 16-byte object at a 16-aligned address: 16, not the old floor.
+        assert_eq!(copy_reloc_align(0x4010, 16, 4), 16);
+        // Same object at an address only 8-aligned: the library proves 8.
+        assert_eq!(copy_reloc_align(0x4008, 16, 4), 8);
+        // A 4-byte int at a page-aligned address needs no more than 4.
+        assert_eq!(copy_reloc_align(0x5000, 4, 4), 4);
+        // Size 12 (struct of 3 ints) rounds to 16; address limits it to 4.
+        assert_eq!(copy_reloc_align(0x4004, 12, 1), 4);
+        // Huge page-aligned array: capped at the page.
+        assert_eq!(copy_reloc_align(0x10_0000, 1 << 20, 8), 4096);
+        // The floor wins over weaker bounds (old placement is preserved).
+        assert_eq!(copy_reloc_align(0x4001, 1, 8), 8);
+        assert_eq!(copy_reloc_align(0, 0, 1), 1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::elf::{STB_GLOBAL, STT_FUNC};
+    use crate::backend::linker_common::{Elf64Symbol, SymStr};
+    use crate::backend::x86::linker::types::GlobalSymbol;
+
+    fn symbol(name: &str, binding: u8, sym_type: u8, shndx: u16) -> Elf64Symbol {
+        Elf64Symbol {
+            name_idx: 0,
+            name: SymStr::new(name),
+            info: (binding << 4) | sym_type,
+            other: 0,
+            shndx,
+            value: 0,
+            size: 4,
+        }
+    }
+
+    fn export(name: &str, info: u8, version: Option<&str>, default_ver: bool) -> DynSymbol {
+        DynSymbol {
+            name: name.to_string(),
+            info,
+            value: 0x1000,
+            size: 4,
+            in_exec_segment: false,
+            version: version.map(str::to_string),
+            is_default_ver: default_ver,
+        }
+    }
+
+    /// An `--as-needed` library is needed by a non-weak reference to what it
+    /// exports (the default version for a plain name, the named version for
+    /// `name@VER`) or by a common its strong data takes -- never by a weak
+    /// reference alone, nor by a common its weak data or code meets (bfd
+    /// 2.47, `tests/linker` `positional_shared_operands` and
+    /// `common_binds_shared_data`).
+    #[test]
+    fn only_non_weak_uses_need_an_as_needed_library() {
+        let func = (STB_GLOBAL << 4) | STT_FUNC;
+        let data = (STB_GLOBAL << 4) | STT_OBJECT;
+        let weak_data = (STB_WEAK << 4) | STT_OBJECT;
+        let needed = |globals: &[(&str, GlobalSymbol)], exports: &[DynSymbol]| {
+            let globals: FxHashMap<String, GlobalSymbol> = globals
+                .iter()
+                .map(|(n, g)| (n.to_string(), g.clone()))
+                .collect();
+            shared_library_needed(exports, &globals)
+        };
+        let undef =
+            |binding| GlobalSymbol::new_undefined(&symbol("f", binding, STT_FUNC, SHN_UNDEF));
+        let common = GlobalSymbol::new_common(0, &symbol("s", STB_GLOBAL, STT_OBJECT, SHN_COMMON));
+        let foo = [export("foo", func, None, true)];
+
+        assert!(needed(&[("foo", undef(STB_GLOBAL))], &foo));
+        assert!(!needed(&[("foo", undef(STB_WEAK))], &foo));
+        assert!(!needed(&[("bar", undef(STB_GLOBAL))], &foo));
+        // A non-default version answers only `name@VER`.
+        let versioned = [export("foo", func, Some("V1"), false)];
+        assert!(!needed(&[("foo", undef(STB_GLOBAL))], &versioned));
+        assert!(needed(&[("foo@V1", undef(STB_GLOBAL))], &versioned));
+        assert!(!needed(&[("foo@V1", undef(STB_WEAK))], &versioned));
+        assert!(!needed(&[("foo@V2", undef(STB_GLOBAL))], &versioned));
+        // Commons: strong data takes one; weak data and code do not.
+        assert!(needed(
+            &[("s", common.clone())],
+            &[export("s", data, None, true)]
+        ));
+        assert!(!needed(
+            &[("s", common.clone())],
+            &[export("s", weak_data, None, true)]
+        ));
+        assert!(!needed(&[("s", common)], &[export("s", func, None, true)]));
+    }
 }

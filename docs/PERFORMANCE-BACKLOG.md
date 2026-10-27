@@ -144,3 +144,34 @@ the sibling-call A/B used the SAME compiler binary, differing only by
   measurement artifacts — the same binaries' stdout gates the comparison.
   Remaining-gap ownership: regalloc/callocation quality (the §5.1
   post-TODO-2 residuals), not call shape.
+
+## x86 SIMD: measured gaps
+
+Context and contracts: `x86-isa-permissions-and-simd-abi.md`. Ir figures
+are Callgrind counts (modeled, not hardware).
+
+* **i686 GNU vector arithmetic is scalarized.** `driver/pipeline.rs` sets
+  the vector-lowering width to 0 for non-x86-64, and the i686 backend
+  implements about 12 of the roughly 202 `Vec*` families. Add-instruction
+  counts at `-O2 -mavx2`, m32 vs m64: char32B 173/5, short32B 93/5,
+  int32B 53/5, ll32B 65/5, int16B 33/4, ll16B 37/4, float32B 81/5,
+  double32B 45/5. GCC needs 3 at m32. The fix is porting the families,
+  ideally by sharing the x86-64 emitters. Opening the gate first would
+  miscompile.
+* **i686 vector arguments** are copied through memory more than once, and
+  the i686 sret path copies with `rep movsb`. Both create store-forwarding
+  stalls on wide values.
+* **MMX on x86-64** (`_mm_add_pi16` and friends) is lowered through scalar
+  code instead of one SSE2 instruction on the low half of an XMM register.
+  The F2 `movq` round trip and the redundant `movl %edi,%edi` zero-extension
+  are part of the same work.
+* **MMX API gaps:** the `_m_*` aliases, `_mm_s*_pi*` shifts,
+  `_mm_setr_pi8`, the SSE2 `_si64` forms and the SSSE3 `_pi` forms are not
+  provided yet.
+* **Ir gaps to GCC 16.2:** reduction_vecreg 3278 vs 1721, popcount 5801
+  vs 4728, nbody 3385 vs 2965, switch_dispatch 978 vs 766, zstd
+  `double_fast` 2823.5 vs 2686.2.
+* **Unsigned-exit reductions** (`for (size_t i...) s += x[i]`) stay scalar
+  under the Slt/Sgt restriction of the reduction recognizer. A census of 74
+  benchmark programs at `-O2` and `-O3 -march=x86-64-v3` found no
+  occurrence, so the restriction stays.

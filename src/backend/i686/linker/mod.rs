@@ -29,6 +29,7 @@
 //! - `emit` - Phase 10: executable layout and ELF32 emission
 //! - `link` - Orchestration: `link_builtin` and `link_shared` entry points
 
+mod debug;
 mod dynamic;
 mod dynsym;
 mod emit;
@@ -40,7 +41,9 @@ mod parse;
 mod reloc;
 mod sections;
 mod shared;
+mod shdr;
 mod symbols;
+mod symtab;
 mod tls;
 #[expect(dead_code)] // ELF constants defined for completeness; not all used yet
 mod types;

@@ -598,6 +598,7 @@ pub fn peephole_optimize(asm: String) -> String {
     if n == 0 {
         return asm;
     }
+    crate::backend::peephole_common::hide_debug_rows(&lines, &mut kinds, LineKind::Nop);
 
     // Phase 1: Iterative local passes (up to 8 rounds)
     let rotate = std::env::var("CCC_NO_LOOP_ROTATE").is_err();
@@ -699,16 +700,9 @@ pub fn peephole_optimize(asm: String) -> String {
         }
     }
 
-    // Build result, filtering out Nop lines
+    // Build result: kept lines, with the hidden `-g` rows put back.
     debug_assert_eq!(lines.len(), kinds.len());
-    let mut result = String::with_capacity(asm.len());
-    for i in 0..lines.len() {
-        if kinds[i] != LineKind::Nop {
-            result.push_str(&lines[i]);
-            result.push('\n');
-        }
-    }
-    result
+    crate::backend::peephole_common::join_with_debug_rows(&lines, |i| kinds[i] != LineKind::Nop)
 }
 
 /// Propagate a register copy used only as a memory-address alias within one
@@ -3924,12 +3918,19 @@ fn nzv_condition(cc: &str) -> bool {
     )
 }
 
+/// First line at or after `from` (below `n`) that is not deleted. Deleted
+/// lines -- earlier passes' and the hidden `-g` rows -- emit nothing, so an
+/// adjacency pattern must step over them, or `-g` alone would block it.
+fn next_live(kinds: &[LineKind], from: usize, n: usize) -> Option<usize> {
+    (from..n).find(|&k| kinds[k] != LineKind::Nop)
+}
+
 fn fuse_and_cmp_zero(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
     if std::env::var("CCC_NO_AND_TST_FUSION").is_ok() {
         return false;
     }
     let mut changed = false;
-    for i in 0..n.saturating_sub(2) {
+    for i in 0..n {
         if kinds[i] != LineKind::Alu {
             continue;
         }
@@ -3947,9 +3948,15 @@ fn fuse_and_cmp_zero(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> 
         if dst == REG_NONE || dst >= 32 {
             continue;
         }
-        // i+1: cmp <same reg>, #0 (or xzr/wzr)
-        let t1 = lines[i + 1].trim();
-        if kinds[i + 1] != LineKind::Compare || !t1.starts_with("cmp ") {
+        // Next live line: cmp <same reg>, #0 (or xzr/wzr)
+        let Some(j) = next_live(kinds, i + 1, n) else {
+            continue;
+        };
+        let Some(k) = next_live(kinds, j + 1, n) else {
+            continue;
+        };
+        let t1 = lines[j].trim();
+        if kinds[j] != LineKind::Compare || !t1.starts_with("cmp ") {
             continue;
         }
         let mut cops = t1[4..].split(',');
@@ -3958,8 +3965,8 @@ fn fuse_and_cmp_zero(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> 
         if creg != dform || !(cimm == "#0" || cimm == "xzr" || cimm == "wzr") {
             continue;
         }
-        // i+2: an N/Z/V-only flag consumer.
-        let t2 = lines[i + 2].trim();
+        // The live line after it: an N/Z/V-only flag consumer.
+        let t2 = lines[k].trim();
         let cc_ok = if let Some(rest) = t2.strip_prefix("b.") {
             rest.split_once(' ')
                 .map(|(cc, _)| nzv_condition(cc))
@@ -3977,8 +3984,8 @@ fn fuse_and_cmp_zero(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> 
         }
         lines[i] = format!("    ands {}, {}, {}", dform, sform, cform);
         kinds[i] = LineKind::Alu;
-        lines[i + 1] = String::new();
-        kinds[i + 1] = LineKind::Nop;
+        lines[j] = String::new();
+        kinds[j] = LineKind::Nop;
         changed = true;
     }
     changed
@@ -4252,7 +4259,7 @@ fn eliminate_overwritten_moves(lines: &[String], kinds: &mut [LineKind], n: usiz
 // exactly `mov wD, wS`. Sound only if A is not read later in the block.
 fn fold_zext_move_chains(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
     let mut changed = false;
-    for i in 0..n.saturating_sub(2) {
+    for i in 0..n {
         let LineKind::Move {
             dst: a,
             src: s,
@@ -4261,11 +4268,17 @@ fn fold_zext_move_chains(lines: &mut [String], kinds: &mut [LineKind], n: usize)
         else {
             continue;
         };
+        let Some(m1) = next_live(kinds, i + 1, n) else {
+            continue;
+        };
+        let Some(m2) = next_live(kinds, m1 + 1, n) else {
+            continue;
+        };
         let LineKind::Move {
             dst: a2,
             src: s2,
             is_32bit: true,
-        } = kinds[i + 1]
+        } = kinds[m1]
         else {
             continue;
         };
@@ -4276,7 +4289,7 @@ fn fold_zext_move_chains(lines: &mut [String], kinds: &mut [LineKind], n: usize)
             dst: d,
             src: s3,
             is_32bit: false,
-        } = kinds[i + 2]
+        } = kinds[m2]
         else {
             continue;
         };
@@ -4287,7 +4300,7 @@ fn fold_zext_move_chains(lines: &mut [String], kinds: &mut [LineKind], n: usize)
         // A write-only line (e.g. `mov x0, #15`) ends the old value's life.
         let (xa, wa) = (xreg_name(a), wreg_name(a));
         let mut a_live = false;
-        for j in (i + 3)..n {
+        for j in (m2 + 1)..n {
             match kinds[j] {
                 // Control-flow boundaries are NOT "value is dead" proofs.
                 // levkropp's break-as-dead default folded d2hi()'s return-
@@ -4347,8 +4360,8 @@ fn fold_zext_move_chains(lines: &mut [String], kinds: &mut [LineKind], n: usize)
             src: s,
             is_32bit: true,
         };
-        kinds[i + 1] = LineKind::Nop;
-        kinds[i + 2] = LineKind::Nop;
+        kinds[m1] = LineKind::Nop;
+        kinds[m2] = LineKind::Nop;
         changed = true;
     }
     changed
@@ -6607,6 +6620,70 @@ fn hoist_loop_invariant_remats(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `-g` rows are hidden from every pass: a row between a dead `mov` and
+    /// its overwrite must not keep it (k_hashmix.c kept `mov x0, #0` at -O0).
+    #[test]
+    fn debug_rows_change_no_code() {
+        let body = [
+            "    stp x29, x30, [sp, #-64]!",
+            "    mov x29, sp",
+            "    mov x0, #0",
+            "    str x0, [sp, #16]",
+            "    mov x0, #0",
+            "    sxtw x0, w0",
+            "    str x0, [sp, #24]",
+            "    ldp x29, x30, [sp], #64",
+            "    ret",
+        ];
+        let plain = format!("f:\n{}\n", body.join("\n"));
+        let rows: Vec<String> = body
+            .iter()
+            .enumerate()
+            .map(|(n, l)| format!(".loc 1 {} 5\n{l}", n + 1))
+            .collect();
+        let debug = peephole_optimize(format!("f:\n{}\n", rows.join("\n")));
+        let plain = peephole_optimize(plain);
+        let code = |s: &str| {
+            s.lines()
+                .filter(|l| !l.starts_with(".loc"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert_eq!(code(&debug), code(&plain));
+        assert_eq!(plain.matches("mov x0, #0").count(), 1, "{plain}");
+        assert!(debug.contains(".loc 1 9 5\n    ret"), "{debug}");
+        // Adjacency patterns step over rows (range_check_fold.c kept
+        // `and; cmp #0` under -O2 -g) and over the zext chain's rows.
+        for body in [
+            [
+                "    and w8, w7, #0xff",
+                "    cmp w8, #0",
+                "    b.eq .L1",
+                "    mov x0, #1",
+            ],
+            [
+                "    mov x3, x2",
+                "    mov w3, w3",
+                "    mov x4, x3",
+                "    mov x0, x4",
+            ],
+        ] {
+            let tail = ".L1:\n    ret\n";
+            let plain = peephole_optimize(format!("f:\n{}\n{tail}", body.join("\n")));
+            let rows: Vec<String> = body
+                .iter()
+                .enumerate()
+                .map(|(n, l)| format!(".loc 1 {} 3\n{l}", n + 1))
+                .collect();
+            let debug = peephole_optimize(format!("f:\n{}\n{tail}", rows.join("\n")));
+            assert_eq!(code(&debug), code(&plain), "{body:?}");
+        }
+        assert!(
+            peephole_optimize("f:\n.loc 1 1 3\n    and w8, w7, #0xff\n.loc 1 2 3\n    cmp w8, #0\n    b.eq .L1\n    mov x0, #1\n.L1:\n    ret\n".into())
+                .contains("ands w8, w7, #0xff")
+        );
+    }
 
     /// Run `coalesce_entry_copies` to a fixpoint and return the live text.
     fn coalesce_to_fixpoint(asm: &str) -> Vec<String> {

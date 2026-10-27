@@ -265,12 +265,22 @@ pub struct Driver {
     /// Set by `-mno-popcnt`: POPCNT (0F B8) forbidden; the bit-count
     /// lowering falls back to the shr/adc loop.
     pub(super) popcnt_explicitly_disabled: bool,
-    /// `-mprfchw` or a PRFCHW-implying `-march=` (see
-    /// `x86_march_implies_prfchw`): `prefetchw` is available. Arch-implied
-    /// like every `enable_*` bit; the explicit flags are replayed.
+    /// `-mprfchw` or a PRFCHW `-march=` CPU: `prefetchw` is available.
+    /// Arch-implied like every `enable_*` bit; the explicit flags are
+    /// replayed.
     pub(super) enable_prfchw: bool,
     /// Sticky `-mno-prfchw` (GCC: wins over a later PRFCHW `-march=`).
     pub(super) prfchw_explicitly_disabled: bool,
+    /// GCC's ABM (`-mabm` or an ABM `-march=` CPU, `__ABM__`): POPCNT, and
+    /// LZCNT unless an LZCNT flag decided it ([`Driver::resolved_lzcnt`]).
+    pub(super) enable_abm: bool,
+    /// `-mno-abm` was the last ABM decision: a `-march=` CPU then withholds
+    /// what it has only through ABM
+    /// ([`crate::backend::x86::arch_table::X86ArchRow::abm_derived`]).
+    pub(super) abm_explicitly_disabled: bool,
+    /// Sticky `-mno-mmx`: no `__MMX__` (GCC 16.2; the MMX intrinsics stay,
+    /// lccc emulates them without the MMX registers).
+    pub(super) mmx_explicitly_disabled: bool,
 
     /// Explicit `-msse` (and, as its weaker spelling, `-msse2`). On x86-64
     /// SSE is baseline and only `no_sse` matters; on i686 the default
@@ -297,6 +307,10 @@ pub struct Driver {
     /// profile it selects); explicit `-msse`/`-msse2` still override the
     /// veto at resolve time.
     pub(super) march_pre_sse: bool,
+    /// The pre-SSE2 `-march=` CPU has MMX (Pentium MMX/II/III, K6, WinChip,
+    /// the Athlons): GCC 16.2 keeps `__MMX__` there, `-mno-sse` included.
+    /// Meaningful only with `march_pre_sse`; set with it per `-march=`.
+    pub(super) march_pre_sse_mmx: bool,
     /// Set by `-mno-movbe`: MOVBE forbidden.
     pub(super) movbe_explicitly_disabled: bool,
     /// Set by `-mno-cx16`: CMPXCHG16B forbidden.
@@ -666,9 +680,13 @@ impl Driver {
             popcnt_explicitly_disabled: false,
             enable_prfchw: false,
             prfchw_explicitly_disabled: false,
+            enable_abm: false,
+            abm_explicitly_disabled: false,
+            mmx_explicitly_disabled: false,
             enable_sse: false,
             enable_sse2: false,
             march_pre_sse: false,
+            march_pre_sse_mmx: false,
             movbe_explicitly_disabled: false,
             cx16_explicitly_disabled: false,
             x86_explicit_isa_args: Vec::new(),
@@ -870,6 +888,7 @@ impl Driver {
         // to use.  (`__builtin_cpu_supports` is a *runtime* CPUID question
         // and deliberately does NOT consult this set — see `cpu_probe`.)
         crate::common::x86_features::set_effective(self.effective_x86_features());
+        crate::common::x86_features::set_explicit(self.x86_explicit_feature_bits());
         // GCC's BIGGEST_ALIGNMENT, the cap C11 `_Alignof` applies to
         // non-user-aligned types (`min_align_of_type`): 16 on x86, 32 under
         // TARGET_AVX, 64 under TARGET_AVX512F. It follows the *requested*
@@ -1762,24 +1781,14 @@ impl Driver {
         // there too; an explicit pre-SSE `-march=` drops SSE/SSE2 AND __MMX__
         // (measured on GCC 16.2 / Clang 23.1.3: `-m32 -march=i686` defines
         // none of the three — but `-m32 -march=i686 -msse` revives ALL of
-        // them, so MMX follows `!march_pre_sse || sse_on`, not the arch
-        // alone), while `-mno-sse2` drops only the SSE2 pair and `-mno-sse`
+        // them, so MMX follows the arch's MMX or an SSE grant; see
+        // `resolved_i686_mmx`), while `-mno-sse2` drops only the SSE2 pair and `-mno-sse`
         // drops SSE (MMX stays — measured on both oracles).
         // Projects like stb_image, minimp3, dr_libs use #ifdef __SSE2__ to
         // enable SIMD paths.
         let (sse_on, sse2_on, mmx_on) = if self.target == Target::I686 {
             let sse = self.resolved_i686_sse();
-            (
-                sse,
-                self.resolved_i686_sse2(),
-                // MMX follows the arch unless a full register-file denial is
-                // active: `-m32 -mgeneral-regs-only` defines none of
-                // __SSE__/__SSE2__/__MMX__ (measured), unlike `-mno-sse`,
-                // which keeps __MMX__ (both oracles). x86-64 keeps __MMX__
-                // under `-mgeneral-regs-only` — the i386 asymmetry is
-                // GCC's own (measured on 16.2).
-                (!self.march_pre_sse || sse) && !self.general_regs_only,
-            )
+            (sse, self.resolved_i686_sse2(), self.resolved_i686_mmx())
         } else {
             // x86-64: the SSE pair and MMX ride the x86-64 baseline, and the
             // order-sensitive raw denial bits already carry the exact GCC
@@ -1794,7 +1803,9 @@ impl Driver {
             (
                 self.target == Target::X86_64 && !self.no_sse,
                 self.target == Target::X86_64 && !self.no_sse2,
-                self.target == Target::X86_64 && !self.general_regs_only,
+                self.target == Target::X86_64
+                    && !self.general_regs_only
+                    && !self.mmx_explicitly_disabled,
             )
         };
         preprocessor.set_sse_macros(sse_on, sse2_on, mmx_on);
@@ -1812,7 +1823,8 @@ impl Driver {
         // made the preprocessor lie about the codegen contract (an
         // #ifdef __BMI__ fallback path would disagree with the emitted
         // `andnq`).
-        // GFNI/MOVRS/AMX/CMPCCXADD retain their measured SSE-only forms;
+        // GFNI keeps the SSE-only gate (its intrinsics need SSE2, see the
+        // AES note in `docs/x86-isa-permissions-and-simd-abi.md` §1.6);
         // SSE3+ and the AVX-dependent families require the second predicate.
         let xmm_macros_enabled = !self.no_sse;
         let simd_macros_enabled = xmm_macros_enabled && !self.no_sse2;
@@ -1833,11 +1845,15 @@ impl Driver {
             // friends must exactly mirror what the backend may emit,
             // or an #ifdef-guarded intrinsic path could disagree with
             // the scalar codegen contract.
-            self.resolved_bmi1(),
+            // `__BMI__` and `__MOVBE__` announce the CPU on i686 too, as
+            // GCC's do (`-m32 -march=haswell`): lccc's BMI1 intrinsics are
+            // plain C and none keys on `__MOVBE__`, so every path the
+            // macros select compiles there.
+            self.resolved_codegen_bmi1(),
             self.resolved_builtin_bmi2(),
             self.resolved_lzcnt(),
             self.resolved_popcnt(),
-            self.resolved_movbe(),
+            self.resolved_isa_movbe(),
             self.enable_rdrnd,
             simd_macros_enabled && self.enable_avx512f,
             simd_macros_enabled && self.enable_avx512cd,
@@ -1869,17 +1885,26 @@ impl Driver {
             simd_macros_enabled && self.enable_sha512,
             simd_macros_enabled && self.enable_sm3,
             simd_macros_enabled && self.enable_sm4,
-            xmm_macros_enabled && self.enable_movrs,
-            xmm_macros_enabled && self.enable_amx_tile,
-            xmm_macros_enabled && self.enable_amx_int8,
-            xmm_macros_enabled && self.enable_amx_bf16,
-            xmm_macros_enabled && self.enable_cmpccxadd,
+            // MOVRS, AMX and CMPCCXADD use no SSE register: GCC 16.2 keeps
+            // them under `-mno-sse` and `-mgeneral-regs-only` (measured on
+            // `-march=sapphirerapids`/`clearwaterforest`).
+            self.enable_movrs,
+            self.enable_amx_tile,
+            self.enable_amx_int8,
+            self.enable_amx_bf16,
+            self.enable_cmpccxadd,
             self.enable_apxf,
         );
+        for macro_name in self.x86_cpu_name_macros() {
+            preprocessor.define_macro(macro_name, "1");
+        }
         // `__PRFCHW__` mirrors the codegen permission exactly (GCC defines
         // it for `-mprfchw` and every PRFCHW `-march=`, independent of SSE).
         if self.resolved_prfchw() {
             preprocessor.define_macro("__PRFCHW__", "1");
+        }
+        if self.resolved_abm() {
+            preprocessor.define_macro("__ABM__", "1");
         }
         // Define _REENTRANT when -pthread is used.
         // GCC and Clang automatically define _REENTRANT=1 when -pthread is passed.
@@ -3019,6 +3044,8 @@ impl Driver {
                 for block in &mut func.blocks {
                     block.label = label_map[&block.label];
                 }
+                func.terminator_spans
+                    .remap(|label| label_map.get(&label).copied());
 
                 // Renumber label references held INSIDE instructions.
                 //
@@ -3292,9 +3319,12 @@ impl Driver {
         module
     }
 
-    /// Enforce target-feature and debug-info contracts on the final emitted text.
-    /// Keeping this validation separate leaves assembly emission and timing
-    /// readable, while every emitter still passes through one choke point.
+    /// Enforce the final-text contracts on the emitted assembly: the ISA the
+    /// target grants (`-march=`/`-m` flags, each function's own
+    /// `target("...")`) and debug-info honesty. Every emitter (codegen,
+    /// MachInst, peephole) has run, so this one choke point sees each
+    /// instruction the object will contain; a refused instruction names its
+    /// function instead of emitting code that would #UD.
     fn validate_target_assembly(
         &self,
         module: &crate::ir::module::IrModule,
@@ -3333,12 +3363,14 @@ impl Driver {
                 .functions
                 .iter()
                 .filter(|f| {
-                    let has = |name: &str| f.target_features.iter().any(|feature| feature == name);
-                    !has("no-sse")
-                        && !has("no-sse2")
-                        && ["sse2", "sse3", "ssse3", "sse4.1", "sse4.2", "avx", "avx2"]
-                            .iter()
-                            .any(|feature| has(feature))
+                    !f.target_features.is_empty()
+                        && crate::backend::x86::isa::function_feature_bits(
+                            self.effective_x86_features().raw(),
+                            self.x86_explicit_feature_bits(),
+                            &f.target_features,
+                            true,
+                        ) & (1 << crate::common::x86_features::X86Feature::Sse2 as u8)
+                            != 0
                 })
                 .map(|f| f.name.as_str())
                 .collect();
@@ -3361,7 +3393,13 @@ impl Driver {
         // refuses such functions ("SSE register return with SSE disabled",
         // "x87 register return with x87 disabled").
         if matches!(self.target, Target::X86_64 | Target::I686) {
-            if let Some((func, line, unit, attr)) = first_target_attribute_leak(module, asm) {
+            if let Some((func, line, unit, attr)) = first_target_attribute_leak(
+                module,
+                asm,
+                self.target == Target::I686,
+                self.effective_x86_features().raw(),
+                self.x86_explicit_feature_bits(),
+            ) {
                 return Err(format!(
                     "{input_file}: in function '{func}': {unit} is disabled by \
                      __attribute__((target(\"{attr}\"))) and lccc has no lowering of this \
@@ -3384,13 +3422,27 @@ impl Driver {
             // function only (GCC accepts `target("sse2")` under `-mno-sse2`);
             // its neighbours stay checked, and denials remain the job of
             // first_target_attribute_leak above.
-            let grants: std::collections::HashMap<&str, [bool; 3]> = module
+            let grants: std::collections::HashMap<&str, u64> = module
                 .functions
                 .iter()
                 .filter(|f| !f.target_features.is_empty())
-                .map(|f| (f.name.as_str(), i686_target_sse_grants(&f.target_features)))
+                .map(|f| {
+                    let bits = crate::backend::x86::isa::function_feature_bits(
+                        self.effective_x86_features().raw(),
+                        self.x86_explicit_feature_bits(),
+                        &f.target_features,
+                        false,
+                    );
+                    (f.name.as_str(), bits)
+                })
                 .collect();
-            let granted = |func: &str, level: usize| grants.get(func).is_some_and(|g| g[level]);
+            let granted = |func: &str, level: usize| {
+                use crate::common::x86_features::X86Feature as F;
+                let feature = [F::Sse, F::Sse2, F::Sse3][level];
+                grants
+                    .get(func)
+                    .is_some_and(|bits| bits & (1 << feature as u8) != 0)
+            };
             let leak = (!self.resolved_i686_sse())
                 .then(|| first_xmm_reference_if(asm, |func, _| !granted(func, 0)))
                 .flatten()
@@ -3484,6 +3536,9 @@ impl Driver {
         time_phases: bool,
         t0: std::time::Instant,
     ) -> Result<String, String> {
+        if let Some(diagnostic) = unsettled_x86_requirement(module) {
+            return Err(format!("{input_file}: {diagnostic}"));
+        }
         // Generate assembly using target-specific codegen
         let t8 = std::time::Instant::now();
         let opts = crate::backend::CodegenOptions {
@@ -3727,11 +3782,17 @@ impl Driver {
         if self.lzcnt_explicitly_disabled {
             return false;
         }
+        // GCC: ABM brings LZCNT unless an LZCNT option decided it; a
+        // denial returned above, and `-mlzcnt` sets `enable_lzcnt`.
         match self.target {
-            Target::X86_64 => self.enable_lzcnt,
-            Target::I686 => self.enable_lzcnt,
+            Target::X86_64 | Target::I686 => self.enable_lzcnt || self.enable_abm,
             _ => false,
         }
+    }
+
+    /// GCC's ABM state (`__ABM__`), on x86-64 and i686.
+    pub(super) fn resolved_abm(&self) -> bool {
+        matches!(self.target, Target::X86_64 | Target::I686) && self.enable_abm
     }
 
     /// Soundness: the instruction IS the builtin's semantics — the choice
@@ -3795,6 +3856,60 @@ impl Driver {
                 || self.enable_avx2
                 || self.enable_avx512f
                 || !self.march_pre_sse)
+    }
+
+    /// GCC's CPU-name macros, as measured per CPU in `arch_table.rs`:
+    /// `__haswell`, `__haswell__`, `__core_avx2__`, ... for the `-march=`
+    /// CPU (`x86-64` by default: `__k8`), `__tune_haswell__`, ... for the
+    /// `-mtune=` CPU, or without one for the `-march=` CPU unless it is an
+    /// `x86-64*` level (generic tuning). `gen_x86_arch_table.py --check`
+    /// verifies both defaults against GCC for every CPU. The
+    /// `__athlon_sse__`-style companions need SSE, as in GCC. `native`,
+    /// `generic` and names invalid for the target define nothing.
+    pub(crate) fn x86_cpu_name_macros(&self) -> Vec<&'static str> {
+        use crate::backend::x86::isa::X86Isa;
+        if !matches!(self.target, Target::X86_64 | Target::I686) {
+            return Vec::new();
+        }
+        let i686 = self.target == Target::I686;
+        let sse = if i686 {
+            self.resolved_i686_sse()
+        } else {
+            !self.no_sse
+        };
+        let arch = X86Isa::arch_row(self.x86_march.as_deref().unwrap_or("x86-64"));
+        let tune = match self.x86_tune.as_deref() {
+            Some(tune) => X86Isa::arch_row(tune),
+            None => self
+                .x86_march
+                .as_deref()
+                .filter(|arch| !arch.starts_with("x86-64"))
+                .and_then(X86Isa::arch_row),
+        };
+        let arch = arch
+            .filter(|row| row.x86_64 || i686)
+            .map_or(&[][..], |row| row.arch_macros);
+        let tune = tune
+            .filter(|row| row.x86_64 || i686)
+            .map_or(&[][..], |row| row.tune_macros);
+        arch.iter()
+            .chain(tune)
+            .copied()
+            .filter(|name| sse || !name.ends_with("_sse__"))
+            .collect()
+    }
+
+    /// Whether this i686 invocation defines `__MMX__`. MMX follows the arch
+    /// (any SSE CPU, or a pre-SSE CPU with MMX) or an SSE grant, unless a
+    /// full register-file denial is active: `-m32 -mgeneral-regs-only`
+    /// defines none of __SSE__/__SSE2__/__MMX__ (measured), unlike
+    /// `-mno-sse`, which keeps __MMX__ (both oracles). x86-64 keeps __MMX__
+    /// under `-mgeneral-regs-only`; the i386 asymmetry is GCC's own
+    /// (measured on 16.2).
+    pub(crate) fn resolved_i686_mmx(&self) -> bool {
+        (!self.march_pre_sse || self.march_pre_sse_mmx || self.resolved_i686_sse())
+            && !self.general_regs_only
+            && !self.mmx_explicitly_disabled
     }
 
     /// Whether this i686 invocation enables the SSE2 level (above the SSE
@@ -3893,6 +4008,17 @@ impl Driver {
 
     pub(super) fn resolved_movbe(&self) -> bool {
         self.target == Target::X86_64 && !self.movbe_explicitly_disabled && self.enable_movbe
+    }
+
+    /// MOVBE on the target CPU, x86-64 or i686: GCC's `__MOVBE__` and the
+    /// compile-time feature set. Code generation reads `resolved_movbe`
+    /// (the i686 backend selects no MOVBE), and no lccc header keys an
+    /// intrinsic on the macro, so announcing it on i686 promises nothing
+    /// the compiler cannot compile.
+    pub(super) fn resolved_isa_movbe(&self) -> bool {
+        matches!(self.target, Target::X86_64 | Target::I686)
+            && !self.movbe_explicitly_disabled
+            && self.enable_movbe
     }
 
     /// Effective x86 feature set — the compile-time guarantees this invocation
@@ -4059,8 +4185,11 @@ impl Driver {
         // '-mavxvnniint8'`), and its headers declare none of those intrinsics.
         // Those rows are therefore pinned by lccc's own flag contract, and the
         // gate says so instead of pretending to compare.
-        let avx512_vnni = self.enable_avx512vnni && self.enable_avx512vl;
-        set.insert_if(isa.ymm && (self.enable_avxvnni || avx512_vnni), F::AvxVnni);
+        //
+        // `F::AvxVnni` is the CPUID AVX-VNNI bit (VEX), exactly GCC's
+        // `__AVXVNNI__`; AVX512-VNNI+VL reaches the same intrinsics through
+        // EVEX: AVX512-VNNI with AVX512-VL (`isa::function_evex_vnni_permitted`).
+        set.insert_if(isa.ymm && self.enable_avxvnni, F::AvxVnni);
         set.insert_if(isa.ymm && self.enable_avxvnniint8, F::AvxVnniInt8);
         set.insert_if(isa.ymm && self.enable_avxvnniint16, F::AvxVnniInt16);
 
@@ -4108,10 +4237,10 @@ impl Driver {
         // Integer ISA: the resolved predicates already encode the default
         // grant, the `-march` ceiling and the sticky denials — the same
         // predicates `__BMI__`/`__BMI2__`/`__LZCNT__`/`__MOVBE__` use.
-        set.insert_if(self.resolved_bmi1(), F::Bmi);
+        set.insert_if(self.resolved_codegen_bmi1(), F::Bmi);
         set.insert_if(self.resolved_builtin_bmi2(), F::Bmi2);
         set.insert_if(self.resolved_lzcnt(), F::Lzcnt);
-        set.insert_if(self.resolved_movbe(), F::Movbe);
+        set.insert_if(self.resolved_isa_movbe(), F::Movbe);
         // RDRAND has no resolved predicate and no explicit-denial bit; the
         // request flag is the only signal, so it is used as-is (an
         // unrequested feature folds to 0, the safe direction).
@@ -4317,51 +4446,114 @@ mod arm_simd_reference_tests {
 }
 
 /// The first compiler-generated instruction a function's own
-/// `target("...")` attribute forbids, as `(function, line, unit, entry)`:
-/// `general-regs-only` / `no-sse` deny every XMM/YMM/ZMM form, `no-sse2` the
-/// SSE2 vocabulary (SSE1 stays legal: GCC 16.2 keeps `mulss` there), and
-/// `general-regs-only` / `no-80387` every x87 form. A denial wins over a grant
-/// in the same attribute, as in `X86Isa::with_target_features`, so the fence
-/// and codegen read the attribute alike. Functions absent from the final
-/// text are skipped.
+/// `target("...")` attribute forbids, as `(function, line, unit, entry)`,
+/// where `entry` is the option that removed the unit: the SSE register
+/// class (`general-regs-only`, `no-sse`, an `arch=` CPU without SSE), the
+/// SSE2 vocabulary (SSE1 stays legal: GCC 16.2 keeps `mulss` under
+/// `no-sse2`), on i686 SSE3, and the x87 stack (`general-regs-only`,
+/// `no-80387`). The SSE levels are the function's features in GCC's
+/// semantics (`isa::function_feature_bits`, from the TU's `tu` and
+/// `tu_explicit`), the ones codegen reads, so a later grant
+/// (`no-sse2,aes`) lifts a denial here as it does there. A unit the TU
+/// already lacks is the TU-level scan's to report. Functions absent from
+/// the final text are skipped.
+/// The diagnostic for the first body that still holds an x86 requirement
+/// an `always_inline` function deferred to its callers
+/// ([`crate::ir::module::X86IsaNeeds`]). Inlining settles every requirement
+/// its caller grants, so one that survives would be emitted where its
+/// intrinsic is illegal; GCC refuses the same source ("inlining failed in
+/// call to 'always_inline': target specific option mismatch"). What
+/// survives is exactly what the function lacks, so all of it is named.
+fn unsettled_x86_requirement(module: &crate::ir::module::IrModule) -> Option<String> {
+    use crate::common::x86_features::X86Feature;
+    let unsettled = module
+        .functions
+        .iter()
+        .find(|f| !f.is_declaration && f.x86_isa_needs.deferred != 0)?;
+    let calls_it = |f: &&crate::ir::module::IrFunction| {
+        f.blocks.iter().flat_map(|b| &b.instructions).any(|inst| {
+            matches!(inst, crate::ir::instruction::Instruction::Call { func, .. }
+                if *func == unsettled.name)
+        })
+    };
+    let site = module
+        .functions
+        .iter()
+        .filter(|f| f.name != unsettled.name)
+        .find(calls_it)
+        .unwrap_or(unsettled);
+    let needs = &unsettled.x86_isa_needs;
+    let missing: Vec<X86Feature> = X86Feature::ALL
+        .into_iter()
+        .filter(|&f| needs.deferred & 1 << f as u8 != 0)
+        .collect();
+    let names: Vec<&str> = missing.iter().map(|f| f.name()).collect();
+    let flags: Vec<String> = names.iter().map(|n| format!("-m{n}")).collect();
+    Some(format!(
+        "in function '{}': `{}` requires {} ({}), which the requested target does not \
+         have; inlining failed in call to 'always_inline' '{}': target specific option \
+         mismatch",
+        site.name,
+        needs.first_use.as_deref().unwrap_or(&unsettled.name),
+        names.join(", "),
+        flags.join(" "),
+        unsettled.name,
+    ))
+}
+
 fn first_target_attribute_leak(
     module: &crate::ir::module::IrModule,
     asm: &str,
-) -> Option<(String, String, &'static str, &'static str)> {
+    i686: bool,
+    tu: u64,
+    tu_explicit: u64,
+) -> Option<(String, String, &'static str, String)> {
+    use crate::common::x86_features::X86Feature as F;
     type Scan = fn(&str) -> Option<(String, String)>;
-    const RULES: [(&[&str], &str, Scan); 3] = [
-        (&["general-regs-only", "no-sse"], "SSE", first_sse_reference),
-        (&["no-sse2"], "SSE2", first_sse2_reference),
-        (
-            &["general-regs-only", "no-80387"],
-            "x87",
-            first_x87_reference,
-        ),
+    fn sse3(body: &str) -> Option<(String, String)> {
+        first_sse3_reference_unless(body, |_| false)
+    }
+    let levels: [(F, &'static str, Scan); 3] = [
+        (F::Sse, "SSE", first_sse_reference),
+        (F::Sse2, "SSE2", first_sse2_reference),
+        (F::Sse3, "SSE3", sse3),
     ];
     for func in module
         .functions
         .iter()
         .filter(|f| !f.is_declaration && !f.target_features.is_empty())
     {
-        let denial = |names: &[&'static str]| {
-            names
+        let features = &func.target_features;
+        let mut rules: Vec<(&'static str, String, Scan)> = Vec::new();
+        // The lowest removed level: its scan covers the levels above it.
+        // x86-64 has no SSE3 class of its own (codegen reaches SSE3 only
+        // through SSE4.1, which the vector permission already follows).
+        if let Some((entry, unit, scan)) =
+            levels
                 .iter()
-                .copied()
-                .find(|n| func.target_features.iter().any(|f| f == n))
-        };
-        let mut text = None;
-        let mut sse_denied = false;
-        for (names, unit, scan) in RULES {
-            let Some(entry) = denial(names) else {
-                continue;
-            };
-            // SSE2 is a subset of SSE: a full SSE denial already covers it.
-            if unit == "SSE2" && sse_denied {
-                continue;
-            }
-            sse_denied |= unit == "SSE";
-            let body = text.get_or_insert_with(|| function_text(asm, &func.name));
-            if let Some((name, line)) = scan(body) {
+                .take(if i686 { 3 } else { 2 })
+                .find_map(|&(feature, unit, scan)| {
+                    crate::backend::x86::isa::target_option_denying(
+                        tu,
+                        tu_explicit,
+                        features,
+                        !i686,
+                        feature,
+                    )
+                    .map(|entry| (entry, unit, scan))
+                })
+        {
+            rules.push((unit, entry.to_string(), scan));
+        }
+        if let Some(entry) = crate::backend::x86::isa::function_x87_denial(features) {
+            rules.push(("x87", entry.clone(), first_x87_reference));
+        }
+        if rules.is_empty() {
+            continue;
+        }
+        let body = function_text(asm, &func.name);
+        for (unit, entry, scan) in rules {
+            if let Some((name, line)) = scan(&body) {
                 return Some((name, line, unit, entry));
             }
         }
@@ -4522,50 +4714,6 @@ fn first_sse3_reference_unless(
     })
 }
 
-/// `[SSE, SSE2, SSE3]` that a function's own `target()` attribute grants on
-/// i686, on top of the translation unit's resolved floor. Grants imply the
-/// levels below them; `no-sse*` / `general-regs-only` win over grants (the
-/// feature list is sorted, so source order is gone; this matches
-/// `X86Isa::with_target_features`). `arch=` grants only for CPUs
-/// `X86Isa::arch_level` models: its fallback for unknown names is the
-/// x86-64 baseline, a superset of i386/pentium, so such names grant
-/// nothing and the TU floor stays in force. Unmodelled features grant
-/// nothing (fail closed).
-fn i686_target_sse_grants(features: &[String]) -> [bool; 3] {
-    let has = |name: &str| features.iter().any(|f| f == name);
-    if has("no-sse") || has("general-regs-only") {
-        return [false; 3];
-    }
-    let mut grant = [false; 3];
-    if let Some(arch) = features
-        .iter()
-        .filter_map(|f| f.strip_prefix("arch="))
-        .next_back()
-    {
-        let isa = crate::backend::x86::isa::X86Isa::arch_level(arch);
-        if arch == "x86-64" || isa.sse41 {
-            grant = [true, true, isa.sse41];
-        }
-    }
-    for feature in features {
-        match feature.as_str() {
-            "sse" => grant[0] = true,
-            "sse2" => grant[..2].fill(true),
-            "sse3" | "ssse3" | "sse4" | "sse4.1" | "sse4.2" | "avx" | "avx2" | "avx512f"
-            | "avx512bw" | "avx512dq" | "avx512vl" | "fma" => grant = [true; 3],
-            _ => {}
-        }
-    }
-    if has("no-sse2") {
-        grant[1] = false;
-        grant[2] = false;
-    }
-    if has("no-sse3") {
-        grant[2] = false;
-    }
-    grant
-}
-
 /// Any x87 instruction. Every x87 mnemonic (SDM Vol. 2, AT&T suffixes
 /// included) begins with `f`; the only other x86 mnemonics that do are the
 /// FXSAVE/FXRSTOR state images and 3DNow!'s FEMMS, which compute nothing.
@@ -4721,7 +4869,9 @@ mod sse_reference_tests {
             f.target_features = features.iter().map(|s| (*s).to_string()).collect();
             let mut module = IrModule::new();
             module.functions = vec![f];
-            first_target_attribute_leak(&module, asm)
+            let tu = crate::backend::x86::isa::X86Isa::arch_row("x86-64")
+                .map_or(0, |row| row.feature_bits());
+            first_target_attribute_leak(&module, asm, false, tu, 0)
                 .map(|(func, line, unit, entry)| (func, line.trim().to_string(), unit, entry))
         };
         assert_eq!(
@@ -4730,7 +4880,7 @@ mod sse_reference_tests {
                 "flt".into(),
                 "mulss %xmm1, %xmm0".into(),
                 "SSE",
-                "general-regs-only"
+                "general-regs-only".into()
             ))
         );
         assert_eq!(check("flt", &["no-sse"]).map(|h| h.2), Some("SSE"));
@@ -4738,13 +4888,20 @@ mod sse_reference_tests {
         assert_eq!(check("flt", &["no-sse2"]), None);
         assert_eq!(
             check("dbl", &["no-sse2"]).map(|h| (h.2, h.3)),
-            Some(("SSE2", "no-sse2"))
+            Some(("SSE2", "no-sse2".into()))
         );
-        // A denial wins over a grant in the same attribute.
+        // The options apply in order, as in codegen and GCC: a later denial
+        // wins, and a later grant lifts it (`aes` brings SSE2 back).
         assert_eq!(check("dbl", &["avx2", "no-sse"]).map(|h| h.2), Some("SSE"));
+        assert_eq!(check("dbl", &["no-sse2", "aes"]), None);
+        assert_eq!(check("dbl", &["no-sse", "sse2"]), None);
+        assert_eq!(
+            check("ld", &["general-regs-only", "80387"]).map(|h| h.2),
+            None
+        );
         assert_eq!(
             check("ld", &["no-80387"]).map(|h| (h.2, h.3)),
-            Some(("x87", "no-80387"))
+            Some(("x87", "no-80387".into()))
         );
         assert_eq!(
             check("ld", &["general-regs-only"]).map(|h| h.2),
@@ -4757,6 +4914,49 @@ mod sse_reference_tests {
         assert_eq!(check("user", &["general-regs-only"]), None);
         assert_eq!(check("gone", &["general-regs-only"]), None);
         assert_eq!(check("flt", &["avx2"]), None);
+    }
+
+    /// On i686 a function's own `arch=` is its SSE ceiling (GCC discards
+    /// the TU's ISA flags for it), and `no-sse3` is enforced like the
+    /// other denials.
+    #[test]
+    fn i686_target_attribute_arch_sets_the_function_ceiling() {
+        use super::first_target_attribute_leak;
+        use crate::common::types::IrType;
+        use crate::ir::module::{IrFunction, IrModule};
+        let asm = concat!(
+            ".type flt, @function\nflt:\n    mulss %xmm1, %xmm0\n    ret\n",
+            ".type dbl, @function\ndbl:\n    mulsd %xmm1, %xmm0\n    ret\n",
+            ".type cvt, @function\ncvt:\n    fisttpl (%esp)\n    ret\n",
+        );
+        let check = |name: &str, features: &str| {
+            let mut f = IrFunction::new(name.into(), IrType::I32, vec![], false);
+            f.target_features = crate::ir::module::normalize_target_features(features);
+            let mut module = IrModule::new();
+            module.functions = vec![f];
+            // A TU with SSE3 (`-march=prescott`), so every level can be denied;
+            // what the TU lacks is the TU-level scan's to report.
+            let tu = crate::backend::x86::isa::X86Isa::arch_row("prescott")
+                .map_or(0, |row| row.feature_bits());
+            first_target_attribute_leak(&module, asm, true, tu, 0).map(|hit| (hit.2, hit.3))
+        };
+        assert_eq!(check("flt", "arch=i686"), Some(("SSE", "arch=i686".into())));
+        assert_eq!(check("flt", "arch=pentium3"), None);
+        assert_eq!(
+            check("dbl", "arch=pentium3"),
+            Some(("SSE2", "arch=pentium3".into()))
+        );
+        assert_eq!(check("dbl", "arch=pentium4"), None);
+        assert_eq!(
+            check("cvt", "arch=pentium4"),
+            Some(("SSE3", "arch=pentium4".into()))
+        );
+        assert_eq!(check("cvt", "arch=prescott"), None);
+        // Grants after `arch=` raise the ceiling; ones before it are gone.
+        assert_eq!(check("dbl", "arch=i686,sse2"), None);
+        assert_eq!(check("dbl", "sse2,arch=i686").map(|h| h.0), Some("SSE"));
+        assert_eq!(check("cvt", "no-sse3"), Some(("SSE3", "no-sse3".into())));
+        assert_eq!(check("cvt", "sse2"), None);
     }
 
     #[test]
@@ -4961,38 +5161,46 @@ mod scoped_sse2_fence_tests {
 
 #[cfg(test)]
 mod i686_target_grant_tests {
-    use super::{first_sse3_reference_unless, i686_target_sse_grants};
+    use super::first_sse3_reference_unless;
 
+    /// `[SSE, SSE2, SSE3]` of an i686 function with `target(features)` in a
+    /// TU without SSE (`-march=i386`).
     fn grants(features: &[&str]) -> [bool; 3] {
+        use crate::common::x86_features::X86Feature as F;
         let owned: Vec<String> = features.iter().map(|f| (*f).to_string()).collect();
-        i686_target_sse_grants(&owned)
+        let bits = crate::backend::x86::isa::function_feature_bits(0, 0, &owned, false);
+        [F::Sse, F::Sse2, F::Sse3].map(|f| bits & (1 << f as u8) != 0)
     }
 
+    /// GCC 16.2 `-m32 -march=i386`, `#pragma GCC target(...)`: grants imply
+    /// the levels below them and the options apply in order (measured).
     #[test]
-    fn grants_imply_lower_levels_and_denials_win() {
+    fn grants_imply_lower_levels_in_order() {
         assert_eq!(grants(&[]), [false; 3]);
         assert_eq!(grants(&["sse"]), [true, false, false]);
         assert_eq!(grants(&["sse2"]), [true, true, false]);
         assert_eq!(grants(&["ssse3"]), [true; 3]);
         assert_eq!(grants(&["avx2"]), [true; 3]);
-        assert_eq!(grants(&["no-sse3", "sse4.1"]), [true, true, false]);
-        assert_eq!(grants(&["no-sse2", "sse4.1"]), [true, false, false]);
+        assert_eq!(grants(&["no-sse3", "sse4.1"]), [true; 3]);
+        assert_eq!(grants(&["no-sse2", "sse4.1"]), [true; 3]);
         assert_eq!(grants(&["avx", "no-sse"]), [false; 3]);
-        assert_eq!(grants(&["general-regs-only", "sse2"]), [false; 3]);
-        // Unmodelled features grant nothing.
+        assert_eq!(grants(&["general-regs-only", "sse2"]), [true, true, false]);
+        assert_eq!(grants(&["sse2", "general-regs-only"]), [false; 3]);
+        // Integer extensions grant no SSE.
         assert_eq!(grants(&["popcnt", "bmi2"]), [false; 3]);
     }
 
     #[test]
-    fn arch_grants_only_for_modelled_cpus() {
+    fn arch_grants_the_cpus_levels() {
         assert_eq!(grants(&["arch=x86-64"]), [true, true, false]);
         assert_eq!(grants(&["arch=nehalem"]), [true; 3]);
         assert_eq!(grants(&["arch=haswell"]), [true; 3]);
-        // arch_level's fallback is the x86-64 baseline; on i686 that would
-        // invent SSE2 for a Pentium, so unknown names keep the TU floor.
         assert_eq!(grants(&["arch=pentium"]), [false; 3]);
         assert_eq!(grants(&["arch=i686"]), [false; 3]);
+        assert_eq!(grants(&["sse3", "arch=i686"]), [false; 3]);
         assert_eq!(grants(&["arch=haswell", "no-sse3"]), [true, true, false]);
+        // An unknown name (diagnosed at lowering) grants nothing on i686.
+        assert_eq!(grants(&["arch=bogus"]), [false; 3]);
     }
 
     #[test]

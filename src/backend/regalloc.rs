@@ -933,7 +933,13 @@ pub fn x86_inst_fixed_scratch(inst: &Instruction) -> X86FixedScratch {
             }
         }
         Instruction::Intrinsic { op, .. } => match op {
-            IntrinsicOp::Rdtscp => RDX_RDI,
+            // The portable PDEP/PEXT loop (a function without BMI2) keeps
+            // the result in %rdx and the current mask bit in %rdi.
+            IntrinsicOp::Rdtscp
+            | IntrinsicOp::Pdep32
+            | IntrinsicOp::Pdep64
+            | IntrinsicOp::Pext32
+            | IntrinsicOp::Pext64 => RDX_RDI,
             // GCC __builtin_apply family and __builtin_longjmp: the emitters
             // read/write the raw %rdx (DoBuiltinApply stages arg3 into it AND
             // performs a real `call *%r11` that the IR does not model as a

@@ -463,6 +463,11 @@ pub struct ElfWriterBase {
     /// Bytes of directive-generated fill materialized so far by this
     /// writer — bounded by [`MAX_TOTAL_DIRECTIVE_FILL`] (see there).
     fill_budget_used: usize,
+    /// `.file N "name"` records in directive order.
+    debug_files: Vec<(u32, String)>,
+    /// `.loc` rows as (label at the row's address, file, line, column): a
+    /// label, so subsection merging moves the row with its code.
+    debug_rows: Vec<(String, u32, u32, u32)>,
 }
 
 impl ElfWriterBase {
@@ -519,6 +524,8 @@ impl ElfWriterBase {
             code_align_floor: 0,
             text_align,
             fill_budget_used: 0,
+            debug_files: Vec::new(),
+            debug_rows: Vec::new(),
         }
     }
 
@@ -543,6 +550,168 @@ impl ElfWriterBase {
             );
             self.section_order.push(name.to_string());
         }
+    }
+
+    /// `.file N "name"`; a later one for the same `N` renames it.
+    pub fn debug_file(&mut self, number: u32, name: String) {
+        self.debug_files.push((number, name));
+    }
+
+    /// `.loc FILE LINE COLUMN`: a line row at the current location (in
+    /// `.text` before any section directive, as in GNU as).
+    pub fn debug_loc(&mut self, file: u32, line: u32, column: u32) {
+        self.ensure_text_section();
+        let label = format!(".Lloc\u{1}{}", self.debug_rows.len());
+        let at = (self.current_section.clone(), self.current_offset());
+        self.labels.insert(label.clone(), at);
+        self.debug_rows.push((label, file, line, column));
+    }
+
+    /// GNU as `dwarf2_finish`: the `.loc` rows become a DWARF v4
+    /// `.debug_line`, and an input without its own `.debug_info` gets compile
+    /// units for it (see `elf::dwarf`).  `abs32` and `abs_addr` are the
+    /// 32-bit and `address_size`-byte absolute relocations.  Under
+    /// [`Self::keep_code_labels`] (RISC-V linker relaxation) every code
+    /// address is relocated against a label at it, which the linker moves
+    /// when it deletes bytes.  Call after the last section change and before
+    /// [`Self::write_elf`].
+    pub fn finish_debug_sections(
+        &mut self,
+        address_size: usize,
+        abs32: u32,
+        abs_addr: u32,
+    ) -> Result<(), String> {
+        use super::dwarf::{
+            DwarfFunction, DwarfLineLocation, DwarfSectionInfo, build_dwarf_info_sections,
+            build_dwarf_line_section,
+        };
+        if self.debug_rows.is_empty() || self.sections.contains_key(".debug_line") {
+            return Ok(());
+        }
+        let index_of: FxHashMap<&str, usize> = self
+            .section_order
+            .iter()
+            .enumerate()
+            .map(|(i, name)| (name.as_str(), i))
+            .collect();
+        let section_info: Vec<DwarfSectionInfo<'_>> = self
+            .section_order
+            .iter()
+            .map(|name| {
+                let section = self.sections.get(name);
+                DwarfSectionInfo {
+                    name,
+                    size: section.map_or(0, ObjSection::size),
+                    is_executable: section.is_some_and(|s| s.sh_flags & SHF_EXECINSTR != 0),
+                }
+            })
+            .collect();
+        // The row labels answer `symbol_at` for their own addresses.
+        let mut at_labels: FxHashMap<(usize, u64), String> = FxHashMap::default();
+        let mut locations = Vec::with_capacity(self.debug_rows.len());
+        for (sequence, (label, file, line, column)) in (0u64..).zip(&self.debug_rows) {
+            let Some((section, offset)) = self.labels.get(label) else {
+                continue;
+            };
+            let Some(&section_index) = index_of.get(section.as_str()) else {
+                continue;
+            };
+            at_labels
+                .entry((section_index, *offset))
+                .or_insert_with(|| label.clone());
+            locations.push(DwarfLineLocation {
+                section_index,
+                offset: *offset,
+                file_number: *file,
+                line: *line,
+                column: *column,
+                sequence,
+            });
+        }
+        let functions: Vec<DwarfFunction<'_>> = self
+            .symbol_types
+            .iter()
+            .filter(|&(_, &sym_type)| sym_type == STT_FUNC || sym_type == STT_GNU_IFUNC)
+            .filter_map(|(name, _)| {
+                let (section, offset) = self.labels.get(name)?;
+                Some(DwarfFunction {
+                    name,
+                    section_index: *index_of.get(section.as_str())?,
+                    offset: *offset,
+                    size: self.symbol_sizes.get(name).copied().unwrap_or(0),
+                    external: self.global_symbols.contains_key(name)
+                        || self.weak_symbols.contains_key(name),
+                })
+            })
+            .collect();
+        let primary_file = self
+            .debug_files
+            .iter()
+            .find(|(number, _)| *number == 1)
+            .or_else(|| self.debug_files.first())
+            .map_or("", |(_, name)| name.as_str());
+        let comp_dir = std::env::current_dir()
+            .map(|dir| dir.to_string_lossy().into_owned())
+            .unwrap_or_default();
+
+        let first_new_label = at_labels.len();
+        let mut symbol_at = |section_index: usize, offset: u64| -> String {
+            let next = at_labels.len() - first_new_label;
+            at_labels
+                .entry((section_index, offset))
+                .or_insert_with(|| format!(".Lloc\u{1}end{next}"))
+                .clone()
+        };
+        let relax = self.keep_code_labels;
+        let mut labelled: Option<&mut dyn FnMut(usize, u64) -> String> =
+            if relax { Some(&mut symbol_at) } else { None };
+        let mut built = Vec::new();
+        if let Some((line, units)) = build_dwarf_line_section(
+            &self.debug_files,
+            &locations,
+            &section_info,
+            address_size,
+            abs_addr,
+            labelled.as_deref_mut(),
+        )? {
+            built.push(line);
+            if !self.sections.contains_key(".debug_info")
+                && !self.sections.contains_key(".debug_abbrev")
+            {
+                if let Some((info, abbrev)) = build_dwarf_info_sections(
+                    &units,
+                    &section_info,
+                    &functions,
+                    primary_file,
+                    &comp_dir,
+                    concat!("LCCC ", env!("CARGO_PKG_VERSION")),
+                    address_size,
+                    abs32,
+                    abs_addr,
+                    labelled,
+                )? {
+                    built.extend([info, abbrev]);
+                }
+            }
+        }
+        // Labels `symbol_at` made up (section ends, function ends).
+        let made: Vec<(String, (String, u64))> = if relax {
+            at_labels
+                .into_iter()
+                .filter(|(_, label)| label.starts_with(".Lloc\u{1}end"))
+                .map(|((section_index, offset), label)| {
+                    (label, (self.section_order[section_index].clone(), offset))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        self.labels.extend(made);
+        for section in built {
+            self.section_order.push(section.name.clone());
+            self.sections.insert(section.name.clone(), section);
+        }
+        Ok(())
     }
 
     /// Get the current write offset within the current section.

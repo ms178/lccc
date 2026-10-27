@@ -196,52 +196,6 @@ fn profile_path_arg(arg: &str, prefix: &str) -> Result<String, String> {
     }
 }
 
-/// Whether `-march=<march>` implies PRFCHW (`prefetchw`). The table is GCC's
-/// measured `__PRFCHW__` set for every x86 `-march=` this driver accepts
-/// (`gcc-16 -march=X -dM -E`; `knl`/`knm` from GCC 14, which still accepts
-/// them): Broadwell and later big cores, Silvermont and later Atoms, every
-/// Zen. Notably absent: Nehalem..Haswell and the `x86-64-v2/v3/v4` levels
-/// (the ISA levels do not include PRFCHW). `native` is probed separately.
-fn x86_march_implies_prfchw(march: &str) -> bool {
-    matches!(
-        march,
-        "silvermont"
-            | "goldmont"
-            | "broadwell"
-            | "skylake"
-            | "znver1"
-            | "znver2"
-            | "znver3"
-            | "znver4"
-            | "znver5"
-            | "alderlake"
-            | "raptorlake"
-            | "raptor-lake"
-            | "meteorlake"
-            | "gracemont"
-            | "alderlake-n"
-            | "arrowlake"
-            | "sierraforest"
-            | "grandridge"
-            | "arrowlake-s"
-            | "lunarlake"
-            | "wildcatlake"
-            | "clearwaterforest"
-            | "skylake-avx512"
-            | "cascadelake"
-            | "cooperlake"
-            | "icelake-client"
-            | "icelake-server"
-            | "tigerlake"
-            | "rocketlake"
-            | "sapphirerapids"
-            | "graniterapids"
-            | "graniterapids-d"
-            | "knl"
-            | "knm"
-    )
-}
-
 impl Driver {
     /// Parse the value of `-falign-*=N[:M]`: a power-of-two byte alignment
     /// with an optional max-skip (`.p2align` third operand). Returns `None`
@@ -293,6 +247,7 @@ impl Driver {
         // serves.
         self.enable_sse = false;
         self.enable_prfchw = false;
+        self.enable_abm = false;
         self.enable_sse3 = false;
         self.enable_ssse3 = false;
         self.enable_sse4_1 = false;
@@ -373,6 +328,33 @@ impl Driver {
             .rev()
             .find(|arg| arg.as_str() == enabled || arg.as_str() == disabled)
             .is_some_and(|arg| arg.as_str() == enabled)
+    }
+
+    /// GCC's explicit-ISA mask of the command line (`ix86_isa_flags_explicit`):
+    /// every feature an explicit ISA option sets or clears. GCC's driver
+    /// first drops each option a later spelling of the same option
+    /// overrides, so `-mavx512bmm -mno-avx512bmm` makes only AVX512BMM
+    /// explicit, while `-mpopcnt -mno-popcnt` still leaves POPCNT explicit
+    /// and blocks a `target("sse4.2")` from bringing it (gcc-16 `-E`,
+    /// measured). `-march=` makes nothing explicit.
+    pub(crate) fn x86_explicit_feature_bits(&self) -> u64 {
+        use crate::backend::x86::arch_table::x86_target_option;
+        let option = |arg: &str| {
+            let name = arg.strip_prefix("-m").unwrap_or(arg);
+            match name.strip_prefix("no-") {
+                Some(name) => (true, name.to_owned()),
+                None => (false, name.to_owned()),
+            }
+        };
+        let args = &self.x86_explicit_isa_args;
+        args.iter()
+            .enumerate()
+            .map(|(i, arg)| (option(arg), &args[i + 1..]))
+            .filter(|((_, name), later)| later.iter().all(|arg| option(arg).1 != *name))
+            .filter_map(|((negated, name), _)| {
+                x86_target_option(&name).map(|handler| handler.touched(negated))
+            })
+            .fold(0, |mask, touched| mask | touched)
     }
 
     /// The AVX-512 subsets and AVX-VNNI (AVX-512 / AVX10 feature flags;
@@ -521,36 +503,11 @@ impl Driver {
                 true
             }
             "-mno-avx512bmm" => {
+                // GCC's unset mask is AVX512BMM alone: the BW and F it
+                // brought stay (`-mavx512bw -mavx512bmm -mno-avx512bmm`
+                // keeps both), and `-mavx512bmm -mno-avx512bmm` cancels
+                // before either is applied.
                 self.enable_avx512bmm = false;
-                // BMM is enabled together with AVX512BW and AVX512F. GCC's
-                // option state drops those implied prerequisites when BMM
-                // was their only active source; retain them when another
-                // explicit subset or architecture grant still requires them.
-                let bw_needed = self.x86_isa_flag_was_enabled("-mavx512bw", "-mno-avx512bw")
-                    || self.enable_avx512vbmi
-                    || self.enable_avx512vbmi2
-                    || self.enable_avx512bitalg
-                    || self.enable_avx512bf16
-                    || self.enable_avx512fp16
-                    || self.enable_avx10_1
-                    || self.enable_avx10_2;
-                if !bw_needed {
-                    self.enable_avx512bw = false;
-                }
-                let f_needed = self.x86_isa_flag_was_enabled("-mavx512f", "-mno-avx512f")
-                    || self.enable_avx512bw
-                    || self.enable_avx512cd
-                    || self.enable_avx512dq
-                    || self.enable_avx512vl
-                    || self.enable_avx512ifma
-                    || self.enable_avx512vnni
-                    || self.enable_avx512vpopcntdq
-                    || self.enable_avx512er
-                    || self.enable_avx512pf
-                    || self.enable_avx512vp2intersect;
-                if !f_needed {
-                    self.enable_avx512f = false;
-                }
                 true
             }
             _ => false,
@@ -576,9 +533,72 @@ impl Driver {
     /// ...) return `false` and stay with the main match: they have no
     /// arch-set interaction.
     fn apply_x86_isa_mflag(&mut self, arg: &str) -> bool {
-        if self.grant_avx512_family(arg)
+        if !self.apply_x86_isa_mflag_arm(arg) {
+            return false;
+        }
+        self.apply_x86_option_mask(arg);
+        // An extension's option enables the extensions it requires
+        // (`-mamx-int8` defines `__AMX_TILE__`).
+        if let Some(extra) = arg.strip_prefix("-m").and_then(|name| {
+            crate::backend::x86::arch_table::X86ExtraFeature::ALL
+                .into_iter()
+                .find(|extra| extra.option() == name)
+        }) {
+            self.set_x86_extras(extra.requires_extras());
+        }
+        self.drop_x86_extras_without_requirements();
+        true
+    }
+
+    /// The flag's own bookkeeping: the sticky denials the resolved
+    /// predicates read, the SSE register-class state and the extensions
+    /// outside GCC's option masks. What the flag implies for the other
+    /// features is [`Self::apply_x86_option_mask`]'s.
+    /// The `-m`/`-mno-` flags that set exactly one ISA bit and imply
+    /// nothing else. Returns `false` for flags outside this set.
+    fn apply_x86_isa_toggle(&mut self, arg: &str) -> bool {
+        match arg {
+            "-mrdrnd" => self.enable_rdrnd = true,
+            "-mgfni" => self.enable_gfni = true,
+            "-mmovrs" => self.enable_movrs = true,
+            "-musermsr" => self.enable_user_msr = true,
+            // APX Foundation: extra GPRs r16–r31, NDD 3-operand ALU.
+            // Off by default — emitting it on a non-APX host (Raptor Lake,
+            // i7-14700KF, …) is #UD. `-march=raptorlake` must never imply this.
+            "-mapx" | "-mapxf" => self.enable_apxf = true,
+            "-mno-apx" | "-mno-apxf" => self.enable_apxf = false,
+            "-mamx-tile" => self.enable_amx_tile = true,
+            "-mamx-int8" => self.enable_amx_int8 = true,
+            "-mamx-bf16" => self.enable_amx_bf16 = true,
+            "-mcmpccxadd" => self.enable_cmpccxadd = true,
+            "-mno-avxvnni" => self.enable_avxvnni = false,
+            "-mno-avxvnniint8" => self.enable_avxvnniint8 = false,
+            "-mno-avxvnniint16" => self.enable_avxvnniint16 = false,
+            "-mno-avxifma" => self.enable_avxifma = false,
+            "-mno-avxneconvert" => self.enable_avxneconvert = false,
+            "-mno-sha512" => self.enable_sha512 = false,
+            "-mno-sm3" => self.enable_sm3 = false,
+            "-mno-sm4" => self.enable_sm4 = false,
+            "-mno-movrs" => self.enable_movrs = false,
+            "-mno-usermsr" => self.enable_user_msr = false,
+            "-mno-amx-tile" => self.enable_amx_tile = false,
+            "-mno-amx-int8" => self.enable_amx_int8 = false,
+            "-mno-amx-bf16" => self.enable_amx_bf16 = false,
+            "-mno-cmpccxadd" => self.enable_cmpccxadd = false,
+            "-mno-aes" => self.enable_aes = false,
+            "-mno-pclmul" => self.enable_pclmul = false,
+            "-mno-f16c" => self.enable_f16c = false,
+            _ => return false,
+        }
+        true
+    }
+
+    fn apply_x86_isa_mflag_arm(&mut self, arg: &str) -> bool {
+        if self.apply_x86_mmx_mflag(arg)
+            || self.grant_avx512_family(arg)
             || self.apply_x86_sse_level_mflag(arg)
             || self.apply_x86_avx512_mno_mflag(arg)
+            || self.apply_x86_isa_toggle(arg)
         {
             return true;
         }
@@ -710,6 +730,15 @@ impl Driver {
                 self.enable_popcnt = true;
                 self.popcnt_explicitly_disabled = false;
             }
+            "-mabm" => {
+                // GCC's set mask: ABM and POPCNT (`-mno-popcnt -mabm` has
+                // POPCNT); LZCNT follows ABM unless an LZCNT flag decided
+                // it (`resolved_lzcnt`). Measured, gcc-16 `-dM`.
+                self.enable_abm = true;
+                self.abm_explicitly_disabled = false;
+                self.enable_popcnt = true;
+                self.popcnt_explicitly_disabled = false;
+            }
             "-mcx16" => {
                 self.enable_cx16 = true;
                 self.cx16_explicitly_disabled = false;
@@ -718,7 +747,6 @@ impl Driver {
                 self.enable_movbe = true;
                 self.movbe_explicitly_disabled = false;
             }
-            "-mrdrnd" => self.enable_rdrnd = true,
             "-mavxifma" => {
                 self.enable_avxifma = true;
                 self.grant_avx2_class();
@@ -727,7 +755,6 @@ impl Driver {
                 self.enable_avxneconvert = true;
                 self.grant_avx2_class();
             }
-            "-mgfni" => self.enable_gfni = true,
             "-mavxvnniint8" => {
                 self.enable_avxvnniint8 = true;
                 self.grant_avx2_class();
@@ -748,29 +775,6 @@ impl Driver {
                 self.enable_sm4 = true;
                 self.grant_avx_class();
             }
-            "-mmovrs" => self.enable_movrs = true,
-            "-muser_msr" => self.enable_user_msr = true,
-            // APX Foundation: extra GPRs r16–r31, NDD 3-operand ALU.
-            // Off by default — emitting it on a non-APX host (Raptor Lake,
-            // i7-14700KF, …) is #UD. `-march=raptorlake` must never imply this.
-            "-mapx" | "-mapxf" => self.enable_apxf = true,
-            "-mno-apx" | "-mno-apxf" => self.enable_apxf = false,
-            "-mamx-tile" => self.enable_amx_tile = true,
-            "-mamx-int8" => self.enable_amx_int8 = true,
-            "-mamx-bf16" => self.enable_amx_bf16 = true,
-            "-mcmpccxadd" => self.enable_cmpccxadd = true,
-            "-mno-avxvnni" => self.enable_avxvnni = false,
-            "-mno-avxvnniint8" => self.enable_avxvnniint8 = false,
-            "-mno-avxvnniint16" => self.enable_avxvnniint16 = false,
-            "-mno-sha512" => self.enable_sha512 = false,
-            "-mno-sm3" => self.enable_sm3 = false,
-            "-mno-sm4" => self.enable_sm4 = false,
-            "-mno-movrs" => self.enable_movrs = false,
-            "-mno-user_msr" => self.enable_user_msr = false,
-            "-mno-amx-tile" => self.enable_amx_tile = false,
-            "-mno-amx-int8" => self.enable_amx_int8 = false,
-            "-mno-amx-bf16" => self.enable_amx_bf16 = false,
-            "-mno-cmpccxadd" => self.enable_cmpccxadd = false,
             "-mvaes" => {
                 self.enable_vaes = true;
                 self.grant_avx_class();
@@ -779,9 +783,6 @@ impl Driver {
                 self.enable_vpclmulqdq = true;
                 self.grant_avx_class();
             }
-            "-mno-aes" => self.enable_aes = false,
-            "-mno-pclmul" => self.enable_pclmul = false,
-            "-mno-f16c" => self.enable_f16c = false,
             "-mno-fma" => {
                 self.enable_fma = false;
                 self.fma_explicitly_disabled = true;
@@ -808,6 +809,21 @@ impl Driver {
                 // Sticky denial: an explicit v2+ grant carries POPCNT;
                 // this explicit denial removes it from that grant.
                 self.popcnt_explicitly_disabled = true;
+            }
+            "-mno-abm" => {
+                // GCC's unset mask is ABM alone (`-march=btver1 -mno-abm`
+                // keeps POPCNT and LZCNT), but a CPU that has POPCNT and
+                // LZCNT only through ABM loses them (`-march=amdfam10
+                // -mno-abm` has neither) unless a flag before this one
+                // granted them. A later `-march=` reads the sticky denial.
+                self.enable_abm = false;
+                self.abm_explicitly_disabled = true;
+                let derived = self
+                    .x86_march
+                    .as_deref()
+                    .and_then(crate::backend::x86::isa::X86Isa::arch_row)
+                    .map_or(0, |row| row.abm_derived());
+                self.withhold_x86_abm_derived(derived);
             }
             "-mno-cx16" => {
                 self.enable_cx16 = false;
@@ -1016,158 +1032,314 @@ impl Driver {
         }
         self.enable_avx2 = true;
     }
-    fn enable_x86_v3_profile(&mut self) {
-        self.enable_x86_avx2_profile();
-        // BMI/LZCNT/MOVBE are integer ISA and remain legal under `-mno-sse`.
-        self.enable_bmi = true;
-        self.enable_bmi2 = true;
-        self.enable_lzcnt = true;
-        self.enable_movbe = true;
-        self.enable_cx16 = true;
-        // x86-64-v3 is a superset of v2, which added POPCNT.
-        self.enable_popcnt = true;
-        if self.sse_explicitly_disabled {
-            return;
+    /// A CPU GCC 16.2 accepts: its measured `X86_ARCH_TABLE` row, the one
+    /// source for every `-march=` name (and for `target("arch=")`, the CPU
+    /// macros and the `target_clones` resolvers), so the driver cannot
+    /// drift from GCC the way hand-kept profiles did (Sapphire Rapids
+    /// without AVX-VNNI and AMX, Tiger Lake without AVX512VP2INTERSECT).
+    /// Integer extensions stay legal under `-mno-sse`; the vector ones and
+    /// the macro-only extensions that require them do not (GCC:
+    /// `-march=clearwaterforest -mno-sse` keeps `__CMPCCXADD__` and drops
+    /// `__SHA512__`, measured into
+    /// [`crate::backend::x86::arch_table::X86ExtraFeature::requires`]).
+    fn enable_x86_arch_row(&mut self, march: &str) -> Result<(), String> {
+        use crate::backend::x86::arch_table::X86ExtraFeature as E;
+        use crate::common::x86_features::X86Feature as F;
+        let Some(row) = crate::backend::x86::isa::X86Isa::arch_row(march) else {
+            return Err(format!("unsupported x86 -march={}", march));
+        };
+        if !row.x86_64 {
+            if self.target != Target::I686 {
+                return Err(format!(
+                    "-march={} is only valid with -m32/-m16 (i686 target)",
+                    march
+                ));
+            }
+            // The i686 SSE level: none (MMX at most), SSE only, or the
+            // SSE2 baseline. Arch-implied `enable_sse` is reset by the next
+            // `-march=`, like every other arch-implied bit.
+            self.march_pre_sse = !row.has(F::Sse2);
+            self.march_pre_sse_mmx = row.has(F::Mmx);
+            self.enable_sse = row.has(F::Sse) && !self.sse_explicitly_disabled;
         }
-        self.enable_f16c = true;
-        self.enable_fma = true;
-    }
-    fn enable_x86_haswell_profile(&mut self) {
-        self.enable_x86_v3_profile();
-        if self.sse_explicitly_disabled {
-            return;
+        // Integer ISA: legal under `-mno-sse`. A denied ABM takes with it
+        // what the CPU has only through ABM (the replayed flags restore
+        // an explicit POPCNT or LZCNT).
+        self.enable_abm |= row.feature_bits() & crate::backend::x86::arch_table::ABM != 0
+            && !self.abm_explicitly_disabled;
+        self.enable_popcnt |= row.has(F::Popcnt);
+        self.enable_cx16 |= row.has(F::Cx16);
+        self.enable_bmi |= row.has(F::Bmi);
+        self.enable_bmi2 |= row.has(F::Bmi2);
+        self.enable_lzcnt |= row.has(F::Lzcnt);
+        self.enable_movbe |= row.has(F::Movbe);
+        self.enable_rdrnd |= row.has(F::Rdrnd);
+        if self.abm_explicitly_disabled {
+            self.withhold_x86_abm_derived(row.abm_derived());
         }
-        self.enable_aes = true;
-        self.enable_pclmul = true;
-        self.enable_rdrnd = true;
-    }
-    fn enable_x86_avx512_profile(&mut self) {
-        self.enable_x86_v3_profile();
-        if self.sse_explicitly_disabled {
-            return;
+        for extra in E::ALL {
+            if row.has_extra(extra) {
+                *self.x86_extra_slot(extra) = true;
+            }
         }
-        self.enable_avx512f = true;
-        self.enable_avx512cd = true;
-        self.enable_avx512dq = true;
-        self.enable_avx512bw = true;
-        self.enable_avx512vl = true;
-    }
-    fn enable_x86_avx512_cpu_profile(&mut self) {
-        self.enable_x86_avx512_profile();
-        self.enable_aes = true;
-        self.enable_pclmul = true;
-        self.enable_rdrnd = true;
-    }
-    fn enable_x86_cascadelake_profile(&mut self) {
-        self.enable_x86_avx512_cpu_profile();
-        self.enable_avx512vnni = true;
-    }
-    fn enable_x86_cooperlake_profile(&mut self) {
-        self.enable_x86_cascadelake_profile();
-        self.enable_avx512bf16 = true;
-    }
-    fn enable_x86_icelake_profile(&mut self) {
-        self.enable_x86_cascadelake_profile();
-        self.enable_avx512ifma = true;
-        self.enable_avx512vbmi = true;
-        self.enable_avx512vbmi2 = true;
-        self.enable_avx512bitalg = true;
-        self.enable_avx512vpopcntdq = true;
-        self.enable_gfni = true;
-        self.enable_vaes = true;
-        self.enable_vpclmulqdq = true;
-    }
-    fn enable_x86_sapphirerapids_profile(&mut self) {
-        self.enable_x86_icelake_profile();
-        self.enable_avx512bf16 = true;
-        self.enable_avx512fp16 = true;
-    }
-    fn enable_x86_knl_profile(&mut self) {
-        self.enable_x86_v3_profile();
         if self.sse_explicitly_disabled {
-            return;
+            self.drop_x86_extras_without_requirements();
+            return Ok(());
         }
-        self.enable_pclmul = true;
-        self.enable_rdrnd = true;
-        self.enable_avx512f = true;
-        self.enable_avx512cd = true;
-        self.enable_avx512er = true;
-        self.enable_avx512pf = true;
-    }
-    fn enable_x86_znver3_profile(&mut self) {
-        self.enable_x86_haswell_profile();
-        if self.sse_explicitly_disabled {
-            return;
+        if row.has(F::Sse2) {
+            self.no_sse = false;
         }
-        self.enable_vaes = true;
-        self.enable_vpclmulqdq = true;
-    }
-    fn enable_x86_znver4_profile(&mut self) {
-        self.enable_x86_icelake_profile();
-        self.enable_avx512bf16 = true;
-    }
-    fn enable_x86_znver5_profile(&mut self) {
-        self.enable_x86_znver4_profile();
-        self.enable_avxvnni = true;
-        self.enable_avx512vp2intersect = true;
-    }
-    fn enable_x86_nehalem_profile(&mut self) {
-        // POPCNT shipped with Nehalem/Barcelona and is part of the
-        // x86-64-v2 baseline contract; like BMI/LZCNT it is integer ISA
-        // and stays legal under `-mno-sse`.
-        self.enable_popcnt = true;
-        // CMPXCHG16B is part of the x86-64-v2 contract; integer ISA, so it
-        // stays legal under `-mno-sse` like POPCNT.
-        self.enable_cx16 = true;
-        if self.sse_explicitly_disabled {
-            return;
+        for (feature, slot) in [
+            (F::Sse3, &mut self.enable_sse3),
+            (F::Ssse3, &mut self.enable_ssse3),
+            (F::Sse41, &mut self.enable_sse4_1),
+            (F::Sse42, &mut self.enable_sse4_2),
+            (F::Avx, &mut self.enable_avx),
+            (F::Avx2, &mut self.enable_avx2),
+            (F::Fma, &mut self.enable_fma),
+            (F::F16c, &mut self.enable_f16c),
+            (F::Aes, &mut self.enable_aes),
+            (F::Pclmul, &mut self.enable_pclmul),
+            (F::Vaes, &mut self.enable_vaes),
+            (F::Vpclmulqdq, &mut self.enable_vpclmulqdq),
+            (F::Gfni, &mut self.enable_gfni),
+            (F::AvxVnni, &mut self.enable_avxvnni),
+            (F::AvxVnniInt8, &mut self.enable_avxvnniint8),
+            (F::AvxVnniInt16, &mut self.enable_avxvnniint16),
+            (F::Avx512F, &mut self.enable_avx512f),
+            (F::Avx512Bw, &mut self.enable_avx512bw),
+            (F::Avx512Dq, &mut self.enable_avx512dq),
+            (F::Avx512Vl, &mut self.enable_avx512vl),
+            (F::Avx512Vnni, &mut self.enable_avx512vnni),
+            (F::Avx512BitAlg, &mut self.enable_avx512bitalg),
+            (F::Avx512Vpopcntdq, &mut self.enable_avx512vpopcntdq),
+            (F::Avx512Cd, &mut self.enable_avx512cd),
+            (F::Avx512Ifma, &mut self.enable_avx512ifma),
+            (F::Avx512Vbmi, &mut self.enable_avx512vbmi),
+            (F::Avx512Vbmi2, &mut self.enable_avx512vbmi2),
+            (F::Avx512Bf16, &mut self.enable_avx512bf16),
+            (F::Avx512Fp16, &mut self.enable_avx512fp16),
+            (F::Avx512Bmm, &mut self.enable_avx512bmm),
+            (F::Avx512Vp2intersect, &mut self.enable_avx512vp2intersect),
+            (F::Avx512Er, &mut self.enable_avx512er),
+            (F::Avx512Pf, &mut self.enable_avx512pf),
+        ] {
+            *slot |= row.has(feature);
         }
-        self.no_sse = false;
-        self.enable_sse3 = true;
-        self.enable_ssse3 = true;
-        self.enable_sse4_1 = true;
-        self.enable_sse4_2 = true;
+        self.drop_x86_extras_without_requirements();
+        Ok(())
     }
-    fn enable_x86_westmere_profile(&mut self) {
-        self.enable_x86_nehalem_profile();
-        self.enable_aes = true;
-        self.enable_pclmul = true;
-    }
-    fn enable_x86_sandybridge_profile(&mut self) {
-        self.enable_x86_westmere_profile();
-        self.enable_x86_avx_profile();
-    }
-    fn enable_x86_ivybridge_profile(&mut self) {
-        self.enable_x86_sandybridge_profile();
-        self.enable_f16c = true;
-        self.enable_rdrnd = true;
-    }
-    fn enable_x86_silvermont_profile(&mut self) {
-        self.enable_x86_nehalem_profile();
-        self.enable_pclmul = true;
-        self.enable_movbe = true;
-        self.enable_rdrnd = true;
-    }
-    fn enable_x86_goldmont_profile(&mut self) {
-        self.enable_x86_silvermont_profile();
-        self.enable_aes = true;
-    }
-    fn enable_x86_alderlake_profile(&mut self) {
-        self.enable_x86_haswell_profile();
-        if self.sse_explicitly_disabled {
-            return;
+
+    /// `-mmmx`/`-mno-mmx`. GCC 16.2 keeps compiling the MMX intrinsics on
+    /// x86-64 under `-mno-mmx` (through SSE) and only stops announcing
+    /// `__MMX__`; lccc's MMX intrinsics never use the MMX registers, so the
+    /// denial is the macro's alone, on i686 too. Sticky: SSE's implication
+    /// of MMX does not override it (`-mno-mmx -msse` has no `__MMX__`).
+    fn apply_x86_mmx_mflag(&mut self, arg: &str) -> bool {
+        match arg {
+            "-mmmx" => self.mmx_explicitly_disabled = false,
+            "-mno-mmx" => self.mmx_explicitly_disabled = true,
+            _ => return false,
         }
-        self.enable_avxvnni = true;
-        self.enable_gfni = true;
-        self.enable_vaes = true;
-        self.enable_vpclmulqdq = true;
+        true
     }
-    fn enable_x86_arrowlake_profile(&mut self) {
-        self.enable_x86_alderlake_profile();
-        self.enable_avxifma = true;
-        self.enable_avxneconvert = true;
-        self.enable_avxvnniint8 = true;
-        self.enable_cmpccxadd = true;
+
+    /// The driver bit of a modelled `X86Feature`; `None` for CMOV, FXSR and
+    /// the SSE/SSE2/MMX state, which the denial flags own.
+    fn x86_feature_slot(
+        &mut self,
+        feature: crate::common::x86_features::X86Feature,
+    ) -> Option<&mut bool> {
+        use crate::common::x86_features::X86Feature as F;
+        Some(match feature {
+            F::Cmov | F::Fxsr | F::Mmx | F::Sse | F::Sse2 => return None,
+            F::Sse3 => &mut self.enable_sse3,
+            F::Ssse3 => &mut self.enable_ssse3,
+            F::Sse41 => &mut self.enable_sse4_1,
+            F::Sse42 => &mut self.enable_sse4_2,
+            F::Popcnt => &mut self.enable_popcnt,
+            F::Cx16 => &mut self.enable_cx16,
+            F::Avx => &mut self.enable_avx,
+            F::Avx2 => &mut self.enable_avx2,
+            F::Fma => &mut self.enable_fma,
+            F::F16c => &mut self.enable_f16c,
+            F::Bmi => &mut self.enable_bmi,
+            F::Bmi2 => &mut self.enable_bmi2,
+            F::Lzcnt => &mut self.enable_lzcnt,
+            F::Movbe => &mut self.enable_movbe,
+            F::Aes => &mut self.enable_aes,
+            F::Pclmul => &mut self.enable_pclmul,
+            F::Rdrnd => &mut self.enable_rdrnd,
+            F::Vaes => &mut self.enable_vaes,
+            F::Vpclmulqdq => &mut self.enable_vpclmulqdq,
+            F::AvxVnni => &mut self.enable_avxvnni,
+            F::AvxVnniInt8 => &mut self.enable_avxvnniint8,
+            F::AvxVnniInt16 => &mut self.enable_avxvnniint16,
+            F::Gfni => &mut self.enable_gfni,
+            F::Avx512F => &mut self.enable_avx512f,
+            F::Avx512Bw => &mut self.enable_avx512bw,
+            F::Avx512Dq => &mut self.enable_avx512dq,
+            F::Avx512Vl => &mut self.enable_avx512vl,
+            F::Avx512Vnni => &mut self.enable_avx512vnni,
+            F::Avx512BitAlg => &mut self.enable_avx512bitalg,
+            F::Avx512Vpopcntdq => &mut self.enable_avx512vpopcntdq,
+            F::Avx512Cd => &mut self.enable_avx512cd,
+            F::Avx512Ifma => &mut self.enable_avx512ifma,
+            F::Avx512Vbmi => &mut self.enable_avx512vbmi,
+            F::Avx512Vbmi2 => &mut self.enable_avx512vbmi2,
+            F::Avx512Bf16 => &mut self.enable_avx512bf16,
+            F::Avx512Fp16 => &mut self.enable_avx512fp16,
+            F::Avx512Bmm => &mut self.enable_avx512bmm,
+            F::Avx512Vp2intersect => &mut self.enable_avx512vp2intersect,
+            F::Avx512Er => &mut self.enable_avx512er,
+            F::Avx512Pf => &mut self.enable_avx512pf,
+        })
+    }
+
+    /// The driver's features as `EffectiveFeatures` bits (and ABM), with
+    /// the SSE and SSE2 levels as the register-class state resolves them.
+    fn x86_driver_feature_bits(&mut self) -> u64 {
+        use crate::common::x86_features::X86Feature as F;
+        let (sse, sse2) = if self.target == Target::I686 {
+            (self.resolved_i686_sse(), self.resolved_i686_sse2())
+        } else {
+            let sse = !self.no_sse && !self.general_regs_only;
+            (sse, sse && !self.no_sse2)
+        };
+        let mut bits = crate::backend::x86::isa::with_feature(0, F::Sse, sse);
+        bits = crate::backend::x86::isa::with_feature(bits, F::Sse2, sse2);
+        for feature in F::ALL {
+            if self.x86_feature_slot(feature).is_some_and(|on| *on) {
+                bits |= 1 << feature as u8;
+            }
+        }
+        if self.enable_abm {
+            bits |= crate::backend::x86::arch_table::ABM;
+        }
+        bits
+    }
+
+    /// What an ISA option implies for the other features: GCC 16.2's
+    /// measured set or unset mask for it
+    /// ([`crate::backend::x86::arch_table::x86_target_option`], the one
+    /// `target("...")` uses), then the override implications it triggers
+    /// (`-msse4` brings POPCNT, which an explicit `-mno-popcnt` still
+    /// denies through its sticky flag). `-mno-avx2` thereby removes every
+    /// AVX-512 subset, `-mno-avx` FMA and F16C, `-mvpclmulqdq` brings
+    /// PCLMUL: the hand-kept arms had all three wrong.
+    fn apply_x86_option_mask(&mut self, arg: &str) {
+        use crate::backend::x86::arch_table::{ABM, X86_IMPLIED, x86_target_option};
+        use crate::common::x86_features::X86Feature as F;
+        let Some(option) = arg.strip_prefix("-m") else {
+            return;
+        };
+        let (negated, name) = option
+            .strip_prefix("no-")
+            .map_or((false, option), |name| (true, name));
+        let Some(handler) = x86_target_option(name) else {
+            return;
+        };
+        let before = self.x86_driver_feature_bits();
+        let Some(mut after) = handler.apply(before, negated) else {
+            return;
+        };
+        for &(trigger, implied) in X86_IMPLIED {
+            if after & trigger != 0 && before & trigger == 0 {
+                after |= implied;
+            }
+        }
+        for feature in F::ALL {
+            if let Some(slot) = self.x86_feature_slot(feature) {
+                *slot = after & (1 << feature as u8) != 0;
+            }
+        }
+        self.enable_abm = after & ABM != 0;
+    }
+
+    /// Disable every macro-only extension a required feature has left
+    /// ([`crate::backend::x86::arch_table::X86ExtraFeature::requires`]):
+    /// GCC's `-mno-avx2` removes AVXIFMA and keeps SHA512, `-mno-avx`
+    /// removes both, `-mno-sse` keeps CMPCCXADD (measured).
+    /// ... and every extension whose required extension has left (AMX-INT8
+    /// with AMX-TILE), to a fixed point.
+    fn drop_x86_extras_without_requirements(&mut self) {
+        use crate::backend::x86::arch_table::X86ExtraFeature as E;
+        let bits = self.x86_driver_feature_bits();
+        loop {
+            let extras = self.x86_extras();
+            let mut changed = false;
+            for extra in E::ALL {
+                let lacking =
+                    extra.requires() & !bits != 0 || extra.requires_extras() & !extras != 0;
+                let slot = self.x86_extra_slot(extra);
+                if *slot && lacking {
+                    *slot = false;
+                    changed = true;
+                }
+            }
+            if !changed {
+                return;
+            }
+        }
+    }
+
+    /// The enabled macro-only extensions, one bit per `X86ExtraFeature`.
+    fn x86_extras(&mut self) -> u32 {
+        use crate::backend::x86::arch_table::X86ExtraFeature as E;
+        E::ALL
+            .into_iter()
+            .filter(|&extra| *self.x86_extra_slot(extra))
+            .fold(0, |bits, extra| bits | 1 << extra as u8)
+    }
+
+    /// Enable the macro-only extensions of `bits`.
+    fn set_x86_extras(&mut self, bits: u32) {
+        use crate::backend::x86::arch_table::X86ExtraFeature as E;
+        for extra in E::ALL {
+            if bits & 1 << extra as u8 != 0 {
+                *self.x86_extra_slot(extra) = true;
+            }
+        }
+    }
+
+    /// Clear the `derived` POPCNT/LZCNT a CPU grants only through ABM, once
+    /// ABM is denied, except where an earlier explicit flag granted them
+    /// (GCC: `-march=amdfam10 -mpopcnt -mno-abm` keeps POPCNT). `-mabm`
+    /// itself never precedes the denial here: `-mabm -mno-abm` cancels.
+    fn withhold_x86_abm_derived(&mut self, derived: u64) {
+        use crate::common::x86_features::X86Feature as F;
+        let has = |feature: F| derived & (1 << feature as u8) != 0;
+        if has(F::Popcnt) && !self.x86_isa_flag_was_enabled("-mpopcnt", "-mno-popcnt") {
+            self.enable_popcnt = false;
+        }
+        if has(F::Lzcnt) && !self.x86_isa_flag_was_enabled("-mlzcnt", "-mno-lzcnt") {
+            self.enable_lzcnt = false;
+        }
+    }
+
+    /// The driver bit of a macro-only extension.
+    fn x86_extra_slot(
+        &mut self,
+        extra: crate::backend::x86::arch_table::X86ExtraFeature,
+    ) -> &mut bool {
+        use crate::backend::x86::arch_table::X86ExtraFeature as E;
+        match extra {
+            E::Prfchw => &mut self.enable_prfchw,
+            E::AvxIfma => &mut self.enable_avxifma,
+            E::AvxNeConvert => &mut self.enable_avxneconvert,
+            E::Cmpccxadd => &mut self.enable_cmpccxadd,
+            E::Sha512 => &mut self.enable_sha512,
+            E::Sm3 => &mut self.enable_sm3,
+            E::Sm4 => &mut self.enable_sm4,
+            E::Movrs => &mut self.enable_movrs,
+            E::UserMsr => &mut self.enable_user_msr,
+            E::AmxTile => &mut self.enable_amx_tile,
+            E::AmxInt8 => &mut self.enable_amx_int8,
+            E::AmxBf16 => &mut self.enable_amx_bf16,
+            E::Avx10_1 => &mut self.enable_avx10_1,
+            E::Avx10_2 => &mut self.enable_avx10_2,
+            E::ApxF => &mut self.enable_apxf,
+        }
     }
 
     /// Parse GCC-compatible command-line arguments and populate driver fields.
@@ -1218,6 +1390,27 @@ impl Driver {
         // closes that register file; `-msse`/`-msse2` can subsequently lift it.
         if self.target == Target::I686 && self.no_sse2 {
             self.no_sse = self.sse_explicitly_disabled || self.general_regs_only;
+        }
+        // APX's extended GPRs exist only in 64-bit mode (GCC 16.2's wording).
+        if self.target == Target::I686 && self.enable_apxf {
+            return Err("'-mapxf' is not supported for 32-bit code".to_string());
+        }
+        // GCC 16.2 rejects a `-mtune=` name outside its vocabulary ("bad
+        // value for '-mtune=' switch"); configure and Kbuild `cc-option`
+        // probes rely on that rejection, so an invented name must not pass.
+        if let Some(tune) = self.x86_tune.as_deref() {
+            use crate::backend::x86::arch_table::x86_tune_name_valid;
+            let x86_64 = self.target == Target::X86_64;
+            if matches!(self.target, Target::X86_64 | Target::I686)
+                && tune != "native"
+                && !x86_tune_name_valid(tune, x86_64)
+            {
+                return Err(if x86_64 && x86_tune_name_valid(tune, false) {
+                    format!("-mtune={tune} is only valid with -m32/-m16 (i686 target)")
+                } else {
+                    format!("unsupported x86 -mtune={tune}")
+                });
+            }
         }
 
         // Store raw args for GCC -m16 passthrough. We keep everything except
@@ -2137,7 +2330,7 @@ impl Driver {
                         self.target = Target::X86_64;
                     }
                 }
-                "-mno-mmx" | "-mno-3dnow" => {}
+                "-mno-3dnow" => {}
                 // ── Kernel -m flags with per-flag semantic justification ──
                 // (The blanket -mno-* fallback below covers pure ISA-disable
                 // probes; flags listed here need MORE than "we never emit it".)
@@ -2190,7 +2383,6 @@ impl Driver {
                 }
                 "-mxsave" | "-mxsaveopt" | "-mxsavec" | "-mno-xsave" | "-mno-xsaveopt"
                 | "-mno-xsavec" => {}
-                "-mmmx" => {}
                 "-m3dnow" => return Err("3DNow! is unsupported".to_string()),
                 "-mcmodel=kernel" => self.code_model_kernel = true,
                 "-mcmodel=small" | "-mcmodel=medlow" | "-mcmodel=medium" | "-mcmodel=medany"
@@ -2221,6 +2413,7 @@ impl Driver {
                             // every accepted spelling resets the pre-SSE veto,
                             // and the legacy 32-bit baselines re-set it.
                             self.march_pre_sse = false;
+                            self.march_pre_sse_mmx = false;
                             match march {
                                 "x86-64" | "x86-64-v1" | "generic" => {}
                                 // Legacy 32-bit baselines (kernel REALMODE_CFLAGS
@@ -2231,8 +2424,7 @@ impl Driver {
                                 // are honored independently. Real-mode setup code
                                 // executes on the boot CPU — a physical x86-64
                                 // machine — so the i686 baseline is sound there.
-                                "i386" | "i486" | "i586" | "i686" | "pentium" | "pentiumpro"
-                                | "pentium-mmx" => {
+                                "i386" | "i486" | "i586" | "i686" | "pentium" | "pentiumpro" => {
                                     if self.target != Target::I686 {
                                         return Err(format!(
                                             "-march={} is only valid with -m32/-m16 (i686 target)",
@@ -2248,61 +2440,6 @@ impl Driver {
                                     // kernel's `-march=i386 -m16` real-mode code
                                     // gets neither, as measured).
                                     self.march_pre_sse = true;
-                                }
-                                "nehalem" => self.enable_x86_nehalem_profile(),
-                                "westmere" => self.enable_x86_westmere_profile(),
-                                "sandybridge" => self.enable_x86_sandybridge_profile(),
-                                "ivybridge" => self.enable_x86_ivybridge_profile(),
-                                "silvermont" => self.enable_x86_silvermont_profile(),
-                                "goldmont" => self.enable_x86_goldmont_profile(),
-                                "x86-64-v2" => {
-                                    self.enable_x86_nehalem_profile();
-                                }
-                                "x86-64-v3" => self.enable_x86_v3_profile(),
-                                "haswell" | "broadwell" | "skylake" | "znver1" | "znver2" => {
-                                    self.enable_x86_haswell_profile()
-                                }
-                                "znver3" => self.enable_x86_znver3_profile(),
-                                "znver4" => self.enable_x86_znver4_profile(),
-                                "znver5" => self.enable_x86_znver5_profile(),
-                                // Alder Lake ISA (the E-core's capability set: AVX2,
-                                // AVX-VNNI, GFNI, VAES, VPCLMULQDQ, no AVX-512):
-                                // shared by Raptor Lake, Meteor Lake, Alder Lake-N
-                                // and the Gracemont-only spelling.  The *tuning* row
-                                // still differs (cpu_model::resolve maps gracemont /
-                                // alderlake-n to the E-core row, meteorlake to the
-                                // Raptor Lake class).
-                                "alderlake" | "raptorlake" | "raptor-lake" | "meteorlake"
-                                | "gracemont" | "alderlake-n" => {
-                                    self.enable_x86_alderlake_profile()
-                                }
-                                // Sierra Forest / Grand Ridge (Crestmont E-core): Alder
-                                // Lake ISA + AVX-IFMA, AVX-NE-CONVERT, AVX-VNNI-INT8,
-                                // CMPCCXADD — the same additions Arrow Lake carries
-                                // (GCC `PTA_SIERRAFOREST`, LLVM `SRFFeatures`).
-                                "arrowlake" | "sierraforest" | "grandridge" => {
-                                    self.enable_x86_arrowlake_profile()
-                                }
-                                // Clearwater Forest (Darkmont) adds AVX-VNNI-INT16
-                                // like Arrow Lake-S / Lunar Lake.
-                                "arrowlake-s" | "lunarlake" | "wildcatlake"
-                                | "clearwaterforest" => {
-                                    self.enable_x86_arrowlake_profile();
-                                    self.enable_avxvnniint16 = true;
-                                }
-                                "x86-64-v4" => self.enable_x86_avx512_profile(),
-                                "skylake-avx512" => self.enable_x86_avx512_cpu_profile(),
-                                "cascadelake" => self.enable_x86_cascadelake_profile(),
-                                "cooperlake" => self.enable_x86_cooperlake_profile(),
-                                "icelake-client" | "icelake-server" | "tigerlake"
-                                | "rocketlake" => self.enable_x86_icelake_profile(),
-                                "sapphirerapids" | "graniterapids" | "graniterapids-d" => {
-                                    self.enable_x86_sapphirerapids_profile()
-                                }
-                                "knl" => self.enable_x86_knl_profile(),
-                                "knm" => {
-                                    self.enable_x86_knl_profile();
-                                    self.enable_avx512vpopcntdq = true;
                                 }
                                 "novalake" | "diamondrapids" => {
                                     return Err(format!(
@@ -2376,20 +2513,20 @@ impl Driver {
                                             if std::arch::is_x86_feature_detected!("f16c") {
                                                 self.enable_f16c = true;
                                             }
+                                            // Each AVX-512 subset is its own CPUID
+                                            // bit: Xeon Phi has F+CD without VL, and
+                                            // the xmm/ymm EVEX forms (`vprold`) are
+                                            // #UD there.
                                             if std::arch::is_x86_feature_detected!("avx512f") {
-                                                self.enable_x86_avx512_profile();
-                                                // VL is its own CPUID bit, not implied by F:
-                                                // Xeon Phi (KNL: F+CD+ER+PF, no VL) plus
-                                                // several early-SP parts have F without
-                                                // VL, and the xmm/ymm EVEX forms (e.g.
-                                                // `vprold`) are #UD there.  The profile
-                                                // grants VL unconditionally; clear it
-                                                // unless the host really has it (GCC's
-                                                // native probe reads the VL bit too).
-                                                if !std::arch::is_x86_feature_detected!("avx512vl")
-                                                {
-                                                    self.enable_avx512vl = false;
-                                                }
+                                                self.enable_avx512f = true;
+                                                self.enable_avx512cd =
+                                                    std::arch::is_x86_feature_detected!("avx512cd");
+                                                self.enable_avx512dq =
+                                                    std::arch::is_x86_feature_detected!("avx512dq");
+                                                self.enable_avx512bw =
+                                                    std::arch::is_x86_feature_detected!("avx512bw");
+                                                self.enable_avx512vl =
+                                                    std::arch::is_x86_feature_detected!("avx512vl");
                                             }
                                         }
                                     }
@@ -2398,7 +2535,7 @@ impl Driver {
                                         return Err("-march=native requires an x86-64 host; pass an explicit profile".to_string());
                                     }
                                 }
-                                _ => return Err(format!("unsupported x86 -march={}", march)),
+                                _ => self.enable_x86_arch_row(march)?,
                             }
                         }
                         _ => {
@@ -2416,9 +2553,6 @@ impl Driver {
                     // `-mno-bmi -march=x86-64-v3` → `__BMI__` absent;
                     // `-mbmi -march=x86-64` → `__BMI__` defined.
                     if matches!(self.target, Target::X86_64 | Target::I686) {
-                        if x86_march_implies_prfchw(march) {
-                            self.enable_prfchw = true;
-                        }
                         self.replay_x86_explicit_isa_flags();
                     }
                 }
@@ -2426,10 +2560,8 @@ impl Driver {
                     let tune = &arg["-mtune=".len()..];
                     match self.target {
                         Target::X86_64 | Target::I686 => {
-                            // Accept all GCC-compatible tune names (zlib-ng probes
-                            // skylake-avx512/cascadelake etc.). Unknown tunes are
-                            // stored but otherwise ignored – matching GCC's permissive
-                            // handling and ensuring configure scripts never abort.
+                            // Validated after parsing, once `-m32` is known
+                            // (GCC's vocabulary depends on the mode).
                             self.x86_tune = Some(tune.to_string());
                         }
                         _ => {
@@ -4087,6 +4219,48 @@ mod cli_tests {
         for f in ["-mapx", "-mapxf", "-mno-apx", "-mno-apxf"] {
             assert!(try_flag(f).is_ok(), "{f} must be accepted");
         }
+    }
+
+    /// `-mtune=` takes GCC 16.2's vocabulary for the mode (measured with
+    /// gcc-16 at -m64 and -m32 over 130 names, generated into
+    /// `arch_table.rs`; GCC rejects the others with "bad value"), whatever
+    /// the order of `-m32`; `-mapxf` is refused for 32-bit code, as by GCC.
+    #[test]
+    fn mtune_vocabulary_and_32_bit_apx_follow_gcc() {
+        let parse = |args: &[&str]| {
+            let mut d = Driver::new();
+            let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            d.parse_cli_args(&owned).map(|_| ())
+        };
+        for ok in [
+            &["ccc", "-mtune=znver6", "x.c"][..],
+            &["ccc", "-mtune=novalake", "x.c"],
+            &["ccc", "-mtune=generic", "x.c"],
+            &["ccc", "-mtune=intel", "x.c"],
+            &["ccc", "-mtune=native", "x.c"],
+            &["ccc", "-mtune=x86-64", "x.c"],
+            &["ccc", "-m32", "-mtune=pentium4", "x.c"],
+            &["ccc", "-mtune=pentium4", "-m32", "x.c"],
+            &["ccc", "-mapxf", "x.c"],
+        ] {
+            parse(ok).unwrap_or_else(|e| panic!("{ok:?}: {e}"));
+        }
+        for name in [
+            "knl",
+            "knm",
+            "kabylake",
+            "raptor-lake",
+            "alderlake-n",
+            "x86-64-v3",
+            "bogus",
+        ] {
+            let err = parse(&["ccc", &format!("-mtune={name}"), "x.c"]).expect_err(name);
+            assert!(err.contains("unsupported x86 -mtune="), "{err}");
+        }
+        let err = parse(&["ccc", "-mtune=pentium4", "x.c"]).expect_err("32-bit-only tune");
+        assert!(err.contains("only valid with -m32"), "{err}");
+        let err = parse(&["ccc", "-m32", "-mapxf", "x.c"]).expect_err("-m32 -mapxf");
+        assert!(err.contains("not supported for 32-bit code"), "{err}");
     }
 
     /// Stack alignment: a request for <= 16 bytes is permission to align less
@@ -6334,43 +6508,301 @@ mod prefetch_isa_tests {
         }
     }
 
+    /// Every x86-64 `-march=` profile resolves to exactly GCC 16.2's
+    /// feature set (`X86_ARCH_TABLE`, measured from `gcc-16 -march=NAME
+    /// -dM -E`). A profile granting more than GCC is fail-open: lccc
+    /// predefined `__AES__` for Westmere..Broadwell, whose Pentium and
+    /// Celeron parts lack AES-NI, after GCC 16 had removed it.
     #[test]
-    fn march_table_matches_gcc_prfchw_set() {
-        // `gcc-16 -march=X -dM -E | grep -c __PRFCHW__`, measured.
-        for m in [
-            "nehalem",
-            "westmere",
-            "sandybridge",
-            "ivybridge",
-            "haswell",
-            "x86-64",
-            "x86-64-v2",
-            "x86-64-v3",
-            "x86-64-v4",
-            "generic",
-            "i686",
-        ] {
-            assert!(!super::x86_march_implies_prfchw(m), "{m}");
+    fn march_profiles_match_gcc_feature_sets() {
+        use crate::backend::x86::arch_table::X86ExtraFeature;
+        use crate::common::x86_features::X86Feature;
+        let mut checked = 0;
+        for row in crate::backend::x86::arch_table::X86_ARCH_TABLE
+            .iter()
+            .filter(|r| r.x86_64)
+        {
+            let mut d = Driver::new();
+            let march = format!("-march={}", row.name);
+            let args: Vec<String> = ["ccc", &march, "x.c"].map(str::to_string).to_vec();
+            if let Err(e) = d.parse_cli_args(&args) {
+                // The only refusals: AVX10/APX CPUs, an explicit error.
+                assert!(e.contains("AVX10/APX"), "{}: {e}", row.name);
+                continue;
+            }
+            let features = d.effective_x86_features();
+            let drift: Vec<_> = X86Feature::ALL
+                .iter()
+                .filter(|&&f| features.contains(f) != row.has(f))
+                .map(|&f| (f, features.contains(f)))
+                .collect();
+            assert!(drift.is_empty(), "{}: (feature, lccc) {drift:?}", row.name);
+            // The macro-only extensions (`__PRFCHW__`, `__AMX_TILE__`, ...).
+            let extras: Vec<_> = X86ExtraFeature::ALL
+                .into_iter()
+                .filter(|&e| *d.x86_extra_slot(e) != row.has_extra(e))
+                .collect();
+            assert!(extras.is_empty(), "{}: extras {extras:?}", row.name);
+            checked += 1;
         }
-        for m in [
-            "silvermont",
-            "goldmont",
-            "broadwell",
-            "skylake",
-            "znver1",
-            "znver5",
-            "alderlake",
-            "raptorlake",
-            "meteorlake",
-            "arrowlake-s",
-            "lunarlake",
-            "skylake-avx512",
-            "icelake-server",
-            "sapphirerapids",
-            "graniterapids-d",
-            "clearwaterforest",
-        ] {
-            assert!(super::x86_march_implies_prfchw(m), "{m}");
+        let x86_64_rows = crate::backend::x86::arch_table::X86_ARCH_TABLE
+            .iter()
+            .filter(|r| r.x86_64)
+            .count();
+        assert_eq!(
+            checked,
+            x86_64_rows - 2,
+            "every GCC x86-64 CPU but the AVX10/APX two"
+        );
+    }
+
+    /// GCC 16.2's CPU-name macros (`gcc-16 [-m32] ... -dM -E`, measured):
+    /// the `-march=` CPU's, plus the tuning CPU's from `-mtune=` or else
+    /// the `-march=` CPU unless it is an `x86-64*` level; SSE companions
+    /// follow SSE; other targets get none.
+    #[test]
+    fn x86_cpu_name_macros_match_gcc() {
+        fn macros(args: &[&str]) -> Vec<&'static str> {
+            let mut d = Driver::new();
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            d.parse_cli_args(&args).unwrap();
+            let mut names = d.x86_cpu_name_macros();
+            names.sort_unstable();
+            names
         }
+        let cases: &[(&[&str], &[&str])] = &[
+            (&["ccc", "x.c"], &["__k8", "__k8__"]),
+            (&["ccc", "-march=x86-64-v3", "x.c"], &["__k8", "__k8__"]),
+            (
+                &["ccc", "-march=haswell", "x.c"],
+                &[
+                    "__core_avx2",
+                    "__core_avx2__",
+                    "__haswell",
+                    "__haswell__",
+                    "__tune_core_avx2__",
+                    "__tune_haswell__",
+                ],
+            ),
+            (
+                &["ccc", "-mtune=haswell", "x.c"],
+                &["__k8", "__k8__", "__tune_core_avx2__", "__tune_haswell__"],
+            ),
+            (
+                &["ccc", "-march=corei7", "-mtune=generic", "x.c"],
+                &["__corei7", "__corei7__", "__nehalem", "__nehalem__"],
+            ),
+            (&["i686-ccc", "x.c"], &["__k8", "__k8__"]),
+            (
+                &["i686-ccc", "-march=athlon-4", "x.c"],
+                &[
+                    "__athlon",
+                    "__athlon__",
+                    "__athlon_sse__",
+                    "__tune_athlon__",
+                    "__tune_athlon_sse__",
+                ],
+            ),
+            (
+                &["i686-ccc", "-march=athlon-4", "-mno-sse", "x.c"],
+                &["__athlon", "__athlon__", "__tune_athlon__"],
+            ),
+            (
+                &["i686-ccc", "-march=i686", "-mtune=athlon", "x.c"],
+                &[
+                    "__i686",
+                    "__i686__",
+                    "__pentiumpro",
+                    "__pentiumpro__",
+                    "__tune_athlon__",
+                ],
+            ),
+            (&["aarch64-ccc", "x.c"], &[]),
+        ];
+        for (args, want) in cases {
+            assert_eq!(macros(args), *want, "{args:?}");
+        }
+    }
+
+    /// On i686 every GCC 16.2 CPU name is accepted with GCC's SSE level and
+    /// MMX: pre-SSE (with or without MMX), SSE only, or SSE2 and up; on
+    /// x86-64 a 32-bit-only CPU is an error.
+    #[test]
+    fn i686_march_names_match_gcc_sse_and_mmx() {
+        use crate::common::x86_features::X86Feature as F;
+        for row in crate::backend::x86::arch_table::X86_ARCH_TABLE {
+            let march = format!("-march={}", row.name);
+            let mut d = Driver::new();
+            let args: Vec<String> = ["i686-ccc", &march, "x.c"].map(str::to_string).to_vec();
+            if let Err(e) = d.parse_cli_args(&args) {
+                assert!(e.contains("AVX10/APX"), "{}: {e}", row.name);
+                continue;
+            }
+            assert_eq!(d.resolved_i686_sse(), row.has(F::Sse), "{} SSE", row.name);
+            assert_eq!(
+                d.resolved_i686_sse2(),
+                row.has(F::Sse2),
+                "{} SSE2",
+                row.name
+            );
+            assert_eq!(d.resolved_i686_mmx(), row.has(F::Mmx), "{} MMX", row.name);
+            // GCC's `-m32 -march=haswell` announces BMI1 and MOVBE as well.
+            assert_eq!(
+                d.resolved_codegen_bmi1(),
+                row.has(F::Bmi),
+                "{} BMI",
+                row.name
+            );
+            assert_eq!(
+                d.resolved_isa_movbe(),
+                row.has(F::Movbe),
+                "{} MOVBE",
+                row.name
+            );
+            assert_eq!(
+                d.resolved_abm(),
+                row.feature_bits() & crate::backend::x86::arch_table::ABM != 0,
+                "{} ABM",
+                row.name
+            );
+            if !row.x86_64 {
+                let mut d = Driver::new();
+                let args: Vec<String> = ["ccc", &march, "x.c"].map(str::to_string).to_vec();
+                assert!(d.parse_cli_args(&args).is_err(), "{} on x86-64", row.name);
+            }
+        }
+    }
+
+    /// `-mabm`/`-mno-abm` against `-march=` and the POPCNT/LZCNT flags, in
+    /// every order GCC 16.2 was measured in (`gcc-16 -dM -E`): `-mabm`
+    /// sets POPCNT and brings LZCNT unless an LZCNT flag decided it;
+    /// `-mno-abm` revokes ABM only, except what a CPU has only through ABM.
+    #[test]
+    fn abm_flags_match_gcc() {
+        // (argv, __ABM__, __POPCNT__, __LZCNT__)
+        let cases: &[(&[&str], [bool; 3])] = &[
+            (&["ccc", "-march=amdfam10"], [true, true, true]),
+            (
+                &["ccc", "-march=amdfam10", "-mno-abm"],
+                [false, false, false],
+            ),
+            (
+                &["ccc", "-mno-abm", "-march=amdfam10"],
+                [false, false, false],
+            ),
+            (
+                &["ccc", "-march=amdfam10", "-mabm", "-mno-abm"],
+                [false, false, false],
+            ),
+            (
+                &["ccc", "-march=amdfam10", "-mpopcnt", "-mno-abm"],
+                [false, true, false],
+            ),
+            (
+                &["ccc", "-march=amdfam10", "-mlzcnt", "-mno-abm"],
+                [false, false, true],
+            ),
+            (&["ccc", "-march=btver1", "-mno-abm"], [false, true, true]),
+            (&["ccc", "-march=x86-64", "-mabm"], [true, true, true]),
+            (
+                &["ccc", "-march=x86-64", "-mno-lzcnt", "-mabm"],
+                [true, true, false],
+            ),
+            (
+                &["ccc", "-march=x86-64", "-mabm", "-mno-lzcnt"],
+                [true, true, false],
+            ),
+            (
+                &["ccc", "-march=x86-64", "-mno-popcnt", "-mabm"],
+                [true, true, true],
+            ),
+            (
+                &["ccc", "-march=x86-64", "-mabm", "-mno-abm"],
+                [false, false, false],
+            ),
+            (
+                &["i686-ccc", "-march=amdfam10", "-mno-abm"],
+                [false, false, false],
+            ),
+            (&["i686-ccc", "-mabm"], [true, true, true]),
+        ];
+        for (argv, want) in cases {
+            let mut d = Driver::new();
+            let args: Vec<String> = argv
+                .iter()
+                .map(|a| (*a).to_string())
+                .chain(["x.c".to_string()])
+                .collect();
+            d.parse_cli_args(&args).unwrap();
+            let got = [d.resolved_abm(), d.resolved_popcnt(), d.resolved_lzcnt()];
+            assert_eq!(got, *want, "{argv:?}: [ABM, POPCNT, LZCNT]");
+        }
+    }
+
+    /// Every ISA option implies what GCC 16.2's measured masks say, for
+    /// the `enable_*` bits behind the macros and the effective features
+    /// (`gcc-16 -dM -E`): each case was a hand-kept arm that drifted.
+    #[test]
+    fn isa_flags_follow_gccs_option_masks() {
+        use crate::backend::x86::arch_table::X86ExtraFeature as E;
+        let parse = |argv: &[&str]| {
+            let mut d = Driver::new();
+            let args: Vec<String> = argv
+                .iter()
+                .map(|a| (*a).to_string())
+                .chain(["x.c".to_string()])
+                .collect();
+            d.parse_cli_args(&args).unwrap();
+            d
+        };
+        // `-mno-avx2` removes every AVX-512 subset (it kept all eleven).
+        let mut d = parse(&["ccc", "-march=icelake-server", "-mno-avx2"]);
+        assert!(
+            d.enable_avx
+                && !d.enable_avx2
+                && !d.enable_avx512f
+                && !d.enable_avx512vl
+                && !d.enable_avx512bw
+        );
+        assert!(d.enable_vaes && d.enable_fma, "AVX-level features stay");
+        // `-mno-avx` removes FMA and F16C, whose VEX forms need AVX.
+        d = parse(&["ccc", "-march=haswell", "-mno-avx"]);
+        assert!(!d.enable_fma && !d.enable_f16c && !d.enable_avx2 && d.enable_sse4_2);
+        // `-mno-pclmul` removes VPCLMULQDQ; `-mvpclmulqdq` brings PCLMUL.
+        d = parse(&["ccc", "-march=icelake-server", "-mno-pclmul"]);
+        assert!(!d.enable_pclmul && !d.enable_vpclmulqdq && d.enable_vaes);
+        d = parse(&["ccc", "-mvpclmulqdq"]);
+        assert!(d.enable_vpclmulqdq && d.enable_pclmul && d.enable_avx);
+        // `-msse4` is SSE4.2, with the POPCNT SSE4.2 brings; an explicit
+        // `-mno-popcnt` before it still wins.
+        d = parse(&["ccc", "-msse4"]);
+        assert!(d.enable_sse4_2 && d.resolved_popcnt());
+        d = parse(&["ccc", "-mno-popcnt", "-msse4"]);
+        assert!(d.enable_sse4_2 && !d.resolved_popcnt());
+        // Extensions leave with the features they require: AVXIFMA with
+        // AVX2, SHA512 only with AVX; CMPCCXADD survives `-mno-sse`.
+        d = parse(&["ccc", "-march=clearwaterforest", "-mno-avx2"]);
+        assert!(!*d.x86_extra_slot(E::AvxIfma) && *d.x86_extra_slot(E::Sha512));
+        d = parse(&["ccc", "-march=clearwaterforest", "-mno-avx"]);
+        assert!(!*d.x86_extra_slot(E::Sha512) && *d.x86_extra_slot(E::Cmpccxadd));
+        d = parse(&["ccc", "-mno-avx2", "-march=clearwaterforest"]);
+        assert!(
+            !*d.x86_extra_slot(E::AvxIfma),
+            "a sticky denial applies to a later -march="
+        );
+        // `-mno-avx512bmm` takes BMM alone.
+        d = parse(&["ccc", "-mavx512bw", "-mavx512bmm", "-mno-avx512bmm"]);
+        assert!(!d.enable_avx512bmm && d.enable_avx512bw && d.enable_avx512f);
+        // `-mno-mmx` withdraws `__MMX__`, also against SSE's implication.
+        for argv in [
+            &["ccc", "-mno-mmx"][..],
+            &["ccc", "-mno-mmx", "-msse"],
+            &["i686-ccc", "-mno-mmx"],
+        ] {
+            let d = parse(argv);
+            assert!(d.mmx_explicitly_disabled, "{argv:?}");
+        }
+        assert!(!parse(&["i686-ccc", "-mno-mmx"]).resolved_i686_mmx());
+        assert!(!parse(&["ccc", "-mno-mmx", "-mmmx"]).mmx_explicitly_disabled);
     }
 }

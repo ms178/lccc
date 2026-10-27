@@ -3523,16 +3523,17 @@ impl InstructionEncoder {
         // xmm/ymm0–15 stay on the VEX path (shorter). Without the high-reg
         // check, xmm16 would wrap into the 3-bit VEX/ModRM fields as xmm0.
         let has_zmm_or_k = ops.iter().any(operand_needs_evex);
-        // Dual-encoded VEX/EVEX mnemonics (AVX-VNNI ∩ AVX512-VNNI, plus the
-        // AVX-IFMA ∩ AVX512-IFMA pair): GAS 2.47 emits the EVEX row by
-        // default even when the VEX form is the same length or shorter
-        // (`vpdpbusd %ymm3,%ymm1,%ymm2` = `62 f2 75 28 50 d3`, byte-probed;
-        // the INT8 variants vpdpbssd/bsud/wssud have no EVEX form and stay
-        // VEX). The {vex} hint (handled below) still forces the VEX row
-        // (`{vex} vpmadd52huq %ymm3,%ymm1,%ymm2` = `c4 e2 f5 b5 d3`).
+        // Dual-encoded VEX/EVEX mnemonics (AVX-VNNI ∩ AVX512-VNNI, all four
+        // including the saturating `s` forms, plus the AVX-IFMA ∩
+        // AVX512-IFMA pair): GAS emits the EVEX row by default even when the
+        // VEX form is shorter (`vpdpbusds %ymm2,%ymm1,%ymm0` =
+        // `62 f2 75 28 51 c2`; GAS 2.44 and llvm-mc 23 byte-probed, both
+        // modes). The INT8/INT16 variants (vpdpbssd, vpdpwusd, ...) have no
+        // EVEX form and stay VEX. The {vex} hint (handled below) forces the
+        // VEX row (`{vex} vpmadd52huq %ymm3,%ymm1,%ymm2` = `c4 e2 f5 b5 d3`).
         let prefer_evex = matches!(
             mnemonic,
-            "vpdpbusd" | "vpdpwssd" | "vpmadd52luq" | "vpmadd52huq"
+            "vpdpbusd" | "vpdpbusds" | "vpdpwssd" | "vpdpwssds" | "vpmadd52luq" | "vpmadd52huq"
         ) || avx::vcvt_params(mnemonic).is_some_and(|params| params.prefer_evex)
             || evex_shift_memory;
         // {vex}/{vex2}/{vex3} (GAS 2.47): the EVEX encoding is forbidden.
@@ -7058,17 +7059,24 @@ mod encoding_opt_tests {
     #[test]
     fn vex_mem_source_forms() {
         // Encoding gap sweep: every byte verified against GAS 2.47.
-        // Dual-encoded VNNI rows (vpdpbusd/vpdpwssd) default to the EVEX
-        // encoding like GAS 2.47 on BOTH x86-64 and i686 (byte-probed;
-        // clang/gcc/icc agree); the {vex} hint forces the 6-byte VEX row.
-        // The INT8 variants (vpdpbusds) have no EVEX form and stay VEX.
+        // Dual-encoded VNNI rows (vpdpbusd/vpdpbusds/vpdpwssd/vpdpwssds)
+        // default to the EVEX encoding like GAS on BOTH x86-64 and i686
+        // (byte-probed with GAS 2.44 and llvm-mc 23); the {vex} hint forces
+        // the VEX row. The INT8 variants (vpdpbssd) have no EVEX form.
         assert_eq!(hex("vpdpbusd (%rax), %xmm1, %xmm2"), "62 f2 75 08 50 10");
         assert_eq!(
             hex("vpdpbusd 0x20(%rax), %ymm1, %ymm2"),
             "62 f2 75 28 50 50 01"
         );
         assert_eq!(hex("{vex} vpdpbusd (%rax), %xmm1, %xmm2"), "c4 e2 71 50 10");
-        assert_eq!(hex("vpdpbusds (%rax), %xmm1, %xmm2"), "c4 e2 71 51 10");
+        assert_eq!(hex("vpdpbusds (%rax), %xmm1, %xmm2"), "62 f2 75 08 51 10");
+        assert_eq!(
+            hex("{vex} vpdpbusds (%rax), %xmm1, %xmm2"),
+            "c4 e2 71 51 10"
+        );
+        assert_eq!(hex("vpdpwssds %xmm2, %xmm1, %xmm0"), "62 f2 75 08 53 c2");
+        assert_eq!(hex("{vex} vpdpwssds %xmm2, %xmm1, %xmm0"), "c4 e2 71 53 c2");
+        assert_eq!(hex("vpdpbssd %ymm2, %ymm1, %ymm0"), "c4 e2 77 50 c2");
         // Variable-shift count from memory (r/m = count, vvvv = data).
         assert_eq!(hex("vpslld (%rax), %xmm6, %xmm7"), "c5 c9 f2 38");
         assert_eq!(

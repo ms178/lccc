@@ -13,7 +13,13 @@
 #      `no-movbe` keeps `bswap`;
 #   6. FP a function's own target denies (`general-regs-only`, `no-sse`,
 #      `no-sse2`, `no-80387`) is refused naming the function, on x86-64 and
-#      i686, while integer-only and SSE1 code under the same denials builds.
+#      i686, while integer-only and SSE1 code under the same denials builds;
+#   7. intrinsics are accepted exactly where GCC 16.2 accepts them: `arch=`
+#      replaces the command line's ISA and the options before it, denials
+#      cascade (`no-sse2` revokes AES), `general-regs-only` revokes the SSE
+#      class but not integer extensions, and malformed `arch=` values are
+#      the errors GCC reports. With gcc-16 present every verdict is
+#      re-measured on GCC, so the table cannot drift from the oracle.
 # zstd relies on all four: its *_bmi2 clones are dispatched at run time
 # from plain code (DYNAMIC_BMI2).
 set -euo pipefail
@@ -154,4 +160,48 @@ if [[ -n "$GCC_ORACLE" ]]; then
             && fail "GCC accepts what the gate refuses: $src"
     done
 fi
+
+# 7. Intrinsic permission matrix: <verdict> <flags> <target> <body>, where
+#    verdict is `accept`, `reject` (lccc and GCC agree), or `portable:INSN`:
+#    lccc's portable header form (popcntintrin.h, like the BMI headers)
+#    builds without INSN where GCC rejects the call. `-dM -E` drift is the
+#    `march_profiles_match_gcc_feature_sets` unit test's.
+verdict() {
+    local want=$1 flags=$2 target=$3 body=$4 cc got gcc_want=$1
+    printf '#include <immintrin.h>\n__attribute__((target("%s"))) long f(__m256i *v, unsigned x) {\n    %s\n}\n' \
+        "$target" "$body" >"$tmp/p.c"
+    if [[ $want == portable:* ]]; then gcc_want=reject; want=accept; fi
+    for cc in "$CCC" ${GCC_ORACLE:+"$GCC_ORACLE"}; do
+        # shellcheck disable=SC2086 # $flags is a word list
+        if "$cc" -O2 $flags -S "$tmp/p.c" -o "$tmp/p.s" 2>"$tmp/p.err"; then got=accept; else got=reject; fi
+        [[ $cc == "$CCC" ]] || want=$gcc_want
+        [[ $got == "$want" ]] || fail "${cc##*/} ${got}s target(\"$target\") $flags: $body $(head -c 300 "$tmp/p.err")"
+        if [[ $cc == "$CCC" && $1 == portable:* ]] && grep -Eq "\\b${1#portable:}" "$tmp/p.s"; then
+            fail "target(\"$target\") $flags emitted ${1#portable:}: $body"
+        fi
+    done
+}
+aes='return _mm_cvtsi128_si64(_mm_aesenc_si128(_mm_set1_epi64x(x), _mm_set1_epi64x(3)));'
+add256='*v = _mm256_add_epi32(*v, *v); return 0;'
+pop='return _mm_popcnt_u32(x);'
+pdep='return _pdep_u32(x, 0xff00ff);'
+verdict portable:popcnt -mpopcnt "arch=x86-64" "$pop"
+verdict reject -mavx2 "arch=x86-64" "$add256"
+verdict reject "" "avx2,arch=x86-64" "$add256"
+verdict accept "" "arch=x86-64,avx2" "$add256"
+verdict reject "" "arch=haswell" "$aes"
+verdict accept "" "arch=haswell" "$pdep"
+verdict accept "" "arch=skylake" "$aes"
+verdict accept "" "aes" "$aes"
+verdict reject -maes "no-sse2" "$aes"
+verdict reject -maes "general-regs-only" "$aes"
+verdict accept -mbmi2 "general-regs-only" "$pdep"
+verdict accept "-maes -mpclmul" "no-avx" "$aes"
+verdict accept -mpopcnt "no-sse4.2" "$pop"
+verdict accept "" "popcnt" "$pop"
+verdict reject -mavx2 "no-sse4.1" "$add256"
+verdict reject -march=haswell "tune=generic" "$aes"
+for bad in arch=bogus arch=generic arch=native arch=pentium4 "arch=haswell,arch=skylake"; do
+    verdict reject "" "$bad" "return x;"
+done
 echo "target-attribute ISA gate: PASS"

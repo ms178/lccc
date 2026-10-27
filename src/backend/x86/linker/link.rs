@@ -14,7 +14,7 @@ use super::elf::*;
 use super::emit_exec::emit_executable;
 use super::emit_shared::emit_shared_library;
 use super::icf;
-use super::input::{load_file, load_file_as_needed};
+use super::input::{load_file, load_file_as_needed, load_library_as_needed};
 use super::plt_got::{collect_ifunc_symbols, collect_local_ifuncs, create_plt_got};
 use super::types::{GlobalSymbol, INTERP};
 use crate::backend::linker_common::{self, OutputSection};
@@ -260,6 +260,7 @@ pub(crate) fn evaluate_pending_defsyms(
 
 pub fn link_builtin(
     object_files: &[&str],
+    object_as_needed: &[bool],
     output_path: &str,
     user_args: &[String],
     lib_paths: &[&str],
@@ -290,6 +291,10 @@ pub fn link_builtin(
     // scripts) searching only the driver's default directories.
     let parsed_args = linker_common::parse_linker_args(user_args);
     parsed_args.validate_common_page_size()?;
+    let fatal_warnings = parsed_args.fatal_warnings;
+    if parsed_args.warn_common {
+        objects.enable_warn_common();
+    }
 
     // `-L` directories first, in command-line order, then the defaults -- the
     // order GNU ld searches in.
@@ -310,15 +315,17 @@ pub fn link_builtin(
         }
     }
 
-    // Load user object files
-    for path in object_files {
-        load_file(
+    // Load user object files, each with the `--as-needed` state it was
+    // named under (`linker_common::object_as_needed`).
+    for (i, path) in object_files.iter().enumerate() {
+        load_file_as_needed(
             path,
             &mut objects,
             &mut globals,
             &mut needed_sonames,
             &all_lib_paths,
             false,
+            linker_common::object_as_needed(object_as_needed, i, &parsed_args.inputs, path),
         )?;
     }
 
@@ -334,11 +341,6 @@ pub fn link_builtin(
         .iter()
         .map(|kw| format!("-z {kw} ignored"))
         .collect();
-    if parsed_args.warn_common {
-        option_warnings.push(
-            "--warn-common ignored: common-symbol diagnostics are not implemented".to_string(),
-        );
-    }
     // `--emit-relocs` is implemented only for `-T` script links
     // (`emit_script` retains the applied relocations there); on this path
     // the flag parses but the emitter cannot honour it, so say so rather
@@ -396,47 +398,18 @@ pub fn link_builtin(
     let wrap_symbols = parsed_args.wrap_symbols;
     let undefined_symbols = parsed_args.undefined_symbols;
 
-    // Positional --as-needed state, keyed by the input as it was written on the
-    // command line. The executable path resolves libraries through flat name
-    // lists (`libs_to_load`, `extra_object_files`) rather than the ordered
-    // `inputs` vector, so the per-input flag is carried across in this map.
-    //
-    // Absent from the map means "not mentioned by the user", which covers
-    // driver-supplied and default system libraries; GNU ld's default is
-    // --no-as-needed, but those libraries are only consulted when something is
-    // still undefined, so recording them unconditionally would add DT_NEEDED
-    // entries for libraries that were never asked for. They stay as-needed.
-    let as_needed_of: FxHashMap<String, bool> = parsed_args
-        .inputs
-        .iter()
-        .map(|it| (it.name.clone(), it.as_needed))
-        .collect();
-    // Same for --whole-archive, which is positional for exactly the same
-    // reason.  `link_shared` threads it through the ordered `inputs` vector;
-    // this path resolves through flat name lists, so the flag travels in a map
-    // keyed by the name as written.
+    // Positional --whole-archive state.  `link_shared` threads it through the
+    // ordered `inputs` vector; this path resolves through flat name lists
+    // (`libs_to_load`, `extra_object_files`), so the flag travels in a map
+    // keyed by the name as written.  --as-needed likewise
+    // (`linker_common::input_as_needed`).
     let whole_archive_of: FxHashMap<String, bool> = parsed_args
         .inputs
         .iter()
         .map(|it| (it.name.clone(), it.whole_archive))
         .collect();
-    // `-lfoo` resolves to some /path/libfoo.so.N; map a resolved path back to
-    // the stem the user wrote so the flag can be recovered.
-    let as_needed_for = |path_or_name: &str| -> bool {
-        if let Some(&v) = as_needed_of.get(path_or_name) {
-            return v;
-        }
-        let base = std::path::Path::new(path_or_name)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(path_or_name);
-        let stem = base.strip_prefix("lib").unwrap_or(base);
-        let stem = stem.split(".so").next().unwrap_or(stem);
-        if let Some(&v) = as_needed_of.get(stem) {
-            return v;
-        }
-        true
-    };
+    let as_needed_for =
+        |path_or_name: &str| linker_common::input_as_needed(&parsed_args.inputs, path_or_name);
     // Recover the `--whole-archive` state for a resolved library path or the
     // `-l` stem the user wrote.  Defaults to false: GNU ld's default is
     // selective archive loading.
@@ -548,11 +521,13 @@ pub fn link_builtin(
         let mut all_lib_names: Vec<String> = libs_to_load.clone();
         all_lib_names.extend(needed_libs.iter().map(|s| s.to_string()));
 
-        let mut lib_paths_resolved: Vec<String> = Vec::new();
+        // (path, found by an `-l` search) -- the latter decides the name a
+        // soname-less library is recorded under.
+        let mut lib_paths_resolved: Vec<(String, bool)> = Vec::new();
         // Include deferred .a and .so files first (preserving command-line order)
         for lib_path in &deferred_libs {
-            if !lib_paths_resolved.contains(lib_path) {
-                lib_paths_resolved.push(lib_path.clone());
+            if !lib_paths_resolved.iter().any(|(p, _)| p == lib_path) {
+                lib_paths_resolved.push((lib_path.clone(), false));
             }
         }
         for (idx, lib_name) in all_lib_names.iter().enumerate() {
@@ -564,8 +539,8 @@ pub fn link_builtin(
             if let Some(lib_path) =
                 linker_common::resolve_lib_positional(lib_name, &all_lib_paths, static_only)
             {
-                if !lib_paths_resolved.contains(&lib_path) {
-                    lib_paths_resolved.push(lib_path);
+                if !lib_paths_resolved.iter().any(|(p, _)| *p == lib_path) {
+                    lib_paths_resolved.push((lib_path, true));
                 }
             } else if is_user {
                 // User-specified -l library not found: error (matching ld behavior)
@@ -585,12 +560,17 @@ pub fn link_builtin(
             changed = false;
             let prev_obj_count = objects.len();
             let prev_dyn_count = needed_sonames.len();
-            for lib_path in &lib_paths_resolved {
+            for (lib_path, searched) in &lib_paths_resolved {
                 let wa = whole_archive_for(lib_path);
                 if wa && whole_archive_loaded.contains(lib_path) {
                     continue;
                 }
-                load_file_as_needed(
+                let load = if *searched {
+                    load_library_as_needed
+                } else {
+                    load_file_as_needed
+                };
+                load(
                     lib_path,
                     &mut objects,
                     &mut globals,
@@ -634,6 +614,10 @@ pub fn link_builtin(
         }
     }
 
+    linker_common::warn_common::report_common_warnings(
+        &objects.take_common_warnings(),
+        fatal_warnings,
+    )?;
     define_tls_module_base(&mut globals, &objects);
 
     // Resolve remaining undefined symbols from default system libraries
@@ -903,7 +887,7 @@ pub fn link_builtin(
         &dead_sections,
     );
     linker_common::apply_cie_redirects(&mut objects, &section_map, &eh_packing)?;
-    if !parsed_args.strip_all {
+    if !parsed_args.strip_all && !parsed_args.strip_debug {
         linker_common::merge_debug_sections_elf64(
             &objects,
             &mut output_sections,
@@ -1042,6 +1026,7 @@ pub fn link_builtin(
 /// them as ordinary inputs instead and passes none here.
 pub fn link_shared(
     object_files: &[&str],
+    object_as_needed: &[bool],
     output_path: &str,
     user_args: &[String],
     lib_paths: &[&str],
@@ -1066,6 +1051,9 @@ pub fn link_shared(
     // input list -- the one thing that previously blocked the merge.
     let parsed = linker_common::parse_linker_args(user_args);
     parsed.validate_common_page_size()?;
+    if parsed.warn_common {
+        objects.enable_warn_common();
+    }
     // The shared-object emitter cannot retain applied relocations, and the
     // separate common-page-size granularity is not implemented. Defer these
     // diagnostics until the final --fatal-warnings state is known, just as in
@@ -1075,11 +1063,6 @@ pub fn link_shared(
         .iter()
         .map(|kw| format!("-z {kw} ignored"))
         .collect();
-    if parsed.warn_common {
-        option_warnings.push(
-            "--warn-common ignored: common-symbol diagnostics are not implemented".to_string(),
-        );
-    }
     if parsed.emit_relocs {
         option_warnings.push(
             "--emit-relocs ignored: relocation retention is only implemented for -T script links"
@@ -1135,7 +1118,7 @@ pub fn link_shared(
 
     // Load the leading startup objects and the user object files (from the
     // compiler driver, before user_args)
-    for path in crt_objects_before.iter().chain(object_files) {
+    for path in crt_objects_before {
         load_file(
             path,
             &mut objects,
@@ -1143,6 +1126,17 @@ pub fn link_shared(
             &mut needed_sonames,
             &lib_path_strings,
             false,
+        )?;
+    }
+    for (i, path) in object_files.iter().enumerate() {
+        load_file_as_needed(
+            path,
+            &mut objects,
+            &mut globals,
+            &mut needed_sonames,
+            &lib_path_strings,
+            false,
+            linker_common::object_as_needed(object_as_needed, i, &parsed.inputs, path),
         )?;
     }
 
@@ -1192,7 +1186,7 @@ pub fn link_shared(
                 if *wa && whole_archive_loaded.contains(lib_path) {
                     continue; // Already loaded all members
                 }
-                load_file_as_needed(
+                load_library_as_needed(
                     lib_path,
                     &mut objects,
                     &mut globals,
@@ -1227,13 +1221,14 @@ pub fn link_shared(
             changed = false;
             let prev_count = objects.len();
             for lib_path in &implicit_paths {
-                load_file(
+                load_library_as_needed(
                     lib_path,
                     &mut objects,
                     &mut globals,
                     &mut needed_sonames,
                     &all_lib_paths,
                     false,
+                    true,
                 )?;
             }
             if objects.len() != prev_count {
@@ -1255,6 +1250,10 @@ pub fn link_shared(
         )?;
     }
 
+    linker_common::warn_common::report_common_warnings(
+        &objects.take_common_warnings(),
+        parsed.fatal_warnings,
+    )?;
     define_tls_module_base(&mut globals, &objects);
 
     // Resolve remaining undefined symbols against system libraries (libc, libm,

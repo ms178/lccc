@@ -1190,6 +1190,7 @@ fn link_builtin_native(
         return match arch.elf_machine {
             EM_X86_64 => x86::linker::link_shared(
                 object_files,
+                &[], // the driver's own objects: `input_as_needed`
                 output_path,
                 user_args,
                 &refs.lib_paths,
@@ -1199,6 +1200,7 @@ fn link_builtin_native(
             ),
             EM_AARCH64 => arm::linker::link_shared(
                 object_files,
+                &[], // the driver's own objects: `input_as_needed`
                 output_path,
                 user_args,
                 &refs.lib_paths,
@@ -1208,6 +1210,7 @@ fn link_builtin_native(
             ),
             EM_RISCV => riscv::linker::link_shared(
                 object_files,
+                &[], // the driver's own objects: `input_as_needed`
                 output_path,
                 user_args,
                 &refs.lib_paths,
@@ -1245,6 +1248,7 @@ fn link_builtin_native(
     match arch.elf_machine {
         EM_X86_64 => x86::linker::link_builtin(
             object_files,
+            &[], // the driver's own objects: `input_as_needed`
             output_path,
             user_args,
             &refs.lib_paths,
@@ -1263,6 +1267,7 @@ fn link_builtin_native(
         ),
         EM_AARCH64 => arm::linker::link_builtin(
             object_files,
+            &[], // the driver's own objects: `input_as_needed`
             output_path,
             user_args,
             &refs.lib_paths,
@@ -1273,6 +1278,7 @@ fn link_builtin_native(
         ),
         EM_RISCV => riscv::linker::link_builtin(
             object_files,
+            &[], // the driver's own objects: `input_as_needed`
             output_path,
             user_args,
             &refs.lib_paths,

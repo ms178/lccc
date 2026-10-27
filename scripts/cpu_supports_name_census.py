@@ -19,9 +19,11 @@ transcribed documentation:
   * every remote compile is cached under `.godbolt-cache/census-v1/` keyed by
     (compiler, source, flags), so a re-run after an interruption is free.
 
-`--lccc-src` diffs the census against LCCC's own tables
-(`src/common/cpu_probe.rs`, `src/common/isa_features.rs`) and fails the run
-when GCC accepts a name LCCC does not.  The CI gate
+`--lccc-src` diffs the census against LCCC's probe table
+(`src/common/cpu_probe.rs`) and fails the run when GCC accepts a name LCCC
+does not.  `--gcc-isas` adds every name of GCC's `ISA_NAMES_TABLE`
+(`gcc/common/config/i386/i386-isas.h`) to the candidates and fails when the
+built-in list lacks one, so a new GCC cannot outgrow the census unnoticed.  The CI gate
 (`tests/regression/check_cpu_supports_runtime.sh`) uses the recorded census at
 `tests/data/cpu_supports_name_census.json` for the same property without any
 network access; this tool is how that file is regenerated.
@@ -29,7 +31,8 @@ network access; this tool is how that file is regenerated.
 Usage:
     scripts/cpu_supports_name_census.py --compilers gcc16.2,clang,icx -j6 \\
         --json tests/data/cpu_supports_name_census.json
-    scripts/cpu_supports_name_census.py --compilers gcc16.2 --lccc-src .
+    scripts/cpu_supports_name_census.py --compilers gcc16.2 --lccc-src . \\
+        --gcc-isas path/to/gcc/common/config/i386/i386-isas.h
 """
 from __future__ import annotations
 
@@ -86,6 +89,11 @@ CANDIDATES: list[str] = [
     "mwait", "svm", "vmx", "avic", "npt", "ept", "smap", "smep", "invpcid",
     "la57", "5levelpaging", "gds", "pta", "crc32", "pcommit", "erms",
     "rdpru", "cmpccxadd", "raoint", "rng", "amx-vnni",
+    # the rest of GCC 16.2's ISA_NAMES_TABLE
+    "3dnowp", "adx", "aeskle", "amx-avx512", "amx-fp8", "amx-movrs",
+    "amx-tf32", "apxf", "avx512bmm", "bmi", "bmi2", "cmpxchg8b", "fsgsbase",
+    "fxsave", "ibt", "lm", "prefetchi", "usermsr", "widekl", "x86-64",
+    "x86-64-v2", "x86-64-v3", "x86-64-v4",
     # constructive controls: must be rejected by every compiler
     "not-a-real-feature", "avx9", "sse5",
 ]
@@ -215,8 +223,14 @@ def census_compiler(compiler: str, names: list[str], flags: str, jobs: int,
 LCCC_PROBE_ENTRY_RE = re.compile(r'"([^"]+)"\s*,\s*Probe::new\s*\(')
 
 
-def lccc_names(src_root: Path) -> tuple[set[str], set[str]]:
-    """LCCC's runtime-probe names (canonical + aliases) and static names.
+def gcc_isa_names(header: Path) -> list[str]:
+    """The names of GCC's `ISA_NAMES_TABLE` (`i386-isas.h`)."""
+    text = header.read_text(encoding="utf-8")
+    return re.findall(r'ISA_NAMES_TABLE_ENTRY\s*\(\s*"([^"]+)"', text)
+
+
+def lccc_names(src_root: Path) -> set[str]:
+    """LCCC's runtime-probe names (canonical + aliases).
 
     Each table is extracted from its own body, so a name mentioned in a doc
     comment or in another table cannot enter the set.
@@ -227,10 +241,7 @@ def lccc_names(src_root: Path) -> tuple[set[str], set[str]]:
     alias_block = probe.split("pub const NAME_ALIASES", 1)[1] if "pub const NAME_ALIASES" in probe else ""
     aliases = {alias for alias, _canonical in
                re.findall(r'\("([^"]+)",\s*"([^"]+)"\s*\)', alias_block)}
-    static = (src_root / "src/common/isa_features.rs").read_text(encoding="utf-8")
-    body = static.split("pub const FEATURE_TABLE", 1)[1].split("];", 1)[0]
-    static_names = set(re.findall(r'"([^"]+)"', body))
-    return canonical | aliases, static_names
+    return canonical | aliases
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -242,6 +253,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="file with one candidate name per line (overrides the list)")
     parser.add_argument("--json", default=None, help="write the census JSON here")
     parser.add_argument("--lccc-src", default=None, help="LCCC root; diff the tables")
+    parser.add_argument("--gcc-isas", default=None,
+                        help="GCC's i386-isas.h: require its names among the candidates")
     parser.add_argument("--verify-json", default=None,
                         help="offline: check a recorded census against the "
                              "current source tables (used by the CI gate)")
@@ -256,12 +269,18 @@ def main(argv: list[str] | None = None) -> int:
              if args.names else list(CANDIDATES))
     seen: set[str] = set()
     names = [n for n in names if not (n in seen or seen.add(n))]
+    if args.gcc_isas:
+        uncovered = sorted(set(gcc_isa_names(Path(args.gcc_isas))) - set(CANDIDATES))
+        if uncovered:
+            print("CANDIDATES lacks GCC ISA_NAMES_TABLE names: " + ", ".join(uncovered),
+                  file=sys.stderr)
+            return 1
 
     if args.verify_json:
         status = 0
         recorded = json.loads(Path(args.verify_json).read_text(encoding="utf-8"))
         root = Path(args.lccc_src or ".")
-        probe_names, static_names = lccc_names(root)
+        probe_names = lccc_names(root)
         recorded_probe = set(recorded.get("lccc_names", {}).get("probe", []))
         if recorded_probe and recorded_probe != probe_names:
             print("CENSUS DRIFT: recorded lccc probe names differ from the source",
@@ -300,7 +319,7 @@ def main(argv: list[str] | None = None) -> int:
     status = 0
     if args.lccc_src:
         root = Path(args.lccc_src)
-        probe_names, static_names = lccc_names(root)
+        probe_names = lccc_names(root)
         for compiler, data in census.items():
             accepted = set(data["accepted"])  # type: ignore[arg-type]
             missing = sorted(accepted - probe_names)
@@ -314,14 +333,6 @@ def main(argv: list[str] | None = None) -> int:
                 status = 1
             if extra:
                 print("  lccc-only extras (informational): " + ", ".join(extra))
-        uncovered = sorted(n for n in static_names if n not in probe_names)
-        if uncovered:
-            print("STATIC TABLE NAMES WITHOUT RUNTIME PROBE:", file=sys.stderr)
-            for name in uncovered:
-                print(f"    {name}", file=sys.stderr)
-            status = 1
-        else:
-            print(f"static table: {len(static_names)} names, all covered by the runtime probe")
 
     if args.json:
         out = Path(args.json)
@@ -332,7 +343,7 @@ def main(argv: list[str] | None = None) -> int:
             "strict": [c for c in STRICT_COMPILERS if c in census],
             "candidates": names,
             "lccc_names": {
-                "probe": sorted(lccc_names(Path(args.lccc_src or "."))[0]) if (
+                "probe": sorted(lccc_names(Path(args.lccc_src or "."))) if (
                     Path(args.lccc_src or ".") / "src/common/cpu_probe.rs"
                 ).exists() else [],
             },

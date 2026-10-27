@@ -19,8 +19,8 @@ use crate::backend::linker_common::defsym;
 use crate::backend::linker_common::{
     self,
     linker_script::{
-        self, AssignOp, Assignment, EvalCtx, EvalError, LinkerScript, OutputSecDef, SecItem,
-        SectionsItem, SortKind, eval_expr, glob_match,
+        self, AssignOp, Assignment, EvalCtx, EvalError, InputSpec, LinkerScript, OutputSecDef,
+        SecItem, SectionsItem, SortKind, eval_expr, glob_match,
     },
 };
 
@@ -1079,6 +1079,79 @@ pub fn link_with_script_i386_with_extras(
     )
 }
 
+/// Names of non-alloc input sections that no script pattern (including
+/// `/DISCARD/`) matches, in first-seen order. Empty and `SHF_EXCLUDE`
+/// sections are not output material.
+fn non_alloc_orphan_names(
+    sections: &[SectionsItem],
+    objects: &[Object],
+    candidates: &[(usize, usize)],
+) -> Vec<String> {
+    const SHF_EXCLUDE: u64 = 0x8000_0000;
+    let matched = |name: &str| {
+        sections.iter().any(|item| {
+            let SectionsItem::Output(def) = item else {
+                return false;
+            };
+            def.items.iter().any(|body| {
+                matches!(body, SecItem::Input(spec)
+                    if spec.patterns.iter().any(|p| glob_match(p, name)))
+            })
+        })
+    };
+    let mut seen: FxHashSet<&str> = FxHashSet::default();
+    let mut names = Vec::new();
+    for &(oi, si) in candidates {
+        let sec = &objects[oi].sections[si];
+        if sec.flags & (SHF_ALLOC_ | SHF_EXCLUDE) != 0 || sec.size == 0 || sec.name.is_empty() {
+            continue;
+        }
+        if seen.insert(sec.name.as_str()) && !matched(&sec.name) {
+            names.push(sec.name.clone());
+        }
+    }
+    names
+}
+
+fn non_alloc_orphan_def(name: String) -> SectionsItem {
+    SectionsItem::Output(OutputSecDef {
+        items: vec![SecItem::Input(InputSpec {
+            patterns: vec![name.clone()],
+            keep: false,
+            sort: SortKind::None,
+        })],
+        name,
+        address: Some(linker_script::Expr::Num(0)),
+        info: false,
+        at_lma: None,
+        phdrs: Vec::new(),
+        fill: None,
+        align: None,
+        region: None,
+        lma_region: None,
+    })
+}
+
+/// Input sections grouped by name, groups and members in input order.
+fn group_by_name(sections: &[(usize, usize)], objects: &[Object]) -> Vec<Vec<(usize, usize)>> {
+    let mut index: FxHashMap<&str, usize> = FxHashMap::default();
+    let mut groups: Vec<Vec<(usize, usize)>> = Vec::new();
+    for &(oi, si) in sections {
+        let name = objects[oi].sections[si].name.as_str();
+        let slot = *index.entry(name).or_insert_with(|| {
+            groups.push(Vec::new());
+            groups.len() - 1
+        });
+        groups[slot].push((oi, si));
+    }
+    groups
+}
+
+fn align_up_pow2(value: u64, align: u64) -> u64 {
+    debug_assert!(align.is_power_of_two());
+    (value + align - 1) & !(align - 1)
+}
+
 #[expect(clippy::too_many_arguments)]
 fn link_with_script_machine(
     objects: &mut [Object],
@@ -1097,7 +1170,7 @@ fn link_with_script_machine(
     machine: ScriptMachine,
     extras: &ScriptLinkExtras,
 ) -> Result<(), String> {
-    let script: LinkerScript = linker_script::parse_linker_script(script_src)?;
+    let mut script: LinkerScript = linker_script::parse_linker_script(script_src)?;
 
     // `--gc-sections` for script links uses the same relocation-reachability
     // engine as ordinary links, with two script-specific root classes:
@@ -1297,6 +1370,18 @@ fn link_with_script_machine(
             unassigned.push((oi, si));
         }
     }
+
+    // Non-alloc orphans (DWARF, `.comment`, ...) are kept, as GNU ld keeps
+    // them: each unmatched name becomes `NAME 0 : { *(NAME) }` after the
+    // script's own sections, the exact form the kernel's DWARF_DEBUG macro
+    // spells out. Matching below is by name alone, so "no pattern in any
+    // definition matches" is precisely "would be an orphan". Non-alloc
+    // definitions never move dot, so no loaded address changes.
+    script.sections.extend(
+        non_alloc_orphan_names(&script.sections, objects, &unassigned)
+            .into_iter()
+            .map(non_alloc_orphan_def),
+    );
 
     // Output section definitions in script order.
     let out_defs: Vec<&OutputSecDef> = script
@@ -1992,40 +2077,64 @@ fn link_with_script_machine(
         }
     }
 
-    // Append orphan alloc sections at the end (page-aligned).
-    if !orphans.is_empty() {
-        for (oi, si) in orphans {
+    // Append orphan alloc sections at the end, one output section per name
+    // (GNU ld merges same-named orphans; one header per input fragment would
+    // make ADDR/SIZEOF and __start_/__stop_ see only the last fragment).
+    for group in group_by_name(&orphans, objects) {
+        let first = &objects[group[0].0].sections[group[0].1];
+        let name = first.name.clone();
+        let align = group
+            .iter()
+            .map(|&(oi, si)| objects[oi].sections[si].addralign.max(1))
+            .max()
+            .unwrap_or(1);
+        dot = align_up_pow2(dot, align);
+        let start = dot;
+        let owner = out_secs.len();
+        let mut placed = Vec::with_capacity(group.len());
+        let (mut flags, mut nobits) = (0u64, true);
+        for &(oi, si) in &group {
             let sec = &objects[oi].sections[si];
-            let a = sec.addralign.max(1);
-            dot = (dot + a - 1) & !(a - 1);
+            dot = align_up_pow2(dot, sec.addralign.max(1));
             placed_map.insert((oi, si), dot);
-            placed_owner.insert((oi, si), out_secs.len());
-            let start = dot;
-            dot += sec.size;
-            dot_home = Some(sec.name.clone());
-            sections_meta.insert(sec.name.clone(), (start, sec.size, a, start));
-            out_secs.push(OutSec {
-                name: sec.name.clone(),
-                vaddr: start,
-                lma: start,
+            placed_owner.insert((oi, si), owner);
+            placed.push(Placed {
+                obj_idx: oi,
+                sec_idx: si,
+                vaddr: dot,
                 size: sec.size,
-                align: a,
-                sh_type: sec.sh_type,
-                flags: sec.flags & !SHF_GROUP_,
-                file_offset: 0,
-                is_alloc: true,
-                nobits: sec.sh_type == SHT_NOBITS_,
-                phdrs: Vec::new(),
-                fill: None,
-                placed: vec![Placed {
-                    obj_idx: oi,
-                    sec_idx: si,
-                    vaddr: start,
-                    size: sec.size,
-                }],
-                data_commands: Vec::new(),
             });
+            dot += sec.size;
+            flags |= sec.flags & !SHF_GROUP_;
+            nobits &= sec.sh_type == SHT_NOBITS_;
         }
+        let size = dot - start;
+        dot_home = Some(name.clone());
+        sections_meta.insert(name.clone(), (start, size, align, start));
+        out_secs.push(OutSec {
+            name,
+            vaddr: start,
+            lma: start,
+            size,
+            align,
+            // A NOBITS member mixed with file-backed ones is materialised
+            // as zeros, as in any PROGBITS output section.
+            sh_type: if nobits {
+                SHT_NOBITS_
+            } else if first.sh_type == SHT_NOBITS_ {
+                SHT_PROGBITS_
+            } else {
+                first.sh_type
+            },
+            flags,
+            file_offset: 0,
+            is_alloc: true,
+            nobits,
+            phdrs: Vec::new(),
+            fill: None,
+            placed,
+            data_commands: Vec::new(),
+        });
     }
 
     // ── Re-run deferred assignments to fixed point ──
@@ -2184,6 +2293,37 @@ fn link_with_script_machine(
                         "linker script: cannot resolve assignment {} = ... ({})",
                         a.symbol, e
                     ));
+                }
+            }
+        }
+    }
+
+    // GNU ld defines __start_SEC/__stop_SEC for every output section whose
+    // name is a C identifier when an input references them and nothing
+    // defines them (registries built with __attribute__((section)) rely on
+    // it). They bracket the whole output section.
+    let wanted_bounds: FxHashSet<&str> = objects
+        .iter()
+        .flat_map(|obj| obj.symbols.iter())
+        .filter(|sym| sym.shndx == SHN_UNDEF && !sym.is_local())
+        .map(|sym| sym.name.as_str())
+        .filter(|name| name.starts_with("__start_") || name.starts_with("__stop_"))
+        .collect();
+    if !wanted_bounds.is_empty() {
+        for os in &out_secs {
+            if !linker_common::is_valid_c_identifier_for_section(&os.name) {
+                continue;
+            }
+            for (symbol, value) in [
+                (format!("__start_{}", os.name), os.vaddr),
+                (format!("__stop_{}", os.name), os.vaddr + os.size),
+            ] {
+                if wanted_bounds.contains(symbol.as_str())
+                    && !symbols.contains_key(&symbol)
+                    && !def_syms.contains_key(&symbol)
+                {
+                    sym_home.insert(symbol.clone(), os.name.clone());
+                    symbols.insert(symbol, value);
                 }
             }
         }
@@ -3636,7 +3776,12 @@ fn link_with_script_machine(
         Ok(())
     }
 
-    if emit_symtab {
+    // `-s` drops .symtab/.strtab, except that --emit-relocs records index
+    // symbols (GNU ld keeps the referenced ones under `-s --emit-relocs`;
+    // the full table is a valid superset, an empty one would leave every
+    // retained relocation pointing past the end of .symtab).
+    let keep_symtab = emit_symtab || emit_relocs;
+    if keep_symtab {
         let add_sym = |name: &str,
                        value: u64,
                        size: u64,
@@ -3926,11 +4071,15 @@ fn link_with_script_machine(
         out.push(0);
     }
     let symtab_off = out.len() as u64;
-    for e in &symtab {
-        out.extend_from_slice(&e[..machine.sym_size()]);
+    if keep_symtab {
+        for e in &symtab {
+            out.extend_from_slice(&e[..machine.sym_size()]);
+        }
     }
     let strtab_off = out.len() as u64;
-    out.extend_from_slice(&strtab);
+    if keep_symtab {
+        out.extend_from_slice(&strtab);
+    }
 
     let mut rela_offsets: Vec<u64> = Vec::with_capacity(retained.len());
     for rr in &retained {
@@ -3962,8 +4111,14 @@ fn link_with_script_machine(
             shname(&mut shstrtab, &n)
         })
         .collect();
-    let symtab_name = shname(&mut shstrtab, ".symtab");
-    let strtab_name = shname(&mut shstrtab, ".strtab");
+    let (symtab_name, strtab_name) = if keep_symtab {
+        (
+            shname(&mut shstrtab, ".symtab"),
+            shname(&mut shstrtab, ".strtab"),
+        )
+    } else {
+        (0, 0)
+    };
     let shstrtab_name = shname(&mut shstrtab, ".shstrtab");
 
     while out.len() % table_align != 0 {
@@ -4038,7 +4193,7 @@ fn link_with_script_machine(
     //   [0]              NULL
     //   [1 .. n_hdrs)    output sections (hdr_secs order)
     //   [n_hdrs ..]      .rela.* (one per retained group), if --emit-relocs
-    //   then             .symtab, .strtab, .shstrtab
+    //   then             .symtab, .strtab (unless stripped), .shstrtab
     let symtab_idx = n_hdrs + retained.len();
     let strtab_idx = symtab_idx + 1;
 
@@ -4073,34 +4228,36 @@ fn link_with_script_machine(
         )?;
     }
 
-    write_script_shdr(
-        machine,
-        &mut out,
-        symtab_name,
-        SHT_SYMTAB_,
-        0,
-        0,
-        symtab_off,
-        (symtab.len() * machine.sym_size()) as u64,
-        strtab_idx as u32,
-        n_local_syms as u32,
-        table_align as u64,
-        machine.sym_size() as u64,
-    )?;
-    write_script_shdr(
-        machine,
-        &mut out,
-        strtab_name,
-        SHT_STRTAB_,
-        0,
-        0,
-        strtab_off,
-        strtab.len() as u64,
-        0,
-        0,
-        1,
-        0,
-    )?;
+    if keep_symtab {
+        write_script_shdr(
+            machine,
+            &mut out,
+            symtab_name,
+            SHT_SYMTAB_,
+            0,
+            0,
+            symtab_off,
+            (symtab.len() * machine.sym_size()) as u64,
+            strtab_idx as u32,
+            n_local_syms as u32,
+            table_align as u64,
+            machine.sym_size() as u64,
+        )?;
+        write_script_shdr(
+            machine,
+            &mut out,
+            strtab_name,
+            SHT_STRTAB_,
+            0,
+            0,
+            strtab_off,
+            strtab.len() as u64,
+            0,
+            0,
+            1,
+            0,
+        )?;
+    }
     write_script_shdr(
         machine,
         &mut out,
@@ -4116,7 +4273,7 @@ fn link_with_script_machine(
         0,
     )?;
 
-    let sh_count = (n_hdrs + retained.len() + 3) as u16;
+    let sh_count = (n_hdrs + retained.len() + if keep_symtab { 3 } else { 1 }) as u16;
     match machine {
         ScriptMachine::X86_64 => {
             w64(&mut out, 40, shoff);

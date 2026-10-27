@@ -70,6 +70,27 @@ pub fn append_build_id_object_styled(objects: &mut Vec<Elf64Object>, style: &Bui
     }
 }
 
+/// `-S`/`--strip-debug` (and `-s`) for the paths that place input sections
+/// themselves -- a linker script, `-r`: each debug section stops being an
+/// input section, exactly like the parser's own metadata (`SHT_NULL`), and
+/// loses its relocations. Section indices stay stable, so every other
+/// reference is untouched.
+pub fn strip_debug_sections(objects: &mut [Elf64Object]) {
+    use crate::backend::elf::{SHF_ALLOC, SHT_NULL};
+    use crate::backend::linker_common::is_debug_section_name;
+    for obj in objects {
+        for (si, sec) in obj.sections.iter_mut().enumerate() {
+            if sec.flags & SHF_ALLOC == 0 && is_debug_section_name(&sec.name) {
+                sec.sh_type = SHT_NULL;
+                sec.size = 0;
+                if let Some(relocs) = obj.relocations.get_mut(si) {
+                    relocs.clear();
+                }
+            }
+        }
+    }
+}
+
 /// Relocatable link (`ld -r`): merge objects into a single ET_REL (x86-64).
 pub fn link_relocatable_x86(objects: &[Elf64Object], output: &str) -> Result<(), String> {
     crate::backend::x86::linker::emit_rel::link_relocatable(objects, output)
@@ -236,14 +257,23 @@ pub const DEFAULT_SEARCH_DIRS_I386: &[&str] = &[
     "/usr/lib",
 ];
 
+/// The `--as-needed` state in effect for an input file named just before
+/// `args[at]`, for each ascending position `at`
+/// (`linker_common::as_needed_states`).
+pub fn as_needed_states(args: &[String], at: &[usize]) -> Vec<bool> {
+    crate::backend::linker_common::as_needed_states(args, at)
+}
+
 pub fn link_builtin_x86(
     object_files: &[&str],
+    object_as_needed: &[bool],
     output: &str,
     user_args: &[String],
     search_dirs: &[&str],
 ) -> Result<(), String> {
     crate::backend::x86::linker::link_builtin(
         object_files,
+        object_as_needed,
         output,
         user_args,
         search_dirs, // after the -L paths in user_args
@@ -256,12 +286,14 @@ pub fn link_builtin_x86(
 /// Shared-library link for the standalone `lccc-ld -shared` driver.
 pub fn link_shared_x86(
     object_files: &[&str],
+    object_as_needed: &[bool],
     output: &str,
     user_args: &[String],
     search_dirs: &[&str],
 ) -> Result<(), String> {
     crate::backend::x86::linker::link_shared(
         object_files,
+        object_as_needed,
         output,
         user_args,
         search_dirs,
@@ -331,6 +363,7 @@ pub const DEFAULT_SEARCH_DIRS_RISCV64: &[&str] = &[
 
 pub fn link_builtin_aarch64(
     object_files: &[&str],
+    object_as_needed: &[bool],
     output: &str,
     user_args: &[String],
     search_dirs: &[&str],
@@ -338,6 +371,7 @@ pub fn link_builtin_aarch64(
 ) -> Result<(), String> {
     crate::backend::arm::linker::link_builtin(
         object_files,
+        object_as_needed,
         output,
         user_args,
         search_dirs,
@@ -350,12 +384,14 @@ pub fn link_builtin_aarch64(
 
 pub fn link_shared_aarch64(
     object_files: &[&str],
+    object_as_needed: &[bool],
     output: &str,
     user_args: &[String],
     search_dirs: &[&str],
 ) -> Result<(), String> {
     crate::backend::arm::linker::link_shared(
         object_files,
+        object_as_needed,
         output,
         user_args,
         search_dirs,
@@ -367,12 +403,14 @@ pub fn link_shared_aarch64(
 
 pub fn link_builtin_riscv64(
     object_files: &[&str],
+    object_as_needed: &[bool],
     output: &str,
     user_args: &[String],
     search_dirs: &[&str],
 ) -> Result<(), String> {
     crate::backend::riscv::linker::link_builtin(
         object_files,
+        object_as_needed,
         output,
         user_args,
         search_dirs,
@@ -384,12 +422,14 @@ pub fn link_builtin_riscv64(
 
 pub fn link_shared_riscv64(
     object_files: &[&str],
+    object_as_needed: &[bool],
     output: &str,
     user_args: &[String],
     search_dirs: &[&str],
 ) -> Result<(), String> {
     crate::backend::riscv::linker::link_shared(
         object_files,
+        object_as_needed,
         output,
         user_args,
         search_dirs,

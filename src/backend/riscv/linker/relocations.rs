@@ -648,9 +648,10 @@ pub fn resolve_archive_members(
                     }
                 }
                 for sym in &obj.symbols {
+                    // Non-weak only (`collect_initial_symbols`).
                     if sym.shndx == SHN_UNDEF
                         && !sym.name.is_empty()
-                        && sym.binding() != STB_LOCAL
+                        && !matches!(sym.binding(), STB_LOCAL | STB_WEAK)
                         && !defined_syms.contains(sym.name.as_str())
                     {
                         undefined_syms.insert(sym.name.to_string());

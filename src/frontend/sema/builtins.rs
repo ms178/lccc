@@ -824,6 +824,13 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
         "__builtin_cpu_supports",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::CpuSupports),
     );
+    // __builtin_cpu_is("cpu") returns nonzero if the CPU executing the program
+    // is the named vendor, family or model: one comparison against libgcc's
+    // `__cpu_model`, the ABI GCC lowers to (`common::cpu_is_table`).
+    m.insert(
+        "__builtin_cpu_is",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::CpuIs),
+    );
 
     // Cache flush - maps to __clear_cache runtime function (provided by libgcc/glibc).
     // On x86 this is a no-op (cache coherent), on ARM/RISC-V it flushes icache.
@@ -1004,6 +1011,23 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
     m.insert(
         "__builtin_ia32_bzhi_di",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Bzhi64),
+    );
+    // BMI2 PDEP/PEXT (GCC's names; `_pdep_u32` and friends).
+    m.insert(
+        "__builtin_ia32_pdep_si",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pdep32),
+    );
+    m.insert(
+        "__builtin_ia32_pdep_di",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pdep64),
+    );
+    m.insert(
+        "__builtin_ia32_pext_si",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pext32),
+    );
+    m.insert(
+        "__builtin_ia32_pext_di",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pext64),
     );
 
     // x86 AES-NI builtins
@@ -3638,6 +3662,8 @@ pub enum BuiltinIntrinsic {
     /// __builtin_cpu_supports("feature") - folds on the effective feature set
     /// (1 = the backend guarantees the feature for this invocation)
     CpuSupports,
+    /// __builtin_cpu_is("cpu") - runtime comparison against libgcc's `__cpu_model`
+    CpuIs,
     /// __builtin_add_overflow(a, b, result_ptr) -> bool (1 if overflow)
     AddOverflow,
     /// __builtin_sub_overflow(a, b, result_ptr) -> bool (1 if overflow)
@@ -3711,6 +3737,11 @@ pub enum BuiltinIntrinsic {
     // BMI2 BZHI: `__builtin_ia32_bzhi_si` / `__builtin_ia32_bzhi_di`
     X86Bzhi32,
     X86Bzhi64,
+    // BMI2 PDEP/PEXT: `__builtin_ia32_{pdep,pext}_{si,di}`
+    X86Pdep32,
+    X86Pdep64,
+    X86Pext32,
+    X86Pext64,
     // AES-NI intrinsics
     X86Aesenc128,
     X86Aesenclast128,

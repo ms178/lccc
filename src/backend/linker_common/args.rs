@@ -107,6 +107,9 @@ pub struct LinkerArgs {
     pub is_pie: bool,
     /// `-s` / `--strip-all`: omit `.symtab` and `.strtab` from the output.
     pub strip_all: bool,
+    /// `-S` / `--strip-debug`: omit the debug sections, keep the symbol
+    /// table (GNU ld). `--strip-all` implies it.
+    pub strip_debug: bool,
     /// `--hash-style=gnu|sysv|both`.  `Gnu` is the default everywhere that
     /// matters on x86-64; `both` is still requested by builds targeting
     /// pre-2.23 glibc, which has no `DT_GNU_HASH` support.
@@ -185,8 +188,8 @@ pub struct LinkerArgs {
     pub pack_dyn_relocs_invalid: Option<String>,
     /// `-t` / `--trace`: print each input file / archive member as loaded.
     pub trace_files: bool,
-    /// `--warn-common` requests a duplicate-COMMON diagnostic that the
-    /// built-in linker does not yet implement; keep it visible for warnings.
+    /// `--warn-common`: GNU ld's COMMON-symbol diagnostics (see
+    /// `warn_common`), honoring `--fatal-warnings`.
     pub warn_common: bool,
     /// `--fatal-warnings` / `--no-fatal-warnings`.
     pub fatal_warnings: bool,
@@ -231,18 +234,13 @@ impl LinkerArgs {
     /// Warn about accepted diagnostic/keyword options whose behavior the
     /// built-in backend does not implement, honoring the final
     /// `--fatal-warnings` state. Target-specific backends call this for the
-    /// shared `-z KEY=VALUE` warning set and `--warn-common` request.
+    /// shared `-z KEY=VALUE` warning set.
     pub fn warn_unimplemented_keyword_options(&self) -> Result<(), String> {
-        let mut warnings: Vec<String> = self
+        let warnings: Vec<String> = self
             .z_ignored_keywords
             .iter()
             .map(|kw| format!("-z {kw} ignored"))
             .collect();
-        if self.warn_common {
-            warnings.push(
-                "--warn-common ignored: common-symbol diagnostics are not implemented".to_string(),
-            );
-        }
         if self.fatal_warnings && !warnings.is_empty() {
             return Err(format!("warning treated as error: {}", warnings[0]));
         }
@@ -309,6 +307,65 @@ pub struct InputItem {
     /// `-call_shared`) turns it back off.  Positional, like
     /// `--whole-archive`; it has no effect on plain file operands.
     pub static_search: bool,
+}
+
+/// The `--as-needed` state of the input written as `path_or_name`: a path,
+/// or the `-l` stem that a resolved `/dir/libNAME.so[.N]` came from; the last
+/// mention wins.  An input the user never named (a driver default) is
+/// as-needed: such libraries are consulted only for what is still undefined,
+/// and GNU's no-as-needed default would give each one a DT_NEEDED nobody
+/// asked for.
+pub fn input_as_needed(inputs: &[InputItem], path_or_name: &str) -> bool {
+    let state_of = |name: &str| {
+        inputs
+            .iter()
+            .rev()
+            .find(|it| it.name == name)
+            .map(|it| it.as_needed)
+    };
+    let base = std::path::Path::new(path_or_name)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(path_or_name);
+    let stem = base.strip_prefix("lib").unwrap_or(base);
+    let stem = stem.split(".so").next().unwrap_or(stem);
+    state_of(path_or_name)
+        .or_else(|| state_of(stem))
+        .unwrap_or(true)
+}
+
+/// The `--as-needed` state that the GNU ld command line `args` puts in
+/// effect for an input file named just before `args[at]` (`at ==
+/// args.len()`: after the last argument), for each of the ascending
+/// positions `at`.  It is the state [`parse_linker_args`] records for a
+/// bare input file ([`InputItem::as_needed`]), for a caller that keeps its
+/// input files apart from the options: the standalone `lccc-ld` loads them
+/// in command-line order itself, and a library it names after
+/// `--no-as-needed` must get its `DT_NEEDED` used or not.
+pub fn as_needed_states(args: &[String], at: &[usize]) -> Vec<bool> {
+    let mut pos = PositionalState::default();
+    let mut stack: Vec<PositionalState> = Vec::new();
+    let mut applied = 0;
+    at.iter()
+        .map(|&end| {
+            for tok in &args[applied..end.clamp(applied, args.len())] {
+                pos.apply(tok, &mut stack);
+            }
+            applied = applied.max(end.min(args.len()));
+            pos.as_needed
+        })
+        .collect()
+}
+
+/// The `--as-needed` state of the `i`-th of a link's `object_files`: the
+/// state the caller recorded for it (`states`, from [`as_needed_states`]),
+/// or, when the caller recorded none -- the compiler driver, whose
+/// `object_files` are its own objects --, what [`input_as_needed`] says.
+pub fn object_as_needed(states: &[bool], i: usize, inputs: &[InputItem], path: &str) -> bool {
+    states
+        .get(i)
+        .copied()
+        .unwrap_or_else(|| input_as_needed(inputs, path))
 }
 
 /// Positional input state that `--push-state` saves and `--pop-state`
@@ -474,6 +531,7 @@ fn apply_plain_flag(result: &mut LinkerArgs, tok: &str) -> bool {
         "-no-pie" | "--no-pie" | "--no-pic-executable" => result.is_pie = false,
         // Exact match only, so `-soname`/`-shared` are not shadowed.
         "-s" | "--strip-all" => result.strip_all = true,
+        "-S" | "--strip-debug" => result.strip_debug = true,
         "-t" | "--trace" => result.trace_files = true,
         "--fatal-warnings" => result.fatal_warnings = true,
         "--no-fatal-warnings" => result.fatal_warnings = false,
@@ -912,6 +970,7 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
         "-rpath-link",
         "--rpath-link",
         "--hash-style",
+        "-hash-style",
         "--dynamic-linker",
         "-dynamic-linker",
         "-I",
@@ -1190,11 +1249,16 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
                     result.symbolic = s;
                 } else if part == "--no-undefined" {
                     result.no_undefined = true;
-                } else if let Some(v) = part.strip_prefix("--hash-style=") {
+                // GNU ld also takes the single-dash spelling, which the
+                // RISC-V gcc driver passes (`-hash-style=gnu`).
+                } else if let Some(v) = part
+                    .strip_prefix("--hash-style=")
+                    .or_else(|| part.strip_prefix("-hash-style="))
+                {
                     if let Some(h) = parse_hash_style(v) {
                         result.hash_style = h;
                     }
-                } else if part == "--hash-style" && j + 1 < parts.len() {
+                } else if (part == "--hash-style" || part == "-hash-style") && j + 1 < parts.len() {
                     j += 1;
                     if let Some(h) = parse_hash_style(parts[j]) {
                         result.hash_style = h;
@@ -1272,6 +1336,21 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
 #[cfg(test)]
 mod map_arg_tests {
     use super::*;
+
+    /// GNU ld takes `--hash-style` single- or double-dashed, with the value
+    /// attached or separate; the RISC-V gcc driver passes `-hash-style=gnu`.
+    #[test]
+    fn hash_style_takes_both_spellings() {
+        for flags in [
+            &["-Wl,--hash-style=sysv"][..],
+            &["-Wl,-hash-style=sysv"],
+            &["-Wl,--hash-style,sysv"],
+            &["-Wl,-hash-style,sysv"],
+        ] {
+            let parsed = parse_linker_args(&args(flags));
+            assert!(matches!(parsed.hash_style, HashStyle::Sysv), "{flags:?}");
+        }
+    }
 
     #[test]
     fn rpath_is_one_colon_joined_runpath_unless_old_dtags() {
@@ -1865,5 +1944,38 @@ mod z_isa_level_tests {
         assert!(mixed.property_link_flags().is_err());
         let mixed2 = parse_linker_args(&args(&["-Wl,-z,x86-64-v9", "-Wl,-z,x86-64-v3"]));
         assert!(mixed2.property_link_flags().is_err());
+    }
+
+    /// `lccc-ld` keeps its input files apart from the options: each takes
+    /// the `--as-needed` state of its position, `--push-state` scoping
+    /// included, which is the state `parse_linker_args` records for an
+    /// input named inline at that position.
+    #[test]
+    fn as_needed_states_follow_the_position() {
+        let opts = args(&[
+            "--as-needed",
+            "--push-state",
+            "--no-as-needed",
+            "--pop-state",
+            "--no-as-needed",
+        ]);
+        assert_eq!(
+            as_needed_states(&opts, &[0, 1, 3, 4, 5]),
+            [false, true, false, true, false]
+        );
+        assert_eq!(as_needed_states(&opts, &[4, 4, 9]), [true, true, false]);
+        for at in 0..=opts.len() {
+            let mut inline = opts.clone();
+            inline.insert(at, "-lx".to_string());
+            let parsed = parse_linker_args(&inline);
+            assert_eq!(
+                [parsed.inputs[0].as_needed],
+                *as_needed_states(&opts, &[at]),
+                "input before argument {at}"
+            );
+        }
+        // A recorded state wins; without one, the driver's rule applies.
+        assert!(!object_as_needed(&[false], 0, &[], "./a.so"));
+        assert!(object_as_needed(&[], 0, &[], "./a.so"));
     }
 }

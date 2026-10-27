@@ -3060,6 +3060,11 @@ pub(super) fn narrow_dead_sign_extension(store: &mut LineStore, infos: &mut [Lin
         let name64 = REG_NAMES[0][dst_fam as usize];
         let mask = 1u16 << dst_fam;
         let mut ok = false;
+        // Last line the scan examined: everything between it and `j` is
+        // stepped over (deleted lines, hidden `-g` rows, comments), so its
+        // live-out is the live-in of `j`.  `j - 1` would ask about a hidden
+        // row, which has no liveness, and `-g` alone would keep the movslq.
+        let mut last = i;
         let mut j = i + 1;
         while j < len {
             if super::helpers::steps_over_line(&infos[j], infos[j].trimmed(store.get(j))) {
@@ -3068,7 +3073,7 @@ pub(super) fn narrow_dead_sign_extension(store: &mut LineStore, infos: &mut [Lin
             }
             if infos[j].is_barrier() || infos[j].pinned {
                 // Safe to stop here only if the register is dead from now on.
-                ok = matches!(lv.live_after(j - 1, dst_fam), Some(false));
+                ok = matches!(lv.live_after(last, dst_fam), Some(false));
                 break;
             }
             let tj = infos[j].trimmed(store.get(j));
@@ -3099,6 +3104,7 @@ pub(super) fn narrow_dead_sign_extension(store: &mut LineStore, infos: &mut [Lin
                     break;
                 }
             }
+            last = j;
             j += 1;
         }
         if ok {

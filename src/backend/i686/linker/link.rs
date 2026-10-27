@@ -186,7 +186,6 @@ fn finish_pie_32(
     pending_defsyms: &PendingDefsyms,
     output_path: &str,
 ) -> Result<(), String> {
-    let mut referenced: FxHashSet<String> = FxHashSet::default();
     let mut unresolved: Vec<&str> = Vec::new();
     let mut seen: FxHashSet<&str> = FxHashSet::default();
     for sym in inputs.iter().flat_map(|o| o.symbols.iter()) {
@@ -200,16 +199,11 @@ fn finish_pie_32(
         {
             continue;
         }
-        match resolved.dynlib_syms.get(sym.name.as_str()) {
-            Some(entry) => {
-                referenced.insert(entry.lib.clone());
-            }
-            None if sym.binding != STB_WEAK
-                && !super::shared::is_emitter_defined(&sym.name, section_name_to_idx) =>
-            {
-                unresolved.push(&sym.name);
-            }
-            None => {}
+        if sym.binding != STB_WEAK
+            && !resolved.dynlib_syms.contains_key(sym.name.as_str())
+            && !super::shared::is_emitter_defined(&sym.name, section_name_to_idx)
+        {
+            unresolved.push(&sym.name);
         }
     }
     if !unresolved.is_empty() {
@@ -220,7 +214,7 @@ fn finish_pie_32(
             .collect::<Vec<_>>()
             .join("\n"));
     }
-    let needed_sonames = resolved.needed_sonames(&referenced);
+    let needed_sonames = resolved.needed_sonames();
     let interp_buf: Option<Vec<u8>> =
         if !resolved.shared_libs.is_empty() || args.dynamic_linker.is_some() {
             Some(match args.dynamic_linker.as_deref() {
@@ -251,15 +245,6 @@ fn finish_pie_32(
         opts,
         pending_defsyms,
     )
-}
-
-/// Sonames the resolved symbols bind to (for as-needed DT_NEEDED).
-fn referenced_sonames(global_symbols: &FxHashMap<String, LinkerSymbol>) -> FxHashSet<String> {
-    global_symbols
-        .values()
-        .filter(|s| s.is_dynamic && !s.dynlib.is_empty())
-        .map(|s| s.dynlib.clone())
-        .collect()
 }
 
 /// Built-in linker entry point with pre-resolved CRT objects and library paths.
@@ -297,7 +282,12 @@ pub fn link_builtin(
         defsyms: &args.defsym_defs,
         allow_shared: !user_static,
         wrap: &opts.wrap,
+        warn_common: args.warn_common,
     })?;
+    crate::backend::linker_common::warn_common::report_common_warnings(
+        &resolved.common_warnings,
+        args.fatal_warnings,
+    )?;
     // GNU ld: an executable is dynamic exactly when a shared object takes
     // part in the link.  A `-nostdlib` link of plain objects is static (no
     // PT_INTERP, no .dynamic) even without `-static`.
@@ -315,9 +305,11 @@ pub fn link_builtin(
     merge_gnu_properties(&mut inputs, &opts.properties);
 
     // Phase 5: Merge sections
-    let (mut output_sections, mut section_name_to_idx, section_map) = merge_sections(&mut inputs);
+    let (mut output_sections, mut section_name_to_idx, section_map) =
+        merge_sections(&mut inputs, !opts.strip_debug);
 
     // Phase 6: Resolve symbols
+    import_shared_commons(&mut inputs, &resolved.common_imports);
     let no_dynlib_syms: DynlibSyms = FxHashMap::default();
     let dynlib_for_resolve = if opts.is_pie {
         &no_dynlib_syms
@@ -365,7 +357,7 @@ pub fn link_builtin(
     }
 
     // Phase 7: Mark PLT/GOT needs and check undefined
-    mark_plt_got_needs(&inputs, &mut global_symbols, is_static);
+    let local_got_slots = mark_plt_got_needs(&inputs, &mut global_symbols);
 
     check_undefined_symbols(&global_symbols)?;
 
@@ -383,9 +375,10 @@ pub fn link_builtin(
     }
 
     // Phase 9: Collect IFUNC symbols for static linking
-    let ifunc_symbols = collect_ifunc_symbols(&global_symbols, is_static);
+    let ifunc_symbols = collect_ifunc_symbols(&global_symbols);
+    let local_ifuncs = collect_local_ifuncs(&inputs, &section_map);
 
-    let needed = resolved.needed_sonames(&referenced_sonames(&global_symbols));
+    let needed = resolved.needed_sonames();
 
     // Phase 10: Layout + emit
     // PT_INTERP: honour `--dynamic-linker=PATH` (lccc-ld normalises every
@@ -412,9 +405,11 @@ pub fn link_builtin(
         &plt_symbols,
         &got_dyn_symbols,
         &got_local_symbols,
+        &local_got_slots,
         num_plt,
         num_got_total,
         &ifunc_symbols,
+        &local_ifuncs,
         is_static,
         &needed,
         &opts,
@@ -592,7 +587,12 @@ pub fn link_shared(
         defsyms: &args.defsym_defs,
         allow_shared: true,
         wrap: &opts.wrap,
+        warn_common: args.warn_common,
     })?;
+    crate::backend::linker_common::warn_common::report_common_warnings(
+        &resolved.common_warnings,
+        args.fatal_warnings,
+    )?;
     let mut inputs = std::mem::take(&mut resolved.objects);
     trace_inputs_32(&inputs, &resolved, opts.trace);
 
@@ -600,11 +600,13 @@ pub fn link_shared(
     merge_gnu_properties(&mut inputs, &opts.properties);
 
     // Merge sections
-    let (mut output_sections, mut section_name_to_idx, section_map) = merge_sections(&mut inputs);
+    let (mut output_sections, mut section_name_to_idx, section_map) =
+        merge_sections(&mut inputs, !opts.strip_debug);
 
     // Resolve symbols.  The output's undefined references stay undefined
     // (they are bound at load time); the linked shared objects' dynamic
     // symbols decide DT_NEEDED and `--no-undefined` only.
+    import_shared_commons(&mut inputs, &resolved.common_imports);
     let no_dynlib_syms: DynlibSyms = FxHashMap::default();
     let (mut global_symbols, _sym_resolution) =
         resolve_symbols(&inputs, &output_sections, &section_map, &no_dynlib_syms);
@@ -625,7 +627,6 @@ pub fn link_shared(
 
     // Undefined non-local references of the output, and which linked shared
     // object (first in command-line order) satisfies each.
-    let mut referenced: FxHashSet<String> = FxHashSet::default();
     let mut unresolved: Vec<&str> = Vec::new();
     let mut seen: FxHashSet<&str> = FxHashSet::default();
     for sym in inputs.iter().flat_map(|o| o.symbols.iter()) {
@@ -639,16 +640,11 @@ pub fn link_shared(
         {
             continue;
         }
-        match resolved.dynlib_syms.get(sym.name.as_str()) {
-            Some(entry) => {
-                referenced.insert(entry.lib.clone());
-            }
-            None if sym.binding != STB_WEAK
-                && !super::shared::is_emitter_defined(&sym.name, &section_name_to_idx) =>
-            {
-                unresolved.push(&sym.name);
-            }
-            None => {}
+        if sym.binding != STB_WEAK
+            && !resolved.dynlib_syms.contains_key(sym.name.as_str())
+            && !super::shared::is_emitter_defined(&sym.name, &section_name_to_idx)
+        {
+            unresolved.push(&sym.name);
         }
     }
     if opts.no_undefined && !unresolved.is_empty() {
@@ -659,7 +655,7 @@ pub fn link_shared(
             .collect::<Vec<_>>()
             .join("\n"));
     }
-    let needed_sonames = resolved.needed_sonames(&referenced);
+    let needed_sonames = resolved.needed_sonames();
 
     // Emit shared library
     emit_shared_library_32(

@@ -31,6 +31,7 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 /// `crt_objects_after`: CRT objects to link after user objects (e.g., crtend.o, crtn.o)
 pub fn link_builtin(
     object_files: &[&str],
+    object_as_needed: &[bool],
     output_path: &str,
     user_args: &[String],
     lib_paths: &[&str],
@@ -73,12 +74,13 @@ pub fn link_builtin(
     linker_common::require_libs(&needed_libs, &lib_search_paths, is_static)?;
     let implicit_from = needed_libs.len();
     needed_libs.extend(needed_libs_default.iter().map(|s| s.to_string()));
+    let lib_as_needed = input::libs_as_needed(&needed_libs, implicit_from, &parsed_args.inputs);
 
     // ── Phase 1: Load inputs, discover shared libs, resolve archives ────
 
     let mut input_objs: Vec<(String, ElfObject)> = Vec::new();
     let mut inline_archive_paths: Vec<String> = Vec::new();
-    let mut positional_shared_libs: Vec<String> = Vec::new();
+    let mut positional_shared_libs: Vec<(String, usize)> = Vec::new();
     input::load_input_files(
         &all_inputs,
         &mut input_objs,
@@ -91,6 +93,13 @@ pub fn link_builtin(
     input::collect_initial_symbols(&input_objs, &mut defined_syms, &mut undefined_syms);
 
     let mut shared_lib_syms = input::SharedLibSyms::default();
+    if parsed_args.warn_common {
+        shared_lib_syms.record_libraries();
+    }
+    // The objects read before any library: their commons meet the libraries
+    // "common first"; any read later (archive members) "library first".
+    let late_from = input_objs.len();
+    shared_lib_syms.expect_commons(&input_objs);
     let mut actual_needed_libs: Vec<String> = Vec::new();
     if !is_static {
         // Positionally-named .so inputs (./libfoo.so on the command line):
@@ -100,12 +109,14 @@ pub fn link_builtin(
         // DT_NEEDED follows link order, as with GNU ld.
         input::register_positional_shared_libs(
             &positional_shared_libs,
+            |path| operand_as_needed(object_files, object_as_needed, &parsed_args.inputs, path),
+            &input_objs,
             &mut shared_lib_syms,
             &mut actual_needed_libs,
         );
         input::discover_shared_lib_symbols(
             &needed_libs,
-            implicit_from,
+            &lib_as_needed,
             &lib_search_paths,
             &mut input_objs,
             &mut defined_syms,
@@ -155,6 +166,15 @@ pub fn link_builtin(
     // gcc's spec: crtend's zero terminator ends `.eh_frame` (libgcc's linear
     // FDE search stops there) and crtn's epilogue ends `.init`/`.fini`.
     load_trailing_crt_objects(crt_objects_after, &mut input_objs)?;
+
+    report_common_warnings(
+        parsed_args.warn_common,
+        parsed_args.fatal_warnings,
+        &input_objs,
+        late_from,
+        &shared_lib_syms,
+    )?;
+    symbols::import_shared_commons(&mut input_objs, late_from, &shared_lib_syms);
 
     // ── Phase 2: Merge sections ─────────────────────────────────────────
 
@@ -262,6 +282,7 @@ pub fn link_builtin(
 /// time), pulled every member of an archive, and dropped `-rpath`.)
 pub fn link_shared(
     object_files: &[&str],
+    object_as_needed: &[bool],
     output_path: &str,
     user_args: &[String],
     lib_paths: &[&str],
@@ -289,12 +310,13 @@ pub fn link_shared(
     linker_common::require_libs(&needed_libs, &lib_search_paths, false)?;
     let implicit_from = needed_libs.len();
     needed_libs.extend(implicit_libs.iter().map(|s| s.to_string()));
+    let lib_as_needed = input::libs_as_needed(&needed_libs, implicit_from, &parsed_args.inputs);
 
     // ── Phase 1: Load inputs, discover shared libs, resolve archives ──
 
     let mut input_objs: Vec<(String, ElfObject)> = Vec::new();
     let mut inline_archive_paths: Vec<String> = Vec::new();
-    let mut positional_shared_libs: Vec<String> = Vec::new();
+    let mut positional_shared_libs: Vec<(String, usize)> = Vec::new();
     input::load_input_files(
         &all_inputs,
         &mut input_objs,
@@ -310,16 +332,23 @@ pub fn link_shared(
     input::collect_initial_symbols(&input_objs, &mut defined_syms, &mut undefined_syms);
 
     let mut shared_lib_syms = input::SharedLibSyms::default();
+    if parsed_args.warn_common {
+        shared_lib_syms.record_libraries();
+    }
+    let late_from = input_objs.len();
+    shared_lib_syms.expect_commons(&input_objs);
     let mut needed_sonames: Vec<String> = Vec::new();
     // Positional .so inputs first: link order (see `link_builtin`).
     input::register_positional_shared_libs(
         &positional_shared_libs,
+        |path| operand_as_needed(object_files, object_as_needed, &parsed_args.inputs, path),
+        &input_objs,
         &mut shared_lib_syms,
         &mut needed_sonames,
     );
     input::discover_shared_lib_symbols(
         &needed_libs,
-        implicit_from,
+        &lib_as_needed,
         &lib_search_paths,
         &mut input_objs,
         &mut defined_syms,
@@ -351,6 +380,15 @@ pub fn link_shared(
     // FDE search stops there) and crtn's epilogue ends `.init`/`.fini`.
     load_trailing_crt_objects(crt_objects_after, &mut input_objs)?;
     let soname = parsed_args.soname;
+
+    report_common_warnings(
+        parsed_args.warn_common,
+        parsed_args.fatal_warnings,
+        &input_objs,
+        late_from,
+        &shared_lib_syms,
+    )?;
+    symbols::import_shared_commons(&mut input_objs, late_from, &shared_lib_syms);
 
     // ── Phase 2: Merge sections ─────────────────────────────────────
 
@@ -408,8 +446,63 @@ fn load_trailing_crt_objects(
     let paths: Vec<String> = crt_objects_after.iter().map(|s| s.to_string()).collect();
     let (mut archives, mut shared) = (Vec::new(), Vec::new());
     input::load_input_files(&paths, input_objs, &mut archives, &mut shared)?;
-    if let Some(p) = archives.first().or(shared.first()) {
+    if let Some(p) = archives.first().or(shared.first().map(|(path, _)| path)) {
         return Err(format!("{p}: trailing startup file is not an object"));
     }
     Ok(())
+}
+
+/// `--warn-common`: the objects in link order, then the libraries in the
+/// order they were read -- the order this linker resolves them in.
+/// The `--as-needed` state of a shared object named on the command line:
+/// that of its position, else GNU's `--no-as-needed` default (an operand the
+/// driver passed through is still one the user named).
+/// The `--as-needed` state of the positional shared library `path`: the one
+/// the caller recorded for it among `object_files` (the standalone linker's
+/// operands; the last mention wins), else the one it was named under in the
+/// arguments (`positional_as_needed`).
+fn operand_as_needed(
+    object_files: &[&str],
+    object_as_needed: &[bool],
+    inputs: &[linker_common::InputItem],
+    path: &str,
+) -> bool {
+    object_files
+        .iter()
+        .rposition(|&f| f == path)
+        .and_then(|i| object_as_needed.get(i).copied())
+        .unwrap_or_else(|| positional_as_needed(inputs, path))
+}
+
+fn positional_as_needed(inputs: &[linker_common::InputItem], path: &str) -> bool {
+    inputs
+        .iter()
+        .rev()
+        .find(|it| !it.is_lib && it.name == path)
+        .is_some_and(|it| it.as_needed)
+}
+
+/// `--warn-common` in this linker's link order: the objects read before the
+/// libraries (`input_objs[..late_from]`), the libraries in the link, then
+/// the archive members and trailing objects read after them.
+fn report_common_warnings(
+    warn_common: bool,
+    fatal_warnings: bool,
+    input_objs: &[(String, ElfObject)],
+    late_from: usize,
+    shared_lib_syms: &input::SharedLibSyms,
+) -> Result<(), String> {
+    if !warn_common {
+        return Ok(());
+    }
+    let mut common = linker_common::warn_common::CommonDiagnostics::default();
+    let (early, late) = input_objs.split_at(late_from);
+    for (_, obj) in early {
+        common.add_object(obj);
+    }
+    shared_lib_syms.replay_libraries(&mut common);
+    for (_, obj) in late {
+        common.add_object(obj);
+    }
+    linker_common::warn_common::report_common_warnings(&common.into_warnings(), fatal_warnings)
 }

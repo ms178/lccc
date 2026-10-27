@@ -1391,30 +1391,22 @@ fn with_function_x86_vec_isa<R>(
     if target != crate::backend::Target::X86_64 || features.is_empty() {
         return body(base_isa);
     }
-    let fn_isa = base_isa.with_target_features(features);
-    let fn_avx512vl = (base_avx512vl
-        || features.iter().any(|f| {
-            matches!(
-                f.as_str(),
-                "avx512vl"
-                    | "arch=x86-64-v4"
-                    | "arch=skylake-avx512"
-                    | "arch=cascadelake"
-                    | "arch=cooperlake"
-                    | "arch=icelake-client"
-                    | "arch=icelake-server"
-                    | "arch=tigerlake"
-                    | "arch=sapphirerapids"
-                    | "arch=emeraldrapids"
-                    | "arch=graniterapids"
-                    | "arch=znver4"
-                    | "arch=znver5"
-            )
-        }))
-        && fn_isa.ymm
-        && !features
-            .iter()
-            .any(|f| f == "no-avx512vl" || f == "no-avx512f");
+    // The TU's features with the module's selections, then the function's
+    // options in GCC's semantics: an `arch=haswell` function loses the TU's
+    // AVX512VL, and `no-avx2` every AVX-512 subset.
+    let tu = crate::common::x86_features::effective().raw();
+    let base = crate::backend::x86::isa::with_feature(
+        base_isa.overlay(tu),
+        crate::common::x86_features::X86Feature::Avx512Vl,
+        base_avx512vl,
+    );
+    let set = crate::common::x86_features::EffectiveFeatures::from_raw(
+        crate::backend::x86::isa::fold_target_features(base, features),
+    );
+    let fn_isa = crate::backend::x86::isa::X86Isa::from_feature_bits(set.raw());
+    let fn_avx512vl = fn_isa.ymm
+        && set.contains(crate::common::x86_features::X86Feature::Avx512F)
+        && set.contains(crate::common::x86_features::X86Feature::Avx512Vl);
     vectorize::set_x86_simd_isa(fn_isa.simd, fn_isa.ymm, fn_isa.sse41, fn_avx512vl);
     vectorize::set_x86_fma_enabled(fn_isa.fma);
     vectorize::set_x86_strict_recip_avx2_enabled(fn_isa.ymm && fn_isa.sse41);

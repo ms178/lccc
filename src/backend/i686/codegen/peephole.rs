@@ -13813,7 +13813,7 @@ fn producer_touches_slots(lines: &[String], jcc_idx: usize, slots: &[String]) ->
     while p > 0 {
         p -= 1;
         let t = lines[p].trim();
-        if t.is_empty() || t.ends_with(':') {
+        if is_row_or_blank(t) || t.ends_with(':') {
             continue;
         }
         let prod_slot = t.split(',').find_map(|op| {
@@ -13830,6 +13830,13 @@ fn producer_touches_slots(lines: &[String], jcc_idx: usize, slots: &[String]) ->
         };
     }
     false
+}
+
+/// A blank line or a `-g` line row: this string pass runs on re-serialized
+/// text, where rows are visible again, and must read them like blanks or
+/// `-g` changes what it hoists.
+fn is_row_or_blank(t: &str) -> bool {
+    t.is_empty() || crate::backend::peephole_common::is_loc_directive(t)
 }
 
 fn else_hoist_diamonds(asm: String) -> String {
@@ -13907,7 +13914,7 @@ fn else_hoist_diamonds(asm: String) -> String {
         let mut then_slots: Vec<String> = Vec::new();
         while j < lines.len() {
             let t = lines[j].trim();
-            if t.is_empty() || t.ends_with(':') {
+            if is_row_or_blank(t) || t.ends_with(':') {
                 // Block labels inside the then-body are transparent: the
                 // rewrite keeps the body in place, so every entry path
                 // (fallthrough or jump) sees identical code.
@@ -13935,7 +13942,7 @@ fn else_hoist_diamonds(asm: String) -> String {
         }
         // Lelse: label immediately after the jmp.
         let mut k = j + 1;
-        while k < lines.len() && lines[k].trim().is_empty() {
+        while k < lines.len() && is_row_or_blank(lines[k].trim()) {
             k += 1;
         }
         let else_lbl = format!("{}:", else_target);
@@ -13950,7 +13957,7 @@ fn else_hoist_diamonds(asm: String) -> String {
         let mut else_slots: Vec<String> = Vec::new();
         while m < lines.len() {
             let t = lines[m].trim();
-            if t.is_empty() {
+            if is_row_or_blank(t) {
                 m += 1;
                 continue;
             }
@@ -13984,7 +13991,11 @@ fn else_hoist_diamonds(asm: String) -> String {
         }
         // rel8 guard for both branch forms.
         let span_est = |a: usize, b: usize| -> usize {
-            (a..=b).map(|r| lines[r].trim().len() + 2).sum::<usize>() / 6
+            (a..=b)
+                .filter(|&r| !is_row_or_blank(lines[r].trim()))
+                .map(|r| lines[r].trim().len() + 2)
+                .sum::<usize>()
+                / 6
         };
         if span_est(i + 1, j - 1) + 2 > 120 || span_est(k + 1, *else_stores.last().unwrap()) > 120 {
             i += 1;
@@ -14046,6 +14057,12 @@ fn else_hoist_diamonds(asm: String) -> String {
         out.push(format!("    {} {}", jcc, join_target));
         out.extend_from_slice(&lines[i + 1..j]); // then body
         out.extend_from_slice(&lines[j + 1..=k]); // blanks + Lelse label
+        // Rows and blanks of the else body stay (the stores moved up).
+        out.extend(
+            (k + 1..m)
+                .filter(|r| !else_stores.contains(r))
+                .map(|r| lines[r].clone()),
+        );
         out.extend_from_slice(&lines[m..]); // join label onward
         let advanced = i + 1 + else_stores.len();
         lines = out;
@@ -14119,6 +14136,7 @@ pub fn peephole_optimize(asm: String) -> String {
     let mut infos: Vec<LineInfo> = (0..line_count)
         .map(|i| classify_line(store.get(i)))
         .collect();
+    let debug_rows = hide_debug_rows(&store, &mut infos);
     pin_inline_asm_regions(&store, &mut infos);
 
     // Phase 1: Iterative local passes
@@ -14348,7 +14366,8 @@ pub fn peephole_optimize(asm: String) -> String {
     // Phase 6: select-diamond else-hoist runs on the FINAL text — earlier
     // passes shape the diamond (fusing the flag producer, folding prep)
     // that this pass needs to see.
-    let hoisted = else_hoist_diamonds(store.build_result(|i| infos[i].is_nop()));
+    let hoisted =
+        else_hoist_diamonds(store.build_result_with_debug_rows(|i| infos[i].is_nop(), &debug_rows));
 
     // Phase 7 (terminal): cross-jump duplicate function epilogues.  Every
     // return site carries its own `addl/popl…/ret` copy; the 32 KiB setup
@@ -15534,6 +15553,7 @@ fn merge_duplicate_epilogues_terminal(asm: String) -> String {
     let mut infos: Vec<LineInfo> = (0..store.len())
         .map(|i| classify_line(store.get(i)))
         .collect();
+    let debug_rows = hide_debug_rows(&store, &mut infos);
     pin_inline_asm_regions(&store, &mut infos);
     if !merge_epilogue_tails_i686(&mut store, &mut infos) {
         // Return the caller's buffer untouched: rebuilding it here would make
@@ -15541,7 +15561,24 @@ fn merge_duplicate_epilogues_terminal(asm: String) -> String {
         // which is another pass's contract to keep.
         return asm;
     }
-    store.build_result(|i| infos[i].is_nop())
+    store.build_result_with_debug_rows(|i| infos[i].is_nop(), &debug_rows)
+}
+
+/// Hide every `-g` line row (`.loc`) from the passes by marking it deleted;
+/// `LineStore::build_result_with_debug_rows` re-emits each where it stood,
+/// so no window's adjacency assumption can make `-g` change the code (the
+/// x86-64 peephole does the same; see its `hide_debug_rows`).
+fn hide_debug_rows(store: &LineStore, infos: &mut [LineInfo]) -> Vec<bool> {
+    let mut rows = vec![false; infos.len()];
+    for (i, info) in infos.iter_mut().enumerate() {
+        if info.kind == LineKind::Directive
+            && crate::backend::peephole_common::is_loc_directive(trimmed(store, info, i))
+        {
+            info.kind = LineKind::Nop;
+            rows[i] = true;
+        }
+    }
+    rows
 }
 
 #[cfg(test)]
@@ -18454,6 +18491,30 @@ mod tests {
         assert!(store < br, "hoisted store precedes branch: {}", r);
         assert!(!r.contains("jmp .LBB13"), "jmp deleted: {}", r);
         assert!(r.contains("movl $48, 112(%esp)"), "then store kept: {}", r);
+    }
+
+    /// `-g` rows before every line (including inside both arms) must not
+    /// change what hoists: the pass reads re-serialized text, where rows are
+    /// visible (const_array_promote.c kept its diamond only under `-g`).
+    #[test]
+    fn else_hoist_reads_debug_rows_as_blanks() {
+        let plain = "    andl $1, %edx\n    je .LBB12\n.LBB11:\n    movl $48, 112(%esp)\n    jmp .LBB13\n.LBB12:\n    movl $32, 112(%esp)\n.LBB13:\n    ret\n";
+        let rows: String = plain
+            .lines()
+            .enumerate()
+            .map(|(n, l)| format!(".loc 1 {} 0\n{l}\n", n + 1))
+            .collect();
+        let code = |asm: &str| -> String {
+            asm.lines()
+                .filter(|l| !l.starts_with(".loc"))
+                .map(|l| format!("{l}\n"))
+                .collect()
+        };
+        let expected = peephole_optimize(plain.to_string());
+        assert!(!expected.contains("jmp .LBB13"), "plain hoist: {expected}");
+        let debug = peephole_optimize(rows);
+        assert_eq!(code(&debug), code(&expected));
+        assert!(debug.contains(".loc 1 7 0"), "else-body row kept: {debug}");
     }
 
     #[test]

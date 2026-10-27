@@ -24,14 +24,15 @@ LD_PRELOAD) for the lazy case.
 """
 
 import os
+import re
 import shutil
 import struct
 import subprocess
 import tempfile
 import textwrap
 
-# ── ELF32 inspection (program headers only: lccc's executables carry no
-# section headers, and the dynamic linker never reads them either) ────────
+# ── ELF32 inspection (program headers only: the dynamic linker never reads
+# section headers; the cases that check those use readelf/nm) ─────────────
 
 PT_LOAD, PT_DYNAMIC, PT_NOTE, PT_TLS = 1, 2, 4, 7
 PT_GNU_EH_FRAME, PT_GNU_STACK, PT_GNU_RELRO = 0x6474E550, 0x6474E551, 0x6474E552
@@ -552,9 +553,11 @@ def case_options_and_tags(e):
     for flags, pred, what in checks:
         for shared in (False, True):
             out = "o_so" if shared else "o_exe"
-            src = "rl.c" if shared else "rm.c"
-            extra = ["-fPIC", "-shared"] if shared else ["-no-pie", "-Llib", "-lrl"]
-            _ok(e.gcc(*extra, src, *flags, "-o", out), f"{what} ({'so' if shared else 'exe'})")
+            # The library after the object that uses it: gcc links -l
+            # libraries --as-needed, so GNU ld drops one named earlier.
+            inputs = (["-fPIC", "-shared", "rl.c"] if shared
+                      else ["-no-pie", "rm.c", "-Llib", "-lrl"])
+            _ok(e.gcc(*inputs, *flags, "-o", out), f"{what} ({'so' if shared else 'exe'})")
             if not pred(Elf32(e.path(out))):
                 raise Fail(f"{what} not reflected in the {'shared object' if shared else 'executable'}")
             if what.startswith("-z now") or "hash" in what:
@@ -979,6 +982,359 @@ def case_copy_only_when_addressed(e):
             raise Fail(f"{who}: got_only has no R_386_GLOB_DAT: {by_type}")
 
 
+DBG_LIB = r"""
+#include <stdio.h>
+int lib_counter = 3;
+__thread int lib_tls = 4;
+static int lib_static(int v) { return v * lib_counter; }
+int lib_fn(int v) { lib_tls += v; return lib_static(v) + lib_tls; }
+"""
+
+DBG_MAIN = r"""
+#include <stdio.h>
+extern int lib_fn(int);
+extern int lib_counter;
+__thread int t_var = 6;
+int g_init = 7;
+int g_zero;
+const int g_const = 8;
+static int static_fn(int x) {
+    int r = x + g_init;
+    return r * 2;
+}
+int helper(int x) {
+    g_zero += static_fn(x);
+    return g_zero + t_var + lib_fn(x) + lib_counter;
+}
+int main(void) {
+    printf("%d %d\n", helper(2), g_const);
+    return 0;
+}
+"""
+
+USER_ANCHORS = r"""
+#include <stdio.h>
+/* Legal C names GNU ld only PROVIDEs: the program's definitions win. */
+int end = 42;
+int etext = 7;
+int edata = 9;
+int main(void) {
+    end++;
+    printf("%d %d %d\n", end, etext, edata);
+    return 0;
+}
+"""
+
+ALIGN_LIB = r"""
+char a_pad = 1;
+_Alignas(16) float b_vec[4] = {1, 2, 3, 4};
+long long c_wide = 5;
+"""
+
+ALIGN_MAIN = r"""
+#include <stdio.h>
+#include <stdint.h>
+#include <xmmintrin.h>
+extern char a_pad;
+extern float b_vec[4];
+extern long long c_wide;
+/* GCC folds `&c_wide % 8` to 0: it assumes the ABI alignment of an extern
+   long long -- which is exactly what the COPY slot must provide. Launder the
+   addresses so the run measures them. */
+static uintptr_t opaque(const void *p) {
+    uintptr_t v = (uintptr_t)p;
+    __asm__("" : "+r"(v));
+    return v;
+}
+int main(void) {
+    __m128 v = _mm_load_ps(b_vec);          /* movaps: faults if misaligned */
+    float out[4];
+    _mm_storeu_ps(out, _mm_add_ps(v, v));
+    printf("%d %d %g %d %lld\n", (int)(opaque(b_vec) % 16),
+           (int)(opaque(&c_wide) % 8), out[3], a_pad, c_wide);
+    return 0;
+}
+"""
+
+
+def _readelf_clean(e, path, *opts):
+    """readelf output; any warning or error on stderr is a malformed file."""
+    r = _ok(e.cmd(["readelf", "-W", *opts, path]), f"readelf {' '.join(opts)} {path}")
+    err = r.stderr.decode(errors="replace").strip()
+    if err:
+        raise Fail(f"readelf {' '.join(opts)} {os.path.basename(path)}: {err[:400]}")
+    return r.stdout.decode()
+
+
+def _sections(e, path):
+    """{name: (index, type, flags)} from readelf -S."""
+    out = {}
+    for m in re.finditer(r"^\s*\[\s*(\d+)\]\s+(\S+)\s+(\S+)\s+[0-9a-f]+\s+[0-9a-f]+\s+"
+                         r"[0-9a-f]+\s+[0-9a-f]+\s+(\w*)", _readelf_clean(e, path, "-S"), re.M):
+        out[m.group(2)] = (int(m.group(1)), m.group(3), m.group(4))
+    return out
+
+
+def _nm_types(e, path, names):
+    r = _ok(e.cmd(["nm", path]), f"nm {path}").stdout.decode()
+    got = {}
+    for ln in r.splitlines():
+        f = ln.split()
+        if len(f) == 3 and f[2] in names:
+            got[f[2]] = f[1]
+    return got
+
+
+def case_section_headers_and_debug(e):
+    """Executables and shared objects carry a complete section-header table,
+    the DWARF of their inputs, and a .symtab, as GNU ld's do.
+
+    lccc-ld used to write executables with no section headers at all (and
+    shared objects with no debug sections), so gdb, addr2line, nm and perf
+    saw nothing: a `-g` build could not be debugged.  The same `gcc -g`
+    objects are linked by GNU ld and lccc-ld and must agree on: the set of
+    .debug_* sections; each user symbol's nm class (so st_shndx names the
+    right kind of section); the run output.  readelf must read every table
+    without a warning, `strip` and `objcopy` (which rebuild the file from
+    its section headers) must produce images that still run identically,
+    `-S` must drop the DWARF but keep .symtab, and `-s` both.  An exported
+    definition's .dynsym st_shndx must name its real section.
+    """
+    _w(e.td, "dl.c", DBG_LIB)
+    _w(e.td, "dm.c", DBG_MAIN)
+    _ok(e.gcc("-g", "-O0", "-fPIC", "-c", "dl.c", "-o", "dl.o", lccc=False), "compile dl.c")
+    _ok(e.gcc("-g", "-O0", "-fno-pic", "-c", "dm.c", "-o", "dm.o", lccc=False), "compile dm.c")
+    os.mkdir(e.path("ref"))
+    os.mkdir(e.path("new"))
+    for lccc, d in ((False, "ref"), (True, "new")):
+        _ok(e.gcc("-shared", "dl.o", "-o", e.path(d, "libdl1.so"), lccc=lccc),
+            f"{d}: link libdl1.so")
+        _ok(e.gcc("-no-pie", "dm.o", "-o", e.path(d, "dm"), e.path(d, "libdl1.so"),
+                  lccc=lccc), f"{d}: link dm")
+    want = _expect_same_runs(e, e.path("ref", "dm"), e.path("new", "dm"),
+                             e.path("ref"), e.path("new"), "debug link")
+    user = {"main", "helper", "static_fn", "g_init", "g_zero", "g_const", "t_var"}
+    for f in ("dm", "libdl1.so"):
+        ref, new = e.path("ref", f), e.path("new", f)
+        dbg_ref = {n for n in _sections(e, ref) if n.startswith(".debug_")}
+        secs = _sections(e, new)
+        dbg_new = {n for n in secs if n.startswith(".debug_")}
+        if not dbg_ref or dbg_new != dbg_ref:
+            raise Fail(f"{f}: debug sections {sorted(dbg_new)}, GNU ld {sorted(dbg_ref)}")
+        for need in (".symtab", ".strtab", ".dynsym", ".dynamic", ".text"):
+            if need not in secs:
+                raise Fail(f"{f}: no {need} header")
+        _readelf_clean(e, new, "-l", "-s", "--dyn-syms", "-r", "-d")
+        _readelf_clean(e, new, "--debug-dump=info,line,aranges,str")
+    got, ref_types = (_nm_types(e, e.path(d, "dm"), user) for d in ("new", "ref"))
+    if got != ref_types or len(got) != len(user):
+        raise Fail(f"nm classes {got}, GNU ld {ref_types}")
+    # .dynsym st_shndx of the library's exports.
+    secs = _sections(e, e.path("new", "libdl1.so"))
+    by_index = {i: n for n, (i, _, _) in secs.items()}
+    dyn = _readelf_clean(e, e.path("new", "libdl1.so"), "--dyn-syms")
+    for sym, want_sec in (("lib_fn", ".text"), ("lib_counter", ".data"), ("lib_tls", ".tdata")):
+        m = re.search(r"^\s*\d+:\s+[0-9a-f]+\s+\d+\s+\w+\s+\w+\s+\w+\s+(\d+)\s+" + sym + r"$",
+                      dyn, re.M)
+        if not m or by_index.get(int(m.group(1))) != want_sec:
+            raise Fail(f"libdl1.so: {sym} st_shndx -> "
+                       f"{by_index.get(int(m.group(1))) if m else None}, want {want_sec}")
+    # Tools that rebuild the file from its section headers.
+    for tool, argv in (("strip", ["strip", "-o"]), ("objcopy", ["objcopy", "-R", ".comment"])):
+        for f in ("dm", "libdl1.so"):
+            os.makedirs(e.path(tool), exist_ok=True)
+            src, dst = e.path("new", f), e.path(tool, f)
+            cmd = argv + [dst, src] if tool == "strip" else argv + [src, dst]
+            _ok(e.cmd(cmd), f"{tool} {f}")
+        for now in (False, True):
+            r = e.run(e.path(tool, "dm"), now, e.path(tool))
+            if r.returncode != 0 or r.stdout != want:
+                raise Fail(f"{tool}ped image: rc={r.returncode} out={r.stdout!r} want {want!r}")
+    # -S keeps .symtab, -s drops it; both drop the DWARF.
+    for flag, keeps_symtab in (("-Wl,-S", True), ("-Wl,--strip-debug", True), ("-Wl,-s", False)):
+        exe = e.path("new", "dm" + flag.replace(",", "_").replace("-", "_"))
+        _ok(e.gcc("-no-pie", "dm.o", "-o", exe, e.path("new", "libdl1.so"), flag), f"link {flag}")
+        secs = _sections(e, exe)
+        if any(n.startswith(".debug_") for n in secs) or (".symtab" in secs) != keeps_symtab:
+            raise Fail(f"{flag}: sections {sorted(secs)}")
+        r = e.run(exe, False, e.path("new"))
+        if r.returncode != 0 or r.stdout != want:
+            raise Fail(f"{flag}: rc={r.returncode} out={r.stdout!r}")
+
+
+def case_provided_symbols_yield_to_inputs(e):
+    """GNU ld only PROVIDEs `end`, `etext`, `edata`, `__data_start` and
+    friends: an input definition wins.  lccc-ld's executable emitter used to
+    overwrite them unconditionally, so a program's own `int end` was
+    redirected to the end of .bss (its stores clobbering whatever lay
+    there), and crt1.o's `__data_start` pointed into the RELRO padding
+    instead of at .data.
+    """
+    _w(e.td, "ua.c", USER_ANCHORS)
+    for lccc in (False, True):
+        who = "lccc" if lccc else "GNU"
+        _ok(e.gcc("-O1", "-no-pie", "-fno-pic", "ua.c", "-o", f"ua_{who}", lccc=lccc),
+            f"{who}: link")
+    _expect_same_runs(e, e.path("ua_GNU"), e.path("ua_lccc"), None, None, "user anchors")
+    secs = _sections(e, e.path("ua_lccc"))
+    sh = _readelf_clean(e, e.path("ua_lccc"), "-S")
+    m = re.search(r"\]\s+\.data\s+PROGBITS\s+([0-9a-f]+)\s+[0-9a-f]+\s+([0-9a-f]+)", sh)
+    if ".data" not in secs or not m:
+        raise Fail("no .data header")
+    lo, size = int(m.group(1), 16), int(m.group(2), 16)
+    nm = _ok(e.cmd(["nm", e.path("ua_lccc")]), "nm").stdout.decode()
+    vals = {f[2]: int(f[0], 16) for f in (ln.split() for ln in nm.splitlines()) if len(f) == 3}
+    for sym in ("__data_start", "end", "etext", "edata"):
+        if not lo <= vals.get(sym, -1) < lo + size:
+            raise Fail(f"{sym} = {vals.get(sym)!r}, outside .data [{lo:#x}, {lo + size:#x})")
+
+
+def case_copy_relocation_alignment(e):
+    """The executable's copy of a copy-relocated object keeps the alignment
+    the library gave it.  lccc-ld aligned every COPY slot to 4: after a
+    1-byte object, a 16-byte-aligned vector landed 4 mod 16 and the
+    program's `movaps` faulted; an 8-byte object straddling a cache line
+    loses the atomicity of its 8-byte accesses.
+    """
+    _w(e.td, "al.c", ALIGN_LIB)
+    _w(e.td, "am.c", ALIGN_MAIN)
+    _ok(e.gcc("-O1", "-fPIC", "-shared", "al.c", "-o", "libal.so", lccc=False), "build libal.so")
+    _ok(e.gcc("-O1", "-msse", "-fno-pic", "-c", "am.c", "-o", "am.o", lccc=False), "compile am.c")
+    for lccc in (False, True):
+        who = "lccc" if lccc else "GNU"
+        _ok(e.gcc("-no-pie", "am.o", "-o", f"am_{who}", e.path("libal.so"), lccc=lccc),
+            f"{who}: link")
+    out = _expect_same_runs(e, e.path("am_GNU"), e.path("am_lccc"), e.td, e.td, "copy alignment")
+    if out != b"0 0 8 1 5\n":
+        raise Fail(f"reference output {out!r}")
+    rel = _ok(e.cmd(["readelf", "-rW", e.path("am_lccc")]), "readelf -r").stdout.decode()
+    copies = {ln.split()[4].split("@")[0] for ln in rel.splitlines()
+              if len(ln.split()) >= 5 and ln.split()[2] == "R_386_COPY"}
+    if copies != {"a_pad", "b_vec", "c_wide"}:
+        raise Fail(f"R_386_COPY for {sorted(copies)}: the case no longer tests COPY slots")
+
+
+LOCAL_HELPER_DEF = "static int helper(void) { return 41; }\nint a(void) { return helper(); }\n"
+LOCAL_HELPER_USE = "int helper(void);\nint a(void);\nint main(void) { return helper() + a(); }\n"
+LOCAL_ATOI_DEF = "static int atoi(const char *s) { (void)s; return 99; }\nint a(void) { return atoi(\"1\"); }\n"
+LOCAL_ATOI_USE = r"""#include <stdio.h>
+#include <stdlib.h>
+int a(void);
+int main(void) { printf("%d %d\n", atoi("5"), a()); return 0; }
+"""
+LOCAL_IFUNC_C = r"""#include <stdio.h>
+static int impl(void) { return 42; }
+static void *resolve_local(void) { return (void *)impl; }
+static int local_fn(void) __attribute__((ifunc("resolve_local")));
+static void *resolve_global(void) { return (void *)impl; }
+int global_fn(void) __attribute__((ifunc("resolve_global")));
+int (*volatile fp)(void) = local_fn;
+int main(void) { printf("%d %d %d\n", local_fn(), global_fn(), fp()); return 0; }
+"""
+# R_386_GOT32 (assembled with -mrelax-relocations=no) against an STB_LOCAL
+# object whose name another object defines globally, and against an
+# STB_LOCAL IFUNC (whose slot must hold the IPLT stub, the address every
+# other reference to it resolves to).
+LOCAL_GOT_S = """\t.text
+\t.globl\tvia_got
+\t.type\tvia_got, @function
+via_got:
+\tcall\t1f
+1:\tpopl\t%ecx
+\taddl\t$_GLOBAL_OFFSET_TABLE_+[.-1b], %ecx
+\tmovl\tlval@GOT(%ecx), %eax
+\tmovl\t(%eax), %eax
+\tret
+\t.globl\tifunc_via_got
+\t.type\tifunc_via_got, @function
+ifunc_via_got:
+\tcall\t2f
+2:\tpopl\t%ecx
+\taddl\t$_GLOBAL_OFFSET_TABLE_+[.-2b], %ecx
+\tmovl\tpick@GOT(%ecx), %eax
+\tret
+\t.globl\tifunc_direct
+\t.type\tifunc_direct, @function
+ifunc_direct:
+\tmovl\t$pick, %eax
+\tret
+impl:
+\tmovl\t$7, %eax
+\tret
+\t.type\tpick, @gnu_indirect_function
+pick:
+\tmovl\t$impl, %eax
+\tret
+\t.data
+\t.type\tlval, @object
+lval:\t.long\t123
+\t.section\t.note.GNU-stack,"",@progbits
+"""
+LOCAL_GOT_MAIN = r"""#include <stdio.h>
+int lval = 456;
+int via_got(void);
+int (*ifunc_via_got(void))(void);
+int (*ifunc_direct(void))(void);
+int main(void) {
+    int (*a)(void) = ifunc_via_got(), (*b)(void) = ifunc_direct();
+    printf("%d %d %d %d %d\n", via_got(), lval, a(), b(), a == b);
+    return 0;
+}
+"""
+
+
+def case_local_symbols_have_file_scope(e):
+    """An STB_LOCAL symbol is visible only inside its own object.  lccc-ld
+    used to enter locals into the global table as fallback definitions:
+    another file's `static helper` silently satisfied an undefined
+    `helper`, a `static atoi` captured every object's call to libc's, and a
+    local's name could route other references through a same-named
+    global's PLT.  GOT slots were keyed by name, so `local@GOT` collided
+    with a global of that name (a hard error), and STB_LOCAL IFUNCs were
+    called -- and had their address taken -- as their resolver in dynamic
+    links and as their resolver's address through pointers in static ones.
+    """
+    for fn, body in (("lh.c", LOCAL_HELPER_DEF), ("lu.c", LOCAL_HELPER_USE),
+                     ("la.c", LOCAL_ATOI_DEF), ("lm.c", LOCAL_ATOI_USE),
+                     ("if.c", LOCAL_IFUNC_C), ("lg.s", LOCAL_GOT_S), ("lgm.c", LOCAL_GOT_MAIN)):
+        _w(e.td, fn, body)
+    _ok(e.gcc("-O0", "-fno-builtin", "-c", "lh.c", "lu.c", "la.c", "lm.c", lccc=False), "compile")
+    _ok(e.gcc("-O1", "-c", "if.c", "lgm.c", lccc=False), "compile")
+    _ok(e.gcc("-c", "-Wa,-mrelax-relocations=no", "lg.s", lccc=False), "assemble")
+    rel = _ok(e.cmd(["readelf", "-rW", e.path("lg.o")]), "readelf -r").stdout.decode()
+    if sum(" R_386_GOT32 " in ln for ln in rel.splitlines()) != 2:
+        raise Fail(f"lg.o lost its R_386_GOT32 relocations: the case tests nothing\n{rel}")
+
+    # The undefined reference stays undefined.
+    for lccc in (False, True):
+        who = "lccc" if lccc else "GNU"
+        r = e.gcc("-no-pie", "lh.o", "lu.o", "-o", f"lh_{who}", lccc=lccc)
+        if r.returncode == 0 or "helper" not in r.stderr.decode(errors="replace"):
+            raise Fail(f"{who}: undefined `helper' linked (rc={r.returncode})")
+
+    want = {"la": b"5 99\n", "if": b"42 42 42\n", "lg": b"123 456 7 7 1\n"}
+    objs = {"la": ["la.o", "lm.o"], "if": ["if.o"], "lg": ["lg.o", "lgm.o"]}
+    for link in ("-no-pie", "-static"):
+        for key, inputs in objs.items():
+            for lccc in (False, True):
+                who = "lccc" if lccc else "GNU"
+                _ok(e.gcc(link, *inputs, "-o", f"{key}{link}_{who}", lccc=lccc),
+                    f"{who} {link}: link {key}")
+            out = _expect_same_runs(e, e.path(f"{key}{link}_GNU"), e.path(f"{key}{link}_lccc"),
+                                    None, None, f"{key} {link}")
+            if out != want[key]:
+                raise Fail(f"{key} {link}: reference output {out!r}, want {want[key]!r}")
+
+    # A shared library's undefined `helper' is an import, never bound to
+    # another object's local of that name.
+    _ok(e.gcc("-fPIC", "-O0", "-c", "lh.c", "-o", "plh.o", lccc=False), "compile -fPIC")
+    _ok(e.gcc("-fPIC", "-O0", "-c", "lu.c", "-o", "plu.o", lccc=False), "compile -fPIC")
+    _ok(e.gcc("-shared", "plh.o", "plu.o", "-o", "libl.so"), "lccc: link -shared")
+    dyn = _readelf_clean(e, e.path("libl.so"), "--dyn-syms")
+    if not re.search(r"\bUND\s+helper\b", dyn):
+        raise Fail(f"libl.so does not import `helper':\n{dyn}")
+
+
 CASES = [
     ("i386_tls_matrix", case_tls_matrix),
     ("i386_exe_tls_transitions", case_exe_tls_transitions),
@@ -989,6 +1345,10 @@ CASES = [
     ("i386_text_relocations", case_text_relocations),
     ("i386_copy_relocation_aliases", case_copy_relocation_aliases),
     ("i386_copy_only_when_addressed", case_copy_only_when_addressed),
+    ("i386_section_headers_and_debug", case_section_headers_and_debug),
+    ("i386_provided_symbols_yield_to_inputs", case_provided_symbols_yield_to_inputs),
+    ("i386_copy_relocation_alignment", case_copy_relocation_alignment),
+    ("i386_local_symbols_have_file_scope", case_local_symbols_have_file_scope),
 ]
 
 

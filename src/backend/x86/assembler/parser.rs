@@ -1101,33 +1101,13 @@ fn parse_directive(line: &str) -> Result<AsmItem, String> {
                 .map_err(|_| format!("bad cfi offset value: {}", args))?;
             Ok(AsmItem::Cfi(CfiDirective::Offset(reg, off as i32)))
         }
-        ".file" => {
-            // .file N "filename"
-            let parts: Vec<&str> = args.splitn(2, |c: char| c.is_whitespace()).collect();
-            if parts.len() == 2 {
-                let num: u32 = parts[0].trim().parse().unwrap_or(0);
-                let filename = parts[1].trim().trim_matches('"').to_string();
-                Ok(AsmItem::File(num, filename))
-            } else {
-                Ok(AsmItem::Empty) // ignore malformed .file
-            }
-        }
+        ".file" => Ok(match crate::backend::elf::parse_file_directive(args)? {
+            Some((number, filename)) => AsmItem::File(number, filename),
+            None => AsmItem::Empty,
+        }),
         ".loc" => {
-            // .loc filenum line column
-            let nums: Vec<u32> = args
-                .split_whitespace()
-                .take(3)
-                .filter_map(|s| s.parse().ok())
-                .collect();
-            if nums.len() >= 2 {
-                Ok(AsmItem::Loc(
-                    nums[0],
-                    nums[1],
-                    nums.get(2).copied().unwrap_or(0),
-                ))
-            } else {
-                Ok(AsmItem::Empty)
-            }
+            let (file, line, column) = crate::backend::elf::parse_loc_directive(args)?;
+            Ok(AsmItem::Loc(file, line, column))
         }
         ".pushsection" => {
             // .pushsection name,"flags",@type - same syntax as .section

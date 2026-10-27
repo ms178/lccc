@@ -7,6 +7,7 @@
 use super::elf_read::*;
 use super::relocations::resolve_archive_members;
 use crate::backend::linker_common;
+use crate::backend::linker_common::warn_common::CommonDiagnostics;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
 /// Exports of the linked shared libraries, bound with GNU ld's policy (the
@@ -15,20 +16,122 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 /// unversioned reference binds only to a default (`@@`) version — a hidden
 /// `foo@V1` beside `foo@@V2` must not win because it comes later in the
 /// table.  The provider is recorded so imports get their `Verneed`.
+///
+/// Libraries are read after the command line's objects, so a common of
+/// those meets them "common first": the first linked library with a strong
+/// data definition takes it (`shared_def_overrides_common`), even after
+/// another library's weak one -- that export is the one bound.
 #[derive(Default)]
 pub struct SharedLibSyms {
     syms: FxHashMap<String, DynSymbol>,
     provider: FxHashMap<String, String>,
+    /// Commons of the objects read before the libraries, minus names some
+    /// object gives non-default visibility (`expect_commons`).
+    commons: FxHashSet<String>,
+    /// The members of `commons` a library definition took.
+    taken: FxHashSet<String>,
+    /// `--warn-common`: each library read, in order, with its strong
+    /// default-version definitions; `None` unless requested.
+    libraries: Option<Vec<(String, Vec<String>)>>,
 }
 
 impl SharedLibSyms {
-    /// Offer one export of `soname`; the first default-version export wins.
+    /// Remember every library read from now on for `--warn-common`.
+    pub fn record_libraries(&mut self) {
+        self.libraries = Some(Vec::new());
+    }
+
+    /// A library at `path` was read (a no-op unless recording).
+    pub fn note_library(&mut self, path: &str, syms: &[DynSymbol]) {
+        use crate::backend::linker_common::warn_common::shared_definitions;
+        if let Some(libraries) = &mut self.libraries {
+            let defs = shared_definitions(syms).map(str::to_string).collect();
+            libraries.push((path.to_string(), defs));
+        }
+    }
+
+    /// Feed the recorded libraries, in reading order.
+    pub fn replay_libraries(&self, common: &mut CommonDiagnostics) {
+        for (path, defs) in self.libraries.iter().flatten() {
+            common.add_shared_definitions(path, defs.iter().map(String::as_str));
+        }
+    }
+
+    /// Record the commons of the objects read so far, before any library.
+    pub fn expect_commons(&mut self, input_objs: &[(String, ElfObject)]) {
+        let symbols = || input_objs.iter().flat_map(|(_, obj)| &obj.symbols);
+        let restricted: FxHashSet<&str> = symbols()
+            .filter(|sym| sym.binding() != STB_LOCAL && sym.visibility() != STV_DEFAULT)
+            .map(|sym| sym.name.as_str())
+            .collect();
+        self.commons = symbols()
+            .filter(|sym| sym.shndx == SHN_COMMON && !restricted.contains(sym.name.as_str()))
+            .map(|sym| sym.name.to_string())
+            .collect();
+    }
+
+    /// Whether `sym` takes over one of the expected commons.
+    pub fn takes_common(&self, sym: &DynSymbol) -> bool {
+        sym.is_default_ver
+            && self.commons.contains(&sym.name)
+            && !self.taken.contains(&sym.name)
+            && linker_common::shared_def_overrides_common(sym.info)
+    }
+
+    /// Whether a library definition took the common `name` read before the
+    /// libraries (`Some(false)`: it stays a common), or `None` when no such
+    /// common was expected.
+    pub fn common_taken(&self, name: &str) -> Option<bool> {
+        self.commons
+            .contains(name)
+            .then(|| self.taken.contains(name))
+    }
+
+    /// Offer one export of `soname` from a library in the link; the first
+    /// default-version export wins, except over an expected common.
     pub fn offer(&mut self, sym: DynSymbol, soname: &str) {
-        if !sym.is_default_ver || self.syms.contains_key(&sym.name) {
+        if self.takes_common(&sym) {
+            self.taken.insert(sym.name.clone());
+        } else if !sym.is_default_ver || self.syms.contains_key(&sym.name) {
             return;
         }
         self.provider.insert(sym.name.clone(), soname.to_string());
         self.syms.insert(sym.name.clone(), sym);
+    }
+
+    /// Bring the library `path` (`soname`, exporting `syms`) into the link
+    /// unless it is `as_needed` and, read now, would neither satisfy a
+    /// reference (`satisfies`) no library in the link already answers, nor
+    /// take a common -- one of `commons_before` when given, the commons read
+    /// before it -- and is not in it already: bfd unloads such a library,
+    /// symbols included.  Returns whether it is in the link.
+    pub fn link_library(
+        &mut self,
+        path: &str,
+        soname: &str,
+        syms: Vec<DynSymbol>,
+        as_needed: bool,
+        satisfies: impl Fn(&str) -> bool,
+        commons_before: Option<&FxHashSet<&str>>,
+        needed: &mut Vec<String>,
+    ) -> bool {
+        let wanted = |si: &DynSymbol| {
+            (satisfies(&si.name) && !self.syms.contains_key(&si.name))
+                || (commons_before.is_none_or(|before| before.contains(si.name.as_str()))
+                    && self.takes_common(si))
+        };
+        let soname_linked = needed.iter().any(|n| n == soname);
+        if as_needed && !soname_linked && !syms.iter().any(wanted) {
+            return false;
+        }
+        self.note_library(path, &syms);
+        for si in syms {
+            self.offer(si, soname);
+        }
+        if !soname_linked {
+            needed.push(soname.to_string());
+        }
+        true
     }
 
     /// The shared library that provides `name`.
@@ -63,7 +166,7 @@ pub fn load_input_files(
     all_inputs: &[String],
     input_objs: &mut Vec<(String, ElfObject)>,
     inline_archive_paths: &mut Vec<String>,
-    positional_shared_libs: &mut Vec<String>,
+    positional_shared_libs: &mut Vec<(String, usize)>,
 ) -> Result<(), String> {
     for path in all_inputs {
         if !std::path::Path::new(path).exists() {
@@ -76,7 +179,7 @@ pub fn load_input_files(
         } else if data.len() >= 18 && &data[0..4] == b"\x7fELF" {
             let e_type = u16::from_le_bytes([data[16], data[17]]);
             if e_type == ET_DYN {
-                positional_shared_libs.push(path.clone());
+                positional_shared_libs.push((path.clone(), input_objs.len()));
             } else {
                 let obj = parse_object(&data, path).map_err(|e| format!("{}: {}", path, e))?;
                 input_objs.push((path.clone(), obj));
@@ -88,36 +191,97 @@ pub fn load_input_files(
 }
 
 /// Register the dynamic symbols of positionally-named shared libraries and
-/// record their DT_NEEDED entries (DT_SONAME, else the file name — bfd's
-/// rule for literal paths too).
+/// record their DT_NEEDED entries (DT_SONAME, else the path as named:
+/// `linker_common::unsonamed_needed_name`).  Each comes with the number of
+/// `input_objs` named before it: an `--as-needed` one is kept, as by GNU
+/// ld, only for a non-weak reference or a common those objects hold.
 pub fn register_positional_shared_libs(
-    positional_shared_libs: &[String],
+    positional_shared_libs: &[(String, usize)],
+    as_needed: impl Fn(&str) -> bool,
+    input_objs: &[(String, ElfObject)],
     shared_lib_syms: &mut SharedLibSyms,
     actual_needed_libs: &mut Vec<String>,
 ) {
-    for path in positional_shared_libs {
-        let data = match std::fs::read(path) {
-            Ok(d) => d,
-            Err(_) => continue,
-        };
-        let needed = linker_common::parse_soname(&data).unwrap_or_else(|| {
-            std::path::Path::new(path)
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default()
-        });
-        if let Ok(syms) = read_shared_lib_symbols(path) {
-            for si in syms {
-                shared_lib_syms.offer(si, &needed);
+    // What the objects before the library define, reference non-weakly
+    // and hold as commons -- grown one object at a time.
+    let mut defined: FxHashSet<&str> = FxHashSet::default();
+    let mut undefined: FxHashSet<&str> = FxHashSet::default();
+    let mut commons: FxHashSet<&str> = FxHashSet::default();
+    let mut read = 0;
+    for (path, objs_before) in positional_shared_libs {
+        for (_, obj) in input_objs.get(read..*objs_before).unwrap_or(&[]) {
+            for sym in obj.symbols.iter().filter(|s| s.binding() != STB_LOCAL) {
+                let name = sym.name.as_str();
+                match sym.shndx {
+                    SHN_UNDEF
+                        if sym.binding() != STB_WEAK
+                            && !defined.contains(name)
+                            && !commons.contains(name) =>
+                    {
+                        undefined.insert(name);
+                    }
+                    SHN_UNDEF => {}
+                    // A common defines the name for the references too.
+                    SHN_COMMON => {
+                        commons.insert(name);
+                        undefined.remove(name);
+                    }
+                    _ => {
+                        defined.insert(name);
+                        undefined.remove(name);
+                    }
+                }
             }
         }
-        if !needed.is_empty() && !actual_needed_libs.contains(&needed) {
-            actual_needed_libs.push(needed);
-        }
+        read = read.max(*objs_before);
+        let Ok(data) = std::fs::read(path) else {
+            continue;
+        };
+        let needed = linker_common::parse_soname(&data)
+            .unwrap_or_else(|| linker_common::unsonamed_needed_name(path, false));
+        shared_lib_syms.link_library(
+            path,
+            &needed,
+            linker_common::parse_shared_library_symbols(&data, path).unwrap_or_default(),
+            as_needed(path),
+            |name| undefined.contains(name),
+            Some(&commons),
+            actual_needed_libs,
+        );
     }
 }
 
+/// The `--as-needed` state of each of `needed_libs`: a library the user
+/// named (before `implicit_from`) has the state of its command-line
+/// position; of the driver's, gcc links its shared unwinder as-needed
+/// (`-lgcc --as-needed -lgcc_s`), and the default `-lm` -- not in gcc's spec
+/// at all -- is as-needed too, so it costs a program that uses no libm
+/// function no library load.
+pub fn libs_as_needed(
+    needed_libs: &[String],
+    implicit_from: usize,
+    inputs: &[linker_common::InputItem],
+) -> Vec<bool> {
+    needed_libs
+        .iter()
+        .enumerate()
+        .map(|(i, lib)| {
+            if i < implicit_from {
+                linker_common::input_as_needed(inputs, lib)
+            } else {
+                lib == "gcc_s" || lib == "m"
+            }
+        })
+        .collect()
+}
+
 /// Scan input objects to build initial defined/undefined symbol sets.
+///
+/// `undefined_syms` holds the names referenced non-weakly and not defined:
+/// GNU ld extracts an archive member, or keeps an `--as-needed` library, only
+/// for such a reference (`ref_regular_nonweak`).  A weak one binds to a
+/// definition the link has anyway -- linked libraries' exports are imported
+/// from `shared_lib_syms`, not from this set.
 pub fn collect_initial_symbols(
     input_objs: &[(String, ElfObject)],
     defined_syms: &mut FxHashSet<String>,
@@ -134,7 +298,7 @@ pub fn collect_initial_symbols(
         for sym in &obj.symbols {
             if sym.shndx == SHN_UNDEF
                 && !sym.name.is_empty()
-                && sym.binding() != STB_LOCAL
+                && !matches!(sym.binding(), STB_LOCAL | STB_WEAK)
                 && !defined_syms.contains(sym.name.as_str())
             {
                 undefined_syms.insert(sym.name.to_string());
@@ -152,7 +316,7 @@ pub fn collect_initial_symbols(
 /// Also loads archive members from `_nonshared.a` files referenced in linker scripts.
 pub fn discover_shared_lib_symbols(
     needed_libs: &[String],
-    implicit_from: usize,
+    lib_as_needed: &[bool],
     lib_search_paths: &[String],
     input_objs: &mut Vec<(String, ElfObject)>,
     defined_syms: &mut FxHashSet<String>,
@@ -177,13 +341,7 @@ pub fn discover_shared_lib_symbols(
                 Ok(d) => d,
                 Err(_) => continue,
             };
-            // gcc links its shared unwinder `--as-needed` (`-lgcc
-            // --as-needed -lgcc_s`): a DT_NEEDED only when it is used. The
-            // driver's default `-lm` -- not in gcc's spec at all -- is
-            // as-needed too, so it costs a program that uses no libm
-            // function no library load; a user `-lm` keeps GNU's
-            // no-as-needed meaning.
-            let as_needed = libname == "gcc_s" || (i >= implicit_from && libname == "m");
+            let as_needed = lib_as_needed[i];
             if data.starts_with(b"/* GNU ld script")
                 || data.starts_with(b"OUTPUT_FORMAT")
                 || data.starts_with(b"GROUP")
@@ -218,20 +376,15 @@ pub fn discover_shared_lib_symbols(
                 // symbols at link time and then failed to find them at
                 // runtime — observed on real riscv64 glibc under qemu.)
                 let needed = linker_common::parse_soname(&data).unwrap_or_else(|| so_name.clone());
-                let mut used = false;
-                if let Ok(syms) = read_shared_lib_symbols(&path) {
-                    for si in syms {
-                        used |=
-                            undefined_syms.contains(&si.name) && !defined_syms.contains(&si.name);
-                        shared_lib_syms.offer(si, &needed);
-                    }
-                }
-                if as_needed && !used {
-                    break;
-                }
-                if !actual_needed_libs.contains(&needed) {
-                    actual_needed_libs.push(needed);
-                }
+                shared_lib_syms.link_library(
+                    &path,
+                    &needed,
+                    linker_common::parse_shared_library_symbols(&data, &path).unwrap_or_default(),
+                    as_needed,
+                    |name| undefined_syms.contains(name) && !defined_syms.contains(name),
+                    None,
+                    actual_needed_libs,
+                );
             }
             break;
         }
@@ -298,20 +451,21 @@ fn process_linker_script(
         if bytes.starts_with(b"!<arch>\n") || is_thin_archive(&bytes) {
             load_nonshared_archive(&path, input_objs, defined_syms, undefined_syms);
         } else if bytes.starts_with(b"\x7fELF") {
-            let Ok(syms) = read_shared_lib_symbols(&path) else {
+            let Ok(syms) = linker_common::parse_shared_library_symbols(&bytes, &path) else {
                 continue;
             };
-            let used = syms
-                .iter()
-                .any(|si| undefined_syms.contains(&si.name) && !defined_syms.contains(&si.name));
-            let file = path.rsplit('/').next().unwrap_or(&path);
-            let soname = linker_common::parse_soname(&bytes).unwrap_or_else(|| file.to_string());
-            if (used || !token_as_needed) && !actual_needed_libs.contains(&soname) {
-                actual_needed_libs.push(soname.clone());
-            }
-            for si in syms {
-                shared_lib_syms.offer(si, &soname);
-            }
+            let soname = linker_common::parse_soname(&bytes).unwrap_or_else(|| {
+                linker_common::unsonamed_needed_name(&path, token.starts_with("-l"))
+            });
+            shared_lib_syms.link_library(
+                &path,
+                &soname,
+                syms,
+                token_as_needed,
+                |name| undefined_syms.contains(name) && !defined_syms.contains(name),
+                None,
+                actual_needed_libs,
+            );
         }
     }
 }

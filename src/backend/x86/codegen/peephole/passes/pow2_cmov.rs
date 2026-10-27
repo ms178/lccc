@@ -41,9 +41,13 @@
 //!    the block's trailing flags are the `sar`'s both before and after the
 //!    rewrite, so every downstream reader keeps its value; unknown entry
 //!    state at a label in between is refused rather than reasoned about.
-//! 3. **The scratch dies with the block**: no reader of `%S` after the sign
-//!    chain until its next definition — deleting the two shifts would
-//!    otherwise strand later readers.
+//! 3. **The scratch dies with the block**: `%S` is dead after the sign
+//!    chain — deleting the two shifts would otherwise strand later readers.
+//!    The answer is the exact CFG dataflow of `liveness::FileLiveness`
+//!    (branches followed; at `ret` the prologue's `# LCCC_RET_RAX/RDX`
+//!    markers decide which return registers the caller observes); only a
+//!    function that analysis cannot resolve falls back to a fail-closed
+//!    linear scan that stops at every control transfer.
 //! 4. **Immediates fit**: the conditional `lea` displaces `2^k-1` as a
 //!    signed 32-bit displacement, so `1 ≤ k ≤ 31` (a wider shift keeps the
 //!    original identity).
@@ -56,14 +60,23 @@
 
 use super::super::types::*;
 use super::identical_blocks::reads_flags;
+use super::liveness::FileLiveness;
 use super::relay_and_lea::{plain_gp_operand, split_two_operands};
 
 /// Rewrite every recognised sign-chain block.  Returns whether the text
 /// changed.
 pub(super) fn run(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let mut changed = false;
+    // Exact CFG liveness, built on the first block that reaches the scratch
+    // question and never refreshed: a rewrite deletes only the dead scratch's
+    // definitions and reads and moves `%T`'s definition earlier *inside* the
+    // block, so the block's live-in set is unchanged or smaller and every
+    // answer outside the block can only become "dead" — a stale "live" is
+    // conservative. (Rewritten blocks never match again: their `lea` has a
+    // displacement and no `mov`/`sar`/`shr` head.)
+    let mut liveness: Option<FileLiveness> = None;
     for end in 0..infos.len() {
-        if let Some(block) = Block::discover(store, infos, end) {
+        if let Some(block) = Block::discover(store, infos, end, &mut liveness) {
             if block.apply(store, infos) {
                 changed = true;
             }
@@ -84,7 +97,12 @@ struct Block {
 }
 
 impl Block {
-    fn discover(store: &LineStore, infos: &[LineInfo], end: usize) -> Option<Block> {
+    fn discover(
+        store: &LineStore,
+        infos: &[LineInfo],
+        end: usize,
+        liveness: &mut Option<FileLiveness>,
+    ) -> Option<Block> {
         let e = plain_sar(store, infos, end)?;
         // Walking down from the final sar: lea, bias shift, sign shift, mov.
         let lea_i = prev_non_silence(store, infos, end)?;
@@ -187,9 +205,15 @@ impl Block {
             }
         }
 
-        // Scratch liveness: no reader of %S after the lea (its last chain
-        // read) until the next definition of %S.
-        if scratch_live_after(store, infos, lea_i, s) {
+        // Scratch liveness after the lea (its last chain read): the exact
+        // dataflow answer — which follows branches and honours the
+        // prologue's return-register markers at `ret` — and the fail-closed
+        // linear scan only where that function is unanalysable.
+        let live = liveness
+            .get_or_insert_with(|| FileLiveness::new(store, infos))
+            .live_after(lea_i, s)
+            .unwrap_or_else(|| scratch_live_after(store, infos, lea_i, s));
+        if live {
             return None;
         }
 
@@ -669,6 +693,66 @@ mod tests {
                 "return-register scratch must stay live:\n{out}"
             );
         }
+    }
+
+    #[test]
+    fn the_return_markers_decide_which_return_register_ret_observes() {
+        // Prologue output for an `int` return: `%rdx` carries nothing at
+        // `ret`, so an `%edx` sign scratch dies with the block (the shape
+        // `x * (x + 2) / 2` lowers to); with the marker flipped it is live.
+        let body = |rdx: u8| {
+            format!(
+                concat!(
+                    "f:\n.cfi_startproc\n",
+                    "    # LCCC_RET_RDX {}\n",
+                    "    # LCCC_RET_RAX 1\n",
+                    "    movl %edi, %edx\n",
+                    "    sarl $31, %edx\n",
+                    "    shrl $31, %edx\n",
+                    "    leal (%rdi,%rdx), %eax\n",
+                    "    sarl $1, %eax\n",
+                    "    ret\n",
+                    ".cfi_endproc\n",
+                ),
+                rdx
+            )
+        };
+        let out = run_cmov(&body(0));
+        assert!(out.contains("cmovns %edi, %eax"), "{out}");
+        assert!(out.contains("leal 1(%rdi), %eax"), "{out}");
+        assert!(!out.contains("%edx"), "dead scratch retired:\n{out}");
+        let out = run_cmov(&body(1));
+        assert!(out.contains("shrl $31, %edx"), "live %rdx kept:\n{out}");
+        assert!(!out.contains("cmovns"), "{out}");
+    }
+
+    #[test]
+    fn a_branch_is_followed_to_the_scratch_overwrite() {
+        // The jump's target overwrites the scratch before any read, so it is
+        // dead after the block on every path; a read at the target is not.
+        let body = |target: &str| {
+            frame(&format!(
+                concat!(
+                    "    movl %edi, %r9d\n",
+                    "    sarl $31, %r9d\n",
+                    "    shrl $28, %r9d\n",
+                    "    leal (%rdi, %r9), %esi\n",
+                    "    sarl $4, %esi\n",
+                    "    jmp .Ljoin\n",
+                    ".Ljoin:\n",
+                    "    {}\n",
+                    "    movl %esi, %eax\n",
+                    "    ret\n",
+                ),
+                target
+            ))
+        };
+        let out = run_cmov(&body("movl $7, %r9d"));
+        assert!(out.contains("cmovns %edi, %esi"), "{out}");
+        assert!(out.contains("leal 15(%rdi), %esi"), "{out}");
+        let out = run_cmov(&body("addl %r9d, %esi"));
+        assert!(out.contains("shrl $28, %r9d"), "read at the target:\n{out}");
+        assert!(!out.contains("cmovns"), "{out}");
     }
 
     #[test]

@@ -52,6 +52,31 @@ pub(super) fn load_file_as_needed(
         lib_paths,
         whole_archive,
         as_needed,
+        false,
+        0,
+    )
+}
+
+/// As [`load_file_as_needed`], for the library an `-l` search found at
+/// `path` (`linker_common::unsonamed_needed_name`).
+pub(super) fn load_library_as_needed(
+    path: &str,
+    objects: &mut linker_common::ObjectSet,
+    globals: &mut FxHashMap<String, GlobalSymbol>,
+    needed_sonames: &mut Vec<String>,
+    lib_paths: &[String],
+    whole_archive: bool,
+    as_needed: bool,
+) -> Result<(), String> {
+    load_file_depth(
+        path,
+        objects,
+        globals,
+        needed_sonames,
+        lib_paths,
+        whole_archive,
+        as_needed,
+        true,
         0,
     )
 }
@@ -93,6 +118,7 @@ fn load_file_depth(
     lib_paths: &[String],
     whole_archive: bool,
     as_needed: bool,
+    by_search: bool,
     depth: usize,
 ) -> Result<(), String> {
     if std::env::var("LINKER_DEBUG").is_ok() {
@@ -174,6 +200,7 @@ fn load_file_depth(
                         lib_paths,
                         whole_archive,
                         as_needed || input.as_needed,
+                        matches!(input.entry, LinkerScriptEntry::Lib(_)),
                         depth + 1,
                     )?;
                 }
@@ -189,10 +216,12 @@ fn load_file_depth(
         if e_type == ET_DYN {
             linker_common::load_shared_library_elf64_as_needed(
                 path,
+                objects,
                 globals,
                 needed_sonames,
                 lib_paths,
                 as_needed,
+                by_search,
             )?;
             // A library's `.dynsym` names export the executable's definitions
             // it references -- if it is part of the link.  An `--as-needed`
@@ -201,12 +230,8 @@ fn load_file_depth(
             // unloads such a library, its symbols included.  (It is in the
             // link iff its soname is in the DT_NEEDED list, also when an
             // earlier input put it there.)
-            let soname = linker_common::parse_soname(data).unwrap_or_else(|| {
-                Path::new(path)
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| path.to_string())
-            });
+            let soname = linker_common::parse_soname(data)
+                .unwrap_or_else(|| linker_common::unsonamed_needed_name(path, by_search));
             if needed_sonames.contains(&soname) {
                 objects.note_dso_names(linker_common::shared_library_dynsym_names(data));
             }

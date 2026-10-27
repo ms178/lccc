@@ -666,6 +666,7 @@ impl Lowerer {
             // CPU feature detection builtins return int
             "__builtin_cpu_init" => Some(IrType::I32),
             "__builtin_cpu_supports" => Some(IrType::I32),
+            "__builtin_cpu_is" => Some(IrType::I32),
             // Fortification builtins: return type matches the underlying libc function
             // Memory/string functions return pointer (dest)
             "__builtin___memcpy_chk"
