@@ -43,7 +43,7 @@ pub fn type_name_const_base(ts: &TypeSpecifier, explicit: bool, lookup: &impl Co
 }
 
 /// The specifier `ts` is derived from.
-fn base_specifier(mut ts: &TypeSpecifier) -> &TypeSpecifier {
+pub fn base_specifier(mut ts: &TypeSpecifier) -> &TypeSpecifier {
     loop {
         match ts {
             TypeSpecifier::Pointer(inner, _)

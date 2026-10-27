@@ -74,6 +74,17 @@ struct Scope {
     /// (unlike `const_base`, which for a pointer object records its
     /// POINTEE's constness).
     top_const: FxHashSet<String>,
+    /// Function parameters, so read-only diagnostics can say GCC's
+    /// `read-only parameter 'p'` instead of `read-only variable 'p'`.
+    parameters: FxHashSet<String>,
+    /// The written alias naming an object's base type when that base is a
+    /// typedef (`CI a[1]` under `typedef const int CI;`): GCC's
+    /// `*(const CI *)&a` keeps the ALIAS name, which `CType` erases.
+    written_type_names: FxHashMap<String, String>,
+    /// Objects whose type's base specifier is `volatile`. The twin of
+    /// `const_base` for GCC's read-only location spelling
+    /// (`*(const volatile int *)&a`).
+    volatile_base: FxHashSet<String>,
     /// The value of a folded const object, converted to its type, so that
     /// `int a = cc;` can be evaluated for `const int cc = 5;`.
     folded_values: FxHashMap<String, FoldedValue>,
@@ -127,6 +138,9 @@ impl Scope {
             constexpr_members: FxHashMap::default(),
             const_base: FxHashSet::default(),
             top_const: FxHashSet::default(),
+            parameters: FxHashSet::default(),
+            written_type_names: FxHashMap::default(),
+            volatile_base: FxHashSet::default(),
             pointer_quals: FxHashMap::default(),
             folded_values: FxHashMap::default(),
             enumerators: FxHashSet::default(),
@@ -394,8 +408,64 @@ impl SymbolTable {
             .map(Vec::as_slice)
     }
 
+    /// Record `name` as a function parameter (GCC's read-only wording
+    /// distinguishes parameters from ordinary variables).
+    pub fn mark_parameter(&mut self, name: &str) {
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.parameters.insert(name.to_string());
+        }
+    }
+
+    /// Whether the innermost visible declaration of `name` is a function
+    /// parameter (see [`Self::mark_parameter`]).
+    pub fn is_parameter(&self, name: &str) -> bool {
+        self.scopes
+            .iter()
+            .rev()
+            .find(|scope| scope.symbols.contains_key(name))
+            .is_some_and(|scope| scope.parameters.contains(name))
+    }
+
     /// Record that the innermost scope's object `name` has a top-level
     /// `const` (see the `top_const` field on `Scope`).
+    /// Record the alias that names `name`'s base type (GCC keeps typedef
+    /// names in `read-only location` spellings).
+    pub fn mark_written_type_name(&mut self, name: &str, alias: &str) {
+        if let Some(scope) = self.scopes.last_mut() {
+            scope
+                .written_type_names
+                .insert(name.to_string(), alias.to_string());
+        }
+    }
+
+    /// The written alias of `name`'s base type, when it is a typedef.
+    pub fn written_type_name(&self, name: &str) -> Option<&str> {
+        self.scopes
+            .iter()
+            .rev()
+            .find(|scope| scope.symbols.contains_key(name))
+            .and_then(|scope| scope.written_type_names.get(name))
+            .map(String::as_str)
+    }
+
+    /// Record that `name`'s base specifier is `volatile` (see
+    /// [`Self::mark_const_base`]).
+    pub fn mark_volatile_base(&mut self, name: &str) {
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.volatile_base.insert(name.to_string());
+        }
+    }
+
+    /// Whether the innermost visible declaration of `name` has a `volatile`
+    /// base specifier.
+    pub fn is_volatile_base(&self, name: &str) -> bool {
+        self.scopes
+            .iter()
+            .rev()
+            .find(|scope| scope.symbols.contains_key(name))
+            .is_some_and(|scope| scope.volatile_base.contains(name))
+    }
+
     pub fn mark_top_const(&mut self, name: &str) {
         if let Some(scope) = self.scopes.last_mut() {
             scope.top_const.insert(name.to_string());
