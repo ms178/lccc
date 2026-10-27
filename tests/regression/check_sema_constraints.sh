@@ -9,7 +9,7 @@ C
 ! "$CCC" -fsyntax-only "$t/bad.c" 2>"$t/e" || { echo "FAIL: negative assertion at ${BASH_SOURCE[0]##*/}:$LINENO" >&2; exit 1; }
 # The stem (no trailing `s`) matches GCC's measured singular phrasings of
 # -Wincompatible-pointer-types as well as the historical plural spelling.
-for x in "'return' with a value" "return with no value" "incompatible types" "incompatible pointer type" "too few arguments to function 'one'" "too many arguments to function 'one'" "too few arguments to function 'fp'"; do grep -q "$x" "$t/e"; done
+for x in "'return' with a value" "'return' with no value" "incompatible types" "incompatible pointer type" "too few arguments to function 'one'" "too many arguments to function 'one'" "too few arguments to function 'fp'"; do grep -q "$x" "$t/e"; done
 cat >"$t/good.c" <<'C'
 struct A{int x;}; static int add(int a,int b){return a+b;} static int sum(int n,...){return n;}
 int main(void){struct A a={1},b=a;void*vp=&a;struct A*ap=vp;int(*fp)(int,int)=add;return fp(a.x,b.x)==2&&sum(2,1,2)==2&&ap==&a?0:1;}
