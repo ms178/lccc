@@ -539,7 +539,7 @@ impl Parser {
                         return_type =
                             TypeSpecifier::Array(Box::new(return_type), size_expr.clone());
                     }
-                    DerivedDeclarator::Pointer(space) => {
+                    DerivedDeclarator::Pointer(space, _) => {
                         return_type = TypeSpecifier::Pointer(Box::new(return_type), pending_space);
                         pending_space = *space;
                     }
@@ -560,7 +560,7 @@ impl Parser {
             let mut i = 0;
             while i < prefix.len() {
                 match &prefix[i] {
-                    DerivedDeclarator::Pointer(_) => {
+                    DerivedDeclarator::Pointer(..) => {
                         if let Some(DerivedDeclarator::FunctionPointer(
                             params,
                             variadic,
@@ -616,7 +616,7 @@ impl Parser {
             let mut pending_space = AddressSpace::Default;
             for d in derived {
                 match d {
-                    DerivedDeclarator::Pointer(space) => {
+                    DerivedDeclarator::Pointer(space, _) => {
                         return_type = TypeSpecifier::Pointer(Box::new(return_type), pending_space);
                         pending_space = *space;
                     }
@@ -654,7 +654,7 @@ impl Parser {
                                     | DerivedDeclarator::Function(..) => {
                                         found_fptr = true;
                                     }
-                                    DerivedDeclarator::Pointer(_) if found_fptr => {
+                                    DerivedDeclarator::Pointer(..) if found_fptr => {
                                         ptrs_after += 1;
                                     }
                                     _ => {}
@@ -731,7 +731,7 @@ impl Parser {
             let mut star_spaces = pderived
                 .iter()
                 .filter_map(|d| match d {
-                    DerivedDeclarator::Pointer(space) => Some(*space),
+                    DerivedDeclarator::Pointer(space, _) => Some(*space),
                     _ => None,
                 })
                 .collect::<Vec<_>>();
@@ -753,7 +753,7 @@ impl Parser {
         // (`struct sd * __seg_gs *` declares a pointer whose pointee values
         // live in %gs — the kernel's percpu `T * __percpu *` members).
         for d in pderived {
-            if let DerivedDeclarator::Pointer(space) = d {
+            if let DerivedDeclarator::Pointer(space, _) = d {
                 full_type = TypeSpecifier::Pointer(Box::new(full_type), *space);
             }
         }
@@ -1870,7 +1870,7 @@ impl Parser {
         let mut pending_space = AddressSpace::Default;
         for d in derived {
             match d {
-                DerivedDeclarator::Pointer(space) => {
+                DerivedDeclarator::Pointer(space, _) => {
                     spec = TypeSpecifier::Pointer(Box::new(spec), pending_space);
                     pending_space = *space;
                 }

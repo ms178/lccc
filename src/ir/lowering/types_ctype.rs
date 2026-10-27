@@ -71,6 +71,7 @@ impl Lowerer {
                             fptr_inner_ptr_depth: 0,
                             pointer_depth: 0,
                             pointer_const: false,
+                            pointer_quals: Vec::new(),
                         })
                         .collect();
                     TypeSpecifier::FunctionPointer(
@@ -147,6 +148,7 @@ impl Lowerer {
                         fptr_inner_ptr_depth: 0,
                         pointer_depth: 0,
                         pointer_const: false,
+                        pointer_quals: Vec::new(),
                     })
                     .collect();
                 TypeSpecifier::BareFunction(
@@ -410,6 +412,9 @@ impl Lowerer {
                         object_volatile: f.object_volatile,
                         object_const: f.object_const,
                         counted_by: f.counted_by.clone(),
+                        pointer_quals: crate::common::type_builder::declarator_pointer_quals(
+                            &f.derived,
+                        ),
                     })
                 })
                 .collect();

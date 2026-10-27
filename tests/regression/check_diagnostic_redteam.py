@@ -51,6 +51,32 @@ CASES = [
     ('void_return_value', 'void f(void){return 1;}', False, 'return-mismatch'),
     ('missing_return_value', 'int f(void){return;}', False, 'return-mismatch'),
     ('implicit_int', 'f(void){return 0;}', False, 'implicit-int'),
+    # Per-level pointer qualifiers. `CType` erases qualifiers, so before the
+    # per-level record these middle-level consts were invisible and every
+    # `*p = 0` below was silently accepted. Measured against gcc 16.2.0 and
+    # clang 23.1.4: exactly the cases marked True are constraint violations.
+    ('const_middle_level', 'void f(int *const *p){*p=0;}', True, None),
+    ('mutable_middle_pointee', 'void f(int *const *p){**p=1;}', False, None),
+    ('mutable_middle_object', 'void f(int *const *p){p=0;}', False, None),
+    ('const_middle_element', 'void f(int *const *p){p[0]=0;}', True, None),
+    ('const_middle_offset', 'void f(int *const *p){*(p+0)=0;}', True, None),
+    ('const_middle_increment', 'void f(int *const *p){(*p)++;}', True, None),
+    ('const_middle_compound', 'void f(int *const *p){*p+=0;}', True, None),
+    ('const_third_level', 'void f(int **const *p){*p=0;}', True, None),
+    ('const_third_level_inner', 'void f(int *const **p){**p=0;}', True, None),
+    ('mutable_third_level', 'void f(int *const **p){*p=0;}', False, None),
+    ('const_middle_local', 'void f(void){int *const *p=0;*p=0;}', True, None),
+    ('const_middle_field', 'struct S{int *const *p;};void f(struct S*s){*s->p=0;}', True, None),
+    ('mutable_field_pointee', 'struct S{int *const *p;};void f(struct S*s){**s->p=1;}', False, None),
+    ('const_middle_typedef', 'typedef int *const cp;void f(cp *p){*p=0;}', True, None),
+    ('const_typedef_object', 'typedef int *const cp;void f(void){cp x=0;x=0;}', True, None),
+    ('mutable_typedef_pointer', 'typedef int *const cp;void f(cp p){*p=0;}', False, None),
+    ('const_typedef_parameter', 'typedef int *const cp;void f(cp p){p=0;}', True, None),
+    ('mutable_typedef_pointee', 'typedef int *const cp;void f(cp *p){**p=0;}', False, None),
+    ('const_typedef_field', 'typedef int *const cp;struct S{cp *f;};void g(struct S*s){*s->f=0;}', True, None),
+    ('mutable_typedef_field_pointee', 'typedef int *const cp;struct S{cp *f;};void g(struct S*s){**s->f=0;}', False, None),
+    ('const_typedef_chain', 'typedef int *const cp;typedef cp *cpp;void f(cpp p){*p=0;}', True, None),
+    ('const_middle_prefix_offset', 'void f(int *const *p){*(1+p)=0;}', True, None),
 ]
 
 

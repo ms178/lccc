@@ -967,7 +967,7 @@ impl Lowerer {
                     let mut func_info = None;
                     for d in &declarator.derived {
                         match d {
-                            DerivedDeclarator::Pointer(_) => ptr_count += 1,
+                            DerivedDeclarator::Pointer(..) => ptr_count += 1,
                             DerivedDeclarator::Function(p, v, _) => {
                                 func_info = Some((p.clone(), *v));
                                 break;

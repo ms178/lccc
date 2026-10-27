@@ -51,7 +51,7 @@ pub fn build_prefix_return_type_spec(
     let mut i = 0;
     while i < prefix.len() {
         match &prefix[i] {
-            DerivedDeclarator::Pointer(_) => {
+            DerivedDeclarator::Pointer(..) => {
                 if let Some(DerivedDeclarator::FunctionPointer(params, variadic, has_prototype)) =
                     prefix.get(i + 1)
                 {
@@ -118,7 +118,7 @@ pub fn extract_fptr_typedef_info(
     };
     // Strip the entity's own `FunctionPointer` and its preceding syntax-marker `Pointer`.
     let prefix_len = if derived.len() >= 2
-        && matches!(derived[derived.len() - 2], DerivedDeclarator::Pointer(_))
+        && matches!(derived[derived.len() - 2], DerivedDeclarator::Pointer(..))
     {
         derived.len() - 2
     } else {
@@ -202,6 +202,11 @@ pub struct TypeScopeFrame {
     pub qualified_pointee_changed: Vec<(String, bool)>,
     /// Same, for `const_base_typedefs`.
     pub const_base_changed: Vec<(String, bool)>,
+    /// Every change to `pointer_quals_typedefs` in this scope, with the
+    /// previous entry; undone last-write-first.
+    pub pointer_quals_changed: Vec<(String, Option<Vec<u8>>)>,
+    /// Same, for `top_const_typedefs`.
+    pub top_const_typedef_changed: Vec<(String, bool)>,
 }
 
 impl TypeScopeFrame {
@@ -223,6 +228,8 @@ impl TypeScopeFrame {
             typedef_alignments_shadowed: Vec::new(),
             qualified_pointee_changed: Vec::new(),
             const_base_changed: Vec::new(),
+            pointer_quals_changed: Vec::new(),
+            top_const_typedef_changed: Vec::new(),
         }
     }
 }
@@ -261,6 +268,15 @@ pub struct TypeContext {
     /// here for the null pointer constant rule: `(CNPT)0` is not one. Scoped
     /// like `typedefs` (see [`Self::set_typedef_pointee_qualified`]).
     pub qualified_pointee_typedefs: FxHashSet<String>,
+    /// Per-pointer-level CVR bits of pointer typedefs (`typedef int *const
+    /// cp;`). `CType` carries no qualifiers, so an alias's middle level would
+    /// otherwise vanish at every use (`cp *p` = pointer to const pointer).
+    /// Scoped like `typedefs` (see [`Self::set_typedef_pointer_quals`]).
+    pub pointer_quals_typedefs: FxHashMap<String, Vec<u8>>,
+    /// Pointer typedefs whose own object is `const`
+    /// (`typedef int *const cp;`). `x = 0` is rejected for such an alias, and a
+    /// `cp p` parameter is read-only, exactly as written out.
+    pub top_const_typedefs: FxHashSet<String>,
     /// Typedefs whose base specifier is `const` (`typedef const int CI;`,
     /// `typedef const char *CS;`; see `common::qualifiers`). Scoped like
     /// `typedefs` (see [`Self::set_typedef_const_base`]).
@@ -313,6 +329,8 @@ impl TypeContext {
             typedefs: FxHashMap::default(),
             typedef_alignments: FxHashMap::default(),
             qualified_pointee_typedefs: FxHashSet::default(),
+            pointer_quals_typedefs: FxHashMap::default(),
+            top_const_typedefs: FxHashSet::default(),
             const_base_typedefs: FxHashSet::default(),
             function_typedefs: FxHashMap::default(),
             func_ptr_typedefs: FxHashSet::default(),
@@ -648,6 +666,23 @@ impl TypeContext {
             // Last-write-first: each entry holds the value that write
             // replaced, so restoring in reverse rebuilds the pre-scope state
             // exactly.  `None` marks a name this scope introduced.
+            for (key, previous) in frame.pointer_quals_changed.into_iter().rev() {
+                match previous {
+                    Some(quals) => {
+                        self.pointer_quals_typedefs.insert(key, quals);
+                    }
+                    None => {
+                        self.pointer_quals_typedefs.remove(&key);
+                    }
+                }
+            }
+            for (key, was_const) in frame.top_const_typedef_changed.into_iter().rev() {
+                if was_const {
+                    self.top_const_typedefs.insert(key);
+                } else {
+                    self.top_const_typedefs.remove(&key);
+                }
+            }
             for (key, was_const) in frame.const_base_changed.into_iter().rev() {
                 if was_const {
                     self.const_base_typedefs.insert(key);
@@ -881,6 +916,54 @@ impl TypeContext {
         } else {
             self.qualified_pointee_typedefs.remove(name);
         }
+    }
+
+    /// Record the per-level CVR bits of pointer typedef `name`, undone when the
+    /// current scope is popped (see `set_typedef_const_base`).
+    pub fn set_typedef_pointer_quals(&mut self, name: &str, quals: Vec<u8>) {
+        let previous = self.pointer_quals_typedefs.get(name).cloned();
+        if previous.as_deref() == Some(quals.as_slice()) {
+            return;
+        }
+        if let Some(frame) = self.scope_stack.get_mut().last_mut() {
+            frame
+                .pointer_quals_changed
+                .push((name.to_string(), previous));
+        }
+        if quals.iter().any(|&q| q != 0) {
+            self.pointer_quals_typedefs.insert(name.to_string(), quals);
+        } else {
+            self.pointer_quals_typedefs.remove(name);
+        }
+    }
+
+    /// Per-level CVR bits of pointer typedef `name`, if it recorded any.
+    pub fn typedef_pointer_quals(&self, name: &str) -> Option<&[u8]> {
+        self.pointer_quals_typedefs.get(name).map(Vec::as_slice)
+    }
+
+    /// Record whether pointer typedef `name` declares a read-only object
+    /// (`typedef int *const cp;`), undone when the scope is popped.
+    pub fn set_typedef_top_const(&mut self, name: &str, is_const: bool) {
+        let was_const = self.top_const_typedefs.contains(name);
+        if was_const == is_const {
+            return;
+        }
+        if let Some(frame) = self.scope_stack.get_mut().last_mut() {
+            frame
+                .top_const_typedef_changed
+                .push((name.to_string(), was_const));
+        }
+        if is_const {
+            self.top_const_typedefs.insert(name.to_string());
+        } else {
+            self.top_const_typedefs.remove(name);
+        }
+    }
+
+    /// Whether pointer typedef `name` declares a read-only object.
+    pub fn typedef_is_top_const(&self, name: &str) -> bool {
+        self.top_const_typedefs.contains(name)
     }
 
     /// Record whether typedef `name` has a `const` base specifier, undone when

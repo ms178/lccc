@@ -1299,7 +1299,7 @@ impl Parser {
         ) || derived.iter().any(|d| {
             matches!(
                 d,
-                DerivedDeclarator::Pointer(_)
+                DerivedDeclarator::Pointer(..)
                     | DerivedDeclarator::Function(..)
                     | DerivedDeclarator::FunctionPointer(..)
             )
@@ -1414,7 +1414,7 @@ impl Parser {
             let field_base_const = field_spec_const;
             let field_object_const = if derived
                 .iter()
-                .any(|d| matches!(d, DerivedDeclarator::Pointer(_)))
+                .any(|d| matches!(d, DerivedDeclarator::Pointer(..)))
             {
                 self.attrs.parsing_pointer_const()
             } else {
@@ -1575,7 +1575,15 @@ impl Parser {
             )
         });
 
-        if has_function {
+        // A star's own CVR run has no representation in `TypeSpecifier::Pointer`
+        // (which carries only the space), so folding would silently drop a
+        // middle level's `const` (`int *const *p`) and accept `*p = 0`.
+        // Keep the declarator list, which carries it, for the general builder.
+        let has_star_qualifiers = derived
+            .iter()
+            .any(|d| matches!(d, DerivedDeclarator::Pointer(_, cvr) if *cvr != 0));
+
+        if has_function || has_star_qualifiers {
             return (base.clone(), derived.to_vec());
         }
 
@@ -1597,7 +1605,7 @@ impl Parser {
         let mut i = 0;
         while i < derived.len() {
             match &derived[i] {
-                DerivedDeclarator::Pointer(space) => {
+                DerivedDeclarator::Pointer(space, _) => {
                     result = TypeSpecifier::Pointer(Box::new(result), pending_space);
                     pending_space = *space;
                     i += 1;

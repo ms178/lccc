@@ -2007,6 +2007,7 @@ impl<'a> SemaConstEval<'a> {
                     object_volatile: f.object_volatile,
                     object_const: f.object_const,
                     counted_by: f.counted_by.clone(),
+                    pointer_quals: Vec::new(),
                 })
             })
             .collect()

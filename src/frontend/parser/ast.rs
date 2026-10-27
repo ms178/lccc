@@ -457,6 +457,12 @@ pub struct ParamDecl {
     /// True for `T *const p`: the pointer parameter object itself is read-only
     /// (the `const` on the star closest to the name).
     pub pointer_const: bool,
+    /// CVR bits of each pointer level, indexed by level (`[0]` is the level
+    /// closest to the base type, `[len-1]` the parameter object's own level).
+    /// `pointer_const` is the object's bit; this vector carries the *middle*
+    /// levels too, whose `const` `CType` erases (`int *const *p`: `[0]` has
+    /// [`CVR_CONST`], so `*p` is read-only).
+    pub pointer_quals: Vec<u8>,
 }
 
 /// Bit masks for boolean flags in `Declaration::flags`.
@@ -1041,15 +1047,36 @@ pub struct InitDeclarator {
     pub span: Span,
 }
 
+/// CVR qualifier bits carried by a pointer star (`DerivedDeclarator::Pointer`).
+/// The layout matches the abstract-declarator path (`AbstractDeclaratorLevel`),
+/// where `apply_to` pushes the same encoding per pointer level.
+pub const CVR_CONST: u8 = 1 << 0;
+pub const CVR_VOLATILE: u8 = 1 << 1;
+pub const CVR_RESTRICT: u8 = 1 << 2;
+
+/// `true` when the `const` bit is set in a CVR mask.
+pub fn cvr_is_const(cvr: u8) -> bool {
+    cvr & CVR_CONST != 0
+}
+
 /// Derived parts of a declarator (pointers, arrays, function params).
 #[derive(Debug, Clone)]
 pub enum DerivedDeclarator {
-    /// A `*`. The address space is the qualifier written immediately after this
-    /// `*` (`long *__seg_gs *p`: the first star carries `__seg_gs`). It qualifies
-    /// the storage of the pointer that the NEXT pointer level points to, so
-    /// `p` points at a segment pointer. The last star's space is the declared
-    /// object's own space and is carried separately (`DeclAttributes::object_space`).
-    Pointer(AddressSpace),
+    /// A `*`, with the qualifiers written immediately after it: the address
+    /// space (`long *__seg_gs *p`: the first star carries `__seg_gs`) and the
+    /// CVR bits ([`CVR_CONST`], [`CVR_VOLATILE`], [`CVR_RESTRICT`]).
+    ///
+    /// The space qualifies the storage of the pointer that the NEXT pointer
+    /// level points to, so `p` points at a segment pointer. The last star's
+    /// space is the declared object's own space and is carried separately
+    /// (`DeclAttributes::object_space`).
+    ///
+    /// The CVR bits are the star's own qualifiers. They are not the CType:
+    /// `CType::Pointer` erases qualifiers, and a middle level's `const`
+    /// (`int *const *p`) is exactly what decides whether `*p = 0` is legal.
+    /// Type construction records each star's bits in the same order it wraps
+    /// pointer levels, so the collected vector is indexed by level.
+    Pointer(AddressSpace, u8),
     Array(Option<Box<Expr>>),
     Function(Vec<ParamDecl>, bool, bool), // params, variadic, has_prototype
     /// Function pointer: (*name)(params) - distinguishes from pointer-to-return-type
@@ -1105,7 +1132,7 @@ impl DerivedDeclarator {
         };
         slice
             .iter()
-            .filter(|d| matches!(d, DerivedDeclarator::Pointer(_)))
+            .filter(|d| matches!(d, DerivedDeclarator::Pointer(..)))
             .count()
     }
 }
@@ -1134,6 +1161,7 @@ mod declarator_law_tests {
             fptr_inner_ptr_depth: 0,
             pointer_depth: 0,
             pointer_const: false,
+            pointer_quals: Vec::new(),
         }
     }
 
@@ -1160,7 +1188,7 @@ mod declarator_law_tests {
             // int *f(int) — pointer return.
             (
                 vec![
-                    Pointer(crate::common::types::AddressSpace::Default),
+                    Pointer(crate::common::types::AddressSpace::Default, 0),
                     func(1),
                 ],
                 true,
@@ -1169,8 +1197,8 @@ mod declarator_law_tests {
             // int **f(int) — two indirections.
             (
                 vec![
-                    Pointer(crate::common::types::AddressSpace::Default),
-                    Pointer(crate::common::types::AddressSpace::Default),
+                    Pointer(crate::common::types::AddressSpace::Default, 0),
+                    Pointer(crate::common::types::AddressSpace::Default, 0),
                     func(1),
                 ],
                 true,
@@ -1180,7 +1208,7 @@ mod declarator_law_tests {
             // (SQLite's sqlite3OsDlSym shape): the prefix has ONE Pointer.
             (
                 vec![
-                    Pointer(crate::common::types::AddressSpace::Default),
+                    Pointer(crate::common::types::AddressSpace::Default, 0),
                     fnp(0),
                     func(1),
                 ],
@@ -1193,9 +1221,9 @@ mod declarator_law_tests {
             // leading-run count undercounts (1 instead of 2).
             (
                 vec![
-                    Pointer(crate::common::types::AddressSpace::Default),
+                    Pointer(crate::common::types::AddressSpace::Default, 0),
                     fnp(0),
-                    Pointer(crate::common::types::AddressSpace::Default),
+                    Pointer(crate::common::types::AddressSpace::Default, 0),
                     fnp(1),
                     func(1),
                 ],
@@ -1205,7 +1233,10 @@ mod declarator_law_tests {
             // int (*fp)(int) — function-pointer OBJECT: not a function,
             // whole-list depth 1 (the typedef return is depth-1 = 0: int).
             (
-                vec![Pointer(crate::common::types::AddressSpace::Default), fnp(1)],
+                vec![
+                    Pointer(crate::common::types::AddressSpace::Default, 0),
+                    fnp(1),
+                ],
                 false,
                 1,
             ),
@@ -1213,8 +1244,8 @@ mod declarator_law_tests {
             // typedef return depth 1.
             (
                 vec![
-                    Pointer(crate::common::types::AddressSpace::Default),
-                    Pointer(crate::common::types::AddressSpace::Default),
+                    Pointer(crate::common::types::AddressSpace::Default, 0),
+                    Pointer(crate::common::types::AddressSpace::Default, 0),
                     fnp(1),
                 ],
                 false,
@@ -1224,7 +1255,7 @@ mod declarator_law_tests {
             (vec![Array(None), fnp(1)], false, 0),
             // Plain pointer object.
             (
-                vec![Pointer(crate::common::types::AddressSpace::Default)],
+                vec![Pointer(crate::common::types::AddressSpace::Default, 0)],
                 false,
                 1,
             ),
@@ -1931,7 +1962,7 @@ impl DerivedDeclarator {
     /// bound, or the expressions of its parameter types.
     pub fn for_each_expr<'a>(&'a self, f: &mut dyn FnMut(&'a Expr)) {
         match self {
-            DerivedDeclarator::Pointer(_) | DerivedDeclarator::Array(None) => {}
+            DerivedDeclarator::Pointer(..) | DerivedDeclarator::Array(None) => {}
             DerivedDeclarator::Array(Some(bound)) => f(bound),
             DerivedDeclarator::Function(params, _, _)
             | DerivedDeclarator::FunctionPointer(params, _, _) => {

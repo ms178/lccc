@@ -533,10 +533,23 @@ impl SemanticAnalyzer {
                 } else if param.pointer_depth > 0 {
                     param.pointer_const
                 } else {
-                    param.is_const
+                    param.is_const || self.base_typedef_is_top_const(&param.type_spec)
                 };
                 if top_const {
                     self.symbol_table.mark_top_const(name);
+                }
+                // Middle levels of a multi-level pointer keep their `const`
+                // only here: `CType` has no qualifier slots, so `int *const
+                // *p` would otherwise look identical to `int **p` and `*p = 0`
+                // would be accepted (GCC rejects it, C11 6.5.16p1).
+                {
+                    // Levels inherited from a typedef the parameter is built on
+                    // come first: they are closer to the base type.
+                    let mut pointer_quals = self.base_typedef_pointer_quals(&param.type_spec);
+                    pointer_quals.extend(param.pointer_quals.iter().copied());
+                    if !pointer_quals.is_empty() {
+                        self.symbol_table.mark_pointer_quals(name, pointer_quals);
+                    }
                 }
             }
         }
@@ -646,10 +659,23 @@ impl SemanticAnalyzer {
                 } else if param.pointer_depth > 0 {
                     param.pointer_const
                 } else {
-                    param.is_const
+                    param.is_const || self.base_typedef_is_top_const(&param.type_spec)
                 };
                 if top_const {
                     self.symbol_table.mark_top_const(name);
+                }
+                // Middle levels of a multi-level pointer keep their `const`
+                // only here: `CType` has no qualifier slots, so `int *const
+                // *p` would otherwise look identical to `int **p` and `*p = 0`
+                // would be accepted (GCC rejects it, C11 6.5.16p1).
+                {
+                    // Levels inherited from a typedef the parameter is built on
+                    // come first: they are closer to the base type.
+                    let mut pointer_quals = self.base_typedef_pointer_quals(&param.type_spec);
+                    pointer_quals.extend(param.pointer_quals.iter().copied());
+                    if !pointer_quals.is_empty() {
+                        self.symbol_table.mark_pointer_quals(name, pointer_quals);
+                    }
                 }
             }
         }
@@ -1051,6 +1077,26 @@ impl SemanticAnalyzer {
                 self.result
                     .type_context
                     .set_typedef_const_base(&declarator.name, const_base);
+                // An alias must keep the per-level qualifiers of the type it
+                // names: `typedef int *const cp;` used as `cp *p` declares a
+                // pointer to a const pointer, and `*p = 0` is a constraint
+                // violation (C11 6.5.16p1). Levels inherited from a typedef the
+                // alias is built on come first (they are closer to the base).
+                let typedef_quals = {
+                    let mut quals = self.base_typedef_pointer_quals(&decl.type_spec);
+                    quals.extend(type_builder::declarator_pointer_quals(&declarator.derived));
+                    quals
+                };
+                self.result
+                    .type_context
+                    .set_typedef_pointer_quals(&declarator.name, typedef_quals);
+                // `typedef int *const cp;` declares a read-only pointer
+                // object; every `cp x` is read-only like a written-out
+                // `int *const x`, and `x = 0` is a constraint violation.
+                self.result.type_context.set_typedef_top_const(
+                    &declarator.name,
+                    matches!(resolved_ctype, CType::Pointer(..)) && declarator.attrs.pointer_const,
+                );
                 self.result
                     .type_context
                     .typedefs
@@ -1396,6 +1442,17 @@ impl SemanticAnalyzer {
             if const_base {
                 self.symbol_table.mark_const_base(&init_decl.name);
             }
+            // Per-level pointer qualifiers (`int *const *p`): the middle levels
+            // are erased from `CType`, so the read-only check reads them from
+            // the symbol table. Recorded in CType creation order.
+            if is_object {
+                let mut pointer_quals = self.base_typedef_pointer_quals(&decl.type_spec);
+                pointer_quals.extend(type_builder::declarator_pointer_quals(&init_decl.derived));
+                if !pointer_quals.is_empty() {
+                    self.symbol_table
+                        .mark_pointer_quals(&init_decl.name, pointer_quals);
+                }
+            }
             // Top-level const for assignment/`++`/`--` (C11 6.5.16p1): with
             // any pointer star the `const` closest to the name decides
             // (`int *const p` read-only, `const int *q` writable, `q`'s
@@ -1406,11 +1463,14 @@ impl SemanticAnalyzer {
                 let has_star = init_decl
                     .derived
                     .iter()
-                    .any(|d| matches!(d, DerivedDeclarator::Pointer(_)));
+                    .any(|d| matches!(d, DerivedDeclarator::Pointer(..)));
                 let top_const = if has_star {
                     init_decl.attrs.pointer_const
                 } else {
-                    decl.is_const()
+                    // Without a star the object's own qualifier comes from the
+                    // declaration's `const`, or from the alias it is declared
+                    // with (`typedef int *const cp; cp x;`).
+                    decl.is_const() || self.base_typedef_is_top_const(&decl.type_spec)
                 };
                 if top_const {
                     self.symbol_table.mark_top_const(&init_decl.name);
@@ -1439,7 +1499,7 @@ impl SemanticAnalyzer {
                 && !init_decl.derived.iter().any(|d| {
                     matches!(
                         d,
-                        DerivedDeclarator::Pointer(_)
+                        DerivedDeclarator::Pointer(..)
                             | DerivedDeclarator::Function(..)
                             | DerivedDeclarator::FunctionPointer(..)
                     )
@@ -6134,6 +6194,11 @@ impl SemanticAnalyzer {
                     object_volatile: f.object_volatile,
                     object_const: f.object_const,
                     counted_by: f.counted_by.clone(),
+                    pointer_quals: {
+                        let mut quals = self.base_typedef_pointer_quals(&f.type_spec);
+                        quals.extend(type_builder::declarator_pointer_quals(&f.derived));
+                        quals
+                    },
                 })
             })
             .collect()
@@ -6711,6 +6776,23 @@ impl SemanticAnalyzer {
             .map_or((false, false), |(base, object, _)| (base, object))
     }
 
+    /// Per-level pointer qualifiers of the member `field` selected from `base`
+    /// (`base.field` when `indirect` is false, `base->field` otherwise).
+    fn member_pointer_quals(&self, base: &Expr, field: &str, indirect: bool) -> Option<Vec<u8>> {
+        let Some(CType::Struct(key) | CType::Union(key)) = self.member_base_ctype(base, indirect)
+        else {
+            return None;
+        };
+        self.result
+            .type_context
+            .borrow_struct_layouts()
+            .get(key.as_ref())
+            .and_then(|layout| {
+                layout
+                    .field_pointer_quals(field, &*self.result.type_context.borrow_struct_layouts())
+            })
+    }
+
     fn readonly_base_qualifier(&self, expr: &Expr) -> bool {
         match expr {
             Expr::MemberAccess(base, field, _) => self.member_constness(base, field, false).0,
@@ -6754,6 +6836,16 @@ impl SemanticAnalyzer {
                         base
                     };
                 }
+                // `*(p + i)` is the same lvalue `p[i]` names, but `p + i`
+                // itself still designates a POINTER: the dereference belongs to
+                // the enclosing `*`, so the chain only unwraps the offset.
+                Expr::BinaryOp(op, lhs, rhs, _) if matches!(op, BinOp::Add | BinOp::Sub) => {
+                    root = if tc.infer_expr_ctype(lhs).is_some_and(|ty| ty.is_integer()) {
+                        rhs
+                    } else {
+                        lhs
+                    };
+                }
                 _ => break,
             }
         }
@@ -6770,6 +6862,41 @@ impl SemanticAnalyzer {
             Some(CType::Array(..)) => 0,
             _ => return false, // unknown type: stay silent
         };
+        // A symbol that recorded its per-level qualifiers decides exactly:
+        // the k-th dereference of `root` designates pointer level `k + 1`, and
+        // only the level beyond every star (`k + 1 == depth`) designates the
+        // base object. Levels in between are invisible to `CType`
+        // (`int *const *p` has `const` on level 1, so `*p = 0` is a
+        // modification of a read-only object).
+        if depth > 0 {
+            // Where the per-level qualifiers of the root's type are recorded:
+            // objects in the symbol table, members in their layout.
+            let levels: Option<Vec<u8>> = match root {
+                Expr::Identifier(name, _) => {
+                    self.symbol_table.pointer_quals(name).map(<[u8]>::to_vec)
+                }
+                Expr::MemberAccess(base, field, _) => self.member_pointer_quals(base, field, false),
+                Expr::PointerMemberAccess(base, field, _) => {
+                    self.member_pointer_quals(base, field, true)
+                }
+                _ => None,
+            };
+            if let Some(levels) = levels {
+                // `root` has a `depth`-level pointer type, so `*root` names the
+                // object of level `depth - 1` and every further dereference
+                // drops one level; level 0 is the base object.
+                let target = depth as usize - (k + 1);
+                if target == 0 {
+                    return self.readonly_base_qualifier(root);
+                }
+                if target < depth as usize {
+                    return levels
+                        .get(target - 1)
+                        .is_some_and(|&cvr| crate::frontend::parser::ast::cvr_is_const(cvr));
+                }
+                return false;
+            }
+        }
         match (k, depth) {
             // `*root` of a one-star root: the base specifier IS the pointee.
             (0, 1) | (0, 0) => {
@@ -7005,6 +7132,65 @@ impl SemanticAnalyzer {
 
     /// The expression type checker over this analyzer's state.
     /// Base constness of a declaration's type (see `common::qualifiers`).
+    /// CVR bits of each pointer level of a declarator, in CType creation
+    /// order: index `L-1` is pointer level `L`, counting the level closest to
+    /// the base type as 1 (`int *const *p` → level 1 is `const`).
+    ///
+    /// `CType::Pointer` carries no qualifiers, and this is the only place they
+    /// survive the parser. Function-pointer declarators are the one shape whose
+    /// entries the type builder may reorder around the `FunctionPointer` core;
+    /// a function type is never an assignment target, so its levels are not
+    /// consulted by the read-only check.
+    /// Whether the alias naming `type_spec`'s base declares a read-only object
+    /// (`typedef int *const cp;`), so a declaration with no star of its own is
+    /// read-only. See [`Self::base_typedef_pointer_quals`] for the leaf walk.
+    fn base_typedef_is_top_const(&self, type_spec: &TypeSpecifier) -> bool {
+        let mut leaf = type_spec;
+        loop {
+            match leaf {
+                TypeSpecifier::Pointer(inner, _)
+                | TypeSpecifier::Array(inner, _)
+                | TypeSpecifier::TypeofType(inner)
+                | TypeSpecifier::Vector(inner, _)
+                | TypeSpecifier::ExtVector(inner, _) => leaf = inner,
+                _ => break,
+            }
+        }
+        match leaf {
+            TypeSpecifier::TypedefName(name) => self.result.type_context.typedef_is_top_const(name),
+            _ => false,
+        }
+    }
+
+    /// Per-level pointer qualifiers inherited from the typedef named by
+    /// `type_spec` (empty for any other base). An alias keeps the qualifiers of
+    /// the type it names, so a declaration built on it starts with them.
+    fn base_typedef_pointer_quals(&self, type_spec: &TypeSpecifier) -> Vec<u8> {
+        // The type name may already be wrapped in pointers/arrays (the parser
+        // folds a simple declarator into the specifier), so follow the shape
+        // down to the leaf that carries the name.
+        let mut leaf = type_spec;
+        loop {
+            match leaf {
+                TypeSpecifier::Pointer(inner, _)
+                | TypeSpecifier::Array(inner, _)
+                | TypeSpecifier::TypeofType(inner)
+                | TypeSpecifier::Vector(inner, _)
+                | TypeSpecifier::ExtVector(inner, _) => leaf = inner,
+                _ => break,
+            }
+        }
+        match leaf {
+            TypeSpecifier::TypedefName(name) => self
+                .result
+                .type_context
+                .typedef_pointer_quals(name)
+                .map(<[u8]>::to_vec)
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+
     fn decl_const_base(&self, type_spec: &TypeSpecifier, explicit: bool) -> bool {
         crate::common::qualifiers::type_name_const_base(
             type_spec,
@@ -7946,6 +8132,7 @@ mod record_layouts_correspond_tests {
             object_volatile: false,
             object_const: false,
             counted_by: None,
+            pointer_quals: Vec::new(),
         }
     }
 
@@ -8747,6 +8934,48 @@ mod kr_prototype_tests {
         );
     }
 
+    /// The blocker the audit opened this PR for: a `const` on a middle pointer
+    /// level is invisible in `CType`, so the read-only check has to read it
+    /// from the declarator record. Everything below was measured with
+    /// gcc 16.2.0 and clang 23.1.4.
+    #[test]
+    fn middle_pointer_levels_keep_their_const() {
+        // `*p` designates a const pointer object: assigning to it is a
+        // constraint violation (C11 6.5.16p1).
+        for bad in [
+            "void f(int *const *p){*p=0;}",
+            "void f(int *const *p){(*p)++;}",
+            "void f(int *const *p){p[0]=0;}",
+            "void f(int *const *p){*(p+0)=0;}",
+            "void f(int **const *p){*p=0;}",
+            "void f(int *const **p){**p=0;}",
+            "void f(void){int *const *p=0;*p=0;}",
+            "struct S{int *const *p;};void f(struct S*s){*s->p=0;}",
+            "typedef int *const cp;void f(cp *p){*p=0;}",
+            "typedef int *const cp;void f(void){cp x=0;x=0;}",
+            "typedef int *const cp;void f(cp p){p=0;}",
+            "typedef int *const cp;typedef cp *cpp;void f(cpp p){*p=0;}",
+        ] {
+            assert!(analyze(bad).1.is_err(), "{bad}");
+        }
+        // Legal forms stay legal: only the qualified level is read-only, and a
+        // `const` on a pointee does not make the pointer itself read-only.
+        for good in [
+            "void f(int *const *p){**p=1;}",
+            "void f(int *const *p){p=0;}",
+            "void f(int **const p){*p=0;}",
+            "void f(int *const **p){*p=0;}",
+            "void f(int *const p){*p=1;}",
+            "void f(const int **p){*p=0;}",
+            "void f(int *volatile *p){*p=0;}",
+            "typedef int *const cp;void f(cp p){*p=0;}",
+            "typedef int *const cp;void f(cp *p){**p=0;}",
+            "struct S{int *const *p;};void f(struct S*s){**s->p=1;}",
+        ] {
+            assert!(analyze(good).1.is_ok(), "{good}");
+        }
+    }
+
     #[test]
     fn real_prototypes_keep_pointer_constraints() {
         assert!(
@@ -8875,7 +9104,7 @@ fn declares_const_object(decl: &Declaration, init_decl: &InitDeclarator) -> bool
     let has_pointer = init_decl
         .derived
         .iter()
-        .any(|d| matches!(d, DerivedDeclarator::Pointer(_)));
+        .any(|d| matches!(d, DerivedDeclarator::Pointer(..)));
     // A volatile object is never a folded constant: every read of it is an
     // access that must reach memory (C11 6.7.3p7), so `const volatile` objects
     // are not recorded here. For a pointer declarator only the object's own
