@@ -6838,17 +6838,17 @@ impl SemanticAnalyzer {
     /// `_Generic` selection already uses.
     fn pointee_readonly(&self, ptr: &Expr) -> bool {
         // Walk the dereference chain down to its root so the verdict can be
-        // exact: an object at `*^k root` is const exactly when `k + 1` equals the
-        // root's pointer depth (the const then sits on the root's base
-        // specifier -- `const int *q`, `*q` read-only) or when the root is a
-        // non-pointer array whose elements are const (`*a` of `const int
-        // a[]`).  Deeper constness (a const at a middle level of a multi-star
-        // type, or a base const not yet consumed by the chain) is *not*
-        // recorded anywhere qualifier-free `CType` can see, so it reports
-        // "not read-only" instead of guessing -- a missing diagnostic never
-        // breaks a legal program, while a wrong one does (GCC 16.2 accepts
-        // `b = *(*p)++;` for `p: const unsigned char **`, whose base const
-        // sits two levels below the incremented `*p`).
+        // exact. `CType::Pointer` carries no qualifiers, so the per-level
+        // `const` bits come from the declaration that produced the root's
+        // type: symbols, members, cast type names, compound literals and
+        // function return types each record them (index `L-1` is pointer level
+        // `L`). With the root's pointer depth known, the object `*^k root`
+        // designates is level `depth - k`; level 0 is the base object, whose
+        // qualifier is the separate base-const record. An array-typed root
+        // (`const int *a[2]; *a[0] = 1`) supplies the ELEMENT's depth, since
+        // its subscript already consumed a dereference. When nothing recorded
+        // the levels the check stays silent rather than guessing: a missing
+        // diagnostic never breaks a legal program, a wrong one does.
         let tc = self.expr_type_checker();
         let mut derefs = 0usize;
         let mut root = ptr;
