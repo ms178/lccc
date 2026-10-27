@@ -1647,8 +1647,10 @@ impl Parser {
             let saved_const = self.attrs.parsing_const();
             let saved_volatile = self.attrs.parsing_volatile();
             let saved_space = self.attrs.parsing_address_space;
+            let saved_pointer_const = self.attrs.parsing_pointer_const();
             self.attrs.set_const(false);
             self.attrs.set_volatile(false);
+            self.attrs.set_pointer_const(false);
             self.attrs.parsing_address_space = AddressSpace::Default;
 
             let q_start = self.pos;
@@ -1669,6 +1671,7 @@ impl Parser {
 
             self.attrs.set_const(saved_const);
             self.attrs.set_volatile(saved_volatile);
+            self.attrs.set_pointer_const(saved_pointer_const);
             self.attrs.parsing_address_space = saved_space;
 
             self.skip_gcc_extensions();
