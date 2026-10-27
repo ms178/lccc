@@ -465,6 +465,7 @@ class LinkerContractTest(unittest.TestCase):
             ("--strict", "--strict --list"),                    # runs nothing
             ("LCCC_REQUIRE_I386=1", "LCCC_REQUIRE_I386=0"),
             ("LCCC_RELOCS_TOOL=", "LCCC_RELOCS_TOOX="),
+            ("LCCC_BFD_LD=", "LCCC_BFD_LD_MISSING="),
             ("gas-2.47-x86_64-linux-gnu/bin:", "gas-2.42/bin:"),  # unpinned assembler
             ("python3 tests/linker/run_linker_tests.py",
              "echo python3 tests/linker/run_linker_tests.py"),

@@ -63,6 +63,8 @@ REPO=$(CDPATH= cd -- "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 # A stale binary in a directory named bfd-2.47 must never be published as 2.47.
 # shellcheck source=oracle_versions.sh
 source "$(dirname "${BASH_SOURCE[0]}")/oracle_versions.sh"
+# shellcheck source=native_bfd_wrapper.sh
+source "$(dirname "${BASH_SOURCE[0]}")/native_bfd_wrapper.sh"
 
 JOBS="${JOBS:-2}"                      # research policy: -j2
 ARTIFACTS="${ARTIFACTS:-$HOME/artifacts/oracles}"
@@ -127,9 +129,10 @@ fi
 
 # ── GNU ld 2.47 (primary oracle) ────────────────────────────────────────────
 
-# Match the native driver/runtime layout, not the upstream configure
-# defaults (which omit Debian multiarch libc and default to old dtags).
-# Version equality alone does not make that a usable native oracle.
+# Match the native driver/runtime layout, not the cached binary's upstream
+# configure defaults (which omit Debian multiarch libc and default to old
+# dtags). The stable ld-2.47 wrapper below supplies these defaults while
+# preserving caller overrides; version equality alone is not a usable oracle.
 native_multiarch=$(gcc -print-multiarch)
 native_lib_path=/usr/local/lib:/lib:/usr/lib:/lib64:/usr/lib64
 if [ -n "$native_multiarch" ] && [ -d "/lib/$native_multiarch" ]; then
@@ -140,7 +143,7 @@ fi
 for libdir in /lib32 /usr/lib32 /lib/i386-linux-gnu /usr/lib/i386-linux-gnu; do
     [ ! -d "$libdir" ] || native_lib_path="$native_lib_path:$libdir"
 done
-bfd_layout="new-dtags=1;sysroot=/;lib-path=$native_lib_path"
+bfd_layout="native-wrapper-v1;new-dtags=1;sysroot=/;lib-path=$native_lib_path"
 bfd_layout_stamp="$PREFIX/bfd-$BINUTILS_VER/.native-layout"
 if [ -x "$PREFIX/bfd-$BINUTILS_VER/bin/ld" ] &&
    oracle_native_layout_matches "$bfd_layout_stamp" "$bfd_layout"; then
@@ -243,8 +246,12 @@ for pair in "ld-$BINUTILS_VER:$PREFIX/bfd-$BINUTILS_VER/bin/ld" \
         rm -f "$LINKDIR/$name"
         continue
     fi
-    printf '#!/bin/sh\nexec %s "$@"\n' "$target" > "$LINKDIR/$name.tmp"
-    chmod +x "$LINKDIR/$name.tmp"
+    if [ "$name" = "ld-$BINUTILS_VER" ]; then
+        write_native_bfd_wrapper "$LINKDIR/$name.tmp" "$target" "$native_lib_path"
+    else
+        printf '#!/bin/sh\nexec %s "$@"\n' "$target" > "$LINKDIR/$name.tmp"
+        chmod +x "$LINKDIR/$name.tmp"
+    fi
     mv -f "$LINKDIR/$name.tmp" "$LINKDIR/$name"
 done
 

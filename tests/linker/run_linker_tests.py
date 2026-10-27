@@ -6448,16 +6448,17 @@ def _text_relocations_test(args, oracles):
 
     A PIE whose `.rodata` holds an absolute pointer (`.quad sym` from
     hand-written assembly or non-PIC objects) used to keep that section in
-    the read-only segment with no DT_TEXTREL: ld.so faulted writing the
-    RELATIVE before `main`.  lccc-ld now places such a section at the head
-    of PT_GNU_RELRO (as its shared-object emitter already did): written
-    while still writable, then protected -- no text relocation, so `-z
-    text` links it.  Code cannot move (`movabs $sym` in `.text`, in a PIE or
-    a shared object): that is a real text relocation, which used to be
-    written into a read-only mapping just the same, and now follows GNU
-    ld's policy on both linkers -- the default warns about the first site
-    and that DT_TEXTREL is created and emits DT_TEXTREL + DF_TEXTREL,
-    `-z text` refuses the link with GNU's message, `-z notext` is silent.
+    the read-only segment with no text-relocation marker: ld.so faulted
+    writing the RELATIVE before `main`.  lccc-ld now places such a section at
+    the head of PT_GNU_RELRO (as its shared-object emitter already did):
+    written while still writable, then protected -- no text relocation, so
+    `-z text` links it.  Code cannot move (`movabs $sym` in `.text`, in a PIE
+    or a shared object): that is a real text relocation, which used to be
+    written into a read-only mapping just the same. Both linkers warn about
+    the first site and identify the relocation with DT_TEXTREL and/or
+    DF_TEXTREL; GNU ld 2.47 can emit DT_TEXTREL without the redundant
+    DF_TEXTREL bit. `-z text` refuses the link with GNU's message, and
+    `-z notext` is silent.
     """
     name = "text_relocations"
     td = tempfile.mkdtemp(prefix=f"lnk.{name}.")
@@ -6495,6 +6496,11 @@ def _text_relocations_test(args, oracles):
             flags = next((v for t, v in dyn if t == 30), 0)  # DT_FLAGS
             return has_tag, bool(flags & 4)  # DF_TEXTREL
 
+        def has_textrel(d):
+            # Either marker carries the ABI meaning. BFD 2.47 omits the
+            # redundant DF_TEXTREL bit when it already emits DT_TEXTREL.
+            return any(textrel_tags(d))
+
         def run(exe, want, libdir=None):
             env = dict(os.environ)
             if libdir:
@@ -6511,8 +6517,8 @@ def _text_relocations_test(args, oracles):
             return Result(name, "FAIL", f"ro PIE -z text: rc {r.returncode} "
                           f"stderr {r.stderr.decode()[:300]!r}")
         d = image("ro.pie")
-        if textrel_tags(d) != (False, False):
-            return Result(name, "FAIL", "ro PIE: DT_TEXTREL/DF_TEXTREL without code relocations")
+        if has_textrel(d):
+            return Result(name, "FAIL", "ro PIE: text-relocation marker without code relocations")
         tbl = _nm_addrs(os.path.join(td, "ro.pie"), td)["tbl"]
         relro = [p for p in _elf_bytes_phdrs(d) if p[0] == 0x6474E552]
         if len(relro) != 1 or not relro[0][3] <= tbl < relro[0][3] + relro[0][5]:
@@ -6536,8 +6542,8 @@ def _text_relocations_test(args, oracles):
                 if f"creating DT_TEXTREL in a {kind}" not in msg or site not in msg:
                     return Result(name, "FAIL", f"{label}: default link must warn like GNU ld: "
                                   f"{msg[:300]!r}")
-                if textrel_tags(image(out + "." + tag)) != (True, True):
-                    return Result(name, "FAIL", f"{label}: DT_TEXTREL + DF_TEXTREL missing")
+                if not has_textrel(image(out + "." + tag)):
+                    return Result(name, "FAIL", f"{label}: DT_TEXTREL/DF_TEXTREL marker missing")
                 r = link(tag, argv + ["-Wl,-z,text"], out + ".ztext")
                 if r.returncode == 0 or b"read-only segment has dynamic relocations" not in r.stderr:
                     return Result(name, "FAIL", f"{label} -z text: rc {r.returncode} "
@@ -6546,8 +6552,8 @@ def _text_relocations_test(args, oracles):
                 if r.returncode != 0 or b"TEXTREL" in r.stderr or b"read-only" in r.stderr:
                     return Result(name, "FAIL", f"{label} -z notext: rc {r.returncode} "
                                   f"{r.stderr[:300]!r}")
-                if textrel_tags(image(out + ".notext")) != (True, True):
-                    return Result(name, "FAIL", f"{label} -z notext: tags missing")
+                if not has_textrel(image(out + ".notext")):
+                    return Result(name, "FAIL", f"{label} -z notext: marker missing")
         err = run("all.pie.lccc", "5 7\n")
         if err:
             return Result(name, "FAIL", err)
@@ -6555,7 +6561,7 @@ def _text_relocations_test(args, oracles):
         # relro-moved, so `-z text` accepts it).
         os.replace(os.path.join(td, "libtr.so.lccc"), os.path.join(td, "libtr.so"))
         r = link("lccc", ["-shared", "ro.o", "-Wl,-z,text"], "libro.so")
-        if r.returncode != 0 or textrel_tags(image("libro.so")) != (False, False):
+        if r.returncode != 0 or has_textrel(image("libro.so")):
             return Result(name, "FAIL", f"ro .so -z text: rc {r.returncode} {r.stderr[:300]!r}")
         r = link("lccc", ["-pie", "m_all.o", "./libtr.so", "./libro.so"], "use.pie")
         if r.returncode != 0:

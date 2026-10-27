@@ -2536,11 +2536,14 @@ if [ -x target/fastbuild/lccc-ld ]; then
         bash tests/linker/setup_kernel_tools.sh --prefix "$HOME/.cache/lccc-kernel-tools"
     gate "linker-harness-selftest" fast \
         python3 tests/linker/test_run_linker_helpers.py
+    # GCC -fuse-ld=bfd does not discover the triplet-prefixed BFD 2.47 in the
+    # GAS prefix; gotpcrel_edges needs it as an explicit newer-linker fallback.
     gate "linker-suite" fast env \
         LCCC_TEST_ASSEMBLER="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" \
         PATH="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin:$PATH" \
         LCCC_REQUIRE_I386=1 \
         LCCC_RELOCS_TOOL="$HOME/.cache/lccc-kernel-tools/bin/relocs" \
+        LCCC_BFD_LD="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/x86_64-linux-gnu-ld.bfd" \
         python3 tests/linker/run_linker_tests.py --lccc target/fastbuild/lccc --strict
 else
     echo "SKIP  linker fuzz + linker suite (target/fastbuild/lccc-ld not built)"
