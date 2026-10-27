@@ -73,7 +73,7 @@ jobs:
           path: ${{ runner.temp }}/toolchain-cache/toolchain-cache.json
           if-no-files-found: error
   evidence:
-    if: ${{ github.event_name == 'workflow_dispatch' || hashFiles('engineering/toolchains/.agent-cache-dispatch') == '' }}
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.pull_request.head.ref != 'arena/1f67deb1-lccc' }}
     # Opt-in research: manual, or a PR explicitly changing this definition.
     name: Same-host portable/native runtime and Callgrind
     runs-on: ubuntu-24.04
@@ -292,7 +292,7 @@ jobs:
           if-no-files-found: warn
 
   agent-cache-publish:
-    if: ${{ github.event_name == 'pull_request' && hashFiles('engineering/toolchains/.agent-cache-dispatch') != '' }}
+    if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.ref == 'arena/1f67deb1-lccc' }}
     name: Publish GitHub-only agent toolchain cache (one-time bridge)
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -302,7 +302,16 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+      - name: Check one-time publication marker
+        id: marker
+        run: |
+          if [ -f engineering/toolchains/.agent-cache-dispatch ]; then
+            echo 'enabled=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'enabled=false' >> "$GITHUB_OUTPUT"
+          fi
       - name: Publish immutable GitHub-only toolchain tag
+        if: steps.marker.outputs.enabled == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
@@ -311,6 +320,7 @@ jobs:
             --tag "$(cat engineering/toolchains/.agent-cache-dispatch)" \
             --work "$RUNNER_TEMP/agent-toolchain-cache"
       - name: Upload reviewed cache lock inputs
+        if: steps.marker.outputs.enabled == 'true'
         uses: actions/upload-artifact@v6
         with:
           name: agent-toolchain-cache-lock
