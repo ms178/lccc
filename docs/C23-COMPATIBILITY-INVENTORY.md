@@ -1,7 +1,7 @@
 # C23 accept/reject inventory vs GCC 16.2
 
-Measured: 2026-10-26<br>
-Oracle: GCC 16.2.0 (`/home/user/toolchains/gcc16.2/prefix/bin/gcc-16`)<br>
+Measured: 2026-10-27<br>
+Oracle: GCC 16.2.0 (`gcc-16`)<br>
 Compiler: `target/fastbuild/lccc`<br>
 Probes: 24 translation units. This is not an overall C23 coverage percentage.
 
@@ -37,13 +37,35 @@ Every probe is compiled with `-fsyntax-only` in the listed mode. C17 outcomes ar
 
 ## Measured C23 differences
 
-- `bitint-17` is a confirmed implementation gap: GCC 16.2 accepts the C23
-  `unsigned _BitInt(17)` probe, while LCCC rejects it in both C23 and C17 modes.
-  This is deferred, not an intentional C23 rejection. Do not add syntax-only
-  acceptance or change the oracle expectation: the fixed-width `CType` model
-  cannot yet preserve arbitrary precision and signedness through conversions,
-  constants, layout, ABI lowering, code generation, and debug metadata. Keep
-  the probe visible until end-to-end support and differential ABI/layout tests
-  land; see `engineering/DECISIONS.md` and the live backlog.
+- `bitint-17`: GCC 16.2 accepts `unsigned _BitInt(17)`; LCCC rejects it in C23
+  and C17. This is a deferred implementation gap, not an intentional C23
+  rejection. Do not add syntax-only acceptance or change the oracle expectation:
+  the fixed-width `CType` model cannot preserve arbitrary precision and
+  signedness through integer conversions, constant evaluation, object and
+  aggregate layout, ABI classification, code generation, and debug metadata.
+  Keep this row visible until end-to-end support has compiler-oracle, ABI, and
+  layout coverage; see the live `_BitInt` item in `backlog.md`.
 
-Source hashes, complete diagnostics, and argv are preserved when the same run is requested with `--json`.
+## Measured C17 mode differences
+
+LCCC accepts these probes in `-std=c17`, while GCC 16.2 rejects them in that
+mode: `auto-type-inference`, `static-assert-keyword`, `alignof-keyword`,
+`one-argument-va-start`, `elifdef`, and `elifndef`. These are LCCC C17-mode
+extensions for this probe set, not C23-mode mismatches. GCC also accepts several
+C23-era spellings as GNU extensions in C17 (shown separately in the table).
+
+## Method and scope
+
+The report was refreshed on 2026-10-27 with `tests/regression/check_c23_inventory.py`
+against GCC 16.2.0 and the current fastbuild compiler. Each probe is compiled
+with `-fsyntax-only`; GCC's declared C23 expectations are checked, and C23 and
+C17 LCCC/GCC verdict differences are reported separately. The machine-readable
+run preserves each probe's source hash, full diagnostics, and argv; it is
+produced with the same script's `--json` option and kept as task evidence outside
+the repository rather than committed as generated data.
+
+This is a small per-feature accept/reject sample, not a comprehensive C23
+conformance suite and not a coverage percentage. It does not establish runtime,
+ABI, layout, code-generation, or exhaustive half-format correctness. In
+particular, the `_Float16` probe is a single syntax/semantic sample, not an
+exhaustive check across all 2^16 encodings and rounding modes.

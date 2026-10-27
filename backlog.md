@@ -219,31 +219,60 @@ a native GS-relative regression catches the former default-space load. See
 This is a bounded MB-01/UP-7 contribution, **not** closure of the option inventory,
 all-architecture audit or full comparison backlog.
 
-### MB-02 · P0 · R — linker option contract and the dead flags
+### MB-02 · P0 · R — linker option contract and no silent no-ops
 
-**Why.** `lccc-ld` and `-Wl,…` accepted 92/93 probed options without a word on
-`e8ae10a`; on `2070d23f` the five dead ones (`-z pack-relative-relocs`,
-`--pack-dyn-relocs=relr`, `--image-base`, `-z max-page-size`, `--oformat=binary`)
-are still silent no-ops (R, §2). The compiler driver now warns for tolerated options; the linker side has no equivalent. `src/bin/lccc_ld.rs::is_benign_ignorable`
-silently swallows `--fatal-warnings`, `--no-relax`, `--warn-common`,
-`--eh-frame-hdr`… and `warn_unimplemented` warns only for flags that reach the
-fallthrough. Two of the dead flags matter for real distributions: Arch's default
-LDFLAGS include `-Wl,-z,pack-relative-relocs` (no `DT_RELR` emitted today) and
-`-Wl,-O1 --sort-common`.
+**Status (re-audited 2026-10-27).** The no-op findings on `e8ae10a` and
+`2070d23f` are historical, not the current checkout. The x86-64 path now emits
+RELR for `-z pack-relative-relocs` / `--pack-dyn-relocs=relr`, carries the
+`GLIBC_ABI_DT_RELR` version need, honors `--image-base` and 64-KiB
+`-z max-page-size`, and writes `--oformat=binary` output identical to
+`objcopy -O binary` of the same LCCC ELF. Regression cases now pin the RELR
+loader contract, every `PT_LOAD` alignment, the image-base address, and raw
+output bytes. The available GNU BFD accepted the 64-KiB page-size option but
+rejected ELF `--image-base`; the image-base test therefore asserts LCCC's effect
+without claiming BFD parity.
+
+`--fatal-warnings` is parsed and now promotes deferred unimplemented-option
+warnings regardless of argument order. `--warn-common` no longer disappears in
+the benign-ignore list: standalone `lccc-ld --warn-common` and the compiler
+driver's `-Wl,--warn-common` path explicitly warn that the requested
+common-symbol diagnostic is not implemented; the linker test verifies fatal
+promotion in both flag orders on both paths. The selected
+`-z common-page-size[=N]` policy is also explicit:
+warn that its separate layout granularity is ignored, validate BFD-compatible
+zero/power-of-two spellings, reject malformed values, and promote the warning
+under `--fatal-warnings`. Regression coverage spans x86-64 built-in/shared/
+script and i386 built-in/shared/script links, plus the compiler driver's
+`-Wl,` path. AArch64 and RISC-V built-in backends now share the validation and
+warning policy; AArch64 was smoke-checked with the pinned assembler, while a
+RISC-V cross-link fixture remains unavailable. The strict linker suite now
+reports 313 pass, 0 fail, 0 warn, and 0 skip with GCC 16.2, BFD/mold oracles, and the
+pinned BFD 2.47 fallback for the CODE_4_GOTPCRELX case. This is the focused
+linker suite, not a completed `ci_local.sh --fast` run. The remaining issue is
+the *whole linker option surface*: there is still no generated BFD/LLD/mold
+option union or exhaustive `Implemented | BenignNoop | Refused | WarnUnimplemented`
+inventory; the remaining benign-ignore entries and `--O1/--sort-common`
+behavior need evidence and justification.
+
+**Why.** Without that inventory, additional semantic, ABI, and diagnostic
+options can still be silently swallowed. Arch's default LDFLAGS include
+`-Wl,-z,pack-relative-relocs` and `-Wl,-O1 --sort-common`; RELR is now covered,
+but the broader option contract remains open.
 
 **Where.** `src/bin/lccc_ld.rs` (`is_benign_ignorable`, `warn_unimplemented`),
 `src/backend/linker_common/args.rs`, `parse_linker_args` users in the driver.
 
-**Reproducer.**
+**Current regression reproducer.** With the fastbuild binary, the focused
+linker cases pin the accepted effects and the warning-policy edge:
 ```bash
-cat > a.c <<'E'
-#include <stdio.h>
-int main(void){puts("hi");return 0;}
-E
-lccc -Wl,-z,pack-relative-relocs a.c -o a  && readelf -d a | grep -c RELR   # 0 (bfd: 3)
-lccc -Wl,--image-base=0x10000000 a.c -o b  && readelf -h b | grep Entry      # unchanged
-lccc -Wl,-z,max-page-size=65536 a.c -o c   && readelf -lW c | grep LOAD | head -1   # Align 0x1000
-lccc -Wl,--oformat=binary a.c -o d && file d                                  # still ELF
+python3 tests/linker/run_linker_tests.py --lccc target/fastbuild/lccc --filter pack_relative_relocs
+python3 tests/linker/run_linker_tests.py --lccc target/fastbuild/lccc --filter pack_dyn_relocs_relr_alias
+python3 tests/linker/run_linker_tests.py --lccc target/fastbuild/lccc --filter max_page_size_64k
+python3 tests/linker/run_linker_tests.py --lccc target/fastbuild/lccc --filter image_base_sets_first_load
+python3 tests/linker/run_linker_tests.py --lccc target/fastbuild/lccc --filter binary_output_matches_objcopy
+python3 tests/linker/run_linker_tests.py --lccc target/fastbuild/lccc --filter warn_common
+python3 tests/linker/run_linker_tests.py --lccc target/fastbuild/lccc --filter common_page_size_warns_and_honors_fatal_warnings --strict
+python3 tests/linker/run_linker_tests.py --lccc target/fastbuild/lccc --filter emit_relocs_warns_when_unimplemented --strict
 ```
 
 **Plan.**
@@ -253,20 +282,27 @@ lccc -Wl,--oformat=binary a.c -o d && file d                                  # 
    `mold --help` (all installable in the sandbox) → union list checked into a
    data file; the gate fails on any option that is in the union but absent from
    the table (no un-triaged options).
-3. Classify the 93 probed flags: implement MB-14 items; `--fatal-warnings`
-   must **make warnings fatal** (it currently does nothing) — this matters for
-   `-Wl,--fatal-warnings` in kernel and CI builds; `--oformat=binary` and
-   `-N/-n/--omagic/--nmagic` either implemented or refused; `--print-memory-usage`
-   and `--trace/-t` implemented (trivial, from the layout tables) or refused.
-4. Make every `WarnUnimplemented` print once per option with the standard
-   prefix, and exit non-zero under `--fatal-warnings`.
+3. Finish classifying the probed flags: the MB-14 RELR, image-base, max-page-size
+   and binary-output contracts now have focused x86-64 gates. `common-page-size`
+   has an explicit warn-and-ignore policy, value validation, and cross-path
+   fatal-warning coverage; continue auditing `-N/-n/--omagic/--nmagic`,
+   `--print-memory-usage`, `--trace/-t`, and the actual `--warn-common` warning.
+   Implement each or assign a justified `BenignNoop`, `Refused`, or
+   `WarnUnimplemented` status.
+4. Keep every `WarnUnimplemented` diagnostic deduplicated and explicit, and make
+   final `--fatal-warnings` state promote it regardless of argument position;
+   `warn_common_fatal_order` and the common-page-size gate cover both orderings.
+   Expand this gate as the option table is populated.
 
 **Gates.** Option-surface test (to be created, e.g.
 scripts/ld_option_surface.py (to be created)): for each option with an `Implemented` class, run
 a mini-link and assert the effect via `readelf` (examples in the reproducer);
 for `Refused`, assert rc≠0 and message.
-**Accept.** 0 silent no-ops among options present in bfd/lld/mold; the four
-reproducer lines show their effect or an error. **Effort** M · **ROI** 4.5.
+**Accept.** 0 silent no-ops among options present in bfd/lld/mold; the generated
+surface inventory is mutation-verified, and every accepted/refused/warned option
+has an effect or diagnostic gate. The focused RELR, image-base, page-size,
+binary-output, and fatal-warning regressions remain green. **Effort** M ·
+**ROI** 4.5.
 
 ### MB-03 · closed upstream — keep a regression gate for `__builtin_cpu_supports`
 
@@ -445,14 +481,22 @@ refuse — never ignore. **Effort** M (a–e together L) · **ROI** 3.2.
 
 ## 5. Tier M1 — Completeness and debuggability
 
-### MB-10 · P1 · R — DWARF: from "no debug sections" to usable gdb
+### MB-10 · P1 · R — DWARF line tables landed; DIEs and gdb remain
 
-**Why.** `-g -O0 -c` produces **no** `.debug_*` sections (R); the native x86
-assembler parses `.file`/`.loc` and drops them (`AsmItem::{File,Loc}` in
-`src/backend/x86/assembler/parser.rs` are "parsed but skipped"). Consequence:
-no `addr2line`, no `perf annotate` source lines, no gdb locals, no kernel BTF.
-`-gsplit-dwarf` is accepted and ignored with a warning. This is the largest
-"does not feel finished" gap for daily use.
+**Status (re-audited 2026-10-27).** The old "no `.debug_*` sections" claim is
+stale for line tables. `tests/regression/check_dwarf_line_tables.py` passes with
+GCC 16.2 and LCCC on x86-64, plus LCCC i686: it checks `.debug_line` rows,
+`.rela.debug_line` / `.rel.debug_line`, multi-object address relocation,
+non-allocated debug sections, `--strip-all`, and preservation/relocation of
+GCC's full DWARF through executable and shared links. This is not evidence that
+LCCC emits full DIEs for its own code: GCC's `.debug_info` is only checked for
+preservation. `gdb`, pahole and objtool are unavailable in this harness, so no
+locals/arguments/CFI/BTF inspection is claimed.
+
+**Why.** LCCC-generated line tables now support basic source/address mapping,
+but its own `-g` output still lacks a demonstrated usable DIE tree for gdb
+(types, parameters, locals), and optimized location lists remain open. The
+remaining debug gap is substantially narrower than the historical baseline.
 
 **Where.** x86 and i686 assemblers (`src/backend/x86/assembler/`, i686 equivalent),
 `src/backend/x86/assembler/elf_writer.rs` (section + relocation emission),
@@ -461,13 +505,12 @@ no `addr2line`, no `perf annotate` source lines, no gdb locals, no kernel BTF.
 fed by `CType`.
 
 **Plan (each stage is shippable alone).**
-1. **Line table (S–M).** Teach both assemblers to turn `.file N "name"`/`.loc`
-   (with `is_stmt`, `prologue_end`, `discriminator`, `view`) into a DWARF 5
-   line program in `.debug_line` (+ `.debug_line_str`), with
-   `DW_LNE_set_address` relocated against the section symbol
-   (`R_X86_64_64` / `R_386_32`, written into `.rela.debug_line`/`.rel.debug_line`).
-   Support `-gdwarf-4` as the alternate format (directory/file tables differ).
-   Update the honesty check to validate the **object**, not the `.s` text.
+1. **Line table (basic DWARF emission and relocation now landed).** Keep the
+   existing `.file`/`.loc` mapping and x86-64/i686 relocation gates; finish
+   coverage for `.loc` flags (`is_stmt`, `prologue_end`, `discriminator`,
+   `view`), `.debug_line_str`, and `-gdwarf-4` directory/file tables. The current
+   gate verifies decoded rows and multi-object address relocation, not every
+   line-program feature.
 2. **Minimal DIE tree at -O0 (M).** `.debug_info`/`.debug_abbrev`/`.debug_str`:
    compile unit (producer, language `DW_LANG_C11`, name, comp_dir, `low_pc`/`high_pc`
    or `DW_AT_ranges`, `stmt_list`); base, pointer, const/volatile, typedef,
@@ -487,20 +530,25 @@ fed by `CType`.
    either implemented or Refused, BTF generation for the kernel
    (`pahole`-compatible) as a follow-up.
 
-**Gates.** (a) `readelf --debug-dump=decodedline` rows map `.loc` lines
-exactly; (b) `addr2line -e a.out <pc>` for every function entry of a 3-file
-program; (c) gdb batch (`gdb` installs from apt): `break g`, `run`, `bt`,
-`info args`, `info locals`, `print *ptr`, `ptype struct S`, `finish` all
-return the expected text at `-O0`; (d) the same on i686 via `gdb` + `-m32`;
-(e) mutation: corrupt one relocation and see (a) fail. (f) `llvm-dwarfdump
---verify` where available.
-**Accept.** Stages 1+2 land together with a stable gdb test; stage 3 has its
-own acceptance on the benchmark corpus (≥ 90 % of parameters inspectable at
-`-O1`). **Effort** L · **ROI** 3.8.
+**Gate status (2026-10-27).** `tests/regression/check_dwarf_line_tables.py`
+now covers the decoded-line, object-relocation, multi-object, strip, executable,
+and shared-link portions of (a)/(e); the full DWARF preservation checks also
+run `readelf --debug-dump=info`. `gdb` and `llvm-dwarfdump` were unavailable,
+so the remaining debugger/verification claims are still untested.
+
+**Remaining gates.** (a) exact decoded `.loc` rows for every supported flag;
+(b) `addr2line -e a.out <pc>` for every function entry of a 3-file program;
+(c) gdb batch: `break g`, `run`, `bt`, `info args`, `info locals`, `print *ptr`,
+`ptype struct S`, `finish` at `-O0`; (d) the same on i686 via `gdb` + `-m32`;
+(e) mutation: corrupt one relocation and see the gate fail; (f)
+`llvm-dwarfdump --verify` where available.
+**Accept.** The line-table stage is already independently gated; the DIE stage
+must land with a stable gdb test. Stage 3 has its own acceptance on the benchmark
+corpus (≥ 90 % of parameters inspectable at `-O1`). **Effort** L · **ROI** 3.8.
 
 ### MB-11 · P2 · R — C23 conformance inventory and half-format edge cases
 
-**Status (re-audited 2026-10-26).** The earlier 39/40 count and statement that
+**Status (re-audited 2026-10-27).** The earlier 39/40 count and statement that
 `_Float16`/`__bf16` were rejected are stale. The current tree implements both
 half formats, their literals/conversions and ABI lowering, with targeted GCC 16
 regressions including `gcc16_half_bfloat16_abi.c`, `gcc16_half_f16c.c` and the
@@ -522,7 +570,12 @@ fixed-width `CType` model cannot carry `_BitInt` precision and signedness throug
 integer conversions, constants, layout, ABI lowering, codegen and debug metadata.
 The inventory documents the measured rejection and the end-to-end acceptance
 criteria; until that work lands, keep the row visible and do not publish a C23
-coverage percentage.
+coverage percentage. The 2026-10-27 report is saved at
+`/home/user/lccc-c23-inventory-2026-10-27.{json,md}`; the same run records six
+C17-mode differences where LCCC accepts extensions that GCC 16.2 rejects:
+`alignof-keyword`, `auto-type-inference`, `elifdef`, `elifndef`,
+`one-argument-va-start`, and `static-assert-keyword`. See
+`docs/C23-COMPATIBILITY-INVENTORY.md` for the dated method and classifications.
 
 The historical per-function AVX2 vectorization candidate was remeasured with
 `tests/regression/per_function_target_avx2_reduction/reduction.c`: at `-O2`
@@ -557,35 +610,47 @@ coverage rather than weakening the existing known-gap row. **Effort** M–L ·
 
 ### MB-12 · P1 · R — warnings that real builds rely on
 
-**Why.** Missing vs GCC 13 `-Wall -Wextra` (R): `-Wformat`, `-Wsign-compare`,
-`-Wunused-variable`. Arch's default flags contain `-Wformat -Werror=format-security`;
-a compiler that cannot raise that diagnostic cannot enforce the policy.
-`-Wall -Werror` itself works for the warnings that exist (R: implicit
-declaration becomes `error [-Werror=implicit-function-declaration]`).
+**Status (re-audited 2026-10-27).** The earlier missing-warning list is stale:
+`-Wunused-variable`, core `-Wformat`, `-Wsign-compare`, and now
+`-Wformat-security` have focused compatibility cases. The `-Wformat-security`
+implementation diagnoses a non-literal printf-family format with no format
+arguments, requires both `-Wformat` and `-Wformat-security` (GCC 16.2
+behavior), and supports suppression, demotion, and `-Werror=format-security`.
+`tests/regression/check_warning_compat.py` passes these cases against GCC 16.2
+and LCCC. Clang 23.1.3 also warns for the same source (different diagnostic
+text); the requested Clang 23.1.4 and ICX 2026.2 toolchains are unavailable in
+the current harness, so no exact-version claim is made.
 
-**Where.** `src/frontend/sema/` (diagnostics), a new format-string checker
-module, warning-registry in `src/driver/cli.rs`/diagnostic sink.
+**Why.** The current gate is still a narrow compatibility sample, not a
+complete warning inventory or corpus-wide precision proof. `-Wunused-but-set-variable`,
+`-Wunused-function`, `-Wunused-parameter`, the full format subfamilies, warning
+group expansion/defaults, and unknown `-W` naming need broader coverage before
+real builds can rely on the entire GCC warning contract.
+
+**Where.** `src/frontend/sema/analysis.rs` (semantic checks), warning kinds and
+configuration in `src/common/error.rs` / `src/driver/cli.rs`, and the
+`tests/regression/check_warning_compat.py` parity gate.
 
 **Plan.**
-1. Warning registry: one table `(name, default-on, in -Wall, in -Wextra, description)`
-   driving `-W<name>`, `-Wno-<name>`, `-Werror=<name>`, `-Wno-error=<name>`,
-   the `[-Wname]` suffix, and `-Wall/-Wextra/-pedantic` group expansion; unknown
-   `-W` names follow MB-01.
-2. `-Wunused-variable`, `-Wunused-but-set-variable`, `-Wunused-function` (static,
-   not referenced), `-Wunused-parameter` (`-Wextra`): need a `used`/`set` bit on
-   declarations, respecting `(void)x`, `__attribute__((unused))`,
-   `[[maybe_unused]]`, and variables used only in `sizeof`/unevaluated contexts.
-3. `-Wsign-compare` (C: `-Wextra`): signed/unsigned relational comparison after
-   usual arithmetic conversions, with GCC's constant-value exemptions.
-4. `-Wformat` family for `printf`/`scanf`/`strftime`/`strfmon` families:
-   built-in knowledge of libc names plus `__attribute__((format(printf,m,n)))`;
-   checks: conversion/argument type mismatch, missing/extra arguments, `%n`, width
-   `*` types; `-Wformat-security` (non-literal format string, no arguments) so
-   `-Werror=format-security` works; `-Wformat-nonliteral` and
-   `-Wformat-overflow` later.
-5. Later: `-Wmaybe-uninitialized` (needs flow analysis before `mem2reg`),
-   `-Wshadow`, `-Wmissing-prototypes`, `-Wstrict-prototypes`, `-Wimplicit-fallthrough`,
-   `-Wcast-qual`, `-Wdeprecated-declarations`.
+1. Warning registry: finish a single table `(name, default-on, in -Wall, in
+   -Wextra, description)` driving `-W<name>`, `-Wno-<name>`, `-Werror=<name>`,
+   `-Wno-error=<name>`, the `[-Wname]` suffix, and `-Wall/-Wextra/-pedantic`
+   expansion; unknown `-W` names follow MB-01. The focused `FormatSecurity`
+   kind/config is now present, but the whole registry/group matrix is not done.
+2. Extend unused diagnostics beyond the gated `-Wunused-variable` case:
+   `-Wunused-but-set-variable`, `-Wunused-function` (static, not referenced),
+   and `-Wunused-parameter` (`-Wextra`) need correct `used`/`set` state,
+   respecting `(void)x`, `__attribute__((unused))`, `[[maybe_unused]]`, and
+   `sizeof`/unevaluated contexts.
+3. Expand the existing `-Wsign-compare` and core `-Wformat` coverage. For the
+   format family (`printf`/`scanf`/`strftime`/`strfmon`), cover libc names plus
+   `__attribute__((format(printf,m,n)))`, conversion/argument mismatch,
+   missing/extra arguments, `%n`, and width `*` types. `-Wformat-security`
+   (non-literal format, no arguments) and `-Werror=format-security` are now
+   implemented; `-Wformat-nonliteral` and `-Wformat-overflow` remain later work.
+4. Later: `-Wmaybe-uninitialized` (needs flow analysis before `mem2reg`),
+   `-Wshadow`, `-Wmissing-prototypes`, `-Wstrict-prototypes`,
+   `-Wimplicit-fallthrough`, `-Wcast-qual`, and `-Wdeprecated-declarations`.
 
 **Gates.** Per-warning positive/negative tests; **precision gate**: zero new
 warnings over `tests/benchmark/programs`, the zlib-ng/gzip/expat sources and
@@ -628,34 +693,65 @@ comparisons against `ld -m elf_i386`. **Accept.** The seven rows in §2's
 
 ### MB-14 · P1 · R — x86-64 linker: DT_RELR, page size, image base, small flags
 
-**Why.** Five flags are dead (MB-02 R list). Of those, `DT_RELR` is the one with
-real-world weight: Arch ships with it, it shrinks PIE/shared-object relocation
-tables 60–90 % and speeds startup.
+**Progress (re-audited 2026-10-27).** The old "five flags are dead" baseline
+is stale. The current x86-64 linker emits `DT_RELR`/`DT_RELRSZ`/`DT_RELRENT`
+and the `GLIBC_ABI_DT_RELR` version need for both `-z pack-relative-relocs`
+and `--pack-dyn-relocs=relr`; the new regression cases also run the PIE.
+`-z max-page-size=0x10000` sets every `PT_LOAD.p_align` to 64 KiB and matches
+available BFD; `--image-base=0x10000000` moves the first `ET_EXEC` load segment
+as requested (GNU BFD in this sandbox rejects the ELF option, so no BFD-parity
+claim); `--oformat=binary` matches `objcopy -O binary` byte-for-byte. These
+contracts now have focused tests in `tests/linker/run_linker_tests.py`.
+
+`common-page-size` is not implemented as a separate layout granularity; valid
+requests now warn that they are ignored, and `--fatal-warnings` promotes that
+warning in either option order. BFD 2.47 measurement accepts zero or a
+power-of-two value and rejects malformed/non-power-of-two values; LCCC validates
+that contract before warning. The regression gate covers x86-64 built-in,
+shared, and script links plus i386 built-in, shared, and script links, including
+invalid values. The x86-64 shared path also promotes `--emit-relocs` under
+`--fatal-warnings`. The full strict linker suite passes 313/313 with no warns or
+skips (BFD/mold oracles; the pinned BFD 2.47 linker is used for the
+CODE_4_GOTPCRELX reference case). Remaining work is implementing and measuring a
+separate common-page-size layout granularity, adding image-base alignment/error
+cases and reference behavior where an oracle accepts it, residual small flags,
+and broader RELR/ICF differential validation.
+
+**Why.** `DT_RELR` remains a high-impact ABI contract: Arch ships with it; it
+shrinks PIE/shared-object relocation tables and is only safe when the matching
+glibc version need is emitted. The unimplemented page-size and small-option
+edges still need explicit policy.
 
 **Where.** `src/backend/x86/linker/emit_exec.rs`, `emit_shared.rs`,
 `plt_got.rs`, layout constants in `layout_plan.rs`; `src/backend/linker_common/`.
 
-**Plan.**
-1. **RELR.** After layout, collect all `R_X86_64_RELATIVE`-class entries whose
-   place is 8-byte aligned and whose value is `base + addend` with the addend
-   *stored in the place* (RELR has no explicit addend): write the addend into
-   the section data, then encode sorted offsets as RELR words — an even word is
-   an address entry, an odd word is a 63-bit bitmap for the following 63
-   words. Entries that cannot be encoded (unaligned, or needing an explicit
-   addend elsewhere) stay in `.rela.dyn`. Emit `.relr.dyn`, `DT_RELR`,
-   `DT_RELRSZ`, `DT_RELRENT=8`, and **add the version dependency on
-   `GLIBC_ABI_DT_RELR`** (a `DT_VERNEED` entry against `libc.so.6`), otherwise
-   older glibc loads the binary and mis-relocates it. Enable on
-   `-z pack-relative-relocs` / `--pack-dyn-relocs=relr`; keep off by default.
-2. `-z max-page-size=N` / `-z common-page-size=N`: parametrise the layout's
-   page constant (currently 0x1000); needed for aarch64-style 64 KiB hosts and
-   for `-z separate-code` alignments. i686: keep 4096 and refuse other values
-   (already refused, MB-13).
-3. `--image-base=ADDR`: base of the first PT_LOAD for `ET_EXEC` (and the
-   preferred base recorded for `ET_DYN`). Validate alignment.
-4. Small ones: `--print-memory-usage`, `--trace/-t`, `--oformat=binary` (or
-   Refused), `-N/-n/--omagic/--nmagic` (Refused unless implemented),
-   `--fatal-warnings` (MB-02), `-z keep-text-section-prefix`.
+**Remaining plan.**
+1. **RELR audit/coverage.** The encoder and loader-version dependency are in
+   place. Preserve the contract: collect only encodable `R_X86_64_RELATIVE`
+   entries whose place is 8-byte aligned and whose addend is stored at the
+   place; encode sorted offsets as even address entries and odd 63-bit bitmaps;
+   leave unencodable entries in `.rela.dyn`; emit `.relr.dyn`, `DT_RELR`,
+   `DT_RELRSZ`, `DT_RELRENT=8`, and `GLIBC_ABI_DT_RELR`; enable only on
+   `-z pack-relative-relocs` / `--pack-dyn-relocs=relr`, off by default. Add
+   bitmap-boundary/mixed-relocation mutation tests and compare loader behavior
+   and relocation-section size with BFD/mold.
+2. **Page size.** `-z max-page-size=N` is implemented and its 64-KiB
+   `PT_LOAD.p_align` is differentially tested. A separate
+   `-z common-page-size=N` is not implemented as a separate granularity: valid
+   values warn as ignored, malformed/non-power-of-two values are rejected, and
+   `--fatal-warnings` promotes the warning across x86-64 and i386 built-in,
+   shared, and script paths. If the separate RELRO/protection granularity is
+   implemented later, test its boundaries independently from maximum segment
+   alignment; i386 max-page-size/RELR parity remains tracked in MB-13.
+3. `--image-base=ADDR` sets the first `PT_LOAD` base for `ET_EXEC` and `ET_DYN`
+   in the focused test. Validate alignment/error cases and retain the caveat:
+   the available GNU BFD rejects this option for ELF, so do not claim BFD parity
+   unless a reference linker later accepts it.
+4. Small options: `--oformat=binary` is implemented and byte-compared with
+   `objcopy`; `--fatal-warnings` promotes both parser- and backend-generated
+   warnings independently of argument order. Still classify/implement or refuse
+   `--print-memory-usage`, `--trace/-t`, `-N/-n/--omagic/--nmagic`, and
+   `-z keep-text-section-prefix`.
 5. Verify (not assume) `--icf=all|safe` correctness: the flag is accepted by
    lccc-ld; bfd 2.42 rejects it, lld/mold implement it. Add a run-and-compare
    test that function pointers to merged functions still compare unequal under

@@ -65,7 +65,8 @@ class Case:
                  expect_dyn_relacount=None, expect_same_address=None,
                  expect_distinct_addresses=None,
                  expect_dyn_has=None, expect_dyn_missing=None,
-                 expect_comment=None, expect_symbol_order=None):
+                 expect_comment=None, expect_symbol_order=None,
+                 expect_load_alignment=None, expect_version_needs=None):
         self.name = name
         self.sources = sources              # dict fname -> contents (.c or .s)
         self.link_inputs = link_inputs      # ordered link inputs; default: all objects
@@ -144,6 +145,12 @@ class Case:
         # the dedicated params above.
         self.expect_dyn_has = expect_dyn_has
         self.expect_dyn_missing = expect_dyn_missing
+        # Every PT_LOAD must use this p_align value; pins `-z max-page-size`
+        # effects in the emitted program headers, not merely option acceptance.
+        self.expect_load_alignment = expect_load_alignment
+        # Version-need names that must be present in `readelf -V` output.
+        # This covers ABI contracts such as GLIBC_ABI_DT_RELR.
+        self.expect_version_needs = expect_version_needs
         # Ordered .comment subsequence: every listed string must occur
         # EXACTLY ONCE in the merged .comment section, in the listed
         # relative order.  Extra entries (the toolchain's own ident from
@@ -1299,6 +1306,33 @@ case("dyn_init_fini_nopie",
     expect_dyn_init_fini=True,
     expect_dyn_relacount=False,
     tags=("dynamic",))
+
+case("pack_relative_relocs_glibc_contract",
+    # DT_RELR is only safe when the dynamic loader is told it is required.
+    # Check the three dynamic tags and the GLIBC_ABI_DT_RELR version need, not
+    # just that the linker accepted -z pack-relative-relocs.
+    {"a.c": "int global = 42; int *pointer = &global; "
+            "int main(void) { return *pointer != 42; }"},
+    ldflags=["-pie", "-Wl,-z,pack-relative-relocs"],
+    expect_elf_type="DYN",
+    expect_dyn_has=["RELR", "RELRSZ", "RELRENT"],
+    expect_version_needs=["GLIBC_ABI_DT_RELR"],
+    tags=("dynamic", "relocations", "options"))
+
+case("pack_dyn_relocs_relr_alias",
+    {"a.c": "int global = 42; int *pointer = &global; "
+            "int main(void) { return *pointer != 42; }"},
+    ldflags=["-pie", "-Wl,--pack-dyn-relocs=relr"],
+    expect_elf_type="DYN",
+    expect_dyn_has=["RELR", "RELRSZ", "RELRENT"],
+    expect_version_needs=["GLIBC_ABI_DT_RELR"],
+    tags=("dynamic", "relocations", "options"))
+
+case("max_page_size_64k",
+    {"a.c": "int main(void) { return 0; }"},
+    ldflags=["-Wl,-z,max-page-size=0x10000"],
+    expect_load_alignment=0x10000,
+    tags=("layout", "options"))
 
 case("rpath_default_is_runpath",
     # A plain -rpath must land in DT_RUNPATH, not DT_RPATH: bfd (as every
@@ -7326,6 +7360,9 @@ def _emit_relocs_warns_test(args, oracles):
         r = sh([CC, "-c", "-O1", "a.c"], cwd=td)
         if r.returncode != 0:
             return Result(name, "SKIP", "fixture compile failed")
+        pic = sh([CC, "-fPIC", "-c", "-O1", "a.c", "-o", "a.pic.o"], cwd=td)
+        if pic.returncode != 0:
+            return Result(name, "SKIP", "PIC fixture compile failed")
         shim = _shim_for(td, lccc_ld)
         for spelling in ("--emit-relocs", "-q"):
             out = os.path.join(td, "a.out")
@@ -7345,12 +7382,369 @@ def _emit_relocs_warns_test(args, oracles):
                 return Result(name, "FAIL",
                               "%s: no .rela.text retained and no warning on stderr"
                               % spelling)
+        for order, options in (
+            ("fatal-first", ("--fatal-warnings", "--emit-relocs")),
+            ("fatal-last", ("--emit-relocs", "--fatal-warnings")),
+        ):
+            r = sh(
+                [CC, "-B" + shim, *("-Wl," + option for option in options),
+                 "a.o", "-o", order + ".out"],
+                cwd=td,
+            )
+            err = r.stderr.decode(errors="replace")
+            if r.returncode == 0 or "warning treated as error" not in err:
+                return Result(name, "FAIL",
+                              "%s: --fatal-warnings did not promote --emit-relocs: %s"
+                              % (order, err[:250]))
+            if "--emit-relocs ignored" not in err:
+                return Result(name, "FAIL",
+                              "%s: promoted warning omitted --emit-relocs: %s"
+                              % (order, err[:250]))
+        shared = sh(
+            [lccc_ld, "-shared", "--emit-relocs", "a.pic.o", "-o", "liba.so"],
+            cwd=td,
+        )
+        shared_err = shared.stderr.decode(errors="replace")
+        if shared.returncode or "--emit-relocs ignored" not in shared_err:
+            return Result(name, "FAIL", f"shared link did not diagnose --emit-relocs: {shared_err!r}")
+        for order, options in (
+            ("shared-fatal-first", ("--fatal-warnings", "--emit-relocs")),
+            ("shared-fatal-last", ("--emit-relocs", "--fatal-warnings")),
+        ):
+            fatal = sh(
+                [lccc_ld, "-shared", *options, "a.pic.o", "-o", f"{order}.so"],
+                cwd=td,
+            )
+            fatal_err = fatal.stderr.decode(errors="replace")
+            if fatal.returncode == 0 or "warning treated as error" not in fatal_err:
+                return Result(name, "FAIL", f"{order}: warning not promoted: {fatal_err!r}")
+            if "--emit-relocs ignored" not in fatal_err:
+                return Result(name, "FAIL", f"{order}: promoted error omitted warning: {fatal_err!r}")
         return Result(name, "PASS")
 
 
 
+def _warn_common_fatal_order_test(args, oracles):
+    """An unimplemented linker warning request is never a silent no-op.
+
+    `--warn-common` affects diagnostics rather than the image. Until LCCC
+    implements the GNU common-symbol warning itself, it must report the
+    unsupported request; `--fatal-warnings` must promote that report whether
+    the flag appears before or after `--warn-common`.
+    """
+    name = "warn_common_fatal_order"
+    lccc_ld = os.path.abspath(os.path.join(os.path.dirname(args.lccc), "lccc-ld"))
+    if not os.path.exists(lccc_ld):
+        return Result(name, "SKIP", "no lccc-ld")
+    with tempfile.TemporaryDirectory(prefix="lccc-warn-common-") as td:
+        with open(os.path.join(td, "a.c"), "w", encoding="utf-8") as stream:
+            stream.write("int shared_common; int main(void) { return shared_common; }\n")
+        with open(os.path.join(td, "b.c"), "w", encoding="utf-8") as stream:
+            stream.write("int shared_common;\n")
+        compiled = sh([CC, "-fcommon", "-c", "a.c", "b.c"], cwd=td)
+        if compiled.returncode:
+            return Result(name, "SKIP", "fixture compile failed: " + compiled.stderr.decode(errors="replace")[:200])
+
+        nonfatal = sh(
+            [lccc_ld, "--warn-common", "a.o", "b.o", "-o", "nonfatal.out"],
+            cwd=td,
+        )
+        stderr = nonfatal.stderr.decode(errors="replace")
+        if nonfatal.returncode:
+            return Result(name, "FAIL", "nonfatal link failed: " + stderr[:300])
+        if "--warn-common" not in stderr or "not implemented" not in stderr:
+            return Result(name, "FAIL", "--warn-common was not diagnosed: " + repr(stderr))
+
+        for order, options in (
+            ("fatal-first", ("--fatal-warnings", "--warn-common")),
+            ("fatal-last", ("--warn-common", "--fatal-warnings")),
+        ):
+            fatal = sh(
+                [lccc_ld, *options, "a.o", "b.o", "-o", f"{order}.out"],
+                cwd=td,
+            )
+            fatal_stderr = fatal.stderr.decode(errors="replace")
+            if fatal.returncode == 0 or "warning treated as error" not in fatal_stderr:
+                return Result(
+                    name,
+                    "FAIL",
+                    f"{order}: --fatal-warnings did not promote the request: {fatal_stderr!r}",
+                )
+            if "--warn-common" not in fatal_stderr:
+                return Result(name, "FAIL", f"{order}: error omitted --warn-common: {fatal_stderr!r}")
+
+        # The compiler driver has a separate `-Wl,` forwarding path. Guard it
+        # too: recording the option only in standalone lccc-ld's CLI would
+        # leave ordinary `lccc -Wl,--warn-common` links silently unchanged.
+        lccc = os.path.abspath(args.lccc)
+        driver = sh(
+            [lccc, "-Wl,--warn-common", "a.o", "b.o", "-o", "driver.out"],
+            cwd=td,
+        )
+        driver_stderr = driver.stderr.decode(errors="replace")
+        if driver.returncode or "--warn-common" not in driver_stderr or "not implemented" not in driver_stderr:
+            return Result(name, "FAIL", f"compiler-driver request was not diagnosed: {driver_stderr!r}")
+        for order, options in (
+            ("driver-fatal-first", ("--fatal-warnings", "--warn-common")),
+            ("driver-fatal-last", ("--warn-common", "--fatal-warnings")),
+        ):
+            fatal = sh(
+                [lccc, *("-Wl," + option for option in options),
+                 "a.o", "b.o", "-o", f"{order}.out"],
+                cwd=td,
+            )
+            fatal_stderr = fatal.stderr.decode(errors="replace")
+            if fatal.returncode == 0 or "warning treated as error" not in fatal_stderr:
+                return Result(
+                    name,
+                    "FAIL",
+                    f"{order}: compiler driver did not promote --warn-common: {fatal_stderr!r}",
+                )
+            if "--warn-common" not in fatal_stderr:
+                return Result(name, "FAIL", f"{order}: error omitted --warn-common: {fatal_stderr!r}")
+        return Result(name, "PASS")
+
+
+def _linker_start_object(td):
+    """Build a tiny freestanding x86-64 entry point for raw-linker probes."""
+    source = """\
+        .text
+        .globl _start
+        .type _start,@function
+    _start:
+        mov $60, %rax
+        xor %rdi, %rdi
+        syscall
+        .size _start, .-_start
+        .section .note.GNU-stack,\"\",@progbits
+    """
+    with open(os.path.join(td, "start.s"), "w", encoding="utf-8") as stream:
+        stream.write(textwrap.dedent(source))
+    return sh([CC, "-c", "start.s", "-o", "start.o"], cwd=td)
+
+
+def _common_page_size_warning_test(args, oracles):
+    """The ignored common-page-size warning survives all supported x86 link paths."""
+    name = "common_page_size_warns_and_honors_fatal_warnings"
+    lccc_ld = os.path.abspath(os.path.join(os.path.dirname(args.lccc), "lccc-ld"))
+    if not os.path.exists(lccc_ld):
+        return Result(name, "SKIP", "no lccc-ld")
+    with tempfile.TemporaryDirectory(prefix="lccc-common-page-size-") as td:
+        compiled = _linker_start_object(td)
+        if compiled.returncode:
+            return Result(name, "SKIP", "fixture compile failed: " + compiled.stderr.decode(errors="replace")[:200])
+
+        script = textwrap.dedent("""\
+            ENTRY(_start)
+            SECTIONS {
+              . = 0x400000;
+              .text : { *(.text .text.*) }
+            }
+        """)
+        with open(os.path.join(td, "page.lds"), "w", encoding="utf-8") as stream:
+            stream.write(script)
+
+        source32 = textwrap.dedent("""\
+            .text
+            .globl _start
+            .type _start,@function
+        _start:
+            mov $1, %eax
+            xor %ebx, %ebx
+            int $0x80
+            .size _start, .-_start
+            .section .note.GNU-stack,"",@progbits
+        """)
+        with open(os.path.join(td, "start32.s"), "w", encoding="utf-8") as stream:
+            stream.write(source32)
+        assembled32 = sh([CC, "-m32", "-c", "start32.s", "-o", "start32.o"], cwd=td)
+        if assembled32.returncode:
+            return Result(
+                name,
+                "SKIP",
+                "i386 assembly fixture failed: " + assembled32.stderr.decode(errors="replace")[:200],
+            )
+
+        option = "common-page-size=0x1000"
+        warning = f"-z {option} ignored"
+
+        def exercise_path(label, prefix, obj, has_entry):
+            entry = ["-e", "_start"] if has_entry else []
+            nonfatal = sh(
+                [lccc_ld, *prefix, "-z", option, *entry, obj, "-o", f"{label}.out"],
+                cwd=td,
+            )
+            stderr = nonfatal.stderr.decode(errors="replace")
+            if nonfatal.returncode or warning not in stderr:
+                return f"{label}: nonfatal request was not diagnosed: {stderr!r}"
+
+            bare = sh(
+                [lccc_ld, *prefix, "-z", "common-page-size", *entry, obj,
+                 "-o", f"{label}.bare.out"],
+                cwd=td,
+            )
+            bare_stderr = bare.stderr.decode(errors="replace")
+            if bare.returncode or "-z common-page-size ignored" not in bare_stderr:
+                return f"{label}: bare keyword was not diagnosed: {bare_stderr!r}"
+
+            invalid = sh(
+                [lccc_ld, *prefix, "-z", "common-page-size=0x1800", *entry, obj,
+                 "-o", f"{label}.invalid.out"],
+                cwd=td,
+            )
+            invalid_stderr = invalid.stderr.decode(errors="replace")
+            if invalid.returncode == 0 or "invalid common page size" not in invalid_stderr:
+                return f"{label}: invalid value was not rejected: {invalid_stderr!r}"
+
+            for order, options in (
+                ("fatal-first", ("--fatal-warnings", "-z", option)),
+                ("fatal-last", ("-z", option, "--fatal-warnings")),
+            ):
+                fatal = sh(
+                    [lccc_ld, *prefix, *options, *entry, obj, "-o", f"{label}.{order}.out"],
+                    cwd=td,
+                )
+                fatal_stderr = fatal.stderr.decode(errors="replace")
+                if fatal.returncode == 0 or "warning treated as error" not in fatal_stderr:
+                    return f"{label}/{order}: request not promoted: {fatal_stderr!r}"
+                if warning not in fatal_stderr:
+                    return f"{label}/{order}: error omitted request: {fatal_stderr!r}"
+            return None
+
+        modes = (
+            ("regular-x86-64", [], "start.o", True),
+            ("shared-x86-64", ["-shared"], "start.o", False),
+            ("script-x86-64", ["-T", "page.lds"], "start.o", False),
+            ("regular-i386", ["-m", "elf_i386"], "start32.o", True),
+            ("shared-i386", ["-m", "elf_i386", "-shared"], "start32.o", False),
+            ("script-i386", ["-m", "elf_i386", "-T", "page.lds"], "start32.o", False),
+        )
+        for label, prefix, obj, has_entry in modes:
+            failure = exercise_path(label, prefix, obj, has_entry)
+            if failure:
+                return Result(name, "FAIL", failure)
+
+        # The compiler driver's -Wl path feeds the regular x86-64 backend
+        # directly; make sure it validates and warns instead of bypassing the
+        # lccc-ld command-line checks above.
+        with open(os.path.join(td, "driver.c"), "w", encoding="utf-8") as stream:
+            stream.write("int main(void) { return 0; }\n")
+        driver_compile = sh([CC, "-c", "driver.c", "-o", "driver.o"], cwd=td)
+        if driver_compile.returncode:
+            return Result(name, "SKIP", "driver fixture compile failed: " + driver_compile.stderr.decode(errors="replace")[:200])
+        lccc = os.path.abspath(args.lccc)
+        driver_option = "-Wl,-z,common-page-size=0x1000"
+        driver_warning = "-z common-page-size=0x1000 ignored"
+        driver = sh([lccc, driver_option, "driver.o", "-o", "driver.out"], cwd=td)
+        driver_stderr = driver.stderr.decode(errors="replace")
+        if driver.returncode or driver_warning not in driver_stderr:
+            return Result(name, "FAIL", f"compiler-driver request was not diagnosed: {driver_stderr!r}")
+        invalid_driver = sh(
+            [lccc, "-Wl,-z,common-page-size=3", "driver.o", "-o", "driver-invalid.out"],
+            cwd=td,
+        )
+        invalid_stderr = invalid_driver.stderr.decode(errors="replace")
+        if invalid_driver.returncode == 0 or "invalid common page size" not in invalid_stderr:
+            return Result(name, "FAIL", f"compiler-driver accepted invalid value: {invalid_stderr!r}")
+        for order, options in (
+            ("driver-fatal-first", ("-Wl,--fatal-warnings", driver_option)),
+            ("driver-fatal-last", (driver_option, "-Wl,--fatal-warnings")),
+        ):
+            fatal = sh(
+                [lccc, *options, "driver.o", "-o", f"driver-{order}.out"],
+                cwd=td,
+            )
+            fatal_stderr = fatal.stderr.decode(errors="replace")
+            if fatal.returncode == 0 or "warning treated as error" not in fatal_stderr:
+                return Result(name, "FAIL", f"{order}: compiler driver did not promote warning: {fatal_stderr!r}")
+            if driver_warning not in fatal_stderr:
+                return Result(name, "FAIL", f"{order}: promoted error omitted common-page-size: {fatal_stderr!r}")
+        return Result(name, "PASS")
+
+
+def _image_base_layout_test(args, oracles):
+    """Pin LCCC's ELF image-base effect without claiming BFD parity.
+
+    GNU BFD 2.40 rejects --image-base for ELF, so this is intentionally an
+    LCCC-specific layout contract until a reference linker accepts the option.
+    """
+    name = "image_base_sets_first_load"
+    lccc_ld = os.path.abspath(os.path.join(os.path.dirname(args.lccc), "lccc-ld"))
+    if not os.path.exists(lccc_ld):
+        return Result(name, "SKIP", "no lccc-ld")
+    with tempfile.TemporaryDirectory(prefix="lccc-image-base-") as td:
+        compiled = _linker_start_object(td)
+        if compiled.returncode:
+            return Result(name, "SKIP", "fixture compile failed: " + compiled.stderr.decode(errors="replace")[:200])
+        linked = sh(
+            [lccc_ld, "--image-base=0x10000000", "-e", "_start", "start.o", "-o", "base.out"],
+            cwd=td,
+        )
+        if linked.returncode:
+            return Result(name, "FAIL", "link failed: " + linked.stderr.decode(errors="replace")[:300])
+        with open(os.path.join(td, "base.out"), "rb") as image:
+            phdrs = _elf_bytes_phdrs(image.read())
+        if phdrs is None:
+            return Result(name, "FAIL", "cannot parse ELF program headers")
+        loads = [p for p in phdrs if p[0] == _PT_LOAD]
+        if not loads or loads[0][3] != 0x10000000:
+            got = [hex(p[3]) for p in loads]
+            return Result(name, "FAIL", f"ET_EXEC first PT_LOAD is {got[:1]}, expected 0x10000000")
+
+        shared = sh(
+            [lccc_ld, "-shared", "--image-base=0x10000000", "start.o", "-o", "base.so"],
+            cwd=td,
+        )
+        if shared.returncode:
+            return Result(name, "FAIL", "shared link failed: " + shared.stderr.decode(errors="replace")[:300])
+        if elf_e_type(os.path.join(td, "base.so")) != "DYN":
+            return Result(name, "FAIL", "shared image is not ET_DYN")
+        with open(os.path.join(td, "base.so"), "rb") as image:
+            shared_phdrs = _elf_bytes_phdrs(image.read())
+        shared_loads = [p for p in (shared_phdrs or []) if p[0] == _PT_LOAD]
+        if not shared_loads or shared_loads[0][3] != 0x10000000:
+            got = [hex(p[3]) for p in shared_loads]
+            return Result(name, "FAIL", f"ET_DYN first PT_LOAD is {got[:1]}, expected 0x10000000")
+        return Result(name, "PASS")
+
+
+def _binary_output_matches_objcopy_test(args, oracles):
+    """`--oformat=binary` must equal objcopy's flat image of the ELF link."""
+    name = "binary_output_matches_objcopy"
+    lccc_ld = os.path.abspath(os.path.join(os.path.dirname(args.lccc), "lccc-ld"))
+    if not os.path.exists(lccc_ld):
+        return Result(name, "SKIP", "no lccc-ld")
+    if not shutil.which("objcopy"):
+        return Result(name, "SKIP", "no objcopy")
+    with tempfile.TemporaryDirectory(prefix="lccc-binary-output-") as td:
+        compiled = _linker_start_object(td)
+        if compiled.returncode:
+            return Result(name, "SKIP", "fixture compile failed: " + compiled.stderr.decode(errors="replace")[:200])
+        elf = sh([lccc_ld, "-e", "_start", "start.o", "-o", "image.elf"], cwd=td)
+        if elf.returncode:
+            return Result(name, "FAIL", "ELF link failed: " + elf.stderr.decode(errors="replace")[:300])
+        raw = sh(
+            [lccc_ld, "--oformat=binary", "-e", "_start", "start.o", "-o", "image.bin"],
+            cwd=td,
+        )
+        if raw.returncode:
+            return Result(name, "FAIL", "binary link failed: " + raw.stderr.decode(errors="replace")[:300])
+        ref = sh(["objcopy", "-O", "binary", "image.elf", "objcopy.bin"], cwd=td)
+        if ref.returncode:
+            return Result(name, "SKIP", "objcopy reference failed: " + ref.stderr.decode(errors="replace")[:200])
+        with open(os.path.join(td, "image.bin"), "rb") as image:
+            got = image.read()
+        with open(os.path.join(td, "objcopy.bin"), "rb") as image:
+            expected = image.read()
+        if got.startswith(b"\x7fELF"):
+            return Result(name, "FAIL", "--oformat=binary produced an ELF header")
+        if got != expected:
+            return Result(name, "FAIL", f"binary differs from objcopy ({len(got)} vs {len(expected)} bytes)")
+        return Result(name, "PASS")
+
+
 def _gc_eh_frame_invariant_test(args, oracles):
-    """`.eh_frame` must survive --gc-sections with exactly the live FDE set.
+    """`.eh_frame` must survive --gc-sections with exactly the live FDE set."
 
     The runtime `gc_sections_keeps_eh_frame` case proves unwinding works; this
     checks the *structure*, because the two failure modes are different: a
@@ -11274,6 +11668,12 @@ def _registry(args, oracles):
         one("crossarch_gnu_hash_relro", _crossarch_gnu_hash_relro_test, "dynamic"),
         one("static_pie_refused", _static_pie_refusal_test, "driver"),
         one("emit_relocs_warns_when_unimplemented", _emit_relocs_warns_test, "kernel"),
+        one("warn_common_fatal_order", _warn_common_fatal_order_test, "diagnostics"),
+        one("common_page_size_warns_and_honors_fatal_warnings",
+            _common_page_size_warning_test, "options", "layout", "diagnostics"),
+        one("image_base_sets_first_load", _image_base_layout_test, "options", "layout"),
+        one("binary_output_matches_objcopy", _binary_output_matches_objcopy_test,
+            "options", "layout"),
         one("dyn_init_fini_shared", _dyn_init_fini_shared_test, "dynamic"),
         one("script_hidden_not_exported", _script_hidden_visibility_test, "script"),
         one("script_pic_gotpcrel_relaxation", _script_pic_gotpcrel_test, "script"),
@@ -11591,12 +11991,18 @@ def dyn_hash_tags(path):
 _DT_INIT = 12
 _DT_FINI = 13
 _DT_RELACOUNT = 0x6FFFFFF9
+_DT_RELRSZ = 35
+_DT_RELR = 36
+_DT_RELRENT = 37
 _DT_RPATH = 15
 _DT_RUNPATH = 29
 _DT_NUMBERS = {
     "INIT": _DT_INIT,
     "FINI": _DT_FINI,
     "RELACOUNT": _DT_RELACOUNT,
+    "RELRSZ": _DT_RELRSZ,
+    "RELR": _DT_RELR,
+    "RELRENT": _DT_RELRENT,
     "RPATH": _DT_RPATH,
     "RUNPATH": _DT_RUNPATH,
 }
@@ -11985,6 +12391,30 @@ def run_case(c, args, oracles):
                 if _DT_NUMBERS[name] in tags:
                     return Result(c.name, "FAIL",
                         f"DT_{name} must not be in .dynamic")
+        if c.expect_load_alignment is not None:
+            with open(lccc_out, "rb") as image:
+                phdrs = _elf_bytes_phdrs(image.read())
+            if phdrs is None:
+                return Result(c.name, "FAIL", "cannot parse ELF program headers")
+            loads = [p for p in phdrs if p[0] == _PT_LOAD]
+            if not loads:
+                return Result(c.name, "FAIL", "no PT_LOAD segments")
+            wrong = [p[6] for p in loads if p[6] != c.expect_load_alignment]
+            if wrong:
+                return Result(
+                    c.name,
+                    "FAIL",
+                    f"PT_LOAD p_align values are {[hex(p[6]) for p in loads]}, "
+                    f"expected all {c.expect_load_alignment:#x}",
+                )
+        if c.expect_version_needs:
+            version = sh(["readelf", "-VW", lccc_out], cwd=td)
+            if version.returncode:
+                return Result(c.name, "FAIL", "readelf -V failed: " + version.stderr.decode(errors="replace")[:200])
+            ver_text = version.stdout.decode(errors="replace")
+            missing = [name for name in c.expect_version_needs if name not in ver_text]
+            if missing:
+                return Result(c.name, "FAIL", f"missing version needs {missing}")
         if c.expect_comment is not None:
             got = comment_strings(lccc_out)
             if got is None:
