@@ -6849,19 +6849,19 @@ impl SemanticAnalyzer {
                 _ => break,
             }
         }
-        let k = derefs; // this call asks about `*^k root`'s successor
-        let depth = match tc.infer_expr_ctype(root) {
-            Some(CType::Pointer(mut inner, _)) => {
-                let mut d = 1u32;
-                while let CType::Pointer(next, _) = *inner {
-                    d += 1;
-                    inner = next;
+        let mut k = derefs; // this call asks about `*^k root`'s successor
+        let mut depth = pointer_depth_of(tc.infer_expr_ctype(root).as_ref());
+        if depth == 0 {
+            // An array-typed root (`const int *a[2]; *a[0] = 1`): the chain's
+            // subscript already consumed the array layer, so the ELEMENT type
+            // supplies the pointer depth and one dereference is accounted for.
+            if let Some(CType::Array(element, _)) = tc.infer_expr_ctype(root) {
+                if k >= 1 {
+                    depth = pointer_depth_of(Some(&element));
+                    k -= 1;
                 }
-                d
             }
-            Some(CType::Array(..)) => 0,
-            _ => return false, // unknown type: stay silent
-        };
+        }
         // A symbol that recorded its per-level qualifiers decides exactly:
         // the k-th dereference of `root` designates pointer level `k + 1`, and
         // only the level beyond every star (`k + 1 == depth`) designates the
@@ -6885,7 +6885,9 @@ impl SemanticAnalyzer {
                 // `root` has a `depth`-level pointer type, so `*root` names the
                 // object of level `depth - 1` and every further dereference
                 // drops one level; level 0 is the base object.
-                let target = depth as usize - (k + 1);
+                let Some(target) = (depth as usize).checked_sub(k + 1) else {
+                    return false;
+                };
                 if target == 0 {
                     return self.readonly_base_qualifier(root);
                 }
@@ -8955,6 +8957,9 @@ mod kr_prototype_tests {
             "typedef int *const cp;void f(void){cp x=0;x=0;}",
             "typedef int *const cp;void f(cp p){p=0;}",
             "typedef int *const cp;typedef cp *cpp;void f(cpp p){*p=0;}",
+            "void f(void){const int *a[2]={0};*a[0]=1;}",
+            "void f(void){int *const a[2]={0};a[0]=0;}",
+            "void f(void){int (*const fp)(void)=0;fp=0;}",
         ] {
             assert!(analyze(bad).1.is_err(), "{bad}");
         }
@@ -8971,6 +8976,9 @@ mod kr_prototype_tests {
             "typedef int *const cp;void f(cp p){*p=0;}",
             "typedef int *const cp;void f(cp *p){**p=0;}",
             "struct S{int *const *p;};void f(struct S*s){**s->p=1;}",
+            "void f(void){int *a[2]={0};*a[0]=1;}",
+            "void f(void){int *a[2]={0};a[0]=0;}",
+            "void f(void){int (*fp)(void)=0;fp=0;}",
         ] {
             assert!(analyze(good).1.is_ok(), "{good}");
         }
@@ -9100,6 +9108,21 @@ mod kr_prototype_tests {
 /// Whether `init_decl` declares a const-qualified object (C11 6.7.3p5): the
 /// base type is const when the declarator has no pointer, and the outermost
 /// pointer is const when it has one (`const int *p` is not a const object).
+/// Number of consecutive pointer levels in `ty` (0 for anything that is not a
+/// pointer, including arrays and functions).
+fn pointer_depth_of(ty: Option<&CType>) -> usize {
+    let mut inner = match ty {
+        Some(CType::Pointer(inner, _)) => &**inner,
+        _ => return 0,
+    };
+    let mut depth = 1usize;
+    while let CType::Pointer(next, _) = inner {
+        depth += 1;
+        inner = next;
+    }
+    depth
+}
+
 fn declares_const_object(decl: &Declaration, init_decl: &InitDeclarator) -> bool {
     let has_pointer = init_decl
         .derived

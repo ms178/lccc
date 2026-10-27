@@ -77,6 +77,12 @@ CASES = [
     ('mutable_typedef_field_pointee', 'typedef int *const cp;struct S{cp *f;};void g(struct S*s){**s->f=0;}', False, None),
     ('const_typedef_chain', 'typedef int *const cp;typedef cp *cpp;void f(cpp p){*p=0;}', True, None),
     ('const_middle_prefix_offset', 'void f(int *const *p){*(1+p)=0;}', True, None),
+    # The array layer is transparent: the element type decides the level.
+    ('const_array_element_pointee', 'void f(void){const int *a[2]={0};*a[0]=1;}', True, None),
+    ('mutable_array_element_pointee', 'void f(void){int *a[2]={0};*a[0]=1;}', False, None),
+    ('const_array_of_const_pointers', 'void f(void){int *const a[2]={0};a[0]=0;}', True, None),
+    ('const_function_pointer_object', 'void f(void){int (*const fp)(void)=0;fp=0;}', True, None),
+    ('mutable_function_pointer_object', 'void f(void){int (*fp)(void)=0;fp=0;}', False, None),
 ]
 
 
