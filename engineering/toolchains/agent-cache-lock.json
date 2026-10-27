@@ -1,0 +1,119 @@
+{
+  "cache_json_sha256": "e19a693232ec3c02dbb7900a003c577273eb1a3ffbd160bf4f36a8920744d2eb",
+  "commit_sha": "579003a922138f3c79fe690de55c6e0d5fdee129",
+  "part_size": 94371840,
+  "priority": [
+    "rust",
+    "clang",
+    "gcc",
+    "binutils",
+    "mold",
+    "qemu",
+    "kernel-relocs",
+    "arm-a64-xml",
+    "debs-bookworm",
+    "binutils-source",
+    "rust-msrv"
+  ],
+  "provenance": {
+    "clang_rust": "harness-cache-4 release assets",
+    "debian_sid_packages": "debian-debs.sha256",
+    "kernel": "v7.3 torvalds tree",
+    "mold": "rui314/mold v3.0.0 release"
+  },
+  "repository": "ms178/lccc",
+  "schema": 1,
+  "tag": "harness-cache-5",
+  "tag_sha": "a88c52e60e2af8bbacb6a111616f5c7aa44b821f",
+  "tools": {
+    "arm-a64-xml": {
+      "file": "ISA_A64_xml_A_profile-2026-09_md.tar.gz",
+      "kind": "tar.gz",
+      "root": "ISA_A64_xml_A_profile-2026-06_mc",
+      "sha256": "62917cba0da668deb6c28005231f4b94d1044cd52dbe4a4729fcc26d1642d827",
+      "size": 41597577,
+      "version": "2026-09"
+    },
+    "binutils": {
+      "file": "binutils-2.47-debian-sid-x86_64.tar.xz",
+      "kind": "tar.xz",
+      "root": "binutils-2.47-debian-sid-x86_64",
+      "sha256": "07a4a3a382c700077f0e83177b2a54f6d3d373143cb8886a5456795b9dc42e9a",
+      "size": 2140820,
+      "version": "2.47.50.20261021-1"
+    },
+    "binutils-source": {
+      "file": "binutils-2.47-source.tar.xz",
+      "kind": "tar.xz",
+      "root": "binutils-2.47",
+      "sha256": "154ab23b60070e8f27013c22977f1129425d67d1e8acd6e13010e617811e4cff",
+      "size": 29034716,
+      "version": "2.47"
+    },
+    "clang": {
+      "file": "clang-23.1.4-linux-x64.tar.xz",
+      "kind": "tar.xz",
+      "root": "clang-23.1.4",
+      "sha256": "373e20c398712e21bbfdbb401176f5057b0adc6ae28816cd11da049fc111ecf0",
+      "size": 67322400,
+      "version": "23.1.4"
+    },
+    "debs-bookworm": {
+      "file": "debs-bookworm.tar.xz",
+      "kind": "tar.xz",
+      "root": "debs",
+      "sha256": "24a4be08d5c6a28aed78f424ebdc9596f85cc2e8ebd0ba230f99a2bf9cdfb20d",
+      "size": 32787168,
+      "version": "bookworm"
+    },
+    "gcc": {
+      "file": "gcc-16.2.0-bookworm-x86_64.tar.xz",
+      "kind": "tar.xz",
+      "root": "gcc-16",
+      "sha256": "4fa6af4f6b29991e31631af18d83964a69caa9daf3f78546d4dc30f39880cd8a",
+      "size": 65152756,
+      "version": "16.2.0"
+    },
+    "kernel-relocs": {
+      "file": "kernel-relocs-v7.3-x86_64.tar.xz",
+      "kind": "tar.xz",
+      "root": "kernel-relocs-v7.3-x86_64",
+      "sha256": "22d53750bab31d6941915a4681e653b0cce9b46b1618e3d01f1358fdaee11f30",
+      "size": 17704,
+      "version": "7.3"
+    },
+    "mold": {
+      "file": "mold-3.0.0-x86_64-linux.tar.gz",
+      "kind": "tar.gz",
+      "root": "mold-3.0.0-x86_64-linux",
+      "sha256": "6c90d4a474c7c0409dfb575be03a5345878ac14fdba18de8b40fa58c60121189",
+      "size": 14067330,
+      "version": "3.0.0"
+    },
+    "qemu": {
+      "file": "qemu-user-11.1.2-x86_64.tar.xz",
+      "kind": "tar.xz",
+      "root": "qemu-user-11.1.2-x86_64",
+      "sha256": "5b33a5799be092ecfb562c7fb25a24d60181c6506f691929f837f7c6644100f3",
+      "size": 9445920,
+      "version": "11.1.2"
+    },
+    "rust": {
+      "file": "rust-1.99.1-x86_64-unknown-linux-gnu.tar.xz",
+      "kind": "tar.xz",
+      "root": "1.99.1-x86_64-unknown-linux-gnu",
+      "sha256": "2876570cf5dd56b3d101aa3321126d2bcb30a3e8c3b692b4c4d45f10cd95d190",
+      "size": 151257000,
+      "version": "1.99.1"
+    },
+    "rust-msrv": {
+      "file": "rust-1.97.0-msrv.tar.xz",
+      "kind": "tar.xz",
+      "root": "rust-1.97.0-msrv",
+      "sha256": "4817d9deb5a7182b149476d70368476be831c0ebe56acec6f57435c88331bb1b",
+      "size": 129382312,
+      "version": "1.97.0"
+    }
+  },
+  "tree_sha": "a190926d6ede128b92d4c247cd1ed7c4a22bc7b7"
+}

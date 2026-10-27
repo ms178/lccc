@@ -6,7 +6,7 @@
 # job); all bytes are verified before they enter the tag.
 set -Eeuo pipefail
 
-TAG=${TAG:-harness-cache-5}
+TAG=${TAG:-harness-cache-6}
 REMOTE=${REMOTE:-origin}
 WORK=${WORK:-${RUNNER_TEMP:-/tmp}/agent-toolchain-cache}
 REPO=${GITHUB_REPOSITORY:-ms178/lccc}
@@ -101,7 +101,8 @@ from pathlib import Path
 text=Path(sys.argv[1]).read_text(errors='ignore').split('\n\n')
 want={'binutils-x86-64-linux-gnu':'2.47.50.20261021-1','binutils-common':'2.47.50.20261021-1',
       'libbinutils':'2.47.50.20261021-1','libctf-nobfd0':None,'libctf0':None,
-      'libjansson4':None,'libsframe3':None,'libzstd1':None,'zlib1g':None}
+      'libjansson4':None,'libsframe3':None,'libzstd1':None,'zlib1g':None,
+      'libc6':None,'libgcc-s1':None}
 best={}
 for stanza in text:
     d={}
@@ -130,10 +131,17 @@ while IFS=$'\t' read -r pkg ver filename sha; do
 done < "$SRC/deb-list.tsv"
 
 BINUTILS_ROOT=binutils-2.47-debian-sid-x86_64
-rm -rf "$STAGE/$BINUTILS_ROOT"; mkdir -p "$STAGE/$BINUTILS_ROOT"/{bin,usr/bin,usr/lib,usr/lib/x86_64-linux-gnu}
+rm -rf "$STAGE/$BINUTILS_ROOT"; mkdir -p "$STAGE/$BINUTILS_ROOT"/{bin,lib,lib/x86_64-linux-gnu,usr/bin,usr/lib,usr/lib/x86_64-linux-gnu}
 cp -a "$EXTRACT/binutils/usr/bin/." "$STAGE/$BINUTILS_ROOT/usr/bin/"
 cp -a "$EXTRACT/binutils/usr/lib/x86_64-linux-gnu/." "$STAGE/$BINUTILS_ROOT/usr/lib/x86_64-linux-gnu/" 2>/dev/null || true
 cp -a "$EXTRACT/binutils/usr/lib/." "$STAGE/$BINUTILS_ROOT/usr/lib/" 2>/dev/null || true
+# Sid binaries need GLIBC 2.38; bundle the matching loader and libc so the
+# archive also works on older bookworm-era hosts.
+cp -a "$EXTRACT/binutils/lib/x86_64-linux-gnu/." "$STAGE/$BINUTILS_ROOT/lib/x86_64-linux-gnu/" 2>/dev/null || true
+LOADER=$(find "$STAGE/$BINUTILS_ROOT" -name 'ld-linux-x86-64.so.2' -print -quit)
+[ -n "$LOADER" ] || die "bundled glibc loader missing"
+cp -a "$LOADER" "$STAGE/$BINUTILS_ROOT/lib/ld-linux-x86-64.so.2"
+chmod 755 "$STAGE/$BINUTILS_ROOT/lib/ld-linux-x86-64.so.2"
 make_wrapper() {
     local name=$1 target=$2 extra=${3:-} dest="$STAGE/$BINUTILS_ROOT/bin/$1"
     rm -f "$dest"
@@ -143,7 +151,9 @@ here=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 export LD_LIBRARY_PATH="$here/usr/lib/x86_64-linux-gnu:$here/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export LIBRARY_PATH="$here/usr/lib/x86_64-linux-gnu${LIBRARY_PATH:+:$LIBRARY_PATH}"
 export COMPILER_PATH="$here/usr/bin${COMPILER_PATH:+:$COMPILER_PATH}"
-exec "$here/usr/bin/__TARGET__" __EXTRA__ "$@"
+exec "$here/lib/ld-linux-x86-64.so.2" \
+    --library-path "$here/lib/x86_64-linux-gnu:$here/usr/lib/x86_64-linux-gnu:$here/usr/lib" \
+    "$here/usr/bin/__TARGET__" __EXTRA__ "$@"
 WRAP
     sed -i "s|__TARGET__|$target|; s|__EXTRA__|$extra|" "$dest"
     chmod 755 "$dest"

@@ -22,7 +22,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_LOCK = ROOT / 'engineering/toolchains/agent-cache-lock.json'
-DEFAULT_TAG = 'harness-cache-5'
+DEFAULT_TAG = 'harness-cache-6'
 
 
 def run(cmd: list[str], *, cwd: Path | None = None, check: bool = True) -> subprocess.CompletedProcess:
