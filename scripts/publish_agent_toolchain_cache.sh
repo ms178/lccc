@@ -187,7 +187,7 @@ for f in "${!KPINS[@]}"; do
     fetch "$STAGE/$KREL_ROOT/src/$f" "$url"
     verify "$STAGE/$KREL_ROOT/src/$f" "${KPINS[$f]}"
 done
-( cd "$STAGE/$KREL_ROOT/src" && cc -O2 -I. -o ../../bin/relocs relocs_common.c relocs_32.c relocs_64.c )
+( cd "$STAGE/$KREL_ROOT/src" && cc -O2 -I. -o ../bin/relocs relocs_common.c relocs_32.c relocs_64.c )
 printf 'v7.3 sha256:digested-by-tag-manifest\n' > "$STAGE/$KREL_ROOT/STAMP"
 tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -I 'xz -T2 -6' \
     -cf "$FILES/kernel-relocs-v7.3-x86_64.tar.xz" -C "$STAGE" "$KREL_ROOT"
