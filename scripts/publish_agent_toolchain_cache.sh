@@ -180,7 +180,7 @@ tar -xf "$FILES/gcc-16.2.0-bookworm-x86_64.tar.xz" -C "$EXTRACT/tools"
 tar -xf "$FILES/clang-23.1.4-linux-x64.tar.xz" -C "$EXTRACT/tools"
 tar -xf "$FILES/rust-1.99.1-x86_64-unknown-linux-gnu.tar.xz" -C "$EXTRACT/tools"
 tar -xf "$FILES/mold-3.0.0-x86_64-linux.tar.gz" -C "$EXTRACT/tools"
-tar -xf "$FILES/binutils-2.47-debian-sid-x86_64.tar.xz" -C "$EXTRACT/tools"
+tar -xf "$FILES/binutils-2.47-x86_64-linux.tar.xz" -C "$EXTRACT/tools"
 GCC_BIN=$(find "$EXTRACT/tools" -type f -name gcc-16 -perm -111 | head -1)
 CLANG_BIN=$(find "$EXTRACT/tools" -type f \( -name 'clang-23*' -o -name 'clang' \) -perm -111 | head -1)
 RUSTC_BIN=$(find "$EXTRACT/tools" -type f -name rustc -perm -111 | head -1)
