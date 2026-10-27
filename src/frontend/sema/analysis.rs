@@ -6057,6 +6057,26 @@ impl SemanticAnalyzer {
                     // Delegate to shared build_full_ctype for correct inside-out type construction
                     type_builder::build_full_ctype(self, &f.type_spec, &f.derived)
                 };
+                // A by-value record (including an array element) must be
+                // complete at this point. Pointers to incomplete records are
+                // legal and deliberately stop this walk. Do not install a
+                // self-referential layout after reporting the constraint.
+                let mut object = &ty;
+                while let CType::Array(inner, _) = object {
+                    object = inner;
+                }
+                if let CType::Struct(key) | CType::Union(key) = object {
+                    if !self.defined_structs.borrow().contains(key.as_ref()) {
+                        self.diagnostics.borrow_mut().error(
+                            format!(
+                                "field '{}' has incomplete type",
+                                f.name.as_deref().unwrap_or("<anonymous>")
+                            ),
+                            f.span,
+                        );
+                        return None;
+                    }
+                }
                 let name = f.name.clone().unwrap_or_default();
                 let bit_width = f
                     .bit_width

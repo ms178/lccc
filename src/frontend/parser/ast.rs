@@ -1371,6 +1371,7 @@ pub enum TypeSpecifier {
 /// A field declaration in a struct/union.
 #[derive(Debug, Clone)]
 pub struct StructFieldDecl {
+    pub span: Span,
     pub type_spec: TypeSpecifier,
     pub name: Option<String>,
     pub bit_width: Option<Box<Expr>>,

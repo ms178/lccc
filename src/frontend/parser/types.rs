@@ -1217,10 +1217,25 @@ impl Parser {
             }
             if let Some(type_spec) = self.parse_type_specifier() {
                 if matches!(self.peek(), TokenKind::Semicolon) {
+                    // A tag reference without a declarator is not an anonymous
+                    // member (C11 6.7.2.1p13). Treating `struct S;` inside S
+                    // as a member constructs a cyclic layout and makes member
+                    // lookup recurse forever. The tag reference has no body
+                    // to register; retain the warning, not a synthetic field.
+                    if matches!(
+                        &type_spec,
+                        TypeSpecifier::Struct(Some(_), None, ..)
+                            | TypeSpecifier::Union(Some(_), None, ..)
+                    ) {
+                        self.diagnostics
+                            .warning("declaration does not declare anything", self.peek_span());
+                        continue;
+                    }
                     // Anonymous field (e.g., anonymous struct/union)
                     let alignment = self.attrs.parsed_alignas.take();
                     let alignas_type = self.attrs.parsed_alignas_type.take();
                     fields.push(StructFieldDecl {
+                        span: self.peek_span(),
                         type_spec,
                         name: None,
                         bit_width: None,
@@ -1363,6 +1378,7 @@ impl Parser {
                     colon_span,
                 );
                 fields.push(StructFieldDecl {
+                    span: colon_span,
                     type_spec: type_spec.clone(),
                     name: None,
                     bit_width,
@@ -1454,6 +1470,7 @@ impl Parser {
             }
 
             fields.push(StructFieldDecl {
+                span: declarator_span,
                 type_spec: field_type,
                 name,
                 bit_width,

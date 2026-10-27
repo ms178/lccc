@@ -13,6 +13,10 @@ import tempfile
 
 # name, source, hard read-only error, warning class (None for legal controls).
 CASES = [
+    ('recursive_named_field', 'struct S{struct S a;};void f(struct S*p){(void)p;}', True, None),
+    ('incomplete_array_field', 'struct S;struct T{struct S a[2];};', True, None),
+    ('legal_recursive_pointer', 'struct S{struct S *p;};void f(struct S*p){p->p=p;}', False, None),
+    ('recursive_tag_is_not_member', 'struct S{struct S;};void f(struct S*p){p->z=1;}', True, None),
     ('mutable_outer_parameter', 'void f(int *const *p){p=0;}', False, None),
     ('const_outer_parameter', 'void f(int **const p){p=0;}', True, None),
     ('const_member', 'struct S{const int x;};void f(struct S*p){p->x=1;}', True, None),
