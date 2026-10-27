@@ -138,9 +138,9 @@ cp -a "$EXTRACT/binutils/usr/lib/." "$STAGE/$BINUTILS_ROOT/usr/lib/" 2>/dev/null
 # Sid binaries need GLIBC 2.38; bundle the matching loader and libc so the
 # archive also works on older bookworm-era hosts.
 cp -a "$EXTRACT/binutils/lib/x86_64-linux-gnu/." "$STAGE/$BINUTILS_ROOT/lib/x86_64-linux-gnu/" 2>/dev/null || true
-LOADER=$(find "$STAGE/$BINUTILS_ROOT" -name 'ld-linux-x86-64.so.2' -print -quit)
-[ -n "$LOADER" ] || die "bundled glibc loader missing"
-cp -a "$LOADER" "$STAGE/$BINUTILS_ROOT/lib/ld-linux-x86-64.so.2"
+LOADER=$(readlink -f "$STAGE/$BINUTILS_ROOT/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2" 2>/dev/null || true)
+[ -n "$LOADER" ] && [ -f "$LOADER" ] || die "bundled glibc loader missing"
+cp -L "$LOADER" "$STAGE/$BINUTILS_ROOT/lib/ld-linux-x86-64.so.2"
 chmod 755 "$STAGE/$BINUTILS_ROOT/lib/ld-linux-x86-64.so.2"
 make_wrapper() {
     local name=$1 target=$2 extra=${3:-} dest="$STAGE/$BINUTILS_ROOT/bin/$1"
@@ -148,7 +148,6 @@ make_wrapper() {
     cat > "$dest" <<'WRAP'
 #!/bin/sh
 here=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
-export LD_LIBRARY_PATH="$here/usr/lib/x86_64-linux-gnu:$here/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export LIBRARY_PATH="$here/usr/lib/x86_64-linux-gnu${LIBRARY_PATH:+:$LIBRARY_PATH}"
 export COMPILER_PATH="$here/usr/bin${COMPILER_PATH:+:$COMPILER_PATH}"
 exec "$here/lib/ld-linux-x86-64.so.2" \
