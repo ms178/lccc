@@ -6,11 +6,14 @@ sudo dpkg --add-architecture i386
 sudo apt-get update
 sudo apt-get install -y --no-install-recommends python3-yaml autoconf automake libc6-dev-i386 linux-libc-dev:i386 libc6-dbg
 # Bootstrap with a current binary linker and Clang's integrated assembler.
-git fetch --depth=1 origin tag harness-cache-1
+# mold 3.0.0 superseded the harness-cache-1 tag binary (2.42.1); the
+# dedicated installer pins the upstream release digest and link-probes
+# the result instead of the stale tag payload vouching for itself.
 mkdir -p "$RUNNER_TEMP/current-linker"
-git show harness-cache-1:mold-2.42.1-x86_64.part00 > "$RUNNER_TEMP/current-linker/ld"
-echo "86b918f8af9444aed086ea73b593b88e910d49829d2cae979cbb84509b64dc76  $RUNNER_TEMP/current-linker/ld" | sha256sum -c -
-chmod +x "$RUNNER_TEMP/current-linker/ld"
+mold_driver=$(bash scripts/ci_install_mold_oracle.sh --prefix "$RUNNER_TEMP/mold-3.0.0" --print-bin)
+ln -sfn "$mold_driver" "$RUNNER_TEMP/current-linker/ld"
+ln -sfn "$mold_driver" "$RUNNER_TEMP/current-linker/mold"
+ln -sfn "$mold_driver" "$RUNNER_TEMP/current-linker/ld.mold"
 echo "$RUNNER_TEMP/current-linker" >> "$GITHUB_PATH"
 export PATH="$RUNNER_TEMP/current-linker:$PATH"
 clang_driver=$(bash scripts/ci_install_clang_oracle.sh --print-bin) || {

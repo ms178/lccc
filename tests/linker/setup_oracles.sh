@@ -6,8 +6,9 @@
 # and `real_workloads.py` compare against.  Project policy, encoded here so it
 # is honoured automatically instead of remembered:
 #
-#   * mold is pinned to the v2.42.1 release tag by default (research owner's
-#     standing preference, 2026-09-13) and wild tracks git HEAD.  Both are
+#   * mold is pinned to the v3.0.0 release tag by default (research owner's
+#     standing preference, refreshed 2026-10-27: latest public release)
+#     and wild tracks git HEAD.  Both are
 #     built from SOURCE at the chosen ref, never from a prebuilt tarball:
 #     stale oracles have already produced two *false* lccc failures
 #     (wild 0.7.0 got constructor priority order and RELRO enforcement wrong;
@@ -22,13 +23,16 @@
 #   * Build both with `-march=native`: the oracles are timing references, so
 #     they must not be handicapped relative to lccc.
 #
-#   * Restrict mold to the targets we actually compare against:
-#         -DMOLD_TARGETS='X86_64;I386'
-#     mold instantiates its entire linker as a template over ~12 target types
-#     (X86_64 I386 ARM64LE ARM64BE ARM32LE ARM32BE RV32LE RV32BE RV64LE
-#     RV64BE PPC32 PPC64V1 PPC64V2 S390X SPARC64 M68K SH4LE LOONGARCH...),
-#     and each one recompiles every .cc file.  Dropping the targets we never
-#     test cuts the build from ~25 min to a few minutes on a 2-core box.
+#   * Restrict mold to the targets we actually compare against.  mold
+#     3.x is a Rust program (the CMake build and its -DMOLD_TARGETS=
+#     preset are gone): each of its ~20 ELF targets is a separate crate
+#     under arch/, selected by a same-named Cargo feature of mold-cli.
+#     The x86-only preset is therefore
+#         cargo build --release -p mold-cli \
+#             --no-default-features --features x86_64,i386,system-allocator
+#     Dropping the targets we never test cuts the build to a few
+#     minutes on a 2-core box; ./install-mold.sh then installs bin/ +
+#     lib/mold/mold-wrapper.so + libexec/mold/ld.
 #
 #   * Skip work we do not need: mimalloc off (we are not benchmarking mold's
 #     allocator against itself), and only the `wild` binary from wild's
@@ -48,8 +52,9 @@ PREFIX=${LCCC_ORACLE_PREFIX:-/home/user/tools}
 FORCE=0
 JOBS=${JOBS:-2}
 
-# Version pins.  The research owner's standing preference (2026-09-13) pins
-# mold to the v2.42.1 release while wild stays on git HEAD: release-tagged
+# Version pins.  The research owner's standing preference pins mold to
+# the latest public release (v3.0.0 since 2026-10-05, refreshed
+# 2026-10-27) while wild stays on git HEAD: release-tagged
 # oracles give reproducible timing baselines, and a stale *pinned* oracle is
 # still auditable because the ref is recorded below.  Override with
 #     MOLD_REF=HEAD tests/linker/setup_oracles.sh
@@ -65,11 +70,11 @@ JOBS=${JOBS:-2}
 ONLY=${ONLY:-mold,wild,bfd,lld}
 want() { [[ ",$ONLY," == *",$1,"* ]]; }
 
-MOLD_REF=${MOLD_REF:-v2.42.1}
+MOLD_REF=${MOLD_REF:-v3.0.0}
 WILD_REF=${WILD_REF:-HEAD}
 ref_suffix() { [[ $1 == HEAD ]] && echo "" || echo "-$(echo "$1" | tr '/.' '__')"; }
 # Check out a tag/branch/SHA, tolerating the `v` prefix that upstream uses on
-# its release tags (mold tags `v2.42.1`, not `2.42.1`).
+# its release tags (mold tags `v3.0.0`, not `3.0.0`).
 checkout_ref() {
   local dir=$1 ref=$2
   if [[ $ref == HEAD ]]; then git -C "$dir" reset -q --hard origin/main; return; fi
@@ -114,8 +119,9 @@ if ! want mold; then
 elif have "$MOLD_NAME"; then
   log "mold already present: $("$BIN/$MOLD_NAME" --version | head -1)"
 else
-  log "building mold ${MOLD_REF} (targets: X86_64;I386)"
-  command -v cmake >/dev/null || { echo "cmake is required" >&2; exit 1; }
+  log "building mold ${MOLD_REF} (cargo features: x86_64,i386,system-allocator)"
+  command -v cargo >/dev/null || { echo "cargo is required (mold 3.x is built with Cargo, not CMake)" >&2; exit 1; }
+  command -v cc >/dev/null || { echo "cc is required (mold-wrapper.so is a small C file)" >&2; exit 1; }
   MOLD_DIR="$SRC/mold-src$(ref_suffix "$MOLD_REF")"
   if [[ ! -d "$MOLD_DIR/.git" ]]; then
     rm -rf "$MOLD_DIR"
@@ -124,16 +130,15 @@ else
   git -C "$MOLD_DIR" fetch --filter=blob:none origin --tags >/dev/null 2>&1 || true
   checkout_ref "$MOLD_DIR" "$MOLD_REF"
   log "mold source: $(git -C "$MOLD_DIR" describe --tags --always) $(git -C "$MOLD_DIR" rev-parse --short HEAD)"
-  cmake -S "$MOLD_DIR" -B "$MOLD_DIR/build" \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DMOLD_TARGETS='X86_64;I386' \
-        -DMOLD_USE_MIMALLOC=OFF \
-        -DMOLD_LTO=OFF \
-        -DCMAKE_C_FLAGS="-O2 $NATIVE" \
-        -DCMAKE_CXX_FLAGS="-O2 $NATIVE" \
-        -DCMAKE_INSTALL_PREFIX="$MOLD_DIR/inst"
-  cmake --build "$MOLD_DIR/build" -j "$JOBS"
-  cmake --install "$MOLD_DIR/build"
+  # mimalloc off, as before (we are not benchmarking mold's allocator
+  # against itself): the mold 3.x spelling is the `system-allocator`
+  # Cargo feature.  `-C target-cpu=native` is the Rust spelling of the
+  # oracles' -march=native policy.
+  ( cd "$MOLD_DIR" && \
+    RUSTFLAGS="-C target-cpu=native" \
+    cargo build --release --locked -j "$JOBS" -p mold-cli \
+          --no-default-features --features x86_64,i386,system-allocator && \
+    PREFIX="$MOLD_DIR/inst" ./install-mold.sh )
   install -m755 "$MOLD_DIR/inst/bin/mold" "$BIN/$MOLD_NAME"
   ln -sf "$MOLD_NAME" "$BIN/ld$(ref_suffix "$MOLD_REF").mold"
   # Canonical alias: the test suites discover the mold oracle via `which mold`.
@@ -289,7 +294,7 @@ fi
     echo "lld:   $(git -C "$SRC/llvm-src" rev-parse HEAD 2>/dev/null || echo unknown) (release/${LLD_MAJOR}.x, X86 backend only)"
   fi
   echo "binutils (bfd/as reference): $BINUTILS_VERSION"
-  echo "mold build targets: X86_64;I386"
+  echo "mold build features: x86_64,i386,system-allocator (mold-cli Cargo preset)"
 } > "$BIN/ORACLE_REVISIONS.txt"
 
 cat <<EOF

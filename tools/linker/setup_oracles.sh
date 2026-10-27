@@ -2,10 +2,11 @@
 # Build/restore the comparison linkers used by tests/linker/run_linker_tests.py
 # and the differential/ICF tooling.
 #
-# Pinning policy (user directive, refreshed 2026-09-27): the oracles are
+# Pinning policy (user directive, refreshed 2026-10-27): the oracles are
 #   * GNU ld (bfd) from binutils 2.47  (release tarball, ftp.gnu.org)
-#   * mold 2.42.1                      (release tarball, github.com/rui314/mold),
-#                                      built with -DMOLD_TARGETS='X86_64;I386'
+#   * mold 3.0.0                       (release tarball, github.com/rui314/mold),
+#                                      built with Cargo target features
+#                                      x86_64,i386 only (see below)
 #   * LLVM lld 23.1.x                  (apt.llvm.org llvm-toolchain-<codename>-23;
 #                                      the installed version is asserted to be
 #                                      23.1.* and recorded in ORACLES.lock)
@@ -28,11 +29,14 @@
 # Wrappers whose target is missing are likewise removed, never left dangling.
 #
 # Build-time preset (2-vCPU / 2 GB host, -j2 research policy):
-#   * mold: MOLD_TARGETS is mold's own CMake cache variable (CMakeLists.txt,
-#     v2.42.1: `set(MOLD_TARGETS X86_64 I386 ARM64LE ... CACHE STRING ...)`);
-#     every source file is instantiated once per listed target, so restricting
-#     it to the two x86 ELF targets cuts the template instantiation work by
-#     ~10x.  X86_64 must stay first (MOLD_FIRST_TARGET).
+#   * mold: mold 3.x is a Rust program; the CMake build and its
+#     `-DMOLD_TARGETS=` preset were removed upstream.  The equivalent
+#     x86-only preset is Cargo's per-target feature set in cli/Cargo.toml:
+#     `cargo build --release -p mold-cli --no-default-features
+#      --features x86_64,i386`.  Each target is a separate crate, so
+#     restricting it to the two x86 ELF targets drops the other eighteen
+#     target crates from the build.  Then ./install-mold.sh installs bin/
+#     plus lib/mold/mold-wrapper.so and the libexec/mold/ld sibling.
 #   * binutils: only bfd + ld are configured/built (`all-ld`,
 #     `install-strip-ld`) — gas/binutils/gprof/gdb are not linker oracles
 #     (GNU as 2.47 has its own provisioner, scripts/ensure_gas_247.sh).
@@ -71,8 +75,8 @@ BINUTILS_VER=2.47
 # Same release bytes as scripts/ensure_gas_247.sh. This archive stamps its
 # binaries 2.47.20260726; oracle_versions.sh accepts that exact banner.
 BINUTILS_SHA256=154ab23b60070e8f27013c22977f1129425d67d1e8acd6e13010e617811e4cff
-MOLD_VER=2.42.1
-MOLD_TARGETS='X86_64;I386'
+MOLD_VER=3.0.0
+MOLD_FEATURES='x86_64,i386'
 LLD_MAJOR=23
 LLD_MINOR_PIN=23.1
 WITH_WILD="${WITH_WILD:-1}"
@@ -111,7 +115,10 @@ cache_prefix() {    # <prefix dir>
 
 need curl tar xz sha256sum
 restore_cached "bfd-$BINUTILS_VER" bin/ld || need make gcc g++
-restore_cached "mold-$MOLD_VER" bin/mold || need cmake make g++
+# rustup installs cargo outside the default PATH; mold 3.x needs it (and a
+# C compiler for its two small C parts: mold-wrapper.so, lto-message).
+[ -d "$HOME/.cargo/bin" ] && PATH="$HOME/.cargo/bin:$PATH"
+restore_cached "mold-$MOLD_VER" bin/mold || need cargo cc
 if [ "$WITH_WILD" = 1 ]; then
     # rustup installs cargo outside the default PATH.
     [ -d "$HOME/.cargo/bin" ] && PATH="$HOME/.cargo/bin:$PATH"
@@ -163,7 +170,7 @@ fi
 
 oracle_require_version "$PREFIX/bfd-$BINUTILS_VER/bin/ld" "$BINUTILS_VER"
 
-# ── mold 2.42.1, MOLD_USE_SYSTEM_* defaults (self-contained binary) ─────────
+# ── mold 3.0.0 (Rust build; upstream defaults, self-contained binary) ──────
 if [ -x "$PREFIX/mold-$MOLD_VER/bin/mold" ]; then
     note "mold  : $("$PREFIX/mold-$MOLD_VER/bin/mold" --version) (restored from $ARTIFACTS)"
 else
@@ -173,16 +180,17 @@ else
     MT="$SRC/mold-$MOLD_VER"
     rm -rf "$MT"; tar -xzf "$TARBALL" -C "$SRC"
     ( cd "$MT"
-      cmake -B build -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
-            -DCMAKE_CXX_FLAGS='-march=native' \
-            -DMOLD_TARGETS="$MOLD_TARGETS" \
-            -DCMAKE_INSTALL_PREFIX="$PREFIX/mold-$MOLD_VER"
-      cmake --build build -j "$JOBS" && cmake --install build
+      # mold 3.x has no CMake/MOLD_TARGETS: one Cargo feature per target
+      # (cli/Cargo.toml).  -C target-cpu=native is the Rust spelling of
+      # the oracles' -march=native policy.
+      RUSTFLAGS='-C target-cpu=native' \
+      cargo build --release --locked -j "$JOBS" -p mold-cli \
+            --no-default-features --features "$MOLD_FEATURES"
+      PREFIX="$PREFIX/mold-$MOLD_VER" ./install-mold.sh
       strip "$PREFIX/mold-$MOLD_VER/bin/mold" 2>/dev/null || true )
     rm -rf "$MT"
     cache_prefix "mold-$MOLD_VER"
-    note "mold  : $("$PREFIX/mold-$MOLD_VER/bin/mold" --version) (built, targets $MOLD_TARGETS)"
+    note "mold  : $("$PREFIX/mold-$MOLD_VER/bin/mold" --version) (built, features $MOLD_FEATURES)"
 fi
 
 oracle_require_version "$PREFIX/mold-$MOLD_VER/bin/mold" "$MOLD_VER"
@@ -228,6 +236,14 @@ else
 fi
 
 # ── convenience wrappers (stable names on PATH) ─────────────────────────────
+# Versioned wrapper names embed their pin: after a mold pin bump the old
+# `mold-<oldver>` wrapper would otherwise keep vouching for the stale
+# oracle in $LINKDIR forever.  Remove versioned mold wrappers that are
+# not the current pin (this directory holds only script-written wrappers).
+for stale in "$LINKDIR"/mold-[0-9]*; do
+    [ -e "$stale" ] || continue
+    [ "$stale" = "$LINKDIR/mold-$MOLD_VER" ] || rm -f "$stale"
+done
 WILD_BIN="$PREFIX/wild-git/bin/wild"
 wild_enabled=0
 [ "$WITH_WILD" = 1 ] && [ -x "$WILD_BIN" ] && wild_enabled=1
@@ -249,7 +265,7 @@ done
 {
     printf '# %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ) setup_oracles.sh"
     printf 'ld      %s\n' "$("$PREFIX/bfd-$BINUTILS_VER/bin/ld" --version | head -1)"
-    printf 'mold    %s (MOLD_TARGETS=%s)\n' "$("$PREFIX/mold-$MOLD_VER/bin/mold" --version)" "$MOLD_TARGETS"
+    printf 'mold    %s (cargo features %s)\n' "$("$PREFIX/mold-$MOLD_VER/bin/mold" --version)" "$MOLD_FEATURES"
     printf 'ld.lld  %s\n' "$lld_banner"
     if [ "$wild_enabled" = 1 ]; then
         printf 'wild    %s (rev %s)\n' "$("$WILD_BIN" --version 2>&1 | head -1)" \

@@ -23,8 +23,9 @@ code is held constant and only the linker varies.
 Oracles
 -------
 The competing linkers are the PINNED oracles provisioned by
-tools/linker/setup_oracles.sh (GNU ld 2.47, mold 2.42.1 built for
-X86_64;I386, LLVM lld 23.1.x, optionally wild HEAD), found as the wrappers in
+tools/linker/setup_oracles.sh (GNU ld 2.47, mold 3.0.0 built with the
+mold-cli Cargo features x86_64,i386, LLVM lld 23.1.x, optionally wild HEAD),
+found as the wrappers in
 $LCCC_ORACLE_BIN (default /home/user/artifacts/bin).  A same-named linker on
 PATH is used only as a labelled fallback ("bfd(system)"), and
 `--require-pinned` turns a missing pin into an error, so a comparison is never
@@ -71,7 +72,7 @@ ORACLE_BIN = os.environ.get("LCCC_ORACLE_BIN", "/home/user/artifacts/bin")
 # (label, pinned wrapper written by tools/linker/setup_oracles.sh, PATH fallback)
 ORACLES = (
     ("bfd", "ld-2.47", "ld.bfd"),
-    ("mold", "mold-2.42.1", "mold"),
+    ("mold", "mold-3.0.0", "mold"),
     ("lld", "ld.lld-23.1", "ld.lld"),
     ("wild", "wild", "wild"),
 )
