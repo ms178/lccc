@@ -4701,7 +4701,7 @@ impl SemanticAnalyzer {
                 // Unlike a bare `*p`, pointer arithmetic needs the size even
                 // under `sizeof` (`sizeof(p[0])` is ill-formed), so this
                 // reports in unevaluated operands too (measured on gcc-16.2).
-                if let Some(name) = self.incomplete_record_name(&pointee_of(&base_ty)) {
+                if let Some(name) = self.incomplete_record_name(pointee_of(&base_ty)) {
                     self.diagnostics
                         .borrow_mut()
                         .error(format!("invalid use of undefined type '{name}'"), span);
@@ -5071,7 +5071,7 @@ impl SemanticAnalyzer {
         // -- including a discarded statement -- as "invalid use of undefined
         // type 'struct f'" at the `*`. `&*p` is the one exception: it never
         // computes the value (measured).
-        if let Some(name) = self.incomplete_record_name(&pointee_of(&ty)) {
+        if let Some(name) = self.incomplete_record_name(pointee_of(&ty)) {
             // `sizeof(*p)` and a `_Generic` selector replace the value rule
             // with their own incomplete-type diagnostic (measured).
             if !self.address_of_operand.get() && !self.in_unevaluated_operand() {
@@ -6483,7 +6483,7 @@ dereference it before applying '->' to it?"
         if !matches!(ty, CType::Pointer(..)) {
             return None;
         }
-        self.incomplete_record_name(&pointee_of(&ty))
+        self.incomplete_record_name(pointee_of(&ty))
     }
 
     /// `p++` / `p--` on a pointer to an undefined record type (C23 6.5.2.4p1
@@ -8656,15 +8656,16 @@ fn pointee_compat(from: &CType, to: &CType) -> PtrCompat {
     }
 }
 
-/// The pointer half of C23 6.5.2.2p7 for a single call argument.
 /// The type a pointer (or array) operand designates, else the operand itself.
-fn pointee_of(ty: &CType) -> CType {
+/// Borrowed, not cloned: this runs on every `*`, `.`, `->`, `[]` and `++`.
+fn pointee_of(ty: &CType) -> &CType {
     match ty {
-        CType::Pointer(inner, _) | CType::Array(inner, _) => (**inner).clone(),
-        other => other.clone(),
+        CType::Pointer(inner, _) | CType::Array(inner, _) => inner,
+        other => other,
     }
 }
 
+/// The pointer half of C23 6.5.2.2p7 for a single call argument.
 fn pointer_argument_compat(from: &CType, to: &CType) -> PtrCompat {
     match (from, to) {
         (CType::Pointer(from_inner, from_space), CType::Pointer(to_inner, to_space)) => {
