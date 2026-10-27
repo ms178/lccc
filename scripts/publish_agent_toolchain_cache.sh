@@ -114,7 +114,7 @@ make MAKEINFO=true install-gas install-ld DESTDIR=/work/build/stage >/dev/null
 EOS
 chmod +x "$WORK/build-binutils.sh"
 docker run --rm -v "$WORK:/work" -w /work debian:bookworm bash /work/build-binutils.sh
-chown -R "$(id -u):$(id -g)" "$WORK/build/stage"
+sudo chown -R "$(id -u):$(id -g)" "$WORK/build/stage"
 cp -a "$WORK/build/stage/usr/bin/." "$STAGE/$BINUTILS_ROOT/libexec/"
 LDSCRIPTS=$(find "$WORK/build/stage/usr" -type d -name ldscripts -print -quit)
 [ -n "$LDSCRIPTS" ] || die "binutils ldscripts directory missing"
