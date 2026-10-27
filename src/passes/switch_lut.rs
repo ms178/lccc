@@ -1338,7 +1338,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "timing witness; run explicitly with --ignored --nocapture"]
     fn switch_definition_index_scaling_witness() {
         use std::hint::black_box;
         use std::time::Instant;

@@ -213,6 +213,7 @@ jobs:
         # compiler instead of a second, subtly different configuration.
         export RUSTFLAGS="$(cat target/lccc-rustflags)"
         python3 scripts/test_ci_oracle_diagnostics.py
+        python3 tests/regression/test_check_switch_cross_execute.py
         python3 scripts/ci_test_report.py --self-test
         python3 scripts/ci_test_report.py -- cargo test --profile fastbuild --all-targets --locked -j 2
         python3 tests/regression/check_avx512_scalar_witness.py --self-test

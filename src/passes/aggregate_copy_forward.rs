@@ -517,6 +517,149 @@ fn global_names_may_alias(
     })
 }
 
+type PointerPaths = FxHashMap<u32, (u32, Vec<(Operand, crate::common::types::IrType)>)>;
+type ConstructionCopies = FxHashMap<u32, (usize, usize, Value)>;
+
+/// Remove candidates whose earlier publication can change an intervening
+/// memory observation. Keeping this proof separate from candidate discovery
+/// and rewriting makes the alias boundary independently reviewable.
+fn reject_conflicting_constructions(
+    func: &IrFunction,
+    paths: &PointerPaths,
+    copies: &mut ConstructionCopies,
+    symbol_facts: Option<&super::module_symbol_facts::ModuleSymbolFacts>,
+) {
+    let global_addresses = global_address_names(func);
+    // MAY provenance above detects aliases, but a partial global set from
+    // select(global, unknown) is NOT a no-alias proof. Use only unique,
+    // direct GlobalAddr definitions when proving distinct globals here.
+    let multi_def = super::gvn::find_multi_def_values(func);
+    let direct_globals: FxHashMap<u32, &str> = func
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|inst| match inst {
+            Instruction::GlobalAddr { dest, name } if !multi_def.contains(&dest.0) => {
+                Some((dest.0, name.as_str()))
+            }
+            _ => None,
+        })
+        .collect();
+    let mut reject = FxHashSet::default();
+    for (&root, &(copy_b, copy_i, dest)) in copies.iter() {
+        // dest's aliasing root (dest may be a GEP into a larger object;
+        // any access to that object is conservatively a conflict).
+        let dest_root = paths.get(&dest.0).map(|p| p.0).unwrap_or(dest.0);
+        let dest_globals = global_addresses.get(&dest.0);
+        // Address construction does not publish bytes. Start at the
+        // first redirected WRITE, not Alloca/GEP, so loads used to build
+        // the temporary before its first store do not block forwarding.
+        let first_use = func.blocks[copy_b].instructions[..copy_i]
+            .iter()
+            .position(|inst| match inst {
+                Instruction::Store { ptr, .. } | Instruction::Memcpy { dest: ptr, .. } => {
+                    paths.get(&ptr.0).is_some_and(|p| p.0 == root)
+                }
+                _ => false,
+            })
+            .unwrap_or(copy_i);
+        let access_may_alias = |pointer: Value| {
+            if pointer == dest {
+                return true;
+            }
+            let access_root = paths.get(&pointer.0).map(|p| p.0);
+            // Validation above proves the construction root non-escaping;
+            // its own stores cannot name the destination's old contents.
+            if access_root == Some(root) {
+                return false;
+            }
+            if let Some(dest_path) = paths.get(&dest.0) {
+                if let Some(access_root) = access_root {
+                    return access_root == dest_path.0;
+                }
+                if direct_globals.contains_key(&pointer.0) {
+                    return false;
+                }
+            } else if direct_globals.contains_key(&dest.0) && access_root.is_some() {
+                return false;
+            }
+            if let (Some(a), Some(b), Some(facts)) = (
+                direct_globals.get(&dest.0),
+                direct_globals.get(&pointer.0),
+                symbol_facts,
+            ) {
+                return !facts.globals_distinct(a, b);
+            }
+            // Different SSA ids, unknown roots, and partial MAY sets do
+            // not prove disjointness. In particular a parameter can point
+            // at the destination global, and a call can access it implicitly.
+            true
+        };
+        // dest's MEMORY must be untouched inside the window (the memcpy
+        // itself at copy_i is the legitimate final write). Pure address
+        // computations — GetElementPtr / Copy / Phi over pointers rooted
+        // at dest — do not read or write that memory and must not
+        // reject (the hoisted destination GEP itself sits inside the
+        // window by construction). Everything else that references a
+        // dest-rooted value is a read, a write, or an escape
+        // (Load/Store/Memcpy/Call/Intrinsic/InlineAsm/Cast/...) and
+        // fails closed. GlobalAddr values use symbol identity as well:
+        // the frontend may materialize the same object under many SSA
+        // ids, and pr126405 showed that comparing only those ids misses
+        // the destination loads in this window.
+        for ii in first_use..copy_i {
+            let inst = &func.blocks[copy_b].instructions[ii];
+            if matches!(
+                inst,
+                Instruction::GetElementPtr { .. }
+                    | Instruction::Copy { .. }
+                    | Instruction::Phi { .. }
+            ) {
+                continue;
+            }
+            let memory_conflict = match inst {
+                Instruction::Load { ptr, .. } | Instruction::Store { ptr, .. } => {
+                    access_may_alias(*ptr)
+                }
+                Instruction::Memcpy { dest, src, .. } => {
+                    access_may_alias(*dest) || access_may_alias(*src)
+                }
+                Instruction::AtomicLoad { .. } | Instruction::Fence { .. } => true,
+                _ => is_opaque_memory_write(inst) || inst.may_write_memory(),
+            };
+            let mut touches_dest = memory_conflict;
+            inst.for_each_used_value(|v| {
+                let alloca_alias = v == dest.0 || paths.get(&v).is_some_and(|p| p.0 == dest_root);
+                let global_alias = dest_globals.is_some_and(|dest_names| {
+                    global_addresses.get(&v).is_some_and(|used_names| {
+                        global_names_may_alias(dest_names, used_names, symbol_facts)
+                    })
+                });
+                if alloca_alias || global_alias {
+                    touches_dest = true;
+                }
+            });
+            if let Some(d) = inst.dest() {
+                if d.0 == dest.0 || paths.get(&d.0).is_some_and(|p| p.0 == dest_root) {
+                    touches_dest = true;
+                }
+            }
+            if touches_dest {
+                reject.insert(root);
+                break;
+            }
+        }
+    }
+    if std::env::var("CCC_DEBUG_AGGFWD").is_ok() {
+        for r in &reject {
+            eprintln!("[STOREFWD-REJ] {} root=v{} dest-window", func.name, r);
+        }
+    }
+    for root in reject {
+        copies.remove(&root);
+    }
+}
+
 /// Redirect construction of a store-only temporary aggregate into the final
 /// memcpy destination.  This turns `build(tmp); memcpy(dst, tmp)` into
 /// `build(dst)` when every use of `tmp` is a same-block GEP/store or that copy.
@@ -832,138 +975,7 @@ fn forward_store_only_temporaries(
     // zlib-ng fold_1: `x_tmp3=*c3; *c3=*c0; *c1=*c2; ...; *c2=x_tmp3` — the
     // snapshot write was redirected into c2 while `*c1=*c2` still read c2's
     // old value (CRC mismatch on every odd-length fold_copy+fold sequence).
-    {
-        let global_addresses = global_address_names(func);
-        // MAY provenance above detects aliases, but a partial global set from
-        // select(global, unknown) is NOT a no-alias proof. Use only unique,
-        // direct GlobalAddr definitions when proving distinct globals here.
-        let multi_def = super::gvn::find_multi_def_values(func);
-        let direct_globals: FxHashMap<u32, &str> = func
-            .blocks
-            .iter()
-            .flat_map(|block| &block.instructions)
-            .filter_map(|inst| match inst {
-                Instruction::GlobalAddr { dest, name } if !multi_def.contains(&dest.0) => {
-                    Some((dest.0, name.as_str()))
-                }
-                _ => None,
-            })
-            .collect();
-        let mut reject = FxHashSet::default();
-        for (&root, &(copy_b, copy_i, dest)) in &copies {
-            // dest's aliasing root (dest may be a GEP into a larger object;
-            // any access to that object is conservatively a conflict).
-            let dest_root = paths.get(&dest.0).map(|p| p.0).unwrap_or(dest.0);
-            let dest_globals = global_addresses.get(&dest.0);
-            // Address construction does not publish bytes. Start at the
-            // first redirected WRITE, not Alloca/GEP, so loads used to build
-            // the temporary before its first store do not block forwarding.
-            let first_use = func.blocks[copy_b].instructions[..copy_i]
-                .iter()
-                .position(|inst| match inst {
-                    Instruction::Store { ptr, .. } | Instruction::Memcpy { dest: ptr, .. } => {
-                        paths.get(&ptr.0).is_some_and(|p| p.0 == root)
-                    }
-                    _ => false,
-                })
-                .unwrap_or(copy_i);
-            let access_may_alias = |pointer: Value| {
-                if pointer == dest {
-                    return true;
-                }
-                let access_root = paths.get(&pointer.0).map(|p| p.0);
-                // Validation above proves the construction root non-escaping;
-                // its own stores cannot name the destination's old contents.
-                if access_root == Some(root) {
-                    return false;
-                }
-                if let Some(dest_path) = paths.get(&dest.0) {
-                    if let Some(access_root) = access_root {
-                        return access_root == dest_path.0;
-                    }
-                    if direct_globals.contains_key(&pointer.0) {
-                        return false;
-                    }
-                } else if direct_globals.contains_key(&dest.0) && access_root.is_some() {
-                    return false;
-                }
-                if let (Some(a), Some(b), Some(facts)) = (
-                    direct_globals.get(&dest.0),
-                    direct_globals.get(&pointer.0),
-                    symbol_facts,
-                ) {
-                    return !facts.globals_distinct(a, b);
-                }
-                // Different SSA ids, unknown roots, and partial MAY sets do
-                // not prove disjointness. In particular a parameter can point
-                // at the destination global, and a call can access it implicitly.
-                true
-            };
-            // dest's MEMORY must be untouched inside the window (the memcpy
-            // itself at copy_i is the legitimate final write). Pure address
-            // computations — GetElementPtr / Copy / Phi over pointers rooted
-            // at dest — do not read or write that memory and must not
-            // reject (the hoisted destination GEP itself sits inside the
-            // window by construction). Everything else that references a
-            // dest-rooted value is a read, a write, or an escape
-            // (Load/Store/Memcpy/Call/Intrinsic/InlineAsm/Cast/...) and
-            // fails closed. GlobalAddr values use symbol identity as well:
-            // the frontend may materialize the same object under many SSA
-            // ids, and pr126405 showed that comparing only those ids misses
-            // the destination loads in this window.
-            for ii in first_use..copy_i {
-                let inst = &func.blocks[copy_b].instructions[ii];
-                if matches!(
-                    inst,
-                    Instruction::GetElementPtr { .. }
-                        | Instruction::Copy { .. }
-                        | Instruction::Phi { .. }
-                ) {
-                    continue;
-                }
-                let memory_conflict = match inst {
-                    Instruction::Load { ptr, .. } | Instruction::Store { ptr, .. } => {
-                        access_may_alias(*ptr)
-                    }
-                    Instruction::Memcpy { dest, src, .. } => {
-                        access_may_alias(*dest) || access_may_alias(*src)
-                    }
-                    Instruction::AtomicLoad { .. } | Instruction::Fence { .. } => true,
-                    _ => is_opaque_memory_write(inst) || inst.may_write_memory(),
-                };
-                let mut touches_dest = memory_conflict;
-                inst.for_each_used_value(|v| {
-                    let alloca_alias =
-                        v == dest.0 || paths.get(&v).is_some_and(|p| p.0 == dest_root);
-                    let global_alias = dest_globals.is_some_and(|dest_names| {
-                        global_addresses.get(&v).is_some_and(|used_names| {
-                            global_names_may_alias(dest_names, used_names, symbol_facts)
-                        })
-                    });
-                    if alloca_alias || global_alias {
-                        touches_dest = true;
-                    }
-                });
-                if let Some(d) = inst.dest() {
-                    if d.0 == dest.0 || paths.get(&d.0).is_some_and(|p| p.0 == dest_root) {
-                        touches_dest = true;
-                    }
-                }
-                if touches_dest {
-                    reject.insert(root);
-                    break;
-                }
-            }
-        }
-        if std::env::var("CCC_DEBUG_AGGFWD").is_ok() {
-            for r in &reject {
-                eprintln!("[STOREFWD-REJ] {} root=v{} dest-window", func.name, r);
-            }
-        }
-        for root in reject {
-            copies.remove(&root);
-        }
-    }
+    reject_conflicting_constructions(func, &paths, &mut copies, symbol_facts);
     if copies.is_empty() {
         return 0;
     }

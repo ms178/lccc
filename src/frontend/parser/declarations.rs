@@ -772,6 +772,35 @@ impl Parser {
         (full_type, None, false, false, decayed_array)
     }
 
+    /// Finish the first declarator before parsing comma siblings. Values that
+    /// belong to the declaration specifiers are restored from DeclContext.
+    fn clear_completed_declarator_attributes(&mut self) {
+        self.attrs.set_weak(false);
+        self.attrs.parsing_alias_target = None;
+        self.attrs.parsing_ifunc_target = None;
+        self.attrs.parsing_target_clones = None;
+        self.attrs.parsing_externally_visible = false;
+        self.attrs.parsing_zero_call_used_regs = None;
+        self.attrs.parsing_no_sanitize = None;
+        self.attrs.set_uninitialized(false);
+        self.attrs.parsing_visibility = None;
+        self.attrs.parsing_tls_model = None;
+        self.attrs.parsing_section = None;
+        self.attrs.set_error_attr(false);
+        self.attrs.set_noreturn(false);
+        self.attrs.set_nested_fn(false);
+        self.attrs.set_pure(false);
+        self.attrs.set_const_attr(false);
+        self.attrs.set_cold(false);
+        self.attrs.parsing_cleanup_fn = None;
+        self.attrs.set_used(false);
+        self.attrs.set_maybe_unused(false);
+        self.attrs.set_fastcall(false);
+        self.attrs.parsing_regparm = None;
+        self.attrs.set_naked(false);
+        self.attrs.set_no_instrument(false);
+    }
+
     /// Parse the rest of a declaration (not a function definition).
     fn parse_declaration_rest(
         &mut self,
@@ -914,30 +943,7 @@ impl Parser {
                 d.attrs.set_nested_fn(true);
             }
         }
-        self.attrs.set_weak(false);
-        self.attrs.parsing_alias_target = None;
-        self.attrs.parsing_ifunc_target = None;
-        self.attrs.parsing_target_clones = None;
-        self.attrs.parsing_externally_visible = false;
-        self.attrs.parsing_zero_call_used_regs = None;
-        self.attrs.parsing_no_sanitize = None;
-        self.attrs.set_uninitialized(false);
-        self.attrs.parsing_visibility = None;
-        self.attrs.parsing_tls_model = None;
-        self.attrs.parsing_section = None;
-        self.attrs.set_error_attr(false);
-        self.attrs.set_noreturn(false);
-        self.attrs.set_nested_fn(false);
-        self.attrs.set_pure(false);
-        self.attrs.set_const_attr(false);
-        self.attrs.set_cold(false);
-        self.attrs.parsing_cleanup_fn = None;
-        self.attrs.set_used(false);
-        self.attrs.set_maybe_unused(false);
-        self.attrs.set_fastcall(false);
-        self.attrs.parsing_regparm = None;
-        self.attrs.set_naked(false);
-        self.attrs.set_no_instrument(false);
+        self.clear_completed_declarator_attributes();
         ctx.is_common = ctx.is_common || extra_common;
         if let Some(a) = extra_aligned {
             ctx.alignment = Some(ctx.alignment.map_or(a, |prev| prev.max(a)));
