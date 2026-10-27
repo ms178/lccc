@@ -1157,6 +1157,9 @@ impl Parser {
             let qualifier_start = self.pos;
             let base_space =
                 std::mem::replace(&mut self.attrs.parsing_address_space, AddressSpace::Default);
+            // Each star owns its qualifier run; an inner const pointer
+            // must not make the parameter object itself read-only.
+            self.attrs.set_pointer_const(false);
             self.skip_cv_qualifiers();
             star_spaces.push(std::mem::replace(
                 &mut self.attrs.parsing_address_space,
@@ -1331,6 +1334,7 @@ impl Parser {
                 }
                 let base_space =
                     std::mem::replace(&mut self.attrs.parsing_address_space, AddressSpace::Default);
+                self.attrs.set_pointer_const(false);
                 self.skip_cv_qualifiers();
                 object_space = std::mem::replace(&mut self.attrs.parsing_address_space, base_space);
                 object_span = star_span;

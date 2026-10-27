@@ -13,6 +13,8 @@ import tempfile
 
 # name, source, hard read-only error, warning class (None for legal controls).
 CASES = [
+    ('mutable_outer_parameter', 'void f(int *const *p){p=0;}', False, None),
+    ('const_outer_parameter', 'void f(int **const p){p=0;}', True, None),
     ('const_member', 'struct S{const int x;};void f(struct S*p){p->x=1;}', True, None),
     ('mutable_member_after_const', 'struct S{const int x;int y;};void f(struct S*p){p->y=1;}', False, None),
     ('const_member_pointer', 'struct S{int *const p;};void f(struct S*s){s->p=0;}', True, None),
