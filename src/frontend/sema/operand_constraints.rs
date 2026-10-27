@@ -1,21 +1,26 @@
-//! Operand-type constraints of C23 6.5 and 6.8.4-6.8.5 for the operand kinds
-//! that have no valid use as arithmetic or truth values: structures and
-//! unions, `void`, and C23 `nullptr_t`.
+//! Operand-type constraints of C23 6.5, 6.5.2.3 and 6.5.3.2 and of the
+//! "as if by assignment" conversions of 6.5.16.1: the operand kinds that have
+//! no valid use as arithmetic or truth values (structures and unions, `void`,
+//! C23 `nullptr_t`), the operand class of `*`, `.` and `->`, and the two
+//! `void` value verdicts.
 //!
 //! lccc used to accept these operands and hand them to lowering, which has no
 //! meaning for them: `a + b` on two (struct-based) `__m128i` values compiled
-//! into a binary that segfaulted, where GCC 16.2 and Clang 23.1.3 reject or
-//! define the program. Each rule below is a constraint both oracles enforce
-//! as a hard error, with the messages GCC uses.
+//! into a binary that segfaulted, and `*x` on an `int`, `x->a` on a `double`
+//! or `p.a` on a pointer were compiled as whatever the lowering guessed, where
+//! GCC 16.2 and Clang 23.1.4 reject the program. Each rule below is a
+//! constraint the oracles enforce, with the messages GCC uses.
 //!
-//! The rules are pure functions of the operand types (already decayed, see
-//! [`CType::decayed_value_ctype`]) and of whether an operand is a null pointer
-//! constant, so they are unit-tested here without building expressions. The
-//! analyzer decides which inferred types are exact enough to check (see
-//! `SemanticAnalyzer::constraint_operand`); every other combination, such as
-//! GCC's pointer/integer leniency, is outside this module and unchanged.
+//! The rules are pure functions of the operand types -- some of them the
+//! *undecayed* type (`.` does not apply array-to-pointer conversion; see
+//! `SemanticAnalyzer::exact_operand_ctype`) -- and of whether an operand is a
+//! null pointer constant, so they are unit-tested here without building
+//! expressions. The analyzer decides which inferred types are exact enough to
+//! check, owns the column policy, and owns every message that quotes the
+//! operator's operand; every other combination, such as GCC's pointer/integer
+//! leniency, is outside this module and unchanged.
 
-use crate::common::types::CType;
+use crate::common::types::{AddressSpace, CType};
 use crate::frontend::parser::ast::{BinOp, UnaryOp};
 
 /// The operand classes these constraints distinguish.
@@ -66,15 +71,91 @@ pub(super) struct Operand<'a> {
     pub null_constant: bool,
 }
 
-const VOID_VALUE: &str = "void value not ignored as it ought to be";
+pub(super) const VOID_VALUE: &str = "void value not ignored as it ought to be";
+
+/// The two record verdicts of [`scalar_required`]: a record operand where a
+/// truth value is required.
+pub(super) const STRUCT_VALUE: &str = "used struct type value where scalar is required";
+pub(super) const UNION_VALUE: &str = "used union type value where scalar is required";
+
+/// GCC's other `void` diagnostic: an operator that would have to *produce* a
+/// value from the operand (`!`, `~`, `-`, `+`, `++`, `--`, `op=`, a cast) says
+/// this instead of the "not ignored as it ought to be" form that the value
+/// contexts (initialization, `return`, argument passing, binary operators,
+/// conditions) use. Both were measured on gcc-16.2.
+const VOID_USE: &str = "invalid use of void expression";
+
+/// GCC 16.2's spelling of a type in a diagnostic: `type_to_string`'s form,
+/// which differs from C's declaration syntax in ways that matter for
+/// verbatim message parity -- `long unsigned int` (not `unsigned long`),
+/// `long long int`, `__int128 unsigned`, `complex double` (not
+/// `_Complex double`), and `__vector(4) int` for a GNU vector. A typedef
+/// name cannot be reproduced (the inferred type no longer knows it), so
+/// GCC's `'T' {aka 'int'}` appears here as plain `'int'`.
+/// The parameter list of a function type in gcc's spelling: `void` for an
+/// empty prototype, `int, char *` otherwise, `...` appended when variadic.
+fn function_params(f: &crate::common::types::FunctionType) -> String {
+    let mut params: Vec<String> = f.params.iter().map(|(ty, _)| type_name(ty)).collect();
+    if params.is_empty() && f.has_prototype {
+        params.push("void".into());
+    }
+    if f.variadic {
+        params.push("...".into());
+    }
+    params.join(", ")
+}
+
+pub(super) fn type_name(ty: &CType) -> String {
+    match ty {
+        CType::Long => "long int".into(),
+        CType::ULong => "long unsigned int".into(),
+        CType::LongLong => "long long int".into(),
+        CType::ULongLong => "long long unsigned int".into(),
+        CType::Int128 => "__int128".into(),
+        CType::UInt128 => "__int128 unsigned".into(),
+        CType::ComplexFloat => "complex float".into(),
+        CType::ComplexDouble => "complex double".into(),
+        CType::ComplexLongDouble => "complex long double".into(),
+        // `type_to_string` writes a function type without the space its
+        // declaration syntax has (`int(void)`, not `int (void)`), a pointer
+        // to an array as `int (*)[3]`, and a pointer to a function as
+        // `int (*)(void)`.
+        CType::Function(f) => {
+            let mut spelling = type_name(&f.return_type);
+            spelling.push('(');
+            spelling.push_str(&function_params(f));
+            spelling.push(')');
+            spelling
+        }
+        CType::Pointer(inner, AddressSpace::Default) => match &**inner {
+            CType::Array(elem, len) => format!(
+                "{} (*)[{}]",
+                type_name(elem),
+                len.map(|n| n.to_string()).unwrap_or_default()
+            ),
+            CType::Function(f) => {
+                format!("{} (*)({})", type_name(&f.return_type), function_params(f))
+            }
+            _ => format!("{} *", type_name(inner)),
+        },
+        CType::Vector(elem, total_size) => {
+            let lanes = match elem.size() {
+                0 => 1,
+                size => total_size / size,
+            };
+            format!("__vector({lanes}) {}", type_name(elem))
+        }
+        _ => ty.to_string(),
+    }
+}
 
 /// GCC's "used struct type value where scalar is required", for a controlling
 /// expression, `!`, `&&`, `||` or the first operand of `?:`. `nullptr_t` is a
 /// scalar type and allowed (it converts to `false`).
 pub(super) fn scalar_required(ty: &CType) -> Option<String> {
     match ty {
-        CType::Struct(_) => Some("used struct type value where scalar is required".into()),
-        CType::Union(_) => Some("used union type value where scalar is required".into()),
+        CType::Struct(_) => Some(STRUCT_VALUE.into()),
+        CType::Union(_) => Some(UNION_VALUE.into()),
         CType::Void => Some(VOID_VALUE.into()),
         _ => None,
     }
@@ -101,7 +182,7 @@ pub(super) fn unary(op: UnaryOp, ty: &CType) -> Option<String> {
         UnaryOp::ImagPart => "__imag__",
     };
     match kind(ty) {
-        Kind::Void => Some(VOID_VALUE.into()),
+        Kind::Void => Some(VOID_USE.into()),
         Kind::Record => Some(format!("wrong type argument to {what}")),
         // `!nullptr` is valid (a scalar operand); every arithmetic unary
         // operator requires an arithmetic operand (C23 6.5.3.3p1).
@@ -112,12 +193,105 @@ pub(super) fn unary(op: UnaryOp, ty: &CType) -> Option<String> {
     }
 }
 
+/// Unary `*` (C23 6.5.3.2p2): the operand must have pointer type. An array or
+/// a function designator is accepted -- both convert to a pointer, and `*f`
+/// is the designator `f` itself. A `void` operand has no value to speak of,
+/// so its diagnostic is GCC's void-value error rather than a type-argument
+/// message; everything else (arithmetic, record, vector, `nullptr_t`) is
+/// "invalid type argument of unary '*'".
+pub(super) fn indirection(ty: &CType) -> Option<String> {
+    match kind(ty) {
+        Kind::Pointer => None,
+        Kind::Void => Some(VOID_VALUE.into()),
+        // The message quotes the *promoted* operand type: `*c` on a
+        // `char`/`_Bool` says `'int'`, and an enumeration its compatible
+        // type (`'unsigned int'` for `enum E { A }`), measured on gcc-16.2.
+        _ => Some(format!(
+            "invalid type argument of unary '*' (have '{}')",
+            type_name(&ty.integer_promoted())
+        )),
+    }
+}
+
+/// Whether `ty` is a pointer to `void`. Dereferencing one is a GNU extension
+/// GCC accepts with the default-on warning `dereferencing 'void *' pointer`;
+/// the resulting lvalue has type `void`, which is what the value rules judge.
+pub(super) fn is_void_pointer(ty: &CType) -> bool {
+    matches!(ty, CType::Pointer(inner, _) if matches!(**inner, CType::Void))
+}
+
+/// What a member selection can do with its operand, before the member name is
+/// looked up (C23 6.5.2.3p2-p3). The analyzer owns the messages that name the
+/// member or quote the operand, so this only classifies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum MemberOperand {
+    /// A struct or union, reached directly (`.`) or through a pointer (`->`).
+    Record,
+    /// `.` on a pointer to a record: GCC asks whether `->` was meant.
+    Pointer,
+    /// `->` on a pointer to a pointer to a record: GCC asks whether it should
+    /// be dereferenced first.
+    PointerToPointer,
+    /// `->` on a value that is not a pointer at all.
+    NotPointer,
+    /// `->` through `void *`: GCC warns and then rejects the member request.
+    VoidPointer,
+    /// A value no member can be selected from.
+    NotRecord,
+}
+
+/// Classify the operand type of `.` (`arrow == false`) or `->`
+/// (`arrow == true`). An array or function operand of `->` has already
+/// converted to a pointer (C23 6.3.2.1p3), so it is judged by what it points
+/// to; the same conversion makes `int a[3]; a->x` a member request on `int`,
+/// which GCC rejects.
+pub(super) fn member_operand(ty: &CType, arrow: bool) -> MemberOperand {
+    if arrow {
+        return match ty {
+            CType::Pointer(inner, _) | CType::Array(inner, _) => match &**inner {
+                // An ext vector has named lanes, so `p->x` on an `I4 *` is a
+                // lane selection, not a member error (the analyzer validates
+                // the selector).
+                CType::Struct(_) | CType::Union(_) | CType::ExtVector(..) => MemberOperand::Record,
+                CType::Void => MemberOperand::VoidPointer,
+                // `struct S **pp; pp->a`: the pointee is itself a pointer to
+                // a record, which GCC suggests dereferencing first. A pointer
+                // to a non-record (`int **`) gets the plain member error.
+                CType::Pointer(pointee, _)
+                    if matches!(&**pointee, CType::Struct(_) | CType::Union(_)) =>
+                {
+                    MemberOperand::PointerToPointer
+                }
+                _ => MemberOperand::NotRecord,
+            },
+            // A function designator decays to a pointer to the function itself.
+            CType::Function(_) => MemberOperand::NotRecord,
+            _ => MemberOperand::NotPointer,
+        };
+    }
+    match ty {
+        // An ext vector has named lanes; the analyzer validates the selector.
+        CType::Struct(_) | CType::Union(_) | CType::ExtVector(..) => MemberOperand::Record,
+        // gcc-16.2 suggests `->` only when the pointer's pointee is a record;
+        // `int *`, `void *` and `struct S **` get the plain member error.
+        CType::Pointer(pointee, _)
+            if matches!(
+                &**pointee,
+                CType::Struct(_) | CType::Union(_) | CType::ExtVector(..)
+            ) =>
+        {
+            MemberOperand::Pointer
+        }
+        _ => MemberOperand::NotRecord,
+    }
+}
+
 /// Postfix and prefix `++`/`--` (C23 6.5.2.4p1, 6.5.3.1p1): a real or pointer
 /// operand.
 pub(super) fn increment(increment: bool, ty: &CType) -> Option<String> {
     let what = if increment { "increment" } else { "decrement" };
     match kind(ty) {
-        Kind::Void => Some(VOID_VALUE.into()),
+        Kind::Void => Some(VOID_USE.into()),
         Kind::Record | Kind::NullPtr => Some(format!("wrong type argument to {what}")),
         _ => None,
     }
@@ -190,7 +364,12 @@ pub(super) fn conditional_arms(then_ty: &CType, else_ty: &CType) -> Option<Strin
     let valid = match (tk, ek) {
         _ if record_vector_pair(tk, ek) => true,
         (Kind::Void, _) | (_, Kind::Void) => true,
-        (Kind::Record, Kind::Record) => true,
+        // Two records convert only when they are the same record type
+        // (gcc-16.2: `1 ? s : t` for `struct S`/`struct T` and for a
+        // `struct` against a `union` is "type mismatch in conditional
+        // expression"; an unnamed record is a different type from every
+        // other declaration too).
+        (Kind::Record, Kind::Record) => then_ty == else_ty,
         (Kind::Record, _) | (_, Kind::Record) => false,
         (Kind::NullPtr, other) | (other, Kind::NullPtr) => {
             matches!(other, Kind::NullPtr | Kind::Pointer)
@@ -200,15 +379,37 @@ pub(super) fn conditional_arms(then_ty: &CType, else_ty: &CType) -> Option<Strin
     (!valid).then(|| "type mismatch in conditional expression".to_string())
 }
 
+/// Where an "as if by assignment" conversion happens (C23 6.5.16.1p1). GCC
+/// words the record mismatch differently in each context, and it uses both of
+/// its `void` diagnostics here (measured on gcc-16.2): initialization and
+/// `return` say "void value not ignored as it ought to be" at the operand,
+/// while assignment and argument passing say "invalid use of void expression".
+#[derive(Clone, Copy, Debug)]
+pub(super) enum AssignmentCtx<'a> {
+    Initialization,
+    /// `=` itself: the diagnostic is anchored at the assignment operator.
+    Assignment,
+    Returning,
+    Argument {
+        index: usize,
+        callee: &'a str,
+    },
+}
+
 /// Simple assignment, and the conversions "as if by assignment" of
 /// initialization, argument passing and `return` (C23 6.5.16.1p1), for a
 /// `nullptr_t`, `void` or record operand on either side. Record-to-record
 /// compatibility stays with the callers, which know the anonymous-record key
 /// caveats.
-pub(super) fn assignment(from: Operand<'_>, to: &CType) -> Option<String> {
+pub(super) fn assignment(from: Operand<'_>, to: &CType, ctx: AssignmentCtx<'_>) -> Option<String> {
     let (fk, tk) = (kind(from.ty), kind(to));
     let valid = match (fk, tk) {
-        (Kind::Void, _) => return Some(VOID_VALUE.into()),
+        (Kind::Void, _) => {
+            return Some(match ctx {
+                AssignmentCtx::Initialization | AssignmentCtx::Returning => VOID_VALUE.into(),
+                AssignmentCtx::Assignment | AssignmentCtx::Argument { .. } => VOID_USE.into(),
+            });
+        }
         // An object of type `void` cannot exist; nothing to diagnose here.
         (_, Kind::Void) => true,
         _ if record_vector_pair(fk, tk) => true,
@@ -218,11 +419,22 @@ pub(super) fn assignment(from: Operand<'_>, to: &CType) -> Option<String> {
         (Kind::NullPtr, _) => tk == Kind::Pointer || matches!(to, CType::Bool),
         _ => true,
     };
-    (!valid).then(|| {
-        format!(
-            "incompatible types (have '{}' but expected '{}')",
-            from.ty, to
-        )
+    (!valid).then(|| match ctx {
+        AssignmentCtx::Initialization => format!(
+            "incompatible types when initializing type '{to}' using type '{}'",
+            from.ty
+        ),
+        AssignmentCtx::Assignment => format!(
+            "incompatible types when assigning to type '{to}' from type '{}'",
+            from.ty
+        ),
+        AssignmentCtx::Returning => format!(
+            "incompatible types when returning type '{}' but '{to}' was expected",
+            from.ty
+        ),
+        AssignmentCtx::Argument { index, callee } => {
+            format!("incompatible type for argument {} of '{callee}'", index + 1)
+        }
     })
 }
 
@@ -247,7 +459,7 @@ pub(super) fn cast(
         _ => {}
     }
     match fk {
-        Kind::Void => return Some("invalid use of void expression".into()),
+        Kind::Void => return Some(VOID_USE.into()),
         // GCC's equal-size record/vector reinterpretation is not judged here.
         Kind::Record if kind(to) == Kind::Vector => return None,
         Kind::Record => {
@@ -279,7 +491,7 @@ pub(super) fn cast(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::types::AddressSpace;
+    use crate::common::types::{AddressSpace, EnumType};
 
     fn op(ty: &CType) -> Operand<'_> {
         Operand {
@@ -305,13 +517,34 @@ mod tests {
         let p = ptr(CType::Int);
         let vp = ptr(CType::Void);
         // Initialization / assignment.
-        assert!(assignment(op(&n), &int).is_some(), "int a = nullptr");
-        assert!(assignment(op(&n), &dbl).is_some(), "double a = nullptr");
-        assert!(assignment(op(&p), &n).is_some(), "nullptr_t m = p");
-        assert!(assignment(op(&n), &p).is_none(), "int *q = n");
-        assert!(assignment(op(&n), &bool_).is_none(), "bool b = n");
-        assert!(assignment(npc(&int), &n).is_none(), "nullptr_t m = 0");
-        assert!(assignment(op(&int), &n).is_some(), "nullptr_t m = x");
+        assert!(
+            assignment(op(&n), &int, AssignmentCtx::Assignment).is_some(),
+            "int a = nullptr"
+        );
+        assert!(
+            assignment(op(&n), &dbl, AssignmentCtx::Assignment).is_some(),
+            "double a = nullptr"
+        );
+        assert!(
+            assignment(op(&p), &n, AssignmentCtx::Assignment).is_some(),
+            "nullptr_t m = p"
+        );
+        assert!(
+            assignment(op(&n), &p, AssignmentCtx::Assignment).is_none(),
+            "int *q = n"
+        );
+        assert!(
+            assignment(op(&n), &bool_, AssignmentCtx::Assignment).is_none(),
+            "bool b = n"
+        );
+        assert!(
+            assignment(npc(&int), &n, AssignmentCtx::Assignment).is_none(),
+            "nullptr_t m = 0"
+        );
+        assert!(
+            assignment(op(&int), &n, AssignmentCtx::Assignment).is_some(),
+            "nullptr_t m = x"
+        );
         // Casts.
         assert!(cast(op(&n), &int, || false).is_some(), "(int)nullptr");
         assert!(cast(op(&n), &CType::Float, || false).is_some(), "(float)n");
@@ -363,13 +596,22 @@ mod tests {
         let s = CType::Struct("struct.S".into());
         let u = CType::Union("union.U".into());
         let (int, void, p) = (CType::Int, CType::Void, ptr(CType::Int));
-        assert!(assignment(op(&s), &int).is_some(), "int a = s");
-        assert!(assignment(op(&int), &s).is_some(), "s = 1");
         assert!(
-            assignment(op(&s), &s).is_none(),
+            assignment(op(&s), &int, AssignmentCtx::Assignment).is_some(),
+            "int a = s"
+        );
+        assert!(
+            assignment(op(&int), &s, AssignmentCtx::Assignment).is_some(),
+            "s = 1"
+        );
+        assert!(
+            assignment(op(&s), &s, AssignmentCtx::Assignment).is_none(),
             "record pairs are the caller's"
         );
-        assert!(assignment(op(&void), &int).is_some(), "int a = v()");
+        assert!(
+            assignment(op(&void), &int, AssignmentCtx::Assignment).is_some(),
+            "int a = v()"
+        );
         assert!(
             cast(op(&s), &int, || false).unwrap().contains("an integer"),
             "(int)s"
@@ -418,7 +660,10 @@ mod tests {
         );
         // A record against a vector is not judged (lccc's struct `__m128`).
         let v = CType::Vector(Box::new(CType::Float), 16);
-        assert!(assignment(op(&s), &v).is_none() && assignment(op(&v), &s).is_none());
+        assert!(
+            assignment(op(&s), &v, AssignmentCtx::Assignment).is_none()
+                && assignment(op(&v), &s, AssignmentCtx::Assignment).is_none()
+        );
         assert!(binary(BinOp::Add, op(&s), op(&v)).is_none());
         assert!(cast(op(&s), &v, || false).is_none() && conditional_arms(&s, &v).is_none());
         // Ordinary operands are untouched, including GCC's leniencies.
@@ -427,6 +672,253 @@ mod tests {
             binary(BinOp::Lt, op(&p), op(&int)).is_none(),
             "p < 1 (GCC warns)"
         );
-        assert!(assignment(op(&int), &p).is_none(), "p = 1 (GCC permerror)");
+        assert!(
+            assignment(op(&int), &p, AssignmentCtx::Assignment).is_none(),
+            "p = 1 (GCC permerror)"
+        );
+    }
+
+    /// `*` (C23 6.5.3.2p2) and the operand classes of `.`/`->` (6.5.2.3p2-p3),
+    /// measured one statement at a time on gcc-16.2; Clang 23.1.4 agrees on
+    /// every verdict (it words the messages differently, so the text here is
+    /// GCC's). Enumerations are covered end to end by
+    /// `tests/regression/check_operand_diagnostics.sh`.
+    #[test]
+    fn indirection_and_member_operands_match_gcc() {
+        let (int, dbl, void) = (CType::Int, CType::Double, CType::Void);
+        let s = CType::Struct("S".into());
+        let u = CType::Union("U".into());
+        let vec = CType::Vector(Box::new(CType::Int), 16);
+        let p = ptr(CType::Int);
+        let arr = CType::Array(Box::new(CType::Int), Some(3));
+        let func = CType::Function(Box::new(crate::common::types::FunctionType {
+            return_type: CType::Int,
+            params: Vec::new(),
+            variadic: false,
+            has_prototype: true,
+        }));
+        // Anything with pointer type is accepted; an array and a function
+        // designator convert to one, so `*a` and `*g` are legal.
+        assert!(indirection(&p).is_none(), "*p");
+        assert!(indirection(&arr).is_none(), "*a");
+        assert!(indirection(&func).is_none(), "*g");
+        // `void` operands get the value error; the rest GCC's type argument
+        // message, quoting the *integer-promoted* operand type.
+        assert_eq!(indirection(&void).as_deref(), Some(VOID_VALUE));
+        let msg = |ty: &CType| indirection(ty).unwrap();
+        assert_eq!(msg(&int), "invalid type argument of unary '*' (have 'int')");
+        assert_eq!(
+            msg(&dbl),
+            "invalid type argument of unary '*' (have 'double')"
+        );
+        assert_eq!(
+            msg(&CType::Bool),
+            "invalid type argument of unary '*' (have 'int')"
+        );
+        assert_eq!(
+            msg(&CType::Short),
+            "invalid type argument of unary '*' (have 'int')"
+        );
+        assert_eq!(
+            msg(&CType::Float),
+            "invalid type argument of unary '*' (have 'float')"
+        );
+        assert_eq!(
+            msg(&CType::ComplexDouble),
+            "invalid type argument of unary '*' (have 'complex double')"
+        );
+        assert_eq!(
+            msg(&vec),
+            "invalid type argument of unary '*' (have '__vector(4) int')"
+        );
+        assert_eq!(
+            msg(&s),
+            "invalid type argument of unary '*' (have 'struct S')"
+        );
+        assert_eq!(
+            msg(&u),
+            "invalid type argument of unary '*' (have 'union U')"
+        );
+        // `->` requires a pointer to a record; `.` requires a record.
+        assert_eq!(member_operand(&s, false), MemberOperand::Record);
+        assert_eq!(member_operand(&u, false), MemberOperand::Record);
+        assert_eq!(member_operand(&ptr(s.clone()), true), MemberOperand::Record);
+        assert_eq!(member_operand(&ptr(u.clone()), true), MemberOperand::Record);
+        // A `.` on `int *` is the plain member error; the suggestion appears
+        // only when the pointer's pointee is a record.
+        assert_eq!(member_operand(&p, false), MemberOperand::NotRecord);
+        assert_eq!(
+            member_operand(&ptr(s.clone()), false),
+            MemberOperand::Pointer
+        );
+        assert_eq!(
+            member_operand(&ptr(ptr(s.clone())), false),
+            MemberOperand::NotRecord
+        );
+        assert_eq!(member_operand(&p, true), MemberOperand::NotRecord);
+        assert_eq!(
+            member_operand(&ptr(ptr(s.clone())), true),
+            MemberOperand::PointerToPointer
+        );
+        assert_eq!(
+            member_operand(&ptr(ptr(CType::Int)), true),
+            MemberOperand::NotRecord
+        );
+        // An ext vector's lanes are selected, not looked up as members, so a
+        // pointer to one is accepted here and validated by the selector check.
+        let ext = CType::ExtVector(
+            Box::new(CType::Int),
+            crate::common::types::ExtVectorLayout::new(&CType::Int, 4).unwrap(),
+        );
+        assert_eq!(member_operand(&ext, false), MemberOperand::Record);
+        assert_eq!(
+            member_operand(&ptr(ext.clone()), true),
+            MemberOperand::Record
+        );
+        assert_eq!(member_operand(&ptr(ext), false), MemberOperand::Pointer);
+        assert_eq!(
+            member_operand(&ptr(ptr(void.clone())), true),
+            MemberOperand::NotRecord
+        );
+        assert_eq!(
+            member_operand(&ptr(void.clone()), true),
+            MemberOperand::VoidPointer
+        );
+        assert_eq!(member_operand(&arr, false), MemberOperand::NotRecord);
+        assert_eq!(member_operand(&arr, true), MemberOperand::NotRecord);
+        assert_eq!(member_operand(&func, true), MemberOperand::NotRecord);
+        assert_eq!(member_operand(&int, false), MemberOperand::NotRecord);
+        assert_eq!(member_operand(&int, true), MemberOperand::NotPointer);
+        assert_eq!(member_operand(&dbl, true), MemberOperand::NotPointer);
+        assert_eq!(member_operand(&s, true), MemberOperand::NotPointer);
+        // `void *` is a pointer, so `*p` warns (GNU extension) and yields the
+        // `void` the value rules then judge.
+        assert!(is_void_pointer(&ptr(void.clone())));
+        assert!(!is_void_pointer(&p));
+        assert!(!is_void_pointer(&ptr(ptr(void.clone()))));
+        assert!(!is_void_pointer(&void));
+    }
+
+    /// The quoted type spelling of the operand messages is gcc-16.2's
+    /// `type_to_string`, not C declaration syntax.
+    #[test]
+    fn quoted_types_use_gcc_spelling() {
+        assert_eq!(type_name(&CType::Int), "int");
+        assert_eq!(type_name(&CType::UInt), "unsigned int");
+        assert_eq!(type_name(&CType::Long), "long int");
+        assert_eq!(type_name(&CType::ULong), "long unsigned int");
+        assert_eq!(type_name(&CType::LongLong), "long long int");
+        assert_eq!(type_name(&CType::ULongLong), "long long unsigned int");
+        assert_eq!(type_name(&CType::Int128), "__int128");
+        assert_eq!(type_name(&CType::UInt128), "__int128 unsigned");
+        assert_eq!(type_name(&CType::Float), "float");
+        assert_eq!(type_name(&CType::Float16), "_Float16");
+        assert_eq!(type_name(&CType::ComplexFloat), "complex float");
+        assert_eq!(type_name(&CType::ComplexLongDouble), "complex long double");
+        assert_eq!(
+            type_name(&CType::Vector(Box::new(CType::Int), 16)),
+            "__vector(4) int"
+        );
+        assert_eq!(
+            type_name(&CType::Vector(Box::new(CType::Double), 32)),
+            "__vector(4) double"
+        );
+        assert_eq!(type_name(&ptr(CType::Int)), "int *");
+        assert_eq!(
+            type_name(&ptr(CType::Array(Box::new(CType::Int), Some(3)))),
+            "int (*)[3]"
+        );
+        let f = CType::Function(Box::new(crate::common::types::FunctionType {
+            return_type: CType::Int,
+            params: vec![(CType::Int, None)],
+            variadic: false,
+            has_prototype: true,
+        }));
+        assert_eq!(type_name(&f), "int(int)");
+        assert_eq!(type_name(&ptr(f)), "int (*)(int)");
+        assert_eq!(
+            type_name(&CType::Function(Box::new(
+                crate::common::types::FunctionType {
+                    return_type: CType::Void,
+                    params: Vec::new(),
+                    variadic: true,
+                    has_prototype: false,
+                }
+            ))),
+            "void(...)"
+        );
+        assert_eq!(type_name(&CType::Struct("S".into())), "struct S");
+        assert_eq!(
+            type_name(&CType::Struct("__anon_struct_7".into())),
+            "struct <anonymous>"
+        );
+        // An enumeration quotes its compatible type once promoted, so the
+        // enum spelling itself only matters for a bare `type_name` call.
+        let e = CType::Enum(EnumType {
+            name: Some("E".into()),
+            variants: vec![("A".into(), 0)],
+            is_packed: false,
+            fixed: None,
+        });
+        assert_eq!(type_name(&e), "enum E");
+        assert_eq!(type_name(&e.integer_promoted()), "unsigned int");
+    }
+
+    /// GCC words an incompatible record conversion differently in each
+    /// context, and uses both of its `void` diagnostics (measured).
+    #[test]
+    fn conversions_are_worded_per_context() {
+        let (int, void) = (CType::Int, CType::Void);
+        let s = CType::Struct("S".into());
+        let arg = || AssignmentCtx::Argument {
+            index: 0,
+            callee: "h",
+        };
+        assert_eq!(
+            assignment(op(&s), &int, AssignmentCtx::Initialization).unwrap(),
+            "incompatible types when initializing type 'int' using type 'struct S'"
+        );
+        assert_eq!(
+            assignment(op(&s), &int, AssignmentCtx::Assignment).unwrap(),
+            "incompatible types when assigning to type 'int' from type 'struct S'"
+        );
+        assert_eq!(
+            assignment(op(&s), &int, AssignmentCtx::Returning).unwrap(),
+            "incompatible types when returning type 'struct S' but 'int' was expected"
+        );
+        assert_eq!(
+            assignment(op(&s), &int, arg()).unwrap(),
+            "incompatible type for argument 1 of 'h'"
+        );
+        assert_eq!(
+            assignment(op(&void), &int, AssignmentCtx::Initialization).unwrap(),
+            VOID_VALUE
+        );
+        assert_eq!(
+            assignment(op(&void), &int, AssignmentCtx::Returning).unwrap(),
+            VOID_VALUE
+        );
+        assert_eq!(
+            assignment(op(&void), &int, AssignmentCtx::Assignment).unwrap(),
+            VOID_USE
+        );
+        assert_eq!(assignment(op(&void), &int, arg()).unwrap(), VOID_USE);
+        // A matching record pair converts (C23 6.5.16.1p1) and so does a
+        // record-to-record copy of the same type.
+        assert!(assignment(op(&s), &s, AssignmentCtx::Assignment).is_none());
+    }
+
+    /// Two records in `?:` convert only when they are the same type.
+    #[test]
+    fn conditional_rejects_distinct_records() {
+        let (s, t, u) = (
+            CType::Struct("S".into()),
+            CType::Struct("T".into()),
+            CType::Union("U".into()),
+        );
+        assert!(conditional_arms(&s, &s).is_none());
+        assert!(conditional_arms(&s, &t).is_some());
+        assert!(conditional_arms(&s, &u).is_some());
+        assert!(conditional_arms(&s, &CType::Int).is_some());
     }
 }

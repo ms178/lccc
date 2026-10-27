@@ -811,6 +811,13 @@ gate "shuffle-diagnostics" fast \
 gate "gcc162-diagnostic-severity" fast \
     env CCC="$LCCC" GCC="${GCC16:-gcc-16}" bash tests/regression/check_gcc162_diagnostic_severity.sh
 
+# The operand constraints of C23 6.5.2.3 and 6.5.3.2 -- `*` on a non-pointer,
+# `.`/`->` on the wrong operand, the two `void` operand wordings, the
+# per-context record conversion messages and the `void *` indirection warning
+# with its -w/-Werror behaviour -- pinned line/column/message to gcc-16.2.
+gate "operand-diagnostics" fast \
+    env CCC="$LCCC" GCC="${GCC16:-gcc-16}" bash tests/regression/check_operand_diagnostics.sh
+
 # Clang ext_vector_type component access against the Clang 23.1.4 oracle:
 # LCCC's diagnostics for ext_vector_select/errors.c equal Clang's (line,
 # column, message), LCCC accepts exactly the forms Clang accepts and puts the
