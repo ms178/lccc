@@ -4392,7 +4392,14 @@ impl SemanticAnalyzer {
             // differences are accepted, so the verdict is the very function
             // the argument path uses.
             let both_pointers = matches!((&t, &e), (CType::Pointer(..), CType::Pointer(..)));
+            // C23 6.5.15p6: a null pointer constant arm takes the type of the
+            // other pointer arm, so `c ? gp : (void *)0` never converts between
+            // incompatible pointer types -- gcc-16.2 accepts it in every
+            // address space (tests/regression/seg_conv/parity_table.tsv).
+            let null_arm = self.expr_type_checker().is_null_pointer_constant(then_expr)
+                || self.expr_type_checker().is_null_pointer_constant(else_expr);
             if both_pointers
+                && !null_arm
                 && pointer_argument_compat(&t, &e) == PtrCompat::Incompatible
                 && pointer_argument_compat(&e, &t) == PtrCompat::Incompatible
             {
