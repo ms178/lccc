@@ -99,8 +99,7 @@ pub(crate) fn demorgan_debug_enabled() -> bool {
         // Exploratory (metric-only) emissions of the dual-layout selection
         // do not describe shipped code: their traces would double the
         // count-based assertions in check_demorgan_branch_split.
-        && !crate::backend::state::EXPLORATORY_EMISSION
-            .load(std::sync::atomic::Ordering::Relaxed)
+        && !crate::backend::state::EXPLORATORY_EMISSION.with(std::cell::Cell::get)
 }
 
 pub(crate) fn compute_cmp_replay_scan(
@@ -2084,13 +2083,11 @@ impl X86Codegen {
         false_val: &Operand,
         ty: IrType,
     ) -> bool {
-        // VEX only: the OQ predicates 13/14/17/18 exist solely in the
-        // 32-predicate VEX encoding, and `blendvpd` without VEX is SSE4.1
-        // with an implicit %xmm0 mask.  Under legacy SSE the caller's
-        // ucomisd + setcc/branch path is used instead (GCC does the same at
-        // -mno-avx).
+        // The OQ predicates 13/14/17/18 exist solely in the 32-predicate VEX
+        // encoding, and `blendvpd` without VEX is SSE4.1 with an implicit
+        // %xmm0 mask, so legacy SSE takes the cmpsd + logic-op bit select.
         if !self.isa.avx {
-            return false;
+            return self.try_emit_fp_select_sse_mask(dest, op, lhs, rhs, true_val, false_val, ty);
         }
         // vcmpsd predicate per the ucomisd-setcc semantics:
         //   * Eq  → EQ_OQ (0):  ordered equal, NaN → false  (setnp&sete)
@@ -2220,6 +2217,155 @@ impl X86Codegen {
         ));
         self.store_xmm0_fp_dest(dest, ty);
         return true;
+    }
+
+    /// S05 FP-SELECT under legacy SSE (SSE1 for F32, SSE2 for F64): the
+    /// select is a bit select over a `cmpss`/`cmpsd` mask, never a GPR
+    /// `cmov`. The `cmov` fallback costs three XMM<->GPR crossings per
+    /// select; llvm-mca 23.1.4 on glibc's `floor` select chain measures
+    /// 40.0 -> 29.0 cycles/iteration (alderlake) and 28.0 -> 26.0 (znver4),
+    /// with fewer uops and no branch-misprediction exposure. LLVM's X86
+    /// `LowerSELECT` uses the same FSETCC + logic shape without SSE4.1.
+    ///
+    /// Predicates: legacy `cmpsd` has only imm 0-7, so `>`/`>=` swap the
+    /// operands into LT/LE. EQ (0) is false on unordered, NEQ (4) true,
+    /// LT (1)/LE (2) false: the same results as the VEX OQ predicates and
+    /// the ucomisd `seta`/`setae` fallback. LT/LE are the signaling forms,
+    /// which is what C Annex F requires of relational operators (GCC emits
+    /// `comisd` there); values are unaffected either way.
+    ///
+    /// Select: `F ^ ((T ^ F) & mask)` lands in the destination home without
+    /// a final move. A +0.0 arm needs one logic op (`andps` / `andnps`);
+    /// -0.0 is not all-zero bits and takes the generic select. Scalar lanes
+    /// only: upper lanes are don't-care, exactly as for the VEX blend.
+    /// Register contract as for `try_emit_fp_select_blend`: homes are
+    /// xmm2-xmm15, xmm0/xmm1 are scratch.
+    fn try_emit_fp_select_sse_mask(
+        &mut self,
+        dest: &Value,
+        op: IrCmpOp,
+        lhs: &Operand,
+        rhs: &Operand,
+        true_val: &Operand,
+        false_val: &Operand,
+        ty: IrType,
+    ) -> bool {
+        let (imm, swap): (u8, bool) = match op {
+            IrCmpOp::Eq => (0, false),
+            IrCmpOp::Ne => (4, false),
+            IrCmpOp::Slt | IrCmpOp::Ult => (1, false),
+            IrCmpOp::Sle | IrCmpOp::Ule => (2, false),
+            IrCmpOp::Sgt | IrCmpOp::Ugt => (1, true),
+            IrCmpOp::Sge | IrCmpOp::Uge => (2, true),
+        };
+        let (first, second) = if swap { (rhs, lhs) } else { (lhs, rhs) };
+        let (cmp, xor, and, andn, mov) = if ty == IrType::F64 {
+            ("cmpsd", "xorpd", "andpd", "andnpd", "movapd")
+        } else {
+            ("cmpss", "xorps", "andps", "andnps", "movaps")
+        };
+        let is_pos_zero = |op: &Operand| match op {
+            Operand::Const(IrConst::F64(c)) => c.to_bits() == 0,
+            Operand::Const(IrConst::F32(c)) => c.to_bits() == 0,
+            _ => false,
+        };
+
+        if let Some(d) = self.dest_reg(dest).filter(|r| is_xmm_reg(*r)) {
+            let d_name = phys_reg_name(d);
+            // 1. mask -> %xmm0 (the compare runs before any arm staging can
+            //    overwrite a home it reads).
+            self.emit_fp_operand_to_xmm(first, ty, "xmm0");
+            let src = match self.fp_src_mem_operand(second, ty) {
+                Some(s) => s,
+                None => {
+                    self.emit_fp_operand_to_xmm(second, ty, "xmm1");
+                    "%xmm1".to_string()
+                }
+            };
+            self.state
+                .emit_fmt(format_args!("    {cmp} ${imm}, {src}, %xmm0"));
+            if is_pos_zero(false_val) {
+                // mask ? T : +0.0 == T & mask.
+                self.emit_fp_operand_to_xmm(true_val, ty, d_name);
+                self.state
+                    .emit_fmt(format_args!("    {and} %xmm0, %{d_name}"));
+            } else if is_pos_zero(true_val) {
+                // mask ? +0.0 : F == F & ~mask.
+                self.emit_fp_operand_to_xmm(false_val, ty, d_name);
+                self.state
+                    .emit_fmt(format_args!("    {andn} %{d_name}, %xmm0"));
+                self.state
+                    .emit_fmt(format_args!("    {mov} %xmm0, %{d_name}"));
+            } else if let Some(f_name) = match false_val {
+                Operand::Value(v) => self
+                    .reg_assignments
+                    .get(&v.0)
+                    .copied()
+                    .filter(|r| is_xmm_reg(*r) && *r != d)
+                    .map(phys_reg_name),
+                _ => None,
+            } {
+                // F lives in another XMM register: build the select in the
+                // destination, dest = ((T ^ F) & mask) ^ F, with no scratch
+                // copy (T -> dest is a no-op when T already lives there).
+                self.emit_fp_operand_to_xmm(true_val, ty, d_name);
+                self.state
+                    .emit_fmt(format_args!("    {xor} %{f_name}, %{d_name}"));
+                self.state
+                    .emit_fmt(format_args!("    {and} %xmm0, %{d_name}"));
+                self.state
+                    .emit_fmt(format_args!("    {xor} %{f_name}, %{d_name}"));
+            } else {
+                // 2. T -> %xmm1 BEFORE F can overwrite a shared home.
+                self.emit_fp_operand_to_xmm(true_val, ty, "xmm1");
+                // 3. F -> dest home (no-op when it already lives there).
+                self.emit_fp_operand_to_xmm(false_val, ty, d_name);
+                // 4. dest = F ^ ((T ^ F) & mask).
+                self.state
+                    .emit_fmt(format_args!("    {xor} %{d_name}, %xmm1"));
+                self.state.emit_fmt(format_args!("    {and} %xmm0, %xmm1"));
+                self.state
+                    .emit_fmt(format_args!("    {xor} %xmm1, %{d_name}"));
+            }
+            self.state.reg_cache.invalidate_acc();
+            return true;
+        }
+
+        // No XMM home for the destination: select into the %xmm0
+        // accumulator. With only two scratch registers the FALSE arm must be
+        // XMM-homed (the same budget rule as the VEX blend's Case B).
+        let false_home = match false_val {
+            Operand::Value(v) => self
+                .reg_assignments
+                .get(&v.0)
+                .copied()
+                .filter(|r| is_xmm_reg(*r)),
+            _ => None,
+        };
+        let Some(f_reg) = false_home else {
+            return false;
+        };
+        let f_name = phys_reg_name(f_reg);
+        // 1. mask -> %xmm1.
+        self.emit_fp_operand_to_xmm(first, ty, "xmm1");
+        let src = match self.fp_src_mem_operand(second, ty) {
+            Some(s) => s,
+            None => {
+                self.emit_fp_operand_to_xmm(second, ty, "xmm0");
+                "%xmm0".to_string()
+            }
+        };
+        self.state
+            .emit_fmt(format_args!("    {cmp} ${imm}, {src}, %xmm1"));
+        // 2. xmm0 = F ^ ((T ^ F) & mask).
+        self.emit_fp_operand_to_xmm(true_val, ty, "xmm0");
+        self.state
+            .emit_fmt(format_args!("    {xor} %{f_name}, %xmm0"));
+        self.state.emit_fmt(format_args!("    {and} %xmm1, %xmm0"));
+        self.state
+            .emit_fmt(format_args!("    {xor} %{f_name}, %xmm0"));
+        self.store_xmm0_fp_dest(dest, ty);
+        true
     }
 
     /// Is this select arm the address of an over-aligned (> 16) alloca?

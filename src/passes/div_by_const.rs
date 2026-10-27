@@ -297,6 +297,15 @@ pub(crate) fn div_by_const_function(func: &mut IrFunction) -> usize {
 
                     if let Some(divisor) = const_val {
                         let expanded = match op {
+                            IrBinOp::SDiv | IrBinOp::SRem if is_signed_type_min(divisor, *ty) => {
+                                Some(expand_by_signed_type_min(
+                                    *dest,
+                                    lhs,
+                                    *op == IrBinOp::SRem,
+                                    *ty,
+                                    &mut next_id,
+                                ))
+                            }
                             IrBinOp::UDiv => {
                                 let udivisor = divisor as u64;
                                 if udivisor >= 2 && udivisor <= u32::MAX as u64 {
@@ -1750,6 +1759,72 @@ fn expand_sdiv_neg(
     Some(insts)
 }
 
+/// Whether `divisor` is the most negative value of the signed word `ty`
+/// (`INT_MIN` for I32, `LLONG_MIN` for I64).
+fn is_signed_type_min(divisor: i64, ty: IrType) -> bool {
+    match ty {
+        IrType::I32 => divisor == i64::from(i32::MIN),
+        IrType::I64 => divisor == i64::MIN,
+        _ => false,
+    }
+}
+
+/// `x / MIN` and `x % MIN` for the word's most negative value.  Every
+/// dividend but `MIN` itself has `|x| < |MIN|`, so the truncating quotient is
+/// `x == MIN` and the remainder is `x`, except `0` at `MIN`.  One compare
+/// (plus a `cmov` for the remainder) replaces an `idiv`, which costs 10-18
+/// cycles on Golden Cove and Zen 4 and is not pipelined; GCC 16.2 emits the
+/// same compare.  Neither result can trap: `MIN / MIN` is 1 and `MIN % MIN`
+/// is 0, both representable.
+///
+/// The compare yields a C `int`, so the I64 quotient widens it exactly as the
+/// front end widens `(long)(x == y)`.
+fn expand_by_signed_type_min(
+    dest: Value,
+    x: &Operand,
+    remainder: bool,
+    ty: IrType,
+    next_id: &mut u32,
+) -> Vec<Instruction> {
+    let min = match ty {
+        IrType::I32 => IrConst::I32(i32::MIN),
+        _ => IrConst::I64(i64::MIN),
+    };
+    let is_min = |dest| Instruction::Cmp {
+        dest,
+        op: IrCmpOp::Eq,
+        lhs: *x,
+        rhs: Operand::Const(min),
+        ty,
+    };
+    if remainder {
+        let hit = fresh_value(next_id);
+        return vec![
+            is_min(hit),
+            Instruction::Select {
+                dest,
+                cond: Operand::Value(hit),
+                true_val: Operand::Const(IrConst::from_i64(0, ty)),
+                false_val: *x,
+                ty,
+            },
+        ];
+    }
+    if ty == IrType::I32 {
+        return vec![is_min(dest)];
+    }
+    let hit = fresh_value(next_id);
+    vec![
+        is_min(hit),
+        Instruction::Cast {
+            dest,
+            src: Operand::Value(hit),
+            from_ty: IrType::I32,
+            to_ty: IrType::I64,
+        },
+    ]
+}
+
 fn expand_urem32_in_i64(
     dest: Value,
     x: &Operand,
@@ -2428,6 +2503,20 @@ mod tests {
                     (*dest, i32::from(truth))
                 }
                 Instruction::Copy { dest, src } => (*dest, read(&env, src)),
+                Instruction::Select {
+                    dest,
+                    cond,
+                    true_val,
+                    false_val,
+                    ..
+                } => {
+                    let pick = if read(&env, cond) != 0 {
+                        true_val
+                    } else {
+                        false_val
+                    };
+                    (*dest, read(&env, pick))
+                }
                 other => panic!("unexpected instruction in a 32-bit expansion: {other:?}"),
             };
             env.insert(d.0, v);
@@ -2610,6 +2699,75 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `x / MIN` and `x % MIN` match C's truncating semantics at the
+    /// boundaries, are a compare rather than an `idiv`, and the dispatcher
+    /// routes both widths there.
+    #[test]
+    fn signed_type_min_divisor_is_a_compare() {
+        let (x, q) = (Value(1), Value(0));
+        let cases32 = [
+            i32::MIN,
+            i32::MIN + 1,
+            -2,
+            -1,
+            0,
+            1,
+            2,
+            i32::MAX - 1,
+            i32::MAX,
+        ];
+        for remainder in [false, true] {
+            let mut next = 2;
+            let insts =
+                expand_by_signed_type_min(q, &Operand::Value(x), remainder, IrType::I32, &mut next);
+            assert!(insts.len() <= 2, "{insts:?}");
+            for &v in &cases32 {
+                let want = if remainder {
+                    v.wrapping_rem(i32::MIN)
+                } else {
+                    v.wrapping_div(i32::MIN)
+                };
+                assert_eq!(
+                    run_expansion32(&insts, (x, v), q),
+                    want,
+                    "x={v} rem={remainder}"
+                );
+            }
+        }
+        let cases64 = [
+            i64::MIN,
+            i64::MIN + 1,
+            i64::from(i32::MIN),
+            -1,
+            0,
+            1,
+            i64::MAX,
+        ];
+        for remainder in [false, true] {
+            let mut next = 2;
+            let insts =
+                expand_by_signed_type_min(q, &Operand::Value(x), remainder, IrType::I64, &mut next);
+            assert!(insts.len() <= 2, "{insts:?}");
+            for &v in &cases64 {
+                let want = if remainder {
+                    v.wrapping_rem(i64::MIN)
+                } else {
+                    v.wrapping_div(i64::MIN)
+                };
+                assert_eq!(
+                    run_expansion(&insts, (x, v), q),
+                    want,
+                    "x={v} rem={remainder}"
+                );
+            }
+        }
+        assert!(is_signed_type_min(i64::from(i32::MIN), IrType::I32));
+        assert!(is_signed_type_min(i64::MIN, IrType::I64));
+        // An I64 division by INT_MIN is an ordinary power of two, not MIN.
+        assert!(!is_signed_type_min(i64::from(i32::MIN), IrType::I64));
+        assert!(!is_signed_type_min(i64::MIN, IrType::U64));
     }
 }
 

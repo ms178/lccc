@@ -177,6 +177,11 @@ if bad:
     print(f"FAIL: {len(bad)} CFI invariant violations", file=sys.stderr)
     for b in bad[:40]:
         print("  " + b, file=sys.stderr)
+    # Preserve actionable failures in GitHub's check annotations even when
+    # the full Actions log receiver is unavailable to reviewers.
+    for b in bad[:20]:
+        escaped = b.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+        print(f"::error title=CFI invariant::{escaped}", file=sys.stderr)
     sys.exit(1)
 print(f"PASS: CFI invariants hold ({nfn} functions, {nret} returns)")
 PY

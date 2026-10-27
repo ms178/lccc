@@ -38,8 +38,8 @@ pub(super) const RBP_OFFSET_NONE: i32 = i32::MIN;
 /// Compact classification of a single assembly line.
 /// Stored in a parallel array alongside the raw text, so hot loops
 /// can check integer fields instead of re-parsing strings.
-#[derive(Clone, Copy, Hash)]
-#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+#[cfg_attr(test, derive(Debug))]
 pub(super) struct LineInfo {
     pub(super) kind: LineKind,
     /// Pre-parsed extension classification for redundant extension elimination.

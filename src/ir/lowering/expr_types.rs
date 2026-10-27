@@ -158,15 +158,17 @@ impl Lowerer {
                     }
                 }
                 match name.as_str() {
-                    "__builtin_shufflevector" => return Some(16),
-                    "__builtin_shuffle" => {
+                    "__builtin_shuffle" | "__builtin_shufflevector" => {
                         let bytes = match self.get_expr_ctype(expr) {
                             Some(ct) if ct.is_vector() => ct.size(),
                             // Not resolvable: keep the historical packed
                             // answer rather than inventing a size.
                             _ => return None,
                         };
-                        if bytes > 8 {
+                        // The lowering packs only results of at most 8 bytes
+                        // on x86-64 (`call_result_is_packed`); everything else,
+                        // every i686 result included, is the object's address.
+                        if bytes > 8 || crate::common::types::target_is_32bit() {
                             return Some(bytes);
                         }
                         return None;
@@ -401,7 +403,6 @@ impl Lowerer {
             return Some(IrType::Ptr);
         }
         match name {
-            "__builtin_shufflevector" => Some(IrType::Ptr),
             // x86 vector scalar extractions with 64-bit results (long long /
             // unsigned long long). Without these the call was typed with the
             // target int (I32 on i686): every consumer sign-extended the low
@@ -1853,6 +1854,20 @@ impl Lowerer {
                     }
                     if name == "__builtin_choose_expr" && args.len() >= 3 {
                         return self.get_expr_ctype(self.resolve_builtin_choose_expr(args));
+                    }
+                    // Sema's cache does not cover `typeof` operands, which
+                    // reach here: without this, `typeof(__builtin_shuffle(a, m))`
+                    // fell back to `int` with only a warning.
+                    if matches!(
+                        name.as_str(),
+                        "__builtin_shuffle" | "__builtin_shufflevector"
+                    ) {
+                        if let Some(result) = args.first().and_then(|first| {
+                            let first = self.get_expr_ctype(first)?;
+                            CType::shuffle_builtin_result(name, &first, args.len())
+                        }) {
+                            return Some(result);
+                        }
                     }
                     if Self::is_polymorphic_atomic_builtin(name) {
                         if let Some(first_arg) = args.first() {

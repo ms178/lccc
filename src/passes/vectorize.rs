@@ -91,6 +91,9 @@
 
 #[path = "vectorize_byte_count_normalize.rs"]
 mod byte_count_normalize;
+#[cfg(test)]
+#[path = "vectorize_byte_sum_tests.rs"]
+mod byte_sum_tests;
 #[path = "vectorize_generator_map.rs"]
 mod generator_map;
 #[path = "vectorize_strict_recip.rs"]
@@ -861,15 +864,15 @@ fn vectorize_with_analysis_mode(
         } else if !neon
             && !force_two_wide
             && !late_minmax_only()
-            && !force_sse2
-            && x86_avx2_available()
+            && byte_sum_width(force_sse2).is_some()
             && let Some(count_pattern) = analyze_byte_count_loop(func, loop_info, cfg)
         {
-            // Byte-predicate counting reduction (`c += pred(s[i])`): the
-            // strlen/memchr/ctype-classifier family.  AVX2-only by
-            // construction (`vpsadbw` over 32 byte lanes); the analysis
-            // fails closed for every shape the packed form cannot express
-            // exactly, and the loop keeps its scalar form on those paths.
+            // Byte-sum reduction: predicate counts (`c += pred(s[i])`, the
+            // strlen/memchr/ctype-classifier family) and byte sums
+            // (`s += p[i]`), `vpsadbw` over 32 lanes with AVX2 or `psadbw`
+            // over 16 on the SSE2 baseline.  The analysis fails closed for
+            // every shape the packed form cannot express exactly, and the
+            // loop keeps its scalar form on those paths.
             let n = transform_byte_count_reduction(func, &count_pattern);
             if n > 0 {
                 if debug {
@@ -884,8 +887,7 @@ fn vectorize_with_analysis_mode(
         } else if !neon
             && !force_two_wide
             && !late_minmax_only()
-            && !force_sse2
-            && x86_avx2_available()
+            && byte_sum_width(force_sse2).is_some()
             && normalize_byte_count
             && let n = byte_count_normalize::transform(func, loop_info, cfg)
             && n > 0
@@ -943,16 +945,18 @@ fn vectorize_with_analysis_mode(
                 }
                 continue;
             }
-            // The one non-min/max late admission: the guarded I32→I64
-            // widening sum (`if (a[i] > k) s += a[i]`). It is the ONLY
-            // reduction shape the early run can structurally never see in
-            // transformable form — before if_convert the guard is still a
+            // The non-min/max late admission: the guarded I32 sum
+            // (`if (a[i] > k) s += a[i]`), widening into a `long` or
+            // equal-width into an `int`. These are the reduction shapes the
+            // early run can structurally never see in transformable form —
+            // before if_convert the guard is still a
             // body branch (the internal-CondBranch legality check rejects
             // it), and after if_convert the Select form exists but the
             // early run has already finished. The late rerun's masked
             // value-shaped composite (VecWidenMaskedAddValueI32x4ToI64x2
-            // on SSE2, VecWidenMaskedAddI32x4ToI64x2 on AVX2) handles
-            // exactly this shape. Kept out on purpose: unguarded sums
+            // on SSE2, VecWidenMaskedAddI32x4ToI64x4 on AVX2) handles the
+            // widening shape; VecMaskedAddI32x8 (AVX2) / VecMaskedAddValueI32x4
+            // (SSE2) the equal-width one. Kept out on purpose: unguarded sums
             // (the adler32 s1/s2 class) and every other kind still fail
             // closed here — the original unrestricted rerun measured
             // +1.05 % retired instructions on zlib_ng_adler32 for
@@ -962,7 +966,7 @@ fn vectorize_with_analysis_mode(
                 && !matches!(red_pattern.kind, ReductionKind::Min | ReductionKind::Max)
                 && !(red_pattern.kind == ReductionKind::Sum
                     && red_pattern.element_type == IrType::I32
-                    && red_pattern.accumulator_type == IrType::I64
+                    && matches!(red_pattern.accumulator_type, IrType::I64 | IrType::I32)
                     && red_pattern.guard_cond.is_some())
             {
                 if debug {
@@ -1332,7 +1336,7 @@ struct ReductionPattern {
     /// Conditional-sum guard: the Cmp value feeding the Select that wraps
     /// the accumulator update (`if (a[i] > 0) s += a[i]`). None for plain
     /// reductions. The transform emits the MASKED widening add
-    /// (VecWidenMaskedAddI32x4ToI64x2) for this shape.
+    /// (VecWidenMaskedAddI32x4ToI64x4) for this shape.
     guard_cond: Option<Value>,
     /// The guard comparison's rhs operand (validated: the comparison is
     /// `loaded_lane > guard_rhs`, signed, lhs = the loaded element).
@@ -3685,6 +3689,483 @@ fn reduction_remainder_types_supported(iv_ty: IrType, limit_ty: IrType, signed: 
     matches!(iv_ty, IrType::I32 | IrType::I64) && limit_ty == iv_ty && signed
 }
 
+/// Rewrite the guard compare of a conditional sum into the one form the
+/// masked composites and the scalar remainder encode, `loaded > rhs` (signed,
+/// element type), returning that `rhs`.  Accepted spellings:
+///
+/// * `loaded > r`  -> `r`
+/// * `r < loaded`  -> `r`              (the same predicate, operands mirrored)
+/// * `loaded >= c` -> `c - 1`          (constant `c`, I32, `c != INT_MIN`)
+/// * `c <= loaded` -> `c - 1`          (mirrored)
+///
+/// `c - 1` is exact for every `c > INT_MIN`: `a >= c` iff `a > c - 1` over
+/// the signed integers.  `c == INT_MIN` would wrap (and `a >= INT_MIN` is a
+/// tautology, a different fold), so it stays scalar.  A run-time `r` is only
+/// accepted for the strict forms -- `r - 1` would need an instruction and
+/// overflow reasoning.
+fn canonical_sgt_guard_rhs(
+    op: IrCmpOp,
+    lhs: &Operand,
+    rhs: &Operand,
+    ty: IrType,
+    loaded: Value,
+) -> Option<Operand> {
+    let is_loaded = |o: &Operand| matches!(o, Operand::Value(v) if v.0 == loaded.0);
+    let minus_one = |o: &Operand| -> Option<Operand> {
+        let Operand::Const(c) = o else { return None };
+        let c = i32::try_from(c.to_i64()?).ok()?;
+        (ty == IrType::I32 && c != i32::MIN).then(|| Operand::Const(IrConst::I32(c - 1)))
+    };
+    match op {
+        IrCmpOp::Sgt if is_loaded(lhs) && !is_loaded(rhs) => Some(*rhs),
+        IrCmpOp::Slt if is_loaded(rhs) && !is_loaded(lhs) => Some(*lhs),
+        IrCmpOp::Sge if is_loaded(lhs) => minus_one(rhs),
+        IrCmpOp::Sle if is_loaded(rhs) => minus_one(lhs),
+        _ => None,
+    }
+}
+
+/// The masked composites read the guard `rhs` once per vector step (and
+/// `hoist_masked_guard_splats` splats it once in the preheader), never per
+/// lane, so a `rhs` defined inside the loop — a header phi, a second load,
+/// anything recomputed per iteration — would be read stale for every lane
+/// but the first. Constants and values defined outside the loop qualify;
+/// anything else keeps the loop scalar.
+fn guard_rhs_is_loop_invariant(func: &IrFunction, body: &FxHashSet<usize>, rhs: &Operand) -> bool {
+    let Operand::Value(v) = rhs else {
+        return true;
+    };
+    !body.iter().any(|&bi| {
+        func.blocks.get(bi).is_some_and(|b| {
+            b.instructions
+                .iter()
+                .any(|i| i.dest().is_some_and(|d| d.0 == v.0))
+        })
+    })
+}
+
+/// Hoist the run-time guard of every masked reduction step out of its loop.
+///
+/// The masked steps take the `lane > rhs` guard as a scalar, so a run-time
+/// `rhs` used to be re-broadcast every iteration (`movd` + `pshufd` /
+/// `vpbroadcastd`, two µops on the loop's critical port per step, and per
+/// interleave slice). The splat is loop-invariant: build it ONCE as a
+/// `VecBroadcastI32x8` (the 256-bit equal-width step) or `VecBroadcastI32x4`
+/// (every 128-bit compare) at the end of the loop's unique out-of-loop
+/// predecessor and pass the vector in the guard slot
+/// (`IntrinsicOp::masked_guard_arg_index`). The register allocator then
+/// homes it like any map broadcast (guard slot only, fail-closed), and the
+/// emitters compare against the home directly.
+///
+/// Soundness: the broadcast is pure, so speculating it on a preheader that
+/// also branches elsewhere is free of side effects. `rhs` is defined outside
+/// the loop (re-checked here, not trusted from the analyzer) and used inside
+/// it, so in SSA its definition dominates the header and therefore the
+/// unique preheader — never block 0, where a later-defined `rhs` would not
+/// exist yet. Loops without a unique preheader keep the in-loop splat.
+/// Constant guards compare against a folded `.rodata` splat — except a ZERO
+/// guard on the AVX memory-shaped steps (`VecMaskedAddI32x8`,
+/// `VecWidenMaskedAddI32x4ToI64x4`): hoisting a zero splat there lets the
+/// emitter fold the lane load into `vpmaxsd MEM, %zero, %dst` (max(lane, 0)
+/// is the masked lane), one instruction where the rodata form needs a
+/// separate load. The SSE2 value-shaped steps have no load to fold, so their
+/// zero guard stays a rodata `pmaxsd`. One broadcast per (preheader, rhs,
+/// width): interleave slices and twin accumulators share it. Returns the
+/// number of guard slots rewritten.
+pub(crate) fn hoist_masked_guard_splats(func: &mut IrFunction) -> usize {
+    // The AVX memory-shaped steps, whose lane load a register zero lets the
+    // emitter fold into `vpmaxsd`.
+    let folds_zero_guard = |op: &IntrinsicOp| {
+        matches!(
+            op,
+            IntrinsicOp::VecMaskedAddI32x8 | IntrinsicOp::VecWidenMaskedAddI32x4ToI64x4
+        )
+    };
+    let is_zero = |a: &Operand| matches!(a, Operand::Const(c) if c.to_i64() == Some(0));
+    let hoistable = |op: &IntrinsicOp, a: &Operand| match a {
+        Operand::Value(_) => true,
+        Operand::Const(_) => folds_zero_guard(op) && is_zero(a),
+    };
+    let has_candidate = func.blocks.iter().flat_map(|b| &b.instructions).any(|i| {
+        matches!(i, Instruction::Intrinsic { op, args, .. }
+            if op.masked_guard_arg_index().and_then(|g| args.get(g)).is_some_and(|a| hoistable(op, a)))
+    });
+    if !has_candidate {
+        return 0;
+    }
+    let cfg = CfgAnalysis::build(func);
+    let loops =
+        loop_analysis::find_natural_loops(func.blocks.len(), &cfg.preds, &cfg.succs, &cfg.idom);
+    let mut def_block: FxHashMap<u32, usize> = FxHashMap::default();
+    let mut splat_defs: FxHashSet<u32> = FxHashSet::default();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for inst in &block.instructions {
+            if let Some(d) = inst.dest() {
+                def_block.insert(d.0, bi);
+            }
+            if let Instruction::Intrinsic {
+                dest: Some(d),
+                op: IntrinsicOp::VecBroadcastI32x4 | IntrinsicOp::VecBroadcastI32x8,
+                ..
+            } = inst
+            {
+                splat_defs.insert(d.0);
+            }
+        }
+    }
+    let mut next = func.next_value_id;
+    let mut created: FxHashMap<(usize, u32, bool), Value> = FxHashMap::default();
+    let mut inserts: Vec<(usize, Instruction)> = Vec::new();
+    let mut rewrites: Vec<(usize, usize, usize, Value)> = Vec::new();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            let Instruction::Intrinsic { op, args, .. } = inst else {
+                continue;
+            };
+            let Some(g) = op.masked_guard_arg_index() else {
+                continue;
+            };
+            let Some(rhs) = args.get(g).copied().filter(|a| hoistable(op, a)) else {
+                continue;
+            };
+            // Key: the guard value's id, or u32::MAX for the zero constant
+            // (SSA ids never reach it).
+            let key = match rhs {
+                Operand::Value(v) if splat_defs.contains(&v.0) => continue,
+                Operand::Value(v) => v.0,
+                Operand::Const(_) => u32::MAX,
+            };
+            let Some(lp) = loops
+                .iter()
+                .filter(|l| l.contains(bi))
+                .min_by_key(|l| l.len())
+            else {
+                continue;
+            };
+            if def_block.get(&key).is_some_and(|&db| lp.contains(db)) {
+                continue;
+            }
+            let Some(pre) = lp.find_preheader(&cfg.preds) else {
+                continue;
+            };
+            let wide = *op == IntrinsicOp::VecMaskedAddI32x8;
+            let splat = *created.entry((pre, key, wide)).or_insert_with(|| {
+                let v = Value(next);
+                next += 1;
+                inserts.push((
+                    pre,
+                    Instruction::Intrinsic {
+                        dest: Some(v),
+                        op: if wide {
+                            IntrinsicOp::VecBroadcastI32x8
+                        } else {
+                            IntrinsicOp::VecBroadcastI32x4
+                        },
+                        dest_ptr: None,
+                        args: vec![rhs],
+                    },
+                ));
+                v
+            });
+            rewrites.push((bi, ii, g, splat));
+        }
+    }
+    for &(bi, ii, g, splat) in &rewrites {
+        if let Instruction::Intrinsic { args, .. } = &mut func.blocks[bi].instructions[ii] {
+            args[g] = Operand::Value(splat);
+        }
+    }
+    for (pre, inst) in inserts {
+        func.blocks[pre].instructions.push(inst);
+    }
+    func.next_value_id = next;
+    rewrites.len()
+}
+
+#[cfg(test)]
+mod masked_guard_splat_hoist_tests {
+    use super::*;
+
+    fn block(label: u32, instructions: Vec<Instruction>, terminator: Terminator) -> BasicBlock {
+        BasicBlock {
+            label: BlockId(label),
+            instructions,
+            terminator,
+            source_spans: vec![],
+        }
+    }
+
+    fn masked(dest: u32, op: IntrinsicOp, guard: u32) -> Instruction {
+        let mut args = vec![Operand::Value(Value(10)), Operand::Value(Value(12))];
+        if op == IntrinsicOp::VecMaskedAddI32x8 {
+            args.push(Operand::Const(IrConst::I64(0)));
+        }
+        args.push(Operand::Value(Value(guard)));
+        Instruction::Intrinsic {
+            dest: Some(Value(dest)),
+            op,
+            dest_ptr: None,
+            args,
+        }
+    }
+
+    fn guard_of(inst: &Instruction) -> Operand {
+        let Instruction::Intrinsic { op, args, .. } = inst else {
+            panic!("expected a masked step");
+        };
+        args[op.masked_guard_arg_index().expect("masked step")]
+    }
+
+    /// b0 entry -> b1 preheader (defines the invariant guard v1) -> b2
+    /// header <-> b3 body -> b4 exit. The body holds two 128-bit steps and
+    /// one 256-bit step on v1, plus a step whose guard v14 is recomputed in
+    /// the body.
+    #[test]
+    fn invariant_guards_splat_once_per_width_in_the_preheader() {
+        let mut func = IrFunction::new("guard_hoist".into(), IrType::I32, vec![], false);
+        let copy = |d: u32, k: i32| Instruction::Copy {
+            dest: Value(d),
+            src: Operand::Const(IrConst::I32(k)),
+        };
+        func.blocks = vec![
+            block(0, vec![], Terminator::Branch(BlockId(1))),
+            block(1, vec![copy(1, 7)], Terminator::Branch(BlockId(2))),
+            block(
+                2,
+                vec![Instruction::Phi {
+                    dest: Value(10),
+                    ty: IrType::I32,
+                    incoming: vec![
+                        (Operand::Const(IrConst::I32(0)), BlockId(1)),
+                        (Operand::Value(Value(11)), BlockId(3)),
+                    ],
+                }],
+                Terminator::CondBranch {
+                    cond: Operand::Const(IrConst::I32(1)),
+                    true_label: BlockId(3),
+                    false_label: BlockId(4),
+                },
+            ),
+            block(
+                3,
+                vec![
+                    copy(14, 3),
+                    masked(11, IntrinsicOp::VecMaskedAddValueI32x4, 1),
+                    masked(15, IntrinsicOp::VecWidenMaskedAddValueI32x4ToI64x2, 1),
+                    masked(16, IntrinsicOp::VecMaskedAddI32x8, 1),
+                    masked(17, IntrinsicOp::VecMaskedAddValueI32x4, 14),
+                ],
+                Terminator::Branch(BlockId(2)),
+            ),
+            block(4, vec![], Terminator::Return(None)),
+        ];
+        func.next_value_id = 100;
+
+        assert_eq!(hoist_masked_guard_splats(&mut func), 3);
+        assert!(func.blocks[0].instructions.is_empty(), "never block 0");
+        let pre = &func.blocks[1].instructions;
+        assert_eq!(pre.len(), 3, "the guard def plus one splat per width");
+        let splat = |i: usize, want: IntrinsicOp| match &pre[i] {
+            Instruction::Intrinsic {
+                dest: Some(d),
+                op,
+                args,
+                ..
+            } if *op == want && args.as_slice() == [Operand::Value(Value(1))] => *d,
+            other => panic!("expected {want:?} of v1, got {other:?}"),
+        };
+        let narrow = splat(1, IntrinsicOp::VecBroadcastI32x4);
+        let wide = splat(2, IntrinsicOp::VecBroadcastI32x8);
+        let body = &func.blocks[3].instructions;
+        assert_eq!(guard_of(&body[1]), Operand::Value(narrow));
+        assert_eq!(guard_of(&body[2]), Operand::Value(narrow));
+        assert_eq!(guard_of(&body[3]), Operand::Value(wide));
+        assert_eq!(
+            guard_of(&body[4]),
+            Operand::Value(Value(14)),
+            "loop-variant guard"
+        );
+        assert_eq!(func.next_value_id, 102);
+
+        // Idempotent: hoisted splats are recognised and never re-hoisted.
+        assert_eq!(hoist_masked_guard_splats(&mut func), 0);
+        assert_eq!(func.blocks[1].instructions.len(), 3);
+    }
+
+    /// A zero guard is hoisted only for the AVX memory-shaped steps (whose
+    /// lane load then folds into `vpmaxsd`); other constants, and the SSE2
+    /// value-shaped steps' zero guard, keep their folded rodata compare.
+    #[test]
+    fn zero_guards_hoist_only_where_the_load_folds() {
+        let zero = Operand::Const(IrConst::I32(0));
+        let step = |dest: u32, op: IntrinsicOp, guard: Operand| {
+            let mut args = vec![Operand::Value(Value(10)), Operand::Value(Value(12))];
+            if op != IntrinsicOp::VecMaskedAddValueI32x4 {
+                args.push(Operand::Const(IrConst::I64(0)));
+            }
+            args.push(guard);
+            Instruction::Intrinsic {
+                dest: Some(Value(dest)),
+                op,
+                dest_ptr: None,
+                args,
+            }
+        };
+        let mut func = IrFunction::new("zero_guard".into(), IrType::I32, vec![], false);
+        func.blocks = vec![
+            block(0, vec![], Terminator::Branch(BlockId(1))),
+            block(
+                1,
+                vec![
+                    step(11, IntrinsicOp::VecMaskedAddI32x8, zero),
+                    step(13, IntrinsicOp::VecWidenMaskedAddI32x4ToI64x4, zero),
+                    step(14, IntrinsicOp::VecMaskedAddValueI32x4, zero),
+                    step(
+                        15,
+                        IntrinsicOp::VecMaskedAddI32x8,
+                        Operand::Const(IrConst::I32(5)),
+                    ),
+                ],
+                Terminator::CondBranch {
+                    cond: Operand::Const(IrConst::I32(1)),
+                    true_label: BlockId(1),
+                    false_label: BlockId(2),
+                },
+            ),
+            block(2, vec![], Terminator::Return(None)),
+        ];
+        func.next_value_id = 100;
+        assert_eq!(hoist_masked_guard_splats(&mut func), 2);
+        let pre = &func.blocks[0].instructions;
+        assert_eq!(pre.len(), 2, "{pre:?}");
+        for (inst, want) in pre.iter().zip([
+            IntrinsicOp::VecBroadcastI32x8,
+            IntrinsicOp::VecBroadcastI32x4,
+        ]) {
+            assert!(
+                matches!(inst, Instruction::Intrinsic { op, args, .. } if *op == want && args.as_slice() == [zero]),
+                "{inst:?}"
+            );
+        }
+        let body = &func.blocks[1].instructions;
+        assert!(matches!(guard_of(&body[0]), Operand::Value(Value(100))));
+        assert!(matches!(guard_of(&body[1]), Operand::Value(Value(101))));
+        assert_eq!(
+            guard_of(&body[2]),
+            zero,
+            "SSE2 value step keeps the rodata pmaxsd"
+        );
+        assert_eq!(guard_of(&body[3]), Operand::Const(IrConst::I32(5)));
+    }
+
+    #[test]
+    fn guard_invariance_is_decided_by_the_defining_block() {
+        let mut func = IrFunction::new("guard_inv".into(), IrType::I32, vec![], false);
+        func.blocks = vec![
+            block(
+                0,
+                vec![Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Const(IrConst::I32(1)),
+                }],
+                Terminator::Branch(BlockId(1)),
+            ),
+            block(
+                1,
+                vec![Instruction::Copy {
+                    dest: Value(2),
+                    src: Operand::Const(IrConst::I32(2)),
+                }],
+                Terminator::Branch(BlockId(1)),
+            ),
+        ];
+        let body: FxHashSet<usize> = [1].into_iter().collect();
+        assert!(guard_rhs_is_loop_invariant(
+            &func,
+            &body,
+            &Operand::Value(Value(1))
+        ));
+        assert!(!guard_rhs_is_loop_invariant(
+            &func,
+            &body,
+            &Operand::Value(Value(2))
+        ));
+        assert!(guard_rhs_is_loop_invariant(
+            &func,
+            &body,
+            &Operand::Const(IrConst::I32(5))
+        ));
+        // A value with no defining instruction (a parameter) is invariant.
+        assert!(guard_rhs_is_loop_invariant(
+            &func,
+            &body,
+            &Operand::Value(Value(9))
+        ));
+    }
+}
+
+#[cfg(test)]
+mod canonical_sgt_guard_rhs_tests {
+    use super::*;
+
+    const A: Value = Value(7);
+
+    fn c(v: i64) -> Operand {
+        Operand::Const(IrConst::I32(v as i32))
+    }
+
+    fn rhs_i32(o: Option<Operand>) -> Option<i64> {
+        match o? {
+            Operand::Const(k) => k.to_i64(),
+            Operand::Value(v) => Some(-1_000_000 - i64::from(v.0)),
+        }
+    }
+
+    #[test]
+    fn spellings_canonicalise_to_loaded_gt_rhs() {
+        let a = Operand::Value(A);
+        let r = Operand::Value(Value(9));
+        let t = IrType::I32;
+        let g = |op, l: &Operand, rr: &Operand| rhs_i32(canonical_sgt_guard_rhs(op, l, rr, t, A));
+        assert_eq!(g(IrCmpOp::Sgt, &a, &c(5)), Some(5));
+        assert_eq!(g(IrCmpOp::Sgt, &a, &r), Some(-1_000_009));
+        assert_eq!(g(IrCmpOp::Slt, &c(5), &a), Some(5));
+        assert_eq!(g(IrCmpOp::Slt, &r, &a), Some(-1_000_009));
+        assert_eq!(g(IrCmpOp::Sge, &a, &c(0)), Some(-1));
+        assert_eq!(
+            g(IrCmpOp::Sge, &a, &c(i64::from(i32::MAX))),
+            Some(i64::from(i32::MAX) - 1)
+        );
+        assert_eq!(g(IrCmpOp::Sle, &c(1), &a), Some(0));
+        assert_eq!(
+            g(IrCmpOp::Sge, &a, &c(i64::from(i32::MIN) + 1)),
+            Some(i64::from(i32::MIN))
+        );
+    }
+
+    #[test]
+    fn refusals() {
+        let a = Operand::Value(A);
+        let r = Operand::Value(Value(9));
+        let t = IrType::I32;
+        let g = |op, l: &Operand, rr: &Operand| canonical_sgt_guard_rhs(op, l, rr, t, A);
+        // `c - 1` would wrap.
+        assert!(g(IrCmpOp::Sge, &a, &c(i64::from(i32::MIN))).is_none());
+        assert!(g(IrCmpOp::Sle, &c(i64::from(i32::MIN)), &a).is_none());
+        // Run-time bound on a non-strict compare.
+        assert!(g(IrCmpOp::Sge, &a, &r).is_none());
+        assert!(g(IrCmpOp::Sle, &r, &a).is_none());
+        // Wrong side / wrong predicate / unsigned / self-compare.
+        assert!(g(IrCmpOp::Sgt, &c(5), &a).is_none());
+        assert!(g(IrCmpOp::Slt, &a, &c(5)).is_none());
+        assert!(g(IrCmpOp::Ugt, &a, &c(5)).is_none());
+        assert!(g(IrCmpOp::Eq, &a, &c(5)).is_none());
+        assert!(g(IrCmpOp::Sgt, &a, &a).is_none());
+        // The constant adjustment is only proven for I32 compares.
+        assert!(canonical_sgt_guard_rhs(IrCmpOp::Sge, &a, &c(3), IrType::I64, A).is_none());
+    }
+}
+
 /// `neon` enables AArch64-only forms: i32→i64 dot products whose multiply
 /// operands are sign-extension casts of i32 loads (lowered to smlal/smlal2).
 fn analyze_reduction_pattern(
@@ -4779,18 +5260,20 @@ fn analyze_reduction_pattern(
             'gc: for &bi in &loop_info.body {
                 for inst in &func.blocks[bi].instructions {
                     if let Instruction::Cmp {
-                        dest, op, lhs, rhs, ..
+                        dest,
+                        op,
+                        lhs,
+                        rhs,
+                        ty,
                     } = inst
+                        && dest.0 == gcv.0
+                        && let Some(rhs) = canonical_sgt_guard_rhs(*op, lhs, rhs, *ty, root_load)
+                        && guard_rhs_is_loop_invariant(func, &loop_info.body, &rhs)
                     {
-                        if dest.0 == gcv.0
-                            && *op == IrCmpOp::Sgt
-                            && matches!(lhs, Operand::Value(lv) if lv.0 == root_load.0)
-                        {
-                            select_guard_cond = Some(gcv);
-                            guard_rhs = Some(*rhs);
-                            valid = true;
-                            break 'gc;
-                        }
+                        select_guard_cond = Some(gcv);
+                        guard_rhs = Some(rhs);
+                        valid = true;
+                        break 'gc;
                     }
                 }
             }
@@ -4817,7 +5300,7 @@ fn analyze_reduction_pattern(
         // comparing the I32 LOADED element — the accumulator's ADD type is
         // I64 but the lanes are I32, and a masked WIDENING composite covers
         // exactly that shape on either transform: the AVX2 path's
-        // `VecWidenMaskedAddI32x4ToI64x2` (vpmovsxdq, needs AVX2/SSE4.1) or
+        // `VecWidenMaskedAddI32x4ToI64x4` (I64x4 accumulator, AVX2) or
         // the SSE2 path's `VecWidenMaskedAddValueI32x4ToI64x2` (pcmpgtd +
         // pand + dual sign-unpack, pure SSE2). The exception is gated on at
         // least one of those transforms being selectable for the target:
@@ -4968,11 +5451,10 @@ fn analyze_reduction_pattern(
                 // ONE exception: signed I32 -> I64 widening when the target
                 // provides a true widening load+add. AArch64 NEON
                 // VecLoadWidenI32ToI64x2 (ldr + saddlp/smlal) and x86
-                // VecWidenAddI32x4ToI64x2 (vmovdqu + vpmovsxdq×2 +
-                // vextracti128 + paddq×2) both keep full I64 precision per
-                // lane. allow_widening_i32 is set for both targets; the x86
-                // AVX2 path additionally requires the AVX feature for
-                // vpmovsxdq's VEX encoding.
+                // VecWidenAddI32x4ToI64x4 (vpmovsxdq m128 -> ymm + vpaddq)
+                // both keep full I64 precision per lane. allow_widening_i32
+                // is set for both targets; the x86 memory-shaped composite is
+                // emitted only by the AVX2 transform (256-bit vpaddq).
                 let allowed_widen =
                     allow_widening_i32 && element_type == IrType::I64 && *from_ty == IrType::I32;
                 if *from_ty != element_type && !allowed_widen {
@@ -9976,6 +10458,33 @@ fn parse_map_operand(
 // truncation at the end reproduces the wrapping `int` sum exactly (C
 // signed overflow is UB; the wrapped value is the only observable
 // behaviour a wrapping machine could produce).
+//
+// Byte SUMS (`s += p[i]`, `s += p[i] & 0x0f`, `s += a[i] ^ b[i]`) ride the
+// same machinery with the `& 1` dropped (`ByteSumKind`).  `psadbw` against
+// zero adds the eight byte lanes of each group EXACTLY, so the packed body
+// is exact whenever every lane holds the scalar value itself:
+//
+//   * the tree is lane-exact in VALUE position: loads, invariants, the
+//     ring ops (+ - & | ^) and selects whose arms are lane-exact.  A
+//     compare used as a VALUE is refused: its packed lane is 0xFF where the
+//     scalar setcc is 1 (the parser's interval for a mask is the packed
+//     (-1, 0), so `0 - (c == k)` would otherwise pass with range (0, 1)
+//     while the scalar value is -1);
+//   * the parser's wide interval of the root lies in [0, 255]: the low byte
+//     (which the ring homomorphism makes lane-exact) then IS the value.
+//
+// A root interval inside [-128, 127] (a `signed char` stream) is summed
+// through the bias identity  v = (v ^ 0x80) - 128  on the byte lane: the
+// packed body adds `psadbw(lane ^ 0x80, 0)` and the vector exit subtracts
+// 128 per byte the vector loop consumed (`128 * rem_start`).  Exact mod 2^64,
+// hence mod the accumulator width.
+//
+// Width (`ByteSumWidth`): 32 lanes with AVX2, otherwise 16 lanes on the
+// SSE2 baseline -- `pcmpeqb`/`pcmpgtb`, `pand`, `pminub`, `psadbw`,
+// `paddq` are all SSE2, and every 16-lane arm used below already lowers
+// without SSE4.1 (the byte blend is the bitwise select).  i686 is excluded:
+// SSE2 is not in its baseline and the horizontal exit moves a qword to a
+// general register.
 
 /// Does this tree evaluate to 0 or 1 in the SCALAR interpreter (the
 /// remainder/exit world)?  Cmp yields a setcc (0/1), a boolean-select's
@@ -10049,6 +10558,105 @@ fn rewrite_zero_one_selects(expr: MapExpr) -> MapExpr {
     rebuilt
 }
 
+/// What the packed body adds per byte lane (see the section comment).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ByteSumKind {
+    /// A 0/1-valued predicate tree: summed as `tree & 1`.
+    Predicate,
+    /// A lane-exact tree whose wide value lies in [0, 255].
+    Unsigned,
+    /// A lane-exact tree whose wide value lies in [-128, 127]: summed as
+    /// `lane ^ 0x80`, then corrected by -128 per consumed byte.
+    Signed,
+}
+
+/// Packed width of the byte-sum family.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ByteSumWidth {
+    /// AVX2: 32 byte lanes, four u64 group sums.
+    Ymm32,
+    /// SSE2 baseline: 16 byte lanes, two u64 group sums.
+    Xmm16,
+}
+
+impl ByteSumWidth {
+    fn lanes(self) -> i64 {
+        match self {
+            ByteSumWidth::Ymm32 => 32,
+            ByteSumWidth::Xmm16 => 16,
+        }
+    }
+}
+
+/// The byte-sum width this target admits, if any.  AArch64 never reaches
+/// the x86 arms (its callers test `neon` first); the late min/max-only
+/// rerun is excluded by the callers as well.
+fn byte_sum_width(force_sse2: bool) -> Option<ByteSumWidth> {
+    if x86_avx2_available() && !force_sse2 {
+        Some(ByteSumWidth::Ymm32)
+    } else if x86_simd_available() && x86_64_vector_intrinsics_available() {
+        Some(ByteSumWidth::Xmm16)
+    } else {
+        None
+    }
+}
+
+/// Is every VALUE-position node lane-exact on bytes in BOTH interpreter
+/// worlds?  Loads, invariants, the ring ops and selects over lane-exact
+/// arms are; a compare or mask conjunction in value position is not (0xFF
+/// packed vs 1 scalar), and a min/max has no scalar mirror (the remainder
+/// emitter refuses it), so it declines here rather than half-way through.
+fn byte_value_tree_is_lane_exact(expr: &MapExpr) -> bool {
+    match expr {
+        MapExpr::Load(_) | MapExpr::Invariant(_) => true,
+        MapExpr::BinOp(op, l, r) => {
+            matches!(
+                op,
+                IrBinOp::Add | IrBinOp::Sub | IrBinOp::And | IrBinOp::Or | IrBinOp::Xor
+            ) && byte_value_tree_is_lane_exact(l)
+                && byte_value_tree_is_lane_exact(r)
+        }
+        MapExpr::Select(_mask, t, f) => {
+            byte_value_tree_is_lane_exact(t) && byte_value_tree_is_lane_exact(f)
+        }
+        MapExpr::Cmp(..)
+        | MapExpr::MaskConj { .. }
+        | MapExpr::MinMax { .. }
+        | MapExpr::Sqrt(_)
+        | MapExpr::Round(..)
+        | MapExpr::Fma { .. } => false,
+    }
+}
+
+/// Whether `expr`'s PACKED value is a lane mask (0 or -1 per byte): a
+/// compare, a mask conjunction, or an AND/OR of lane masks (closed: 0/-1
+/// AND/OR 0/-1 is 0/-1).  Its scalar value is then 0/1, so summing the
+/// packed lanes yields exactly 255 times the scalar count.
+fn packed_is_lane_mask(expr: &MapExpr) -> bool {
+    match expr {
+        MapExpr::Cmp(..) | MapExpr::MaskConj { .. } => true,
+        MapExpr::BinOp(IrBinOp::And | IrBinOp::Or, l, r) => {
+            packed_is_lane_mask(l) && packed_is_lane_mask(r)
+        }
+        _ => false,
+    }
+}
+
+/// Classify the added tree, or `None` when no packed form is exact.
+fn classify_byte_sum(tree: &MapExpr, range: Option<(i64, i64)>) -> Option<ByteSumKind> {
+    if is_scalar_zero_one_tree(tree) {
+        return Some(ByteSumKind::Predicate);
+    }
+    if !byte_value_tree_is_lane_exact(tree) {
+        return None;
+    }
+    match range? {
+        (lo, hi) if lo >= 0 && hi <= 255 => Some(ByteSumKind::Unsigned),
+        (lo, hi) if lo >= -128 && hi <= 127 => Some(ByteSumKind::Signed),
+        _ => None,
+    }
+}
+
 /// The recognised loop shape, with every value the transform needs.
 struct ByteCountPattern {
     header_idx: usize,
@@ -10072,8 +10680,12 @@ struct ByteCountPattern {
     /// The preheader incoming of the accumulator phi (a constant or an
     /// outside value); it is re-added at the exit materialisation.
     acc_init: Operand,
-    /// The 0/1-valued byte-lane predicate tree that was added.
+    /// The byte-lane tree that was added (0/1 predicate or byte value).
     tree: MapExpr,
+    /// How the packed body sums `tree` (see `ByteSumKind`).
+    kind: ByteSumKind,
+    /// Packed width chosen for this target.
+    width: ByteSumWidth,
     /// Stream bases for `MapEmitCtx` + the remainder mirror.
     src_bases: Vec<Value>,
     /// The element type of the byte streams (I8 or U8).
@@ -10796,7 +11408,7 @@ fn analyze_byte_count_loop(
             }),
         }
     };
-    let Some((tree, _range)) = parse_byte_map_expr(
+    let Some((tree, tree_range)) = parse_byte_map_expr(
         func,
         &loop_blocks,
         &leaf_tys,
@@ -10810,11 +11422,28 @@ fn analyze_byte_count_loop(
         }
         return None;
     };
-    if !is_scalar_zero_one_tree(&tree) {
+    let Some(kind) = classify_byte_sum(&tree, tree_range) else {
         if debug {
-            eprintln!("[VEC-CNT] added value is not provably 0/1; declining");
+            eprintln!(
+                "[VEC-CNT] added value is neither a 0/1 predicate nor a lane-exact byte \
+                 in [0,255] / [-128,127] (range {tree_range:?}); declining"
+            );
         }
         return None;
+    };
+    let Some(width) = byte_sum_width(sse2_forced()) else {
+        return None;
+    };
+    // Profitability with a KNOWN trip count (the matmul arm's rule): the
+    // packed body must run at least twice, or setup + horizontal exit +
+    // scalar remainder cost more than the scalar loop saves.
+    if let Operand::Const(c) = &limit {
+        if c.to_i64().is_some_and(|n| n < 2 * width.lanes()) {
+            if debug {
+                eprintln!("[VEC-CNT] constant trip count below two packed iterations; declining");
+            }
+            return None;
+        }
     }
 
     // Stream bases for emission.
@@ -10851,19 +11480,398 @@ fn analyze_byte_count_loop(
         acc_ty,
         acc_init,
         tree,
+        kind,
+        width,
         src_bases,
         elem_ty,
         leaf_tys,
     })
 }
 
-/// Emit the packed counting body and remainder.  AVX2-only by construction
-/// (`vpsadbw` over 32 byte lanes); every other target keeps the scalar loop.
+/// Emit the packed byte-sum body and remainder at the pattern's width
+/// (`vpsadbw` over 32 byte lanes with AVX2, `psadbw` over 16 on the SSE2
+/// baseline).
 fn transform_byte_count_reduction(func: &mut IrFunction, p: &ByteCountPattern) -> usize {
     let mut next_val_id = func.next_value_id;
     let changes = transform_byte_count_reduction_inner(func, p, &mut next_val_id);
     func.next_value_id = next_val_id;
     changes
+}
+
+/// Insert `inst` at `at`, keeping the block's positional span table in
+/// step (codegen reads line info by instruction index, so an unspanned
+/// insertion shifts every later instruction's attribution).  The new entry
+/// inherits its predecessor's span (the block's first span at the front);
+/// an absent table (empty for a non-empty block) stays absent.
+fn spanned_insert(block: &mut BasicBlock, at: usize, inst: Instruction) {
+    if block.source_spans.len() == block.instructions.len() {
+        let fill = at
+            .checked_sub(1)
+            .and_then(|i| block.source_spans.get(i))
+            .or_else(|| block.source_spans.first())
+            .copied()
+            .unwrap_or_else(crate::common::source::Span::dummy);
+        block.source_spans.insert(at, fill);
+    }
+    block.instructions.insert(at, inst);
+}
+
+/// Append `inst`, keeping the span table in step (see `spanned_insert`).
+fn spanned_push(block: &mut BasicBlock, inst: Instruction) {
+    let at = block.instructions.len();
+    spanned_insert(block, at, inst);
+}
+
+/// The byte-sum trees of a recognised pattern (see `byte_sum_trees`).
+struct ByteSumTrees {
+    /// The scalar per-byte addend (the remainder mirror).
+    count_tree: MapExpr,
+    /// The packed per-lane addend psadbw sums.
+    packed_tree: MapExpr,
+    /// `packed_tree` is a raw 0/0xFF lane mask: the exit divides the
+    /// horizontal sum by 255.
+    mask_sum: bool,
+    /// `packed_tree` counts the COMPLEMENT of the predicate: the exit takes
+    /// `consumed - count`.
+    complement: bool,
+}
+
+/// A byte-sum loop whose packed trip count is a compile-time constant
+/// (constant limit, `limit >= W`): the vector loop consumes exactly
+/// `packed` bytes (at least one full vector) and the scalar remainder
+/// `rem < W`.  Both loops are then known to run, so neither needs an entry
+/// test (see `byte_sum_bottom_test_packed_loop`).
+#[derive(Clone, Copy)]
+struct ByteSumConstTrip {
+    packed: i64,
+    rem: i64,
+}
+
+/// Decide the constant-trip form, including every shape precondition of
+/// the bottom-tested rewrite, so the rewrite itself cannot fail once the
+/// transform has started mutating: the header leaves on the (rewritten)
+/// exit comparison, the latch is a separate block that only jumps back,
+/// and the accumulator phi has a latch incoming the exit can read.
+fn byte_sum_const_trip(
+    func: &IrFunction,
+    p: &ByteCountPattern,
+    vec_end: &Operand,
+    exit_op: IrCmpOp,
+    unsigned_exit: bool,
+) -> Option<ByteSumConstTrip> {
+    let Operand::Const(IrConst::I64(packed)) = *vec_end else {
+        return None;
+    };
+    if !matches!(exit_op, IrCmpOp::Slt | IrCmpOp::Ult) || packed < p.width.lanes() {
+        return None;
+    }
+    let limit = match p.limit {
+        Operand::Const(IrConst::I32(v)) if unsigned_exit => i64::from(v as u32),
+        Operand::Const(IrConst::I32(v)) => i64::from(v),
+        Operand::Const(IrConst::I64(v)) => v,
+        _ => return None,
+    };
+    let rem = limit.checked_sub(packed)?;
+    if !(0..p.width.lanes()).contains(&rem) {
+        return None;
+    }
+    let header_label = func.blocks[p.header_idx].label;
+    let latch_label = func.blocks[p.latch_idx].label;
+    if p.latch_idx == p.header_idx
+        || !matches!(func.blocks[p.latch_idx].terminator, Terminator::Branch(l) if l == header_label)
+        || !matches!(func.blocks[p.header_idx].terminator,
+            Terminator::CondBranch { cond: Operand::Value(c), .. } if c == p.exit_cmp_dest)
+        || phi_incoming_from(func, p.header_idx, p.acc_phi, latch_label).is_none()
+    {
+        return None;
+    }
+    Some(ByteSumConstTrip { packed, rem })
+}
+
+/// The incoming operand of phi `phi` (in block `block`) on the edge from
+/// `pred`.
+fn phi_incoming_from(
+    func: &IrFunction,
+    block: usize,
+    phi: Value,
+    pred: BlockId,
+) -> Option<Operand> {
+    func.blocks[block]
+        .instructions
+        .iter()
+        .find_map(|inst| match inst {
+            Instruction::Phi { dest, incoming, .. } if *dest == phi => {
+                incoming.iter().find(|(_, l)| *l == pred).map(|(op, _)| *op)
+            }
+            _ => None,
+        })
+}
+
+/// Turn the packed loop into a guard-free do-while (constant trip count,
+/// at least one vector: `byte_sum_const_trip` proved both and the shape).
+/// The header's exit test is dropped (DCE removes the compare) and the
+/// latch tests the NEXT byte IV with the same predicate and polarity, so
+/// the loop exits from the latch -- after the backedge values exist, which
+/// is what the vector exit then reads.  Left top-tested, backend layout
+/// rotation duplicates the header test as an entry guard that reads the
+/// IV's register (`xor %r8d,%r8d; cmp $E,%r8; jge`), which no later pass
+/// folds.
+fn byte_sum_bottom_test_packed_loop(
+    func: &mut IrFunction,
+    p: &ByteCountPattern,
+    exit_cmp_at: usize,
+    (byte_iv, byte_iv_next): (Value, Value),
+    vec_exit_label: BlockId,
+    next_val_id: &mut u32,
+) -> usize {
+    let header_label = func.blocks[p.header_idx].label;
+    let Instruction::Cmp {
+        op, lhs, rhs, ty, ..
+    } = func.blocks[p.header_idx].instructions[exit_cmp_at]
+    else {
+        return 0;
+    };
+    let Terminator::CondBranch {
+        true_label,
+        false_label,
+        ..
+    } = func.blocks[p.header_idx].terminator
+    else {
+        return 0;
+    };
+    let next = |o: Operand| match o {
+        Operand::Value(v) if v == byte_iv => Operand::Value(byte_iv_next),
+        other => other,
+    };
+    let continue_on_true = true_label != vec_exit_label;
+    let cond = count_fresh(next_val_id);
+    func.blocks[p.header_idx].terminator = Terminator::Branch(if continue_on_true {
+        true_label
+    } else {
+        false_label
+    });
+    spanned_push(
+        &mut func.blocks[p.latch_idx],
+        Instruction::Cmp {
+            dest: cond,
+            op,
+            lhs: next(lhs),
+            rhs: next(rhs),
+            ty,
+        },
+    );
+    let (stay, leave) = (header_label, vec_exit_label);
+    func.blocks[p.latch_idx].terminator = Terminator::CondBranch {
+        cond: Operand::Value(cond),
+        true_label: if continue_on_true { stay } else { leave },
+        false_label: if continue_on_true { leave } else { stay },
+    };
+    2
+}
+
+/// The inverse of 255 modulo 2^64 (`0xFEFE_FEFE_FEFE_FEFF`).
+const INV_255_MOD_2_64: i64 = 0xFEFE_FEFE_FEFE_FEFFu64 as i64;
+const _: () = assert!(255u64.wrapping_mul(INV_255_MOD_2_64 as u64) == 1);
+
+/// Inputs of the vector-exit block (see `byte_sum_exit_insts`).
+struct ByteSumExit {
+    /// The packed partial sum, after any correction.
+    h: Value,
+    /// The scalar remainder's starting index.
+    rem_start: Value,
+    /// The final packed accumulator.
+    acc: Operand,
+    /// Bytes the vector loop consumed (the byte IV, or a constant).
+    consumed: Operand,
+    iv_ty: IrType,
+    ymm: bool,
+    signed: bool,
+    mask_sum: bool,
+    complement: bool,
+}
+
+/// The vector-exit instructions after `prefix`: the horizontal sum, the
+/// remainder's start index, and the corrections (exact `/ 255` for a mask
+/// sum, `consumed - count` for a complement, `- 128 * consumed` for a
+/// signed sum, whose packed lanes were biased by `^ 0x80`).
+fn byte_sum_exit_insts(
+    e: &ByteSumExit,
+    mut insts: Vec<Instruction>,
+    next_val_id: &mut u32,
+) -> Vec<Instruction> {
+    let h_raw = if e.signed || e.mask_sum {
+        count_fresh(next_val_id)
+    } else {
+        e.h
+    };
+    insts.push(Instruction::Intrinsic {
+        dest: Some(h_raw),
+        op: if e.ymm {
+            IntrinsicOp::VecHorizontalAddI64x4
+        } else {
+            IntrinsicOp::VecHorizontalAddI64x2
+        },
+        dest_ptr: None,
+        args: vec![e.acc],
+    });
+    // The resume index is the consumed byte count (= iv * W): the vector
+    // loop's only induction variable (see the exit rewrite), or its
+    // compile-time value.
+    let wide_iv = matches!(e.iv_ty, IrType::I64 | IrType::U64);
+    insts.push(match e.consumed {
+        Operand::Const(IrConst::I64(n)) => Instruction::Copy {
+            dest: e.rem_start,
+            src: Operand::Const(if wide_iv {
+                IrConst::I64(n)
+            } else {
+                IrConst::I32(n as i32)
+            }),
+        },
+        consumed if wide_iv => Instruction::Copy {
+            dest: e.rem_start,
+            src: consumed,
+        },
+        consumed => Instruction::Cast {
+            dest: e.rem_start,
+            src: consumed,
+            from_ty: IrType::I64,
+            to_ty: e.iv_ty,
+        },
+    });
+    if e.mask_sum {
+        // 255 per counted lane, so the division is EXACT: `h_raw` is
+        // 255 * count with no u64 wrap (count < 2^64 / 255), and an exact
+        // division is a multiplication by the divisor's inverse mod 2^64
+        // (255 * 0xFEFE_FEFE_FEFE_FEFF == 1 mod 2^64).  One `imul` by a
+        // `movabs` constant instead of `mulq` + `shrq $7`, which also
+        // clobbered %rdx.
+        let counted = if e.complement {
+            count_fresh(next_val_id)
+        } else {
+            e.h
+        };
+        insts.push(Instruction::BinOp {
+            dest: counted,
+            op: IrBinOp::Mul,
+            lhs: Operand::Value(h_raw),
+            rhs: Operand::Const(IrConst::I64(INV_255_MOD_2_64)),
+            ty: IrType::I64,
+        });
+        if e.complement {
+            insts.push(Instruction::BinOp {
+                dest: e.h,
+                op: IrBinOp::Sub,
+                lhs: e.consumed,
+                rhs: Operand::Value(counted),
+                ty: IrType::I64,
+            });
+        }
+    }
+    if e.signed {
+        // The packed body added (v + 128) per consumed byte.
+        let bias = match e.consumed {
+            Operand::Const(IrConst::I64(n)) => Operand::Const(IrConst::I64(n << 7)),
+            consumed => {
+                let b = count_fresh(next_val_id);
+                insts.push(Instruction::BinOp {
+                    dest: b,
+                    op: IrBinOp::Shl,
+                    lhs: consumed,
+                    rhs: Operand::Const(IrConst::I64(7)),
+                    ty: IrType::I64,
+                });
+                Operand::Value(b)
+            }
+        };
+        insts.push(Instruction::BinOp {
+            dest: e.h,
+            op: IrBinOp::Sub,
+            lhs: Operand::Value(h_raw),
+            rhs: bias,
+            ty: IrType::I64,
+        });
+    }
+    insts
+}
+
+/// Build the scalar and packed trees for `p`.
+fn byte_sum_trees(p: &ByteCountPattern) -> ByteSumTrees {
+    // The SCALAR tree (remainder mirror) and the PACKED tree (vector body).
+    //
+    // Predicate: 0/1 selects → `m & 1`, then make the top level an `& 1`
+    // over a mask producer (idempotence-aware); both worlds use that tree.
+    // Unsigned byte value: the tree itself in both worlds.  Signed byte
+    // value: the packed lane is biased by `^ 0x80` into [0, 255] (the exit
+    // subtracts 128 per consumed byte); the scalar mirror keeps the signed
+    // value, which the remainder sign-extends.
+    let count_tree = match p.kind {
+        ByteSumKind::Predicate => {
+            let tree = rewrite_zero_one_selects(p.tree.clone());
+            let already_and_one = match &tree {
+                MapExpr::BinOp(IrBinOp::And, _, r) => matches!(
+                    r.as_ref(),
+                    MapExpr::Invariant(Operand::Const(c)) if c.to_i64() == Some(1)
+                ),
+                _ => false,
+            };
+            if already_and_one {
+                tree
+            } else {
+                MapExpr::BinOp(
+                    IrBinOp::And,
+                    Box::new(tree),
+                    Box::new(MapExpr::Invariant(Operand::Const(IrConst::I32(1)))),
+                )
+            }
+        }
+        ByteSumKind::Unsigned | ByteSumKind::Signed => p.tree.clone(),
+    };
+    // Range fusion on the mask side (windows, single-bit unions, signed
+    // classifiers, complement windows) — the same canonicalisation the map
+    // path applies, for the same two-instruction compares.
+    let count_tree = fold_unsigned_range_masks(&count_tree, 8);
+    // Predicate counts over a lane MASK sum the mask itself: psadbw adds
+    // 255 per set lane, so the exit divides the horizontal sum by 255 once
+    // (exact: it is 255 * count) instead of masking every vector with
+    // `& 1`.  A `!=` mask additionally counts its complement: the body
+    // packs `==` (one pcmpeqb instead of pcmpeqb + all-ones + pxor) and the
+    // exit takes `consumed - count(==)`, the vector loop having consumed
+    // exactly `byte_iv` bytes.  The scalar remainder keeps the `& 1` tree.
+    let (packed_tree, mask_sum, complement) = match p.kind {
+        ByteSumKind::Signed => (
+            MapExpr::BinOp(
+                IrBinOp::Xor,
+                Box::new(count_tree.clone()),
+                Box::new(MapExpr::Invariant(Operand::Const(IrConst::I32(0x80)))),
+            ),
+            false,
+            false,
+        ),
+        ByteSumKind::Unsigned => (count_tree.clone(), false, false),
+        ByteSumKind::Predicate => match &count_tree {
+            MapExpr::BinOp(IrBinOp::And, m, one)
+                if packed_is_lane_mask(m)
+                    && matches!(
+                        one.as_ref(),
+                        MapExpr::Invariant(Operand::Const(c)) if c.to_i64() == Some(1)
+                    ) =>
+            {
+                match m.as_ref() {
+                    MapExpr::Cmp(IrCmpOp::Ne, a, b) => {
+                        (MapExpr::Cmp(IrCmpOp::Eq, a.clone(), b.clone()), true, true)
+                    }
+                    _ => ((**m).clone(), true, false),
+                }
+            }
+            _ => (count_tree.clone(), false, false),
+        },
+    };
+    ByteSumTrees {
+        count_tree,
+        packed_tree,
+        mask_sum,
+        complement,
+    }
 }
 
 fn transform_byte_count_reduction_inner(
@@ -10872,7 +11880,8 @@ fn transform_byte_count_reduction_inner(
     next_val_id: &mut u32,
 ) -> usize {
     let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
-    const VEC_WIDTH: i64 = 32;
+    let vec_width: i64 = p.width.lanes();
+    let ymm = p.width == ByteSumWidth::Ymm32;
     let mut changes = 0usize;
 
     // Preheader: the unique non-loop predecessor branching to the header.
@@ -10922,37 +11931,27 @@ fn transform_byte_count_reduction_inner(
     let preheader_label = func.blocks[preheader_idx].label;
     let latch_label = func.blocks[p.latch_idx].label;
 
-    // Normalise the tree: 0/1 selects → `m & 1`, then make the top level
-    // an `& 1` over a mask producer (idempotence-aware).
-    let tree = rewrite_zero_one_selects(p.tree.clone());
-    let already_and_one = match &tree {
-        MapExpr::BinOp(IrBinOp::And, _, r) => {
-            matches!(r.as_ref(), MapExpr::Invariant(Operand::Const(c)) if c.to_i64() == Some(1))
-        }
-        _ => false,
-    };
-    let count_tree = if already_and_one {
-        tree
-    } else {
-        MapExpr::BinOp(
-            IrBinOp::And,
-            Box::new(tree),
-            Box::new(MapExpr::Invariant(Operand::Const(IrConst::I32(1)))),
-        )
-    };
-    // Range fusion on the mask side (windows, single-bit unions, signed
-    // classifiers, complement windows) — the same canonicalisation the map
-    // path applies, for the same two-instruction compares.
-    let count_tree = fold_unsigned_range_masks(&count_tree, 8);
+    let ByteSumTrees {
+        count_tree,
+        packed_tree,
+        mask_sum,
+        complement,
+    } = byte_sum_trees(p);
 
-    // Ops wiring (byte-lane AVX2 arms, mirroring `transform_map_vector`).
+    // Ops wiring (byte-lane arms at the pattern's width, mirroring
+    // `transform_map_vector`'s AVX2 and SSE2 tables).
     let bin_op = |op: &IrBinOp| -> Option<IntrinsicOp> {
-        match op {
-            IrBinOp::Add => Some(IntrinsicOp::VecAddI8x32),
-            IrBinOp::Sub => Some(IntrinsicOp::VecSubI8x32),
-            IrBinOp::And => Some(IntrinsicOp::VecAndI32x8),
-            IrBinOp::Or => Some(IntrinsicOp::VecOrI32x8),
-            IrBinOp::Xor => Some(IntrinsicOp::VecXorI32x8),
+        match (op, ymm) {
+            (IrBinOp::Add, true) => Some(IntrinsicOp::VecAddI8x32),
+            (IrBinOp::Sub, true) => Some(IntrinsicOp::VecSubI8x32),
+            (IrBinOp::And, true) => Some(IntrinsicOp::VecAndI32x8),
+            (IrBinOp::Or, true) => Some(IntrinsicOp::VecOrI32x8),
+            (IrBinOp::Xor, true) => Some(IntrinsicOp::VecXorI32x8),
+            (IrBinOp::Add, false) => Some(IntrinsicOp::VecAddI8x16),
+            (IrBinOp::Sub, false) => Some(IntrinsicOp::VecSubI8x16),
+            (IrBinOp::And, false) => Some(IntrinsicOp::VecAndI32x4),
+            (IrBinOp::Or, false) => Some(IntrinsicOp::VecOrI32x4),
+            (IrBinOp::Xor, false) => Some(IntrinsicOp::VecXorI32x4),
             _ => None,
         }
     };
@@ -10966,17 +11965,28 @@ fn transform_byte_count_reduction_inner(
             IrCmpOp::Ule => 6,
             _ => return None,
         };
-        Some((IntrinsicOp::VecCmpI8x32, imm))
+        let cmp = if ymm {
+            IntrinsicOp::VecCmpI8x32
+        } else {
+            IntrinsicOp::VecCmpI8x16
+        };
+        Some((cmp, imm))
     };
-    let blendv_op = Some(IntrinsicOp::VecBlendvI8x32);
+    let blendv_op = Some(if ymm {
+        IntrinsicOp::VecBlendvI8x32
+    } else {
+        IntrinsicOp::VecBlendvI8x16
+    });
     let minmax_op = |is_max: bool| -> Option<IntrinsicOp> {
-        match is_max {
-            false => Some(IntrinsicOp::VecMinU8x32),
-            true => Some(IntrinsicOp::VecMaxU8x32),
+        match (is_max, ymm) {
+            (false, true) => Some(IntrinsicOp::VecMinU8x32),
+            (true, true) => Some(IntrinsicOp::VecMaxU8x32),
+            (false, false) => Some(IntrinsicOp::VecMinU8x16),
+            (true, false) => Some(IntrinsicOp::VecMaxU8x16),
         }
     };
     if !map_tree_ops_available(
-        &count_tree,
+        &packed_tree,
         &bin_op,
         None,
         &cmp_op,
@@ -11007,10 +12017,6 @@ fn transform_byte_count_reduction_inner(
     let rem_one = match p.iv_ty {
         IrType::I32 | IrType::U32 => IrConst::I32(1),
         _ => IrConst::I64(1),
-    };
-    let iv_width_const = match p.iv_ty {
-        IrType::I32 | IrType::U32 => IrConst::I32(VEC_WIDTH as i32),
-        _ => IrConst::I64(VEC_WIDTH),
     };
     let exit_label = func.blocks[p.exit_idx].label;
     let vec_exit_label = {
@@ -11091,12 +12097,20 @@ fn transform_byte_count_reduction_inner(
         }
         return 0;
     };
-    // Widen the 0/1 value to the I64 remainder accumulator.
+    // Widen the scalar value to the I64 remainder accumulator.  The mirror
+    // computes at the stream type, whose LOW BYTE is exact (ring
+    // homomorphism); the analyzer proved the value's interval, so the
+    // widening reads that byte with the interval's signedness.  A 0/1
+    // predicate is the same under either.
     let wide_v = count_fresh(&mut *next_val_id);
     rem_body_insts.push(Instruction::Cast {
         dest: wide_v,
         src: scalar_v,
-        from_ty: p.elem_ty,
+        from_ty: match p.kind {
+            ByteSumKind::Predicate => p.elem_ty,
+            ByteSumKind::Unsigned => IrType::U8,
+            ByteSumKind::Signed => IrType::I8,
+        },
         to_ty: IrType::I64,
     });
     rem_body_insts.push(Instruction::BinOp {
@@ -11113,38 +12127,28 @@ fn transform_byte_count_reduction_inner(
         _ => IrConst::I64(n),
     };
     let divided_limit = match &p.limit {
-        Operand::Const(IrConst::I32(n)) => Operand::Const(IrConst::I32(*n / VEC_WIDTH as i32)),
-        Operand::Const(IrConst::I64(n)) => Operand::Const(IrConst::I64(*n / VEC_WIDTH)),
+        Operand::Const(IrConst::I32(n)) => Operand::Const(IrConst::I32(*n / vec_width as i32)),
+        Operand::Const(IrConst::I64(n)) => Operand::Const(IrConst::I64(*n / vec_width)),
         Operand::Value(limit_val) => {
-            let shift = VEC_WIDTH.trailing_zeros() as i64;
+            let shift = vec_width.trailing_zeros() as i64;
             let quotient = count_fresh(&mut *next_val_id);
             let shift_inst = Instruction::BinOp {
                 dest: quotient,
                 op: divide_op,
                 lhs: Operand::Value(*limit_val),
                 rhs: Operand::Const(int_const(if divide_op == IrBinOp::SDiv {
-                    VEC_WIDTH
+                    vec_width
                 } else {
                     shift
                 })),
                 ty: p.iv_ty,
             };
-            func.blocks[preheader_idx].instructions.push(shift_inst);
+            spanned_push(&mut func.blocks[preheader_idx], shift_inst);
             changes += 1;
             Operand::Value(quotient)
         }
         _ => return 0,
     };
-
-    // Rewrite only the branch-tested exit comparison to the divided limit.
-    // Unrelated body comparisons that also mention the IV must remain intact.
-    if let Instruction::Cmp { rhs, .. } = &mut func.blocks[p.header_idx].instructions[exit_cmp_idx]
-    {
-        *rhs = divided_limit.clone();
-        changes += 1;
-    } else {
-        debug_assert!(false, "preflighted byte-count exit comparison changed");
-    }
 
     // The byte IV (mirrors the map transform).
     let byte_iv = count_fresh(&mut *next_val_id);
@@ -11154,7 +12158,8 @@ fn transform_byte_count_reduction_inner(
         .iter()
         .position(|i| !matches!(i, Instruction::Phi { .. }))
         .unwrap_or(func.blocks[p.header_idx].instructions.len());
-    func.blocks[p.header_idx].instructions.insert(
+    spanned_insert(
+        &mut func.blocks[p.header_idx],
         phi_pos,
         Instruction::Phi {
             dest: byte_iv,
@@ -11165,16 +12170,105 @@ fn transform_byte_count_reduction_inner(
             ],
         },
     );
-    func.blocks[p.latch_idx]
-        .instructions
-        .push(Instruction::BinOp {
+    spanned_push(
+        &mut func.blocks[p.latch_idx],
+        Instruction::BinOp {
             dest: byte_iv_next,
             op: IrBinOp::Add,
             lhs: Operand::Value(byte_iv),
-            rhs: Operand::Const(IrConst::I64(VEC_WIDTH)),
+            rhs: Operand::Const(IrConst::I64(vec_width)),
             ty: IrType::I64,
-        });
+        },
+    );
     changes += 2;
+
+    // ONE induction variable in the vector loop: the branch-tested exit
+    // comparison `iv OP limit` becomes `byte_iv OP vec_end`, with
+    // `byte_iv = iv * W` and `vec_end = ext64(limit / W) * W` (preheader).
+    // Multiplying both sides by W > 0 is monotone and injective in i64 for
+    // every 32-bit quotient (and for a 64-bit one, |quotient * W| <= |limit|),
+    // so the predicate is kept verbatim -- signedness and polarity included --
+    // once the quotient is widened the way the PREDICATE reads it (sign- for
+    // a signed compare, zero- for an unsigned one; `byte_iv` itself is a
+    // small non-negative count, identical under both).  A non-positive
+    // signed quotient keeps `0 OP vec_end` false exactly like `0 OP q`.  The
+    // original counter is then read by nothing but its own increment (every
+    // outside use is rewritten to a limit-based value below, the resume
+    // index comes from `byte_iv`), so DCE drops it: before, the loop paid a
+    // second increment, and the exit converted the trip count back to bytes
+    // (`shl; cltq; movslq`).  Unrelated body comparisons that also mention
+    // the IV stay intact.
+    // The byte-IV phi went in at `phi_pos`, ahead of every non-phi
+    // instruction, so the exit comparison moved down by one.
+    let exit_cmp_at = exit_cmp_idx + usize::from(phi_pos <= exit_cmp_idx);
+    let exit_op = match &func.blocks[p.header_idx].instructions[exit_cmp_at] {
+        Instruction::Cmp { op, .. } => *op,
+        _ => {
+            debug_assert!(false, "preflighted byte-count exit comparison changed");
+            IrCmpOp::Slt
+        }
+    };
+    let unsigned_exit = matches!(
+        exit_op,
+        IrCmpOp::Ult | IrCmpOp::Ule | IrCmpOp::Ugt | IrCmpOp::Uge
+    );
+    let vec_end = match &divided_limit {
+        Operand::Const(c) => {
+            let q = match c {
+                IrConst::I32(v) if unsigned_exit => i64::from(*v as u32),
+                IrConst::I32(v) => i64::from(*v),
+                IrConst::I64(v) => *v,
+                _ => {
+                    debug_assert!(false, "divided limit is an integer constant");
+                    0
+                }
+            };
+            Operand::Const(IrConst::I64(q * vec_width))
+        }
+        Operand::Value(q) => {
+            let wide = if matches!(p.iv_ty, IrType::I64 | IrType::U64) {
+                Operand::Value(*q)
+            } else {
+                let w = count_fresh(&mut *next_val_id);
+                spanned_push(
+                    &mut func.blocks[preheader_idx],
+                    Instruction::Cast {
+                        dest: w,
+                        src: Operand::Value(*q),
+                        from_ty: if unsigned_exit {
+                            IrType::U32
+                        } else {
+                            IrType::I32
+                        },
+                        to_ty: IrType::I64,
+                    },
+                );
+                Operand::Value(w)
+            };
+            let end = count_fresh(&mut *next_val_id);
+            spanned_push(
+                &mut func.blocks[preheader_idx],
+                Instruction::BinOp {
+                    dest: end,
+                    op: IrBinOp::Shl,
+                    lhs: wide,
+                    rhs: Operand::Const(IrConst::I64(i64::from(vec_width.trailing_zeros()))),
+                    ty: IrType::I64,
+                },
+            );
+            changes += 1;
+            Operand::Value(end)
+        }
+    };
+    if let Instruction::Cmp { lhs, rhs, ty, .. } =
+        &mut func.blocks[p.header_idx].instructions[exit_cmp_at]
+    {
+        *lhs = Operand::Value(byte_iv);
+        *rhs = vec_end.clone();
+        *ty = IrType::I64;
+        changes += 1;
+    }
+    let const_trip = byte_sum_const_trip(func, p, &vec_end, exit_op, unsigned_exit);
 
     // The zero vector for `vpsadbw`'s second operand lives in the preheader
     // (register-allocated once); the `& 1` constant rides the tree's own
@@ -11191,14 +12285,19 @@ fn transform_byte_count_reduction_inner(
     // producers in class 8 the whole web — zero → phi → vpaddq → backedge
     // → horizontal exit — unifies and stays register-homed.
     let zero_vec = count_fresh(&mut *next_val_id);
-    func.blocks[preheader_idx]
-        .instructions
-        .push(Instruction::Intrinsic {
+    spanned_push(
+        &mut func.blocks[preheader_idx],
+        Instruction::Intrinsic {
             dest: Some(zero_vec),
-            op: IntrinsicOp::VecZeroI64x4,
+            op: if ymm {
+                IntrinsicOp::VecZeroI64x4
+            } else {
+                IntrinsicOp::VecZeroI64x2
+            },
             dest_ptr: None,
             args: vec![],
-        });
+        },
+    );
     changes += 1;
 
     // Emit the packed body through `MapEmitCtx`, replacing the scalar add.
@@ -11210,8 +12309,16 @@ fn transform_byte_count_reduction_inner(
             src_bases: &p.src_bases,
             byte_iv,
             byte_disp: 0,
-            load_op: IntrinsicOp::VecLoadI32x8,
-            broadcast_op: IntrinsicOp::VecBroadcastI32x8,
+            load_op: if ymm {
+                IntrinsicOp::VecLoadI32x8
+            } else {
+                IntrinsicOp::VecLoadI32x4
+            },
+            broadcast_op: if ymm {
+                IntrinsicOp::VecBroadcastI32x8
+            } else {
+                IntrinsicOp::VecBroadcastI32x4
+            },
             sqrt_op: None,
             round_op: None,
             madd_op: None,
@@ -11221,7 +12328,11 @@ fn transform_byte_count_reduction_inner(
             minmax_op: &minmax_op,
             blendv_op,
             narrow_const_bytes: Some(1),
-            byte_broadcast_op: Some(IntrinsicOp::VecBroadcastI8x32),
+            byte_broadcast_op: Some(if ymm {
+                IntrinsicOp::VecBroadcastI8x32
+            } else {
+                IntrinsicOp::VecBroadcastI8x16
+            }),
             node_cache: Vec::new(),
             broadcast_cache: Vec::new(),
             preheader_insts: Vec::new(),
@@ -11231,22 +12342,31 @@ fn transform_byte_count_reduction_inner(
         };
         let _ = &mut preheader_insts;
         let _ = &mut vec_insts;
-        // The emitted tree ALWAYS ends in `& 1` (the wrap above made sure
-        // of it), so its result is directly the 0/1 byte-lane vector.
-        let sad_src = match ctx.emit(&count_tree) {
+        // The packed tree's lanes are the per-byte addends: `& 1` for a
+        // predicate (or the raw 0/0xFF mask, scaled out at the exit), the
+        // byte itself, or the `^ 0x80`-biased byte.
+        let sad_src = match ctx.emit(&packed_tree) {
             Some(m) => m,
             None => return 0,
         };
         let sad_v = count_fresh(&mut ctx.next_val_id);
         ctx.vec_insts.push(Instruction::Intrinsic {
             dest: Some(sad_v),
-            op: IntrinsicOp::VecSadbwU8x32,
+            op: if ymm {
+                IntrinsicOp::VecSadbwU8x32
+            } else {
+                IntrinsicOp::VecSadbwU8x16
+            },
             dest_ptr: None,
             args: vec![Operand::Value(sad_src), Operand::Value(zero_vec)],
         });
         ctx.vec_insts.push(Instruction::Intrinsic {
             dest: Some(acc_sum),
-            op: IntrinsicOp::VecAddI64x4,
+            op: if ymm {
+                IntrinsicOp::VecAddI64x4
+            } else {
+                IntrinsicOp::VecAddI64x2
+            },
             dest_ptr: None,
             args: vec![Operand::Value(p.acc_phi), Operand::Value(sad_v)],
         });
@@ -11254,21 +12374,25 @@ fn transform_byte_count_reduction_inner(
         *next_val_id = ctx.next_val_id;
         let pre = std::mem::take(&mut ctx.preheader_insts);
         let body = std::mem::take(&mut ctx.vec_insts);
-        func.blocks[preheader_idx].instructions.extend(pre);
-        // Replace the scalar add with the packed chain IN ORDER (splice:
-        // repeated `insert(ai+1, ..)` would reverse the chain).
+        for inst in pre {
+            spanned_push(&mut func.blocks[preheader_idx], inst);
+        }
+        // Replace the scalar add with the packed chain IN ORDER, every
+        // instruction inheriting the add's source span.
         let (ab, ai) = p.add_site;
-        // Unreachable-by-construction: the chain lowers `And(tree, 1)`,
-        // which emits at least the And, the sadbw and the accumulator add.
+        // Unreachable-by-construction: the chain always ends in the sadbw
+        // and the accumulator add pushed just above.
         // Fail loudly rather than silently returning mid-mutation (which
         // would leave the function half-rewritten).
         let Some(first) = body.first() else {
-            unreachable!("counting chain is never empty: And(tree,1) lowers to >= 3 instructions");
+            unreachable!("byte-sum chain is never empty: it ends in sadbw + accumulator add");
         };
         let rest: Vec<Instruction> = body.iter().skip(1).cloned().collect();
         let add_inst = &mut func.blocks[ab].instructions[ai];
         *add_inst = first.clone();
-        func.blocks[ab].instructions.splice(ai + 1..ai + 1, rest);
+        for (k, inst) in rest.into_iter().enumerate() {
+            spanned_insert(&mut func.blocks[ab], ai + 1 + k, inst);
+        }
     }
 
     // Rewire the accumulator phi: entry → zero vector, backedge → acc_sum.
@@ -11327,26 +12451,47 @@ fn transform_byte_count_reduction_inner(
         }
     }
 
+    if const_trip.is_some() {
+        changes += byte_sum_bottom_test_packed_loop(
+            func,
+            p,
+            exit_cmp_at,
+            (byte_iv, byte_iv_next),
+            vec_exit_label,
+            &mut *next_val_id,
+        );
+    }
+    // What the vector exit reads.  The bottom-tested loop leaves from the
+    // latch, after the backedge values exist: the accumulator is the phi's
+    // latch incoming and the consumed byte count is the constant `packed`.
+    let (acc_out, consumed) = match const_trip {
+        Some(t) => (
+            phi_incoming_from(func, p.header_idx, p.acc_phi, latch_label)
+                .unwrap_or(Operand::Value(p.acc_phi)),
+            Operand::Const(IrConst::I64(t.packed)),
+        ),
+        None => (Operand::Value(p.acc_phi), Operand::Value(byte_iv)),
+    };
     let vec_exit_block = BasicBlock {
         label: vec_exit_label,
         instructions: {
             // The rematerialized source-base chains first: they dominate
             // (and are consumed by) the remainder below.
-            let mut insts = vec_exit_prefix;
-            insts.push(Instruction::Intrinsic {
-                dest: Some(h),
-                op: IntrinsicOp::VecHorizontalAddI64x4,
-                dest_ptr: None,
-                args: vec![Operand::Value(p.acc_phi)],
-            });
-            insts.push(Instruction::BinOp {
-                dest: rem_start,
-                op: IrBinOp::Mul,
-                lhs: Operand::Value(p.iv),
-                rhs: Operand::Const(iv_width_const),
-                ty: p.iv_ty,
-            });
-            insts
+            byte_sum_exit_insts(
+                &ByteSumExit {
+                    h,
+                    rem_start,
+                    acc: acc_out,
+                    consumed,
+                    iv_ty: p.iv_ty,
+                    ymm,
+                    signed: p.kind == ByteSumKind::Signed,
+                    mask_sum,
+                    complement,
+                },
+                vec_exit_prefix,
+                &mut *next_val_id,
+            )
         },
         terminator: Terminator::Branch(rem_header_label),
         source_spans: vec![],
@@ -11354,6 +12499,21 @@ fn transform_byte_count_reduction_inner(
     func.blocks.push(vec_exit_block);
     let vec_exit_idx = func.blocks.len() - 1;
     changes += 1;
+    // The remainder's exit edge (source block, accumulator on it) that the
+    // exit phis read.  A constant trip count decides the remainder at
+    // compile time: no remainder at all when `limit % W == 0` (the vector
+    // exit jumps straight to the exit), otherwise at least one iteration,
+    // so the remainder is bottom-tested like the vector loop.
+    let rem_trips = const_trip.map(|t| t.rem);
+    let (rem_exit_label, rem_exit_acc) = match rem_trips {
+        Some(0) => {
+            func.blocks[vec_exit_idx].terminator = Terminator::Branch(exit_label);
+            (vec_exit_label, h)
+        }
+        Some(_) => (rem_latch_label, r_acc_next),
+        None => (rem_header_label, r_acc),
+    };
+    let rem_bottom_tested = rem_trips.is_some_and(|r| r > 0);
 
     // Remainder header: r_acc phi (entry: h) + iv phi + compare.
     let mut rem_header_insts = vec![
@@ -11373,30 +12533,34 @@ fn transform_byte_count_reduction_inner(
                 (Operand::Value(rem_iv_next), rem_latch_label),
             ],
         },
-        Instruction::Cmp {
-            dest: rem_cmp,
-            // Reuse EXACTLY the accepted exit predicate: a U32 IV needs
-            // Ult (an Slt on a value >= 2^31 reads negative and runs
-            // away), an I32 IV needs Slt.  The analyzer guarantees this
-            // is one of the two.
-            op: p.exit_cmp_op,
-            lhs: Operand::Value(rem_iv),
-            rhs: p.limit.clone(),
-            ty: p.iv_ty,
-        },
     ];
-    let _ = &mut rem_header_insts;
-    let rem_header_block = BasicBlock {
-        label: rem_header_label,
-        instructions: rem_header_insts,
-        terminator: Terminator::CondBranch {
+    // Reuse EXACTLY the accepted exit predicate: a U32 IV needs Ult (an Slt
+    // on a value >= 2^31 reads negative and runs away), an I32 IV needs
+    // Slt.  The analyzer guarantees this is one of the two.  Top-tested it
+    // reads `rem_iv`; bottom-tested, the latch reads `rem_iv_next`.
+    let rem_test = |iv: Value| Instruction::Cmp {
+        dest: rem_cmp,
+        op: p.exit_cmp_op,
+        lhs: Operand::Value(iv),
+        rhs: p.limit.clone(),
+        ty: p.iv_ty,
+    };
+    let rem_header_term = if rem_bottom_tested {
+        Terminator::Branch(rem_body_label)
+    } else {
+        rem_header_insts.push(rem_test(rem_iv));
+        Terminator::CondBranch {
             cond: Operand::Value(rem_cmp),
             true_label: rem_body_label,
             false_label: exit_label,
-        },
+        }
+    };
+    let rem_header_block = BasicBlock {
+        label: rem_header_label,
+        instructions: rem_header_insts,
+        terminator: rem_header_term,
         source_spans: vec![],
     };
-    func.blocks.push(rem_header_block);
 
     // Remainder body: the pre-mutation-emitted scalar mirror (see the
     // construction site above) plus the accumulator update.
@@ -11406,21 +12570,37 @@ fn transform_byte_count_reduction_inner(
         terminator: Terminator::Branch(rem_latch_label),
         source_spans: vec![],
     };
-    func.blocks.push(rem_body_block);
 
+    let mut rem_latch_insts = vec![Instruction::BinOp {
+        dest: rem_iv_next,
+        op: IrBinOp::Add,
+        lhs: Operand::Value(rem_iv),
+        rhs: Operand::Const(rem_one),
+        ty: p.iv_ty,
+    }];
+    let rem_latch_term = if rem_bottom_tested {
+        rem_latch_insts.push(rem_test(rem_iv_next));
+        Terminator::CondBranch {
+            cond: Operand::Value(rem_cmp),
+            true_label: rem_header_label,
+            false_label: exit_label,
+        }
+    } else {
+        Terminator::Branch(rem_header_label)
+    };
     let rem_latch_block = BasicBlock {
         label: rem_latch_label,
-        instructions: vec![Instruction::BinOp {
-            dest: rem_iv_next,
-            op: IrBinOp::Add,
-            lhs: Operand::Value(rem_iv),
-            rhs: Operand::Const(rem_one),
-            ty: p.iv_ty,
-        }],
-        terminator: Terminator::Branch(rem_header_label),
+        instructions: rem_latch_insts,
+        terminator: rem_latch_term,
         source_spans: vec![],
     };
-    func.blocks.push(rem_latch_block);
+    // An elided remainder (constant trip count, `limit % W == 0`) emits
+    // none of its blocks: nothing branches to them.
+    if rem_trips != Some(0) {
+        func.blocks.push(rem_header_block);
+        func.blocks.push(rem_body_block);
+        func.blocks.push(rem_latch_block);
+    }
 
     // Final value: an exit-block phi merging r_acc (the remainder edge)
     // with 0 (every non-loop edge -- the loop guard's bypass and any
@@ -11476,7 +12656,7 @@ fn transform_byte_count_reduction_inner(
     let mut pos = exit_block_phis;
     let acc_on_exit: Operand = if other_preds.is_empty() {
         // Single-predecessor exit (unguarded loop): r_acc is the value.
-        Operand::Value(r_acc)
+        Operand::Value(rem_exit_acc)
     } else {
         // Merge: 0 on every path that did not go through the remainder
         // (acc_init is added separately below), r_acc on the remainder
@@ -11486,8 +12666,9 @@ fn transform_byte_count_reduction_inner(
         for lbl in &other_preds {
             incoming.push((Operand::Const(IrConst::I64(0)), *lbl));
         }
-        incoming.push((Operand::Value(r_acc), rem_header_label));
-        func.blocks[p.exit_idx].instructions.insert(
+        incoming.push((Operand::Value(rem_exit_acc), rem_exit_label));
+        spanned_insert(
+            &mut func.blocks[p.exit_idx],
             pos,
             Instruction::Phi {
                 dest: exit_phi,
@@ -11499,7 +12680,8 @@ fn transform_byte_count_reduction_inner(
         changes += 1;
         Operand::Value(exit_phi)
     };
-    func.blocks[p.exit_idx].instructions.insert(
+    spanned_insert(
+        &mut func.blocks[p.exit_idx],
         pos,
         Instruction::Cast {
             dest: init_wide,
@@ -11509,7 +12691,8 @@ fn transform_byte_count_reduction_inner(
         },
     );
     pos += 1;
-    func.blocks[p.exit_idx].instructions.insert(
+    spanned_insert(
+        &mut func.blocks[p.exit_idx],
         pos,
         Instruction::BinOp {
             dest: total_wide,
@@ -11524,7 +12707,8 @@ fn transform_byte_count_reduction_inner(
         total_wide
     } else {
         let t = count_fresh(&mut *next_val_id);
-        func.blocks[p.exit_idx].instructions.insert(
+        spanned_insert(
+            &mut func.blocks[p.exit_idx],
             2,
             Instruction::Cast {
                 dest: t,
@@ -11566,24 +12750,26 @@ fn transform_byte_count_reduction_inner(
             IrType::I32 => Operand::Const(IrConst::I32(0)),
             _ => Operand::Const(IrConst::I64(0)),
         };
-        func.blocks[vec_exit_idx]
-            .instructions
-            .push(Instruction::Cmp {
+        spanned_push(
+            &mut func.blocks[vec_exit_idx],
+            Instruction::Cmp {
                 dest: c,
                 op: IrCmpOp::Sgt,
                 lhs: p.limit.clone(),
                 rhs: zero.clone(),
                 ty: p.iv_ty,
-            });
-        func.blocks[vec_exit_idx]
-            .instructions
-            .push(Instruction::Select {
+            },
+        );
+        spanned_push(
+            &mut func.blocks[vec_exit_idx],
+            Instruction::Select {
                 dest: s,
                 cond: Operand::Value(c),
                 true_val: p.limit.clone(),
                 false_val: zero,
                 ty: p.iv_ty,
-            });
+            },
+        );
         Operand::Value(s)
     } else {
         // unsigned: the limit itself (defined outside the loop, so it
@@ -11607,8 +12793,9 @@ fn transform_byte_count_reduction_inner(
         for lbl in &other_preds {
             incoming.push((iv_entry_const.clone(), *lbl));
         }
-        incoming.push((iv_final_edge, rem_header_label));
-        func.blocks[p.exit_idx].instructions.insert(
+        incoming.push((iv_final_edge, rem_exit_label));
+        spanned_insert(
+            &mut func.blocks[p.exit_idx],
             exit_block_phis,
             Instruction::Phi {
                 dest: iv_exit_phi,
@@ -11621,9 +12808,8 @@ fn transform_byte_count_reduction_inner(
     };
     // Rewrite every outside use of the IV phi — INCLUDING Intrinsic
     // consumers (a later packed op reading `i`), but EXCLUDING the new
-    // blocks: the vec-exit's `rem_start = iv << 5` deliberately reads
-    // the VECTOR IV (that is the resume computation), and the remainder
-    // blocks never reference the original phi.
+    // blocks (which never reference the original phi: the resume index
+    // reads the byte IV).
     if let Operand::Value(iv_repl) = &iv_on_exit {
         let iv_updates =
             rewrite_value_uses_outside(func, &p.loop_blocks, &new_block_labels, p.iv.0, *iv_repl);
@@ -15235,6 +16421,86 @@ fn narrow_domains(elem_bytes: u32) -> ((i64, i64), (i64, i64)) {
 /// The value of a lane mask: all-ones (-1) or all-zeros (0).
 const MASK_RANGE: (i64, i64) = (-1, 0);
 
+/// The value domain of an integer type, when it fits an `i64` interval.
+fn int_type_domain(ty: IrType) -> Option<(i64, i64)> {
+    match ty {
+        IrType::I8 => Some((i64::from(i8::MIN), i64::from(i8::MAX))),
+        IrType::U8 => Some((0, i64::from(u8::MAX))),
+        IrType::I16 => Some((i64::from(i16::MIN), i64::from(i16::MAX))),
+        IrType::U16 => Some((0, i64::from(u16::MAX))),
+        IrType::I32 => Some((i64::from(i32::MIN), i64::from(i32::MAX))),
+        IrType::U32 => Some((0, i64::from(u32::MAX))),
+        IrType::I64 => Some((i64::MIN, i64::MAX)),
+        _ => None,
+    }
+}
+
+/// Interval of `cast from_ty -> to_ty` for a non-narrowing cast (widening or
+/// same-size reinterpretation), given the source interval.
+///
+/// The result value is the source bits read as `from_ty` (widening) or as
+/// `to_ty` (same size).  An interval already inside that domain is the exact
+/// answer; otherwise the cast can wrap, and the whole domain is the sound
+/// answer.  `None` (unknown) stays unknown, and so does a type without an
+/// `i64` domain (`U64`): the caller then refuses anything range-dependent.
+fn cast_range(r: WideRange, from_ty: IrType, to_ty: IrType) -> WideRange {
+    let read_as = if to_ty.size() > from_ty.size() {
+        from_ty
+    } else {
+        to_ty
+    };
+    let r = r?;
+    let dom = int_type_domain(read_as)?;
+    if range_within(Some(r), dom) {
+        Some(r)
+    } else {
+        Some(dom)
+    }
+}
+
+#[cfg(test)]
+mod cast_range_tests {
+    use super::*;
+
+    #[test]
+    fn non_narrowing_casts_carry_the_interval_of_their_semantics() {
+        // Same-size reinterpretation: [0, 255] read as i8 wraps.
+        assert_eq!(
+            cast_range(Some((0, 255)), IrType::U8, IrType::I8),
+            Some((-128, 127))
+        );
+        assert_eq!(
+            cast_range(Some((-128, 127)), IrType::I8, IrType::U8),
+            Some((0, 255))
+        );
+        // ...but an interval inside both domains survives exactly.
+        assert_eq!(
+            cast_range(Some((0, 127)), IrType::U8, IrType::I8),
+            Some((0, 127))
+        );
+        assert_eq!(
+            cast_range(Some((3, 9)), IrType::I8, IrType::U8),
+            Some((3, 9))
+        );
+        // Widening reads the SOURCE type: value-preserving inside its domain.
+        assert_eq!(
+            cast_range(Some((0, 255)), IrType::U8, IrType::I32),
+            Some((0, 255))
+        );
+        assert_eq!(
+            cast_range(Some((-128, 127)), IrType::I8, IrType::I64),
+            Some((-128, 127))
+        );
+        assert_eq!(
+            cast_range(Some((0, 255)), IrType::I8, IrType::I32),
+            Some((-128, 127))
+        );
+        // Unknown stays unknown; a type with no i64 domain refuses.
+        assert_eq!(cast_range(None, IrType::U8, IrType::I8), None);
+        assert_eq!(cast_range(Some((0, 5)), IrType::I64, IrType::U64), None);
+    }
+}
+
 fn range_within(r: WideRange, bound: (i64, i64)) -> bool {
     matches!(r, Some((lo, hi)) if lo >= bound.0 && hi <= bound.1)
 }
@@ -15359,6 +16625,74 @@ fn normalize_cmp_for_lanes(op: IrCmpOp) -> (IrCmpOp, bool) {
     }
 }
 
+/// The lane form of a byte-map compare over parsed operands `l`/`r` (with
+/// their value ranges): the mask itself for `mask != 0`, otherwise a lane
+/// compare in the byte domain both sides fit (after wrapping a folded
+/// constant spelling), or `None` when no domain is exact.
+fn byte_map_cmp(
+    op: IrCmpOp,
+    mut l: MapExpr,
+    lr: WideRange,
+    mut r: MapExpr,
+    rr: WideRange,
+    u_dom: (i64, i64),
+    s_dom: (i64, i64),
+) -> Option<(MapExpr, WideRange)> {
+    // `m != 0` over a lane MASK is `m` itself in both worlds: the
+    // scalar value of a compare is 0/1 and its packed value 0/-1,
+    // and `!= 0` maps each onto itself.  Re-deriving it would cost
+    // a compare plus an all-ones NOT per vector (`if (p[i] == 0)
+    // c++` arrives as `(p[i] == 0) != 0` after count
+    // normalisation: two pcmpeqb and a pxor instead of one
+    // pcmpeqb).  `m == 0` stays a compare: it is the single
+    // pcmpeqb NOT, the cheapest spelling there is.
+    if op == IrCmpOp::Ne {
+        let is_mask = |e: &MapExpr| matches!(e, MapExpr::Cmp(..) | MapExpr::MaskConj { .. });
+        let is_zero = |e: &MapExpr| matches!(e, MapExpr::Invariant(Operand::Const(c)) if c.to_i64() == Some(0));
+        if lr == Some(MASK_RANGE) && is_mask(&l) && is_zero(&r) {
+            return Some((l, Some(MASK_RANGE)));
+        }
+        if rr == Some(MASK_RANGE) && is_mask(&r) && is_zero(&l) {
+            return Some((r, Some(MASK_RANGE)));
+        }
+    }
+    // The frontend's narrow-compare fold wraps compare constants
+    // to the lane width: C's `zext(x) == 0xAA` (an int compare
+    // against 170) arrives as a U8-lane compare against the I8
+    // spelling of 0xAA, i.e. −86.  The wrapped spelling is exact
+    // at the lane width, but the constant's range (−86, −86)
+    // fails the unsigned-domain side-condition below and the
+    // whole loop would stay scalar — precisely the shape memchr
+    // and table-lookup classifiers write.  Reinterpret a
+    // single-point CONSTANT modulo the other side's byte domain,
+    // rewriting the invariant so the packed splat, the range
+    // analysis, and the scalar remainder mirror all see the
+    // domain value (170 for the example).  Runtime invariants
+    // never wrap (their value is unknowable); only the folded
+    // constant spelling does.
+    let byte_op = if range_within(lr, u_dom) && range_within(rr, u_dom) {
+        byte_predicate_unsigned(op)
+    } else if range_within(lr, s_dom) && range_within(rr, s_dom) {
+        op
+    } else if try_wrap_lane_cmp_constant(&mut l, lr, rr, u_dom)
+        || try_wrap_lane_cmp_constant(&mut r, rr, lr, u_dom)
+    {
+        byte_predicate_unsigned(op)
+    } else if try_wrap_lane_cmp_constant(&mut l, lr, rr, s_dom)
+        || try_wrap_lane_cmp_constant(&mut r, rr, lr, s_dom)
+    {
+        op
+    } else {
+        return None;
+    };
+    let (norm_op, swap) = normalize_cmp_for_lanes(byte_op);
+    let (a, b) = if swap { (r, l) } else { (l, r) };
+    Some((
+        MapExpr::Cmp(norm_op, Box::new(a), Box::new(b)),
+        Some(MASK_RANGE),
+    ))
+}
+
 /// Parse the expression feeding a BYTE store into a byte-lane `MapExpr`,
 /// together with the interval its value can take in the WIDE domain.
 ///
@@ -15466,9 +16800,24 @@ fn parse_byte_map_expr(
                 elem_bytes,
             )?;
             if to_ty.size() >= from_ty.size() {
-                // Widening (zext/sext): value-preserving, hence the identity
-                // on the narrow lane.  The interval is unchanged.
-                Some((e, r))
+                // Widening (zext/sext) and same-size signedness changes are
+                // the identity on the narrow lane (no bit changes), but NOT
+                // necessarily on the interval:
+                //
+                //   * widening reads the source as `from_ty`: the result is
+                //     the source interval when it lies in `from_ty`'s
+                //     domain, and that domain otherwise;
+                //   * a same-size reinterpretation (`(signed char)u8`, the
+                //     `Cast U8 -> I8` lccc emits for it) maps [0, 255] onto
+                //     [-128, 127]: the interval survives only when it fits
+                //     `to_ty`'s domain.
+                //
+                // Passing the interval through unchanged gave
+                // `(signed char)p[i]` the range [0, 255], so the compare arm
+                // picked the UNSIGNED byte predicate and
+                // `(signed char)p[i] < 0` was false for every byte >= 0x80
+                // (a live miscompile of the byte map vectorizer).
+                Some((e, cast_range(r, *from_ty, *to_ty)))
             } else if to_ty.size() == elem_bytes as usize {
                 // Truncation to the LANE width: the identity on the lane, and
                 // the result's interval is that width's domain (C defines
@@ -15537,7 +16886,7 @@ fn parse_byte_map_expr(
             ))
         }
         Instruction::Cmp { op, lhs, rhs, .. } => {
-            let (mut l, lr) = parse_byte_map_operand(
+            let (l, lr) = parse_byte_map_operand(
                 func,
                 loop_blocks,
                 leaf_tys,
@@ -15546,7 +16895,7 @@ fn parse_byte_map_expr(
                 depth + 1,
                 elem_bytes,
             )?;
-            let (mut r, rr) = parse_byte_map_operand(
+            let (r, rr) = parse_byte_map_operand(
                 func,
                 loop_blocks,
                 leaf_tys,
@@ -15555,41 +16904,7 @@ fn parse_byte_map_expr(
                 depth + 1,
                 elem_bytes,
             )?;
-            // The frontend's narrow-compare fold wraps compare constants
-            // to the lane width: C's `zext(x) == 0xAA` (an int compare
-            // against 170) arrives as a U8-lane compare against the I8
-            // spelling of 0xAA, i.e. −86.  The wrapped spelling is exact
-            // at the lane width, but the constant's range (−86, −86)
-            // fails the unsigned-domain side-condition below and the
-            // whole loop would stay scalar — precisely the shape memchr
-            // and table-lookup classifiers write.  Reinterpret a
-            // single-point CONSTANT modulo the other side's byte domain,
-            // rewriting the invariant so the packed splat, the range
-            // analysis, and the scalar remainder mirror all see the
-            // domain value (170 for the example).  Runtime invariants
-            // never wrap (their value is unknowable); only the folded
-            // constant spelling does.
-            let byte_op = if range_within(lr, u_dom) && range_within(rr, u_dom) {
-                byte_predicate_unsigned(*op)
-            } else if range_within(lr, s_dom) && range_within(rr, s_dom) {
-                *op
-            } else if try_wrap_lane_cmp_constant(&mut l, lr, rr, u_dom)
-                || try_wrap_lane_cmp_constant(&mut r, rr, lr, u_dom)
-            {
-                byte_predicate_unsigned(*op)
-            } else if try_wrap_lane_cmp_constant(&mut l, lr, rr, s_dom)
-                || try_wrap_lane_cmp_constant(&mut r, rr, lr, s_dom)
-            {
-                *op
-            } else {
-                return None;
-            };
-            let (norm_op, swap) = normalize_cmp_for_lanes(byte_op);
-            let (a, b) = if swap { (r, l) } else { (l, r) };
-            Some((
-                MapExpr::Cmp(norm_op, Box::new(a), Box::new(b)),
-                Some(MASK_RANGE),
-            ))
+            byte_map_cmp(*op, l, lr, r, rr, u_dom, s_dom)
         }
         Instruction::Select {
             cond,
@@ -26116,12 +27431,27 @@ fn emit_invariant_vector_bound(
                 rhs: Operand::Const(const_of(i128::from(start_elem))),
                 ty: limit_ty,
             },
-            Instruction::BinOp {
-                dest: trips,
-                op: IrBinOp::SDiv,
-                lhs: Operand::Value(remaining),
-                rhs: Operand::Const(const_of(i128::from(vec_width))),
-                ty: limit_ty,
+            // `remaining = max(limit, start) - start` is non-negative by
+            // construction, where truncating and flooring division agree:
+            // a power-of-two width is one `sar`. The backend does not
+            // strength-reduce a division created this late (it would emit
+            // `cqo` + `idiv`, tens of cycles per loop entry).
+            if width_pow2 {
+                Instruction::BinOp {
+                    dest: trips,
+                    op: IrBinOp::AShr,
+                    lhs: Operand::Value(remaining),
+                    rhs: Operand::Const(const_of(i128::from(vec_width.trailing_zeros()))),
+                    ty: limit_ty,
+                }
+            } else {
+                Instruction::BinOp {
+                    dest: trips,
+                    op: IrBinOp::SDiv,
+                    lhs: Operand::Value(remaining),
+                    rhs: Operand::Const(const_of(i128::from(vec_width))),
+                    ty: limit_ty,
+                }
             },
         ]);
         let relative = if use_byte_iv {
@@ -26178,10 +27508,18 @@ fn emit_invariant_vector_bound(
 
     let div_dest = Value(*next_val_id);
     *next_val_id += 1;
-    let (div_op, divisor) = if signed_limit {
+    let (div_op, divisor) = if signed_limit && use_byte_iv && width_pow2 {
+        // The byte-IV path clamps the signed quotient to >= 0 before ANY use
+        // (below). Under that clamp flooring equals truncating division: for
+        // limit >= 0 they are identical, and for limit < 0 both quotients are
+        // <= 0 and clamp to 0. So one `sar` replaces `cqo` + `idiv` (the
+        // backend does not strength-reduce a division created this late).
+        (IrBinOp::AShr, u64::from(vec_width.trailing_zeros()))
+    } else if signed_limit {
         // `LShr` would turn a negative signed loop bound into a huge positive
-        // value. `AShr` is also wrong because C/IR signed division truncates
-        // toward zero rather than rounding negative values down.
+        // value. Without the clamp `AShr` is also wrong: C/IR signed division
+        // truncates toward zero, and a floored negative bound would start the
+        // scalar remainder below the loop's start.
         (IrBinOp::SDiv, vec_width)
     } else if width_pow2 {
         (IrBinOp::LShr, vec_width.trailing_zeros() as u64)
@@ -26641,6 +27979,11 @@ mod reduction_bound_safety_tests {
                                         IrBinOp::Sub => a - b,
                                         IrBinOp::Mul => a * b,
                                         IrBinOp::SDiv => a / b,
+                                        // Floor shift: differs from SDiv on a
+                                        // negative dividend; the compare with
+                                        // the i128 oracle below proves the
+                                        // clamp to 0 that follows absorbs it.
+                                        IrBinOp::AShr => a >> b,
                                         IrBinOp::Shl => a << b,
                                         _ => panic!("unexpected bound operation: {inst:?}"),
                                     };
@@ -26858,9 +28201,22 @@ mod reduction_bound_safety_tests {
             .iter()
             .flat_map(|block| block.instructions.iter())
             .collect();
+        // Clamped signed quotient by a power-of-two width: an exact `sar`.
         assert!(instructions.iter().any(|inst| matches!(
             inst,
-            Instruction::BinOp { dest, op: IrBinOp::SDiv, .. } if *dest == Value(10)
+            Instruction::BinOp {
+                dest,
+                op: IrBinOp::AShr,
+                rhs: Operand::Const(IrConst::I32(3)),
+                ..
+            } if *dest == Value(10)
+        )));
+        assert!(!instructions.iter().any(|inst| matches!(
+            inst,
+            Instruction::BinOp {
+                op: IrBinOp::SDiv,
+                ..
+            }
         )));
         assert!(instructions.iter().any(|inst| matches!(
             inst,
@@ -26918,11 +28274,20 @@ mod reduction_bound_safety_tests {
                 ..
             }
         )));
+        // `max(limit, 1) - 1 >= 0`: the power-of-two division is a `sar`.
         assert!(nonzero_instructions.iter().any(|inst| matches!(
             inst,
             Instruction::BinOp {
-                op: IrBinOp::SDiv,
+                op: IrBinOp::AShr,
+                rhs: Operand::Const(IrConst::I32(3)),
                 ty: IrType::I32,
+                ..
+            }
+        )));
+        assert!(!nonzero_instructions.iter().any(|inst| matches!(
+            inst,
+            Instruction::BinOp {
+                op: IrBinOp::SDiv,
                 ..
             }
         )));
@@ -27074,8 +28439,10 @@ fn transform_reduction_avx2(
     // Determine vector width and intrinsics based on element type
     // NOTE: These are only used for pattern matching - the actual transform uses Vec* variants
     // The widening I32→I64 reduction consumes FOUR I32 lanes per iteration
-    // (VecWidenAddI32x4ToI64x2) and reduces into an I64x2 accumulator; its
-    // horizontal intrinsic is the I64x2 hadd.
+    // (VecWidenAddI32x4ToI64x4: `vpmovsxdq m128, %ymm` + `vpaddq`) into an
+    // I64x4 accumulator; its horizontal intrinsic is the I64x4 hadd. Four
+    // lanes per step (not eight) keeps the composite at two instructions
+    // with no vextracti128; vec_interleave supplies the unroll.
     let widening_i64 =
         pattern.accumulator_type == IrType::I64 && pattern.element_type == IrType::I32;
     let (vec_width, _load_intrinsic, _add_intrinsic, _mul_intrinsic, horizontal_intrinsic) =
@@ -27089,10 +28456,10 @@ fn transform_reduction_avx2(
             ),
             IrType::I32 if widening_i64 => (
                 4u64,
-                IntrinsicOp::VecWidenAddI32x4ToI64x2,
-                IntrinsicOp::VecWidenAddI32x4ToI64x2,
+                IntrinsicOp::VecWidenAddI32x4ToI64x4,
+                IntrinsicOp::VecWidenAddI32x4ToI64x4,
                 None,
-                IntrinsicOp::VecHorizontalAddI64x2,
+                IntrinsicOp::VecHorizontalAddI64x4,
             ),
             // v12 Fix F: Max reduction (find_max). 8-wide lane max with a
             // horizontal max-reduce. The transform body (below, replacing the
@@ -27619,9 +28986,9 @@ fn transform_reduction_avx2(
 
                 // Map to register-based intrinsics based on element type.
                 // The WIDENING case (I32 loads accumulated into an I64
-                // accumulator) uses the composite VecWidenAddI32x4ToI64x2
-                // intrinsic: one instruction = load 4×I32 + sign-extend +
-                // paddq into the I64x2 accumulator. The emitted body then
+                // accumulator) uses the composite VecWidenAddI32x4ToI64x4
+                // intrinsic: one step = load 4×I32 + sign-extend + vpaddq
+                // into the I64x4 accumulator. The emitted body then
                 // carries a single intrinsic instead of a load/add pair.
                 let widening_i64 =
                     pattern.accumulator_type == IrType::I64 && pattern.element_type == IrType::I32;
@@ -27632,9 +28999,9 @@ fn transform_reduction_avx2(
                         IntrinsicOp::VecZeroF64x4,
                     ),
                     IrType::I32 if widening_i64 => (
-                        IntrinsicOp::VecWidenAddI32x4ToI64x2,
-                        IntrinsicOp::VecWidenAddI32x4ToI64x2,
-                        IntrinsicOp::VecZeroI64x2,
+                        IntrinsicOp::VecWidenAddI32x4ToI64x4,
+                        IntrinsicOp::VecWidenAddI32x4ToI64x4,
+                        IntrinsicOp::VecZeroI64x4,
                     ),
                     IrType::I32 => (
                         IntrinsicOp::VecLoadI32x8,
@@ -27716,7 +29083,7 @@ fn transform_reduction_avx2(
                             .unwrap_or(Operand::Const(IrConst::I32(0)));
                         let masked_inst = Instruction::Intrinsic {
                             dest: Some(vec_sum_value),
-                            op: IntrinsicOp::VecWidenMaskedAddI32x4ToI64x2,
+                            op: IntrinsicOp::VecWidenMaskedAddI32x4ToI64x4,
                             dest_ptr: None,
                             args: vec![
                                 Operand::Value(pattern.accumulator_phi),
@@ -28351,25 +29718,30 @@ fn transform_reduction_sse2(
         return 0;
     }
 
-    // GUARDED REDUCTIONS FAIL CLOSED here EXCEPT the guarded widening sum:
-    // the 128-bit register-based path now has a masked value-shaped
-    // composite (VecWidenMaskedAddValueI32x4ToI64x2, pcmpgtd + pand +
-    // dual sign-unpack — the SSE2 form of the AVX2 transform's
-    // `VecWidenMaskedAddI32x4ToI64x2`), selected in the width table below
-    // for the I32→I64 Sum arm. Every other guarded shape on this path
-    // (Max/DotProduct guards, the I32-equal-width guard) still has no
-    // masked composite, and the generic Sum emitter would silently DROP
-    // the guard — the loop would sum every element instead of the guarded
-    // subset. Measured at -mno-avx on the widen_i32_i64_sse2_reduction
-    // battery's int-accumulator spelling: `if (p[i] > 0) s += p[i]`
-    // printed the UNGUARDED total (pre-existing; the long-accumulator
-    // spelling joined it when the analyzer's widening exception opened).
-    // NEON keeps its own audited paths.
-    if !neon
-        && pattern.guard_cond.is_some()
-        && !(pattern.kind == ReductionKind::Sum
-            && pattern.element_type == IrType::I32
-            && pattern.accumulator_type == IrType::I64)
+    // GUARDED REDUCTIONS FAIL CLOSED here EXCEPT the two guarded I32 sums
+    // the x86 128-bit register-based path has masked value-shaped
+    // composites for (the guard is validated as `loaded_lane > rhs`,
+    // signed, which is exactly pcmpgtd(rhs, lane)):
+    //  * I32→I64 widening: VecWidenMaskedAddValueI32x4ToI64x2 (pcmpgtd +
+    //    pand + dual sign-unpack — the SSE2 form of the AVX2 transform's
+    //    `VecWidenMaskedAddI32x4ToI64x4`);
+    //  * I32 equal-width: VecMaskedAddValueI32x4 (pcmpgtd + pand + paddd —
+    //    the SSE2 form of `VecMaskedAddI32x8`).
+    // Every other guarded shape (Max/DotProduct guards, other element
+    // types) has no masked composite, and the generic emitters would
+    // silently DROP the guard — the loop would sum every element instead
+    // of the guarded subset (measured at -mno-avx on the
+    // widen_i32_i64_sse2_reduction battery: `if (p[i] > 0) s += p[i]`
+    // printed the UNGUARDED total before the masked composites existed).
+    // NEON has no masked composite on this path either (its Sum arms are
+    // `VecAddI32x4` / `VecSadalpI32x4`, both guard-blind), so a guarded
+    // reduction never reaches it: fail closed by construction rather than
+    // by the analyzer happening to keep such loops away.
+    if pattern.guard_cond.is_some()
+        && (neon
+            || !(pattern.kind == ReductionKind::Sum
+                && pattern.element_type == IrType::I32
+                && matches!(pattern.accumulator_type, IrType::I64 | IrType::I32)))
     {
         if debug {
             eprintln!("[VEC-RED] SSE2 path cannot express a guarded reduction; staying scalar");
@@ -28443,7 +29815,7 @@ fn transform_reduction_sse2(
             // two I64 halves, paddq both into the accumulator — the
             // `long s += a[i]` loop at GCC's 16-byte/iteration width on
             // the SSE2 baseline. The memory-shaped composite
-            // (VecWidenAddI32x4ToI64x2) needs vpmovsxdq (SSE4.1), so this
+            // (VecWidenAddI32x4ToI64x4) needs AVX2 (ymm vpaddq), so this
             // arm uses the VALUE-shaped composite built by the Sum
             // emitter from VecLoadI32x4 (psrad/punpck dual unpack +
             // paddq×2; guarded sums take the masked sibling). Sum only:
@@ -28958,9 +30330,16 @@ fn transform_reduction_sse2(
                         IntrinsicOp::VecAddF64x2,
                         IntrinsicOp::VecZeroF64x2,
                     ),
+                    // x86 SSE2 guarded equal-width sum: the masked value-
+                    // shaped step (pcmpgtd + pand + paddd) carries the guard
+                    // rhs; the gate above admits a guard here only off NEON.
                     IntrinsicOp::LoadI32x4 => (
                         IntrinsicOp::VecLoadI32x4,
-                        IntrinsicOp::VecAddI32x4,
+                        if pattern.guard_cond.is_some() {
+                            IntrinsicOp::VecMaskedAddValueI32x4
+                        } else {
+                            IntrinsicOp::VecAddI32x4
+                        },
                         IntrinsicOp::VecZeroI32x4,
                     ),
                     IntrinsicOp::VecLoadF32x4 => (
@@ -29062,13 +30441,13 @@ fn transform_reduction_sse2(
                 };
 
                 // Create vector add (accumulate) - reads from PHI, produces new value
-                // (the masked value-shaped widening sibling carries the
-                // validated guard rhs as a third argument)
+                // (the masked value-shaped steps carry the validated guard
+                // rhs as a third argument — `masked_guard_arg_index` == 2)
                 let mut add_args = vec![
                     Operand::Value(pattern.accumulator_phi),
                     Operand::Value(vec_load),
                 ];
-                if vec_add_op == IntrinsicOp::VecWidenMaskedAddValueI32x4ToI64x2 {
+                if vec_add_op.masked_guard_arg_index().is_some() {
                     add_args.push(
                         pattern
                             .guard_rhs
@@ -29086,6 +30465,29 @@ fn transform_reduction_sse2(
                 // Insert instructions and remove old scalar add
                 {
                     let body_block = &mut func.blocks[pattern.body_idx];
+                    // A guarded step subsumes the Select (true_val == the
+                    // scalar Add's result, sitting AFTER the Add): remove it
+                    // first, as the AVX2 splice does, so no instruction is
+                    // left reading the deleted Add — the backedge is rewired
+                    // to `vec_sum_value` by latch label below.
+                    if pattern.guard_cond.is_some() {
+                        let add_result_id = body_block
+                            .instructions
+                            .get(pattern.accumulator_add_idx)
+                            .and_then(|i| i.dest())
+                            .map(|d| d.0);
+                        let select_idx = body_block.instructions.iter().position(|sin| {
+                            matches!(
+                                sin,
+                                Instruction::Select { true_val: Operand::Value(tv), .. }
+                                    if Some(tv.0) == add_result_id
+                            )
+                        });
+                        if let Some(si) = select_idx {
+                            debug_assert!(si > pattern.accumulator_add_idx);
+                            body_block.instructions.remove(si);
+                        }
+                    }
                     body_block
                         .instructions
                         .insert(pattern.accumulator_add_idx, load_inst);

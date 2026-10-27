@@ -67,7 +67,7 @@ static __inline__ __m128i __attribute__((__always_inline__))
 _mm_set1_epi32(int __i)
 {
     long long __q = (long long)(unsigned int)__i
-                  | ((long long)(unsigned int)__i << 32);
+                  | ((unsigned long long)(unsigned int)__i << 32);
     return (__m128i){  __q, __q  };
 }
 
@@ -510,8 +510,8 @@ _mm_unpacklo_epi32(__m128i __a, __m128i __b)
     unsigned int __a1 = (unsigned int)(__a[0] >> 32);
     unsigned int __b0 = (unsigned int)__b[0];
     unsigned int __b1 = (unsigned int)(__b[0] >> 32);
-    long long __lo = (long long)__a0 | ((long long)__b0 << 32);
-    long long __hi = (long long)__a1 | ((long long)__b1 << 32);
+    long long __lo = (long long)__a0 | ((unsigned long long)__b0 << 32);
+    long long __hi = (long long)__a1 | ((unsigned long long)__b1 << 32);
     return (__m128i){  __lo, __hi  };
 }
 
@@ -523,8 +523,8 @@ _mm_unpackhi_epi32(__m128i __a, __m128i __b)
     unsigned int __a3 = (unsigned int)(__a[1] >> 32);
     unsigned int __b2 = (unsigned int)__b[1];
     unsigned int __b3 = (unsigned int)(__b[1] >> 32);
-    long long __lo = (long long)__a2 | ((long long)__b2 << 32);
-    long long __hi = (long long)__a3 | ((long long)__b3 << 32);
+    long long __lo = (long long)__a2 | ((unsigned long long)__b2 << 32);
+    long long __hi = (long long)__a3 | ((unsigned long long)__b3 << 32);
     return (__m128i){  __lo, __hi  };
 }
 
@@ -548,8 +548,8 @@ static __inline__ __m128i __attribute__((__always_inline__))
 _mm_set1_epi16(short __w)
 {
     unsigned short __uw = (unsigned short)__w;
-    long long __q = (long long)__uw | ((long long)__uw << 16)
-                  | ((long long)__uw << 32) | ((long long)__uw << 48);
+    long long __q = (long long)__uw | ((unsigned long long)__uw << 16)
+                  | ((unsigned long long)__uw << 32) | ((unsigned long long)__uw << 48);
     return (__m128i){  __q, __q  };
 }
 
@@ -558,14 +558,15 @@ static __inline__ __m128i __attribute__((__always_inline__))
 _mm_setr_epi16(short __w0, short __w1, short __w2, short __w3,
                short __w4, short __w5, short __w6, short __w7)
 {
-    long long __lo = (long long)(unsigned short)__w0
-                   | ((long long)(unsigned short)__w1 << 16)
-                   | ((long long)(unsigned short)__w2 << 32)
-                   | ((long long)(unsigned short)__w3 << 48);
-    long long __hi = (long long)(unsigned short)__w4
-                   | ((long long)(unsigned short)__w5 << 16)
-                   | ((long long)(unsigned short)__w6 << 32)
-                   | ((long long)(unsigned short)__w7 << 48);
+    /* 32-bit halves, joined once: unsigned throughout (a signed 64-bit
+     * shift of a set top bit is undefined), and no 64-bit shift chains on
+     * i686 register pairs. */
+    unsigned int __q0 = (unsigned short)__w0 | ((unsigned int)(unsigned short)__w1 << 16);
+    unsigned int __q1 = (unsigned short)__w2 | ((unsigned int)(unsigned short)__w3 << 16);
+    unsigned int __q2 = (unsigned short)__w4 | ((unsigned int)(unsigned short)__w5 << 16);
+    unsigned int __q3 = (unsigned short)__w6 | ((unsigned int)(unsigned short)__w7 << 16);
+    long long __lo = (long long)(((unsigned long long)__q1 << 32) | __q0);
+    long long __hi = (long long)(((unsigned long long)__q3 << 32) | __q2);
     return (__m128i){  __lo, __hi  };
 }
 
@@ -581,10 +582,10 @@ _mm_set_epi16(short __w7, short __w6, short __w5, short __w4,
 static __inline__ __m128i __attribute__((__always_inline__))
 _mm_setr_epi32(int __i0, int __i1, int __i2, int __i3)
 {
-    long long __lo = (long long)(unsigned int)__i0
-                   | ((long long)(unsigned int)__i1 << 32);
-    long long __hi = (long long)(unsigned int)__i2
-                   | ((long long)(unsigned int)__i3 << 32);
+    long long __lo = (long long)(((unsigned long long)(unsigned int)__i1 << 32)
+                                 | (unsigned int)__i0);
+    long long __hi = (long long)(((unsigned long long)(unsigned int)__i3 << 32)
+                                 | (unsigned int)__i2);
     return (__m128i){  __lo, __hi  };
 }
 
@@ -602,22 +603,17 @@ _mm_set_epi8(char __b15, char __b14, char __b13, char __b12,
              char __b7, char __b6, char __b5, char __b4,
              char __b3, char __b2, char __b1, char __b0)
 {
-    long long __lo = (long long)(unsigned char)__b0
-                   | ((long long)(unsigned char)__b1 << 8)
-                   | ((long long)(unsigned char)__b2 << 16)
-                   | ((long long)(unsigned char)__b3 << 24)
-                   | ((long long)(unsigned char)__b4 << 32)
-                   | ((long long)(unsigned char)__b5 << 40)
-                   | ((long long)(unsigned char)__b6 << 48)
-                   | ((long long)(unsigned char)__b7 << 56);
-    long long __hi = (long long)(unsigned char)__b8
-                   | ((long long)(unsigned char)__b9 << 8)
-                   | ((long long)(unsigned char)__b10 << 16)
-                   | ((long long)(unsigned char)__b11 << 24)
-                   | ((long long)(unsigned char)__b12 << 32)
-                   | ((long long)(unsigned char)__b13 << 40)
-                   | ((long long)(unsigned char)__b14 << 48)
-                   | ((long long)(unsigned char)__b15 << 56);
+    /* 32-bit quarters, joined once (see _mm_setr_epi16). */
+    unsigned int __q0 = (unsigned char)__b0 | ((unsigned int)(unsigned char)__b1 << 8)
+                     | ((unsigned int)(unsigned char)__b2 << 16) | ((unsigned int)(unsigned char)__b3 << 24);
+    unsigned int __q1 = (unsigned char)__b4 | ((unsigned int)(unsigned char)__b5 << 8)
+                     | ((unsigned int)(unsigned char)__b6 << 16) | ((unsigned int)(unsigned char)__b7 << 24);
+    unsigned int __q2 = (unsigned char)__b8 | ((unsigned int)(unsigned char)__b9 << 8)
+                     | ((unsigned int)(unsigned char)__b10 << 16) | ((unsigned int)(unsigned char)__b11 << 24);
+    unsigned int __q3 = (unsigned char)__b12 | ((unsigned int)(unsigned char)__b13 << 8)
+                     | ((unsigned int)(unsigned char)__b14 << 16) | ((unsigned int)(unsigned char)__b15 << 24);
+    long long __lo = (long long)(((unsigned long long)__q1 << 32) | __q0);
+    long long __hi = (long long)(((unsigned long long)__q3 << 32) | __q2);
     return (__m128i){  __lo, __hi  };
 }
 
@@ -1186,9 +1182,19 @@ _mm_cvtsd_si64(__m128d __a)
 #if defined(__x86_64__)
     return __builtin_ia32_cvtsd2si64(__a);
 #else
-    /* 32-bit x86 has no 64-bit `cvtsd2si`; keep a portable truncating
-       definition rather than silently rounding the wrong way. */
-    return (long long)__a[0];
+    /* i686 has no 64-bit CVTSD2SI. This emulation is exact under every
+     * MXCSR.RC. Below 2^52 one ADDSD/SUBSD pair with copysign(2^52, x)
+     * rounds x to an integer per MXCSR (the sum's ulp is exactly 1), so
+     * the cast is exact. From 2^52 to 2^63, x is already integral. NaN and
+     * |x| >= 2^63 give the integer indefinite, as the instruction does. */
+    double __x = __a[0];
+    if (__builtin_fabs(__x) < 0x1p52) {
+        __m128d __m = _mm_set_sd(__builtin_copysign(0x1p52, __x));
+        return (long long)_mm_cvtsd_f64(_mm_sub_sd(_mm_add_sd(__a, __m), __m));
+    }
+    if (__x >= -0x1p63 && __x < 0x1p63)
+        return (long long)__x;
+    return -0x7fffffffffffffffLL - 1;
 #endif
 }
 

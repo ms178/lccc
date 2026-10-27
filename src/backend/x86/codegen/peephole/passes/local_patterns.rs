@@ -14208,11 +14208,13 @@ pub(super) fn fold_shift_into_sib(store: &mut LineStore, infos: &mut [LineInfo])
         let mut j = next_non_debug(store, infos, i + 1, len);
         let mut steps = 0usize;
         let mut add_rest: Option<String> = None;
+        let mut consumer: Option<usize> = None;
         while j < len && steps <= WINDOW && !infos[j].is_barrier() && !infos[j].pinned {
             let t = infos[j].trimmed(store.get(j));
             if let Some(rest) = t.strip_prefix(add_prefix.as_str()) {
                 if rest.contains(&shifted_reg) {
                     add_rest = Some(rest.to_string());
+                    consumer = Some(j);
                 }
                 break;
             }
@@ -14232,13 +14234,29 @@ pub(super) fn fold_shift_into_sib(store: &mut LineStore, infos: &mut [LineInfo])
             //
             // deleting the `shl` and folding the add into
             // `leaq (%r9,%rax,8), %r9` scales the QUOTIENT by eight.
-            if infos[j].reg_refs & (1u16 << shifted_fam) != 0
-                || matches!(flags_effect(t), FlagsEffect::Reads)
-            {
+            if infos[j].reg_refs & (1u16 << shifted_fam) != 0 {
+                consumer = Some(j);
+                break;
+            }
+            if matches!(flags_effect(t), FlagsEffect::Reads) {
                 break;
             }
             steps += 1;
             j = next_non_debug(store, infos, j + 1, len);
+        }
+        // Absolute-symbol form (non-PIC): the shifted register is consumed
+        // as the bare base of a memory operand, `OP sym+d(%R)`, and the SIB
+        // index slot carries the scale instead: `OP sym+d(, %R, 2^k)`.
+        if let Some(cj) = consumer
+            && let Some(new_line) =
+                shift_into_mem_index(store, infos, &mut dead, i, cj, &shifted_reg, scale)
+        {
+            replace_line(store, &mut infos[cj], cj, new_line);
+            mark_nop(&mut infos[i]);
+            dead.invalidate(store, infos, cj);
+            changed = true;
+            i = cj + 1;
+            continue;
         }
         let Some(rest) = add_rest else {
             i += 1;
@@ -14334,6 +14352,103 @@ pub(super) fn fold_shift_into_sib(store: &mut LineStore, infos: &mut [LineInfo])
     changed
 }
 
+/// The memory-operand arm of `fold_shift_into_sib`: line `i` scales `%R`
+/// (by `scale`) and line `j`, the first later line naming `%R`, uses it only
+/// as the bare base of one memory operand, `D(%R)`.  Returns `j` rewritten to
+/// `D(, %R, scale)` when deleting line `i` is unobservable.
+///
+/// `D(%R)` addresses `D + (R << k)`; `D(, %R, 2^k)` addresses `D + R * 2^k`:
+/// the same 64-bit sum, and `D` keeps its relocation (an absolute symbol
+/// displacement is `R_X86_64_32S` with or without a base register).  This is
+/// the non-PIC shape of `table[idx]` -- PIC stages the symbol in a register
+/// and takes the `addq` arm -- measured on histogram/zstd at `-fno-pie`:
+/// `shlq $3,%r11; addq $1,bins(%r11)` was one instruction per element more
+/// than GCC's `addq $1,bins(,%r11,8)`.
+///
+/// Obligations, beyond the window scan's (no intervening mention of `%R`, no
+/// intervening flag reader):
+/// * `%R` is the 64-bit name (a 32-bit base is an `addr32` access) and not
+///   `%rsp` (unencodable as an index; the caller already refused it);
+/// * `%R` occurs in `j` exactly once, as that base, with no SIB index and no
+///   implicit use -- any other read would see the unscaled value;
+/// * `D` names no register: `%rip` cannot take an index and a segment
+///   prefix is not worth the special case;
+/// * the scaled value has no reader after `j` (`j` may overwrite `%R`);
+/// * `j` itself reads no flag (`adc`/`sbb`/`cmovcc` consume the CF/ZF that
+///   `shl` produced -- the window scan stops AT the consumer, before its
+///   flag check, so the obligation is discharged here);
+/// * the flags `shl` wrote are unobservable: `j` rewrites all of them
+///   (add/sub/and/or/xor/cmp/test), or none are read after it.  `inc`,
+///   `dec`, shifts and `bt` preserve some flags, so they take the second
+///   branch.
+fn shift_into_mem_index(
+    store: &LineStore,
+    infos: &[LineInfo],
+    dead: &mut LazyDeadness,
+    i: usize,
+    j: usize,
+    reg: &str,
+    scale: u32,
+) -> Option<String> {
+    let fam = register_family_fast(reg);
+    if fam > REG_GP_MAX || REG_NAMES[0][fam as usize] != reg || fam == 4 {
+        return None;
+    }
+    if !all_editable(infos, &[i, j]) {
+        return None;
+    }
+    let t = infos[j].trimmed(store.get(j));
+    if matches!(flags_effect(t), FlagsEffect::Reads) {
+        return None;
+    }
+    let needle = format!("({reg})");
+    let at = t.find(&needle)?;
+    if t[at + needle.len()..].contains(&needle) {
+        return None;
+    }
+    // The displacement: back to the operand's start.
+    let disp_start = t[..at]
+        .rfind(|c: char| c == ' ' || c == ',' || c == '*')
+        .map_or(0, |p| p + 1);
+    let disp = &t[disp_start..at];
+    if disp.contains('%') {
+        return None;
+    }
+    let rest = format!("{}{}", &t[..disp_start], &t[at + needle.len()..]);
+    let bit = 1u16 << fam;
+    if line_refs_family(&rest, fam)
+        || (fam < 4 && rest.contains(HIGH_BYTE_NAMES[fam as usize]))
+        || implicit_reg_refs(t.as_bytes()) & bit != 0
+        || has_implicit_reg_usage(t)
+    {
+        return None;
+    }
+    if !dead.dead_after(store, infos, j, fam, &[i, j]) {
+        return None;
+    }
+    let mnemonic = t.split_whitespace().next()?;
+    let full_flag_writer = matches!(flags_effect(t), FlagsEffect::Writes)
+        && ["add", "sub", "and", "or", "xor", "cmp", "test"]
+            .iter()
+            .any(|stem| {
+                mnemonic
+                    .strip_prefix(stem)
+                    .is_some_and(|sfx| matches!(sfx, "" | "b" | "w" | "l" | "q"))
+            });
+    if !full_flag_writer && !flags_dead_after(store, infos, j + 1) {
+        return None;
+    }
+    let disp = if disp.is_empty() { "0" } else { disp };
+    Some(format!(
+        "    {}{}(, {}, {}){}",
+        &t[..disp_start],
+        disp,
+        reg,
+        scale,
+        &t[at + needle.len()..]
+    ))
+}
+
 /// `shlq $K, %R` / `shll $K, %R` / `salq $K, %R` -> `(K, "%R")`.  Only the
 /// immediate form, and only a plain register destination: `shl %cl, %rax` has
 /// a runtime count (no constant scale) and `shlq $3, (%rax)` is memory.
@@ -14355,6 +14470,99 @@ fn parse_self_doubling(t: &str) -> Option<&str> {
     let rest = t.strip_prefix("addq ")?;
     let (src, dst) = split_two_operands(rest)?;
     (src == dst && dst.starts_with('%') && !dst.contains('(')).then_some(dst)
+}
+
+#[cfg(test)]
+mod shift_into_mem_index_tests {
+    //! The absolute-symbol (non-PIC) arm of the shift->SIB fold.
+    use super::super::super::types::classify_line;
+    use crate::backend::peephole_common::LineStore;
+
+    fn run(body: &str) -> Vec<String> {
+        let asm = format!("f:\n.cfi_startproc\n{body}    ret\n.cfi_endproc\n");
+        let mut store = LineStore::new(asm);
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        super::fold_shift_into_sib(&mut store, &mut infos);
+        (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .filter(|t| !t.is_empty() && !t.starts_with('.') && !t.ends_with(':'))
+            .collect()
+    }
+
+    #[test]
+    fn scaled_index_moves_into_the_sib() {
+        assert_eq!(
+            run("    movzbl bytes(, %rdi), %r11d\n    shlq $3, %r11\n    addq $1, bins(%r11)\n"),
+            [
+                "movzbl bytes(, %rdi), %r11d",
+                "addq $1, bins(, %r11, 8)",
+                "ret"
+            ]
+        );
+        // symbol+offset displacement, a store, and a bare base.
+        assert_eq!(
+            run("    shlq $2, %r10\n    movl %esi, tab+12(%r10)\n"),
+            ["movl %esi, tab+12(, %r10, 4)", "ret"]
+        );
+        assert_eq!(
+            run("    shlq $1, %r9\n    addw $7, (%r9)\n"),
+            ["addw $7, 0(, %r9, 2)", "ret"]
+        );
+        // `inc` keeps CF: legal here only because no flag is read after.
+        assert_eq!(
+            run("    shlq $3, %r8\n    incq bins(%r8)\n"),
+            ["incq bins(, %r8, 8)", "ret"]
+        );
+    }
+
+    #[test]
+    fn refusals() {
+        let keeps_shift = |body: &str| run(body).iter().any(|l| l.starts_with("shlq"));
+        // The scaled value is read again after the access.
+        assert!(keeps_shift(
+            "    shlq $3, %r11\n    addq $1, bins(%r11)\n    movq %r11, %rax\n"
+        ));
+        // The consumer reads the flags `shl` wrote.
+        assert!(keeps_shift("    shlq $3, %r11\n    adcq $0, bins(%r11)\n"));
+        assert!(keeps_shift("    shlq $3, %r11\n    sbbl $0, bins(%r11)\n"));
+        assert!(keeps_shift(
+            "    shlq $3, %r11\n    cmovbq bins(%r11), %rax\n    movq %rax, %rdi\n"
+        ));
+        // A second mention in the consumer (data operand and base).
+        assert!(keeps_shift(
+            "    shlq $3, %r11\n    addq %r11, bins(%r11)\n"
+        ));
+        // Already indexed, RIP-relative, segment, 32-bit shift.
+        assert!(keeps_shift(
+            "    shlq $3, %r11\n    addq $1, bins(%r11, %rdi)\n"
+        ));
+        assert!(keeps_shift(
+            "    shlq $3, %r11\n    addq $1, 8(%r11, %rdi, 2)\n"
+        ));
+        assert!(keeps_shift(
+            "    shlq $3, %r11\n    movq %fs:8(%r11), %rax\n"
+        ));
+        assert!(
+            run("    shll $3, %r11d\n    movq bins(%r11), %rax\n")
+                .iter()
+                .any(|l| l.starts_with("shll"))
+        );
+        // `inc` preserves CF from the shift, and CF is read afterwards.
+        assert!(keeps_shift(
+            "    shlq $3, %r8\n    incq bins(%r8)\n    adcq $0, %rax\n"
+        ));
+        // A flag-neutral consumer whose flags are read afterwards.
+        assert!(keeps_shift(
+            "    shlq $3, %r8\n    movq bins(%r8), %rax\n    setc %cl\n"
+        ));
+        // An intervening flag reader / mention.
+        assert!(keeps_shift(
+            "    shlq $3, %r8\n    setc %cl\n    movq bins(%r8), %rax\n"
+        ));
+    }
 }
 
 #[cfg(test)]

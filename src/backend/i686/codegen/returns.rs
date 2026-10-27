@@ -21,7 +21,11 @@ impl I686Codegen {
                     _ => unreachable!("invalid wide vector return width"),
                 };
                 emit!(self.state, "    vmovups (%eax), %{}", register);
+                // No vzeroupper on this exit: it would destroy the upper lanes
+                // of the value being returned (the caller uses the AVX ABI).
+                let dirty = std::mem::replace(&mut self.state.dirty_upper_ymm, false);
                 self.emit_epilogue_and_ret(frame_size);
+                self.state.dirty_upper_ymm = dirty;
                 return;
             }
             if ret_ty == IrType::U16 && self.current_return_half_xmm {

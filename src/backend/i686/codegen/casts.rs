@@ -13,15 +13,23 @@
 //!
 //! # ISA floor
 //!
-//! The sequences below use the scalar SSE conversions (`cvtsi2ssl`,
-//! `cvttss2si`, `movd`) and SSE3's `fisttp`. That is not a new
-//! requirement: the i686 backend already emits SSE/SSE2/SSE3
-//! unconditionally across `intrinsics.rs`, `alu.rs`, `comparison.rs` and
-//! the original cast paths, and no target-feature gating interface exists
-//! (recorded as a follow-up; the Linux-kernel `no_sse` flag only governs
-//! variadic prologues). `fisttp` truncates toward zero by definition, so
-//! float-to-integer conversion is independent of the ambient x87
-//! rounding control without any control-word save/restore.
+//! Every sequence honours the TU's resolved ISA (`CodegenOptions::
+//! i686_no_sse2` / `i686_no_sse3`, decided by the driver from `-march=`,
+//! `-msse*` and the denials):
+//!
+//! - SSE2 present (the GCC 16.2 `-m32` baseline, `-march=x86-64`): int<->F32
+//!   uses `cvtsi2ssl` / `cvttss2si` with `movd` between `%eax` and `%xmm0`.
+//! - SSE2 absent (`-march=i686`, `-mno-sse`, `-mno-sse2`,
+//!   `-mgeneral-regs-only`): the same conversions go through x87 memory
+//!   operands (`fildl`/`fildq` + `fstps`, `flds` + a truncating store).
+//! - Truncating float->int stores use FISTTP only when SSE3 is present;
+//!   otherwise `I686Codegen::emit_x87_truncating_store` switches the x87
+//!   rounding control to round-toward-zero around FISTP and restores it.
+//!   Either way the conversion is independent of the ambient rounding
+//!   direction.
+//!
+//! The driver re-checks the final assembly for SSE, SSE2 and FISTTP
+//! references the resolved ISA does not permit and fails closed.
 //!
 //! # Unsigned conversions (no ambient-precision arithmetic)
 //!
@@ -30,12 +38,12 @@
 //!   exponent word `0x403e` = bias + 63), not via `fildq` + `fadds 2^64`.
 //!   The correction addition is exact only while the x87 precision
 //!   control is 64-bit; the encoding is exact at every PC setting.
-//! - x87 → U64: compare against `2^63` (`fucomip`), convert the low half
-//!   with `fisttpq` directly, and for `x >= 2^63` convert the exact
-//!   difference `x - 2^63` (Sterbenz-exact in extended precision, result
-//!   in `[0, 2^63)`) and OR bit 63 back. No signed-overflow indefinite,
-//!   no FE_INVALID on valid inputs, no control-word traffic.
-//! - F32 → U32: `flds` + `fisttpq` (64-bit form), never the signed
+//! - x87 → U64: compare against `2^63` (`fucomip`) and truncate values
+//!   below it with a signed 64-bit truncating store. For `x >= 2^63` store
+//!   the exact native extended encoding (`fstpt`): when the exponent word
+//!   is `0x403e` the 64-bit significand *is* the result. No arithmetic
+//!   subject to precision control, no FE_INVALID on valid inputs.
+//! - F32 → U32: `flds` + a 64-bit truncating store, never the signed
 //!   `cvttss2si`, which returns the indefinite `0x80000000` and raises
 //!   FE_INVALID for `[2^31, 2^32)`.
 //!
@@ -225,6 +233,33 @@ impl I686Codegen {
             self.emit_cast_instrs_impl(from_ty, to_ty);
             self.store_eax_to(dest);
             return;
+        }
+
+        // F64 -> a result that fits signed i32, with SSE2 (the default
+        // `-m32` baseline): one CVTTSD2SI straight from the value's slot, as
+        // GCC 16.2 emits. It truncates regardless of MXCSR.RC, and an
+        // out-of-range input yields 0x80000000 with FE_INVALID, the same
+        // integer-indefinite as the x87 32-bit store; narrower results are
+        // the low bits, like GCC. F64 values are always slot-homed here
+        // (`emit_f64_load_to_x87` has no register arm); anything else takes
+        // the x87 path.
+        if self.sse2_scalar_enabled
+            && from_ty == IrType::F64
+            && matches!(
+                to_ty,
+                IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32
+            )
+        {
+            if let Operand::Value(v) = src {
+                if let Some(slot) = self.state.get_slot(v.0) {
+                    let sr = self.slot_ref(slot);
+                    emit!(self.state, "    cvttsd2sil {}, %eax", sr);
+                    self.state.reg_cache.invalidate_acc();
+                    self.cast_normalize_eax(to_ty);
+                    self.store_eax_to(dest);
+                    return;
+                }
+            }
         }
 
         // --- Everything involving floating point and a wide operand,
@@ -514,9 +549,8 @@ impl I686Codegen {
 
     /// Pop st(0), returning an integer in eax or edx:eax.
     ///
-    /// FISTTP truncates toward zero without touching the caller's x87
-    /// control word, so the result does not depend on the ambient
-    /// rounding direction.
+    /// The truncating store (`emit_x87_truncating_store`) rounds toward
+    /// zero whatever the ambient rounding direction.
     ///
     /// This implements ordinary C conversions on their defined domain. It
     /// does not implement saturating conversions or assign semantics to
@@ -537,7 +571,7 @@ impl I686Codegen {
 
         if wide_conversion {
             self.state.emit("    subl $8, %esp");
-            self.state.emit("    fisttpq (%esp)");
+            self.emit_x87_truncating_store('q');
             self.state.emit("    movl (%esp), %eax");
             if pair_result {
                 self.state.emit("    movl 4(%esp), %edx");
@@ -552,20 +586,64 @@ impl I686Codegen {
             // 16 bits (as GCC does) also makes the C-undefined out-of-range
             // result the 16-bit indefinite integer 0x8000, matching GCC.
             self.state.emit("    subl $4, %esp");
-            self.state.emit("    fisttps (%esp)");
+            self.emit_x87_truncating_store('s');
             self.state.emit("    movswl (%esp), %eax");
             self.state.emit("    addl $4, %esp");
             self.state.reg_cache.invalidate_acc();
         } else {
             // Every defined U16/I32 result fits signed i32.
             self.state.emit("    subl $4, %esp");
-            self.state.emit("    fisttpl (%esp)");
+            self.emit_x87_truncating_store('l');
             self.state.emit("    movl (%esp), %eax");
             self.state.emit("    addl $4, %esp");
             self.state.reg_cache.invalidate_acc();
         }
 
         self.cast_normalize_eax(to_ty);
+    }
+
+    /// Convert the canonical signed i32 in `%eax` to F32 bits in `%eax`
+    /// (one correctly rounded conversion either way).
+    fn cast_i32_eax_to_f32(&mut self) {
+        if self.sse2_scalar_enabled {
+            self.state.emit("    cvtsi2ssl %eax, %xmm0");
+            self.state.emit("    movd %xmm0, %eax");
+        } else {
+            // x87 memory forms: FILD is exact for every i32 and FSTPS
+            // performs the single rounding to F32.
+            self.state.emit("    pushl %eax");
+            self.state.emit("    fildl (%esp)");
+            self.state.emit("    fstps (%esp)");
+            self.state.emit("    popl %eax");
+        }
+    }
+
+    /// Convert the U32 in `%eax` to F32 bits in `%eax`: an exact 64-bit
+    /// integer load and one F32 rounding at the store. No shift/round/add
+    /// reconstruction, whose directed rounding can disagree with a single
+    /// correctly rounded conversion.
+    fn cast_u32_eax_to_f32_x87(&mut self) {
+        self.state.emit("    pushl $0");
+        self.state.emit("    pushl %eax");
+        self.state.emit("    fildq (%esp)");
+        self.state.emit("    fstps (%esp)");
+        self.state.emit("    popl %eax");
+        self.state.emit("    addl $4, %esp");
+    }
+
+    /// Truncate the F32 bits in `%eax` to a `to_ty` result that fits signed
+    /// i32 (I8..I32, U8, U16), canonicalised in `%eax`.
+    fn cast_f32_eax_to_small_integer(&mut self, to_ty: IrType) {
+        if self.sse2_scalar_enabled {
+            self.state.emit("    movd %eax, %xmm0");
+            self.state.emit("    cvttss2si %xmm0, %eax");
+            self.cast_normalize_eax(to_ty);
+        } else {
+            self.state.emit("    pushl %eax");
+            self.state.emit("    flds (%esp)");
+            self.state.emit("    addl $4, %esp");
+            self.cast_x87_to_integer(to_ty);
+        }
     }
 
     /// Pop st(0), returning U64 in edx:eax.
@@ -575,7 +653,7 @@ impl I686Codegen {
     /// depend on the ambient precision-control setting:
     ///
     /// ```text
-    /// x <  2^63: fisttpq(x) directly — truncation, in signed range.
+    /// x <  2^63: a 64-bit truncating store directly, in signed range.
     /// x >= 2^63: the native extended encoding is stored with fstpt.
     ///            Every finite extended value in [2^63, 2^64) is an
     ///            integer whose sign/exponent word is 0x403e and whose
@@ -610,11 +688,11 @@ impl I686Codegen {
         self.state.emit("    fucomip %st(1), %st");
         self.state.out.emit_jcc_label("    jbe", &high);
 
-        // Low path: defined inputs truncate into signed i64. FISTTP
-        // truncates toward zero independently of the ambient rounding
+        // Low path: defined inputs truncate into signed i64. The truncating
+        // store rounds toward zero independently of the ambient rounding
         // direction and performs no arithmetic subject to precision
         // control. Fractional inputs may still raise FE_INEXACT.
-        self.state.emit("    fisttpq (%esp)");
+        self.emit_x87_truncating_store('q');
         self.state.emit("    movl (%esp), %eax");
         self.state.emit("    movl 4(%esp), %edx");
         self.state.out.emit_jmp_label(&done);
@@ -634,7 +712,7 @@ impl I686Codegen {
         // NaN / infinity / >= 2^64 (or negative): integer-indefinite.
         self.state.out.emit_named_label(&not_range);
         self.state.emit("    fldt (%esp)");
-        self.state.emit("    fisttpq (%esp)");
+        self.emit_x87_truncating_store('q');
         self.state.emit("    movl (%esp), %eax");
         self.state.emit("    movl 4(%esp), %edx");
 
@@ -691,8 +769,7 @@ impl I686Codegen {
             CastKind::SignedToFloat { to_f64: false, .. } => {
                 self.state.reg_cache.invalidate_acc();
                 self.cast_normalize_eax(from_ty);
-                self.state.emit("    cvtsi2ssl %eax, %xmm0");
-                self.state.emit("    movd %xmm0, %eax");
+                self.cast_i32_eax_to_f32();
             }
 
             CastKind::UnsignedToFloat { to_f64: false, .. } => {
@@ -701,8 +778,13 @@ impl I686Codegen {
 
                 if matches!(from_ty, IrType::U8 | IrType::U16) {
                     // Canonical values always fit signed i32.
-                    self.state.emit("    cvtsi2ssl %eax, %xmm0");
-                    self.state.emit("    movd %xmm0, %eax");
+                    self.cast_i32_eax_to_f32();
+                    return;
+                }
+                if !self.sse2_scalar_enabled {
+                    // x87 only: the exact 64-bit load below covers the
+                    // whole U32 range, so no sign split is needed.
+                    self.cast_u32_eax_to_f32_x87();
                     return;
                 }
 
@@ -717,25 +799,14 @@ impl I686Codegen {
                 self.state.out.emit_jmp_label(&done);
 
                 self.state.out.emit_named_label(&high);
-                // Exact 64-bit integer load, one F32 rounding at store.
-                // No shift/round/add reconstruction, whose directed
-                // rounding can disagree with a single correctly rounded
-                // conversion.
-                self.state.emit("    pushl $0");
-                self.state.emit("    pushl %eax");
-                self.state.emit("    fildq (%esp)");
-                self.state.emit("    fstps (%esp)");
-                self.state.emit("    popl %eax");
-                self.state.emit("    addl $4, %esp");
+                self.cast_u32_eax_to_f32_x87();
 
                 self.state.out.emit_named_label(&done);
             }
 
             CastKind::FloatToSigned { from_f64: false } => {
                 self.state.reg_cache.invalidate_acc();
-                self.state.emit("    movd %eax, %xmm0");
-                self.state.emit("    cvttss2si %xmm0, %eax");
-                self.cast_normalize_eax(to_ty);
+                self.cast_f32_eax_to_small_integer(to_ty);
             }
 
             CastKind::FloatToUnsigned {
@@ -745,10 +816,8 @@ impl I686Codegen {
                 self.state.reg_cache.invalidate_acc();
 
                 if matches!(to_ty, IrType::U8 | IrType::U16) {
-                    // All defined results fit the signed SSE conversion.
-                    self.state.emit("    movd %eax, %xmm0");
-                    self.state.emit("    cvttss2si %xmm0, %eax");
-                    self.cast_normalize_eax(to_ty);
+                    // All defined results fit the signed 32-bit conversion.
+                    self.cast_f32_eax_to_small_integer(to_ty);
                 } else {
                     assert!(
                         to_ty == IrType::U32,
@@ -765,7 +834,7 @@ impl I686Codegen {
                     self.state.emit("    subl $8, %esp");
                     self.state.emit("    movl %eax, (%esp)");
                     self.state.emit("    flds (%esp)");
-                    self.state.emit("    fisttpq (%esp)");
+                    self.emit_x87_truncating_store('q');
                     self.state.emit("    movl (%esp), %eax");
                     self.state.emit("    addl $8, %esp");
                 }
@@ -1154,5 +1223,51 @@ mod narrow_extension_tests {
             assert!(!cg.state.out.buf.contains("movzbl"));
             assert!(cg.state.out.buf.contains("movl"));
         }
+    }
+
+    fn x87_only_codegen(no_sse2: bool) -> crate::backend::i686::codegen::emit::I686Codegen {
+        let mut opts = crate::backend::CodegenOptions::default();
+        opts.i686_no_sse2 = no_sse2;
+        opts.i686_no_sse3 = true;
+        let mut cg = crate::backend::i686::codegen::emit::I686Codegen::new();
+        cg.apply_options(&opts);
+        cg
+    }
+
+    #[test]
+    fn f32_casts_follow_the_sse2_permission() {
+        type Cg = crate::backend::i686::codegen::emit::I686Codegen;
+        let shapes: [(&str, fn(&mut Cg)); 4] = [
+            ("i32->f32", |cg| cg.cast_i32_eax_to_f32()),
+            ("u32->f32", |cg| cg.cast_u32_eax_to_f32_x87()),
+            ("f32->i32", |cg| {
+                cg.cast_f32_eax_to_small_integer(IrType::I32)
+            }),
+            ("f32->i16", |cg| {
+                cg.cast_f32_eax_to_small_integer(IrType::I16)
+            }),
+        ];
+        for (name, emit) in shapes {
+            let mut cg = x87_only_codegen(true);
+            emit(&mut cg);
+            let asm = &cg.state.out.buf;
+            assert!(!asm.contains("xmm"), "{name} without SSE2: {asm}");
+            assert!(!asm.contains("fisttp"), "{name} without SSE3: {asm}");
+        }
+        // The SSE2 forms stay the single-instruction conversions.
+        let mut cg = x87_only_codegen(false);
+        cg.cast_i32_eax_to_f32();
+        assert!(cg.state.out.buf.contains("cvtsi2ssl %eax, %xmm0"));
+        let mut cg = x87_only_codegen(false);
+        cg.cast_f32_eax_to_small_integer(IrType::I32);
+        assert!(cg.state.out.buf.contains("cvttss2si %xmm0, %eax"));
+        // x87 F32 -> I32 truncates through the rounding-control switch.
+        let mut cg = x87_only_codegen(true);
+        cg.cast_f32_eax_to_small_integer(IrType::I32);
+        let asm = &cg.state.out.buf;
+        assert!(
+            asm.contains("flds (%esp)") && asm.contains("fistpl 4(%esp)"),
+            "{asm}"
+        );
     }
 }

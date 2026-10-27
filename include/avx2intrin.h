@@ -31,7 +31,7 @@ static __inline__ __m256i __attribute__((__always_inline__))
 _mm256_set1_epi32(int __i)
 {
     long long __q = (long long)(unsigned int)__i
-                  | ((long long)(unsigned int)__i << 32);
+                  | ((unsigned long long)(unsigned int)__i << 32);
     return (__m256i){  __q, __q, __q, __q  };
 }
 

@@ -580,7 +580,7 @@ impl Lowerer {
     /// directly: unsigned T fits iff `hi == 0` and `lo` survives the
     /// truncation round trip; signed T iff `hi` is `lo`'s sign fill and `lo`
     /// survives the round trip.  Returns (truncated result, overflow flag).
-    fn lower_overflow_u64_pair(
+    pub(super) fn lower_overflow_u64_pair(
         &mut self,
         op: IrBinOp,
         lhs: (Operand, IrType),

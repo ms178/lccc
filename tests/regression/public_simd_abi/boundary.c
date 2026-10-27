@@ -2,7 +2,8 @@
  * Nine vectors overflow both ABI register files; mixed XMM/YMM arguments,
  * GP scalars, a 64-bit scalar, direct calls and volatile indirect calls must
  * preserve EVERY byte. No intrinsic or floating arithmetic can conceal an
- * ABI error by recomputing the result on the caller side. */
+ * ABI error by recomputing the result on the caller side. BITS=64 is the
+ * MMX __m64. */
 #include <immintrin.h>
 #include <string.h>
 #include <stdio.h>
@@ -14,7 +15,12 @@
 #ifndef KIND
 #define KIND 0
 #endif
-#if BITS == 128
+#if BITS == 64
+  /* __m64 is SSE class on x86-64 (GCC passes it in %xmm). On i686 the gate
+   * pins GCC's -mno-mmx ABI (memory), which lccc follows because it never
+   * enables MMX. */
+  typedef __m64 T;
+#elif BITS == 128
 # if KIND == 0
   typedef __m128 T;
 # elif KIND == 1

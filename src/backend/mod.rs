@@ -141,12 +141,6 @@ pub(crate) struct CodegenOptions {
     pub(crate) stack_clash_protection: bool,
     /// Resolved target stack-protector guard configuration (`-mstack-protector-guard*`).
     pub(crate) stack_protector_guard: Option<stack_protector::EffectiveStackGuard>,
-    /// Whether SSE is disabled (-mno-sse). When true, the x86 codegen avoids
-    /// SSE/XMM instructions in variadic prologues (XMM register saving) and
-    /// va_start sets fp_offset to overflow so va_arg never uses XMM regs.
-    /// TODO: Full -mno-sse support would also need to avoid SSE in float
-    /// operations, casts, and other FP codegen paths. Currently only the
-    /// variadic ABI path is gated, which is sufficient for the Linux kernel.
     /// Byte alignment for function entry labels (`.p2align log2`). 0 = none.
     /// GCC/Clang use 16 at -O1..-O3 and none at -Os/-Oz.
     pub(crate) function_alignment: u32,
@@ -154,7 +148,23 @@ pub(crate) struct CodegenOptions {
     /// number of live SSE argument registers to a variadic callee. Only honoured
     /// together with `no_sse`, where no such register can be in use.
     pub(crate) skip_rax_setup: bool,
+    /// The xmm register file is off-limits for compiler-chosen code
+    /// (`-mno-sse`, `-mno-sse2`, and on i686 every invocation whose resolved
+    /// ISA lacks SSE, e.g. a pre-SSE `-march=`). x86-64 keeps variadic
+    /// prologues and `va_arg` off xmm and the driver fails closed on any
+    /// remaining SSE reference; i686 drops its `movups` block copies.
     pub(crate) no_sse: bool,
+    /// i686 only: SSE2 is not part of the resolved ISA (`-mno-sse2`,
+    /// `-mno-sse`, `-mgeneral-regs-only`, or an `-march=` below SSE2). Scalar
+    /// F32 arithmetic, compares and int<->F32 casts then use x87 instead of
+    /// the SSE2 `movd`-based forms. `false` (the derived default) is the
+    /// GCC 16.2 `-m32` baseline, `-march=x86-64`.
+    pub(crate) i686_no_sse2: bool,
+    /// i686 only: SSE3 is not part of the resolved ISA, so FISTTP is
+    /// unavailable and truncating float->int conversions switch the x87
+    /// rounding control instead. The driver sets this for the default `-m32`
+    /// baseline (x86-64-v1 has no SSE3).
+    pub(crate) i686_no_sse3: bool,
     /// Whether to use only general-purpose registers (-mgeneral-regs-only).
     /// On AArch64, this prevents FP/SIMD register usage in variadic function
     /// prologues (no q0-q7 saves) and sets __vr_offs=0 in va_start.
@@ -599,6 +609,7 @@ impl Target {
                     && !opts.disable_regalloc
                     && opts.mcount.is_none()
                     && opts.patchable_function_entry.is_none();
+                let opaque_symbols = x86::codegen::ipa_ra::module_opaque_symbols(module);
                 let mut poisoned_callees = crate::common::fx_hash::FxHashSet::default();
                 for func in &module.functions {
                     if !func.is_declaration
@@ -624,13 +635,17 @@ impl Target {
                         poisoned_callees.clone(),
                         poisoned_callers.clone(),
                         opts.ra_config.debug_ra,
-                    );
+                    )
+                    .with_opaque_symbols(opaque_symbols.clone());
                     let raw = generation::generate_module_with_debug(
                         &mut cg,
                         module,
                         opts.debug_info,
                         source_mgr,
                     );
+                    // The whole-file peephole rewrites every function's text,
+                    // so it runs under an ISA legal in all of them.
+                    cg.publish_peephole_isa();
                     // Escape hatch for bisecting a suspected peephole miscompile:
                     // LCCC_NO_PEEPHOLE=1 emits the pre-peephole assembly verbatim.
                     let asm = if std::env::var_os("LCCC_NO_PEEPHOLE").is_some() {
@@ -642,6 +657,7 @@ impl Target {
                             opts.optimize_for_size,
                         )
                     };
+                    x86::isa::set_current(opts.isa);
                     let asm = x86::codegen::peephole::lower_tls_call_markers(asm);
                     let asm = zero_call_used_regs::apply_zero_call_used_regs(
                         asm,

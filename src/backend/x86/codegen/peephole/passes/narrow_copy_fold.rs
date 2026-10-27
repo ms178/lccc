@@ -448,28 +448,26 @@ pub(super) fn fold_register_copies(store: &mut LineStore, infos: &mut [LineInfo]
         // whose only consumer is `movb %r9b, …` folds the store straight
         // onto `%dil`, which is exactly the shape GCC emits for byte
         // truncation stores).
-        let (rule_width, sfam, dfam, is_ext) = if let Some((width, sfam, dfam)) =
-            parse_reg_to_reg_mov(trimmed)
-        {
-            let eff_width =
-                if width == W32 && super::relay_and_lea::upper32_zero_at(store, infos, i, sfam) {
+        // A plain 32-bit copy covers 64-bit readers too when the source's
+        // upper half is proven zero.  That proof can walk the CFG
+        // (`upper32_zero_at` -> `upper32_zero_into_label`), so it is asked
+        // lazily, by the first use that actually reads above 32 bits; uses
+        // that stay within 32 bits rename identically at either width.
+        let (mut rule_width, sfam, dfam, is_ext, mut widen_pending) =
+            if let Some((width, sfam, dfam)) = parse_reg_to_reg_mov(trimmed) {
+                (width, sfam, dfam, false, width == W32)
+            } else if let Some((sw, sfam, dfam)) = parse_reg_to_reg_ext(trimmed) {
+                let width = if trimmed.starts_with("movslq ")
+                    && sign_extend_is_identity(store, infos, i, sfam)
+                {
                     W64
                 } else {
-                    width
+                    sw
                 };
-            (eff_width, sfam, dfam, false)
-        } else if let Some((sw, sfam, dfam)) = parse_reg_to_reg_ext(trimmed) {
-            let width = if trimmed.starts_with("movslq ")
-                && sign_extend_is_identity(store, infos, i, sfam)
-            {
-                W64
+                (width, sfam, dfam, true, false)
             } else {
-                sw
+                continue;
             };
-            (width, sfam, dfam, true)
-        } else {
-            continue;
-        };
         // RBP is allocatable in rsp-relative functions. Do not mistake its
         // byte/word/dword aliases for a frame pointer and strand hot-loop
         // copies. Reuse the frame/unwind/opaque-use proof, cached per function;
@@ -563,8 +561,15 @@ pub(super) fn fold_register_copies(store: &mut LineStore, infos: &mut [LineInfo]
             // copy cannot cover it; `mentions_only_within` rejects that
             // automatically because the address spells the 64-bit name.
             if !mentions_only_within(line, dfam, rule_width) {
-                ok = false;
-                break;
+                let widened = widen_pending
+                    && mentions_only_within(line, dfam, W64)
+                    && super::relay_and_lea::upper32_zero_at(store, infos, i, sfam);
+                widen_pending = false;
+                if !widened {
+                    ok = false;
+                    break;
+                }
+                rule_width = W64;
             }
             // Never rename `%rbp` INTO a memory operand, even where it is a
             // proven GPR (the rule `eliminate_move_relays` follows): every

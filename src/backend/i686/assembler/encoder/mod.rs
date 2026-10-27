@@ -128,26 +128,49 @@ fn fma3_opcode(m: &str) -> Option<(u8, u8)> {
 /// Returns the original string with addend 0 if no offset is found.
 ///
 /// GAS evaluates the whole expression around the symbol, so `sym+38+4` is
-/// `sym+(38+4)` and `sym-4+2` is `sym+(-4+2)`.  The local loop this replaces
-/// parsed only a SINGLE term after the first sign and then kept scanning:
-/// for `boot_params+38+4` the first candidate parsed as symbol `boot_params`
-/// with a non-numeric tail, so scanning continued and the NEXT sign produced
-/// the "symbol" `boot_params+38` with addend 4.  That name is not a symbol, but
-/// it was used as one, so the object carried an UNDEFINED symbol literally
-/// named `boot_params+38` and lccc-ld refused the kernel's `setup.elf` with
-/// `undefined symbols: boot_params+38, vminfo+31`.  The x86 boot code emits
-/// exactly that shape for 64-bit field copies in -m16 mode
-/// (`movl vminfo+31+4, %eax`, arch/x86/boot/video-vesa.c).
+/// `sym+(38+4)` and `sym-4+2` is `sym+(-4+2)`.  The shared x86 relocation
+/// grammar (the one the x86-64 encoder uses) decides first, so both encoders
+/// agree with GAS by construction: `vminfo+31+4` -> (`vminfo`, 35) -- the
+/// Linux -m16 boot code's 64-bit field copies (arch/x86/boot/video-vesa.c),
+/// which used to produce an UNDEFINED symbol literally named `vminfo+31` --
+/// and `ca+16+4` -> (`ca`, 20), `4+ca` -> (`ca`, 4), `ca+8-4` -> (`ca`, 4)
+/// (i686 `-fno-pie` codegen emits `movl ca+16+4, %edx` for the high half of a
+/// 64-bit global load; tests/regression/global_init_pointer_scalar_base_m32.c).
 ///
-/// The x86-64 encoder already had the correct implementation — full constant
-/// expression evaluation on either side of the sign, with a symbol-character
-/// check on the symbol half — so i686 now delegates to it instead of keeping a
-/// second, weaker copy.  Both encoders therefore agree with GAS (and with each
-/// other) by construction: `as` folds `vminfo+31+4` to `vminfo+0x23`, and so
-/// does this.
+/// The scan below stays as the fallback for exactly what the shared grammar
+/// declines on purpose: a symbol carrying a relocation modifier
+/// (`x@indntpoff+4`).  Without it the base-less caller receives
+/// (`x@indntpoff+4`, 0), its `rsplit_once('@')` sees the modifier
+/// `indntpoff+4`, which is not a known one, and the object gets an R_386_32
+/// against an undefined symbol of that literal name.  With it the caller
+/// receives (`x@indntpoff`, 4) and splits the modifier off afterwards.
 pub(super) fn split_label_offset(label: &str) -> (&str, i64) {
-    crate::backend::x86::assembler::parser::split_relocation_symbol_addend(label)
-        .unwrap_or((label, 0))
+    if let Some(split) =
+        crate::backend::x86::assembler::parser::split_relocation_symbol_addend(label)
+    {
+        return split;
+    }
+    // Scan for '+' or '-' that separates the symbol from the offset.
+    // Skip the first character to avoid splitting on leading sign/dot.
+    for (i, c) in label.char_indices().skip(1) {
+        if c == '+' || c == '-' {
+            let left = label[..i].trim();
+            if left.is_empty() {
+                continue;
+            }
+            // Extract the numeric part (including sign for '-')
+            let num_str = if c == '+' {
+                label[i + 1..].trim()
+            } else {
+                // Keep the '-' sign
+                label[i..].trim()
+            };
+            if let Ok(offset) = num_str.parse::<i64>() {
+                return (left, offset);
+            }
+        }
+    }
+    (label, 0)
 }
 
 /// Relocation entry for the linker to resolve.
@@ -4062,6 +4085,63 @@ mod merged_pr629_followup_tests {
             assemble("{rex2} {vex} vpaddd %xmm1,%xmm2,%xmm3").unwrap_err(),
             "`{rex2}' is only supported in 64-bit mode"
         );
+    }
+}
+
+#[cfg(test)]
+mod split_label_offset_tests {
+    use super::split_label_offset;
+
+    #[test]
+    fn constant_chains_fold_like_gas() {
+        assert_eq!(split_label_offset("ca+16+4"), ("ca", 20));
+        assert_eq!(split_label_offset("4+ca"), ("ca", 4));
+        assert_eq!(split_label_offset("ca+8-4"), ("ca", 4));
+        assert_eq!(split_label_offset("ca-8"), ("ca", -8));
+        assert_eq!(split_label_offset("pa_tr_efer + 4"), ("pa_tr_efer", 4));
+        assert_eq!(split_label_offset(".Lstr0+1"), (".Lstr0", 1));
+        assert_eq!(split_label_offset("plain"), ("plain", 0));
+    }
+
+    #[test]
+    fn modifier_symbols_keep_the_scan_fallback() {
+        // The caller splits a known `@MOD` off the returned symbol.
+        assert_eq!(split_label_offset("x@indntpoff+4"), ("x@indntpoff", 4));
+        assert_eq!(split_label_offset("x@indntpoff"), ("x@indntpoff", 0));
+    }
+
+    /// End to end through the i686 assembler: every base-less spelling
+    /// relocates against `ca` with the folded addend, which REL keeps in the
+    /// displacement bytes (GAS 2.47 -32: `.data+0x14`, `+0x4`, `+0x4`).
+    #[test]
+    fn base_less_operands_relocate_against_the_symbol() {
+        let dir = std::env::temp_dir().join(format!("lccc-i686-split-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let obj = dir.join("t.o");
+        let asm = "    .data\nca: .long 1,2,3,4,5,6,7,8\n    .text\nf:\n    movl ca+16+4, %edx\n    movl 4+ca, %eax\n    movl ca+8-4, %ecx\n    ret\n";
+        crate::backend::i686::assembler::assemble(asm, obj.to_str().unwrap()).unwrap();
+        let bytes = std::fs::read(&obj).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        // No symbol name may carry the arithmetic.
+        for bad in [&b"ca+16"[..], b"4+ca", b"ca+8"] {
+            assert!(
+                !bytes.windows(bad.len()).any(|w| w == bad),
+                "symbol named {:?} in the object",
+                String::from_utf8_lossy(bad)
+            );
+        }
+        // movl disp32,%edx = 8b 15 <20>; movl moffs,%eax = a1 <4>;
+        // movl disp32,%ecx = 8b 0d <4>  (ca is at .data+0).
+        for enc in [
+            &[0x8b, 0x15, 20, 0, 0, 0][..],
+            &[0xa1, 4, 0, 0, 0],
+            &[0x8b, 0x0d, 4, 0, 0, 0],
+        ] {
+            assert!(
+                bytes.windows(enc.len()).any(|w| w == enc),
+                "missing encoding {enc:02x?}"
+            );
+        }
     }
 }
 

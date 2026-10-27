@@ -20,15 +20,16 @@ counts), complement of negation, saturated min/max selects, zero-test selects in
 all four arm orders, or-chain selects, boolean products, and power-of-two
 remainder and division in both widths.
 """
+import argparse
 import os
 import random
+import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
-LCCC = "/home/user/lccc/target/fastbuild/lccc"
-GCC = "/home/user/.local/gcc16/gcc-16/bin/gcc-16"
+ROOT = Path(__file__).resolve().parents[1]
 
 WIDTHS = {"int8_t": 8, "uint8_t": 8, "int16_t": 16, "uint16_t": 16, "int32_t": 32,
           "uint32_t": 32, "int64_t": 64, "uint64_t": 64}
@@ -230,7 +231,12 @@ def program(cases):
 
 
 def main():
-    rounds = int(sys.argv[1]) if len(sys.argv) > 1 else 40
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("rounds", nargs="?", type=int, default=40)
+    parser.add_argument("--lccc", default=os.environ.get("CCC", str(ROOT / "target/fastbuild/lccc")))
+    parser.add_argument("--gcc", default=os.environ.get("GCC", shutil.which("gcc-16") or "gcc-16"))
+    args = parser.parse_args()
+    rounds = args.rounds
     failures = 0
     off = {"CCC_NO_RING_IDENTITIES": "1", "CCC_DISABLE_PASSES": "bit_idioms,div_by_const"}
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -240,7 +246,7 @@ def main():
             path = tmp / "fuzz.c"
             path.write_text(source)
             outputs = {}
-            for label, compiler, extra in (("on", LCCC, {}), ("off", LCCC, off), ("gcc", GCC, {})):
+            for label, compiler, extra in (("on", args.lccc, {}), ("off", args.lccc, off), ("gcc", args.gcc, {})):
                 binary = tmp / f"{label}.bin"
                 build_result = subprocess.run(
                     [compiler, "-O2", "-w", str(path), "-o", str(binary)],
@@ -257,7 +263,9 @@ def main():
                 continue
             if len(set(outputs.values())) != 1:
                 print(f"seed {seed}: MISMATCH {outputs}")
-                Path(f"/home/user/research/fuzz_fail_{seed}.c").write_text(source)
+                keep = ROOT / "research" / f"fuzz_fail_{seed}.c"
+                keep.parent.mkdir(exist_ok=True)
+                keep.write_text(source)
                 failures += 1
     print(f"{rounds} programs, {failures} failures")
     return 1 if failures else 0

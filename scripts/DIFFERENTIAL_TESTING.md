@@ -85,6 +85,27 @@ engine:
 Like the pre-unification testers, the wrappers run forever unless bounded
 (`--count N` / legacy `--tests N`).
 
+## Targeted scalar-float fuzzer
+
+`scripts/fuzz_float_scalar_vs_gcc.py` is a focused generator for the x86-64
+scalar float register paths random corpora rarely stress: many float values
+live across non-inlined calls, float<->u32 bit casts, phis fed by compares,
+and back-edge copies (spill/reload, GPR homes, FP copy webs). Output is an
+integer hash, compared bit-exactly with GCC 16.2. Every program is screened
+with UBSan including `float-cast-overflow` first, so UB never counts.
+
+```bash
+# SSE1-only x86-64 (-mno-sse2): no SSE2 move may leak, results must match.
+./scripts/fuzz_float_scalar_vs_gcc.py --mode sse1 --cases 240
+# Baseline ISA at -O1/-O2/-O3/-O2 -mavx2.
+./scripts/fuzz_float_scalar_vs_gcc.py --mode default --cases 240 --keep /tmp/div
+```
+
+It found the SSE1 scalar routes that still emitted SSE2 moves and the FP
+copy-web leader miscompile (`tests/regression/fp_copy_web_call_leader.c`).
+It is a session tool, not a CI gate: the bugs it finds are pinned by reduced
+fixtures and permission probes, which run in milliseconds.
+
 ## Why this matters
 
 LCCC's correctness bar is the hard constraint of the project: a fast compiler

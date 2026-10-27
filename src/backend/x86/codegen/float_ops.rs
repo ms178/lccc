@@ -58,6 +58,10 @@ impl X86Codegen {
     /// in the accumulator already, and even then the direct move from the GP
     /// register wins.
     pub(super) fn load_bits64_to_xmm0(&mut self, op: &Operand) {
+        if !self.isa.simd {
+            self.load_bits64_to_xmm0_sse1(op);
+            return;
+        }
         if let Operand::Value(v) = op {
             let is_alloca = self.state.is_alloca(v.0);
             if self.state.acc_has_verified(v.0, is_alloca) {
@@ -84,6 +88,41 @@ impl X86Codegen {
         // Constants and anything else: materialize in %rax and move across.
         self.operand_to_rax(op);
         self.state.emit("    movq %rax, %xmm0");
+    }
+
+    /// `load_bits64_to_xmm0` without SSE2 (`-mno-sse2 -msse`, an x86-64
+    /// 8-byte vector or SSE-class struct result). SSE1 has no MOVQ between a
+    /// GPR or memory and an XMM register: a slot loads with MOVLPS (the upper
+    /// lanes are not part of the eightbyte), an XMM home copies with MOVAPS,
+    /// and a GPR value crosses through the balanced stack bridge.
+    fn load_bits64_to_xmm0_sse1(&mut self, op: &Operand) {
+        if let Operand::Value(v) = op {
+            let is_alloca = self.state.is_alloca(v.0);
+            if self.state.acc_has_verified(v.0, is_alloca) {
+                self.emit_scalar_gpr_to_xmm("rax", "eax", "xmm0", false);
+                return;
+            }
+            if let Some(reg) = self.fresh_home_of(v.0) {
+                let name = phys_reg_name(reg);
+                if is_xmm_reg(reg) {
+                    if name != "xmm0" {
+                        self.state
+                            .emit_fmt(format_args!("    movaps %{}, %xmm0", name));
+                    }
+                } else {
+                    self.emit_scalar_gpr_to_xmm(name, phys_reg_name_32(reg), "xmm0", false);
+                }
+                return;
+            }
+            if let Some(slot) = self.state.get_slot(v.0) {
+                self.state
+                    .out
+                    .emit_instr_rbp_reg("    movlps", slot.0, "xmm0");
+                return;
+            }
+        }
+        self.operand_to_rax(op);
+        self.emit_scalar_gpr_to_xmm("rax", "eax", "xmm0", false);
     }
 
     pub(super) fn load_fp_to_xmm0(&mut self, op: &Operand, ty: IrType) {
@@ -214,11 +253,8 @@ impl X86Codegen {
             self.state.reg_cache.invalidate_acc();
             return;
         }
-        if matches!(ty, IrType::F32 | IrType::D32) {
-            self.state.emit("    movd %xmm0, %eax");
-        } else {
-            self.state.emit("    movq %xmm0, %rax");
-        }
+        let f32ish = matches!(ty, IrType::F32 | IrType::D32);
+        self.emit_scalar_xmm_to_gpr("xmm0", "rax", f32ish.then_some("eax"));
         self.state.reg_cache.invalidate_acc();
         self.store_rax_to(dest);
     }
@@ -312,13 +348,7 @@ impl X86Codegen {
                 } else {
                     self.operand_to_rcx(op);
                 }
-                if ty == IrType::F32 {
-                    self.state
-                        .emit_fmt(format_args!("    movd %{}, %{}", gpr32, reg));
-                } else {
-                    self.state
-                        .emit_fmt(format_args!("    movq %{}, %{}", gpr, reg));
-                }
+                self.emit_scalar_gpr_to_xmm(gpr, gpr32, reg, ty == IrType::F32);
             }
         }
     }

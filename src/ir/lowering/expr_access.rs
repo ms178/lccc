@@ -119,10 +119,12 @@ impl Lowerer {
         // Vector-to-scalar cast: load the vector data as the target scalar type.
         // Vectors are stored in stack allocas and lower_expr returns a pointer.
         // A cast like `(long long)(V2SI){2,2}` must load the 8 bytes of vector
-        // data as an integer, not return the alloca pointer itself.
+        // data as an integer, not return the alloca pointer itself. A call
+        // returning a small vector in a register yields the bits, not an
+        // address; `vector_operand_ptr` spills that carrier first
+        // (`(long long)f()` dereferenced the bits).
         if inner_ctype.is_vector() && !target_ctype.is_vector() {
-            let src = self.lower_expr(inner);
-            let ptr = self.operand_to_value(src);
+            let ptr = self.vector_operand_ptr(inner, &inner_ctype);
             let to_ty = self.type_spec_to_ir(target_type);
             let dest = self.fresh_value();
             self.emit(Instruction::Load {
@@ -165,9 +167,13 @@ impl Lowerer {
             return Operand::Value(alloca);
         }
 
-        // Vector-to-vector cast: memcpy between allocas if sizes match.
+        // Vector-to-vector cast: memcpy between allocas if sizes match. The
+        // source is always an address (`vector_operand_ptr` spills a packed
+        // small-vector call result), because every consumer of a cast treats
+        // its value as one: `(__m64)_mm_add_pi16(a, b)` passed on the packed
+        // bits, and `_mm_extract_pi16` of an rvalue dereferenced them.
         if inner_ctype.is_vector() && target_ctype.is_vector() {
-            let src = self.lower_expr(inner);
+            let src = Operand::Value(self.vector_operand_ptr(inner, &inner_ctype));
             let src_size = self.ctype_size(&inner_ctype);
             let dst_size = self.ctype_size(&target_ctype);
             if src_size == dst_size {

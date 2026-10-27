@@ -374,11 +374,7 @@ impl X86Codegen {
             // _Float128 result stays in %xmm0 (single-XMM SysV ABI).
             return;
         }
-        if to_ty == IrType::F32 {
-            self.state.emit("    movd %xmm0, %eax");
-        } else {
-            self.state.emit("    movq %xmm0, %rax");
-        }
+        self.emit_scalar_xmm_to_gpr("xmm0", "rax", (to_ty == IrType::F32).then_some("eax"));
     }
 
     pub(super) fn emit_float_to_i128_call_impl(

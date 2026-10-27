@@ -2003,6 +2003,10 @@ jobs:
         # the four design refusals asserted as refusals, the kill-switch
         # control, runtime parity on-vs-off, and the §5.3 gcc-16.2 shape pin.
         env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_sibcall_shapes.sh
+        # IPA-RA must not summarize weak/interposable bodies: a strong
+        # override linked from another TU clobbers %r8-%r11 (was 55, not 79)
+        # at -O1/-O2 under no-pic, -fPIE and -fPIC.
+        env CCC=target/fastbuild/lccc bash tests/regression/check_ipa_ra_interposition.sh
         # The i128-atomic consumer reproducer from
         # FOLLOWUP-2026-10-21-i128-atomic-o2.md (fixed; pinned so the class
         # cannot silently return), at -O0..-O3 under default and -mcx16.

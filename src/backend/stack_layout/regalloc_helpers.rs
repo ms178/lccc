@@ -396,6 +396,9 @@ pub fn run_regalloc_and_merge_clobbers_ipa(
                             // unconditional.
                             | O::VecWidenAddValueI32x4ToI64x2
                             | O::VecWidenMaskedAddValueI32x4ToI64x2
+                            // SSE2 masked equal-width step: %xmm2 stages a
+                            // slot-homed guard splat beside the lane copy.
+                            | O::VecMaskedAddValueI32x4
                     ) || (sse2_i32_mul_lowering && matches!(op, O::VecMulI32x4))
                 } else {
                     false

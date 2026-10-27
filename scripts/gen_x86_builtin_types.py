@@ -40,7 +40,8 @@ def argument_vector_widths(descriptor):
 
 def argument_scalar_types(descriptor):
     scalar = {'INT': 'I32', 'SI': 'I32', 'UINT': 'U32', 'INT64': 'I64',
-              'UINT64': 'U64', 'LONGLONG': 'I64', 'USHORT': 'U16', 'UCHAR': 'U8'}
+              'UINT64': 'U64', 'LONGLONG': 'I64', 'ULONGLONG': 'U64',
+              'USHORT': 'U16', 'UCHAR': 'U8'}
     return tuple(scalar.get(token) for token in descriptor.split('_FTYPE_', 1)[1].split('_')
                  if token not in ('VOID', 'COUNT', 'CONVERT', 'PTEST'))
 
@@ -108,11 +109,13 @@ def generate():
 def c_type(token):
     scalar = {'VOID': 'void', 'INT': 'int', 'SI': 'int', 'UINT': 'unsigned int',
               'INT64': 'long long', 'UINT64': 'unsigned long long',
-              'LONGLONG': 'long long', 'USHORT': 'unsigned short', 'UCHAR': 'unsigned char'}
+              'LONGLONG': 'long long', 'ULONGLONG': 'unsigned long long',
+              'USHORT': 'unsigned short', 'UCHAR': 'unsigned char'}
     pointer = {'PCCHAR': 'const char *', 'PCHAR': 'char *', 'PV2DI': 'tV2DI *',
                'PINT': 'int *', 'PLONGLONG': 'long long *', 'PDOUBLE': 'double *',
                'PUNSIGNED': 'unsigned int *', 'PCDOUBLE': 'const double *',
-               'PCFLOAT': 'const float *'}
+               'PCFLOAT': 'const float *', 'PFLOAT': 'float *',
+               'PULONGLONG': 'unsigned long long *'}
     if token in scalar:
         return scalar[token]
     if token in pointer:

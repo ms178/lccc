@@ -879,12 +879,20 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Movnti64),
     );
     m.insert(
+        "__builtin_ia32_movntq",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Movntq),
+    );
+    m.insert(
         "__builtin_ia32_movntdq",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Movntdq),
     );
     m.insert(
         "__builtin_ia32_movntpd",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Movntpd),
+    );
+    m.insert(
+        "__builtin_ia32_movntps",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Movntps),
     );
     m.insert(
         "__builtin_ia32_loaddqu",
@@ -1084,19 +1092,19 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
     // XMM-register caching and the same `movdqu` emission.
     m.insert(
         "_mm_loadu_ps",
-        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Loaddqu),
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86LoadPs),
     );
     m.insert(
         "_mm_load_ps",
-        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Loaddqu),
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86LoadPs),
     );
     m.insert(
         "_mm_storeu_ps",
-        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Storedqu),
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86StorePs),
     );
     m.insert(
         "_mm_store_ps",
-        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Storedqu),
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86StorePs),
     );
     m.insert(
         "_mm_loadu_pd",
@@ -1349,12 +1357,20 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Movnti64),
     );
     m.insert(
+        "_mm_stream_pi",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Movntq),
+    );
+    m.insert(
         "_mm_stream_si32",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Movnti),
     );
     m.insert(
         "_mm_stream_pd",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Movntpd),
+    );
+    m.insert(
+        "_mm_stream_ps",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Movntps),
     );
     m.insert(
         "_mm_lfence",
@@ -3665,10 +3681,19 @@ pub enum BuiltinIntrinsic {
     X86Clflush,
     X86Movnti,
     X86Movnti64,
+    /// SSE1 `MOVNTQ` semantics (`_mm_stream_pi`): an 8-byte non-temporal
+    /// store, lowered without touching MMX state (see `lower_movntq_builtin`).
+    X86Movntq,
     X86Movntdq,
     X86Movntpd,
+    X86Movntps,
     X86Loaddqu,
     X86Storedqu,
+    /// `_mm_load{,u}_ps` / `_mm_store{,u}_ps`: the same 16-byte copy as
+    /// `X86Loaddqu`/`X86Storedqu`, but SSE1 (MOVUPS), so an SSE1-only target
+    /// keeps them.
+    X86LoadPs,
+    X86StorePs,
     X86Pcmpeqb128,
     X86Pcmpeqd128,
     X86Psubusb128,
@@ -3772,7 +3797,7 @@ pub enum BuiltinIntrinsic {
     X86MinPs128,      // __builtin_ia32_minps (MINPS)
     X86ShufPsValue,   // __builtin_ia32_shufps (SHUFPS imm8) — by-value raw builtin
     X86CvtPd2PsValue, // __builtin_ia32_cvtpd2ps (CVTPD2PS) — by-value raw builtin
-    ShuffleVector,    // __builtin_shufflevector (4-lane 32-bit shuffles)
+    ShuffleVector,    // __builtin_shufflevector (any lane count; one result lane per index)
     Shuffle,          // __builtin_shuffle(v[, v2], mask) — GCC vector-extension permute
     X86MaxPs256V,     // __builtin_ia32_maxps256 (VMAXPS ymm)
     X86MinPs256V,     // __builtin_ia32_minps256 (VMINPS ymm)

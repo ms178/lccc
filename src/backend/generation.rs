@@ -4737,8 +4737,7 @@ fn emit_functions_and_sections(
                 // post-peephole). Debug traces are suppressed (the flag)
                 // because these emissions are not the shipped code.
                 let mark = cg.state().out.buf.len();
-                crate::backend::state::EXPLORATORY_EMISSION
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                crate::backend::state::EXPLORATORY_EMISSION.with(|flag| flag.set(true));
                 generate_function(cg, attr_align, func, source_mgr, file_table);
                 let chain_raw = cg.state_ref().out.buf[mark..].to_string();
                 cg.state().out.buf.truncate(mark);
@@ -4798,8 +4797,7 @@ fn emit_functions_and_sections(
                             orig_stack
                         );
                     }
-                    crate::backend::state::EXPLORATORY_EMISSION
-                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                    crate::backend::state::EXPLORATORY_EMISSION.with(|flag| flag.set(false));
                     // Emit the measured winner for real: debug traces fire
                     // exactly once per site (count-based test assertions),
                     // and the shipped text comes from a non-exploratory
@@ -4832,8 +4830,7 @@ fn emit_functions_and_sections(
                 } else {
                     // Malformed record (block count changed after the layout
                     // pass — defensive): emit once with the live order.
-                    crate::backend::state::EXPLORATORY_EMISSION
-                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                    crate::backend::state::EXPLORATORY_EMISSION.with(|flag| flag.set(false));
                     generate_function(cg, attr_align, func, source_mgr, file_table);
                 }
             } else {
@@ -5142,7 +5139,7 @@ fn generate_function(
     cg.set_function_target_features(&[]);
     // Exploratory (dual-layout measurement) emissions are truncated away;
     // only the shipped emission may define a summary or a keep record.
-    if !crate::backend::state::EXPLORATORY_EMISSION.load(std::sync::atomic::Ordering::Relaxed) {
+    if !crate::backend::state::EXPLORATORY_EMISSION.with(std::cell::Cell::get) {
         cg.note_function_emitted(func, mark);
     }
 }

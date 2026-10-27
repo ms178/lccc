@@ -277,7 +277,11 @@ for mode in -m64 -m32; do
 done
 
 # Retain useful clone folding when the original whole-loop proof licenses it.
-CCC_LOOP_ROTATE=1 CCC_DEBUG_LOOP_ROTATE=1 "$CCC" -O2 -fwrapv -S "$corpus" -o "$work/proved-rotation.s" 2> "$work/proved-rotation.log"
+# The pre-vectorizer run (`affold_prevec`) folds every loop of this corpus
+# BEFORE rotation clones it, which would leave this mechanism untested; it is
+# unscheduled here so the clone fold's own proof is what must fire.
+CCC_DISABLE_PASSES=affold_prevec CCC_LOOP_ROTATE=1 CCC_DEBUG_LOOP_ROTATE=1 \
+    "$CCC" -O2 -fwrapv -S "$corpus" -o "$work/proved-rotation.s" 2> "$work/proved-rotation.log"
 grep -Eq '\[ROT\] affine exit-compare folds: [1-9]' "$work/proved-rotation.log" || bad "no proven rotation-clone fold survived"
 echo '  signed control proof: m64/m32 oracle/rotation/disable matrix complete (verdict below)'
 

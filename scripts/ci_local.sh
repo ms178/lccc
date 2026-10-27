@@ -566,6 +566,11 @@ gate "public-native-simd-abi" fast \
 # These were orphaned (not wired into any gate) until this entry.
 gate "ext-vector-callsite-abi" fast \
     env CCC="$LCCC" bash tests/regression/check_ext_vector_callsite_abi.sh
+# IPA-RA must not summarize a body another TU can replace at link time
+# (#pragma weak, late weak redeclaration, top-level asm .weak): a silent
+# miscompile class no single-TU corpus case can reach. Six tiny links.
+gate "ipa-ra-interposition" fast \
+    env CCC="$LCCC" bash tests/regression/check_ipa_ra_interposition.sh
 gate "ext-vector-lane1-abi" fast \
     env CCC="$LCCC" bash tests/regression/check_ext_vector_lane1_abi.sh
 gate "ext-vector-narrow-arith" fast \
@@ -731,12 +736,8 @@ gate "vector-abi-wide" fast \
 gate "gnu-vector-align-abi" fast \
     env CCC="$LCCC" bash tests/regression/check_gnu_vector_align_abi.sh
 
-# GCC-compatible 16-byte vector_size i686 carriers, including the SSE-only
-# and no-SSE boundaries, with typed shuffles across every compiler pairing.
-# The hosted leg runs after a swap-enabled fastbuild with GNU as 2.47 and the
-# exact GCC 16.2 / Clang 23.1.4 oracles in the unsharded differential lane.
-gate "i686-gnu-vector-abi" fast \
-    env CCC="$LCCC" bash tests/regression/check_i686_gnu_vector_abi.sh
+# i686-gnu-vector-abi runs after `asm-diff-oracle-gas-2.47` (below): it
+# needs that gate's pinned GNU as 2.47.
 
 # AUD-TMP-1: temp files must be symlink-proof. Drives the pre-placed-symlink
 # reproducer (and its pre-placed-directory variant) against the built compiler
@@ -2020,6 +2021,15 @@ gate "inline-asm-utf8" fast \
 # same script hosted CI runs.
 gate "asm-diff-oracle-gas-2.47" fast \
     bash scripts/ensure_gas_247.sh x86_64-linux-gnu
+
+# GCC-compatible 16-byte vector_size i686 carriers, including the SSE-only
+# and no-SSE boundaries, with typed shuffles across every compiler pairing.
+# Mirrors the hosted ipa-lrs.yml step: GNU as 2.47 from the pin the gate
+# above provisioned (the script refuses any other `as`), and the exact
+# GCC 16.2 / Clang 23.1.4 oracles.
+gate "i686-gnu-vector-abi" fast \
+    env PATH="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin:$PATH" CCC="$LCCC" \
+        bash tests/regression/check_i686_gnu_vector_abi.sh
 
 # The same provisioning for the AArch64 side, and it is load-bearing for
 # every aarch64 gate below: they take their verdicts FROM a 2.47 `as`, and
