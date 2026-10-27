@@ -93,6 +93,9 @@ for arch in x86-64 i686; do
         exe=$work/runtime-$arch$opt
         "$cc" "$opt" "$runtime" -o "$exe"
         timeout 10 "$exe"
+        values=$work/values-$arch$opt
+        "$cc" "$opt" "$repo/tests/regression/builtin_floor_float_values.c" -lm -o "$values"
+        timeout 10 "$values"
     done
 done
 
