@@ -1715,6 +1715,8 @@ jobs:
         tar -xzf lccc-fast.tar.gz
         test "$(cat target/ci-build.commit)" = "$(git rev-parse HEAD)"
         sha256sum -c target/ci-build.sha256
+    - name: Execute switch contracts on AArch64 and RISC-V
+      run: python3 tests/regression/check_switch_cross_execute.py
     - name: Run destructive-path guard regression
       run: bash tests/regression/check_destructive_guards.sh
     - name: Verify basic-block SLP soundness contracts

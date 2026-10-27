@@ -435,3 +435,35 @@ The real probe test requires **both** `LCCC_TEST_REAL_ICX=1` and
 `LCCC_ICX_BIN`. An explicitly requested real probe fails on a wrong or unusable
 compiler instead of being converted to a skip. No compilation is performed
 by that probe, only predefined-macro preprocessing.
+
+### Switch lowering red-team contracts
+
+`python3 -m unittest scripts.test_aarch64_execute_suite` exercises oracle
+failure classification and bounded mismatch diagnostics without external tools.
+`tests/regression/check_builtin_floor_narrowing.sh` separates call-routing
+contracts from a numerical binary32 oracle: 42 signed boundary inputs and
+65,536 deterministic samples, each checked through three call forms, on both
+x86 ABIs at five optimization levels. It checks quiet-NaN classification and
+signed zero, not NaN payloads or floating-environment exception flags.
+
+`python3 tests/regression/check_switch_cross_execute.py` runs nine self-checking
+switch fixtures with LUT lowering on/off under AArch64 and RV64 QEMU (36 runs).
+It requires the fastbuild target drivers, Clang 23.1.4, triplet GNU linkers,
+QEMU user emulators, and host C declaration headers. The executable uses a
+minimal syscall startup and no cross libc; printf/puts are no-ops, so acceptance
+is based on each fixture's exit-code oracle, not its printed output. `--clang`,
+`--qemu-dir`, and `--lccc-dir` select tool locations; `--ld` selects one GNU
+linker supporting both target emulations instead of the triplet defaults.
+The assembler/linker CI lane runs this gate after cross-toolchain provisioning.
+
+For a compile-time lookup witness (not a timing threshold gate):
+
+```sh
+cargo test --profile fastbuild --lib switch_definition_index_scaling_witness \
+  -- --ignored --nocapture
+```
+
+The witness asserts equality between linear-scan and indexed definition
+results, and reports both timings for 2,000 queries. Production indexes only
+original switch operands, rejects multiple definitions, and rebuilds return
+path memoization after each IR transformation.

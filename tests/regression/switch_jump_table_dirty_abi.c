@@ -18,8 +18,9 @@ __attribute__((noinline)) int jt32(uint32_t x) {
     }
 }
 
-#if defined(__x86_64__)
+#if defined(__x86_64__) || defined(__aarch64__)
 typedef int (*jt32_fn)(uint32_t);
+#if defined(__x86_64__)
 __asm__(
     ".text\n"
     ".globl call_dirty32\n"
@@ -34,6 +35,20 @@ __asm__(
     "    addq $8, %rsp\n"
     "    ret\n"
     ".size call_dirty32, .-call_dirty32\n");
+#else
+/* AAPCS64 also leaves the high argument bits unspecified. Tail dispatch keeps
+ * the link register untouched while injecting noncanonical bits into x0. */
+__asm__(
+    ".text\n"
+    ".globl call_dirty32\n"
+    ".type call_dirty32,%function\n"
+    "call_dirty32:\n"
+    "    mov x16, x0\n"
+    "    mov w2, w2\n"
+    "    orr x0, x1, x2\n"
+    "    br x16\n"
+    ".size call_dirty32, .-call_dirty32\n");
+#endif
 extern int call_dirty32(jt32_fn fn, uint64_t upper, uint32_t low);
 #endif
 
@@ -46,7 +61,7 @@ int main(void) {
         if (jt32(x) != expected[x])
             return 1;
     }
-#if defined(__x86_64__)
+#if defined(__x86_64__) || defined(__aarch64__)
     const uint64_t uppers[] = {
         0x1234567800000000ULL, 0xffffffff00000000ULL, 0x8000000000000000ULL
     };
