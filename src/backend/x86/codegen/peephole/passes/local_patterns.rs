@@ -2092,8 +2092,11 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                 ),
                 ExtKind::Cltq => matches!(
                     prev_ext,
-                    ExtKind::ProducerMovslqToRax
+                    ExtKind::ProducerMovsbqToRax
+                        | ExtKind::ProducerMovswqToRax
+                        | ExtKind::ProducerMovslqToRax
                         | ExtKind::ProducerMovqConstRax
+                        | ExtKind::MovsbqAlRax
                         | ExtKind::MovslqEaxRax
                         | ExtKind::Cltq
                 ),
@@ -2159,8 +2162,11 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                         let k_ext = infos[k].ext_kind;
                         if matches!(
                             k_ext,
-                            ExtKind::ProducerMovslqToRax
+                            ExtKind::ProducerMovsbqToRax
+                                | ExtKind::ProducerMovswqToRax
+                                | ExtKind::ProducerMovslqToRax
                                 | ExtKind::ProducerMovqConstRax
+                                | ExtKind::MovsbqAlRax
                                 | ExtKind::MovslqEaxRax
                                 | ExtKind::Cltq
                         ) {
@@ -4397,10 +4403,10 @@ pub(super) fn eliminate_fp_spill_around_load(
                             );
 
                             if xmm1_dead_after {
-                                // Two rewrites, chosen by what the gap
-                                // (K, L) does with %xmm0:
+                                // Two rewrites, chosen by what I..L outside
+                                // K itself does with %xmm0:
                                 //
-                                //  * gap never names %xmm0 → ROLE SWAP:
+                                //  * no other instruction names %xmm0 → ROLE SWAP:
                                 //    K loads into %xmm1 instead, %xmm0 keeps
                                 //    V, L becomes `addsd %xmm1, %xmm0`
                                 //    (V + X; addition commutes).  Zero
@@ -4412,8 +4418,16 @@ pub(super) fn eliminate_fp_spill_around_load(
                                 //    are, L adds %xmm1.  The old pass
                                 //    applied the role swap here too and
                                 //    computed on V instead of X.
-                                let gap_uses_xmm0 = (k_pos + 1..l_pos).any(|g| {
-                                    !infos[g].is_nop()
+                                // Role swap keeps V in %xmm0 from I through
+                                // L, so a clobber BEFORE K is just as fatal
+                                // as one after it (stdarg-4.c: pxor/cvtsi2sd
+                                // overwrite the pending va_arg double).
+                                // Inspect the whole I..L interval except K
+                                // itself; any such use selects the relay,
+                                // which preserves V in %xmm1 instead.
+                                let gap_uses_xmm0 = (i + 1..l_pos).any(|g| {
+                                    g != k_pos
+                                        && !infos[g].is_nop()
                                         && infos[g].trimmed(store.get(g)).contains("%xmm0")
                                 });
                                 if gap_uses_xmm0 {

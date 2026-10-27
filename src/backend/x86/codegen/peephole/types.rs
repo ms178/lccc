@@ -179,6 +179,8 @@ pub(super) enum ExtKind {
     ProducerMovzwqToRax,
     /// Producer that writes to %rax with movsbq
     ProducerMovsbqToRax,
+    /// Producer that writes to %rax with movswq
+    ProducerMovswqToRax,
     /// Producer that writes to %rax with movslq
     ProducerMovslqToRax,
     /// Producer: movq $const, %rax
@@ -940,6 +942,9 @@ pub(super) fn classify_mov_ext(s: &str, sb: &[u8]) -> ExtKind {
     }
     if s.starts_with("movsbq ") && s.ends_with("%rax") {
         return ExtKind::ProducerMovsbqToRax;
+    }
+    if s.starts_with("movswq ") && s.ends_with("%rax") {
+        return ExtKind::ProducerMovswqToRax;
     }
 
     // Producers: movl ... %eax

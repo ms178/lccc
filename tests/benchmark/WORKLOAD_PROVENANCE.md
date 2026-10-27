@@ -113,6 +113,35 @@ they are stable screening kernels for regressions in addressing, branches,
 register allocation, and memory-op folding before graduating to the pinned
 end-to-end workloads.
 
+## Switch-LUT admission microbenchmarks
+
+Four repository-local synthetic programs give `switch_lut` an explicit
+performance oracle. They are deliberately separate shapes rather than claims
+about an application workload:
+
+| Benchmark | Eligible shape | Primary comparison | Deterministic oracle |
+|---|---|---|---|
+| `switch_lut_bool_bench` | forwarded constant returns, `{0,1}` plus zero default | one-bit membership mask versus switch dispatch | fixed LCG stream and accumulated classification sum |
+| `switch_lut_two_val_bench` | forwarded constant returns, two table values including the default | general two-value mask versus switch dispatch | fixed LCG stream and accumulated classification sum |
+| `switch_lut_packed_bench` | sixteen dense four-bit results; default zero is also a table value | packed immediate LUT versus switch dispatch | fixed LCG stream and accumulated lookup sum |
+| `switch_lut_packed_fallback_bench` | same table with default 16, which no table slot encodes | packed extraction plus out-of-range result select | fixed LCG stream and accumulated lookup/default sum |
+
+Each function is `noinline`, each input stream includes out-of-range defaults,
+and `-DN=<count>` scales the hot loop (default eight million iterations).
+Measure the pass directly with the existing interleaved, correctness-gated
+harness:
+
+```sh
+python3 scripts/perf_ab.py \
+  --env CCC_DISABLE_PASSES=switch_lut \
+  --only switch_lut_bool_bench,switch_lut_two_val_bench,switch_lut_packed_bench,switch_lut_packed_fallback_bench \
+  --reps 9
+```
+
+The pass-disabled arm is B, so `B/A > 1` favors the enabled pass. Static
+instruction counts and Callgrind branch simulation answer different questions;
+neither replaces the native timing or a real-application benchmark.
+
 ## What these kernels can and cannot establish
 
 They can isolate code-generation questions such as:

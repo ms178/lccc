@@ -4085,6 +4085,38 @@ mod tests {
     }
 
     #[test]
+    fn test_redundant_cltq_after_narrow_sign_extensions() {
+        for producer in [
+            "movsbq %dil, %rax",
+            "movsbq %al, %rax",
+            "movsbq -8(%rbp), %rax",
+            "movswq %di, %rax",
+            "movswq %ax, %rax",
+            "movswq -8(%rbp), %rax",
+        ] {
+            let asm = format!("    {producer}\n    cltq\n");
+            let result = peephole_optimize(asm);
+            assert!(result.contains(producer), "lost producer: {result}");
+            assert!(
+                !result.contains("cltq"),
+                "{producer} already sign-extends to 64 bits: {result}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_narrow_sign_extension_does_not_hide_rax_clobber_from_cltq() {
+        for producer in ["movsbq %dil, %rax", "movswq %di, %rax"] {
+            let asm = format!("    {producer}\n    addl $1, %eax\n    cltq\n");
+            let result = peephole_optimize(asm);
+            assert!(
+                result.contains("cltq"),
+                "intervening eax write must retain cltq after {producer}: {result}"
+            );
+        }
+    }
+
+    #[test]
     fn test_dead_store_elimination() {
         let asm = [
             "    pushq %rbp",

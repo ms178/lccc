@@ -183,16 +183,23 @@ def test_one(source: Path, tools: Toolchain, work_root: Path) -> Result:
             clang_compile = compile_reference(
                 tools.clang, source, clang_binary, tools, test_flags, clang=True
             )
-            if clang_compile.returncode == 0:
-                clang_result = execute(clang_binary, tools)
-                if clang_result != gcc_result:
-                    return Result(
-                        str(source),
-                        "ORACLE-DISAGREE",
-                        "clang-vs-gcc",
-                        time.monotonic() - started,
-                        f"clang rc={clang_result[0]} vs gcc rc={gcc_result[0]}",
-                    )
+            if clang_compile.returncode != 0:
+                return Result(
+                    str(source),
+                    "HARNESS-ERROR",
+                    "clang-compile",
+                    time.monotonic() - started,
+                    text(clang_compile.stderr),
+                )
+            clang_result = execute(clang_binary, tools)
+            if clang_result != gcc_result:
+                return Result(
+                    str(source),
+                    "ORACLE-DISAGREE",
+                    "clang-vs-gcc",
+                    time.monotonic() - started,
+                    f"clang rc={clang_result[0]} vs gcc rc={gcc_result[0]}",
+                )
 
         return Result(str(source), "PASS", "execute", time.monotonic() - started)
     except subprocess.TimeoutExpired as error:
@@ -309,7 +316,9 @@ def main() -> int:
         temporary_json.replace(args.json)
     if args.keep:
         print(f"WORKDIR {work_root}")
-    return 1 if any(result.status in {"FAIL", "HARNESS-ERROR"} for result in results) else 0
+    return 1 if any(
+        result.status in {"FAIL", "HARNESS-ERROR", "ORACLE-DISAGREE"} for result in results
+    ) else 0
 
 
 if __name__ == "__main__":

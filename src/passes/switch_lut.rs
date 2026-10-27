@@ -9,8 +9,9 @@
 //!    constants `{v0, v1}`, packs membership into a single immediate `mask`:
 //!      `idx = (word)val - (word)min_case`
 //!      `in_range = idx <_u span`
-//!      `safe_idx = Select(in_range, idx, 0)`
-//!      `bit = (mask >>_u safe_idx) & 1`
+//!      `bit = BitTest(mask, idx)` (the index is total modulo the word width)
+//!    The final range select makes the bit unobservable out of range, so this
+//!    encoding needs no clamped index. Packed extraction uses the same contract.
 //!    - For boolean `{0, 1}` with `default == 0` (character classifiers, token
 //!      predicates, state-set checks), emits `Select(in_range, bit, 0)` — zero
 //!      memory loads, zero jump tables, zero indirect branches.
@@ -21,10 +22,14 @@
 //!    When all in-range constants lie within `[base, base + (2^k - 1)]`, packs
 //!    all `span` `k`-bit unsigned deltas into a single 64-bit (or 32-bit on
 //!    ILP32) immediate constant:
-//!      `shift = safe_idx << log2(k)`
+//!      `shift = idx << log2(k)`
 //!      `delta = (packed >>_u shift) & ((1 << k) - 1)`
 //!      `in_val = base + delta`
 //!      `res = Select(in_range, in_val, default_val)`
+//!    `LShr` is total: its count is reduced modulo the word width. In range,
+//!    `shift < span * k <= word_bits`, so the selected entry is exact. Out of
+//!    range, the final select discards the extracted value. No index clamp is
+//!    needed, and extraction remains independent of the range comparison.
 //!
 //! Pass name for `CCC_DISABLE_PASSES`: `"switch_lut"`.
 
@@ -64,6 +69,9 @@ struct SwitchPlan {
     block_idx: usize,
     val: Operand,
     sw_ty: IrType,
+    /// Original narrow condition and type when `val` is a lossless integer
+    /// promotion and every case is representable in that original domain.
+    narrow_val: Option<(Operand, IrType)>,
     min_case: i64,
     span: u64,
     sink: SinkKind,
@@ -256,10 +264,16 @@ fn analyze_switch(
     }
 
     let encoding = choose_encoding(&table, def_val, word_bits)?;
+    let narrow_val = if matches!(&encoding, LutEncoding::TwoVal { .. }) {
+        promoted_narrow_source(func, val, sw_ty, cases)
+    } else {
+        None
+    };
     Some(SwitchPlan {
         block_idx,
         val,
         sw_ty,
+        narrow_val,
         min_case: min_c,
         span,
         sink,
@@ -285,6 +299,48 @@ fn const_to_i64_typed(c: &IrConst, ty: IrType) -> Option<i64> {
     })
 }
 
+fn promoted_narrow_source(
+    func: &IrFunction,
+    val: Operand,
+    sw_ty: IrType,
+    cases: &[(i64, BlockId)],
+) -> Option<(Operand, IrType)> {
+    if sw_ty.size() > 4 {
+        return None;
+    }
+    let Operand::Value(val) = val else {
+        return None;
+    };
+    let (src, from_ty) = func.blocks.iter().find_map(|block| {
+        block.instructions.iter().find_map(|inst| match inst {
+            Instruction::Cast {
+                dest,
+                src,
+                from_ty,
+                to_ty,
+            } if *dest == val
+                && *to_ty == sw_ty
+                && from_ty.is_integer()
+                && !from_ty.is_128bit()
+                && from_ty.size() < sw_ty.size() =>
+            {
+                Some((*src, *from_ty))
+            }
+            _ => None,
+        })
+    })?;
+    // A case outside the promoted source domain is unreachable in the
+    // original switch, but could alias an in-range value after narrow
+    // wraparound (for example `case 130` with an I8 source and `x == -126`).
+    // Reject the entire narrowing unless every case is exactly representable.
+    for &(case, _) in cases {
+        if const_to_i64_typed(&IrConst::I64(case), from_ty) != Some(case) {
+            return None;
+        }
+    }
+    Some((src, from_ty))
+}
+
 fn block_const_return(b: &BasicBlock, ret_ty: IrType) -> Option<i64> {
     if !b.instructions.is_empty() {
         return None;
@@ -293,6 +349,34 @@ fn block_const_return(b: &BasicBlock, ret_ty: IrType) -> Option<i64> {
         Terminator::Return(Some(Operand::Const(c))) => const_to_i64_typed(c, ret_ty),
         _ => None,
     }
+}
+
+fn const_return_from(
+    func: &IrFunction,
+    start: BlockId,
+    ret_ty: IrType,
+    label_to_idx: &FxHashMap<BlockId, usize>,
+) -> Option<i64> {
+    // Canonicalized switches commonly share a return through empty forwarding
+    // blocks.  Following them is analysis-only: apply_plan leaves every old
+    // block in place, so shared predecessors need no exclusivity restriction.
+    // Bound the walk to reject a malformed/uncleaned branch cycle instead of
+    // looping forever.
+    let mut label = start;
+    for _ in 0..=func.blocks.len() {
+        let block = &func.blocks[*label_to_idx.get(&label)?];
+        if let Some(value) = block_const_return(block, ret_ty) {
+            return Some(value);
+        }
+        if !block.instructions.is_empty() {
+            return None;
+        }
+        let Terminator::Branch(next) = block.terminator else {
+            return None;
+        };
+        label = next;
+    }
+    None
 }
 
 fn try_collect_direct_returns(
@@ -305,12 +389,10 @@ fn try_collect_direct_returns(
     if !ret_ty.is_integer() || ret_ty.is_128bit() {
         return None;
     }
-    let def_b = &func.blocks[*label_to_idx.get(&default)?];
-    let def_val = block_const_return(def_b, ret_ty)?;
+    let def_val = const_return_from(func, default, ret_ty, label_to_idx)?;
     let mut vals = Vec::with_capacity(cases.len());
     for &(_, target) in cases {
-        let tb = &func.blocks[*label_to_idx.get(&target)?];
-        vals.push(block_const_return(tb, ret_ty)?);
+        vals.push(const_return_from(func, target, ret_ty, label_to_idx)?);
     }
     Some((ret_ty, def_val, vals))
 }
@@ -538,16 +620,37 @@ fn fresh(next_vid: &mut u32) -> Value {
 
 fn apply_plan(func: &mut IrFunction, plan: SwitchPlan, is_32bit: bool, next_vid: &mut u32) {
     let word_ty = if is_32bit { IrType::U32 } else { IrType::U64 };
-    let word_const = |v: u64| -> Operand {
-        Operand::Const(if is_32bit {
+    let res_ty = match plan.sink {
+        SinkKind::DirectReturn { ret_ty } => ret_ty,
+        SinkKind::JoinPhi { phi_ty, .. } => phi_ty,
+    };
+    // A two-value lookup only consumes the index modulo the mask width (for
+    // BitTest) and through the unsigned range guard. Keep that index in U32
+    // when the switch condition is narrower than the target word instead of
+    // needlessly extending every operation to U64. Packed extraction retains
+    // its word-width index and total shift semantics; the 64-bit-on-32-bit
+    // range guard below is deliberately unchanged.
+    let narrow_two_val = plan.sw_ty.size() < word_ty.size()
+        && plan.sw_ty.size() <= 4
+        && matches!(&plan.encoding, LutEncoding::TwoVal { .. });
+    let idx_ty = if narrow_two_val { IrType::U32 } else { word_ty };
+    // For a validated 8/16-bit source the full U32 container is intentionally
+    // not observed: only the low source-width bits feed the range guard and
+    // only the low log2(mask_width) bits feed BitTest. Keeping the original
+    // narrow operand as the subtraction input avoids a promotion whose upper
+    // bits cannot affect either consumer. The explicit narrowing cast before
+    // Cmp below is the boundary that makes this contract visible.
+    let raw_narrow_two_val = if !is_32bit && narrow_two_val {
+        plan.narrow_val
+    } else {
+        None
+    };
+    let idx_const = |v: u64| -> Operand {
+        Operand::Const(if idx_ty == IrType::U32 {
             IrConst::I32(v as u32 as i32)
         } else {
             IrConst::I64(v as i64)
         })
-    };
-    let res_ty = match plan.sink {
-        SinkKind::DirectReturn { ret_ty } => ret_ty,
-        SinkKind::JoinPhi { phi_ty, .. } => phi_ty,
     };
 
     let sw_label = func.blocks[plan.block_idx].label;
@@ -560,10 +663,28 @@ fn apply_plan(func: &mut IrFunction, plan: SwitchPlan, is_32bit: bool, next_vid:
             .copied()
             .unwrap_or_else(Span::dummy);
 
-        // Cast switch operand (preserving C signedness to word width first when
-        // widening a signed narrow type like `char` -> `int` -> `u64`!).
-        let val_word = if plan.sw_ty == word_ty {
+        // Convert once to the index type. In particular, a signed narrow
+        // condition converts directly to U32: C's signed-to-unsigned
+        // conversion supplies the required wrapping bit pattern. The old
+        // word-width path remains intact for packed LUTs and wide switches.
+        let val_word = if let Some((narrow_val, _)) = raw_narrow_two_val {
+            narrow_val
+        } else if plan.sw_ty == idx_ty {
             plan.val
+        } else if narrow_two_val {
+            let u = fresh(next_vid);
+            push_inst(
+                block,
+                tracked,
+                span,
+                Instruction::Cast {
+                    dest: u,
+                    src: plan.val,
+                    from_ty: plan.sw_ty,
+                    to_ty: idx_ty,
+                },
+            );
+            Operand::Value(u)
         } else if plan.sw_ty.size() < word_ty.size() && plan.sw_ty.is_signed() {
             let signed_word = if is_32bit { IrType::I32 } else { IrType::I64 };
             let sext = fresh(next_vid);
@@ -607,7 +728,7 @@ fn apply_plan(func: &mut IrFunction, plan: SwitchPlan, is_32bit: bool, next_vid:
             Operand::Value(u)
         };
 
-        let min_u = if is_32bit {
+        let min_u = if idx_ty == IrType::U32 {
             plan.min_case as u32 as u64
         } else {
             plan.min_case as u64
@@ -624,8 +745,8 @@ fn apply_plan(func: &mut IrFunction, plan: SwitchPlan, is_32bit: bool, next_vid:
                     dest: d,
                     op: IrBinOp::Sub,
                     lhs: val_word,
-                    rhs: word_const(min_u),
-                    ty: word_ty,
+                    rhs: idx_const(min_u),
+                    ty: idx_ty,
                 },
             );
             Operand::Value(d)
@@ -675,6 +796,38 @@ fn apply_plan(func: &mut IrFunction, plan: SwitchPlan, is_32bit: bool, next_vid:
                 },
             );
             cmp
+        } else if let Some((_, narrow_ty)) = raw_narrow_two_val {
+            let range_idx = if min_u == 0 {
+                idx
+            } else {
+                let narrow = fresh(next_vid);
+                push_inst(
+                    block,
+                    tracked,
+                    span,
+                    Instruction::Cast {
+                        dest: narrow,
+                        src: idx,
+                        from_ty: idx_ty,
+                        to_ty: narrow_ty,
+                    },
+                );
+                Operand::Value(narrow)
+            };
+            let cmp = fresh(next_vid);
+            push_inst(
+                block,
+                tracked,
+                span,
+                Instruction::Cmp {
+                    dest: cmp,
+                    op: IrCmpOp::Ult,
+                    lhs: range_idx,
+                    rhs: Operand::Const(make_typed_const(plan.span as i64, narrow_ty)),
+                    ty: narrow_ty,
+                },
+            );
+            cmp
         } else {
             let cmp = fresh(next_vid);
             push_inst(
@@ -685,26 +838,12 @@ fn apply_plan(func: &mut IrFunction, plan: SwitchPlan, is_32bit: bool, next_vid:
                     dest: cmp,
                     op: IrCmpOp::Ult,
                     lhs: idx,
-                    rhs: word_const(plan.span),
-                    ty: word_ty,
+                    rhs: idx_const(plan.span),
+                    ty: idx_ty,
                 },
             );
             cmp
         };
-
-        let safe_idx = fresh(next_vid);
-        push_inst(
-            block,
-            tracked,
-            span,
-            Instruction::Select {
-                dest: safe_idx,
-                cond: Operand::Value(in_range),
-                true_val: idx,
-                false_val: word_const(0),
-                ty: word_ty,
-            },
-        );
 
         let final_val = match plan.encoding {
             LutEncoding::TwoVal {
@@ -713,7 +852,7 @@ fn apply_plan(func: &mut IrFunction, plan: SwitchPlan, is_32bit: bool, next_vid:
                 v1,
                 def_val,
             } => emit_two_val_lookup(
-                block, tracked, span, is_32bit, word_ty, res_ty, in_range, safe_idx, mask, v0, v1,
+                block, tracked, span, is_32bit, word_ty, res_ty, in_range, idx, mask, v0, v1,
                 def_val, next_vid,
             ),
             LutEncoding::Packed {
@@ -723,8 +862,8 @@ fn apply_plan(func: &mut IrFunction, plan: SwitchPlan, is_32bit: bool, next_vid:
                 base,
                 def_val,
             } => emit_packed_lookup(
-                block, tracked, span, is_32bit, word_ty, res_ty, in_range, safe_idx, packed,
-                shift_log2, entry_mask, base, def_val, next_vid,
+                block, tracked, span, is_32bit, word_ty, res_ty, in_range, idx, packed, shift_log2,
+                entry_mask, base, def_val, next_vid,
             ),
         };
 
@@ -764,7 +903,7 @@ fn emit_two_val_lookup(
     word_ty: IrType,
     res_ty: IrType,
     in_range: Value,
-    safe_idx: Value,
+    idx: Operand,
     mask: u64,
     v0: i64,
     v1: i64,
@@ -788,19 +927,14 @@ fn emit_two_val_lookup(
         return res;
     }
 
-    let shr = fresh(next_vid);
-    push_inst(
-        block,
-        tracked,
-        span,
-        Instruction::BinOp {
-            dest: shr,
-            op: IrBinOp::LShr,
-            lhs: make_word_const(mask, is_32bit),
-            rhs: Operand::Value(safe_idx),
-            ty: word_ty,
-        },
-    );
+    // BitTest is total: its index is reduced modulo the word width on every
+    // target. In range, idx is exactly the old clamped index. Out of range,
+    // the final select below discards both this bit and the value derived
+    // from it, so a clamped zero index would be unobservable. Emitting the
+    // canonical op here is necessary because switch_lut runs after the last
+    // general simplify pass that recognizes shift+AND as BitTest. Like a
+    // shift count, `idx` may be narrower than the mask: every backend consumes
+    // it modulo the mask width, so extending it cannot change the selected bit.
     let bit = fresh(next_vid);
     push_inst(
         block,
@@ -808,9 +942,9 @@ fn emit_two_val_lookup(
         span,
         Instruction::BinOp {
             dest: bit,
-            op: IrBinOp::And,
-            lhs: Operand::Value(shr),
-            rhs: make_word_const(1, is_32bit),
+            op: IrBinOp::BitTest,
+            lhs: make_word_const(mask, is_32bit),
+            rhs: idx,
             ty: word_ty,
         },
     );
@@ -886,7 +1020,7 @@ fn emit_packed_lookup(
     word_ty: IrType,
     res_ty: IrType,
     in_range: Value,
-    safe_idx: Value,
+    idx: Operand,
     packed: u64,
     shift_log2: u32,
     entry_mask: u64,
@@ -902,7 +1036,7 @@ fn emit_packed_lookup(
         Instruction::BinOp {
             dest: shift_amt,
             op: IrBinOp::Shl,
-            lhs: Operand::Value(safe_idx),
+            lhs: idx,
             rhs: make_word_const(shift_log2 as u64, is_32bit),
             ty: word_ty,
         },
@@ -968,6 +1102,11 @@ fn emit_packed_lookup(
         );
         s
     };
+    // Like BitTest above, LShr has a total modulo-word-width count. The
+    // in-range arm observes only a proven in-bounds table entry; the other
+    // arm discards every out-of-range intermediate. Keeping the select on the
+    // result avoids a second clamp select and lets extraction execute in
+    // parallel with the range comparison.
     let res = fresh(next_vid);
     push_inst(
         block,
@@ -982,4 +1121,376 @@ fn emit_packed_lookup(
         },
     );
     res
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn block(label: u32, terminator: Terminator) -> BasicBlock {
+        BasicBlock {
+            label: BlockId(label),
+            instructions: Vec::new(),
+            terminator,
+            source_spans: Vec::new(),
+        }
+    }
+
+    fn forwarded_switch(cycle: bool) -> IrFunction {
+        let mut func = IrFunction::new("forwarded_switch".into(), IrType::I32, vec![], false);
+        func.blocks = vec![
+            BasicBlock {
+                label: BlockId(0),
+                instructions: vec![Instruction::Copy {
+                    dest: Value(0),
+                    src: Operand::Const(IrConst::I32(0)),
+                }],
+                terminator: Terminator::Switch {
+                    val: Operand::Value(Value(0)),
+                    cases: vec![(10, BlockId(1)), (11, BlockId(2)), (12, BlockId(3))],
+                    default: BlockId(4),
+                    ty: IrType::I32,
+                },
+                source_spans: Vec::new(),
+            },
+            block(1, Terminator::Branch(BlockId(if cycle { 2 } else { 5 }))),
+            block(2, Terminator::Branch(BlockId(if cycle { 1 } else { 5 }))),
+            block(3, Terminator::Branch(BlockId(6))),
+            // Two table values total: the default must not introduce a third.
+            block(
+                4,
+                Terminator::Return(Some(Operand::Const(IrConst::I32(10)))),
+            ),
+            block(
+                5,
+                Terminator::Return(Some(Operand::Const(IrConst::I32(10)))),
+            ),
+            block(
+                6,
+                Terminator::Return(Some(Operand::Const(IrConst::I32(11)))),
+            ),
+        ];
+        func
+    }
+
+    #[test]
+    fn direct_returns_follow_empty_forwarders() {
+        let mut func = forwarded_switch(false);
+        assert_eq!(run_function(&mut func, false), 1);
+        assert!(matches!(
+            func.blocks[0].terminator,
+            Terminator::Return(Some(Operand::Value(_)))
+        ));
+    }
+
+    #[test]
+    fn direct_returns_reject_forwarding_cycles() {
+        let mut func = forwarded_switch(true);
+        assert_eq!(run_function(&mut func, false), 0);
+        assert!(matches!(
+            func.blocks[0].terminator,
+            Terminator::Switch { .. }
+        ));
+    }
+
+    fn promoted_forwarded_switch(case_values: [i64; 3]) -> IrFunction {
+        let mut func = forwarded_switch(false);
+        func.blocks[0].instructions = vec![
+            Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Const(IrConst::I8(0)),
+            },
+            Instruction::Cast {
+                dest: Value(1),
+                src: Operand::Value(Value(0)),
+                from_ty: IrType::I8,
+                to_ty: IrType::I32,
+            },
+        ];
+        let Terminator::Switch { val, cases, .. } = &mut func.blocks[0].terminator else {
+            unreachable!()
+        };
+        *val = Operand::Value(Value(1));
+        for ((case, _), new_value) in cases.iter_mut().zip(case_values) {
+            *case = new_value;
+        }
+        func
+    }
+
+    #[test]
+    fn promoted_narrow_source_uses_narrow_guard() {
+        let mut func = promoted_forwarded_switch([10, 11, 12]);
+        assert_eq!(run_function(&mut func, false), 1);
+        let insts = &func.blocks[0].instructions;
+        assert!(insts.iter().any(|inst| matches!(
+            inst,
+            Instruction::BinOp {
+                op: IrBinOp::Sub,
+                lhs: Operand::Value(Value(0)),
+                ty: IrType::U32,
+                ..
+            }
+        )));
+        assert!(insts.iter().any(|inst| matches!(
+            inst,
+            Instruction::Cmp {
+                op: IrCmpOp::Ult,
+                ty: IrType::I8,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn out_of_domain_case_rejects_promoted_narrow_source() {
+        let mut func = promoted_forwarded_switch([120, 121, 130]);
+        assert_eq!(run_function(&mut func, false), 1);
+        let insts = &func.blocks[0].instructions;
+        assert!(insts.iter().any(|inst| matches!(
+            inst,
+            Instruction::Cmp {
+                op: IrCmpOp::Ult,
+                ty: IrType::U32,
+                ..
+            }
+        )));
+        assert!(!insts.iter().any(|inst| matches!(
+            inst,
+            Instruction::Cmp {
+                op: IrCmpOp::Ult,
+                ty: IrType::I8,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn two_val_uses_u32_index_and_total_bit_test_without_clamp() {
+        let mut func = forwarded_switch(false);
+        assert_eq!(run_function(&mut func, false), 1);
+        let insts = &func.blocks[0].instructions;
+        let bit_indices: Vec<Value> = insts
+            .iter()
+            .filter_map(|inst| match inst {
+                Instruction::BinOp {
+                    op: IrBinOp::BitTest,
+                    rhs: Operand::Value(index),
+                    ..
+                } => Some(*index),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(bit_indices.len(), 1, "{insts:#?}");
+        let (sub_index, sub_ty) = insts
+            .iter()
+            .find_map(|inst| match inst {
+                Instruction::BinOp {
+                    dest,
+                    op: IrBinOp::Sub,
+                    ty,
+                    ..
+                } => Some((*dest, *ty)),
+                _ => None,
+            })
+            .expect("two-value lookup must subtract its minimum case");
+        assert_eq!(sub_ty, IrType::U32, "{insts:#?}");
+        assert_eq!(bit_indices[0], sub_index, "{insts:#?}");
+        assert!(insts.iter().any(|inst| matches!(
+            inst,
+            Instruction::Cmp {
+                op: IrCmpOp::Ult,
+                lhs: Operand::Value(index),
+                ty: IrType::U32,
+                ..
+            } if *index == sub_index
+        )));
+        assert!(!insts.iter().any(|inst| matches!(
+            inst,
+            Instruction::Cast {
+                to_ty: IrType::I64 | IrType::U64,
+                ..
+            }
+        )));
+        assert!(!insts.iter().any(|inst| matches!(
+            inst,
+            Instruction::Select { dest, .. } if *dest == bit_indices[0]
+        )));
+        assert!(!insts.iter().any(|inst| matches!(
+            inst,
+            Instruction::BinOp {
+                op: IrBinOp::LShr,
+                ..
+            }
+        )));
+    }
+
+    fn packed_switch() -> IrFunction {
+        packed_switch_with_default(9)
+    }
+
+    fn packed_switch_with_default(default_value: i32) -> IrFunction {
+        let mut func = IrFunction::new("packed_switch".into(), IrType::I32, vec![], false);
+        func.blocks = vec![
+            BasicBlock {
+                label: BlockId(0),
+                instructions: vec![Instruction::Copy {
+                    dest: Value(0),
+                    src: Operand::Const(IrConst::I32(0)),
+                }],
+                terminator: Terminator::Switch {
+                    val: Operand::Value(Value(0)),
+                    cases: vec![(10, BlockId(1)), (11, BlockId(2)), (12, BlockId(3))],
+                    default: BlockId(4),
+                    ty: IrType::I32,
+                },
+                source_spans: Vec::new(),
+            },
+            block(
+                1,
+                Terminator::Return(Some(Operand::Const(IrConst::I32(10)))),
+            ),
+            block(
+                2,
+                Terminator::Return(Some(Operand::Const(IrConst::I32(11)))),
+            ),
+            block(
+                3,
+                Terminator::Return(Some(Operand::Const(IrConst::I32(12)))),
+            ),
+            block(
+                4,
+                Terminator::Return(Some(Operand::Const(IrConst::I32(default_value)))),
+            ),
+        ];
+        func
+    }
+
+    fn assert_packed_total_lookup(default_value: i32, is_32bit: bool) {
+        let mut func = packed_switch_with_default(default_value);
+        assert_eq!(run_function(&mut func, is_32bit), 1);
+        let insts = &func.blocks[0].instructions;
+        let word_ty = if is_32bit { IrType::U32 } else { IrType::U64 };
+        let indices: Vec<Value> = insts
+            .iter()
+            .filter_map(|inst| match inst {
+                Instruction::BinOp {
+                    dest,
+                    op: IrBinOp::Sub,
+                    ty,
+                    ..
+                } if *ty == word_ty => Some(*dest),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            indices.len(),
+            1,
+            "packed lookup must form one word-width index: {insts:#?}"
+        );
+        let idx = indices[0];
+        let range_checks: Vec<Value> = insts
+            .iter()
+            .filter_map(|inst| match inst {
+                Instruction::Cmp {
+                    dest,
+                    op: IrCmpOp::Ult,
+                    lhs: Operand::Value(lhs),
+                    ty,
+                    ..
+                } if *lhs == idx && *ty == word_ty => Some(*dest),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            range_checks.len(),
+            1,
+            "packed lookup must range-check the unclamped index once: {insts:#?}"
+        );
+        let in_range = range_checks[0];
+        let shifts: Vec<(usize, Value)> = insts
+            .iter()
+            .enumerate()
+            .filter_map(|(pos, inst)| match inst {
+                Instruction::BinOp {
+                    dest,
+                    op: IrBinOp::Shl,
+                    lhs: Operand::Value(lhs),
+                    ty,
+                    ..
+                } if *lhs == idx && *ty == word_ty => Some((pos, *dest)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            shifts.len(),
+            1,
+            "packed extraction must scale the unclamped index once: {insts:#?}"
+        );
+        let (shift_pos, shift_amount) = shifts[0];
+        assert!(insts.iter().any(|inst| matches!(
+            inst,
+            Instruction::BinOp {
+                op: IrBinOp::LShr,
+                rhs: Operand::Value(rhs),
+                ty,
+                ..
+            } if *rhs == shift_amount && *ty == word_ty
+        )));
+        assert_eq!(
+            insts
+                .iter()
+                .filter(|inst| matches!(inst, Instruction::Select { .. }))
+                .count(),
+            1,
+            "total extraction needs only the final result select: {insts:#?}"
+        );
+        let select_positions: Vec<usize> = insts
+            .iter()
+            .enumerate()
+            .filter_map(|(pos, inst)| {
+                if matches!(
+                    inst,
+                    Instruction::Select {
+                        cond: Operand::Value(cond),
+                        false_val: Operand::Const(IrConst::I32(value)),
+                        ty: IrType::I32,
+                        ..
+                    } if *cond == in_range && *value == default_value
+                ) {
+                    Some(pos)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            select_positions.len(),
+            1,
+            "final select must provide the typed default exactly once: {insts:#?}"
+        );
+        let select_pos = select_positions[0];
+        assert!(shift_pos < select_pos);
+        assert!(!insts.iter().any(|inst| matches!(
+            inst,
+            Instruction::BinOp {
+                op: IrBinOp::BitTest,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn packed_without_default_value_slot_uses_total_unclamped_lookup() {
+        assert_packed_total_lookup(9, false);
+    }
+
+    #[test]
+    fn packed_default_value_slot_uses_same_total_unclamped_lookup() {
+        assert_packed_total_lookup(11, false);
+    }
+
+    #[test]
+    fn packed_ilp32_uses_total_unclamped_lookup() {
+        assert_packed_total_lookup(11, true);
+    }
 }

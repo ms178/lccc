@@ -256,6 +256,7 @@ impl Parser {
         let regparm = self.attrs.parsing_regparm;
         let is_naked = self.attrs.parsing_naked();
         let no_instrument = self.attrs.parsing_no_instrument();
+        let is_noinline = self.attrs.parsing_noinline();
         let is_pure = self.attrs.parsing_pure();
         let is_const_attr = self.attrs.parsing_const_attr();
         let is_cold = self.attrs.parsing_cold();
@@ -336,6 +337,16 @@ impl Parser {
                 }
             }
         }
+        // `noinline` is a function property, not a one-declaration parsing
+        // hint.  Preserve it from a prior prototype through a later bare
+        // definition just like no_instrument_function above.
+        if is_noinline {
+            if let Some(n) = &name {
+                if matches!(derived.last(), Some(DerivedDeclarator::Function(..))) {
+                    self.func_decl_noinline.insert(n.clone());
+                }
+            }
+        }
 
         if is_funcdef {
             self.parse_function_def(
@@ -391,7 +402,10 @@ impl Parser {
         let is_extern = self.attrs.parsing_extern();
         let is_gnu_inline = self.attrs.parsing_gnu_inline();
         let is_always_inline = self.attrs.parsing_always_inline();
-        let is_noinline = self.attrs.parsing_noinline();
+        let is_noinline = self.attrs.parsing_noinline()
+            || name
+                .as_deref()
+                .is_some_and(|n| self.func_decl_noinline.contains(n));
 
         // Build return type from derived declarators
         let mut return_type = self.build_return_type(type_spec, &derived);

@@ -7957,10 +7957,10 @@ impl X86Codegen {
     /// Is the jump table indexed by the value's low 32 bits?
     ///
     /// `build_jump_table`'s index arithmetic is the switch type's own
-    /// wraparound, so every 32-bit (and narrower) class qualifies: a 32-bit
-    /// definition always leaves the full register equal to the value's low
-    /// word, which is why both the in-place and the `%rax` dispatchers may
-    /// use the unsigned 32-bit `(v - min) mod 2^32 < range` test.
+    /// wraparound, so every 32-bit (and narrower) class qualifies for the
+    /// unsigned 32-bit `(v - min) mod 2^32 < range` test. Any subsequent
+    /// 64-bit address use must first canonicalize the register home; the IR
+    /// type alone does not guarantee clean upper bits.
     fn switch_index_is_32bit(ty: IrType) -> bool {
         matches!(
             ty,
@@ -7968,8 +7968,8 @@ impl X86Codegen {
         )
     }
 
-    /// The `(value, 64-bit reg, 32-bit reg)` an in-place 32-bit switch
-    /// dispatch may use, or `None` for the canonical `%rax` path.
+    /// The `(value, physical reg, 64-bit reg, 32-bit reg)` an in-place 32-bit
+    /// switch dispatch may use, or `None` for the canonical `%rax` path.
     ///
     /// Only 32-bit switch types qualify — the table index is the value's low
     /// word — and only when the value is already resident in a GPR that can
@@ -7980,7 +7980,7 @@ impl X86Codegen {
         &mut self,
         val: &Operand,
         ty: IrType,
-    ) -> Option<(u32, &'static str, &'static str)> {
+    ) -> Option<(u32, PhysReg, &'static str, &'static str)> {
         let Operand::Value(v) = val else {
             return None;
         };
@@ -7990,7 +7990,7 @@ impl X86Codegen {
         self.fresh_home_of(v.0)
             .filter(|&reg| !is_xmm_reg(reg) && phys_reg_name(reg) != "rsp")
             .filter(|_| self.value_home_is_expendable(v.0))
-            .map(|reg| (v.0, phys_reg_name(reg), phys_reg_name_32(reg)))
+            .map(|reg| (v.0, reg, phys_reg_name(reg), phys_reg_name_32(reg)))
     }
 
     /// May [`Self::emit_switch_jump_table`]'s direct 32-bit path destroy the
@@ -9725,10 +9725,11 @@ impl ArchCodegen for X86Codegen {
         // (b) DIRECT 32-BIT REGISTERS (fast path): when the switch value
         //     is already resident in a GPR, index the table from that
         //     register's 64-bit view and run the whole sub/cmp sequence
-        //     in 32-bit form. A 32-bit definition always leaves the full
-        //     64-bit register equal to the value's low word (32-bit ops
-        //     zero the upper word; 64-bit definitions store the value
-        //     itself), so no extend is needed; and the unsigned 32-bit
+        //     in 32-bit form. The emitter first establishes the defined
+        //     32-bit value: a plain 32-bit subtract clears the upper word,
+        //     while min == 0 and narrow sources need an explicit extension.
+        //     Without that step an ABI argument's arbitrary upper bits would
+        //     become part of the 64-bit SIB address. The unsigned 32-bit
         //     wraparound test
         //         (v - min) mod 2^32 < range   (jae when ≥)
         //     is exactly the in-range predicate for every i8..u32
@@ -9738,7 +9739,22 @@ impl ArchCodegen for X86Codegen {
         //     cmpl $range,%reg; jae` shape and drops the rax
         //     materialisation plus the zero/sign extend from the hot
         //     dispatch path.
-        let direct32 = self.direct32_switch_index(val, ty);
+        let direct32 = self
+            .direct32_switch_index(val, ty)
+            .and_then(|(v_id, reg, r64, r32)| {
+                // Select the extension before committing to the fast path.
+                // An unexpected type must use the canonical RAX sequence,
+                // not turn an emitter precondition into a panic.
+                let extend = match ty {
+                    IrType::I32 | IrType::U32 => None,
+                    IrType::U8 => Some("movzbl"),
+                    IrType::U16 => Some("movzwl"),
+                    IrType::I8 => Some("movsbl"),
+                    IrType::I16 => Some("movswl"),
+                    _ => return None,
+                };
+                Some((v_id, reg, r64, r32, extend))
+            });
 
         let in_range = match val {
             Operand::Value(v) => {
@@ -9753,7 +9769,24 @@ impl ArchCodegen for X86Codegen {
         };
 
         let index_reg: &'static str = match direct32 {
-            Some((v_id, r64, r32)) => {
+            Some((v_id, reg, r64, r32, extend)) => {
+                // A register home does not prove that bits above the IR
+                // value are canonical: external ABI arguments may have
+                // arbitrary upper bits, and narrow producers may only write
+                // their low byte/word. A 64-bit SIB index observes all of
+                // them. Establish the defined 32-bit value before the first
+                // compare/subtract; the subtract itself would otherwise
+                // consume dirty low-word bits for narrow sources.
+                if let Some(extend) = extend {
+                    let source = typed_phys_reg_name(reg, ty);
+                    self.state
+                        .emit_fmt(format_args!("    {} %{}, %{}", extend, source, r32));
+                } else if min_val == 0 {
+                    // Unlike subl, cmpl does not write its destination and
+                    // therefore cannot clear the upper half of the SIB index.
+                    self.state
+                        .emit_fmt(format_args!("    movl %{}, %{}", r32, r32));
+                }
                 if min_val != 0 {
                     // min_val fits i32: every 32-bit-class case value
                     // does. The 32-bit sub wraps mod 2^32 — exactly the

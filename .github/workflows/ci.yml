@@ -789,6 +789,12 @@ jobs:
     # lane-split: 1868 s). The preamble above is byte-identical in every
     # lane-split: shard; tests/regression/check_ci_lane_plan.py fails if a gate disappears,
     # lane-split: is duplicated, or a shard drifts from this record.
+    - name: Builtin floor float narrowing contracts
+      run: env CCC=target/fastbuild/lccc CCC_I686=target/fastbuild/lccc-i686 bash tests/regression/check_builtin_floor_narrowing.sh
+    - name: Store-forwarding DWORD self-reload contracts
+      run: env CCC=target/fastbuild/lccc CCC_I686=target/fastbuild/lccc-i686 bash tests/regression/check_store_forwarding_dword_reload.sh
+    - name: x86 execute regression fixes on both ABIs
+      run: env CCC=target/fastbuild/lccc CCC_I686=target/fastbuild/lccc-i686 bash tests/regression/check_x86_torture_execute_fixes.sh
     - name: Check FP-contraction parity with GCC
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_fp_contract_parity.sh
     - name: ext-vector swizzle diagnostics

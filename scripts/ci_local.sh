@@ -244,6 +244,15 @@ gate "sibcall-shapes" fast \
     bash tests/regression/check_sibcall_shapes.sh
 gate "fno-builtin-fold-contract" fast \
     env CCC="$LCCC" bash tests/regression/check_fno_builtin_folds.sh
+gate "builtin-floor-float-narrowing" fast \
+    env CCC="$LCCC" CCC_I686=target/fastbuild/lccc-i686 \
+    bash tests/regression/check_builtin_floor_narrowing.sh
+gate "store-forwarding-dword-reload" fast \
+    env CCC="$LCCC" CCC_I686=target/fastbuild/lccc-i686 \
+    bash tests/regression/check_store_forwarding_dword_reload.sh
+gate "x86-execute-fixes" fast \
+    env CCC="$LCCC" CCC_I686=target/fastbuild/lccc-i686 \
+    bash tests/regression/check_x86_torture_execute_fixes.sh
 
 # --------------------------------------------------------------- job:test --
 # The ratchet that keeps the 2026-10-13 audit's debt numbers from growing:

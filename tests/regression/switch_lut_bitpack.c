@@ -67,5 +67,5 @@ int main(void) {
         h = (h ^ (unsigned long long)(unsigned int)join_phi_with_ext_pred(x & 1, x >> 1)) * 1099511628211ULL;
     }
     printf("%016llx\n", h);
-    return 0;
+    return h != 0x42d9e96cdd8295feULL;
 }

@@ -3031,30 +3031,52 @@ impl ArchCodegen for ArmCodegen {
         val: &Operand,
         cases: &[(i64, BlockId)],
         default: &BlockId,
-        _ty: IrType,
+        ty: IrType,
     ) {
         use crate::backend::traits::build_jump_table;
         let (table, min_val, range) = build_jump_table(cases, default);
         let table_label = self.state.fresh_label("jt");
         let default_label = default.as_label();
+        let use_32bit = matches!(
+            ty,
+            IrType::I32 | IrType::U32 | IrType::I16 | IrType::U16 | IrType::I8 | IrType::U8
+        );
+        // Narrow switch arithmetic is modulo 2^32, just like the compare
+        // chain above. A w-write also gives the x0 table index a defined,
+        // zero upper half without changing the unsigned range test.
+        let (index, scratch) = if use_32bit {
+            ("w0", "w17")
+        } else {
+            ("x0", "x17")
+        };
         self.operand_to_x0(val);
         if min_val != 0 {
             if min_val > 0 && min_val <= 4095 {
                 self.state
-                    .emit_fmt(format_args!("    sub x0, x0, #{}", min_val));
-            } else if min_val < 0 && (-min_val) <= 4095 {
-                self.state
-                    .emit_fmt(format_args!("    add x0, x0, #{}", -min_val));
+                    .emit_fmt(format_args!("    sub {index}, {index}, #{min_val}"));
+            } else if min_val < 0 && min_val.unsigned_abs() <= 4095 {
+                self.state.emit_fmt(format_args!(
+                    "    add {index}, {index}, #{}",
+                    min_val.unsigned_abs()
+                ));
             } else {
                 self.load_large_imm("x17", min_val);
-                self.state.emit("    sub x0, x0, x17");
+                self.state
+                    .emit_fmt(format_args!("    sub {index}, {index}, {scratch}"));
             }
+        } else if use_32bit {
+            // AAPCS64 leaves the upper half of a 32-bit argument unspecified.
+            // The table address uses x0, so materialize the required zero
+            // extension even when no subtraction would otherwise write w0.
+            self.state.emit("    mov w0, w0");
         }
         if range <= 4095 {
-            self.state.emit_fmt(format_args!("    cmp x0, #{}", range));
+            self.state
+                .emit_fmt(format_args!("    cmp {index}, #{range}"));
         } else {
             self.load_large_imm("x17", range as i64);
-            self.state.emit("    cmp x0, x17");
+            self.state
+                .emit_fmt(format_args!("    cmp {index}, {scratch}"));
         }
         let range_skip = self.state.fresh_label("range_ok");
         self.state.emit_fmt(format_args!("    b.lo {}", range_skip));
@@ -3636,6 +3658,89 @@ mod compare_immediate_tests {
             ArmCodegen::const_as_cmn_imm12(&IrConst::I64(-2), IrType::U64),
             Some((2, 0))
         );
+    }
+}
+
+#[cfg(test)]
+mod switch_jump_table_tests {
+    use super::*;
+
+    fn emit(val: Operand, cases: &[(i64, BlockId)], ty: IrType) -> String {
+        let mut cg = ArmCodegen::new();
+        cg.emit_switch_jump_table(&val, cases, &BlockId(90), ty);
+        cg.state.out.buf
+    }
+
+    #[test]
+    fn signed_i32_negative_cases_use_a_32bit_index() {
+        let asm = emit(
+            Operand::Const(IrConst::I32(-3)),
+            &[
+                (-3, BlockId(1)),
+                (-2, BlockId(2)),
+                (0, BlockId(3)),
+                (2, BlockId(4)),
+                (4, BlockId(5)),
+            ],
+            IrType::I32,
+        );
+        assert!(asm.contains("add w0, w0, #3"), "{asm}");
+        assert!(asm.contains("cmp w0, #8"), "{asm}");
+        assert!(asm.contains("[x17, x0, lsl #2]"), "{asm}");
+        assert!(!asm.contains("add x0, x0, #3"), "{asm}");
+        assert!(!asm.contains("cmp x0, #8"), "{asm}");
+    }
+
+    #[test]
+    fn zero_based_narrow_switches_define_the_upper_index_half() {
+        for ty in [
+            IrType::I8,
+            IrType::U8,
+            IrType::I16,
+            IrType::U16,
+            IrType::I32,
+            IrType::U32,
+        ] {
+            let asm = emit(
+                Operand::Const(IrConst::I32(0)),
+                &[(0, BlockId(1)), (1, BlockId(2)), (2, BlockId(3))],
+                ty,
+            );
+            assert!(asm.contains("mov w0, w0"), "{ty:?}: {asm}");
+            assert!(asm.contains("cmp w0, #3"), "{ty:?}: {asm}");
+            assert!(asm.contains("[x17, x0, lsl #2]"), "{ty:?}: {asm}");
+        }
+    }
+
+    #[test]
+    fn i64_switch_index_remains_64bit() {
+        let asm = emit(
+            Operand::Const(IrConst::I64(-3)),
+            &[(-3, BlockId(1)), (-2, BlockId(2)), (0, BlockId(3))],
+            IrType::I64,
+        );
+        assert!(asm.contains("add x0, x0, #3"), "{asm}");
+        assert!(asm.contains("cmp x0, #4"), "{asm}");
+        assert!(!asm.contains("add w0, w0, #3"), "{asm}");
+        assert!(!asm.contains("cmp w0, #4"), "{asm}");
+    }
+
+    #[test]
+    fn i64_min_switch_base_uses_subtraction_not_an_overflowed_immediate() {
+        let asm = emit(
+            Operand::Const(IrConst::I64(i64::MIN)),
+            &[
+                (i64::MIN, BlockId(1)),
+                (i64::MIN + 1, BlockId(2)),
+                (i64::MIN + 2, BlockId(3)),
+                (i64::MIN + 3, BlockId(4)),
+                (i64::MIN + 4, BlockId(5)),
+            ],
+            IrType::I64,
+        );
+        assert!(asm.contains("sub x0, x0, x17"), "{asm}");
+        assert!(asm.contains("cmp x0, #5"), "{asm}");
+        assert!(!asm.contains("#-9223372036854775808"), "{asm}");
     }
 }
 

@@ -1788,6 +1788,24 @@ fn merge_identical_blocks(lines: &mut [String], kinds: &mut [LineKind], n: usize
             unusable[b] = true;
         }
     }
+    // Jump-table case labels have incoming edges from DATA, not from a
+    // Branch line: `.word .Lcase - .Ljt`. Such references never contribute to
+    // succs/preds above. Deleting the case block would therefore leave an
+    // undefined relocation even when its body is textually identical to
+    // another return arm. Treat every directive reference to a known label as
+    // an unresolved incoming edge; this also covers `.set`/address aliases.
+    for i in 0..n {
+        if kinds[i] != LineKind::Directive {
+            continue;
+        }
+        for token in lines[i]
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '$'))
+        {
+            if let Some(&b) = label_block.get(token) {
+                unusable[b] = true;
+            }
+        }
+    }
     // Body text: instructions only, so labels, directives and alignment are
     // transparent (an alignment directive must not make two blocks differ).
     let mut body: Vec<String> = Vec::with_capacity(nb);
@@ -6770,6 +6788,28 @@ mod tests {
         let n = lines.len();
         assert!(!merge_identical_blocks(&mut lines, &mut kinds, n));
         assert_eq!(kinds[7], LineKind::Label, "duplicate block was deleted");
+    }
+
+    #[test]
+    fn identical_blocks_preserve_jump_table_data_references() {
+        let asm = "f:\n    br x9\n.section .rodata\n.Ljt:\n    .word .Lkeep - .Ljt\n    .word .Ldup - .Ljt\n.section .text\n.Lkeep:\n    b .Ldone\n.Ldup:\n    b .Ldone\n.Ldone:\n    mov x0, #42\n    ret\n";
+        let mut lines: Vec<String> = asm.lines().map(str::to_owned).collect();
+        let mut kinds: Vec<LineKind> = lines.iter().map(|line| classify_line(line)).collect();
+        let n = lines.len();
+        assert!(!merge_identical_blocks(&mut lines, &mut kinds, n));
+        let dup = lines.iter().position(|line| line == ".Ldup:").unwrap();
+        assert_eq!(kinds[dup], LineKind::Label, "jump target was deleted");
+    }
+
+    #[test]
+    fn identical_blocks_still_merge_without_data_references() {
+        let asm = "f:\n    br x9\n.Lkeep:\n    b .Ldone\n.Ldup:\n    b .Ldone\n.Ldone:\n    mov x0, #42\n    ret\n";
+        let mut lines: Vec<String> = asm.lines().map(str::to_owned).collect();
+        let mut kinds: Vec<LineKind> = lines.iter().map(|line| classify_line(line)).collect();
+        let n = lines.len();
+        assert!(merge_identical_blocks(&mut lines, &mut kinds, n));
+        let dup = lines.iter().position(|line| line == ".Ldup:").unwrap();
+        assert_eq!(kinds[dup], LineKind::Nop, "plain duplicate was kept");
     }
 
     #[test]

@@ -700,6 +700,10 @@ pub struct Parser {
     pub(super) func_decl_stack_protect: FxHashSet<String>,
     /// File-scope function names whose prototype carried `no_stack_protector`.
     pub(super) func_decl_no_stack_protector: FxHashSet<String>,
+    /// File-scope functions whose any declaration carried `noinline`.
+    /// Function attributes merge across redeclarations; a bare later
+    /// definition must not silently become inlinable (frame-address.c).
+    pub(super) func_decl_noinline: FxHashSet<String>,
     /// Count of parse errors encountered (invalid tokens at top level, etc.)
     pub error_count: usize,
     /// Number of currently-live expression-parse frames (E5 hardening).
@@ -791,6 +795,7 @@ impl Parser {
             func_decl_no_instrument: FxHashSet::default(),
             func_decl_stack_protect: FxHashSet::default(),
             func_decl_no_stack_protector: FxHashSet::default(),
+            func_decl_noinline: FxHashSet::default(),
             error_count: 0,
             parser_frame_depth: 0,
             nesting_budget_diagnosed: false,

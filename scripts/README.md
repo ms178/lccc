@@ -316,6 +316,12 @@ python3 scripts/aarch64_execute_suite.py \
     --lccc target/fastbuild/lccc-arm \
     --assembler /path/to/binutils-2.47/aarch64-linux-gnu-as \
     --jobs 2 --flags=-O2 --json /tmp/aarch64-torture.json
+
+# With Debian's aarch64-linux-gnu cross GCC/glibc and static Clang references,
+# use --sysroot=/ (the cross driver layout is already target-qualified). Using
+# /usr/aarch64-linux-gnu as Clang's sysroot can double-prefix linker-script paths.
+# An explicitly requested Clang compile/link failure is HARNESS-ERROR, and an
+# ORACLE-DISAGREE is nonzero; neither can silently degrade to a GCC-only PASS.
 ```
 
 ## Contracts the gates now pin (2026-10-13 audit session)

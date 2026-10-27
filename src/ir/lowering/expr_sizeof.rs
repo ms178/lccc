@@ -250,9 +250,14 @@ impl Lowerer {
             {
                 crate::common::types::target_ptr_size()
             }
-            // Shift operators: result type is promoted left operand
+            // GNU scalar-LHS/vector-RHS shifts produce the vector type;
+            // otherwise the result is the promoted left operand.
             BinOp::Shl | BinOp::Shr => {
-                self.sizeof_expr(lhs).max(4) // integer promotion of left operand only
+                if self.expr_ctype(rhs).is_vector() {
+                    self.sizeof_expr(rhs)
+                } else {
+                    self.sizeof_expr(lhs).max(4)
+                }
             }
             // Arithmetic/bitwise: usual arithmetic conversions
             _ => {

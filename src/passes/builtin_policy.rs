@@ -205,7 +205,15 @@ pub(crate) fn apply(module: &mut IrModule, cli: &BuiltinFlags) {
                     b
                 }
             };
-            info.assume_library = cli.may_assume(callee) && !blocks;
+            // GCC keeps the four fortified stdio builtins recognizable
+            // beside a real TU definition; its *-chk-1.c execution tests
+            // distinguish that from plain printf.  Do not bypass aliases,
+            // asm opacity, or a command-line withdrawal, and never extend
+            // this exception to an ordinary library name.
+            let defined_fortified_stdio = blocks
+                && inventory.bodies.contains(callee)
+                && crate::common::pass_policy::is_fortified_stdio_builtin(callee);
+            info.assume_library = cli.may_assume(callee) && (!blocks || defined_fortified_stdio);
         }
     }
 }
@@ -599,6 +607,62 @@ mod tests {
         m.toplevel_asm.push("call memcpy_fast".to_string());
         apply(&mut m, &BuiltinFlags::default());
         assert_eq!(assumed(&m, "main"), pairs(&[("memcpy", true)]));
+    }
+
+    #[test]
+    fn gcc_fortified_stdio_definition_does_not_hide_the_builtin() {
+        for name in [
+            "__printf_chk",
+            "__vprintf_chk",
+            "__fprintf_chk",
+            "__vfprintf_chk",
+        ] {
+            let mut m = module(vec![
+                func(name, true, &[]),
+                func("printf", true, &[]),
+                func("main", true, &[name, "printf"]),
+            ]);
+            apply(&mut m, &BuiltinFlags::default());
+            assert_eq!(
+                assumed(&m, "main"),
+                pairs(&[(name, true), ("printf", false)]),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn fortified_stdio_cli_withdrawals_stay_authoritative() {
+        for name in [
+            "__printf_chk",
+            "__vprintf_chk",
+            "__fprintf_chk",
+            "__vfprintf_chk",
+        ] {
+            for blanket in [false, true] {
+                let mut cli = BuiltinFlags::default();
+                if blanket {
+                    cli.withdraw_all();
+                } else {
+                    cli.withdraw_name(name);
+                }
+                let mut m = module(vec![func(name, true, &[]), func("main", true, &[name])]);
+                apply(&mut m, &cli);
+                assert_eq!(assumed(&m, "main"), pairs(&[(name, false)]));
+            }
+        }
+    }
+
+    #[test]
+    fn fortified_stdio_alias_remains_opaque() {
+        let mut m = module(vec![
+            func("impl_printf", true, &[]),
+            func("main", true, &["__printf_chk"]),
+        ]);
+        m.aliases
+            .push(("__printf_chk".to_string(), "impl_printf".to_string(), false));
+        apply(&mut m, &BuiltinFlags::default());
+        assert_eq!(assumed(&m, "main"), pairs(&[("__printf_chk", false)]));
     }
 
     #[test]

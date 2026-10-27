@@ -867,6 +867,7 @@ fn run_inline_phase(
     allow_inline: bool,
     size_profile: bool,
     target: crate::backend::Target,
+    pic: bool,
     ra_config: &crate::backend::regalloc::RaConfig,
 ) {
     let dump_pre =
@@ -1029,8 +1030,12 @@ fn run_inline_phase(
     // Copy forwarding can expose another temporary in a copy chain
     // (`object -> tmp1 -> tmp2 -> field load`), so run to a small fixed point.
     if !std::env::var("CCC_NO_AGG_COPY_FWD").is_ok() {
+        let symbol_facts = module_symbol_facts::ModuleSymbolFacts::from_module(module, pic);
         for _ in 0..8 {
-            if module.for_each_function(aggregate_copy_forward::run) == 0 {
+            if module.for_each_function(|func| {
+                aggregate_copy_forward::run_with_symbol_facts(func, &symbol_facts)
+            }) == 0
+            {
                 break;
             }
         }
@@ -1912,6 +1917,7 @@ pub(crate) fn run_passes(
         allow_inline,
         optimize_for_size,
         target,
+        pic,
         ra_config,
     );
     preloop_dump!("inline_phase");
@@ -3592,8 +3598,12 @@ pub(crate) fn run_passes(
     }
     verify::verify_after_pass(module, "sret_copy_elision");
     if !std::env::var("CCC_NO_AGG_COPY_FWD").is_ok() {
+        let symbol_facts = module_symbol_facts::ModuleSymbolFacts::from_module(module, pic);
         for _ in 0..8 {
-            if module.for_each_function(aggregate_copy_forward::run) == 0 {
+            if module.for_each_function(|func| {
+                aggregate_copy_forward::run_with_symbol_facts(func, &symbol_facts)
+            }) == 0
+            {
                 break;
             }
         }

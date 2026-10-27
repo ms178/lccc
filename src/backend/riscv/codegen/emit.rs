@@ -945,13 +945,18 @@ impl ArchCodegen for RiscvCodegen {
         self.operand_to_t0(val);
 
         if min_val != 0 {
-            let neg_min = -min_val;
-            if (-2048..=2047).contains(&neg_min) {
+            if let Some(delta) = min_val
+                .checked_neg()
+                .filter(|delta| (-2048..=2047).contains(delta))
+            {
                 self.state
-                    .emit_fmt(format_args!("    addi t0, t0, {}", neg_min));
+                    .emit_fmt(format_args!("    addi t0, t0, {delta}"));
             } else {
-                self.state.emit_fmt(format_args!("    li t1, {}", neg_min));
-                self.state.emit("    add t0, t0, t1");
+                // In particular, -i64::MIN is not representable. Subtracting
+                // the materialized base avoids both a debug overflow and a
+                // wrapped immediate while preserving modulo-2^64 indexing.
+                self.state.emit_fmt(format_args!("    li t1, {min_val}"));
+                self.state.emit("    sub t0, t0, t1");
             }
         }
         let range_ok = self.state.fresh_label("range_ok");

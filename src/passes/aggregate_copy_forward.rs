@@ -432,10 +432,94 @@ fn pointer_paths(
     paths
 }
 
+/// Symbols that each value may use as an address root.  Unlike pointer_paths,
+/// this is deliberately a MAY analysis: unions are never narrowed, including
+/// for multiply-defined values and mixed phis.  That is the appropriate
+/// default for a liveness guard, where missing an alias can delete a copy.
+fn global_address_names(func: &IrFunction) -> FxHashMap<u32, FxHashSet<String>> {
+    let mut names: FxHashMap<u32, FxHashSet<String>> = FxHashMap::default();
+    let mut edges: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    let mut add_edge = |src: u32, dest: u32| edges.entry(src).or_default().push(dest);
+
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            match inst {
+                Instruction::GlobalAddr { dest, name } => {
+                    names.entry(dest.0).or_default().insert(name.clone());
+                }
+                Instruction::GetElementPtr { dest, base, .. } => add_edge(base.0, dest.0),
+                Instruction::Copy {
+                    dest,
+                    src: Operand::Value(src),
+                }
+                | Instruction::Cast {
+                    dest,
+                    src: Operand::Value(src),
+                    ..
+                } => add_edge(src.0, dest.0),
+                Instruction::Phi { dest, incoming, .. } => {
+                    for (op, _) in incoming {
+                        if let Operand::Value(src) = op {
+                            add_edge(src.0, dest.0);
+                        }
+                    }
+                }
+                Instruction::Select {
+                    dest,
+                    true_val,
+                    false_val,
+                    ..
+                } => {
+                    for op in [true_val, false_val] {
+                        if let Operand::Value(src) = op {
+                            add_edge(src.0, dest.0);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Propagate unions to a fixed point with a worklist.  A value is queued
+    // only when its set grew, so cycles and mixed phis terminate without the
+    // single-definition assumptions required by pointer_paths.
+    let mut pending: Vec<u32> = names.keys().copied().collect();
+    while let Some(src) = pending.pop() {
+        let Some(src_names) = names.get(&src).cloned() else {
+            continue;
+        };
+        for dest in edges.get(&src).into_iter().flatten() {
+            let dest_names = names.entry(*dest).or_default();
+            let old_len = dest_names.len();
+            dest_names.extend(src_names.iter().cloned());
+            if dest_names.len() != old_len {
+                pending.push(*dest);
+            }
+        }
+    }
+    names
+}
+
+fn global_names_may_alias(
+    a: &FxHashSet<String>,
+    b: &FxHashSet<String>,
+    facts: Option<&super::module_symbol_facts::ModuleSymbolFacts>,
+) -> bool {
+    a.iter().any(|an| {
+        b.iter().any(|bn| {
+            an == bn || facts.is_none_or(|facts| !facts.globals_distinct(an.as_str(), bn.as_str()))
+        })
+    })
+}
+
 /// Redirect construction of a store-only temporary aggregate into the final
 /// memcpy destination.  This turns `build(tmp); memcpy(dst, tmp)` into
 /// `build(dst)` when every use of `tmp` is a same-block GEP/store or that copy.
-fn forward_store_only_temporaries(func: &mut IrFunction) -> usize {
+fn forward_store_only_temporaries(
+    func: &mut IrFunction,
+    symbol_facts: Option<&super::module_symbol_facts::ModuleSymbolFacts>,
+) -> usize {
     let paths = pointer_paths(func);
     let roots: FxHashSet<u32> = paths
         .iter()
@@ -733,11 +817,13 @@ fn forward_store_only_temporaries(func: &mut IrFunction) -> usize {
     // snapshot write was redirected into c2 while `*c1=*c2` still read c2's
     // old value (CRC mismatch on every odd-length fold_copy+fold sequence).
     {
+        let global_addresses = global_address_names(func);
         let mut reject = FxHashSet::default();
         for (&root, &(copy_b, copy_i, dest)) in &copies {
             // dest's aliasing root (dest may be a GEP into a larger object;
             // any access to that object is conservatively a conflict).
             let dest_root = paths.get(&dest.0).map(|p| p.0).unwrap_or(dest.0);
+            let dest_globals = global_addresses.get(&dest.0);
             // First instruction that references `root` before the copy.
             let mut first_use = copy_i;
             for (ii, inst) in func.blocks[copy_b].instructions.iter().enumerate() {
@@ -768,7 +854,10 @@ fn forward_store_only_temporaries(func: &mut IrFunction) -> usize {
             // window by construction). Everything else that references a
             // dest-rooted value is a read, a write, or an escape
             // (Load/Store/Memcpy/Call/Intrinsic/InlineAsm/Cast/...) and
-            // fails closed.
+            // fails closed. GlobalAddr values use symbol identity as well:
+            // the frontend may materialize the same object under many SSA
+            // ids, and pr126405 showed that comparing only those ids misses
+            // the destination loads in this window.
             for ii in first_use..copy_i {
                 let inst = &func.blocks[copy_b].instructions[ii];
                 if matches!(
@@ -781,7 +870,14 @@ fn forward_store_only_temporaries(func: &mut IrFunction) -> usize {
                 }
                 let mut touches_dest = false;
                 inst.for_each_used_value(|v| {
-                    if v == dest.0 || paths.get(&v).is_some_and(|p| p.0 == dest_root) {
+                    let alloca_alias =
+                        v == dest.0 || paths.get(&v).is_some_and(|p| p.0 == dest_root);
+                    let global_alias = dest_globals.is_some_and(|dest_names| {
+                        global_addresses.get(&v).is_some_and(|used_names| {
+                            global_names_may_alias(dest_names, used_names, symbol_facts)
+                        })
+                    });
+                    if alloca_alias || global_alias {
                         touches_dest = true;
                     }
                 });
@@ -890,6 +986,20 @@ fn forward_store_only_temporaries(func: &mut IrFunction) -> usize {
 }
 
 pub(crate) fn run(func: &mut IrFunction) -> usize {
+    run_impl(func, None)
+}
+
+pub(crate) fn run_with_symbol_facts(
+    func: &mut IrFunction,
+    symbol_facts: &super::module_symbol_facts::ModuleSymbolFacts,
+) -> usize {
+    run_impl(func, Some(symbol_facts))
+}
+
+fn run_impl(
+    func: &mut IrFunction,
+    symbol_facts: Option<&super::module_symbol_facts::ModuleSymbolFacts>,
+) -> usize {
     // Sub-pass gates for miscompile bisection (this pass family has produced
     // eight distinct unsoundness bugs; being able to isolate the store-only
     // forwarding, the main forwarding, and the dead-store elimination
@@ -897,7 +1007,7 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
     let reverse_changes = if std::env::var("CCC_NO_AGG_STORE_FWD").is_ok() {
         0
     } else {
-        forward_store_only_temporaries(func)
+        forward_store_only_temporaries(func, symbol_facts)
     };
     if std::env::var("CCC_NO_AGG_MAIN").is_ok() {
         return reverse_changes
@@ -1051,6 +1161,34 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
                 let is_defining_copy = matches!(inst, Instruction::Memcpy { dest, .. } if dest.0 == *root)
                     && bi == candidate.block
                     && ii == candidate.inst;
+                // A second write to the candidate destroys the snapshot that
+                // its defining copy established.  This is easy to miss when
+                // the later memcpy has an UNTRACKED source (a global or an
+                // arbitrary pointer): candidate collection skips that copy,
+                // so the duplicate-source-copy guard never sees it.  The old
+                // destination-use allowlist then treated the overwrite as an
+                // ordinary post-copy use and forwarded even older snapshots
+                // to the original source (gcc.c-torture pr126405).
+                //
+                // Store and Memcpy are the two attributable memory writes.
+                // Every other writing shape already fails `allowed_shape`
+                // below.  Keep only the one defining write, irrespective of
+                // whether the other write occurs before or after it: a
+                // single full snapshot candidate must remain the sole write
+                // whose value all forwarded reads can observe.
+                let writes_candidate_dest = match inst {
+                    Instruction::Store { ptr, .. } => paths
+                        .get(&ptr.0)
+                        .is_some_and(|(written_root, _)| written_root == root),
+                    Instruction::Memcpy { dest, .. } => paths
+                        .get(&dest.0)
+                        .is_some_and(|(written_root, _)| written_root == root),
+                    _ => false,
+                };
+                if writes_candidate_dest && !is_defining_copy {
+                    invalid.insert(*root);
+                    continue;
+                }
                 let is_path_definition = matches!(inst, Instruction::GetElementPtr { base, .. } if base.0 == value)
                     || matches!(inst, Instruction::Copy { src: Operand::Value(v), .. } if v.0 == value)
                     || matches!(inst, Instruction::Phi { incoming, .. } if phi_pure_root(incoming, &paths) == Some(*root));
@@ -1284,6 +1422,139 @@ mod tests {
     use crate::ir::reexports::{BasicBlock, BlockId, IrConst, Terminator};
 
     #[test]
+    fn preserves_snapshot_when_untracked_source_overwrites_temporary() {
+        // pr126405: `old = tmp` must observe tmp's initial value even though
+        // a later copy from a global overwrites tmp.  The global source has
+        // no pointer_paths entry, so candidate collection cannot use its
+        // duplicate-copy guard to discover this second definition.
+        let mut func = IrFunction::new("snapshot_overwrite".into(), IrType::I64, vec![], false);
+        func.next_value_id = 5;
+        let alloca = |dest| Instruction::Alloca {
+            dest: Value(dest),
+            ty: IrType::Ptr,
+            size: 16,
+            align: 8,
+            volatile: false,
+            semantic_volatile: false,
+        };
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                alloca(0), // original source
+                alloca(1), // overwritten temporary
+                alloca(2), // older snapshot
+                Instruction::Memcpy {
+                    dest: Value(1),
+                    src: Value(0),
+                    size: 16,
+                },
+                Instruction::Memcpy {
+                    dest: Value(2),
+                    src: Value(1),
+                    size: 16,
+                },
+                Instruction::GlobalAddr {
+                    dest: Value(3),
+                    name: "global".into(),
+                },
+                Instruction::Memcpy {
+                    dest: Value(1),
+                    src: Value(3),
+                    size: 16,
+                },
+                Instruction::Load {
+                    volatile: false,
+                    dest: Value(4),
+                    ptr: Value(2),
+                    ty: IrType::I64,
+                    seg_override: AddressSpace::Default,
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(4)))),
+            source_spans: vec![],
+        });
+
+        assert_eq!(run(&mut func), 0);
+        let copies: Vec<_> = func.blocks[0]
+            .instructions
+            .iter()
+            .filter_map(|instruction| match instruction {
+                Instruction::Memcpy { dest, src, .. } => Some((*dest, *src)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            copies,
+            vec![
+                (Value(1), Value(0)),
+                (Value(2), Value(1)),
+                (Value(1), Value(3)),
+            ]
+        );
+    }
+
+    #[test]
+    fn store_forwarding_rejects_same_global_under_a_second_value_id() {
+        // pr126405: after forwarding the temporary's store into global g,
+        // this load would observe the NEW value.  Before the transform it
+        // reads g's old value, and the final memcpy happens only afterwards.
+        // A distinct GlobalAddr SSA id is not a distinct object.
+        let mut func = IrFunction::new("global_alias_window".into(), IrType::I32, vec![], false);
+        func.next_value_id = 4;
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::GlobalAddr {
+                    dest: Value(0),
+                    name: "g".into(),
+                },
+                Instruction::Alloca {
+                    dest: Value(1),
+                    ty: IrType::Ptr,
+                    size: 4,
+                    align: 4,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                Instruction::Store {
+                    volatile: false,
+                    val: Operand::Const(IrConst::I32(7)),
+                    ptr: Value(1),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
+                Instruction::GlobalAddr {
+                    dest: Value(2),
+                    name: "g".into(),
+                },
+                Instruction::Load {
+                    volatile: false,
+                    dest: Value(3),
+                    ptr: Value(2),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
+                Instruction::Memcpy {
+                    dest: Value(0),
+                    src: Value(1),
+                    size: 4,
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
+            source_spans: vec![],
+        });
+
+        assert_eq!(forward_store_only_temporaries(&mut func, None), 0);
+        assert!(func.blocks[0].instructions.iter().any(|instruction| {
+            matches!(instruction, Instruction::Store { ptr, .. } if *ptr == Value(1))
+        }));
+        assert!(func.blocks[0].instructions.iter().any(|instruction| {
+            matches!(instruction, Instruction::Memcpy { dest, src, .. }
+                if *dest == Value(0) && *src == Value(1))
+        }));
+    }
+
+    #[test]
     fn preserves_copy_when_source_write_uses_untracked_pointer_arithmetic() {
         let mut func = IrFunction::new("untracked_store".into(), IrType::I32, vec![], false);
         func.next_value_id = 4;
@@ -1337,7 +1608,7 @@ mod tests {
             source_spans: vec![],
         });
 
-        assert_eq!(forward_store_only_temporaries(&mut func), 0);
+        assert_eq!(forward_store_only_temporaries(&mut func, None), 0);
         assert!(
             func.blocks[0]
                 .instructions
@@ -1397,7 +1668,7 @@ mod tests {
             source_spans: vec![crate::common::source::Span::dummy()],
         });
 
-        assert_eq!(forward_store_only_temporaries(&mut func), 1);
+        assert_eq!(forward_store_only_temporaries(&mut func, None), 1);
         assert_eq!(func.blocks[0].instructions.len(), 5);
         assert_eq!(func.blocks[0].source_spans.len(), 1);
         assert!(matches!(
