@@ -489,8 +489,13 @@ impl<'a> ExprTypeChecker<'a> {
         let lct = self.infer_expr_ctype(lhs);
         let rct = self.infer_expr_ctype(rhs);
 
-        // Shift operators: result type is the promoted type of the left operand
+        // GNU vector shifts are element-wise when either operand is a vector.
+        // For `scalar << vector` the scalar is splatted and the result has the
+        // RHS vector type; only scalar shifts use the promoted-lhs rule.
         if matches!(op, BinOp::Shl | BinOp::Shr) {
+            if rct.as_ref().is_some_and(CType::is_vector) {
+                return rct;
+            }
             if let Some(l) = lct {
                 return Some(l.integer_promoted());
             }

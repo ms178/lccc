@@ -316,6 +316,12 @@ python3 scripts/aarch64_execute_suite.py \
     --lccc target/fastbuild/lccc-arm \
     --assembler /path/to/binutils-2.47/aarch64-linux-gnu-as \
     --jobs 2 --flags=-O2 --json /tmp/aarch64-torture.json
+
+# With Debian's aarch64-linux-gnu cross GCC/glibc and static Clang references,
+# use --sysroot=/ (the cross driver layout is already target-qualified). Using
+# /usr/aarch64-linux-gnu as Clang's sysroot can double-prefix linker-script paths.
+# An explicitly requested Clang compile/link failure is HARNESS-ERROR, and an
+# ORACLE-DISAGREE is nonzero; neither can silently degrade to a GCC-only PASS.
 ```
 
 ## Contracts the gates now pin (2026-10-13 audit session)
@@ -429,3 +435,39 @@ The real probe test requires **both** `LCCC_TEST_REAL_ICX=1` and
 `LCCC_ICX_BIN`. An explicitly requested real probe fails on a wrong or unusable
 compiler instead of being converted to a skip. No compilation is performed
 by that probe, only predefined-macro preprocessing.
+
+### Switch lowering red-team contracts
+
+`python3 -m unittest scripts.test_aarch64_execute_suite` exercises oracle
+failure classification and bounded mismatch diagnostics without external tools.
+`tests/regression/check_builtin_floor_narrowing.sh` separates call-routing
+contracts from a numerical binary32 oracle: 42 signed boundary inputs and
+65,536 deterministic samples, each checked through three call forms, on both
+x86 ABIs at five optimization levels. It checks quiet-NaN classification and
+signed zero, not NaN payloads or floating-environment exception flags.
+
+`python3 tests/regression/check_switch_cross_execute.py` runs nine self-checking
+switch fixtures with LUT lowering on/off under AArch64 and RV64 QEMU (36 runs).
+It requires the fastbuild target drivers, Clang 23.1.4, GNU target linkers or LLD,
+QEMU user emulators, and host C declaration headers. The executable uses a
+minimal syscall startup and no cross libc; printf/puts are no-ops, so acceptance
+is based on each fixture's exit-code oracle, not its printed output. `--clang`,
+`--qemu-dir`, and `--lccc-dir` select tool locations; `--ld` selects one GNU/LLD
+linker supporting both target emulations. Discovery prefers GNU triplet linkers,
+then system LLD, then the building Rust toolchain's bundled `rust-lld`. These
+freestanding fixtures do not require cross GCC or cross libc packages.
+`python3 tests/regression/test_check_switch_cross_execute.py` tests discovery
+and its fail-closed missing-tool diagnostics.
+The assembler/linker CI lane runs this gate after cross-toolchain provisioning.
+
+For a compile-time lookup witness (not a timing threshold gate):
+
+```sh
+cargo test --profile fastbuild --lib switch_definition_index_scaling_witness \
+  -- --nocapture
+```
+
+The witness runs in the normal unit suite (no timing threshold) and asserts equality between linear-scan and indexed definition
+results, and reports both timings for 2,000 queries. Production indexes only
+original switch operands, rejects multiple definitions, and rebuilds return
+path memoization after each IR transformation.

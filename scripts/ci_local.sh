@@ -18,24 +18,25 @@
 # GitHub CI runs the slow gates on every PR, so a full local run is not required.
 #
 #   ./scripts/ci_local.sh              # everything (test + bench + clippy)
-#   ./scripts/ci_local.sh --fast       # skip ONLY the six slow gates:
+#   ./scripts/ci_local.sh --fast       # skip ONLY the seven slow gates:
 #                                      #   cargo-test-debug-assertions,
 #                                      #   regression-corpus-ssa,
 #                                      #   benchmark-output-oracle,
 #                                      #   bounded-callgrind-corpus,
 #                                      #   peephole-whitespace-invariance,
-#                                      #   regression-corpus-debug-assertions
+#                                      #   regression-corpus-debug-assertions,
+#                                      #   switch-cross-execute (cross toolchains required)
 #                                      # rustfmt and clippy ALWAYS run — they
 #                                      # are the CI lint jobs, and skipping
 #                                      # them locally is how a red PR ships.
-#   ./scripts/ci_local.sh --slow       # ONLY the six slow gates (plus the
+#   ./scripts/ci_local.sh --slow       # ONLY the seven slow gates (plus the
 #                                      # build).  If a --fast stamp for the SAME
 #                                      # tree exists, a green --slow run upgrades
 #                                      # it to mode=full: fast + slow on one tree
 #                                      # is every gate GitHub runs.
 #   ./scripts/ci_local.sh --only NAME  # a single gate, substring match
 #
-# A --fast pass is NOT CI-equivalent: GitHub runs all six slow gates on every
+# A --fast pass is NOT CI-equivalent: GitHub runs all seven slow gates on every
 # PR.  PR #638 went red on check_peephole_whitespace.sh after a green
 # --fast run, because the snapshot gate accepted a fast stamp.  lccc-snapshot.sh
 # accepts a mode=fast stamp as its gate (owner decision: GitHub CI runs the
@@ -244,6 +245,15 @@ gate "sibcall-shapes" fast \
     bash tests/regression/check_sibcall_shapes.sh
 gate "fno-builtin-fold-contract" fast \
     env CCC="$LCCC" bash tests/regression/check_fno_builtin_folds.sh
+gate "builtin-floor-float-narrowing" fast \
+    env CCC="$LCCC" CCC_I686=target/fastbuild/lccc-i686 \
+    bash tests/regression/check_builtin_floor_narrowing.sh
+gate "store-forwarding-dword-reload" fast \
+    env CCC="$LCCC" CCC_I686=target/fastbuild/lccc-i686 \
+    bash tests/regression/check_store_forwarding_dword_reload.sh
+gate "x86-execute-fixes" fast \
+    env CCC="$LCCC" CCC_I686=target/fastbuild/lccc-i686 \
+    bash tests/regression/check_x86_torture_execute_fixes.sh
 
 # --------------------------------------------------------------- job:test --
 # The ratchet that keeps the 2026-10-13 audit's debt numbers from growing:
@@ -1147,7 +1157,7 @@ gate "addr-value-fuzz-smoke" fast \
 # / known-equivalent near-miss pairs in one TU, plus the harness's own
 # negative control (a fake optimiser must be caught) in the unit tests.
 gate "mutpair-harness-tests" fast \
-    sh -c 'python3 scripts/mutpair.py --self-test && python3 -m unittest scripts.test_mutpair -v'
+    sh -c 'python3 scripts/mutpair.py --self-test && python3 -m unittest scripts.test_mutpair scripts.test_aarch64_execute_suite -v'
 
 gate "mutpair-differential-smoke" fast \
     python3 scripts/fuzz_diff.py --engine mutpair --count 4 \
@@ -1374,6 +1384,12 @@ gate "tls-model-selection" fast \
 
 # Cross-architecture TLS model/relocation/runtime contract. This catches the
 # formerly hard-coded LE lowering in PIC/shared AArch64 and RISC-V objects.
+# The hosted assembler/linker lane provisions both cross toolchains. Keep
+# this in the full local run, not the fast x86-only shards: compiling/linking
+# the fixtures is quick, but those shards do not provision target linkers.
+gate "switch-cross-execute" slow \
+    python3 tests/regression/check_switch_cross_execute.py
+
 gate "tls-cross-models" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_tls_cross_models.sh
 
@@ -1454,6 +1470,7 @@ gate "integer-order-networks" fast python3 tests/regression/check_integer_order_
 # switch, host fallback and pair liveness. Mirrors the hosted step.
 gate "peephole-pair-parallel" fast python3 tests/regression/check_peephole_pair_parallel.py
 gate "oracle-diagnostics" fast python3 scripts/test_ci_oracle_diagnostics.py
+gate "cross-linker-discovery" fast python3 tests/regression/test_check_switch_cross_execute.py
 
 gate "tls-model-option" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_tls_model_option.sh

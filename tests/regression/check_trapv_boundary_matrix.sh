@@ -49,6 +49,9 @@ cat > "$td/trapv_matrix.c" <<'EOF'
 #include <stdio.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
 typedef long long ll;
 typedef unsigned long long ull;
 int add32(int, int); int sub32(int, int); int mul32(int, int); int neg32(int);
@@ -96,6 +99,13 @@ static int expect(int f, ll a, ll b, ll *w) {
     }
 }
 int main(void) {
+#if defined(__linux__)
+    /* The verdict uses wait status, not core files. The 910 expected aborts
+       must not invoke a host core-dump service. RLIMIT_CORE alone does not
+       prevent Linux pipe-style core handlers; fork inherits dumpability. */
+    if (prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) != 0 ||
+        prctl(PR_GET_DUMPABLE, 0, 0, 0, 0) != 0) return 2;
+#endif
     int traps = 0, bad = 0;
     for (int f = 0; f < NF; f++)
         for (int i = 0; i < NV; i++)

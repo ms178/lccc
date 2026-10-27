@@ -47,7 +47,9 @@ pub(crate) fn eliminate_dead_aggregate_field_stores(func: &mut IrFunction) -> us
                         dest, base, offset, ..
                     } => root_suffix.get(&base.0).copied().map(|(root, suffix)| {
                         let next = match (offset, suffix) {
-                            (Operand::Const(c), Some(s)) => c.to_i64().map(|o| s + o),
+                            (Operand::Const(c), Some(s)) => {
+                                c.to_i64().and_then(|o| s.checked_add(o))
+                            }
                             _ => None, // variable or already-unknown offset
                         };
                         (dest.0, (root, next))
@@ -336,10 +338,13 @@ fn pointer_paths(
     func: &IrFunction,
 ) -> FxHashMap<u32, (u32, Vec<(Operand, crate::common::types::IrType)>)> {
     let mut paths = FxHashMap::default();
+    let multi_def = super::gvn::find_multi_def_values(func);
     for block in &func.blocks {
         for inst in &block.instructions {
             if let Instruction::Alloca { dest, .. } = inst {
-                paths.insert(dest.0, (dest.0, Vec::new()));
+                if !multi_def.contains(&dest.0) {
+                    paths.insert(dest.0, (dest.0, Vec::new()));
+                }
             }
         }
     }
@@ -349,7 +354,6 @@ fn pointer_paths(
     // other definitions may point elsewhere.  Every access through such an
     // id then takes the untracked (conservative, no-forwarding) fallback —
     // the same refusal discipline as gvn/copy_prop/global_addr_cse.
-    let multi_def = super::gvn::find_multi_def_values(func);
     let mut changed = true;
     while changed {
         changed = false;
@@ -399,7 +403,7 @@ fn pointer_paths(
                                                 u32,
                                                 Vec<(Operand, crate::common::types::IrType)>,
                                             )| {
-                                                p.0 != path.0 || p.1.len() != path.1.len()
+                                                p.0 != path.0 || p.1 != path.1
                                             },
                                         ) {
                                             compatible = false;
@@ -432,10 +436,237 @@ fn pointer_paths(
     paths
 }
 
+/// Symbols that each value may use as an address root.  Unlike pointer_paths,
+/// this is deliberately a MAY analysis: unions are never narrowed, including
+/// for multiply-defined values and mixed phis.  That is the appropriate
+/// default for a liveness guard, where missing an alias can delete a copy.
+fn global_address_names(func: &IrFunction) -> FxHashMap<u32, FxHashSet<String>> {
+    let mut names: FxHashMap<u32, FxHashSet<String>> = FxHashMap::default();
+    let mut edges: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    let mut add_edge = |src: u32, dest: u32| edges.entry(src).or_default().push(dest);
+
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            match inst {
+                Instruction::GlobalAddr { dest, name } => {
+                    names.entry(dest.0).or_default().insert(name.clone());
+                }
+                Instruction::GetElementPtr { dest, base, .. } => add_edge(base.0, dest.0),
+                Instruction::Copy {
+                    dest,
+                    src: Operand::Value(src),
+                }
+                | Instruction::Cast {
+                    dest,
+                    src: Operand::Value(src),
+                    ..
+                } => add_edge(src.0, dest.0),
+                Instruction::Phi { dest, incoming, .. } => {
+                    for (op, _) in incoming {
+                        if let Operand::Value(src) = op {
+                            add_edge(src.0, dest.0);
+                        }
+                    }
+                }
+                Instruction::Select {
+                    dest,
+                    true_val,
+                    false_val,
+                    ..
+                } => {
+                    for op in [true_val, false_val] {
+                        if let Operand::Value(src) = op {
+                            add_edge(src.0, dest.0);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Propagate unions to a fixed point with a worklist.  A value is queued
+    // only when its set grew, so cycles and mixed phis terminate without the
+    // single-definition assumptions required by pointer_paths.
+    let mut pending: Vec<u32> = names.keys().copied().collect();
+    while let Some(src) = pending.pop() {
+        let Some(src_names) = names.get(&src).cloned() else {
+            continue;
+        };
+        for dest in edges.get(&src).into_iter().flatten() {
+            let dest_names = names.entry(*dest).or_default();
+            let old_len = dest_names.len();
+            dest_names.extend(src_names.iter().cloned());
+            if dest_names.len() != old_len {
+                pending.push(*dest);
+            }
+        }
+    }
+    names
+}
+
+fn global_names_may_alias(
+    a: &FxHashSet<String>,
+    b: &FxHashSet<String>,
+    facts: Option<&super::module_symbol_facts::ModuleSymbolFacts>,
+) -> bool {
+    a.iter().any(|an| {
+        b.iter().any(|bn| {
+            an == bn || facts.is_none_or(|facts| !facts.globals_distinct(an.as_str(), bn.as_str()))
+        })
+    })
+}
+
+type PointerPaths = FxHashMap<u32, (u32, Vec<(Operand, crate::common::types::IrType)>)>;
+type ConstructionCopies = FxHashMap<u32, (usize, usize, Value)>;
+
+/// Remove candidates whose earlier publication can change an intervening
+/// memory observation. Keeping this proof separate from candidate discovery
+/// and rewriting makes the alias boundary independently reviewable.
+fn reject_conflicting_constructions(
+    func: &IrFunction,
+    paths: &PointerPaths,
+    copies: &mut ConstructionCopies,
+    symbol_facts: Option<&super::module_symbol_facts::ModuleSymbolFacts>,
+) {
+    let global_addresses = global_address_names(func);
+    // MAY provenance above detects aliases, but a partial global set from
+    // select(global, unknown) is NOT a no-alias proof. Use only unique,
+    // direct GlobalAddr definitions when proving distinct globals here.
+    let multi_def = super::gvn::find_multi_def_values(func);
+    let direct_globals: FxHashMap<u32, &str> = func
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|inst| match inst {
+            Instruction::GlobalAddr { dest, name } if !multi_def.contains(&dest.0) => {
+                Some((dest.0, name.as_str()))
+            }
+            _ => None,
+        })
+        .collect();
+    let mut reject = FxHashSet::default();
+    for (&root, &(copy_b, copy_i, dest)) in copies.iter() {
+        // dest's aliasing root (dest may be a GEP into a larger object;
+        // any access to that object is conservatively a conflict).
+        let dest_root = paths.get(&dest.0).map(|p| p.0).unwrap_or(dest.0);
+        let dest_globals = global_addresses.get(&dest.0);
+        // Address construction does not publish bytes. Start at the
+        // first redirected WRITE, not Alloca/GEP, so loads used to build
+        // the temporary before its first store do not block forwarding.
+        let first_use = func.blocks[copy_b].instructions[..copy_i]
+            .iter()
+            .position(|inst| match inst {
+                Instruction::Store { ptr, .. } | Instruction::Memcpy { dest: ptr, .. } => {
+                    paths.get(&ptr.0).is_some_and(|p| p.0 == root)
+                }
+                _ => false,
+            })
+            .unwrap_or(copy_i);
+        let access_may_alias = |pointer: Value| {
+            if pointer == dest {
+                return true;
+            }
+            let access_root = paths.get(&pointer.0).map(|p| p.0);
+            // Validation above proves the construction root non-escaping;
+            // its own stores cannot name the destination's old contents.
+            if access_root == Some(root) {
+                return false;
+            }
+            if let Some(dest_path) = paths.get(&dest.0) {
+                if let Some(access_root) = access_root {
+                    return access_root == dest_path.0;
+                }
+                if direct_globals.contains_key(&pointer.0) {
+                    return false;
+                }
+            } else if direct_globals.contains_key(&dest.0) && access_root.is_some() {
+                return false;
+            }
+            if let (Some(a), Some(b), Some(facts)) = (
+                direct_globals.get(&dest.0),
+                direct_globals.get(&pointer.0),
+                symbol_facts,
+            ) {
+                return !facts.globals_distinct(a, b);
+            }
+            // Different SSA ids, unknown roots, and partial MAY sets do
+            // not prove disjointness. In particular a parameter can point
+            // at the destination global, and a call can access it implicitly.
+            true
+        };
+        // dest's MEMORY must be untouched inside the window (the memcpy
+        // itself at copy_i is the legitimate final write). Pure address
+        // computations — GetElementPtr / Copy / Phi over pointers rooted
+        // at dest — do not read or write that memory and must not
+        // reject (the hoisted destination GEP itself sits inside the
+        // window by construction). Everything else that references a
+        // dest-rooted value is a read, a write, or an escape
+        // (Load/Store/Memcpy/Call/Intrinsic/InlineAsm/Cast/...) and
+        // fails closed. GlobalAddr values use symbol identity as well:
+        // the frontend may materialize the same object under many SSA
+        // ids, and pr126405 showed that comparing only those ids misses
+        // the destination loads in this window.
+        for ii in first_use..copy_i {
+            let inst = &func.blocks[copy_b].instructions[ii];
+            if matches!(
+                inst,
+                Instruction::GetElementPtr { .. }
+                    | Instruction::Copy { .. }
+                    | Instruction::Phi { .. }
+            ) {
+                continue;
+            }
+            let memory_conflict = match inst {
+                Instruction::Load { ptr, .. } | Instruction::Store { ptr, .. } => {
+                    access_may_alias(*ptr)
+                }
+                Instruction::Memcpy { dest, src, .. } => {
+                    access_may_alias(*dest) || access_may_alias(*src)
+                }
+                Instruction::AtomicLoad { .. } | Instruction::Fence { .. } => true,
+                _ => is_opaque_memory_write(inst) || inst.may_write_memory(),
+            };
+            let mut touches_dest = memory_conflict;
+            inst.for_each_used_value(|v| {
+                let alloca_alias = v == dest.0 || paths.get(&v).is_some_and(|p| p.0 == dest_root);
+                let global_alias = dest_globals.is_some_and(|dest_names| {
+                    global_addresses.get(&v).is_some_and(|used_names| {
+                        global_names_may_alias(dest_names, used_names, symbol_facts)
+                    })
+                });
+                if alloca_alias || global_alias {
+                    touches_dest = true;
+                }
+            });
+            if let Some(d) = inst.dest() {
+                if d.0 == dest.0 || paths.get(&d.0).is_some_and(|p| p.0 == dest_root) {
+                    touches_dest = true;
+                }
+            }
+            if touches_dest {
+                reject.insert(root);
+                break;
+            }
+        }
+    }
+    if std::env::var("CCC_DEBUG_AGGFWD").is_ok() {
+        for r in &reject {
+            eprintln!("[STOREFWD-REJ] {} root=v{} dest-window", func.name, r);
+        }
+    }
+    for root in reject {
+        copies.remove(&root);
+    }
+}
+
 /// Redirect construction of a store-only temporary aggregate into the final
 /// memcpy destination.  This turns `build(tmp); memcpy(dst, tmp)` into
 /// `build(dst)` when every use of `tmp` is a same-block GEP/store or that copy.
-fn forward_store_only_temporaries(func: &mut IrFunction) -> usize {
+fn forward_store_only_temporaries(
+    func: &mut IrFunction,
+    symbol_facts: Option<&super::module_symbol_facts::ModuleSymbolFacts>,
+) -> usize {
     let paths = pointer_paths(func);
     let roots: FxHashSet<u32> = paths
         .iter()
@@ -536,7 +767,7 @@ fn forward_store_only_temporaries(func: &mut IrFunction) -> usize {
         let mut total = 0i64;
         for (op, _) in path {
             match op {
-                Operand::Const(c) => total += c.to_i64()?,
+                Operand::Const(c) => total = total.checked_add(c.to_i64()?)?,
                 _ => return None,
             }
         }
@@ -684,11 +915,23 @@ fn forward_store_only_temporaries(func: &mut IrFunction) -> usize {
                 // the DESTINATION object and corrupts whatever neighbors it
                 // there (structs_bitfields: 12-byte memcpy, 8..16 store).
                 let within_copy = |v: u32, ty: crate::common::types::IrType| -> bool {
-                    const_offset(v).is_some_and(|off| off >= 0 && off + type_size(ty) <= copy_size)
+                    const_offset(v).is_some_and(|off| {
+                        off >= 0
+                            && off
+                                .checked_add(type_size(ty))
+                                .is_some_and(|end| end <= copy_size)
+                    })
                 };
                 let allowed = match inst {
                     Instruction::GetElementPtr { base, .. } => base.0 == value,
-                    Instruction::Store { ptr, ty, .. } => ptr.0 == value && within_copy(value, *ty),
+                    Instruction::Store { ptr, val, ty, .. } => {
+                        // Even `store root, root` escapes the address through
+                        // the eventual copy. Redirecting only the write would
+                        // leave a self-pointer naming the unconstructed alloca.
+                        ptr.0 == value
+                            && !matches!(val, Operand::Value(v) if paths.get(&v.0).is_some_and(|p| p.0 == *root))
+                            && within_copy(value, *ty)
+                    }
                     Instruction::Copy {
                         src: Operand::Value(v),
                         ..
@@ -732,79 +975,7 @@ fn forward_store_only_temporaries(func: &mut IrFunction) -> usize {
     // zlib-ng fold_1: `x_tmp3=*c3; *c3=*c0; *c1=*c2; ...; *c2=x_tmp3` — the
     // snapshot write was redirected into c2 while `*c1=*c2` still read c2's
     // old value (CRC mismatch on every odd-length fold_copy+fold sequence).
-    {
-        let mut reject = FxHashSet::default();
-        for (&root, &(copy_b, copy_i, dest)) in &copies {
-            // dest's aliasing root (dest may be a GEP into a larger object;
-            // any access to that object is conservatively a conflict).
-            let dest_root = paths.get(&dest.0).map(|p| p.0).unwrap_or(dest.0);
-            // First instruction that references `root` before the copy.
-            let mut first_use = copy_i;
-            for (ii, inst) in func.blocks[copy_b].instructions.iter().enumerate() {
-                if ii >= copy_i {
-                    break;
-                }
-                let mut hit = false;
-                inst.for_each_used_value(|v| {
-                    if paths.get(&v).is_some_and(|p| p.0 == root) {
-                        hit = true;
-                    }
-                });
-                if let Some(d) = inst.dest() {
-                    if paths.get(&d.0).is_some_and(|p| p.0 == root) {
-                        hit = true;
-                    }
-                }
-                if hit {
-                    first_use = ii;
-                    break;
-                }
-            }
-            // dest's MEMORY must be untouched inside the window (the memcpy
-            // itself at copy_i is the legitimate final write). Pure address
-            // computations — GetElementPtr / Copy / Phi over pointers rooted
-            // at dest — do not read or write that memory and must not
-            // reject (the hoisted destination GEP itself sits inside the
-            // window by construction). Everything else that references a
-            // dest-rooted value is a read, a write, or an escape
-            // (Load/Store/Memcpy/Call/Intrinsic/InlineAsm/Cast/...) and
-            // fails closed.
-            for ii in first_use..copy_i {
-                let inst = &func.blocks[copy_b].instructions[ii];
-                if matches!(
-                    inst,
-                    Instruction::GetElementPtr { .. }
-                        | Instruction::Copy { .. }
-                        | Instruction::Phi { .. }
-                ) {
-                    continue;
-                }
-                let mut touches_dest = false;
-                inst.for_each_used_value(|v| {
-                    if v == dest.0 || paths.get(&v).is_some_and(|p| p.0 == dest_root) {
-                        touches_dest = true;
-                    }
-                });
-                if let Some(d) = inst.dest() {
-                    if d.0 == dest.0 || paths.get(&d.0).is_some_and(|p| p.0 == dest_root) {
-                        touches_dest = true;
-                    }
-                }
-                if touches_dest {
-                    reject.insert(root);
-                    break;
-                }
-            }
-        }
-        if std::env::var("CCC_DEBUG_AGGFWD").is_ok() {
-            for r in &reject {
-                eprintln!("[STOREFWD-REJ] {} root=v{} dest-window", func.name, r);
-            }
-        }
-        for root in reject {
-            copies.remove(&root);
-        }
-    }
+    reject_conflicting_constructions(func, &paths, &mut copies, symbol_facts);
     if copies.is_empty() {
         return 0;
     }
@@ -890,6 +1061,20 @@ fn forward_store_only_temporaries(func: &mut IrFunction) -> usize {
 }
 
 pub(crate) fn run(func: &mut IrFunction) -> usize {
+    run_impl(func, None)
+}
+
+pub(crate) fn run_with_symbol_facts(
+    func: &mut IrFunction,
+    symbol_facts: &super::module_symbol_facts::ModuleSymbolFacts,
+) -> usize {
+    run_impl(func, Some(symbol_facts))
+}
+
+fn run_impl(
+    func: &mut IrFunction,
+    symbol_facts: Option<&super::module_symbol_facts::ModuleSymbolFacts>,
+) -> usize {
     // Sub-pass gates for miscompile bisection (this pass family has produced
     // eight distinct unsoundness bugs; being able to isolate the store-only
     // forwarding, the main forwarding, and the dead-store elimination
@@ -897,7 +1082,7 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
     let reverse_changes = if std::env::var("CCC_NO_AGG_STORE_FWD").is_ok() {
         0
     } else {
-        forward_store_only_temporaries(func)
+        forward_store_only_temporaries(func, symbol_facts)
     };
     if std::env::var("CCC_NO_AGG_MAIN").is_ok() {
         return reverse_changes
@@ -1051,6 +1236,34 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
                 let is_defining_copy = matches!(inst, Instruction::Memcpy { dest, .. } if dest.0 == *root)
                     && bi == candidate.block
                     && ii == candidate.inst;
+                // A second write to the candidate destroys the snapshot that
+                // its defining copy established.  This is easy to miss when
+                // the later memcpy has an UNTRACKED source (a global or an
+                // arbitrary pointer): candidate collection skips that copy,
+                // so the duplicate-source-copy guard never sees it.  The old
+                // destination-use allowlist then treated the overwrite as an
+                // ordinary post-copy use and forwarded even older snapshots
+                // to the original source (gcc.c-torture pr126405).
+                //
+                // Store and Memcpy are the two attributable memory writes.
+                // Every other writing shape already fails `allowed_shape`
+                // below.  Keep only the one defining write, irrespective of
+                // whether the other write occurs before or after it: a
+                // single full snapshot candidate must remain the sole write
+                // whose value all forwarded reads can observe.
+                let writes_candidate_dest = match inst {
+                    Instruction::Store { ptr, .. } => paths
+                        .get(&ptr.0)
+                        .is_some_and(|(written_root, _)| written_root == root),
+                    Instruction::Memcpy { dest, .. } => paths
+                        .get(&dest.0)
+                        .is_some_and(|(written_root, _)| written_root == root),
+                    _ => false,
+                };
+                if writes_candidate_dest && !is_defining_copy {
+                    invalid.insert(*root);
+                    continue;
+                }
                 let is_path_definition = matches!(inst, Instruction::GetElementPtr { base, .. } if base.0 == value)
                     || matches!(inst, Instruction::Copy { src: Operand::Value(v), .. } if v.0 == value)
                     || matches!(inst, Instruction::Phi { incoming, .. } if phi_pure_root(incoming, &paths) == Some(*root));
@@ -1132,7 +1345,13 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
     let mut invalid = FxHashSet::default();
     for (bi, block) in func.blocks.iter().enumerate() {
         for (ii, inst) in block.instructions.iter().enumerate() {
-            if is_opaque_memory_write(inst) {
+            let untracked_write = match inst {
+                Instruction::Store { ptr, .. } | Instruction::Memcpy { dest: ptr, .. } => {
+                    !paths.contains_key(&ptr.0)
+                }
+                _ => false,
+            };
+            if is_opaque_memory_write(inst) || untracked_write {
                 for (&dest_root, candidate) in &candidates {
                     let after_copy = bi == candidate.block && ii > candidate.inst;
                     // A non-escaping alloca cannot be written by an opaque
@@ -1284,6 +1503,396 @@ mod tests {
     use crate::ir::reexports::{BasicBlock, BlockId, IrConst, Terminator};
 
     #[test]
+    fn preserves_snapshot_when_untracked_source_overwrites_temporary() {
+        // pr126405: `old = tmp` must observe tmp's initial value even though
+        // a later copy from a global overwrites tmp.  The global source has
+        // no pointer_paths entry, so candidate collection cannot use its
+        // duplicate-copy guard to discover this second definition.
+        let mut func = IrFunction::new("snapshot_overwrite".into(), IrType::I64, vec![], false);
+        func.next_value_id = 5;
+        let alloca = |dest| Instruction::Alloca {
+            dest: Value(dest),
+            ty: IrType::Ptr,
+            size: 16,
+            align: 8,
+            volatile: false,
+            semantic_volatile: false,
+        };
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                alloca(0), // original source
+                alloca(1), // overwritten temporary
+                alloca(2), // older snapshot
+                Instruction::Memcpy {
+                    dest: Value(1),
+                    src: Value(0),
+                    size: 16,
+                },
+                Instruction::Memcpy {
+                    dest: Value(2),
+                    src: Value(1),
+                    size: 16,
+                },
+                Instruction::GlobalAddr {
+                    dest: Value(3),
+                    name: "global".into(),
+                },
+                Instruction::Memcpy {
+                    dest: Value(1),
+                    src: Value(3),
+                    size: 16,
+                },
+                Instruction::Load {
+                    volatile: false,
+                    dest: Value(4),
+                    ptr: Value(2),
+                    ty: IrType::I64,
+                    seg_override: AddressSpace::Default,
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(4)))),
+            source_spans: vec![],
+        });
+
+        assert_eq!(run(&mut func), 0);
+        let copies: Vec<_> = func.blocks[0]
+            .instructions
+            .iter()
+            .filter_map(|instruction| match instruction {
+                Instruction::Memcpy { dest, src, .. } => Some((*dest, *src)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            copies,
+            vec![
+                (Value(1), Value(0)),
+                (Value(2), Value(1)),
+                (Value(1), Value(3)),
+            ]
+        );
+    }
+
+    #[test]
+    fn store_forwarding_rejects_same_global_under_a_second_value_id() {
+        // pr126405: after forwarding the temporary's store into global g,
+        // this load would observe the NEW value.  Before the transform it
+        // reads g's old value, and the final memcpy happens only afterwards.
+        // A distinct GlobalAddr SSA id is not a distinct object.
+        let mut func = IrFunction::new("global_alias_window".into(), IrType::I32, vec![], false);
+        func.next_value_id = 4;
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::GlobalAddr {
+                    dest: Value(0),
+                    name: "g".into(),
+                },
+                Instruction::Alloca {
+                    dest: Value(1),
+                    ty: IrType::Ptr,
+                    size: 4,
+                    align: 4,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                Instruction::Store {
+                    volatile: false,
+                    val: Operand::Const(IrConst::I32(7)),
+                    ptr: Value(1),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
+                Instruction::GlobalAddr {
+                    dest: Value(2),
+                    name: "g".into(),
+                },
+                Instruction::Load {
+                    volatile: false,
+                    dest: Value(3),
+                    ptr: Value(2),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
+                Instruction::Memcpy {
+                    dest: Value(0),
+                    src: Value(1),
+                    size: 4,
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
+            source_spans: vec![],
+        });
+
+        assert_eq!(forward_store_only_temporaries(&mut func, None), 0);
+        assert!(func.blocks[0].instructions.iter().any(|instruction| {
+            matches!(instruction, Instruction::Store { ptr, .. } if *ptr == Value(1))
+        }));
+        assert!(func.blocks[0].instructions.iter().any(|instruction| {
+            matches!(instruction, Instruction::Memcpy { dest, src, .. }
+                if *dest == Value(0) && *src == Value(1))
+        }));
+    }
+
+    #[test]
+    fn pointer_paths_reject_equal_depth_but_different_offsets_and_redefined_allocas() {
+        let mut func = IrFunction::new("different_offsets".into(), IrType::I32, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            source_spans: vec![],
+            instructions: vec![
+                Instruction::Alloca {
+                    dest: Value(0),
+                    ty: IrType::Ptr,
+                    size: 16,
+                    align: 8,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                Instruction::GetElementPtr {
+                    dest: Value(1),
+                    base: Value(0),
+                    offset: Operand::Const(IrConst::I64(0)),
+                    ty: IrType::I32,
+                },
+                Instruction::GetElementPtr {
+                    dest: Value(2),
+                    base: Value(0),
+                    offset: Operand::Const(IrConst::I64(8)),
+                    ty: IrType::I32,
+                },
+                Instruction::Phi {
+                    dest: Value(3),
+                    ty: IrType::Ptr,
+                    incoming: vec![
+                        (Operand::Value(Value(1)), BlockId(1)),
+                        (Operand::Value(Value(2)), BlockId(2)),
+                    ],
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+        });
+        assert!(!pointer_paths(&func).contains_key(&3));
+        func.blocks[0].instructions.push(Instruction::Copy {
+            dest: Value(0),
+            src: Operand::Value(Value(9)),
+        });
+        assert!(pointer_paths(&func).is_empty());
+    }
+
+    #[test]
+    fn self_pointer_construction_is_not_a_store_only_temporary() {
+        let mut func = IrFunction::new("self_pointer".into(), IrType::I32, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            source_spans: vec![],
+            instructions: vec![
+                Instruction::GlobalAddr {
+                    dest: Value(1),
+                    name: "out".into(),
+                },
+                alloca(0, 16),
+                Instruction::Store {
+                    volatile: false,
+                    ptr: Value(0),
+                    val: Operand::Value(Value(0)),
+                    ty: IrType::Ptr,
+                    seg_override: AddressSpace::Default,
+                },
+                Instruction::Memcpy {
+                    dest: Value(1),
+                    src: Value(0),
+                    size: 16,
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+        });
+        assert_eq!(forward_store_only_temporaries(&mut func, None), 0);
+    }
+
+    #[test]
+    fn store_forwarding_checks_unknown_reads_and_implicit_calls() {
+        use crate::ir::instruction::CallInfo;
+        for opaque_call in [false, true] {
+            let mut func = IrFunction::new(
+                "unknown_destination_observer".into(),
+                IrType::I32,
+                vec![],
+                false,
+            );
+            let observer = if opaque_call {
+                Instruction::Call {
+                    func: "observe_global".into(),
+                    info: CallInfo::default(),
+                }
+            } else {
+                Instruction::Load {
+                    volatile: false,
+                    dest: Value(3),
+                    ptr: Value(9),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                }
+            };
+            func.blocks.push(BasicBlock {
+                label: BlockId(0),
+                source_spans: vec![],
+                instructions: vec![
+                    Instruction::GlobalAddr {
+                        dest: Value(0),
+                        name: "g".into(),
+                    },
+                    Instruction::GlobalAddr {
+                        dest: Value(8),
+                        name: "gp".into(),
+                    },
+                    Instruction::Load {
+                        volatile: false,
+                        dest: Value(9),
+                        ptr: Value(8),
+                        ty: IrType::Ptr,
+                        seg_override: AddressSpace::Default,
+                    },
+                    Instruction::Alloca {
+                        dest: Value(1),
+                        ty: IrType::Ptr,
+                        size: 4,
+                        align: 4,
+                        volatile: false,
+                        semantic_volatile: false,
+                    },
+                    Instruction::Store {
+                        volatile: false,
+                        val: Operand::Const(IrConst::I32(7)),
+                        ptr: Value(1),
+                        ty: IrType::I32,
+                        seg_override: AddressSpace::Default,
+                    },
+                    observer,
+                    Instruction::Memcpy {
+                        dest: Value(0),
+                        src: Value(1),
+                        size: 4,
+                    },
+                ],
+                terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+            });
+            let mut before_write = func.clone();
+            let observer = before_write.blocks[0].instructions.remove(5);
+            before_write.blocks[0].instructions.insert(4, observer);
+            assert_eq!(forward_store_only_temporaries(&mut before_write, None), 2);
+            assert_eq!(
+                forward_store_only_temporaries(&mut func, None),
+                0,
+                "call={opaque_call}"
+            );
+            if !opaque_call {
+                // Preserve useful forwarding when object identity really is
+                // known; a mixed global/unknown select must NOT reuse that proof.
+                let mut facts = super::super::module_symbol_facts::ModuleSymbolFacts::default();
+                facts.identity_witnesses.insert("g".into());
+                for mixed in [false, true] {
+                    let mut distinct = func.clone();
+                    distinct.blocks[0].instructions.insert(
+                        3,
+                        Instruction::GlobalAddr {
+                            dest: Value(2),
+                            name: "h".into(),
+                        },
+                    );
+                    let mut pointer = Value(2);
+                    if mixed {
+                        distinct.blocks[0].instructions.insert(
+                            4,
+                            Instruction::Select {
+                                dest: Value(4),
+                                cond: Operand::Const(IrConst::I32(1)),
+                                true_val: Operand::Value(Value(2)),
+                                false_val: Operand::Value(Value(9)),
+                                ty: IrType::Ptr,
+                            },
+                        );
+                        pointer = Value(4);
+                    }
+                    for inst in &mut distinct.blocks[0].instructions {
+                        if let Instruction::Load {
+                            dest: Value(3),
+                            ptr,
+                            ..
+                        } = inst
+                        {
+                            *ptr = pointer;
+                        }
+                    }
+                    assert_eq!(
+                        forward_store_only_temporaries(&mut distinct, Some(&facts)),
+                        2 * usize::from(!mixed)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn escaped_snapshot_source_may_be_written_through_an_untracked_pointer() {
+        let mut func = IrFunction::new("escaped_snapshot".into(), IrType::I32, vec![], false);
+        let alloca = |dest| Instruction::Alloca {
+            dest: Value(dest),
+            ty: IrType::I32,
+            size: 4,
+            align: 4,
+            volatile: false,
+            semantic_volatile: false,
+        };
+        let load = |dest, ptr, ty| Instruction::Load {
+            volatile: false,
+            dest: Value(dest),
+            ptr: Value(ptr),
+            ty,
+            seg_override: AddressSpace::Default,
+        };
+        let store = |ptr, val, ty| Instruction::Store {
+            volatile: false,
+            ptr: Value(ptr),
+            val,
+            ty,
+            seg_override: AddressSpace::Default,
+        };
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            source_spans: vec![],
+            instructions: vec![
+                alloca(0),
+                alloca(1),
+                Instruction::GlobalAddr {
+                    dest: Value(4),
+                    name: "escaped".into(),
+                },
+                store(0, Operand::Const(IrConst::I32(42)), IrType::I32),
+                store(4, Operand::Value(Value(0)), IrType::Ptr),
+                Instruction::Memcpy {
+                    dest: Value(1),
+                    src: Value(0),
+                    size: 4,
+                },
+                load(6, 0, IrType::I32),
+                load(9, 4, IrType::Ptr),
+                store(9, Operand::Const(IrConst::I32(7)), IrType::I32),
+                load(3, 1, IrType::I32),
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
+        });
+        assert_eq!(run(&mut func), 0);
+        assert!(
+            func.blocks[0]
+                .instructions
+                .iter()
+                .any(|inst| matches!(inst, Instruction::Memcpy { .. }))
+        );
+    }
+
+    #[test]
     fn preserves_copy_when_source_write_uses_untracked_pointer_arithmetic() {
         let mut func = IrFunction::new("untracked_store".into(), IrType::I32, vec![], false);
         func.next_value_id = 4;
@@ -1337,7 +1946,7 @@ mod tests {
             source_spans: vec![],
         });
 
-        assert_eq!(forward_store_only_temporaries(&mut func), 0);
+        assert_eq!(forward_store_only_temporaries(&mut func, None), 0);
         assert!(
             func.blocks[0]
                 .instructions
@@ -1397,7 +2006,7 @@ mod tests {
             source_spans: vec![crate::common::source::Span::dummy()],
         });
 
-        assert_eq!(forward_store_only_temporaries(&mut func), 1);
+        assert_eq!(forward_store_only_temporaries(&mut func, None), 1);
         assert_eq!(func.blocks[0].instructions.len(), 5);
         assert_eq!(func.blocks[0].source_spans.len(), 1);
         assert!(matches!(
@@ -1616,7 +2225,7 @@ mod tests {
     fn forwards_reads_through_a_path_into_another_forwarded_temporary() {
         let (obj, tmp1, tmp1_hi, tmp2, slot, out, field, loaded) = (0, 1, 2, 3, 4, 7, 5, 6);
         let mut func = IrFunction::new("chain".into(), IrType::I32, vec![], false);
-        func.next_value_id = 8;
+        func.next_value_id = 9;
         func.blocks.push(BasicBlock {
             label: BlockId(0),
             instructions: vec![
@@ -1645,6 +2254,17 @@ mod tests {
                     dest: Value(tmp1),
                     src: Value(obj),
                     size: 32,
+                },
+                // Keep obj's storage identity observable so the reverse
+                // store-only pass cannot move its construction into tmp1.
+                // This fixture isolates MAIN read-path composition, not which
+                // valid allocation the reverse pass elects to construct in.
+                Instruction::Load {
+                    volatile: false,
+                    dest: Value(8),
+                    ptr: Value(obj),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
                 },
                 Instruction::GetElementPtr {
                     dest: Value(tmp1_hi),

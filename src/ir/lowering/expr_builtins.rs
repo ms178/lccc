@@ -93,6 +93,74 @@ impl Lowerer {
         Some(Operand::Value(result))
     }
 
+    /// Map `floor(float)` to `floorf(float)` without changing the type of the
+    /// source expression. Every float is exactly representable as a double;
+    /// below 2^24 its integral result is in float's exact integer range, and
+    /// at or above 2^24 the input is already integral. Infinities, NaNs and
+    /// signed zero have the same operation at either width. The explicit
+    /// widening cast preserves the source expression's double type, after
+    /// which ordinary cast cleanup can cancel a surrounding float conversion.
+    ///
+    /// The explicit `__builtin_floor` spelling remains a library operation
+    /// even under `-fno-builtin`; for the plain spelling the caller has
+    /// already applied the command-line policy. In contrast, a
+    /// `-fno-builtin-floorf` withdrawal does NOT prohibit this replacement:
+    /// it is the enabled `floor` builtin whose contraction GCC and Clang
+    /// specify, not an independent assumption about a `floorf` call site.
+    fn try_lower_float_floor_builtin(&mut self, name: &str, args: &[Expr]) -> Option<Operand> {
+        let explicit_builtin = match name {
+            "floor" => false,
+            "__builtin_floor" => true,
+            _ => return None,
+        };
+        if args.len() != 1 {
+            return None;
+        }
+        // The explicit spelling `floor((double)x)` is the same widening when
+        // x is a float. Peel exactly that cast, never a general double
+        // argument (which could carry precision not representable as float).
+        let arg_expr = match &args[0] {
+            Expr::Cast(TypeSpecifier::Double, inner, ..)
+                if matches!(self.get_expr_ctype(inner), Some(CType::Float)) =>
+            {
+                inner.as_ref()
+            }
+            other => other,
+        };
+        if !matches!(self.get_expr_ctype(arg_expr), Some(CType::Float)) {
+            return None;
+        }
+
+        let arg = self.lower_expr_with_type(arg_expr, IrType::F32);
+        let narrowed = self.fresh_value();
+        self.emit(Instruction::Call {
+            func: "floorf".to_string(),
+            info: CallInfo {
+                dest: Some(narrowed),
+                args: vec![arg],
+                arg_types: vec![IrType::F32],
+                return_type: IrType::F32,
+                num_fixed_args: 1,
+                struct_arg_sizes: vec![None],
+                struct_arg_aligns: vec![None],
+                struct_arg_classes: vec![Vec::new()],
+                struct_arg_riscv_float_classes: vec![None],
+                struct_arg_is_f128_sse: vec![false],
+                assume_library: explicit_builtin,
+                ..CallInfo::default()
+            },
+        });
+
+        let widened = self.fresh_value();
+        self.emit(Instruction::Cast {
+            dest: widened,
+            src: Operand::Value(narrowed),
+            from_ty: IrType::F32,
+            to_ty: IrType::F64,
+        });
+        Some(Operand::Value(widened))
+    }
+
     /// Try to lower a __builtin_* call. Returns Some(result) if handled.
     pub(super) fn try_lower_builtin_call(&mut self, name: &str, args: &[Expr]) -> Option<Operand> {
         // -ffreestanding/-fno-builtin disables hosted-library aliases such as
@@ -117,6 +185,12 @@ impl Lowerer {
         // 20021127-1 defines `llabs` to abort() and requires the builtin.
         // This must run BEFORE the is_defined override below.
         if let Some(result) = self.try_lower_abs_builtin(name, args) {
+            return Some(result);
+        }
+
+        // Like abs/llabs, exact float narrowing precedes a later user
+        // definition. See the helper for the proof and withdrawal policy.
+        if let Some(result) = self.try_lower_float_floor_builtin(name, args) {
             return Some(result);
         }
 

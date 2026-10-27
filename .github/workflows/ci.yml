@@ -213,6 +213,7 @@ jobs:
         # compiler instead of a second, subtly different configuration.
         export RUSTFLAGS="$(cat target/lccc-rustflags)"
         python3 scripts/test_ci_oracle_diagnostics.py
+        python3 tests/regression/test_check_switch_cross_execute.py
         python3 scripts/ci_test_report.py --self-test
         python3 scripts/ci_test_report.py -- cargo test --profile fastbuild --all-targets --locked -j 2
         python3 tests/regression/check_avx512_scalar_witness.py --self-test
@@ -789,6 +790,12 @@ jobs:
     # lane-split: 1868 s). The preamble above is byte-identical in every
     # lane-split: shard; tests/regression/check_ci_lane_plan.py fails if a gate disappears,
     # lane-split: is duplicated, or a shard drifts from this record.
+    - name: Builtin floor float narrowing contracts
+      run: env CCC=target/fastbuild/lccc CCC_I686=target/fastbuild/lccc-i686 bash tests/regression/check_builtin_floor_narrowing.sh
+    - name: Store-forwarding DWORD self-reload contracts
+      run: env CCC=target/fastbuild/lccc CCC_I686=target/fastbuild/lccc-i686 bash tests/regression/check_store_forwarding_dword_reload.sh
+    - name: x86 execute regression fixes on both ABIs
+      run: env CCC=target/fastbuild/lccc CCC_I686=target/fastbuild/lccc-i686 bash tests/regression/check_x86_torture_execute_fixes.sh
     - name: Check FP-contraction parity with GCC
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_fp_contract_parity.sh
     - name: ext-vector swizzle diagnostics
@@ -1005,7 +1012,7 @@ jobs:
         python3 scripts/mutpair.py --self-test
         python3 scripts/slice_superopt.py --self-test
         python3 scripts/yarpgen_mutpair.py --self-test
-        python3 -m unittest scripts.test_mutpair scripts.test_slice_superopt scripts.test_yarpgen_mutpair
+        python3 -m unittest scripts.test_mutpair scripts.test_slice_superopt scripts.test_yarpgen_mutpair scripts.test_aarch64_execute_suite
     - name: SysV by-value aggregate and vector ABI against GCC 16
       run: |
         emitted=$(mktemp -d)
@@ -1709,6 +1716,8 @@ jobs:
         tar -xzf lccc-fast.tar.gz
         test "$(cat target/ci-build.commit)" = "$(git rev-parse HEAD)"
         sha256sum -c target/ci-build.sha256
+    - name: Execute switch contracts on AArch64 and RISC-V
+      run: python3 tests/regression/check_switch_cross_execute.py
     - name: Run destructive-path guard regression
       run: bash tests/regression/check_destructive_guards.sh
     - name: Verify basic-block SLP soundness contracts

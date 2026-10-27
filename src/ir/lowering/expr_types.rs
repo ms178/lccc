@@ -706,6 +706,12 @@ impl Lowerer {
             | BinOp::LogicalAnd
             | BinOp::LogicalOr => crate::common::types::target_int_ir_type(),
             BinOp::Shl | BinOp::Shr => {
+                // GNU vector shifts are element-wise when either operand is
+                // a vector.  A scalar lhs is splatted to the rhs vector type;
+                // the scalar-C "promoted lhs" rule applies only otherwise.
+                if self.get_expr_ctype(rhs).is_some_and(|ct| ct.is_vector()) {
+                    return self.get_expr_type(rhs);
+                }
                 let lty = self.get_expr_type(lhs);
                 promote_integer(lty)
             }
@@ -1372,8 +1378,14 @@ impl Lowerer {
             _ => {}
         }
 
-        // Shift operators: result type is the promoted type of the left operand
+        // GNU vector shifts produce the vector type even when its operand is
+        // on the right (`scalar << vector`); scalar shifts keep promoted-lhs.
         if matches!(op, BinOp::Shl | BinOp::Shr) {
+            if let Some(rct) = self.get_expr_ctype(rhs) {
+                if rct.is_vector() {
+                    return Some(rct);
+                }
+            }
             if let Some(lct) = self.get_expr_ctype(lhs) {
                 return Some(Self::integer_promote_ctype(&lct));
             }

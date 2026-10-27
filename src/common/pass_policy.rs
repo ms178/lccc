@@ -127,6 +127,17 @@ impl Default for BuiltinPolicy {
     }
 }
 
+/// GCC's fortified stdio builtins retain their builtin identity beside a
+/// translation-unit definition (the `*-chk-1.c` execution tests rely on it).
+/// They are nevertheless library entry points, not compiler-runtime helpers:
+/// `-fno-builtin` and a per-name withdrawal must still disable that identity.
+pub(crate) fn is_fortified_stdio_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "__printf_chk" | "__vprintf_chk" | "__fprintf_chk" | "__vfprintf_chk"
+    )
+}
+
 impl BuiltinPolicy {
     /// Every name is the library function (a hosted TU, no flags).
     pub const HOSTED: BuiltinPolicy = BuiltinPolicy {
@@ -164,7 +175,10 @@ impl BuiltinPolicy {
     pub fn may_assume(self, name: &str) -> bool {
         match Libcall::from_name(name) {
             Some(l) => self.may_assume_libcall(l),
-            None => !self.blanket_withdrawn || name.starts_with("__"),
+            None => {
+                !self.blanket_withdrawn
+                    || (name.starts_with("__") && !is_fortified_stdio_builtin(name))
+            }
         }
     }
 

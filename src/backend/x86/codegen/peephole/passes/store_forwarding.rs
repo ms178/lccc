@@ -614,7 +614,18 @@ fn gsf_handle_load(
             let is_epilogue_restore = matches!(load_reg, 3 | 12 | 13 | 14 | 15)
                 && load_offset < 0
                 && is_near_epilogue(infos, i);
-            if exact_width && load_reg == mapping.reg_id && !is_epilogue_restore {
+            if exact_width
+                && load_reg == mapping.reg_id
+                && !is_epilogue_restore
+                && (load_size != MoveSize::L || (mapping.zext && zext_nop_env))
+            {
+                // A full-width self-reload is a no-op, and a byte/word
+                // self-reload preserves every bit above its own width.  An
+                // L->L reload is different: the memory read also zeroes bits
+                // 32..63.  Delete that form only when the tracked register
+                // already has a zero upper half; otherwise the ordinary
+                // forward below rewrites it to `movl %r32, %r32`, retaining
+                // exactly that architectural side effect.
                 mark_nop(&mut infos[i]);
                 changed = true;
                 load_still_writes_reg = false;
@@ -2467,6 +2478,56 @@ mod tests {
             "the Q→L self-reload must be deleted by neither the zext nop \
              (upper half is the swapped-in memory bits) nor anything else"
         );
+    }
+
+    #[test]
+    fn dword_self_reload_keeps_live_upper_zeroing() {
+        // L->L is not the full-width identity case: although the low dword
+        // already matches, the reload clears the upper half of the register.
+        // This is the phase-1/phase-2 composition from gcc.c-torture
+        // pr39240.c: an earlier pass removes a now-redundant explicit zext,
+        // then store forwarding must not remove the reload that provides it.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movabsq $0xfedcba9876543210, %rax\n",
+            "    movl %eax, 32(%rsp)\n",
+            "    movq %rcx, %r10\n",
+            "    movl 32(%rsp), %eax\n",
+            "    movq %rax, 40(%rsp)\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (mut store, mut infos) = build_pinned(asm);
+        let reload = (0..store.len())
+            .find(|&i| store.get(i).contains("movl 32(%rsp), %eax"))
+            .expect("reload line index");
+        assert!(global_store_forwarding(&mut store, &mut infos));
+        assert!(!infos[reload].is_nop(), "upper-half zeroing is observable");
+        assert_eq!(infos[reload].trimmed(store.get(reload)), "movl %eax, %eax");
+    }
+
+    #[test]
+    fn dword_self_reload_is_elided_only_with_a_proven_zero_upper_half() {
+        // Keep the optimization for the genuinely redundant case.  The
+        // 32-bit immediate write proves bits 32..63 zero before the store,
+        // and no intervening write changes that fact.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movl $7, %eax\n",
+            "    movl %eax, 32(%rsp)\n",
+            "    movq %rcx, %r10\n",
+            "    movl 32(%rsp), %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (mut store, mut infos) = build_pinned(asm);
+        let reload = (0..store.len())
+            .find(|&i| store.get(i).contains("movl 32(%rsp), %eax"))
+            .expect("reload line index");
+        assert!(global_store_forwarding(&mut store, &mut infos));
+        assert!(infos[reload].is_nop(), "the reload is a true no-op");
     }
 
     #[test]

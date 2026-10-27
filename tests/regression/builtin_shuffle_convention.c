@@ -2,17 +2,19 @@
 //
 // pr94591 shape: shuffle with an identity mask through a vector-type cast
 // compound literal; pr85331 shape: shuffle with a constant reverse mask.
-// Covers the return-convention contract: <=8-byte vectors travel as packed
-// register values (the vector-assignment consumer spills them), >8-byte
-// vectors by memory (the result alloca pointer). A convention mismatch
-// corrupts the destination with the alloca's ADDRESS (amd64: si={ptr_lo,
-// ptr_hi}).
+// Covers the return-convention contract: on x86-64, <=8-byte vectors travel
+// as packed register values (the vector-assignment consumer spills them) and
+// >8-byte vectors by memory (the result alloca pointer). i686 uses the memory
+// convention for every vector, including V2SI. A convention mismatch corrupts
+// the destination or dereferences packed data as an alloca ADDRESS.
 extern void abort (void);
 
 typedef unsigned V2SI_u __attribute__((vector_size(8)));
 typedef int V2SI_d __attribute__((vector_size(8)));
-typedef unsigned long V2DI_u __attribute__((vector_size(16)));
-typedef long V2DI_d __attribute__((vector_size(16)));
+// long long keeps these two-lane 64-bit vectors on both x86 ABIs; long would
+// be only 32 bits (and therefore four lanes) in the i686 test.
+typedef unsigned long long V2DI_u __attribute__((vector_size(16)));
+typedef long long V2DI_d __attribute__((vector_size(16)));
 typedef double V2DF __attribute__((vector_size(16)));
 
 void
@@ -33,7 +35,7 @@ void
 rev_v2df (V2DF *r)
 {
   V2DF y = { 1.0, 2.0 };
-  V2DI_u m = { 1UL, 0UL };
+  V2DI_u m = { 1ULL, 0ULL };
   *r = __builtin_shuffle (y, (V2DI_d) m);
 }
 
