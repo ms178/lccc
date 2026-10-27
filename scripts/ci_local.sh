@@ -1156,7 +1156,7 @@ gate "addr-value-fuzz-smoke" fast \
 # / known-equivalent near-miss pairs in one TU, plus the harness's own
 # negative control (a fake optimiser must be caught) in the unit tests.
 gate "mutpair-harness-tests" fast \
-    sh -c 'python3 scripts/mutpair.py --self-test && python3 -m unittest scripts.test_mutpair -v'
+    sh -c 'python3 scripts/mutpair.py --self-test && python3 -m unittest scripts.test_mutpair scripts.test_aarch64_execute_suite -v'
 
 gate "mutpair-differential-smoke" fast \
     python3 scripts/fuzz_diff.py --engine mutpair --count 4 \
