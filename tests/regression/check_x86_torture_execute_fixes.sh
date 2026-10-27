@@ -18,6 +18,7 @@ tests=(
     builtin_shuffle_convention
     overflow_mul_narrow_result
     noinline_prototype_attribute
+    noinline_comma_attribute
 )
 for arch in x86-64 i686; do
     cc=$CCC
@@ -30,4 +31,17 @@ for arch in x86-64 i686; do
         done
         echo "PASS $arch $test (-O0/-O1/-O2/-O3/-Os)"
     done
+done
+
+# Runtime equality cannot establish the noinline property. Pin the call in
+# each optimized caller, separately from the parser's declarator matrix.
+for cc in "$CCC" "$CCC_I686"; do
+    "$cc" -O2 -S "$root/tests/regression/noinline_comma_attribute.c" -o "$work/noinline.s"
+    awk '/^caller:/ { inside=1 } inside { print } /^\.size[[:space:]]+caller,/ { inside=0 }' \
+        "$work/noinline.s" > "$work/caller.s"
+    grep -Eq '(call|jmp)(q|l)?[[:space:]]+kept(@PLT)?([[:space:]]|$)' "$work/caller.s" || {
+        echo "FAIL: comma-declared noinline function was inlined by $cc" >&2
+        cat "$work/caller.s" >&2
+        exit 1
+    }
 done

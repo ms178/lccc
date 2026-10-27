@@ -36,6 +36,7 @@ struct DeclContext {
     /// after a declarator (see `parse_external_decl`).
     spec_visibility: Option<String>,
     spec_tls_model: Option<crate::common::tls::TlsModel>,
+    spec_noinline: bool,
 }
 
 /// Parser-side mirror of `common::type_builder::apply_declaration_address_space`
@@ -168,6 +169,7 @@ impl Parser {
         // first declarator's own attributes are merged in and taken.
         let spec_visibility = self.attrs.parsing_visibility.clone();
         let spec_tls_model = self.attrs.parsing_tls_model;
+        let spec_noinline = self.attrs.parsing_noinline();
 
         // Bare type with no declarator (e.g., struct definition)
         if self.at_eof() || matches!(self.peek(), TokenKind::Semicolon) {
@@ -340,13 +342,7 @@ impl Parser {
         // `noinline` is a function property, not a one-declaration parsing
         // hint.  Preserve it from a prior prototype through a later bare
         // definition just like no_instrument_function above.
-        if is_noinline {
-            if let Some(n) = &name {
-                if matches!(derived.last(), Some(DerivedDeclarator::Function(..))) {
-                    self.func_decl_noinline.insert(n.clone());
-                }
-            }
-        }
+        self.record_function_noinline(name.as_deref(), &derived, is_noinline);
 
         if is_funcdef {
             self.parse_function_def(
@@ -366,8 +362,24 @@ impl Parser {
                 is_common,
                 spec_visibility,
                 spec_tls_model,
+                spec_noinline,
             };
             self.parse_declaration_rest(type_spec, name, derived, start, ctx)
+        }
+    }
+
+    /// Record a property of a function entity, not a pointer object. Call this
+    /// for every declarator, after its own trailing attributes are consumed.
+    fn record_function_noinline(
+        &mut self,
+        name: Option<&str>,
+        derived: &[DerivedDeclarator],
+        noinline: bool,
+    ) {
+        if noinline && matches!(derived.last(), Some(DerivedDeclarator::Function(..))) {
+            if let Some(name) = name {
+                self.func_decl_noinline.insert(name.to_owned());
+            }
         }
     }
 
@@ -890,6 +902,13 @@ impl Parser {
         if self.attrs.parsing_error_attr() {
             last_decl.attrs.set_error_attr(true);
         }
+        self.record_function_noinline(
+            Some(&last_decl.name),
+            &last_decl.derived,
+            self.attrs.parsing_noinline(),
+        );
+        self.attrs.set_noinline(false);
+
         if nested_fn_decl_level {
             for d in &mut declarators {
                 d.attrs.set_nested_fn(true);
@@ -926,6 +945,9 @@ impl Parser {
 
         // Parse additional declarators separated by commas
         while self.consume_if(&TokenKind::Comma) {
+            // Specifier attributes apply to every sibling; attributes attached
+            // to one declarator must not leak to the next one.
+            self.attrs.set_noinline(ctx.spec_noinline);
             let (dname, dderived) = self.parse_declarator();
             let d_object_space = self.attrs.declarator_object_space;
             let d_object_volatile = self.attrs.declarator_object_volatile;
@@ -1024,6 +1046,12 @@ impl Parser {
             if let Some(a) = skip_aligned {
                 ctx.alignment = Some(ctx.alignment.map_or(a, |prev| prev.max(a)));
             }
+            self.record_function_noinline(
+                Some(&last_decl.name),
+                &last_decl.derived,
+                self.attrs.parsing_noinline(),
+            );
+            self.attrs.set_noinline(false);
         }
 
         // Register typedef names
@@ -1965,5 +1993,58 @@ mod seg_placement_tests {
         let before = format!("{t:?}");
         apply_decl_address_space_to_spec(&mut t, AddressSpace::Default);
         assert_eq!(format!("{t:?}"), before);
+    }
+}
+
+#[cfg(test)]
+mod noinline_declaration_tests {
+    use super::*;
+    use crate::frontend::lexer::Lexer;
+
+    #[test]
+    fn noinline_merges_each_function_declarator_without_leaking() {
+        for (prototype, expected) in [
+            (
+                "int f(void) __attribute__((noinline)); int g(void);",
+                [true, false],
+            ),
+            (
+                "int g(void), f(void) __attribute__((noinline));",
+                [true, false],
+            ),
+            (
+                "int f(void) __attribute__((noinline)), g(void);",
+                [true, false],
+            ),
+            (
+                "__attribute__((noinline)) int f(void), g(void);",
+                [true, true],
+            ),
+            (
+                "int f(void); int f(void) __attribute__((noinline)); int f(void);",
+                [true, false],
+            ),
+            ("int (*p)(void) __attribute__((noinline));", [false, false]),
+            (
+                "int (*f(void))(void) __attribute__((noinline));",
+                [true, false],
+            ),
+        ] {
+            let source =
+                format!("{prototype} int f(void) {{ return 1; }} int g(void) {{ return 2; }}");
+            let mut parser = Parser::new(Lexer::new(&source, 0).tokenize());
+            let tu = parser.parse();
+            assert_eq!(parser.error_count, 0, "{source}");
+            let actual: Vec<_> = tu
+                .decls
+                .iter()
+                .filter_map(|d| match d {
+                    ExternalDecl::FunctionDef(f) => Some(f.attrs.is_noinline()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(actual, expected, "{source}");
+            assert!(!parser.func_decl_noinline.contains("p"));
+        }
     }
 }
