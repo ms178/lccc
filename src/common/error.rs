@@ -176,7 +176,7 @@ impl WarningKind {
     /// The kinds GCC 16.2 makes default *errors* in every dialect from C99
     /// onward (measured: `-std=gnu17` and `-std=gnu23` reject with exit 1,
     /// `-std=gnu90` only warns with exit 0). The driver seeds these into
-    /// [`WarningConfig::errors`] after CLI parsing unless the user demoted
+    /// [`WarningConfig::default_errors`] after CLI parsing unless the user demoted
     /// them explicitly (`-Wno-error=<name>` wins; a disabled warning is
     /// suppressed before severity is consulted).
     pub fn gcc162_c99_default_error_kinds() -> &'static [WarningKind] {
@@ -377,7 +377,8 @@ impl WarningConfig {
 
     /// Check if a warning of the given kind should be emitted at all.
     pub fn is_enabled(&self, kind: WarningKind) -> bool {
-        !self.inhibit_all && self.enabled.contains(&kind)
+        self.enabled.contains(&kind)
+            && (!self.inhibit_all || (self.default_errors.contains(&kind) && self.is_error(kind)))
     }
 
     /// Check if a warning of the given kind should be promoted to an error.

@@ -528,7 +528,9 @@ impl SemanticAnalyzer {
                 // closest to the name (`int *const p`); without a star the
                 // declaration's own `const` decides (`const int x`,
                 // `const P q`).
-                let top_const = if param.pointer_depth > 0 {
+                let top_const = if param.decayed_array {
+                    false
+                } else if param.pointer_depth > 0 {
                     param.pointer_const
                 } else {
                     param.is_const
@@ -639,7 +641,9 @@ impl SemanticAnalyzer {
                 // closest to the name (`int *const p`); without a star the
                 // declaration's own `const` decides (`const int x`,
                 // `const P q`).
-                let top_const = if param.pointer_depth > 0 {
+                let top_const = if param.decayed_array {
+                    false
+                } else if param.pointer_depth > 0 {
                     param.pointer_const
                 } else {
                     param.is_const
@@ -2389,9 +2393,10 @@ impl SemanticAnalyzer {
                         let expr_is_void =
                             matches!(checker.infer_expr_ctype(expr), Some(CType::Void) | None);
                         if !expr_is_void {
-                            self.diagnostics.borrow_mut().warning(
+                            self.diagnostics.borrow_mut().warning_with_kind(
                                 "'return' with a value, in function returning void",
-                                *span,
+                                expr.span(),
+                                crate::common::error::WarningKind::ReturnMismatch,
                             );
                         }
                     } else {
@@ -2428,7 +2433,7 @@ impl SemanticAnalyzer {
                     .is_some_and(|t| !matches!(t, CType::Void))
                 {
                     self.diagnostics.borrow_mut().warning_with_kind(
-                        "return with no value, in function returning non-void",
+                        "'return' with no value, in function returning non-void",
                         *span,
                         crate::common::error::WarningKind::ReturnMismatch,
                     );
@@ -4175,38 +4180,52 @@ impl SemanticAnalyzer {
         // passing, `return`) is `-Wint-conversion`, a default error from
         // C99 on and a warning in gnu90 (measured). Explicit casts take a
         // different path and never reach this implicit conversion.
-        if from_ty.is_integer() && matches!(to, CType::Pointer(..)) {
-            let tc = self.expr_type_checker();
-            if !tc.is_null_pointer_constant(from) {
-                let context = match ctx {
-                    IConvContext::Initialization => {
-                        format!("initialization of '{to}' from '{from_ty}'")
+        let integer_to_pointer = from_ty.is_integer()
+            && matches!(to, CType::Pointer(..))
+            && !self.expr_type_checker().is_null_pointer_constant(from);
+        let pointer_to_integer = to.is_integer()
+            && !matches!(to, CType::Bool)
+            && matches!(
+                from_ty,
+                CType::Pointer(..) | CType::Array(..) | CType::Function(..)
+            );
+        if integer_to_pointer || pointer_to_integer {
+            let context = match ctx {
+                IConvContext::Initialization => {
+                    format!("initialization of '{to}' from '{from_ty}'")
+                }
+                IConvContext::Assignment => {
+                    format!("assignment to '{to}' from '{from_ty}'")
+                }
+                IConvContext::Returning => {
+                    format!("returning '{from_ty}' from a function with return type '{to}'")
+                }
+                IConvContext::Argument { index, callee } => {
+                    format!("passing argument {} of '{}'", index + 1, callee)
+                }
+            };
+            // GCC's measured column policy: `return` points at the
+            // returned value, while initialization, assignment, and
+            // argument passing keep the surrounding conversion
+            // expression's span (which matches gcc's column in all
+            // three probe contexts).
+            let ic_span = match ctx {
+                IConvContext::Returning => from.span(),
+                _ => span,
+            };
+            self.diagnostics.borrow_mut().warning_with_kind(
+                format!(
+                    "{context} makes {} without a cast",
+                    if integer_to_pointer {
+                        "pointer from integer"
+                    } else {
+                        "integer from pointer"
                     }
-                    IConvContext::Assignment => {
-                        format!("assignment to '{to}' from '{from_ty}'")
-                    }
-                    IConvContext::Returning => {
-                        format!("returning '{from_ty}' from a function with return type '{to}'")
-                    }
-                    IConvContext::Argument { index, callee } => {
-                        format!("passing argument {} of '{}'", index + 1, callee)
-                    }
-                };
-                // GCC's measured column policy: `return` points at the
-                // returned value, while initialization, assignment, and
-                // argument passing keep the surrounding conversion
-                // expression's span (which matches gcc's column in all
-                // three probe contexts).
-                let ic_span = match ctx {
-                    IConvContext::Returning => from.span(),
-                    _ => span,
-                };
-                self.diagnostics.borrow_mut().warning_with_kind(
-                    format!("{context} makes pointer from integer without a cast"),
-                    ic_span,
-                    crate::common::error::WarningKind::IntConversion,
-                );
-            }
+                ),
+                ic_span,
+                crate::common::error::WarningKind::IntConversion,
+            );
+            return true;
         }
         // Pointer-shaped source against a pointer target with
         // incompatible pointees: C11 6.5.16.1 constraint, GCC
@@ -6697,18 +6716,18 @@ impl SemanticAnalyzer {
         };
         match (k, depth) {
             // `*root` of a one-star root: the base specifier IS the pointee.
-            (0, 1) | (1, 0) => {
+            (0, 1) | (0, 0) => {
                 if depth == 0 {
                     // `*a` of an array: the element, i.e. the array's own
                     // top-level const (`const int a[]`, `int *const ap[]`).
                     root_name.is_some_and(|name| self.symbol_table.is_top_const(name))
                 } else {
-                    root_name.is_some_and(|name| self.symbol_table.is_const_base(name))
+                    crate::common::qualifiers::expr_const_base(root, &tc)
                 }
             }
             // The chain consumes every star: the const is the base one.
-            (k, depth) if depth > 0 && k as u32 == depth => {
-                root_name.is_some_and(|name| self.symbol_table.is_const_base(name))
+            (k, depth) if depth > 0 && k + 1 == depth as usize => {
+                crate::common::qualifiers::expr_const_base(root, &tc)
             }
             // Middle-level const is unrecorded: do not guess (see above).
             _ => false,

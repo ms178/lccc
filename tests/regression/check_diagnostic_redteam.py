@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+"""Independent negative/positive diagnostic contracts, across target drivers.
+
+Expected severity and classification were probed against GCC 16.2.0. An exact
+oracle, when supplied, is checked too; timeouts and crashes are never rejections.
+"""
+import argparse
+import os
+from pathlib import Path
+import re
+import subprocess
+import tempfile
+
+# name, source, hard read-only error, warning class (None for legal controls).
+CASES = [
+    ('const_depth2', 'void f(const int **p){**p=1;}', True, None),
+    ('const_depth3', 'void f(const int ***p){***p=1;}', True, None),
+    ('const_array_deref', 'void f(void){const int a[1]={0};*a=1;}', True, None),
+    ('const_cast', 'void f(int *p){*(const int*)p=1;}', True, None),
+    ('mutable_middle', 'void f(const int **p){*p=0;(*p)++;}', False, None),
+    ('mutable_parameter_array', 'void f(const int p[1]){p=0;}', False, None),
+    ('const_parameter_element', 'void f(const int p[1]){p[0]=1;}', True, None),
+    ('pointer_bool', '_Bool f(int *p){return p;}', False, None),
+    ('integer_pointer_init', 'void f(void){int *p=1;(void)p;}', False, 'int-conversion'),
+    ('pointer_integer_init', 'void f(int *p){int x=p;(void)x;}', False, 'int-conversion'),
+    ('pointer_integer_assign', 'void f(int *p){int x;x=p;}', False, 'int-conversion'),
+    ('pointer_integer_return', 'int f(int *p){return p;}', False, 'int-conversion'),
+    ('pointer_integer_argument', 'void g(int);void f(int *p){g(p);}', False, 'int-conversion'),
+    ('void_return_value', 'void f(void){return 1;}', False, 'return-mismatch'),
+    ('missing_return_value', 'int f(void){return;}', False, 'return-mismatch'),
+    ('implicit_int', 'f(void){return 0;}', False, 'implicit-int'),
+]
+
+
+def run(cc, source, std, flags):
+    result = subprocess.run([cc, '-std=' + std, '-fsyntax-only', *flags, str(source)],
+                            capture_output=True, text=True, timeout=20)
+    if result.returncode not in (0, 1) or re.search(
+            r'panicked at|internal compiler error|unrecognized command-line', result.stderr):
+        raise AssertionError((cc, result.returncode, result.stderr))
+    return result
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--ccc', default=os.environ.get('CCC', 'target/fastbuild/lccc'))
+    parser.add_argument('--gcc', default=os.environ.get('GCC', 'gcc-16'))
+    args = parser.parse_args()
+    cc = str(Path(args.ccc).resolve())
+    oracle = None
+    try:
+        version = subprocess.check_output([args.gcc, '-dumpfullversion'], text=True).strip()
+        if version == '16.2.0':
+            oracle = args.gcc
+        else:
+            print(f'Exact GCC comparison unavailable: found {version}; static contracts still run')
+    except FileNotFoundError:
+        print('Exact GCC comparison unavailable; static contracts still run')
+    count = 0
+    with tempfile.TemporaryDirectory(prefix='diagnostic-redteam-') as tmp:
+        for name, source, hard, kind in CASES:
+            path = Path(tmp) / (name + '.c')
+            path.write_text(source)
+            for std in ('gnu90', 'gnu17', 'gnu23'):
+                options = [[], ['-w']]
+                if kind:
+                    options += [['-Wno-error=' + kind], ['-Wno-' + kind]]
+                for flags in options:
+                    enabled = bool(kind and '-Wno-' + kind not in flags)
+                    default_error = enabled and std != 'gnu90' and not any(
+                        flag.startswith('-Wno-error=') for flag in flags)
+                    expected = int(hard or default_error)
+                    result = run(cc, path, std, flags)
+                    assert result.returncode == expected, (name, std, flags, expected, result.stderr)
+                    if oracle:
+                        ref = run(oracle, path, std, flags)
+                        assert ref.returncode == expected, ('oracle drift', name, std, flags, ref.stderr)
+                    # Each kind-aware conversion is diagnosed once, not once in
+                    # the funnel and again in the old per-context checks.
+                    labels = re.findall(r'\[-W(?:error=)?' + str(kind) + r'\]', result.stderr) if kind else []
+                    warn_live = enabled and (std != 'gnu90' or kind == 'int-conversion')
+                    wanted_labels = int(warn_live and ('-w' not in flags or default_error))
+                    assert len(labels) == wanted_labels, (name, std, flags, labels, result.stderr)
+                    count += 1
+    print(f'PASS {count} diagnostic red-team contracts' + (' with exact GCC 16.2.0' if oracle else ''))
+
+
+if __name__ == '__main__':
+    main()
