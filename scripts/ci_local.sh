@@ -202,8 +202,16 @@ if [ ! -x "$LCCC" ]; then
     exit 1
 fi
 
-gate "driver-option-contract" fast \
-    env CCC="$LCCC" bash tests/regression/check_driver_option_contract.sh
+# The driver contract's 6,776-case -ftrapv matrix used to make one hosted
+# frontend shard ~19 minutes longer than its twin. Hosted CI runs the core
+# contract once and each ABI leg on a different shard; the local mirror keeps
+# the same three gates so a partial run cannot silently lose an ABI.
+gate "driver-option-contract-core" fast \
+    env CCC="$LCCC" bash tests/regression/check_driver_option_contract.sh --skip-trapv-matrix
+gate "trapv-boundary-matrix-m64" fast \
+    env CCC="$LCCC" bash tests/regression/check_trapv_boundary_matrix.sh --bits -m64
+gate "trapv-boundary-matrix-m32" fast \
+    env CCC="$LCCC" bash tests/regression/check_trapv_boundary_matrix.sh --bits -m32
 
 # Opt-in IPA-PTA/LRS must have a local mirror as well as the dedicated hosted
 # lane. Available pinned oracles are used; the dedicated lane additionally

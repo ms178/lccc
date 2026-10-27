@@ -67,3 +67,21 @@ The current Arena sandbox allowlist blocks that host, so the published payloads
 cannot yet be restored locally here. Publication/version guards ran on GitHub;
 that is not a claim of a successful local Rust/Clang installation. An environment
 that permits the official GitHub asset redirect can restore this same lock.
+
+## GitHub-only agent cache
+
+Arena-style agents often cannot reach the release-asset CDN, Debian mirrors,
+kernel.org or Arm's CDN.  `scripts/publish_agent_toolchain_cache.sh` therefore
+publishes an immutable orphan tag (default `harness-cache-5`) whose tree holds
+every current toolchain as `<name>.partNN` blobs.  The consumer,
+
+    python3 scripts/restore_agent_toolchain_cache.py --tag harness-cache-5 --prefix /path
+
+fetches that one ref from `origin`, reassembles the parts, verifies
+`MANIFEST.sha256` and the reviewed lock in `engineering/toolchains/`, extracts
+the toolchains, and writes `env.sh`.  The tag carries GCC 16.2.0, Clang 23.1.4,
+Rust 1.99.1, the 1.97.0 MSRV floor, mold 3.0.0, prebuilt Debian sid binutils
+2.47 binaries, QEMU user 11.1.2, kernel relocs v7.3, Arm A64 ISA XML 2026-09,
+the bookworm runtime debs, and the binutils 2.47 source tarball.  Publishing is
+opt-in via the `Publish GitHub-only agent toolchain cache` workflow; no ordinary
+PR check downloads these bytes.
