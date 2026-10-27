@@ -79,6 +79,53 @@ struct SwitchPlan {
     absorbed_sources: FxHashSet<BlockId>,
 }
 
+/// Definitions of ORIGINAL switch operands. Applying a plan appends new IR
+/// and edits terminators/phi inputs, but never rewrites an original Cast.
+/// Thus this small index remains valid for the entire fixed-point run. Track
+/// all definitions of each operand, including non-casts, and fail closed on
+/// multiply-defined values rather than guessing which cast reaches a switch.
+type CastSource = (Operand, IrType, IrType);
+struct SwitchDefinitions(FxHashMap<Value, Option<CastSource>>);
+
+impl SwitchDefinitions {
+    fn collect(func: &IrFunction) -> Self {
+        let mut definitions: FxHashMap<Value, Option<CastSource>> = FxHashMap::default();
+        for block in &func.blocks {
+            if let Terminator::Switch {
+                val: Operand::Value(value),
+                ..
+            } = block.terminator
+            {
+                definitions.insert(value, None);
+            }
+        }
+        if definitions.is_empty() {
+            return Self(definitions);
+        }
+        let mut seen = FxHashSet::default();
+        for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+            if let Some(dest) = inst.dest() {
+                if let Some(definition) = definitions.get_mut(&dest) {
+                    *definition = if seen.insert(dest) {
+                        match inst {
+                            Instruction::Cast {
+                                src,
+                                from_ty,
+                                to_ty,
+                                ..
+                            } => Some((*src, *from_ty, *to_ty)),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                }
+            }
+        }
+        Self(definitions)
+    }
+}
+
 /// Run the register bit-packed switch LUT pass across one function.
 pub(crate) fn run_function(func: &mut IrFunction, is_32bit: bool) -> usize {
     if func.blocks.len() < 4 {
@@ -87,9 +134,10 @@ pub(crate) fn run_function(func: &mut IrFunction, is_32bit: bool) -> usize {
     let word_bits: u64 = if is_32bit { 32 } else { 64 };
     let mut next_vid = func.max_value_id().saturating_add(1);
     let mut changes = 0usize;
+    let definitions = SwitchDefinitions::collect(func);
 
     loop {
-        let Some(plan) = find_next_plan(func, word_bits) else {
+        let Some(plan) = find_next_plan(func, word_bits, &definitions) else {
             break;
         };
         apply_plan(func, plan, is_32bit, &mut next_vid);
@@ -102,7 +150,13 @@ pub(crate) fn run_function(func: &mut IrFunction, is_32bit: bool) -> usize {
     changes
 }
 
-fn find_next_plan(func: &IrFunction, word_bits: u64) -> Option<SwitchPlan> {
+fn find_next_plan(
+    func: &IrFunction,
+    word_bits: u64,
+    definitions: &SwitchDefinitions,
+) -> Option<SwitchPlan> {
+    // Return paths can change after a plan; rebuild this memo each iteration.
+    let mut returns = FxHashMap::default();
     let mut label_to_idx: FxHashMap<BlockId, usize> =
         FxHashMap::with_capacity_and_hasher(func.blocks.len(), Default::default());
     for (idx, b) in func.blocks.iter().enumerate() {
@@ -167,6 +221,8 @@ fn find_next_plan(func: &IrFunction, word_bits: u64) -> Option<SwitchPlan> {
             word_bits,
             &label_to_idx,
             &pred_edges,
+            definitions,
+            &mut returns,
         ) {
             return Some(plan);
         }
@@ -186,6 +242,8 @@ fn analyze_switch(
     word_bits: u64,
     label_to_idx: &FxHashMap<BlockId, usize>,
     pred_edges: &FxHashMap<BlockId, usize>,
+    definitions: &SwitchDefinitions,
+    returns: &mut FxHashMap<BlockId, Option<i64>>,
 ) -> Option<SwitchPlan> {
     let mut norm_cases: Vec<(i64, BlockId)> = Vec::with_capacity(cases.len());
     for &(raw_c, target) in cases {
@@ -228,7 +286,7 @@ fn analyze_switch(
 
     // Try Subform A1 (DirectReturn) or Subform A2 (JoinPhi).
     let (sink, def_val, case_vals, absorbed_sources) = if let Some((ret_ty, dv, cvs)) =
-        try_collect_direct_returns(func, cases, default, label_to_idx)
+        try_collect_direct_returns(func, cases, default, label_to_idx, returns)
     {
         (
             SinkKind::DirectReturn { ret_ty },
@@ -265,7 +323,7 @@ fn analyze_switch(
 
     let encoding = choose_encoding(&table, def_val, word_bits)?;
     let narrow_val = if matches!(&encoding, LutEncoding::TwoVal { .. }) {
-        promoted_narrow_source(func, val, sw_ty, cases)
+        promoted_narrow_source(definitions, val, sw_ty, cases)
     } else {
         None
     };
@@ -300,7 +358,7 @@ fn const_to_i64_typed(c: &IrConst, ty: IrType) -> Option<i64> {
 }
 
 fn promoted_narrow_source(
-    func: &IrFunction,
+    definitions: &SwitchDefinitions,
     val: Operand,
     sw_ty: IrType,
     cases: &[(i64, BlockId)],
@@ -311,24 +369,14 @@ fn promoted_narrow_source(
     let Operand::Value(val) = val else {
         return None;
     };
-    let (src, from_ty) = func.blocks.iter().find_map(|block| {
-        block.instructions.iter().find_map(|inst| match inst {
-            Instruction::Cast {
-                dest,
-                src,
-                from_ty,
-                to_ty,
-            } if *dest == val
-                && *to_ty == sw_ty
-                && from_ty.is_integer()
-                && !from_ty.is_128bit()
-                && from_ty.size() < sw_ty.size() =>
-            {
-                Some((*src, *from_ty))
-            }
-            _ => None,
-        })
-    })?;
+    let (src, from_ty, to_ty) = definitions.0.get(&val).copied().flatten()?;
+    if to_ty != sw_ty
+        || !from_ty.is_integer()
+        || from_ty.is_128bit()
+        || from_ty.size() >= sw_ty.size()
+    {
+        return None;
+    }
     // A case outside the promoted source domain is unreachable in the
     // original switch, but could alias an in-range value after narrow
     // wraparound (for example `case 130` with an I8 source and `x == -126`).
@@ -356,27 +404,38 @@ fn const_return_from(
     start: BlockId,
     ret_ty: IrType,
     label_to_idx: &FxHashMap<BlockId, usize>,
+    memo: &mut FxHashMap<BlockId, Option<i64>>,
 ) -> Option<i64> {
-    // Canonicalized switches commonly share a return through empty forwarding
-    // blocks.  Following them is analysis-only: apply_plan leaves every old
-    // block in place, so shared predecessors need no exclusivity restriction.
-    // Bound the walk to reject a malformed/uncleaned branch cycle instead of
-    // looping forever.
+    // Memoize successes AND failures, including cycles. Inserting None while
+    // walking detects a back edge without recursion or another visited set.
+    // All queries in one analysis round use the same function return type.
+    let mut path = Vec::new();
     let mut label = start;
-    for _ in 0..=func.blocks.len() {
-        let block = &func.blocks[*label_to_idx.get(&label)?];
+    let result = loop {
+        if let Some(result) = memo.get(&label) {
+            break *result;
+        }
+        memo.insert(label, None);
+        path.push(label);
+        let Some(&index) = label_to_idx.get(&label) else {
+            break None;
+        };
+        let block = &func.blocks[index];
         if let Some(value) = block_const_return(block, ret_ty) {
-            return Some(value);
+            break Some(value);
         }
         if !block.instructions.is_empty() {
-            return None;
+            break None;
         }
         let Terminator::Branch(next) = block.terminator else {
-            return None;
+            break None;
         };
         label = next;
+    };
+    for label in path {
+        memo.insert(label, result);
     }
-    None
+    result
 }
 
 fn try_collect_direct_returns(
@@ -384,15 +443,16 @@ fn try_collect_direct_returns(
     cases: &[(i64, BlockId)],
     default: BlockId,
     label_to_idx: &FxHashMap<BlockId, usize>,
+    memo: &mut FxHashMap<BlockId, Option<i64>>,
 ) -> Option<(IrType, i64, Vec<i64>)> {
     let ret_ty = func.return_type;
     if !ret_ty.is_integer() || ret_ty.is_128bit() {
         return None;
     }
-    let def_val = const_return_from(func, default, ret_ty, label_to_idx)?;
+    let def_val = const_return_from(func, default, ret_ty, label_to_idx, memo)?;
     let mut vals = Vec::with_capacity(cases.len());
     for &(_, target) in cases {
-        vals.push(const_return_from(func, target, ret_ty, label_to_idx)?);
+        vals.push(const_return_from(func, target, ret_ty, label_to_idx, memo)?);
     }
     Some((ret_ty, def_val, vals))
 }
@@ -1215,6 +1275,117 @@ mod tests {
             *case = new_value;
         }
         func
+    }
+
+    #[test]
+    fn multiply_defined_switch_operand_cannot_recover_a_narrow_source() {
+        for noncast_first in [false, true] {
+            let mut func = promoted_forwarded_switch([10, 11, 12]);
+            let clobber = Instruction::Copy {
+                dest: Value(1),
+                src: Operand::Const(IrConst::I32(400)),
+            };
+            if noncast_first {
+                func.blocks[0].instructions.insert(0, clobber);
+            } else {
+                func.blocks[0].instructions.push(clobber);
+            }
+            let definitions = SwitchDefinitions::collect(&func);
+            assert!(
+                promoted_narrow_source(
+                    &definitions,
+                    Operand::Value(Value(1)),
+                    IrType::I32,
+                    &[(10, BlockId(1)), (11, BlockId(2)), (12, BlockId(3))],
+                )
+                .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn return_memo_handles_long_shared_paths_and_cycles_without_recursion() {
+        for cycle in [false, true] {
+            let mut func = IrFunction::new("long_chain".into(), IrType::I32, vec![], false);
+            for label in 0..10000 {
+                func.blocks
+                    .push(block(label, Terminator::Branch(BlockId(label + 1))));
+            }
+            func.blocks.push(block(
+                10000,
+                if cycle {
+                    Terminator::Branch(BlockId(0))
+                } else {
+                    Terminator::Return(Some(Operand::Const(IrConst::I32(7))))
+                },
+            ));
+            let labels = func
+                .blocks
+                .iter()
+                .enumerate()
+                .map(|(i, b)| (b.label, i))
+                .collect();
+            let mut memo = FxHashMap::default();
+            let expected = if cycle { None } else { Some(7) };
+            for label in 0..=10000 {
+                assert_eq!(
+                    const_return_from(&func, BlockId(label), IrType::I32, &labels, &mut memo),
+                    expected
+                );
+            }
+            assert_eq!(memo.len(), 10001);
+        }
+    }
+
+    #[test]
+    #[ignore = "timing witness; run explicitly with --ignored --nocapture"]
+    fn switch_definition_index_scaling_witness() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let mut func = IrFunction::new("many_switches".into(), IrType::I32, vec![], false);
+        for label in 0..2000 {
+            let value = Value(label + 2000);
+            let mut b = block(
+                label,
+                Terminator::Switch {
+                    val: Operand::Value(value),
+                    cases: vec![],
+                    default: BlockId(0),
+                    ty: IrType::I32,
+                },
+            );
+            b.instructions.push(Instruction::Cast {
+                dest: value,
+                src: Operand::Value(Value(label)),
+                from_ty: IrType::I8,
+                to_ty: IrType::I32,
+            });
+            func.blocks.push(b);
+        }
+        let start = Instant::now();
+        let mut old = Vec::new();
+        for value in 2000..4000 {
+            old.push(func.blocks.iter().flat_map(|b| &b.instructions).find_map(
+                |inst| match inst {
+                    Instruction::Cast {
+                        dest,
+                        src,
+                        from_ty,
+                        to_ty,
+                    } if dest.0 == black_box(value) => Some((*src, *from_ty, *to_ty)),
+                    _ => None,
+                },
+            ));
+        }
+        let scan = start.elapsed();
+        let start = Instant::now();
+        let definitions = SwitchDefinitions::collect(black_box(&func));
+        let indexed: Vec<_> = (2000..4000)
+            .map(|value| definitions.0[&Value(value)])
+            .collect();
+        let lookup = start.elapsed();
+        assert_eq!(old, indexed);
+        eprintln!("2000 definitions/queries: scan={scan:?}, collect+lookup={lookup:?}");
     }
 
     #[test]
