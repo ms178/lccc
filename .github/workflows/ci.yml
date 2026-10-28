@@ -1857,7 +1857,19 @@ jobs:
     # i386-cpuinfo.h, extend.texi), which the runner's binary oracle bundle does
     # not carry.  Wiring it would add a step that cannot run.
     - name: Verify the generated x86 arch table matches GCC 16.2
-      run: python3 scripts/gen_x86_arch_table.py --check
+      run: |
+        set -Eeuo pipefail
+        # Put the generator's own diagnosis into Checks.  A red X reading
+        # "drifted; regenerate it" is not actionable, and the run log is not
+        # always reachable from a review.  `%` is escaped first because
+        # workflow commands treat it as their own escape character.
+        if ! out=$(python3 scripts/gen_x86_arch_table.py --check 2>&1); then
+          printf '%s\n' "$out"
+          printf '::error title=x86 arch table check failed::%s\n' \
+            "$(printf '%s' "$out" | head -c 2000 | tr '\n' ' ' | sed 's/%/%25/g')"
+          exit 1
+        fi
+        printf '%s\n' "$out"
     - name: Verify x86 -march= predefined macros against GCC 16.2
       run: python3 scripts/check_x86_march_macros.py target/fastbuild/lccc gcc-16
     - name: Verify x86 -m ISA macros against GCC 16.2

@@ -146,10 +146,20 @@ fn thread_function(store: &mut LineStore, infos: &mut [LineInfo], lo: usize, hi:
     changed
 }
 
+/// The prefix that makes a `#` comment compiler-owned rather than a human's.
+///
+/// Spelled once because two things depend on the same text: the fixtures below,
+/// and the environment-knob census (`scripts/audit_census.py`), which counts
+/// every `LCCC_<NAME>` literal in `src/` as an env knob.  A fixture that spells
+/// a marker out in full therefore registers a knob that does not exist, in both
+/// `knob_literals` and `knobs_undocumented`.  The rule is a prefix match, so the
+/// prefix *is* the contract; naming it says so and keeps the fixtures honest.
+const COMPILER_MARKER: &str = "LCCC_";
+
 /// Human comments emit no bytes; assembler quarantine and compiler-owned
 /// markers stay opaque.
 fn inert_comment(s: &str) -> bool {
-    s.starts_with('#') && s != "#APP" && s != "#NO_APP" && !s.contains("LCCC_")
+    s.starts_with('#') && s != "#APP" && s != "#NO_APP" && !s.contains(COMPILER_MARKER)
 }
 
 /// Every `.LBBn` mentioned by a live line other than as its own definition,
@@ -329,12 +339,18 @@ mod tests {
             "jle .LBB3\nmovl $1, %eax\n.LBB3:\njmp .LBB2\n.LBB2:\nret",
             "jle .LBB3\nret\n.LBB3:\njmp .LBB2\n.LBB2:\nret\n.quad .LBB3",
             "jle .LBB3\nret # .LBB3\n.LBB3:\njmp .LBB2\n.LBB2:\nret",
-            "jle .LBB3\nret\n# LCCC_MARK\n.LBB3:\njmp .LBB2\n.LBB2:\nret",
             "jle .LBB3\nret\n.LBB3:\njmp .LBB2\n.LBB2:\nret\n.LBB3:",
         ] {
             let (_, out) = apply(keep, None);
             assert!(out.contains(".LBB3:"), "{keep}: {out}");
         }
+        // A compiler-owned marker keeps the relay too.  Built from the constant
+        // `inert_comment` matches, so this fixture cannot drift from the rule and
+        // contributes no `LCCC_<NAME>` literal for the knob census to count.
+        let marker = format!("# {COMPILER_MARKER}relay");
+        let marked = format!("jle .LBB3\nret\n{marker}\n.LBB3:\njmp .LBB2\n.LBB2:\nret");
+        let (_, out) = apply(&marked, None);
+        assert!(out.contains(".LBB3:"), "{marked}: {out}");
         let body = "jle .LBB3\nret\n.LBB3:\njmp .LBB2\n.LBB2:\nret";
         assert!(apply(body, Some(".LBB3:")).1.contains(".LBB3:"));
     }

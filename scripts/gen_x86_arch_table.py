@@ -23,6 +23,7 @@ Run without arguments to regenerate the file, or with ``--check`` to
 re-measure and reject drift. ``GCC`` selects the oracle (default
 ``gcc-16``); it must be GCC 16.2, the version the table records.
 """
+import difflib
 import os
 import re
 import shutil
@@ -34,6 +35,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = ROOT / 'src/backend/x86/arch_table.rs'
 GCC = os.environ.get('GCC', 'gcc-16')
+# How many diff lines `--check` prints before truncating: enough to name the
+# drifted rows, short enough to stay readable in a CI annotation.
+DIFF_LIMIT = 60
 EXPECTED_VERSION = '16.2.0'
 
 # `X86Feature` variant -> the GCC macro that announces it. CMOV has no
@@ -805,6 +809,37 @@ def rustfmt(text):
     return proc.stdout
 
 
+
+def check_committed(text, current, rel, fmt):
+    """`--check`: fail unless the committed table is what the oracle generates.
+
+    ``text`` is this run's regenerated table and ``current`` the committed file.
+    A byte difference is not necessarily drift: ``text`` went through *this*
+    run's rustfmt and the committed file through whichever stable the author
+    ran, so formatter churn alone can differ.  Both sides are therefore put
+    through ``fmt`` before being compared -- table drift still fails, and the
+    committed file's formatting stays owned by `cargo fmt --check`, which CI
+    runs separately.  On drift the unified diff is printed (truncated to
+    ``DIFF_LIMIT`` lines) because "regenerate it" without the offending rows is
+    not actionable from a red check.
+    """
+    if current == text:
+        print(f'PASS: {rel} matches {GCC} ({len(text.splitlines())} lines)')
+        return
+    normalised = fmt(current) if current else ''
+    if normalised == text:
+        print(f'PASS: {rel} matches {GCC} ({len(text.splitlines())} lines; '
+              'committed copy is stale under this rustfmt, run `cargo fmt`)')
+        return
+    diff = list(difflib.unified_diff(
+        normalised.splitlines(), text.splitlines(),
+        fromfile=f'{rel} (committed)', tofile=f'{rel} (regenerated from {GCC})',
+        lineterm=''))
+    shown = '\n'.join(diff[:DIFF_LIMIT])
+    more = f'\n... {len(diff) - DIFF_LIMIT} more diff lines' if len(diff) > DIFF_LIMIT else ''
+    sys.exit(f'{rel} drifted from {GCC}; regenerate it\n{shown}{more}')
+
+
 def main(argv):
     if argv not in ([], ['--check']):
         sys.exit('usage: gen_x86_arch_table.py [--check]')
@@ -818,10 +853,8 @@ def main(argv):
         render(rows, options, measure_implied(options), measure_extra_requires(), derived, tunes)
     )
     if argv == ['--check']:
-        current = OUTPUT.read_text() if OUTPUT.exists() else ''
-        if current != text:
-            sys.exit(f'{OUTPUT.relative_to(ROOT)} drifted from {GCC}; regenerate it')
-        print(f'PASS: {OUTPUT.relative_to(ROOT)} matches {GCC} ({len(text.splitlines())} lines)')
+        check_committed(text, OUTPUT.read_text() if OUTPUT.exists() else '',
+                        str(OUTPUT.relative_to(ROOT)), rustfmt)
         return
     OUTPUT.write_text(text)
     print(f'wrote {OUTPUT.relative_to(ROOT)}')
