@@ -7,9 +7,19 @@ use crate::backend::elf::{STB_LOCAL, STV_DEFAULT};
 use crate::common::fx_hash::FxHashMap;
 
 use super::elf::*;
-use super::reloc;
+use super::reloc::{
+    R_AARCH64_TLSDESC_ADR_PAGE21, R_AARCH64_TLSDESC_CALL, R_AARCH64_TLSDESC_LD64_LO12,
+    R_AARCH64_TLSGD_ADR_PAGE21, R_AARCH64_TLSIE_ADR_GOTTPREL_PAGE21,
+    R_AARCH64_TLSIE_LD64_GOTTPREL_LO12_NC,
+};
+use super::tls_got::{
+    R_AARCH64_TLS_DTPMOD64, R_AARCH64_TLS_DTPREL64, R_AARCH64_TLS_TPREL64, R_AARCH64_TLSDESC,
+    TlsGot, TlsKind,
+};
 use super::types::{EhFrameHdr, GlobalSymbol, PAGE_SIZE, init_fini_entries};
+use super::{debug, reloc};
 use crate::backend::linker_common;
+use crate::backend::linker_common::shdr;
 use linker_common::{DynStrTab, OutputSection};
 
 /// Emit a shared library (.so) ELF file for AArch64.
@@ -23,6 +33,7 @@ pub(super) fn emit_shared_library(
     soname: Option<String>,
     rpath: Option<&(i64, String)>,
     pending_defsyms: &[(String, String, usize)],
+    strip_all: bool,
 ) -> Result<(), String> {
     let base_addr: u64 = 0;
     // Binding constraints come from the gABI-merged visibility on each
@@ -149,6 +160,17 @@ pub(super) fn emit_shared_library(
                             sym.is_undefined() && !sym.is_local()
                         };
                         if sym_needs_got && !dyn_sym_names.contains(&sym.name.to_string()) {
+                            dyn_sym_names.push(sym.name.to_string());
+                        }
+                    }
+                    // A TLS variable of another module.
+                    t if TlsKind::of(t).is_some() && !sym.is_local() => {
+                        let undefined = globals
+                            .get(sym.name.as_str())
+                            .map_or(sym.is_undefined(), |g| {
+                                g.is_dynamic || g.defined_in.is_none()
+                            });
+                        if undefined && !dyn_sym_names.contains(&sym.name.to_string()) {
                             dyn_sym_names.push(sym.name.to_string());
                         }
                     }
@@ -458,6 +480,8 @@ pub(super) fn emit_shared_library(
     let rela_dyn_offset = offset;
     let rela_dyn_addr = base_addr + offset;
     let mut max_rela_count: usize = 0;
+    let tls_got = TlsGot::collect(objects, globals);
+    max_rela_count += tls_got.dynamic_reloc_count();
     // Count ABS64 relocations (become RELATIVE)
     for obj in objects.iter() {
         for sec_relas in &obj.relocations {
@@ -586,7 +610,9 @@ pub(super) fn emit_shared_library(
             }
         }
     }
-    let got_size = got_needed.len() as u64 * 8;
+    // The TLS slots (`tls_got.rs`) follow the address slots in `.got`.
+    let tls_got_base = got_needed.len() as u64 * 8;
+    let got_size = tls_got_base + tls_got.size;
     offset += got_size;
 
     // GOT.PLT for PLT symbols — covered by RELRO: this emitter always runs
@@ -785,43 +811,9 @@ pub(super) fn emit_shared_library(
     // Save RW segment file size before appending section headers
     let rw_end_offset = offset;
 
-    // Section headers: null, .dynsym, .dynstr, .gnu.hash, .dynamic, .rela.dyn, .shstrtab
-    // Build .shstrtab
-    let mut shstrtab_data: Vec<u8> = vec![0]; // null byte at offset 0
-    let shname_dynsym = shstrtab_data.len() as u32;
-    shstrtab_data.extend_from_slice(b".dynsym\0");
-    let shname_dynstr = shstrtab_data.len() as u32;
-    shstrtab_data.extend_from_slice(b".dynstr\0");
-    let shname_gnu_hash = shstrtab_data.len() as u32;
-    shstrtab_data.extend_from_slice(b".gnu.hash\0");
-    let shname_dynamic = shstrtab_data.len() as u32;
-    shstrtab_data.extend_from_slice(b".dynamic\0");
-    let shname_rela_dyn = shstrtab_data.len() as u32;
-    shstrtab_data.extend_from_slice(b".rela.dyn\0");
-    let shname_interp: u32;
-    if is_exec_dyn {
-        shname_interp = shstrtab_data.len() as u32;
-        shstrtab_data.extend_from_slice(b".interp\0");
-    } else {
-        shname_interp = 0;
-    }
-    let shname_shstrtab = shstrtab_data.len() as u32;
-    shstrtab_data.extend_from_slice(b".shstrtab\0");
-
-    // Append .shstrtab data and section headers after file content
-    offset = (offset + 7) & !7;
-    let shstrtab_offset = offset;
-    let shstrtab_size = shstrtab_data.len() as u64;
-    offset += shstrtab_size;
-    offset = (offset + 7) & !7;
-    let shdr_offset = offset;
-    let sh_count: u16 = if is_exec_dyn {
-        8 // + .interp
-    } else {
-        7 // null + .dynsym + .dynstr + .gnu.hash + .dynamic + .rela.dyn + .shstrtab
-    };
-    let shdr_total = sh_count as u64 * 64;
-    offset += shdr_total;
+    // Debug sections follow the load image in the file, unmapped; the
+    // section-header table is appended once the image is complete.
+    offset = linker_common::place_debug_sections(output_sections, offset);
 
     // Build output buffer
     let file_size = offset as usize;
@@ -841,14 +833,14 @@ pub(super) fn emit_shared_library(
     let e_entry = globals.get("_start").map(|g| g.value).unwrap_or(0);
     w64(&mut out, 24, e_entry);
     w64(&mut out, 32, 64); // e_phoff
-    w64(&mut out, 40, shdr_offset); // e_shoff
+    w64(&mut out, 40, 0); // e_shoff: set by append_section_headers
     w32(&mut out, 48, 0);
     w16(&mut out, 52, 64);
     w16(&mut out, 54, 56);
     w16(&mut out, 56, phdr_count as u16);
     w16(&mut out, 58, 64); // e_shentsize
-    w16(&mut out, 60, sh_count); // e_shnum
-    w16(&mut out, 62, sh_count - 1); // e_shstrndx (last section)
+    w16(&mut out, 60, 0); // e_shnum
+    w16(&mut out, 62, 0); // e_shstrndx
 
     // Program headers
     let mut ph = 64usize;
@@ -1042,6 +1034,9 @@ pub(super) fn emit_shared_library(
 
     // .dynsym
     let import_has_strong_ref = linker_common::import_strong_refs(objects);
+    // Defined entries whose `st_shndx` names a section header, resolved
+    // once the header table exists: (entry, address, TLS).
+    let mut dynsym_sections: Vec<(usize, u64, bool)> = Vec::new();
     let mut ds = dynsym_offset as usize + 24;
     for name in &dyn_sym_names {
         let no = dynstr.get_offset(name) as u32;
@@ -1057,16 +1052,22 @@ pub(super) fn emit_shared_library(
                     out[ds + 5] = gsym.visibility & 0x3;
                 }
                 // Absolute symbols (`--defsym k=77`) carry SHN_ABS so the
-                // loader uses the value verbatim; section-defined symbols use
-                // section 1 (the first section of this link) as in the
-                // i686 shared emitter.
-                let shndx = if gsym.section_idx == SHN_ABS {
-                    SHN_ABS
+                // loader uses the value verbatim; a section-defined one names
+                // its section header (below). A TLS symbol's value is its
+                // offset in the TLS template (gABI): the loader adds the
+                // module's TLS block offset to it.
+                let tls = gsym.info & 0xf == STT_TLS;
+                if gsym.section_idx == SHN_ABS {
+                    w16(&mut out, ds + 6, SHN_ABS);
                 } else {
-                    1
+                    dynsym_sections.push((ds, gsym.value, tls));
+                }
+                let value = if tls {
+                    gsym.value.wrapping_sub(tls_addr)
+                } else {
+                    gsym.value
                 };
-                w16(&mut out, ds + 6, shndx);
-                w64(&mut out, ds + 8, gsym.value);
+                w64(&mut out, ds + 8, value);
                 w64(&mut out, ds + 16, gsym.size);
             } else {
                 // Import: WEAK iff every reference is weak (see
@@ -1183,6 +1184,51 @@ pub(super) fn emit_shared_library(
         }
     }
 
+    for slot in &tls_got.slots {
+        let at = got_addr + tls_got_base + slot.offset;
+        let sym = &objects[slot.obj_idx].symbols[slot.sym_idx];
+        let template_off = || {
+            reloc::resolve_sym(
+                slot.obj_idx,
+                sym,
+                &globals_snap,
+                section_map,
+                output_sections,
+            )
+            .wrapping_sub(tls_addr)
+        };
+        let si = if slot.preemptible {
+            dyn_sym_names
+                .iter()
+                .position(|n| n == sym.name.as_str())
+                .map(|p| p as u64 + 1)
+                .ok_or_else(|| format!("missing dynamic symbol for AArch64 TLS '{}'", sym.name))?
+                << 32
+        } else {
+            0
+        };
+        match slot.kind {
+            TlsKind::Ie | TlsKind::Desc => {
+                let r_type = if slot.kind == TlsKind::Ie {
+                    R_AARCH64_TLS_TPREL64
+                } else {
+                    R_AARCH64_TLSDESC
+                };
+                let addend = if slot.preemptible { 0 } else { template_off() };
+                rela_dyn_entries.push((at, si | r_type, addend));
+            }
+            TlsKind::Gd => {
+                rela_dyn_entries.push((at, si | R_AARCH64_TLS_DTPMOD64, 0));
+                if slot.preemptible {
+                    rela_dyn_entries.push((at + 8, si | R_AARCH64_TLS_DTPREL64, 0));
+                } else {
+                    let word = (got_offset + tls_got_base + slot.offset + 8) as usize;
+                    w64(&mut out, word, template_off());
+                }
+            }
+        }
+    }
+
     for obj_idx in 0..objects.len() {
         for sec_idx in 0..objects[obj_idx].sections.len() {
             let relas = &objects[obj_idx].relocations[sec_idx];
@@ -1193,6 +1239,10 @@ pub(super) fn emit_shared_library(
                 Some(&v) => v,
                 None => continue,
             };
+            // Unloaded (debug) sections resolve statically in `debug.rs`.
+            if output_sections[out_idx].flags & SHF_ALLOC == 0 {
+                continue;
+            }
             let sa = output_sections[out_idx].addr;
             let sfo = output_sections[out_idx].file_offset;
 
@@ -1453,6 +1503,36 @@ pub(super) fn emit_shared_library(
                         let sa_val = (s as i64).wrapping_add(a) as u64;
                         reloc::encode_movw(&mut out, fp, ((sa_val >> 48) & 0xffff) as u32);
                     }
+                    t if TlsKind::of(t).is_some() => {
+                        let slot = TlsKind::of(t)
+                            .and_then(|kind| tls_got.slot(&reloc::got_key(obj_idx, sym), kind))
+                            .ok_or_else(|| format!("no AArch64 TLS GOT slot for '{}'", sym.name))?;
+                        let at = got_addr + tls_got_base + slot.offset;
+                        match t {
+                            R_AARCH64_TLSDESC_ADR_PAGE21
+                            | R_AARCH64_TLSGD_ADR_PAGE21
+                            | R_AARCH64_TLSIE_ADR_GOTTPREL_PAGE21 => {
+                                let imm =
+                                    ((at & !0xFFF) as i64).wrapping_sub((p & !0xFFF) as i64) >> 12;
+                                reloc::encode_adrp(&mut out, fp, imm)?;
+                            }
+                            R_AARCH64_TLSDESC_LD64_LO12 | R_AARCH64_TLSIE_LD64_GOTTPREL_LO12_NC => {
+                                reloc::encode_ldst_imm12(&mut out, fp, (at & 0xFFF) as u32, 3);
+                            }
+                            _ => reloc::encode_add_imm12(&mut out, fp, (at & 0xFFF) as u32),
+                        }
+                    }
+                    // The descriptor call stays: the loader fills the slot.
+                    R_AARCH64_TLSDESC_CALL => {}
+                    // R_AARCH64_TLSLE_*: a TP offset is unknown in a shared
+                    // object (GNU ld refuses them too).
+                    544..=551 => {
+                        return Err(format!(
+                            "local-exec TLS relocation against '{}' cannot be used in a shared \
+                             object; recompile with -fPIC",
+                            sym.name
+                        ));
+                    }
                     R_AARCH64_NONE => {}
                     other => {
                         return Err(format!(
@@ -1634,90 +1714,58 @@ pub(super) fn emit_shared_library(
     w64(&mut out, dd, DT_NULL as u64);
     w64(&mut out, dd + 8, 0);
 
-    // Write .shstrtab
-    write_bytes(&mut out, shstrtab_offset as usize, &shstrtab_data);
-
-    // Write section headers (64 bytes each for ELF64)
-    // Helper to write one section header
-    let mut sh = shdr_offset as usize;
-    // [0] SHT_NULL
-    // (already zeroed)
-    sh += 64;
-    // [1] .dynsym (SHT_DYNSYM = 11)
-    w32(&mut out, sh, shname_dynsym);
-    w32(&mut out, sh + 4, 11); // SHT_DYNSYM
-    w64(&mut out, sh + 8, 0x2); // SHF_ALLOC
-    w64(&mut out, sh + 16, dynsym_addr); // sh_addr
-    w64(&mut out, sh + 24, dynsym_offset); // sh_offset
-    w64(&mut out, sh + 32, dynsym_size); // sh_size
-    w32(&mut out, sh + 40, 2); // sh_link = .dynstr index
-    w32(&mut out, sh + 44, 1); // sh_info = 1 (one local sym: null)
-    w64(&mut out, sh + 48, 8); // sh_addralign
-    w64(&mut out, sh + 56, 24); // sh_entsize
-    sh += 64;
-    // [2] .dynstr (SHT_STRTAB = 3)
-    w32(&mut out, sh, shname_dynstr);
-    w32(&mut out, sh + 4, 3); // SHT_STRTAB
-    w64(&mut out, sh + 8, 0x2); // SHF_ALLOC
-    w64(&mut out, sh + 16, dynstr_addr);
-    w64(&mut out, sh + 24, dynstr_offset);
-    w64(&mut out, sh + 32, dynstr_size);
-    w64(&mut out, sh + 48, 1); // sh_addralign
-    sh += 64;
-    // [3] .gnu.hash (SHT_GNU_HASH = 0x6ffffff6)
-    w32(&mut out, sh, shname_gnu_hash);
-    w32(&mut out, sh + 4, 0x6ffffff6u32); // SHT_GNU_HASH
-    w64(&mut out, sh + 8, 0x2); // SHF_ALLOC
-    w64(&mut out, sh + 16, gnu_hash_addr);
-    w64(&mut out, sh + 24, gnu_hash_offset);
-    w64(&mut out, sh + 32, gnu_hash_size);
-    w32(&mut out, sh + 40, 1); // sh_link = .dynsym index
-    w64(&mut out, sh + 48, 8);
-    sh += 64;
-    // [4] .dynamic (SHT_DYNAMIC = 6)
-    w32(&mut out, sh, shname_dynamic);
-    w32(&mut out, sh + 4, 6); // SHT_DYNAMIC
-    w64(&mut out, sh + 8, 0x3); // SHF_WRITE | SHF_ALLOC
-    w64(&mut out, sh + 16, dynamic_addr_so);
-    w64(&mut out, sh + 24, dynamic_offset);
-    w64(&mut out, sh + 32, dynamic_size);
-    w32(&mut out, sh + 40, 2); // sh_link = .dynstr index
-    w64(&mut out, sh + 48, 8);
-    w64(&mut out, sh + 56, 16); // sh_entsize
-    sh += 64;
-    // [5] .rela.dyn (SHT_RELA = 4)
-    w32(&mut out, sh, shname_rela_dyn);
-    w32(&mut out, sh + 4, 4); // SHT_RELA
-    w64(&mut out, sh + 8, 0x2); // SHF_ALLOC
-    w64(&mut out, sh + 16, rela_dyn_addr);
-    w64(&mut out, sh + 24, rela_dyn_offset);
-    w64(&mut out, sh + 32, rela_dyn_size);
-    w32(&mut out, sh + 40, 1); // sh_link = .dynsym index
-    w64(&mut out, sh + 48, 8);
-    w64(&mut out, sh + 56, 24); // sh_entsize
-    sh += 64;
-    if is_exec_dyn {
-        // [6] .interp (SHT_PROGBITS = 1)
-        w32(&mut out, sh, shname_interp);
-        w32(&mut out, sh + 4, 1); // SHT_PROGBITS
-        w64(&mut out, sh + 8, 0x2); // SHF_ALLOC
-        w64(&mut out, sh + 16, interp_addr);
-        w64(&mut out, sh + 24, interp_offset);
-        w64(&mut out, sh + 32, INTERP.len() as u64);
-        w64(&mut out, sh + 48, 1); // sh_addralign
-        sh += 64;
-    }
-    // [.shstrtab] (SHT_STRTAB = 3) — always the last section
-    w32(&mut out, sh, shname_shstrtab);
-    w32(&mut out, sh + 4, 3); // SHT_STRTAB
-    w64(&mut out, sh + 24, shstrtab_offset);
-    w64(&mut out, sh + 32, shstrtab_size);
-    w64(&mut out, sh + 48, 1);
-
     // .eh_frame_hdr from the relocated .eh_frame
     if let Some(h) = &eh_frame_hdr {
         h.write(&mut out)?;
     }
+    debug::apply_debug_relocations(
+        objects,
+        &globals_snap,
+        section_map,
+        output_sections,
+        &mut out,
+    )?;
+
+    let extra = shdr::dynamic_headers(&shdr::DynamicSections {
+        interp: if is_exec_dyn {
+            (interp_addr, interp_offset, INTERP.len() as u64)
+        } else {
+            (0, 0, 0)
+        },
+        gnu_hash: (gnu_hash_addr, gnu_hash_offset, gnu_hash_size),
+        dynsym: (dynsym_addr, dynsym_offset, dynsym_size),
+        dynstr: (dynstr_addr, dynstr_offset, dynstr_size),
+        rela_dyn: (rela_dyn_addr, rela_dyn_offset, rela_dyn_size),
+        rela_plt: (so_rela_plt_addr, so_rela_plt_offset, so_rela_plt_size),
+        plt: (so_plt_addr, so_plt_offset, so_plt_size),
+        dynamic: (dynamic_addr_so, dynamic_offset, dynamic_size),
+        got: (got_addr, got_offset, got_size),
+        got_plt: (so_got_plt_addr, so_got_plt_offset, so_got_plt_size),
+        eh_frame_hdr: eh_frame_hdr
+            .as_ref()
+            .map_or((0, 0, 0), |h| (h.vaddr, h.offset, h.size)),
+        // bfd's AArch64 `.plt` has no entry size (measured, bfd 2.44).
+        ..Default::default()
+    });
+    let headers = debug::section_headers(output_sections, extra);
+    for &(entry, addr, tls) in &dynsym_sections {
+        let shndx = match shdr::section_of(&headers, addr, tls) {
+            shdr::SymSection::Named(n) => shdr::header_index(&headers, &n),
+            shdr::SymSection::Abs => None,
+        }
+        .unwrap_or(SHN_ABS);
+        w16(&mut out, entry + 6, shndx);
+    }
+    let syms = (!strip_all).then(|| {
+        debug::symtab(
+            objects,
+            &globals_snap,
+            section_map,
+            output_sections,
+            &headers,
+        )
+    });
+    shdr::append_section_headers(&mut out, &headers, syms.as_deref())?;
 
     std::fs::write(output_path, &out)
         .map_err(|e| format!("failed to write '{}': {}", output_path, e))?;

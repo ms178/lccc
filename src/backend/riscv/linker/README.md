@@ -22,7 +22,10 @@ It is active by default (when the `gcc_linker` Cargo feature is not enabled).
 - Full RISC-V relocation processing (35+ relocation types including compressed)
 - PLT/GOT generation for function calls into shared libraries
 - COPY relocations for data symbols imported from shared libraries
-- TLS support (Local-Exec and Initial-Exec models; GD→LE relaxation for static binaries; PT_TLS segment)
+- TLS support in every model: Local-Exec, Initial-Exec, General-Dynamic (relaxed to LE for a
+  variable the executable defines; a real `tls_index` for an import and in shared objects,
+  with `DTPMOD64`/`DTPREL64`/`TPREL64` dynamic relocations, `got.rs`); PT_TLS segment;
+  exported TLS symbols carry their TLS-template offset
 - GNU RELRO segment for .dynamic, .got, init/fini arrays
 - Linker-defined symbols (`__global_pointer$`, `_start`, `_edata`, `__bss_start`, ...)
 - Shared library output (`ET_DYN`) with `R_RISCV_RELATIVE` relocations and SONAME
@@ -149,7 +152,8 @@ A separate 5-phase pipeline (with sub-phases) produces `ET_DYN` shared objects:
 | `sections.rs`     | ~115  | Phase 2: Section merging - groups input sections by canonical output name with proper alignment. |
 | `symbols.rs`      | ~270  | Phase 3: Global symbol table construction, COMMON symbol allocation, PLT/GOT symbol identification, local symbol vaddr computation. |
 | `reloc.rs`        | ~580  | Phase 6: Relocation application via `RelocContext` struct. Parameterized for executable vs shared library linking (collects R_RISCV_RELATIVE entries for .so output). |
-| `relocations.rs`  | ~620  | Shared building blocks: relocation constants, instruction patching (`patch_*`), symbol resolution (`resolve_symbol_value`, `find_hi20_value`), shared types (`GlobalSym`, `MergedSection`, `InputSecRef`), and utility functions (`build_gnu_hash`, `resolve_archive_members`, `output_section_name`, `section_order`). ELF writing helpers (`write_shdr`, `write_phdr`, `write_phdr_at`, `align_up`, `pad_to`) are re-exported from `linker_common`. |
+| `relocations.rs`  | ~620  | Shared building blocks: relocation constants, instruction patching (`patch_*`), symbol resolution (`resolve_symbol_value`, `find_hi20_value`), shared types (`GlobalSym`, `MergedSection`, `InputSecRef`), and utility functions (`build_gnu_hash`, `resolve_archive_members`, `output_section_name`, `section_order`). ELF writing helpers (`write_phdr`, `write_phdr_at`, `align_up`, `pad_to`) are re-exported from `linker_common`. |
+| `debug.rs`        | ~400  | DWARF sections (merge, placement, static relocation), the section-header list and `.symtab` both writers hand to `linker_common::shdr`. |
 | `elf_read.rs`     | ~90   | Re-exports shared linker_common types; delegates ELF parsing to shared infrastructure |
 
 ## Key Data Structures
@@ -194,7 +198,6 @@ GlobalSym {
     defined:     bool,           // true if defined in an input object
     needs_plt:   bool,           // true if this is a PLT-resolved dynamic function
     plt_idx:     usize,          // index into the PLT entry array
-    got_offset:  Option<u64>,    // offset within .got (if this symbol has a GOT entry)
     section_idx: Option<usize>,  // index into merged_sections (if defined locally)
 }
 ```
@@ -288,8 +291,12 @@ Input sections are grouped into output sections by name prefix:
 | `.eh_frame`                    | `.eh_frame`      |
 | `.riscv.attributes`            | `.riscv.attributes` (first instance only) |
 
-Non-allocatable sections (debug info, comment sections) are silently dropped,
-as are `.note.GNU-stack` sections. Group sections (`SHT_GROUP`), symbol tables,
+Non-allocatable sections other than `.riscv.attributes` and DWARF are dropped
+(`.comment`, ...), as are `.note.GNU-stack` sections. DWARF (`.debug_*`) is
+merged by exact name into sections after the image at address 0, its
+relocations -- including the ADD/SUB and SET/SUB ULEB128 label differences of
+relaxable code -- resolved statically in place by `debug.rs`; `-S` drops it,
+`-s` drops it and `.symtab`. Group sections (`SHT_GROUP`), symbol tables,
 string tables, and relocation sections are consumed structurally but not
 merged as content sections.
 
@@ -323,7 +330,17 @@ object:
 - Undefined data symbols (`STT_OBJECT`) from shared libraries are recorded
   for COPY relocation (allocated in `.bss` at link time).
 - Symbols referenced via `R_RISCV_GOT_HI20`, `R_RISCV_TLS_GOT_HI20`, or
-  `R_RISCV_TLS_GD_HI20` relocations are collected for GOT slot allocation.
+  `R_RISCV_TLS_GD_HI20` relocations are collected for GOT slot allocation
+  (`got.rs`): one slot per (symbol, access kind) -- an address, an
+  initial-exec TP offset, or a two-word general-dynamic `tls_index` -- so a
+  variable reached both ways gets both. TLS imports (`STT_TLS` in a shared
+  library) are dynamic symbols but are never given a PLT entry or a copy.
+- In an executable, a GD access to a variable it defines needs no slot (it
+  is relaxed to LE); a TLS import's slots are filled by the loader:
+  `R_RISCV_TLS_TPREL64` for IE, `DTPMOD64` + `DTPREL64` for GD. A shared
+  object resolves non-preemptible slots against itself (symbol 0): the
+  template offset as the `TPREL64` addend, a static `DTPREL` word biased by
+  `TLS_DTV_OFFSET` (0x800).
 
 ### Phase 4: Address Layout
 
@@ -454,7 +471,7 @@ linker:
 | `R_RISCV_CALL_PLT`      | 19   | S + A - P            | AUIPC+JALR pair        |
 | `R_RISCV_GOT_HI20`      | 20   | G + A - P            | U-type (AUIPC)         |
 | `R_RISCV_TLS_GOT_HI20`  | 21   | G + A - P            | U-type (AUIPC)         |
-| `R_RISCV_TLS_GD_HI20`   | 22   | G + A - P (relaxed to LE in static) | U-type (AUIPC→LUI) |
+| `R_RISCV_TLS_GD_HI20`   | 22   | G + A - P (relaxed to LE for an executable's own variable) | U-type (AUIPC; LUI when relaxed) |
 | `R_RISCV_PCREL_HI20`    | 23   | S + A - P            | U-type (AUIPC)         |
 | `R_RISCV_PCREL_LO12_I`  | 24   | lo12(hi20_target)    | I-type                 |
 | `R_RISCV_PCREL_LO12_S`  | 25   | lo12(hi20_target)    | S-type                 |

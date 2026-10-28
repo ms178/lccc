@@ -374,6 +374,15 @@ pub fn link_builtin(
         &mut section_map,
         &dead_sections,
     );
+    // DWARF sections follow every allocated one, unloaded (see `debug.rs`).
+    if !parsed_common.strip_all && !parsed_common.strip_debug {
+        linker_common::merge_debug_sections_elf64(
+            &objects,
+            &mut output_sections,
+            &mut section_map,
+            &dead_sections,
+        )?;
+    }
 
     // Allocate COMMON symbols (using shared implementation)
     // No --sort-common on this path yet: default (unsorted) order.
@@ -399,6 +408,7 @@ pub fn link_builtin(
             export_dynamic,
             rpath.as_ref(),
             &pending_defsyms,
+            parsed_common.strip_all,
         )
     } else {
         // Fall back to static emit
@@ -409,6 +419,7 @@ pub fn link_builtin(
             &section_map,
             output_path,
             &pending_defsyms,
+            parsed_common.strip_all,
         )
     }
 }
@@ -533,6 +544,14 @@ pub fn link_shared(
     let mut output_sections: Vec<OutputSection> = Vec::new();
     let mut section_map: FxHashMap<(usize, usize), (usize, u64)> = FxHashMap::default();
     linker_common::merge_sections_elf64(&objects, &mut output_sections, &mut section_map);
+    if !parsed_args.strip_all && !parsed_args.strip_debug {
+        linker_common::merge_debug_sections_elf64(
+            &objects,
+            &mut output_sections,
+            &mut section_map,
+            &FxHashSet::default(),
+        )?;
+    }
     // No --sort-common on this path yet: default (unsorted) order.
     linker_common::allocate_common_symbols_elf64(&mut globals, &mut output_sections, false);
 
@@ -577,6 +596,7 @@ pub fn link_shared(
         soname,
         rpath.as_ref(),
         &pending_defsyms,
+        parsed_args.strip_all,
     )
 }
 

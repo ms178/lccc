@@ -3302,6 +3302,10 @@ impl Driver {
                 "-rdynamic" => {
                     self.linker_ordered_items.push("-rdynamic".to_string());
                 }
+                // GCC's `-s`: strip at link time (ld -s), in command-line order.
+                "-s" => {
+                    self.linker_ordered_items.push("-s".to_string());
+                }
                 "-pipe" | "-Xa" | "-Xc" | "-Xt" => {}
                 "-pthread" => {
                     self.pthread = true;
@@ -5884,6 +5888,7 @@ mod cli_tests {
             "-shared",
             "-static",
             "-rdynamic",
+            "-s",
             "-no-pie",
             "-L/usr/local/lib",
             "-lm",

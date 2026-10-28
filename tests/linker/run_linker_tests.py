@@ -1875,6 +1875,35 @@ case("strip_all",
     ldflags=["-Wl,-s"],
     tags=("special",))
 
+case("strip_all_driver_flag",
+    # GCC spells link-time strip `-s`, and the driver has to forward it to the
+    # linker in command-line order (a local flag that never reaches the link
+    # silently ships an unstripped binary -- the user believes the symbols are
+    # gone).  This is the driver path, distinct from `-Wl,-s` above.
+    {"a.c": """
+        #include <stdio.h>
+        int named_symbol(int x){ return x * 2; }
+        int main(void){ printf("%d\\n", named_symbol(21)); return 0; }
+     """},
+    ldflags=["-s"],
+    expect_stdout="42\n",
+    expect_no_symtab=True,
+    tags=("strip",))
+
+case("strip_debug_keeps_symtab",
+    # `-S` drops DWARF but keeps `.symtab`: the two strip levels are distinct,
+    # and a driver that mapped `-S` onto `-s` would erase the names too.
+    {"a.c": """
+        #include <stdio.h>
+        int named_symbol(int x){ return x * 2; }
+        int main(void){ printf("%d\\n", named_symbol(21)); return 0; }
+     """},
+    compile_flags=["-O1", "-g"],
+    ldflags=["-Wl,-S"],
+    expect_stdout="42\n",
+    expect_symtab_valid=True,
+    tags=("strip",))
+
 case("undefined_flag_pulls_archive",
     {"main.c": """
         #include <stdio.h>
@@ -8368,6 +8397,247 @@ def _script_orphans_test(args, oracles):
             shutil.rmtree(td, ignore_errors=True)
 
 
+def _tls_shared_matrix_test(args, oracles):
+    """TLS crosses shared-object boundaries correctly in every access model.
+
+    A library exports two initialised `__thread` variables and also uses a
+    static and a hidden one (non-preemptible: module-relative slots); the
+    program reads and writes the exported ones, compares `&ltv` across the
+    boundary and repeats the checks in a second thread.  Each library model
+    (the target's -fPIC default, AArch64's descriptor and traditional
+    dialects, initial-exec) is linked by lccc and by bfd, each program
+    model against both, plus the lccc-linked pair and a static link.  Every
+    case must run and exit 0.  The RISC-V and AArch64 linkers used to export
+    absolute TLS symbol values (a library's variables were read outside its
+    TLS block), emit a plain symbol relocation or a JUMP_SLOT for TLS GOT
+    slots, leave `bl __tls_get_addr` in relaxed GD sequences, write the
+    descriptor result into the wrong register and refuse TLS in AArch64
+    shared objects.  x86-64 and i686 always run; AArch64 and RISC-V when
+    their cross compiler and qemu-user are installed.
+    """
+    name = "tls_shared_matrix"
+    bindir = os.path.dirname(os.path.abspath(args.lccc))
+    lib_c = ("__thread int ltv = 42;\n__thread int ltv2 = 7;\n"
+             "static __thread int priv = 5;\n"
+             "__attribute__((visibility(\"hidden\"))) __thread int hid = 9;\n"
+             "int *addr_ltv(void) { return &ltv; }\n"
+             "int get_ltv(void) { return ltv + priv + hid - 14; }\n"
+             "void bump_private(void) { priv += 100; hid += 100; }\n")
+    use_c = ("#include <pthread.h>\n#include <stdio.h>\n"
+             "extern __thread int ltv, ltv2;\n"
+             "int get_ltv(void);\nint *addr_ltv(void);\nvoid bump_private(void);\n"
+             "static void *thr(void *p) {\n  (void)p;\n  ltv = 1;\n  bump_private();\n"
+             "  return (void *)(long)(get_ltv() == 1 + 200 && ltv2 == 7 && addr_ltv() == &ltv);\n}\n"
+             "int main(void) {\n  ltv2 += 1;\n  pthread_t t;\n  void *r = 0;\n"
+             "  if (pthread_create(&t, 0, thr, 0) || pthread_join(t, &r)) return 3;\n"
+             "  printf(\"%d %d %d\\n\", ltv, ltv2, get_ltv());\n"
+             "  return !(ltv == 42 && ltv2 == 8 && get_ltv() == 42 && addr_ltv() == &ltv && r);\n}\n")
+    ie = ["-fPIC", "-ftls-model=initial-exec"]
+    # (tag, lccc driver, compiler, how to run, models: None = the default)
+    targets = [("x86-64", "lccc-x86", [CC], [], [None, ["-fPIC"], ie]),
+               ("i686", "lccc-i686", [CC, "-m32"], [], [None, ["-fPIC"], ie])]
+    skipped = []
+    for triple, drv in (("aarch64-linux-gnu", "lccc-arm"), ("riscv64-linux-gnu", "lccc-riscv")):
+        cross = shutil.which(triple + "-gcc")
+        qemu = shutil.which("qemu-" + triple.split("-")[0])
+        if not (cross and qemu):
+            skipped.append(triple.split("-")[0])
+            continue
+        models = [None, ["-fPIC"], ie]
+        if triple.startswith("aarch64"):
+            models += [["-fPIC", "-mtls-dialect=desc"], ["-fPIC", "-mtls-dialect=trad"]]
+        targets.append((triple.split("-")[0], drv, [cross], [qemu, "-L", f"/usr/{triple}"], models))
+    ran = 0
+    for tag, drv, cc, runner, models in targets:
+        lccc = os.path.join(bindir, drv)
+        if not os.path.exists(lccc):
+            skipped.append(tag)
+            continue
+        with tempfile.TemporaryDirectory(prefix="lccc-tls-matrix-") as td:
+            for fname, text in (("lib.c", lib_c), ("use.c", use_c)):
+                with open(os.path.join(td, fname), "w", encoding="utf-8") as stream:
+                    stream.write(text)
+            for d in ("bfd", "lccc"):
+                os.mkdir(os.path.join(td, d))
+            for ui, um in enumerate(models):
+                r = sh([*cc, "-O2", *(um or []), "-c", "use.c", "-o", f"use{ui}.o"], cwd=td)
+                if r.returncode != 0:
+                    return Result(name, "FAIL", f"{tag}: compile use.c {um}: "
+                                  f"{r.stderr.decode(errors='replace')[:200]}")
+
+            def run(exe, libdir, what):
+                env = {"LD_LIBRARY_PATH": os.path.join(td, libdir)} if libdir else None
+                r = sh([*runner, os.path.join(td, exe)], cwd=td, timeout=60, env=env)
+                if r.returncode != 0:
+                    return f"{tag} {what}: exit {r.returncode}: {r.stdout.decode(errors='replace')[:80]}"
+                return None
+
+            for li, lm in enumerate(models):
+                lflags = lm or ["-fPIC"]
+                steps = [[*cc, "-O2", *lflags, "-c", "lib.c", "-o", f"lib{li}.o"],
+                         [*cc, "-shared", f"lib{li}.o", "-o", "bfd/libt.so"],
+                         [lccc, "-shared", f"lib{li}.o", "-o", "lccc/libt.so",
+                          "-Wl,-soname,libt.so"]]
+                for step in steps:
+                    r = sh(step, cwd=td, timeout=120)
+                    if r.returncode != 0:
+                        return Result(name, "FAIL", f"{tag} lib {lflags}: {' '.join(step[:2])}: "
+                                      f"{r.stderr.decode(errors='replace')[:200]}")
+                for ui, um in enumerate(models):
+                    pm = um or ["default"]
+                    links = [
+                        ([*cc, f"use{ui}.o", "-o", "x1", "-Llccc", "-lt", "-lpthread"], "lccc",
+                         f"lccc .so {lflags} <- bfd program {pm}"),
+                        ([lccc, f"use{ui}.o", "-o", "x2", "-Lbfd", "-lt", "-lpthread"], "bfd",
+                         f"bfd .so {lflags} <- lccc program {pm}"),
+                        ([lccc, f"use{ui}.o", "-o", "x3", "-Llccc", "-lt", "-lpthread"], "lccc",
+                         f"lccc .so {lflags} <- lccc program {pm}"),
+                        ([lccc, "-static", f"lib{li}.o", f"use{ui}.o", "-o", "x4", "-lpthread"], None,
+                         f"static {lflags} + {pm}"),
+                    ]
+                    for cmd, libdir, what in links:
+                        r = sh(cmd, cwd=td, timeout=120)
+                        if r.returncode != 0:
+                            return Result(name, "FAIL", f"{tag} {what}: link: "
+                                          f"{r.stderr.decode(errors='replace')[:200]}")
+                        why = run(cmd[cmd.index("-o") + 1], libdir, what)
+                        if why:
+                            return Result(name, "FAIL", why)
+                        ran += 1
+    detail = f"{ran} links ran"
+    if skipped:
+        detail += f"; skipped {', '.join(skipped)} (no cross compiler/qemu/driver)"
+    return Result(name, "PASS", detail)
+
+
+def _crossarch_debug_sections_test(args, oracles):
+    """The AArch64 and RISC-V linkers keep DWARF and a complete section table.
+
+    Neither copied any .debug_* section into an output nor wrote .symtab;
+    AArch64 static and dynamic executables had no section headers at all,
+    and its shared objects listed only their dynamic sections, so gdb had
+    no file:line and
+    readelf/nm/perf nothing to read.  For a static executable, a dynamic
+    executable and a shared object: the table parses without a readelf
+    warning; .debug_info, .debug_line, .debug_abbrev and .symtab are
+    present; DW_AT_low_pc of every function equals its .symtab address and
+    starts a line-table row (the debug relocations were resolved statically,
+    in place); -S drops the DWARF but keeps .symtab, -s drops both.  With
+    the cross GCC installed, its -O2 objects (location and range lists,
+    .debug_str offsets, PREL32 in .debug_line) link to a warning-free
+    readelf -w with the same low_pc/.symtab agreement.
+    """
+    name = "crossarch_debug_sections"
+    bindir = os.path.dirname(args.lccc)
+    drivers = [("lccc-arm", "aarch64-linux-gnu-gcc"), ("lccc-riscv", "riscv64-linux-gnu-gcc")]
+    src = r"""
+static int table[4] = {1, 2, 3, 4};
+int counter;
+static int helper(int x) { return x * table[x & 3]; }
+int lib_fn(int x) { return helper(x) + counter; }
+int main(int argc, char **argv) { (void)argv; counter = lib_fn(argc); return counter > 100; }
+"""
+    debug_names = (".debug_info", ".debug_line", ".debug_abbrev")
+
+    def readelf(td, *argv):
+        r = sh(["readelf", "-W", *argv], cwd=td)
+        return r.stdout.decode(errors="replace"), r.stderr.decode(errors="replace")
+
+    def check(td, out, tag, want_debug=True, want_symtab=True):
+        text, err = readelf(td, "-S", out)
+        if err.strip():
+            return f"{tag}: readelf -S: {err.strip()[:200]}"
+        names = re.findall(r"\]\s+(\S+)", text)
+        has_debug = all(n in names for n in debug_names)
+        if has_debug != want_debug or any(n.startswith(".debug") for n in names) != want_debug:
+            return f"{tag}: debug sections {[n for n in names if n.startswith('.debug')]}"
+        if (".symtab" in names) != want_symtab:
+            return f"{tag}: .symtab present={'.symtab' in names}"
+        if not want_debug:
+            return None
+        syms, _ = readelf(td, "-s", out)
+        funcs = {}
+        for line in syms.splitlines():
+            f = line.split()
+            if len(f) >= 8 and f[3] == "FUNC" and f[6] != "UND":
+                funcs.setdefault(f[7], int(f[1], 16))
+        info, err = readelf(td, "--debug-dump=info", out)
+        if err.strip():
+            return f"{tag}: readelf --debug-dump=info: {err.strip()[:200]}"
+        low_pcs, cur = {}, None
+        for line in info.splitlines():
+            if "DW_TAG_" in line:
+                cur = None
+            # readelf 2.40+ prefixes the form: "(string) main",
+            # "(strp) (offset: 0x1c): main", "(addr) 0x400100".
+            m = re.search(r"DW_AT_name\s*:\s*(.*)$", line)
+            if m:
+                cur = re.sub(r"^(\([^)]*\)\s*:?\s*)+", "", m.group(1)).strip()
+            m = re.search(r"DW_AT_low_pc\s*:\s*(?:\([^)]*\)\s*)?(0x[0-9a-f]+)", line)
+            if m and cur:
+                low_pcs[cur] = int(m.group(1), 16)
+        lines, err = readelf(td, "--debug-dump=decodedline", out)
+        if err.strip():
+            return f"{tag}: readelf --debug-dump=decodedline: {err.strip()[:200]}"
+        rows = {int(a, 16) for a in re.findall(r"\s(0x[0-9a-f]+)\s", lines)}
+        checked = [f for f in low_pcs if f in funcs]
+        if not checked:
+            return f"{tag}: no function has both DW_AT_low_pc and a .symtab entry ({sorted(low_pcs)})"
+        for f in checked:
+            if low_pcs[f] != funcs[f]:
+                return f"{tag}: {f} DW_AT_low_pc 0x{low_pcs[f]:x} != .symtab 0x{funcs[f]:x}"
+            if low_pcs[f] not in rows:
+                return f"{tag}: {f} at 0x{low_pcs[f]:x} starts no line-table row"
+        return None
+
+    covered = []
+    with tempfile.TemporaryDirectory() as td:
+        c = os.path.join(td, "d.c")
+        with open(c, "w") as f:
+            f.write(src)
+        for drv, gcc in drivers:
+            path = os.path.join(bindir, drv)
+            if not os.path.exists(path):
+                continue
+            links = {
+                "static": ["-static"],
+                "static -S": ["-static", "-Wl,-S"],
+                "static -s": ["-static", "-s"],
+                "dynamic": [],
+                "shared": ["-shared", "-fPIC"],
+            }
+            for tag, flags in links.items():
+                out = os.path.join(td, f"{drv}-{tag.replace(' ', '')}")
+                r = sh([path, "-g", "-O1", *flags, c, "-o", out], cwd=td, timeout=120)
+                if r.returncode != 0:
+                    return Result(name, "FAIL", f"{drv} {tag}: {r.stderr.decode(errors='replace')[:300]}")
+                why = check(td, out, f"{drv} {tag}",
+                            want_debug=not tag.endswith(("-S", "-s")),
+                            want_symtab=not tag.endswith("-s"))
+                if why:
+                    return Result(name, "FAIL", why)
+            covered.append(drv)
+            if shutil.which(gcc):
+                obj = os.path.join(td, f"{drv}-gcc.o")
+                r = sh([gcc, "-g", "-O2", "-c", c, "-o", obj], cwd=td, timeout=120)
+                if r.returncode != 0:
+                    return Result(name, "FAIL", f"{gcc}: {r.stderr.decode(errors='replace')[:300]}")
+                out = os.path.join(td, f"{drv}-gcc")
+                r = sh([path, "-static", obj, "-o", out], cwd=td, timeout=120)
+                if r.returncode != 0:
+                    return Result(name, "FAIL", f"{drv} gcc objects: {r.stderr.decode(errors='replace')[:300]}")
+                _, err = readelf(td, "-w", out)
+                if err.strip():
+                    return Result(name, "FAIL", f"{drv} gcc objects: readelf -w: {err.strip()[:200]}")
+                why = check(td, out, f"{drv} gcc -O2 objects")
+                if why:
+                    return Result(name, "FAIL", why)
+                covered.append(f"{drv}+{gcc}")
+    if not covered:
+        return Result(name, "SKIP", "no cross driver built")
+    return Result(name, "PASS", ", ".join(covered))
+
+
 def _script_nonalloc_section_test(args, oracles):
     """Non-ALLOC PROGBITS must be written and have relocations applied."""
     name = "script_nonalloc_debug_payload"
@@ -12154,6 +12424,8 @@ def _registry(args, oracles):
         one("script_nonalloc_debug_payload", _script_nonalloc_section_test,
             "script", "kernel"),
         one("script_orphans_match_gnu", _script_orphans_test, "script"),
+        one("crossarch_debug_sections", _crossarch_debug_sections_test, "layout"),
+        one("tls_shared_matrix", _tls_shared_matrix_test, "dynamic"),
         _Entry(("so_default_interposable",),
                lambda: _interpose_test(args, oracles, "so_default_interposable", [], "101\n"),
                ("shared",)),

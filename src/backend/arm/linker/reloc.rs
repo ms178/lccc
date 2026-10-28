@@ -27,15 +27,41 @@ const R_AARCH64_TLSLE_MOVW_TPREL_G1_NC: u32 = 546;
 const R_AARCH64_TLSLE_MOVW_TPREL_G0: u32 = 547;
 const R_AARCH64_TLSLE_MOVW_TPREL_G0_NC: u32 = 548;
 
-// TLS descriptor / Initial exec (convert to LE for static linking)
-const R_AARCH64_TLSDESC_ADR_PAGE21: u32 = 562;
-const R_AARCH64_TLSDESC_LD64_LO12: u32 = 563;
-const R_AARCH64_TLSDESC_ADD_LO12: u32 = 564;
-const R_AARCH64_TLSDESC_CALL: u32 = 569;
+// TLS descriptor: relaxed in executables
+pub const R_AARCH64_TLSDESC_ADR_PAGE21: u32 = 562;
+pub const R_AARCH64_TLSDESC_LD64_LO12: u32 = 563;
+pub const R_AARCH64_TLSDESC_ADD_LO12: u32 = 564;
+pub const R_AARCH64_TLSDESC_CALL: u32 = 569;
 
-// GD (General Dynamic) -> LE relaxation for static linking
-const R_AARCH64_TLSGD_ADR_PAGE21: u32 = 513;
-const R_AARCH64_TLSGD_ADD_LO12_NC: u32 = 514;
+// GD (General Dynamic): relaxed in executables
+pub const R_AARCH64_TLSGD_ADR_PAGE21: u32 = 513;
+pub const R_AARCH64_TLSGD_ADD_LO12_NC: u32 = 514;
+
+// The instructions TLS relaxation writes.
+const NOP: u32 = 0xd503_201f;
+const MOVZ_X_LSL16: u32 = 0xd2a0_0000;
+const MOVK_X: u32 = 0xf280_0000;
+const LDR_X_UIMM: u32 = 0xf940_0000;
+const MRS_X1_TPIDR_EL0: u32 = 0xd53b_d041;
+const ADD_X0_X1_X0: u32 = 0x8b00_0020;
+
+/// The `bl __tls_get_addr` of a general-dynamic sequence: the CALL26 right
+/// after its TLSGD_ADD_LO12_NC, which that relocation rewrote.
+pub fn is_relaxed_tls_call(relas: &[Rela], i: usize, sym_name: &str) -> bool {
+    i > 0
+        && sym_name == "__tls_get_addr"
+        && relas[i].rela_type == R_AARCH64_CALL26
+        && relas[i - 1].rela_type == R_AARCH64_TLSGD_ADD_LO12_NC
+        && relas[i - 1].offset + 4 == relas[i].offset
+}
+
+/// An instruction-rewrite site must lie inside the output.
+fn check_insn_site(out: &[u8], fp: usize, len: usize) -> Result<(), String> {
+    if fp + len > out.len() {
+        return Err(format!("AArch64 TLS rewrite site {fp:#x} exceeds output"));
+    }
+    Ok(())
+}
 
 // IE (Initial Exec) TLS
 pub const R_AARCH64_TLSIE_ADR_GOTTPREL_PAGE21: u32 = 541;
@@ -204,10 +230,14 @@ pub fn apply_relocations(
                 Some(&v) => v,
                 None => continue,
             };
+            // Unloaded (debug) sections resolve statically in `debug.rs`.
+            if output_sections[out_idx].flags & SHF_ALLOC == 0 {
+                continue;
+            }
             let sa = output_sections[out_idx].addr;
             let sfo = output_sections[out_idx].file_offset;
 
-            for rela in relas {
+            for (ri, rela) in relas.iter().enumerate() {
                 if rela.rela_type == R_AARCH64_NONE {
                     continue;
                 }
@@ -223,6 +253,9 @@ pub fn apply_relocations(
                     continue;
                 }
                 let sym = &objects[obj_idx].symbols[si];
+                if is_relaxed_tls_call(relas, ri, &sym.name) {
+                    continue;
+                }
                 let p = sa + sec_off + rela.offset;
                 let fp = (sfo + sec_off + rela.offset) as usize;
                 let a = rela.addend;
@@ -495,69 +528,64 @@ pub fn apply_one_reloc(
             }
         }
 
-        // ── TLSDESC relaxation to LE for static linking ──
-        R_AARCH64_TLSDESC_ADR_PAGE21 => {
-            // Replace ADRP with MOVZ Xd, #tprel_g1, LSL #16
-            let tp = tprel(s, a, tls_info);
-            if fp + 4 > out.len() {
-                return Ok(());
+        // ── TLS descriptor and general-dynamic access, in an executable ──
+        // A variable the executable defines is relaxed to local-exec, one
+        // imported from a shared library to initial-exec through its GOT
+        // slot (TPREL64, `emit_dynamic`), as GNU ld does. The descriptor ABI
+        // returns the TP offset in x0, the general-dynamic one the address.
+        R_AARCH64_TLSDESC_ADR_PAGE21 | R_AARCH64_TLSGD_ADR_PAGE21 => {
+            check_insn_site(out, fp, 4)?;
+            if let Some(slot) = got_info.entry_addr(got_key) {
+                let imm = ((slot & !0xFFF) as i64).wrapping_sub((p & !0xFFF) as i64) >> 12;
+                encode_adrp(out, fp, imm)?;
+            } else {
+                let rd = read_u32(out, fp) & 0x1f;
+                let tp = tprel(s, a, tls_info) as u64;
+                w32(
+                    out,
+                    fp,
+                    MOVZ_X_LSL16 | ((((tp >> 16) & 0xffff) as u32) << 5) | rd,
+                );
             }
+        }
+        R_AARCH64_TLSDESC_LD64_LO12 | R_AARCH64_TLSGD_ADD_LO12_NC => {
+            check_insn_site(out, fp, 4)?;
             let insn = read_u32(out, fp);
-            let rd = insn & 0x1f;
-            let imm16 = ((tp as u64 >> 16) & 0xffff) as u32;
-            let new_insn = 0xd2a00000 | (imm16 << 5) | rd;
-            w32(out, fp, new_insn);
-        }
-        R_AARCH64_TLSDESC_LD64_LO12 => {
-            // Replace LDR with MOVK Xd, #tprel_lo
-            let tp = tprel(s, a, tls_info);
-            if fp + 4 > out.len() {
-                return Ok(());
+            // The result register: the descriptor load's base (x0 by the
+            // ABI; its destination is the resolver, x1), the add's target.
+            let xd = if rtype == R_AARCH64_TLSDESC_LD64_LO12 {
+                (insn >> 5) & 0x1f
+            } else {
+                insn & 0x1f
+            };
+            if let Some(slot) = got_info.entry_addr(got_key) {
+                // ldr xd, [xd, #:lo12:slot]
+                let imm12 = ((slot & 0xFFF) >> 3) as u32;
+                w32(out, fp, LDR_X_UIMM | (imm12 << 10) | (xd << 5) | xd);
+            } else {
+                let tp = tprel(s, a, tls_info) as u64;
+                w32(out, fp, MOVK_X | (((tp & 0xffff) as u32) << 5) | xd);
             }
-            let insn = read_u32(out, fp);
-            let rd = insn & 0x1f;
-            let imm16 = (tp as u64 & 0xffff) as u32;
-            let new_insn = 0xf2800000 | (imm16 << 5) | rd;
-            w32(out, fp, new_insn);
-        }
-        R_AARCH64_TLSDESC_ADD_LO12 => {
-            // NOP (the value is already in the register from MOVZ+MOVK)
-            if fp + 4 > out.len() {
-                return Ok(());
+            if rtype == R_AARCH64_TLSGD_ADD_LO12_NC {
+                // `bl __tls_get_addr; nop` -> `mrs x1, tpidr_el0;
+                // add x0, x1, x0` (the call's CALL26 is skipped, see
+                // `is_relaxed_tls_call`).
+                check_insn_site(out, fp + 4, 8)?;
+                if read_u32(out, fp + 4) & 0xfc00_0000 != 0x9400_0000
+                    || read_u32(out, fp + 8) != NOP
+                {
+                    return Err(format!(
+                        "AArch64 general-dynamic TLS access to '{sym_name}' in {source} is not \
+                         `add; bl __tls_get_addr; nop`"
+                    ));
+                }
+                w32(out, fp + 4, MRS_X1_TPIDR_EL0);
+                w32(out, fp + 8, ADD_X0_X1_X0);
             }
-            w32(out, fp, 0xd503201f); // NOP
         }
-        R_AARCH64_TLSDESC_CALL => {
-            // NOP (no runtime call needed for static linking)
-            if fp + 4 > out.len() {
-                return Ok(());
-            }
-            w32(out, fp, 0xd503201f); // NOP
-        }
-
-        // ── TLS GD -> LE relaxation ──
-        // TODO: full GD relaxation also needs to NOP the BL __tls_get_addr that follows
-        R_AARCH64_TLSGD_ADR_PAGE21 => {
-            let tp = tprel(s, a, tls_info);
-            if fp + 4 > out.len() {
-                return Ok(());
-            }
-            let insn = read_u32(out, fp);
-            let rd = insn & 0x1f;
-            let imm16 = ((tp as u64 >> 16) & 0xffff) as u32;
-            let new_insn = 0xd2a00000 | (imm16 << 5) | rd;
-            w32(out, fp, new_insn);
-        }
-        R_AARCH64_TLSGD_ADD_LO12_NC => {
-            let tp = tprel(s, a, tls_info);
-            if fp + 4 > out.len() {
-                return Ok(());
-            }
-            let insn = read_u32(out, fp);
-            let rd = insn & 0x1f;
-            let imm16 = (tp as u64 & 0xffff) as u32;
-            let new_insn = 0xf2800000 | (imm16 << 5) | rd;
-            w32(out, fp, new_insn);
+        R_AARCH64_TLSDESC_ADD_LO12 | R_AARCH64_TLSDESC_CALL => {
+            check_insn_site(out, fp, 4)?;
+            w32(out, fp, NOP);
         }
 
         other => {

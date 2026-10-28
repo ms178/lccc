@@ -466,17 +466,31 @@ TP offsets:
 | `R_AARCH64_TLSIE_ADR_GOTTPREL_PAGE21` | 541 | ADRP to GOT page holding TP offset |
 | `R_AARCH64_TLSIE_LD64_GOTTPREL_LO12_NC` | 542 | LDR from GOT entry |
 
-#### TLS Descriptor (TLSDESC) Relaxation to LE
+#### TLS Descriptor (TLSDESC) and General-Dynamic Access in Executables
 
-For static linking, TLSDESC sequences are relaxed to direct TP-offset
-computation:
+An executable relaxes both, as GNU ld does: to LE for a variable it
+defines, to IE through a GOT slot (`R_AARCH64_TLS_TPREL64`, filled by the
+loader) for one imported from a shared library. The descriptor sequence
+returns the TP offset in x0 (the base register of its LDR -- the LDR's
+destination is the resolver, x1); the GD sequence returns the address, so
+its `bl __tls_get_addr; nop` becomes `mrs x1, tpidr_el0; add x0, x1, x0`
+and the call's CALL26 is skipped (no PLT entry is made for it).
 
-| Type | ELF # | Relaxation |
-|------|-------|------------|
-| `R_AARCH64_TLSDESC_ADR_PAGE21` | 562 | ADRP -> MOVZ Xd, #tprel_g1, LSL #16 |
-| `R_AARCH64_TLSDESC_LD64_LO12` | 563 | LDR -> MOVK Xd, #tprel_lo |
-| `R_AARCH64_TLSDESC_ADD_LO12` | 564 | ADD -> NOP |
-| `R_AARCH64_TLSDESC_CALL` | 569 | BLR -> NOP |
+| Type | ELF # | To LE | To IE |
+|------|-------|-------|-------|
+| `R_AARCH64_TLSDESC_ADR_PAGE21` / `TLSGD_ADR_PAGE21` | 562 / 513 | MOVZ x0, #tprel_g1, LSL #16 | ADRP x0, slot |
+| `R_AARCH64_TLSDESC_LD64_LO12` / `TLSGD_ADD_LO12_NC` | 563 / 514 | MOVK x0, #tprel_g0 | LDR x0, [x0, #:lo12:slot] |
+| `R_AARCH64_TLSDESC_ADD_LO12` | 564 | NOP | NOP |
+| `R_AARCH64_TLSDESC_CALL` | 569 | NOP | NOP |
+
+#### TLS in Shared Objects
+
+A shared object cannot relax (`tls_got.rs`): IE slots get
+`R_AARCH64_TLS_TPREL64`, GD pairs `DTPMOD64` + `DTPREL64`, descriptor pairs
+`R_AARCH64_TLSDESC` (eagerly, in `.rela.dyn`, as lld does), by name for a
+preemptible symbol and against the object itself (symbol 0, template offset
+as addend; a static DTPREL word) otherwise. Local-exec relocations are an
+error, as in GNU ld. Exported TLS symbols carry their template offset.
 
 #### TLS General Dynamic (GD) Relaxation to LE
 

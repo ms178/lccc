@@ -6,9 +6,10 @@
 use crate::common::fx_hash::FxHashMap;
 
 use super::elf::*;
-use super::reloc;
 use super::types::{BASE_ADDR, EhFrameHdr, GlobalSymbol, PAGE_SIZE};
+use super::{debug, reloc};
 use crate::backend::linker_common;
+use crate::backend::linker_common::shdr;
 use linker_common::OutputSection;
 
 // ── Static ELF emission ───────────────────────────────────────────────
@@ -20,6 +21,7 @@ pub(super) fn emit_executable(
     section_map: &FxHashMap<(usize, usize), (usize, u64)>,
     output_path: &str,
     pending_defsyms: &[(String, String, usize)],
+    strip_all: bool,
 ) -> Result<(), String> {
     if std::env::var("LINKER_DEBUG").is_ok() {
         eprintln!("output sections:");
@@ -576,6 +578,9 @@ pub(super) fn emit_executable(
         eprintln!("  entry_addr = 0x{:x}", entry_addr);
     }
 
+    // Debug sections follow the load image in the file, unmapped.
+    let offset = linker_common::place_debug_sections(output_sections, offset);
+
     // Build output buffer
     let file_size = offset as usize;
     let mut out = vec![0u8; file_size];
@@ -715,6 +720,13 @@ pub(super) fn emit_executable(
         &tls_info,
         &got_info,
     )?;
+    debug::apply_debug_relocations(
+        objects,
+        &globals_snap,
+        section_map,
+        output_sections,
+        &mut out,
+    )?;
 
     // Build .eh_frame_hdr from relocated .eh_frame data and write it
     if let Some(h) = &eh_frame_hdr {
@@ -829,6 +841,56 @@ pub(super) fn emit_executable(
         eh_frame_hdr_size,
         4,
     );
+
+    // Section headers: the output sections plus the synthesized ones, then
+    // .symtab unless stripped. bfd names the IRELATIVE trio `.rela.plt`,
+    // `.plt` and `.got.plt` in a static link too (measured, bfd 2.44).
+    let extra = vec![
+        shdr::synthetic(".got", SHF_WRITE, got_addr, got_offset, got_size, 8),
+        shdr::synthetic(
+            ".got.plt",
+            SHF_WRITE,
+            iplt_got_addr,
+            iplt_got_offset,
+            iplt_got_count as u64 * 8,
+            8,
+        ),
+        shdr::synthetic(
+            ".rela.plt",
+            0,
+            rela_iplt_addr,
+            rela_iplt_offset,
+            rela_iplt_size,
+            8,
+        ),
+        shdr::synthetic(
+            ".plt",
+            SHF_EXECINSTR,
+            iplt_stub_addr,
+            iplt_stub_file_off,
+            iplt_stub_size,
+            16,
+        ),
+        shdr::synthetic(
+            ".eh_frame_hdr",
+            0,
+            eh_frame_hdr_vaddr,
+            eh_frame_hdr_offset,
+            eh_frame_hdr_size,
+            4,
+        ),
+    ];
+    let headers = debug::section_headers(output_sections, extra);
+    let syms = (!strip_all).then(|| {
+        debug::symtab(
+            objects,
+            &globals_snap,
+            section_map,
+            output_sections,
+            &headers,
+        )
+    });
+    shdr::append_section_headers(&mut out, &headers, syms.as_deref())?;
 
     // Write output
     std::fs::write(output_path, &out)

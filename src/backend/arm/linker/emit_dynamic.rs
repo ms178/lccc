@@ -7,9 +7,11 @@
 use crate::common::fx_hash::FxHashMap;
 
 use super::elf::*;
-use super::reloc;
+use super::tls_got::R_AARCH64_TLS_TPREL64;
 use super::types::{BASE_ADDR, EhFrameHdr, GlobalSymbol, INTERP, PAGE_SIZE, init_fini_entries};
+use super::{debug, reloc};
 use crate::backend::linker_common;
+use crate::backend::linker_common::shdr;
 use linker_common::{DynStrTab, OutputSection};
 
 // ── Dynamic executable emission ─────────────────────────────────────────
@@ -27,6 +29,7 @@ pub(super) fn emit_dynamic_executable(
     export_dynamic: bool,
     rpath: Option<&(i64, String)>,
     pending_defsyms: &[(String, String, usize)],
+    strip_all: bool,
 ) -> Result<(), String> {
     let mut dynstr = DynStrTab::new();
     for lib in needed_sonames {
@@ -551,6 +554,8 @@ pub(super) fn emit_dynamic_executable(
         .unwrap_or(text_page_addr);
 
     // === Build output buffer ===
+    // Debug sections follow the load image in the file, unmapped.
+    let offset = linker_common::place_debug_sections(output_sections, offset);
     let file_size = offset as usize;
     let mut out = vec![0u8; file_size];
 
@@ -758,6 +763,9 @@ pub(super) fn emit_dynamic_executable(
 
     // .dynsym
     let mut ds = dynsym_offset as usize + 24;
+    // Defined entries whose `st_shndx` names a section header, resolved
+    // once the header table exists: (entry, address, TLS).
+    let mut dynsym_sections: Vec<(usize, u64, bool)> = Vec::new();
     for name in &dyn_sym_names {
         let no = dynstr.get_offset(name) as u32;
         w32(&mut out, ds, no);
@@ -769,7 +777,7 @@ pub(super) fn emit_dynamic_executable(
                     out[ds + 4] = (STB_GLOBAL << 4) | (gsym.info & 0xf);
                     out[ds + 5] = 0;
                 }
-                w16(&mut out, ds + 6, 1);
+                dynsym_sections.push((ds, gsym.value, false));
                 w64(&mut out, ds + 8, gsym.value);
                 w64(&mut out, ds + 16, gsym.size);
             } else if !gsym.is_dynamic && gsym.section_idx != SHN_UNDEF && gsym.value != 0 {
@@ -779,8 +787,15 @@ pub(super) fn emit_dynamic_executable(
                     out[ds + 4] = (stb << 4) | stt;
                     out[ds + 5] = 0;
                 }
-                w16(&mut out, ds + 6, 1);
-                w64(&mut out, ds + 8, gsym.value);
+                // A TLS symbol's value is its TLS template offset (gABI).
+                let tls = stt == STT_TLS;
+                dynsym_sections.push((ds, gsym.value, tls));
+                let value = if tls {
+                    gsym.value.wrapping_sub(tls_addr)
+                } else {
+                    gsym.value
+                };
+                w64(&mut out, ds + 8, value);
                 w64(&mut out, ds + 16, gsym.size);
             } else {
                 // Preserve original binding (STB_WEAK vs STB_GLOBAL) and type
@@ -810,8 +825,10 @@ pub(super) fn emit_dynamic_executable(
     // .dynstr
     write_bytes(&mut out, dynstr_offset as usize, dynstr.as_bytes());
 
-    // .rela.dyn (GLOB_DAT + COPY)
-    // AArch64: R_AARCH64_GLOB_DAT = 1025, R_AARCH64_COPY = 1024
+    // .rela.dyn (GLOB_DAT + COPY; an imported TLS variable's GOT slot holds
+    // its TP offset, R_AARCH64_TLS_TPREL64)
+    // AArch64: R_AARCH64_GLOB_DAT = 1025, R_AARCH64_COPY = 1024 (the TLS
+    // types come from `tls_got`, the one place they are defined)
     const R_AARCH64_GLOB_DAT: u64 = 1025;
     const R_AARCH64_COPY: u64 = 1024;
     let mut rd = rela_dyn_offset as usize;
@@ -820,18 +837,20 @@ pub(super) fn emit_dynamic_executable(
         if name.is_empty() || *is_plt {
             continue;
         }
-        let is_dynamic = globals
-            .get(name)
-            .map(|g| g.is_dynamic && !g.copy_reloc)
-            .unwrap_or(false);
-        if is_dynamic {
+        let import = globals.get(name).filter(|g| g.is_dynamic && !g.copy_reloc);
+        if let Some(g) = import {
+            let r_type = if g.info & 0xf == STT_TLS {
+                R_AARCH64_TLS_TPREL64
+            } else {
+                R_AARCH64_GLOB_DAT
+            };
             let si = dyn_sym_names
                 .iter()
                 .position(|n| n == name)
                 .map(|i| i + 1)
                 .unwrap_or(0) as u64;
             w64(&mut out, rd, gd_a);
-            w64(&mut out, rd + 8, (si << 32) | R_AARCH64_GLOB_DAT);
+            w64(&mut out, rd + 8, (si << 32) | r_type);
             w64(&mut out, rd + 16, 0);
             rd += 24;
         }
@@ -1059,10 +1078,14 @@ pub(super) fn emit_dynamic_executable(
                 Some(&v) => v,
                 None => continue,
             };
+            // Unloaded (debug) sections resolve statically in `debug.rs`.
+            if output_sections[out_idx].flags & SHF_ALLOC == 0 {
+                continue;
+            }
             let sa = output_sections[out_idx].addr;
             let sfo = output_sections[out_idx].file_offset;
 
-            for rela in relas {
+            for (ri, rela) in relas.iter().enumerate() {
                 if rela.rela_type == R_AARCH64_NONE {
                     continue;
                 }
@@ -1078,6 +1101,9 @@ pub(super) fn emit_dynamic_executable(
                     continue;
                 }
                 let sym = &objects[obj_idx].symbols[si];
+                if reloc::is_relaxed_tls_call(relas, ri, &sym.name) {
+                    continue;
+                }
                 let p = sa + sec_off + rela.offset;
                 let fp = (sfo + sec_off + rela.offset) as usize;
                 let a = rela.addend;
@@ -1242,6 +1268,50 @@ pub(super) fn emit_dynamic_executable(
     if let Some(h) = &eh_frame_hdr {
         h.write(&mut out)?;
     }
+    debug::apply_debug_relocations(
+        objects,
+        &globals_snap,
+        section_map,
+        output_sections,
+        &mut out,
+    )?;
+
+    let extra = shdr::dynamic_headers(&shdr::DynamicSections {
+        interp: (interp_addr, interp_offset, INTERP.len() as u64),
+        gnu_hash: (gnu_hash_addr, gnu_hash_offset, gnu_hash_size),
+        dynsym: (dynsym_addr, dynsym_offset, dynsym_size),
+        dynstr: (dynstr_addr, dynstr_offset, dynstr_size),
+        rela_dyn: (rela_dyn_addr, rela_dyn_offset, rela_dyn_size),
+        rela_plt: (rela_plt_addr, rela_plt_offset, rela_plt_size),
+        plt: (plt_addr, plt_offset, plt_size),
+        dynamic: (dynamic_addr, dynamic_offset, dynamic_size),
+        got: (got_addr, got_offset, got_size),
+        got_plt: (got_plt_addr, got_plt_offset, got_plt_size),
+        eh_frame_hdr: eh_frame_hdr
+            .as_ref()
+            .map_or((0, 0, 0), |h| (h.vaddr, h.offset, h.size)),
+        // bfd's AArch64 `.plt` has no entry size (measured, bfd 2.44).
+        ..Default::default()
+    });
+    let headers = debug::section_headers(output_sections, extra);
+    for &(entry, addr, tls) in &dynsym_sections {
+        let shndx = match shdr::section_of(&headers, addr, tls) {
+            shdr::SymSection::Named(n) => shdr::header_index(&headers, &n),
+            shdr::SymSection::Abs => None,
+        }
+        .unwrap_or(SHN_ABS);
+        w16(&mut out, entry + 6, shndx);
+    }
+    let syms = (!strip_all).then(|| {
+        debug::symtab(
+            objects,
+            &globals_snap,
+            section_map,
+            output_sections,
+            &headers,
+        )
+    });
+    shdr::append_section_headers(&mut out, &headers, syms.as_deref())?;
 
     // Write output
     std::fs::write(output_path, &out)

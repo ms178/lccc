@@ -8,6 +8,7 @@
 //! behavior controlled by `RelocContext`.
 
 use super::elf_read::*;
+use super::got::{GotKind, GotLayout};
 use super::relocations::{
     GlobalSym, MergedSection, R_RISCV_32, R_RISCV_32_PCREL, R_RISCV_64, R_RISCV_ADD8,
     R_RISCV_ADD16, R_RISCV_ADD32, R_RISCV_ADD64, R_RISCV_ALIGN, R_RISCV_BRANCH, R_RISCV_CALL_PLT,
@@ -30,7 +31,7 @@ pub struct RelocContext<'a> {
     pub local_sym_vaddrs: &'a [Vec<u64>],
     pub global_syms: &'a FxHashMap<String, GlobalSym>,
     pub got_vaddr: u64,
-    pub got_symbols: &'a [String],
+    pub got: &'a GotLayout,
     pub got_plt_vaddr: u64,
     pub tls_vaddr: u64,
     /// For executable linking: GD->LE TLS relaxation info (auipc_vaddr -> (sym_value, addend))
@@ -39,8 +40,6 @@ pub struct RelocContext<'a> {
     pub gd_tls_call_nop: &'a FxHashSet<u64>,
     /// Whether to collect R_RISCV_RELATIVE dynamic relocations (shared lib mode)
     pub collect_relatives: bool,
-    /// For shared library linking: additional GOT offset mapping
-    pub got_sym_offsets: &'a FxHashMap<String, u64>,
     /// For shared library linking: PLT stub addresses for undefined symbols
     pub plt_sym_addrs: &'a FxHashMap<String, u64>,
 }
@@ -311,37 +310,30 @@ fn resolve_sym_value(
     }
 }
 
-/// Look up a GOT entry address for the given symbol.
+/// The address of the GOT slot of `kind` a relocation against `sym`
+/// addresses. An executable reaches an imported function's address through
+/// its `.got.plt` slot when it has no `.got` slot of its own.
 fn lookup_got_entry(
     sym: &super::elf_read::Symbol,
     obj_idx: usize,
     addend: i64,
+    kind: GotKind,
     ctx: &RelocContext,
-) -> u64 {
-    let (sym_name, _) = got_sym_key(obj_idx, sym, addend);
-
-    // Check got_sym_offsets first (shared lib path)
-    if let Some(&got_off) = ctx.got_sym_offsets.get(&sym_name) {
-        return ctx.got_vaddr + got_off;
+) -> Result<u64, String> {
+    let (key, _) = got_sym_key(obj_idx, sym, addend);
+    if let Some(off) = ctx.got.offset(&key, kind) {
+        return Ok(ctx.got_vaddr + off);
     }
-
-    // Check global symbol's got_offset
-    if let Some(gs) = ctx.global_syms.get(sym.name.as_str()) {
-        if let Some(got_off) = gs.got_offset {
-            return ctx.got_vaddr + got_off;
-        }
-        // PLT symbol: use GOT.PLT
-        if gs.needs_plt {
-            return ctx.got_plt_vaddr + (2 + gs.plt_idx) as u64 * 8;
+    if kind == GotKind::Addr && !ctx.collect_relatives {
+        if let Some(gs) = ctx
+            .global_syms
+            .get(sym.name.as_str())
+            .filter(|g| g.needs_plt)
+        {
+            return Ok(ctx.got_plt_vaddr + (2 + gs.plt_idx) as u64 * 8);
         }
     }
-
-    // Search got_symbols by name
-    if let Some(idx) = ctx.got_symbols.iter().position(|n| n == &sym_name) {
-        return ctx.got_vaddr + idx as u64 * 8;
-    }
-
-    0
+    Err(format!("no RISC-V {kind:?} GOT slot for '{}'", sym.name))
 }
 
 /// Resolve a 64-bit address and record the fixup the loader still owes it.
@@ -502,7 +494,7 @@ fn apply_one_reloc(
             }
         }
         R_RISCV_GOT_HI20 => {
-            let got_entry_vaddr = lookup_got_entry(sym, obj_idx, a, ctx);
+            let got_entry_vaddr = lookup_got_entry(sym, obj_idx, a, GotKind::Addr, ctx)?;
             let offset_val = super::displacement::checked_auipc_delta(got_entry_vaddr, a, p)?;
             patch_u_type(data, off, offset_val as u32);
         }
@@ -699,9 +691,23 @@ fn apply_one_reloc(
                 obj_name
             ));
         }
+        R_RISCV_TLS_GD_HI20
+            if ctx
+                .got
+                .offset(&got_sym_key(obj_idx, sym, a).0, GotKind::TlsGd)
+                .is_some() =>
+        {
+            // A real `tls_index` (shared object, or an executable's import).
+            let slot = lookup_got_entry(sym, obj_idx, a, GotKind::TlsGd, ctx)?;
+            let offset_val = super::displacement::checked_auipc_delta(slot, a, p)?;
+            patch_u_type(data, off, offset_val as u32);
+        }
         R_RISCV_TLS_GD_HI20 => {
-            // GD->LE relaxation: rewrite auipc -> lui with tprel
-            // TODO: In shared libs, this should emit TLS_DTPMOD64/DTPOFF64 dynamic relocs
+            // GD->LE relaxation of a variable the executable defines:
+            // auipc -> lui with the TP offset (`collect_gd_tls_relax_info`).
+            if ctx.collect_relatives {
+                return Err(format!("no RISC-V tls_index for '{}'", sym.name));
+            }
             let tprel = (s as i64 + a - ctx.tls_vaddr as i64) as u32;
             let hi = tprel.wrapping_add(0x800) & 0xFFFFF000;
             if off + 4 <= data.len() {
@@ -710,7 +716,7 @@ fn apply_one_reloc(
             }
         }
         R_RISCV_TLS_GOT_HI20 => {
-            let got_entry_vaddr = lookup_got_entry(sym, obj_idx, a, ctx);
+            let got_entry_vaddr = lookup_got_entry(sym, obj_idx, a, GotKind::TlsIe, ctx)?;
             let offset_val = super::displacement::checked_auipc_delta(got_entry_vaddr, a, p)?;
             patch_u_type(data, off, offset_val as u32);
         }
@@ -749,7 +755,7 @@ fn find_hi20_value_for_reloc(
             auipc_addr,
             sec_offset,
             ctx.got_vaddr,
-            ctx.got_symbols,
+            ctx.got,
         )
     } else {
         super::relocations::find_hi20_value(
@@ -763,7 +769,7 @@ fn find_hi20_value_for_reloc(
             auipc_addr,
             sec_offset,
             ctx.got_vaddr,
-            ctx.got_symbols,
+            ctx.got,
             ctx.got_plt_vaddr,
             ctx.gd_tls_relax_info,
             ctx.tls_vaddr,
@@ -771,7 +777,8 @@ fn find_hi20_value_for_reloc(
     }
 }
 
-/// Collect GD TLS relaxation info for static binaries.
+/// Collect GD TLS relaxation info for executables: every general-dynamic
+/// access to a variable the executable defines (no `tls_index` slot).
 ///
 /// Pre-scans relocations to find R_RISCV_TLS_GD_HI20 entries and their
 /// associated __tls_get_addr CALL_PLT entries, so they can be relaxed
@@ -782,6 +789,7 @@ pub fn collect_gd_tls_relax_info(
     section_vaddrs: &[u64],
     local_sym_vaddrs: &[Vec<u64>],
     global_syms: &FxHashMap<String, GlobalSym>,
+    got: &GotLayout,
     gd_tls_relax_info: &mut FxHashMap<u64, (u64, i64)>,
     gd_tls_call_nop: &mut FxHashSet<u64>,
 ) {
@@ -798,9 +806,13 @@ pub fn collect_gd_tls_relax_info(
 
             for (ri, reloc) in relocs.iter().enumerate() {
                 if reloc.rela_type == R_RISCV_TLS_GD_HI20 {
+                    let sym = &obj.symbols[reloc.sym_idx as usize];
+                    let key = got_sym_key(obj_idx, sym, reloc.addend).0;
+                    if got.offset(&key, GotKind::TlsGd).is_some() {
+                        continue; // an import keeps its `tls_index`
+                    }
                     let offset = sec_offset + reloc.offset;
                     let auipc_vaddr = ms_vaddr + offset;
-                    let sym = &obj.symbols[reloc.sym_idx as usize];
                     let sym_val = resolve_symbol_value(
                         sym,
                         reloc.sym_idx as usize,

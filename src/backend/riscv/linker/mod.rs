@@ -25,10 +25,12 @@
 //! - `emit_shared`: Shared library (.so) emission
 
 mod align;
+mod debug;
 mod displacement;
 mod elf_read;
 mod emit_exec;
 mod emit_shared;
+mod got;
 mod input;
 mod link;
 mod reloc;

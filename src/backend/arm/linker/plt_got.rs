@@ -7,6 +7,11 @@
 use crate::common::fx_hash::FxHashMap;
 
 use super::elf::*;
+use super::reloc::{
+    self, R_AARCH64_TLSDESC_ADR_PAGE21, R_AARCH64_TLSDESC_LD64_LO12, R_AARCH64_TLSGD_ADD_LO12_NC,
+    R_AARCH64_TLSGD_ADR_PAGE21, R_AARCH64_TLSIE_ADR_GOTTPREL_PAGE21,
+    R_AARCH64_TLSIE_LD64_GOTTPREL_LO12_NC,
+};
 use super::types::GlobalSymbol;
 
 /// True when a dynamic symbol of ELF type `sym_type`, defined at a library
@@ -28,13 +33,14 @@ pub(super) fn create_plt_got(
 
     for obj in objects {
         for sec_idx in 0..obj.sections.len() {
-            for rela in &obj.relocations[sec_idx] {
+            let relas = &obj.relocations[sec_idx];
+            for (ri, rela) in relas.iter().enumerate() {
                 let si = rela.sym_idx as usize;
                 if si >= obj.symbols.len() {
                     continue;
                 }
                 let sym = &obj.symbols[si];
-                if sym.name.is_empty() {
+                if sym.name.is_empty() || reloc::is_relaxed_tls_call(relas, ri, &sym.name) {
                     continue;
                 }
                 let gsym_info = globals
@@ -86,6 +92,21 @@ pub(super) fn create_plt_got(
                             }
                         } else if !copy_reloc_names.contains(&sym.name.to_string()) {
                             copy_reloc_names.push(sym.name.to_string());
+                        }
+                    }
+                    // An imported TLS variable is reached through a GOT slot
+                    // holding its TP offset, whatever the access model
+                    // (`reloc.rs` relaxes descriptor and GD access to IE).
+                    R_AARCH64_TLSIE_ADR_GOTTPREL_PAGE21
+                    | R_AARCH64_TLSIE_LD64_GOTTPREL_LO12_NC
+                    | R_AARCH64_TLSDESC_ADR_PAGE21
+                    | R_AARCH64_TLSDESC_LD64_LO12
+                    | R_AARCH64_TLSGD_ADR_PAGE21
+                    | R_AARCH64_TLSGD_ADD_LO12_NC
+                        if gsym_info.map(|g| g.0).unwrap_or(false) =>
+                    {
+                        if !got_only_names.contains(&sym.name.to_string()) {
+                            got_only_names.push(sym.name.to_string());
                         }
                     }
                     R_AARCH64_ADR_GOT_PAGE | R_AARCH64_LD64_GOT_LO12_NC => {
