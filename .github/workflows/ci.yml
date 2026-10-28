@@ -2893,7 +2893,8 @@ jobs:
       # process spawns on the hosted runner), assigned longest-processing-
       # time first by scripts/ci_bench_shards.py.
       # Original assignment: predicted 389 s of 771 s for 23 kernels.
-      # The bounded F32 map extends this shard; F64 extends shard b.
+      # The bounded F32 map and zlib-ng compare256 extend this shard; F64
+      # extends shard b. Rebalance from a fresh report if the cost shifts.
       only: >-
           fp32_product_map,
           f32_sse1_map,
@@ -2920,6 +2921,7 @@ jobs:
           tls_seg_access,
           zlib_ng_adler32,
           zlib_ng_adler32_combine,
+          zlib_ng_compare256,
   benchmark-b:
     name: Benchmark corpus (shard b)
     needs: [build]
@@ -3080,6 +3082,9 @@ jobs:
     - name: Volatile reduction O3 contracts and ICX matrix
       run: |
         set -euo pipefail
+        # Preserve the failing command in the check annotations as well as
+        # the job log, including when the vendor-runtime matrix fails.
+        trap 'status=$?; printf "::error title=Volatile reduction ICX matrix::line %s, exit %s: %s\n" "$LINENO" "$status" "$BASH_COMMAND"' ERR
         # Shared ICX objects use vendor dynamic runtimes even when ordinary
         # executables use static Intel runtimes. Keep dlopen's loader explicit.
         intel_runtime=$(find "$RUNNER_TEMP/intel-icx-2026.2" -name libimf.so -print -quit)
