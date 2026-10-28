@@ -75,6 +75,22 @@ readonly SPELLING_ALLOWLIST=(
     # "__LDBL_MAX__": GCC uses a trailing 'L' suffix, lccc matches the value
     # but not the exact token spelling — justified, same numeric value.
     "__LDBL_MAX__"
+    # "__SIZE_MAX__" on i686 (ILP32): lccc emits "4294967295U" (unsigned int
+    # suffix) while gcc-16 emits "4294967295UL" (unsigned long suffix).  Same
+    # numeric value (4294967295), different token spelling — justified.
+    "__SIZE_MAX__"
+    # "__STDC_VERSION__": lccc claims C23 (202311L) in every -std= mode per
+    # its permissive-extension dialect policy; gcc-16 emits 201710L (gnu17)
+    # and 199409L (gnu90).  Same __STDC__ conformance level class, different
+    # dialect string — justified.
+    "__STDC_VERSION__"
+    # "__GNUC__": lccc claims GCC 14.2.0 (GP-05 policy: __GNUC__=14 avoids
+    # glibc headers enabling features lccc does not implement).  gcc-16
+    # reports 16.  Intentional version claim — justified.
+    "__GNUC__"
+    # "__VERSION__": mirrors __GNUC__ — lccc "14.2.0" vs gcc-16 "16.2.0".
+    # Intentional version string — justified.
+    "__VERSION__"
 )
 
 # Pairs to probe: (target, dialect)
