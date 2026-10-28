@@ -462,6 +462,8 @@ gate "binary-equivalence-contracts" fast \
 
 gate "benchmark-harness-contracts" fast \
     python3 tests/benchmark/test_benchmark_harness.py
+gate "zlib-compare256-correctness" fast \
+    python3 tests/regression/check_zlib_compare256.py --lccc "$LCCC" --gcc "${GCC16:-gcc-16}" --m32
 
 gate "label-reference-cost-contracts" fast \
     python3 scripts/test_measure_label_ref_cost.py

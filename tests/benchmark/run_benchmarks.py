@@ -163,6 +163,8 @@ BENCHMARKS: tuple[Benchmark, ...] = (
               ("zlib_ng_adler32.c",), ("workload", "zlib-ng", "checksum", "loop")),
     Benchmark("zlib_ng_adler32_combine", "zlib-ng checksum composition / modular arithmetic",
               ("zlib_ng_adler32_combine.c",), ("workload", "zlib-ng", "checksum", "integer")),
+    Benchmark("zlib_ng_compare256", "zlib-ng 256-byte match extension / XOR and bit scan",
+              ("zlib_ng_compare256.c",), ("workload", "zlib-ng", "compression", "memory", "bit")),
     Benchmark("expat_xml_scan", "Expat UTF-8 XML name-token scan",
               ("expat_xml_scan.c",), ("workload", "expat", "parser", "branch")),
     Benchmark("expat_siphash24", "Expat SipHash-2-4 keyed name hashing / short variable messages",

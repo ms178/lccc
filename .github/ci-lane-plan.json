@@ -965,7 +965,7 @@
     "frontend-a": {
       "group": "frontend",
       "mode": "steps",
-      "predicted_gate_seconds": 270.0,
+      "predicted_gate_seconds": 271.91,
       "shards": 3,
       "steps": [
         {
@@ -1059,6 +1059,10 @@
         {
           "measured_s": 1.0,
           "name": "Verify benchmark harness oracle and timing contracts"
+        },
+        {
+          "measured_s": 1.91,
+          "name": "Verify zlib-ng match kernel across optimization levels and ABIs"
         },
         {
           "measured_s": 0.25,

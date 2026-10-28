@@ -65,7 +65,32 @@ the earlier PR's red checks are not evidence for this branch. In particular,
 standalone test commands that build and immediately execute `-m32` programs
 need an explicit private-interpreter flag or a real host multilib installation;
 merely setting `LIBRARY_PATH` cannot change a binary's ELF interpreter.
-The warning-registry work (GP-09), the remaining quantified GP verdicts,
-real-workload benchmark additions, and multi-compiler research comparisons are
-not yet claimed complete. No generated-code performance improvement is claimed
+The warning registry (GP-09) and initial workload/comparator additions have
+landed; the remaining quantified GP verdicts, complete real-workload coverage,
+and multi-compiler research comparisons are not yet claimed complete. No generated-code performance improvement is claimed
 for this diagnostics and infrastructure work.
+
+## Workload research update
+
+The benchmark registry now includes a zlib-ng 2.3.3 `compare256_64` kernel,
+with upstream source provenance and the unaligned `memcpy` fallback. Its
+self-check covers every mismatch offset from 0 through 256 across all 64
+pairs of byte alignments, plus same-pointer inputs. A differential gate runs
+GCC 16.2 and LCCC at `-O0`, `-O2`, `-O3` and `-Os`, both native and i686,
+and requires a deliberately mutated kernel to fail. Clang 23.1.4 was also
+checked locally. This is a derived kernel, not a complete compression test
+or a performance claim.
+
+The pinned zlib-ng 2.3.3 source and packaging patch were verified by SHA-256,
+then the configure/Make static build was run with GCC 16.2 and LCCC at `-O2`
+in zlib-compat mode. For both builds, `libz.a`, `example`, and `minigzip` were
+explicitly built, and upstream `make -C test alltests` completed, including its
+static/example and regression targets. Three additional inputs (empty,
+deterministic random and repetitive), four compression levels, both
+producers and both consumers gave 48 successful cross-compiler roundtrips;
+24 streams also decoded with system gzip. This corrects an earlier attempt
+where `make test` was a no-op and no `minigzip` existed. CMake/CTest and the
+full upstream test configurations remain unrun because CMake was unavailable;
+these results do not replace them. The local evidence is under
+`~/.cache/lccc/zlib-configure-test-v2` and is not a target-hardware timing
+measurement.
