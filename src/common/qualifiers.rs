@@ -11,7 +11,7 @@
 //! rules through [`ConstLookup`], so their selections agree.
 
 use crate::frontend::parser::ast::{
-    BinOp, Expr, GenericAssociation, PostfixOp, TypeSpecifier, UnaryOp,
+    BinOp, BlockItem, Expr, GenericAssociation, PostfixOp, Stmt, TypeSpecifier, UnaryOp,
 };
 
 /// The declarations a phase knows about.
@@ -23,6 +23,24 @@ pub trait ConstLookup {
     fn typedef_const_base(&self, name: &str) -> bool;
     /// Whether `expr` has pointer or array type.
     fn is_pointer(&self, expr: &Expr) -> bool;
+    /// Resolve the selected association expression of a `_Generic` selection.
+    fn select_generic<'a>(
+        &self,
+        _controlling: &Expr,
+        _associations: &'a [GenericAssociation],
+    ) -> Option<&'a Expr> {
+        None
+    }
+    /// Recorded base constness of member `field` on `base` (`base->field` when
+    /// `indirect` is true, `base.field` otherwise).
+    fn member_const_base(&self, _base: &Expr, _field: &str, _indirect: bool) -> bool {
+        false
+    }
+    /// Recorded base constness of the return type of a call to `callee`, when
+    /// `callee` resolves to a known function signature.
+    fn call_const_base(&self, _callee: &Expr) -> Option<bool> {
+        None
+    }
 }
 
 /// Base constness of the type named by `ts`, whose own spelling has a base
@@ -86,6 +104,67 @@ pub fn expr_const_base(expr: &Expr, lookup: &impl ConstLookup) -> bool {
         Expr::CompoundLiteral(ts, _, _, st) => {
             type_name_const_base(ts, st.is_const || st.is_constexpr, lookup)
         }
+        Expr::GenericSelection(controlling, associations, _) => lookup
+            .select_generic(controlling, associations)
+            .is_some_and(|selected| expr_const_base(selected, lookup)),
+        Expr::PointerMemberAccess(base, field, _) => {
+            lookup.member_const_base(base, field, true)
+                || (!lookup.is_pointer(expr) && expr_const_base(base, lookup))
+        }
+        Expr::MemberAccess(base, field, _) => {
+            lookup.member_const_base(base, field, false)
+                || (!lookup.is_pointer(expr)
+                    && !lookup.is_pointer(base)
+                    && expr_const_base(base, lookup))
+        }
+        Expr::StmtExpr(compound, _) => match compound.items.last() {
+            Some(BlockItem::Statement(Stmt::Expr(Some(last)))) => expr_const_base(last, lookup),
+            _ => false,
+        },
+        Expr::FunctionCall(callee, _, _) => lookup.call_const_base(callee).unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// Whether `expr`'s base constness is recorded by declarations rather than
+/// falling back to the unrecorded default.
+fn expr_const_recorded(expr: &Expr, lookup: &impl ConstLookup) -> bool {
+    let pointer_operand = |a: &Expr, b: &Expr| {
+        let operand = if lookup.is_pointer(a) { a } else { b };
+        expr_const_recorded(operand, lookup)
+    };
+    match expr {
+        Expr::Identifier(..)
+        | Expr::Cast(..)
+        | Expr::CompoundLiteral(..)
+        | Expr::StringLiteral(..)
+        | Expr::WideStringLiteral(..)
+        | Expr::Char16StringLiteral(..)
+        | Expr::PointerMemberAccess(..)
+        | Expr::MemberAccess(..) => true,
+        Expr::AddressOf(inner, _)
+        | Expr::Deref(inner, _)
+        | Expr::Comma(_, inner, _)
+        | Expr::Assign(inner, ..)
+        | Expr::CompoundAssign(_, inner, ..)
+        | Expr::UnaryOp(UnaryOp::PreInc | UnaryOp::PreDec, inner, _)
+        | Expr::PostfixOp(PostfixOp::PostInc | PostfixOp::PostDec, inner, _) => {
+            expr_const_recorded(inner, lookup)
+        }
+        Expr::ArraySubscript(a, b, _) | Expr::BinaryOp(BinOp::Add | BinOp::Sub, a, b, _) => {
+            pointer_operand(a, b)
+        }
+        Expr::Conditional(_, a, b, _) | Expr::GnuConditional(a, b, _) => {
+            expr_const_recorded(a, lookup) && expr_const_recorded(b, lookup)
+        }
+        Expr::GenericSelection(controlling, associations, _) => lookup
+            .select_generic(controlling, associations)
+            .is_some_and(|selected| expr_const_recorded(selected, lookup)),
+        Expr::StmtExpr(compound, _) => match compound.items.last() {
+            Some(BlockItem::Statement(Stmt::Expr(Some(last)))) => expr_const_recorded(last, lookup),
+            _ => false,
+        },
+        Expr::FunctionCall(callee, _, _) => lookup.call_const_base(callee).is_some(),
         _ => false,
     }
 }
@@ -103,10 +182,10 @@ pub fn association_const_base(assoc: &GenericAssociation, lookup: &impl ConstLoo
 ///
 /// A type operand's constness is exact (C2y), so it is always compared. An
 /// expression operand undergoes lvalue conversion, which drops a non-pointer
-/// operand's qualifiers and keeps a pointer's pointee ones; as an operand's
-/// constness is unknown where no declaration records it, it is compared only
-/// when the associations differ in constness or the operand is known const --
-/// otherwise `_Generic(s.name, const char *: 1)` could not select.
+/// operand's qualifiers and keeps a pointer's pointee ones; when a pointer
+/// operand's constness is recorded and `default:` is present (such as Linux's
+/// `container_of_const`), constness is also compared so a non-const pointer
+/// selects `default:` rather than a `const T *` association.
 pub fn controlling_const(
     controlling: &Expr,
     associations: &[GenericAssociation],
@@ -121,5 +200,10 @@ pub fn controlling_const(
         .filter(|a| a.type_spec.is_some())
         .map(|a| association_const_base(a, lookup));
     let differ = typed.clone().any(|c| c) && typed.any(|c| !c);
-    (is_const, is_const || differ)
+    let has_default = associations.iter().any(|a| a.type_spec.is_none());
+    let known_pointer = lookup.is_pointer(controlling) && expr_const_recorded(controlling, lookup);
+    (
+        is_const,
+        is_const || differ || (has_default && known_pointer),
+    )
 }

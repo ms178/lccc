@@ -825,7 +825,7 @@
     "codegen-b": {
       "group": "codegen",
       "mode": "steps",
-      "predicted_gate_seconds": 403.11,
+      "predicted_gate_seconds": 403.36,
       "shards": 2,
       "steps": [
         {
@@ -903,6 +903,10 @@
         {
           "measured_s": 0.37,
           "name": "Verify kernel boot-path ISA contract (patch + artifact scan)"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Linux 6.18 semantic-analysis and qualifier parity"
         },
         {
           "measured_s": 17.63,

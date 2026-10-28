@@ -1269,7 +1269,9 @@ impl Lowerer {
         ty.is_integer()
             && self.resolve_ctype_size(ty) == crate::common::types::target_ptr_size()
             && self.eval_const_expr(expr).is_none()
-            && (self.eval_global_addr_expr(expr).is_some() || Self::expr_contains_label_addr(expr))
+            && (self.eval_global_addr_expr(expr).is_some()
+                || self.is_string_literal_addr_expr(expr)
+                || Self::expr_contains_label_addr(expr))
     }
 
     /// Consume consecutive expression items from `items` to flat-initialize an array field.

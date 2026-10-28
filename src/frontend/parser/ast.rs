@@ -377,6 +377,8 @@ impl std::fmt::Debug for FunctionAttributes {
 #[derive(Debug, Clone)]
 pub struct FunctionDef {
     pub return_type: TypeSpecifier,
+    /// Explicit `const` on the return type's base specifier (`const int *f(void)`).
+    pub return_base_const: bool,
     /// `const` bits of the RETURN type's pointer levels (bit `L-1` is pointer
     /// level `L`). `CType` erases qualifiers, so `int *const *f(void)` would
     /// otherwise look like `int **f(void)` and `*f() = 0` be accepted.

@@ -880,6 +880,11 @@ pub struct X86Codegen {
     /// the 16-byte save slot above the argument area instead of a static
     /// `addq` (the realignment delta is runtime-dependent).
     pub(super) dyn_align_cleanup: bool,
+    /// Defense-in-depth for mature `CallIndirect`: true when an indirect
+    /// call's argument is homed in `%r10` (`PhysReg(11)`), so Phase 0 parked
+    /// the callee pointer in a 16-byte transient stack slot instead of
+    /// clobbering `%r10` before argument staging.
+    pub(super) indirect_fptr_on_stack: bool,
     /// Scratch register index for inline asm allocation (GP registers)
     pub(super) asm_scratch_idx: usize,
     /// Scratch register index for inline asm allocation (XMM registers)
@@ -1623,6 +1628,7 @@ impl X86Codegen {
             vararg_gp_save: true,
             vararg_fp_save: true,
             dyn_align_cleanup: false,
+            indirect_fptr_on_stack: false,
             asm_scratch_idx: 0,
             asm_xmm_scratch_idx: 0,
             reg_assignments: FxHashMap::default(),
@@ -10617,6 +10623,7 @@ impl ArchCodegen for X86Codegen {
         fn call_abi_config(&self) -> CallAbiConfig => call_abi_config_impl;
         fn emit_call_compute_stack_space(&self, arg_classes: &[CallArgClass], arg_types: &[IrType], struct_arg_aligns: &[Option<usize>], _struct_arg_classes: &[Vec<crate::common::types::EightbyteClass>], struct_arg_is_f128_sse: &[bool]) -> usize => emit_call_compute_stack_space_impl;
         fn emit_call_spill_fptr(&mut self, func_ptr: &Operand) => emit_call_spill_fptr_impl;
+        fn emit_call_spill_fptr_with_args(&mut self, func_ptr: &Operand, args: &[Operand]) => emit_call_spill_fptr_with_args_impl;
         fn emit_call_stack_args(&mut self, args: &[Operand], arg_classes: &[CallArgClass], arg_types: &[IrType], stack_arg_space: usize, fptr_spill: usize, f128_temp_space: usize, struct_arg_aligns: &[Option<usize>], _struct_arg_classes: &[Vec<crate::common::types::EightbyteClass>], struct_arg_is_f128_sse: &[bool]) -> i64 => emit_call_stack_args_impl;
         fn emit_call_reg_args(&mut self, args: &[Operand], arg_classes: &[CallArgClass], arg_types: &[IrType], total_sp_adjust: i64, f128_temp_space: usize, stack_arg_space: usize, struct_arg_riscv_float_classes: &[Option<crate::common::types::RiscvFloatClass>]) => emit_call_reg_args_impl;
         fn emit_call_instruction(&mut self, direct_name: Option<&str>, func_ptr: Option<&Operand>, indirect: bool, stack_arg_space: usize) => emit_call_instruction_impl;

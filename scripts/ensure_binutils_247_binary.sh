@@ -48,4 +48,6 @@ fi
 
 python3 "$RESTORE" --tag "$tag" --prefix "$prefix" --repo "$REPO" --remote "$remote" --only binutils
 bash "$0" --prefix "$prefix" --verify-only
-[ "$print_bin" = 1 ] && echo "$prefix/bin"
+if [ "$print_bin" = 1 ]; then
+    echo "$prefix/bin"
+fi

@@ -1372,6 +1372,13 @@ gate "isa-gate-escape" fast \
 # the built boot/decompressor objects are baseline-clean.
 gate "kernel-boot-isa" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_kernel_boot_isa.sh
+# The front-end half of the same 6.18 kernel contract: _Generic/
+# container_of_const qualifier selection (including long typeof(...)
+# spellings), enum callback compatibility, bit-field promotion,
+# __attribute__((cleanup)) scope guards, -Wformat parity, function-pointer
+# arithmetic and string-literal address relocations in static storage.
+gate "kernel-618-sema-parity" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_kernel_618_sema_parity.sh
 # Executed __seg_gs runtime contract: segment accesses and aggregate copies
 # run under a real GS base and match gcc -O2.
 gate "seg-gs-runtime" fast \

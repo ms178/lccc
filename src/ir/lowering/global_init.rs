@@ -423,6 +423,9 @@ impl Lowerer {
 
     /// The truth value of a folded operand: an address is never null.
     fn global_truth(&self, expr: &Expr) -> Option<bool> {
+        if self.is_string_literal_addr_expr(expr) {
+            return Some(true);
+        }
         match self.global_operand(expr) {
             Some(GlobalOperand::Int(v)) => Some(v != 0),
             Some(GlobalOperand::Addr(..)) => Some(true),
@@ -525,7 +528,7 @@ impl Lowerer {
     ///   `var Alloc = (var)((char*)((var[]){ NULL, ... }) + sizeof(struct Header))`
     /// The compound literal `(var[]){ NULL, ... }` must be materialized as an
     /// anonymous global before the pointer arithmetic can be resolved.
-    fn materialize_compound_literals_in_expr(&mut self, expr: &Expr) {
+    pub(super) fn materialize_compound_literals_in_expr(&mut self, expr: &Expr) {
         match expr {
             Expr::CompoundLiteral(type_spec, init, _, st) => {
                 let key = expr as *const Expr as usize;
@@ -1633,9 +1636,69 @@ impl Lowerer {
 // =============================================================================
 
 impl Lowerer {
+    /// Pure `&self` query matching [`Self::eval_string_literal_addr_expr`] without
+    /// interning literals, used by relocation-planning predicates (`&self`).
+    pub(super) fn is_string_literal_addr_expr(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::BinaryOp(BinOp::Add, lhs, rhs, _) => {
+                self.can_eval_string_literal_with_offset(lhs, rhs)
+                    || self.can_eval_string_literal_with_offset(rhs, lhs)
+            }
+            Expr::BinaryOp(BinOp::Sub, lhs, rhs, _) => {
+                self.can_eval_string_literal_with_offset(lhs, rhs)
+            }
+            Expr::AddressOf(inner, _) => match inner.as_ref() {
+                Expr::ArraySubscript(base, index, _) => {
+                    self.can_eval_string_literal_with_offset(base, index)
+                }
+                Expr::StringLiteral(..)
+                | Expr::WideStringLiteral(..)
+                | Expr::Char16StringLiteral(..) => true,
+                Expr::Identifier(..) => self.function_name_string(inner).is_some(),
+                Expr::Deref(sub, _) => self.is_string_literal_addr_expr(sub),
+                _ => false,
+            },
+            Expr::Cast(_, inner, _, _) => self.is_string_literal_addr_expr(inner),
+            Expr::Conditional(cond, then, els, _) => {
+                let Some(cv) = self.eval_init_condition(cond) else {
+                    return false;
+                };
+                let taken = if cv.is_nonzero() { then } else { els };
+                self.is_string_literal_addr_expr(taken)
+            }
+            Expr::GenericSelection(controlling, associations, _) => self
+                .resolve_generic_selection_expr(controlling, associations)
+                .is_some_and(|sel| self.is_string_literal_addr_expr(sel)),
+            Expr::FunctionCall(callee, args, _)
+                if matches!(callee.as_ref(), Expr::Identifier(name, _) if name == "__builtin_choose_expr")
+                    && args.len() >= 3 =>
+            {
+                let Some(cv) = self.eval_const_expr(&args[0]) else {
+                    return false;
+                };
+                let chosen = if cv.is_nonzero() { &args[1] } else { &args[2] };
+                self.is_string_literal_addr_expr(chosen)
+            }
+            Expr::Identifier(..) => self.function_name_string(expr).is_some(),
+            Expr::StringLiteral(..)
+            | Expr::WideStringLiteral(..)
+            | Expr::Char16StringLiteral(..) => true,
+            _ => false,
+        }
+    }
+
+    fn can_eval_string_literal_with_offset(&self, str_expr: &Expr, offset_expr: &Expr) -> bool {
+        (self.extract_string_literal(str_expr).is_some()
+            || self.function_name_string(str_expr).is_some())
+            && self
+                .eval_const_expr(offset_expr)
+                .and_then(|v| self.const_to_i64(&v))
+                .is_some()
+    }
+
     /// Evaluate a string literal address expression for static initializers.
-    /// Handles: `"hello"`, `"hello" + 2`, `"hello" - 1`, `(type*)"hello"`,
-    /// `&"hello"[2]`, etc.
+    /// Handles: `"hello"`, `&"hello"`, `"hello" + 2`, `"hello" - 1`,
+    /// `(type*)"hello"`, `&"hello"[2]`, conditionals, `_Generic`, etc.
     pub(super) fn eval_string_literal_addr_expr(&mut self, expr: &Expr) -> Option<GlobalInit> {
         match expr {
             Expr::BinaryOp(BinOp::Add, lhs, rhs, _) => self
@@ -1644,16 +1707,21 @@ impl Lowerer {
             Expr::BinaryOp(BinOp::Sub, lhs, rhs, _) => {
                 self.eval_string_literal_with_offset(lhs, rhs, true)
             }
-            // &"string"[index] -> intern string literal + byte offset
-            // This is equivalent to "string" + index, but expressed as
-            // address-of array subscript on a string literal.
-            Expr::AddressOf(inner, _) => {
-                if let Expr::ArraySubscript(base, index, _) = inner.as_ref() {
+            // &"string"[index] -> intern string literal + byte offset;
+            // &"string" -> address of the string array object itself (same runtime
+            // base address as the decayed string pointer, e.g. kernel PCI_VDEVICE's
+            // `(0 ? 0 : (kernel_ulong_t)&"PARPORT_SERIAL")`).
+            Expr::AddressOf(inner, _) => match inner.as_ref() {
+                Expr::ArraySubscript(base, index, _) => {
                     self.eval_string_literal_with_offset(base, index, false)
-                } else {
-                    None
                 }
-            }
+                Expr::StringLiteral(..)
+                | Expr::WideStringLiteral(..)
+                | Expr::Char16StringLiteral(..)
+                | Expr::Identifier(..) => self.eval_string_literal_addr_expr(inner),
+                Expr::Deref(sub, _) => self.eval_string_literal_addr_expr(sub),
+                _ => None,
+            },
             Expr::Cast(_, inner, _, _) => self.eval_string_literal_addr_expr(inner),
             // `c ? "a" : "b"` with a constant condition is the selected operand
             // (the kernel's `__builtin_constant_p(MOD ": ...") ? MOD ": ..." : ...`).
@@ -1664,6 +1732,23 @@ impl Lowerer {
                     els
                 };
                 self.eval_string_literal_addr_expr(taken)
+            }
+            Expr::GenericSelection(controlling, associations, _) => {
+                let selected = self
+                    .resolve_generic_selection_expr(controlling, associations)?
+                    .clone();
+                self.eval_string_literal_addr_expr(&selected)
+            }
+            Expr::FunctionCall(callee, args, _)
+                if matches!(callee.as_ref(), Expr::Identifier(name, _) if name == "__builtin_choose_expr")
+                    && args.len() >= 3 =>
+            {
+                let chosen = if self.eval_const_expr(&args[0])?.is_nonzero() {
+                    &args[1]
+                } else {
+                    &args[2]
+                };
+                self.eval_string_literal_addr_expr(chosen)
             }
             Expr::Identifier(..) => {
                 let (name, _) = self.function_name_string(expr)?;
@@ -2151,7 +2236,12 @@ impl Lowerer {
                     return true;
                 }
                 if h::expr_contains_string_literal(expr)
-                    && h::type_has_pointer_elements(field_ty, &*self.types.borrow_struct_layouts())
+                    && (h::type_has_pointer_elements(
+                        field_ty,
+                        &*self.types.borrow_struct_layouts(),
+                    ) || (self.ctype_can_hold_addr_constant(field_ty)
+                        && self.eval_const_expr(expr).is_none()
+                        && self.is_string_literal_addr_expr(expr)))
                 {
                     return true;
                 }
