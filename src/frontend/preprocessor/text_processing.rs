@@ -5,7 +5,9 @@
 //! balancing checks, and directive line splitting.
 
 use super::pipeline::Preprocessor;
-use super::utils::{copy_literal_bytes_raw, is_digit_separator, skip_literal_bytes};
+use super::utils::{
+    copy_literal_bytes_raw, hash_token_len, is_digit_separator, skip_literal_bytes,
+};
 
 /// Mapping from output line numbers to original source line numbers.
 ///
@@ -182,21 +184,30 @@ fn first_non_blank(line: &[u8]) -> Option<u8> {
     line.iter().copied().find(|&b| b != b' ' && b != b'\t')
 }
 
-/// First byte at or after `from` that is neither a space, a tab nor inside
-/// a block comment closed on the same line; `None` at a line end.
-fn next_token_byte(bytes: &[u8], mut from: usize) -> Option<u8> {
+/// Whether the first token of a line is a directive introducer, recognizing
+/// `%:` but not the longer `%:%:` token.
+fn starts_directive(line: &[u8]) -> bool {
+    let offset = line.iter().position(|&b| b != b' ' && b != b'\t');
+    offset.is_some_and(|i| hash_token_len(&line[i..]) != 0)
+}
+
+/// Find a directive introducer at or after `from`, skipping horizontal space
+/// and same-line block comments. A newline terminates the search.
+fn next_token_is_directive(bytes: &[u8], mut from: usize) -> bool {
     loop {
-        match bytes.get(from)? {
-            b' ' | b'\t' => from += 1,
-            b'\n' => return None,
-            b'/' if bytes.get(from + 1) == Some(&b'*') => {
-                let close = bytes[from + 2..].windows(2).position(|w| w == b"*/")?;
+        match bytes.get(from) {
+            Some(b' ' | b'\t') => from += 1,
+            Some(b'/') if bytes.get(from + 1) == Some(&b'*') => {
+                let Some(close) = bytes[from + 2..].windows(2).position(|w| w == b"*/") else {
+                    return false;
+                };
                 if bytes[from + 2..from + 2 + close].contains(&b'\n') {
-                    return None;
+                    return false;
                 }
                 from += close + 4;
             }
-            &b => return Some(b),
+            Some(b'\n') | None => return false,
+            _ => return hash_token_len(&bytes[from..]) != 0,
         }
     }
 }
@@ -377,9 +388,9 @@ impl Preprocessor {
                     let spanned = src_line - comment_start_line;
                     let line_so_far = &result[line_start..];
                     let collapse = spanned > 0
-                        && (first_non_blank(line_so_far) == Some(b'#')
+                        && (starts_directive(line_so_far)
                             || (first_non_blank(line_so_far).is_some()
-                                && next_token_byte(bytes, i) == Some(b'#')));
+                                && next_token_is_directive(bytes, i)));
                     if spanned == 0 || collapse {
                         result.push(b' ');
                     }
@@ -550,7 +561,8 @@ impl Preprocessor {
             if let Some(pos) = bs_pos {
                 if !continuation {
                     splice_state = SpliceState::Code;
-                    splittable = !matches!(first_non_blank(line.as_bytes()), Some(b'#' | b'/'));
+                    splittable = first_non_blank(line.as_bytes()) != Some(b'/')
+                        && !starts_directive(line.as_bytes());
                 }
                 splice_state = splice_state.scan(&line.as_bytes()[..pos]);
                 let next = lines.peek().map_or(&b""[..], |l| l.as_bytes());
@@ -561,7 +573,7 @@ impl Preprocessor {
                     && splittable
                     && boundary
                     && matches!(splice_state, SpliceState::Code | SpliceState::BlockComment)
-                    && first_non_blank(next) != Some(b'#')
+                    && !starts_directive(next)
                 {
                     // Keep the line break: this part ends its joined line.
                     // A block comment stays open across it (`splice_state`

@@ -1731,6 +1731,12 @@ impl Driver {
             Target::I686 => preprocessor.set_target("i686"),
             Target::X86_64 => preprocessor.set_target("x86_64"),
         }
+        // set_target may add architecture-specific default directories, so
+        // clear them only after target selection. User-specified directories
+        // are added separately below and remain available with -nostdinc.
+        if self.nostdinc {
+            preprocessor.clear_default_include_paths();
+        }
         // Apply RISC-V ABI/arch overrides from -mabi= and -march= flags.
         // These must come after set_target() which sets defaults for RV64GC/lp64d.
         if self.target == Target::Riscv64 {
@@ -1939,15 +1945,13 @@ impl Driver {
         // (infinite recursion or wrong control flow). Undefining _FORTIFY_SOURCE
         // prevents these wrappers from being emitted.
         preprocessor.undefine_macro("_FORTIFY_SOURCE");
-        // User/system include directories: map through LCCC_SYSROOT when set
-        // (GNU --sysroot analogy; prefixed path preferred when it exists,
-        // un-prefixed fallback keeps normal hosts bit-identical). See the
-        // linker-side twin in `backend/common.rs` and the built-in include
-        // list mapping in `frontend/preprocessor/predefined_macros.rs`.
+        // User/system include directories use the legacy LCCC_SYSROOT overlay:
+        // prefixed paths are preferred when present, with a host fallback.
+        // This differs from GNU --sysroot and is not an isolation boundary.
+        // See `backend/common.rs` and `predefined_macros.rs`.
         fn sysroot_include_path(path: &str) -> String {
-            // One source of truth for "what is the sysroot": the same accessor
-            // the linker's discovery uses, so a driver that was given
-            // `--sysroot` cannot disagree with the linker it spawns.
+            // Use the same overlay accessor as the built-in linker. GNU driver
+            // sysroot flags are rejected separately until fully implemented.
             let prefixed = match crate::backend::common::sysroot() {
                 Some(root) => format!("{root}{path}"),
                 None => return path.to_string(),

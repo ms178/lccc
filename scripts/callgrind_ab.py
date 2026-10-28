@@ -4,8 +4,11 @@
 Ir and pinned I1/D1/LL/branch counts are simulated instruction/cache-model
 metrics, NOT Raptor Lake uops, cycles, PMU counters or measured speedups.
 Equal-length aa/bb paths are retained. Matched ISA flags are the caller's job.
-Software/library/startup differences can still matter despite pinned geometry.
-Importing this module performs no compiler/tool discovery or subprocess work.
+Registered workloads apply their required benchmark flags to both arms after
+caller options. Output equality is a screen, not proof of defined C behavior
+or an independent correctness oracle. Software/library/startup differences can
+still matter despite pinned geometry. Importing this module performs no
+compiler/tool discovery or subprocess work.
 
 Usage: scripts/callgrind_ab.py MINE REF "OPT [OPT...]" [bench ...]
 Optional: --out-root DIR --heavy --gcc-include-command gcc
@@ -27,6 +30,7 @@ import tempfile
 REPO=Path(__file__).resolve().parents[1];sys.path.insert(0,str(REPO))
 from tools.corpus import process,publication,schema
 from scripts.perf_ab import matched_link_flags, split_driver_flags
+from tests.benchmark import run_benchmarks as benchmark_registry
 
 CG_I1='32768,8,64';CG_D1='32768,8,64';CG_LL='33554432,16,64'
 REQUIRED_EVENTS={'Ir','I1mr','D1mr','D1mw','ILmr','DLmr','DLmw','Bcm','Bim'}
@@ -241,6 +245,57 @@ def tool_identity(command,option='--version'):
     return dict(command=argv,executable=str(Path(executable).resolve()),sha256=schema.file_hash(Path(executable)),version=text[:4096])
 
 
+def workload_contract(selector, explicit_id=None):
+    """Resolve a registry workload, without conflating aliases of one source.
+
+    Raw, unregistered source stems remain usable, but have no known semantic
+    contract; callers must supply suitable options themselves. A shared source
+    without a matching canonical name is ambiguous and must be disambiguated.
+    """
+    items=benchmark_registry.BENCHMARKS
+    by_name={item.name:item for item in items}
+    item=by_name.get(explicit_id) if explicit_id else by_name.get(selector)
+    if explicit_id and item is None:
+        raise ValueError('unknown benchmark registry id: '+explicit_id)
+    if item is None:
+        matches=[candidate for candidate in items
+                 if any(Path(name).stem==selector for name in candidate.sources)]
+        if len(matches)>1:
+            raise ValueError('ambiguous benchmark source '+selector+'; use --workload-id')
+        item=matches[0] if matches else None
+    source=(benchmark_registry.source_for(item) if item is not None
+            else REPO/'tests/benchmark/programs'/f'{selector}.c')
+    if item is not None and explicit_id and selector != item.name and (
+            source is None or selector != source.stem):
+        raise ValueError('workload id does not name the selected source: '+explicit_id)
+    return item,source
+
+
+def effective_workload_options(options,item):
+    """Put registry semantics last, while allowing explicit sizing macros.
+
+    A -D/-U supplied by the caller replaces a same-named registry -D (e.g.
+    the corpus screen's bounded PASSES). Non-macro registry options, notably
+    -fwrapv and FP/ISA requirements, override conflicting caller options.
+    Both the registry and overrides are recorded in the result manifest.
+    """
+    macros=set()
+    for index,token in enumerate(options):
+        if token in ('-D','-U'):
+            value=options[index+1] if index+1<len(options) else ''
+        elif token.startswith(('-D','-U')):
+            value=token[2:]
+        else:
+            continue
+        if value:
+            macros.add(value.split('=',1)[0])
+    registry=list(item.extra_flags) if item is not None else []
+    overridden=[flag for flag in registry
+                if flag.startswith('-D') and flag[2:].split('=',1)[0] in macros]
+    applied=[flag for flag in registry if flag not in overridden]
+    return [*options,*applied],registry,overridden
+
+
 def _measure(args,benches,outroot,manifest,cache):
     matched_opt=matched_link_flags(manifest['opt_tokens'],args.mine,args.ref)
     manifest['opt']=shlex.join(matched_opt);manifest['opt_tokens']=matched_opt
@@ -251,13 +306,23 @@ def _measure(args,benches,outroot,manifest,cache):
     manifest['tools']={name:tool_identity(cmd) for name,cmd in [('mine',args.mine),('ref',args.ref),('valgrind','valgrind'),('include_discovery',args.gcc_include_command)]}
     rows=[];failures=manifest['failures']
     for bench in benches:
-        source=REPO/'tests/benchmark/programs'/f'{bench}.c';entry=dict(status='ERROR');manifest['results'][bench]=entry
-        if not source.is_file():entry['detail']='missing-source';failures[bench]='missing-source';continue
+        entry=dict(status='ERROR');manifest['results'][bench]=entry
+        try:
+            item,source=workload_contract(bench,args.workload_id)
+        except ValueError as error:
+            entry['detail']=str(error);failures[bench]=str(error);continue
+        if source is None or not source.is_file():entry['detail']='missing-source';failures[bench]='missing-source';continue
+        options,registry_flags,overridden=effective_workload_options(matched_opt,item)
+        entry['workload']=dict(registry_id=item.name if item else None,
+                               source=str(source),registry_flags=registry_flags,
+                               overridden_registry_macros=overridden,
+                               effective_opt_tokens=options,
+                               contract='registered' if item else 'unregistered; caller supplies semantics')
         entry['source_sha256']=schema.file_hash(source);mbin=mdir/bench;rbin=rdir/bench
         entry['compilation']={}
         err=None
         for side,compiler,binary in (('mine',args.mine,mbin),('ref',args.ref,rbin)):
-            err=compile_program(compiler,matched_opt,source,binary,include=manifest['include'])
+            err=compile_program(compiler,options,source,binary,include=manifest['include'])
             entry['compilation'][side]=retain_process_receipt(str(binary)+'.compile',primary_error=err)
             if err:break
         if err:entry['detail']=err;failures[bench]=err;continue
@@ -310,6 +375,7 @@ def build_parser():
     ap.add_argument('--heavy',action='store_true')
     ap.add_argument('--out-root',type=Path)
     ap.add_argument('--gcc-include-command',default='gcc')
+    ap.add_argument('--workload-id',help='registry id when one source has multiple workload variants')
     return ap
 
 
@@ -362,6 +428,7 @@ def main(argv=None):
     # and unlike hand-rolled argv reordering it keeps a bare `--` meaningful.
     args=ap.parse_intermixed_args(argv);benches=args.bench or DEFAULT_FAST+(sorted(HEAVY) if args.heavy else [])
     if args.instrument_timeout < 1:ap.error('instrumentation timeout must be positive')
+    if args.workload_id and len(benches)!=1:ap.error('--workload-id requires exactly one benchmark')
     if len(set(benches))!=len(benches) or any(not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.-]*',b) for b in benches):
         ap.error('duplicate/unsafe benchmark name')
     # A unique common prefix avoids stale/concurrent default outputs. Explicit

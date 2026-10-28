@@ -88,6 +88,18 @@ int main(void) {
                 self.assertEqual(args[1], driver)
                 self.assertEqual(args[args.index("--gcc-include-command") + 1], driver)
 
+    def test_shared_source_variants_pass_their_registry_identity(self):
+        for name,source in (("fp32_product_map", "fp_product_map"),
+                            ("fp64_product_map", "fp_product_map"),
+                            ("linux_find_bit_scaled", "linux_find_bit"),
+                            ("lz4_match_extend", "lz4_compress")):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as td, \
+                    patch.object(screen.cg, "main", return_value=1) as measure:
+                self.assertEqual(screen.main(["--mine", "stub", "--only", name, "--out", td]), 1)
+                command = measure.call_args.args[0]
+                self.assertIn(source, command)
+                self.assertEqual(command[command.index("--workload-id") + 1], name)
+
     def test_common_semantic_flags_reach_both_measurement_arms(self):
         import shlex
         with tempfile.TemporaryDirectory() as td, patch.object(screen.cg, "main", return_value=1) as measure:

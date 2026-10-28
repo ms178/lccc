@@ -152,7 +152,7 @@ impl Parser {
                 }
                 // GNU extensions
                 TokenKind::Attribute => {
-                    let (_, aligned, mk, _, _) = self.parse_gcc_attributes();
+                    let (_, aligned, mk, _, _) = self.parse_gcc_attributes_spec();
                     mode_kind = mode_kind.or(mk);
                     if let Some(a) = aligned {
                         self.attrs.parsed_alignas =
@@ -565,7 +565,7 @@ impl Parser {
                         self.attrs.set_inline(true);
                     }
                     TokenKind::Attribute => {
-                        let (_, aligned, mk, _, _) = self.parse_gcc_attributes();
+                        let (_, aligned, mk, _, _) = self.parse_gcc_attributes_spec();
                         *mode_kind = mode_kind.or(mk);
                         if let Some(a) = aligned {
                             self.attrs.parsed_alignas =
@@ -1133,7 +1133,7 @@ impl Parser {
                     self.attrs.set_inline(true);
                 }
                 TokenKind::Attribute => {
-                    let (_, aligned, _, _, _) = self.parse_gcc_attributes();
+                    let (_, aligned, _, _, _) = self.parse_gcc_attributes_spec();
                     if let Some(a) = aligned {
                         self.attrs.parsed_alignas =
                             Some(self.attrs.parsed_alignas.map_or(a, |prev| prev.max(a)));
@@ -1177,7 +1177,7 @@ impl Parser {
             }
             let pos_before = self.pos;
             self.attrs.parsing_counted_by = None;
-            let (pre_spec_packed, pre_spec_align, _, _, _) = self.parse_gcc_attributes();
+            let (pre_spec_packed, pre_spec_align, _, _, _) = self.parse_gcc_attributes_spec();
             if let Some(a) = pre_spec_align {
                 self.attrs.parsed_alignas =
                     Some(self.attrs.parsed_alignas.map_or(a, |prev| prev.max(a)));

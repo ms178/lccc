@@ -11,12 +11,11 @@ use super::pipeline::Preprocessor;
 
 /// LCCC_SYSROOT-aware candidate mapping for built-in include discovery.
 ///
-/// Mirrors GNU `--sysroot` semantics: when `LCCC_SYSROOT` is set and the
-/// prefixed variant of the path exists, it is preferred; otherwise the
-/// original path is returned unchanged. This lets an *unpacked multilib
-/// tree* (rootless sandbox, reproducible CI image) act as the system root
-/// without any code-path divergence on normal hosts. See the linker-side
-/// twin in `backend/common.rs` for CRT/library discovery.
+/// This legacy overlay is not GNU `--sysroot`: when `LCCC_SYSROOT` is set,
+/// an existing prefixed candidate is preferred, but the original host path
+/// remains a fallback. Only selected target-specific defaults use it. It can
+/// help consume an unpacked multilib tree but does not isolate header search.
+/// See the linker-side overlay in `backend/common.rs` for CRT/library lookup.
 fn sysroot_candidate(path: &str) -> PathBuf {
     if let Ok(root) = std::env::var("LCCC_SYSROOT") {
         if !root.is_empty() {

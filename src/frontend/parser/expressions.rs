@@ -1113,16 +1113,21 @@ impl Parser {
                 }
                 Expr::IntLiteral(0, span)
             }
-            TokenKind::BuiltinVaArg => self.parse_va_arg_expr(),
-            TokenKind::BuiltinTypesCompatibleP => self.parse_types_compatible_expr(),
             TokenKind::Typeof | TokenKind::TypeofUnqual => {
+                // GCC 16.2 rejects a type specifier in expression position
+                // (measured: `expected expression before '__typeof__'`).
                 let span = self.peek_span();
+                let spelling = if matches!(self.peek(), TokenKind::Typeof) {
+                    "__typeof__"
+                } else {
+                    "__typeof_unqual__"
+                };
+                self.emit_error(format!("expected expression before '{spelling}'"), span);
                 self.advance();
-                if matches!(self.peek(), TokenKind::LParen) {
-                    self.skip_balanced_parens();
-                }
                 Expr::IntLiteral(0, span)
             }
+            TokenKind::BuiltinVaArg => self.parse_va_arg_expr(),
+            TokenKind::BuiltinTypesCompatibleP => self.parse_types_compatible_expr(),
             TokenKind::Builtin => {
                 let span = self.peek_span();
                 self.advance();

@@ -1083,13 +1083,13 @@ fn g_andq_byte_mask_makes_32bit_copy_cover_64bit_reader_in_block() {
 
 #[test]
 fn g_andq_sign_extended_mask_does_not_prove_upper_zero() {
-    // $0x8000_0000 encodes as a negative imm32 and sign-extends to an
+    // $-2147483648 encodes as a negative imm32 and sign-extends to an
     // all-ones high mask: the source's upper 32 bits survive, so the copy
     // feeding the 64-bit reader must remain (families may be renamed by
     // coalescing; pin the surviving dword copy and the un-folded OR reader).
     let out = run(&f(concat!(
         "    movq %rdi, %r10\n",
-        "    andq $2147483648, %r10\n",
+        "    andq $-2147483648, %r10\n",
         "    movl %r10d, %esi\n",
         "    orq %rsi, %rdx\n",
         "    ret",
@@ -1097,4 +1097,96 @@ fn g_andq_sign_extended_mask_does_not_prove_upper_zero() {
     assert_eq!(count(&out, "movl %edi, %esi"), 1, "{}", out);
     assert!(out.contains("orq %rsi, %rdx"), "{}", out);
     assert!(!out.contains("orq %rdi, %rdx"), "{}", out);
+}
+
+#[test]
+fn upper32_fact_ledger_distinguishes_partial_and_implicit_writes() {
+    use super::update_upper32_zero;
+
+    let mut upper = [false; 16];
+    update_upper32_zero("movzbw %al, %ax", &mut upper);
+    assert!(!upper[0], "word destination leaves the upper half unknown");
+    update_upper32_zero("movzbl %al, %eax", &mut upper);
+    assert!(upper[0], "dword destination must still establish the fact");
+    update_upper32_zero("divq %rcx", &mut upper);
+    assert!(
+        !upper[0],
+        "divide implicitly redefines the full accumulator"
+    );
+    update_upper32_zero("andq $127, %rax", &mut upper);
+    assert!(upper[0], "bounded AND remains a useful producer");
+    update_upper32_zero("cmpxchgq %rsi, %rdi", &mut upper);
+    assert!(!upper[0], "CMPXCHG implicitly redefines the accumulator");
+    update_upper32_zero("movl $1, %edi", &mut upper);
+    assert!(upper[7]);
+    update_upper32_zero("cmpxchgq %rsi, %rdi", &mut upper);
+    assert!(!upper[7], "CMPXCHG can redefine its explicit destination");
+}
+
+#[test]
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn upper32_selfmove_architectural_execution() {
+    use super::super::*;
+    use super::{eliminate_self_moves, fold_register_copies};
+    use crate::backend::peephole_common::LineStore;
+    use crate::common::temp_files::TempFile;
+    use std::process::Command;
+
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/regression/fixtures/upper32-selfmove");
+    let original = std::fs::read_to_string(fixtures.join("witness.s")).unwrap();
+    let store = LineStore::new(original.clone());
+    let mut infos: Vec<_> = (0..store.len())
+        .map(|i| classify_line(store.get(i)))
+        .collect();
+    eliminate_self_moves(&store, &mut infos);
+    let isolated = (0..store.len())
+        .filter(|&i| !infos[i].is_nop())
+        .map(|i| store.get(i))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    let mut store = LineStore::new(original.clone());
+    let mut infos: Vec<_> = (0..store.len())
+        .map(|i| classify_line(store.get(i)))
+        .collect();
+    fold_register_copies(&mut store, &mut infos);
+    let folded = (0..store.len())
+        .filter(|&i| !infos[i].is_nop())
+        .map(|i| store.get(i))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    let pipeline = peephole_optimize(original.clone());
+    let asm = TempFile::try_new("upper32-selfmove", "witness", "s").unwrap();
+    let exe = TempFile::try_new("upper32-selfmove", "witness", "exe").unwrap();
+    let mut failures = Vec::new();
+    for (stage, code) in [
+        ("original", original),
+        ("isolated", isolated),
+        ("register-copy pass", folded),
+        ("whole pipeline", pipeline),
+    ] {
+        std::fs::write(asm.path(), &code).unwrap();
+        let build = Command::new("gcc")
+            .args(["-O2", "-Werror", "-o"])
+            .arg(exe.path())
+            .arg(fixtures.join("driver.c"))
+            .arg(asm.path())
+            .output()
+            .unwrap();
+        assert!(
+            build.status.success(),
+            "{stage}: {}\n{code}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+        let result = Command::new(exe.path()).output().unwrap();
+        if !result.status.success() || result.stdout != b"upper32 self-moves: 0 failures\n" {
+            failures.push(format!(
+                "{stage}: {}\n{code}",
+                String::from_utf8_lossy(&result.stdout)
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

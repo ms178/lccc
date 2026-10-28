@@ -17,6 +17,31 @@ win.** Size is the weaker signal and is treated as such here: it is never a
 pass/fail gate, because vectorising *reduces* the instruction count while
 *raising* throughput, so a size table alone can invert the truth.
 
+## Static local-reference comparisons
+
+`scripts/godbolt.py compare` separately compares assembly, including explicit
+offline `--local-ref LABEL=EXECUTABLE` references. Use `--oracles ''` to avoid
+a Compiler Explorer request. `--artifact-dir` writes per-compiler assembly and
+`manifest.json`; `--json` can select a different manifest path. For example:
+
+```sh
+python3 scripts/godbolt.py compare kernel.c --function hot_loop --flags=-O2 \
+    --local target/fastbuild/lccc --oracles '' \
+    --local-ref gcc=/path/to/gcc-16 --local-ref clang=/path/to/clang-23 \
+    --artifact-dir /tmp/kernel-comparison
+```
+
+The primary `--local` launcher and each explicit reference are version-probed,
+hashed and checked again after compilation. A reference is additionally checked
+for x86-64 LP64 and rejects retargeting/opaque flag channels. Each SHA-256
+identifies **only that launcher**, not any compiler, dynamic library or
+configuration a wrapper invokes; the primary target is not independently
+attested. Diagnosed ignored options are rejected. A changed source or launcher,
+missing reference or unavailable requested remote makes the result nonzero, even
+if some assembly was captured. Remote ICC and ICX remain separately requested oracles;
+not having network access does not turn them into measured results. Instruction
+counts are static observations, **not** correctness or runtime evidence.
+
 ## Two classes of file in `tests/oracle/programs/`
 
 The directory holds two kinds of source, and this harness owns only the first:

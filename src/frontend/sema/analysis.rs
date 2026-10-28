@@ -249,6 +249,11 @@ pub struct SemanticAnalyzer {
     /// check. Uses RefCell for interior mutability since resolve_struct_or_union
     /// takes &self.
     defined_structs: RefCell<FxHashSet<String>>,
+    /// Occurrence spans whose `typeof(expr)` has already had the
+    /// expression's constraint checks run (C11 6.7.3 walk; GCC reports per
+    /// occurrence and `type_spec_to_ctype` resolves each occurrence
+    /// repeatedly, so the walk is keyed on the expression's span).
+    typeof_seen: RefCell<FxHashSet<(u32, u32, u32)>>,
     /// Return type of the function body currently being checked.
     current_return_type: Option<CType>,
     /// Stack of enclosing function definition names for nested functions.
@@ -301,6 +306,7 @@ impl SemanticAnalyzer {
             result: SemaResult::default(),
             diagnostics: RefCell::new(DiagnosticEngine::new()),
             defined_structs: RefCell::new(FxHashSet::default()),
+            typeof_seen: RefCell::new(FxHashSet::default()),
             current_return_type: None,
             function_nesting_stack: Vec::new(),
             no_builtins: false,
@@ -555,6 +561,15 @@ impl SemanticAnalyzer {
                 if const_base {
                     self.symbol_table.mark_const_base(name);
                 }
+                self.symbol_table.mark_parameter(name);
+                if let TypeSpecifier::TypedefName(alias) =
+                    crate::common::qualifiers::base_specifier(&param.type_spec)
+                {
+                    self.symbol_table.mark_written_type_name(name, alias);
+                }
+                if param.is_volatile {
+                    self.symbol_table.mark_volatile_base(name);
+                }
                 // Top-level const for C11 6.5.16p1: a parameter with any
                 // star is read-only only when the `const` sits on the star
                 // closest to the name (`int *const p`); without a star the
@@ -698,6 +713,15 @@ impl SemanticAnalyzer {
                 // closest to the name (`int *const p`); without a star the
                 // declaration's own `const` decides (`const int x`,
                 // `const P q`).
+                self.symbol_table.mark_parameter(name);
+                if let TypeSpecifier::TypedefName(alias) =
+                    crate::common::qualifiers::base_specifier(&param.type_spec)
+                {
+                    self.symbol_table.mark_written_type_name(name, alias);
+                }
+                if param.is_volatile {
+                    self.symbol_table.mark_volatile_base(name);
+                }
                 let top_const = if param.decayed_array {
                     false
                 } else if param.pointer_depth > 0 {
@@ -1137,10 +1161,22 @@ impl SemanticAnalyzer {
                 // `typedef int *const cp;` declares a read-only pointer
                 // object; every `cp x` is read-only like a written-out
                 // `int *const x`, and `x = 0` is a constraint violation.
-                self.result.type_context.set_typedef_top_const(
-                    &declarator.name,
-                    matches!(resolved_ctype, CType::Pointer(..)) && declarator.attrs.pointer_const,
-                );
+                // A star keeps the old rule (the star closest to the name);
+                // without one the alias's own base decides (`typedef const
+                // int CI;` makes every `CI x` a read-only object, `CI a[1]`
+                // read-only elements), inherited through alias chains.
+                let has_star = declarator
+                    .derived
+                    .iter()
+                    .any(|d| matches!(d, DerivedDeclarator::Pointer(..)));
+                let typedef_top_const = if has_star {
+                    matches!(resolved_ctype, CType::Pointer(..)) && declarator.attrs.pointer_const
+                } else {
+                    decl.is_const() || self.base_typedef_is_top_const(&decl.type_spec)
+                };
+                self.result
+                    .type_context
+                    .set_typedef_top_const(&declarator.name, typedef_top_const);
                 self.result
                     .type_context
                     .typedefs
@@ -1510,6 +1546,17 @@ impl SemanticAnalyzer {
             });
             if const_base {
                 self.symbol_table.mark_const_base(&init_decl.name);
+            }
+            if is_object {
+                if let TypeSpecifier::TypedefName(alias) =
+                    crate::common::qualifiers::base_specifier(&decl.type_spec)
+                {
+                    self.symbol_table
+                        .mark_written_type_name(&init_decl.name, alias);
+                }
+                if decl.is_volatile() || init_decl.attrs.object_volatile {
+                    self.symbol_table.mark_volatile_base(&init_decl.name);
+                }
             }
             // Per-level pointer qualifiers (`int *const *p`): the middle levels
             // are erased from `CType`, so the read-only check reads them from
@@ -3293,7 +3340,11 @@ impl SemanticAnalyzer {
                 if !self.check_ext_vector_assignable(lhs, *span) {
                     self.check_lvalue_operand(lhs, *span);
                 }
-                self.check_readonly_mutation(lhs, *span, "assignment");
+                // The array wording wins over read-only (measured); one
+                // diagnostic, like GCC.
+                if !self.check_array_assignment_target(lhs, *span) {
+                    self.check_readonly_mutation(lhs, *span, "assignment");
+                }
                 // Check for invalid pointer <-> float conversions in assignment
                 let checker = self.expr_type_checker();
                 if let (Some(lhs_ty), Some(rhs_ty)) =
@@ -3324,12 +3375,14 @@ impl SemanticAnalyzer {
                 let void_target = self
                     .exact_operand_ctype(lhs)
                     .is_some_and(|ty| matches!(ty, CType::Void));
+                let array_target = self.check_array_assignment_target(lhs, *span);
                 if void_target {
                     self.diagnostics
                         .borrow_mut()
                         .error("invalid use of void expression".to_string(), *span);
-                } else {
-                    // `E1 op= E2` has the operand constraints of `E1 op E2`.
+                } else if !array_target {
+                    // `E1 op= E2` has the operand constraints of `E1 op E2`;
+                    // an array target already reported its own wording.
                     self.check_binary_operands(*op, lhs, rhs, *span);
                 }
                 if matches!(op, BinOp::Add | BinOp::Sub) {
@@ -3340,8 +3393,11 @@ impl SemanticAnalyzer {
                 if !self.check_ext_vector_assignable(lhs, *span) {
                     self.check_lvalue_operand(lhs, *span);
                 }
-                // GCC phrases `op=` on a const operand as an assignment.
-                self.check_readonly_mutation(lhs, *span, "assignment");
+                // GCC phrases `op=` on a const operand as an assignment; the
+                // array wording already fired for an array target.
+                if !array_target {
+                    self.check_readonly_mutation(lhs, *span, "assignment");
+                }
             }
             Expr::Conditional(cond, then_expr, else_expr, span) => {
                 self.analyze_expr(cond);
@@ -3414,6 +3470,9 @@ impl SemanticAnalyzer {
                         self.check_sizeof_incomplete_expr(inner, *span);
                     }
                     SizeofArg::Type(ts) => {
+                        if let TypeSpecifier::Typeof(expr, _) = ts {
+                            self.check_typeof_constraints(expr);
+                        }
                         self.check_void_type_name(ts, *span);
                         // Check for sizeof on incomplete struct/union types.
                         // sizeof(struct X) where struct X has no definition is an error.
@@ -3496,6 +3555,9 @@ impl SemanticAnalyzer {
                     }
                 }
                 SizeofArg::Type(ts) => {
+                    if let TypeSpecifier::Typeof(expr, _) = ts {
+                        self.check_typeof_constraints(expr);
+                    }
                     self.check_void_type_name(ts, *span);
                     if let TypeSpecifier::Array(_, Some(bound)) = ts {
                         self.analyze_expr(bound);
@@ -4377,7 +4439,9 @@ impl SemanticAnalyzer {
         else {
             return;
         };
-        if !operand_constraints::involved(&lt) && !operand_constraints::involved(&rt) {
+        if !operand_constraints::binary_interested(&lt)
+            && !operand_constraints::binary_interested(&rt)
+        {
             return;
         }
         let nullptr = matches!(lt, CType::NullPtr) || matches!(rt, CType::NullPtr);
@@ -4651,7 +4715,44 @@ impl SemanticAnalyzer {
             return;
         };
         let to = self.type_spec_to_ctype(ts);
-        if !operand_constraints::involved(&from_ty) && !operand_constraints::involved(&to) {
+        // GCC 16.2's -Wpointer-to-int-cast (measured): default-on in every
+        // dialect, never a dialect default error, and it fires only when the
+        // integer target's object size differs from the pointer's. `_Bool`
+        // and enumeration targets never warn. The check precedes the
+        // `involved` gate because both sides of an ordinary pointer-to-int
+        // cast are unremarkable as constraints.
+        if matches!(from_ty, CType::Pointer(..) | CType::Array(..))
+            && to.is_integer()
+            && !matches!(to, CType::Bool | CType::Enum(_))
+        {
+            let layouts = self.result.type_context.borrow_struct_layouts();
+            let ptr_size =
+                CType::Pointer(Box::new(CType::Void), AddressSpace::Default).size_ctx(&*layouts);
+            let to_size = to.size_ctx(&*layouts);
+            drop(layouts);
+            if to_size != ptr_size {
+                self.diagnostics.borrow_mut().warning_with_kind(
+                    "cast from pointer to integer of different size".to_string(),
+                    span,
+                    crate::common::error::WarningKind::PointerToIntCast,
+                );
+            }
+        }
+        // The C11 6.5.4p2 pairings reach `cast()` even though neither side
+        // is otherwise "involved": both are ordinary as assignments, but a
+        // pointer against a floating-point/complex type is a constraint
+        // violation in either direction (measured on GCC 16.2.0).
+        let pointer_float_cast = (matches!(from_ty, CType::Pointer(..) | CType::Array(..))
+            && (operand_constraints::is_real_float(&to) || to.is_complex()))
+            || ((operand_constraints::is_real_float(&from_ty) || from_ty.is_complex())
+                && matches!(
+                    to,
+                    CType::Pointer(..) | CType::Array(..) | CType::Function(_)
+                ));
+        if !operand_constraints::involved(&from_ty)
+            && !operand_constraints::involved(&to)
+            && !pointer_float_cast
+        {
             return;
         }
         let null_constant = self.null_constant_if(matches!(to, CType::NullPtr), inner);
@@ -6674,7 +6775,63 @@ dereference it before applying '->' to it?"
     /// to sema-specific trait methods.
     fn type_spec_to_ctype(&self, spec: &TypeSpecifier) -> CType {
         use crate::common::type_builder::TypeConvertContext;
+        if let TypeSpecifier::Typeof(expr, _) = spec {
+            self.check_typeof_constraints(expr);
+        }
         self.resolve_type_spec_to_ctype(spec)
+    }
+
+    /// GCC 16.2 runs an `typeof(expr)` occurrence's expression constraints
+    /// at the occurrence itself (measured: `__typeof__((double)p)` reports
+    /// `invalid cast from type 'int *' to type 'double'`, once per
+    /// occurrence). `type_spec_to_ctype` resolves a `Typeof` once per type
+    /// query, so the walk is keyed on the expression's span: one walk per
+    /// spelling, every spelling independent (two occurrences, two errors).
+    fn check_typeof_constraints(&self, expr: &Expr) {
+        let sp = expr.span();
+        let key = (sp.file_id, sp.start, sp.end);
+        if !self.typeof_seen.borrow_mut().insert(key) {
+            return;
+        }
+        match expr {
+            Expr::Cast(ts, inner, span, _) => self.check_cast_operand(ts, inner, *span),
+            Expr::BinaryOp(op, lhs, rhs, span) => self.check_binary_operands(*op, lhs, rhs, *span),
+            _ => {}
+        }
+        // Walk the operand tree so constraints in any subexpression fire
+        // with the source order GCC reports (a violating argument inside a
+        // call reports when the call's typeof is resolved).
+        match expr {
+            Expr::Deref(inner, _)
+            | Expr::UnaryOp(_, inner, _)
+            | Expr::PostfixOp(_, inner, _)
+            | Expr::MemberAccess(inner, _, _)
+            | Expr::PointerMemberAccess(inner, _, _)
+            | Expr::Cast(_, inner, _, _) => self.check_typeof_constraints(inner),
+            Expr::ArraySubscript(base, index, _) => {
+                self.check_typeof_constraints(base);
+                self.check_typeof_constraints(index);
+            }
+            Expr::BinaryOp(_, lhs, rhs, _)
+            | Expr::Assign(lhs, rhs, _)
+            | Expr::Comma(lhs, rhs, _)
+            | Expr::CompoundAssign(_, lhs, rhs, _) => {
+                self.check_typeof_constraints(lhs);
+                self.check_typeof_constraints(rhs);
+            }
+            Expr::Conditional(a, b, c, _) => {
+                self.check_typeof_constraints(a);
+                self.check_typeof_constraints(b);
+                self.check_typeof_constraints(c);
+            }
+            Expr::FunctionCall(callee, args, _) => {
+                self.check_typeof_constraints(callee);
+                for arg in args {
+                    self.check_typeof_constraints(arg);
+                }
+            }
+            _ => {}
+        }
     }
 
     fn convert_struct_fields(
@@ -6695,19 +6852,32 @@ dereference it before applying '->' to it?"
                 // legal and deliberately stop this walk. Do not install a
                 // self-referential layout after reporting the constraint.
                 let mut object = &ty;
+                let mut through_array = false;
                 while let CType::Array(inner, _) = object {
+                    through_array = true;
                     object = inner;
                 }
                 // One completeness predicate for records, shared with the
                 // `sizeof`/`*`/pointer-arithmetic rules.
-                if self.incomplete_record_name(object).is_some() {
-                    self.diagnostics.borrow_mut().error(
-                        format!(
-                            "field '{}' has incomplete type",
-                            f.name.as_deref().unwrap_or("<anonymous>")
-                        ),
-                        f.span,
-                    );
+                if let Some(name) = self.incomplete_record_name(object) {
+                    // GCC 16.2 distinguishes the two shapes (measured):
+                    // a scalar field says `field 'a' has incomplete type`,
+                    // an array field says `array type has incomplete
+                    // element type 'struct S'`.
+                    if through_array {
+                        self.diagnostics.borrow_mut().error(
+                            format!("array type has incomplete element type '{name}'"),
+                            f.span,
+                        );
+                    } else {
+                        self.diagnostics.borrow_mut().error(
+                            format!(
+                                "field '{}' has incomplete type",
+                                f.name.as_deref().unwrap_or("<anonymous>")
+                            ),
+                            f.span,
+                        );
+                    }
                     return None;
                 }
                 let name = f.name.clone().unwrap_or_default();
@@ -7372,9 +7542,22 @@ dereference it before applying '->' to it?"
         // `Expr::span()` stores the *operator* token for some composites
         // (the parser records `*` for `Deref`, `[` for subscripting and `(`
         // for a call), so cover the operands too: `*q` is `*`+inner,
-        // `a[i]` is base+index and `f()` is the callee plus `)`.
+        // `a[i]` is base+index, `p + 1` needs its right operand, `s->f` its
+        // field name, and `g()` its callee plus `)`.
+        struct CoverFlags {
+            /// Closing `]` tokens the fragment still owes (`a[b[0]]`
+            /// owes two), consumed in source order until they balance.
+            bracket: u32,
+            call: u32,
+            field: Option<String>,
+        }
         let mut span = expr.span();
-        fn cover(expr: &Expr, span: &mut Span) {
+        let mut flags = CoverFlags {
+            bracket: 0,
+            call: 0,
+            field: None,
+        };
+        fn cover(expr: &Expr, span: &mut Span, flags: &mut CoverFlags) {
             let child = expr.span();
             if child.file_id == span.file_id {
                 span.start = span.start.min(child.start);
@@ -7383,57 +7566,73 @@ dereference it before applying '->' to it?"
             match expr {
                 Expr::Deref(inner, _)
                 | Expr::UnaryOp(_, inner, _)
-                | Expr::PostfixOp(_, inner, _) => cover(inner, span),
-                Expr::FunctionCall(callee, args, _) => {
-                    cover(callee, span);
-                    for arg in args {
-                        cover(arg, span);
-                    }
-                }
-                Expr::MemberAccess(base, _, _) | Expr::PointerMemberAccess(base, _, _) => {
-                    cover(base, span)
-                }
+                | Expr::PostfixOp(_, inner, _) => cover(inner, span, flags),
                 Expr::ArraySubscript(base, index, _) => {
-                    cover(base, span);
-                    cover(index, span);
+                    flags.bracket += 1;
+                    cover(base, span, flags);
+                    cover(index, span, flags);
                 }
                 Expr::BinaryOp(_, lhs, rhs, _)
                 | Expr::Assign(lhs, rhs, _)
                 | Expr::Comma(lhs, rhs, _) => {
-                    cover(lhs, span);
-                    cover(rhs, span);
+                    cover(lhs, span, flags);
+                    cover(rhs, span, flags);
                 }
                 Expr::CompoundAssign(_, lhs, rhs, _) | Expr::Conditional(lhs, rhs, _, _) => {
-                    cover(lhs, span);
-                    cover(rhs, span);
+                    cover(lhs, span, flags);
+                    cover(rhs, span, flags);
+                }
+                Expr::MemberAccess(base, field, _) | Expr::PointerMemberAccess(base, field, _) => {
+                    if flags.field.is_none() {
+                        flags.field = Some(field.clone());
+                    }
+                    cover(base, span, flags);
+                }
+                Expr::FunctionCall(callee, args, _) => {
+                    flags.call += 1;
+                    cover(callee, span, flags);
+                    for arg in args {
+                        cover(arg, span, flags);
+                    }
                 }
                 _ => {}
             }
         }
-        cover(expr, &mut span);
-        // The closing bracket is not part of any child: include it when the
-        // source has one where it belongs (`f(...)`, `a[...]`).
-        if matches!(expr, Expr::FunctionCall(..) | Expr::ArraySubscript(..)) {
-            if let Some(sm) = self.diagnostics.borrow().share_source_manager() {
-                let content = sm.get_content(span.file_id);
-                let mut probe = span.end as usize;
-                while probe < content.len() && content.as_bytes()[probe].is_ascii_whitespace() {
-                    probe += 1;
-                }
-                let close = match expr {
-                    Expr::FunctionCall(..) => Some(b')'),
-                    _ => Some(b']'),
-                };
-                if content.as_bytes().get(probe) == close.as_ref() {
-                    span.end = probe as u32 + 1;
-                }
-            }
-        }
+        cover(expr, &mut span, &mut flags);
         let Some(sm) = self.diagnostics.borrow().share_source_manager() else {
             return "<expr>".to_string();
         };
         let content = sm.get_content(span.file_id);
-        let (start, end) = (span.start as usize, span.end as usize);
+        let (start, mut end) = (span.start as usize, span.end as usize);
+        // GCC's spelling completes the source fragment: the closing `]` of a
+        // subscript, the closing `)` of a call, and a member's field name
+        // (`s->p`, whose span stops at the `->` token).
+        let mut probe = end;
+        // Brackets and parens nest inside the fragment (`a[b[0]]`,
+        // `a[f(0)]`), so consume the closing tokens in source order until
+        // the covered one balances; only then complete a member's field
+        // name (`s->p`, whose span stops at the `->` token).
+        loop {
+            while probe < content.len() && content.as_bytes()[probe].is_ascii_whitespace() {
+                probe += 1;
+            }
+            let closing = match content.as_bytes().get(probe) {
+                Some(&b']') if flags.bracket > 0 => &mut flags.bracket,
+                Some(&b')') if flags.call > 0 => &mut flags.call,
+                _ => break,
+            };
+            *closing -= 1;
+            probe += 1;
+            end = probe;
+        }
+        if let Some(field) = &flags.field {
+            if content
+                .get(probe..)
+                .is_some_and(|rest| rest.starts_with(field.as_str()))
+            {
+                end = probe + field.len();
+            }
+        }
         if start <= end
             && end <= content.len()
             && content.is_char_boundary(start)
@@ -7445,6 +7644,412 @@ dereference it before applying '->' to it?"
             }
         }
         "<expr>".to_string()
+    }
+
+    /// GCC 16.2's tree-style spelling of a pointer type (measured): the
+    /// first star separates, every later star glues, and each level's `const`
+    /// prints right after its own star (`int * const*`,
+    /// `int * const* const*`, `const int *`). Base cv prefixes the written
+    /// name, so typedef aliases keep their alias (`const CI *`).
+    fn gcc_pointer_type_text(
+        &self,
+        base: &str,
+        base_const: bool,
+        base_volatile: bool,
+        levels: &[u8],
+    ) -> String {
+        let mut out = String::new();
+        if base_const {
+            out.push_str("const ");
+        }
+        if base_volatile {
+            out.push_str("volatile ");
+        }
+        out.push_str(base);
+        for (i, &cvr) in levels.iter().enumerate() {
+            out.push_str(if i == 0 { " *" } else { "*" });
+            if crate::frontend::parser::ast::cvr_is_const(cvr) {
+                out.push_str(" const");
+            }
+            if cvr & crate::frontend::parser::ast::CVR_VOLATILE != 0 {
+                out.push_str(" volatile");
+            }
+        }
+        out
+    }
+
+    /// The cast's type-name spelling for a read-only location
+    /// (`*(const int *)p`, `*(int * const*)p`): the name comes from the
+    /// type specifier (aliases kept), base cv from the qualifier record
+    /// plus typedefs, one printed level per pointer star of the resolved
+    /// type.
+    fn cast_location_type_text(
+        &self,
+        ts: &TypeSpecifier,
+        quals: &crate::frontend::parser::ast::CastQualifiers,
+    ) -> String {
+        let lookup = self.expr_type_checker();
+        let base_ts = crate::common::qualifiers::base_specifier(ts);
+        let base = match base_ts {
+            TypeSpecifier::TypedefName(name) => name.clone(),
+            other => gcc_format_type_name(&self.type_spec_to_ctype(other)),
+        };
+        let base_const =
+            crate::common::qualifiers::type_name_const_base(ts, quals.base_const, &lookup);
+        let stars = indirection_depth_of(Some(&self.type_spec_to_ctype(ts)));
+        let mut levels = const_levels_to_cvr(quals.pointer_const_levels);
+        levels.resize(stars, 0);
+        self.gcc_pointer_type_text(&base, base_const, quals.pointee_volatile, &levels)
+    }
+
+    /// The `(T *)` / `(T *)&` type GCC prints for array-shaped locations
+    /// (`*(const int *)&a`, `**(const int **)&ap`, `*(const int *)a` for an
+    /// adjusted array parameter): the element after the root's array layers,
+    /// named by the written alias when the declaration used one.
+    fn location_ptr_type_text(&self, root: &Expr, root_ty: &CType) -> Option<String> {
+        let mut elem: &CType = root_ty;
+        if let CType::Pointer(inner, _) = elem {
+            elem = inner;
+        }
+        while let CType::Array(inner, _) = elem {
+            elem = inner;
+        }
+        let mut base_ty: &CType = elem;
+        while let CType::Pointer(inner, _) | CType::Array(inner, _) = base_ty {
+            base_ty = inner;
+        }
+        let written = match root {
+            Expr::Identifier(name, _) => self.symbol_table.written_type_name(name),
+            _ => None,
+        };
+        let base = written.map_or_else(|| gcc_format_type_name(base_ty), str::to_string);
+        let base_const =
+            crate::common::qualifiers::expr_const_base(root, &self.expr_type_checker());
+        let base_volatile = match root {
+            Expr::Identifier(name, _) => self.symbol_table.is_volatile_base(name),
+            _ => false,
+        };
+        let mut levels = match root {
+            Expr::Identifier(name, _) => self
+                .symbol_table
+                .pointer_quals(name)
+                .map(<[u8]>::to_vec)
+                .unwrap_or_default(),
+            Expr::MemberAccess(base_expr, field, _) => self
+                .member_pointer_quals(base_expr, field, false)
+                .unwrap_or_default(),
+            Expr::PointerMemberAccess(base_expr, field, _) => self
+                .member_pointer_quals(base_expr, field, true)
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        // Recorded quals can be shorter than the element's pointer chain
+        // (an unrecorded cv-less star yields `None`): pad from the type so
+        // the printed star count is exact.
+        levels.resize(indirection_depth_of(Some(elem)), 0);
+        // The cast pointer itself: one more star beyond the element's levels.
+        levels.push(0);
+        Some(self.gcc_pointer_type_text(&base, base_const, base_volatile, &levels))
+    }
+
+    /// An integer constant spelled as an expression, for byte-offset folding.
+    /// The signed value GCC 16.2's read-only printer folds in an index or
+    /// offset (measured): integer literals, a leading unary `-`, and
+    /// arithmetic whose leaves are all literals (`1+0` -> `1`, `2*2` ->
+    /// `4`, `1-3` -> `-2`). Identifiers never fold, even when declared
+    /// `const` (`a[N]` keeps its source), and division keeps integer
+    /// semantics with a zero divisor refusing the fold.
+    fn expr_int_value(expr: &Expr) -> Option<i64> {
+        match expr {
+            Expr::IntLiteral(v, _) => Some(*v),
+            Expr::UIntLiteral(v, _) => i64::try_from(*v).ok(),
+            Expr::LongLiteral(v, _) => Some(*v),
+            Expr::ULongLiteral(v, _) => i64::try_from(*v).ok(),
+            Expr::LongLongLiteral(v, _) => Some(*v),
+            Expr::ULongLongLiteral(v, _) => i64::try_from(*v).ok(),
+            Expr::UnaryOp(UnaryOp::Neg, inner, _) => Self::expr_int_value(inner)?.checked_neg(),
+            Expr::BinaryOp(op, lhs, rhs, _) => {
+                let a = Self::expr_int_value(lhs)?;
+                let b = Self::expr_int_value(rhs)?;
+                match op {
+                    BinOp::Add => a.checked_add(b),
+                    BinOp::Sub => a.checked_sub(b),
+                    BinOp::Mul => a.checked_mul(b),
+                    BinOp::Div => a.checked_div(b),
+                    BinOp::Mod => a.checked_rem(b),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// The size of `ptr`'s pointee in bytes, when both are known.
+    fn pointee_size_bytes(&self, ptr: &Expr) -> Option<usize> {
+        let tc = self.expr_type_checker();
+        let ty = tc.infer_expr_ctype(ptr)?;
+        let CType::Pointer(pointee, _) = ty else {
+            return None;
+        };
+        if matches!(*pointee, CType::Function(_) | CType::Void) {
+            return None;
+        }
+        let layouts = self.result.type_context.borrow_struct_layouts();
+        let size = pointee.size_ctx(&*layouts);
+        (size > 0).then_some(size)
+    }
+
+    /// GCC 16.2's array-subscript spelling inside a read-only location:
+    /// array roots keep their source shape with literal index arithmetic
+    /// folded, a pointer-typed base renders as a dereference of the
+    /// offset pointer (`(*(b + 4))[0]` for an adjusted parameter), and a
+    /// dereference base keeps its required parentheses (`(*p)[0]`).
+    fn array_subscript_text(&self, expr: &Expr) -> String {
+        let tc = self.expr_type_checker();
+        let Expr::ArraySubscript(base, index, _) = expr else {
+            return self.expr_source_text(expr);
+        };
+        let base_is_int = tc.infer_expr_ctype(base).is_some_and(|t| t.is_integer());
+        let (ptr_side, index_expr) = if base_is_int {
+            (index, base)
+        } else {
+            (base, index)
+        };
+        let atom = |e: &Expr| {
+            if matches!(e, Expr::ArraySubscript(..)) {
+                self.array_subscript_text(e)
+            } else {
+                self.expr_source_text(e)
+            }
+        };
+        if tc
+            .infer_expr_ctype(ptr_side)
+            .is_some_and(|t| matches!(t, CType::Array(..)))
+        {
+            let base_text = atom(ptr_side);
+            if base_text == "<expr>" {
+                return "<expr>".to_string();
+            }
+            // A dereference base needs the parentheses C requires
+            // (`(*p)[0]`), which the source span alone does not carry.
+            let base_text = match &**ptr_side {
+                Expr::Deref(..) => format!("({base_text})"),
+                _ => base_text,
+            };
+            let idx_text = match Self::expr_int_value(index_expr) {
+                Some(v) => v.to_string(),
+                None => {
+                    let t = self.expr_source_text(index_expr);
+                    if t == "<expr>" {
+                        return "<expr>".to_string();
+                    }
+                    t
+                }
+            };
+            return format!("{base_text}[{idx_text}]");
+        }
+        // Pointer indexing: a dereference of the offset pointer.
+        let (Some(lit), Some(size)) = (
+            Self::expr_int_value(index_expr),
+            self.pointee_size_bytes(ptr_side),
+        ) else {
+            return self.expr_source_text(expr);
+        };
+        let Some(delta) = (lit as i128).checked_mul(size as i128) else {
+            return self.expr_source_text(expr);
+        };
+        let base_text = atom(ptr_side);
+        if base_text == "<expr>" {
+            return "<expr>".to_string();
+        }
+        if delta == 0 {
+            format!("(*{base_text})")
+        } else {
+            format!("(*({base_text} + {delta}))")
+        }
+    }
+
+    /// GCC 16.2's `read-only location '<expr>'` spelling (measured):
+    /// pointer arithmetic folds to `*p` / `*(p + <bytes>)`, array roots to
+    /// `*(T *)&slot` (an adjusted array parameter drops the `&`:
+    /// `*(T *)a`), casts keep their type name plus operand, an all-zero
+    /// compound literal folds to its value (`*0`), and every
+    /// source-shaped root keeps its source with a completed `]`, `)` or
+    /// field name. A non-literal offset falls back to source (GCC prints
+    /// an internal scaled form there — a documented divergence).
+    fn readonly_location_text(&self, target: &Expr) -> String {
+        let tc = self.expr_type_checker();
+        let mut stars = 0usize;
+        let mut offset_bytes: i128 = 0;
+        let mut folded = true;
+        let mut cur = target;
+        loop {
+            match cur {
+                Expr::Deref(inner, _) => {
+                    stars += 1;
+                    cur = inner;
+                }
+                Expr::ArraySubscript(base, index, _) => {
+                    let base_is_int = tc.infer_expr_ctype(base).is_some_and(|t| t.is_integer());
+                    let (ptr_side, index_expr) = if base_is_int {
+                        (index, base)
+                    } else {
+                        (base, index)
+                    };
+                    if tc
+                        .infer_expr_ctype(ptr_side)
+                        .is_some_and(|t| matches!(t, CType::Array(..)))
+                    {
+                        // Array-root subscripts keep their source shape with
+                        // literal arithmetic folded (`a[1+0]` -> `a[1]`,
+                        // `a[(1+1)]` -> `a[2]`, `a[2*2]` -> `a[4]`;
+                        // identifiers keep source, `a[N]`), and a pointer
+                        // base renders GCC's deref spelling (`b[0]` on a
+                        // parameter -> `(*b)`, `b[1]` -> `(*(b + 4))`).
+                        let text = self.array_subscript_text(cur);
+                        return if text == "<expr>" {
+                            self.expr_source_text(target)
+                        } else {
+                            format!("{}{text}", "*".repeat(stars))
+                        };
+                    }
+                    let (Some(lit), Some(size)) = (
+                        Self::expr_int_value(index_expr),
+                        self.pointee_size_bytes(ptr_side),
+                    ) else {
+                        folded = false;
+                        break;
+                    };
+                    let Some(delta) = (lit as i128).checked_mul(size as i128) else {
+                        folded = false;
+                        break;
+                    };
+                    match offset_bytes.checked_add(delta) {
+                        Some(v) => offset_bytes = v,
+                        None => {
+                            folded = false;
+                            break;
+                        }
+                    }
+                    stars += 1;
+                    cur = ptr_side;
+                }
+                Expr::BinaryOp(op @ (BinOp::Add | BinOp::Sub), lhs, rhs, _) => {
+                    let lhs_is_int = tc.infer_expr_ctype(lhs).is_some_and(|t| t.is_integer());
+                    let (ptr_side, off_expr) = if lhs_is_int { (rhs, lhs) } else { (lhs, rhs) };
+                    let (Some(lit), Some(size)) = (
+                        Self::expr_int_value(off_expr),
+                        self.pointee_size_bytes(ptr_side),
+                    ) else {
+                        folded = false;
+                        break;
+                    };
+                    let Some(delta) = (lit as i128).checked_mul(size as i128) else {
+                        folded = false;
+                        break;
+                    };
+                    let updated = if matches!(op, BinOp::Add) {
+                        offset_bytes.checked_add(delta)
+                    } else {
+                        offset_bytes.checked_sub(delta)
+                    };
+                    match updated {
+                        Some(v) => offset_bytes = v,
+                        None => {
+                            folded = false;
+                            break;
+                        }
+                    }
+                    cur = ptr_side;
+                }
+                _ => break,
+            }
+        }
+        if !folded {
+            return self.expr_source_text(target);
+        }
+        let source = |e: &Expr| self.expr_source_text(e);
+        // A compound literal initialized with `0` prints as its value (`*0`).
+        if let Expr::CompoundLiteral(_, init, _, _) = cur {
+            if stars > 0 {
+                // `{0}` parses as a single-item list; both spellings fold.
+                let zero = match &**init {
+                    Initializer::Expr(e) => matches!(Self::expr_int_value(e), Some(0)),
+                    Initializer::List(items) => {
+                        items.len() == 1
+                            && items[0].designators.is_empty()
+                            && matches!(&items[0].init, Initializer::Expr(e)
+                                if matches!(Self::expr_int_value(e), Some(0)))
+                    }
+                };
+                if zero {
+                    return format!("{}0", "*".repeat(stars));
+                }
+            }
+            return self.expr_source_text(target);
+        }
+        if let Expr::Cast(ts, inner, _, quals) = cur {
+            if stars > 0 {
+                // `*(T *)&<array element>` cancels to the element itself
+                // (measured: `*(const int *)&a[0]` reports `a[0]`).
+                if let Expr::AddressOf(borrowed, _) = &**inner {
+                    if matches!(**borrowed, Expr::ArraySubscript(..)) {
+                        return self.readonly_location_text(borrowed);
+                    }
+                }
+                let ty = self.cast_location_type_text(ts, quals);
+                return format!("{}({ty}){}", "*".repeat(stars), source(inner));
+            }
+            return self.expr_source_text(target);
+        }
+        let Some(root_ty) = tc.infer_expr_ctype(cur) else {
+            return self.expr_source_text(target);
+        };
+        // Array root: `*(T *)&slot`, one star per dereference past the
+        // array layers (`*a` -> 1, `**ap` -> 2, `**a` of a 2-D array -> 1).
+        if matches!(root_ty, CType::Array(..)) {
+            let mut dims = 0usize;
+            let mut walk = &root_ty;
+            while let CType::Array(inner, _) = walk {
+                dims += 1;
+                walk = inner;
+            }
+            return match stars.checked_sub(dims).and_then(|rest| rest.checked_add(1)) {
+                Some(out) if out >= 1 => match self.location_ptr_type_text(cur, &root_ty) {
+                    Some(ty_text) => {
+                        format!("{}({ty_text})&{}", "*".repeat(out), source(cur))
+                    }
+                    None => self.expr_source_text(target),
+                },
+                _ => self.expr_source_text(target),
+            };
+        }
+        // An adjusted array parameter is already a pointer to the array:
+        // `*(T *)a` (no address-of), one star per array layer consumed.
+        if let CType::Pointer(inner, _) = &root_ty {
+            if matches!(&**inner, CType::Array(..)) {
+                let mut dims = 0usize;
+                let mut walk: &CType = inner;
+                while let CType::Array(sub, _) = walk {
+                    dims += 1;
+                    walk = sub;
+                }
+                if let Some(out) = stars.checked_sub(dims).filter(|&out| out >= 1) {
+                    if let Some(ty_text) = self.location_ptr_type_text(cur, &root_ty) {
+                        return format!("{}({ty_text}){}", "*".repeat(out), source(cur));
+                    }
+                }
+                return self.expr_source_text(target);
+            }
+            if stars == 0 {
+                return self.expr_source_text(target);
+            }
+            if offset_bytes == 0 {
+                return format!("{}{}", "*".repeat(stars), source(cur));
+            }
+            return format!("{}({} + {})", "*".repeat(stars), source(cur), offset_bytes);
+        }
+        self.expr_source_text(target)
     }
 
     fn member_constness(&self, base: &Expr, field: &str, indirect: bool) -> (bool, bool) {
@@ -7533,14 +8138,25 @@ dereference it before applying '->' to it?"
             }
         }
         let mut k = derefs; // this call asks about `*^k root`'s successor
-        let mut depth = pointer_depth_of(tc.infer_expr_ctype(root).as_ref());
+        // Two measured successor views of an adjusted array parameter
+        // (`const int a[1][1]`): with no dereference yet the caller asked
+        // about the pointee view itself (`b[0][1]` — the array's elements
+        // are one pointer star away, base const), while a dereference has
+        // already travelled through an array layer and must count it to
+        // land on the base (`**a` — read-only). Both wordings pass the
+        // red-team gates only with this split.
+        let mut depth = if k == 0 {
+            pointer_depth_of(tc.infer_expr_ctype(root).as_ref())
+        } else {
+            indirection_depth_of(tc.infer_expr_ctype(root).as_ref())
+        };
         if depth == 0 {
             // An array-typed root (`const int *a[2]; *a[0] = 1`): the chain's
             // subscript already consumed the array layer, so the ELEMENT type
             // supplies the pointer depth and one dereference is accounted for.
             if let Some(CType::Array(element, _)) = tc.infer_expr_ctype(root) {
                 if k >= 1 {
-                    depth = pointer_depth_of(Some(&element));
+                    depth = indirection_depth_of(Some(&element));
                     k -= 1;
                 }
             }
@@ -7661,6 +8277,27 @@ dereference it before applying '->' to it?"
         }
     }
 
+    /// GCC 16.2 rejects an assignment whose left operand has array type
+    /// with `assignment to expression with array type` (C11 6.5.16p1),
+    /// reported BEFORE the const check (measured: `const int a[2]` says
+    /// the array wording, not read-only) and before the `op=` operand
+    /// rules. `*a` on an array-typed operand keeps the array type
+    /// (measured on gcc-16.2). Returns whether the constraint fired, so
+    /// the caller suppresses the redundant diagnostics GCC does not print.
+    fn check_array_assignment_target(&self, target: &Expr, span: Span) -> bool {
+        let tc = self.expr_type_checker();
+        // The assigned expression's own type decides: `*a` of a 1-D array
+        // is the element (a legal assignment), `*a` of a 2-D array is the
+        // inner array (measured on gcc-16.2.0), and `a` itself is the array.
+        let is_array = matches!(tc.infer_expr_ctype(target), Some(CType::Array(..)));
+        if is_array {
+            self.diagnostics
+                .borrow_mut()
+                .error("assignment to expression with array type".to_string(), span);
+        }
+        is_array
+    }
+
     /// Emit GCC 16.2's read-only diagnostic for a mutation whose operand
     /// fails [`Self::lvalue_readonly`]. `verb` is the measured GCC word:
     /// `assignment` for `=`/`op=`, `increment` for pre/postfix `++`, and
@@ -7671,6 +8308,11 @@ dereference it before applying '->' to it?"
             return;
         }
         let message = match target {
+            // GCC 16.2 says `parameter` for a function parameter and
+            // `variable` for everything else (measured).
+            Expr::Identifier(name, _) if self.symbol_table.is_parameter(name) => {
+                format!("{verb} of read-only parameter '{name}'")
+            }
             Expr::Identifier(name, _) => format!("{verb} of read-only variable '{name}'"),
             Expr::MemberAccess(base, field, _) => {
                 if self.lvalue_readonly(base) {
@@ -7688,7 +8330,7 @@ dereference it before applying '->' to it?"
             }
             _ => format!(
                 "{verb} of read-only location '{}'",
-                self.expr_source_text(target)
+                self.readonly_location_text(target)
             ),
         };
         self.diagnostics.borrow_mut().error(message, op_span);
@@ -9937,6 +10579,28 @@ fn pointer_depth_of(ty: Option<&CType>) -> usize {
     depth
 }
 
+/// Indirections as the read-only diagnostics count them: pointer stars AND
+/// embedded array layers behind a pointer both count as one level (the
+/// adjusted `const int a[1][1]` parameter has type `const int (*)[1]`;
+/// `**a` must reach the element's base `const`, and the printer renders
+/// the same star count — both measured on gcc-16.2.0).
+///
+/// [`pointer_depth_of`] stays pointer-only for the declarator return-const
+/// mask ([`declarator_return_const_levels`]), where an array layer is not
+/// a qualifier-bearing star.
+fn indirection_depth_of(ty: Option<&CType>) -> usize {
+    let mut inner = match ty {
+        Some(CType::Pointer(inner, _)) => &**inner,
+        _ => return 0,
+    };
+    let mut depth = 1usize;
+    while let CType::Pointer(next, _) | CType::Array(next, _) = inner {
+        depth += 1;
+        inner = next;
+    }
+    depth
+}
+
 fn declares_const_object(decl: &Declaration, init_decl: &InitDeclarator) -> bool {
     let has_pointer = init_decl
         .derived
@@ -9976,6 +10640,7 @@ fn is_initializer_slot(field: &StructFieldLayout) -> bool {
 #[cfg(test)]
 mod builtin_return_flow_tests {
     use super::SemanticAnalyzer;
+    use crate::common::error::{WarningConfig, WarningKind};
     use crate::frontend::lexer::Lexer;
     use crate::frontend::parser::Parser;
 
@@ -9986,6 +10651,11 @@ mod builtin_return_flow_tests {
         let tu = parser.parse();
         assert_eq!(parser.error_count, 0, "{body}");
         let mut analyzer = SemanticAnalyzer::new();
+        // GCC enables -Wreturn-type under -Wall, not by default. Test the
+        // fallthrough analysis with that diagnostic explicitly requested.
+        let mut config = WarningConfig::new();
+        config.enable(WarningKind::ReturnType);
+        analyzer.diagnostics.borrow_mut().set_warning_config(config);
         assert!(analyzer.analyze(&tu).is_ok(), "{body}");
         analyzer.diagnostics.borrow().warning_count()
     }

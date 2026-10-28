@@ -719,15 +719,12 @@ impl ElfWriter {
 
     fn process_directive(&mut self, directive: &Directive) -> Result<(), String> {
         match directive {
-            Directive::PushSection(info) => {
-                self.base.push_section(
-                    &info.name,
-                    &info.flags,
-                    info.flags_explicit,
-                    Some(info.sec_type.as_str()),
-                );
-                Ok(())
-            }
+            Directive::PushSection(info) => self.base.push_section(
+                &info.name,
+                &info.flags,
+                info.flags_explicit,
+                info.sec_type.as_deref(),
+            ),
             Directive::PopSection => {
                 self.base.pop_section();
                 Ok(())
@@ -736,38 +733,29 @@ impl ElfWriter {
                 self.base.restore_previous_section();
                 Ok(())
             }
-            Directive::Section(info) => {
-                self.base.process_section_directive(
-                    &info.name,
-                    &info.flags,
-                    info.flags_explicit,
-                    Some(info.sec_type.as_str()),
-                );
-                Ok(())
-            }
+            Directive::Section(info) => self.base.process_section_directive(
+                &info.name,
+                &info.flags,
+                info.flags_explicit,
+                info.sec_type.as_deref(),
+            ),
 
-            Directive::Text => {
-                self.base.switch_to_standard_section(
-                    ".text",
-                    SHT_PROGBITS,
-                    SHF_ALLOC | SHF_EXECINSTR,
-                );
-                Ok(())
-            }
+            Directive::Text => self.base.switch_to_standard_section(
+                ".text",
+                SHT_PROGBITS,
+                SHF_ALLOC | SHF_EXECINSTR,
+            ),
             Directive::Data => {
                 self.base
-                    .switch_to_standard_section(".data", SHT_PROGBITS, SHF_ALLOC | SHF_WRITE);
-                Ok(())
+                    .switch_to_standard_section(".data", SHT_PROGBITS, SHF_ALLOC | SHF_WRITE)
             }
             Directive::Bss => {
                 self.base
-                    .switch_to_standard_section(".bss", SHT_NOBITS, SHF_ALLOC | SHF_WRITE);
-                Ok(())
+                    .switch_to_standard_section(".bss", SHT_NOBITS, SHF_ALLOC | SHF_WRITE)
             }
             Directive::Rodata => {
                 self.base
-                    .switch_to_standard_section(".rodata", SHT_PROGBITS, SHF_ALLOC);
-                Ok(())
+                    .switch_to_standard_section(".rodata", SHT_PROGBITS, SHF_ALLOC)
             }
 
             Directive::Globl(sym) => {

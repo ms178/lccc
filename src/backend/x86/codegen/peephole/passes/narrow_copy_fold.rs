@@ -278,7 +278,22 @@ fn update_upper32_zero(t: &str, upper32_zero: &mut [bool]) {
         return;
     }
 
-    // Any 32-bit write zero-extends to 64 on x86-64.
+    // The destination scan below only sees named operands. Divide, multiply,
+    // CMPXCHG, string instructions and other instructions can also redefine
+    // registers implicitly; stale zero facts for those families would make a
+    // subsequent 32-bit self-move lose its required zero-extension.
+    let implicit_writes = implicit_write_refs(t.as_bytes());
+    if implicit_writes != 0 {
+        for (family, is_zero) in upper32_zero.iter_mut().enumerate() {
+            if implicit_writes & (1u16 << family) != 0 {
+                *is_zero = false;
+            }
+        }
+    }
+
+    // Any 32-bit write zero-extends to 64 on x86-64. A movz instruction
+    // only establishes this fact when its destination is at least 32 bits:
+    // `movzbw %al, %ax` leaves bits 16..63 untouched.
     let writes_zx32 = op.ends_with('l')
         && (op.starts_with("mov")
             || op.starts_with("add")
@@ -291,7 +306,7 @@ fn update_upper32_zero(t: &str, upper32_zero: &mut [bool]) {
             || op.starts_with("shl")
             || op.starts_with("shr")
             || op.starts_with("sar"))
-        || op.starts_with("movz");
+        || matches!(op, "movzbl" | "movzbq" | "movzwl" | "movzwq");
 
     if writes_zx32 {
         if let Some(comma) = t.rfind(',') {

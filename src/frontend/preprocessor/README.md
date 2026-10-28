@@ -615,8 +615,10 @@ i686, and i386.
 - **`_Pragma("...")` is skipped** -- the C99 `_Pragma` operator is consumed
   and discarded during macro expansion rather than being executed.
 - **No `#embed` support** -- the C23 `#embed` directive is not implemented.
-- **No digraph/trigraph processing** -- trigraphs (`??=`, `??/`, etc.) and
-  digraphs (`<:`, `:>`) are not translated in the preprocessor phase.
+- **No trigraph processing** -- trigraphs (`??=`, `??/`, etc.) are not
+  translated. Digraph tokens, directive introducers and macro `#`/`##`
+  spellings are recognized while retaining their spelling for stringification;
+  the regression is bounded and does not establish all preprocessing parity.
 - **Expression evaluator does not support floating-point** -- `#if`
   expressions are evaluated using integer arithmetic only (standard-compliant,
   since preprocessor expressions are integer constant expressions).

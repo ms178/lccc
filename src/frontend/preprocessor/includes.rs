@@ -1403,8 +1403,8 @@ impl Preprocessor {
     }
 
     /// True when `path` lives in a SYSTEM directory (-isystem, the default
-    /// system search paths, -idirafter, or the compiler's bundled-header
-    /// set).  GCC's -MMD/-MM dependency filter is directory-based, and the
+    /// system search paths including bundled headers, or -idirafter). GCC's
+    /// -MMD/-MM dependency filter is directory-based, and the
     /// verdict must follow the FILE's location — not the directive's
     /// `<>`/`""` spelling and not the search step that matched: a quoted
     /// include resolved next to an including file that itself sits in a
@@ -1412,13 +1412,11 @@ impl Preprocessor {
     /// `"y.h"` from the same directory), which neither spelling- nor
     /// step-based verdicts get right.
     pub(super) fn is_system_directory(&self, path: &Path) -> bool {
-        let bundled = Preprocessor::bundled_include_dir();
         for dir in self
             .isystem_include_paths
             .iter()
             .chain(self.system_include_paths.iter())
             .chain(self.after_include_paths.iter())
-            .chain(bundled.iter())
         {
             if path.starts_with(dir) {
                 return true;
@@ -1463,6 +1461,13 @@ impl Preprocessor {
         //   4. Default system paths
         //   5. -idirafter paths
         //
+        // Absolute header names do not require any search directory. In
+        // particular they remain usable under -nostdinc, even for <...>.
+        let direct = Path::new(include_path);
+        if direct.is_absolute() && direct.is_file() {
+            return Some(make_absolute(direct));
+        }
+
         // The reserved-header step is active only when the bundled directory
         // remains in the configured system search list, preserving -nostdinc
         // behavior. It avoids GCC's newer unsupported intrinsic umbrella
@@ -1503,6 +1508,29 @@ impl Preprocessor {
             }
 
             // Step 2: Search -iquote paths (quoted includes only)
+            for dir in &self.quote_include_paths {
+                let candidate = dir.join(include_path);
+                if candidate.is_file() {
+                    return Some(make_absolute(&candidate));
+                }
+            }
+        }
+
+        // GCC 16.2 falls back to its quote chain for an angle include when
+        // *no existing bracket-search directory* remains (notably
+        // `-nostdinc -iquote DIR`). Adding even an empty -I/-isystem dir
+        // disables that fallback. __has_include uses this same resolver.
+        // Keep the ordinary path cheap: default system directories normally
+        // make the first condition false.
+        if is_system
+            && self.system_include_paths.is_empty()
+            && !self
+                .include_paths
+                .iter()
+                .chain(self.isystem_include_paths.iter())
+                .chain(self.after_include_paths.iter())
+                .any(|path| path.is_dir())
+        {
             for dir in &self.quote_include_paths {
                 let candidate = dir.join(include_path);
                 if candidate.is_file() {
@@ -1768,6 +1796,22 @@ impl Preprocessor {
 #[cfg(test)]
 mod intrinsic_include_tests {
     use super::*;
+
+    #[test]
+    fn clearing_default_paths_invalidates_cached_resolutions() {
+        let mut preprocessor = Preprocessor::new();
+        assert!(
+            preprocessor
+                .resolve_include_path("immintrin.h", true)
+                .is_some()
+        );
+        preprocessor.clear_default_include_paths();
+        assert!(
+            preprocessor
+                .resolve_include_path("immintrin.h", true)
+                .is_none()
+        );
+    }
 
     #[test]
     fn system_intrinsics_prefer_bundled_headers_over_user_i_path() {

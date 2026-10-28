@@ -11,6 +11,11 @@
 # the IR verifier this gate exists to exercise.  Excluded rather than
 # re-sampled because the rest of the list is unchanged and a regeneration would
 # shift all 84 entries.
+#
+# clang-c/Sema/cast.c is ineligible under that same rule: it carries
+# `expected-error {{pointer cannot be cast to type}}` for a C11 6.5.4p2
+# violation, and lccc now enforces that constraint (GCC 16.2 parity), so the
+# file no longer compiles with or without the verifier.
 tests/bench/cpu_model/tune_probe.c
 tests/benchmark/kernel_corpus/k08_bcopy.c
 tests/benchmark/programs/ascii_case_fold.c
@@ -34,7 +39,6 @@ tests/corpus/clang-c/Sema/attr-nonnull.c
 tests/corpus/clang-c/Sema/attr-target-version-unsupported.c
 tests/corpus/clang-c/Sema/builtin-assume-aligned-downgrade.c
 tests/corpus/clang-c/Sema/builtins-hexagon-v55.c
-tests/corpus/clang-c/Sema/cast.c
 tests/corpus/clang-c/Sema/deep_recursion.c
 tests/corpus/clang-c/Sema/format-attr-missing.c
 tests/corpus/clang-c/Sema/gcc_ms_struct.c

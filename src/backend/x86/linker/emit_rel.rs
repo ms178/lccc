@@ -6,8 +6,9 @@
 //! module builds (`.ko` files are `ld -r` outputs).
 //!
 //! Semantics implemented (matching GNU ld):
-//! * Input sections with identical names are concatenated (no `.text.foo` →
-//!   `.text` folding — that is script-driven and does not happen under -r).
+//! * Input sections with identical names and retain state are concatenated
+//!   (no `.text.foo` → `.text` folding — that is script-driven under -r).
+//!   Retained and non-retained sections of the same name stay distinct.
 //! * Relocations are NOT applied; they are carried over with `r_offset`
 //!   rebased to the merged section and symbol indices remapped.
 //! * References through STT_SECTION symbols are redirected to the merged
@@ -23,9 +24,10 @@ use crate::backend::elf::{elf64_sym_entry, push_strtab_name};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
 use crate::backend::elf::{
-    ELF_MAGIC, ELFCLASS64, ELFDATA2LSB, EM_X86_64, ET_REL, SHN_ABS, SHN_COMMON, SHN_UNDEF,
-    SHT_GROUP, SHT_NOBITS, SHT_NULL, SHT_PROGBITS, SHT_REL, SHT_RELA, SHT_STRTAB, SHT_SYMTAB,
-    STB_GLOBAL, STB_LOCAL, STB_WEAK, STT_FILE, STT_SECTION, read_u32, w16, w32, w64,
+    ELF_MAGIC, ELFCLASS64, ELFDATA2LSB, ELFOSABI_GNU, EM_X86_64, ET_REL, SHF_GNU_RETAIN, SHN_ABS,
+    SHN_COMMON, SHN_UNDEF, SHT_GROUP, SHT_NOBITS, SHT_NULL, SHT_PROGBITS, SHT_REL, SHT_RELA,
+    SHT_STRTAB, SHT_SYMTAB, STB_GLOBAL, STB_LOCAL, STB_WEAK, STT_FILE, STT_GNU_IFUNC, STT_SECTION,
+    read_u32, w16, w32, w64,
 };
 use crate::backend::linker_common::{Elf64Object, write_elf64_shdr};
 
@@ -84,9 +86,11 @@ pub fn link_relocatable(objects: &[Elf64Object], output_path: &str) -> Result<()
         }
     }
 
-    // ── 2. Merge input sections by exact name ──────────────────────────
+    // ── 2. Merge input sections by name and GNU retention ──────────────
+    // GNU ld keeps same-named R and non-R sections distinct under -r:
+    // OR-ing their flags makes otherwise dead data survive the final GC.
     let mut out_secs: Vec<RelOutSec> = Vec::new();
-    let mut out_by_name: FxHashMap<String, usize> = FxHashMap::default();
+    let mut out_by_name: FxHashMap<String, [Option<usize>; 2]> = FxHashMap::default();
     // (obj, sec) -> (out_sec_idx, offset)
     let mut sec_map: FxHashMap<(usize, usize), (usize, u64)> = FxHashMap::default();
 
@@ -105,11 +109,12 @@ pub fn link_relocatable(objects: &[Elf64Object], output_path: &str) -> Result<()
                 continue;
             }
 
-            let idx = match out_by_name.get(&sec.name) {
-                Some(&i) => i,
+            let variant = usize::from(sec.flags & SHF_GNU_RETAIN != 0);
+            let idx = match out_by_name.get(&sec.name).and_then(|slots| slots[variant]) {
+                Some(i) => i,
                 None => {
                     let i = out_secs.len();
-                    out_by_name.insert(sec.name.clone(), i);
+                    out_by_name.entry(sec.name.clone()).or_default()[variant] = Some(i);
                     out_secs.push(RelOutSec {
                         name: sec.name.clone(),
                         sh_type: sec.sh_type,
@@ -385,7 +390,8 @@ pub fn link_relocatable(objects: &[Elf64Object], output_path: &str) -> Result<()
                         let sym = obj.symbols.get(rela.sym_idx as usize);
                         let target = sym.and_then(|s| {
                             let ssec = obj.sections.get(s.shndx as usize)?;
-                            out_by_name.get(&ssec.name).copied()
+                            let variant = usize::from(ssec.flags & SHF_GNU_RETAIN != 0);
+                            out_by_name.get(&ssec.name).and_then(|slots| slots[variant])
                         });
                         match target {
                             Some(t) => ((t + 1) as u32, 0),
@@ -598,6 +604,13 @@ pub fn link_relocatable(objects: &[Elf64Object], output_path: &str) -> Result<()
     out[4] = ELFCLASS64;
     out[5] = ELFDATA2LSB;
     out[6] = 1;
+    // GNU ld only interprets OS-specific R and IFUNC bits with the matching
+    // OSABI. Preserve that contract across an intermediate -r link too.
+    if out_secs.iter().any(|s| s.flags & SHF_GNU_RETAIN != 0)
+        || out_syms.iter().any(|s| s.info & 0xf == STT_GNU_IFUNC)
+    {
+        out[7] = ELFOSABI_GNU;
+    }
     w16(&mut out, 16, ET_REL);
     w16(&mut out, 18, EM_X86_64);
     w32(&mut out, 20, 1);

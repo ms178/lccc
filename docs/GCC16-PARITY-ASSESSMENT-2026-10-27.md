@@ -13,6 +13,47 @@ from documentation or inferred from a neighbouring measurement.
 
 ---
 
+## Current bounded update (2026-10-28)
+
+The scorecard and prose below record the **2026-10-27** tree; they are not a
+current compatibility score. The full item-by-item update is
+[backlog §12.0](../backlog.md#120-bounded-gp-01gp-24-sentinel-verdicts-2026-10-28).
+On those bounded tests, **8 of 24 items are partial, 16 remain open, and none
+is certified complete**. A passing sentinel is not an acceptance suite.
+
+* GP-01: 127 GCC-known names, 83 inventoried as unimplemented, 48 implemented
+  names including four non-GCC Clang extensions; 33 attribute probes and two
+  glibc headers at four optimization levels pass. This inventory does not
+  implement the 83 names; function-typedef attribute diagnostics remain open.
+* GP-02/03/04: `ms_abi`, frontend `retain`, and x86 `interrupt` remain
+  correctness hazards. Mixed GCC/LCCC `ms_abi` links returned 42 or SIGSEGV;
+  retained C data lacked `R`; an interrupt function ended in `ret`, not
+  GCC's `iretq`. The assemblers now preserve uniquely named GNU retained
+  sections, and x86-64 `ld -r` preserves retention, but the C attribute is
+  still missing and same-name assembler variants are refused.
+* GP-05/23: on one x86-64 GNU23 empty TU, GCC has 408 macros, LCCC 466;
+  153 are GCC-only, 211 LCCC-only and 34 common replacements differ. LCCC
+  still identifies as GCC 14. No broader macro parity is asserted.
+* GP-07: bounded digraph execution, stringification, token-boundary and
+  directive tests now pass against GCC 16.2, including native/i686 and
+  five integrated targets. The UCN identifier sentinel remains rejected.
+* GP-09: a warning registry and 57 GCC 16.2 precedence/severity comparisons
+  pass; the complete warning surface and workload-wide precision gate remain
+  open. GP-20 now emits some DIEs as well as line tables, so the historical
+  "line-only" description below no longer describes current output.
+* GP-24: seven derived kernels have bounded compiler comparisons; zlib-ng
+  2.3.3 static Make `alltests` passed under GCC and LCCC, as did 48
+  cross-compiler roundtrips and 24 gzip decodes. CMake/CTest, the remaining
+  workload matrix and target-hardware performance results remain unverified.
+
+The current sentinel's raw local evidence is in
+`~/.cache/lccc/gp-sentinel-audit.{py,json,txt}`; checked-in regression scripts
+cover the landed narrower gates. Versions and limitations are detailed in
+[the session follow-up](FOLLOWUP-2026-10-28-GCC16-ATTRIBUTES.md). Neither this
+update nor the older scorecard establishes GCC 16.2 parity.
+
+---
+
 ## 1. Method
 
 | Technique | What it measures | Scale |
@@ -217,6 +258,14 @@ known gaps (`__fp16`, `__builtin_bit_cast/assume`, unknown attributes, inline-as
 constraint strings, implicit-int).
 
 ### 3.6 Driver option surface — 11 % effect, but honest about it
+
+**2026-10-28 bounded update:** `-nostdinc` now suppresses default include
+paths, including target-specific and bundled paths. GNU `--sysroot` and
+`-isysroot` were found to be accepted without applying the requested root;
+the driver now refuses those requests rather than silently selecting host
+headers or libraries. `LCCC_SYSROOT` remains a partial, host-fallback overlay,
+not GNU sysroot isolation. The counts below are the earlier 2026-10-27 survey,
+not an updated complete option census.
 
 1 389 unique options from GCC's own help catalogue, probed one by one:
 

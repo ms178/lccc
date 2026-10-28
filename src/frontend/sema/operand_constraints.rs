@@ -48,10 +48,32 @@ fn kind(ty: &CType) -> Kind {
     }
 }
 
+/// The real floating-point types of C11 6.5.4p2 — the types a pointer may
+/// NOT be cast to (and that may not be cast to a pointer). Deliberately
+/// broader than [`CType::is_floating`], which excludes the extended formats
+/// on purpose for the usual arithmetic conversions: the cast constraint is
+/// about the TYPE CLASS, not about arithmetic mixing. Measured against
+/// GCC 16.2.0: `_Float16`, `__bf16`, `_Float128` and the GNU decimal types
+/// all reject pointer casts with `pointer value used where a
+/// floating-point was expected` / `cannot convert to a pointer type`.
+pub(super) fn is_real_float(ty: &CType) -> bool {
+    ty.is_floating()
+        || ty.is_decimal()
+        || matches!(ty, CType::Float16 | CType::BFloat16 | CType::Float128)
+}
+
 /// Whether a constraint here can concern an operand of this type. Callers use
 /// it to skip the null-pointer-constant evaluation for ordinary operands.
 pub(super) fn involved(ty: &CType) -> bool {
     matches!(kind(ty), Kind::Record | Kind::Void | Kind::NullPtr)
+}
+
+/// Whether [`binary`] can judge this operand at all: everything [`involved`]
+/// covers plus the pointer, floating-point and complex shapes the pointer
+/// arithmetic and float-misuse rules pair against. Used only by the binary
+/// gate so the cast gates keep their measured narrow skip.
+pub(super) fn binary_interested(ty: &CType) -> bool {
+    involved(ty) || matches!(kind(ty), Kind::Pointer) || is_real_float(ty) || ty.is_complex()
 }
 
 /// A record paired with a vector, which these rules do not judge.
@@ -344,14 +366,70 @@ pub(super) fn binary(op: BinOp, lhs: Operand<'_>, rhs: Operand<'_>) -> Option<St
         (Kind::NullPtr, _) | (_, Kind::NullPtr) => false,
         _ => true,
     };
-    (!valid).then(|| {
+    let invalid = |()| {
         format!(
             "invalid operands to binary {} (have '{}' and '{}')",
             binop_spelling(op),
             lhs.ty,
             rhs.ty
         )
-    })
+    };
+    if !valid {
+        return Some(invalid(()));
+    }
+    // C11 6.5.5-6.5.11: a pointer operand takes part only in `+`/`-` with
+    // an integer and in equality/ordering against pointers and integers;
+    // every other shape is GCC's `invalid operands` wording. Measured on
+    // gcc-16.2.0: `p + q`, `p - 1.5`, `1 - p`, `p * 2`, `p / 2.0`,
+    // `p % 2`, `p << 1`, `p >> 1`, `p & q`, `p | 1.5`, `p ^ q`,
+    // `p < 1.5`, `p == 1.5`, `p + 1.0i`, and `p + g` (a function)
+    // all report; `p + 1`, `1 + p`, `p + 0ul`, `p - q`, `p == q`,
+    // `p == 42`, `p < 1`, and `p == nullptr` all pass (the integer
+    // comparison's warning is a separate diagnostic class).
+    // Modulo and the bitwise/shift operators accept no floating-point
+    // operand (measured on gcc-16.2.0: `2.0 % 2.0`, `2.0 & 2`, `1.5 & 1`,
+    // `2 << 1.5` all report `invalid operands`; `2.0 == 2.0` does not).
+    if matches!(
+        op,
+        BinOp::Mod | BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr
+    ) && (is_real_float(lhs.ty)
+        || lhs.ty.is_complex()
+        || is_real_float(rhs.ty)
+        || rhs.ty.is_complex())
+    {
+        return Some(invalid(()));
+    }
+    if matches!(lk, Kind::Pointer) || matches!(rk, Kind::Pointer) {
+        let other_is_int =
+            |ty: &CType| !is_real_float(ty) && !ty.is_complex() && matches!(kind(ty), Kind::Other);
+        let ptr_ok = match op {
+            BinOp::Add => {
+                (matches!(lk, Kind::Pointer) && other_is_int(rhs.ty))
+                    || (matches!(rk, Kind::Pointer) && other_is_int(lhs.ty))
+            }
+            // Pointer subtraction stays valid on both pointer shapes; an
+            // integer left-hand side is not a pointer difference (`1 - p`).
+            BinOp::Sub => {
+                matches!(lk, Kind::Pointer) && (matches!(rk, Kind::Pointer) || other_is_int(rhs.ty))
+            }
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                let lhs_ok = !matches!(lk, Kind::Pointer)
+                    || matches!(rk, Kind::Pointer | Kind::NullPtr)
+                    || other_is_int(rhs.ty);
+                let rhs_ok = !matches!(rk, Kind::Pointer)
+                    || matches!(lk, Kind::Pointer | Kind::NullPtr)
+                    || other_is_int(lhs.ty);
+                lhs_ok && rhs_ok
+            }
+            // Multiplicative, shift and bitwise operators take no pointer
+            // operands at all.
+            _ => false,
+        };
+        if !ptr_ok {
+            return Some(invalid(()));
+        }
+    }
+    None
 }
 
 /// The second and third operands of `?:` (C23 6.5.15p3). A `nullptr_t` arm
@@ -477,6 +555,20 @@ pub(super) fn cast(
             ));
         }
         _ => {}
+    }
+    // C11 6.5.4p2: a pointer converts only to an integer type. GCC 16.2
+    // rejects pointer-to-floating/complex casts with this exact wording,
+    // and `-w` does not silence a constraint (measured).
+    if fk == Kind::Pointer {
+        if is_real_float(to) {
+            return Some("pointer value used where a floating-point was expected".into());
+        }
+        if to.is_complex() {
+            return Some("pointer value used where a complex was expected".into());
+        }
+    }
+    if kind(to) == Kind::Pointer && (is_real_float(from.ty) || from.ty.is_complex()) {
+        return Some("cannot convert to a pointer type".into());
     }
     let valid = match (fk, kind(to)) {
         // Only `nullptr_t` itself or a null pointer constant converts to it.
@@ -633,6 +725,17 @@ mod tests {
             "(union U)x, no int member"
         );
         assert!(cast(op(&void), &int, || false).is_some(), "(int)v()");
+        // C11 6.5.4p2, both directions (measured on GCC 16.2.0).
+        assert_eq!(
+            cast(op(&p), &CType::Double, || false).as_deref(),
+            Some("pointer value used where a floating-point was expected"),
+            "(double)p"
+        );
+        assert_eq!(
+            cast(op(&CType::Double), &p, || false).as_deref(),
+            Some("cannot convert to a pointer type"),
+            "(char *)b"
+        );
         assert!(cast(op(&s), &void, || false).is_none(), "(void)s");
         assert!(binary(BinOp::Add, op(&s), op(&int)).is_some(), "s + 1");
         assert!(
