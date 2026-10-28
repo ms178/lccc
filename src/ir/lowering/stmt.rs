@@ -782,7 +782,7 @@ impl Lowerer {
             has_explicit_align,
             is_const: var_is_const,
             is_used: declarator.attrs.is_used(),
-            is_retain: false,
+            is_retain: declarator.attrs.is_retain(),
             is_nocommon: false,
             is_thread_local: decl.is_thread_local(),
         });

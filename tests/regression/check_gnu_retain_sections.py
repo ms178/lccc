@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SHF_GNU_RETAIN survives assembly and really roots GC (not frontend retain).
+"""SHF_GNU_RETAIN survives assembly and roots GC; C TLS retain is executable.
 
 Tests x86-64, i686, AArch64, RV64 and RV32 integrated assemblers, comparing
 native flags with GNU as; optional cross assemblers extend the oracle check.
@@ -129,6 +129,64 @@ def check_sections(obj: Path, expected: dict[str, tuple[int, int]]) -> None:
             raise RuntimeError(f'{obj}: {name}: got {found!r}, expected {[want]!r}')
 
 
+TLS_SECTIONS = {
+    '.tdata.retained_init': (1, A | W | T | R),
+    '.tbss.retained_zero': (8, A | W | T | R),
+    '.tdata.retained_const': (1, A | W | T | R),
+    '.tbss.retained_const_zero': (8, A | W | T | R),
+    '.custom_tls_init': (1, A | W | T | R),
+    '.custom_tls_zero': (1, A | W | T | R),
+    '.plain_tls_init': (1, A | W | T),
+    '.plain_tls_zero': (1, A | W | T),
+    '.data.rel.ro.retained_ptr': (1, A | W | R),
+}
+TLS_GLOBALS = {
+    'retained_init': '.tdata.retained_init',
+    'retained_zero': '.tbss.retained_zero',
+    'retained_const': '.tdata.retained_const',
+    'retained_const_zero': '.tbss.retained_const_zero',
+    'custom_init': '.custom_tls_init',
+    'custom_zero': '.custom_tls_zero',
+    'plain_init': '.plain_tls_init',
+    'plain_zero': '.plain_tls_zero',
+}
+
+
+def check_tls_source_object(obj: Path) -> None:
+    """Check symbol *types* as well as section bits (both affect TLS ABI)."""
+    check_sections(obj, TLS_SECTIONS)
+    sections, symbols = elf(obj)
+    types = {}
+    for line in run(['readelf', '-sW', obj]).stdout.splitlines():
+        fields = line.split()
+        if len(fields) >= 8 and fields[0].endswith(':'):
+            types[fields[7]] = fields[3]
+    for name, section in TLS_GLOBALS.items():
+        index = symbols.get(name, 0)
+        if not 0 < index < len(sections) or sections[index][0] != section or types.get(name) != 'TLS':
+            raise RuntimeError(f'{obj}: {name} is not TLS in {section}: '
+                               f'index={index}, type={types.get(name)}')
+    index = symbols.get('retained_ptr', 0)
+    if not 0 < index < len(sections) or sections[index][0] != '.data.rel.ro.retained_ptr':
+        raise RuntimeError(f'{obj}: retained PIC pointer is not in .data.rel.ro')
+    # Local symbol suffixes are compiler-dependent; used prevents frontend DCE.
+    for stem, wanted, kind, section_type in [
+            ('local_thread.', A | W | T | R, 'TLS', 1),
+            ('local_zero.', A | W | T | R, 'TLS', 8),
+            ('local_object.', A | W | R, 'OBJECT', 1),
+            ('local_spec_a.', A | W | R, 'OBJECT', 1),
+            ('local_spec_b.', A | W | R, 'OBJECT', 1),
+            ('local_sibling.', A | W, 'OBJECT', 1),
+            ('local_after.', A | W, 'OBJECT', 1)]:
+        found = [name for name in symbols if stem in name and types.get(name) == kind]
+        if len(found) != 1:
+            raise RuntimeError(f'{obj}: expected one {stem} {kind}, found {found}')
+        index = symbols[found[0]]
+        if (not 0 < index < len(sections) or
+                sections[index][1:] != (section_type, wanted)):
+            raise RuntimeError(f'{obj}: {found[0]} has wrong section type or flags')
+
+
 def check_split(obj: Path, target: str, case: int) -> None:
     sections, symbols = elf(obj)
     if not all(sym in symbols and 0 < symbols[sym] < len(sections) for sym in ('first', 'second')):
@@ -213,6 +271,37 @@ def main() -> None:
                         raise RuntimeError(f'{name} conflict {i}: wrong failure: {result.stderr}')
                 else:
                     check_split(obj, name, i)
+        # C frontend, not just handwritten assembly: both initialized and
+        # zero TLS, const TLS, explicit sections, and function-scope statics.
+        # RV32 is an assembler-only target here; compile the other four.
+        tls_source = ROOT / 'tests/regression/fixtures/retain-c/tls.c'
+        tls_reference = work / 'gcc-tls.o'
+        run([args.gcc, '-O2', '-fPIC', '-c', tls_source, '-o', tls_reference])
+        check_tls_source_object(tls_reference)
+        for name, cc, flags, _, _ in targets[:-1]:
+            tls_obj = work / f'{name}-tls.o'
+            run([cc, *flags, '-O2', '-fPIC', '-c', tls_source, '-o', tls_obj])
+            check_tls_source_object(tls_obj)
+            if name == 'x86-64':
+                # Link the LCCC object with both GCC's GNU linker and LCCC's
+                # own linker; section-bit-only tests miss a malformed TLS image.
+                for linker_cc in (args.gcc, compiler):
+                    exe = work / f'tls-{Path(linker_cc).name}'
+                    run([linker_cc, '-Wl,--gc-sections', tls_obj, '-o', exe])
+                    run([exe])
+        # Verify separate per-thread initialized and zero TLS images. Compile
+        # with both frontends and link each with both native linker drivers.
+        thread_source = ROOT / 'tests/regression/fixtures/retain-c/tls-thread.c'
+        for frontend in (args.gcc, compiler):
+            for opt in ('-O0', '-O1', '-O2', '-O3', '-Os'):
+                for pic in ('-fPIC', '-fno-pic'):
+                    stem = f'thread-{Path(frontend).name}-{opt[1:]}-{pic[2:]}'
+                    obj = work / f'{stem}.o'
+                    run([frontend, opt, pic, '-pthread', '-c', thread_source, '-o', obj])
+                    for linker_cc in (args.gcc, compiler):
+                        exe = work / f'{stem}-{Path(linker_cc).name}'
+                        run([linker_cc, '-no-pie', '-pthread', '-Wl,--gc-sections', obj, '-o', exe])
+                        run([exe])
         # A changed attribute/type within the *same* R variant is invalid in
         # GAS, unlike the two R/non-R variants above.
         invalid = [
@@ -314,7 +403,7 @@ int main(void) { return 0; }
             raise RuntimeError('GCC assembly: retained or discarded symbols have wrong GC result')
     print(f'PASS: GNU retain sections on {len(targets)} integrated assemblers, '
           f'{oracle_count} GAS oracles, 30 collision checks, GNU/mold x86/i686 GC and LCCC x86-64 GC, '
-          'GNU/LCCC partial links, GCC 16 assembly and negative controls')
+          'GNU/LCCC partial links, GCC 16 assembly, C TLS ABI/thread runtime and negative controls')
 
 
 if __name__ == '__main__':

@@ -81,7 +81,7 @@ def inspect(assembly, mode, expect_debug=False):
     if re.search(r"(?m)^\s*(?:lb|lbu|lh|lhu|lw|lwu|ld)\s", body(assembly, "plain_discard")):
         errors.append(f"{mode} plain_discard unexpectedly loads nonvolatile data")
     if any(marker in assembly for marker in ("LCCC_VOLATILE_BEGIN", "LCCC_VOLATILE_END",
-                                              "LCCC_RISCV_OPAQUE")):
+                                              "riscv_volatile_opaque")):
         errors.append(f"{mode}: internal volatile markers leaked into assembly")
     if expect_debug and not re.search(r"(?m)^\s*\.loc\s", body(assembly, "local_reads")):
         errors.append(f"{mode}: local_reads lost its debug rows")
