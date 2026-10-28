@@ -1075,6 +1075,89 @@ impl X86Codegen {
             // miscompile).  See `backend::common::compute_value_type_map`.
             let value_types = crate::backend::common::compute_value_type_map(func);
 
+            self.rorx_masked_shifts.clear();
+            if self.bmi2_enabled && super::isel::rorx_allowed() {
+                let mut shift_defs: FxHashMap<u32, (u32, u32)> = FxHashMap::default();
+                for block in &func.blocks {
+                    for inst in &block.instructions {
+                        if let Instruction::BinOp {
+                            dest,
+                            op: IrBinOp::LShr | IrBinOp::AShr,
+                            rhs: Operand::Const(c),
+                            ty,
+                            ..
+                        } = inst
+                        {
+                            if use_counts.get(&dest.0).copied() != Some(1) {
+                                continue;
+                            }
+                            let width: u32 = match ty {
+                                IrType::I32 | IrType::U32 => 32,
+                                IrType::I64 | IrType::U64 => 64,
+                                _ => continue,
+                            };
+                            let Some(raw) = c.to_i64() else { continue };
+                            let amount = (raw as u32) & (width - 1);
+                            if amount >= 1 && amount < width {
+                                shift_defs.insert(dest.0, (width, amount));
+                            }
+                        }
+                    }
+                }
+                if !shift_defs.is_empty() {
+                    for block in &func.blocks {
+                        for inst in &block.instructions {
+                            match inst {
+                                Instruction::BinOp {
+                                    op: IrBinOp::And,
+                                    lhs,
+                                    rhs,
+                                    ..
+                                } => {
+                                    let pair = match (lhs, rhs) {
+                                        (Operand::Value(v), Operand::Const(c))
+                                        | (Operand::Const(c), Operand::Value(v)) => Some((v.0, c)),
+                                        _ => None,
+                                    };
+                                    if let Some((vid, c)) = pair
+                                        && let Some(&(width, amount)) = shift_defs.get(&vid)
+                                        && let Some(raw) = c.to_i64()
+                                    {
+                                        let mask = if width == 32 {
+                                            (raw as u32) as u64
+                                        } else {
+                                            raw as u64
+                                        };
+                                        let clear_limit = 1u64 << (width - amount);
+                                        if mask < clear_limit {
+                                            self.rorx_masked_shifts.insert(vid);
+                                        }
+                                    }
+                                }
+                                Instruction::Cast {
+                                    src: Operand::Value(v),
+                                    to_ty,
+                                    ..
+                                } => {
+                                    if let Some(&(width, amount)) = shift_defs.get(&v.0) {
+                                        let kept_bits: u32 = match to_ty {
+                                            IrType::I8 | IrType::U8 => 8,
+                                            IrType::I16 | IrType::U16 => 16,
+                                            IrType::I32 | IrType::U32 if width == 64 => 32,
+                                            _ => 999,
+                                        };
+                                        if kept_bits <= width - amount {
+                                            self.rorx_masked_shifts.insert(v.0);
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+
             // Find fused Cmp → Select/CondBranch pairs: the consumer must be
             // the immediately-following instruction (or the block terminator)
             // and the Cmp dest must have exactly one use.

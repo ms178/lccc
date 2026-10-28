@@ -2513,9 +2513,6 @@ impl IntrinsicOp {
         )
     }
 
-    /// Returns true if this intrinsic produces a 128/256-bit vector value
-    /// (as opposed to a scalar).  These values cannot live in a GPR; backends
-    /// either home them on the stack or allocate SIMD registers for them.
     /// Argument slot holding the `lane > rhs` guard of a masked reduction
     /// step, or `None` for every other op. The ONE definition shared by the
     /// vectorizer (which may place a hoisted preheader splat there), the
@@ -2530,6 +2527,60 @@ impl IntrinsicOp {
         }
     }
 
+    /// Argument slot holding the byte-index operand of a register-dest
+    /// `VecLoad*` / `VecStore*` memory access, or `None` for every other op.
+    ///
+    /// The emitter addresses these families as `base + index*1 + disp`, with
+    /// `[base, index, disp]` for loads and `[src, base, index, disp]` for
+    /// stores — the `vec_mem_operand` / `emit_vec_store_addr` convention, which
+    /// [`crate::passes::alias::vec_intrinsic_access`] models for the alias
+    /// engine. This accessor is the ONE definition of that layout: consumers
+    /// that must distinguish an *address* operand from a *data* operand (IV
+    /// widening, SIB folding, alias analysis) ask here instead of restating the
+    /// family list, so a new op joins every consumer at once.
+    ///
+    /// Op families deliberately absent: the memory-dest `Load*`/`Loadu*`/
+    /// `Store*` forms (they round-trip through `dest_ptr`), every register-only
+    /// vector op, and the FMA/hoisted/strict-reciprocal family, whose scalar
+    /// slots are multiplicands and guards, not offsets.
+    pub fn vec_mem_offset_arg_index(&self) -> Option<usize> {
+        match self {
+            // `VecLoad*(base, index[, disp])`.
+            IntrinsicOp::VecLoadF64x4
+            | IntrinsicOp::VecLoadI32x8
+            | IntrinsicOp::VecLoadF32x8
+            | IntrinsicOp::VecLoadI8x32
+            | IntrinsicOp::VecLoadI64x4
+            | IntrinsicOp::VecLoadI16x16
+            | IntrinsicOp::VecLoadF64x2
+            | IntrinsicOp::VecLoadI32x4
+            | IntrinsicOp::VecLoadF32x4
+            | IntrinsicOp::VecLoadI64x2
+            | IntrinsicOp::VecLoadI16x8
+            | IntrinsicOp::VecLoadI8x16
+            | IntrinsicOp::VecLoadWidenI32ToI64x2
+            | IntrinsicOp::VecLoadI32x4Pair => Some(1),
+            // `VecStore*(src, base, index[, disp])`.
+            IntrinsicOp::VecStoreI32x4
+            | IntrinsicOp::VecStoreF32x4
+            | IntrinsicOp::VecStoreF64x2
+            | IntrinsicOp::VecStoreI64x2
+            | IntrinsicOp::VecStoreI16x8
+            | IntrinsicOp::VecStoreI8x16
+            | IntrinsicOp::VecStoreI32x8
+            | IntrinsicOp::VecStoreF32x8
+            | IntrinsicOp::VecStoreF64x4
+            | IntrinsicOp::VecStoreI64x4
+            | IntrinsicOp::VecStoreI8x32
+            | IntrinsicOp::VecStoreI16x16
+            | IntrinsicOp::VecStoreI32x4Pair => Some(2),
+            _ => None,
+        }
+    }
+
+    /// Returns true if this intrinsic produces a 128/256-bit vector value
+    /// (as opposed to a scalar).  These values cannot live in a GPR; backends
+    /// either home them on the stack or allocate SIMD registers for them.
     pub fn produces_vector_value(&self) -> bool {
         matches!(
             self,
@@ -3526,6 +3577,114 @@ mod memory_classification_tests {
             assert!(
                 !op.writes_memory_via_args() && !op.may_read_memory(),
                 "{op:?} is pure compute and must not look like a memory op"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod vec_mem_offset_tests {
+    use super::IntrinsicOp as O;
+
+    /// The register-dest `VecLoad*` families address `base + index + disp` with
+    /// the index in argument 1; the `VecStore*` families with `[src, base,
+    /// index, disp]` and the index in argument 2. This is the contract the
+    /// x86 emitter's `vec_mem_operand` implements and the alias engine models,
+    /// so a drift here is a miscompile in every consumer at once.
+    #[test]
+    fn load_families_expose_slot_one_and_stores_slot_two() {
+        for op in [
+            O::VecLoadF64x4,
+            O::VecLoadI32x8,
+            O::VecLoadF32x8,
+            O::VecLoadI8x32,
+            O::VecLoadI64x4,
+            O::VecLoadI16x16,
+            O::VecLoadF64x2,
+            O::VecLoadI32x4,
+            O::VecLoadF32x4,
+            O::VecLoadI64x2,
+            O::VecLoadI16x8,
+            O::VecLoadI8x16,
+            O::VecLoadWidenI32ToI64x2,
+            O::VecLoadI32x4Pair,
+        ] {
+            assert_eq!(op.vec_mem_offset_arg_index(), Some(1), "{op:?} index slot");
+            assert!(
+                op.may_read_memory(),
+                "{op:?} must classify as a memory read"
+            );
+            assert!(
+                !op.writes_memory_via_args(),
+                "{op:?} is a load and must not classify as an argument-memory write"
+            );
+        }
+        for op in [
+            O::VecStoreI32x4,
+            O::VecStoreF32x4,
+            O::VecStoreF64x2,
+            O::VecStoreI64x2,
+            O::VecStoreI16x8,
+            O::VecStoreI8x16,
+            O::VecStoreI32x8,
+            O::VecStoreF32x8,
+            O::VecStoreF64x4,
+            O::VecStoreI64x4,
+            O::VecStoreI8x32,
+            O::VecStoreI16x16,
+            O::VecStoreI32x4Pair,
+        ] {
+            assert_eq!(op.vec_mem_offset_arg_index(), Some(2), "{op:?} index slot");
+            assert!(
+                op.writes_memory_via_args(),
+                "{op:?} must classify as an argument-memory write"
+            );
+        }
+    }
+
+    /// The accessor must be strictly narrower than the memory-behaviour
+    /// predicates: the FMA / hoisted / strict-reciprocal families read or write
+    /// memory through *data-positioned* arguments (multiplicands, guards), so
+    /// they must never report an address-index slot. Widening an induction
+    /// variable consumed by one of them as data would change the computed
+    /// value rather than its address.
+    #[test]
+    fn non_vector_memory_ops_never_expose_an_index_slot() {
+        for op in [
+            O::FmaF64x2,
+            O::FmaF64x4,
+            O::FmaF64x2Hoisted,
+            O::FmaF64x4Hoisted,
+            O::FmaF64x4SIB,
+            O::MulAddF64x4HoistedSIB,
+            O::StrictRecipMulAddF64x4,
+            O::StrictRecipMulAddPackedF64x4,
+            O::BroadcastLoadF64,
+            O::Loadu256,
+            O::Load256,
+        ] {
+            assert_eq!(
+                op.vec_mem_offset_arg_index(),
+                None,
+                "{op:?} must not expose a vector index slot"
+            );
+        }
+        // ... and the register-only vector ops have no slot at all.
+        for op in [
+            O::VecAddI32x8,
+            O::VecSubI32x8,
+            O::VecMulI32x8,
+            O::VecAndI32x8,
+            O::VecHorizontalAddI32x8,
+            O::VecBroadcastI32x8,
+            O::VecZeroI32x8,
+            O::VecMaddwdI16x16,
+            O::VecConstI8x32,
+        ] {
+            assert_eq!(
+                op.vec_mem_offset_arg_index(),
+                None,
+                "{op:?} is register-only"
             );
         }
     }

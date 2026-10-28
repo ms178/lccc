@@ -72,7 +72,15 @@ MARKER='FIX''ME'
 #        the slack predates it): the count dropped without the budget following.
 #        Tightened to the measurement, per the rule above -- a budget of 147
 #        over 146 reads permits one more read than the code has.
-ENV_READ_BUDGET=146
+#   143  2026-10-28: the three SSA-parameter diagnostic switches
+#        (CCC_NO_SSA_PARAM / CCC_SSA_PARAM_SKIP / CCC_SSA_PARAM_LOG, previously
+#        three per-call-site reads in inline.rs) and CCC_NO_STRIDED_REDUCE are
+#        now resolved once in `run_passes` (src/passes/mod.rs, which this gate
+#        excludes) and installed through set_ssa_param_config /
+#        set_strided_reduce_enabled, so no pass site reads them at all -- the
+#        three inline.rs reads and the strided-reduce read leave the count.
+#        Tightened to the new measurement, per the rule above.
+ENV_READ_BUDGET=143
 
 fail=0
 report() { # report <label> <offending lines>

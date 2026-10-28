@@ -38,6 +38,12 @@ pub trait HomeMap {
 
     /// Does any usable home satisfy `pred`?
     fn any_home(&self, pred: &dyn Fn(PhysReg) -> bool) -> bool;
+
+    /// True when value `id` is a single-use immediate right shift whose sole
+    /// consumer masks off the rotated-in upper bits, making BMI2 `rorx` legal.
+    fn is_rorx_masked_shift(&self, _id: u32) -> bool {
+        false
+    }
 }
 
 impl HomeMap for FxHashMap<u32, PhysReg> {
@@ -610,6 +616,14 @@ pub fn lower_binop(
         let rhs_home_is_dst = matches!(rhs, Operand::Value(v) if v.0 != dest.0)
             && matches!(rhs, Operand::Value(v) if value_to_reg(v, ra) == value_to_reg(dest, ra))
             && matches!(value_to_reg(dest, ra), MachReg::Phys(_));
+        let alu_size = if op == IrBinOp::And
+            && size == OpSize::S64
+            && matches!(rhs, Operand::Const(c) if (0..=i32::MAX as i64).contains(&const_to_i64(c)))
+        {
+            OpSize::S32
+        } else {
+            size
+        };
         if rhs_home_is_dst {
             let lhs_survives = match lhs {
                 Operand::Const(_) => true,
@@ -617,23 +631,26 @@ pub fn lower_binop(
             };
             let commutative = !matches!(op, IrBinOp::Sub);
             if commutative && lhs_survives {
-                emit_mov_operand_r(rhs, dst, size, ra, out);
-                emit_alu_operand_r(alu_op, lhs, dst, size, ra, out);
+                emit_mov_operand_r(rhs, dst, alu_size, ra, out);
+                emit_alu_operand_r(alu_op, lhs, dst, alu_size, ra, out);
                 return true;
             }
             return false;
         }
-        emit_mov_operand_r(lhs, dst, size, ra, out);
-        emit_alu_operand_r(alu_op, rhs, dst, size, ra, out);
+        emit_mov_operand_r(lhs, dst, alu_size, ra, out);
+        emit_alu_operand_r(alu_op, rhs, dst, alu_size, ra, out);
         return true;
     }
 
     // ── Shift operations ─────────────────────────────────────────────
     if let Some(shift_op) = binop_to_shift(op) {
-        // BMI2 RORX for immediate rotates: flag-preserving, non-destructive,
-        // 3-operand VEX. Converts Rol(n) -> Ror(width-n). S32/S64 only,
-        // immediate-only right rotate. Removes mov + flags dep for SHA-256/ChaCha ARX.
-        if matches!(shift_op, ShiftOp::Rol | ShiftOp::Ror)
+        // BMI2 RORX for immediate rotates and masked right shifts:
+        // flag-preserving, non-destructive, 3-operand VEX. Converts Rol(n) ->
+        // Ror(width-n), and uses Ror(n) for single-use Shr/Sar when the sole
+        // consumer masks off the rotated-in upper bits (`is_rorx_masked_shift`).
+        let rorx_shift_ok = matches!(shift_op, ShiftOp::Rol | ShiftOp::Ror)
+            || (matches!(shift_op, ShiftOp::Shr | ShiftOp::Sar) && ra.is_rorx_masked_shift(dest.0));
+        if rorx_shift_ok
             && matches!(size, OpSize::S32 | OpSize::S64)
             && shlx_mode() != ShlxMode::Never
             && rorx_allowed()
@@ -3238,5 +3255,84 @@ mod tests {
                 size: OpSize::S64,
             }]
         ));
+    }
+
+    #[test]
+    fn s64_nonneg_and_narrows_to_s32_and_masked_shr_uses_rorx() {
+        struct MaskedHomeMap {
+            regs: FxHashMap<u32, PhysReg>,
+            masked_shift: u32,
+        }
+        impl HomeMap for MaskedHomeMap {
+            fn get(&self, id: &u32) -> Option<&PhysReg> {
+                std::collections::HashMap::get(&self.regs, id)
+            }
+            fn any_home(&self, pred: &dyn Fn(PhysReg) -> bool) -> bool {
+                self.regs.values().any(|&r| pred(r))
+            }
+            fn is_rorx_masked_shift(&self, id: u32) -> bool {
+                id == self.masked_shift
+            }
+        }
+
+        let mut regs = FxHashMap::default();
+        regs.insert(1, PhysReg(1));
+        regs.insert(2, PhysReg(1)); // same reg -> exercises `andl` narrowing
+        regs.insert(3, PhysReg(2));
+        let ra = MaskedHomeMap {
+            regs,
+            masked_shift: 3,
+        };
+
+        // 64-bit `x & 0xff` in same register lowers to 32-bit `andl $255, %reg32`.
+        let mut out = Vec::new();
+        assert!(lower_binop(
+            &Value(2),
+            IrBinOp::And,
+            &Operand::Value(Value(1)),
+            &Operand::Const(IrConst::I64(0xff)),
+            IrType::U64,
+            &ra,
+            &mut out,
+        ));
+        assert!(
+            matches!(
+                out.as_slice(),
+                [MachInst::Alu {
+                    op: AluOp::And,
+                    size: OpSize::S32,
+                    ..
+                }]
+            ),
+            "expected S32 And, got {out:?}"
+        );
+
+        // When BMI2 SHLX/RORX is enabled, masked `LShr` emits `MachInst::Rorx`.
+        set_shlx_mode(ShlxMode::Always);
+        out.clear();
+        assert!(lower_binop(
+            &Value(3),
+            IrBinOp::LShr,
+            &Operand::Value(Value(1)),
+            &Operand::Const(IrConst::I64(16)),
+            IrType::U32,
+            &ra,
+            &mut out,
+        ));
+        set_shlx_mode(ShlxMode::Never);
+        if rorx_allowed() {
+            assert!(
+                matches!(
+                    out.as_slice(),
+                    [MachInst::Rorx {
+                        amount: 16,
+                        src: MachReg::Phys(PhysReg(1)),
+                        dst: MachReg::Phys(PhysReg(2)),
+                        size: OpSize::S32,
+                    }]
+                ),
+                "expected S32 Rorx, got {out:?}"
+            );
+        }
     }
 }

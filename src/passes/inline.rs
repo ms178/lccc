@@ -550,6 +550,7 @@ fn is_hot_leaf_candidate(data: &CalleeData) -> bool {
         && !data.has_loops
         && !data.is_recursive
         && !data.const_trip_only
+        && !data.const_branch_only
         && instructions <= MAX_HOT_LOOP_INLINE_LEAF_INSTRUCTIONS
         && data.blocks.len() <= MAX_INLINE_BLOCKS_NO_LOOPS
 }
@@ -577,6 +578,7 @@ fn is_sroa_unlockable_candidate(data: &CalleeData) -> bool {
         && !data.has_loops
         && !data.is_recursive
         && !data.const_trip_only
+        && !data.const_branch_only
         && instructions <= MAX_SROA_UNLOCK_HELPER_INSTRUCTIONS
         && data.blocks.len() <= MAX_INLINE_BLOCKS_NO_LOOPS
 }
@@ -809,6 +811,7 @@ fn is_hot_loop_helper_candidate(data: &CalleeData) -> bool {
         && data.has_loops
         && !data.is_recursive
         && !data.const_trip_only
+        && !data.const_branch_only
         && instructions <= MAX_HOT_LOOP_HELPER_INSTRUCTIONS
         && data.blocks.len() <= MAX_HOT_LOOP_HELPER_BLOCKS
 }
@@ -890,6 +893,11 @@ fn select_inline_site(
                 &site.args,
             );
         if callee_data.const_trip_only && !const_trip_admitted {
+            continue;
+        }
+        // Constant-branch-specialized `static inline` callees are handled in
+        // pass 2 so caller budgets and hard/absolute caps always apply.
+        if callee_data.const_branch_only {
             continue;
         }
         // Never use ordinary inlining for a recursive callee. A clone still
@@ -1025,6 +1033,16 @@ fn select_inline_site(
                 &site.args,
             );
         if callee_data.const_trip_only && !const_trip_admitted {
+            continue;
+        }
+        let const_branch_admitted = callee_data.const_branch_only
+            && !size_optimized
+            && const_branch_site_arg(
+                callee_data.const_branch_params,
+                &callee_data.param_struct_sizes,
+                &site.args,
+            );
+        if callee_data.const_branch_only && !const_branch_admitted {
             continue;
         }
         let callee_inst_count: usize = callee_data
@@ -1216,6 +1234,7 @@ fn select_inline_site(
                 && !callee_data.is_always_inline
                 && !size_cap_exempt
                 && !const_trip_admitted
+                && !const_branch_admitted
                 && !hot_inline_leaf
                 && !(in_loop
                     && !callee_data.has_loops
@@ -1361,6 +1380,38 @@ thread_local! {
 
 /// Record this translation unit's interposition mode (resolved once per
 /// unit by the driver, the same shape as the affine-fold knobs).
+/// Diagnostic configuration for SSA parameter substitution, resolved once per
+/// translation unit by `run_passes` (`set_ssa_param_config`).
+///
+/// `CCC_NO_SSA_PARAM=1` disables substitution; `CCC_SSA_PARAM_SKIP=a,b` names
+/// callees to leave alone; `CCC_SSA_PARAM_LOG=1` traces each substitution.
+#[derive(Clone, Default)]
+pub(crate) struct SsaParamConfig {
+    pub(crate) enabled: bool,
+    pub(crate) skip: crate::common::fx_hash::FxHashSet<String>,
+    pub(crate) log: bool,
+}
+
+thread_local! {
+    static SSA_PARAM_CONFIG: std::cell::RefCell<SsaParamConfig> =
+        std::cell::RefCell::new(SsaParamConfig {
+            enabled: true,
+            skip: crate::common::fx_hash::FxHashSet::default(),
+            log: false,
+        });
+}
+
+/// Install this translation unit's substitution configuration. Called once per
+/// `run_passes` invocation so a previous compile on the same worker thread
+/// cannot leak its diagnostics into the next one.
+pub(crate) fn set_ssa_param_config(config: SsaParamConfig) {
+    SSA_PARAM_CONFIG.with(|cell| *cell.borrow_mut() = config);
+}
+
+fn ssa_param_config() -> SsaParamConfig {
+    SSA_PARAM_CONFIG.with(|cell| cell.borrow().clone())
+}
+
 pub(crate) fn set_semantic_interposition(interposable: bool) {
     SEMANTIC_INTERPOSITION.with(|f| f.set(interposable));
 }
@@ -2869,6 +2920,14 @@ struct CalleeData {
     /// static-loop limits, so ordinary sites must not clone it. Such a callee
     /// is selected only at a call site with a qualifying constant argument.
     const_trip_only: bool,
+    /// Parameters tested in a `Switch` or `CondBranch` compare against a
+    /// compile-time constant (see `const_branch_param_mask`).
+    const_branch_params: u64,
+    /// Acyclic leaf `static inline` body exceeding `MAX_INLINE_INSTRUCTIONS` /
+    /// `MAX_INLINE_BLOCKS_NO_LOOPS`, admitted only at call sites passing a
+    /// compile-time constant for a branch-controlling parameter (e.g.
+    /// `is_invalid_utf8(p, 2|3|4)` in libexpat's `normal_contentTok`).
+    const_branch_only: bool,
     /// Whether recursively expanding ordinary eligible callees reaches a loop.
     /// A tiny wrapper can otherwise conceal a large loop nest from the raw
     /// tiny/small threshold used by the fixed-point inliner.
@@ -3002,12 +3061,120 @@ fn fits_static_loop_inline_limits(
 /// the compare feeding a loop-exiting conditional branch. A parameter that is
 /// reassigned inside the loop reaches the compare through a phi, so it is not
 /// counted and the tier cannot admit it.
+fn collect_unmutated_param_values(
+    func: &IrFunction,
+) -> (FxHashMap<Value, usize>, FxHashMap<Value, Value>) {
+    let mut param_of: FxHashMap<Value, usize> = FxHashMap::default();
+    let mut copy_src: FxHashMap<Value, Value> = FxHashMap::default();
+    let mut entry_allocas: FxHashSet<u32> = FxHashSet::default();
+    if let Some(entry) = func.blocks.first() {
+        for inst in &entry.instructions {
+            if let Instruction::Alloca {
+                dest,
+                volatile: false,
+                semantic_volatile: false,
+                ..
+            } = inst
+            {
+                entry_allocas.insert(dest.0);
+            }
+        }
+    }
+    let mut alloca_store_param: FxHashMap<u32, Option<usize>> = FxHashMap::default();
+    let mut raw_param_ref: FxHashMap<u32, usize> = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::ParamRef {
+                dest, param_idx, ..
+            } = inst
+            {
+                param_of.insert(*dest, *param_idx);
+                raw_param_ref.insert(dest.0, *param_idx);
+            }
+        }
+    }
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            match inst {
+                Instruction::Store {
+                    ptr,
+                    val: Operand::Value(v),
+                    volatile: false,
+                    ..
+                } if entry_allocas.contains(&ptr.0) => {
+                    if let Some(&p) = raw_param_ref.get(&v.0) {
+                        alloca_store_param
+                            .entry(ptr.0)
+                            .and_modify(|e| *e = None)
+                            .or_insert(Some(p));
+                    } else {
+                        alloca_store_param.insert(ptr.0, None);
+                    }
+                    if entry_allocas.contains(&v.0) {
+                        alloca_store_param.insert(v.0, None);
+                    }
+                }
+                Instruction::Load {
+                    ptr,
+                    volatile: false,
+                    ..
+                } if entry_allocas.contains(&ptr.0) => {}
+                Instruction::Alloca { .. } => {}
+                _ => {
+                    crate::backend::liveness::for_each_operand_in_instruction(inst, |op| {
+                        if let Operand::Value(v) = op
+                            && entry_allocas.contains(&v.0)
+                        {
+                            alloca_store_param.insert(v.0, None);
+                        }
+                    });
+                    crate::backend::liveness::for_each_value_use_in_instruction(inst, |v| {
+                        if entry_allocas.contains(&v.0) {
+                            alloca_store_param.insert(v.0, None);
+                        }
+                    });
+                }
+            }
+        }
+    }
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            match inst {
+                Instruction::Load {
+                    dest,
+                    ptr,
+                    volatile: false,
+                    ..
+                } => {
+                    if let Some(Some(p)) = alloca_store_param.get(&ptr.0) {
+                        param_of.insert(*dest, *p);
+                    }
+                }
+                Instruction::Copy {
+                    dest,
+                    src: Operand::Value(src),
+                }
+                | Instruction::Cast {
+                    dest,
+                    src: Operand::Value(src),
+                    ..
+                } => {
+                    copy_src.insert(*dest, *src);
+                }
+                _ => {}
+            }
+        }
+    }
+    (param_of, copy_src)
+}
+
 fn loop_bound_param_mask(func: &IrFunction) -> u64 {
     if func.blocks.is_empty() {
         return 0;
     }
     let mut param_of: FxHashMap<Value, usize> = FxHashMap::default();
     let mut copy_src: FxHashMap<Value, Value> = FxHashMap::default();
+    let mut param_const_adj: FxHashMap<Value, usize> = FxHashMap::default();
     let mut cmp_operands: FxHashMap<Value, (Operand, Operand)> = FxHashMap::default();
     for block in &func.blocks {
         for inst in &block.instructions {
@@ -3023,10 +3190,45 @@ fn loop_bound_param_mask(func: &IrFunction) -> u64 {
                 } => {
                     copy_src.insert(*dest, *src);
                 }
+                Instruction::BinOp {
+                    dest,
+                    op: IrBinOp::Add | IrBinOp::Sub,
+                    lhs: Operand::Value(v),
+                    rhs: Operand::Const(_),
+                    ..
+                } => {
+                    if let Some(&p) = param_of.get(v) {
+                        param_const_adj.insert(*dest, p);
+                    }
+                }
                 Instruction::Cmp { dest, lhs, rhs, .. } => {
-                    cmp_operands.insert(*dest, (lhs.clone(), rhs.clone()));
+                    cmp_operands.insert(*dest, (*lhs, *rhs));
                 }
                 _ => {}
+            }
+        }
+    }
+    // Second sweep for param ± const across mem2reg Copies (`v = Copy(param); i = Sub(v, 1)`).
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::BinOp {
+                dest,
+                op: IrBinOp::Add | IrBinOp::Sub,
+                lhs: Operand::Value(v),
+                rhs: Operand::Const(_),
+                ..
+            } = inst
+            {
+                let mut r = *v;
+                for _ in 0..8 {
+                    match copy_src.get(&r) {
+                        Some(&s) => r = s,
+                        None => break,
+                    }
+                }
+                if let Some(&p) = param_of.get(&r) {
+                    param_const_adj.insert(*dest, p);
+                }
             }
         }
     }
@@ -3086,6 +3288,41 @@ fn loop_bound_param_mask(func: &IrFunction) -> u64 {
                     mask |= 1u64 << idx;
                 }
             }
+            // Countdown helper shape (`for (int i = n - 1; i >= 0; i--)`):
+            // header Phi initialized from `param` or `param ± const` outside
+            // the loop and compared against a constant exit threshold.
+            let phi_cand = match (lhs, rhs) {
+                (Operand::Value(v), Operand::Const(_)) | (Operand::Const(_), Operand::Value(v)) => {
+                    Some(root(*v))
+                }
+                _ => None,
+            };
+            if let Some(pv) = phi_cand {
+                for h_inst in &func.blocks[lp.header].instructions {
+                    let Instruction::Phi { dest, incoming, .. } = h_inst else {
+                        break;
+                    };
+                    if *dest != pv {
+                        continue;
+                    }
+                    for (in_op, in_blk) in incoming {
+                        let Some(&pred_idx) = label_index.get(in_blk) else {
+                            continue;
+                        };
+                        if lp.body.contains(&pred_idx) {
+                            continue;
+                        }
+                        if let Some(idx) = param_of_operand(in_op).or_else(|| match in_op {
+                            Operand::Value(iv) => param_const_adj.get(&root(*iv)).copied(),
+                            Operand::Const(_) => None,
+                        }) {
+                            if idx < 64 {
+                                mask |= 1u64 << idx;
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
     mask
@@ -3112,6 +3349,94 @@ fn const_trip_site_arg(
                     .is_some_and(|v| (MIN_CONST_TRIP_COUNT..=MAX_CONST_TRIP_COUNT).contains(&v)),
                 Operand::Value(_) => false,
             }
+    })
+}
+
+/// Instruction and block ceilings for acyclic leaf `static inline` helpers
+/// admitted only at call sites passing a compile-time constant for a
+/// branch-controlling parameter (`Switch` selector or `CondBranch` compare
+/// against a constant). Once specialized, SCCP/CFG simplification folds the
+/// selector dispatch away so only the active arm remains in the caller.
+const MAX_CONST_BRANCH_INLINE_INSTRUCTIONS: usize = 128;
+const MAX_CONST_BRANCH_INLINE_BLOCKS: usize = 32;
+
+fn const_branch_param_mask(func: &IrFunction) -> u64 {
+    if func.blocks.is_empty() {
+        return 0;
+    }
+    let (param_of, copy_src) = collect_unmutated_param_values(func);
+    let root = |mut v: Value| -> Value {
+        for _ in 0..8 {
+            match copy_src.get(&v) {
+                Some(&s) => v = s,
+                None => break,
+            }
+        }
+        v
+    };
+    let param_of_op = |op: &Operand| -> Option<usize> {
+        match op {
+            Operand::Value(v) => param_of.get(&root(*v)).copied(),
+            Operand::Const(_) => None,
+        }
+    };
+    let mut cmp_operands: FxHashMap<Value, (Operand, Operand)> = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Cmp { dest, lhs, rhs, .. } = inst {
+                cmp_operands.insert(*dest, (*lhs, *rhs));
+            }
+        }
+    }
+    let mut mask = 0u64;
+    for block in &func.blocks {
+        match &block.terminator {
+            Terminator::Switch { val, .. } => {
+                if let Some(idx) = param_of_op(val)
+                    && idx < 64
+                {
+                    mask |= 1u64 << idx;
+                }
+            }
+            Terminator::CondBranch { cond, .. } => {
+                if let Some(idx) = param_of_op(cond)
+                    && idx < 64
+                {
+                    mask |= 1u64 << idx;
+                }
+                if let Operand::Value(cv) = cond
+                    && let Some((lhs, rhs)) = cmp_operands.get(&root(*cv))
+                {
+                    match (lhs, rhs) {
+                        (opnd, Operand::Const(_)) | (Operand::Const(_), opnd) => {
+                            if let Some(idx) = param_of_op(opnd)
+                                && idx < 64
+                            {
+                                mask |= 1u64 << idx;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    mask
+}
+
+fn const_branch_site_arg(
+    const_branch_params: u64,
+    param_struct_sizes: &[Option<usize>],
+    args: &[Operand],
+) -> bool {
+    if const_branch_params == 0 {
+        return false;
+    }
+    args.iter().take(64).enumerate().any(|(i, arg)| {
+        const_branch_params & (1u64 << i) != 0
+            && param_struct_sizes.get(i).is_some_and(Option::is_none)
+            && matches!(arg, Operand::Const(_))
     })
 }
 
@@ -3481,6 +3806,28 @@ fn callee_data_for(
             0
         };
         let const_trip_candidate = loop_bound_params != 0;
+        let has_outgoing_calls = func.blocks.iter().any(|b| {
+            b.instructions.iter().any(|i| {
+                matches!(
+                    i,
+                    Instruction::Call { .. } | Instruction::CallIndirect { .. }
+                )
+            })
+        });
+        let const_branch_params = if func.is_static
+            && func.is_inline
+            && !func.is_always_inline
+            && !func.is_gnu_inline_def
+            && !has_loops
+            && !has_outgoing_calls
+            && inst_count_for_static <= MAX_CONST_BRANCH_INLINE_INSTRUCTIONS
+            && func.blocks.len() <= MAX_CONST_BRANCH_INLINE_BLOCKS
+        {
+            const_branch_param_mask(func)
+        } else {
+            0
+        };
+        let const_branch_candidate = const_branch_params != 0;
         // Medium static callees up to MAX_MEDIUM_STATIC_INLINE_INSTRUCTIONS
         // instructions are admitted, including small loop CFGs. This exposes
         // aggregate-return helpers such as make_group to scalar cleanup. The
@@ -3645,7 +3992,9 @@ fn callee_data_for(
             && !is_medium_static
             && !is_small_static
             && !fits_single_call_site_static;
-        let fits_normal = const_trip_only || fits_general_normal;
+        let const_branch_only =
+            const_branch_candidate && !fits_general_normal && !fits_single_call_site_static;
+        let fits_normal = const_trip_only || const_branch_only || fits_general_normal;
         let fits_relaxed = inst_count <= MAX_ALWAYS_INLINE_INSTRUCTIONS
             && func.blocks.len() <= MAX_ALWAYS_INLINE_BLOCKS;
         // Single-call-site statics were already size-checked above against
@@ -3758,6 +4107,8 @@ fn callee_data_for(
             direct_call_count: total_calls,
             loop_bound_params,
             const_trip_only,
+            const_branch_params,
+            const_branch_only,
             has_inlineable_loop_descendant: false,
             has_inlined_calls: func.has_inlined_calls,
             // Any static callee with a single call site is dead after
@@ -5366,17 +5717,16 @@ fn inline_call_site(
         }
     }
 
-    // CCC_NO_SSA_PARAM=1 disables parameter substitution (diagnostic toggle).
-    let ssa_param_enabled = std::env::var("CCC_NO_SSA_PARAM").is_err();
-    // CCC_SSA_PARAM_SKIP=callee1,callee2 disables substitution for named
-    // callees; CCC_SSA_PARAM_LOG=1 traces substitutions (diagnostics).
-    let ssa_skip: crate::common::fx_hash::FxHashSet<String> = std::env::var("CCC_SSA_PARAM_SKIP")
-        .unwrap_or_default()
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-    let ssa_log = std::env::var("CCC_SSA_PARAM_LOG").is_ok();
+    // Parameter substitution's diagnostic switches, resolved once per
+    // translation unit by `run_passes` rather than read here: the pass-pipeline
+    // env-read ratchet (tests/regression/check_env_test_hygiene.sh) requires a
+    // new switch to be resolved in `run_passes`, so no `getenv` runs per call
+    // site.
+    let SsaParamConfig {
+        enabled: ssa_param_enabled,
+        skip: ssa_skip,
+        log: ssa_log,
+    } = ssa_param_config();
     let substitutable: Vec<bool> = (0..param_alloca_info.len())
         .map(|i| {
             let ok = ssa_param_enabled
@@ -6790,6 +7140,8 @@ mod inline_limit_tests {
             direct_call_count: 2,
             loop_bound_params: 0,
             const_trip_only: false,
+            const_branch_params: 0,
+            const_branch_only: false,
             has_inlineable_loop_descendant: false,
             has_inlined_calls: false,
             is_single_call_site_static: false,
@@ -9786,6 +10138,8 @@ mod sroa_unlock_tests {
             direct_call_count: 2,
             loop_bound_params: 0,
             const_trip_only: false,
+            const_branch_params: 0,
+            const_branch_only: false,
             has_inlineable_loop_descendant: false,
             has_inlined_calls: false,
             is_single_call_site_static: false,
@@ -9957,5 +10311,66 @@ mod sroa_unlock_tests {
             }],
         );
         assert!(!admitted(&used));
+    }
+
+    #[test]
+    fn const_branch_only_static_inline_admits_constant_arg_and_skips_variable_arg() {
+        let mut f = IrFunction::new(
+            "is_invalid_utf8_like".into(),
+            IrType::I32,
+            vec![crate::ir::reexports::IrParam {
+                ty: IrType::I32,
+                noalias: false,
+                struct_size: None,
+                struct_align: None,
+                param_align: None,
+                struct_eightbyte_classes: vec![],
+                is_f128_sse: false,
+                riscv_float_class: None,
+            }],
+            false,
+        );
+        f.is_static = true;
+        f.is_inline = true;
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![Instruction::ParamRef {
+                dest: Value(0),
+                param_idx: 0,
+                ty: IrType::I32,
+            }],
+            terminator: Terminator::Switch {
+                val: Operand::Value(Value(0)),
+                cases: vec![(2, BlockId(1)), (3, BlockId(2))],
+                default: BlockId(1),
+                ty: IrType::I32,
+            },
+            source_spans: vec![],
+        });
+        f.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![],
+            terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+            source_spans: vec![],
+        });
+        f.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: vec![],
+            terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(1)))),
+            source_spans: vec![],
+        });
+        let mask = const_branch_param_mask(&f);
+        assert_eq!(mask, 1);
+        let p_sizes = vec![None];
+        assert!(const_branch_site_arg(
+            mask,
+            &p_sizes,
+            &[Operand::Const(IrConst::I32(3))]
+        ));
+        assert!(!const_branch_site_arg(
+            mask,
+            &p_sizes,
+            &[Operand::Value(Value(9))]
+        ));
     }
 }

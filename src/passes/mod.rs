@@ -1595,6 +1595,22 @@ pub(crate) fn run_passes(
         target == crate::backend::Target::X86_64 && !pass_disabled(&disabled, "reduction_unroll"),
     );
     div_by_const::set_exact_enabled(!pass_disabled(&disabled, "exact_signed_div"));
+    // Diagnostic kill switches are resolved here, once per translation unit, so
+    // no pass reads the environment per call site (the env-read ratchet in
+    // tests/regression/check_env_test_hygiene.sh). `mod.rs` is deliberately
+    // outside that count.
+    let strided_reduce_allowed = std::env::var_os("CCC_NO_STRIDED_REDUCE").is_none();
+    vectorize::set_strided_reduce_enabled(strided_reduce_allowed);
+    inline::set_ssa_param_config(inline::SsaParamConfig {
+        enabled: std::env::var("CCC_NO_SSA_PARAM").is_err(),
+        skip: std::env::var("CCC_SSA_PARAM_SKIP")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        log: std::env::var("CCC_SSA_PARAM_LOG").is_ok(),
+    });
     vectorize::set_strict_recip_pack_enabled(!pass_disabled(&disabled, "strict_recip_pack"));
     vectorize::set_byte_count_normalize_enabled(!pass_disabled(&disabled, "byte_count_normalize"));
     // Snapshot the map policy switches once, like the other pass-pipeline
@@ -2091,6 +2107,7 @@ pub(crate) fn run_passes(
     //               5=gvn, 6=licm, 7=ifconv, 8=copyprop2, 9=dce, 10=cfg2
     const NUM_PASSES: usize = 11;
     let mut prev_pass_changes = [usize::MAX; NUM_PASSES]; // MAX = "assume changed" for iter 0
+    let mut prev_purity_changes = 1usize;
 
     // Track first iteration's total changes for diminishing-returns early exit.
     let mut iter0_total_changes = 0usize;
@@ -2970,8 +2987,9 @@ pub(crate) fn run_passes(
         {
             // GVN is enabled; CCC_DISABLE_PASSES=gvn is the diagnostic kill switch.
             let gvn_enabled = true;
-            let run_gvn = gvn_enabled && !dis.gvn && should_run!(5, 0, 1, 3);
-            let run_licm = !dis.licm && should_run!(6, 0, 1, 5);
+            let run_gvn =
+                gvn_enabled && !dis.gvn && (should_run!(5, 0, 1, 3, 6) || prev_purity_changes > 0);
+            let run_licm = !dis.licm && (should_run!(6, 0, 1, 5) || prev_purity_changes > 0);
             let run_ivsr = iter == 0
                 && std::env::var("CCC_NO_IVSR").is_err()
                 && !pass_disabled(&disabled, "ivsr");
@@ -3266,9 +3284,10 @@ pub(crate) fn run_passes(
         // have simplified call arguments to constants (e.g., phi nodes collapsed
         // after CFG simplification resolved dead branches from IS_ENABLED() checks).
         let mut ipcp_changes = 0;
+        let mut purity_changes = 0;
         if !dis.ipcp {
             ipcp_changes = timed_pass!("ipcp", ipcp::run(module));
-            let purity_changes = ip_purity::run(module);
+            purity_changes = ip_purity::run(module);
             if ipcp_changes > 0 || purity_changes > 0 {
                 changed.iter_mut().for_each(|c| *c = true);
             }
@@ -3313,6 +3332,7 @@ pub(crate) fn run_passes(
         const DIMINISHING_RETURNS_FACTOR: usize = 20; // 1/20 = 5% threshold
         if iter > 1
             && ipcp_changes == 0
+            && purity_changes == 0
             && iter0_total_changes > 0
             && total_changes_excl_dce * DIMINISHING_RETURNS_FACTOR < iter0_total_changes
         {
@@ -3321,6 +3341,7 @@ pub(crate) fn run_passes(
 
         // Save per-pass change counts for next iteration's skip decisions.
         prev_pass_changes = cur_pass_changes;
+        prev_purity_changes = purity_changes;
 
         // Prepare dirty set for next iteration: only re-visit functions that changed.
         std::mem::swap(&mut dirty, &mut changed);

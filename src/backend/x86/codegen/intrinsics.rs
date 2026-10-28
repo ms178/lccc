@@ -8058,9 +8058,12 @@ impl X86Codegen {
                 // scratch]; its four lanes have already been computed by
                 // equivalent lane-wise modular integer operations.
                 let packed = matches!(op, IntrinsicOp::StrictRecipMulAddPackedF64x4);
-                assert_eq!(
-                    args.len(),
-                    if packed { 5 } else { 8 },
+                assert!(
+                    if packed {
+                        matches!(args.len(), 5 | 6)
+                    } else {
+                        args.len() == 8
+                    },
                     "strict reciprocal argument contract"
                 );
                 let base_index = if packed { 2 } else { 5 };
@@ -8112,11 +8115,21 @@ impl X86Codegen {
                     self.state.emit("    vcvtdq2pd %xmm0, %ymm0");
                 }
                 self.state.dirty_upper_ymm = true;
-                let one = self.vec_const_rip_operand(1.0f64.to_bits(), 8);
-                self.state
-                    .emit_fmt(format_args!("    vbroadcastsd {}, %ymm1", one));
-                // AT&T VEX order is src2, src1, dst: ymm0 = ymm1 / ymm0.
-                self.state.emit("    vdivpd %ymm0, %ymm1, %ymm0");
+                if let Some(one_reg) = packed
+                    .then(|| args.get(5))
+                    .flatten()
+                    .and_then(|arg| self.vec_home_256(arg))
+                {
+                    // AT&T VEX order is src2, src1, dst: ymm0 = one_reg / ymm0.
+                    self.state
+                        .emit_fmt(format_args!("    vdivpd %ymm0, {}, %ymm0", one_reg));
+                } else {
+                    let one = self.vec_const_rip_operand(1.0f64.to_bits(), 8);
+                    self.state
+                        .emit_fmt(format_args!("    vbroadcastsd {}, %ymm1", one));
+                    // AT&T VEX order is src2, src1, dst: ymm0 = ymm1 / ymm0.
+                    self.state.emit("    vdivpd %ymm0, %ymm1, %ymm0");
+                }
 
                 // Form the contiguous source address before using rax for a
                 // fallback scratch pointer; vec_mem_operand may materialize

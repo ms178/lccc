@@ -1,9 +1,9 @@
 {
-  "fns_over_1000": 27,
-  "fns_over_300": 228,
-  "fns_over_500": 94,
+  "fns_over_1000": 26,
+  "fns_over_300": 234,
+  "fns_over_500": 97,
   "ignored_tests": 10,
-  "knob_literals": 540,
+  "knob_literals": 541,
   "knob_names": [
     "CCC_AGGREGATE_SPLIT",
     "CCC_AGG_BYVAL_DEBUG",
@@ -357,6 +357,7 @@
     "CCC_NO_STENCIL_VEC",
     "CCC_NO_STORE_DSE",
     "CCC_NO_STORE_SINK",
+    "CCC_NO_STRIDED_REDUCE",
     "CCC_NO_TIER2_GRAPH",
     "CCC_NO_TWO_BLOCK_UNROLL",
     "CCC_NO_UNIVSR",
@@ -547,7 +548,7 @@
     "LCCC_WHY_NOT_VECTORIZE"
   ],
   "knobs_undocumented": 268,
-  "panic_sites": 836,
-  "panic_sites_hot": 103,
+  "panic_sites": 837,
+  "panic_sites_hot": 101,
   "unsafe_sites": 25
 }

@@ -216,6 +216,30 @@ BENCHMARKS: tuple[Benchmark, ...] = (
     Benchmark("zstd_double_fast", "Zstandard double-fast match search / dual hash tables",
               ("zstd_double_fast.c",), ("workload", "zstd", "compression", "memory"),
               ci_sharded=False),
+    # Third extension round (archpkgbuilds workload kernels: gzip, zlib-ng,
+    # expat, sqlite, linux-cachymod-6.18, glibc). Each exercises a distinct
+    # codegen regime (8-table slice-by-8 CRC, saturating u16 hash-table slide +
+    # rolling insert, UTF-8 byte-class state machine, 12-way switch + big-endian
+    # record decoder, 4-lane 64-bit rotate-multiply hash, SWAR word scan +
+    # GNU_HASH djb2) and self-checks against an independent reference in-binary.
+    Benchmark("gzip_crc32_slice8", "GNU gzip slice-by-8 CRC-32 / 8-way table lookup and endian word xor",
+              ("gzip_crc32_slice8.c",), ("workload", "gzip", "checksum", "memory"),
+              ci_sharded=False),
+    Benchmark("zlib_ng_slide_hash", "zlib-ng slide_hash_c + rolling insert_string / saturating u16 array map",
+              ("zlib_ng_slide_hash.c",), ("workload", "zlib-ng", "compression", "vectorize", "loop"),
+              ci_sharded=False),
+    Benchmark("expat_utf8_content", "Expat UTF-8 XML content scanner / byte-class dispatch and entity loops",
+              ("expat_utf8_content.c",), ("workload", "expat", "parser", "switch", "branch"),
+              ci_sharded=False),
+    Benchmark("sqlite_vdbe_serial", "SQLite VDBE sqlite3VdbeSerialGet / switch jump-table and big-endian decode",
+              ("sqlite_vdbe_serial.c",), ("workload", "sqlite", "database", "switch", "endian"),
+              ci_sharded=False),
+    Benchmark("linux_xxhash64", "Linux kernel xxhash64 / 4-lane 64-bit rotate-multiply streaming hash",
+              ("linux_xxhash64.c",), ("workload", "linux", "hash", "integer", "loop"),
+              ci_sharded=False),
+    Benchmark("glibc_dl_hash", "glibc _dl_new_hash + SWAR strchrnul / dynamic linker symbol table lookup",
+              ("glibc_dl_hash.c",), ("workload", "glibc", "string", "hash", "bit"),
+              ci_sharded=False),
 )
 
 

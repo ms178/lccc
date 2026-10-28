@@ -98,6 +98,8 @@ mod byte_sum_tests;
 mod generator_map;
 #[path = "vectorize_strict_recip.rs"]
 mod strict_recip;
+#[path = "vectorize_strided_i32_reduce.rs"]
+mod strided_i32_reduce;
 
 use super::module_symbol_facts::ModuleSymbolFacts;
 use crate::common::fp_contract::FpContract;
@@ -485,6 +487,13 @@ pub(crate) fn x86_fma_available_pub() -> bool {
 /// thread cannot leak ISA permission into the next one.
 pub(crate) fn set_x86_strict_recip_avx2_enabled(enabled: bool) {
     X86_STRICT_RECIP_AVX2_AVAILABLE.with(|available| available.set(enabled));
+}
+
+/// Resolve the strided-2 i32 reduction vectorizer's kill switch once per
+/// translation unit. The submodule is private to this pass, so the pipeline
+/// reaches it through here.
+pub(crate) fn set_strided_reduce_enabled(enabled: bool) {
+    strided_i32_reduce::set_enabled(enabled);
 }
 
 pub(crate) fn set_strict_recip_pack_enabled(enabled: bool) {
@@ -1136,6 +1145,20 @@ fn vectorize_with_analysis_mode(
                 }
                 total_changes += transform_reduction_avx2(func, &red_pattern, fp_contract);
             }
+        } else if !neon
+            && !force_two_wide
+            && !late_minmax_only()
+            && !force_sse2
+            && x86_avx2_available()
+            && {
+                let n = strided_i32_reduce::try_transform(func, loop_info, &cfg, symbol_facts);
+                total_changes += n;
+                n > 0
+            }
+        {
+            if debug {
+                eprintln!("[VEC] Strided I32 reduction pattern matched! Transformed to AVX2");
+            }
         } else if !no_map_vec() {
             // AUD-4: the late scope deliberately does NOT gate the map
             // vectorizer. It exists to keep late REDUCTION admission narrow
@@ -1157,7 +1180,10 @@ fn vectorize_with_analysis_mode(
             {
                 total_changes += 1;
             }
-            if let Some(map_pattern) = analyze_map_pattern(func, loop_info, neon, symbol_facts) {
+            let companion_backup = try_canonicalize_companion_pointer_ivs(func, loop_info);
+            let map_changes = if let Some(map_pattern) =
+                analyze_map_pattern(func, loop_info, neon, symbol_facts)
+            {
                 // AArch64 is always 128-bit; x86 uses 256-bit vectors unless
                 // the focused SSE diagnostic override requests 128-bit code.
                 let avx2 = !neon && !force_two_wide && !map_sse_forced() && x86_avx2_available();
@@ -1173,28 +1199,46 @@ fn vectorize_with_analysis_mode(
                         map_pattern.elem_ty
                     );
                 }
-                total_changes += transform_map_vector(func, &map_pattern, avx2, neon, fp_contract);
-            } else if std::env::var("CCC_NO_STENCIL_VEC").is_err() {
-                // AUD-4: same reasoning as the map vectorizer above -- the
-                // late scope restricts reduction admission, not stencils.
-                // OP-05a: generalized non-reduction FP loops (stencils and
-                // multi-load maps with constant tap offsets). AArch64's NEON
-                // intrinsics are not wired for the displacement form yet.
-                if let Some(stencil_pattern) =
-                    analyze_stencil_pattern(func, loop_info, symbol_facts)
-                {
-                    if !neon {
-                        let avx2 = !force_two_wide && !map_sse_forced() && x86_avx2_available();
-                        if debug {
+                transform_map_vector(func, &map_pattern, avx2, neon, fp_contract)
+            } else {
+                0
+            };
+            if map_changes > 0 {
+                total_changes += map_changes;
+            } else {
+                if let Some(backup) = companion_backup {
+                    restore_companion_pointer_ivs(func, backup);
+                }
+                if std::env::var("CCC_NO_STENCIL_VEC").is_err() {
+                    // AUD-4: same reasoning as the map vectorizer above -- the
+                    // late scope restricts reduction admission, not stencils.
+                    // OP-05a: generalized non-reduction FP loops (stencils and
+                    // multi-load maps with constant tap offsets). AArch64's NEON
+                    // intrinsics are not wired for the displacement form yet.
+                    if let Some(stencil_pattern) =
+                        analyze_stencil_pattern(func, loop_info, symbol_facts)
+                    {
+                        if !neon {
+                            let avx2 = !force_two_wide && !map_sse_forced() && x86_avx2_available();
+                            if debug {
+                                eprintln!(
+                                    "[VEC] Stencil pattern matched! taps={} {:?} ({}-bit)",
+                                    stencil_pattern.taps.len(),
+                                    stencil_pattern.elem_ty,
+                                    if avx2 { 256 } else { 128 }
+                                );
+                            }
+                            total_changes +=
+                                transform_stencil_vector(func, &stencil_pattern, avx2, fp_contract);
+                        }
+                    } else {
+                        let why = take_reject().unwrap_or("pattern shape not recognized");
+                        if debug || std::env::var("LCCC_WHY_NOT_VECTORIZE").is_ok() {
                             eprintln!(
-                                "[VEC] Stencil pattern matched! taps={} {:?} ({}-bit)",
-                                stencil_pattern.taps.len(),
-                                stencil_pattern.elem_ty,
-                                if avx2 { 256 } else { 128 }
+                                "[VEC] Loop {} (header block {}) not vectorized: {}",
+                                idx, loop_info.header, why
                             );
                         }
-                        total_changes +=
-                            transform_stencil_vector(func, &stencil_pattern, avx2, fp_contract);
                     }
                 } else {
                     let why = take_reject().unwrap_or("pattern shape not recognized");
@@ -1204,14 +1248,6 @@ fn vectorize_with_analysis_mode(
                             idx, loop_info.header, why
                         );
                     }
-                }
-            } else {
-                let why = take_reject().unwrap_or("pattern shape not recognized");
-                if debug || std::env::var("LCCC_WHY_NOT_VECTORIZE").is_ok() {
-                    eprintln!(
-                        "[VEC] Loop {} (header block {}) not vectorized: {}",
-                        idx, loop_info.header, why
-                    );
                 }
             }
         } else {
@@ -6772,6 +6808,7 @@ mod roots_proven_distinct_tests {
         ModuleSymbolFacts {
             aliased_names: aliased.iter().map(|name| (*name).to_owned()).collect(),
             identity_witnesses: local.iter().map(|name| (*name).to_owned()).collect(),
+            ..ModuleSymbolFacts::default()
         }
     }
 
@@ -16987,33 +17024,80 @@ fn parse_byte_map_expr(
                     ));
                 }
             }
-            // Exact unsigned min/max fold.  `vpminub`/`vpmaxub` need both
-            // operands inside [0, 255]; there the wide and byte unsigned
-            // orders coincide, which is exactly the condition the compare
-            // arm above already checked when it produced the mask.
-            if let MapExpr::Cmp(cmp_op, cl, cr) = &cond_expr {
-                let unsigned_domain = range_within(tr, u_dom) && range_within(fr, u_dom);
-                if unsigned_domain && matches!(cmp_op, IrCmpOp::Ult | IrCmpOp::Ule) {
-                    // `(a < b) ? a : b` == min(a, b); `(a < b) ? b : a` == max.
-                    if **cl == t && **cr == f {
-                        return Some((
-                            MapExpr::MinMax {
-                                is_max: false,
-                                l: Box::new(t),
-                                r: Box::new(f),
-                            },
-                            union,
-                        ));
-                    }
-                    if **cl == f && **cr == t {
-                        return Some((
-                            MapExpr::MinMax {
-                                is_max: true,
-                                l: Box::new(t),
-                                r: Box::new(f),
-                            },
-                            union,
-                        ));
+            // Exact unsigned min/max and saturating-subtract folds.
+            // `vpminub`/`vpmaxub` exist on both SSE2 and AVX2; 16-bit unsigned
+            // `vpminuw`/`vpmaxuw` (`VecMinU16x16`/`VecMaxU16x16`) require AVX2
+            // (`avx2 == true` in `transform_map_vector`), so keep SSE2 16-bit
+            // lanes on `MapExpr::Select`.
+            let u_minmax_hw =
+                elem_bytes == 1 || (!map_sse_forced() && !sse2_forced() && x86_avx2_available());
+            if u_minmax_hw {
+                if let MapExpr::Cmp(cmp_op, cl, cr) = &cond_expr {
+                    if matches!(cmp_op, IrCmpOp::Ult | IrCmpOp::Ule) {
+                        // Unsigned saturating subtract (e.g. zlib-ng `slide_hash_c`:
+                        // `m >= w ? m - w : 0`, `m > w ? m - w : 0`, `m < w ? 0 : m - w`,
+                        // `m <= w ? 0 : m - w`): for all unsigned N-bit lanes M and W,
+                        // `(max_u(M, W) - W) mod 2^N == (M >= W ? M - W : 0)`.
+                        if fr == Some((0, 0)) {
+                            if let MapExpr::BinOp(IrBinOp::Sub, sub_l, sub_r) = &t {
+                                if **sub_l == **cr && **sub_r == **cl {
+                                    return Some((
+                                        MapExpr::BinOp(
+                                            IrBinOp::Sub,
+                                            Box::new(MapExpr::MinMax {
+                                                is_max: true,
+                                                l: cr.clone(),
+                                                r: cl.clone(),
+                                            }),
+                                            cl.clone(),
+                                        ),
+                                        Some(u_dom),
+                                    ));
+                                }
+                            }
+                        }
+                        if tr == Some((0, 0)) {
+                            if let MapExpr::BinOp(IrBinOp::Sub, sub_l, sub_r) = &f {
+                                if **sub_l == **cl && **sub_r == **cr {
+                                    return Some((
+                                        MapExpr::BinOp(
+                                            IrBinOp::Sub,
+                                            Box::new(MapExpr::MinMax {
+                                                is_max: true,
+                                                l: cl.clone(),
+                                                r: cr.clone(),
+                                            }),
+                                            cr.clone(),
+                                        ),
+                                        Some(u_dom),
+                                    ));
+                                }
+                            }
+                        }
+                        let unsigned_domain = range_within(tr, u_dom) && range_within(fr, u_dom);
+                        if unsigned_domain {
+                            // `(a < b) ? a : b` == min(a, b); `(a < b) ? b : a` == max.
+                            if **cl == t && **cr == f {
+                                return Some((
+                                    MapExpr::MinMax {
+                                        is_max: false,
+                                        l: Box::new(t),
+                                        r: Box::new(f),
+                                    },
+                                    union,
+                                ));
+                            }
+                            if **cl == f && **cr == t {
+                                return Some((
+                                    MapExpr::MinMax {
+                                        is_max: true,
+                                        l: Box::new(t),
+                                        r: Box::new(f),
+                                    },
+                                    union,
+                                ));
+                            }
+                        }
                     }
                 }
             }
@@ -17060,6 +17144,27 @@ fn invariant_byte_promotion(
             return match from_ty {
                 IrType::U8 | IrType::U16 => Some((*src, u_dom)),
                 IrType::I8 | IrType::I16 => Some((*src, s_dom)),
+                _ => None,
+            };
+        }
+    }
+    // Also accept a loop-invariant value already typed at the exact narrow lane
+    // width (e.g. a `uint16_t` `ParamRef` feeding a narrow `Sub` after SROA /
+    // inlining without an intermediate `I32` promotion).
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if inst.dest() != Some(v) {
+                continue;
+            }
+            let Some(ty) = inst.result_type() else {
+                return None;
+            };
+            if ty.size() != elem_bytes as usize {
+                return None;
+            }
+            return match ty {
+                IrType::U8 | IrType::U16 => Some((v, u_dom)),
+                IrType::I8 | IrType::I16 => Some((v, s_dom)),
                 _ => None,
             };
         }
@@ -20957,24 +21062,231 @@ fn transform_strict_computed_recip_reduction(
     let remaining = fresh_strict_value(&mut next_value_id);
     let enough_lanes = fresh_strict_value(&mut next_value_id);
     let scratch = fresh_strict_value(&mut next_value_id);
+    let packed_iv_phi = fresh_strict_value(&mut next_value_id);
 
     // Build every new instruction before changing the original CFG.  A future
     // extension which accidentally widens the accepted DAG therefore fails as
     // an all-or-nothing no-op rather than leaving half-versioned IR behind.
-    let packed_plan = STRICT_RECIP_PACK_ENABLED.with(|enabled| {
+    let preheader_label = func.blocks[pattern.preheader_idx].label;
+    let carried_plan = STRICT_RECIP_PACK_ENABLED.with(|enabled| {
         if !enabled.get() {
             return None;
         }
-        strict_recip::build_plan(func, pattern, vector_iv, next_value_id)
+        strict_recip::build_carried_plan(func, pattern, packed_iv_phi, next_value_id)
     });
     let mut prefix = Vec::new();
     let mut vector_body_instructions;
     let mut denominator_args = Vec::new();
-    let intrinsic = if let Some(plan) = packed_plan {
+    let mut header_instructions = vec![Instruction::Phi {
+        dest: vector_sum,
+        ty: IrType::F64,
+        incoming: vec![(pattern.sum_init.clone(), preheader_label)],
+    }];
+    let remainder_iv_operand;
+    let intrinsic = if let Some(plan) = carried_plan {
         next_value_id = plan.next;
         prefix = plan.prefix;
         vector_body_instructions = plan.instructions;
         denominator_args.push(Operand::Value(plan.denominator));
+
+        let byte_offset_phi = fresh_strict_value(&mut next_value_id);
+        let byte_offset_next = fresh_strict_value(&mut next_value_id);
+        let vector_sum_next = fresh_strict_value(&mut next_value_id);
+        let mut args = vec![Operand::Value(vector_sum)];
+        args.extend(denominator_args);
+        args.extend([
+            Operand::Value(pattern.source_base),
+            Operand::Value(byte_offset_phi),
+            Operand::Value(scratch),
+        ]);
+        if x86_avx2_available() {
+            let one_splat = fresh_strict_value(&mut next_value_id);
+            prefix.push(Instruction::Intrinsic {
+                dest: Some(one_splat),
+                op: IntrinsicOp::VecBroadcastF64x4,
+                dest_ptr: None,
+                args: vec![Operand::Const(IrConst::F64(1.0))],
+            });
+            args.push(Operand::Value(one_splat));
+        }
+        vector_body_instructions.push(Instruction::Intrinsic {
+            dest: Some(vector_sum_next),
+            op: IntrinsicOp::StrictRecipMulAddPackedF64x4,
+            dest_ptr: None,
+            args,
+        });
+        vector_body_instructions.push(Instruction::BinOp {
+            dest: byte_offset_next,
+            op: IrBinOp::Add,
+            lhs: Operand::Value(byte_offset_phi),
+            rhs: Operand::Const(IrConst::I64(32)),
+            ty: IrType::I64,
+        });
+
+        if let Instruction::Phi { incoming, .. } = &mut header_instructions[0] {
+            incoming.push((Operand::Value(vector_sum_next), vector_body_label));
+        }
+        header_instructions.push(Instruction::Phi {
+            dest: byte_offset_phi,
+            ty: IrType::I64,
+            incoming: vec![
+                (Operand::Const(IrConst::I64(0)), preheader_label),
+                (Operand::Value(byte_offset_next), vector_body_label),
+            ],
+        });
+        header_instructions.push(Instruction::Phi {
+            dest: packed_iv_phi,
+            ty: IrType::I32,
+            incoming: vec![
+                (Operand::Value(plan.packed_iv_init), preheader_label),
+                (Operand::Value(plan.packed_iv_next), vector_body_label),
+            ],
+        });
+
+        let const_limit = {
+            let mut cur = pattern.limit.clone();
+            let mut found = None;
+            for _ in 0..4 {
+                match cur {
+                    Operand::Const(c) => {
+                        found = c
+                            .to_i64()
+                            .filter(|&n| (0..=i64::from(i32::MAX)).contains(&n));
+                        break;
+                    }
+                    Operand::Value(v) => {
+                        let mut next_op = None;
+                        'outer: for blk in &func.blocks {
+                            for inst in &blk.instructions {
+                                if let Instruction::Copy { dest, src } = inst {
+                                    if *dest == v {
+                                        next_op = Some(src.clone());
+                                        break 'outer;
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(op) = next_op {
+                            cur = op;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+            found
+        };
+        if let Some(n) = const_limit {
+            let vec_iters = n / 4;
+            let byte_limit = vec_iters * 32;
+            header_instructions.push(Instruction::Cmp {
+                dest: enough_lanes,
+                op: IrCmpOp::Ult,
+                lhs: Operand::Value(byte_offset_phi),
+                rhs: Operand::Const(IrConst::I64(byte_limit)),
+                ty: IrType::U64,
+            });
+            remainder_iv_operand = Operand::Const(IrConst::I32((vec_iters * 4) as i32));
+        } else if x86_avx2_available() {
+            let is_ge4 = fresh_strict_value(&mut next_value_id);
+            let n_clamped = fresh_strict_value(&mut next_value_id);
+            let n_u64 = fresh_strict_value(&mut next_value_id);
+            let vec_iters = fresh_strict_value(&mut next_value_id);
+            let byte_limit = fresh_strict_value(&mut next_value_id);
+            let rem_iv_u64 = fresh_strict_value(&mut next_value_id);
+            let rem_iv = fresh_strict_value(&mut next_value_id);
+            prefix.push(Instruction::Cmp {
+                dest: is_ge4,
+                op: IrCmpOp::Sgt,
+                lhs: pattern.limit.clone(),
+                rhs: Operand::Const(IrConst::I32(3)),
+                ty: IrType::I32,
+            });
+            prefix.push(Instruction::Select {
+                dest: n_clamped,
+                cond: Operand::Value(is_ge4),
+                true_val: pattern.limit.clone(),
+                false_val: Operand::Const(IrConst::I32(0)),
+                ty: IrType::I32,
+            });
+            prefix.push(Instruction::Cast {
+                dest: n_u64,
+                src: Operand::Value(n_clamped),
+                from_ty: IrType::I32,
+                to_ty: IrType::U64,
+            });
+            prefix.push(Instruction::BinOp {
+                dest: vec_iters,
+                op: IrBinOp::LShr,
+                lhs: Operand::Value(n_u64),
+                rhs: Operand::Const(IrConst::I64(2)),
+                ty: IrType::U64,
+            });
+            prefix.push(Instruction::BinOp {
+                dest: byte_limit,
+                op: IrBinOp::Shl,
+                lhs: Operand::Value(vec_iters),
+                rhs: Operand::Const(IrConst::I64(5)),
+                ty: IrType::U64,
+            });
+            prefix.push(Instruction::BinOp {
+                dest: rem_iv_u64,
+                op: IrBinOp::Shl,
+                lhs: Operand::Value(vec_iters),
+                rhs: Operand::Const(IrConst::I64(2)),
+                ty: IrType::U64,
+            });
+            prefix.push(Instruction::Cast {
+                dest: rem_iv,
+                src: Operand::Value(rem_iv_u64),
+                from_ty: IrType::U64,
+                to_ty: IrType::I32,
+            });
+            header_instructions.push(Instruction::Cmp {
+                dest: enough_lanes,
+                op: IrCmpOp::Ult,
+                lhs: Operand::Value(byte_offset_phi),
+                rhs: Operand::Value(byte_limit),
+                ty: IrType::U64,
+            });
+            remainder_iv_operand = Operand::Value(rem_iv);
+        } else {
+            let vector_iv_next = fresh_strict_value(&mut next_value_id);
+            vector_body_instructions.push(Instruction::BinOp {
+                dest: vector_iv_next,
+                op: IrBinOp::Add,
+                lhs: Operand::Value(vector_iv),
+                rhs: Operand::Const(IrConst::I32(4)),
+                ty: IrType::I32,
+            });
+            header_instructions.push(Instruction::Phi {
+                dest: vector_iv,
+                ty: IrType::I32,
+                incoming: vec![
+                    (Operand::Const(IrConst::I32(0)), preheader_label),
+                    (Operand::Value(vector_iv_next), vector_body_label),
+                ],
+            });
+            // Avoid `j + 3 < n`: it creates signed-overflow UB for an
+            // otherwise valid source trip count near INT_MAX.  Once a prefix
+            // iteration has executed, this invariant proves both `n - j` and
+            // `j + 4` are defined in the I32 domain.
+            header_instructions.push(Instruction::BinOp {
+                dest: remaining,
+                op: IrBinOp::Sub,
+                lhs: pattern.limit.clone(),
+                rhs: Operand::Value(vector_iv),
+                ty: IrType::I32,
+            });
+            header_instructions.push(Instruction::Cmp {
+                dest: enough_lanes,
+                op: IrCmpOp::Sgt,
+                lhs: Operand::Value(remaining),
+                rhs: Operand::Const(IrConst::I32(3)),
+                ty: IrType::I32,
+            });
+            remainder_iv_operand = Operand::Value(vector_iv);
+        }
         IntrinsicOp::StrictRecipMulAddPackedF64x4
     } else {
         // The private allocator MAY have advanced before a later DAG operand
@@ -21013,91 +21325,76 @@ fn transform_strict_computed_recip_reduction(
         }
 
         denominator_args.extend(denominators.into_iter().map(Operand::Value));
+        let byte_offset_index = fresh_strict_value(&mut next_value_id);
+        let byte_offset = fresh_strict_value(&mut next_value_id);
+        vector_body_instructions.push(Instruction::Cast {
+            dest: byte_offset_index,
+            src: Operand::Value(vector_iv),
+            from_ty: IrType::I32,
+            to_ty: IrType::I64,
+        });
+        vector_body_instructions.push(Instruction::BinOp {
+            dest: byte_offset,
+            op: IrBinOp::Shl,
+            lhs: Operand::Value(byte_offset_index),
+            rhs: Operand::Const(IrConst::I64(3)),
+            ty: IrType::I64,
+        });
+        let vector_sum_next = fresh_strict_value(&mut next_value_id);
+        let mut args = vec![Operand::Value(vector_sum)];
+        args.extend(denominator_args);
+        args.extend([
+            Operand::Value(pattern.source_base),
+            Operand::Value(byte_offset),
+            Operand::Value(scratch),
+        ]);
+        vector_body_instructions.push(Instruction::Intrinsic {
+            dest: Some(vector_sum_next),
+            op: IntrinsicOp::StrictRecipMulAddF64x4,
+            dest_ptr: None,
+            args,
+        });
+        let vector_iv_next = fresh_strict_value(&mut next_value_id);
+        vector_body_instructions.push(Instruction::BinOp {
+            dest: vector_iv_next,
+            op: IrBinOp::Add,
+            lhs: Operand::Value(vector_iv),
+            rhs: Operand::Const(IrConst::I32(4)),
+            ty: IrType::I32,
+        });
+        if let Instruction::Phi { incoming, .. } = &mut header_instructions[0] {
+            incoming.push((Operand::Value(vector_sum_next), vector_body_label));
+        }
+        header_instructions.push(Instruction::Phi {
+            dest: vector_iv,
+            ty: IrType::I32,
+            incoming: vec![
+                (Operand::Const(IrConst::I32(0)), preheader_label),
+                (Operand::Value(vector_iv_next), vector_body_label),
+            ],
+        });
+        header_instructions.push(Instruction::BinOp {
+            dest: remaining,
+            op: IrBinOp::Sub,
+            lhs: pattern.limit.clone(),
+            rhs: Operand::Value(vector_iv),
+            ty: IrType::I32,
+        });
+        header_instructions.push(Instruction::Cmp {
+            dest: enough_lanes,
+            op: IrCmpOp::Sgt,
+            lhs: Operand::Value(remaining),
+            rhs: Operand::Const(IrConst::I32(3)),
+            ty: IrType::I32,
+        });
+        remainder_iv_operand = Operand::Value(vector_iv);
         IntrinsicOp::StrictRecipMulAddF64x4
     };
-
-    let byte_offset_index = fresh_strict_value(&mut next_value_id);
-    let byte_offset = fresh_strict_value(&mut next_value_id);
-    vector_body_instructions.push(Instruction::Cast {
-        dest: byte_offset_index,
-        src: Operand::Value(vector_iv),
-        from_ty: IrType::I32,
-        to_ty: IrType::I64,
-    });
-    vector_body_instructions.push(Instruction::BinOp {
-        dest: byte_offset,
-        op: IrBinOp::Shl,
-        lhs: Operand::Value(byte_offset_index),
-        rhs: Operand::Const(IrConst::I64(3)),
-        ty: IrType::I64,
-    });
-    let vector_sum_next = fresh_strict_value(&mut next_value_id);
-    let mut args = vec![Operand::Value(vector_sum)];
-    args.extend(denominator_args);
-    args.extend([
-        Operand::Value(pattern.source_base),
-        Operand::Value(byte_offset),
-        Operand::Value(scratch),
-    ]);
-    vector_body_instructions.push(Instruction::Intrinsic {
-        dest: Some(vector_sum_next),
-        op: intrinsic,
-        dest_ptr: None,
-        args,
-    });
-    let vector_iv_next = fresh_strict_value(&mut next_value_id);
-    vector_body_instructions.push(Instruction::BinOp {
-        dest: vector_iv_next,
-        op: IrBinOp::Add,
-        lhs: Operand::Value(vector_iv),
-        rhs: Operand::Const(IrConst::I32(4)),
-        ty: IrType::I32,
-    });
+    let _ = intrinsic;
 
     let vector_header = BasicBlock {
         label: vector_header_label,
-        instructions: vec![
-            Instruction::Phi {
-                dest: vector_sum,
-                ty: IrType::F64,
-                incoming: vec![
-                    (
-                        pattern.sum_init.clone(),
-                        func.blocks[pattern.preheader_idx].label,
-                    ),
-                    (Operand::Value(vector_sum_next), vector_body_label),
-                ],
-            },
-            Instruction::Phi {
-                dest: vector_iv,
-                ty: IrType::I32,
-                incoming: vec![
-                    (
-                        Operand::Const(IrConst::I32(0)),
-                        func.blocks[pattern.preheader_idx].label,
-                    ),
-                    (Operand::Value(vector_iv_next), vector_body_label),
-                ],
-            },
-            // Avoid `j + 3 < n`: it creates signed-overflow UB for an
-            // otherwise valid source trip count near INT_MAX.  Once a prefix
-            // iteration has executed, this invariant proves both `n - j` and
-            // `j + 4` are defined in the I32 domain.
-            Instruction::BinOp {
-                dest: remaining,
-                op: IrBinOp::Sub,
-                lhs: pattern.limit.clone(),
-                rhs: Operand::Value(vector_iv),
-                ty: IrType::I32,
-            },
-            Instruction::Cmp {
-                dest: enough_lanes,
-                op: IrCmpOp::Sgt,
-                lhs: Operand::Value(remaining),
-                rhs: Operand::Const(IrConst::I32(3)),
-                ty: IrType::I32,
-            },
-        ],
+        instructions: header_instructions,
         terminator: Terminator::CondBranch {
             cond: Operand::Value(enough_lanes),
             true_label: vector_body_label,
@@ -21112,7 +21409,6 @@ fn transform_strict_computed_recip_reduction(
         source_spans: vec![],
     };
 
-    let preheader_label = func.blocks[pattern.preheader_idx].label;
     let original_header_label = func.blocks[pattern.header_idx].label;
     // Locate both phi inputs while the old CFG is still wholly intact.  The
     // matcher proved these indices exist, but keeping the plan explicit makes
@@ -21140,7 +21436,7 @@ fn transform_strict_computed_recip_reduction(
     let mut rewritten_header_instructions = func.blocks[pattern.header_idx].instructions.clone();
     for (inst_idx, incoming_idx, replacement) in [
         (sum_input.0, sum_input.1, Operand::Value(vector_sum)),
-        (iv_input.0, iv_input.1, Operand::Value(vector_iv)),
+        (iv_input.0, iv_input.1, remainder_iv_operand),
     ] {
         let Instruction::Phi { incoming, .. } = &mut rewritten_header_instructions[inst_idx] else {
             // This is intentionally before the first IR mutation.  The
@@ -33931,6 +34227,352 @@ pub(crate) fn vectorize_function_with_symbol_facts(
     }
 }
 
+struct CompanionPointerIvBackup {
+    header_idx: usize,
+    header_insts: Vec<Instruction>,
+    body_entry_idx: usize,
+    body_entry_insts: Vec<Instruction>,
+    next_value_id: u32,
+}
+
+fn restore_companion_pointer_ivs(func: &mut IrFunction, backup: CompanionPointerIvBackup) {
+    func.blocks[backup.header_idx].instructions = backup.header_insts;
+    func.blocks[backup.body_entry_idx].instructions = backup.body_entry_insts;
+    func.next_value_id = backup.next_value_id;
+}
+
+/// Canonicalize post-increment companion pointer phis (`*q++ = f(*p++)`) into
+/// `ptr_init + iv * stride` `GetElementPtr`s at loop body entry so `VEC-MAP`
+/// sees a single-IV loop and rewires scalar remainder tails to `ptr_init +
+/// rem_iv * stride` automatically. Caller rolls back via
+/// [`restore_companion_pointer_ivs`] if map vectorization declines the loop.
+fn try_canonicalize_companion_pointer_ivs(
+    func: &mut IrFunction,
+    loop_info: &loop_analysis::NaturalLoop,
+) -> Option<CompanionPointerIvBackup> {
+    let header_idx = loop_info.header;
+    let phi_count = func.blocks[header_idx]
+        .instructions
+        .iter()
+        .filter(|i| matches!(i, Instruction::Phi { .. }))
+        .count();
+    if phi_count < 2 {
+        return None;
+    }
+
+    let Terminator::CondBranch {
+        cond: Operand::Value(cmp_dest),
+        true_label,
+        false_label,
+    } = func.blocks[header_idx].terminator
+    else {
+        return None;
+    };
+    let in_loop = |lbl: BlockId| {
+        loop_info
+            .body
+            .iter()
+            .copied()
+            .find(|&b| func.blocks[b].label == lbl)
+    };
+    let body_entry_idx = match (in_loop(true_label), in_loop(false_label)) {
+        (Some(b), None) if b != header_idx => b,
+        (None, Some(b)) if b != header_idx => b,
+        _ => return None,
+    };
+
+    // Collect 2-way header Phis sharing one external preheader and one loop latch.
+    struct HeaderPhi {
+        dest: Value,
+        ty: IrType,
+        pre_op: Operand,
+        back_val: Value,
+    }
+    let mut header_phis = Vec::with_capacity(phi_count);
+    let mut shared_edges: Option<(BlockId, BlockId)> = None;
+    let mut cmp_lhs_val: Option<Value> = None;
+    for inst in &func.blocks[header_idx].instructions {
+        match inst {
+            Instruction::Phi {
+                dest, ty, incoming, ..
+            } => {
+                if incoming.len() != 2 {
+                    return None;
+                }
+                let (e0_in, e1_in) = (
+                    in_loop(incoming[0].1).is_some(),
+                    in_loop(incoming[1].1).is_some(),
+                );
+                let ((pre_op, pre_lbl), (back_op, latch_lbl)) = match (e0_in, e1_in) {
+                    (false, true) => (&incoming[0], &incoming[1]),
+                    (true, false) => (&incoming[1], &incoming[0]),
+                    _ => return None,
+                };
+                let Operand::Value(back_val) = back_op else {
+                    return None;
+                };
+                if let Some((exp_pre, exp_latch)) = shared_edges {
+                    if *pre_lbl != exp_pre || *latch_lbl != exp_latch {
+                        return None;
+                    }
+                } else {
+                    shared_edges = Some((*pre_lbl, *latch_lbl));
+                }
+                header_phis.push(HeaderPhi {
+                    dest: *dest,
+                    ty: *ty,
+                    pre_op: pre_op.clone(),
+                    back_val: *back_val,
+                });
+            }
+            Instruction::Cmp {
+                dest,
+                lhs: Operand::Value(l),
+                ..
+            } if *dest == cmp_dest => {
+                cmp_lhs_val = Some(*l);
+            }
+            _ => {}
+        }
+    }
+    let cmp_lhs_val = cmp_lhs_val?;
+
+    // Locate the primary unit-step zero-initialized integer IV tested by `cmp_dest`.
+    let iv_idx = header_phis.iter().position(|p| {
+        matches!(p.ty, IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64)
+            && matches!(&p.pre_op, Operand::Const(c) if c.to_i64() == Some(0))
+            && value_traces_to_iv_through_copies(func, cmp_lhs_val, p.dest)
+            && find_inst_in_loop(func, &loop_info.body, p.back_val).is_some_and(|(_, inst)| {
+                match inst {
+                    Instruction::BinOp {
+                        op: IrBinOp::Add,
+                        lhs,
+                        rhs,
+                        ty,
+                        ..
+                    } if *ty == p.ty => match (lhs, rhs) {
+                        (Operand::Value(v), Operand::Const(c))
+                        | (Operand::Const(c), Operand::Value(v)) => {
+                            c.to_i64() == Some(1)
+                                && value_traces_to_iv_through_copies(func, *v, p.dest)
+                        }
+                        _ => false,
+                    },
+                    _ => false,
+                }
+            })
+    })?;
+    let iv_phi = header_phis[iv_idx].dest;
+    let iv_ty = header_phis[iv_idx].ty;
+
+    let mut loop_defs = FxHashSet::default();
+    for &b in &loop_info.body {
+        for inst in &func.blocks[b].instructions {
+            if let Some(d) = inst.dest() {
+                loop_defs.insert(d);
+            }
+        }
+    }
+
+    // Validate every companion pointer phi (`*q++`, stride in {1, 2, 4, 8}).
+    let mut companions: Vec<(Value, Value, u32)> = Vec::with_capacity(header_phis.len() - 1);
+    let mut companion_phi_set = FxHashSet::default();
+    let mut companion_back_map: FxHashMap<Value, Value> = FxHashMap::default();
+    for (idx, p) in header_phis.iter().enumerate() {
+        if idx == iv_idx {
+            continue;
+        }
+        if !matches!(p.ty, IrType::Ptr | IrType::I64 | IrType::U64) {
+            return None;
+        }
+        let Operand::Value(ptr_init) = p.pre_op else {
+            return None;
+        };
+        if loop_defs.contains(&ptr_init) {
+            return None;
+        }
+        // Trace `p.back_val` through copies to `GetElementPtr(p.dest, Const(s))`
+        // or `BinOp(Add, p.dest, Const(s))` (after `affold`).
+        let mut cur = p.back_val;
+        let mut stride_opt: Option<u32> = None;
+        for _ in 0..6 {
+            let (_, inst) = find_inst_in_loop(func, &loop_info.body, cur)?;
+            match inst {
+                Instruction::Copy {
+                    src: Operand::Value(s),
+                    ..
+                } => cur = *s,
+                Instruction::GetElementPtr {
+                    base,
+                    offset: Operand::Const(c),
+                    ..
+                } if value_traces_to_iv_through_copies(func, *base, p.dest) => {
+                    let s = c.to_i64()?;
+                    if matches!(s, 1 | 2 | 4 | 8) {
+                        stride_opt = Some(s as u32);
+                    }
+                    break;
+                }
+                Instruction::BinOp {
+                    op: IrBinOp::Add,
+                    lhs,
+                    rhs,
+                    ty: IrType::I64 | IrType::U64 | IrType::Ptr,
+                    ..
+                } => {
+                    let matched = match (lhs, rhs) {
+                        (Operand::Value(b), Operand::Const(c))
+                        | (Operand::Const(c), Operand::Value(b))
+                            if value_traces_to_iv_through_copies(func, *b, p.dest) =>
+                        {
+                            c.to_i64()
+                        }
+                        _ => None,
+                    };
+                    if let Some(s) = matched {
+                        if matches!(s, 1 | 2 | 4 | 8) {
+                            stride_opt = Some(s as u32);
+                        }
+                    }
+                    break;
+                }
+                _ => return None,
+            }
+        }
+        let stride = stride_opt?;
+        companion_phi_set.insert(p.dest);
+        companion_back_map.insert(p.back_val, p.dest);
+        companions.push((p.dest, ptr_init, stride));
+    }
+
+    // Soundness checks:
+    // 1. Neither `ptr_phi` nor `ptr_next` may escape `loop_info.body` or be read
+    //    inside `header_idx` (other than `ptr_next` on `ptr_phi`'s own Phi).
+    // 2. `ptr_next` may have NO uses in `loop_info.body` other than `ptr_phi`'s
+    //    backedge, distinguishing post-increment (`*q++`) from pre-increment (`*++q`).
+    for (b_idx, block) in func.blocks.iter().enumerate() {
+        let in_lp = loop_info.body.contains(&b_idx);
+        for inst in &block.instructions {
+            if b_idx == header_idx {
+                if let Instruction::Phi { dest, incoming, .. } = inst {
+                    if companion_phi_set.contains(dest) {
+                        for (op, _) in incoming {
+                            if let Operand::Value(v) = op {
+                                if companion_phi_set.contains(v) {
+                                    return None;
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                }
+            }
+            let mut illegal = false;
+            let check_val = |v: Value| -> bool {
+                if companion_back_map.contains_key(&v) {
+                    return true;
+                }
+                if (!in_lp || b_idx == header_idx) && companion_phi_set.contains(&v) {
+                    return true;
+                }
+                false
+            };
+            crate::backend::liveness::for_each_operand_in_instruction(inst, |op| {
+                if let Operand::Value(v) = op {
+                    if check_val(*v) {
+                        illegal = true;
+                    }
+                }
+            });
+            if let Instruction::GetElementPtr { base, .. } = inst {
+                if check_val(*base) {
+                    illegal = true;
+                }
+            }
+            if illegal {
+                return None;
+            }
+        }
+        let mut term_illegal = false;
+        crate::backend::liveness::for_each_operand_in_terminator(&block.terminator, |op| {
+            if let Operand::Value(v) = op {
+                if companion_back_map.contains_key(v)
+                    || ((!in_lp || b_idx == header_idx) && companion_phi_set.contains(v))
+                {
+                    term_illegal = true;
+                }
+            }
+        });
+        if term_illegal {
+            return None;
+        }
+    }
+
+    let backup = CompanionPointerIvBackup {
+        header_idx,
+        header_insts: func.blocks[header_idx].instructions.clone(),
+        body_entry_idx,
+        body_entry_insts: func.blocks[body_entry_idx].instructions.clone(),
+        next_value_id: func.next_value_id,
+    };
+
+    func.blocks[header_idx].instructions.retain(
+        |inst| !matches!(inst, Instruction::Phi { dest, .. } if companion_phi_set.contains(dest)),
+    );
+
+    let mut next_val = func.next_value_id;
+    let mut fresh = || {
+        let v = Value(next_val);
+        next_val += 1;
+        v
+    };
+    let mut injected = Vec::with_capacity(1 + companions.len() * 2);
+    let iv_u64 = if iv_ty.size() == 8 {
+        iv_phi
+    } else {
+        let w = fresh();
+        injected.push(Instruction::Cast {
+            dest: w,
+            src: Operand::Value(iv_phi),
+            from_ty: iv_ty,
+            to_ty: IrType::U64,
+        });
+        w
+    };
+    for (ptr_phi, ptr_init, stride) in companions {
+        let byte_off = if stride == 1 {
+            iv_u64
+        } else {
+            let off = fresh();
+            injected.push(Instruction::BinOp {
+                dest: off,
+                op: IrBinOp::Shl,
+                lhs: Operand::Value(iv_u64),
+                rhs: Operand::Const(IrConst::I64(i64::from(stride.trailing_zeros()))),
+                ty: IrType::U64,
+            });
+            off
+        };
+        injected.push(Instruction::GetElementPtr {
+            dest: ptr_phi,
+            base: ptr_init,
+            offset: Operand::Value(byte_off),
+            ty: IrType::Ptr,
+        });
+    }
+    let insert_pos = func.blocks[body_entry_idx]
+        .instructions
+        .iter()
+        .take_while(|i| matches!(i, Instruction::Phi { .. }))
+        .count();
+    func.blocks[body_entry_idx]
+        .instructions
+        .splice(insert_pos..insert_pos, injected);
+    func.next_value_id = next_val;
+
+    Some(backup)
+}
+
 /// The x86 late rerun (post-if_convert) uses the strict-FP AVX-shaped policy.
 pub(crate) fn vectorize_function_late_with_symbol_facts(
     func: &mut IrFunction,
@@ -34024,17 +34666,27 @@ pub(crate) fn vectorize_const_trip_map_loops(
             if lp.body.len() > 4 || loop_touches_named_space(func, lp) {
                 continue; // the unroller's tiny/general 2-3-block window
             }
+            let companion_backup = try_canonicalize_companion_pointer_ivs(func, lp);
             let Some(pattern) = analyze_map_pattern(func, lp, false, symbol_facts) else {
+                if let Some(backup) = companion_backup {
+                    restore_companion_pointer_ivs(func, backup);
+                }
                 continue;
             };
             if !x86_simd_available()
                 && (pattern.elem_ty != IrType::F32 || !pattern.expr.sse1_f32_legal())
             {
+                if let Some(backup) = companion_backup {
+                    restore_companion_pointer_ivs(func, backup);
+                }
                 continue;
             }
             if !matches!(&pattern.limit, Operand::Const(c)
                 if c.to_i64().is_some_and(|t| (5..=16).contains(&t)))
             {
+                if let Some(backup) = companion_backup {
+                    restore_companion_pointer_ivs(func, backup);
+                }
                 continue;
             }
             let avx2 = !map_sse_forced() && !sse2_forced() && x86_avx2_available();
@@ -34050,6 +34702,9 @@ pub(crate) fn vectorize_const_trip_map_loops(
                 }
                 changed += n;
                 break;
+            }
+            if let Some(backup) = companion_backup {
+                restore_companion_pointer_ivs(func, backup);
             }
         }
         total += changed;

@@ -171,19 +171,56 @@ impl LivenessResult {
             .any(|iv| iv.value_id == value_id && iv.start <= point && point <= iv.end)
     }
 
-    /// True iff some **segment** strictly contains a call (`start < cp < end`).
-    /// Matches Part 1 `spans_any_call`. Fat intervals over-approx this.
-    pub fn live_across_any_call(&self, value_id: u32) -> bool {
-        for iv in &self.segments {
-            if iv.value_id != value_id {
-                continue;
-            }
-            let idx = self.call_points.partition_point(|&cp| cp <= iv.start);
-            if idx < self.call_points.len() && self.call_points[idx] < iv.end {
-                return true;
-            }
+    /// True iff `point` is the start coordinate of some block `b` (`point ==
+    /// block_starts[b]`) and `value_id` is `live_in` to `b`.
+    ///
+    /// Because a block's entry and its first instruction share coordinate
+    /// `block_starts[b]`, an interval or segment starting at `s` represents a
+    /// birth at `s` only when `!is_live_in_at_point(value_id, s)`. When
+    /// `is_live_in_at_point(value_id, s)` holds — including when all defining
+    /// predecessors sit later in linear block layout (e.g. after inlining or
+    /// jump threading) — `value_id` already carries a live value immediately
+    /// before the instruction at `s` executes.
+    #[inline]
+    pub fn is_live_in_at_point(&self, value_id: u32, point: u32) -> bool {
+        match self.block_starts.binary_search(&point) {
+            Ok(b) => self.is_live_in(b, value_id),
+            Err(_) => false,
         }
-        false
+    }
+
+    /// True iff `[start, end]` of `value_id` is live across any point in sorted
+    /// `call_points`: strictly interior calls (`start < cp < end`) always span,
+    /// and a boundary call at `cp == start < end` spans iff `value_id` is
+    /// already live-in at `start` rather than born as the call's output.
+    #[inline]
+    pub fn range_spans_any_call(
+        &self,
+        value_id: u32,
+        start: u32,
+        end: u32,
+        call_points: &[u32],
+    ) -> bool {
+        if start >= end {
+            return false;
+        }
+        let idx = if self.is_live_in_at_point(value_id, start) {
+            call_points.partition_point(|&cp| cp < start)
+        } else {
+            call_points.partition_point(|&cp| cp <= start)
+        };
+        idx < call_points.len() && call_points[idx] < end
+    }
+
+    /// True iff some **segment** is live across a call: `start < cp < end`, or
+    /// `cp == start < end` when `value_id` is live-in to the block starting at
+    /// `start` (e.g. a diamond arm or out-of-order loop header whose first
+    /// instruction is a call).
+    pub fn live_across_any_call(&self, value_id: u32) -> bool {
+        self.segments.iter().any(|iv| {
+            iv.value_id == value_id
+                && self.range_spans_any_call(value_id, iv.start, iv.end, &self.call_points)
+        })
     }
 
     pub fn fat_interval(&self, value_id: u32) -> Option<(u32, u32)> {

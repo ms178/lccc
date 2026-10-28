@@ -4237,6 +4237,7 @@ mod tests {
         let symbol_facts = ModuleSymbolFacts {
             aliased_names: FxHashSet::default(),
             identity_witnesses: ["D".to_string(), "S".to_string()].into_iter().collect(),
+            ..ModuleSymbolFacts::default()
         };
         super::run_function(
             func,
@@ -4404,6 +4405,7 @@ mod tests {
         let symbol_facts = ModuleSymbolFacts {
             identity_witnesses: aliases.clone(),
             aliased_names: aliases,
+            ..ModuleSymbolFacts::default()
         };
         assert_eq!(
             super::run_function(&mut f, &symbol_facts, Capabilities::default()),

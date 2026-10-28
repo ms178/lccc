@@ -72,8 +72,18 @@ pub(crate) fn div_by_const_function(func: &mut IrFunction) -> usize {
     // Note: An unsigned U32 in range [2^31, 2^32-1] does NOT fit in i32!
     // A signed negative I32 (e.g. -10) in 64 bits has bit 63 set, and does NOT fit in u32!
     let max_id = func.max_value_id() as usize;
+    let bounded = BoundedDivAnalysis::compute(func, max_id);
     let mut is_known_u32: Vec<bool> = vec![false; max_id + 1];
     let mut is_known_i32: Vec<bool> = vec![false; max_id + 1];
+
+    for (id, &ub) in bounded.max_u64.iter().enumerate() {
+        if ub <= u32::MAX as u64 {
+            is_known_u32[id] = true;
+        }
+        if ub <= i32::MAX as u64 {
+            is_known_i32[id] = true;
+        }
+    }
 
     for block in &func.blocks {
         for inst in &block.instructions {
@@ -208,7 +218,7 @@ pub(crate) fn div_by_const_function(func: &mut IrFunction) -> usize {
         }
     };
 
-    for block in &mut func.blocks {
+    for (block_idx, block) in func.blocks.iter_mut().enumerate() {
         // Chained remainder decomposition: `(x % a) % b` is `x % b` whenever
         // `b` divides `a` — both are truncating remainders of the same sign
         // domain, and a value that differs from `x` by a multiple of `b` has
@@ -308,34 +318,91 @@ pub(crate) fn div_by_const_function(func: &mut IrFunction) -> usize {
                             }
                             IrBinOp::UDiv => {
                                 let udivisor = divisor as u64;
-                                if udivisor >= 2 && udivisor <= u32::MAX as u64 {
-                                    let d32 = udivisor as u32;
-                                    match *ty {
-                                        IrType::U32 => {
-                                            expand_udiv32(*dest, lhs, d32, *ty, &mut next_id)
+                                if udivisor >= 2 {
+                                    if let Some(exp) = bounded.try_expand_udiv(
+                                        block_idx,
+                                        *dest,
+                                        lhs,
+                                        udivisor,
+                                        *ty,
+                                        &mut next_id,
+                                    ) {
+                                        Some(exp)
+                                    } else if udivisor <= u32::MAX as u64 {
+                                        let d32 = udivisor as u32;
+                                        match *ty {
+                                            IrType::U32 => {
+                                                expand_udiv32(*dest, lhs, d32, *ty, &mut next_id)
+                                            }
+                                            IrType::I64 | IrType::U64 if lhs_is_u32(lhs) => {
+                                                expand_udiv32_in_i64(*dest, lhs, d32, &mut next_id)
+                                                    .map(|(i, _)| i)
+                                            }
+                                            IrType::I64 | IrType::U64 => expand_udiv64(
+                                                *dest,
+                                                lhs,
+                                                udivisor,
+                                                *ty,
+                                                &mut next_id,
+                                            ),
+                                            _ => None,
                                         }
-                                        IrType::I64 | IrType::U64 if lhs_is_u32(lhs) => {
-                                            expand_udiv32_in_i64(*dest, lhs, d32, &mut next_id)
-                                                .map(|(i, _)| i)
+                                    } else {
+                                        match *ty {
+                                            IrType::I64 | IrType::U64 => expand_udiv64(
+                                                *dest,
+                                                lhs,
+                                                udivisor,
+                                                *ty,
+                                                &mut next_id,
+                                            ),
+                                            _ => None,
                                         }
-                                        IrType::I64 | IrType::U64 => {
-                                            expand_udiv64(*dest, lhs, udivisor, *ty, &mut next_id)
-                                        }
-                                        _ => None,
-                                    }
-                                } else if udivisor >= 2 {
-                                    match *ty {
-                                        IrType::I64 | IrType::U64 => {
-                                            expand_udiv64(*dest, lhs, udivisor, *ty, &mut next_id)
-                                        }
-                                        _ => None,
                                     }
                                 } else {
                                     None
                                 }
                             }
                             IrBinOp::SDiv => {
-                                if divisor > 1 && divisor <= i32::MAX as i64 {
+                                if divisor > 1
+                                    && matches!(ty, IrType::I32 | IrType::I64)
+                                    && bounded.is_nonneg_operand(block_idx, lhs, *ty)
+                                {
+                                    bounded.expand_nonneg_sdiv(
+                                        block_idx,
+                                        *dest,
+                                        lhs,
+                                        divisor as u64,
+                                        *ty,
+                                        &mut next_id,
+                                    )
+                                } else if divisor < -1
+                                    && divisor > i64::MIN
+                                    && matches!(ty, IrType::I32 | IrType::I64)
+                                    && bounded.is_nonneg_operand(block_idx, lhs, *ty)
+                                {
+                                    let pos_d = (-divisor) as u64;
+                                    let q_pos = fresh_value(&mut next_id);
+                                    bounded
+                                        .expand_nonneg_sdiv(
+                                            block_idx,
+                                            q_pos,
+                                            lhs,
+                                            pos_d,
+                                            *ty,
+                                            &mut next_id,
+                                        )
+                                        .map(|mut insts| {
+                                            insts.push(Instruction::BinOp {
+                                                dest: *dest,
+                                                op: IrBinOp::Sub,
+                                                lhs: Operand::Const(IrConst::from_i64(0, *ty)),
+                                                rhs: Operand::Value(q_pos),
+                                                ty: *ty,
+                                            });
+                                            insts
+                                        })
+                                } else if divisor > 1 && divisor <= i32::MAX as i64 {
                                     match *ty {
                                         IrType::I32 => expand_sdiv32(
                                             *dest,
@@ -410,33 +477,71 @@ pub(crate) fn div_by_const_function(func: &mut IrFunction) -> usize {
                             }
                             IrBinOp::URem => {
                                 let udivisor = divisor as u64;
-                                if udivisor >= 2 && udivisor <= u32::MAX as u64 {
-                                    let d32 = udivisor as u32;
-                                    match *ty {
-                                        IrType::U32 => {
-                                            expand_urem32(*dest, lhs, d32, *ty, &mut next_id)
+                                if udivisor >= 2 {
+                                    if let Some(exp) = bounded.try_expand_urem(
+                                        block_idx,
+                                        *dest,
+                                        lhs,
+                                        udivisor,
+                                        *ty,
+                                        &mut next_id,
+                                    ) {
+                                        Some(exp)
+                                    } else if udivisor <= u32::MAX as u64 {
+                                        let d32 = udivisor as u32;
+                                        match *ty {
+                                            IrType::U32 => {
+                                                expand_urem32(*dest, lhs, d32, *ty, &mut next_id)
+                                            }
+                                            IrType::I64 | IrType::U64 if lhs_is_u32(lhs) => {
+                                                expand_urem32_in_i64(*dest, lhs, d32, &mut next_id)
+                                            }
+                                            IrType::I64 | IrType::U64 => expand_urem64(
+                                                *dest,
+                                                lhs,
+                                                udivisor,
+                                                *ty,
+                                                &mut next_id,
+                                            ),
+                                            _ => None,
                                         }
-                                        IrType::I64 | IrType::U64 if lhs_is_u32(lhs) => {
-                                            expand_urem32_in_i64(*dest, lhs, d32, &mut next_id)
+                                    } else {
+                                        match *ty {
+                                            IrType::I64 | IrType::U64 => expand_urem64(
+                                                *dest,
+                                                lhs,
+                                                udivisor,
+                                                *ty,
+                                                &mut next_id,
+                                            ),
+                                            _ => None,
                                         }
-                                        IrType::I64 | IrType::U64 => {
-                                            expand_urem64(*dest, lhs, udivisor, *ty, &mut next_id)
-                                        }
-                                        _ => None,
-                                    }
-                                } else if udivisor >= 2 {
-                                    match *ty {
-                                        IrType::I64 | IrType::U64 => {
-                                            expand_urem64(*dest, lhs, udivisor, *ty, &mut next_id)
-                                        }
-                                        _ => None,
                                     }
                                 } else {
                                     None
                                 }
                             }
                             IrBinOp::SRem => {
-                                if divisor > 1 && divisor <= i32::MAX as i64 {
+                                let abs_d = if divisor > 1 {
+                                    Some(divisor as u64)
+                                } else if divisor < -1 && divisor > i64::MIN {
+                                    Some((-divisor) as u64)
+                                } else {
+                                    None
+                                };
+                                if let Some(pos_d) = abs_d.filter(|_| {
+                                    matches!(ty, IrType::I32 | IrType::I64)
+                                        && bounded.is_nonneg_operand(block_idx, lhs, *ty)
+                                }) {
+                                    bounded.expand_nonneg_srem(
+                                        block_idx,
+                                        *dest,
+                                        lhs,
+                                        pos_d,
+                                        *ty,
+                                        &mut next_id,
+                                    )
+                                } else if divisor > 1 && divisor <= i32::MAX as i64 {
                                     let d32 = divisor as i32;
                                     match *ty {
                                         IrType::I32 => {
@@ -534,6 +639,1278 @@ fn fresh_value(next_id: &mut u32) -> Value {
     let v = Value(*next_id);
     *next_id += 1;
     v
+}
+
+// ─── Bounded & Dominating-Sign Analysis ────────────────────────────────────
+
+struct BoundedDivAnalysis {
+    /// Sound non-negative upper bound for each SSA `Value(id)` (`u64::MAX` = unknown or possibly negative).
+    max_u64: Vec<u64>,
+    /// Immediate dominator per block (`usize::MAX` if unreachable, `idom[0] == 0`).
+    idom: Vec<usize>,
+    /// Per-block single-predecessor edge facts proving `Value(id) >= 0`.
+    dom_nonneg: Vec<Vec<u32>>,
+    /// Whether `block_idx` belongs to a natural loop.
+    in_loop: Vec<bool>,
+    /// Whether `block_idx` is a load-free byte-store loop body (`generator_map` candidate).
+    is_gen_map_candidate: Vec<bool>,
+}
+
+#[inline]
+fn type_umax(ty: IrType) -> u64 {
+    match ty {
+        IrType::U8 => u8::MAX as u64,
+        IrType::U16 => u16::MAX as u64,
+        IrType::U32 => u32::MAX as u64,
+        IrType::U64 => u64::MAX,
+        IrType::I8 => u8::MAX as u64,
+        IrType::I16 => u16::MAX as u64,
+        IrType::I32 => u32::MAX as u64,
+        IrType::I64 => u64::MAX,
+        _ => u64::MAX,
+    }
+}
+
+#[inline]
+fn type_smax(ty: IrType) -> u64 {
+    match ty {
+        IrType::I8 => i8::MAX as u64,
+        IrType::I16 => i16::MAX as u64,
+        IrType::I32 => i32::MAX as u64,
+        IrType::I64 => i64::MAX as u64,
+        _ => 0,
+    }
+}
+
+#[inline]
+fn block_dominates(a: usize, mut b: usize, idom: &[usize]) -> bool {
+    loop {
+        if b == a {
+            return true;
+        }
+        let next = *idom.get(b).unwrap_or(&usize::MAX);
+        if next == usize::MAX || next == b {
+            return false;
+        }
+        b = next;
+    }
+}
+
+impl BoundedDivAnalysis {
+    fn compute(func: &IrFunction, max_id: usize) -> Self {
+        use crate::common::fx_hash::FxHashMap;
+        use crate::ir::analysis::{build_cfg, build_label_map, compute_dominators};
+        use crate::ir::reexports::Terminator;
+
+        let num_blocks = func.blocks.len();
+        let mut def_count = vec![0u32; max_id + 1];
+        let mut cmp_defs: FxHashMap<u32, (IrCmpOp, Operand, Operand, IrType)> =
+            FxHashMap::default();
+        let mut cast_parents: FxHashMap<u32, u32> = FxHashMap::default();
+
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Some(d) = inst.dest() {
+                    let id = d.0 as usize;
+                    if id <= max_id {
+                        def_count[id] = def_count[id].saturating_add(1);
+                    }
+                }
+                match inst {
+                    Instruction::Cmp {
+                        dest,
+                        op,
+                        lhs,
+                        rhs,
+                        ty,
+                    } => {
+                        cmp_defs.insert(dest.0, (*op, *lhs, *rhs, *ty));
+                    }
+                    Instruction::Cast {
+                        dest,
+                        src: Operand::Value(s),
+                        from_ty,
+                        to_ty,
+                    } if from_ty.is_integer()
+                        && to_ty.is_integer()
+                        && !from_ty.is_unsigned()
+                        && !to_ty.is_unsigned()
+                        && to_ty.size() >= from_ty.size() =>
+                    {
+                        cast_parents.insert(dest.0, s.0);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let label_map = build_label_map(func);
+        let (preds, succs) = build_cfg(func, &label_map);
+        let idom = compute_dominators(num_blocks, &preds, &succs);
+
+        // Identify natural-loop blocks via back-edges `tail -> header` where `header` dominates `tail`.
+        let mut in_loop = vec![false; num_blocks];
+        let mut loop_work: Vec<usize> = Vec::new();
+        for tail in 0..num_blocks {
+            if idom.get(tail).copied().unwrap_or(usize::MAX) == usize::MAX {
+                continue;
+            }
+            for &succ in succs.row(tail) {
+                let header = succ as usize;
+                if block_dominates(header, tail, &idom) {
+                    in_loop[header] = true;
+                    if !in_loop[tail] {
+                        in_loop[tail] = true;
+                        loop_work.push(tail);
+                    }
+                    while let Some(cur) = loop_work.pop() {
+                        if cur == header {
+                            continue;
+                        }
+                        for &p in preds.row(cur) {
+                            let pi = p as usize;
+                            if !in_loop[pi]
+                                && idom.get(pi).copied().unwrap_or(usize::MAX) != usize::MAX
+                            {
+                                in_loop[pi] = true;
+                                loop_work.push(pi);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut is_gen_map_candidate = vec![false; num_blocks];
+        for (bi, block) in func.blocks.iter().enumerate() {
+            if !in_loop[bi] {
+                continue;
+            }
+            let mut has_load_or_call = false;
+            let mut byte_stores = 0usize;
+            let mut other_stores = false;
+            for inst in &block.instructions {
+                match inst {
+                    Instruction::Load { .. }
+                    | Instruction::Call { .. }
+                    | Instruction::CallIndirect { .. } => {
+                        has_load_or_call = true;
+                        break;
+                    }
+                    Instruction::Store { ty, .. } => {
+                        if matches!(ty, IrType::U8 | IrType::I8) {
+                            byte_stores += 1;
+                        } else {
+                            other_stores = true;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if !has_load_or_call && !other_stores && byte_stores == 1 {
+                is_gen_map_candidate[bi] = true;
+            }
+        }
+
+        // Gather single-predecessor edge facts proving `v >= 0`.
+        let mut dom_nonneg: Vec<Vec<u32>> = vec![Vec::new(); num_blocks];
+        for (pi, block) in func.blocks.iter().enumerate() {
+            let Terminator::CondBranch {
+                cond: Operand::Value(cv),
+                true_label,
+                false_label,
+            } = block.terminator
+            else {
+                continue;
+            };
+            if true_label == false_label {
+                continue;
+            }
+            if def_count.get(cv.0 as usize).copied().unwrap_or(2) > 1 {
+                continue;
+            }
+            let Some(&(raw_op, lhs, rhs, cmp_ty)) = cmp_defs.get(&cv.0) else {
+                continue;
+            };
+            if !cmp_ty.is_integer() || cmp_ty.is_unsigned() {
+                continue;
+            }
+            let canon: Option<(IrCmpOp, Value, i64)> = match (lhs, rhs) {
+                (Operand::Value(v), Operand::Const(c)) => c.to_i64().map(|ci| (raw_op, v, ci)),
+                (Operand::Const(c), Operand::Value(v)) => {
+                    let flipped = match raw_op {
+                        IrCmpOp::Slt => Some(IrCmpOp::Sgt),
+                        IrCmpOp::Sle => Some(IrCmpOp::Sge),
+                        IrCmpOp::Sgt => Some(IrCmpOp::Slt),
+                        IrCmpOp::Sge => Some(IrCmpOp::Sle),
+                        _ => None,
+                    };
+                    flipped.and_then(|op| c.to_i64().map(|ci| (op, v, ci)))
+                }
+                _ => None,
+            };
+            let Some((op, val, c)) = canon else {
+                continue;
+            };
+            if def_count.get(val.0 as usize).copied().unwrap_or(2) > 1 {
+                continue;
+            }
+            let true_nonneg = (op == IrCmpOp::Sge && c >= 0) || (op == IrCmpOp::Sgt && c >= -1);
+            let false_nonneg = (op == IrCmpOp::Slt && c >= 0) || (op == IrCmpOp::Sle && c >= -1);
+            if true_nonneg {
+                if let Some(&ti) = label_map.get(&true_label) {
+                    let ti = ti as usize;
+                    if preds.row(ti) == [pi as u32] && !dom_nonneg[ti].contains(&val.0) {
+                        dom_nonneg[ti].push(val.0);
+                    }
+                }
+            }
+            if false_nonneg {
+                if let Some(&fi) = label_map.get(&false_label) {
+                    let fi = fi as usize;
+                    if preds.row(fi) == [pi as u32] && !dom_nonneg[fi].contains(&val.0) {
+                        dom_nonneg[fi].push(val.0);
+                    }
+                }
+            }
+        }
+
+        let is_dom_nonneg = |b_idx: usize, mut vid: u32| -> bool {
+            loop {
+                let mut cur = b_idx;
+                loop {
+                    if let Some(list) = dom_nonneg.get(cur) {
+                        if list.contains(&vid) {
+                            return true;
+                        }
+                    }
+                    let next = *idom.get(cur).unwrap_or(&usize::MAX);
+                    if next == usize::MAX || next == cur {
+                        break;
+                    }
+                    cur = next;
+                }
+                if let Some(&src_id) = cast_parents.get(&vid) {
+                    if def_count.get(vid as usize).copied().unwrap_or(2) <= 1
+                        && def_count.get(src_id as usize).copied().unwrap_or(2) <= 1
+                    {
+                        vid = src_id;
+                        continue;
+                    }
+                }
+                return false;
+            }
+        };
+
+        // Monotone pessimistic greatest-fixpoint (`u64::MAX` top): every pass only
+        // tightens sound upper bounds, so stopping after 4 passes is sound by induction.
+        let mut max_u64 = vec![u64::MAX; max_id + 1];
+        for _pass in 0..4 {
+            let mut changed = false;
+            for (bi, block) in func.blocks.iter().enumerate() {
+                for inst in &block.instructions {
+                    let Some(dest) = inst.dest() else {
+                        continue;
+                    };
+                    let id = dest.0 as usize;
+                    if id > max_id || def_count[id] != 1 {
+                        continue;
+                    }
+                    let cand = Self::eval_inst_bound(inst, bi, &max_u64, &is_dom_nonneg);
+                    if cand < max_u64[id] {
+                        max_u64[id] = cand;
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        // Propagate single-def signed widening casts (`I32 -> I64`) into `dom_nonneg`
+        // for any child whose source is known non-negative.
+        for (&child, &parent) in &cast_parents {
+            if def_count.get(child as usize).copied().unwrap_or(2) == 1
+                && def_count.get(parent as usize).copied().unwrap_or(2) <= 1
+            {
+                for list in &mut dom_nonneg {
+                    if list.contains(&parent) && !list.contains(&child) {
+                        list.push(child);
+                    }
+                }
+            }
+        }
+
+        Self {
+            max_u64,
+            idom,
+            dom_nonneg,
+            in_loop,
+            is_gen_map_candidate,
+        }
+    }
+
+    fn op_bound_in(op: &Operand, ty: IrType, bounds: &[u64]) -> u64 {
+        match op {
+            Operand::Value(v) => bounds.get(v.0 as usize).copied().unwrap_or(u64::MAX),
+            Operand::Const(c) => match c {
+                IrConst::I128(v) => {
+                    if *v >= 0 && *v <= u64::MAX as i128 {
+                        *v as u64
+                    } else {
+                        u64::MAX
+                    }
+                }
+                _ => {
+                    let Some(ci) = c.to_i64() else {
+                        return u64::MAX;
+                    };
+                    if ty.is_unsigned() {
+                        match ty {
+                            IrType::U8 => (ci as u8) as u64,
+                            IrType::U16 => (ci as u16) as u64,
+                            IrType::U32 => (ci as u32) as u64,
+                            IrType::U64 => ci as u64,
+                            _ => u64::MAX,
+                        }
+                    } else if ci >= 0 && (ci as u64) <= type_smax(ty) {
+                        ci as u64
+                    } else {
+                        u64::MAX
+                    }
+                }
+            },
+        }
+    }
+
+    fn eval_inst_bound(
+        inst: &Instruction,
+        block_idx: usize,
+        bounds: &[u64],
+        is_dom_nonneg: &dyn Fn(usize, u32) -> bool,
+    ) -> u64 {
+        match inst {
+            Instruction::ParamRef { ty, .. } | Instruction::Load { ty, .. } => match ty {
+                IrType::U8 => u8::MAX as u64,
+                IrType::U16 => u16::MAX as u64,
+                IrType::U32 => u32::MAX as u64,
+                _ => u64::MAX,
+            },
+            Instruction::Cmp { .. } => 1,
+            Instruction::Copy { src, .. } => match src {
+                Operand::Value(v) => bounds.get(v.0 as usize).copied().unwrap_or(u64::MAX),
+                Operand::Const(c) => match c.to_i64() {
+                    Some(v) if v >= 0 => v as u64,
+                    _ => u64::MAX,
+                },
+            },
+            Instruction::Cast {
+                src,
+                from_ty,
+                to_ty,
+                ..
+            } if from_ty.is_integer() && to_ty.is_integer() && to_ty.size() <= 8 => {
+                let b = Self::op_bound_in(src, *from_ty, bounds);
+                let from_nonneg = if from_ty.is_unsigned() {
+                    b < u64::MAX || from_ty.size() <= 4
+                } else {
+                    b <= type_smax(*from_ty)
+                        || matches!(src, Operand::Value(v) if is_dom_nonneg(block_idx, v.0))
+                };
+                let b_eff = if from_ty.is_unsigned() && from_ty.size() <= 4 {
+                    b.min(type_umax(*from_ty))
+                } else if !from_ty.is_unsigned() && b == u64::MAX && from_nonneg {
+                    type_smax(*from_ty)
+                } else {
+                    b
+                };
+                if from_nonneg {
+                    if to_ty.size() >= from_ty.size() {
+                        if to_ty.is_unsigned() || b_eff <= type_smax(*to_ty) {
+                            b_eff
+                        } else {
+                            u64::MAX
+                        }
+                    } else if b_eff <= type_umax(*to_ty) {
+                        if to_ty.is_unsigned() || b_eff <= type_smax(*to_ty) {
+                            b_eff
+                        } else {
+                            u64::MAX
+                        }
+                    } else if to_ty.is_unsigned() {
+                        type_umax(*to_ty)
+                    } else {
+                        u64::MAX
+                    }
+                } else if to_ty.is_unsigned() && to_ty.size() <= 4 {
+                    type_umax(*to_ty)
+                } else {
+                    u64::MAX
+                }
+            }
+            Instruction::Phi { incoming, ty, .. }
+                if ty.is_integer() && ty.size() <= 8 && !incoming.is_empty() =>
+            {
+                let mut acc = 0u64;
+                for (op, _) in incoming {
+                    acc = acc.max(Self::op_bound_in(op, *ty, bounds));
+                    if acc == u64::MAX {
+                        break;
+                    }
+                }
+                if ty.is_unsigned() {
+                    if ty.size() <= 4 {
+                        acc.min(type_umax(*ty))
+                    } else {
+                        acc
+                    }
+                } else if acc <= type_smax(*ty) {
+                    acc
+                } else {
+                    u64::MAX
+                }
+            }
+            Instruction::Select {
+                true_val,
+                false_val,
+                ty,
+                ..
+            } if ty.is_integer() && ty.size() <= 8 => {
+                let m = Self::op_bound_in(true_val, *ty, bounds)
+                    .max(Self::op_bound_in(false_val, *ty, bounds));
+                if ty.is_unsigned() {
+                    if ty.size() <= 4 {
+                        m.min(type_umax(*ty))
+                    } else {
+                        m
+                    }
+                } else if m <= type_smax(*ty) {
+                    m
+                } else {
+                    u64::MAX
+                }
+            }
+            Instruction::BinOp {
+                op, lhs, rhs, ty, ..
+            } if ty.is_integer() && ty.size() <= 8 => {
+                let lim = if ty.is_unsigned() {
+                    type_umax(*ty)
+                } else {
+                    type_smax(*ty)
+                };
+                let type_floor = if ty.is_unsigned() && ty.size() <= 4 {
+                    type_umax(*ty)
+                } else {
+                    u64::MAX
+                };
+                let a = Self::op_bound_in(lhs, *ty, bounds);
+                let b = Self::op_bound_in(rhs, *ty, bounds);
+                let rhs_const = match rhs {
+                    Operand::Const(c) => c.to_i64(),
+                    _ => None,
+                };
+                match op {
+                    IrBinOp::URem if ty.is_unsigned() => {
+                        let d_opt = rhs_const.map(|c| {
+                            if ty.size() == 4 {
+                                (c as u32) as u64
+                            } else if ty.size() == 2 {
+                                (c as u16) as u64
+                            } else if ty.size() == 1 {
+                                (c as u8) as u64
+                            } else {
+                                c as u64
+                            }
+                        });
+                        if let Some(d) = d_opt.filter(|&d| d >= 1) {
+                            (d - 1).min(a).min(type_floor)
+                        } else {
+                            a.min(type_floor)
+                        }
+                    }
+                    IrBinOp::SRem if !ty.is_unsigned() => {
+                        let lhs_nn = a <= lim
+                            || matches!(lhs, Operand::Value(v) if is_dom_nonneg(block_idx, v.0));
+                        let abs_d = rhs_const.and_then(|c| {
+                            if c > 0 {
+                                Some(c as u64)
+                            } else if c < 0 && c > i64::MIN {
+                                Some((-c) as u64)
+                            } else {
+                                None
+                            }
+                        });
+                        if let Some(d) = abs_d.filter(|&d| lhs_nn && d >= 1 && d - 1 <= lim) {
+                            let a_eff = if a <= lim { a } else { lim };
+                            (d - 1).min(a_eff)
+                        } else {
+                            u64::MAX
+                        }
+                    }
+                    IrBinOp::UDiv if ty.is_unsigned() => {
+                        let d_opt = rhs_const.map(|c| {
+                            if ty.size() == 4 {
+                                (c as u32) as u64
+                            } else {
+                                c as u64
+                            }
+                        });
+                        if let Some(d) = d_opt.filter(|&d| d >= 1 && a <= lim) {
+                            (a / d).min(type_floor)
+                        } else {
+                            type_floor
+                        }
+                    }
+                    IrBinOp::SDiv if !ty.is_unsigned() => {
+                        let lhs_nn = a <= lim
+                            || matches!(lhs, Operand::Value(v) if is_dom_nonneg(block_idx, v.0));
+                        if let Some(d) = rhs_const
+                            .filter(|&c| c > 0)
+                            .map(|c| c as u64)
+                            .filter(|_| lhs_nn)
+                        {
+                            let a_eff = if a <= lim { a } else { lim };
+                            a_eff / d
+                        } else {
+                            u64::MAX
+                        }
+                    }
+                    IrBinOp::LShr => {
+                        let bits = (ty.size() * 8) as i64;
+                        if let Some(s) = rhs_const.filter(|&s| s >= 0 && s < bits) {
+                            if ty.is_unsigned() {
+                                let a_eff = a.min(type_umax(*ty));
+                                a_eff >> (s as u32)
+                            } else if s > 0 {
+                                let a_eff = a.min(type_umax(*ty));
+                                let shifted = a_eff >> (s as u32);
+                                if shifted <= lim { shifted } else { u64::MAX }
+                            } else if a <= lim {
+                                a
+                            } else {
+                                u64::MAX
+                            }
+                        } else {
+                            type_floor
+                        }
+                    }
+                    IrBinOp::AShr if !ty.is_unsigned() => {
+                        let bits = (ty.size() * 8) as i64;
+                        let lhs_nn = a <= lim
+                            || matches!(lhs, Operand::Value(v) if is_dom_nonneg(block_idx, v.0));
+                        if let Some(s) = rhs_const.filter(|&s| lhs_nn && s >= 0 && s < bits) {
+                            let a_eff = if a <= lim { a } else { lim };
+                            a_eff >> (s as u32)
+                        } else {
+                            u64::MAX
+                        }
+                    }
+                    IrBinOp::And => {
+                        if a <= lim && b <= lim {
+                            a.min(b)
+                        } else if a <= lim {
+                            a
+                        } else if b <= lim {
+                            b
+                        } else {
+                            type_floor
+                        }
+                    }
+                    IrBinOp::Or | IrBinOp::Xor => {
+                        if a <= lim && b <= lim {
+                            let u = a | b;
+                            let mask = if u == 0 {
+                                0
+                            } else {
+                                u64::MAX >> u.leading_zeros()
+                            };
+                            if mask <= lim { mask } else { type_floor }
+                        } else {
+                            type_floor
+                        }
+                    }
+                    IrBinOp::Add => {
+                        if a <= lim && b <= lim {
+                            a.checked_add(b).filter(|&s| s <= lim).unwrap_or(type_floor)
+                        } else {
+                            type_floor
+                        }
+                    }
+                    IrBinOp::Mul => {
+                        if a <= lim && b <= lim {
+                            a.checked_mul(b).filter(|&p| p <= lim).unwrap_or(type_floor)
+                        } else {
+                            type_floor
+                        }
+                    }
+                    IrBinOp::Shl => {
+                        let bits = (ty.size() * 8) as i64;
+                        if let Some(s) = rhs_const.filter(|&s| a <= lim && s >= 0 && s < bits) {
+                            let su = s as u32;
+                            a.checked_shl(su)
+                                .filter(|&p| p <= lim && (su == 0 || (p >> su) == a))
+                                .unwrap_or(type_floor)
+                        } else {
+                            type_floor
+                        }
+                    }
+                    _ => type_floor,
+                }
+            }
+            _ => u64::MAX,
+        }
+    }
+
+    fn op_unsigned_bound(&self, op: &Operand, ty: IrType) -> u64 {
+        match op {
+            Operand::Value(v) => self.max_u64.get(v.0 as usize).copied().unwrap_or(u64::MAX),
+            Operand::Const(c) => {
+                let Some(ci) = c.to_i64() else {
+                    return u64::MAX;
+                };
+                match ty.size() {
+                    1 => (ci as u8) as u64,
+                    2 => (ci as u16) as u64,
+                    4 => (ci as u32) as u64,
+                    _ => ci as u64,
+                }
+            }
+        }
+    }
+
+    fn is_nonneg_in_block(&self, block_idx: usize, vid: u32) -> bool {
+        let mut cur = block_idx;
+        loop {
+            if let Some(list) = self.dom_nonneg.get(cur) {
+                if list.contains(&vid) {
+                    return true;
+                }
+            }
+            let next = *self.idom.get(cur).unwrap_or(&usize::MAX);
+            if next == usize::MAX || next == cur {
+                return false;
+            }
+            cur = next;
+        }
+    }
+
+    fn is_nonneg_operand(&self, block_idx: usize, op: &Operand, ty: IrType) -> bool {
+        let smax = type_smax(ty);
+        match op {
+            Operand::Value(v) => {
+                let ub = self.max_u64.get(v.0 as usize).copied().unwrap_or(u64::MAX);
+                ub <= smax || self.is_nonneg_in_block(block_idx, v.0)
+            }
+            Operand::Const(c) => c.to_i64().is_some_and(|ci| ci >= 0 && (ci as u64) <= smax),
+        }
+    }
+
+    fn try_expand_udiv(
+        &self,
+        block_idx: usize,
+        dest: Value,
+        lhs: &Operand,
+        udivisor: u64,
+        ty: IrType,
+        next_id: &mut u32,
+    ) -> Option<Vec<Instruction>> {
+        if !matches!(ty, IrType::U32 | IrType::U64 | IrType::I64) || udivisor < 2 {
+            return None;
+        }
+        let max_x = self.op_unsigned_bound(lhs, ty);
+        if max_x < udivisor {
+            return Some(vec![Instruction::Copy {
+                dest,
+                src: Operand::Const(IrConst::from_i64(0, ty)),
+            }]);
+        }
+        if udivisor.is_power_of_two() {
+            return None;
+        }
+        let gen_map = self
+            .is_gen_map_candidate
+            .get(block_idx)
+            .copied()
+            .unwrap_or(false);
+        let in_loop = self.in_loop.get(block_idx).copied().unwrap_or(false);
+        if ty == IrType::U32 && udivisor <= 65_535 && max_x <= 65_535 {
+            if gen_map {
+                return expand_udiv32_u16_pure(
+                    dest,
+                    lhs,
+                    udivisor as u32,
+                    max_x as u32,
+                    true,
+                    next_id,
+                );
+            }
+            if max_x < udivisor.saturating_mul(2) {
+                return Some(emit_uge_quotient(dest, lhs, udivisor, ty, next_id));
+            }
+            return expand_udiv32_u16_pure(
+                dest,
+                lhs,
+                udivisor as u32,
+                max_x as u32,
+                in_loop,
+                next_id,
+            );
+        }
+        if max_x < udivisor.saturating_mul(2) {
+            return Some(emit_uge_quotient(dest, lhs, udivisor, ty, next_id));
+        }
+        None
+    }
+
+    fn try_expand_urem(
+        &self,
+        block_idx: usize,
+        dest: Value,
+        lhs: &Operand,
+        udivisor: u64,
+        ty: IrType,
+        next_id: &mut u32,
+    ) -> Option<Vec<Instruction>> {
+        if !matches!(ty, IrType::U32 | IrType::U64 | IrType::I64) || udivisor < 2 {
+            return None;
+        }
+        let max_x = self.op_unsigned_bound(lhs, ty);
+        if max_x < udivisor {
+            return Some(vec![Instruction::Copy { dest, src: *lhs }]);
+        }
+        if udivisor.is_power_of_two() {
+            return None;
+        }
+        let gen_map = self
+            .is_gen_map_candidate
+            .get(block_idx)
+            .copied()
+            .unwrap_or(false);
+        let in_loop = self.in_loop.get(block_idx).copied().unwrap_or(false);
+        if ty == IrType::U32 && udivisor <= 65_535 && max_x <= 65_535 {
+            if gen_map {
+                return expand_urem32_u16_pure(
+                    dest,
+                    lhs,
+                    udivisor as u32,
+                    max_x as u32,
+                    true,
+                    next_id,
+                );
+            }
+            if max_x < udivisor.saturating_mul(2) {
+                return Some(emit_uge_remainder(dest, lhs, udivisor, ty, next_id));
+            }
+            return expand_urem32_u16_pure(
+                dest,
+                lhs,
+                udivisor as u32,
+                max_x as u32,
+                in_loop,
+                next_id,
+            );
+        }
+        if max_x < udivisor.saturating_mul(2) {
+            return Some(emit_uge_remainder(dest, lhs, udivisor, ty, next_id));
+        }
+        None
+    }
+
+    fn expand_nonneg_sdiv(
+        &self,
+        block_idx: usize,
+        dest: Value,
+        lhs: &Operand,
+        udivisor: u64,
+        ty: IrType,
+        next_id: &mut u32,
+    ) -> Option<Vec<Instruction>> {
+        if udivisor < 2 {
+            return None;
+        }
+        let smax = type_smax(ty);
+        let max_x = self.op_unsigned_bound(lhs, ty).min(smax);
+        let gen_map = self
+            .is_gen_map_candidate
+            .get(block_idx)
+            .copied()
+            .unwrap_or(false);
+        let in_loop = self.in_loop.get(block_idx).copied().unwrap_or(false);
+
+        if max_x < udivisor {
+            return Some(vec![Instruction::Copy {
+                dest,
+                src: Operand::Const(IrConst::from_i64(0, ty)),
+            }]);
+        }
+        if udivisor.is_power_of_two() {
+            let k = udivisor.trailing_zeros();
+            if ty == IrType::I32 && gen_map {
+                let u_in = fresh_value(next_id);
+                let u_out = fresh_value(next_id);
+                return Some(vec![
+                    Instruction::Cast {
+                        dest: u_in,
+                        src: *lhs,
+                        from_ty: IrType::I32,
+                        to_ty: IrType::U32,
+                    },
+                    Instruction::BinOp {
+                        dest: u_out,
+                        op: IrBinOp::LShr,
+                        lhs: Operand::Value(u_in),
+                        rhs: Operand::Const(IrConst::I32(k as i32)),
+                        ty: IrType::U32,
+                    },
+                    Instruction::Cast {
+                        dest,
+                        src: Operand::Value(u_out),
+                        from_ty: IrType::U32,
+                        to_ty: IrType::I32,
+                    },
+                ]);
+            }
+            return Some(vec![Instruction::BinOp {
+                dest,
+                op: IrBinOp::AShr,
+                lhs: *lhs,
+                rhs: Operand::Const(IrConst::from_i64(k as i64, ty)),
+                ty,
+            }]);
+        }
+
+        match ty {
+            IrType::I32 if udivisor <= i32::MAX as u64 => {
+                if !gen_map && max_x < udivisor.saturating_mul(2) {
+                    let ge = fresh_value(next_id);
+                    return Some(vec![
+                        Instruction::Cmp {
+                            dest: ge,
+                            op: IrCmpOp::Sge,
+                            lhs: *lhs,
+                            rhs: Operand::Const(IrConst::I32(udivisor as i32)),
+                            ty: IrType::I32,
+                        },
+                        Instruction::Cast {
+                            dest,
+                            src: Operand::Value(ge),
+                            from_ty: IrType::I8,
+                            to_ty: IrType::I32,
+                        },
+                    ]);
+                }
+                let u_in = fresh_value(next_id);
+                let u_out = fresh_value(next_id);
+                let mut insts = vec![Instruction::Cast {
+                    dest: u_in,
+                    src: *lhs,
+                    from_ty: IrType::I32,
+                    to_ty: IrType::U32,
+                }];
+                let u_op = Operand::Value(u_in);
+                let body = if udivisor <= 65_535 && max_x <= 65_535 {
+                    expand_udiv32_u16_pure(
+                        u_out,
+                        &u_op,
+                        udivisor as u32,
+                        max_x as u32,
+                        gen_map || in_loop,
+                        next_id,
+                    )
+                    .or_else(|| {
+                        expand_udiv32(u_out, &u_op, udivisor as u32, IrType::U32, next_id)
+                    })?
+                } else {
+                    expand_udiv32(u_out, &u_op, udivisor as u32, IrType::U32, next_id)?
+                };
+                insts.extend(body);
+                insts.push(Instruction::Cast {
+                    dest,
+                    src: Operand::Value(u_out),
+                    from_ty: IrType::U32,
+                    to_ty: IrType::I32,
+                });
+                Some(insts)
+            }
+            IrType::I64 => {
+                if max_x < udivisor.saturating_mul(2) && udivisor <= i64::MAX as u64 {
+                    let ge = fresh_value(next_id);
+                    return Some(vec![
+                        Instruction::Cmp {
+                            dest: ge,
+                            op: IrCmpOp::Sge,
+                            lhs: *lhs,
+                            rhs: Operand::Const(IrConst::I64(udivisor as i64)),
+                            ty: IrType::I64,
+                        },
+                        Instruction::Cast {
+                            dest,
+                            src: Operand::Value(ge),
+                            from_ty: IrType::I8,
+                            to_ty: IrType::I64,
+                        },
+                    ]);
+                }
+                if max_x <= u32::MAX as u64 && udivisor <= u32::MAX as u64 {
+                    expand_udiv32_in_i64(dest, lhs, udivisor as u32, next_id).map(|(i, _)| i)
+                } else {
+                    expand_udiv64(dest, lhs, udivisor, IrType::I64, next_id)
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn expand_nonneg_srem(
+        &self,
+        block_idx: usize,
+        dest: Value,
+        lhs: &Operand,
+        udivisor: u64,
+        ty: IrType,
+        next_id: &mut u32,
+    ) -> Option<Vec<Instruction>> {
+        if udivisor < 2 {
+            return None;
+        }
+        let smax = type_smax(ty);
+        let max_x = self.op_unsigned_bound(lhs, ty).min(smax);
+        let gen_map = self
+            .is_gen_map_candidate
+            .get(block_idx)
+            .copied()
+            .unwrap_or(false);
+        let in_loop = self.in_loop.get(block_idx).copied().unwrap_or(false);
+
+        if max_x < udivisor {
+            return Some(vec![Instruction::Copy { dest, src: *lhs }]);
+        }
+        if udivisor.is_power_of_two() {
+            return Some(vec![Instruction::BinOp {
+                dest,
+                op: IrBinOp::And,
+                lhs: *lhs,
+                rhs: Operand::Const(IrConst::from_i64((udivisor - 1) as i64, ty)),
+                ty,
+            }]);
+        }
+
+        match ty {
+            IrType::I32 if udivisor <= i32::MAX as u64 => {
+                if !gen_map && max_x < udivisor.saturating_mul(2) {
+                    let ge = fresh_value(next_id);
+                    let diff = fresh_value(next_id);
+                    return Some(vec![
+                        Instruction::Cmp {
+                            dest: ge,
+                            op: IrCmpOp::Sge,
+                            lhs: *lhs,
+                            rhs: Operand::Const(IrConst::I32(udivisor as i32)),
+                            ty: IrType::I32,
+                        },
+                        Instruction::BinOp {
+                            dest: diff,
+                            op: IrBinOp::Sub,
+                            lhs: *lhs,
+                            rhs: Operand::Const(IrConst::I32(udivisor as i32)),
+                            ty: IrType::I32,
+                        },
+                        Instruction::Select {
+                            dest,
+                            cond: Operand::Value(ge),
+                            true_val: Operand::Value(diff),
+                            false_val: *lhs,
+                            ty: IrType::I32,
+                        },
+                    ]);
+                }
+                let u_in = fresh_value(next_id);
+                let u_out = fresh_value(next_id);
+                let mut insts = vec![Instruction::Cast {
+                    dest: u_in,
+                    src: *lhs,
+                    from_ty: IrType::I32,
+                    to_ty: IrType::U32,
+                }];
+                let u_op = Operand::Value(u_in);
+                let body = if udivisor <= 65_535 && max_x <= 65_535 {
+                    expand_urem32_u16_pure(
+                        u_out,
+                        &u_op,
+                        udivisor as u32,
+                        max_x as u32,
+                        gen_map || in_loop,
+                        next_id,
+                    )
+                    .or_else(|| {
+                        expand_urem32(u_out, &u_op, udivisor as u32, IrType::U32, next_id)
+                    })?
+                } else {
+                    expand_urem32(u_out, &u_op, udivisor as u32, IrType::U32, next_id)?
+                };
+                insts.extend(body);
+                insts.push(Instruction::Cast {
+                    dest,
+                    src: Operand::Value(u_out),
+                    from_ty: IrType::U32,
+                    to_ty: IrType::I32,
+                });
+                Some(insts)
+            }
+            IrType::I64 => {
+                if max_x < udivisor.saturating_mul(2) && udivisor <= i64::MAX as u64 {
+                    let ge = fresh_value(next_id);
+                    let diff = fresh_value(next_id);
+                    return Some(vec![
+                        Instruction::Cmp {
+                            dest: ge,
+                            op: IrCmpOp::Sge,
+                            lhs: *lhs,
+                            rhs: Operand::Const(IrConst::I64(udivisor as i64)),
+                            ty: IrType::I64,
+                        },
+                        Instruction::BinOp {
+                            dest: diff,
+                            op: IrBinOp::Sub,
+                            lhs: *lhs,
+                            rhs: Operand::Const(IrConst::I64(udivisor as i64)),
+                            ty: IrType::I64,
+                        },
+                        Instruction::Select {
+                            dest,
+                            cond: Operand::Value(ge),
+                            true_val: Operand::Value(diff),
+                            false_val: *lhs,
+                            ty: IrType::I64,
+                        },
+                    ]);
+                }
+                if max_x <= u32::MAX as u64 && udivisor <= u32::MAX as u64 {
+                    expand_urem32_in_i64(dest, lhs, udivisor as u32, next_id)
+                } else {
+                    expand_urem64(dest, lhs, udivisor, IrType::I64, next_id)
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
+fn emit_uge_quotient(
+    dest: Value,
+    x: &Operand,
+    d: u64,
+    ty: IrType,
+    next_id: &mut u32,
+) -> Vec<Instruction> {
+    let ge = fresh_value(next_id);
+    vec![
+        Instruction::Cmp {
+            dest: ge,
+            op: IrCmpOp::Uge,
+            lhs: *x,
+            rhs: Operand::Const(IrConst::from_i64(d as i64, ty)),
+            ty,
+        },
+        Instruction::Cast {
+            dest,
+            src: Operand::Value(ge),
+            from_ty: IrType::I8,
+            to_ty: ty,
+        },
+    ]
+}
+
+fn emit_uge_remainder(
+    dest: Value,
+    x: &Operand,
+    d: u64,
+    ty: IrType,
+    next_id: &mut u32,
+) -> Vec<Instruction> {
+    let ge = fresh_value(next_id);
+    let diff = fresh_value(next_id);
+    vec![
+        Instruction::Cmp {
+            dest: ge,
+            op: IrCmpOp::Uge,
+            lhs: *x,
+            rhs: Operand::Const(IrConst::from_i64(d as i64, ty)),
+            ty,
+        },
+        Instruction::BinOp {
+            dest: diff,
+            op: IrBinOp::Sub,
+            lhs: *x,
+            rhs: Operand::Const(IrConst::from_i64(d as i64, ty)),
+            ty,
+        },
+        Instruction::Select {
+            dest,
+            cond: Operand::Value(ge),
+            true_val: Operand::Value(diff),
+            false_val: *x,
+            ty,
+        },
+    ]
+}
+
+/// Pure-`U32` division by constant `d` (`2 <= d <= 65535`, non-power-of-2)
+/// when `x <= max_x <= 65535`.
+///
+/// Avoids widening to `U64` so that:
+/// 1. 52,099 / 65,519 divisors use a 2-op 32-bit `Mul` + `LShr` (cheaper even in scalar code);
+/// 2. Inside loops (`allow_add16`), the remaining 13,420 divisors use Hacker's Delight
+///    16-bit add-fixup (`(x * m_lo) >> 16` + half-step), keeping every instruction in
+///    `IrType::U32` so `vectorize_generator_map` can vectorize 32 lanes per iteration.
+fn expand_udiv32_u16_pure(
+    dest: Value,
+    x: &Operand,
+    d: u32,
+    max_x: u32,
+    allow_add16: bool,
+    next_id: &mut u32,
+) -> Option<Vec<Instruction>> {
+    if !(2..=65_535).contains(&d) || d.is_power_of_two() || max_x > 65_535 {
+        return None;
+    }
+    let d64 = d as u64;
+    let mx64 = max_x as u64;
+    let x1 = if mx64 >= d64 - 1 {
+        ((mx64 - (d64 - 1)) / d64) * d64 + (d64 - 1)
+    } else {
+        mx64
+    };
+    let x2 = mx64;
+
+    for s in 1u32..32 {
+        let two_s = 1u64 << s;
+        let m = two_s.div_ceil(d64);
+        if mx64 * m <= u32::MAX as u64 && ((x1 * m) >> s) == x1 / d64 && ((x2 * m) >> s) == x2 / d64
+        {
+            let prod = fresh_value(next_id);
+            return Some(vec![
+                Instruction::BinOp {
+                    dest: prod,
+                    op: IrBinOp::Mul,
+                    lhs: *x,
+                    rhs: Operand::Const(IrConst::I32(m as u32 as i32)),
+                    ty: IrType::U32,
+                },
+                Instruction::BinOp {
+                    dest,
+                    op: IrBinOp::LShr,
+                    lhs: Operand::Value(prod),
+                    rhs: Operand::Const(IrConst::I32(s as i32)),
+                    ty: IrType::U32,
+                },
+            ]);
+        }
+    }
+
+    if !allow_add16 {
+        return None;
+    }
+
+    for p in 1u32..=16 {
+        let two_pow = 1u64 << (16 + p);
+        let magic = two_pow.div_ceil(d64);
+        let error = magic * d64 - two_pow;
+        if error <= (1u64 << p) && magic > 0x1_0000 && magic <= 0x2_0000 {
+            let m_lo = (magic - 0x1_0000) as u32;
+            let prod = fresh_value(next_id);
+            let t1 = fresh_value(next_id);
+            let diff = fresh_value(next_id);
+            let half = fresh_value(next_id);
+            let mut insts = Vec::with_capacity(6);
+            insts.push(Instruction::BinOp {
+                dest: prod,
+                op: IrBinOp::Mul,
+                lhs: *x,
+                rhs: Operand::Const(IrConst::I32(m_lo as i32)),
+                ty: IrType::U32,
+            });
+            insts.push(Instruction::BinOp {
+                dest: t1,
+                op: IrBinOp::LShr,
+                lhs: Operand::Value(prod),
+                rhs: Operand::Const(IrConst::I32(16)),
+                ty: IrType::U32,
+            });
+            insts.push(Instruction::BinOp {
+                dest: diff,
+                op: IrBinOp::Sub,
+                lhs: *x,
+                rhs: Operand::Value(t1),
+                ty: IrType::U32,
+            });
+            insts.push(Instruction::BinOp {
+                dest: half,
+                op: IrBinOp::LShr,
+                lhs: Operand::Value(diff),
+                rhs: Operand::Const(IrConst::I32(1)),
+                ty: IrType::U32,
+            });
+            if p > 1 {
+                let sum = fresh_value(next_id);
+                insts.push(Instruction::BinOp {
+                    dest: sum,
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(half),
+                    rhs: Operand::Value(t1),
+                    ty: IrType::U32,
+                });
+                insts.push(Instruction::BinOp {
+                    dest,
+                    op: IrBinOp::LShr,
+                    lhs: Operand::Value(sum),
+                    rhs: Operand::Const(IrConst::I32((p - 1) as i32)),
+                    ty: IrType::U32,
+                });
+            } else {
+                insts.push(Instruction::BinOp {
+                    dest,
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(half),
+                    rhs: Operand::Value(t1),
+                    ty: IrType::U32,
+                });
+            }
+            return Some(insts);
+        }
+    }
+
+    None
+}
+
+fn expand_urem32_u16_pure(
+    dest: Value,
+    x: &Operand,
+    d: u32,
+    max_x: u32,
+    allow_add16: bool,
+    next_id: &mut u32,
+) -> Option<Vec<Instruction>> {
+    let q = fresh_value(next_id);
+    let mut insts = expand_udiv32_u16_pure(q, x, d, max_x, allow_add16, next_id)?;
+    let prod = fresh_value(next_id);
+    insts.push(Instruction::BinOp {
+        dest: prod,
+        op: IrBinOp::Mul,
+        lhs: Operand::Value(q),
+        rhs: Operand::Const(IrConst::I32(d as i32)),
+        ty: IrType::U32,
+    });
+    insts.push(Instruction::BinOp {
+        dest,
+        op: IrBinOp::Sub,
+        lhs: *x,
+        rhs: Operand::Value(prod),
+        ty: IrType::U32,
+    });
+    Some(insts)
 }
 
 // ─── Unsigned division by constant (32-bit) ────────────────────────────────
@@ -2943,5 +4320,233 @@ mod nested_remainder_tests {
                 "nesting kept for x={v}: {insts:?}"
             );
         }
+    }
+
+    #[test]
+    fn u16_pure_u32_div_and_rem_are_exact_across_full_u16_domain() {
+        let x = Value(1);
+        let out = Value(2);
+        // Covers both Direct (3, 5, 10, 95, 255, 1000, 65521) and Add16 (7, 14, 19, 21, 31, 65519).
+        for &d in &[
+            3u32, 5, 7, 10, 14, 19, 21, 31, 95, 255, 1000, 65_519, 65_521,
+        ] {
+            let mut next = 10;
+            let div_insts =
+                expand_udiv32_u16_pure(out, &Operand::Value(x), d, 65_535, true, &mut next)
+                    .expect("u16 pure u32 udiv must succeed");
+            assert!(
+                div_insts.iter().all(|i| matches!(
+                    i,
+                    Instruction::BinOp {
+                        ty: IrType::U32,
+                        ..
+                    }
+                )),
+                "expected pure U32 BinOps for d={d}: {div_insts:?}"
+            );
+            let mut next_r = 10;
+            let rem_insts =
+                expand_urem32_u16_pure(out, &Operand::Value(x), d, 65_535, true, &mut next_r)
+                    .expect("u16 pure u32 urem must succeed");
+            for xv in 0u32..=65_535 {
+                let q = run_mixed(&div_insts, (x, xv as i32), out) as u32;
+                let r = run_mixed(&rem_insts, (x, xv as i32), out) as u32;
+                assert_eq!(q, xv / d, "udiv mismatch for x={xv} d={d}");
+                assert_eq!(r, xv % d, "urem mismatch for x={xv} d={d}");
+            }
+        }
+    }
+
+    #[test]
+    fn dominating_nonneg_branch_promotes_srem64_to_unsigned() {
+        // Block 0: if (len <s 0) goto B1 else goto B2
+        // Block 2: r = SRem(len, 65521, I64) -> must use UMulHigh (not SMulHigh).
+        let len = Value(1);
+        let cmp = Value(2);
+        let rem = Value(3);
+        let mut f = IrFunction::new(
+            "zng_combine_like".to_string(),
+            IrType::I64,
+            Vec::new(),
+            false,
+        );
+        f.next_value_id = 32;
+        f.blocks = vec![
+            BasicBlock {
+                label: BlockId(0),
+                instructions: vec![
+                    Instruction::ParamRef {
+                        dest: len,
+                        param_idx: 0,
+                        ty: IrType::I64,
+                    },
+                    Instruction::Cmp {
+                        dest: cmp,
+                        op: IrCmpOp::Slt,
+                        lhs: Operand::Value(len),
+                        rhs: Operand::Const(IrConst::I64(0)),
+                        ty: IrType::I64,
+                    },
+                ],
+                terminator: Terminator::CondBranch {
+                    cond: Operand::Value(cmp),
+                    true_label: BlockId(1),
+                    false_label: BlockId(2),
+                },
+                source_spans: Vec::new(),
+            },
+            BasicBlock {
+                label: BlockId(1),
+                instructions: Vec::new(),
+                terminator: Terminator::Return(Some(Operand::Const(IrConst::I64(0)))),
+                source_spans: Vec::new(),
+            },
+            BasicBlock {
+                label: BlockId(2),
+                instructions: vec![Instruction::BinOp {
+                    dest: rem,
+                    op: IrBinOp::SRem,
+                    lhs: Operand::Value(len),
+                    rhs: Operand::Const(IrConst::I64(65_521)),
+                    ty: IrType::I64,
+                }],
+                terminator: Terminator::Return(Some(Operand::Value(rem))),
+                source_spans: Vec::new(),
+            },
+        ];
+        div_by_const_function(&mut f);
+        let b2 = &f.blocks[2].instructions;
+        assert!(
+            b2.iter().any(|i| matches!(
+                i,
+                Instruction::BinOp {
+                    op: IrBinOp::UMulHigh,
+                    ..
+                }
+            )),
+            "expected UMulHigh in nonneg branch block: {b2:?}"
+        );
+        assert!(
+            !b2.iter().any(|i| matches!(
+                i,
+                Instruction::BinOp {
+                    op: IrBinOp::SMulHigh,
+                    ..
+                }
+            )),
+            "unexpected signed SMulHigh in nonneg branch block: {b2:?}"
+        );
+    }
+
+    #[test]
+    fn loop_phi_upper_bound_reduces_adler_urem_to_select() {
+        // Header B1: s1 = Phi((1, B0), (s1_next, B1)); s2 = Phi((0, B0), (s2_next, B1))
+        //            b = Load(U8); bz = Cast(b, U8 -> U32)
+        //            a1 = Add(s1, bz, U32); s1_next = URem(a1, 65521, U32)
+        //            a2 = Add(s2, s1_next, U32); s2_next = URem(a2, 65521, U32)
+        let mut f = IrFunction::new("adler_ref".to_string(), IrType::U32, Vec::new(), false);
+        f.next_value_id = 64;
+        f.blocks = vec![
+            BasicBlock {
+                label: BlockId(0),
+                instructions: vec![Instruction::ParamRef {
+                    dest: Value(1),
+                    param_idx: 0,
+                    ty: IrType::Ptr,
+                }],
+                terminator: Terminator::Branch(BlockId(1)),
+                source_spans: Vec::new(),
+            },
+            BasicBlock {
+                label: BlockId(1),
+                instructions: vec![
+                    Instruction::Phi {
+                        dest: Value(2),
+                        ty: IrType::U32,
+                        incoming: vec![
+                            (Operand::Const(IrConst::I32(1)), BlockId(0)),
+                            (Operand::Value(Value(6)), BlockId(1)),
+                        ],
+                    },
+                    Instruction::Phi {
+                        dest: Value(3),
+                        ty: IrType::U32,
+                        incoming: vec![
+                            (Operand::Const(IrConst::I32(0)), BlockId(0)),
+                            (Operand::Value(Value(8)), BlockId(1)),
+                        ],
+                    },
+                    Instruction::Load {
+                        dest: Value(4),
+                        ptr: Value(1),
+                        ty: IrType::U8,
+                        seg_override: crate::common::types::AddressSpace::Default,
+                        volatile: false,
+                    },
+                    Instruction::Cast {
+                        dest: Value(5),
+                        src: Operand::Value(Value(4)),
+                        from_ty: IrType::U8,
+                        to_ty: IrType::U32,
+                    },
+                    Instruction::BinOp {
+                        dest: Value(10),
+                        op: IrBinOp::Add,
+                        lhs: Operand::Value(Value(2)),
+                        rhs: Operand::Value(Value(5)),
+                        ty: IrType::U32,
+                    },
+                    Instruction::BinOp {
+                        dest: Value(6),
+                        op: IrBinOp::URem,
+                        lhs: Operand::Value(Value(10)),
+                        rhs: Operand::Const(IrConst::I32(65_521)),
+                        ty: IrType::U32,
+                    },
+                    Instruction::BinOp {
+                        dest: Value(11),
+                        op: IrBinOp::Add,
+                        lhs: Operand::Value(Value(3)),
+                        rhs: Operand::Value(Value(6)),
+                        ty: IrType::U32,
+                    },
+                    Instruction::BinOp {
+                        dest: Value(8),
+                        op: IrBinOp::URem,
+                        lhs: Operand::Value(Value(11)),
+                        rhs: Operand::Const(IrConst::I32(65_521)),
+                        ty: IrType::U32,
+                    },
+                ],
+                terminator: Terminator::Branch(BlockId(1)),
+                source_spans: Vec::new(),
+            },
+        ];
+        div_by_const_function(&mut f);
+        let b1 = &f.blocks[1].instructions;
+        let selects = b1
+            .iter()
+            .filter(|i| matches!(i, Instruction::Select { .. }))
+            .count();
+        let muls = b1
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    Instruction::BinOp {
+                        op: IrBinOp::Mul,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(
+            selects, 2,
+            "both adler URem ops must lower to Select: {b1:?}"
+        );
+        assert_eq!(
+            muls, 0,
+            "no multiply-by-magic should remain in loop: {b1:?}"
+        );
     }
 }

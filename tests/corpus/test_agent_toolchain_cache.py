@@ -173,6 +173,7 @@ class AgentToolchainCache(unittest.TestCase):
             tmp_path = Path(tmp)
             fake_repo = tmp_path / 'repo'
             (fake_repo / 'scripts').mkdir(parents=True)
+            (fake_repo / 'tools/linker').mkdir(parents=True)
             (fake_repo / 'engineering/toolchains').mkdir(parents=True)
             (fake_repo / 'engineering/toolchains/agent-cache-lock.json').write_text('{"tag": "fake-tag"}\n')
             # The installer's --verify-only leg sources the real strict version
@@ -180,7 +181,7 @@ class AgentToolchainCache(unittest.TestCase):
             # the reviewed helper keeps this test honest about what a banner must
             # satisfy rather than stubbing the check away.
             fake_versions = fake_repo / 'tools/linker'
-            fake_versions.mkdir(parents=True)
+            fake_versions.mkdir(parents=True, exist_ok=True)
             (fake_versions / 'oracle_versions.sh').write_text(
                 (ROOT / 'tools/linker/oracle_versions.sh').read_text())
             src_script = (ROOT / 'scripts/ensure_binutils_247_binary.sh').read_text()

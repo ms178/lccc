@@ -36,6 +36,10 @@ pub(crate) struct ModuleSymbolFacts {
     /// Strong, unredirected, locally binding definitions in this unit: object
     /// identities no other name can reach (see the module documentation).
     pub(crate) identity_witnesses: FxHashSet<String>,
+    /// Minimum allocated byte size for strong, locally binding definitions in
+    /// `identity_witnesses`. Interposable, weak, common, or aliased symbols are
+    /// excluded so bounds proofs never assume a replaceable definition's size.
+    pub(crate) defined_sizes: FxHashMap<String, usize>,
 }
 
 impl ModuleSymbolFacts {
@@ -45,6 +49,11 @@ impl ModuleSymbolFacts {
             && (self.identity_witnesses.contains(a) || self.identity_witnesses.contains(b))
             && !self.aliased_names.contains(a)
             && !self.aliased_names.contains(b)
+    }
+
+    /// Proven minimum allocated byte size of a locally binding global object.
+    pub(crate) fn global_min_bytes(&self, name: &str) -> Option<usize> {
+        self.defined_sizes.get(name).copied()
     }
 
     /// `shlib` is GCC's `flag_shlib` (`-fPIC`/`-fpic`/`-shared`): only there
@@ -71,12 +80,16 @@ impl ModuleSymbolFacts {
             defined: bool,
             weak_or_common: bool,
             visibility: Option<&'a str>,
+            defined_size: usize,
         }
         let mut decls: FxHashMap<&str, Decl<'_>> = FxHashMap::default();
         for g in &module.globals {
             let d = decls.entry(g.name.as_str()).or_default();
             d.is_static |= g.is_static;
-            d.defined |= !g.is_extern;
+            if !g.is_extern {
+                d.defined = true;
+                d.defined_size = d.defined_size.max(g.size);
+            }
             d.weak_or_common |= g.is_weak || g.is_common;
             if d.visibility.is_none() {
                 d.visibility = g.visibility.as_deref();
@@ -91,6 +104,7 @@ impl ModuleSymbolFacts {
             }
         }
         // Arbitrary assembler may define aliases the IR cannot enumerate.
+        let mut defined_sizes = FxHashMap::default();
         let identity_witnesses = if module.toplevel_asm.is_empty() {
             decls
                 .into_iter()
@@ -100,7 +114,12 @@ impl ModuleSymbolFacts {
                         && !aliased_names.contains(*name)
                         && crate::common::tls::binds_locally(shlib, d.is_static, true, d.visibility)
                 })
-                .map(|(name, _)| name.to_string())
+                .map(|(name, d)| {
+                    if d.defined_size > 0 {
+                        defined_sizes.insert(name.to_string(), d.defined_size);
+                    }
+                    name.to_string()
+                })
                 .collect()
         } else {
             FxHashSet::default()
@@ -109,6 +128,7 @@ impl ModuleSymbolFacts {
         Self {
             aliased_names,
             identity_witnesses,
+            defined_sizes,
         }
     }
 }
@@ -257,6 +277,7 @@ mod tests {
         let facts = ModuleSymbolFacts {
             aliased_names: ["w_alias", "w2"].map(str::to_owned).into_iter().collect(),
             identity_witnesses: ["w", "w2"].map(str::to_owned).into_iter().collect(),
+            ..ModuleSymbolFacts::default()
         };
         assert!(facts.globals_distinct("w", "decl"));
         assert!(facts.globals_distinct("decl", "w"));

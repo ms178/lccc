@@ -10,15 +10,19 @@ GCC=${GCC_BIN:-gcc}
 source_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source="$source_dir/vectorize_matmul_negative_bound.c"
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/lccc-matmul-negative-bound.XXXXXX")
+
 trap 'rm -rf "$tmp"' EXIT
 
 check_assembly() { # assembly path, mode, bound type
-    python3 - "$1" "$2" "$3" <<'PY'
+    python3 - "$1" "$2" "$3" "$source_dir/lib" <<'PY'
 import re
 import sys
 from pathlib import Path
 
-path, mode, bound_type = sys.argv[1:]
+path, mode, bound_type, libdir = sys.argv[1:]
+sys.path.insert(0, libdir)
+from byte_iv_divide import divides_byte_iv, narrows_after_divide  # noqa: E402
+
 text = Path(path).read_text(encoding="utf-8")
 match = re.search(r"(?ms)^matmul_vector_loop:\n(.*?)^\.size matmul_vector_loop,", text)
 if not match:
@@ -30,12 +34,13 @@ if not packed:
 if mode == "avx2":
     if "%ymm" not in body:
         raise SystemExit(f"{path}: {bound_type}/AVX2 lacks a YMM packed loop")
-    if not re.search(r"(?m)^\s*shrq\s+\$3,\s*%r\w+", body):
-        raise SystemExit(f"{path}: {bound_type}/AVX2 lacks a 64-bit byte-to-element shift")
-    if bound_type == "i32" and not re.search(
-        r"(?m)^\s*shrq\s+\$3,\s*%r\w+\n\s*movslq\s+%e\w+,\s*%r\w+",
-        body,
-    ):
+    # The byte-to-element divide must be 64-bit: `shrq`, or the BMI2
+    # `rorxq` rewrite of it (see tests/regression/lib/byte_iv_divide.py).
+    if not divides_byte_iv(body, 3, require_64bit=True):
+        raise SystemExit(
+            f"{path}: {bound_type}/AVX2 lacks a 64-bit byte-to-element divide"
+        )
+    if bound_type == "i32" and not narrows_after_divide(body, 3):
         raise SystemExit(
             f"{path}: I32 AVX2 narrows the byte IV before computing the scalar tail"
         )

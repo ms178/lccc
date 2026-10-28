@@ -1955,18 +1955,10 @@ fn i686_scratch_pool(config: &RegAllocConfig) -> bool {
             .any(|r| matches!(r.0, 4 | 5))
 }
 
-/// Live *across* a clobber: defined before it, used after it.
-/// Born at a call (retval) or dying at a call (arg) may use caller-saved.
-#[inline]
-fn spans_any_call(iv: &LiveInterval, call_points: &[u32]) -> bool {
-    let idx = call_points.partition_point(|&cp| cp <= iv.start);
-    idx < call_points.len() && call_points[idx] < iv.end
-}
-
 /// Half-open `[start, end)` occupancy against a sorted point list.
 ///
-/// Unlike `spans_any_call`, a point exactly at `start` counts: synthetic
-/// slot contents can already be live at a block boundary.
+/// A point exactly at `start` counts: synthetic slot contents can already be
+/// live at a block boundary.
 fn half_open_range_contains_any_point(start: u32, end: u32, points: &[u32]) -> bool {
     if start >= end {
         return false;
@@ -1980,9 +1972,18 @@ fn half_open_range_contains_any_point(start: u32, end: u32, points: &[u32]) -> b
 /// Segment data is authoritative when present. Values with no segments fall
 /// back to the fat envelope so a missing-segment owner is never treated as
 /// "not call-spanning".
+///
+/// At a block boundary (`seg.start == block_starts[b]`), a segment whose value
+/// is `live_in` to `b` already holds a live value before instruction 0 at
+/// `block_starts[b]` executes — even when `iv_map[&v].0 == block_starts[b]`
+/// because all defining predecessors lie later in linear block layout (e.g.
+/// after inlining a multi-block helper ahead of an existing loop header).
+/// Using `LivenessResult::is_live_in_at_point` distinguishes live-in re-entry
+/// at `cp == seg.start` (spanned) from a call-output birth at `cp == seg.start`
+/// (not spanned).
 fn collect_call_spanning_owners(
     liveness: &LivenessResult,
-    iv_map: &FxHashMap<u32, (u32, u32)>,
+    _iv_map: &FxHashMap<u32, (u32, u32)>,
     coalesce_member_of: &FxHashMap<u32, u32>,
     call_points: &[u32],
 ) -> FxHashSet<u32> {
@@ -1991,32 +1992,39 @@ fn collect_call_spanning_owners(
     let mut segmented: FxHashSet<u32> = FxHashSet::default();
     for seg in &liveness.segments {
         segmented.insert(seg.value_id);
-        let def = iv_map
-            .get(&seg.value_id)
-            .map(|&(s, _)| s)
-            .unwrap_or(seg.start);
-        let idx = call_points.partition_point(|&cp| cp < seg.start || cp <= def);
-        if idx < call_points.len() && call_points[idx] < seg.end {
+        if liveness.range_spans_any_call(seg.value_id, seg.start, seg.end, call_points) {
             set.insert(owner_of(seg.value_id));
         }
     }
     for interval in &liveness.intervals {
-        if !segmented.contains(&interval.value_id) && spans_any_call(interval, call_points) {
+        if !segmented.contains(&interval.value_id)
+            && liveness.range_spans_any_call(
+                interval.value_id,
+                interval.start,
+                interval.end,
+                call_points,
+            )
+        {
             set.insert(owner_of(interval.value_id));
         }
     }
     set
 }
 
-/// Call points a segment is live ACROSS: defined before the call and live
-/// after it (`def < cp`, `seg.start <= cp < seg.end`) -- the predicate of
+/// Call points a segment is live ACROSS: strictly interior calls (`seg.start <
+/// cp < seg.end`), plus a boundary call at `cp == seg.start < seg.end` when
+/// `seg.value_id` is `live_in` at `seg.start` — matching
 /// [`collect_call_spanning_owners`].
 fn segment_spanned_calls<'a>(
+    liveness: &LivenessResult,
     seg: &LiveInterval,
-    def: u32,
     call_points: &'a [u32],
 ) -> impl Iterator<Item = u32> + 'a {
-    let lo = call_points.partition_point(|&cp| cp < seg.start || cp <= def);
+    let lo = if liveness.is_live_in_at_point(seg.value_id, seg.start) {
+        call_points.partition_point(|&cp| cp < seg.start)
+    } else {
+        call_points.partition_point(|&cp| cp <= seg.start)
+    };
     let (start, end) = (seg.start, seg.end);
     call_points[lo..]
         .iter()
@@ -2403,7 +2411,7 @@ fn compact_callee_saved_homes(
 fn add_cold_call_xmm_saves(
     assignments: &FxHashMap<u32, PhysReg>,
     liveness: &LivenessResult,
-    iv_map: &FxHashMap<u32, (u32, u32)>,
+    _iv_map: &FxHashMap<u32, (u32, u32)>,
     enabled: bool,
     caller_save_spans: &mut FxHashMap<u8, Vec<(u32, u32)>>,
 ) {
@@ -2418,8 +2426,7 @@ fn add_cold_call_xmm_saves(
         if !(20..=33).contains(&reg.0) {
             continue;
         }
-        let def = iv_map.get(&seg.value_id).map_or(seg.start, |&(s, _)| s);
-        for cp in segment_spanned_calls(seg, def, &liveness.call_points) {
+        for cp in segment_spanned_calls(liveness, seg, &liveness.call_points) {
             // XMM homes span only cold calls
             // (`collect_cold_only_call_spanning_owners`). Should that ever
             // break, saving around the call is still sound, so fail closed
@@ -2456,7 +2463,7 @@ fn add_cold_call_xmm_saves(
 /// value is really live across.
 fn collect_cold_only_call_spanning_owners(
     liveness: &LivenessResult,
-    iv_map: &FxHashMap<u32, (u32, u32)>,
+    _iv_map: &FxHashMap<u32, (u32, u32)>,
     coalesce_member_of: &FxHashMap<u32, u32>,
 ) -> FxHashSet<u32> {
     let owner_of = |value: u32| coalesce_member_of.get(&value).copied().unwrap_or(value);
@@ -2468,8 +2475,7 @@ fn collect_cold_only_call_spanning_owners(
     let mut segmented: FxHashSet<u32> = FxHashSet::default();
     for seg in &liveness.segments {
         segmented.insert(seg.value_id);
-        let def = iv_map.get(&seg.value_id).map_or(seg.start, |&(s, _)| s);
-        for cp in segment_spanned_calls(seg, def, &liveness.call_points) {
+        for cp in segment_spanned_calls(liveness, seg, &liveness.call_points) {
             if liveness.cold_call_points.binary_search(&cp).is_ok() {
                 cold.insert(owner_of(seg.value_id));
             } else {
@@ -2507,6 +2513,31 @@ fn overlaps_inclusive_skip_birth(iv: &LiveInterval, points: &[u32]) -> bool {
     // `start` is a valid birth exemption for this candidate.
     let idx = points.partition_point(|&p| p <= iv.start);
     idx < points.len() && points[idx] <= iv.end
+}
+
+/// Liveness-aware birth-skipping inclusive hazard overlap: `iv.start` is a
+/// valid birth exemption only when neither `iv.value_id` nor any member of its
+/// coalesce class is already `live_in` at `iv.start` (a block-entry coordinate
+/// shared with instruction 0).
+#[inline]
+fn overlaps_inclusive_skip_birth_liveness(
+    liveness: &LivenessResult,
+    coalesce_groups: Option<&FxHashMap<u32, Vec<u32>>>,
+    iv: &LiveInterval,
+    points: &[u32],
+) -> bool {
+    let live_at_start = liveness.is_live_in_at_point(iv.value_id, iv.start)
+        || coalesce_groups
+            .and_then(|g| g.get(&iv.value_id))
+            .is_some_and(|ms| {
+                ms.iter()
+                    .any(|&m| liveness.is_live_in_at_point(m, iv.start))
+            });
+    if live_at_start {
+        overlaps_inclusive(iv, points)
+    } else {
+        overlaps_inclusive_skip_birth(iv, points)
+    }
 }
 
 // ── i686 div/rem same-block pair analysis ────────────────────────────────────
@@ -5247,7 +5278,14 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     .copied()
                     .filter(|iv| base_ok(&assignments, iv))
                     .filter(|iv| !scratch_denied.contains(&iv.value_id))
-                    .filter(|iv| !overlaps_inclusive_skip_birth(iv, reg_hazards))
+                    .filter(|iv| {
+                        !overlaps_inclusive_skip_birth_liveness(
+                            &liveness,
+                            Some(&coalesce_groups),
+                            iv,
+                            reg_hazards,
+                        )
+                    })
                     .collect();
                 if config.ra_config.debug_ra_intervals {
                     let cands: Vec<u32> = intervals.iter().map(|iv| iv.value_id).collect();
@@ -5576,7 +5614,12 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                         && !riscv_entry_guard.contains(&iv.value_id)
                         && !later_arg_values.contains(&iv.value_id)
                         && !divrem_tail_dests.contains(&iv.value_id)
-                        && !overlaps_inclusive_skip_birth(iv, &rdx_clobbers)
+                        && !overlaps_inclusive_skip_birth_liveness(
+                            &liveness,
+                            Some(&coalesce_groups),
+                            iv,
+                            &rdx_clobbers,
+                        )
                 })
                 .collect();
             if config.ra_config.debug_ra_intervals {
@@ -5922,7 +5965,14 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                             && (ordered_param_homes || !param_restricted.contains(&iv.value_id))
                             && !riscv_entry_guard.contains(&iv.value_id)
                     })
-                    .filter(|iv| !overlaps_inclusive_skip_birth(iv, reg_hazards))
+                    .filter(|iv| {
+                        !overlaps_inclusive_skip_birth_liveness(
+                            &liveness,
+                            Some(&coalesce_groups),
+                            iv,
+                            reg_hazards,
+                        )
+                    })
                     .filter(|iv| {
                         !holders
                             .iter()
@@ -6332,7 +6382,14 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                             && (ordered_param_homes || !param_restricted.contains(&iv.value_id))
                             && !riscv_entry_guard.contains(&iv.value_id)
                     })
-                    .filter(|iv| !overlaps_inclusive_skip_birth(iv, reg_hazards))
+                    .filter(|iv| {
+                        !overlaps_inclusive_skip_birth_liveness(
+                            &liveness,
+                            Some(&coalesce_groups),
+                            iv,
+                            reg_hazards,
+                        )
+                    })
                     .filter(|iv| {
                         !holders
                             .iter()
@@ -7027,13 +7084,14 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             // Sharing the dest home is a new live range for the source.
             // Caller-saved XMM/volatile NEON cannot inherit a home that
             // the source already needed to survive a call.
-            let src_live = LiveInterval {
-                start: src_iv.0,
-                end: src_iv.1,
-                value_id: candidate.backedge_src,
-            };
             let dest_callee_fp = arm_fp_pool && (32..=38).contains(&d.0);
-            if spans_any_call(&src_live, call_points) && !dest_callee_fp {
+            if liveness.range_spans_any_call(
+                candidate.backedge_src,
+                src_iv.0,
+                src_iv.1,
+                call_points,
+            ) && !dest_callee_fp
+            {
                 continue;
             }
             assignments.insert(candidate.backedge_src, d);
@@ -8814,14 +8872,7 @@ fn allocate_vector_registers_destructive(
             continue;
         }
         let spans_call = pieces.iter().any(|&(start, end)| {
-            spans_any_call(
-                &LiveInterval {
-                    value_id: v,
-                    start,
-                    end,
-                },
-                &liveness.call_points,
-            )
+            liveness.range_spans_any_call(v, start, end, &liveness.call_points)
         });
         if spans_call {
             continue;
@@ -9336,8 +9387,13 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
             // intrinsics), so the load/store/gather endpoints join
             // class 6 to keep the web connected.
             O::VecLoadI32x4Pair | O::VecStoreI32x4Pair | O::VecPackI32x4Pair => Some(6),
-            // ARX lane ops (rotate/shuffle): class 6 (I32x4 family).
-            O::VecRotlI32x4 | O::VecShufdI32x4 | O::VecXorI32x4 | O::VecOrI32x4 => Some(6),
+            // ARX / packed-DAG lane ops (rotate/shuffle/sub/bitwise): class 6 (I32x4 family).
+            O::VecRotlI32x4
+            | O::VecShufdI32x4
+            | O::VecSubI32x4
+            | O::VecAndI32x4
+            | O::VecXorI32x4
+            | O::VecOrI32x4 => Some(6),
             // BB-SLP 128-bit dword shifts: class 6 (I32x4 family).
             O::VecShlI32x4 | O::VecLShrI32x4 | O::VecAShrI32x4 => Some(6),
             // Per-lane variable dword shifts (VEX.128 three-operand form,
@@ -9503,6 +9559,7 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                     // illegal, forcing the `movdqa %ymm5, %ymm0` +
                     // `movdqa %ymm3, %ymm1` staging pair before every
                     // `vpand` — two dead copies per counting iteration.
+                    | O::VecSubI32x8
                     | O::VecAndI32x8
                     | O::VecOrI32x8
                     | O::VecXorI32x8
@@ -9515,12 +9572,14 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                     // accumulator home and writes its own destination
                     // through the shared 128-bit fold (scratch xmm0/xmm1).
                     | O::VecMaskedAddValueI32x4
-                    // ARX lane ops: their emitters resolve a homed source
-                    // through %xmm0/%xmm1 scratch without writing the home
-                    // (movdqa in, shifts/por on scratch), so a register-homed
-                    // I32x4 value stays live across them.
+                    // ARX / packed-DAG lane ops: their emitters resolve a
+                    // homed source through %xmm0/%xmm1 scratch without writing
+                    // the home, so a register-homed I32x4 value stays live
+                    // across them.
                     | O::VecRotlI32x4
                     | O::VecShufdI32x4
+                    | O::VecSubI32x4
+                    | O::VecAndI32x4
                     | O::VecXorI32x4
                     | O::VecOrI32x4
                     // BB-SLP 128-bit dword shifts: VEX.128 immediate
@@ -9749,6 +9808,7 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                                 // counting accumulator to a stack slot
                                 // (one 32-byte round-trip per iteration).
                                 | O::VecCmpI8x32
+                                | O::VecSubI32x8
                                 | O::VecAndI32x8
                                 | O::VecOrI32x8
                                 | O::VecXorI32x8
@@ -10022,6 +10082,7 @@ fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecBlendvF64x4
                     | O::VecMinF64x4
                     | O::VecMaxF64x4
+                    | O::StrictRecipMulAddPackedF64x4
             ),
             3 => matches!(
                 op,
@@ -10226,6 +10287,18 @@ fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
                         if let Operand::Value(v) = arg {
                             if i != guard && candidates.contains_key(&v.0) {
                                 bad.insert(v.0);
+                            }
+                        }
+                    }
+                }
+                if *op == O::StrictRecipMulAddPackedF64x4 {
+                    for (i, arg) in args.iter().enumerate() {
+                        if let Operand::Value(v) = arg {
+                            if let Some(&cls) = candidates.get(&v.0) {
+                                let ok = (cls == 6 && i == 1) || (cls == 2 && i == 5);
+                                if !ok {
+                                    bad.insert(v.0);
+                                }
                             }
                         }
                     }
@@ -12924,13 +12997,12 @@ fn apply_phi_coalesce_assignments_with_config(
         // models the call (callee-saved home or slot save/reload around
         // the call point); keep that home instead of overwriting it.
         if let Some(&src_iv) = iv_map.get(&backedge_src) {
-            let src_live = LiveInterval {
-                start: src_iv.0,
-                end: src_iv.1,
-                value_id: backedge_src,
-            };
-            if spans_any_call(&src_live, &liveness.call_points)
-                && !callee_saved.iter().any(|r| r.0 == reg.0)
+            if liveness.range_spans_any_call(
+                backedge_src,
+                src_iv.0,
+                src_iv.1,
+                &liveness.call_points,
+            ) && !callee_saved.iter().any(|r| r.0 == reg.0)
             {
                 if ra_config.debug_phi_coalesce {
                     eprintln!(
@@ -12963,7 +13035,7 @@ fn apply_phi_coalesce_assignments_with_config(
                     end: src_iv.1,
                     value_id: backedge_src,
                 };
-                if overlaps_inclusive_skip_birth(&src_live, rdx_clobbers) {
+                if overlaps_inclusive_skip_birth_liveness(liveness, None, &src_live, rdx_clobbers) {
                     if ra_config.debug_phi_coalesce {
                         eprintln!(
                             "[PHI_COALESCE] BLOCKED assign dest=v{} src=v{} r{}: source live across an rdx clobber point",
@@ -17435,6 +17507,124 @@ mod allocation_kernel_tests {
             spanning.is_empty(),
             "call in a segment gap must not span: {spanning:?}"
         );
+    }
+
+    #[test]
+    fn out_of_order_loop_header_leading_call_marks_live_in_values_call_spanning() {
+        use crate::ir::reexports::{CallInfo, IrCmpOp};
+        // Reproduces the post-inline block layout from `sqlite_vdbe_serial`:
+        // B0 jumps to B2 (preheader laid out AFTER loop header B1). B2 defines
+        // loop-carried `acc` (v1) and `p` (v2) and branches back to B1, whose
+        // first instruction (at `block_starts[1]`) is `v3 = call step()`.
+        // Both `seg.start` and `iv_map[&v].0` equal `block_starts[1] == cp`,
+        // yet v1/v2 are live-in across `call step()` while v3 is born at it.
+        let mut func = IrFunction::new("ooo_call_hdr".to_string(), IrType::I64, vec![], false);
+        func.blocks = vec![
+            block(0, vec![], Terminator::Branch(BlockId(2))),
+            block(
+                1,
+                vec![
+                    Instruction::Call {
+                        func: "step".to_string(),
+                        info: CallInfo {
+                            dest: Some(Value(3)),
+                            args: vec![],
+                            arg_types: vec![],
+                            return_type: IrType::I64,
+                            is_variadic: false,
+                            num_fixed_args: 0,
+                            struct_arg_sizes: vec![],
+                            struct_arg_aligns: vec![],
+                            struct_arg_classes: vec![],
+                            struct_arg_riscv_float_classes: vec![],
+                            struct_arg_is_f128_sse: vec![],
+                            ret_is_f128_sse: false,
+                            is_sret: false,
+                            is_fastcall: false,
+                            regparm: None,
+                            is_pure: false,
+                            is_const: false,
+                            ret_eightbyte_classes: vec![],
+                            assume_library: false,
+                            cold: false,
+                        },
+                    },
+                    Instruction::BinOp {
+                        dest: Value(4),
+                        op: IrBinOp::Add,
+                        lhs: Operand::Value(Value(1)),
+                        rhs: Operand::Value(Value(3)),
+                        ty: IrType::I64,
+                    },
+                    Instruction::BinOp {
+                        dest: Value(5),
+                        op: IrBinOp::Add,
+                        lhs: Operand::Value(Value(2)),
+                        rhs: Operand::Const(IrConst::I32(1)),
+                        ty: IrType::I32,
+                    },
+                    Instruction::Copy {
+                        dest: Value(1),
+                        src: Operand::Value(Value(4)),
+                    },
+                    Instruction::Copy {
+                        dest: Value(2),
+                        src: Operand::Value(Value(5)),
+                    },
+                    Instruction::Cmp {
+                        dest: Value(6),
+                        op: IrCmpOp::Ult,
+                        lhs: Operand::Value(Value(2)),
+                        rhs: Operand::Const(IrConst::I32(4)),
+                        ty: IrType::I32,
+                    },
+                ],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(6)),
+                    true_label: BlockId(1),
+                    false_label: BlockId(3),
+                },
+            ),
+            block(
+                2,
+                vec![
+                    Instruction::Copy {
+                        dest: Value(1),
+                        src: Operand::Const(IrConst::I64(0)),
+                    },
+                    Instruction::Copy {
+                        dest: Value(2),
+                        src: Operand::Const(IrConst::I32(0)),
+                    },
+                ],
+                Terminator::Branch(BlockId(1)),
+            ),
+            block(
+                3,
+                vec![],
+                Terminator::Return(Some(Operand::Value(Value(1)))),
+            ),
+        ];
+        func.next_value_id = 7;
+
+        let liveness = compute_live_intervals(&func);
+        assert!(liveness.live_across_any_call(1));
+        assert!(liveness.live_across_any_call(2));
+        assert!(
+            !liveness.live_across_any_call(3),
+            "call retval v3 is born at the call and must not count as call-spanning"
+        );
+
+        let iv_map = interval_map(&liveness);
+        let spanning = collect_call_spanning_owners(
+            &liveness,
+            &iv_map,
+            &FxHashMap::default(),
+            &liveness.call_points,
+        );
+        assert!(spanning.contains(&1), "{spanning:?}");
+        assert!(spanning.contains(&2), "{spanning:?}");
+        assert!(!spanning.contains(&3), "{spanning:?}");
     }
 
     #[test]
