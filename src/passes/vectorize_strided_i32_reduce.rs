@@ -129,12 +129,8 @@ fn scalar_trip_count(op: IrCmpOp, iv_ty: IrType, bound: i64) -> Option<u64> {
         return None;
     }
     let trips = match (op, signed) {
-        (IrCmpOp::Ult, false) | (IrCmpOp::Slt, true) => {
-            (bound as u64).div_ceil(SCALAR_STEP_BYTES)
-        }
-        (IrCmpOp::Ule, false) | (IrCmpOp::Sle, true) => {
-            (bound as u64) / SCALAR_STEP_BYTES + 1
-        }
+        (IrCmpOp::Ult, false) | (IrCmpOp::Slt, true) => (bound as u64).div_ceil(SCALAR_STEP_BYTES),
+        (IrCmpOp::Ule, false) | (IrCmpOp::Sle, true) => (bound as u64) / SCALAR_STEP_BYTES + 1,
         _ => return None,
     };
     (trips > 0).then_some(trips)
