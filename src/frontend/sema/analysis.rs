@@ -4454,6 +4454,46 @@ impl SemanticAnalyzer {
             null_constant: self.null_constant_if(nullptr, rhs),
         };
         let message = operand_constraints::binary(op, lhs_op, rhs_op);
+        // GCC 16.2's -Wcompare-distinct-pointer-types (measured): a
+        // default-on warning for every relational operator between two
+        // pointer-shaped operands (after array/function decay) whose
+        // pointees differ. The `void *` absorption applies at the
+        // OUTERMOST level only: `void *` against `int *` and against
+        // `void **` are silent, `void **` against `int **` warns (all
+        // measured). C-compatible-but-distinct pointees warn as well:
+        // `char *` against `unsigned char *`, `int *` against `unsigned *`
+        // and `enum E *` against `int *` all report (measured), which is
+        // stricter than the argument-passing compatibility the conditional
+        // arm check uses.
+        if message.is_none()
+            && matches!(
+                op,
+                BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+            )
+        {
+            fn pointee(ty: &CType) -> Option<&CType> {
+                match ty {
+                    CType::Pointer(inner, _) => Some(inner),
+                    CType::Array(inner, _) => Some(inner),
+                    // A function designator decays to a pointer to that
+                    // function type: the pointee view is the type itself.
+                    CType::Function(_) => Some(ty),
+                    _ => None,
+                }
+            }
+            if let (Some(lhs_pointee), Some(rhs_pointee)) = (pointee(&lt), pointee(&rt)) {
+                let compatible = lhs_pointee == rhs_pointee
+                    || *lhs_pointee == CType::Void
+                    || *rhs_pointee == CType::Void;
+                if !compatible {
+                    self.diagnostics.borrow_mut().warning_with_kind(
+                        "comparison of distinct pointer types lacks a cast".to_string(),
+                        span,
+                        crate::common::error::WarningKind::CompareDistinctPointerTypes,
+                    );
+                }
+            }
+        }
         // Only the `void` verdict is anchored at the operand ("void value not
         // ignored as it ought to be" at `g` in `g() * 2`); "invalid operands
         // to binary" stays on the operator, which both measurements confirm.
@@ -4735,6 +4775,31 @@ impl SemanticAnalyzer {
                     "cast from pointer to integer of different size".to_string(),
                     span,
                     crate::common::error::WarningKind::PointerToIntCast,
+                );
+            }
+        }
+        // The mirror image, GCC 16.2's -Wint-to-pointer-cast (measured):
+        // default-on in every dialect and never a dialect default error;
+        // it fires when the integer source's object size differs from the
+        // pointer's, `_Bool` and enumeration sources never warn, and
+        // integer constant expressions are folded silently (`(void *)42`
+        // is silent while `(void *)i32` is not, and the exemption is the
+        // constant-ness: `(void *)cj` for `const int cj = 5` warns).
+        if matches!(to, CType::Pointer(..))
+            && from_ty.is_integer()
+            && !matches!(from_ty, CType::Bool | CType::Enum(_))
+            && !self.is_integer_constant_expr(inner)
+        {
+            let layouts = self.result.type_context.borrow_struct_layouts();
+            let ptr_size =
+                CType::Pointer(Box::new(CType::Void), AddressSpace::Default).size_ctx(&*layouts);
+            let from_size = from_ty.size_ctx(&*layouts);
+            drop(layouts);
+            if from_size != ptr_size {
+                self.diagnostics.borrow_mut().warning_with_kind(
+                    "cast to pointer from integer of different size".to_string(),
+                    span,
+                    crate::common::error::WarningKind::IntToPointerCast,
                 );
             }
         }
@@ -6128,8 +6193,14 @@ dereference it before applying '->' to it?"
             return;
         }
 
+        // GCC appends the ORIGINAL (pre-conversion) operand types,
+        // measured: `u < -1` -> `… signedness: 'unsigned int' and 'int'`.
         self.diagnostics.borrow_mut().warning_with_kind(
-            "comparison of integer expressions of different signedness",
+            format!(
+                "comparison of integer expressions of different signedness: '{}' and '{}'",
+                gcc_format_type_name(&lhs_type),
+                gcc_format_type_name(&rhs_type)
+            ),
             span,
             warning_kind,
         );
