@@ -2844,6 +2844,8 @@ fi
 # have shipped wrong answers before, which is why they are asserted.
 gate "godbolt-oracle-selftest" fast \
     python3 tools/oracle/godbolt_oracle_selftest.py
+gate "godbolt-explicit-local-selftest" fast \
+    python3 tests/corpus/test_godbolt_explicit_local.py
 
 # One CE cache now backs four tools, and every way it can be wrong is silent:
 # a forgeable key serves one program's result for another's, a truncated

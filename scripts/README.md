@@ -44,7 +44,7 @@ construction, reports the honest source fallback for that shape. See the
 | `gen_encoding_sweep.py` | Generate instructions that have MORE THAN ONE legal encoding (accumulator short forms, imm8 sign-extension, redundant REX, VEX2-vs-VEX3, scale-1 index folds, ...). These are the only places an encoding can be improved, and most are invisible to a structural-coverage corpus. |
 | `gen_asmdiff_corpus.py` | Generate the `tests/asm-diff/*.casefile` corpora. Every case is validated against GNU as before being written. |
 | `gen_apx_asmdiff.py` | Generate `tests/asm-diff/apx.casefile`: REX2/EGPR/NDD/`{nf}`/`{evex}` plus the unsigned-imm32-into-EGPR size win (tagged `betterok`). |
-| `godbolt.py` | Compiler Explorer client. Fetches GCC/Clang/ICC/ICX code generation so the Intel compilers can serve as reference oracles without a local Intel toolchain. |
+| `godbolt.py` | Compiler Explorer client for GCC/Clang/ICC/ICX assembly; `compare --local-ref LABEL=EXECUTABLE` adds explicit native local references without network, with launcher-only hashes and fail-closed missing/ignored-option reports. |
 | `codegen_oracle.py` | Batch local/Compiler-Explorer comparison with deterministic artifacts and architecture-aware x86 or AArch64 instruction/load/store/stack-traffic statistics; AArch64 defaults to GCC 16.1, GCC trunk, and Clang 22.1. `--rank` is the whole-corpus survey absorbed from the deleted `codegen_scoreboard.py`: every function of every source is ranked by instruction-count gap to the best oracle, worst first, with the scoreboard's historical defaults preserved (`-O2 -march=x86-64-v3`, `--min-insns`, `-v`, `--baseline`, the `gaps` JSON schema, and the always-exit-0 survey contract — compiler failures go to stderr; `--oracles ''` is the scoreboard's local-only same-binary A/B mode). Both report modes share ONE metric implementation; the old oracle-vs-scoreboard divergence (non-VEX packed SSE mnemonics undercounted) is fixed, and remote compiles share the scoreboard's `att-v2` digest cache. |
 | `check_codegen_refactor_identity.py` | Byte-for-byte assembly gate for pure codegen refactors. It compiles a corpus with before/after LCCC binaries under a scrubbed default `CCC_*`/`LCCC_*` environment and honours adjacent `.flags` files; the report separately canonicalizes only LCCC PGO-generation process-ID suffixes, which are intentionally nondeterministic. |
 | `reproduce_historical_peephole_utf8.py` | Extracts and executes the exact historical UTF-8-corrupting helper. It resolves the current Rust channel from `rust-toolchain.toml` even though the intentionally historical snippet is compiled with its original Rust-2021 semantics. |
@@ -279,12 +279,19 @@ tar xf binutils-2.47.tar.xz && mkdir bu-build && cd bu-build
 make -j"$(nproc)" MAKEINFO=true all-gas all-binutils all-ld
 ```
 
-`godbolt.py` needs only network access:
+`godbolt.py` uses Compiler Explorer when remote oracles are requested; explicit local references can also be compared offline:
 
 ```bash
 scripts/godbolt.py list --filter icx
 scripts/godbolt.py compare kernel.c --flags "-O3 -march=x86-64-v3" \
     --local ./target/fastbuild/lccc
+
+# Offline assembly comparison; paths may be compilers or launchers.
+# This is static assembly only, not a correctness or performance verdict.
+scripts/godbolt.py compare kernel.c --function hot_loop --flags=-O2 \
+    --local target/fastbuild/lccc --oracles '' \
+    --local-ref gcc=/path/to/gcc-16 --local-ref clang=/path/to/clang-23 \
+    --artifact-dir /tmp/local-comparison
 
 # AArch64 structural comparison (ARM64 GCC 16.1 on Compiler Explorer):
 python3 scripts/codegen_oracle.py test.c --function hot_loop \

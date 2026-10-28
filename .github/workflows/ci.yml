@@ -1120,6 +1120,7 @@ jobs:
       run: |
         python3 scripts/test_local_oracles.py
         python3 scripts/test_icx_provision.py
+        python3 tests/corpus/test_godbolt_explicit_local.py
     - name: Const-volatile object reads are not folded
       run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_const_volatile_objects.sh
     - name: Named-space brace-elided initializers

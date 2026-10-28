@@ -284,9 +284,9 @@ def compilation_error(data: Any) -> str | None:
         for line in lines:
             if re.search(r"\b(?:warning|error)\b", line, re.I) and re.search(
                 r"(?:ignoring (?:unknown )?(?:option|argument)|"
-                r"(?:unknown|unsupported) (?:command.line )?(?:option|argument|architecture)|"
+                r"(?:unknown|unsupported|unrecogni[sz]ed) (?:command.line )?(?:option|argument|architecture)|"
                 r"argument unused during compilation|"
-                r"(?:option|argument|flag|architecture).*?(?:ignored|not supported|unsupported))",
+                r"(?:option|argument|flag|architecture).*?(?:ignored|not supported|unsupported|not implemented))",
                 line, re.I,
             ):
                 return f"requested compiler options not honored: {line[:240]}"
@@ -480,16 +480,18 @@ def _compile_local(executable: str, source: Path, flags: str) -> list[str]:
     # as a symlink. Own a private directory and clean it on every failure path.
     with tempfile.TemporaryDirectory(prefix="lccc-godbolt-") as td:
         output = Path(td) / "output.s"
-        command = [executable, *shlex.split(flags), "-S", str(source), "-o", str(output)]
         try:
+            command = [executable, *shlex.split(flags), "-S", str(source), "-o", str(output)]
             result = subprocess.run(command, capture_output=True, text=True, timeout=120)
-            if result.returncode:
-                raise GodboltError(f"local compile failed: {' '.join(command)}\n{result.stderr}")
+            error = compilation_error({"code": result.returncode, "stdout": result.stdout,
+                                       "stderr": result.stderr})
+            if error:
+                raise GodboltError(f"local compile failed: {' '.join(command)}\n{error}")
             text = output.read_text(errors="replace")
             if not text.strip():
                 raise GodboltError("local compiler produced empty assembly")
             return text.splitlines()
-        except (OSError, subprocess.TimeoutExpired) as error:
+        except (OSError, ValueError, subprocess.TimeoutExpired) as error:
             raise GodboltError(f"local compile failed: {error}") from error
 
 
@@ -546,7 +548,7 @@ def validate_local_oracle_flags(name: str, flags: str) -> None:
     for token in tokens:
         if (token in ('-m16', '-m32', '-mx32', '--') or token.startswith('@')
                 or any(token == opt or token.startswith(opt + '=') for opt in forbidden)
-                or token.startswith(('-Xarch_', '-Wp,', '-Xclang='))):
+                or token.startswith(('-B', '-Xarch_', '-Wp,', '-Xclang='))):
             raise GodboltError(f"{name}: native x86-64 LP64 oracle rejects target/opaque option {token!r}")
 
 
@@ -743,10 +745,102 @@ def command_compile(args: argparse.Namespace) -> int:
     return 0
 
 
+def stable_launcher_digest(path: Path) -> str:
+    """Hash only the launcher and reject changes during the read.
+
+    A wrapper's target is deliberately outside this identity scope.
+    """
+    try:
+        before = _binary_identity(path)
+        digest = hashlib.sha256()
+        with path.open("rb") as source:
+            for chunk in iter(lambda: source.read(1 << 20), b""):
+                digest.update(chunk)
+        if _binary_identity(path) != before:
+            raise GodboltError(f"compiler launcher changed while hashing: {path}")
+        return digest.hexdigest()
+    except OSError as error:
+        raise GodboltError(f"cannot hash compiler launcher {path}: {error}") from error
+
+
+def local_reference_metadata(label: str, executable: str, flags: str) -> dict[str, Any]:
+    """Identify an explicit local native oracle without provisioning or network.
+
+    The executable hash is deliberately named *launcher*: a shell shim can
+    dispatch to another binary, so its digest alone does not pin the compiler.
+    Macro and version probes supply evidence, not an attestation of that binary.
+    """
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", label):
+        raise GodboltError(f"invalid local reference label {label!r}")
+    if not executable.strip():
+        raise GodboltError(f"{label}: empty local executable")
+    validate_local_oracle_flags(label, flags)
+    resolved = shutil.which(os.path.expanduser(executable))
+    if resolved is None:
+        raise GodboltError(f"{label}: local compiler is not executable: {executable}")
+    path = Path(resolved).resolve()
+    try:
+        before = _binary_identity(path)
+        proc = subprocess.run([str(path), "--version"], capture_output=True, text=True, timeout=60)
+        lines = proc.stdout.splitlines()
+        if proc.returncode or not lines or not lines[0].strip():
+            raise GodboltError(f"{label}: local compiler did not report a version")
+        macros = _probe_macros(str(path))
+        if macros.get("__x86_64__") != "1" or macros.get("__SIZEOF_POINTER__") != "8":
+            raise GodboltError(f"{label}: local compiler is not native x86-64 LP64")
+        digest = stable_launcher_digest(path)
+        if _binary_identity(path) != before:
+            raise GodboltError(f"{label}: compiler launcher changed during identification")
+        return {
+            "key": label,
+            "id": f"local:{label}",
+            "name": lines[0].strip(),
+            "compilerType": "explicit-local",
+            "launcher": str(path),
+            "launcher_sha256": digest,
+            "identity_scope": "launcher only; wrapper targets are not pinned",
+            "target": "x86_64",
+            "pointer_bits": 64,
+        }
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise GodboltError(f"{label}: local compiler probe failed: {error}") from error
+
+
 def command_compare(args: argparse.Namespace) -> int:
-    source_text = args.source.read_text()
+    source_bytes = args.source.read_bytes()
+    # Match read_text()'s universal-newline behavior for the remote request;
+    # the manifest records both its digest and the local raw-byte digest.
+    source_text = source_bytes.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
     requested = [item.strip() for item in args.oracles.split(",") if item.strip()]
-    compilers = list_compilers("c") if any(n not in LOCAL_ORACLES for n in requested) else []
+    if len(requested) != len(set(requested)):
+        print("duplicate remote oracle label", file=sys.stderr)
+        return 1
+    local_specs = getattr(args, "local_ref", [])
+    local_pairs = []
+    names = {"lccc", *requested}
+    for spec in local_specs:
+        label, separator, executable = spec.partition("=")
+        if not separator or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", label):
+            print(f"invalid --local-ref {spec!r}; expected LABEL=EXECUTABLE", file=sys.stderr)
+            return 1
+        if label in names:
+            print(f"duplicate comparator label: {label}", file=sys.stderr)
+            return 1
+        names.add(label)
+        local_pairs.append((label, executable))
+    if not requested and not local_pairs:
+        print("compare requires at least one oracle or explicit local reference", file=sys.stderr)
+        return 1
+
+    # If the CE catalog is unavailable, preserve the local results and record
+    # each remote as an error. Never turn missing ICC/ICX evidence into a pass.
+    compilers: list[dict[str, Any]] = []
+    catalog_error = None
+    if any(name not in LOCAL_ORACLES for name in requested):
+        try:
+            compilers = list_compilers("c")
+        except GodboltError as error:
+            catalog_error = str(error)
     artifact_dir: Path | None = args.artifact_dir
     if artifact_dir:
         artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -769,7 +863,25 @@ def command_compare(args: argparse.Namespace) -> int:
         print(error, file=sys.stderr)
         return 1
 
+    for label, executable in local_pairs:
+        try:
+            metadata = local_reference_metadata(label, executable, args.flags)
+            lines = _compile_local(metadata["launcher"], args.source, args.flags)
+            if stable_launcher_digest(Path(metadata["launcher"])) != metadata["launcher_sha256"]:
+                raise GodboltError(f"{label}: compiler launcher changed during compilation")
+            body = _function_body(lines, args.function)
+            if body is None:
+                raise GodboltError(f"function '{args.function}' was not emitted (likely inlined or removed)")
+            records.append({**metadata, "flags": args.flags,
+                            "instructions": _instruction_count(body), "assembly": body})
+        except GodboltError as error:
+            records.append({"key": label, "id": f"local:{label}", "error": str(error)})
+
     for requested_name in requested:
+        if catalog_error is not None and requested_name not in LOCAL_ORACLES:
+            records.append({"key": requested_name, "id": resolve_compiler(requested_name),
+                            "error": f"Compiler Explorer catalog unavailable: {catalog_error}"})
+            continue
         try:
             meta, lines = oracle_assembly(requested_name, args.source, args.flags, compilers=compilers)
         except GodboltError as error:
@@ -787,34 +899,42 @@ def command_compare(args: argparse.Namespace) -> int:
             "instructions": _instruction_count(body), "assembly": body,
         })
 
+    if args.source.read_bytes() != source_bytes:
+        records.append({"key": "input", "id": str(args.source),
+                        "error": "source changed during comparison; results are not comparable"})
+
+    print("Static assembly comparison only; correctness and runtime are not measured.")
     print(f"{'compiler':<14} {'resolved id':<20} {'instructions':>12}  name")
     print("-" * 82)
     for record in records:
         count = record.get("instructions")
         count_text = str(count) if count is not None else "ERROR"
         print(f"{record['key']:<14} {record['id']:<20} {count_text:>12}  {record.get('name', '')}")
+        if "error" in record:
+            print(f"  {record['key']}: {record['error']}", file=sys.stderr)
         if artifact_dir and "assembly" in record:
             safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", record["key"])
             (artifact_dir / f"{safe}.s").write_text("\n".join(record["assembly"]) + "\n")
 
     manifest = {
         "schema": 1,
+        "scope": "static-assembly-only",
         "source": str(args.source),
-        "source_sha256": hashlib.sha256(source_text.encode()).hexdigest(),
+        "source_sha256": hashlib.sha256(source_bytes).hexdigest(),
+        "remote_source_sha256": hashlib.sha256(source_text.encode()).hexdigest(),
         "function": args.function,
         "remote_flags": args.flags,
         "local_flags": args.local_flags or args.flags,
         "oracles": [{k: v for k, v in record.items() if k != "assembly"}
                     for record in records],
     }
-    if args.json:
-        args.json.parent.mkdir(parents=True, exist_ok=True)
-        tmp = args.json.with_suffix(f".tmp.{os.getpid()}")
+    manifest_path = args.json or (artifact_dir / "manifest.json" if artifact_dir else None)
+    if manifest_path:
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = manifest_path.with_suffix(f".tmp.{os.getpid()}")
         tmp.write_text(json.dumps(manifest, indent=2) + "\n")
-        tmp.replace(args.json)
-        print(f"wrote {args.json}")
-    elif artifact_dir:
-        (artifact_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+        tmp.replace(manifest_path)
+        print(f"wrote {manifest_path}")
     return 1 if any("error" in record for record in records) else 0
 
 
@@ -918,6 +1038,8 @@ def build_parser() -> argparse.ArgumentParser:
     compare_p.add_argument("--flags", default="-O3 -march=x86-64-v3")
     compare_p.add_argument("--local-flags")
     compare_p.add_argument("--oracles", default=",".join(DEFAULT_ORACLES))
+    compare_p.add_argument("--local-ref", action="append", default=[], metavar="LABEL=EXECUTABLE",
+                           help="add a native x86-64 LP64 compiler without network; repeatable")
     compare_p.add_argument("--function")
     compare_p.add_argument("--artifact-dir", type=Path)
     compare_p.add_argument("--json", type=Path)
