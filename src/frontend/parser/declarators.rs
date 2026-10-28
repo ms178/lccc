@@ -937,34 +937,16 @@ impl Parser {
                     outer_fn_returns,
                 ) = self.parse_param_declarator_full();
                 let adjusted_cvr = self.attrs.param_adjusted_cvr;
-                // C11 6.7.6.3p2: `register` is a parameter's only storage
-                // class (GCC 16.2 wording).
-                if self.attrs.take_storage_classes() != 0 {
-                    let message = match &name {
-                        Some(n) => format!("storage class specified for parameter '{n}'"),
-                        None => "storage class specified for unnamed parameter".to_string(),
-                    };
-                    self.emit_error(message, param_span);
-                }
-                // A parameter has automatic storage, so a named space cannot
-                // hold it: GCC 14.2 rejects `long __seg_gs x`. A pointer parameter
-                // (`long __seg_gs *p`) is fine; its qualifier names the pointee.
-                if param_addr_space != AddressSpace::Default
-                    && pointer_depth == 0
-                    && inner_ptr_depth == 0
-                    && array_dims.is_empty()
-                    && ptr_to_array_dims.is_empty()
-                    && !is_func_ptr
-                {
-                    self.emit_error(
-                        format!(
-                            "'{}' specified for parameter '{}'",
-                            param_addr_space,
-                            name.as_deref().unwrap_or("")
-                        ),
-                        param_span,
-                    );
-                }
+                self.check_parameter_storage(
+                    name.as_deref(),
+                    param_span,
+                    param_addr_space,
+                    pointer_depth == 0
+                        && inner_ptr_depth == 0
+                        && array_dims.is_empty()
+                        && ptr_to_array_dims.is_empty()
+                        && !is_func_ptr,
+                );
                 // Post-name GCC attributes: `int x __attribute__((aligned(32)))`.
                 // The parameter declarator parser does not consume them; parse
                 // them here and merge `aligned` with any pre-name/_Alignas
@@ -1128,6 +1110,70 @@ impl Parser {
         (params, variadic, true)
     }
 
+    /// A parameter's storage constraints are independent of declarator
+    /// construction. Check them once after its shape is known, retaining the
+    /// original parameter span and register-storage exception.
+    fn check_parameter_storage(
+        &mut self,
+        name: Option<&str>,
+        span: Span,
+        space: AddressSpace,
+        direct_object: bool,
+    ) {
+        if self.attrs.take_storage_classes() != 0 {
+            let message = match name {
+                Some(name) => format!("storage class specified for parameter '{name}'"),
+                None => "storage class specified for unnamed parameter".to_string(),
+            };
+            self.emit_error(message, span);
+        }
+        // Parameters have automatic storage; a named space can qualify a
+        // pointee but cannot be the storage of a direct parameter object.
+        if space != AddressSpace::Default && direct_object {
+            self.emit_error(
+                format!("'{space}' specified for parameter '{}'", name.unwrap_or("")),
+                span,
+            );
+        }
+    }
+
+    /// The last parenthesised star describes the parameter object's storage,
+    /// unlike earlier stars that describe pointees. Preserve the distinct
+    /// GCC wording for unnamed parenthesised parameters.
+    fn check_param_group_space(&mut self, name: Option<&str>, space: AddressSpace, span: Span) {
+        if space != AddressSpace::Default {
+            let message = match name {
+                Some(name) => format!("'{space}' specified for parameter '{name}'"),
+                None => format!("'{space}' specified for unnamed parameter"),
+            };
+            self.emit_error(message, span);
+        }
+    }
+
+    /// One parameter star's exact CVR and named space. Reset per-star flags,
+    /// then restore the declaration-wide unions; do not rescan qualifier tokens.
+    fn parse_param_star_quals(&mut self) -> (AddressSpace, u8) {
+        let base_space =
+            std::mem::replace(&mut self.attrs.parsing_address_space, AddressSpace::Default);
+        self.attrs.set_pointer_const(false);
+        let outer_volatile = self.attrs.parsing_volatile();
+        let outer_restrict = self.attrs.parsing_restrict();
+        self.attrs.set_volatile(false);
+        self.attrs.set_restrict(false);
+        self.skip_cv_qualifiers();
+        let star_volatile = self.attrs.parsing_volatile();
+        let star_restrict = self.attrs.parsing_restrict();
+        let cvr = u8::from(self.attrs.parsing_pointer_const())
+            | (u8::from(star_volatile) << 1)
+            | (u8::from(star_restrict) << 2);
+        self.attrs.set_volatile(outer_volatile || star_volatile);
+        self.attrs.set_restrict(outer_restrict || star_restrict);
+        (
+            std::mem::replace(&mut self.attrs.parsing_address_space, base_space),
+            cvr,
+        )
+    }
+
     /// Parse a K&R-style identifier list: foo(a, b, c)
     fn parse_kr_identifier_list(&mut self) -> (Vec<ParamDecl>, bool, bool) {
         let mut params = Vec::with_capacity(8);
@@ -1209,36 +1255,9 @@ impl Parser {
             if !self.enter_pointer_level(pointer_depth, star_span) {
                 break;
             }
-            // Preserve the optimization-significant qualifier instead of
-            // dropping it with const/volatile. Scan exactly the qualifier run
-            // attached to this `*`, before nested function declarators begin.
-            let qualifier_start = self.pos;
-            let base_space =
-                std::mem::replace(&mut self.attrs.parsing_address_space, AddressSpace::Default);
-            // Each star owns its qualifier run; an inner const pointer
-            // must not make the parameter object itself read-only.
-            self.attrs.set_pointer_const(false);
-            // ... and its own `volatile`/`restrict`: the specifiers' (or an
-            // earlier star's) belong to a deeper level. The flags keep their
-            // union afterwards, as before.
-            let outer_volatile = self.attrs.parsing_volatile();
-            let outer_restrict = self.attrs.parsing_restrict();
-            self.attrs.set_volatile(false);
-            self.attrs.set_restrict(false);
-            self.skip_cv_qualifiers();
-            let (star_volatile, star_restrict) =
-                (self.attrs.parsing_volatile(), self.attrs.parsing_restrict());
-            self.attrs.set_volatile(outer_volatile || star_volatile);
-            self.attrs.set_restrict(outer_restrict || star_restrict);
-            star_quals.push((
-                std::mem::replace(&mut self.attrs.parsing_address_space, base_space),
-                u8::from(self.attrs.parsing_pointer_const())
-                    | (u8::from(star_volatile) << 1)
-                    | (u8::from(star_restrict) << 2),
-            ));
-            is_restrict |= self.tokens[qualifier_start..self.pos]
-                .iter()
-                .any(|tok| matches!(tok.kind, TokenKind::Restrict));
+            let quals = self.parse_param_star_quals();
+            is_restrict |= quals.1 & CVR_RESTRICT != 0;
+            star_quals.push(quals);
             // Also skip __attribute__(...) after pointer qualifiers.
             // E.g., `int * __attribute__((unused)) p` is valid GNU C.
             self.skip_gcc_extensions();
@@ -1412,25 +1431,9 @@ impl Parser {
                 if !self.enter_pointer_level(inner_ptr_depth, star_span) {
                     break;
                 }
-                let base_space =
-                    std::mem::replace(&mut self.attrs.parsing_address_space, AddressSpace::Default);
-                // The star's own qualifier run, as in the leading-star loop.
-                self.attrs.set_pointer_const(false);
-                let outer_volatile = self.attrs.parsing_volatile();
-                let outer_restrict = self.attrs.parsing_restrict();
-                self.attrs.set_volatile(false);
-                self.attrs.set_restrict(false);
-                self.skip_cv_qualifiers();
-                let (star_volatile, star_restrict) =
-                    (self.attrs.parsing_volatile(), self.attrs.parsing_restrict());
-                self.attrs.set_volatile(outer_volatile || star_volatile);
-                self.attrs.set_restrict(outer_restrict || star_restrict);
-                paren_star_quals.push(
-                    u8::from(self.attrs.parsing_pointer_const())
-                        | (u8::from(star_volatile) << 1)
-                        | (u8::from(star_restrict) << 2),
-                );
-                object_space = std::mem::replace(&mut self.attrs.parsing_address_space, base_space);
+                let (space, cvr) = self.parse_param_star_quals();
+                paren_star_quals.push(cvr);
+                object_space = space;
                 object_span = star_span;
                 // Also skip __attribute__(...) after pointer qualifiers.
                 // E.g., `void (*__attribute__((unused)) fp)(int)` is valid GNU C.
@@ -1519,13 +1522,7 @@ impl Parser {
             // A parameter has automatic storage and cannot live in a named
             // space; GCC 14.2 rejects `void f(long (*__seg_gs p)[4])` and the
             // unnamed form. Same rule as the non-parenthesised declarator.
-            if object_space != AddressSpace::Default {
-                let msg = match name.as_deref() {
-                    Some(n) => format!("'{object_space}' specified for parameter '{n}'"),
-                    None => format!("'{object_space}' specified for unnamed parameter"),
-                };
-                self.emit_error(msg, object_span);
-            }
+            self.check_param_group_space(name.as_deref(), object_space, object_span);
             *pointer_depth += inner_ptr_depth.saturating_sub(1);
             // Parse array dimensions inside parens: (*a[]) or (*a[N])
             // These represent "array of pointers" and need to be propagated

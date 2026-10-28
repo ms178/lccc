@@ -25,6 +25,12 @@ all their construction paths can be migrated safely.
 | Fail closed on subprocess results | Error severity, exit status, driver summaries and unexpected stderr must agree | Searching only for expected primary diagnostics and dropping every other line |
 | Require exact GCC by default | Accidental oracle absence/version drift must not weaken CI | Silent success without the specified oracle |
 
+Parameter storage/address-space diagnostics and per-star CVR collection are
+factored into focused parser helpers. This removes duplicate qualifier-run
+logic and a second token scan. It also keeps the audit ratchet at 234 functions
+over 300 lines without weakening its baseline (the initial change raised it
+to 236). No production unsafe site or hot panic site was added.
+
 ## Ownership map
 
 - `PtrQuals`: complete recorded **pointee** CVR at one pointer level and its
