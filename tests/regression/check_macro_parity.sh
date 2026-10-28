@@ -124,48 +124,48 @@ for target in "${TARGETS[@]}"; do
         fi
 
         # Build sorted name→value maps.
-        # Lines look like `#define NAME value` or `#define NAME value-with-spaces`.
-        awk '{$1=""; sub(/^ /,""); print}' "$td/gcc.txt" > "$td/gcc.names"
-        awk '{$1=""; sub(/^ /,""); print}' "$td/lccc.txt" > "$td/lccc.names"
-        # Actually we need name and value separately.
-        awk '{print $1, $2}' "$td/gcc.txt" | sort > "$td/gcc.nv"
-        awk '{print $1, $2}' "$td/lccc.txt" | sort > "$td/lccc.nv"
+        # Strip the leading #define token; each line becomes "NAME value".
+        awk '{$1=""; sub(/^ /,""); print}' "$td/gcc.txt" | sort > "$td/gcc.nv"
+        awk '{$1=""; sub(/^ /,""); print}' "$td/lccc.txt" | sort > "$td/lccc.nv"
 
-        comm -13 "$td/gcc.nv" "$td/lccc.nv" > "$td/only_lccc.txt"   # lccc-defined only
-        comm -23 "$td/gcc.nv" "$td/lccc.nv" > "$td/only_gcc.txt"    # gcc-defined only
-        comm -12 "$td/gcc.nv" "$td/lccc.nv" > "$td/both.txt"        # defined by both
+        # Name-only lists for set operations (a macro with different values
+        # must not count as missing/forbidden — that's a SPELLING issue).
+        awk '{print $1}' "$td/gcc.nv" | sort > "$td/gcc.names"
+        awk '{print $1}' "$td/lccc.nv" | sort > "$td/lccc.names"
+
+        comm -13 "$td/gcc.names" "$td/lccc.names" > "$td/only_lccc_names.txt"   # lccc-defined only
+        comm -23 "$td/gcc.names" "$td/lccc.names" > "$td/only_gcc_names.txt"    # gcc-defined only
+        comm -12 "$td/gcc.names" "$td/lccc.names" > "$td/both_names.txt"        # defined by both
 
         # --- FORBIDDEN check: lccc-defined names that are on the pinned list ---
-        while IFS= read -r line; do
-            [ -z "$line" ] && continue
-            name="${line%% *}"
+        while IFS= read -r name; do
+            [ -z "$name" ] && continue
             # Is this name on the FORBIDDEN_LIST?
             for fb in "${FORBIDDEN_LIST[@]}"; do
                 if [ "$name" = "$fb" ]; then
-                    echo "FAIL: $target/$dialect: FORBIDDEN macro '$name' defined by lccc (value: ${line#* })"
+                    lccc_val=$(awk -v name="$name" '$1 == name { $1=""; sub(/^ /,""); print; exit }' "$td/lccc.nv")
+                    echo "FAIL: $target/$dialect: FORBIDDEN macro '$name' defined by lccc (value: $lccc_val)"
                     fail=1
                 fi
             done
-        done < "$td/only_lccc.txt"
+        done < "$td/only_lccc_names.txt"
 
         # --- MISSING check: essential macros gcc defines but lccc doesn't ---
-        while IFS= read -r line; do
-            [ -z "$line" ] && continue
-            name="${line%% *}"
+        while IFS= read -r name; do
+            [ -z "$name" ] && continue
             for ess in "${MISSING_ESSENTIAL[@]}"; do
                 if [ "$name" = "$ess" ]; then
                     echo "FAIL: $target/$dialect: MISSING essential macro '$name' (defined by gcc-16, not lccc)"
                     fail=1
                 fi
             done
-        done < "$td/only_gcc.txt"
+        done < "$td/only_gcc_names.txt"
 
         # --- SPELLING check: both define it, values differ ---
-        while IFS= read -r line; do
-            [ -z "$line" ] && continue
-            name="${line%% *}"
-            gcc_val=$(awk -v name="$name" '$1 == name {print $2; exit}' "$td/gcc.nv")
-            lccc_val=$(awk -v name="$name" '$1 == name {print $2; exit}' "$td/lccc.nv")
+        while IFS= read -r name; do
+            [ -z "$name" ] && continue
+            gcc_val=$(awk -v name="$name" '$1 == name { $1=""; sub(/^ /,""); print; exit }' "$td/gcc.nv")
+            lccc_val=$(awk -v name="$name" '$1 == name { $1=""; sub(/^ /,""); print; exit }' "$td/lccc.nv")
             if [ "$gcc_val" != "$lccc_val" ]; then
                 # Check allowlist
                 allowed=0
@@ -177,15 +177,12 @@ for target in "${TARGETS[@]}"; do
                     fail=1
                 fi
             fi
-        done < "$both.txt"
+        done < "$td/both_names.txt"
     done
 done
 
 if [ "$fail" -ne 0 ]; then
     echo "FAIL: macro parity gate — see above"
-    echo "::notice title=GP-23 DEBUG only_lccc.txt::$(cat "$td/only_lccc.txt" 2>/dev/null | tr '\n' '|')"
-    echo "::notice title=GP-23 DEBUG only_gcc.txt::$(cat "$td/only_gcc.txt" 2>/dev/null | tr '\n' '|')"
-    echo "::notice title=GP-23 DEBUG both.txt::$(cat "$td/both.txt" 2>/dev/null | tr '\n' '|')"
     exit 1
 fi
 echo "OK: macro parity (FORBIDDEN empty, MISSING essential empty, SPELLING allowlist respected)"
