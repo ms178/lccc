@@ -88,5 +88,74 @@ class AgentToolchainCache(unittest.TestCase):
             self.assertTrue(res_print.stdout.strip().endswith(f'{prefix}/bin'), res_print.stdout)
 
 
+    def test_escaping_link_chain_is_rejected(self):
+        """Members that are each legal can still form an escaping chain."""
+        import os
+        import tempfile
+        spec = importlib.util.spec_from_file_location('agent_cache_chain_test', RESTORE)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            prefix = base / 'prefix'
+            (prefix / 'other').mkdir(parents=True)
+            (base / 'outside').mkdir()
+            os.symlink('root/link', prefix / 'bin')
+            (prefix / 'root').mkdir()
+            os.symlink('inside/../../outside', prefix / 'root/link')
+            os.symlink('../other', prefix / 'root/inside')
+            # Every individual target is legal; only the closed chain escapes.
+            with self.assertRaisesRegex(RuntimeError, 'escapes the cache prefix'):
+                module.reject_escaping_links(prefix)
+
+    def test_contained_links_are_accepted(self):
+        import os
+        import tempfile
+        spec = importlib.util.spec_from_file_location('agent_cache_contained_test', RESTORE)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix = Path(tmp) / 'prefix'
+            (prefix / 'tool/bin').mkdir(parents=True)
+            os.symlink('gcc-16', prefix / 'tool/bin/cc')
+            os.symlink('../tool/bin/gcc-16', prefix / 'tool/bin/alias')
+            module.reject_escaping_links(prefix)  # must not raise
+
+    def test_filter_probe_precedes_part_reassembly(self):
+        """An unsupported host must fail before materialising 500 MiB."""
+        import subprocess as sp
+        import tempfile
+        spec = importlib.util.spec_from_file_location('agent_cache_probe_test', RESTORE)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / 'repo'
+            repo.mkdir()
+            sp.run(['git', 'init', '-q', '-b', 'main', str(repo)], check=True)
+            sp.run(['git', '-C', str(repo), '-c', 'user.name=t', '-c', 'user.email=t@e.invalid',
+                    'commit', '-q', '--allow-empty', '-m', 'x'], check=True)
+            sp.run(['git', '-C', str(repo), 'tag', 'synthetic'], check=True)
+            with mock.patch.object(module, 'extraction_supported', return_value=False), \
+                    mock.patch.object(module, 'materialise') as materialise, \
+                    mock.patch.object(module, 'read_blob') as read_blob:
+                with self.assertRaisesRegex(RuntimeError, 'filter-capable Python'):
+                    module.restore(repo, '', 'synthetic', Path(tmp) / 'prefix', None,
+                                   skip_lock=True, only=None, no_shims=False,
+                                   verify_only=False, force=False)
+            materialise.assert_not_called()
+            read_blob.assert_not_called()
+
+    def test_missing_lock_file_is_an_error(self):
+        import tempfile
+        spec = importlib.util.spec_from_file_location('agent_cache_lock_test', RESTORE)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(RuntimeError, 'does not exist'):
+                module.restore(Path(tmp), '', 'synthetic', Path(tmp) / 'prefix',
+                               Path(tmp) / 'absent-lock.json', skip_lock=False, only=None,
+                               no_shims=False, verify_only=False, force=False)
+
+
 if __name__ == '__main__':
     unittest.main()
