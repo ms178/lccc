@@ -3610,7 +3610,10 @@ mod vec_mem_offset_tests {
             O::VecLoadI32x4Pair,
         ] {
             assert_eq!(op.vec_mem_offset_arg_index(), Some(1), "{op:?} index slot");
-            assert!(op.may_read_memory(), "{op:?} must classify as a memory read");
+            assert!(
+                op.may_read_memory(),
+                "{op:?} must classify as a memory read"
+            );
             assert!(
                 !op.writes_memory_via_args(),
                 "{op:?} is a load and must not classify as an argument-memory write"
@@ -3678,7 +3681,11 @@ mod vec_mem_offset_tests {
             O::VecMaddwdI16x16,
             O::VecConstI8x32,
         ] {
-            assert_eq!(op.vec_mem_offset_arg_index(), None, "{op:?} is register-only");
+            assert_eq!(
+                op.vec_mem_offset_arg_index(),
+                None,
+                "{op:?} is register-only"
+            );
         }
     }
 }

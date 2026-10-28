@@ -1503,12 +1503,24 @@ mod tests {
         // `<` takes ceil(bound / 8) iterations: iv = 0, 8, ..., < bound.
         assert_eq!(scalar_trip_count(IrCmpOp::Ult, IrType::U64, 8), Some(1));
         assert_eq!(scalar_trip_count(IrCmpOp::Ult, IrType::U64, 9), Some(2));
-        assert_eq!(scalar_trip_count(IrCmpOp::Ult, IrType::U64, 1024), Some(128));
-        assert_eq!(scalar_trip_count(IrCmpOp::Slt, IrType::I64, 1024), Some(128));
+        assert_eq!(
+            scalar_trip_count(IrCmpOp::Ult, IrType::U64, 1024),
+            Some(128)
+        );
+        assert_eq!(
+            scalar_trip_count(IrCmpOp::Slt, IrType::I64, 1024),
+            Some(128)
+        );
         // `<=` takes floor(bound / 8) + 1: iv = 0, 8, ..., <= bound.
         assert_eq!(scalar_trip_count(IrCmpOp::Ule, IrType::U32, 8), Some(2));
-        assert_eq!(scalar_trip_count(IrCmpOp::Ule, IrType::U32, 1023), Some(128));
-        assert_eq!(scalar_trip_count(IrCmpOp::Sle, IrType::I32, 1023), Some(128));
+        assert_eq!(
+            scalar_trip_count(IrCmpOp::Ule, IrType::U32, 1023),
+            Some(128)
+        );
+        assert_eq!(
+            scalar_trip_count(IrCmpOp::Sle, IrType::I32, 1023),
+            Some(128)
+        );
         // Signedness must agree with the IV type.
         assert_eq!(scalar_trip_count(IrCmpOp::Ult, IrType::I64, 1024), None);
         assert_eq!(scalar_trip_count(IrCmpOp::Slt, IrType::U64, 1024), None);
@@ -1516,12 +1528,21 @@ mod tests {
         assert_eq!(scalar_trip_count(IrCmpOp::Ult, IrType::U64, 0), None);
         assert_eq!(scalar_trip_count(IrCmpOp::Slt, IrType::I64, -8), None);
         // A bound outside the IV type is refused rather than reinterpreted.
-        assert_eq!(scalar_trip_count(IrCmpOp::Ult, IrType::U32, 1i64 << 32), None);
-        assert_eq!(scalar_trip_count(IrCmpOp::Slt, IrType::I32, 1i64 << 32), None);
+        assert_eq!(
+            scalar_trip_count(IrCmpOp::Ult, IrType::U32, 1i64 << 32),
+            None
+        );
+        assert_eq!(
+            scalar_trip_count(IrCmpOp::Slt, IrType::I32, 1i64 << 32),
+            None
+        );
         assert_eq!(scalar_trip_count(IrCmpOp::Slt, IrType::I32, -1), None);
         // A bound one past the wrap-free limit is refused; the limit itself is
         // accepted for `<=` (last iteration sits exactly at the maximum).
-        assert_eq!(scalar_trip_count(IrCmpOp::Ule, IrType::U32, i64::from(u32::MAX) - 7), None);
+        assert_eq!(
+            scalar_trip_count(IrCmpOp::Ule, IrType::U32, i64::from(u32::MAX) - 7),
+            None
+        );
         assert_eq!(
             scalar_trip_count(IrCmpOp::Ule, IrType::U32, i64::from(u32::MAX) - 8),
             Some((i64::from(u32::MAX) - 8) as u64 / 8 + 1)
