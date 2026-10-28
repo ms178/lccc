@@ -60,8 +60,8 @@ known rendering/context lines are recognized deliberately; unexpected driver
 failures, missing-column errors, panics, ICEs and foreign-file primary errors
 are not silently dropped. LCCC summary counts must equal primary error counts.
 
-The independent composition matrix has 26 hand-written cases plus all 64
-CVR pairs at both immediate and nested pointer boundaries (154 cases total).
+The independent composition matrix has 30 hand-written cases plus all 64
+CVR pairs at both immediate and nested pointer boundaries (158 cases total).
 Each target/dialect/compiler combination also checks applicable suppression
 and promotion, so warning-only and legal inputs independently exercise zero
 exit status. The matrix runs GNU C90/C17/C23; `__restrict__` is used because
@@ -85,8 +85,8 @@ members. It is discovered by the existing target regression corpus.
 
 - The pre-change compiler missed 57 results in 78 hand-written
   case/dialect combinations; GCC matched every stored expectation.
-- The fixed four-driver matrix passed 5,726 checks with GCC 16.2.0 and
-  Clang 23.1.4 (154 cases, three dialects, suppression/promotion included).
+- The fixed four-driver matrix passed 5,910 checks with GCC 16.2.0 and
+  Clang 23.1.4 (158 cases, three dialects, suppression/promotion included).
 - The annotated corpus passed 27 logical checks across its nine variants.
 - Operand diagnostics passed; position diagnostics passed 16/16.
 - Diagnostic red-team gate passed 1,431 contracts against GCC 16.2.0.
