@@ -310,6 +310,41 @@ fn resolve_sym_value(
     }
 }
 
+/// Whether `sym` names something a `hi20` address form can encode.
+///
+/// `auipc` + `add`/`load` materialises `S + A`, so `S` has to be an address
+/// the loader maps. A symbol in an input section without `SHF_ALLOC` is
+/// written to the file but never mapped: `build_local_sym_vaddrs` has no
+/// section address to add, the symbol resolves to a file offset or zero, and
+/// the two instructions then materialise that number with no diagnostic. The
+/// section is the only proof available, because zero is also a legitimate
+/// mapped address and UNDEF/ABS symbols resolve to zero without owning a
+/// section at all.
+///
+/// Globals resolve through `global_syms`, and their weak/PLT/preemptible
+/// rules already decide what may be encoded, so they are not judged here.
+fn pcrel_target_is_addressable(
+    sym: &super::elf_read::Symbol,
+    obj: &super::elf_read::ElfObject,
+) -> bool {
+    if !sym.is_local() && !sym.name.is_empty() {
+        return true;
+    }
+    match sym.shndx {
+        // No definition anywhere: nothing to address.
+        SHN_UNDEF => false,
+        // A value rather than a location; the merged global holds the address.
+        SHN_ABS | SHN_COMMON => true,
+        // Any other reserved index is not an input section, so there is no
+        // flag to consult and `st_value` is not an address.
+        _ if sym.shndx >= SHN_LORESERVE => false,
+        idx => obj
+            .sections
+            .get(idx as usize)
+            .is_some_and(|section| section.flags & SHF_ALLOC != 0),
+    }
+}
+
 /// The address of the GOT slot of `kind` a relocation against `sym`
 /// addresses. An executable reaches an imported function's address through
 /// its `.got.plt` slot when it has no `.got` slot of its own.
@@ -455,9 +490,10 @@ fn apply_one_reloc(
                 .ok_or_else(|| format!("R_RISCV_32 field exceeds output in '{}'", obj_name))?;
             field.copy_from_slice(&value.to_le_bytes());
         }
-        R_RISCV_PCREL_HI20 => {
-            let offset_val = super::displacement::checked_auipc_delta(s, a, p)?;
-            patch_u_type(data, off, offset_val as u32);
+        R_RISCV_PCREL_HI20 | R_RISCV_GOT_HI20 => {
+            apply_pcrel_hi20(
+                rela_type, data, off, s, a, p, sym, obj_idx, obj, obj_name, ctx,
+            )?;
         }
         R_RISCV_PCREL_LO12_I => {
             let auipc_addr = s as i64 + a;
@@ -492,11 +528,6 @@ fn apply_one_reloc(
                 );
                 patch_s_type(data, off, hi_val as u32);
             }
-        }
-        R_RISCV_GOT_HI20 => {
-            let got_entry_vaddr = lookup_got_entry(sym, obj_idx, a, GotKind::Addr, ctx)?;
-            let offset_val = super::displacement::checked_auipc_delta(got_entry_vaddr, a, p)?;
-            patch_u_type(data, off, offset_val as u32);
         }
         R_RISCV_CALL_PLT => {
             if ctx.gd_tls_call_nop.contains(&p) {
@@ -707,6 +738,45 @@ fn apply_one_reloc(
     Ok(())
 }
 
+/// Patch the `auipc` of a PC-relative address access: `%pcrel_hi` of the
+/// symbol itself, or of the GOT slot that holds its address. Both end up
+/// materialising an address in a register, so both need the section proof --
+/// an `auipc` pair carries no range check that would catch a file offset, and
+/// the displacement to a section near offset 0 always fits in the +-2 GiB
+/// window.
+#[allow(clippy::too_many_arguments)]
+fn apply_pcrel_hi20(
+    rela_type: u32,
+    data: &mut [u8],
+    off: usize,
+    s: u64,
+    a: i64,
+    p: u64,
+    sym: &super::elf_read::Symbol,
+    obj_idx: usize,
+    obj: &super::elf_read::ElfObject,
+    obj_name: &str,
+    ctx: &RelocContext,
+) -> Result<(), String> {
+    if !pcrel_target_is_addressable(sym, obj) {
+        return Err(format!(
+            "RISC-V PC-relative address relocation requires a symbol in a loaded \
+             section: '{}' in '{}' (its input section is not SHF_ALLOC, so it is \
+             written to the output but never mapped and S is a file offset, not an \
+             address)",
+            sym.name, obj_name
+        ));
+    }
+    let target = if rela_type == R_RISCV_GOT_HI20 {
+        lookup_got_entry(sym, obj_idx, a, GotKind::Addr, ctx)?
+    } else {
+        s
+    };
+    let delta = super::displacement::checked_auipc_delta(target, a, p)?;
+    patch_u_type(data, off, delta as u32);
+    Ok(())
+}
+
 /// Patch the `auipc` of a TLS access: either the `hi20` of a real
 /// `tls_index`/`tls_offset` GOT slot, or -- for a `GD` access to a variable
 /// the executable itself defines -- the relaxed `lui` form carrying the TP
@@ -859,5 +929,117 @@ pub fn collect_gd_tls_relax_info(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn object(section_flags: u64) -> super::super::elf_read::ElfObject {
+        super::super::elf_read::ElfObject {
+            sections: vec![
+                crate::backend::linker_common::Elf64Section {
+                    name_idx: 0,
+                    name: "".into(),
+                    sh_type: 1,
+                    flags: 0,
+                    addr: 0,
+                    offset: 0,
+                    size: 0,
+                    link: 0,
+                    info: 0,
+                    addralign: 0,
+                    entsize: 0,
+                },
+                crate::backend::linker_common::Elf64Section {
+                    name_idx: 0,
+                    name: ".data".into(),
+                    sh_type: 1,
+                    flags: section_flags,
+                    addr: 0,
+                    offset: 0,
+                    size: 8,
+                    link: 0,
+                    info: 0,
+                    addralign: 8,
+                    entsize: 0,
+                },
+            ],
+            symbols: vec![],
+            section_data: vec![],
+            relocations: vec![],
+            source_name: "probe.o".into(),
+        }
+    }
+
+    fn symbol(binding: u8, name: &str, shndx: u16) -> super::super::elf_read::Symbol {
+        super::super::elf_read::Symbol {
+            name_idx: 0,
+            name: name.into(),
+            info: (binding << 4) | STT_OBJECT,
+            other: 0,
+            shndx,
+            value: 0,
+            size: 0,
+        }
+    }
+
+    /// The `hi20` guard is what stops an address form from materialising a
+    /// file offset. Every branch is pinned: a loaded section is addressable,
+    /// an unloaded one is not, and the reserved indices keep their by-meaning
+    /// treatment. The probe that motivated it linked a `%pcrel_hi` reference
+    /// into a non-allocated section and produced `a0 = 0x2e0` with no
+    /// diagnostic while the target sat at address 0.
+    #[test]
+    fn pcrel_targets_need_a_loaded_section() {
+        let loaded = object(SHF_ALLOC);
+        let unloaded = object(0);
+        assert!(pcrel_target_is_addressable(
+            &symbol(STB_LOCAL, "t", 1),
+            &loaded
+        ));
+        assert!(!pcrel_target_is_addressable(
+            &symbol(STB_LOCAL, "t", 1),
+            &unloaded
+        ));
+        // No definition to address.
+        assert!(!pcrel_target_is_addressable(
+            &symbol(STB_LOCAL, "t", SHN_UNDEF),
+            &loaded
+        ));
+        // Values, not locations.
+        assert!(pcrel_target_is_addressable(
+            &symbol(STB_LOCAL, "t", SHN_ABS),
+            &unloaded
+        ));
+        assert!(pcrel_target_is_addressable(
+            &symbol(STB_LOCAL, "t", SHN_COMMON),
+            &unloaded
+        ));
+        // Reserved indices that are not an input section at all.
+        assert!(!pcrel_target_is_addressable(
+            &symbol(STB_LOCAL, "t", SHN_LORESERVE),
+            &loaded
+        ));
+        assert!(!pcrel_target_is_addressable(
+            &symbol(STB_LOCAL, "t", 0xffff),
+            &loaded
+        ));
+        // A section index past the header table (crafted input).
+        assert!(!pcrel_target_is_addressable(
+            &symbol(STB_LOCAL, "t", 9),
+            &loaded
+        ));
+        // Globals resolve through `global_syms`; the callers own those rules.
+        assert!(pcrel_target_is_addressable(
+            &symbol(STB_GLOBAL, "target", SHN_UNDEF),
+            &unloaded
+        ));
+        // An unnamed local is still judged by its section.
+        assert!(!pcrel_target_is_addressable(
+            &symbol(STB_LOCAL, "", 1),
+            &unloaded
+        ));
     }
 }
