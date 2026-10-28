@@ -144,7 +144,17 @@ readonly SPELLING_ALLOWLIST=(
     # "unsigned short int"; "long unsigned int" vs "unsigned int").  Same
     # type on x86-64 Linux, different token order — justified.
     "__UINT16_TYPE__"
+    "__UINT_LEAST16_TYPE__"
     "__UINT_FAST32_TYPE__"
+    # "__WCHAR_MAX__", "__WCHAR_MIN__": gcc-16 emits hex ("0x7fffffff") or
+    # symbolic references ("(-__WCHAR_MAX__ - 1)") while lccc emits decimal
+    # ("2147483647", "(-2147483647-1)").  Same value, different spelling —
+    # justified.
+    "__WCHAR_MAX__"
+    "__WCHAR_MIN__"
+    # "__WINT_MAX__": gcc-16 emits hex ("0xffffffffU") while lccc emits
+    # decimal ("4294967295U").  Same value, different base — justified.
+    "__WINT_MAX__"
 )
 
 # Pairs to probe: (target, dialect)
