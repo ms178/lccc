@@ -1062,13 +1062,12 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
                 if infos[k].is_nop() || matches!(infos[k].kind, LineKind::Push { .. }) {
                     continue;
                 }
-                // DIRECTIVE-LAW: a non-CFI directive ends the backward walk (a
-                // `.long`/`.byte` may emit machine code). A qualifying CFI
-                // directive proves the prologue and ends it too; but a code-less
-                // `.cfi_offset`/`.cfi_remember_state` interspersed in the push
-                // chain emits no instructions, so step over it — stopping here
-                // silently disabled never-read DSE for the whole function when
-                // modern output places a `.cfi_offset` after every callee save.
+                // DIRECTIVE-LAW: selecting -- the walk reads each directive's
+                // text to locate the named prologue markers
+                // (cfi_startproc/cfi_def_cfa_offset). Only the code-less
+                // `.cfi_*` family (`.cfi_offset`/`.cfi_remember_state`), proven
+                // by its content prefix below, is stepped over; any other
+                // directive can emit data and ends the backward walk.
                 if matches!(infos[k].kind, LineKind::Directive) {
                     let dl = infos[k].trimmed(store.get(k));
                     if dl.contains("cfi_startproc") || dl.contains("cfi_def_cfa_offset") {
@@ -1147,8 +1146,9 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
         //   * any escape event -> bail for the whole function (a leaked
         //     address may reach any slot via arithmetic or a callee).
         //
-        // Pre-scan for escape events before collecting reads.
-        let mut has_unparseable_indirect = false;
+        // Pre-scan for a raw frame-base escape before collecting reads.
+        let mut has_unparseable_indirect =
+            frame_base_escapes(store, infos, body_start, func_end, rbp_is_frame);
         // Base-tagged frame reads and unbounded-upward "floors" (escaped
         // addresses and SIB array accesses). Base: b'b' = %rbp, b's' = %rsp.
         let mut read_ranges: Vec<(u8, i32, i32)> = Vec::new();
@@ -1174,41 +1174,6 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
         // next label is a branch-only target entered at canonical rsp depth,
         // so the prior block's epilogue delta must not carry into it.
         let mut path_ended = false;
-        for k in body_start..func_end {
-            if infos[k].is_nop() {
-                continue;
-            }
-            let t = infos[k].trimmed(store.get(k));
-            // Only a RAW copy of the frame base value (movq %rsp, %reg with
-            // no memory operand) escapes the ENTIRE frame. A frame memory
-            // operand, plain or SIB, names a specific displacement and is
-            // handled with ranges/floors in the read scan below — the old
-            // text checks matched only "(%rsp)" and treated every SIB form
-            // (`40(%rsp,%r11,4)`) as a raw-base escape, bailing on the
-            // common "frame buffer + scalar home slots" layout (sha, chacha).
-            let frame_mem = parse_frame_mem(t);
-            if frame_mem.is_none() {
-                // Raw %rsp value flowing into a register (movq %rsp, %reg etc.).
-                // Frame adjustments (subq/addq $N,%rsp; pushq/popq) and the
-                // FP prologue mov are not escapes.
-                if t.contains("%rsp") && !is_rsp_shift_line(t) && t != "movq %rsp, %rbp" {
-                    has_unparseable_indirect = true;
-                    break;
-                }
-                // Same for %rbp when it is the frame pointer.
-                if rbp_is_frame
-                    && t.contains("%rbp")
-                    && t != "movq %rsp, %rbp"
-                    && !matches!(
-                        infos[k].kind,
-                        LineKind::Push { reg: REG_RBP } | LineKind::Pop { reg: REG_RBP }
-                    )
-                {
-                    has_unparseable_indirect = true;
-                    break;
-                }
-            }
-        }
 
         for k in body_start..func_end {
             if infos[k].is_nop() {
@@ -1216,111 +1181,13 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
             }
             let t = infos[k].trimmed(store.get(k));
 
-            if infos[k].kind == LineKind::Label {
-                if path_ended {
-                    // Branch-only target: codegen enters it at canonical depth.
-                    rsp_delta = 0;
-                }
-                path_ended = false;
-            } else if infos[k].kind == LineKind::Ret {
-                // Fall-through cannot cross a return; the next label is a
-                // branch target at canonical depth, not a continuation of the
-                // epilogue's shifted state.
-                path_ended = true;
-            } else if infos[k].kind == LineKind::Jmp {
-                if rsp_delta != 0 {
-                    // An unconditional jump while shifted only stays sound if
-                    // the target block performs no frame-slot access (a pure
-                    // shared epilogue of pops/ret). If the block between the
-                    // next label and its terminator names any frame operand,
-                    // its true depth is unknowable here — fail closed.
-                    let mut q = k + 1;
-                    while q < func_end && infos[q].kind != LineKind::Label {
-                        q += 1;
-                    }
-                    while q < func_end
-                        && !matches!(
-                            infos[q].kind,
-                            LineKind::Ret
-                                | LineKind::Jmp
-                                | LineKind::CondJmp
-                                | LineKind::JmpIndirect
-                        )
-                    {
-                        if !infos[q].is_nop()
-                            && parse_frame_mem(infos[q].trimmed(store.get(q))).is_some()
-                        {
-                            has_unparseable_indirect = true;
-                            break;
-                        }
-                        q += 1;
-                    }
-                    if has_unparseable_indirect {
-                        break;
-                    }
-                }
-                path_ended = true;
-            }
-
-            // SOUNDNESS: a fall-through / loop-header label is deliberately NOT
-            // a delta boundary. Real codegen places loop back-edge labels
-            // *inside* a push/pop window (e.g. cmpxchg retry loops:
-            // `pushq %rax; .Lloop: andq (%rsp)…; jne .Lloop; popq`), where
-            // every edge reaching the label shares the shifted depth. Resetting
-            // there mis-attributes operands in the loop and after the matching
-            // pop (a live canonical slot-8 store read post-pop was mapped to
-            // slot 16 and deleted). Only a label after a path-ending ret/jmp
-            // resets (above); a conditional/indirect branch at non-canonical
-            // depth is independently rejected by the terminator bail below.
-
-            // SOUNDNESS: an RSP-shifting instruction (push/pop/subq/addq
-            // on %rsp) changes the effective address of every %rsp-relative
-            // slot after it (offsets are compared verbatim). Historically
-            // ANY non-epilogue shift bailed the whole function, which a
-            // balanced in-body variadic call-arg window
-            // (`pushq …; call; addq $N,%rsp`) triggered even though the
-            // frame returns to canonical depth. The constant `rsp_delta`
-            // now tracks the depth across such regions and the frame
-            // operands below are translated back to canonical offsets
-            // (`canonical_frame_off`), so reads inside the window attribute
-            // correctly while dead canonical-depth stores stay deletable.
-            //
-            // Every codegen shift is a constant, so an unparseable one keeps
-            // the historical rule: accept only a proven epilogue chain (pops
-            // of the pushed region, no frame-slot load can observe it),
-            // otherwise bail. A terminator reached at non-canonical depth
-            // violates the block-entry invariant and also bails.
-            if is_rsp_shift_line(t) {
-                // A push/pop with a *memory* operand (e.g. the variadic idiom
-                // `movq %rax,0(%rsp); pushq 0(%rsp)`) shifts rsp AND reads or
-                // writes a frame slot at the pre-shift depth. The delta step
-                // alone would drop that frame access and let the home store
-                // look dead. Register/immediate pushes (`pushq %rax`,
-                // `pushq $0`) carry no frame operand and are safe. Fail closed
-                // on the memory form rather than reconstruct the exact range.
-                if (t.starts_with("push") || t.starts_with("pop")) && t.contains('(') {
-                    has_unparseable_indirect = true;
-                    break;
-                }
-                match rsp_delta_step(t) {
-                    Some(step) => rsp_delta += step,
-                    None if is_epilogue_rsp_shift(store, infos, k, func_end) => {}
-                    None => {
-                        has_unparseable_indirect = true;
-                        break;
-                    }
-                }
-            }
-            // A body control transfer (conditional/indirect branch) at
-            // non-canonical depth would enter another block below its
-            // canonical rsp, invalidating the verbatim-offset model: codegen
-            // only balances push/pop windows in straight-line code, so this
-            // cannot happen in valid output — fail closed if it does. A
-            // plain `ret`/epilogue tail `jmp` is excluded: frame teardown
-            // legitimately leaves delta non-zero and no frame slot is read
-            // past it (the historical epilogue acceptance below).
-            if rsp_delta != 0 && matches!(infos[k].kind, LineKind::CondJmp | LineKind::JmpIndirect)
-            {
+            // Track the linear rsp depth across balanced push/pop windows and
+            // the path-end label reset, translating frame operands below back
+            // to canonical offsets via `canonical_frame_off`. A `false` return
+            // means this line makes the verbatim-offset model unsafe (memory
+            // form push, unparseable shift, branch at non-canonical depth, …):
+            // leave the whole function unoptimized rather than mis-attribute.
+            if !step_rsp_depth(store, infos, k, func_end, &mut rsp_delta, &mut path_ended) {
                 has_unparseable_indirect = true;
                 break;
             }
@@ -1742,6 +1609,131 @@ fn is_epilogue_rsp_shift(store: &LineStore, infos: &[LineInfo], k: usize, func_e
                 }
                 return false;
             }
+        }
+    }
+    false
+}
+
+/// True if the block an unconditional `jmp` at `k` lands in — the run from the
+/// next label up to that block's terminator — names any frame memory operand.
+/// Only consulted when the jmp is reached at non-canonical rsp depth: if the
+/// target block touches a frame slot, its true entry depth cannot be
+/// reconstructed linearly, so the caller fails closed; a pure pop/ret shared
+/// epilogue names no frame operand and is safe to reset to canonical depth.
+fn shifted_jmp_target_touches_frame(
+    store: &LineStore,
+    infos: &[LineInfo],
+    k: usize,
+    func_end: usize,
+) -> bool {
+    let mut q = k + 1;
+    while q < func_end && infos[q].kind != LineKind::Label {
+        q += 1;
+    }
+    while q < func_end
+        && !matches!(
+            infos[q].kind,
+            LineKind::Ret | LineKind::Jmp | LineKind::CondJmp | LineKind::JmpIndirect
+        )
+    {
+        if !infos[q].is_nop() && parse_frame_mem(infos[q].trimmed(store.get(q))).is_some() {
+            return true;
+        }
+        q += 1;
+    }
+    false
+}
+
+/// Advance the linear rsp-depth model across one body line, updating the
+/// signed `rsp_delta` (bytes rsp sits below its canonical post-prologue value)
+/// and the `path_ended` latch (a `ret`/unconditional `jmp` makes the next
+/// label a branch-only target that re-enters at canonical depth).
+///
+/// Returns `false` when the line makes the verbatim-offset model unsafe and
+/// the whole function must be left unoptimized: a memory-form push/pop (which
+/// shifts rsp and also reads/writes a frame slot), an unparseable
+/// non-epilogue shift, a conditional/indirect branch at non-canonical depth,
+/// or a shifted unconditional jmp whose target block accesses a frame slot.
+/// A fall-through/loop-header label deliberately does not reset the depth:
+/// loop back-edges legitimately target a label inside an open push/pop window.
+fn step_rsp_depth(
+    store: &LineStore,
+    infos: &[LineInfo],
+    k: usize,
+    func_end: usize,
+    rsp_delta: &mut i64,
+    path_ended: &mut bool,
+) -> bool {
+    let t = infos[k].trimmed(store.get(k));
+    if infos[k].kind == LineKind::Label {
+        if *path_ended {
+            *rsp_delta = 0;
+        }
+        *path_ended = false;
+    } else if infos[k].kind == LineKind::Ret {
+        *path_ended = true;
+    } else if infos[k].kind == LineKind::Jmp {
+        if *rsp_delta != 0 && shifted_jmp_target_touches_frame(store, infos, k, func_end) {
+            return false;
+        }
+        *path_ended = true;
+    }
+
+    if is_rsp_shift_line(t) {
+        // A push/pop with a *memory* operand (e.g. the variadic idiom
+        // `movq %rax,0(%rsp); pushq 0(%rsp)`) shifts rsp AND reads or writes a
+        // frame slot at the pre-shift depth; counting only the delta step would
+        // drop that frame access. Register/immediate forms carry no frame
+        // operand and are safe to model as a bare step.
+        if (t.starts_with("push") || t.starts_with("pop")) && t.contains('(') {
+            return false;
+        }
+        match rsp_delta_step(t) {
+            Some(step) => *rsp_delta += step,
+            None if is_epilogue_rsp_shift(store, infos, k, func_end) => {}
+            None => return false,
+        }
+    }
+    if *rsp_delta != 0 && matches!(infos[k].kind, LineKind::CondJmp | LineKind::JmpIndirect) {
+        return false;
+    }
+    true
+}
+
+/// Pre-scan for a raw frame-base escape: a line with no frame memory operand
+/// that copies the frame base into another register (`movq %rsp,%reg`, or
+/// `%rbp` when it is the frame pointer). A leaked base may reach any frame
+/// slot through arithmetic or a callee, so a hit bails the whole function.
+/// Frame memory operands (plain or SIB) name a specific displacement and are
+/// handled with ranges/floors by the read scan instead; frame adjustments and
+/// the FP prologue `movq %rsp,%rbp` are not escapes.
+fn frame_base_escapes(
+    store: &LineStore,
+    infos: &[LineInfo],
+    body_start: usize,
+    func_end: usize,
+    rbp_is_frame: bool,
+) -> bool {
+    for k in body_start..func_end {
+        if infos[k].is_nop() {
+            continue;
+        }
+        let t = infos[k].trimmed(store.get(k));
+        if parse_frame_mem(t).is_some() {
+            continue;
+        }
+        if t.contains("%rsp") && !is_rsp_shift_line(t) && t != "movq %rsp, %rbp" {
+            return true;
+        }
+        if rbp_is_frame
+            && t.contains("%rbp")
+            && t != "movq %rsp, %rbp"
+            && !matches!(
+                infos[k].kind,
+                LineKind::Push { reg: REG_RBP } | LineKind::Pop { reg: REG_RBP }
+            )
+        {
+            return true;
         }
     }
     false
