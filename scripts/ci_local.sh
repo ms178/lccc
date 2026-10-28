@@ -791,6 +791,9 @@ gate "c23-compatibility-inventory" fast \
 gate "warning-compatibility" fast \
     python3 tests/regression/check_warning_compat.py \
         --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"
+gate "warning-precedence" fast \
+    python3 tests/regression/check_warning_precedence.py \
+        --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"
 gate "attribute-diagnostics" fast \
     env GCC="${GCC16:-gcc-16}" python3 tests/regression/check_attribute_diagnostics.py
 gate "dwarf-line-tables" fast \
