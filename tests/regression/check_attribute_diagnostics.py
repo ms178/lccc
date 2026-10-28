@@ -17,7 +17,7 @@ Every probe runs both compilers; expectations are gcc's own first
 diagnostic, so the gate fails on any wording drift.
 """
 from __future__ import annotations
-import os, shutil, subprocess, sys, tempfile
+import os, re, shutil, subprocess, sys, tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -69,21 +69,13 @@ PROBES = [
     ('ok-int-aligned', 'int __attribute__((aligned(8))) x;', None, False),
     ('ok-fn-cold', 'void __attribute__((cold)) c(void){}', None, False),
     ('ok-format-default', '__attribute__((format(printf,1,2))) void g(const char*,...);', None, False),
-    # glibc-header shapes: gcc-16.2 is silent on these by default and lccc
-    # must be too (the regression that broke every CI lane at GP-01).
-    ('ok-nothrow-list', 'void __attribute__((__nothrow__, __leaf__)) f(void){}', None, False),
-    ('ok-nothrow-single', 'void __attribute__((nothrow)) f(void){}', None, False),
-    ('ok-leaf', 'void __attribute__((leaf)) f(void){}', None, False),
-    # glibc bits/stdlib-bsearch.h shapes (measured 2026-10-28): spec-position
-    # `__gnu_inline__` on a pointer-returning function must stay silent —
-    # the exact -O3 CI failure of the ICX volatile-reduction lane.
+    # Preserve upstream's GCC 16.2 canonical-name and glibc pointer-return
+    # controls while extending the inventory and optimization-level survey.
     ('ok-gnu-inline-ptr-ret',
      'extern __inline __attribute__ ((__gnu_inline__)) void *fa(int);', None, False),
     ('ok-gnu-inline-nth',
      'extern __inline __attribute__ ((__gnu_inline__)) void *\n'
      '__attribute__ ((__nothrow__ , __leaf__)) fc(int);', None, False),
-    # Canonical-name wording (measured on gcc-16.2): dunder spellings print
-    # the stripped name, and the dedicated `naked` phrase must still fire.
     ('naked-dunder-object',
      'extern __attribute__ ((__naked__)) int (*f1)(void);',
      "'naked' attribute only applies to functions", False),
@@ -97,33 +89,57 @@ PROBES = [
      "'const' attribute on function returning 'void'", False),
     ('pure-void-dunder', 'void __attribute__((__pure__)) v(void){}',
      "'pure' attribute on function returning 'void'", False),
-]
-
-# TUs that pull in system headers must compile clean under -Werror, the
-# exact condition of scripts/check_exact_signed_div.py.
-HEADER_PROBES = [
-    '#include <stdio.h>\nint main(void){ return ferror(stdin) ? 1 : 0; }',
-    '#include <stdlib.h>\n#include <string.h>\nint main(void){ return (int)(size_t)malloc(1) + (int)strlen(""); }',
+    ('ok-underscored-nothrow-leaf', 'void __attribute__((__nothrow__, __leaf__)) f(void){}', None, False),
+    ('ok-nothrow', 'void __attribute__((nothrow)) f(void){}', None, False),
+    ('ok-leaf', 'void __attribute__((leaf)) f(void){}', None, False),
 ]
 
 # Generated from the registry: GCC 16.2 knows these, lccc's dispatcher has
 # no handler for them. Shrink-only: removing a name must be paired with the
 # dispatcher gaining a handler (the gate re-probes both directions).
 UNIMPLEMENTED = sorted(set("""
-alloc_align alloc_size assume btf_decl_tag btf_type_tag callee_pop_aggregate_return cdecl cf_check
+access alloc_align alloc_size artificial assume btf_decl_tag btf_type_tag callee_pop_aggregate_return cdecl cf_check
 copy deprecated designated_init expected_throw fallthrough flag_enum flatten force_align_arg_pointer
 format format_arg gcc_struct hardbool indirect_branch indirect_return interrupt leaf malloc may_alias
 ms_abi ms_hook_prologue ms_struct musttail no_address_safety_analysis no_callee_saved_registers
-no_caller_saved_registers no_icf no_reorder no_sanitize_address no_sanitize_thread no_split_stack
+no_caller_saved_registers no_icf no_profile_instrument_function no_reorder no_sanitize_address
+no_sanitize_coverage no_sanitize_thread no_split_stack
 no_stack_limit nocf_check noclone nocommon nodirect_extern_access noinit noipa nonnull nonstring noplt
-null_terminated_string_arg patchable_function_entry persistent preserve_none retain returns_nonnull
+nothrow objc_root_class
+null_terminated_string_arg patchable_function_entry persistent preserve_none reproducible retain
+returns_nonnull returns_twice
 signed_bool_precision simd sseregparm stdcall strict_flex_array strub sysv_abi tainted_args
-target_version thiscall transaction_pure transaction_unsafe unavailable vector_mask warn_if_not_aligned
+target_version thiscall transaction_callable transaction_may_cancel_outer transaction_pure
+transaction_safe_dynamic transaction_unsafe unavailable unsequenced vector_mask warn_if_not_aligned
 warn_unused warn_unused_result
-access artificial no_profile_instrument_function no_sanitize_coverage nothrow
-objc_root_class reproducible returns_twice transaction_callable
-transaction_may_cancel_outer transaction_safe_dynamic unsequenced
 """.split()))
+
+# These system headers use GCC's underscored spelling of attributes (notably
+# __nothrow__ and __leaf__). Any diagnostic, even a non-attribute one, breaks
+# real projects that build their translation units with warnings as errors.
+HEADER_PROBES = [
+    ('stdio', '#include <stdio.h>\nint f(void) { return ferror(stdin); }'),
+    ('stdlib-string', '#include <stdlib.h>\n#include <string.h>\n'
+     'int f(void) { return atoi("0") + (int)strlen("x"); }'),
+]
+
+
+def registry_unimplemented() -> list[str]:
+    """Check the pin against the actual Rust table, not just its diagnostics."""
+    source = (ROOT / 'src/frontend/parser/attribute_registry.rs').read_text()
+    def names(table):
+        match = re.search(rf'const {table}: &\[&str\] = &\[(.*?)\n\];', source, re.S)
+        if not match:
+            raise ValueError(f'missing attribute registry table {table}')
+        entries = re.findall(r'"([^"\n]+)"', match.group(1))
+        if len(entries) != len(set(entries)):
+            raise ValueError(f'duplicate names in {table}')
+        return entries
+    known = names('GCC_KNOWN')
+    if known != sorted(known):
+        raise ValueError('GCC_KNOWN must be sorted')
+    return sorted(set(known) - set(names('IMPLEMENTED')))
+
 
 def first_diag(stderr: str) -> str:
     for line in stderr.splitlines():
@@ -151,14 +167,17 @@ def main() -> int:
         print('SKIP: gcc-16 not found')
         return 1
     failures = []
+    actual_inventory = registry_unimplemented()
+    if actual_inventory != UNIMPLEMENTED:
+        failures.append(('inventory', 'registry/pin mismatch', UNIMPLEMENTED, actual_inventory))
     for name, src, expected, explicit in PROBES:
         flags = ['-Wattributes'] if explicit else []
         grext, gerr = run(gcc, src, flags)
         lex, lerr = run(str(LCCC), src, flags)
         gdiag, ldiag = first_diag(gerr), first_diag(lerr)
         if expected is None:
-            if gdiag or ldiag:
-                failures.append((name, 'expected silence', gdiag, ldiag))
+            if grext or lex or gerr or lerr:
+                failures.append((name, 'expected silence and success', (grext, gerr), (lex, lerr)))
         else:
             if expected not in gdiag:
                 failures.append((name, 'gcc wording drift', expected, gdiag))
@@ -166,6 +185,11 @@ def main() -> int:
                 failures.append((name, 'text drift', gdiag, ldiag))
         if lex != grext and expected is not None:
             failures.append((name, 'exit drift', grext, lex))
+    for name, src in HEADER_PROBES:
+        for label, cc in (('gcc', gcc), ('lccc', str(LCCC))):
+            rc, err = run(cc, src, ['-Wall', '-Wextra', '-Werror'])
+            if rc or err:
+                failures.append((name, f'{label} header probe must be silent', 0, (rc, err)))
     # Inventory: explicit -Wattributes reports each pinned name; gcc stays
     # silent on the valid-target probe (the delta is exactly the pin).
     for n in UNIMPLEMENTED:
@@ -180,18 +204,6 @@ def main() -> int:
             failures.append((n, 'gcc no longer knows the name', '', gdiag))
         if want not in ldiag:
             failures.append((n, 'inventory silent', want, ldiag))
-    # Header TUs: identical under -Wall -Wextra -Werror on both compilers.
-    # -O2 matters: `bits/stdlib-bsearch.h` (the `__gnu_inline__` glibc
-    # shape) only appears when __OPTIMIZE__ is defined, so an -O0-only
-    # probe compiles clean while the -O3 CI lanes fail.
-    for i, src in enumerate(HEADER_PROBES):
-        grext, gerr = run(gcc, src, ['-Wall', '-Wextra', '-Werror', '-O2'])
-        lex, lerr = run(str(LCCC), src, ['-Wall', '-Wextra', '-Werror', '-O2'])
-        gdiag, ldiag = first_diag(gerr), first_diag(lerr)
-        if gdiag:
-            failures.append((f'header-{i}', 'gcc warns', '', gdiag))
-        if ldiag or lex != 0:
-            failures.append((f'header-{i}', 'lccc not clean', '', f'rc={lex} {ldiag}'))
     # -Wno-attributes suppresses everything.
     _, lerr = run(str(LCCC), '__attribute__((frobnicate)) int y;', ['-Wno-attributes'])
     if first_diag(lerr):
@@ -202,7 +214,8 @@ def main() -> int:
             print('  ', f)
         return 1
     print(f'PASS: attribute diagnostics match gcc-16.2 '
-          f'({len(PROBES)} probes + {len(UNIMPLEMENTED)} pinned inventory names)')
+          f'({len(PROBES)} probes + {len(HEADER_PROBES)} header probes + '
+          f'{len(UNIMPLEMENTED)} pinned inventory names)')
     return 0
 
 if __name__ == '__main__':

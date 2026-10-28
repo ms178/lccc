@@ -177,6 +177,9 @@ const GCC_KNOWN: &[&str] = &[
 
 /// Names the dispatcher applies (the `match` in `parse.rs`, normalized).
 /// Anything in [`GCC_KNOWN`] outside this list is [`AttributeClass::Unimplemented`].
+/// Four implemented Clang extensions (`address_space`, `diagnose_as`,
+/// `diagnose_as_builtin`, `ext_vector_type`) are intentionally not GCC-known;
+/// classification checks this list first so lccc still accepts them.
 const IMPLEMENTED: &[&str] = &[
     "address_space",
     "aligned",
