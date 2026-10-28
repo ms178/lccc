@@ -1469,6 +1469,24 @@ fn update_facts(t: &str, facts: &mut ExtFacts<'_>) {
         update_facts_for_cmov(t, facts);
         return;
     }
+    // 64-bit masked AND with a nonnegative imm32 mask bounds the RESULT width
+    // independently of the source (`x & m <= m`): a byte mask proves a byte
+    // value, a word mask a 16-bit value, any other in-range mask at least a
+    // zero upper half. The sign-extension boundary (m < 0x8000_0000) is
+    // enforced inside the shared predicate, matching GAS's imm32 encoding.
+    // This lets a following re-extension or 32-bit copy into a 64-bit reader
+    // fold (the revvarint `movzbl; andq $127; movl ...; orq` shape).
+    if op == "andq" {
+        if let DstKind::Reg(df) = classify_dst(t) {
+            if let Some(width) = super::relay_and_lea::andq_imm_narrow_width(t, df) {
+                facts.set_zero_extended(df, width, ext16_enabled());
+                return;
+            }
+        }
+        // An unrecognised andq (register mask, odd text) must not keep any
+        // stale fact about its destination; the catch-all below clears it.
+    }
+
     // Any other 32-bit ALU write (addl, subl, andl, orl, leal, imull, shifts)
     // zero-extends to 64 bits on x86-64, so the destination family is
     // upper-32-zero (but not byte/16-bit-known).  Without this, an
@@ -2510,5 +2528,51 @@ mod tests {
             "    ret\n",
         ));
         assert!(out.contains("movzbl %al, %eax"), "asm was:\n{out}");
+    }
+
+    // ── masked 64-bit AND establishes narrow facts (PERF-5 residue) ───────
+
+    #[test]
+    fn andq_mask_establishes_width_facts_in_the_ledger() {
+        // r10 is GP family 10. Vectors: [upper32, byte, is16, sext32, sext8,
+        // sext16]. A byte/word mask must establish the matching zero-extended
+        // width fact without inventing any sign-extension fact.
+        let f = ledger_after("andq $127, %r10", false);
+        assert!(f[0][10], "upper32 zero: {f:?}");
+        assert!(f[1][10], "byte-width value: {f:?}");
+        assert!(f[2][10], "16-bit-width value: {f:?}");
+        assert!(!f[3][10] && !f[4][10] && !f[5][10], "no sext fact: {f:?}");
+
+        let f = ledger_after("andq $65535, %r10", false);
+        assert!(f[0][10] && !f[1][10] && f[2][10], "word mask: {f:?}");
+
+        let f = ledger_after("andq $1048575, %r10", false);
+        assert!(f[0][10] && !f[1][10] && !f[2][10], "dword mask: {f:?}");
+    }
+
+    #[test]
+    fn andq_sign_extended_mask_establishes_no_narrow_fact() {
+        // The imm32 sign-extension boundary: $0x8000_0000 keeps the source's
+        // upper half, so no width fact may be established. Starting the ledger
+        // believing everything proves the old facts are actually cleared.
+        let f = ledger_after("andq $2147483648, %r10", true);
+        assert!(!f[0][10] && !f[1][10] && !f[2][10], "negative imm32: {f:?}");
+        let f = ledger_after("andq %rax, %r10", true);
+        assert!(!f[0][10] && !f[1][10], "register mask: {f:?}");
+    }
+
+    #[test]
+    fn andq_byte_fact_removes_a_following_byte_re_extension() {
+        // The byte-mask fact makes the second movzbl a provable no-op, the
+        // same way a byte load would.
+        let out = run(concat!(
+            "foo:\n",
+            "    movzbl (%rdi), %r10d\n",
+            "    andq $127, %r10\n",
+            "    movzbl %r10b, %r10d\n",
+            "    movl %r10d, %eax\n",
+            "    ret\n",
+        ));
+        assert!(!out.contains("movzbl %r10b, %r10d"), "asm was:\n{out}");
     }
 }
