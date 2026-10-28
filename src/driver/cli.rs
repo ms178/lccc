@@ -37,8 +37,10 @@
 //! | everything else unimplemented — `-f*`, `-m*`, `--*`, `-W<name>`, `-Werror=<name>`, `--param`, GNU-accepted `-g` selectors, presentation namespaces (`-fdiagnostics-*`, `-fmessage-length=`, `-fmax-errors=`, `-f*prefix-map=`, `-fverbose-asm`) | **warning naming the option**, once per compilation; `LCCC_STRICT_OPTIONS=1` makes it fatal |
 //!
 //! The last row is the one that needs defending, and the defence is the
-//! measurement, not taste.  LCCC implements six warning names out of the 409
-//! GNU exposes (`gcc -Q --help=warnings`, measured) and has no parameter,
+//! measurement, not taste.  LCCC implements sixteen warning names out of the
+//! 549 GNU exposes (`gcc -Q --help=warnings`, measured; the table is
+//! `WARNING_REGISTRY` in `src/common/error.rs` — spelling, groups and default
+//! severity all derive from it) and has no parameter,
 //! debug-selector, optimisation or long-option table at all, so for those
 //! namespaces it cannot tell a typo from a spelling a newer GNU added.  The
 //! consequence of ignoring a request in this row is an optimisation, warning,

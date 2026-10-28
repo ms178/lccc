@@ -1123,6 +1123,30 @@ impl Driver {
                     )?;
                 }
 
+                // Report `#warning`-class diagnostics on stderr with the
+                // source excerpt, exactly as the compile paths do (gcc
+                // 16.2's `-E` prints the warning block the same way while
+                // its preprocessed text still streams to stdout —
+                // measured). -Werror promotion fails the run just like a
+                // syntax check.
+                if !preprocessor.warnings().is_empty() {
+                    let mut source_manager = SourceManager::new();
+                    source_manager.add_file(filename.to_string(), source.clone());
+                    source_manager.build_line_map();
+                    let mut diagnostics = DiagnosticEngine::new();
+                    diagnostics.set_warning_config(self.effective_warning_config());
+                    diagnostics.set_color_mode(self.color_mode);
+                    diagnostics.set_source_manager(source_manager);
+                    self.emit_preprocessor_warnings(&preprocessor, &mut diagnostics);
+                    if diagnostics.has_errors() {
+                        return Err(format!(
+                            "{} preprocessor warning(s) promoted by -Werror in {}",
+                            diagnostics.error_count(),
+                            filename
+                        ));
+                    }
+                }
+
                 // Check for preprocessor errors (missing includes, #error,
                 // etc.) AFTER emitting output so the result is still available
                 // for downstream tools that ignore the exit code.
@@ -1160,6 +1184,26 @@ impl Driver {
     /// flag used to be silently dropped by the unknown-argument handler,
     /// so `printf '#include <stdio.h>\n' | lccc -x c - -fsyntax-only`
     /// compiled AND LINKED the stdin TU and failed on the missing `main`.
+    /// Emit collected preprocessor diagnostics (`#warning` and friends)
+    /// through `diagnostics` with the [`crate::common::error::WarningKind::Cpp`]
+    /// kind, so `-Wcpp`/`-Wno-cpp`/`-Werror=cpp` control them exactly as
+    /// GCC does. Shared by every path that preprocesses without going
+    /// through `parse_and_analyze_c_tu`, which has the same drain inline.
+    fn emit_preprocessor_warnings(
+        &self,
+        preprocessor: &Preprocessor,
+        diagnostics: &mut DiagnosticEngine,
+    ) {
+        for warn in preprocessor.warnings() {
+            let diag = crate::common::error::Diagnostic::warning_with_kind(
+                warn.message.clone(),
+                crate::common::error::WarningKind::Cpp,
+            )
+            .with_location(&warn.file, warn.line, warn.col);
+            diagnostics.emit(&diag);
+        }
+    }
+
     fn run_syntax_only(&self) -> Result<(), String> {
         for input_file in &self.input_files {
             if Self::is_object_or_archive(input_file) {
@@ -1221,6 +1265,13 @@ impl Driver {
             diagnostics.set_warning_config(self.effective_warning_config());
             diagnostics.set_color_mode(self.color_mode);
             diagnostics.set_source_manager(source_manager);
+            // Drain preprocessor warnings through the engine with the Cpp
+            // kind — the full compile path does this, and without it
+            // `-fsyntax-only` dropped `#warning` entirely (measured against
+            // gcc-16.2, which reports it in every mode, `-fsyntax-only`
+            // included; `-Wcpp`/`-Wno-cpp`/`-Werror=cpp` control it here
+            // for the same reason they do there).
+            self.emit_preprocessor_warnings(&preprocessor, &mut diagnostics);
             for (msg, span) in lexer_diags {
                 diagnostics.error(msg, span);
             }

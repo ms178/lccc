@@ -135,6 +135,23 @@ pub enum WarningKind {
     /// measured; `_Bool` and enumeration targets never warn).
     /// GCC flag: -Wpointer-to-int-cast
     PointerToIntCast,
+    /// An integer was cast to a pointer type whose object size differs from
+    /// the integer's (measured against GCC 16.2: default-on in every
+    /// dialect, never a dialect default error; `_Bool` and enumeration
+    /// sources never warn, and integer constant expressions are folded
+    /// silently — `(void *)42` is silent while `(void *)i32` warns, and
+    /// the exemption is the constant-ness: `const int cj = 5; (void *)cj`
+    /// warns).
+    /// GCC flag: -Wint-to-pointer-cast
+    IntToPointerCast,
+    /// `==`/`!=`/ordering between pointers to distinct pointee types
+    /// (measured against GCC 16.2: default-on in every dialect, never a
+    /// dialect default error; `void *` absorbs the other side at the
+    /// OUTERMOST level only, and signed/unsigned or enum-versus-int
+    /// pointees ARE distinct here even where the argument-passing rules
+    /// call them compatible).
+    /// GCC flag: -Wcompare-distinct-pointer-types
+    CompareDistinctPointerTypes,
 }
 
 /// Supported warning groups. `-Wall` and `-Wextra` are broad groups;
@@ -303,6 +320,22 @@ pub const WARNING_REGISTRY: &[WarningDescriptor] = &[
         false,
         "pointer-to-integer cast of a different width"
     ),
+    warning!(
+        IntToPointerCast,
+        "int-to-pointer-cast",
+        true,
+        [],
+        false,
+        "integer-to-pointer cast of a different width"
+    ),
+    warning!(
+        CompareDistinctPointerTypes,
+        "compare-distinct-pointer-types",
+        true,
+        [],
+        false,
+        "comparison of pointers with distinct pointee types"
+    ),
 ];
 
 impl WarningKind {
@@ -316,6 +349,18 @@ impl WarningKind {
     /// The GCC-compatible flag name (without the -W prefix).
     pub fn flag_name(self) -> &'static str {
         self.descriptor().name
+    }
+
+    /// How GCC labels this warning inside `[-W…]` / `[-Werror=…]`
+    /// diagnostics. `-Wformat` is the one leveled option and GCC prints it
+    /// with the trailing `=` (`[-Wformat=]`, `[-Werror=format=]`,
+    /// measured on gcc-16.2); every other kind's label equals its flag
+    /// name.
+    pub fn flag_suffix(self) -> &'static str {
+        match self {
+            WarningKind::Format => "format=",
+            other => other.flag_name(),
+        }
     }
 
     /// Parse a *leaf* warning name. `implicit` is a group, not an alias for
@@ -518,6 +563,10 @@ impl WarningConfig {
                 } else if let Some(group) = WarningGroup::from_flag_name(name) {
                     self.set_group_werror(group);
                     true
+                } else if let Some((base, level)) = name.split_once('=') {
+                    // `-Werror=format=0` (measured): level 0 disables the
+                    // warning entirely, promotion or not.
+                    self.apply_level(base, level, true)
                 } else {
                     false
                 }
@@ -552,11 +601,53 @@ impl WarningConfig {
                 } else if let Some(group) = WarningGroup::from_flag_name(flag) {
                     self.select_group(group, true);
                     true
+                } else if let Some((base, level)) = flag.split_once('=') {
+                    // `-W<name>=<level>`: only leveled warnings accept
+                    // levels. Measured on gcc-16.2: `-Wformat=0|1|2` are
+                    // recognized (2 = the -Wformat family, of which LCCC
+                    // implements -Wformat-security); every other
+                    // `-W<name>=N` is a driver error there, and false lets
+                    // the tolerated-option diagnostic stand in.
+                    if !level.is_empty() && level.bytes().all(|b| b.is_ascii_digit()) {
+                        self.apply_level(base, level, false)
+                    } else {
+                        false
+                    }
                 } else {
                     false
                 }
             }
         }
+    }
+
+    /// Apply a numeric level to a leveled warning: GCC 16.2 accepts levels
+    /// only for `-Wformat` (measured — `=0` disables, `=1` enables, `=2`
+    /// enables the -Wformat family, of which LCCC implements the core
+    /// warning and -Wformat-security). `promote` marks the
+    /// `-Werror=<name>=<level>` spelling, where `>=1` also promotes.
+    /// Returns false for anything GCC would not recognize here.
+    fn apply_level(&mut self, base: &str, level: &str, promote: bool) -> bool {
+        let Some(kind) = WarningKind::from_flag_name(base) else {
+            return false;
+        };
+        if kind != WarningKind::Format || !matches!(level, "0" | "1" | "2") {
+            return false;
+        }
+        match level {
+            // Measured: `-Werror -Wformat=0` and `-Werror=format=0` are
+            // both completely silent, so =0 is a full disable.
+            "0" => self.disable(kind),
+            _ => {
+                self.enable(kind);
+                if level == "2" {
+                    self.enable(WarningKind::FormatSecurity);
+                }
+                if promote {
+                    self.set_werror(kind);
+                }
+            }
+        }
+        true
     }
 }
 
@@ -881,12 +972,12 @@ impl DiagnosticEngine {
                         let suffix = if self.warning_config.default_errors.contains(&kind) {
                             // Default-severity error (dialect promotion):
                             // GCC prints the plain flag label (measured).
-                            format!("[-W{}]", kind.flag_name())
+                            format!("[-W{}]", kind.flag_suffix())
                         } else {
                             // Explicit -Werror=<name> or global -Werror
                             // promoting a live warning: GCC prints the
                             // -Werror= label (measured).
-                            format!("[-Werror={}]", kind.flag_name())
+                            format!("[-Werror={}]", kind.flag_suffix())
                         };
                         let promoted = Diagnostic {
                             severity: Severity::Error,
@@ -904,7 +995,7 @@ impl DiagnosticEngine {
                     // Render as warning with [-W<name>] suffix
                     let annotated = Diagnostic {
                         severity: Severity::Warning,
-                        message: format!("{} [-W{}]", diag.message, kind.flag_name()),
+                        message: format!("{} [-W{}]", diag.message, kind.flag_suffix()),
                         span: diag.span,
                         warning_kind: diag.warning_kind,
                         notes: diag.notes.clone(),
@@ -1419,6 +1510,8 @@ mod dialect_severity_redteam_tests {
             WarningKind::ReturnMismatch,
             WarningKind::IntConversion,
             WarningKind::PointerToIntCast,
+            WarningKind::IntToPointerCast,
+            WarningKind::CompareDistinctPointerTypes,
         ];
         let registered: HashSet<_> = WARNING_REGISTRY.iter().map(|entry| entry.kind).collect();
         let names: HashSet<_> = WARNING_REGISTRY.iter().map(|entry| entry.name).collect();
@@ -1487,5 +1580,160 @@ mod dialect_severity_redteam_tests {
         assert!(config.is_enabled(WarningKind::IntConversion));
         assert!(!config.is_enabled(WarningKind::ImplicitInt));
         assert!(!config.bare_return_enabled);
+    }
+
+    /// The measured membership cells that the command-line gate re-verifies
+    /// against GCC 16.2, stated against the registry as it stands.
+    #[test]
+    fn registry_matches_the_measured_gcc162_cells() {
+        // Defaults: every enabled-by-default kind except the
+        // compatibility-only `undeclared` switch.
+        let mut default_on: Vec<&str> = WARNING_REGISTRY
+            .iter()
+            .filter(|entry| entry.default_on)
+            .map(|entry| entry.name)
+            .collect();
+        default_on.sort_unstable();
+        let mut expected_defaults = [
+            "implicit-function-declaration",
+            "cpp",
+            "incompatible-pointer-types",
+            "attributes",
+            "implicit-int",
+            "return-mismatch",
+            "int-conversion",
+            "pointer-to-int-cast",
+            "int-to-pointer-cast",
+            "compare-distinct-pointer-types",
+            "undeclared",
+        ];
+        expected_defaults.sort_unstable();
+        assert_eq!(default_on, expected_defaults);
+        // Exactly the measured five dialect default errors from C99 on.
+        let mut c99: Vec<&str> = WARNING_REGISTRY
+            .iter()
+            .filter(|entry| entry.c99_default_error)
+            .map(|entry| entry.name)
+            .collect();
+        c99.sort_unstable();
+        assert_eq!(
+            c99,
+            [
+                "implicit-function-declaration",
+                "implicit-int",
+                "incompatible-pointer-types",
+                "int-conversion",
+                "return-mismatch",
+            ]
+        );
+        // Group membership is only observable for default-off warnings
+        // (a group never re-enables a `-Wno-`'d warning, measured), and
+        // these are exactly the members that turn them on.
+        let wall: Vec<&str> = WARNING_REGISTRY
+            .iter()
+            .filter(|entry| !entry.default_on && entry.groups.contains(&WarningGroup::All))
+            .map(|entry| entry.name)
+            .collect();
+        assert_eq!(wall, ["return-type", "unused-variable", "format"]);
+        let wextra: Vec<&str> = WARNING_REGISTRY
+            .iter()
+            .filter(|entry| !entry.default_on && entry.groups.contains(&WarningGroup::Extra))
+            .map(|entry| entry.name)
+            .collect();
+        assert_eq!(wextra, ["sign-compare"]);
+        assert!(
+            !WARNING_REGISTRY
+                .iter()
+                .any(|entry| entry.groups.contains(&WarningGroup::Pedantic))
+        );
+        // Diagnostic labels: `-Wformat` prints with a trailing `=`.
+        for entry in WARNING_REGISTRY {
+            let suffix = entry.kind.flag_suffix();
+            assert_eq!(
+                suffix,
+                if entry.kind == WarningKind::Format {
+                    "format="
+                } else {
+                    entry.name
+                },
+                "{} label",
+                entry.name
+            );
+        }
+    }
+
+    /// GCC 16.2 (measured): a group flag never re-enables a warning an
+    /// explicit `-Wno-<name>` turned off, in either order, while a
+    /// positive `-W<name>` or `-Werror=<name>` does.
+    #[test]
+    fn group_flags_never_reenable_an_explicit_disable() {
+        for group_first in [true, false] {
+            for kind in [WarningKind::UnusedVariable, WarningKind::SignCompare] {
+                let mut config = WarningConfig::new();
+                let apply_group = |config: &mut WarningConfig, kind: WarningKind| {
+                    if kind == WarningKind::UnusedVariable {
+                        config.enable_wall();
+                    } else {
+                        config.enable_wextra();
+                    }
+                };
+                if group_first {
+                    apply_group(&mut config, kind);
+                    config.disable(kind);
+                } else {
+                    config.disable(kind);
+                    apply_group(&mut config, kind);
+                }
+                assert!(
+                    !config.is_enabled(kind),
+                    "{kind:?} group_first={group_first}"
+                );
+            }
+            // The same rule for a default-on kind and -Wall.
+            let mut config = WarningConfig::new();
+            if group_first {
+                config.enable_wall();
+                config.disable(WarningKind::ReturnType);
+            } else {
+                config.disable(WarningKind::ReturnType);
+                config.enable_wall();
+            }
+            assert!(!config.is_enabled(WarningKind::ReturnType));
+        }
+        // The positive forms win over the disable.
+        let mut config = WarningConfig::new();
+        config.disable(WarningKind::ReturnType);
+        config.enable(WarningKind::ReturnType);
+        assert!(config.is_enabled(WarningKind::ReturnType));
+        let mut config = WarningConfig::new();
+        config.disable(WarningKind::Format);
+        config.set_werror(WarningKind::Format);
+        assert!(config.is_enabled(WarningKind::Format));
+        assert!(config.is_error(WarningKind::Format));
+    }
+
+    /// `-Wformat=0|1|2` are the only level spellings GCC 16.2 accepts
+    /// (measured; every other `-W<name>=N` is a driver error there, which
+    /// LCCC answers with its tolerated-option diagnostic via `false`).
+    #[test]
+    fn format_levels_follow_gcc() {
+        let mut config = WarningConfig::new();
+        assert!(config.process_flag("format=0"));
+        assert!(!config.is_enabled(WarningKind::Format));
+        config.werror_all = true;
+        assert!(!config.is_enabled(WarningKind::Format));
+        let mut config = WarningConfig::new();
+        assert!(config.process_flag("format=1"));
+        assert!(config.is_enabled(WarningKind::Format));
+        assert!(!config.is_enabled(WarningKind::FormatSecurity));
+        let mut config = WarningConfig::new();
+        assert!(config.process_flag("format=2"));
+        assert!(config.is_enabled(WarningKind::Format));
+        assert!(config.is_enabled(WarningKind::FormatSecurity));
+        assert!(!config.process_flag("sign-compare=1"));
+        // `-Werror=format=0` disables outright (measured).
+        let mut config = WarningConfig::new();
+        assert!(config.process_flag("error=format=0"));
+        assert!(!config.is_enabled(WarningKind::Format));
     }
 }
