@@ -155,6 +155,17 @@ readonly SPELLING_ALLOWLIST=(
     # "__WINT_MAX__": gcc-16 emits hex ("0xffffffffU") while lccc emits
     # decimal ("4294967295U").  Same value, different base — justified.
     "__WINT_MAX__"
+    # "__WCHAR_TYPE__": gcc-16 emits "long int" on i686 while lccc emits
+    # "int".  Both are 32-bit on ILP32 — same type size, different spelling —
+    # justified.
+    "__WCHAR_TYPE__"
+    # "__FLT_EVAL_METHOD__", "__FLT_EVAL_METHOD_TS_18661_3__": gcc-16 emits 2
+    # (x87 extended-precision evaluation) on i686 while lccc emits 0
+    # (evaluate per expression type / SSE semantics).  Intentional design
+    # choice — lccc uses declared FP precision, not x87 cache semantics —
+    # justified.
+    "__FLT_EVAL_METHOD__"
+    "__FLT_EVAL_METHOD_TS_18661_3__"
 )
 
 # Pairs to probe: (target, dialect)
