@@ -1780,20 +1780,22 @@ impl Parser {
                         }
                     }
                     _ => {
-                        // C23 attributes in the implementation namespace: GCC
-                        // accepts the ones it knows silently and reports the
-                        // rest as "'x' attribute ignored" (measured 2026-10-27:
-                        // `int q [[frobnicate]];` warns, `[[maybe_unused]]`
-                        // does not). One phrasing covers both "not a GCC
-                        // attribute" and "GCC attribute we do not implement",
-                        // which is what GCC itself prints for the first case.
-                        if !crate::frontend::parser::attr_registry::accepted_silently(&attr_name) {
+                        // C23 attributes in the implementation namespace use
+                        // the registry's three classes, with the C23 wording
+                        // measured on gcc-16.2.0 (2026-10-27): a name no GCC
+                        // attribute registry entry matches is reported as
+                        // `'x' attribute ignored` (`int q [[frobnicate]];`),
+                        // while a registry name is silent by default -- the
+                        // same funnel `__attribute__((...))` goes through, so
+                        // there is exactly one classification in the compiler.
+                        use crate::frontend::parser::attribute_registry as registry;
+                        if matches!(
+                            registry::classify(&attr_name),
+                            registry::AttributeClass::Unknown
+                        ) {
                             let span = self.peek_span();
                             self.diagnostics.warning_with_kind(
-                                format!(
-                                    "'{}' attribute ignored",
-                                    crate::frontend::parser::attr_registry::normalize(&attr_name)
-                                ),
+                                format!("'{}' attribute ignored", registry::canonical(&attr_name)),
                                 span,
                                 crate::common::error::WarningKind::Attributes,
                             );
@@ -2486,31 +2488,33 @@ impl Parser {
                 self.parse_address_space_attr();
             }
             _ => {
-                // Unknown to the dispatcher. Three cases, exactly as GCC 16.2
-                // distinguishes them (measured 2026-10-27):
-                //   * a GCC attribute whose semantics we do not implement ->
-                //     `'x' attribute ignored` (GCC implements it silently;
-                //     silence here would hide an ABI/codegen divergence)
-                //   * a GCC attribute with only diagnostic/optimisation effect
-                //     -> accepted silently, like GCC
+                // Reachable only through the C23 spelling `[[gnu::name]]`,
+                // which dispatches here directly instead of passing the
+                // `__attribute__((...))` classification funnel. Answer with
+                // the same registry classes so both spellings agree:
                 //   * not a GCC attribute at all -> `'x' attribute directive
                 //     ignored`
-                use crate::common::error::WarningKind;
-                use crate::frontend::parser::attr_registry::{Disposition, classify, normalize};
+                //   * GCC attribute whose semantics are not implemented ->
+                //     `'x' attribute ignored` under an explicit `-Wattributes`
+                //   * registry-implemented names never arrive here; their
+                //     dispatch arms above already consumed them.
+                use crate::frontend::parser::attribute_registry::{
+                    self as registry, AttributeClass,
+                };
                 let span = self.peek_span();
-                let spelling = normalize(name).to_string();
-                match classify(name) {
-                    Some(Disposition::Unimplemented) => self.diagnostics.warning_with_kind(
-                        format!("'{spelling}' attribute ignored"),
-                        span,
-                        WarningKind::Attributes,
-                    ),
-                    Some(Disposition::Implemented) | Some(Disposition::Benign) => {}
-                    None => self.diagnostics.warning_with_kind(
+                let spelling = registry::canonical(name).to_string();
+                match registry::classify(name) {
+                    AttributeClass::Unknown => self.diagnostics.warning_with_kind(
                         format!("'{spelling}' attribute directive ignored"),
                         span,
-                        WarningKind::Attributes,
+                        crate::common::error::WarningKind::Attributes,
                     ),
+                    AttributeClass::Unimplemented => self.attribute_warning(
+                        format!("'{spelling}' attribute ignored"),
+                        span,
+                        true,
+                    ),
+                    AttributeClass::Implemented => {}
                 }
                 self.advance();
                 if matches!(self.peek(), TokenKind::LParen) {

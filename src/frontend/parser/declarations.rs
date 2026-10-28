@@ -116,35 +116,7 @@ impl Parser {
 
         // Handle top-level asm("..."); directives - emit verbatim in assembly output
         if matches!(self.peek(), TokenKind::Asm) {
-            self.advance();
-            self.consume_if(&TokenKind::Volatile);
-            if matches!(self.peek(), TokenKind::LParen) {
-                self.advance(); // consume (
-                // Collect all string literal pieces (may be concatenated)
-                let mut asm_str = String::new();
-                loop {
-                    match self.peek() {
-                        TokenKind::StringLiteral(s) => {
-                            asm_str.push_str(s);
-                            self.advance();
-                        }
-                        TokenKind::RParen | TokenKind::Eof => break,
-                        _ => {
-                            self.advance();
-                        }
-                    }
-                }
-                if matches!(self.peek(), TokenKind::RParen) {
-                    self.advance();
-                }
-                self.consume_if(&TokenKind::Semicolon);
-                if !asm_str.is_empty() {
-                    return Some(ExternalDecl::TopLevelAsm(asm_str));
-                }
-                return Some(ExternalDecl::Declaration(Declaration::empty()));
-            }
-            self.consume_if(&TokenKind::Semicolon);
-            return Some(ExternalDecl::Declaration(Declaration::empty()));
+            return Some(self.parse_toplevel_asm());
         }
 
         // Handle _Static_assert at file scope
@@ -389,6 +361,44 @@ impl Parser {
             };
             self.parse_declaration_rest(type_spec, name, derived, start, ctx)
         }
+    }
+
+    /// `asm("...")` / `asm volatile ("...")` / `asm("...");` at file scope.
+    ///
+    /// Top-level asm is emitted verbatim, so the string pieces are concatenated
+    /// here and never parsed as C. An empty directive still consumes the
+    /// declaration: `asm("");` yields an empty declaration rather than falling
+    /// through to the declarator parser (measured: gcc-16.2 accepts it).
+    fn parse_toplevel_asm(&mut self) -> ExternalDecl {
+        self.advance();
+        self.consume_if(&TokenKind::Volatile);
+        if matches!(self.peek(), TokenKind::LParen) {
+            self.advance(); // consume (
+            // Collect all string literal pieces (may be concatenated)
+            let mut asm_str = String::new();
+            loop {
+                match self.peek() {
+                    TokenKind::StringLiteral(s) => {
+                        asm_str.push_str(s);
+                        self.advance();
+                    }
+                    TokenKind::RParen | TokenKind::Eof => break,
+                    _ => {
+                        self.advance();
+                    }
+                }
+            }
+            if matches!(self.peek(), TokenKind::RParen) {
+                self.advance();
+            }
+            self.consume_if(&TokenKind::Semicolon);
+            if !asm_str.is_empty() {
+                return ExternalDecl::TopLevelAsm(asm_str);
+            }
+            return ExternalDecl::Declaration(Declaration::empty());
+        }
+        self.consume_if(&TokenKind::Semicolon);
+        ExternalDecl::Declaration(Declaration::empty())
     }
 
     /// Record a property of a function entity, not a pointer object. Call this

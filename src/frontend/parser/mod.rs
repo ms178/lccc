@@ -1,6 +1,5 @@
 pub(crate) mod asm_validate;
 pub(crate) mod ast;
-pub(crate) mod attr_registry;
 mod attribute_registry;
 mod declarations;
 mod declarators;
