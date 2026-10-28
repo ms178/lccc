@@ -1329,7 +1329,7 @@
     "frontend-c": {
       "group": "frontend",
       "mode": "steps",
-      "predicted_gate_seconds": 270.41,
+      "predicted_gate_seconds": 271.42,
       "shards": 3,
       "steps": [
         {
@@ -1347,6 +1347,10 @@
         {
           "measured_s": 0.46,
           "name": "GNU retain section flags and linker garbage collection"
+        },
+        {
+          "measured_s": 1.01,
+          "name": "C digraph token, macro and directive parity"
         },
         {
           "measured_s": 2.0,

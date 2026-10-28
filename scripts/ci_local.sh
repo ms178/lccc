@@ -788,6 +788,11 @@ gate "c23-compatibility-inventory" fast \
     python3 tests/regression/check_c23_inventory.py \
         --lccc "$LCCC" --gcc "${GCC16:-gcc-16}" \
         --json target/c23-inventory.json --markdown target/c23-inventory.md
+# Digraph spelling is observable in macro stringification; this also exercises
+# directives, token boundaries, maximal munch and native/i686 execution.
+gate "c-digraphs" fast \
+    python3 tests/regression/check_c_digraphs.py \
+        --lccc "$LCCC" --gcc "${GCC16:-gcc-16}" --m32
 # GCC warning-group parity and DWARF line/link preservation are cheap focused
 # gates; keeping them in the local mirror prevents hosted-only drift.
 gate "warning-compatibility" fast \

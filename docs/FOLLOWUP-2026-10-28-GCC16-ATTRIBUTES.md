@@ -119,3 +119,21 @@ above is for GNU ld and mold, not LCCC. Separately, the local mold 3.0.0
 `-r` probe discarded `R` even for GNU-as-produced input; no mold partial-link
 correctness is claimed. None of these bounded checks establishes GP-03
 completion or whole-program GCC compatibility.
+
+## C digraphs: bounded GP-07 progress
+
+The lexer now recognizes `<:`, `:>`, `<%`, `%>`, `%:` and `%:%:` as the
+corresponding C punctuators. The preprocessor accepts `%:` directives and
+`%:` / `%:%:` macro operators while preserving original token spelling during
+stringification. Its text-level scanners respect maximal munch, prevent
+accidental digraph creation at macro boundaries, and do not interpret operator
+spellings inside literals. Directive line splices, multi-line comments and
+source locations are included in the differential.
+
+The checked-in gate compares GCC 16.2 and LCCC with 22 native/i686 executions
+across C99, C11, C17, C23 and GNU89 (including a C23 digit-separator case),
+emits objects for five integrated targets, checks seven preprocessing controls,
+40 adjacent/overlapping punctuator cases, three invalid inputs and a source
+position. Both local and hosted fast CI run it. These are bounded tests: UCN
+identifiers remain unimplemented, trigraph and pedantic behavior are not
+covered, and no whole-language parity or performance gain is claimed.

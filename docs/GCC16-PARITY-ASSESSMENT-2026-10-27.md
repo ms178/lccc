@@ -18,7 +18,7 @@ from documentation or inferred from a neighbouring measurement.
 The scorecard and prose below record the **2026-10-27** tree; they are not a
 current compatibility score. The full item-by-item update is
 [backlog §12.0](../backlog.md#120-bounded-gp-01gp-24-sentinel-verdicts-2026-10-28).
-On those bounded tests, **7 of 24 items are partial, 17 remain open, and none
+On those bounded tests, **8 of 24 items are partial, 16 remain open, and none
 is certified complete**. A passing sentinel is not an acceptance suite.
 
 * GP-01: 127 GCC-known names, 83 inventoried as unimplemented, 48 implemented
@@ -33,6 +33,9 @@ is certified complete**. A passing sentinel is not an acceptance suite.
 * GP-05/23: on one x86-64 GNU23 empty TU, GCC has 408 macros, LCCC 466;
   153 are GCC-only, 211 LCCC-only and 34 common replacements differ. LCCC
   still identifies as GCC 14. No broader macro parity is asserted.
+* GP-07: bounded digraph execution, stringification, token-boundary and
+  directive tests now pass against GCC 16.2, including native/i686 and
+  five integrated targets. The UCN identifier sentinel remains rejected.
 * GP-09: a warning registry and 57 GCC 16.2 precedence/severity comparisons
   pass; the complete warning surface and workload-wide precision gate remain
   open. GP-20 now emits some DIEs as well as line tables, so the historical

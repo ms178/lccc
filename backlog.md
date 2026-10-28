@@ -1445,7 +1445,7 @@ completion. `OPEN` means the acceptance criterion has not been met or tested;
 | GP-04 | OPEN, wrong code | x86 interrupt sentinel under `-mgeneral-regs-only`: GCC ends in `iretq`; LCCC ends in `ret`, without a diagnostic. Other contract attributes remain unaudited here. |
 | GP-05 | OPEN | Empty-TU GNU23 macro comparison: GCC 408 names, LCCC 466; 153 GCC-only, 211 LCCC-only, 34 common names differ; LCCC predefines `EOF`, `BUFSIZ` and `__STDC_NO_ATOMICS__`, GCC does not. One target/dialect only. |
 | GP-06 | OPEN | GCC accepts one `_BitInt(7)` parameter/return sentinel; LCCC rejects it. No width, ABI or runtime matrix. |
-| GP-07 | OPEN | GCC accepts both a digraph function and a UCN identifier; LCCC rejects both (0/2). |
+| GP-07 | PARTIAL | Digraph punctuation, `%:` directives and `%:`/`%:%:` macro operators now have a GCC 16.2 differential: 22 native/i686 executions over five dialects, five integrated-target object emissions, 40 overlapping-punctuator cases and negative controls pass. Stringification preserves spelling. This is bounded, not a full preprocessing or pedantic audit; GCC accepts the UCN identifier sentinel and LCCC still rejects it. |
 | GP-08 | PARTIAL | One C23 empty-prototype call sentinel is rejected by both compilers; this does not establish the full strictness/over-acceptance inventory. |
 | GP-09 | PARTIAL | Warning registry landed and 57 precedence/severity cases match GCC 16.2.0, with a unique-name self-check and local/hosted gates. Pedantic membership, the full warning surface, and the workload-wide zero-false-positive precision gate remain open. |
 | GP-10 | OPEN | GCC rejects GNU statement expressions with `-std=c23 -pedantic-errors`; LCCC accepts and reports that option unimplemented. |

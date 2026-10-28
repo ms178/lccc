@@ -5,6 +5,40 @@
 //! they avoid the overhead of `Vec<char>` allocation. The char-oriented versions are
 //! retained for code that still operates on `&[char]`.
 
+/// Length of a multi-byte `<` punctuator. Text-level macro scanners must
+/// consume it as a token: the `%:` bytes inside `<%:` belong to `<%` and `:`,
+/// not to a stringize operator. `<<` likewise wins over a following `<%`.
+#[inline]
+pub(super) fn less_punctuator_len(bytes: &[u8]) -> usize {
+    match bytes {
+        [b'<', b'<', b'=', ..] => 3,
+        [b'<', b'<' | b'=' | b':' | b'%', ..] => 2,
+        _ => 0,
+    }
+}
+
+/// Length of a `##` preprocessing token, including its C digraph spelling.
+#[inline]
+pub(super) fn paste_token_len(bytes: &[u8]) -> usize {
+    match bytes {
+        [b'#', b'#', ..] => 2,
+        [b'%', b':', b'%', b':', ..] => 4,
+        _ => 0,
+    }
+}
+
+/// Length of a single `#` preprocessing token. Maximal munch makes `##` and
+/// `%:%:` a different token, so neither may introduce a directive/stringize.
+#[inline]
+pub(super) fn hash_token_len(bytes: &[u8]) -> usize {
+    match bytes {
+        [b'#', b'#', ..] | [b'%', b':', b'%', b':', ..] => 0,
+        [b'#', ..] => 1,
+        [b'%', b':', ..] => 2,
+        _ => 0,
+    }
+}
+
 /// Check if a character can start a C identifier.
 /// GCC extension: '$' is allowed in identifiers (-fdollars-in-identifiers, on by default).
 pub fn is_ident_start(c: char) -> bool {
@@ -214,6 +248,30 @@ pub(super) fn is_digit_separator(bytes: &[u8], i: usize) -> bool {
         k = prev;
     }
     k < i && starts_ppnumber(k)
+}
+
+#[cfg(test)]
+mod digraph_token_tests {
+    use super::*;
+
+    #[test]
+    fn alternate_hash_tokens_use_maximal_munch() {
+        for (input, hash, paste) in [
+            (&b"#x"[..], 1, 0),
+            (b"%:x", 2, 0),
+            (b"##x", 0, 2),
+            (b"%:%:x", 0, 4),
+            (b"%>x", 0, 0),
+            (b"", 0, 0),
+        ] {
+            assert_eq!(hash_token_len(input), hash, "{input:?}");
+            assert_eq!(paste_token_len(input), paste, "{input:?}");
+        }
+        assert_eq!(less_punctuator_len(b"<%:x"), 2);
+        assert_eq!(less_punctuator_len(b"<<%:x"), 2);
+        assert_eq!(less_punctuator_len(b"<<=%:x"), 3);
+        assert_eq!(less_punctuator_len(b"<x"), 0);
+    }
 }
 
 #[cfg(test)]

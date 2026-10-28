@@ -17,8 +17,9 @@ use std::cell::Cell;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
 use super::utils::{
-    bytes_to_str, copy_literal_bytes_to_string, is_digit_separator, is_ident_cont_byte,
-    is_ident_start_byte, ppnumber_end, skip_literal_bytes,
+    bytes_to_str, copy_literal_bytes_to_string, hash_token_len, is_digit_separator,
+    is_ident_cont_byte, is_ident_start_byte, less_punctuator_len, paste_token_len, ppnumber_end,
+    skip_literal_bytes,
 };
 
 /// Check if two adjacent bytes would form an unintended multi-character token
@@ -46,6 +47,9 @@ fn would_paste_tokens(last: u8, first: u8) -> bool {
         | (b'%', b'=') => true,
         // && ||
         (b'&', b'&') | (b'|', b'|') => true,
+        // Alternative bracket/brace/hash punctuators. `:%` is conservative:
+        // %: followed by %: would otherwise form the single %:%: token.
+        (b':', b'>') | (b'%', b'>') | (b'%', b':') | (b':', b'%') => true,
         // ## (token paste)
         (b'#', b'#') => true,
         // / followed by * or / (comment start)
@@ -1383,8 +1387,8 @@ impl MacroTable {
         (result, result_ends_with_func_ident)
     }
 
-    /// Handle # (stringify) and ## (token paste) operators.
-    /// Returns `Cow::Borrowed` when the body has no `#` (the common case),
+    /// Handle # / %: (stringify) and ## / %:%: (token paste) operators.
+    /// Returns `Cow::Borrowed` when neither spelling can occur (the common case),
     /// avoiding a String allocation.
     fn handle_stringify_and_paste<'a>(
         &self,
@@ -1397,8 +1401,8 @@ impl MacroTable {
         let bytes = body.as_bytes();
         let len = bytes.len();
 
-        // Short-circuit: if body contains no '#', nothing to do
-        if !body.contains('#') {
+        // Short-circuit the common case without allocating.
+        if !body.contains('#') && !body.contains("%:") {
             return std::borrow::Cow::Borrowed(body);
         }
 
@@ -1406,8 +1410,20 @@ impl MacroTable {
         let mut i = 0;
 
         while i < len {
-            if bytes[i] == b'#' && i + 1 < len && bytes[i + 1] == b'#' {
-                // Token paste operator ##
+            // An operator spelling inside a literal is ordinary text.
+            if bytes[i] == b'"' || (bytes[i] == b'\'' && !is_digit_separator(bytes, i)) {
+                i = copy_literal_bytes_to_string(bytes, i, bytes[i], &mut result);
+                continue;
+            }
+            let less_len = less_punctuator_len(&bytes[i..]);
+            if less_len != 0 {
+                result.push_str(&body[i..i + less_len]);
+                i += less_len;
+                continue;
+            }
+            let paste_len = paste_token_len(&bytes[i..]);
+            if paste_len != 0 {
+                // Token paste operator ## or %:%:
                 while result.ends_with(' ') || result.ends_with('\t') {
                     result.pop();
                 }
@@ -1446,7 +1462,7 @@ impl MacroTable {
                     }
                 }
 
-                i += 2; // skip ##
+                i += paste_len;
 
                 while i < len && (bytes[i] == b' ' || bytes[i] == b'\t') {
                     i += 1;
@@ -1527,9 +1543,12 @@ impl MacroTable {
                 continue;
             }
 
-            if bytes[i] == b'#' && i + 1 < len && bytes[i + 1] != b'#' {
-                // Stringification operator #
-                i += 1;
+            let hash_len = hash_token_len(&bytes[i..]);
+            if hash_len != 0 {
+                // Stringification operator # or %:. Preserve the original
+                // spelling if this is not a parameter (diagnosed elsewhere).
+                let operator = &body[i..i + hash_len];
+                i += hash_len;
                 while i < len && (bytes[i] == b' ' || bytes[i] == b'\t') {
                     i += 1;
                 }
@@ -1556,12 +1575,12 @@ impl MacroTable {
                         result.push_str(&stringify_arg(&arg_str));
                         result.push('"');
                     } else {
-                        result.push('#');
+                        result.push_str(operator);
                         result.push_str(param_name);
                     }
                     continue;
                 } else {
-                    result.push('#');
+                    result.push_str(operator);
                     continue;
                 }
             }
