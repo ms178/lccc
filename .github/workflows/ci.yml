@@ -1856,7 +1856,30 @@ jobs:
     # is deliberately absent: it needs GCC's *source* tree (i386-common.cc,
     # i386-cpuinfo.h, extend.texi), which the runner's binary oracle bundle does
     # not carry.  Wiring it would add a step that cannot run.
+    #
+    # This job's own `gcc-16` is the apt package, which is 16.0.1 on the current
+    # runner image -- not the 16.2.0 the table records, and the generator
+    # (correctly) refuses to validate against anything else.  The pinned oracle
+    # is therefore resolved to an explicit path and passed to each gate, rather
+    # than installed onto PATH: the "Select GCC 16 for legacy oracle invocations"
+    # step above already pinned `gcc` for the rest of this job, and two later
+    # steps still ask for `gcc-16` by name.
+    - name: Cache the pinned GCC 16.2 oracle
+      uses: actions/cache@v6
+      with:
+        path: ~/.cache/lccc/gcc-oracle
+        key: lccc-gcc-oracle-${{ runner.os }}-16.2-${{ hashFiles('scripts/ci_install_gcc_oracle.sh') }}
+    - name: Locate the pinned GCC 16.2 oracle
+      id: gcc162
+      run: |
+        set -Eeuo pipefail
+        bin=$(bash scripts/ci_install_gcc_oracle.sh --version 16.2 --print-bin | tail -1)
+        [ -x "$bin" ] || { echo "::error title=GCC 16.2 oracle::not executable: $bin"; exit 1; }
+        printf 'oracle: %s (%s)\n' "$bin" "$("$bin" -dumpversion)"
+        echo "bin=$bin" >> "$GITHUB_OUTPUT"
     - name: Verify the generated x86 arch table matches GCC 16.2
+      env:
+        GCC: ${{ steps.gcc162.outputs.bin }}
       run: |
         set -Eeuo pipefail
         # Put the generator's own diagnosis into Checks.  A red X reading
@@ -1871,9 +1894,13 @@ jobs:
         fi
         printf '%s\n' "$out"
     - name: Verify x86 -march= predefined macros against GCC 16.2
-      run: python3 scripts/check_x86_march_macros.py target/fastbuild/lccc gcc-16
+      run: >-
+        python3 scripts/check_x86_march_macros.py target/fastbuild/lccc
+        "${{ steps.gcc162.outputs.bin }}"
     - name: Verify x86 -m ISA macros against GCC 16.2
-      run: python3 scripts/check_x86_mflag_macros.py target/fastbuild/lccc --gcc gcc-16
+      run: >-
+        python3 scripts/check_x86_mflag_macros.py target/fastbuild/lccc
+        --gcc "${{ steps.gcc162.outputs.bin }}"
     - name: Verify range-fold branch contracts
       env:
         CCC: target/fastbuild/lccc
