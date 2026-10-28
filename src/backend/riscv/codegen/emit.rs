@@ -833,6 +833,14 @@ impl ArchCodegen for RiscvCodegen {
     fn state_ref(&self) -> &CodegenState {
         &self.state
     }
+
+    fn mark_volatile_access(&mut self, begin: bool) {
+        self.state.emit_fmt(format_args!(
+            "    # LCCC_VOLATILE_{}",
+            if begin { "BEGIN" } else { "END" }
+        ));
+    }
+
     fn ptr_directive(&self) -> PtrDirective {
         PtrDirective::Dword
     }
