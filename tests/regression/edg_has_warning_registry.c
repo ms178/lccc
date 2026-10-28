@@ -1,8 +1,8 @@
 /* `__has_warning` must consult the compiler's ACTUAL warning registry
- * (EDG-transplant review finding: no blanket truth values). A flag lccc
- * implements (-Wreturn-type) yields 1; a flag no compiler knows
- * (-Wtotally-bogus-flag-xyz) yields 0 and sends ported sources down
- * their compatibility fallback.
+ * (EDG-transplant review finding: no blanket truth values). Flags lccc
+ * implements (-Wreturn-type, and -Wpedantic since GP-10) yield 1; a flag
+ * no compiler knows (-Wtotally-bogus-flag-xyz) yields 0 and sends ported
+ * sources down their compatibility fallback.
  *
  * This is an LCCC self-check (see the .env sidecar), not a GCC differential.
  * Provenance: EDG Changes excerpt workflow (docs/edg_changes_c_extract.md). */
@@ -23,5 +23,5 @@ int main(void) {
   pedantic = 1;
 #endif
   printf("%d %d %d %d\n", known, bogus, groups, pedantic);
-  return !(known && !bogus && groups && !pedantic);
+  return !(known && !bogus && groups && pedantic);
 }

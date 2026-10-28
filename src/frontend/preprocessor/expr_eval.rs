@@ -446,7 +446,16 @@ impl Preprocessor {
         if *i < len {
             *i += 1;
         }
-        if Self::is_supported_builtin(name) {
+        // GCC 16.2 conditions many GNU x86 builtins on a target flag
+        // (measured: `__has_builtin(__builtin_ia32_maxps256)` is 0 at
+        // default and 1 under -mavx, while the call itself already errors
+        // without the extension). The availability table mirrors that
+        // sweep; the feature macros it names are defined by exactly the
+        // same flags GCC uses to answer, implication chain included.
+        if Self::is_supported_builtin(name)
+            && crate::common::x86_builtin_availability::x86_builtin_feature_macro(name)
+                .is_none_or(|feature_macro| self.macros.is_defined(feature_macro))
+        {
             "1"
         } else {
             "0"

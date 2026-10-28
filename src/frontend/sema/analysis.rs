@@ -1648,6 +1648,17 @@ impl SemanticAnalyzer {
                     }
                 }
             }
+            if has_vla_bound && !self.symbol_table.at_file_scope() {
+                // Measured GCC 16.2: `-Wvla` (default-off, no group
+                // membership) warns `ISO C90 forbids variable length array
+                // '<name>'` once per declarator; file-scope instead keeps
+                // the hard "variably modified" error alone.
+                self.diagnostics.borrow_mut().warning_with_kind(
+                    format!("ISO C90 forbids variable length array '{}'", init_decl.name),
+                    init_decl.span,
+                    crate::common::error::WarningKind::Vla,
+                );
+            }
             if has_vla_bound {
                 if let Some(init) = &init_decl.init {
                     if !matches!(init, Initializer::List(items) if items.is_empty()) {
