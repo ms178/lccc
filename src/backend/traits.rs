@@ -2832,9 +2832,9 @@ pub trait ArchCodegen {
         let _ = self;
     }
     /// Bracket the text of one volatile load or store with a begin/end marker
-    /// so a text-level peephole can keep the access opaque. x86-64 emits
-    /// `# LCCC_VOLATILE_BEGIN` / `# LCCC_VOLATILE_END`; other targets emit
-    /// nothing, because not every assembler accepts a `#` comment line.
+    /// so a text-level peephole can keep the access opaque. The x86-64, i686
+    /// and RISC-V backends emit `# LCCC_VOLATILE_BEGIN` / `# LCCC_VOLATILE_END`;
+    /// other targets may emit nothing because comment syntax differs.
     fn mark_volatile_access(&mut self, _begin: bool) {}
 
     /// PF-15: consume a deferred narrowing-widen compare (x86-64). Called

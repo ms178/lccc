@@ -809,7 +809,11 @@ impl Target {
                     opts.debug_info,
                     source_mgr,
                 );
-                let optimized = riscv::codegen::peephole::peephole_optimize(raw);
+                let optimized = if std::env::var_os("LCCC_NO_PEEPHOLE").is_some() {
+                    peephole_common::strip_volatile_markers(raw)
+                } else {
+                    riscv::codegen::peephole::peephole_optimize(raw)
+                };
                 let optimized = zero_call_used_regs::apply_zero_call_used_regs(
                     optimized,
                     Target::Riscv64,
