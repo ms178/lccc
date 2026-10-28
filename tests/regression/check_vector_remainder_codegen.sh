@@ -45,7 +45,7 @@ import sys
 
 text = open(sys.argv[1], encoding="utf-8").read()
 packed = re.compile(r"\bvp(?:addd|subd|xor[ds]?|ord|andd|mulld|slld|srld|srad)\b")
-for name in ("sum_global", "sum_dynamic"):
+for name in ("sum_global_full", "sum_dynamic_tail"):
     match = re.search(rf"(?ms)^{name}:\n(.*?)^\.size {name},", text)
     if not match:
         raise SystemExit(f"{name}: missing assembly body")

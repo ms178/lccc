@@ -6,9 +6,25 @@
 //! sum accumulator:
 //!
 //! ```c
-//! for (unsigned long i = 0; (i + 8) <= len; i += 8)
+//! for (unsigned long i = 0; i < BYTES; i += 8) /* BYTES: compile-time constant */
 //!     acc += *(const uint32_t *)(buf + i) ^ (uint32_t)i;
 //! ```
+//!
+//! ### Admitted exit test
+//!
+//! [`analyze`] requires the loop header's exit comparison to name the induction
+//! variable itself on one side and an `Operand::Const` on the other, so the trip
+//! count is known when the transform runs. A run-time bound -- including the
+//! `(i + 8) <= len` spelling this module used to document -- is declined: the
+//! guard-page contract below needs the scalar trip count `T` up front. Admitting
+//! one would need the grouped-bound machinery the map and matmul arms use (a
+//! `(bound - 1) >> 2` trip count and a per-vector in-range test in the
+//! preheader) plus a re-proof of the dereferenceability argument against a
+//! non-constant prefix; that is not implemented here.
+//!
+//! The corpus gate `tests/regression/check_vector_remainder_codegen.sh` pins
+//! both dereferenceability paths below on
+//! `tests/regression/vectorize_strided_i32_reduce.c`.
 //!
 //! ### Even-lane SIMD homomorphism (zero shuffles inside the loop)
 //!
