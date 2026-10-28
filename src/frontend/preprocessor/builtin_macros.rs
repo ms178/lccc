@@ -433,55 +433,14 @@ fn define_type_traits_macros(macros: &mut MacroTable) {
     def(macros, "__STDC_UTF_16__", "1");
     def(macros, "__STDC_UTF_32__", "1");
     // Note: We support _Complex types, so __STDC_NO_COMPLEX__ is NOT defined.
-    // __STDC_NO_ATOMICS__ is NOT defined: _Atomic is implemented, so defining
-    // it would be an autoconf capability denial (GP-05).
     // __STDC_NO_THREADS__ is NOT defined because we link against glibc which provides <threads.h>
     // VLA declarations lower to DynAlloca and are supported. Do not define
     // __STDC_NO_VLA__: autoconf uses its presence as a hard capability denial.
 
-    // EXIT_SUCCESS and EXIT_FAILURE from <stdlib.h>
-    def(macros, "EXIT_SUCCESS", "0");
-    def(macros, "EXIT_FAILURE", "1");
-
-    // RAND_MAX from <stdlib.h>
-    def(macros, "RAND_MAX", "2147483647");
-
-    // EOF from <stdio.h>
-    def(macros, "EOF", "(-1)");
-
-    // BUFSIZ from <stdio.h>
-    def(macros, "BUFSIZ", "8192");
-
-    // SEEK constants from <stdio.h>
-    def(macros, "SEEK_SET", "0");
-    def(macros, "SEEK_CUR", "1");
-    def(macros, "SEEK_END", "2");
-
-    // errno values from <errno.h>
-    def(macros, "ENOENT", "2");
-    def(macros, "EINTR", "4");
-    def(macros, "EIO", "5");
-    def(macros, "ENOMEM", "12");
-    def(macros, "EACCES", "13");
-    def(macros, "EEXIST", "17");
-    def(macros, "ENOTDIR", "20");
-    def(macros, "EISDIR", "21");
-    def(macros, "EINVAL", "22");
-    def(macros, "ENFILE", "23");
-    def(macros, "EMFILE", "24");
-    def(macros, "ENOSPC", "28");
-    def(macros, "EPIPE", "32");
-    def(macros, "ERANGE", "34");
-    def(macros, "ENOSYS", "38");
-
-    // Signal numbers from <signal.h>
-    def(macros, "SIGABRT", "6");
-    def(macros, "SIGFPE", "8");
-    def(macros, "SIGILL", "4");
-    def(macros, "SIGINT", "2");
-    def(macros, "SIGSEGV", "11");
-    def(macros, "SIGTERM", "15");
-    def(macros, "SIG_DFL", "((void(*)(int))0)");
-    def(macros, "SIG_IGN", "((void(*)(int))1)");
-    def(macros, "SIG_ERR", "((void(*)(int))-1)");
+    // NOTE: libc macros (EOF, BUFSIZ, EXIT_SUCCESS, errno values, signal numbers,
+// …) are intentionally NOT predefined here.  GP-05: they must come from the
+// real headers (<stdio.h>, <stdlib.h>, <errno.h>, <signal.h>) rather than the
+// compiler, because GCC does not define them without an #include and lccc's
+// -dM output must match GCC's.  See FORBIDDEN_LIST in
+// tests/regression/check_macro_parity.sh.
 }
