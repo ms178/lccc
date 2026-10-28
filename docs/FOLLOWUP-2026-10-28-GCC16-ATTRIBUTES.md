@@ -175,9 +175,14 @@ linker semantics. `C_INCLUDE_PATH` is not consumed by LCCC. Until those
 semantics can be implemented together, the driver now **rejects** GNU sysroot
 requests (including `/` and linker passthrough forms) rather than producing
 potentially host-contaminated output. The extractor's printed recipe now makes
-these limits explicit. Five contract tests cover four targets, three modes,
-response files, root-dependent queries and a GCC private-header control. This
-is a fail-closed compatibility gap, not completed GNU sysroot support; the
+these limits explicit. Six contract tests cover four targets, three modes,
+joined `-isysrootDIR` and preprocessor/linker passthroughs, nested response
+files and cycles, option-like operands, root-dependent queries, and a GCC
+private-header control. GCC 16.2 accepts `-isysrootDIR` and
+`-Wp,-isysroot,DIR`; the prior safeguard still ignored both. The response-file
+expander now handles nested files with a bounded cycle guard, and the query
+scan skips other options' operands. This is a fail-closed compatibility gap,
+not completed GNU sysroot support; the
 standalone `lccc-ld` and the legacy overlay need their own isolation audit.
 
 ## Red-team update: upstream ANDQ and self-move safety

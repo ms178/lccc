@@ -44,8 +44,13 @@ class SysrootRefusal(unittest.TestCase):
     def test_sysroot_options_refuse_before_any_compilation(self):
         spellings = ((f'--sysroot={self.sysroot}',), ('--sysroot', self.sysroot),
                      (f'-isysroot={self.sysroot}',), ('-isysroot', self.sysroot),
+                     (f'-isysroot{self.sysroot}',),
+                     (f'-Wp,-isysroot,{self.sysroot}',),
+                     (f'-Wp,-isysroot{self.sysroot}',),
+                     (f'-Wp,-MD,dep,-isysroot,{self.sysroot}',),
                      ('--sysroot=/',), (f'-Wl,--sysroot={self.sysroot}',),
-                     ('-Xlinker', f'--sysroot={self.sysroot}'))
+                     ('-Xlinker', f'--sysroot={self.sysroot}'),
+                     ('-Xlinker', '-o', self.source, '-Xlinker', f'--sysroot={self.sysroot}'))
         for target in ('lccc', 'lccc-i686', 'lccc-arm', 'lccc-riscv'):
             compiler = LCCC.parent / target
             self.assertTrue(compiler.is_file(), f'missing built target {compiler}')
@@ -60,8 +65,11 @@ class SysrootRefusal(unittest.TestCase):
     def test_response_file_and_sysroot_dependent_queries_also_refuse(self):
         response = self.root / 'args.rsp'
         response.write_text(f'--sysroot="{self.sysroot}"\n')
+        nested = self.root / 'nested.rsp'
+        nested.write_text(f'@"{response}"\n')
         for args in ((f'@{response}', '-E', self.source),
                      (f'@{response}', '-print-libgcc-file-name'),
+                     (f'@{nested}', '-print-libgcc-file-name'),
                      ('--sysroot', self.sysroot, '-print-file-name=crtbegin.o')):
             with self.subTest(args=args):
                 run = self.run_cc(LCCC, *args)
@@ -75,10 +83,37 @@ class SysrootRefusal(unittest.TestCase):
             self.assertNotEqual(run.returncode, 0, run.stdout)
             self.assertIn('requires a directory', run.stderr.lower())
 
-    def test_option_like_output_operand_is_not_a_sysroot(self):
-        run = self.run_cc(LCCC, '-E', '-o', '--sysroot=output', self.source)
-        self.assertEqual(run.returncode, 0, run.stderr)
-        self.assertTrue((self.root / '--sysroot=output').is_file())
+    def test_option_like_operands_are_not_options(self):
+        for output in ('--sysroot=output', '-isysrootoutput', '-dumpmachine'):
+            with self.subTest(output=output):
+                run = self.run_cc(LCCC, '-E', '-o', output, self.source)
+                self.assertEqual(run.returncode, 0, run.stderr)
+                self.assertEqual(run.stdout, '')
+                self.assertTrue((self.root / output).is_file())
+        # The option-like token is the linker's output filename, not a
+        # --sysroot request. Preprocessing doesn't invoke the linker.
+        for passthrough in (('-Wl,-o,--sysroot=output',),
+                            ('-Xlinker', '-o', '-Xlinker', '--sysroot=output'),
+                            ('-Wp,-MD,-isysrootoutput',)):
+            with self.subTest(passthrough=passthrough):
+                run = self.run_cc(LCCC, '-E', *passthrough, self.source)
+                self.assertEqual(run.returncode, 0, run.stderr)
+
+    def test_queries_in_nested_responses_and_response_cycles(self):
+        inner = self.root / 'inner.rsp'
+        outer = self.root / 'outer.rsp'
+        inner.write_text('-dumpmachine\n')
+        outer.write_text(f'@"{inner}"\n')
+        for cc in (GCC, LCCC):
+            with self.subTest(cc=cc):
+                query = self.run_cc(cc, f'@{outer}')
+                self.assertEqual(query.returncode, 0, query.stderr)
+                self.assertTrue(query.stdout.strip())
+                cycle = self.root / 'cycle.rsp'
+                cycle.write_text(f'@"{cycle}"\n')
+                run = self.run_cc(cc, f'@{cycle}', '--version')
+                self.assertNotEqual(run.returncode, 0, run.stdout)
+                self.assertIn('@-files', run.stderr)
 
 
 if __name__ == '__main__':
