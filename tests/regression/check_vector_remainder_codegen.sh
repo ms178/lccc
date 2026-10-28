@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# Structural regression for division-free AVX2 vector remainder transitions.
+# Structural regression for the AVX2 vector transitions that divide a 64-bit
+# byte induction variable back into a scalar index, and for the strided-2 i32
+# sum-reduction vectorizer, whose scalar remainder starts from that same divide.
+# Both are shape contracts: a scalar fallback would satisfy every arithmetic
+# comparison in the corpus while leaving the transform dead.
 set -euo pipefail
 CCC=${CCC:-./target/release/lccc}
 dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -10,6 +14,44 @@ flags=(-O2 -march=x86-64-v3 -ffast-math -ffp-contract=fast)
 "$CCC" "${flags[@]}" -S "$dir/vectorize_matmul_tail.c" -o "$tmp/matmul.s"
 "$CCC" "${flags[@]}" -S "$dir/../benchmark/patterns/simd_fp_oracle.c" \
     -o "$tmp/reduction.s"
+
+# The strided-2 i32 sum-reduction fixture: one function reading a global array
+# (the whole vector prefix is provably inside the object) and one reading a
+# run-time pointer (only the prefix inside the scalar loop's own bytes may be
+# vectorized). Its output is compared against GCC, so the packed arithmetic
+# assertion below cannot pass on a scalar fallback that happens to be correct.
+strided_src="$dir/vectorize_strided_i32_reduce.c"
+"$CCC" "${flags[@]}" -S "$strided_src" -o "$tmp/strided.s"
+"$CCC" "${flags[@]}" "$strided_src" -o "$tmp/strided"
+${GCC_BIN:-gcc} -O2 -march=x86-64-v3 "$strided_src" -o "$tmp/strided-ref"
+expected_out=$("$tmp/strided-ref")
+actual_out=$(timeout 60 "$tmp/strided")
+if [[ $actual_out != "$expected_out" ]]; then
+    printf 'FAIL: strided i32 reduction output differs from GCC:\n  lccc: %q\n  gcc : %q\n' \
+        "$actual_out" "$expected_out" >&2
+    exit 1
+fi
+python3 - "$tmp/strided.s" <<'PY2'
+import re
+import sys
+
+text = open(sys.argv[1], encoding="utf-8").read()
+packed = re.compile(r"\bvp(?:addd|subd|xor[ds]?|ord|andd|mulld|slld|srld|srad)\b")
+for name in ("sum_global", "sum_dynamic"):
+    match = re.search(rf"(?ms)^{name}:\n(.*?)^\.size {name},", text)
+    if not match:
+        raise SystemExit(f"{name}: missing assembly body")
+    body = match.group(1)
+    if "%ymm" not in body:
+        raise SystemExit(
+            f"{name}: strided-2 i32 reduction was not vectorized (no 256-bit register)"
+        )
+    if not packed.search(body):
+        raise SystemExit(
+            f"{name}: no packed dword arithmetic in the reduction loop "
+            "(a scalar fallback cannot be the vectorized transform)"
+        )
+PY2
 
 python3 - "$tmp/matmul.s" "$tmp/reduction.s" "$dir/lib" <<'PY'
 import re
