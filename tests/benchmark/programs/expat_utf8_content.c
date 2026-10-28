@@ -78,6 +78,15 @@ static void init_utf8_table_and_doc(void)
 
     size_t pos = 0;
     uint32_t s = 0x6C078965U;
+#ifdef BENCH_DIGEST_PROBE
+    /* One-bit perturbation of the input generator.
+     * tests/corpus/test_benchmark_digest_sensitivity.py links every workload
+     * with and without this define and requires the printed digest to move: a
+     * digest blind to one changed input byte cannot catch a miscompile that
+     * corrupts the data it reads (an earlier XOR-folded digest here was
+     * identically zero for every input and every compiler). */
+    s ^= 0x01U;
+#endif
     while (pos + 16U < sizeof(xml_buf)) {
         s = s * 1664525U + 1013904223U;
         uint32_t kind = (s >> 24) & 31U;
@@ -287,7 +296,12 @@ int main(void)
         }
         if (cur != end)
             return 2;
-        digest ^= pass_hash + p;
+        /* Mix multiplicatively, NOT with an XOR fold: the pass body is
+         * periodic in `p & 7`, so every pass hash recurs 32 times and a XOR
+         * fold cancels to a constant (it printed 0000000000000000 for every
+         * input and every compiler). A digest that cannot move cannot catch a
+         * miscompile. */
+        digest = (digest ^ (pass_hash + (uint64_t)p)) * 1099511628211ULL;
         total_tokens += tok_cnt;
     }
 

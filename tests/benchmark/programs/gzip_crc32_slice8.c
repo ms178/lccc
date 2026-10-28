@@ -40,6 +40,15 @@ static void init_tables_and_payload(void)
     }
 
     uint32_t s = 0x9E3779B9U;
+#ifdef BENCH_DIGEST_PROBE
+    /* One-bit perturbation of the input generator.
+     * tests/corpus/test_benchmark_digest_sensitivity.py links every workload
+     * with and without this define and requires the printed digest to move: a
+     * digest blind to one changed input byte cannot catch a miscompile that
+     * corrupts the data it reads (an earlier XOR-folded digest here was
+     * identically zero for every input and every compiler). */
+    s ^= 0x01U;
+#endif
     for (size_t i = 0; i < sizeof(payload); i++) {
         s = s * 1664525U + 1013904223U;
         payload[i] = (unsigned char)((s >> 16) ^ (uint32_t)i);

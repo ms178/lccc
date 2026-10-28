@@ -88,6 +88,15 @@ static void ref_slide_chain(Pos *table, uint32_t entries, uint16_t wsize)
 int main(void)
 {
     uint32_t s = 0x243F6A88U;
+#ifdef BENCH_DIGEST_PROBE
+    /* One-bit perturbation of the input generator.
+     * tests/corpus/test_benchmark_digest_sensitivity.py links every workload
+     * with and without this define and requires the printed digest to move: a
+     * digest blind to one changed input byte cannot catch a miscompile that
+     * corrupts the data it reads (an earlier XOR-folded digest here was
+     * identically zero for every input and every compiler). */
+    s ^= 0x01U;
+#endif
     for (size_t i = 0; i < sizeof(window_buf); i++) {
         s = s * 1664525U + 1013904223U;
         window_buf[i] = (uint8_t)((s >> 20) ^ (s >> 11));

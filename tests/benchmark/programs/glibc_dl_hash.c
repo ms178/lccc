@@ -101,6 +101,15 @@ static void init_symbols(void)
     static const char alphabet[] =
         "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
     uint32_t s = 0xC0FFEE42U;
+#ifdef BENCH_DIGEST_PROBE
+    /* One-bit perturbation of the input generator.
+     * tests/corpus/test_benchmark_digest_sensitivity.py links every workload
+     * with and without this define and requires the printed digest to move: a
+     * digest blind to one changed input byte cannot catch a miscompile that
+     * corrupts the data it reads (an earlier XOR-folded digest here was
+     * identically zero for every input and every compiler). */
+    s ^= 0x01U;
+#endif
     size_t pos = 0;
 
     for (uint32_t i = 0; i < SYMBOL_COUNT; i++) {
@@ -138,7 +147,12 @@ int main(void)
             const char *sym = sym_arena + sym_offsets[i];
             const char *hit = glibc_swar_strchrnul(sym, sep);
             uint32_t h = glibc_dl_new_hash(sym);
-            acc = (acc * 1099511628211ULL) ^ ((uint64_t)h + (uint64_t)(hit - sym));
+            /* The pass index participates in the mix, so repeating a pass over
+             * identical data still contributes a distinct term and the digest
+             * cannot settle into a cycle of its own. */
+            acc = (acc * 1099511628211ULL)
+                  ^ ((uint64_t)h + (uint64_t)(hit - sym)
+                     + (uint64_t)p * 0x9E3779B97F4A7C15ULL);
         }
     }
 

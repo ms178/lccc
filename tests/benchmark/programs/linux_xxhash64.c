@@ -141,6 +141,15 @@ int main(void)
         return 2;
 
     uint32_t s = 0x13579BDFU;
+#ifdef BENCH_DIGEST_PROBE
+    /* One-bit perturbation of the input generator.
+     * tests/corpus/test_benchmark_digest_sensitivity.py links every workload
+     * with and without this define and requires the printed digest to move: a
+     * digest blind to one changed input byte cannot catch a miscompile that
+     * corrupts the data it reads (an earlier XOR-folded digest here was
+     * identically zero for every input and every compiler). */
+    s ^= 0x01U;
+#endif
     for (size_t i = 0; i < sizeof(data_buf); i++) {
         s = rol32(s * 0x9E3779B1U, 13) + 0x85EBCA77U;
         data_buf[i] = (uint8_t)(s >> 24);

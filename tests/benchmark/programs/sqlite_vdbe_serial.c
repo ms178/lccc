@@ -52,6 +52,10 @@ typedef struct {
 static uint8_t arena[RECORD_COUNT * 64U];
 static uint32_t rec_offsets[RECORD_COUNT];
 
+/* Bytes of the DECODED cells, mixed by `scan_all_records`. Set by every call,
+ * read by the caller as the half of the checksum that no length sum sees. */
+static uint64_t content;
+
 static inline uint32_t serial_type_len(uint32_t serial_type)
 {
     if (serial_type >= 128U)
@@ -147,6 +151,15 @@ static int64_t build_records(void)
 {
     uint32_t pos = 0;
     uint32_t s = 0xA5A5F00DU;
+#ifdef BENCH_DIGEST_PROBE
+    /* One-bit perturbation of the input generator.
+     * tests/corpus/test_benchmark_digest_sensitivity.py links every workload
+     * with and without this define and requires the printed digest to move: a
+     * digest blind to one changed input byte cannot catch a miscompile that
+     * corrupts the data it reads (an earlier XOR-folded digest here was
+     * identically zero for every input and every compiler). */
+    s ^= 0x01U;
+#endif
     int64_t expected_sum = 0;
 
     for (uint32_t r = 0; r < RECORD_COUNT; r++) {
@@ -218,6 +231,7 @@ __attribute__((noinline))
 static int64_t scan_all_records(void)
 {
     uint64_t total = 0;
+    content = 1469598103934665603ULL;
     VdbeCell cell;
     for (uint32_t r = 0; r < RECORD_COUNT; r++) {
         const uint8_t *rec = arena + rec_offsets[r];
@@ -227,10 +241,21 @@ static int64_t scan_all_records(void)
             uint32_t st = rec[h];
             vdbe_serial_get(body, st, &cell);
             body += serial_type_len(st);
-            if (cell.flags == MEM_Int)
+            if (cell.flags == MEM_Int) {
                 total += (uint64_t)cell.i;
-            else if (cell.flags & (MEM_Str | MEM_Blob))
+            } else if (cell.flags & (MEM_Str | MEM_Blob)) {
                 total += (uint64_t)cell.n;
+                /* Fold the decoded bytes themselves: summing lengths alone
+                 * leaves every string/blob payload invisible to the checksum,
+                 * so a miscompile that corrupts text but keeps its length
+                 * compares equal. */
+                for (uint32_t k = 0; k < cell.n; k++)
+                    content = (content ^ (uint64_t)cell.z[k]) * 1099511628211ULL;
+            } else if (cell.flags == MEM_Real) {
+                uint64_t bits;
+                memcpy(&bits, &cell.r, sizeof(bits));
+                content = (content ^ bits) * 1099511628211ULL;
+            }
         }
     }
     return (int64_t)total;
@@ -244,8 +269,14 @@ int main(void)
         return 1;
 
     uint64_t acc = 0;
-    for (uint32_t p = 0; p < PASSES; p++)
-        acc += (uint64_t)scan_all_records() ^ (uint64_t)p;
+    for (uint32_t p = 0; p < PASSES; p++) {
+        int64_t total = scan_all_records();
+        /* Every pass decodes the same arena, so the pass index participates in
+         * the mix: repeating an identical pass still contributes a distinct
+         * term and the digest cannot settle into a cycle of its own. */
+        acc = (acc ^ ((uint64_t)total + content + (uint64_t)p * 0x9E3779B97F4A7C15ULL))
+              * 1099511628211ULL;
+    }
 
     printf("%016llx\n", (unsigned long long)acc);
     return 0;
