@@ -1930,7 +1930,10 @@ impl Parser {
             AttributeClass::Unknown => {
                 // GCC 16.2 verbatim (measured): the unknown-name wording.
                 self.attribute_warning(
-                    format!("\'{name}\' attribute directive ignored"),
+                    format!(
+                        "\'{}\' attribute directive ignored",
+                        attribute_registry::canonical(name)
+                    ),
                     name_span,
                     false,
                 );
@@ -1942,7 +1945,14 @@ impl Parser {
             AttributeClass::Unimplemented => {
                 // The generated inventory: only an explicit request shows it,
                 // so valid uses keep GCC's own (silent) behaviour by default.
-                self.attribute_warning(format!("\'{name}\' attribute ignored"), name_span, true);
+                self.attribute_warning(
+                    format!(
+                        "\'{}\' attribute ignored",
+                        attribute_registry::canonical(name)
+                    ),
+                    name_span,
+                    true,
+                );
                 self.advance();
                 if matches!(self.peek(), TokenKind::LParen) {
                     self.skip_balanced_parens();
@@ -1950,8 +1960,11 @@ impl Parser {
             }
             AttributeClass::Implemented => {
                 if attribute_registry::target(name) != AttributeTarget::Any {
+                    // GCC prints and compares the canonical spelling
+                    // (`__naked__` -> `naked`, measured); store it once so
+                    // every placement message matches its wording.
                     self.attrs.parsing_attr_targets.push((
-                        name.to_string(),
+                        attribute_registry::canonical(name).to_string(),
                         name_span,
                         attribute_registry::target(name),
                     ));
@@ -2011,11 +2024,18 @@ impl Parser {
         if recorded.is_empty() {
             return;
         }
+        // The OUTERMOST derived names the declaration kind: `void *f(int)`
+        // is [Pointer, Function] (a function — gcc is silent on
+        // `extern __inline __attribute__((gnu_inline)) void *f(int);`),
+        // while `int (*fp)(void)` is [Function, Pointer] (an object).
+        // A single-element slice match misclassified every
+        // pointer-returning function as an object and fired
+        // `'__gnu_inline__' attribute ignored` on glibc's stdlib-bsearch.h.
         let is_function = matches!(
-            derived,
-            [crate::frontend::parser::ast::DerivedDeclarator::Function(
+            derived.last(),
+            Some(crate::frontend::parser::ast::DerivedDeclarator::Function(
                 ..
-            )]
+            ))
         );
         let is_record = matches!(
             type_spec,

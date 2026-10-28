@@ -74,6 +74,29 @@ PROBES = [
     ('ok-nothrow-list', 'void __attribute__((__nothrow__, __leaf__)) f(void){}', None, False),
     ('ok-nothrow-single', 'void __attribute__((nothrow)) f(void){}', None, False),
     ('ok-leaf', 'void __attribute__((leaf)) f(void){}', None, False),
+    # glibc bits/stdlib-bsearch.h shapes (measured 2026-10-28): spec-position
+    # `__gnu_inline__` on a pointer-returning function must stay silent —
+    # the exact -O3 CI failure of the ICX volatile-reduction lane.
+    ('ok-gnu-inline-ptr-ret',
+     'extern __inline __attribute__ ((__gnu_inline__)) void *fa(int);', None, False),
+    ('ok-gnu-inline-nth',
+     'extern __inline __attribute__ ((__gnu_inline__)) void *\n'
+     '__attribute__ ((__nothrow__ , __leaf__)) fc(int);', None, False),
+    # Canonical-name wording (measured on gcc-16.2): dunder spellings print
+    # the stripped name, and the dedicated `naked` phrase must still fire.
+    ('naked-dunder-object',
+     'extern __attribute__ ((__naked__)) int (*f1)(void);',
+     "'naked' attribute only applies to functions", False),
+    ('unknown-dunder',
+     'extern __attribute__ ((__made_up__)) int (*f2)(void);',
+     "'made_up' attribute directive ignored", False),
+    ('gnu-inline-object',
+     'extern __attribute__ ((__gnu_inline__)) int (*fpo)(void);',
+     "'gnu_inline' attribute ignored", False),
+    ('const-void-dunder', 'void __attribute__((__const__)) v(void){}',
+     "'const' attribute on function returning 'void'", False),
+    ('pure-void-dunder', 'void __attribute__((__pure__)) v(void){}',
+     "'pure' attribute on function returning 'void'", False),
 ]
 
 # TUs that pull in system headers must compile clean under -Werror, the
@@ -158,9 +181,12 @@ def main() -> int:
         if want not in ldiag:
             failures.append((n, 'inventory silent', want, ldiag))
     # Header TUs: identical under -Wall -Wextra -Werror on both compilers.
+    # -O2 matters: `bits/stdlib-bsearch.h` (the `__gnu_inline__` glibc
+    # shape) only appears when __OPTIMIZE__ is defined, so an -O0-only
+    # probe compiles clean while the -O3 CI lanes fail.
     for i, src in enumerate(HEADER_PROBES):
-        grext, gerr = run(gcc, src, ['-Wall', '-Wextra', '-Werror'])
-        lex, lerr = run(str(LCCC), src, ['-Wall', '-Wextra', '-Werror'])
+        grext, gerr = run(gcc, src, ['-Wall', '-Wextra', '-Werror', '-O2'])
+        lex, lerr = run(str(LCCC), src, ['-Wall', '-Wextra', '-Werror', '-O2'])
         gdiag, ldiag = first_diag(gerr), first_diag(lerr)
         if gdiag:
             failures.append((f'header-{i}', 'gcc warns', '', gdiag))
