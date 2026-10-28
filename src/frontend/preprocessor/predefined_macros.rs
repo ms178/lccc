@@ -63,19 +63,97 @@ impl Preprocessor {
             ("__x86_64", "1"),
             ("__amd64__", "1"),
             ("__amd64", "1"),
-            // GCC compat: claim GCC 14.2.0. This is:
-            //  - >= 5.1 (Linux kernel minimum requirement)
-            //  - >= 7.4 (QEMU minimum requirement)
-            //  - A modern version that satisfies most project requirements.
-            // For glibc's _Float* types (expected native for GCC >= 7), we define
-            // them as macros mapping to standard C types below.
-            ("__GNUC__", "14"),
+            // GCC compatibility claim. The compiler targets **GCC 16.2** semantics
+            // (see docs/GCC16-PARITY-ASSESSMENT-2026-10-27.md), so it claims 16.2:
+            // a claim lower than the implemented language level makes headers take
+            // the pre-16 code paths (`__GNUC_PREREQ`), while a claim higher than the
+            // implementation would be an over-claim. Keep this in lockstep with
+            // `-dumpversion`/`-dumpfullversion` (src/driver/cli.rs) and with the
+            // `GCC_VERSION_*` constants below; `tests/regression/check_macro_parity.sh`
+            // fails if they diverge.
+            ("__GNUC__", "16"),
             ("__GNUC_MINOR__", "2"),
             ("__GNUC_PATCHLEVEL__", "0"),
-            ("__VERSION__", "\"14.2.0\""),
+            ("__VERSION__", "\"16.2.0\""),
             // C99 inline semantics: tells gnulib and other libraries that
             // plain `inline` provides an inline definition only (no external symbol).
             ("__GNUC_STDC_INLINE__", "1"),
+            // --- GCC 16.2 predefined environment (measured 2026-10-27) -------
+            // Spellings and values are byte-identical to `gcc-16 -dM -E` on
+            // x86-64 so the macro-parity gate diffs to zero on these rows.
+            ("__BIGGEST_ALIGNMENT__", "16"),
+            ("__CHAR8_TYPE__", "unsigned char"),
+            ("__FINITE_MATH_ONLY__", "0"),
+            ("__FLOAT_WORD_ORDER__", "__ORDER_LITTLE_ENDIAN__"),
+            ("__SIZEOF_FLOAT80__", "16"),
+            ("__GXX_ABI_VERSION", "1021"),
+            ("__REGISTER_PREFIX__", ""),
+            ("__SIG_ATOMIC_TYPE__", "int"),
+            ("__GCC_HAVE_DWARF2_CFI_ASM", "1"),
+            ("__GCC_HAVE_SYNC_COMPARE_AND_SWAP_1", "1"),
+            ("__GCC_HAVE_SYNC_COMPARE_AND_SWAP_2", "1"),
+            ("__GCC_HAVE_SYNC_COMPARE_AND_SWAP_4", "1"),
+            ("__GCC_HAVE_SYNC_COMPARE_AND_SWAP_8", "1"),
+            ("__GCC_ATOMIC_TEST_AND_SET_TRUEVAL", "1"),
+            ("__GCC_ATOMIC_BOOL_LOCK_FREE", "2"),
+            ("__GCC_ATOMIC_CHAR_LOCK_FREE", "2"),
+            ("__GCC_ATOMIC_CHAR8_T_LOCK_FREE", "2"),
+            ("__GCC_ATOMIC_CHAR16_T_LOCK_FREE", "2"),
+            ("__GCC_ATOMIC_CHAR32_T_LOCK_FREE", "2"),
+            ("__GCC_ATOMIC_SHORT_LOCK_FREE", "2"),
+            ("__GCC_ATOMIC_INT_LOCK_FREE", "2"),
+            ("__GCC_ATOMIC_LONG_LOCK_FREE", "2"),
+            ("__GCC_ATOMIC_LLONG_LOCK_FREE", "2"),
+            ("__GCC_ATOMIC_WCHAR_T_LOCK_FREE", "2"),
+            ("__GCC_ATOMIC_POINTER_LOCK_FREE", "2"),
+            ("__STDC_IEC_559__", "1"),
+            ("__STDC_IEC_559_COMPLEX__", "1"),
+            ("__STDC_IEC_60559_BFP__", "201404L"),
+            ("__STDC_IEC_60559_COMPLEX__", "201404L"),
+            ("__STDC_ISO_10646__", "201706L"),
+            ("__FLT_IS_IEC_60559__", "1"),
+            ("__DBL_IS_IEC_60559__", "1"),
+            ("__LDBL_IS_IEC_60559__", "1"),
+            (
+                "__FLT_NORM_MAX__",
+                "3.40282346638528859811704183484516925e+38F",
+            ),
+            (
+                "__DBL_NORM_MAX__",
+                "((double)1.79769313486231570814527423731704357e+308L)",
+            ),
+            (
+                "__LDBL_NORM_MAX__",
+                "1.18973149535723176502126385303097021e+4932L",
+            ),
+            ("__INT8_MAX__", "0x7f"),
+            ("__INT16_MAX__", "0x7fff"),
+            ("__INT32_MAX__", "0x7fffffff"),
+            ("__INT64_MAX__", "0x7fffffffffffffffL"),
+            ("__INTMAX_MAX__", "0x7fffffffffffffffL"),
+            ("__INTPTR_MAX__", "0x7fffffffffffffffL"),
+            ("__UINT8_MAX__", "0xff"),
+            ("__UINT16_MAX__", "0xffff"),
+            ("__UINT32_MAX__", "0xffffffffU"),
+            ("__UINT64_MAX__", "0xffffffffffffffffUL"),
+            ("__UINTMAX_MAX__", "0xffffffffffffffffUL"),
+            ("__UINTPTR_MAX__", "0xffffffffffffffffUL"),
+            ("__INT_LEAST8_MAX__", "0x7f"),
+            ("__INT_LEAST16_MAX__", "0x7fff"),
+            ("__INT_LEAST32_MAX__", "0x7fffffff"),
+            ("__INT_LEAST64_MAX__", "0x7fffffffffffffffL"),
+            ("__UINT_LEAST8_MAX__", "0xff"),
+            ("__UINT_LEAST16_MAX__", "0xffff"),
+            ("__UINT_LEAST32_MAX__", "0xffffffffU"),
+            ("__UINT_LEAST64_MAX__", "0xffffffffffffffffUL"),
+            ("__INT_FAST8_MAX__", "0x7f"),
+            ("__INT_FAST16_MAX__", "0x7fffffffffffffffL"),
+            ("__INT_FAST32_MAX__", "0x7fffffffffffffffL"),
+            ("__INT_FAST64_MAX__", "0x7fffffffffffffffL"),
+            ("__UINT_FAST8_MAX__", "0xff"),
+            ("__UINT_FAST16_MAX__", "0xffffffffffffffffUL"),
+            ("__UINT_FAST32_MAX__", "0xffffffffffffffffUL"),
+            ("__UINT_FAST64_MAX__", "0xffffffffffffffffUL"),
             // sizeof macros
             ("__SIZEOF_POINTER__", "8"),
             ("__SIZEOF_INT__", "4"),
@@ -122,7 +200,7 @@ impl Preprocessor {
             ("__INT32_TYPE__", "int"),
             ("__INT64_TYPE__", "long int"),
             ("__UINT8_TYPE__", "unsigned char"),
-            ("__UINT16_TYPE__", "unsigned short int"),
+            ("__UINT16_TYPE__", "short unsigned int"),
             ("__UINT32_TYPE__", "unsigned int"),
             ("__UINT64_TYPE__", "long unsigned int"),
             ("__INTPTR_TYPE__", "long int"),
@@ -132,7 +210,7 @@ impl Preprocessor {
             ("__INT_LEAST32_TYPE__", "int"),
             ("__INT_LEAST64_TYPE__", "long int"),
             ("__UINT_LEAST8_TYPE__", "unsigned char"),
-            ("__UINT_LEAST16_TYPE__", "unsigned short int"),
+            ("__UINT_LEAST16_TYPE__", "short unsigned int"),
             ("__UINT_LEAST32_TYPE__", "unsigned int"),
             ("__UINT_LEAST64_TYPE__", "long unsigned int"),
             ("__INT_FAST8_TYPE__", "signed char"),
@@ -141,7 +219,7 @@ impl Preprocessor {
             ("__INT_FAST64_TYPE__", "long int"),
             ("__UINT_FAST8_TYPE__", "unsigned char"),
             ("__UINT_FAST16_TYPE__", "long unsigned int"),
-            ("__UINT_FAST32_TYPE__", "unsigned int"),
+            ("__UINT_FAST32_TYPE__", "long unsigned int"),
             ("__UINT_FAST64_TYPE__", "long unsigned int"),
             // FLT characteristics
             ("__FLT_MANT_DIG__", "24"),
@@ -459,6 +537,19 @@ impl Preprocessor {
                 // The cast type is `OFFSETOF_SIZE_TYPEDEF` (common/types.rs).
                 "((__lccc_offsetof_size_t)&((type *)0)->member)",
             ),
+            // Integer-constant construction macros. GCC predefines these (they
+            // are how <stdint.h> implements INT64_C without knowing the target's
+            // type spelling); measured byte-identical to `gcc-16 -dM -E`.
+            ("__INT8_C", &["c"], "c"),
+            ("__INT16_C", &["c"], "c"),
+            ("__INT32_C", &["c"], "c"),
+            ("__INT64_C", &["c"], "c ## L"),
+            ("__INTMAX_C", &["c"], "c ## L"),
+            ("__UINT8_C", &["c"], "c"),
+            ("__UINT16_C", &["c"], "c"),
+            ("__UINT32_C", &["c"], "c ## U"),
+            ("__UINT64_C", &["c"], "c ## UL"),
+            ("__UINTMAX_C", &["c"], "c ## UL"),
             // __has_builtin, __has_attribute, __has_feature, __has_extension,
             // __has_include, and __has_include_next are NOT defined as macros.
             // They are handled as special preprocessor operators:
@@ -672,8 +763,13 @@ impl Preprocessor {
     pub fn set_optimize(&mut self, optimize: bool, optimize_size: bool) {
         if optimize {
             self.define_simple_macro("__OPTIMIZE__", "1");
+            self.macros.undefine("__NO_INLINE__");
         } else {
             self.macros.undefine("__OPTIMIZE__");
+            // GCC predefines `__NO_INLINE__` exactly when it is not optimizing;
+            // glibc's <string.h> and several allocators key `extern inline`
+            // decisions off it.
+            self.define_simple_macro("__NO_INLINE__", "1");
         }
         if optimize_size {
             self.define_simple_macro("__OPTIMIZE_SIZE__", "1");

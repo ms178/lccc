@@ -1954,6 +1954,8 @@ impl Lowerer {
             has_explicit_align: false,
             is_const: (storage.is_const || storage.is_constexpr) && !storage.is_thread_local,
             is_used: false,
+            is_retain: false,
+            is_nocommon: false,
             is_thread_local: storage.is_thread_local,
         });
 

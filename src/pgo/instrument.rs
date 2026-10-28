@@ -623,6 +623,8 @@ pub fn instrument_module(
             has_explicit_align: true,
             is_const: false,
             is_used: true,
+            is_retain: false,
+            is_nocommon: false,
             is_thread_local: false,
         });
 
@@ -786,6 +788,8 @@ pub fn instrument_module(
                             has_explicit_align: true,
                             is_const: false,
                             is_used: true,
+                            is_retain: false,
+                            is_nocommon: false,
                             is_thread_local: false,
                         };
                         if !m.globals.iter().any(|x| x.name == g.name) {
@@ -2138,6 +2142,8 @@ fn emit_value_prof_helpers(m: &mut IrModule, uid: u64, vp_recorder: &str) {
             has_explicit_align: true,
             is_const: true,
             is_used: true,
+            is_retain: false,
+            is_nocommon: false,
             is_thread_local: false,
         });
     }
@@ -2168,6 +2174,8 @@ fn emit_value_prof_helpers(m: &mut IrModule, uid: u64, vp_recorder: &str) {
             has_explicit_align: true,
             is_const: false,
             is_used: true,
+            is_retain: false,
+            is_nocommon: false,
             is_thread_local: false,
         });
     }
@@ -2187,6 +2195,8 @@ fn emit_value_prof_helpers(m: &mut IrModule, uid: u64, vp_recorder: &str) {
         has_explicit_align: true,
         is_const: false,
         is_used: true,
+        is_retain: false,
+        is_nocommon: false,
         is_thread_local: false,
     });
     // addr2name table: {addr, name} pairs for every defined function.
@@ -2223,6 +2233,8 @@ fn emit_value_prof_helpers(m: &mut IrModule, uid: u64, vp_recorder: &str) {
             has_explicit_align: true,
             is_const: true,
             is_used: true,
+            is_retain: false,
+            is_nocommon: false,
             is_thread_local: false,
         });
     }

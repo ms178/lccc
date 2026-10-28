@@ -992,6 +992,8 @@ mod tests {
             has_explicit_align: false,
             is_const: false,
             is_used: false,
+            is_retain: false,
+            is_nocommon: false,
             is_thread_local: false,
         }
     }

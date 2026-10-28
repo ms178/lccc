@@ -1037,6 +1037,8 @@ pub(crate) fn run(module: &mut IrModule) -> usize {
                 visibility: None,
                 has_explicit_align: false,
                 is_used: true,
+                is_retain: false,
+                is_nocommon: false,
                 is_thread_local: false,
             });
             apply_one(&mut module.functions[fi], a, &name);
@@ -1653,6 +1655,8 @@ mod tests {
             visibility: None,
             has_explicit_align: false,
             is_used: true,
+            is_retain: false,
+            is_nocommon: false,
             is_thread_local: false,
         };
         let mut m = mk_module(vec![caller, reader], vec![pre(".LCA_0"), pre(".LCA_2")]);

@@ -98,6 +98,14 @@ pub struct IrGlobal {
     pub is_const: bool,
     /// __attribute__((used)) - prevent dead code elimination of this symbol.
     pub is_used: bool,
+    /// __attribute__((retain)) - keep the object's section alive through
+    /// `--gc-sections` (SHF_GNU_RETAIN). GCC also gives the object its own
+    /// section (`<default>.<name>`), which is what makes retention visible.
+    pub is_retain: bool,
+    /// __attribute__((nocommon)) - a tentative definition that must stay a
+    /// real `.bss` object even under `-fcommon`, which is applied to the whole
+    /// module after lowering.
+    pub is_nocommon: bool,
     /// Whether this global has _Thread_local or __thread storage class.
     /// Thread-local globals are placed in .tdata/.tbss and accessed via TLS mechanisms.
     pub is_thread_local: bool,

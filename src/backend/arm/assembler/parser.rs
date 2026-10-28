@@ -629,8 +629,7 @@ fn resolve_set_constants(lines: &[String]) -> Vec<String> {
                             continue;
                         }
                     }
-                    new_result.push(bytes[i] as char);
-                    i += 1;
+                    asm_preprocess::push_char_at(&mut new_result, &substituted, &mut i);
                 }
                 substituted = new_result;
             }
@@ -735,8 +734,7 @@ fn resolve_register_aliases(lines: &[String]) -> Vec<String> {
                             continue;
                         }
                     }
-                    new_result.push(bytes[i] as char);
-                    i += 1;
+                    asm_preprocess::push_char_at(&mut new_result, &result, &mut i);
                 }
                 result = new_result;
             }

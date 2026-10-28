@@ -136,6 +136,8 @@ mod tests {
             is_const: false,
             is_used: false,
             is_thread_local: false,
+            is_retain: false,
+            is_nocommon: false,
         }
     }
 

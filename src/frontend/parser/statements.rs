@@ -4,9 +4,11 @@
 // break, continue, goto (including computed goto), labels, compound
 // statements, and inline assembly (GCC syntax).
 
+use super::asm_validate;
 use super::ast::*;
 use super::parse::Parser;
 use crate::common::encoding::narrow_string_byte_carrier_to_utf8;
+use crate::common::source::Span;
 use crate::frontend::lexer::token::TokenKind;
 
 impl Parser {
@@ -526,6 +528,7 @@ impl Parser {
         }
 
         self.expect_closing(&TokenKind::RParen, open);
+        self.validate_inline_asm(&template, &outputs, &inputs, goto_labels.len(), open);
         self.consume_if(&TokenKind::Semicolon);
 
         Stmt::InlineAsm {
@@ -534,6 +537,63 @@ impl Parser {
             inputs,
             clobbers,
             goto_labels,
+        }
+    }
+
+    /// Reject the `asm` operand and template shapes GCC rejects.
+    ///
+    /// The back ends' `classify_constraint` has a `_ => {}` catch-all that maps
+    /// an unmodelled constraint letter to a general-purpose register, so
+    /// `asm("" : "=r"(r) : "z"(x))` used to compile here and emit the wrong
+    /// register class. Diagnosing at parse time is the only point where the
+    /// operand's *source* role (output vs input) and the operand count are
+    /// still explicit. See `super::asm_validate` for the measured GCC 16.2
+    /// message set.
+    fn validate_inline_asm(
+        &mut self,
+        template: &str,
+        outputs: &[AsmOperand],
+        inputs: &[AsmOperand],
+        label_count: usize,
+        span: Span,
+    ) {
+        if outputs.is_empty() && inputs.is_empty() && label_count == 0 && !template.contains('%') {
+            return;
+        }
+        let is_x86 = matches!(crate::common::types::target_elf_machine(), 3 | 62);
+        // Fold the operand expressions first: the fold borrows the enum table
+        // immutably, and the diagnostics below need `&mut self`.
+        let constness: Vec<asm_validate::Constness> = outputs
+            .iter()
+            .chain(inputs.iter())
+            .map(|op| asm_validate::constness(&op.expr, &self.enum_constants))
+            .collect();
+        let out_view: Vec<asm_validate::Operand<'_>> = outputs
+            .iter()
+            .enumerate()
+            .map(|(i, op)| asm_validate::Operand {
+                constraint: op.constraint.as_str(),
+                constant: constness[i],
+            })
+            .collect();
+        let in_view: Vec<asm_validate::Operand<'_>> = inputs
+            .iter()
+            .enumerate()
+            .map(|(i, op)| asm_validate::Operand {
+                constraint: op.constraint.as_str(),
+                constant: constness[outputs.len() + i],
+            })
+            .collect();
+        for problem in asm_validate::validate(template, &out_view, &in_view, label_count, is_x86) {
+            let at = problem
+                .operand
+                .and_then(|i| outputs.iter().chain(inputs.iter()).nth(i))
+                .map_or(span, |op| op.expr.span());
+            if problem.is_error {
+                self.emit_error(problem.message, at);
+            } else {
+                self.diagnostics.warning(problem.message, at);
+            }
         }
     }
 

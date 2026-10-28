@@ -34,38 +34,38 @@ pub enum CommentStyle {
 /// Preserves newlines inside comments so line numbers remain correct for error messages.
 /// String-aware: does not strip `/* */` inside quoted string literals (e.g. `.asciz` data).
 pub fn strip_c_comments(text: &str) -> String {
-    let mut result = String::with_capacity(text.len());
+    // Copies whole byte runs instead of mapping byte-by-byte: `bytes[i] as char`
+    // would re-encode every UTF-8 byte as a Latin-1 code point, so an asm symbol
+    // named `café` or `€` would reach the symbol table as mojibake.
     let bytes = text.as_bytes();
+    let mut result = String::with_capacity(bytes.len());
     let mut i = 0;
+    let mut run = 0; // start of the byte run not yet copied
     let mut in_string = false;
-    let mut escape = false;
     while i < bytes.len() {
         if in_string {
-            if escape {
-                escape = false;
-                result.push(bytes[i] as char);
-                i += 1;
-                continue;
+            match bytes[i] {
+                b'\\' => {
+                    // Skip the escaped byte (a UTF-8 continuation is skipped
+                    // whole so the string state stays in sync).
+                    i += 1;
+                    if i < bytes.len() {
+                        i += utf8_char_len(bytes[i]);
+                    }
+                }
+                b'"' | b'\n' => {
+                    in_string = false;
+                    i += 1;
+                }
+                _ => i += utf8_char_len(bytes[i]),
             }
-            if bytes[i] == b'\\' {
-                escape = true;
-                result.push(bytes[i] as char);
-                i += 1;
-                continue;
-            }
-            if bytes[i] == b'"' {
-                in_string = false;
-            }
-            // Newlines end the string context (unterminated string on this line)
-            if bytes[i] == b'\n' {
-                in_string = false;
-            }
-            result.push(bytes[i] as char);
-            i += 1;
-        } else if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            continue;
+        }
+        if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            result.push_str(&text[run..i]);
             i += 2;
-            while i + 1 < bytes.len() {
-                if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+            while i < bytes.len() {
+                if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
                     i += 2;
                     break;
                 }
@@ -74,15 +74,46 @@ pub fn strip_c_comments(text: &str) -> String {
                 }
                 i += 1;
             }
-        } else {
-            if bytes[i] == b'"' {
-                in_string = true;
-            }
-            result.push(bytes[i] as char);
-            i += 1;
+            run = i;
+            continue;
         }
+        if bytes[i] == b'"' {
+            in_string = true;
+        }
+        i += utf8_char_len(bytes[i]);
     }
+    result.push_str(&text[run..]);
     result
+}
+
+/// Copy the character starting at `*i` into `out` and advance `*i` past it.
+///
+/// Replacing `out.push(bytes[i] as char)` with this keeps non-ASCII text
+/// intact: a raw byte pushed as a `char` is re-encoded as Latin-1, so an
+/// assembler symbol such as `café` or `€` (legal in GAS and emitted by the C
+/// front end for extended identifiers) came out as mojibake and stopped
+/// resolving. `*i` must sit on a UTF-8 boundary, which holds because every
+/// step either consumes a whole character or an ASCII match.
+pub fn push_char_at(out: &mut String, text: &str, i: &mut usize) {
+    match text[*i..].chars().next() {
+        Some(ch) => {
+            out.push(ch);
+            *i += ch.len_utf8();
+        }
+        None => *i = text.len(),
+    }
+}
+
+/// Length in bytes of the UTF-8 sequence led by `lead` (1 for ASCII or a
+/// continuation byte, so a lenient scan never stalls on malformed input).
+fn utf8_char_len(lead: u8) -> usize {
+    match lead {
+        0x00..=0x7F => 1,
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF7 => 4,
+        _ => 1,
+    }
 }
 
 /// Strip trailing line comment from a single line, respecting string literals.
@@ -1446,33 +1477,35 @@ fn split_leading_labels(stmt: &str) -> (Vec<&str>, &str) {
 /// of `\orig_len`. In GAS, `\()` is used to explicitly delimit parameter names
 /// from adjacent identifier characters (e.g., `\op\()_safe_regs`).
 pub fn replace_macro_param(text: &str, pattern: &str, replacement: &str) -> String {
-    let pat_bytes = pattern.as_bytes();
-    let pat_len = pat_bytes.len();
-    let text_bytes = text.as_bytes();
-    let text_len = text_bytes.len();
-    let mut result = String::with_capacity(text_len);
-    let mut i = 0;
-    while i < text_len {
-        if i + pat_len <= text_len && &text_bytes[i..i + pat_len] == pat_bytes {
-            // Check that the character after the match is not an identifier continuation
-            let after = if i + pat_len < text_len {
-                text_bytes[i + pat_len]
-            } else {
-                b' ' // end of string counts as delimiter
-            };
-            if after.is_ascii_alphanumeric() || after == b'_' {
-                // Not a full match -- the parameter name continues
-                result.push(text_bytes[i] as char);
-                i += 1;
-            } else {
-                result.push_str(replacement);
-                i += pat_len;
-            }
-        } else {
-            result.push(text_bytes[i] as char);
-            i += 1;
-        }
+    let pat_len = pattern.len();
+    if pat_len == 0 || !text.contains(pattern) {
+        // Nothing to substitute: skip the copying pass entirely (this runs for
+        // every `\param` of every line of every macro body).
+        return text.to_string();
     }
+    let text_bytes = text.as_bytes();
+    let mut result = String::with_capacity(text.len());
+    let mut copied = 0; // text before this offset is already in `result`
+    let mut search = 0;
+    while let Some(rel) = text[search..].find(pattern) {
+        let at = search + rel;
+        // The character after the match must not extend the parameter name;
+        // GAS symbol characters include every byte with the high bit set.
+        let continues = text_bytes
+            .get(at + pat_len)
+            .is_some_and(|&b| b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80);
+        if continues {
+            // Not a full match -- the parameter name continues. `at + 1` is a
+            // char boundary because the pattern starts with `\\`.
+            search = at + 1;
+            continue;
+        }
+        result.push_str(&text[copied..at]);
+        result.push_str(replacement);
+        copied = at + pat_len;
+        search = copied;
+    }
+    result.push_str(&text[copied..]);
     result
 }
 

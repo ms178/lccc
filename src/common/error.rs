@@ -341,6 +341,11 @@ pub struct WarningConfig {
     not_errors: crate::common::fx_hash::FxHashSet<WarningKind>,
     default_errors: crate::common::fx_hash::FxHashSet<WarningKind>,
     explicit_enable: crate::common::fx_hash::FxHashSet<WarningKind>,
+    /// `-Wsystem-headers`: report warnings located in system headers (off by
+    /// default, as in GCC).
+    system_headers: bool,
+    /// Pre-C99 implicit return types belong to -Wreturn-type under -Wall
+    /// or an explicit -Wreturn-type request, not to the C99 constraint class.
     legacy_implicit_return_type: bool,
     permissive: Option<bool>,
     bare_return_enabled: bool,
@@ -362,6 +367,7 @@ impl WarningConfig {
             not_errors: crate::common::fx_hash::FxHashSet::default(),
             default_errors: crate::common::fx_hash::FxHashSet::default(),
             explicit_enable: crate::common::fx_hash::FxHashSet::default(),
+            system_headers: false,
             legacy_implicit_return_type: false,
             permissive: None,
             bare_return_enabled: true,
@@ -484,6 +490,12 @@ impl WarningConfig {
         self.explicit_enable.contains(&kind)
     }
 
+    /// `-Wsystem-headers` / `-Wno-system-headers`.
+    pub fn set_system_headers(&mut self, enabled: bool) {
+        self.system_headers = enabled;
+    }
+
+    /// Check if a warning of the given kind should be promoted to an error.
     pub fn is_error(&self, kind: WarningKind) -> bool {
         ((self.errors.contains(&kind) || self.default_errors.contains(&kind))
             && !self.not_errors.contains(&kind))
@@ -508,6 +520,24 @@ impl WarningConfig {
             }
             "no-error" => {
                 self.werror_all = false;
+                true
+            }
+            "all" => {
+                self.enable_wall();
+                true
+            }
+            "extra" => {
+                self.enable_wextra();
+                true
+            }
+            // `-Wsystem-headers`: report warnings located in system headers.
+            // Not a warning category of its own, so it is not a WarningKind.
+            "system-headers" => {
+                self.system_headers = true;
+                true
+            }
+            "no-system-headers" => {
+                self.system_headers = false;
                 true
             }
             _ if flag.starts_with("error=") => {
@@ -802,6 +832,10 @@ impl DiagnosticEngine {
         self.warning_count += 1;
     }
 
+    /// `-Wsystem-headers` / `-Wno-system-headers`.
+    pub fn set_system_headers(&mut self, enabled: bool) {
+        self.warning_config.set_system_headers(enabled);
+    }
     /// Set the warning configuration (parsed from CLI flags).
     pub fn set_warning_config(&mut self, config: WarningConfig) {
         self.warning_config = config;
@@ -857,6 +891,19 @@ impl DiagnosticEngine {
     /// - If -Werror or -Werror=<name> applies, it is promoted to an error.
     /// - The GCC-style `[-W<name>]` suffix is appended to the message.
     pub fn emit(&mut self, diag: &Diagnostic) {
+        // GCC suppresses diagnostics that come from a system header unless
+        // -Wsystem-headers asks for them; the suppression applies to warnings
+        // only. Without this, a project that merely includes <pthread.h>
+        // would see our honest `'returns_twice' attribute ignored` note on a
+        // declaration it does not own.
+        if diag.severity == Severity::Warning
+            && !self.warning_config.system_headers
+            && diag
+                .span
+                .is_some_and(|span| self.span_is_in_system_header(span))
+        {
+            return;
+        }
         match diag.severity {
             Severity::Warning => {
                 if let Some(mut kind) = diag.warning_kind {
@@ -943,6 +990,22 @@ impl DiagnosticEngine {
                 // notes don't count separately
             }
         }
+    }
+
+    /// Whether `span` resolves into a system header.
+    ///
+    /// The test is the one GCC's driver applies when it classifies include
+    /// directories: the compiler's own `<built-in>` buffer, `/usr/include*`,
+    /// the GCC installation's include directory, `/usr/local/include*` and
+    /// `/usr/lib*/gcc/*/include*`. `-I`/`-isystem` directories are not
+    /// consulted here; those are ordinary user directories from the point of
+    /// view of this predicate, so a warning inside them is still reported.
+    fn span_is_in_system_header(&self, span: Span) -> bool {
+        let Some(sm) = self.source_manager.as_ref() else {
+            return false;
+        };
+        let file = sm.resolve_span(span).file;
+        is_system_header_path(&file)
     }
 
     /// Emit an error with a message and span.
@@ -1487,5 +1550,140 @@ mod dialect_severity_redteam_tests {
         assert!(config.is_enabled(WarningKind::IntConversion));
         assert!(!config.is_enabled(WarningKind::ImplicitInt));
         assert!(!config.bare_return_enabled);
+    }
+}
+
+/// Whether a resolved source path names a system header.
+///
+/// This is the path test GCC's driver applies when it marks include
+/// directories as `-isystem` implicitly; it is deliberately narrow so that a
+/// warning inside a project's own headers always survives.
+pub fn is_system_header_path(path: &str) -> bool {
+    // `<built-in>` and `<command line>` are the compiler's own pseudo-files:
+    // GCC reports them as system headers, so their warnings follow
+    // -Wsystem-headers like any other. (A warning that originates in *user*
+    // code always carries a user-file location, so this cannot hide one.)
+    if path == "<built-in>" || path == "<command line>" {
+        return true;
+    }
+    let Some((dir, _)) = path.rsplit_once('/') else {
+        // A bare relative path is a project file.
+        return false;
+    };
+    // The compiler's own bundled headers (`include/` next to the binary) are
+    // system headers by definition; they are recognised by shape below only if
+    // they live under an install prefix, so name them explicitly.
+    if dir.ends_with("/lib/gcc") || dir.contains("/lib/gcc/") {
+        return true;
+    }
+    is_system_include_dir(dir)
+}
+
+/// Whether `dir` is one of the include directories GCC marks as system
+/// implicitly: anything under `/usr/include`, `/usr/local/include`, the GCC or
+/// LLVM installation trees, or a cross sysroot's `<triple>/include` (Debian
+/// spells those `/usr/<triple>/include` and `/usr/lib/<triple>/include`).
+///
+/// The test is on *directory shape*, not on a list of prefixes, so a sysroot
+/// passed with `--sysroot=/opt/sysroot` is covered too. A project that happens
+/// to install headers under `.../usr/include` is treated as a system directory,
+/// which is also what GCC's `-isystem` defaults do.
+pub fn is_system_include_dir(dir: &str) -> bool {
+    // Path-boundary comparison: `/usr/include_local` is NOT `/usr/include`.
+    let under = |base: &str| dir == base || dir.starts_with(&format!("{base}/"));
+    if under("/usr/include") || under("/usr/local/include") {
+        return true;
+    }
+    // `/usr/lib/gcc/<triple>/<version>/include`, `/usr/lib/llvm-<n>/lib/clang/
+    // <version>/include`, `/usr/lib/<triple>/include`, `/opt/sysroot/usr/lib/
+    // gcc/...`: the directory itself ends in `include` beneath a compiler or
+    // sysroot tree.
+    let ends_with_include = dir.ends_with("/include")
+        || dir
+            .rsplit_once('/')
+            .is_some_and(|(_, last)| last == "include");
+    ends_with_include
+        && (dir.contains("/lib/gcc/")
+            || dir.contains("/lib/clang/")
+            || dir.starts_with("/opt/")
+            || dir.contains("/usr/")
+            || dir.contains("-linux-gnu")
+            || dir.contains("-linux-musl")
+            || dir.contains("-unknown-"))
+}
+
+#[cfg(test)]
+mod system_header_tests {
+    use super::is_system_header_path;
+
+    #[test]
+    fn system_headers_are_recognised() {
+        assert!(is_system_header_path("/usr/include/pthread.h"));
+        assert!(is_system_header_path(
+            "/usr/lib/gcc/x86_64-linux-gnu/12/include/stddef.h"
+        ));
+        assert!(is_system_header_path("<built-in>"));
+    }
+
+    #[test]
+    fn project_headers_are_not() {
+        assert!(!is_system_header_path("src/main.c"));
+        assert!(!is_system_header_path("/home/user/project/include/x.h"));
+        assert!(!is_system_header_path("/usr/include_local/x.h"));
+        assert!(!is_system_header_path("/home/user/project/usr/x.h"));
+    }
+
+    #[test]
+    fn cross_sysroots_are_system_headers() {
+        // The AArch64/RISC-V lanes compile against a Debian cross sysroot; a
+        // warning inside it must not reach the user any more than one in the
+        // native `/usr/include` does.
+        for p in [
+            "/usr/aarch64-linux-gnu/include/stdio.h",
+            "/usr/include/i386-linux-gnu/bits/types.h",
+            "/usr/lib/gcc/aarch64-linux-gnu/14/include/stddef.h",
+            "/opt/sysroot/usr/include/zlib.h",
+            "/usr/lib/llvm-19/lib/clang/19/include/immintrin.h",
+        ] {
+            assert!(is_system_header_path(p), "{p}");
+        }
+    }
+
+    #[test]
+    fn warnings_from_system_headers_are_suppressed_unless_requested() {
+        use super::DiagnosticEngine;
+        use crate::common::source::{SourceManager, Span};
+        let mut sm = SourceManager::new();
+        let sys = sm.add_file("/usr/include/x.h".to_string(), "int v;\n".to_string());
+        let usr = sm.add_file("src/main.c".to_string(), "int v;\n".to_string());
+        let mut engine = DiagnosticEngine::new();
+        engine.set_source_manager(sm);
+
+        // Default: a warning the user cannot act on is not printed, but it is
+        // still counted as suppressed (not as emitted).
+        engine.warning("in a system header", Span::new(0, 5, sys));
+        assert_eq!(
+            engine.warning_count, 0,
+            "system-header warning must be suppressed"
+        );
+        // A warning in the user's own file is unaffected.
+        engine.warning("in the user's file", Span::new(0, 5, usr));
+        assert_eq!(engine.warning_count, 1);
+
+        // `-Wsystem-headers` turns the suppression off.
+        engine.set_system_headers(true);
+        engine.warning("in a system header", Span::new(0, 5, sys));
+        assert_eq!(engine.warning_count, 2);
+
+        // Errors are never suppressed: a broken system header is still a
+        // broken translation unit.
+        engine.error("in a system header", Span::new(0, 5, sys));
+        assert_eq!(engine.error_count, 1);
+    }
+
+    #[test]
+    fn command_line_and_builtin_locations_are_system() {
+        assert!(is_system_header_path("<built-in>"));
+        assert!(is_system_header_path("<command line>"));
     }
 }

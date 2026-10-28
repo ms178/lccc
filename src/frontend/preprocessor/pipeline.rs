@@ -325,6 +325,19 @@ impl Preprocessor {
             // §6.10.9) apply in source order relative to directives.
             self.drain_expansion_pragmas();
             let trimmed = line.trim();
+            // C95 digraph `%:` denotes `#` in every context, so a directive
+            // may be introduced by it (`%:include <stdio.h>`), which GCC 16.2
+            // accepts in every dialect. Normalising here is the single point
+            // where a directive line is recognised; the lexer maps `%:` to
+            // `Hash` everywhere else.
+            let digraph_directive;
+            let trimmed = match trimmed.strip_prefix("%:") {
+                Some(rest) => {
+                    digraph_directive = format!("#{rest}");
+                    digraph_directive.as_str()
+                }
+                None => trimmed,
+            };
 
             // Build this output line's source-position resolver: comment
             // breakpoints (if any) composed with the join map give the

@@ -7064,6 +7064,8 @@ mod value_reference_tests {
             is_const: false,
             is_used: false,
             is_thread_local: false,
+            is_retain: false,
+            is_nocommon: false,
         }];
         let (referenced, asm) = collect_value_referenced_functions(&module);
         assert!(function_referenced_as_value("callee", &referenced, &asm));

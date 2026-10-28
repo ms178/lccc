@@ -179,6 +179,14 @@ pub(super) mod parsed_attr_flag {
     pub const UNINITIALIZED: u64 = 1 << 31;
     /// C23 `[[maybe_unused]]` / GNU `unused` attribute.
     pub const MAYBE_UNUSED: u64 = 1 << 32;
+    /// `__attribute__((retain))` — section must survive section GC.
+    pub const RETAIN: u64 = 1 << 33;
+    /// `__attribute__((noinit))` — object lives in `.noinit`, never zeroed.
+    pub const NOINIT: u64 = 1 << 34;
+    /// `__attribute__((persistent))` — object lives in `.persistent`.
+    pub const PERSISTENT: u64 = 1 << 35;
+    /// `__attribute__((nocommon))` — tentative definition is not a common block.
+    pub const NO_COMMON_ATTR: u64 = 1 << 36;
     /// The storage-class specifiers a declaration carries (C11 6.7.1; GNU
     /// `auto` is NESTED_FN). `register` is not tracked.
     pub const STORAGE_CLASSES: u64 =
@@ -410,6 +418,38 @@ impl ParsedDeclAttrs {
     #[inline]
     pub fn parsing_used(&self) -> bool {
         self.flags & parsed_attr_flag::USED != 0
+    }
+    #[inline]
+    pub fn parsing_retain(&self) -> bool {
+        self.flags & parsed_attr_flag::RETAIN != 0
+    }
+    #[inline]
+    pub fn set_retain(&mut self, v: bool) {
+        self.set_flag(parsed_attr_flag::RETAIN, v)
+    }
+    #[inline]
+    pub fn parsing_noinit(&self) -> bool {
+        self.flags & parsed_attr_flag::NOINIT != 0
+    }
+    #[inline]
+    pub fn set_noinit(&mut self, v: bool) {
+        self.set_flag(parsed_attr_flag::NOINIT, v)
+    }
+    #[inline]
+    pub fn parsing_persistent(&self) -> bool {
+        self.flags & parsed_attr_flag::PERSISTENT != 0
+    }
+    #[inline]
+    pub fn set_persistent(&mut self, v: bool) {
+        self.set_flag(parsed_attr_flag::PERSISTENT, v)
+    }
+    #[inline]
+    pub fn parsing_nocommon(&self) -> bool {
+        self.flags & parsed_attr_flag::NO_COMMON_ATTR != 0
+    }
+    #[inline]
+    pub fn set_nocommon(&mut self, v: bool) {
+        self.set_flag(parsed_attr_flag::NO_COMMON_ATTR, v)
     }
     #[inline]
     pub fn parsing_maybe_unused(&self) -> bool {
@@ -1740,6 +1780,24 @@ impl Parser {
                         }
                     }
                     _ => {
+                        // C23 attributes in the implementation namespace: GCC
+                        // accepts the ones it knows silently and reports the
+                        // rest as "'x' attribute ignored" (measured 2026-10-27:
+                        // `int q [[frobnicate]];` warns, `[[maybe_unused]]`
+                        // does not). One phrasing covers both "not a GCC
+                        // attribute" and "GCC attribute we do not implement",
+                        // which is what GCC itself prints for the first case.
+                        if !crate::frontend::parser::attr_registry::accepted_silently(&attr_name) {
+                            let span = self.peek_span();
+                            self.diagnostics.warning_with_kind(
+                                format!(
+                                    "'{}' attribute ignored",
+                                    crate::frontend::parser::attr_registry::normalize(&attr_name)
+                                ),
+                                span,
+                                crate::common::error::WarningKind::Attributes,
+                            );
+                        }
                         self.advance();
                         if matches!(self.peek(), TokenKind::LParen) {
                             self.skip_balanced_parens();
@@ -2183,6 +2241,26 @@ impl Parser {
                 self.advance();
                 self.attrs.parsing_section = self.parse_string_attr_arg();
             }
+            // GCC 16.2 object-placement attributes (measured 2026-10-27):
+            //   retain    -> own section `.data.<name>`/`.bss.<name>` + SHF_GNU_RETAIN
+            //   noinit    -> `.noinit` (SHT_NOBITS); diagnosed on an initialized object
+            //   persistent-> `.persistent` (PROGBITS); diagnosed on an uninitialized one
+            "retain" | "__retain__" => {
+                self.attrs.set_retain(true);
+                self.advance();
+            }
+            "noinit" | "__noinit__" => {
+                self.attrs.set_noinit(true);
+                self.advance();
+            }
+            "persistent" | "__persistent__" => {
+                self.attrs.set_persistent(true);
+                self.advance();
+            }
+            "nocommon" | "__nocommon__" => {
+                self.attrs.set_nocommon(true);
+                self.advance();
+            }
             "__diagnose_as"
             | "diagnose_as"
             | "__diagnose_as__"
@@ -2408,6 +2486,32 @@ impl Parser {
                 self.parse_address_space_attr();
             }
             _ => {
+                // Unknown to the dispatcher. Three cases, exactly as GCC 16.2
+                // distinguishes them (measured 2026-10-27):
+                //   * a GCC attribute whose semantics we do not implement ->
+                //     `'x' attribute ignored` (GCC implements it silently;
+                //     silence here would hide an ABI/codegen divergence)
+                //   * a GCC attribute with only diagnostic/optimisation effect
+                //     -> accepted silently, like GCC
+                //   * not a GCC attribute at all -> `'x' attribute directive
+                //     ignored`
+                use crate::common::error::WarningKind;
+                use crate::frontend::parser::attr_registry::{Disposition, classify, normalize};
+                let span = self.peek_span();
+                let spelling = normalize(name).to_string();
+                match classify(name) {
+                    Some(Disposition::Unimplemented) => self.diagnostics.warning_with_kind(
+                        format!("'{spelling}' attribute ignored"),
+                        span,
+                        WarningKind::Attributes,
+                    ),
+                    Some(Disposition::Implemented) | Some(Disposition::Benign) => {}
+                    None => self.diagnostics.warning_with_kind(
+                        format!("'{spelling}' attribute directive ignored"),
+                        span,
+                        WarningKind::Attributes,
+                    ),
+                }
                 self.advance();
                 if matches!(self.peek(), TokenKind::LParen) {
                     self.skip_balanced_parens();

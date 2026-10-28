@@ -117,12 +117,21 @@ fn strip_blue_paint(s: &str) -> std::borrow::Cow<'_, str> {
 /// In final output, discard paint/paste markers and serialize token boundaries;
 /// during token paste, discard blue paint only. Allocate only for a real edit.
 fn normalize_internal_markers(s: &str, final_output: bool) -> std::borrow::Cow<'_, str> {
-    let is_marker = |b| {
+    let is_marker = |b: u8| {
         b == BLUE_PAINT_MARKER
             || (final_output
                 && matches!(b, PASTE_PROTECT_START | PASTE_PROTECT_END | TOKEN_BOUNDARY))
     };
-    if !s.as_bytes().iter().copied().any(is_marker) {
+    // The four markers are 0x01..=0x04, so the "nothing to do" test is a range
+    // compare that vectorises, instead of a per-byte closure call. This runs for
+    // every expanded line of every translation unit (23.5k times on a 10k-line
+    // TU), and the answer is almost always "no markers".
+    let hit = if final_output {
+        s.as_bytes().iter().any(|&b| b.wrapping_sub(1) < 4)
+    } else {
+        s.as_bytes().iter().any(|&b| b == BLUE_PAINT_MARKER)
+    };
+    if !hit {
         return std::borrow::Cow::Borrowed(s);
     }
     let bytes = s.as_bytes();
@@ -1953,6 +1962,58 @@ fn stringify_arg(arg: &str) -> String {
 /// Parse a #define directive line and return a MacroDef.
 /// The line should be the text after `#define ` (with leading whitespace stripped).
 /// Operates on bytes for performance.
+/// Translate the C95 digraphs that matter inside a replacement list: `%:%:` is
+/// `##` and `%:` is `#`. Substitution works on the body text, so a digraph left
+/// in place is never recognised as a paste or stringize operator
+/// (`#define CAT(a,b) a %:%: b` produced `x %:%: y`, a syntax error). One
+/// translation happens here, at define time, so every later stage sees the
+/// canonical spelling; string and character literals are left untouched, where
+/// `%:` is ordinary text.
+fn normalize_body_digraphs(body: &str) -> String {
+    if !body.contains("%:") {
+        return body.to_string();
+    }
+    let bytes = body.as_bytes();
+    let mut out = String::with_capacity(body.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' | b'\'' => {
+                let quote = bytes[i];
+                out.push(quote as char);
+                i += 1;
+                while i < bytes.len() {
+                    out.push(bytes[i] as char);
+                    if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                        out.push(bytes[i + 1] as char);
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i] == quote {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'%' if bytes.get(i + 1) == Some(&b':') => {
+                if bytes.get(i + 2) == Some(&b'%') && bytes.get(i + 3) == Some(&b':') {
+                    out.push_str("##");
+                    i += 4;
+                } else {
+                    out.push('#');
+                    i += 2;
+                }
+            }
+            b => {
+                out.push(b as char);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
 pub fn parse_define(line: &str) -> Option<MacroDef> {
     let line = line.trim();
     if line.is_empty() {
@@ -2041,7 +2102,7 @@ pub fn parse_define(line: &str) -> Option<MacroDef> {
 
         // Rest is the body
         let body = if i < len {
-            line[i..].trim().to_string()
+            normalize_body_digraphs(line[i..].trim())
         } else {
             String::new()
         };
@@ -2057,7 +2118,7 @@ pub fn parse_define(line: &str) -> Option<MacroDef> {
     } else {
         // Object-like macro
         let body = if i < len {
-            line[i..].trim().to_string()
+            normalize_body_digraphs(line[i..].trim())
         } else {
             String::new()
         };

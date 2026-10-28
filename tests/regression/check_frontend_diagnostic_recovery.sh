@@ -28,7 +28,9 @@ for name in ('lccc', 'lccc-x86', 'lccc-i686', 'lccc-arm', 'lccc-riscv'):
         errors = [d for d in raw if d['kind'] == 'error' and d['file'] is not None]
         match = re.search(r'^ccc: error: .+: (\d+) frontend error\(s\)$', text, re.M)
         assert match and int(match[1]) == len(errors), (name, source, text)
-        assert 'unexpected character byte 0x40' in text, (name, source, text)
+        # GCC 16.2's wording for a stray byte (this used to be a private
+        # message, `unexpected character byte 0x40 in source`).
+        assert "stray '@' in program" in text, (name, source, text)
         assert diagnostics.classify(1, text, compiler_family='lccc') == 'REJECT'
         print('PASS', name, source.name, 'counted errors:', len(errors))
 PY

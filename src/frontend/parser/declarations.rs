@@ -313,6 +313,10 @@ impl Parser {
         decl_attrs.set_uninitialized(is_uninitialized);
         decl_attrs.set_stack_protect(is_stack_protect);
         decl_attrs.set_no_stack_protector(is_no_stack_protector);
+        decl_attrs.set_retain(self.attrs.parsing_retain());
+        decl_attrs.set_noinit(self.attrs.parsing_noinit());
+        decl_attrs.set_persistent(self.attrs.parsing_persistent());
+        decl_attrs.set_nocommon(self.attrs.parsing_nocommon());
         decl_attrs.set_nested_fn(self.attrs.parsing_nested_fn());
         decl_attrs.alias_target = alias_target;
         decl_attrs.ifunc_target = ifunc_target;
@@ -927,6 +931,20 @@ impl Parser {
         }
         if self.attrs.parsing_used() {
             last_decl.attrs.set_used(true);
+        }
+        // Object-placement attributes (GCC 16.2): carried on the declarator so
+        // lowering can place the object and diagnose misuse.
+        if self.attrs.parsing_retain() {
+            last_decl.attrs.set_retain(true);
+        }
+        if self.attrs.parsing_noinit() {
+            last_decl.attrs.set_noinit(true);
+        }
+        if self.attrs.parsing_persistent() {
+            last_decl.attrs.set_persistent(true);
+        }
+        if self.attrs.parsing_nocommon() {
+            last_decl.attrs.set_nocommon(true);
         }
         if self.attrs.parsing_maybe_unused() {
             last_decl.attrs.set_maybe_unused(true);

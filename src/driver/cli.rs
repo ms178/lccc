@@ -196,6 +196,32 @@ fn profile_path_arg(arg: &str, prefix: &str) -> Result<String, String> {
     }
 }
 
+/// The Debian multiarch tuple for `target`, which is what `-print-multiarch`
+/// answers (glibc's configure and pkg-config use it as a library-directory
+/// suffix). Note this deliberately differs from `Target::triple()` for i686:
+/// Debian spells the 32-bit x86 multiarch tuple `i386-linux-gnu`.
+fn multiarch_triple(target: &Target) -> &'static str {
+    match target {
+        Target::X86_64 => "x86_64-linux-gnu",
+        Target::I686 => "i386-linux-gnu",
+        Target::Aarch64 => "aarch64-linux-gnu",
+        Target::Riscv64 => "riscv64-linux-gnu",
+    }
+}
+
+/// The GCC version this compiler implements and claims.
+///
+/// One source of truth: `__GNUC__`/`__GNUC_MINOR__`/`__VERSION__` in
+/// `src/frontend/preprocessor/predefined_macros.rs`, `-dumpversion`,
+/// `-dumpfullversion`, `--version` and `-v` all read these constants, and
+/// `tests/regression/check_macro_parity.sh` fails if the preprocessor table and
+/// these drift apart. Claiming a version lower than the implemented language
+/// level makes headers take stale code paths; claiming higher is an over-claim.
+pub const GCC_COMPAT_MAJOR: &str = "16";
+pub const GCC_COMPAT_MINOR: &str = "2";
+pub const GCC_COMPAT_PATCHLEVEL: &str = "0";
+pub const GCC_COMPAT_FULL_VERSION: &str = "16.2.0";
+
 impl Driver {
     /// Parse the value of `-falign-*=N[:M]`: a power-of-two byte alignment
     /// with an optional max-skip (`.p2align` third operand). Returns `None`
@@ -1462,8 +1488,41 @@ impl Driver {
                     println!("{}", target.triple());
                     return Ok(true);
                 }
+                // `-dumpversion` and `-dumpfullversion` both answer the full
+                // version: measured on the gcc 16.2 oracle, `-dumpversion`
+                // prints "16.2.0" (not just the major), and configure scripts
+                // that parse it accept either. Answering the shorter form here
+                // was a measurable divergence.
                 "-dumpversion" => {
-                    println!("14");
+                    println!("{}", GCC_COMPAT_FULL_VERSION);
+                    return Ok(true);
+                }
+                "-dumpfullversion" => {
+                    println!("{}", GCC_COMPAT_FULL_VERSION);
+                    return Ok(true);
+                }
+                "-print-sysroot" | "--print-sysroot" => {
+                    // GCC answers with the configured sysroot; without one it
+                    // prints an empty line (NOT an error), and configure
+                    // scripts test the result for emptiness. This driver has
+                    // no configured sysroot and refuses `--sysroot`/`-isysroot`
+                    // outright (see `reject_unsupported_sysroots`), so the
+                    // answer is the empty line, measured the same as gcc 16.2
+                    // built without `--with-sysroot`.
+                    println!();
+                    return Ok(true);
+                }
+                "-print-multiarch" | "--print-multiarch" => {
+                    // glibc's configure and pkg-config use this as the library
+                    // directory suffix ("x86_64-linux-gnu"). Empty output makes
+                    // them fall back to a bogus multiarch tuple.
+                    println!("{}", multiarch_triple(target));
+                    return Ok(true);
+                }
+                "-print-multi-lib" | "--print-multi-lib" => {
+                    // GCC prints one entry per multilib; lccc has exactly one,
+                    // the default, spelled "." followed by its option list (none).
+                    println!(".;");
                     return Ok(true);
                 }
                 "-print-libgcc-file-name" | "--print-libgcc-file-name" => {
@@ -1513,42 +1572,20 @@ impl Driver {
                     || arg.starts_with("--print-file-name=") =>
                 {
                     // glibc link rules: `${CC} --print-file-name=crtbeginS.o`.
+                    // Both spellings (`-` and `--`) and both query sites answer
+                    // through one implementation, so they cannot drift apart.
                     let name = arg.trim_start_matches('-').trim_start_matches('-');
                     let name = name.strip_prefix("print-file-name=").unwrap_or(name);
-                    if name == "include" {
-                        if let Some(bundled) =
-                            crate::frontend::preprocessor::Preprocessor::bundled_include_dir()
-                        {
-                            println!("{}", bundled.display());
-                            return Ok(true);
-                        }
-                    }
-                    let triple = target.triple();
-                    let search_dirs = [
-                        format!("/usr/lib/gcc/{}/13/", triple),
-                        format!("/usr/lib/{}/", triple),
-                        "/usr/lib/".to_string(),
-                    ];
-                    let mut found = false;
-                    for dir in &search_dirs {
-                        let path = format!("{}{}", dir, name);
-                        if std::path::Path::new(&path).exists() {
-                            println!("{}", path);
-                            found = true;
-                            break;
-                        }
-                    }
-                    if !found {
-                        println!("{}", name);
-                    }
+                    println!("{}", Self::print_file_name(name, target));
                     return Ok(true);
                 }
                 "--version" => {
                     // Meson detects GCC by checking for "Free Software Foundation"
-                    // in the --version output. We claim GCC 14.2.0 compatibility
-                    // (matching our __GNUC__/__GNUC_MINOR__/__GNUC_PATCHLEVEL__).
+                    // in the --version output. The claimed version is the GCC
+                    // release this compiler implements (see GCC_COMPAT_*).
                     println!(
-                        "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0"
+                        "lccc (a high performance Claude's C Compiler fork, GCC-compatible) {}",
+                        GCC_COMPAT_FULL_VERSION
                     );
                     println!("GCC is maintained by the Free Software Foundation, Inc.");
                     println!("This program is a fork of CCC (written by Claude Opus 4.6);");
@@ -1573,12 +1610,13 @@ impl Driver {
                 }
                 "-v" if args.len() == 2 => {
                     println!(
-                        "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0"
+                        "lccc (a high performance Claude's C Compiler fork, GCC-compatible) {}",
+                        GCC_COMPAT_FULL_VERSION
                     );
                     // GCC-style line so configure scripts that grep `-v` output
                     // for "gcc" (e.g. zlib-ng's compiler detection) classify the
                     // driver as GCC-compatible and enable the -fPIC/-std paths.
-                    println!("gcc version 14.2.0 (lccc)");
+                    println!("gcc version {} (lccc)", GCC_COMPAT_FULL_VERSION);
                     println!("Target: {}", target.triple());
                     return Ok(true);
                 }
@@ -1626,42 +1664,10 @@ impl Driver {
                     return Ok(true);
                 }
                 _ if arg.starts_with("-print-file-name=") => {
-                    let name = &arg["-print-file-name=".len()..];
-                    // Special case: "include" should return our bundled include
-                    // directory so that build systems (e.g., Linux kernel) pick up
-                    // our intrinsic headers (arm_neon.h, emmintrin.h, etc.) instead
-                    // of the host GCC's headers which use incompatible builtins.
-                    if name == "include" {
-                        if let Some(bundled) =
-                            crate::frontend::preprocessor::Preprocessor::bundled_include_dir()
-                        {
-                            println!("{}", bundled.display());
-                            return Ok(true);
-                        }
-                    }
-                    // Search standard library directories for the requested file.
-                    // If found, print the full path; otherwise echo the name back
-                    // (matching GCC behavior).
-                    let triple = target.triple();
-                    let search_dirs = [
-                        format!("/usr/lib/gcc/{}/13/", triple),
-                        format!("/usr/lib/gcc-cross/{}/13/", triple),
-                        format!("/usr/lib/{}/", triple),
-                        format!("/usr/{}/lib/", triple),
-                        "/usr/lib/".to_string(),
-                    ];
-                    let mut found = false;
-                    for dir in &search_dirs {
-                        let path = format!("{}{}", dir, name);
-                        if std::path::Path::new(&path).exists() {
-                            println!("{}", path);
-                            found = true;
-                            break;
-                        }
-                    }
-                    if !found {
-                        println!("{}", name);
-                    }
+                    println!(
+                        "{}",
+                        Self::print_file_name(&arg["-print-file-name=".len()..], target)
+                    );
                     return Ok(true);
                 }
                 _ => {}
@@ -1842,6 +1848,39 @@ impl Driver {
     }
 
     /// Split response file contents into tokens, handling simple quoting.
+    /// Resolve one `-print-file-name=<name>` query.
+    ///
+    /// `include` answers with this compiler's bundled include directory, so that
+    /// build systems (the Linux kernel, for one) pick up its intrinsic headers
+    /// instead of the host GCC's, which use incompatible builtins. Anything else is
+    /// searched for in the target's library directories and echoed back verbatim
+    /// when it is not found -- that is what GCC does, and configure scripts test
+    /// for it (`x` means "not found").
+    fn print_file_name(name: &str, target: &Target) -> String {
+        if name == "include" {
+            if let Some(bundled) =
+                crate::frontend::preprocessor::Preprocessor::bundled_include_dir()
+            {
+                return bundled.display().to_string();
+            }
+        }
+        let triple = target.triple();
+        let search_dirs = [
+            format!("/usr/lib/gcc/{}/13/", triple),
+            format!("/usr/lib/gcc-cross/{}/13/", triple),
+            format!("/usr/lib/{}/", triple),
+            format!("/usr/{}/lib/", triple),
+            "/usr/lib/".to_string(),
+        ];
+        for dir in &search_dirs {
+            let path = format!("{}{}", dir, name);
+            if std::path::Path::new(&path).exists() {
+                return path;
+            }
+        }
+        name.to_string()
+    }
+
     fn split_response_file(contents: &str) -> Vec<String> {
         let mut tokens = Vec::new();
         let mut current = String::new();
@@ -2776,9 +2815,26 @@ impl Driver {
                 // `-fprofile-generate=P`/`-fprofile-use=P` decides the
                 // directory, a bare mode switch uses the `-fprofile-dir` given
                 // before OR after it, and an empty path is an error.
-                "-fprofile-generate" | "-fprofile-arcs" | "-ftest-coverage" => {
+                "-fprofile-generate" => {
                     self.pgo_generate =
                         Some(profile_dir.clone().unwrap_or_else(|| ".".to_string()));
+                }
+                // GCC's gcov flags are a DIFFERENT instrumented-profile format
+                // from lccc's PGO (`.gcno`/`.gcda`, `__gcov_*` counters, read by
+                // `gcov`). lccc does not emit them, and until it does these two
+                // must not be silently re-routed into the PGO path: a coverage
+                // job would then read 0 % while the compiler printed a PGO
+                // banner, which is exactly the "accepted, no effect" class
+                // pillar 1 forbids. Refuse with a named reason (measured
+                // 2026-10-27: before this change both flags alone printed
+                // `lccc: PGO: instrumented N functions ...` and produced no
+                // gcov data at all).
+                arg @ ("-ftest-coverage" | "-fprofile-arcs") => {
+                    return Err(format!(
+                        "{arg} is not implemented: lccc emits no .gcno/.gcda and no __gcov_* \
+counters, so `gcov` would report no data. Use -fprofile-generate/-fprofile-use for \
+profile-guided optimisation, or an oracle-compiler build for coverage"
+                    ));
                 }
                 arg if arg.starts_with("-fprofile-generate=") => {
                     self.pgo_generate = Some(profile_path_arg(arg, "-fprofile-generate=")?);
@@ -4167,10 +4223,15 @@ mod cli_tests {
             generate_dir(&["-fprofile-dir=D", "-fprofile-generate=P"]),
             dir("P")
         );
-        assert_eq!(
-            generate_dir(&["-fprofile-dir=D", "-fprofile-arcs"]),
-            dir("D")
-        );
+        // `-fprofile-arcs`/`-ftest-coverage` are NOT PGO aliases: they are
+        // refused (no gcov emission). See the `-ftest-coverage` arm.
+        for flag in ["-fprofile-arcs", "-ftest-coverage"] {
+            let err = match parse_flags(&["-fprofile-dir=D", flag]) {
+                Ok(_) => panic!("{flag} must be refused"),
+                Err(e) => e,
+            };
+            assert!(err.contains("not implemented"), "{flag}: {err}");
+        }
         assert_eq!(generate_dir(&["-fprofile-generate"]), dir("."));
         let used = parse_flags(&["-fprofile-dir=U", "-fprofile-use"])
             .unwrap()

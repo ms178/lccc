@@ -2862,10 +2862,21 @@ fn global_init_needs_dynamic_reloc(init: &GlobalInit) -> bool {
 /// 7. Zero-initialized common globals go to .comm.
 /// 8. Zero-initialized non-common globals go to .bss.
 fn classify_global(g: &IrGlobal, pic_mode: bool) -> GlobalSection {
+    classify_global_impl(g, pic_mode, true)
+}
+
+/// `classify_global` without the `retain` override: the section a retained
+/// object would otherwise land in, which is the base of its per-object section
+/// name. Taking a flag instead of cloning the global keeps this allocation-free
+/// on a hot path (every global of every module).
+fn classify_global_impl(g: &IrGlobal, pic_mode: bool, honour_retain: bool) -> GlobalSection {
     if g.is_extern {
         return GlobalSection::Extern;
     }
-    if g.section.is_some() {
+    // `retain` also forces the Custom path: GCC gives a retained object its own
+    // section (`<default>.<name>`) so that SHF_GNU_RETAIN protects exactly that
+    // object from `--gc-sections`.
+    if g.section.is_some() || (honour_retain && g.is_retain) {
         return GlobalSection::Custom;
     }
     let is_zero = matches!(g.init, GlobalInit::Zero);
@@ -2893,6 +2904,22 @@ fn classify_global(g: &IrGlobal, pic_mode: bool) -> GlobalSection {
         return GlobalSection::Common;
     }
     GlobalSection::Bss
+}
+
+/// The section a `retain`-ed object gets when it has no explicit `section`
+/// attribute: its default section with `.<name>` appended, which is what GCC
+/// 16.2 emits (measured: `.data.keep`, `.bss.keep_bss`, both with SHF_GNU_RETAIN).
+fn retained_section_name(g: &IrGlobal, pic_mode: bool) -> String {
+    let base = match classify_global_impl(g, pic_mode, false) {
+        GlobalSection::Rodata => ".rodata",
+        GlobalSection::DataRelRo => ".data.rel.ro",
+        GlobalSection::Tdata => ".tdata",
+        GlobalSection::Tbss => ".tbss",
+        GlobalSection::Common | GlobalSection::Bss => ".bss",
+        GlobalSection::Custom | GlobalSection::Extern => ".data",
+        GlobalSection::Data => ".data",
+    };
+    format!("{base}.{}", g.name)
 }
 
 /// Emit global variable definitions, grouped by target section.
@@ -2937,16 +2964,25 @@ fn emit_globals(
         if !matches!(sect, GlobalSection::Custom) {
             continue;
         }
-        let section_name = g.section.as_ref().expect("custom section must have a name");
+        let section_name = g
+            .section
+            .clone()
+            .unwrap_or_else(|| retained_section_name(g, pic_mode));
+        let section_name = &section_name;
         // Use "a" (read-only) for const-qualified globals or rodata sections,
         // "aw" (writable) otherwise. GCC uses the const qualification of the
         // variable to determine section flags, not just the section name.
         // This matters for kernel sections like .modinfo which contain const data.
-        let flags = if g.is_const || section_name.contains("rodata") {
-            "a"
+        let mut flags = if g.is_const || section_name.contains("rodata") {
+            "a".to_string()
         } else {
-            "aw"
+            "aw".to_string()
         };
+        // SHF_GNU_RETAIN: `.section NAME,"awR",@progbits`. GNU as maps the "R"
+        // flag to SHF_GNU_RETAIN, which the linker honours under --gc-sections.
+        if g.is_retain {
+            flags.push('R');
+        }
         // GCC parity (verified against GCC 16.2 / GAS 2.47): a C `section`
         // attribute on a zero-initialized global still materializes PROGBITS
         // zero bytes — GCC never emits @nobits for a section attribute. Both
@@ -2968,7 +3004,9 @@ fn emit_globals(
         // fixed type, and the kernel's `static int lines __section(".data")`
         // pattern shares .data with relocatable pointer data — a NOBITS
         // .data silently drops that content (compressed misc.c boot hang).
-        let section_type = if section_name.starts_with(".bss") {
+        // `.noinit` is SHT_NOBITS in GCC: the object must not be zeroed by the
+        // loader, so nothing may be written to the section image.
+        let section_type = if section_name.starts_with(".bss") || section_name == ".noinit" {
             "@nobits"
         } else {
             "@progbits"

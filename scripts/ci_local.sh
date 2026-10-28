@@ -209,6 +209,21 @@ fi
 # the runner's core_pattern handler until the matrix became non-dumpable.)
 gate "driver-option-contract-core" fast \
     env CCC="$LCCC" bash tests/regression/check_driver_option_contract.sh --skip-trapv-matrix
+
+# Differential diagnostics the frontend owns: the attribute classes, the lexer
+# extensions, the identifier character tables and the inline-asm
+# operand/template rules are each pinned against the GCC 16.2 oracle, because
+# every one of them used to be silent (an unimplemented attribute generated
+# foreign-ABI code, an unmodelled constraint letter silently became a GPR).
+# Hosted CI runs the same scripts.
+gate "attribute-diagnostics" fast \
+    env CCC="$LCCC" bash tests/regression/check_attribute_diagnostics.sh
+gate "lexer-extensions" fast \
+    env CCC="$LCCC" bash tests/regression/check_lexer_extensions.sh
+gate "ucn-identifier-table" fast \
+    env CCC="$LCCC" GCC="${GCC16:-gcc-16}" bash tests/regression/check_ucn_identifier_table.sh
+gate "asm-operand-diagnostics" fast \
+    env CCC="$LCCC" GCC="${GCC16:-gcc-16}" bash tests/regression/check_asm_operand_diagnostics.sh
 gate "trapv-boundary-matrix-m64" fast \
     env CCC="$LCCC" bash tests/regression/check_trapv_boundary_matrix.sh --bits -m64
 gate "trapv-boundary-matrix-m32" fast \
