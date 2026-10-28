@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import shlex
 import subprocess
@@ -11,6 +12,11 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+# The phrases below are GCC's C-locale spelling. Under a UTF-8 locale GCC
+# quotes with U+2018/U+2019 instead, and Python itself exports
+# LC_CTYPE=C.UTF-8 to children when started in the C locale (PEP 538),
+# so every compiler runs with LC_ALL=C.
+ENV = {**os.environ, "LC_ALL": "C"}
 SOURCE = r'''
 extern int printf(const char *, ...) __attribute__((format(printf, 1, 2)));
 static int unused_file_scope;
@@ -95,7 +101,9 @@ FORMAT_SECURITY_ERROR_FLAGS = ("-Wformat", "-Werror=format-security")
 
 
 def compiler_version(command: list[str]) -> str:
-    proc = subprocess.run(command + ["-dumpfullversion"], text=True, capture_output=True)
+    proc = subprocess.run(
+        command + ["-dumpfullversion"], text=True, capture_output=True, env=ENV
+    )
     if proc.returncode:
         raise RuntimeError(f"cannot query GCC version: {proc.stderr.strip()}")
     return proc.stdout.strip()
@@ -111,6 +119,7 @@ def run_case(label: str, command: list[str], flags: tuple[str, ...], source: Pat
         cwd=ROOT,
         text=True,
         capture_output=True,
+        env=ENV,
         timeout=30,
     )
     if proc.returncode:
@@ -137,6 +146,7 @@ def run_format_security_error(
         cwd=ROOT,
         text=True,
         capture_output=True,
+        env=ENV,
         timeout=30,
     )
     if proc.returncode == 0:
