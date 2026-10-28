@@ -589,40 +589,34 @@ const fn cache(
 }
 
 impl X86Cpu {
-    /// Map a `-march=`/`-mtune=` spelling (GCC/Clang vocabulary) to a row.
-    /// Returns `None` for names the driver does not know at all; names it
-    /// knows but has no dedicated row for resolve to the closest core.
+    /// Map a GCC 16.2 `-march=`/`-mtune=` name to its tuning row: the
+    /// modelled cores and their closest relatives by name, every other name
+    /// GCC accepts to [`X86Cpu::Generic`]. `None` for a name GCC rejects.
     pub fn from_name(name: &str) -> Option<X86Cpu> {
+        use super::arch_table::{X86_TUNE_ONLY_NAMES, x86_arch_row};
         use X86Cpu::*;
         Some(match name {
-            "generic" | "x86-64" | "x86-64-v2" | "x86-64-v3" | "x86-64-v4" | "nocona" | "core2"
-            | "nehalem" | "westmere" | "silvermont" | "goldmont" | "goldmont-plus" | "tremont"
-            | "bonnell" | "atom" | "k8" | "opteron" | "barcelona" | "bdver1" | "bdver2"
-            | "bdver3" | "bdver4" | "btver1" | "btver2" | "knl" | "knm" | "intel" => Generic,
             "sandybridge" | "corei7-avx" => SandyBridge,
             "ivybridge" | "core-avx-i" => IvyBridge,
             "haswell" | "core-avx2" => Haswell,
             "broadwell" => Broadwell,
-            "skylake" | "kabylake" | "coffeelake" | "cometlake" | "amberlake" | "whiskeylake" => {
-                Skylake
-            }
+            "skylake" => Skylake,
             "skylake-avx512" | "cascadelake" | "cooperlake" | "cannonlake" => SkylakeAvx512,
             "icelake-client" | "icelake-server" | "tigerlake" | "rocketlake" => IceLake,
             "alderlake" => AlderLake,
-            "raptorlake" | "raptor-lake" => RaptorLake,
+            "raptorlake" => RaptorLake,
             "meteorlake" => MeteorLake,
-            "gracemont" | "sierraforest" | "grandridge" | "clearwaterforest" | "alderlake-n" => {
-                Gracemont
-            }
-            "sapphirerapids" | "emeraldrapids" | "graniterapids" | "graniterapids-d" => {
-                SapphireRapids
-            }
-            "arrowlake" | "arrowlake-s" | "lunarlake" | "pantherlake" | "wildcatlake" => ArrowLake,
+            "gracemont" | "sierraforest" | "grandridge" | "clearwaterforest" => Gracemont,
+            "sapphirerapids" | "emeraldrapids" | "graniterapids" | "graniterapids-d"
+            | "diamondrapids" => SapphireRapids,
+            "arrowlake" | "arrowlake-s" | "lunarlake" | "pantherlake" | "wildcatlake"
+            | "novalake" => ArrowLake,
             "znver1" => Znver1,
             "znver2" => Znver2,
             "znver3" => Znver3,
             "znver4" => Znver4,
-            "znver5" => Znver5,
+            "znver5" | "znver6" => Znver5,
+            _ if x86_arch_row(name).is_some() || X86_TUNE_ONLY_NAMES.contains(&name) => Generic,
             _ => return None,
         })
     }
@@ -2194,6 +2188,33 @@ mod tests {
                 t.name
             );
         }
+    }
+
+    /// Every name GCC 16.2 accepts for `-march=` or `-mtune=` resolves to a
+    /// row; the spellings GCC rejects, which this map used to invent, do not.
+    #[test]
+    fn from_name_covers_exactly_gccs_vocabulary() {
+        use crate::backend::x86::arch_table::{X86_ARCH_TABLE, X86_TUNE_ONLY_NAMES};
+        let gcc_names = X86_ARCH_TABLE.iter().map(|row| row.name);
+        for name in gcc_names.chain(X86_TUNE_ONLY_NAMES.iter().copied()) {
+            assert!(X86Cpu::from_name(name).is_some(), "{name}");
+        }
+        for name in [
+            "knl",
+            "knm",
+            "kabylake",
+            "coffeelake",
+            "cometlake",
+            "amberlake",
+            "whiskeylake",
+            "alderlake-n",
+            "raptor-lake",
+            "bogus",
+        ] {
+            assert_eq!(X86Cpu::from_name(name), None, "{name}");
+        }
+        assert_eq!(X86Cpu::from_name("znver6"), Some(X86Cpu::Znver5));
+        assert_eq!(X86Cpu::from_name("pentium4"), Some(X86Cpu::Generic));
     }
 
     #[test]

@@ -36,10 +36,42 @@ pub(super) enum I686FastcallSlot {
     /// area (callee reference: 8(%ebp) / entry ESP+4), occupying `size`
     /// bytes.
     Stack { offset: i64, size: usize },
-    /// A native vector passed in `%xmm`/`%ymm`/`%zmm{reg_idx}` (`size` =
-    /// 16/32/64), assigned exactly as for cdecl
-    /// (`call_abi::i386_vector_reg_bytes`).
-    Vector { reg_idx: usize, size: usize },
+    /// A native vector passed in `%xmm`/`%ymm`/`%zmm{reg_idx}`, assigned
+    /// exactly as for cdecl (`call_abi::i386_vector_reg_bytes`).
+    Vector {
+        reg_idx: usize,
+        width: VectorRegWidth,
+    },
+}
+
+/// The register file of a native vector argument. Typed rather than a byte
+/// count so the argument copier's match is total: the classifier only ever
+/// yields one of these three widths.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum VectorRegWidth {
+    Xmm,
+    Ymm,
+    Zmm,
+}
+
+impl VectorRegWidth {
+    fn from_bytes(bytes: usize) -> Option<Self> {
+        match bytes {
+            16 => Some(Self::Xmm),
+            32 => Some(Self::Ymm),
+            64 => Some(Self::Zmm),
+            _ => None,
+        }
+    }
+
+    /// The unaligned full-width load and register name for `%{reg}{idx}`.
+    fn load(self, reg_idx: usize) -> (&'static str, String) {
+        match self {
+            Self::Xmm => ("movups", format!("xmm{reg_idx}")),
+            Self::Ymm => ("vmovups", format!("ymm{reg_idx}")),
+            Self::Zmm => ("vmovups", format!("zmm{reg_idx}")),
+        }
+    }
 }
 
 /// Where the bytes of an outgoing by-value argument are read from.
@@ -1299,18 +1331,21 @@ impl I686Codegen {
             // breaks the ECX/EDX chain. Variadic calls keep every vector on
             // the stack, like cdecl.
             let classes = struct_classes.get(i).map(Vec::as_slice).unwrap_or(&[]);
-            let native_vector = !force_stack.get(i).copied().unwrap_or(false)
-                && crate::backend::call_abi::i386_vector_reg_bytes(
+            let native_vector = if force_stack.get(i).copied().unwrap_or(false) {
+                None
+            } else {
+                crate::backend::call_abi::i386_vector_reg_bytes(
                     &abi,
                     classes,
                     struct_sizes.get(i).copied().flatten(),
                 )
-                .is_some();
-            if native_vector {
+                .and_then(VectorRegWidth::from_bytes)
+            };
+            if let Some(width) = native_vector {
                 if !is_variadic && vector_regs_used < abi.vector_xmm_regs {
                     slots.push(I686FastcallSlot::Vector {
                         reg_idx: vector_regs_used,
-                        size,
+                        width,
                     });
                     vector_regs_used += 1;
                     continue;
@@ -2022,18 +2057,13 @@ impl I686Codegen {
         // registers (the operand -- the vector object's address -- is
         // staged through %eax, and %ecx/%edx must be the last writes).
         for (i, slot) in slots.iter().enumerate() {
-            let I686FastcallSlot::Vector { reg_idx, size } = *slot else {
+            let I686FastcallSlot::Vector { reg_idx, width } = *slot else {
                 continue;
             };
             self.operand_to_eax(&args[i]);
-            let (instruction, register) = match size {
-                16 => ("movups", format!("xmm{reg_idx}")),
-                32 => ("vmovups", format!("ymm{reg_idx}")),
-                64 => ("vmovups", format!("zmm{reg_idx}")),
-                _ => unreachable!("invalid native vector argument width"),
-            };
+            let (instruction, register) = width.load(reg_idx);
             emit!(self.state, "    {} (%eax), %{}", instruction, register);
-            if size > 16 {
+            if width != VectorRegWidth::Xmm {
                 self.state.dirty_upper_ymm = true;
             }
         }
@@ -3092,8 +3122,9 @@ impl ArchCodegen for I686Codegen {
                 IrUnaryOp::Ctz | IrUnaryOp::CtzNonZero => self.emit_i64_ctz(),
                 IrUnaryOp::Popcount => self.emit_i64_popcount(),
                 IrUnaryOp::Bswap => self.emit_i64_bswap(),
-                IrUnaryOp::BitReverse => unreachable!("bit-reverse idiom is not enabled for i686"),
-                IrUnaryOp::IsConstant => unreachable!("handled above"),
+                IrUnaryOp::BitReverse | IrUnaryOp::IsConstant => {
+                    unreachable!("{op:?} never reaches the i686 unary dispatch")
+                }
             }
             self.emit_store_acc_pair(dest);
             self.state.reg_cache.invalidate_all();
@@ -3115,8 +3146,9 @@ impl ArchCodegen for I686Codegen {
             IrUnaryOp::CtzNonZero => self.emit_int_ctz_nonzero(ty),
             IrUnaryOp::Popcount => self.emit_int_popcount(ty),
             IrUnaryOp::Bswap => self.emit_int_bswap(ty),
-            IrUnaryOp::BitReverse => unreachable!("bit-reverse idiom is not enabled for i686"),
-            IrUnaryOp::IsConstant => unreachable!("handled above"),
+            IrUnaryOp::BitReverse | IrUnaryOp::IsConstant => {
+                unreachable!("{op:?} never reaches the i686 unary dispatch")
+            }
         }
         self.state.reg_cache.invalidate_acc();
         self.store_eax_to(dest);
@@ -4718,7 +4750,7 @@ mod tests {
             vec![
                 Vector {
                     reg_idx: 0,
-                    size: 16
+                    width: VectorRegWidth::Xmm
                 },
                 Reg(0)
             ]
@@ -4746,15 +4778,15 @@ mod tests {
                 Reg(0),
                 Vector {
                     reg_idx: 0,
-                    size: 16
+                    width: VectorRegWidth::Xmm
                 },
                 Vector {
                     reg_idx: 1,
-                    size: 16
+                    width: VectorRegWidth::Xmm
                 },
                 Vector {
                     reg_idx: 2,
-                    size: 16
+                    width: VectorRegWidth::Xmm
                 },
                 Stack {
                     offset: 0,
@@ -4784,7 +4816,7 @@ mod tests {
                 Reg(0),
                 Vector {
                     reg_idx: 0,
-                    size: 32
+                    width: VectorRegWidth::Ymm
                 },
                 Reg(1)
             ]

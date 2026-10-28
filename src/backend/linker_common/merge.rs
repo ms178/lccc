@@ -264,7 +264,9 @@ pub fn merge_debug_sections_elf64(
     Ok(())
 }
 
-fn is_debug_section_name(name: &str) -> bool {
+/// Whether a non-allocated input section carries debug information that a
+/// final link keeps (and `--strip-debug` drops).
+pub fn is_debug_section_name(name: &str) -> bool {
     name.starts_with(".debug_")
         || name.starts_with(".zdebug_")
         || name == ".gdb_index"

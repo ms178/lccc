@@ -40,6 +40,12 @@ pub(super) struct RelocContext<'a> {
     /// Absolute addresses of the `___tls_get_addr` call fields of
     /// transitioned GD/LDM sequences: their relocations are dropped.
     pub tls_relaxed_call_slots: crate::common::fx_hash::FxHashSet<u32>,
+    /// IPLT stub of each STB_LOCAL IFUNC, by (object, symbol): every
+    /// reference resolves to it, so a call reaches the selected
+    /// implementation and a taken address compares equal everywhere.
+    pub local_ifunc_stubs: &'a FxHashMap<(usize, usize), u32>,
+    /// GOT index (from the start of .got) of each STB_LOCAL symbol's slot.
+    pub local_got_index: &'a FxHashMap<(usize, usize), usize>,
 }
 
 /// Apply all relocations from input objects to the output sections.
@@ -116,10 +122,16 @@ fn apply_one_reloc(
         return Err(format!("invalid symbol index {} in reloc", sym_idx));
     };
 
-    let sym_addr = resolve_sym_addr(obj_idx, sym, ctx);
+    let sym_addr = ctx
+        .local_ifunc_stubs
+        .get(&(obj_idx, sym_idx as usize))
+        .copied()
+        .unwrap_or_else(|| resolve_sym_addr(obj_idx, sym, ctx));
 
-    // Check if this symbol goes through PLT
+    // Check if this symbol goes through PLT (a named import: a local of the
+    // same name is a different symbol).
     let is_dyn = !sym.name.is_empty()
+        && sym.binding != STB_LOCAL
         && ctx
             .global_symbols
             .get(sym.name.as_str())
@@ -158,8 +170,13 @@ fn apply_one_reloc(
             let off = rel_offset as usize;
             let conversion = got32x_conversion(&sec.data, off);
             let baseless = got_field_baseless(&sec.data, off);
+            let local_slot = ctx
+                .local_got_index
+                .get(&(obj_idx, sym_idx as usize))
+                .copied();
             let (value, conv) = resolve_got_reloc(
-                obj, sym, sym_addr, addend, rel_type, conversion, baseless, patch_addr, ctx,
+                obj, sym, local_slot, sym_addr, addend, rel_type, conversion, baseless, patch_addr,
+                ctx,
             )?;
             got32x_conv = conv;
             value
@@ -526,14 +543,17 @@ pub(super) fn got_target_relaxable(sym: &InputSymbol, gs: Option<&LinkerSymbol>)
 /// Resolve R_386_GOT32 or R_386_GOT32X: the GOT-relative offset of the
 /// symbol's slot (the slot's absolute address for a base-less field), or --
 /// for a relaxable `GOT32X` load site of a symbol defined here -- the
-/// symbol's address, with `true` telling the caller to turn the load into
-/// `movl $x, %r`. Slots are keyed by name in `global_symbols`,
-/// where an STB_LOCAL symbol may find another object's entry (locals are
-/// fallback definitions, see `symbols.rs`): a local owns the slot only when
-/// the slot's link-time value is its own address.
+/// symbol's address, with the conversion telling the caller to rewrite the
+/// instruction (`movl $x, %r`, a direct branch, ...). Named symbols' slots
+/// are keyed by name in `global_symbols`; an STB_LOCAL symbol's slot by
+/// (object, symbol) -- `local_slot`, its index from the start of `.got`
+/// (`mark_plt_got_needs`) -- so a local never reads a same-named global's
+/// slot.
+#[expect(clippy::too_many_arguments)]
 pub(super) fn resolve_got_reloc(
     obj: &InputObject,
     sym: &InputSymbol,
+    local_slot: Option<usize>,
     sym_addr: u32,
     addend: i32,
     rel_type: u32,
@@ -542,7 +562,8 @@ pub(super) fn resolve_got_reloc(
     patch_addr: u32,
     ctx: &RelocContext,
 ) -> Result<(u32, Option<Got32xConversion>), String> {
-    let gs = (!sym.name.is_empty())
+    let local = sym.binding == STB_LOCAL || sym.sym_type == STT_SECTION || sym.name.is_empty();
+    let gs = (!local)
         .then(|| ctx.global_symbols.get(sym.name.as_str()))
         .flatten();
     if let Some(conv) = conversion.filter(|_| rel_type == R_386_GOT32X) {
@@ -561,38 +582,39 @@ pub(super) fn resolve_got_reloc(
             return Ok((value, Some(conv)));
         }
     }
-    if let Some(gs) = gs.filter(|gs| gs.needs_got) {
-        let owned = sym.binding != STB_LOCAL || (!gs.is_dynamic && gs.address == sym_addr);
-        if owned {
-            // Every GOT-relative reference to a named symbol gave it a slot
-            // of its own (`mark_plt_got_needs`); for a shared-library symbol
-            // that slot is filled by GLOB_DAT -- never the lazy `.got.plt`
-            // slot of its PLT entry, which holds `PLT+6` until the first
-            // call, so an address loaded from it would change over time.
-            let got_entry_addr =
-                ctx.got_vaddr + (ctx.got_reserved as u32 + (gs.got_index - ctx.num_plt) as u32) * 4;
-            let base = if baseless { 0 } else { ctx.got_base as i32 };
-            return Ok(((got_entry_addr as i32 + addend - base) as u32, None));
-        }
+    let base = if baseless { 0 } else { ctx.got_base as i32 };
+    let slot_addr = if local {
+        local_slot.map(|index| ctx.got_vaddr + index as u32 * 4)
+    } else {
+        // Every GOT-relative reference to a named symbol gave it a slot of
+        // its own (`mark_plt_got_needs`); for a shared-library symbol that
+        // slot is filled by GLOB_DAT -- never the lazy `.got.plt` slot of
+        // its PLT entry, which holds `PLT+6` until the first call, so an
+        // address loaded from it would change over time.
+        gs.filter(|gs| gs.needs_got).map(|gs| {
+            ctx.got_vaddr + (ctx.got_reserved as u32 + (gs.got_index - ctx.num_plt) as u32) * 4
+        })
+    };
+    match slot_addr {
+        Some(addr) => Ok(((addr as i32 + addend - base) as u32, None)),
+        // Resolving to the symbol's GOT-relative offset without converting
+        // the instruction would load from the symbol instead of its slot.
+        None => Err(format!(
+            "{}: {} against `{}' has no GOT slot (internal: the slot planner \
+             and the relocation pass disagree)",
+            obj.filename,
+            if rel_type == R_386_GOT32X {
+                "R_386_GOT32X"
+            } else {
+                "R_386_GOT32"
+            },
+            if sym.name.is_empty() {
+                "<section>"
+            } else {
+                sym.name.as_str()
+            }
+        )),
     }
-    // Resolving to the symbol's GOT-relative offset without converting the
-    // instruction would load from the symbol instead of its slot.
-    Err(format!(
-        "{}: {} against local symbol `{}' needs a GOT slot of its own, but \
-         lccc-ld keys GOT slots by name and that name is bound to another \
-         definition (address the local symbol with @GOTOFF)",
-        obj.filename,
-        if rel_type == R_386_GOT32X {
-            "R_386_GOT32X"
-        } else {
-            "R_386_GOT32"
-        },
-        if sym.name.is_empty() {
-            "<section>"
-        } else {
-            sym.name.as_str()
-        }
-    ))
 }
 
 #[cfg(test)]

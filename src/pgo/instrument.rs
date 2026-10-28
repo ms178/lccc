@@ -1622,6 +1622,7 @@ fn dump_helper(
         is_static: true,
         is_inline: false,
         is_always_inline: false,
+        x86_isa_needs: Default::default(),
         is_noinline: true,
         target_features: Vec::new(),
         next_value_id: next,
@@ -1644,6 +1645,8 @@ fn dump_helper(
         is_gnu_inline_def: false,
         loop_promoted_f64_values: Vec::new(),
         ssp: Default::default(),
+        body_span: crate::common::source::Span::dummy(),
+        terminator_spans: Default::default(),
     };
     m.functions.push(f);
     m.destructors.push(name.into());
@@ -1670,6 +1673,7 @@ fn dump_helper(
                 is_static: false,
                 is_inline: false,
                 is_always_inline: false,
+                x86_isa_needs: Default::default(),
                 is_noinline: false,
                 target_features: Vec::new(),
                 next_value_id: 0,
@@ -1692,6 +1696,8 @@ fn dump_helper(
                 is_gnu_inline_def: false,
                 loop_promoted_f64_values: Vec::new(),
                 ssp: Default::default(),
+                body_span: crate::common::source::Span::dummy(),
+                terminator_spans: Default::default(),
             })
         }
     }
@@ -1960,6 +1966,7 @@ fn push_helper_fn(
         is_static: true,
         is_inline: false,
         is_always_inline: false,
+        x86_isa_needs: Default::default(),
         is_noinline: true,
         target_features: Vec::new(),
         // `push_helper_fn` appends alloca/load parameter plumbing after the
@@ -1986,6 +1993,8 @@ fn push_helper_fn(
         is_gnu_inline_def: false,
         loop_promoted_f64_values: Vec::new(),
         ssp: Default::default(),
+        body_span: crate::common::source::Span::dummy(),
+        terminator_spans: Default::default(),
     });
 }
 

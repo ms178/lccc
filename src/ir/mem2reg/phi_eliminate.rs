@@ -1397,6 +1397,11 @@ fn apply_phi_transformations(func: &mut IrFunction, ctx: &mut PhiElimCtx) {
             trampoline.old_target,
             trampoline.label,
         );
+        func.terminator_spans.retarget(
+            func.blocks[trampoline.pred_idx].label,
+            trampoline.old_target,
+            trampoline.label,
+        );
     }
 
     // Append trampoline blocks to the function

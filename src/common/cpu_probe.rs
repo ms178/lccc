@@ -39,13 +39,18 @@
 //! # Semantics (identical to libgcc's runtime model)
 //!
 //! * The probe reads CPUID leaves 0, 1, 7 (subleaves 0 and 1), 0xD (subleaf 1),
-//!   0x14 (subleaf 0), 0x24 (subleaf 0) and 0x80000001/0x80000008, each
-//!   guarded by the CPU's advertised maximum leaf (basic or extended), so no
-//!   undefined CPUID input is ever issued.
+//!   0x14 (subleaf 0), 0x19, 0x1E (subleaf 1), 0x24 (subleaf 0) and
+//!   0x80000001/0x80000008/0x80000021, each guarded by the CPU's advertised
+//!   maximum leaf (basic or extended), so no undefined CPUID input is ever
+//!   issued.
+//! * The name set is GCC 16.2's `ISA_NAMES_TABLE`
+//!   (`common/config/i386/i386-isas.h`), including the `x86-64`..`x86-64-v4`
+//!   levels, which are computed once from the gated words ([`ISA_LEVELS`]).
+//!   `kl`/`widekl` read as clear unless the OS enabled Key Locker (AESKLE).
 //! * `AVX`-class features additionally require OSXSAVE (`CPUID.1:ECX[27]`) and
 //!   `XGETBV(0) & 0x6 == 0x6` (XMM+YMM state enabled by the OS); AVX-512-class
 //!   features require `XGETBV(0) & 0xE6 == 0xE6`; AMX-class features require
-//!   `XGETBV(0) & 0x60000 == 0x60000`.  A CPU whose OS does not save the state
+//!   `XGETBV(0) & 0x60000 == 0x60000`; APX requires `XGETBV(0) & 0x80000`.  A CPU whose OS does not save the state
 //!   cannot legally execute the instruction no matter what CPUID says, which is
 //!   why the xstate gate clears the feature bit in the cached word (the shape
 //!   libgcc uses when it builds `__cpu_features`).
@@ -74,6 +79,9 @@
 //!   that does not save YMM state cannot run them either; the gated answer is
 //!   the conservative one (a dispatcher takes its generic path) and is
 //!   unobservable on any CPU that can execute the instruction at all.
+//! * `avx512bmm` is gated on the AVX-512 xstate like every other AVX-512
+//!   bit; libgcc 16.2 omits that check for it alone (a false `1` on an OS
+//!   that does not save ZMM state, where the dispatched code would fault).
 //! * The answer is `0`/`1` (`1<<bit` masked down), not libgcc's raw feature bit
 //!   mask.  C truthiness is identical, and `int x = ...; if (x == 1)` keeps
 //!   working with LCCC where it would not with GCC.
@@ -127,19 +135,30 @@ pub enum CpuWord {
     /// `CPUID.0x80000008:EBX` — AMD cache/ISA bits: CLZERO (bit 0) and
     /// WBNOINVD (bit 9).
     Ext8Ebx,
+    /// `CPUID.0x19:EBX` — Key Locker: AESKLE (bit 0, the OS enabled it) and
+    /// WIDE_KL (bit 2). Both read as clear unless AESKLE is set.
+    Leaf19Ebx,
+    /// `CPUID.(0x1E,1):EAX` — AMX-FP8, AMX-TF32, AMX-AVX512, AMX-MOVRS.
+    Leaf1E1Eax,
+    /// `CPUID.0x80000021:EAX` — AVX512BMM (bit 23).
+    Ext21Eax,
     /// Synthetic word holding the AVX10 levels: bit *N* set means the CPU
     /// implements AVX10.*N* (`CPUID.(0x24,0):EBX[7:0] >= N`, gated by the AVX10
     /// advertisement bit `CPUID.(7,1):EDX[19]`).  Storing a *level* as a bit
     /// keeps every `avx10.N` probe an ordinary "load word, AND mask, test"
     /// and keeps the version comparison in the once-per-program initialiser.
     Avx10Levels,
+    /// Synthetic word holding the x86-64 micro-architecture levels: bit 1 is
+    /// the baseline, bits 2..4 are v2..v4, each set when the features of
+    /// [`ISA_LEVELS`] are (after the xstate gates, as libgcc decides them).
+    IsaLevels,
     /// `XGETBV(0)` low half — which CPU state the OS has enabled.
     Xcr0,
 }
 
 impl CpuWord {
     /// Every word the generated probe maintains, for table-driven generation.
-    pub const ALL: [CpuWord; 14] = [
+    pub const ALL: [CpuWord; 18] = [
         CpuWord::Leaf1Edx,
         CpuWord::Leaf1Ecx,
         CpuWord::Leaf7Ebx,
@@ -152,7 +171,11 @@ impl CpuWord {
         CpuWord::Ext1Edx,
         CpuWord::Leaf14Ebx,
         CpuWord::Ext8Ebx,
+        CpuWord::Leaf19Ebx,
+        CpuWord::Leaf1E1Eax,
+        CpuWord::Ext21Eax,
         CpuWord::Avx10Levels,
+        CpuWord::IsaLevels,
         CpuWord::Xcr0,
     ];
 
@@ -172,7 +195,11 @@ impl CpuWord {
             CpuWord::Ext1Edx => "__lccc_cpu_wext1edx",
             CpuWord::Leaf14Ebx => "__lccc_cpu_w14ebx",
             CpuWord::Ext8Ebx => "__lccc_cpu_wext8ebx",
+            CpuWord::Leaf19Ebx => "__lccc_cpu_w19ebx",
+            CpuWord::Leaf1E1Eax => "__lccc_cpu_w1e1eax",
+            CpuWord::Ext21Eax => "__lccc_cpu_wext21eax",
             CpuWord::Avx10Levels => "__lccc_cpu_wavx10",
+            CpuWord::IsaLevels => "__lccc_cpu_wlevels",
             CpuWord::Xcr0 => "__lccc_cpu_wxcr0",
         }
     }
@@ -190,6 +217,9 @@ pub enum Xstate {
     Avx512,
     /// AMX state: `XGETBV(0) & 0x60000 == 0x60000` (bits 17 and 18).
     Amx,
+    /// APX state: `XGETBV(0) & 0x80000 == 0x80000` (bit 19, the extended
+    /// GPRs).
+    Apx,
 }
 
 impl Xstate {
@@ -200,6 +230,7 @@ impl Xstate {
             Xstate::Vex => 0x6,
             Xstate::Avx512 => 0xE6,
             Xstate::Amx => 0x60000,
+            Xstate::Apx => 0x80000,
         }
     }
 
@@ -210,6 +241,7 @@ impl Xstate {
             Xstate::Vex => "vex",
             Xstate::Avx512 => "avx512",
             Xstate::Amx => "amx",
+            Xstate::Apx => "apx",
         }
     }
 }
@@ -245,6 +277,7 @@ impl Probe {
 /// `rdrand`) and the underscore spellings used by `-m` flags and macros.
 pub const PROBE_TABLE: &[(&str, Probe)] = &[
     // ---- leaf 1 EDX / ECX ---------------------------------------------------
+    ("cmpxchg8b", Probe::new(CpuWord::Leaf1Edx, 8, Xstate::None)),
     ("cmov", Probe::new(CpuWord::Leaf1Edx, 15, Xstate::None)),
     ("fxsr", Probe::new(CpuWord::Leaf1Edx, 24, Xstate::None)),
     ("mmx", Probe::new(CpuWord::Leaf1Edx, 23, Xstate::None)),
@@ -350,6 +383,7 @@ pub const PROBE_TABLE: &[(&str, Probe)] = &[
     ("serialize", Probe::new(CpuWord::Leaf7Edx, 14, Xstate::None)),
     ("tsxldtrk", Probe::new(CpuWord::Leaf7Edx, 16, Xstate::None)),
     ("pconfig", Probe::new(CpuWord::Leaf7Edx, 18, Xstate::None)),
+    ("ibt", Probe::new(CpuWord::Leaf7Edx, 20, Xstate::None)),
     ("amx-bf16", Probe::new(CpuWord::Leaf7Edx, 22, Xstate::Amx)),
     (
         "avx512fp16",
@@ -392,6 +426,7 @@ pub const PROBE_TABLE: &[(&str, Probe)] = &[
         Probe::new(CpuWord::Leaf71Edx, 14, Xstate::None),
     ),
     ("usermsr", Probe::new(CpuWord::Leaf71Edx, 15, Xstate::None)),
+    ("apxf", Probe::new(CpuWord::Leaf71Edx, 21, Xstate::Apx)),
     ("movrs", Probe::new(CpuWord::Leaf71Eax, 31, Xstate::None)),
     // ---- leaf 0xD, subleaf 1 ------------------------------------------------
     ("xsaveopt", Probe::new(CpuWord::LeafD1Eax, 0, Xstate::Vex)),
@@ -408,6 +443,7 @@ pub const PROBE_TABLE: &[(&str, Probe)] = &[
     ("tbm", Probe::new(CpuWord::Ext1Ecx, 21, Xstate::Vex)),
     ("mwaitx", Probe::new(CpuWord::Ext1Ecx, 29, Xstate::None)),
     ("lm", Probe::new(CpuWord::Ext1Edx, 29, Xstate::None)),
+    ("3dnowp", Probe::new(CpuWord::Ext1Edx, 30, Xstate::None)),
     ("3dnow", Probe::new(CpuWord::Ext1Edx, 31, Xstate::None)),
     // ---- leaves 0x14 / 0x80000008 / 0x24 (AUD-CPU-1: the six names GCC 16.2
     // accepts that LCCC did not model before; rejecting them would have been a
@@ -419,6 +455,39 @@ pub const PROBE_TABLE: &[(&str, Probe)] = &[
     // AVX10: bit N of the synthetic word means "AVX10.N supported".
     ("avx10.1", Probe::new(CpuWord::Avx10Levels, 1, Xstate::None)),
     ("avx10.2", Probe::new(CpuWord::Avx10Levels, 2, Xstate::None)),
+    // ---- leaves 0x19 / 0x1E.1 / 0x80000021 and the ISA levels: the rest of
+    // GCC 16.2's `ISA_NAMES_TABLE` (`common/config/i386/i386-isas.h`).
+    ("aeskle", Probe::new(CpuWord::Leaf19Ebx, 0, Xstate::None)),
+    ("widekl", Probe::new(CpuWord::Leaf19Ebx, 2, Xstate::None)),
+    ("amx-fp8", Probe::new(CpuWord::Leaf1E1Eax, 4, Xstate::Amx)),
+    ("amx-tf32", Probe::new(CpuWord::Leaf1E1Eax, 6, Xstate::Amx)),
+    (
+        "amx-avx512",
+        Probe::new(CpuWord::Leaf1E1Eax, 7, Xstate::Amx),
+    ),
+    ("amx-movrs", Probe::new(CpuWord::Leaf1E1Eax, 8, Xstate::Amx)),
+    // libgcc reports AVX512BMM without the AVX-512 xstate check it applies to
+    // every other AVX-512 bit; a dispatcher would then run ZMM code the OS
+    // does not save. Gated like the rest of the family.
+    (
+        "avx512bmm",
+        Probe::new(CpuWord::Ext21Eax, 23, Xstate::Avx512),
+    ),
+    ("x86-64", Probe::new(CpuWord::IsaLevels, 1, Xstate::None)),
+    ("x86-64-v2", Probe::new(CpuWord::IsaLevels, 2, Xstate::None)),
+    ("x86-64-v3", Probe::new(CpuWord::IsaLevels, 3, Xstate::None)),
+    ("x86-64-v4", Probe::new(CpuWord::IsaLevels, 4, Xstate::None)),
+];
+
+/// The x86-64 micro-architecture levels as libgcc's `__cpu_indicator_init`
+/// decides them: level `N` (bit `N` of [`CpuWord::IsaLevels`]) needs level
+/// `N - 1` and every feature listed for it, read from the words after the
+/// xstate gates. GCC checks exactly these (SSE3..SSE4.1 come with SSE4.2).
+pub const ISA_LEVELS: &[(u8, &[&str])] = &[
+    (1, &["lm", "sse2"]),
+    (2, &["cx16", "popcnt", "lahf-lm", "sse4.2"]),
+    (3, &["avx2", "bmi", "bmi2", "f16c", "fma", "lzcnt", "movbe"]),
+    (4, &["avx512bw", "avx512cd", "avx512dq", "avx512vl"]),
 ];
 
 /// Alternative spellings accepted for the same feature.
@@ -436,6 +505,7 @@ pub const NAME_ALIASES: &[(&str, &str)] = &[
     ("abm", "lzcnt"),
     ("cmpxchg16b", "cx16"),
     ("lahf_lm", "lahf-lm"),
+    ("fxsave", "fxsr"),
     ("amx_tile", "amx-tile"),
     ("amx_int8", "amx-int8"),
     ("amx_bf16", "amx-bf16"),
@@ -701,6 +771,26 @@ pub fn runtime_asm(target: ProbeTarget, pic: bool, emit_cfi: bool) -> String {
     out.push_str("\tmovl\t$0x14, %eax\n\txorl\t%ecx, %ecx\n\tcpuid\n");
     out.push_str(&ctx.store(CpuWord::Leaf14Ebx, "%ebx"));
     out.push_str(".Llccc_cpu_no_leaf14:\n");
+    // Leaf 0x19: Key Locker.
+    out.push_str("\txorl\t%eax, %eax\n\tcpuid\n\tcmpl\t$0x19, %eax\n");
+    out.push_str("\tjb\t.Llccc_cpu_no_leaf19\n");
+    out.push_str("\tmovl\t$0x19, %eax\n\txorl\t%ecx, %ecx\n\tcpuid\n");
+    out.push_str(&ctx.store(CpuWord::Leaf19Ebx, "%ebx"));
+    out.push_str(".Llccc_cpu_no_leaf19:\n");
+    // Key Locker is usable only once the OS enabled it (AESKLE): libgcc
+    // reports neither `kl` nor `widekl` otherwise, nor without leaf 0x19.
+    out.push_str("\ttestl\t$1, ");
+    out.push_str(&ctx.word_operand(CpuWord::Leaf19Ebx));
+    out.push_str("\n\tjne\t.Llccc_cpu_kl_enabled\n");
+    out.push_str(&ctx.and_word(CpuWord::Leaf19Ebx, !(1 << 2)));
+    out.push_str(&ctx.and_word(CpuWord::Leaf7Ecx, !(1 << 23)));
+    out.push_str(".Llccc_cpu_kl_enabled:\n");
+    // Leaf 0x1E subleaf 1: the second-generation AMX extensions.
+    out.push_str("\txorl\t%eax, %eax\n\tcpuid\n\tcmpl\t$0x1e, %eax\n");
+    out.push_str("\tjb\t.Llccc_cpu_no_leaf1e\n");
+    out.push_str("\tmovl\t$0x1e, %eax\n\tmovl\t$1, %ecx\n\tcpuid\n");
+    out.push_str(&ctx.store(CpuWord::Leaf1E1Eax, "%eax"));
+    out.push_str(".Llccc_cpu_no_leaf1e:\n");
     // Leaf 0x24 subleaf 0: the AVX10 version byte.  LCCC caches *levels*, not
     // the raw version, so `avx10.N` stays an ordinary bit test.
     out.push_str("\txorl\t%eax, %eax\n\tcpuid\n\tcmpl\t$0x24, %eax\n");
@@ -737,6 +827,12 @@ pub fn runtime_asm(target: ProbeTarget, pic: bool, emit_cfi: bool) -> String {
     out.push_str("\tmovl\t$0x80000008, %eax\n\tcpuid\n");
     out.push_str(&ctx.store(CpuWord::Ext8Ebx, "%ebx"));
     out.push_str(".Llccc_cpu_no_ext8:\n");
+    // Extended leaf 0x80000021: AVX512BMM (EAX bit 23).
+    out.push_str("\tmovl\t$0x80000000, %eax\n\tcpuid\n\tcmpl\t$0x80000021, %eax\n");
+    out.push_str("\tjb\t.Llccc_cpu_no_ext21\n");
+    out.push_str("\tmovl\t$0x80000021, %eax\n\txorl\t%ecx, %ecx\n\tcpuid\n");
+    out.push_str(&ctx.store(CpuWord::Ext21Eax, "%eax"));
+    out.push_str(".Llccc_cpu_no_ext21:\n");
 
     // XSTATE: OSXSAVE gates the XGETBV instruction itself.
     out.push_str("\ttestl\t$0x08000000, ");
@@ -745,9 +841,10 @@ pub fn runtime_asm(target: ProbeTarget, pic: bool, emit_cfi: bool) -> String {
     out.push_str("\txorl\t%ecx, %ecx\n\txgetbv\n");
     out.push_str(&ctx.store(CpuWord::Xcr0, "%eax"));
     out.push_str(".Llccc_cpu_no_xstate:\n");
-    for state in [Xstate::Vex, Xstate::Avx512, Xstate::Amx] {
+    for state in [Xstate::Vex, Xstate::Avx512, Xstate::Amx, Xstate::Apx] {
         out.push_str(&state_gate_asm(state, &ctx));
     }
+    out.push_str(&isa_levels_asm(&ctx));
     out.push_str(&format!("\tmovl\t$1, {}\n", ctx.ready_operand()));
 
     // Epilogue.  Both exits land here, and every push has a matching pop on
@@ -808,6 +905,41 @@ fn cleared_masks(state: Xstate) -> Vec<(CpuWord, u32)> {
     per_word
 }
 
+/// The `(word, mask)` pairs that must all be fully set for `features`.
+fn required_masks(features: &[&str]) -> Vec<(CpuWord, u32)> {
+    let mut per_word: Vec<(CpuWord, u32)> = Vec::new();
+    // Every ISA_LEVELS name resolves (`isa_levels_chain_in_order`).
+    for probe in features.iter().filter_map(|name| lookup(name)) {
+        match per_word.iter_mut().find(|(w, _)| *w == probe.word) {
+            Some((_, mask)) => *mask |= probe.bit_mask(),
+            None => per_word.push((probe.word, probe.bit_mask())),
+        }
+    }
+    per_word
+}
+
+/// Set the [`ISA_LEVELS`] bits of [`CpuWord::IsaLevels`], lowest first; the
+/// first level the CPU misses ends the chain.
+fn isa_levels_asm(ctx: &Ctx) -> String {
+    let mut out = String::new();
+    for &(level, features) in ISA_LEVELS {
+        for (word, mask) in required_masks(features) {
+            out.push_str(&format!(
+                "\tmovl\t{}, %eax\n\tandl\t${mask}, %eax\n\tcmpl\t${mask}, %eax\n",
+                ctx.word_operand(word)
+            ));
+            out.push_str("\tjne\t.Llccc_cpu_levels_done\n");
+        }
+        out.push_str(&format!(
+            "\torl\t${}, {}\n",
+            1u32 << level,
+            ctx.word_operand(CpuWord::IsaLevels)
+        ));
+    }
+    out.push_str(".Llccc_cpu_levels_done:\n");
+    out
+}
+
 /// The xstate gate: when the required bits are missing from `XGETBV(0)`,
 /// clear the corresponding feature bits so no probe can report them.
 fn state_gate_asm(state: Xstate, ctx: &Ctx) -> String {
@@ -832,20 +964,81 @@ fn state_gate_asm(state: Xstate, ctx: &Ctx) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::isa_features::FEATURE_TABLE;
 
+    /// Every extension the driver can grant is a name dispatch code can
+    /// probe: the model's own enums are the list, so nothing drifts.
     #[test]
-    fn every_static_feature_name_has_a_runtime_probe() {
-        // The static fold answers 1 for a name only if the effective target
-        // guarantees it; a name outside this table would be rejected as
-        // invalid even though the driver models it.  Keep the two tables in
-        // sync in both directions.
-        for name in FEATURE_TABLE {
-            assert!(
-                lookup(name).is_some(),
-                "static feature {name} has no runtime probe entry"
-            );
+    fn every_modelled_feature_has_a_runtime_probe() {
+        use crate::backend::x86::arch_table::X86ExtraFeature;
+        use crate::common::x86_features::X86Feature;
+        let names = X86Feature::ALL
+            .iter()
+            .map(|f| f.name())
+            .chain(X86ExtraFeature::ALL.iter().map(|f| f.option()));
+        for name in names {
+            assert!(lookup(name).is_some(), "{name} has no runtime probe entry");
         }
+    }
+
+    /// The names of GCC 16.2's `ISA_NAMES_TABLE` the probe once lacked, at
+    /// libgcc's CPUID locations.
+    #[test]
+    fn gcc_isa_names_table_locations() {
+        use CpuWord as W;
+        for (name, word, bit, state) in [
+            ("cmpxchg8b", W::Leaf1Edx, 8, Xstate::None),
+            ("fxsave", W::Leaf1Edx, 24, Xstate::None),
+            ("ibt", W::Leaf7Edx, 20, Xstate::None),
+            ("apxf", W::Leaf71Edx, 21, Xstate::Apx),
+            ("3dnowp", W::Ext1Edx, 30, Xstate::None),
+            ("aeskle", W::Leaf19Ebx, 0, Xstate::None),
+            ("widekl", W::Leaf19Ebx, 2, Xstate::None),
+            ("amx-fp8", W::Leaf1E1Eax, 4, Xstate::Amx),
+            ("amx-tf32", W::Leaf1E1Eax, 6, Xstate::Amx),
+            ("amx-avx512", W::Leaf1E1Eax, 7, Xstate::Amx),
+            ("amx-movrs", W::Leaf1E1Eax, 8, Xstate::Amx),
+            ("avx512bmm", W::Ext21Eax, 23, Xstate::Avx512),
+            ("x86-64", W::IsaLevels, 1, Xstate::None),
+            ("x86-64-v4", W::IsaLevels, 4, Xstate::None),
+        ] {
+            assert_eq!(lookup(name), Some(Probe::new(word, bit, state)), "{name}");
+        }
+    }
+
+    /// Each level is a chain over gated words: v3 needs v2's bits too, and
+    /// every listed feature resolves to a probe.
+    #[test]
+    fn isa_levels_chain_in_order() {
+        let asm = runtime_asm(ProbeTarget::X86_64, false, false);
+        let mut at = 0;
+        for &(level, features) in ISA_LEVELS {
+            for name in features {
+                assert!(
+                    lookup(name).is_some(),
+                    "ISA_LEVELS name {name} has no probe"
+                );
+            }
+            assert!(!required_masks(features).is_empty());
+            let set = format!("orl\t${}, ", 1u32 << level);
+            at += asm[at..]
+                .find(&set)
+                .unwrap_or_else(|| panic!("level {level}"));
+        }
+        let levels = asm.find("orl\t$2, __lccc_cpu_wlevels").expect("baseline");
+        let gates = asm.rfind(".Llccc_cpu_xstate_").expect("gates");
+        assert!(gates < levels, "levels must read the gated words");
+    }
+
+    /// Key Locker and APX follow the OS-enable bits libgcc checks.
+    #[test]
+    fn key_locker_and_apx_need_os_enablement() {
+        let asm = runtime_asm(ProbeTarget::X86_64, false, false);
+        let kl = asm
+            .find("testl\t$1, __lccc_cpu_w19ebx")
+            .expect("AESKLE test");
+        assert!(asm[kl..].contains("andl\t$4294967291, __lccc_cpu_w19ebx"));
+        assert!(asm[kl..].contains("andl\t$4286578687, __lccc_cpu_w7ecx"));
+        assert!(asm.contains("andl\t$524288, %eax"), "APX xstate gate");
     }
 
     #[test]

@@ -843,7 +843,12 @@ pub fn encode_instruction(
 
         // ── Pseudo-instructions ──
         "nop" => Ok(EncodeResult::Word(encode_i(OP_OP_IMM, 0, 0, 0, 0))), // addi x0, x0, 0
-        "li" => encode_li(operands),
+        // The ELF writer encodes `li` itself, with the object's XLEN.
+        "li" => encode_li(operands, true),
+        // GNU as: `csrrw x0, cycle, x0`; the ELF writer emits `c.unimp`
+        // (0x0000) instead when RVC is on, as GNU as does.
+        "unimp" => Ok(EncodeResult::Word(0xC000_1073)),
+        "c.unimp" => Ok(EncodeResult::Half(0)),
         "mv" | "move" => encode_mv(operands),
         "not" => encode_not(operands),
         "neg" => encode_neg(operands),

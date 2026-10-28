@@ -114,17 +114,21 @@ impl FormatExpectation {
             other => other.decayed_value_ctype().integer_promoted(),
         };
         match self {
-            Self::Exact(expected) => &promoted == expected,
+            Self::Exact(expected) => {
+                &promoted == expected || same_scalar_modulo_sign(&promoted, expected)
+            }
             Self::IntegerEither => matches!(promoted, CType::Int | CType::UInt),
             Self::CharacterPointer => matches!(
                 promoted,
-                CType::Pointer(ref pointee, _) if matches!(pointee.as_ref(), CType::Char)
+                CType::Pointer(ref pointee, _) if pointee.is_char_type()
             ),
             Self::AnyPointer => matches!(promoted, CType::Pointer(..) | CType::NullPtr),
             Self::PointerTo(pointee) => matches!(
                 promoted,
                 CType::Pointer(ref actual_pointee, _)
                     if actual_pointee.as_ref() == pointee
+                        || same_scalar_modulo_sign(actual_pointee, pointee)
+                        || enum_matches_integer(actual_pointee, pointee)
             ),
         }
     }
@@ -156,6 +160,8 @@ pub struct FunctionInfo {
     pub is_defined: bool,
     /// Whether the function is declared with __attribute__((noreturn)) or _Noreturn
     pub is_noreturn: bool,
+    /// Whether the function's return type has a `const` base specifier (`const T *f()`).
+    pub return_base_const: bool,
     /// `const` bits of the RETURN type's pointer levels (bit `L-1` is pointer
     /// level `L`, level 1 closest to the base type). `CType` erases
     /// qualifiers, so `*g() = 0` for `int *const *g(void)` is only
@@ -505,6 +511,8 @@ impl SemanticAnalyzer {
             prototype,
             is_defined: true,
             is_noreturn: func.attrs.is_noreturn(),
+            return_base_const: self
+                .resolve_return_base_const(&func.return_type, func.return_base_const),
             return_pointer_const_levels: self
                 .combine_return_const_levels(&func.return_type, func.return_pointer_const_levels),
         };
@@ -515,6 +523,8 @@ impl SemanticAnalyzer {
         // the function is nested.
         if let Some(prior) = self.result.functions.get(&mangled) {
             func_info.is_noreturn |= prior.is_noreturn;
+            func_info.return_base_const |= prior.return_base_const;
+            func_info.return_pointer_const_levels |= prior.return_pointer_const_levels;
             if func_info.prototype.is_none() {
                 func_info.prototype = prior.prototype.clone();
             }
@@ -621,11 +631,17 @@ impl SemanticAnalyzer {
 
         // Preserve noreturn from a prior declaration (e.g., the prototype may have
         // __attribute__((noreturn)) even if the definition doesn't repeat it).
-        let prior_noreturn = self
+        let (prior_noreturn, prior_base_const, prior_levels) = self
             .result
             .functions
             .get(&func.name)
-            .is_some_and(|fi| fi.is_noreturn);
+            .map_or((false, false, 0), |fi| {
+                (
+                    fi.is_noreturn,
+                    fi.return_base_const,
+                    fi.return_pointer_const_levels,
+                )
+            });
         let prototype = if func.has_prototype {
             Some(FunctionType {
                 return_type: return_type.clone(),
@@ -646,8 +662,12 @@ impl SemanticAnalyzer {
             prototype,
             is_defined: true,
             is_noreturn: func.attrs.is_noreturn() || prior_noreturn,
+            return_base_const: self
+                .resolve_return_base_const(&func.return_type, func.return_base_const)
+                || prior_base_const,
             return_pointer_const_levels: self
-                .combine_return_const_levels(&func.return_type, func.return_pointer_const_levels),
+                .combine_return_const_levels(&func.return_type, func.return_pointer_const_levels)
+                | prior_levels,
         };
         let func_ctype = CType::Function(Box::new(func_info.call_type()));
 
@@ -1341,6 +1361,10 @@ impl SemanticAnalyzer {
                                         prototype,
                                         is_defined: false,
                                         is_noreturn,
+                                        return_base_const: self.resolve_return_base_const(
+                                            &decl.type_spec,
+                                            decl.is_const(),
+                                        ),
                                         return_pointer_const_levels: self
                                             .combine_return_const_levels(
                                                 &decl.type_spec,
@@ -1382,12 +1406,15 @@ impl SemanticAnalyzer {
                 // A later prototype may be the one that spells the return
                 // type's level qualifiers; keep what either declared. Computed
                 // before the table entry is borrowed.
+                let return_base_const =
+                    self.resolve_return_base_const(&decl.type_spec, decl.is_const());
                 let return_levels = self.combine_return_const_levels(
                     &decl.type_spec,
                     declarator_return_const_levels(&init_decl.derived, &ft.return_type),
                 );
                 if let Some(existing) = self.result.functions.get_mut(&init_decl.name) {
                     existing.is_noreturn |= is_noreturn;
+                    existing.return_base_const |= return_base_const;
                     existing.return_pointer_const_levels |= return_levels;
                     if prototype.is_some() {
                         existing.prototype = prototype;
@@ -1409,10 +1436,8 @@ impl SemanticAnalyzer {
                             prototype,
                             is_defined: false,
                             is_noreturn,
-                            return_pointer_const_levels: self.combine_return_const_levels(
-                                &decl.type_spec,
-                                declarator_return_const_levels(&init_decl.derived, &ft.return_type),
-                            ),
+                            return_base_const,
+                            return_pointer_const_levels: return_levels,
                         },
                     );
                 }
@@ -1578,7 +1603,9 @@ impl SemanticAnalyzer {
                 self.symbol_table.mark_local_object(
                     &init_decl.name,
                     init_decl.span,
-                    init_decl.attrs.is_maybe_unused() || init_decl.attrs.is_used(),
+                    init_decl.attrs.is_maybe_unused()
+                        || init_decl.attrs.is_used()
+                        || init_decl.attrs.cleanup_fn.is_some(),
                 );
             }
 
@@ -3732,6 +3759,7 @@ impl SemanticAnalyzer {
                     prototype: None,
                     is_defined: false,
                     is_noreturn: false,
+                    return_base_const: false,
                     return_pointer_const_levels: 0,
                 };
                 self.result.functions.insert(name.clone(), func_info);
@@ -4107,7 +4135,11 @@ impl SemanticAnalyzer {
             );
             return;
         };
-        let Some(actual) = self.expr_type_checker().infer_expr_ctype(arg) else {
+        let checker = self.expr_type_checker();
+        let Some(actual) = checker
+            .infer_expr_ctype(arg)
+            .map(|ct| checker.bitfield_promoted_if_bitfield(arg, ct))
+        else {
             return;
         };
         if !expected.accepts(&actual) {
@@ -6020,8 +6052,8 @@ dereference it before applying '->' to it?"
             return;
         }
 
-        let lhs_promoted = lhs_type.integer_promoted();
-        let rhs_promoted = rhs_type.integer_promoted();
+        let lhs_promoted = checker.bitfield_promoted_ctype(lhs, &lhs_type);
+        let rhs_promoted = checker.bitfield_promoted_ctype(rhs, &rhs_type);
         if lhs_promoted.is_signed() == rhs_promoted.is_signed() {
             return;
         }
@@ -8454,6 +8486,14 @@ dereference it before applying '->' to it?"
     /// consulted by the read-only check.
     /// Combine the `const` levels an alias in the return type contributes with
     /// those the declarator spells (`typedef int *const cp; cp *g(void)`).
+    fn resolve_return_base_const(&self, type_spec: &TypeSpecifier, explicit: bool) -> bool {
+        crate::common::qualifiers::type_name_const_base(
+            type_spec,
+            explicit,
+            &self.expr_type_checker(),
+        )
+    }
+
     fn combine_return_const_levels(&self, type_spec: &TypeSpecifier, declarator: u32) -> u32 {
         let prefix = self.base_typedef_pointer_quals(type_spec);
         let prefix_mask = prefix.iter().enumerate().fold(0u32, |mask, (level, cvr)| {
@@ -8670,6 +8710,7 @@ dereference it before applying '->' to it?"
                 prototype: None,
                 is_defined: false,
                 is_noreturn,
+                return_base_const: false,
                 return_pointer_const_levels: 0,
             };
             self.result.functions.insert(name.to_string(), func_info);
@@ -9287,6 +9328,17 @@ fn pointee_compat(from: &CType, to: &CType) -> PtrCompat {
             // named records, where the key IS the identity.
             if a.starts_with("__anon_") || b.starts_with("__anon_") {
                 PtrCompat::Unknown
+            } else {
+                PtrCompat::Incompatible
+            }
+        }
+        (CType::Enum(e1), CType::Enum(e2)) => {
+            if e1 == e2
+                || (e1.name.is_some()
+                    && e1.name == e2.name
+                    && (e1.variants.is_empty() || e2.variants.is_empty()))
+            {
+                PtrCompat::Compatible
             } else {
                 PtrCompat::Incompatible
             }

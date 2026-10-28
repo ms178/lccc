@@ -19,7 +19,7 @@ Usage (two terminals, or background the QEMU side):
 
     qemu-system-x86_64 ... -s -S -accel tcg &      # -s = gdbstub on :1234
     scripts/qemu_gdbstub_probe.py --port 1234 \\
-        --system-map /opt/kwork/linux-6.18.55/System.map \\
+        --system-map ~/.cache/lccc/kernel-work/linux-6.18.58/System.map \\
         --break free_large_kmalloc \\
         --reg rsi --until-range 0xffffffff81000000-0xffffffff82300000 \\
         --stack-scan --max-hits 4000
@@ -36,9 +36,14 @@ Notes that cost time to rediscover:
 from __future__ import annotations
 
 import argparse
+import os
+from pathlib import Path
 import socket
 import sys
 import time
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import lccc_paths  # noqa: E402
 
 # QEMU's x86-64 gdbstub register order for the `g` packet. Everything after
 # `gs` (segment internals, FPU, vector state) is ignored here.
@@ -194,7 +199,9 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=1234)
-    ap.add_argument("--system-map", required=True)
+    default_sysmap = os.path.join(lccc_paths.kernel_default_dir(), "System.map")
+    ap.add_argument("--system-map", default=default_sysmap,
+                    help="path to System.map (default: %(default)s)")
     ap.add_argument("--break", dest="breaks", action="append", required=True,
                     metavar="SYMBOL_OR_ADDR",
                     help="symbol name from System.map, or a 0x address")

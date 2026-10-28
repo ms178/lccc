@@ -753,18 +753,6 @@ impl Preprocessor {
         }
     }
 
-    /// Define x86/x86_64 SIMD feature macros (__SSE__, __SSE2__, __MMX__, etc.).
-    ///
-    /// GCC/Clang always define these for x86_64 (SSE2 is baseline for the ISA).
-    /// For i686, GCC only defines them with explicit -msse/-msse2, but since our
-    /// i686 backend always uses SSE2 instructions, we define them unconditionally.
-    ///
-    /// When `no_sse` is true (from -mno-sse or similar flags), these macros are
-    /// not defined (matching GCC behavior for kernel builds). `no_sse2` can
-    /// independently suppress only the SSE2 macros in an SSE-only i686 TU.
-    ///
-    /// Must be called after set_target() since it checks which arch is active.
-
     /// Define/undefine the baseline SSE/MMX macros to the invocation's
     /// resolved levels. The baseline macros are pre-defined in
     /// PREDEFINED_OBJECT_MACROS (the x86 default state: SSE/SSE2/MMX all on),
@@ -781,7 +769,9 @@ impl Preprocessor {
     /// `-mno-sse` never touches `__MMX__` (MMX is independent of SSE).
     /// `__MMX_WITH_SSE__` is x86-64-only (neither oracle defines it for
     /// i386) and follows the SSE2 level, not the SSE1 level (GCC 16.2,
-    /// measured: `-m32 -mno-sse2` keeps `__SSE__` but drops it).
+    /// measured: `-m32 -mno-sse2` keeps `__SSE__` but drops it). The `_MATH`
+    /// pair follows lccc's scalar FP codegen (`apply_sse_macro_levels`).
+    /// Must be called after `set_target()` (it reads the active arch).
     pub fn set_sse_macros(&mut self, sse_on: bool, sse2_on: bool, mmx_on: bool) {
         let is_x86_64 = self.macros.is_defined("__x86_64__");
 
@@ -1464,10 +1454,11 @@ impl Preprocessor {
 /// the oracle-verified matrix is testable without a full preprocessor.
 ///
 /// Non-x86 targets (no `__x86_64__` and no `__i386__`) get none of the
-/// family at all. The four level macros plus the Clang-style `_MATH` pair
-/// follow their levels exactly (see `set_sse_macros` for the oracle
-/// provenance); `__MMX_WITH_SSE__` is granted only on x86-64, following
-/// the SSE2 level (GCC 16.2, measured).
+/// family at all. The level macros follow their levels exactly (see
+/// `set_sse_macros` for the oracle provenance); the `_MATH` pair states
+/// which scalar math lccc's codegen does in SSE (on i686 only F32, and only
+/// with SSE2); `__MMX_WITH_SSE__` is granted only on x86-64, following the
+/// SSE2 level (GCC 16.2, measured).
 pub(crate) fn apply_sse_macro_levels(
     macros: &mut MacroTable,
     is_x86_64: bool,
@@ -1496,8 +1487,17 @@ pub(crate) fn apply_sse_macro_levels(
     set("__SSE__", sse_on);
     set("__SSE2__", sse2_on);
     set("__MMX__", mmx_on);
-    set("__SSE_MATH__", sse_on);
-    set("__SSE2_MATH__", sse2_on);
+    // `_MATH`: SSE does the scalar float math, so it states lccc's own
+    // codegen, not just the ISA level. x86-64 does F32/F64 in SSE/SSE2. The
+    // i686 backend does F32 in SSE only with SSE2 (`sse2_scalar_enabled`;
+    // an SSE1-only CPU stays on x87, `fmuls`) and F64 always on x87 (with
+    // declared-type rounding), so `__SSE_MATH__` follows SSE2 and
+    // `__SSE2_MATH__` is never defined: the GCC 16.2 macros of its
+    // F32-in-SSE, F64-on-x87 mode (`-m32 -msse -mno-sse2 -mfpmath=sse`).
+    // Copying Clang's i386 pair (it really does SSE2 math) told code keyed
+    // on `__SSE2_MATH__` that doubles are never x87-evaluated.
+    set("__SSE_MATH__", if is_x86_64 { sse_on } else { sse2_on });
+    set("__SSE2_MATH__", is_x86_64 && sse2_on);
     // GCC 16.2, measured: x86-64-only, and it tracks the SSE2 level, NOT
     // the SSE1 level — `-mno-sse2` (SSE1 still granted) drops it, exactly
     // like `__SSE2__`; i386 never gets it, even at the x86-64 baseline
@@ -1539,11 +1539,11 @@ mod sse_macro_tests {
 
     // Oracle-verified matrix (GCC 16.2 / Clang 23.1.3, i386 `-m32` family).
     // The driver resolves [sse, sse2, mmx]; `set_sse_macros` must publish
-    // exactly the oracle macro set: the plain level macros AND the
-    // Clang-style `_MATH` pair follow the same levels (lccc follows Clang
-    // here — GCC 16.2 defines neither on i386, documented fork), and
-    // `__MMX_WITH_SSE__` is x86-64-only, so `set_sse_macros` (i386 path)
-    // never defines it.
+    // exactly the oracle macro set for the plain level macros. The `_MATH`
+    // pair states lccc's i686 codegen (F32 in SSE with SSE2, F64 on x87):
+    // `__SSE_MATH__` follows SSE2, `__SSE2_MATH__` never appears, as in
+    // GCC 16.2's `-msse -mno-sse2 -mfpmath=sse` mode; `__MMX_WITH_SSE__`
+    // is x86-64-only, so `set_sse_macros` (i386 path) never defines it.
     #[test]
     fn sse_macros_follow_granular_levels() {
         for (sse, sse2, mmx) in [
@@ -1559,7 +1559,7 @@ mod sse_macro_tests {
             let d = defined_set(&macros);
             assert_eq!(
                 d,
-                [sse, sse2, mmx, sse, sse2, false],
+                [sse, sse2, mmx, sse2, false, false],
                 "levels (sse={sse}, sse2={sse2}, mmx={mmx})"
             );
         }
@@ -1580,7 +1580,8 @@ mod sse_macro_tests {
         apply_sse_macro_levels(&mut macros, false, true, false, true); // -msse revival
         assert!(macros.is_defined("__SSE__"));
         assert!(macros.is_defined("__MMX__"));
-        assert!(macros.is_defined("__SSE_MATH__"));
+        // SSE1 alone: F32 stays on x87.
+        assert!(!macros.is_defined("__SSE_MATH__"));
         assert!(!macros.is_defined("__SSE2__"));
         assert!(!macros.is_defined("__SSE2_MATH__"));
         // `__MMX_WITH_SSE__` is published by the x86-64 path, never here.
@@ -1602,6 +1603,9 @@ mod sse_macro_tests {
         pp.set_sse_macros(true, true, true); // -m32 baseline
         assert!(pp.macros.is_defined("__SSE__"));
         assert!(pp.macros.is_defined("__SSE2__"));
+        // F32 in SSE, F64 on x87.
+        assert!(pp.macros.is_defined("__SSE_MATH__"));
+        assert!(!pp.macros.is_defined("__SSE2_MATH__"));
 
         pp.set_sse_macros(false, false, true); // -m32 -mno-sse (MMX keeps)
         assert!(!pp.macros.is_defined("__SSE__"));

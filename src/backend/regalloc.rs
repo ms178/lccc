@@ -933,7 +933,13 @@ pub fn x86_inst_fixed_scratch(inst: &Instruction) -> X86FixedScratch {
             }
         }
         Instruction::Intrinsic { op, .. } => match op {
-            IntrinsicOp::Rdtscp => RDX_RDI,
+            // The portable PDEP/PEXT loop (a function without BMI2) keeps
+            // the result in %rdx and the current mask bit in %rdi.
+            IntrinsicOp::Rdtscp
+            | IntrinsicOp::Pdep32
+            | IntrinsicOp::Pdep64
+            | IntrinsicOp::Pext32
+            | IntrinsicOp::Pext64 => RDX_RDI,
             // GCC __builtin_apply family and __builtin_longjmp: the emitters
             // read/write the raw %rdx (DoBuiltinApply stages arg3 into it AND
             // performs a real `call *%r11` that the IR does not model as a
@@ -4477,7 +4483,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // one of those registers (rdi/rsi/rdx/r8/r9 on x86-64) is clobbered by an
     // earlier argument before this value is read. Exclude arg registers from
     // the Phase-2 pool for exactly these values (see RegAllocConfig::call_arg_regs).
-    let (later_arg_values, indirect_arg_values) = collect_call_arg_values(func);
+    let (mut later_arg_values, mut indirect_arg_values) = collect_call_arg_values(func);
 
     let block_loop_weight: Vec<u64> = liveness
         .block_loop_depth
@@ -4789,6 +4795,26 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         FxHashSet::default()
     };
     propagate_member_restrictions(&mut riscv_entry_guard, &coalesce_member_of);
+    // Copy-coalesce webs are scanned through their group leader only (`scan_ivs`
+    // drops members via `coalesce_member_of`), and `propagate_coalesce_members`
+    // later copies the leader's physical register to every member. Propagate
+    // call-argument staging hazards (`later_arg_values`, `indirect_arg_values`)
+    // across the full equivalence class so a leader cannot take `%r10` (or an
+    // ABI argument register) when a merged member is consumed by `CallIndirect`
+    // (or at argument index >= 1) — Linux 6.18.58 `__rb_insert_augmented`
+    // (`lib/rbtree.c`) merged `parent` (`v200`, arg0 of `augment_rotate`) under
+    // entry copy leader `v217`, which otherwise entered Wave 4 and received
+    // `%r10`, clobbered by `emit_call_spill_fptr_impl` before `%rdi` staging.
+    propagate_member_restrictions(&mut later_arg_values, &coalesce_member_of);
+    propagate_member_restrictions(&mut indirect_arg_values, &coalesce_member_of);
+    for (leader, members) in &coalesce_groups {
+        if later_arg_values.contains(leader) {
+            later_arg_values.extend(members.iter().copied());
+        }
+        if indirect_arg_values.contains(leader) {
+            indirect_arg_values.extend(members.iter().copied());
+        }
+    }
 
     // Hole-aware call spanning (the "80% of LLVM's split" win): a value needs
     // a callee-saved home only when a call point falls INSIDE one of its live
@@ -6576,6 +6602,12 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         &mut assignments,
         &config.available_regs,
         Some((&coalesce_member_of, &config.caller_saved_regs)),
+        Some(PhiCallArgHazards {
+            later_arg_values: &later_arg_values,
+            indirect_arg_values: &indirect_arg_values,
+            call_arg_regs: &config.call_arg_regs,
+            indirect_target_regs: &config.indirect_target_regs,
+        }),
         &config.ra_config,
     );
 
@@ -12672,6 +12704,7 @@ fn apply_phi_coalesce_assignments(
         assignments,
         callee_saved,
         None,
+        None,
         &RaConfig::default(),
     )
 }
@@ -12727,6 +12760,14 @@ fn phi_home_blockers(
     blockers
 }
 
+#[derive(Clone, Copy)]
+struct PhiCallArgHazards<'a> {
+    later_arg_values: &'a FxHashSet<u32>,
+    indirect_arg_values: &'a FxHashSet<u32>,
+    call_arg_regs: &'a [PhysReg],
+    indirect_target_regs: &'a [PhysReg],
+}
+
 fn apply_phi_coalesce_assignments_with_config(
     func: &IrFunction,
     liveness: &LivenessResult,
@@ -12735,6 +12776,7 @@ fn apply_phi_coalesce_assignments_with_config(
     assignments: &mut FxHashMap<u32, PhysReg>,
     callee_saved: &[PhysReg],
     rehome: Option<(&FxHashMap<u32, u32>, &[PhysReg])>,
+    call_arg_hazards: Option<PhiCallArgHazards<'_>>,
     ra_config: &RaConfig,
 ) -> Vec<PhiCoalesceCandidate> {
     // Blocker re-homing (see `rehome_phi_blockers`) needs the copy-web
@@ -12833,6 +12875,26 @@ fn apply_phi_coalesce_assignments_with_config(
         let Some(&reg) = assignments.get(&phi_dest) else {
             continue;
         };
+
+        // Call-argument / indirect-target staging hazard: a secondary backedge
+        // source that is also consumed at argument index >= 1 (or as an
+        // indirect-call argument) dies AT that call (`spans_any_call` is false
+        // when `end == cp`), so inheriting an ABI argument register or `%r10`
+        // from `phi_dest` would let earlier argument/callee staging clobber it.
+        if let Some(haz) = call_arg_hazards {
+            if (haz.later_arg_values.contains(&backedge_src) && haz.call_arg_regs.contains(&reg))
+                || (haz.indirect_arg_values.contains(&backedge_src)
+                    && haz.indirect_target_regs.contains(&reg))
+            {
+                if ra_config.debug_phi_coalesce {
+                    eprintln!(
+                        "[PHI_COALESCE] BLOCKED assign dest=v{} src=v{} r{}: call-arg/indirect-target hazard",
+                        phi_dest, backedge_src, reg.0
+                    );
+                }
+                continue;
+            }
+        }
 
         let preds = &cfg
             .get_or_insert_with(|| {
@@ -15484,6 +15546,7 @@ mod phi_coalesce_tests {
             assignments,
             callee_saved,
             Some((member_of, &caller_saved)),
+            None,
             &RaConfig::default(),
         );
         set_target_elf_machine(saved);
@@ -16007,6 +16070,112 @@ mod phi_coalesce_tests {
                 home.0
             );
         }
+    }
+
+    #[test]
+    fn coalesced_web_propagates_indirect_and_later_call_arg_hazards() {
+        // Reproduces Linux 6.18.58 `__rb_insert_augmented` (`lib/rbtree.c`):
+        // v1 (entry copy leader) coalesces with v2 (`parent`, arg0 of
+        // `CallIndirect`), while v3 (entry copy leader) coalesces with v4
+        // (`arg1` of `CallIndirect`). Even when %r10 (`PhysReg(11)`) is the
+        // first caller-saved candidate in Wave 4 and %rdi (`PhysReg(14)`) is
+        // in `call_arg_regs`, neither coalesced web may receive a register
+        // clobbered during callee/argument staging.
+        let mut func = IrFunction::new(
+            "coalesced_indirect_arg".to_string(),
+            IrType::Void,
+            vec![],
+            false,
+        );
+        func.blocks = vec![
+            block(
+                0,
+                vec![
+                    Instruction::Load {
+                        dest: Value(1),
+                        ptr: Value(0),
+                        ty: IrType::Ptr,
+                        seg_override: crate::common::types::AddressSpace::Default,
+                        volatile: false,
+                    },
+                    Instruction::Copy {
+                        dest: Value(2),
+                        src: Operand::Value(Value(1)),
+                    },
+                    Instruction::Load {
+                        dest: Value(3),
+                        ptr: Value(0),
+                        ty: IrType::Ptr,
+                        seg_override: crate::common::types::AddressSpace::Default,
+                        volatile: false,
+                    },
+                    Instruction::Copy {
+                        dest: Value(4),
+                        src: Operand::Value(Value(3)),
+                    },
+                ],
+                Terminator::Branch(BlockId(1)),
+            ),
+            block(
+                1,
+                vec![Instruction::CallIndirect {
+                    func_ptr: Operand::Value(Value(9)),
+                    info: crate::ir::reexports::CallInfo {
+                        dest: None,
+                        args: vec![Operand::Value(Value(2)), Operand::Value(Value(4))],
+                        arg_types: vec![IrType::Ptr, IrType::Ptr],
+                        return_type: IrType::Void,
+                        ..Default::default()
+                    },
+                }],
+                Terminator::Return(None),
+            ),
+        ];
+        func.next_value_id = 10;
+
+        let config = RegAllocConfig {
+            ipa_regs: Vec::new(),
+            available_regs: Vec::new(),
+            accumulator_policy: AccumulatorPolicy {
+                operand_order: AccumulatorOperandOrder::LhsFirst,
+                return_consumes_accumulator: false,
+            },
+            // Put PhysReg(11) (%r10) FIRST so Wave 4 would hand it out first
+            // if `indirect_arg_values` failed to propagate to leader v1.
+            caller_saved_regs: vec![PhysReg(11), PhysReg(14), PhysReg(15), PhysReg(10)],
+            call_arg_regs: vec![PhysReg(14), PhysReg(15)],
+            indirect_target_regs: vec![PhysReg(11)],
+            allow_inline_asm_regalloc: false,
+            leaf_caller_saved_homes: false,
+            xmm_regs: Vec::new(),
+            never_materialized: FxHashSet::default(),
+            folded_index_uses: FxHashMap::default(),
+            fold_base_regs: Vec::new(),
+            fold_readmit: FxHashSet::default(),
+            reg_hints: FxHashMap::default(),
+            ra_config: Arc::new(RaConfig::default()),
+        };
+        let result = allocate_registers(&func, &config);
+        let r2 = result
+            .assignments
+            .get(&2)
+            .copied()
+            .expect("v2 assigned caller-saved home");
+        let r4 = result
+            .assignments
+            .get(&4)
+            .copied()
+            .expect("v4 assigned caller-saved home");
+        assert_ne!(
+            r2,
+            PhysReg(11),
+            "indirect-call arg0 web {{v1,v2}} must never receive %r10 (PhysReg(11))"
+        );
+        assert!(
+            !matches!(r4.0, 11 | 14 | 15),
+            "indirect-call arg1 web {{v3,v4}} must avoid both %r10 and call_arg_regs, got r{}",
+            r4.0
+        );
     }
 
     /// Split-latch loop helper:

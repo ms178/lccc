@@ -74,6 +74,8 @@ impl CfiStream for AsmStatement {
             | AsmDirective::Size(..)
             | AsmDirective::Local(_)
             | AsmDirective::Set(..)
+            | AsmDirective::File(..)
+            | AsmDirective::Loc(..)
             | AsmDirective::Ignored => CfiItemKind::NoBytes,
             _ => CfiItemKind::Bytes,
         }

@@ -190,11 +190,12 @@ if bad:
     sys.exit(1)
 PEOF
 
-# ── a local name bound to another object's slot is refused ──
-# Two objects each need a slot for their own `static lv` (`leal lv@GOT`
-# takes the slot's address, R_386_GOT32): the name-keyed slot can hold only
-# one of the two addresses, so the other reference must fail rather than
-# read the wrong object's slot.
+# ── each object's local name gets its own GOT slot ──
+# Two objects each take the address of their own `static lv` through a GOT
+# slot (`leal lv@GOT`, R_386_GOT32, not convertible).  A local symbol has file
+# scope, so the slots are distinct and each object reads its own `lv`: GNU ld
+# links this and prints `1 2` (an earlier name-keyed slot table could hold
+# only one of the two addresses and had to refuse the link).
 for i in 1 2; do
     cat >"$td/gc$i.s" <<EOF
  .data
@@ -202,18 +203,18 @@ lv: .long $i
  .text
  .globl other$i
 other$i: push %ebx; call 1f; 1: pop %ebx; addl \$_GLOBAL_OFFSET_TABLE_+[.-1b], %ebx
- leal lv@GOT(%ebx), %eax; movl (%eax), %eax; pop %ebx; ret
+ leal lv@GOT(%ebx), %eax; movl (%eax), %eax; movl (%eax), %eax; pop %ebx; ret
 EOF
     "$ccc" -m32 -c "$td/gc$i.s" -o "$td/gc$i.o"
 done
-printf 'int main(void) { return 0; }\n' >"$td/gcm.c"
-if err=$("$ccc" -m32 -no-pie "$td/gcm.c" "$td/gc1.o" "$td/gc2.o" -o "$td/gbad" 2>&1); then
-    echo "FAIL: a non-convertible GOT reference to a colliding local name linked"
-    exit 1
-fi
-if ! grep -q "needs a GOT slot of its own" <<<"$err"; then
-    printf 'FAIL: unexpected diagnostic for the colliding local GOT slot:\n%s\n' "$err"
-    exit 1
-fi
+printf '#include <stdio.h>\nint other1(void), other2(void);\nint main(void) { printf("%%d %%d\\n", other1(), other2()); return 0; }\n' >"$td/gcm.c"
+for pie in -no-pie -pie; do
+    "$ccc" -m32 "$pie" "$td/gcm.c" "$td/gc1.o" "$td/gc2.o" -o "$td/glocal"
+    got=$("$td/glocal")
+    if [ "$got" != "1 2" ]; then
+        echo "FAIL: per-object local GOT slots ($pie): got '$got', GNU ld gives '1 2'"
+        exit 1
+    fi
+done
 
 echo "OK: i686 GOT32X (ld 2.47 conversions, absolute base-less slots, per-object local slots; runtime correct)"

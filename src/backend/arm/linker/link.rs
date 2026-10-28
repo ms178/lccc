@@ -11,7 +11,9 @@ use super::elf::*;
 use super::emit_dynamic::emit_dynamic_executable;
 use super::emit_shared::emit_shared_library;
 use super::emit_static::emit_executable;
-use super::input::{load_file, resolve_lib, resolve_lib_prefer_shared};
+use super::input::{
+    load_file, load_file_as_needed, load_library_as_needed, resolve_lib, resolve_lib_prefer_shared,
+};
 use super::plt_got::create_plt_got;
 use super::types::GlobalSymbol;
 use crate::backend::linker_common;
@@ -26,6 +28,7 @@ use linker_common::OutputSection;
 /// symbol references.
 pub fn link_builtin(
     object_files: &[&str],
+    object_as_needed: &[bool],
     output_path: &str,
     user_args: &[String],
     lib_paths: &[&str],
@@ -49,6 +52,9 @@ pub fn link_builtin(
     let parsed_common = linker_common::parse_linker_args(user_args);
     parsed_common.validate_common_page_size()?;
     parsed_common.warn_unimplemented_keyword_options()?;
+    if parsed_common.warn_common {
+        objects.enable_warn_common();
+    }
     let rpath = linker_common::rpath_dyn_entry(&parsed_common);
     let mut export_dynamic = parsed_common.export_dynamic;
     for arg in user_args {
@@ -78,15 +84,19 @@ pub fn link_builtin(
         }
     }
 
-    // Load user object files
-    for path in object_files {
-        load_file(
+    // Load user object files, each with the `--as-needed` state it was
+    // named under (`linker_common::object_as_needed`).
+    let as_needed_for =
+        |path_or_name: &str| linker_common::input_as_needed(&parsed_common.inputs, path_or_name);
+    for (i, path) in object_files.iter().enumerate() {
+        load_file_as_needed(
             path,
             &mut objects,
             &mut globals,
             &mut needed_sonames,
             &all_lib_paths,
             is_static,
+            linker_common::object_as_needed(object_as_needed, i, &parsed_common.inputs, path),
         )?;
     }
 
@@ -122,13 +132,14 @@ pub fn link_builtin(
             combined.extend(all_lib_paths.iter().cloned());
             let lib_path =
                 resolver(l, &combined).ok_or_else(|| linker_common::cannot_find_lib(l))?;
-            load_file(
+            load_library_as_needed(
                 &lib_path,
                 &mut objects,
                 &mut globals,
                 &mut needed_sonames,
                 &combined,
                 is_static,
+                as_needed_for(l),
             )?;
         } else if let Some(wl_arg) = arg.strip_prefix("-Wl,") {
             let parts: Vec<&str> = wl_arg.split(',').collect();
@@ -147,13 +158,14 @@ pub fn link_builtin(
                     combined.extend(all_lib_paths.iter().cloned());
                     let lib_path = resolver(lib, &combined)
                         .ok_or_else(|| linker_common::cannot_find_lib(lib))?;
-                    load_file(
+                    load_library_as_needed(
                         &lib_path,
                         &mut objects,
                         &mut globals,
                         &mut needed_sonames,
                         &combined,
                         is_static,
+                        as_needed_for(lib),
                     )?;
                 } else if let Some(defsym_arg) = part.strip_prefix("--defsym=") {
                     // --defsym=SYMBOL=EXPR: define a symbol alias
@@ -182,13 +194,14 @@ pub fn link_builtin(
                 j += 1;
             }
         } else if !arg.starts_with('-') && Path::new(arg).exists() {
-            load_file(
+            load_file_as_needed(
                 arg,
                 &mut objects,
                 &mut globals,
                 &mut needed_sonames,
                 &all_lib_paths,
                 is_static,
+                as_needed_for(arg),
             )?;
         }
         arg_i += 1;
@@ -218,13 +231,14 @@ pub fn link_builtin(
             changed = false;
             let prev_count = objects.len();
             for lib_path in &lib_paths_resolved {
-                load_file(
+                load_library_as_needed(
                     lib_path,
                     &mut objects,
                     &mut globals,
                     &mut needed_sonames,
                     &combined_lib_paths,
                     is_static,
+                    true,
                 )?;
             }
             if objects.len() != prev_count {
@@ -248,6 +262,11 @@ pub fn link_builtin(
             )?;
         }
     }
+
+    linker_common::warn_common::report_common_warnings(
+        &objects.take_common_warnings(),
+        parsed_common.fatal_warnings,
+    )?;
 
     // For dynamic linking, resolve remaining undefined symbols against system libs.
     // Only when gcc's default libraries were requested: the driver passes
@@ -406,6 +425,7 @@ pub fn link_builtin(
 /// _Unwind_GetRegionStart" when the library was loaded.)
 pub fn link_shared(
     object_files: &[&str],
+    object_as_needed: &[bool],
     output_path: &str,
     user_args: &[String],
     lib_paths: &[&str],
@@ -421,23 +441,39 @@ pub fn link_shared(
     let parsed_args = linker_common::parse_linker_args(user_args);
     parsed_args.validate_common_page_size()?;
     parsed_args.warn_unimplemented_keyword_options()?;
+    if parsed_args.warn_common {
+        objects.enable_warn_common();
+    }
     let rpath = linker_common::rpath_dyn_entry(&parsed_args);
     let soname = parsed_args.soname.clone();
     let defsym_defs = parsed_args.defsym_defs.clone();
 
-    for path in crt_objects_before
+    let as_needed_for =
+        |path_or_name: &str| linker_common::input_as_needed(&parsed_args.inputs, path_or_name);
+    // The driver's objects (or the standalone linker's operands, each with
+    // the state it was named under), then the files among `user_args`.
+    let operands = object_files.iter().enumerate().map(|(i, &path)| {
+        (
+            path,
+            linker_common::object_as_needed(object_as_needed, i, &parsed_args.inputs, path),
+        )
+    });
+    let named = parsed_args
+        .extra_object_files
         .iter()
-        .copied()
-        .chain(object_files.iter().copied())
-        .chain(parsed_args.extra_object_files.iter().map(String::as_str))
-    {
-        load_file(
+        .map(|path| (path.as_str(), as_needed_for(path)));
+    let crt = crt_objects_before
+        .iter()
+        .map(|&path| (path, as_needed_for(path)));
+    for (path, as_needed) in crt.chain(operands).chain(named) {
+        load_file_as_needed(
             path,
             &mut objects,
             &mut globals,
             &mut needed_sonames,
             &lib_path_strings,
             false,
+            as_needed,
         )?;
     }
 
@@ -465,13 +501,14 @@ pub fn link_shared(
     while changed {
         let prev_count = objects.len();
         for lib_path in &lib_paths_resolved {
-            load_file(
+            load_library_as_needed(
                 lib_path,
                 &mut objects,
                 &mut globals,
                 &mut needed_sonames,
                 &all_lib_paths,
                 false,
+                as_needed_for(lib_path),
             )?;
         }
         changed = objects.len() != prev_count;
@@ -486,6 +523,11 @@ pub fn link_shared(
             false,
         )?;
     }
+
+    linker_common::warn_common::report_common_warnings(
+        &objects.take_common_warnings(),
+        parsed_args.fatal_warnings,
+    )?;
 
     // Merge sections (no gc-sections for shared libraries)
     let mut output_sections: Vec<OutputSection> = Vec::new();

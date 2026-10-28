@@ -1029,38 +1029,46 @@ mod tests {
         assert!(out.contains(".LBB3:\n"), "successor label lost:\n{out}");
     }
 
+    const TRAILING_LOC: &str = concat!(
+        "f:\n",
+        ".cfi_startproc\n",
+        "    testl %edi, %edi\n",
+        "    jne .LBB1\n",
+        "    jmp .LBB2\n",
+        ".LBB1:\n",
+        "    movl $1, %eax\n",
+        "    addl $2, %eax\n",
+        "    addl $3, %eax\n",
+        "    addl $4, %eax\n",
+        "    jmp .LBB3\n",
+        "    .loc 1 10 0\n",
+        ".LBB2:\n",
+        "    movl $1, %eax\n",
+        "    addl $2, %eax\n",
+        "    addl $3, %eax\n",
+        "    addl $4, %eax\n",
+        "    jmp .LBB3\n",
+        "    .loc 1 10 0\n",
+        ".LBB3:\n",
+        "    ret\n",
+        ".cfi_endproc\n",
+    );
+
     /// A trailing `.loc` must not pose as the block terminator: the block
     /// above still ends in `jmp`, so it has no fall-through edge. Treating
     /// the marker as a `Directive` terminator invents a fall-through edge
     /// into the layout successor, the two blocks' fall-through successors
     /// differ, and the merge is wrongly skipped. (The markers also must not
     /// count as dirt: exactly one copy survives, on the canonical block.)
+    /// The pass itself, on visible markers: the pipeline hides rows.
     #[test]
     fn trailing_debug_markers_do_not_fake_fallthrough() {
-        let out = run(concat!(
-            "f:\n",
-            ".cfi_startproc\n",
-            "    testl %edi, %edi\n",
-            "    jne .LBB1\n",
-            "    jmp .LBB2\n",
-            ".LBB1:\n",
-            "    movl $1, %eax\n",
-            "    addl $2, %eax\n",
-            "    addl $3, %eax\n",
-            "    addl $4, %eax\n",
-            "    jmp .LBB3\n",
-            "    .loc 1 10 0\n",
-            ".LBB2:\n",
-            "    movl $1, %eax\n",
-            "    addl $2, %eax\n",
-            "    addl $3, %eax\n",
-            "    addl $4, %eax\n",
-            "    jmp .LBB3\n",
-            "    .loc 1 10 0\n",
-            ".LBB3:\n",
-            "    ret\n",
-            ".cfi_endproc\n",
-        ));
+        let mut store = super::LineStore::new(TRAILING_LOC.to_string());
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|index| super::classify_line(store.get(index)))
+            .collect();
+        assert!(super::merge_identical_blocks(&mut store, &mut infos));
+        let out = store.build_result(|index| infos[index].is_nop());
         assert_eq!(
             out.matches("movl $1, %eax").count(),
             1,
@@ -1071,6 +1079,27 @@ mod tests {
             1,
             "debug marker was not preserved exactly once:\n{out}"
         );
+    }
+
+    /// Through the pipeline the rows are hidden, so the result is the
+    /// row-free result, rows kept. (Before rows were hidden this input merged
+    /// only under `-g`: the visible `.loc` between `jmp .LBB3` and `.LBB3:`
+    /// kept the jump-to-next-label elision from firing.)
+    #[test]
+    fn trailing_debug_markers_leave_the_pipeline_result_unchanged() {
+        let plain: String = TRAILING_LOC
+            .lines()
+            .filter(|l| !l.trim_start().starts_with(".loc"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let out = run(TRAILING_LOC);
+        let code: String = out
+            .lines()
+            .filter(|l| !l.trim_start().starts_with(".loc"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        assert_eq!(code, run(&plain));
+        assert!(out.contains(".loc 1 10 0"), "{out}");
     }
 
     #[test]

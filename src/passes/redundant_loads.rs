@@ -417,6 +417,7 @@ mod tests {
             is_static: false,
             is_inline: false,
             is_always_inline: false,
+            x86_isa_needs: Default::default(),
             is_noinline: false,
             target_features: Vec::new(),
             next_value_id: 4,
@@ -439,6 +440,8 @@ mod tests {
             is_gnu_inline_def: false,
             loop_promoted_f64_values: Vec::new(),
             ssp: Default::default(),
+            body_span: crate::common::source::Span::dummy(),
+            terminator_spans: Default::default(),
         };
         let removed = run(&mut func);
         assert_eq!(removed, 0, "volatile loads must not merge");

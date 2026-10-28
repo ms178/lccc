@@ -435,6 +435,7 @@ impl Parser {
         let is_static = self.attrs.parsing_static();
         let is_inline = self.attrs.parsing_inline();
         let is_extern = self.attrs.parsing_extern();
+        let return_base_const = self.attrs.parsing_const();
         let is_gnu_inline = self.attrs.parsing_gnu_inline();
         let is_always_inline = self.attrs.parsing_always_inline();
         let is_noinline = self.attrs.parsing_noinline()
@@ -494,7 +495,9 @@ impl Parser {
                 start,
             );
         }
+        let open = self.peek_span();
         let body = self.parse_compound_stmt();
+        let body_span = self.through_previous_token(open);
         for n in shadowed_added {
             self.shadowed_typedefs.remove(&n);
         }
@@ -502,6 +505,7 @@ impl Parser {
 
         Some(ExternalDecl::FunctionDef(FunctionDef {
             alignment,
+            return_base_const,
             return_pointer_const_levels: crate::frontend::parser::ast::return_pointer_const_levels(
                 &return_type,
                 &derived,
@@ -526,6 +530,7 @@ impl Parser {
             ),
             is_kr: is_kr_style,
             span: start,
+            body_span,
         }))
     }
 
@@ -1078,6 +1083,9 @@ impl Parser {
             if self.attrs.parsing_maybe_unused() {
                 last_decl.attrs.set_maybe_unused(true);
                 self.attrs.set_maybe_unused(false);
+            }
+            if let Some(cleanup) = self.attrs.parsing_cleanup_fn.take() {
+                last_decl.attrs.cleanup_fn = Some(cleanup);
             }
             if let Some(reg) = skip_asm_reg {
                 last_decl.attrs.asm_register = Some(reg);

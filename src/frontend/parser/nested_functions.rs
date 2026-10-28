@@ -284,8 +284,11 @@ impl Parser {
                 }
             }
         }
+        let return_base_const = self.attrs.parsing_const();
         self.attrs.set_noreturn(false);
+        let open = self.peek_span();
         let body = self.parse_compound_stmt();
+        let body_span = self.through_previous_token(open);
         for n in shadowed_added {
             self.shadowed_typedefs.remove(&n);
         }
@@ -310,6 +313,7 @@ impl Parser {
         // only known once the lowering side has built the `IrFunction`.
         Some(FunctionDef {
             alignment: None,
+            return_base_const,
             return_pointer_const_levels: crate::frontend::parser::ast::return_pointer_const_levels(
                 &return_type,
                 &derived,
@@ -323,6 +327,7 @@ impl Parser {
             attrs,
             is_kr: is_kr_style,
             span: start,
+            body_span,
         })
     }
 }

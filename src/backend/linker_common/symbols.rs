@@ -311,6 +311,40 @@ pub fn is_exported_dynamic_symbol<G: GlobalSymbolOps>(g: &G) -> bool {
         && is_dynamic_visibility(g.visibility())
 }
 
+/// GNU ld's resolution of a regular COMMON symbol against a shared-library
+/// definition of the same (default-version) name, as measured with bfd
+/// (runtime value, `DT_NEEDED` and `--warn-common` text agree; mold binds
+/// the same way, lld keeps the common):
+///
+/// | library definition | common met first  | library met first |
+/// |--------------------|-------------------|-------------------|
+/// | GLOBAL/UNIQUE data | library binds     | library binds     |
+/// | WEAK data          | common stays      | common stays      |
+/// | function, TLS      | common stays      | common stays      |
+///
+/// The order does not matter -- a weak library definition loses to the
+/// common even when a regular reference bound the name to it before the
+/// common arrived (x86-64 and i686, `--as-needed` or not).  A common is
+/// always a variable, so a function of that name is never what it means.
+/// `info` is the library symbol's `st_info`.  Binding the library
+/// definition turns the common into an import (a copy relocation in an
+/// executable).
+pub fn shared_def_overrides_common(info: u8) -> bool {
+    use crate::backend::elf::STB_GLOBAL;
+    const STB_GNU_UNIQUE: u8 = 10;
+    let binding = info >> 4;
+    (binding == STB_GLOBAL || binding == STB_GNU_UNIQUE) && is_data_type(info)
+}
+
+/// Code never takes over a common, and neither does thread-local data: a
+/// common is a non-TLS object, and binding it to a TLS definition would turn
+/// its every access into a read of the wrong address (bfd keeps the common
+/// when it comes first and rejects the mismatch when the library does).
+fn is_data_type(info: u8) -> bool {
+    use crate::backend::elf::{STT_FUNC, STT_GNU_IFUNC, STT_TLS};
+    !matches!(info & 0xf, STT_FUNC | STT_GNU_IFUNC | STT_TLS)
+}
+
 /// Whether a symbol of merged visibility `vis` may appear in `.dynsym` as a
 /// definition.  HIDDEN and INTERNAL symbols are, by definition, not visible
 /// outside the component; exporting them (as the x86-64 emitters once did

@@ -177,10 +177,51 @@ do_check() {
 }
 
 # --- scan -------------------------------------------------------------------
+# ZSTD (`lib/zstd/common/{portability_macros,compiler}.h`, included into
+# `arch/x86/boot/compressed/misc.c` when `CONFIG_KERNEL_ZSTD=y`) enables
+# `DYNAMIC_BMI2=1` under GCC >= 11 / Clang / LCCC and marks its runtime
+# CPUID-gated clones with `__attribute__((__target__("lzcnt,bmi,bmi2")))`.
+# Those clones are never entered on baseline CPUs (`qemu64` boots cleanly via
+# the `_default` path); allow ONLY `lzcnt`/`bmi`/`bmi2` mnemonics inside those
+# exact ZSTD dynamic-dispatch symbols while still forbidding AVX/SSE4.2/`movbe`
+# there and forbidding the full `ISA_RE` in every other symbol.
+#
+# Trust boundary: object code carries no attribute record, so the only signal
+# available at scan time is the symbol NAME. The regex below pins the exact
+# ZSTD naming family (DYNAMIC_BMI2 dispatch clones and the HUF fast-path
+# internals); an unrelated baseline function deliberately named to match could
+# smuggle an allowed mnemonic past the scan. That is accepted because (1) the
+# boot objects are produced by our own frontend from the in-tree ZSTD sources,
+# never from hand-written assembly, and (2) the AVX/SSE4.2/`movbe` veto and the
+# every-other-symbol ISA_RE veto are unconditional. The regression gate's
+# anti-vacuity control additionally proves the attributed clone really emits
+# the allowed mnemonics, so a target-attribute regression cannot hide here.
+ZSTD_DYN_BMI2_SYM_RE='^((FSE|HUF|ZSTD)_[A-Za-z0-9_]*_bmi2|HUF_decompress4X[12]_usingDTable_internal_fast(_c_loop)?)(\.[A-Za-z0-9_.]+)?$'
+# POSIX/mawk-compatible boundaries (`mawk` has no `\b`): disassembly lines
+# precede mnemonics with whitespace and follow them with whitespace or EOL.
+ZSTD_DYN_BMI2_ALLOWED_RE='(^|[[:space:]])(rorx[ql]?|andn[ql]?|shrx[ql]?|shlx[ql]?|sarx[ql]?|mulx[ql]?|bzhi[ql]?|bextr[ql]?|blsi[ql]?|blsmsk[ql]?|blsr[ql]?|pdep[ql]?|pext[ql]?|tzcnt[ql]?|lzcnt[ql]?)([[:space:]]|$)'
+
 scan_obj() { # scan_obj <file> ; echoes the offending mnemonics, rc 1 on a hit
     local file=$1 hits
     # Strip `#` comments first: a comment naming an instruction is not one.
-    hits=$(objdump -d --no-show-raw-insn "$file" 2>/dev/null | sed 's/#.*//' \
+    # Within ZSTD DYNAMIC_BMI2 runtime-dispatched clones only, strip the
+    # `lzcnt,bmi,bmi2` mnemonics explicitly authorized by ZSTD's target attr.
+    hits=$(objdump -d --no-show-raw-insn "$file" 2>/dev/null \
+           | awk -v sym_re="$ZSTD_DYN_BMI2_SYM_RE" -v allow_re="$ZSTD_DYN_BMI2_ALLOWED_RE" '
+               /^[0-9a-fA-F]+[[:space:]]+<[^>]+>:/ {
+                   s = $0
+                   sub(/^[^<]*</, "", s)
+                   sub(/>:.*$/, "", s)
+                   in_zstd_bmi2 = (s ~ sym_re)
+                   next
+               }
+               {
+                   sub(/#.*/, "")
+                   if (in_zstd_bmi2) {
+                       gsub(allow_re, " ")
+                   }
+                   print
+               }' \
            | sed -E "s/$LEGACY_V_RE//g" \
            | grep -oE "$ISA_RE" | sort -u | tr '\n' ' ' || true)
     if [[ -n ${hits// /} ]]; then

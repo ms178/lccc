@@ -53,6 +53,7 @@ use super::emit::{
 };
 use super::gnu_hash::build_gnu_hash_32;
 use super::options::{LinkOptions, Symbolic};
+use super::shdr::{self, Shdr32, StdSection};
 use super::types::*;
 use crate::backend::linker_common;
 
@@ -272,22 +273,6 @@ fn plan(rel_type: u32, t: &Target, data: &[u8], off: usize) -> Plan {
 /// (`___tls_get_addr`, `_Unwind_Resume`, `_ITM_*TMCloneTable`, ...) that
 /// must be imported, and binding those locally to 0 breaks e.g. crtbeginS's
 /// weak `_ITM_registerTMCloneTable` test.
-/// One section header of the output (`Elf32_Shdr` fields plus the output
-/// section it describes, `None` for the emitter's synthetic tables).
-struct Shdr32 {
-    name: String,
-    out_idx: Option<usize>,
-    ty: u32,
-    flags: u32,
-    addr: u32,
-    offset: u32,
-    size: u32,
-    link: u32,
-    info: u32,
-    align: u32,
-    entsize: u32,
-}
-
 pub(super) fn is_emitter_defined(name: &str, sections: &FxHashMap<String, usize>) -> bool {
     linker_common::defsym::is_linker_defined(name)
         || name
@@ -507,7 +492,10 @@ pub(super) fn emit_shared_library_32(
             let Some(&(out_idx, sec_base)) = section_map.get(&(obj_idx, sec.input_index)) else {
                 continue;
             };
-            if sec.relocations.is_empty() {
+            // Debug sections are resolved statically (`debug.rs`): nothing
+            // at run time reads them, so they need no GOT slot or dynamic
+            // relocation.
+            if sec.relocations.is_empty() || output_sections[out_idx].flags & SHF_ALLOC == 0 {
                 continue;
             }
             let writable = sec.flags & SHF_WRITE != 0;
@@ -1284,6 +1272,9 @@ pub(super) fn emit_shared_library_32(
             let Some(&(out_idx, sec_base)) = section_map.get(&(obj_idx, sec.input_index)) else {
                 continue;
             };
+            if output_sections[out_idx].flags & SHF_ALLOC == 0 {
+                continue;
+            }
             for &(rel_offset, rel_type, sym_idx, addend) in &sec.relocations {
                 let Some(sym) = obj.symbols.get(sym_idx as usize) else {
                     continue;
@@ -1553,282 +1544,138 @@ pub(super) fn emit_shared_library_32(
     // -- if the defining section is read-only or inside PT_GNU_RELRO.  With
     // every definition claiming index 1 (then `.dynamic`, which is RELRO)
     // the first store to such a variable faulted.
-    const SHT_DYNAMIC: u32 = 6;
-    const SHT_HASH: u32 = 5;
-    const SHT_GNU_HASH_: u32 = 0x6fff_fff6;
-    const SHT_GNU_VERNEED: u32 = 0x6fff_fffe;
-    const SHT_GNU_VERSYM: u32 = 0x6fff_ffff;
-    const A: u32 = SHF_ALLOC;
-    const AW: u32 = SHF_ALLOC | SHF_WRITE;
-    let mut shdrs: Vec<Shdr32> = Vec::new();
-    let mut synth = |name: &str, ty, flags, addr, offset, size, align, entsize| {
-        shdrs.push(Shdr32 {
-            name: name.to_string(),
-            out_idx: None,
-            ty,
-            flags,
-            addr,
-            offset,
-            size,
-            link: 0,
-            info: 0,
-            align,
-            entsize,
-        });
-    };
-    if interp_size > 0 {
-        synth(
-            ".interp",
-            SHT_PROGBITS,
-            A,
+    let mut shdrs: Vec<Shdr32> = Shdr32::standard_all(&[
+        (
+            StdSection::Interp,
+            true,
             interp_vaddr,
             interp_offset,
             interp_size,
-            1,
-            0,
-        );
-    }
-    if sysv_hash.is_some() {
-        synth(
-            ".hash",
-            SHT_HASH,
-            A,
+        ),
+        (
+            StdSection::BuildId,
+            true,
+            note_vaddr + (build_id_offset - note_offset),
+            build_id_offset,
+            build_id_size,
+        ),
+        (
+            StdSection::Hash,
+            sysv_hash.is_some(),
             hash_vaddr,
             hash_offset,
             hash_size,
-            4,
-            4,
-        );
-    }
-    if want_gnu_hash {
-        synth(
-            ".gnu.hash",
-            SHT_GNU_HASH_,
-            A,
+        ),
+        (
+            StdSection::GnuHash,
+            want_gnu_hash,
             gnu_hash_vaddr,
             gnu_hash_offset,
             gnu_hash_size,
-            4,
-            0,
-        );
-    }
-    synth(
-        ".dynsym",
-        SHT_DYNSYM,
-        A,
-        dynsym_vaddr,
-        dynsym_offset,
-        dynsym_size,
-        4,
-        16,
-    );
-    synth(
-        ".dynstr",
-        SHT_STRTAB,
-        A,
-        dynstr_vaddr,
-        dynstr_offset,
-        dynstr_size,
-        1,
-        0,
-    );
-    if versym_size > 0 {
-        synth(
-            ".gnu.version",
-            SHT_GNU_VERSYM,
-            A,
+        ),
+        (
+            StdSection::Dynsym,
+            true,
+            dynsym_vaddr,
+            dynsym_offset,
+            dynsym_size,
+        ),
+        (
+            StdSection::Dynstr,
+            true,
+            dynstr_vaddr,
+            dynstr_offset,
+            dynstr_size,
+        ),
+        (
+            StdSection::Versym,
+            true,
             versym_vaddr,
             versym_offset,
             versym_size,
-            2,
-            2,
-        );
-    }
-    if verneed_size > 0 {
-        synth(
-            ".gnu.version_r",
-            SHT_GNU_VERNEED,
-            A,
+        ),
+        (
+            StdSection::Verneed,
+            true,
             verneed_vaddr,
             verneed_offset,
             verneed_size,
-            4,
-            0,
-        );
-    }
-    if rel_dyn_size > 0 {
-        synth(
-            ".rel.dyn",
-            SHT_REL,
-            A,
+        ),
+        (
+            StdSection::RelDyn,
+            true,
             rel_dyn_vaddr,
             rel_dyn_offset,
             rel_dyn_size,
-            4,
-            8,
-        );
-    }
-    if relr_actual_size > 0 {
-        synth(
-            ".relr.dyn",
-            SHT_RELR,
-            A,
+        ),
+        (
+            StdSection::Relr,
+            true,
             relr_dyn_vaddr,
             relr_dyn_offset,
             relr_actual_size,
-            4,
-            4,
-        );
-    }
-    if rel_plt_size > 0 {
-        synth(
-            ".rel.plt",
-            SHT_REL,
-            A | SHF_INFO_LINK,
+        ),
+        (
+            StdSection::RelPlt,
+            true,
             rel_plt_vaddr,
             rel_plt_offset,
             rel_plt_size,
-            4,
-            8,
-        );
-    }
-    if plt_total_size > 0 {
-        synth(
-            ".plt",
-            SHT_PROGBITS,
-            A | SHF_EXECINSTR,
-            plt_vaddr,
-            plt_offset,
-            plt_total_size,
-            16,
-            4,
-        );
-    }
-    if eh_frame_hdr_size > 0 {
-        synth(
-            ".eh_frame_hdr",
-            SHT_PROGBITS,
-            A,
+        ),
+        (StdSection::Plt, true, plt_vaddr, plt_offset, plt_total_size),
+        (
+            StdSection::EhFrameHdr,
+            true,
             eh_frame_hdr_vaddr,
             eh_frame_hdr_offset,
             eh_frame_hdr_size,
-            4,
-            0,
-        );
-    }
-    synth(
-        ".dynamic",
-        SHT_DYNAMIC,
-        AW,
-        dynamic_vaddr,
-        dynamic_offset,
-        dynamic_size,
-        4,
-        8,
-    );
-    if got_size > 0 {
-        synth(
-            ".got",
-            SHT_PROGBITS,
-            AW,
-            got_vaddr,
-            got_offset,
-            got_size,
-            4,
-            4,
-        );
-    }
-    synth(
-        ".got.plt",
-        SHT_PROGBITS,
-        AW,
-        gotplt_vaddr,
-        gotplt_offset,
-        gotplt_size,
-        4,
-        4,
-    );
-    for (i, sec) in output_sections.iter().enumerate() {
-        if sec.flags & SHF_ALLOC == 0 {
-            continue;
-        }
-        shdrs.push(Shdr32 {
-            name: sec.name.clone(),
-            out_idx: Some(i),
-            ty: sec.sh_type,
-            flags: sec.flags,
-            addr: sec.addr,
-            offset: sec.file_offset,
-            size: sec.data.len() as u32,
-            link: 0,
-            info: 0,
-            align: sec.align.max(1),
-            entsize: 0,
-        });
-    }
-    // Address order; a zero-sized section sorts before a sized one at the
-    // same address, and NOBITS after PROGBITS (`.tbss` overlaps what
-    // follows `.tdata`).
-    shdrs.sort_by_key(|h| (h.addr, h.size != 0, h.ty == SHT_NOBITS));
-    // Header indices start at 1 (index 0 is the null header).
-    let synth_index = |shdrs: &[Shdr32], name: &str| {
-        shdrs
-            .iter()
-            .position(|h| h.out_idx.is_none() && h.name == name)
-            .map_or(0, |i| i as u32 + 1)
-    };
-    let (dynsym_hdr, dynstr_hdr, gotplt_hdr) = (
-        synth_index(&shdrs, ".dynsym"),
-        synth_index(&shdrs, ".dynstr"),
-        synth_index(&shdrs, ".got.plt"),
-    );
-    for h in shdrs.iter_mut().filter(|h| h.out_idx.is_none()) {
-        match h.name.as_str() {
-            ".dynsym" => {
-                h.link = dynstr_hdr;
-                h.info = 1; // one local: the null symbol
-            }
-            ".dynamic" => h.link = dynstr_hdr,
-            ".hash" | ".gnu.hash" | ".gnu.version" | ".rel.dyn" => h.link = dynsym_hdr,
-            ".gnu.version_r" => {
-                h.link = dynstr_hdr;
-                h.info = verneed_count;
-            }
-            ".rel.plt" => {
-                h.link = dynsym_hdr;
-                h.info = gotplt_hdr;
-            }
-            _ => {}
-        }
-    }
-    let out_sec_hdr: FxHashMap<usize, u16> = shdrs
-        .iter()
-        .enumerate()
-        .filter_map(|(i, h)| h.out_idx.map(|o| (o, i as u16 + 1)))
-        .collect();
-    // Section index of a definition that is not in an input section
-    // (emitter-defined anchors): `__start_SEC`/`__stop_SEC` belong to SEC;
-    // otherwise the section containing the address, end inclusive (`_end`
-    // is one past `.bss`), preferring the later one at a boundary.
-    let containing_hdr = |name: &str, addr: u32| -> u16 {
-        if let Some(sec) = name
-            .strip_prefix("__start_")
-            .or_else(|| name.strip_prefix("__stop_"))
-            && let Some(i) = shdrs
-                .iter()
-                .position(|h| h.out_idx.is_some() && h.name == sec)
-        {
-            return i as u16 + 1;
-        }
-        shdrs
-            .iter()
-            .enumerate()
-            // TLS templates overlay ordinary addresses; a non-TLS anchor
-            // never lives in them (a TLS symbol always has its section).
-            .filter(|(_, h)| h.flags & SHF_TLS == 0 && h.addr <= addr && addr <= h.addr + h.size)
-            .max_by_key(|(_, h)| h.addr)
-            .map_or(dynsym_hdr as u16, |(i, _)| i as u16 + 1)
-    };
+        ),
+        (
+            StdSection::Dynamic,
+            true,
+            dynamic_vaddr,
+            dynamic_offset,
+            dynamic_size,
+        ),
+        (StdSection::Got, true, got_vaddr, got_offset, got_size),
+        (
+            StdSection::GotPlt,
+            true,
+            gotplt_vaddr,
+            gotplt_offset,
+            gotplt_size,
+        ),
+    ])
+    .collect();
+    // Debug sections follow the load image; nothing at run time maps them.
+    super::debug::apply_debug_relocations(
+        inputs,
+        section_map,
+        output_sections,
+        global_symbols,
+        tls_addr,
+    )?;
+    let file_end = super::debug::place_debug_sections(output_sections, data_seg_file_end);
+    shdrs.extend(Shdr32::of_outputs(output_sections));
+    shdr::finish(&mut shdrs, verneed_count);
+    let symbols = (!opts.strip_all).then(|| {
+        super::symtab::build(
+            inputs,
+            section_map,
+            output_sections,
+            global_symbols,
+            section_name_to_idx,
+            &shdrs,
+            tls_addr,
+        )
+    });
+    let file_end = symbols
+        .as_ref()
+        .map_or(file_end, |t| t.place(&mut shdrs, file_end));
+    let dynsym_hdr = shdr::synth_index(&shdrs, ".dynsym") as u16;
+    let out_sec_hdr = shdr::output_index_map(&shdrs);
+    let containing_hdr =
+        |name: &str, addr: u32| shdr::containing_index(&shdrs, name, addr, dynsym_hdr);
 
     // ── .dynsym ──────────────────────────────────────────────────────────
     let mut dynsym_data: Vec<u8> = vec![0u8; 16];
@@ -1894,19 +1741,8 @@ pub(super) fn emit_shared_library_32(
     };
 
     // ── Write ────────────────────────────────────────────────────────────
-    let mut shstrtab: Vec<u8> = vec![0];
-    let mut name_offs: Vec<u32> = Vec::new();
-    for h in &shdrs {
-        name_offs.push(shstrtab.len() as u32);
-        shstrtab.extend_from_slice(h.name.as_bytes());
-        shstrtab.push(0);
-    }
-    let shstrtab_name = shstrtab.len() as u32;
-    shstrtab.extend_from_slice(b".shstrtab\0");
-    let shstrtab_file_off = data_seg_file_end as usize;
-    let shdr_table_off = align_up((shstrtab_file_off + shstrtab.len()) as u32, 4) as usize;
-    let shnum = shdrs.len() + 2;
-    let mut output = vec![0u8; shdr_table_off + shnum * 40];
+    let header_table = shdr::serialize(&shdrs, file_end)?;
+    let mut output = vec![0u8; header_table.end];
 
     output[0..4].copy_from_slice(&ELF_MAGIC);
     output[4] = ELFCLASS32;
@@ -1928,13 +1764,13 @@ pub(super) fn emit_shared_library_32(
     };
     output[24..28].copy_from_slice(&entry.to_le_bytes());
     output[28..32].copy_from_slice(&ehdr_size.to_le_bytes());
-    output[32..36].copy_from_slice(&(shdr_table_off as u32).to_le_bytes());
     output[40..42].copy_from_slice(&(ehdr_size as u16).to_le_bytes());
     output[42..44].copy_from_slice(&32u16.to_le_bytes());
     output[44..46].copy_from_slice(&(num_phdrs as u16).to_le_bytes());
-    output[46..48].copy_from_slice(&40u16.to_le_bytes());
-    output[48..50].copy_from_slice(&(shnum as u16).to_le_bytes());
-    output[50..52].copy_from_slice(&((shnum - 1) as u16).to_le_bytes());
+    header_table.write(&mut output);
+    if let Some(t) = &symbols {
+        t.write(&shdrs, &mut output);
+    }
 
     let mut phdrs: Vec<[u32; 8]> = Vec::with_capacity(num_phdrs as usize);
     // [type, offset, vaddr, filesz, memsz, flags, align, -]
@@ -2110,39 +1946,6 @@ pub(super) fn emit_shared_library_32(
             put(sec.file_offset, &sec.data);
         }
     }
-    put(shstrtab_file_off as u32, &shstrtab);
-    let mut table: Vec<u8> = vec![0u8; 40];
-    for (i, h) in shdrs.iter().enumerate() {
-        for v in [
-            name_offs[i],
-            h.ty,
-            h.flags,
-            h.addr,
-            h.offset,
-            h.size,
-            h.link,
-            h.info,
-            h.align,
-            h.entsize,
-        ] {
-            table.extend_from_slice(&v.to_le_bytes());
-        }
-    }
-    for v in [
-        shstrtab_name,
-        SHT_STRTAB,
-        0,
-        0,
-        shstrtab_file_off as u32,
-        shstrtab.len() as u32,
-        0,
-        0,
-        1,
-        0,
-    ] {
-        table.extend_from_slice(&v.to_le_bytes());
-    }
-    put(shdr_table_off as u32, &table);
 
     if build_id_size > 0 {
         linker_common::build_id::write_build_id_skeleton_styled(

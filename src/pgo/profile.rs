@@ -739,6 +739,7 @@ mod tests {
             is_static: false,
             is_inline: false,
             is_always_inline: false,
+            x86_isa_needs: Default::default(),
             is_noinline: false,
             target_features: Vec::new(),
             next_value_id: 0,
@@ -761,6 +762,8 @@ mod tests {
             is_gnu_inline_def: false,
             loop_promoted_f64_values: vec![],
             ssp: Default::default(),
+            body_span: crate::common::source::Span::dummy(),
+            terminator_spans: Default::default(),
         }
     }
 

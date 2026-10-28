@@ -203,10 +203,10 @@ if [ ! -x "$LCCC" ]; then
     exit 1
 fi
 
-# The driver contract's 6,776-case -ftrapv matrix used to make one hosted
-# frontend shard ~19 minutes longer than its twin. Hosted CI runs the core
-# contract once and each ABI leg on a different shard; the local mirror keeps
-# the same three gates so a partial run cannot silently lose an ABI.
+# The driver contract's 6,776-case -ftrapv matrix runs as one gate per ABI,
+# hosted and here, so a partial run cannot silently lose an ABI.  (Its 910
+# expected SIGABRTs per ABI used to cost ~2,000 s hosted: each went through
+# the runner's core_pattern handler until the matrix became non-dumpable.)
 gate "driver-option-contract-core" fast \
     env CCC="$LCCC" bash tests/regression/check_driver_option_contract.sh --skip-trapv-matrix
 gate "trapv-boundary-matrix-m64" fast \
@@ -356,6 +356,10 @@ gate "hot-loop-register-homes" fast \
 # only gate that exercises the historical crash/miscompile corpus end to end.
 gate "cpu-supports-runtime" fast \
     env CCC="$LCCC" bash tests/regression/check_cpu_supports_runtime.sh
+# The __builtin_cpu_is half: name space and diagnostics, raw-field and GCC 16.2
+# runtime agreement, constructor order, i686 and AArch64 legs (~1 s).
+gate "cpu-is-runtime" fast \
+    env CCC="$LCCC" bash tests/regression/check_cpu_is_runtime.sh
 
 # The GOT-slot half of the same work: a local symbol referenced through its
 # GOT slot must keep the symbol in the relocation (folding it produced 145
@@ -791,6 +795,31 @@ gate "dwarf-line-tables" fast \
     python3 tests/regression/check_dwarf_line_tables.py \
         --lccc "$LCCC" --lccc-i686 target/fastbuild/lccc-i686 \
         --gcc "${GCC16:-gcc-16}"
+# RVC: .text and relocations byte-identical to GNU as on RV64 and RV32
+# (spelling-based compression, branch relaxation, `li`); SKIP without
+# riscv64 binutils.
+gate "riscv-rvc-parity" fast \
+    python3 tests/regression/check_riscv_rvc_parity.py --lccc target/fastbuild/lccc-riscv
+# -g must not change code: every historical divergence (sentinel list) on
+# x86-64, i686, AArch64 and RISC-V plus a 1-in-32 sample on x86-64 and i686.
+# Hosted in the unsharded backend job.
+gate "debug-info-invariance" fast \
+    env CCC="$LCCC" CCC_I686=target/fastbuild/lccc-i686 \
+        CCC_ARM=target/fastbuild/lccc-arm CCC_RISCV=target/fastbuild/lccc-riscv \
+        bash tests/regression/check_debug_info_invariance.sh
+# The x86 ISA tables are generated from GCC 16.2, so they are only as true as
+# the last re-measurement.  `--check` re-renders the whole table (every CPU x
+# mode x negatable option, 8772 cross-checked cases) and byte-compares it with
+# the committed file; the two macro gates then compare the predefined macros a
+# user's `#ifdef` actually sees (204 `-march=` cases, 714 `-m`/`-mno-` cases).
+# Hosted in the unsharded backend job.  `gen_x86_cpu_is_table.py --check` is
+# not mirrored because it needs GCC's source tree, not just its binary.
+gate "generated-x86-arch-table-sync" fast \
+    env GCC="${GCC16:-gcc-16}" python3 scripts/gen_x86_arch_table.py --check
+gate "x86-march-macro-parity" fast \
+    python3 scripts/check_x86_march_macros.py "$LCCC" "${GCC16:-gcc-16}"
+gate "x86-mflag-macro-parity" fast \
+    python3 scripts/check_x86_mflag_macros.py "$LCCC" --gcc "${GCC16:-gcc-16}"
 gate "ivsr-reproducers" fast \
     env CCC="$LCCC" bash tests/regression/check_ivsr_reproducers.sh
 
@@ -1343,6 +1372,13 @@ gate "isa-gate-escape" fast \
 # the built boot/decompressor objects are baseline-clean.
 gate "kernel-boot-isa" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_kernel_boot_isa.sh
+# The front-end half of the same 6.18 kernel contract: _Generic/
+# container_of_const qualifier selection (including long typeof(...)
+# spellings), enum callback compatibility, bit-field promotion,
+# __attribute__((cleanup)) scope guards, -Wformat parity, function-pointer
+# arithmetic and string-literal address relocations in static storage.
+gate "kernel-618-sema-parity" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_kernel_618_sema_parity.sh
 # Executed __seg_gs runtime contract: segment accesses and aggregate copies
 # run under a real GS base and match gcc -O2.
 gate "seg-gs-runtime" fast \

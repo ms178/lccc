@@ -70,7 +70,8 @@ class NativeBuiltinTypes(unittest.TestCase):
         actual = {line.split('\t')[0] for line in generator.FACTS.read_text().splitlines()
                   if line.endswith('\tx86_64')}
         self.assertEqual(actual, {'__builtin_ia32_' + name for name in
-                                 ('bzhi_di', 'crc32di', 'cvtsd2si64', 'cvtss2si64', 'movnti64')})
+                                 ('bzhi_di', 'crc32di', 'cvtsd2si64', 'cvtss2si64', 'movnti64',
+                                  'pdep_di', 'pext_di')})
 
     def test_vnni_contracts_do_not_require_vnni_execution(self):
         source = generator.contract_source()

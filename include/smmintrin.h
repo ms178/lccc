@@ -3,6 +3,8 @@
 #define _SMMINTRIN_H_INCLUDED
 
 #include <tmmintrin.h>
+/* SSE4.2 shipped POPCNT; GCC's smmintrin.h carries its intrinsics too. */
+#include <popcntintrin.h>
 
 /* === SSE4.1 insert/extract intrinsics === */
 

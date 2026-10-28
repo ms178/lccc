@@ -1,3 +1,4 @@
+pub(crate) mod arch_table;
 #[cfg_attr(feature = "gcc_assembler", allow(dead_code))]
 // Built-in assembler unused when gcc handles assembly
 pub(crate) mod assembler;

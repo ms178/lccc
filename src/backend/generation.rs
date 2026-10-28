@@ -5240,6 +5240,17 @@ fn generate_function_body(
     cg.state()
         .emit_fmt(format_args!(".type {}, {}", func.name, type_dir));
     cg.state().emit_fmt(format_args!("{}:", func.name));
+    // `-g`: record the body's opening brace as the function's entry row.
+    // `insert_fn_entry_locs` places it after the label once the peephole and
+    // CFI synthesis are done (see `CodegenState::fn_entry_locs`). Without
+    // this row the prologue bytes had no line and a debugger's prologue
+    // skip had no row to skip *from*: `break func` and frames stopped in
+    // the prologue had no file:line.
+    if cg.state_ref().debug_info && !file_table.is_empty() {
+        if let Some(loc) = source_mgr.and_then(|sm| entry_loc(&func.body_span, sm, file_table)) {
+            cg.state().fn_entry_locs.insert(func.name.clone(), loc);
+        }
+    }
     // Function delimiters. A backend with `fn_boundary_markers` (x86-64,
     // i686) gets bare markers: after its peephole they are either expanded
     // into full CFI derived from the final code (cfi_synth) or stripped
@@ -5252,7 +5263,6 @@ fn generate_function_body(
             cg.state().fn_boundary_marked.insert(func.name.clone());
         }
     }
-
     if emit_patchable {
         if let Some((total, before)) = cg.state().patchable_function_entry {
             let after = total.saturating_sub(before);
@@ -6736,6 +6746,35 @@ fn generate_function_body(
         cg.flush_vecreg_liveout();
 
         cg.state().next_block_label = func.blocks.get(block_idx + 1).map(|b| b.label);
+        // `-g`: the terminator's own statement (`return y;`, `goto`, a loop
+        // step's back edge), then for a return the closing brace, which the
+        // epilogue places.
+        let mut closing_row = None;
+        if emit_debug {
+            let sm = source_mgr.expect("debug mode requires source manager");
+            if let Some(span) = func
+                .terminator_spans
+                .span_of(block.label, &block.terminator)
+            {
+                emit_loc_directive(
+                    cg,
+                    &span,
+                    sm,
+                    file_table,
+                    &mut last_debug_file,
+                    &mut last_debug_line,
+                );
+            }
+            if matches!(block.terminator, Terminator::Return(_)) {
+                closing_row = func
+                    .body_span
+                    .closing_delimiter()
+                    .and_then(|close| entry_loc(&close, sm, file_table))
+                    .filter(|&(file, line, _)| (file, line) != (last_debug_file, last_debug_line));
+                cg.state().pending_epilogue_loc =
+                    closing_row.map(|(file, line, column)| format!(".loc {file} {line} {column}"));
+            }
+        }
         if let Some((fi, _, kind)) = fuse_idx {
             if let Terminator::CondBranch {
                 true_label,
@@ -6774,6 +6813,13 @@ fn generate_function_body(
         } else {
             generate_terminator(cg, &block.terminator, frame_size, block.label.0);
         }
+        if let Some((file, line, _)) = closing_row {
+            // Placed by the epilogue unless this return emitted none.
+            if cg.state().pending_epilogue_loc.take().is_none() {
+                last_debug_file = file;
+                last_debug_line = line;
+            }
+        }
         cg.state().current_program_point += 1;
     }
 
@@ -6789,6 +6835,20 @@ fn generate_function_body(
     emit_switch_to_section(cg, &func_sect);
 }
 
+/// The `(file, line, column)` row of `span`, if it names a known file.
+fn entry_loc(
+    span: &Span,
+    source_mgr: &SourceManager,
+    file_table: &FxHashMap<String, u32>,
+) -> Option<(u32, u32, u32)> {
+    if span.start == 0 && span.end == 0 {
+        return None;
+    }
+    let loc = source_mgr.resolve_span(*span);
+    let file = *file_table.get(&loc.file)?;
+    Some((file, loc.line, loc.column))
+}
+
 fn emit_loc_directive(
     cg: &mut dyn ArchCodegen,
     span: &Span,
@@ -6797,18 +6857,12 @@ fn emit_loc_directive(
     last_file: &mut u32,
     last_line: &mut u32,
 ) {
-    if span.start == 0 && span.end == 0 {
-        return;
-    }
-    let loc = source_mgr.resolve_span(*span);
-    if let Some(&dwarf_file_id) = file_table.get(&loc.file) {
-        if dwarf_file_id != *last_file || loc.line != *last_line {
-            cg.state().emit_fmt(format_args!(
-                ".loc {} {} {}",
-                dwarf_file_id, loc.line, loc.column
-            ));
-            *last_file = dwarf_file_id;
-            *last_line = loc.line;
+    if let Some((file, line, column)) = entry_loc(span, source_mgr, file_table) {
+        if file != *last_file || line != *last_line {
+            cg.state()
+                .emit_fmt(format_args!(".loc {file} {line} {column}"));
+            *last_file = file;
+            *last_line = line;
         }
     }
 }

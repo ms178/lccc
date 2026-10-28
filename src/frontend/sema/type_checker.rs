@@ -68,6 +68,41 @@ impl qualifiers::ConstLookup for ExprTypeChecker<'_> {
             Some(CType::Pointer(..) | CType::Array(..))
         )
     }
+
+    fn select_generic<'b>(
+        &self,
+        controlling: &Expr,
+        associations: &'b [GenericAssociation],
+    ) -> Option<&'b Expr> {
+        self.generic_selection_index(controlling, associations)
+            .map(|i| &associations[i].expr)
+    }
+
+    fn member_const_base(&self, base: &Expr, field: &str, indirect: bool) -> bool {
+        let base_ct = if indirect {
+            match self.infer_expr_ctype(base) {
+                Some(CType::Pointer(inner, _) | CType::Array(inner, _)) => Some(*inner),
+                _ => None,
+            }
+        } else {
+            self.infer_expr_ctype(base)
+        };
+        let Some(CType::Struct(key) | CType::Union(key)) = base_ct else {
+            return false;
+        };
+        let layouts = self.types.borrow_struct_layouts();
+        layouts
+            .get(key.as_ref())
+            .and_then(|layout| layout.field_constness(field, &*layouts))
+            .is_some_and(|(base_const, _, _)| base_const)
+    }
+
+    fn call_const_base(&self, callee: &Expr) -> Option<bool> {
+        match callee {
+            Expr::Identifier(name, _) => self.functions.get(name).map(|f| f.return_base_const),
+            _ => None,
+        }
+    }
 }
 
 impl<'a> ExprTypeChecker<'a> {
@@ -287,7 +322,7 @@ impl<'a> ExprTypeChecker<'a> {
                 UnaryOp::Neg | UnaryOp::Plus | UnaryOp::BitNot => {
                     if let Some(inner_ct) = self.infer_expr_ctype(inner) {
                         if inner_ct.is_integer() {
-                            Some(inner_ct.integer_promoted())
+                            Some(self.bitfield_promoted_ctype(inner, &inner_ct))
                         } else {
                             Some(inner_ct)
                         }
@@ -486,8 +521,12 @@ impl<'a> ExprTypeChecker<'a> {
         }
 
         // Evaluate each operand type once and reuse the results.
-        let lct = self.infer_expr_ctype(lhs);
-        let rct = self.infer_expr_ctype(rhs);
+        let lct = self
+            .infer_expr_ctype(lhs)
+            .map(|ct| self.bitfield_promoted_if_bitfield(lhs, ct));
+        let rct = self
+            .infer_expr_ctype(rhs)
+            .map(|ct| self.bitfield_promoted_if_bitfield(rhs, ct));
 
         // GNU vector shifts are element-wise when either operand is a vector.
         // For `scalar << vector` the scalar is splatted and the result has the
@@ -502,27 +541,21 @@ impl<'a> ExprTypeChecker<'a> {
             return Some(CType::Int);
         }
 
-        // Pointer arithmetic for Add and Sub
+        // Pointer arithmetic for Add and Sub (including function designators
+        // decaying to function pointers under GNU C pointer-arithmetic rules).
+        let is_ptr_or_fn = |ct: &CType| ct.is_pointer_like() || matches!(ct, CType::Function(_));
         if matches!(op, BinOp::Add | BinOp::Sub) {
             if let Some(ref l) = lct {
                 match l {
                     CType::Pointer(_, _) => {
-                        if *op == BinOp::Sub {
-                            if let Some(ref r) = rct {
-                                if r.is_pointer_like() {
-                                    return Some(CType::Long);
-                                }
-                            }
+                        if *op == BinOp::Sub && rct.as_ref().is_some_and(is_ptr_or_fn) {
+                            return Some(CType::Long);
                         }
                         return lct;
                     }
                     CType::Array(elem, _) => {
-                        if *op == BinOp::Sub {
-                            if let Some(ref r) = rct {
-                                if r.is_pointer_like() {
-                                    return Some(CType::Long);
-                                }
-                            }
+                        if *op == BinOp::Sub && rct.as_ref().is_some_and(is_ptr_or_fn) {
+                            return Some(CType::Long);
                         }
                         // The decayed array keeps the space of its object:
                         // `long __seg_gs a[8]; a + 4` points into %gs.
@@ -530,6 +563,12 @@ impl<'a> ExprTypeChecker<'a> {
                             .operand_memory_space(lhs)
                             .unwrap_or(AddressSpace::Default);
                         return Some(CType::Pointer(elem.clone(), space));
+                    }
+                    CType::Function(_) => {
+                        if *op == BinOp::Sub && rct.as_ref().is_some_and(is_ptr_or_fn) {
+                            return Some(CType::Long);
+                        }
+                        return Some(CType::Pointer(Box::new(l.clone()), AddressSpace::Default));
                     }
                     _ => {}
                 }
@@ -544,6 +583,12 @@ impl<'a> ExprTypeChecker<'a> {
                                 .operand_memory_space(rhs)
                                 .unwrap_or(AddressSpace::Default);
                             return Some(CType::Pointer(elem.clone(), space));
+                        }
+                        CType::Function(_) => {
+                            return Some(CType::Pointer(
+                                Box::new(r.clone()),
+                                AddressSpace::Default,
+                            ));
                         }
                         _ => {}
                     }
@@ -677,6 +722,69 @@ impl<'a> ExprTypeChecker<'a> {
             // `v.xy` a two-lane vector of it.
             CType::ExtVector(..) => base_ctype.ext_vector_swizzle_ctype(field_name),
             _ => None,
+        }
+    }
+
+    /// Look up the declared bit-field width when `expr` directly designates a
+    /// struct/union bit-field member (including through anonymous records).
+    fn expr_bitfield_width(&self, expr: &Expr) -> Option<u32> {
+        let (base_expr, field_name, is_pointer) = match expr {
+            Expr::MemberAccess(b, f, _) => (b.as_ref(), f.as_str(), false),
+            Expr::PointerMemberAccess(b, f, _) => (b.as_ref(), f.as_str(), true),
+            _ => return None,
+        };
+        let base_ctype = if is_pointer {
+            match self.infer_expr_ctype(base_expr)? {
+                CType::Pointer(inner, _) | CType::Array(inner, _) => *inner,
+                _ => return None,
+            }
+        } else {
+            self.infer_expr_ctype(base_expr)?
+        };
+        let (CType::Struct(key) | CType::Union(key)) = base_ctype else {
+            return None;
+        };
+        let layouts = self.types.borrow_struct_layouts();
+        layouts
+            .get(key.as_ref())?
+            .field_offset_with_bitfield(field_name, &*layouts)?
+            .3
+    }
+
+    /// Apply C11 6.3.1.1p2 bit-field integer promotion ONLY if `expr` is a
+    /// bit-field member access; otherwise leave `ct` unchanged.
+    pub fn bitfield_promoted_if_bitfield(&self, expr: &Expr, ct: CType) -> CType {
+        let Some(width) = self.expr_bitfield_width(expr) else {
+            return ct;
+        };
+        if width <= 31 {
+            CType::Int
+        } else if width == 32 {
+            if ct.is_unsigned() {
+                CType::UInt
+            } else {
+                CType::Int
+            }
+        } else {
+            ct
+        }
+    }
+
+    /// Integer promotion (`integer_promoted`) aware of bit-field widths.
+    pub fn bitfield_promoted_ctype(&self, expr: &Expr, ct: &CType) -> CType {
+        let Some(width) = self.expr_bitfield_width(expr) else {
+            return ct.integer_promoted();
+        };
+        if width <= 31 {
+            CType::Int
+        } else if width == 32 {
+            if ct.is_unsigned() {
+                CType::UInt
+            } else {
+                CType::Int
+            }
+        } else {
+            ct.integer_promoted()
         }
     }
 
@@ -1236,8 +1344,12 @@ impl<'a> ExprTypeChecker<'a> {
         }
         match name {
             // BMI2 BZHI returns its operand type.
-            "__builtin_ia32_bzhi_si" => Some(CType::UInt),
-            "__builtin_ia32_bzhi_di" => Some(CType::ULongLong),
+            "__builtin_ia32_bzhi_si" | "__builtin_ia32_pdep_si" | "__builtin_ia32_pext_si" => {
+                Some(CType::UInt)
+            }
+            "__builtin_ia32_bzhi_di" | "__builtin_ia32_pdep_di" | "__builtin_ia32_pext_di" => {
+                Some(CType::ULongLong)
+            }
             // Float-returning builtins
             "__builtin_inf"
             | "__builtin_huge_val"
@@ -1420,7 +1532,7 @@ impl<'a> ExprTypeChecker<'a> {
             | "__builtin_cpu_init" => Some(CType::Void),
 
             // CPU feature detection
-            "__builtin_cpu_supports" => Some(CType::Int),
+            "__builtin_cpu_supports" | "__builtin_cpu_is" => Some(CType::Int),
 
             _ => None,
         }

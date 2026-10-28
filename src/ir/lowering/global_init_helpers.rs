@@ -56,15 +56,28 @@ pub(super) fn expr_contains_string_literal(expr: &Expr) -> bool {
         Expr::StringLiteral(_, _)
         | Expr::WideStringLiteral(_, _)
         | Expr::Char16StringLiteral(_, _) => true,
-        Expr::BinaryOp(_, lhs, rhs, _) => {
-            expr_contains_string_literal(lhs) || expr_contains_string_literal(rhs)
+        Expr::Identifier(name, _)
+            if crate::frontend::parser::ast::is_function_name_builtin(name) =>
+        {
+            true
         }
-        Expr::Cast(_, inner, _, _) => expr_contains_string_literal(inner),
+        Expr::AddressOf(inner, _) | Expr::Deref(inner, _) | Expr::Cast(_, inner, _, _) => {
+            expr_contains_string_literal(inner)
+        }
+        Expr::ArraySubscript(base, index, _) | Expr::BinaryOp(_, base, index, _) => {
+            expr_contains_string_literal(base) || expr_contains_string_literal(index)
+        }
         Expr::Conditional(_, then, els, _) => {
             expr_contains_string_literal(then) || expr_contains_string_literal(els)
         }
         Expr::GnuConditional(cond, els, _) => {
             expr_contains_string_literal(cond) || expr_contains_string_literal(els)
+        }
+        Expr::GenericSelection(_, assocs, _) => {
+            assocs.iter().any(|a| expr_contains_string_literal(&a.expr))
+        }
+        Expr::FunctionCall(callee, args, _) if matches!(callee.as_ref(), Expr::Identifier(name, _) if name == "__builtin_choose_expr") => {
+            args.iter().skip(1).any(expr_contains_string_literal)
         }
         _ => false,
     }

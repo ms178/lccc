@@ -9,7 +9,62 @@ use super::relocations::{
     GlobalSym, MergedSection, R_RISCV_GOT_HI20, R_RISCV_TLS_GD_HI20, R_RISCV_TLS_GOT_HI20,
     got_sym_key,
 };
+use crate::backend::elf::STV_DEFAULT;
+use crate::backend::linker_common;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
+
+/// GNU ld binds a default-visibility COMMON to shared-library data: the
+/// tentative definition becomes a reference and is imported like any
+/// undefined data (a copy relocation in an executable, an undefined dynamic
+/// symbol in a shared object).  Rewriting it before symbol resolution, as
+/// bfd's `elf_merge_symbol` does, lets every later phase see a plain
+/// reference.  The libraries come after `input_objs[..late_from]`, so a
+/// common of those binds where a strong data definition took it
+/// (`SharedLibSyms::common_taken`); a common read after them (an archive
+/// member) meets the first library definition of the name, and binds to it
+/// if that is strong data (`shared_def_overrides_common`: bfd's rule is the
+/// same in either order) unless the name was a common already.  A name a
+/// regular object gives non-default visibility never binds to a library.
+pub fn import_shared_commons(
+    input_objs: &mut [(String, ElfObject)],
+    late_from: usize,
+    shared: &super::input::SharedLibSyms,
+) {
+    let imports = |name: &str, late: bool| match shared.common_taken(name) {
+        Some(taken) => taken,
+        None => {
+            late && shared
+                .get(name)
+                .is_some_and(|dsym| linker_common::shared_def_overrides_common(dsym.info))
+        }
+    };
+    let candidates = input_objs.iter().enumerate().any(|(k, (_, obj))| {
+        obj.symbols
+            .iter()
+            .any(|sym| sym.shndx == SHN_COMMON && imports(sym.name.as_str(), k >= late_from))
+    });
+    if !candidates {
+        return;
+    }
+    let restricted: FxHashSet<String> = input_objs
+        .iter()
+        .flat_map(|(_, obj)| &obj.symbols)
+        .filter(|sym| sym.binding() != STB_LOCAL && sym.visibility() != STV_DEFAULT)
+        .map(|sym| sym.name.to_string())
+        .collect();
+    for (k, (_, obj)) in input_objs.iter_mut().enumerate() {
+        for sym in &mut obj.symbols {
+            let name = sym.name.as_str();
+            if sym.shndx == SHN_COMMON
+                && !restricted.contains(name)
+                && imports(name, k >= late_from)
+            {
+                sym.shndx = SHN_UNDEF;
+                sym.value = 0;
+            }
+        }
+    }
+}
 
 /// Build the global symbol table from all input objects.
 ///
@@ -331,4 +386,134 @@ pub fn check_undefined_symbols(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::elf::{STB_GLOBAL, STB_WEAK, STT_FUNC, STT_TLS, STV_HIDDEN};
+    use crate::backend::linker_common::{Elf64Object, Elf64Symbol, SymStr};
+
+    /// GNU ld's COMMON-vs-shared-library rules (each measured with bfd;
+    /// `tests/linker` `common_binds_shared_data` checks real links): a
+    /// common read before the libraries is taken by the first linked strong
+    /// data definition, even after a weak one; one read after them by the
+    /// first library definition if that is strong data; weak data, code,
+    /// TLS and restricted names never bind; and an `--as-needed` library is
+    /// linked by taking a common, or else dropped with its symbols.
+    #[test]
+    fn commons_bind_like_gnu_ld() {
+        use super::super::input::SharedLibSyms;
+        let sym = |name: &str, shndx: u16, other: u8| Elf64Symbol {
+            name_idx: 0,
+            name: SymStr::new(name),
+            info: (STB_GLOBAL << 4) | STT_OBJECT,
+            other,
+            shndx,
+            value: 8,
+            size: 4,
+        };
+        let object = |name: &str, symbols: Vec<Elf64Symbol>| {
+            let obj = Elf64Object {
+                sections: vec![],
+                symbols,
+                section_data: vec![],
+                relocations: vec![],
+                source_name: name.to_string(),
+            };
+            (name.to_string(), obj)
+        };
+        let export = |name: &str, binding: u8, kind: u8| DynSymbol {
+            name: name.to_string(),
+            info: (binding << 4) | kind,
+            value: 0x1000,
+            size: 4,
+            in_exec_segment: false,
+            version: None,
+            is_default_ver: true,
+        };
+        let early = [
+            "strong",
+            "weak",
+            "func",
+            "tls",
+            "hidden",
+            "hidden_ref",
+            "two",
+            "kept_by",
+            "absent",
+        ];
+        let mut commons: Vec<Elf64Symbol> = early.iter().map(|n| sym(n, SHN_COMMON, 0)).collect();
+        commons[4].other = STV_HIDDEN;
+        let mut objs = vec![
+            object("c.o", commons),
+            object("r.o", vec![sym("hidden_ref", SHN_UNDEF, STV_HIDDEN)]),
+        ];
+        let mut shared = SharedLibSyms::default();
+        shared.expect_commons(&objs);
+        let mut needed = Vec::new();
+        let none = |_: &str| false;
+        let libs = [
+            ("libw.so", false, vec![export("two", STB_WEAK, STT_OBJECT)]),
+            (
+                "libl.so",
+                false,
+                vec![
+                    export("strong", STB_GLOBAL, STT_OBJECT),
+                    export("weak", STB_WEAK, STT_OBJECT),
+                    export("func", STB_GLOBAL, STT_FUNC),
+                    export("tls", STB_GLOBAL, STT_TLS),
+                    export("hidden", STB_GLOBAL, STT_OBJECT),
+                    export("hidden_ref", STB_GLOBAL, STT_OBJECT),
+                    export("two", STB_GLOBAL, STT_OBJECT),
+                    export("late_weak", STB_WEAK, STT_OBJECT),
+                    export("late_func", STB_GLOBAL, STT_FUNC),
+                    export("late_strong", STB_GLOBAL, STT_OBJECT),
+                ],
+            ),
+            (
+                "libn.so",
+                true,
+                vec![export("kept_by", STB_GLOBAL, STT_OBJECT)],
+            ),
+            (
+                "libu.so",
+                true,
+                vec![export("unused", STB_GLOBAL, STT_OBJECT)],
+            ),
+        ];
+        let linked: Vec<bool> = libs
+            .into_iter()
+            .map(|(soname, as_needed, syms)| {
+                shared.link_library(soname, soname, syms, as_needed, none, None, &mut needed)
+            })
+            .collect();
+        assert_eq!(linked, [true, true, true, false]);
+        assert_eq!(needed, ["libw.so", "libl.so", "libn.so"]);
+        assert!(
+            shared.get("unused").is_none(),
+            "a dropped library offers nothing"
+        );
+        assert_eq!(shared.provider_of("two"), Some("libl.so"));
+        // An archive member read after the libraries.
+        let late_from = objs.len();
+        let late = ["late_weak", "late_func", "weak", "late_strong"];
+        objs.push(object(
+            "m.o",
+            late.iter().map(|n| sym(n, SHN_COMMON, 0)).collect(),
+        ));
+        import_shared_commons(&mut objs, late_from, &shared);
+        let imported = |k: usize| -> Vec<&str> {
+            objs[k]
+                .1
+                .symbols
+                .iter()
+                .filter(|s| s.shndx == SHN_UNDEF)
+                .map(|s| s.name.as_str())
+                .collect()
+        };
+        assert_eq!(imported(0), ["strong", "two", "kept_by"]);
+        assert_eq!(imported(2), ["late_strong"]);
+        assert_eq!(objs[0].1.symbols[0].value, 0);
+    }
 }

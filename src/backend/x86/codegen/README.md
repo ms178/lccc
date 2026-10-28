@@ -188,7 +188,7 @@ These are available for values whose live ranges do not span function calls:
 | PhysReg ID | Register | Notes |
 |------------|----------|-------|
 | 10 | `r11` | General-purpose scratch |
-| 11 | `r10` | Excluded if function has indirect calls (used as `call *%r10` trampoline) |
+| 11 | `r10` | Excluded if function has indirect calls (used as `call *%r10` trampoline). The exclusion propagates across whole copy-coalesce webs (leaders and members), so an indirect-call argument can never be homed here. Defense in depth: if an argument ever is homed in `r10`, `emit_call_spill_fptr_with_args_impl` parks the callee pointer in a 16-byte transient stack slot and reloads it after argument staging |
 | 12 | `r8` | Excluded if function has i128 ops or atomic RMW |
 | 13 | `r9` | Excluded if function has i128 ops |
 | 14 | `rdi` | Free after prologue stores incoming params; excluded if function has i128 ops |

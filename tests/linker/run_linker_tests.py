@@ -1487,6 +1487,34 @@ case("copy_reloc_libc_data",
     ldflags=["-no-pie"],
     tags=("reloc", "dynamic"))
 
+case("copy_reloc_keeps_library_alignment",
+    # The executable's copy of a copy-relocated object keeps the alignment
+    # the library gave it.  COPY slots used to be aligned to 8, so after the
+    # 1-byte `a_pad` a 16-byte-aligned vector landed 8 mod 16 and the
+    # program's `movaps` (`_mm_load_ps`, non-PIC) faulted.
+    {"main.c": """
+        #include <stdio.h>
+        #include <stdint.h>
+        #include <xmmintrin.h>
+        extern char a_pad;
+        extern float b_vec[4];
+        int main(void){
+            __m128 v = _mm_load_ps(b_vec);
+            float out[4];
+            _mm_storeu_ps(out, _mm_add_ps(v, v));
+            printf("%d %g %d\\n", (int)((uintptr_t)b_vec % 16), out[3], a_pad);
+            return 0;
+        }
+     """,
+     "lib.c": "char a_pad = 1;\n_Alignas(16) float b_vec[4] = {1, 2, 3, 4};\n"},
+    link_inputs=["main.o", "libal.so"],
+    compile_flags=["-O1", "-fno-pic", "-fno-pie"],
+    ldflags=["-no-pie", "-Wl,-rpath,$ORIGIN"],
+    setup=lambda td: (sh([CC, "-c", "-fpic", "lib.c"], cwd=td),
+                      sh([CC, "-shared", "lib.o", "-o", "libal.so"], cwd=td)),
+    expect_stdout="0 8 1\n",
+    tags=("reloc", "dynamic"))
+
 case("gotpcrelx_relaxation",
     # GCC emits R_X86_64_REX_GOTPCRELX for extern data under -fpie;
     # linkers may relax mov->lea when the symbol binds locally.
@@ -7437,85 +7465,371 @@ def _emit_relocs_warns_test(args, oracles):
 
 
 
-def _warn_common_fatal_order_test(args, oracles):
-    """An unimplemented linker warning request is never a silent no-op.
+_WARN_COMMON_FORMS = re.compile(
+    r"warning: (?:definition of|common of|multiple common of) `"
+)
 
-    `--warn-common` affects diagnostics rather than the image. Until LCCC
-    implements the GNU common-symbol warning itself, it must report the
-    unsupported request; `--fatal-warnings` must promote that report whether
-    the flag appears before or after `--warn-common`.
+
+def _warn_common_lines(stderr):
+    """The `--warn-common` diagnostics of one link, program prefix removed."""
+    lines = []
+    for line in stderr.splitlines():
+        if _WARN_COMMON_FORMS.search(line):
+            lines.append(line.split(": ", 1)[1] if ": " in line else line)
+    return lines
+
+
+def _warn_common_fatal_order_test(args, oracles):
+    """`--warn-common` reports exactly GNU ld's COMMON diagnostics.
+
+    Each link is run through LCCC and through GCC with bfd on the same
+    `-fcommon` objects, and the five message forms must match line for line:
+    pairwise conflicts in both orders (one object with several conflicting
+    symbols also pins the emission order), ownership moving to a larger
+    common, weak definitions staying silent, shared-library definitions in
+    both orders (a library named before an object through standalone
+    lccc-ld, which is positional like bfd), and an archive member that is
+    not extracted because its symbol is already common.  `--fatal-warnings` must fail the link exactly
+    when a diagnostic exists, in either option order, through the compiler
+    driver and through standalone lccc-ld.  Covers x86-64 and i686.
     """
     name = "warn_common_fatal_order"
-    lccc_ld = os.path.abspath(os.path.join(os.path.dirname(args.lccc), "lccc-ld"))
+    lccc = os.path.abspath(args.lccc)
+    lccc_ld = os.path.join(os.path.dirname(lccc), "lccc-ld")
     if not os.path.exists(lccc_ld):
         return Result(name, "SKIP", "no lccc-ld")
-    with tempfile.TemporaryDirectory(prefix="lccc-warn-common-") as td:
-        with open(os.path.join(td, "a.c"), "w", encoding="utf-8") as stream:
-            stream.write("int shared_common; int main(void) { return shared_common; }\n")
-        with open(os.path.join(td, "b.c"), "w", encoding="utf-8") as stream:
-            stream.write("int shared_common;\n")
-        compiled = sh([CC, "-fcommon", "-c", "a.c", "b.c"], cwd=td)
-        if compiled.returncode:
-            return Result(name, "SKIP", "fixture compile failed: " + compiled.stderr.decode(errors="replace")[:200])
+    if not oracles:
+        return Result(name, "SKIP", "no bfd oracle")
+    bfd = oracles[0][1]
+    sources = {
+        "c1.c": "int x; int y[2]; int z; int w[4];\n",
+        "c2.c": "int x = 1; int y[4]; int z; int w[2];\n",
+        "c3.c": "int q;\n",
+        "c4.c": "int q = 5;\n",
+        "r1.c": "int r;\n",
+        "r2.c": "int r[8];\n",
+        "r3.c": "int r;\n",
+        "rw.c": "__attribute__((weak)) int r = 3;\n",
+        "ru.c": "extern int r[]; int ru(void) { return r[0]; }\n",
+        "s1.c": "int s;\n",
+        "s3.c": "int s = 9;\n",
+        "mn.c": "int main(void) { return 0; }\n",
+    }
+    links = [
+        ("common-then-def", ["c3.o", "c4.o"]),
+        ("def-then-common", ["c4.o", "c3.o"]),
+        ("several-symbols", ["c1.o", "c2.o"]),
+        ("several-symbols-rev", ["c2.o", "c1.o"]),
+        ("ownership-chain", ["r1.o", "r2.o", "r3.o"]),
+        ("weak-is-silent", ["r1.o", "rw.o"]),
+        ("dso-after-common", ["s1.o", "./libs.so"]),
+        ("archive-not-extracted", ["r1.o", "ru.o", "libr.a"]),
+    ]
+    # The compiler driver resolves libraries after the objects (as mold and
+    # lld do), so a library named before an object is compared where both
+    # linkers are positional: standalone lccc-ld against bfd, --no-as-needed.
+    positional = [
+        ("dso-before-common", ["./libs.so", "s1.o"]),
+        ("def-replaces-dso-owner", ["./libs.so", "s3.o", "s1.o"]),
+        ("dso-between-commons", ["s1.o", "./libs.so", "c3.o", "s1.o"]),
+    ]
+    for abi in ([], ["-m32"]):
+        tag = "i686" if abi else "x86-64"
+        with tempfile.TemporaryDirectory(prefix="lccc-warn-common-") as td:
+            for fname, text in sources.items():
+                with open(os.path.join(td, fname), "w", encoding="utf-8") as stream:
+                    stream.write(text)
+            built = sh([CC, *abi, "-fcommon", "-c", *sources], cwd=td)
+            if built.returncode == 0:
+                # libs.so defines `s` (and only `s`) as a strong export.
+                with open(os.path.join(td, "libs.c"), "w", encoding="utf-8") as stream:
+                    stream.write("int s = 4;\n")
+                built = sh([CC, *abi, "-fPIC", "-shared", "-o", "libs.so", "libs.c"], cwd=td)
+            if built.returncode == 0:
+                built = sh(["ar", "rc", "libr.a", "r2.o"], cwd=td)
+            if built.returncode:
+                if abi:
+                    return Result(name, "PASS", "x86-64 only (no -m32 toolchain)")
+                return Result(name, "SKIP", "fixture build failed: "
+                              + built.stderr.decode(errors="replace")[:200])
+            for label, objs in links:
+                inputs = ["mn.o", *objs]
+                want = sh([*bfd, *abi, "-Wl,--warn-common", *inputs, "-o", "bfd.out"], cwd=td)
+                got = sh([lccc, *abi, "-Wl,--warn-common", *inputs, "-o", "lccc.out"], cwd=td)
+                want_err = want.stderr.decode(errors="replace")
+                got_err = got.stderr.decode(errors="replace")
+                if want.returncode or got.returncode:
+                    return Result(name, "FAIL", f"{tag} {label}: link failed: bfd "
+                                  f"rc={want.returncode} {want_err[:200]!r}; lccc "
+                                  f"rc={got.returncode} {got_err[:200]!r}")
+                want_lines = _warn_common_lines(want_err)
+                got_lines = _warn_common_lines(got_err)
+                if got_lines != want_lines:
+                    return Result(name, "FAIL", f"{tag} {label}: diagnostics differ: "
+                                  f"bfd {want_lines!r}, lccc {got_lines!r}")
+                for order in (("--fatal-warnings", "--warn-common"),
+                              ("--warn-common", "--fatal-warnings")):
+                    wl = ["-Wl," + option for option in order]
+                    fatal = sh([lccc, *abi, *wl, *inputs, "-o", "fatal.out"], cwd=td)
+                    if (fatal.returncode != 0) != bool(want_lines):
+                        return Result(name, "FAIL", f"{tag} {label} {order[0]} first: "
+                                      f"rc={fatal.returncode} with "
+                                      f"{len(want_lines)} GNU diagnostic(s)")
+            if not abi:
+                for label, objs in positional:
+                    inputs = ["--no-as-needed", "mn.o", *objs]
+                    want = sh([*bfd, "-nostdlib", "-Wl,-e,main", "-Wl,--warn-common",
+                               *("-Wl," + i if i.startswith("--") else i for i in inputs),
+                               "-o", "bfd.out"], cwd=td)
+                    got = sh([lccc_ld, "--warn-common", "-e", "main", *inputs,
+                              "-o", "lccc.out"], cwd=td)
+                    want_lines = _warn_common_lines(want.stderr.decode(errors="replace"))
+                    got_lines = _warn_common_lines(got.stderr.decode(errors="replace"))
+                    if got.returncode or got_lines != want_lines:
+                        return Result(name, "FAIL", f"positional {label}: rc={got.returncode} "
+                                      f"bfd {want_lines!r}, lccc-ld {got_lines!r}")
+            # Standalone lccc-ld forwards the option to the backend, which
+            # names the objects exactly as the driver path does.
+            if not abi:
+                raw = sh([lccc_ld, "--warn-common", "-e", "main", "mn.o", "c3.o", "c4.o",
+                          "-o", "raw.out"], cwd=td)
+                raw_lines = _warn_common_lines(raw.stderr.decode(errors="replace"))
+                if raw_lines != ["c4.o: warning: definition of `q' overriding common from c3.o"]:
+                    return Result(name, "FAIL", f"standalone lccc-ld: {raw_lines!r}")
+                raw = sh([lccc_ld, "--warn-common", "--fatal-warnings", "-e", "main", "mn.o",
+                          "r1.o", "rw.o", "-o", "raw.out"], cwd=td)
+                if raw.returncode:
+                    return Result(name, "FAIL", "standalone lccc-ld failed a link without a "
+                                  "diagnostic: " + raw.stderr.decode(errors="replace")[:200])
+    return Result(name, "PASS")
 
-        nonfatal = sh(
-            [lccc_ld, "--warn-common", "a.o", "b.o", "-o", "nonfatal.out"],
-            cwd=td,
+
+def _common_binds_shared_data_test(args, oracles):
+    """A COMMON binds to a shared library's data definition as in GNU ld.
+
+    bfd (and mold) let a strong data definition in a linked shared library
+    win over a regular object's tentative definition in either order: the
+    program reads the library's initialized value through a copy relocation
+    or a GOT import, and a `-shared` output leaves the name undefined.  A
+    weak definition (in either order, also one a reference bound first), a
+    function or TLS variable of that name, and a hidden common keep the
+    common; a strong definition in a later library still takes it after a
+    weak one.
+
+    The driver reads libraries after objects; lccc-ld run as gcc's `ld`
+    sees them where the command line puts them.  There an `--as-needed`
+    library that satisfies nothing where it appears is dropped, symbols
+    included.  Every case runs against bfd's result, on x86-64 and i686.
+    """
+    name = "common_binds_shared_data"
+    lccc = os.path.abspath(args.lccc)
+    if not oracles:
+        return Result(name, "SKIP", "no bfd oracle")
+    bfd = oracles[0][1]
+    sources = {
+        "m.c": '#include <stdio.h>\nextern int s;\nint main(void) { printf("%d\\n", s); return 0; }\n',
+        "c.c": "int s;\n",
+        "cv.c": '__attribute__((visibility("hidden"))) int s;\nint *cv(void) { return &s; }\n',
+        "mg.c": '#include <stdio.h>\nint get(void);\nint main(void) { printf("%d\\n", get()); return 0; }\n',
+        "cg.c": "int s;\nint get(void) { return s; }\n",
+    }
+    libs = {
+        "libl.c": "int s = 4;\n",
+        "libw.c": "__attribute__((weak)) int s = 4;\n",
+        "libf.c": "int s(void) { return 4; }\n",
+        "libt.c": "__thread int s = 4;\n",
+    }
+    cases = [
+        ("strong-after-common", ["m.o", "c.o", "./libl.so"]),
+        ("strong-before-common", ["m.o", "./libl.so", "c.o"]),
+        ("weak-after-common", ["m.o", "c.o", "./libw.so"]),
+        ("function-after-common", ["m.o", "c.o", "./libf.so"]),
+        ("hidden-common", ["m.o", "cv.o", "./libl.so"]),
+        ("tls-after-common", ["m.o", "c.o", "./libt.so"]),
+        ("weak-then-strong", ["m.o", "c.o", "./libw.so", "./libl.so"]),
+    ]
+    # Nothing references `s` before `cg.o`'s common.  (A TLS definition met
+    # first is an error in bfd.)
+    positional = [
+        ("strong-before-common", ["mg.o", "./libl.so", "cg.o"]),
+        ("weak-before-common", ["mg.o", "./libw.so", "cg.o"]),
+        ("weak-bound-before-common", ["m.o", "./libw.so", "c.o"]),
+        ("function-before-common", ["mg.o", "./libf.so", "cg.o"]),
+        ("strong-after-common", ["mg.o", "cg.o", "./libl.so"]),
+        ("tls-after-common", ["mg.o", "cg.o", "./libt.so"]),
+        ("weak-then-strong", ["mg.o", "cg.o", "./libw.so", "./libl.so"]),
+    ]
+    lccc_ld = os.path.join(os.path.dirname(lccc), "lccc-ld")
+    checked = []
+    for abi in ([], ["-m32"]):
+        tag = "i686" if abi else "x86-64"
+        with tempfile.TemporaryDirectory(prefix="lccc-common-dso-") as td:
+            for fname, text in {**sources, **libs}.items():
+                with open(os.path.join(td, fname), "w", encoding="utf-8") as stream:
+                    stream.write(text)
+            built = sh([CC, *abi, "-fcommon", "-fPIC", "-c", *sources], cwd=td)
+            for lib in libs:
+                if built.returncode == 0:
+                    built = sh([CC, *abi, "-fPIC", "-shared", "-o", lib[:-2] + ".so", lib],
+                               cwd=td)
+            if built.returncode:
+                if abi:
+                    break
+                return Result(name, "SKIP", "fixture build failed: "
+                              + built.stderr.decode(errors="replace")[:200])
+            env = {"LD_LIBRARY_PATH": td}
+            runs = [(f"{tag}:{label}", [*bfd, *abi], [lccc, *abi], inputs)
+                    for label, inputs in cases]
+            if os.path.exists(lccc_ld):
+                shim = "-B" + _shim_for(td, lccc_ld)
+                runs += [(f"{tag}:ld:{mode[2:]}:{label}", [*bfd, *abi, f"-Wl,{mode}"],
+                          [CC, *abi, shim, f"-Wl,{mode}"], inputs)
+                         for mode in ("--no-as-needed", "--as-needed")
+                         for label, inputs in positional]
+            for label, oracle, linker, inputs in runs:
+                want = sh([*oracle, *inputs, "-o", "bfd.out"], cwd=td)
+                got = sh([*linker, *inputs, "-o", "lccc.out"], cwd=td)
+                if want.returncode or got.returncode:
+                    return Result(name, "FAIL", f"{label}: link failed: bfd "
+                                  f"rc={want.returncode}, lccc rc={got.returncode} "
+                                  + got.stderr.decode(errors="replace")[:200])
+                want_out = sh([os.path.join(td, "bfd.out")], cwd=td, env=env).stdout
+                got_run = sh([os.path.join(td, "lccc.out")], cwd=td, env=env)
+                if got_run.returncode or got_run.stdout != want_out:
+                    return Result(name, "FAIL", f"{label}: bfd printed {want_out!r}, "
+                                  f"lccc rc={got_run.returncode} printed {got_run.stdout!r}")
+                checked.append(f"{label}={want_out.decode().strip()}")
+            # In a shared object the bound common is an undefined import.
+            for linker, out in ((bfd, "bfd.so"), ([lccc], "lccc.so")):
+                linked = sh([*linker, *abi, "-shared", "c.o", "./libl.so", "-o", out], cwd=td)
+                if linked.returncode:
+                    return Result(name, "FAIL", f"{tag} -shared link failed ({out}): "
+                                  + linked.stderr.decode(errors="replace")[:200])
+            dyn = {out: sh(["readelf", "-W", "--dyn-syms", out], cwd=td).stdout.decode()
+                   for out in ("bfd.so", "lccc.so")}
+            und = {out: any(line.split()[-1:] == ["s"] and " UND " in line
+                            for line in text.splitlines())
+                   for out, text in dyn.items()}
+            if und["lccc.so"] != und["bfd.so"]:
+                return Result(name, "FAIL", f"{tag} -shared: `s` undefined in bfd's output "
+                              f"{und['bfd.so']}, in lccc's {und['lccc.so']}")
+    return Result(name, "PASS", " ".join(checked))
+
+
+def _positional_shared_operands_test(args, oracles):
+    """lccc-ld, run as gcc's `ld`, scopes `--as-needed` like GNU ld.
+
+    A shared library named on the command line is kept or dropped by the
+    `--as-needed` state in effect where it is named (`--push-state` scoping
+    included) -- kept only for a non-weak reference or a common read before
+    it -- and a kept library's exports are in the symbol table from
+    there on: an object read later binds to them, and an archive member that
+    defines the same name is then not extracted.  An archive is searched only
+    where it is named, so a library after it binds a name it could have
+    supplied to a later object.  A soname-less library is
+    recorded under the name it was given.  Each case compares the link's
+    success, the program's output and the fixture libraries' `DT_NEEDED`
+    strings against bfd's: every case on x86-64 and i686, the six that
+    decide an operand by its position on AArch64 and RISC-V when their cross
+    compiler and qemu-user are installed (the backend job provisions both;
+    the cross drivers also exercise `-maarch64linux -EL --sysroot=/`).
+    """
+    name = "positional_shared_operands"
+    lccc_ld = os.path.join(os.path.dirname(os.path.abspath(args.lccc)), "lccc-ld")
+    if not oracles:
+        return Result(name, "SKIP", "no bfd oracle")
+    if not os.path.exists(lccc_ld):
+        return Result(name, "SKIP", "no lccc-ld")
+    bfd = oracles[0][1]
+    sources = {
+        "mf.c": '#include <stdio.h>\nint foo(void);\nextern int fooval;\n'
+                'int main(void) { printf("%d %d\\n", foo(), fooval); return 0; }\n',
+        "m0.c": '#include <stdio.h>\nint main(void) { puts("0"); return 0; }\n',
+        "mw.c": '#include <stdio.h>\n__attribute__((weak)) int foo(void);\n'
+                'int main(void) { printf("%d\\n", foo ? foo() : -1); return 0; }\n',
+        "bar.c": "int foo(void) { return 8; }\nint fooval = 10;\n",
+    }
+    libs = {"libfoo.c": "int foo(void) { return 7; }\nint fooval = 9;\n",
+            "libu.c": "int unused_u(void) { return 1; }\n",
+            "libv.c": "int unused_v(void) { return 2; }\n"}
+    push_state = ["m0.o", "-Wl,--push-state,--as-needed", "./libu.so", "-Wl,--pop-state",
+                  "./libv.so"]
+    cases = [
+        (mode, label, inputs)
+        for mode in ("--no-as-needed", "--as-needed")
+        for label, inputs in (
+            ("lib-before-user", ["./libfoo.so", "mf.o"]),
+            ("lib-after-user", ["mf.o", "./libfoo.so"]),
+            ("unused-lib", ["m0.o", "./libu.so"]),
+            ("lib-before-archive", ["./libfoo.so", "mf.o", "libbar.a"]),
+            # An archive is scanned where it is named: libbar.a, read before
+            # mf.o needs `foo`, is not searched again, so libfoo.so binds it.
+            ("archive-before-user-lib", ["libbar.a", "mf.o", "./libfoo.so"]),
+            # Only a non-weak reference keeps an --as-needed library.
+            ("weak-ref-lib", ["mw.o", "./libfoo.so"]),
+            ("push-state", push_state),
         )
-        stderr = nonfatal.stderr.decode(errors="replace")
-        if nonfatal.returncode:
-            return Result(name, "FAIL", "nonfatal link failed: " + stderr[:300])
-        if "--warn-common" not in stderr or "not implemented" not in stderr:
-            return Result(name, "FAIL", "--warn-common was not diagnosed: " + repr(stderr))
+    ]
+    cross_cases = [
+        case for case in cases
+        if case[:2] in {("--no-as-needed", "lib-before-user"), ("--as-needed", "lib-before-user"),
+                        ("--as-needed", "lib-before-archive"), ("--as-needed", "weak-ref-lib"),
+                        ("--as-needed", "archive-before-user-lib"), ("--as-needed", "push-state")}
+    ]
+    # (tag, compiler, ABI flags, bfd's spelling, how to run, cases)
+    targets = [("x86-64", CC, [], bfd, [], cases), ("i686", CC, ["-m32"], bfd, [], cases)]
+    for triple in ("aarch64-linux-gnu", "riscv64-linux-gnu"):
+        cross = shutil.which(triple + "-gcc")
+        qemu = shutil.which("qemu-" + triple.split("-")[0])
+        if cross and qemu:
+            targets.append((triple.split("-")[0], cross, [], [cross, "-fuse-ld=bfd"],
+                            [qemu, "-L", f"/usr/{triple}"], cross_cases))
+    fixtures = ("libfoo.so", "libu.so", "libv.so")
+    checked = []
+    skipped = []
+    for tag, cc, abi, oracle, runner, todo in targets:
+        with tempfile.TemporaryDirectory(prefix="lccc-positional-so-") as td:
+            for fname, text in {**sources, **libs}.items():
+                with open(os.path.join(td, fname), "w", encoding="utf-8") as stream:
+                    stream.write(text)
+            built = sh([cc, *abi, "-c", *sources], cwd=td)
+            if built.returncode == 0:
+                built = sh(["ar", "rcs", "libbar.a", "bar.o"], cwd=td)
+            for lib in libs:
+                if built.returncode == 0:
+                    built = sh([cc, *abi, "-fPIC", "-shared", "-o", lib[:-2] + ".so", lib],
+                               cwd=td)
+            if built.returncode:
+                if tag == "x86-64":
+                    return Result(name, "SKIP", "fixture build failed: "
+                                  + built.stderr.decode(errors="replace")[:200])
+                skipped.append(tag)
+                continue
+            env = {"LD_LIBRARY_PATH": td}
+            shim = "-B" + _shim_for(td, lccc_ld)
 
-        for order, options in (
-            ("fatal-first", ("--fatal-warnings", "--warn-common")),
-            ("fatal-last", ("--warn-common", "--fatal-warnings")),
-        ):
-            fatal = sh(
-                [lccc_ld, *options, "a.o", "b.o", "-o", f"{order}.out"],
-                cwd=td,
-            )
-            fatal_stderr = fatal.stderr.decode(errors="replace")
-            if fatal.returncode == 0 or "warning treated as error" not in fatal_stderr:
-                return Result(
-                    name,
-                    "FAIL",
-                    f"{order}: --fatal-warnings did not promote the request: {fatal_stderr!r}",
-                )
-            if "--warn-common" not in fatal_stderr:
-                return Result(name, "FAIL", f"{order}: error omitted --warn-common: {fatal_stderr!r}")
+            def outcome(linker, inputs, out):
+                linked = sh([*linker, *inputs, "-o", out], cwd=td)
+                if linked.returncode:
+                    return ("link failed",)
+                ran = sh([*runner, os.path.join(td, out)], cwd=td, env=env)
+                dynamic = sh(["readelf", "-d", out], cwd=td).stdout.decode(errors="replace")
+                # The recorded string, not just the library: GNU ld records
+                # a soname-less library by the name it was given.
+                needed = sorted(entry for entry in re.findall(r"\(NEEDED\).*\[(.*)\]", dynamic)
+                                if os.path.basename(entry) in fixtures)
+                return (ran.returncode, ran.stdout.decode(errors="replace").strip(), needed)
 
-        # The compiler driver has a separate `-Wl,` forwarding path. Guard it
-        # too: recording the option only in standalone lccc-ld's CLI would
-        # leave ordinary `lccc -Wl,--warn-common` links silently unchanged.
-        lccc = os.path.abspath(args.lccc)
-        driver = sh(
-            [lccc, "-Wl,--warn-common", "a.o", "b.o", "-o", "driver.out"],
-            cwd=td,
-        )
-        driver_stderr = driver.stderr.decode(errors="replace")
-        if driver.returncode or "--warn-common" not in driver_stderr or "not implemented" not in driver_stderr:
-            return Result(name, "FAIL", f"compiler-driver request was not diagnosed: {driver_stderr!r}")
-        for order, options in (
-            ("driver-fatal-first", ("--fatal-warnings", "--warn-common")),
-            ("driver-fatal-last", ("--warn-common", "--fatal-warnings")),
-        ):
-            fatal = sh(
-                [lccc, *("-Wl," + option for option in options),
-                 "a.o", "b.o", "-o", f"{order}.out"],
-                cwd=td,
-            )
-            fatal_stderr = fatal.stderr.decode(errors="replace")
-            if fatal.returncode == 0 or "warning treated as error" not in fatal_stderr:
-                return Result(
-                    name,
-                    "FAIL",
-                    f"{order}: compiler driver did not promote --warn-common: {fatal_stderr!r}",
-                )
-            if "--warn-common" not in fatal_stderr:
-                return Result(name, "FAIL", f"{order}: error omitted --warn-common: {fatal_stderr!r}")
-        return Result(name, "PASS")
+            for mode, label, inputs in todo:
+                want = outcome([*oracle, *abi, f"-Wl,{mode}"], inputs, "bfd.out")
+                got = outcome([cc, *abi, shim, f"-Wl,{mode}"], inputs, "lccc.out")
+                case = f"{tag}:{mode[2:]}:{label}"
+                if got != want:
+                    return Result(name, "FAIL", f"{case}: bfd {want}, lccc-ld {got}")
+                checked.append(case)
+    note = f" (no fixtures for {', '.join(skipped)})" if skipped else ""
+    targets_run = sorted({case.split(":")[0] for case in checked})
+    return Result(name, "PASS", f"{len(checked)} cases match bfd on {' '.join(targets_run)}{note}")
 
 
 def _linker_start_object(td):
@@ -7935,6 +8249,118 @@ def _elf32_vdso_test(args, oracles):
         if re.search(r" R_386_", remaining):
             return Result(name, "FAIL", "vDSO retained a dynamic relocation")
         return Result(name, "PASS")
+    except Exception as e:
+        return Result(name, "FAIL", f"harness exception: {e!r}")
+    finally:
+        if not args.keep:
+            shutil.rmtree(td, ignore_errors=True)
+
+
+def _script_orphans_test(args, oracles):
+    """Orphan handling of script links matches GNU ld on x86-64 and i386.
+
+    A script that does not name the debug sections (any -T link of -g
+    objects) kept no DWARF at all; same-named allocated orphans got one
+    header per input fragment; __start_/__stop_ were undefined for orphan
+    registries; -s left .symtab/.strtab behind, and -s --emit-relocs wrote
+    an empty .symtab under relocations that index into it.
+    """
+    name = "script_orphans_match_gnu"
+    td = tempfile.mkdtemp(prefix=f"lnk.{name}.")
+    try:
+        unit = r'''
+            .globl _start
+            .text
+        _start:
+            {load} __start_reg, {reg}
+            {load} __stop_reg, {reg}
+            ret
+            .section reg,"a",@progbits
+            .long 1
+            .section .debug_orphan,"",@progbits
+            .{word} _start
+            .ascii "DWARF"
+        '''
+        other = r'''
+            .section reg,"a",@progbits
+            .long 2
+            .section .debug_orphan,"",@progbits
+            .ascii "MORE"
+        '''
+        script = "ENTRY(_start)\nSECTIONS {\n  . = 0x400000;\n  .text : { *(.text) }\n}\n"
+        with open(os.path.join(td, "o.lds"), "w") as f:
+            f.write(script)
+        lccc_ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
+        have_bfd = shutil.which("ld.bfd") is not None
+
+        def sections(output):
+            text = sh(["readelf", "-SW", output], cwd=td).stdout.decode(errors="replace")
+            return re.findall(r"\]\s+(\S+)", text)
+
+        for arch, cflag, emul, word, load, reg in (
+            ("x86-64", [], "elf_x86_64", "quad", "movabsq $", "%rax"),
+            ("i386", ["-m32"], "elf_i386", "long", "movl $", "%eax"),
+        ):
+            objs = []
+            for idx, src in enumerate((unit, other)):
+                body = textwrap.dedent(src).replace("{load} ", load).replace("{reg}", reg)
+                body = body.replace("{word}", word)
+                path = os.path.join(td, f"{arch}-{idx}.s")
+                with open(path, "w") as f:
+                    f.write(body)
+                obj = path[:-2] + ".o"
+                r = sh([CC, *cflag, "-c", path, "-o", obj], cwd=td)
+                if r.returncode != 0:
+                    return Result(name, "SKIP", f"{arch} assembler: {r.stderr.decode()[:200]}")
+                objs.append(obj)
+            links = {}
+            for flags in ([], ["-S"], ["-s"], ["-s", "--emit-relocs"]):
+                out = os.path.join(td, f"{arch}{''.join(flags).replace('-', '_')}.lccc")
+                r = sh([lccc_ld, "-m", emul, "-T", "o.lds", *flags, *objs, "-o", out], cwd=td)
+                if r.returncode != 0:
+                    return Result(name, "FAIL", f"{arch} {flags}: {r.stderr.decode()[:300]}")
+                re_check = sh(["readelf", "-aW", out], cwd=td)
+                if re_check.returncode != 0 or re_check.stderr.strip():
+                    return Result(name, "FAIL", f"{arch} {flags}: readelf: {re_check.stderr.decode()[:200]}")
+                links[tuple(flags)] = out
+            plain = links[()]
+            names = sections(plain)
+            if names.count("reg") != 1:
+                return Result(name, "FAIL", f"{arch}: orphan 'reg' has {names.count('reg')} headers")
+            if ".debug_orphan" not in names or ".symtab" not in names:
+                return Result(name, "FAIL", f"{arch}: plain link sections {names}")
+            symbols = sh(["nm", plain], cwd=td).stdout.decode()
+            bounds = {f[2]: int(f[0], 16) for f in map(str.split, symbols.splitlines())
+                      if len(f) == 3 and f[2] in ("__start_reg", "__stop_reg")}
+            if len(bounds) != 2 or bounds["__stop_reg"] - bounds["__start_reg"] != 8:
+                return Result(name, "FAIL", f"{arch}: __start_/__stop_reg = {bounds}")
+            r = sh(["objcopy", "--dump-section", f".debug_orphan={plain}.dbg", plain], cwd=td)
+            data = open(f"{plain}.dbg", "rb").read() if r.returncode == 0 else b""
+            width = 8 if word == "quad" else 4
+            if data != (0x400000).to_bytes(width, "little") + b"DWARFMORE":
+                return Result(name, "FAIL", f"{arch}: .debug_orphan bytes {data!r}")
+            if have_bfd:
+                ref = os.path.join(td, f"{arch}.bfd")
+                if sh(["ld.bfd", "-m", emul, "-T", "o.lds", *objs, "-o", ref], cwd=td).returncode == 0:
+                    sh(["objcopy", "--dump-section", f".debug_orphan={ref}.dbg", ref], cwd=td)
+                    if open(f"{ref}.dbg", "rb").read() != data:
+                        return Result(name, "FAIL", f"{arch}: .debug_orphan differs from ld.bfd")
+            strip_debug = sections(links[("-S",)])
+            if any(n.startswith(".debug") for n in strip_debug) or ".symtab" not in strip_debug:
+                return Result(name, "FAIL", f"{arch} -S: {strip_debug}")
+            strip_all = sections(links[("-s",)])
+            if ".symtab" in strip_all or ".strtab" in strip_all:
+                return Result(name, "FAIL", f"{arch} -s kept {strip_all}")
+            relocs = links[("-s", "--emit-relocs")]
+            count = len([line for line in sh(["readelf", "-sW", relocs], cwd=td).stdout.decode()
+                         .splitlines() if re.match(r"\s*\d+:", line)])
+            info = sh(["readelf", "-rW", relocs], cwd=td).stdout.decode()
+            indices = [int(m, 16) >> (32 if width == 8 else 8)
+                       for m in re.findall(r"^[0-9a-f]+\s+([0-9a-f]+)\s+R_", info, re.M)]
+            if not indices or max(indices) >= count:
+                return Result(name, "FAIL",
+                              f"{arch} -s --emit-relocs: symbol indices {indices} vs {count} symbols")
+        return Result(name, "PASS", "x86-64 and i386" + (", bytes match ld.bfd" if have_bfd else ""))
     except Exception as e:
         return Result(name, "FAIL", f"harness exception: {e!r}")
     finally:
@@ -11704,6 +12130,8 @@ def _registry(args, oracles):
         one("static_pie_refused", _static_pie_refusal_test, "driver"),
         one("emit_relocs_warns_when_unimplemented", _emit_relocs_warns_test, "kernel"),
         one("warn_common_fatal_order", _warn_common_fatal_order_test, "diagnostics"),
+        one("common_binds_shared_data", _common_binds_shared_data_test, "dynamic"),
+        one("positional_shared_operands", _positional_shared_operands_test, "dynamic"),
         one("common_page_size_warns_and_honors_fatal_warnings",
             _common_page_size_warning_test, "options", "layout", "diagnostics"),
         one("image_base_sets_first_load", _image_base_layout_test, "options", "layout"),
@@ -11725,6 +12153,7 @@ def _registry(args, oracles):
             "layout"),
         one("script_nonalloc_debug_payload", _script_nonalloc_section_test,
             "script", "kernel"),
+        one("script_orphans_match_gnu", _script_orphans_test, "script"),
         _Entry(("so_default_interposable",),
                lambda: _interpose_test(args, oracles, "so_default_interposable", [], "101\n"),
                ("shared",)),

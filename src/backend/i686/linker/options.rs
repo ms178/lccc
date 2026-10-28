@@ -93,6 +93,10 @@ pub(super) struct LinkOptions {
     /// (`linker_common::cet`).  The LAM bits are always clear: `elf_i386`
     /// does not source `x86-64-lam.sh`, so GNU ld ignores `-z lam-*`.
     pub properties: PropertyLinkFlags,
+    /// `-S`/`--strip-debug` or `-s`/`--strip-all`: drop the debug sections.
+    pub strip_debug: bool,
+    /// `-s`/`--strip-all`: also omit `.symtab`/`.strtab`.
+    pub strip_all: bool,
 }
 
 impl LinkOptions {
@@ -329,11 +333,6 @@ pub(super) fn check_capabilities(
     for kw in &args.z_ignored_keywords {
         warnings.push(format!("-z {kw} ignored"));
     }
-    if args.warn_common {
-        warnings.push(
-            "--warn-common ignored: common-symbol diagnostics are not implemented".to_string(),
-        );
-    }
     if args.fatal_warnings && !warnings.is_empty() {
         return Err(format!("warning treated as error: {}", warnings[0]));
     }
@@ -380,6 +379,8 @@ pub(super) fn check_capabilities(
         dt_flags_1,
         wrap: args.wrap_symbols.clone(),
         properties,
+        strip_debug: args.strip_debug || args.strip_all,
+        strip_all: args.strip_all,
     })
 }
 

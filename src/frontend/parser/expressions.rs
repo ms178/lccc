@@ -281,30 +281,42 @@ impl Parser {
     /// `void *const` and `void *volatile` qualify the pointer itself, and the
     /// cast type `void *` stays unqualified (C23 6.3.2.3p3, GCC 14). The scan
     /// stops at that `*` or at the type name's closing `)`.
+    ///
+    /// The scan runs to EOF rather than a fixed token budget: kernel
+    /// `WRITE_ONCE`/`container_of_const` spellings nest `typeof(_Generic(...))`
+    /// casts well past 64 tokens (the previous cap silently dropped
+    /// `pointee_volatile`), and `peek_nth` returns EOF past the token stream,
+    /// so termination is guaranteed. Cost is O(cast length) per declarator;
+    /// the total per translation unit is bounded by the number of declarators
+    /// times its type length, the same linear-per-construct shape as the rest
+    /// of the parser, and no allocation is performed.
     fn type_name_qualifiers(&self) -> CastQualifiers {
         let mut q = CastQualifiers::default();
         let mut depth = 0usize;
         let mut stars = 0usize;
         let mut before_first_star = true;
         let mut volatile_before_star = false;
-        for n in 0..64 {
+        let mut n = 0usize;
+        loop {
             match self.peek_nth(n) {
-                TokenKind::Const if before_first_star => {
+                TokenKind::Eof => break,
+                TokenKind::Const if depth == 0 && before_first_star => {
                     q.pointee_qualified = true;
                     q.base_const = true;
                 }
-                TokenKind::Volatile if before_first_star => {
+                TokenKind::Volatile if depth == 0 && before_first_star => {
                     q.pointee_qualified = true;
-                    if depth == 0 {
-                        volatile_before_star = true;
-                    }
+                    volatile_before_star = true;
                 }
-                TokenKind::LParen => depth += 1,
+                TokenKind::LParen | TokenKind::LBrace | TokenKind::LBracket => depth += 1,
                 TokenKind::RParen => {
                     if depth == 0 {
                         break;
                     }
                     depth -= 1;
+                }
+                TokenKind::RBrace | TokenKind::RBracket => {
+                    depth = depth.saturating_sub(1);
                 }
                 TokenKind::Star if depth == 0 => {
                     stars += 1;
@@ -312,6 +324,7 @@ impl Parser {
                 }
                 _ => {}
             }
+            n += 1;
         }
         // `volatile` must qualify the pointee of a single-level pointer:
         // `(volatile T **)` has a plain `T *` pointee, not a volatile one.
@@ -321,6 +334,11 @@ impl Parser {
 
     /// Scan top-level storage-class and const specifiers inside `( ... )` before `)`.
     /// Returns `(storage, has_any_storage_class, invalid_storage_class_name)`.
+    ///
+    /// Like `type_name_qualifiers`, the scan reaches EOF instead of a fixed
+    /// token budget: a nested `typeof(...)` inside the compound literal's type
+    /// can exceed any static cap, and balanced `()`/`{}`/`[]` tracking keeps
+    /// the depth correct across nested initializers.
     fn scan_compound_literal_storage(
         &self,
     ) -> (
@@ -335,14 +353,19 @@ impl Parser {
         let mut stars = 0usize;
         let mut const_before_star = false;
         let mut const_after_last_star = false;
-        for n in 0..64 {
+        let mut n = 0usize;
+        loop {
             match self.peek_nth(n) {
-                TokenKind::LParen => depth += 1,
+                TokenKind::Eof => break,
+                TokenKind::LParen | TokenKind::LBrace | TokenKind::LBracket => depth += 1,
                 TokenKind::RParen => {
                     if depth == 0 {
                         break;
                     }
                     depth -= 1;
+                }
+                TokenKind::RBrace | TokenKind::RBracket => {
+                    depth = depth.saturating_sub(1);
                 }
                 TokenKind::Star if depth == 0 => {
                     stars += 1;
@@ -386,6 +409,7 @@ impl Parser {
                 }
                 _ => {}
             }
+            n += 1;
         }
         if (stars == 0 && const_before_star) || (stars > 0 && const_after_last_star) {
             st.is_const = true;

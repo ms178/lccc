@@ -71,6 +71,13 @@ pub const SHF_STRINGS: u64 = 0x20;
 pub const SHF_INFO_LINK: u64 = 0x40;
 pub const SHF_GROUP: u64 = 0x200;
 pub const SHF_TLS: u64 = 0x400;
+/// The section holds an `Elf{32,64}_Chdr` followed by compressed data
+/// (gABI; never combined with `SHF_ALLOC`).
+pub const SHF_COMPRESSED: u64 = 0x800;
+/// `ch_type` of a `SHF_COMPRESSED` section: zlib (RFC 1950).
+pub const ELFCOMPRESS_ZLIB: u32 = 1;
+/// `ch_type` of a `SHF_COMPRESSED` section: Zstandard (RFC 8878).
+pub const ELFCOMPRESS_ZSTD: u32 = 2;
 pub const SHF_EXCLUDE: u64 = 0x8000_0000;
 pub const SHF_GNU_RETAIN: u64 = 0x20_0000;
 

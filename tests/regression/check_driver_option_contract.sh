@@ -397,9 +397,9 @@ if [ "$trap_rc" -ne 134 ]; then
     exit 1
 fi
 
-# The 6,776-case boundary matrix is split into one script per ABI so hosted CI
-# can place -m64 and -m32 on different runners. Locally both legs run in
-# parallel; --skip-trapv-matrix is the hosted core-only half of the contract.
+# The 6,776-case boundary matrix lives in one script per ABI, which CI runs as
+# separate gates; --skip-trapv-matrix is the core-only half of the contract.
+# Run standalone, this script still covers both legs, in parallel.
 if [[ $SKIP_MATRIX != 1 ]]; then
     pids=()
     for bits in -m64 -m32; do

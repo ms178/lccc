@@ -92,7 +92,29 @@ has "$tmp/out.s" 'lzcnt' || fail "v3 -mno-bmi lost lzcnt (ABM is independent)"
 printf '#ifdef __LZCNT__\nint lz_m;\n#endif\n#ifdef __POPCNT__\nint pc_m;\n#endif\n#ifdef __BMI__\nint bmi_m;\n#endif\n' >"$tmp/m.c"
 "$CCC" -O2 -m32 -mbmi -mlzcnt -mpopcnt -S "$tmp/m.c" -o "$tmp/m1.s"
 has "$tmp/m1.s" 'lz_m' && has "$tmp/m1.s" 'pc_m' || fail "i686 __LZCNT__/__POPCNT__ missing"
-has "$tmp/m1.s" 'bmi_m' && fail "i686 __BMI__ defined without ANDN/BLSR codegen"
+has "$tmp/m1.s" 'bmi_m' || fail "i686 -mbmi lacks __BMI__ (GCC 16.2 defines it)"
+# __BMI__ promises that <bmiintrin.h> works, not a particular instruction
+# selection: every GCC 16.2 BMI intrinsic must compute GCC's answer on i686
+# (expected line printed by gcc-16 -m32 -mbmi at -O0 and -O2).
+cat >"$tmp/bmi.c" <<'EOF'
+#include <x86intrin.h>
+#include <stdio.h>
+volatile unsigned a = 0xF0F0A5A8u, b = 0x0FF0FFFFu, c = 0x0804u, z = 0;
+int main(void)
+{
+    printf("%x %x %x %x %x %x %x %x %x %x %x\n", __andn_u32(a, b), __blsr_u32(a),
+           _blsr_u32(a), _blsi_u32(a), _blsmsk_u32(a), _tzcnt_u32(a),
+           __tzcnt_u16((unsigned short)a), _bextr_u32(a, 4, 12), __bextr_u32(a, c),
+           _tzcnt_u32(z), __tzcnt_u32(a));
+    return 0;
+}
+EOF
+for opt in -O0 -O2; do
+    "$CCC" $opt -m32 -mbmi "$tmp/bmi.c" -o "$tmp/bmi"
+    got=$("$tmp/bmi")
+    [ "$got" = "f005a57 f0f0a5a0 f0f0a5a0 8 f 3 3 a5a 5a 20 3" ] \
+        || fail "i686 -mbmi $opt intrinsics differ from GCC 16.2: $got"
+done
 "$CCC" -O2 -m32 -S "$tmp/m.c" -o "$tmp/m2.s"
 has "$tmp/m2.s" 'lz_m|pc_m|bmi_m' && fail "baseline -m32 defines an integer-ISA macro"
 "$CCC" -O2 -mbmi -S "$tmp/m.c" -o "$tmp/m3.s"

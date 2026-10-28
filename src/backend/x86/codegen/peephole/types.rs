@@ -508,6 +508,90 @@ fn directive_line_info(text: &str, ts: u16) -> LineInfo {
     info
 }
 
+/// Instruction prefixes GAS accepts as separate words before a mnemonic.
+const INSN_PREFIXES: &[&str] = &[
+    "lock", "rep", "repe", "repz", "repne", "repnz", "notrack", "bnd", "xacquire", "xrelease",
+    "cs", "ds", "es", "fs", "gs", "ss", "data16", "data32", "addr16", "addr32", "rex32", "rex64",
+];
+
+fn is_insn_prefix(word: &str) -> bool {
+    (2..=8).contains(&word.len()) && INSN_PREFIXES.iter().any(|p| word.eq_ignore_ascii_case(p))
+}
+
+/// Split comment-free, leading-trimmed `text` into "had prefix words" and
+/// the mnemonic after them (`None`: nothing follows the prefixes). `;`
+/// separates like whitespace, as in `lock; addl ...`.
+pub(super) fn mnemonic_after_prefixes(text: &str) -> (bool, Option<&str>) {
+    let mut words = text
+        .split(|c: char| c.is_ascii_whitespace() || c == ';')
+        .filter(|w| !w.is_empty());
+    let mut had_prefix = false;
+    loop {
+        match words.next() {
+            None => return (had_prefix, None),
+            Some(w) if is_insn_prefix(w) => had_prefix = true,
+            Some(w) => return (had_prefix, Some(w)),
+        }
+    }
+}
+
+/// True for a mnemonic that transfers control or traps: after it, a linear
+/// scan of the following lines no longer follows execution.
+pub(super) fn is_control_transfer_mnemonic(mnemonic: &str) -> bool {
+    const HEADS: &[&str] = &[
+        "j", "loop", "call", "ret", "lret", "lcall", "ljmp", "iret", "int", "syscall", "sysenter",
+        "sysexit", "sysret", "xbegin", "xabort", "ud0", "ud1", "ud2", "hlt", "icebp", "rsm",
+        "bound", "vmcall", "vmmcall", "vmlaunch", "vmresume",
+    ];
+    HEADS.iter().any(|head| {
+        mnemonic
+            .get(..head.len())
+            .is_some_and(|word| word.eq_ignore_ascii_case(head))
+    })
+}
+
+/// True for comment-free, leading-trimmed `s` that is a control transfer
+/// behind prefix words (`notrack jmp *%rax`, `bnd ret`, `rep ret`).
+///
+/// Such a line starts with the prefix, so none of `classify_line`'s
+/// recognisers sees its `j`/`call`/`ret`: as `Other` it would be a non-branch
+/// that every pass assumes falls through, hiding the edge it takes. LCCC's
+/// codegen emits none outside `#APP` regions, but hand-written and future
+/// emitter text can. It is classified exactly as opaque as inline asm:
+/// pinned, so no rewrite can drop a CET `notrack`, and reading every
+/// register, which keeps backward liveness sound for any hidden successor
+/// (everything is live before it, whatever its edge reaches). The first-word
+/// test keeps the common, unprefixed line to one short scan.
+fn is_prefixed_control_transfer(s: &str) -> bool {
+    let sb = s.as_bytes();
+    let word_end = sb
+        .iter()
+        .position(|&c| c == b' ' || c == b'\t' || c == b';')
+        .unwrap_or(sb.len());
+    word_end < sb.len()
+        && is_insn_prefix(&s[..word_end])
+        && matches!(mnemonic_after_prefixes(s), (true, Some(m)) if is_control_transfer_mnemonic(m))
+}
+
+/// The classification of a line no pass may rewrite or reason through:
+/// inline asm (`#APP` regions) and a prefixed control transfer. It reads
+/// every register and memory and is pinned.
+pub(super) fn opaque_line_info(ts: u16) -> LineInfo {
+    LineInfo {
+        kind: LineKind::InlineAsm,
+        ext_kind: ExtKind::None,
+        trim_start: ts,
+        has_indirect_mem: true,
+        rbp_offset: RBP_OFFSET_NONE,
+        reg_refs: u16::MAX,
+        pinned: true,
+        // Not a directive line; the field is only read for
+        // `LineKind::Directive`, and false is the fail-closed value.
+        inert_dir: false,
+        volatile_access: false,
+    }
+}
+
 /// Parse one assembly line into a `LineInfo`.
 pub(super) fn classify_line(raw: &str) -> LineInfo {
     let b = raw.as_bytes();
@@ -571,6 +655,11 @@ pub(super) fn classify_line(raw: &str) -> LineInfo {
         info.pinned = true;
         info.has_indirect_mem = true;
         return info;
+    }
+
+    // Before the recognisers below, which never see a prefixed `j`/`ret`.
+    if is_prefixed_control_transfer(s) {
+        return opaque_line_info(ts);
     }
 
     // Scalar-FP / SSE XMM stack moves: classified precisely (offset + byte
@@ -3371,6 +3460,32 @@ mod classify_directive_tests {
             classify_line("    .string \"a#b:\"").kind,
             LineKind::Directive
         );
+    }
+
+    #[test]
+    fn a_prefixed_control_transfer_is_opaque_and_prefixed_data_ops_are_not() {
+        for text in [
+            "    notrack jmp *%rax",
+            "    bnd jmp .L3",
+            "    bnd ret",
+            "    rep ret",
+            "    notrack call *%rcx",
+            "    NOTRACK JMP *%rax",
+            "    notrack; jmp *%rax",
+            "    bnd jne .L4",
+        ] {
+            let i = classify_line(text);
+            assert_eq!(i.kind, LineKind::InlineAsm, "{text}");
+            assert!(i.pinned && i.reg_refs == u16::MAX, "{text}");
+        }
+        for text in [
+            "    rep movsb",
+            "    lock addl $1, (%rdi)",
+            "    jmp *%rax",
+            "    ret",
+        ] {
+            assert_ne!(classify_line(text).kind, LineKind::InlineAsm, "{text}");
+        }
     }
 
     #[test]

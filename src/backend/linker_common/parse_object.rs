@@ -6,11 +6,13 @@
 
 use super::SymStr;
 use super::filemap::FileBacking;
+use super::inflate::decompress_input_section;
 use super::secdata::SectionData;
 use super::types::{Elf64Object, Elf64Rela, Elf64Section, Elf64Symbol};
 use crate::backend::elf::{
-    ELF_MAGIC, ELFCLASS64, ELFDATA2LSB, EM_RISCV, ET_REL, SHT_NOBITS, SHT_RELA, SHT_SYMTAB,
-    read_cstr, read_cstr_ref, read_i64, read_u16, read_u32, read_u64, slice_at, table_entry,
+    ELF_MAGIC, ELFCLASS64, ELFDATA2LSB, EM_RISCV, ET_REL, SHF_COMPRESSED, SHT_NOBITS, SHT_RELA,
+    SHT_SYMTAB, read_cstr, read_cstr_ref, read_i64, read_u16, read_u32, read_u64, slice_at,
+    table_entry,
 };
 
 /// Parse an ELF64 relocatable object file (.o).
@@ -76,6 +78,34 @@ pub fn parse_elf64_object_backed(
         ));
     };
     parse_elf64_object_inner(data, Some((backing, base)), source_name, expected_machine)
+}
+
+/// Compressed debug sections (GAS defaults to zlib when binutils is built
+/// with --enable-compressed-debug-sections, as the oracle toolchain is).
+/// Their relocations address the uncompressed bytes, so they are inflated
+/// before the relocation bounds check.
+fn decompress_input_sections(
+    source_name: &str,
+    sections: &mut [Elf64Section],
+    section_data: &mut [SectionData],
+) -> Result<(), String> {
+    for (sec, sd) in sections.iter_mut().zip(section_data.iter_mut()) {
+        if sec.sh_type == SHT_NOBITS {
+            continue;
+        }
+        let decompressed = decompress_input_section(&sec.name, sec.flags, sd.as_slice(), true)
+            .map_err(|e| format!("{source_name}: section '{}': {e}", sec.name))?;
+        if let Some(d) = decompressed {
+            sec.size = d.data.len() as u64;
+            sec.addralign = d.align;
+            sec.flags &= !SHF_COMPRESSED;
+            if let Some(name) = d.rename {
+                sec.name = name;
+            }
+            *sd = SectionData::owned(d.data);
+        }
+    }
+    Ok(())
 }
 
 fn parse_elf64_object_inner(
@@ -241,6 +271,8 @@ fn parse_elf64_object_inner(
         };
         section_data.push(sd);
     }
+
+    decompress_input_sections(source_name, &mut sections, &mut section_data)?;
 
     // Find symbol table and its string table
     let mut symbols = Vec::new();

@@ -1097,6 +1097,10 @@ impl Lowerer {
             } else {
                 Some(Operand::Const(IrConst::I32(0)))
             };
+            // Falling off the end returns at the closing brace (GCC's row).
+            if let Some(close) = nf.body_span.closing_delimiter() {
+                self.func_mut().current_span = close;
+            }
             self.terminate(Terminator::Return(ret_op));
         }
 
@@ -1155,6 +1159,7 @@ impl Lowerer {
             is_static: true,
             is_inline: false,
             is_always_inline: false,
+            x86_isa_needs: Default::default(),
             is_noinline: true,
             target_features: Vec::new(),
             next_value_id: next_val,
@@ -1183,6 +1188,8 @@ impl Lowerer {
                 max_char_array_bytes: self.func().ssp_max_char_array_bytes,
                 stack_guard_alloca: None,
             },
+            body_span: nf.body_span,
+            terminator_spans: std::mem::take(&mut self.func_mut().term_spans),
         };
         self.module.functions.push(ir_func);
         // Note: the module field is accessed via self.module — verify the

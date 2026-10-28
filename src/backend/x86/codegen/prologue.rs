@@ -3348,6 +3348,7 @@ impl X86Codegen {
     }
 
     pub(super) fn emit_epilogue_impl(&mut self, frame_size: i64) {
+        self.state.flush_epilogue_loc();
         let used_regs = self.used_callee_saved.clone();
         let num_saved = used_regs.len() as i64;
         let omit_fp = self.state.omit_frame_pointer;
@@ -4383,6 +4384,7 @@ impl X86Codegen {
     }
 
     pub(super) fn emit_epilogue_and_ret_impl(&mut self, frame_size: i64) {
+        self.state.flush_epilogue_loc();
         // IS-20: a function that dirtied upper YMM halves must clean them
         // before returning, or every legacy-SSE instruction in the caller
         // pays the AVX-SSE transition penalty (~50-100 cycles on current

@@ -63,32 +63,39 @@ fn resolve_clone_spec(spec: &str) -> Result<(u32, Vec<Probe>), String> {
         Ok(v)
     };
 
-    const V2_FEATS: &[&str] = &["cx16", "popcnt", "sse3", "ssse3", "sse4.1", "sse4.2"];
-    const V3_FEATS: &[&str] = &[
-        "avx", "avx2", "bmi", "bmi2", "cx16", "f16c", "fma", "lzcnt", "movbe", "popcnt", "sse3",
-        "ssse3", "sse4.1", "sse4.2",
-    ];
-    const V4_FEATS: &[&str] = &[
-        "avx", "avx2", "avx512f", "avx512bw", "avx512cd", "avx512dq", "avx512vl", "bmi", "bmi2",
-        "cx16", "f16c", "fma", "lzcnt", "movbe", "popcnt", "sse3", "ssse3", "sse4.1", "sse4.2",
-    ];
+    // An `arch=` clone is compiled with that CPU's GCC feature set
+    // (`X86Isa::with_target_features`, the intrinsic permission), so the
+    // resolver probes every one of those features: a Nehalem has the whole
+    // x86-64-v2 set but no PCLMUL, and must not run the `arch=westmere`
+    // clone, whose code may use `_mm_clmulepi64_si128`. The rows carry the
+    // CPU's whole AVX-512 set, so a Sapphire Rapids clone also needs
+    // AVX512-FP16 and a Tiger Lake one AVX512-VP2INTERSECT.
+    let arch_probes = |arch: &str| -> Result<Vec<Probe>, String> {
+        let row = crate::backend::x86::isa::X86Isa::arch_row(arch)
+            .filter(|row| row.x86_64)
+            .ok_or_else(|| format!("target_clones attribute '{spec}' is not supported"))?;
+        let names: Vec<&str> = crate::common::x86_features::X86Feature::ALL
+            .iter()
+            .filter(|&&feature| row.has(feature))
+            .map(|feature| feature.name())
+            .collect();
+        lookup_all(&names)
+    };
+    let arch = spec.strip_prefix("arch=").unwrap_or("");
 
     match spec {
-        "arch=x86-64" => Ok((gcc_prio::X86_64_BASELINE, lookup_all(&["sse2"])?)),
+        "arch=x86-64" => Ok((gcc_prio::X86_64_BASELINE, arch_probes(arch)?)),
         "arch=nehalem" | "arch=silvermont" | "arch=goldmont" | "arch=tremont" => {
-            Ok((gcc_prio::PROC_SSE4_2, lookup_all(V2_FEATS)?))
+            Ok((gcc_prio::PROC_SSE4_2, arch_probes(arch)?))
         }
-        "arch=x86-64-v2" => Ok((gcc_prio::X86_64_V2, lookup_all(V2_FEATS)?)),
+        "arch=x86-64-v2" => Ok((gcc_prio::X86_64_V2, arch_probes(arch)?)),
         // GCC resolves `arch=westmere` (NEHALEM + PCLMUL) to P_PCLMUL.
-        "arch=westmere" => Ok((gcc_prio::PCLMUL, lookup_all(V2_FEATS)?)),
-        "arch=sandybridge" | "arch=ivybridge" => Ok((
-            gcc_prio::PROC_AVX,
-            lookup_all(&["avx", "cx16", "popcnt", "sse4.1", "sse4.2"])?,
-        )),
+        "arch=westmere" => Ok((gcc_prio::PCLMUL, arch_probes(arch)?)),
+        "arch=sandybridge" | "arch=ivybridge" => Ok((gcc_prio::PROC_AVX, arch_probes(arch)?)),
         "arch=haswell" | "arch=broadwell" | "arch=skylake" | "arch=alderlake"
         | "arch=raptorlake" | "arch=meteorlake" | "arch=arrowlake" | "arch=znver1"
-        | "arch=znver2" | "arch=znver3" => Ok((gcc_prio::PROC_AVX2, lookup_all(V3_FEATS)?)),
-        "arch=x86-64-v3" => Ok((gcc_prio::X86_64_V3, lookup_all(V3_FEATS)?)),
+        | "arch=znver2" | "arch=znver3" => Ok((gcc_prio::PROC_AVX2, arch_probes(arch)?)),
+        "arch=x86-64-v3" => Ok((gcc_prio::X86_64_V3, arch_probes(arch)?)),
         "arch=skylake-avx512"
         | "arch=cascadelake"
         | "arch=cooperlake"
@@ -98,9 +105,9 @@ fn resolve_clone_spec(spec: &str) -> Result<(u32, Vec<Probe>), String> {
         | "arch=sapphirerapids"
         | "arch=emeraldrapids"
         | "arch=znver4"
-        | "arch=znver5" => Ok((gcc_prio::PROC_AVX512F, lookup_all(V4_FEATS)?)),
-        "arch=x86-64-v4" => Ok((gcc_prio::X86_64_V4, lookup_all(V4_FEATS)?)),
-        "arch=graniterapids" => Ok((gcc_prio::PROC_AVX10_1, lookup_all(V4_FEATS)?)),
+        | "arch=znver5" => Ok((gcc_prio::PROC_AVX512F, arch_probes(arch)?)),
+        "arch=x86-64-v4" => Ok((gcc_prio::X86_64_V4, arch_probes(arch)?)),
+        "arch=graniterapids" => Ok((gcc_prio::PROC_AVX10_1, arch_probes(arch)?)),
         other => {
             let probe = cpu_probe::lookup(other).ok_or_else(|| {
                 format!("ISA '{other}' is not supported in 'target_clones' attribute")
@@ -120,9 +127,9 @@ fn resolve_clone_spec(spec: &str) -> Result<(u32, Vec<Probe>), String> {
 ///
 /// One deliberate difference: GCC dispatches a named CPU (`arch=haswell`)
 /// with `__builtin_cpu_is`, lccc with the CPU's feature set. Every `arch=`
-/// clone is compiled with a subset of the features its resolver probes
-/// (`X86Isa::arch_level`), so this is safe, and it lets newer CPUs of the
-/// same level run the clone.
+/// clone's code generation and intrinsics are confined to that CPU's GCC
+/// feature set (`X86_ARCH_TABLE`), all of which its resolver probes, so
+/// this is safe, and it lets other CPUs with those features run the clone.
 mod gcc_prio {
     pub(super) const NONE: u32 = 0;
     pub(super) const X86_64_BASELINE: u32 = 4;
@@ -166,9 +173,76 @@ mod gcc_prio {
     }
 }
 
+/// GCC 16.2's verdict on an x86 `target("...")` string, or `None` when it
+/// is accepted: a repeated `key=` option, `arch=generic`, a CPU name GCC
+/// does not know (`native` included), and a 32-bit-only CPU on x86-64 are
+/// errors there, worded as GCC words them.
+fn x86_target_attribute_error(raw: &str, x86_64: bool) -> Option<String> {
+    let options: Vec<&str> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|o| !o.is_empty())
+        .collect();
+    for (index, option) in options.iter().enumerate() {
+        if let Some((key, _)) = option.split_once('=')
+            && options[..index]
+                .iter()
+                .any(|prev| prev.split_once('=').is_some_and(|(k, _)| k == key))
+        {
+            return Some(format!(
+                "attribute value '{option}' was already specified in 'target' attribute"
+            ));
+        }
+    }
+    let arch = options.iter().find_map(|o| o.strip_prefix("arch="))?;
+    if arch == "generic" {
+        return Some("'generic' CPU can be used only for 'target(\"tune=\")' attribute".into());
+    }
+    match crate::backend::x86::isa::X86Isa::arch_row(arch) {
+        None => Some(format!(
+            "bad value '{arch}' for 'target(\"arch=\")' attribute"
+        )),
+        Some(row) if x86_64 && !row.x86_64 => {
+            Some("CPU you selected does not support x86-64 instruction set".into())
+        }
+        Some(_) => None,
+    }
+}
+
 impl Lowerer {
+    /// Diagnose a function's x86 `target("...")` string as GCC does.
+    pub(super) fn diagnose_x86_target_attribute(&self, func: &FunctionDef) {
+        if !matches!(self.target, Target::X86_64 | Target::I686) {
+            return;
+        }
+        let Some(raw) = func.attrs.target.as_deref() else {
+            return;
+        };
+        if let Some(message) = x86_target_attribute_error(raw, self.target == Target::X86_64) {
+            self.diagnostics.borrow_mut().error(message, func.span);
+        }
+    }
+
     /// Lower a `FunctionDef` carrying `__attribute__((target_clones(...)))`.
     pub(super) fn lower_target_clones_function(&mut self, func: &FunctionDef, raw_clones: &str) {
+        // GCC 16.2 ignores `target_clones` beside `target` (with this
+        // warning) and compiles the plain function under its `target`.
+        if func
+            .attrs
+            .target
+            .as_deref()
+            .is_some_and(|t| !t.trim().is_empty())
+        {
+            self.diagnostics.borrow_mut().warning_with_kind(
+                "ignoring attribute 'target_clones' because it conflicts with attribute 'target'",
+                func.span,
+                crate::common::error::WarningKind::Attributes,
+            );
+            let mut plain = func.clone();
+            plain.attrs.target_clones = None;
+            self.lower_function(&plain);
+            return;
+        }
         let specs = parse_target_clones_list(raw_clones);
         if !specs.iter().any(|s| s == "default") {
             self.diagnostics.borrow_mut().error(
@@ -239,12 +313,8 @@ impl Lowerer {
             cloned.attrs.set_used(true);
             cloned.attrs.visibility = None;
             cloned.attrs.symver = None;
-            if let Some(extra) = extra_target {
-                cloned.attrs.target = Some(match &func.attrs.target {
-                    Some(prev) if !prev.is_empty() => format!("{prev},{extra}"),
-                    _ => extra.to_string(),
-                });
-            }
+            // No `target` here: one beside `target_clones` returned above.
+            cloned.attrs.target = extra_target.map(str::to_string);
             self.lower_function(&cloned);
         };
 
@@ -342,6 +412,7 @@ impl Lowerer {
             is_static: true,
             is_inline: false,
             is_always_inline: false,
+            x86_isa_needs: Default::default(),
             is_noinline: true,
             target_features: Vec::new(),
             next_value_id: built.next_value,
@@ -370,6 +441,9 @@ impl Lowerer {
                 no_stack_protector: true,
                 ..Default::default()
             },
+            // Synthesized resolver: no source body.
+            body_span: crate::common::source::Span::dummy(),
+            terminator_spans: Default::default(),
         };
         self.defined_functions.insert(resolver_name.to_string());
         self.module.functions.push(ir_func);
@@ -378,10 +452,76 @@ impl Lowerer {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_clone_spec;
+    use super::{resolve_clone_spec, x86_target_attribute_error};
+
+    /// The verdicts GCC 16.2 gives (measured on `gcc-16 -c`).
+    #[test]
+    fn target_attribute_strings_are_judged_like_gcc() {
+        fn x64(raw: &str) -> Option<String> {
+            x86_target_attribute_error(raw, true)
+        }
+        assert_eq!(x64("arch=haswell,no-avx2"), None);
+        assert_eq!(x64("avx2,arch=x86-64,tune=znver4"), None);
+        assert_eq!(x64("arch=core2"), None);
+        assert_eq!(
+            x64("arch=haswell,arch=x86-64").as_deref(),
+            Some("attribute value 'arch=x86-64' was already specified in 'target' attribute")
+        );
+        assert_eq!(
+            x64("tune=haswell,arch=x86-64,tune=znver4").as_deref(),
+            Some("attribute value 'tune=znver4' was already specified in 'target' attribute")
+        );
+        assert_eq!(
+            x64("arch=generic").as_deref(),
+            Some("'generic' CPU can be used only for 'target(\"tune=\")' attribute")
+        );
+        for bad in ["bogus", "native", "x86-64-v1", "raptor-lake", "knl"] {
+            assert_eq!(
+                x64(&format!("arch={bad}")),
+                Some(format!(
+                    "bad value '{bad}' for 'target(\"arch=\")' attribute"
+                ))
+            );
+        }
+        assert_eq!(
+            x64("arch=pentium4").as_deref(),
+            Some("CPU you selected does not support x86-64 instruction set")
+        );
+        assert_eq!(x86_target_attribute_error("arch=pentium4", false), None);
+        assert_eq!(x86_target_attribute_error("arch=i386,sse2", false), None);
+    }
 
     fn prio(spec: &str) -> u32 {
         resolve_clone_spec(spec).expect(spec).0
+    }
+
+    /// An `arch=` clone is dispatched only where every feature its code may
+    /// use is present (GCC 16.2's feature set for the CPU).
+    #[test]
+    fn arch_clones_probe_the_cpus_whole_feature_set() {
+        use crate::common::cpu_probe::lookup;
+        let probes = |spec: &str| resolve_clone_spec(spec).expect(spec).1;
+        let has = |spec: &str, name: &str| probes(spec).contains(&lookup(name).expect(name));
+        // Nehalem has the v2 set but no PCLMUL; the Westmere clone may use it.
+        assert!(has("arch=westmere", "pclmul") && has("arch=westmere", "popcnt"));
+        assert!(!has("arch=x86-64-v2", "pclmul"));
+        assert!(has("arch=haswell", "rdrnd") && !has("arch=haswell", "aes"));
+        assert!(has("arch=skylake", "aes"));
+        assert!(has("arch=x86-64-v4", "avx512vl") && has("arch=znver4", "avx512bw"));
+        assert!(!has("arch=x86-64-v3", "avx512f"));
+        // Every `arch=` clone requires at least its level's features.
+        for spec in [
+            "arch=x86-64-v3",
+            "arch=haswell",
+            "arch=znver3",
+            "arch=alderlake",
+        ] {
+            for name in [
+                "avx2", "fma", "bmi2", "movbe", "cx16", "popcnt", "f16c", "lzcnt",
+            ] {
+                assert!(has(spec, name), "{spec} {name}");
+            }
+        }
     }
 
     #[test]

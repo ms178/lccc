@@ -1,4 +1,4 @@
-//! RV64C compressed instruction support.
+//! RVC (C extension) compressed instruction support, RV64 and RV32.
 //!
 //! Implements the RISC-V C (compressed) extension for RV64. After the assembler
 //! encodes all instructions as 32-bit words, this module attempts to compress
@@ -14,9 +14,30 @@
 /// Returns `Some(halfword)` if the instruction can be compressed, `None` otherwise.
 /// This only handles instructions without relocations; instructions with pending
 /// relocations are not candidates for compression.
+pub fn try_compress_rv64(word: u32) -> Option<u16> {
+    compress_rv64_as_written(word).or_else(|| commuted(word).and_then(compress_rv64_as_written))
+}
+
+/// GNU as also matches the commuted operand order of the commutative
+/// register-register ops when the order as written has no 2-byte form:
+/// `add a0, a1, a0` is `c.add a0, a1` (and, or, xor, addw alike), while
+/// `add s0, x0, s0` stays `c.mv s0, s0`.
+fn commuted(word: u32) -> Option<u32> {
+    let (opcode, funct3, funct7) = (word & 0x7F, (word >> 12) & 0x7, word >> 25);
+    let commutative = funct7 == 0
+        && match opcode {
+            0b0110011 => matches!(funct3, 0b000 | 0b100 | 0b110 | 0b111),
+            0b0111011 => funct3 == 0b000,
+            _ => false,
+        };
+    let (rd, rs1, rs2) = ((word >> 7) & 0x1F, (word >> 15) & 0x1F, (word >> 20) & 0x1F);
+    (commutative && rd == rs2 && rs1 != rs2)
+        .then(|| (word & !((0x1F << 15) | (0x1F << 20))) | (rs2 << 15) | (rs1 << 20))
+}
+
 // Binary literals use groupings matching RISC-V compressed instruction format fields.
 #[expect(clippy::unusual_byte_groupings)]
-pub fn try_compress_rv64(word: u32) -> Option<u16> {
+fn compress_rv64_as_written(word: u32) -> Option<u16> {
     let opcode = word & 0x7F;
     let rd = (word >> 7) & 0x1F;
     let funct3 = (word >> 12) & 0x7;
@@ -597,18 +618,15 @@ pub fn try_compress_rv64(word: u32) -> Option<u16> {
 
         // ── JAL (opcode 1101111) ──
         0b1101111 => {
-            // C.J: jal x0, offset (only if rd=x0)
-            // Not compressing JAL here because it has relocations typically
-            // and the offset range is limited to +-2KiB for C.J
+            // Symbolic `j`/`jal` are relaxed to c.j/c.jal by the writer
+            // (`ElfWriter::short_branch`), which knows the distance.
             None
         }
 
         // ── BEQ/BNE (opcode 1100011) ──
         0b1100011 => {
-            // C.BEQZ/C.BNEZ: beq/bne rs1', x0, offset
-            // Not compressing branches here because they typically have pending
-            // relocations for local labels, and we'd need to change the relocation
-            // type. This would be handled separately in a more advanced compression pass.
+            // Symbolic branches are relaxed to c.beqz/c.bnez by the writer
+            // (`ElfWriter::short_branch`), which knows the distance.
             None
         }
 
@@ -626,6 +644,33 @@ pub fn try_compress_rv64(word: u32) -> Option<u16> {
     }
 }
 
+/// GNU as's compression of one relocation-free instruction for the object's
+/// XLEN.  RV32 has no `addiw`/`addw`/`subw`/`ld`/`sd`: their RV64C slots are
+/// `c.jal` and `c.flw`/`c.fsw`(`sp`) there, and a shift by 32 or more has no
+/// compressed form (`shamt[5]` is reserved).  `flw`/`fsw` take the `lw`/`sw`
+/// layouts with funct3 bit 13 set; unlike `c.lwsp`, `c.flwsp` may name f0.
+pub fn try_compress(word: u32, rv64: bool) -> Option<u16> {
+    if rv64 {
+        return try_compress_rv64(word);
+    }
+    let funct3 = (word >> 12) & 0x7;
+    match (word & 0x7F, funct3) {
+        (0b0011011, _) | (0b0111011, _) | (0b0000011, 0b011) | (0b0100011, 0b011) => None,
+        (0b0010011, 0b001 | 0b101) if (word >> 25) & 1 != 0 => None,
+        (0b0000111, 0b010) => {
+            let (rd, rs1) = ((word >> 7) & 0x1F, (word >> 15) & 0x1F);
+            if rd == 0 && rs1 == 2 {
+                // c.flwsp f0: try_compress_rv64 refuses `lw x0` (reserved).
+                let as_lw = (word & !0x7F & !(0x1F << 7)) | 0b0000011 | (1 << 7);
+                return try_compress_rv64(as_lw).map(|h| (h | 0x2000) & !(0x1F << 7));
+            }
+            try_compress_rv64((word & !0x7F) | 0b0000011).map(|h| h | 0x2000)
+        }
+        (0b0100111, 0b010) => try_compress_rv64((word & !0x7F) | 0b0100011).map(|h| h | 0x2000),
+        _ => try_compress_rv64(word),
+    }
+}
+
 /// Check if a register number is in the "compressed" range (x8-x15).
 /// These are the registers that can be encoded in 3-bit fields.
 #[inline]
@@ -640,92 +685,167 @@ fn creg_num(reg: u32) -> u32 {
     reg - 8
 }
 
-/// Compress instructions in a section's data buffer.
-///
-/// Takes the section data (which contains 32-bit instructions) and produces
-/// a compressed version where eligible instructions are replaced with 16-bit
-/// equivalents. Returns the new data and an offset mapping (old_offset -> new_offset)
-/// for each 4-byte boundary in the original data.
-///
-/// `reloc_offsets` is the set of offsets that have relocations; instructions at
-/// those offsets should NOT be compressed because relocations assume 4-byte
-/// instruction size.
-pub fn compress_section(
-    data: &[u8],
-    reloc_offsets: &crate::common::fx_hash::FxHashSet<u64>,
-) -> (Vec<u8>, Vec<(u64, u64)>) {
-    let mut new_data = Vec::with_capacity(data.len());
-    let mut offset_map = Vec::new(); // (old_offset, new_offset)
-
-    let mut pos = 0;
-    while pos < data.len() {
-        let old_offset = pos as u64;
-        let new_offset = new_data.len() as u64;
-        offset_map.push((old_offset, new_offset));
-
-        // Check if this is already a compressed (2-byte) instruction.
-        // In RISC-V, bits [1:0] != 0b11 indicates a 16-bit instruction.
-        if pos + 2 <= data.len() {
-            let low_byte = data[pos];
-            if (low_byte & 0x03) != 0x03 {
-                // Already a 2-byte compressed instruction — pass through as-is
-                new_data.extend_from_slice(&data[pos..pos + 2]);
-                pos += 2;
-                continue;
-            }
-        }
-
-        // Need 4 bytes for a full-width instruction
-        if pos + 4 > data.len() {
-            // Trailing bytes — copy them directly
-            new_data.extend_from_slice(&data[pos..]);
-            pos = data.len();
-            break;
-        }
-
-        // Don't compress instructions that have relocations
-        if reloc_offsets.contains(&old_offset) {
-            new_data.extend_from_slice(&data[pos..pos + 4]);
-            pos += 4;
-            continue;
-        }
-
-        let word = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
-
-        if let Some(halfword) = try_compress_rv64(word) {
-            new_data.extend_from_slice(&halfword.to_le_bytes());
-        } else {
-            new_data.extend_from_slice(&data[pos..pos + 4]);
-        }
-
-        pos += 4;
-    }
-
-    // Copy any trailing bytes (shouldn't happen for well-formed code)
-    if pos < data.len() {
-        let old_offset = pos as u64;
-        let new_offset = new_data.len() as u64;
-        offset_map.push((old_offset, new_offset));
-        new_data.extend_from_slice(&data[pos..]);
-    }
-
-    (new_data, offset_map)
+/// GNU as compresses by spelling, not by encoding: an instruction takes a
+/// 2-byte form only through one of its mnemonic's RVC aliases in the opcode
+/// table (opcodes/riscv-opc.c, the `INSN_CLASS_ZCA`/`ZCF`/`ZCD` entries; no
+/// Zcb here).  So `mv a0, zero` and `jalr ra, 0(t0)` stay 4 bytes although
+/// `c.li a0, 0` and `c.jalr t0` mean the same.  Hand-written assembly sizes
+/// code by these rules (equal-length `ALTERNATIVE` sequences, fixed-size
+/// stubs), so the assembler compresses exactly what GNU as does; denser
+/// spellings are the code generator's business.  `half` is what
+/// [`try_compress`] made of the instruction; `operand_count` tells the
+/// 1-operand `jr rs`/`jalr rs` (which have aliases) from `jalr rd, 0(rs)`.
+pub fn spelling_allows(mnemonic: &str, operand_count: usize, half: u16) -> bool {
+    use CKind::*;
+    let Some(kind) = CKind::of(half) else {
+        return false;
+    };
+    let lower;
+    let mnemonic = if mnemonic.bytes().any(|b| b.is_ascii_uppercase()) {
+        lower = mnemonic.to_ascii_lowercase();
+        lower.as_str()
+    } else {
+        mnemonic
+    };
+    let aliases: &[CKind] = match mnemonic {
+        "addi" => &[Addi4spn, Addi, Nop, Addi16sp, Li, Mv],
+        "add" => &[Add, Addi, Addi4spn, Addi16sp, Mv],
+        "li" => &[Lui, Li],
+        "lui" => &[Lui],
+        "mv" | "move" => &[Mv],
+        "nop" => &[Nop],
+        "ebreak" | "sbreak" => &[Ebreak],
+        "ret" => &[Jr],
+        "jr" if operand_count == 1 => &[Jr],
+        "jalr" if operand_count == 1 => &[Jalr],
+        "andi" => &[Andi],
+        "and" => &[And, Andi],
+        "or" => &[Or],
+        "xor" => &[Xor],
+        "sub" => &[Sub],
+        "addiw" | "sext.w" => &[Addiw],
+        "addw" => &[Addw, Addiw],
+        "subw" => &[Subw],
+        "slli" | "sll" => &[Slli],
+        "srli" | "srl" => &[Srli],
+        "srai" | "sra" => &[Srai],
+        "lw" => &[Lw, Lwsp],
+        "sw" => &[Sw, Swsp],
+        // One slot each: `c.ld`/`c.sd` on RV64, `c.flw`/`c.fsw` on RV32
+        // (`try_compress` only makes the one the XLEN has).
+        "ld" | "flw" => &[Ld, Ldsp],
+        "sd" | "fsw" => &[Sd, Sdsp],
+        "fld" => &[Fld, Fldsp],
+        "fsd" => &[Fsd, Fsdsp],
+        _ => &[],
+    };
+    aliases.contains(&kind)
 }
 
-/// Remap an offset from old to new using the offset map.
-/// If the exact offset is in the map, returns the new offset.
-/// Otherwise, interpolates based on the nearest lower entry.
-pub fn remap_offset(offset: u64, offset_map: &[(u64, u64)]) -> u64 {
-    // Binary search for the largest old_offset <= offset
-    match offset_map.binary_search_by_key(&offset, |&(old, _)| old) {
-        Ok(idx) => offset_map[idx].1,
-        Err(0) => offset, // Before any mapped offset
-        Err(idx) => {
-            // offset is between offset_map[idx-1] and offset_map[idx]
-            let (prev_old, prev_new) = offset_map[idx - 1];
-            let delta = offset - prev_old;
-            prev_new + delta
-        }
+/// The mnemonic of a word of an `li` expansion (`lui`, `addiw`, `addi`,
+/// `slli`), which GNU as assembles, and compresses, as written.
+pub fn li_word_mnemonic(word: u32) -> &'static str {
+    match (word & 0x7F, (word >> 12) & 0x7) {
+        (0b0110111, _) => "lui",
+        (0b0011011, 0b000) => "addiw",
+        (0b0010011, 0b000) => "addi",
+        (0b0010011, 0b001) => "slli",
+        _ => "",
+    }
+}
+
+/// The slot of a 2-byte instruction, as far as [`spelling_allows`] needs:
+/// HINT and reserved encodings (which no alias produces) are `None`, and so
+/// are the branches and jumps, which branch relaxation handles.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CKind {
+    Addi4spn,
+    Fld,
+    Lw,
+    Ld,
+    Fsd,
+    Sw,
+    Sd,
+    Nop,
+    Addi,
+    Addiw,
+    Li,
+    Lui,
+    Addi16sp,
+    Srli,
+    Srai,
+    Andi,
+    Sub,
+    Xor,
+    Or,
+    And,
+    Subw,
+    Addw,
+    Slli,
+    Fldsp,
+    Lwsp,
+    Ldsp,
+    Jr,
+    Mv,
+    Ebreak,
+    Jalr,
+    Add,
+    Fsdsp,
+    Swsp,
+    Sdsp,
+}
+
+impl CKind {
+    fn of(half: u16) -> Option<Self> {
+        use CKind::*;
+        let h = u32::from(half);
+        let rd = (h >> 7) & 0x1F;
+        let rs2 = (h >> 2) & 0x1F;
+        let bit12 = (h >> 12) & 1;
+        let ci_imm_zero = bit12 == 0 && rs2 == 0;
+        Some(match (h & 0b11, h >> 13) {
+            (0b00, 0b000) => Addi4spn,
+            (0b00, 0b001) => Fld,
+            (0b00, 0b010) => Lw,
+            (0b00, 0b011) => Ld,
+            (0b00, 0b101) => Fsd,
+            (0b00, 0b110) => Sw,
+            (0b00, 0b111) => Sd,
+            (0b01, 0b000) if half == 0x0001 => Nop,
+            (0b01, 0b000) if rd != 0 && !ci_imm_zero => Addi,
+            (0b01, 0b001) if rd != 0 => Addiw,
+            (0b01, 0b010) if rd != 0 => Li,
+            (0b01, 0b011) if rd == 2 => Addi16sp,
+            (0b01, 0b011) if rd != 0 => Lui,
+            (0b01, 0b100) => match ((h >> 10) & 0b11, bit12, (h >> 5) & 0b11) {
+                (0b00, _, _) => Srli,
+                (0b01, _, _) => Srai,
+                (0b10, _, _) => Andi,
+                (_, 0, 0b00) => Sub,
+                (_, 0, 0b01) => Xor,
+                (_, 0, 0b10) => Or,
+                (_, 0, 0b11) => And,
+                (_, 1, 0b00) => Subw,
+                (_, 1, 0b01) => Addw,
+                _ => return None,
+            },
+            (0b10, 0b000) if rd != 0 => Slli,
+            (0b10, 0b001) => Fldsp,
+            (0b10, 0b010) if rd != 0 => Lwsp,
+            (0b10, 0b011) => Ldsp,
+            (0b10, 0b100) => match (bit12, rd, rs2) {
+                (0, 0, _) | (1, 0, 1..) => return None,
+                (0, _, 0) => Jr,
+                (0, _, _) => Mv,
+                (1, 0, 0) => Ebreak,
+                (1, _, 0) => Jalr,
+                _ => Add,
+            },
+            (0b10, 0b101) => Fsdsp,
+            (0b10, 0b110) => Swsp,
+            (0b10, 0b111) => Sdsp,
+            _ => return None,
+        })
     }
 }
 
@@ -850,12 +970,6 @@ mod tests {
             "c.jr ra (ret) should be 0x8082, got 0x{:04x}",
             hw
         );
-    }
-
-    #[test]
-    fn test_no_compress_with_reloc() {
-        // Instructions with relocations shouldn't be compressed
-        // (This is handled by compress_section, not try_compress_rv64)
     }
 
     #[test]

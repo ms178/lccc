@@ -36,23 +36,12 @@ impl Lowerer {
         match self.target {
             Target::Aarch64 => true,
             Target::X86_64 | Target::I686 => {
-                use crate::common::x86_features::X86Feature;
-                let mut enabled =
-                    crate::common::x86_features::effective().contains(X86Feature::F16c);
-                if let Some(fs) = self.func_state.as_ref() {
-                    for req in &fs.target_features {
-                        match req.as_str() {
-                            "f16c" | "avx2" | "avx512f" | "arch=x86-64-v3" | "arch=x86-64-v4" => {
-                                enabled = true;
-                            }
-                            "no-f16c" | "no-avx" => {
-                                enabled = false;
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                enabled
+                let features = self
+                    .func_state
+                    .as_ref()
+                    .map_or(&[][..], |fs| &fs.target_features);
+                crate::backend::x86::isa::function_features(features, self.target == Target::X86_64)
+                    .contains(crate::common::x86_features::X86Feature::F16c)
             }
             Target::Riscv64 => false,
         }

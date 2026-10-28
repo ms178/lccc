@@ -1308,7 +1308,10 @@ pub trait ArchCodegen {
         // Phase 0: Spill indirect function pointer before any stack manipulation.
         let indirect = func_ptr.is_some() && direct_name.is_none();
         if indirect {
-            self.emit_call_spill_fptr(func_ptr.expect("indirect call requires func_ptr"));
+            self.emit_call_spill_fptr_with_args(
+                func_ptr.expect("indirect call requires func_ptr"),
+                args,
+            );
         }
 
         // Compute stack space needed for overflow args.
@@ -1444,6 +1447,13 @@ pub trait ArchCodegen {
     /// No-op on x86 (uses r10). ARM/RISC-V spill to stack.
     fn emit_call_spill_fptr(&mut self, func_ptr: &Operand) {
         let _ = func_ptr;
+    }
+
+    /// Spill an indirect function pointer with sight of the call's arguments so
+    /// backends whose fast path stages the callee into an allocatable scratch
+    /// register (x86-64 `%r10`) can avoid clobbering a live argument home.
+    fn emit_call_spill_fptr_with_args(&mut self, func_ptr: &Operand, _args: &[Operand]) {
+        self.emit_call_spill_fptr(func_ptr);
     }
 
     /// Size of the function pointer spill slot (0 for x86, 16 for ARM).

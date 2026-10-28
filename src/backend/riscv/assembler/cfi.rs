@@ -82,6 +82,8 @@ impl CfiStream for AsmStatement {
             | Directive::Set(..)
             | Directive::ArchOption(_)
             | Directive::Attribute(_)
+            | Directive::File(..)
+            | Directive::Loc(..)
             | Directive::Ignored => CfiItemKind::NoBytes,
             _ => CfiItemKind::Bytes,
         }

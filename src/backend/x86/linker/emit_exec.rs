@@ -1272,7 +1272,8 @@ pub(super) fn emit_executable(
                 // Size the shared slot for the group's largest member, not
                 // for whoever sorts first (see copy_group_max_sizes).
                 let group_size = copy_group_max.get(k).copied().unwrap_or(*size);
-                let aligned = (bss_addr + bss_size + 7) & !7;
+                let align = linker_common::copy_reloc_align(k.1, group_size, 8);
+                let aligned = (bss_addr + bss_size).next_multiple_of(align);
                 bss_size = aligned - bss_addr + group_size;
                 copy_reloc_addr_map.insert(k.clone(), aligned);
                 aligned

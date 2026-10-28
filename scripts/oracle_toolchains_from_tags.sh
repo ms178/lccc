@@ -281,6 +281,11 @@ if [ "$WITH_SHIMS" = 1 ]; then
     for name in rustc cargo rustfmt clippy-driver; do
         install_shim "$name" "$RUST_ROOT/bin/$name"
     done
+    for name in cargo-clippy cargo-fmt rustdoc; do
+        if [ -x "$RUST_ROOT/bin/$name" ]; then
+            install_shim "$name" "$RUST_ROOT/bin/$name"
+        fi
+    done
     install_shim mold "$PREFIX/bin/mold"
     install_shim ld.mold "$PREFIX/bin/mold"
     if [ "$WITH_BINUTILS" = 1 ] && [ -x "$PREFIX/binutils-$BINUTILS_VERSION/bin/as" ]; then

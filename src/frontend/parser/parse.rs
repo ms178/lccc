@@ -1234,6 +1234,16 @@ impl Parser {
         }
     }
 
+    /// `open` widened through the token just consumed (a body's `}`).
+    pub(super) fn through_previous_token(&self, open: Span) -> Span {
+        match self.pos.checked_sub(1).and_then(|i| self.tokens.get(i)) {
+            Some(tok) if tok.span.file_id == open.file_id && tok.span.end > open.end => {
+                Span::new(open.start, tok.span.end, open.file_id)
+            }
+            _ => open,
+        }
+    }
+
     pub(super) fn peek_span(&self) -> Span {
         if self.pos < self.tokens.len() {
             self.tokens[self.pos].span

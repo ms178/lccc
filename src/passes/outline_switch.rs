@@ -898,6 +898,7 @@ fn build_outlined_function(
         is_static: true,
         is_inline: false,
         is_always_inline: false,
+        x86_isa_needs: func.x86_isa_needs.clone(),
         is_noinline: true, // Do NOT inline back — that defeats the purpose
         // The outlined cases ran under the parent's ISA; keep it.
         target_features: func.target_features.clone(),
@@ -924,6 +925,9 @@ fn build_outlined_function(
         global_init_label_blocks: Vec::new(),
         ret_eightbyte_classes: Vec::new(),
         ret_is_f128_sse: false,
+        // Synthesized: the outlined body has no opening brace of its own.
+        body_span: crate::common::source::Span::dummy(),
+        terminator_spans: Default::default(),
     }
 }
 

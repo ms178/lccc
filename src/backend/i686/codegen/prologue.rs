@@ -1926,6 +1926,7 @@ impl I686Codegen {
     // ---- emit_epilogue_and_ret ----
 
     pub(super) fn emit_epilogue_and_ret_impl(&mut self, frame_size: i64) {
+        self.state.flush_epilogue_loc();
         // Same discipline as x86-64 (and GCC on i386): a function that wrote
         // YMM/ZMM upper state cleans it before returning, or the caller's
         // legacy-SSE code pays the AVX-SSE transition / false-dependency cost.

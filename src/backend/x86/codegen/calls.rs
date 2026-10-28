@@ -767,6 +767,7 @@ impl X86Codegen {
     /// on SysV x86-64, and caller-saved live values have already been spilled by
     /// `emit_pre_call_save_caller_regs` before this hook runs.
     pub(super) fn emit_call_spill_fptr_impl(&mut self, func_ptr: &Operand) {
+        self.indirect_fptr_on_stack = false;
         // Statically resolved targets (a paravirt data cell, or a direct
         // `&symbol` value) need no r10 spill: emit_call_instruction_impl
         // emits the resolved call form directly.
@@ -781,6 +782,91 @@ impl X86Codegen {
         self.state.reg_cache.invalidate_all();
         self.flush_pending_vec_store_impl();
         self.state.invalidate_vec_peephole();
+    }
+
+    /// Defense-in-depth wrapper for indirect-call target pre-staging: RA's
+    /// `indirect_target_regs` exclusion keeps indirect-call arguments off
+    /// `%r10` (`PhysReg(11)`), so the zero-stack `%r10` fast path fires on
+    /// every normal compilation. If an argument ever arrives homed in `%r10`
+    /// (e.g. under a bisect flag or future RA pass), park the callee pointer
+    /// in a 16-byte transient stack slot until stack/register argument staging
+    /// has finished reading `%r10`, then reload `%r10` right before the call.
+    pub(super) fn emit_call_spill_fptr_with_args_impl(
+        &mut self,
+        func_ptr: &Operand,
+        args: &[Operand],
+    ) {
+        self.indirect_fptr_on_stack = false;
+        let arg_uses_r10 = args.iter().any(|op| {
+            matches!(
+                op,
+                Operand::Value(v)
+                    if self
+                        .reg_assignments
+                        .get(&v.0)
+                        .is_some_and(|phys| phys.0 == 11)
+            )
+        });
+        if !arg_uses_r10 {
+            self.emit_call_spill_fptr_impl(func_ptr);
+            return;
+        }
+        if self.try_resolve_indirect_call_global(func_ptr).is_some() {
+            self.state.reg_cache.invalidate_all();
+            self.flush_pending_vec_store_impl();
+            self.state.invalidate_vec_peephole();
+            return;
+        }
+        self.operand_to_rax(func_ptr);
+        self.state.emit("    subq $16, %rsp");
+        self.state.emit("    movq %rax, (%rsp)");
+        if self.state.out.use_rsp_addressing {
+            self.state.out.rsp_frame_size += 16;
+        }
+        self.indirect_fptr_on_stack = true;
+        self.state.reg_cache.invalidate_all();
+        self.flush_pending_vec_store_impl();
+        self.state.invalidate_vec_peephole();
+    }
+
+    fn reload_spilled_indirect_fptr_to_r10(&mut self, stack_arg_space: usize) {
+        if !self.indirect_fptr_on_stack {
+            return;
+        }
+        if self.dyn_align_cleanup {
+            // Regular call only: the dyn-align save slot holds the pre-
+            // realignment %rsp, whose top qword is the parked pointer.
+            // emit_call_cleanup_impl owns the slot reclaim on this path; an
+            // armed sibling call can never be dynamically realigned (its
+            // zero-stack-argument guard rules the whole realignment arm out).
+            debug_assert!(stack_arg_space > 0);
+            let area = (stack_arg_space + 15) & !15;
+            self.state
+                .out
+                .emit_instr_mem_reg("    movq", area as i64, "rsp", "r10");
+            self.state.emit("    movq (%r10), %r10");
+            return;
+        }
+        let need_align_pad = stack_arg_space % 16 != 0;
+        let pushed_bytes = stack_arg_space + if need_align_pad { 8 } else { 0 };
+        if pushed_bytes == 0 {
+            // No outgoing stack area (this includes every armed sibling call):
+            // the parked slot is the top of %rsp, so reload and reclaim it
+            // immediately; the flag must be clear before the next emission.
+            self.state.emit("    movq (%rsp), %r10");
+            self.state.emit("    addq $16, %rsp");
+            if self.state.out.use_rsp_addressing {
+                self.state.out.rsp_frame_size -= 16;
+            }
+            self.indirect_fptr_on_stack = false;
+        } else {
+            // Regular call with stack args: the slot sits ABOVE the pushed
+            // outgoing area at %rsp + pushed_bytes. It stays allocated across
+            // the call; emit_call_cleanup_impl reclaims it via fptr_extra.
+            self.state
+                .out
+                .emit_instr_mem_reg("    movq", pushed_bytes as i64, "rsp", "r10");
+        }
     }
 
     /// Load `len` (1..=8) bytes at `off` of the object addressed by %rax into
@@ -1551,7 +1637,7 @@ impl X86Codegen {
         direct_name: Option<&str>,
         func_ptr: Option<&Operand>,
         _indirect: bool,
-        _stack_arg_space: usize,
+        stack_arg_space: usize,
     ) {
         // Lazy flush: the call clobbers all XMM registers — a pending
         // deferred vector-result store must hit its slot first.
@@ -1614,9 +1700,28 @@ impl X86Codegen {
                         }
                     }
                     // Value-based indirect: Phase 0 already loaded the
-                    // target into %r10 (emit_call_spill_fptr_impl); the
+                    // target into %r10 (emit_call_spill_fptr_impl), or parked
+                    // it on the stack when %r10 held a call argument; the
                     // epilogue does not touch caller-saved registers.
-                    None => SibcallTarget::Reg("r10"),
+                    None => {
+                        // The sibcall arming guards (arm_sibcall_candidate_impl)
+                        // refuse every stack-class argument and every variadic
+                        // /sret/regparm case, and dynamic realignment exists
+                        // solely for >16-aligned STACK arguments, so both are
+                        // unreachable here. The parked-fptr reload therefore
+                        // always takes its zero-arg self-reclaiming branch:
+                        // assert the full reclaim so a future relaxation of an
+                        // arming guard fails loudly instead of tail-jumping
+                        // with the transient 16-byte slot still on %rsp.
+                        debug_assert!(!self.dyn_align_cleanup);
+                        debug_assert_eq!(stack_arg_space, 0);
+                        self.reload_spilled_indirect_fptr_to_r10(stack_arg_space);
+                        debug_assert!(
+                            !self.indirect_fptr_on_stack,
+                            "sibling call must reclaim the parked fptr slot before jmp *r10"
+                        );
+                        SibcallTarget::Reg("r10")
+                    }
                 }
             } else {
                 // Unreachable: the driver only arms sites whose emission
@@ -1693,9 +1798,9 @@ impl X86Codegen {
                 }
             } else {
                 // Indirect function pointers are preloaded into r10 by
-                // emit_call_spill_fptr_impl before stack arguments are pushed.  Do
-                // not reload the Operand here: stack argument setup changes %rsp,
-                // so RSP-relative slots would be addressed incorrectly.
+                // emit_call_spill_fptr_impl before stack arguments are pushed
+                // (or parked on the stack when %r10 held a call argument).
+                self.reload_spilled_indirect_fptr_to_r10(stack_arg_space);
                 self.emit_retpoline_call("r10");
             }
         }
@@ -1796,10 +1901,26 @@ impl X86Codegen {
             }
             self.state.emit("    movq (%rsp), %r11");
             self.state.emit("    movq %r11, %rsp");
+            if self.indirect_fptr_on_stack {
+                self.indirect_fptr_on_stack = false;
+                self.state.emit("    addq $16, %rsp");
+                if self.state.out.use_rsp_addressing {
+                    self.state.out.rsp_frame_size -= 16;
+                }
+            }
             return;
         }
+        let fptr_extra = if self.indirect_fptr_on_stack {
+            self.indirect_fptr_on_stack = false;
+            if self.state.out.use_rsp_addressing {
+                self.state.out.rsp_frame_size -= 16;
+            }
+            16
+        } else {
+            0
+        };
         let need_align_pad = stack_arg_space % 16 != 0;
-        let total_cleanup = stack_arg_space + if need_align_pad { 8 } else { 0 };
+        let total_cleanup = stack_arg_space + if need_align_pad { 8 } else { 0 } + fptr_extra;
         if total_cleanup > 0 {
             self.state
                 .out
@@ -2177,6 +2298,156 @@ pub(super) fn vector_reg_move(size: usize, idx: usize) -> (&'static str, String)
                 "movups"
             };
             (instruction, format!("xmm{idx}"))
+        }
+    }
+}
+
+#[cfg(test)]
+mod indirect_fptr_parking_tests {
+    use super::*;
+    use crate::backend::regalloc::PhysReg;
+
+    // PhysReg(11) is the x86-64 indirect-target register (%r10).
+    const R10: PhysReg = PhysReg(11);
+
+    fn emitter_with_rsp_frame() -> X86Codegen {
+        let mut cg = X86Codegen::new();
+        // Make rsp_frame_size moves observable alongside the emitted text.
+        cg.state.out.use_rsp_addressing = true;
+        cg
+    }
+
+    fn fptr() -> Operand {
+        Operand::Value(Value(7))
+    }
+
+    /// Drive Phase 0 with the argument homed in %r10 so the emitter parks the
+    /// callee pointer in the transient 16-byte stack slot.
+    fn parked_emitter() -> X86Codegen {
+        let mut cg = emitter_with_rsp_frame();
+        cg.reg_assignments.insert(7, PhysReg(14)); // fptr: %rdi -> %rax
+        cg.reg_assignments.insert(1, R10); // argument home: %r10
+        let args = [Operand::Value(Value(1))];
+        cg.emit_call_spill_fptr_with_args_impl(&fptr(), &args);
+        assert!(cg.indirect_fptr_on_stack);
+        cg
+    }
+
+    #[test]
+    fn fast_path_preloads_r10_when_no_argument_uses_r10() {
+        let mut cg = emitter_with_rsp_frame();
+        cg.reg_assignments.insert(7, PhysReg(14));
+        cg.reg_assignments.insert(1, PhysReg(15)); // argument in %rsi
+        let args = [Operand::Value(Value(1))];
+        cg.emit_call_spill_fptr_with_args_impl(&fptr(), &args);
+        let out = &cg.state.out.buf;
+        assert!(out.contains("movq %rax, %r10"), "{out}");
+        assert!(
+            !out.contains("subq $16, %rsp"),
+            "fast path must not park the pointer: {out}"
+        );
+        assert!(!cg.indirect_fptr_on_stack);
+        assert_eq!(cg.state.out.rsp_frame_size, 0);
+    }
+
+    #[test]
+    fn entry_of_every_spill_resets_a_stale_parking_flag() {
+        let mut cg = emitter_with_rsp_frame();
+        cg.indirect_fptr_on_stack = true;
+        cg.reg_assignments.insert(7, PhysReg(14));
+        cg.reg_assignments.insert(1, PhysReg(15));
+        let args = [Operand::Value(Value(1))];
+        cg.emit_call_spill_fptr_with_args_impl(&fptr(), &args);
+        assert!(
+            !cg.indirect_fptr_on_stack,
+            "a stale flag must not survive a new spill entry point"
+        );
+    }
+
+    #[test]
+    fn r10_homed_argument_parks_fptr_in_transient_stack_slot() {
+        let mut cg = emitter_with_rsp_frame();
+        cg.reg_assignments.insert(7, PhysReg(14));
+        cg.reg_assignments.insert(1, R10);
+        let args = [Operand::Value(Value(1))];
+        cg.emit_call_spill_fptr_with_args_impl(&fptr(), &args);
+        let out = &cg.state.out.buf;
+        assert!(out.contains("subq $16, %rsp"), "{out}");
+        assert!(out.contains("movq %rax, (%rsp)"), "{out}");
+        assert!(
+            !out.contains("movq %rax, %r10"),
+            "the %r10 argument must not be clobbered: {out}"
+        );
+        assert!(cg.indirect_fptr_on_stack);
+        assert_eq!(cg.state.out.rsp_frame_size, 16);
+    }
+
+    #[test]
+    fn zero_stack_reload_reclaims_slot_and_clears_flag() {
+        let mut cg = parked_emitter();
+        cg.reload_spilled_indirect_fptr_to_r10(0);
+        let out = &cg.state.out.buf;
+        assert!(out.contains("movq (%rsp), %r10"), "{out}");
+        assert!(out.contains("addq $16, %rsp"), "{out}");
+        assert!(!cg.indirect_fptr_on_stack);
+        assert_eq!(cg.state.out.rsp_frame_size, 0);
+    }
+
+    #[test]
+    fn stack_arg_reload_keeps_slot_until_call_cleanup_reclaims() {
+        let mut cg = parked_emitter();
+        // 24 bytes of outgoing stack args: parity pad makes pushed_bytes 32.
+        cg.reload_spilled_indirect_fptr_to_r10(24);
+        let out = &cg.state.out.buf;
+        assert!(out.contains("movq 32(%rsp), %r10"), "{out}");
+        assert!(
+            cg.indirect_fptr_on_stack,
+            "the slot stays allocated across the call"
+        );
+        assert_eq!(cg.state.out.rsp_frame_size, 16);
+        cg.emit_call_cleanup_impl(24, 0, false);
+        assert!(!cg.indirect_fptr_on_stack);
+        assert_eq!(cg.state.out.rsp_frame_size, 0);
+        // 24 args + 8 parity pad + 16 fptr slot = 48, single combined addq.
+        assert!(
+            cg.state.out.buf.contains("addq $48, %rsp"),
+            "{}",
+            cg.state.out.buf
+        );
+    }
+
+    #[test]
+    fn dyn_align_reload_reads_through_save_slot_and_cleanup_reclaims() {
+        let mut cg = parked_emitter();
+        cg.dyn_align_cleanup = true;
+        cg.reload_spilled_indirect_fptr_to_r10(64);
+        let out = &cg.state.out.buf;
+        // area = (64 + 15) & !15 = 64; the save slot holds the anchor whose
+        // top qword is the parked pointer.
+        assert!(out.contains("movq 64(%rsp), %r10"), "{out}");
+        assert!(out.contains("movq (%r10), %r10"), "{out}");
+        assert!(
+            cg.indirect_fptr_on_stack,
+            "the dyn-align cleanup path owns the reclaim"
+        );
+        cg.emit_call_cleanup_impl(64, 0, false);
+        assert!(!cg.indirect_fptr_on_stack);
+        assert_eq!(cg.state.out.rsp_frame_size, 0);
+    }
+
+    #[test]
+    fn back_to_back_indirect_calls_keep_frame_accounting_balanced() {
+        let mut cg = emitter_with_rsp_frame();
+        cg.reg_assignments.insert(7, PhysReg(14));
+        cg.reg_assignments.insert(1, R10);
+        let args = [Operand::Value(Value(1))];
+        for _ in 0..3 {
+            cg.emit_call_spill_fptr_with_args_impl(&fptr(), &args);
+            assert_eq!(cg.state.out.rsp_frame_size, 16);
+            assert!(cg.indirect_fptr_on_stack);
+            cg.reload_spilled_indirect_fptr_to_r10(0);
+            assert_eq!(cg.state.out.rsp_frame_size, 0);
+            assert!(!cg.indirect_fptr_on_stack);
         }
     }
 }

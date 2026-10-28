@@ -73,58 +73,17 @@ const MAX_POST_GLOBAL_ITERATIONS: usize = 4;
 /// True when an assembly line, after any textual instruction prefixes, is a
 /// control transfer or trap that makes a linear peephole scan unsafe.
 ///
-/// `classify_line` recognizes the ordinary unprefixed spellings. This catches
-/// e.g. `notrack jmp *%rax` and `bnd call foo`, which otherwise look like an
-/// opaque `Other` line and can hide a path that skips a later physical write.
+/// `classify_line` recognizes the unprefixed branch spellings and classifies
+/// a prefixed one (`notrack jmp *%rax`, `bnd call foo`) as opaque inline asm;
+/// this also catches the transfers and traps it leaves as `Other` (`ud2`,
+/// `syscall`, `loop`, `xbegin`, ...) and a dangling prefix.
 fn is_opaque_control_transfer(text: &str) -> bool {
-    const PREFIXES: &[&str] = &[
-        "lock", "rep", "repe", "repz", "repne", "repnz", "notrack", "bnd", "xacquire", "xrelease",
-        "cs", "ds", "es", "fs", "gs", "ss", "data16", "data32", "addr16", "addr32", "rex32",
-        "rex64",
-    ];
     let end = crate::backend::peephole_common::line_len_without_trailing_comment(text.as_bytes());
-    let mut words = text[..end].split_ascii_whitespace();
-    let mut mnemonic = words.next().unwrap_or("");
-    while PREFIXES
-        .iter()
-        .any(|prefix| mnemonic.eq_ignore_ascii_case(prefix))
-    {
-        let Some(next) = words.next() else {
-            return true; // a dangling prefix is opaque too
-        };
-        mnemonic = next;
+    match mnemonic_after_prefixes(&text[..end]) {
+        (true, None) => true, // a dangling prefix is opaque too
+        (_, Some(mnemonic)) => is_control_transfer_mnemonic(mnemonic),
+        (false, None) => false,
     }
-    let starts = |prefix: &str| {
-        mnemonic
-            .get(..prefix.len())
-            .is_some_and(|word| word.eq_ignore_ascii_case(prefix))
-    };
-    starts("j")
-        || starts("loop")
-        || starts("call")
-        || starts("ret")
-        || starts("lret")
-        || starts("lcall")
-        || starts("ljmp")
-        || starts("iret")
-        || starts("int")
-        || starts("syscall")
-        || starts("sysenter")
-        || starts("sysexit")
-        || starts("sysret")
-        || starts("xbegin")
-        || starts("xabort")
-        || starts("ud0")
-        || starts("ud1")
-        || starts("ud2")
-        || starts("hlt")
-        || starts("icebp")
-        || starts("rsm")
-        || starts("bound")
-        || starts("vmcall")
-        || starts("vmmcall")
-        || starts("vmlaunch")
-        || starts("vmresume")
 }
 
 // ── Stack-address escape pinning ─────────────────────────────────────────────
@@ -218,19 +177,7 @@ fn pin_inline_asm_regions(store: &LineStore, infos: &mut [LineInfo]) {
             continue;
         }
         if in_asm {
-            infos[i] = LineInfo {
-                kind: LineKind::InlineAsm,
-                ext_kind: ExtKind::None,
-                trim_start: infos[i].trim_start,
-                has_indirect_mem: true,
-                rbp_offset: RBP_OFFSET_NONE,
-                reg_refs: u16::MAX,
-                pinned: true,
-                // Not a directive line; the field is only read for
-                // `LineKind::Directive`, and false is the fail-closed value.
-                inert_dir: false,
-                volatile_access: false,
-            };
+            infos[i] = opaque_line_info(infos[i].trim_start);
         }
     }
 }
@@ -634,6 +581,29 @@ fn retire_dead_pure_writes(
     any
 }
 
+/// Hide every `-g` line row (`.loc`) from the passes by marking it deleted;
+/// `LineStore::build_result_with_debug_rows` puts each back where it stood.
+///
+/// `.loc` emits no bytes, but a window that stops at it -- or only fuses
+/// physically adjacent lines -- optimized `-g` code less: 36 of the 1162
+/// x86-64 regression sources compiled to different code with `-g` (a
+/// copy-coalesce `movl %eax, %r10d` / `op` split by a row, a dead spill a
+/// row kept alive). Teaching each of the hundreds of walkers the
+/// steppable-directive law would be a law every new pass must remember;
+/// hiding the rows makes the passes see the non-`-g` text by construction.
+fn hide_debug_rows(store: &LineStore, infos: &mut [LineInfo]) -> Vec<bool> {
+    let mut rows = vec![false; infos.len()];
+    for (i, info) in infos.iter_mut().enumerate() {
+        if info.kind == LineKind::Directive
+            && crate::backend::peephole_common::is_loc_directive(info.trimmed(store.get(i)))
+        {
+            mark_nop(info);
+            rows[i] = info.is_nop();
+        }
+    }
+    rows
+}
+
 fn peephole_optimize_inner(
     mut asm: String,
     ra_config: &RaConfig,
@@ -696,6 +666,7 @@ fn peephole_optimize_inner(
     let mut infos: Vec<LineInfo> = (0..line_count)
         .map(|i| classify_line(store.get(i)))
         .collect();
+    let debug_rows = hide_debug_rows(&store, &mut infos);
     pin_inline_asm_regions(&store, &mut infos);
     pin_volatile_access_regions(&store, &mut infos);
     pin_volatile_stack_slots(&store, &mut infos);
@@ -2268,7 +2239,8 @@ fn peephole_optimize_inner(
 
     // Dead copies can leave branch-only blocks after the IR CFG cleanup.
     // Retarget their direct edges while lines are still individually parsed.
-    // Never delete labels: computed gotos and address identity stay intact.
+    // Only relays it orphans go (no mention anywhere in the file), so
+    // computed gotos and address identity stay intact.
     // Retargeting can widen a rel8 branch while retaining its relay. Until
     // exact layout proves non-growth, preserve size mode rather than guess.
     if !optimize_for_size && !sk("jump_thread") {
@@ -2336,9 +2308,9 @@ fn peephole_optimize_inner(
     // instructions — leaving windows that are now flag-neutral and safe to
     // strip. Same for redundant zero-extensions exposed by relay folding.
     if std::env::var("CCC_NO_PEEPHOLE_RERUN").is_ok() {
-        return store.build_result(|i| infos[i].is_nop());
+        return store.build_result_with_debug_rows(|i| infos[i].is_nop(), &debug_rows);
     }
-    let mut result = store.build_result(|i| infos[i].is_nop());
+    let mut result = store.build_result_with_debug_rows(|i| infos[i].is_nop(), &debug_rows);
     let _ = compare_branch::fuse_late_compare_bool_spills(&mut result);
     let _ = pushf_elim::eliminate_redundant_pushfq(&mut result);
     let _ = redundant_ext::eliminate_redundant_zero_extend(&mut result);
@@ -2370,6 +2342,108 @@ fn in_function(body: &[&str]) -> String {
 mod tests {
     use super::*;
     use crate::backend::metric_pair::{MetricCandidate, pair_counters, tag_metric_candidate};
+
+    // ── `-g` invariance: hidden line rows ──────────────────────────────────
+
+    /// `body` with `per_line` `.loc` rows before every line.
+    fn with_rows(body: &[&str], per_line: usize) -> Vec<String> {
+        let mut out = Vec::new();
+        for (n, line) in body.iter().enumerate() {
+            for k in 0..per_line {
+                out.push(format!(".loc 1 {} {k}", n + 1));
+            }
+            out.push((*line).to_string());
+        }
+        out
+    }
+
+    fn code_of(asm: &str) -> String {
+        asm.lines()
+            .filter(|l| !crate::backend::peephole_common::is_loc_directive(l.trim()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn assert_g_invariant(body: &[&str], per_line: usize) -> String {
+        let plain = peephole_optimize(in_function(body));
+        let rows = with_rows(body, per_line);
+        let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
+        let debug = peephole_optimize(in_function(&rows));
+        assert_eq!(code_of(&debug), code_of(&plain), "-g changed the code");
+        // A row whose lines were all deleted is superseded; some must stay.
+        assert!(debug.contains(".loc 1 "), "rows were dropped:\n{debug}");
+        plain
+    }
+
+    /// Dead-store elimination's window is 64 *live* lines: rows (or lines
+    /// earlier passes deleted) no longer shrink it, so a store overwritten 40
+    /// instructions later dies with and without `-g` (it survived `-g` at
+    /// -O0 in simd_defer_chain.c, where rows pushed the overwrite past 64
+    /// raw lines).
+    #[test]
+    fn dead_store_window_ignores_debug_rows() {
+        let mut body = vec![
+            "    pushq %rbp",
+            "    movq %rsp, %rbp",
+            "    subq $32, %rsp",
+            "    movq %rdi, -8(%rbp)",
+        ];
+        body.extend(std::iter::repeat_n("    addq %rsi, %rdx", 40));
+        body.extend([
+            "    movq %rdx, -8(%rbp)",
+            "    movq -8(%rbp), %rax",
+            "    leave",
+            "    ret",
+        ]);
+        let plain = assert_g_invariant(&body, 2);
+        assert!(!plain.contains("movq %rdi, -8(%rbp)"), "{plain}");
+    }
+
+    /// The FP constant hoist plants its materialization in a NOP slot; a
+    /// hidden row is not one, or `-g` alone would hoist.
+    #[test]
+    fn fp_constant_hoist_does_not_take_a_debug_row_slot() {
+        assert_g_invariant(
+            &[
+                "    movsd (%rdi), %xmm2",
+                "    mulsd .LCFP_3(%rip), %xmm2",
+                "    movsd 8(%rdi), %xmm5",
+                "    mulsd .LCFP_3(%rip), %xmm5",
+                "    addsd %xmm5, %xmm2",
+                "    movapd %xmm2, %xmm0",
+            ],
+            1,
+        );
+    }
+
+    /// A row between a copy and its consumer must not block the coalesce
+    /// (36 regression sources compiled differently with `-g` before rows
+    /// were hidden).
+    #[test]
+    fn copy_coalesce_ignores_debug_rows() {
+        assert_g_invariant(
+            &[
+                "    movl %edi, %eax",
+                "    movl %eax, %r10d",
+                "    xorl $255, %r10d",
+                "    movl %r10d, %eax",
+                "    ret",
+            ],
+            1,
+        );
+    }
+
+    /// A row right before the barrier that ends the sign-extension scan must
+    /// not hide the liveness proof (`-O2 -g` kept three `movslq` in
+    /// packed_mask_shifts.c once the closing-brace row preceded the epilogue).
+    #[test]
+    fn dead_sign_extension_proof_ignores_debug_rows() {
+        let plain = assert_g_invariant(
+            &["    movslq %edi, %rcx", "    movl %ecx, (%rsi)", "    ret"],
+            1,
+        );
+        assert!(!plain.contains("movslq"), "{plain}");
+    }
 
     // ── Dual-layout metric pair: scheduling, determinism, instruments ──────
 
@@ -5885,11 +5959,14 @@ mod regression_tests {
         assert!(out.contains("popq %r13"), "{out}");
     }
 
-    /// A transient stack bridge must block the same FPO cleanup with CFI
-    /// disabled; otherwise `-fno-asynchronous-unwind-tables` changes the
-    /// prologue even though the CFI directives are the only option difference.
+    /// A dead save in a framed function whose body moves `%rsp` transiently
+    /// (the SSE1 scalar GPR/XMM bridge) is still removed: the preserving
+    /// strategy grows `subq`/`addq` by the push's 8 bytes, so `%rsp` in the
+    /// body, and with it every `%rsp`-relative slot, is unchanged. Codegen
+    /// writes no CFI (`cfi_synth` derives it afterwards), so the same input
+    /// reaches this pass with and without unwind tables.
     #[test]
-    fn fpo_dead_save_kept_across_transient_rsp_writes_without_cfi() {
+    fn fpo_dead_save_removed_across_transient_rsp_writes() {
         let asm = concat!(
             "f:\n",
             ".cfi_startproc\n",
@@ -5897,6 +5974,7 @@ mod regression_tests {
             "    subq $8, %rsp\n",
             "    leaq -8(%rsp), %rsp\n",
             "    movq %rax, (%rsp)\n",
+            "    movss (%rsp), %xmm0\n",
             "    leaq 8(%rsp), %rsp\n",
             "    addq $8, %rsp\n",
             "    popq %r13\n",
@@ -5905,8 +5983,59 @@ mod regression_tests {
             ".size f, .-f\n",
         );
         let out = peephole_optimize(asm.to_string());
-        assert!(out.contains("pushq %r13"), "{out}");
-        assert!(out.contains("popq %r13"), "{out}");
+        assert!(!out.contains("%r13"), "{out}");
+        assert!(
+            out.contains("subq $16, %rsp") && out.contains("addq $16, %rsp"),
+            "{out}"
+        );
+        for bridge in [
+            "leaq -8(%rsp), %rsp",
+            "movq %rax, (%rsp)",
+            "leaq 8(%rsp), %rsp",
+        ] {
+            assert!(out.contains(bridge), "{bridge}: {out}");
+        }
+    }
+
+    /// Call-argument pushes and their `addq` cleanup are balanced around
+    /// the call, so they do not block a dead save either (the shape of
+    /// `struct_by_value.c`'s `main`: a 48-byte struct passed by value).
+    /// `%rsp` is unchanged at every body instruction, which keeps the
+    /// call's 16-byte alignment and every `%rsp`-relative slot.
+    #[test]
+    fn fpo_dead_save_removed_across_call_argument_pushes() {
+        let asm = concat!(
+            "main:\n",
+            ".cfi_startproc\n",
+            "    pushq %rbx\n",
+            "    subq $112, %rsp\n",
+            "    leaq 64(%rsp), %rax\n",
+            "    pushq 40(%rax)\n",
+            "    pushq 32(%rax)\n",
+            "    pushq 24(%rax)\n",
+            "    pushq 16(%rax)\n",
+            "    pushq 8(%rax)\n",
+            "    pushq 0(%rax)\n",
+            "    leaq 64(%rsp), %rdi\n",
+            "    call id@PLT\n",
+            "    addq $48, %rsp\n",
+            "    movl 16(%rsp), %eax\n",
+            "    addq $112, %rsp\n",
+            "    popq %rbx\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+            ".size main, .-main\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(!out.contains("%rbx"), "{out}");
+        assert!(
+            out.contains("subq $120, %rsp") && out.contains("addq $120, %rsp"),
+            "{out}"
+        );
+        assert!(
+            out.contains("addq $48, %rsp") && out.contains("movl 16(%rsp), %eax"),
+            "{out}"
+        );
     }
 
     /// chacha20_core as emitted: per-push CFI, a frame, an epilogue with

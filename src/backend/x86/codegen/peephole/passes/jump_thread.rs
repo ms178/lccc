@@ -1,6 +1,9 @@
 //! Bypass empty direct-jump trampolines left by allocation and dead copies.
 //!
-//! Retarget edges, never remove/reorder code or labels. The skipped window
+//! Retarget edges, never reorder code. The only deletion is a relay the
+//! retargeting orphaned: labels no line of the file mentions (so no computed
+//! goto, jump table or address comparison can observe them), entered by no
+//! fallthrough, holding one direct `jmp`. The skipped window
 //! contains only labels, comments, deleted lines and one unconditional jump:
 //! registers, memory and flags are unchanged. Keep function scope, inline asm,
 //! pinned lines, semantic directives (including CFI and alignment padding),
@@ -78,7 +81,7 @@ fn thread_function(store: &mut LineStore, infos: &mut [LineInfo], lo: usize, hi:
             LineKind::Nop | LineKind::Empty => {}
             // Human comments emit no bytes. Keep assembler quarantine and
             // compiler-owned liveness/ABI markers opaque to this CFG rewrite.
-            _ if s.starts_with('#') && s != "#APP" && s != "#NO_APP" && !s.contains("LCCC_") => {}
+            _ if inert_comment(s) => {}
             LineKind::Label => {
                 if let Some(label) = local_label(label_text(s)).filter(|l| labels.contains(l)) {
                     if let Some(target) = next {
@@ -143,6 +146,118 @@ fn thread_function(store: &mut LineStore, infos: &mut [LineInfo], lo: usize, hi:
     changed
 }
 
+/// The prefix that makes a `#` comment compiler-owned rather than a human's.
+///
+/// Spelled once because two things depend on the same text: the fixtures below,
+/// and the environment-knob census (`scripts/audit_census.py`), which counts
+/// every `LCCC_<NAME>` literal in `src/` as an env knob.  A fixture that spells
+/// a marker out in full therefore registers a knob that does not exist, in both
+/// `knob_literals` and `knobs_undocumented`.  The rule is a prefix match, so the
+/// prefix *is* the contract; naming it says so and keeps the fixtures honest.
+const COMPILER_MARKER: &str = "LCCC_";
+
+/// Human comments emit no bytes; assembler quarantine and compiler-owned
+/// markers stay opaque.
+fn inert_comment(s: &str) -> bool {
+    s.starts_with('#') && s != "#APP" && s != "#NO_APP" && !s.contains(COMPILER_MARKER)
+}
+
+/// Every `.LBBn` mentioned by a live line other than as its own definition,
+/// plus the labels defined more than once. Comments count: over-approximating
+/// references only keeps more code.
+fn label_uses(store: &LineStore, infos: &[LineInfo]) -> (FxHashSet<u32>, FxHashSet<u32>) {
+    let mut used = FxHashSet::default();
+    let mut defined = FxHashSet::default();
+    let mut duplicate = FxHashSet::default();
+    for (i, info) in infos.iter().enumerate() {
+        if info.is_nop() {
+            continue;
+        }
+        let mut s = info.trimmed(store.get(i));
+        if info.kind == LineKind::Label {
+            if let Some(label) = local_label(label_text(s))
+                && !defined.insert(label)
+            {
+                duplicate.insert(label);
+            }
+            s = s.split_once(':').map_or("", |(_, rest)| rest);
+        }
+        let mut rest = s;
+        while let Some(at) = rest.find(".LBB") {
+            rest = &rest[at + 4..];
+            let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+            if let Ok(label) = rest[..digits].parse() {
+                used.insert(label);
+            }
+        }
+    }
+    (used, duplicate)
+}
+
+/// Delete the relays [`thread_function`] orphaned: a run of unreferenced,
+/// uniquely defined, unpinned labels (inert comments between them stay) that
+/// follows an unconditional transfer and ends in one direct `jmp`. Nothing
+/// can reach the run, so dropping it changes no execution, only dead bytes.
+fn remove_dead_relays(store: &LineStore, infos: &mut [LineInfo], lo: usize, hi: usize) -> bool {
+    let mut changed = false;
+    loop {
+        let (used, duplicate) = label_uses(store, infos);
+        let dead_label = |infos: &[LineInfo], k: usize| {
+            infos[k].kind == LineKind::Label
+                && !infos[k].pinned
+                && local_label(label_text(infos[k].trimmed(store.get(k))))
+                    .is_some_and(|l| !used.contains(&l) && !duplicate.contains(&l))
+        };
+        let mut found = None;
+        let mut prev_transfers = false;
+        let mut k = lo;
+        while k < hi && found.is_none() {
+            let info = infos[k];
+            let s = info.trimmed(store.get(k));
+            if info.is_nop() || info.kind == LineKind::Empty || inert_comment(s) {
+                k += 1;
+                continue;
+            }
+            if prev_transfers && dead_label(infos, k) {
+                let mut labels = vec![k];
+                let mut q = k + 1;
+                while q < hi {
+                    let qs = infos[q].trimmed(store.get(q));
+                    if infos[q].is_nop() || infos[q].kind == LineKind::Empty || inert_comment(qs) {
+                        q += 1;
+                    } else if dead_label(infos, q) {
+                        labels.push(q);
+                        q += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if q < hi
+                    && !infos[q].pinned
+                    && infos[q].kind != LineKind::InlineAsm
+                    && branch(infos[q].trimmed(store.get(q))).is_some_and(|(m, _)| m == "jmp")
+                {
+                    labels.push(q);
+                    found = Some(labels);
+                }
+            }
+            let mnemonic = s.split_whitespace().next().unwrap_or("");
+            prev_transfers = !info.pinned
+                && info.kind != LineKind::InlineAsm
+                && info.kind != LineKind::Label
+                && matches!(mnemonic, "jmp" | "ret" | "retq" | "ud2");
+            k += 1;
+        }
+        let Some(lines) = found else {
+            return changed;
+        };
+        for line in lines {
+            mark_nop(&mut infos[line]);
+        }
+        changed = true;
+    }
+}
+
 pub(super) fn run(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let mut start = None;
     let mut changed = false;
@@ -157,7 +272,10 @@ pub(super) fn run(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
             start = Some(i + 1);
         } else if s == ".cfi_endproc" {
             if let Some(lo) = start.take() {
-                changed |= thread_function(store, infos, lo, i);
+                if thread_function(store, infos, lo, i) {
+                    remove_dead_relays(store, infos, lo, i);
+                    changed = true;
+                }
             }
         }
     }
@@ -183,7 +301,9 @@ mod tests {
         }
         let changed = run(&mut store, &mut infos);
         let text = (0..store.len())
-            .map(|i| store.get(i))
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim())
+            .filter(|line| !line.is_empty())
             .collect::<Vec<_>>()
             .join("\n");
         assert!(!run(&mut store, &mut infos), "must reach a fixpoint");
@@ -191,19 +311,48 @@ mod tests {
     }
 
     #[test]
-    fn threads_chain_aliases_comments_and_keeps_every_label() {
+    fn threads_chain_aliases_comments_and_drops_orphaned_relays() {
         for ws in [" ", "\t", "  \t "] {
             let body = format!(
                 "jne{ws}.LBB1 # edge\nret\n.LBB1:\n# harmless\n.LBB2: # alias\njmp{ws}.LBB3\n.LBB3:\njmp{ws}.LBB4\n.LBB4:\nadcq $0, %rax\nret"
             );
             let (changed, out) = apply(&body, None);
             assert!(changed, "separator {ws:?}: {out}");
-            assert!(out.contains("jne .LBB4 # edge"), "{out}");
-            for label in 1..=4 {
-                assert!(out.contains(&format!(".LBB{label}:")));
-            }
-            assert!(out.contains("adcq $0, %rax")); // Incoming flags untouched.
+            assert_eq!(
+                out,
+                "f:\n.cfi_startproc\njne .LBB4 # edge\nret\n# harmless\n.LBB4:\nadcq $0, %rax\nret\n.cfi_endproc",
+                "separator {ws:?}"
+            );
         }
+    }
+
+    /// Only the orphaned, unreachable relay goes: a fallthrough entry, any
+    /// mention (data, comment, `leaq`), pinning or a compiler marker keeps it.
+    #[test]
+    fn orphaned_relay_removal_fails_closed() {
+        let (_, out) = apply(
+            "jle .LBB3\nmovl $1, %eax\nret\n.LBB3:\njmp .LBB2\n.LBB2:\nret",
+            None,
+        );
+        assert!(out.contains("jle .LBB2") && !out.contains(".LBB3"), "{out}");
+        for keep in [
+            "jle .LBB3\nmovl $1, %eax\n.LBB3:\njmp .LBB2\n.LBB2:\nret",
+            "jle .LBB3\nret\n.LBB3:\njmp .LBB2\n.LBB2:\nret\n.quad .LBB3",
+            "jle .LBB3\nret # .LBB3\n.LBB3:\njmp .LBB2\n.LBB2:\nret",
+            "jle .LBB3\nret\n.LBB3:\njmp .LBB2\n.LBB2:\nret\n.LBB3:",
+        ] {
+            let (_, out) = apply(keep, None);
+            assert!(out.contains(".LBB3:"), "{keep}: {out}");
+        }
+        // A compiler-owned marker keeps the relay too.  Built from the constant
+        // `inert_comment` matches, so this fixture cannot drift from the rule and
+        // contributes no `LCCC_<NAME>` literal for the knob census to count.
+        let marker = format!("# {COMPILER_MARKER}relay");
+        let marked = format!("jle .LBB3\nret\n{marker}\n.LBB3:\njmp .LBB2\n.LBB2:\nret");
+        let (_, out) = apply(&marked, None);
+        assert!(out.contains(".LBB3:"), "{marked}: {out}");
+        let body = "jle .LBB3\nret\n.LBB3:\njmp .LBB2\n.LBB2:\nret";
+        assert!(apply(body, Some(".LBB3:")).1.contains(".LBB3:"));
     }
 
     #[test]
