@@ -3592,8 +3592,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     result.push_str(&expr[start..i]);
                 }
             } else {
-                result.push(bytes[i] as char);
-                i += 1;
+                crate::backend::asm_preprocess::push_char_at(&mut result, expr, &mut i);
             }
         }
         result
@@ -5532,8 +5531,9 @@ impl<A: X86Arch> ElfWriterCore<A> {
         let mut out = String::with_capacity(expr.len() + 24);
         let mut label_made = false;
         let mut label_name = String::new();
-        for (i, &b) in bytes.iter().enumerate() {
-            if b == b'.' {
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'.' {
                 let prev_ok = i == 0
                     || !(bytes[i - 1].is_ascii_alphanumeric()
                         || bytes[i - 1] == b'_'
@@ -5549,10 +5549,13 @@ impl<A: X86Arch> ElfWriterCore<A> {
                         label_made = true;
                     }
                     out.push_str(&label_name);
+                    i += 1;
                     continue;
                 }
             }
-            out.push(b as char);
+            // Whole-character copy: a byte pushed as `char` would re-encode a
+            // non-ASCII symbol name (`café`) as Latin-1 mojibake.
+            crate::backend::asm_preprocess::push_char_at(&mut out, expr, &mut i);
         }
         Some((sec_idx, out))
     }

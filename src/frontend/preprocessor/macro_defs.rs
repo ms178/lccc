@@ -117,12 +117,21 @@ fn strip_blue_paint(s: &str) -> std::borrow::Cow<'_, str> {
 /// In final output, discard paint/paste markers and serialize token boundaries;
 /// during token paste, discard blue paint only. Allocate only for a real edit.
 fn normalize_internal_markers(s: &str, final_output: bool) -> std::borrow::Cow<'_, str> {
-    let is_marker = |b| {
+    let is_marker = |b: u8| {
         b == BLUE_PAINT_MARKER
             || (final_output
                 && matches!(b, PASTE_PROTECT_START | PASTE_PROTECT_END | TOKEN_BOUNDARY))
     };
-    if !s.as_bytes().iter().copied().any(is_marker) {
+    // The four markers are 0x01..=0x04, so the "nothing to do" test is a range
+    // compare that vectorises, instead of a per-byte closure call. This runs for
+    // every expanded line of every translation unit (23.5k times on a 10k-line
+    // TU), and the answer is almost always "no markers".
+    let hit = if final_output {
+        s.as_bytes().iter().any(|&b| b.wrapping_sub(1) < 4)
+    } else {
+        s.as_bytes().iter().any(|&b| b == BLUE_PAINT_MARKER)
+    };
+    if !hit {
         return std::borrow::Cow::Borrowed(s);
     }
     let bytes = s.as_bytes();

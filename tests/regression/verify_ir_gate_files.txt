@@ -42,7 +42,6 @@ tests/corpus/clang-c/Sema/builtins-hexagon-v55.c
 tests/corpus/clang-c/Sema/deep_recursion.c
 tests/corpus/clang-c/Sema/format-attr-missing.c
 tests/corpus/clang-c/Sema/gcc_ms_struct.c
-tests/corpus/clang-c/Sema/inline-asm-validate-m68k.c
 tests/corpus/clang-c/Sema/mips16_attr_not_allowed.c
 tests/corpus/clang-c/Sema/pid_t.c
 tests/corpus/clang-c/Sema/preserve-none-call-conv.c
@@ -94,3 +93,6 @@ tests/regression/vectorize_map_i32_n25.c
 tests/regression/vectorize_map_i32_n96.c
 tests/regression/vectorize_trip_count_gate.c
 tests/regression/widen_i32_i64_sse2_reduction.c
+# Removed: tests/corpus/clang-c/Sema/inline-asm-validate-m68k.c (m68k-only
+# constraint letters; with operand validation in place it is rejected here
+# exactly as gcc 16.2 rejects it on x86-64, so it cannot reach the IR).

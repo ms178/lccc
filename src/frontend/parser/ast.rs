@@ -773,7 +773,7 @@ pub struct DeclAttributes {
     /// Const on this declarator's outermost star, captured before its initializer.
     pub pointer_const: bool,
     /// Packed boolean flags — see `decl_attr_flag` constants.
-    flags: u16,
+    flags: u32,
     /// Named address space written after the declarator's last `*`
     /// (`long *__seg_gs p`): the space of the object itself, not its pointee.
     pub object_space: AddressSpace,
@@ -842,41 +842,54 @@ pub struct DeclAttributes {
 /// Bit masks for boolean flags in `DeclAttributes::flags`.
 pub mod decl_attr_flag {
     /// `__attribute__((constructor))` — run before main.
-    pub const CONSTRUCTOR: u16 = 1 << 0;
+    pub const CONSTRUCTOR: u32 = 1 << 0;
     /// `__attribute__((destructor))` — run after main.
-    pub const DESTRUCTOR: u16 = 1 << 1;
+    pub const DESTRUCTOR: u32 = 1 << 1;
     /// `__attribute__((weak))` — emit as a weak symbol.
-    pub const WEAK: u16 = 1 << 2;
+    pub const WEAK: u32 = 1 << 2;
     /// `__attribute__((error("...")))` or `__attribute__((warning("...")))`.
-    pub const ERROR_ATTR: u16 = 1 << 3;
+    pub const ERROR_ATTR: u32 = 1 << 3;
     /// `__attribute__((noreturn))` or `_Noreturn`.
-    pub const NORETURN: u16 = 1 << 4;
+    pub const NORETURN: u32 = 1 << 4;
     /// `__attribute__((used))` — prevent dead code elimination.
-    pub const USED: u16 = 1 << 5;
+    pub const USED: u32 = 1 << 5;
     /// `__attribute__((fastcall))` — i386 fastcall calling convention.
-    pub const FASTCALL: u16 = 1 << 6;
+    pub const FASTCALL: u32 = 1 << 6;
     /// `__attribute__((naked))` — emit no prologue/epilogue.
-    pub const NAKED: u16 = 1 << 7;
+    pub const NAKED: u32 = 1 << 7;
     /// `__attribute__((no_instrument_function))` — skip mcount/__fentry__ prologue.
-    pub const NO_INSTRUMENT: u16 = 1 << 8;
+    pub const NO_INSTRUMENT: u32 = 1 << 8;
     /// `__attribute__((pure))` — read-only memory access, no observable side effects.
-    pub const PURE: u16 = 1 << 9;
+    pub const PURE: u32 = 1 << 9;
     /// `__attribute__((const))` — no memory access, no observable side effects.
-    pub const CONST_ATTR: u16 = 1 << 10;
+    pub const CONST_ATTR: u32 = 1 << 10;
     /// `__attribute__((cold))` — the function is unlikely to execute.
     /// Meaningful on functions only; ignored for variables like GCC.
-    pub const COLD: u16 = 1 << 11;
+    pub const COLD: u32 = 1 << 11;
     /// GNU `auto` at block scope, i.e. a nested function (see
     /// `parsed_attr_flag::NESTED_FN`). Not an attribute spelling: there is no
     /// `__attribute__((auto))`, only the storage-class keyword.
-    pub const NESTED_FN: u16 = 1 << 12;
+    pub const NESTED_FN: u32 = 1 << 12;
     /// `__attribute__((uninitialized))` — opt an automatic variable out of
     /// `-ftrivial-auto-var-init={zero,pattern}`.
-    pub const UNINITIALIZED: u16 = 1 << 13;
+    pub const UNINITIALIZED: u32 = 1 << 13;
     /// `__attribute__((stack_protect))` — force stack-protector canary.
-    pub const STACK_PROTECT: u16 = 1 << 14;
+    pub const STACK_PROTECT: u32 = 1 << 14;
     /// `__attribute__((no_stack_protector))` — disable stack-protector canary.
-    pub const NO_STACK_PROTECTOR: u16 = 1 << 15;
+    pub const NO_STACK_PROTECTOR: u32 = 1 << 15;
+    /// `__attribute__((retain))` — keep the object's section against
+    /// `--gc-sections` (SHF_GNU_RETAIN). GCC also gives the object its own
+    /// section (`.data.<name>`), which is what makes retention observable.
+    pub const RETAIN: u32 = 1 << 16;
+    /// `__attribute__((noinit))` — zero-initialized object placed in `.noinit`
+    /// (SHT_NOBITS), so the loader does not clear it at startup.
+    pub const NOINIT: u32 = 1 << 17;
+    /// `__attribute__((persistent))` — initialized object placed in
+    /// `.persistent`, which firmware-like loaders leave untouched.
+    pub const PERSISTENT: u32 = 1 << 18;
+    /// `__attribute__((nocommon))` — a tentative definition goes to `.bss`
+    /// instead of a common block, whatever `-fcommon` says.
+    pub const NO_COMMON_ATTR: u32 = 1 << 19;
 }
 
 impl DeclAttributes {
@@ -945,6 +958,38 @@ impl DeclAttributes {
     #[inline]
     pub fn is_stack_protect(&self) -> bool {
         self.flags & decl_attr_flag::STACK_PROTECT != 0
+    }
+    #[inline]
+    pub fn is_retain(&self) -> bool {
+        self.flags & decl_attr_flag::RETAIN != 0
+    }
+    #[inline]
+    pub fn set_retain(&mut self, v: bool) {
+        self.set_flag(decl_attr_flag::RETAIN, v)
+    }
+    #[inline]
+    pub fn is_noinit(&self) -> bool {
+        self.flags & decl_attr_flag::NOINIT != 0
+    }
+    #[inline]
+    pub fn set_noinit(&mut self, v: bool) {
+        self.set_flag(decl_attr_flag::NOINIT, v)
+    }
+    #[inline]
+    pub fn is_persistent(&self) -> bool {
+        self.flags & decl_attr_flag::PERSISTENT != 0
+    }
+    #[inline]
+    pub fn set_persistent(&mut self, v: bool) {
+        self.set_flag(decl_attr_flag::PERSISTENT, v)
+    }
+    #[inline]
+    pub fn is_nocommon(&self) -> bool {
+        self.flags & decl_attr_flag::NO_COMMON_ATTR != 0
+    }
+    #[inline]
+    pub fn set_nocommon(&mut self, v: bool) {
+        self.set_flag(decl_attr_flag::NO_COMMON_ATTR, v)
     }
     #[inline]
     pub fn is_no_stack_protector(&self) -> bool {
@@ -1023,7 +1068,7 @@ impl DeclAttributes {
     }
 
     #[inline]
-    fn set_flag(&mut self, mask: u16, v: bool) {
+    fn set_flag(&mut self, mask: u32, v: bool) {
         if v {
             self.flags |= mask;
         } else {

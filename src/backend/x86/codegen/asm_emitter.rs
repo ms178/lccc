@@ -54,6 +54,15 @@ impl InlineAsmEmitter for X86Codegen {
                 return AsmOperandKind::Tied(n);
             }
         }
+        // x87 FPU register class: "f" is GCC's "any 387 register"; the
+        // allocator picks st(0) for the first free slot, which is what the
+        // x87 stack machinery in `inline_asm.rs` preloads and stores from.
+        // Without this arm `"f"` fell through the catch-all below and was
+        // classified as a general-purpose register, so an x87 statement got a
+        // GPR substituted for an `st(...)` operand: silent wrong code.
+        if c == "f" {
+            return AsmOperandKind::X87St0;
+        }
         // x87 FPU stack constraints: "t" = st(0), "u" = st(1)
         // These are always single-character constraints, so check before multi-alt parsing.
         if c == "t" {
@@ -379,6 +388,43 @@ impl InlineAsmEmitter for X86Codegen {
                             let sr = self.slot_ref(slot.0);
                             self.state
                                 .emit_fmt(format_args!("    {} {}", fld_instr, sr));
+                        }
+                    } else if let Some(home) = self.home_reg_name(v.0) {
+                        // The value has no stack slot: it lives only in its
+                        // fresh home. Dropping the load here (the behaviour
+                        // before this arm) left the x87 stack empty, so
+                        // `asm("fsqrt" : "=t"(r) : "0"(x))` returned NaN for
+                        // every -O1 register-resident `x`. Store the bits to
+                        // scratch stack space and `fld` them; a `movq` from an
+                        // XMM home copies the raw bit pattern, which is what
+                        // `fld` of the matching width wants.
+                        let (store_instr, slot_size) = match ty {
+                            IrType::F32 => ("movss", 4),
+                            IrType::F128 => ("", 0), // handled below
+                            _ => ("movq", 8),
+                        };
+                        if slot_size != 0 {
+                            self.state
+                                .emit_fmt(format_args!("    subq ${}, %rsp", slot_size));
+                            if home.starts_with("xmm") {
+                                self.state.emit_fmt(format_args!(
+                                    "    {} %{}, (%rsp)",
+                                    store_instr, home
+                                ));
+                            } else if slot_size == 4 {
+                                self.state.emit_fmt(format_args!(
+                                    "    movl %{}, (%rsp)",
+                                    Self::reg_to_32(&home)
+                                ));
+                            } else {
+                                self.state
+                                    .emit_fmt(format_args!("    movq %{}, (%rsp)", home));
+                            }
+                            let fld_instr = if slot_size == 4 { "flds" } else { "fldl" };
+                            self.state
+                                .emit_fmt(format_args!("    {} (%rsp)", fld_instr));
+                            self.state
+                                .emit_fmt(format_args!("    addq ${}, %rsp", slot_size));
                         }
                     }
                 }

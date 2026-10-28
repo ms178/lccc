@@ -965,132 +965,32 @@
     "frontend-a": {
       "group": "frontend",
       "mode": "steps",
-      "predicted_gate_seconds": 271.91,
+      "predicted_gate_seconds": 273.41,
       "shards": 3,
       "steps": [
         {
-          "measured_s": 8.0,
-          "name": "Signed affine-step and signed index home contracts"
-        },
-        {
-          "measured_s": 3.0,
-          "name": "IVSR vecaddr struct-walk shape and contracts"
-        },
-        {
-          "measured_s": 2.0,
-          "name": "Relocation and PGO harness red-team tests"
-        },
-        {
-          "measured_s": 15.0,
-          "name": "Memory value forwarding and predicate effect contracts"
-        },
-        {
-          "measured_s": 1.0,
-          "name": "Shuffle builtin diagnostics"
-        },
-        {
-          "measured_s": 7.0,
-          "name": "Scalar logic against GCC 16 and Clang 23.1.4"
-        },
-        {
-          "measured_s": 125.0,
-          "name": "ISA-sensitive intrinsic feature gate"
-        },
-        {
-          "measured_s": 0.25,
-          "name": "Check GOT-slot references to local symbols"
-        },
-        {
-          "measured_s": 36.0,
-          "name": "Verify GCC provisioning contracts (mock only)"
-        },
-        {
-          "measured_s": 21.0,
-          "name": "Reproducer replay (pinned ISA, both legs)"
-        },
-        {
-          "measured_s": 1.0,
-          "name": "Builtin floor float narrowing contracts"
-        },
-        {
-          "measured_s": 0.25,
-          "name": "Check 16-byte CAS lowering (libatomic by default, cmpxchg16b under -mcx16)"
-        },
-        {
-          "measured_s": 3.0,
-          "name": "IV-widen exposed-latch trajectory gates"
-        },
-        {
-          "measured_s": 1.0,
-          "name": "Debug knobs are neutral"
-        },
-        {
-          "measured_s": 2.0,
-          "name": "Verify the two-wide matmul lowering on the x86-64 baseline"
-        },
-        {
-          "measured_s": 0.25,
-          "name": "ext_vector_type target widths and invalid element diagnostics"
-        },
-        {
-          "measured_s": 1.0,
-          "name": "Check signed matmul bounds across AVX2 and two-wide paths"
-        },
-        {
-          "measured_s": 0.25,
-          "name": "Verify 16-byte XMM slot forwarding end to end"
-        },
-        {
-          "measured_s": 11.0,
-          "name": "Variadic pack count inlining contracts"
+          "measured_s": 0.5,
+          "name": "Attribute diagnostics match the GCC 16.2 classes"
         },
         {
           "measured_s": 1.0,
           "name": "Audit loop branch and must-execute contracts"
         },
         {
-          "measured_s": 2.0,
-          "name": "Empty-aggregate cross-compiler ABI contracts"
-        },
-        {
-          "measured_s": 0.25,
-          "name": "Check temporary-file symlink isolation"
+          "measured_s": 1.0,
+          "name": "Builtin floor float narrowing contracts"
         },
         {
           "measured_s": 1.0,
-          "name": "Verify benchmark harness oracle and timing contracts"
-        },
-        {
-          "measured_s": 1.91,
-          "name": "Verify zlib-ng match kernel across optimization levels and ABIs"
-        },
-        {
-          "measured_s": 0.25,
-          "name": "Verify benchmark codegen registry and evidence (mock only)"
-        },
-        {
-          "measured_s": 4.0,
-          "name": "Compound literal as a designated aggregate element"
-        },
-        {
-          "measured_s": 5.0,
-          "name": "Intrinsic differential corpus (lccc vs GCC)"
-        },
-        {
-          "measured_s": 0.25,
-          "name": "Verify binary-equivalence attribution contracts"
-        },
-        {
-          "measured_s": 1.0,
-          "name": "IV-widen paired-counter mirror proof (gcc-16 parity and proof-firing assertion)"
-        },
-        {
-          "measured_s": 3.0,
-          "name": "RISC-V shared-binding mutation controls"
+          "name": "C23 inventory and warning parity against GCC 16.2"
         },
         {
           "measured_s": 2.0,
           "name": "Check -ftrapv boundary matrix (m64)"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Check 16-byte CAS lowering (libatomic by default, cmpxchg16b under -mcx16)"
         },
         {
           "measured_s": 1.0,
@@ -1098,23 +998,87 @@
         },
         {
           "measured_s": 0.25,
-          "name": "Verify W2 load->cast fold structure and runtime"
-        },
-        {
-          "measured_s": 1.0,
-          "name": "Verify exact shift and byte sign-extension fold"
-        },
-        {
-          "measured_s": 5.0,
-          "name": "ext_vector_type by-value ABI under the AVX ABI level vs the Clang 23.1.4 oracle"
+          "name": "Check GOT-slot references to local symbols"
         },
         {
           "measured_s": 0.25,
-          "name": "Surface ext-vector ABI failures in annotations"
+          "name": "Check hot-loop register homes survive an in-loop call"
         },
         {
           "measured_s": 1.0,
-          "name": "C23 inventory and warning parity against GCC 16.2"
+          "name": "Check signed matmul bounds across AVX2 and two-wide paths"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Check temporary-file symlink isolation"
+        },
+        {
+          "measured_s": 4.0,
+          "name": "Compound literal as a designated aggregate element"
+        },
+        {
+          "measured_s": 1.0,
+          "name": "Debug knobs are neutral"
+        },
+        {
+          "measured_s": 2.0,
+          "name": "Empty-aggregate cross-compiler ABI contracts"
+        },
+        {
+          "measured_s": 125.0,
+          "name": "ISA-sensitive intrinsic feature gate"
+        },
+        {
+          "measured_s": 3.0,
+          "name": "IV-widen exposed-latch trajectory gates"
+        },
+        {
+          "measured_s": 1.0,
+          "name": "IV-widen paired-counter mirror proof (gcc-16 parity and proof-firing assertion)"
+        },
+        {
+          "measured_s": 3.0,
+          "name": "IVSR vecaddr struct-walk shape and contracts"
+        },
+        {
+          "measured_s": 5.0,
+          "name": "Intrinsic differential corpus (lccc vs GCC)"
+        },
+        {
+          "measured_s": 15.0,
+          "name": "Memory value forwarding and predicate effect contracts"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Named-space typedef code generation"
+        },
+        {
+          "measured_s": 2.0,
+          "name": "PGO buffered I/O lock lifetime and injected failures"
+        },
+        {
+          "measured_s": 3.0,
+          "name": "RISC-V shared-binding mutation controls"
+        },
+        {
+          "measured_s": 2.0,
+          "name": "Relocation and PGO harness red-team tests"
+        },
+        {
+          "measured_s": 21.0,
+          "name": "Reproducer replay (pinned ISA, both legs)"
+        },
+        {
+          "measured_s": 7.0,
+          "name": "Scalar logic against GCC 16 and Clang 23.1.4"
+        },
+        {
+          "measured_s": 1.0,
+          "name": "Shuffle builtin diagnostics"
+        },
+        {
+          "measured_s": 8.0,
+          "name": "Signed affine-step and signed index home contracts"
         },
         {
           "measured_s": 0.25,
@@ -1122,23 +1086,63 @@
         },
         {
           "measured_s": 1.0,
+          "name": "Static-local constant initializers"
+        },
+        {
+          "measured_s": 1.0,
           "name": "Subscript constraint diagnostics"
         },
         {
           "measured_s": 0.25,
-          "name": "Check hot-loop register homes survive an in-loop call"
+          "name": "Surface ext-vector ABI failures in annotations"
         },
         {
-          "measured_s": 2.0,
-          "name": "PGO buffered I/O lock lifetime and injected failures"
+          "measured_s": 11.0,
+          "name": "Variadic pack count inlining contracts"
         },
         {
           "measured_s": 0.25,
-          "name": "Named-space typedef code generation"
+          "name": "Verify 16-byte XMM slot forwarding end to end"
+        },
+        {
+          "measured_s": 36.0,
+          "name": "Verify GCC provisioning contracts (mock only)"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Verify W2 load->cast fold structure and runtime"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Verify benchmark codegen registry and evidence (mock only)"
         },
         {
           "measured_s": 1.0,
-          "name": "Static-local constant initializers"
+          "name": "Verify benchmark harness oracle and timing contracts"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Verify binary-equivalence attribution contracts"
+        },
+        {
+          "measured_s": 1.0,
+          "name": "Verify exact shift and byte sign-extension fold"
+        },
+        {
+          "measured_s": 2.0,
+          "name": "Verify the two-wide matmul lowering on the x86-64 baseline"
+        },
+        {
+          "measured_s": 1.91,
+          "name": "Verify zlib-ng match kernel across optimization levels and ABIs"
+        },
+        {
+          "measured_s": 5.0,
+          "name": "ext_vector_type by-value ABI under the AVX ABI level vs the Clang 23.1.4 oracle"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "ext_vector_type target widths and invalid element diagnostics"
         }
       ]
     },
@@ -1333,84 +1337,12 @@
     "frontend-c": {
       "group": "frontend",
       "mode": "steps",
-      "predicted_gate_seconds": 271.42,
+      "predicted_gate_seconds": 273.42,
       "shards": 3,
       "steps": [
         {
-          "measured_s": 1.0,
-          "name": "Named-space pointer declarator levels"
-        },
-        {
-          "measured_s": 0.25,
-          "name": "Check default ISA policy (x86-64 default emits no post-baseline instruction)"
-        },
-        {
-          "measured_s": 1.0,
-          "name": "GAS character literals and quoted macro defaults across assemblers"
-        },
-        {
-          "measured_s": 0.46,
-          "name": "GNU retain section flags and linker garbage collection"
-        },
-        {
           "measured_s": 1.01,
           "name": "C digraph token, macro and directive parity"
-        },
-        {
-          "measured_s": 2.0,
-          "name": "Check -ftrapv boundary matrix (m32)"
-        },
-        {
-          "measured_s": 4.0,
-          "name": "RISC-V relocation rejection and positive controls"
-        },
-        {
-          "measured_s": 0.25,
-          "name": "Vector initializers inside aggregates"
-        },
-        {
-          "measured_s": 1.0,
-          "name": "Check a value live across a 16-byte atomic survives the libatomic call"
-        },
-        {
-          "measured_s": 5.0,
-          "name": "a9987 salvage and SWAR cast soundness"
-        },
-        {
-          "measured_s": 0.25,
-          "name": "SSE AVX public API inventory and parser controls"
-        },
-        {
-          "measured_s": 5.0,
-          "name": "GNU vector_size alignment model and MEMORY-class vector argument ABI against GCC 16"
-        },
-        {
-          "measured_s": 0.25,
-          "name": "Surface GNU vector alignment ABI failures in annotations"
-        },
-        {
-          "measured_s": 1.0,
-          "name": "Inline-asm memory operands always carry an address"
-        },
-        {
-          "measured_s": 0.25,
-          "name": "One-lane ext_vector FP/int carrier correctness"
-        },
-        {
-          "measured_s": 2.0,
-          "name": "Ill-typed builtin acceptance"
-        },
-        {
-          "measured_s": 1.0,
-          "name": "RISC-V shared-binding relocation algebra"
-        },
-        {
-          "measured_s": 0.25,
-          "name": "One-lane ext_vector caller-side marshalling (-O0/-O1/-O2)"
-        },
-        {
-          "measured_s": 2.45,
-          "name": "GCC 16.2 diagnostic severity parity"
         },
         {
           "measured_s": 3.0,
@@ -1418,47 +1350,27 @@
         },
         {
           "measured_s": 1.0,
-          "name": "Verify local oracle identity and ICX provisioning (offline, mock only)"
-        },
-        {
-          "measured_s": 0.25,
-          "name": "Const-volatile object reads are not folded"
-        },
-        {
-          "measured_s": 0.25,
-          "name": "Named-space brace-elided initializers"
-        },
-        {
-          "measured_s": 6.0,
-          "name": "Vector argument operand forms against GCC 16"
-        },
-        {
-          "measured_s": 1.0,
-          "name": "Store-forwarding DWORD self-reload contracts"
+          "name": "Check -fno-builtin constant-fold withdrawal (F1)"
         },
         {
           "measured_s": 2.0,
-          "name": "ext-vector swizzle diagnostics"
+          "name": "Check -ftrapv boundary matrix (m32)"
         },
         {
           "measured_s": 1.0,
-          "name": "Diagnostic positions survive the preprocessor"
+          "name": "Check a value live across a 16-byte atomic survives the libatomic call"
+        },
+        {
+          "measured_s": 20.0,
+          "name": "Check baseline-SSE2 packed multiply-add codegen"
         },
         {
           "measured_s": 0.25,
-          "name": "Verify native VEX flag-read architectural controls"
+          "name": "Check default ISA policy (x86-64 default emits no post-baseline instruction)"
         },
         {
-          "measured_s": 1.0,
-          "name": "Integer order and bit-reversal networks"
-        },
-        {
-          "measured_s": 0.25,
-          "name": "Verify benchmark ranking contracts"
-        },
-        {
-          "measured_s": 2.0,
-          "name": "x86 execute regression fixes on both ABIs"
+          "measured_s": 60.0,
+          "name": "Check driver option contracts (core)"
         },
         {
           "measured_s": 1.0,
@@ -1466,7 +1378,95 @@
         },
         {
           "measured_s": 0.25,
-          "name": "Verify _mm_cvtts*_si32 truncation under every MXCSR rounding mode"
+          "name": "Const-volatile object reads are not folded"
+        },
+        {
+          "measured_s": 1.0,
+          "name": "Diagnostic positions survive the preprocessor"
+        },
+        {
+          "measured_s": 8.0,
+          "name": "Ext-vector rvalue subscript cross-ABI"
+        },
+        {
+          "measured_s": 1.0,
+          "name": "GAS character literals and quoted macro defaults across assemblers"
+        },
+        {
+          "measured_s": 2.45,
+          "name": "GCC 16.2 diagnostic severity parity"
+        },
+        {
+          "measured_s": 0.46,
+          "name": "GNU retain section flags and linker garbage collection"
+        },
+        {
+          "measured_s": 56.0,
+          "name": "GNU vector-extension whole-vector lowering (runtime vs GCC + ceilings)"
+        },
+        {
+          "measured_s": 5.0,
+          "name": "GNU vector_size alignment model and MEMORY-class vector argument ABI against GCC 16"
+        },
+        {
+          "measured_s": 10.0,
+          "name": "IVSR integer-domain contracts"
+        },
+        {
+          "measured_s": 1.0,
+          "name": "Identifier UCN/UTF-8 character classes match GCC 16.2"
+        },
+        {
+          "measured_s": 2.0,
+          "name": "Ill-typed builtin acceptance"
+        },
+        {
+          "measured_s": 1.0,
+          "name": "Inline-asm memory operands always carry an address"
+        },
+        {
+          "measured_s": 0.75,
+          "name": "Inline-asm operand and template diagnostics match GCC 16.2"
+        },
+        {
+          "measured_s": 1.0,
+          "name": "Integer order and bit-reversal networks"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Intrinsic arity table matches the headers"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Lexer extensions and their diagnostics match GCC 16.2"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Named-space brace-elided initializers"
+        },
+        {
+          "measured_s": 1.0,
+          "name": "Named-space pointer declarator levels"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "One-lane ext_vector FP/int carrier correctness"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "One-lane ext_vector caller-side marshalling (-O0/-O1/-O2)"
+        },
+        {
+          "measured_s": 4.0,
+          "name": "RISC-V relocation rejection and positive controls"
+        },
+        {
+          "measured_s": 1.0,
+          "name": "RISC-V shared-binding relocation algebra"
+        },
+        {
+          "measured_s": 4.0,
+          "name": "Ring identities against GCC 16 and Clang 23.1.4"
         },
         {
           "measured_s": 17.0,
@@ -1474,51 +1474,67 @@
         },
         {
           "measured_s": 0.25,
-          "name": "Intrinsic arity table matches the headers"
-        },
-        {
-          "measured_s": 4.0,
-          "name": "Ring identities against GCC 16 and Clang 23.1.4"
+          "name": "SSE AVX public API inventory and parser controls"
         },
         {
           "measured_s": 1.0,
-          "name": "Check -fno-builtin constant-fold withdrawal (F1)"
+          "name": "Store-forwarding DWORD self-reload contracts"
         },
         {
-          "measured_s": 45.0,
-          "name": "SysV by-value aggregate and vector ABI against GCC 16"
+          "measured_s": 0.25,
+          "name": "Surface GNU vector alignment ABI failures in annotations"
         },
         {
-          "measured_s": 10.0,
-          "name": "IVSR integer-domain contracts"
-        },
-        {
-          "measured_s": 60.0,
-          "name": "Check driver option contracts (core)"
-        },
-        {
-          "measured_s": 2.0,
-          "name": "Void declarators and initializers"
+          "measured_s": 0.25,
+          "name": "Surface vector-extension codegen failures in annotations"
         },
         {
           "measured_s": 0.25,
           "name": "Surface void-declarator failures in annotations"
         },
         {
-          "measured_s": 8.0,
-          "name": "Ext-vector rvalue subscript cross-ABI"
+          "measured_s": 45.0,
+          "name": "SysV by-value aggregate and vector ABI against GCC 16"
         },
         {
-          "measured_s": 20.0,
-          "name": "Check baseline-SSE2 packed multiply-add codegen"
-        },
-        {
-          "measured_s": 56.0,
-          "name": "GNU vector-extension whole-vector lowering (runtime vs GCC + ceilings)"
+          "measured_s": 6.0,
+          "name": "Vector argument operand forms against GCC 16"
         },
         {
           "measured_s": 0.25,
-          "name": "Surface vector-extension codegen failures in annotations"
+          "name": "Vector initializers inside aggregates"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Verify _mm_cvtts*_si32 truncation under every MXCSR rounding mode"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Verify benchmark ranking contracts"
+        },
+        {
+          "measured_s": 1.0,
+          "name": "Verify local oracle identity and ICX provisioning (offline, mock only)"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Verify native VEX flag-read architectural controls"
+        },
+        {
+          "measured_s": 2.0,
+          "name": "Void declarators and initializers"
+        },
+        {
+          "measured_s": 5.0,
+          "name": "a9987 salvage and SWAR cast soundness"
+        },
+        {
+          "measured_s": 2.0,
+          "name": "ext-vector swizzle diagnostics"
+        },
+        {
+          "measured_s": 2.0,
+          "name": "x86 execute regression fixes on both ABIs"
         }
       ]
     }
@@ -1536,8 +1552,8 @@
     },
     "frontend": {
       "costs": "/tmp/frontend-costs.tsv",
-      "measured_seconds_total": 809.95,
-      "source": "measured: previous plan measured_s (GitHub Actions run 40479214961 frontend step timings; floor/store-forwarding/x86-execute gates at their initial estimates; GCC 16.2 diagnostic severity parity 2.45 s: 1.67 s as recorded by #992 plus 0.78 s for the check_operand_diagnostics.sh leg #993 appended, measured locally); trapv ABI legs 2.0 s each: the 1,999 s / 1,953 s hosted on 09724bee2 were the runner's core_pattern handler (910 SIGABRTs per leg), gone since the matrix became non-dumpable (1.24 s / 1.36 s locally under a 50 ms pipe handler)"
+      "measured_seconds_total": 816.83,
+      "source": "measured: previous plan measured_s (GitHub Actions run 40479214961 frontend step timings; floor/store-forwarding/x86-execute gates at their initial estimates; GCC 16.2 diagnostic severity parity 2.45 s: 1.67 s as recorded by #992 plus 0.78 s for the check_operand_diagnostics.sh leg #993 appended, measured locally); trapv ABI legs 2.0 s each: the 1,999 s / 1,953 s hosted on 09724bee2 were the runner's core_pattern handler (910 SIGABRTs per leg), gone since the matrix became non-dumpable (1.24 s / 1.36 s locally under a 50 ms pipe handler); attribute/asm-operand/lexer/UCN diagnostic gates 0.5/0.75/0.25/1.0 s: local maxima 0.35/0.52/0.22/0.99 s measured on the fastbuild compiler, rounded up to the next quarter second (2026-10-28)"
     }
   }
 }

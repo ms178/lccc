@@ -116,35 +116,7 @@ impl Parser {
 
         // Handle top-level asm("..."); directives - emit verbatim in assembly output
         if matches!(self.peek(), TokenKind::Asm) {
-            self.advance();
-            self.consume_if(&TokenKind::Volatile);
-            if matches!(self.peek(), TokenKind::LParen) {
-                self.advance(); // consume (
-                // Collect all string literal pieces (may be concatenated)
-                let mut asm_str = String::new();
-                loop {
-                    match self.peek() {
-                        TokenKind::StringLiteral(s) => {
-                            asm_str.push_str(s);
-                            self.advance();
-                        }
-                        TokenKind::RParen | TokenKind::Eof => break,
-                        _ => {
-                            self.advance();
-                        }
-                    }
-                }
-                if matches!(self.peek(), TokenKind::RParen) {
-                    self.advance();
-                }
-                self.consume_if(&TokenKind::Semicolon);
-                if !asm_str.is_empty() {
-                    return Some(ExternalDecl::TopLevelAsm(asm_str));
-                }
-                return Some(ExternalDecl::Declaration(Declaration::empty()));
-            }
-            self.consume_if(&TokenKind::Semicolon);
-            return Some(ExternalDecl::Declaration(Declaration::empty()));
+            return Some(self.parse_toplevel_asm());
         }
 
         // Handle _Static_assert at file scope
@@ -313,6 +285,10 @@ impl Parser {
         decl_attrs.set_uninitialized(is_uninitialized);
         decl_attrs.set_stack_protect(is_stack_protect);
         decl_attrs.set_no_stack_protector(is_no_stack_protector);
+        decl_attrs.set_retain(self.attrs.parsing_retain());
+        decl_attrs.set_noinit(self.attrs.parsing_noinit());
+        decl_attrs.set_persistent(self.attrs.parsing_persistent());
+        decl_attrs.set_nocommon(self.attrs.parsing_nocommon());
         decl_attrs.set_nested_fn(self.attrs.parsing_nested_fn());
         decl_attrs.alias_target = alias_target;
         decl_attrs.ifunc_target = ifunc_target;
@@ -385,6 +361,44 @@ impl Parser {
             };
             self.parse_declaration_rest(type_spec, name, derived, start, ctx)
         }
+    }
+
+    /// `asm("...")` / `asm volatile ("...")` / `asm("...");` at file scope.
+    ///
+    /// Top-level asm is emitted verbatim, so the string pieces are concatenated
+    /// here and never parsed as C. An empty directive still consumes the
+    /// declaration: `asm("");` yields an empty declaration rather than falling
+    /// through to the declarator parser (measured: gcc-16.2 accepts it).
+    fn parse_toplevel_asm(&mut self) -> ExternalDecl {
+        self.advance();
+        self.consume_if(&TokenKind::Volatile);
+        if matches!(self.peek(), TokenKind::LParen) {
+            self.advance(); // consume (
+            // Collect all string literal pieces (may be concatenated)
+            let mut asm_str = String::new();
+            loop {
+                match self.peek() {
+                    TokenKind::StringLiteral(s) => {
+                        asm_str.push_str(s);
+                        self.advance();
+                    }
+                    TokenKind::RParen | TokenKind::Eof => break,
+                    _ => {
+                        self.advance();
+                    }
+                }
+            }
+            if matches!(self.peek(), TokenKind::RParen) {
+                self.advance();
+            }
+            self.consume_if(&TokenKind::Semicolon);
+            if !asm_str.is_empty() {
+                return ExternalDecl::TopLevelAsm(asm_str);
+            }
+            return ExternalDecl::Declaration(Declaration::empty());
+        }
+        self.consume_if(&TokenKind::Semicolon);
+        ExternalDecl::Declaration(Declaration::empty())
     }
 
     /// Record a property of a function entity, not a pointer object. Call this
@@ -927,6 +941,20 @@ impl Parser {
         }
         if self.attrs.parsing_used() {
             last_decl.attrs.set_used(true);
+        }
+        // Object-placement attributes (GCC 16.2): carried on the declarator so
+        // lowering can place the object and diagnose misuse.
+        if self.attrs.parsing_retain() {
+            last_decl.attrs.set_retain(true);
+        }
+        if self.attrs.parsing_noinit() {
+            last_decl.attrs.set_noinit(true);
+        }
+        if self.attrs.parsing_persistent() {
+            last_decl.attrs.set_persistent(true);
+        }
+        if self.attrs.parsing_nocommon() {
+            last_decl.attrs.set_nocommon(true);
         }
         if self.attrs.parsing_maybe_unused() {
             last_decl.attrs.set_maybe_unused(true);

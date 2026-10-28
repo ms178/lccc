@@ -25,6 +25,7 @@ for flag in \
     -fvisibility=bogus -ftrivial-auto-var-init=bogus -fzero-call-used-regs=bogus \
     -fopenmp -freg-struct-return \
     -fno-profile-arcs -fno-test-coverage -fno-branch-probabilities -fno-auto-profile \
+    -ftest-coverage -fprofile-arcs \
     -finstrument-functions-exclude-file-list=generated.c \
     -finstrument-functions-exclude-function-list=helper \
     -fprofile-update=unknown -fdiagnostics-color=unknown \
@@ -54,6 +55,19 @@ if LCCC_STRICT_OPTIONS=1 "$CCC" -fdefinitely-not-a-flag -c "$td/plain.c" -o "$td
     echo "FAIL: LCCC_STRICT_OPTIONS=1 must refuse a table-miss -f spelling" >&2
     exit 1
 fi
+# Coverage flags are refused by name and must name their replacement, so a
+# CI coverage job cannot silently report 0 %.
+for flag in -ftest-coverage -fprofile-arcs; do
+    if "$CCC" "$flag" -c "$td/plain.c" -o "$td/cov.o" 2>"$td/cov.err"; then
+        echo "FAIL: $flag accepted but emits no gcov data" >&2
+        exit 1
+    fi
+    grep -Fq -- "-fprofile-generate" "$td/cov.err" || {
+        echo "FAIL: $flag refusal does not point at -fprofile-generate" >&2
+        cat "$td/cov.err" >&2
+        exit 1
+    }
+done
 for flag in -fno-stack-protector -fno-stack-clash-protection -fno-lto -fsanitize=none -fno-strict-aliasing -fno-trapv; do
     "$CCC" "$flag" -c "$td/plain.c" -o "$td/noop.o"
 done

@@ -743,6 +743,8 @@ fn costly_tls_follows_the_backend_model_table() {
         is_const: false,
         is_used: false,
         is_thread_local: true,
+        is_retain: false,
+        is_nocommon: false,
     };
     let mut module = IrModule::default();
     module.globals = vec![

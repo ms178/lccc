@@ -668,17 +668,42 @@ fn parse_line_items(line: &str) -> Result<Vec<AsmItem>, String> {
 ///   "1:  stmxcsr -8(%rsp)"  -> Some(("1", "stmxcsr -8(%rsp)"))
 ///   ".Lfoo: ret"     -> Some((".Lfoo", "ret"))
 ///   "mov %rax, %rbx" -> None (no label)
+/// GAS's symbol grammar for the label position:
+/// `[A-Za-z_.$@][A-Za-z0-9_.$@]*`, plus numeric local labels (`1:`).
+fn is_gas_symbol(candidate: &str) -> bool {
+    let mut bytes = candidate.bytes();
+    match bytes.next() {
+        Some(c) if c.is_ascii_alphabetic() || matches!(c, b'_' | b'.' | b'$' | b'@') => {}
+        Some(c) if c.is_ascii_digit() => {
+            return bytes.all(|c| c.is_ascii_digit());
+        }
+        // Extended identifiers: C99 UCNs and UTF-8 identifier characters reach
+        // the assembler as raw UTF-8 bytes (`café`), exactly as GCC emits them,
+        // so any non-ASCII byte is a symbol character.
+        Some(c) if c >= 0x80 => {}
+        _ => return false,
+    }
+    bytes.all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'$' | b'@') || c >= 0x80)
+}
+
 fn try_parse_label(line: &str) -> Option<(String, &str)> {
     let trimmed = line.trim();
     if let Some(colon_pos) = trimmed.find(':') {
         let candidate = trimmed[..colon_pos].trim();
-        // Verify it's a valid label (no spaces, starts with letter/dot/digit)
+        // Verify it's a valid label (no spaces, starts with letter/dot/digit).
+        //
+        // `$` is a legal symbol character to GAS and to this compiler's own
+        // lexer (`-fdollars-in-identifiers`, on by default), so
+        // `int $x = 1;` emits `.globl $x` / `$x:` and must round-trip. The old
+        // unconditional `$` rejection turned that into
+        // `unhandled instruction: $x: []` — a compiler failure on a program
+        // GCC accepts. `%` stays excluded: a `%`-first candidate is a register.
         if !candidate.is_empty()
             && !candidate.contains(' ')
             && !candidate.contains('\t')
             && !candidate.contains(',')
-            && !candidate.starts_with('$')
             && !candidate.starts_with('%')
+            && is_gas_symbol(candidate)
         {
             let rest = trimmed[colon_pos + 1..].trim();
             return Some((candidate.to_string(), rest));
@@ -1787,8 +1812,27 @@ fn parse_operand(s: &str) -> Result<Operand, String> {
         return parse_register_operand(s);
     }
 
-    // Immediate: $42, $symbol, $symbol@GOTPCREL
+    // `$` is both GAS's immediate prefix and a legal symbol character, so
+    // `$x(%rip)` (a memory reference to the symbol `$x`, which this compiler's
+    // lexer accepts under `-fdollars-in-identifiers`) is a memory operand, not
+    // an immediate: an immediate expression cannot be followed by a base
+    // register. GAS itself needs `($x)(%rip)` there; accepting the bare form
+    // keeps the compiler's own output assembleable.
     if let Some(rest) = s.strip_prefix('$') {
+        // Only `$SYMBOL(...)` is a memory reference; `$(expr)` is GCC's
+        // parenthesised immediate (`movq $(l1-xtrnA), %rax`) and must stay one.
+        if !rest.starts_with('(') {
+            if let Some(paren) = rest.find('(') {
+                let sym = &rest[..paren];
+                if !sym.is_empty()
+                    && sym.bytes().all(|c| {
+                        c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'$' | b'@')
+                    })
+                {
+                    return parse_memory_operand(s);
+                }
+            }
+        }
         return parse_immediate_operand(rest);
     }
 

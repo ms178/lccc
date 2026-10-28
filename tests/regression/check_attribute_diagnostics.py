@@ -120,20 +120,20 @@ PROBES = [
 # no handler for them. Shrink-only: removing a name must be paired with the
 # dispatcher gaining a handler (the gate re-probes both directions).
 UNIMPLEMENTED = sorted(set("""
-access alloc_align alloc_size artificial assume btf_decl_tag btf_type_tag callee_pop_aggregate_return cdecl cf_check
-copy deprecated designated_init expected_throw fallthrough flag_enum flatten force_align_arg_pointer
-format format_arg gcc_struct hardbool indirect_branch indirect_return interrupt leaf malloc may_alias
-ms_abi ms_hook_prologue ms_struct musttail no_address_safety_analysis no_callee_saved_registers
-no_caller_saved_registers no_icf no_profile_instrument_function no_reorder no_sanitize_address
-no_sanitize_coverage no_sanitize_thread no_split_stack
-no_stack_limit nocf_check noclone nocommon nodirect_extern_access noinit noipa nonnull nonstring noplt
-nothrow objc_root_class
-null_terminated_string_arg patchable_function_entry persistent preserve_none reproducible retain
-returns_nonnull returns_twice
+access alloc_align alloc_size artificial assume assume_aligned btf_decl_tag btf_type_tag
+callee_pop_aggregate_return cdecl cf_check copy deprecated designated_init expected_throw
+fallthrough fd_arg fd_arg_read fd_arg_write flag_enum flatten force_align_arg_pointer format
+format_arg gcc_struct hardbool hot indirect_branch indirect_return interrupt leaf malloc
+may_alias ms_abi ms_hook_prologue ms_struct musttail no_address_safety_analysis
+no_callee_saved_registers no_caller_saved_registers no_icf no_profile_instrument_function
+no_reorder no_sanitize_address no_sanitize_coverage no_sanitize_thread no_split_stack
+no_stack_limit nocf_check noclone nodirect_extern_access noipa nonnull nonnull_if_nonzero
+nonstring noplt nothrow null_terminated_string_arg objc_nullability objc_root_class
+patchable_function_entry preserve_none reproducible returns_nonnull returns_twice sentinel
 signed_bool_precision simd sseregparm stdcall strict_flex_array strub sysv_abi tainted_args
 target_version thiscall transaction_callable transaction_may_cancel_outer transaction_pure
-transaction_safe_dynamic transaction_unsafe unavailable unsequenced vector_mask warn_if_not_aligned
-warn_unused warn_unused_result
+transaction_safe transaction_safe_dynamic transaction_unsafe unavailable unsequenced
+vector_mask warn_if_not_aligned warn_unused warn_unused_result
 """.split()))
 
 # These system headers use GCC's underscored spelling of attributes (notably

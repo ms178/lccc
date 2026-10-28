@@ -556,9 +556,9 @@ jobs:
         tar -xzf lccc-fast.tar.gz
         test "$(cat target/ci-build.commit)" = "$(git rev-parse HEAD)"
         sha256sum -c target/ci-build.sha256
-    # lane-split: 41 of 130 gate steps of the `frontend` lane, assigned
-    # lane-split: by longest-processing-time over measured cost (270 s of
-    # lane-split: 810 s). The preamble above is byte-identical in every
+    # lane-split: 44 of 138 gate steps of the `frontend` lane, assigned
+    # lane-split: by longest-processing-time over measured cost (273 s of
+    # lane-split: 817 s). The preamble above is byte-identical in every
     # lane-split: shard; tests/regression/check_ci_lane_plan.py fails if a gate disappears,
     # lane-split: is duplicated, or a shard drifts from this record.
     - name: Signed affine-step and signed index home contracts
@@ -582,6 +582,8 @@ jobs:
       run: python3 scripts/ci_test_report.py -- env CCC=target/fastbuild/lccc bash tests/regression/check_intrinsic_feature_gate.sh
     - name: Check GOT-slot references to local symbols
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_got_slot_local_addend.sh
+    - name: Attribute diagnostics match the GCC 16.2 classes
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_attribute_diagnostics.sh
     - name: Verify GCC provisioning contracts (mock only)
       run: python3 tests/regression/check_ci_gcc16_provisioning.py
     - name: Reproducer replay (pinned ISA, both legs)
@@ -780,9 +782,9 @@ jobs:
         tar -xzf lccc-fast.tar.gz
         test "$(cat target/ci-build.commit)" = "$(git rev-parse HEAD)"
         sha256sum -c target/ci-build.sha256
-    # lane-split: 45 of 130 gate steps of the `frontend` lane, assigned
+    # lane-split: 45 of 138 gate steps of the `frontend` lane, assigned
     # lane-split: by longest-processing-time over measured cost (270 s of
-    # lane-split: 810 s). The preamble above is byte-identical in every
+    # lane-split: 817 s). The preamble above is byte-identical in every
     # lane-split: shard; tests/regression/check_ci_lane_plan.py fails if a gate disappears,
     # lane-split: is duplicated, or a shard drifts from this record.
     - name: Vector arguments and returns at the compiler boundary
@@ -1051,9 +1053,9 @@ jobs:
         tar -xzf lccc-fast.tar.gz
         test "$(cat target/ci-build.commit)" = "$(git rev-parse HEAD)"
         sha256sum -c target/ci-build.sha256
-    # lane-split: 44 of 130 gate steps of the `frontend` lane, assigned
-    # lane-split: by longest-processing-time over measured cost (270 s of
-    # lane-split: 810 s). The preamble above is byte-identical in every
+    # lane-split: 49 of 138 gate steps of the `frontend` lane, assigned
+    # lane-split: by longest-processing-time over measured cost (273 s of
+    # lane-split: 817 s). The preamble above is byte-identical in every
     # lane-split: shard; tests/regression/check_ci_lane_plan.py fails if a gate disappears,
     # lane-split: is duplicated, or a shard drifts from this record.
     - name: Named-space pointer declarator levels
@@ -1097,6 +1099,8 @@ jobs:
           python3 scripts/ci_annotate_log.py --title "GNU vector alignment ABI" "$RUNNER_TEMP/gnu-vector-align-abi.log" || true
     - name: Inline-asm memory operands always carry an address
       run: env GCC=gcc-16 CCC=target/fastbuild/lccc python3 tests/regression/check_rmwcc_mem_operand.py
+    - name: Inline-asm operand and template diagnostics match GCC 16.2
+      run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_asm_operand_diagnostics.sh
     - name: One-lane ext_vector FP/int carrier correctness
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_lane1_abi.sh
     - name: Ill-typed builtin acceptance
@@ -1185,6 +1189,10 @@ jobs:
     # check_trapv_boundary_matrix.sh); this step is the rest of the contract.
     - name: Check driver option contracts (core)
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_driver_option_contract.sh --skip-trapv-matrix
+    - name: Lexer extensions and their diagnostics match GCC 16.2
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_lexer_extensions.sh
+    - name: Identifier UCN/UTF-8 character classes match GCC 16.2
+      run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_ucn_identifier_table.sh
     - name: Void declarators and initializers
       run: |
         set -o pipefail

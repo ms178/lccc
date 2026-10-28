@@ -2254,8 +2254,7 @@ impl ElfWriterBase {
                 }
                 result.push_str(resolved);
             } else {
-                result.push(c as char);
-                i += 1;
+                crate::backend::asm_preprocess::push_char_at(&mut result, expr, &mut i);
             }
         }
         result

@@ -2469,6 +2469,9 @@ impl Driver {
         if self.fcommon {
             for global in &mut module.globals {
                 if !global.is_common
+                    // `__attribute__((nocommon))` opts this object out of
+                    // common linkage even though -fcommon is in force.
+                    && !global.is_nocommon
                     && !global.is_extern
                     && !global.is_static
                     && !global.is_thread_local

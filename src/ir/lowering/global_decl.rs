@@ -435,6 +435,8 @@ impl Lowerer {
             has_explicit_align: false,
             is_const: false,
             is_used: false,
+            is_retain: false,
+            is_nocommon: false,
             is_thread_local: true,
         });
         self.emitted_global_names.insert(declarator.name.clone());
@@ -834,6 +836,43 @@ impl Lowerer {
                 }
             }
         }
+        // Object-placement attributes (GCC 16.2). Measured on `gcc-16 -c`:
+        //   `__attribute__((noinit))` on a zero-initialized object -> `.noinit`
+        //       (SHT_NOBITS); on an initialized one GCC warns
+        //       "ignoring 'noinit' attribute set on initialized variable".
+        //   `__attribute__((persistent))` on an initialized object -> `.persistent`
+        //       (PROGBITS); on a zero-initialized one GCC warns
+        //       "ignoring 'persistent' attribute set on uninitialized variable".
+        //   `__attribute__((retain))` keeps the object's *default* section and
+        //       adds SHF_GNU_RETAIN, in a section of its own
+        //       (`.data.<name>` / `.bss.<name>`) — handled by the backend,
+        //       which is the only place that knows the default section.
+        // An explicit `section(...)` wins over all three, as in GCC.
+        let explicit_section = declarator.attrs.section.clone();
+        let is_zero_init = matches!(init, GlobalInit::Zero);
+        let mut section = explicit_section;
+        if section.is_none() && declarator.attrs.is_noinit() {
+            if is_zero_init {
+                section = Some(".noinit".to_string());
+            } else {
+                self.diagnostics.borrow_mut().warning_with_kind(
+                    "ignoring 'noinit' attribute set on initialized variable",
+                    declarator.span,
+                    crate::common::error::WarningKind::Attributes,
+                );
+            }
+        }
+        if section.is_none() && declarator.attrs.is_persistent() {
+            if is_zero_init {
+                self.diagnostics.borrow_mut().warning_with_kind(
+                    "ignoring 'persistent' attribute set on uninitialized variable",
+                    declarator.span,
+                    crate::common::error::WarningKind::Attributes,
+                );
+            } else {
+                section = Some(".persistent".to_string());
+            }
+        }
         self.module.globals.push(IrGlobal {
             name: emit_name,
             ty: global_ty,
@@ -842,13 +881,18 @@ impl Lowerer {
             init,
             is_static: decl.is_static(),
             is_extern: is_extern_decl,
-            is_common: decl.is_common(),
-            section: declarator.attrs.section.clone(),
+            // `__attribute__((nocommon))` overrides `-fcommon`: the tentative
+            // definition becomes a real `.bss` object rather than a common
+            // block (GCC 16.2).
+            is_common: decl.is_common() && !declarator.attrs.is_nocommon(),
+            is_nocommon: declarator.attrs.is_nocommon(),
+            section,
             is_weak: declarator.attrs.is_weak() || prior_was_weak,
             visibility: declarator.attrs.visibility.clone(),
             has_explicit_align,
             is_const: var_is_const,
             is_used: declarator.attrs.is_used(),
+            is_retain: declarator.attrs.is_retain(),
             is_thread_local: decl.is_thread_local(),
         });
     }

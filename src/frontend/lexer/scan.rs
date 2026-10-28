@@ -101,8 +101,28 @@ impl Lexer {
 
             // Identifiers and keywords
             // GCC extension: '$' is allowed in identifiers (-fdollars-in-identifiers, on by default)
+            //
+            // Extended identifiers (C99 6.4.2.1, GCC 16.2 accepts all three
+            // spellings in every dialect):
+            //   `\uXXXX` / `\UXXXXXXXX` universal character names, and raw
+            //   UTF-8 encoded identifier characters. Both start here because
+            //   the leading byte is not ASCII-alphabetic.
             if ch == b'_' || ch == b'$' || ch.is_ascii_alphabetic() {
+                // `lex_identifier` extends itself into a UCN/UTF-8
+                // continuation, so the common case scans the name exactly once.
                 return self.lex_identifier(start);
+            }
+            if ch >= 0x80 || ch == b'\\' {
+                if let Some(tok) = self.try_lex_extended_identifier(start) {
+                    return tok;
+                }
+                if ch == b'\\' {
+                    // Not an identifier: a backslash outside a literal is the
+                    // stray '\' GCC reports.
+                    self.pos += 1;
+                    self.emit_lex_diag("stray '\\' in program", start, self.pos);
+                    continue;
+                }
             }
 
             // Punctuation and operators
@@ -1544,6 +1564,175 @@ impl Lexer {
         char::from_u32(val).unwrap_or('\u{FFFD}')
     }
 
+    /// Lex an identifier whose first byte is a `\\u`/`\\U` universal character
+    /// name or a UTF-8 lead byte. `self.pos` is still at `start`; `None` means
+    /// the bytes are not an identifier, so the caller falls through to its
+    /// stray-character handling.
+    fn try_lex_extended_identifier(&mut self, start: usize) -> Option<Token> {
+        let first = *self.input.get(start)?;
+        if first < 0x80 && first != b'\\' {
+            return None;
+        }
+        self.finish_extended_identifier(start, String::new())
+    }
+
+    /// Scan the rest of an identifier whose ASCII prefix `start..self.pos` is
+    /// already consumed and whose decoded text is `name` (empty when the name
+    /// starts with a UCN or a UTF-8 character).
+    ///
+    /// The decoded name is the UTF-8 spelling of the identifier, so
+    /// `caf\u00e9`, `café` and `caf\U000000E9` all intern to the same symbol,
+    /// which is what C99 6.4.2.1 requires (a UCN denotes the character, not a
+    /// textual escape).
+    ///
+    /// Validity is decided by the measured Annex D tables in
+    /// [`super::ucn_id_table`], not by a Unicode property: GCC 16.2 accepts
+    /// `€` and U+0301 and rejects U+00A9 and the private-use planes, and every
+    /// diagnostic below reuses GCC's wording because these messages are part
+    /// of the differential contract (see
+    /// `tests/regression/check_ucn_identifier_table.sh`).
+    fn finish_extended_identifier(&mut self, start: usize, mut name: String) -> Option<Token> {
+        use super::ucn_id_table::{is_identifier_continue, is_identifier_start};
+        let mut pos = self.pos.max(start);
+        loop {
+            let Some(&lead) = self.input.get(pos) else {
+                break;
+            };
+            let at_start = name.is_empty();
+            let (ch, len) = if lead == b'\\' {
+                let Some((value, len)) = Self::decode_identifier_ucn(&self.input[pos..]) else {
+                    // A malformed or truncated escape ends the identifier; the
+                    // backslash is then reported as a stray character.
+                    break;
+                };
+                let spelling = std::str::from_utf8(&self.input[pos..pos + len]).unwrap_or_default();
+                // GCC rejects a surrogate code point or anything above the
+                // 31-bit UCN range as "not a valid universal character", and
+                // reports the escape exactly as it was spelled (`\ud800`
+                // stays lower case).
+                let valid_char = value <= 0x7FFF_FFFF && !(0xD800..=0xDFFF).contains(&value);
+                let allowed = if valid_char {
+                    if at_start {
+                        is_identifier_start(value)
+                    } else {
+                        is_identifier_continue(value)
+                    }
+                } else {
+                    false
+                };
+                if !allowed {
+                    let message = if !valid_char {
+                        format!("{spelling} is not a valid universal character")
+                    } else if at_start && is_identifier_continue(value) {
+                        format!(
+                            "universal character {spelling} is not valid at the start of an identifier"
+                        )
+                    } else {
+                        format!("universal character {spelling} is not valid in an identifier")
+                    };
+                    // The escape remains part of the identifier: GCC reports a
+                    // single diagnostic here and keeps parsing, so the token
+                    // carries the decoded name.
+                    self.pos = pos + len;
+                    self.emit_lex_diag(message, start, self.pos);
+                    if valid_char {
+                        name.push(char::from_u32(value).unwrap_or('\u{FFFD}'));
+                    }
+                    return Some(Token::new(
+                        TokenKind::Identifier(name),
+                        Span::new(start as u32, self.pos as u32, self.file_id),
+                    ));
+                }
+                (char::from_u32(value).unwrap_or('\u{FFFD}'), len)
+            } else {
+                let len = match lead {
+                    0x00..=0x7F => 1,
+                    0xC0..=0xDF => 2,
+                    0xE0..=0xEF => 3,
+                    0xF0..=0xF7 => 4,
+                    _ => break,
+                };
+                if self.input.len() < pos + len {
+                    break;
+                }
+                match std::str::from_utf8(&self.input[pos..pos + len])
+                    .ok()
+                    .and_then(|s| s.chars().next())
+                {
+                    Some(c) => (c, len),
+                    None => break,
+                }
+            };
+            if lead != b'\\' && ch >= '\u{80}' {
+                // Raw UTF-8 is judged by the same table, with GCC's distinct
+                // wording for a character that may only appear inside an
+                // identifier (`extended character ́ is not valid at the start
+                // of an identifier`).
+                if at_start {
+                    if !is_identifier_start(ch as u32) {
+                        if is_identifier_continue(ch as u32) {
+                            self.pos = pos + len;
+                            self.emit_lex_diag(
+                                format!(
+                                    "extended character {ch} is not valid at the start of an identifier"
+                                ),
+                                start,
+                                self.pos,
+                            );
+                            name.push(ch);
+                            return Some(Token::new(
+                                TokenKind::Identifier(name),
+                                Span::new(start as u32, self.pos as u32, self.file_id),
+                            ));
+                        }
+                        return None;
+                    }
+                } else if !is_identifier_continue(ch as u32) {
+                    break;
+                }
+            } else if lead != b'\\' && !(ch == '_' || ch == '$' || ch.is_ascii_alphanumeric()) {
+                // ASCII that the caller did not consume: not an identifier
+                // character, and not this function's business.
+                if at_start {
+                    return None;
+                }
+                break;
+            }
+            pos += len;
+            name.push(ch);
+        }
+        if name.is_empty() {
+            return None;
+        }
+        self.pos = pos;
+        let span = Span::new(start as u32, pos as u32, self.file_id);
+        if let Some(kw) = TokenKind::from_keyword(&name, self.gnu_extensions, self.c23) {
+            return Some(Token::new(kw, span));
+        }
+        Some(Token::new(TokenKind::Identifier(name), span))
+    }
+
+    /// Decode one `\\uXXXX` / `\\UXXXXXXXX` universal character name at the
+    /// start of `input`, returning the code point (not a `char`: a surrogate or
+    /// an out-of-range value is diagnosed, not discarded) and the byte length
+    /// consumed. `None` when the bytes are not a well-formed 6/10-byte escape,
+    /// including a truncated one, which GCC also treats as not-a-UCN.
+    fn decode_identifier_ucn(input: &[u8]) -> Option<(u32, usize)> {
+        let digits = match input.get(1) {
+            Some(b'u') => 4,
+            Some(b'U') => 8,
+            _ => return None,
+        };
+        let mut value: u32 = 0;
+        for &b in input.get(2..2 + digits)? {
+            if !b.is_ascii_hexdigit() {
+                return None;
+            }
+            value = value * 16 + u32::from(hex_digit_val(b));
+        }
+        Some((value, 2 + digits))
+    }
+
     fn lex_identifier(&mut self, start: usize) -> Token {
         while self.pos < self.input.len()
             && (self.input[self.pos] == b'_'
@@ -1551,6 +1740,20 @@ impl Lexer {
                 || self.input[self.pos].is_ascii_alphanumeric())
         {
             self.pos += 1;
+        }
+        // An extended identifier may continue with a universal character name
+        // or a UTF-8 character (`café`, `caf\u00e9`). The ASCII prefix is
+        // already consumed, so the continuation is scanned from here instead of
+        // re-scanning the whole name.
+        if self
+            .input
+            .get(self.pos)
+            .is_some_and(|&b| b >= 0x80 || b == b'\\')
+        {
+            let name = String::from_utf8_lossy(&self.input[start..self.pos]).into_owned();
+            if let Some(tok) = self.finish_extended_identifier(start, name) {
+                return tok;
+            }
         }
 
         // Check for wide/unicode char/string prefixes: L'x', L"...", u'x', u"...", U'x', U"..."
@@ -1682,6 +1885,9 @@ impl Lexer {
             b'~' => TokenKind::Tilde,
             b'?' => TokenKind::Question,
             b':' => {
+                // Digraph `:>` is `]` (C95 6.4.6, accepted by GCC in every
+                // dialect; `:>` is the only spelling whose meaning changes
+                // when it is not recognised, so it is lexed here).
                 if self.input.get(self.pos) == Some(&b'>') {
                     self.pos += 1;
                     TokenKind::RBracket
@@ -1763,6 +1969,8 @@ impl Lexer {
                 }
             }
             b'%' => match self.input.get(self.pos) {
+                // Digraph punctuators (C95 6.4.6, accepted by GCC in every
+                // dialect): `%:` is `#`, `%:%:` is `##`, `%>` is `}`.
                 Some(b'=') => {
                     self.pos += 1;
                     TokenKind::PercentAssign
@@ -1843,10 +2051,12 @@ impl Lexer {
             b'<' => {
                 if self.pos < self.input.len() {
                     match self.input[self.pos] {
+                        // Digraph `<:` is `[` (C95 6.4.6).
                         b':' => {
                             self.pos += 1;
                             TokenKind::LBracket
                         }
+                        // Digraph `<%` is `{` (C95 6.4.6).
                         b'%' => {
                             self.pos += 1;
                             TokenKind::LBrace
@@ -1900,15 +2110,14 @@ impl Lexer {
                 // self.input[self.pos] instead skips its successor and reads
                 // past EOF for a final unknown byte.
                 let bad_start = start;
-                let bad = ch;
+                // A byte of a non-UTF-8 source file was re-encoded into the
+                // private use area on load; report the original byte, not the
+                // lead byte of its PUA encoding (`stray '\377'`, not `'\356'`).
+                let (bad, _) = decode_pua_byte(&self.input, start);
                 while self.pos < self.input.len() && (self.input[self.pos] & 0xC0) == 0x80 {
                     self.pos += 1;
                 }
-                self.emit_lex_diag(
-                    format!("unexpected character byte 0x{:02X} in source", bad),
-                    bad_start,
-                    self.pos,
-                );
+                self.emit_lex_diag(stray_character_message(bad), bad_start, self.pos);
                 return None;
             }
         };
@@ -1917,6 +2126,19 @@ impl Lexer {
             kind,
             Span::new(start as u32, self.pos as u32, self.file_id),
         ))
+    }
+}
+
+/// GCC 16.2's wording for a byte that cannot begin a token: a printable ASCII
+/// character is quoted as itself, anything else by its octal value
+/// (`stray '@' in program`, `stray '\1' in program`, `stray '\302' in program`
+/// — the last one is the lead byte of a multi-byte character that the
+/// identifier rules rejected).
+fn stray_character_message(byte: u8) -> String {
+    if byte.is_ascii_graphic() {
+        format!("stray '{}' in program", byte as char)
+    } else {
+        format!("stray '\\{:o}' in program", byte)
     }
 }
 
@@ -2030,7 +2252,7 @@ mod recovery_tests {
         assert_eq!(tokens.len(), 1);
         assert!(tokens[0].is_eof());
         assert_eq!(lexer.diagnostics.len(), 1);
-        assert!(lexer.diagnostics[0].0.contains("0x40"));
+        assert_eq!(lexer.diagnostics[0].0, "stray '@' in program");
         assert_eq!(lexer.diagnostics[0].1, Span::new(0, 1, 3));
     }
 
@@ -2045,12 +2267,139 @@ mod recovery_tests {
 
     #[test]
     fn unicode_recovery_preserves_complete_scalar_span() {
-        let mut lexer = Lexer::new("€;", 0);
+        // U+00A0 is the one UTF-8 class GCC 16.2 refuses in an identifier
+        // (`stray '\302' in program`): every non-whitespace code point,
+        // including `€`, is an identifier character there.
+        let mut lexer = Lexer::new("\u{a0};", 0);
         let tokens = lexer.tokenize();
         assert_eq!(tokens[0].kind, TokenKind::Semicolon);
-        assert_eq!(tokens[0].span, Span::new(3, 4, 0));
+        assert_eq!(tokens[0].span, Span::new(2, 3, 0));
         assert_eq!(lexer.diagnostics.len(), 1);
-        assert_eq!(lexer.diagnostics[0].1, Span::new(0, 3, 0));
+        assert_eq!(lexer.diagnostics[0].1, Span::new(0, 2, 0));
+    }
+
+    #[test]
+    fn non_ascii_identifiers_follow_gcc_not_xid() {
+        // Measured against GCC 16.2: `€` (Sc), U+200B (Cf), emoji and combining
+        // marks are accepted in identifiers, and `caf\u00e9`, `café` and
+        // `caf\U000000E9` must be the same identifier (C99 6.4.2.1).
+        let mut lexer = Lexer::new(r"caf\u00e9 caf\u00e92 caf\U000000E9", 0);
+        let tokens = lexer.tokenize();
+        assert!(lexer.diagnostics.is_empty(), "{:?}", lexer.diagnostics);
+        let names: Vec<_> = tokens
+            .iter()
+            .filter_map(|t| match &t.kind {
+                TokenKind::Identifier(n) => Some(n.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, vec!["café", "café2", "café"]);
+
+        let mut lexer = Lexer::new(r"int \u20ac = 1; int caf\u20ac = 2;", 0);
+        let tokens = lexer.tokenize();
+        assert!(lexer.diagnostics.is_empty(), "{:?}", lexer.diagnostics);
+        for want in ["€", "caf€"] {
+            assert!(
+                tokens
+                    .iter()
+                    .any(|t| matches!(&t.kind, TokenKind::Identifier(n) if n == want)),
+                "missing {want}"
+            );
+        }
+
+        // A UCN below U+00A0 (or a whitespace code point) is a hard error, and
+        // the token still carries the decoded name so parsing can continue.
+        for (src, bad) in [
+            (r"int \u0041bc = 1;", 0x41u32),
+            (r"int \u0024 = 1;", 0x24),
+            (r"int a\u00a0b = 1;", 0xa0),
+        ] {
+            let mut lexer = Lexer::new(src, 0);
+            lexer.tokenize();
+            assert_eq!(lexer.diagnostics.len(), 1, "{src}");
+            assert!(
+                lexer.diagnostics[0].0.contains(&format!("\\u{:04x}", bad)),
+                "{src}: {:?}",
+                lexer.diagnostics[0].0
+            );
+        }
+    }
+
+    #[test]
+    fn identifier_ucn_classes_follow_the_measured_annex_d_tables() {
+        use super::super::ucn_id_table::{is_identifier_continue, is_identifier_start};
+        // Accepted everywhere (Annex D.1). Each of these is outside
+        // `XID_Start`, so a Unicode-property approximation would reject them.
+        for cp in [
+            0xA8, 0xAA, 0xE9, 0x3B1, 0x203F, 0x20AC, 0x200B, 0xFFFD, 0x1F600,
+        ] {
+            assert!(
+                is_identifier_start(cp),
+                "U+{cp:04X} must start an identifier"
+            );
+            assert!(
+                is_identifier_continue(cp),
+                "U+{cp:04X} must continue an identifier"
+            );
+        }
+        // Accepted only inside an identifier (Annex D.2): combining marks.
+        for cp in [0x301, 0x345, 0x20D0, 0xFE20] {
+            assert!(
+                !is_identifier_start(cp),
+                "U+{cp:04X} must not start an identifier"
+            );
+            assert!(
+                is_identifier_continue(cp),
+                "U+{cp:04X} must continue an identifier"
+            );
+        }
+        // Rejected in both positions: Latin-1 symbols, private use, plane 16,
+        // and the ideographic space (all of them non-whitespace or whitespace,
+        // but none of them in Annex D).
+        for cp in [
+            0xA0, 0xA1, 0xA9, 0x1680, 0x2028, 0x3000, 0xE000, 0xF8FF, 0x10FFFF,
+        ] {
+            assert!(
+                !is_identifier_start(cp),
+                "U+{cp:04X} must not start an identifier"
+            );
+            assert!(
+                !is_identifier_continue(cp),
+                "U+{cp:04X} must not continue an identifier"
+            );
+        }
+        // Below U+00A0 the table is empty by construction (GCC rejects the whole
+        // range in an identifier), and the table must stay sorted and disjoint.
+        assert!(!is_identifier_continue(0x41));
+        let cont = super::super::ucn_id_table::ID_CONTINUE;
+        for pair in cont.windows(2) {
+            assert!(
+                pair[0].1 < pair[1].0,
+                "identifier_continue table is unsorted or overlapping at {:?}",
+                pair
+            );
+        }
+    }
+
+    #[test]
+    fn stray_characters_use_gcc_wording() {
+        // Measured: printable ASCII is quoted as itself, everything else in
+        // octal, and a byte of a non-UTF-8 file is reported as that byte rather
+        // than as the lead byte of its private-use carrier.
+        for (source, want) in [
+            ("int a@b;", "stray '@' in program"),
+            ("int a`b;", "stray '`' in program"),
+            ("int a\u{7f}b;", "stray '\\177' in program"),
+            ("int a\u{a9}b;", "stray '\\302' in program"),
+        ] {
+            let mut lexer = Lexer::new(source, 0);
+            lexer.tokenize();
+            assert!(
+                lexer.diagnostics.iter().any(|(m, _)| m == want),
+                "{source}: {:?}",
+                lexer.diagnostics
+            );
+        }
     }
 
     #[test]

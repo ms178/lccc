@@ -49,9 +49,12 @@ pub fn parse_section_flags(
                 'S' => flags |= SHF_STRINGS,
                 'T' => flags |= SHF_TLS,
                 'G' => flags |= SHF_GROUP,
-                // GNU as: sections with `R` are roots for --gc-sections.
+                // GNU as spells SHF_GNU_RETAIN as "R" (GCC emits it for
+                // `__attribute__((retain))`). The linker keeps a section alive
+                // through --gc-sections only when this bit is set.
                 'R' => flags |= SHF_GNU_RETAIN,
                 'o' => {} // SHF_LINK_ORDER - handle later
+                'e' => flags |= SHF_EXCLUDE,
                 _ => {}
             }
         }

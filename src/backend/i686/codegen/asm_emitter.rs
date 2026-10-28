@@ -55,6 +55,15 @@ impl InlineAsmEmitter for I686Codegen {
                 return AsmOperandKind::Tied(n);
             }
         }
+        // x87 FPU register class: "f" is GCC's "any 387 register"; the
+        // allocator picks st(0) for the first free slot, which is what the
+        // x87 stack machinery in `inline_asm.rs` preloads and stores from.
+        // Without this arm `"f"` fell through the catch-all below and was
+        // classified as a general-purpose register, so an x87 statement got a
+        // GPR substituted for an `st(...)` operand: silent wrong code.
+        if c == "f" {
+            return AsmOperandKind::X87St0;
+        }
         // x87 FPU stack constraints: "t" = st(0), "u" = st(1)
         if c == "t" {
             return AsmOperandKind::X87St0;
