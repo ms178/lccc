@@ -47,6 +47,21 @@ void c_arr_cast_store(unsigned long a) { ((volatile unsigned *)a)[1] = 1; ((vola
 void c_cast_read(unsigned long a) { unsigned x = *(volatile unsigned *)a; unsigned y = *(volatile unsigned *)a; (void)(x + y); }
 void c_cast_stmt_read(unsigned long a) { *(volatile unsigned *)a; *(volatile unsigned *)a; }
 void v_unused_member_read(volatile struct regs *r) { unsigned a = r->ctrl; unsigned b = r->ctrl; (void)(a + b); }
+
+/* The field itself, not just its enclosing aggregate, can be volatile. */
+struct fields { volatile int v; int plain; volatile unsigned bits:3; int *volatile vp; volatile int *target; };
+struct fields global_fields;
+struct outer_fields { struct fields nested; };
+struct anonymous_fields { union { volatile int v; int plain; }; };
+void local_field_reads(void) { struct fields s = {9}; s.v; s.v; }
+void global_field_reads(void) { global_fields.v; global_fields.v; }
+void pointer_field_reads(struct fields *s) { s->v; s->v; }
+int pointer_field_sum(struct fields *s) { return s->v + s->v; }
+void pointer_bitfield_reads(struct fields *s) { s->bits; s->bits; }
+void pointer_object_reads(struct fields *s) { s->vp; s->vp; }
+void nested_field_reads(struct outer_fields *s) { s->nested.v; s->nested.v; }
+void anonymous_field_reads(struct anonymous_fields *s) { s->v; s->v; }
+void plain_field_reads(struct fields *s) { s->plain; s->plain; s->target; s->target; }
 C
 
 # Store count: a mov with an immediate source to a memory operand.
@@ -95,8 +110,47 @@ for probe in m_ptr_store:store:2 m_obj_store:store:2 m_global_store:store:2 \
         fail=$((fail + 1))
     fi
 done
+# Count instructions with a simple memory source, not the initializer store.
+# Every positive field-only fixture entails two volatile reads; the plain
+# field and the nonvolatile pointer-to-volatile field are negative controls.
+count_source_loads() {
+    awk -v want="$2" '
+        /^[A-Za-z_][A-Za-z0-9_]*:/ { fn = $0; sub(/:.*/, "", fn) }
+        /^[ \t]+[a-z]+[ \t]+[^,]*\(%[a-z0-9]+\),/ && fn == want { n++ }
+        END { print n + 0 }' "$1"
+}
+for probe in local_field_reads:2 global_field_reads:2 pointer_field_reads:2 \
+    pointer_field_sum:2 pointer_bitfield_reads:2 pointer_object_reads:2 \
+    nested_field_reads:2 anonymous_field_reads:2 plain_field_reads:0; do
+    fn=${probe%%:*}
+    want=${probe##*:}
+    g=$(count_source_loads "$tmp/gcc.s" "$fn")
+    l=$(count_source_loads "$tmp/lccc.s" "$fn")
+    if [[ $g != "$want" || $l != "$want" ]]; then
+        echo "FAIL $fn: GCC 16.2 loads=$g, lccc loads=$l, expected $want" >&2
+        fail=$((fail + 1))
+    fi
+done
+cat > "$tmp/runtime.c" <<'C'
+struct S { volatile int v; int plain; volatile unsigned bits:3; int *volatile p; };
+static int k = 7;
+__attribute__((noinline)) int calc(struct S *s) {
+    int a = s->v + s->v;
+    int b = s->bits + s->bits;
+    return a + b + *s->p + s->plain;
+}
+int main(void) { struct S s = {5, 2, 3, &k}; return calc(&s) != 25; }
+C
+for compiler in "$GCC_ORACLE_BIN" "$CCC"; do
+    for level in 0 2 3; do
+        if ! "$compiler" -O"$level" "$tmp/runtime.c" -o "$tmp/runtime" || ! "$tmp/runtime"; then
+            echo "FAIL field-read runtime: $compiler -O$level" >&2
+            fail=$((fail + 1))
+        fi
+    done
+done
 if (( fail > 0 )); then
     echo "check_volatile_member_codegen: FAILED ($fail)" >&2
     exit 1
 fi
-echo "check_volatile_member_codegen: PASSED (15 functions, store and memory-reference counts match GCC 16.2)"
+echo "check_volatile_member_codegen: PASSED (24 functions; GCC 16.2 shapes and runtime)"

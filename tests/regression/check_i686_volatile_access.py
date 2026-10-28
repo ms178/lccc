@@ -20,16 +20,18 @@ def inspect(assembly: str, level: str) -> list[str]:
     errors = []
     stack_read = re.compile(r"(?m)^\s*(?:mov\w*|add\w*)\s+-?\d*\(%e(?:sp|bp)\),")
     stack_store = re.compile(r"(?m)^\s*mov\w*\s+(?:\$-?\d+|%[a-z]+),\s*-?\d*\(%e(?:sp|bp)\)")
-    for name, minimum in (("direct", 2), ("parameter", 2), ("byte_reads", 2), ("wide_reads", 4)):
+    for name, minimum in (("direct", 2), ("parameter", 2), ("byte_reads", 2), ("wide_reads", 4),
+                          ("local_field", 2)):
         actual = len(stack_read.findall(body(assembly, name)))
         if actual < minimum:
             errors.append(f"-O{level} {name}: {actual} stack reads, expected >= {minimum}")
     actual = len(stack_store.findall(body(assembly, "stores")))
     if actual < 2:
         errors.append(f"-O{level} stores: {actual} stack stores, expected >= 2")
-    actual = len(re.findall(r"(?m)^\s*mov\w*\s+\(%e[a-z]+\),", body(assembly, "indirect")))
-    if actual < 2:
-        errors.append(f"-O{level} indirect: {actual} volatile loads, expected >= 2")
+    for name in ("indirect", "pointer_field"):
+        actual = len(re.findall(r"(?m)^\s*mov\w*\s+\(%e[a-z]+\),", body(assembly, name)))
+        if actual < 2:
+            errors.append(f"-O{level} {name}: {actual} volatile loads, expected >= 2")
     if level in ("2", "3", "s") and stack_read.search(body(assembly, "plain_discard")):
         errors.append(f"-O{level} plain_discard: nonvolatile control still reads its stack")
     if "LCCC_VOLATILE_BEGIN" in assembly or "LCCC_VOLATILE_END" in assembly:

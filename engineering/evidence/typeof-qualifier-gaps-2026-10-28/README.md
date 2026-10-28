@@ -51,11 +51,15 @@ Its wide access still splits into multiple machine operations, unlike GCC
 wide-access parity. RISC-V still deletes ordinary local/parameter reads in
 `target-local-volatile.c` at `-O2`; x86-64 and AArch64 retain them.
 
-Another independent frontend/lowering gap is a discarded read of a volatile
-field of a nonvolatile local struct: GCC 16.2 retains both reads for
-`struct S { volatile int x; }; void f(void) { struct S s = {9}; s.x; s.x; }`,
-while current LCCC deletes them on x86-64. Existing member tests cover stores
-and reads through volatile base objects, not this field-only read.
+An independent member-access defect also deleted discarded reads of volatile
+fields in nonvolatile structs. Lowering now consults the field qualifier as
+well as the enclosing object. The GCC 16.2 member gate covers local, global,
+pointer, nested, anonymous-union, bitfield and volatile-pointer-object reads,
+plus nonvolatile field/pointer controls. The older compiler failed all eight
+positive x86-64 field-only probes. The i686 gate also checks local and
+pointer fields at five optimization levels; the older compiler lost both
+reads in each of those ten cases. Runtime checks passed with GCC 16.2 and
+LCCC on i686 at those five levels.
 
 A separate loss of qualifiers on ordinary file- and block-scope `extern`
 declarations has also been repaired. The volatile-access gate checks extern

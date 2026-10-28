@@ -24,9 +24,9 @@
 #
 # One documented exception: `f_field_twice` reads the `const volatile` member
 # `f` of a `const struct` global. GCC 16.2 folds that read to 2 (no memory
-# reference), which C11 6.7.3p7 does not allow. lccc keeps the read, as the
-# standard requires, and the pinned lccc count is 1. A GCC/standard divergence
-# is reported here, not silently matched.
+# reference), which C11 6.7.3p7 does not allow. lccc keeps both reads, as the
+# standard requires. A GCC/standard divergence is reported here, not silently
+# matched.
 #
 # At -O0 every local lives in the stack frame, so whole-function counts are
 # not meaningful. The -O0 check counts references to the global symbol only.
@@ -109,8 +109,8 @@ l=$(count_mem_refs "$tmp/lccc.s" f_field_twice)
 if [[ $g != 0 ]]; then
     echo "FAIL f_field_twice: GCC 16.2 count is $g; the documented divergence pins 0 (fixture or GCC drift)" >&2
     fail=$((fail + 1))
-elif [[ $l != 1 ]]; then
-    echo "FAIL f_field_twice: lccc memory-reference count is $l; the standard requires both volatile reads (pinned 1 load, the second read is reused from the first)" >&2
+elif [[ $l != 2 ]]; then
+    echo "FAIL f_field_twice: lccc memory-reference count is $l; the standard requires both volatile reads (pinned 2 loads)" >&2
     sed -n "/^f_field_twice:/,/\\.size f_field_twice,/p" "$tmp/lccc.s" >&2
     fail=$((fail + 1))
 fi
@@ -137,4 +137,4 @@ if (( fail > 0 )); then
     echo "check_const_volatile_objects: FAILED ($fail)" >&2
     exit 1
 fi
-echo "check_const_volatile_objects: PASSED (10 functions at -O2 and 4 symbol checks at -O0; volatile reads match GCC 16.2, non-volatile const controls still fold)"
+echo "check_const_volatile_objects: PASSED (10 functions at -O2, 4 symbol checks at -O0; GCC's const-member divergence pinned)"
