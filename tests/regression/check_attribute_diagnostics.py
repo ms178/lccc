@@ -92,6 +92,28 @@ PROBES = [
     ('ok-underscored-nothrow-leaf', 'void __attribute__((__nothrow__, __leaf__)) f(void){}', None, False),
     ('ok-nothrow', 'void __attribute__((nothrow)) f(void){}', None, False),
     ('ok-leaf', 'void __attribute__((leaf)) f(void){}', None, False),
+    # Function identity is determined by the final derived declarator, not by
+    # requiring a singleton Function list. Return pointers (including function
+    # pointers) must not turn valid attributes into default-on warnings.
+    ('ok-gnu-inline-pointer-return',
+     'extern inline __attribute__((gnu_inline)) void *f(void){return 0;}', None, False),
+    ('ok-noinline-pointer-return', 'int __attribute__((noinline)) *f(void);', None, False),
+    ('ok-const-void-pointer-return', 'void __attribute__((const)) *f(void);', None, False),
+    ('ok-pure-deep-pointer-return', 'void __attribute__((pure)) **f(void);', None, False),
+    ('ok-pure-function-pointer-return',
+     'void __attribute__((pure)) (*f(void))(int);', None, False),
+    ('ok-const-function-pointer-return',
+     'void __attribute__((const)) (*f(void))(int);', None, False),
+    ('ok-pure-typedef-pointer-return',
+     'typedef void *P; P __attribute__((pure)) f(void);', None, False),
+    ('ok-local-pointer-return',
+     'void g(void) { void __attribute__((pure)) *f(void); (void)f; }', None, False),
+    ('ignored-noreturn-pointer-object', 'int __attribute__((noreturn)) *p;',
+     "'noreturn' attribute ignored", False),
+    ('ignored-noinline-function-pointer-object', 'int __attribute__((noinline)) (*p)(void);',
+     "'noinline' attribute ignored", False),
+    ('ignored-cleanup-on-pointer-return-function', 'int __attribute__((cleanup(c))) *f(void);',
+     "'cleanup' attribute ignored", False),
 ]
 
 # Generated from the registry: GCC 16.2 knows these, lccc's dispatcher has
@@ -187,9 +209,12 @@ def main() -> int:
             failures.append((name, 'exit drift', grext, lex))
     for name, src in HEADER_PROBES:
         for label, cc in (('gcc', gcc), ('lccc', str(LCCC))):
-            rc, err = run(cc, src, ['-Wall', '-Wextra', '-Werror'])
-            if rc or err:
-                failures.append((name, f'{label} header probe must be silent', 0, (rc, err)))
+            # glibc selects additional extern-inline definitions when
+            # __OPTIMIZE__ is defined, notably bsearch returning void *.
+            for opt in ('-O0', '-O2', '-O3', '-Os'):
+                rc, err = run(cc, src, [opt, '-Wall', '-Wextra', '-Werror'])
+                if rc or err:
+                    failures.append((name, f'{label} {opt} header probe must be silent', 0, (rc, err)))
     # Inventory: explicit -Wattributes reports each pinned name; gcc stays
     # silent on the valid-target probe (the delta is exactly the pin).
     for n in UNIMPLEMENTED:
@@ -214,7 +239,7 @@ def main() -> int:
             print('  ', f)
         return 1
     print(f'PASS: attribute diagnostics match gcc-16.2 '
-          f'({len(PROBES)} probes + {len(HEADER_PROBES)} header probes + '
+          f'({len(PROBES)} probes + {len(HEADER_PROBES)} headers x 4 optimization levels + '
           f'{len(UNIMPLEMENTED)} pinned inventory names)')
     return 0
 

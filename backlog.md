@@ -1439,7 +1439,7 @@ completion. `OPEN` means the acceptance criterion has not been met or tested;
 
 | Item | Verdict | Observed evidence / remaining acceptance gap |
 |---|---|---|
-| GP-01 | PARTIAL | 22 attribute cases and two glibc header probes pass; 127 GCC-known names, 83 known-but-unimplemented inventory entries, and 48 implemented names (four are Clang-only). Semantic implementation of the 83 is not implied. |
+| GP-01 | PARTIAL | 33 attribute cases and two glibc headers at four optimization levels pass; 127 GCC-known names, 83 known-but-unimplemented inventory entries, and 48 implemented names (four are Clang-only). Semantic implementation of the 83 is not implied; function-typedef attribute diagnostics remain open. |
 | GP-02 | OPEN, wrong code | `ms_abi` four-int sentinel: GCC/GCC returns success; GCC caller + LCCC callee returns 42 instead of success; LCCC caller + GCC callee dies SIGSEGV. No complete mixed-ABI matrix. |
 | GP-03 | OPEN, wrong code | The C `retain` sentinel still emits plain `.data` with `WA`, versus GCC `.data.retained` with `WAR`; frontend propagation is absent. The five integrated assemblers now preserve a uniquely named `R` section and GNU OSABI, and x86-64 `ld -r` preserves R/non-R separation. Same-named assembler variants are refused, and LCCC i686 userspace GC remains unimplemented. This is infrastructure, not attribute support. |
 | GP-04 | OPEN, wrong code | x86 interrupt sentinel under `-mgeneral-regs-only`: GCC ends in `iretq`; LCCC ends in `ret`, without a diagnostic. Other contract attributes remain unaudited here. |

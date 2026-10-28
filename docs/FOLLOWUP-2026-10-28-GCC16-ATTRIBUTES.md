@@ -15,9 +15,10 @@ names incorrectly falling into the unknown-name class. The registry now has
 127 GCC-known names, of which 83 are inventoried as unimplemented; 48 are
 implemented, including four intentional Clang extensions that GCC itself does
 not recognize. The regression gate cross-checks the actual registry against
-its inventory, checks GCC and LCCC on 22 focused probes, and compiles two
-system-header translation units with `-Wall -Wextra -Werror`. It is wired into
-both the local and hosted CI mirrors. Explicit `-Wattributes` still reports
+its inventory, checks GCC and LCCC on 33 focused probes, and compiles two
+system-header translation units at four optimization levels with
+`-Wall -Wextra -Werror`. It is wired into both the local and hosted CI
+mirrors. Explicit `-Wattributes` still reports
 known-but-unimplemented attributes; accepting a name is not a claim that its
 semantics are implemented.
 
@@ -44,8 +45,9 @@ unchanged during this session.
   2.47, and mold 3.0.0. Eight GiB of swap is active.
 * `cargo build --profile fastbuild -j 2`, `cargo fmt --check`, and
   `cargo clippy --profile fastbuild -j 2 -- -D warnings`: PASS.
-* Attribute gate: PASS (22 focused probes, two header probes, 83 pinned names).
-  Diagnostic red team: PASS (999 contracts against exact GCC 16.2.0).
+* Attribute gate: PASS (33 focused probes, two header probes at four
+  optimization levels, 83 pinned names). Diagnostic red team: PASS (999
+  contracts against exact GCC 16.2.0).
   Operand, severity (39 verdicts), position (12 cases), warning-compatibility,
   and frontend-recovery gates: PASS. Census ratchet: PASS.
 * Offline-deb tests: PASS (six tests including archive traversal, cross-package
@@ -57,6 +59,20 @@ unchanged during this session.
   headers were copied into the private root because the multilib package is
   only a delta. GCC and LCCC each built and ran a 32-bit stdio probe using the
   private dynamic interpreter. This is not a host-wide multilib installation.
+
+## Optimized header diagnostic correction
+
+The first hosted ICX integration run failed its volatile-reduction step; the
+hosted log was unavailable, so its exact cause is unconfirmed. The same LCCC
+`-O3 -Wall -Wextra -Werror` command failed locally on glibc's optimized
+`bsearch` inline definition: a function returning `void *` was mistaken for a
+non-function. Attribute checks now use the canonical declarator predicate and
+return-pointer depth. GCC/LCCC differential controls cover pointer and
+function-pointer returns, local declarations, genuine void returns, and
+function-pointer objects. Both volatile workloads compile warning-free at
+`-O3`, and their GCC/LCCC output agrees for 12 arguments each. GCC-silent
+function typedef declarations can still trigger a false attribute warning;
+resolving typedef function layers requires further scope-aware work.
 
 ## Remaining work and limits
 

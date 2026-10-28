@@ -22,8 +22,9 @@ On those bounded tests, **8 of 24 items are partial, 16 remain open, and none
 is certified complete**. A passing sentinel is not an acceptance suite.
 
 * GP-01: 127 GCC-known names, 83 inventoried as unimplemented, 48 implemented
-  names including four non-GCC Clang extensions; 22 attribute and two glibc
-  header probes pass. This inventory does not implement the 83 names.
+  names including four non-GCC Clang extensions; 33 attribute probes and two
+  glibc headers at four optimization levels pass. This inventory does not
+  implement the 83 names; function-typedef attribute diagnostics remain open.
 * GP-02/03/04: `ms_abi`, frontend `retain`, and x86 `interrupt` remain
   correctness hazards. Mixed GCC/LCCC `ms_abi` links returned 42 or SIGSEGV;
   retained C data lacked `R`; an interrupt function ended in `ret`, not

@@ -2024,19 +2024,11 @@ impl Parser {
         if recorded.is_empty() {
             return;
         }
-        // The OUTERMOST derived names the declaration kind: `void *f(int)`
-        // is [Pointer, Function] (a function — gcc is silent on
-        // `extern __inline __attribute__((gnu_inline)) void *f(int);`),
-        // while `int (*fp)(void)` is [Function, Pointer] (an object).
-        // A single-element slice match misclassified every
-        // pointer-returning function as an object and fired
-        // `'__gnu_inline__' attribute ignored` on glibc's stdlib-bsearch.h.
-        let is_function = matches!(
-            derived.last(),
-            Some(crate::frontend::parser::ast::DerivedDeclarator::Function(
-                ..
-            ))
-        );
+        // The final derived layer names the declaration kind: `void *f(int)`
+        // is a function, while `int (*fp)(void)` is an object. This also
+        // covers glibc's pointer-returning `__gnu_inline__` prototypes.
+        let is_function =
+            crate::frontend::parser::ast::DerivedDeclarator::declares_function(derived);
         let is_record = matches!(
             type_spec,
             TypeSpecifier::Struct(..) | TypeSpecifier::Union(..)
@@ -2045,7 +2037,8 @@ impl Parser {
         // violation for it (a false `attribute ignored` would be worse than
         // a missed one on a record typedef).
         let is_typedef = matches!(type_spec, TypeSpecifier::TypedefName(_));
-        let returns_void = matches!(type_spec, TypeSpecifier::Void);
+        let returns_void = matches!(type_spec, TypeSpecifier::Void)
+            && crate::frontend::parser::ast::DerivedDeclarator::return_pointer_depth(derived) == 0;
         for (name, span, target) in recorded {
             if returns_void && is_function && matches!(name.as_str(), "const" | "pure") {
                 self.diagnostics.warning_with_kind(
