@@ -462,6 +462,8 @@ gate "binary-equivalence-contracts" fast \
 
 gate "benchmark-harness-contracts" fast \
     python3 tests/benchmark/test_benchmark_harness.py
+gate "zlib-compare256-correctness" fast \
+    python3 tests/regression/check_zlib_compare256.py --lccc "$LCCC" --gcc "${GCC16:-gcc-16}" --m32
 
 gate "label-reference-cost-contracts" fast \
     python3 scripts/test_measure_label_ref_cost.py
@@ -786,11 +788,21 @@ gate "c23-compatibility-inventory" fast \
     python3 tests/regression/check_c23_inventory.py \
         --lccc "$LCCC" --gcc "${GCC16:-gcc-16}" \
         --json target/c23-inventory.json --markdown target/c23-inventory.md
+# Digraph spelling is observable in macro stringification; this also exercises
+# directives, token boundaries, maximal munch and native/i686 execution.
+gate "c-digraphs" fast \
+    python3 tests/regression/check_c_digraphs.py \
+        --lccc "$LCCC" --gcc "${GCC16:-gcc-16}" --m32
 # GCC warning-group parity and DWARF line/link preservation are cheap focused
 # gates; keeping them in the local mirror prevents hosted-only drift.
 gate "warning-compatibility" fast \
     python3 tests/regression/check_warning_compat.py \
         --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"
+gate "warning-precedence" fast \
+    python3 tests/regression/check_warning_precedence.py \
+        --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"
+gate "attribute-diagnostics" fast \
+    env GCC="${GCC16:-gcc-16}" python3 tests/regression/check_attribute_diagnostics.py
 gate "dwarf-line-tables" fast \
     python3 tests/regression/check_dwarf_line_tables.py \
         --lccc "$LCCC" --lccc-i686 target/fastbuild/lccc-i686 \
@@ -1492,6 +1504,9 @@ gate "asm-char-and-macro-defaults" fast \
     CCC_ARM=target/fastbuild/lccc-arm \
     CCC_RISCV=target/fastbuild/lccc-riscv \
     python3 tests/regression/check_asm_char_and_macro_defaults.py
+
+gate "gnu-retain-sections" fast \
+    python3 tests/regression/check_gnu_retain_sections.py --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"
 
 # The debug knobs this series documents (`CCC_DEBUG_VOLRED`,
 # `CCC_DEBUG_STATIC_INIT`, `CCC_DEBUG_TYPES_COMPATIBLE`) may explain a decision
@@ -2839,6 +2854,8 @@ fi
 # have shipped wrong answers before, which is why they are asserted.
 gate "godbolt-oracle-selftest" fast \
     python3 tools/oracle/godbolt_oracle_selftest.py
+gate "godbolt-explicit-local-selftest" fast \
+    python3 tests/corpus/test_godbolt_explicit_local.py
 
 # One CE cache now backs four tools, and every way it can be wrong is silent:
 # a forgeable key serves one program's result for another's, a truncated

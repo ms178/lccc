@@ -1681,7 +1681,14 @@ impl Lexer {
             b',' => TokenKind::Comma,
             b'~' => TokenKind::Tilde,
             b'?' => TokenKind::Question,
-            b':' => TokenKind::Colon,
+            b':' => {
+                if self.input.get(self.pos) == Some(&b'>') {
+                    self.pos += 1;
+                    TokenKind::RBracket
+                } else {
+                    TokenKind::Colon
+                }
+            }
             b'#' => {
                 if self.pos < self.input.len() && self.input[self.pos] == b'#' {
                     self.pos += 1;
@@ -1755,14 +1762,26 @@ impl Lexer {
                     TokenKind::Slash
                 }
             }
-            b'%' => {
-                if self.pos < self.input.len() && self.input[self.pos] == b'=' {
+            b'%' => match self.input.get(self.pos) {
+                Some(b'=') => {
                     self.pos += 1;
                     TokenKind::PercentAssign
-                } else {
-                    TokenKind::Percent
                 }
-            }
+                Some(b'>') => {
+                    self.pos += 1;
+                    TokenKind::RBrace
+                }
+                Some(b':') => {
+                    self.pos += 1;
+                    if self.input.get(self.pos..self.pos + 2) == Some(b"%:") {
+                        self.pos += 2;
+                        TokenKind::HashHash
+                    } else {
+                        TokenKind::Hash
+                    }
+                }
+                _ => TokenKind::Percent,
+            },
             b'&' => {
                 if self.pos < self.input.len() {
                     match self.input[self.pos] {
@@ -1824,6 +1843,14 @@ impl Lexer {
             b'<' => {
                 if self.pos < self.input.len() {
                     match self.input[self.pos] {
+                        b':' => {
+                            self.pos += 1;
+                            TokenKind::LBracket
+                        }
+                        b'%' => {
+                            self.pos += 1;
+                            TokenKind::LBrace
+                        }
                         b'<' => {
                             self.pos += 1;
                             if self.pos < self.input.len() && self.input[self.pos] == b'=' {
@@ -1905,6 +1932,39 @@ fn hex_digit_val(c: u8) -> u8 {
 #[cfg(test)]
 mod recovery_tests {
     use super::*;
+
+    #[test]
+    fn digraph_tokens_keep_source_spans_and_maximal_munch() {
+        let input = "<: :> <% %> %: %:%: <%: <<%:";
+        let mut lexer = Lexer::new(input, 0);
+        let tokens = lexer.tokenize();
+        let kinds: Vec<_> = tokens.iter().map(|token| token.kind.clone()).collect();
+        assert_eq!(
+            kinds,
+            [
+                TokenKind::LBracket,
+                TokenKind::RBracket,
+                TokenKind::LBrace,
+                TokenKind::RBrace,
+                TokenKind::Hash,
+                TokenKind::HashHash,
+                TokenKind::LBrace,
+                TokenKind::Colon,
+                TokenKind::LessLess,
+                TokenKind::Hash,
+                TokenKind::Eof,
+            ]
+        );
+        let spellings: Vec<_> = tokens[..tokens.len() - 1]
+            .iter()
+            .map(|token| &input[token.span.start as usize..token.span.end as usize])
+            .collect();
+        assert_eq!(
+            spellings,
+            ["<:", ":>", "<%", "%>", "%:", "%:%:", "<%", ":", "<<", "%:"]
+        );
+        assert!(lexer.diagnostics.is_empty());
+    }
 
     #[test]
     fn hexadecimal_literals_round_directly_to_their_token_type() {

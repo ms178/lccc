@@ -1600,9 +1600,28 @@ impl<A: X86Arch> ElfWriterCore<A> {
         // GCC -fexceptions object ("changed section attributes").
         if let Some(&idx) = self.section_map.get(&dir.name) {
             if dir.flags.as_deref().is_none_or(str::is_empty) {
+                // GAS treats a bare or empty-flags directive as the non-R
+                // variant, not as a re-entry into a retained section. Our
+                // writer cannot yet represent same-named R/non-R sections;
+                // reject instead of silently retaining the wrong content.
+                if self.sections[idx].flags & elf_mod::SHF_GNU_RETAIN != 0 {
+                    return Err(format!(
+                        "same-named retained and non-retained sections are not yet supported: {}",
+                        dir.name
+                    ));
+                }
                 flags = self.sections[idx].flags;
             }
             if dir.section_type.is_none() {
+                // With explicit nonempty R flags GAS applies the name's
+                // default type. A custom NOBITS section re-entered without
+                // `@nobits` is an error, not a switch to its old type.
+                if self.sections[idx].flags & elf_mod::SHF_GNU_RETAIN != 0
+                    && dir.flags.as_deref().is_some_and(|f| !f.is_empty())
+                    && section_type != self.sections[idx].section_type
+                {
+                    return Err(format!("changed section attributes for {}", dir.name));
+                }
                 section_type = self.sections[idx].section_type;
             }
         }

@@ -135,6 +135,46 @@ class MainContract(unittest.TestCase):
             self.assertEqual(len(doc['paths']['mine']),len(doc['paths']['ref']));self.assertEqual(Path(doc['paths']['mine']).name,'aa');self.assertEqual(Path(doc['paths']['ref']).name,'bb')
             self.assertTrue(doc['results']['fib']['correctness']['mine']['stdout_sha256'])
             self.assertIn('not PMU',doc['model'])
+
+    def test_registered_semantics_reach_both_arms_after_caller_flags(self):
+        for name in ('arith_loop','loop_patterns','switch_dispatch'):
+            seen=[]
+            def compiler(cmd,opt,src,out,**kw):
+                seen.append((cmd,list(opt)))
+                out.write_bytes(b'dummy');out.chmod(0o755)
+                cg.run_recorded([cmd,str(src),'-o',str(out)],180,str(out)+'.compile')
+            with self.subTest(workload=name),tempfile.TemporaryDirectory() as td, \
+                 mock.patch.object(cg,'compile_program',side_effect=compiler), \
+                 mock.patch.object(cg,'tool_identity',return_value={'version':'mock','sha256':'a'*64}), \
+                 mock.patch.object(cg,'gcc_include',return_value='-Ifake'), \
+                 mock.patch.object(cg,'_run',return_value=result()), \
+                 mock.patch.object(cg,'callgrind',return_value=(ev(),None,{'mock':True})):
+                code=cg.main(['mock-mine','mock-ref','--opt=-O2 -fno-wrapv',name,'--out-root',td])
+                self.assertEqual(code,0)
+                self.assertEqual(len(seen),2)
+                for _,opts in seen:
+                    self.assertGreater(opts.index('-fwrapv'),opts.index('-fno-wrapv'))
+                contract=schema.loads((Path(td)/'manifest.json').read_text())['results'][name]['workload']
+                self.assertEqual(contract['registry_id'],name)
+                self.assertEqual(contract['effective_opt_tokens'],seen[0][1])
+                self.assertIn('-fwrapv',contract['registry_flags'])
+
+    def test_shared_sources_need_the_right_registry_identity_and_sizing_override(self):
+        with self.assertRaisesRegex(ValueError,'ambiguous'):
+            cg.workload_contract('fp_product_map')
+        item,source=cg.workload_contract('fp_product_map','fp64_product_map')
+        self.assertEqual(item.name,'fp64_product_map')
+        self.assertEqual(source.name,'fp_product_map.c')
+        options,registry,overrides=cg.effective_workload_options(['-O2'],item)
+        self.assertIn('-DFP_MAP_DOUBLE',options)
+        self.assertEqual(overrides,[])
+        item,source=cg.workload_contract('linux_find_bit','linux_find_bit_scaled')
+        options,registry,overrides=cg.effective_workload_options(['-O2','-DPASSES=128'],item)
+        self.assertIn('-DPASSES=128',options)
+        self.assertNotIn('-DPASSES=65536',options)
+        self.assertEqual(overrides,['-DPASSES=65536'])
+        with self.assertRaisesRegex(ValueError,'does not name'):
+            cg.workload_contract('fib','switch_dispatch')
     def test_zero_Ir_failure_manifest_not_division_or_log_error(self):
         with tempfile.TemporaryDirectory() as td:
             root=Path(td);self.assertEqual(self.mock_measurement(root,ev(0)),2)

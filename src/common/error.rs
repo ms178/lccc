@@ -137,165 +137,231 @@ pub enum WarningKind {
     PointerToIntCast,
 }
 
-impl WarningKind {
-    /// The GCC-compatible flag name for this warning (without the -W prefix).
-    pub fn flag_name(self) -> &'static str {
-        match self {
-            WarningKind::Undeclared => "undeclared",
-            WarningKind::ImplicitFunctionDeclaration => "implicit-function-declaration",
-            WarningKind::Cpp => "cpp",
-            WarningKind::ReturnType => "return-type",
-            WarningKind::IncompatiblePointerTypes => "incompatible-pointer-types",
-            WarningKind::Attributes => "attributes",
-            WarningKind::UnusedVariable => "unused-variable",
-            WarningKind::SignCompare => "sign-compare",
-            WarningKind::Format => "format",
-            WarningKind::FormatSecurity => "format-security",
-            WarningKind::ImplicitInt => "implicit-int",
-            WarningKind::ReturnMismatch => "return-mismatch",
-            WarningKind::IntConversion => "int-conversion",
-            WarningKind::PointerToIntCast => "pointer-to-int-cast",
-        }
-    }
+/// Supported warning groups. `-Wall` and `-Wextra` are broad groups;
+/// `-Wimplicit` and `-Wunused` are more specific subgroups.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WarningGroup {
+    All,
+    Extra,
+    Implicit,
+    Unused,
+    // Reserved for warnings implemented by the future GP-10 pedantic work.
+    Pedantic,
+}
 
-    /// Parse a warning flag name (without the -W prefix) into a WarningKind.
-    /// Returns None for unrecognized names (which are silently ignored, matching GCC).
-    pub fn from_flag_name(name: &str) -> Option<Self> {
+impl WarningGroup {
+    fn from_flag_name(name: &str) -> Option<Self> {
         match name {
-            "undeclared" => Some(WarningKind::Undeclared),
-            "implicit-function-declaration" => Some(WarningKind::ImplicitFunctionDeclaration),
-            "implicit" => Some(WarningKind::ImplicitFunctionDeclaration),
-            "cpp" => Some(WarningKind::Cpp),
-            "return-type" => Some(WarningKind::ReturnType),
-            "incompatible-pointer-types" => Some(WarningKind::IncompatiblePointerTypes),
-            "attributes" => Some(WarningKind::Attributes),
-            "unused-variable" => Some(WarningKind::UnusedVariable),
-            "sign-compare" => Some(WarningKind::SignCompare),
-            "format" => Some(WarningKind::Format),
-            "format-security" => Some(WarningKind::FormatSecurity),
-            "implicit-int" => Some(WarningKind::ImplicitInt),
-            "return-mismatch" => Some(WarningKind::ReturnMismatch),
-            "int-conversion" => Some(WarningKind::IntConversion),
-            "pointer-to-int-cast" => Some(WarningKind::PointerToIntCast),
+            "all" => Some(Self::All),
+            "extra" => Some(Self::Extra),
+            "implicit" => Some(Self::Implicit),
+            "unused" => Some(Self::Unused),
+            // Do not claim -Wpedantic is implemented merely because its
+            // membership slot exists: no pedantic diagnostics are implemented.
             _ => None,
         }
     }
 
-    /// The kinds GCC 16.2 makes default *errors* in every dialect from C99
-    /// onward (measured: `-std=gnu17` and `-std=gnu23` reject with exit 1,
-    /// `-std=gnu90` only warns with exit 0). The driver seeds these into
-    /// [`WarningConfig::default_errors`] after CLI parsing unless the user demoted
-    /// them explicitly (`-Wno-error=<name>` wins; a disabled warning is
-    /// suppressed before severity is consulted).
-    pub fn gcc162_c99_default_error_kinds() -> &'static [WarningKind] {
-        &[
-            WarningKind::ImplicitFunctionDeclaration,
-            WarningKind::ImplicitInt,
-            WarningKind::ReturnMismatch,
-            WarningKind::IntConversion,
-            WarningKind::IncompatiblePointerTypes,
-        ]
-    }
-
-    /// All warning kinds that are enabled by -Wall.
-    pub fn wall_set() -> &'static [WarningKind] {
-        &[
-            WarningKind::ImplicitFunctionDeclaration,
-            WarningKind::Cpp,
-            WarningKind::ReturnType,
-            WarningKind::IncompatiblePointerTypes,
-            WarningKind::UnusedVariable,
-            WarningKind::Format,
-            // WarningKind::Undeclared is now a hard error, not a warning
-        ]
-    }
-
-    /// All warning kinds that are enabled by -Wextra (in addition to -Wall).
-    pub fn wextra_set() -> &'static [WarningKind] {
-        // GCC enables -Wsign-compare in C with -Wextra.
-        &[WarningKind::SignCompare]
-    }
-
-    /// Warning kinds emitted without an enabling -W flag. Keep the existing
-    /// default diagnostics stable; new parity warnings are opt-in through
-    /// their GCC-compatible group or individual switch.
-    fn default_set() -> &'static [WarningKind] {
-        &[
-            WarningKind::Undeclared,
-            WarningKind::ImplicitFunctionDeclaration,
-            WarningKind::Cpp,
-            WarningKind::ReturnType,
-            WarningKind::IncompatiblePointerTypes,
-            WarningKind::Attributes,
-            WarningKind::ImplicitInt,
-            WarningKind::ReturnMismatch,
-            WarningKind::IntConversion,
-            WarningKind::PointerToIntCast,
-        ]
+    fn priority(self) -> u8 {
+        match self {
+            Self::All | Self::Extra | Self::Pedantic => 1,
+            Self::Implicit | Self::Unused => 2,
+        }
     }
 }
 
-/// Configuration for warning behavior: which warnings are enabled,
-/// and which are promoted to errors.
-///
-/// Processed from CLI flags in left-to-right order.
+/// Single source of truth for each modeled warning's spelling and policy.
+#[derive(Debug, Clone, Copy)]
+pub struct WarningDescriptor {
+    pub kind: WarningKind,
+    pub name: &'static str,
+    pub default_on: bool,
+    pub groups: &'static [WarningGroup],
+    pub c99_default_error: bool,
+    pub description: &'static str,
+}
+
+macro_rules! warning {
+    ($kind:ident, $name:literal, $default:expr, [$($group:ident),* $(,)?], $c99:expr, $description:literal) => {
+        WarningDescriptor {
+            kind: WarningKind::$kind,
+            name: $name,
+            default_on: $default,
+            groups: &[$(WarningGroup::$group),*],
+            c99_default_error: $c99,
+            description: $description,
+        }
+    };
+}
+
+/// GCC 16.2 C warning membership, measured with positive and negative flags.
+/// `Undeclared` is a compatibility-only switch; the corresponding condition is
+/// a hard error, not an emitted warning. Pedantic has no implemented members.
+pub const WARNING_REGISTRY: &[WarningDescriptor] = &[
+    warning!(
+        Undeclared,
+        "undeclared",
+        true,
+        [],
+        false,
+        "compatibility-only undeclared name switch"
+    ),
+    warning!(
+        ImplicitFunctionDeclaration,
+        "implicit-function-declaration",
+        true,
+        [All, Implicit],
+        true,
+        "undeclared function call"
+    ),
+    warning!(Cpp, "cpp", true, [], false, "preprocessor #warning"),
+    warning!(
+        ReturnType,
+        "return-type",
+        false,
+        [All],
+        false,
+        "control reaches end of a non-void function"
+    ),
+    warning!(
+        IncompatiblePointerTypes,
+        "incompatible-pointer-types",
+        true,
+        [],
+        true,
+        "incompatible pointer conversion"
+    ),
+    warning!(
+        Attributes,
+        "attributes",
+        true,
+        [],
+        false,
+        "ignored or inapplicable attribute"
+    ),
+    warning!(
+        UnusedVariable,
+        "unused-variable",
+        false,
+        [All, Unused],
+        false,
+        "unused block-scope variable"
+    ),
+    warning!(
+        SignCompare,
+        "sign-compare",
+        false,
+        [Extra],
+        false,
+        "mixed-sign integer comparison"
+    ),
+    warning!(
+        Format,
+        "format",
+        false,
+        [All],
+        false,
+        "invalid printf-family argument"
+    ),
+    warning!(
+        FormatSecurity,
+        "format-security",
+        false,
+        [],
+        false,
+        "nonliteral format without arguments"
+    ),
+    warning!(
+        ImplicitInt,
+        "implicit-int",
+        true,
+        [All, Implicit],
+        true,
+        "implicit int declaration"
+    ),
+    warning!(
+        ReturnMismatch,
+        "return-mismatch",
+        true,
+        [],
+        true,
+        "return value incompatible with function type"
+    ),
+    warning!(
+        IntConversion,
+        "int-conversion",
+        true,
+        [],
+        true,
+        "integer and pointer conversion without a cast"
+    ),
+    warning!(
+        PointerToIntCast,
+        "pointer-to-int-cast",
+        true,
+        [],
+        false,
+        "pointer-to-integer cast of a different width"
+    ),
+];
+
+impl WarningKind {
+    fn descriptor(self) -> &'static WarningDescriptor {
+        WARNING_REGISTRY
+            .iter()
+            .find(|entry| entry.kind == self)
+            .expect("every WarningKind must have a registry row")
+    }
+
+    /// The GCC-compatible flag name (without the -W prefix).
+    pub fn flag_name(self) -> &'static str {
+        self.descriptor().name
+    }
+
+    /// Parse a *leaf* warning name. `implicit` is a group, not an alias for
+    /// implicit-function-declaration: it also enables implicit-int.
+    pub fn from_flag_name(name: &str) -> Option<Self> {
+        WARNING_REGISTRY
+            .iter()
+            .find(|entry| entry.name == name)
+            .map(|entry| entry.kind)
+    }
+}
+
+/// Warning selection and severity. More specific enable/disable options beat
+/// less specific groups regardless of ordering; within a specificity level the
+/// last option wins (GCC 16.2). Severity demotion has its own GCC rules.
 #[derive(Debug, Clone)]
 pub struct WarningConfig {
-    /// Per-warning enabled state. Warnings not in this set are suppressed.
     enabled: crate::common::fx_hash::FxHashSet<WarningKind>,
-    /// Per-warning error promotion. Warnings in this set are emitted as errors.
+    /// Highest CLI selection specificity seen for a kind; defaults have no
+    /// entry, broad groups have priority 1, subgroups 2, leaf switches 3.
+    enable_priority: crate::common::fx_hash::FxHashMap<WarningKind, u8>,
     errors: crate::common::fx_hash::FxHashSet<WarningKind>,
-    /// Per-warning error DEMOTION (`-Wno-error=<name>`): never an error, even
-    /// under a global `-Werror` given before or after it (GCC 16.2, measured).
-    /// The last of `-Werror=<name>` / `-Wno-error=<name>` decides.
     not_errors: crate::common::fx_hash::FxHashSet<WarningKind>,
-    /// Kinds that are errors by GCC 16.2's *dialect default severity*
-    /// (`-Wimplicit-int` and friends from C99 on) rather than by an
-    /// explicit `-Werror=<name>` request. Kept separate because GCC
-    /// prints the plain `[-W<name>]` suffix for default-severity errors
-    /// but `[-Werror=<name>]` for an explicit promotion (measured), and
-    /// so `-Wno-error=<name>` can undo exactly this class at any point.
     default_errors: crate::common::fx_hash::FxHashSet<WarningKind>,
-    /// Kinds the user explicitly requested with a positive `-W<name>` or
-    /// `-Werror=<name>` flag. GCC 16.2 (measured): in gnu90 an explicit
-    /// `-Wimplicit-int` or `-Wimplicit-function-declaration` still warns
-    /// while the diagnostic is silent by default, so default suppression
-    /// must not swallow an explicit request.
     explicit_enable: crate::common::fx_hash::FxHashSet<WarningKind>,
-    /// Whether `-Wall`/`-Wextra` was requested (GCC 16.2, measured:
-    /// `-Wall -std=gnu90` still warns implicit function declarations).
-    wall_requested: bool,
-    /// Pre-C99 implicit return types belong to -Wreturn-type under -Wall
-    /// or an explicit -Wreturn-type request, not to the C99 constraint class.
     legacy_implicit_return_type: bool,
-    /// -fpermissive demotes dialect-default constraints, not explicit -Werror.
     permissive: Option<bool>,
-    /// A bare return in a value-returning function is gated by -Wreturn-type
-    /// before C99; a value returned from void is independently default-on.
     bare_return_enabled: bool,
-    /// Global -Werror flag: promote ALL warnings to errors.
     pub werror_all: bool,
-    /// Global `-w` flag: inhibit ALL warning messages.  Measured against
-    /// GCC 16.2 (2026-10-17): `-w` wins regardless of position (`-w -Wall`
-    /// and `-Wall -w` are both silent, including `#warning` directives), so
-    /// this is a sticky latch that `enable`/`enable_wall` never clear.
     inhibit_all: bool,
 }
 
 impl WarningConfig {
-    /// Create a default config with existing default diagnostics enabled and none promoted to errors.
     pub fn new() -> Self {
-        let mut enabled = crate::common::fx_hash::FxHashSet::default();
-        for &kind in WarningKind::default_set() {
-            enabled.insert(kind);
-        }
+        let enabled = WARNING_REGISTRY
+            .iter()
+            .filter(|entry| entry.default_on)
+            .map(|entry| entry.kind)
+            .collect();
         Self {
             enabled,
+            enable_priority: crate::common::fx_hash::FxHashMap::default(),
             errors: crate::common::fx_hash::FxHashSet::default(),
             not_errors: crate::common::fx_hash::FxHashSet::default(),
             default_errors: crate::common::fx_hash::FxHashSet::default(),
             explicit_enable: crate::common::fx_hash::FxHashSet::default(),
-            wall_requested: false,
             legacy_implicit_return_type: false,
             permissive: None,
             bare_return_enabled: true,
@@ -304,126 +370,136 @@ impl WarningConfig {
         }
     }
 
-    /// `-w`: inhibit every warning message from now on.  Sticky — later
-    /// `-Wall`/`-Wextra`/`-W<name>` do not re-enable anything (GCC 16.2
-    /// measured contract; see the field documentation).
     pub fn set_inhibit_all(&mut self) {
         self.inhibit_all = true;
     }
 
-    /// Select GCC's default-constraint demotion without changing explicit flags.
     pub fn set_permissive(&mut self, enabled: bool) {
         self.permissive = Some(enabled);
     }
 
-    /// Enable a specific warning.
+    fn select(&mut self, kind: WarningKind, enabled: bool, priority: u8) {
+        if self
+            .enable_priority
+            .get(&kind)
+            .is_some_and(|&old| old > priority)
+        {
+            return;
+        }
+        self.enable_priority.insert(kind, priority);
+        if enabled {
+            self.enabled.insert(kind);
+        } else {
+            self.enabled.remove(&kind);
+        }
+    }
+
+    fn select_group(&mut self, group: WarningGroup, enabled: bool) {
+        for entry in WARNING_REGISTRY {
+            if entry.groups.contains(&group) {
+                self.select(entry.kind, enabled, group.priority());
+            }
+        }
+    }
+
     pub fn enable(&mut self, kind: WarningKind) {
-        self.enabled.insert(kind);
+        self.select(kind, true, 3);
         self.explicit_enable.insert(kind);
     }
 
-    /// Disable a specific warning (-Wno-<name>).
     pub fn disable(&mut self, kind: WarningKind) {
-        self.enabled.remove(&kind);
+        self.select(kind, false, 3);
     }
 
-    /// Enable all -Wall warnings.
     pub fn enable_wall(&mut self) {
-        self.wall_requested = true;
-        for &kind in WarningKind::wall_set() {
-            self.enabled.insert(kind);
-        }
+        self.select_group(WarningGroup::All, true);
     }
 
-    /// Enable the warnings selected by -Wextra. GCC keeps this group
-    /// independent from -Wall; callers may pass both switches when desired.
     pub fn enable_wextra(&mut self) {
-        for &kind in WarningKind::wextra_set() {
-            self.enabled.insert(kind);
-        }
+        self.select_group(WarningGroup::Extra, true);
     }
 
-    /// Promote a specific warning to error (-Werror=<name>).
     pub fn set_werror(&mut self, kind: WarningKind) {
         self.errors.insert(kind);
         self.not_errors.remove(&kind);
-        // -Werror=<name> also implicitly enables the warning, and counts
-        // as an explicit request for pre-C99 default suppression.
-        self.enabled.insert(kind);
-        self.explicit_enable.insert(kind);
+        self.enable(kind);
     }
 
-    /// Demote a specific warning from error (-Wno-error=<name>).
     pub fn clear_werror(&mut self, kind: WarningKind) {
         self.errors.remove(&kind);
         self.default_errors.remove(&kind);
         self.not_errors.insert(kind);
     }
 
-    /// Seed the GCC 16.2 default-error kinds for a C99-or-later dialect
-    /// (see `WarningKind::gcc162_c99_default_error_kinds`), called once
-    /// after CLI parsing so every later flag order is already settled.
-    /// An explicit `-Wno-error=<name>` (recorded in `not_errors`) wins;
-    /// a warning disabled with `-Wno-<name>` stays suppressed before
-    /// severity is ever consulted, so only the error set changes here.
-    pub fn apply_gcc162_c99_default_errors(&mut self) {
-        for &kind in WarningKind::gcc162_c99_default_error_kinds() {
-            if self.permissive != Some(true) && !self.not_errors.contains(&kind) {
-                self.default_errors.insert(kind);
+    /// GCC 16.2 expands `-Werror=<group>` to error classifications for each
+    /// leaf as well as enabling the group. Unlike enablement specificity,
+    /// these explicit classifications replace earlier per-leaf demotions.
+    fn set_group_werror(&mut self, group: WarningGroup) {
+        for entry in WARNING_REGISTRY {
+            if entry.groups.contains(&group) {
+                self.select(entry.kind, true, group.priority());
+                self.errors.insert(entry.kind);
+                self.not_errors.remove(&entry.kind);
             }
         }
     }
 
-    /// Pre-C99 enablement differs from severity: implicit int/declarations
-    /// need an explicit request (or -Wall for declarations). Bare returns
-    /// need -Wreturn-type, but returning a value from void stays default-on.
-    /// An explicit -fno-permissive promotes only live constraint diagnostics.
+    pub fn apply_gcc162_c99_default_errors(&mut self) {
+        for entry in WARNING_REGISTRY {
+            if entry.c99_default_error
+                && self.permissive != Some(true)
+                && !self.not_errors.contains(&entry.kind)
+            {
+                self.default_errors.insert(entry.kind);
+            }
+        }
+    }
+
+    /// In pre-C99 modes, implicit diagnostics are not on by default but can
+    /// still be selected by -Wall, -Wimplicit or their leaf switches. GCC's
+    /// bare-return subcase is unusual: mentioning -Wreturn-type *or its
+    /// negation*, including -Wno-all, enables -Wreturn-mismatch in gnu90.
     pub fn suppress_gcc162_pre_c99_defaults(&mut self) {
-        self.legacy_implicit_return_type =
-            self.wall_requested || self.explicit_enable.contains(&WarningKind::ReturnType);
-        // Naming -Wreturn-mismatch alone does not enable bare returns in
-        // pre-C99 modes; -Wreturn-type owns this subcase's enablement.
-        self.bare_return_enabled =
-            self.legacy_implicit_return_type && self.enabled.contains(&WarningKind::ReturnType);
-        if !self.explicit_enable.contains(&WarningKind::ImplicitInt) {
-            self.disable(WarningKind::ImplicitInt);
+        self.legacy_implicit_return_type = self.enabled.contains(&WarningKind::ReturnType);
+        self.bare_return_enabled = self.enable_priority.contains_key(&WarningKind::ReturnType);
+        for kind in [
+            WarningKind::ImplicitInt,
+            WarningKind::ImplicitFunctionDeclaration,
+        ] {
+            if !self.enable_priority.contains_key(&kind) {
+                self.enabled.remove(&kind);
+            }
         }
-        if !self
-            .explicit_enable
-            .contains(&WarningKind::ImplicitFunctionDeclaration)
-            && !self.wall_requested
-        {
-            self.disable(WarningKind::ImplicitFunctionDeclaration);
-        }
-        // IntConversion stays enabled: measured warning-by-default in
-        // gnu90 as well.
-        // An explicit -fno-permissive requests default errors even pre-C99,
-        // but must not enable a diagnostic whose subcase is otherwise silent.
         if self.permissive == Some(false) {
             self.apply_gcc162_c99_default_errors();
         }
     }
 
-    /// Check if a warning of the given kind should be emitted at all.
     pub fn is_enabled(&self, kind: WarningKind) -> bool {
         self.enabled.contains(&kind)
             && (!self.inhibit_all || (self.default_errors.contains(&kind) && self.is_error(kind)))
     }
 
-    /// Whether `kind` came from an explicit positive flag.
     pub fn is_explicitly_requested(&self, kind: WarningKind) -> bool {
         self.explicit_enable.contains(&kind)
     }
 
-    /// Check if a warning of the given kind should be promoted to an error.
     pub fn is_error(&self, kind: WarningKind) -> bool {
         ((self.errors.contains(&kind) || self.default_errors.contains(&kind))
             && !self.not_errors.contains(&kind))
             || (self.werror_all && !self.not_errors.contains(&kind))
     }
 
-    /// Process a single -W flag argument (the part after -W).
-    /// Returns true if the flag was recognized, false if unknown (silently ignored).
+    /// Whether a positive name denotes a supported warning or group. Shared
+    /// with `__has_warning` so preprocessor capability claims use this table.
+    pub fn recognizes_name(name: &str) -> bool {
+        name == "error"
+            || WarningGroup::from_flag_name(name).is_some()
+            || WarningKind::from_flag_name(name).is_some()
+    }
+
+    /// Process one option after its `-W` prefix, returning false for unknown
+    /// names so the driver can apply its option-contract policy.
     pub fn process_flag(&mut self, flag: &str) -> bool {
         match flag {
             "error" => {
@@ -434,21 +510,16 @@ impl WarningConfig {
                 self.werror_all = false;
                 true
             }
-            "all" => {
-                self.enable_wall();
-                true
-            }
-            "extra" => {
-                self.enable_wextra();
-                true
-            }
             _ if flag.starts_with("error=") => {
                 let name = &flag[6..];
                 if let Some(kind) = WarningKind::from_flag_name(name) {
                     self.set_werror(kind);
                     true
+                } else if let Some(group) = WarningGroup::from_flag_name(name) {
+                    self.set_group_werror(group);
+                    true
                 } else {
-                    false // unknown warning name, silently ignored
+                    false
                 }
             }
             _ if flag.starts_with("no-error=") => {
@@ -457,7 +528,9 @@ impl WarningConfig {
                     self.clear_werror(kind);
                     true
                 } else {
-                    false
+                    // GCC 16.2 accepts group demotions but does not expand
+                    // them to the leaf warning classifications we emit.
+                    WarningGroup::from_flag_name(name).is_some()
                 }
             }
             _ if flag.starts_with("no-") => {
@@ -465,17 +538,22 @@ impl WarningConfig {
                 if let Some(kind) = WarningKind::from_flag_name(name) {
                     self.disable(kind);
                     true
+                } else if let Some(group) = WarningGroup::from_flag_name(name) {
+                    self.select_group(group, false);
+                    true
                 } else {
-                    false // unknown warning name, silently ignored
+                    false
                 }
             }
             _ => {
-                // Try as a positive warning name: -W<name> enables it
                 if let Some(kind) = WarningKind::from_flag_name(flag) {
                     self.enable(kind);
                     true
+                } else if let Some(group) = WarningGroup::from_flag_name(flag) {
+                    self.select_group(group, true);
+                    true
                 } else {
-                    false // unknown, silently ignored (matching GCC behavior)
+                    false
                 }
             }
         }
@@ -1322,6 +1400,40 @@ fn is_uninteresting_macro(name: &str) -> bool {
 #[cfg(test)]
 mod dialect_severity_redteam_tests {
     use super::*;
+
+    #[test]
+    fn warning_registry_covers_each_kind_exactly_once() {
+        use std::collections::HashSet;
+        let kinds = [
+            WarningKind::Undeclared,
+            WarningKind::ImplicitFunctionDeclaration,
+            WarningKind::Cpp,
+            WarningKind::ReturnType,
+            WarningKind::IncompatiblePointerTypes,
+            WarningKind::Attributes,
+            WarningKind::UnusedVariable,
+            WarningKind::SignCompare,
+            WarningKind::Format,
+            WarningKind::FormatSecurity,
+            WarningKind::ImplicitInt,
+            WarningKind::ReturnMismatch,
+            WarningKind::IntConversion,
+            WarningKind::PointerToIntCast,
+        ];
+        let registered: HashSet<_> = WARNING_REGISTRY.iter().map(|entry| entry.kind).collect();
+        let names: HashSet<_> = WARNING_REGISTRY.iter().map(|entry| entry.name).collect();
+        assert_eq!(WARNING_REGISTRY.len(), kinds.len());
+        assert_eq!(registered.len(), kinds.len());
+        assert_eq!(names.len(), kinds.len());
+        for kind in kinds {
+            assert!(registered.contains(&kind));
+            assert_eq!(WarningKind::from_flag_name(kind.flag_name()), Some(kind));
+        }
+        for group in ["all", "extra", "implicit", "unused"] {
+            assert!(WarningConfig::recognizes_name(group));
+        }
+        assert!(!WarningConfig::recognizes_name("pedantic"));
+    }
 
     #[test]
     fn quiet_mode_preserves_default_errors_but_suppresses_promoted_warnings() {

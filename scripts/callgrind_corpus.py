@@ -71,8 +71,8 @@ def main(argv=None):
                                 "-Wl,--no-as-needed", "-lm", *args.cflag,
                                 *workload_flags(item, sizes[item.name])])
             command = [args.mine, args.ref, "--opt=" + flags, bench.source_for(item).stem,
-                       "--out-root", str(directory), "--instrument-timeout", "60",
-                       "--gcc-include-command", args.gcc_include_command]
+                       "--workload-id", item.name, "--out-root", str(directory),
+                       "--instrument-timeout", "60", "--gcc-include-command", args.gcc_include_command]
             print(item.name, flush=True)
             try:
                 with (directory / "run.log").open("w") as log, contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):

@@ -17,7 +17,10 @@ use super::text_processing::{
     CommentSegments, LineResolver, LineResolverData, LineSegments, split_first_word,
     strip_line_comment,
 };
-use super::utils::{is_ident_cont, is_ident_start};
+use super::utils::{
+    hash_token_len, is_digit_separator, is_ident_cont, is_ident_start, less_punctuator_len,
+    paste_token_len,
+};
 
 /// Deduplicate a list of macro names, preserving order (first occurrence wins).
 /// Used to remove duplicate names from nested macro expansions.
@@ -364,9 +367,17 @@ impl Preprocessor {
             // be processed regardless of pending multi-line accumulation. Other
             // directives (#include, #define, etc.) are only processed when there's
             // no pending line in included files.
-            let is_directive = trimmed.starts_with('#');
+            let hash_len = hash_token_len(trimmed.as_bytes());
+            let is_directive = hash_len != 0;
+            // `col` names the position just after the full introducer, as it
+            // does for `#`; `%:` spans two source bytes.
+            let hash_col = if is_directive {
+                line.len() - line.trim_start().len() + hash_len + 1
+            } else {
+                0 // never used for a non-directive
+            };
             let is_conditional_directive = if is_directive {
-                let after_hash = trimmed[1..].trim_start();
+                let after_hash = trimmed[hash_len..].trim_start();
                 after_hash.starts_with("if")
                     || after_hash.starts_with("elif")
                     || after_hash.starts_with("else")
@@ -386,7 +397,6 @@ impl Preprocessor {
             if is_conditional_directive && !pending_line.is_empty() {
                 // Process the conditional directive (updates conditional stack)
                 // Column of the directive keyword (1-based, after '#')
-                let hash_col = line.find('#').map(|i| i + 2).unwrap_or(1);
                 self.process_directive(trimmed, source_line_num + 1, hash_col);
                 // Don't add the directive line to pending_line, don't flush.
                 // Just count a newline for line numbering preservation.
@@ -401,14 +411,13 @@ impl Preprocessor {
             // files would leak into the output as literal text. This mirrors the
             // conditional directive handling above.
             let is_define_undef_directive = if is_directive && !is_conditional_directive {
-                let after_hash = trimmed[1..].trim_start();
+                let after_hash = trimmed[hash_len..].trim_start();
                 after_hash.starts_with("define") || after_hash.starts_with("undef")
             } else {
                 false
             };
             if is_define_undef_directive && is_include && !pending_line.is_empty() {
                 if self.conditionals.is_active() {
-                    let hash_col = line.find('#').map(|i| i + 2).unwrap_or(1);
                     self.process_directive(trimmed, source_line_num + 1, hash_col);
                 }
                 Self::pend_blank(&mut pending_line, &mut pending_newlines, 1);
@@ -421,7 +430,7 @@ impl Preprocessor {
             // expressions. These must be consumed (updating line tracking state)
             // without being appended to the pending accumulation buffer.
             let is_line_directive = if is_directive && !is_conditional_directive {
-                let after_hash = trimmed[1..].trim_start();
+                let after_hash = trimmed[hash_len..].trim_start();
                 after_hash.starts_with("line ")
                     || after_hash.starts_with("line\t")
                     || after_hash
@@ -433,7 +442,6 @@ impl Preprocessor {
             };
             if is_line_directive && !pending_line.is_empty() {
                 if self.conditionals.is_active() {
-                    let hash_col = line.find('#').map(|i| i + 2).unwrap_or(1);
                     self.process_directive(trimmed, source_line_num + 1, hash_col);
                 }
                 Self::pend_blank(&mut pending_line, &mut pending_newlines, 1);
@@ -452,7 +460,7 @@ impl Preprocessor {
                 // effect for tokens that follow them, not tokens that precede them.
                 let output_len_before_directive = output.len();
                 if !pending_line.is_empty() && !is_include {
-                    let after_hash = trimmed[1..].trim_start();
+                    let after_hash = trimmed[hash_len..].trim_start();
                     if after_hash.starts_with("define") || after_hash.starts_with("undef") {
                         // The accumulated text spans several physical lines;
                         // expand it against a flat resolver (the current
@@ -495,7 +503,6 @@ impl Preprocessor {
                     }
                 }
                 // Column of the directive keyword (1-based, after '#')
-                let hash_col = line.find('#').map(|i| i + 2).unwrap_or(1);
                 let include_result = self.process_directive(trimmed, source_line_num + 1, hash_col);
                 let emitted_include_content =
                     include_result.as_deref().is_some_and(|c| !c.is_empty());
@@ -1127,6 +1134,13 @@ impl Preprocessor {
         self.macros.undefine(name);
     }
 
+    /// Drop only the implicit compiler and system search directories.
+    /// Explicit -I/-iquote/-isystem/-idirafter paths remain available.
+    pub fn clear_default_include_paths(&mut self) {
+        self.system_include_paths.clear();
+        self.include_resolve_cache.clear();
+    }
+
     /// Add an include search path for #include directives (-I flag).
     /// Adds regardless of whether the directory currently exists.
     pub fn add_include_path(&mut self, path: &str) {
@@ -1226,8 +1240,8 @@ impl Preprocessor {
     }
 
     fn process_directive(&mut self, line: &str, line_num: usize, col: usize) -> Option<String> {
-        // Strip leading # and whitespace
-        let after_hash = line.trim_start_matches('#').trim();
+        // Strip the complete # / %: introducer and surrounding whitespace.
+        let after_hash = line[hash_token_len(line.as_bytes())..].trim();
 
         // Strip trailing comments (// style)
         let after_hash = strip_line_comment(after_hash);
@@ -1422,7 +1436,7 @@ impl Preprocessor {
         let mut i = 0usize;
         while i < bytes.len() {
             let c = bytes[i];
-            if c == b'"' || c == b'\'' {
+            if c == b'"' || (c == b'\'' && !is_digit_separator(bytes, i)) {
                 let quote = c;
                 i += 1;
                 while i < bytes.len() && bytes[i] != quote {
@@ -1434,8 +1448,19 @@ impl Preprocessor {
                 i += 1;
                 continue;
             }
-            if c == b'#' {
-                let mut j = i + 1;
+            let less_len = less_punctuator_len(&bytes[i..]);
+            if less_len != 0 {
+                i += less_len;
+                continue;
+            }
+            let paste_len = paste_token_len(&bytes[i..]);
+            if paste_len != 0 {
+                i += paste_len;
+                continue;
+            }
+            let hash_len = hash_token_len(&bytes[i..]);
+            if hash_len != 0 {
+                let mut j = i + hash_len;
                 while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
                     j += 1;
                 }
@@ -1476,7 +1501,7 @@ impl Preprocessor {
             // Skip string and char literals: a '#' inside a literal is
             // ordinary text, not the stringize operator (#define F(x) "#"
             // and #define G(x) '#' are both valid).
-            if c == b'"' || c == b'\'' {
+            if c == b'"' || (c == b'\'' && !is_digit_separator(bytes, i)) {
                 let quote = c;
                 i += 1;
                 while i < len && bytes[i] != quote {
@@ -1488,16 +1513,24 @@ impl Preprocessor {
                 i += 1;
                 continue;
             }
-            if c != b'#' {
+            // Each alternate spelling is a single preprocessing token;
+            // check the longer token first (maximal munch).
+            let less_len = less_punctuator_len(&bytes[i..]);
+            if less_len != 0 {
+                i += less_len;
+                continue;
+            }
+            let paste_len = paste_token_len(&bytes[i..]);
+            if paste_len != 0 {
+                i += paste_len;
+                continue;
+            }
+            let hash_len = hash_token_len(&bytes[i..]);
+            if hash_len == 0 {
                 i += 1;
                 continue;
             }
-            // '##' is token pasting, not stringize: skip both.
-            if i + 1 < len && bytes[i + 1] == b'#' {
-                i += 2;
-                continue;
-            }
-            let mut j = i + 1;
+            let mut j = i + hash_len;
             while j < len && (bytes[j] == b' ' || bytes[j] == b'\t') {
                 j += 1;
             }

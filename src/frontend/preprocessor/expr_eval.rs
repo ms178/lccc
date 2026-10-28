@@ -196,11 +196,8 @@ impl Preprocessor {
         };
         // -Wno-<name> asks about the same warning as -W<name>.
         let rest = rest.strip_prefix("no-").unwrap_or(rest);
-        // Warning groups accepted by WarningConfig::process_flag.
-        if matches!(rest, "all" | "extra" | "error") {
-            return true;
-        }
-        crate::common::error::WarningKind::from_flag_name(rest).is_some()
+        // The driver and preprocessor must consult the same registry.
+        crate::common::error::WarningConfig::recognizes_name(rest)
     }
 
     /// Clang's `__has_warning("-Wflag")` operator (full contract, Clang

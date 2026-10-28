@@ -2552,10 +2552,10 @@ mod tests {
 
     #[test]
     fn andq_sign_extended_mask_establishes_no_narrow_fact() {
-        // The imm32 sign-extension boundary: $0x8000_0000 keeps the source's
+        // At the imm32 sign-extension boundary, $-2147483648 keeps the source's
         // upper half, so no width fact may be established. Starting the ledger
         // believing everything proves the old facts are actually cleared.
-        let f = ledger_after("andq $2147483648, %r10", true);
+        let f = ledger_after("andq $-2147483648, %r10", true);
         assert!(!f[0][10] && !f[1][10] && !f[2][10], "negative imm32: {f:?}");
         let f = ledger_after("andq %rax, %r10", true);
         assert!(!f[0][10] && !f[1][10], "register mask: {f:?}");

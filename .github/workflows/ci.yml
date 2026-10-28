@@ -623,6 +623,8 @@ jobs:
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_temp_symlink.sh
     - name: Verify benchmark harness oracle and timing contracts
       run: python3 tests/benchmark/test_benchmark_harness.py
+    - name: Verify zlib-ng match kernel across optimization levels and ABIs
+      run: python3 tests/regression/check_zlib_compare256.py --lccc target/fastbuild/lccc --gcc gcc-16 --m32
     - name: Verify benchmark codegen registry and evidence (mock only)
       run: python3 tests/regression/check_benchmark_codegen_registry.py
     - name: Compound literal as a designated aggregate element
@@ -1063,6 +1065,10 @@ jobs:
             CCC_ARM=target/fastbuild/lccc-arm \
             CCC_RISCV=target/fastbuild/lccc-riscv \
             python3 tests/regression/check_asm_char_and_macro_defaults.py
+    - name: GNU retain section flags and linker garbage collection
+      run: python3 tests/regression/check_gnu_retain_sections.py --lccc target/fastbuild/lccc --gcc gcc-16
+    - name: C digraph token, macro and directive parity
+      run: python3 tests/regression/check_c_digraphs.py --lccc target/fastbuild/lccc --gcc gcc-16 --m32
     - name: Check -ftrapv boundary matrix (m32)
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_trapv_boundary_matrix.sh --bits -m32
     - name: RISC-V relocation rejection and positive controls
@@ -1111,12 +1117,16 @@ jobs:
           --markdown "$RUNNER_TEMP/c23-inventory.md"
         python3 tests/regression/check_warning_compat.py \
           --lccc target/fastbuild/lccc --gcc gcc-16
+        python3 tests/regression/check_warning_precedence.py \
+          --lccc target/fastbuild/lccc --gcc gcc-16
+        env GCC=gcc-16 python3 tests/regression/check_attribute_diagnostics.py
     - name: Cargo gate resource isolation
       run: python3 scripts/test_ci_resources.py
     - name: Verify local oracle identity and ICX provisioning (offline, mock only)
       run: |
         python3 scripts/test_local_oracles.py
         python3 scripts/test_icx_provision.py
+        python3 tests/corpus/test_godbolt_explicit_local.py
     - name: Const-volatile object reads are not folded
       run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_const_volatile_objects.sh
     - name: Named-space brace-elided initializers
@@ -2883,7 +2893,8 @@ jobs:
       # process spawns on the hosted runner), assigned longest-processing-
       # time first by scripts/ci_bench_shards.py.
       # Original assignment: predicted 389 s of 771 s for 23 kernels.
-      # The bounded F32 map extends this shard; F64 extends shard b.
+      # The bounded F32 map and zlib-ng compare256 extend this shard; F64
+      # extends shard b. Rebalance from a fresh report if the cost shifts.
       only: >-
           fp32_product_map,
           f32_sse1_map,
@@ -2910,6 +2921,7 @@ jobs:
           tls_seg_access,
           zlib_ng_adler32,
           zlib_ng_adler32_combine,
+          zlib_ng_compare256,
   benchmark-b:
     name: Benchmark corpus (shard b)
     needs: [build]
@@ -3070,6 +3082,9 @@ jobs:
     - name: Volatile reduction O3 contracts and ICX matrix
       run: |
         set -euo pipefail
+        # Preserve the failing command in the check annotations as well as
+        # the job log, including when the vendor-runtime matrix fails.
+        trap 'status=$?; printf "::error title=Volatile reduction ICX matrix::line %s, exit %s: %s\n" "$LINENO" "$status" "$BASH_COMMAND"' ERR
         # Shared ICX objects use vendor dynamic runtimes even when ordinary
         # executables use static Intel runtimes. Keep dlopen's loader explicit.
         intel_runtime=$(find "$RUNNER_TEMP/intel-icx-2026.2" -name libimf.so -print -quit)

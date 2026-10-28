@@ -14,15 +14,18 @@ consume it:
 3. `redundant_ext::update_facts` (byte/16-bit zero-extension facts too, so a
    following `movzbl`/`movzwl` of the masked value is deleted).
 
-Masks that encode as negative imm32 (`$0x80000000`+, which GAS sign-extends
-to an all-ones high mask), register/memory-source ANDs, wrong-destination
+Negative signed imm32 masks, register/memory-source ANDs, wrong-destination
 ANDs and `andl` all return `None`: no fact is established and the existing
-extensions are retained. Rationale and the `x & m <= m` result-width bound
-are documented at the predicate.
+extensions are retained. GAS 2.47 rejects positive `$2147483648` and
+`$0xffffffff` for `andq`; the encodable sign-extension-boundary spellings are
+`$-2147483648` and `$-1`. The negative tests now use these valid spellings.
+Rationale and the `x & m <= m` result-width bound are documented at the
+predicate. The byte-fact cutoff is conservatively `0x7f`, not the mathematically
+possible `0xff`; the wider cutoff has not been justified by workload evidence.
 
-This closes archive item **PERF-5** ("no redundant-extension elimination /
-`nonzero_bits`"), whose reproducer is the `andq $127` + `movslq`/`movl`
-residue in the reverse-varint digit loop.
+This addresses the recorded **PERF-5** reproducer: the `andq $127` +
+`movslq`/`movl` residue in the reverse-varint digit loop. It does not by
+itself implement general `nonzero_bits` tracking or establish a runtime win.
 
 ## Blast radius (assembly A/B, feature forced off via a temporary env gate)
 
@@ -56,23 +59,26 @@ Reference-normalized geometric means (lower = faster than the references):
 | baseline (`baseline-56.json`) | 0.83354 | 0.87196 |
 | with fix (`after-56.json`) | **0.82899** | **0.86361** |
 
-Per-kernel within-run normalized change: geo **−1.09 %** vs best
-reference; 29 kernels improve, 7 flat, 20 move within the run-to-run noise
-band. Every apparent raw-median "regression" is on one of the 73 TUs whose
-assembly is byte-identical between the two compilers, i.e. host noise, not
-a codegen effect.
+The per-kernel within-run normalized change is geo −1.09% vs best reference.
+This compares two separate five-repetition runs, not paired per-round deltas;
+the hypervisor and scheduler can affect it. The reported assembly screen says
+73 TUs were byte-identical, but that does not establish that every timing
+movement is noise or prove a causal speedup on the five changed TUs.
 
-Focused paired A/B (same binary, feature on vs forced off;
-`paired-ab-20reps.json`, `paired-ab-40reps.json`), the three affected
-benchmark kernels:
+Focused paired A/B (`paired-ab-20reps.json`, `paired-ab-40reps.json`)
+compared generated programs using feature-on and forced-off compiler binaries.
+The earlier table divided independent wall-time medians; that is not the median
+of the paired ratios. The recorded 40-round **on/off paired ratios** and 95%
+bootstrap intervals are:
 
-| kernel | 20-rep effect | 40-rep effect |
-| --- | --- | --- |
-| `switch_dispatch` | −1.22 % | −4.97 % |
-| `double_reduction` | +7.48 % (noise; min on < min off) | −0.11 % |
-| `linux_list_sort` | +0.87 % (noise) | −0.15 % (best-case min −6.8 %) |
+| kernel | median paired ratio | 95% interval |
+| --- | ---: | ---: |
+| `switch_dispatch` | 1.00248 | [0.99164, 1.01852] |
+| `double_reduction` | 0.99941 | [0.98908, 1.00737] |
+| `linux_list_sort` | 1.00185 | [0.99665, 1.01062] |
 
-No affected kernel regresses once reps are raised; the change strictly
-removes rename/issue uops from hot paths and never lengthens a dependency
-chain. Static counts are reported alongside wall time per the backlog's
-metric-trap rule; Callgrind was not used for any runtime claim.
+All three intervals include 1. The samples do not establish either a speedup
+or the absence of a modest regression, and static instruction removal does not
+by itself prove a uop or dependency-chain improvement. These measurements are
+from a virtualized host, not the requested target hardware; PMU data was not
+available. Callgrind was not used for the wall-time claims.

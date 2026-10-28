@@ -10635,6 +10635,7 @@ fn is_initializer_slot(field: &StructFieldLayout) -> bool {
 #[cfg(test)]
 mod builtin_return_flow_tests {
     use super::SemanticAnalyzer;
+    use crate::common::error::{WarningConfig, WarningKind};
     use crate::frontend::lexer::Lexer;
     use crate::frontend::parser::Parser;
 
@@ -10645,6 +10646,11 @@ mod builtin_return_flow_tests {
         let tu = parser.parse();
         assert_eq!(parser.error_count, 0, "{body}");
         let mut analyzer = SemanticAnalyzer::new();
+        // GCC enables -Wreturn-type under -Wall, not by default. Test the
+        // fallthrough analysis with that diagnostic explicitly requested.
+        let mut config = WarningConfig::new();
+        config.enable(WarningKind::ReturnType);
+        analyzer.diagnostics.borrow_mut().set_warning_config(config);
         assert!(analyzer.analyze(&tu).is_ok(), "{body}");
         analyzer.diagnostics.borrow().warning_count()
     }

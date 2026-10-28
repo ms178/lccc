@@ -1,52 +1,79 @@
 #!/usr/bin/env bash
-# ============================================================================
-# offline_deb_extract.sh — extract offline .deb files into an ISOLATED sysroot.
-#
-# INCIDENT (2026-10-28): `dpkg -x pkg.deb /` let archive paths resolve through
-# the usrmerge symlink /lib64 -> usr/lib64 and clobber the amd64 loader
-# /lib64/ld-linux-x86-64.so.2, killing every exec and file write in the
-# sandbox.  Extracting packages onto the system root is FORBIDDEN.
-#
-# This wrapper refuses any destination outside /home/user or /tmp, refuses to
-# run as root, and prints the environment recipe for consuming the sysroot.
-#
-# Usage:
-#   scripts/offline_deb_extract.sh <dest-dir> <pkg.deb> [more.deb ...]
-#
-# Offline multilib example (cached debs from the harness tag cache):
-#   scripts/offline_deb_extract.sh /home/user/i386-sysroot \
-#       ~/.cache/lccc/agent-toolchains/debs/libc6-dev-i386_*.deb \
-#       ~/.cache/lccc/agent-toolchains/debs/libc6-i386_*.deb
-#   export C_INCLUDE_PATH=/home/user/i386-sysroot/usr/include/i386-linux-gnu
-#   export LIBRARY_PATH=/home/user/i386-sysroot/usr/lib32:/home/user/i386-sysroot/lib32
-#   export LD_LIBRARY_PATH=/home/user/i386-sysroot/lib32
-#   gcc -B/home/user/i386-sysroot/usr/lib32/ …   # only if crt startup files are needed
-# ============================================================================
+# Extract trusted, offline Debian packages without touching the host system.
+# Usage: scripts/offline_deb_extract.sh SYSROOT PACKAGE.deb [PACKAGE.deb ...]
+# SYSROOT must be an absent or empty directory strictly below /home/user or
+# /tmp. All packages for one sysroot must be provided together. Absolute Debian
+# symlinks are converted to sysroot-relative links. No maintainer scripts run.
 set -euo pipefail
+umask 077
 
-dest=${1:?usage: offline_deb_extract.sh <dest-dir> <pkg.deb> ...}
+if (( $# < 2 )); then
+    echo "usage: $0 SYSROOT PACKAGE.deb [PACKAGE.deb ...]" >&2
+    exit 2
+fi
+if [[ $(id -u) == 0 ]]; then
+    echo 'offline-deb: refuse to extract as root; run unprivileged' >&2
+    exit 1
+fi
+sysroot=$(realpath -m -- "$1")
 shift
-[[ $# -ge 1 ]] || { echo 'error: at least one .deb required' >&2; exit 2; }
-
-# Hard destination boundary: workspace or temp only.
-case "$(realpath -m "$dest")" in
-  /home/user/*|/tmp/*) ;;
-  *) echo "error: refusing destination outside /home/user or /tmp: $dest" >&2; exit 1 ;;
+case "$sysroot" in
+    /home/user/*|/tmp/*) ;;
+    *) echo "offline-deb: destination must be strictly below /home/user or /tmp: $sysroot" >&2; exit 1 ;;
 esac
-
-# Never as root: prefix extraction does not need privileges, and root is how
-# the previous incident reached system paths.
-[[ "$(id -u)" -ne 0 ]] || { echo 'error: run unprivileged (no sudo)' >&2; exit 1; }
-
-mkdir -p "$dest"
-for deb in "$@"; do
-  [[ -f "$deb" ]] || { echo "error: no such deb: $deb" >&2; exit 1; }
-  dpkg -x "$deb" "$dest"     # into the PREFIX only — never /
+if [[ -e $sysroot || -L $sysroot ]]; then
+    if [[ ! -d $sysroot || ! -O $sysroot || -n $(find "$sysroot" -mindepth 1 -maxdepth 1 -print -quit) ]]; then
+        echo "offline-deb: destination must be an empty, user-owned directory: $sysroot" >&2
+        exit 1
+    fi
+fi
+packages=()
+for package in "$@"; do
+    if [[ ! -f $package ]]; then
+        echo "offline-deb: no such package: $package" >&2
+        exit 1
+    fi
+    packages+=("$(realpath -e -- "$package")")
 done
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+python3 "$script_dir/offline_deb_validate.py" check "${packages[@]}"
 
-echo "extracted into sysroot: $dest"
-echo 'consume with (adjust subdirs after inspecting the prefix):'
-echo "  export C_INCLUDE_PATH=\"$dest/usr/include/i386-linux-gnu\${C_INCLUDE_PATH:+:\$C_INCLUDE_PATH}\""
-echo "  export LIBRARY_PATH=\"$dest/usr/lib32:$dest/lib32\${LIBRARY_PATH:+:\$LIBRARY_PATH}\""
-echo "  export LD_LIBRARY_PATH=\"$dest/lib32:$dest/usr/lib32\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}\""
-echo '  # crt/startup files if a link fails: add -B'"$dest"'/usr/lib32/'
+parent=$(dirname -- "$sysroot")
+mkdir -p -- "$parent"
+# Re-resolve after creating the parent; an existing symlink must not redirect
+# the extraction outside either permitted root.
+sysroot=$(realpath -m -- "$sysroot")
+case "$sysroot" in
+    /home/user/*|/tmp/*) ;;
+    *) echo "offline-deb: destination escaped the allowed roots: $sysroot" >&2; exit 1 ;;
+esac
+stage=$(mktemp -d "${sysroot}.tmp.XXXXXXXX")
+trap 'rm -rf -- "$stage"' EXIT
+for package in "${packages[@]}"; do
+    dpkg -x "$package" "$stage"
+done
+python3 "$script_dir/offline_deb_validate.py" confine "$stage"
+# Never replace nonempty directories, even if the destination changed while
+# packages were being checked. Rename only a completely validated staging tree.
+if [[ -e $sysroot ]]; then
+    rmdir -- "$sysroot"
+fi
+mv -T -- "$stage" "$sysroot"
+trap - EXIT
+printf 'Extracted %d trusted package(s) unprivileged into %s\n' "${#packages[@]}" "$sysroot"
+printf 'export LCCC_SYSROOT=%q\n' "$sysroot"
+cat <<'RECIPE'
+# These variables are for GCC and the dynamic loader; they do not establish
+# LCCC header or link isolation. LCCC does not read C_INCLUDE_PATH.
+export C_INCLUDE_PATH="$LCCC_SYSROOT/usr/include:$LCCC_SYSROOT/usr/include/x86_64-linux-gnu${C_INCLUDE_PATH:+:$C_INCLUDE_PATH}"
+export LIBRARY_PATH="$LCCC_SYSROOT/usr/lib32:$LCCC_SYSROOT/lib32${LIBRARY_PATH:+:$LIBRARY_PATH}"
+export LD_LIBRARY_PATH="$LCCC_SYSROOT/lib32:$LCCC_SYSROOT/usr/lib32${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+# Example for GCC, 32-bit (also supply suitable glibc and compiler headers):
+# gcc-16 -m32 --sysroot="$LCCC_SYSROOT" -B"$LCCC_SYSROOT/usr/lib32/" \
+#   -Wl,--dynamic-linker="$LCCC_SYSROOT/lib32/ld-linux.so.2" source.c -o program
+# LCCC's LCCC_SYSROOT is a partial overlay with host fallbacks, NOT GNU
+# --sysroot; the LCCC driver rejects GNU sysroot flags instead of ignoring them.
+# For controlled LCCC preprocessing, pass -nostdinc and all necessary -I or
+# -isystem directories explicitly. Linking also needs a separately verified
+# CRT/library setup; an explicit dynamic loader alone does not isolate it.
+RECIPE

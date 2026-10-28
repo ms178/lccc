@@ -92,7 +92,9 @@ pub enum SizeExpr {
 pub struct SectionInfo {
     pub name: String,
     pub flags: String,
-    pub sec_type: String,
+    /// Type as written; `None` must not be mistaken for an explicit type
+    /// when re-entering an existing section.
+    pub sec_type: Option<String>,
     /// True when the directive explicitly included a flags field (even if empty).
     pub flags_explicit: bool,
 }
@@ -726,16 +728,7 @@ fn parse_section_args(args: &str) -> SectionInfo {
     } else {
         String::new()
     };
-    let sec_type = if parts.len() > 2 {
-        parts[2].trim().to_string()
-    } else {
-        // Default type based on section name
-        if name == ".bss" || name.starts_with(".bss.") || name.starts_with(".tbss") {
-            "@nobits".to_string()
-        } else {
-            "@progbits".to_string()
-        }
-    };
+    let sec_type = parts.get(2).map(|part| part.trim().to_string());
     SectionInfo {
         name,
         flags,
