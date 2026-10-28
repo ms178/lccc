@@ -91,6 +91,38 @@ readonly SPELLING_ALLOWLIST=(
     # "__VERSION__": mirrors __GNUC__ — lccc "14.2.0" vs gcc-16 "16.2.0".
     # Intentional version string — justified.
     "__VERSION__"
+    # "__DBL_MIN__", "__DBL_MAX__", "__DBL_EPSILON__", "__DBL_DENORM_MIN__":
+    # gcc-16 wraps the value in "((double)...)" (a cast expression); lccc
+    # emits the bare numeric literal.  Same value, different spelling —
+    # justified.
+    "__DBL_MIN__"
+    "__DBL_MAX__"
+    "__DBL_EPSILON__"
+    "__DBL_DENORM_MIN__"
+    # "__BYTE_ORDER__": gcc-16 defines it symbolically as
+    # "__ORDER_LITTLE_ENDIAN__" while lccc emits the expanded numeric value
+    # "1234".  Both denote little-endian byte order — justified.
+    "__BYTE_ORDER__"
+    # "__DEC32_EPSILON__", "__DEC64_EPSILON__", "__DEC128_EPSILON__",
+    # "__DEC32_MIN__", "__DEC64_MIN__", "__DEC128_MIN__",
+    # "__DEC32_MAX__", "__DEC64_MAX__", "__DEC128_MAX__",
+    # "__DEC32_SUBNORMAL_MIN__", "__DEC64_SUBNORMAL_MIN__",
+    # "__DEC128_SUBNORMAL_MIN__": gcc-16 uses uppercase exponent ("1E-6DF")
+    # while lccc uses lowercase ("1e-6DF"), and the trailing suffix differs
+    # ("DF" vs "DL").  Same decimal-floating-point value, different token
+    # spelling — justified.
+    "__DEC32_EPSILON__"
+    "__DEC64_EPSILON__"
+    "__DEC128_EPSILON__"
+    "__DEC32_MIN__"
+    "__DEC64_MIN__"
+    "__DEC128_MIN__"
+    "__DEC32_MAX__"
+    "__DEC64_MAX__"
+    "__DEC128_MAX__"
+    "__DEC32_SUBNORMAL_MIN__"
+    "__DEC64_SUBNORMAL_MIN__"
+    "__DEC128_SUBNORMAL_MIN__"
 )
 
 # Pairs to probe: (target, dialect)
