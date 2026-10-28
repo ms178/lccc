@@ -1945,15 +1945,17 @@ impl Driver {
         // linker-side twin in `backend/common.rs` and the built-in include
         // list mapping in `frontend/preprocessor/predefined_macros.rs`.
         fn sysroot_include_path(path: &str) -> String {
-            match std::env::var("LCCC_SYSROOT") {
-                Ok(root) if !root.is_empty() => {
-                    let prefixed = format!("{}{}", root.trim_end_matches('/'), path);
-                    if std::path::Path::new(&prefixed).is_dir() {
-                        return prefixed;
-                    }
-                    path.to_string()
-                }
-                _ => path.to_string(),
+            // One source of truth for "what is the sysroot": the same accessor
+            // the linker's discovery uses, so a driver that was given
+            // `--sysroot` cannot disagree with the linker it spawns.
+            let prefixed = match crate::backend::common::sysroot() {
+                Some(root) => format!("{root}{path}"),
+                None => return path.to_string(),
+            };
+            if std::path::Path::new(&prefixed).is_dir() {
+                prefixed
+            } else {
+                path.to_string()
             }
         }
         for path in &self.include_paths {

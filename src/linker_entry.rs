@@ -19,6 +19,19 @@ pub use crate::backend::linker_common::cet::{PropertyLinkFlags, merge_property_i
 /// it describes the GNU-ld interface level advertised by this implementation.
 pub const GNU_LD_VERSION_OUTPUT: &str = "GNU ld (LCCC built-in) 2.42";
 
+/// Publish `--sysroot=DIR` to the linker's path resolution.
+///
+/// `lccc-ld` calls this once from `main` instead of exporting `LCCC_SYSROOT`
+/// into its own environment: the resolved sysroot is process configuration, not
+/// ambient state, and mutating `environ` is a data race (edition 2024 made
+/// `std::env::set_var` `unsafe` for exactly that reason).  Library and runtime
+/// discovery consult `backend::common::sysroot`, which prefers this override and
+/// still honours `LCCC_SYSROOT` for the compiler driver and for callers that set
+/// it in the child's environment.
+pub fn set_sysroot_override(root: &str) {
+    crate::backend::common::set_sysroot_override(root);
+}
+
 /// Load a mix of relocatable objects (.o) and archives (.a) for x86-64 with
 /// whole-command-line group semantics. `inputs` is (path, whole_archive).
 /// `undefined` are `-u`/`--undefined` symbols that must pull archive members.

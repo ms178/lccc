@@ -807,6 +807,19 @@ gate "debug-info-invariance" fast \
     env CCC="$LCCC" CCC_I686=target/fastbuild/lccc-i686 \
         CCC_ARM=target/fastbuild/lccc-arm CCC_RISCV=target/fastbuild/lccc-riscv \
         bash tests/regression/check_debug_info_invariance.sh
+# The x86 ISA tables are generated from GCC 16.2, so they are only as true as
+# the last re-measurement.  `--check` re-renders the whole table (every CPU x
+# mode x negatable option, 8772 cross-checked cases) and byte-compares it with
+# the committed file; the two macro gates then compare the predefined macros a
+# user's `#ifdef` actually sees (204 `-march=` cases, 714 `-m`/`-mno-` cases).
+# Hosted in the unsharded backend job.  `gen_x86_cpu_is_table.py --check` is
+# not mirrored because it needs GCC's source tree, not just its binary.
+gate "generated-x86-arch-table-sync" fast \
+    env GCC="${GCC16:-gcc-16}" python3 scripts/gen_x86_arch_table.py --check
+gate "x86-march-macro-parity" fast \
+    python3 scripts/check_x86_march_macros.py "$LCCC" "${GCC16:-gcc-16}"
+gate "x86-mflag-macro-parity" fast \
+    python3 scripts/check_x86_mflag_macros.py "$LCCC" --gcc "${GCC16:-gcc-16}"
 gate "ivsr-reproducers" fast \
     env CCC="$LCCC" bash tests/regression/check_ivsr_reproducers.sh
 

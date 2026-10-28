@@ -73,11 +73,11 @@ little = data[5] == 1
 end = '<' if little else '>'
 if is64:
     (e_shoff,) = struct.unpack_from(end + 'Q', data, 0x28)
-    e_shentsize, e_shnum, e_shstrndx = struct.unpack_from(end + 'HHH', data, 0x3A)
+    e_shentsize, e_shnum, _ = struct.unpack_from(end + 'HHH', data, 0x3A)
     fmt = end + 'IIQQQQIIQQ'
 else:
     (e_shoff,) = struct.unpack_from(end + 'I', data, 0x20)
-    e_shentsize, e_shnum, e_shstrndx = struct.unpack_from(end + 'HHH', data, 0x2E)
+    e_shentsize, e_shnum, _ = struct.unpack_from(end + 'HHH', data, 0x2E)
     fmt = end + 'IIIIIIIIII'
 
 
@@ -85,26 +85,27 @@ def section(index):
     return struct.unpack_from(fmt, data, e_shoff + index * e_shentsize)
 
 
-_, _, _, _, str_off, str_size, _, _, _, _ = section(e_shstrndx)
-strtab = data[str_off:str_off + str_size]
-
-code = b''
+# Executable sections are kept separate rather than concatenated: a 16-bit
+# pattern is only a real instruction at a halfword-aligned offset within its
+# own section, and concatenating would let a coincidental byte pair straddling
+# a section boundary (or an odd offset inside a wider instruction) satisfy the
+# search.
+code = []
 for i in range(e_shnum):
-    name_off = section(i)[0]
     sh_flags, sh_offset, sh_size = section(i)[2], section(i)[4], section(i)[5]
-    name = strtab[name_off:strtab.index(b'\0', name_off)].decode() if name_off < len(strtab) else ''
     if sh_flags & 0x4 and sh_flags & 0x2:              # SHF_EXECINSTR | SHF_ALLOC
-        code += data[sh_offset:sh_offset + sh_size]
-        _ = name
+        code.append(data[sh_offset:sh_offset + sh_size])
 
 for word in wanted:
     value = int(word, 0)
     for width in (4, 2):                               # full and compressed form
         if value >= 1 << (8 * width):
             continue
-        packed = struct.pack(end + 'I', value)
-        if (packed if little else packed[::-1])[:width] in code or packed[:width] in code:
-            sys.exit(0)
+        packed = struct.pack(end + 'I', value)[:width]
+        for sec in code:
+            # Step by `width`: only instruction-aligned offsets for that form.
+            if any(sec[o:o + width] == packed for o in range(0, len(sec) - width + 1, width)):
+                sys.exit(0)
 print(f'{path}: none of {" ".join(wanted)} is encoded in an executable section', file=sys.stderr)
 sys.exit(1)
 PYEOF
@@ -224,8 +225,22 @@ done
 #    first), so this pins the mechanism the emitters rely on -- an explicit
 #    trap, which is the same instruction `emit_unreachable` emits for an
 #    unlowerable op.
-for spec in "arm:$ccc_arm:0xd4200000" "riscv:$ccc_riscv:0x00100073"; do
-    label=${spec%%:*}; rest=${spec#*:}; tool=${rest%%:*}; enc=${rest##*:}
+#
+#    RISC-V has two legal spellings of that trap and either is correct: with
+#    the C extension `ebreak` has the 16-bit alias `c.ebreak` (0x9002), and GNU
+#    as's own opcode table lists the mnemonic twice --
+#    `{"ebreak", "C", MATCH_C_EBREAK, ..., INSN_ALIAS}` ahead of the 32-bit
+#    `{"ebreak", "I", MATCH_EBREAK, ...}` -- so an RVC-enabled assembler emits
+#    the alias.  The Linux kernel hit this same stale-assumption bug in
+#    `is_valid_bugaddr()` and now carries `__BUG_INSN_32`/`__BUG_INSN_16` for
+#    exactly this reason.  What is under test is that *a* trap is encoded in an
+#    executable section, not which spelling the assembler chose: requiring only
+#    the 32-bit form would fail a correct assembler, and accepting both keeps
+#    the property the check exists for (a trap the assembler dropped, or turned
+#    into something else, still fails).
+for spec in "arm:$ccc_arm:0xd4200000" "riscv:$ccc_riscv:0x00100073:0x9002"; do
+    label=${spec%%:*}; rest=${spec#*:}; tool=${rest%%:*}; encs=${rest#*:}
+    IFS=: read -r -a enc_arr <<<"$encs"
     printf 'void lccc_trap_probe(void) { __builtin_trap(); }\n' >"$tmp/trap.c"
     "$tool" -O1 -S "$tmp/trap.c" -o "$tmp/trap-$label.s"
     body=$(function_body lccc_trap_probe "$tmp/trap-$label.s")
@@ -236,8 +251,8 @@ for spec in "arm:$ccc_arm:0xd4200000" "riscv:$ccc_riscv:0x00100073"; do
                  { printf '%s\n' "$body" >&2; fail "RISC-V: the trap is no longer ebreak"; } ;;
     esac
     "$tool" -O1 -c "$tmp/trap.c" -o "$tmp/trap-$label.o"
-    trap_in_object "$tmp/trap-$label.o" "$enc" ||
-        fail "$label: the trap is not encoded in the object"
+    trap_in_object "$tmp/trap-$label.o" "${enc_arr[@]}" ||
+        fail "$label: the trap is not encoded in the object (wanted: ${enc_arr[*]})"
 done
 
 echo "PASS: x86-only intrinsics are rejected off x86 with a diagnostic, portable ones lower, and the trap safety net encodes"

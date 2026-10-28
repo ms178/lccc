@@ -636,22 +636,65 @@ const DIRECT_LD_AARCH64: DirectLdArchConfig = DirectLdArchConfig {
 // then discovers crt1.o under $LCCC_SYSROOT/usr/lib32 and crtbegin.o under
 // $LCCC_SYSROOT/usr/lib/gcc/i686-linux-gnu/<ver> when those exist.
 
+/// The sysroot a driver was given on its command line, if any.
+///
+/// `lccc-ld` used to publish `--sysroot=DIR` by calling `std::env::set_var`,
+/// laundering a parsed command-line argument through `environ` so that callees
+/// could find it again.  That is the one thing this tree forbids outside
+/// `src/test_support.rs` (see `tests/regression/check_env_test_hygiene.sh`):
+/// glibc's `setenv` may reallocate the `environ` array another thread's
+/// `getenv` is walking, which is precisely why edition 2024 made the call
+/// `unsafe`.  The override carries the same information without the mutation:
+/// one write before any input is read, immutable afterwards, and reading it
+/// costs an atomic load instead of an `environ` scan plus a `String`.
+static SYSROOT_OVERRIDE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Record `--sysroot=DIR` for this process.
+///
+/// Called once from `main`, before any input is read.  GNU ld's "last one wins"
+/// is already resolved by the caller (`sysroot_arg` in `lccc-ld`), and
+/// `--sysroot=/` never arrives here: it is the host root and changes no path.
+/// Trailing slashes are stripped once, at install time, rather than on every
+/// candidate path the process resolves.
+pub(crate) fn set_sysroot_override(root: &str) {
+    let root = root.trim_end_matches('/');
+    if !root.is_empty() {
+        let _ = SYSROOT_OVERRIDE.set(root.to_string());
+    }
+}
+
+/// The active sysroot, trailing slashes stripped: the command-line override,
+/// else `LCCC_SYSROOT`.  `None` when neither is set, which is the normal case
+/// and the one that allocates nothing.
+pub(crate) fn sysroot() -> Option<std::borrow::Cow<'static, str>> {
+    if let Some(root) = SYSROOT_OVERRIDE.get() {
+        return Some(std::borrow::Cow::Borrowed(root.as_str()));
+    }
+    let root = std::env::var("LCCC_SYSROOT").ok()?;
+    let root = root.trim_end_matches('/');
+    if root.is_empty() {
+        return None;
+    }
+    Some(std::borrow::Cow::Owned(root.to_string()))
+}
+
 /// Map an absolute candidate path onto the active sysroot (if any).
 // NOTE: deliberately NOT gated on `not(feature = "gcc_linker")`: the always-
 // compiled i686 shared-library linker (linker/shared.rs) resolves NEEDED
 // libraries through the sysroot helpers under every feature combination.
 pub(crate) fn with_sysroot_prefix(path: &str) -> String {
-    match std::env::var("LCCC_SYSROOT") {
-        Ok(root) if !root.is_empty() => format!("{}{}", root.trim_end_matches('/'), path),
-        _ => path.to_string(),
+    match sysroot() {
+        Some(root) => format!("{root}{path}"),
+        None => path.to_string(),
     }
 }
 
-/// If `path` is already rooted beneath `LCCC_SYSROOT`, return its equivalent
-/// absolute host path. Require a path-component boundary: a sysroot `/opt/root`
-/// must not match `/opt/root-old/file` and turn the suffix into a relative path.
+/// If `path` is already rooted beneath the active sysroot, return its
+/// equivalent absolute host path. Require a path-component boundary: a sysroot
+/// `/opt/root` must not match `/opt/root-old/file` and turn the suffix into a
+/// relative path.
 pub(crate) fn strip_sysroot_prefix(path: &str) -> Option<String> {
-    let root = std::env::var("LCCC_SYSROOT").ok()?;
+    let root = sysroot()?;
     strip_sysroot_prefix_from(path, &root)
 }
 

@@ -84,10 +84,12 @@ fn main() {
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<String> = expand_response_files(&raw_args);
     if let Some(root) = sysroot_arg(&args) {
-        // SAFETY: nothing has spawned a thread yet, so no other thread can
-        // be reading the environment.  The backends look the sysroot up in
-        // `LCCC_SYSROOT`, the variable the driver documents.
-        unsafe { std::env::set_var("LCCC_SYSROOT", root) };
+        // Publish `--sysroot` without mutating the process environment: glibc's
+        // `setenv` may reallocate the `environ` array another thread is walking
+        // (why edition 2024 made `set_var` unsafe), and this tree confines
+        // environment mutation to `src/test_support.rs`.  The backends resolve
+        // the same value through `backend::common::sysroot`.
+        lccc::linker_entry::set_sysroot_override(root);
     }
 
     // Last line of defence against a panic on malformed input.

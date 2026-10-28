@@ -1515,7 +1515,7 @@
       "source": "measured: scripts/ci_gate_costs.py (previous plan measured_s); Errexit-negation detector 1 s by scripts/ci_local.sh --fast (0 s + 0 s, floored)"
     },
     "frontend": {
-      "costs": "/home/user/.cache/tmp/frontend-costs.tsv",
+      "costs": "/tmp/frontend-costs.tsv",
       "measured_seconds_total": 809.95,
       "source": "measured: previous plan measured_s (GitHub Actions run 40479214961 frontend step timings; floor/store-forwarding/x86-execute gates at their initial estimates; GCC 16.2 diagnostic severity parity 2.45 s: 1.67 s as recorded by #992 plus 0.78 s for the check_operand_diagnostics.sh leg #993 appended, measured locally); trapv ABI legs 2.0 s each: the 1,999 s / 1,953 s hosted on 09724bee2 were the runner's core_pattern handler (910 SIGABRTs per leg), gone since the matrix became non-dumpable (1.24 s / 1.36 s locally under a 50 ms pipe handler)"
     }
