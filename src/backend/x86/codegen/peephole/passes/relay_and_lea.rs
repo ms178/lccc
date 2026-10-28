@@ -6718,13 +6718,10 @@ mod tests {
         // The imm32 sign-extension boundary: bits 32..63 of the effective mask
         // are all ones, so the source's upper half survives.
         assert_eq!(
-            super::andq_imm_narrow_width("andq $2147483648, %r10", 10),
+            super::andq_imm_narrow_width("andq $-2147483648, %r10", 10),
             None
         );
-        assert_eq!(
-            super::andq_imm_narrow_width("andq $4294967295, %r10", 10),
-            None
-        );
+        assert_eq!(super::andq_imm_narrow_width("andq $-1, %r10", 10), None);
         // A register mask cannot bound the result.
         assert_eq!(super::andq_imm_narrow_width("andq %rax, %r10", 10), None);
         // The 32-bit form is not this predicate's job (dword rule handles it).
@@ -6766,7 +6763,7 @@ mod tests {
             "foo:\n",
             ".cfi_startproc\n",
             "    movq %rdi, %r10\n",
-            "    andq $2147483648, %r10\n",
+            "    andq $-2147483648, %r10\n",
             "    movl %r10d, %esi\n",
             "    orq %rsi, %rdx\n",
             "    ret\n",
