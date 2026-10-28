@@ -506,12 +506,12 @@ impl Parser {
         // First colon: outputs
         if matches!(self.peek(), TokenKind::Colon) {
             self.advance();
-            outputs = self.parse_asm_operands();
+            outputs = self.parse_asm_operands(false);
 
             // Second colon: inputs
             if matches!(self.peek(), TokenKind::Colon) {
                 self.advance();
-                inputs = self.parse_asm_operands();
+                inputs = self.parse_asm_operands(true);
 
                 // Third colon: clobbers
                 if matches!(self.peek(), TokenKind::Colon) {
@@ -611,13 +611,13 @@ impl Parser {
         narrow_string_byte_carrier_to_utf8(&byte_carrier).unwrap_or(byte_carrier)
     }
 
-    fn parse_asm_operands(&mut self) -> Vec<AsmOperand> {
+    fn parse_asm_operands(&mut self, is_input: bool) -> Vec<AsmOperand> {
         let mut operands = Vec::with_capacity(8);
         if matches!(self.peek(), TokenKind::Colon | TokenKind::RParen) {
             return operands;
         }
         loop {
-            let operand = self.parse_one_asm_operand();
+            let operand = self.parse_one_asm_operand(is_input);
             operands.push(operand);
             if !self.consume_if(&TokenKind::Comma) {
                 break;
@@ -626,7 +626,7 @@ impl Parser {
         operands
     }
 
-    fn parse_one_asm_operand(&mut self) -> AsmOperand {
+    fn parse_one_asm_operand(&mut self, is_input: bool) -> AsmOperand {
         // Optional [name]
         let name = if matches!(self.peek(), TokenKind::LBracket) {
             let open = self.peek_span();
@@ -646,11 +646,40 @@ impl Parser {
 
         // Constraint string (may be concatenated)
         let constraint = if let TokenKind::StringLiteral(s) = self.peek() {
+            let span = self.peek_span();
             let mut full = s.clone();
             self.advance();
             while let TokenKind::StringLiteral(s2) = self.peek() {
                 full.push_str(s2);
                 self.advance();
+            }
+            // GCC 16.2's constraint-direction contract (measured exact
+            // wordings): inputs may not carry the output-only `=`/`+`
+            // modifiers, and outputs must ask for a written location with
+            // one of them. Checked here so a bad statement never reaches
+            // lowering, exactly like GCC's parse-time rejection.
+            if is_input {
+                if full.contains('=') {
+                    self.emit_error("input operand constraint contains '='", span);
+                } else if full.contains('+') {
+                    self.emit_error("input operand constraint contains '+'", span);
+                }
+            } else if !full.is_empty() {
+                if !full.contains('=') && !full.contains('+') {
+                    self.emit_error("output operand constraint lacks '='", span);
+                } else if let Some(comma) = full.find(',') {
+                    // Alternatives after the first may not re-introduce the
+                    // write modifiers (measured on gcc-16.2: `=r,=r` ->
+                    // `operand constraint contains incorrectly positioned
+                    // '+' or '='`).
+                    let rest = &full[comma + 1..];
+                    if rest.contains('=') || rest.contains('+') {
+                        self.emit_error(
+                            "operand constraint contains incorrectly positioned '+' or '='",
+                            span,
+                        );
+                    }
+                }
             }
             full
         } else {

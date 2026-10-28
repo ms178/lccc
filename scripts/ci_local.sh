@@ -822,6 +822,21 @@ gate "warning-compatibility" fast \
 gate "warning-precedence" fast \
     python3 tests/regression/check_warning_precedence.py \
         --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"
+gate "macro-parity" fast \
+    python3 tests/regression/check_macro_parity.py \
+        --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"
+gate "has-builtin-features" fast \
+    python3 tests/regression/check_has_builtin_features.py \
+        --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"
+gate "asm-constraints" fast \
+    python3 tests/regression/check_asm_constraints.py \
+        --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"
+gate "driver-queries" fast \
+    python3 tests/regression/check_driver_queries.py \
+        --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"
+gate "option-effect-ledger" fast \
+    python3 tests/regression/check_option_effect_ledger.py \
+        --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"
 gate "attribute-diagnostics" fast \
     env GCC="${GCC16:-gcc-16}" python3 tests/regression/check_attribute_diagnostics.py
 gate "dwarf-line-tables" fast \

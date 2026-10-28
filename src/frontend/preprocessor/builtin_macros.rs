@@ -30,6 +30,7 @@ fn def(macros: &mut MacroTable, name: &str, body: &str) {
 /// Define the compiler-owned predefined macros (see the module docs).
 pub fn define_builtin_macros(macros: &mut MacroTable) {
     define_stdatomic_macros(macros);
+    define_extra_gcc_predefines(macros);
     // assert() is NOT defined here. It comes from the system <assert.h> header,
     // which properly handles NDEBUG. Code that uses assert() without including
     // <assert.h> will correctly get a compilation error.
@@ -131,7 +132,248 @@ fn define_type_traits_macros(macros: &mut MacroTable) {
     // atomics (measured: lccc defined it while GCC 16.2 did not).
     def(macros, "__STDC_UTF_16__", "1");
     def(macros, "__STDC_UTF_32__", "1");
-    // We support _Complex types, so __STDC_NO_COMPLEX__ is NOT defined.
-    // __STDC_NO_THREADS__ is NOT defined: glibc provides <threads.h>.
-    // VLA declarations lower to DynAlloca, so __STDC_NO_VLA__ is NOT defined.
+    // NOTE: `__STDC_NO_ATOMICS__` is deliberately NOT predefined. LCCC
+    // implements the __atomic_* builtins (GCC predefines none of the
+    // glibc-facing atomics claims either); claiming no-atomics broke
+    // <stdatomic.h>'s capability path (GP-05 measurement).
+    // Note: We support _Complex types, so __STDC_NO_COMPLEX__ is NOT defined.
+    // __STDC_NO_THREADS__ is NOT defined because we link against glibc which provides <threads.h>
+    // VLA declarations lower to DynAlloca and are supported. Do not define
+    // __STDC_NO_VLA__: autoconf uses its presence as a hard capability denial.
+}
+
+/// GCC 16.2 predefines LCCC lacked, derived from a complete `gcc-16.2 -dM
+/// -E` differential (2026-10-28, GP-05): the compiler-owned
+/// `__U<INT…>_MAX__`/`_C()` limit family, the atomics lock-free and
+/// compare-exchange claims glibc's fast paths test, the IEC-559/ISO-10646
+/// claims, segment-address support, and the binary32/64/128 `_FloatN`
+/// capability probes. Values are verbatim GCC output. GCC-only names NOT
+/// added here (decimal-FP `__DEC*` macros, unverified `__GCC_*` asm/CFI
+/// claims, HLE hints, C++ ABI identity) remain pinned as honest gaps in
+/// `tests/regression/check_macro_parity.py`.
+const EXTRA_GCC_PREDEFINES: &[(&str, &str)] = &[
+    ("_STDC_PREDEF_H", "1"),
+    ("__BIGGEST_ALIGNMENT__", "16"),
+    ("__BITINT_MAXWIDTH__", "65535"),
+    ("__CHAR8_TYPE__", "unsigned char"),
+    ("__DBL_IS_IEC_60559__", "1"),
+    (
+        "__DBL_NORM_MAX__",
+        "((double)1.79769313486231570814527423731704357e+308L)",
+    ),
+    ("__FINITE_MATH_ONLY__", "0"),
+    ("__FLOAT_WORD_ORDER__", "__ORDER_LITTLE_ENDIAN__"),
+    ("__FLT128_IS_IEC_60559__", "1"),
+    ("__FLT32X_DECIMAL_DIG__", "17"),
+    (
+        "__FLT32X_DENORM_MIN__",
+        "4.94065645841246544176568792868221372e-324F32x",
+    ),
+    ("__FLT32X_DIG__", "15"),
+    (
+        "__FLT32X_EPSILON__",
+        "2.22044604925031308084726333618164062e-16F32x",
+    ),
+    ("__FLT32X_HAS_DENORM__", "1"),
+    ("__FLT32X_HAS_INFINITY__", "1"),
+    ("__FLT32X_HAS_QUIET_NAN__", "1"),
+    ("__FLT32X_IS_IEC_60559__", "1"),
+    ("__FLT32X_MANT_DIG__", "53"),
+    ("__FLT32X_MAX_10_EXP__", "308"),
+    ("__FLT32X_MAX_EXP__", "1024"),
+    (
+        "__FLT32X_MAX__",
+        "1.79769313486231570814527423731704357e+308F32x",
+    ),
+    ("__FLT32X_MIN_10_EXP__", "(-307)"),
+    ("__FLT32X_MIN_EXP__", "(-1021)"),
+    (
+        "__FLT32X_MIN__",
+        "2.22507385850720138309023271733240406e-308F32x",
+    ),
+    (
+        "__FLT32X_NORM_MAX__",
+        "1.79769313486231570814527423731704357e+308F32x",
+    ),
+    ("__FLT32_DECIMAL_DIG__", "9"),
+    (
+        "__FLT32_DENORM_MIN__",
+        "1.40129846432481707092372958328991613e-45F32",
+    ),
+    ("__FLT32_DIG__", "6"),
+    (
+        "__FLT32_EPSILON__",
+        "1.19209289550781250000000000000000000e-7F32",
+    ),
+    ("__FLT32_HAS_DENORM__", "1"),
+    ("__FLT32_HAS_INFINITY__", "1"),
+    ("__FLT32_HAS_QUIET_NAN__", "1"),
+    ("__FLT32_IS_IEC_60559__", "1"),
+    ("__FLT32_MANT_DIG__", "24"),
+    ("__FLT32_MAX_10_EXP__", "38"),
+    ("__FLT32_MAX_EXP__", "128"),
+    (
+        "__FLT32_MAX__",
+        "3.40282346638528859811704183484516925e+38F32",
+    ),
+    ("__FLT32_MIN_10_EXP__", "(-37)"),
+    ("__FLT32_MIN_EXP__", "(-125)"),
+    (
+        "__FLT32_MIN__",
+        "1.17549435082228750796873653722224568e-38F32",
+    ),
+    (
+        "__FLT32_NORM_MAX__",
+        "3.40282346638528859811704183484516925e+38F32",
+    ),
+    ("__FLT64X_DECIMAL_DIG__", "21"),
+    (
+        "__FLT64X_DENORM_MIN__",
+        "3.64519953188247460252840593361941982e-4951F64x",
+    ),
+    ("__FLT64X_DIG__", "18"),
+    (
+        "__FLT64X_EPSILON__",
+        "1.08420217248550443400745280086994171e-19F64x",
+    ),
+    ("__FLT64X_HAS_DENORM__", "1"),
+    ("__FLT64X_HAS_INFINITY__", "1"),
+    ("__FLT64X_HAS_QUIET_NAN__", "1"),
+    ("__FLT64X_IS_IEC_60559__", "1"),
+    ("__FLT64X_MANT_DIG__", "64"),
+    ("__FLT64X_MAX_10_EXP__", "4932"),
+    ("__FLT64X_MAX_EXP__", "16384"),
+    (
+        "__FLT64X_MAX__",
+        "1.18973149535723176502126385303097021e+4932F64x",
+    ),
+    ("__FLT64X_MIN_10_EXP__", "(-4931)"),
+    ("__FLT64X_MIN_EXP__", "(-16381)"),
+    (
+        "__FLT64X_MIN__",
+        "3.36210314311209350626267781732175260e-4932F64x",
+    ),
+    (
+        "__FLT64X_NORM_MAX__",
+        "1.18973149535723176502126385303097021e+4932F64x",
+    ),
+    ("__FLT64_DECIMAL_DIG__", "17"),
+    (
+        "__FLT64_DENORM_MIN__",
+        "4.94065645841246544176568792868221372e-324F64",
+    ),
+    ("__FLT64_DIG__", "15"),
+    (
+        "__FLT64_EPSILON__",
+        "2.22044604925031308084726333618164062e-16F64",
+    ),
+    ("__FLT64_HAS_DENORM__", "1"),
+    ("__FLT64_HAS_INFINITY__", "1"),
+    ("__FLT64_HAS_QUIET_NAN__", "1"),
+    ("__FLT64_IS_IEC_60559__", "1"),
+    ("__FLT64_MANT_DIG__", "53"),
+    ("__FLT64_MAX_10_EXP__", "308"),
+    ("__FLT64_MAX_EXP__", "1024"),
+    (
+        "__FLT64_MAX__",
+        "1.79769313486231570814527423731704357e+308F64",
+    ),
+    ("__FLT64_MIN_10_EXP__", "(-307)"),
+    ("__FLT64_MIN_EXP__", "(-1021)"),
+    (
+        "__FLT64_MIN__",
+        "2.22507385850720138309023271733240406e-308F64",
+    ),
+    (
+        "__FLT64_NORM_MAX__",
+        "1.79769313486231570814527423731704357e+308F64",
+    ),
+    ("__FLT_IS_IEC_60559__", "1"),
+    (
+        "__FLT_NORM_MAX__",
+        "3.40282346638528859811704183484516925e+38F",
+    ),
+    ("__FXSR__", "1"),
+    ("__GCC_ATOMIC_CHAR8_T_LOCK_FREE", "2"),
+    ("__GCC_ATOMIC_TEST_AND_SET_TRUEVAL", "1"),
+    ("__GCC_HAVE_SYNC_COMPARE_AND_SWAP_1", "1"),
+    ("__GCC_HAVE_SYNC_COMPARE_AND_SWAP_2", "1"),
+    ("__GCC_HAVE_SYNC_COMPARE_AND_SWAP_4", "1"),
+    ("__GCC_HAVE_SYNC_COMPARE_AND_SWAP_8", "1"),
+    ("__GCC_IEC_559", "2"),
+    ("__GCC_IEC_559_COMPLEX", "2"),
+    ("__GNUC_EXECUTION_CHARSET_NAME", "\"UTF-8\""),
+    ("__GNUC_WIDE_EXECUTION_CHARSET_NAME", "\"UTF-32LE\""),
+    ("__INT16_MAX__", "0x7fff"),
+    ("__INT32_MAX__", "0x7fffffff"),
+    ("__INT64_MAX__", "0x7fffffffffffffffL"),
+    ("__INT8_MAX__", "0x7f"),
+    ("__INTMAX_MAX__", "0x7fffffffffffffffL"),
+    ("__INTPTR_MAX__", "0x7fffffffffffffffL"),
+    ("__INT_FAST16_MAX__", "0x7fffffffffffffffL"),
+    ("__INT_FAST32_MAX__", "0x7fffffffffffffffL"),
+    ("__INT_FAST64_MAX__", "0x7fffffffffffffffL"),
+    ("__INT_FAST8_MAX__", "0x7f"),
+    ("__INT_LEAST16_MAX__", "0x7fff"),
+    ("__INT_LEAST32_MAX__", "0x7fffffff"),
+    ("__INT_LEAST64_MAX__", "0x7fffffffffffffffL"),
+    ("__INT_LEAST8_MAX__", "0x7f"),
+    ("__LDBL_IS_IEC_60559__", "1"),
+    (
+        "__LDBL_NORM_MAX__",
+        "1.18973149535723176502126385303097021e+4932L",
+    ),
+    ("__NO_INLINE__", "1"),
+    ("__SEG_FS", "1"),
+    ("__SEG_GS", "1"),
+    ("__SIG_ATOMIC_TYPE__", "int"),
+    ("__SIZEOF_FLOAT80__", "16"),
+    ("__STDC_IEC_559_COMPLEX__", "1"),
+    ("__STDC_IEC_559__", "1"),
+    ("__STDC_IEC_60559_BFP__", "201404L"),
+    ("__STDC_IEC_60559_COMPLEX__", "201404L"),
+    ("__STDC_ISO_10646__", "201706L"),
+    ("__UINT16_MAX__", "0xffff"),
+    ("__UINT32_MAX__", "0xffffffffU"),
+    ("__UINT64_MAX__", "0xffffffffffffffffUL"),
+    ("__UINT8_MAX__", "0xff"),
+    ("__UINTMAX_MAX__", "0xffffffffffffffffUL"),
+    ("__UINTPTR_MAX__", "0xffffffffffffffffUL"),
+    ("__UINT_FAST16_MAX__", "0xffffffffffffffffUL"),
+    ("__UINT_FAST32_MAX__", "0xffffffffffffffffUL"),
+    ("__UINT_FAST64_MAX__", "0xffffffffffffffffUL"),
+    ("__UINT_FAST8_MAX__", "0xff"),
+    ("__UINT_LEAST16_MAX__", "0xffff"),
+    ("__UINT_LEAST32_MAX__", "0xffffffffU"),
+    ("__UINT_LEAST64_MAX__", "0xffffffffffffffffUL"),
+    ("__UINT_LEAST8_MAX__", "0xff"),
+];
+
+const EXTRA_GCC_FUNC_PREDEFINES: &[(&str, &[&str], &str)] = &[
+    ("__INT16_C", &["c"], "c"),
+    ("__INT32_C", &["c"], "c"),
+    ("__INT64_C", &["c"], "c ## L"),
+    ("__INT8_C", &["c"], "c"),
+    ("__INTMAX_C", &["c"], "c ## L"),
+    ("__UINT16_C", &["c"], "c"),
+    ("__UINT32_C", &["c"], "c ## U"),
+    ("__UINT64_C", &["c"], "c ## UL"),
+    ("__UINT8_C", &["c"], "c"),
+    ("__UINTMAX_C", &["c"], "c ## UL"),
+];
+
+fn define_extra_gcc_predefines(macros: &mut MacroTable) {
+    for &(name, body) in EXTRA_GCC_PREDEFINES {
+        def(macros, name, body);
+    }
+    for &(name, params, body) in EXTRA_GCC_FUNC_PREDEFINES {
+        macros.define(MacroDef {
+            name: name.to_string(),
+            is_function_like: true,
+            params: params.iter().map(|p| p.to_string()).collect(),
+            is_variadic: false,
+            has_named_variadic: false,
+            body: body.to_string(),
+        });
+    }
 }

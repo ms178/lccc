@@ -307,6 +307,14 @@ pub struct Driver {
     /// profile it selects); explicit `-msse`/`-msse2` still override the
     /// veto at resolve time.
     pub(super) march_pre_sse: bool,
+    /// Whether the final `-march=` CPU carries FXSR (`F::Fxsr` in the
+    /// generated ISA table). Drives `__FXSR__` on i686; x86-64 defines it
+    /// unconditionally (measured on GCC 16.2).
+    pub(super) march_fxsr: bool,
+    /// Explicit `-mfxsr`/`-mno-fxsr` (last one wins; measured: GCC's flag
+    /// overrides even the `-march` row, e.g. `-march=k6 -mfxsr` defines
+    /// `__FXSR__` and `-march=pentium4 -mno-fxsr` drops it).
+    pub(super) fxsr_override: Option<bool>,
     /// The pre-SSE2 `-march=` CPU has MMX (Pentium MMX/II/III, K6, WinChip,
     /// the Athlons): GCC 16.2 keeps `__MMX__` there, `-mno-sse` included.
     /// Meaningful only with `march_pre_sse`; set with it per `-march=`.
@@ -687,6 +695,8 @@ impl Driver {
             enable_sse2: false,
             march_pre_sse: false,
             march_pre_sse_mmx: false,
+            march_fxsr: true,
+            fxsr_override: None,
             movbe_explicitly_disabled: false,
             cx16_explicitly_disabled: false,
             x86_explicit_isa_args: Vec::new(),
@@ -1866,6 +1876,15 @@ impl Driver {
             )
         };
         preprocessor.set_sse_macros(sse_on, sse2_on, mmx_on);
+        // `__FXSR__` is march-driven only: GCC 16.2 defines it for every
+        // x86-64 invocation (even -mno-sse/-mgeneral-regs-only/-mno-mmx,
+        // measured) and on i686 exactly for `-march=` CPUs whose row carries
+        // Fxsr (pentium2+/k8 yes; pentium*/k6/athlon/via/geode/lakemont/
+        // i686 no - measured against the generated table).
+        let fxsr_on = self
+            .fxsr_override
+            .unwrap_or(self.target == Target::X86_64 || self.march_fxsr);
+        preprocessor.set_fxsr_macro(fxsr_on);
 
         // Define extended feature macros (__SSE3__, __AVX__, __BMI__, ...).
         // The SIMD half is gated on the xmm file being open and its SSE2

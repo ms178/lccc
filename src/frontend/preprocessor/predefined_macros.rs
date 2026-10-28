@@ -876,6 +876,22 @@ impl Preprocessor {
         apply_sse_macro_levels(&mut self.macros, is_x86_64, sse_on, sse2_on, mmx_on);
     }
 
+    /// Publish `__FXSR__` for the active x86 target (the driver resolves
+    /// the level: always on x86-64, the `-march` row's Fxsr bit on i686;
+    /// measured against GCC 16.2, which ignores -mno-sse/-mno-mmx/
+    /// -mgeneral-regs-only for this macro). No-op on non-x86 targets.
+    pub fn set_fxsr_macro(&mut self, on: bool) {
+        let is_x86 = self.macros.is_defined("__x86_64__") || self.macros.is_defined("__i386__");
+        if !is_x86 {
+            return;
+        }
+        if on {
+            self.define_simple_macro("__FXSR__", "1");
+        } else {
+            self.macros.undefine("__FXSR__");
+        }
+    }
+
     /// Define extended SIMD feature macros (__SSE3__, __AVX__, __AVX2__, etc.)
     /// when the corresponding -msse3, -mavx, -mavx2 flags are passed.
     /// Projects like blosc use #ifdef __AVX2__ to select optimized code paths.
@@ -1280,17 +1296,10 @@ impl Preprocessor {
                 self.define_simple_macro("__LONG_MAX__", "2147483647L");
                 self.define_simple_macro("__SIZE_MAX__", "4294967295U");
                 self.define_simple_macro("__PTRDIFF_MAX__", "2147483647");
-                // Override <limits.h> macros for ILP32 (long is 32-bit)
-                self.define_simple_macro("LONG_MIN", "(-2147483647L-1L)");
-                self.define_simple_macro("LONG_MAX", "2147483647L");
-                self.define_simple_macro("ULONG_MAX", "4294967295UL");
-                // Override <stdint.h> macros for ILP32 (pointer/size_t are 32-bit)
-                self.define_simple_macro("INTPTR_MIN", "(-2147483647-1)");
-                self.define_simple_macro("INTPTR_MAX", "2147483647");
-                self.define_simple_macro("UINTPTR_MAX", "4294967295U");
-                self.define_simple_macro("SIZE_MAX", "4294967295U");
-                self.define_simple_macro("PTRDIFF_MIN", "(-2147483647-1)");
-                self.define_simple_macro("PTRDIFF_MAX", "2147483647");
+                // NOTE: the unprefixed `<limits.h>`/`<stdint.h>` macros are
+                // deliberately NOT defined here (or at the LP64 default):
+                // GCC predefines none of them in any dialect (measured), so
+                // bare uses must fail equally in both compilers (GP-05).
                 // Type names for ILP32 (long is 32-bit, so many types change)
                 self.define_simple_macro("__SIZE_TYPE__", "unsigned int");
                 self.define_simple_macro("__PTRDIFF_TYPE__", "int");

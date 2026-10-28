@@ -1125,6 +1125,16 @@ jobs:
           --lccc target/fastbuild/lccc --gcc gcc-16
         python3 tests/regression/check_warning_precedence.py \
           --lccc target/fastbuild/lccc --gcc gcc-16
+        python3 tests/regression/check_macro_parity.py \
+          --lccc target/fastbuild/lccc --gcc gcc-16
+        python3 tests/regression/check_has_builtin_features.py \
+          --lccc target/fastbuild/lccc --gcc gcc-16
+        python3 tests/regression/check_asm_constraints.py \
+          --lccc target/fastbuild/lccc --gcc gcc-16
+        python3 tests/regression/check_driver_queries.py \
+          --lccc target/fastbuild/lccc --gcc gcc-16
+        python3 tests/regression/check_option_effect_ledger.py \
+          --lccc target/fastbuild/lccc --gcc gcc-16
         env GCC=gcc-16 python3 tests/regression/check_attribute_diagnostics.py
     - name: Cargo gate resource isolation
       run: python3 scripts/test_ci_resources.py

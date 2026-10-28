@@ -152,6 +152,17 @@ pub enum WarningKind {
     /// call them compatible).
     /// GCC flag: -Wcompare-distinct-pointer-types
     CompareDistinctPointerTypes,
+    /// ISO C language-extension constraints (the `-pedantic` family).
+    /// Measured on GCC 16.2: `-pedantic`/`-Wpedantic` warn and
+    /// `-pedantic-errors` errors with the PLAIN `[-Wpedantic]` label,
+    /// while `-Werror=pedantic` prints `[-Werror=pedantic]`.
+    /// GCC flag: -Wpedantic / -pedantic / -pedantic-errors
+    Pedantic,
+    /// A block-scope array bound is not an integer constant expression
+    /// (measured GCC 16.2: default-off, NOT in -Wall/-Wextra, message
+    /// `ISO C90 forbids variable length array '<name>'`).
+    /// GCC flag: -Wvla
+    Vla,
 }
 
 /// Supported warning groups. `-Wall` and `-Wextra` are broad groups;
@@ -336,6 +347,22 @@ pub const WARNING_REGISTRY: &[WarningDescriptor] = &[
         false,
         "comparison of pointers with distinct pointee types"
     ),
+    warning!(
+        Pedantic,
+        "pedantic",
+        false,
+        [],
+        false,
+        "ISO C language-extension constraints (statement expressions, ...)"
+    ),
+    warning!(
+        Vla,
+        "vla",
+        false,
+        [],
+        false,
+        "variable length array at block scope"
+    ),
 ];
 
 impl WarningKind {
@@ -474,6 +501,16 @@ impl WarningConfig {
         self.errors.insert(kind);
         self.not_errors.remove(&kind);
         self.enable(kind);
+    }
+
+    /// `-pedantic-errors`: the diagnostic becomes an error with GCC's
+    /// PLAIN `[-Wpedantic]` label (the same default-severity promotion
+    /// class as the dialect default errors), and a later spelling wins
+    /// over an earlier `-Wno-error=` (measured).
+    pub fn set_dialect_error(&mut self, kind: WarningKind) {
+        self.enable(kind);
+        self.not_errors.remove(&kind);
+        self.default_errors.insert(kind);
     }
 
     pub fn clear_werror(&mut self, kind: WarningKind) {
@@ -1575,6 +1612,8 @@ mod dialect_severity_redteam_tests {
             WarningKind::PointerToIntCast,
             WarningKind::IntToPointerCast,
             WarningKind::CompareDistinctPointerTypes,
+            WarningKind::Pedantic,
+            WarningKind::Vla,
         ];
         let registered: HashSet<_> = WARNING_REGISTRY.iter().map(|entry| entry.kind).collect();
         let names: HashSet<_> = WARNING_REGISTRY.iter().map(|entry| entry.name).collect();
@@ -1588,7 +1627,9 @@ mod dialect_severity_redteam_tests {
         for group in ["all", "extra", "implicit", "unused"] {
             assert!(WarningConfig::recognizes_name(group));
         }
-        assert!(!WarningConfig::recognizes_name("pedantic"));
+        // GP-10 landed the leaf: -Wpedantic is now a recognised name, and
+        // the Pedantic *group* slot stays reserved (no members yet).
+        assert!(WarningConfig::recognizes_name("pedantic"));
     }
 
     #[test]

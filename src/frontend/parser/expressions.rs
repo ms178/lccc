@@ -1096,6 +1096,15 @@ impl Parser {
                     let span = self.peek_span();
                     let compound = self.parse_compound_stmt();
                     self.expect_closing(&TokenKind::RParen, open);
+                    // Measured on GCC 16.2: `-pedantic`/`-Wpedantic` warn
+                    // "ISO C forbids braced-groups within expressions
+                    // [-Wpedantic]" (and `-pedantic-errors` errors) in every
+                    // dialect; silent by default and under -Wall/-Wextra.
+                    self.diagnostics.warning_with_kind(
+                        "ISO C forbids braced-groups within expressions",
+                        span,
+                        crate::common::error::WarningKind::Pedantic,
+                    );
                     Expr::StmtExpr(compound, span)
                 } else {
                     let expr = self.parse_expr();

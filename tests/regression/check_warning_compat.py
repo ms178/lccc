@@ -133,6 +133,17 @@ KIND_FIXTURES = {
     ),
     "unused-variable": ("void probe_uv(void) { int probe_local = 1; }", "unused variable"),
     "sign-compare": ("int probe_sc(unsigned u) { return u < -1; }", "different signedness"),
+    "pedantic": (
+        "int probe_pedantic(int x) { int y = ({ int t = x; t + 1; }); return y; }",
+        "ISO C forbids braced-groups",
+    ),
+    "vla": (
+        # The bound result must be READ: with -Wall the write-only shape
+        # also pulls in GCC's unrelated -Wunused-but-set-variable, which is
+        # a different kind's fixture problem (that gap is backlog-listed).
+        "int probe_vla(int n) { int a[n]; a[0] = n; return a[0]; }",
+        "variable length array",
+    ),
     "format": (
         'extern int printf(const char *, ...) __attribute__((format(printf, 1, 2)));\n'
         'void probe_fmt(void) { printf("%d", 1L); }',
@@ -244,14 +255,19 @@ def kind_enabled(name: str, flags: tuple[str, ...]) -> bool:
     with `-Wno-<name>` sticky against groups and re-enabled only by a
     later positive form (GCC 16.2, measured)."""
     if f"-Wno-{name}" in flags:
-        positive = f"-W{name}" in flags
-        return positive and flags.index(f"-W{name}") > flags.index(f"-Wno-{name}")
+        positive_spellings = (f"-W{name}", f"-Werror={name}")
+        if name == "pedantic":
+            positive_spellings = positive_spellings + ("-pedantic", "-pedantic-errors")
+        no_index = flags.index(f"-Wno-{name}")
+        return any(sp in flags and flags.index(sp) > no_index for sp in positive_spellings)
     on = name in DEFAULT_ON
     if "-Wall" in flags and name in IN_WALL:
         on = True
     if "-Wextra" in flags and name in IN_WEXTRA:
         on = True
     if f"-W{name}" in flags or f"-Werror={name}" in flags:
+        on = True
+    if name == "pedantic" and ("-pedantic" in flags or "-pedantic-errors" in flags):
         on = True
     return on
 

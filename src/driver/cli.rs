@@ -767,6 +767,13 @@ impl Driver {
                 self.enable_popcnt = true;
                 self.popcnt_explicitly_disabled = false;
             }
+            "-mfxsr" => {
+                // Measured last-wins pair; the flag overrides the -march row.
+                self.fxsr_override = Some(true);
+            }
+            "-mno-fxsr" => {
+                self.fxsr_override = Some(false);
+            }
             "-mcx16" => {
                 self.enable_cx16 = true;
                 self.cx16_explicitly_disabled = false;
@@ -1088,6 +1095,7 @@ impl Driver {
             // `-march=`, like every other arch-implied bit.
             self.march_pre_sse = !row.has(F::Sse2);
             self.march_pre_sse_mmx = row.has(F::Mmx);
+            self.march_fxsr = row.has(F::Fxsr);
             self.enable_sse = row.has(F::Sse) && !self.sse_explicitly_disabled;
         }
         // Integer ISA: legal under `-mno-sse`. A denied ABM takes with it
@@ -1479,6 +1487,34 @@ impl Driver {
     fn handle_query_flags(args: &[String], target: &Target) -> Result<bool, String> {
         // Do not mistake an option's argument (e.g. `-o -dumpmachine`) for
         // an early-exit query. Sysroot-dependent queries were already rejected.
+        //
+        // The target-selecting -m flags are not parsed until after this
+        // early pass, but GCC answers the ACTIVE-target queries after them
+        // (measured: `gcc-16 -m32 -print-multiarch` -> `i386-linux-gnu` and
+        // `-m32 -print-multi-directory` -> `32`). Re-resolve the same four
+        // target switches the main loop applies, in order, skipping option
+        // operands exactly like the query loop below. `-dumpmachine` stays
+        // on the configured/binary target: GCC's own answer is likewise
+        // independent of -m32 (measured: `x86_64-pc-linux-gnu` both ways).
+        let mut effective_target = *target;
+        {
+            let mut scan = args[1..].iter();
+            while let Some(arg) = scan.next() {
+                if Self::option_consumes_next(arg) {
+                    scan.next();
+                    continue;
+                }
+                match arg.as_str() {
+                    "-m16" | "-m32" => effective_target = Target::I686,
+                    "-m64" => effective_target = Target::X86_64,
+                    "-mlittle-endian" if effective_target == Target::X86_64 => {
+                        effective_target = Target::Aarch64;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let target = &effective_target;
         let mut iter = args[1..].iter();
         while let Some(arg) = iter.next() {
             if Self::option_consumes_next(arg) {
@@ -1504,14 +1540,12 @@ impl Driver {
                     return Ok(true);
                 }
                 "-print-sysroot" | "--print-sysroot" => {
-                    // GCC answers with the configured sysroot; without one it
-                    // prints an empty line (NOT an error), and configure
-                    // scripts test the result for emptiness. This driver has
-                    // no configured sysroot and refuses `--sysroot`/`-isysroot`
-                    // outright (see `reject_unsupported_sysroots`), so the
-                    // answer is the empty line, measured the same as gcc 16.2
-                    // built without `--with-sysroot`.
-                    println!();
+                    // GCC 16.2 prints ZERO bytes when no --sysroot is in
+                    // effect (measured: `gcc-16 -print-sysroot | od -c` ->
+                    // `0000000`), and configure scripts test for emptiness.
+                    // This driver refuses `--sysroot`/`-isysroot` outright
+                    // (see `reject_unsupported_sysroots`), so the answer is
+                    // always exactly empty.
                     return Ok(true);
                 }
                 "-print-multiarch" | "--print-multiarch" => {
@@ -1522,9 +1556,17 @@ impl Driver {
                     return Ok(true);
                 }
                 "-print-multi-lib" | "--print-multi-lib" => {
-                    // GCC prints one entry per multilib; lccc has exactly one,
-                    // the default, spelled "." followed by its option list (none).
+                    // GCC 16.2's multilib list for this configuration
+                    // (measured byte-exactly for default and -m32: the
+                    // primary line is `.;` — dir plus empty options — then
+                    // the 32-bit variant). LCCC's single binary builds both
+                    // halves of the x86 pair, so the capability list does
+                    // not depend on the active target; non-x86 targets have
+                    // no sub-multilibs.
                     println!(".;");
+                    if matches!(*target, Target::X86_64 | Target::I686) {
+                        println!("32;@m32");
+                    }
                     return Ok(true);
                 }
                 "-print-libgcc-file-name" | "--print-libgcc-file-name" => {
@@ -1626,7 +1668,13 @@ impl Driver {
                     // GCC query returning the compiler's multilib directory.
                     // glibc's configure reads `multidir` from this; an empty
                     // answer makes its csu rules mis-expand (`; ; ln -s .`).
-                    println!(".");
+                    // Measured against gcc-16.2: `.` for the primary and
+                    // `32` when -m32 selects the 32-bit multilib.
+                    if *target == Target::I686 {
+                        println!("32");
+                    } else {
+                        println!(".");
+                    }
                     return Ok(true);
                 }
                 _ if arg.starts_with("-print-prog-name=")
@@ -2044,6 +2092,25 @@ impl Driver {
                     self.optimize_size = true;
                     self.omit_frame_pointer = true;
                 }
+                // Measured on GCC 16.2 (probe set, 2026-10-28): `-Og`
+                // compiles byte-identically to its `-O1` and `-Ofast` to
+                // its `-O3`. LCCC implements -O1/-O3 and fast-math already,
+                // so both requests become real pipeline settings instead of
+                // tolerated no-ops (GP-22 option-effect ledger: an accepted
+                // spelling must change an artifact).
+                "-Og" => {
+                    self.opt_level = 1;
+                    self.optimize = true;
+                    self.optimize_size = false;
+                    self.omit_frame_pointer = true;
+                }
+                "-Ofast" => {
+                    self.opt_level = 3;
+                    self.optimize = true;
+                    self.optimize_size = false;
+                    self.omit_frame_pointer = true;
+                    self.fast_math = true;
+                }
 
                 // Debug info — GCC flag semantics, honored exactly:
                 //   -g / -ggdb / -g<N> / -ggdb<N> / -gdwarf-<N>  enable debug
@@ -2419,6 +2486,17 @@ impl Driver {
                 // NOTE: these arms must not `return` — the parse loop still
                 // has the input files and every other option to walk.
                 "-ansi" => self.apply_std_dialect("c90")?,
+                // GP-10: the pedantic family. `-pedantic` enables the
+                // warning kind; `-pedantic-errors` promotes it with GCC's
+                // plain-label semantics (measured: `[-Wpedantic]` even
+                // though the diagnostic is an error, while the explicit
+                // `-Werror=pedantic` spelling prints `[-Werror=pedantic]`).
+                "-pedantic" => self
+                    .warning_config
+                    .enable(crate::common::error::WarningKind::Pedantic),
+                "-pedantic-errors" => self
+                    .warning_config
+                    .set_dialect_error(crate::common::error::WarningKind::Pedantic),
                 arg if arg.starts_with("-std=") => self.apply_std_dialect(&arg[5..])?,
 
                 // Machine/target flags
@@ -2543,6 +2621,7 @@ impl Driver {
                             // and the legacy 32-bit baselines re-set it.
                             self.march_pre_sse = false;
                             self.march_pre_sse_mmx = false;
+                            self.march_fxsr = true;
                             match march {
                                 "x86-64" | "x86-64-v1" | "generic" => {}
                                 // Legacy 32-bit baselines (kernel REALMODE_CFLAGS
@@ -2569,6 +2648,9 @@ impl Driver {
                                     // kernel's `-march=i386 -m16` real-mode code
                                     // gets neither, as measured).
                                     self.march_pre_sse = true;
+                                    // Every name in this legacy pre-SSE list
+                                    // is FXSR-less on GCC 16.2 (measured).
+                                    self.march_fxsr = false;
                                 }
                                 "novalake" | "diamondrapids" => {
                                     return Err(format!(
@@ -3280,6 +3362,14 @@ profile-guided optimisation, or an oracle-compiler build for coverage"
 
                 // Linker flags
                 "-static" => self.static_link = true,
+                // Static-PIE is a link-layout request (special crt objects
+                // plus PIE output): tolerating it silently produced a
+                // binary that means something other than what was asked
+                // (measured: accepted-and-inert). It joins the documented
+                // refusal class like `-flto` (GP-22 option-effect ledger).
+                "-static-pie" => {
+                    return Err("-static-pie is not supported by the LCCC driver".to_string());
+                }
                 "-shared" => self.shared_lib = true,
                 "-r" | "-relocatable" => self.relocatable = true,
                 // Codegen already defaults to PIC, but the *link* only becomes
