@@ -236,6 +236,56 @@ if bash "$SCRIPT" scan "$tmp/does-not-exist" > /dev/null 2>&1; then
     fail=1
 fi
 
+echo "== scan: ZSTD DYNAMIC_BMI2 target-attributed clone vs baseline leak =="
+cat > "$tmp/zstd_dyn.c" <<'EOF'
+#include <stdint.h>
+__attribute__((__target__("lzcnt,bmi,bmi2")))
+uint32_t FSE_readNCount_body_bmi2(uint32_t a, uint32_t n) {
+    return (a << n) ^ (uint32_t)__builtin_clz(a | 1u);
+}
+uint32_t FSE_readNCount_body_default(uint32_t a, uint32_t n) {
+    return a + n;
+}
+EOF
+"$CCC" -O2 -march=x86-64 -c "$tmp/zstd_dyn.c" -o "$tmp/zstd_dyn_ok.o"
+# Anti-vacuity control: the symbol allowlist earns its keep only if the
+# target-attributed clone ACTUALLY emits an lzcnt/bmi/bmi2 mnemonic. If
+# per-function target handling regressed to baseline codegen the object
+# would contain zero allowed instructions and the scan would still pass,
+# proving nothing. Pin the signal before asking the scanner to accept it.
+bmi2_mnemonics=$(objdump -d --no-show-raw-insn "$tmp/zstd_dyn_ok.o" \
+    | awk '
+        /^[0-9a-fA-F]+[[:space:]]+<[^>]+>:/ {
+            s = $0
+            sub(/^[^<]*</, "", s)
+            sub(/>:.*$/, "", s)
+            in_bmi2 = (s ~ /^FSE_readNCount_body_bmi2(\.[A-Za-z0-9_.]+)?$/)
+            next
+        }
+        in_bmi2 { sub(/#.*/, ""); print }' \
+    | grep -cE '(^|[[:space:]])(rorx[ql]?|andn[ql]?|shrx[ql]?|shlx[ql]?|sarx[ql]?|mulx[ql]?|bzhi[ql]?|bextr[ql]?|blsi[ql]?|blsmsk[ql]?|blsr[ql]?|pdep[ql]?|pext[ql]?|tzcnt[ql]?|lzcnt[ql]?)([[:space:]]|$)' || true)
+if [ "$bmi2_mnemonics" -lt 1 ]; then
+    echo "FAIL: FSE_readNCount_body_bmi2 contains no DYNAMIC_BMI2 mnemonic (per-function target attribute regressed?)" >&2
+    objdump -d --no-show-raw-insn "$tmp/zstd_dyn_ok.o" >&2
+    fail=1
+fi
+if ! bash "$SCRIPT" scan "$tmp/zstd_dyn_ok.o" > "$tmp/scan_zstd_ok.log" 2>&1; then
+    echo "FAIL: scan rejected ZSTD DYNAMIC_BMI2 target-attributed clone" >&2
+    sed 's/^/  /' "$tmp/scan_zstd_ok.log" >&2
+    fail=1
+fi
+cat > "$tmp/zstd_leak.c" <<'EOF'
+#include <stdint.h>
+__attribute__((__target__("lzcnt,bmi,bmi2")))
+uint32_t FSE_readNCount_body_bmi2(uint32_t a, uint32_t n) { return a & ~n; }
+uint32_t FSE_readNCount_body_default(uint32_t a, uint32_t n) { return a & ~n; }
+EOF
+"$CCC" -O2 -march=x86-64-v3 -c "$tmp/zstd_leak.c" -o "$tmp/zstd_leak.o"
+if bash "$SCRIPT" scan "$tmp/zstd_leak.o" > /dev/null 2>&1; then
+    echo "FAIL: scan accepted BMI2 leaked into FSE_readNCount_body_default" >&2
+    fail=1
+fi
+
 if [ "$fail" = 0 ]; then
     echo "PASS: boot-path ISA contract (patch, idempotence, refactor refusal, artifact scan)"
 fi

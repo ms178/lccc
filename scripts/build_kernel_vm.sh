@@ -52,9 +52,9 @@ cd "$K"
 
 if [[ ! -f .lccc-vm-config ]]; then
   echo "config: allnoconfig + kernel-vm.fragment + olddefconfig"
-  make ARCH=x86_64 allnoconfig >/dev/null
-  scripts/kconfig/merge_config.sh -m .config "$FRAGMENT" >/dev/null
-  make ARCH=x86_64 olddefconfig >/dev/null
+  make ARCH=x86_64 CC="$LCCC" LD="$LCCC_LD" HOSTCC=gcc allnoconfig >/dev/null
+  scripts/kconfig/merge_config.sh -n -m .config "$FRAGMENT" >/dev/null
+  make ARCH=x86_64 CC="$LCCC" LD="$LCCC_LD" HOSTCC=gcc olddefconfig >/dev/null
 
   # Every CachyMod patch must stay FUNCTIONAL, not merely applied.
   # (SCHED_CLASS_EXT needs DEBUG_INFO_BTF on 6.18 — deferred to milestone 2,
@@ -103,8 +103,8 @@ if [[ ! -f .lccc-vm-config ]]; then
   }
   kconfig_defsync CC="$LCCC" LD="$LCCC_LD" HOSTCC=gcc || {
     echo "build_kernel_vm: syncconfig cannot auto-answer the config (stale .config?); regenerating" >&2
-    make ARCH=x86_64 allnoconfig >/dev/null
-    scripts/kconfig/merge_config.sh -m .config "$FRAGMENT" >/dev/null
+    make ARCH=x86_64 CC="$LCCC" LD="$LCCC_LD" HOSTCC=gcc allnoconfig >/dev/null
+    scripts/kconfig/merge_config.sh -n -m .config "$FRAGMENT" >/dev/null
     kconfig_defsync CC="$LCCC" LD="$LCCC_LD" HOSTCC=gcc || {
       echo "build_kernel_vm: config still fails syncconfig after regeneration" >&2
       exit 1

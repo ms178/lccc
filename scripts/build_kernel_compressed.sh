@@ -62,13 +62,14 @@ cd "$K"
 # ---- 1. VM config so the stub is EFI/KASLR/SEV-free (QEMU -kernel path) ----
 if [[ ! -f .lccc-vm-config ]]; then
   echo "config: allnoconfig + kernel-vm.fragment"
-  make ARCH=x86_64 allnoconfig >/dev/null
+  make ARCH=x86_64 CC="$LCCC" LD="$LCCC_LD" HOSTCC=gcc allnoconfig >/dev/null
   scripts/kconfig/merge_config.sh -m .config \
     "$SCRIPT_DIR/kernel-vm.fragment" >/dev/null
-  make ARCH=x86_64 olddefconfig >/dev/null
-  make ARCH=x86_64 syncconfig >/dev/null
-  # timeconst.h / asm-offsets must match HZ_800 from the fragment.
-  make ARCH=x86_64 HOSTCC=gcc CC=gcc prepare >/dev/null
+  make ARCH=x86_64 CC="$LCCC" LD="$LCCC_LD" HOSTCC=gcc olddefconfig >/dev/null
+  make ARCH=x86_64 CC="$LCCC" LD="$LCCC_LD" HOSTCC=gcc syncconfig >/dev/null
+  # timeconst.h / asm-offsets must match HZ_800 from the fragment; kernel TUs
+  # (kernel/asm-offsets.c) are compiled exclusively with LCCC, never GCC.
+  make ARCH=x86_64 HOSTCC=gcc CC="$LCCC" LD="$LCCC_LD" prepare >/dev/null
   touch .lccc-vm-config
 fi
 grep -q '^CONFIG_KERNEL_ZSTD=y$' .config || {

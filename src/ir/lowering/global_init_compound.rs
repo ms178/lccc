@@ -428,7 +428,9 @@ impl Lowerer {
                 }
             }
         }
-        // Try as a global address expression (&x, func name, array name, etc.)
+        // Try as a global address expression (&x, func name, array name, etc.),
+        // materializing any nested compound literals first.
+        self.materialize_compound_literals_in_expr(expr);
         if let Some(addr) = self.eval_global_addr_expr(expr) {
             return Some(addr);
         }

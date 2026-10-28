@@ -134,7 +134,7 @@ impl Lowerer {
                     // Arrays decay to pointers in expression context
                     return (vi.ty == IrType::Ptr || vi.is_array) && !vi.is_struct;
                 }
-                false
+                self.known_functions.contains(name) || self.sema_functions.contains_key(name)
             }
             Expr::AddressOf(_, _) => true,
             Expr::PostfixOp(_, inner, _) => self.expr_is_pointer(inner),
@@ -308,6 +308,7 @@ impl Lowerer {
                     return self.resolve_ctype_size(pointee).max(1);
                 }
                 CType::Array(elem, _) => return self.resolve_ctype_size(elem).max(1),
+                CType::Function(_) => return 1,
                 _ => {}
             }
         }

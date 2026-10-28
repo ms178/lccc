@@ -75,6 +75,40 @@ impl qualifiers::ConstLookup for Lowerer {
             Some(CType::Pointer(..) | CType::Array(..))
         )
     }
+
+    fn select_generic<'a>(
+        &self,
+        controlling: &Expr,
+        associations: &'a [GenericAssociation],
+    ) -> Option<&'a Expr> {
+        self.resolve_generic_selection_expr(controlling, associations)
+    }
+
+    fn member_const_base(&self, base: &Expr, field: &str, indirect: bool) -> bool {
+        let base_ct = if indirect {
+            match self.get_expr_ctype(base) {
+                Some(CType::Pointer(inner, _) | CType::Array(inner, _)) => Some(*inner),
+                _ => None,
+            }
+        } else {
+            self.get_expr_ctype(base)
+        };
+        let Some(CType::Struct(key) | CType::Union(key)) = base_ct else {
+            return false;
+        };
+        let layouts = self.types.borrow_struct_layouts();
+        layouts
+            .get(key.as_ref())
+            .and_then(|layout| layout.field_constness(field, &*layouts))
+            .is_some_and(|(base_const, _, _)| base_const)
+    }
+
+    fn call_const_base(&self, callee: &Expr) -> Option<bool> {
+        match callee {
+            Expr::Identifier(name, _) => self.sema_functions.get(name).map(|f| f.return_base_const),
+            _ => None,
+        }
+    }
 }
 
 impl Lowerer {
@@ -731,7 +765,9 @@ impl Lowerer {
                     // Also handle array types decaying to pointers
                     let lct = self.expr_ctype(lhs);
                     let rct = self.expr_ctype(rhs);
-                    if lct.is_pointer_like() && rct.is_pointer_like() {
+                    let is_ptr_or_fn =
+                        |ct: &CType| ct.is_pointer_like() || matches!(ct, CType::Function(_));
+                    if is_ptr_or_fn(&lct) && is_ptr_or_fn(&rct) {
                         return crate::common::types::target_int_ir_type();
                     }
                 }
@@ -1393,34 +1429,37 @@ impl Lowerer {
             return Some(CType::Int);
         }
 
-        // Pointer arithmetic for Add and Sub
+        // Pointer arithmetic for Add and Sub (including function designators)
+        let is_ptr_or_fn = |ct: &CType| ct.is_pointer_like() || matches!(ct, CType::Function(_));
         if matches!(op, BinOp::Add | BinOp::Sub) {
             if let Some(lct) = self.get_expr_ctype(lhs) {
                 match &lct {
                     CType::Pointer(_, _) => {
-                        if *op == BinOp::Sub {
-                            // ptr - ptr = ptrdiff_t (long)
-                            if let Some(rct) = self.get_expr_ctype(rhs) {
-                                if rct.is_pointer_like() {
-                                    return Some(CType::Long);
-                                }
-                            }
+                        if *op == BinOp::Sub
+                            && self.get_expr_ctype(rhs).as_ref().is_some_and(is_ptr_or_fn)
+                        {
+                            return Some(CType::Long);
                         }
                         return Some(lct);
                     }
                     CType::Array(elem, _) => {
-                        if *op == BinOp::Sub {
-                            // array - ptr/array = ptrdiff_t (long)
-                            if let Some(rct) = self.get_expr_ctype(rhs) {
-                                if rct.is_pointer_like() {
-                                    return Some(CType::Long);
-                                }
-                            }
+                        if *op == BinOp::Sub
+                            && self.get_expr_ctype(rhs).as_ref().is_some_and(is_ptr_or_fn)
+                        {
+                            return Some(CType::Long);
                         }
                         // The decayed array keeps the space of its object:
                         // `*(arr + i)` on a __seg_gs array reads %gs.
                         let space = self.get_addr_space_of_struct_expr(lhs);
                         return Some(CType::Pointer(elem.clone(), space));
+                    }
+                    CType::Function(_) => {
+                        if *op == BinOp::Sub
+                            && self.get_expr_ctype(rhs).as_ref().is_some_and(is_ptr_or_fn)
+                        {
+                            return Some(CType::Long);
+                        }
+                        return Some(CType::Pointer(Box::new(lct), AddressSpace::Default));
                     }
                     _ => {}
                 }
@@ -1433,6 +1472,9 @@ impl Lowerer {
                         CType::Array(elem, _) => {
                             let space = self.get_addr_space_of_struct_expr(rhs);
                             return Some(CType::Pointer(elem, space));
+                        }
+                        CType::Function(_) => {
+                            return Some(CType::Pointer(Box::new(rct), AddressSpace::Default));
                         }
                         _ => {}
                     }

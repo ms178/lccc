@@ -1549,6 +1549,10 @@ jobs:
       env:
         CCC: target/fastbuild/lccc
       run: bash tests/regression/check_kernel_boot_isa.sh
+    - name: Linux 6.18 semantic-analysis and qualifier parity
+      env:
+        CCC: target/fastbuild/lccc
+      run: bash tests/regression/check_kernel_618_sema_parity.sh
     - name: Run __seg_gs runtime regression
       env:
         CCC: target/fastbuild/lccc

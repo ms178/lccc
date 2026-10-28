@@ -284,6 +284,7 @@ impl Parser {
                 }
             }
         }
+        let return_base_const = self.attrs.parsing_const();
         self.attrs.set_noreturn(false);
         let open = self.peek_span();
         let body = self.parse_compound_stmt();
@@ -312,6 +313,7 @@ impl Parser {
         // only known once the lowering side has built the `IrFunction`.
         Some(FunctionDef {
             alignment: None,
+            return_base_const,
             return_pointer_const_levels: crate::frontend::parser::ast::return_pointer_const_levels(
                 &return_type,
                 &derived,

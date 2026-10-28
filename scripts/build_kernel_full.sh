@@ -46,16 +46,21 @@ here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 # shellcheck source=kernel_version.sh
 . "$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/kernel_version.sh"
 K=${KERNEL_DIR:-$(lccc_kernel_default_dir)}
-PKGDIR=${PKGDIR:-/home/user/archpkgbuilds/packages/linux-cachymod-6.18}
+PKGDIR=${PKGDIR:-$(lccc_kernel_pkgdir)}
 REPO_ROOT=$(CDPATH= cd -- "$here/.." && pwd)
 LCCC=${LCCC:-$REPO_ROOT/target/fastbuild/lccc}
 LCCC_LD=${LCCC_LD:-$REPO_ROOT/target/fastbuild/lccc-ld}
+HOSTCC=${HOSTCC:-gcc}
 JOBS=${LCCC_JOBS:-2}
 NOOBJTOOL=${LCCC_NOOBJTOOL:-1}
 RECONFIG=${LCCC_RECONFIG:-0}
 
 # ---- 1. ensure the patched tree exists -------------------------------------
-"$here/prepare_kernel_tree.sh" "$K"
+if [[ -n $PKGDIR ]]; then
+  PKGDIR="$PKGDIR" "$here/prepare_kernel_tree.sh" "$K"
+else
+  "$here/prepare_kernel_tree.sh" "$K"
+fi
 
 # ---- 2. LCCC-bootable configuration ----------------------------------------
 #   * Start from the x86_64 arch default (lean, bootable, fast on 2 cores).
@@ -70,7 +75,7 @@ RECONFIG=${LCCC_RECONFIG:-0}
 #     "Restart config..." prompt that otherwise stalls a headless build).
 cd "$K"
 if [[ $RECONFIG == 1 ]] || ! grep -q "^CONFIG_SCHED_BORE=y" .config; then
-  make ARCH=x86_64 defconfig >/dev/null
+  make ARCH=x86_64 CC="$LCCC" LD="$LCCC_LD" HOSTCC="$HOSTCC" defconfig >/dev/null
   ./scripts/config \
     --enable CACHY \
     --enable SCHED_BORE \
@@ -81,8 +86,9 @@ if [[ $RECONFIG == 1 ]] || ! grep -q "^CONFIG_SCHED_BORE=y" .config; then
     --enable UNWINDER_FRAME_POINTER --disable UNWINDER_ORC \
     --disable STACK_VALIDATION --disable OBJTOOL --disable OBJTOOL_WERROR \
     --disable DEBUG_ENTRY --disable FUNCTION_TRACER --disable DYNAMIC_FTRACE
-  make ARCH=x86_64 olddefconfig </dev/null >/dev/null || true
-  make ARCH=x86_64 prepare -j"$JOBS" >/dev/null
+  make ARCH=x86_64 CC="$LCCC" LD="$LCCC_LD" HOSTCC="$HOSTCC" olddefconfig </dev/null >/dev/null
+  make ARCH=x86_64 CC="$LCCC" LD="$LCCC_LD" HOSTCC="$HOSTCC" syncconfig </dev/null >/dev/null
+  make ARCH=x86_64 CC="$LCCC" LD="$LCCC_LD" HOSTCC="$HOSTCC" prepare -j"$JOBS" >/dev/null
 fi
 
 # ---- 3. objtool shim for compile-only sweeps -------------------------------

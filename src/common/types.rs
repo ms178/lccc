@@ -400,6 +400,12 @@ pub fn ctypes_compatible(t1: &CType, t2: &CType) -> bool {
             ctypes_compatible(a, b) && (sa == sb || sa.is_none() || sb.is_none())
         }
         (CType::Function(a), CType::Function(b)) => function_types_compatible(a, b),
+        (CType::Enum(e1), CType::Enum(e2)) => {
+            e1 == e2
+                || (e1.name.is_some()
+                    && e1.name == e2.name
+                    && (e1.variants.is_empty() || e2.variants.is_empty()))
+        }
         (CType::Enum(e), other) | (other, CType::Enum(e)) if other.is_integer() => {
             &e.compatible_ctype() == other
         }
