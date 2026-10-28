@@ -9,6 +9,7 @@
 //! - `emit_shared`: shared library (.so) emission
 
 use super::elf_read::*;
+use super::got::{GotKind, GotLayout};
 use super::relocations::section_order;
 use super::{input, sections, symbols};
 use crate::backend::linker_common;
@@ -46,6 +47,7 @@ pub fn link_builtin(
     let trace = parsed_args.trace_files;
     let rpath = linker_common::rpath_dyn_entry(&parsed_args);
     let is_static = parsed_args.is_static;
+    let (strip_all, strip_debug) = (parsed_args.strip_all, parsed_args.strip_debug);
     let defsym_defs = parsed_args.defsym_defs;
 
     // Collect all input files: CRT before + user objects + bare files from args + CRT after
@@ -181,6 +183,8 @@ pub fn link_builtin(
     super::reloc::validate_input_relocations(&input_objs)?;
     let (mut merged_sections, mut merged_map, input_sec_refs) =
         sections::merge_sections(&input_objs);
+    let mut debug_sections =
+        super::debug::DebugSections::collect(&input_objs, !strip_all && !strip_debug)?;
 
     // ── Phase 3: Build global symbol table ──────────────────────────────
 
@@ -231,8 +235,30 @@ pub fn link_builtin(
         symbols::check_undefined_symbols(&global_syms, &FxHashMap::default())?;
     }
 
-    let (got_symbols, tls_got_symbols, local_got_sym_info) =
-        symbols::collect_got_entries(&input_objs);
+    // General-dynamic access to a variable the executable defines is
+    // relaxed to local-exec (`reloc::collect_gd_tls_relax_info`) and needs
+    // no `tls_index`; one to an import keeps it, filled by the loader.
+    let (wanted_got, local_got_sym_info) = symbols::collect_got_entries(&input_objs);
+    let got = GotLayout::new(wanted_got.into_iter().filter(|(key, kind)| {
+        *kind != GotKind::TlsGd
+            || (!local_got_sym_info.contains_key(key)
+                && global_syms.get(key).is_some_and(|g| !g.defined))
+    }));
+    // TLS imports: dynamic symbols reached only through GOT slots.
+    let tls_imports: Vec<String> = got
+        .entries()
+        .filter(|(key, kind, _)| {
+            *kind != GotKind::Addr
+                && global_syms.get(*key).is_some_and(|g| !g.defined)
+                && shared_lib_syms.contains_key(*key)
+        })
+        .map(|(key, _, _)| key.to_string())
+        .fold(Vec::new(), |mut v, k| {
+            if !v.contains(&k) {
+                v.push(k);
+            }
+            v
+        });
 
     // Sort sections by canonical order
     let mut sec_indices: Vec<usize> = (0..merged_sections.len()).collect();
@@ -249,8 +275,8 @@ pub fn link_builtin(
         &mut merged_map,
         &sec_mapping,
         &mut global_syms,
-        &got_symbols,
-        &tls_got_symbols,
+        &got,
+        &tls_imports,
         &local_got_sym_info,
         &plt_symbols,
         &copy_symbols,
@@ -259,6 +285,8 @@ pub fn link_builtin(
         &shared_lib_syms,
         rpath.as_ref(),
         is_static,
+        &mut debug_sections,
+        !strip_all,
         output_path,
     )
 }
@@ -293,6 +321,7 @@ pub fn link_shared(
     let parsed_args = linker_common::parse_linker_args(user_args);
     parsed_args.validate_common_page_size()?;
     parsed_args.warn_unimplemented_keyword_options()?;
+    let (strip_all, strip_debug) = (parsed_args.strip_all, parsed_args.strip_debug);
     let rpath = linker_common::rpath_dyn_entry(&parsed_args);
 
     let mut all_inputs: Vec<String> = Vec::new();
@@ -395,6 +424,8 @@ pub fn link_shared(
     super::reloc::validate_input_relocations(&input_objs)?;
     let (mut merged_sections, mut merged_map, input_sec_refs) =
         sections::merge_sections(&input_objs);
+    let mut debug_sections =
+        super::debug::DebugSections::collect(&input_objs, !strip_all && !strip_debug)?;
 
     // ── Phase 3: Build global symbol table ───────────────────────────
 
@@ -414,8 +445,8 @@ pub fn link_shared(
     );
 
     // Identify GOT entries needed
-    let (got_symbols, tls_got_symbols, local_got_sym_info) =
-        symbols::collect_got_entries(&input_objs);
+    let (wanted_got, local_got_sym_info) = symbols::collect_got_entries(&input_objs);
+    let got = GotLayout::new(wanted_got);
 
     // ── Phase 4+: Emit shared library ───────────────────────────────
 
@@ -425,13 +456,14 @@ pub fn link_shared(
         &mut merged_map,
         &sec_mapping,
         &mut global_syms,
-        &got_symbols,
-        &tls_got_symbols,
+        &got,
         &local_got_sym_info,
         &needed_sonames,
         &shared_lib_syms,
         soname,
         rpath.as_ref(),
+        &mut debug_sections,
+        !strip_all,
         output_path,
     )
 }

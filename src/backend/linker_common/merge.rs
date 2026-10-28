@@ -204,14 +204,14 @@ pub fn merge_sections_elf64_gc(
 /// cross-section relocations remain meaningful. Call this after the
 /// allocatable sections have been sorted, so appended debug outputs do not
 /// participate in load-segment layout or section ordering.
-pub fn merge_debug_sections_elf64(
-    objects: &[Elf64Object],
+pub fn merge_debug_sections_elf64<'a>(
+    objects: impl IntoIterator<Item = &'a Elf64Object>,
     output_sections: &mut Vec<OutputSection>,
     section_map: &mut FxHashMap<(usize, usize), (usize, u64)>,
     dead_sections: &FxHashSet<(usize, usize)>,
 ) -> Result<(), String> {
     let mut output_map: FxHashMap<String, usize> = FxHashMap::default();
-    for (obj_idx, object) in objects.iter().enumerate() {
+    for (obj_idx, object) in objects.into_iter().enumerate() {
         for (section_idx, section) in object.sections.iter().enumerate() {
             if section.flags & SHF_ALLOC != 0
                 || section.flags & SHF_EXCLUDE != 0
@@ -262,6 +262,22 @@ pub fn merge_debug_sections_elf64(
         }
     }
     Ok(())
+}
+
+/// Give each non-empty non-allocated output section a file offset starting
+/// at `file_end`, in output order, and address 0: debug sections follow the
+/// last segment and are never loaded. Returns the new end of the file data.
+pub fn place_debug_sections(output_sections: &mut [OutputSection], mut file_end: u64) -> u64 {
+    for sec in output_sections
+        .iter_mut()
+        .filter(|s| s.flags & SHF_ALLOC == 0 && s.mem_size > 0)
+    {
+        file_end = file_end.next_multiple_of(sec.alignment.max(1));
+        sec.addr = 0;
+        sec.file_offset = file_end;
+        file_end += sec.mem_size;
+    }
+    file_end
 }
 
 /// Whether a non-allocated input section carries debug information that a

@@ -199,6 +199,29 @@ def main():
         assert ("local allocated section-relative" in p.stderr
                 or "symbol in a surviving section" in p.stderr), p.stderr
         checks += 1
+        # The static and dynamic writers share that predicate. ADRP cannot be
+        # caught by an out-of-range check the way ADR can: its window is
+        # +-4 GiB, so a page number for a file offset always fits and encodes
+        # the load bias silently. Both forms, in both writers, must refuse.
+        for form in ["adr x0,target", "adrp x0,target"]:
+            src.write_text('.text\n.global entry\nentry: ' + form + '\nret\n'
+                           '.section .debug_target,"",%progbits\n.local target\n'
+                           'target: .quad 1\n')
+            run(["-c", src, "-o", obj])
+            for mode in (["-nostdlib", "-shared"], ["-nostdlib"]):
+                p = run([*mode, obj, "-o", exe], False)
+                assert "symbol in a surviving section" in p.stderr, (form, mode, p.stderr)
+                checks += 1
+        # A target the image does load keeps both forms working in both
+        # writers; the refusal above must be about the section, not the form.
+        src.write_text('.text\n.global entry\nentry: adrp x0,target\n'
+                       'add x0,x0,:lo12:target\nadr x1,local\nret\n'
+                       '.data\n.global target\ntarget: .quad 7\n'
+                       '.local local\nlocal: .quad 9\n')
+        run(["-c", src, "-o", obj])
+        for mode in (["-nostdlib", "-shared"], ["-nostdlib"]):
+            run([*mode, obj, "-o", exe])
+            checks += 1
         # Same-name local symbols must retain object identity, not consult a
         # global name-only visibility/address table. Decode both input orders.
         local_objects = []

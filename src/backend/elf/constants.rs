@@ -108,6 +108,10 @@ pub const STV_PROTECTED: u8 = 3;
 // ── Special section indices ──────────────────────────────────────────────────
 
 pub const SHN_UNDEF: u16 = 0;
+/// First reserved section index: every value from here up is an `SHN_*`
+/// marker, so a real section index (and a symbol's `st_shndx` without
+/// `SHN_XINDEX`) must stay below it.
+pub const SHN_LORESERVE: u16 = 0xff00;
 pub const SHN_ABS: u16 = 0xfff1;
 pub const SHN_COMMON: u16 = 0xfff2;
 

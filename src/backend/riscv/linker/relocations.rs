@@ -9,12 +9,13 @@
 //! - **Symbol resolution**: `resolve_symbol_value`, `got_sym_key`,
 //!   `find_hi20_value` for AUIPC/LO12 relocation pairing.
 //! - **Shared types**: `GlobalSym`, `MergedSection`, `InputSecRef`.
-//! - **ELF writing helpers** (re-exported from `linker_common`): `write_shdr`,
+//! - **ELF writing helpers** (re-exported from `linker_common`):
 //!   `write_phdr`, `write_phdr_at`, `align_up`, `pad_to`.
 //! - **Utility functions**: `build_gnu_hash`, `find_versioned_soname`,
 //!   `resolve_archive_members`, `output_section_name`, `section_order`.
 
 use super::elf_read::*;
+use super::got::{GotKind, GotLayout};
 use crate::common::fx_hash::FxHashMap;
 
 // ── RISC-V relocation type constants ─────────────────────────────────────
@@ -255,7 +256,7 @@ pub fn find_hi20_value(
     auipc_vaddr: u64,
     sec_offset: u64,
     got_vaddr: u64,
-    got_symbols: &[String],
+    got: &GotLayout,
     got_plt_vaddr: u64,
     gd_tls_relax_info: &FxHashMap<u64, (u64, i64)>,
     tls_vaddr: u64,
@@ -277,7 +278,7 @@ pub fn find_hi20_value(
         auipc_vaddr,
         sec_offset,
         got_vaddr,
-        got_symbols,
+        got,
         Some(got_plt_vaddr),
     )
 }
@@ -297,7 +298,7 @@ pub fn find_hi20_value_shared(
     auipc_vaddr: u64,
     sec_offset: u64,
     got_vaddr: u64,
-    got_symbols: &[String],
+    got: &GotLayout,
 ) -> i64 {
     find_hi20_value_core(
         obj,
@@ -310,7 +311,7 @@ pub fn find_hi20_value_shared(
         auipc_vaddr,
         sec_offset,
         got_vaddr,
-        got_symbols,
+        got,
         None,
     )
 }
@@ -327,7 +328,7 @@ fn find_hi20_value_core(
     auipc_vaddr: u64,
     sec_offset: u64,
     got_vaddr: u64,
-    got_symbols: &[String],
+    got: &GotLayout,
     got_plt_vaddr: Option<u64>,
 ) -> i64 {
     if sec_idx >= obj.relocations.len() {
@@ -362,43 +363,23 @@ fn find_hi20_value_core(
                 let target = s as i64 + reloc.addend;
                 return (target - auipc_vaddr as i64) & 0xFFF;
             }
-            R_RISCV_GOT_HI20 | R_RISCV_TLS_GOT_HI20 => {
-                let hi_sym_idx = reloc.sym_idx as usize;
-                let sym = &obj.symbols[hi_sym_idx];
-                let (sym_name, _) = got_sym_key(obj_idx, sym, reloc.addend);
-
-                // Executable path: check global_syms first (for got_offset or PLT),
-                // then fall back to got_symbols list.
-                // Shared lib path: check got_symbols first, then global_syms.
-                let got_entry_vaddr = if let Some(gpv) = got_plt_vaddr {
-                    // Executable path
-                    if let Some(gs) = global_syms.get(sym.name.as_str()) {
-                        if let Some(got_off) = gs.got_offset {
-                            got_vaddr + got_off
-                        } else {
-                            // PLT symbol: use GOT.PLT
+            R_RISCV_GOT_HI20 | R_RISCV_TLS_GOT_HI20 | R_RISCV_TLS_GD_HI20 => {
+                let Some(kind) = GotKind::of(reloc.rela_type) else {
+                    continue;
+                };
+                let sym = &obj.symbols[reloc.sym_idx as usize];
+                let (key, _) = got_sym_key(obj_idx, sym, reloc.addend);
+                // As `reloc::lookup_got_entry`; a missing slot is reported
+                // by the HI20 relocation itself.
+                let got_entry_vaddr = match got.offset(&key, kind) {
+                    Some(off) => got_vaddr + off,
+                    None => match (kind, got_plt_vaddr, global_syms.get(sym.name.as_str())) {
+                        (GotKind::Addr, Some(gpv), Some(gs)) if gs.needs_plt => {
                             gpv + (2 + gs.plt_idx) as u64 * 8
                         }
-                    } else if let Some(idx) = got_symbols.iter().position(|n| n == &sym_name) {
-                        got_vaddr + idx as u64 * 8
-                    } else {
-                        0
-                    }
-                } else {
-                    // Shared lib path: got_symbols first, then global_syms
-                    if let Some(idx) = got_symbols.iter().position(|n| n == &sym_name) {
-                        got_vaddr + idx as u64 * 8
-                    } else if let Some(gs) = global_syms.get(sym.name.as_str()) {
-                        if let Some(got_off) = gs.got_offset {
-                            got_vaddr + got_off
-                        } else {
-                            0
-                        }
-                    } else {
-                        0
-                    }
+                        _ => 0,
+                    },
                 };
-
                 return (got_entry_vaddr as i64 + reloc.addend - auipc_vaddr as i64) & 0xFFF;
             }
             _ => {}
@@ -423,10 +404,16 @@ pub struct GlobalSym {
     pub needs_plt: bool,
     /// Index into the PLT (if needs_plt).
     pub plt_idx: usize,
-    /// GOT offset (relative to GOT base) if this symbol has a GOT entry.
-    pub got_offset: Option<u64>,
     /// Section index in the merged section list, if defined locally.
     pub section_idx: Option<usize>,
+    /// True when this link *synthesized* the definition at value 0 as a weak
+    /// placeholder for an optional runtime hook (`_ITM_registerTMCloneTable`,
+    /// ...). Such a symbol is not a definition of the program: bfd leaves it
+    /// weak and undefined, so `.symtab` must not name an address for it. A
+    /// real definition from an input object never sets this flag, which is why
+    /// it replaces the `value == 0 && weak` guess the symbol table used to
+    /// make -- that guess also discarded legitimate zero-valued definitions.
+    pub placeholder: bool,
 }
 
 /// A merged input section with its assigned virtual address.
@@ -500,7 +487,6 @@ pub use crate::backend::linker_common::align_up_64 as align_up;
 pub use crate::backend::linker_common::pad_to;
 pub use crate::backend::linker_common::write_elf64_phdr as write_phdr;
 pub use crate::backend::linker_common::write_elf64_phdr_at as write_phdr_at;
-pub use crate::backend::linker_common::write_elf64_shdr as write_shdr;
 
 /// Build a proper `.gnu.hash` section for the given dynamic symbol names.
 ///

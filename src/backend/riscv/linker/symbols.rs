@@ -5,11 +5,9 @@
 //! PC-relative GOT references.
 
 use super::elf_read::*;
-use super::relocations::{
-    GlobalSym, MergedSection, R_RISCV_GOT_HI20, R_RISCV_TLS_GD_HI20, R_RISCV_TLS_GOT_HI20,
-    got_sym_key,
-};
-use crate::backend::elf::STV_DEFAULT;
+use super::got::GotKind;
+use super::relocations::{GlobalSym, MergedSection, got_sym_key};
+use crate::backend::elf::{STT_TLS, STV_DEFAULT};
 use crate::backend::linker_common;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
@@ -97,8 +95,8 @@ pub fn build_global_symbols(
                         defined: false,
                         needs_plt: false,
                         plt_idx: 0,
-                        got_offset: None,
                         section_idx: None,
+                        placeholder: false,
                     });
                 // A weak reference seen first must not make a later strong
                 // unresolved reference optional (including hidden symbols).
@@ -120,8 +118,8 @@ pub fn build_global_symbols(
                         defined: true,
                         needs_plt: false,
                         plt_idx: 0,
-                        got_offset: None,
                         section_idx: None,
+                        placeholder: false,
                     });
                 if !entry.defined || (entry.binding == STB_WEAK && sym.binding() == STB_GLOBAL) {
                     entry.value = sym.value;
@@ -158,8 +156,8 @@ pub fn build_global_symbols(
                     defined: false,
                     needs_plt: false,
                     plt_idx: 0,
-                    got_offset: None,
                     section_idx: None,
+                    placeholder: false,
                 });
 
             if entry.defined && !(entry.binding == STB_WEAK && sym.binding() == STB_GLOBAL) {
@@ -233,8 +231,8 @@ fn allocate_common_symbol(
             defined: true,
             needs_plt: false,
             plt_idx: 0,
-            got_offset: None,
             section_idx: Some(bss_idx),
+            placeholder: false,
         });
     if !entry.defined || (entry.binding == STB_WEAK && sym.binding() == STB_GLOBAL) {
         entry.value = off;
@@ -257,6 +255,11 @@ pub fn mark_plt_and_copy_symbols(
     for (name, sym) in global_syms.iter_mut() {
         if !sym.defined {
             if let Some(shlib_sym) = shared_lib_syms.get(name) {
+                // A TLS import is reached through GOT slots the dynamic
+                // loader fills (`got.rs`); it is neither called nor copied.
+                if shlib_sym.sym_type() == STT_TLS {
+                    continue;
+                }
                 // Untyped (STT_NOTYPE) exports: data copies (bfd-compatible),
                 // code keeps its PLT (see DynSymbol::in_exec_segment).
                 if shlib_sym.sym_type() == STT_OBJECT
@@ -275,52 +278,39 @@ pub fn mark_plt_and_copy_symbols(
     (plt_symbols, copy_symbols)
 }
 
-/// Identify GOT entries needed by scanning for GOT_HI20 and TLS GOT relocations.
-///
-/// Returns the ordered list of GOT symbol keys, the set of TLS GOT symbols,
-/// and a map of local GOT symbol info for resolving local GOT entries.
+/// The GOT slots the relocations ask for, in first-reference order, and
+/// the defining `(object, symbol, addend)` of each object-local key.
 pub fn collect_got_entries(
     input_objs: &[(String, ElfObject)],
 ) -> (
-    Vec<String>,
-    FxHashSet<String>,
+    Vec<(String, GotKind)>,
     FxHashMap<String, (usize, usize, i64)>,
 ) {
-    let mut got_symbols: Vec<String> = Vec::new();
-    let mut tls_got_symbols: FxHashSet<String> = FxHashSet::default();
+    let mut wanted: Vec<(String, GotKind)> = Vec::new();
     let mut local_got_sym_info: FxHashMap<String, (usize, usize, i64)> = FxHashMap::default();
-
-    let mut got_set: FxHashSet<String> = FxHashSet::default();
     for (obj_idx, (_, obj)) in input_objs.iter().enumerate() {
         for relocs in &obj.relocations {
             for reloc in relocs {
-                if reloc.rela_type == R_RISCV_GOT_HI20
-                    || reloc.rela_type == R_RISCV_TLS_GOT_HI20
-                    || reloc.rela_type == R_RISCV_TLS_GD_HI20
-                {
-                    let sym = &obj.symbols[reloc.sym_idx as usize];
-                    let (name, is_local) = got_sym_key(obj_idx, sym, reloc.addend);
-                    if !name.is_empty() && !got_set.contains(&name) {
-                        got_set.insert(name.clone());
-                        got_symbols.push(name.clone());
-                        if is_local {
-                            local_got_sym_info.insert(
-                                name.clone(),
-                                (obj_idx, reloc.sym_idx as usize, reloc.addend),
-                            );
-                        }
-                    }
-                    if reloc.rela_type == R_RISCV_TLS_GOT_HI20
-                        || reloc.rela_type == R_RISCV_TLS_GD_HI20
-                    {
-                        tls_got_symbols.insert(name);
-                    }
+                let Some(kind) = GotKind::of(reloc.rela_type) else {
+                    continue;
+                };
+                let sym = &obj.symbols[reloc.sym_idx as usize];
+                let (name, is_local) = got_sym_key(obj_idx, sym, reloc.addend);
+                if name.is_empty() {
+                    continue;
                 }
+                if is_local {
+                    local_got_sym_info.entry(name.clone()).or_insert((
+                        obj_idx,
+                        reloc.sym_idx as usize,
+                        reloc.addend,
+                    ));
+                }
+                wanted.push((name, kind));
             }
         }
     }
-
-    (got_symbols, tls_got_symbols, local_got_sym_info)
+    (wanted, local_got_sym_info)
 }
 
 /// Build local symbol virtual address table for relocation resolution.

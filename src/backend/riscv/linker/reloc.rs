@@ -8,6 +8,7 @@
 //! behavior controlled by `RelocContext`.
 
 use super::elf_read::*;
+use super::got::{GotKind, GotLayout};
 use super::relocations::{
     GlobalSym, MergedSection, R_RISCV_32, R_RISCV_32_PCREL, R_RISCV_64, R_RISCV_ADD8,
     R_RISCV_ADD16, R_RISCV_ADD32, R_RISCV_ADD64, R_RISCV_ALIGN, R_RISCV_BRANCH, R_RISCV_CALL_PLT,
@@ -30,7 +31,7 @@ pub struct RelocContext<'a> {
     pub local_sym_vaddrs: &'a [Vec<u64>],
     pub global_syms: &'a FxHashMap<String, GlobalSym>,
     pub got_vaddr: u64,
-    pub got_symbols: &'a [String],
+    pub got: &'a GotLayout,
     pub got_plt_vaddr: u64,
     pub tls_vaddr: u64,
     /// For executable linking: GD->LE TLS relaxation info (auipc_vaddr -> (sym_value, addend))
@@ -39,8 +40,6 @@ pub struct RelocContext<'a> {
     pub gd_tls_call_nop: &'a FxHashSet<u64>,
     /// Whether to collect R_RISCV_RELATIVE dynamic relocations (shared lib mode)
     pub collect_relatives: bool,
-    /// For shared library linking: additional GOT offset mapping
-    pub got_sym_offsets: &'a FxHashMap<String, u64>,
     /// For shared library linking: PLT stub addresses for undefined symbols
     pub plt_sym_addrs: &'a FxHashMap<String, u64>,
 }
@@ -311,37 +310,65 @@ fn resolve_sym_value(
     }
 }
 
-/// Look up a GOT entry address for the given symbol.
+/// Whether `sym` names something a `hi20` address form can encode.
+///
+/// `auipc` + `add`/`load` materialises `S + A`, so `S` has to be an address
+/// the loader maps. A symbol in an input section without `SHF_ALLOC` is
+/// written to the file but never mapped: `build_local_sym_vaddrs` has no
+/// section address to add, the symbol resolves to a file offset or zero, and
+/// the two instructions then materialise that number with no diagnostic. The
+/// section is the only proof available, because zero is also a legitimate
+/// mapped address and UNDEF/ABS symbols resolve to zero without owning a
+/// section at all.
+///
+/// Globals resolve through `global_syms`, and their weak/PLT/preemptible
+/// rules already decide what may be encoded, so they are not judged here.
+fn pcrel_target_is_addressable(
+    sym: &super::elf_read::Symbol,
+    obj: &super::elf_read::ElfObject,
+) -> bool {
+    if !sym.is_local() && !sym.name.is_empty() {
+        return true;
+    }
+    match sym.shndx {
+        // No definition anywhere: nothing to address.
+        SHN_UNDEF => false,
+        // A value rather than a location; the merged global holds the address.
+        SHN_ABS | SHN_COMMON => true,
+        // Any other reserved index is not an input section, so there is no
+        // flag to consult and `st_value` is not an address.
+        _ if sym.shndx >= SHN_LORESERVE => false,
+        idx => obj
+            .sections
+            .get(idx as usize)
+            .is_some_and(|section| section.flags & SHF_ALLOC != 0),
+    }
+}
+
+/// The address of the GOT slot of `kind` a relocation against `sym`
+/// addresses. An executable reaches an imported function's address through
+/// its `.got.plt` slot when it has no `.got` slot of its own.
 fn lookup_got_entry(
     sym: &super::elf_read::Symbol,
     obj_idx: usize,
     addend: i64,
+    kind: GotKind,
     ctx: &RelocContext,
-) -> u64 {
-    let (sym_name, _) = got_sym_key(obj_idx, sym, addend);
-
-    // Check got_sym_offsets first (shared lib path)
-    if let Some(&got_off) = ctx.got_sym_offsets.get(&sym_name) {
-        return ctx.got_vaddr + got_off;
+) -> Result<u64, String> {
+    let (key, _) = got_sym_key(obj_idx, sym, addend);
+    if let Some(off) = ctx.got.offset(&key, kind) {
+        return Ok(ctx.got_vaddr + off);
     }
-
-    // Check global symbol's got_offset
-    if let Some(gs) = ctx.global_syms.get(sym.name.as_str()) {
-        if let Some(got_off) = gs.got_offset {
-            return ctx.got_vaddr + got_off;
-        }
-        // PLT symbol: use GOT.PLT
-        if gs.needs_plt {
-            return ctx.got_plt_vaddr + (2 + gs.plt_idx) as u64 * 8;
+    if kind == GotKind::Addr && !ctx.collect_relatives {
+        if let Some(gs) = ctx
+            .global_syms
+            .get(sym.name.as_str())
+            .filter(|g| g.needs_plt)
+        {
+            return Ok(ctx.got_plt_vaddr + (2 + gs.plt_idx) as u64 * 8);
         }
     }
-
-    // Search got_symbols by name
-    if let Some(idx) = ctx.got_symbols.iter().position(|n| n == &sym_name) {
-        return ctx.got_vaddr + idx as u64 * 8;
-    }
-
-    0
+    Err(format!("no RISC-V {kind:?} GOT slot for '{}'", sym.name))
 }
 
 /// Resolve a 64-bit address and record the fixup the loader still owes it.
@@ -463,9 +490,10 @@ fn apply_one_reloc(
                 .ok_or_else(|| format!("R_RISCV_32 field exceeds output in '{}'", obj_name))?;
             field.copy_from_slice(&value.to_le_bytes());
         }
-        R_RISCV_PCREL_HI20 => {
-            let offset_val = super::displacement::checked_auipc_delta(s, a, p)?;
-            patch_u_type(data, off, offset_val as u32);
+        R_RISCV_PCREL_HI20 | R_RISCV_GOT_HI20 => {
+            apply_pcrel_hi20(
+                rela_type, data, off, s, a, p, sym, obj_idx, obj, obj_name, ctx,
+            )?;
         }
         R_RISCV_PCREL_LO12_I => {
             let auipc_addr = s as i64 + a;
@@ -500,11 +528,6 @@ fn apply_one_reloc(
                 );
                 patch_s_type(data, off, hi_val as u32);
             }
-        }
-        R_RISCV_GOT_HI20 => {
-            let got_entry_vaddr = lookup_got_entry(sym, obj_idx, a, ctx);
-            let offset_val = super::displacement::checked_auipc_delta(got_entry_vaddr, a, p)?;
-            patch_u_type(data, off, offset_val as u32);
         }
         R_RISCV_CALL_PLT => {
             if ctx.gd_tls_call_nop.contains(&p) {
@@ -699,20 +722,8 @@ fn apply_one_reloc(
                 obj_name
             ));
         }
-        R_RISCV_TLS_GD_HI20 => {
-            // GD->LE relaxation: rewrite auipc -> lui with tprel
-            // TODO: In shared libs, this should emit TLS_DTPMOD64/DTPOFF64 dynamic relocs
-            let tprel = (s as i64 + a - ctx.tls_vaddr as i64) as u32;
-            let hi = tprel.wrapping_add(0x800) & 0xFFFFF000;
-            if off + 4 <= data.len() {
-                let lui_insn: u32 = 0x00000537 | hi; // lui a0, hi
-                data[off..off + 4].copy_from_slice(&lui_insn.to_le_bytes());
-            }
-        }
-        R_RISCV_TLS_GOT_HI20 => {
-            let got_entry_vaddr = lookup_got_entry(sym, obj_idx, a, ctx);
-            let offset_val = super::displacement::checked_auipc_delta(got_entry_vaddr, a, p)?;
-            patch_u_type(data, off, offset_val as u32);
+        R_RISCV_TLS_GD_HI20 | R_RISCV_TLS_GOT_HI20 => {
+            apply_tls_hi20(rela_type, data, off, s, a, p, sym, obj_idx, ctx)?;
         }
         other => {
             // Collecting RELATIVE entries is not a license to discard other
@@ -725,6 +736,90 @@ fn apply_one_reloc(
     }
 
     Ok(())
+}
+
+/// Patch the `auipc` of a PC-relative address access: `%pcrel_hi` of the
+/// symbol itself, or of the GOT slot that holds its address. Both end up
+/// materialising an address in a register, so both need the section proof --
+/// an `auipc` pair carries no range check that would catch a file offset, and
+/// the displacement to a section near offset 0 always fits in the +-2 GiB
+/// window.
+#[allow(clippy::too_many_arguments)]
+fn apply_pcrel_hi20(
+    rela_type: u32,
+    data: &mut [u8],
+    off: usize,
+    s: u64,
+    a: i64,
+    p: u64,
+    sym: &super::elf_read::Symbol,
+    obj_idx: usize,
+    obj: &super::elf_read::ElfObject,
+    obj_name: &str,
+    ctx: &RelocContext,
+) -> Result<(), String> {
+    if !pcrel_target_is_addressable(sym, obj) {
+        return Err(format!(
+            "RISC-V PC-relative address relocation requires a symbol in a loaded \
+             section: '{}' in '{}' (its input section is not SHF_ALLOC, so it is \
+             written to the output but never mapped and S is a file offset, not an \
+             address)",
+            sym.name, obj_name
+        ));
+    }
+    let target = if rela_type == R_RISCV_GOT_HI20 {
+        lookup_got_entry(sym, obj_idx, a, GotKind::Addr, ctx)?
+    } else {
+        s
+    };
+    let delta = super::displacement::checked_auipc_delta(target, a, p)?;
+    patch_u_type(data, off, delta as u32);
+    Ok(())
+}
+
+/// Patch the `auipc` of a TLS access: either the `hi20` of a real
+/// `tls_index`/`tls_offset` GOT slot, or -- for a `GD` access to a variable
+/// the executable itself defines -- the relaxed `lui` form carrying the TP
+/// offset. A shared object has no static TP offset to bake in, so a `GD`
+/// access without a `tls_index` slot is refused rather than mis-encoded.
+fn apply_tls_hi20(
+    rela_type: u32,
+    data: &mut [u8],
+    off: usize,
+    s: u64,
+    a: i64,
+    p: u64,
+    sym: &super::elf_read::Symbol,
+    obj_idx: usize,
+    ctx: &RelocContext,
+) -> Result<(), String> {
+    let kind = if rela_type == R_RISCV_TLS_GD_HI20 {
+        GotKind::TlsGd
+    } else {
+        GotKind::TlsIe
+    };
+    if ctx
+        .got
+        .offset(&got_sym_key(obj_idx, sym, a).0, kind)
+        .is_some()
+    {
+        let slot = lookup_got_entry(sym, obj_idx, a, kind, ctx)?;
+        let delta = super::displacement::checked_auipc_delta(slot, a, p)?;
+        patch_u_type(data, off, delta as u32);
+        return Ok(());
+    }
+    if kind == GotKind::TlsGd && !ctx.collect_relatives {
+        // GD->LE relaxation of a variable the executable defines:
+        // auipc -> lui with the TP offset (`collect_gd_tls_relax_info`).
+        let tprel = (s as i64 + a - ctx.tls_vaddr as i64) as u32;
+        let hi = tprel.wrapping_add(0x800) & 0xFFFFF000;
+        if off + 4 <= data.len() {
+            let lui_insn: u32 = 0x00000537 | hi; // lui a0, hi
+            data[off..off + 4].copy_from_slice(&lui_insn.to_le_bytes());
+        }
+        return Ok(());
+    }
+    Err(format!("no RISC-V {kind:?} GOT slot for '{}'", sym.name))
 }
 
 /// Find the hi20 value for a PCREL_LO12 relocation, dispatching to the
@@ -749,7 +844,7 @@ fn find_hi20_value_for_reloc(
             auipc_addr,
             sec_offset,
             ctx.got_vaddr,
-            ctx.got_symbols,
+            ctx.got,
         )
     } else {
         super::relocations::find_hi20_value(
@@ -763,7 +858,7 @@ fn find_hi20_value_for_reloc(
             auipc_addr,
             sec_offset,
             ctx.got_vaddr,
-            ctx.got_symbols,
+            ctx.got,
             ctx.got_plt_vaddr,
             ctx.gd_tls_relax_info,
             ctx.tls_vaddr,
@@ -771,7 +866,8 @@ fn find_hi20_value_for_reloc(
     }
 }
 
-/// Collect GD TLS relaxation info for static binaries.
+/// Collect GD TLS relaxation info for executables: every general-dynamic
+/// access to a variable the executable defines (no `tls_index` slot).
 ///
 /// Pre-scans relocations to find R_RISCV_TLS_GD_HI20 entries and their
 /// associated __tls_get_addr CALL_PLT entries, so they can be relaxed
@@ -782,6 +878,7 @@ pub fn collect_gd_tls_relax_info(
     section_vaddrs: &[u64],
     local_sym_vaddrs: &[Vec<u64>],
     global_syms: &FxHashMap<String, GlobalSym>,
+    got: &GotLayout,
     gd_tls_relax_info: &mut FxHashMap<u64, (u64, i64)>,
     gd_tls_call_nop: &mut FxHashSet<u64>,
 ) {
@@ -798,9 +895,13 @@ pub fn collect_gd_tls_relax_info(
 
             for (ri, reloc) in relocs.iter().enumerate() {
                 if reloc.rela_type == R_RISCV_TLS_GD_HI20 {
+                    let sym = &obj.symbols[reloc.sym_idx as usize];
+                    let key = got_sym_key(obj_idx, sym, reloc.addend).0;
+                    if got.offset(&key, GotKind::TlsGd).is_some() {
+                        continue; // an import keeps its `tls_index`
+                    }
                     let offset = sec_offset + reloc.offset;
                     let auipc_vaddr = ms_vaddr + offset;
-                    let sym = &obj.symbols[reloc.sym_idx as usize];
                     let sym_val = resolve_symbol_value(
                         sym,
                         reloc.sym_idx as usize,
@@ -828,5 +929,117 @@ pub fn collect_gd_tls_relax_info(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn object(section_flags: u64) -> super::super::elf_read::ElfObject {
+        super::super::elf_read::ElfObject {
+            sections: vec![
+                crate::backend::linker_common::Elf64Section {
+                    name_idx: 0,
+                    name: "".into(),
+                    sh_type: 1,
+                    flags: 0,
+                    addr: 0,
+                    offset: 0,
+                    size: 0,
+                    link: 0,
+                    info: 0,
+                    addralign: 0,
+                    entsize: 0,
+                },
+                crate::backend::linker_common::Elf64Section {
+                    name_idx: 0,
+                    name: ".data".into(),
+                    sh_type: 1,
+                    flags: section_flags,
+                    addr: 0,
+                    offset: 0,
+                    size: 8,
+                    link: 0,
+                    info: 0,
+                    addralign: 8,
+                    entsize: 0,
+                },
+            ],
+            symbols: vec![],
+            section_data: vec![],
+            relocations: vec![],
+            source_name: "probe.o".into(),
+        }
+    }
+
+    fn symbol(binding: u8, name: &str, shndx: u16) -> super::super::elf_read::Symbol {
+        super::super::elf_read::Symbol {
+            name_idx: 0,
+            name: name.into(),
+            info: (binding << 4) | STT_OBJECT,
+            other: 0,
+            shndx,
+            value: 0,
+            size: 0,
+        }
+    }
+
+    /// The `hi20` guard is what stops an address form from materialising a
+    /// file offset. Every branch is pinned: a loaded section is addressable,
+    /// an unloaded one is not, and the reserved indices keep their by-meaning
+    /// treatment. The probe that motivated it linked a `%pcrel_hi` reference
+    /// into a non-allocated section and produced `a0 = 0x2e0` with no
+    /// diagnostic while the target sat at address 0.
+    #[test]
+    fn pcrel_targets_need_a_loaded_section() {
+        let loaded = object(SHF_ALLOC);
+        let unloaded = object(0);
+        assert!(pcrel_target_is_addressable(
+            &symbol(STB_LOCAL, "t", 1),
+            &loaded
+        ));
+        assert!(!pcrel_target_is_addressable(
+            &symbol(STB_LOCAL, "t", 1),
+            &unloaded
+        ));
+        // No definition to address.
+        assert!(!pcrel_target_is_addressable(
+            &symbol(STB_LOCAL, "t", SHN_UNDEF),
+            &loaded
+        ));
+        // Values, not locations.
+        assert!(pcrel_target_is_addressable(
+            &symbol(STB_LOCAL, "t", SHN_ABS),
+            &unloaded
+        ));
+        assert!(pcrel_target_is_addressable(
+            &symbol(STB_LOCAL, "t", SHN_COMMON),
+            &unloaded
+        ));
+        // Reserved indices that are not an input section at all.
+        assert!(!pcrel_target_is_addressable(
+            &symbol(STB_LOCAL, "t", SHN_LORESERVE),
+            &loaded
+        ));
+        assert!(!pcrel_target_is_addressable(
+            &symbol(STB_LOCAL, "t", 0xffff),
+            &loaded
+        ));
+        // A section index past the header table (crafted input).
+        assert!(!pcrel_target_is_addressable(
+            &symbol(STB_LOCAL, "t", 9),
+            &loaded
+        ));
+        // Globals resolve through `global_syms`; the callers own those rules.
+        assert!(pcrel_target_is_addressable(
+            &symbol(STB_GLOBAL, "target", SHN_UNDEF),
+            &unloaded
+        ));
+        // An unnamed local is still judged by its section.
+        assert!(!pcrel_target_is_addressable(
+            &symbol(STB_LOCAL, "", 1),
+            &unloaded
+        ));
     }
 }

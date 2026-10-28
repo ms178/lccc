@@ -6,11 +6,13 @@
 //! ELF64 executable.
 
 use super::elf_read::*;
-use super::relocations::{
-    GlobalSym, MergedSection, align_up, build_gnu_hash, pad_to, write_phdr, write_shdr,
+use super::got::{
+    GotKind, GotLayout, R_RISCV_TLS_DTPMOD64, R_RISCV_TLS_DTPREL64, R_RISCV_TLS_TPREL64,
 };
-use super::{reloc, symbols};
+use super::relocations::{GlobalSym, MergedSection, align_up, build_gnu_hash, pad_to, write_phdr};
+use super::{debug, reloc, symbols};
 use crate::backend::linker_common;
+use crate::backend::linker_common::shdr::{self, ShdrSpec};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
 use crate::backend::elf::{
@@ -18,8 +20,8 @@ use crate::backend::elf::{
     DT_JMPREL, DT_NEEDED, DT_NULL, DT_PLTGOT, DT_PLTREL, DT_PLTRELSZ, DT_PREINIT_ARRAY,
     DT_PREINIT_ARRAYSZ, DT_RELA, DT_RELAENT, DT_RELASZ, DT_STRSZ, DT_STRTAB, DT_SYMENT, DT_SYMTAB,
     DT_VERNEED, DT_VERNEEDNUM, DT_VERSYM, EM_RISCV as EM_RISCV_ELF, ET_EXEC, PF_R, PF_W, PF_X,
-    PT_DYNAMIC, PT_GNU_RELRO, PT_GNU_STACK, PT_INTERP, PT_LOAD, PT_NOTE, PT_TLS, STT_FUNC,
-    STT_GNU_IFUNC,
+    PT_DYNAMIC, PT_GNU_RELRO, PT_GNU_STACK, PT_INTERP, PT_LOAD, PT_NOTE, PT_TLS, SHF_INFO_LINK,
+    STT_FUNC, STT_GNU_IFUNC, STT_TLS,
 };
 
 const PT_GNU_EH_FRAME: u32 = 0x6474e550;
@@ -36,14 +38,16 @@ const INTERP: &[u8] = b"/lib/ld-linux-riscv64-lp64d.so.1\0";
 /// `merged_sections` / `merged_map`: merged output sections from Phase 2
 /// `sec_mapping`: (obj_idx, sec_idx) -> (merged_idx, offset_in_merged)
 /// `global_syms`: resolved global symbol table from Phase 3
-/// `got_symbols`: ordered GOT symbol keys
-/// `tls_got_symbols`: subset of got_symbols that are TLS
+/// `got`: the GOT slots and their offsets
+/// `tls_imports`: TLS variables imported from shared libraries
 /// `local_got_sym_info`: local GOT entries: key -> (obj_idx, sym_idx, addend)
 /// `plt_symbols`: symbols needing PLT entries (dynamic linking only)
 /// `copy_symbols`: symbols needing R_COPY relocations: (name, size)
 /// `sec_indices`: section layout ordering
 /// `actual_needed_libs`: NEEDED sonames for .dynamic
 /// `is_static`: true for static linking (no PLT/GOT/.dynamic)
+/// `debug_sections`: the DWARF to append (none under `-s`/`-S`)
+/// `keep_symtab`: write `.symtab` (false under `-s`)
 /// `output_path`: output file path
 pub fn emit_executable(
     input_objs: &[(String, ElfObject)],
@@ -51,8 +55,8 @@ pub fn emit_executable(
     merged_map: &mut FxHashMap<String, usize>,
     sec_mapping: &FxHashMap<(usize, usize), (usize, u64)>,
     global_syms: &mut FxHashMap<String, GlobalSym>,
-    got_symbols: &[String],
-    tls_got_symbols: &FxHashSet<String>,
+    got: &GotLayout,
+    tls_imports: &[String],
     local_got_sym_info: &FxHashMap<String, (usize, usize, i64)>,
     plt_symbols: &[String],
     copy_symbols: &[(String, u64)],
@@ -61,6 +65,8 @@ pub fn emit_executable(
     shared_lib_syms: &super::input::SharedLibSyms,
     rpath: Option<&(i64, String)>,
     is_static: bool,
+    debug_sections: &mut debug::DebugSections,
+    keep_symtab: bool,
     output_path: &str,
 ) -> Result<(), String> {
     // ── Phase 4: Compute generated section sizes and layout ────────────
@@ -74,7 +80,7 @@ pub fn emit_executable(
     };
     let got_plt_entries = if is_static { 0 } else { plt_symbols.len() + 2 };
     let got_plt_size = got_plt_entries as u64 * 8;
-    let got_size = got_symbols.len() as u64 * 8;
+    let got_size = got.size();
 
     let interp_size = if is_static { 0 } else { INTERP.len() as u64 };
 
@@ -85,10 +91,20 @@ pub fn emit_executable(
         dyn_entry_count as u64 * 16
     };
 
+    // COPY relocations, then what the loader owes the GOT for TLS
+    // imports: TPREL64 per initial-exec slot, DTPMOD64 + DTPREL64 per
+    // `tls_index`.
+    let tls_import_slots = || {
+        got.entries()
+            .filter(|(key, kind, _)| *kind != GotKind::Addr && tls_imports.iter().any(|t| t == key))
+    };
+    let tls_dyn_relocs: usize = tls_import_slots()
+        .map(|(_, kind, _)| if kind == GotKind::TlsGd { 2 } else { 1 })
+        .sum();
     let rela_dyn_size = if is_static {
         0
     } else {
-        copy_symbols.len() as u64 * 24
+        (copy_symbols.len() + tls_dyn_relocs) as u64 * 24
     };
     let rela_plt_size = if is_static {
         0
@@ -188,6 +204,7 @@ pub fn emit_executable(
         let unsorted_names: Vec<String> = {
             let mut v = plt_symbols.to_vec();
             v.extend(copy_sym_names.iter().cloned());
+            v.extend(tls_imports.iter().cloned());
             v
         };
 
@@ -270,6 +287,9 @@ pub fn emit_executable(
             entry[0..4].copy_from_slice(&name_off.to_le_bytes());
             if copy_sym_set.contains(name) {
                 entry[4] = (STB_GLOBAL << 4) | STT_OBJECT;
+            } else if tls_imports.contains(name) {
+                let bind = global_syms.get(name).map_or(STB_GLOBAL, |g| g.binding);
+                entry[4] = (bind << 4) | STT_TLS;
             } else if let Some(gsym) = global_syms.get(name) {
                 let bind = gsym.binding;
                 let stype = if gsym.sym_type != 0 {
@@ -453,13 +473,6 @@ pub fn emit_executable(
     let got_offset = file_offset;
     file_offset += got_size;
     vaddr += got_size;
-
-    // Assign GOT offsets to symbols
-    for (i, name) in got_symbols.iter().enumerate() {
-        if let Some(sym) = global_syms.get_mut(name) {
-            sym.got_offset = Some(i as u64 * 8);
-        }
-    }
 
     // RELRO boundary — ld.so rounds [vaddr, vaddr+memsz) down to page edges
     // before mprotect(PROT_READ), so a memsz that does not reach the next
@@ -737,7 +750,11 @@ pub fn emit_executable(
     };
 
     {
-        let mut define_linker_sym = |name: &str, value: u64, binding: u8| {
+        // `placeholder` marks a definition this linker invents to satisfy an
+        // optional runtime hook. It is carried on the symbol so `.symtab` can
+        // tell it from a definition an input object actually provides: a real
+        // definition is never overwritten here, so the flag stays false.
+        let mut define_linker_sym = |name: &str, value: u64, binding: u8, placeholder: bool| {
             let entry = global_syms
                 .entry(name.to_string())
                 .or_insert_with(|| GlobalSym {
@@ -749,18 +766,19 @@ pub fn emit_executable(
                     defined: false,
                     needs_plt: false,
                     plt_idx: 0,
-                    got_offset: None,
                     section_idx: None,
+                    placeholder: false,
                 });
             if !entry.defined {
                 entry.value = value;
                 entry.defined = true;
                 entry.binding = binding;
+                entry.placeholder = placeholder;
             }
         };
 
         for sym in &get_standard_linker_symbols(&linker_addrs) {
-            define_linker_sym(sym.name, sym.value, sym.binding);
+            define_linker_sym(sym.name, sym.value, sym.binding, false);
         }
 
         // RISC-V specific symbols
@@ -769,25 +787,25 @@ pub fn emit_executable(
         } else {
             data_vaddr + 0x800
         };
-        define_linker_sym("__global_pointer$", gp_value, STB_GLOBAL);
-        define_linker_sym("__BSS_END__", bss_end, STB_GLOBAL);
-        define_linker_sym("__SDATA_BEGIN__", sdata_vaddr, STB_GLOBAL);
-        define_linker_sym("__DATA_BEGIN__", data_vaddr, STB_GLOBAL);
+        define_linker_sym("__global_pointer$", gp_value, STB_GLOBAL, false);
+        define_linker_sym("__BSS_END__", bss_end, STB_GLOBAL, false);
+        define_linker_sym("__SDATA_BEGIN__", sdata_vaddr, STB_GLOBAL, false);
+        define_linker_sym("__DATA_BEGIN__", data_vaddr, STB_GLOBAL, false);
         let rodata_vaddr = merged_map
             .get(".rodata")
             .map(|&i| section_vaddrs[i])
             .unwrap_or(0);
-        define_linker_sym("_IO_stdin_used", rodata_vaddr, STB_GLOBAL);
+        define_linker_sym("_IO_stdin_used", rodata_vaddr, STB_GLOBAL, false);
 
         // Weak symbols for optional features
-        define_linker_sym("_ITM_registerTMCloneTable", 0, STB_WEAK);
-        define_linker_sym("_ITM_deregisterTMCloneTable", 0, STB_WEAK);
-        define_linker_sym("__pthread_initialize_minimal", 0, STB_WEAK);
-        define_linker_sym("_dl_rtld_map", 0, STB_WEAK);
-        define_linker_sym("__gcc_personality_v0", 0, STB_WEAK);
-        define_linker_sym("_Unwind_Resume", 0, STB_WEAK);
-        define_linker_sym("_Unwind_ForcedUnwind", 0, STB_WEAK);
-        define_linker_sym("_Unwind_GetCFA", 0, STB_WEAK);
+        define_linker_sym("_ITM_registerTMCloneTable", 0, STB_WEAK, true);
+        define_linker_sym("_ITM_deregisterTMCloneTable", 0, STB_WEAK, true);
+        define_linker_sym("__pthread_initialize_minimal", 0, STB_WEAK, true);
+        define_linker_sym("_dl_rtld_map", 0, STB_WEAK, true);
+        define_linker_sym("__gcc_personality_v0", 0, STB_WEAK, true);
+        define_linker_sym("_Unwind_Resume", 0, STB_WEAK, true);
+        define_linker_sym("_Unwind_ForcedUnwind", 0, STB_WEAK, true);
+        define_linker_sym("_Unwind_GetCFA", 0, STB_WEAK, true);
     }
 
     // __start_<section> / __stop_<section> symbols
@@ -830,19 +848,17 @@ pub fn emit_executable(
 
     let mut gd_tls_relax_info: FxHashMap<u64, (u64, i64)> = FxHashMap::default();
     let mut gd_tls_call_nop: FxHashSet<u64> = FxHashSet::default();
-    if is_static {
-        reloc::collect_gd_tls_relax_info(
-            input_objs,
-            sec_mapping,
-            &section_vaddrs,
-            &local_sym_vaddrs,
-            global_syms,
-            &mut gd_tls_relax_info,
-            &mut gd_tls_call_nop,
-        );
-    }
+    reloc::collect_gd_tls_relax_info(
+        input_objs,
+        sec_mapping,
+        &section_vaddrs,
+        &local_sym_vaddrs,
+        global_syms,
+        got,
+        &mut gd_tls_relax_info,
+        &mut gd_tls_call_nop,
+    );
 
-    let empty_got_offsets = FxHashMap::default();
     let empty_plt_addrs = FxHashMap::default();
     let ctx = reloc::RelocContext {
         sec_mapping,
@@ -850,13 +866,12 @@ pub fn emit_executable(
         local_sym_vaddrs: &local_sym_vaddrs,
         global_syms,
         got_vaddr,
-        got_symbols,
+        got,
         got_plt_vaddr,
         tls_vaddr,
         gd_tls_relax_info: &gd_tls_relax_info,
         gd_tls_call_nop: &gd_tls_call_nop,
         collect_relatives: false,
-        got_sym_offsets: &empty_got_offsets,
         plt_sym_addrs: &empty_plt_addrs,
     };
     reloc::apply_relocations(input_objs, merged_sections, &ctx)?;
@@ -864,39 +879,29 @@ pub fn emit_executable(
     // ── Phase 7: Build GOT data ─────────────────────────────────────────
 
     let mut got_data = vec![0u8; got_size as usize];
-    for (i, name) in got_symbols.iter().enumerate() {
-        let val = if let Some(gs) = global_syms.get(name) {
-            if tls_got_symbols.contains(name) {
-                gs.value.wrapping_sub(tls_vaddr)
-            } else {
-                gs.value
-            }
-        } else if let Some(&(obj_idx, sym_idx, addend)) = local_got_sym_info.get(name) {
-            let obj = &input_objs[obj_idx].1;
-            let sym = &obj.symbols[sym_idx];
-            let final_val = if let Some(&(merged_idx, sec_offset)) =
-                sec_mapping.get(&(obj_idx, sym.shndx as usize))
-            {
-                if sym.sym_type() == STT_SECTION {
-                    (section_vaddrs[merged_idx] + sec_offset) as i64 + addend
-                } else {
-                    (section_vaddrs[merged_idx] + sec_offset + sym.value) as i64 + addend
-                }
-            } else {
-                0
-            } as u64;
-            if tls_got_symbols.contains(name) {
-                final_val.wrapping_sub(tls_vaddr)
-            } else {
-                final_val
-            }
-        } else {
-            0
-        };
-        let off = i * 8;
-        if off + 8 <= got_data.len() {
-            got_data[off..off + 8].copy_from_slice(&val.to_le_bytes());
+    for (key, kind, off) in got.entries() {
+        // A TLS import's slots are the loader's to fill (`.rela.dyn`).
+        if kind != GotKind::Addr && tls_imports.iter().any(|t| t == key) {
+            continue;
         }
+        let value = if let Some(gs) = global_syms.get(key) {
+            gs.value
+        } else if let Some(&(oi, si, addend)) = local_got_sym_info.get(key) {
+            local_sym_vaddrs[oi][si].wrapping_add(addend as u64)
+        } else {
+            return Err(format!("missing RISC-V GOT symbol '{key}'"));
+        };
+        let value = match kind {
+            GotKind::Addr => value,
+            GotKind::TlsIe => value.wrapping_sub(tls_vaddr),
+            GotKind::TlsGd => {
+                return Err(format!(
+                    "RISC-V tls_index for '{key}', which the executable defines"
+                ));
+            }
+        };
+        let off = off as usize;
+        got_data[off..off + 8].copy_from_slice(&value.to_le_bytes());
     }
 
     // Build GOT.PLT data
@@ -944,6 +949,28 @@ pub fn emit_executable(
             let r_info = ((sym_idx as u64) << 32) | 4; // R_RISCV_COPY
             rela_dyn_data.extend_from_slice(&addr.to_le_bytes());
             rela_dyn_data.extend_from_slice(&r_info.to_le_bytes());
+            rela_dyn_data.extend_from_slice(&0i64.to_le_bytes());
+        }
+    }
+    for (key, kind, off) in tls_import_slots() {
+        let sym_idx = dynsym_names
+            .iter()
+            .position(|n| n == key)
+            .ok_or_else(|| format!("missing dynamic symbol for RISC-V TLS import '{key}'"))?
+            as u64
+            + 1;
+        let slot = got_vaddr + off;
+        let relocs: &[(u64, u64)] = if kind == GotKind::TlsGd {
+            &[
+                (slot, R_RISCV_TLS_DTPMOD64),
+                (slot + 8, R_RISCV_TLS_DTPREL64),
+            ]
+        } else {
+            &[(slot, R_RISCV_TLS_TPREL64)]
+        };
+        for &(at, r_type) in relocs {
+            rela_dyn_data.extend_from_slice(&at.to_le_bytes());
+            rela_dyn_data.extend_from_slice(&((sym_idx << 32) | r_type).to_le_bytes());
             rela_dyn_data.extend_from_slice(&0i64.to_le_bytes());
         }
     }
@@ -1101,9 +1128,6 @@ pub fn emit_executable(
         num_phdrs as u16,
         0x05,
     );
-    let shoff_pos = 40; // e_shoff position in ELF header
-    let shnum_pos = 60;
-    let shstrndx_pos = 62;
 
     // Program headers
     assert_eq!(elf.len(), 64);
@@ -1333,320 +1357,101 @@ pub fn emit_executable(
     pad_to(&mut elf, riscv_attr_offset as usize);
     elf.extend_from_slice(&riscv_attr_data);
 
-    // Section headers
-    let shdr_offset = align_up(elf.len() as u64, 8);
-    pad_to(&mut elf, shdr_offset as usize);
-    elf[shoff_pos..shoff_pos + 8].copy_from_slice(&shdr_offset.to_le_bytes());
-
-    // Build section header string table
-    let mut shstrtab = vec![0u8];
-    let mut shstr_offsets: FxHashMap<String, u32> = FxHashMap::default();
-    let sh_names = [
-        "",
-        ".interp",
-        ".gnu.hash",
-        ".dynsym",
-        ".dynstr",
-        ".gnu.version",
-        ".gnu.version_r",
-        ".rela.dyn",
-        ".rela.plt",
-        ".plt",
-        ".text",
-        ".rodata",
-        ".eh_frame",
-        ".preinit_array",
-        ".init_array",
-        ".fini_array",
-        ".dynamic",
-        ".got",
-        ".got.plt",
-        ".data",
-        ".sdata",
-        ".bss",
-        ".riscv.attributes",
-        ".symtab",
-        ".strtab",
-        ".shstrtab",
-    ];
-    for name in &sh_names {
-        if !name.is_empty() {
-            let off = shstrtab.len() as u32;
-            shstr_offsets.insert(name.to_string(), off);
-            shstrtab.extend_from_slice(name.as_bytes());
-            shstrtab.push(0);
-        }
-    }
-    for ms in merged_sections.iter() {
-        if !ms.name.is_empty() && !shstr_offsets.contains_key(&ms.name) {
-            let off = shstrtab.len() as u32;
-            shstr_offsets.insert(ms.name.clone(), off);
-            shstrtab.extend_from_slice(ms.name.as_bytes());
-            shstrtab.push(0);
-        }
-    }
-
-    let mut section_count: u32 = 0;
-
-    // NULL section header
-    elf.extend_from_slice(&[0u8; 64]);
-    section_count += 1;
-
-    let get_name = |n: &str| -> u32 { shstr_offsets.get(n).copied().unwrap_or(0) };
-
-    let mut _dynsym_shidx = 0u32;
+    // DWARF after the image, then the section-header table and `.symtab`.
+    let syms = debug::Symbols {
+        input_objs,
+        sec_mapping,
+        section_vaddrs: &section_vaddrs,
+        local_sym_vaddrs: &local_sym_vaddrs,
+        global_syms,
+    };
+    debug::write_debug_sections(&mut elf, debug_sections, &syms)?;
+    let mut specs = debug::merged_headers(merged_sections, &section_vaddrs, &section_offsets, true);
     if !is_static {
-        write_shdr(
-            &mut elf,
-            get_name(".interp"),
-            SHT_PROGBITS,
-            SHF_ALLOC,
-            interp_vaddr,
-            interp_offset,
-            interp_size,
-            0,
-            0,
-            1,
-            0,
-        );
-        section_count += 1;
-
-        write_shdr(
-            &mut elf,
-            get_name(".gnu.hash"),
-            0x6ffffff6,
-            SHF_ALLOC,
-            gnu_hash_vaddr,
-            gnu_hash_offset,
-            gnu_hash_data.len() as u64,
-            section_count + 1,
-            0,
-            8,
-            0,
-        );
-        section_count += 1;
-        _dynsym_shidx = section_count;
-
-        write_shdr(
-            &mut elf,
-            get_name(".dynsym"),
-            11,
-            SHF_ALLOC,
-            dynsym_vaddr,
-            dynsym_offset,
-            dynsym_data.len() as u64,
-            section_count + 1,
-            1,
-            8,
-            24,
-        );
-        section_count += 1;
-
-        write_shdr(
-            &mut elf,
-            get_name(".dynstr"),
-            SHT_STRTAB,
-            SHF_ALLOC,
-            dynstr_vaddr,
-            dynstr_offset,
-            dynstr_data.len() as u64,
-            0,
-            0,
-            1,
-            0,
-        );
-        section_count += 1;
-
-        write_shdr(
-            &mut elf,
-            get_name(".gnu.version"),
-            0x6fffffff,
-            SHF_ALLOC,
-            versym_vaddr,
-            versym_offset,
-            versym_data.len() as u64,
-            _dynsym_shidx,
-            0,
-            2,
-            2,
-        );
-        section_count += 1;
-
-        write_shdr(
-            &mut elf,
-            get_name(".gnu.version_r"),
-            0x6ffffffe,
-            SHF_ALLOC,
-            verneed_vaddr,
-            verneed_offset,
-            verneed_data.len() as u64,
-            section_count - 2,
-            verneed_count as u32,
-            8,
-            0,
-        );
-        section_count += 1;
-
-        if rela_dyn_size > 0 {
-            write_shdr(
-                &mut elf,
-                get_name(".rela.dyn"),
-                SHT_RELA,
-                SHF_ALLOC,
-                rela_dyn_vaddr,
-                rela_dyn_offset,
-                rela_dyn_size,
-                _dynsym_shidx,
-                0,
-                8,
-                24,
-            );
-            section_count += 1;
-        }
-
-        write_shdr(
-            &mut elf,
-            get_name(".rela.plt"),
-            SHT_RELA,
-            SHF_ALLOC | 0x40,
-            rela_plt_vaddr,
-            rela_plt_offset,
-            rela_plt_size,
-            _dynsym_shidx,
-            section_count + 1,
-            8,
-            24,
-        );
-        section_count += 1;
-
-        write_shdr(
-            &mut elf,
-            get_name(".plt"),
-            SHT_PROGBITS,
-            SHF_ALLOC | SHF_EXECINSTR,
-            plt_vaddr,
-            plt_offset,
-            plt_size,
-            0,
-            0,
-            16,
-            16,
-        );
-        section_count += 1;
+        specs.extend(shdr::dynamic_headers(&shdr::DynamicSections {
+            interp: (interp_vaddr, interp_offset, interp_size),
+            gnu_hash: (gnu_hash_vaddr, gnu_hash_offset, gnu_hash_data.len() as u64),
+            dynsym: (dynsym_vaddr, dynsym_offset, dynsym_data.len() as u64),
+            dynstr: (dynstr_vaddr, dynstr_offset, dynstr_data.len() as u64),
+            gnu_version: (versym_vaddr, versym_offset, versym_data.len() as u64),
+            gnu_version_r: (verneed_vaddr, verneed_offset, verneed_data.len() as u64),
+            verneed_count: verneed_count as u32,
+            rela_dyn: (rela_dyn_vaddr, rela_dyn_offset, rela_dyn_size),
+            rela_plt: (rela_plt_vaddr, rela_plt_offset, rela_plt_size),
+            plt: (plt_vaddr, plt_offset, plt_size),
+            plt_entsize: 16,
+            dynamic: (dynamic_vaddr, dynamic_offset, dynamic_data.len() as u64),
+            got: (got_vaddr, got_offset, got_size),
+            got_plt: (got_plt_vaddr, got_plt_offset, got_plt_size),
+            ..Default::default()
+        }));
+    } else {
+        specs.push(shdr::synthetic(
+            ".got", SHF_WRITE, got_vaddr, got_offset, got_size, 8,
+        ));
     }
-
-    // Merged sections
-    for &si in sec_indices {
-        let ms = &merged_sections[si];
-        if ms.sh_flags & SHF_ALLOC == 0 && ms.sh_type != SHT_RISCV_ATTRIBUTES {
+    // The IFUNC stubs, their GOT slots and IRELATIVE table: bfd's output
+    // names in a static link, its input names next to a real PLT.
+    let (iplt, igot, irela) = if is_static {
+        (".plt", ".got.plt", ".rela.plt")
+    } else {
+        (".iplt", ".igot.plt", ".rela.iplt")
+    };
+    specs.push(shdr::synthetic(
+        iplt,
+        SHF_EXECINSTR,
+        iplt_vaddr,
+        iplt_offset,
+        iplt_size,
+        16,
+    ));
+    specs.push(shdr::synthetic(
+        igot,
+        SHF_WRITE,
+        irel_slot_vaddr,
+        irel_slot_offset,
+        ifunc_count * 8,
+        8,
+    ));
+    specs.push(ShdrSpec {
+        info_link: Some(igot),
+        ..shdr::synthetic(
+            irela,
+            SHF_INFO_LINK,
+            irela_vaddr,
+            irela_offset,
+            irela_size,
+            8,
+        )
+    });
+    specs.push(ShdrSpec {
+        align: 1,
+        ..ShdrSpec::new(
+            ".riscv.attributes",
+            SHT_RISCV_ATTRIBUTES,
+            0,
+            0,
+            riscv_attr_offset,
+            riscv_attr_size,
+        )
+    });
+    specs.extend(debug_sections.headers());
+    let headers = shdr::order_headers(specs);
+    // A COPY-relocated definition lives in the section holding its slot
+    // (`.bss`), as bfd records it, rather than SHN_ABS.
+    for (i, name) in dynsym_names.iter().enumerate() {
+        let Some(&(addr, _)) = copy_sym_addrs.get(name) else {
             continue;
+        };
+        if let shdr::SymSection::Named(n) = shdr::section_of(&headers, addr, false) {
+            if let Some(idx) = shdr::header_index(&headers, &n) {
+                let at = dynsym_offset as usize + (i + 1) * 24 + 6;
+                elf[at..at + 2].copy_from_slice(&idx.to_le_bytes());
+            }
         }
-        if ms.name.starts_with(".note.") {
-            continue;
-        }
-        let sh_type = ms.sh_type;
-        let size = ms.data.len() as u64;
-        let offset = section_offsets[si];
-        let va = section_vaddrs[si];
-        write_shdr(
-            &mut elf,
-            get_name(&ms.name),
-            sh_type,
-            ms.sh_flags,
-            va,
-            offset,
-            size,
-            0,
-            0,
-            ms.align,
-            0,
-        );
-        section_count += 1;
     }
-
-    // Generated RW sections
-    if !is_static {
-        write_shdr(
-            &mut elf,
-            get_name(".dynamic"),
-            6,
-            SHF_ALLOC | SHF_WRITE,
-            dynamic_vaddr,
-            dynamic_offset,
-            dynamic_data.len() as u64,
-            4,
-            0,
-            8,
-            16,
-        );
-        section_count += 1;
-    }
-
-    if got_size > 0 {
-        write_shdr(
-            &mut elf,
-            get_name(".got"),
-            SHT_PROGBITS,
-            SHF_ALLOC | SHF_WRITE,
-            got_vaddr,
-            got_offset,
-            got_size,
-            0,
-            0,
-            8,
-            8,
-        );
-        section_count += 1;
-    }
-
-    if !is_static {
-        write_shdr(
-            &mut elf,
-            get_name(".got.plt"),
-            SHT_PROGBITS,
-            SHF_ALLOC | SHF_WRITE,
-            got_plt_vaddr,
-            got_plt_offset,
-            got_plt_size,
-            0,
-            0,
-            8,
-            8,
-        );
-        section_count += 1;
-    }
-
-    // .shstrtab
-    let shstrtab_offset = elf.len() as u64;
-    let shstrtab_shidx = section_count;
-    write_shdr(
-        &mut elf,
-        get_name(".shstrtab"),
-        SHT_STRTAB,
-        0,
-        0,
-        shstrtab_offset + 64,
-        shstrtab.len() as u64,
-        0,
-        0,
-        1,
-        0,
-    );
-    section_count += 1;
-
-    // Patch e_shnum and e_shstrndx
-    elf[shnum_pos..shnum_pos + 2].copy_from_slice(&(section_count as u16).to_le_bytes());
-    elf[shstrndx_pos..shstrndx_pos + 2].copy_from_slice(&(shstrtab_shidx as u16).to_le_bytes());
-
-    // Fix up shstrtab offset
-    let actual_shstrtab_off = elf.len() as u64;
-    let shstrtab_shdr_off = shdr_offset as usize + (shstrtab_shidx as usize) * 64;
-    if shstrtab_shdr_off + 64 <= elf.len() {
-        elf[shstrtab_shdr_off + 24..shstrtab_shdr_off + 32]
-            .copy_from_slice(&actual_shstrtab_off.to_le_bytes());
-    }
-
-    elf.extend_from_slice(&shstrtab);
+    let symtab = keep_symtab.then(|| debug::symtab(&syms, &headers));
+    shdr::append_section_headers(&mut elf, &headers, symtab.as_deref())?;
 
     // Write the file
     std::fs::write(output_path, &elf).map_err(|e| format!("Failed to write output: {}", e))?;

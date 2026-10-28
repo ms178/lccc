@@ -8,10 +8,15 @@
 //! and symbol resolution.
 
 use super::elf_read::*;
+use super::got::{
+    GotKind, GotLayout, R_RISCV_TLS_DTPMOD64, R_RISCV_TLS_DTPREL64, R_RISCV_TLS_TPREL64,
+    TLS_DTV_OFFSET,
+};
 use super::relocations::{
     GlobalSym, MergedSection, R_RISCV_64, R_RISCV_CALL_PLT, align_up, section_order, write_phdr_at,
 };
-use super::{reloc, symbols};
+use super::{debug, reloc, symbols};
+use crate::backend::linker_common::shdr::{self, ShdrSpec};
 use crate::backend::linker_common::{self, DynStrTab};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
@@ -20,6 +25,7 @@ use crate::backend::elf::{
     DT_NULL, DT_RELA, DT_RELAENT, DT_RELASZ, DT_STRSZ, DT_STRTAB, DT_SYMENT, DT_SYMTAB, DT_VERNEED,
     DT_VERNEEDNUM, DT_VERSYM, EM_RISCV as EM_RISCV_ELF, ET_DYN, PF_R, PF_W, PF_X, PT_DYNAMIC,
     PT_GNU_EH_FRAME, PT_GNU_RELRO, PT_GNU_STACK, PT_LOAD, PT_TLS, SHT_GNU_VERNEED, SHT_GNU_VERSYM,
+    STT_TLS,
 };
 
 const R_RISCV_RELATIVE: u64 = 3;
@@ -47,13 +53,14 @@ pub fn emit_shared_library(
     merged_map: &mut FxHashMap<String, usize>,
     sec_mapping: &FxHashMap<(usize, usize), (usize, u64)>,
     global_syms: &mut FxHashMap<String, GlobalSym>,
-    got_symbols: &[String],
-    _tls_got_symbols: &FxHashSet<String>,
+    got: &GotLayout,
     local_got_sym_info: &FxHashMap<String, (usize, usize, i64)>,
     needed_sonames: &[String],
     shared_lib_syms: &super::input::SharedLibSyms,
     soname: Option<String>,
     rpath: Option<&(i64, String)>,
+    debug_sections: &mut debug::DebugSections,
+    keep_symtab: bool,
     output_path: &str,
 ) -> Result<(), String> {
     // ── Phase 3c: Identify PLT entries needed for external function calls ──
@@ -131,7 +138,7 @@ pub fn emit_shared_library(
         section_order(&ms.name, ms.sh_flags)
     });
 
-    let got_size = got_symbols.len() as u64 * 8;
+    let got_size = got.size();
 
     // Estimate max R_RISCV_RELATIVE entries
     let mut max_rela_count: usize = 0;
@@ -144,12 +151,8 @@ pub fn emit_shared_library(
             }
         }
     }
-    for ms in merged_sections.iter() {
-        if ms.name == ".init_array" || ms.name == ".fini_array" {
-            max_rela_count += ms.data.len() / 8;
-        }
-    }
-    max_rela_count += got_symbols.len();
+    // One dynamic relocation per GOT word.
+    max_rela_count += (got_size / 8) as usize;
 
     let has_init_array = merged_sections
         .iter()
@@ -575,16 +578,6 @@ pub fn emit_shared_library(
     let local_sym_vaddrs =
         symbols::build_local_sym_vaddrs(input_objs, sec_mapping, &section_vaddrs, global_syms);
 
-    // Assign GOT offsets to symbols
-    let mut got_sym_offsets: FxHashMap<String, u64> = FxHashMap::default();
-    for (gi, name) in got_symbols.iter().enumerate() {
-        let got_off = gi as u64 * 8;
-        got_sym_offsets.insert(name.clone(), got_off);
-        if let Some(gsym) = global_syms.get_mut(name) {
-            gsym.got_offset = Some(got_off);
-        }
-    }
-
     // ── Phase 5: Emit ELF ───────────────────────────────────────────
     let file_size = offset as usize;
     let mut elf = vec![0u8; file_size];
@@ -793,59 +786,6 @@ pub fn emit_shared_library(
         }
     }
 
-    // Write .dynsym
-    let mut merged_to_shdr: FxHashMap<usize, u16> = FxHashMap::default();
-    {
-        let mut shdr_idx = 4u16;
-        for &si in &sec_indices {
-            let ms = &merged_sections[si];
-            if ms.name == ".riscv.attributes" {
-                continue;
-            }
-            if ms.sh_flags & SHF_ALLOC == 0 && ms.sh_type != SHT_RISCV_ATTRIBUTES {
-                continue;
-            }
-            merged_to_shdr.insert(si, shdr_idx);
-            shdr_idx += 1;
-        }
-    }
-    {
-        let mut ds = dynsym_offset as usize + 24;
-        for name in &dyn_sym_names {
-            let no = dynstr.get_offset(name) as u32;
-            elf[ds..ds + 4].copy_from_slice(&no.to_le_bytes());
-            if let Some(gsym) = global_syms.get(name) {
-                if gsym.defined {
-                    let info = (gsym.binding << 4) | gsym.sym_type;
-                    elf[ds + 4] = info;
-                    elf[ds + 5] = gsym.visibility;
-                    let shndx = gsym
-                        .section_idx
-                        .and_then(|si| merged_to_shdr.get(&si).copied())
-                        .unwrap_or(SHN_ABS);
-                    elf[ds + 6..ds + 8].copy_from_slice(&shndx.to_le_bytes());
-                    elf[ds + 8..ds + 16].copy_from_slice(&gsym.value.to_le_bytes());
-                    elf[ds + 16..ds + 24].copy_from_slice(&gsym.size.to_le_bytes());
-                } else {
-                    let bind = gsym.binding;
-                    let stype = gsym.sym_type;
-                    elf[ds + 4] = (bind << 4) | stype;
-                    elf[ds + 5] = gsym.visibility;
-                    elf[ds + 6..ds + 8].copy_from_slice(&0u16.to_le_bytes());
-                    elf[ds + 8..ds + 16].copy_from_slice(&0u64.to_le_bytes());
-                    elf[ds + 16..ds + 24].copy_from_slice(&0u64.to_le_bytes());
-                }
-            } else {
-                elf[ds + 4] = (STB_GLOBAL << 4) | STT_FUNC;
-                elf[ds + 5] = 0;
-                elf[ds + 6..ds + 8].copy_from_slice(&0u16.to_le_bytes());
-                elf[ds + 8..ds + 16].copy_from_slice(&0u64.to_le_bytes());
-                elf[ds + 16..ds + 24].copy_from_slice(&0u64.to_le_bytes());
-            }
-            ds += 24;
-        }
-    }
-
     // Write .dynstr
     {
         let db = dynstr.as_bytes();
@@ -951,23 +891,65 @@ pub fn emit_shared_library(
     let mut rela_dyn_entries: Vec<(u64, u64)> = Vec::new();
     let mut glob_dat_entries: Vec<(u64, String, i64)> = Vec::new();
 
-    for (gi, name) in got_symbols.iter().enumerate() {
-        let gea = got_vaddr + gi as u64 * 8;
-        if let Some(gsym) = global_syms.get(name) {
-            if gsym.visibility != STV_DEFAULT {
-                if gsym.defined && gsym.section_idx.is_some() {
-                    rela_dyn_entries.push((gea, gsym.value));
-                }
-            } else {
-                glob_dat_entries.push((gea, name.clone(), 0));
-            }
-        } else if let Some(&(oi, si, addend)) = local_got_sym_info.get(name) {
-            if input_objs[oi].1.symbols[si].shndx != SHN_ABS {
-                let value = local_sym_vaddrs[oi][si].wrapping_add(addend as u64);
-                rela_dyn_entries.push((gea, value));
-            }
+    // What each GOT slot holds, statically or by the loader. A symbol
+    // another module may preempt (default visibility, or undefined) is
+    // relocated by name; anything else is resolved here, its TLS slots
+    // against this module (symbol 0): the module id by DTPMOD64, the TP
+    // offset by TPREL64 with the template offset as addend, and the DTPREL
+    // word statically, biased by `TLS_DTV_OFFSET`.
+    let mut tls_dyn_entries: Vec<(u64, Option<String>, u64, i64)> = Vec::new();
+    let mut got_words: Vec<(u64, u64)> = Vec::new();
+    for (key, kind, off) in got.entries() {
+        let gea = got_vaddr + off;
+        let (preemptible, value, absolute) = if let Some(gsym) = global_syms.get(key) {
+            // A definition outside every merged section is absolute
+            // (SHN_ABS): the loader must not add the load base to it.
+            (
+                gsym.visibility == STV_DEFAULT,
+                gsym.defined.then_some(gsym.value),
+                gsym.defined && gsym.section_idx.is_none(),
+            )
+        } else if let Some(&(oi, si, addend)) = local_got_sym_info.get(key) {
+            let v = local_sym_vaddrs[oi][si].wrapping_add(addend as u64);
+            (
+                false,
+                Some(v),
+                input_objs[oi].1.symbols[si].shndx == SHN_ABS,
+            )
         } else {
-            return Err(format!("missing RISC-V GOT symbol '{}'", name));
+            return Err(format!("missing RISC-V GOT symbol '{}'", key));
+        };
+        let name = || Some(key.to_string());
+        match kind {
+            GotKind::Addr if preemptible => glob_dat_entries.push((gea, key.to_string(), 0)),
+            GotKind::Addr => {
+                // An unresolved non-preemptible weak reference stays 0.
+                if let Some(v) = value {
+                    if !absolute {
+                        rela_dyn_entries.push((gea, v));
+                    }
+                    got_words.push((off, v));
+                }
+            }
+            GotKind::TlsIe if preemptible => {
+                tls_dyn_entries.push((gea, name(), R_RISCV_TLS_TPREL64, 0));
+            }
+            GotKind::TlsIe => {
+                let tp = value.unwrap_or(tls_vaddr).wrapping_sub(tls_vaddr);
+                tls_dyn_entries.push((gea, None, R_RISCV_TLS_TPREL64, tp as i64));
+            }
+            GotKind::TlsGd if preemptible => {
+                tls_dyn_entries.push((gea, name(), R_RISCV_TLS_DTPMOD64, 0));
+                tls_dyn_entries.push((gea + 8, name(), R_RISCV_TLS_DTPREL64, 0));
+            }
+            GotKind::TlsGd => {
+                tls_dyn_entries.push((gea, None, R_RISCV_TLS_DTPMOD64, 0));
+                let dtprel = value
+                    .unwrap_or(tls_vaddr)
+                    .wrapping_sub(tls_vaddr)
+                    .wrapping_sub(TLS_DTV_OFFSET);
+                got_words.push((off + 8, dtprel));
+            }
         }
     }
 
@@ -980,13 +962,12 @@ pub fn emit_shared_library(
         local_sym_vaddrs: &local_sym_vaddrs,
         global_syms,
         got_vaddr,
-        got_symbols,
+        got,
         got_plt_vaddr: 0,
         tls_vaddr,
         gd_tls_relax_info: &empty_relax,
         gd_tls_call_nop: &empty_nop,
         collect_relatives: true,
-        got_sym_offsets: &got_sym_offsets,
         plt_sym_addrs: &plt_sym_addrs,
     };
     let reloc_result = reloc::apply_relocations(input_objs, merged_sections, &ctx)?;
@@ -1022,39 +1003,14 @@ pub fn emit_shared_library(
 
     // Emit the GOT once, after input section writes. Local GOT keys are
     // synthetic bookkeeping names and MUST NOT become dynamic symbol names.
-    for (gi, name) in got_symbols.iter().enumerate() {
-        let entry_off = (got_offset + gi as u64 * 8) as usize;
-        let value = if let Some(&(oi, si, addend)) = local_got_sym_info.get(name) {
-            local_sym_vaddrs[oi][si].wrapping_add(addend as u64)
-        } else {
-            global_syms
-                .get(name)
-                .filter(|g| g.defined && g.visibility != STV_DEFAULT)
-                .map_or(0, |g| g.value)
-        };
-        elf[entry_off..entry_off + 8].copy_from_slice(&value.to_le_bytes());
-    }
-
-    // Add RELATIVE entries for init_array/fini_array pointers
-    for ms in merged_sections.iter() {
-        if ms.name == ".init_array" || ms.name == ".fini_array" {
-            let num_entries = ms.data.len() / 8;
-            for ei in 0..num_entries {
-                let ptr_off = ei * 8;
-                if ptr_off + 8 <= ms.data.len() {
-                    let val = u64::from_le_bytes(ms.data[ptr_off..ptr_off + 8].try_into().unwrap());
-                    if val != 0 {
-                        let runtime_addr = ms.vaddr + ptr_off as u64;
-                        rela_dyn_entries.push((runtime_addr, val));
-                    }
-                }
-            }
-        }
+    for &(off, value) in &got_words {
+        let at = (got_offset + off) as usize;
+        elf[at..at + 8].copy_from_slice(&value.to_le_bytes());
     }
 
     // Write .rela.dyn entries
     let relative_count = rela_dyn_entries.len();
-    let actual_rela_count = relative_count + glob_dat_entries.len();
+    let actual_rela_count = relative_count + glob_dat_entries.len() + tls_dyn_entries.len();
     let rela_dyn_size = actual_rela_count as u64 * 24;
     {
         let mut rd = rela_dyn_offset as usize;
@@ -1081,6 +1037,22 @@ pub fn emit_shared_library(
                 elf[rd..rd + 8].copy_from_slice(&rel_offset.to_le_bytes());
                 elf[rd + 8..rd + 16]
                     .copy_from_slice(&((si << 32) | u64::from(R_RISCV_64)).to_le_bytes());
+                elf[rd + 16..rd + 24].copy_from_slice(&addend.to_le_bytes());
+                rd += 24;
+            }
+        }
+        for (rel_offset, sym_name, r_type, addend) in &tls_dyn_entries {
+            let si = match sym_name {
+                Some(n) => dyn_sym_names
+                    .iter()
+                    .position(|d| d == n)
+                    .map(|j| j as u64 + 1)
+                    .ok_or_else(|| format!("missing dynamic symbol for RISC-V TLS slot: '{n}'"))?,
+                None => 0,
+            };
+            if rd + 24 <= elf.len() {
+                elf[rd..rd + 8].copy_from_slice(&rel_offset.to_le_bytes());
+                elf[rd + 8..rd + 16].copy_from_slice(&((si << 32) | r_type).to_le_bytes());
                 elf[rd + 16..rd + 24].copy_from_slice(&addend.to_le_bytes());
                 rd += 24;
             }
@@ -1190,339 +1162,119 @@ pub fn emit_shared_library(
         elf[dd + 8..dd + 16].copy_from_slice(&0u64.to_le_bytes());
     }
 
-    // ── Append section headers ──────────────────────────────────────
-    let mut shstrtab_data: Vec<u8> = vec![0];
-    let mut section_headers: Vec<(String, u32, u64, u64, u64, u64, u32, u32, u64, u64)> =
-        Vec::new();
-
-    let add_shstrtab_name = |name: &str, strtab: &mut Vec<u8>| -> u32 {
-        let off = strtab.len() as u32;
-        strtab.extend_from_slice(name.as_bytes());
-        strtab.push(0);
-        off
-    };
-
-    // Section 0: null
-    section_headers.push(("".into(), 0, 0, 0, 0, 0, 0, 0, 0, 0));
-
-    // .gnu.hash
-    add_shstrtab_name(".gnu.hash", &mut shstrtab_data);
-    section_headers.push((
-        ".gnu.hash".into(),
-        0x6ffffff6,
-        SHF_ALLOC,
-        gnu_hash_addr,
-        gnu_hash_offset,
-        gnu_hash_size,
-        3,
-        0,
-        8,
-        0,
-    ));
-
-    // .dynsym
-    add_shstrtab_name(".dynsym", &mut shstrtab_data);
-    section_headers.push((
-        ".dynsym".into(),
-        SHT_DYNSYM,
-        SHF_ALLOC,
-        dynsym_addr,
-        dynsym_offset,
-        dynsym_size,
-        3,
-        1,
-        8,
-        24,
-    ));
-
-    // .dynstr
-    add_shstrtab_name(".dynstr", &mut shstrtab_data);
-    section_headers.push((
-        ".dynstr".into(),
-        SHT_STRTAB,
-        SHF_ALLOC,
-        dynstr_addr,
-        dynstr_offset,
-        dynstr_size,
-        0,
-        0,
-        1,
-        0,
-    ));
-
-    // Fix .gnu.hash link to point to .dynsym (index 2)
-    section_headers[1].6 = 2;
-
-    // Add merged sections as section headers
-    for &si in &sec_indices {
-        let ms = &merged_sections[si];
-        if ms.name == ".riscv.attributes" {
-            continue;
-        }
-        if ms.sh_flags & SHF_ALLOC == 0 && ms.sh_type != SHT_RISCV_ATTRIBUTES {
-            continue;
-        }
-        add_shstrtab_name(&ms.name, &mut shstrtab_data);
-        let sh_offset = if ms.sh_type == SHT_NOBITS {
-            0
-        } else {
-            ms.vaddr - base_addr
-        };
-        let sh_size = ms.data.len() as u64;
-        section_headers.push((
-            ms.name.clone(),
-            ms.sh_type,
-            ms.sh_flags,
-            ms.vaddr,
-            sh_offset,
-            sh_size,
-            0,
-            0,
-            ms.align,
-            0,
-        ));
-    }
-
-    // .rela.dyn
-    add_shstrtab_name(".rela.dyn", &mut shstrtab_data);
-    section_headers.push((
-        ".rela.dyn".into(),
-        SHT_RELA,
-        SHF_ALLOC,
-        rela_dyn_addr,
-        rela_dyn_offset,
-        rela_dyn_size,
-        2,
-        0,
-        8,
-        24,
-    ));
-
-    // .dynamic
-    add_shstrtab_name(".dynamic", &mut shstrtab_data);
-    section_headers.push((
-        ".dynamic".into(),
-        SHT_DYNAMIC,
-        SHF_ALLOC | SHF_WRITE,
-        dynamic_addr,
-        dynamic_offset,
-        dynamic_size,
-        3,
-        0,
-        8,
-        16,
-    ));
-
-    // .got
-    if got_size > 0 {
-        add_shstrtab_name(".got", &mut shstrtab_data);
-        section_headers.push((
-            ".got".into(),
-            SHT_PROGBITS,
-            SHF_ALLOC | SHF_WRITE,
-            got_vaddr,
-            got_offset,
-            got_size,
-            0,
-            0,
-            8,
-            8,
-        ));
-    }
-
-    // .got.plt
-    if got_plt_size > 0 {
-        add_shstrtab_name(".got.plt", &mut shstrtab_data);
-        section_headers.push((
-            ".got.plt".into(),
-            SHT_PROGBITS,
-            SHF_ALLOC | SHF_WRITE,
-            got_plt_vaddr,
-            got_plt_offset,
-            got_plt_size,
-            0,
-            0,
-            8,
-            8,
-        ));
-    }
-
-    // .plt
-    if plt_size > 0 {
-        add_shstrtab_name(".plt", &mut shstrtab_data);
-        section_headers.push((
-            ".plt".into(),
-            SHT_PROGBITS,
-            SHF_ALLOC | SHF_EXECINSTR,
-            plt_vaddr,
-            plt_offset,
-            plt_size,
-            0,
-            0,
-            16,
-            plt_entry_size,
-        ));
-    }
-
-    // .rela.plt
-    if rela_plt_size > 0 {
-        add_shstrtab_name(".rela.plt", &mut shstrtab_data);
-        section_headers.push((
-            ".rela.plt".into(),
-            SHT_RELA,
-            SHF_ALLOC,
-            rela_plt_addr,
-            rela_plt_offset,
-            rela_plt_size,
-            2,
-            0,
-            8,
-            24,
-        ));
-    }
-
-    // .riscv.attributes (non-loadable)
+    // `.riscv.attributes` (non-loadable; PT_RISCV_ATTRIBUTES names it),
+    // DWARF, then the section-header table and `.symtab`.
     let mut attr_file_offset = 0u64;
     let mut attr_size = 0u64;
     if let Some(ms) = merged_sections
         .iter()
         .find(|ms| ms.name == ".riscv.attributes")
     {
-        add_shstrtab_name(".riscv.attributes", &mut shstrtab_data);
         attr_file_offset = elf.len() as u64;
         attr_size = ms.data.len() as u64;
         elf.extend_from_slice(&ms.data);
-        section_headers.push((
-            ".riscv.attributes".into(),
-            SHT_RISCV_ATTRIBUTES,
-            0,
-            0,
-            attr_file_offset,
-            attr_size,
-            0,
-            0,
-            1,
-            0,
-        ));
     }
-
-    if !verneed_plan.is_empty() {
-        add_shstrtab_name(".gnu.version", &mut shstrtab_data);
-        section_headers.push((
-            ".gnu.version".into(),
-            SHT_GNU_VERSYM,
-            SHF_ALLOC,
-            base_addr + versym_offset,
-            versym_offset,
-            versym_size,
-            2, // .dynsym
-            0,
-            2,
-            2,
-        ));
-        add_shstrtab_name(".gnu.version_r", &mut shstrtab_data);
-        section_headers.push((
-            ".gnu.version_r".into(),
-            SHT_GNU_VERNEED,
-            SHF_ALLOC,
+    let syms = debug::Symbols {
+        input_objs,
+        sec_mapping,
+        section_vaddrs: &section_vaddrs,
+        local_sym_vaddrs: &local_sym_vaddrs,
+        global_syms,
+    };
+    debug::write_debug_sections(&mut elf, debug_sections, &syms)?;
+    // Offsets equal addresses in this layout (base 0).
+    let mut specs = debug::merged_headers(merged_sections, &section_vaddrs, &section_vaddrs, false);
+    specs.extend(shdr::dynamic_headers(&shdr::DynamicSections {
+        gnu_hash: (gnu_hash_addr, gnu_hash_offset, gnu_hash_size),
+        dynsym: (dynsym_addr, dynsym_offset, dynsym_size),
+        dynstr: (dynstr_addr, dynstr_offset, dynstr_size),
+        gnu_version: (base_addr + versym_offset, versym_offset, versym_size),
+        gnu_version_r: (
             base_addr + verneed_offset,
             verneed_offset,
             verneed_data.len() as u64,
-            3, // .dynstr
-            verneed_plan.file_count() as u32,
-            4,
-            0,
-        ));
-    }
-
-    // .shstrtab
-    add_shstrtab_name(".shstrtab", &mut shstrtab_data);
-    let shstrtab_idx = section_headers.len();
-    let shstrtab_file_offset = elf.len() as u64;
-    elf.extend_from_slice(&shstrtab_data);
-    section_headers.push((
-        ".shstrtab".into(),
-        SHT_STRTAB,
+        ),
+        verneed_count: verneed_plan.file_count() as u32,
+        rela_dyn: (rela_dyn_addr, rela_dyn_offset, rela_dyn_size),
+        rela_plt: (rela_plt_addr, rela_plt_offset, rela_plt_size),
+        plt: (plt_vaddr, plt_offset, plt_size),
+        plt_entsize: plt_entry_size,
+        dynamic: (dynamic_addr, dynamic_offset, dynamic_size),
+        got: (got_vaddr, got_offset, got_size),
+        got_plt: (got_plt_vaddr, got_plt_offset, got_plt_size),
+        ..Default::default()
+    }));
+    specs.push(ShdrSpec::new(
+        ".riscv.attributes",
+        SHT_RISCV_ATTRIBUTES,
         0,
         0,
-        shstrtab_file_offset,
-        shstrtab_data.len() as u64,
-        0,
-        0,
-        1,
-        0,
+        attr_file_offset,
+        attr_size,
     ));
-
-    // Write section headers
-    while elf.len() % 8 != 0 {
-        elf.push(0);
-    }
-    let shdr_offset = elf.len() as u64;
-    let shdr_count = section_headers.len();
-
-    // Rebuild shstrtab name offsets
-    let mut name_offsets: Vec<u32> = Vec::new();
+    specs.extend(debug_sections.headers());
+    let headers = shdr::order_headers(specs);
+    // Write .dynsym now that the header order is final: `st_shndx` names
+    // the section header holding each definition, and a TLS symbol's
+    // `st_value` is its offset in the TLS template (gABI; the dynamic
+    // loader adds it to the module's TLS block -- an address there put
+    // every importer's TLS access out of the block).
     {
-        let mut _strtab_pos = 0u32;
-        for (name, ..) in &section_headers {
-            if name.is_empty() {
-                name_offsets.push(0);
+        let mut ds = dynsym_offset as usize + 24;
+        for name in &dyn_sym_names {
+            let no = dynstr.get_offset(name) as u32;
+            elf[ds..ds + 4].copy_from_slice(&no.to_le_bytes());
+            if let Some(gsym) = global_syms.get(name) {
+                if gsym.defined {
+                    let info = (gsym.binding << 4) | gsym.sym_type;
+                    elf[ds + 4] = info;
+                    elf[ds + 5] = gsym.visibility;
+                    let tls = gsym.sym_type == STT_TLS;
+                    let section = gsym
+                        .section_idx
+                        .map(|si| merged_sections[si].name.as_str())
+                        .filter(|n| shdr::header_index(&headers, n).is_some())
+                        .map(str::to_string)
+                        .map_or_else(
+                            || shdr::section_of(&headers, gsym.value, tls),
+                            shdr::SymSection::Named,
+                        );
+                    let shndx = match section {
+                        shdr::SymSection::Named(n) => {
+                            shdr::header_index(&headers, &n).unwrap_or(SHN_ABS)
+                        }
+                        shdr::SymSection::Abs => SHN_ABS,
+                    };
+                    let value = if tls {
+                        gsym.value - tls_vaddr
+                    } else {
+                        gsym.value
+                    };
+                    elf[ds + 6..ds + 8].copy_from_slice(&shndx.to_le_bytes());
+                    elf[ds + 8..ds + 16].copy_from_slice(&value.to_le_bytes());
+                    elf[ds + 16..ds + 24].copy_from_slice(&gsym.size.to_le_bytes());
+                } else {
+                    let bind = gsym.binding;
+                    let stype = gsym.sym_type;
+                    elf[ds + 4] = (bind << 4) | stype;
+                    elf[ds + 5] = gsym.visibility;
+                    elf[ds + 6..ds + 8].copy_from_slice(&0u16.to_le_bytes());
+                    elf[ds + 8..ds + 16].copy_from_slice(&0u64.to_le_bytes());
+                    elf[ds + 16..ds + 24].copy_from_slice(&0u64.to_le_bytes());
+                }
             } else {
-                let name_bytes = name.as_bytes();
-                let mut found = false;
-                for pos in 0..shstrtab_data.len() {
-                    if pos + name_bytes.len() < shstrtab_data.len()
-                        && &shstrtab_data[pos..pos + name_bytes.len()] == name_bytes
-                        && shstrtab_data[pos + name_bytes.len()] == 0
-                    {
-                        name_offsets.push(pos as u32);
-                        found = true;
-                        break;
-                    }
-                }
-                if !found {
-                    name_offsets.push(_strtab_pos);
-                }
+                elf[ds + 4] = (STB_GLOBAL << 4) | STT_FUNC;
+                elf[ds + 5] = 0;
+                elf[ds + 6..ds + 8].copy_from_slice(&0u16.to_le_bytes());
+                elf[ds + 8..ds + 16].copy_from_slice(&0u64.to_le_bytes());
+                elf[ds + 16..ds + 24].copy_from_slice(&0u64.to_le_bytes());
             }
-            _strtab_pos += name.len() as u32 + 1;
+            ds += 24;
         }
     }
 
-    for (
-        idx,
-        (
-            _name,
-            sh_type,
-            sh_flags,
-            sh_addr,
-            sh_offset,
-            sh_size,
-            sh_link,
-            sh_info,
-            sh_addralign,
-            sh_entsize,
-        ),
-    ) in section_headers.iter().enumerate()
-    {
-        let mut shdr = [0u8; 64];
-        let name_off = name_offsets[idx];
-        shdr[0..4].copy_from_slice(&name_off.to_le_bytes());
-        shdr[4..8].copy_from_slice(&sh_type.to_le_bytes());
-        shdr[8..16].copy_from_slice(&sh_flags.to_le_bytes());
-        shdr[16..24].copy_from_slice(&sh_addr.to_le_bytes());
-        shdr[24..32].copy_from_slice(&sh_offset.to_le_bytes());
-        shdr[32..40].copy_from_slice(&sh_size.to_le_bytes());
-        shdr[40..44].copy_from_slice(&sh_link.to_le_bytes());
-        shdr[44..48].copy_from_slice(&sh_info.to_le_bytes());
-        shdr[48..56].copy_from_slice(&sh_addralign.to_le_bytes());
-        shdr[56..64].copy_from_slice(&sh_entsize.to_le_bytes());
-        elf.extend_from_slice(&shdr);
-    }
-
-    // Update ELF header with section header info
-    elf[40..48].copy_from_slice(&shdr_offset.to_le_bytes());
-    elf[60..62].copy_from_slice(&(shdr_count as u16).to_le_bytes());
-    elf[62..64].copy_from_slice(&(shstrtab_idx as u16).to_le_bytes());
+    let symtab = keep_symtab.then(|| debug::symtab(&syms, &headers));
+    shdr::append_section_headers(&mut elf, &headers, symtab.as_deref())?;
 
     // Update PT_RISCV_ATTRIBUTES phdr if present
     if has_riscv_attrs && attr_size > 0 {

@@ -25,6 +25,7 @@
 //! - `emit_shared`: Shared library (.so) emission
 //! - `emit_static`: Static executable emission
 
+mod debug;
 #[expect(dead_code)] // Re-exports ELF constants/types; not all constants used by every linker path
 pub mod elf;
 mod emit_dynamic;
@@ -34,6 +35,7 @@ mod input;
 mod link;
 mod plt_got;
 pub mod reloc;
+mod tls_got;
 pub mod types;
 
 pub use link::link_builtin;
