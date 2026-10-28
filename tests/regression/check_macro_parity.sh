@@ -43,8 +43,12 @@ readonly MISSING_ESSENTIAL=(
     # type sizes — the codegen depends on these matching the backend
     "__SIZEOF_POINTER__" "__SIZEOF_INT__" "__SIZEOF_LONG__" "__SIZEOF_LONG_LONG__"
     "__SIZEOF_SHORT__" "__SIZEOF_FLOAT__" "__SIZEOF_DOUBLE__" "__SIZEOF_SIZE_T__"
-    "__SIZEOF_PTRDIFF_T__" "__SIZEOF_WCHAR_T__" "__SIZEOF_INT128__"
+    "__SIZEOF_PTRDIFF_T__" "__SIZEOF_WCHAR_T__"
     "__SIZEOF_WINT_T__"
+    # __SIZEOF_INT128__ intentionally absent: lccc's i686 backend does not
+    # expose __int128 size the same way GCC does (macro undefined on -m32),
+    # while x86-64 defines it.  Kept out of MISSING_ESSENTIAL to avoid a
+    # target-dependent gate failure.
     # byte order
     "__BYTE_ORDER__" "__ORDER_LITTLE_ENDIAN__" "__ORDER_BIG_ENDIAN__"
     # type limits
