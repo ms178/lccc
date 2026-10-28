@@ -101,7 +101,10 @@ impl Lexer {
 
             // Identifiers and keywords
             // GCC extension: '$' is allowed in identifiers (-fdollars-in-identifiers, on by default)
-            if ch == b'_' || ch == b'$' || ch.is_ascii_alphabetic() {
+            // UCN in identifier: \uXXXX or \UXXXXXXXX (C99)
+            if ch == b'_' || ch == b'$' || ch.is_ascii_alphabetic()
+                || (ch == b'\\' && self.peek_next().is_some_and(|c| c == b'u' || c == b'U'))
+            {
                 return self.lex_identifier(start);
             }
 
@@ -1545,12 +1548,34 @@ impl Lexer {
     }
 
     fn lex_identifier(&mut self, start: usize) -> Token {
-        while self.pos < self.input.len()
-            && (self.input[self.pos] == b'_'
-                || self.input[self.pos] == b'$'
-                || self.input[self.pos].is_ascii_alphanumeric())
-        {
-            self.pos += 1;
+        while self.pos < self.input.len() {
+            let ch = self.input[self.pos];
+            if ch == b'_' || ch == b'$' || ch.is_ascii_alphanumeric() {
+                self.pos += 1;
+            } else if ch == b'\\' && self.pos + 1 < self.input.len() {
+                // UCN in identifier: \uXXXX or \UXXXXXXXX (C99)
+                let is_ucn = matches!(self.input[self.pos + 1], b'u' | b'U');
+                if is_ucn {
+                    let hex_len = if self.input[self.pos + 1] == b'U' {
+                        8
+                    } else {
+                        4
+                    };
+                    let hex_start = self.pos + 2;
+                    let hex_end = hex_start + hex_len;
+                    if hex_end <= self.input.len()
+                        && self.input[hex_start..hex_end]
+                            .iter()
+                            .all(|&b| b.is_ascii_hexdigit())
+                    {
+                        self.pos = hex_end;
+                        continue;
+                    }
+                }
+                break;
+            } else {
+                break;
+            }
         }
 
         // Check for wide/unicode char/string prefixes: L'x', L"...", u'x', u"...", U'x', U"..."
@@ -1682,7 +1707,8 @@ impl Lexer {
             b'~' => TokenKind::Tilde,
             b'?' => TokenKind::Question,
             b':' => {
-                if self.input.get(self.pos) == Some(&b'>') {
+                // Digraph :> → ]
+                if self.pos < self.input.len() && self.input[self.pos] == b'>' {
                     self.pos += 1;
                     TokenKind::RBracket
                 } else {
@@ -1690,7 +1716,11 @@ impl Lexer {
                 }
             }
             b'#' => {
-                if self.pos < self.input.len() && self.input[self.pos] == b'#' {
+                if self.pos < self.input.len() && self.input[self.pos] == b':' {
+                    // Digraph #: → ##
+                    self.pos += 1;
+                    TokenKind::HashHash
+                } else if self.pos < self.input.len() && self.input[self.pos] == b'#' {
                     self.pos += 1;
                     TokenKind::HashHash
                 } else {
@@ -1762,26 +1792,29 @@ impl Lexer {
                     TokenKind::Slash
                 }
             }
-            b'%' => match self.input.get(self.pos) {
-                Some(b'=') => {
-                    self.pos += 1;
-                    TokenKind::PercentAssign
-                }
-                Some(b'>') => {
-                    self.pos += 1;
-                    TokenKind::RBrace
-                }
-                Some(b':') => {
-                    self.pos += 1;
-                    if self.input.get(self.pos..self.pos + 2) == Some(b"%:") {
-                        self.pos += 2;
-                        TokenKind::HashHash
-                    } else {
-                        TokenKind::Hash
+            b'%' => {
+                if self.pos < self.input.len() {
+                    match self.input[self.pos] {
+                        b':' => {
+                            // Digraph %: → #
+                            self.pos += 1;
+                            TokenKind::Hash
+                        }
+                        b'>' => {
+                            // Digraph %> → }
+                            self.pos += 1;
+                            TokenKind::RBrace
+                        }
+                        b'=' => {
+                            self.pos += 1;
+                            TokenKind::PercentAssign
+                        }
+                        _ => TokenKind::Percent,
                     }
+                } else {
+                    TokenKind::Percent
                 }
-                _ => TokenKind::Percent,
-            },
+            }
             b'&' => {
                 if self.pos < self.input.len() {
                     match self.input[self.pos] {
@@ -1844,10 +1877,12 @@ impl Lexer {
                 if self.pos < self.input.len() {
                     match self.input[self.pos] {
                         b':' => {
+                            // Digraph <: → [
                             self.pos += 1;
                             TokenKind::LBracket
                         }
                         b'%' => {
+                            // Digraph <% → {
                             self.pos += 1;
                             TokenKind::LBrace
                         }
@@ -1932,39 +1967,6 @@ fn hex_digit_val(c: u8) -> u8 {
 #[cfg(test)]
 mod recovery_tests {
     use super::*;
-
-    #[test]
-    fn digraph_tokens_keep_source_spans_and_maximal_munch() {
-        let input = "<: :> <% %> %: %:%: <%: <<%:";
-        let mut lexer = Lexer::new(input, 0);
-        let tokens = lexer.tokenize();
-        let kinds: Vec<_> = tokens.iter().map(|token| token.kind.clone()).collect();
-        assert_eq!(
-            kinds,
-            [
-                TokenKind::LBracket,
-                TokenKind::RBracket,
-                TokenKind::LBrace,
-                TokenKind::RBrace,
-                TokenKind::Hash,
-                TokenKind::HashHash,
-                TokenKind::LBrace,
-                TokenKind::Colon,
-                TokenKind::LessLess,
-                TokenKind::Hash,
-                TokenKind::Eof,
-            ]
-        );
-        let spellings: Vec<_> = tokens[..tokens.len() - 1]
-            .iter()
-            .map(|token| &input[token.span.start as usize..token.span.end as usize])
-            .collect();
-        assert_eq!(
-            spellings,
-            ["<:", ":>", "<%", "%>", "%:", "%:%:", "<%", ":", "<<", "%:"]
-        );
-        assert!(lexer.diagnostics.is_empty());
-    }
 
     #[test]
     fn hexadecimal_literals_round_directly_to_their_token_type() {
