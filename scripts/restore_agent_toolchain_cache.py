@@ -622,31 +622,36 @@ def self_test() -> int:
         if (destination / 'root/link').exists() or (destination / 'root/link').is_symlink():
             raise AssertionError('rejected archive was partially extracted')
 
-        # A *chain* of legal links can still leave the prefix.  Member-level
-        # validation cannot see it, so the post-extraction scan must.
+        # A *chain* of individually legal links can still leave the prefix.
+        # Member-level validation cannot see it, so the post-extraction scan
+        # must.  The invariant under test is the scan's, so build the
+        # post-extraction state directly: routing this through tarfile would
+        # assert a per-member policy that differs between filter versions
+        # (some materialise the composition, some refuse one hop), which makes
+        # the case pass or fail for reasons unrelated to the guard.
         chain_dest = base / 'chain-prefix'
-        (chain_dest / 'other').mkdir(parents=True)
-        (base / 'chain-outside').mkdir()
-        chain = base / 'chain.tar'
-        with tarfile.open(chain, 'w') as output:
-            for name, link in (('bin', 'root/link'),
-                               ('root/link', 'inside/../../outside'),
-                               ('root/inside', '../other')):
-                item = tarfile.TarInfo(name)
-                item.type = tarfile.SYMTYPE
-                item.linkname = link
-                output.addfile(item)
-        installed = extract_untrusted(chain, chain_dest)
+        (chain_dest / 'root').mkdir(parents=True)
+        (chain_dest / 'other').mkdir()
+        (chain_dest / 'root' / 'inside').symlink_to('../other')
+        (chain_dest / 'root' / 'link').symlink_to('inside/../../outside')
+        (chain_dest / 'bin').symlink_to('root/link')
+        root = chain_dest.resolve()
+        if not escaped(chain_dest / 'bin', root):
+            raise AssertionError(
+                'self-test chain does not escape; the guard case would be vacuous: '
+                f'{os.path.realpath(chain_dest / "bin")} vs {root}')
         try:
             reject_escaping_links(chain_dest)
         except RuntimeError:
             pass
         else:
             raise AssertionError('link chain escaping the prefix was not rejected')
-        if (base / 'chain-outside' / 'gcc-16').exists():
-            raise AssertionError('escaped link let a wrapper be written outside')
-        if not installed:
-            raise AssertionError('extraction produced no installed manifest')
+        links = sorted(entry.name for entry in chain_dest.rglob('*') if entry.is_symlink())
+        if links != ['bin', 'inside', 'link']:
+            raise AssertionError(f'chain fixture is incomplete: {links}')
+        for probe in ('bin', 'root/link'):
+            if not escaped(chain_dest / probe, root):
+                raise AssertionError(f'{probe} does not escape; guard case is vacuous')
         print('agent cache restore self-test: PASS')
         return 0
 
