@@ -132,6 +132,14 @@ inside `typeof` (six wrong-result cases are tracked), and a volatile
 `typeof` object can have observable reads elided. Reproducers and limits are
 in `engineering/evidence/typeof-qualifier-gaps-2026-10-28/`.
 
+A separate red team found that file- and block-scope `extern volatile` objects
+and pointees lost their qualifiers in lowering, silently deleting loads and
+stores; extern const-pointee metadata was also missing from `_Generic`. The
+extern declaration paths now use the same qualifier setup as definitions.
+GCC 16.2 assembly controls cover scalar, pointer, array, struct and TLS
+accesses, with a nonvolatile negative control. This does not by itself fix
+qualifiers inherited through `typeof`.
+
 With the identical manual configuration, upstream's 5,196-check suite passes
 against GCC-, Clang- and LCCC-compiled libraries; an LCCC-compiled upstream test
 runner also passes. On one aligned synthetic XML input the upstream benchmark's

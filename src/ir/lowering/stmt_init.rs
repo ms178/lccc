@@ -56,6 +56,7 @@ impl Lowerer {
 
         if !self.globals.contains_key(&declarator.name) {
             let mut ext_da = self.analyze_declaration(&decl.type_spec, &declarator.derived);
+            self.apply_declaration_qualifiers(&mut ext_da, decl, declarator);
             ext_da.apply_decl_vector_type(decl);
             // A block-scope `extern` names an object with linkage, so it is
             // placed exactly like its file-scope declaration (global_decl.rs).

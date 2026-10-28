@@ -370,6 +370,7 @@ impl Lowerer {
         }
         if !self.globals.contains_key(&declarator.name) {
             let mut da = self.analyze_declaration(&decl.type_spec, &declarator.derived);
+            self.apply_declaration_qualifiers(&mut da, decl, declarator);
             da.apply_decl_vector_type(decl);
             let mut ginfo = GlobalInfo::from_analysis(&da);
             ginfo.var.address_space =
@@ -562,6 +563,21 @@ impl Lowerer {
         }
     }
 
+    /// Attach the qualifiers that `CType` does not carry. Every declaration
+    /// path, including an `extern` with no definition in this translation
+    /// unit, needs these flags before any expression can read the object.
+    pub(super) fn apply_declaration_qualifiers(
+        &self,
+        da: &mut DeclAnalysis,
+        decl: &Declaration,
+        declarator: &InitDeclarator,
+    ) {
+        da.base_type_volatile = decl.is_volatile();
+        da.base_type_const =
+            crate::common::qualifiers::type_name_const_base(&decl.type_spec, decl.is_const(), self);
+        da.object_volatile = declarator.attrs.object_volatile;
+    }
+
     /// Run declaration analysis with vector_size, array-of-pointers fixup, unsized
     /// array fixup, and scalar size adjustment.
     fn prepare_global_analysis(
@@ -570,10 +586,7 @@ impl Lowerer {
         declarator: &InitDeclarator,
     ) -> DeclAnalysis {
         let mut da = self.analyze_declaration(&decl.type_spec, &declarator.derived);
-        da.base_type_volatile = decl.is_volatile();
-        da.base_type_const =
-            crate::common::qualifiers::type_name_const_base(&decl.type_spec, decl.is_const(), self);
-        da.object_volatile = declarator.attrs.object_volatile;
+        self.apply_declaration_qualifiers(&mut da, decl, declarator);
         da.apply_decl_vector_type(decl);
         if da.is_array_of_pointers || da.is_array_of_func_ptrs {
             da.struct_layout = None;

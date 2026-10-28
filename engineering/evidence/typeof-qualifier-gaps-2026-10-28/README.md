@@ -32,6 +32,12 @@ volatile. For this fixture on x86-64 at `-O2`, GCC 16.2 emits two reads of
 not an optimization win. This fixture is not a passing regression until the
 volatile type and access semantics are fixed end to end.
 
+A separate loss of qualifiers on ordinary file- and block-scope `extern`
+declarations has been repaired. The existing volatile-access gate now checks
+extern scalar, pointer, array, member and TLS accesses and a nonvolatile
+control, as well as an extern const-pointee `_Generic` execution. This does
+not establish volatile-`typeof` support.
+
 ```sh
 gcc-16 -std=gnu17 -O2 -S engineering/evidence/typeof-qualifier-gaps-2026-10-28/volatile.c -o /tmp/gcc-volatile.s
 target/fastbuild/lccc -std=gnu17 -O2 -S engineering/evidence/typeof-qualifier-gaps-2026-10-28/volatile.c -o /tmp/lccc-volatile.s

@@ -167,4 +167,78 @@ if [ "$n_ref" -ge 1 ] && grep -qE '^[[:space:]]*j[a-z]+ +\.' <<<"$loop"; then
     fi
 done
 
+# 7. An extern declaration still describes a volatile object or pointee.
+# Both file- and block-scope declarations used to lose their qualifier before
+# IR construction, so even discarded reads disappeared at -O2. The symbol
+# references count accesses in these simple straight-line functions; the
+# pointer-target cases additionally count the two indirect loads.
+cat >"$td/extern.c" <<'EOF'
+extern volatile int g_flag;
+extern int *volatile g_ptr;
+extern volatile int *g_target;
+extern volatile int g_arr[4];
+struct regs { int x; };
+extern volatile struct regs g_regs;
+extern _Thread_local volatile int g_tls;
+extern int plain;
+int global_sum(void) { return g_flag + g_flag; }
+void global_discard(void) { g_flag; g_flag; }
+void global_stores(void) { g_flag = 1; g_flag = 2; }
+void global_ptr(void) { g_ptr; g_ptr; }
+void global_target(void) { *g_target; *g_target; }
+void global_array(void) { g_arr[0]; g_arr[0]; }
+void global_member(void) { g_regs.x; g_regs.x; }
+void global_tls(void) { g_tls; g_tls; }
+void block_discard(void) { extern volatile int b_flag; b_flag; b_flag; }
+void block_ptr(void) { extern int *volatile b_ptr; b_ptr; b_ptr; }
+void block_target(void) { extern volatile int *b_target; *b_target; *b_target; }
+void block_tls(void) { extern _Thread_local volatile int b_tls; b_tls; b_tls; }
+void plain_discard(void) { plain; plain; }
+EOF
+"$CCC" -O2 -S "$td/extern.c" -o "$td/extern.s" || { echo "FAIL: compile extern.c"; exit 1; }
+for probe in global_sum:g_flag:2 global_discard:g_flag:2 global_stores:g_flag:2 \
+             global_ptr:g_ptr:2 global_array:g_arr:2 global_member:g_regs:2 \
+             block_discard:b_flag:2 block_ptr:b_ptr:2 plain_discard:plain:0; do
+    IFS=: read -r fn symbol want <<<"$probe"
+    body=$(awk -v f="$fn" '$0==f":"{ins=1} ins{print} ins && /^[[:space:]]*\.size/{exit}' "$td/extern.s")
+    n=$(grep -cE "(^|[^[:alnum:]_])${symbol}\\(%rip\\)" <<<"$body" || true)
+    if [[ -n $body && $n == "$want" ]]; then
+        echo "ok: $fn keeps $want observable accesses"
+    else
+        echo "FAIL: $fn has $n references to $symbol, expected $want"; rc=1
+    fi
+done
+for fn in global_target block_target; do
+    body=$(awk -v f="$fn" '$0==f":"{ins=1} ins{print} ins && /^[[:space:]]*\.size/{exit}' "$td/extern.s")
+    n=$(grep -cE '^[[:space:]]*mov[a-z]*[[:space:]]+\(%r[a-z0-9]+\),' <<<"$body" || true)
+    if [[ -n $body && $n == 2 ]]; then
+        echo "ok: $fn preserves both volatile pointee loads"
+    else
+        echo "FAIL: $fn has $n indirect loads, expected 2"; rc=1
+    fi
+done
+for fn in global_tls block_tls; do
+    body=$(awk -v f="$fn" '$0==f":"{ins=1} ins{print} ins && /^[[:space:]]*\.size/{exit}' "$td/extern.s")
+    n=$(grep -cE '%fs:\(' <<<"$body" || true)
+    if [[ -n $body && $n == 2 ]]; then
+        echo "ok: $fn preserves both volatile TLS loads"
+    else
+        echo "FAIL: $fn has $n TLS loads, expected 2"; rc=1
+    fi
+done
+
+# The same extern metadata carries the pointee's constness for `_Generic`.
+# Both controls are unevaluated; they need no definitions of the externs.
+cat >"$td/extern_generic.c" <<'EOF'
+extern const int *g_const;
+int global_type(void) { return _Generic(g_const, const int *: 1, int *: 0, default: 2); }
+int block_type(void) { extern const int *b_const; return _Generic(b_const, const int *: 1, int *: 0, default: 2); }
+int main(void) { return global_type() != 1 || block_type() != 1; }
+EOF
+if "$CCC" -O2 "$td/extern_generic.c" -o "$td/extern_generic" && "$td/extern_generic"; then
+    echo "ok: extern pointee constness selects the correct _Generic arm"
+else
+    echo "FAIL: extern pointee constness was lost"; rc=1
+fi
+
 exit $rc

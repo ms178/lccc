@@ -129,13 +129,7 @@ impl Lowerer {
             }
 
             let mut da = self.analyze_declaration(type_spec, &declarator.derived);
-            da.base_type_volatile = decl.is_volatile();
-            da.base_type_const = crate::common::qualifiers::type_name_const_base(
-                &decl.type_spec,
-                decl.is_const(),
-                self,
-            );
-            da.object_volatile = declarator.attrs.object_volatile;
+            self.apply_declaration_qualifiers(&mut da, decl, declarator);
             da.apply_decl_vector_type(decl);
             self.fixup_unsized_array(&mut da, type_spec, &declarator.derived, &declarator.init);
 
