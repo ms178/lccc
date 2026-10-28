@@ -440,6 +440,7 @@ impl Lowerer {
                     return None;
                 }
                 Some(StructField {
+                    own_cvr: None,
                     name: f.name.clone().unwrap_or_default(),
                     ty,
                     bit_width,

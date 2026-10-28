@@ -1996,6 +1996,7 @@ impl<'a> SemaConstEval<'a> {
                     return None;
                 }
                 Some(crate::common::types::StructField {
+                    own_cvr: None,
                     name,
                     ty,
                     bit_width,

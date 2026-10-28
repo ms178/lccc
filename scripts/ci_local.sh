@@ -839,6 +839,12 @@ gate "option-effect-ledger" fast \
         --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"
 gate "attribute-diagnostics" fast \
     env GCC="${GCC16:-gcc-16}" python3 tests/regression/check_attribute_diagnostics.py
+# Pointer-target qualifiers of implicit conversions (-Wdiscarded-qualifiers
+# and the multi-level incompatible-pointer-types errors), byte-for-byte
+# against GCC 16.2; two -fsyntax-only compiles.
+gate "qualifier-conversions" fast \
+    python3 tests/regression/check_qualifier_conversions.py \
+        --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"
 gate "dwarf-line-tables" fast \
     python3 tests/regression/check_dwarf_line_tables.py \
         --lccc "$LCCC" --lccc-i686 target/fastbuild/lccc-i686 \

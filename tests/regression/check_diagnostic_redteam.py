@@ -11,6 +11,11 @@ import re
 import subprocess
 import tempfile
 
+# Contracts compare GCC's English text byte for byte; under a UTF-8 locale
+# GCC quotes with U+2018/U+2019 instead of ASCII apostrophes, so every
+# compiler runs with LC_ALL=C.
+ENV = {**os.environ, 'LC_ALL': 'C'}
+
 # name, source, hard read-only error, warning class (None for legal controls).
 # Each combo asserts: our exit code, our warning label count, and the VERBATIM
 # first diagnostic (message + location spelling) against exact GCC 16.2.0.
@@ -238,7 +243,7 @@ def first_diag(err):
 
 def run(cc, source, std, flags):
     result = subprocess.run([cc, '-std=' + std, '-fsyntax-only', *flags, str(source)],
-                            capture_output=True, text=True, timeout=20)
+                            capture_output=True, text=True, timeout=20, env=ENV)
     if result.returncode not in (0, 1) or re.search(
             r'panicked at|internal compiler error|unrecognized command-line', result.stderr):
         raise AssertionError((cc, result.returncode, result.stderr))
@@ -253,7 +258,7 @@ def main():
     cc = str(Path(args.ccc).resolve())
     oracle = None
     try:
-        version = subprocess.check_output([args.gcc, '-dumpfullversion'], text=True).strip()
+        version = subprocess.check_output([args.gcc, '-dumpfullversion'], text=True, env=ENV).strip()
         if version == '16.2.0':
             oracle = args.gcc
         else:

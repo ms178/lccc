@@ -45,13 +45,12 @@
 #   * `_Countof` names its operand type (`to type 'void'`, `'int (*)[3]'`,
 #     `'int(void)'`) and carets the operand's parenthesis.
 #
-# Two measured gcc behaviours are deliberately NOT pinned to gcc's column:
+# Two cases are asserted by line, severity and message rather than column:
 #
-#   * gcc carets "type mismatch in conditional expression" and "pointer type
-#     mismatch in conditional expression" at the `:`, while lccc's AST records
-#     the conditional at the start of its first operand (it keeps no `:` span).
-#     The message, severity and `-W` classification match; only the column
-#     differs, so those cases are asserted by line/severity/message.
+#   * "type mismatch in conditional expression" and "pointer type mismatch in
+#     conditional expression": gcc carets the `:`, and so does lccc, which
+#     recovers it from the source (the AST keeps no `:` span); the byte-exact
+#     column is pinned by tests/regression/check_qualifier_conversions.py.
 #   * gcc appends `{aka 'int'}` for a typedef'd operand (`'T' {aka 'int'}`).
 #     The inferred type no longer carries the spelling a declaration used, so
 #     lccc prints the canonical type (`'int'`); asserted explicitly below.
@@ -579,6 +578,59 @@ for std in gnu90 gnu17; do
             [[ $orc == $rc ]] || fail "pointer_arms.c@$std $flags: gcc oracle exits $orc, lccc $rc"
         fi
     done
+done
+
+# ------------------------- operand types after the integer promotions (16) --
+# GCC names the operands of "invalid operands" after the integer promotions
+# its build_binary_op applies first (C11 6.5.5-6.5.14): char, short, _Bool
+# and a packed enum are 'int', an unsigned-int enum 'unsigned int', a narrow
+# bit-field 'int'; a bit-field wider than int but narrower than its declared
+# type keeps its own type, spelled 'long unsigned int:40'. Compound
+# assignment promotes too; float, records and pointers do not change.
+cat > operand_promoted.c <<'C'
+enum E { A, B };
+enum __attribute__((packed)) P { PA, PB };
+struct S { int x; };
+struct BF { unsigned f : 3; unsigned long g : 40; int h : 2; };
+void f(char c, signed char sc, unsigned char uc, short s, unsigned short us, _Bool b,
+       enum E e, enum P pe, struct S st, struct BF bf, float fl, long l, int *p) {
+  (void)(c % 1.5);
+  (void)(sc + st);
+  (void)(uc ^ 2.0);
+  (void)(us << 1.5);
+  (void)(b % 1.5);
+  (void)(e % 1.5);
+  (void)(pe % 1.5);
+  (void)(bf.f % 1.5);
+  (void)(bf.g % 1.5);
+  (void)(bf.h | 1.5);
+  (void)(fl % 2);
+  (void)(l % 1.5);
+  (void)(st * s);
+  s %= 1.5;
+  c |= 2.0;
+  (void)(p * c);
+}
+C
+for std in gnu90 gnu17 gnu23; do
+expect_diags operand_promoted.c "$std" 1 <<'EOF'
+operand_promoted.c:7:12: error: invalid operands to binary % (have 'int' and 'double')
+operand_promoted.c:8:13: error: invalid operands to binary + (have 'int' and 'struct S')
+operand_promoted.c:9:13: error: invalid operands to binary ^ (have 'int' and 'double')
+operand_promoted.c:10:13: error: invalid operands to binary << (have 'int' and 'double')
+operand_promoted.c:11:12: error: invalid operands to binary % (have 'int' and 'double')
+operand_promoted.c:12:12: error: invalid operands to binary % (have 'unsigned int' and 'double')
+operand_promoted.c:13:13: error: invalid operands to binary % (have 'int' and 'double')
+operand_promoted.c:14:15: error: invalid operands to binary % (have 'int' and 'double')
+operand_promoted.c:15:15: error: invalid operands to binary % (have 'long unsigned int:40' and 'double')
+operand_promoted.c:16:15: error: invalid operands to binary | (have 'int' and 'double')
+operand_promoted.c:17:13: error: invalid operands to binary % (have 'float' and 'int')
+operand_promoted.c:18:12: error: invalid operands to binary % (have 'long int' and 'double')
+operand_promoted.c:19:13: error: invalid operands to binary * (have 'struct S' and 'int')
+operand_promoted.c:20:5: error: invalid operands to binary % (have 'int' and 'double')
+operand_promoted.c:21:5: error: invalid operands to binary | (have 'int' and 'double')
+operand_promoted.c:22:12: error: invalid operands to binary * (have 'int *' and 'int')
+EOF
 done
 
 # --------------------------------------------- the legal shapes still work ---

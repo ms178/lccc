@@ -148,8 +148,11 @@ impl Parser {
         // is the declared object (`long *__seg_gs p` puts `p` in %gs), while a
         // qualifier on an earlier `*` belongs to the pointee (`long *__seg_gs *p`).
         let mut object_space = AddressSpace::Default;
-        // `volatile` written before the first `*` belongs to the specifier.
-        let spec_volatile = self.attrs.parsing_volatile();
+        // `volatile` written before the first `*` belongs to the specifier
+        // (not one an earlier declarator's star left in the flag).
+        let spec_volatile = self.attrs.parsing_volatile() && !self.attrs.volatile_from_stars;
+        // Likewise `restrict` (legal there only on a typedef'd pointer base).
+        let spec_restrict = self.attrs.parsing_restrict();
         let typedef_use = self.attrs.parsing_typedef_use();
         let typedef_object_volatile = self.attrs.parsing_typedef_object_volatile();
         // `volatile` written after the most recent `*` (the last one is the
@@ -186,10 +189,13 @@ impl Parser {
             self.skip_cv_qualifiers();
             let star_volatile = self.attrs.parsing_volatile();
             self.attrs.set_volatile(outer_volatile || star_volatile);
+            if star_volatile && !outer_volatile {
+                self.attrs.volatile_from_stars = true;
+            }
             last_star_volatile = Some(star_volatile);
             last_star_restrict = self.attrs.parsing_restrict();
             last_star_atomic = self.attrs.parsing_atomic();
-            self.attrs.set_restrict(false);
+            self.attrs.set_restrict(spec_restrict);
             self.attrs.set_atomic(spec_atomic);
             let star_space = std::mem::replace(&mut self.attrs.parsing_address_space, base_space);
             // Each star keeps its own qualifiers (see `DerivedDeclarator::Pointer`):
@@ -338,6 +344,7 @@ impl Parser {
                 .iter()
                 .all(|d| matches!(d, DerivedDeclarator::Array(_)));
         self.attrs.declarator_base_volatile = spec_volatile || typedef_element_volatile;
+        self.attrs.declarator_base_restrict = spec_restrict;
         // Locals and globals read the declaration-wide flag (see
         // `d.set_volatile(attrs.parsing_volatile())` in declarations.rs), so the
         // element qualifier must also be carried there.
@@ -882,6 +889,10 @@ impl Parser {
             // alongside `saved_const`.
             let saved_pointer_const = self.attrs.parsing_pointer_const();
             self.attrs.set_pointer_const(false);
+            // Likewise `restrict`: an earlier parameter's star or specifier
+            // (`int *restrict *a, const char **b`) is not `b`'s.
+            let saved_restrict = self.attrs.parsing_restrict();
+            self.attrs.set_restrict(false);
             // Each parameter's volatile and typedef qualifiers are its own
             // (`VI p, int y`: `y` is not volatile), so clear them before its
             // specifiers are parsed.
@@ -908,6 +919,7 @@ impl Parser {
                 // For `const int *p`, parsing_const is true here; the `*` is handled below.
                 let param_is_const = self.attrs.parsing_const();
                 let param_is_volatile = self.attrs.parsing_volatile();
+                let param_base_restrict = self.attrs.parsing_restrict();
                 let (
                     name,
                     pointer_depth,
@@ -921,8 +933,10 @@ impl Parser {
                     param_is_restrict,
                     paren_ptr_total,
                     star_quals,
+                    paren_star_quals,
                     outer_fn_returns,
                 ) = self.parse_param_declarator_full();
+                let adjusted_cvr = self.attrs.param_adjusted_cvr;
                 // C11 6.7.6.3p2: `register` is a parameter's only storage
                 // class (GCC 16.2 wording).
                 if self.attrs.take_storage_classes() != 0 {
@@ -1074,6 +1088,7 @@ impl Parser {
                 let param_pointer_const = self.attrs.parsing_pointer_const();
                 self.attrs.set_const(saved_const);
                 self.attrs.set_pointer_const(saved_pointer_const);
+                self.attrs.set_restrict(saved_restrict);
                 self.attrs.set_noreturn(saved_noreturn);
                 params.push(ParamDecl {
                     type_spec,
@@ -1092,10 +1107,14 @@ impl Parser {
                     pointer_depth,
                     pointer_const: param_pointer_const,
                     pointer_quals,
+                    base_restrict: param_base_restrict,
+                    paren_star_quals,
+                    adjusted_cvr,
                 });
             } else {
                 self.attrs.set_const(saved_const);
                 self.attrs.set_pointer_const(saved_pointer_const);
+                self.attrs.set_restrict(saved_restrict);
                 self.attrs.set_noreturn(saved_noreturn);
                 break;
             }
@@ -1132,6 +1151,9 @@ impl Parser {
                 pointer_depth: 0,
                 pointer_const: false,
                 pointer_quals: Vec::new(),
+                base_restrict: false,
+                paren_star_quals: Vec::new(),
+                adjusted_cvr: 0,
             });
             if !self.consume_if(&TokenKind::Comma) {
                 break;
@@ -1165,6 +1187,8 @@ impl Parser {
         // inside (see the construction in parse_param_list).
         u32,
         Vec<(AddressSpace, u8)>,
+        // The parenthesised stars' CVR bits (see `ParamDecl::paren_star_quals`).
+        Vec<u8>,
         Vec<(Vec<ParamDecl>, bool, bool, u32)>,
     ) {
         let param_start = self.peek_span();
@@ -1194,12 +1218,23 @@ impl Parser {
             // Each star owns its qualifier run; an inner const pointer
             // must not make the parameter object itself read-only.
             self.attrs.set_pointer_const(false);
+            // ... and its own `volatile`/`restrict`: the specifiers' (or an
+            // earlier star's) belong to a deeper level. The flags keep their
+            // union afterwards, as before.
+            let outer_volatile = self.attrs.parsing_volatile();
+            let outer_restrict = self.attrs.parsing_restrict();
+            self.attrs.set_volatile(false);
+            self.attrs.set_restrict(false);
             self.skip_cv_qualifiers();
+            let (star_volatile, star_restrict) =
+                (self.attrs.parsing_volatile(), self.attrs.parsing_restrict());
+            self.attrs.set_volatile(outer_volatile || star_volatile);
+            self.attrs.set_restrict(outer_restrict || star_restrict);
             star_quals.push((
                 std::mem::replace(&mut self.attrs.parsing_address_space, base_space),
                 u8::from(self.attrs.parsing_pointer_const())
-                    | (u8::from(self.attrs.parsing_volatile()) << 1)
-                    | (u8::from(self.attrs.parsing_restrict()) << 2),
+                    | (u8::from(star_volatile) << 1)
+                    | (u8::from(star_restrict) << 2),
             ));
             is_restrict |= self.tokens[qualifier_start..self.pos]
                 .iter()
@@ -1216,6 +1251,7 @@ impl Parser {
         let mut fptr_has_prototype = false;
         let mut fptr_inner_ptr_depth: u32 = 0;
         let mut paren_ptr_total: u32 = 0;
+        let mut paren_star_quals: Vec<u8> = Vec::new();
         let mut outer_fn_returns: Vec<(Vec<ParamDecl>, bool, bool, u32)> = Vec::new();
 
         let had_paren_decl = matches!(self.peek(), TokenKind::LParen) && self.is_paren_declarator();
@@ -1230,6 +1266,7 @@ impl Parser {
                 &mut fptr_has_prototype,
                 &mut fptr_inner_ptr_depth,
                 &mut paren_ptr_total,
+                &mut paren_star_quals,
                 &mut outer_fn_returns,
             )
         } else if let TokenKind::Identifier(n) = self.peek() {
@@ -1241,10 +1278,15 @@ impl Parser {
         };
 
         // Parse trailing array dimensions
+        self.attrs.param_adjusted_cvr = 0;
         while matches!(self.peek(), TokenKind::LBracket) && !self.is_c23_attr_start() {
             self.advance();
-            // Skip C99 array qualifiers (static, restrict, const, volatile)
-            self.skip_array_qualifiers();
+            // C99 array qualifiers (static, restrict, const, volatile); the
+            // first dimension's qualify the adjusted pointer.
+            let quals = self.skip_array_qualifiers();
+            if array_dims.is_empty() {
+                self.attrs.param_adjusted_cvr = quals;
+            }
             if matches!(self.peek(), TokenKind::RBracket) {
                 array_dims.push(None);
                 self.advance();
@@ -1308,6 +1350,7 @@ impl Parser {
             is_restrict,
             paren_ptr_total,
             star_quals,
+            paren_star_quals,
             outer_fn_returns,
         )
     }
@@ -1325,6 +1368,7 @@ impl Parser {
         fptr_has_prototype: &mut bool,
         fptr_inner_ptr_depth: &mut u32,
         paren_ptr_total: &mut u32,
+        paren_star_quals: &mut Vec<u8>,
         outer_fn_returns: &mut Vec<(Vec<ParamDecl>, bool, bool, u32)>,
     ) -> Option<String> {
         let save = self.pos;
@@ -1370,14 +1414,29 @@ impl Parser {
                 }
                 let base_space =
                     std::mem::replace(&mut self.attrs.parsing_address_space, AddressSpace::Default);
+                // The star's own qualifier run, as in the leading-star loop.
                 self.attrs.set_pointer_const(false);
+                let outer_volatile = self.attrs.parsing_volatile();
+                let outer_restrict = self.attrs.parsing_restrict();
+                self.attrs.set_volatile(false);
+                self.attrs.set_restrict(false);
                 self.skip_cv_qualifiers();
+                let (star_volatile, star_restrict) =
+                    (self.attrs.parsing_volatile(), self.attrs.parsing_restrict());
+                self.attrs.set_volatile(outer_volatile || star_volatile);
+                self.attrs.set_restrict(outer_restrict || star_restrict);
+                paren_star_quals.push(
+                    u8::from(self.attrs.parsing_pointer_const())
+                        | (u8::from(star_volatile) << 1)
+                        | (u8::from(star_restrict) << 2),
+                );
                 object_space = std::mem::replace(&mut self.attrs.parsing_address_space, base_space);
                 object_span = star_span;
                 // Also skip __attribute__(...) after pointer qualifiers.
                 // E.g., `void (*__attribute__((unused)) fp)(int)` is valid GNU C.
                 self.skip_gcc_extensions();
             }
+            let mut nested_group_name = None;
             if matches!(self.peek(), TokenKind::LParen) && self.is_paren_declarator() {
                 let inner_save = self.pos;
                 let inner_attrs = self.attrs.clone();
@@ -1390,6 +1449,7 @@ impl Parser {
                 let mut nested_fptr_has_prototype = false;
                 let mut nested_inner_ptr_depth = 0u32;
                 let mut nested_paren_ptr_total = 0u32;
+                let mut nested_paren_star_quals = Vec::new();
                 let mut nested_outer_fn_returns = Vec::new();
                 let nested_name = self.parse_paren_param_declarator(
                     &mut nested_ptr_depth,
@@ -1401,6 +1461,7 @@ impl Parser {
                     &mut nested_fptr_has_prototype,
                     &mut nested_inner_ptr_depth,
                     &mut nested_paren_ptr_total,
+                    &mut nested_paren_star_quals,
                     &mut nested_outer_fn_returns,
                 );
                 if nested_is_func_ptr && self.consume_if(&TokenKind::RParen) {
@@ -1422,10 +1483,31 @@ impl Parser {
                         return nested_name;
                     }
                 }
-                self.pos = inner_save;
-                self.attrs = inner_attrs;
+                // A nested group of plain stars closed by this group's `)`
+                // (`(*(*p))[3]`, `(*(*fp))(int)`): its stars bind outside the
+                // array or parameter list exactly like this group's own, so
+                // they add to its depth. Rewinding and keeping only the name
+                // dropped them (`int (*(*p))[3]` was typed `int (*)[3]`).
+                let plain_stars = !nested_is_func_ptr
+                    && nested_array_dims.is_empty()
+                    && nested_ptr_to_array_dims.is_empty()
+                    && nested_paren_ptr_total == 0
+                    && nested_outer_fn_returns.is_empty()
+                    && nested_fptr_params.is_none()
+                    && matches!(self.peek(), TokenKind::RParen);
+                if plain_stars {
+                    inner_ptr_depth += nested_ptr_depth;
+                    // Written after this group's stars, so further out.
+                    paren_star_quals.extend(nested_paren_star_quals);
+                    nested_group_name = Some(nested_name);
+                } else {
+                    self.pos = inner_save;
+                    self.attrs = inner_attrs;
+                }
             }
-            let name = if let TokenKind::Identifier(n) = self.peek() {
+            let name = if let Some(nested_name) = nested_group_name {
+                nested_name
+            } else if let TokenKind::Identifier(n) = self.peek() {
                 let n = n.clone();
                 self.advance();
                 Some(n)

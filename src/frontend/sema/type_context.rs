@@ -14,7 +14,7 @@
 //! scope push/pop instead of O(total-map-size).
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
-use crate::common::types::{AddressSpace, CType, RcLayout, StructLayout};
+use crate::common::types::{AddressSpace, CType, PtrQuals, RcLayout, StructLayout};
 use crate::frontend::parser::ast::{DerivedDeclarator, ParamDecl, TypeSpecifier};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -207,6 +207,8 @@ pub struct TypeScopeFrame {
     pub pointer_quals_changed: Vec<(String, Option<Vec<u8>>)>,
     /// Same, for `top_const_typedefs`.
     pub top_const_typedef_changed: Vec<(String, bool)>,
+    /// Same, for `typedef_top_cvr`.
+    pub typedef_top_cvr_changed: Vec<(String, Option<u8>)>,
 }
 
 impl TypeScopeFrame {
@@ -230,6 +232,7 @@ impl TypeScopeFrame {
             const_base_changed: Vec::new(),
             pointer_quals_changed: Vec::new(),
             top_const_typedef_changed: Vec::new(),
+            typedef_top_cvr_changed: Vec::new(),
         }
     }
 }
@@ -277,6 +280,12 @@ pub struct TypeContext {
     /// (`typedef int *const cp;`). `x = 0` is rejected for such an alias, and a
     /// `cp p` parameter is read-only, exactly as written out.
     pub top_const_typedefs: FxHashSet<String>,
+    /// The complete top-level `PtrQuals` CVR bits of each typedef whose type
+    /// they are known for (`typedef const char cc;` -> const,
+    /// `typedef int *volatile vp;` -> volatile). A pointer declared on such a
+    /// base records its pointee's qualifiers; a typedef missing here leaves
+    /// them unrecorded. Scoped like `typedefs`.
+    pub typedef_top_cvr: FxHashMap<String, u8>,
     /// Typedefs whose base specifier is `const` (`typedef const int CI;`,
     /// `typedef const char *CS;`; see `common::qualifiers`). Scoped like
     /// `typedefs` (see [`Self::set_typedef_const_base`]).
@@ -331,6 +340,7 @@ impl TypeContext {
             qualified_pointee_typedefs: FxHashSet::default(),
             pointer_quals_typedefs: FxHashMap::default(),
             top_const_typedefs: FxHashSet::default(),
+            typedef_top_cvr: FxHashMap::default(),
             const_base_typedefs: FxHashSet::default(),
             function_typedefs: FxHashMap::default(),
             func_ptr_typedefs: FxHashSet::default(),
@@ -432,7 +442,7 @@ impl TypeContext {
             ("clock_t", long_s.clone()),
             (
                 "timer_t",
-                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+                CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC),
             ),
             ("clockid_t", CType::Int),
             // <sys/types.h>
@@ -461,51 +471,51 @@ impl TypeContext {
             // <locale.h>
             (
                 "locale_t",
-                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+                CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC),
             ),
             // <pthread.h>
             ("pthread_t", size_type),
             (
                 "pthread_mutex_t",
-                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+                CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC),
             ),
             (
                 "pthread_cond_t",
-                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+                CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC),
             ),
             ("pthread_key_t", CType::UInt),
             (
                 "pthread_attr_t",
-                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+                CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC),
             ),
             ("pthread_once_t", CType::Int),
             (
                 "pthread_mutexattr_t",
-                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+                CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC),
             ),
             (
                 "pthread_condattr_t",
-                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+                CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC),
             ),
             // <setjmp.h>
             (
                 "jmp_buf",
-                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+                CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC),
             ),
             (
                 "sigjmp_buf",
-                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+                CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC),
             ),
             // <stdio.h>
             (
                 "FILE",
-                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+                CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC),
             ),
             ("fpos_t", ssize_type),
             // <dirent.h>
             (
                 "DIR",
-                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+                CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC),
             ),
             // POSIX internal names
             ("__u_char", CType::UChar),
@@ -526,15 +536,15 @@ impl TypeContext {
             // applies the target-specific concrete ABI type.
             (
                 "va_list",
-                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+                CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC),
             ),
             (
                 "__builtin_va_list",
-                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+                CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC),
             ),
             (
                 "__gnuc_va_list",
-                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+                CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC),
             ),
         ];
         for (name, ct) in builtins {
@@ -673,6 +683,16 @@ impl TypeContext {
                     }
                     None => {
                         self.pointer_quals_typedefs.remove(&key);
+                    }
+                }
+            }
+            for (key, previous) in frame.typedef_top_cvr_changed.into_iter().rev() {
+                match previous {
+                    Some(cvr) => {
+                        self.typedef_top_cvr.insert(key, cvr);
+                    }
+                    None => {
+                        self.typedef_top_cvr.remove(&key);
                     }
                 }
             }
@@ -964,6 +984,33 @@ impl TypeContext {
     /// Whether pointer typedef `name` declares a read-only object.
     pub fn typedef_is_top_const(&self, name: &str) -> bool {
         self.top_const_typedefs.contains(name)
+    }
+
+    /// Record typedef `name`'s complete top-level CVR bits (`None`: not known),
+    /// undone when the current scope is popped.
+    pub fn set_typedef_top_cvr(&mut self, name: &str, cvr: Option<u8>) {
+        let previous = self.typedef_top_cvr.get(name).copied();
+        if previous == cvr {
+            return;
+        }
+        if let Some(frame) = self.scope_stack.get_mut().last_mut() {
+            frame
+                .typedef_top_cvr_changed
+                .push((name.to_string(), previous));
+        }
+        match cvr {
+            Some(cvr) => {
+                self.typedef_top_cvr.insert(name.to_string(), cvr);
+            }
+            None => {
+                self.typedef_top_cvr.remove(name);
+            }
+        }
+    }
+
+    /// Typedef `name`'s complete top-level CVR bits, if known.
+    pub fn typedef_top_cvr(&self, name: &str) -> Option<u8> {
+        self.typedef_top_cvr.get(name).copied()
     }
 
     /// Record whether typedef `name` has a `const` base specifier, undone when

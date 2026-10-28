@@ -1136,6 +1136,8 @@ jobs:
         python3 tests/regression/check_option_effect_ledger.py \
           --lccc target/fastbuild/lccc --gcc gcc-16
         env GCC=gcc-16 python3 tests/regression/check_attribute_diagnostics.py
+        python3 tests/regression/check_qualifier_conversions.py \
+          --lccc target/fastbuild/lccc --gcc gcc-16
     - name: Cargo gate resource isolation
       run: python3 scripts/test_ci_resources.py
     - name: Verify local oracle identity and ICX provisioning (offline, mock only)

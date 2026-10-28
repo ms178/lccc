@@ -491,9 +491,9 @@ impl Lowerer {
     /// through Default-space casts to the address-of operand so the load
     /// keeps the `%gs:`/`%fs:` prefix (direct `return pcp` already does).
     pub(super) fn get_addr_space_of_ptr_expr(&self, expr: &Expr) -> AddressSpace {
-        if let Some(CType::Pointer(_, addr_space)) = self.get_expr_ctype(expr) {
-            if addr_space != AddressSpace::Default {
-                return addr_space;
+        if let Some(CType::Pointer(_, quals)) = self.get_expr_ctype(expr) {
+            if quals.space != AddressSpace::Default {
+                return quals.space;
             }
         }
         match expr {
@@ -522,7 +522,7 @@ impl Lowerer {
     /// the other operand of the reversed form `i[p]`.
     fn subscript_operand_space(&self, operand: &Expr) -> Option<AddressSpace> {
         match self.get_expr_ctype(operand) {
-            Some(CType::Pointer(_, pointee_space)) => Some(pointee_space),
+            Some(CType::Pointer(_, pointee_space)) => Some(pointee_space.space),
             Some(CType::Array(_, _)) => Some(self.get_addr_space_of_struct_expr(operand)),
             _ => None,
         }

@@ -172,6 +172,14 @@ KIND_FIXTURES = {
         "int *probe_a; char *probe_b;\nint probe_cdp(void) { return probe_a == probe_b; }",
         "comparison of distinct pointer types lacks a cast",
     ),
+    "discarded-qualifiers": (
+        "const char *probe_dq_src;\nchar *probe_dq(void) { return probe_dq_src; }",
+        "return discards 'const' qualifier from pointer target type",
+    ),
+    "discarded-array-qualifiers": (
+        "const int probe_daq_src[2][2];\nint (*probe_daq(void))[2] { return probe_daq_src; }",
+        "return discards 'const' qualifier from pointer target type",
+    ),
 }
 
 # Measured membership/severity cells, stated INDEPENDENTLY of the LCCC
@@ -194,6 +202,8 @@ DEFAULT_ON = {
     "pointer-to-int-cast",
     "int-to-pointer-cast",
     "compare-distinct-pointer-types",
+    "discarded-qualifiers",
+    "discarded-array-qualifiers",
 }
 IN_WALL = {"return-type", "unused-variable", "format"}
 IN_WEXTRA = {"sign-compare"}
@@ -245,6 +255,7 @@ def kind_state(
         text=True,
         capture_output=True,
         timeout=30,
+        env=ENV,
     )
     return proc.returncode != 0, diag_lines(proc.stderr)
 
@@ -482,6 +493,7 @@ def run_mb01_rows(gcc: list[str], lccc: list[str], temp: Path) -> None:
             text=True,
             capture_output=True,
             timeout=30,
+            env=ENV,
         )
 
     positive_unknowns = ("-Wtotally-bogus", "-Wsign-compare=1")
@@ -562,6 +574,7 @@ def run_precision_sweep(gcc: list[str], lccc: list[str]) -> None:
                     text=True,
                     capture_output=True,
                     timeout=120,
+                    env=ENV,
                 )
                 results.append(proc)
             g_run, l_run = results

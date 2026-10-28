@@ -204,6 +204,7 @@ impl Parser {
             self.attrs.declarator_object_atomic,
         );
         let declarator_base_volatile = self.attrs.declarator_base_volatile;
+        let declarator_base_restrict = self.attrs.declarator_base_restrict;
         let (post_ctor, post_dtor, post_mode, post_common, post_aligned, first_asm_reg) =
             self.parse_asm_and_attributes();
         let mode_kind = decl_mode.or(post_mode);
@@ -268,6 +269,7 @@ impl Parser {
         decl_attrs.pointer_const = declarator_pointer_const;
         (decl_attrs.object_restrict, decl_attrs.object_atomic) = declarator_object_quals;
         decl_attrs.base_volatile = declarator_base_volatile;
+        decl_attrs.base_restrict = declarator_base_restrict;
         decl_attrs.set_constructor(is_constructor);
         decl_attrs.set_destructor(is_destructor);
         decl_attrs.set_weak(is_weak);
@@ -521,6 +523,13 @@ impl Parser {
             alignment,
             return_base_const,
             return_pointer_const_levels: crate::frontend::parser::ast::return_pointer_const_levels(
+                &return_type,
+                &derived,
+            ),
+            return_base_cvr: u8::from(return_base_const) * crate::frontend::parser::ast::CVR_CONST
+                | u8::from(decl_attrs.base_volatile) * crate::frontend::parser::ast::CVR_VOLATILE
+                | u8::from(decl_attrs.base_restrict) * crate::frontend::parser::ast::CVR_RESTRICT,
+            return_star_cvr: crate::frontend::parser::ast::return_star_chain(
                 &return_type,
                 &derived,
             ),
@@ -1027,6 +1036,7 @@ impl Parser {
                 self.attrs.declarator_object_atomic,
             );
             let d_base_volatile = self.attrs.declarator_base_volatile;
+            let d_base_restrict = self.attrs.declarator_base_restrict;
             let (d_ctor, d_dtor, _, d_common, _, d_asm_reg) = self.parse_asm_and_attributes();
             ctx.is_common = ctx.is_common || d_common;
             let d_weak = self.attrs.parsing_weak();
@@ -1098,6 +1108,7 @@ impl Parser {
                     da.pointer_const = d_pointer_const;
                     (da.object_restrict, da.object_atomic) = d_object_quals;
                     da.base_volatile = d_base_volatile;
+                    da.base_restrict = d_base_restrict;
                     da.asm_register = d_asm_reg;
                     da.cleanup_fn = d_cleanup_fn;
                     da
@@ -1291,6 +1302,7 @@ impl Parser {
                 self.attrs.declarator_object_atomic,
             );
             let l_base_volatile = self.attrs.declarator_base_volatile;
+            let l_base_restrict = self.attrs.declarator_base_restrict;
             let (skip_mode, skip_aligned, skip_asm_reg) = self.skip_asm_and_attributes();
             let local_maybe_unused = spec_maybe_unused || self.attrs.parsing_maybe_unused();
             self.attrs.set_maybe_unused(false);
@@ -1330,6 +1342,7 @@ impl Parser {
                     da.pointer_const = l_pointer_const;
                     (da.object_restrict, da.object_atomic) = l_object_quals;
                     da.base_volatile = l_base_volatile;
+                    da.base_restrict = l_base_restrict;
                     da.section = local_section;
                     da.tls_model = local_tls_model;
                     da.asm_register = skip_asm_reg;

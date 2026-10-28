@@ -233,10 +233,23 @@ pub(super) struct ParsedDeclAttrs {
     /// qualifier: the object for a non-pointer, the pointee for a pointer).
     /// Set by `parse_declarator_with_attrs`; read by the typedef registration.
     pub(super) declarator_base_volatile: bool,
+    /// The `volatile` flag is set only because a declarator star added it:
+    /// the declaration-wide flag keeps the union of the specifiers' and every
+    /// star's `volatile` (`int *volatile a, *b;` leaves it set for `b`), and
+    /// this tells a later declarator that its specifiers did not write one.
+    /// Cleared by every specifier `volatile`.
+    pub(super) volatile_from_stars: bool,
+    /// `restrict` in the specifiers of the last declarator's declaration (see
+    /// `DeclAttributes::base_restrict`). Set by `parse_declarator_with_attrs`.
+    pub(super) declarator_base_restrict: bool,
     /// `restrict` / `_Atomic` of the object the last declarator names (see
     /// `DeclAttributes::object_restrict`). Set by `parse_declarator_with_attrs`.
     pub(super) declarator_object_restrict: bool,
     pub(super) declarator_object_atomic: bool,
+    /// The CVR bits written inside a parameter's first `[...]` (`int
+    /// a[const 2]`), which qualify the pointer it is adjusted to (C23
+    /// 6.7.6.3p7). Set by `parse_param_declarator_full`.
+    pub(super) param_adjusted_cvr: u8,
 
     /// Named address space of the declaration being parsed, moved out of
     /// `parsing_address_space` right after its type specifier. Parameter
@@ -1552,13 +1565,18 @@ impl Parser {
     ///   [static restrict const 10], [restrict n], [const], [static 10], etc.
     /// We skip these qualifiers since they only affect optimization hints and
     /// don't change the type semantics (array params decay to pointers).
-    pub(super) fn skip_array_qualifiers(&mut self) {
-        while let TokenKind::Static
-        | TokenKind::Const
-        | TokenKind::Volatile
-        | TokenKind::Restrict
-        | TokenKind::Atomic = self.peek()
-        {
+    /// Skip the qualifiers and `static` of an array declarator's `[...]`,
+    /// returning their CVR bits (`ast::CVR_CONST` and friends).
+    pub(super) fn skip_array_qualifiers(&mut self) -> u8 {
+        let mut cvr = 0;
+        loop {
+            cvr |= match self.peek() {
+                TokenKind::Const => CVR_CONST,
+                TokenKind::Volatile => CVR_VOLATILE,
+                TokenKind::Restrict => CVR_RESTRICT,
+                TokenKind::Static | TokenKind::Atomic => 0,
+                _ => return cvr,
+            };
             self.advance();
         }
     }

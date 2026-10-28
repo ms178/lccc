@@ -301,10 +301,15 @@ impl Parser {
                 TokenKind::Const if depth == 0 && before_first_star => {
                     q.pointee_qualified = true;
                     q.base_const = true;
+                    q.base_cvr |= crate::frontend::parser::ast::CVR_CONST;
                 }
                 TokenKind::Volatile if depth == 0 && before_first_star => {
                     q.pointee_qualified = true;
                     volatile_before_star = true;
+                    q.base_cvr |= crate::frontend::parser::ast::CVR_VOLATILE;
+                }
+                TokenKind::Restrict if depth == 0 && before_first_star => {
+                    q.base_cvr |= crate::frontend::parser::ast::CVR_RESTRICT;
                 }
                 TokenKind::LParen | TokenKind::LBrace | TokenKind::LBracket => depth += 1,
                 TokenKind::RParen => {
@@ -473,6 +478,7 @@ impl Parser {
                             self.scan_compound_literal_storage_in_range(save + 1, type_end);
                         cl_storage.pointer_const_levels = levels_mask;
                         qualifiers.pointer_const_levels = levels_mask;
+                        qualifiers.set_star_chain(&result_type, &pointer_quals);
                         let span = self.peek_span();
                         // The cast expression's span covers the whole
                         // `(type)expr` form, starting at the `(`: storing only

@@ -20,6 +20,10 @@ from __future__ import annotations
 import os, re, shutil, subprocess, sys, tempfile
 from pathlib import Path
 
+# Probes compare GCC's English text byte for byte; under a UTF-8 locale GCC
+# quotes with U+2018/U+2019, so every compiler runs with LC_ALL=C.
+ENV = {**os.environ, 'LC_ALL': 'C'}
+
 ROOT = Path(__file__).resolve().parents[2]
 LCCC = ROOT / 'target/fastbuild/lccc'
 
@@ -175,7 +179,7 @@ def run(cc, src, flags):
         path = f.name
     try:
         r = subprocess.run([cc, '-fsyntax-only', '-std=gnu23', *flags, path],
-                           capture_output=True, text=True)
+                           capture_output=True, text=True, env=ENV)
         return r.returncode, r.stderr
     finally:
         os.unlink(path)

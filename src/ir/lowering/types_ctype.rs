@@ -6,7 +6,9 @@
 
 use super::lower::Lowerer;
 use crate::common::type_builder;
-use crate::common::types::{AddressSpace, CType, StructField, StructLayout, max_object_bytes};
+use crate::common::types::{
+    AddressSpace, CType, PtrQuals, StructField, StructLayout, max_object_bytes,
+};
 use crate::frontend::parser::ast::{
     DerivedDeclarator, EnumVariant, Expr, ParamDecl, StructFieldDecl, TypeSpecifier,
 };
@@ -72,6 +74,9 @@ impl Lowerer {
                             pointer_depth: 0,
                             pointer_const: false,
                             pointer_quals: Vec::new(),
+                            base_restrict: false,
+                            paren_star_quals: Vec::new(),
+                            adjusted_cvr: 0,
                         })
                         .collect();
                     TypeSpecifier::FunctionPointer(
@@ -149,6 +154,9 @@ impl Lowerer {
                         pointer_depth: 0,
                         pointer_const: false,
                         pointer_quals: Vec::new(),
+                        base_restrict: false,
+                        paren_star_quals: Vec::new(),
+                        adjusted_cvr: 0,
                     })
                     .collect();
                 TypeSpecifier::BareFunction(
@@ -244,7 +252,7 @@ impl Lowerer {
                     variadic: fti.variadic,
                     has_prototype: fti.has_prototype,
                 }));
-                return CType::Pointer(Box::new(func_type), AddressSpace::Default);
+                return CType::Pointer(Box::new(func_type), PtrQuals::GENERIC);
             }
         }
 
@@ -254,7 +262,7 @@ impl Lowerer {
         // adjusted to 'qualified pointer to type'". This handles typedef'd array types
         // like `typedef struct S name[1]` used as function parameters.
         if let CType::Array(elem, _) = ctype {
-            return CType::Pointer(elem, AddressSpace::Default);
+            return CType::Pointer(elem, PtrQuals::GENERIC);
         }
         ctype
     }
@@ -312,7 +320,7 @@ impl Lowerer {
                 variadic: fti.variadic,
                 has_prototype: fti.has_prototype,
             }));
-            return Some(CType::Pointer(Box::new(func_type), AddressSpace::Default));
+            return Some(CType::Pointer(Box::new(func_type), PtrQuals::GENERIC));
         }
         None
     }
@@ -401,6 +409,7 @@ impl Lowerer {
                     // (it may lower it); see `StructField::type_align`.
                     let type_align = self.typedef_alignment_for_type_spec(&f.type_spec).copied();
                     Some(StructField {
+                        own_cvr: None,
                         name: f.name.clone().unwrap_or_default(),
                         ty,
                         bit_width,

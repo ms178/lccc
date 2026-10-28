@@ -161,6 +161,12 @@ impl Parser {
         // One declarator: the function name and its parameter list.
         let (name, derived, decl_mode, _decl_common, _decl_aligned, _) =
             self.parse_declarator_with_attrs();
+        // The return type's base qualifiers, before the body's declarations
+        // overwrite the per-declarator slots.
+        let (ret_base_volatile, ret_base_restrict) = (
+            self.attrs.declarator_base_volatile,
+            self.attrs.declarator_base_restrict,
+        );
         let (_post_ctor, _post_dtor, post_mode, _post_common, _post_aligned, _first_asm_reg) =
             self.parse_asm_and_attributes();
         // A nested definition carries no alignment.  GCC applies none either:
@@ -315,6 +321,13 @@ impl Parser {
             alignment: None,
             return_base_const,
             return_pointer_const_levels: crate::frontend::parser::ast::return_pointer_const_levels(
+                &return_type,
+                &derived,
+            ),
+            return_base_cvr: u8::from(return_base_const) * crate::frontend::parser::ast::CVR_CONST
+                | u8::from(ret_base_volatile) * crate::frontend::parser::ast::CVR_VOLATILE
+                | u8::from(ret_base_restrict) * crate::frontend::parser::ast::CVR_RESTRICT,
+            return_star_cvr: crate::frontend::parser::ast::return_star_chain(
                 &return_type,
                 &derived,
             ),

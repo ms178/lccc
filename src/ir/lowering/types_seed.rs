@@ -6,7 +6,7 @@
 
 use super::definitions::FuncSig;
 use super::lower::Lowerer;
-use crate::common::types::{AddressSpace, CType, IrType};
+use crate::common::types::{AddressSpace, CType, IrType, PtrQuals};
 
 impl Lowerer {
     /// Pre-populate typedef mappings for builtin/standard types.
@@ -89,7 +89,7 @@ impl Lowerer {
             ("clock_t", long_s.clone()),
             (
                 "timer_t",
-                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+                CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC),
             ),
             ("clockid_t", CType::Int),
             // <sys/types.h>
@@ -118,51 +118,51 @@ impl Lowerer {
             // <locale.h>
             (
                 "locale_t",
-                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+                CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC),
             ),
             // <pthread.h> - opaque types, treat as unsigned long or pointer
             ("pthread_t", size_type),
             (
                 "pthread_mutex_t",
-                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+                CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC),
             ),
             (
                 "pthread_cond_t",
-                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+                CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC),
             ),
             ("pthread_key_t", CType::UInt),
             (
                 "pthread_attr_t",
-                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+                CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC),
             ),
             ("pthread_once_t", CType::Int),
             (
                 "pthread_mutexattr_t",
-                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+                CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC),
             ),
             (
                 "pthread_condattr_t",
-                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+                CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC),
             ),
             // <setjmp.h>
             (
                 "jmp_buf",
-                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+                CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC),
             ),
             (
                 "sigjmp_buf",
-                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+                CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC),
             ),
             // <stdio.h>
             (
                 "FILE",
-                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+                CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC),
             ),
             ("fpos_t", ssize_type),
             // <dirent.h>
             (
                 "DIR",
-                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+                CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC),
             ),
         ];
         for (name, ct) in builtins {
@@ -173,7 +173,7 @@ impl Lowerer {
         let va_list_type = match self.target {
             Target::Riscv64 => {
                 // RISC-V: va_list = void * (8 bytes, passed by value)
-                CType::Pointer(Box::new(CType::Void), AddressSpace::Default)
+                CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC)
             }
             Target::Aarch64 => {
                 // AArch64: va_list is a 32-byte struct, represented as char[32]
@@ -185,7 +185,7 @@ impl Lowerer {
             }
             Target::I686 => {
                 // i686 cdecl: va_list = char* (simple pointer to stack args)
-                CType::Pointer(Box::new(CType::plain_char()), AddressSpace::Default)
+                CType::Pointer(Box::new(CType::plain_char()), PtrQuals::GENERIC)
             }
         };
         self.types

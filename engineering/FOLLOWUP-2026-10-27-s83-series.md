@@ -95,19 +95,10 @@ says so in a warning: `void *v; ... v[0];` is rc 1 under gcc-16
 
 ## Scheduled next (ms178-2.patch, decided 2026-10-27)
 
-- lccc's AArch64 and RISC-V linkers copy no `.debug_*` section into
-  executables or shared objects (gdb has no file:line on lccc-linked cross
-  binaries), and AArch64 static and dynamic executables have no
-  section-header table. Measured with `dbg2.c`/`far.c`: AArch64 0/0/8
-  section headers (static/dynamic/shared), RISC-V 19/25/20, `.debug_*` 0
-  everywhere.
-- `__builtin_cpu_is`/`__builtin_cpu_supports` at -O2: the init guard's cold
-  call keeps a frame in a leaf (`subq $8, %rsp`), and the feature-word load
-  stays inside loops that GCC 16.2 hoists it out of.
-- Qualifiers in `CType` (decided 2026-10-27: in ms178-2): the nested
-  pointer conversions that gcc-16 rejects must error, and dropping a
-  qualifier on conversion must warn (`-Wdiscarded-qualifiers`), with a
-  gcc-16 differential gate.
+Delivered in ms178-2 (`FOLLOWUP-2026-10-28-ms178-2.md`): `.debug_*`
+sections, `.symtab` and complete section tables in the AArch64 and RISC-V
+linkers, and pointer qualifiers in `CType` with a gcc-16 differential gate.
+The `__builtin_cpu_*` -O2 item is carried there under "Next".
 
 ## Scheduled after ms178-2 (decided 2026-10-27)
 

@@ -26,7 +26,7 @@ use crate::common::symbol_table::{FoldedValue, Symbol, SymbolTable};
 use crate::common::type_builder;
 use crate::common::type_builder::TypeConvertContext;
 use crate::common::types::{
-    AddressSpace, CType, ExtVectorLayout, ExtVectorSelectorError, FunctionType, RcLayout,
+    AddressSpace, CType, ExtVectorLayout, ExtVectorSelectorError, FunctionType, PtrQuals, RcLayout,
     StructFieldLayout, StructLayout,
 };
 use crate::frontend::parser::ast::{
@@ -478,7 +478,7 @@ impl SemanticAnalyzer {
             .unwrap_or_default();
         let mangled = format!("{}.{}", parent, func.name);
 
-        let return_type = self.type_spec_to_ctype(&func.return_type);
+        let return_type = self.function_def_return_ctype(func);
         self.collect_enum_constants_from_type_spec(&func.return_type, func.span);
 
         let params: Vec<(CType, Option<String>)> = func
@@ -552,11 +552,15 @@ impl SemanticAnalyzer {
         for param in &func.params {
             if let Some(name) = &param.name {
                 let ty = self.param_decl_ctype(param);
+                let own_cvr = self.param_object_cvr(param, &ty);
                 let const_base = self.decl_const_base(&param.type_spec, param.is_const);
                 let base_volatile =
                     param.is_volatile || self.scalar_typeof_is_volatile(&param.type_spec);
+                // A parameter declared as an array is a pointer whose own
+                // qualifiers are those written inside its first `[...]`
+                // (C23 6.7.7.4p7): `int a[const 2]` makes `a = 0` an error.
                 let top_const = if param.decayed_array {
-                    false
+                    param.adjusted_cvr & PtrQuals::CONST != 0
                 } else if param.pointer_depth > 0 {
                     param.pointer_const
                 } else {
@@ -573,6 +577,7 @@ impl SemanticAnalyzer {
                     address_space: AddressSpace::Default,
                 });
                 self.symbol_table.mark_automatic(name);
+                self.symbol_table.mark_object_cvr(name, own_cvr);
                 if const_base {
                     self.symbol_table.mark_const_base(name);
                 }
@@ -610,7 +615,7 @@ impl SemanticAnalyzer {
     }
 
     fn analyze_function_def_inner(&mut self, func: &FunctionDef) {
-        let return_type = self.type_spec_to_ctype(&func.return_type);
+        let return_type = self.function_def_return_ctype(func);
         if func.is_kr {
             for p in &func.params {
                 self.check_void_param(p, VoidRole::KrParameter, func.span);
@@ -698,11 +703,15 @@ impl SemanticAnalyzer {
         for param in &func.params {
             if let Some(name) = &param.name {
                 let ty = self.param_decl_ctype(param);
+                let own_cvr = self.param_object_cvr(param, &ty);
                 let const_base = self.decl_const_base(&param.type_spec, param.is_const);
                 let base_volatile =
                     param.is_volatile || self.scalar_typeof_is_volatile(&param.type_spec);
+                // A parameter declared as an array is a pointer whose own
+                // qualifiers are those written inside its first `[...]`
+                // (C23 6.7.7.4p7): `int a[const 2]` makes `a = 0` an error.
                 let top_const = if param.decayed_array {
-                    false
+                    param.adjusted_cvr & PtrQuals::CONST != 0
                 } else if param.pointer_depth > 0 {
                     param.pointer_const
                 } else {
@@ -719,6 +728,7 @@ impl SemanticAnalyzer {
                     address_space: AddressSpace::Default,
                 });
                 self.symbol_table.mark_automatic(name);
+                self.symbol_table.mark_object_cvr(name, own_cvr);
                 if const_base {
                     self.symbol_table.mark_const_base(name);
                 }
@@ -1133,15 +1143,56 @@ impl SemanticAnalyzer {
                 // Store resolved CType for the typedef.
                 // Use build_full_ctype_with_base to reuse the already-resolved base
                 // type, avoiding re-resolution of anonymous struct type specs.
+                let base_cvr = self.specifier_cvr(
+                    &decl.type_spec,
+                    written_cvr(
+                        decl.is_const(),
+                        declarator.attrs.base_volatile,
+                        declarator.attrs.base_restrict,
+                    ),
+                );
                 let mut resolved_ctype = if declarator.derived.is_empty() {
                     base_type.clone()
                 } else {
-                    type_builder::build_full_ctype_with_base(
+                    type_builder::build_qualified_ctype_with_base(
                         self,
                         base_type.clone(),
+                        base_cvr,
                         &declarator.derived,
                     )
                 };
+                // The alias's own top-level qualifiers, when completely known:
+                // the specifiers' for a plain or array alias, the outermost
+                // star's for a pointer (the parser drops the stars' around a
+                // function core).
+                let top_cvr = match declarator.derived.last() {
+                    None => base_cvr,
+                    // An array type is qualified exactly like its elements
+                    // (`typedef const int A[3]` is a const-qualified type).
+                    Some(DerivedDeclarator::Array(_))
+                        if declarator
+                            .derived
+                            .iter()
+                            .all(|d| matches!(d, DerivedDeclarator::Array(_))) =>
+                    {
+                        base_cvr
+                    }
+                    Some(DerivedDeclarator::Pointer(_, cvr))
+                        if !declarator.derived.iter().any(|d| {
+                            matches!(
+                                d,
+                                DerivedDeclarator::Function(..)
+                                    | DerivedDeclarator::FunctionPointer(..)
+                            )
+                        }) =>
+                    {
+                        Some(*cvr)
+                    }
+                    Some(_) => None,
+                };
+                self.result
+                    .type_context
+                    .set_typedef_top_cvr(&declarator.name, top_cvr);
                 // Same declaration-level address space rule as variables
                 // (see analyze_declaration); lowering applies it to typedefs
                 // too (stmt.rs lower_local_typedef).
@@ -1277,9 +1328,15 @@ impl SemanticAnalyzer {
                 // type. This is critical for anonymous structs: re-resolving the type
                 // spec would call next_anon_struct_id() again and produce a different
                 // key for each declarator, breaking pointer-array compatibility checks.
-                type_builder::build_full_ctype_with_base(
+                let written = written_cvr(
+                    decl.is_const(),
+                    init_decl.attrs.base_volatile,
+                    init_decl.attrs.base_restrict,
+                );
+                type_builder::build_qualified_ctype_with_base(
                     self,
                     base_type.clone(),
+                    self.specifier_cvr(&decl.type_spec, written),
                     &init_decl.derived,
                 )
             };
@@ -1580,6 +1637,17 @@ impl SemanticAnalyzer {
                 } else {
                     decl.is_const() || base_top_const
                 };
+            // The object's own qualifiers, for `&x` and an array's decay.
+            let own_cvr = type_builder::declarator_own_cvr(&init_decl.derived, &full_type, || {
+                self.specifier_cvr(
+                    &decl.type_spec,
+                    written_cvr(
+                        decl.is_const(),
+                        init_decl.attrs.base_volatile,
+                        init_decl.attrs.base_restrict,
+                    ),
+                )
+            });
             self.symbol_table.declare(Symbol {
                 name: init_decl.name.clone(),
                 ty: full_type,
@@ -1609,6 +1677,9 @@ impl SemanticAnalyzer {
             }
             if top_const {
                 self.symbol_table.mark_top_const(&init_decl.name);
+            }
+            if is_object {
+                self.symbol_table.mark_object_cvr(&init_decl.name, own_cvr);
             }
             if links && !self.symbol_table.at_file_scope() {
                 self.symbol_table.mark_linked(&init_decl.name);
@@ -4324,14 +4395,78 @@ impl SemanticAnalyzer {
                 return None;
             }
         }
-        let ty = self
-            .expr_type_checker()
-            .infer_expr_ctype(expr)?
-            .decayed_value_ctype();
+        let raw = self.expr_type_checker().infer_expr_ctype(expr)?;
+        let decays = matches!(raw, CType::Array(..));
+        let mut ty = raw.decayed_value_ctype();
+        // `&lvalue` and an array lvalue's decay point at an object whose own
+        // qualifiers may be exactly known.
+        let object = match expr {
+            Expr::AddressOf(inner, _) => Some(inner.as_ref()),
+            _ if decays => Some(expr),
+            _ => None,
+        };
+        if let (Some(object), CType::Pointer(_, quals)) = (object, &mut ty) {
+            if quals.cvr().is_none() {
+                if let Some(cvr) = self.lvalue_object_cvr(object) {
+                    *quals = quals.with_cvr(Some(cvr));
+                }
+            }
+        }
         if matches!(ty, CType::Void) && !self.is_exact_void(expr) {
             return None;
         }
         Some(ty)
+    }
+
+    /// The complete own CVR bits of the object the lvalue `expr` designates,
+    /// when exactly known: a variable's record; a member's own qualifiers
+    /// joined with its containing object's (C11 6.5.2.3p3, `.` and `->`
+    /// alike); and the pointee record of the pointer that `*`, `->` or a
+    /// subscript goes through (an array operand: the array object's own,
+    /// which are its elements'). `None` when any link is unknown.
+    fn lvalue_object_cvr(&self, expr: &Expr) -> Option<u8> {
+        match expr {
+            Expr::Identifier(name, _) => self.symbol_table.object_cvr(name),
+            Expr::MemberAccess(base, field, _) => {
+                let outer = self.lvalue_object_cvr(base)?;
+                let record = self.expr_type_checker().infer_expr_ctype(base)?;
+                Some(outer | self.member_own_cvr(&record, field)?)
+            }
+            Expr::PointerMemberAccess(base, field, _) => {
+                let (record, outer) = self.designated_pointee(base)?;
+                Some(outer | self.member_own_cvr(&record, field)?)
+            }
+            Expr::Deref(inner, _) => self.designated_pointee(inner).map(|(_, cvr)| cvr),
+            Expr::ArraySubscript(lhs, rhs, _) => {
+                let checker = self.expr_type_checker();
+                let lhs_indexes = checker
+                    .infer_expr_ctype(lhs)
+                    .is_some_and(|t| matches!(t, CType::Pointer(..) | CType::Array(..)));
+                let base = if lhs_indexes { lhs } else { rhs };
+                self.designated_pointee(base).map(|(_, cvr)| cvr)
+            }
+            _ => None,
+        }
+    }
+
+    /// The object type `expr` points at (an array operand: its element) and
+    /// that object's complete own CVR bits, when exactly known.
+    fn designated_pointee(&self, expr: &Expr) -> Option<(CType, u8)> {
+        match self.expr_type_checker().infer_expr_ctype(expr)? {
+            CType::Pointer(pointee, quals) => Some((*pointee, quals.cvr()?)),
+            CType::Array(elem, _) => Some((*elem, self.lvalue_object_cvr(expr)?)),
+            _ => None,
+        }
+    }
+
+    /// Member `field`'s own CVR bits in record type `record` (see
+    /// `StructLayout::member_own_cvr`).
+    fn member_own_cvr(&self, record: &CType, field: &str) -> Option<u8> {
+        let (CType::Struct(key) | CType::Union(key)) = record else {
+            return None;
+        };
+        let layouts = self.result.type_context.borrow_struct_layouts();
+        layouts.get(&key[..])?.member_own_cvr(field, &*layouts)
     }
 
     /// The type of `expr` for the expression-level constraints that inspect
@@ -4483,64 +4618,70 @@ impl SemanticAnalyzer {
         }
     }
 
+    /// A binary operand after its integer promotions, which C11 6.5.5-6.5.14
+    /// apply before the operator's constraints; GCC 16.2 names the promoted
+    /// types in "invalid operands" (`short % 1.5` has `'int'`, an `unsigned
+    /// int` enumeration `'unsigned int'`, `unsigned f : 3` `'int'`). The
+    /// width is returned for a bit-field wider than `int` but narrower than
+    /// its declared type, which keeps its own bit-field type.
+    fn promoted_binary_operand(&self, expr: &Expr, ty: &CType) -> (CType, Option<u32>) {
+        let checker = self.expr_type_checker();
+        let promoted = checker.bitfield_promoted_ctype(expr, ty);
+        let width = checker.expr_bitfield_width(expr).filter(|&width| {
+            let layouts = self.result.type_context.borrow_struct_layouts();
+            let bits = |t: &CType| t.size_ctx(&*layouts) * 8;
+            usize::try_from(width).is_ok_and(|w| w > bits(&CType::Int) && w < bits(ty))
+        });
+        (promoted, width)
+    }
+
     fn check_binary_operands(&self, op: BinOp, lhs: &Expr, rhs: &Expr, span: Span) {
+        fn operand(ty: &CType, null_constant: bool, bit_width: Option<u32>) -> Operand<'_> {
+            Operand {
+                ty,
+                null_constant,
+                bit_width,
+            }
+        }
         let (Some(lt), Some(rt)) = (self.constraint_operand(lhs), self.constraint_operand(rhs))
         else {
             return;
         };
+        if matches!(
+            op,
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+        ) {
+            self.check_pointer_comparison(op, (lhs, &lt), (rhs, &rt), span);
+        }
         if !operand_constraints::binary_interested(&lt)
             && !operand_constraints::binary_interested(&rt)
         {
             return;
         }
         let nullptr = matches!(lt, CType::NullPtr) || matches!(rt, CType::NullPtr);
-        let lhs_op = Operand {
-            ty: &lt,
-            null_constant: self.null_constant_if(nullptr, lhs),
-        };
-        let rhs_op = Operand {
-            ty: &rt,
-            null_constant: self.null_constant_if(nullptr, rhs),
-        };
-        let message = operand_constraints::binary(op, lhs_op, rhs_op);
-        // GCC 16.2's -Wcompare-distinct-pointer-types (measured): a
-        // default-on warning for every relational operator between two
-        // pointer-shaped operands (after array/function decay) whose
-        // pointees differ. The `void *` absorption applies at the
-        // OUTERMOST level only: `void *` against `int *` and against
-        // `void **` are silent, `void **` against `int **` warns (all
-        // measured). C-compatible-but-distinct pointees warn as well:
-        // `char *` against `unsigned char *`, `int *` against `unsigned *`
-        // and `enum E *` against `int *` all report (measured), which is
-        // stricter than the argument-passing compatibility the conditional
-        // arm check uses.
-        if message.is_none()
-            && matches!(
-                op,
-                BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
-            )
+        let (lhs_null, rhs_null) = (
+            self.null_constant_if(nullptr, lhs),
+            self.null_constant_if(nullptr, rhs),
+        );
+        let mut message = operand_constraints::binary(
+            op,
+            operand(&lt, lhs_null, None),
+            operand(&rt, rhs_null, None),
+        );
+        // The integer promotions never change the verdict, only the types
+        // the message names, so they are computed on the error path alone.
+        if message
+            .as_deref()
+            .is_some_and(|m| m.starts_with("invalid operands"))
         {
-            fn pointee(ty: &CType) -> Option<&CType> {
-                match ty {
-                    CType::Pointer(inner, _) => Some(inner),
-                    CType::Array(inner, _) => Some(inner),
-                    // A function designator decays to a pointer to that
-                    // function type: the pointee view is the type itself.
-                    CType::Function(_) => Some(ty),
-                    _ => None,
-                }
-            }
-            if let (Some(lhs_pointee), Some(rhs_pointee)) = (pointee(&lt), pointee(&rt)) {
-                let compatible = lhs_pointee == rhs_pointee
-                    || *lhs_pointee == CType::Void
-                    || *rhs_pointee == CType::Void;
-                if !compatible {
-                    self.diagnostics.borrow_mut().warning_with_kind(
-                        "comparison of distinct pointer types lacks a cast".to_string(),
-                        span,
-                        crate::common::error::WarningKind::CompareDistinctPointerTypes,
-                    );
-                }
+            let (lp, lhs_width) = self.promoted_binary_operand(lhs, &lt);
+            let (rp, rhs_width) = self.promoted_binary_operand(rhs, &rt);
+            if let Some(promoted) = operand_constraints::binary(
+                op,
+                operand(&lp, lhs_null, lhs_width),
+                operand(&rp, rhs_null, rhs_width),
+            ) {
+                message = Some(promoted);
             }
         }
         // Only the `void` verdict is anchored at the operand ("void value not
@@ -4570,11 +4711,96 @@ impl SemanticAnalyzer {
         self.constraint_error(message, message_span);
     }
 
+    /// GCC 16.2's comparison warnings (C23 6.5.8p2, 6.5.9p2), at the
+    /// operator, measured in gnu90, gnu17 and with `-pedantic`:
+    ///
+    /// * two pointers whose pointees are incompatible, ignoring the
+    ///   pointees' own qualifiers but not their signedness: "comparison of
+    ///   distinct pointer types lacks a cast" (`-Wcompare-distinct-pointer-
+    ///   types`). A `void *` side or a null pointer constant exempts
+    ///   equality; a relational operator exempts only a null pointer
+    ///   constant (`ip < v` warns, `fp < fp` is merely `-Wpedantic`);
+    /// * a pointer against an integer that is not a null pointer constant:
+    ///   "comparison between pointer and integer" (no option); an ordered
+    ///   comparison with a literal `0` is only `-Wpedantic`.
+    fn check_pointer_comparison(
+        &self,
+        op: BinOp,
+        (lhs, lt): (&Expr, &CType),
+        (rhs, rt): (&Expr, &CType),
+        span: Span,
+    ) {
+        let checker = self.expr_type_checker();
+        match (lt, rt) {
+            (CType::Pointer(a, a_space), CType::Pointer(b, b_space)) => {
+                if a_space != b_space
+                    || checker.is_null_pointer_constant(lhs)
+                    || checker.is_null_pointer_constant(rhs)
+                {
+                    return;
+                }
+                let (a_void, b_void) = (**a == CType::Void, **b == CType::Void);
+                let distinct = if a_void || b_void {
+                    !matches!(op, BinOp::Eq | BinOp::Ne) && a_void != b_void
+                } else {
+                    pointee_compat_at(a, b, false) == PtrCompat::Incompatible
+                };
+                if distinct {
+                    self.diagnostics.borrow_mut().warning_with_kind(
+                        "comparison of distinct pointer types lacks a cast".to_string(),
+                        span,
+                        crate::common::error::WarningKind::CompareDistinctPointerTypes,
+                    );
+                }
+            }
+            (CType::Pointer(..), int) | (int, CType::Pointer(..)) if int.is_integer() => {
+                let int_expr = if matches!(lt, CType::Pointer(..)) {
+                    rhs
+                } else {
+                    lhs
+                };
+                if !checker.is_null_pointer_constant(int_expr) {
+                    self.diagnostics
+                        .borrow_mut()
+                        .warning("comparison between pointer and integer", span);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn check_conditional_arms(&self, then_expr: &Expr, else_expr: &Expr, span: Span) {
+        // gcc-16.2 carets every verdict on the conditional at its `:`.
+        let span = self.conditional_colon_span(else_expr).unwrap_or(span);
         if let (Some(t), Some(e)) = (
             self.constraint_operand(then_expr),
             self.constraint_operand(else_expr),
         ) {
+            // A pointer arm against an arithmetic one (C23 6.5.15p3 allows
+            // only a null pointer constant): an integer is gcc's
+            // `-Wint-conversion` "pointer/integer type mismatch" (a default
+            // error from C99 on, a warning in gnu90), anything else -- a
+            // floating or complex arm -- a plain type mismatch (measured).
+            let arithmetic_arm = match (&t, &e) {
+                (CType::Pointer(..), other) if other.is_arithmetic() => Some((other, else_expr)),
+                (other, CType::Pointer(..)) if other.is_arithmetic() => Some((other, then_expr)),
+                _ => None,
+            };
+            if let Some((other, arm)) = arithmetic_arm {
+                if !other.is_integer() {
+                    self.constraint_error(
+                        Some("type mismatch in conditional expression".to_string()),
+                        span,
+                    );
+                } else if !self.expr_type_checker().is_null_pointer_constant(arm) {
+                    self.diagnostics.borrow_mut().warning_with_kind(
+                        "pointer/integer type mismatch in conditional expression".to_string(),
+                        span,
+                        crate::common::error::WarningKind::IntConversion,
+                    );
+                }
+                return;
+            }
             // Two pointer arms whose pointees are incompatible: GCC's
             // `-Wincompatible-pointer-types`, a default error from C99 on and
             // a warning in gnu90 (measured; Clang words it differently and
@@ -4616,6 +4842,18 @@ impl SemanticAnalyzer {
         let Some(from_ty) = self.constraint_operand(from) else {
             return false;
         };
+        // GCC 16.2's anchors for the conversion verdicts below (measured with
+        // `-Wint-conversion`, `-Wincompatible-pointer-types` and
+        // `-Wdiscarded-qualifiers` alike): an initialization points at the
+        // initializer's first token, an argument or a `return` at the
+        // operand's caret, and an assignment at its `=` (the caller's span).
+        let span = match ctx {
+            IConvContext::Initialization => self.initializer_start_span(from),
+            IConvContext::Argument { .. } | IConvContext::Returning => {
+                self.operand_caret_span(from)
+            }
+            IConvContext::Assignment => span,
+        };
         // GCC 16.2: an integer that is not a null-pointer constant used
         // where a pointer is expected (initialization, assignment, argument
         // passing, `return`) is `-Wint-conversion`, a default error from
@@ -4650,10 +4888,7 @@ impl SemanticAnalyzer {
             // argument passing keep the surrounding conversion
             // expression's span (which matches gcc's column in all
             // three probe contexts).
-            let ic_span = match ctx {
-                IConvContext::Returning => from.span(),
-                _ => span,
-            };
+            let ic_span = span;
             self.diagnostics.borrow_mut().warning_with_kind(
                 format!(
                     "{context} makes {} without a cast",
@@ -4728,16 +4963,42 @@ impl SemanticAnalyzer {
             };
             // Same measured column policy as the integer case: `return`
             // points at the returned value.
-            let ip_span = match ctx {
-                IConvContext::Returning => from.span(),
-                _ => span,
-            };
+            let ip_span = span;
             self.diagnostics.borrow_mut().warning_with_kind(
                 message,
                 ip_span,
                 crate::common::error::WarningKind::IncompatiblePointerTypes,
             );
             return true;
+        }
+        // C23 6.5.16.1p1: the target's pointee must have all the qualifiers of
+        // the source's. GCC 16.2 warns (`-Wdiscarded-qualifiers`, or
+        // `-Wdiscarded-array-qualifiers` for a pointer to an array) with the
+        // measured phrasings and columns below.
+        if space_ok {
+            if let Some((dropped, array)) = discarded_pointee_qualifiers(&from_ty, to) {
+                let quals = crate::common::types::cvr_spelling(dropped);
+                // Singular even for `'const volatile'` (measured).
+                let what = format!("discards '{quals}' qualifier from pointer target type");
+                let message = match ctx {
+                    IConvContext::Initialization => format!("initialization {what}"),
+                    IConvContext::Assignment => format!("assignment {what}"),
+                    IConvContext::Returning => format!("return {what}"),
+                    IConvContext::Argument { index, callee } => {
+                        format!("passing argument {} of '{}' {what}", index + 1, callee)
+                    }
+                };
+                let dq_span = span;
+                let kind = if array {
+                    crate::common::error::WarningKind::DiscardedArrayQualifiers
+                } else {
+                    crate::common::error::WarningKind::DiscardedQualifiers
+                };
+                self.diagnostics
+                    .borrow_mut()
+                    .warning_with_kind(message, dq_span, kind);
+                return true;
+            }
         }
         if !operand_constraints::involved(&from_ty) && !operand_constraints::involved(to) {
             return false;
@@ -4753,6 +5014,7 @@ impl SemanticAnalyzer {
         let operand = Operand {
             ty: &from_ty,
             null_constant,
+            bit_width: None,
         };
         // A `void` value is reported at the start of the operand itself
         // (`p[i]` on a `void *` is spelled `*(p + i)`, so it lands where `*p`
@@ -4816,7 +5078,7 @@ impl SemanticAnalyzer {
         {
             let layouts = self.result.type_context.borrow_struct_layouts();
             let ptr_size =
-                CType::Pointer(Box::new(CType::Void), AddressSpace::Default).size_ctx(&*layouts);
+                CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC).size_ctx(&*layouts);
             let to_size = to.size_ctx(&*layouts);
             drop(layouts);
             if to_size != ptr_size {
@@ -4840,8 +5102,7 @@ impl SemanticAnalyzer {
             && !self.is_integer_constant_expr(inner)
         {
             let layouts = self.result.type_context.borrow_struct_layouts();
-            let ptr_size =
-                CType::Pointer(Box::new(CType::Void), AddressSpace::Default).size_ctx(&*layouts);
+            let ptr_size = to.size_ctx(&*layouts);
             let from_size = from_ty.size_ctx(&*layouts);
             drop(layouts);
             if from_size != ptr_size {
@@ -4873,6 +5134,7 @@ impl SemanticAnalyzer {
         let operand = Operand {
             ty: &from_ty,
             null_constant,
+            bit_width: None,
         };
         let union_has_member = || match &to {
             CType::Union(key) => self
@@ -5634,15 +5896,39 @@ dereference it before applying '->' to it?"
             if transparent {
                 // GCC's member rule replaces the assignment constraints; an
                 // argument whose type is unknown gets no verdict, as below.
-                let accepted = checker.infer_expr_ctype(arg).is_none_or(|arg_ty| {
-                    let arg_ty = self.conversion_source_ctype(arg, arg_ty);
-                    self.transparent_union_accepts(arg, &arg_ty, param_ty)
-                });
-                if !accepted {
-                    self.diagnostics.borrow_mut().error(
-                        format!("incompatible type for argument {} of '{}'", index + 1, name),
-                        arg.span(),
-                    );
+                let verdict = match checker.infer_expr_ctype(arg) {
+                    Some(arg_ty) => {
+                        let arg_ty = self.conversion_source_ctype(arg, arg_ty);
+                        self.transparent_union_accepts(arg, &arg_ty, param_ty)
+                    }
+                    None => TransparentVerdict::Accepted,
+                };
+                match verdict {
+                    TransparentVerdict::Accepted => {}
+                    TransparentVerdict::Dropping(dropped, array) => {
+                        let quals = crate::common::types::cvr_spelling(dropped);
+                        let kind = if array {
+                            crate::common::error::WarningKind::DiscardedArrayQualifiers
+                        } else {
+                            crate::common::error::WarningKind::DiscardedQualifiers
+                        };
+                        self.diagnostics.borrow_mut().warning_with_kind(
+                            format!(
+                                "passing argument {} of '{}' discards '{quals}' qualifier \
+                                 from pointer target type",
+                                index + 1,
+                                name
+                            ),
+                            self.operand_caret_span(arg),
+                            kind,
+                        );
+                    }
+                    TransparentVerdict::Rejected => {
+                        self.diagnostics.borrow_mut().error(
+                            format!("incompatible type for argument {} of '{}'", index + 1, name),
+                            arg.span(),
+                        );
+                    }
                 }
                 continue;
             }
@@ -5766,25 +6052,40 @@ dereference it before applying '->' to it?"
     }
 
     /// Whether `arg` may be passed for a `transparent_union` parameter: it is
-    /// the union itself, or [`transparent_member_accepts`] one of its members.
-    fn transparent_union_accepts(&self, arg: &Expr, arg_ty: &CType, union_ty: &CType) -> bool {
+    /// the union itself, or [`transparent_member_accepts`] one of its
+    /// members. Like GCC's member loop, a member taking the argument without
+    /// a warning wins; otherwise the first member that only drops pointee
+    /// qualifiers is used, and the drop is reported (measured on gcc-16.2).
+    fn transparent_union_accepts(
+        &self,
+        arg: &Expr,
+        arg_ty: &CType,
+        union_ty: &CType,
+    ) -> TransparentVerdict {
         if arg_ty == union_ty {
-            return true;
+            return TransparentVerdict::Accepted;
         }
         let CType::Union(key) = union_ty else {
-            return false;
+            return TransparentVerdict::Rejected;
         };
         let null_constant = self.expr_type_checker().is_null_pointer_constant(arg);
-        self.result
-            .type_context
-            .borrow_struct_layouts()
-            .get(&**key)
-            .is_some_and(|layout| {
-                layout
-                    .fields
-                    .iter()
-                    .any(|m| transparent_member_accepts(&m.ty, arg_ty, null_constant))
-            })
+        let layouts = self.result.type_context.borrow_struct_layouts();
+        let Some(layout) = layouts.get(&**key) else {
+            return TransparentVerdict::Rejected;
+        };
+        let mut marginal = None;
+        for member in &layout.fields {
+            if !transparent_member_accepts(&member.ty, arg_ty, null_constant) {
+                continue;
+            }
+            match discarded_pointee_qualifiers(arg_ty, &member.ty) {
+                None => return TransparentVerdict::Accepted,
+                Some((dropped, array)) => {
+                    marginal.get_or_insert(TransparentVerdict::Dropping(dropped, array));
+                }
+            }
+        }
+        marginal.unwrap_or(TransparentVerdict::Rejected)
     }
 
     fn check_record_argument_compatibility(
@@ -6309,7 +6610,7 @@ dereference it before applying '->' to it?"
         // An array operand decays to a pointer to its element; a generic
         // array is a pointer into the default space.
         let decay = |ct: CType| match ct {
-            CType::Array(elem, _) => CType::Pointer(elem, AddressSpace::Default),
+            CType::Array(elem, _) => CType::Pointer(elem, PtrQuals::GENERIC),
             other => other,
         };
         let lt = decay(self.conversion_source_ctype(lhs, lt));
@@ -6350,7 +6651,7 @@ dereference it before applying '->' to it?"
             return;
         };
         let decay = |ct: CType| match ct {
-            CType::Array(elem, _) => CType::Pointer(elem, AddressSpace::Default),
+            CType::Array(elem, _) => CType::Pointer(elem, PtrQuals::GENERIC),
             other => other,
         };
         let tt = decay(self.conversion_source_ctype(then_expr, tt));
@@ -6380,10 +6681,10 @@ dereference it before applying '->' to it?"
             CType::Array(elem, _) => {
                 let space = self.array_expr_space(expr);
                 if space != AddressSpace::Default {
-                    return CType::Pointer(elem.clone(), space);
+                    return CType::Pointer(elem.clone(), PtrQuals::of(space));
                 }
             }
-            CType::Pointer(elem, AddressSpace::Default) => {
+            CType::Pointer(elem, quals) if quals.space == AddressSpace::Default => {
                 if let Expr::BinaryOp(BinOp::Add | BinOp::Sub, lhs, rhs, _) = expr {
                     for operand in [lhs, rhs] {
                         if self
@@ -6392,7 +6693,7 @@ dereference it before applying '->' to it?"
                         {
                             let space = self.array_expr_space(operand);
                             if space != AddressSpace::Default {
-                                return CType::Pointer(elem.clone(), space);
+                                return CType::Pointer(elem.clone(), PtrQuals::of(space));
                             }
                         }
                     }
@@ -6442,7 +6743,7 @@ dereference it before applying '->' to it?"
     fn element_space(&self, base: &Expr) -> AddressSpace {
         match self.expr_ctype(base) {
             Some(CType::Array(..)) => self.array_expr_space(base),
-            Some(CType::Pointer(_, space)) => space,
+            Some(CType::Pointer(_, quals)) => quals.space,
             _ => AddressSpace::Default,
         }
     }
@@ -6450,7 +6751,7 @@ dereference it before applying '->' to it?"
     /// The pointee space of a pointer-valued expression (the base of a `->`).
     fn pointee_space(&self, expr: &Expr) -> AddressSpace {
         match self.expr_ctype(expr) {
-            Some(CType::Pointer(_, space)) => space,
+            Some(CType::Pointer(_, quals)) => quals.space,
             _ => AddressSpace::Default,
         }
     }
@@ -6465,12 +6766,13 @@ dereference it before applying '->' to it?"
     /// Wording follows GCC's two directions.
     fn check_explicit_cast_address_space(&self, cast: &Expr, inner: &Expr, span: Span) {
         let checker = self.expr_type_checker();
-        let (Some(CType::Pointer(_, from_space)), Some(CType::Pointer(_, to_space))) = (
+        let (Some(CType::Pointer(_, from)), Some(CType::Pointer(_, to))) = (
             checker.infer_expr_ctype(inner),
             checker.infer_expr_ctype(cast),
         ) else {
             return;
         };
+        let (from_space, to_space) = (from.space, to.space);
         if from_space == to_space {
             return;
         }
@@ -7026,12 +7328,9 @@ dereference it before applying '->' to it?"
         fields
             .iter()
             .filter_map(|f| {
-                let ty = if f.derived.is_empty() {
-                    self.type_spec_to_ctype(&f.type_spec)
-                } else {
-                    // Delegate to shared build_full_ctype for correct inside-out type construction
-                    type_builder::build_full_ctype(self, &f.type_spec, &f.derived)
-                };
+                // The shared builder: inside-out construction plus the
+                // pointee qualifiers, also for a folded simple declarator.
+                let ty = self.field_ctype(f);
                 // A by-value record (including an array element) must be
                 // complete at this point. Pointers to incomplete records are
                 // legal and deliberately stop this walk. Do not install a
@@ -7129,6 +7428,7 @@ dereference it before applying '->' to it?"
                         quals.extend(type_builder::declarator_pointer_quals(&f.derived));
                         quals
                     },
+                    own_cvr: self.field_own_cvr(f),
                 })
             })
             .collect()
@@ -7141,12 +7441,7 @@ dereference it before applying '->' to it?"
     ) -> Option<CType> {
         for f in fields {
             if f.name.as_deref() == Some(target) {
-                let ty = if f.derived.is_empty() {
-                    self.type_spec_to_ctype(&f.type_spec)
-                } else {
-                    type_builder::build_full_ctype(self, &f.type_spec, &f.derived)
-                };
-                return Some(ty);
+                return Some(self.field_ctype(f));
             }
             if f.name.is_none() {
                 if let TypeSpecifier::Struct(_, Some(sub), ..)
@@ -7647,6 +7942,73 @@ dereference it before applying '->' to it?"
     /// gcc-16.2 points several operand diagnostics at the start of the whole
     /// operand. This walks the leftmost subexpression and keeps the smallest
     /// start, so `g()` and `p[i]` begin at `g` and `p`.
+    /// The first token of an initializer, `(` included: GCC anchors an
+    /// initialization's conversion verdicts there (`char *b = (cs);` points
+    /// at the `(`, `char *a = cs + 1;` at `cs`).
+    fn initializer_start_span(&self, expr: &Expr) -> Span {
+        let mut span = self.expr_start_span(expr);
+        let Some(sm) = self.diagnostics.borrow().share_source_manager() else {
+            return span;
+        };
+        let content = sm.get_content(span.file_id);
+        let bytes = content.as_bytes();
+        let mut probe = (span.start as usize).min(bytes.len());
+        while probe > 0 {
+            match bytes[probe - 1] {
+                b'(' => {
+                    probe -= 1;
+                    span.start = probe as u32;
+                }
+                byte if byte.is_ascii_whitespace() => probe -= 1,
+                _ => break,
+            }
+        }
+        span
+    }
+
+    /// GCC's caret for an operand: a conditional carets its `:` (measured
+    /// for `return`, arguments, `-Wint-conversion` and
+    /// `-Wdiscarded-qualifiers`); every other expression's span already is
+    /// its caret (a binary operator's span is the operator).
+    fn operand_caret_span(&self, expr: &Expr) -> Span {
+        let else_expr = match expr {
+            Expr::Conditional(_, _, else_expr, _) | Expr::GnuConditional(_, else_expr, _) => {
+                else_expr
+            }
+            _ => return expr.span(),
+        };
+        self.conditional_colon_span(else_expr)
+            .unwrap_or_else(|| expr.span())
+    }
+
+    /// The `:` of a conditional whose third operand is `else_expr`: GCC's
+    /// caret for the conditional itself (its type-mismatch verdicts and its
+    /// use as an operand). The AST keeps no `:` span, so this scans back
+    /// from the third operand over blanks and opening parentheses.
+    fn conditional_colon_span(&self, else_expr: &Expr) -> Option<Span> {
+        let start = self.expr_start_span(else_expr);
+        let sm = self.diagnostics.borrow().share_source_manager()?;
+        let content = sm.get_content(start.file_id);
+        let bytes = content.as_bytes();
+        let mut probe = (start.start as usize).min(bytes.len());
+        while probe > 0 {
+            probe -= 1;
+            match bytes[probe] {
+                b':' => {
+                    return Some(Span {
+                        start: probe as u32,
+                        end: probe as u32 + 1,
+                        file_id: start.file_id,
+                    });
+                }
+                b'(' => {}
+                byte if byte.is_ascii_whitespace() => {}
+                _ => return None,
+            }
+        }
+        None
+    }
+
     fn expr_start_span(&self, expr: &Expr) -> Span {
         let mut span = expr.span();
         let mut cursor = expr;
@@ -8653,11 +9015,7 @@ dereference it before applying '->' to it?"
                 );
                 continue;
             }
-            let field_ct = if f.derived.is_empty() {
-                self.type_spec_to_ctype(&f.type_spec)
-            } else {
-                type_builder::build_full_ctype(self, &f.type_spec, &f.derived)
-            };
+            let field_ct = self.field_ctype(f);
             let valid_target = matches!(field_ct, CType::Array(_, None))
                 || matches!(
                     field_ct,
@@ -8974,6 +9332,102 @@ dereference it before applying '->' to it?"
         quals
     }
 
+    /// A definition's return type, its pointer levels' qualifiers recorded
+    /// when the parser kept them (see `FunctionDef::return_star_cvr`).
+    fn function_def_return_ctype(&self, func: &FunctionDef) -> CType {
+        let mut ty = self.type_spec_to_ctype(&func.return_type);
+        if !func.return_star_cvr.is_empty() {
+            // The base under the stars and any arrays they point at
+            // (`const int (*f(void))[2]`), whose qualifiers an alias may add.
+            let mut leaf = &func.return_type;
+            while let TypeSpecifier::Pointer(inner, _) | TypeSpecifier::Array(inner, _) = leaf {
+                leaf = inner;
+            }
+            let base = self.specifier_cvr(leaf, func.return_base_cvr);
+            type_builder::record_pointer_quals(&mut ty, base, &func.return_star_cvr);
+        }
+        ty
+    }
+
+    /// A parameter's complete own qualifiers, for `&p`: its specifiers'
+    /// (`const int x`, an alias of a pointer type), a plain run of leading
+    /// stars' last one (`char *const p`), or an array parameter's first
+    /// `[...]` (`int a[const 2]`). `None` for an alias of an array or
+    /// function type, a function pointer and a parenthesised declarator.
+    fn param_object_cvr(&self, param: &ParamDecl, ty: &CType) -> Option<u8> {
+        use crate::common::type_builder::TypeConvertContext;
+        if param.fptr_params.is_some() || !param.paren_star_quals.is_empty() {
+            return None;
+        }
+        if param.decayed_array {
+            return Some(param.adjusted_cvr);
+        }
+        let depth = param.pointer_depth as usize;
+        if depth > 0 {
+            // A plain run of leading stars: the last one's own qualifiers.
+            return (param.pointer_quals.len() == depth && matches!(ty, CType::Pointer(..)))
+                .then(|| param.pointer_quals[depth - 1]);
+        }
+        // An alias of an array or function type is adjusted to a pointer
+        // whose own qualifiers are not the alias's (C23 6.7.6.3p7-8).
+        if matches!(
+            self.resolve_type_spec_to_ctype(&param.type_spec),
+            CType::Array(..) | CType::Function(..)
+        ) {
+            return None;
+        }
+        self.specifier_cvr(
+            &param.type_spec,
+            written_cvr(param.is_const, param.is_volatile, param.base_restrict),
+        )
+    }
+
+    /// The type of struct field `f` with a declarator, its pointer levels'
+    /// qualifiers recorded (see `type_builder::build_qualified_ctype`).
+    fn field_ctype(&self, f: &StructFieldDecl) -> CType {
+        let written = written_cvr(f.base_const, f.base_volatile, f.base_restrict);
+        let mut ty = type_builder::build_qualified_ctype(self, &f.type_spec, written, &f.derived);
+        if f.derived.is_empty() {
+            // A simple declarator was folded into the specifier (see
+            // `record_folded_spec_quals`); its base is the folded leaf.
+            let mut leaf = &f.type_spec;
+            while let TypeSpecifier::Pointer(inner, _) | TypeSpecifier::Array(inner, _) = leaf {
+                leaf = inner;
+            }
+            if !std::ptr::eq(leaf, &f.type_spec) {
+                type_builder::record_folded_spec_quals(
+                    &mut ty,
+                    &f.type_spec,
+                    self.specifier_cvr(leaf, written),
+                );
+            }
+        }
+        ty
+    }
+
+    /// A member's complete own qualifiers (see `StructField::own_cvr`), by the
+    /// rule of a variable's object record (`declarator_own_cvr`). The parser
+    /// folds a simple declarator into the specifier only when no star carries
+    /// a qualifier (`fold_simple_derived`), so a folded star's own bits are
+    /// exactly none.
+    fn field_own_cvr(&self, f: &StructFieldDecl) -> Option<u8> {
+        let written = written_cvr(f.base_const, f.base_volatile, f.base_restrict);
+        if !f.derived.is_empty() {
+            let ty = self.field_ctype(f);
+            return type_builder::declarator_own_cvr(&f.derived, &ty, || {
+                self.specifier_cvr(&f.type_spec, written)
+            });
+        }
+        let mut leaf = &f.type_spec;
+        while let TypeSpecifier::Array(inner, _) = leaf {
+            leaf = inner;
+        }
+        if matches!(leaf, TypeSpecifier::Pointer(..)) {
+            return Some(0);
+        }
+        self.specifier_cvr(leaf, written)
+    }
+
     fn decl_const_base(&self, type_spec: &TypeSpecifier, explicit: bool) -> bool {
         crate::common::qualifiers::type_name_const_base(
             type_spec,
@@ -9075,17 +9529,17 @@ dereference it before applying '->' to it?"
             ("getchar", CType::Int, false),
             (
                 "malloc",
-                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+                CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC),
                 false,
             ),
             (
                 "calloc",
-                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+                CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC),
                 false,
             ),
             (
                 "realloc",
-                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+                CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC),
                 false,
             ),
             ("free", CType::Void, false),
@@ -9093,17 +9547,17 @@ dereference it before applying '->' to it?"
             ("abort", CType::Void, false),
             (
                 "memcpy",
-                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+                CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC),
                 false,
             ),
             (
                 "memmove",
-                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+                CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC),
                 false,
             ),
             (
                 "memset",
-                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+                CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC),
                 false,
             ),
             ("memcmp", CType::Int, false),
@@ -9111,7 +9565,7 @@ dereference it before applying '->' to it?"
             ("strcmp", CType::Int, false),
             (
                 "strcpy",
-                CType::Pointer(Box::new(CType::Char), AddressSpace::Default),
+                CType::Pointer(Box::new(CType::Char), PtrQuals::GENERIC),
                 false,
             ),
             ("atoi", CType::Int, false),
@@ -9349,7 +9803,18 @@ pub(super) fn fold_to_type(
     }
 }
 
+/// The qualifiers written in a declaration's specifiers, as `PtrQuals` bits.
+fn written_cvr(is_const: bool, is_volatile: bool, is_restrict: bool) -> u8 {
+    u8::from(is_const) * PtrQuals::CONST
+        | u8::from(is_volatile) * PtrQuals::VOLATILE
+        | u8::from(is_restrict) * PtrQuals::RESTRICT
+}
+
 impl type_builder::TypeConvertContext for SemanticAnalyzer {
+    fn typedef_cvr(&self, name: &str) -> Option<u8> {
+        self.result.type_context.typedef_top_cvr(name)
+    }
+
     fn typeof_object_space(&self, expr: &Expr) -> AddressSpace {
         let checker = self.expr_type_checker();
         checker.lvalue_address_space(expr)
@@ -9691,11 +10156,51 @@ fn enum_matches_integer(a: &CType, b: &CType) -> bool {
     }
 }
 
+/// The qualifiers of `from`'s pointee that pointer type `to`'s pointee lacks,
+/// when both are recorded (see `PtrQuals`), and whether that pointee is an
+/// array (its elements carry them).
+fn discarded_pointee_qualifiers(from: &CType, to: &CType) -> Option<(u8, bool)> {
+    let (CType::Pointer(from_inner, from_quals), CType::Pointer(_, to_quals)) = (from, to) else {
+        return None;
+    };
+    let dropped = from_quals.cvr()? & !to_quals.cvr()?;
+    (dropped != 0).then(|| (dropped, matches!(**from_inner, CType::Array(..))))
+}
+
+/// Whether two pointed-to types differ in a qualifier both sides recorded at
+/// some pointer level (see `PtrQuals`). Compatible types are identically
+/// qualified (C23 6.2.7, 6.7.3p11): `char **` and `const char **` point at
+/// different types, and so do `void **` and `const void **`. `CType` equality
+/// ignores the qualifiers, so this runs before any shortcut on it.
+fn recorded_quals_differ(from: &CType, to: &CType) -> bool {
+    match (from, to) {
+        (CType::Pointer(a, a_quals), CType::Pointer(b, b_quals)) => {
+            matches!((a_quals.cvr(), b_quals.cvr()), (Some(x), Some(y)) if x != y)
+                || recorded_quals_differ(a, b)
+        }
+        (CType::Array(a, _), CType::Array(b, _)) => recorded_quals_differ(a, b),
+        _ => false,
+    }
+}
+
 fn pointee_compat(from: &CType, to: &CType) -> PtrCompat {
+    pointee_compat_at(from, to, true)
+}
+
+/// [`pointee_compat`]; `sign_lenient` admits a pointee differing only in
+/// signedness (`-Wpointer-sign`, not a constraint violation). It holds for
+/// the pointee of an assignment only: below it the types must be compatible
+/// (gcc-16.2 rejects `int **` to `unsigned **`, `char **` to `unsigned char
+/// **` and `int (*)[3]` to `unsigned (*)[3]`), and a comparison admits no
+/// sign difference at all (`int *` == `unsigned *` is distinct).
+fn pointee_compat_at(from: &CType, to: &CType, sign_lenient: bool) -> PtrCompat {
+    if recorded_quals_differ(from, to) {
+        return PtrCompat::Incompatible;
+    }
     if from == to {
         return PtrCompat::Compatible;
     }
-    if same_scalar_modulo_sign(from, to) {
+    if sign_lenient && same_scalar_modulo_sign(from, to) {
         return PtrCompat::Compatible;
     }
     if enum_matches_integer(from, to) {
@@ -9713,7 +10218,7 @@ fn pointee_compat(from: &CType, to: &CType) -> PtrCompat {
                     if a_space != b_space {
                         PtrCompat::Incompatible
                     } else {
-                        pointee_compat(a, b)
+                        pointee_compat_at(a, b, false)
                     }
                 }
             }
@@ -9723,7 +10228,7 @@ fn pointee_compat(from: &CType, to: &CType) -> PtrCompat {
             // differ are different types.
             match (a_len, b_len) {
                 (Some(x), Some(y)) if x != y => PtrCompat::Incompatible,
-                _ => pointee_compat(a, b),
+                _ => pointee_compat_at(a, b, false),
             }
         }
         (CType::Function(a), CType::Function(b)) => {
@@ -9827,6 +10332,16 @@ fn pointer_argument_compat(from: &CType, to: &CType) -> PtrCompat {
     }
 }
 
+/// [`SemanticAnalyzer::transparent_union_accepts`]'s verdict.
+#[derive(Clone, Copy)]
+enum TransparentVerdict {
+    Accepted,
+    /// Accepted by a member whose pointee lacks these qualifiers of the
+    /// argument's (and whether that pointee is an array).
+    Dropping(u8, bool),
+    Rejected,
+}
+
 /// One member of a `transparent_union` against an argument type (after
 /// array/function decay), as GCC's `convert_for_assignment` member loop
 /// decides it -- each rule measured on GCC 16.2, c17 and c23 alike:
@@ -9838,13 +10353,16 @@ fn pointer_argument_compat(from: &CType, to: &CType) -> PtrCompat {
 /// * a pointer member: a pointer argument with a compatible target or a
 ///   `void` target on either side -- but NOT a target differing only in
 ///   signedness (`char *` for `unsigned char *`, which an ordinary argument
-///   only warns about) -- or a null pointer constant. Dropped qualifiers
-///   are a warning there and CType carries none, so they cannot reject.
+///   only warns about) -- or a null pointer constant. Dropped pointee
+///   qualifiers are a warning there (reported by the caller), so they never
+///   reject; a qualifier difference below the pointee does.
 ///
 /// `PtrCompat::Unknown` (an unresolved pointee) accepts: a false rejection
 /// breaks a valid program, a miss only loses a diagnostic.
 fn transparent_member_accepts(member: &CType, arg: &CType, null_constant: bool) -> bool {
-    if member == arg {
+    // `CType` equality ignores qualifiers: `const char **` is not a
+    // `char **` member (the pointer rule below rejects it).
+    if member == arg && !recorded_quals_differ(arg, member) {
         return true;
     }
     match (member, arg) {
@@ -9884,8 +10402,8 @@ fn first_space_mismatch(from: &CType, to: &CType) -> Option<SpaceMismatch> {
                 if fs != ts {
                     Some(SpaceMismatch {
                         depth,
-                        from_space: *fs,
-                        to_space: *ts,
+                        from_space: fs.space,
+                        to_space: ts.space,
                     })
                 } else {
                     walk(f, t, depth + 1)
@@ -9925,6 +10443,7 @@ mod record_layouts_correspond_tests {
 
     fn field(name: &str, ty: CType, offset: usize) -> StructFieldLayout {
         StructFieldLayout {
+            own_cvr: None,
             name: name.to_string(),
             ty,
             offset,
@@ -10069,7 +10588,7 @@ mod pointer_argument_compat_tests {
         PtrCompat, function_types_compatible, pointee_compat, pointer_argument_compat,
         transparent_member_accepts,
     };
-    use crate::common::types::{AddressSpace, CType, EnumType, FunctionType};
+    use crate::common::types::{AddressSpace, CType, EnumType, FunctionType, PtrQuals};
     use std::rc::Rc;
 
     /// GCC 16.2's transparent_union member rule, row by row
@@ -10137,10 +10656,10 @@ mod pointer_argument_compat_tests {
     }
 
     fn ptr(t: CType) -> CType {
-        CType::Pointer(Box::new(t), AddressSpace::Default)
+        CType::Pointer(Box::new(t), PtrQuals::GENERIC)
     }
     fn segfs(t: CType) -> CType {
-        CType::Pointer(Box::new(t), AddressSpace::SegFs)
+        CType::Pointer(Box::new(t), PtrQuals::of(AddressSpace::SegFs))
     }
     fn arr(t: CType, n: Option<usize>) -> CType {
         CType::Array(Box::new(t), n)
@@ -10457,8 +10976,8 @@ mod pointer_argument_compat_tests {
         // ... and the full argument check follows from that.
         assert_eq!(
             pointer_argument_compat(
-                &CType::Pointer(Box::new(pg_level.clone()), AddressSpace::Default),
-                &CType::Pointer(Box::new(CType::UInt), AddressSpace::Default)
+                &CType::Pointer(Box::new(pg_level.clone()), PtrQuals::GENERIC),
+                &CType::Pointer(Box::new(CType::UInt), PtrQuals::GENERIC)
             ),
             PtrCompat::Compatible
         );
