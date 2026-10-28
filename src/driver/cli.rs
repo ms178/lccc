@@ -1850,34 +1850,45 @@ impl Driver {
         let mut in_single_quote = false;
         let mut in_double_quote = false;
         let mut escape = false;
+        // `""` and `''` are real empty arguments in GCC response files.
+        // Dropping one shifts every later operand: `-I "" --sysroot=...`
+        // would otherwise swallow the sysroot as -I's value, bypassing the
+        // fail-closed pre-scan and silently exposing host headers.
+        let mut started = false;
 
         for ch in contents.chars() {
             if escape {
                 current.push(ch);
                 escape = false;
+                started = true;
                 continue;
             }
             match ch {
                 '\\' if !in_single_quote => {
                     escape = true;
+                    started = true;
                 }
                 '\'' if !in_double_quote => {
                     in_single_quote = !in_single_quote;
+                    started = true;
                 }
                 '"' if !in_single_quote => {
                     in_double_quote = !in_double_quote;
+                    started = true;
                 }
                 c if c.is_ascii_whitespace() && !in_single_quote && !in_double_quote => {
-                    if !current.is_empty() {
+                    if started {
                         tokens.push(std::mem::take(&mut current));
+                        started = false;
                     }
                 }
                 _ => {
                     current.push(ch);
+                    started = true;
                 }
             }
         }
-        if !current.is_empty() {
+        if started {
             tokens.push(current);
         }
         tokens
@@ -3953,6 +3964,28 @@ mod cli_tests {
     use crate::backend::Target;
     use crate::common::fp_contract::FpContract;
     use crate::driver::pipeline::Driver;
+
+    #[test]
+    fn response_file_empty_quoted_operands_are_preserved() {
+        let actual = Driver::split_response_file(
+            r#"-I '' -o "" "two words" 'three words' escaped\ space a""b"#,
+        );
+        assert_eq!(
+            actual,
+            [
+                "-I",
+                "",
+                "-o",
+                "",
+                "two words",
+                "three words",
+                "escaped space",
+                "ab"
+            ]
+        );
+        assert_eq!(Driver::split_response_file("-o \""), ["-o", ""]);
+        assert_eq!(Driver::split_response_file("-o \\"), ["-o", ""]);
+    }
 
     /// Parse one flag against a fresh Driver, returning the error text if any.
     fn try_flag(flag: &str) -> Result<(), String> {

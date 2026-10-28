@@ -411,6 +411,7 @@ impl Parser {
             }
             n += 1;
         }
+        st.base_const = const_before_star;
         if (stars == 0 && const_before_star) || (stars > 0 && const_after_last_star) {
             st.is_const = true;
         }

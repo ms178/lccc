@@ -22,7 +22,7 @@ On those bounded tests, **8 of 24 items are partial, 16 remain open, and none
 is certified complete**. A passing sentinel is not an acceptance suite.
 
 * GP-01: 127 GCC-known names, 83 inventoried as unimplemented, 48 implemented
-  names including four non-GCC Clang extensions; 33 attribute probes and two
+  names including four non-GCC Clang extensions; 40 attribute probes and two
   glibc headers at four optimization levels pass. This inventory does not
   implement the 83 names; function-typedef attribute diagnostics remain open.
 * GP-02/03/04: `ms_abi`, frontend `retain`, and x86 `interrupt` remain
@@ -43,8 +43,12 @@ is certified complete**. A passing sentinel is not an acceptance suite.
   "line-only" description below no longer describes current output.
 * GP-24: seven derived kernels have bounded compiler comparisons; zlib-ng
   2.3.3 static Make `alltests` passed under GCC and LCCC, as did 48
-  cross-compiler roundtrips and 24 gzip decodes. CMake/CTest, the remaining
-  workload matrix and target-hardware performance results remain unverified.
+  cross-compiler roundtrips and 24 gzip decodes. A manually configured upstream
+  Expat 2.9.0 suite passed 5,196 checks with GCC, Clang and LCCC libraries and
+  an LCCC-compiled runner. The bounded Expat benchmark observed LCCC/GCC median
+  CPU-time ratio 1.3161 [1.3077, 1.3206] on this virtualized Xeon, not a
+  speedup. Expat configure/CMake/CTest, other workload configurations and
+  target-hardware performance remain unverified.
 
 The current sentinel's raw local evidence is in
 `~/.cache/lccc/gp-sentinel-audit.{py,json,txt}`; checked-in regression scripts

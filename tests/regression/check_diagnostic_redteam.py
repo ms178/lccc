@@ -122,6 +122,43 @@ CASES = [
     ('typedef_const_array', 'typedef const int CI;void f(void){CI a[1]={0};*a=1;}', True, None),
     ('typedef_star_object', 'typedef int *const PC;void f(void){PC q=0;q=0;}', True, None),
     ('typedef_pointee_writable', 'typedef const int *IP;void f(void){IP p=0;p=0;}', False, None),
+    # `const` on a pointer typedef qualifies the pointer itself, not its
+    # pointee (Expat 2.9.0's `const XML_Parser rootParser` is one real use).
+    # Also retain the aliased level when a later star creates a pointer to it.
+    ('typedef_qual_parameter_base', 'typedef int *P;void f(const P p){*p=1;}', False, None),
+    ('typedef_qual_parameter_object', 'typedef int *P;void f(const P p){p=0;}', True, None),
+    ('typedef_qual_middle_base', 'typedef int *P;void f(const P *p){**p=1;}', False, None),
+    ('typedef_qual_middle_object', 'typedef int *P;void f(const P *p){*p=0;}', True, None),
+    ('typedef_qual_chain_base', 'typedef int *P;typedef const P CP;void f(CP p){*p=1;}', False, None),
+    ('typedef_qual_chain_middle', 'typedef int *P;typedef const P CP;void f(CP *p){*p=0;}', True, None),
+    ('typedef_qual_derived_chain', 'typedef int *P;typedef const P *Q;void f(Q p){*p=0;}', True, None),
+    ('typedef_qual_struct_base', 'struct S{int x;};typedef struct S *P;void f(const P p){p->x=1;}', False, None),
+    ('typedef_qual_nested_base', 'struct A{int x;};struct S{struct A a;};typedef struct S *P;void f(const P p){p->a.x=1;}', False, None),
+    ('typedef_qual_field_base', 'typedef int *P;struct S{const P p;};void f(struct S*s){*s->p=1;}', False, None),
+    ('typedef_qual_field_object', 'typedef int *P;struct S{const P p;};void f(struct S*s){s->p=0;}', True, None),
+    ('typedef_qual_field_middle', 'typedef int *P;struct S{const P *p;};void f(struct S*s){*s->p=0;}', True, None),
+    ('typedef_qual_field_middle_base', 'typedef int *P;struct S{const P *p;};void f(struct S*s){**s->p=1;}', False, None),
+    ('typedef_qual_cast_base', 'typedef int *P;void f(int*q){*(const P)q=1;}', False, None),
+    ('typedef_qual_cast_middle', 'typedef int *P;void f(int**q){*(const P *)q=0;}', True, None),
+    ('typedef_qual_cast_middle_base', 'typedef int *P;void f(int**q){**(const P *)q=1;}', False, None),
+    ('typedef_qual_literal_middle', 'typedef int *P;void f(void){*(const P *){0}=0;}', True, None),
+    ('typedef_qual_literal_base', 'typedef int *P;void f(void){**(const P *){0}=1;}', False, None),
+    ('typedef_qual_pointer_to_array', 'typedef int *(*P)[2];void f(const P *p){*p=0;}', True, None),
+    ('typedef_qual_pointer_to_array_base', 'typedef int *(*P)[2];void f(const P p){p[0][0]=0;}', False, None),
+    ('typedef_qual_return_middle', 'typedef int *P;const P *g(void);void f(void){*g()=0;}', True, None),
+    ('typedef_qual_return_base', 'typedef int *P;const P *g(void);void f(void){**g()=1;}', False, None),
+    ('typedef_qual_array_base', 'typedef int *A[2];void f(void){int x;const A a={&x};*a[0]=1;}', False, None),
+    ('typedef_qual_array_element', 'typedef int *A[2];void f(void){int x;const A a={&x};a[0]=0;}', True, None),
+    ('typedef_qual_double_middle', 'typedef int **P;void f(const P *p){*p=0;}', True, None),
+    ('typedef_qual_double_inner', 'typedef int **P;void f(const P *p){**p=0;}', False, None),
+    # An unqualified aliased pointer still occupies a level when a later
+    # declarator supplies its own qualifiers.
+    ('typedef_unqualified_level_padding', 'typedef int *P;void f(P *const *p){*p=0;}', True, None),
+    ('typedef_unqualified_level_base', 'typedef int *P;void f(P *const *p){**p=0;}', False, None),
+    ('typedef_const_field_alias', 'typedef int *P;typedef const P CP;struct S{CP p;};void f(struct S*s){s->p=0;}', True, None),
+    ('typedef_const_field_alias_base', 'typedef int *P;typedef const P CP;struct S{CP p;};void f(struct S*s){*s->p=0;}', False, None),
+    ('typedef_const_field_alias_star', 'typedef int *P;typedef const P CP;struct S{CP *p;};void f(struct S*s){s->p=0;}', False, None),
+    ('typedef_const_field_alias_array', 'typedef int *P;typedef const P CP;struct S{CP *p[2];};void f(struct S*s){s->p[0]=0;}', False, None),
     # Array transparency in the read-only walk: dims, stars and the
     # element type decide the level (measured against GCC 16.2).
     ('multidim_array_deref', 'void f(void){const int a[1][1]={{0}};**a=1;}', True, None),

@@ -62,6 +62,13 @@ impl qualifiers::ConstLookup for ExprTypeChecker<'_> {
         self.types.const_base_typedefs.contains(name)
     }
 
+    fn typedef_const_pointer_level(&self, name: &str) -> Option<usize> {
+        self.types
+            .typedefs
+            .get(name)
+            .and_then(qualifiers::typedef_const_pointer_level)
+    }
+
     fn is_pointer(&self, expr: &Expr) -> bool {
         matches!(
             self.infer_expr_ctype(expr),
@@ -1281,7 +1288,7 @@ impl<'a> ExprTypeChecker<'a> {
                     type_align,
                     is_packed: f.is_packed,
                     base_volatile: f.base_volatile,
-                    base_const: f.base_const,
+                    base_const: qualifiers::type_name_const_base(&f.type_spec, f.base_const, self),
                     object_volatile: f.object_volatile,
                     object_const: f.object_const,
                     counted_by: f.counted_by.clone(),

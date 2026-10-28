@@ -21,6 +21,9 @@ pub trait ConstLookup {
     fn object_const_base(&self, name: &str) -> bool;
     /// Base constness of the typedef `name`.
     fn typedef_const_base(&self, name: &str) -> bool;
+    /// The pointer level qualified by `const name`, if `name` denotes a
+    /// pointer or an array of pointers. Levels are zero-based, from the base.
+    fn typedef_const_pointer_level(&self, name: &str) -> Option<usize>;
     /// Whether `expr` has pointer or array type.
     fn is_pointer(&self, expr: &Expr) -> bool;
     /// Resolve the selected association expression of a `_Generic` selection.
@@ -47,17 +50,48 @@ pub trait ConstLookup {
 /// `const` when `explicit` is set (`const int *`), or that inherits one from a
 /// typedef (`typedef const int CI; CI *`) or a `typeof` operand.
 pub fn type_name_const_base(ts: &TypeSpecifier, explicit: bool, lookup: &impl ConstLookup) -> bool {
-    explicit
-        || match base_specifier(ts) {
-            TypeSpecifier::TypedefName(name) => lookup.typedef_const_base(name),
-            // `typeof` keeps every qualifier; `typeof_unqual` drops only the
-            // top-level one, which is the base one unless it is a pointer.
-            TypeSpecifier::Typeof(expr, unqual) => {
-                (!unqual || lookup.is_pointer(expr)) && expr_const_base(expr, lookup)
-            }
-            TypeSpecifier::TypeofType(inner) => type_name_const_base(inner, false, lookup),
-            _ => false,
+    match base_specifier(ts) {
+        // Qualifying a pointer typedef qualifies the pointer, not its target:
+        // `typedef int *P; const P p` is `int *const p`. A typedef can already
+        // carry a const pointee independently (`typedef const int *P`).
+        TypeSpecifier::TypedefName(name) => {
+            lookup.typedef_const_base(name)
+                || (explicit && lookup.typedef_const_pointer_level(name).is_none())
         }
+        // `typeof` keeps every qualifier; `typeof_unqual` drops only the
+        // top-level one, which is the base one unless it is a pointer.
+        TypeSpecifier::Typeof(expr, unqual) => {
+            explicit || ((!unqual || lookup.is_pointer(expr)) && expr_const_base(expr, lookup))
+        }
+        TypeSpecifier::TypeofType(inner) => explicit || type_name_const_base(inner, false, lookup),
+        _ => explicit,
+    }
+}
+
+/// For a typedef, return the zero-based pointer level qualified by `const T`.
+/// Arrays are transparent to qualification: `const A` for `typedef int *A[2]`
+/// has const pointer elements. Count inner pointers too so that the outermost
+/// pointer's index is measured from the innermost base, as in the CVR vectors.
+pub fn typedef_const_pointer_level(ty: &crate::common::types::CType) -> Option<usize> {
+    use crate::common::types::CType;
+    let mut ty = ty;
+    while let CType::Array(inner, _) = ty {
+        ty = inner;
+    }
+    if !matches!(ty, CType::Pointer(..)) {
+        return None;
+    }
+    let mut pointers = 0;
+    loop {
+        match ty {
+            CType::Pointer(inner, _) => {
+                pointers += 1;
+                ty = inner;
+            }
+            CType::Array(inner, _) => ty = inner,
+            _ => return Some(pointers - 1),
+        }
+    }
 }
 
 /// The specifier `ts` is derived from.
@@ -102,7 +136,7 @@ pub fn expr_const_base(expr: &Expr, lookup: &impl ConstLookup) -> bool {
         }
         Expr::Cast(ts, _, _, qualifiers) => type_name_const_base(ts, qualifiers.base_const, lookup),
         Expr::CompoundLiteral(ts, _, _, st) => {
-            type_name_const_base(ts, st.is_const || st.is_constexpr, lookup)
+            type_name_const_base(ts, st.base_const || st.is_constexpr, lookup)
         }
         Expr::GenericSelection(controlling, associations, _) => lookup
             .select_generic(controlling, associations)
