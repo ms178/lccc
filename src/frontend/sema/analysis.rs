@@ -2445,7 +2445,7 @@ impl SemanticAnalyzer {
             }
             TypeSpecifier::Array(inner, _)
             | TypeSpecifier::Pointer(inner, _)
-            | TypeSpecifier::TypeofType(inner)
+            | TypeSpecifier::TypeofType(inner, _)
             | TypeSpecifier::Vector(inner, _)
             | TypeSpecifier::ExtVector(inner, _) => {
                 self.collect_enum_constants_from_type_spec(inner, span);
@@ -6909,7 +6909,7 @@ dereference it before applying '->' to it?"
             // Pointers to incomplete types are fine - sizeof gives pointer size
             TypeSpecifier::Pointer(_, _) => {}
             // Arrays and typeof(type) delegate to their inner type
-            TypeSpecifier::Array(elem, _) | TypeSpecifier::TypeofType(elem) => {
+            TypeSpecifier::Array(elem, _) | TypeSpecifier::TypeofType(elem, _) => {
                 self.check_sizeof_incomplete_type(elem, span, operator);
             }
             TypeSpecifier::Typeof(expr, _) => {
