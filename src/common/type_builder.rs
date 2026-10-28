@@ -236,7 +236,7 @@ pub trait TypeConvertContext {
                     has_prototype: *has_prototype,
                 }))
             }
-            TypeSpecifier::TypeofType(inner) => self.resolve_type_spec_to_ctype(inner),
+            TypeSpecifier::TypeofType(inner, _) => self.resolve_type_spec_to_ctype(inner),
             TypeSpecifier::AutoType => CType::Int,
             TypeSpecifier::NullPtrT => CType::NullPtr,
 
@@ -1197,7 +1197,7 @@ pub fn named_space_qualifies_whole_type(
 ) -> bool {
     let typedef_base = matches!(
         type_spec,
-        TypeSpecifier::TypedefName(_) | TypeSpecifier::Typeof(..) | TypeSpecifier::TypeofType(_)
+        TypeSpecifier::TypedefName(_) | TypeSpecifier::Typeof(..) | TypeSpecifier::TypeofType(..)
     );
     typedef_base
         && !derived.iter().any(|d| {

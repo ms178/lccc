@@ -16,7 +16,7 @@ impl Lowerer {
     pub(super) fn resolve_type_spec<'a>(&'a self, ts: &'a TypeSpecifier) -> &'a TypeSpecifier {
         let mut current = ts;
         for _ in 0..32 {
-            if let TypeSpecifier::TypeofType(inner) = current {
+            if let TypeSpecifier::TypeofType(inner, _) = current {
                 current = inner;
                 continue;
             }
@@ -31,7 +31,7 @@ impl Lowerer {
     fn resolve_typedef_ctype(&self, ts: &TypeSpecifier) -> Option<CType> {
         match ts {
             TypeSpecifier::TypedefName(name) => self.types.typedefs.get(name).cloned(),
-            TypeSpecifier::TypeofType(inner) => self.resolve_typedef_ctype(inner),
+            TypeSpecifier::TypeofType(inner, _) => self.resolve_typedef_ctype(inner),
             TypeSpecifier::Typeof(expr, _) => self.get_expr_ctype(expr),
             _ => None,
         }
@@ -122,7 +122,7 @@ impl Lowerer {
                     TypeSpecifier::Int // fallback
                 }
             }
-            TypeSpecifier::TypeofType(inner) => self.resolve_typeof(inner),
+            TypeSpecifier::TypeofType(inner, _) => self.resolve_typeof(inner),
             TypeSpecifier::TypedefName(name) => {
                 // Typedefs now store CType. Convert back to TypeSpecifier for
                 // code that still needs a TypeSpecifier (e.g., typeof resolution).
@@ -262,7 +262,7 @@ impl Lowerer {
                     IrType::I64
                 }
             }
-            TypeSpecifier::TypeofType(inner) => self.type_spec_to_ir(inner),
+            TypeSpecifier::TypeofType(inner, _) => self.type_spec_to_ir(inner),
             TypeSpecifier::FunctionPointer(..) => IrType::Ptr, // function pointer is a pointer
             TypeSpecifier::BareFunction(..) => IrType::Ptr, // bare function type decays to pointer
             // AutoType should be resolved before reaching here (in lower_local_decl)
@@ -500,7 +500,7 @@ impl Lowerer {
             return crate::common::types::target_ptr_size(); // fallback
         }
         // Handle typeof(type-name) by recursing on the inner type specifier
-        if let TypeSpecifier::TypeofType(inner) = ts {
+        if let TypeSpecifier::TypeofType(inner, _) = ts {
             return self.sizeof_type(inner);
         }
         // vector_size carries its explicit byte width; ext_vector_type uses
@@ -554,7 +554,7 @@ impl Lowerer {
             return crate::common::types::target_ptr_size(); // fallback
         }
         // Handle typeof(type-name) by recursing on the inner type specifier
-        if let TypeSpecifier::TypeofType(inner) = ts {
+        if let TypeSpecifier::TypeofType(inner, _) = ts {
             return self.alignof_type(inner);
         }
         // Vectors: GCC TYPE_ALIGN (full size on x86 — drives struct layout,
@@ -628,7 +628,7 @@ impl Lowerer {
             }
             return target_ptr_size();
         }
-        if let TypeSpecifier::TypeofType(inner) = ts {
+        if let TypeSpecifier::TypeofType(inner, _) = ts {
             return self.preferred_alignof_type(inner);
         }
         if matches!(

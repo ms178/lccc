@@ -26,6 +26,12 @@ pub trait ConstLookup {
     fn typedef_const_pointer_level(&self, name: &str) -> Option<usize>;
     /// Whether `expr` has pointer or array type.
     fn is_pointer(&self, expr: &Expr) -> bool;
+    /// Pointer level that a `const` on this expression's type would qualify.
+    /// Arrays are transparent, so an array of pointers has a level but an
+    /// array of integers does not.
+    fn expr_const_pointer_level(&self, expr: &Expr) -> Option<usize>;
+    /// The same level for a type name, including typedef and typeof operands.
+    fn type_const_pointer_level(&self, ts: &TypeSpecifier) -> Option<usize>;
     /// Resolve the selected association expression of a `_Generic` selection.
     fn select_generic<'a>(
         &self,
@@ -58,12 +64,21 @@ pub fn type_name_const_base(ts: &TypeSpecifier, explicit: bool, lookup: &impl Co
             lookup.typedef_const_base(name)
                 || (explicit && lookup.typedef_const_pointer_level(name).is_none())
         }
-        // `typeof` keeps every qualifier; `typeof_unqual` drops only the
-        // top-level one, which is the base one unless it is a pointer.
+        // `const typeof(pointer)` qualifies that pointer, just like a pointer
+        // typedef, not its pointee. For `typeof_unqual`, only the type's own
+        // qualifier is removed; a pointer's pointee remains unchanged. Arrays
+        // of pointers qualify their elements, while arrays of scalars retain
+        // the scalar-base rule.
         TypeSpecifier::Typeof(expr, unqual) => {
-            explicit || ((!unqual || lookup.is_pointer(expr)) && expr_const_base(expr, lookup))
+            let pointer = lookup.expr_const_pointer_level(expr).is_some();
+            (explicit && !pointer) || ((!unqual || pointer) && expr_const_base(expr, lookup))
         }
-        TypeSpecifier::TypeofType(inner) => explicit || type_name_const_base(inner, false, lookup),
+        TypeSpecifier::TypeofType(inner, quals) => {
+            let pointer = lookup.type_const_pointer_level(inner).is_some();
+            (explicit && !pointer)
+                || ((!quals.unqual || pointer)
+                    && type_name_const_base(inner, quals.base_const, lookup))
+        }
         _ => explicit,
     }
 }

@@ -1637,7 +1637,7 @@ impl<'a> SemaConstEval<'a> {
                     Some(8) // fallback
                 }
             }
-            TypeSpecifier::TypeofType(inner) => self.sizeof_type_spec(inner),
+            TypeSpecifier::TypeofType(inner, _) => self.sizeof_type_spec(inner),
             TypeSpecifier::Typeof(expr, _) => {
                 let ctype = self.infer_expr_ctype(expr)?;
                 Some(ctype.size_ctx(&*self.types.borrow_struct_layouts()))
@@ -1878,7 +1878,7 @@ impl<'a> SemaConstEval<'a> {
                     crate::common::types::target_ptr_size()
                 }
             }
-            TypeSpecifier::TypeofType(inner) => self.alignof_type_spec(inner),
+            TypeSpecifier::TypeofType(inner, _) => self.alignof_type_spec(inner),
             TypeSpecifier::Typeof(expr, _) => {
                 if let Some(ctype) = self.infer_expr_ctype(expr) {
                     ctype.align_ctx(&*self.types.borrow_struct_layouts())
@@ -1927,7 +1927,7 @@ impl<'a> SemaConstEval<'a> {
                     target_ptr_size()
                 }
             }
-            TypeSpecifier::TypeofType(inner) => self.preferred_alignof_type_spec(inner),
+            TypeSpecifier::TypeofType(inner, _) => self.preferred_alignof_type_spec(inner),
             // An 8-byte enum prefers 8 like `long long` (GCC `__alignof__`, -m32).
             TypeSpecifier::Enum(name, variants, is_packed, underlying) => CType::Enum(
                 self.resolve_enum_type(name, variants, *is_packed, underlying.as_deref()),

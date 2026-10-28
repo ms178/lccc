@@ -6,7 +6,7 @@
 // and resolve them at the end.
 
 use super::ast::*;
-use super::parse::{ModeKind, Parser};
+use super::parse::{ModeKind, Parser, parsed_attr_flag};
 use crate::common::source::Span;
 use crate::common::types::AddressSpace;
 use crate::frontend::lexer::token::TokenKind;
@@ -833,7 +833,7 @@ impl Parser {
             TypeSpecifier::Enum(..) => true,
             TypeSpecifier::Pointer(inner, _) => Self::type_spec_has_enum_tag(inner),
             TypeSpecifier::Array(inner, _) => Self::type_spec_has_enum_tag(inner),
-            TypeSpecifier::TypeofType(inner) => Self::type_spec_has_enum_tag(inner),
+            TypeSpecifier::TypeofType(inner, _) => Self::type_spec_has_enum_tag(inner),
             // A record with an enum field inherits the range-dependence: the
             // field's alignment is the completed enum's alignment.
             TypeSpecifier::Struct(_, Some(fields), ..)
@@ -1038,11 +1038,25 @@ impl Parser {
         // it returns, so the backtrack path below also sees the enclosing
         // state again.
         if self.is_type_specifier() {
-            if let Some(result_type) = self.parse_nested_type_name() {
+            // The argument is a separate type name. In particular, an outer
+            // `const typeof(int *)` qualifies the pointer; it is not a
+            // `const` written on the argument's base `int`. Preserve the
+            // argument's own base and pointer-level qualifiers before the
+            // enclosing parser state is restored.
+            self.attrs.flags &= !(parsed_attr_flag::CONST | parsed_attr_flag::POINTER_CONST);
+            if let Some((result_type, pointer_quals)) = self.parse_nested_type_name_with_quals() {
                 if matches!(self.peek(), TokenKind::RParen) {
+                    let base_const = self.attrs.parsing_const();
                     self.advance();
                     self.attrs.flags = saved_flags;
-                    return TypeSpecifier::TypeofType(Box::new(result_type));
+                    return TypeSpecifier::TypeofType(
+                        Box::new(result_type),
+                        TypeofTypeQualifiers {
+                            base_const,
+                            pointer_quals,
+                            unqual,
+                        },
+                    );
                 }
             }
             // Didn't work as type, backtrack
@@ -1933,6 +1947,55 @@ mod enumerator_attribute_tests {
             }
             assert!(!parser.enum_constants.contains_key("deprecated"));
             assert!(!parser.enum_constants.contains_key("maybe_unused"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod typeof_type_qualifier_tests {
+    use super::super::Parser;
+    use crate::frontend::lexer::Lexer;
+    use crate::frontend::parser::ast::{CVR_CONST, ExternalDecl, TypeSpecifier};
+
+    #[test]
+    fn type_operand_qualifiers_are_scoped_and_preserved() {
+        for (source, outer_const, base_const, pointer_quals, unqual) in [
+            ("const __typeof__(int *) p;", true, false, vec![0], false),
+            ("__typeof__(const int *) p;", false, true, vec![0], false),
+            (
+                "const __typeof__(int *const) p;",
+                true,
+                false,
+                vec![CVR_CONST],
+                false,
+            ),
+            (
+                "__typeof__(const int *const *) p;",
+                false,
+                true,
+                vec![CVR_CONST, 0],
+                false,
+            ),
+            (
+                "__typeof_unqual__(const int *const) p;",
+                false,
+                true,
+                vec![CVR_CONST],
+                true,
+            ),
+        ] {
+            let mut parser = Parser::new(Lexer::new(source, 0).tokenize());
+            let tu = parser.parse();
+            let Some(ExternalDecl::Declaration(decl)) = tu.decls.first() else {
+                panic!("expected declaration: {source}");
+            };
+            assert_eq!(decl.is_const(), outer_const, "{source}");
+            let TypeSpecifier::TypeofType(_, quals) = &decl.type_spec else {
+                panic!("expected typeof(type-name): {source}");
+            };
+            assert_eq!(quals.base_const, base_const, "{source}");
+            assert_eq!(quals.pointer_quals, pointer_quals, "{source}");
+            assert_eq!(quals.unqual, unqual, "{source}");
         }
     }
 }
