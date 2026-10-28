@@ -12,7 +12,9 @@ import re
 import subprocess
 import tempfile
 
-FIXTURE = Path(__file__).with_name("typeof_scalar_volatile.c")
+# Assembly-only fixture intentionally has an unresolved block-scope extern;
+# keep it out of the standalone top-level regression corpus glob.
+FIXTURE = Path(__file__).parent / "fixtures" / "typeof-scalar-volatile" / "probe.c"
 OPT_LEVELS = ("0", "1", "2", "3", "s")
 SYMBOLS = {
     "expr_discard": "from_expr",
