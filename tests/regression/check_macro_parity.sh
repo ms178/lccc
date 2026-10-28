@@ -144,6 +144,7 @@ for target in "${TARGETS[@]}"; do
             for fb in "${FORBIDDEN_LIST[@]}"; do
                 if [ "$name" = "$fb" ]; then
                     lccc_val=$(awk -v name="$name" '$1 == name { $1=""; sub(/^ /,""); print; exit }' "$td/lccc.nv")
+                    echo "::error title=GP-23 FORBIDDEN::$target/$dialect: FORBIDDEN macro '$name' defined by lccc (value: $lccc_val)"
                     echo "FAIL: $target/$dialect: FORBIDDEN macro '$name' defined by lccc (value: $lccc_val)"
                     fail=1
                 fi
@@ -155,6 +156,7 @@ for target in "${TARGETS[@]}"; do
             [ -z "$name" ] && continue
             for ess in "${MISSING_ESSENTIAL[@]}"; do
                 if [ "$name" = "$ess" ]; then
+                    echo "::error title=GP-23 MISSING::$target/$dialect: MISSING essential macro '$name' (defined by gcc-16, not lccc)"
                     echo "FAIL: $target/$dialect: MISSING essential macro '$name' (defined by gcc-16, not lccc)"
                     fail=1
                 fi
@@ -173,6 +175,7 @@ for target in "${TARGETS[@]}"; do
                     if [ "$name" = "$sp" ]; then allowed=1; break; fi
                 done
                 if [ "$allowed" -eq 0 ]; then
+                    echo "::error title=GP-23 SPELLING::$target/$dialect: SPELLING mismatch '$name': gcc=$gcc_val lccc=$lccc_val"
                     echo "FAIL: $target/$dialect: SPELLING mismatch '$name': gcc=$gcc_val lccc=$lccc_val"
                     fail=1
                 fi
