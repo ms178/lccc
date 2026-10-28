@@ -18,6 +18,10 @@ pub struct IrModule {
     /// module level so redeclarations/prototypes can contribute without
     /// inflating every IrFunction and every optimization clone.
     pub function_alignments: crate::common::fx_hash::FxHashMap<String, usize>,
+    /// Emitted function symbols whose code sections carry SHF_GNU_RETAIN.
+    /// Module-level storage lets any declaration contribute without inflating
+    /// every IrFunction and every optimization clone.
+    pub retained_functions: crate::common::fx_hash::FxHashSet<String>,
     /// Linker names of functions referenced by this translation unit but not
     /// defined in it. Backends need this distinction when taking addresses:
     /// PIE may use copy relocations for ordinary extern data, but no analogous
@@ -542,6 +546,7 @@ impl IrModule {
         Self {
             functions: Vec::new(),
             function_alignments: crate::common::fx_hash::FxHashMap::default(),
+            retained_functions: crate::common::fx_hash::FxHashSet::default(),
             extern_function_symbols: crate::common::fx_hash::FxHashSet::default(),
             globals: Vec::new(),
             string_literals: Vec::new(),

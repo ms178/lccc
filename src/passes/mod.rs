@@ -1711,7 +1711,7 @@ pub(crate) fn run_passes(
         // of its AST references (an unevaluated `sizeof`/`typeof` operand
         // counts), and only the IR knows which survive.  An unreachable one
         // may call functions defined nowhere, which must not reach the link.
-        dead_statics::eliminate_dead_static_functions(module);
+        dead_statics::eliminate_dead_statics_at_o0(module);
         // -O0 runs one budgeted fixpoint above: the always-inline rounds,
         // whose second-pass budget is a correctness budget (an unexpanded
         // must-inline call cannot link).  Its cap hits must surface too.

@@ -622,6 +622,10 @@ pub struct CodegenState {
     /// __attribute__((section("..."))). Used to restore the correct section
     /// after emitting data (e.g., jump tables) in other sections.
     pub current_text_section: String,
+    /// Retain is part of a text section's identity: GAS permits same-named
+    /// retained and non-retained sections, and both must be restored exactly
+    /// after a jump table or per-function constant pool.
+    pub current_text_retain: bool,
     /// Whether to use the kernel code model (-mcmodel=kernel). All symbols
     /// are assumed to be in the negative 2GB of the virtual address space.
     /// Uses absolute sign-extended 32-bit addressing (movq $symbol) for
@@ -909,6 +913,7 @@ impl CodegenState {
             f128_load_sources: FxHashMap::default(),
             f128_direct_slots: FxHashSet::default(),
             current_text_section: ".text".to_string(),
+            current_text_retain: false,
             code_model_kernel: false,
             no_jump_tables: false,
             weak_extern_symbols: FxHashSet::default(),
@@ -984,6 +989,20 @@ impl CodegenState {
     /// function bodies into `__patchable_function_entries,"awo"`).
     pub fn invalidate_text_section(&mut self) {
         self.current_text_section.clear();
+    }
+
+    /// Return from an inline data section to the current function's exact
+    /// text-section variant without changing the remembered identity.
+    pub fn restore_current_text_section(&mut self) {
+        let flags = if self.current_text_retain {
+            "axR"
+        } else {
+            "ax"
+        };
+        self.out.emit_fmt(format_args!(
+            ".section {},\"{}\",@progbits",
+            self.current_text_section, flags
+        ));
     }
 
     /// Generate a fresh label with the given prefix.  Delegates to the single

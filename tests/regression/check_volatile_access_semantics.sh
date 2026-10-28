@@ -254,4 +254,13 @@ else
     echo "SKIP: i686 volatile codegen ($i686_cc not built)"
 fi
 
+riscv_cc=${CCC_RISCV:-"$(dirname "$CCC")/lccc-riscv"}
+if [[ -x "$riscv_cc" ]]; then
+    if ! python3 "$(dirname "$0")/check_riscv_volatile_access.py" --compiler "$riscv_cc"; then
+        rc=1
+    fi
+else
+    echo "SKIP: RISC-V volatile codegen ($riscv_cc not built)"
+fi
+
 exit $rc

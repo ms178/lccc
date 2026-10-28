@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SHF_GNU_RETAIN survives assembly and really roots GC (not frontend retain).
+"""SHF_GNU_RETAIN survives assembly and roots GC; C TLS retain is executable.
 
 Tests x86-64, i686, AArch64, RV64 and RV32 integrated assemblers, comparing
 native flags with GNU as; optional cross assemblers extend the oracle check.
@@ -129,6 +129,154 @@ def check_sections(obj: Path, expected: dict[str, tuple[int, int]]) -> None:
             raise RuntimeError(f'{obj}: {name}: got {found!r}, expected {[want]!r}')
 
 
+TLS_SECTIONS = {
+    '.tdata.retained_init': (1, A | W | T | R),
+    '.tbss.retained_zero': (8, A | W | T | R),
+    '.tdata.retained_const': (1, A | W | T | R),
+    '.tbss.retained_const_zero': (8, A | W | T | R),
+    '.custom_tls_init': (1, A | W | T | R),
+    '.custom_tls_zero': (1, A | W | T | R),
+    '.plain_tls_init': (1, A | W | T),
+    '.plain_tls_zero': (1, A | W | T),
+    '.data.rel.ro.retained_ptr': (1, A | W | R),
+}
+TLS_GLOBALS = {
+    'retained_init': '.tdata.retained_init',
+    'retained_zero': '.tbss.retained_zero',
+    'retained_const': '.tdata.retained_const',
+    'retained_const_zero': '.tbss.retained_const_zero',
+    'custom_init': '.custom_tls_init',
+    'custom_zero': '.custom_tls_zero',
+    'plain_init': '.plain_tls_init',
+    'plain_zero': '.plain_tls_zero',
+}
+
+
+def check_tls_source_object(obj: Path) -> None:
+    """Check symbol *types* as well as section bits (both affect TLS ABI)."""
+    check_sections(obj, TLS_SECTIONS)
+    sections, symbols = elf(obj)
+    types = {}
+    for line in run(['readelf', '-sW', obj]).stdout.splitlines():
+        fields = line.split()
+        if len(fields) >= 8 and fields[0].endswith(':'):
+            types[fields[7]] = fields[3]
+    for name, section in TLS_GLOBALS.items():
+        index = symbols.get(name, 0)
+        if not 0 < index < len(sections) or sections[index][0] != section or types.get(name) != 'TLS':
+            raise RuntimeError(f'{obj}: {name} is not TLS in {section}: '
+                               f'index={index}, type={types.get(name)}')
+    index = symbols.get('retained_ptr', 0)
+    if not 0 < index < len(sections) or sections[index][0] != '.data.rel.ro.retained_ptr':
+        raise RuntimeError(f'{obj}: retained PIC pointer is not in .data.rel.ro')
+    # Local symbol suffixes are compiler-dependent; used prevents frontend DCE.
+    for stem, wanted, kind, section_type in [
+            ('local_thread.', A | W | T | R, 'TLS', 1),
+            ('local_zero.', A | W | T | R, 'TLS', 8),
+            ('local_object.', A | W | R, 'OBJECT', 1),
+            ('local_spec_a.', A | W | R, 'OBJECT', 1),
+            ('local_spec_b.', A | W | R, 'OBJECT', 1),
+            ('local_sibling.', A | W, 'OBJECT', 1),
+            ('local_after.', A | W, 'OBJECT', 1)]:
+        found = [name for name in symbols if stem in name and types.get(name) == kind]
+        if len(found) != 1:
+            raise RuntimeError(f'{obj}: expected one {stem} {kind}, found {found}')
+        index = symbols[found[0]]
+        if (not 0 < index < len(sections) or
+                sections[index][1:] != (section_type, wanted)):
+            raise RuntimeError(f'{obj}: {found[0]} has wrong section type or flags')
+
+
+FUNCTION_RETAINED = {
+    'keep_default', 'keep_static', 'retain_prototype', 'retain_after',
+    'used_prototype', 'used_after', 'keep_custom', 'keep_cold', 'jump_fn',
+}
+FUNCTION_DEAD = {'used_not_retain', 'unused_retain_only', 'unused_retain_data'}
+
+
+def check_function_object(obj: Path) -> None:
+    sections, symbols = elf(obj)
+    for name in FUNCTION_RETAINED:
+        index = symbols.get(name, 0)
+        if not 0 < index < len(sections) or sections[index][1:] != (1, A | X | R):
+            raise RuntimeError(f'{obj}: retained function {name} has wrong section: '
+                               f'{sections[index] if 0 < index < len(sections) else index}')
+        if name == 'keep_custom' and sections[index][0] != '.custom_fn':
+            raise RuntimeError(f'{obj}: explicit function section was lost')
+        if name not in ('keep_custom', 'keep_cold') and sections[index][0] != f'.text.{name}':
+            raise RuntimeError(f'{obj}: {name} must have its own text section')
+    index = symbols.get('used_not_retain', 0)
+    if not 0 < index < len(sections) or sections[index] != ('.discard_fn', 1, A | X):
+        raise RuntimeError(f'{obj}: used without retain must not gain SHF_GNU_RETAIN')
+    if any(symbols.get(name, 0) != 0 for name in ('unused_retain_only', 'unused_retain_data')):
+        raise RuntimeError(f'{obj}: retain alone unexpectedly prevented frontend DCE at -O2')
+
+
+def check_function_gc(binary: Path, *, o0: bool = False) -> None:
+    _, symbols = elf(binary)
+    present = {name for name, index in symbols.items() if index != 0}
+    expected = FUNCTION_RETAINED | ({'unused_retain_only', 'unused_retain_data'} if o0 else set())
+    missing = expected - present
+    unexpected = (FUNCTION_DEAD - expected) & present
+    if missing or unexpected:
+        raise RuntimeError(f'{binary}: retained functions missing {missing}; '
+                           f'unretained functions present {unexpected}')
+    if {'helper_a', 'helper_b'} - present:
+        raise RuntimeError(f'{binary}: jump-table dependencies were discarded')
+
+
+def check_local_object_sizes(obj: Path, pointer_bytes: int) -> None:
+    """Stack-slot padding must never become ELF static/TLS object size."""
+    expected = {
+        'c': 1, 'c_zero': 1, 'h': 2, 'i': 4, 'i_zero': 4,
+        'f': 4, 'd': 8, 'tls': 4, 'array': 12,
+        'aggregate': 5 * pointer_bytes, 'flexible': 16, 'vector': 16,
+        'tiny': 2, 'decl_vec': 16, 'p': pointer_bytes, 'q': pointer_bytes,
+    }
+    found = {}
+    for line in run(['readelf', '-sW', obj]).stdout.splitlines():
+        fields = line.split()
+        if len(fields) >= 8 and fields[3] in ('OBJECT', 'TLS'):
+            parts = fields[7].split('.')
+            if len(parts) >= 2 and parts[-2] in expected and parts[-1].isdigit():
+                name = parts[-2]
+                if name in found:
+                    raise RuntimeError(f'{obj}: duplicate local symbol {name}')
+                found[name] = int(fields[2])
+    if found != expected:
+        raise RuntimeError(f'{obj}: local object sizes {found}, expected {expected}')
+    # A pointer-to-struct's brace initializer must not append pointee padding.
+    sections, _ = elf(obj)
+    table_indices = [i for i, section in enumerate(sections) if section[0] == '.ptr_table']
+    if len(table_indices) != 1:
+        raise RuntimeError(f'{obj}: expected one .ptr_table')
+    data = obj.read_bytes()
+    if data[4] == 2:
+        shoff, shentsize = struct.unpack_from('<Q', data, 40)[0], struct.unpack_from('<H', data, 58)[0]
+        size = struct.unpack_from('<Q', data, shoff + table_indices[0] * shentsize + 32)[0]
+    else:
+        shoff, shentsize = struct.unpack_from('<I', data, 32)[0], struct.unpack_from('<H', data, 46)[0]
+        size = struct.unpack_from('<I', data, shoff + table_indices[0] * shentsize + 20)[0]
+    if size != 2 * pointer_bytes:
+        raise RuntimeError(f'{obj}: .ptr_table size {size}, expected {2 * pointer_bytes}')
+    for name, wanted_size, wanted_align in [('.tiny_vector', 2, 2),
+                                            ('.decl_vector', 16, 16),
+                                            ('.global_vector', 16, 16)]:
+        indices = [i for i, section in enumerate(sections) if section[0] == name]
+        if len(indices) != 1:
+            raise RuntimeError(f'{obj}: expected one {name} section')
+        pos = shoff + indices[0] * shentsize
+        if data[4] == 2:
+            sec_size = struct.unpack_from('<Q', data, pos + 32)[0]
+            sec_align = struct.unpack_from('<Q', data, pos + 48)[0]
+        else:
+            sec_size = struct.unpack_from('<I', data, pos + 20)[0]
+            sec_align = struct.unpack_from('<I', data, pos + 32)[0]
+        if (sec_size, sec_align) != (wanted_size, wanted_align):
+            raise RuntimeError(f'{obj}: {name} has size/alignment {sec_size}/{sec_align}, '
+                               f'expected {wanted_size}/{wanted_align}')
+
+
 def check_split(obj: Path, target: str, case: int) -> None:
     sections, symbols = elf(obj)
     if not all(sym in symbols and 0 < symbols[sym] < len(sections) for sym in ('first', 'second')):
@@ -213,6 +361,93 @@ def main() -> None:
                         raise RuntimeError(f'{name} conflict {i}: wrong failure: {result.stderr}')
                 else:
                     check_split(obj, name, i)
+        # C frontend, not just handwritten assembly: both initialized and
+        # zero TLS, const TLS, explicit sections, and function-scope statics.
+        # RV32 is an assembler-only target here; compile the other four.
+        tls_source = ROOT / 'tests/regression/fixtures/retain-c/tls.c'
+        tls_reference = work / 'gcc-tls.o'
+        run([args.gcc, '-O2', '-fPIC', '-c', tls_source, '-o', tls_reference])
+        check_tls_source_object(tls_reference)
+        for name, cc, flags, _, _ in targets[:-1]:
+            tls_obj = work / f'{name}-tls.o'
+            run([cc, *flags, '-O2', '-fPIC', '-c', tls_source, '-o', tls_obj])
+            check_tls_source_object(tls_obj)
+            if name == 'x86-64':
+                # Link the LCCC object with both GCC's GNU linker and LCCC's
+                # own linker; section-bit-only tests miss a malformed TLS image.
+                for linker_cc in (args.gcc, compiler):
+                    exe = work / f'tls-{Path(linker_cc).name}'
+                    run([linker_cc, '-Wl,--gc-sections', tls_obj, '-o', exe])
+                    run([exe])
+        # Verify separate per-thread initialized and zero TLS images. Compile
+        # with both frontends and link each with both native linker drivers.
+        thread_source = ROOT / 'tests/regression/fixtures/retain-c/tls-thread.c'
+        for frontend in (args.gcc, compiler):
+            for opt in ('-O0', '-O1', '-O2', '-O3', '-Os'):
+                for pic in ('-fPIC', '-fno-pic'):
+                    stem = f'thread-{Path(frontend).name}-{opt[1:]}-{pic[2:]}'
+                    obj = work / f'{stem}.o'
+                    run([frontend, opt, pic, '-pthread', '-c', thread_source, '-o', obj])
+                    for linker_cc in (args.gcc, compiler):
+                        exe = work / f'{stem}-{Path(linker_cc).name}'
+                        run([linker_cc, '-no-pie', '-pthread', '-Wl,--gc-sections', obj, '-o', exe])
+                        run([exe])
+        # Verify exact ELF sizes, including TLS, vector, flexible-array and
+        # pointer-to-struct brace initializers; auto stack padding is not a
+        # valid object size and can corrupt custom pointer tables.
+        local_source = ROOT / 'tests/regression/fixtures/retain-c/local-size.c'
+        for name, cc, flags, pointer_bytes in [
+                ('gcc-64', args.gcc, [], 8), ('gcc-32', args.gcc, ['-m32'], 4),
+                *[(name, cc, flags, 4 if name == 'i686' else 8)
+                  for name, cc, flags, _, _ in targets[:-1]]]:
+            obj = work / f'{name}-local-size.o'
+            run([cc, *flags, '-O2', '-fPIC', '-c', local_source, '-o', obj])
+            check_local_object_sizes(obj, pointer_bytes)
+            if name in ('gcc-64', 'x86-64'):
+                exe = work / f'{name}-local-size'
+                run([args.gcc, obj, '-o', exe])
+                run([exe])
+
+        # C function retain differs from `used`: it must root its own code
+        # section, including when inherited from earlier or later prototypes.
+        # The switch forces an in-function .rodata round trip on each backend.
+        function_source = ROOT / 'tests/regression/fixtures/retain-c/functions.c'
+        function_reference = work / 'gcc-functions.o'
+        run([args.gcc, '-O2', '-ffunction-sections', '-c', function_source, '-o', function_reference])
+        check_function_object(function_reference)
+        for name, cc, flags, _, _ in targets[:-1]:
+            obj = work / f'{name}-functions.o'
+            asm = work / f'{name}-functions.s'
+            opts = [*flags, '-O2', '-ffunction-sections']
+            run([cc, *opts, '-c', function_source, '-o', obj])
+            check_function_object(obj)
+            run([cc, *opts, '-S', function_source, '-o', asm])
+            text = asm.read_text()
+            body = text.split('jump_fn:', 1)[1].split('.size jump_fn', 1)[0]
+            if '.section .rodata' not in body or '.section .text.jump_fn,"axR"' not in body:
+                raise RuntimeError(f'{name}: jump-table section round trip lost the retain flag')
+            if name == 'x86-64':
+                for linker_cc in (args.gcc, compiler):
+                    exe = work / f'functions-{Path(linker_cc).name}'
+                    run([linker_cc, '-no-pie', '-Wl,--gc-sections', obj, '-o', exe])
+                    run([exe])
+                    check_function_gc(exe)
+        # Check the GCC-produced object under both native linker drivers too.
+        for linker_cc in (args.gcc, compiler):
+            exe = work / f'functions-gcc-{Path(linker_cc).name}'
+            run([linker_cc, '-no-pie', '-Wl,--gc-sections', function_reference, '-o', exe])
+            check_function_gc(exe)
+        # -O0 retains unused retain-only definitions; optimized GCC may DCE
+        # them. Neither behavior should depend on -ffunction-sections.
+        for frontend in (args.gcc, compiler):
+            for opt in ('-O0', '-O1', '-O2', '-O3', '-Os'):
+                for fs in ('-ffunction-sections', '-fno-function-sections'):
+                    obj = work / 'function-matrix.o'
+                    exe = work / 'function-matrix'
+                    run([frontend, opt, fs, '-c', function_source, '-o', obj])
+                    run([args.gcc, '-no-pie', '-Wl,--gc-sections', obj, '-o', exe])
+                    check_function_gc(exe, o0=opt == '-O0')
+
         # A changed attribute/type within the *same* R variant is invalid in
         # GAS, unlike the two R/non-R variants above.
         invalid = [
@@ -314,7 +549,8 @@ int main(void) { return 0; }
             raise RuntimeError('GCC assembly: retained or discarded symbols have wrong GC result')
     print(f'PASS: GNU retain sections on {len(targets)} integrated assemblers, '
           f'{oracle_count} GAS oracles, 30 collision checks, GNU/mold x86/i686 GC and LCCC x86-64 GC, '
-          'GNU/LCCC partial links, GCC 16 assembly and negative controls')
+          'GNU/LCCC partial links, GCC 16 assembly, C TLS/thread runtime, '
+          'static object layouts, retained-function GC and section restoration and negative controls')
 
 
 if __name__ == '__main__':

@@ -22,6 +22,16 @@ use crate::ir::reexports::{Instruction, IrModule, Operand, Value};
 
 /// Remove internal-linkage (static) functions and globals that are unreachable.
 pub(crate) fn eliminate_dead_static_functions(module: &mut IrModule) {
+    eliminate_dead_statics(module, false);
+}
+
+/// GCC emits an otherwise-unused `retain` definition at -O0, but may omit it
+/// at optimized levels. Preserve its whole reference graph only in that tier.
+pub(crate) fn eliminate_dead_statics_at_o0(module: &mut IrModule) {
+    eliminate_dead_statics(module, true);
+}
+
+fn eliminate_dead_statics(module: &mut IrModule, preserve_retained: bool) {
     let n_funcs = module.functions.len();
 
     // Phases 1–4 borrow module strings; the block ends that borrow before we
@@ -38,7 +48,10 @@ pub(crate) fn eliminate_dead_static_functions(module: &mut IrModule) {
             &func_refs,
             &global_refs,
             &address_taken,
-            &name_to_ids,
+            ReachabilityOptions {
+                name_to_ids: &name_to_ids,
+                preserve_retained,
+            },
         );
         (reachable, address_taken)
     };
@@ -683,6 +696,11 @@ fn mark_named(
 ///
 /// Propagation order is LIFO (DFS). For a pure reachability fixpoint this is
 /// equivalent to BFS; each ID is enqueued at most once.
+struct ReachabilityOptions<'a> {
+    name_to_ids: &'a FxHashMap<&'a str, Vec<usize>>,
+    preserve_retained: bool,
+}
+
 fn compute_reachability(
     module: &IrModule,
     n_funcs: usize,
@@ -690,8 +708,9 @@ fn compute_reachability(
     func_refs: &[Vec<usize>],
     global_refs: &[Vec<usize>],
     address_taken: &[bool],
-    name_to_ids: &FxHashMap<&str, Vec<usize>>,
+    options: ReachabilityOptions<'_>,
 ) -> Vec<bool> {
+    let name_to_ids = options.name_to_ids;
     let mut reachable = vec![false; nsyms];
     let mut worklist = Vec::with_capacity(nsyms.min(64));
 
@@ -699,7 +718,10 @@ fn compute_reachability(
         if func.is_declaration {
             continue;
         }
-        if !func.is_static || func.is_used {
+        if !func.is_static
+            || func.is_used
+            || (options.preserve_retained && module.retained_functions.contains(&func.name))
+        {
             mark_reachable(i, &mut reachable, &mut worklist);
         }
     }
@@ -708,7 +730,11 @@ fn compute_reachability(
         if global.is_extern {
             continue;
         }
-        if !global.is_static || global.is_common || global.is_used {
+        if !global.is_static
+            || global.is_common
+            || global.is_used
+            || (options.preserve_retained && global.is_retain)
+        {
             mark_reachable(n_funcs + j, &mut reachable, &mut worklist);
         }
     }

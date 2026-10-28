@@ -56,7 +56,11 @@ impl Lowerer {
         for decl in &tu.decls {
             match decl {
                 ExternalDecl::FunctionDef(func) => {
-                    if self.is_skippable_function(func) && !func.attrs.is_used() {
+                    let is_used =
+                        func.attrs.is_used() || self.used_function_decls.contains(&func.name);
+                    let is_retained =
+                        func.attrs.is_retain() || self.retained_function_decls.contains(&func.name);
+                    if self.is_skippable_function(func) && !is_used && !is_retained {
                         // For skippable functions, collect their refs into a separate map
                         // so we can do transitive closure later
                         let mut func_refs = FxHashSet::default();
@@ -69,7 +73,7 @@ impl Lowerer {
                         // are roots even though they are static — otherwise their
                         // callees (rtld_timer_start etc.) get skipped and the
                         // link fails with undefined references.
-                        if func.attrs.is_used() {
+                        if is_used || is_retained {
                             referenced.insert(func.name.clone());
                         }
                         self.collect_refs_from_function(func, &mut referenced);

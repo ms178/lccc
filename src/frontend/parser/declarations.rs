@@ -1197,6 +1197,9 @@ impl Parser {
         self.attrs.set_typedef_use(false);
         self.attrs.set_typedef_object_volatile(false);
         self.attrs.set_pointer_const(false);
+        // A containing function or previous declaration must not donate its
+        // retain attribute to a new block-scope declaration.
+        self.attrs.set_retain(false);
         self.attrs.parsing_address_space = AddressSpace::Default;
         let type_spec = self.parse_type_specifier()?;
         let spec_maybe_unused = self.attrs.parsing_maybe_unused();
@@ -1217,6 +1220,11 @@ impl Parser {
         let spec_tls_model = self.attrs.parsing_tls_model.take();
         let spec_uninitialized = self.attrs.parsing_uninitialized();
         self.attrs.set_uninitialized(false);
+        // Specifier attributes apply to all comma siblings; declarator
+        // attributes apply only to that sibling. Consume the parser bit before
+        // an initializer can introduce attributes of its own.
+        let spec_retain = self.attrs.parsing_retain();
+        self.attrs.set_retain(false);
 
         // Snapshot the declaration's address space NOW: initializer parsing
         // can contain casts to segment-qualified pointers, and the abstract-
@@ -1288,6 +1296,8 @@ impl Parser {
             self.attrs.set_maybe_unused(false);
             let local_uninitialized = spec_uninitialized || self.attrs.parsing_uninitialized();
             self.attrs.set_uninitialized(false);
+            let local_retain = spec_retain || self.attrs.parsing_retain();
+            self.attrs.set_retain(false);
             let local_cleanup_fn = self.attrs.parsing_cleanup_fn.take();
             let local_section = self.attrs.parsing_section.take();
             let local_visibility = self
@@ -1306,6 +1316,9 @@ impl Parser {
             } else {
                 None
             };
+            // Attributes parsed inside an initializer belong to that nested
+            // construct, not to this declarator or the next comma sibling.
+            self.attrs.set_retain(false);
             declarators.push(InitDeclarator {
                 name: name.unwrap_or_default(),
                 derived,
@@ -1323,6 +1336,7 @@ impl Parser {
                     da.cleanup_fn = local_cleanup_fn;
                     da.set_uninitialized(local_uninitialized);
                     da.set_used(self.attrs.parsing_used());
+                    da.set_retain(local_retain);
                     da.set_maybe_unused(local_maybe_unused);
                     da.set_nested_fn(self.attrs.parsing_nested_fn());
                     da.set_noreturn(self.attrs.parsing_noreturn());
@@ -1355,6 +1369,10 @@ impl Parser {
             if self.attrs.parsing_maybe_unused() {
                 last_decl.attrs.set_maybe_unused(true);
                 self.attrs.set_maybe_unused(false);
+            }
+            if self.attrs.parsing_retain() {
+                last_decl.attrs.set_retain(true);
+                self.attrs.set_retain(false);
             }
             if let Some(a) = post_init_aligned {
                 alignment = Some(alignment.map_or(a, |prev| prev.max(a)));

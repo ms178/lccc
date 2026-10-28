@@ -143,6 +143,7 @@ impl Lowerer {
                     da.struct_layout = None;
                     da.is_struct = false;
                 }
+                self.fix_static_scalar_size(&mut da, type_spec);
                 self.lower_local_static_decl(decl, declarator, &da, type_spec);
                 continue;
             }
@@ -692,6 +693,13 @@ impl Lowerer {
             } else {
                 da.base_ty
             };
+            // `struct_layout` can describe a pointer's pointee. It must not
+            // pad a pointer object's brace initializer to the pointee size.
+            let object_struct_layout = if da.is_pointer {
+                None
+            } else {
+                da.struct_layout.clone()
+            };
             self.lower_global_init(
                 initializer,
                 type_spec,
@@ -699,7 +707,7 @@ impl Lowerer {
                 da.is_array,
                 da.elem_size,
                 da.actual_alloc_size,
-                &da.struct_layout,
+                &object_struct_layout,
                 &da.array_dim_strides,
                 da.c_type.as_ref(),
             )
@@ -707,42 +715,14 @@ impl Lowerer {
             GlobalInit::Zero
         };
 
-        // Compute natural alignment from the type specifier. This picks up
-        // struct/union __attribute__((aligned(N))) that is part of the type
-        // definition rather than the variable declaration. Without this,
-        // `static struct fxregs_state fxregs` would get da.var_ty.align() == 1
-        // (IrType::I8) instead of the struct's required 16-byte alignment.
-        let c_align = self.alignof_type(type_spec);
-        let natural = if c_align > 0 {
-            c_align.max(da.var_ty.align())
-        } else {
-            da.var_ty.align()
-        };
-
-        // Respect explicit __attribute__((aligned(N))) / _Alignas(N) on static locals.
-        // Resolve _Alignas(type) via the lowerer for accurate typedef resolution.
-        let mut explicit_align = crate::common::types::strictest_alignment([
-            decl.alignment,
-            decl.alignas_type.as_ref().map(|ts| self.alignof_type(ts)),
-        ]);
-        // Recompute sizeof for aligned(sizeof(type)) with full layout info
-        if let Some(ref sizeof_ts) = decl.alignment_sizeof_type {
-            let real_sizeof = self.sizeof_type(sizeof_ts);
-            explicit_align = Some(explicit_align.map_or(real_sizeof, |a| a.max(real_sizeof)));
-        }
-        // Also incorporate alignment from typedef
-        if let Some(&td_align) = self.typedef_alignment_for_type_spec(type_spec) {
-            explicit_align = Some(explicit_align.map_or(td_align, |a: usize| a.max(td_align)));
-        }
+        // File- and block-scope statics share object alignment rules; do not
+        // let the pointer IR carrier over-align small vector objects.
+        let (align, explicit_align) = self.compute_static_alignment(decl, type_spec, da);
         let has_explicit_align = explicit_align.is_some();
-        let align = if let Some(explicit) = explicit_align {
-            natural.max(explicit)
-        } else {
-            natural
-        };
 
         // For struct initializers emitted as byte arrays, set element type to I8
         let global_ty = da.resolve_global_ty(&init);
+        let final_size = da.initialized_static_size(&init);
 
         // Function-scope statics get the same const classification as
         // file-scope globals -- see the long comment in
@@ -770,7 +750,7 @@ impl Lowerer {
         self.module.globals.push(IrGlobal {
             name: static_name.clone(),
             ty: global_ty,
-            size: da.actual_alloc_size,
+            size: final_size,
             align,
             init,
             is_static: true,
@@ -782,7 +762,7 @@ impl Lowerer {
             has_explicit_align,
             is_const: var_is_const,
             is_used: declarator.attrs.is_used(),
-            is_retain: false,
+            is_retain: declarator.attrs.is_retain(),
             is_nocommon: false,
             is_thread_local: decl.is_thread_local(),
         });

@@ -221,6 +221,21 @@ pub(super) struct DeclAnalysis {
 }
 
 impl DeclAnalysis {
+    /// Static initialized structs can occupy more than `sizeof(T)` when a GNU
+    /// flexible-array member is initialized. Use the emitted image size for
+    /// the ELF object while retaining the C type's size for `sizeof`.
+    pub fn initialized_static_size(&self, init: &GlobalInit) -> usize {
+        match init {
+            GlobalInit::Array(vals) if self.is_struct && vals.len() > self.actual_alloc_size => {
+                vals.len()
+            }
+            GlobalInit::Compound(_) if self.is_struct => {
+                init.emitted_byte_size().max(self.actual_alloc_size)
+            }
+            _ => self.actual_alloc_size,
+        }
+    }
+
     /// Apply a resolved vector CType to this declaration analysis. The caller
     /// preserves the distinction between byte-sized `vector_size` and padded,
     /// explicit-lane-count `ext_vector_type` before reaching this method.

@@ -833,6 +833,14 @@ impl ArchCodegen for RiscvCodegen {
     fn state_ref(&self) -> &CodegenState {
         &self.state
     }
+
+    fn mark_volatile_access(&mut self, begin: bool) {
+        self.state.emit_fmt(format_args!(
+            "    # LCCC_VOLATILE_{}",
+            if begin { "BEGIN" } else { "END" }
+        ));
+    }
+
     fn ptr_directive(&self) -> PtrDirective {
         PtrDirective::Dword
     }
@@ -985,9 +993,7 @@ impl ArchCodegen for RiscvCodegen {
             self.state
                 .emit_fmt(format_args!("    .word {} - {}", target_label, table_label));
         }
-        let sect = self.state.current_text_section.clone();
-        self.state
-            .emit_fmt(format_args!(".section {},\"ax\",@progbits", sect));
+        self.state.restore_current_text_section();
         self.state.reg_cache.invalidate_all();
     }
 

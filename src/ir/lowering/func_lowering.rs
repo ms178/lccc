@@ -1301,6 +1301,12 @@ impl Lowerer {
             .unwrap_or(false);
         // Use the lowerer's global next_label counter to ensure labels are globally unique
         let next_label = self.next_label;
+        let emitted_name = self
+            .asm_label_map
+            .get(&func.name)
+            .cloned()
+            .unwrap_or_else(|| func.name.clone());
+        let is_retain = func.attrs.is_retain() || self.retained_function_decls.contains(&func.name);
 
         let ir_func = IrFunction {
             pass_policy: Default::default(),
@@ -1310,11 +1316,7 @@ impl Lowerer {
             // gnulib's stdio.h) has already been collected into asm_label_map
             // by the signature pass, and call sites resolve through it, so we
             // only need to rename the emitted definition symbol here.
-            name: self
-                .asm_label_map
-                .get(&func.name)
-                .cloned()
-                .unwrap_or_else(|| func.name.clone()),
+            name: emitted_name.clone(),
             return_type,
             params,
             blocks: std::mem::take(&mut self.func_mut().blocks),
@@ -1339,14 +1341,18 @@ impl Lowerer {
             // Downstream consumers key on the section name (e.g. the
             // loop-alignment pass skips unlikely-section functions, whose
             // padding could never be amortized).
-            section: func
-                .attrs
-                .section
-                .clone()
-                .or_else(|| func.attrs.is_cold().then(|| ".text.unlikely".to_string())),
+            section: func.attrs.section.clone().or_else(|| {
+                func.attrs.is_cold().then(|| {
+                    if is_retain {
+                        format!(".text.unlikely.{emitted_name}")
+                    } else {
+                        ".text.unlikely".to_string()
+                    }
+                })
+            }),
             visibility: func.attrs.visibility.clone(),
             is_weak: func.attrs.is_weak(),
-            is_used: func.attrs.is_used(),
+            is_used: func.attrs.is_used() || self.used_function_decls.contains(&func.name),
             has_inlined_calls: false,
             param_alloca_values: param_alloca_vals,
             uses_sret,
@@ -1400,6 +1406,9 @@ impl Lowerer {
             self.module
                 .zero_call_used_regs_attrs
                 .insert(ir_func.name.clone(), mode);
+        }
+        if is_retain {
+            self.module.retained_functions.insert(ir_func.name.clone());
         }
         self.module.functions.push(ir_func);
         self.pop_scope();

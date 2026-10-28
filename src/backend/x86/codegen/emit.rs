@@ -1928,7 +1928,6 @@ impl X86Codegen {
         if self.vec_const_labels.is_empty() && self.lane_const_labels.is_empty() {
             return;
         }
-        let sect = self.state.current_text_section.clone();
         self.state.emit(".section .rodata");
         self.state.emit(".align 4");
         let mut entries: Vec<(&(u64, u8), &String)> = self.vec_const_labels.iter().collect();
@@ -1983,8 +1982,7 @@ impl X86Codegen {
                 self.state.emit_fmt(format_args!("    {} {}", directive, v));
             }
         }
-        self.state
-            .emit_fmt(format_args!(".section {},\"ax\",@progbits", sect));
+        self.state.restore_current_text_section();
         // Keep the counter monotonic across functions so every .LvcN label is
         // unique module-wide (dedup only happens within one function's pool,
         // which is flushed together). Resetting per function would emit
@@ -9952,9 +9950,7 @@ impl ArchCodegen for X86Codegen {
                     .emit_fmt(format_args!("    .long {} - {}", target_label, table_label));
             }
         }
-        let sect = self.state.current_text_section.clone();
-        self.state
-            .emit_fmt(format_args!(".section {},\"ax\",@progbits", sect));
+        self.state.restore_current_text_section();
 
         self.state.reg_cache.invalidate_all();
         self.flush_pending_vec_store_impl();

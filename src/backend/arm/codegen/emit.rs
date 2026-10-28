@@ -3097,9 +3097,7 @@ impl ArchCodegen for ArmCodegen {
             self.state
                 .emit_fmt(format_args!("    .word {} - {}", target_label, table_label));
         }
-        let sect = self.state.current_text_section.clone();
-        self.state
-            .emit_fmt(format_args!(".section {},\"ax\",@progbits", sect));
+        self.state.restore_current_text_section();
         self.state.reg_cache.invalidate_all();
     }
 

@@ -2969,15 +2969,17 @@ fn emit_globals(
             .clone()
             .unwrap_or_else(|| retained_section_name(g, pic_mode));
         let section_name = &section_name;
-        // Use "a" (read-only) for const-qualified globals or rodata sections,
-        // "aw" (writable) otherwise. GCC uses the const qualification of the
-        // variable to determine section flags, not just the section name.
-        // This matters for kernel sections like .modinfo which contain const data.
-        let mut flags = if g.is_const || section_name.contains("rodata") {
-            "a".to_string()
-        } else {
-            "aw".to_string()
-        };
+        // TLS templates must be writable, even for C `const` objects: the
+        // loader constructs a writable per-thread image. PIC constants with
+        // address relocations likewise need writable storage until relocated
+        // (normally .data.rel.ro), including in explicit custom sections.
+        let needs_write = g.is_thread_local
+            || (pic_mode && global_init_needs_dynamic_reloc(&g.init))
+            || !(g.is_const || section_name.contains("rodata"));
+        let mut flags = if needs_write { "aw" } else { "a" }.to_string();
+        if g.is_thread_local {
+            flags.push('T');
+        }
         // SHF_GNU_RETAIN: `.section NAME,"awR",@progbits`. GNU as maps the "R"
         // flag to SHF_GNU_RETAIN, which the linker honours under --gc-sections.
         if g.is_retain {
@@ -3004,9 +3006,13 @@ fn emit_globals(
         // fixed type, and the kernel's `static int lines __section(".data")`
         // pattern shares .data with relocatable pointer data — a NOBITS
         // .data silently drops that content (compressed misc.c boot hang).
-        // `.noinit` is SHT_NOBITS in GCC: the object must not be zeroed by the
-        // loader, so nothing may be written to the section image.
-        let section_type = if section_name.starts_with(".bss") || section_name == ".noinit" {
+        // `.noinit` and `.tbss` sections are also NOBITS. In particular a
+        // retained zero TLS object lives in `.tbss.<name>`; making it PROGBITS
+        // changes the TLS image and may place initialized data after BSS.
+        let section_type = if section_name.starts_with(".bss")
+            || section_name.starts_with(".tbss")
+            || section_name == ".noinit"
+        {
             "@nobits"
         } else {
             "@progbits"
@@ -3016,7 +3022,12 @@ fn emit_globals(
             section_name, flags, section_type
         ));
         if matches!(g.init, GlobalInit::Zero) || g.size == 0 {
-            emit_zero_global(out, g, "@object", ptr_dir, alignment);
+            let obj_type = if g.is_thread_local {
+                "@tls_object"
+            } else {
+                "@object"
+            };
+            emit_zero_global(out, g, obj_type, ptr_dir, alignment);
         } else {
             emit_global_def(out, g, ptr_dir, alignment);
         }
