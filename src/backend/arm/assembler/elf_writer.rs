@@ -709,6 +709,14 @@ impl ElfWriter {
                 Ok(())
             }
 
+            AsmDirective::File(number, name) => {
+                self.base.debug_file(*number, name.clone());
+                Ok(())
+            }
+            AsmDirective::Loc(file, line, column) => {
+                self.base.debug_loc(*file, *line, *column);
+                Ok(())
+            }
             AsmDirective::Ignored | AsmDirective::Ltorg => Ok(()),
             AsmDirective::Cfi(name, _) => Err(format!(
                 "internal: {name} reached the ELF writer without CFI lowering"
@@ -1131,6 +1139,12 @@ impl ElfWriter {
             elf_class: ELFCLASS64,
             force_rela: false,
         };
+        use super::encoder::RelocType;
+        self.base.finish_debug_sections(
+            8,
+            RelocType::Abs32.elf_type(),
+            RelocType::Abs64.elf_type(),
+        )?;
         self.base.write_elf(output_path, &config, false)
     }
 }
@@ -3111,5 +3125,74 @@ mod leb128_tests {
         let err = data_of(".data\n.uleb128 2f-1f\n1:\n.text\nnop\n2:\n")
             .expect_err("no assembly-time constant");
         assert!(err.contains("LEB128"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod debug_line_tests {
+    use super::*;
+
+    fn assemble(asm: &str) -> ElfWriter {
+        let statements =
+            super::super::prepare_statements(asm).unwrap_or_else(|e| panic!("parse: {e}"));
+        let mut writer = ElfWriter::new();
+        writer
+            .process_statements(&statements)
+            .unwrap_or_else(|e| panic!("assemble: {e}"));
+        writer
+    }
+
+    /// `.loc`, `.arch` and `.ident` place nothing, so the literal of an
+    /// earlier `ldr =` still waits for the end of the section (GNU as).  It
+    /// used to be dumped at each of them -- between the `ldr` and the `add`,
+    /// where the CPU executed the constant (SIGILL under qemu).
+    #[test]
+    fn line_directives_do_not_dump_the_literal_pool() {
+        let w = assemble(
+            ".file 1 \"p.c\"\n.text\nf:\nldr x0, =0x1122334455667788\n.loc 1 5 0\n\
+             .arch armv8-a\n.ident \"x\"\nadd x0, x0, #1\nret\n",
+        );
+        let text = &w.base.sections[".text"].data;
+        let word = |i: usize| {
+            u32::from_le_bytes([
+                text[4 * i],
+                text[4 * i + 1],
+                text[4 * i + 2],
+                text[4 * i + 3],
+            ])
+        };
+        assert_eq!(word(1), 0x9100_0400, "`add x0, x0, #1` follows the ldr");
+        assert_eq!(word(2), 0xd65f_03c0, "`ret`");
+        assert_eq!(
+            text[text.len() - 8..],
+            0x1122_3344_5566_7788u64.to_le_bytes(),
+            "the literal closes the section"
+        );
+    }
+
+    /// `.file`/`.loc` become a line table and a compile unit addressed by
+    /// section offsets (AArch64 linkers never delete code bytes).
+    #[test]
+    fn loc_rows_become_a_line_table() {
+        let mut w = assemble(
+            ".file 1 \"p.c\"\n.text\n.globl f\n.type f,%function\nf:\n.loc 1 3 0\nnop\n\
+             .loc 1 4 2\nret\n.size f, .-f\n",
+        );
+        w.base.finish_debug_sections(8, 258, 257).unwrap();
+        let line = &w.base.sections[".debug_line"];
+        let targets: Vec<_> = line
+            .relocs
+            .iter()
+            .map(|r| (r.reloc_type, r.symbol_name.as_str(), r.addend))
+            .collect();
+        assert_eq!(targets, [(257, ".text", 0)]);
+        let info = &w.base.sections[".debug_info"];
+        assert!(
+            info.relocs
+                .iter()
+                .any(|r| (r.reloc_type, r.symbol_name.as_str()) == (258, ".debug_line")),
+            "the unit points at its line program"
+        );
+        assert!(w.base.sections.contains_key(".debug_abbrev"));
     }
 }

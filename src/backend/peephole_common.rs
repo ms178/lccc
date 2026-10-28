@@ -564,6 +564,84 @@ impl LineStore {
         }
         result
     }
+
+    /// [`Self::build_result`] for a store whose `-g` line rows were hidden
+    /// from the passes (`rows[i]`: line `i` was a `.loc` the driver marked
+    /// deleted so no window could see it -- the only way `-g` cannot change
+    /// the code, whatever adjacency each pass assumes).
+    ///
+    /// A hidden row is re-emitted where it stood: it is held and written
+    /// directly before the next line that survives. A later row reached
+    /// first supersedes it (both would describe the same address, where the
+    /// last row wins), which also retires the copy a deleted duplicate block
+    /// carried; a row with no surviving line after it is dropped. A slot a
+    /// pass overwrote is emitted as its new text through `skip`.
+    pub(crate) fn build_result_with_debug_rows(
+        &self,
+        skip: impl Fn(usize) -> bool,
+        rows: &[bool],
+    ) -> String {
+        let mut result = String::with_capacity(self.original.len());
+        let mut held: Option<usize> = None;
+        for i in 0..self.entries.len() {
+            if !skip(i) {
+                if let Some(row) = held.take() {
+                    result.push_str(self.get(row));
+                    result.push('\n');
+                }
+                result.push_str(self.get(i));
+                result.push('\n');
+            } else if rows.get(i).copied().unwrap_or(false) && is_loc_directive(self.get(i).trim())
+            {
+                held = Some(i);
+            }
+        }
+        result
+    }
+}
+
+/// Hide every `-g` line row from a `Vec<String>` peephole (AArch64, RISC-V)
+/// by classifying it as deleted, so no window, adjacency test or line census
+/// can see it: `-g` must not change the code. [`join_with_debug_rows`] puts
+/// the rows back.
+pub(crate) fn hide_debug_rows<K: Copy>(lines: &[String], kinds: &mut [K], deleted: K) {
+    for (line, kind) in lines.iter().zip(kinds.iter_mut()) {
+        if is_loc_directive(line.trim()) {
+            *kind = deleted;
+        }
+    }
+}
+
+/// [`LineStore::build_result_with_debug_rows`] for the `Vec<String>`
+/// peepholes. A deleted line whose text is still a `.loc` is a hidden row
+/// (or a pass's copy of one; no pass saw rows as anything but deleted lines).
+/// It is held and written directly before the next kept line; a later row
+/// reached first supersedes it, and a row with no kept line after it is
+/// dropped.
+pub(crate) fn join_with_debug_rows(lines: &[String], kept: impl Fn(usize) -> bool) -> String {
+    let mut result = String::with_capacity(lines.iter().map(|l| l.len() + 1).sum());
+    let mut held: Option<&str> = None;
+    for (i, line) in lines.iter().enumerate() {
+        if kept(i) {
+            if let Some(row) = held.take() {
+                result.push_str(row);
+                result.push('\n');
+            }
+            result.push_str(line);
+            result.push('\n');
+        } else if is_loc_directive(line.trim()) {
+            held = Some(line);
+        }
+    }
+    result
+}
+
+/// A `-g` line-table row: `.loc` and its operands (blank-separated), not a
+/// lookalike such as `.location` or `.loc_mark_labels`.
+pub(crate) fn is_loc_directive(trimmed: &str) -> bool {
+    trimmed
+        .strip_prefix(".loc")
+        .is_some_and(|rest| rest.starts_with([' ', '\t']))
 }
 
 // ── Assembler-directive effects ────────────────────────────────────────────────
@@ -1428,5 +1506,42 @@ mod tests {
         assert_eq!(s.get(1), "B2");
         assert_eq!(s.replacements.len(), 1, "second replace must not leak");
         assert_eq!(s.build_result(|i| i == 0), "B2\nc\n");
+    }
+}
+
+#[cfg(test)]
+mod debug_row_tests {
+    use super::{LineStore, is_loc_directive};
+
+    #[test]
+    fn loc_lookalikes_are_not_rows() {
+        assert!(is_loc_directive(".loc 1 2 3"));
+        assert!(is_loc_directive(".loc\t1 2"));
+        for t in [
+            ".location 1",
+            ".loc_mark_labels 1",
+            ".loc",
+            ".file 1 \"a.c\"",
+        ] {
+            assert!(!is_loc_directive(t), "{t}");
+        }
+    }
+
+    /// Rows come back where they stood; a row superseded before any
+    /// surviving line, or with none after it, is dropped; an overwritten
+    /// slot is emitted as its new text.
+    #[test]
+    fn hidden_rows_are_re_emitted_in_place() {
+        let mut store = LineStore::new(
+            ".loc 1 1 0\na\n.loc 1 2 0\ndead\n.loc 1 3 0\nb\n.loc 1 4 0\nc\n.loc 1 5 0\n"
+                .to_string(),
+        );
+        let rows = [true, false, true, false, true, false, true, false, true];
+        store.replace(6, "planted".to_string());
+        let deleted = |i: usize| (rows[i] && i != 6) || i == 3;
+        assert_eq!(
+            store.build_result_with_debug_rows(deleted, &rows),
+            ".loc 1 1 0\na\n.loc 1 3 0\nb\nplanted\nc\n"
+        );
     }
 }

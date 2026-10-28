@@ -2454,10 +2454,16 @@ pub(super) fn hoist_repeated_fp_constant_loads(
         let reg = format!("%xmm{}", free);
 
         // Materialization slot: the latest NOP before the first use, with
-        // no label between slot and last use (pure fall-through).
+        // no label between slot and last use (pure fall-through). Not a
+        // hidden `-g` row (`hide_debug_rows`): those slots exist only under
+        // `-g`, so taking one hoisted there and not in the plain build (and
+        // overwrote the row).
         let first = sites[0];
         let last = sites[sites.len() - 1];
-        let Some(slot) = (0..first).rev().find(|&p| infos[p].is_nop()) else {
+        let Some(slot) = (0..first).rev().find(|&p| {
+            infos[p].is_nop()
+                && !crate::backend::peephole_common::is_loc_directive(store.get(p).trim())
+        }) else {
             continue;
         };
         if (slot + 1..=last).any(|k| infos[k].kind == LineKind::Label) {

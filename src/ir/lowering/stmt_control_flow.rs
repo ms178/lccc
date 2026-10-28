@@ -56,6 +56,7 @@ impl Lowerer {
         self.terminate(Terminator::Branch(cond_label));
 
         self.start_block(cond_label);
+        self.func_mut().current_span = cond.span();
         // ms178: direct branch lowering for the while condition.
         self.lower_condition_branch(cond, body_label, end_label);
 
@@ -119,6 +120,7 @@ impl Lowerer {
         // Condition
         self.start_block(cond_label);
         if let Some(cond) = cond {
+            self.func_mut().current_span = cond.span();
             // ms178: direct branch lowering for the for-loop condition.
             self.lower_condition_branch(cond, body_label, end_label);
         } else {
@@ -133,6 +135,9 @@ impl Lowerer {
         // Increment
         self.start_block(inc_label);
         if let Some(inc) = inc {
+            // Its own row: after the body, the current span is the body's
+            // last statement, and the step was attributed to that line.
+            self.func_mut().current_span = inc.span();
             // The increment expression's result is discarded: post-inc/dec
             // can skip their volatile old-value spill.
             self.lower_expr_discard(inc);
@@ -169,6 +174,9 @@ impl Lowerer {
         self.terminate(Terminator::Branch(cond_label));
 
         self.start_block(cond_label);
+        // Lowered after the body: without its own span the condition got
+        // the line of the body's last statement.
+        self.func_mut().current_span = cond.span();
         // ms178: direct branch lowering for the do-while condition.
         self.lower_condition_branch(cond, body_label, end_label);
 

@@ -14,9 +14,13 @@ pub(crate) fn result_type(name: &str) -> Option<CType> {
         "__builtin_ia32_bzhi_si"
         | "__builtin_ia32_crc32hi"
         | "__builtin_ia32_crc32qi"
-        | "__builtin_ia32_crc32si" => CType::UInt,
+        | "__builtin_ia32_crc32si"
+        | "__builtin_ia32_pdep_si"
+        | "__builtin_ia32_pext_si" => CType::UInt,
         "__builtin_ia32_bzhi_di"
         | "__builtin_ia32_crc32di"
+        | "__builtin_ia32_pdep_di"
+        | "__builtin_ia32_pext_di"
         | "__builtin_ia32_rdtsc"
         | "__builtin_ia32_rdtscp" => CType::ULongLong,
         "__builtin_ia32_loaddqu"
@@ -261,6 +265,8 @@ pub(crate) fn requires_64_bit(name: &str) -> bool {
         | "__builtin_ia32_cvtsd2si64"
         | "__builtin_ia32_cvtss2si64"
         | "__builtin_ia32_movnti64"
+        | "__builtin_ia32_pdep_di"
+        | "__builtin_ia32_pext_di"
     )
 }
 
@@ -286,7 +292,11 @@ pub(crate) fn argument_vector_widths(name: &str) -> Option<&'static [usize]> {
         | "__builtin_ia32_crc32si"
         | "__builtin_ia32_movnti"
         | "__builtin_ia32_movnti64"
-        | "__builtin_ia32_movntq" => &[0, 0],
+        | "__builtin_ia32_movntq"
+        | "__builtin_ia32_pdep_di"
+        | "__builtin_ia32_pdep_si"
+        | "__builtin_ia32_pext_di"
+        | "__builtin_ia32_pext_si" => &[0, 0],
         "__builtin_ia32_movntdq"
         | "__builtin_ia32_movntpd"
         | "__builtin_ia32_movntps"
@@ -520,10 +530,14 @@ pub(crate) fn argument_scalar_types(name: &str) -> Option<&'static [Option<IrTyp
     Some(match name {
         "__builtin_ia32_crc32hi" => &[Some(IrType::U32), Some(IrType::U16)],
         "__builtin_ia32_bzhi_si"
-        | "__builtin_ia32_crc32si" => &[Some(IrType::U32), Some(IrType::U32)],
+        | "__builtin_ia32_crc32si"
+        | "__builtin_ia32_pdep_si"
+        | "__builtin_ia32_pext_si" => &[Some(IrType::U32), Some(IrType::U32)],
         "__builtin_ia32_crc32qi" => &[Some(IrType::U32), Some(IrType::U8)],
         "__builtin_ia32_bzhi_di"
-        | "__builtin_ia32_crc32di" => &[Some(IrType::U64), Some(IrType::U64)],
+        | "__builtin_ia32_crc32di"
+        | "__builtin_ia32_pdep_di"
+        | "__builtin_ia32_pext_di" => &[Some(IrType::U64), Some(IrType::U64)],
         "__builtin_ia32_lfence"
         | "__builtin_ia32_pause"
         | "__builtin_ia32_rdtsc"

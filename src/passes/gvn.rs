@@ -2443,6 +2443,7 @@ mod tests {
             is_static: false,
             is_inline: false,
             is_always_inline: false,
+            x86_isa_needs: Default::default(),
             is_noinline: false,
             target_features: Vec::new(),
             is_declaration: false,
@@ -2462,6 +2463,8 @@ mod tests {
             is_gnu_inline_def: false,
             loop_promoted_f64_values: Vec::new(),
             ssp: Default::default(),
+            body_span: crate::common::source::Span::dummy(),
+            terminator_spans: Default::default(),
         };
 
         let mut module = IrModule {
@@ -2537,6 +2540,7 @@ mod tests {
             is_static: false,
             is_inline: false,
             is_always_inline: false,
+            x86_isa_needs: Default::default(),
             is_noinline: false,
             target_features: Vec::new(),
             is_declaration: false,
@@ -2556,6 +2560,8 @@ mod tests {
             ret_is_f128_sse: false,
             loop_promoted_f64_values: Vec::new(),
             ssp: Default::default(),
+            body_span: crate::common::source::Span::dummy(),
+            terminator_spans: Default::default(),
         };
 
         let mut module = IrModule {
@@ -2619,6 +2625,7 @@ mod tests {
             is_static: false,
             is_inline: false,
             is_always_inline: false,
+            x86_isa_needs: Default::default(),
             is_noinline: false,
             target_features: Vec::new(),
             is_declaration: false,
@@ -2638,6 +2645,8 @@ mod tests {
             ret_is_f128_sse: false,
             loop_promoted_f64_values: Vec::new(),
             ssp: Default::default(),
+            body_span: crate::common::source::Span::dummy(),
+            terminator_spans: Default::default(),
         };
 
         let mut module = IrModule {
@@ -2707,6 +2716,7 @@ mod tests {
             is_static: false,
             is_inline: false,
             is_always_inline: false,
+            x86_isa_needs: Default::default(),
             is_noinline: false,
             target_features: Vec::new(),
             is_declaration: false,
@@ -2726,6 +2736,8 @@ mod tests {
             ret_is_f128_sse: false,
             loop_promoted_f64_values: Vec::new(),
             ssp: Default::default(),
+            body_span: crate::common::source::Span::dummy(),
+            terminator_spans: Default::default(),
         };
 
         let mut module = IrModule {
@@ -2799,6 +2811,7 @@ mod tests {
             is_static: false,
             is_inline: false,
             is_always_inline: false,
+            x86_isa_needs: Default::default(),
             is_noinline: false,
             target_features: Vec::new(),
             is_declaration: false,
@@ -2818,6 +2831,8 @@ mod tests {
             ret_is_f128_sse: false,
             loop_promoted_f64_values: Vec::new(),
             ssp: Default::default(),
+            body_span: crate::common::source::Span::dummy(),
+            terminator_spans: Default::default(),
         };
 
         let mut module = IrModule {
@@ -2904,6 +2919,7 @@ mod tests {
             is_static: false,
             is_inline: false,
             is_always_inline: false,
+            x86_isa_needs: Default::default(),
             is_noinline: false,
             target_features: Vec::new(),
             is_declaration: false,
@@ -2923,6 +2939,8 @@ mod tests {
             ret_is_f128_sse: false,
             loop_promoted_f64_values: Vec::new(),
             ssp: Default::default(),
+            body_span: crate::common::source::Span::dummy(),
+            terminator_spans: Default::default(),
         };
 
         let mut module = IrModule {
@@ -2982,6 +3000,7 @@ mod tests {
             is_static: false,
             is_inline: false,
             is_always_inline: false,
+            x86_isa_needs: Default::default(),
             is_noinline: false,
             target_features: Vec::new(),
             is_declaration: false,
@@ -3001,6 +3020,8 @@ mod tests {
             ret_is_f128_sse: false,
             loop_promoted_f64_values: Vec::new(),
             ssp: Default::default(),
+            body_span: crate::common::source::Span::dummy(),
+            terminator_spans: Default::default(),
         }
     }
 
@@ -3835,6 +3856,7 @@ mod tests {
             is_static: false,
             is_inline: false,
             is_always_inline: false,
+            x86_isa_needs: Default::default(),
             is_noinline: false,
             target_features: Vec::new(),
             is_declaration: false,
@@ -3854,6 +3876,8 @@ mod tests {
             ret_is_f128_sse: false,
             loop_promoted_f64_values: Vec::new(),
             ssp: Default::default(),
+            body_span: crate::common::source::Span::dummy(),
+            terminator_spans: Default::default(),
         };
 
         let mut module = IrModule {
@@ -3914,6 +3938,7 @@ mod tests {
             is_static: false,
             is_inline: false,
             is_always_inline: false,
+            x86_isa_needs: Default::default(),
             is_noinline: false,
             target_features: Vec::new(),
             is_declaration: false,
@@ -3932,6 +3957,8 @@ mod tests {
             is_gnu_inline_def: false,
             loop_promoted_f64_values: Vec::new(),
             ssp: Default::default(),
+            body_span: crate::common::source::Span::dummy(),
+            terminator_spans: Default::default(),
         }
     }
 

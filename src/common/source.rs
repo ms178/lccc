@@ -15,6 +15,16 @@ impl Span {
         }
     }
 
+    /// The last byte of a span that runs from an opening to a closing
+    /// delimiter -- a function body's `}`.  `None` for a single-token span.
+    pub fn closing_delimiter(self) -> Option<Self> {
+        (self.end > self.start.saturating_add(1)).then(|| Self {
+            start: self.end - 1,
+            end: self.end,
+            file_id: self.file_id,
+        })
+    }
+
     pub fn dummy() -> Self {
         Self {
             start: 0,

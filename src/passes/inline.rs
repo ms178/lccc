@@ -1722,6 +1722,7 @@ fn inline_run_with(
                                             is_static: false,
                                             is_inline: false,
                                             is_always_inline: false,
+                                            x86_isa_needs: Default::default(),
                                             is_noinline: false,
                                             target_features: Vec::new(),
                                             next_value_id: 0,
@@ -1744,6 +1745,8 @@ fn inline_run_with(
                                             is_gnu_inline_def: false,
                                             loop_promoted_f64_values: Vec::new(),
                                             ssp: Default::default(),
+                                            body_span: crate::common::source::Span::dummy(),
+                                            terminator_spans: Default::default(),
                                         };
                                         dummy
                                     },
@@ -2057,6 +2060,7 @@ fn inline_run_with(
                                             is_static: false,
                                             is_inline: false,
                                             is_always_inline: false,
+                                            x86_isa_needs: Default::default(),
                                             is_noinline: false,
                                             target_features: Vec::new(),
                                             next_value_id: 0,
@@ -2079,6 +2083,8 @@ fn inline_run_with(
                                             is_gnu_inline_def: false,
                                             loop_promoted_f64_values: Vec::new(),
                                             ssp: Default::default(),
+                                            body_span: crate::common::source::Span::dummy(),
+                                            terminator_spans: Default::default(),
                                         };
                                         dummy
                                     },
@@ -2807,6 +2813,10 @@ struct CalleeData {
     /// The callee's normalized `target("...")` feature set; see
     /// [`target_isa_allows_inline`].
     target_features: Vec<String>,
+    /// What the body needs from the x86 ISA beyond `target_features`.
+    x86_isa_needs: crate::ir::module::X86IsaNeeds,
+    /// The body computes with floating-point or SIMD values.
+    uses_fp_or_simd: bool,
     /// Builtin assumptions under which this body was formed. Cloning must
     /// conservatively merge these into the caller before later synthesis.
     builtin_policy: crate::common::pass_policy::BuiltinPolicy,
@@ -3724,6 +3734,8 @@ fn callee_data_for(
         Some(CalleeData {
             blocks: func.blocks.clone(),
             target_features: func.target_features.clone(),
+            x86_isa_needs: func.x86_isa_needs.clone(),
+            uses_fp_or_simd: body_uses_fp_or_simd(func),
             builtin_policy: func.pass_policy.builtins,
             ssp: func.ssp,
             param_struct_sizes,
@@ -4253,33 +4265,130 @@ fn func_has_vector_intrinsics(func: &IrFunction) -> bool {
     })
 }
 
+/// The ISA contract of inlining: a body may move only into a caller whose
+/// feature set covers what the body needs. Every inline path selects sites
+/// through [`find_inline_call_sites`], so this one check covers ordinary,
+/// always_inline and PGO-forced inlining. Refusing is always correct: the
+/// callee stays an ordinary call.
+///
+/// A callee with its own `target(...)` needs its whole feature set (GCC's
+/// `can_inline_p`, each set read in GCC's semantics by
+/// [`crate::backend::x86::isa::function_feature_bits`]). zstd's runtime
+/// dispatch shows why (`ZSTD_encodeSequences` → `static
+/// BMI2_TARGET_ATTRIBUTE ZSTD_encodeSequences_bmi2`, single call site): the
+/// BMI2 clone inlined into its plain dispatcher would be emitted under the
+/// dispatcher's baseline ISA, silently discarding the clone, and a plain
+/// caller absorbing a `target("avx2")` body would execute AVX2 before the
+/// CPUID check.
+///
+/// A callee without `target(...)` needs only what its IR depends on
+/// ([`crate::ir::module::X86IsaNeeds`]): the features the lowering relied
+/// on, the requirements an `always_inline` header body deferred, and the
+/// FP/SIMD registers if it computes with such values. The rest of its IR is
+/// lowered under the caller's own features, so `_mm_popcnt_u32` inlined
+/// into a `target("arch=x86-64")` dispatch baseline becomes the portable
+/// sequence there, `_mm512_add_epi8` inlines into a `target("avx512bw")`
+/// caller of a `-march=x86-64` unit, and a helper that relied on AVX2
+/// stays a call. A plain `always_inline` caller takes every plain body and
+/// its needs: it is checked in turn where it is inlined.
+fn target_isa_allows_inline(caller: &IrFunction, callee: &CalleeData) -> bool {
+    match crate::common::types::target_elf_machine() {
+        // 3 = EM_386 (i686), 62 = EM_X86_64.
+        machine @ (3 | 62) => x86_features_allow_inline(
+            &caller.target_features,
+            caller.is_always_inline,
+            IsaCallee {
+                features: &callee.target_features,
+                needs: callee.x86_isa_needs.relied | callee.x86_isa_needs.deferred,
+                uses_fp_or_simd: callee.uses_fp_or_simd,
+            },
+            crate::common::x86_features::effective().raw(),
+            crate::common::x86_features::explicit(),
+            machine == 62,
+        ),
+        _ => callee
+            .target_features
+            .iter()
+            .all(|f| caller.target_features.contains(f)),
+    }
+}
+
+/// The callee side of [`x86_features_allow_inline`].
+#[derive(Clone, Copy)]
+struct IsaCallee<'a> {
+    /// Its normalized `target(...)` options.
+    features: &'a [String],
+    /// Its relied and deferred x86 needs (`X86Feature` bits).
+    needs: u64,
+    uses_fp_or_simd: bool,
+}
+
+/// [`target_isa_allows_inline`] on x86 in a translation unit with features
+/// `tu`, `tu_explicit` of them explicit on the command line.
+fn x86_features_allow_inline(
+    caller: &[String],
+    caller_always_inline: bool,
+    callee: IsaCallee<'_>,
+    tu: u64,
+    tu_explicit: u64,
+    x86_64: bool,
+) -> bool {
+    use crate::backend::x86::isa::{function_feature_bits, function_x87_denial};
+    use crate::common::x86_features::X86Feature as F;
+    let features = |options: &[String]| function_feature_bits(tu, tu_explicit, options, x86_64);
+    if !callee.features.is_empty() {
+        return caller == callee.features || features(callee.features) & !features(caller) == 0;
+    }
+    if caller_always_inline && caller.is_empty() {
+        return true;
+    }
+    let mut needed = callee.needs;
+    if callee.uses_fp_or_simd {
+        if function_x87_denial(caller).is_some() {
+            return false;
+        }
+        needed |= tu & (1 << F::Sse as u8 | 1 << F::Sse2 as u8);
+    }
+    needed & !features(caller) == 0
+}
+
+/// Whether `func` computes with floating-point or SIMD values, so that
+/// wherever it is inlined the FP/vector register file must be available.
+fn body_uses_fp_or_simd(func: &IrFunction) -> bool {
+    use crate::common::types::EightbyteClass;
+    let call_uses_fp = |info: &crate::ir::instruction::CallInfo| {
+        info.return_type.is_float()
+            || info.arg_types.iter().any(IrType::is_float)
+            || info
+                .struct_arg_classes
+                .iter()
+                .flatten()
+                .any(|class| matches!(class, EightbyteClass::Sse | EightbyteClass::SseUp))
+    };
+    func.return_type.is_float()
+        || func.params.iter().any(|param| param.ty.is_float())
+        || func
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .any(|inst| {
+                inst.result_type().is_some_and(|ty| ty.is_float())
+                    || match inst {
+                        Instruction::Store { ty, .. } => ty.is_float(),
+                        Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
+                            call_uses_fp(info)
+                        }
+                        Instruction::Intrinsic { op, .. } => op.is_vector_op(),
+                        _ => false,
+                    }
+            })
+}
+
 /// Find call sites in a function that are eligible for inlining.
 /// `caller_has_section`: true if the caller has a custom section attribute.
 /// When true, callees that exceed normal inline limits (but fit relaxed limits)
 /// are also eligible, since cross-section calls from section-attributed functions
 /// (e.g., .head.text, .noinstr.text) can cause boot/runtime failures.
-/// GCC's `can_inline_p` ISA rule over `__attribute__((target(...)))`: a
-/// callee may be cloned into a caller only when every feature the callee
-/// names is also named by the caller (both sets are normalized: sorted and
-/// deduplicated).
-///
-/// Every inline path selects sites through [`find_inline_call_sites`], so
-/// this one check covers ordinary, always_inline and PGO-forced inlining.
-/// Two failure modes motivate it, both seen on zstd's runtime dispatch
-/// (`ZSTD_encodeSequences` → `static BMI2_TARGET_ATTRIBUTE
-/// ZSTD_encodeSequences_bmi2`, single call site):
-/// * the BMI2 clone inlined into its plain dispatcher is emitted under
-///   the dispatcher's baseline ISA, silently discarding the clone;
-/// * conversely, a plain caller absorbing a `target("avx2")` body would
-///   execute AVX2 on the path that runs *before* the CPUID check.
-///
-/// Refusing is always correct: the callee stays an ordinary call. A plain
-/// callee (empty set) inlines anywhere and inherits the caller's ISA,
-/// matching GCC (`static inline` helpers inside a `_bmi2` clone).
-fn target_isa_allows_inline(caller: &[String], callee: &[String]) -> bool {
-    callee.iter().all(|f| caller.binary_search(f).is_ok())
-}
-
 fn find_inline_call_sites(
     func: &IrFunction,
     callee_map: &FxHashMap<String, CalleeData>,
@@ -4304,10 +4413,7 @@ fn find_inline_call_sites(
                         }
                         // ISA contract: never clone a body that may use
                         // extensions its caller was not compiled for.
-                        if !target_isa_allows_inline(
-                            &func.target_features,
-                            &callee_data.target_features,
-                        ) {
+                        if !target_isa_allows_inline(func, callee_data) {
                             continue;
                         }
                         if func.ssp.no_stack_protector != callee_data.ssp.no_stack_protector {
@@ -5786,6 +5892,21 @@ fn inline_call_site(
         .builtins
         .conservative_merge(callee.builtin_policy);
     caller.ssp.merge_inlined(callee.ssp);
+    // The caller's body now holds the callee's ISA-dependent IR.
+    let machine = crate::common::types::target_elf_machine();
+    let caller_features = if matches!(machine, 3 | 62) {
+        crate::backend::x86::isa::function_feature_bits(
+            crate::common::x86_features::effective().raw(),
+            crate::common::x86_features::explicit(),
+            &caller.target_features,
+            machine == 62,
+        )
+    } else {
+        0
+    };
+    caller
+        .x86_isa_needs
+        .absorb(&callee.x86_isa_needs, caller_features);
 
     true
 }
@@ -6660,6 +6781,8 @@ mod inline_limit_tests {
             single_call_site: false,
             agg_frame_bytes: 0,
             is_always_inline: false,
+            x86_isa_needs: Default::default(),
+            uses_fp_or_simd: false,
             exceeds_normal_limits: false,
             is_static_inline: false,
             is_gnu_inline_def: false,
@@ -6877,6 +7000,7 @@ mod value_reference_tests {
             is_static: false,
             is_inline: false,
             is_always_inline: false,
+            x86_isa_needs: Default::default(),
             is_noinline: false,
             target_features: Vec::new(),
             next_value_id: 2,
@@ -6899,6 +7023,8 @@ mod value_reference_tests {
             is_gnu_inline_def: false,
             loop_promoted_f64_values: Vec::new(),
             ssp: Default::default(),
+            body_span: crate::common::source::Span::dummy(),
+            terminator_spans: Default::default(),
         }
     }
 
@@ -7371,6 +7497,7 @@ mod const_trip_tests {
             is_static: true,
             is_inline: false,
             is_always_inline: false,
+            x86_isa_needs: Default::default(),
             is_noinline: false,
             target_features: Vec::new(),
             next_value_id: 16,
@@ -7393,6 +7520,8 @@ mod const_trip_tests {
             is_gnu_inline_def: false,
             loop_promoted_f64_values: Vec::new(),
             ssp: Default::default(),
+            body_span: crate::common::source::Span::dummy(),
+            terminator_spans: Default::default(),
         }
     }
 
@@ -9309,48 +9438,151 @@ mod extern_admission_tests {
 
 #[cfg(test)]
 mod target_isa_tests {
-    use super::target_isa_allows_inline;
+    use super::{IsaCallee, x86_features_allow_inline};
+    use crate::backend::x86::isa::X86Isa;
+    use crate::common::x86_features::X86Feature;
     use crate::ir::module::normalize_target_features;
 
     fn set(raw: &str) -> Vec<String> {
         normalize_target_features(raw)
     }
 
-    #[test]
-    fn normalization_is_canonical() {
-        assert_eq!(set(" BMI2 ,lzcnt,,bmi, bmi2 "), ["bmi", "bmi2", "lzcnt"]);
-        assert!(set(" , ").is_empty());
+    fn cpu(name: &str) -> u64 {
+        X86Isa::arch_row(name).expect("GCC CPU").feature_bits()
+    }
+
+    /// May `callee` (with its own `target(...)`) inline into the plain
+    /// function `caller` in an x86-64 TU with features `tu`?
+    fn allows(caller: &str, callee: &str, tu: u64) -> bool {
+        let callee = set(callee);
+        let side = IsaCallee {
+            features: &callee,
+            needs: 0,
+            uses_fp_or_simd: false,
+        };
+        x86_features_allow_inline(&set(caller), false, side, tu, 0, true)
+    }
+
+    /// May a callee without `target(...)` that needs `needs` (and, with
+    /// `fp`, the FP/SIMD registers) inline into `caller`?
+    fn plain_allows(caller: &str, always_inline: bool, needs: u64, fp: bool, tu: u64) -> bool {
+        let side = IsaCallee {
+            features: &[],
+            needs,
+            uses_fp_or_simd: fp,
+        };
+        x86_features_allow_inline(&set(caller), always_inline, side, tu, 0, true)
+    }
+
+    fn bits(features: &[X86Feature]) -> u64 {
+        features.iter().fold(0, |b, &f| b | 1 << f as u8)
     }
 
     #[test]
-    fn plain_callee_inlines_anywhere() {
-        assert!(target_isa_allows_inline(&[], &[]));
-        assert!(target_isa_allows_inline(&set("bmi2"), &[]));
+    fn normalization_keeps_the_attribute_order() {
+        assert_eq!(
+            set(" BMI2 ,lzcnt,,bmi, bmi2 "),
+            ["bmi2", "lzcnt", "bmi", "bmi2"]
+        );
+        assert!(set(" , ").is_empty());
+    }
+
+    /// GCC 16.2: `arch=` discards the ISA options before it (grants,
+    /// denials, `general-regs-only`) and keeps those after it and every
+    /// `key=value` option.
+    #[test]
+    fn arch_discards_the_isa_options_before_it() {
+        assert_eq!(set("avx2,arch=x86-64"), ["arch=x86-64"]);
+        assert_eq!(
+            set("no-avx2,general-regs-only,arch=haswell,no-fma"),
+            ["arch=haswell", "no-fma"]
+        );
+        assert_eq!(
+            set("tune=znver4,avx2,arch=x86-64,popcnt"),
+            ["tune=znver4", "arch=x86-64", "popcnt"]
+        );
+        assert_eq!(set("bmi2,lzcnt"), ["bmi2", "lzcnt"]);
+    }
+
+    /// A body without `target(...)` carries only what its IR depends on.
+    #[test]
+    fn plain_callee_needs_only_what_its_ir_depends_on() {
+        use X86Feature as F;
+        let (v1, haswell) = (cpu("x86-64"), cpu("haswell"));
+        // `_mm_popcnt_u32` (`__builtin_popcount`) depends on nothing: it
+        // reaches a haswell unit's dispatch baseline and becomes the
+        // portable sequence there.
+        assert!(plain_allows("arch=x86-64", false, 0, false, haswell));
+        assert!(plain_allows("general-regs-only", false, 0, false, v1));
+        // A helper that lowered an AVX2 intrinsic stays a call there.
+        let avx2 = bits(&[F::Avx2]);
+        assert!(!plain_allows("arch=x86-64", false, avx2, false, haswell));
+        assert!(plain_allows("arch=haswell", false, avx2, false, haswell));
+        assert!(plain_allows("", false, avx2, false, haswell));
+        // FP and SIMD values need the register files the caller removes.
+        assert!(!plain_allows("general-regs-only", false, 0, true, v1));
+        assert!(!plain_allows("no-sse2", false, 0, true, v1));
+        assert!(!plain_allows("no-80387", false, 0, true, v1));
+        assert!(plain_allows("bmi2", false, 0, true, v1));
+        assert!(plain_allows("no-80387,80387", false, 0, true, v1));
+    }
+
+    /// lccc's 512-bit intrinsics are `always_inline` header bodies whose
+    /// requirement a `-march=x86-64` unit defers to the inlining caller.
+    #[test]
+    fn deferred_requirements_settle_in_a_granting_caller() {
+        use X86Feature as F;
+        let v1 = cpu("x86-64");
+        let bw = bits(&[F::Avx512Bw, F::Avx512F]);
+        assert!(plain_allows("avx512bw", false, bw, true, v1));
+        assert!(plain_allows("avx512bmm", false, bw, true, v1));
+        assert!(!plain_allows("avx512f", false, bw, true, v1));
+        assert!(!plain_allows("", false, bw, true, v1));
+        // Another header body takes it over and is checked where it lands.
+        assert!(plain_allows("", true, bw, true, v1));
+        // A `target(...)` always_inline caller is no deferring header body.
+        assert!(!plain_allows("avx2", true, bw, true, v1));
+    }
+
+    /// Absorbing a body settles exactly the deferred features the caller
+    /// grants, and keeps the first intrinsic that needs what remains.
+    #[test]
+    fn absorbing_settles_granted_deferred_features() {
+        use crate::ir::module::X86IsaNeeds;
+        use X86Feature as F;
+        let inlined = X86IsaNeeds {
+            relied: bits(&[F::Sse2]),
+            deferred: bits(&[F::Avx512Bw, F::Avx512F]),
+            first_use: Some("_mm512_add_epi8".to_string()),
+        };
+        let mut granting = X86IsaNeeds::default();
+        granting.absorb(&inlined, bits(&[F::Sse2, F::Avx512Bw, F::Avx512F]));
+        assert_eq!((granting.relied, granting.deferred), (bits(&[F::Sse2]), 0));
+        assert_eq!(granting.first_use, None);
+        let mut header = X86IsaNeeds::default();
+        header.absorb(&inlined, cpu("x86-64"));
+        assert_eq!(header.deferred, inlined.deferred);
+        assert_eq!(header.first_use.as_deref(), Some("_mm512_add_epi8"));
     }
 
     #[test]
     fn target_callee_needs_a_covering_caller() {
+        let v1 = cpu("x86-64");
         // zstd: plain dispatcher -> static BMI2 clone must stay a call.
-        assert!(!target_isa_allows_inline(&[], &set("lzcnt,bmi,bmi2")));
+        assert!(!allows("", "lzcnt,bmi,bmi2", v1));
         // Partial cover is not enough: one missing feature refuses.
-        assert!(!target_isa_allows_inline(
-            &set("bmi,bmi2"),
-            &set("lzcnt,bmi,bmi2")
-        ));
+        assert!(!allows("bmi,bmi2", "lzcnt,bmi,bmi2", v1));
         // Equal and superset callers accept, independent of spelling order.
-        assert!(target_isa_allows_inline(
-            &set("bmi2,bmi,lzcnt"),
-            &set("lzcnt,bmi,bmi2")
-        ));
-        assert!(target_isa_allows_inline(
-            &set("avx2,bmi,bmi2"),
-            &set("bmi2")
-        ));
-        // `arch=` and vector entries compare as opaque features.
-        assert!(!target_isa_allows_inline(
-            &set("bmi2"),
-            &set("arch=haswell")
-        ));
+        assert!(allows("bmi2,bmi,lzcnt", "lzcnt,bmi,bmi2", v1));
+        assert!(allows("avx2,bmi,bmi2", "bmi2", v1));
+        // Features compare, not spellings: `avx2` covers `sse4.2`, and
+        // `arch=haswell` covers `avx2,bmi2`, but not the reverse.
+        assert!(allows("avx2", "sse4.2,popcnt", v1));
+        assert!(allows("arch=haswell", "avx2,bmi2", v1));
+        assert!(!allows("bmi2", "arch=haswell", v1));
+        assert!(!allows("avx2", "avx512bmm", v1));
+        // A callee's denial needs no cover.
+        assert!(allows("", "no-avx2", cpu("haswell")));
     }
 }
 
@@ -9543,6 +9775,8 @@ mod sroa_unlock_tests {
             single_call_site: false,
             agg_frame_bytes: 0,
             is_always_inline: false,
+            x86_isa_needs: Default::default(),
+            uses_fp_or_simd: false,
             exceeds_normal_limits: false,
             is_static_inline: declared_inline,
             is_gnu_inline_def: false,

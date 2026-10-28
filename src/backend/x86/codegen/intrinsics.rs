@@ -2331,6 +2331,75 @@ impl X86Codegen {
         }
     }
 
+    /// `%rax = pdep/pext(%rax, mask = %rcx)`. A function that may use BMI2
+    /// gets the instruction. One that may not (a `target("arch=x86-64")`
+    /// caller of the inlined `bmi2intrin.h` under `-mbmi2`) gets an exact
+    /// loop over the mask's set bits, with no data-dependent branch:
+    ///
+    /// * PDEP, lowest bit first: `low = m & -m`, merged into the result
+    ///   (`%rdx`) by CMOV when the source's next bit is set.
+    /// * PEXT, highest bit first: BSR finds the bit, BT copies the source
+    ///   bit to CF, ADC shifts it into the result, BTR clears the mask bit.
+    ///
+    /// `%rdx`/`%rdi` are declared scratch in `x86_inst_fixed_scratch`.
+    fn emit_pdep_pext(&mut self, op: &IntrinsicOp) {
+        let wide = matches!(op, IntrinsicOp::Pdep64 | IntrinsicOp::Pext64);
+        let deposit = matches!(op, IntrinsicOp::Pdep32 | IntrinsicOp::Pdep64);
+        let (sfx, src, mask, acc, bit) = if wide {
+            ('q', "rax", "rcx", "rdx", "rdi")
+        } else {
+            ('l', "eax", "ecx", "edx", "edi")
+        };
+        if self.bmi2_enabled {
+            let mnemonic = if deposit { "pdep" } else { "pext" };
+            self.state
+                .emit_fmt(format_args!("    {mnemonic}{sfx} %{mask}, %{src}, %{src}"));
+            return;
+        }
+        let head = self
+            .state
+            .fresh_label(if deposit { "pdep_loop" } else { "pext_loop" });
+        let done = self
+            .state
+            .fresh_label(if deposit { "pdep_done" } else { "pext_done" });
+        self.state.emit("    xorl %edx, %edx");
+        self.state
+            .emit_fmt(format_args!("    test{sfx} %{mask}, %{mask}"));
+        self.state.out.emit_jcc_label("    je", &done);
+        self.state.out.emit_named_label(&head);
+        if deposit {
+            self.state
+                .emit_fmt(format_args!("    mov{sfx} %{mask}, %{bit}"));
+            self.state.emit_fmt(format_args!("    neg{sfx} %{bit}"));
+            self.state
+                .emit_fmt(format_args!("    and{sfx} %{mask}, %{bit}"));
+            self.state
+                .emit_fmt(format_args!("    xor{sfx} %{bit}, %{mask}"));
+            self.state
+                .emit_fmt(format_args!("    or{sfx} %{acc}, %{bit}"));
+            self.state.emit("    testb $1, %al");
+            self.state
+                .emit_fmt(format_args!("    cmovne{sfx} %{bit}, %{acc}"));
+            self.state.emit_fmt(format_args!("    shr{sfx} $1, %{src}"));
+        } else {
+            self.state
+                .emit_fmt(format_args!("    bsr{sfx} %{mask}, %{bit}"));
+            self.state
+                .emit_fmt(format_args!("    bt{sfx} %{bit}, %{src}"));
+            self.state
+                .emit_fmt(format_args!("    adc{sfx} %{acc}, %{acc}"));
+            self.state
+                .emit_fmt(format_args!("    btr{sfx} %{bit}, %{mask}"));
+        }
+        self.state
+            .emit_fmt(format_args!("    test{sfx} %{mask}, %{mask}"));
+        self.state.out.emit_jcc_label("    jne", &head);
+        self.state.out.emit_named_label(&done);
+        self.state
+            .emit_fmt(format_args!("    mov{sfx} %{acc}, %{src}"));
+        self.state.reg_cache.invalidate_all();
+    }
+
     pub(super) fn emit_intrinsic_impl(
         &mut self,
         dest: &Option<Value>,
@@ -2564,6 +2633,17 @@ impl X86Codegen {
                     self.state.emit("    movd %eax, %xmm0");
                     self.state.emit("    pshufd $0, %xmm0, %xmm0");
                     self.sse_store_dest(dptr, "xmm0");
+                }
+            }
+            IntrinsicOp::Pdep32
+            | IntrinsicOp::Pdep64
+            | IntrinsicOp::Pext32
+            | IntrinsicOp::Pext64 => {
+                self.operand_to_reg(&args[0], "rax");
+                self.operand_to_reg(&args[1], "rcx");
+                self.emit_pdep_pext(op);
+                if let Some(d) = dest {
+                    self.store_rax_to(d);
                 }
             }
             IntrinsicOp::Crc32_8
@@ -3613,6 +3693,12 @@ impl X86Codegen {
                         IntrinsicOp::Dpwssds128 | IntrinsicOp::Dpwssds256 => "vpdpwssds",
                         _ => unreachable!(),
                     };
+                    // The four AVX-VNNI forms also exist as EVEX (AVX512-VNNI),
+                    // which assemblers pick by default; name the encoding the
+                    // function's CPU executes (`vex_vnni`). The INT8/INT16
+                    // forms are VEX-only.
+                    let dual = matches!(inst, "vpdpbusd" | "vpdpbusds" | "vpdpwssd" | "vpdpwssds");
+                    let hint = if dual && self.vex_vnni { "{vex} " } else { "" };
                     let is256 = matches!(
                         op,
                         IntrinsicOp::Dpbusd256
@@ -3635,14 +3721,14 @@ impl X86Codegen {
                         self.avx_load_arg_to(&args[1], "ymm1");
                         self.avx_load_arg_to(&args[2], "ymm2");
                         self.state
-                            .emit_fmt(format_args!("    {} %ymm2, %ymm1, %ymm0", inst));
+                            .emit_fmt(format_args!("    {hint}{inst} %ymm2, %ymm1, %ymm0"));
                         self.avx_store_dest(dptr);
                     } else {
                         self.sse_load_arg(&args[0], "xmm0");
                         self.sse_load_arg(&args[1], "xmm1");
                         self.sse_load_arg(&args[2], "xmm2");
                         self.state
-                            .emit_fmt(format_args!("    {} %xmm2, %xmm1, %xmm0", inst));
+                            .emit_fmt(format_args!("    {hint}{inst} %xmm2, %xmm1, %xmm0"));
                         self.sse_store_dest(dptr, "xmm0");
                     }
                 }

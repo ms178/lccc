@@ -9,6 +9,24 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use super::types::*;
 use crate::backend::linker_common;
 
+/// Turn the tentative definitions a shared library's data definition takes
+/// over (`input::bind_shared_commons`, GNU ld's binding) into references:
+/// each is then imported like any undefined data (`R_386_GLOB_DAT` or a copy
+/// relocation in an executable, an undefined dynamic symbol in a shared
+/// object).  Rewriting them before resolution, as bfd's `elf_merge_symbol`
+/// does, lets every later phase see a plain reference.
+pub(super) fn import_shared_commons(inputs: &mut [InputObject], imports: &FxHashSet<String>) {
+    if imports.is_empty() {
+        return;
+    }
+    for sym in inputs.iter_mut().flat_map(|obj| &mut obj.symbols) {
+        if sym.section_index == SHN_COMMON && imports.contains(&sym.name) {
+            sym.section_index = SHN_UNDEF;
+            sym.value = 0;
+        }
+    }
+}
+
 pub(super) fn resolve_symbols(
     inputs: &[InputObject],
     _output_sections: &[OutputSection],
@@ -28,6 +46,21 @@ pub(super) fn resolve_symbols(
                 continue;
             }
             if sym.section_index == SHN_UNDEF {
+                continue;
+            }
+            // An STB_LOCAL definition has file scope: it never satisfies
+            // another object's reference and never names a slot others can
+            // find (gABI; GNU ld and the x86-64 linker agree).  Treating
+            // locals as fallback definitions bound `extern int helper()` to
+            // another file's `static int helper()` instead of reporting it
+            // undefined, and -- since a name present here is never looked up
+            // in the linked libraries -- let a `static atoi` capture every
+            // other object's libc `atoi`.  Locals resolve per object
+            // (`resolve_via_section_map`); their GOT slots and IFUNC stubs
+            // are keyed by (object, symbol) in `collect_local_got_slots` and
+            // `collect_local_ifuncs`.
+            if sym.binding == STB_LOCAL {
+                sym_resolution.insert((obj_idx, sym_idx), sym.name.clone());
                 continue;
             }
 
@@ -79,23 +112,10 @@ pub(super) fn resolve_symbols(
 
             match global_symbols.get(sym.name.as_str()) {
                 None => {
-                    // Note: STB_LOCAL symbols are deliberately inserted here when no
-                    // entry exists yet. Unlike ELF64 backends that skip locals entirely,
-                    // the i686 backend must allow locals as fallback definitions because
-                    // glibc's static archives contain cross-object references that resolve
-                    // through local symbols. The Some arm below prevents locals from
-                    // *overriding* any existing entry (global, weak, or other local).
                     global_symbols.insert(sym.name.to_string(), new_sym);
                 }
                 Some(existing) => {
-                    // Local symbols must not override any existing entry.
-                    // They have file scope only and should not shadow globals
-                    // or weaks from other objects (e.g. a static "data" in one
-                    // file must not shadow a global "data" in another).
-                    if sym.binding == STB_LOCAL {
-                        // Already have a definition; keep it.
-                    } else if sym.binding == STB_GLOBAL
-                        && (existing.binding == STB_WEAK || existing.binding == STB_LOCAL)
+                    if sym.binding == STB_GLOBAL && existing.binding == STB_WEAK
                         || (!existing.is_defined && new_sym.is_defined)
                     {
                         global_symbols.insert(sym.name.to_string(), new_sym);
@@ -272,12 +292,18 @@ pub(super) fn allocate_common_symbols(
 // Phase 7: PLT/GOT marking + undefined check
 // ══════════════════════════════════════════════════════════════════════════════
 
+/// Marks the PLT/GOT/COPY needs of named (global) symbols and returns the
+/// GOT slots STB_LOCAL symbols need, one per (object, symbol) in input
+/// order.  A local never touches a same-named global's entry: a `static
+/// atoi` call is not a reason to give libc's `atoi` a PLT slot, and a
+/// `static` object named like a DSO variable must not copy-relocate it.
 pub(super) fn mark_plt_got_needs(
     inputs: &[InputObject],
     global_symbols: &mut FxHashMap<String, LinkerSymbol>,
-    _is_static: bool,
-) {
-    for obj in inputs.iter() {
+) -> Vec<(usize, usize)> {
+    let mut local_got: Vec<(usize, usize)> = Vec::new();
+    let mut local_seen: FxHashSet<(usize, usize)> = FxHashSet::default();
+    for (obj_idx, obj) in inputs.iter().enumerate() {
         for sec in &obj.sections {
             // Executables transition every GD/LDM sequence (see tls.rs), so
             // their `___tls_get_addr` calls disappear and need no PLT/GOT.
@@ -290,10 +316,23 @@ pub(super) fn mark_plt_got_needs(
                     continue;
                 };
 
-                if sym.sym_type == STT_SECTION || sym.name.is_empty() {
+                if dead_calls.contains(&rel_offset) {
                     continue;
                 }
-                if dead_calls.contains(&rel_offset) {
+                if sym.binding == STB_LOCAL || sym.sym_type == STT_SECTION {
+                    if matches!(rel_type, R_386_GOT32 | R_386_GOT32X)
+                        && sec.flags & SHF_ALLOC != 0
+                        && !(rel_type == R_386_GOT32X
+                            && super::reloc::got32x_conversion(&sec.data, rel_offset as usize)
+                                .is_some()
+                            && super::reloc::got_target_relaxable(sym, None))
+                        && local_seen.insert((obj_idx, sym_idx as usize))
+                    {
+                        local_got.push((obj_idx, sym_idx as usize));
+                    }
+                    continue;
+                }
+                if sym.name.is_empty() {
                     continue;
                 }
 
@@ -385,6 +424,7 @@ pub(super) fn mark_plt_got_needs(
             }
         }
     }
+    local_got
 }
 
 /// Whether the relocated field at `offset` of `sec` is the rel32 of a direct
@@ -495,20 +535,43 @@ pub(super) fn build_plt_got_lists(
     )
 }
 
+/// The executable's own named IFUNCs.  Static and dynamic executables both
+/// call them through an IPLT stub whose GOT slot an `R_386_IRELATIVE` fills
+/// (`.rel.iplt` applied by the static startup code, the tail of `.rel.dyn`
+/// applied by ld.so); a dynamic executable calling the resolver directly
+/// returned the implementation's address instead of calling it.  A
+/// shared-library IFUNC is the library's business (`is_dynamic`).
 pub(super) fn collect_ifunc_symbols(
     global_symbols: &FxHashMap<String, LinkerSymbol>,
-    is_static: bool,
 ) -> Vec<String> {
-    if !is_static {
-        return Vec::new();
-    }
     let mut ifunc_symbols: Vec<String> = global_symbols
         .iter()
-        .filter(|(_, s)| s.is_defined && s.sym_type == STT_GNU_IFUNC)
+        .filter(|(_, s)| s.is_defined && !s.is_dynamic && s.sym_type == STT_GNU_IFUNC)
         .map(|(n, _)| n.clone())
         .collect();
     ifunc_symbols.sort();
     ifunc_symbols
+}
+
+/// STB_LOCAL IFUNCs (`static T f(void) __attribute__((ifunc("r")))`) of
+/// kept sections, by (object, symbol): they get IPLT stubs after the named
+/// ones, and every relocation against them resolves to the stub.
+pub(super) fn collect_local_ifuncs(
+    inputs: &[InputObject],
+    section_map: &SectionMap,
+) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    for (obj_idx, obj) in inputs.iter().enumerate() {
+        for (sym_idx, sym) in obj.symbols.iter().enumerate() {
+            if sym.binding == STB_LOCAL
+                && sym.sym_type == STT_GNU_IFUNC
+                && section_map.contains_key(&(obj_idx, sym.section_index as usize))
+            {
+                out.push((obj_idx, sym_idx));
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -571,5 +634,60 @@ mod tests {
         assert_eq!(s.address, 0, "layout assigns sectioned addresses later");
         assert_eq!(s.output_section, 0);
         assert_eq!(s.section_offset, 0x110);
+    }
+
+    fn local(name: &str, value: u32, shndx: u16) -> InputSymbol {
+        InputSymbol {
+            binding: STB_LOCAL,
+            ..sym(name, value, shndx)
+        }
+    }
+
+    fn object(filename: &str, symbols: Vec<InputSymbol>) -> InputObject {
+        InputObject {
+            sections: vec![],
+            symbols,
+            filename: filename.to_string(),
+        }
+    }
+
+    /// An STB_LOCAL definition never satisfies another object's reference:
+    /// `extern int helper()` against another file's `static helper` stays
+    /// undefined (GNU ld: "undefined reference"), and a `static atoi` does
+    /// not capture other objects' references to the shared library's.
+    /// Regression test: locals used to be inserted as fallback definitions.
+    #[test]
+    fn locals_never_satisfy_other_objects_references() {
+        let inputs = [
+            object("a.o", vec![local("helper", 0, 1), local("atoi", 0x10, 1)]),
+            object(
+                "b.o",
+                vec![sym("helper", 0, SHN_UNDEF), sym("atoi", 0, SHN_UNDEF)],
+            ),
+        ];
+        let mut section_map = SectionMap::default();
+        section_map.insert((0, 1), (0, 0));
+        let mut libs = FxHashMap::default();
+        libs.insert(
+            "atoi".to_string(),
+            super::super::input::DynlibSym {
+                lib: "libc.so.6".to_string(),
+                sym_type: STT_FUNC,
+                size: 0,
+                version: None,
+                is_default_ver: true,
+                binding: STB_GLOBAL,
+                value: 0,
+                in_exec: true,
+            },
+        );
+        let (globals, _) = resolve_symbols(&inputs, &[], &section_map, &libs);
+        let helper = globals.get("helper").expect("the reference is recorded");
+        assert!(!helper.is_defined && !helper.is_dynamic, "{helper:?}");
+        let atoi = globals.get("atoi").expect("the reference is recorded");
+        assert!(
+            atoi.is_dynamic,
+            "libc's atoi, not a.o's static one: {atoi:?}"
+        );
     }
 }

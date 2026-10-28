@@ -7,6 +7,8 @@
 use crate::common::fx_hash::FxHashMap;
 
 use super::types::*;
+use crate::backend::elf::SHF_COMPRESSED;
+use crate::backend::linker_common::inflate::decompress_input_section;
 
 /// Return a checked byte range from an ELF input.  Offsets and sizes are
 /// attacker-controlled u32 values, so addition must happen in checked usize
@@ -24,31 +26,6 @@ fn elf_range<'a>(
         .ok_or_else(|| format!("{}: {} range overflows", filename, what))?;
     data.get(start..end)
         .ok_or_else(|| format!("{}: {} extends past end of file", filename, what))
-}
-
-/// Whether a section holds DWARF debug information.
-///
-/// i386 uses implicit-addend `REL` relocations, so applying one means reading
-/// the existing bytes at `r_offset` out of the target section. Producers
-/// routinely emit a debug relocation whose field runs a couple of bytes past
-/// the end of its section: `gcc -m32 -g` under binutils 2.44 puts an
-/// `R_386_32` against `.text` at offset 0x76 in a `.debug_info` that is only
-/// 0x74 bytes long, and GCC 16.2's 32-bit `libgcc.a(_muldi3.o)` has four such
-/// fields. GNU ld 2.44, lld and mold all link those objects silently.
-///
-/// Treating one as a hard error made lccc-ld unable to link *any* 32-bit
-/// program built with `-g` by a current GCC -- the section is pure debug
-/// metadata, is never executed, and the field cannot be written anyway
-/// without spilling into the following section. So: skip these, and keep the
-/// strict diagnostic for every section that carries program semantics.
-fn is_debug_section(name: &str) -> bool {
-    // The relocation section for `.debug_info` is `.rel.debug_info`; strip
-    // either relocation prefix before testing the underlying section name.
-    let n = name
-        .strip_prefix(".rela")
-        .or_else(|| name.strip_prefix(".rel"))
-        .unwrap_or(name);
-    n.starts_with(".debug") || n.starts_with(".zdebug")
 }
 
 /// Decode the in-place addend carried by an Elf32_Rel relocation.  i386 uses
@@ -266,8 +243,8 @@ pub(super) fn parse_elf32(data: &[u8], filename: &str) -> Result<InputObject, St
 
     let mut sections = Vec::with_capacity(e_shnum);
     for (i, shdr) in shdrs.iter().enumerate() {
-        let sec_name = read_cstr(shstrtab_data, shdr.name as usize);
-        let sec_data = if shdr.sh_type != SHT_NOBITS && shdr.size > 0 {
+        let mut sec_name = read_cstr(shstrtab_data, shdr.name as usize);
+        let mut sec_data = if shdr.sh_type != SHT_NOBITS && shdr.size > 0 {
             elf_range(
                 data,
                 shdr.offset,
@@ -279,6 +256,21 @@ pub(super) fn parse_elf32(data: &[u8], filename: &str) -> Result<InputObject, St
         } else {
             vec![0u8; shdr.size as usize]
         };
+        // REL addends live in the section bytes, and both they and the
+        // relocation offsets address the uncompressed form: decompress first.
+        let (mut flags, mut align) = (shdr.flags, shdr.addralign.max(1));
+        if shdr.sh_type != SHT_NOBITS
+            && let Some(d) = decompress_input_section(&sec_name, u64::from(flags), &sec_data, false)
+                .map_err(|e| format!("{filename}: section '{sec_name}': {e}"))?
+        {
+            sec_data = d.data;
+            flags &= !(SHF_COMPRESSED as u32);
+            // ch_addralign is a u32 field in Elf32_Chdr.
+            align = (d.align as u32).max(1);
+            if let Some(name) = d.rename {
+                sec_name = name;
+            }
+        }
 
         let mut relocs = Vec::new();
         if let Some(rel_indices) = rel_map.get(&i) {
@@ -297,20 +289,12 @@ pub(super) fn parse_elf32(data: &[u8], filename: &str) -> Result<InputObject, St
                     let r_info = read_u32(entry, 4);
                     let sym_idx = r_info >> 8;
                     let rel_type = r_info & 0xff;
-                    let addend =
-                        match rel_addend(&sec_data, r_offset, rel_type, filename, &sec_name) {
-                            Ok(addend) => addend,
-                            Err(e) => {
-                                // See is_debug_section: an out-of-range field in
-                                // DWARF is benign and universally tolerated, so
-                                // drop just that relocation. Anything else is a
-                                // genuine corrupt or unsupported object.
-                                if !is_debug_section(&sec_name) {
-                                    return Err(e);
-                                }
-                                continue;
-                            }
-                        };
+                    // Debug sections included: a field past the end of its
+                    // section is a malformed object. (The "past the end"
+                    // fields once seen in `gcc -m32 -g` objects were offsets
+                    // into a compressed section -- relocations address the
+                    // decompressed bytes, which is what `sec_data` now is.)
+                    let addend = rel_addend(&sec_data, r_offset, rel_type, filename, &sec_name)?;
                     relocs.push((r_offset, rel_type, sym_idx, addend));
                 }
             }
@@ -319,9 +303,9 @@ pub(super) fn parse_elf32(data: &[u8], filename: &str) -> Result<InputObject, St
         sections.push(InputSection {
             name: sec_name,
             sh_type: shdr.sh_type,
-            flags: shdr.flags,
+            flags,
             data: sec_data,
-            align: shdr.addralign.max(1),
+            align,
             relocations: relocs,
             input_index: i,
             entsize: shdr.entsize,
@@ -399,17 +383,6 @@ mod tests {
             rel_addend(&bytes, 3, R_386_PC32, "x.o", ".text").unwrap(),
             0
         );
-    }
-
-    #[test]
-    fn debug_sections_are_recognised_with_and_without_the_rel_prefix() {
-        assert!(is_debug_section(".debug_info"));
-        assert!(is_debug_section(".zdebug_line"));
-        assert!(is_debug_section(".rel.debug_info"));
-        assert!(!is_debug_section(".text"));
-        assert!(!is_debug_section(".rodata"));
-        assert!(is_debug_section(".rela.debug_info"));
-        assert!(!is_debug_section(".rel.text"));
     }
 
     #[test]

@@ -2088,8 +2088,11 @@ impl I686Codegen {
             | IntrinsicOp::Dpwssds256 => {
                 if let Some(dptr) = dest_ptr {
                     let inst = match op {
-                        IntrinsicOp::Dpbusd128 | IntrinsicOp::Dpbusd256 => "vpdpbusd",
-                        IntrinsicOp::Dpbusds128 | IntrinsicOp::Dpbusds256 => "vpdpbusds",
+                        // The dual-encoded AVX-VNNI forms name VEX: AVX-VNNI is
+                        // the only grant that reaches them on i686 (the EVEX
+                        // AVX512-VNNI route is x86-64 only).
+                        IntrinsicOp::Dpbusd128 | IntrinsicOp::Dpbusd256 => "{vex} vpdpbusd",
+                        IntrinsicOp::Dpbusds128 | IntrinsicOp::Dpbusds256 => "{vex} vpdpbusds",
                         IntrinsicOp::Dpwusd128 | IntrinsicOp::Dpwusd256 => "vpdpwusd",
                         IntrinsicOp::Dpwusds128 | IntrinsicOp::Dpwusds256 => "vpdpwusds",
                         IntrinsicOp::Dpbssd128 | IntrinsicOp::Dpbssd256 => "vpdpbssd",
@@ -2100,8 +2103,8 @@ impl I686Codegen {
                         IntrinsicOp::Dpbuuds128 | IntrinsicOp::Dpbuuds256 => "vpdpbuuds",
                         IntrinsicOp::Dpwuud128 | IntrinsicOp::Dpwuud256 => "vpdpwuud",
                         IntrinsicOp::Dpwuuds128 | IntrinsicOp::Dpwuuds256 => "vpdpwuuds",
-                        IntrinsicOp::Dpwssd128 | IntrinsicOp::Dpwssd256 => "vpdpwssd",
-                        IntrinsicOp::Dpwssds128 | IntrinsicOp::Dpwssds256 => "vpdpwssds",
+                        IntrinsicOp::Dpwssd128 | IntrinsicOp::Dpwssd256 => "{vex} vpdpwssd",
+                        IntrinsicOp::Dpwssds128 | IntrinsicOp::Dpwssds256 => "{vex} vpdpwssds",
                         _ => unreachable!("unexpected VNNI op: {:?}", op),
                     };
                     let is256 = matches!(

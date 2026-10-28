@@ -656,6 +656,9 @@ pub struct CodegenState {
     pub protected_slot_values: FxHashSet<u32>,
     /// Whether to emit .file/.loc debug directives for source-level debugging.
     pub debug_info: bool,
+    /// `-g`: the closing brace's `.loc`, set while a `return` is emitted and
+    /// placed by the epilogue (GCC's row), so a debugger stops at `}`.
+    pub pending_epilogue_loc: Option<String>,
     /// Pre-computed parameter classifications for the current function.
     /// Populated by `emit_store_params` so that `emit_param_ref` can access them.
     pub param_classes: Vec<crate::backend::call_abi::ParamClass>,
@@ -729,6 +732,12 @@ pub struct CodegenState {
     /// `NAME:` through the `.cfi_endproc` right before `.size NAME, .-NAME`),
     /// so CFI the user writes in top-level asm is never touched.
     pub fn_boundary_marked: FxHashSet<String>,
+    /// `-g`: each function's entry line row `(file, line, column)` -- the
+    /// body's opening brace -- keyed by its label. Not emitted inline:
+    /// the peephole's and CFI synthesis's entry matchers rely on the exact
+    /// `NAME:` / `.cfi_startproc` / prologue shape, so the `.loc` is
+    /// inserted after all of them by [`crate::backend::insert_fn_entry_locs`].
+    pub fn_entry_locs: FxHashMap<String, (u32, u32, u32)>,
     /// i686: bytes a directly called function pops on return (`ret $N`:
     /// the i386 SysV hidden struct-return pointer, the stack arguments of a
     /// fastcall callee), keyed by callee symbol. The call's text does not
@@ -909,6 +918,7 @@ impl CodegenState {
             asm_output_values: FxHashSet::default(),
             protected_slot_values: FxHashSet::default(),
             debug_info: false,
+            pending_epilogue_loc: None,
             param_classes: Vec::new(),
             num_params: 0,
             func_is_variadic: false,
@@ -926,6 +936,7 @@ impl CodegenState {
             emit_cfi: true,
             fn_boundary_markers: false,
             fn_boundary_marked: FxHashSet::default(),
+            fn_entry_locs: FxHashMap::default(),
             callee_pops_direct: FxHashMap::default(),
             callee_pops_indirect: FxHashMap::default(),
 
@@ -996,6 +1007,13 @@ impl CodegenState {
                 self.x87_pending = None;
                 self.out.emit("    fstp %st(0)");
             }
+        }
+    }
+
+    /// Place the pending closing-brace row (see `pending_epilogue_loc`).
+    pub fn flush_epilogue_loc(&mut self) {
+        if let Some(loc) = self.pending_epilogue_loc.take() {
+            self.emit(&loc);
         }
     }
 

@@ -780,6 +780,7 @@ impl ArmCodegen {
     // ---- emit_epilogue_and_ret ----
 
     pub(super) fn emit_epilogue_and_ret_impl(&mut self, frame_size: i64) {
+        self.state.flush_epilogue_loc();
         if !self.conditional_increment_leaf {
             self.emit_restore_callee_saved();
             self.emit_epilogue_arm(frame_size);

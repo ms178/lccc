@@ -46,9 +46,9 @@
 //! more reliable.
 
 use crate::backend::elf::{GRP_COMDAT, SHT_GROUP, read_u32};
-use crate::common::fx_hash::FxHashSet;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
-use super::types::Elf64Object;
+use super::types::{DynSymbol, Elf64Object};
 
 /// Result of a COMDAT scan.
 #[derive(Debug, Default)]
@@ -110,6 +110,15 @@ pub struct ObjectSet {
     objects: Vec<Elf64Object>,
     claimed: FxHashSet<String>,
     dso_names: FxHashSet<String>,
+    /// `--warn-common` diagnostics over the inputs in registration order;
+    /// `None` (no work at all) unless the link asked for them.
+    common: Option<Box<super::warn_common::CommonDiagnostics>>,
+    /// The shared libraries in the link, in link order, each with its
+    /// exports, and the first export per name in link order: under `name`
+    /// the default version (what an unversioned reference binds), under
+    /// `name@VER` each versioned one (what a `.symver` reference binds).
+    shared_libs: Vec<(String, Vec<DynSymbol>)>,
+    shared_exports: FxHashMap<String, (usize, usize)>,
 }
 
 impl ObjectSet {
@@ -120,6 +129,9 @@ impl ObjectSet {
     /// Append the next object in link order and record the group
     /// signatures it claims.
     pub fn push(&mut self, obj: Elf64Object) {
+        if let Some(common) = self.common.as_deref_mut() {
+            common.add_object(&obj);
+        }
         for (sig, _) in comdat_groups(&obj) {
             if !self.claimed.contains(sig) {
                 self.claimed.insert(sig.to_string());
@@ -141,6 +153,64 @@ impl ObjectSet {
     /// Names some shared library of the link defines or references.
     pub fn dso_names(&self) -> &FxHashSet<String> {
         &self.dso_names
+    }
+    /// Collect `--warn-common` diagnostics from the next input on.
+    pub fn enable_warn_common(&mut self) {
+        self.common = Some(Box::default());
+    }
+    /// The shared library at `path` (`soname`) is part of the link from this
+    /// point of the input order on -- `--as-needed` kept it, or
+    /// `--no-as-needed` asked for it.  As with GNU ld, its exports enter the
+    /// symbol table there: a reference registered later binds to them, they
+    /// take part in `--warn-common`, and its data definitions take over a
+    /// common registered later.  A library dropped as unneeded is unloaded,
+    /// symbols included, and must not get here.  Re-scans of a library
+    /// group are no-ops: the first definition of a name in link order is
+    /// the one that binds.
+    pub fn note_linked_library(&mut self, path: &str, soname: &str, dyn_syms: Vec<DynSymbol>) {
+        if let Some(common) = self.common.as_deref_mut() {
+            common.add_shared_library(path, &dyn_syms);
+        }
+        if self.shared_libs.iter().any(|(name, _)| name == soname) {
+            return;
+        }
+        let lib = self.shared_libs.len();
+        for (idx, dsym) in dyn_syms.iter().enumerate() {
+            if dsym.is_default_ver {
+                self.shared_exports
+                    .entry(dsym.name.clone())
+                    .or_insert((lib, idx));
+            }
+            if let Some(ver) = &dsym.version {
+                self.shared_exports
+                    .entry(format!("{}@{}", dsym.name, ver))
+                    .or_insert((lib, idx));
+            }
+        }
+        self.shared_libs.push((soname.to_string(), dyn_syms));
+    }
+    /// The export of a library linked earlier that a reference to `name`
+    /// (`base@VER` for a versioned one) binds, by the rules of
+    /// `match_shared_library_dynsyms`: `(soname, definition, the library's
+    /// exports)`.
+    pub fn linked_shared_export(&self, name: &str) -> Option<(&str, &DynSymbol, &[DynSymbol])> {
+        let &(lib, idx) = self.shared_exports.get(name)?;
+        let (soname, exports) = &self.shared_libs[lib];
+        Some((soname, &exports[idx], exports))
+    }
+    /// The library data definition that takes a common of `name`, if the
+    /// first library linked earlier that defines `name` defines strong data
+    /// (`shared_def_overrides_common`).
+    pub fn linked_shared_data(&self, name: &str) -> Option<(&str, &DynSymbol, &[DynSymbol])> {
+        self.linked_shared_export(name)
+            .filter(|(_, dsym, _)| super::symbols::shared_def_overrides_common(dsym.info))
+    }
+    /// The `--warn-common` diagnostics so far, in emission order.
+    pub fn take_common_warnings(&mut self) -> Vec<String> {
+        self.common
+            .take()
+            .map(|common| common.into_warnings())
+            .unwrap_or_default()
     }
 
     pub fn into_vec(self) -> Vec<Elf64Object> {
@@ -473,5 +543,69 @@ mod tests {
             assert_eq!(a, b, "COMDAT plan must be stable across runs");
         }
         assert_eq!(first.groups_discarded, 2);
+    }
+
+    fn provider<'a>(set: &'a ObjectSet, name: &str) -> Option<(&'a str, &'a str)> {
+        set.linked_shared_export(name)
+            .map(|(soname, dsym, _)| (soname, dsym.name.as_str()))
+    }
+
+    /// A linked library's exports answer later references as
+    /// `match_shared_library_dynsyms` binds them -- the default version for
+    /// a plain name, any version for `name@VER`, the first library in link
+    /// order -- and a later common only to strong data; a re-scan of a
+    /// library group changes nothing.
+    #[test]
+    fn linked_library_exports_answer_later_references() {
+        use crate::backend::elf::{STB_GLOBAL, STB_WEAK, STT_FUNC, STT_OBJECT};
+        let dsym = |name: &str, info: u8, version: Option<&str>, default_ver: bool| DynSymbol {
+            name: name.to_string(),
+            info,
+            value: 0x1000,
+            size: 4,
+            in_exec_segment: false,
+            version: version.map(str::to_string),
+            is_default_ver: default_ver,
+        };
+        let data = (STB_GLOBAL << 4) | STT_OBJECT;
+        let weak_data = (STB_WEAK << 4) | STT_OBJECT;
+        let func = (STB_GLOBAL << 4) | STT_FUNC;
+        let mut set = ObjectSet::new();
+        set.note_linked_library(
+            "./liba.so",
+            "liba.so",
+            vec![
+                dsym("v", data, None, true),
+                dsym("f", func, Some("V2"), true),
+                dsym("old", func, Some("V1"), false),
+                dsym("w", weak_data, None, true),
+            ],
+        );
+        set.note_linked_library(
+            "./libb.so",
+            "libb.so",
+            vec![dsym("f", data, None, true), dsym("b", data, None, true)],
+        );
+        assert_eq!(provider(&set, "v"), Some(("liba.so", "v")));
+        assert_eq!(provider(&set, "f"), Some(("liba.so", "f")));
+        assert_eq!(provider(&set, "f@V2"), Some(("liba.so", "f")));
+        assert_eq!(
+            provider(&set, "old"),
+            None,
+            "non-default: versioned refs only"
+        );
+        assert_eq!(provider(&set, "old@V1"), Some(("liba.so", "old")));
+        assert_eq!(provider(&set, "b"), Some(("libb.so", "b")));
+        assert!(set.linked_shared_data("v").is_some());
+        assert!(
+            set.linked_shared_data("w").is_none(),
+            "weak data never takes a common"
+        );
+        assert!(
+            set.linked_shared_data("f").is_none(),
+            "liba's function comes first"
+        );
+        set.note_linked_library("./libb.so", "libb.so", vec![dsym("v", data, None, true)]);
+        assert_eq!(provider(&set, "v"), Some(("liba.so", "v")));
     }
 }

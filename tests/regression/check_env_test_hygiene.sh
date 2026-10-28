@@ -67,7 +67,12 @@ MARKER='FIX''ME'
 # two more env reads than the code has, with nothing to stop a third.
 # PR835 follow-up: pipeline-owned byte-count ablation plus one SSE2 snapshot
 # instead of six repeated candidate-loop reads; measured 147 sites.
-ENV_READ_BUDGET=147
+#
+#   146  measured on the x86-ISA-table tree (both at its base and at its tip, so
+#        the slack predates it): the count dropped without the budget following.
+#        Tightened to the measurement, per the rule above -- a budget of 147
+#        over 146 reads permits one more read than the code has.
+ENV_READ_BUDGET=146
 
 fail=0
 report() { # report <label> <offending lines>

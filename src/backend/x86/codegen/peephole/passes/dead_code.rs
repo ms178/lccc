@@ -363,12 +363,17 @@ pub(super) fn eliminate_dead_stores(store: &LineStore, infos: &mut [LineInfo]) -
 
         let store_bytes = store_size.byte_size();
 
-        let end = std::cmp::min(i + WINDOW, len);
         let mut slot_read = false;
         let mut slot_overwritten = false;
         let mut pattern_len: usize = 0;
+        // The window is WINDOW *live* lines. Counted in raw indices it
+        // shrank with every line an earlier pass deleted and with every
+        // hidden `-g` row, so `-g` kept dead stores the plain build removed
+        // (simd_defer_chain.c at -O0) and deletions upstream decided what
+        // this pass could still see.
+        let mut live = 0usize;
 
-        for j in (i + 1)..end {
+        for j in (i + 1)..len {
             // A NOP'd line has no effect: it neither reads our slot nor
             // overwrites it. (No pass revives a NOP slot with its preserved
             // text; the one NOP-slot reuse -- the FP constant hoist -- writes
@@ -379,6 +384,10 @@ pub(super) fn eliminate_dead_stores(store: &LineStore, infos: &mut [LineInfo]) -
             // already held its value (the earlier store is then the writer).
             if infos[j].is_nop() {
                 continue;
+            }
+            live += 1;
+            if live > WINDOW {
+                break;
             }
 
             if infos[j].is_barrier() {

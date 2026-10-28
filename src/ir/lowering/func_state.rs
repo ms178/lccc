@@ -104,6 +104,12 @@ pub(super) struct FunctionBuildState {
     pub name: String,
     /// Normalized per-function ISA requests; never change the invocation globally.
     pub target_features: Vec<String>,
+    /// `always_inline` without its own `target(...)`: an x86 feature the
+    /// translation unit lacks is deferred to the inlining caller
+    /// ([`crate::ir::module::X86IsaNeeds`]) instead of rejected.
+    pub x86_defers_isa: bool,
+    /// What the body needs from the x86 ISA so far.
+    pub x86_isa_needs: crate::ir::module::X86IsaNeeds,
     /// Return type of the function currently being lowered
     pub return_type: IrType,
     /// Whether the current function returns _Bool
@@ -116,6 +122,10 @@ pub(super) struct FunctionBuildState {
     /// block gets the one `__lccc_cpu_init` call that populates them
     /// (AUD-CPU-1; set by `Lowerer::mark_cpu_probe_init`).
     pub cpu_probe_init: bool,
+    /// Whether this function reads libgcc's `__cpu_model` (`__builtin_cpu_is`),
+    /// so its entry block gets the guarded `__cpu_indicator_init` call
+    /// (set by `Lowerer::mark_cpu_model_init`).
+    pub cpu_model_init: bool,
     /// Variable -> alloca mapping with metadata
     pub locals: FxHashMap<String, LocalInfo>,
     /// Loop/switch context: `(label, scope_depth, loop_names)` to jump to on `break`.
@@ -187,6 +197,8 @@ pub(super) struct FunctionBuildState {
     /// The current source span, set before lowering each statement/expression.
     /// Emitted instructions inherit this span for debug info tracking.
     pub current_span: Span,
+    /// The statement each terminated block's terminator came from (`-g`).
+    pub term_spans: crate::ir::module::TerminatorSpans,
     /// Whether this function is a candidate for inlining (always_inline, inline, or static).
     /// Used by __builtin_constant_p lowering: in non-inline-candidate functions, non-constant
     /// expressions resolve immediately to 0. In inline candidates, they emit IsConstant
@@ -302,11 +314,14 @@ impl FunctionBuildState {
             current_label: BlockId(0),
             name,
             target_features: Vec::new(),
+            x86_defers_isa: false,
+            x86_isa_needs: Default::default(),
             return_type,
             return_is_bool,
             return_ctype: None,
             sret_ptr: None,
             cpu_probe_init: false,
+            cpu_model_init: false,
             locals: FxHashMap::default(),
             break_labels: Vec::new(),
             continue_labels: Vec::new(),
@@ -332,6 +347,7 @@ impl FunctionBuildState {
             param_alloca_values: Vec::new(),
             instr_spans: Vec::new(),
             current_span: Span::dummy(),
+            term_spans: Default::default(),
             is_inline_candidate: false,
             global_init_label_blocks: Vec::new(),
             nested_functions: FxHashMap::default(),

@@ -219,7 +219,12 @@ pub enum AsmDirective {
     /// ELF writer (`.` and already-defined labels resolve; forward
     /// references are an error).
     Org { expr: String, fill: u8 },
-    /// Other ignored directives (.file, .loc, .ident, etc.)
+    /// `.file N "name"`: a DWARF line-table file.
+    File(u32, String),
+    /// `.loc FILE LINE COLUMN`: a line row at the current location.
+    Loc(u32, u32, u32),
+    /// Directives that place no bytes and change nothing this assembler
+    /// models (`.ident`, `.arch`, `.cpu`, ...).
     Ignored,
 }
 
@@ -1588,11 +1593,19 @@ fn parse_directive(line: &str) -> Result<AsmStatement, String> {
             }
             AsmDirective::RawBytes(bytes)
         }
-        // Other directives we can safely ignore
-        ".file" | ".loc" | ".ident" | ".addrsig" | ".addrsig_sym" | ".build_attributes"
-        | ".eabi_attribute" | ".arch" | ".arch_extension" | ".cpu" | ".ltorg" | ".pool" => {
-            AsmDirective::Ltorg
+        ".file" => match crate::backend::elf::parse_file_directive(args)? {
+            Some((number, name)) => AsmDirective::File(number, name),
+            None => AsmDirective::Ignored,
+        },
+        ".loc" => {
+            let (file, line, column) = crate::backend::elf::parse_loc_directive(args)?;
+            AsmDirective::Loc(file, line, column)
         }
+        // A literal pool is dumped only where the source asks (GNU as):
+        // anywhere else its data would land between instructions.
+        ".ltorg" | ".pool" => AsmDirective::Ltorg,
+        ".ident" | ".addrsig" | ".addrsig_sym" | ".build_attributes" | ".eabi_attribute"
+        | ".arch" | ".arch_extension" | ".cpu" => AsmDirective::Ignored,
         _ => {
             return Err(format!(
                 "unsupported AArch64 assembler directive: {} {}",

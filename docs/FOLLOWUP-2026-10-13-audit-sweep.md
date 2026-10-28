@@ -362,7 +362,7 @@ and never keep two copies of the same thing.
 * **The census baseline moves by exactly what upstream brought in**: the
   merged tree measures `panic_sites` 889 → 890 (+1, the
   `expect("canonical_name returns table entries")` invariant in upstream's
-  `src/common/isa_features.rs` — unreachable, since the name comes from the
+  `isa_features` table (since replaced by the driver model's own enums) — unreachable, since the name comes from the
   same table) and `unsafe_sites` 27 → 29 (+2, the `Self::cpuid` /
   `Self::cpuid_count` wrappers, `unsafe` for toolchains older than 1.97 with
   `#[allow(unused_unsafe)]` for the ones where `__cpuid` is already safe).

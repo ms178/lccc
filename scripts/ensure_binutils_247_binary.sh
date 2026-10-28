@@ -33,10 +33,14 @@ if [ "$self_test" = 1 ]; then
     exit 0
 fi
 if [ "$verify_only" = 1 ]; then
+    # The repository's one version matcher: a whole release token on the
+    # identity line.  A bare `grep 2\.47` also accepted 2.47.50.* (a Debian
+    # snapshot of binutils master, i.e. 2.48 development), 2.470 and 2.47.1.
+    # shellcheck source=../tools/linker/oracle_versions.sh
+    . "$REPO/tools/linker/oracle_versions.sh"
     for tool in as ld ld.bfd objdump readelf; do
         [ -x "$prefix/bin/$tool" ] || { echo "missing $prefix/bin/$tool" >&2; exit 1; }
-        "$prefix/bin/$tool" --version 2>/dev/null | grep -q '2\.47' || {
-            echo "$tool is not binutils 2.47" >&2; exit 1; }
+        oracle_require_version "$prefix/bin/$tool" 2.47 || exit 1
     done
     echo "binutils 2.47 binary oracle OK: $prefix/bin"
     exit 0

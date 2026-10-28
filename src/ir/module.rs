@@ -1,5 +1,7 @@
 use super::constants::IrConst;
-use super::instruction::{BasicBlock, Instruction, Terminator, Value};
+use super::instruction::{BasicBlock, BlockId, Instruction, Terminator, Value};
+use crate::common::fx_hash::FxHashMap;
+use crate::common::source::Span;
 /// IR module, function, and global variable definitions.
 ///
 /// `IrModule` is the top-level compilation unit containing functions, globals,
@@ -193,19 +195,164 @@ impl GlobalInit {
     }
 }
 
-/// Normalize a `target("...")` attribute string into the canonical
-/// feature set stored in [`IrFunction::target_features`]: split on commas,
-/// trim, lower-case, drop empties, sort, deduplicate. Canonical order lets
-/// the inliner compare sets with a plain subset test.
+/// Normalize a `target("...")` attribute string into the option list
+/// stored in [`IrFunction::target_features`]: split on commas, trim,
+/// lower-case, drop empties, and keep the order: GCC applies the options
+/// in order (`avx512bmm,no-avx512bmm` keeps AVX512BW, `no-sse2,aes` has
+/// SSE2), as does [`crate::backend::x86::isa::function_feature_bits`].
+/// Consumers compare the resulting feature sets, never the strings.
+///
+/// An `arch=` replaces the ISA with the named CPU's and forgets everything
+/// before it, so the ISA options before the last one (grants, denials,
+/// `general-regs-only`) are dropped here; options after it apply on top of
+/// the CPU. `key=value` options such as `tune=` are not ISA options and
+/// survive. GCC 16.2 compiles `target("avx2,arch=x86-64")` to SSE2 and
+/// `target("no-avx2,arch=haswell")` to AVX2 (measured).
 pub fn normalize_target_features(raw: &str) -> Vec<String> {
     let mut features: Vec<String> = raw
         .split(',')
         .map(|f| f.trim().to_ascii_lowercase())
         .filter(|f| !f.is_empty())
         .collect();
-    features.sort_unstable();
-    features.dedup();
+    if let Some(arch) = features.iter().rposition(|f| f.starts_with("arch=")) {
+        let mut index = 0;
+        features.retain(|f| {
+            let keep = index >= arch || f.contains('=');
+            index += 1;
+            keep
+        });
+    }
     features
+}
+
+/// What a function body needs from the x86 ISA beyond the feature set its
+/// own `target(...)` options give it (bits are `X86Feature`s).
+///
+/// Most IR is ISA-neutral: the backend lowers it under the feature set of
+/// the function it ends up in, so a callee without `target(...)` may inline
+/// into a caller with fewer features (`_mm_popcnt_u32`'s
+/// `__builtin_popcount` becomes `popcnt` or a bit trick). What is not
+/// neutral is an intrinsic the lowering emitted because a permission check
+/// passed: such a body may only move into callers holding `relied`.
+/// lccc's 512-bit intrinsics are `always_inline` header functions without
+/// GCC's per-function `target`, so a requirement the translation unit
+/// lacks is `deferred`: legal once inlined into a caller that grants it,
+/// an error naming [`Self::first_use`] if the body survives inlining.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct X86IsaNeeds {
+    /// Features whose permission the lowering relied on.
+    pub relied: u64,
+    /// Features an `always_inline` body without `target(...)` needs but
+    /// its translation unit does not have.
+    pub deferred: u64,
+    /// The first intrinsic that needs a deferred feature.
+    pub first_use: Option<String>,
+}
+
+impl X86IsaNeeds {
+    /// Take over the needs of a body inlined into a function whose feature
+    /// set is `caller_features`: what that function grants is settled.
+    pub fn absorb(&mut self, inlined: &X86IsaNeeds, caller_features: u64) {
+        self.relied |= inlined.relied;
+        let deferred = inlined.deferred & !caller_features;
+        if deferred != 0 && self.first_use.is_none() {
+            self.first_use.clone_from(&inlined.first_use);
+        }
+        self.deferred |= deferred;
+    }
+}
+
+/// What a block's terminator looked like when lowering recorded its
+/// statement.  A row is emitted only while the terminator keeps this shape:
+/// a pass that merges blocks or retargets a jump changes it, and the stale
+/// span is dropped instead of naming the line of another statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminatorShape {
+    Return,
+    Branch(BlockId),
+    CondBranch(BlockId, BlockId),
+    Other,
+}
+
+impl TerminatorShape {
+    pub fn of(term: &Terminator) -> Self {
+        match term {
+            Terminator::Return(_) => Self::Return,
+            Terminator::Branch(target) => Self::Branch(*target),
+            Terminator::CondBranch {
+                true_label,
+                false_label,
+                ..
+            } => Self::CondBranch(*true_label, *false_label),
+            _ => Self::Other,
+        }
+    }
+
+    /// The same shape after a relabelling; `None` if a target is gone.
+    fn remapped(self, map: &impl Fn(BlockId) -> Option<BlockId>) -> Option<Self> {
+        Some(match self {
+            Self::Branch(t) => Self::Branch(map(t)?),
+            Self::CondBranch(t, f) => Self::CondBranch(map(t)?, map(f)?),
+            other => other,
+        })
+    }
+}
+
+/// `-g`: the statement each block's terminator was lowered from, keyed by
+/// block label.  A statement can lower to nothing but its terminator --
+/// `return y;` once mem2reg drops the load of `y`, `goto`, `break` -- and
+/// with only instruction spans it got no line row: no breakpoint could land
+/// on it.
+#[derive(Debug, Clone, Default)]
+pub struct TerminatorSpans(FxHashMap<BlockId, (Span, TerminatorShape)>);
+
+impl TerminatorSpans {
+    pub fn record(&mut self, label: BlockId, span: Span, term: &Terminator) {
+        if span != Span::dummy() {
+            self.0.insert(label, (span, TerminatorShape::of(term)));
+        }
+    }
+
+    /// The statement of `label`'s terminator, while it still has the
+    /// recorded shape.
+    pub fn span_of(&self, label: BlockId, term: &Terminator) -> Option<Span> {
+        self.0
+            .get(&label)
+            .filter(|(_, shape)| *shape == TerminatorShape::of(term))
+            .map(|(span, _)| *span)
+    }
+
+    /// Follow a renumbering that adds `offset` to every label.
+    pub fn shift(&mut self, offset: u32) {
+        self.remap(|label| Some(BlockId(label.0 + offset)));
+    }
+
+    /// Follow a relabelling: `map` gives each live block's new label.  An
+    /// entry whose block or target is gone (`None`) is dropped: its old
+    /// label may name another block now.
+    pub fn remap(&mut self, map: impl Fn(BlockId) -> Option<BlockId>) {
+        self.0 = std::mem::take(&mut self.0)
+            .into_iter()
+            .filter_map(|(label, (span, shape))| Some((map(label)?, (span, shape.remapped(&map)?))))
+            .collect();
+    }
+
+    /// `label`'s terminator now goes to `new_target` where it went to
+    /// `old_target` (an edge split): still the same statement's jump.
+    pub fn retarget(&mut self, label: BlockId, old_target: BlockId, new_target: BlockId) {
+        if let Some((_, shape)) = self.0.get_mut(&label) {
+            let swap = |t: BlockId| if t == old_target { new_target } else { t };
+            *shape = match *shape {
+                TerminatorShape::Branch(t) => TerminatorShape::Branch(swap(t)),
+                // `retarget_block_edge_once` moves one edge: the true one first.
+                TerminatorShape::CondBranch(t, f) if t == old_target => {
+                    TerminatorShape::CondBranch(new_target, f)
+                }
+                TerminatorShape::CondBranch(t, f) => TerminatorShape::CondBranch(t, swap(f)),
+                other => other,
+            };
+        }
+    }
 }
 
 /// An IR function.
@@ -243,15 +390,26 @@ pub struct IrFunction {
     /// Set by vectorization and other transformation passes to avoid duplicate labels.
     /// A value of 0 means "not yet computed" (will fall back to scanning).
     pub next_label: u32,
+    /// Opening brace of the definition's body: under `-g` it is the
+    /// function's first line-table row, placed before the prologue as GCC
+    /// does, so debuggers can attribute the entry and skip the prologue to
+    /// the next row.  It runs through the closing brace, whose line is the
+    /// epilogue's row.  `Span::dummy()` for synthesized functions.
+    pub body_span: crate::common::source::Span,
+    /// `-g` rows for terminators (see [`TerminatorSpans`]).
+    pub terminator_spans: TerminatorSpans,
     /// __attribute__((section("..."))) - place in specific ELF section.
     pub section: Option<String>,
     /// Normalized `__attribute__((target("...")))` features: lower-case,
-    /// trimmed, sorted, deduplicated (see [`normalize_target_features`]).
+    /// trimmed, in the attribute's order (see [`normalize_target_features`]).
     /// Empty for functions without the attribute. The inliner refuses to
     /// clone a callee whose set is not a subset of its caller's (GCC's
     /// `can_inline_p` ISA rule); the x86-64 emitter enables the scalar
     /// integer extensions it names while emitting this function.
     pub target_features: Vec<String>,
+    /// What the body needs from the x86 ISA beyond its `target(...)`, for
+    /// the inliner's ISA contract (`passes::inline`).
+    pub x86_isa_needs: X86IsaNeeds,
     /// __attribute__((visibility("hidden"|"default"|...)))
     pub visibility: Option<String>,
     /// __attribute__((weak)) - emit as a weak symbol (STB_WEAK).
@@ -431,6 +589,7 @@ impl IrFunction {
             is_static: false,
             is_inline: false,
             is_always_inline: false,
+            x86_isa_needs: Default::default(),
             is_noinline: false,
             target_features: Vec::new(),
             next_value_id: 0,
@@ -453,6 +612,8 @@ impl IrFunction {
             is_gnu_inline_def: false,
             loop_promoted_f64_values: Vec::new(),
             ssp: SspInfo::default(),
+            body_span: crate::common::source::Span::dummy(),
+            terminator_spans: Default::default(),
         }
     }
 

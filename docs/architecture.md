@@ -54,6 +54,12 @@ scan in `live_range.rs`; segment-aware interference and a Tier-2 graph
 colorer are production; `RegAllocConfig` includes XMM, call-arg regs, folded
 AArch64 indices.
 
+## x86 ISA permissions and SIMD ABI
+
+What code each function may contain (`-march=`, `target()`, intrinsics),
+the predefined macros, the SIMD calling convention and the CFI contract:
+[x86 ISA permissions and the SIMD ABI](x86-isa-permissions-and-simd-abi.md).
+
 ## Licensing
 
 Dual license: LCCC additions MIT/Apache/BSD; CCC-derived CC0. Paths are

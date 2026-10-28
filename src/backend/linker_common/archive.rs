@@ -1,20 +1,17 @@
-//! Archive and file loading for ELF64 linkers.
+//! Archive loading for ELF64 linkers.
 //!
-//! Provides iterative archive member resolution (the `--start-group` algorithm),
-//! regular and thin archive loading, and a generic file dispatch function that
-//! handles archives, linker scripts, shared libraries, and object files.
+//! Provides iterative archive member resolution (the `--start-group` algorithm)
+//! and regular and thin archive loading.
 
 use crate::common::fx_hash::FxHashMap;
 use std::path::Path;
 
 use super::dynamic::register_symbols_elf64;
 use super::parse_object::{parse_elf64_object, parse_elf64_object_at};
-use super::resolve_lib::resolve_lib;
 use super::symbols::GlobalSymbolOps;
 use super::types::Elf64Object;
 use crate::backend::elf::{
-    ELF_MAGIC, ET_DYN, LinkerScriptEntry, SHN_UNDEF, STB_WEAK, STT_FILE, STT_SECTION,
-    is_thin_archive, parse_archive_members, parse_linker_script_entries,
+    ELF_MAGIC, SHN_UNDEF, STB_WEAK, STT_FILE, STT_SECTION, parse_archive_members,
     parse_thin_archive_members, read_u16,
 };
 
@@ -233,133 +230,5 @@ pub fn load_thin_archive_elf64<G: GlobalSymbolOps>(
     } else {
         resolve_archive_members(&mut member_objects, objects, globals, should_replace_extra)?;
     }
-    Ok(())
-}
-
-/// Load a file, dispatching by format (archive, thin archive, linker script,
-/// shared library, or object file).
-///
-/// The `on_shared_lib` callback handles shared libraries (.so files). This allows
-/// x86 and ARM to handle dynamic symbol extraction differently. Pass a no-op
-/// closure for static-only linking.
-///
-/// Currently unused: x86 and ARM linkers have their own `load_file` implementations.
-/// This generic version will be used as those linkers migrate to shared infrastructure.
-#[expect(dead_code)] // Planned shared infrastructure; x86/ARM linkers will migrate to this
-pub fn load_file_elf64<G: GlobalSymbolOps>(
-    path: &str,
-    objects: &mut super::ObjectSet,
-    globals: &mut FxHashMap<String, G>,
-    expected_machine: u16,
-    lib_paths: &[String],
-    prefer_static: bool,
-    should_replace_extra: fn(&G) -> bool,
-    on_shared_lib: &mut dyn FnMut(&str, &[u8]) -> Result<(), String>,
-) -> Result<(), String> {
-    if std::env::var("LINKER_DEBUG").is_ok() {
-        eprintln!("load_file: {}", path);
-    }
-
-    let data = std::fs::read(path).map_err(|e| format!("failed to read '{}': {}", path, e))?;
-
-    // Regular archive
-    if data.len() >= 8 && &data[0..8] == b"!<arch>\n" {
-        return load_archive_elf64(
-            &data,
-            path,
-            objects,
-            globals,
-            expected_machine,
-            should_replace_extra,
-            false,
-        );
-    }
-
-    // Thin archive
-    if is_thin_archive(&data) {
-        return load_thin_archive_elf64(
-            &data,
-            path,
-            objects,
-            globals,
-            expected_machine,
-            should_replace_extra,
-            false,
-        );
-    }
-
-    // Not ELF? Try linker script (handles GROUP and INPUT directives)
-    if data.len() >= 4 && data[0..4] != ELF_MAGIC {
-        if let Ok(text) = std::str::from_utf8(&data) {
-            if let Some(entries) = parse_linker_script_entries(text) {
-                let script_dir = Path::new(path)
-                    .parent()
-                    .map(|p| p.to_string_lossy().to_string());
-                for entry in &entries {
-                    match entry {
-                        LinkerScriptEntry::Path(lib_path) => {
-                            if Path::new(lib_path).exists() {
-                                load_file_elf64(
-                                    lib_path,
-                                    objects,
-                                    globals,
-                                    expected_machine,
-                                    lib_paths,
-                                    prefer_static,
-                                    should_replace_extra,
-                                    on_shared_lib,
-                                )?;
-                            } else if let Some(ref dir) = script_dir {
-                                let resolved = format!("{}/{}", dir, lib_path);
-                                if Path::new(&resolved).exists() {
-                                    load_file_elf64(
-                                        &resolved,
-                                        objects,
-                                        globals,
-                                        expected_machine,
-                                        lib_paths,
-                                        prefer_static,
-                                        should_replace_extra,
-                                        on_shared_lib,
-                                    )?;
-                                }
-                            }
-                        }
-                        LinkerScriptEntry::Lib(lib_name) => {
-                            if let Some(resolved_path) =
-                                resolve_lib(lib_name, lib_paths, prefer_static)
-                            {
-                                load_file_elf64(
-                                    &resolved_path,
-                                    objects,
-                                    globals,
-                                    expected_machine,
-                                    lib_paths,
-                                    prefer_static,
-                                    should_replace_extra,
-                                    on_shared_lib,
-                                )?;
-                            }
-                        }
-                    }
-                }
-                return Ok(());
-            }
-        }
-        return Err(format!("{}: not a valid ELF object or archive", path));
-    }
-
-    // Shared library
-    if data.len() >= 18 {
-        let e_type = u16::from_le_bytes([data[16], data[17]]);
-        if e_type == ET_DYN {
-            return on_shared_lib(path, &data);
-        }
-    }
-
-    // Regular ELF object
-    let obj = parse_elf64_object(&data, path, expected_machine)?;
-    register_symbols_elf64(objects, &obj, globals, should_replace_extra)?;
-    objects.push(obj);
     Ok(())
 }

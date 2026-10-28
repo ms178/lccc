@@ -33,25 +33,47 @@ _bzhi_u64(unsigned long long __src, unsigned long long __index)
 }
 #endif
 
+/* PDEP/PEXT. On x86-64 with BMI2 the builtins reach the backend, which
+ * emits `pdep`/`pext` for each function that may use BMI2 and an exact
+ * portable loop for one that may not: this header is compiled under the
+ * translation unit's ISA and then inlined, so a caller's own
+ * `target("arch=x86-64")` must not inherit an instruction its CPU lacks.
+ * Elsewhere (no BMI2, i686) the portable form below is used. It visits
+ * only the mask's set bits, without data-dependent branches. */
+static __inline__ unsigned int __attribute__((__always_inline__))
+__lccc_pdep_u32(unsigned int __src, unsigned int __mask)
+{
+    unsigned int __r = 0;
+    while (__mask) {
+        unsigned int __low = __mask & (0U - __mask);
+        __r |= __low & (0U - (__src & 1U));
+        __src >>= 1;
+        __mask ^= __low;
+    }
+    return __r;
+}
+
+static __inline__ unsigned int __attribute__((__always_inline__))
+__lccc_pext_u32(unsigned int __src, unsigned int __mask)
+{
+    unsigned int __r = 0, __bit = 1;
+    while (__mask) {
+        unsigned int __low = __mask & (0U - __mask);
+        __r |= __bit & (0U - (unsigned int)((__src & __low) != 0));
+        __bit <<= 1;
+        __mask ^= __low;
+    }
+    return __r;
+}
+
 /* _pdep_u32: parallel bit deposit */
 static __inline__ unsigned int __attribute__((__always_inline__))
 _pdep_u32(unsigned int __src, unsigned int __mask)
 {
-#ifdef __BMI2__
-    unsigned int __r;
-    __asm__("pdepl %2, %1, %0" : "=r"(__r) : "r"(__src), "rm"(__mask));
-    return __r;
+#if defined(__x86_64__) && defined(__BMI2__)
+    return __builtin_ia32_pdep_si(__src, __mask);
 #else
-    unsigned int __result = 0;
-    unsigned int __k = 0;
-    for (unsigned int __i = 0; __i < 32; __i++) {
-        if (__mask & (1U << __i)) {
-            if (__src & (1U << __k))
-                __result |= (1U << __i);
-            __k++;
-        }
-    }
-    return __result;
+    return __lccc_pdep_u32(__src, __mask);
 #endif
 }
 
@@ -59,21 +81,10 @@ _pdep_u32(unsigned int __src, unsigned int __mask)
 static __inline__ unsigned int __attribute__((__always_inline__))
 _pext_u32(unsigned int __src, unsigned int __mask)
 {
-#ifdef __BMI2__
-    unsigned int __r;
-    __asm__("pextl %2, %1, %0" : "=r"(__r) : "r"(__src), "rm"(__mask));
-    return __r;
+#if defined(__x86_64__) && defined(__BMI2__)
+    return __builtin_ia32_pext_si(__src, __mask);
 #else
-    unsigned int __result = 0;
-    unsigned int __k = 0;
-    for (unsigned int __i = 0; __i < 32; __i++) {
-        if (__mask & (1U << __i)) {
-            if (__src & (1U << __i))
-                __result |= (1U << __k);
-            __k++;
-        }
-    }
-    return __result;
+    return __lccc_pext_u32(__src, __mask);
 #endif
 }
 
@@ -83,20 +94,16 @@ static __inline__ unsigned long long __attribute__((__always_inline__))
 _pdep_u64(unsigned long long __src, unsigned long long __mask)
 {
 #ifdef __BMI2__
-    unsigned long long __r;
-    __asm__("pdepq %2, %1, %0" : "=r"(__r) : "r"(__src), "rm"(__mask));
-    return __r;
+    return __builtin_ia32_pdep_di(__src, __mask);
 #else
-    unsigned long long __result = 0;
-    unsigned long long __k = 0;
-    for (unsigned long long __i = 0; __i < 64; __i++) {
-        if (__mask & (1ULL << __i)) {
-            if (__src & (1ULL << __k))
-                __result |= (1ULL << __i);
-            __k++;
-        }
+    unsigned long long __r = 0;
+    while (__mask) {
+        unsigned long long __low = __mask & (0ULL - __mask);
+        __r |= __low & (0ULL - (__src & 1ULL));
+        __src >>= 1;
+        __mask ^= __low;
     }
-    return __result;
+    return __r;
 #endif
 }
 
@@ -105,21 +112,38 @@ static __inline__ unsigned long long __attribute__((__always_inline__))
 _pext_u64(unsigned long long __src, unsigned long long __mask)
 {
 #ifdef __BMI2__
-    unsigned long long __r;
-    __asm__("pextq %2, %1, %0" : "=r"(__r) : "r"(__src), "rm"(__mask));
-    return __r;
+    return __builtin_ia32_pext_di(__src, __mask);
 #else
-    unsigned long long __result = 0;
-    unsigned long long __k = 0;
-    for (unsigned long long __i = 0; __i < 64; __i++) {
-        if (__mask & (1ULL << __i)) {
-            if (__src & (1ULL << __i))
-                __result |= (1ULL << __k);
-            __k++;
-        }
+    unsigned long long __r = 0, __bit = 1;
+    while (__mask) {
+        unsigned long long __low = __mask & (0ULL - __mask);
+        __r |= __bit & (0ULL - (unsigned long long)((__src & __low) != 0));
+        __bit <<= 1;
+        __mask ^= __low;
     }
-    return __result;
+    return __r;
 #endif
+}
+#endif
+
+/* _mulx_u32/_mulx_u64: full unsigned product, high half through the
+ * pointer. A widening multiply is the exact operation; it needs no ISA
+ * extension, so every function may use it. */
+static __inline__ unsigned int __attribute__((__always_inline__))
+_mulx_u32(unsigned int __x, unsigned int __y, unsigned int *__hi)
+{
+    unsigned long long __p = (unsigned long long)__x * __y;
+    *__hi = (unsigned int)(__p >> 32);
+    return (unsigned int)__p;
+}
+
+#ifdef __x86_64__
+static __inline__ unsigned long long __attribute__((__always_inline__))
+_mulx_u64(unsigned long long __x, unsigned long long __y, unsigned long long *__hi)
+{
+    unsigned __int128 __p = (unsigned __int128)__x * __y;
+    *__hi = (unsigned long long)(__p >> 64);
+    return (unsigned long long)__p;
 }
 #endif
 

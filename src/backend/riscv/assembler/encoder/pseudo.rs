@@ -3,224 +3,72 @@ use super::*;
 
 // ── Pseudo-instruction encoders ──────────────────────────────────────
 
-pub(crate) fn encode_li(operands: &[Operand]) -> Result<EncodeResult, String> {
+/// `li rd, imm`, expanded exactly as GNU as does, so that hand-written
+/// assembly gets the sizes it was written against.  A value in 12 bits is
+/// `addi rd, x0, imm` (the opcode table's `li d,j`); a larger one is
+/// `load_const` (gas/config/tc-riscv.c), after `normalize_constant_expr`,
+/// which on RV32 reads a value that fits 32 bits unsigned as signed.  The
+/// caller compresses each word as GNU as's `md_assemblef` does: by the
+/// word's own mnemonic.
+pub(crate) fn encode_li(operands: &[Operand], rv64: bool) -> Result<EncodeResult, String> {
     let rd = get_reg(operands, 0)?;
-    let imm = get_imm(operands, 1)?;
-
-    let words = encode_li_immediate(rd, imm);
-    if words.len() == 1 {
-        Ok(EncodeResult::Word(words[0]))
+    let mut imm = get_imm(operands, 1)?;
+    if !rv64 && (0..=0xFFFF_FFFF).contains(&imm) {
+        imm = i64::from(imm as u32 as i32);
+    }
+    let mut words = Vec::new();
+    if (-2048..=2047).contains(&imm) {
+        words.push(encode_i(OP_OP_IMM, rd, 0, 0, imm as i32));
     } else {
-        Ok(EncodeResult::Words(words))
+        load_const(rd, imm, rv64, &mut words);
     }
+    Ok(if words.len() == 1 {
+        EncodeResult::Word(words[0])
+    } else {
+        EncodeResult::Words(words)
+    })
 }
 
-/// Sign-extend a value from `bits` width to i64.
-pub(crate) fn sign_extend_li(val: i64, bits: u32) -> i64 {
-    let shift = 64 - bits;
-    (val << shift) >> shift
+/// Whether `li`'s own RVC aliases (`li d,Co`, `li d,Cv`) can match.  GNU as
+/// matches them against the operand as written; only its later `li d,j`
+/// entry, which has no 2-byte form, reads an RV32 value in 2^31..2^32 as
+/// signed.  So RV32 `li a0, 0xFFFFFFFF` is a 4-byte `addi a0, zero, -1`
+/// while `li a0, -1` is `c.li` (a `lui` or longer expansion compresses
+/// either way).
+pub(crate) fn li_rvc_aliases_match(operands: &[Operand], rv64: bool) -> bool {
+    rv64 || !get_imm(operands, 1).is_ok_and(|imm| (0x8000_0000..=0xFFFF_FFFF).contains(&imm))
 }
 
-/// Emit lui + addiw (or just addi) for a 32-bit signed value into register `rd`.
-///
-/// On RV64, the `li` pseudo-instruction uses `lui + addiw` (not `lui + addi`)
-/// to ensure proper 32-bit sign extension. GAS always uses `addiw` after `lui`
-/// for `li` on RV64. For small values (fits in 12 bits), `addi rd, x0, imm`
-/// is sufficient since the result is the same.
-pub(crate) fn encode_li_32bit(rd: u32, imm: i32) -> Vec<u32> {
-    if (-2048..=2047).contains(&imm) {
-        return vec![encode_i(OP_OP_IMM, rd, 0, 0, imm)]; // addi rd, x0, imm
-    }
-    let lo = (imm << 20) >> 20; // sign-extend low 12 bits
-    let hi = ((imm as u32).wrapping_add(if lo < 0 { 0x1000 } else { 0 })) & 0xFFFFF000;
-    let mut words = vec![encode_u(OP_LUI, rd, hi)];
-    if lo != 0 {
-        // Use addiw (OP_OP_IMM_32) to match GAS behavior on RV64.
-        // lui sign-extends the 20-bit immediate to 64 bits, and addiw
-        // ensures the final 32-bit result is properly sign-extended.
-        words.push(encode_i(OP_OP_IMM_32, rd, 0, rd, lo)); // addiw rd, rd, lo
-    }
-    words
-}
-
-/// Encode `li` pseudo-instruction for an arbitrary 64-bit immediate.
-///
-/// Decomposes the value into a sequence of lui/addiw/slli/addi instructions.
-/// For 64-bit values that don't fit in 32 bits, finds optimal shift amounts
-/// such that the value = ((upper << shift1) + lo1) << shift2 + lo2 ...
-/// where upper fits in 32 bits and each lo fits in 12 signed bits.
-pub(crate) fn encode_li_immediate(rd: u32, imm: i64) -> Vec<u32> {
-    // Case 1: fits in 12 bits (addi rd, x0, imm)
-    if (-2048..=2047).contains(&imm) {
-        return vec![encode_i(OP_OP_IMM, rd, 0, 0, imm as i32)];
-    }
-
-    // Case 2: fits in 32 bits (lui + addi)
-    if (-0x80000000..=0x7FFFFFFF).contains(&imm) {
-        return encode_li_32bit(rd, imm as i32);
-    }
-
-    // Case 3: 64-bit — try single shift: imm = (upper << shift) + lo12
-    let lo12 = sign_extend_li(imm & 0xFFF, 12);
-    let mut best: Option<Vec<u32>> = None;
-
-    for shift in 12..45 {
-        let remainder = imm.wrapping_sub(lo12);
-        if remainder & ((1i64 << shift) - 1) != 0 {
-            continue;
+/// GNU as's `load_const`: a value that is not a sign-extended 32-bit one
+/// (RV64 only) is its upper part shifted right past its trailing zeros,
+/// loaded recursively, then `slli` and `addi` of the low 12 bits; otherwise
+/// `lui` of the upper 20 bits and/or `addiw` (RV32: `addi`) of the low 12.
+/// On RV32 a wider value keeps its low 32 bits, as there.
+fn load_const(rd: u32, value: i64, rv64: bool, words: &mut Vec<u32>) {
+    let lower = ((value & 0xFFF) ^ 0x800) - 0x800;
+    let upper = value.wrapping_sub(lower);
+    if rv64 && value != i64::from(value as i32) {
+        // `upper` is nonzero here: `lower` is a sign-extended 12-bit value.
+        let mut shift = 12;
+        while (upper >> shift) & 1 == 0 {
+            shift += 1;
         }
-        let upper = remainder >> shift;
-        if !(-0x80000000..=0x7FFFFFFF).contains(&upper) {
-            continue;
-        }
-
-        let mut words = encode_li_32bit(rd, upper as i32);
-        // Convert addi to addiw after lui for proper 64-bit sign extension
-        if words.len() == 2 {
-            let first_opcode = words[0] & 0x7F;
-            let second_opcode = words[1] & 0x7F;
-            if first_opcode == OP_LUI && second_opcode == OP_OP_IMM {
-                words[1] = (words[1] & !0x7F) | OP_OP_IMM_32;
-            }
-        }
+        load_const(rd, upper >> shift, rv64, words);
         words.push(encode_i(OP_OP_IMM, rd, 0b001, rd, shift)); // slli
-        if lo12 != 0 {
-            words.push(encode_i(OP_OP_IMM, rd, 0, rd, lo12 as i32)); // addi
+        if lower != 0 {
+            words.push(encode_i(OP_OP_IMM, rd, 0, rd, lower as i32)); // addi
         }
-
-        if best.is_none() || words.len() < best.as_ref().unwrap().len() {
-            best = Some(words);
+    } else {
+        let mut hi_reg = 0;
+        if upper != 0 {
+            words.push(encode_u(OP_LUI, rd, upper as u32)); // lui (bits 31:12)
+            hi_reg = rd;
         }
-    }
-
-    if let Some(words) = best {
-        return words;
-    }
-
-    // Case 4: two-level shift — imm = ((A << shift1) + lo_b) << shift2 + lo_c
-    for shift2 in 12..33 {
-        let remainder_c = imm.wrapping_sub(lo12);
-        if remainder_c & ((1i64 << shift2) - 1) != 0 {
-            continue;
-        }
-        let inner = remainder_c >> shift2;
-        let lo12_b = sign_extend_li(inner & 0xFFF, 12);
-
-        for shift1 in 12..33 {
-            let remainder_b = inner.wrapping_sub(lo12_b);
-            if remainder_b & ((1i64 << shift1) - 1) != 0 {
-                continue;
-            }
-            let upper = remainder_b >> shift1;
-            if !(-0x80000000..=0x7FFFFFFF).contains(&upper) {
-                continue;
-            }
-
-            let mut words = encode_li_32bit(rd, upper as i32);
-            if words.len() == 2 {
-                let first_opcode = words[0] & 0x7F;
-                let second_opcode = words[1] & 0x7F;
-                if first_opcode == OP_LUI && second_opcode == OP_OP_IMM {
-                    words[1] = (words[1] & !0x7F) | OP_OP_IMM_32;
-                }
-            }
-            words.push(encode_i(OP_OP_IMM, rd, 0b001, rd, shift1)); // slli
-            if lo12_b != 0 {
-                words.push(encode_i(OP_OP_IMM, rd, 0, rd, lo12_b as i32)); // addi
-            }
-            words.push(encode_i(OP_OP_IMM, rd, 0b001, rd, shift2)); // slli
-            if lo12 != 0 {
-                words.push(encode_i(OP_OP_IMM, rd, 0, rd, lo12 as i32)); // addi
-            }
-
-            if best.is_none() || words.len() < best.as_ref().unwrap().len() {
-                best = Some(words);
-            }
+        if lower != 0 || hi_reg == 0 {
+            let opcode = if rv64 { OP_OP_IMM_32 } else { OP_OP_IMM };
+            words.push(encode_i(opcode, rd, 0, hi_reg, lower as i32)); // addiw / addi
         }
     }
-
-    if let Some(words) = best {
-        return words;
-    }
-
-    // Case 5: three-level shift (needed for dense bit patterns across all 64 bits)
-    for shift3 in 12..23 {
-        let rem_c = imm.wrapping_sub(lo12);
-        if rem_c & ((1i64 << shift3) - 1) != 0 {
-            continue;
-        }
-        let v2 = rem_c >> shift3;
-        let lo12_b = sign_extend_li(v2 & 0xFFF, 12);
-
-        for shift2 in 12..23 {
-            let rem_b = v2.wrapping_sub(lo12_b);
-            if rem_b & ((1i64 << shift2) - 1) != 0 {
-                continue;
-            }
-            let v1 = rem_b >> shift2;
-            let lo12_a = sign_extend_li(v1 & 0xFFF, 12);
-
-            for shift1 in 12..23 {
-                let rem_a = v1.wrapping_sub(lo12_a);
-                if rem_a & ((1i64 << shift1) - 1) != 0 {
-                    continue;
-                }
-                let upper = rem_a >> shift1;
-                if !(-0x80000000..=0x7FFFFFFF).contains(&upper) {
-                    continue;
-                }
-
-                let mut words = encode_li_32bit(rd, upper as i32);
-                if words.len() == 2 {
-                    let first_opcode = words[0] & 0x7F;
-                    let second_opcode = words[1] & 0x7F;
-                    if first_opcode == OP_LUI && second_opcode == OP_OP_IMM {
-                        words[1] = (words[1] & !0x7F) | OP_OP_IMM_32;
-                    }
-                }
-                words.push(encode_i(OP_OP_IMM, rd, 0b001, rd, shift1));
-                if lo12_a != 0 {
-                    words.push(encode_i(OP_OP_IMM, rd, 0, rd, lo12_a as i32));
-                }
-                words.push(encode_i(OP_OP_IMM, rd, 0b001, rd, shift2));
-                if lo12_b != 0 {
-                    words.push(encode_i(OP_OP_IMM, rd, 0, rd, lo12_b as i32));
-                }
-                words.push(encode_i(OP_OP_IMM, rd, 0b001, rd, shift3));
-                if lo12 != 0 {
-                    words.push(encode_i(OP_OP_IMM, rd, 0, rd, lo12 as i32));
-                }
-
-                if best.is_none() || words.len() < best.as_ref().unwrap().len() {
-                    best = Some(words);
-                }
-            }
-        }
-    }
-
-    if let Some(words) = best {
-        return words;
-    }
-
-    // Fallback: lui + addiw + slli 32, then add lower bits via addi chain
-    eprintln!("warning: li fallback for 0x{:x}", imm as u64);
-    let upper = (imm >> 32) as i32;
-    let mut words = encode_li_32bit(rd, upper);
-    if words.len() == 2 {
-        let first_opcode = words[0] & 0x7F;
-        let second_opcode = words[1] & 0x7F;
-        if first_opcode == OP_LUI && second_opcode == OP_OP_IMM {
-            words[1] = (words[1] & !0x7F) | OP_OP_IMM_32;
-        }
-    }
-    words.push(encode_i(OP_OP_IMM, rd, 0b001, rd, 32)); // slli rd, rd, 32
-    let mut remaining = imm as i32 as i64;
-    while remaining != 0 {
-        let chunk = remaining.clamp(-2048, 2047);
-        words.push(encode_i(OP_OP_IMM, rd, 0, rd, chunk as i32));
-        remaining -= chunk;
-    }
-    words
 }
 
 pub(crate) fn encode_mv(operands: &[Operand]) -> Result<EncodeResult, String> {

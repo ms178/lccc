@@ -89,12 +89,15 @@ impl Lowerer {
             base_return_type,
             return_is_bool,
         ));
+        self.diagnose_x86_target_attribute(func);
         self.func_mut().target_features = func
             .attrs
             .target
             .as_deref()
             .map(crate::ir::module::normalize_target_features)
             .unwrap_or_default();
+        self.func_mut().x86_defers_isa =
+            func.attrs.is_always_inline() && self.func_mut().target_features.is_empty();
         let return_ctype = self.type_spec_to_ctype(&func.return_type);
         if !func.attrs.is_static() && !self.is_internal_function(&func.name) {
             self.diagnose_unsupported_ext_vector_abi(&return_ctype, true, func.span);
@@ -1190,6 +1193,10 @@ impl Lowerer {
             } else {
                 Some(Operand::Const(IrConst::I32(0)))
             };
+            // Falling off the end returns at the closing brace (GCC's row).
+            if let Some(close) = func.body_span.closing_delimiter() {
+                self.func_mut().current_span = close;
+            }
             self.terminate(Terminator::Return(ret_op));
         }
 
@@ -1308,6 +1315,7 @@ impl Lowerer {
             is_static,
             is_inline: func.attrs.is_inline(),
             is_always_inline: func.attrs.is_always_inline(),
+            x86_isa_needs: std::mem::take(&mut self.func_mut().x86_isa_needs),
             is_noinline: func.attrs.is_noinline(),
             target_features: func
                 .attrs
@@ -1350,6 +1358,8 @@ impl Lowerer {
                 max_char_array_bytes: self.func().ssp_max_char_array_bytes,
                 stack_guard_alloca: None,
             },
+            body_span: func.body_span,
+            terminator_spans: std::mem::take(&mut self.func_mut().term_spans),
         };
         // Collect __attribute__((symver("..."))) directives
         if let Some(ref sv) = func.attrs.symver {

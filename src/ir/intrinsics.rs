@@ -104,6 +104,13 @@ pub enum IntrinsicOp {
     SetEpi8,
     /// Set all dwords to value (splat)
     SetEpi32,
+    /// BMI2 parallel bit deposit/extract (`args`: source, mask). The x86-64
+    /// backend emits `pdep`/`pext` only where the function may use BMI2 and
+    /// an exact portable loop elsewhere, so the op is legal in any function.
+    Pdep32,
+    Pdep64,
+    Pext32,
+    Pext64,
     /// CRC32 accumulate
     Crc32_8,
     Crc32_16,
@@ -2293,6 +2300,8 @@ impl IntrinsicOp {
             IntrinsicOp::CopysignF32 | IntrinsicOp::CopysignF64 |
             IntrinsicOp::F128Fabs | IntrinsicOp::F128Neg | IntrinsicOp::F128Copysign |
             IntrinsicOp::F16ToF32 | IntrinsicOp::F32ToF16 |
+            IntrinsicOp::Pdep32 | IntrinsicOp::Pdep64 |
+            IntrinsicOp::Pext32 | IntrinsicOp::Pext64 |
             IntrinsicOp::VecWidenAddI32x4ToI64x4
             | IntrinsicOp::VecWidenMaskedAddI32x4ToI64x4
             | IntrinsicOp::VecMaskedAddI32x8 |
@@ -2880,6 +2889,22 @@ mod vector_width_tests {
             IntrinsicOp::Cvtss2Si64,
             IntrinsicOp::MovemaskPs128,
             IntrinsicOp::MovemaskPd128,
+        ] {
+            assert!(op.is_pure(), "{op:?} has no observable side effect");
+            assert_eq!(op.vector_result_width(), None, "{op:?} is scalar");
+        }
+    }
+
+    /// `pdep`/`pext` are pure scalar functions of (source, mask) in every
+    /// function: the backend picks the instruction or the exact loop, so
+    /// CSE and DCE may treat them like any arithmetic.
+    #[test]
+    fn pdep_pext_are_pure_scalar_ops() {
+        for op in [
+            IntrinsicOp::Pdep32,
+            IntrinsicOp::Pdep64,
+            IntrinsicOp::Pext32,
+            IntrinsicOp::Pext64,
         ] {
             assert!(op.is_pure(), "{op:?} has no observable side effect");
             assert_eq!(op.vector_result_width(), None, "{op:?} is scalar");

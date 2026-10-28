@@ -4046,6 +4046,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
         // Materialize the `.file`/`.loc` records emitted by `-g` as a
         // relocatable DWARF v4 line table. The section/offset relocations are
         // resolved by the final linker, after code layout is fixed.
+        let mut debug_line_units: Vec<elf_mod::DwarfLineUnit> = Vec::new();
         if !shared_sections.contains_key(".debug_line") {
             let section_info: Vec<elf_mod::DwarfSectionInfo<'_>> = self
                 .sections
@@ -4063,7 +4064,13 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 &section_info,
                 address_size,
                 A::reloc_abs(address_size),
+                None,
             )? {
+                let (mut debug_line, units) = debug_line;
+                if A::uses_rel_format() {
+                    fold_rel_addends(&mut debug_line)?;
+                }
+                debug_line_units = units;
                 section_names.push(debug_line.name.clone());
                 shared_sections.insert(debug_line.name.clone(), debug_line);
             }
@@ -4212,6 +4219,72 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 }
                 SymverFlag::Remove => {
                     symver_removed.insert(name.clone());
+                }
+            }
+        }
+
+        // GAS `dwarf2_finish` parity: a synthesized line table without a
+        // source-provided `.debug_info` gets compile units, or no debugger
+        // ever reads it (see `elf::dwarf`).
+        if !debug_line_units.is_empty()
+            && !shared_sections.contains_key(".debug_info")
+            && !shared_sections.contains_key(".debug_abbrev")
+        {
+            let section_info: Vec<elf_mod::DwarfSectionInfo<'_>> = self
+                .sections
+                .iter()
+                .map(|sec| elf_mod::DwarfSectionInfo {
+                    name: &sec.name,
+                    size: sec.cursor(),
+                    is_executable: sec.flags & SHF_EXECINSTR != 0,
+                })
+                .collect();
+            let functions: Vec<elf_mod::DwarfFunction<'_>> = self
+                .pending_types
+                .iter()
+                .filter(|(_, kind)| {
+                    matches!(kind, SymbolKind::Function | SymbolKind::GnuIndirectFunction)
+                })
+                .filter_map(|(name, _)| {
+                    let &(section_index, offset) = self.label_positions.get(name)?;
+                    Some(elf_mod::DwarfFunction {
+                        name,
+                        section_index,
+                        offset,
+                        size: symbol_sizes.get(name).copied().unwrap_or(0),
+                        external: global_symbols.contains_key(name)
+                            || weak_symbols.contains_key(name),
+                    })
+                })
+                .collect();
+            let primary_file = self
+                .debug_files
+                .iter()
+                .find(|(number, _)| *number == 1)
+                .or_else(|| self.debug_files.first())
+                .map_or("", |(_, name)| name.as_str());
+            let comp_dir = std::env::current_dir()
+                .map(|dir| dir.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let address_size = if A::elf_class() == ELFCLASS32 { 4 } else { 8 };
+            if let Some((info, abbrev)) = elf_mod::build_dwarf_info_sections(
+                &debug_line_units,
+                &section_info,
+                &functions,
+                primary_file,
+                &comp_dir,
+                concat!("LCCC ", env!("CARGO_PKG_VERSION")),
+                address_size,
+                A::reloc_abs(4),
+                A::reloc_abs(address_size),
+                None,
+            )? {
+                for mut section in [info, abbrev] {
+                    if A::uses_rel_format() {
+                        fold_rel_addends(&mut section)?;
+                    }
+                    section_names.push(section.name.clone());
+                    shared_sections.insert(section.name.clone(), section);
                 }
             }
         }
@@ -6197,6 +6270,35 @@ fn instr_operands_mention_dot(instr: &Instruction) -> bool {
     })
 }
 
+/// REL targets (i386) carry a relocation's addend in the field it
+/// relocates. The DWARF builders produce RELA-style relocations, so fold
+/// each addend into its field and clear it -- otherwise every code address
+/// past a section's first byte (a `.loc` after the prologue, a second
+/// function's `DW_AT_low_pc`) and every second unit's `DW_AT_stmt_list`
+/// pointed at offset 0. All of these relocations are 32-bit on ELF32.
+fn fold_rel_addends(section: &mut ObjSection) -> Result<(), String> {
+    for reloc in &mut section.relocs {
+        let at = usize::try_from(reloc.offset).map_err(|_| "DWARF relocation offset overflow")?;
+        let field = section.data.get_mut(at..at + 4).ok_or_else(|| {
+            format!(
+                "{}: relocation at {at:#x} is outside the section",
+                section.name
+            )
+        })?;
+        let addend = i32::try_from(reloc.addend).map_err(|_| {
+            format!(
+                "{}: REL addend {} exceeds 32 bits",
+                section.name, reloc.addend
+            )
+        })?;
+        let value =
+            i32::from_le_bytes([field[0], field[1], field[2], field[3]]).wrapping_add(addend);
+        field.copy_from_slice(&value.to_le_bytes());
+        reloc.addend = 0;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod pad_queue_tests {
     use super::{PadEdit, PadQueue};
@@ -8137,5 +8239,52 @@ mod batched_edit_differential_tests {
             fallbacks >= total,
             "only {fallbacks} queue fallbacks over {total} programs"
         );
+    }
+}
+
+#[cfg(test)]
+mod rel_addend_tests {
+    use super::fold_rel_addends;
+    use crate::backend::elf::{ObjReloc, ObjSection};
+
+    fn section(data: Vec<u8>, relocs: Vec<ObjReloc>) -> ObjSection {
+        ObjSection {
+            name: ".debug_line".into(),
+            sh_type: 1,
+            sh_flags: 0,
+            data,
+            sh_size: None,
+            sh_addralign: 1,
+            relocs,
+            comdat_group: None,
+        }
+    }
+
+    fn reloc(offset: u64, addend: i64) -> ObjReloc {
+        ObjReloc {
+            offset,
+            reloc_type: 1,
+            symbol_name: ".text".into(),
+            addend,
+        }
+    }
+
+    /// i386 REL: the addend lives in the field. `DW_LNE_set_address` to a
+    /// `.loc` 0xa bytes into `.text` must read `.text + 0xa`, not `.text`.
+    #[test]
+    fn addends_move_into_their_fields() {
+        let mut sec = section(
+            vec![0xaa, 0, 0, 0, 0, 0xbb, 0, 0, 0, 0],
+            vec![reloc(1, 0xa), reloc(5, 0)],
+        );
+        fold_rel_addends(&mut sec).unwrap();
+        assert_eq!(sec.data, [0xaa, 0x0a, 0, 0, 0, 0xbb, 0, 0, 0, 0]);
+        assert!(sec.relocs.iter().all(|r| r.addend == 0));
+    }
+
+    #[test]
+    fn out_of_range_fields_and_addends_are_errors() {
+        assert!(fold_rel_addends(&mut section(vec![0; 6], vec![reloc(3, 1)])).is_err());
+        assert!(fold_rel_addends(&mut section(vec![0; 4], vec![reloc(0, 1 << 33)])).is_err());
     }
 }

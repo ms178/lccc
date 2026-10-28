@@ -93,12 +93,3 @@ pub fn parse_thin_archive(
 pub fn parse_shared_library_symbols(data: &[u8], lib_name: &str) -> Result<Vec<DynSymbol>, String> {
     linker_common::parse_shared_library_symbols(data, lib_name)
 }
-
-/// Read dynamic symbols from a shared library file path.
-///
-/// Convenience wrapper that reads the file and delegates to
-/// `parse_shared_library_symbols`.
-pub fn read_shared_lib_symbols(path: &str) -> Result<Vec<DynSymbol>, String> {
-    let data = std::fs::read(path).map_err(|e| format!("Cannot read {}: {}", path, e))?;
-    parse_shared_library_symbols(&data, path)
-}

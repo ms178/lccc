@@ -1236,8 +1236,12 @@ impl<'a> ExprTypeChecker<'a> {
         }
         match name {
             // BMI2 BZHI returns its operand type.
-            "__builtin_ia32_bzhi_si" => Some(CType::UInt),
-            "__builtin_ia32_bzhi_di" => Some(CType::ULongLong),
+            "__builtin_ia32_bzhi_si" | "__builtin_ia32_pdep_si" | "__builtin_ia32_pext_si" => {
+                Some(CType::UInt)
+            }
+            "__builtin_ia32_bzhi_di" | "__builtin_ia32_pdep_di" | "__builtin_ia32_pext_di" => {
+                Some(CType::ULongLong)
+            }
             // Float-returning builtins
             "__builtin_inf"
             | "__builtin_huge_val"
@@ -1420,7 +1424,7 @@ impl<'a> ExprTypeChecker<'a> {
             | "__builtin_cpu_init" => Some(CType::Void),
 
             // CPU feature detection
-            "__builtin_cpu_supports" => Some(CType::Int),
+            "__builtin_cpu_supports" | "__builtin_cpu_is" => Some(CType::Int),
 
             _ => None,
         }

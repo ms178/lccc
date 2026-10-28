@@ -92,8 +92,11 @@ pub(super) fn property_note_extent(
     })
 }
 
+/// `keep_debug`: append the DWARF sections as well (false under
+/// `--strip-debug` / `--strip-all`).
 pub(super) fn merge_sections(
     inputs: &mut [InputObject],
+    keep_debug: bool,
 ) -> (Vec<OutputSection>, FxHashMap<String, usize>, SectionMap) {
     let mut output_sections: Vec<OutputSection> = Vec::new();
     let mut section_name_to_idx: FxHashMap<String, usize> = FxHashMap::default();
@@ -165,6 +168,18 @@ pub(super) fn merge_sections(
                     .extend(std::iter::repeat_n(0u8, sec.data.len()));
             }
         }
+    }
+
+    // After every allocated section, so the debug outputs never take part
+    // in segment layout.
+    if keep_debug {
+        super::debug::merge_debug_sections(
+            inputs,
+            &discarded,
+            &mut output_sections,
+            &mut section_name_to_idx,
+            &mut section_map,
+        );
     }
 
     (output_sections, section_name_to_idx, section_map)

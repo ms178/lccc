@@ -186,6 +186,7 @@ fn renumber_module_blocks(m: &mut IrModule, offset: u32) -> u32 {
             max_seen = max_seen.max(b.label.0 + 1);
             shift_block_refs(b, offset);
         }
+        func.terminator_spans.shift(offset);
         for bid in &mut func.global_init_label_blocks {
             bid.0 += offset;
             max_seen = max_seen.max(bid.0 + 1);

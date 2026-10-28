@@ -952,10 +952,42 @@ impl Lowerer {
     /// of the block that owns it, which is only reachable when a loop re-enters
     /// the entry block *and* the first probe read sits after a phi.  The
     /// fallback is correct, just slower on the hot path.
+    ///
+    /// The same guarded split initialises libgcc's `__cpu_model` for
+    /// `__builtin_cpu_is` (see [`Self::mark_cpu_model_init`]); a function that
+    /// needs both gets both guards, each placed before the first read it
+    /// protects.
     pub(super) fn splice_cpu_probe_init(&mut self) {
-        if !self.func_state.as_ref().is_some_and(|s| s.cpu_probe_init) {
+        let Some((probe, model)) = self
+            .func_state
+            .as_ref()
+            .map(|s| (s.cpu_probe_init, s.cpu_model_init))
+        else {
             return;
+        };
+        if probe {
+            self.splice_guarded_init(
+                crate::common::cpu_probe::is_probe_word_symbol,
+                crate::common::cpu_probe::READY_SYMBOL,
+                crate::common::cpu_probe::INIT_SYMBOL,
+            );
         }
+        if model {
+            use crate::common::cpu_is_table::{INIT_SYMBOL, MODEL_SYMBOL};
+            self.splice_guarded_init(|name| name == MODEL_SYMBOL, MODEL_SYMBOL, INIT_SYMBOL);
+        }
+    }
+
+    /// Split the entry block before the first `GlobalAddr` of a symbol that
+    /// `first_read` selects, and guard `call init_symbol` with
+    /// `load i32 ready_symbol != 0` (the shape documented on
+    /// [`Self::splice_cpu_probe_init`]).
+    fn splice_guarded_init(
+        &mut self,
+        first_read: impl Fn(&str) -> bool,
+        ready_symbol: &str,
+        init_symbol: &str,
+    ) {
         let (entry_label, pos, splittable) = {
             let Some(f) = self.func_state.as_ref() else {
                 return;
@@ -966,10 +998,9 @@ impl Lowerer {
             let pos = entry
                 .instructions
                 .iter()
-                .position(|inst| {
-                    matches!(inst, Instruction::GlobalAddr { name, .. }
-                        if crate::common::cpu_probe::is_probe_word_symbol(name))
-                })
+                .position(
+                    |inst| matches!(inst, Instruction::GlobalAddr { name, .. } if first_read(name)),
+                )
                 .unwrap_or(entry.instructions.len());
             let splittable = !entry.instructions[pos..]
                 .iter()
@@ -981,7 +1012,7 @@ impl Lowerer {
             let Some(entry) = self.func_state.as_mut().and_then(|s| s.blocks.first_mut()) else {
                 return;
             };
-            entry.instructions.insert(pos, Self::cpu_probe_init_call());
+            entry.instructions.insert(pos, Self::init_call(init_symbol));
             if !entry.source_spans.is_empty() {
                 entry.source_spans.insert(pos, Span::dummy());
             }
@@ -1017,7 +1048,7 @@ impl Lowerer {
         );
         entry.instructions.push(Instruction::GlobalAddr {
             dest: ready_addr,
-            name: crate::common::cpu_probe::READY_SYMBOL.to_string(),
+            name: ready_symbol.to_string(),
         });
         entry.instructions.push(Instruction::Load {
             dest: ready_val,
@@ -1044,7 +1075,7 @@ impl Lowerer {
         });
         f.blocks.push(BasicBlock {
             label: cold,
-            instructions: vec![Self::cpu_probe_init_call()],
+            instructions: vec![Self::init_call(init_symbol)],
             terminator: Terminator::Branch(hot),
             source_spans: if tracked {
                 vec![Span::dummy()]
@@ -1069,10 +1100,11 @@ impl Lowerer {
         }
     }
 
-    /// The `call __lccc_cpu_init` instruction (AUD-CPU-1).
-    fn cpu_probe_init_call() -> Instruction {
+    /// The argument-less `call init_symbol` of a guarded initialiser; its
+    /// result, if any (`__cpu_indicator_init` returns `int`), is unused.
+    fn init_call(init_symbol: &str) -> Instruction {
         Instruction::Call {
-            func: crate::common::cpu_probe::INIT_SYMBOL.to_string(),
+            func: init_symbol.to_string(),
             info: CallInfo {
                 dest: None,
                 args: Vec::new(),
@@ -1117,6 +1149,91 @@ impl Lowerer {
             IrCmpOp::Ne,
             Operand::Value(masked),
             Operand::Const(IrConst::I32(0)),
+            IrType::I32,
+        )
+    }
+
+    /// Resolve the argument of `__builtin_cpu_is` to the `__cpu_model` field
+    /// and value GCC compares (`crate::common::cpu_is_table`, generated from
+    /// GCC 16.2's own code generation).
+    ///
+    /// Unlike `__builtin_cpu_supports`, no non-x86 name space exists to stay
+    /// compatible with: GCC has no such builtin on AArch64 and Clang 23.1
+    /// rejects it there ("builtin is not supported on this target") and on
+    /// RISC-V for every name in this table (measured), so a non-x86 target
+    /// diagnoses instead of folding to a silent 0.
+    fn resolve_cpu_is(
+        &self,
+        args: &[Expr],
+    ) -> Result<(crate::common::cpu_is_table::CpuModelField, u32), String> {
+        let name = match args {
+            [crate::frontend::parser::ast::Expr::StringLiteral(s, _)] => s,
+            [] => return Err("too few arguments to function '__builtin_cpu_is'".to_string()),
+            [_, _, ..] => {
+                return Err("too many arguments to function '__builtin_cpu_is'".to_string());
+            }
+            _ => {
+                return Err("parameter to builtin must be a string constant or literal".to_string());
+            }
+        };
+        if !matches!(
+            self.target,
+            crate::backend::Target::X86_64 | crate::backend::Target::I686
+        ) {
+            return Err("builtin is not supported on this target".to_string());
+        }
+        crate::common::cpu_is_table::lookup(name)
+            .ok_or_else(|| format!("parameter to builtin not valid: {name}"))
+    }
+
+    /// Record that this function reads libgcc's `__cpu_model`, so its entry
+    /// block initialises it once through `__cpu_indicator_init` (guarded by
+    /// the vendor word, which that initialiser always leaves nonzero).
+    ///
+    /// GCC relies on libgcc's constructor having run, which does not hold in
+    /// a constructor that runs earlier; the guard makes every
+    /// `__builtin_cpu_is` correct regardless of constructor order.
+    fn mark_cpu_model_init(&mut self) {
+        if let Some(state) = self.func_state.as_mut() {
+            state.cpu_model_init = true;
+        }
+    }
+
+    /// Emit `__cpu_model.<field> == value`.
+    fn emit_cpu_model_compare(
+        &mut self,
+        field: crate::common::cpu_is_table::CpuModelField,
+        value: u32,
+    ) -> Value {
+        let base = self.fresh_value();
+        self.emit(Instruction::GlobalAddr {
+            dest: base,
+            name: crate::common::cpu_is_table::MODEL_SYMBOL.to_string(),
+        });
+        let addr = if field.offset() == 0 {
+            base
+        } else {
+            let addr = self.fresh_value();
+            self.emit(Instruction::GetElementPtr {
+                dest: addr,
+                base,
+                offset: Operand::Const(IrConst::ptr_int(field.offset())),
+                ty: IrType::I8,
+            });
+            addr
+        };
+        let word = self.fresh_value();
+        self.emit(Instruction::Load {
+            dest: word,
+            ptr: addr,
+            ty: IrType::I32,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        });
+        self.emit_cmp_val(
+            IrCmpOp::Eq,
+            Operand::Value(word),
+            Operand::Const(IrConst::I32(value as i32)),
             IrType::I32,
         )
     }
@@ -1267,8 +1384,40 @@ impl Lowerer {
                     }
                 }
             }
+            // __builtin_cpu_is("cpu") - GCC's lowering: one comparison against
+            // libgcc's `__cpu_model`, never a constant; the same diagnostics as
+            // `__builtin_cpu_supports` above.
+            BuiltinIntrinsic::CpuIs => {
+                let resolved = self.resolve_cpu_is(args);
+                for arg in args {
+                    let _ = self.lower_expr(arg);
+                }
+                match resolved {
+                    Ok((field, value)) if self.func_state.is_some() => {
+                        self.mark_cpu_model_init();
+                        Some(Operand::Value(self.emit_cpu_model_compare(field, value)))
+                    }
+                    Ok(_) => {
+                        self.diagnostics.borrow_mut().error(
+                            "initializer element is not constant",
+                            Self::builtin_arg_span(args),
+                        );
+                        Some(Operand::Const(IrConst::I32(0)))
+                    }
+                    Err(message) => {
+                        self.diagnostics
+                            .borrow_mut()
+                            .error(message, Self::builtin_arg_span(args));
+                        Some(Operand::Const(IrConst::I32(0)))
+                    }
+                }
+            }
             BuiltinIntrinsic::X86Bzhi32 => self.lower_bzhi_builtin(intrinsic, false, name, args),
             BuiltinIntrinsic::X86Bzhi64 => self.lower_bzhi_builtin(intrinsic, true, name, args),
+            BuiltinIntrinsic::X86Pdep32
+            | BuiltinIntrinsic::X86Pdep64
+            | BuiltinIntrinsic::X86Pext32
+            | BuiltinIntrinsic::X86Pext64 => self.lower_pdep_pext_builtin(intrinsic, name, args),
             BuiltinIntrinsic::X86Movntq => self.lower_movntq_builtin(name, args),
             // X86 SSE/AES/CRC intrinsics - delegated to lower_x86_intrinsic
             BuiltinIntrinsic::X86Lfence
@@ -2709,8 +2858,7 @@ impl Lowerer {
                 self.target,
                 crate::backend::Target::X86_64 | crate::backend::Target::I686
             )
-            && crate::common::x86_features::effective()
-                .contains(crate::common::x86_features::X86Feature::Sse2)
+            && self.x86_feature_relied(crate::common::x86_features::X86Feature::Sse2)
         {
             // PSHUFD copies arbitrary 32-bit bit patterns, including floats;
             // it is not a floating-point operation and raises no FP exception.
@@ -2934,166 +3082,91 @@ impl Lowerer {
         if !matches!(crate::common::types::target_elf_machine(), 3 | 62) {
             return;
         }
-        if self.x86_feature_permitted(requirement.feature) {
+        if self.x86_feature_relied(requirement.feature) {
             return;
         }
-        self.diagnostics.borrow_mut().error(
-            format!(
-                "`{}` requires the {} instruction-set extension ({}){}, which the requested target does not have",
-                name,
-                requirement.feature.name(),
-                requirement.flag,
-                requirement.also.unwrap_or("")
-            ),
-            span,
+        // The AVX-VNNI dot products also exist as EVEX (AVX512-VNNI+VL).
+        if requirement.feature == crate::common::x86_features::X86Feature::AvxVnni
+            && crate::backend::x86::isa::function_evex_vnni_permitted(
+                self.func_state
+                    .as_ref()
+                    .map_or(&[][..], |f| &f.target_features),
+                self.target == crate::backend::Target::X86_64,
+            )
+        {
+            use crate::common::x86_features::X86Feature as F;
+            for feature in [F::Avx512Vnni, F::Avx512Vl, F::Avx2] {
+                self.note_x86_relied(feature);
+            }
+            return;
+        }
+        // AES, PCLMUL and GFNI keep their bit under a later `no-sse2`
+        // (`features_permit`): what the function lacks then is SSE2.
+        let sse2_missing = crate::backend::x86::isa::function_features(
+            self.func_state
+                .as_ref()
+                .map_or(&[][..], |f| &f.target_features),
+            self.target == crate::backend::Target::X86_64,
+        )
+        .contains(requirement.feature);
+        if let Some(state) = self
+            .func_state
+            .as_mut()
+            .filter(|state| state.x86_defers_isa)
+        {
+            let needs = &mut state.x86_isa_needs;
+            needs.deferred |= 1 << requirement.feature as u8;
+            if sse2_missing {
+                needs.deferred |= 1 << crate::common::x86_features::X86Feature::Sse2 as u8;
+            }
+            needs.first_use.get_or_insert_with(|| name.to_string());
+            return;
+        }
+        let also = if sse2_missing {
+            " with SSE2 (-msse2)"
+        } else {
+            requirement.also.unwrap_or("")
+        };
+        let message = format!(
+            "`{}` requires the {} instruction-set extension ({}){}, which the requested target does not have",
+            name,
+            requirement.feature.name(),
+            requirement.flag,
+            also
         );
+        self.diagnostics.borrow_mut().error(message, span);
     }
 
-    /// Whether the function being lowered may use `feature`: the TU's
-    /// effective ISA, overridden by the function's own legacy-SSE..AVX2
-    /// `target(...)` requests (enabling a level grants it and everything
-    /// below; `no-X` revokes X and everything above).
-    fn x86_feature_permitted(&self, feature: crate::common::x86_features::X86Feature) -> bool {
-        use crate::common::x86_features::X86Feature as F;
-
-        let mut permitted = crate::common::x86_features::effective().contains(feature);
-        let avx512_requirement = matches!(
-            feature,
-            F::Avx512F
-                | F::Avx512Bw
-                | F::Avx512Dq
-                | F::Avx512Vl
-                | F::Avx512Vnni
-                | F::Avx512BitAlg
-                | F::Avx512Vpopcntdq
-                | F::Avx512Cd
-                | F::Avx512Ifma
-                | F::Avx512Vbmi
-                | F::Avx512Vbmi2
-                | F::Avx512Bf16
-                | F::Avx512Fp16
-                | F::Avx512Bmm
-                | F::Avx512Vp2intersect
-                | F::Avx512Er
-                | F::Avx512Pf
-        );
-        // Legacy 128-bit extensions keep the same register/ABI class under a
-        // function target attribute. Honor that local permission without leaking
-        // it into another function or claiming per-function wider-vector support.
-        let needed = match feature {
-            F::Sse => Some(0),
-            F::Sse2 => Some(1),
-            F::Sse3 => Some(2),
-            F::Ssse3 => Some(3),
-            F::Sse41 => Some(4),
-            F::Sse42 => Some(5),
-            F::Avx => Some(6),
-            F::Avx2 => Some(7),
-            _ => None,
-        };
-        if let Some(function) = self.func_state.as_ref() {
-            for request in &function.target_features {
-                let (enabled, requested_feature) = request
-                    .strip_prefix("no-")
-                    .map_or((true, request.as_str()), |f| (false, f));
-                // AVX-512 subsets imply F; several BW subsets also imply BW,
-                // and VP2INTERSECT implies DQ (matching GCC's target-feature
-                // semantics). Negative prerequisites revoke their dependents.
-                let avx512_feature = matches!(
-                    requested_feature,
-                    "avx512f"
-                        | "avx512bw"
-                        | "avx512dq"
-                        | "avx512vl"
-                        | "avx512cd"
-                        | "avx512ifma"
-                        | "avx512vbmi"
-                        | "avx512vbmi2"
-                        | "avx512vnni"
-                        | "avx512bitalg"
-                        | "avx512vpopcntdq"
-                        | "avx512bf16"
-                        | "avx512fp16"
-                        | "avx512er"
-                        | "avx512pf"
-                        | "avx512vp2intersect"
-                        | "avx512bmm"
-                );
-                let avx512_bw_dependent = matches!(
-                    feature,
-                    F::Avx512Vbmi
-                        | F::Avx512Vbmi2
-                        | F::Avx512BitAlg
-                        | F::Avx512Bf16
-                        | F::Avx512Fp16
-                        | F::Avx512Bmm
-                );
-
-                if requested_feature == "avx512f" {
-                    if avx512_requirement {
-                        permitted = enabled;
-                    }
-                    continue;
-                }
-                if !enabled && requested_feature == "avx512bw" && avx512_bw_dependent {
-                    permitted = false;
-                    continue;
-                }
-                if requested_feature == feature.name() {
-                    permitted = enabled;
-                    continue;
-                }
-                if enabled && feature == F::Avx512F && avx512_feature {
-                    permitted = true;
-                    continue;
-                }
-                if enabled
-                    && feature == F::Avx512Bw
-                    && matches!(
-                        requested_feature,
-                        "avx512vbmi" | "avx512vbmi2" | "avx512bitalg" | "avx512bf16" | "avx512fp16"
-                    )
-                {
-                    permitted = true;
-                    continue;
-                }
-                if enabled && feature == F::Avx512Dq && requested_feature == "avx512vp2intersect" {
-                    permitted = true;
-                    continue;
-                }
-                if !enabled
-                    && feature == F::Fma
-                    && matches!(
-                        requested_feature,
-                        "sse" | "sse2" | "sse3" | "ssse3" | "sse4.1" | "sse4.2" | "avx"
-                    )
-                {
-                    permitted = false;
-                    continue;
-                }
-                let Some(needed) = needed else {
-                    continue;
-                };
-                let level = match requested_feature {
-                    "sse" => 0,
-                    "sse2" => 1,
-                    "sse3" => 2,
-                    "ssse3" => 3,
-                    "sse4.1" => 4,
-                    "sse4.2" => 5,
-                    "avx" => 6,
-                    "avx2" => 7,
-                    _ => continue,
-                };
-                if enabled && level >= needed {
-                    permitted = true;
-                }
-                if !enabled && level <= needed {
-                    permitted = false;
-                }
-            }
+    /// [`Self::x86_feature_permitted`], recording a granted feature as one
+    /// the body relies on: the IR then holds a form only that feature
+    /// allows, which the inliner must not move into a caller without it.
+    fn x86_feature_relied(&mut self, feature: crate::common::x86_features::X86Feature) -> bool {
+        let permitted = self.x86_feature_permitted(feature);
+        if permitted {
+            self.note_x86_relied(feature);
         }
         permitted
+    }
+
+    /// Record `feature` among the x86 features the current function's body
+    /// relies on.
+    fn note_x86_relied(&mut self, feature: crate::common::x86_features::X86Feature) {
+        if let Some(state) = self.func_state.as_mut() {
+            state.x86_isa_needs.relied |= 1 << feature as u8;
+        }
+    }
+
+    /// Whether the function being lowered may use `feature`
+    /// ([`crate::backend::x86::isa::function_feature_permitted`] over its
+    /// own `target(...)`; the translation unit's features without one).
+    fn x86_feature_permitted(&self, feature: crate::common::x86_features::X86Feature) -> bool {
+        crate::backend::x86::isa::function_feature_permitted(
+            self.func_state
+                .as_ref()
+                .map_or(&[][..], |function| &function.target_features),
+            feature,
+            self.target == crate::backend::Target::X86_64,
+        )
     }
 
     /// `_mm_stream_pi` / `__builtin_ia32_movntq`: GCC's SSE1 8-byte
@@ -3144,7 +3217,7 @@ impl Lowerer {
         } else {
             self.lower_typed_x86_builtin_argument(name, value, 1)
         };
-        if self.x86_feature_permitted(F::Sse2) {
+        if self.x86_feature_relied(F::Sse2) {
             self.emit(Instruction::Intrinsic {
                 dest: None,
                 op: IntrinsicOp::Movnti64,
@@ -3161,6 +3234,26 @@ impl Lowerer {
             });
         }
         Some(Operand::Const(IrConst::I64(0)))
+    }
+
+    /// `__builtin_ia32_{pdep,pext}_{si,di}`: an `Intrinsic` whose instruction
+    /// the x86-64 backend chooses per final function (`pdep`/`pext` where
+    /// that function may use BMI2, an exact portable loop where it may not).
+    /// Choosing here would be wrong: `bmi2intrin.h` is lowered under the
+    /// TU's ISA and then inlined into callers whose own `target(...)` may
+    /// forbid BMI2. i686 has no BMI2 codegen (as for `bzhi`), so the builtins
+    /// are rejected there and the header takes its portable form.
+    fn lower_pdep_pext_builtin(
+        &mut self,
+        intrinsic: &BuiltinIntrinsic,
+        name: &str,
+        args: &[Expr],
+    ) -> Option<Operand> {
+        if self.target == crate::backend::Target::I686 {
+            return self.reject_builtin_call(format!("'{name}' is not available on i686"), args, 8);
+        }
+        self.check_x86_intrinsic_feature(intrinsic, name, args);
+        self.lower_x86_intrinsic(intrinsic, name, args)
     }
 
     /// `__builtin_ia32_bzhi_si`/`_di`: BMI2 `bzhi` (see `IrBinOp::Bzhi` for
@@ -3711,6 +3804,10 @@ fn x86_intrinsic_kind(intrinsic: &BuiltinIntrinsic) -> X86IntrinsicKind {
         | BuiltinIntrinsic::X86Cvtsi128Si64
         | BuiltinIntrinsic::X86Cvtsd2Si64
         | BuiltinIntrinsic::X86Cvtss2Si64
+        | BuiltinIntrinsic::X86Pdep32
+        | BuiltinIntrinsic::X86Pdep64
+        | BuiltinIntrinsic::X86Pext32
+        | BuiltinIntrinsic::X86Pext64
         | BuiltinIntrinsic::X86Crc32_8
         | BuiltinIntrinsic::X86Crc32_16
         | BuiltinIntrinsic::X86Crc32_32
@@ -4136,11 +4233,13 @@ fn x86_intrinsic_required_feature(intrinsic: &BuiltinIntrinsic) -> Option<Intrin
             also: None,
         },
         // BMI2 BZHI (`_bzhi_u32`/`_bzhi_u64`).
-        B::X86Bzhi32 | B::X86Bzhi64 => IntrinsicRequirement {
-            feature: F::Bmi2,
-            flag: "-mbmi2",
-            also: None,
-        },
+        B::X86Bzhi32 | B::X86Bzhi64 | B::X86Pdep32 | B::X86Pdep64 | B::X86Pext32 | B::X86Pext64 => {
+            IntrinsicRequirement {
+                feature: F::Bmi2,
+                flag: "-mbmi2",
+                also: None,
+            }
+        }
         // AES-NI, 128-bit forms (the `_mm_*`/`__builtin_ia32_*` spellings that
         // map onto the legacy-encoded instructions).
         B::X86Aesenc128
@@ -4355,6 +4454,10 @@ fn x86_intrinsic_op(intrinsic: &BuiltinIntrinsic) -> IntrinsicOp {
         BuiltinIntrinsic::X86Cvtsi128Si64 => IntrinsicOp::Cvtsi128Si64,
         BuiltinIntrinsic::X86Cvtsd2Si64 => IntrinsicOp::Cvtsd2Si64,
         BuiltinIntrinsic::X86Cvtss2Si64 => IntrinsicOp::Cvtss2Si64,
+        BuiltinIntrinsic::X86Pdep32 => IntrinsicOp::Pdep32,
+        BuiltinIntrinsic::X86Pdep64 => IntrinsicOp::Pdep64,
+        BuiltinIntrinsic::X86Pext32 => IntrinsicOp::Pext32,
+        BuiltinIntrinsic::X86Pext64 => IntrinsicOp::Pext64,
         BuiltinIntrinsic::X86Crc32_8 => IntrinsicOp::Crc32_8,
         BuiltinIntrinsic::X86Crc32_16 => IntrinsicOp::Crc32_16,
         BuiltinIntrinsic::X86Crc32_32 => IntrinsicOp::Crc32_32,

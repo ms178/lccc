@@ -545,6 +545,7 @@ pub fn peephole_optimize(asm: String) -> String {
     if n == 0 {
         return asm;
     }
+    crate::backend::peephole_common::hide_debug_rows(&lines, &mut kinds, LineKind::Nop);
 
     let merge_blocks = std::env::var("CCC_NO_IDENTICAL_BLOCK_MERGE").is_err();
     let coalesce_entry = std::env::var("CCC_NO_ENTRY_COPY_COALESCE").is_err();
@@ -608,15 +609,10 @@ pub fn peephole_optimize(asm: String) -> String {
         }
     }
 
-    // Build result
-    let mut result = String::with_capacity(asm.len());
-    for i in 0..n {
-        if kinds[i] != LineKind::Nop {
-            result.push_str(&lines[i]);
-            result.push('\n');
-        }
-    }
-    result
+    // Build result: kept lines, with the hidden `-g` rows put back.
+    crate::backend::peephole_common::join_with_debug_rows(&lines[..n], |i| {
+        kinds[i] != LineKind::Nop
+    })
 }
 
 // ── Pass 1: Adjacent store/load elimination ──────────────────────────────────
@@ -2480,6 +2476,36 @@ mod tests {
         let out = peephole_optimize(input.to_string());
         assert!(out.contains("bne t0, t1, .Ltarget"), "{out}");
         assert!(!out.contains("jump .Ltarget"), "{out}");
+    }
+
+    /// `-g` rows are hidden from every pass: a row between the branch and
+    /// its target is no directive the fusion must fail closed on (the
+    /// `bge .Lskip; j` pair survived `-g` in k_hashmix.c at -O0).
+    #[test]
+    fn debug_rows_change_no_code() {
+        let plain = "f:\n    beq t0, t1, .Lskip\n    jump .Ltarget, t6\n.Lskip:\n    li t2, 3\n.Ltarget:\n    ret\n";
+        let rows = "f:\n.loc 1 2 3\n    beq t0, t1, .Lskip\n.loc 1 3 1\n    jump .Ltarget, t6\n.Lskip:\n.loc 1 4 5\n    li t2, 3\n.Ltarget:\n.loc 1 5 1\n    ret\n";
+        let (plain, debug) = (
+            peephole_optimize(plain.into()),
+            peephole_optimize(rows.into()),
+        );
+        let code = |s: &str| {
+            s.lines()
+                .filter(|l| !l.starts_with(".loc"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert_eq!(code(&debug), code(&plain));
+        assert!(plain.contains("bne t0, t1, .Ltarget"), "{plain}");
+        // Each row survives, directly before the line it described.
+        assert!(
+            debug.contains(".loc 1 2 3\n    bne t0, t1, .Ltarget"),
+            "{debug}"
+        );
+        assert!(
+            debug.contains(".loc 1 4 5\n    li t2, 3") && debug.contains(".loc 1 5 1\n    ret"),
+            "{debug}"
+        );
     }
 
     #[test]

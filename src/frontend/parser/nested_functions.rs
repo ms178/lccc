@@ -285,7 +285,9 @@ impl Parser {
             }
         }
         self.attrs.set_noreturn(false);
+        let open = self.peek_span();
         let body = self.parse_compound_stmt();
+        let body_span = self.through_previous_token(open);
         for n in shadowed_added {
             self.shadowed_typedefs.remove(&n);
         }
@@ -323,6 +325,7 @@ impl Parser {
             attrs,
             is_kr: is_kr_style,
             span: start,
+            body_span,
         })
     }
 }

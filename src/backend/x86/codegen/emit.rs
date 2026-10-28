@@ -1059,6 +1059,12 @@ pub struct X86Codegen {
     /// per-function `target("...")` overrides.
     module_no_sse: bool,
     module_avx512: bool,
+    /// The current function has AVX-VNNI (CPUID, VEX): the dual-encoded dot
+    /// products get `{vex}`, the only form Alder Lake-class CPUs (no
+    /// AVX-512) execute. Otherwise they were permitted through AVX512-VNNI
+    /// + VL and keep the assembler's default EVEX form, the only one
+    /// Cascade Lake and Ice Lake execute.
+    pub(super) vex_vnni: bool,
     module_avx512vl: bool,
     /// True when the target has LZCNT/ABM (-mlzcnt or an enabling -march).
     /// When false, Clz lowers to a BSR sequence with an explicit zero fixup:
@@ -1658,6 +1664,7 @@ impl X86Codegen {
             peephole_isa: super::super::isa::X86Isa::default(),
             module_no_sse: false,
             module_avx512: false,
+            vex_vnni: false,
             module_avx512vl: false,
             lzcnt_enabled: false,
             popcnt_enabled: false,
@@ -3560,6 +3567,10 @@ impl X86Codegen {
     /// Transfer scalar carrier bits without granting SSE2 to SSE1 code.
     /// SSE1 has no GPR/XMM bit-move instruction. Use a balanced, flag-preserving
     /// stack bridge; scalar consumers do not observe the upper XMM lanes.
+    /// The bridge's `%rsp` motion is described by `cfi_synth`, which derives
+    /// the CFI from the final text; a directive emitted here would reach the
+    /// peephole and make its output depend on `-fasynchronous-unwind-tables`
+    /// (the FPO callee-save elimination refuses `.cfi_adjust_cfa_offset`).
     pub(super) fn emit_scalar_gpr_to_xmm(
         &mut self,
         gpr64: &str,
@@ -3576,18 +3587,12 @@ impl X86Codegen {
             ));
         } else {
             self.state.emit_fmt(format_args!("    pushq %{}", gpr64));
-            if self.state.emit_cfi && self.state.omit_frame_pointer {
-                self.state.emit("    .cfi_adjust_cfa_offset 8");
-            }
             self.state.emit_fmt(format_args!(
                 "    {} (%rsp), %{}",
                 if f32ish { "movss" } else { "movlps" },
                 xmm
             ));
             self.state.emit("    leaq 8(%rsp), %rsp");
-            if self.state.emit_cfi && self.state.omit_frame_pointer {
-                self.state.emit("    .cfi_adjust_cfa_offset -8");
-            }
         }
     }
 
@@ -3603,9 +3608,6 @@ impl X86Codegen {
             ));
         } else {
             self.state.emit("    leaq -8(%rsp), %rsp");
-            if self.state.emit_cfi && self.state.omit_frame_pointer {
-                self.state.emit("    .cfi_adjust_cfa_offset 8");
-            }
             self.state.emit_fmt(format_args!(
                 "    {} %{}, (%rsp)",
                 if gpr32.is_some() { "movss" } else { "movlps" },
@@ -3617,9 +3619,6 @@ impl X86Codegen {
                 gpr32.unwrap_or(gpr64)
             ));
             self.state.emit("    leaq 8(%rsp), %rsp");
-            if self.state.emit_cfi && self.state.omit_frame_pointer {
-                self.state.emit("    .cfi_adjust_cfa_offset -8");
-            }
         }
     }
 
@@ -7759,77 +7758,58 @@ pub(super) struct ScalarIsa {
 }
 
 impl ScalarIsa {
-    /// The scalar extensions legal under `features` (normalized
-    /// `target("...")` names) on top of `self`, the TU's selection. GCC
-    /// spellings: `abm` = LZCNT+POPCNT, `sse4.2` implies POPCNT (GCC 16.2
-    /// defines `__POPCNT__` for `-msse4.2`). An `arch=` entry replaces the
-    /// TU's selection with that CPU's, as in GCC (`target("arch=x86-64")`
-    /// under `-march=haswell` is the baseline path of a runtime dispatch and
-    /// must not use BMI2); explicit `no-*` denials are applied last.
-    pub(super) fn with_target_features(mut self, features: &[String]) -> Self {
-        if features.iter().any(|f| f.starts_with("arch=")) {
-            self = Self::default();
-        }
-        for feature in features {
-            match feature.as_str() {
-                "bmi" => self.bmi1 = true,
-                "bmi2" => self.bmi2 = true,
-                "lzcnt" => self.lzcnt = true,
-                "popcnt" | "sse4.2" => self.popcnt = true,
-                "abm" => {
-                    self.lzcnt = true;
-                    self.popcnt = true;
-                }
-                "arch=x86-64-v2" | "arch=nehalem" | "arch=westmere" | "arch=sandybridge"
-                | "arch=ivybridge" | "arch=silvermont" | "arch=goldmont" | "arch=tremont" => {
-                    self.popcnt = true;
-                }
-                "arch=x86-64-v3"
-                | "arch=x86-64-v4"
-                | "arch=haswell"
-                | "arch=broadwell"
-                | "arch=skylake"
-                | "arch=skylake-avx512"
-                | "arch=cascadelake"
-                | "arch=cooperlake"
-                | "arch=icelake-client"
-                | "arch=icelake-server"
-                | "arch=tigerlake"
-                | "arch=sapphirerapids"
-                | "arch=emeraldrapids"
-                | "arch=graniterapids"
-                | "arch=alderlake"
-                | "arch=raptorlake"
-                | "arch=meteorlake"
-                | "arch=arrowlake"
-                | "arch=znver1"
-                | "arch=znver2"
-                | "arch=znver3"
-                | "arch=znver4"
-                | "arch=znver5" => {
-                    self.bmi1 = true;
-                    self.bmi2 = true;
-                    self.lzcnt = true;
-                    self.popcnt = true;
-                }
-                _ => {}
-            }
-        }
-        for feature in features {
-            match feature.as_str() {
-                "no-bmi" => self.bmi1 = false,
-                "no-bmi2" => self.bmi2 = false,
-                "no-lzcnt" => self.lzcnt = false,
-                "no-popcnt" => self.popcnt = false,
-                "no-abm" => {
-                    self.lzcnt = false;
-                    self.popcnt = false;
-                }
-                _ => {}
-            }
-        }
-        self
+    /// `bits` with each extension set to this selection's choice.
+    fn overlay(self, bits: u64) -> u64 {
+        use super::super::isa::with_feature;
+        use crate::common::x86_features::X86Feature as F;
+        [
+            (self.bmi1, F::Bmi),
+            (self.bmi2, F::Bmi2),
+            (self.lzcnt, F::Lzcnt),
+            (self.popcnt, F::Popcnt),
+        ]
+        .into_iter()
+        .fold(bits, |bits, (on, feature)| with_feature(bits, feature, on))
     }
+
+    /// The extensions of a feature set.
+    fn of(features: crate::common::x86_features::EffectiveFeatures) -> Self {
+        use crate::common::x86_features::X86Feature as F;
+        ScalarIsa {
+            bmi1: features.contains(F::Bmi),
+            bmi2: features.contains(F::Bmi2),
+            lzcnt: features.contains(F::Lzcnt),
+            popcnt: features.contains(F::Popcnt),
+        }
+    }
+}
+
+/// One function's feature set: the TU's features `tu` with the module's
+/// selections (which `CCC_NO_*` knobs may narrow), then the function's
+/// `target("...")` options in GCC's semantics
+/// ([`super::super::isa::fold_target_features`]): `sse4.2` brings POPCNT,
+/// `abm` LZCNT and POPCNT, `no-abm` removes neither, and an `arch=`
+/// replaces the TU's selection with the CPU's (`target("arch=x86-64")`
+/// under `-march=haswell` is the baseline path of a runtime dispatch and
+/// must not use BMI2).
+fn function_feature_set(
+    tu: u64,
+    isa: super::super::isa::X86Isa,
+    scalar: ScalarIsa,
+    avx512: bool,
+    avx512vl: bool,
+    features: &[String],
+) -> crate::common::x86_features::EffectiveFeatures {
+    use super::super::isa::{fold_target_features, with_feature};
+    use crate::common::x86_features::X86Feature as F;
+    let module = isa.overlay(scalar.overlay(tu));
+    let module = with_feature(module, F::Avx512F, avx512);
+    let module = with_feature(module, F::Avx512Vl, avx512vl);
+    crate::common::x86_features::EffectiveFeatures::from_raw(if features.is_empty() {
+        module
+    } else {
+        fold_target_features(module, features)
+    })
 }
 
 impl X86Codegen {
@@ -8085,7 +8065,23 @@ impl X86Codegen {
 
 impl ArchCodegen for X86Codegen {
     fn set_function_target_features(&mut self, features: &[String]) {
-        let scalar_isa = self.module_scalar_isa.with_target_features(features);
+        use super::super::isa::{X86Isa, features_permit};
+        use crate::common::x86_features::{X86Feature as F, effective};
+        // One feature set for the whole function.
+        let set = function_feature_set(
+            effective().raw(),
+            self.module_isa,
+            self.module_scalar_isa,
+            self.module_avx512,
+            self.module_avx512vl,
+            features,
+        );
+        self.vex_vnni = features_permit(set, F::AvxVnni);
+        let scalar_isa = if features.is_empty() {
+            self.module_scalar_isa
+        } else {
+            ScalarIsa::of(set)
+        };
         let live_scalar = ScalarIsa {
             bmi1: self.bmi1_enabled,
             bmi2: self.bmi2_enabled,
@@ -8099,70 +8095,15 @@ impl ArchCodegen for X86Codegen {
             self.popcnt_enabled = scalar_isa.popcnt;
             self.publish_shlx_mode();
         }
-        let vec_isa = self.module_isa.with_target_features(features);
-        // The TU's AVX-512 bits survive unless an `arch=` entry replaces
-        // the TU's ISA (`target("arch=haswell")` in a `-march=x86-64-v4` TU
-        // has no AVX-512, as in GCC). AVX512BW/DQ/CD imply AVX512F (GCC 16.2
-        // compiles `target("avx512bw")` loops to zmm); none implies VL.
-        let arch_reset = features.iter().any(|f| f.starts_with("arch="));
-        let want_avx512 = ((self.module_avx512 && !arch_reset)
-            || features.iter().any(|f| {
-                matches!(
-                    f.as_str(),
-                    "avx512f"
-                        | "avx512bw"
-                        | "avx512dq"
-                        | "avx512cd"
-                        | "avx512vl"
-                        | "avx512ifma"
-                        | "avx512vbmi"
-                        | "avx512vbmi2"
-                        | "avx512vnni"
-                        | "avx512bitalg"
-                        | "avx512vpopcntdq"
-                        | "avx512bf16"
-                        | "avx512fp16"
-                        | "avx512er"
-                        | "avx512pf"
-                        | "avx512vp2intersect"
-                        | "avx512bmm"
-                        | "arch=x86-64-v4"
-                        | "arch=skylake-avx512"
-                        | "arch=cascadelake"
-                        | "arch=cooperlake"
-                        | "arch=icelake-client"
-                        | "arch=icelake-server"
-                        | "arch=tigerlake"
-                        | "arch=sapphirerapids"
-                        | "arch=emeraldrapids"
-                        | "arch=graniterapids"
-                        | "arch=znver4"
-                        | "arch=znver5"
-                )
-            }))
-            && vec_isa.ymm
-            && !features.iter().any(|f| f == "no-avx512f");
-        let want_avx512vl = ((self.module_avx512vl && !arch_reset)
-            || features.iter().any(|f| {
-                matches!(
-                    f.as_str(),
-                    "avx512vl"
-                        | "arch=x86-64-v4"
-                        | "arch=skylake-avx512"
-                        | "arch=cascadelake"
-                        | "arch=cooperlake"
-                        | "arch=icelake-client"
-                        | "arch=icelake-server"
-                        | "arch=tigerlake"
-                        | "arch=sapphirerapids"
-                        | "arch=emeraldrapids"
-                        | "arch=graniterapids"
-                        | "arch=znver4"
-                        | "arch=znver5"
-                )
-            }))
-            && want_avx512
-            && !features.iter().any(|f| f == "no-avx512vl");
+        let vec_isa = if features.is_empty() {
+            self.module_isa
+        } else {
+            X86Isa::from_feature_bits(set.raw())
+        };
+        // AVX-512 needs the 256-bit class lccc's EVEX emitters build on;
+        // AVX512BW/DQ/CD imply AVX512F and none implies VL (GCC's graph).
+        let want_avx512 = set.contains(F::Avx512F) && vec_isa.ymm;
+        let want_avx512vl = want_avx512 && set.contains(F::Avx512Vl);
         self.peephole_isa = self.peephole_isa.meet(vec_isa);
         let want_no_sse = if features.is_empty() {
             self.module_no_sse
@@ -12445,17 +12386,8 @@ mod scalar_sse1_bridge_tests {
                         // ADD/SUB would destroy a pending comparison's flags.
                         assert!(!out.contains("addq") && !out.contains("subq"), "{out}");
                     }
-                    let cfa_pairs = usize::from(!sse2 && omit_frame_pointer) * 2;
-                    assert_eq!(
-                        out.matches(".cfi_adjust_cfa_offset 8\n").count(),
-                        cfa_pairs,
-                        "{out}"
-                    );
-                    assert_eq!(
-                        out.matches(".cfi_adjust_cfa_offset -8\n").count(),
-                        cfa_pairs,
-                        "{out}"
-                    );
+                    // CFI is cfi_synth's job, after the peephole.
+                    assert!(!out.contains(".cfi_"), "{out}");
                 }
             }
         }
@@ -12466,8 +12398,13 @@ mod scalar_sse1_bridge_tests {
 mod target_feature_isa_tests {
     use super::*;
 
-    fn feats(names: &[&str]) -> Vec<String> {
-        names.iter().map(|s| (*s).to_string()).collect()
+    /// The scalar extensions `set_function_target_features` derives for a
+    /// function with the options `names` in a TU whose selection is `tu`
+    /// (no vector ISA, so only the scalar fold is observed).
+    fn scalar(tu: ScalarIsa, names: &[&str]) -> ScalarIsa {
+        let features: Vec<String> = names.iter().map(|s| (*s).to_string()).collect();
+        let none = super::super::super::isa::X86Isa::from_feature_bits(0);
+        ScalarIsa::of(function_feature_set(0, none, tu, false, false, &features))
     }
 
     #[test]
@@ -12481,25 +12418,22 @@ mod target_feature_isa_tests {
         let none = ScalarIsa::default();
         // GCC 16.2: `target("arch=x86-64")` under `-march=haswell` is the
         // baseline path of a dispatch; it keeps none of the TU's extensions.
-        assert_eq!(haswell.with_target_features(&feats(&["arch=x86-64"])), none);
+        assert_eq!(scalar(haswell, &["arch=x86-64"]), none);
         assert_eq!(
-            haswell.with_target_features(&feats(&["arch=x86-64-v2"])),
+            scalar(haswell, &["arch=x86-64-v2"]),
             ScalarIsa {
                 popcnt: true,
                 ..none
             }
         );
         assert_eq!(
-            haswell.with_target_features(&feats(&["arch=x86-64", "bmi2"])),
+            scalar(haswell, &["arch=x86-64", "bmi2"]),
             ScalarIsa { bmi2: true, ..none }
         );
-        assert_eq!(
-            none.with_target_features(&feats(&["arch=haswell"])),
-            haswell
-        );
+        assert_eq!(scalar(none, &["arch=haswell"]), haswell);
         // Without `arch=` the TU's selection stays; denials still apply.
         assert_eq!(
-            haswell.with_target_features(&feats(&["no-bmi2"])),
+            scalar(haswell, &["no-bmi2"]),
             ScalarIsa {
                 bmi2: false,
                 ..haswell
@@ -12507,7 +12441,25 @@ mod target_feature_isa_tests {
         );
         // GCC 16.2 defines `__POPCNT__` for `-msse4.2`.
         assert_eq!(
-            none.with_target_features(&feats(&["sse4.2"])),
+            scalar(none, &["sse4.2"]),
+            ScalarIsa {
+                popcnt: true,
+                ..none
+            }
+        );
+        // `abm` grants POPCNT and brings LZCNT; `no-abm` takes neither away
+        // (GCC 16.2 `-march=haswell`, `target("no-abm")`: both macros stay).
+        assert_eq!(
+            scalar(none, &["abm"]),
+            ScalarIsa {
+                lzcnt: true,
+                popcnt: true,
+                ..none
+            }
+        );
+        assert_eq!(scalar(haswell, &["no-abm"]), haswell);
+        assert_eq!(
+            scalar(none, &["abm", "no-lzcnt"]),
             ScalarIsa {
                 popcnt: true,
                 ..none
