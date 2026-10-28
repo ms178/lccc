@@ -144,8 +144,8 @@ for target in "${TARGETS[@]}"; do
         while IFS= read -r line; do
             [ -z "$line" ] && continue
             name="${line%% *}"
-            gcc_val=$(grep "^$name " "$td/gcc.nv" | head -1 | cut -d' ' -f2-)
-            lccc_val=$(grep "^$name " "$td/lccc.nv" | head -1 | cut -d' ' -f2-)
+            gcc_val=$(awk -v name="$name" '$1 == name {print $2; exit}' "$td/gcc.nv")
+            lccc_val=$(awk -v name="$name" '$1 == name {print $2; exit}' "$td/lccc.nv")
             if [ "$gcc_val" != "$lccc_val" ]; then
                 # Check allowlist
                 allowed=0
