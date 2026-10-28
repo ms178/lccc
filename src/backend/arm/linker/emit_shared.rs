@@ -1291,31 +1291,42 @@ pub(super) fn emit_shared_library(
                         }
                     }
                     R_AARCH64_ADR_PREL_PG_HI21 => {
-                        // For undefined/dynamic symbols in shared libs, redirect through GOT
-                        if let Some(&gea) = got_sym_addrs.get(sym.name.as_str()) {
-                            if s == 0
-                                || globals_snap
-                                    .get(sym.name.as_str())
-                                    .is_some_and(|g| g.is_dynamic || g.defined_in.is_none())
-                            {
-                                let page_g = gea & !0xFFF;
-                                let page_p = p & !0xFFF;
-                                let imm = (page_g as i64).wrapping_sub(page_p as i64) >> 12;
-                                reloc::encode_adrp(&mut out, fp, imm)?;
-                            } else {
-                                let sa_val = (s as i64).wrapping_add(a) as u64;
-                                let page_s = sa_val & !0xFFF;
-                                let page_p = p & !0xFFF;
-                                let imm = (page_s as i64).wrapping_sub(page_p as i64) >> 12;
-                                reloc::encode_adrp(&mut out, fp, imm)?;
+                        // Undefined/dynamic symbols in shared libs are reached
+                        // through a GOT slot: `adrp` takes the slot's page and
+                        // the following `ldr` completes the address.
+                        let got_page = got_sym_addrs
+                            .get(sym.name.as_str())
+                            .filter(|_| {
+                                s == 0
+                                    || globals_snap
+                                        .get(sym.name.as_str())
+                                        .is_some_and(|g| g.is_dynamic || g.defined_in.is_none())
+                            })
+                            .copied();
+                        let page = match got_page {
+                            Some(gea) => gea & !0xFFF,
+                            None => {
+                                // Direct form: same section proof as the ADR
+                                // arm below. Without it a target in a
+                                // non-allocated section encodes a page number
+                                // for a file offset, which the loader resolves
+                                // to the load bias (ADRP's +-4 GiB range never
+                                // catches this, unlike ADR's +-1 MiB).
+                                if !reloc::adr_target_is_addressable(
+                                    obj_idx,
+                                    sym,
+                                    &globals_snap,
+                                    section_map,
+                                    output_sections,
+                                ) {
+                                    return Err(reloc::adr_section_error(&sym.name));
+                                }
+                                ((s as i64).wrapping_add(a) as u64) & !0xFFF
                             }
-                        } else {
-                            let sa_val = (s as i64).wrapping_add(a) as u64;
-                            let page_s = sa_val & !0xFFF;
-                            let page_p = p & !0xFFF;
-                            let imm = (page_s as i64).wrapping_sub(page_p as i64) >> 12;
-                            reloc::encode_adrp(&mut out, fp, imm)?;
-                        }
+                        };
+                        let page_p = p & !0xFFF;
+                        let imm = (page as i64).wrapping_sub(page_p as i64) >> 12;
+                        reloc::encode_adrp(&mut out, fp, imm)?;
                     }
                     R_AARCH64_ADR_PREL_LO21 => {
                         // Load bias cancels only for a locally bound,
@@ -1377,17 +1388,23 @@ pub(super) fn emit_shared_library(
                         // UNDEFINED reference whose definition lives in
                         // another input is legitimate (merged into one
                         // GlobalSymbol by registration).
-                        let resolves_via_section_map =
-                            sym.is_local() || sym.sym_type() == STT_SECTION;
-                        if resolves_via_section_map
-                            && !section_map.contains_key(&(obj_idx, sym.shndx as usize))
-                        {
-                            return Err(format!(
-                                "ADR relocation requires a symbol in a surviving section: '{}' \
-                                 (undefined, common, or its input section was discarded; S would be 0 \
-                                 and the encoded displacement would resolve to the load bias at runtime)",
-                                sym.name
-                            ));
+                        // Surviving is not enough: the section must also be
+                        // `SHF_ALLOC`. A debug or other non-loadable section is
+                        // written after the image near file offset 0, so an
+                        // `adr` into it encodes a displacement to a file
+                        // offset, not to anything the loader maps -- and since
+                        // this linker keeps `.debug_*` sections now, "section
+                        // dropped" no longer covers that case. The predicate
+                        // is shared with the static and dynamic writers, so
+                        // all three refuse the same inputs.
+                        if !reloc::adr_target_is_addressable(
+                            obj_idx,
+                            sym,
+                            &globals_snap,
+                            section_map,
+                            output_sections,
+                        ) {
+                            return Err(reloc::adr_section_error(&sym.name));
                         }
                         let delta = (s as i64).wrapping_add(a).wrapping_sub(p as i64);
                         reloc::encode_adr(&mut out, fp, delta)?;

@@ -1149,6 +1149,15 @@ pub(super) fn emit_dynamic_executable(
                         reloc::write_checked_data(&mut out, fp, rela.rela_type, v, &sym.name)?;
                     }
                     R_AARCH64_ADR_PREL_PG_HI21 => {
+                        if !reloc::adr_target_is_addressable(
+                            obj_idx,
+                            sym,
+                            &globals_snap,
+                            section_map,
+                            output_sections,
+                        ) {
+                            return Err(reloc::adr_section_error(&sym.name));
+                        }
                         let sa_val = (s as i64).wrapping_add(a) as u64;
                         let page_s = sa_val & !0xFFF;
                         let page_p = p & !0xFFF;
@@ -1156,6 +1165,15 @@ pub(super) fn emit_dynamic_executable(
                         reloc::encode_adrp(&mut out, fp, imm)?;
                     }
                     R_AARCH64_ADR_PREL_LO21 => {
+                        if !reloc::adr_target_is_addressable(
+                            obj_idx,
+                            sym,
+                            &globals_snap,
+                            section_map,
+                            output_sections,
+                        ) {
+                            return Err(reloc::adr_section_error(&sym.name));
+                        }
                         let offset_val = (s as i64).wrapping_add(a).wrapping_sub(p as i64);
                         reloc::encode_adr(&mut out, fp, offset_val)?;
                     }

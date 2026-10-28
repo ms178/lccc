@@ -136,6 +136,81 @@ pub fn resolve_sym(
         .unwrap_or(sym.value)
 }
 
+/// Whether `sym` names something an `ADR`/`ADRP` can encode.
+///
+/// Those forms write `S + A - P` into the instruction, so `S` must be an
+/// address the loader maps. A symbol defined in a section that survives only
+/// as file content -- `.debug_*` or any other input section without
+/// `SHF_ALLOC` -- has no runtime address: such sections are laid out after the
+/// image near file offset 0, so the encoded displacement would land on the
+/// load bias instead of the symbol. A discarded input section is equally
+/// addressless. Checking the section is what makes this sound: `S == 0` alone
+/// proves nothing, because zero is also a legitimate mapped address, and
+/// UNDEF/ABS symbols resolve to zero without owning a section at all.
+///
+/// Symbols that do not resolve through an input section keep their existing
+/// treatment and count as addressable here: undefined and weak references,
+/// `SHN_ABS` values (an address by definition), symbols imported from a shared
+/// library, and linker-defined symbols (which live in allocated output
+/// sections). The callers own those rules.
+pub(super) fn adr_target_is_addressable(
+    obj_idx: usize,
+    sym: &Symbol,
+    globals: &FxHashMap<String, GlobalSymbol>,
+    section_map: &FxHashMap<(usize, usize), (usize, u64)>,
+    output_sections: &[OutputSection],
+) -> bool {
+    let via_input_section = sym.is_local() || sym.name.is_empty();
+    let (def_obj, shndx) = if via_input_section {
+        (obj_idx, sym.shndx)
+    } else {
+        match globals.get(sym.name.as_str()) {
+            Some(g) => match g.defined_in {
+                // Linker-defined symbols are allocated by construction.
+                Some(usize::MAX) => return true,
+                // Defined in this link: that object owns the section, and this
+                // object only carries the undefined reference.
+                Some(def_obj) => (def_obj, g.section_idx),
+                None => return true,
+            },
+            None => return true,
+        }
+    };
+    match shndx {
+        // A global reference that stayed undefined is resolved by the callers
+        // (weak -> 0, DSO import -> PLT/GOT, preemptible -> refused). A local
+        // one has no definition anywhere, so there is nothing to address.
+        SHN_UNDEF => return !via_input_section,
+        // Both name a value rather than a location, and the merged global
+        // holds the real address.
+        SHN_ABS | SHN_COMMON => return true,
+        // Any other reserved index is not an input section at all, so there
+        // is no mapping to prove -- `resolve_sym` falls back to the raw
+        // `st_value`, which is not an address.
+        _ if shndx >= SHN_LORESERVE => return false,
+        _ => {}
+    }
+    section_map
+        .get(&(def_obj, shndx as usize))
+        .is_some_and(|&(out_idx, _)| {
+            output_sections
+                .get(out_idx)
+                .is_some_and(|section| section.flags & SHF_ALLOC != 0)
+        })
+}
+
+/// The refusal every AArch64 writer raises for an `ADR`/`ADRP` whose target
+/// has no load address. One spelling, so the diagnostic cannot drift between
+/// the static, dynamic and shared writers.
+pub(super) fn adr_section_error(sym: &str) -> String {
+    format!(
+        "ADR/ADRP relocation requires a symbol in a surviving section: '{sym}' \
+         (undefined, common, or its input section was discarded or is not loaded: a \
+         non-allocated section is written to the file but never mapped, so the encoded \
+         displacement would address a file offset or the load bias instead of the symbol)"
+    )
+}
+
 /// A shared ADR can cancel load bias only against a local allocated section.
 /// Do not infer this property from an address: zero is a valid mapped address,
 /// whereas UNDEF/ABS and discarded sections can also resolve numerically to zero.
@@ -259,6 +334,24 @@ pub fn apply_relocations(
                 let p = sa + sec_off + rela.offset;
                 let fp = (sfo + sec_off + rela.offset) as usize;
                 let a = rela.addend;
+                // ADR/ADRP write `S + A - P` into the instruction, so the
+                // target has to own a load address. `apply_one_reloc` only
+                // sees the resolved number, where an addressless symbol is
+                // indistinguishable from a legitimate one (zero is mappable),
+                // so the section proof happens here while the symbol is still
+                // in hand.
+                if matches!(
+                    rela.rela_type,
+                    R_AARCH64_ADR_PREL_LO21 | R_AARCH64_ADR_PREL_PG_HI21
+                ) && !adr_target_is_addressable(
+                    obj_idx,
+                    sym,
+                    globals,
+                    section_map,
+                    output_sections,
+                ) {
+                    return Err(adr_section_error(&sym.name));
+                }
                 let s = resolve_sym(obj_idx, sym, globals, section_map, output_sections);
                 let gkey = got_key(obj_idx, sym);
 
@@ -1002,6 +1095,130 @@ mod adr_checked_tests {
         );
         sections[0].addr = u64::MAX;
         assert_eq!(resolve_shared_adr_target(0, &symbol, &map, &sections), None);
+    }
+
+    /// The ADR/ADRP admission predicate is the only thing standing between a
+    /// kept-but-unloaded section and an instruction that points at a file
+    /// offset. Every branch is pinned here: a section that survives allocated
+    /// is addressable, one that survives unallocated or was discarded is not,
+    /// and the reserved indices keep their by-meaning treatment.
+    #[test]
+    fn adr_targets_need_an_allocated_section() {
+        let mut symbol = Symbol {
+            name_idx: 0,
+            name: "".into(),
+            info: 0, // STB_LOCAL | STT_NOTYPE
+            other: 0,
+            shndx: 1,
+            value: 0,
+            size: 0,
+        };
+        let section = |flags: u64| OutputSection {
+            name: ".text".into(),
+            sh_type: 1,
+            flags,
+            alignment: 1,
+            inputs: vec![],
+            data: vec![],
+            addr: 0,
+            file_offset: 0,
+            mem_size: 8,
+        };
+        let sections = vec![section(SHF_ALLOC), section(0)];
+        let mut map = FxHashMap::default();
+        map.insert((0, 1), (0, 0));
+        map.insert((1, 1), (0, 0));
+        let globals: FxHashMap<String, GlobalSymbol> = FxHashMap::default();
+        let addressable = |obj_idx: usize,
+                           sym: &Symbol,
+                           map: &FxHashMap<(usize, usize), (usize, u64)>,
+                           sections: &[OutputSection]| {
+            adr_target_is_addressable(obj_idx, sym, &globals, map, sections)
+        };
+
+        // Local in a loaded section: the ordinary case.
+        assert!(addressable(0, &symbol, &map, &sections));
+        // The same symbol in a section kept only as file content: no address.
+        map.insert((0, 1), (1, 0));
+        assert!(!addressable(0, &symbol, &map, &sections));
+        // Discarded entirely (the pre-`keep .debug_*` behaviour).
+        map.remove(&(0, 1));
+        assert!(!addressable(0, &symbol, &map, &sections));
+        map.insert((0, 1), (0, 0));
+
+        // Reserved indices: ABS and COMMON name values, so they stay legal;
+        // every other reserved index is not an input section at all.
+        for (shndx, expected) in [
+            (SHN_UNDEF, false), // a local reference with no definition
+            (SHN_ABS, true),
+            (SHN_COMMON, true),
+            (SHN_LORESERVE, false),
+            (0xfff1, true),  // SHN_ABS under a different spelling
+            (0xffff, false), // SHN_XINDEX: no section to prove
+        ] {
+            symbol.shndx = shndx;
+            assert_eq!(
+                addressable(0, &symbol, &map, &sections),
+                expected,
+                "{shndx:#x}"
+            );
+        }
+        symbol.shndx = 1;
+
+        // A global defined in another object is judged by *that* object's
+        // section, which is why the predicate cannot look at the reference's
+        // own (undefined) st_shndx.
+        let mut globals: FxHashMap<String, GlobalSymbol> = FxHashMap::default();
+        let mut global = Symbol {
+            name: "target".into(),
+            info: (STB_GLOBAL << 4) | STT_OBJECT,
+            shndx: SHN_UNDEF,
+            ..symbol.clone()
+        };
+        globals.insert(
+            "target".into(),
+            GlobalSymbol {
+                value: 0,
+                size: 0,
+                info: (STB_GLOBAL << 4) | STT_OBJECT,
+                defined_in: Some(1),
+                section_idx: 1,
+                from_lib: None,
+                plt_idx: None,
+                got_idx: None,
+                is_dynamic: false,
+                copy_reloc: false,
+                lib_sym_value: 0,
+                lib_in_exec: false,
+                visibility: 0,
+            },
+        );
+        // Object 1's section 1 is the unallocated one via `map` above.
+        let mut map2 = FxHashMap::default();
+        map2.insert((1, 1), (1, 0));
+        assert!(!adr_target_is_addressable(
+            0, &global, &globals, &map2, &sections
+        ));
+        map2.insert((1, 1), (0, 0));
+        assert!(adr_target_is_addressable(
+            0, &global, &globals, &map2, &sections
+        ));
+        // Linker-defined symbols (defined_in == usize::MAX) are allocated by
+        // construction and never consult the map.
+        globals.get_mut("target").unwrap().defined_in = Some(usize::MAX);
+        assert!(adr_target_is_addressable(
+            0, &global, &globals, &map2, &sections
+        ));
+        // Still-undefined global: the callers' weak/preemptible rules decide.
+        globals.get_mut("target").unwrap().defined_in = None;
+        assert!(adr_target_is_addressable(
+            0, &global, &globals, &map2, &sections
+        ));
+        // A named global with no table entry at all is treated the same way.
+        global.name = "absent".into();
+        assert!(adr_target_is_addressable(
+            0, &global, &globals, &map2, &sections
+        ));
     }
 
     #[test]

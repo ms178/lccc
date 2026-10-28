@@ -691,34 +691,8 @@ fn apply_one_reloc(
                 obj_name
             ));
         }
-        R_RISCV_TLS_GD_HI20
-            if ctx
-                .got
-                .offset(&got_sym_key(obj_idx, sym, a).0, GotKind::TlsGd)
-                .is_some() =>
-        {
-            // A real `tls_index` (shared object, or an executable's import).
-            let slot = lookup_got_entry(sym, obj_idx, a, GotKind::TlsGd, ctx)?;
-            let offset_val = super::displacement::checked_auipc_delta(slot, a, p)?;
-            patch_u_type(data, off, offset_val as u32);
-        }
-        R_RISCV_TLS_GD_HI20 => {
-            // GD->LE relaxation of a variable the executable defines:
-            // auipc -> lui with the TP offset (`collect_gd_tls_relax_info`).
-            if ctx.collect_relatives {
-                return Err(format!("no RISC-V tls_index for '{}'", sym.name));
-            }
-            let tprel = (s as i64 + a - ctx.tls_vaddr as i64) as u32;
-            let hi = tprel.wrapping_add(0x800) & 0xFFFFF000;
-            if off + 4 <= data.len() {
-                let lui_insn: u32 = 0x00000537 | hi; // lui a0, hi
-                data[off..off + 4].copy_from_slice(&lui_insn.to_le_bytes());
-            }
-        }
-        R_RISCV_TLS_GOT_HI20 => {
-            let got_entry_vaddr = lookup_got_entry(sym, obj_idx, a, GotKind::TlsIe, ctx)?;
-            let offset_val = super::displacement::checked_auipc_delta(got_entry_vaddr, a, p)?;
-            patch_u_type(data, off, offset_val as u32);
+        R_RISCV_TLS_GD_HI20 | R_RISCV_TLS_GOT_HI20 => {
+            apply_tls_hi20(rela_type, data, off, s, a, p, sym, obj_idx, ctx)?;
         }
         other => {
             // Collecting RELATIVE entries is not a license to discard other
@@ -731,6 +705,51 @@ fn apply_one_reloc(
     }
 
     Ok(())
+}
+
+/// Patch the `auipc` of a TLS access: either the `hi20` of a real
+/// `tls_index`/`tls_offset` GOT slot, or -- for a `GD` access to a variable
+/// the executable itself defines -- the relaxed `lui` form carrying the TP
+/// offset. A shared object has no static TP offset to bake in, so a `GD`
+/// access without a `tls_index` slot is refused rather than mis-encoded.
+fn apply_tls_hi20(
+    rela_type: u32,
+    data: &mut [u8],
+    off: usize,
+    s: u64,
+    a: i64,
+    p: u64,
+    sym: &super::elf_read::Symbol,
+    obj_idx: usize,
+    ctx: &RelocContext,
+) -> Result<(), String> {
+    let kind = if rela_type == R_RISCV_TLS_GD_HI20 {
+        GotKind::TlsGd
+    } else {
+        GotKind::TlsIe
+    };
+    if ctx
+        .got
+        .offset(&got_sym_key(obj_idx, sym, a).0, kind)
+        .is_some()
+    {
+        let slot = lookup_got_entry(sym, obj_idx, a, kind, ctx)?;
+        let delta = super::displacement::checked_auipc_delta(slot, a, p)?;
+        patch_u_type(data, off, delta as u32);
+        return Ok(());
+    }
+    if kind == GotKind::TlsGd && !ctx.collect_relatives {
+        // GD->LE relaxation of a variable the executable defines:
+        // auipc -> lui with the TP offset (`collect_gd_tls_relax_info`).
+        let tprel = (s as i64 + a - ctx.tls_vaddr as i64) as u32;
+        let hi = tprel.wrapping_add(0x800) & 0xFFFFF000;
+        if off + 4 <= data.len() {
+            let lui_insn: u32 = 0x00000537 | hi; // lui a0, hi
+            data[off..off + 4].copy_from_slice(&lui_insn.to_le_bytes());
+        }
+        return Ok(());
+    }
+    Err(format!("no RISC-V {kind:?} GOT slot for '{}'", sym.name))
 }
 
 /// Find the hi20 value for a PCREL_LO12 relocation, dispatching to the
