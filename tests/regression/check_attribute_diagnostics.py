@@ -69,6 +69,18 @@ PROBES = [
     ('ok-int-aligned', 'int __attribute__((aligned(8))) x;', None, False),
     ('ok-fn-cold', 'void __attribute__((cold)) c(void){}', None, False),
     ('ok-format-default', '__attribute__((format(printf,1,2))) void g(const char*,...);', None, False),
+    # glibc-header shapes: gcc-16.2 is silent on these by default and lccc
+    # must be too (the regression that broke every CI lane at GP-01).
+    ('ok-nothrow-list', 'void __attribute__((__nothrow__, __leaf__)) f(void){}', None, False),
+    ('ok-nothrow-single', 'void __attribute__((nothrow)) f(void){}', None, False),
+    ('ok-leaf', 'void __attribute__((leaf)) f(void){}', None, False),
+]
+
+# TUs that pull in system headers must compile clean under -Werror, the
+# exact condition of scripts/check_exact_signed_div.py.
+HEADER_PROBES = [
+    '#include <stdio.h>\nint main(void){ return ferror(stdin) ? 1 : 0; }',
+    '#include <stdlib.h>\n#include <string.h>\nint main(void){ return (int)(size_t)malloc(1) + (int)strlen(""); }',
 ]
 
 # Generated from the registry: GCC 16.2 knows these, lccc's dispatcher has
@@ -85,6 +97,9 @@ null_terminated_string_arg patchable_function_entry persistent preserve_none ret
 signed_bool_precision simd sseregparm stdcall strict_flex_array strub sysv_abi tainted_args
 target_version thiscall transaction_pure transaction_unsafe unavailable vector_mask warn_if_not_aligned
 warn_unused warn_unused_result
+access artificial no_profile_instrument_function no_sanitize_coverage nothrow
+objc_root_class reproducible returns_twice transaction_callable
+transaction_may_cancel_outer transaction_safe_dynamic unsequenced
 """.split()))
 
 def first_diag(stderr: str) -> str:
@@ -142,6 +157,15 @@ def main() -> int:
             failures.append((n, 'gcc no longer knows the name', '', gdiag))
         if want not in ldiag:
             failures.append((n, 'inventory silent', want, ldiag))
+    # Header TUs: identical under -Wall -Wextra -Werror on both compilers.
+    for i, src in enumerate(HEADER_PROBES):
+        grext, gerr = run(gcc, src, ['-Wall', '-Wextra', '-Werror'])
+        lex, lerr = run(str(LCCC), src, ['-Wall', '-Wextra', '-Werror'])
+        gdiag, ldiag = first_diag(gerr), first_diag(lerr)
+        if gdiag:
+            failures.append((f'header-{i}', 'gcc warns', '', gdiag))
+        if ldiag or lex != 0:
+            failures.append((f'header-{i}', 'lccc not clean', '', f'rc={lex} {ldiag}'))
     # -Wno-attributes suppresses everything.
     _, lerr = run(str(LCCC), '__attribute__((frobnicate)) int y;', ['-Wno-attributes'])
     if first_diag(lerr):
