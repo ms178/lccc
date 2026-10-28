@@ -39,11 +39,14 @@ base-const interpretation in sema and lowering fixes those cases. Tests cover
 alias chains, members, arrays, casts, compound literals, function returns and
 pointer-to-array nesting, including both legal writes and required errors.
 
-This is not complete qualifier support. In particular, GCC accepts
-`void f(int *x) { const __typeof__(x) p=x; *p=1; }`, while LCCC still rejects
-it; LCCC also accepts the invalid `const __typeof__(x) *p=&x; *p=0;`.
-Some typedef-based diagnostic spellings still differ from GCC. Those gaps and
-the remaining `typeof`/qualifier representation issues remain open.
+A subsequent bounded `typeof` fix handles both the formerly false error on
+`const __typeof__(x) p=x; *p=1;` and the formerly missed error on
+`const __typeof__(x) *p=&x; *p=0;`. This is still not complete qualifier
+support. In particular, qualified `typeof` operands can give the wrong value
+in `__builtin_types_compatible_p`, and volatile `typeof` objects can lose
+observable reads. Reproducers and tracked builtin divergences are described
+in `engineering/evidence/typeof-qualifier-gaps-2026-10-28/`. Some
+qualifier-based diagnostic spellings may also differ from GCC.
 
 ## Workload and measurements
 

@@ -259,7 +259,7 @@ impl Lowerer {
     ) -> &'a TypeSpecifier {
         if !matches!(
             &decl.type_spec,
-            TypeSpecifier::Typeof(..) | TypeSpecifier::TypeofType(_) | TypeSpecifier::AutoType
+            TypeSpecifier::Typeof(..) | TypeSpecifier::TypeofType(..) | TypeSpecifier::AutoType
         ) {
             return &decl.type_spec;
         }

@@ -80,7 +80,7 @@ fn spec_is_void(ts: &TypeSpecifier, typedefs: TypedefLookup<'_>) -> bool {
     match ts {
         TypeSpecifier::Void => true,
         TypeSpecifier::TypedefName(name) => matches!(typedefs(name), Some(CType::Void)),
-        TypeSpecifier::TypeofType(inner) => spec_is_void(inner, typedefs),
+        TypeSpecifier::TypeofType(inner, _) => spec_is_void(inner, typedefs),
         _ => false,
     }
 }
@@ -107,7 +107,7 @@ fn spec_array_of_void(ts: &TypeSpecifier, typedefs: TypedefLookup<'_>) -> Option
         TypeSpecifier::FunctionPointer(ret, ..) | TypeSpecifier::BareFunction(ret, ..) => {
             spec_array_of_void(ret, typedefs)
         }
-        TypeSpecifier::TypeofType(inner) => {
+        TypeSpecifier::TypeofType(inner, _) => {
             spec_array_of_void(inner, typedefs).map(|_| ArrayOfVoidIn::TypeofName)
         }
         _ => None,
@@ -253,7 +253,8 @@ mod tests {
             msg,
             "struct {{ void a[]; }}"
         );
-        let typeof_name = TypeSpecifier::TypeofType(Box::new(type_name.clone()));
+        let typeof_name =
+            TypeSpecifier::TypeofType(Box::new(type_name.clone()), Default::default());
         let cast = TypeSpecifier::Pointer(Box::new(type_name), AddressSpace::Default);
         assert!(err(&cast, &[], VoidRole::Other).is_some(), "(void (*)[2])0");
         assert_eq!(

@@ -114,6 +114,15 @@ notice the difference — sometimes by silently getting different semantics.
 
 ### 3.1 Language and dialect — strong, with four holes
 
+**2026-10-28 correction:** The following 113-probe survey did not exercise
+qualified `typeof` deeply enough. A subsequent bounded const-propagation fix
+closes diagnostic and `_Generic` cases, but qualified `typeof` still causes
+wrong `__builtin_types_compatible_p` constants and can elide volatile reads.
+Six builtin cases and a volatile reproducer are documented in
+`engineering/evidence/typeof-qualifier-gaps-2026-10-28/`; these are correctness
+hazards, not merely missing diagnostics. The original survey counts below are
+historical and are not a complete language-conformance measure.
+
 113 probes compiled **and executed** by both compilers. Agreement on 105. Excluding
 environment artifacts (`<stdbit.h>`), the real differences are:
 

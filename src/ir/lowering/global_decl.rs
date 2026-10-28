@@ -301,7 +301,7 @@ impl Lowerer {
             }
             if matches!(
                 &decl.type_spec,
-                TypeSpecifier::Typeof(..) | TypeSpecifier::TypeofType(_)
+                TypeSpecifier::Typeof(..) | TypeSpecifier::TypeofType(..)
             ) && self.known_functions.contains(&declarator.name)
             {
                 return true;

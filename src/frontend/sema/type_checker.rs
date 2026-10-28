@@ -76,6 +76,16 @@ impl qualifiers::ConstLookup for ExprTypeChecker<'_> {
         )
     }
 
+    fn expr_const_pointer_level(&self, expr: &Expr) -> Option<usize> {
+        self.infer_expr_ctype(expr)
+            .as_ref()
+            .and_then(qualifiers::typedef_const_pointer_level)
+    }
+
+    fn type_const_pointer_level(&self, ts: &TypeSpecifier) -> Option<usize> {
+        qualifiers::typedef_const_pointer_level(&self.resolve_type_spec(ts))
+    }
+
     fn select_generic<'b>(
         &self,
         controlling: &Expr,
@@ -1000,7 +1010,7 @@ impl<'a> ExprTypeChecker<'a> {
                     CType::Int
                 }
             }
-            TypeSpecifier::TypeofType(inner) => self.resolve_type_spec(inner),
+            TypeSpecifier::TypeofType(inner, _) => self.resolve_type_spec(inner),
             // A cast or type name spelled with `__attribute__((vector_size))`
             // (the parser wraps it, see `apply_pending_vector_attr`).
             TypeSpecifier::Vector(elem, total_bytes) => {
@@ -1697,7 +1707,7 @@ impl<'a> ExprTypeChecker<'a> {
                 // TODO: report diagnostic for unresolved typeof expression
                 CType::Int // fallback
             }
-            TypeSpecifier::TypeofType(inner) => self.resolve_type_spec_with_scope(inner, scope),
+            TypeSpecifier::TypeofType(inner, _) => self.resolve_type_spec_with_scope(inner, scope),
             _ => self.resolve_type_spec(ts),
         }
     }

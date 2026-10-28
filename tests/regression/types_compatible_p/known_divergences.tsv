@@ -1,2 +1,8 @@
 id	prefix	left	right	lccc	oracle	cause	impact	fix_location
-# Currently 0 open divergences against GCC 16.2 (`fnptr_nested_permutation` promoted to `cases.tsv`).
+# Qualifiers inside typeof are not yet combined with the builtin's written levels.
+typeof_type_const_matches	-	__typeof__(const int *)	const int *	0	1	inner const lost	wrong compatibility constant	src/frontend/sema/const_eval.rs and src/ir/lowering/types.rs
+typeof_type_const_differs	-	__typeof__(const int *)	int *	1	0	inner const lost	wrong compatibility constant	src/frontend/sema/const_eval.rs and src/ir/lowering/types.rs
+typeof_expr_const_matches	const int *p;	__typeof__(p)	const int *	0	1	expression base const lost	wrong compatibility constant	src/frontend/sema/const_eval.rs and src/ir/lowering/types.rs
+typeof_expr_const_differs	const int *p;	__typeof__(p)	int *	1	0	expression base const lost	wrong compatibility constant	src/frontend/sema/const_eval.rs and src/ir/lowering/types.rs
+typeof_type_middle_matches	-	__typeof__(int *const *)	int *const *	0	1	middle const lost	wrong compatibility constant	src/frontend/sema/const_eval.rs and src/ir/lowering/types.rs
+typeof_type_middle_differs	-	__typeof__(int *const *)	int **	1	0	middle const lost	wrong compatibility constant	src/frontend/sema/const_eval.rs and src/ir/lowering/types.rs

@@ -1618,7 +1618,7 @@ impl Lowerer {
                 }
             }
             TypeSpecifier::Pointer(_, _) => false, // pointer-to-VLA is a pointer, sizeof is const
-            TypeSpecifier::TypeofType(inner) => self.type_spec_is_vla(inner),
+            TypeSpecifier::TypeofType(inner, _) => self.type_spec_is_vla(inner),
             _ => false,
         }
     }

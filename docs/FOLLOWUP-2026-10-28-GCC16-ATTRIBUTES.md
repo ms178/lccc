@@ -124,9 +124,13 @@ const-qualified pointer-typedef field. The fix tracks the aliased pointer level
 across declarations, fields, casts, compound literals and return types and
 shares the corrected base-const interpretation between sema and lowering.
 GCC 16.2 differential diagnostics, negative controls, four LCCC target drivers
-and runtime `_Generic` checks cover both legal and illegal examples. Qualifier
-support is still incomplete: `const __typeof__(p)` can be falsely diagnosed,
-and the corresponding const middle-pointer mutation can be missed.
+and runtime `_Generic` checks cover both legal and illegal examples. A further
+bounded fix propagates const through `typeof` type names and expressions,
+including middle-pointer qualifiers and shadowed declarations. Qualifier
+support is still incomplete: `__builtin_types_compatible_p` loses qualifiers
+inside `typeof` (six wrong-result cases are tracked), and a volatile
+`typeof` object can have observable reads elided. Reproducers and limits are
+in `engineering/evidence/typeof-qualifier-gaps-2026-10-28/`.
 
 With the identical manual configuration, upstream's 5,196-check suite passes
 against GCC-, Clang- and LCCC-compiled libraries; an LCCC-compiled upstream test
