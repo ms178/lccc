@@ -598,9 +598,9 @@ pub fn param_decl_to_ctype_with(
 /// [`param_decl_to_ctype_with`] recording the qualifiers of the pointer
 /// levels the parameter's declarator wrote (see [`PtrQuals`]), the innermost
 /// one's pointee from `spec_cvr` (see [`TypeConvertContext::specifier_cvr`]).
-/// Only a plain run of leading stars on a non-derived base is recorded; an
-/// adjusted array, a function pointer or a parenthesised declarator keeps
-/// its levels unrecorded.
+/// Plain leading-star chains, adjusted arrays and supported parenthesised
+/// pointer-to-array shapes are recorded. Function-pointer construction paths
+/// without a complete star record remain unknown, never known-unqualified.
 pub fn param_decl_to_ctype_qualified(
     resolve: &dyn Fn(&TypeSpecifier) -> CType,
     spec_cvr: &dyn Fn(&TypeSpecifier, u8) -> Option<u8>,
@@ -829,6 +829,27 @@ fn param_ctype_unrecorded(
                 actual_return = *inner;
             } else {
                 break;
+            }
+        }
+        // The leading stars qualify the callback's RETURN, not its object.
+        // pointer_depth includes extra parenthesised group stars; strip those
+        // before matching the plain return-star chain. More complex folded
+        // returns remain unknown rather than assigning bits to the wrong level.
+        let leading = (param.pointer_depth as usize)
+            .saturating_sub(param.fptr_inner_ptr_depth.saturating_sub(1) as usize);
+        let mut leaf = &param.type_spec;
+        let mut wraps = 0;
+        while let TypeSpecifier::Pointer(inner, _) = leaf {
+            wraps += 1;
+            leaf = inner;
+        }
+        if wraps == leading + param.fptr_inner_ptr_depth.max(1) as usize && !is_derived_spec(leaf) {
+            if let Some(levels) = param.pointer_quals.get(..leading) {
+                record_pointer_quals(
+                    &mut actual_return,
+                    spec_cvr(leaf, written_param_cvr(param)),
+                    levels,
+                );
             }
         }
         let param_types: Vec<(CType, Option<String>)> = fptr_params

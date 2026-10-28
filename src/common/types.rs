@@ -416,6 +416,12 @@ impl PtrQuals {
         }
     }
 
+    /// A proven qualification mismatch. Unknown is not known-unqualified;
+    /// it cannot establish incompatibility. Unlike Eq, this is semantic.
+    pub const fn has_known_cvr_conflict(self, other: Self) -> bool {
+        matches!((self.cvr(), other.cvr()), (Some(a), Some(b)) if a != b)
+    }
+
     /// The same qualifiers on a pointee in `space`.
     #[must_use]
     pub const fn in_space(self, space: AddressSpace) -> Self {
@@ -474,6 +480,30 @@ pub fn cvr_spelling(cvr: u8) -> &'static str {
     NAMES[usize::from(cvr & 0b111)]
 }
 
+/// A qualification conflict anywhere in the shared derived shape. Parameter
+/// names and top-level parameter CVR are not type identity; pointer records
+/// describe the POINTEE and must still be compared inside function signatures.
+/// Missing records remain conservative. This must precede qualifier-blind Eq
+/// shortcuts in semantic conversion checks.
+pub fn recorded_qualifiers_conflict(a: &CType, b: &CType) -> bool {
+    match (a, b) {
+        (CType::Pointer(a, aq), CType::Pointer(b, bq)) => {
+            aq.has_known_cvr_conflict(*bq) || recorded_qualifiers_conflict(a, b)
+        }
+        (CType::Array(a, _), CType::Array(b, _)) => recorded_qualifiers_conflict(a, b),
+        (CType::Function(a), CType::Function(b)) => {
+            recorded_qualifiers_conflict(&a.return_type, &b.return_type)
+                || (a.has_prototype
+                    && b.has_prototype
+                    && a.params
+                        .iter()
+                        .zip(&b.params)
+                        .any(|((a, _), (b, _))| recorded_qualifiers_conflict(a, b)))
+        }
+        _ => false,
+    }
+}
+
 /// Compatibility of two C types in the sense of `__builtin_types_compatible_p`
 /// (C11 6.2.7 "compatible type and composite type").
 ///
@@ -502,12 +532,16 @@ pub fn cvr_spelling(cvr: u8) -> &'static str {
 ///   * enums: compatible with the integer type their value range picks
 ///     (C11 6.7.2.2p4), so a body-less `enum tag` still matches `int` or
 ///     `unsigned int` exactly like GCC;
-///   * everything else: structural equality.  (CV qualification lives in the
-///     parser's per-level qualifier vector, not in `CType`; the predicate's
-///     callers combine the two.)
+///   * recorded pointee qualification is significant at every pointer level,
+///     including function return/parameter types. Unknown records cannot prove
+///     a mismatch. Top-level object qualification is not stored in CType;
+///   * everything else: structural equality. Unlike ordinary CType Eq, this
+///     predicate is for semantic compatibility, not representation identity.
 pub fn ctypes_compatible(t1: &CType, t2: &CType) -> bool {
     match (t1, t2) {
-        (CType::Pointer(a, sa), CType::Pointer(b, sb)) => sa == sb && ctypes_compatible(a, b),
+        (CType::Pointer(a, sa), CType::Pointer(b, sb)) => {
+            sa.space == sb.space && !sa.has_known_cvr_conflict(*sb) && ctypes_compatible(a, b)
+        }
         (CType::Array(a, sa), CType::Array(b, sb)) => {
             ctypes_compatible(a, b) && (sa == sb || sa.is_none() || sb.is_none())
         }
@@ -3993,7 +4027,11 @@ impl CType {
         match (self, assoc) {
             (CType::Enum(_), CType::Enum(_)) => self == assoc,
             (CType::Enum(e), other) | (other, CType::Enum(e)) => e.compatible_ctype() == *other,
-            (CType::Pointer(a, _), CType::Pointer(b, _)) => a.generic_association_matches(b),
+            (CType::Pointer(a, aq), CType::Pointer(b, bq)) => {
+                aq.space == bq.space
+                    && !aq.has_known_cvr_conflict(*bq)
+                    && a.generic_association_matches(b)
+            }
             (CType::Array(a, la), CType::Array(b, lb)) => {
                 (la.is_none() || lb.is_none() || la == lb) && a.generic_association_matches(b)
             }
@@ -4097,8 +4135,17 @@ impl CType {
                     // unprototyped, the composite function type has that
                     // prototype; choosing the then-arm alone can incorrectly
                     // allow extra call arguments.
-                    if let Some(composite) = composite_compatible_type(&t, &e) {
-                        return Some(composite.with_pointee_cvr(joined));
+                    // 6.5.15 joins the immediate pointee qualification; it
+                    // requires compatibility BELOW that qualification. Compare
+                    // the inner types directly, avoiding two cloned stripped
+                    // pointer trees just to ignore their immediate CVR.
+                    if t_quals.space == e_quals.space {
+                        if let Some(composite) = composite_compatible_type(inner_t, inner_e) {
+                            return Some(CType::Pointer(
+                                Box::new(composite),
+                                t_quals.with_cvr(joined),
+                            ));
+                        }
                     }
                     // Pointers to incompatible types: GCC diagnoses the
                     // mismatch (an error since GCC 14, a warning under
@@ -5229,5 +5276,82 @@ mod conditional_type_tests {
         let l2 = super::StructLayout::for_struct_with_packing(&pack2_bf, Some(2), &ctx, false);
         assert_eq!(l2.align, 2);
         assert_eq!(l2.size, 2);
+    }
+}
+
+#[cfg(test)]
+mod pointer_qualifier_contract_tests {
+    use super::*;
+    use std::hash::{Hash, Hasher};
+
+    fn pointer(cvr: Option<u8>) -> CType {
+        CType::Pointer(Box::new(CType::Int), PtrQuals::GENERIC.with_cvr(cvr))
+    }
+
+    #[test]
+    fn representation_identity_and_semantic_conflicts_are_distinct() {
+        let records: Vec<_> = std::iter::once(None).chain((0..8).map(Some)).collect();
+        for &a in &records {
+            for &b in &records {
+                let aq = PtrQuals::GENERIC.with_cvr(a);
+                let bq = PtrQuals::GENERIC.with_cvr(b);
+                assert_eq!(aq, bq);
+                let hash = |q: PtrQuals| {
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    q.hash(&mut h);
+                    h.finish()
+                };
+                assert_eq!(hash(aq), hash(bq));
+                let conflict = matches!((a, b), (Some(a), Some(b)) if a != b);
+                assert_eq!(aq.has_known_cvr_conflict(bq), conflict);
+                assert_eq!(ctypes_compatible(&pointer(a), &pointer(b)), !conflict);
+            }
+        }
+        assert_ne!(PtrQuals::GENERIC, PtrQuals::of(AddressSpace::SegGs));
+        assert_eq!(PtrQuals::GENERIC.cvr(), None);
+        assert_eq!(PtrQuals::GENERIC.with_cvr(Some(0)).cvr(), Some(0));
+    }
+
+    #[test]
+    fn conditional_joins_all_known_immediate_qualifiers_without_guessing() {
+        let records: Vec<_> = std::iter::once(None).chain((0..8).map(Some)).collect();
+        for &a in &records {
+            for &b in &records {
+                let result = CType::conditional_composite_type(
+                    Some(pointer(a)),
+                    Some(pointer(b)),
+                    false,
+                    false,
+                )
+                .unwrap();
+                let CType::Pointer(_, quals) = result else {
+                    panic!("pointer expected")
+                };
+                assert_eq!(quals.cvr(), a.zip(b).map(|(a, b)| a | b));
+            }
+        }
+    }
+
+    #[test]
+    fn function_qualification_is_significant_but_parameter_names_are_not() {
+        let function = |param, name: &str, ret| {
+            CType::Function(Box::new(FunctionType {
+                return_type: ret,
+                params: vec![(param, Some(name.into()))],
+                variadic: false,
+                has_prototype: true,
+            }))
+        };
+        let plain = function(pointer(Some(0)), "x", CType::Void);
+        let renamed = function(pointer(Some(0)), "y", CType::Void);
+        let qualified = function(pointer(Some(PtrQuals::CONST)), "x", CType::Void);
+        assert!(ctypes_compatible(&plain, &renamed));
+        assert!(!recorded_qualifiers_conflict(&plain, &renamed));
+        assert!(!ctypes_compatible(&plain, &qualified));
+        assert!(recorded_qualifiers_conflict(&plain, &qualified));
+        let ret_a = function(CType::Int, "x", pointer(Some(0)));
+        let ret_b = function(CType::Int, "x", pointer(Some(PtrQuals::CONST)));
+        assert!(recorded_qualifiers_conflict(&ret_a, &ret_b));
+        assert!(!ctypes_compatible(&ret_a, &ret_b));
     }
 }

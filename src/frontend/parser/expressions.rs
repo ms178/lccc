@@ -164,15 +164,18 @@ impl Parser {
     fn parse_conditional_expr(&mut self) -> Expr {
         let cond = self.parse_binary_expr(PrecedenceLevel::LogicalOr);
         if self.consume_if(&TokenKind::Question) {
-            let span = cond.span();
+            // As for binary operators, the AST span names the operator.
+            // Capture the colon token before parsing the third operand.
             // GNU extension: `cond ? : else_expr` (omitted middle operand)
             // Condition is evaluated once and used as the then-value if truthy.
             if self.peek() == &TokenKind::Colon {
+                let span = self.peek_span();
                 self.expect_context(&TokenKind::Colon, "in conditional expression");
                 let else_expr = self.parse_conditional_expr();
                 Expr::GnuConditional(Box::new(cond), Box::new(else_expr), span)
             } else {
                 let then_expr = self.parse_expr();
+                let span = self.peek_span();
                 self.expect_context(&TokenKind::Colon, "in conditional expression");
                 let else_expr = self.parse_conditional_expr();
                 Expr::Conditional(

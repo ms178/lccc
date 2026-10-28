@@ -1979,9 +1979,11 @@ pub enum Expr {
     PostfixOp(PostfixOp, Box<Expr>, Span),
     Assign(Box<Expr>, Box<Expr>, Span),
     CompoundAssign(BinOp, Box<Expr>, Box<Expr>, Span),
+    /// The span names the colon token, not the condition or the full range.
     Conditional(Box<Expr>, Box<Expr>, Box<Expr>, Span),
     /// GNU extension: `cond ? : else_expr` - condition is evaluated once and used as the
     /// then-value if truthy. Semantically: `({ auto __tmp = cond; __tmp ? __tmp : else_expr; })`
+    /// The span names the colon token, as for the ordinary conditional.
     GnuConditional(Box<Expr>, Box<Expr>, Span),
     FunctionCall(Box<Expr>, Vec<Expr>, Span),
     ArraySubscript(Box<Expr>, Box<Expr>, Span),

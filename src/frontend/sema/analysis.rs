@@ -4391,82 +4391,17 @@ impl SemanticAnalyzer {
         // struct but yield a pointer to the result slot, which
         // `__CCC_M128I_FROM_BUILTIN(e)` = `*(__m128i *)(e)` dereferences.
         if let Expr::FunctionCall(callee, ..) = expr {
-            if matches!(callee.as_ref(), Expr::Identifier(name, _) if builtins::is_builtin(name)) {
+            if matches!(callee.as_ref(), Expr::Identifier(name, _) if builtins::is_builtin(name)
+                && name != "__builtin_choose_expr")
+            {
                 return None;
             }
         }
-        let raw = self.expr_type_checker().infer_expr_ctype(expr)?;
-        let decays = matches!(raw, CType::Array(..));
-        let mut ty = raw.decayed_value_ctype();
-        // `&lvalue` and an array lvalue's decay point at an object whose own
-        // qualifiers may be exactly known.
-        let object = match expr {
-            Expr::AddressOf(inner, _) => Some(inner.as_ref()),
-            _ if decays => Some(expr),
-            _ => None,
-        };
-        if let (Some(object), CType::Pointer(_, quals)) = (object, &mut ty) {
-            if quals.cvr().is_none() {
-                if let Some(cvr) = self.lvalue_object_cvr(object) {
-                    *quals = quals.with_cvr(Some(cvr));
-                }
-            }
-        }
+        let ty = self.expr_type_checker().infer_value_ctype(expr)?;
         if matches!(ty, CType::Void) && !self.is_exact_void(expr) {
             return None;
         }
         Some(ty)
-    }
-
-    /// The complete own CVR bits of the object the lvalue `expr` designates,
-    /// when exactly known: a variable's record; a member's own qualifiers
-    /// joined with its containing object's (C11 6.5.2.3p3, `.` and `->`
-    /// alike); and the pointee record of the pointer that `*`, `->` or a
-    /// subscript goes through (an array operand: the array object's own,
-    /// which are its elements'). `None` when any link is unknown.
-    fn lvalue_object_cvr(&self, expr: &Expr) -> Option<u8> {
-        match expr {
-            Expr::Identifier(name, _) => self.symbol_table.object_cvr(name),
-            Expr::MemberAccess(base, field, _) => {
-                let outer = self.lvalue_object_cvr(base)?;
-                let record = self.expr_type_checker().infer_expr_ctype(base)?;
-                Some(outer | self.member_own_cvr(&record, field)?)
-            }
-            Expr::PointerMemberAccess(base, field, _) => {
-                let (record, outer) = self.designated_pointee(base)?;
-                Some(outer | self.member_own_cvr(&record, field)?)
-            }
-            Expr::Deref(inner, _) => self.designated_pointee(inner).map(|(_, cvr)| cvr),
-            Expr::ArraySubscript(lhs, rhs, _) => {
-                let checker = self.expr_type_checker();
-                let lhs_indexes = checker
-                    .infer_expr_ctype(lhs)
-                    .is_some_and(|t| matches!(t, CType::Pointer(..) | CType::Array(..)));
-                let base = if lhs_indexes { lhs } else { rhs };
-                self.designated_pointee(base).map(|(_, cvr)| cvr)
-            }
-            _ => None,
-        }
-    }
-
-    /// The object type `expr` points at (an array operand: its element) and
-    /// that object's complete own CVR bits, when exactly known.
-    fn designated_pointee(&self, expr: &Expr) -> Option<(CType, u8)> {
-        match self.expr_type_checker().infer_expr_ctype(expr)? {
-            CType::Pointer(pointee, quals) => Some((*pointee, quals.cvr()?)),
-            CType::Array(elem, _) => Some((*elem, self.lvalue_object_cvr(expr)?)),
-            _ => None,
-        }
-    }
-
-    /// Member `field`'s own CVR bits in record type `record` (see
-    /// `StructLayout::member_own_cvr`).
-    fn member_own_cvr(&self, record: &CType, field: &str) -> Option<u8> {
-        let (CType::Struct(key) | CType::Union(key)) = record else {
-            return None;
-        };
-        let layouts = self.result.type_context.borrow_struct_layouts();
-        layouts.get(&key[..])?.member_own_cvr(field, &*layouts)
     }
 
     /// The type of `expr` for the expression-level constraints that inspect
@@ -4483,7 +4418,9 @@ impl SemanticAnalyzer {
         // `__builtin_ia32_*` yields a pointer to the result slot although it
         // is declared to return a vector struct.
         if let Expr::FunctionCall(callee, ..) = expr {
-            if matches!(callee.as_ref(), Expr::Identifier(name, _) if builtins::is_builtin(name)) {
+            if matches!(callee.as_ref(), Expr::Identifier(name, _) if builtins::is_builtin(name)
+                && name != "__builtin_choose_expr")
+            {
                 return None;
             }
         }
@@ -4771,7 +4708,6 @@ impl SemanticAnalyzer {
 
     fn check_conditional_arms(&self, then_expr: &Expr, else_expr: &Expr, span: Span) {
         // gcc-16.2 carets every verdict on the conditional at its `:`.
-        let span = self.conditional_colon_span(else_expr).unwrap_or(span);
         if let (Some(t), Some(e)) = (
             self.constraint_operand(then_expr),
             self.constraint_operand(else_expr),
@@ -7971,42 +7907,7 @@ dereference it before applying '->' to it?"
     /// `-Wdiscarded-qualifiers`); every other expression's span already is
     /// its caret (a binary operator's span is the operator).
     fn operand_caret_span(&self, expr: &Expr) -> Span {
-        let else_expr = match expr {
-            Expr::Conditional(_, _, else_expr, _) | Expr::GnuConditional(_, else_expr, _) => {
-                else_expr
-            }
-            _ => return expr.span(),
-        };
-        self.conditional_colon_span(else_expr)
-            .unwrap_or_else(|| expr.span())
-    }
-
-    /// The `:` of a conditional whose third operand is `else_expr`: GCC's
-    /// caret for the conditional itself (its type-mismatch verdicts and its
-    /// use as an operand). The AST keeps no `:` span, so this scans back
-    /// from the third operand over blanks and opening parentheses.
-    fn conditional_colon_span(&self, else_expr: &Expr) -> Option<Span> {
-        let start = self.expr_start_span(else_expr);
-        let sm = self.diagnostics.borrow().share_source_manager()?;
-        let content = sm.get_content(start.file_id);
-        let bytes = content.as_bytes();
-        let mut probe = (start.start as usize).min(bytes.len());
-        while probe > 0 {
-            probe -= 1;
-            match bytes[probe] {
-                b':' => {
-                    return Some(Span {
-                        start: probe as u32,
-                        end: probe as u32 + 1,
-                        file_id: start.file_id,
-                    });
-                }
-                b'(' => {}
-                byte if byte.is_ascii_whitespace() => {}
-                _ => return None,
-            }
-        }
-        None
+        expr.span()
     }
 
     fn expr_start_span(&self, expr: &Expr) -> Span {
@@ -10167,22 +10068,6 @@ fn discarded_pointee_qualifiers(from: &CType, to: &CType) -> Option<(u8, bool)> 
     (dropped != 0).then(|| (dropped, matches!(**from_inner, CType::Array(..))))
 }
 
-/// Whether two pointed-to types differ in a qualifier both sides recorded at
-/// some pointer level (see `PtrQuals`). Compatible types are identically
-/// qualified (C23 6.2.7, 6.7.3p11): `char **` and `const char **` point at
-/// different types, and so do `void **` and `const void **`. `CType` equality
-/// ignores the qualifiers, so this runs before any shortcut on it.
-fn recorded_quals_differ(from: &CType, to: &CType) -> bool {
-    match (from, to) {
-        (CType::Pointer(a, a_quals), CType::Pointer(b, b_quals)) => {
-            matches!((a_quals.cvr(), b_quals.cvr()), (Some(x), Some(y)) if x != y)
-                || recorded_quals_differ(a, b)
-        }
-        (CType::Array(a, _), CType::Array(b, _)) => recorded_quals_differ(a, b),
-        _ => false,
-    }
-}
-
 fn pointee_compat(from: &CType, to: &CType) -> PtrCompat {
     pointee_compat_at(from, to, true)
 }
@@ -10194,7 +10079,7 @@ fn pointee_compat(from: &CType, to: &CType) -> PtrCompat {
 /// **` and `int (*)[3]` to `unsigned (*)[3]`), and a comparison admits no
 /// sign difference at all (`int *` == `unsigned *` is distinct).
 fn pointee_compat_at(from: &CType, to: &CType, sign_lenient: bool) -> PtrCompat {
-    if recorded_quals_differ(from, to) {
+    if crate::common::types::recorded_qualifiers_conflict(from, to) {
         return PtrCompat::Incompatible;
     }
     if from == to {
@@ -10362,7 +10247,7 @@ enum TransparentVerdict {
 fn transparent_member_accepts(member: &CType, arg: &CType, null_constant: bool) -> bool {
     // `CType` equality ignores qualifiers: `const char **` is not a
     // `char **` member (the pointer rule below rejects it).
-    if member == arg && !recorded_quals_differ(arg, member) {
+    if member == arg && !crate::common::types::recorded_qualifiers_conflict(arg, member) {
         return true;
     }
     match (member, arg) {

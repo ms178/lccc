@@ -1343,3 +1343,27 @@ mod qualified_pointee_typedef_tests {
         assert!(ctx.qualified_pointee_typedefs.contains("P"));
     }
 }
+
+#[cfg(test)]
+mod typedef_cvr_scope_tests {
+    use super::TypeContext;
+    use crate::common::types::PtrQuals;
+
+    #[test]
+    fn unknown_zero_redeclarations_and_nested_scope_undo_are_distinct() {
+        let mut types = TypeContext::new();
+        types.set_typedef_top_cvr("T", Some(PtrQuals::CONST));
+        types.push_scope();
+        types.set_typedef_top_cvr("T", Some(0));
+        assert_eq!(types.typedef_top_cvr("T"), Some(0));
+        types.push_scope();
+        types.set_typedef_top_cvr("T", None);
+        types.set_typedef_top_cvr("T", Some(PtrQuals::VOLATILE));
+        types.set_typedef_top_cvr("T", None);
+        assert_eq!(types.typedef_top_cvr("T"), None);
+        types.pop_scope();
+        assert_eq!(types.typedef_top_cvr("T"), Some(0));
+        types.pop_scope();
+        assert_eq!(types.typedef_top_cvr("T"), Some(PtrQuals::CONST));
+    }
+}
