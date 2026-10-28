@@ -129,6 +129,12 @@ pub enum WarningKind {
     /// is expected without a null-pointer constant or an explicit cast.
     /// GCC flag: -Wint-conversion
     IntConversion,
+    /// A pointer was cast to an integer type whose object size differs from
+    /// the pointer's (C11 6.5.4p2 permits the cast, GCC 16.2 warns by
+    /// default in EVERY dialect and never as a dialect default error —
+    /// measured; `_Bool` and enumeration targets never warn).
+    /// GCC flag: -Wpointer-to-int-cast
+    PointerToIntCast,
 }
 
 impl WarningKind {
@@ -148,6 +154,7 @@ impl WarningKind {
             WarningKind::ImplicitInt => "implicit-int",
             WarningKind::ReturnMismatch => "return-mismatch",
             WarningKind::IntConversion => "int-conversion",
+            WarningKind::PointerToIntCast => "pointer-to-int-cast",
         }
     }
 
@@ -169,6 +176,7 @@ impl WarningKind {
             "implicit-int" => Some(WarningKind::ImplicitInt),
             "return-mismatch" => Some(WarningKind::ReturnMismatch),
             "int-conversion" => Some(WarningKind::IntConversion),
+            "pointer-to-int-cast" => Some(WarningKind::PointerToIntCast),
             _ => None,
         }
     }
@@ -222,6 +230,7 @@ impl WarningKind {
             WarningKind::ImplicitInt,
             WarningKind::ReturnMismatch,
             WarningKind::IntConversion,
+            WarningKind::PointerToIntCast,
         ]
     }
 }
@@ -399,6 +408,11 @@ impl WarningConfig {
     pub fn is_enabled(&self, kind: WarningKind) -> bool {
         self.enabled.contains(&kind)
             && (!self.inhibit_all || (self.default_errors.contains(&kind) && self.is_error(kind)))
+    }
+
+    /// Whether `kind` came from an explicit positive flag.
+    pub fn is_explicitly_requested(&self, kind: WarningKind) -> bool {
+        self.explicit_enable.contains(&kind)
     }
 
     /// Check if a warning of the given kind should be promoted to an error.
@@ -719,6 +733,14 @@ impl DiagnosticEngine {
     /// expensive analysis for that warning category.
     pub fn warning_enabled(&self, kind: WarningKind) -> bool {
         self.warning_config.is_enabled(kind)
+    }
+
+    /// Whether the user asked for this warning class with a positive
+    /// `-W<name>` or `-Werror=<name>` flag (not merely its default state).
+    /// Used by the attribute inventory: GCC-known-but-unimplemented
+    /// attributes diagnose only on an explicit `-Wattributes` request.
+    pub fn warning_explicitly_requested(&self, kind: WarningKind) -> bool {
+        self.warning_config.is_explicitly_requested(kind)
     }
 
     /// Set the source manager for span resolution and snippet display.

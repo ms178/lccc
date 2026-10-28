@@ -1,4 +1,5 @@
 pub(crate) mod ast;
+mod attribute_registry;
 mod declarations;
 mod declarators;
 mod expressions;
