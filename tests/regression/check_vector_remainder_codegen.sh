@@ -11,6 +11,15 @@ tmp=$(mktemp -d "${TMPDIR:-/tmp}/lccc-vector-remainder.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
 flags=(-O2 -march=x86-64-v3 -ffast-math -ffp-contract=fast)
 
+# Report the failing contract as a workflow annotation as well as on stderr.
+# The lane wrapper truncates the log tail, so a bare `exit 1` from inside a
+# heredoc is invisible in the PR; `check_ch_maj_codegen.sh` reports the same way.
+fail() { # fail <title> <detail>
+    printf '::error title=%s::%s\n' "$1" "$2" >&2
+    printf 'FAIL %s: %s\n' "$1" "$2" >&2
+    exit 1
+}
+
 "$CCC" "${flags[@]}" -S "$dir/vectorize_matmul_tail.c" -o "$tmp/matmul.s"
 "$CCC" "${flags[@]}" -S "$dir/../benchmark/patterns/simd_fp_oracle.c" \
     -o "$tmp/reduction.s"
@@ -27,9 +36,8 @@ ${GCC_BIN:-gcc} -O2 -march=x86-64-v3 "$strided_src" -o "$tmp/strided-ref"
 expected_out=$("$tmp/strided-ref")
 actual_out=$(timeout 60 "$tmp/strided")
 if [[ $actual_out != "$expected_out" ]]; then
-    printf 'FAIL: strided i32 reduction output differs from GCC:\n  lccc: %q\n  gcc : %q\n' \
-        "$actual_out" "$expected_out" >&2
-    exit 1
+    fail "strided i32 reduction arithmetic" \
+        "output differs from GCC (lccc: $actual_out / gcc: $expected_out)"
 fi
 python3 - "$tmp/strided.s" <<'PY2'
 import re
@@ -42,15 +50,19 @@ for name in ("sum_global", "sum_dynamic"):
     if not match:
         raise SystemExit(f"{name}: missing assembly body")
     body = match.group(1)
+    def reject(reason):
+        # One annotation with the body that failed, so the shape can be judged
+        # without a compile of the revision that produced it.
+        detail = body[:1500].replace("%", "%25").replace("\n", "%0A")
+        print(f"::error title=strided-reduce {name}::{reason} --- {detail}",
+              file=sys.stderr)
+        raise SystemExit(f"{name}: {reason}")
+
     if "%ymm" not in body:
-        raise SystemExit(
-            f"{name}: strided-2 i32 reduction was not vectorized (no 256-bit register)"
-        )
+        reject("strided-2 i32 reduction was not vectorized (no 256-bit register)")
     if not packed.search(body):
-        raise SystemExit(
-            f"{name}: no packed dword arithmetic in the reduction loop "
-            "(a scalar fallback cannot be the vectorized transform)"
-        )
+        reject("no packed dword arithmetic in the reduction loop "
+               "(a scalar fallback cannot be the vectorized transform)")
 PY2
 
 python3 - "$tmp/matmul.s" "$tmp/reduction.s" "$dir/lib" <<'PY'
