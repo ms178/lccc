@@ -6090,17 +6090,31 @@ mod regression_tests {
         );
         let out = peephole_optimize(asm.to_string());
         assert!(!out.contains("%rbx") && !out.contains("%r12"), "{out}");
-        assert_eq!(out.matches("subq $88, %rsp").count(), 1, "{out}");
-        assert_eq!(out.matches("addq $88, %rsp").count(), 2, "{out}");
-        // Frame CFA (96) is unchanged; each epilogue steps 96 -> 8 directly.
-        assert_eq!(out.matches(".cfi_def_cfa_offset 96").count(), 2, "{out}");
-        // One CFA step per epilogue (after the addq); the dead pops took
-        // their own directives with them.
-        assert_eq!(out.matches(".cfi_def_cfa_offset 8\n").count(), 2, "{out}");
-        for bad in ["offset 16", "offset 24", ".cfi_offset"] {
-            assert!(!out.contains(bad), "{bad}: {out}");
+        // The interspersed `.cfi_offset` directives no longer make the
+        // prologue backscan skip never-read DSE for the whole function. The
+        // only frame resident was the xmm0 spill, whose reload on the
+        // fall-through path forwards directly (xmm0 is untouched between the
+        // spill and reload), so the leaf is now frameless: no frame
+        // adjustment and no body CFA/CFI-offset directives survive.
+        for gone in [
+            "subq ",
+            "addq ",
+            ".cfi_def_cfa_offset",
+            ".cfi_offset",
+            "8(%rsp)",
+        ] {
+            assert!(!out.contains(gone), "{gone}: {out}");
         }
-        assert!(out.contains("movdqu %xmm0, 8(%rsp)"), "{out}");
+        // The 16 bytes are still stored through %rsi on the fall-through
+        // path, and the branch keeps both returns distinct.
+        assert!(out.contains("movdqu %xmm0, %xmm1"), "{out}");
+        assert!(out.contains("movdqu %xmm1, (%rsi)"), "{out}");
+        assert_eq!(
+            out.lines().filter(|l| l.trim() == "ret").count(),
+            2,
+            "{out}"
+        );
+        assert!(out.contains("je .LBB2"), "{out}");
     }
 
     /// zstd_count's `main`: a dead save between live ones, calls in the
