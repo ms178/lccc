@@ -426,8 +426,6 @@ impl SymbolTable {
             .is_some_and(|scope| scope.parameters.contains(name))
     }
 
-    /// Record that the innermost scope's object `name` has a top-level
-    /// `const` (see the `top_const` field on `Scope`).
     /// Record the alias that names `name`'s base type (GCC keeps typedef
     /// names in `read-only location` spellings).
     pub fn mark_written_type_name(&mut self, name: &str, alias: &str) {
@@ -466,6 +464,8 @@ impl SymbolTable {
             .is_some_and(|scope| scope.volatile_base.contains(name))
     }
 
+    /// Record that the innermost scope's object `name` has a top-level
+    /// `const` (see the `top_const` field on `Scope`).
     pub fn mark_top_const(&mut self, name: &str) {
         if let Some(scope) = self.scopes.last_mut() {
             scope.top_const.insert(name.to_string());

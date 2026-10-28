@@ -1757,6 +1757,13 @@ impl Parser {
                 TokenKind::Restrict | TokenKind::Inline | TokenKind::Register => {
                     self.advance();
                 }
+                TokenKind::Atomic => {
+                    // `double _Atomic x`: the trailing spelling of the C11
+                    // 6.7.3 qualifier (the leading `_Atomic T` and
+                    // `_Atomic(T)` forms parse elsewhere).
+                    self.advance();
+                    self.attrs.set_atomic(true);
+                }
                 TokenKind::Auto => {
                     self.advance();
                     // C gives `auto` no meaning for variables, and the tree has
