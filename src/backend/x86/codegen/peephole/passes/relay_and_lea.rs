@@ -4009,6 +4009,44 @@ fn dest_operand_text(t: &str) -> &str {
     }
 }
 
+/// If `t` is a 64-bit bitwise-AND with an immediate mask
+/// (`andq $imm, %qword`) whose sign-extended encoding provably zeroes the
+/// destination's upper 32 bits, return the narrowest width (8, 16 or 32) that
+/// contains every possible result.
+///
+/// `andq $imm32, %r64` encodes the immediate as a *sign-extended* imm32, so
+/// the effective mask is `sext_32(imm)`. Its bits 32..63 are zero exactly
+/// when `imm` is a nonnegative i32 (`0..=0x7FFF_FFFF`); a mask in
+/// `0x8000_0000..=0xFFFF_FFFF` sign-extends to all-ones up there and keeps
+/// the source's upper half, so those refuse. Within the nonnegative range
+/// the result width follows the mask itself: `x & m <= m`, hence
+/// `m <= 0x7F` proves a byte-width result and `m <= 0xFFFF` a word-width one.
+/// Register or memory mask sources cannot bound the result and return `None`.
+pub(super) fn andq_imm_narrow_width(t: &str, fam: RegId) -> Option<u8> {
+    let mnemonic = t.split_whitespace().next()?;
+    if mnemonic != "andq" {
+        return None;
+    }
+    let rest = t[mnemonic.len()..].trim_start();
+    let (src, dst) = split_two_operands(rest)?;
+    // The 64-bit destination name only: a 32-bit `andl` is handled by the
+    // architecture-wide dword zero-extension rule, not this mask analysis.
+    if dst != REG_NAMES[0][fam as usize] {
+        return None;
+    }
+    let imm = parse_imm32(src)?;
+    if (imm as i32) < 0 {
+        return None;
+    }
+    Some(if imm <= 0x7F {
+        8
+    } else if imm <= 0xFFFF {
+        16
+    } else {
+        32
+    })
+}
+
 /// Whether line `t` (known to write family `fam`) establishes a zero upper
 /// half: a 32-bit-destination write (EVERY dword dest zero-extends —
 /// `movl`/`andl`/`cmovl`/3-operand `imull`/`leal`/`btsl`/`popcntl`/`incl`/
@@ -4016,7 +4054,9 @@ fn dest_operand_text(t: &str) -> &str {
 /// `subq %S, %S`; `xorl`-self is subsumed by the dword rule), or a small
 /// immediate (`movq $imm`: GAS sign-extends imm32, so only nonnegative
 /// counts — `$0xFFFFFFFF` is -1, NOT small; `movabsq $imm64`: only low
-/// 32 bits set). Callers guarantee lowercase text (see `upper32_zero_at`).
+/// 32 bits set), or a masked 64-bit AND whose sign-extended mask has no
+/// high bits (`andq_imm_narrow_width`). Callers guarantee lowercase text
+/// (see `upper32_zero_at`).
 pub(super) fn s_write_proves_upper_zero(t: &str, fam: RegId) -> bool {
     if dest_operand_text(t) == REG_NAMES[1][fam as usize] {
         // ...except conditional writers: `cmov*`/`cfcmov*`/`cmpxchg*`/`bsf`/`bsr`/
@@ -4072,6 +4112,12 @@ pub(super) fn s_write_proves_upper_zero(t: &str, fam: RegId) -> bool {
             }
         }
         return false;
+    }
+    // `andq $imm, %qword` with a nonnegative imm32 mask: the sign-extended
+    // mask carries zeroes in bits 32..63, so the AND result's upper half is
+    // zero regardless of the incoming value.
+    if mnemonic == "andq" {
+        return andq_imm_narrow_width(t, fam).is_some();
     }
     false
 }
@@ -6644,6 +6690,91 @@ mod tests {
         assert!(out.contains("shlq $32, %r8"), "{out}");
         assert!(out.contains("orq %r8, %r10"), "{out}");
         assert!(out.contains("movq %r10, (%rsi)"), "{out}");
+    }
+
+    /// The masked-AND width predicate: a nonnegative imm32 mask bounds the
+    /// result width for every source value, while a negative imm32 encoding
+    /// sign-extends to an all-ones high mask and a register mask is unbounded.
+    #[test]
+    fn andq_imm_narrow_width_predicate_boundaries() {
+        // r10 is GP family 10 in REG_NAMES.
+        assert_eq!(super::andq_imm_narrow_width("andq $127, %r10", 10), Some(8));
+        assert_eq!(
+            super::andq_imm_narrow_width("andq $0x7f, %r10", 10),
+            Some(8)
+        );
+        assert_eq!(
+            super::andq_imm_narrow_width("andq $65535, %r10", 10),
+            Some(16)
+        );
+        assert_eq!(
+            super::andq_imm_narrow_width("andq $1048575, %r10", 10),
+            Some(32)
+        );
+        assert_eq!(
+            super::andq_imm_narrow_width("andq $2147483647, %r10", 10),
+            Some(32)
+        );
+        // The imm32 sign-extension boundary: bits 32..63 of the effective mask
+        // are all ones, so the source's upper half survives.
+        assert_eq!(
+            super::andq_imm_narrow_width("andq $2147483648, %r10", 10),
+            None
+        );
+        assert_eq!(
+            super::andq_imm_narrow_width("andq $4294967295, %r10", 10),
+            None
+        );
+        // A register mask cannot bound the result.
+        assert_eq!(super::andq_imm_narrow_width("andq %rax, %r10", 10), None);
+        // The 32-bit form is not this predicate's job (dword rule handles it).
+        assert_eq!(super::andq_imm_narrow_width("andl $127, %r10d", 10), None);
+        // The destination must be the named family's 64-bit register.
+        assert_eq!(super::andq_imm_narrow_width("andq $127, %r11", 10), None);
+    }
+
+    /// revvarint shape: a byte load masked with `andq $127` provably fits in a
+    /// byte, so the staging `movl` into the 64-bit `orq` reader folds away and
+    /// the reader is retargeted to the mask destination directly.
+    #[test]
+    fn andq_byte_mask_lets_copy_fold_into_64bit_reader() {
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movzbl (%rdi, %r8), %r10d\n",
+            "    andq $127, %r10\n",
+            "    movl %r10d, %esi\n",
+            "    shlq $7, %rdx\n",
+            "    orq %rsi, %rdx\n",
+            "    movq %r8, %rsi\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(!out.contains("movl %r10d, %esi"), "{out}");
+        assert!(out.contains("orq %r10, %rdx"), "{out}");
+        assert!(out.contains("andq $127, %r10"), "{out}");
+    }
+
+    /// A mask in the sign-extended range proves nothing, so the 32-bit copy
+    /// must stay: deleting it would feed the unmasked upper half into the
+    /// 64-bit reader. Register coalescing may rename the families, so pin the
+    /// structural contract — a dword copy survives and the OR still reads its
+    /// zero-extended destination rather than the unmasked source.
+    #[test]
+    fn andq_negative_imm32_mask_keeps_the_copy() {
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movq %rdi, %r10\n",
+            "    andq $2147483648, %r10\n",
+            "    movl %r10d, %esi\n",
+            "    orq %rsi, %rdx\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("movl %edi, %esi"), "{out}");
+        assert!(out.contains("orq %rsi, %rdx"), "{out}");
+        assert!(!out.contains("orq %rdi, %rdx"), "{out}");
     }
 
     #[test]

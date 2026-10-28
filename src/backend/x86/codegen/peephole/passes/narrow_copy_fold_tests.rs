@@ -1059,3 +1059,42 @@ fn ext_into_allocated_rbp_folds_across_rsp_slot_spills() {
     assert_eq!(count(&out, "movzbl %r15b, %ebp"), 0, "{}", out);
     assert_eq!(count(&out, "movb %r15b, (%r12, %r14)"), 1, "{}", out);
 }
+
+// ── G. masked 64-bit AND as an upper32-zero producer (PERF-5 residue) ────────
+
+#[test]
+fn g_andq_byte_mask_makes_32bit_copy_cover_64bit_reader_in_block() {
+    // The forward `upper32_zero` scan used to clear its fact on every `andq`,
+    // so the 32-bit staging copy could not fold into the 64-bit OR reader.
+    // A nonnegative imm32 mask zeroes bits 32..63 for any source value, which
+    // makes the copy provably redundant inside the same block.
+    let out = run(&f(concat!(
+        "    movzbl (%rdi, %r8), %r10d\n",
+        "    andq $127, %r10\n",
+        "    movl %r10d, %esi\n",
+        "    shlq $7, %rdx\n",
+        "    orq %rsi, %rdx\n",
+        "    movq %r8, %rsi\n",
+        "    ret",
+    )));
+    assert_eq!(count(&out, "movl %r10d, %esi"), 0, "{}", out);
+    assert!(out.contains("orq %r10, %rdx"), "{}", out);
+}
+
+#[test]
+fn g_andq_sign_extended_mask_does_not_prove_upper_zero() {
+    // $0x8000_0000 encodes as a negative imm32 and sign-extends to an
+    // all-ones high mask: the source's upper 32 bits survive, so the copy
+    // feeding the 64-bit reader must remain (families may be renamed by
+    // coalescing; pin the surviving dword copy and the un-folded OR reader).
+    let out = run(&f(concat!(
+        "    movq %rdi, %r10\n",
+        "    andq $2147483648, %r10\n",
+        "    movl %r10d, %esi\n",
+        "    orq %rsi, %rdx\n",
+        "    ret",
+    )));
+    assert_eq!(count(&out, "movl %edi, %esi"), 1, "{}", out);
+    assert!(out.contains("orq %rsi, %rdx"), "{}", out);
+    assert!(!out.contains("orq %rdi, %rdx"), "{}", out);
+}
