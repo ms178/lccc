@@ -763,18 +763,10 @@ def stable_launcher_digest(path: Path) -> str:
         raise GodboltError(f"cannot hash compiler launcher {path}: {error}") from error
 
 
-def local_reference_metadata(label: str, executable: str, flags: str) -> dict[str, Any]:
-    """Identify an explicit local native oracle without provisioning or network.
-
-    The executable hash is deliberately named *launcher*: a shell shim can
-    dispatch to another binary, so its digest alone does not pin the compiler.
-    Macro and version probes supply evidence, not an attestation of that binary.
-    """
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", label):
-        raise GodboltError(f"invalid local reference label {label!r}")
+def local_launcher_metadata(label: str, executable: str) -> dict[str, Any]:
+    """Identify the invoked launcher, not a wrapper's transitive toolchain."""
     if not executable.strip():
         raise GodboltError(f"{label}: empty local executable")
-    validate_local_oracle_flags(label, flags)
     resolved = shutil.which(os.path.expanduser(executable))
     if resolved is None:
         raise GodboltError(f"{label}: local compiler is not executable: {executable}")
@@ -785,20 +777,44 @@ def local_reference_metadata(label: str, executable: str, flags: str) -> dict[st
         lines = proc.stdout.splitlines()
         if proc.returncode or not lines or not lines[0].strip():
             raise GodboltError(f"{label}: local compiler did not report a version")
-        macros = _probe_macros(str(path))
-        if macros.get("__x86_64__") != "1" or macros.get("__SIZEOF_POINTER__") != "8":
-            raise GodboltError(f"{label}: local compiler is not native x86-64 LP64")
         digest = stable_launcher_digest(path)
         if _binary_identity(path) != before:
             raise GodboltError(f"{label}: compiler launcher changed during identification")
         return {
             "key": label,
-            "id": f"local:{label}",
             "name": lines[0].strip(),
-            "compilerType": "explicit-local",
             "launcher": str(path),
             "launcher_sha256": digest,
             "identity_scope": "launcher only; wrapper targets are not pinned",
+        }
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise GodboltError(f"{label}: local compiler probe failed: {error}") from error
+
+
+def local_reference_metadata(label: str, executable: str, flags: str) -> dict[str, Any]:
+    """Identify an explicit local native oracle without provisioning or network.
+
+    The executable hash is deliberately named *launcher*: a shell shim can
+    dispatch to another binary, so its digest alone does not pin the compiler.
+    Macro and version probes supply evidence, not an attestation of that binary.
+    """
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", label):
+        raise GodboltError(f"invalid local reference label {label!r}")
+    validate_local_oracle_flags(label, flags)
+    metadata = local_launcher_metadata(label, executable)
+    path = Path(metadata["launcher"])
+    try:
+        before = _binary_identity(path)
+        macros = _probe_macros(str(path))
+        if macros.get("__x86_64__") != "1" or macros.get("__SIZEOF_POINTER__") != "8":
+            raise GodboltError(f"{label}: local compiler is not native x86-64 LP64")
+        if (_binary_identity(path) != before
+                or stable_launcher_digest(path) != metadata["launcher_sha256"]):
+            raise GodboltError(f"{label}: compiler launcher changed during identification")
+        return {
+            **metadata,
+            "id": f"local:{label}",
+            "compilerType": "explicit-local",
             "target": "x86_64",
             "pointer_bits": 64,
         }
@@ -847,7 +863,10 @@ def command_compare(args: argparse.Namespace) -> int:
 
     records: list[dict[str, Any]] = []
     try:
-        local_lines = _compile_local(args.local, args.source, args.local_flags or args.flags)
+        local_metadata = local_launcher_metadata("lccc", args.local)
+        local_lines = _compile_local(local_metadata["launcher"], args.source, args.local_flags or args.flags)
+        if stable_launcher_digest(Path(local_metadata["launcher"])) != local_metadata["launcher_sha256"]:
+            raise GodboltError("lccc: compiler launcher changed during compilation")
         local_body = _function_body(local_lines, args.function)
         if local_body is None:
             raise GodboltError(
@@ -855,7 +874,7 @@ def command_compare(args: argparse.Namespace) -> int:
                 "(likely inlined or removed)"
             )
         records.append({
-            "key": "lccc", "id": str(Path(args.local)), "name": "local LCCC",
+            **local_metadata, "id": str(Path(args.local)),
             "flags": args.local_flags or args.flags,
             "instructions": _instruction_count(local_body), "assembly": local_body,
         })

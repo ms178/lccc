@@ -1,5 +1,6 @@
 """Explicit local assembly comparators must remain offline and fail closed."""
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -57,7 +58,9 @@ class OfflineCompare(unittest.TestCase):
         self.assertEqual(report['scope'],'static-assembly-only')
         self.assertNotEqual(report['source_sha256'],report['remote_source_sha256'])
         self.assertEqual([r['id'] for r in report['oracles']],[str(self.compiler),'local:gcc','local:clang'])
-        self.assertIn('wrapper targets are not pinned',report['oracles'][1]['identity_scope'])
+        for record in report['oracles']:
+            self.assertEqual(record['launcher_sha256'], hashlib.sha256(self.compiler.read_bytes()).hexdigest())
+            self.assertIn('wrapper targets are not pinned', record['identity_scope'])
         self.assertEqual(report['oracles'][1]['instructions'],2)
 
     def test_failed_remote_catalog_is_recorded_and_cannot_pass(self):
@@ -117,6 +120,17 @@ class OfflineCompare(unittest.TestCase):
             rc = self.compare(self.args('--oracles', '', '--local-ref', f'gcc={self.compiler}'))
         self.assertEqual(rc, 1)
         self.assertIn('source changed', json.loads(self.report.read_text())['oracles'][-1]['error'])
+
+    def test_primary_launcher_mutation_fails_closed(self):
+        original = godbolt._compile_local
+        def changing_primary(executable, source, flags):
+            lines = original(executable, source, flags)
+            Path(executable).write_text(FAKE + '# changed after primary compile\n')
+            return lines
+        with patch.object(godbolt, '_compile_local', side_effect=changing_primary):
+            rc = self.compare(self.args('--oracles', '', '--local-ref', f'gcc={self.compiler}'))
+        self.assertEqual(rc, 1)
+        self.assertFalse(self.report.exists())
 
     def test_ignored_option_and_bad_quote_fail_closed(self):
         for stderr in ("warning: argument unused during compilation: '-march=wrong'",

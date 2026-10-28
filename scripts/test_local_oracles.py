@@ -160,10 +160,14 @@ class LocalDispatchContract(unittest.TestCase):
 
     def test_compare_cli_dispatches_locally_and_records_identity(self):
         output = Path(self.temp.name) / 'manifest.json'
+        launcher = Path(self.temp.name) / 'lccc'
+        launcher.write_text('#!/bin/sh\necho fixture-compiler\n')
+        launcher.chmod(0o755)
         with patch.object(godbolt, '_compile_local', return_value=self.lines):
-            self.assertEqual(godbolt.main(['compare', str(self.source), '--local', '/fake/lccc',
+            self.assertEqual(godbolt.main(['compare', str(self.source), '--local', str(launcher),
                 '--oracles', 'icx2026.2', '--function', 'f', '--json', str(output)]), 0)
         manifest = json.loads(output.read_text())
+        self.assertEqual(len(manifest['oracles'][0]['launcher_sha256']), 64)
         self.assertEqual(manifest['oracles'][1]['binary_sha256'], 'a' * 64)
 
     def test_local_listing_is_discoverable_without_network_or_provisioning(self):

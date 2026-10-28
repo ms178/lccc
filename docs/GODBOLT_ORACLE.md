@@ -31,12 +31,14 @@ python3 scripts/godbolt.py compare kernel.c --function hot_loop --flags=-O2 \
     --artifact-dir /tmp/kernel-comparison
 ```
 
-A reference is checked for x86-64 LP64, a version line and an unchanged
-launcher; its SHA-256 identifies **only that launcher**, not any compiler or
-configuration a wrapper invokes. Retargeting/opaque flag channels and diagnosed
-ignored options are rejected. A changed source or launcher, missing reference
-or unavailable requested remote makes the result nonzero, even if some
-assembly was captured. Remote ICC and ICX remain separately requested oracles;
+The primary `--local` launcher and each explicit reference are version-probed,
+hashed and checked again after compilation. A reference is additionally checked
+for x86-64 LP64 and rejects retargeting/opaque flag channels. Each SHA-256
+identifies **only that launcher**, not any compiler, dynamic library or
+configuration a wrapper invokes; the primary target is not independently
+attested. Diagnosed ignored options are rejected. A changed source or launcher,
+missing reference or unavailable requested remote makes the result nonzero, even
+if some assembly was captured. Remote ICC and ICX remain separately requested oracles;
 not having network access does not turn them into measured results. Instruction
 counts are static observations, **not** correctness or runtime evidence.
 
