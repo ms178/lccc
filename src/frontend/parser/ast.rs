@@ -1701,6 +1701,9 @@ pub struct CompoundLiteralStorage {
     pub is_register: bool,
     pub is_thread_local: bool,
     pub is_const: bool,
+    /// `const` before the first star, distinct from the literal's top-level
+    /// constness (`(const P *){0}` for a pointer typedef `P`).
+    pub base_const: bool,
     /// `const` bits of the literal's pointer levels (bit `L-1` is pointer level
     /// `L`), the same encoding as [`CastQualifiers::pointer_const_levels`].
     /// A compound literal is an lvalue, so `*((int *const *){0}) = 0` modifies

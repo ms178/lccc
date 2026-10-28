@@ -513,8 +513,11 @@ impl SemanticAnalyzer {
             is_noreturn: func.attrs.is_noreturn(),
             return_base_const: self
                 .resolve_return_base_const(&func.return_type, func.return_base_const),
-            return_pointer_const_levels: self
-                .combine_return_const_levels(&func.return_type, func.return_pointer_const_levels),
+            return_pointer_const_levels: self.combine_return_const_levels(
+                &func.return_type,
+                func.return_base_const,
+                func.return_pointer_const_levels,
+            ),
         };
         // A block-scope prototype may precede the definition and carry facts the
         // definition does not repeat; `noreturn` is one of them. The file-scope
@@ -591,7 +594,8 @@ impl SemanticAnalyzer {
                 {
                     // Levels inherited from a typedef the parameter is built on
                     // come first: they are closer to the base type.
-                    let mut pointer_quals = self.base_typedef_pointer_quals(&param.type_spec);
+                    let mut pointer_quals =
+                        self.base_typedef_pointer_quals(&param.type_spec, param.is_const);
                     pointer_quals.extend(param.pointer_quals.iter().copied());
                     if !pointer_quals.is_empty() {
                         self.symbol_table.mark_pointer_quals(name, pointer_quals);
@@ -665,9 +669,11 @@ impl SemanticAnalyzer {
             return_base_const: self
                 .resolve_return_base_const(&func.return_type, func.return_base_const)
                 || prior_base_const,
-            return_pointer_const_levels: self
-                .combine_return_const_levels(&func.return_type, func.return_pointer_const_levels)
-                | prior_levels,
+            return_pointer_const_levels: self.combine_return_const_levels(
+                &func.return_type,
+                func.return_base_const,
+                func.return_pointer_const_levels,
+            ) | prior_levels,
         };
         let func_ctype = CType::Function(Box::new(func_info.call_type()));
 
@@ -738,7 +744,8 @@ impl SemanticAnalyzer {
                 {
                     // Levels inherited from a typedef the parameter is built on
                     // come first: they are closer to the base type.
-                    let mut pointer_quals = self.base_typedef_pointer_quals(&param.type_spec);
+                    let mut pointer_quals =
+                        self.base_typedef_pointer_quals(&param.type_spec, param.is_const);
                     pointer_quals.extend(param.pointer_quals.iter().copied());
                     if !pointer_quals.is_empty() {
                         self.symbol_table.mark_pointer_quals(name, pointer_quals);
@@ -1150,7 +1157,8 @@ impl SemanticAnalyzer {
                 // violation (C11 6.5.16p1). Levels inherited from a typedef the
                 // alias is built on come first (they are closer to the base).
                 let typedef_quals = {
-                    let mut quals = self.base_typedef_pointer_quals(&decl.type_spec);
+                    let mut quals =
+                        self.base_typedef_pointer_quals(&decl.type_spec, decl.is_const());
                     quals.extend(type_builder::declarator_pointer_quals(&declarator.derived));
                     quals
                 };
@@ -1368,6 +1376,7 @@ impl SemanticAnalyzer {
                                         return_pointer_const_levels: self
                                             .combine_return_const_levels(
                                                 &decl.type_spec,
+                                                decl.is_const(),
                                                 declarator_return_const_levels(
                                                     &init_decl.derived,
                                                     &ft.return_type,
@@ -1410,6 +1419,7 @@ impl SemanticAnalyzer {
                     self.resolve_return_base_const(&decl.type_spec, decl.is_const());
                 let return_levels = self.combine_return_const_levels(
                     &decl.type_spec,
+                    decl.is_const(),
                     declarator_return_const_levels(&init_decl.derived, &ft.return_type),
                 );
                 if let Some(existing) = self.result.functions.get_mut(&init_decl.name) {
@@ -1561,7 +1571,8 @@ impl SemanticAnalyzer {
             // are erased from `CType`, so the read-only check reads them from
             // the symbol table. Recorded in CType creation order.
             if is_object {
-                let mut pointer_quals = self.base_typedef_pointer_quals(&decl.type_spec);
+                let mut pointer_quals =
+                    self.base_typedef_pointer_quals(&decl.type_spec, decl.is_const());
                 pointer_quals.extend(type_builder::declarator_pointer_quals(&init_decl.derived));
                 if !pointer_quals.is_empty() {
                     self.symbol_table
@@ -6914,12 +6925,24 @@ dereference it before applying '->' to it?"
                     type_align,
                     is_packed: f.is_packed,
                     base_volatile: f.base_volatile,
-                    base_const: f.base_const,
+                    base_const: self.decl_const_base(&f.type_spec, f.base_const),
                     object_volatile: f.object_volatile,
-                    object_const: f.object_const,
+                    object_const: f.object_const
+                        || ({
+                            let mut element = &f.type_spec;
+                            while let TypeSpecifier::Array(inner, _) = element {
+                                element = inner;
+                            }
+                            matches!(element, TypeSpecifier::TypedefName(_))
+                                && !f
+                                    .derived
+                                    .iter()
+                                    .any(|d| matches!(d, DerivedDeclarator::Pointer(..)))
+                                && self.base_typedef_is_top_const(&f.type_spec)
+                        }),
                     counted_by: f.counted_by.clone(),
                     pointer_quals: {
-                        let mut quals = self.base_typedef_pointer_quals(&f.type_spec);
+                        let mut quals = self.base_typedef_pointer_quals(&f.type_spec, f.base_const);
                         quals.extend(type_builder::declarator_pointer_quals(&f.derived));
                         quals
                     },
@@ -7686,13 +7709,29 @@ dereference it before applying '->' to it?"
         let lookup = self.expr_type_checker();
         let base_ts = crate::common::qualifiers::base_specifier(ts);
         let base = match base_ts {
-            TypeSpecifier::TypedefName(name) => name.clone(),
+            TypeSpecifier::TypedefName(name) => {
+                match self.result.type_context.typedefs.get(name) {
+                    // GCC expands a pointer alias when rendering its stars,
+                    // rather than appending those stars to the alias name.
+                    Some(ty)
+                        if crate::common::qualifiers::typedef_const_pointer_level(ty).is_some() =>
+                    {
+                        let mut base = ty;
+                        while let CType::Pointer(inner, _) | CType::Array(inner, _) = base {
+                            base = inner;
+                        }
+                        gcc_format_type_name(base)
+                    }
+                    _ => name.clone(),
+                }
+            }
             other => gcc_format_type_name(&self.type_spec_to_ctype(other)),
         };
         let base_const =
             crate::common::qualifiers::type_name_const_base(ts, quals.base_const, &lookup);
         let stars = indirection_depth_of(Some(&self.type_spec_to_ctype(ts)));
-        let mut levels = const_levels_to_cvr(quals.pointer_const_levels);
+        let mut levels = self.base_typedef_pointer_quals(ts, quals.base_const);
+        levels.extend(const_levels_to_cvr(quals.pointer_const_levels));
         levels.resize(stars, 0);
         self.gcc_pointer_type_text(&base, base_const, quals.pointee_volatile, &levels)
     }
@@ -8173,15 +8212,17 @@ dereference it before applying '->' to it?"
                 Expr::PointerMemberAccess(base, field, _) => {
                     self.member_pointer_quals(base, field, true)
                 }
-                // A cast type name keeps its own per-level `const`
-                // (`*(int *const *)p = 0`); `CType` cannot carry it.
-                Expr::Cast(_, _, _, quals) if quals.pointer_const_levels != 0 => {
-                    Some(const_levels_to_cvr(quals.pointer_const_levels))
+                // A cast or compound literal can inherit pointer levels from
+                // an alias as well as spelling them on its own declarator.
+                Expr::Cast(ts, _, _, quals) => {
+                    let mut levels = self.base_typedef_pointer_quals(ts, quals.base_const);
+                    levels.extend(const_levels_to_cvr(quals.pointer_const_levels));
+                    Some(levels)
                 }
-                // A compound literal of such a type is an lvalue and records
-                // its levels the same way (`*((int *const *){0}) = 0`).
-                Expr::CompoundLiteral(_, _, _, storage) if storage.pointer_const_levels != 0 => {
-                    Some(const_levels_to_cvr(storage.pointer_const_levels))
+                Expr::CompoundLiteral(ts, _, _, storage) => {
+                    let mut levels = self.base_typedef_pointer_quals(ts, storage.base_const);
+                    levels.extend(const_levels_to_cvr(storage.pointer_const_levels));
+                    Some(levels)
                 }
                 // A function's return type keeps its own level qualifiers
                 // (`int *const *g(void)`), so `*g() = 0` is a modification of a
@@ -8197,6 +8238,18 @@ dereference it before applying '->' to it?"
                 _ => None,
             };
             if let Some(levels) = levels {
+                // An array behind a pointer counts as an indirection but not
+                // as a qualifier-bearing pointer level. Walking the actual
+                // type avoids shifting levels for e.g. `int *(*const P)[2]`.
+                if let Some(level) = tc
+                    .infer_expr_ctype(root)
+                    .as_ref()
+                    .and_then(|ty| pointer_level_after_indirections(ty, derefs + 1))
+                {
+                    return levels
+                        .get(level)
+                        .is_some_and(|&cvr| crate::frontend::parser::ast::cvr_is_const(cvr));
+                }
                 // `root` has a `depth`-level pointer type, so `*root` names the
                 // object of level `depth - 1` and every further dereference
                 // drops one level; level 0 is the base object.
@@ -8494,8 +8547,13 @@ dereference it before applying '->' to it?"
         )
     }
 
-    fn combine_return_const_levels(&self, type_spec: &TypeSpecifier, declarator: u32) -> u32 {
-        let prefix = self.base_typedef_pointer_quals(type_spec);
+    fn combine_return_const_levels(
+        &self,
+        type_spec: &TypeSpecifier,
+        explicit: bool,
+        declarator: u32,
+    ) -> u32 {
+        let prefix = self.base_typedef_pointer_quals(type_spec, explicit);
         let prefix_mask = prefix.iter().enumerate().fold(0u32, |mask, (level, cvr)| {
             if level < 32 && crate::frontend::parser::ast::cvr_is_const(*cvr) {
                 mask | (1 << level)
@@ -8530,7 +8588,7 @@ dereference it before applying '->' to it?"
     /// Per-level pointer qualifiers inherited from the typedef named by
     /// `type_spec` (empty for any other base). An alias keeps the qualifiers of
     /// the type it names, so a declaration built on it starts with them.
-    fn base_typedef_pointer_quals(&self, type_spec: &TypeSpecifier) -> Vec<u8> {
+    fn base_typedef_pointer_quals(&self, type_spec: &TypeSpecifier, explicit: bool) -> Vec<u8> {
         // The type name may already be wrapped in pointers/arrays (the parser
         // folds a simple declarator into the specifier), so follow the shape
         // down to the leaf that carries the name.
@@ -8545,15 +8603,27 @@ dereference it before applying '->' to it?"
                 _ => break,
             }
         }
-        match leaf {
-            TypeSpecifier::TypedefName(name) => self
-                .result
-                .type_context
-                .typedef_pointer_quals(name)
-                .map(<[u8]>::to_vec)
-                .unwrap_or_default(),
-            _ => Vec::new(),
+        let TypeSpecifier::TypedefName(name) = leaf else {
+            return Vec::new();
+        };
+        let types = &self.result.type_context;
+        let mut quals = types
+            .typedef_pointer_quals(name)
+            .map(<[u8]>::to_vec)
+            .unwrap_or_default();
+        if let Some(level) = types
+            .typedefs
+            .get(name)
+            .and_then(crate::common::qualifiers::typedef_const_pointer_level)
+        {
+            // Unqualified typedef levels still occupy positions. Without
+            // padding, the first explicit star's qualifiers shift inward.
+            quals.resize(quals.len().max(level + 1), 0);
+            if explicit {
+                quals[level] |= crate::frontend::parser::ast::CVR_CONST;
+            }
         }
+        quals
     }
 
     fn decl_const_base(&self, type_spec: &TypeSpecifier, explicit: bool) -> bool {
@@ -10381,6 +10451,33 @@ mod kr_prototype_tests {
     }
 
     #[test]
+    fn qualified_pointer_typedefs_preserve_their_own_level() {
+        for bad in [
+            "typedef int *P; void f(const P *p) { *p = 0; }",
+            "typedef int *P; typedef const P CP; void f(CP *p) { *p = 0; }",
+            "typedef int *P; void f(P *const *p) { *p = 0; }",
+            "typedef int *P; void f(void) { *(const P *){0} = 0; }",
+            "typedef int *(*P)[2]; void f(const P *p) { *p = 0; }",
+            "typedef int *P; const P *g(void); void f(void) { *g() = 0; }",
+            "typedef int *P; struct S { const P *p; }; void f(struct S *s) { *s->p = 0; }",
+        ] {
+            assert!(analyze(bad).1.is_err(), "{bad}");
+        }
+        for good in [
+            "typedef int *P; void f(const P p) { *p = 1; }",
+            "typedef int *P; void f(const P *p) { **p = 1; }",
+            "typedef int *P; typedef const P CP; void f(CP p) { *p = 1; }",
+            "typedef int *P; void f(P *const *p) { **p = 0; }",
+            "typedef int *P; void f(void) { **(const P *){0} = 1; }",
+            "typedef int *(*P)[2]; void f(const P p) { p[0][0] = 0; }",
+            "typedef int *P; const P *g(void); void f(void) { **g() = 1; }",
+            "typedef int *P; struct S { const P *p; }; void f(struct S *s) { **s->p = 1; }",
+        ] {
+            assert!(analyze(good).1.is_ok(), "{good}");
+        }
+    }
+
+    #[test]
     fn real_prototypes_keep_pointer_constraints() {
         assert!(
             analyze("int typed(short *); int use(void) { short a[2]; return typed(&a); }")
@@ -10557,6 +10654,19 @@ fn const_levels_to_cvr(mask: u32) -> Vec<u8> {
             }
         })
         .collect()
+}
+
+/// If consuming `indirections` from `ty` reaches a pointer, return its
+/// zero-based qualifier level. Arrays consume indirections, but unlike
+/// pointers they have no entry in a declarator's pointer-qualifier vector.
+fn pointer_level_after_indirections(mut ty: &CType, indirections: usize) -> Option<usize> {
+    for _ in 0..indirections {
+        ty = match ty {
+            CType::Pointer(inner, _) | CType::Array(inner, _) => inner,
+            _ => return None,
+        };
+    }
+    crate::common::qualifiers::typedef_const_pointer_level(ty)
 }
 
 /// Number of consecutive pointer levels in `ty` (0 for anything that is not a

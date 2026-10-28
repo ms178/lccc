@@ -69,6 +69,13 @@ impl qualifiers::ConstLookup for Lowerer {
         self.types.const_base_typedefs.contains(name)
     }
 
+    fn typedef_const_pointer_level(&self, name: &str) -> Option<usize> {
+        self.types
+            .typedefs
+            .get(name)
+            .and_then(qualifiers::typedef_const_pointer_level)
+    }
+
     fn is_pointer(&self, expr: &Expr) -> bool {
         matches!(
             self.get_expr_ctype(expr),

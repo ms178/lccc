@@ -408,7 +408,11 @@ impl Lowerer {
                         type_align,
                         is_packed: f.is_packed,
                         base_volatile: f.base_volatile,
-                        base_const: f.base_const,
+                        base_const: crate::common::qualifiers::type_name_const_base(
+                            &f.type_spec,
+                            f.base_const,
+                            self,
+                        ),
                         object_volatile: f.object_volatile,
                         object_const: f.object_const,
                         counted_by: f.counted_by.clone(),
