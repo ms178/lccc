@@ -1592,6 +1592,17 @@ fn peephole_optimize_inner(
                 changed |= c;
             }
         }
+        if !sk("shift_signext") {
+            let c = local_patterns::fold_copy_logical_shift_signext(&mut store, &mut infos);
+            trace(
+                "fold_copy_logical_shift_signext",
+                pass_count,
+                c,
+                &store,
+                &infos,
+            );
+            changed |= c;
+        }
         if !sk("xor_move_fold") {
             {
                 let c = local_patterns::fold_zero_extended_xor_moves(&mut store, &mut infos);

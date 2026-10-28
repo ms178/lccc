@@ -445,6 +445,12 @@ fn zlib_decompress_inner(data: &[u8], expected: usize) -> Result<Vec<u8>, Error>
     if adler32(&out) != want {
         return Err("Adler-32 checksum mismatch");
     }
+    // An ELF compressed section contains exactly one zlib stream. `bytes`
+    // rewinds lookahead, so pos is the exact end of the Adler trailer; any
+    // remainder is malformed input, not padding (BFD rejects it as well).
+    if bits.pos != bits.data.len() {
+        return Err("trailing data after zlib stream");
+    }
     Ok(out)
 }
 
@@ -656,6 +662,17 @@ mod tests {
         let mut bad = fixed;
         bad[12] ^= 1;
         assert!(zlib_decompress(&bad, 15).unwrap_err().contains("Adler-32"));
+        // Neither zero nor non-zero bytes may follow the one stream in an
+        // ELF section. Lookahead must not hide either from the end check.
+        for trailing in [0, b'Z'] {
+            let mut bad = FIXED.to_vec();
+            bad.push(trailing);
+            assert!(
+                zlib_decompress(&bad, 15)
+                    .unwrap_err()
+                    .contains("trailing data")
+            );
+        }
         assert!(zlib_decompress(&fixed[..8], 15).is_err());
         assert!(zlib_decompress(&[0x78, 0x00], 0).is_err());
         assert!(zlib_decompress(&[], 0).is_err());

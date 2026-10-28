@@ -143,8 +143,9 @@ mkdir -p "$work"
 cd "$work" || exit 1
 
 # The archive NAME apt would use for each package, resolved without a download.
-# `--print-uris` prints "<uri> <hash> <size> <filename>" per package; the
-# filename is the last field.
+# `--print-uris` prints "'<uri>' <filename> <size> SHA256:<digest>" per package.
+# Taking the last field selects the digest, misses every cached archive and
+# downloads the same package again into the work directory.
 apt_opts=(
     -o Acquire::http::Timeout=15
     -o Acquire::https::Timeout=15
@@ -152,7 +153,7 @@ apt_opts=(
 )
 archive_name() {  # archive_name <package> -> basename, or empty
     apt-get "${apt_opts[@]}" download --print-uris "$1" 2>/dev/null \
-        | awk 'NR == 1 { print $NF }' \
+        | awk 'NR == 1 { print $2 }' \
         | sed -e "s/^'//" -e "s/'$//" -e 's|.*/||'
 }
 
@@ -231,11 +232,34 @@ fi
 # Rebuild it after grafting /usr; otherwise an `as --version` probe succeeds
 # only on machines where every library happens to be in a built-in search dir.
 loader_cache_failed=0
-if have ldconfig; then
+# Minimal root/agent environments often omit /sbin and /usr/sbin from PATH.
+# Discovery must not report a missing tool when the standard absolute binary
+# is present and sudo can execute it (the earlier PATH-only check did exactly
+# that after successfully unpacking every cross package).
+# The search roots are overridable so a test can exercise this discovery
+# without touching /sbin; production always uses the standard two.
+CROSS_SBIN_DIRS=("${CROSS_SBIN_DIR:-/sbin}" "${CROSS_USR_SBIN_DIR:-/usr/sbin}")
+
+find_ldconfig() {  # -> absolute path on stdout, empty when the host has none
+    local found dir
+    found=$(command -v ldconfig 2>/dev/null || true)
+    if [[ -z $found ]]; then
+        for dir in "${CROSS_SBIN_DIRS[@]}"; do
+            if [[ -x $dir/ldconfig ]]; then
+                found=$dir/ldconfig
+                break
+            fi
+        done
+    fi
+    printf '%s' "$found"
+}
+
+ldconfig_bin=$(find_ldconfig)
+if [[ -n $ldconfig_bin ]]; then
     if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
-        ldconfig || loader_cache_failed=1
+        "$ldconfig_bin" || loader_cache_failed=1
     elif have sudo; then
-        sudo -n ldconfig || loader_cache_failed=1
+        sudo -n "$ldconfig_bin" || loader_cache_failed=1
     else
         echo "[cross] ERROR: ldconfig needs root after dpkg -x cross-toolchain restore" >&2
         loader_cache_failed=1

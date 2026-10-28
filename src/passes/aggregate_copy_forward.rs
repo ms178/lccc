@@ -737,6 +737,15 @@ fn forward_store_only_temporaries(
         copies.remove(&root);
     }
 
+    // A destination value with position-dependent definitions has no single
+    // address that can dominate every redirected construction.  In
+    // particular, a redefine between the first root GEP and first store is
+    // outside the destination-liveness window but changes the eventual copy
+    // destination.  Reject the candidate rather than guessing which
+    // definition each rewritten use would observe.
+    let multi_def = super::gvn::find_multi_def_values(func);
+    copies.retain(|_, (_, _, dest)| !multi_def.contains(&dest.0));
+
     // A candidate must have at least one write that this analysis can
     // attribute to its root. Loop pointer promotion can replace a precise GEP
     // with a marching phi that `pointer_paths` intentionally cannot prove;
@@ -904,7 +913,7 @@ fn forward_store_only_temporaries(
                 let Some((root, _)) = paths.get(&value) else {
                     continue;
                 };
-                let Some((copy_b, copy_i, _)) = copies.get(root) else {
+                let Some((copy_b, copy_i, dest)) = copies.get(root) else {
                     continue;
                 };
                 let copy_size = copy_sizes.get(root).copied().unwrap_or(0);
@@ -946,9 +955,23 @@ fn forward_store_only_temporaries(
                     _ => false,
                 };
                 let path_merge = matches!(inst, Instruction::Copy { .. } | Instruction::Phi { .. });
+                // The rewrite below only edits the memcpy block.  A path
+                // merge anywhere else would keep using the old root after
+                // the copy was deleted, even with an entry-defined final
+                // destination.  Phi inputs in this block additionally execute
+                // on predecessor edges, so their destination must be defined
+                // on entry rather than merely earlier in the block.
+                let destination_entry_available = def_site
+                    .get(&dest.0)
+                    .is_none_or(|(definition_block, _)| *definition_block == 0);
+                let needs_entry_destination = matches!(inst, Instruction::Phi { .. });
                 let ordered = path_merge || ii <= *copy_i;
-                let located = path_merge || bi == *copy_b;
-                if !allowed || !located || !ordered {
+                let located = bi == *copy_b;
+                if (needs_entry_destination && !destination_entry_available)
+                    || !allowed
+                    || !located
+                    || !ordered
+                {
                     invalid.insert(*root);
                 }
             }
@@ -1708,6 +1731,158 @@ mod tests {
             ],
             terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
         });
+        assert_eq!(forward_store_only_temporaries(&mut func, None), 0);
+    }
+
+    #[test]
+    fn store_forwarding_rejects_destination_redefined_before_first_store() {
+        // The first destination definition dominates the first root use, but
+        // the second one determines the eventual memcpy destination.  A GEP
+        // rewritten before that second definition would still name A while
+        // the deleted copy names B.  The destination-liveness window starts
+        // at the first store and therefore cannot see this earlier redefine.
+        let mut func = IrFunction::new("redefined_destination".into(), IrType::I32, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            source_spans: vec![],
+            instructions: vec![
+                Instruction::GlobalAddr {
+                    dest: Value(1),
+                    name: "a".into(),
+                },
+                alloca(0, 4),
+                Instruction::GetElementPtr {
+                    dest: Value(2),
+                    base: Value(0),
+                    offset: Operand::Const(IrConst::I64(0)),
+                    ty: IrType::I32,
+                },
+                Instruction::GlobalAddr {
+                    dest: Value(1),
+                    name: "b".into(),
+                },
+                Instruction::Store {
+                    volatile: false,
+                    ptr: Value(2),
+                    val: Operand::Const(IrConst::I32(42)),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
+                Instruction::Memcpy {
+                    dest: Value(1),
+                    src: Value(0),
+                    size: 4,
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+        });
+        assert_eq!(forward_store_only_temporaries(&mut func, None), 0);
+    }
+
+    #[test]
+    fn store_forwarding_rejects_cross_block_copy_before_local_destination_definition() {
+        // entry -> pointer copy -> construction/copy is a valid original CFG.
+        // Replacing the pointer copy's root with a destination defined only in
+        // the final block would create a use-before-def on that earlier edge.
+        let mut func =
+            IrFunction::new("cross_block_destination".into(), IrType::I32, vec![], false);
+        func.blocks = vec![
+            BasicBlock {
+                label: BlockId(0),
+                source_spans: vec![],
+                instructions: vec![alloca(0, 4)],
+                terminator: Terminator::Branch(BlockId(2)),
+            },
+            BasicBlock {
+                label: BlockId(2),
+                source_spans: vec![],
+                instructions: vec![Instruction::Copy {
+                    dest: Value(2),
+                    src: Operand::Value(Value(0)),
+                }],
+                terminator: Terminator::Branch(BlockId(1)),
+            },
+            BasicBlock {
+                label: BlockId(1),
+                source_spans: vec![],
+                instructions: vec![
+                    Instruction::GlobalAddr {
+                        dest: Value(1),
+                        name: "out".into(),
+                    },
+                    Instruction::Store {
+                        volatile: false,
+                        ptr: Value(2),
+                        val: Operand::Const(IrConst::I32(42)),
+                        ty: IrType::I32,
+                        seg_override: AddressSpace::Default,
+                    },
+                    Instruction::Memcpy {
+                        dest: Value(1),
+                        src: Value(0),
+                        size: 4,
+                    },
+                ],
+                terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+            },
+        ];
+        assert_eq!(forward_store_only_temporaries(&mut func, None), 0);
+    }
+
+    #[test]
+    fn store_forwarding_rejects_cross_block_pointer_copy_with_entry_destination() {
+        // Entry-defined destinations pass the dominance guard, but the
+        // rewrite below only edits the memcpy block.  Accepting this earlier
+        // pointer copy would therefore delete the final memcpy while the
+        // store still writes through a pointer to the unconstructed alloca.
+        let mut func = IrFunction::new(
+            "cross_block_pointer_copy".into(),
+            IrType::I32,
+            vec![],
+            false,
+        );
+        func.blocks = vec![
+            BasicBlock {
+                label: BlockId(0),
+                source_spans: vec![],
+                instructions: vec![
+                    Instruction::GlobalAddr {
+                        dest: Value(1),
+                        name: "out".into(),
+                    },
+                    alloca(0, 4),
+                ],
+                terminator: Terminator::Branch(BlockId(2)),
+            },
+            BasicBlock {
+                label: BlockId(2),
+                source_spans: vec![],
+                instructions: vec![Instruction::Copy {
+                    dest: Value(2),
+                    src: Operand::Value(Value(0)),
+                }],
+                terminator: Terminator::Branch(BlockId(1)),
+            },
+            BasicBlock {
+                label: BlockId(1),
+                source_spans: vec![],
+                instructions: vec![
+                    Instruction::Store {
+                        volatile: false,
+                        ptr: Value(2),
+                        val: Operand::Const(IrConst::I32(42)),
+                        ty: IrType::I32,
+                        seg_override: AddressSpace::Default,
+                    },
+                    Instruction::Memcpy {
+                        dest: Value(1),
+                        src: Value(0),
+                        size: 4,
+                    },
+                ],
+                terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+            },
+        ];
         assert_eq!(forward_store_only_temporaries(&mut func, None), 0);
     }
 
