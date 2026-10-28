@@ -19,9 +19,11 @@ use super::helpers::*;
 ///
 /// The unknown→CLEAR-ALL rule is what makes the pass safe against any future
 /// instruction: a missed opportunity is cheap, a false claim is a miscompile.
-pub(super) fn eliminate_redundant_self_zext(store: &LineStore, infos: &mut [LineInfo]) -> bool {
+pub(super) fn eliminate_redundant_self_zext(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
     let mut changed = false;
+    // (self-zext line, destination family) deferred to the rewrite phase.
+    let mut self_zext_candidates: Vec<(usize, u8)> = Vec::new();
     // zero_upper[family] = upper 32 bits provably zero.
     let mut zero_upper = [false; 16];
     // Caller-saved GP families: rax,rcx,rdx,rsi,rdi,r8,r9,r10,r11.
@@ -151,6 +153,16 @@ pub(super) fn eliminate_redundant_self_zext(store: &LineStore, infos: &mut [Line
                     // for every mnemonic it lists, and clearing is the
                     // conservative answer for each family in it.
                     clear_families(&mut zero_upper, implicit_write_refs(t.as_bytes()));
+                    // ...but a 32-bit implicit write ESTABLISHES the fact for
+                    // the register it writes: `divl %r` leaves the quotient in
+                    // %eax and the remainder in %edx, and the architectural
+                    // 32-bit write zeroes each register's upper half. The
+                    // table above is deliberately a MAY-clear set, so without
+                    // this the `movl %eax, %eax` that widens a division result
+                    // for its 64-bit consumer survives as a no-op.
+                    for fam in implicit_written_families(mnem, t) {
+                        zero_upper[fam] = true;
+                    }
                     zero_upper[dest_reg as usize] = if mnem == "cdq" || mnem == "cltd" {
                         // The classifier names the primary destination %rax,
                         // the INPUT; the real 32-bit write is %edx.
@@ -178,6 +190,15 @@ pub(super) fn eliminate_redundant_self_zext(store: &LineStore, infos: &mut [Line
                 if is_redundant_self_zext {
                     mark_nop(&mut infos[i]);
                     changed = true;
+                    i += 1;
+                    continue;
+                }
+                // A self-zext that survives the redundancy test may still
+                // have a one-instruction form: the note is recorded here and
+                // rewritten after the scan, once no line borrow is outstanding
+                // (the `t`/`mnem` slices above borrow the store).
+                if t.starts_with("movl ") && dest_reg <= 15 {
+                    self_zext_candidates.push((i, dest_reg));
                 }
                 i += 1;
             }
@@ -187,7 +208,96 @@ pub(super) fn eliminate_redundant_self_zext(store: &LineStore, infos: &mut [Line
             }
         }
     }
+    // Rewrite phase: no line borrow is live here, so the store can be edited.
+    // A `movd` establishes the same fact a 32-bit destination write does, so
+    // the next fixpoint iteration of this pass sees it and continues from
+    // there; nothing here depends on `zero_upper` being updated in place.
+    for (i, dest_reg) in self_zext_candidates {
+        if infos[i].is_nop() {
+            continue;
+        }
+        if let Some(replacement) = xmm_bitcast_self_zext(store, infos, i, dest_reg) {
+            replace_line(store, &mut infos[i - 1], i - 1, replacement);
+            mark_nop(&mut infos[i]);
+            changed = true;
+        }
+    }
+
     changed
+}
+
+/// The `movd`/`vmovd` that replaces `movq %xmmN, %rX` when the line at `i` is
+/// the self-zext `movl %eX, %eX` of that same `%rX`.
+///
+/// Returns `None` unless the previous *live* line is exactly that `movq`, the
+/// two lines are adjacent, both are editable, and the destination families
+/// agree. The VEX spelling is preserved: rewriting a `vmovq` to a legacy
+/// `movd` inside VEX-encoded code would pay the SSE/AVX transition penalty the
+/// emitter avoided, and `vmovd` does the same zero-extending GPR write.
+fn xmm_bitcast_self_zext(
+    store: &LineStore,
+    infos: &[LineInfo],
+    i: usize,
+    dest_reg: u8,
+) -> Option<String> {
+    if i == 0 || infos[i].pinned || infos[i - 1].pinned {
+        return None;
+    }
+    let prev = infos[i - 1];
+    if prev.is_nop() || prev.kind == LineKind::Empty {
+        return None;
+    }
+    let text = prev.trimmed(store.get(i - 1));
+    // `vmovq` is written by the AVX path; `movd`/`vmovd` already copy only the
+    // low half, so there is nothing to fuse.
+    let (mnem, rest, fused) = if let Some(r) = text.strip_prefix("vmovq ") {
+        ("vmovq", r, "vmovd")
+    } else if let Some(r) = text.strip_prefix("movq ") {
+        ("movq", r, "movd")
+    } else {
+        return None;
+    };
+    let (src, dst) = rest.split_once(',')?;
+    let (src, dst) = (src.trim(), dst.trim());
+    if !src.starts_with("%xmm") || !dst.starts_with("%r") {
+        return None;
+    }
+    // The GPR must be the one the self-zext widens, and the self-zext must
+    // name the same family on both sides (otherwise it is a real move).
+    if register_family_fast(dst) != dest_reg {
+        return None;
+    }
+    let self_zext = infos[i].trimmed(store.get(i));
+    let (a, b) = self_zext["movl ".len()..].split_once(',')?;
+    if register_family_fast(a.trim()) != register_family_fast(b.trim()) {
+        return None;
+    }
+    let _ = mnem;
+    Some(format!(
+        "    {fused} {src}, {}",
+        REG_NAMES[1][dest_reg as usize]
+    ))
+}
+
+/// Register families whose implicit write by `mnem` is exactly 32 bits wide,
+/// so the write leaves the family's upper 32 bits zero.
+///
+/// Restricted to the spellings the emitter actually produces, and only to the
+/// `l` (32-bit) forms: `divq %r` writes a 64-bit %rax, and the suffix-less
+/// `div`/`mul` aliases are ambiguous without the operand. `cltq`/`cdqe` are
+/// excluded on purpose -- they sign-extend into a full 64-bit %rax, the exact
+/// opposite of this property.
+fn implicit_written_families(mnem: &str, t: &str) -> Vec<usize> {
+    const RAX: usize = 0;
+    const RDX: usize = 2;
+    match mnem {
+        // Widening multiplies and divides: %edx:%eax both receive 32 bits.
+        "mull" | "divl" | "idivl" => vec![RAX, RDX],
+        // Single-operand `imull` is the widening form; the two- and
+        // three-operand forms write only their explicit destination.
+        "imull" if !t.contains(',') => vec![RAX, RDX],
+        _ => Vec::new(),
+    }
 }
 
 /// The explicit AT&T destination: the operand after the last comma, or the
@@ -240,14 +350,121 @@ mod tests {
 
     /// Runs the pass; returns how many `movl %R, %R` lines survive.
     fn survivors(asm: &str, self_zext: &str) -> usize {
-        let store = LineStore::new(asm.to_string());
+        let mut store = LineStore::new(asm.to_string());
         let mut infos: Vec<_> = (0..store.len())
             .map(|i| classify_line(store.get(i)))
             .collect();
-        eliminate_redundant_self_zext(&store, &mut infos);
+        eliminate_redundant_self_zext(&mut store, &mut infos);
         (0..store.len())
             .filter(|&i| !infos[i].is_nop() && store.get(i).trim() == self_zext)
             .count()
+    }
+
+    /// A 32-bit implicit write establishes the fact. `divl`/`mull` leave
+    /// %eax and %edx each written 32 bits wide, so the self-zext the emitter
+    /// adds to widen a division result for a 64-bit consumer is a no-op.
+    /// The `q` forms must NOT be treated this way: `divq` writes a full
+    /// 64-bit %rax, so the same self-zext really does zero the upper half.
+    #[test]
+    fn implicit_32_bit_writes_establish_the_fact() {
+        let cases = [
+            ("divl %edi", "movl %eax, %eax"),
+            ("idivl %edi", "movl %eax, %eax"),
+            ("mull %edi", "movl %eax, %eax"),
+            ("imull %edi", "movl %eax, %eax"),
+            ("divl %edi", "movl %edx, %edx"),
+            ("mull %edi", "movl %edx, %edx"),
+        ];
+        for (writer, self_zext) in cases {
+            let asm = format!("    {writer}\n    {self_zext}\n");
+            assert_eq!(survivors(&asm, self_zext), 0, "after `{writer}`");
+        }
+        // 64-bit forms and the explicit-destination forms keep the extension.
+        for (writer, self_zext) in [
+            ("divq %rdi", "movl %eax, %eax"),
+            ("divq %rdi", "movl %edx, %edx"),
+            ("imull %edi, %eax", "movl %eax, %eax"),
+            ("mulq %rdi", "movl %eax, %eax"),
+            // `cltq` sign-extends into a full 64-bit %rax.
+            ("cltq", "movl %eax, %eax"),
+        ] {
+            let asm = format!(
+                "    movl %esi, %eax\n    movl %esi, %edx\n    {writer}\n    {self_zext}\n"
+            );
+            assert_eq!(survivors(&asm, self_zext), 1, "after `{writer}`");
+        }
+    }
+
+    /// `movq %xmmN, %rX` + `movl %eX, %eX` is the float-bit-cast widening
+    /// pair; `movd %xmmN, %eX` is the same architectural state in one
+    /// instruction. Returns the surviving text of both lines.
+    fn fuse(asm: &str) -> Vec<String> {
+        let mut store = LineStore::new(asm.to_string());
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        eliminate_redundant_self_zext(&mut store, &mut infos);
+        (0..store.len())
+            .filter(|&i| !infos[i].is_nop() && !store.get(i).trim().is_empty())
+            .map(|i| store.get(i).trim().to_string())
+            .filter(|l| !l.starts_with('.'))
+            .collect()
+    }
+
+    #[test]
+    fn xmm_bitcast_self_zext_fuses_to_movd() {
+        assert_eq!(
+            fuse(
+                "    movss (%rbx), %xmm9\n    movq %xmm9, %rax\n    movl %eax, %eax\n    xorq %rax, %r11\n"
+            ),
+            vec!["movss (%rbx), %xmm9", "movd %xmm9, %eax", "xorq %rax, %r11"]
+        );
+        // The VEX spelling is preserved: a legacy `movd` inside VEX code pays
+        // the SSE/AVX transition penalty the emitter avoided.
+        assert_eq!(
+            fuse("    vmovq %xmm3, %rcx\n    movl %ecx, %ecx\n"),
+            vec!["vmovd %xmm3, %ecx"]
+        );
+    }
+
+    /// Every refusal the fusion must make. Each case leaves BOTH lines intact
+    /// (the pair is never half-applied) and the surviving text equals the
+    /// input's live lines.
+    #[test]
+    fn xmm_bitcast_fusion_refuses_what_it_cannot_prove() {
+        let refused = [
+            // not adjacent
+            "    movq %xmm9, %rax\n    xorl %r10d, %r10d\n    movl %eax, %eax\n",
+            // the self-zext widens a DIFFERENT register
+            "    movq %xmm9, %rax\n    movl %ecx, %ecx\n",
+            // a real move, not a self-zext
+            "    movq %xmm9, %rax\n    movl %eax, %ecx\n",
+            // the GPR source is not an XMM register
+            "    movq %rdx, %rax\n    movl %eax, %eax\n",
+        ];
+        for asm in refused {
+            let got = fuse(asm);
+            let want: Vec<String> = asm
+                .lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect();
+            assert_eq!(got, want, "must refuse: {asm:?}");
+        }
+    }
+
+    /// A pinned line is never rewritten: the parameter pre-store the pin marks
+    /// is a live ABI contract, not an artifact.
+    #[test]
+    fn xmm_bitcast_fusion_respects_pins() {
+        let mut store = LineStore::new("    movq %xmm9, %rax\n    movl %eax, %eax\n".to_string());
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        infos[0].pinned = true;
+        eliminate_redundant_self_zext(&mut store, &mut infos);
+        assert_eq!(store.get(0).trim(), "movq %xmm9, %rax");
+        assert_eq!(store.get(1).trim(), "movl %eax, %eax");
     }
 
     /// A memory-destination ALU/`mov` writes no register: the index's
