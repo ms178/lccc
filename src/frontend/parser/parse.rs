@@ -11,7 +11,8 @@
 // Methods are pub(super) so they can be called across modules within the parser.
 
 use super::ast::*;
-use crate::common::error::{DiagnosticEngine, WarningKind};
+use super::attribute_registry;
+use crate::common::error::DiagnosticEngine;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::source::Span;
 use crate::common::types::AddressSpace;
@@ -199,6 +200,16 @@ pub(super) mod parsed_attr_flag {
 pub(super) struct ParsedDeclAttrs {
     /// Packed boolean flags — see `parsed_attr_flag` constants.
     pub(super) flags: u64,
+
+    /// Specifier-position attribute records waiting for the
+    /// declaration-kind applicability check (see
+    /// `attribute_registry::AttributeTarget`); taken by the check or
+    /// cleared by the next declaration boundary.
+    pub(super) parsing_attr_targets: Vec<(
+        String,
+        crate::common::source::Span,
+        super::attribute_registry::AttributeTarget,
+    )>,
 
     /// `__seg_gs` or `__seg_fs` qualifier encountered.
     pub parsing_address_space: AddressSpace,
@@ -1758,7 +1769,26 @@ impl Parser {
     /// Parse __attribute__((...)), C23 [[...]], and __extension__, returning struct attribute flags.
     /// Returns (is_packed, aligned_value, mode_kind, is_common, scalar_storage_order).
     /// scalar_storage_order: Some(true) = big-endian, Some(false) = little-endian, None = unspecified.
+    /// Spec-position entry: attribute records that measure a placement rule
+    /// (see `attribute_registry`) stay on `self.attrs` for the declaration
+    /// kind check; every other caller uses [`Self::parse_gcc_attributes`],
+    /// which clears them so a parameter or struct attribute cannot leak
+    /// into a later declaration's check.
+    pub(super) fn parse_gcc_attributes_spec(
+        &mut self,
+    ) -> (bool, Option<usize>, Option<ModeKind>, bool, Option<bool>) {
+        self.parse_gcc_attributes_inner()
+    }
+
     pub(super) fn parse_gcc_attributes(
+        &mut self,
+    ) -> (bool, Option<usize>, Option<ModeKind>, bool, Option<bool>) {
+        let result = self.parse_gcc_attributes_inner();
+        self.attrs.parsing_attr_targets.clear();
+        result
+    }
+
+    fn parse_gcc_attributes_inner(
         &mut self,
     ) -> (bool, Option<usize>, Option<ModeKind>, bool, Option<bool>) {
         let mut is_packed = false;
@@ -1840,16 +1870,33 @@ impl Parser {
                 }
                 TokenKind::RParen | TokenKind::Eof => break,
                 TokenKind::Noreturn => {
+                    // GCC (measured): a function is silent, an object warns
+                    // `'noreturn' attribute ignored`.
+                    self.attrs.parsing_attr_targets.push((
+                        "noreturn".to_string(),
+                        self.peek_span(),
+                        attribute_registry::AttributeTarget::Function,
+                    ));
                     self.attrs.set_noreturn(true);
                     self.advance();
                 }
                 TokenKind::Const => {
+                    // The `.const` function attribute (measured: ignored on
+                    // objects, `on function returning 'void'` for void).
+                    self.attrs.parsing_attr_targets.push((
+                        "const".to_string(),
+                        self.peek_span(),
+                        attribute_registry::AttributeTarget::Function,
+                    ));
                     self.attrs.set_const_attr(true);
                     self.advance();
                 }
                 TokenKind::Identifier(name) => {
-                    self.dispatch_gcc_attribute(
-                        &name.clone(),
+                    let name = name.clone();
+                    let name_span = self.peek_span();
+                    self.attribute_entry(
+                        &name,
+                        name_span,
                         is_packed,
                         aligned,
                         mode_kind,
@@ -1860,6 +1907,165 @@ impl Parser {
                 _ => {
                     self.advance();
                 }
+            }
+        }
+    }
+
+    /// The classification funnel every list entry goes through: GCC's two
+    /// `-Wattributes` phrasings for unknown and ignored attributes, the
+    /// explicit-flag inventory for known-but-unimplemented names, and the
+    /// applicability record for implemented ones.
+    fn attribute_entry(
+        &mut self,
+        name: &str,
+        name_span: crate::common::source::Span,
+        is_packed: &mut bool,
+        aligned: &mut Option<usize>,
+        mode_kind: &mut Option<ModeKind>,
+        is_common: &mut bool,
+        scalar_storage_order: &mut Option<bool>,
+    ) {
+        use super::attribute_registry::{AttributeClass, AttributeTarget};
+        match attribute_registry::classify(name) {
+            AttributeClass::Unknown => {
+                // GCC 16.2 verbatim (measured): the unknown-name wording.
+                self.attribute_warning(
+                    format!(
+                        "\'{}\' attribute directive ignored",
+                        attribute_registry::canonical(name)
+                    ),
+                    name_span,
+                    false,
+                );
+                self.advance();
+                if matches!(self.peek(), TokenKind::LParen) {
+                    self.skip_balanced_parens();
+                }
+            }
+            AttributeClass::Unimplemented => {
+                // The generated inventory: only an explicit request shows it,
+                // so valid uses keep GCC's own (silent) behaviour by default.
+                self.attribute_warning(
+                    format!(
+                        "\'{}\' attribute ignored",
+                        attribute_registry::canonical(name)
+                    ),
+                    name_span,
+                    true,
+                );
+                self.advance();
+                if matches!(self.peek(), TokenKind::LParen) {
+                    self.skip_balanced_parens();
+                }
+            }
+            AttributeClass::Implemented => {
+                if attribute_registry::target(name) != AttributeTarget::Any {
+                    // GCC prints and compares the canonical spelling
+                    // (`__naked__` -> `naked`, measured); store it once so
+                    // every placement message matches its wording.
+                    self.attrs.parsing_attr_targets.push((
+                        attribute_registry::canonical(name).to_string(),
+                        name_span,
+                        attribute_registry::target(name),
+                    ));
+                }
+                self.dispatch_gcc_attribute(
+                    name,
+                    is_packed,
+                    aligned,
+                    mode_kind,
+                    is_common,
+                    scalar_storage_order,
+                );
+            }
+        }
+    }
+
+    /// Emit a `-Wattributes` diagnostic at the attribute's name token (the
+    /// GCC caret position, measured). `explicit_only` gates the
+    /// known-but-unimplemented inventory behind a positive `-Wattributes`
+    /// or `-Werror=attributes` request.
+    fn attribute_warning(
+        &mut self,
+        message: String,
+        span: crate::common::source::Span,
+        explicit_only: bool,
+    ) {
+        if explicit_only
+            && !self
+                .diagnostics
+                .warning_explicitly_requested(crate::common::error::WarningKind::Attributes)
+        {
+            return;
+        }
+        self.diagnostics.warning_with_kind(
+            message,
+            span,
+            crate::common::error::WarningKind::Attributes,
+        );
+    }
+
+    /// The declaration-kind half of the applicability rule: once the
+    /// specifier and first declarator are known, each recorded
+    /// placement-checked attribute either matches or warns exactly as GCC
+    /// 16.2 does (measured phrasings, including `naked`'s dedicated wording
+    /// and `const`/`pure` on a void-returning function).
+    pub(super) fn check_attribute_targets(
+        &mut self,
+        type_spec: &TypeSpecifier,
+        derived: &[crate::frontend::parser::ast::DerivedDeclarator],
+        recorded: &[(
+            String,
+            crate::common::source::Span,
+            attribute_registry::AttributeTarget,
+        )],
+    ) {
+        use super::attribute_registry::AttributeTarget;
+        if recorded.is_empty() {
+            return;
+        }
+        // The final derived layer names the declaration kind: `void *f(int)`
+        // is a function, while `int (*fp)(void)` is an object. This also
+        // covers glibc's pointer-returning `__gnu_inline__` prototypes.
+        let is_function =
+            crate::frontend::parser::ast::DerivedDeclarator::declares_function(derived);
+        let is_record = matches!(
+            type_spec,
+            TypeSpecifier::Struct(..) | TypeSpecifier::Union(..)
+        );
+        // A typedef's referent is not visible here: never claim a placement
+        // violation for it (a false `attribute ignored` would be worse than
+        // a missed one on a record typedef).
+        let is_typedef = matches!(type_spec, TypeSpecifier::TypedefName(_));
+        let returns_void = matches!(type_spec, TypeSpecifier::Void)
+            && crate::frontend::parser::ast::DerivedDeclarator::return_pointer_depth(derived) == 0;
+        for (name, span, target) in recorded {
+            if returns_void && is_function && matches!(name.as_str(), "const" | "pure") {
+                self.diagnostics.warning_with_kind(
+                    format!("\'{name}\' attribute on function returning 'void'"),
+                    *span,
+                    crate::common::error::WarningKind::Attributes,
+                );
+                continue;
+            }
+            let ok = match target {
+                AttributeTarget::Any => true,
+                AttributeTarget::Function => is_function,
+                AttributeTarget::Object => !is_function,
+                AttributeTarget::Record => is_record || is_typedef,
+            };
+            if !ok {
+                let message = if name == "naked" {
+                    // GCC's dedicated wording (measured on gcc-16.2.0).
+                    format!("\'{name}\' attribute only applies to functions")
+                } else {
+                    format!("\'{name}\' attribute ignored")
+                };
+                self.diagnostics.warning_with_kind(
+                    message,
+                    *span,
+                    crate::common::error::WarningKind::Attributes,
+                );
             }
         }
     }
@@ -2202,16 +2408,10 @@ impl Parser {
                 self.parse_address_space_attr();
             }
             _ => {
-                let span = self.peek_span();
                 self.advance();
                 if matches!(self.peek(), TokenKind::LParen) {
                     self.skip_balanced_parens();
                 }
-                self.diagnostics.warning_with_kind(
-                    format!("'{}' attribute directive ignored", name),
-                    span,
-                    WarningKind::Attributes,
-                );
             }
         }
     }
