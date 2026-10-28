@@ -65,7 +65,17 @@ class BenchmarkShardPlan(unittest.TestCase):
     def test_local_only_workloads_are_an_explicit_fixed_set(self) -> None:
         self.assertEqual(
             self.local_only,
-            ["gzip_longest_match", "linux_list_sort", "zstd_double_fast"],
+            [
+                "gzip_longest_match",
+                "linux_list_sort",
+                "zstd_double_fast",
+                "gzip_crc32_slice8",
+                "zlib_ng_slide_hash",
+                "expat_utf8_content",
+                "sqlite_vdbe_serial",
+                "linux_xxhash64",
+                "glibc_dl_hash",
+            ],
             "changing CI shard membership requires an explicit workflow review",
         )
 

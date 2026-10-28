@@ -1028,6 +1028,7 @@ mod tests {
                 .into_iter()
                 .map(str::to_owned)
                 .collect(),
+            ..ModuleSymbolFacts::default()
         };
         let mut f = func_with(global_roundtrip("source", "destination"));
         assert_eq!(
@@ -1050,6 +1051,7 @@ mod tests {
                 .into_iter()
                 .map(str::to_owned)
                 .collect(),
+            ..ModuleSymbolFacts::default()
         };
         let mut f = func_with(global_roundtrip("source", "alias_source"));
         assert_eq!(

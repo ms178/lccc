@@ -2013,13 +2013,35 @@ fn analyze_iv(
                 {
                     continue;
                 }
-                Instruction::Intrinsic { .. } => {
+                Instruction::Intrinsic { op, args, .. } => {
                     // An intrinsic index/offset slot is address arithmetic
                     // like a GEP offset: decline it under the intercept on a
-                    // divergent member. Any other intrinsic read is an
-                    // ordinary narrow use.
+                    // divergent member. When `!narrow`, a pointer-width byte
+                    // offset feeding `VecLoad*(base, byte_off)` or
+                    // `VecStore*(val, base, byte_off)` is an addressing sink
+                    // identical to `Load.ptr`/`Store.ptr` (`double_reduction`
+                    // `.LBB7`: eliminates per-iteration `movslq %r8d, %r10`).
                     if intercept && !cur_exact {
                         return None;
+                    }
+                    let is_wide_vec_mem_offset = !narrow
+                        && ((op.may_read_memory()
+                            && args.len() >= 2
+                            && args[1] == Operand::Value(cur)
+                            && args
+                                .iter()
+                                .enumerate()
+                                .all(|(i, a)| i == 1 || *a != Operand::Value(cur)))
+                            || (op.writes_memory_via_args()
+                                && args.len() >= 3
+                                && args[2] == Operand::Value(cur)
+                                && args
+                                    .iter()
+                                    .enumerate()
+                                    .all(|(i, a)| i == 2 || *a != Operand::Value(cur))));
+                    if is_wide_vec_mem_offset {
+                        has_addressing = true;
+                        continue;
                     }
                     narrow_escape_or_bail(lp, bi, cur, narrow, &mut escapes)?;
                 }
@@ -8384,5 +8406,53 @@ mod tests {
             );
             assert_eq!((inexact.next_value_id, inexact.next_label), ids);
         }
+    }
+
+    #[test]
+    fn widens_iv_driving_vector_load_and_store_intrinsic_byte_offsets() {
+        let mut f = counting_loop(
+            "vec_slide_hash",
+            IrType::U32,
+            IrBinOp::Add,
+            vec![
+                Instruction::Cast {
+                    dest: Value(10),
+                    src: Operand::Value(Value(1)),
+                    from_ty: IrType::U32,
+                    to_ty: IrType::U64,
+                },
+                Instruction::BinOp {
+                    dest: Value(11),
+                    op: IrBinOp::Shl,
+                    lhs: Operand::Value(Value(10)),
+                    rhs: Operand::Const(IrConst::I64(1)),
+                    ty: IrType::U64,
+                },
+                Instruction::Intrinsic {
+                    dest: Some(Value(12)),
+                    op: crate::ir::intrinsics::IntrinsicOp::VecLoadI16x16,
+                    dest_ptr: None,
+                    args: vec![Operand::Value(Value(50)), Operand::Value(Value(11))],
+                },
+                Instruction::Intrinsic {
+                    dest: None,
+                    op: crate::ir::intrinsics::IntrinsicOp::VecStoreI16x16,
+                    dest_ptr: None,
+                    args: vec![
+                        Operand::Value(Value(50)),
+                        Operand::Value(Value(12)),
+                        Operand::Value(Value(11)),
+                    ],
+                },
+            ],
+            Some(Instruction::Cmp {
+                dest: Value(2),
+                op: IrCmpOp::Ult,
+                lhs: Operand::Value(Value(1)),
+                rhs: Operand::Const(IrConst::I32(256)),
+                ty: IrType::U32,
+            }),
+        );
+        check(&mut f, 1);
     }
 }

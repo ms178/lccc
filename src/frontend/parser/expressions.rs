@@ -282,23 +282,21 @@ impl Parser {
     /// cast type `void *` stays unqualified (C23 6.3.2.3p3, GCC 14). The scan
     /// stops at that `*` or at the type name's closing `)`.
     ///
-    /// The scan runs to EOF rather than a fixed token budget: kernel
-    /// `WRITE_ONCE`/`container_of_const` spellings nest `typeof(_Generic(...))`
-    /// casts well past 64 tokens (the previous cap silently dropped
-    /// `pointee_volatile`), and `peek_nth` returns EOF past the token stream,
-    /// so termination is guaranteed. Cost is O(cast length) per declarator;
-    /// the total per translation unit is bounded by the number of declarators
-    /// times its type length, the same linear-per-construct shape as the rest
-    /// of the parser, and no allocation is performed.
-    fn type_name_qualifiers(&self) -> CastQualifiers {
+    /// The scan runs over the exact `[start, end)` token slice that
+    /// `parse_nested_type_name_with_quals` already matched up to its closing
+    /// `)` rather than a fixed 64-token budget or an unbounded scan to EOF:
+    /// kernel `WRITE_ONCE`/`container_of_const` spellings nest
+    /// `typeof(_Generic(...))` casts well past 64 tokens, while rejected or
+    /// unclosed `( ...` inputs never enter this scan at all.
+    fn type_name_qualifiers_in_range(&self, start: usize, end: usize) -> CastQualifiers {
         let mut q = CastQualifiers::default();
         let mut depth = 0usize;
         let mut stars = 0usize;
         let mut before_first_star = true;
         let mut volatile_before_star = false;
-        let mut n = 0usize;
-        loop {
-            match self.peek_nth(n) {
+        let end = end.min(self.tokens.len());
+        for tok in &self.tokens[start.min(end)..end] {
+            match tok.kind {
                 TokenKind::Eof => break,
                 TokenKind::Const if depth == 0 && before_first_star => {
                     q.pointee_qualified = true;
@@ -324,7 +322,6 @@ impl Parser {
                 }
                 _ => {}
             }
-            n += 1;
         }
         // `volatile` must qualify the pointee of a single-level pointer:
         // `(volatile T **)` has a plain `T *` pointee, not a volatile one.
@@ -332,15 +329,13 @@ impl Parser {
         q
     }
 
-    /// Scan top-level storage-class and const specifiers inside `( ... )` before `)`.
+    /// Scan top-level storage-class and const specifiers inside `[start, end)`
+    /// (the matched `( type-name )` token range before `)`).
     /// Returns `(storage, has_any_storage_class, invalid_storage_class_name)`.
-    ///
-    /// Like `type_name_qualifiers`, the scan reaches EOF instead of a fixed
-    /// token budget: a nested `typeof(...)` inside the compound literal's type
-    /// can exceed any static cap, and balanced `()`/`{}`/`[]` tracking keeps
-    /// the depth correct across nested initializers.
-    fn scan_compound_literal_storage(
+    fn scan_compound_literal_storage_in_range(
         &self,
+        start: usize,
+        end: usize,
     ) -> (
         crate::frontend::parser::ast::CompoundLiteralStorage,
         bool,
@@ -353,9 +348,9 @@ impl Parser {
         let mut stars = 0usize;
         let mut const_before_star = false;
         let mut const_after_last_star = false;
-        let mut n = 0usize;
-        loop {
-            match self.peek_nth(n) {
+        let end = end.min(self.tokens.len());
+        for tok in &self.tokens[start.min(end)..end] {
+            match tok.kind {
                 TokenKind::Eof => break,
                 TokenKind::LParen | TokenKind::LBrace | TokenKind::LBracket => depth += 1,
                 TokenKind::RParen => {
@@ -409,7 +404,6 @@ impl Parser {
                 }
                 _ => {}
             }
-            n += 1;
         }
         st.base_const = const_before_star;
         if (stars == 0 && const_before_star) || (stars > 0 && const_after_last_star) {
@@ -450,8 +444,6 @@ impl Parser {
             let save_ext_vector = self.attrs.parsing_ext_vector_nelem.take();
             self.advance();
             if self.is_type_specifier() {
-                let mut qualifiers = self.type_name_qualifiers();
-                let (mut cl_storage, any_sc, invalid_sc) = self.scan_compound_literal_storage();
                 if let Some((mut result_type, pointer_quals)) =
                     self.parse_nested_type_name_with_quals()
                 {
@@ -474,9 +466,13 @@ impl Parser {
                                     mask
                                 }
                             });
-                    cl_storage.pointer_const_levels = levels_mask;
-                    qualifiers.pointer_const_levels = levels_mask;
                     if matches!(self.peek(), TokenKind::RParen) {
+                        let type_end = self.pos;
+                        let mut qualifiers = self.type_name_qualifiers_in_range(save + 1, type_end);
+                        let (mut cl_storage, any_sc, invalid_sc) =
+                            self.scan_compound_literal_storage_in_range(save + 1, type_end);
+                        cl_storage.pointer_const_levels = levels_mask;
+                        qualifiers.pointer_const_levels = levels_mask;
                         let span = self.peek_span();
                         // The cast expression's span covers the whole
                         // `(type)expr` form, starting at the `(`: storing only
@@ -671,7 +667,6 @@ impl Parser {
             let save_ext_vector = self.attrs.parsing_ext_vector_nelem.take();
             self.advance();
             if self.is_type_specifier() {
-                let (cl_storage, any_sc, invalid_sc) = self.scan_compound_literal_storage();
                 // parse_nested_type_name scopes the pending address-space
                 // qualifier (see its doc comment); the sizeof(type-name)
                 // argument is a nested type-name exactly like a cast's.
@@ -679,6 +674,8 @@ impl Parser {
                     // If __attribute__((vector_size(N))) was parsed, wrap the type
                     result_type = self.apply_pending_vector_attr(result_type);
                     if matches!(self.peek(), TokenKind::RParen) {
+                        let (cl_storage, any_sc, invalid_sc) =
+                            self.scan_compound_literal_storage_in_range(save + 1, self.pos);
                         let lit_span = self.peek_span();
                         self.expect(&TokenKind::RParen);
                         // `sizeof (T){...}` is `sizeof unary-expression`
@@ -734,10 +731,11 @@ impl Parser {
         let save_ext_vector = self.attrs.parsing_ext_vector_nelem.take();
         self.advance();
         if self.is_type_specifier() {
-            let (cl_storage, _any_sc, invalid_sc) = self.scan_compound_literal_storage();
             if let Some(mut result_type) = self.parse_nested_type_name() {
                 result_type = self.apply_pending_vector_attr(result_type);
                 if matches!(self.peek(), TokenKind::RParen) {
+                    let (cl_storage, _any_sc, invalid_sc) =
+                        self.scan_compound_literal_storage_in_range(save + 1, self.pos);
                     let span = self.peek_span();
                     self.advance();
                     if matches!(self.peek(), TokenKind::LBrace) {
@@ -1267,5 +1265,40 @@ impl Parser {
         self.attrs.parsing_address_space = enclosing_address_space;
         self.attrs.set_const(saved_const);
         result
+    }
+}
+
+#[cfg(test)]
+mod bounded_paren_scan_tests {
+    use super::*;
+    use crate::frontend::lexer::Lexer;
+
+    #[test]
+    fn paren_scans_stay_within_matched_range_and_detect_qualifiers_and_storage() {
+        // Parenthesized expression `(x)` followed by distant `const` / `static`
+        // tokens outside `[1, 2)` must never leak into the bounded `[start, end)`
+        // scans even when `end` stops right at the closing `)`.
+        let src_expr = "(x) + 1; static const int tail = 7;";
+        let p = Parser::new(Lexer::new(src_expr, 0).tokenize());
+        let q = p.type_name_qualifiers_in_range(1, 2);
+        assert!(!q.pointee_qualified && !q.base_const && !q.pointee_volatile);
+        let (_, any_sc, invalid_sc) = p.scan_compound_literal_storage_in_range(1, 2);
+        assert!(!any_sc && invalid_sc.is_none());
+
+        // Single-level `(volatile int *)0` sets `pointee_volatile`, whereas
+        // double-level `(volatile int **)0` sets `pointee_qualified` only.
+        let p_vol = Parser::new(Lexer::new("(volatile int *)0;", 0).tokenize());
+        let q_vol = p_vol.type_name_qualifiers_in_range(1, 4);
+        assert!(q_vol.pointee_qualified && q_vol.pointee_volatile);
+
+        let p_vol2 = Parser::new(Lexer::new("(volatile int **)0;", 0).tokenize());
+        let q_vol2 = p_vol2.type_name_qualifiers_in_range(1, 5);
+        assert!(q_vol2.pointee_qualified && !q_vol2.pointee_volatile);
+
+        // C23 storage-class compound literal `(static const int[2]){1, 2}`.
+        let pc = Parser::new(Lexer::new("(static const int[2]){1, 2};", 0).tokenize());
+        let (st, any_c23, bad_c23) = pc.scan_compound_literal_storage_in_range(1, 7);
+        assert!(any_c23 && bad_c23.is_none());
+        assert!(st.is_static && st.is_const);
     }
 }

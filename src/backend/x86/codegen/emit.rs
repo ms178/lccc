@@ -815,6 +815,10 @@ impl super::isel::HomeMap for FreshHomes<'_> {
             .iter()
             .any(|(id, &r)| pred(r) && self.get(id).is_some())
     }
+
+    fn is_rorx_masked_shift(&self, id: u32) -> bool {
+        self.0.rorx_masked_shifts.contains(&id)
+    }
 }
 
 pub struct X86Codegen {
@@ -1135,6 +1139,9 @@ pub struct X86Codegen {
     /// Membership is per-definition — derived values (adds etc. on top of
     /// a bitop result can wrap negative) are deliberately NOT propagated.
     pub(super) bitop_nonneg_values: FxHashSet<u32>,
+    /// Single-use 32/64-bit right shifts whose sole consumer masks off the
+    /// rotated-in high bits, enabling non-destructive BMI2 `rorxl`/`rorxq`.
+    pub(super) rorx_masked_shifts: FxHashSet<u32>,
     /// Values whose GPR home was written by a 32-bit zero-extending indexed load
     /// (`movzbl`, `movzwl`, `movl`), leaving bits 8..63 / 16..63 / 32..63 zeroed.
     pub(super) zext_loaded_values: FxHashSet<u32>,
@@ -1689,6 +1696,7 @@ impl X86Codegen {
             implicit_sext_values: FxHashSet::default(),
             signed_i32_defs: FxHashSet::default(),
             bitop_nonneg_values: FxHashSet::default(),
+            rorx_masked_shifts: FxHashSet::default(),
             zext_loaded_values: FxHashSet::default(),
             fused_cmp_dests: FxHashMap::default(),
             fused_forward_dests: FxHashSet::default(),
@@ -5496,12 +5504,20 @@ impl X86Codegen {
                 }
             } else {
                 let mnemonic = alu_mnemonic(op);
-                if use_32bit {
+                let nonneg_and = op == IrBinOp::And && imm >= 0 && imm <= i32::MAX as i64;
+                if use_32bit || nonneg_and {
                     self.state.emit_fmt(format_args!(
                         "    {}l ${}, %{}",
                         mnemonic, imm, dest_name_32
                     ));
-                    self.emit_sext32_for_value(dest_name_32, dest_name, is_unsigned, dest_value_id);
+                    if !nonneg_and {
+                        self.emit_sext32_for_value(
+                            dest_name_32,
+                            dest_name,
+                            is_unsigned,
+                            dest_value_id,
+                        );
+                    }
                 } else {
                     self.state
                         .emit_fmt(format_args!("    {}q ${}, %{}", mnemonic, imm, dest_name));
@@ -5664,6 +5680,36 @@ impl X86Codegen {
         let (mnem32, mnem64) = shift_mnemonic(op);
 
         if let Some(imm) = Self::const_as_imm32(rhs) {
+            if self.rorx_masked_shifts.contains(&dest_value_id) {
+                let direct_src = match lhs {
+                    Operand::Value(v) => self.reg_assignments.get(&v.0).copied().filter(|r| {
+                        !is_xmm_reg(*r)
+                            && (!self.home_clobbered.contains(&v.0)
+                                || self.home_readable_via_alias(v.0))
+                    }),
+                    _ => None,
+                };
+                if let Some(src) = direct_src {
+                    if use_32bit {
+                        let shift_amount = (imm as u32) & 31;
+                        let src32 = phys_reg_name_32(src);
+                        self.state.emit_fmt(format_args!(
+                            "    rorxl ${}, %{}, %{}",
+                            shift_amount, src32, dest_name_32
+                        ));
+                    } else {
+                        let shift_amount = (imm as u64) & 63;
+                        let src64 = phys_reg_name(src);
+                        self.state.emit_fmt(format_args!(
+                            "    rorxq ${}, %{}, %{}",
+                            shift_amount, src64, dest_name
+                        ));
+                    }
+                    self.state.reg_cache.invalidate_acc();
+                    self.note_inplace_compute(dest_phys, dest_value_id);
+                    return;
+                }
+            }
             self.operand_to_callee_reg(lhs, dest_phys);
             if use_32bit {
                 let shift_amount = (imm as u32) & 31;
@@ -6004,10 +6050,13 @@ impl X86Codegen {
                 // Add/Sub path: cltq for signed, implicit zero-extension for
                 // unsigned.
                 let needs_l_form = imm > i32::MAX as i64;
-                if use_32bit && (matches!(op, IrBinOp::Add | IrBinOp::Sub) || needs_l_form) {
+                let nonneg_and = op == IrBinOp::And && imm >= 0 && imm <= i32::MAX as i64;
+                if (use_32bit && (matches!(op, IrBinOp::Add | IrBinOp::Sub) || needs_l_form))
+                    || nonneg_and
+                {
                     self.state
                         .emit_fmt(format_args!("    {}l ${}, %eax", mnemonic, imm));
-                    if !is_unsigned {
+                    if !nonneg_and && !is_unsigned {
                         // Same needs_sext refinement as the general ALU path
                         // (emit_sext32_for_value): a value with no 64-bit
                         // consumer keeps the zero-extended form; the cltq
@@ -6128,6 +6177,40 @@ impl X86Codegen {
         // Immediate shift
         if matches!(op, IrBinOp::Shl | IrBinOp::AShr | IrBinOp::LShr) {
             if let Some(imm) = Self::const_as_imm32(rhs) {
+                if self.rorx_masked_shifts.contains(&dest.0) {
+                    let src_home = match lhs {
+                        Operand::Value(v) => self.reg_assignments.get(&v.0).copied().filter(|&r| {
+                            let name = phys_reg_name(r);
+                            !is_xmm_reg(r)
+                                && name != "rax"
+                                && name != "rcx"
+                                && name != "rdx"
+                                && (!self.home_clobbered.contains(&v.0)
+                                    || self.home_readable_via_alias(v.0))
+                        }),
+                        _ => None,
+                    };
+                    if let Some(src) = src_home {
+                        if use_32bit {
+                            let shift_amount = (imm as u32) & 31;
+                            let src32 = phys_reg_name_32(src);
+                            self.state.emit_fmt(format_args!(
+                                "    rorxl ${}, %{}, %eax",
+                                shift_amount, src32
+                            ));
+                        } else {
+                            let shift_amount = (imm as u64) & 63;
+                            let src64 = phys_reg_name(src);
+                            self.state.emit_fmt(format_args!(
+                                "    rorxq ${}, %{}, %rax",
+                                shift_amount, src64
+                            ));
+                        }
+                        self.state.reg_cache.invalidate_acc();
+                        self.store_rax_to(dest);
+                        return true;
+                    }
+                }
                 self.operand_to_rax(lhs);
                 let (mnem32, mnem64) = shift_mnemonic(op);
                 if use_32bit {

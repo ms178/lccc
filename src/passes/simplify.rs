@@ -4409,6 +4409,60 @@ fn simplify_binop(
             {
                 return Some(inst);
             }
+            // High-bit logical shift over bitwise Xor/Or with a zero-extended
+            // narrower operand: `(a ^ zext_W(b)) >> s => a >> s` (and `|`) when
+            // `s >= W`. Zero-extension sets bits `W..` to 0, and bitwise Xor/Or
+            // has no carry, so bits `s..` of `a ^ zext_W(b)` equal bits `s..`
+            // of `a`. Breaks the loop-carried `crc` serial dependency chain in
+            // slice-by-8 CRC32 (`gzip_crc32_slice8`) and exposes 32-bit `xorl`
+            // narrowing on the remaining low half. Gated to SSA mode
+            // (`use_counts.is_empty()`) so post-SSA `-O1` i686 webs stay intact.
+            if op == IrBinOp::LShr
+                && use_counts.is_empty()
+                && !simplify_skip("reassoc")
+                && matches!(ty, IrType::I64 | IrType::U64 | IrType::I32 | IrType::U32)
+                && let Operand::Const(c) = rhs
+                && let Some(shift) = c.to_i64()
+            {
+                let width = (ty.size() * 8) as i64;
+                if shift > 0
+                    && shift < width
+                    && let Some(def) = get_binop_def(lhs, binop_defs)
+                    && matches!(def.op, IrBinOp::Xor | IrBinOp::Or)
+                    && def.ty == ty
+                {
+                    let high_bits_zero = |opnd: &Operand| -> bool {
+                        let Operand::Value(v) = opnd else {
+                            return false;
+                        };
+                        let Some(Some(cd)) = cast_defs.get(v.0 as usize) else {
+                            return false;
+                        };
+                        cd.to_ty == ty
+                            && cd.from_ty.is_unsigned()
+                            && cd.from_ty.is_integer()
+                            && ((cd.from_ty.size() * 8) as i64) <= shift
+                    };
+                    if high_bits_zero(&def.rhs) {
+                        return Some(Instruction::BinOp {
+                            dest,
+                            op,
+                            lhs: def.lhs,
+                            rhs: *rhs,
+                            ty,
+                        });
+                    }
+                    if high_bits_zero(&def.lhs) {
+                        return Some(Instruction::BinOp {
+                            dest,
+                            op,
+                            lhs: def.rhs,
+                            rhs: *rhs,
+                            ty,
+                        });
+                    }
+                }
+            }
         }
         IrBinOp::BitTest => {
             // `BitTest(base, index)` is `(base >> index) & 1` — see
@@ -10702,5 +10756,82 @@ mod pack_extract_tests {
         );
         simplify_function(&mut f);
         assert_eq!(reads(&f, 6), None, "|A| = 64 > S = 32");
+    }
+
+    #[test]
+    fn high_bit_lshr_elides_zero_extended_xor_operand_only_when_shift_covers_width() {
+        let make = |from_ty: IrType, shift: i64| {
+            let mut f = IrFunction::new("crc_lshr".into(), IrType::U64, vec![], false);
+            f.blocks.push(crate::ir::reexports::BasicBlock {
+                label: crate::ir::reexports::BlockId(0),
+                instructions: vec![
+                    Instruction::ParamRef {
+                        dest: Value(0),
+                        param_idx: 0,
+                        ty: IrType::U64,
+                    },
+                    Instruction::ParamRef {
+                        dest: Value(1),
+                        param_idx: 1,
+                        ty: from_ty,
+                    },
+                    Instruction::Cast {
+                        dest: Value(2),
+                        src: Operand::Value(Value(1)),
+                        from_ty,
+                        to_ty: IrType::U64,
+                    },
+                    Instruction::BinOp {
+                        dest: Value(3),
+                        op: IrBinOp::Xor,
+                        lhs: Operand::Value(Value(0)),
+                        rhs: Operand::Value(Value(2)),
+                        ty: IrType::U64,
+                    },
+                    Instruction::BinOp {
+                        dest: Value(4),
+                        op: IrBinOp::LShr,
+                        lhs: Operand::Value(Value(3)),
+                        rhs: Operand::Const(IrConst::I64(shift)),
+                        ty: IrType::U64,
+                    },
+                ],
+                terminator: Terminator::Return(Some(Operand::Value(Value(4)))),
+                source_spans: vec![],
+            });
+            f.next_value_id = 5;
+            f
+        };
+
+        // `zext(u32)` has bits 32..63 == 0 -> `>> 32` and `>> 48` bypass the Xor.
+        for s in [32, 48] {
+            let mut f = make(IrType::U32, s);
+            assert!(simplify_function(&mut f) > 0);
+            assert!(f.blocks[0].instructions.iter().any(|i| matches!(
+                i,
+                Instruction::BinOp {
+                    dest: Value(4),
+                    op: IrBinOp::LShr,
+                    lhs: Operand::Value(Value(0)),
+                    ..
+                }
+            )));
+        }
+
+        // `>> 24` overlaps `u32` bit 24..31 -> must NOT bypass Xor; signed `I32`
+        // sign-extends into bits 32..63 -> must NOT bypass Xor.
+        for (ty, s) in [(IrType::U32, 24), (IrType::I32, 48)] {
+            let mut f = make(ty, s);
+            simplify_function(&mut f);
+            assert!(f.blocks[0].instructions.iter().any(|i| matches!(
+                i,
+                Instruction::BinOp {
+                    dest: Value(4),
+                    op: IrBinOp::LShr,
+                    lhs: Operand::Value(Value(3)),
+                    ..
+                }
+            )));
+        }
     }
 }

@@ -1500,17 +1500,7 @@ impl SemanticAnalyzer {
                 while let CType::Array(inner, _) = elem_type {
                     elem_type = inner;
                 }
-                let is_incomplete = match elem_type {
-                    CType::Struct(key) | CType::Union(key) => {
-                        // Keep the RefCell borrow in a named, completed scope.
-                        // Besides documenting the lock boundary, this retains
-                        // identical behavior across Rust 2021/2024 temporary
-                        // drop-order rules before diagnostics are mutated.
-                        let is_defined = self.defined_structs.borrow().contains(&**key);
-                        !is_defined
-                    }
-                    _ => false,
-                };
+                let is_incomplete = self.incomplete_record_name(elem_type).is_some();
                 if is_incomplete {
                     self.diagnostics.borrow_mut().error(
                         format!("storage size of '{}' isn't known", init_decl.name),
@@ -2453,8 +2443,15 @@ impl SemanticAnalyzer {
                     self.collect_enum_constants_from_type_spec(&field.type_spec, span);
                 }
             }
-            TypeSpecifier::Array(inner, _) | TypeSpecifier::Pointer(inner, _) => {
+            TypeSpecifier::Array(inner, _)
+            | TypeSpecifier::Pointer(inner, _)
+            | TypeSpecifier::TypeofType(inner)
+            | TypeSpecifier::Vector(inner, _)
+            | TypeSpecifier::ExtVector(inner, _) => {
                 self.collect_enum_constants_from_type_spec(inner, span);
+            }
+            TypeSpecifier::Typeof(inner_expr, _) => {
+                self.analyze_unevaluated(inner_expr);
             }
             _ => {}
         }
@@ -3453,8 +3450,10 @@ impl SemanticAnalyzer {
                 self.check_conditional_arms(cond, else_expr, *span);
             }
             Expr::ArraySubscript(arr, idx, span) => {
+                let direct_addr_of = self.address_of_operand.replace(false);
                 self.analyze_expr(arr);
                 self.analyze_expr(idx);
+                self.address_of_operand.set(direct_addr_of);
                 self.check_subscript_operands(arr, idx, *span);
             }
             Expr::MemberAccess(obj, field_name, span) => {
@@ -3632,10 +3631,11 @@ impl SemanticAnalyzer {
                 self.check_alignof_incomplete_expr(inner, *span);
             }
             Expr::AddressOf(inner, span) => {
-                // `&*p` never computes the incomplete-typed value, so the
-                // indirect operand is exempt from the "invalid use of
-                // undefined type" rule below (measured on gcc-16.2).
-                let exempt = matches!(inner.as_ref(), Expr::Deref(..));
+                // `&*p` and `&p[i]` never compute the incomplete-typed value, so
+                // the direct indirection is exempt from the evaluated-value
+                // "invalid use of undefined type" rule below (measured on
+                // gcc-16.2; `&p[i]` still checks `p + i` pointer arithmetic).
+                let exempt = matches!(inner.as_ref(), Expr::Deref(..) | Expr::ArraySubscript(..));
                 let previous = self.address_of_operand.replace(exempt);
                 self.analyze_expr(inner);
                 self.address_of_operand.set(previous);
@@ -4946,6 +4946,12 @@ impl SemanticAnalyzer {
                     self.diagnostics
                         .borrow_mut()
                         .error(format!("invalid use of undefined type '{name}'"), span);
+                    if !self.address_of_operand.get() && !self.in_unevaluated_operand() {
+                        let start = self.expr_start_span(base);
+                        self.diagnostics
+                            .borrow_mut()
+                            .error(format!("invalid use of undefined type '{name}'"), start);
+                    }
                 }
                 // `p[0]` on a `void *` is `*(p + 0)`: GCC's GNU extension
                 // warns once here, at the `[`, and the element lvalue then
@@ -4967,6 +4973,17 @@ impl SemanticAnalyzer {
                 "subscripted value is neither array nor pointer nor vector"
             }
             (false, true) if base_ty.is_integer() => {
+                if let Some(name) = self.incomplete_record_name(pointee_of(&index_ty)) {
+                    self.diagnostics
+                        .borrow_mut()
+                        .error(format!("invalid use of undefined type '{name}'"), span);
+                    if !self.address_of_operand.get() && !self.in_unevaluated_operand() {
+                        let start = self.expr_start_span(base);
+                        self.diagnostics
+                            .borrow_mut()
+                            .error(format!("invalid use of undefined type '{name}'"), start);
+                    }
+                }
                 // `i[p]` is `*(p + i)` too, so the GNU `void *` extension is
                 // warned about on either side of the brackets.
                 if operand_constraints::is_void_pointer(&index_ty) && !self.in_unevaluated_operand()
@@ -5275,10 +5292,12 @@ impl SemanticAnalyzer {
     /// `unevaluated_depth`), so the default-on extension warnings stay quiet
     /// exactly where GCC keeps them quiet while the constraint errors fire.
     fn analyze_unevaluated(&mut self, expr: &Expr) {
+        let prev_addr_of = self.address_of_operand.replace(false);
         self.unevaluated_depth.set(self.unevaluated_depth.get() + 1);
         self.analyze_expr(expr);
         self.unevaluated_depth
             .set(self.unevaluated_depth.get().saturating_sub(1));
+        self.address_of_operand.set(prev_addr_of);
     }
 
     /// Whether the operand being judged is unevaluated (`sizeof` and friends).
@@ -5322,10 +5341,13 @@ impl SemanticAnalyzer {
             }
             return;
         }
-        if let Some(message) = operand_constraints::indirection(&ty) {
+        let promoted = self
+            .expr_type_checker()
+            .bitfield_promoted_if_bitfield(operand, ty);
+        if let Some(message) = operand_constraints::indirection(&promoted) {
             // `*g()` on a `void`-returning `g` quotes the value error at the
             // operand (`g`), not at the `*` (measured on gcc-16.2).
-            let message_span = if matches!(ty, CType::Void) {
+            let message_span = if matches!(promoted, CType::Void) {
                 self.expr_start_span(operand)
             } else {
                 op_span
@@ -5371,7 +5393,10 @@ impl SemanticAnalyzer {
                 true
             }
             MemberOperand::NotPointer => {
-                let spelling = self.operand_type_spelling(&base_ctype);
+                let promoted = self
+                    .expr_type_checker()
+                    .bitfield_promoted_if_bitfield(base_expr, base_ctype);
+                let spelling = self.operand_type_spelling(&promoted);
                 self.diagnostics.borrow_mut().error(
                     format!("invalid type argument of '->' (have '{spelling}')"),
                     span,
@@ -6702,25 +6727,38 @@ dereference it before applying '->' to it?"
         }
     }
 
-    /// Whether `ty` is a record type an object cannot be formed of: a
-    /// declared-but-never-defined tag (a placeholder layout) or a key with no
-    /// layout at all. Returns the spelling gcc-16.2 uses in the message
-    /// (`struct f`, `union u`).
+    /// Whether `ty` is a tagged type (`struct`, `union`, or body-less `enum`
+    /// without a C23 fixed underlying type) an object cannot be formed of: a
+    /// declared-but-never-defined tag or a key with no layout at all. Returns
+    /// the spelling gcc-16.2 uses in the message (`struct f`, `union u`,
+    /// `enum E`).
     fn incomplete_record_name(&self, ty: &CType) -> Option<String> {
-        let key = match ty {
-            CType::Struct(key) | CType::Union(key) => key,
-            _ => return None,
-        };
-        if self.defined_structs.borrow().contains(&**key) {
-            return None;
+        match ty {
+            CType::Struct(key) | CType::Union(key) => {
+                if self.defined_structs.borrow().contains(&**key) {
+                    return None;
+                }
+                let complete = self
+                    .result
+                    .type_context
+                    .borrow_struct_layouts()
+                    .get(&**key)
+                    .is_some_and(|layout| layout.is_complete);
+                (!complete).then(|| ty.to_string())
+            }
+            CType::Enum(e) => {
+                if !e.variants.is_empty() || e.fixed.is_some() {
+                    return None;
+                }
+                if let Some(tag) = e.name.as_deref()
+                    && self.result.type_context.enum_types.contains_key(tag)
+                {
+                    return None;
+                }
+                Some(ty.to_string())
+            }
+            _ => None,
         }
-        let complete = self
-            .result
-            .type_context
-            .borrow_struct_layouts()
-            .get(&**key)
-            .is_some_and(|layout| layout.is_complete);
-        (!complete).then(|| ty.to_string())
     }
 
     /// The gcc-16.2 name of the record an expression's pointer operand points
@@ -6852,11 +6890,38 @@ dereference it before applying '->' to it?"
                     );
                 }
             }
+            TypeSpecifier::Enum(Some(tag), None, _, None) => {
+                if !self
+                    .result
+                    .type_context
+                    .enum_types
+                    .contains_key(tag.as_str())
+                {
+                    let caret = self.type_operand_span(span);
+                    self.diagnostics.borrow_mut().error(
+                        format!(
+                            "invalid application of '{operator}' to incomplete type 'enum {tag}'"
+                        ),
+                        caret,
+                    );
+                }
+            }
             // Pointers to incomplete types are fine - sizeof gives pointer size
             TypeSpecifier::Pointer(_, _) => {}
-            // Arrays of incomplete element types - check the element type
-            TypeSpecifier::Array(elem, _) => {
+            // Arrays and typeof(type) delegate to their inner type
+            TypeSpecifier::Array(elem, _) | TypeSpecifier::TypeofType(elem) => {
                 self.check_sizeof_incomplete_type(elem, span, operator);
+            }
+            TypeSpecifier::Typeof(expr, _) => {
+                if let Some(ty) = self.expr_type_checker().infer_expr_ctype(expr)
+                    && let Some(name) = self.incomplete_record_name(&ty)
+                {
+                    let caret = self.type_operand_span(span);
+                    self.diagnostics.borrow_mut().error(
+                        format!("invalid application of '{operator}' to incomplete type '{name}'"),
+                        caret,
+                    );
+                }
             }
             _ => {}
         }

@@ -158,6 +158,19 @@ impl StrictPackedDag<'_> {
     }
 }
 
+/// Carried-IV variant of [`StrictPackedPlan`]: `packed_iv` is a loop-carried
+/// XMM phi seeded to `[0, 1, 2, 3]` in `prefix` and advanced by `packed_iv_next`
+/// (`vpaddd [4, 4, 4, 4]`) on the backedge, eliminating the per-iteration GPR
+/// `vmovd` + `vpshufd` splat.
+pub(super) struct StrictCarriedPackedPlan {
+    pub(super) denominator: Value,
+    pub(super) packed_iv_init: Value,
+    pub(super) packed_iv_next: Value,
+    pub(super) next: u32,
+    pub(super) prefix: Vec<Instruction>,
+    pub(super) instructions: Vec<Instruction>,
+}
+
 pub(super) fn build_plan(
     func: &IrFunction,
     pattern: &StrictComputedRecipReductionPattern,
@@ -197,6 +210,48 @@ pub(super) fn build_plan(
         args: vec![Operand::Value(splat), Operand::Value(offsets)],
     });
     packed.finish(Operand::Value(pattern.denominator))
+}
+
+pub(super) fn build_carried_plan(
+    func: &IrFunction,
+    pattern: &StrictComputedRecipReductionPattern,
+    packed_iv: Value,
+    next_value_id: u32,
+) -> Option<StrictCarriedPackedPlan> {
+    let mut packed = StrictPackedDag {
+        func,
+        body: pattern.body_idx,
+        iv: pattern.iv,
+        packed_iv,
+        values: FxHashMap::default(),
+        constants: FxHashMap::default(),
+        expressions: FxHashMap::default(),
+        prefix: Vec::new(),
+        instructions: Vec::new(),
+        next: next_value_id,
+    };
+    let packed_iv_init = packed.emit(
+        IntrinsicOp::VecPackI32x4,
+        (0..4)
+            .map(|lane| Operand::Const(IrConst::I32(lane)))
+            .collect(),
+        true,
+    );
+    let step4 = packed.operand(Operand::Const(IrConst::I32(4)), 0)?;
+    let denominator = packed.operand(Operand::Value(pattern.denominator), 0)?;
+    let packed_iv_next = packed.emit(
+        IntrinsicOp::VecAddI32x4,
+        vec![Operand::Value(packed_iv), Operand::Value(step4)],
+        false,
+    );
+    Some(StrictCarriedPackedPlan {
+        denominator,
+        packed_iv_init,
+        packed_iv_next,
+        next: packed.next,
+        prefix: packed.prefix,
+        instructions: packed.instructions,
+    })
 }
 
 #[cfg(test)]

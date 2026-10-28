@@ -2422,6 +2422,22 @@ const PURE_PRODUCERS: &[&str] = &[
     "movslq ", "movl ", "movq ", "leal ", "leaq ",
 ];
 
+/// Flag-neutral BMI2 three-operand shifts/rotates (`op src1, src2, dst`):
+/// read all source operands before writing their trailing register destination
+/// and leave EFLAGS untouched.
+const PURE_PRODUCERS_3OP: &[&str] = &[
+    "rorxl ", "rorxq ", "shrxl ", "shrxq ", "shlxl ", "shlxq ", "sarxl ", "sarxq ",
+];
+
+fn split_three_operands_last(rest: &str) -> Option<(&str, &str)> {
+    let (prefix, last) = rest.rsplit_once(',')?;
+    let (first, mid) = prefix.split_once(',')?;
+    if first.trim().is_empty() || mid.trim().is_empty() || last.trim().is_empty() {
+        return None;
+    }
+    Some((prefix.trim(), last.trim()))
+}
+
 /// The 32-bit form, writing `%<d>d`, of the 64-bit producer `op src` whose
 /// result is consumed only through a `movl` copy (the low half, zero-
 /// extended). Each form yields exactly the low 32 bits the copy would take
@@ -2533,11 +2549,19 @@ fn retarget_producer_into_copy_impl(
             continue;
         }
         let prod = infos[i].trimmed(store.get(i)).to_string();
-        let Some(op) = PURE_PRODUCERS.iter().find(|p| prod.starts_with(**p)) else {
-            i += 1;
-            continue;
-        };
-        let Some((prod_src, prod_dst)) = split_two_operands(&prod[op.len()..]) else {
+        let Some((op, prod_src, prod_dst)) = PURE_PRODUCERS
+            .iter()
+            .find(|p| prod.starts_with(**p))
+            .and_then(|&p| split_two_operands(&prod[p.len()..]).map(|(s, d)| (p, s, d)))
+            .or_else(|| {
+                PURE_PRODUCERS_3OP
+                    .iter()
+                    .find(|p| prod.starts_with(**p))
+                    .and_then(|&p| {
+                        split_three_operands_last(&prod[p.len()..]).map(|(s, d)| (p, s, d))
+                    })
+            })
+        else {
             i += 1;
             continue;
         };

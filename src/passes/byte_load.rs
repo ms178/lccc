@@ -92,16 +92,22 @@
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::{AddressSpace, IrType};
-use crate::ir::reexports::{BasicBlock, Instruction, IrBinOp, IrConst, IrFunction, Operand, Value};
+use crate::ir::reexports::{
+    BasicBlock, Instruction, IrBinOp, IrConst, IrFunction, IrUnaryOp, Operand, Value,
+};
 
-/// One matched byte term: the byte loaded at `ptr`, shifted into place.
+/// One matched byte term: the byte loaded at `ptr + byte_off`, shifted into place.
 struct Term {
     /// Shift amount in bits. Distinct multiples of 8 covering `0..bits` are
     /// what makes the OR-tree an n-byte load (enforced in [`validate`]).
     shift: u32,
-    /// Value the byte is loaded from: the shared base expression or a chain
-    /// of constant-offset `GetElementPtr`s on it, resolved by [`resolve_ptr`].
+    /// Value the byte or widened sub-word is loaded from: the shared base
+    /// expression or a chain of constant-offset `GetElementPtr`s on it,
+    /// resolved by [`resolve_ptr`].
     ptr: Value,
+    /// Additional constant byte offset within a pre-widened sub-word load
+    /// (`0` for direct `u8` loads; `0..w` for `u16`/`u32` sub-loads).
+    byte_off: u64,
 }
 
 /// A fully validated rewrite.
@@ -349,7 +355,9 @@ fn const_u64(op: Operand) -> Option<u64> {
     }
 }
 
-/// One `Or` operand: either a partial sum (recurse) or a byte term.
+/// One `Or` operand: either a partial sum (recurse), a shifted/widened unsigned
+/// partial sum (`((uint64_t)get_u32_be(p) << 32) | (uint64_t)get_u32_be(p+4)`),
+/// or a byte term.
 ///
 /// `consumed` collects the values whose defining instruction the rewrite
 /// removes. The final `Or`'s destination is never pushed — users keep it.
@@ -357,6 +365,18 @@ fn match_sum(
     ctx: &Ctx,
     op: Operand,
     bits: u32,
+    depth: u32,
+    terms: &mut Vec<Term>,
+    consumed: &mut Vec<Value>,
+) -> Option<()> {
+    match_sum_shifted(ctx, op, bits, 0, depth, terms, consumed)
+}
+
+fn match_sum_shifted(
+    ctx: &Ctx,
+    op: Operand,
+    bits: u32,
+    base_shift: u32,
     depth: u32,
     terms: &mut Vec<Term>,
     consumed: &mut Vec<Value>,
@@ -374,23 +394,9 @@ fn match_sum(
             ty,
         } if *dest == v && wide_bits(*ty) == Some(bits) => {
             consumed.push(v);
-            match_sum(ctx, *lhs, bits, depth + 1, terms, consumed)?;
-            match_sum(ctx, *rhs, bits, depth + 1, terms, consumed)
+            match_sum_shifted(ctx, *lhs, bits, base_shift, depth + 1, terms, consumed)?;
+            match_sum_shifted(ctx, *rhs, bits, base_shift, depth + 1, terms, consumed)
         }
-        _ => match_term(ctx, v, bits, terms, consumed),
-    }
-}
-
-/// One byte term: `shl (cast u8 -> uN) %c, k`, or the `k == 0` term, which the
-/// front end leaves as the bare zero-extending cast.
-fn match_term(
-    ctx: &Ctx,
-    v: Value,
-    bits: u32,
-    terms: &mut Vec<Term>,
-    consumed: &mut Vec<Value>,
-) -> Option<()> {
-    match ctx.def(v)? {
         Instruction::BinOp {
             dest,
             op: IrBinOp::Shl,
@@ -399,25 +405,43 @@ fn match_term(
             ty,
         } if *dest == v && wide_bits(*ty) == Some(bits) => {
             let k = const_u64(*rhs)?;
-            if k == 0 || k % 8 != 0 || k >= u64::from(bits) {
+            if k == 0 || k % 8 != 0 {
+                return None;
+            }
+            let k32 = u32::try_from(k).ok()?;
+            let total_shift = base_shift.checked_add(k32)?;
+            if total_shift >= bits {
                 return None;
             }
             consumed.push(v);
-            match_cast_load(ctx, *lhs, bits, k as u32, terms, consumed)
+            match_shifted_or_cast_term(ctx, *lhs, bits, total_shift, depth + 1, terms, consumed)
         }
-        _ => match_cast_load(ctx, Operand::Value(v), bits, 0, terms, consumed),
+        _ => match_shifted_or_cast_term(
+            ctx,
+            Operand::Value(v),
+            bits,
+            base_shift,
+            depth + 1,
+            terms,
+            consumed,
+        ),
     }
 }
 
-/// `cast u8 -> uN` of a plain (non-volatile) byte load.
-fn match_cast_load(
+/// Match either a `cast u8 -> uN` byte load at `shift` or a zero-extending
+/// `cast u16/u32 -> uN` of an inner byte-load `Or` tree placed at `shift`.
+fn match_shifted_or_cast_term(
     ctx: &Ctx,
     op: Operand,
     bits: u32,
     shift: u32,
+    depth: u32,
     terms: &mut Vec<Term>,
     consumed: &mut Vec<Value>,
 ) -> Option<()> {
+    if depth > 64 {
+        return None;
+    }
     let v = ctx.peel_consuming(op, consumed)?;
     match ctx.def(v)? {
         Instruction::Cast {
@@ -440,8 +464,95 @@ fn match_cast_load(
                         return None;
                     }
                     consumed.push(lv);
-                    terms.push(Term { shift, ptr: *ptr });
+                    terms.push(Term {
+                        shift,
+                        ptr: *ptr,
+                        byte_off: 0,
+                    });
                     Some(())
+                }
+                _ => None,
+            }
+        }
+        Instruction::Cast {
+            dest,
+            src,
+            from_ty: from_ty @ (IrType::U16 | IrType::U32),
+            to_ty,
+        } if *dest == v && wide_bits(*to_ty) == Some(bits) => {
+            let sub_bits = wide_bits(*from_ty)?;
+            if sub_bits >= bits || shift.checked_add(sub_bits)? > bits {
+                return None;
+            }
+            consumed.push(v);
+            let saved_terms = terms.len();
+            let saved_consumed = consumed.len();
+            if match_sum_shifted(ctx, *src, sub_bits, shift, depth + 1, terms, consumed).is_some() {
+                return Some(());
+            }
+            terms.truncate(saved_terms);
+            consumed.truncate(saved_consumed);
+            // Pre-widened sub-word load (from `byte-accessors-before-inline` or
+            // `bit_idioms`): `Load<U16|U32>` or `UnaryOp::Bswap(Load<U16|U32>)`.
+            // Expand into synthetic per-byte terms so `(u64)be32(p) << 32 |
+            // be32(p + 4)` and its little-endian twin fold into one 64-bit load.
+            let sv = ctx.peel_consuming(*src, consumed)?;
+            let sub_bytes = sub_bits / 8;
+            match ctx.def(sv)? {
+                Instruction::Load {
+                    dest: ldest,
+                    ptr,
+                    ty: lty,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                } if *ldest == sv && wide_bits(*lty) == Some(sub_bits) => {
+                    if ctx.use_count(sv) != 1 {
+                        return None;
+                    }
+                    consumed.push(sv);
+                    for b in 0..sub_bytes {
+                        terms.push(Term {
+                            shift: shift + 8 * b,
+                            ptr: *ptr,
+                            byte_off: b as u64,
+                        });
+                    }
+                    Some(())
+                }
+                Instruction::UnaryOp {
+                    dest: bdest,
+                    op: IrUnaryOp::Bswap,
+                    src: bsrc,
+                    ty: bty,
+                } if *bdest == sv && wide_bits(*bty) == Some(sub_bits) => {
+                    if ctx.use_count(sv) != 1 {
+                        return None;
+                    }
+                    consumed.push(sv);
+                    let lv = ctx.peel_consuming(*bsrc, consumed)?;
+                    match ctx.def(lv)? {
+                        Instruction::Load {
+                            dest: ldest,
+                            ptr,
+                            ty: lty,
+                            seg_override: AddressSpace::Default,
+                            volatile: false,
+                        } if *ldest == lv && wide_bits(*lty) == Some(sub_bits) => {
+                            if ctx.use_count(lv) != 1 {
+                                return None;
+                            }
+                            consumed.push(lv);
+                            for b in 0..sub_bytes {
+                                terms.push(Term {
+                                    shift: shift + 8 * (sub_bytes - 1 - b),
+                                    ptr: *ptr,
+                                    byte_off: b as u64,
+                                });
+                            }
+                            Some(())
+                        }
+                        _ => None,
+                    }
                 }
                 _ => None,
             }
@@ -566,10 +677,7 @@ fn resolve_ptr(
     let v = ctx.peel_or_self(operand_value(op)?, 0)?;
     match ctx.def(v) {
         Some(Instruction::GetElementPtr {
-            dest,
-            base,
-            offset,
-            ty: IrType::Ptr,
+            dest, base, offset, ..
         }) if *dest == v => match const_u64(*offset) {
             // Constant step: keep walking towards the root.
             Some(off) => {
@@ -607,7 +715,7 @@ fn validate(
     if !(2..=8).contains(&m) || m.count_ones() != 1 || m > carrier {
         return None;
     }
-    let mut by_shift: Vec<Option<Value>> = vec![None; m];
+    let mut by_shift: Vec<Option<(Value, u64)>> = vec![None; m];
     for term in &terms {
         if term.shift % 8 != 0 {
             return None;
@@ -616,9 +724,11 @@ fn validate(
         if idx >= m || by_shift[idx].is_some() {
             return None;
         }
-        by_shift[idx] = Some(term.ptr);
+        by_shift[idx] = Some((term.ptr, term.byte_off));
     }
-    let by_shift: Vec<Value> = by_shift.into_iter().collect::<Option<Vec<Value>>>()?;
+    let by_shift: Vec<(Value, u64)> = by_shift
+        .into_iter()
+        .collect::<Option<Vec<(Value, u64)>>>()?;
 
     // Consumed values: single use, single definition, in this block, and not
     // the value the rewrite keeps.
@@ -631,8 +741,9 @@ fn validate(
     // Resolve every term's pointer to (base expression, byte offset).
     let mut resolved: Vec<(Value, u64)> = Vec::with_capacity(m);
     let mut gep_steps: Vec<Value> = Vec::with_capacity(m);
-    for ptr in &by_shift {
-        resolved.push(resolve_ptr(ctx, Operand::Value(*ptr), 0, &mut gep_steps)?);
+    for &(ptr, byte_off) in &by_shift {
+        let (r, off) = resolve_ptr(ctx, Operand::Value(ptr), 0, &mut gep_steps)?;
+        resolved.push((r, off.checked_add(byte_off)?));
     }
     let root = resolved[0].0;
     if resolved.iter().any(|(r, _)| *r != root) {
@@ -677,7 +788,10 @@ fn validate(
     // for a run at a nonzero offset the term's own pointer is kept, which costs
     // nothing — a `GetElementPtr` of constant displacement folds into the
     // load's addressing mode, so the emitted instruction is byte-identical.
-    let lowest = by_shift[load_slot];
+    let (lowest, lowest_byte_off) = by_shift[load_slot];
+    if lowest_byte_off != 0 {
+        return None;
+    }
     let peeled_lowest = ctx.peel_or_self(lowest, 0)?;
     let fold_anchor = resolved[load_slot].1 == 0
         && peeled_lowest != root
@@ -694,14 +808,17 @@ fn validate(
         lowest
     };
     // Every other term's pointer is single-use, defined in this block, and
-    // folded away with the byte it fed.
-    for (k, ptr) in by_shift.iter().enumerate() {
-        if k == load_slot {
+    // folded away with the byte/sub-word it fed. Deduplicate `ptr` across
+    // synthetic sub-word byte terms sharing a single `Load<U16|U32>`.
+    let mut seen_ptrs = FxHashSet::default();
+    seen_ptrs.insert(lowest.0);
+    for (k, &(ptr, _)) in by_shift.iter().enumerate() {
+        if k == load_slot || !seen_ptrs.insert(ptr.0) {
             continue;
         }
-        let peeled = ctx.peel_or_self(*ptr, 0)?;
+        let peeled = ctx.peel_or_self(ptr, 0)?;
         if matches!(ctx.def(peeled), Some(Instruction::GetElementPtr { .. })) {
-            ctx.consume_dead_chain(&mut consumed, *ptr, peeled, block)?;
+            ctx.consume_dead_chain(&mut consumed, ptr, peeled, block)?;
         } else if ctx.use_count(peeled) != 1 || ctx.loc_of(peeled)?.0 != block {
             return None;
         }
@@ -1879,5 +1996,118 @@ mod tests {
             orig.blocks[0].instructions.len(),
             "refusal must not edit the function"
         );
+    }
+
+    #[test]
+    fn fuses_prewidened_bswap32_pair_with_i64_gep_into_bswap64_load() {
+        // Post-inlined `((uint64_t)get_u32_be(p) << 32) | get_u32_be(p + 4)`
+        // where `get_u32_be` was already folded into `Bswap(Load<U32>)` and
+        // `p + 4` uses `GetElementPtr { ty: IrType::I64 }`.
+        let mut f = IrFunction::new(
+            "be64_from_be32_pair".into(),
+            IrType::U64,
+            vec![crate::ir::reexports::IrParam {
+                ty: IrType::Ptr,
+                noalias: false,
+                struct_size: None,
+                struct_align: None,
+                param_align: None,
+                struct_eightbyte_classes: vec![],
+                is_f128_sse: false,
+                riscv_float_class: None,
+            }],
+            false,
+        );
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            source_spans: vec![],
+            instructions: vec![
+                Instruction::ParamRef {
+                    dest: Value(0),
+                    param_idx: 0,
+                    ty: IrType::Ptr,
+                },
+                Instruction::Load {
+                    dest: Value(1),
+                    ptr: Value(0),
+                    ty: IrType::U32,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+                Instruction::UnaryOp {
+                    dest: Value(2),
+                    op: IrUnaryOp::Bswap,
+                    src: Operand::Value(Value(1)),
+                    ty: IrType::U32,
+                },
+                Instruction::Cast {
+                    dest: Value(3),
+                    src: Operand::Value(Value(2)),
+                    from_ty: IrType::U32,
+                    to_ty: IrType::U64,
+                },
+                Instruction::BinOp {
+                    dest: Value(4),
+                    op: IrBinOp::Shl,
+                    lhs: Operand::Value(Value(3)),
+                    rhs: Operand::Const(IrConst::I32(32)),
+                    ty: IrType::U64,
+                },
+                Instruction::GetElementPtr {
+                    dest: Value(5),
+                    base: Value(0),
+                    offset: Operand::Const(IrConst::I64(4)),
+                    ty: IrType::I64,
+                },
+                Instruction::Load {
+                    dest: Value(6),
+                    ptr: Value(5),
+                    ty: IrType::U32,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+                Instruction::UnaryOp {
+                    dest: Value(7),
+                    op: IrUnaryOp::Bswap,
+                    src: Operand::Value(Value(6)),
+                    ty: IrType::U32,
+                },
+                Instruction::Cast {
+                    dest: Value(8),
+                    src: Operand::Value(Value(7)),
+                    from_ty: IrType::U32,
+                    to_ty: IrType::U64,
+                },
+                Instruction::BinOp {
+                    dest: Value(9),
+                    op: IrBinOp::Or,
+                    lhs: Operand::Value(Value(4)),
+                    rhs: Operand::Value(Value(8)),
+                    ty: IrType::U64,
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(9)))),
+        });
+        f.next_value_id = 10;
+
+        assert_eq!(run_function(&mut f, X64), 1);
+        assert_no_dangling_operands(&f);
+        assert!(f.blocks[0].instructions.iter().any(|i| matches!(
+            i,
+            Instruction::Load {
+                ptr: Value(0),
+                ty: IrType::U64,
+                ..
+            }
+        )));
+        assert!(f.blocks[0].instructions.iter().any(|i| matches!(
+            i,
+            Instruction::UnaryOp {
+                dest: Value(9),
+                op: IrUnaryOp::Bswap,
+                ty: IrType::U64,
+                ..
+            }
+        )));
     }
 }

@@ -34,7 +34,7 @@ use super::{
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::ir::analysis;
 use crate::ir::intrinsics::IntrinsicOp;
-use crate::ir::reexports::{Instruction, IrFunction, Operand, Terminator, Value};
+use crate::ir::reexports::{Instruction, IrConst, IrFunction, Operand, Terminator, Value};
 
 /// Run LICM using pre-computed CFG analysis (avoids redundant analysis when
 /// called from a pipeline that shares analysis across GVN, LICM, IVSR).
@@ -418,6 +418,11 @@ fn for_each_hoistable_operand(inst: &Instruction, mut f: impl FnMut(u32)) {
                 collect_op(a, &mut f);
             }
         }
+        Instruction::Call { info, .. } => {
+            for a in &info.args {
+                collect_op(a, &mut f);
+            }
+        }
         // All other instructions are non-hoistable and should never reach here.
         _ => unreachable!("for_each_hoistable_operand called on non-hoistable instruction"),
     }
@@ -432,10 +437,13 @@ struct LoopMemoryInfo {
     /// through `gep(alloca, offset1)` are recognized as modifying the same
     /// base alloca that an intrinsic reads through `gep(alloca, offset2)`.
     modified_base_allocas: FxHashSet<u32>,
-    /// Whether the loop body contains any function calls (Call, CallIndirect,
-    /// or InlineAsm with clobbers). Calls can modify any global variable,
-    /// so loads from globals cannot be hoisted past calls.
+    /// Whether the loop body contains any impure function calls (Call,
+    /// CallIndirect, or InlineAsm with clobbers). Impure calls can modify any
+    /// global variable, so loads from ordinary globals cannot be hoisted past them.
     has_calls: bool,
+    /// Whether the loop body calls `__lccc_cpu_init` (the only routine
+    /// that writes `__lccc_cpu_*` feature-indicator probe words).
+    has_cpu_init_call: bool,
     /// Whether the loop body has stores through pointers that can't be
     /// traced to any known GlobalAddr. Such pointers (e.g., loaded from
     /// a struct field at runtime) could alias any global, so all global
@@ -592,6 +600,7 @@ fn analyze_loop_memory(
 ) -> LoopMemoryInfo {
     let mut stored_allocas = FxHashSet::default();
     let mut has_calls = false;
+    let mut has_cpu_init_call = false;
     let mut has_unknown_derived_stores = false;
     let mut stored_global_bases: FxHashSet<u32> = FxHashSet::default();
 
@@ -684,9 +693,21 @@ fn analyze_loop_memory(
                         }
                     }
                 }
-                // Function calls can modify any global state.
-                Instruction::Call { .. } | Instruction::CallIndirect { .. } => {
-                    has_calls = true;
+                // Impure function calls can modify any global state; read-only
+                // (`is_pure`) and read-none (`is_const`) non-sret calls do not.
+                Instruction::Call { func, info } => {
+                    if func == crate::common::cpu_probe::INIT_SYMBOL {
+                        has_cpu_init_call = true;
+                    }
+                    if !((info.is_pure || info.is_const) && !info.is_sret) {
+                        has_calls = true;
+                    }
+                }
+                Instruction::CallIndirect { info, .. } => {
+                    if !((info.is_pure || info.is_const) && !info.is_sret) {
+                        has_calls = true;
+                        has_cpu_init_call = true;
+                    }
                 }
                 // InlineAsm output operands are pointers (allocas) that the backend
                 // stores results into. Track them as stores to prevent LICM from
@@ -807,6 +828,7 @@ fn analyze_loop_memory(
         stored_allocas,
         modified_base_allocas,
         has_calls,
+        has_cpu_init_call,
         has_unknown_derived_stores,
         stored_global_bases,
     }
@@ -928,6 +950,7 @@ fn is_load_hoistable(
     invariant: &FxHashSet<u32>,
     global_addr_values: &FxHashSet<u32>,
     root_global_addr_values: &FxHashSet<u32>,
+    probe_word_global_values: &FxHashSet<u32>,
     value_to_base_global: &FxHashMap<u32, u32>,
     alias_info: &LoopAliasInfo,
     load_size: i64,
@@ -975,6 +998,12 @@ fn is_load_hoistable(
     // guard protecting the loop is false, so it needs a dedicated preheader
     // like any other derived pointer.
     if global_addr_values.contains(&ptr_id) {
+        // Compiler-internal CPU probe words (`__lccc_cpu_w*`) are populated
+        // once in the entry block's guarded `__lccc_cpu_init` prologue and
+        // never aliased by user stores or ordinary calls.
+        if probe_word_global_values.contains(&ptr_id) && !loop_mem.has_cpu_init_call {
+            return true;
+        }
         if !preheader_is_dedicated && !root_global_addr_values.contains(&ptr_id) {
             licm_debug(|| eprintln!("[LICM] global load: preheader not dedicated"));
             return false;
@@ -1038,6 +1067,189 @@ fn is_load_hoistable(
     })
 }
 
+fn block_has_impure_call(block: &crate::ir::reexports::BasicBlock) -> bool {
+    block.instructions.iter().any(|inst| match inst {
+        Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
+            !((info.is_pure || info.is_const) && !info.is_sret)
+        }
+        Instruction::InlineAsm { clobbers, .. } => !clobbers.is_empty(),
+        _ => false,
+    })
+}
+
+fn eval_typed_int_cmp(
+    op: crate::ir::reexports::IrCmpOp,
+    lhs: i64,
+    rhs: i64,
+    ty: crate::common::types::IrType,
+) -> Option<bool> {
+    use crate::common::types::IrType;
+    let (ls, rs, lu, ru): (i64, i64, u64, u64) = match ty {
+        IrType::I8 | IrType::U8 => (
+            (lhs as i8) as i64,
+            (rhs as i8) as i64,
+            (lhs as u8) as u64,
+            (rhs as u8) as u64,
+        ),
+        IrType::I16 | IrType::U16 => (
+            (lhs as i16) as i64,
+            (rhs as i16) as i64,
+            (lhs as u16) as u64,
+            (rhs as u16) as u64,
+        ),
+        IrType::I32 | IrType::U32 => (
+            (lhs as i32) as i64,
+            (rhs as i32) as i64,
+            (lhs as u32) as u64,
+            (rhs as u32) as u64,
+        ),
+        IrType::I64 | IrType::U64 | IrType::Ptr => (lhs, rhs, lhs as u64, rhs as u64),
+        _ => return None,
+    };
+    use crate::ir::reexports::IrCmpOp;
+    Some(match op {
+        IrCmpOp::Eq => lu == ru,
+        IrCmpOp::Ne => lu != ru,
+        IrCmpOp::Slt => ls < rs,
+        IrCmpOp::Sle => ls <= rs,
+        IrCmpOp::Sgt => ls > rs,
+        IrCmpOp::Sge => ls >= rs,
+        IrCmpOp::Ult => lu < ru,
+        IrCmpOp::Ule => lu <= ru,
+        IrCmpOp::Ugt => lu > ru,
+        IrCmpOp::Uge => lu >= ru,
+    })
+}
+
+/// Prove that entering `header` from `preheader` on iteration 0 unconditionally
+/// reaches `target_block` before any back-edge or impure call.
+fn loop_first_iter_reaches_block(
+    func: &IrFunction,
+    preheader: usize,
+    header: usize,
+    target_block: usize,
+    loop_body: &FxHashSet<usize>,
+    _idom: &[usize],
+) -> bool {
+    if target_block == header {
+        return true;
+    }
+    if block_has_impure_call(&func.blocks[header]) {
+        return false;
+    }
+    let preheader_label = func.blocks[preheader].label;
+    let resolve_entry_const = |op: &Operand| -> Option<i64> {
+        let mut cur = *op;
+        for _ in 0..4 {
+            match cur {
+                Operand::Const(c) => return c.to_i64(),
+                Operand::Value(v) => {
+                    let mut next = None;
+                    for inst in &func.blocks[header].instructions {
+                        if let Instruction::Phi { dest, incoming, .. } = inst
+                            && dest.0 == v.0
+                        {
+                            for (inc_op, inc_lbl) in incoming {
+                                if *inc_lbl == preheader_label {
+                                    next = Some(*inc_op);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if next.is_none() {
+                        for (bi, blk) in func.blocks.iter().enumerate() {
+                            if loop_body.contains(&bi) {
+                                continue;
+                            }
+                            for inst in &blk.instructions {
+                                if let Instruction::Copy { dest, src } = inst
+                                    && dest.0 == v.0
+                                {
+                                    next = Some(*src);
+                                    break;
+                                }
+                            }
+                            if next.is_some() {
+                                break;
+                            }
+                        }
+                    }
+                    cur = next?;
+                }
+            }
+        }
+        None
+    };
+
+    let first_label = match &func.blocks[header].terminator {
+        Terminator::Branch(lbl) => *lbl,
+        Terminator::CondBranch {
+            cond,
+            true_label,
+            false_label,
+        } => {
+            let taken = match cond {
+                Operand::Const(c) => c.to_i64().map(|x| x != 0),
+                Operand::Value(cv) => {
+                    let mut res = None;
+                    for inst in &func.blocks[header].instructions {
+                        if let Instruction::Cmp {
+                            dest,
+                            op,
+                            lhs,
+                            rhs,
+                            ty,
+                        } = inst
+                            && dest.0 == cv.0
+                        {
+                            if let (Some(lv), Some(rv)) =
+                                (resolve_entry_const(lhs), resolve_entry_const(rhs))
+                            {
+                                res = eval_typed_int_cmp(*op, lv, rv, *ty);
+                            }
+                            break;
+                        }
+                    }
+                    res
+                }
+            };
+            let Some(taken) = taken else { return false };
+            if taken { *true_label } else { *false_label }
+        }
+        _ => return false,
+    };
+
+    let find_loop_block = |lbl: crate::ir::reexports::BlockId| -> Option<usize> {
+        func.blocks
+            .iter()
+            .position(|b| b.label == lbl)
+            .filter(|idx| loop_body.contains(idx))
+    };
+
+    let Some(mut cur_idx) = find_loop_block(first_label) else {
+        return false;
+    };
+    for _ in 0..4 {
+        if cur_idx == target_block {
+            return true;
+        }
+        if cur_idx == header || block_has_impure_call(&func.blocks[cur_idx]) {
+            return false;
+        }
+        match &func.blocks[cur_idx].terminator {
+            Terminator::Branch(next_lbl) => {
+                let Some(next_idx) = find_loop_block(*next_lbl) else {
+                    return false;
+                };
+                cur_idx = next_idx;
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
 fn dominates_block(idom: &[usize], a: usize, mut b: usize) -> bool {
     if a == b {
         return true;
@@ -1051,6 +1263,133 @@ fn dominates_block(idom: &[usize], a: usize, mut b: usize) -> bool {
         guard += 1;
     }
     false
+}
+
+/// True when every execution of `preheader` is guaranteed to branch into
+/// `header` — either directly via an unconditional `Branch(header)` or via a
+/// `CondBranch` whose condition is provably constant toward `header` (such as
+/// `loop_rotate`'s `if (0 < N)` entry guard for a constant-trip loop).
+fn preheader_always_enters_header(
+    func: &IrFunction,
+    preheader: usize,
+    header: usize,
+    preds: &analysis::FlatAdj,
+    idom: &[usize],
+) -> bool {
+    let header_label = func.blocks[header].label;
+    match &func.blocks[preheader].terminator {
+        Terminator::Branch(l) => *l == header_label,
+        Terminator::CondBranch {
+            cond,
+            true_label,
+            false_label,
+        } if *true_label == header_label || *false_label == header_label => {
+            let max_id = func.max_value_id() as usize;
+            let mut def_counts = vec![0u8; max_id + 1];
+            for b in &func.blocks {
+                for inst in &b.instructions {
+                    if let Some(d) = inst.dest()
+                        && let Some(slot) = def_counts.get_mut(d.0 as usize)
+                    {
+                        *slot = slot.saturating_add(1);
+                    }
+                }
+            }
+            let mut const_vals: FxHashMap<u32, IrConst> = FxHashMap::default();
+            for (bi, b) in func.blocks.iter().enumerate() {
+                if !dominates_block(idom, bi, preheader) {
+                    continue;
+                }
+                for inst in &b.instructions {
+                    if let Some(d) = inst.dest()
+                        && def_counts.get(d.0 as usize).copied() != Some(1)
+                    {
+                        continue;
+                    }
+                    match inst {
+                        Instruction::Copy {
+                            dest,
+                            src: Operand::Const(c),
+                        } => {
+                            const_vals.insert(dest.0, *c);
+                        }
+                        Instruction::Copy {
+                            dest,
+                            src: Operand::Value(sv),
+                        } => {
+                            if let Some(&c) = const_vals.get(&sv.0) {
+                                const_vals.insert(dest.0, c);
+                            }
+                        }
+                        Instruction::Phi { dest, incoming, .. } if bi == preheader => {
+                            let ph_preds = preds.row(preheader);
+                            if !ph_preds.is_empty() {
+                                let mut common: Option<IrConst> = None;
+                                let mut all_match = true;
+                                for &pred_bi in ph_preds {
+                                    let pred_lbl = func.blocks[pred_bi as usize].label;
+                                    let Some((op, _)) =
+                                        incoming.iter().find(|(_, l)| *l == pred_lbl)
+                                    else {
+                                        all_match = false;
+                                        break;
+                                    };
+                                    let val_c = match op {
+                                        Operand::Const(c) => Some(*c),
+                                        Operand::Value(v) => const_vals.get(&v.0).copied(),
+                                    };
+                                    match (common, val_c) {
+                                        (None, Some(c)) => common = Some(c),
+                                        (Some(a), Some(b)) if a.to_i128() == b.to_i128() => {}
+                                        _ => {
+                                            all_match = false;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if all_match && let Some(c) = common {
+                                    const_vals.insert(dest.0, c);
+                                }
+                            }
+                        }
+                        Instruction::Cmp {
+                            dest,
+                            op,
+                            lhs,
+                            rhs,
+                            ty,
+                        } => {
+                            let l = match lhs {
+                                Operand::Const(c) => Some(*c),
+                                Operand::Value(v) => const_vals.get(&v.0).copied(),
+                            };
+                            let r = match rhs {
+                                Operand::Const(c) => Some(*c),
+                                Operand::Value(v) => const_vals.get(&v.0).copied(),
+                            };
+                            if let (Some(lc), Some(rc)) = (l, r)
+                                && let Some(folded) =
+                                    super::constant_fold::eval_cmp_const(*op, lc, rc, *ty)
+                            {
+                                const_vals.insert(dest.0, folded);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            let cond_const = match cond {
+                Operand::Const(c) => Some(*c),
+                Operand::Value(v) => const_vals.get(&v.0).copied(),
+            };
+            match cond_const.and_then(|c| c.to_i128()) {
+                Some(n) if n != 0 => *true_label == header_label,
+                Some(0) => *false_label == header_label,
+                _ => false,
+            }
+        }
+        _ => false,
+    }
 }
 
 /// Hoist loop-invariant instructions from a natural loop to a preheader.
@@ -1094,10 +1433,8 @@ fn hoist_loop_invariants(
     // non-dedicated preheaders; only the derived-pointer path (call
     // results, params, GEP chains — anything that can fault) requires the
     // dedicated shape.
-    let preheader_is_dedicated = match &func.blocks[preheader].terminator {
-        Terminator::Branch(l) => *l == func.blocks[header].label,
-        _ => false,
-    };
+    let preheader_is_dedicated =
+        preheader_always_enters_header(func, preheader, header, preds, idom);
 
     // Build the set of Value IDs defined inside the loop.
     // InlineAsm outputs are included: after mem2reg promotion, InlineAsm output
@@ -1131,11 +1468,15 @@ fn hoist_loop_invariants(
     // correctly block loads through a different GlobalAddr for "perm".
     let mut global_addr_values: FxHashSet<u32> = FxHashSet::default();
     let mut root_global_addr_values: FxHashSet<u32> = FxHashSet::default();
+    let mut probe_word_global_values: FxHashSet<u32> = FxHashSet::default();
     for block in func.blocks.iter() {
         for inst in &block.instructions {
-            if let Instruction::GlobalAddr { dest, .. } = inst {
+            if let Instruction::GlobalAddr { dest, name } = inst {
                 global_addr_values.insert(dest.0);
                 root_global_addr_values.insert(dest.0);
+                if crate::common::cpu_probe::is_probe_word_symbol(name) {
+                    probe_word_global_values.insert(dest.0);
+                }
             }
         }
     }
@@ -1361,11 +1702,74 @@ fn hoist_loop_invariants(
                             &invariant,
                             &global_addr_values,
                             &root_global_addr_values,
+                            &probe_word_global_values,
                             &value_to_base_global,
                             &alias_info,
                             ty.size() as i64,
                             preheader_is_dedicated,
                         )
+                    }
+                } else if let Instruction::Call { info, .. } = inst {
+                    // Loop-invariant direct pure/const scalar call hoisting:
+                    // -Callee must be `is_pure || is_const`, non-sret, non-variadic,
+                    //  with a scalar return (`dest.is_some()`).
+                    // -Every argument must be loop-invariant.
+                    // -For read-only (`!info.is_const` or pointer-taking) calls:
+                    //  the loop must have no stores or impure calls, the call's
+                    //  block must dominate all loop blocks (or execute on the first
+                    //  iteration via a dedicated preheader whose first iteration is
+                    //  guaranteed to enter the call's block), and `preheader_is_dedicated`
+                    //  must hold so dereferences inside the callee are never speculated
+                    //  across an outer guard or a zero-trip loop.
+                    let scalar_ret = info.dest.is_some()
+                        && info.return_type != crate::common::types::IrType::Void
+                        && !info.return_type.is_long_double()
+                        && !info.return_type.is_128bit();
+                    let args_invariant = info.args.iter().all(|a| match a {
+                        Operand::Const(_) => true,
+                        Operand::Value(v) => {
+                            !loop_defined.contains(&v.0) || invariant.contains(&v.0)
+                        }
+                    });
+                    if (info.is_pure || info.is_const)
+                        && !info.is_sret
+                        && !info.is_variadic
+                        && scalar_ret
+                        && args_invariant
+                    {
+                        let has_ptr_arg =
+                            info.arg_types.contains(&crate::common::types::IrType::Ptr);
+                        if info.is_const && !has_ptr_arg {
+                            // Read-none scalar call without pointers: safe if either
+                            // dominating all loop blocks or guaranteed first-iter entry.
+                            natural_loop
+                                .body
+                                .iter()
+                                .all(|&b| dominates_block(idom, block_idx, b))
+                                || (preheader_is_dedicated
+                                    && loop_first_iter_reaches_block(
+                                        func,
+                                        preheader,
+                                        header,
+                                        block_idx,
+                                        &natural_loop.body,
+                                        idom,
+                                    ))
+                        } else {
+                            preheader_is_dedicated
+                                && !loop_mem.has_calls
+                                && !loop_mem.has_any_stores()
+                                && loop_first_iter_reaches_block(
+                                    func,
+                                    preheader,
+                                    header,
+                                    block_idx,
+                                    &natural_loop.body,
+                                    idom,
+                                )
+                        }
+                    } else {
+                        false
                     }
                 } else {
                     false
@@ -2410,5 +2814,108 @@ mod tests {
 
         // The body block should still have all 3 instructions
         assert_eq!(func.blocks[2].instructions.len(), 3);
+    }
+
+    #[test]
+    fn hoists_cpu_probe_word_across_call_and_pure_call_into_rotated_guard_preheader() {
+        let mut func = IrFunction::new("probe_and_pure".into(), IrType::I64, vec![], false);
+        // Block 0: rotated constant-true entry guard (`0 < 8`) -> Block 1 (loop) / Block 2 (exit).
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::GlobalAddr {
+                    dest: Value(0),
+                    name: "__lccc_cpu_w0".into(),
+                },
+                Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Const(IrConst::I32(0)),
+                },
+                Instruction::Cmp {
+                    dest: Value(2),
+                    op: crate::ir::reexports::IrCmpOp::Ult,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I32(8)),
+                    ty: IrType::U32,
+                },
+            ],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(2)),
+                true_label: BlockId(1),
+                false_label: BlockId(2),
+            },
+            source_spans: vec![],
+        });
+        // Block 1: rotated single-block loop loading `__lccc_cpu_w0` and calling a pure fn.
+        func.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![
+                Instruction::Phi {
+                    dest: Value(3),
+                    ty: IrType::U32,
+                    incoming: vec![
+                        (Operand::Value(Value(1)), BlockId(0)),
+                        (Operand::Value(Value(6)), BlockId(1)),
+                    ],
+                },
+                Instruction::Load {
+                    dest: Value(4),
+                    ptr: Value(0),
+                    ty: crate::common::types::IrType::U64,
+                    seg_override: crate::common::types::AddressSpace::Default,
+                    volatile: false,
+                },
+                Instruction::Call {
+                    func: "pure_helper".into(),
+                    info: crate::ir::reexports::CallInfo {
+                        dest: Some(Value(5)),
+                        args: vec![Operand::Value(Value(4))],
+                        arg_types: vec![crate::common::types::IrType::U64],
+                        return_type: crate::common::types::IrType::I64,
+                        is_pure: true,
+                        ..crate::ir::reexports::CallInfo::default()
+                    },
+                },
+                Instruction::BinOp {
+                    dest: Value(6),
+                    op: crate::ir::reexports::IrBinOp::Add,
+                    lhs: Operand::Value(Value(3)),
+                    rhs: Operand::Const(IrConst::I32(1)),
+                    ty: IrType::U32,
+                },
+                Instruction::Cmp {
+                    dest: Value(7),
+                    op: crate::ir::reexports::IrCmpOp::Ult,
+                    lhs: Operand::Value(Value(6)),
+                    rhs: Operand::Const(IrConst::I32(8)),
+                    ty: IrType::U32,
+                },
+            ],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(7)),
+                true_label: BlockId(1),
+                false_label: BlockId(2),
+            },
+            source_spans: vec![],
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: vec![],
+            terminator: Terminator::Return(Some(Operand::Const(IrConst::I64(0)))),
+            source_spans: vec![],
+        });
+        func.next_value_id = 8;
+
+        let alloca_info = analyze_allocas(&func);
+        let label_to_idx = analysis::build_label_map(&func);
+        let (preds, succs) = analysis::build_cfg(&func, &label_to_idx);
+        let idom = analysis::compute_dominators(func.blocks.len(), &preds, &succs);
+        let loops = loop_analysis::find_natural_loops(func.blocks.len(), &preds, &succs, &idom);
+        assert_eq!(loops.len(), 1);
+        let hoisted = hoist_loop_invariants(&mut func, &loops[0], &preds, &idom, &alloca_info);
+        assert_eq!(
+            hoisted, 2,
+            "both __lccc_cpu_w0 load and pure_helper call should hoist"
+        );
     }
 }

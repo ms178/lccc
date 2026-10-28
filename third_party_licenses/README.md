@@ -18,6 +18,12 @@ extraction boundaries, and the authoritative per-file mapping; see
 | `sqlite_varint.c` | `SQLite-public-domain.txt` |
 | `linux_find_bit.c` | `Linux-GPL-2.0-or-later.txt` |
 | `glibc_memcmp.c` | `GNU-LGPL-2.1-or-later.txt` |
+| `gzip_crc32_slice8.c` | `GNU-LGPL-3.0-or-later.txt` |
+| `zlib_ng_slide_hash.c` | `Zlib.txt` |
+| `expat_utf8_content.c` | `Expat-MIT.txt` |
+| `sqlite_vdbe_serial.c` | `SQLite-public-domain.txt` |
+| `linux_xxhash64.c` | `Linux-GPL-2.0-or-later.txt` (dual `BSD-2-Clause OR GPL-2.0-only`) |
+| `glibc_dl_hash.c` | `GNU-LGPL-2.1-or-later.txt` |
 
 The code headers and provenance manifest control if any wording here differs
 from a package-level license file.  The kernel itself is test/measurement

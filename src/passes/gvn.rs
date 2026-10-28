@@ -76,6 +76,16 @@ enum ExprKey {
     /// Load CSE key: two loads from the same pointer with the same type
     /// produce the same value if no intervening memory modification occurs.
     Load { ptr: VNOperand, ty: IrType },
+    /// Pure/const direct call CSE key. `mem_epoch` is `None` for read-none
+    /// (`is_const` with no pointer arguments) calls and `Some((load_generation,
+    /// unknown_ptr_epoch))` for read-only (`is_pure`) calls so any memory write,
+    /// impure call, or CFG merge invalidates cached pure-call results in O(1).
+    PureCall {
+        func: String,
+        args: Vec<VNOperand>,
+        ret_ty: IrType,
+        mem_epoch: Option<u64>,
+    },
 }
 
 /// Returns true if the ExprKey represents a Load (memory-dependent expression).
@@ -251,6 +261,11 @@ struct GvnState {
     /// invalidate unknown-pointer entries. This preserves the optimization win
     /// for distinct known globals while closing the classic STORE-CCP hole.
     unknown_ptr_epoch: u64,
+    /// Epoch for `ExprKey::PureCall` CSE: advances on any memory write or
+    /// clobber and at CFG merge points reachable from `idom` via any block
+    /// that may modify memory, while keeping `load_generation` unchanged so
+    /// loop-body loads retain vectorization-friendly placement.
+    pure_call_epoch: u64,
     /// Store-to-load forwarding map with the version recorded after the store.
     store_fwd_map: FxHashMap<StoreFwdKey, (Operand, MemoryVersion)>,
     /// Pointer value number -> provably-distinct base object, for pointers
@@ -398,6 +413,7 @@ impl GvnState {
             gep_value_numbers: FxHashMap::default(),
             load_generation: 0,
             unknown_ptr_epoch: 0,
+            pure_call_epoch: 0,
             store_fwd_map: FxHashMap::default(),
             ptr_base: FxHashMap::default(),
             base_store_epoch: FxHashMap::default(),
@@ -862,6 +878,40 @@ impl GvnState {
                     *dest,
                 ))
             }
+            // Pure/const direct scalar calls: read-none (`is_const` with no
+            // pointer arguments) depends only on its argument VNs; read-only
+            // (`is_pure`, or `is_const` with pointer arguments) additionally
+            // keys on `(load_generation, unknown_ptr_epoch)` so any memory
+            // write, impure call, or CFG merge invalidates it in O(1).
+            Instruction::Call { func, info }
+                if (info.is_pure || info.is_const)
+                    && !info.is_sret
+                    && !info.is_variadic
+                    && info.dest.is_some()
+                    && !info.return_type.is_float()
+                    && !info.return_type.is_long_double()
+                    && !info.return_type.is_128bit()
+                    && info.return_type != IrType::Void =>
+            {
+                let call_dest = info.dest?;
+                let args: Vec<VNOperand> =
+                    info.args.iter().map(|a| self.operand_to_vn(a)).collect();
+                let has_ptr_arg = info.arg_types.contains(&IrType::Ptr);
+                let mem_epoch = if info.is_const && !has_ptr_arg {
+                    None
+                } else {
+                    Some(self.pure_call_epoch)
+                };
+                Some((
+                    ExprKey::PureCall {
+                        func: self.context.canonical(func).to_string(),
+                        args,
+                        ret_ty: info.return_type,
+                        mem_epoch,
+                    },
+                    call_dest,
+                ))
+            }
             // Other instructions (Store, Call, AtomicLoad, etc.) are not eligible.
             // AtomicLoad is excluded because it has memory ordering semantics that
             // require the load to actually execute.
@@ -964,6 +1014,7 @@ impl GvnState {
             base_epoch_log_start: self.base_epoch_log.len(),
             saved_load_generation: self.load_generation,
             saved_unknown_ptr_epoch: self.unknown_ptr_epoch,
+            saved_pure_call_epoch: self.pure_call_epoch,
         }
     }
 
@@ -1037,6 +1088,7 @@ impl GvnState {
         // Rollback: restore memory epochs
         self.load_generation = checkpoint.saved_load_generation;
         self.unknown_ptr_epoch = checkpoint.saved_unknown_ptr_epoch;
+        self.pure_call_epoch = checkpoint.saved_pure_call_epoch;
     }
 }
 
@@ -1050,6 +1102,7 @@ struct ScopeCheckpoint {
     base_epoch_log_start: usize,
     saved_load_generation: u32,
     saved_unknown_ptr_epoch: u64,
+    saved_pure_call_epoch: u64,
 }
 
 /// Find param allocas whose address has escaped (used in non-Load/Store contexts).
@@ -1166,6 +1219,16 @@ fn cross_block_renamable(inst: &Instruction) -> bool {
             ty,
             ..
         } => !ty.is_float() && !ty.is_128bit(),
+        Instruction::Call { info, .. } => {
+            (info.is_pure || info.is_const)
+                && !info.is_sret
+                && !info.is_variadic
+                && info.dest.is_some()
+                && !info.return_type.is_float()
+                && !info.return_type.is_long_double()
+                && !info.return_type.is_128bit()
+                && info.return_type != IrType::Void
+        }
         _ => false,
     }
 }
@@ -1580,7 +1643,20 @@ pub(crate) fn run_gvn_with_analysis_and_context(
     );
     state.phi_incoming_feeds = collect_phi_incoming_feeds(func);
     state.xsign_use_info = find_value_use_info(func);
-    gvn_dfs(0, func, &cfg.dom_children, &cfg.preds, &mut state);
+    let block_modifies_mem: Vec<bool> = func
+        .blocks
+        .iter()
+        .map(|b| b.instructions.iter().any(clobbers_memory))
+        .collect();
+    gvn_dfs(
+        0,
+        None,
+        func,
+        &cfg.dom_children,
+        &cfg.preds,
+        &block_modifies_mem,
+        &mut state,
+    );
     apply_pending_renames(func, &mut state);
     state.total_eliminated
 }
@@ -1716,14 +1792,64 @@ fn apply_pending_renames(func: &mut IrFunction, state: &mut GvnState) {
     }
 }
 
+/// True when any block on any path from `idom_idx` to `block_idx` (excluding
+/// `idom_idx`'s straight-line execution already reflected in `state`) may
+/// modify memory. Since `idom_idx` dominates `block_idx`, every predecessor
+/// walked backward before reaching `idom_idx` lies in `idom_idx`'s dominator
+/// subtree; a small visit budget fails closed in O(1) on giant CFGs.
+fn merge_may_modify_memory_since_idom(
+    block_idx: usize,
+    idom_idx: usize,
+    preds: &analysis::FlatAdj,
+    block_modifies_mem: &[bool],
+) -> bool {
+    const VISIT_BUDGET: usize = 64;
+    let mut visited: FxHashSet<usize> = FxHashSet::default();
+    let mut worklist: Vec<usize> = Vec::new();
+    for &p in preds.row(block_idx) {
+        let p = p as usize;
+        if p == idom_idx {
+            continue;
+        }
+        if visited.insert(p) {
+            worklist.push(p);
+        }
+    }
+    while let Some(u) = worklist.pop() {
+        if block_modifies_mem.get(u).copied().unwrap_or(true) {
+            return true;
+        }
+        if visited.len() > VISIT_BUDGET {
+            return true;
+        }
+        for &pred in preds.row(u) {
+            let pred = pred as usize;
+            if pred == idom_idx {
+                if preds.len(idom_idx) > 1
+                    && block_modifies_mem.get(idom_idx).copied().unwrap_or(true)
+                {
+                    return true;
+                }
+                continue;
+            }
+            if visited.insert(pred) {
+                worklist.push(pred);
+            }
+        }
+    }
+    false
+}
+
 /// Recursive DFS over the dominator tree for GVN.
 /// Processes block_idx, then recurses into dominated children.
 /// Uses rollback logs to restore state on backtracking.
 fn gvn_dfs(
     block_idx: usize,
+    idom_opt: Option<usize>,
     func: &mut IrFunction,
     dom_children: &[Vec<usize>],
     preds: &analysis::FlatAdj,
+    block_modifies_mem: &[bool],
     state: &mut GvnState,
 ) {
     let checkpoint = state.save_scope();
@@ -1738,6 +1864,15 @@ fn gvn_dfs(
     // generations are ignored during lookup.
     if block_idx != 0 && preds.len(block_idx) > 1 {
         state.load_generation += 1;
+        let may_modify = match idom_opt {
+            Some(idom_idx) => {
+                merge_may_modify_memory_since_idom(block_idx, idom_idx, preds, block_modifies_mem)
+            }
+            None => true,
+        };
+        if may_modify {
+            state.pure_call_epoch = state.pure_call_epoch.saturating_add(1);
+        }
     }
 
     // Process instructions in this block
@@ -1749,7 +1884,15 @@ fn gvn_dfs(
     let num_children = dom_children[block_idx].len();
     for ci in 0..num_children {
         let child = dom_children[block_idx][ci];
-        gvn_dfs(child, func, dom_children, preds, state);
+        gvn_dfs(
+            child,
+            Some(block_idx),
+            func,
+            dom_children,
+            preds,
+            block_modifies_mem,
+            state,
+        );
     }
 
     state.restore_scope(&checkpoint);
@@ -1804,10 +1947,15 @@ fn clobbers_memory(inst: &Instruction) -> bool {
         | Instruction::InlineAsm { .. }
         | Instruction::VaStart { .. }
         | Instruction::VaEnd { .. }
-        | Instruction::VaCopy { .. } => true,
-        Instruction::Intrinsic {
-            dest_ptr: Some(_), ..
-        } => true,
+        | Instruction::VaCopy { .. }
+        | Instruction::VaArg { .. }
+        | Instruction::VaArgStruct { .. }
+        | Instruction::VaArgVector { .. } => true,
+        Instruction::Intrinsic { dest_ptr, op, .. }
+            if dest_ptr.is_some() || op.writes_memory_via_args() =>
+        {
+            true
+        }
         _ => false,
     }
 }
@@ -1879,6 +2027,7 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState) 
             // a phi of multiple roots cannot survive a later `store &b` just
             // because that store also has a precise per-base epoch.
             state.unknown_ptr_epoch = state.unknown_ptr_epoch.saturating_add(1);
+            state.pure_call_epoch = state.pure_call_epoch.saturating_add(1);
             if *seg_override != AddressSpace::Default {
                 state.load_generation += 1;
             } else {
@@ -1912,6 +2061,7 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState) 
             }
         } else if clobbers_memory(&inst) {
             state.load_generation += 1;
+            state.pure_call_epoch = state.pure_call_epoch.saturating_add(1);
         }
 
         // Store-to-load forwarding: record stored values for subsequent loads.
@@ -4794,5 +4944,107 @@ mod tests {
                     .any(|i| matches!(i, Instruction::Select { dest, .. } if dest.0 == kept))
             );
         }
+    }
+
+    #[test]
+    fn pure_call_cse_crosses_readonly_loop_and_invalidates_on_vecstore_clobber() {
+        let pure_call = |dest: u32| Instruction::Call {
+            func: "scan_ro".into(),
+            info: CallInfo {
+                dest: Some(Value(dest)),
+                args: vec![],
+                arg_types: vec![],
+                return_type: IrType::I64,
+                is_pure: true,
+                ..CallInfo::default()
+            },
+        };
+        // Read-only loop: block 0 calls `scan_ro()`, branches to header block 1
+        // -> latch block 2 (also calling `scan_ro()`) -> back to block 1.
+        let ro_func = fn_of(
+            "ro_loop",
+            vec![
+                blk(
+                    0,
+                    vec![pure_call(1)],
+                    Terminator::Branch(BlockId(1)),
+                    vec![],
+                ),
+                blk(
+                    1,
+                    vec![Instruction::Phi {
+                        dest: Value(2),
+                        ty: IrType::I32,
+                        incoming: vec![
+                            (Operand::Const(IrConst::I32(0)), BlockId(0)),
+                            (Operand::Value(Value(4)), BlockId(2)),
+                        ],
+                    }],
+                    Terminator::CondBranch {
+                        cond: Operand::Value(Value(2)),
+                        true_label: BlockId(3),
+                        false_label: BlockId(2),
+                    },
+                    vec![],
+                ),
+                blk(
+                    2,
+                    vec![
+                        pure_call(3),
+                        Instruction::BinOp {
+                            dest: Value(4),
+                            op: IrBinOp::Add,
+                            lhs: Operand::Value(Value(2)),
+                            rhs: Operand::Const(IrConst::I32(1)),
+                            ty: IrType::I32,
+                        },
+                    ],
+                    Terminator::Branch(BlockId(1)),
+                    vec![],
+                ),
+                blk(
+                    3,
+                    vec![],
+                    Terminator::Return(Some(Operand::Value(Value(1)))),
+                    vec![],
+                ),
+            ],
+            6,
+        );
+        let mut ro_mod = module_of(ro_func);
+        assert_eq!(ro_mod.for_each_function(run_gvn_function), 1);
+
+        // Same-block `VecStoreI32x8` (`dest_ptr: None`, `writes_memory_via_args`)
+        // between two `scan_ro()` calls MUST clobber memory and block CSE.
+        let clobbered = fn_of(
+            "vec_clobber",
+            vec![blk(
+                0,
+                vec![
+                    Instruction::ParamRef {
+                        dest: Value(0),
+                        param_idx: 0,
+                        ty: IrType::Ptr,
+                    },
+                    pure_call(1),
+                    Instruction::Intrinsic {
+                        dest: None,
+                        op: crate::ir::intrinsics::IntrinsicOp::VecStoreI32x8,
+                        dest_ptr: None,
+                        args: vec![
+                            Operand::Value(Value(0)),
+                            Operand::Const(IrConst::I64(0)),
+                            Operand::Value(Value(1)),
+                        ],
+                    },
+                    pure_call(2),
+                ],
+                Terminator::Return(Some(Operand::Value(Value(2)))),
+                vec![],
+            )],
+            4,
+        );
+        let mut clob_mod = module_of(clobbered);
+        assert_eq!(clob_mod.for_each_function(run_gvn_function), 0);
     }
 }
