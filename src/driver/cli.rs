@@ -53,11 +53,11 @@
 //! Escalation is spelled with the `LCCC_STRICT_` prefix already established by
 //! `LCCC_STRICT_MFLAGS` below.
 //!
-//! Two spellings with an implementation in another layer are recognised here
-//! so they cannot reach the fallback at all: `--sysroot[=]`/`-isysroot[=]`
-//! (resolved by the link layer and the include search) and the GNU link-file
-//! switches `-nostartfiles`/`-nodefaultlibs` (recorded on the driver and
-//! forwarded by `build_linker_args` to `backend::common`, like `-nostdlib`).
+//! The GNU link-file switches `-nostartfiles`/`-nodefaultlibs` are recorded on
+//! the driver and forwarded by `build_linker_args` to `backend::common`, like
+//! `-nostdlib`. GNU `--sysroot` and `-isysroot` are refused: the available
+//! `LCCC_SYSROOT` overlay falls back to host paths and does not implement their
+//! header/link isolation or precedence semantics.
 
 use super::pipeline::{CliDefine, CompileMode, Driver};
 use crate::backend::Target;
@@ -1371,17 +1371,17 @@ impl Driver {
             Target::Aarch64 | Target::Riscv64
         ));
 
+        // Expand before the early query path as well: otherwise a sysroot
+        // hidden in a response file could yield a misleading host library path.
+        let expanded_args = Self::expand_response_files(&args[1..]);
+        Self::reject_unsupported_sysroots(&expanded_args)?;
+
         // Handle GCC query flags that exit immediately (before requiring input files).
         // These are used by configure scripts to detect the compiler and target.
         if Self::handle_query_flags(args, &self.target)? {
             return Ok(true);
         }
 
-        // Expand @response_file arguments (GCC/MSVC convention).
-        // Response files contain additional command-line arguments, one per line
-        // or whitespace-separated. Build systems like Meson use them when the
-        // command line would exceed OS limits.
-        let expanded_args = Self::expand_response_files(&args[1..]);
         self.parse_main_args(&expanded_args)?;
 
         // i386 has a real SSE-only state: unlike x86-64's existing backend,
@@ -1444,8 +1444,9 @@ impl Driver {
     /// Handle early-exit query flags (--dumpmachine, --version, etc.).
     /// Returns Ok(true) if a query flag was handled and the process should exit.
     fn handle_query_flags(args: &[String], target: &Target) -> Result<bool, String> {
-        // Capture --sysroot / -isysroot so -print-libgcc-file-name resolves
-        // against the sysroot when one is given (glibc cross-style builds).
+        // Root-dependent query plumbing remains below for a future complete
+        // implementation. True GNU driver sysroot requests are rejected before
+        // this early-exit handler; the legacy overlay is not equivalent.
         let mut sysroot: Option<String> = None;
         {
             let mut it = args[1..].iter();
@@ -1733,6 +1734,64 @@ impl Driver {
             }
         }
         Ok(false)
+    }
+
+    /// Refuse a GNU sysroot request until both header and linker semantics are
+    /// implemented. The old parser accepted the spellings but the driver never
+    /// installed their roots, so even `-E` could silently use host headers.
+    /// Skip operands of other options so an output path such as
+    /// `-o --sysroot=result` is not confused with an actual option.
+    fn reject_unsupported_sysroots(args: &[String]) -> Result<(), String> {
+        let mut i = 0;
+        while i < args.len() {
+            let arg = args[i].as_str();
+            if arg == "--sysroot" || arg == "-isysroot" {
+                if i + 1 == args.len() {
+                    return Err(format!("{arg} requires a directory argument"));
+                }
+                return Err(format!("{arg} is not supported by the LCCC driver"));
+            }
+            if arg.starts_with("--sysroot=") || arg.starts_with("-isysroot=") {
+                return Err(format!("{arg} is not supported by the LCCC driver"));
+            }
+            // These are the options for which parse_main_args consumes the
+            // next token. Keep linker passthrough separate: an explicit ld
+            // sysroot is also not installed by the built-in driver linker.
+            if arg == "-Xlinker" {
+                i += 1;
+                if let Some(value) = args.get(i) {
+                    if value == "--sysroot" || value.starts_with("--sysroot=") {
+                        return Err("linker --sysroot is not supported by the LCCC driver".into());
+                    }
+                }
+            } else if arg.starts_with("-Wl,")
+                && arg[4..]
+                    .split(',')
+                    .any(|item| item == "--sysroot" || item.starts_with("--sysroot="))
+            {
+                return Err("linker --sysroot is not supported by the LCCC driver".into());
+            } else if matches!(
+                arg,
+                "-o" | "-e"
+                    | "-D"
+                    | "-U"
+                    | "-I"
+                    | "-iquote"
+                    | "-isystem"
+                    | "-idirafter"
+                    | "-include"
+                    | "-L"
+                    | "-x"
+                    | "-MF"
+                    | "-MT"
+                    | "-MQ"
+                    | "--param"
+            ) {
+                i += 1;
+            }
+            i += 1;
+        }
+        Ok(())
     }
 
     /// Expand `@file` response file arguments.
@@ -2151,19 +2210,13 @@ impl Driver {
                 }
                 arg if arg.starts_with("-D") => self.add_define(&arg[2..], strict_options)?,
 
-                // `--sysroot=<dir>` / `-isysroot <dir>`: implemented by the
-                // link layer (`backend::common` resolves the CRT objects, the
-                // default library search and `-print-libgcc-file-name` against
-                // it) and by the preprocessor's system include search.  The
-                // operand must be consumed here so it is not mistaken for an
-                // input file; `raw_args` carries the spelling to the layers
-                // that act on it.
-                arg if arg.starts_with("--sysroot=") || arg.starts_with("-isysroot=") => {}
+                // Normally rejected before early queries; retain a defensive
+                // error here rather than reintroducing a silently ignored root.
+                arg if arg.starts_with("--sysroot=") || arg.starts_with("-isysroot=") => {
+                    return Err(format!("{arg} is not supported by the LCCC driver"));
+                }
                 "--sysroot" | "-isysroot" => {
-                    i += 1;
-                    if i >= args.len() {
-                        return Err(format!("{} requires a directory argument", args[i - 1]));
-                    }
+                    return Err(format!("{} is not supported by the LCCC driver", args[i]));
                 }
 
                 // Force-include files
@@ -5732,10 +5785,11 @@ mod cli_tests {
     /// prebuilt driver, found 16 with no arm (`-fno-strict-aliasing`,
     /// `-fwrapv`, `-fno-strict-overflow`, `-fno-plt`, `-flto`,
     /// `-funroll-loops`, `-Og`, `-ansi`, `-fno-ident`, `-fuse-ld=*`,
-    /// `-fvar-tracking-assignments`, …) plus two, `--sysroot=` and
-    /// `-nostartfiles`, whose implementation lives in another layer.  Every one
-    /// of them is now implemented, diagnosed or refused only when ignoring it
-    /// would change the program; none may abort a build.  A list, not a
+    /// `-fvar-tracking-assignments`, …) plus `-nostartfiles`, whose
+    /// implementation lives in another layer. Every listed spelling is
+    /// implemented or diagnosed without aborting the build. Meaning-changing
+    /// unsupported requests such as sysroots are tested separately and refused.
+    /// A list, not a
     /// principle, because the failure mode is "a real-world spelling nobody
     /// thought of": extend it when a build reports one.
     #[test]
@@ -5803,8 +5857,6 @@ mod cli_tests {
             "-nostdinc",
             "-nostartfiles",
             "-nodefaultlibs",
-            "--sysroot=/opt/sysroot",
-            "-isysroot=/opt/sysroot",
             "-shared",
             "-static",
             "-rdynamic",
@@ -5834,42 +5886,44 @@ mod cli_tests {
         }
     }
 
-    /// Spellings whose implementation lives in another layer must be
-    /// *recognised* here.
-    ///
-    /// `--sysroot=`/`-isysroot` are resolved by the link layer and the
-    /// include search; `-nostartfiles`/`-nodefaultlibs` are acted on by the
-    /// link layer once forwarded (see
-    /// `nostartfiles_and_nodefaultlibs_reach_the_linker`).  An arm-less
-    /// spelling is a broken build (a cross build for `--sysroot=`, a
-    /// freestanding link for `-nostartfiles`).
+    /// Link-file switches are acted on after forwarding to the linker.
     #[test]
     fn options_implemented_in_other_layers_are_recognised() {
+        for arg in ["-nostartfiles", "-nodefaultlibs", "-nostdlib", "-nostdinc"] {
+            assert!(try_flag(arg).is_ok(), "{arg} must be recognised");
+        }
+    }
+
+    #[test]
+    fn unsupported_sysroot_requests_are_refused_before_queries() {
         for arg in [
             "--sysroot=/opt/sysroot",
             "-isysroot=/opt/sysroot",
-            "-nostartfiles",
-            "-nodefaultlibs",
-            "-nostdlib",
-            "-nostdinc",
+            "-Wl,--sysroot=/opt/sysroot",
         ] {
-            assert!(try_flag(arg).is_ok(), "{arg} must be recognised");
+            assert!(try_flag(arg).is_err(), "{arg} must not be ignored");
         }
-        // The space-separated forms consume their operand: it must not be
-        // mistaken for an input file (which the driver would try to compile).
+        for option in ["--sysroot", "-isysroot", "-Xlinker"] {
+            let mut d = Driver::new();
+            let root = if option == "-Xlinker" {
+                "--sysroot=/opt/sysroot"
+            } else {
+                "/opt/sysroot"
+            };
+            let args = vec!["ccc".into(), option.into(), root.into(), "x.c".into()];
+            assert!(d.parse_cli_args(&args).is_err());
+        }
         let mut d = Driver::new();
-        let args = vec![
-            "ccc".to_string(),
-            "--sysroot".to_string(),
-            "/opt/sysroot".to_string(),
-            "x.c".to_string(),
-        ];
-        d.parse_cli_args(&args).expect("--sysroot <dir>");
-        assert_eq!(d.input_files, vec!["x.c".to_string()]);
-        // ...and a missing operand is an error, not a silently empty sysroot.
-        let mut d = Driver::new();
-        let args = vec!["ccc".to_string(), "-isysroot".to_string()];
-        assert!(d.parse_cli_args(&args).is_err());
+        let missing = vec!["ccc".to_string(), "-isysroot".to_string()];
+        assert!(
+            d.parse_cli_args(&missing)
+                .unwrap_err()
+                .contains("requires a directory")
+        );
+        // An option-like spelling consumed as -o's operand is not a root.
+        assert!(
+            Driver::reject_unsupported_sysroots(&["-o".into(), "--sysroot=out".into()]).is_ok()
+        );
     }
 
     /// Recognising the GNU link-file switches is not enough: the link layer

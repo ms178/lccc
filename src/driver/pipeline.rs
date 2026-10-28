@@ -1945,15 +1945,13 @@ impl Driver {
         // (infinite recursion or wrong control flow). Undefining _FORTIFY_SOURCE
         // prevents these wrappers from being emitted.
         preprocessor.undefine_macro("_FORTIFY_SOURCE");
-        // User/system include directories: map through LCCC_SYSROOT when set
-        // (GNU --sysroot analogy; prefixed path preferred when it exists,
-        // un-prefixed fallback keeps normal hosts bit-identical). See the
-        // linker-side twin in `backend/common.rs` and the built-in include
-        // list mapping in `frontend/preprocessor/predefined_macros.rs`.
+        // User/system include directories use the legacy LCCC_SYSROOT overlay:
+        // prefixed paths are preferred when present, with a host fallback.
+        // This differs from GNU --sysroot and is not an isolation boundary.
+        // See `backend/common.rs` and `predefined_macros.rs`.
         fn sysroot_include_path(path: &str) -> String {
-            // One source of truth for "what is the sysroot": the same accessor
-            // the linker's discovery uses, so a driver that was given
-            // `--sysroot` cannot disagree with the linker it spawns.
+            // Use the same overlay accessor as the built-in linker. GNU driver
+            // sysroot flags are rejected separately until fully implemented.
             let prefixed = match crate::backend::common::sysroot() {
                 Some(root) => format!("{root}{path}"),
                 None => return path.to_string(),

@@ -75,7 +75,9 @@ class OfflineDebExtractTest(unittest.TestCase):
         self.assertEqual((destination / 'usr/lib/second').read_text(), 'second')
         self.assertEqual(os.readlink(destination / 'usr/lib/absolute'), 'item')
         self.assertEqual((destination / 'usr/lib/absolute').read_text(), 'payload')
-        for needle in ('C_INCLUDE_PATH', 'LIBRARY_PATH', 'LD_LIBRARY_PATH', '-B', '--dynamic-linker'):
+        for needle in ('C_INCLUDE_PATH', 'LIBRARY_PATH', 'LD_LIBRARY_PATH', '-B', '--dynamic-linker',
+                       'LCCC does not read C_INCLUDE_PATH', 'partial overlay with host fallbacks',
+                       'not isolate it'):
             self.assertIn(needle, result.stdout)
 
     def test_rejects_root_boundaries_and_symlink_escape(self) -> None:

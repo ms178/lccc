@@ -63,12 +63,17 @@ trap - EXIT
 printf 'Extracted %d trusted package(s) unprivileged into %s\n' "${#packages[@]}" "$sysroot"
 printf 'export LCCC_SYSROOT=%q\n' "$sysroot"
 cat <<'RECIPE'
+# These variables are for GCC and the dynamic loader; they do not establish
+# LCCC header or link isolation. LCCC does not read C_INCLUDE_PATH.
 export C_INCLUDE_PATH="$LCCC_SYSROOT/usr/include:$LCCC_SYSROOT/usr/include/x86_64-linux-gnu${C_INCLUDE_PATH:+:$C_INCLUDE_PATH}"
 export LIBRARY_PATH="$LCCC_SYSROOT/usr/lib32:$LCCC_SYSROOT/lib32${LIBRARY_PATH:+:$LIBRARY_PATH}"
 export LD_LIBRARY_PATH="$LCCC_SYSROOT/lib32:$LCCC_SYSROOT/usr/lib32${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-# Example for a 32-bit program (also pass suitable host/glibc include paths):
+# Example for GCC, 32-bit (also supply suitable glibc and compiler headers):
 # gcc-16 -m32 --sysroot="$LCCC_SYSROOT" -B"$LCCC_SYSROOT/usr/lib32/" \
 #   -Wl,--dynamic-linker="$LCCC_SYSROOT/lib32/ld-linux.so.2" source.c -o program
-# LCCC recognizes LCCC_SYSROOT; use the same explicit --dynamic-linker when
-# the generated program must run without a system-wide 32-bit loader.
+# LCCC's LCCC_SYSROOT is a partial overlay with host fallbacks, NOT GNU
+# --sysroot; the LCCC driver rejects GNU sysroot flags instead of ignoring them.
+# For controlled LCCC preprocessing, pass -nostdinc and all necessary -I or
+# -isystem directories explicitly. Linking also needs a separately verified
+# CRT/library setup; an explicit dynamic loader alone does not isolate it.
 RECIPE
