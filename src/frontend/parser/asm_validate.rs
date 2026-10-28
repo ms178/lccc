@@ -75,7 +75,7 @@ impl Diagnostic {
 /// Constraint characters the x86 back ends actually classify: register, memory
 /// and symbolic classes on the left, immediate-only classes on the right.
 /// Anything else used to fall through `match { _ => {} }` into `GpReg`.
-const X86_CLASSES: &str = "abcdfglmopqrvxyXADQRSVY";
+const X86_CLASSES: &str = "abcdfglmopqrvxyUADQRSVYX";
 const X86_IMMEDIATES: &str = "eEIJKLMNOGHinZ";
 /// Modifier characters, legal in any constraint.
 const MODIFIERS: &str = "=+&%";
@@ -192,8 +192,10 @@ fn check_constraint(
             continue;
         }
         // `Yz` / `Yk` / `Ym`: the letter after `Y` refines the register class
-        // instead of naming a class of its own.
-        if letter == 'Y' {
+        // instead of naming a class of its own. `C`-prefixed constraints are
+        // the same shape (measured: gcc 16.2 accepts `"Ci"(7)` and rejects
+        // `"Ci"(x)` / `"Cj"(7)`, so the pair is a class, not a letter).
+        if letter == 'Y' || letter == 'C' {
             letters.next();
             has_class = true;
             continue;

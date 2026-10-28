@@ -42,7 +42,7 @@ verdict() {
     if [ $? -eq 0 ]; then
         echo "ACCEPT"
     else
-        printf '%s\n' "$out" | sed -n 's/.*: error: //p' | head -1
+        printf '%s\n' "$out" | sed -n 's/.*: error: //p' | sed -n '1p'
     fi
 }
 
@@ -116,16 +116,16 @@ printf 'int caf\\u00e9 = 7;\nint use_ucn(void) { return caf\xc3\xa9; }\n' >"$TMP
 printf 'int caf\xc3\xa9 = 7;\nint use_raw(void) { return caf\\U000000E9; }\n' >"$TMP/id2.c"
 for idcase in id1 id2; do
     if ! "$CCC" -c "$TMP/$idcase.c" -o "$TMP/$idcase.o" 2>"$TMP/$idcase.err"; then
-        echo "FAIL $idcase: $(head -1 "$TMP/$idcase.err")" >&2
+        echo "FAIL $idcase: $(sed -n '1p' "$TMP/$idcase.err")" >&2
         fail=1
         continue
     fi
-    if nm "$TMP/$idcase.o" | grep -q ' U '; then
+    if nm "$TMP/$idcase.o" | grep -c ' U ' >/dev/null; then
         echo "FAIL $idcase: UCN and UTF-8 spellings are different symbols:" >&2
         nm "$TMP/$idcase.o" >&2
         fail=1
     fi
-    if ! nm "$TMP/$idcase.o" | grep -q "$(printf 'D caf\303\251')"; then
+    if ! nm "$TMP/$idcase.o" | grep -c "$(printf 'D caf\303\251')" >/dev/null; then
         echo "FAIL $idcase: definition is not spelled 'caf\xc3\xa9' in the object:" >&2
         nm "$TMP/$idcase.o" >&2
         fail=1

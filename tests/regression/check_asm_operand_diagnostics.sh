@@ -79,7 +79,10 @@ run_case template_modifier_index error \
     'int f(int x){int r;__asm__ volatile("movb %b2, %b0":"=r"(r):"r"(x));return r;}'
 
 # Shapes that must stay accepted: GCC compiles each of these, so refusing one
-# would be a compatibility regression.
+# would be a compatibility regression. The last three are the ones an
+# unmeasured letter table gets wrong: gcc 16.2 accepts `"U"` for a register and
+# for an immediate, `"Ci"` for an integer constant (a `C`-prefixed pair, like
+# `Yz`, is a class rather than a letter) and `"M"(3)` inside its range.
 for body in \
     'int f(int x){int r;__asm__ volatile("movl %1, %0":"=r"(r):"r"(x));return r;}' \
     'int f(unsigned long *a,long n){int c;__asm__ volatile("btsq %2, %1":"=@ccc"(c),"+m"(*a):"Ir"(n));return c;}' \
@@ -92,7 +95,10 @@ for body in \
     'int f(int x){int r;__asm__ volatile("movl %k1, %0":"=r"(r):"r"(x));return r;}' \
     'int f(short x){int r;__asm__ volatile("movswl %w1, %0":"=r"(r):"r"(x));return r;}' \
     'int f(double x){double r;__asm__ volatile("movsd %1, %0":"=x"(r):"x"(x));return (int)r;}' \
-    'int f(void){int r;__asm__ volatile("xorl %0, %0":"=r"(r)::"cc");return r;}'
+    'int f(void){int r;__asm__ volatile("xorl %0, %0":"=r"(r)::"cc");return r;}' \
+    'int f(int x){int r;__asm__ volatile("movl %1, %0":"=r"(r):"U"(x));return r;}' \
+    'int f(void){int r;__asm__ volatile("movl %1, %0":"=r"(r):"Ci"(7));return r;}' \
+    'int f(void){int r;__asm__ volatile("movl %1, %0":"=r"(r):"M"(3));return r;}'
 do
     expect=$("$GCC" -c -x c -o /dev/null - <<<"$body" 2>&1)
     if [[ -n $expect ]]; then

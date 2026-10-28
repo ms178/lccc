@@ -100,7 +100,7 @@ expect "c23:deprecated" EMPTY 'int q [[deprecated]];'
 
 # --- the diagnostic is -Wattributes-tagged, so -Wno-attributes silences it ---
 printf '%s\n' 'int f(void) __attribute__((ms_abi));' >"$TMP/t.c"
-if ! "$CCC" -fsyntax-only -Wno-attributes "$TMP/t.c" 2>&1 | grep -q .; then :; else
+if ! "$CCC" -fsyntax-only -Wno-attributes "$TMP/t.c" 2>&1 | grep -c . >/dev/null; then :; else
     echo "FAIL: -Wno-attributes did not silence the diagnostic" >&2
     fail=1
 fi
