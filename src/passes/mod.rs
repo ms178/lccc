@@ -1381,7 +1381,7 @@ fn late_vectorize_entry(
 /// Temporarily apply a function's `__attribute__((target("...")))` x86-64 SIMD
 /// capabilities around a middle-end vectorization callback, then restore the
 /// TU baseline immediately. Zero-cost when `target_features` is empty.
-fn with_function_x86_vec_isa<R>(
+pub(crate) fn with_function_x86_vec_isa<R>(
     target: crate::backend::Target,
     base_isa: crate::backend::x86::isa::X86Isa,
     base_avx512vl: bool,
@@ -2238,7 +2238,12 @@ pub(crate) fn run_passes(
         {
             let n = timed_pass!(
                 "vec_arx",
-                run_on_visited(module, &dirty, &mut changed, vec_arx::vec_arx_function)
+                run_on_visited(module, &dirty, &mut changed, |f| {
+                    let feats = f.target_features.clone();
+                    with_function_x86_vec_isa(target, x86_isa, x86_avx512vl, &feats, |_| {
+                        vec_arx::vec_arx_function(f)
+                    })
+                })
             );
             total_changes += n;
             total_changes_excl_dce += n;
@@ -2563,7 +2568,10 @@ pub(crate) fn run_passes(
                 let n = timed_pass!(
                     "slp",
                     run_on_visited(module, &dirty, &mut changed, |f| {
-                        slp_vectorizer::run_bb_slp_with_contract(f, fp_contract)
+                        let feats = f.target_features.clone();
+                        with_function_x86_vec_isa(target, x86_isa, x86_avx512vl, &feats, |_| {
+                            slp_vectorizer::run_bb_slp_with_contract(f, fp_contract)
+                        })
                     })
                 );
                 total_changes += n;
@@ -2757,7 +2765,10 @@ pub(crate) fn run_passes(
                 let n = timed_pass!(
                     "slp_late",
                     run_on_visited(module, &dirty, &mut changed, |f| {
-                        slp_vectorizer::run_bb_slp_with_contract(f, fp_contract)
+                        let feats = f.target_features.clone();
+                        with_function_x86_vec_isa(target, x86_isa, x86_avx512vl, &feats, |_| {
+                            slp_vectorizer::run_bb_slp_with_contract(f, fp_contract)
+                        })
                     })
                 );
                 total_changes += n;
@@ -3845,7 +3856,7 @@ pub(crate) fn run_passes(
     // leave memory here (mem2reg for register images); the cleanups below
     // then see register-valued vector chains instead of slot round trips.
     if !pass_disabled(&disabled, "vecssa") {
-        vec_ssa::promote_vector_allocas(module);
+        vec_ssa::promote_vector_allocas(module, target, x86_isa, x86_avx512vl);
         verify::verify_after_pass(module, "vecssa");
     }
 

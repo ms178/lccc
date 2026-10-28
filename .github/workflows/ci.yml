@@ -1773,6 +1773,10 @@ jobs:
       env:
         CCC: target/fastbuild/lccc
       run: bash tests/regression/check_bb_slp_nested_ifconv.sh
+    - name: Verify per-function target("avx2") widens vector register width
+      env:
+        CCC: target/fastbuild/lccc
+      run: bash tests/regression/check_target_attr_vec_isa.sh
     - name: Verify two-block unroll red-team contracts
       env:
         CCC: target/fastbuild/lccc
