@@ -1266,10 +1266,10 @@ impl ElfWriterBase {
         flags_str: &str,
         flags_explicit: bool,
         sec_type_str: Option<&str>,
-    ) {
+    ) -> Result<(), String> {
         let sh_type = match sec_type_str {
-            Some("@nobits") => SHT_NOBITS,
-            Some("@note") => SHT_NOTE,
+            Some("@nobits" | "%nobits") => SHT_NOBITS,
+            Some("@note" | "%note") => SHT_NOTE,
             _ => {
                 if sec_name == ".bss"
                     || sec_name.starts_with(".bss.")
@@ -1304,22 +1304,66 @@ impl ElfWriterBase {
         if flags_str.contains('G') {
             sh_flags |= SHF_GROUP;
         }
+        if flags_str.contains('R') {
+            sh_flags |= SHF_GNU_RETAIN;
+        }
 
         if sh_flags == 0 && !flags_explicit {
             sh_flags = default_section_flags(sec_name);
         }
 
+        self.check_retain_variant(sec_name, sh_flags)?;
+        if let Some(existing) = self.sections.get(sec_name)
+            && existing.sh_flags & SHF_GNU_RETAIN != 0
+        {
+            // As with GAS, re-entering a retained section with explicitly
+            // different attributes is an error, not an implicit merge. The
+            // generic writer historically ignored these mismatches.
+            if flags_explicit && !flags_str.is_empty() && existing.sh_flags != sh_flags {
+                return Err(format!("changed section attributes for {sec_name}"));
+            }
+            if existing.sh_type != sh_type {
+                if sec_type_str.is_some() {
+                    return Err(format!("changed section type for {sec_name}"));
+                }
+                if flags_explicit && !flags_str.is_empty() {
+                    return Err(format!("changed section attributes for {sec_name}"));
+                }
+            }
+        }
         // Always created at 1: GAS raises AX sections only when an
         // instruction actually lands in them (see `note_instruction`).
         self.ensure_section(sec_name, sh_type, sh_flags, 1);
         self.previous_section = std::mem::replace(&mut self.current_section, sec_name.to_string());
+        Ok(())
+    }
+
+    /// GAS permits distinct same-named retained and non-retained sections.
+    /// The shared writer still keys sections by name, so fail rather than
+    /// silently merging them with the wrong GC semantics.
+    fn check_retain_variant(&self, name: &str, flags: u64) -> Result<(), String> {
+        if let Some(existing) = self.sections.get(name)
+            && (existing.sh_flags ^ flags) & SHF_GNU_RETAIN != 0
+        {
+            return Err(format!(
+                "same-named retained and non-retained sections are not yet supported: {name}"
+            ));
+        }
+        Ok(())
     }
 
     /// Switch to a named standard section (.text, .data, .bss, .rodata).
-    pub fn switch_to_standard_section(&mut self, name: &str, sh_type: u32, sh_flags: u64) {
+    pub fn switch_to_standard_section(
+        &mut self,
+        name: &str,
+        sh_type: u32,
+        sh_flags: u64,
+    ) -> Result<(), String> {
+        self.check_retain_variant(name, sh_flags)?;
         // Always created at 1 — instructions raise later (`note_instruction`).
         self.ensure_section(name, sh_type, sh_flags, 1);
         self.previous_section = std::mem::replace(&mut self.current_section, name.to_string());
+        Ok(())
     }
 
     /// Restore the previous section (for `.previous` directive).
@@ -1339,10 +1383,11 @@ impl ElfWriterBase {
         flags_str: &str,
         flags_explicit: bool,
         sec_type: Option<&str>,
-    ) {
-        self.section_stack
-            .push((self.current_section.clone(), self.previous_section.clone()));
-        self.process_section_directive(name, flags_str, flags_explicit, sec_type);
+    ) -> Result<(), String> {
+        let saved = (self.current_section.clone(), self.previous_section.clone());
+        self.process_section_directive(name, flags_str, flags_explicit, sec_type)?;
+        self.section_stack.push(saved);
+        Ok(())
     }
 
     /// Pop the section stack and restore both current and previous sections.
@@ -1637,7 +1682,7 @@ impl ElfWriterBase {
             return Ok(());
         }
         let saved = (self.current_section.clone(), self.previous_section.clone());
-        self.switch_to_standard_section(".bss", SHT_NOBITS, SHF_ALLOC | SHF_WRITE);
+        self.switch_to_standard_section(".bss", SHT_NOBITS, SHF_ALLOC | SHF_WRITE)?;
         for (name, size, align) in commons {
             self.align_to(align)?;
             let at = (self.current_section.clone(), self.current_offset());

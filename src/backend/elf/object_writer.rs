@@ -400,8 +400,17 @@ pub fn write_relocatable_object(
         )
     })?;
 
-    // ELF header (e_ident)
-    let osabi = if symbols.iter().any(|s| s.sym_type == STT_GNU_IFUNC) {
+    // ELF header (e_ident). GNU ld interprets SHF_GNU_RETAIN only when the
+    // object identifies a GNU (or FreeBSD) OS ABI: setting the flag while
+    // leaving ELFOSABI_NONE makes it an unknown OS-specific bit and silently
+    // allows --gc-sections to discard the section. GNU as marks these objects
+    // ELFOSABI_GNU, just as it does for STT_GNU_IFUNC.
+    let osabi = if symbols.iter().any(|s| s.sym_type == STT_GNU_IFUNC)
+        || section_order.iter().any(|name| {
+            sections
+                .get(name)
+                .is_some_and(|section| section.sh_flags & SHF_GNU_RETAIN != 0)
+        }) {
         ELFOSABI_GNU
     } else {
         ELFOSABI_NONE

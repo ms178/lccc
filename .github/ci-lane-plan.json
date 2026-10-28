@@ -1329,7 +1329,7 @@
     "frontend-c": {
       "group": "frontend",
       "mode": "steps",
-      "predicted_gate_seconds": 269.95,
+      "predicted_gate_seconds": 270.41,
       "shards": 3,
       "steps": [
         {
@@ -1343,6 +1343,10 @@
         {
           "measured_s": 1.0,
           "name": "GAS character literals and quoted macro defaults across assemblers"
+        },
+        {
+          "measured_s": 0.46,
+          "name": "GNU retain section flags and linker garbage collection"
         },
         {
           "measured_s": 2.0,

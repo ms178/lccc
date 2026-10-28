@@ -49,6 +49,8 @@ pub fn parse_section_flags(
                 'S' => flags |= SHF_STRINGS,
                 'T' => flags |= SHF_TLS,
                 'G' => flags |= SHF_GROUP,
+                // GNU as: sections with `R` are roots for --gc-sections.
+                'R' => flags |= SHF_GNU_RETAIN,
                 'o' => {} // SHF_LINK_ORDER - handle later
                 _ => {}
             }
@@ -59,11 +61,11 @@ pub fn parse_section_flags(
 
     let section_type = if let Some(t) = type_str {
         match t {
-            "@progbits" => SHT_PROGBITS,
-            "@nobits" => SHT_NOBITS,
-            "@note" => SHT_NOTE,
-            "@init_array" => SHT_INIT_ARRAY,
-            "@fini_array" => SHT_FINI_ARRAY,
+            "@progbits" | "%progbits" => SHT_PROGBITS,
+            "@nobits" | "%nobits" => SHT_NOBITS,
+            "@note" | "%note" => SHT_NOTE,
+            "@init_array" | "%init_array" => SHT_INIT_ARRAY,
+            "@fini_array" | "%fini_array" => SHT_FINI_ARRAY,
             _ => default_type,
         }
     } else {
@@ -99,6 +101,25 @@ pub fn well_known_section_type(name: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gnu_retain_flag_is_preserved_with_other_flags() {
+        assert_eq!(
+            parse_section_flags(".keep", Some("awTR"), Some("@progbits")),
+            (
+                SHT_PROGBITS,
+                SHF_ALLOC | SHF_WRITE | SHF_TLS | SHF_GNU_RETAIN
+            )
+        );
+        assert_eq!(
+            parse_section_flags(".drop", Some("awT"), Some("@nobits")),
+            (SHT_NOBITS, SHF_ALLOC | SHF_WRITE | SHF_TLS)
+        );
+        assert_eq!(
+            parse_section_flags(".keep", Some("awR"), Some("%nobits")),
+            (SHT_NOBITS, SHF_ALLOC | SHF_WRITE | SHF_GNU_RETAIN)
+        );
+    }
 
     #[test]
     fn well_known_types_are_fixed() {

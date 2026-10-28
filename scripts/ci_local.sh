@@ -1500,6 +1500,9 @@ gate "asm-char-and-macro-defaults" fast \
     CCC_RISCV=target/fastbuild/lccc-riscv \
     python3 tests/regression/check_asm_char_and_macro_defaults.py
 
+gate "gnu-retain-sections" fast \
+    python3 tests/regression/check_gnu_retain_sections.py --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"
+
 # The debug knobs this series documents (`CCC_DEBUG_VOLRED`,
 # `CCC_DEBUG_STATIC_INIT`, `CCC_DEBUG_TYPES_COMPATIBLE`) may explain a decision
 # but must never change emitted code: a knob left exported in a benchmark or

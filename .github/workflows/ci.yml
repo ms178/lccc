@@ -1065,6 +1065,8 @@ jobs:
             CCC_ARM=target/fastbuild/lccc-arm \
             CCC_RISCV=target/fastbuild/lccc-riscv \
             python3 tests/regression/check_asm_char_and_macro_defaults.py
+    - name: GNU retain section flags and linker garbage collection
+      run: python3 tests/regression/check_gnu_retain_sections.py --lccc target/fastbuild/lccc --gcc gcc-16
     - name: Check -ftrapv boundary matrix (m32)
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_trapv_boundary_matrix.sh --bits -m32
     - name: RISC-V relocation rejection and positive controls

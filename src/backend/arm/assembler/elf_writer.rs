@@ -541,25 +541,19 @@ impl ElfWriter {
 
     fn process_directive(&mut self, dir: &AsmDirective) -> Result<(), String> {
         match dir {
-            AsmDirective::Section(sec) => {
-                self.base.process_section_directive(
-                    &sec.name,
-                    sec.flags.as_deref().unwrap_or(""),
-                    sec.flags.is_some(), // flags are explicit when provided
-                    sec.section_type.as_deref(),
-                );
-                Ok(())
-            }
+            AsmDirective::Section(sec) => self.base.process_section_directive(
+                &sec.name,
+                sec.flags.as_deref().unwrap_or(""),
+                sec.flags.is_some(), // flags are explicit when provided
+                sec.section_type.as_deref(),
+            ),
 
-            AsmDirective::PushSection(sec) => {
-                self.base.push_section(
-                    &sec.name,
-                    sec.flags.as_deref().unwrap_or(""),
-                    sec.flags.is_some(),
-                    sec.section_type.as_deref(),
-                );
-                Ok(())
-            }
+            AsmDirective::PushSection(sec) => self.base.push_section(
+                &sec.name,
+                sec.flags.as_deref().unwrap_or(""),
+                sec.flags.is_some(),
+                sec.section_type.as_deref(),
+            ),
 
             AsmDirective::PopSection => {
                 self.base.pop_section();

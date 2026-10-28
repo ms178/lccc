@@ -94,3 +94,27 @@ full upstream test configurations remain unrun because CMake was unavailable;
 these results do not replace them. The local evidence is under
 `~/.cache/lccc/zlib-configure-test-v2` and is not a target-hardware timing
 measurement.
+
+## Retained ELF sections: infrastructure, not frontend completion
+
+The integrated assemblers previously discarded the `R` section flag on all
+five ELF targets. They now emit `SHF_GNU_RETAIN` for uniquely named sections
+and set `ELFOSABI_GNU`: GNU ld ignores that OS-specific bit when the object
+incorrectly advertises System V OSABI. The x86-64 `ld -r` path also preserves
+the flag and OSABI and separates retained from discardable same-named input
+sections. The regression compares five integrated assemblers with GNU as
+2.47, checks PROGBITS/NOBITS, executable, read-only and TLS flags, assembles
+actual GCC 16.2 output, and exercises GC and relocation reachability with GNU
+ld 2.47, mold 3.0.0 and the LCCC x86-64 linker. GNU and LCCC x86-64 partial
+links are followed by a GNU GC link, including same-named R/non-R sections;
+negative controls remove `R` and must be collected.
+
+This does **not** implement the C `retain` attribute, which remains a silent
+frontend correctness hazard. The integrated assemblers still cannot represent
+same-named sections with different retain states; they now reject rather than
+silently merge that case. The i686 LCCC linker currently accepts
+`--gc-sections` without collecting the discarded controls; the i686 GC result
+above is for GNU ld and mold, not LCCC. Separately, the local mold 3.0.0
+`-r` probe discarded `R` even for GNU-as-produced input; no mold partial-link
+correctness is claimed. None of these bounded checks establishes GP-03
+completion or whole-program GCC compatibility.
