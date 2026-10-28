@@ -1410,7 +1410,7 @@ adjective.
 
 ## 12. GCC 16.2 parity register (measured 2026-10-27, `dc878b3`)
 
-Source of every measurement below:
+Source of the original 2026-10-27 measurements below:
 [`docs/GCC16-PARITY-ASSESSMENT-2026-10-27.md`](docs/GCC16-PARITY-ASSESSMENT-2026-10-27.md)
 (oracle GCC 16.2.0, Clang 23.1.4). The report carries the raw numbers, the
 reproducer commands and the risk ranking; this section carries the work.
@@ -1428,6 +1428,48 @@ first.
 Class legend: **W** = wrong code / silent semantic change (highest priority),
 **S** = silent no-op (accepted, does nothing), **D** = missing diagnostics,
 **F** = missing feature, **T** = missing tooling substrate, **P** = process gate.
+
+### 12.0 Bounded GP-01–GP-24 sentinel verdicts (2026-10-28)
+
+These are **sentinels**, not the full acceptance suites. Unless noted,
+GCC is 16.2.0, target is x86-64, LCCC is the integrated fastbuild, and each
+row reports only the specified independent fixtures and named targeted gates. A matching sentinel is not a claim of item
+completion. `OPEN` means the acceptance criterion has not been met or tested;
+`PARTIAL` means some narrower evidence exists.
+
+| Item | Verdict | Observed evidence / remaining acceptance gap |
+|---|---|---|
+| GP-01 | PARTIAL | 22 attribute cases and two glibc header probes pass; 127 GCC-known names, 83 known-but-unimplemented inventory entries, and 48 implemented names (four are Clang-only). Semantic implementation of the 83 is not implied. |
+| GP-02 | OPEN, wrong code | `ms_abi` four-int sentinel: GCC/GCC returns success; GCC caller + LCCC callee returns 42 instead of success; LCCC caller + GCC callee dies SIGSEGV. No complete mixed-ABI matrix. |
+| GP-03 | OPEN, wrong code | The C `retain` sentinel still emits plain `.data` with `WA`, versus GCC `.data.retained` with `WAR`; frontend propagation is absent. The five integrated assemblers now preserve a uniquely named `R` section and GNU OSABI, and x86-64 `ld -r` preserves R/non-R separation. Same-named assembler variants are refused, and LCCC i686 userspace GC remains unimplemented. This is infrastructure, not attribute support. |
+| GP-04 | OPEN, wrong code | x86 interrupt sentinel under `-mgeneral-regs-only`: GCC ends in `iretq`; LCCC ends in `ret`, without a diagnostic. Other contract attributes remain unaudited here. |
+| GP-05 | OPEN | Empty-TU GNU23 macro comparison: GCC 408 names, LCCC 466; 153 GCC-only, 211 LCCC-only, 34 common names differ; LCCC predefines `EOF`, `BUFSIZ` and `__STDC_NO_ATOMICS__`, GCC does not. One target/dialect only. |
+| GP-06 | OPEN | GCC accepts one `_BitInt(7)` parameter/return sentinel; LCCC rejects it. No width, ABI or runtime matrix. |
+| GP-07 | OPEN | GCC accepts both a digraph function and a UCN identifier; LCCC rejects both (0/2). |
+| GP-08 | PARTIAL | One C23 empty-prototype call sentinel is rejected by both compilers; this does not establish the full strictness/over-acceptance inventory. |
+| GP-09 | PARTIAL | Warning registry landed and 57 precedence/severity cases match GCC 16.2.0, with a unique-name self-check and local/hosted gates. Pedantic membership, the full warning surface, and the workload-wide zero-false-positive precision gate remain open. |
+| GP-10 | OPEN | GCC rejects GNU statement expressions with `-std=c23 -pedantic-errors`; LCCC accepts and reports that option unimplemented. |
+| GP-11 | OPEN | GCC reports one definite uninitialized use under `-O2 -Wall -Wuninitialized`; LCCC has no corresponding warning. |
+| GP-12 | OPEN | GCC reports the one `-Wshadow` sentinel; LCCC reports the option unsupported and emits no shadow diagnostic. |
+| GP-13 | OPEN | With `-fprofile-arcs -ftest-coverage`, GCC creates a 284-byte `.gcno`; LCCC produces no `.gcno` and reports LCCC PGO instrumentation. Not gcov-compatible. |
+| GP-14 | PARTIAL | The no-profile sentinel is now warned by LCCC (`no lccc profile files`) and GCC (`-Wmissing-profile`); `.gcda` interop and version/round-trip contracts remain unverified. |
+| GP-15 | OPEN, honest refusal | One `-fsanitize=address` compile is accepted by GCC and refused by LCCC by name. No ASan runtime support claimed. |
+| GP-16 | PARTIAL, honest refusal | `-flto` and `-flto=auto` are refused by LCCC; `-ffat-lto-objects` is diagnosed as tolerated/unimplemented and `-fwhole-program` remains accepted. Consistent refusal/option-effect acceptance remains open. |
+| GP-17 | OPEN | GCC rejects an inline-asm input constraint containing `=`; LCCC accepts it (one fixture; no full 65-case matrix run). |
+| GP-18 | OPEN, over-claim | Without AVX, `__has_builtin(__builtin_ia32_maxps256)` is 0 in GCC and 1 in LCCC. The earlier 5,501-name audit is historical; no new full builtin census is claimed. |
+| GP-19 | OPEN, honest refusal | GCC accepts `-mstackrealign`; LCCC refuses it by name. Other ISA/mitigation flags not measured in this sentinel. |
+| GP-20 | PARTIAL | With `-g -O0`, LCCC now emits compile-unit, subprogram and unspecified-type DIEs, plus line tables; GCC's same fixture also has two base types, one parameter, two members, one structure and two variables. The earlier line-only statement is stale; full DIE/debugger acceptance remains open. |
+| GP-21 | OPEN | LCCC fails all 4 checked queries (`-dumpfullversion`, `-print-multiarch`, `-print-multi-lib`, `-print-sysroot`); GCC answers all 4. |
+| GP-22 | OPEN | `-pedantic` is tolerated with an explicit unsupported-option warning yet does not diagnose the GNU-expression sentinel; there is no demonstrated complete accepted-option effect ledger. |
+| GP-23 | OPEN | The one GNU23 x86-64 macro differential above still has 211 LCCC-only and 153 GCC-only names; no all-target/all-dialect ratchet is claimed. |
+| GP-24 | PARTIAL | Seven derived gzip/zlib-ng/Expat kernels passed bounded GCC/Clang/LCCC checks; the new compare256 gate covers four optimization levels, two ABIs and a detected mutation. Verified zlib-ng 2.3.3 configure/Make static builds passed upstream `alltests` under GCC and LCCC, followed by 48 cross-compiler roundtrips and 24 system-gzip decodes. CMake/CTest, remaining workload projects and kernel-style diagnostic matrices remain unrun. |
+
+The `ms_abi`, `retain`, and `interrupt` findings are correctness/ABI hazards,
+not performance opportunities. The raw bounded audit is in `~/.cache/lccc/gp-sentinel-audit.{py,json,txt}`;
+the checked-in attribute, warning, retain and workload regression gates provide
+repeatable coverage for the corresponding narrower claims. Older measurements
+elsewhere in the register are historical, not freshly re-measured verdicts.
+
 
 ### 12.1 Ranked register
 

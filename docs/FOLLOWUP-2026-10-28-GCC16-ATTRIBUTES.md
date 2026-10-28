@@ -66,9 +66,10 @@ standalone test commands that build and immediately execute `-m32` programs
 need an explicit private-interpreter flag or a real host multilib installation;
 merely setting `LIBRARY_PATH` cannot change a binary's ELF interpreter.
 The warning registry (GP-09) and initial workload/comparator additions have
-landed; the remaining quantified GP verdicts, complete real-workload coverage,
-and multi-compiler research comparisons are not yet claimed complete. No generated-code performance improvement is claimed
-for this diagnostics and infrastructure work.
+landed, and bounded GP-01–GP-24 verdicts are recorded in backlog §12.0.
+Complete real-workload coverage and multi-compiler research comparisons remain
+open. No generated-code performance improvement is claimed for this diagnostic
+and infrastructure work.
 
 ## Workload research update
 
