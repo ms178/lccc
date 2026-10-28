@@ -65,10 +65,25 @@ struct StridedI32ReducePattern {
     expr: StridedExpr,
 }
 
+thread_local! {
+    /// Whether the strided reduction vectorizer may run, resolved ONCE per
+    /// translation unit by `run_passes` (`set_enabled`). The kill switch is not
+    /// read per call site: the pass-pipeline env-read ratchet
+    /// (`tests/regression/check_env_test_hygiene.sh`) requires a new codegen
+    /// switch to be resolved in `run_passes`, which is what keeps a per-loop
+    /// `getenv` off the hot path and out of the pipeline's environment budget.
+    static ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Record whether `CCC_NO_STRIDED_REDUCE` allows the transform. Called once per
+/// translation unit; a previous compile on the same worker thread cannot leak
+/// its setting into the next one.
+pub(crate) fn set_enabled(enabled: bool) {
+    ENABLED.with(|cell| cell.set(enabled));
+}
+
 fn strided_reduce_disabled() -> bool {
-    static DISABLED: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("CCC_NO_STRIDED_REDUCE").is_some());
-    *DISABLED
+    !ENABLED.with(|cell| cell.get())
 }
 
 /// Smallest scalar trip count worth vectorizing: below this, the preheader

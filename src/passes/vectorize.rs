@@ -489,6 +489,13 @@ pub(crate) fn set_x86_strict_recip_avx2_enabled(enabled: bool) {
     X86_STRICT_RECIP_AVX2_AVAILABLE.with(|available| available.set(enabled));
 }
 
+/// Resolve the strided-2 i32 reduction vectorizer's kill switch once per
+/// translation unit. The submodule is private to this pass, so the pipeline
+/// reaches it through here.
+pub(crate) fn set_strided_reduce_enabled(enabled: bool) {
+    strided_i32_reduce::set_enabled(enabled);
+}
+
 pub(crate) fn set_strict_recip_pack_enabled(enabled: bool) {
     STRICT_RECIP_PACK_ENABLED.with(|cell| cell.set(enabled));
 }

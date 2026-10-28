@@ -1595,6 +1595,22 @@ pub(crate) fn run_passes(
         target == crate::backend::Target::X86_64 && !pass_disabled(&disabled, "reduction_unroll"),
     );
     div_by_const::set_exact_enabled(!pass_disabled(&disabled, "exact_signed_div"));
+    // Diagnostic kill switches are resolved here, once per translation unit, so
+    // no pass reads the environment per call site (the env-read ratchet in
+    // tests/regression/check_env_test_hygiene.sh). `mod.rs` is deliberately
+    // outside that count.
+    let strided_reduce_allowed = std::env::var_os("CCC_NO_STRIDED_REDUCE").is_none();
+    vectorize::set_strided_reduce_enabled(strided_reduce_allowed);
+    inline::set_ssa_param_config(inline::SsaParamConfig {
+        enabled: std::env::var("CCC_NO_SSA_PARAM").is_err(),
+        skip: std::env::var("CCC_SSA_PARAM_SKIP")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        log: std::env::var("CCC_SSA_PARAM_LOG").is_ok(),
+    });
     vectorize::set_strict_recip_pack_enabled(!pass_disabled(&disabled, "strict_recip_pack"));
     vectorize::set_byte_count_normalize_enabled(!pass_disabled(&disabled, "byte_count_normalize"));
     // Snapshot the map policy switches once, like the other pass-pipeline

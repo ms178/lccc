@@ -10,7 +10,34 @@ GCC=${GCC_BIN:-gcc}
 source_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source="$source_dir/vectorize_matmul_negative_bound.c"
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/lccc-matmul-negative-bound.XXXXXX")
-trap 'rm -rf "$tmp"' EXIT
+
+# TEMP-DIAG (remove before merge): surface the failure reason as a GitHub
+# annotation, because job logs are not readable while this gate is red.
+diag_on_exit() { # diag_on_exit <exit-status>
+    local rc=$1
+    local f
+    printf '::error title=matmul-gate::rc=%d bound_type=%s mode=%s\n' \
+        "$rc" "${bound_type:-none}" "${mode:-none}"
+    for f in "$tmp"/*.s; do
+        [[ -f $f ]] || continue
+        python3 - "$f" <<'PY2'
+import re
+import sys
+
+text = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+match = re.search(r"(?ms)^matmul_vector_loop:.*?^\.size matmul_vector_loop,.*?$", text)
+body = match.group(0) if match else "MISSING matmul_vector_loop symbol"
+body = body[:6000].replace("%", "%25").replace("\n", "%0A").replace("\r", "")
+print(f"::error title=asm-{sys.argv[1].rsplit('/', 1)[-1]}::{body}")
+PY2
+    done
+    rm -rf "$tmp"
+}
+on_exit() {
+    local status=$?
+    diag_on_exit "$status"
+}
+trap on_exit EXIT
 
 check_assembly() { # assembly path, mode, bound type
     python3 - "$1" "$2" "$3" <<'PY'

@@ -1380,6 +1380,38 @@ thread_local! {
 
 /// Record this translation unit's interposition mode (resolved once per
 /// unit by the driver, the same shape as the affine-fold knobs).
+/// Diagnostic configuration for SSA parameter substitution, resolved once per
+/// translation unit by `run_passes` (`set_ssa_param_config`).
+///
+/// `CCC_NO_SSA_PARAM=1` disables substitution; `CCC_SSA_PARAM_SKIP=a,b` names
+/// callees to leave alone; `CCC_SSA_PARAM_LOG=1` traces each substitution.
+#[derive(Clone, Default)]
+pub(crate) struct SsaParamConfig {
+    pub(crate) enabled: bool,
+    pub(crate) skip: crate::common::fx_hash::FxHashSet<String>,
+    pub(crate) log: bool,
+}
+
+thread_local! {
+    static SSA_PARAM_CONFIG: std::cell::RefCell<SsaParamConfig> =
+        std::cell::RefCell::new(SsaParamConfig {
+            enabled: true,
+            skip: crate::common::fx_hash::FxHashSet::default(),
+            log: false,
+        });
+}
+
+/// Install this translation unit's substitution configuration. Called once per
+/// `run_passes` invocation so a previous compile on the same worker thread
+/// cannot leak its diagnostics into the next one.
+pub(crate) fn set_ssa_param_config(config: SsaParamConfig) {
+    SSA_PARAM_CONFIG.with(|cell| *cell.borrow_mut() = config);
+}
+
+fn ssa_param_config() -> SsaParamConfig {
+    SSA_PARAM_CONFIG.with(|cell| cell.borrow().clone())
+}
+
 pub(crate) fn set_semantic_interposition(interposable: bool) {
     SEMANTIC_INTERPOSITION.with(|f| f.set(interposable));
 }
@@ -5685,17 +5717,16 @@ fn inline_call_site(
         }
     }
 
-    // CCC_NO_SSA_PARAM=1 disables parameter substitution (diagnostic toggle).
-    let ssa_param_enabled = std::env::var("CCC_NO_SSA_PARAM").is_err();
-    // CCC_SSA_PARAM_SKIP=callee1,callee2 disables substitution for named
-    // callees; CCC_SSA_PARAM_LOG=1 traces substitutions (diagnostics).
-    let ssa_skip: crate::common::fx_hash::FxHashSet<String> = std::env::var("CCC_SSA_PARAM_SKIP")
-        .unwrap_or_default()
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-    let ssa_log = std::env::var("CCC_SSA_PARAM_LOG").is_ok();
+    // Parameter substitution's diagnostic switches, resolved once per
+    // translation unit by `run_passes` rather than read here: the pass-pipeline
+    // env-read ratchet (tests/regression/check_env_test_hygiene.sh) requires a
+    // new switch to be resolved in `run_passes`, so no `getenv` runs per call
+    // site.
+    let SsaParamConfig {
+        enabled: ssa_param_enabled,
+        skip: ssa_skip,
+        log: ssa_log,
+    } = ssa_param_config();
     let substitutable: Vec<bool> = (0..param_alloca_info.len())
         .map(|i| {
             let ok = ssa_param_enabled
