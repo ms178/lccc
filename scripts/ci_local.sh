@@ -209,6 +209,13 @@ fi
 # the runner's core_pattern handler until the matrix became non-dumpable.)
 gate "driver-option-contract-core" fast \
     env CCC="$LCCC" bash tests/regression/check_driver_option_contract.sh --skip-trapv-matrix
+
+# GP-23 macro-parity gate: lccc -dM -E must match gcc-16 -dM -E for
+# x86-64/i686 x gnu23/gnu17/gnu90. FORBIDDEN list must be empty (ratchet).
+gate "macro-parity" fast \
+    env CCC="$LCCC" GCC=gcc-16 bash tests/regression/check_macro_parity.sh
+
+
 gate "trapv-boundary-matrix-m64" fast \
     env CCC="$LCCC" bash tests/regression/check_trapv_boundary_matrix.sh --bits -m64
 gate "trapv-boundary-matrix-m32" fast \

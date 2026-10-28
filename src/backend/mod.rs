@@ -432,6 +432,19 @@ impl Target {
         }
     }
 
+    /// Return the Debian multiarch directory name for this target.
+    /// Used by `-print-multiarch` so configure scripts can locate
+    /// system headers/libraries in multiarch paths (e.g. `/usr/lib/x86_64-linux-gnu/`).
+    /// Note: i686's triple is `i686-linux-gnu` but its multiarch dir is `i386-linux-gnu`.
+    pub(crate) fn multiarch_dir(&self) -> &'static str {
+        match self {
+            Target::X86_64 => "x86_64-linux-gnu",
+            Target::I686 => "i386-linux-gnu",
+            Target::Aarch64 => "aarch64-linux-gnu",
+            Target::Riscv64 => "riscv64-linux-gnu",
+        }
+    }
+
     /// Return the dynamic linker path for this target.
     pub(crate) fn dynamic_linker(&self) -> &'static str {
         match self {

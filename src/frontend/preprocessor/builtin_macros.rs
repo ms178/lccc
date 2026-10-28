@@ -432,8 +432,9 @@ fn define_type_traits_macros(macros: &mut MacroTable) {
     // C11/C17 feature test macros
     def(macros, "__STDC_UTF_16__", "1");
     def(macros, "__STDC_UTF_32__", "1");
-    def(macros, "__STDC_NO_ATOMICS__", "1");
     // Note: We support _Complex types, so __STDC_NO_COMPLEX__ is NOT defined.
+    // __STDC_NO_ATOMICS__ is NOT defined: _Atomic is implemented, so defining
+    // it would be an autoconf capability denial (GP-05).
     // __STDC_NO_THREADS__ is NOT defined because we link against glibc which provides <threads.h>
     // VLA declarations lower to DynAlloca and are supported. Do not define
     // __STDC_NO_VLA__: autoconf uses its presence as a hard capability denial.

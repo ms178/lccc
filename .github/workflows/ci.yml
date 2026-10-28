@@ -1185,6 +1185,11 @@ jobs:
     # check_trapv_boundary_matrix.sh); this step is the rest of the contract.
     - name: Check driver option contracts (core)
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_driver_option_contract.sh --skip-trapv-matrix
+    - name: GP-23 macro-parity gate (lccc -dM vs gcc-16 -dM)
+      env:
+        CCC: target/fastbuild/lccc
+        GCC: gcc-16
+      run: bash tests/regression/check_macro_parity.sh
     - name: Void declarators and initializers
       run: |
         set -o pipefail

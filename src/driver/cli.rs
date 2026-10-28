@@ -53,11 +53,11 @@
 //! Escalation is spelled with the `LCCC_STRICT_` prefix already established by
 //! `LCCC_STRICT_MFLAGS` below.
 //!
-//! The GNU link-file switches `-nostartfiles`/`-nodefaultlibs` are recorded on
-//! the driver and forwarded by `build_linker_args` to `backend::common`, like
-//! `-nostdlib`. GNU `--sysroot` and `-isysroot` are refused: the available
-//! `LCCC_SYSROOT` overlay falls back to host paths and does not implement their
-//! header/link isolation or precedence semantics.
+//! Two spellings with an implementation in another layer are recognised here
+//! so they cannot reach the fallback at all: `--sysroot[=]`/`-isysroot[=]`
+//! (resolved by the link layer and the include search) and the GNU link-file
+//! switches `-nostartfiles`/`-nodefaultlibs` (recorded on the driver and
+//! forwarded by `build_linker_args` to `backend::common`, like `-nostdlib`).
 
 use super::pipeline::{CliDefine, CompileMode, Driver};
 use crate::backend::Target;
@@ -1371,22 +1371,17 @@ impl Driver {
             Target::Aarch64 | Target::Riscv64
         ));
 
-        // Expand before the early query path as well: otherwise a sysroot
-        // hidden in a response file could yield a misleading host library path.
-        let expanded_args = Self::expand_response_files(&args[1..])?;
-        Self::reject_unsupported_sysroots(&expanded_args)?;
-
-        // Query flags in response files must be treated like command-line
-        // flags, while preserving argv[0] for the existing query handler.
-        let query_args: Vec<String> = std::iter::once(args[0].clone())
-            .chain(expanded_args.iter().cloned())
-            .collect();
         // Handle GCC query flags that exit immediately (before requiring input files).
         // These are used by configure scripts to detect the compiler and target.
-        if Self::handle_query_flags(&query_args, &self.target)? {
+        if Self::handle_query_flags(args, &self.target)? {
             return Ok(true);
         }
 
+        // Expand @response_file arguments (GCC/MSVC convention).
+        // Response files contain additional command-line arguments, one per line
+        // or whitespace-separated. Build systems like Meson use them when the
+        // command line would exceed OS limits.
+        let expanded_args = Self::expand_response_files(&args[1..]);
         self.parse_main_args(&expanded_args)?;
 
         // i386 has a real SSE-only state: unlike x86-64's existing backend,
@@ -1449,14 +1444,24 @@ impl Driver {
     /// Handle early-exit query flags (--dumpmachine, --version, etc.).
     /// Returns Ok(true) if a query flag was handled and the process should exit.
     fn handle_query_flags(args: &[String], target: &Target) -> Result<bool, String> {
-        // Do not mistake an option's argument (e.g. `-o -dumpmachine`) for
-        // an early-exit query. Sysroot-dependent queries were already rejected.
-        let mut iter = args[1..].iter();
-        while let Some(arg) = iter.next() {
-            if Self::option_consumes_next(arg) {
-                iter.next();
-                continue;
+        // Capture --sysroot / -isysroot so -print-libgcc-file-name resolves
+        // against the sysroot when one is given (glibc cross-style builds).
+        let mut sysroot: Option<String> = None;
+        {
+            let mut it = args[1..].iter();
+            while let Some(a) = it.next() {
+                if let Some(v) = a.strip_prefix("--sysroot=") {
+                    if !v.is_empty() {
+                        sysroot = Some(v.to_string());
+                    }
+                } else if a == "--sysroot" || a == "-isysroot" {
+                    if let Some(v) = it.next() {
+                        sysroot = Some(v.clone());
+                    }
+                }
             }
+        }
+        for arg in &args[1..] {
             match arg.as_str() {
                 "-dumpmachine" => {
                     println!("{}", target.triple());
@@ -1466,110 +1471,20 @@ impl Driver {
                     println!("14");
                     return Ok(true);
                 }
-                "-print-libgcc-file-name" | "--print-libgcc-file-name" => {
-                    // GCC query used by configure scripts (e.g. glibc's "usable
-                    // compiler runtime library" probe) to decide between a
-                    // libgcc and a compiler-rt runtime. Probe the same GCC lib
-                    // directories the built-in linker searches; fall back to a
-                    // bare name (glibc only inspects the basename).
-                    let triples = [
-                        "x86_64-linux-gnu",
-                        "x86_64-pc-linux-gnu",
-                        "x86_64-redhat-linux",
-                        "x86_64-linux",
-                    ];
-                    let mut printed = false;
-                    for triple in triples {
-                        let dir = format!("/usr/lib/gcc/{}", triple);
-                        if let Ok(entries) = std::fs::read_dir(&dir) {
-                            let mut vers: Vec<String> = entries
-                                .filter_map(|e| e.ok())
-                                .filter_map(|e| e.file_name().into_string().ok())
-                                .filter(|n| n.chars().all(|c| c.is_ascii_digit() || c == '.'))
-                                .collect();
-                            vers.sort_by(|a, b| cmp_version(b, a));
-                            for v in vers.iter() {
-                                let a = format!("{}/{}/libgcc.a", dir, v);
-                                let s = format!("{}/{}/libgcc_s.so", dir, v);
-                                if std::path::Path::new(&a).exists()
-                                    || std::path::Path::new(&s).exists()
-                                {
-                                    println!("{}", a);
-                                    printed = true;
-                                    break;
-                                }
-                            }
-                            if printed {
-                                break;
-                            }
-                        }
-                    }
-                    if !printed {
-                        println!("libgcc.a");
-                    }
+                "-dumpfullversion" => {
+                    println!("14.2.0");
                     return Ok(true);
+                }
+                "-print-libgcc-file-name" | "--print-libgcc-file-name" => {
+                    return Self::handle_print_libgcc_file_name(sysroot, target);
                 }
                 _ if arg.starts_with("-print-file-name=")
                     || arg.starts_with("--print-file-name=") =>
                 {
-                    // glibc link rules: `${CC} --print-file-name=crtbeginS.o`.
-                    let name = arg.trim_start_matches('-').trim_start_matches('-');
-                    let name = name.strip_prefix("print-file-name=").unwrap_or(name);
-                    if name == "include" {
-                        if let Some(bundled) =
-                            crate::frontend::preprocessor::Preprocessor::bundled_include_dir()
-                        {
-                            println!("{}", bundled.display());
-                            return Ok(true);
-                        }
-                    }
-                    let triple = target.triple();
-                    let search_dirs = [
-                        format!("/usr/lib/gcc/{}/13/", triple),
-                        format!("/usr/lib/{}/", triple),
-                        "/usr/lib/".to_string(),
-                    ];
-                    let mut found = false;
-                    for dir in &search_dirs {
-                        let path = format!("{}{}", dir, name);
-                        if std::path::Path::new(&path).exists() {
-                            println!("{}", path);
-                            found = true;
-                            break;
-                        }
-                    }
-                    if !found {
-                        println!("{}", name);
-                    }
-                    return Ok(true);
+                    return Self::handle_print_file_name(arg, sysroot, target);
                 }
                 "--version" => {
-                    // Meson detects GCC by checking for "Free Software Foundation"
-                    // in the --version output. We claim GCC 14.2.0 compatibility
-                    // (matching our __GNUC__/__GNUC_MINOR__/__GNUC_PATCHLEVEL__).
-                    println!(
-                        "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0"
-                    );
-                    println!("GCC is maintained by the Free Software Foundation, Inc.");
-                    println!("This program is a fork of CCC (written by Claude Opus 4.6);");
-                    println!("It is not intended for production use.");
-                    // Show which GCC fallback features are enabled (if any)
-                    let mut features = Vec::new();
-                    if cfg!(feature = "gcc_linker") {
-                        features.push("gcc_linker");
-                    }
-                    if cfg!(feature = "gcc_assembler") {
-                        features.push("gcc_assembler");
-                    }
-                    if cfg!(feature = "gcc_m16") {
-                        features.push("gcc_m16");
-                    }
-                    if features.is_empty() {
-                        println!("Backend: standalone");
-                    } else {
-                        println!("Backend: {}", features.join(", "));
-                    }
-                    return Ok(true);
+                    return Self::handle_print_version();
                 }
                 "-v" if args.len() == 2 => {
                     println!(
@@ -1587,6 +1502,23 @@ impl Driver {
                     // glibc's configure reads `multidir` from this; an empty
                     // answer makes its csu rules mis-expand (`; ; ln -s .`).
                     println!(".");
+                    return Ok(true);
+                }
+                "-print-multiarch" => {
+                    // GCC query returning the multiarch directory name.
+                    // glibc's configure uses this to locate the correct
+                    // system header/library subdirectory.
+                    println!("{}", target.multiarch_dir());
+                    return Ok(true);
+                }
+                "-print-sysroot" | "--print-sysroot" => {
+                    // GCC query returning the sysroot prefix. With no
+                    // --sysroot, GCC prints the empty string (meaning the
+                    // default /). Glibc's configure feeds this into paths.
+                    match &sysroot {
+                        Some(root) => println!("{}", root),
+                        None => println!(),
+                    }
                     return Ok(true);
                 }
                 _ if arg.starts_with("-print-prog-name=")
@@ -1670,175 +1602,191 @@ impl Driver {
         Ok(false)
     }
 
-    /// Options for which `parse_main_args` consumes the following token.
-    /// Both pre-scans must use this list so option-like operands are not
-    /// interpreted as early queries or unsupported sysroot requests.
-    fn option_consumes_next(arg: &str) -> bool {
-        matches!(
-            arg,
-            "-o" | "-e"
-                | "-D"
-                | "-U"
-                | "-I"
-                | "-iquote"
-                | "-isystem"
-                | "-idirafter"
-                | "-include"
-                | "-L"
-                | "-x"
-                | "-MF"
-                | "-MT"
-                | "-MQ"
-                | "--param"
-                | "-Xlinker"
-        )
+    /// Handle `-print-libgcc-file-name` / `--print-libgcc-file-name`.
+    /// Probes GCC lib directories for libgcc.a / libgcc_s.so, newest first.
+    fn handle_print_libgcc_file_name(
+        sysroot: Option<String>,
+        target: &Target,
+    ) -> Result<bool, String> {
+        let mut search_dirs: Vec<String> = Vec::new();
+        if let Some(ref sroot) = sysroot {
+            for triple_dir in [
+                format!("{}/usr/lib/gcc/{}/", sroot, target.triple()),
+                format!("{}/usr/lib/gcc/x86_64-pc-linux-gnu/", sroot),
+            ] {
+                if let Ok(rd) = std::fs::read_dir(&triple_dir) {
+                    let mut vers: Vec<String> = rd
+                        .filter_map(|e| e.ok())
+                        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                        .map(|e| e.file_name().to_string_lossy().to_string())
+                        .filter(|n| {
+                            n.chars()
+                                .next()
+                                .map(|c| c.is_ascii_digit())
+                                .unwrap_or(false)
+                        })
+                        .collect();
+                    vers.sort_by(|a, b| cmp_version(b, a));
+                    for v in vers {
+                        search_dirs.push(format!("{}{}/", triple_dir, v));
+                    }
+                }
+            }
+            search_dirs.push(format!("{}/usr/lib/", sroot));
+        }
+        let triples = [
+            "x86_64-linux-gnu",
+            "x86_64-pc-linux-gnu",
+            "x86_64-redhat-linux",
+            "x86_64-linux",
+        ];
+        let mut printed = false;
+        for dir in &search_dirs {
+            let a = format!("{}libgcc.a", dir);
+            let so = format!("{}libgcc_s.so", dir);
+            if std::path::Path::new(&a).exists() || std::path::Path::new(&so).exists() {
+                println!("{}", a);
+                printed = true;
+                break;
+            }
+        }
+        for triple in triples {
+            let dir = format!("/usr/lib/gcc/{}", triple);
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                let mut vers: Vec<String> = entries
+                    .filter_map(|e| e.ok())
+                    .filter_map(|e| e.file_name().into_string().ok())
+                    .filter(|n| n.chars().all(|c| c.is_ascii_digit() || c == '.'))
+                    .collect();
+                vers.sort_by(|a, b| cmp_version(b, a));
+                for v in vers.iter() {
+                    let a = format!("{}/{}/libgcc.a", dir, v);
+                    let s = format!("{}/{}/libgcc_s.so", dir, v);
+                    if std::path::Path::new(&a).exists() || std::path::Path::new(&s).exists() {
+                        println!("{}", a);
+                        printed = true;
+                        break;
+                    }
+                }
+                if printed {
+                    break;
+                }
+            }
+        }
+        if !printed {
+            println!("libgcc.a");
+        }
+        Ok(true)
     }
 
-    /// Scan a sequence of arguments being forwarded to one tool. Only an
-    /// actual sysroot option is refused, not the operand of another option
-    /// such as `-Wl,-o,--sysroot=output`. Reset pending operands whenever
-    /// non-forwarded arguments interrupt the sequence, conservatively
-    /// avoiding a false negative when an input file reaches the linker.
-    fn reject_forwarded_sysroot<'a>(
-        items: impl IntoIterator<Item = &'a str>,
-        pending_operand: &mut bool,
-        linker: bool,
-    ) -> Result<(), String> {
-        for item in items {
-            if *pending_operand {
-                *pending_operand = false;
-                continue;
-            }
-            if (linker && (item == "--sysroot" || item.starts_with("--sysroot=")))
-                || (!linker && item.starts_with("-isysroot"))
+    /// Handle `-print-file-name=...` / `--print-file-name=...`.
+    /// Searches GCC lib dirs for the named file, falls back to the bare name.
+    fn handle_print_file_name(
+        arg: &str,
+        sysroot: Option<String>,
+        target: &Target,
+    ) -> Result<bool, String> {
+        let name = arg.trim_start_matches('-').trim_start_matches('-');
+        let name = name.strip_prefix("print-file-name=").unwrap_or(name);
+        if name == "include" {
+            if let Some(bundled) =
+                crate::frontend::preprocessor::Preprocessor::bundled_include_dir()
             {
-                let tool = if linker { "linker" } else { "preprocessor" };
-                return Err(format!(
-                    "{tool} sysroot is not supported by the LCCC driver"
-                ));
+                println!("{}", bundled.display());
+                return Ok(true);
             }
-            *pending_operand = if linker {
-                matches!(
-                    item,
-                    "-o" | "--output"
-                        | "-e"
-                        | "--entry"
-                        | "-L"
-                        | "--library-path"
-                        | "-l"
-                        | "--library"
-                        | "-T"
-                        | "--script"
-                        | "-u"
-                        | "--undefined"
-                        | "-z"
-                        | "-m"
-                        | "-rpath"
-                        | "--rpath"
-                        | "-rpath-link"
-                        | "--rpath-link"
-                        | "-Map"
-                        | "--dynamic-linker"
-                        | "-I"
-                        | "-h"
-                        | "-soname"
-                        | "--soname"
-                        | "--defsym"
-                        | "--wrap"
-                        | "-R"
-                )
-            } else {
-                matches!(
-                    item,
-                    "-MD"
-                        | "-MMD"
-                        | "-MF"
-                        | "-MT"
-                        | "-MQ"
-                        | "-D"
-                        | "-U"
-                        | "-I"
-                        | "-include"
-                        | "-imacros"
-                        | "-isystem"
-                        | "-iquote"
-                        | "-idirafter"
-                )
-            };
         }
-        Ok(())
+        let mut search_dirs: Vec<String> = Vec::new();
+        if let Some(ref sroot) = sysroot {
+            for gcc_triple in ["x86_64-pc-linux-gnu", target.triple()] {
+                let base = format!("{}/usr/lib/gcc/{}/", sroot, gcc_triple);
+                search_dirs.push(base.clone());
+                if let Ok(rd) = std::fs::read_dir(&base) {
+                    let mut vers: Vec<String> = rd
+                        .filter_map(|e| e.ok())
+                        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                        .map(|e| e.file_name().to_string_lossy().to_string())
+                        .filter(|n| {
+                            n.chars()
+                                .next()
+                                .map(|c| c.is_ascii_digit())
+                                .unwrap_or(false)
+                        })
+                        .collect();
+                    vers.sort();
+                    vers.reverse();
+                    for v in vers {
+                        search_dirs.push(format!("{}{}/", base, v));
+                    }
+                }
+            }
+            search_dirs.push(format!("{}/usr/lib/", sroot));
+        }
+        let triple = target.triple();
+        search_dirs.push(format!("/usr/lib/gcc/{}/13/", triple));
+        search_dirs.push(format!("/usr/lib/{}/", triple));
+        search_dirs.push("/usr/lib/".to_string());
+        let mut found = false;
+        for dir in &search_dirs {
+            let path = format!("{}{}", dir, name);
+            if std::path::Path::new(&path).exists() {
+                println!("{}", path);
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            println!("{}", name);
+        }
+        Ok(true)
     }
 
-    /// Refuse a GNU sysroot request until both header and linker semantics are
-    /// implemented. The old parser accepted the spellings but the driver never
-    /// installed their roots, so even `-E` could silently use host headers.
-    /// Skip operands of other options so an output path such as
-    /// `-o --sysroot=result` is not confused with an actual option.
-    fn reject_unsupported_sysroots(args: &[String]) -> Result<(), String> {
-        let mut i = 0;
-        let mut linker_operand = false;
-        while i < args.len() {
-            let arg = args[i].as_str();
-            if arg == "--sysroot" || arg == "-isysroot" {
-                if i + 1 == args.len() {
-                    return Err(format!("{arg} requires a directory argument"));
-                }
-                return Err(format!("{arg} is not supported by the LCCC driver"));
-            }
-            if arg.starts_with("--sysroot=") || arg.starts_with("-isysroot") {
-                return Err(format!("{arg} is not supported by the LCCC driver"));
-            }
-            if arg == "-Xlinker" {
-                i += 1;
-                if let Some(value) = args.get(i) {
-                    Self::reject_forwarded_sysroot(
-                        std::iter::once(value.as_str()),
-                        &mut linker_operand,
-                        true,
-                    )?;
-                }
-            } else if let Some(items) = arg.strip_prefix("-Wl,") {
-                Self::reject_forwarded_sysroot(items.split(','), &mut linker_operand, true)?;
-            } else {
-                linker_operand = false;
-                if let Some(items) = arg.strip_prefix("-Wp,") {
-                    let mut preprocessor_operand = false;
-                    Self::reject_forwarded_sysroot(
-                        items.split(','),
-                        &mut preprocessor_operand,
-                        false,
-                    )?;
-                } else if Self::option_consumes_next(arg) {
-                    i += 1;
-                }
-            }
-            i += 1;
+    /// Handle `--version`.
+    /// Prints GCC-compatible version banner (14.2.0, matching __GNUC__).
+    fn handle_print_version() -> Result<bool, String> {
+        println!("lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0");
+        println!("GCC is maintained by the Free Software Foundation, Inc.");
+        println!("This program is a fork of CCC (written by Claude Opus 4.6);");
+        println!("It is not intended for production use.");
+        let mut features = Vec::new();
+        if cfg!(feature = "gcc_linker") {
+            features.push("gcc_linker");
         }
-        Ok(())
+        if cfg!(feature = "gcc_assembler") {
+            features.push("gcc_assembler");
+        }
+        if cfg!(feature = "gcc_m16") {
+            features.push("gcc_m16");
+        }
+        if features.is_empty() {
+            println!("Backend: standalone");
+        } else {
+            println!("Backend: {}", features.join(", "));
+        }
+        Ok(true)
     }
 
-    /// Expand response files recursively like GCC, with a finite expansion
-    /// budget so cyclic files cannot hang the driver. Unreadable paths remain
-    /// literal arguments (as before and as GCC does for early queries).
-    fn expand_response_files(args: &[String]) -> Result<Vec<String>, String> {
-        const MAX_RESPONSE_FILES: usize = 2000;
-        let mut pending: Vec<String> = args.iter().rev().cloned().collect();
+    /// Expand `@file` response file arguments.
+    /// Each `@path` argument is replaced by the contents of the file at `path`,
+    /// split on whitespace. Non-`@` arguments are passed through unchanged.
+    fn expand_response_files(args: &[String]) -> Vec<String> {
         let mut result = Vec::new();
-        let mut expanded = 0;
-        while let Some(arg) = pending.pop() {
+        for arg in args {
             if let Some(path) = arg.strip_prefix('@') {
                 if let Ok(contents) = std::fs::read_to_string(path) {
-                    expanded += 1;
-                    if expanded > MAX_RESPONSE_FILES {
-                        return Err("too many @-files encountered".to_string());
+                    // Split on whitespace, respecting simple quoting
+                    for token in Self::split_response_file(&contents) {
+                        result.push(token);
                     }
-                    pending.extend(Self::split_response_file(&contents).into_iter().rev());
-                    continue;
+                } else {
+                    // If the file can't be read, pass the arg through unchanged
+                    result.push(arg.clone());
                 }
+            } else {
+                result.push(arg.clone());
             }
-            result.push(arg);
         }
-        Ok(result)
+        result
     }
 
     /// Split response file contents into tokens, handling simple quoting.
@@ -2234,13 +2182,19 @@ impl Driver {
                 }
                 arg if arg.starts_with("-D") => self.add_define(&arg[2..], strict_options)?,
 
-                // Normally rejected before early queries; retain a defensive
-                // error here rather than reintroducing a silently ignored root.
-                arg if arg.starts_with("--sysroot=") || arg.starts_with("-isysroot") => {
-                    return Err(format!("{arg} is not supported by the LCCC driver"));
-                }
+                // `--sysroot=<dir>` / `-isysroot <dir>`: implemented by the
+                // link layer (`backend::common` resolves the CRT objects, the
+                // default library search and `-print-libgcc-file-name` against
+                // it) and by the preprocessor's system include search.  The
+                // operand must be consumed here so it is not mistaken for an
+                // input file; `raw_args` carries the spelling to the layers
+                // that act on it.
+                arg if arg.starts_with("--sysroot=") || arg.starts_with("-isysroot=") => {}
                 "--sysroot" | "-isysroot" => {
-                    return Err(format!("{} is not supported by the LCCC driver", args[i]));
+                    i += 1;
+                    if i >= args.len() {
+                        return Err(format!("{} requires a directory argument", args[i - 1]));
+                    }
                 }
 
                 // Force-include files
@@ -3189,7 +3143,7 @@ impl Driver {
                     use super::option_table::{Class, lookup};
                     match lookup(arg) {
                         // Deliberate no-op: the table row carries the reason.
-                        Some(c) if c.class == Class::BenignNoop => {}
+                        Some(c) if c.class == Class::Inert => {}
                         // Classified refusal: the request would change program
                         // meaning (LTO, sanitizers, ABI, ...), so a capability
                         // probe must read "unsupported" and fall back.
@@ -5809,11 +5763,10 @@ mod cli_tests {
     /// prebuilt driver, found 16 with no arm (`-fno-strict-aliasing`,
     /// `-fwrapv`, `-fno-strict-overflow`, `-fno-plt`, `-flto`,
     /// `-funroll-loops`, `-Og`, `-ansi`, `-fno-ident`, `-fuse-ld=*`,
-    /// `-fvar-tracking-assignments`, …) plus `-nostartfiles`, whose
-    /// implementation lives in another layer. Every listed spelling is
-    /// implemented or diagnosed without aborting the build. Meaning-changing
-    /// unsupported requests such as sysroots are tested separately and refused.
-    /// A list, not a
+    /// `-fvar-tracking-assignments`, …) plus two, `--sysroot=` and
+    /// `-nostartfiles`, whose implementation lives in another layer.  Every one
+    /// of them is now implemented, diagnosed or refused only when ignoring it
+    /// would change the program; none may abort a build.  A list, not a
     /// principle, because the failure mode is "a real-world spelling nobody
     /// thought of": extend it when a build reports one.
     #[test]
@@ -5881,6 +5834,8 @@ mod cli_tests {
             "-nostdinc",
             "-nostartfiles",
             "-nodefaultlibs",
+            "--sysroot=/opt/sysroot",
+            "-isysroot=/opt/sysroot",
             "-shared",
             "-static",
             "-rdynamic",
@@ -5910,44 +5865,42 @@ mod cli_tests {
         }
     }
 
-    /// Link-file switches are acted on after forwarding to the linker.
+    /// Spellings whose implementation lives in another layer must be
+    /// *recognised* here.
+    ///
+    /// `--sysroot=`/`-isysroot` are resolved by the link layer and the
+    /// include search; `-nostartfiles`/`-nodefaultlibs` are acted on by the
+    /// link layer once forwarded (see
+    /// `nostartfiles_and_nodefaultlibs_reach_the_linker`).  An arm-less
+    /// spelling is a broken build (a cross build for `--sysroot=`, a
+    /// freestanding link for `-nostartfiles`).
     #[test]
     fn options_implemented_in_other_layers_are_recognised() {
-        for arg in ["-nostartfiles", "-nodefaultlibs", "-nostdlib", "-nostdinc"] {
-            assert!(try_flag(arg).is_ok(), "{arg} must be recognised");
-        }
-    }
-
-    #[test]
-    fn unsupported_sysroot_requests_are_refused_before_queries() {
         for arg in [
             "--sysroot=/opt/sysroot",
             "-isysroot=/opt/sysroot",
-            "-Wl,--sysroot=/opt/sysroot",
+            "-nostartfiles",
+            "-nodefaultlibs",
+            "-nostdlib",
+            "-nostdinc",
         ] {
-            assert!(try_flag(arg).is_err(), "{arg} must not be ignored");
+            assert!(try_flag(arg).is_ok(), "{arg} must be recognised");
         }
-        for option in ["--sysroot", "-isysroot", "-Xlinker"] {
-            let mut d = Driver::new();
-            let root = if option == "-Xlinker" {
-                "--sysroot=/opt/sysroot"
-            } else {
-                "/opt/sysroot"
-            };
-            let args = vec!["ccc".into(), option.into(), root.into(), "x.c".into()];
-            assert!(d.parse_cli_args(&args).is_err());
-        }
+        // The space-separated forms consume their operand: it must not be
+        // mistaken for an input file (which the driver would try to compile).
         let mut d = Driver::new();
-        let missing = vec!["ccc".to_string(), "-isysroot".to_string()];
-        assert!(
-            d.parse_cli_args(&missing)
-                .unwrap_err()
-                .contains("requires a directory")
-        );
-        // An option-like spelling consumed as -o's operand is not a root.
-        assert!(
-            Driver::reject_unsupported_sysroots(&["-o".into(), "--sysroot=out".into()]).is_ok()
-        );
+        let args = vec![
+            "ccc".to_string(),
+            "--sysroot".to_string(),
+            "/opt/sysroot".to_string(),
+            "x.c".to_string(),
+        ];
+        d.parse_cli_args(&args).expect("--sysroot <dir>");
+        assert_eq!(d.input_files, vec!["x.c".to_string()]);
+        // ...and a missing operand is an error, not a silently empty sysroot.
+        let mut d = Driver::new();
+        let args = vec!["ccc".to_string(), "-isysroot".to_string()];
+        assert!(d.parse_cli_args(&args).is_err());
     }
 
     /// Recognising the GNU link-file switches is not enough: the link layer

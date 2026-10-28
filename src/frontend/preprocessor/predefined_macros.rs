@@ -63,12 +63,10 @@ impl Preprocessor {
             ("__x86_64", "1"),
             ("__amd64__", "1"),
             ("__amd64", "1"),
-            // GCC compat: claim GCC 14.2.0. This is:
-            //  - >= 5.1 (Linux kernel minimum requirement)
-            //  - >= 7.4 (QEMU minimum requirement)
-            //  - A modern version that satisfies most project requirements.
-            // For glibc's _Float* types (expected native for GCC >= 7), we define
-            // them as macros mapping to standard C types below.
+            // GCC compat: claim GCC 14.2.0.  GP-05's __GNUC__ policy (claim 16
+            // vs keep 14 with -fgnuc-version=) is pending; claiming 16 causes
+            // glibc headers to enable features lccc does not implement, breaking
+            // test compilations.  Kept at 14 until the risk is retired.
             ("__GNUC__", "14"),
             ("__GNUC_MINOR__", "2"),
             ("__GNUC_PATCHLEVEL__", "0"),

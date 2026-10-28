@@ -1497,6 +1497,10 @@
           "name": "Check driver option contracts (core)"
         },
         {
+          "measured_s": 5.0,
+          "name": "GP-23 macro-parity gate (lccc -dM vs gcc-16 -dM)"
+        },
+        {
           "measured_s": 2.0,
           "name": "Void declarators and initializers"
         },
