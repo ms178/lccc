@@ -2,8 +2,10 @@
 
 ## Recovery and integration
 
-The previous diagnostic work was recovered from the open PR and replayed on
-this session's branch, based on `main` at `3f2f6a9`. Main's shared, pure-Rust
+The previous diagnostic work was recovered from the then-open PR and replayed
+on this session's branch. That PR has since merged into main; the subsequent
+rebase preserves its canonical attribute-name diagnostics alongside this
+branch's pointer-return checks and expanded probes. Main's shared, pure-Rust
 zlib/zstd ELF-section decoder supersedes the previous branch's private FFI
 implementation. An automatic replay initially retained both implementations
 and failed to compile; the duplicate implementation and its elevated census
@@ -15,7 +17,7 @@ names incorrectly falling into the unknown-name class. The registry now has
 127 GCC-known names, of which 83 are inventoried as unimplemented; 48 are
 implemented, including four intentional Clang extensions that GCC itself does
 not recognize. The regression gate cross-checks the actual registry against
-its inventory, checks GCC and LCCC on 33 focused probes, and compiles two
+its inventory, checks GCC and LCCC on 40 focused probes, and compiles two
 system-header translation units at four optimization levels with
 `-Wall -Wextra -Werror`. It is wired into both the local and hosted CI
 mirrors. Explicit `-Wattributes` still reports
