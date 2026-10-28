@@ -438,9 +438,9 @@ fn define_type_traits_macros(macros: &mut MacroTable) {
     // __STDC_NO_VLA__: autoconf uses its presence as a hard capability denial.
 
     // NOTE: libc macros (EOF, BUFSIZ, EXIT_SUCCESS, errno values, signal numbers,
-// …) are intentionally NOT predefined here.  GP-05: they must come from the
-// real headers (<stdio.h>, <stdlib.h>, <errno.h>, <signal.h>) rather than the
-// compiler, because GCC does not define them without an #include and lccc's
-// -dM output must match GCC's.  See FORBIDDEN_LIST in
-// tests/regression/check_macro_parity.sh.
+    // …) are intentionally NOT predefined here.  GP-05: they must come from the
+    // real headers (<stdio.h>, <stdlib.h>, <errno.h>, <signal.h>) rather than the
+    // compiler, because GCC does not define them without an #include and lccc's
+    // -dM output must match GCC's.  See FORBIDDEN_LIST in
+    // tests/regression/check_macro_parity.sh.
 }
