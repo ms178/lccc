@@ -128,17 +128,20 @@ and runtime `_Generic` checks cover both legal and illegal examples. A further
 bounded fix propagates const through `typeof` type names and expressions,
 including middle-pointer qualifiers and shadowed declarations. Qualifier
 support is still incomplete: `__builtin_types_compatible_p` loses qualifiers
-inside `typeof` (six wrong-result cases are tracked), and a volatile
-`typeof` object can have observable reads elided. Reproducers and limits are
-in `engineering/evidence/typeof-qualifier-gaps-2026-10-28/`.
+inside `typeof` (six wrong-result cases are tracked). Direct scalar `typeof`
+volatility is now propagated through sema and lowering, but dereferenced
+operands, volatile pointer objects and typedefs can still lose observable
+reads. Independent code generation defects also delete ordinary volatile
+local/parameter reads on i686 and RISC-V. Reproducers and limits are in
+`engineering/evidence/typeof-qualifier-gaps-2026-10-28/`.
 
 A separate red team found that file- and block-scope `extern volatile` objects
 and pointees lost their qualifiers in lowering, silently deleting loads and
 stores; extern const-pointee metadata was also missing from `_Generic`. The
 extern declaration paths now use the same qualifier setup as definitions.
 GCC 16.2 assembly controls cover scalar, pointer, array, struct and TLS
-accesses, with a nonvolatile negative control. This does not by itself fix
-qualifiers inherited through `typeof`.
+accesses, with a nonvolatile negative control. This extern repair does not
+by itself resolve the remaining `typeof` qualifier paths.
 
 With the identical manual configuration, upstream's 5,196-check suite passes
 against GCC-, Clang- and LCCC-compiled libraries; an LCCC-compiled upstream test

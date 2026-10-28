@@ -241,4 +241,8 @@ else
     echo "FAIL: extern pointee constness was lost"; rc=1
 fi
 
+if ! python3 "$(dirname "$0")/check_typeof_scalar_volatile.py" --compiler "$CCC"; then
+    rc=1
+fi
+
 exit $rc

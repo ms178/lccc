@@ -25,21 +25,38 @@ GCC=gcc-16 CCC="$PWD/target/fastbuild/lccc" \
 
 ## Volatile side effects
 
-`volatile.c` isolates a separate issue: `typeof(source)` should make `target`
-volatile. For this fixture on x86-64 at `-O2`, GCC 16.2 emits two reads of
-`target` in both functions; LCCC emits one in `read_twice` and none in
-`discard_twice`. Eliding volatile accesses is a silent correctness defect,
-not an optimization win. This fixture is not a passing regression until the
-volatile type and access semantics are fixed end to end.
+`volatile.c` was the original scalar witness. Before the repair, at `-O2`,
+GCC 16.2 emitted two reads of `target` in each function; LCCC emitted one in
+`read_twice` and none in `discard_twice`. Scalar volatility inherited directly
+from a named object or a non-pointer type-name is now propagated in sema and
+lowering, before any multi-declarator shadowing. This also avoids folding
+explicitly const objects whose `typeof` operand makes them volatile. The
+volatile-access gate checks global, local, extern, parameter and pointee
+accesses, `typeof_unqual`, shadowing and nonvolatile controls at five
+optimization levels against the same expected x86-64 accesses as GCC 16.2.
+
+**Important remaining defects:** `volatile-remaining.c` shows three paths
+still losing volatility: a dereferenced `typeof` operand, a volatile pointer
+object used as the operand, and a typedef of `typeof(source)`. At `-O2`, GCC
+16.2 emits two reads for each of `f`, `g`, and `h`; this LCCC revision emits
+none. These are silent wrong-code cases, not optimization wins; scalar
+coverage is not complete qualified-`typeof` support.
+
+Cross-target inspection also found an independent backend defect in ordinary
+volatile locals and parameters, without any `typeof`:
+`target-local-volatile.c` emits no actual local reads on i686 or RISC-V at
+`-O2`, while x86-64 and AArch64 retain them. The scalar gate is an x86-64
+assembly gate and does not establish volatile-local correctness elsewhere.
 
 A separate loss of qualifiers on ordinary file- and block-scope `extern`
-declarations has been repaired. The existing volatile-access gate now checks
-extern scalar, pointer, array, member and TLS accesses and a nonvolatile
-control, as well as an extern const-pointee `_Generic` execution. This does
-not establish volatile-`typeof` support.
+declarations has also been repaired. The volatile-access gate checks extern
+scalar, pointer, array, member and TLS accesses and a nonvolatile control, as
+well as an extern const-pointee `_Generic` execution.
 
 ```sh
-gcc-16 -std=gnu17 -O2 -S engineering/evidence/typeof-qualifier-gaps-2026-10-28/volatile.c -o /tmp/gcc-volatile.s
-target/fastbuild/lccc -std=gnu17 -O2 -S engineering/evidence/typeof-qualifier-gaps-2026-10-28/volatile.c -o /tmp/lccc-volatile.s
-# Inspect both function bodies; instruction spellings differ.
+GCC=gcc-16 CCC="$PWD/target/fastbuild/lccc" bash tests/regression/check_volatile_access_semantics.sh
+python3 tests/regression/check_typeof_scalar_volatile.py --compiler gcc-16
+gcc-16 -O2 -S engineering/evidence/typeof-qualifier-gaps-2026-10-28/volatile-remaining.c -o /tmp/gcc-volatile.s
+target/fastbuild/lccc -O2 -S engineering/evidence/typeof-qualifier-gaps-2026-10-28/volatile-remaining.c -o /tmp/lccc-volatile.s
+# Inspect f, g and h in both outputs; instruction spellings differ.
 ```

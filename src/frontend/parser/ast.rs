@@ -1473,6 +1473,7 @@ pub enum TypeSpecifier {
 #[derive(Debug, Clone, Default)]
 pub struct TypeofTypeQualifiers {
     pub base_const: bool,
+    pub base_volatile: bool,
     pub pointer_quals: Vec<u8>,
     pub unqual: bool,
 }

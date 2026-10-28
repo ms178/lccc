@@ -553,6 +553,8 @@ impl SemanticAnalyzer {
             if let Some(name) = &param.name {
                 let ty = self.param_decl_ctype(param);
                 let const_base = self.decl_const_base(&param.type_spec, param.is_const);
+                let base_volatile =
+                    param.is_volatile || self.scalar_typeof_is_volatile(&param.type_spec);
                 let top_const = if param.decayed_array {
                     false
                 } else if param.pointer_depth > 0 {
@@ -580,7 +582,7 @@ impl SemanticAnalyzer {
                 {
                     self.symbol_table.mark_written_type_name(name, alias);
                 }
-                if param.is_volatile {
+                if base_volatile {
                     self.symbol_table.mark_volatile_base(name);
                 }
                 // Top-level const for C11 6.5.16p1: a parameter with any
@@ -697,6 +699,8 @@ impl SemanticAnalyzer {
             if let Some(name) = &param.name {
                 let ty = self.param_decl_ctype(param);
                 let const_base = self.decl_const_base(&param.type_spec, param.is_const);
+                let base_volatile =
+                    param.is_volatile || self.scalar_typeof_is_volatile(&param.type_spec);
                 let top_const = if param.decayed_array {
                     false
                 } else if param.pointer_depth > 0 {
@@ -729,7 +733,7 @@ impl SemanticAnalyzer {
                 {
                     self.symbol_table.mark_written_type_name(name, alias);
                 }
-                if param.is_volatile {
+                if base_volatile {
                     self.symbol_table.mark_volatile_base(name);
                 }
                 if top_const {
@@ -966,6 +970,35 @@ impl SemanticAnalyzer {
         self.report_void_declarator(ts, &[], None, VoidRole::Other, span);
     }
 
+    /// Resolve volatile inherited by a non-pointer object through `typeof`.
+    /// Pointer-level and array qualifiers need their own per-level metadata;
+    /// do not confuse a volatile pointee with a volatile pointer object here.
+    fn scalar_typeof_is_volatile(&self, ts: &TypeSpecifier) -> bool {
+        let is_non_pointer_object = |ty: &CType| {
+            !matches!(
+                ty,
+                CType::Pointer(..) | CType::Array(..) | CType::Function(..)
+            )
+        };
+        match crate::common::qualifiers::base_specifier(ts) {
+            TypeSpecifier::Typeof(expr, false) => {
+                let Expr::Identifier(name, _) = expr.as_ref() else {
+                    return false;
+                };
+                self.symbol_table.is_volatile_base(name)
+                    && self
+                        .expr_type_checker()
+                        .infer_expr_ctype(expr)
+                        .is_some_and(|ty| is_non_pointer_object(&ty))
+            }
+            TypeSpecifier::TypeofType(inner, quals) if !quals.unqual => {
+                is_non_pointer_object(&self.type_spec_to_ctype(inner))
+                    && (quals.base_volatile || self.scalar_typeof_is_volatile(inner))
+            }
+            _ => false,
+        }
+    }
+
     fn analyze_declaration(&mut self, decl: &Declaration, is_global: bool) {
         // Register enum constants from this declaration's type specifier.
         // This recursively walks into struct/union fields to find inline
@@ -1041,6 +1074,7 @@ impl SemanticAnalyzer {
         // declarators enters scope. In `typeof(p) *p, q`, the new `p` must not
         // change the type (or qualifiers) subsequently used for `q`.
         let base_const = self.decl_const_base(&decl.type_spec, decl.is_const());
+        let base_volatile = decl.is_volatile() || self.scalar_typeof_is_volatile(&decl.type_spec);
         let base_pointer_quals = self.base_typedef_pointer_quals(&decl.type_spec, decl.is_const());
         let base_top_const = self.base_typedef_is_top_const(&decl.type_spec);
         if decl.is_transparent_union() {
@@ -1573,7 +1607,7 @@ impl SemanticAnalyzer {
                     self.symbol_table
                         .mark_written_type_name(&init_decl.name, alias);
                 }
-                if decl.is_volatile() || init_decl.attrs.object_volatile {
+                if base_volatile || init_decl.attrs.object_volatile {
                     self.symbol_table.mark_volatile_base(&init_decl.name);
                 }
             }
@@ -1942,8 +1976,18 @@ impl SemanticAnalyzer {
             } else {
                 Vec::new()
             };
-            let folds =
-                declares_const_object(decl, init_decl) && checker.is_constant_initializer(init);
+            // Do not substitute a constant for an observable volatile read,
+            // including when volatility came from a scalar typeof operand.
+            // The existing symbol flag also represents volatile pointees, so
+            // do not treat a pointer object itself as volatile on that basis.
+            let volatile_non_pointer = self.symbol_table.is_volatile_base(&init_decl.name)
+                && self
+                    .symbol_table
+                    .lookup(&init_decl.name)
+                    .is_some_and(|s| !matches!(s.ty, CType::Pointer(..)));
+            let folds = declares_const_object(decl, init_decl)
+                && !volatile_non_pointer
+                && checker.is_constant_initializer(init);
             (non_constant, folds)
         };
         for span in non_constant {

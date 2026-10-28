@@ -101,11 +101,13 @@ impl Lowerer {
             self.typeof_vm_base(&decl.type_spec)
         };
 
+        // Resolve before any declarator can shadow the typeof operand.
+        let inherited_volatile = self.scalar_typeof_is_volatile(&decl.type_spec);
         for declarator in &decl.declarators {
             if declarator.name.is_empty() {
                 continue;
             }
-            if decl.is_extern() && self.lower_extern_decl(decl, declarator) {
+            if decl.is_extern() && self.lower_extern_decl(decl, declarator, inherited_volatile) {
                 continue;
             }
             if self.try_lower_block_func_decl(decl, declarator) {
@@ -129,7 +131,7 @@ impl Lowerer {
             }
 
             let mut da = self.analyze_declaration(type_spec, &declarator.derived);
-            self.apply_declaration_qualifiers(&mut da, decl, declarator);
+            self.apply_declaration_qualifiers(&mut da, decl, declarator, inherited_volatile);
             da.apply_decl_vector_type(decl);
             self.fixup_unsized_array(&mut da, type_spec, &declarator.derived, &declarator.init);
 

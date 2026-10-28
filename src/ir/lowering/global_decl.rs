@@ -71,6 +71,9 @@ impl Lowerer {
             return;
         }
 
+        // Freeze inherited qualifiers before a declarator can shadow the
+        // `typeof` operand used by the remaining declarators.
+        let inherited_volatile = self.scalar_typeof_is_volatile(&decl.type_spec);
         for declarator in &decl.declarators {
             if declarator.name.is_empty() {
                 continue;
@@ -119,10 +122,10 @@ impl Lowerer {
             if self.should_skip_global_declarator(decl, declarator) {
                 continue;
             }
-            if self.try_lower_register_global(decl, declarator) {
+            if self.try_lower_register_global(decl, declarator, inherited_volatile) {
                 continue;
             }
-            if self.try_lower_extern_global(decl, declarator) {
+            if self.try_lower_extern_global(decl, declarator, inherited_volatile) {
                 continue;
             }
 
@@ -131,7 +134,7 @@ impl Lowerer {
                 RedeclResult::Proceed { prior_was_weak } => prior_was_weak,
             };
 
-            let da = self.prepare_global_analysis(decl, declarator);
+            let da = self.prepare_global_analysis(decl, declarator, inherited_volatile);
 
             let is_extern_decl = decl.is_extern() && declarator.init.is_none();
             if !is_extern_decl
@@ -315,6 +318,7 @@ impl Lowerer {
         &mut self,
         decl: &Declaration,
         declarator: &InitDeclarator,
+        inherited_volatile: bool,
     ) -> bool {
         let Some(ref reg_name) = declarator.attrs.asm_register else {
             return false;
@@ -323,6 +327,7 @@ impl Lowerer {
             return false;
         }
         let mut da = self.analyze_declaration(&decl.type_spec, &declarator.derived);
+        self.apply_declaration_qualifiers(&mut da, decl, declarator, inherited_volatile);
         da.apply_decl_vector_type(decl);
         let mut ginfo = GlobalInfo::from_analysis(&da);
         ginfo.asm_register = Some(reg_name.clone());
@@ -344,7 +349,12 @@ impl Lowerer {
     }
 
     /// Handle extern without initializer. Returns true if handled (caller should continue).
-    fn try_lower_extern_global(&mut self, decl: &Declaration, declarator: &InitDeclarator) -> bool {
+    fn try_lower_extern_global(
+        &mut self,
+        decl: &Declaration,
+        declarator: &InitDeclarator,
+        inherited_volatile: bool,
+    ) -> bool {
         if !decl.is_extern() || declarator.init.is_some() {
             return false;
         }
@@ -370,7 +380,7 @@ impl Lowerer {
         }
         if !self.globals.contains_key(&declarator.name) {
             let mut da = self.analyze_declaration(&decl.type_spec, &declarator.derived);
-            self.apply_declaration_qualifiers(&mut da, decl, declarator);
+            self.apply_declaration_qualifiers(&mut da, decl, declarator, inherited_volatile);
             da.apply_decl_vector_type(decl);
             let mut ginfo = GlobalInfo::from_analysis(&da);
             ginfo.var.address_space =
@@ -571,8 +581,9 @@ impl Lowerer {
         da: &mut DeclAnalysis,
         decl: &Declaration,
         declarator: &InitDeclarator,
+        inherited_volatile: bool,
     ) {
-        da.base_type_volatile = decl.is_volatile();
+        da.base_type_volatile = decl.is_volatile() || inherited_volatile;
         da.base_type_const =
             crate::common::qualifiers::type_name_const_base(&decl.type_spec, decl.is_const(), self);
         da.object_volatile = declarator.attrs.object_volatile;
@@ -584,9 +595,10 @@ impl Lowerer {
         &self,
         decl: &Declaration,
         declarator: &InitDeclarator,
+        inherited_volatile: bool,
     ) -> DeclAnalysis {
         let mut da = self.analyze_declaration(&decl.type_spec, &declarator.derived);
-        self.apply_declaration_qualifiers(&mut da, decl, declarator);
+        self.apply_declaration_qualifiers(&mut da, decl, declarator, inherited_volatile);
         da.apply_decl_vector_type(decl);
         if da.is_array_of_pointers || da.is_array_of_func_ptrs {
             da.struct_layout = None;

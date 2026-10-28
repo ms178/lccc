@@ -1043,16 +1043,20 @@ impl Parser {
             // `const` written on the argument's base `int`. Preserve the
             // argument's own base and pointer-level qualifiers before the
             // enclosing parser state is restored.
-            self.attrs.flags &= !(parsed_attr_flag::CONST | parsed_attr_flag::POINTER_CONST);
+            self.attrs.flags &= !(parsed_attr_flag::CONST
+                | parsed_attr_flag::VOLATILE
+                | parsed_attr_flag::POINTER_CONST);
             if let Some((result_type, pointer_quals)) = self.parse_nested_type_name_with_quals() {
                 if matches!(self.peek(), TokenKind::RParen) {
                     let base_const = self.attrs.parsing_const();
+                    let base_volatile = self.attrs.parsing_volatile();
                     self.advance();
                     self.attrs.flags = saved_flags;
                     return TypeSpecifier::TypeofType(
                         Box::new(result_type),
                         TypeofTypeQualifiers {
                             base_const,
+                            base_volatile,
                             pointer_quals,
                             unqual,
                         },
@@ -1995,6 +1999,28 @@ mod typeof_type_qualifier_tests {
             };
             assert_eq!(quals.base_const, base_const, "{source}");
             assert_eq!(quals.pointer_quals, pointer_quals, "{source}");
+            assert_eq!(quals.unqual, unqual, "{source}");
+        }
+    }
+
+    #[test]
+    fn type_operand_volatile_is_separate_from_outer_volatile() {
+        for (source, outer_volatile, base_volatile, unqual) in [
+            ("volatile __typeof__(int) x;", true, false, false),
+            ("__typeof__(volatile int) x;", false, true, false),
+            ("volatile __typeof__(volatile int) x;", true, true, false),
+            ("__typeof_unqual__(volatile int) x;", false, true, true),
+        ] {
+            let mut parser = Parser::new(Lexer::new(source, 0).tokenize());
+            let tu = parser.parse();
+            let Some(ExternalDecl::Declaration(decl)) = tu.decls.first() else {
+                panic!("expected declaration: {source}");
+            };
+            assert_eq!(decl.is_volatile(), outer_volatile, "{source}");
+            let TypeSpecifier::TypeofType(_, quals) = &decl.type_spec else {
+                panic!("expected typeof(type-name): {source}");
+            };
+            assert_eq!(quals.base_volatile, base_volatile, "{source}");
             assert_eq!(quals.unqual, unqual, "{source}");
         }
     }
