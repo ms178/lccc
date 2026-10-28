@@ -216,7 +216,7 @@ gate "driver-option-contract-core" fast \
 # every one of them used to be silent (an unimplemented attribute generated
 # foreign-ABI code, an unmodelled constraint letter silently became a GPR).
 # Hosted CI runs the same scripts.
-gate "attribute-diagnostics" fast \
+gate "attribute-class-diagnostics" fast \
     env CCC="$LCCC" bash tests/regression/check_attribute_diagnostics.sh
 gate "lexer-extensions" fast \
     env CCC="$LCCC" bash tests/regression/check_lexer_extensions.sh
