@@ -47,7 +47,7 @@ the remaining `typeof`/qualifier representation issues remain open.
 
 ## Workload and measurements
 
-The upstream `tests/benchmark/benchmark.c` was compiled once by GCC for all
+The upstream `tests/benchmark/benchmark.c` was compiled once by GCC for all <!-- dl-skip: path in the external Expat source tree -->
 arms; only the library compiler differs. Its namespace-enabled workload uses a
 deterministic synthetic 1,400,832-byte XML document, 8,192-byte chunks and
 five parses per timing sample. The document has SHA-256
