@@ -102,7 +102,9 @@ impl Lexer {
             // Identifiers and keywords
             // GCC extension: '$' is allowed in identifiers (-fdollars-in-identifiers, on by default)
             // UCN in identifier: \uXXXX or \UXXXXXXXX (C99)
-            if ch == b'_' || ch == b'$' || ch.is_ascii_alphabetic()
+            if ch == b'_'
+                || ch == b'$'
+                || ch.is_ascii_alphabetic()
                 || (ch == b'\\' && self.peek_next().is_some_and(|c| c == b'u' || c == b'U'))
             {
                 return self.lex_identifier(start);
