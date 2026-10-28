@@ -2,43 +2,25 @@
 # A 32-bit logical right shift by 24 followed by sign-extension of its low
 # byte is exactly an arithmetic right shift by 24.  With a dead shift
 # temporary and unobservable flags, fold the copy/shift/movsbl sequence to
-# copy/sarl.  The skip arm is the structural and runtime control.
+# copy/sarl.
+#
+# The structural contract is asserted on the noinline `shifted()` fixture
+# below, not on a benchmark's `main`.  A benchmark's lowering may legitimately
+# change shape (different inlining, a bitmask LUT, a caller-saved choice), and
+# a gate that pins its exact instruction selection would fail on an unrelated
+# improvement while proving nothing extra.  The benchmark is kept for what it
+# is good at: end-to-end output parity against GCC from -O0 through -Os.
 set -euo pipefail
 CCC=${CCC:-./target/fastbuild/lccc}
 GCC=${GCC:-gcc-16}
+command -v "$CCC" >/dev/null || { echo "no lccc at $CCC" >&2; exit 1; }
+command -v "$GCC" >/dev/null || { echo "no reference compiler $GCC" >&2; exit 1; }
 CCC=$(readlink -f "$CCC")
 GCC=$(readlink -f "$(command -v "$GCC")")
 td=$(mktemp -d)
 trap 'rm -rf "$td"' EXIT
 src=tests/benchmark/programs/switch_lut_bool_bench.c
 flags=(-DN=250000)
-
-"$CCC" -O2 -S "${flags[@]}" "$src" -o "$td/normal.s"
-CCC_PEEPHOLE_SKIP=shift_signext "$CCC" -O2 -S "${flags[@]}" "$src" -o "$td/skip.s"
-normal=$(sed -n '/^main:/,/^\.size[[:space:]]*main/p' "$td/normal.s")
-skip=$(sed -n '/^main:/,/^\.size[[:space:]]*main/p' "$td/skip.s")
-
-if ! grep -qE 'sarl[[:space:]]+\$24,' <<<"$normal" ||
-    grep -qE 'shrl[[:space:]]+\$24,|movsbl' <<<"$normal"; then
-    echo "optimized main must contain sarl \$24 and no shrl/movsbl remnant:" >&2
-    echo "$normal" >&2
-    exit 1
-fi
-if ! grep -qE 'shrl[[:space:]]+\$24,' <<<"$skip" ||
-    ! grep -q 'movsbl' <<<"$skip"; then
-    echo "shift_signext skip arm must retain the original shrl/movsbl sequence:" >&2
-    echo "$skip" >&2
-    exit 1
-fi
-
-"$CCC" -O2 "${flags[@]}" "$src" -o "$td/normal"
-CCC_PEEPHOLE_SKIP=shift_signext "$CCC" -O2 "${flags[@]}" "$src" -o "$td/skip"
-normal_out=$("$td/normal")
-skip_out=$("$td/skip")
-[ "$normal_out" = "$skip_out" ] || {
-    echo "normal/skip output divergence: $normal_out vs $skip_out" >&2
-    exit 1
-}
 
 # The vowel benchmark alone cannot distinguish negative sign-extended bytes
 # from large positive ones: both take its default arm.  Check the actual

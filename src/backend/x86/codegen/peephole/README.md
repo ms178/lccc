@@ -731,7 +731,10 @@ Direct assembler tests cover those refusals, source aliases, killed flags and
 debug-attribution adjacency.  `tests/regression/check_shift_signext_fold.sh`
 adds the optimized/skip structural controls, exact signed results for all 256
 high bytes through an external call, and GCC output parity from -O0 through
--Os; the registered `load-cast-fold` gate runs both cast-fold harnesses.
+-Os.  It is registered as its own gate (`shift-signext-fold` locally,
+"Verify exact shift and byte sign-extension fold" in CI) rather than being
+nested inside `check_load_cast_fold.sh`, so the sharded lane plan accounts for
+its cost and it cannot be skipped by disabling an unrelated harness.
 
 ### Performance-Critical Formatting
 

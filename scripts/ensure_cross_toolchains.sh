@@ -236,15 +236,25 @@ loader_cache_failed=0
 # Discovery must not report a missing tool when the standard absolute binary
 # is present and sudo can execute it (the earlier PATH-only check did exactly
 # that after successfully unpacking every cross package).
-ldconfig_bin=$(command -v ldconfig 2>/dev/null || true)
-if [[ -z $ldconfig_bin ]]; then
-    for candidate in /sbin/ldconfig /usr/sbin/ldconfig; do
-        if [[ -x $candidate ]]; then
-            ldconfig_bin=$candidate
-            break
-        fi
-    done
-fi
+# The search roots are overridable so a test can exercise this discovery
+# without touching /sbin; production always uses the standard two.
+CROSS_SBIN_DIRS=("${CROSS_SBIN_DIR:-/sbin}" "${CROSS_USR_SBIN_DIR:-/usr/sbin}")
+
+find_ldconfig() {  # -> absolute path on stdout, empty when the host has none
+    local found dir
+    found=$(command -v ldconfig 2>/dev/null || true)
+    if [[ -z $found ]]; then
+        for dir in "${CROSS_SBIN_DIRS[@]}"; do
+            if [[ -x $dir/ldconfig ]]; then
+                found=$dir/ldconfig
+                break
+            fi
+        done
+    fi
+    printf '%s' "$found"
+}
+
+ldconfig_bin=$(find_ldconfig)
 if [[ -n $ldconfig_bin ]]; then
     if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
         "$ldconfig_bin" || loader_cache_failed=1
