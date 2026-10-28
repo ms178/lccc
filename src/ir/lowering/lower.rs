@@ -68,6 +68,11 @@ pub struct Lowerer {
     pub(super) defined_functions: FxHashSet<String>,
     // Set of function names declared with static linkage
     pub(super) static_functions: FxHashSet<String>,
+    /// Entity attributes collected from all file-scope declarations, including
+    /// declarations after a definition. `retain` roots linker GC; `used` roots
+    /// frontend/IR DCE. They are intentionally independent.
+    pub(super) retained_function_decls: FxHashSet<String>,
+    pub(super) used_function_decls: FxHashSet<String>,
     /// Set of function names declared with __attribute__((error("..."))) or __attribute__((warning("..."))).
     /// Calls to these functions should be treated as unreachable (they are compile-time assertion traps).
     pub(super) error_functions: FxHashSet<String>,
@@ -366,6 +371,8 @@ impl Lowerer {
             known_functions,
             defined_functions: FxHashSet::default(),
             static_functions: FxHashSet::default(),
+            retained_function_decls: FxHashSet::default(),
+            used_function_decls: FxHashSet::default(),
             error_functions: FxHashSet::default(),
             diagnose_as_builtins: FxHashMap::default(),
             noreturn_functions: FxHashSet::default(),
@@ -807,6 +814,12 @@ impl Lowerer {
         }
         // Used, referenced, or lifecycle-annotated bodies are kept.
         !(func.attrs.is_used()
+            || self.used_function_decls.contains(&func.name)
+            // GCC emits an unused retained static function at -O0, although
+            // it may eliminate it at higher levels. Lower it so the tier's
+            // later DCE can make that decision with the full call graph.
+            || func.attrs.is_retain()
+            || self.retained_function_decls.contains(&func.name)
             || func.attrs.is_constructor()
             || self.module.constructors.contains(&func.name)
             || func.attrs.is_destructor()
@@ -919,6 +932,21 @@ impl Lowerer {
             }
             if let ExternalDecl::Declaration(decl) = decl {
                 for declarator in &decl.declarators {
+                    // Unlike a parser's one-way inheritance, this pre-pass also
+                    // sees attributes declared after the definition. Do not
+                    // classify function-pointer objects as functions.
+                    let function_entity = DerivedDeclarator::declares_function(&declarator.derived)
+                        || (declarator.derived.is_empty()
+                            && matches!(&decl.type_spec, TypeSpecifier::TypedefName(name)
+                                if self.types.function_typedefs.contains_key(name)));
+                    if function_entity && !decl.is_typedef() && !declarator.name.is_empty() {
+                        if declarator.attrs.is_retain() {
+                            self.retained_function_decls.insert(declarator.name.clone());
+                        }
+                        if declarator.attrs.is_used() {
+                            self.used_function_decls.insert(declarator.name.clone());
+                        }
+                    }
                     // Collect __asm__("label") linker symbol redirects on function declarations.
                     // When a function declaration has __asm__("symbol"), calls to that function
                     // should emit the asm label as the linker symbol instead of the C name.

@@ -4111,31 +4111,31 @@ pub(crate) fn detect_and_not_fusions(block: &BasicBlock, use_counts: &[u32]) -> 
     and_indices
 }
 
-fn function_text_section(func: &IrFunction, function_sections: bool) -> String {
+fn function_text_section(func: &IrFunction, function_sections: bool, retain: bool) -> String {
     if let Some(ref sect) = func.section {
         if !sect.is_empty() {
             return sect.clone();
         }
     }
-    if function_sections {
+    if function_sections || retain {
         format!(".text.{}", func.name)
     } else {
         ".text".to_string()
     }
 }
 
-fn emit_switch_to_section(cg: &mut dyn ArchCodegen, sect: &str) {
+fn emit_switch_to_section(cg: &mut dyn ArchCodegen, sect: &str, retain: bool) {
     let sect = if sect.is_empty() { ".text" } else { sect };
-    if cg.state_ref().current_text_section == sect {
+    if cg.state_ref().current_text_section == sect && cg.state_ref().current_text_retain == retain {
         return;
     }
-    if sect == ".text" {
+    cg.state().current_text_section = sect.to_string();
+    cg.state().current_text_retain = retain;
+    if sect == ".text" && !retain {
         cg.state().emit(".text");
     } else {
-        cg.state()
-            .emit_fmt(format_args!(".section {},\"ax\",@progbits", sect));
+        cg.state().restore_current_text_section();
     }
-    cg.state().current_text_section = sect.to_string();
 }
 
 pub fn generate_module_with_debug(
@@ -4622,6 +4622,7 @@ fn emit_functions_and_sections(
     if !function_sections {
         cg.state().emit(".text");
         cg.state().current_text_section = ".text".to_string();
+        cg.state().current_text_retain = false;
     }
     // Direct callees are emitted first when x86 IPA-RA is active.  This does
     // not change the order of unrelated functions, but it turns the summary
@@ -4668,8 +4669,9 @@ fn emit_functions_and_sections(
             continue;
         }
         if !func.is_declaration {
-            let sect = function_text_section(func, function_sections);
-            emit_switch_to_section(cg, &sect);
+            let retain = module.retained_functions.contains(&func.name);
+            let sect = function_text_section(func, function_sections, retain);
+            emit_switch_to_section(cg, &sect, retain);
             // This function's own `aligned(N)`, in the three states GCC
             // distinguishes, handed to `generate_function` as its placement:
             //
@@ -5155,7 +5157,8 @@ fn generate_function_body(
     // `reset_for_function` may clear that field to `""`, and restoring it
     // would emit `.section ,"ax",@progbits`.
     let function_sections = cg.state_ref().function_sections;
-    let func_sect = function_text_section(func, function_sections);
+    let func_retain = cg.state_ref().current_text_retain;
+    let func_sect = function_text_section(func, function_sections, func_retain);
 
     cg.state().reset_for_function();
 
@@ -5217,7 +5220,7 @@ fn generate_function_body(
                 // Restore THIS function's section (custom / .text.foo / .text),
                 // not a hard-coded `.text` that would break -ffunction-sections
                 // and leave the body in the PFE section.
-                emit_switch_to_section(cg, &func_sect);
+                emit_switch_to_section(cg, &func_sect, func_retain);
 
                 if let Some(log2) = fn_entry_align_log2(cg, attr_align) {
                     cg.state().emit_fmt(format_args!(".p2align {}", log2));
@@ -5322,7 +5325,7 @@ fn generate_function_body(
                     cg.state().emit_fmt(format_args!(".align {}", ptr_align));
                     cg.state()
                         .emit_fmt(format_args!("{} {}", ptr_dir.as_str(), lbl));
-                    emit_switch_to_section(cg, &func_sect);
+                    emit_switch_to_section(cg, &func_sect, func_retain);
                 }
                 if mc.nop {
                     // 5-byte NOP, the exact encoding the kernel mandates
@@ -6832,7 +6835,7 @@ fn generate_function_body(
     cg.emit_vector_const_rodata();
     // `emit_vector_const_rodata` switches to .rodata. Restore so the next
     // function cannot land in .rodata if it forgets its own `.section`.
-    emit_switch_to_section(cg, &func_sect);
+    emit_switch_to_section(cg, &func_sect, func_retain);
 }
 
 /// The `(file, line, column)` row of `span`, if it names a known file.

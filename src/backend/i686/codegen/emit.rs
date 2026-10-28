@@ -3723,9 +3723,7 @@ impl ArchCodegen for I686Codegen {
                     .emit_fmt(format_args!("    .long {}", target_label));
             }
         }
-        let sect = self.state.current_text_section.clone();
-        self.state
-            .emit_fmt(format_args!(".section {},\"ax\",@progbits", sect));
+        self.state.restore_current_text_section();
         self.state.reg_cache.invalidate_all();
     }
 

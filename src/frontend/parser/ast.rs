@@ -110,6 +110,8 @@ pub mod func_attr_flag {
     pub const STACK_PROTECT: u32 = 1 << 17;
     /// `__attribute__((no_stack_protector))` — suppress stack-protector canary.
     pub const NO_STACK_PROTECTOR: u32 = 1 << 18;
+    /// `__attribute__((retain))` — keep the emitted function section through linker GC.
+    pub const RETAIN: u32 = 1 << 19;
 }
 
 /// The declaration *specifiers* of a function definition: the part of its
@@ -159,6 +161,7 @@ impl FunctionAttributes {
         attrs.set_destructor(decl.is_destructor());
         attrs.set_weak(decl.is_weak());
         attrs.set_used(decl.is_used());
+        attrs.set_retain(decl.is_retain());
         attrs.set_fastcall(decl.is_fastcall());
         attrs.regparm = decl.regparm;
         attrs.set_naked(decl.is_naked());
@@ -222,6 +225,10 @@ impl FunctionAttributes {
     #[inline]
     pub fn is_used(&self) -> bool {
         self.flags & func_attr_flag::USED != 0
+    }
+    #[inline]
+    pub fn is_retain(&self) -> bool {
+        self.flags & func_attr_flag::RETAIN != 0
     }
     #[inline]
     pub fn is_fastcall(&self) -> bool {
@@ -303,6 +310,10 @@ impl FunctionAttributes {
         self.set_flag(func_attr_flag::USED, v)
     }
     #[inline]
+    pub fn set_retain(&mut self, v: bool) {
+        self.set_flag(func_attr_flag::RETAIN, v)
+    }
+    #[inline]
     pub fn set_fastcall(&mut self, v: bool) {
         self.set_flag(func_attr_flag::FASTCALL, v)
     }
@@ -362,6 +373,7 @@ impl std::fmt::Debug for FunctionAttributes {
             .field("is_destructor", &self.is_destructor())
             .field("is_weak", &self.is_weak())
             .field("is_used", &self.is_used())
+            .field("is_retain", &self.is_retain())
             .field("is_fastcall", &self.is_fastcall())
             .field("regparm", &self.regparm)
             .field("is_naked", &self.is_naked())

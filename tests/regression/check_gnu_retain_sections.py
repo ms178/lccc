@@ -187,6 +187,44 @@ def check_tls_source_object(obj: Path) -> None:
             raise RuntimeError(f'{obj}: {found[0]} has wrong section type or flags')
 
 
+FUNCTION_RETAINED = {
+    'keep_default', 'keep_static', 'retain_prototype', 'retain_after',
+    'used_prototype', 'used_after', 'keep_custom', 'keep_cold', 'jump_fn',
+}
+FUNCTION_DEAD = {'used_not_retain', 'unused_retain_only', 'unused_retain_data'}
+
+
+def check_function_object(obj: Path) -> None:
+    sections, symbols = elf(obj)
+    for name in FUNCTION_RETAINED:
+        index = symbols.get(name, 0)
+        if not 0 < index < len(sections) or sections[index][1:] != (1, A | X | R):
+            raise RuntimeError(f'{obj}: retained function {name} has wrong section: '
+                               f'{sections[index] if 0 < index < len(sections) else index}')
+        if name == 'keep_custom' and sections[index][0] != '.custom_fn':
+            raise RuntimeError(f'{obj}: explicit function section was lost')
+        if name not in ('keep_custom', 'keep_cold') and sections[index][0] != f'.text.{name}':
+            raise RuntimeError(f'{obj}: {name} must have its own text section')
+    index = symbols.get('used_not_retain', 0)
+    if not 0 < index < len(sections) or sections[index] != ('.discard_fn', 1, A | X):
+        raise RuntimeError(f'{obj}: used without retain must not gain SHF_GNU_RETAIN')
+    if any(symbols.get(name, 0) != 0 for name in ('unused_retain_only', 'unused_retain_data')):
+        raise RuntimeError(f'{obj}: retain alone unexpectedly prevented frontend DCE at -O2')
+
+
+def check_function_gc(binary: Path, *, o0: bool = False) -> None:
+    _, symbols = elf(binary)
+    present = {name for name, index in symbols.items() if index != 0}
+    expected = FUNCTION_RETAINED | ({'unused_retain_only', 'unused_retain_data'} if o0 else set())
+    missing = expected - present
+    unexpected = (FUNCTION_DEAD - expected) & present
+    if missing or unexpected:
+        raise RuntimeError(f'{binary}: retained functions missing {missing}; '
+                           f'unretained functions present {unexpected}')
+    if {'helper_a', 'helper_b'} - present:
+        raise RuntimeError(f'{binary}: jump-table dependencies were discarded')
+
+
 def check_split(obj: Path, target: str, case: int) -> None:
     sections, symbols = elf(obj)
     if not all(sym in symbols and 0 < symbols[sym] < len(sections) for sym in ('first', 'second')):
@@ -302,6 +340,46 @@ def main() -> None:
                         exe = work / f'{stem}-{Path(linker_cc).name}'
                         run([linker_cc, '-no-pie', '-pthread', '-Wl,--gc-sections', obj, '-o', exe])
                         run([exe])
+        # C function retain differs from `used`: it must root its own code
+        # section, including when inherited from earlier or later prototypes.
+        # The switch forces an in-function .rodata round trip on each backend.
+        function_source = ROOT / 'tests/regression/fixtures/retain-c/functions.c'
+        function_reference = work / 'gcc-functions.o'
+        run([args.gcc, '-O2', '-ffunction-sections', '-c', function_source, '-o', function_reference])
+        check_function_object(function_reference)
+        for name, cc, flags, _, _ in targets[:-1]:
+            obj = work / f'{name}-functions.o'
+            asm = work / f'{name}-functions.s'
+            opts = [*flags, '-O2', '-ffunction-sections']
+            run([cc, *opts, '-c', function_source, '-o', obj])
+            check_function_object(obj)
+            run([cc, *opts, '-S', function_source, '-o', asm])
+            text = asm.read_text()
+            body = text.split('jump_fn:', 1)[1].split('.size jump_fn', 1)[0]
+            if '.section .rodata' not in body or '.section .text.jump_fn,"axR"' not in body:
+                raise RuntimeError(f'{name}: jump-table section round trip lost the retain flag')
+            if name == 'x86-64':
+                for linker_cc in (args.gcc, compiler):
+                    exe = work / f'functions-{Path(linker_cc).name}'
+                    run([linker_cc, '-no-pie', '-Wl,--gc-sections', obj, '-o', exe])
+                    run([exe])
+                    check_function_gc(exe)
+        # Check the GCC-produced object under both native linker drivers too.
+        for linker_cc in (args.gcc, compiler):
+            exe = work / f'functions-gcc-{Path(linker_cc).name}'
+            run([linker_cc, '-no-pie', '-Wl,--gc-sections', function_reference, '-o', exe])
+            check_function_gc(exe)
+        # -O0 retains unused retain-only definitions; optimized GCC may DCE
+        # them. Neither behavior should depend on -ffunction-sections.
+        for frontend in (args.gcc, compiler):
+            for opt in ('-O0', '-O1', '-O2', '-O3', '-Os'):
+                for fs in ('-ffunction-sections', '-fno-function-sections'):
+                    obj = work / 'function-matrix.o'
+                    exe = work / 'function-matrix'
+                    run([frontend, opt, fs, '-c', function_source, '-o', obj])
+                    run([args.gcc, '-no-pie', '-Wl,--gc-sections', obj, '-o', exe])
+                    check_function_gc(exe, o0=opt == '-O0')
+
         # A changed attribute/type within the *same* R variant is invalid in
         # GAS, unlike the two R/non-R variants above.
         invalid = [
@@ -403,7 +481,8 @@ int main(void) { return 0; }
             raise RuntimeError('GCC assembly: retained or discarded symbols have wrong GC result')
     print(f'PASS: GNU retain sections on {len(targets)} integrated assemblers, '
           f'{oracle_count} GAS oracles, 30 collision checks, GNU/mold x86/i686 GC and LCCC x86-64 GC, '
-          'GNU/LCCC partial links, GCC 16 assembly, C TLS ABI/thread runtime and negative controls')
+          'GNU/LCCC partial links, GCC 16 assembly, C TLS ABI/thread runtime, '
+          'retained-function GC and section-restoration matrices and negative controls')
 
 
 if __name__ == '__main__':
