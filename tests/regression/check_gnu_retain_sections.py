@@ -225,6 +225,58 @@ def check_function_gc(binary: Path, *, o0: bool = False) -> None:
         raise RuntimeError(f'{binary}: jump-table dependencies were discarded')
 
 
+def check_local_object_sizes(obj: Path, pointer_bytes: int) -> None:
+    """Stack-slot padding must never become ELF static/TLS object size."""
+    expected = {
+        'c': 1, 'c_zero': 1, 'h': 2, 'i': 4, 'i_zero': 4,
+        'f': 4, 'd': 8, 'tls': 4, 'array': 12,
+        'aggregate': 5 * pointer_bytes, 'flexible': 16, 'vector': 16,
+        'tiny': 2, 'decl_vec': 16, 'p': pointer_bytes, 'q': pointer_bytes,
+    }
+    found = {}
+    for line in run(['readelf', '-sW', obj]).stdout.splitlines():
+        fields = line.split()
+        if len(fields) >= 8 and fields[3] in ('OBJECT', 'TLS'):
+            parts = fields[7].split('.')
+            if len(parts) >= 2 and parts[-2] in expected and parts[-1].isdigit():
+                name = parts[-2]
+                if name in found:
+                    raise RuntimeError(f'{obj}: duplicate local symbol {name}')
+                found[name] = int(fields[2])
+    if found != expected:
+        raise RuntimeError(f'{obj}: local object sizes {found}, expected {expected}')
+    # A pointer-to-struct's brace initializer must not append pointee padding.
+    sections, _ = elf(obj)
+    table_indices = [i for i, section in enumerate(sections) if section[0] == '.ptr_table']
+    if len(table_indices) != 1:
+        raise RuntimeError(f'{obj}: expected one .ptr_table')
+    data = obj.read_bytes()
+    if data[4] == 2:
+        shoff, shentsize = struct.unpack_from('<Q', data, 40)[0], struct.unpack_from('<H', data, 58)[0]
+        size = struct.unpack_from('<Q', data, shoff + table_indices[0] * shentsize + 32)[0]
+    else:
+        shoff, shentsize = struct.unpack_from('<I', data, 32)[0], struct.unpack_from('<H', data, 46)[0]
+        size = struct.unpack_from('<I', data, shoff + table_indices[0] * shentsize + 20)[0]
+    if size != 2 * pointer_bytes:
+        raise RuntimeError(f'{obj}: .ptr_table size {size}, expected {2 * pointer_bytes}')
+    for name, wanted_size, wanted_align in [('.tiny_vector', 2, 2),
+                                            ('.decl_vector', 16, 16),
+                                            ('.global_vector', 16, 16)]:
+        indices = [i for i, section in enumerate(sections) if section[0] == name]
+        if len(indices) != 1:
+            raise RuntimeError(f'{obj}: expected one {name} section')
+        pos = shoff + indices[0] * shentsize
+        if data[4] == 2:
+            sec_size = struct.unpack_from('<Q', data, pos + 32)[0]
+            sec_align = struct.unpack_from('<Q', data, pos + 48)[0]
+        else:
+            sec_size = struct.unpack_from('<I', data, pos + 20)[0]
+            sec_align = struct.unpack_from('<I', data, pos + 32)[0]
+        if (sec_size, sec_align) != (wanted_size, wanted_align):
+            raise RuntimeError(f'{obj}: {name} has size/alignment {sec_size}/{sec_align}, '
+                               f'expected {wanted_size}/{wanted_align}')
+
+
 def check_split(obj: Path, target: str, case: int) -> None:
     sections, symbols = elf(obj)
     if not all(sym in symbols and 0 < symbols[sym] < len(sections) for sym in ('first', 'second')):
@@ -340,6 +392,22 @@ def main() -> None:
                         exe = work / f'{stem}-{Path(linker_cc).name}'
                         run([linker_cc, '-no-pie', '-pthread', '-Wl,--gc-sections', obj, '-o', exe])
                         run([exe])
+        # Verify exact ELF sizes, including TLS, vector, flexible-array and
+        # pointer-to-struct brace initializers; auto stack padding is not a
+        # valid object size and can corrupt custom pointer tables.
+        local_source = ROOT / 'tests/regression/fixtures/retain-c/local-size.c'
+        for name, cc, flags, pointer_bytes in [
+                ('gcc-64', args.gcc, [], 8), ('gcc-32', args.gcc, ['-m32'], 4),
+                *[(name, cc, flags, 4 if name == 'i686' else 8)
+                  for name, cc, flags, _, _ in targets[:-1]]]:
+            obj = work / f'{name}-local-size.o'
+            run([cc, *flags, '-O2', '-fPIC', '-c', local_source, '-o', obj])
+            check_local_object_sizes(obj, pointer_bytes)
+            if name in ('gcc-64', 'x86-64'):
+                exe = work / f'{name}-local-size'
+                run([args.gcc, obj, '-o', exe])
+                run([exe])
+
         # C function retain differs from `used`: it must root its own code
         # section, including when inherited from earlier or later prototypes.
         # The switch forces an in-function .rodata round trip on each backend.
@@ -481,8 +549,8 @@ int main(void) { return 0; }
             raise RuntimeError('GCC assembly: retained or discarded symbols have wrong GC result')
     print(f'PASS: GNU retain sections on {len(targets)} integrated assemblers, '
           f'{oracle_count} GAS oracles, 30 collision checks, GNU/mold x86/i686 GC and LCCC x86-64 GC, '
-          'GNU/LCCC partial links, GCC 16 assembly, C TLS ABI/thread runtime, '
-          'retained-function GC and section-restoration matrices and negative controls')
+          'GNU/LCCC partial links, GCC 16 assembly, C TLS/thread runtime, '
+          'static object layouts, retained-function GC and section restoration and negative controls')
 
 
 if __name__ == '__main__':

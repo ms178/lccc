@@ -172,7 +172,8 @@ impl Lowerer {
             self.globals.insert(declarator.name.clone(), ginfo);
 
             let init = self.lower_declarator_init(decl, declarator, &da);
-            let (align, explicit_request) = self.compute_global_alignment(decl, &da);
+            let (align, explicit_request) =
+                self.compute_static_alignment(decl, &decl.type_spec, &da);
             let has_explicit_align = explicit_request.is_some();
             let type_align = self
                 .typedef_alignment_for_type_spec(&decl.type_spec)
@@ -633,18 +634,25 @@ impl Lowerer {
             da.alloc_size = one;
             da.actual_alloc_size = one;
         }
-        if !da.is_array && !da.is_pointer && da.struct_layout.is_none() {
-            let c_size = self.sizeof_type(&decl.type_spec);
-            // Vectors use a pointer IR carrier, but their object size is the
-            // target C vector layout (including padding), not sizeof(void *).
-            // The carrier is for address-based lowering only.
-            da.actual_alloc_size = if da.c_type.as_ref().is_some_and(CType::is_vector) {
-                c_size
-            } else {
-                c_size.max(da.var_ty.size())
-            };
-        }
+        self.fix_static_scalar_size(&mut da, &decl.type_spec);
         da
+    }
+
+    /// Stack allocations may be rounded up to the target pointer width, but
+    /// static objects (including block-scope statics and TLS) need their C
+    /// object size in both the ELF symbol table and zero-filled storage.
+    pub(super) fn fix_static_scalar_size(&self, da: &mut DeclAnalysis, type_spec: &TypeSpecifier) {
+        if !da.is_array && !da.is_pointer && da.struct_layout.is_none() {
+            // Vectors use a pointer IR carrier. The fully resolved CType also
+            // includes declaration-level vector_size/ext_vector_type, which a
+            // bare sizeof(type_spec) can otherwise miss.
+            da.actual_alloc_size =
+                if let Some(vector) = da.c_type.as_ref().filter(|c| c.is_vector()) {
+                    vector.size_ctx(&*self.types.borrow_struct_layouts())
+                } else {
+                    self.sizeof_type(type_spec).max(da.var_ty.size())
+                };
+        }
     }
 
     fn lower_declarator_init(
@@ -692,21 +700,23 @@ impl Lowerer {
         }
     }
 
-    /// Object alignment of a global and, when the declaration carries one,
-    /// the explicit alignment request (`aligned(N)`, `_Alignas`, typedef
-    /// `aligned`) before merging with the natural alignment.
-    fn compute_global_alignment(
+    /// Alignment of a static object and, when present, the explicit request
+    /// (`aligned(N)`, `_Alignas`, typedef `aligned`) before natural alignment.
+    pub(super) fn compute_static_alignment(
         &self,
         decl: &Declaration,
+        type_spec: &TypeSpecifier,
         da: &DeclAnalysis,
     ) -> (usize, Option<usize>) {
-        let c_align = self.alignof_type(&decl.type_spec);
-        let is_vector_object = da
+        let c_align = self.alignof_type(type_spec);
+        let vector_object = da
             .c_type
             .as_ref()
-            .is_some_and(is_vector_object_or_array_of_vectors);
-        let natural = if is_vector_object {
-            c_align.max(1)
+            .filter(|ty| is_vector_object_or_array_of_vectors(ty));
+        let natural = if let Some(ty) = vector_object {
+            ty.align_ctx(&*self.types.borrow_struct_layouts())
+                .max(c_align)
+                .max(1)
         } else if c_align > 0 {
             c_align.max(da.var_ty.align())
         } else {
@@ -722,7 +732,7 @@ impl Lowerer {
             let real_sizeof = self.sizeof_type(sizeof_ts);
             explicit = Some(explicit.map_or(real_sizeof, |a| a.max(real_sizeof)));
         }
-        if let Some(&td_align) = self.typedef_alignment_for_type_spec(&decl.type_spec) {
+        if let Some(&td_align) = self.typedef_alignment_for_type_spec(type_spec) {
             explicit = Some(explicit.map_or(td_align, |a| a.max(td_align)));
         }
         match explicit {
@@ -743,16 +753,7 @@ impl Lowerer {
         prior_was_weak: bool,
     ) {
         let global_ty = da.resolve_global_ty(&init);
-        let final_size = match &init {
-            GlobalInit::Array(vals) if da.is_struct && vals.len() > da.actual_alloc_size => {
-                vals.len()
-            }
-            GlobalInit::Compound(_) if da.is_struct => {
-                let emitted = init.emitted_byte_size();
-                emitted.max(da.actual_alloc_size)
-            }
-            _ => da.actual_alloc_size,
-        };
+        let final_size = da.initialized_static_size(&init);
         // For pointer variables, decl.is_const refers to the pointee type, not
         // the pointer, so `const char *p` must NOT be treated as a read-only
         // object -- `p` itself is writable.
