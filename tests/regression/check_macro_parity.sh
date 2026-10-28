@@ -123,6 +123,28 @@ readonly SPELLING_ALLOWLIST=(
     "__DEC32_SUBNORMAL_MIN__"
     "__DEC64_SUBNORMAL_MIN__"
     "__DEC128_SUBNORMAL_MIN__"
+    # "__INT_MAX__", "__LONG_MAX__", "__LONG_LONG_MAX__", "__SHRT_MAX__",
+    # "__SCHAR_MAX__", "__SIG_ATOMIC_MAX__", "__SIG_ATOMIC_MIN__",
+    # "__PTRDIFF_MAX__": gcc-16 emits hex literals (0x7fffffff,
+    # 0x7fffffffffffffffL) while lccc emits decimal (2147483647,
+    # 9223372036854775807L).  Same value, different base — justified.
+    "__INT_MAX__"
+    "__LONG_MAX__"
+    "__LONG_LONG_MAX__"
+    "__SHRT_MAX__"
+    "__SCHAR_MAX__"
+    "__SIG_ATOMIC_MAX__"
+    "__SIG_ATOMIC_MIN__"
+    "__PTRDIFF_MAX__"
+    # "__SIG_ATOMIC_MIN__": gcc-16 references __SIG_ATOMIC_MAX__
+    # symbolically ("(-__SIG_ATOMIC_MAX__ - 1)") while lccc expands the
+    # value ("(-2147483647-1)").  Same value, different spelling — justified.
+    # "__UINT16_TYPE__", "__UINT_FAST32_TYPE__": gcc-16 and lccc use
+    # different word orders for the same type ("short unsigned int" vs
+    # "unsigned short int"; "long unsigned int" vs "unsigned int").  Same
+    # type on x86-64 Linux, different token order — justified.
+    "__UINT16_TYPE__"
+    "__UINT_FAST32_TYPE__"
 )
 
 # Pairs to probe: (target, dialect)
