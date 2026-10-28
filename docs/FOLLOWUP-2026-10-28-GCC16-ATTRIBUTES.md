@@ -153,3 +153,86 @@ emits objects for five integrated targets, checks seven preprocessing controls,
 position. Both local and hosted fast CI run it. These are bounded tests: UCN
 identifiers remain unimplemented, trigraph and pedantic behavior are not
 covered, and no whole-language parity or performance gain is claimed.
+
+## Red-team update: include isolation and sysroots
+
+`-nostdinc` previously left the default and bundled search directories active.
+It now clears them after target selection and invalidates cached resolutions;
+explicit `-I`, `-isystem`, `-iquote` and `-idirafter` directories, current-file
+quoted includes and absolute headers remain usable. The checked-in differential
+covers GCC 16.2 and all four LCCC drivers, `-E`, syntax-only, `-M`/`-MM`,
+`__has_include`, and dependency classification of an explicitly re-added
+bundled directory. GCC 16.2 falls back to the quote chain for an angle include
+when no existing angle-search directory remains; an empty existing `-I` removes
+that fallback. The old compiler failed the negative controls; all six new
+Python tests and the include-cache and dependency-file gates pass.
+
+A separate sentinel showed that `--sysroot=DIR` and `-isysroot DIR` were
+silently accepted by the compiler driver without applying the requested header
+root. `LCCC_SYSROOT` is a nonstandard partial overlay: it has host fallbacks,
+misses some x86-64 defaults, and does not supply full GCC precedence, header or
+linker semantics. `C_INCLUDE_PATH` is not consumed by LCCC. Until those
+semantics can be implemented together, the driver now **rejects** GNU sysroot
+requests (including `/` and linker passthrough forms) rather than producing
+potentially host-contaminated output. The extractor's printed recipe now makes
+these limits explicit. Five contract tests cover four targets, three modes,
+response files, root-dependent queries and a GCC private-header control. This
+is a fail-closed compatibility gap, not completed GNU sysroot support; the
+standalone `lccc-ld` and the legacy overlay need their own isolation audit.
+
+## Red-team update: upstream ANDQ and self-move safety
+
+The upstream non-negative AND-immediate proof is sound for high-bit zeroing,
+but the independent `narrow_copy_fold` ledger was not synchronized with the
+more conservative `redundant_ext` ledger. It incorrectly treated `movzbw` as
+writing the whole low 32 bits and failed to invalidate implicit writes such as
+`divq` and `cmpxchgq`. Before the correction, an executable assembly fixture
+produced three wrong results in the isolated self-move pass, the register-copy
+pass **and the whole peephole pipeline**: 0x100000080 instead of 0x80,
+0x800000000000003f instead of 0x3f, and 0x100000006 instead of 0x6. These
+are executable assembly-level witnesses; no minimal C-source trigger has been
+established. The ANDQ producer made the stale-fact path reachable in the second
+and third shapes, although the underlying bookkeeping defect predates it.
+
+The ledger now establishes zero only for 32/64-bit-destination zero extensions
+and clears the shared implicit-write mask before handling producers. The
+post-fix witness also checks a locked memory compare-exchange, explicit
+compare-exchange destination, and GAS-encodable `$-2147483648` boundary. The
+full `narrow_copy_fold` suite (64 tests), the eight ANDQ tests, and all witness
+stages pass. This guards the demonstrated shapes, not every possible x86
+instruction. The conservative `0x7f` byte-mask cutoff was retained: `0xff` is
+mathematically safe, but an expansion has not been supported by real-workload
+measurements. The upstream evidence README now reports the actual paired
+confidence intervals rather than interpreting separate medians as paired wins.
+
+A bounded Callgrind 3.19.0 screen compared the corrected compiler (SHA-256
+`71ecba3318b045ebf0a3b1edf4d1f8803c77cf47f191c9e4e97d3a595207e529`)
+with the pre-fix compiler (`955dc9b920aa4ead9bc3557cbb775f948814840229bb8ad706759e52eb3eb42c`),
+using registry flags, `-fwrapv` and the checked-in reduced sizes. Output and
+simulated instruction counts matched for all six workloads:
+
+| workload | Ir in each arm |
+| --- | ---: |
+| switch_dispatch | 576,251 |
+| double_reduction | 40,271,925 |
+| zlib_ng_compare256 | 16,636,236 |
+| expat_xml_scan | 1,531,875 |
+| gzip_longest_match | 559,990 |
+| linux_list_sort | 541,589 |
+
+The private manifests are at `~/.cache/lccc/callgrind-safety-review/`. These
+are reduced-size whole-program simulated instructions, not target-hardware
+cycle counts or evidence of equal runtime on other inputs.
+
+## Comparator provenance and remaining evidence
+
+`godbolt.py compare` now identifies, version-probes, hashes and rechecks the
+primary local launcher as well as explicit references. The hash covers only the
+launcher, not wrapper targets, dynamic libraries or configuration, and the
+primary target is not independently attested. An offline `-O2` compare256
+assembly run reports LCCC/GCC 16.2/Clang 23.1.4 counts of 15/15/33; these are
+static counts, not correctness or timing rankings. ICC/ICX Compiler Explorer
+results were unavailable from this sandbox. The separate hosted ICX job passed
+on the earlier pushed head; its result on the final head must be checked anew.
+`gdb`, `pahole`, `objtool`, and `perf` were not available locally; Valgrind was
+run from the isolated verified package prefix. Eight GiB of swap remained active.

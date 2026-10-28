@@ -259,6 +259,14 @@ constraint strings, implicit-int).
 
 ### 3.6 Driver option surface — 11 % effect, but honest about it
 
+**2026-10-28 bounded update:** `-nostdinc` now suppresses default include
+paths, including target-specific and bundled paths. GNU `--sysroot` and
+`-isysroot` were found to be accepted without applying the requested root;
+the driver now refuses those requests rather than silently selecting host
+headers or libraries. `LCCC_SYSROOT` remains a partial, host-fallback overlay,
+not GNU sysroot isolation. The counts below are the earlier 2026-10-27 survey,
+not an updated complete option census.
+
 1 389 unique options from GCC's own help catalogue, probed one by one:
 
 | Class | Count | Meaning |
