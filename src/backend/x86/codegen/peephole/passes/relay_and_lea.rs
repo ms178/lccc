@@ -2429,13 +2429,78 @@ const PURE_PRODUCERS_3OP: &[&str] = &[
     "rorxl ", "rorxq ", "shrxl ", "shrxq ", "shlxl ", "shlxq ", "sarxl ", "sarxq ",
 ];
 
+/// Split `src1, src2, dst` into `("src1, src2", "dst")`, keeping the sources
+/// verbatim so the caller can re-emit them and still test them for register
+/// references as a group.
+///
+/// Both separators must be found with the same balanced-parenthesis scanner
+/// [`split_two_operands`] uses: AT&T SIB operands carry their own commas
+/// (`8(%rax,%rdx,4)`), and a raw split would cut the operand in the middle.
+/// The destination of a three-operand BMI2 form is always last and never a
+/// memory operand, so peeling from the right is exact, and the second scan
+/// makes a two-operand instruction (`(%rax,%rdx,4), %rcx`) return `None`
+/// instead of a bogus pair.
 fn split_three_operands_last(rest: &str) -> Option<(&str, &str)> {
-    let (prefix, last) = rest.rsplit_once(',')?;
-    let (first, mid) = prefix.split_once(',')?;
-    if first.trim().is_empty() || mid.trim().is_empty() || last.trim().is_empty() {
+    let comma = last_top_level_comma(rest.as_bytes())?;
+    let (prefix, last) = (rest[..comma].trim(), rest[comma + 1..].trim());
+    if last.is_empty() {
         return None;
     }
-    Some((prefix.trim(), last.trim()))
+    let inner = last_top_level_comma(prefix.as_bytes())?;
+    if prefix[..inner].trim().is_empty() || prefix[inner + 1..].trim().is_empty() {
+        return None;
+    }
+    Some((prefix, last))
+}
+
+#[cfg(test)]
+mod splitter_tests {
+    use super::*;
+
+    #[test]
+    fn three_operand_split_keeps_sib_commas_inside_the_source() {
+        // BMI2 forms: `op src1, src2, dst` (rorx takes an immediate first).
+        assert_eq!(
+            split_three_operands_last("$5, %rax, %rcx"),
+            Some(("$5, %rax", "%rcx"))
+        );
+        assert_eq!(
+            split_three_operands_last("$5, 8(%rax,%rdx,4), %rcx"),
+            Some(("$5, 8(%rax,%rdx,4)", "%rcx"))
+        );
+        assert_eq!(
+            split_three_operands_last("%ecx, (%rax,%rdx,4), %r11d"),
+            Some(("%ecx, (%rax,%rdx,4)", "%r11d"))
+        );
+        assert_eq!(
+            split_three_operands_last("%ecx, %eax, %r11d"),
+            Some(("%ecx, %eax", "%r11d"))
+        );
+    }
+
+    #[test]
+    fn three_operand_split_refuses_two_operand_and_malformed_text() {
+        // Two operands, with the comma hidden inside the SIB operand.
+        assert_eq!(split_three_operands_last("(%rax,%rdx,4), %rcx"), None);
+        assert_eq!(split_three_operands_last("%rax, %rcx"), None);
+        // Empty slots on either side.
+        assert_eq!(split_three_operands_last("$5, , %rcx"), None);
+        assert_eq!(split_three_operands_last("$5, %rax, "), None);
+        // No separator at all.
+        assert_eq!(split_three_operands_last("%rax"), None);
+    }
+
+    /// The two-operand splitter must stay SIB-safe as well: this is the case the
+    /// module documentation calls out, where a raw split would make dead-pure-
+    /// write elimination delete a real store.
+    #[test]
+    fn two_operand_split_keeps_sib_commas_inside_the_source() {
+        assert_eq!(
+            split_two_operands("8(%rax,%rdx,4), %rcx"),
+            Some(("8(%rax,%rdx,4)", "%rcx"))
+        );
+        assert_eq!(split_two_operands("%rax, %rcx"), Some(("%rax", "%rcx")));
+    }
 }
 
 /// The 32-bit form, writing `%<d>d`, of the 64-bit producer `op src` whose

@@ -76,12 +76,23 @@ done
 log "rustc: $(rustc --version)"
 log "cargo: $(cargo --version)"
 
-# ---- 3. host-package availability (observation only) -----------------------
+# ---- 3. host 32-bit (-m32) support: observe through the safe script --------
 # Installing Debian packages into /, especially on usrmerged systems, can
-# replace the host dynamic loader and destroy the sandbox. Inspect availability
-# only; extract offline packages as an unprivileged user into a sysroot instead.
-log "m32 C oracle: $(gcc -m32 -x c -o /dev/null - <<< 'int main(){return 0;}' 2>/dev/null && echo OK || echo MISSING)"
-log "m32 C++ oracle: $(printf '#include <stdexcept>\nint main(){return 0;}\n' | g++ -m32 -x c++ -o /dev/null - 2>/dev/null && echo OK || echo MISSING)"
+# replace the host dynamic loader and destroy the sandbox. The restore path
+# therefore *never* provisions: it asks scripts/ensure_i386_multilib_safe.sh
+# for a --check-only verdict (compile and run a 32-bit probe; no apt, no dpkg).
+# provisioning, when wanted, stays behind that script's audited --no-upgrade
+# plan, which refuses any apt transaction that would upgrade or remove a live
+# libc and never adds a foreign :i386 architecture.
+if [[ -x ./scripts/ensure_i386_multilib_safe.sh ]]; then
+    if bash ./scripts/ensure_i386_multilib_safe.sh --check-only >/dev/null 2>&1; then
+        log 'm32 C/C++ oracle: OK'
+    else
+        log 'm32 C/C++ oracle: MISSING (run scripts/ensure_i386_multilib_safe.sh; it provisions with --no-upgrade or stages an isolated sysroot)'
+    fi
+else
+    log 'm32 C/C++ oracle: UNKNOWN (scripts/ensure_i386_multilib_safe.sh is missing)'
+fi
 
 # ---- 4. git: remote + identity + executable bits ------------------------------
 # The harness snapshot excludes sensitive credential paths, and in practice it can

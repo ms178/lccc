@@ -157,15 +157,21 @@ pub(crate) fn vec_intrinsic_access<'a>(
         IntrinsicOp::VecLoadWidenI32ToI64x2 | IntrinsicOp::VecLoadI32x4Pair => (false, 8),
         _ => return None,
     };
+    // Slot layout comes from the single IR-level definition: loads carry
+    // `[base, index, disp]`, stores `[src, base, index, disp]`. Ops outside
+    // the register-dest `VecLoad*`/`VecStore*` families fail closed here, so a
+    // new family becomes visible to the alias engine the moment it gains an
+    // entry in `IntrinsicOp::vec_mem_offset_arg_index`.
+    let off_idx = op.vec_mem_offset_arg_index()?;
     let (base, off) = if is_store {
-        (args.get(1)?, args.get(2)?)
+        (args.get(1)?, args.get(off_idx)?)
     } else {
-        (args.first()?, args.get(1)?)
+        (args.first()?, args.get(off_idx)?)
     };
     // The trailing displacement argument must be a constant when present —
     // the emitter's `vec_disp_arg` contract. A value operand there is not a
     // shape this engine models: fail closed.
-    let disp = match args.get(if is_store { 3 } else { 2 }) {
+    let disp = match args.get(off_idx + 1) {
         Some(Operand::Const(c)) => c.to_i64()?,
         None => 0,
         Some(Operand::Value(_)) => return None,

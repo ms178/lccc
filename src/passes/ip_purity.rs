@@ -234,6 +234,49 @@ struct OutParamSummary {
     reads_nonlocal: bool,
 }
 
+/// Successor block indices of `u`, restricted to blocks that exist in this
+/// function (a `Switch` case or `IndirectBranch` target may name a block that
+/// was pruned).
+fn block_successors(
+    func: &IrFunction,
+    u: usize,
+    label_to_idx: &FxHashMap<BlockId, usize>,
+) -> Vec<usize> {
+    let mut targets: Vec<BlockId> = Vec::new();
+    match &func.blocks[u].terminator {
+        Terminator::Branch(t) => targets.push(*t),
+        Terminator::CondBranch {
+            true_label,
+            false_label,
+            ..
+        } => {
+            targets.push(*true_label);
+            targets.push(*false_label);
+        }
+        Terminator::Switch { cases, default, .. } => {
+            targets.push(*default);
+            for &(_, lbl) in cases {
+                targets.push(lbl);
+            }
+        }
+        Terminator::IndirectBranch {
+            possible_targets, ..
+        } => targets.extend(possible_targets.iter().copied()),
+        Terminator::Return(_) | Terminator::Unreachable => {}
+    }
+    targets
+        .into_iter()
+        .filter_map(|lbl| label_to_idx.get(&lbl).copied())
+        .collect()
+}
+
+/// True when the control-flow graph reachable from block 0 contains a cycle.
+///
+/// Iterative three-colour DFS over a precomputed successor table: recursion
+/// depth here would be proportional to the block count, and a large machine
+/// generated function (or a switch-dispatch state machine) would overflow the
+/// compiler's own stack on a valid input. The successor table is built once, so
+/// each edge is materialised and walked exactly once.
 fn func_has_back_edge(func: &IrFunction) -> bool {
     if func.blocks.is_empty() {
         return false;
@@ -245,56 +288,38 @@ fn func_has_back_edge(func: &IrFunction) -> bool {
         .map(|(i, b)| (b.label, i))
         .collect();
     let n = func.blocks.len();
-    let mut color = vec![0u8; n]; // 0 = white, 1 = gray, 2 = black
-
-    fn dfs(
-        u: usize,
-        func: &IrFunction,
-        label_to_idx: &FxHashMap<BlockId, usize>,
-        color: &mut [u8],
-    ) -> bool {
-        color[u] = 1;
-        let mut targets: Vec<BlockId> = Vec::new();
-        match &func.blocks[u].terminator {
-            Terminator::Branch(t) => targets.push(*t),
-            Terminator::CondBranch {
-                true_label,
-                false_label,
-                ..
-            } => {
-                targets.push(*true_label);
-                targets.push(*false_label);
-            }
-            Terminator::Switch { cases, default, .. } => {
-                targets.push(*default);
-                for &(_, lbl) in cases {
-                    targets.push(lbl);
-                }
-            }
-            Terminator::IndirectBranch {
-                possible_targets, ..
-            } => {
-                targets.extend(possible_targets.iter().copied());
-            }
-            Terminator::Return(_) | Terminator::Unreachable => {}
-        }
-        for lbl in targets {
-            if let Some(&v) = label_to_idx.get(&lbl) {
-                if color[v] == 1 {
-                    return true;
-                }
-                if color[v] == 0 && dfs(v, func, label_to_idx, color) {
-                    return true;
-                }
-            }
-        }
-        color[u] = 2;
-        false
-    }
-
+    let succ: Vec<Vec<usize>> = (0..n)
+        .map(|u| block_successors(func, u, &label_to_idx))
+        .collect();
+    // 0 = white (unvisited), 1 = gray (on the DFS path), 2 = black (finished).
+    let mut color = vec![0u8; n];
+    let mut stack: Vec<(usize, usize)> = Vec::new();
     for start in 0..n {
-        if color[start] == 0 && dfs(start, func, &label_to_idx, &mut color) {
-            return true;
+        if color[start] != 0 {
+            continue;
+        }
+        color[start] = 1;
+        stack.push((start, 0));
+        // Each iteration copies the frame out of the stack before touching it,
+        // so the `push` below never overlaps a live `&mut` into the vector.
+        while let Some(&(u, next)) = stack.last() {
+            if next >= succ[u].len() {
+                color[u] = 2;
+                stack.pop();
+                continue;
+            }
+            let v = succ[u][next];
+            if let Some(top) = stack.last_mut() {
+                top.1 = next + 1;
+            }
+            match color[v] {
+                1 => return true,
+                0 => {
+                    color[v] = 1;
+                    stack.push((v, 0));
+                }
+                _ => {}
+            }
         }
     }
     false

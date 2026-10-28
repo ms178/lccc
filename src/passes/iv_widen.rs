@@ -2017,28 +2017,30 @@ fn analyze_iv(
                     // An intrinsic index/offset slot is address arithmetic
                     // like a GEP offset: decline it under the intercept on a
                     // divergent member. When `!narrow`, a pointer-width byte
-                    // offset feeding `VecLoad*(base, byte_off)` or
-                    // `VecStore*(val, base, byte_off)` is an addressing sink
-                    // identical to `Load.ptr`/`Store.ptr` (`double_reduction`
-                    // `.LBB7`: eliminates per-iteration `movslq %r8d, %r10`).
+                    // index feeding a register-dest `VecLoad*`/`VecStore*` is
+                    // an addressing sink identical to `Load.ptr`/`Store.ptr`
+                    // (`double_reduction` `.LBB7`: eliminates the
+                    // per-iteration `movslq %r8d, %r10`).
+                    //
+                    // The slot is *not* guessed from the memory behaviour of
+                    // the op (`may_read_memory` also covers the FMA/hoisted/
+                    // strict-reciprocal families, whose scalar slots are
+                    // multiplicands and guards). It comes from
+                    // `IntrinsicOp::vec_mem_offset_arg_index`, the same
+                    // definition the alias engine uses for `[base, index,
+                    // disp]`, so a data operand can never be mistaken for an
+                    // address and widened under it.
                     if intercept && !cur_exact {
                         return None;
                     }
                     let is_wide_vec_mem_offset = !narrow
-                        && ((op.may_read_memory()
-                            && args.len() >= 2
-                            && args[1] == Operand::Value(cur)
-                            && args
-                                .iter()
-                                .enumerate()
-                                .all(|(i, a)| i == 1 || *a != Operand::Value(cur)))
-                            || (op.writes_memory_via_args()
-                                && args.len() >= 3
-                                && args[2] == Operand::Value(cur)
+                        && op.vec_mem_offset_arg_index().is_some_and(|slot| {
+                            args.get(slot) == Some(&Operand::Value(cur))
                                 && args
                                     .iter()
                                     .enumerate()
-                                    .all(|(i, a)| i == 2 || *a != Operand::Value(cur))));
+                                    .all(|(i, a)| i == slot || *a != Operand::Value(cur))
+                        });
                     if is_wide_vec_mem_offset {
                         has_addressing = true;
                         continue;
@@ -8434,13 +8436,18 @@ mod tests {
                     dest_ptr: None,
                     args: vec![Operand::Value(Value(50)), Operand::Value(Value(11))],
                 },
+                // `VecStore*(src, base, index)`: the store's own argument
+                // order, so the index slot the widening rule consults is the
+                // one the emitter addresses (the fixture previously passed
+                // `[base, src, index]`, which the rule happened to tolerate
+                // only because the index happened to land in slot 2).
                 Instruction::Intrinsic {
                     dest: None,
                     op: crate::ir::intrinsics::IntrinsicOp::VecStoreI16x16,
                     dest_ptr: None,
                     args: vec![
-                        Operand::Value(Value(50)),
                         Operand::Value(Value(12)),
+                        Operand::Value(Value(50)),
                         Operand::Value(Value(11)),
                     ],
                 },

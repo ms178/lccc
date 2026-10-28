@@ -60,7 +60,6 @@ struct StridedI32ReducePattern {
     acc_phi: Value,
     acc_ty: IrType,
     acc_init: Operand,
-    scalar_trips: u64,
     safe_vecs: u64,
     load_bases: Vec<Value>,
     expr: StridedExpr,
@@ -70,6 +69,113 @@ fn strided_reduce_disabled() -> bool {
     static DISABLED: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("CCC_NO_STRIDED_REDUCE").is_some());
     *DISABLED
+}
+
+/// Smallest scalar trip count worth vectorizing: below this, the preheader
+/// setup and the masking/horizontal-add epilogue cost more than the four
+/// iterations per vector can save.
+const MIN_SCALAR_TRIPS: u64 = 16;
+
+/// Bytes advanced by one scalar iteration (a stride-2 `u32` access pair).
+const SCALAR_STEP_BYTES: u64 = 8;
+
+/// Bytes covered by one 256-bit vector iteration.
+const VECTOR_BYTES: u64 = 32;
+
+/// Scalar iterations consumed by one 256-bit vector iteration (`4`).
+const VECTORS_PER_SCALAR_ITER: u64 = VECTOR_BYTES / SCALAR_STEP_BYTES;
+
+/// Number of scalar iterations of `for (iv = 0; iv <cmp> bound; iv += 8)`,
+/// or `None` when the exit test is not one this pass models.
+///
+/// `signed`ness comes from the IV type, and `cmp_op` must agree with it: an
+/// unsigned type compared `Slt` (or a signed type compared `Ult`) means the
+/// IR is not the loop it appears to be, so the pass declines.
+///
+/// Every accepted case is also **wrap-free**: the last iteration's
+/// `iv + 8` must stay inside the IV type, otherwise the scalar loop the
+/// transform resumes into is not a counted loop at all (it either wraps into
+/// an endless loop or is UB in the source), and a trip count derived from a
+/// wrapping increment would be a fiction. That is checked here once, for both
+/// the `<` and `<=` forms, instead of only for `<=`.
+fn scalar_trip_count(op: IrCmpOp, iv_ty: IrType, bound: i64) -> Option<u64> {
+    if bound <= 0 {
+        return None;
+    }
+    let signed = matches!(iv_ty, IrType::I32 | IrType::I64);
+    // The exit constant must fit the IV type in the comparison's own
+    // signedness. Canonical IR gives this for free (the compare is typed, and
+    // `analyze` requires `cmp_ty == iv_ty`), but a non-canonical yet
+    // well-formed constant must not be reinterpreted through an `as` cast.
+    let fits = match iv_ty {
+        IrType::I32 => i32::try_from(bound).is_ok(),
+        IrType::U32 => u32::try_from(bound).is_ok(),
+        IrType::I64 | IrType::U64 => true,
+        _ => return None,
+    };
+    if !fits {
+        return None;
+    }
+    // Largest `iv` value the type can hold, in `i64` space; the largest bound
+    // for which the final `iv + 8` still fits is `limit - 8`.
+    let limit = match iv_ty {
+        IrType::I32 => i64::from(i32::MAX),
+        IrType::U32 => i64::from(u32::MAX),
+        _ => i64::MAX,
+    };
+    // One wrap-free admission test for both comparison forms: the final
+    // `iv + 8` must still fit the IV type.
+    if bound > limit.saturating_sub(SCALAR_STEP_BYTES as i64) {
+        return None;
+    }
+    let trips = match (op, signed) {
+        (IrCmpOp::Ult, false) | (IrCmpOp::Slt, true) => {
+            (bound as u64).div_ceil(SCALAR_STEP_BYTES)
+        }
+        (IrCmpOp::Ule, false) | (IrCmpOp::Sle, true) => {
+            (bound as u64) / SCALAR_STEP_BYTES + 1
+        }
+        _ => return None,
+    };
+    (trips > 0).then_some(trips)
+}
+
+/// Vector iterations the guard-page contract allows for `scalar_trips`.
+///
+/// Iteration `t` reads `[8t, 8t+3]`, so the source program itself guarantees
+/// `[0, 8(T-1)+3]` is readable. A 32-byte vector covering iterations
+/// `4v..4v+3` reads `[32v, 32v+31]`, and `32v+31 <= 8(T-1)+3` holds for every
+/// `v < (T-1)/4`, so the vector prefix never touches a byte the scalar loop
+/// would not have touched. When every base is a proven object of at least
+/// `8T` bytes the tighter `T/4` is used instead.
+fn safe_vec_count(scalar_trips: u64, full_cover: bool) -> u64 {
+    if full_cover {
+        scalar_trips / VECTORS_PER_SCALAR_ITER
+    } else {
+        scalar_trips.saturating_sub(1) / VECTORS_PER_SCALAR_ITER
+    }
+}
+
+/// The byte offset the scalar remainder loop resumes at, expressed in the IV's
+/// own type.
+///
+/// A 4-byte IV takes an `I32` constant whose *bit pattern* is the `u32` value:
+/// for an unsigned IV that is the same bytes the emitter would produce for a
+/// `u32` constant, and for a signed IV the trip-count guard has already
+/// proved `total < 2^31`, so the conversion is exact rather than wrapping.
+/// `None` means "cannot be represented" and the caller declines before
+/// mutating anything.
+fn resume_offset_const(iv_ty: IrType, total_vec_bytes: i64) -> Option<IrConst> {
+    if total_vec_bytes < 0 {
+        return None;
+    }
+    match iv_ty {
+        IrType::I32 | IrType::U32 => u32::try_from(total_vec_bytes)
+            .ok()
+            .map(|v| IrConst::I32(v as i32)),
+        IrType::I64 | IrType::U64 => Some(IrConst::I64(total_vec_bytes)),
+        _ => None,
+    }
 }
 
 pub(super) fn try_transform(
@@ -582,28 +688,8 @@ fn analyze(
     if iv_init_c.to_i64() != Some(0) {
         return None;
     }
-    let signed_iv = matches!(iv_ty, IrType::I32 | IrType::I64);
-    let scalar_trips = match (cmp_op, signed_iv) {
-        (IrCmpOp::Ult, false) | (IrCmpOp::Slt, true) => (bound_raw as u64).div_ceil(8),
-        (IrCmpOp::Ule, false) | (IrCmpOp::Sle, true) => {
-            // Avoid wrap near type max (`iv + 8` must not wrap on last iteration).
-            let max_no_wrap = if iv_ty.size() == 4 {
-                if signed_iv {
-                    i64::from(i32::MAX) - 8
-                } else {
-                    i64::from(u32::MAX) - 8
-                }
-            } else {
-                i64::MAX - 8
-            };
-            if bound_raw > max_no_wrap {
-                return None;
-            }
-            (bound_raw as u64) / 8 + 1
-        }
-        _ => return None,
-    };
-    if scalar_trips < 16 {
+    let scalar_trips = scalar_trip_count(cmp_op, iv_ty, bound_raw)?;
+    if scalar_trips < MIN_SCALAR_TRIPS {
         return None;
     }
 
@@ -789,15 +875,11 @@ fn analyze(
         return None;
     }
 
-    let needed_bytes = scalar_trips.checked_mul(8)?;
+    let needed_bytes = scalar_trips.checked_mul(SCALAR_STEP_BYTES)?;
     let all_bases_cover_full = load_bases.iter().all(|&base| {
         proven_object_bytes(func, base, symbol_facts).is_some_and(|sz| sz >= needed_bytes)
     });
-    let safe_vecs = if all_bases_cover_full {
-        scalar_trips / 4
-    } else {
-        scalar_trips.saturating_sub(1) / 4
-    };
+    let safe_vecs = safe_vec_count(scalar_trips, all_bases_cover_full);
     if safe_vecs < 4 {
         return None;
     }
@@ -811,7 +893,6 @@ fn analyze(
         acc_phi,
         acc_ty,
         acc_init,
-        scalar_trips,
         safe_vecs,
         load_bases,
         expr,
@@ -921,13 +1002,20 @@ impl EmitCtx<'_> {
 }
 
 fn transform(func: &mut IrFunction, p: &StridedI32ReducePattern) -> usize {
+    // Two independent accumulator chains when there are enough vectors to
+    // keep both `vpaddd` pipelines busy.
     let unroll: u64 = if p.safe_vecs >= 8 { 4 } else { 1 };
     let vec_turns = p.safe_vecs / unroll;
     if vec_turns == 0 {
         return 0;
     }
-    let step_bytes = (unroll * 32) as i64;
-    let total_vec_bytes = (vec_turns * unroll * 32) as i64;
+    let step_bytes = (unroll * VECTOR_BYTES) as i64;
+    let total_vec_bytes = (vec_turns * unroll * VECTOR_BYTES) as i64;
+    // Decline *before* any mutation: every rewrite below assumes this constant
+    // is representable in the IV's own type.
+    let Some(rem_iv_const) = resume_offset_const(p.iv_ty, total_vec_bytes) else {
+        return 0;
+    };
     let needs_iv_vec = {
         fn uses_iv(e: &StridedExpr) -> bool {
             match e {
@@ -1257,11 +1345,6 @@ fn transform(func: &mut IrFunction, p: &StridedI32ReducePattern) -> usize {
         ty: p.acc_ty,
     });
 
-    let rem_iv_const = if p.iv_ty.size() == 4 {
-        IrConst::I32(total_vec_bytes as i32)
-    } else {
-        IrConst::I64(total_vec_bytes)
-    };
     let scalar_header_label = func.blocks[p.header_idx].label;
     for inst in &mut func.blocks[p.header_idx].instructions {
         if let Instruction::Phi { dest, incoming, .. } = inst {
@@ -1317,7 +1400,6 @@ fn transform(func: &mut IrFunction, p: &StridedI32ReducePattern) -> usize {
     });
     func.next_value_id = final_next_val;
     func.next_label = next_lbl;
-    let _ = p.scalar_trips;
     change_count
 }
 
@@ -1325,18 +1407,155 @@ fn transform(func: &mut IrFunction, p: &StridedI32ReducePattern) -> usize {
 mod tests {
     use super::*;
 
+    /// The whole transform rests on one arithmetic fact: every vector the pass
+    /// emits stays inside the byte footprint the scalar loop itself
+    /// dereferences. Check it for both admission arms over a dense sweep, using
+    /// the production bound function (not a copy of its formula).
     #[test]
     fn guard_page_safe_vec_count_never_overreads_scalar_footprint() {
-        for scalar_trips in 16u64..=600 {
-            let max_scalar_byte = (scalar_trips - 1) * 8 + 3;
-            let safe_vecs = scalar_trips.saturating_sub(1) / 4;
-            if safe_vecs > 0 {
-                let max_vec_byte = (safe_vecs - 1) * 32 + 31;
+        for scalar_trips in MIN_SCALAR_TRIPS..=200_000 {
+            let max_scalar_byte = (scalar_trips - 1) * SCALAR_STEP_BYTES + 3;
+            // Unproven objects: the vector prefix must stay inside the bytes the
+            // scalar loop itself dereferences, so a guard page or an
+            // exactly-sized heap block cannot be crossed.
+            let vecs = safe_vec_count(scalar_trips, false);
+            if vecs > 0 {
+                let max_vec_byte = (vecs - 1) * VECTOR_BYTES + (VECTOR_BYTES - 1);
                 assert!(
                     max_vec_byte <= max_scalar_byte,
-                    "trips={scalar_trips}: vec reads {max_vec_byte} > scalar {max_scalar_byte}"
+                    "trips={scalar_trips}: vector reads {max_vec_byte} > scalar \
+                     footprint {max_scalar_byte}"
+                );
+            }
+            // Proven objects of >= 8T bytes: the stronger bound may use the
+            // whole object, which is exactly `8T` bytes.
+            let vecs = safe_vec_count(scalar_trips, true);
+            if vecs > 0 {
+                let max_vec_byte = (vecs - 1) * VECTOR_BYTES + (VECTOR_BYTES - 1);
+                assert!(
+                    max_vec_byte < scalar_trips * SCALAR_STEP_BYTES,
+                    "trips={scalar_trips} full-cover: vector reads {max_vec_byte} \
+                     past the proven object of {} bytes",
+                    scalar_trips * SCALAR_STEP_BYTES
                 );
             }
         }
+    }
+
+    /// The tightened admission must never hand back a trip count whose final
+    /// `iv + 8` leaves the IV type: that loop is either UB in the source or a
+    /// wrap in the IR, and a trip count derived from it is a fiction.
+    #[test]
+    fn accepted_trip_counts_never_wrap_the_induction_variable() {
+        let types = [
+            (IrType::I32, i64::from(i32::MAX)),
+            (IrType::U32, i64::from(u32::MAX)),
+            (IrType::I64, i64::MAX),
+            (IrType::U64, i64::MAX),
+        ];
+        for (ty, limit) in types {
+            let signed = matches!(ty, IrType::I32 | IrType::I64);
+            let ops = if signed {
+                [IrCmpOp::Slt, IrCmpOp::Sle]
+            } else {
+                [IrCmpOp::Ult, IrCmpOp::Ule]
+            };
+            for op in ops {
+                // Sweep the whole legal range densely near the top, where a
+                // wrap would live, plus a coarse sweep below it.
+                let mut bounds: Vec<i64> = (1i64..=1_000).map(|x| x * 4096).collect();
+                bounds.extend((limit - 64)..=limit);
+                for bound in bounds {
+                    let Some(trips) = scalar_trip_count(op, ty, bound) else {
+                        continue;
+                    };
+                    // Last iteration's value, then the increment the scalar
+                    // loop performs after its body: it must fit the type.
+                    let last_iv = (trips - 1) * SCALAR_STEP_BYTES;
+                    let after = last_iv + SCALAR_STEP_BYTES;
+                    assert!(
+                        after <= u64::try_from(limit).unwrap(),
+                        "{ty:?} {op:?} bound={bound}: last iv {last_iv} + 8 = {after} \
+                         leaves the type (limit {limit})"
+                    );
+                    // ... and the kept iterations must not overshoot the bound
+                    // in the comparison's own sense: iteration `trips - 1` was
+                    // taken, so its IV satisfies the predicate.
+                    let satisfies = match op {
+                        IrCmpOp::Ult | IrCmpOp::Ule => last_iv <= u64::try_from(bound).unwrap(),
+                        _ => last_iv as i64 <= bound,
+                    };
+                    assert!(
+                        satisfies,
+                        "{ty:?} {op:?} bound={bound}: iteration {} (iv {last_iv}) \
+                         does not satisfy the exit test",
+                        trips - 1
+                    );
+                }
+            }
+        }
+    }
+
+    /// Trip-count formulae, pinned case by case (the property test above
+    /// covers the invariants; this pins the exact arithmetic).
+    #[test]
+    fn trip_counts_match_the_counted_loop_semantics() {
+        // `<` takes ceil(bound / 8) iterations: iv = 0, 8, ..., < bound.
+        assert_eq!(scalar_trip_count(IrCmpOp::Ult, IrType::U64, 8), Some(1));
+        assert_eq!(scalar_trip_count(IrCmpOp::Ult, IrType::U64, 9), Some(2));
+        assert_eq!(scalar_trip_count(IrCmpOp::Ult, IrType::U64, 1024), Some(128));
+        assert_eq!(scalar_trip_count(IrCmpOp::Slt, IrType::I64, 1024), Some(128));
+        // `<=` takes floor(bound / 8) + 1: iv = 0, 8, ..., <= bound.
+        assert_eq!(scalar_trip_count(IrCmpOp::Ule, IrType::U32, 8), Some(2));
+        assert_eq!(scalar_trip_count(IrCmpOp::Ule, IrType::U32, 1023), Some(128));
+        assert_eq!(scalar_trip_count(IrCmpOp::Sle, IrType::I32, 1023), Some(128));
+        // Signedness must agree with the IV type.
+        assert_eq!(scalar_trip_count(IrCmpOp::Ult, IrType::I64, 1024), None);
+        assert_eq!(scalar_trip_count(IrCmpOp::Slt, IrType::U64, 1024), None);
+        // Non-positive bounds are not counted loops this pass models.
+        assert_eq!(scalar_trip_count(IrCmpOp::Ult, IrType::U64, 0), None);
+        assert_eq!(scalar_trip_count(IrCmpOp::Slt, IrType::I64, -8), None);
+        // A bound outside the IV type is refused rather than reinterpreted.
+        assert_eq!(scalar_trip_count(IrCmpOp::Ult, IrType::U32, 1i64 << 32), None);
+        assert_eq!(scalar_trip_count(IrCmpOp::Slt, IrType::I32, 1i64 << 32), None);
+        assert_eq!(scalar_trip_count(IrCmpOp::Slt, IrType::I32, -1), None);
+        // A bound one past the wrap-free limit is refused; the limit itself is
+        // accepted for `<=` (last iteration sits exactly at the maximum).
+        assert_eq!(scalar_trip_count(IrCmpOp::Ule, IrType::U32, i64::from(u32::MAX) - 7), None);
+        assert_eq!(
+            scalar_trip_count(IrCmpOp::Ule, IrType::U32, i64::from(u32::MAX) - 8),
+            Some((i64::from(u32::MAX) - 8) as u64 / 8 + 1)
+        );
+    }
+
+    /// The resume offset must be an exact value of the IV type: the scalar
+    /// remainder loop continues from it, so a wrapped constant would restart
+    /// the loop at a negative byte offset.
+    #[test]
+    fn resume_offset_is_exact_in_the_induction_variable_type() {
+        for ty in [IrType::U32, IrType::I32] {
+            for v in [0u32, 1, 31, 0x7fff_ffff, 0x8000_0000, 0xffff_fff8] {
+                let c = resume_offset_const(ty, i64::from(v)).expect("in range");
+                let IrConst::I32(raw) = c else {
+                    panic!("4-byte IV must resume through an I32 constant");
+                };
+                assert_eq!(
+                    raw as u32, v,
+                    "{ty:?}: bit pattern must carry the unsigned value {v}"
+                );
+            }
+            assert_eq!(
+                resume_offset_const(ty, i64::from(u32::MAX) + 1),
+                None,
+                "{ty:?}: a value past the type must be refused, not truncated"
+            );
+        }
+        for ty in [IrType::U64, IrType::I64] {
+            assert_eq!(
+                resume_offset_const(ty, 1i64 << 40),
+                Some(IrConst::I64(1i64 << 40))
+            );
+        }
+        assert_eq!(resume_offset_const(IrType::U32, -1), None);
     }
 }

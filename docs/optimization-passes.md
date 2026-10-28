@@ -51,6 +51,20 @@ passes; the backend peepholes are documented per backend
   iteration with a scalar tail. Kill switch `CCC_NO_GENERATOR_MAP`; the
   `[VEC-GEN]` trace under `LCCC_DEBUG_VECTORIZE`. Gate:
   `tests/regression/check_generator_map.sh`.
+- **Strided-2 i32 sum reductions** (`vectorize_strided_i32_reduce.rs`) —
+  counted loops whose byte IV steps by 8 and whose accumulator adds a pure
+  32-bit modular expression of the loaded dwords. One 256-bit load puts the
+  four real dwords in the *even* lanes and the intervening ones in the odd
+  lanes, so the whole per-element DAG evaluates with **zero in-loop shuffles**;
+  the epilogue masks the odd lanes and does one horizontal add. AVX2 only, and
+  the loop bound is the scalar loop's own dereferenced footprint
+  (`32v + 31 <= 8(T-1) + 3`) unless every base is a proven object of `>= 8T`
+  bytes, so the vector prefix can never cross a guard page. 4x unrolled with
+  two accumulator chains at `>= 8` safe vectors; scalar tail otherwise. Kill
+  switch `CCC_NO_STRIDED_REDUCE`. The arithmetic that can be wrong — the trip
+  count, the wrap-free admission and the resume constant — is factored into
+  pure functions exercised by exhaustive unit tests in the pass
+  (`cargo test -p lccc vectorize_strided_i32_reduce`).
 - **Widening + masked conditional-sum reductions** — I32->I64 `paddq`
   pipelines, VEX-only bodies (9x AVX-SSE transition penalty avoided).
 - **Loop rotation** (`loop_rotate.rs`, IR) — **opt-in** at the IR level
@@ -256,6 +270,7 @@ benchmark standings:
 | Knob | Default | What it controls | Why this default |
 |---|---|---|---|
 | `CCC_IVSR_SCALAR_DERIVED=1` | **off** (opt-in) | The scalar derived-IV flavor of `ivsr`: rewrites loop-recurrence-derived scalars (rbtree subtree pointers) into IV increments. | Measured net LOSS at default-on: linux_rbtree +1.2%, expat +4.0%, glibc_strstr +4.3%, five golden workloads past the codegen-quality bands (data in `src/passes/iv_strength_reduce.rs`; re-verified 2026-09-24 on x86-64: expat opt-in ≈+20%, glibc_strstr ≈+6.5%, linux_rbtree tie). Pinned opt-in by `tests/regression/check_ivsr_scalar_derived_default.sh`, which also proves the knob stays LIVE (knob-set and knob-unset asm must differ) so it cannot silently rot into a no-op. |
+| `CCC_NO_STRIDED_REDUCE` | **unset** (vectorizer on) | Kill switch for the AVX2 strided-2 i32 sum-reduction vectorizer (`vectorize_strided_i32_reduce.rs`). Set to any value (including empty) to disable the transform and keep the counted scalar loop. | The transform is gated on `x86_avx2_available()` and the same `force_sse2` / `force_two_wide` / late-minmax exclusions as the rest of the vectorizer, and its bound proof is the scalar loop's own footprint; the switch exists for bisection parity with the other vectorizers, not as a supported configuration. |
 | `CCC_NO_ANDN_FUSION` | **unset** (fusion on) | Kill switch for the Not+And → 3-operand `andn` fusion (BMI1) and, with it, the middle-end CH-mux defer that leaves the Not for the backend to fuse. | The fused shape is the GCC/Clang/ICX four-oracle consensus for SHA-256's CH (`tests/regression/check_ch_maj_codegen.sh` pins exactly one `andn` under `-mbmi`, zero without). The switch exists for bisection parity with the other branch fusions, not as a supported configuration. |
 
 The andn knob is resolved ONCE per `run_passes` (the `scalar_andn_available`

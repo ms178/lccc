@@ -31,6 +31,7 @@ import secrets
 import shutil
 import stat
 import subprocess
+import sys
 import tarfile
 import tempfile
 
@@ -319,6 +320,38 @@ def member_kind(member: tarfile.TarInfo) -> str:
     return 'other'
 
 
+# Roots a cache prefix may live under. The restore writes executable wrappers
+# and unpacks tarballs, so a prefix inside an OS tree can replace a system
+# toolchain or the host dynamic loader in place — on a usr-merged root that is
+# instant loss of ``execve`` for the supervisor. Only private, disposable
+# directories are eligible; ``/opt/lccc`` is the one opt-in system location,
+# because it is named for this cache and cannot collide with a distro package.
+SAFE_PREFIX_ROOTS = ('/home', '/root', '/tmp', '/var/tmp', '/var/lib/lccc',
+                     '/srv', '/mnt', '/media', '/opt/lccc')
+
+
+def validate_restore_prefix(prefix: Path) -> Path:
+    """Return ``prefix`` resolved, or raise if it is not a safe restore target.
+
+    Symlinks are resolved first: ``/tmp/cache -> /usr`` must be refused for the
+    reason the literal ``/usr`` is. The check is an allow-list of writable roots
+    rather than a deny-list of system directories, so a directory the distro
+    adds later cannot become silently writable.
+    """
+    resolved = Path(os.path.realpath(prefix))
+    for root in SAFE_PREFIX_ROOTS:
+        root_path = Path(root)
+        if resolved == root_path or root_path in resolved.parents:
+            return resolved
+    raise RuntimeError(
+        f'refusing to restore the agent cache into {str(prefix)!r} '
+        f'(resolves to {str(resolved)!r}): a cache prefix must be a private '
+        f'directory under one of {", ".join(SAFE_PREFIX_ROOTS)} — writing '
+        'executable wrappers or unpacking a tarball into a system tree can '
+        'replace the host toolchain or dynamic loader. Pass --prefix with a '
+        'disposable directory.')
+
+
 def extract_untrusted(archive: Path, prefix: Path) -> list[dict]:
     """Validate every member, then extract; return the member descriptors.
 
@@ -565,7 +598,7 @@ def restore(repo: Path, remote: str, tag: str, prefix: Path, lock_path: Path | N
     if lock and lock.get('tag_sha') and tag_sha != lock['tag_sha']:
         raise RuntimeError(f'tag {tag} resolved to {tag_sha}, lock expects {lock["tag_sha"]}')
 
-    prefix = prefix.resolve()
+    prefix = validate_restore_prefix(prefix)
     stamp = prefix / STAMP_NAME
     installed_path = prefix / INSTALLED_NAME
     wanted = selection_key(only)
@@ -863,10 +896,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.self_test:
         return self_test()
     only = {x.strip() for x in args.only.split(',') if x.strip()} or None
-    return restore(args.repo.resolve(), args.remote, args.tag, args.prefix,
-                   args.lock if args.lock.is_absolute() else (ROOT / args.lock),
-                   skip_lock=args.skip_lock, only=only, no_shims=args.no_shims,
-                   verify_only=args.verify_only, force=args.force)
+    try:
+        return restore(args.repo.resolve(), args.remote, args.tag, args.prefix,
+                       args.lock if args.lock.is_absolute() else (ROOT / args.lock),
+                       skip_lock=args.skip_lock, only=only, no_shims=args.no_shims,
+                       verify_only=args.verify_only, force=args.force)
+    except RuntimeError as error:
+        print(f'error: {error}', file=sys.stderr)
+        return 2
 
 
 if __name__ == '__main__':
