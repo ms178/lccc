@@ -183,12 +183,9 @@ done
 
 if [ "$fail" -ne 0 ]; then
     echo "FAIL: macro parity gate — see above"
-    echo "=== DEBUG: only_lccc.txt ==="
-    cat "$td/only_lccc.txt" 2>/dev/null || echo "(empty or missing)"
-    echo "=== DEBUG: only_gcc.txt ==="
-    cat "$td/only_gcc.txt" 2>/dev/null || echo "(empty or missing)"
-    echo "=== DEBUG: both.txt ==="
-    cat "$td/both.txt" 2>/dev/null || echo "(empty or missing)"
+    echo "::notice title=GP-23 DEBUG only_lccc.txt::$(cat "$td/only_lccc.txt" 2>/dev/null | tr '\n' '|')"
+    echo "::notice title=GP-23 DEBUG only_gcc.txt::$(cat "$td/only_gcc.txt" 2>/dev/null | tr '\n' '|')"
+    echo "::notice title=GP-23 DEBUG both.txt::$(cat "$td/both.txt" 2>/dev/null | tr '\n' '|')"
     exit 1
 fi
 echo "OK: macro parity (FORBIDDEN empty, MISSING essential empty, SPELLING allowlist respected)"
