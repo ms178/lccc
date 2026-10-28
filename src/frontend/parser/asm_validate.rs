@@ -391,7 +391,9 @@ mod tests {
     #[test]
     fn unmodelled_letters_are_refused_not_reclassified() {
         // Every one of these is the `_ => {}` fallback in the x86 classifier.
-        for letter in ["z", "j", "k", "h", "w", "P", "T", "W", "C"] {
+        // `C` is NOT in the list: a `C`-prefixed pair is a class (measured --
+        // gcc 16.2 accepts `"Ci"(7)`), so the letter alone is not evidence.
+        for letter in ["z", "j", "k", "h", "w", "P", "T", "W"] {
             let p = validate(
                 "",
                 &[op("=r", Constness::Unknown)],
