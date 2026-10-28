@@ -573,6 +573,44 @@ fn frame_base(line: &str, default: u8) -> u8 {
     }
 }
 
+/// Byte change to the canonical-to-current rsp offset caused by one
+/// rsp-shifting instruction. The returned `delta` is the number of bytes the
+/// current rsp lies BELOW its canonical (post-prologue) value: a `push` moves
+/// rsp down 8 (delta +8), `pop` reverses it (delta -8), `subq $N,%rsp` adds
+/// N and `addq $N,%rsp` subtracts N. `None` means the shift cannot be parsed
+/// as a constant, so the caller must keep its historical fail-closed rule.
+fn rsp_delta_step(t: &str) -> Option<i64> {
+    let t = t.trim();
+    if t.starts_with("push") {
+        return Some(8);
+    }
+    if t.starts_with("pop") {
+        return Some(-8);
+    }
+    if let Some(rest) = t.strip_prefix("subq $") {
+        return rest.strip_suffix(", %rsp")?.parse::<i64>().ok();
+    }
+    if let Some(rest) = t.strip_prefix("addq $") {
+        let n = rest.strip_suffix(", %rsp")?.parse::<i64>().ok()?;
+        return Some(-n);
+    }
+    None
+}
+
+/// Translate a frame displacement observed while rsp sits `rsp_delta` bytes
+/// below its canonical depth back to the canonical displacement that the
+/// stored read ranges and Phase-2 store offsets already use. At delta D a
+/// textual `disp(%rsp)` addresses canonical byte `disp - D` (e.g. after two
+/// pushes, `24(%rsp)` reads canonical slot 8). `%rbp`-relative operands are
+/// unaffected because the frame pointer never moves inside a function.
+fn canonical_frame_off(base: u8, off: i32, rsp_delta: i64) -> i32 {
+    if base == b's' && rsp_delta != 0 {
+        off - rsp_delta as i32
+    } else {
+        off
+    }
+}
+
 /// Effective byte range read by an SIB frame operand
 /// `disp(%base,%idx,scale)` when `%idx` is a structurally-recognised loop
 /// induction variable, or `None` when its bounds cannot be proven.
@@ -1024,13 +1062,21 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
                 if infos[k].is_nop() || matches!(infos[k].kind, LineKind::Push { .. }) {
                     continue;
                 }
-                // DIRECTIVE-LAW: bails -- this test opens the branch that *ends* the
-                // backward walk; the CFI strings below only decide whether the walk
-                // found a prologue before it ended, and nothing is stepped over.
+                // DIRECTIVE-LAW: a non-CFI directive ends the backward walk (a
+                // `.long`/`.byte` may emit machine code). A qualifying CFI
+                // directive proves the prologue and ends it too; but a code-less
+                // `.cfi_offset`/`.cfi_remember_state` interspersed in the push
+                // chain emits no instructions, so step over it — stopping here
+                // silently disabled never-read DSE for the whole function when
+                // modern output places a `.cfi_offset` after every callee save.
                 if matches!(infos[k].kind, LineKind::Directive) {
                     let dl = infos[k].trimmed(store.get(k));
                     if dl.contains("cfi_startproc") || dl.contains("cfi_def_cfa_offset") {
                         found_cfi = true;
+                        break;
+                    }
+                    if dl.starts_with(".cfi_") {
+                        continue;
                     }
                     break;
                 }
@@ -1119,6 +1165,15 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
         // (see `locally_covering_stores`): such a load is attributed to them
         // instead of being published as a function-wide read range.
         let mut locally_read: Vec<usize> = Vec::new();
+        // Constant byte distance of the current rsp below its canonical
+        // (post-prologue) value across balanced in-body push/pop/sub/add
+        // regions (variadic call-arg staging). Zero everywhere except those
+        // regions; a non-parseable shift or an unbalanced terminator bails.
+        let mut rsp_delta: i64 = 0;
+        // Set once the linear path ends in a `ret`/unconditional `jmp`: the
+        // next label is a branch-only target entered at canonical rsp depth,
+        // so the prior block's epilogue delta must not carry into it.
+        let mut path_ended = false;
         for k in body_start..func_end {
             if infos[k].is_nop() {
                 continue;
@@ -1159,28 +1214,115 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
             if infos[k].is_nop() {
                 continue;
             }
+            let t = infos[k].trimmed(store.get(k));
+
+            if infos[k].kind == LineKind::Label {
+                if path_ended {
+                    // Branch-only target: codegen enters it at canonical depth.
+                    rsp_delta = 0;
+                }
+                path_ended = false;
+            } else if infos[k].kind == LineKind::Ret {
+                // Fall-through cannot cross a return; the next label is a
+                // branch target at canonical depth, not a continuation of the
+                // epilogue's shifted state.
+                path_ended = true;
+            } else if infos[k].kind == LineKind::Jmp {
+                if rsp_delta != 0 {
+                    // An unconditional jump while shifted only stays sound if
+                    // the target block performs no frame-slot access (a pure
+                    // shared epilogue of pops/ret). If the block between the
+                    // next label and its terminator names any frame operand,
+                    // its true depth is unknowable here — fail closed.
+                    let mut q = k + 1;
+                    while q < func_end && infos[q].kind != LineKind::Label {
+                        q += 1;
+                    }
+                    while q < func_end
+                        && !matches!(
+                            infos[q].kind,
+                            LineKind::Ret
+                                | LineKind::Jmp
+                                | LineKind::CondJmp
+                                | LineKind::JmpIndirect
+                        )
+                    {
+                        if !infos[q].is_nop()
+                            && parse_frame_mem(infos[q].trimmed(store.get(q))).is_some()
+                        {
+                            has_unparseable_indirect = true;
+                            break;
+                        }
+                        q += 1;
+                    }
+                    if has_unparseable_indirect {
+                        break;
+                    }
+                }
+                path_ended = true;
+            }
+
+            // SOUNDNESS: a fall-through / loop-header label is deliberately NOT
+            // a delta boundary. Real codegen places loop back-edge labels
+            // *inside* a push/pop window (e.g. cmpxchg retry loops:
+            // `pushq %rax; .Lloop: andq (%rsp)…; jne .Lloop; popq`), where
+            // every edge reaching the label shares the shifted depth. Resetting
+            // there mis-attributes operands in the loop and after the matching
+            // pop (a live canonical slot-8 store read post-pop was mapped to
+            // slot 16 and deleted). Only a label after a path-ending ret/jmp
+            // resets (above); a conditional/indirect branch at non-canonical
+            // depth is independently rejected by the terminator bail below.
 
             // SOUNDNESS: an RSP-shifting instruction (push/pop/subq/addq
             // on %rsp) changes the effective address of every %rsp-relative
-            // slot after it (offsets are compared verbatim). Bailing on ANY
-            // such line disabled this pass for essentially every frame-
-            // pointer-less function, because their EPILOGUES contain
-            // `addq $N,%rsp` + `popq` chains — dead parameter-copy stores
-            // like `movq %r10, 24(%rsp)` survived in every no-FP loop.
+            // slot after it (offsets are compared verbatim). Historically
+            // ANY non-epilogue shift bailed the whole function, which a
+            // balanced in-body variadic call-arg window
+            // (`pushq …; call; addq $N,%rsp`) triggered even though the
+            // frame returns to canonical depth. The constant `rsp_delta`
+            // now tracks the depth across such regions and the frame
+            // operands below are translated back to canonical offsets
+            // (`canonical_frame_off`), so reads inside the window attribute
+            // correctly while dead canonical-depth stores stay deletable.
             //
-            // An epilogue chain is harmless: between the `addq` and the
-            // `ret`/tail-`jmp` only pops (reading their own pushed slots,
-            // which live BELOW the canonical frame) and directives occur, so
-            // no frame-slot load can observe a shifted offset, and after the
-            // terminator the next block re-enters at canonical depth (all
-            // in-body jumps originate at canonical depth — any body-interior
-            // shift still bails below). Accept exactly that shape; every
-            // other RSP shift keeps the conservative bail.
-            if is_rsp_shift_line(infos[k].trimmed(store.get(k))) {
-                if !is_epilogue_rsp_shift(store, infos, k, func_end) {
+            // Every codegen shift is a constant, so an unparseable one keeps
+            // the historical rule: accept only a proven epilogue chain (pops
+            // of the pushed region, no frame-slot load can observe it),
+            // otherwise bail. A terminator reached at non-canonical depth
+            // violates the block-entry invariant and also bails.
+            if is_rsp_shift_line(t) {
+                // A push/pop with a *memory* operand (e.g. the variadic idiom
+                // `movq %rax,0(%rsp); pushq 0(%rsp)`) shifts rsp AND reads or
+                // writes a frame slot at the pre-shift depth. The delta step
+                // alone would drop that frame access and let the home store
+                // look dead. Register/immediate pushes (`pushq %rax`,
+                // `pushq $0`) carry no frame operand and are safe. Fail closed
+                // on the memory form rather than reconstruct the exact range.
+                if (t.starts_with("push") || t.starts_with("pop")) && t.contains('(') {
                     has_unparseable_indirect = true;
                     break;
                 }
+                match rsp_delta_step(t) {
+                    Some(step) => rsp_delta += step,
+                    None if is_epilogue_rsp_shift(store, infos, k, func_end) => {}
+                    None => {
+                        has_unparseable_indirect = true;
+                        break;
+                    }
+                }
+            }
+            // A body control transfer (conditional/indirect branch) at
+            // non-canonical depth would enter another block below its
+            // canonical rsp, invalidating the verbatim-offset model: codegen
+            // only balances push/pop windows in straight-line code, so this
+            // cannot happen in valid output — fail closed if it does. A
+            // plain `ret`/epilogue tail `jmp` is excluded: frame teardown
+            // legitimately leaves delta non-zero and no frame slot is read
+            // past it (the historical epilogue acceptance below).
+            if rsp_delta != 0 && matches!(infos[k].kind, LineKind::CondJmp | LineKind::JmpIndirect)
+            {
+                has_unparseable_indirect = true;
+                break;
             }
 
             // Indirect memory accesses through non-frame registers cannot
@@ -1197,6 +1339,15 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
                         has_unparseable_indirect = true;
                         break;
                     }
+                    // A frame store below canonical depth (inside a push/pop
+                    // window) uses shifted addressing that Phase 2's
+                    // canonical-offset comparison cannot attribute. Call-arg
+                    // windows normally use `push` (LineKind::Push), so this is
+                    // rare; fail closed rather than misattribute the write.
+                    if rsp_delta != 0 && frame_base(t, b's') == b's' {
+                        has_unparseable_indirect = true;
+                        break;
+                    }
                 }
                 // Scalar-FP / SSE slot stores: an `(%rsp)` store is always a
                 // frame-slot write (the FP value lives in a register; only the
@@ -1206,6 +1357,10 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
                 // slot through a data-register %rbp value.
                 LineKind::StoreXmmRbp { .. } => {
                     if !rbp_is_frame && uses_rbp_mem_operand(infos[k].trimmed(store.get(k))) {
+                        has_unparseable_indirect = true;
+                        break;
+                    }
+                    if rsp_delta != 0 && frame_base(t, b's') == b's' {
                         has_unparseable_indirect = true;
                         break;
                     }
@@ -1224,10 +1379,12 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
                         has_unparseable_indirect = true;
                         break;
                     };
-                    match locally_covering_stores(store, infos, k, body_start, base, offset, width)
-                    {
+                    // Map a shifted-depth operand back to its canonical slot so
+                    // it is compared against the canonical store offsets.
+                    let coff = canonical_frame_off(base, offset, rsp_delta);
+                    match locally_covering_stores(store, infos, k, body_start, base, coff, width) {
                         Some(writers) => locally_read.extend(writers),
-                        None => read_ranges.push((base, offset, width)),
+                        None => read_ranges.push((base, coff, width)),
                     }
                 }
                 LineKind::Other { .. } => {
@@ -1239,10 +1396,16 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
                         // callee, indexed later) — record a floor, not a
                         // fixed-width range.
                         if let Some(fm) = parse_frame_mem(line) {
-                            read_floors.push((fm.base, fm.disp));
+                            if fm.sib && rsp_delta != 0 {
+                                has_unparseable_indirect = true;
+                                break;
+                            }
+                            let off = canonical_frame_off(fm.base, fm.disp, rsp_delta);
+                            read_floors.push((fm.base, off));
                         } else if rbp_off != RBP_OFFSET_NONE {
                             let base = frame_base(line, b's');
-                            read_floors.push((base, rbp_off));
+                            let off = canonical_frame_off(base, rbp_off, rsp_delta);
+                            read_floors.push((base, off));
                         }
                     } else if rbp_off != RBP_OFFSET_NONE {
                         let base = frame_base(line, b's');
@@ -1250,14 +1413,20 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
                             has_unparseable_indirect = true;
                             break;
                         };
-                        read_ranges.push((base, rbp_off, width));
-                    } else if parse_frame_mem(line).is_some() {
+                        let off = canonical_frame_off(base, rbp_off, rsp_delta);
+                        read_ranges.push((base, off, width));
+                    } else if let Some(fm) = parse_frame_mem(line) {
                         // Frame operand that was neither a leaq, a cached
                         // plain access, nor a provably bounded SIB: fail
                         // closed (unbounded negative-reach SIB).
+                        if fm.sib && rsp_delta != 0 {
+                            has_unparseable_indirect = true;
+                            break;
+                        }
                         if let Some((base, off, len, is_floor)) =
                             sib_frame_observation(store, infos, k, line)
                         {
+                            let off = canonical_frame_off(base, off, rsp_delta);
                             if is_floor {
                                 read_floors.push((base, off));
                             } else {
@@ -1295,7 +1464,8 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
                             has_unparseable_indirect = true;
                             break;
                         };
-                        read_ranges.push((fm.base, fm.disp, width));
+                        let off = canonical_frame_off(fm.base, fm.disp, rsp_delta);
+                        read_ranges.push((fm.base, off, width));
                     }
                 }
                 _ => {
@@ -1310,11 +1480,17 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
                             has_unparseable_indirect = true;
                             break;
                         };
-                        read_ranges.push((base, rbp_off, width));
-                    } else if parse_frame_mem(line).is_some() {
+                        let off = canonical_frame_off(base, rbp_off, rsp_delta);
+                        read_ranges.push((base, off, width));
+                    } else if let Some(fm) = parse_frame_mem(line) {
+                        if fm.sib && rsp_delta != 0 {
+                            has_unparseable_indirect = true;
+                            break;
+                        }
                         if let Some((base, off, len, is_floor)) =
                             sib_frame_observation(store, infos, k, line)
                         {
+                            let off = canonical_frame_off(base, off, rsp_delta);
                             if is_floor {
                                 read_floors.push((base, off));
                             } else {
@@ -1969,5 +2145,202 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Run never-read DSE and report whether the line matching `text` was
+    /// NOP'd (exact trimmed match, first occurrence).
+    fn dse_removed(asm: &str, text: &str) -> bool {
+        let (store, mut infos) = build(asm);
+        let idx = (0..store.len())
+            .find(|&i| store.get(i).trim() == text)
+            .expect("probe line present");
+        eliminate_never_read_stores(&store, &mut infos);
+        infos[idx].is_nop()
+    }
+
+    /// A `24(%rsp)` read inside a 16-byte push window (delta +16) addresses
+    /// the same slot as the canonical `8(%rsp)` store: the store must be
+    /// kept, while an unrelated never-read vector store is still removed.
+    /// Mirrors the variadic `loop_patterns` region.
+    #[test]
+    fn dse_push_window_read_translates_to_canonical_slot() {
+        let asm = "f:\n\
+.cfi_startproc\n\
+    pushq %rbp\n\
+    subq $48, %rsp\n\
+    movq %rax, 8(%rsp)\n\
+    movdqu %xmm0, 16(%rsp)\n\
+    pushq %rcx\n\
+    pushq %rdx\n\
+    movq 24(%rsp), %rdi\n\
+    call printf@PLT\n\
+    addq $16, %rsp\n\
+    addq $48, %rsp\n\
+    popq %rbp\n\
+    ret\n\
+.cfi_endproc\n";
+        // The shifted read keeps the canonical store alive; the dead vector
+        // store is removed.
+        assert!(!dse_removed(asm, "movq %rax, 8(%rsp)"));
+        assert!(dse_removed(asm, "movdqu %xmm0, 16(%rsp)"));
+        // Mutation: point the shifted read at an unmapped canonical slot
+        // (40-16=24); the 8(%rsp) store is now genuinely dead and is removed.
+        let mutated = asm.replace("movq 24(%rsp), %rdi", "movq 40(%rsp), %rdi");
+        assert!(dse_removed(&mutated, "movq %rax, 8(%rsp)"));
+    }
+
+    /// A conditional jump at non-canonical rsp depth means not every
+    /// successor enters at canonical depth; DSE must bail and keep stores.
+    /// The push that opens the delta must sit in the body (prologue shifts
+    /// precede the DSE body window and are not re-counted).
+    #[test]
+    fn dse_bails_on_unbalanced_conditional_jump() {
+        let asm = "g:\n\
+.cfi_startproc\n\
+    pushq %rbp\n\
+    subq $32, %rsp\n\
+    movl %eax, 8(%rsp)\n\
+    pushq %rcx\n\
+    je .L1\n\
+.L1:\n\
+    addq $8, %rsp\n\
+    addq $32, %rsp\n\
+    popq %rbp\n\
+    ret\n\
+.cfi_endproc\n";
+        assert!(!dse_removed(asm, "movl %eax, 8(%rsp)"));
+        // Mutation: balance the push window before the terminator so delta is
+        // zero at the je; no bail, and the dead store is removed.
+        let mutated = asm.replace(
+            "pushq %rcx\nje .L1\n",
+            "pushq %rcx\naddq $8, %rsp\nje .L1\n",
+        );
+        assert!(dse_removed(&mutated, "movl %eax, 8(%rsp)"));
+    }
+
+    /// An SIB-form frame access while rsp is shifted cannot be mapped to a
+    /// canonical slot: DSE must bail rather than mis-alias.
+    #[test]
+    fn dse_bails_on_sib_frame_access_at_shifted_depth() {
+        let asm = "h:\n\
+.cfi_startproc\n\
+    subq $32, %rsp\n\
+    movl %eax, 8(%rsp)\n\
+    pushq %rbx\n\
+    movl 32(%rsp,%rax,4), %edi\n\
+    addq $8, %rsp\n\
+    addq $32, %rsp\n\
+    ret\n\
+.cfi_endproc\n";
+        assert!(!dse_removed(asm, "movl %eax, 8(%rsp)"));
+        // Mutation: perform the SIB read at canonical depth (before the
+        // push). Its unbounded-upward floor starts at slot 32, so the dead
+        // slot-8 store below the floor is still removed.
+        let mutated = asm.replace(
+            "pushq %rbx\nmovl 32(%rsp,%rax,4), %edi\n",
+            "movl 32(%rsp,%rax,4), %edi\npushq %rbx\n",
+        );
+        assert!(dse_removed(&mutated, "movl %eax, 8(%rsp)"));
+    }
+
+    /// A label inside an open push/pop window (a loop back-edge target, as in
+    /// cmpxchg retry loops) must NOT reset the linear rsp delta: every edge
+    /// reaching the label shares the shifted depth, so a textual frame
+    /// operand still translates by the carried delta. Resetting here would
+    /// mis-attribute the post-pop read and delete a live store.
+    #[test]
+    fn dse_carries_rsp_delta_across_loop_label_in_push_window() {
+        let asm = "k:\n\
+.cfi_startproc\n\
+    subq $32, %rsp\n\
+    pushq %rbx\n\
+.L1:\n\
+    movl 16(%rsp), %edi\n\
+    movl %eax, 8(%rsp)\n\
+    addq $32, %rsp\n\
+    ret\n\
+.cfi_endproc\n";
+        // The +8 delta carries across the loop label: the textual 16(%rsp)
+        // read maps to canonical slot 8 and keeps the slot-8 store alive.
+        assert!(!dse_removed(asm, "movl %eax, 8(%rsp)"));
+        // Mutation: balance the push before the label so the read really
+        // targets canonical slot 16; the slot-8 store is then dead and goes.
+        let mutated = asm.replace("pushq %rbx\n.L1:\n", "pushq %rbx\naddq $8, %rsp\n.L1:\n");
+        assert!(dse_removed(&mutated, "movl %eax, 8(%rsp)"));
+    }
+
+    /// A label reached only through a branch after the linear path ended in
+    /// a `ret` starts a block that codegen enters at canonical rsp depth, even
+    /// though the preceding block's epilogue teardown left the linear delta
+    /// negative. The block's frame reads must map to their textual slots
+    /// (cpuid-output spill shape: stores kept, read in the post-`ret` block).
+    #[test]
+    fn dse_resets_delta_at_label_after_ret_for_branch_target() {
+        let asm = "f:\n\
+.cfi_startproc\n\
+    subq $32, %rsp\n\
+    movl %eax, 16(%rsp)\n\
+    jc .L2\n\
+.L1:\n\
+    addq $32, %rsp\n\
+    ret\n\
+.L2:\n\
+    movl 16(%rsp), %edx\n\
+    jmp .L1\n\
+.cfi_endproc\n";
+        // The read in the post-ret branch block keeps the slot-16 store once
+        // the epilogue's -32 delta is reset at the .L2 label.
+        assert!(!dse_removed(asm, "movl %eax, 16(%rsp)"));
+        // Mutation: drop the `ret` so .L2 is a fall-through label that keeps
+        // the -32 delta; the read mis-maps to slot 48 and the store is deleted.
+        let mutated = asm.replace("ret\n.L2:\n", ".L2:\n");
+        assert!(dse_removed(&mutated, "movl %eax, 16(%rsp)"));
+    }
+
+    /// A `pushq MEM(%rsp)` both shifts rsp and reads a frame slot at the
+    /// pre-shift depth; DSE must fail closed instead of treating it as a
+    /// bare +8 step and dropping the read (variadic push-home idiom).
+    #[test]
+    fn dse_bails_on_memory_form_push() {
+        let asm = "g:\n\
+.cfi_startproc\n\
+    subq $32, %rsp\n\
+    movq %rax, 0(%rsp)\n\
+    pushq 0(%rsp)\n\
+    popq %rdx\n\
+    addq $32, %rsp\n\
+    ret\n\
+.cfi_endproc\n";
+        assert!(!dse_removed(asm, "movq %rax, 0(%rsp)"));
+        // Mutation: a register push carries no frame read, so the slot-0 store
+        // is genuinely never observed and is removed.
+        let mutated = asm.replace("pushq 0(%rsp)\n", "pushq %rax\n");
+        assert!(dse_removed(&mutated, "movq %rax, 0(%rsp)"));
+    }
+
+    /// An unconditional `jmp` reached at non-canonical depth whose target block
+    /// performs a frame-slot access is unanalyzable (the block's true entry
+    /// depth cannot be reconstructed linearly): DSE must fail closed rather
+    /// than reset the delta and mis-attribute the target block's reads.
+    #[test]
+    fn dse_bails_on_shifted_jmp_into_frame_accessing_block() {
+        let asm = "h:\n\
+.cfi_startproc\n\
+    subq $32, %rsp\n\
+    movl %eax, 16(%rsp)\n\
+    pushq %rbx\n\
+    jmp .L2\n\
+.L2:\n\
+    movl 16(%rsp), %edi\n\
+    popq %rbx\n\
+    addq $32, %rsp\n\
+    ret\n\
+.cfi_endproc\n";
+        assert!(!dse_removed(asm, "movl %eax, 16(%rsp)"));
+        // Mutation: turn the shifted jump into fall-through (drop the jmp); the
+        // label no longer resets the delta, the read mis-maps and the store is
+        // deleted — proving the guard is what keeps it.
+        let mutated = asm.replace("jmp .L2\n", "");
+        assert!(dse_removed(&mutated, "movl %eax, 16(%rsp)"));
     }
 }
