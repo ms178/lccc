@@ -22,6 +22,7 @@ impl Lowerer {
         &mut self,
         decl: &Declaration,
         declarator: &InitDeclarator,
+        inherited_volatile: bool,
     ) -> bool {
         // Remove from locals, but track in scope frame so pop_scope()
         // restores the local when this block exits.
@@ -56,6 +57,7 @@ impl Lowerer {
 
         if !self.globals.contains_key(&declarator.name) {
             let mut ext_da = self.analyze_declaration(&decl.type_spec, &declarator.derived);
+            self.apply_declaration_qualifiers(&mut ext_da, decl, declarator, inherited_volatile);
             ext_da.apply_decl_vector_type(decl);
             // A block-scope `extern` names an object with linkage, so it is
             // placed exactly like its file-scope declaration (global_decl.rs).

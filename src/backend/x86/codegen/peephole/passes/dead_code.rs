@@ -350,7 +350,10 @@ pub(super) fn eliminate_dead_stores(store: &LineStore, infos: &mut [LineInfo]) -
         }
 
         let (store_offset, store_size) = match infos[i].kind {
-            LineKind::StoreRbp { offset, size, .. } => (offset, size),
+            // mark_nop refuses pinned lines (notably address-taken slots).
+            // Skip them before the scan so an unchanged line cannot falsely
+            // keep the post-global fixpoint alive.
+            LineKind::StoreRbp { offset, size, .. } if !infos[i].pinned => (offset, size),
             _ => continue,
         };
 
@@ -1750,6 +1753,42 @@ mod tests {
             .map(|i| classify_line(store.get(i)))
             .collect();
         (store, infos)
+    }
+
+    /// Address-taken frame slots retain their StoreRbp classification but are
+    /// pinned by the real pipeline. Reporting a deletion when mark_nop cannot
+    /// remove one falsely prolongs the post-global fixpoint.
+    #[test]
+    fn windowed_dse_does_not_report_pinned_stores_as_deleted() {
+        let asm = "f:\n.cfi_startproc\n    pushq %rbp\n    movq %rsp, %rbp\n    subq $32, %rsp\n    movl %edi, -24(%rbp)\n    movl %esi, -24(%rbp)\n    leaq -24(%rbp), %rcx\n    movq %rbp, %rsp\n    popq %rbp\n    ret\n.cfi_endproc\n";
+        let (store, mut infos) = build(asm);
+        super::super::pin_address_taken_stack_slots(&store, &mut infos);
+        let stores: Vec<usize> = (0..store.len())
+            .filter(|&i| matches!(infos[i].kind, LineKind::StoreRbp { offset: -24, .. }))
+            .collect();
+        assert_eq!(stores.len(), 2);
+        assert!(stores.iter().all(|&i| infos[i].pinned));
+        assert!(!eliminate_dead_stores(&store, &mut infos));
+        assert!(stores.iter().all(|&i| !infos[i].is_nop()));
+    }
+
+    /// A pinned candidate must not disable real dead-store elimination on an
+    /// unrelated, unpinned slot in the same function.
+    #[test]
+    fn windowed_dse_still_eliminates_unpinned_stores_beside_pinned_ones() {
+        let asm = "f:\n.cfi_startproc\n    pushq %rbp\n    movq %rsp, %rbp\n    subq $32, %rsp\n    movl %edi, -24(%rbp)\n    movl %esi, -24(%rbp)\n    movl %edi, -28(%rbp)\n    movl %esi, -28(%rbp)\n    leaq -24(%rbp), %rcx\n    movq %rbp, %rsp\n    popq %rbp\n    ret\n.cfi_endproc\n";
+        let (store, mut infos) = build(asm);
+        super::super::pin_address_taken_stack_slots(&store, &mut infos);
+        let stores: Vec<usize> = (0..store.len())
+            .filter(|&i| matches!(infos[i].kind, LineKind::StoreRbp { .. }))
+            .collect();
+        assert_eq!(stores.len(), 4);
+        assert!(infos[stores[0]].pinned && infos[stores[1]].pinned);
+        assert!(!infos[stores[2]].pinned && !infos[stores[3]].pinned);
+        assert!(eliminate_dead_stores(&store, &mut infos));
+        assert!(!infos[stores[0]].is_nop() && !infos[stores[1]].is_nop());
+        assert!(infos[stores[2]].is_nop() && !infos[stores[3]].is_nop());
+        assert!(!eliminate_dead_stores(&store, &mut infos));
     }
 
     /// The windowed DSE models NOP'd lines as absent: a forwarded (NOP'd)

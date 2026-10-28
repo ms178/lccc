@@ -26,6 +26,8 @@ import io
 import json
 import os
 from pathlib import Path
+import posixpath
+import secrets
 import shutil
 import stat
 import subprocess
@@ -87,14 +89,19 @@ def parse_manifest(text: str) -> dict[str, str]:
 
 
 def write_atomic(path: Path, data: bytes, mode: int) -> None:
-    """Replace ``path`` without ever writing *through* a symlink.
-
-    ``O_NOFOLLOW`` on the temporary plus ``os.replace`` (which swaps the
-    directory entry rather than the link target) means a pre-existing symlink
-    at either name is replaced, never followed.
-    """
-    tmp = path.with_name(path.name + '.tmp')
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, mode)
+    """Replace ``path`` without writing through a symlink or hardlink."""
+    tmp: Path | None = None
+    fd: int | None = None
+    for _ in range(100):
+        candidate = path.with_name(path.name + '.tmp.' + secrets.token_hex(16))
+        try:
+            fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+            tmp = candidate
+            break
+        except FileExistsError:
+            continue
+    if fd is None or tmp is None:
+        raise RuntimeError(f'unable to allocate a private temporary for {path}')
     try:
         # os.write may write fewer bytes than asked; the installed manifest is
         # a few MiB for the real cache, so this must loop rather than assume.
@@ -102,9 +109,13 @@ def write_atomic(path: Path, data: bytes, mode: int) -> None:
         while view:
             view = view[os.write(fd, view):]
         os.fchmod(fd, mode)
-    finally:
         os.close(fd)
-    os.replace(tmp, path)
+        fd = None
+        os.replace(tmp, path)
+    finally:
+        if fd is not None:
+            os.close(fd)
+        tmp.unlink(missing_ok=True)
 
 
 def extractall_takes_filter() -> bool:
@@ -115,9 +126,182 @@ def extractall_takes_filter() -> bool:
         return False
 
 
+def confined_extraction_supported() -> bool:
+    """The fallback requires POSIX descriptor-relative, no-follow operations."""
+    required = (os.open, os.mkdir, os.stat, os.symlink, os.link, os.rename, os.unlink)
+    return (hasattr(os, 'O_NOFOLLOW') and hasattr(os, 'O_DIRECTORY')
+            and all(op in os.supports_dir_fd for op in required)
+            and os.link in os.supports_follow_symlinks
+            and os.stat in os.supports_follow_symlinks)
+
+
 def extraction_supported() -> bool:
-    """Whether this interpreter can extract an untrusted archive safely."""
-    return hasattr(tarfile, 'data_filter') and extractall_takes_filter()
+    """Whether a filtered or descriptor-confined extractor is available."""
+    return ((hasattr(tarfile, 'data_filter') and extractall_takes_filter())
+            or confined_extraction_supported())
+
+
+class UnsafeArchiveError(ValueError):
+    """The archive cannot be extracted without crossing a trust boundary."""
+
+
+def archive_name(name: str) -> str:
+    """Reject absolute and parent-traversing member/hardlink names."""
+    if not name or name.startswith('/') or '..' in name.split('/') or '\0' in name:
+        raise UnsafeArchiveError(f'unsafe archive path: {name!r}')
+    return posixpath.normpath(name)
+
+
+def validate_confined_members(members: list[tarfile.TarInfo]) -> list[tuple[tarfile.TarInfo, str]]:
+    """Validate the complete archive before the fallback writes any member.
+
+    Unlike tarfile's data filter, the fallback does not traverse *any* archive
+    symlink while extracting. This stricter rule makes the absence of the
+    filter API safe, including on an older Python with an unpatched tarfile.
+    """
+    kinds: dict[str, str] = {}
+    normalised: list[tuple[tarfile.TarInfo, str]] = []
+    for member in members:
+        name = archive_name(member.name)
+        kind = member_kind(member)
+        if kind == 'other' or (name == '.' and kind != 'dir'):
+            raise UnsafeArchiveError(f'unsupported archive member: {member.name!r}')
+        if name in kinds:
+            raise UnsafeArchiveError(f'duplicate archive member: {name!r}')
+        kinds[name] = kind
+        normalised.append((member, name))
+        if kind == 'sym':
+            target = member.linkname
+            if not target or target.startswith('/') or '\0' in target:
+                raise UnsafeArchiveError(f'unsafe symlink: {name!r} -> {target!r}')
+            resolved = posixpath.normpath(posixpath.join(posixpath.dirname(name), target))
+            if resolved == '..' or resolved.startswith('../'):
+                raise UnsafeArchiveError(f'escaping symlink: {name!r} -> {target!r}')
+        elif kind == 'lnk':
+            target = archive_name(member.linkname)
+            if target == name or kinds.get(target) not in ('file', 'lnk'):
+                raise UnsafeArchiveError(f'hardlink target must be an earlier file: {name!r} -> {target!r}')
+
+    for _, name in normalised:
+        parent = posixpath.dirname(name)
+        while parent and parent != '.':
+            if parent in kinds and kinds[parent] != 'dir':
+                raise UnsafeArchiveError(f'archive member {name!r} traverses {parent!r}')
+            parent = posixpath.dirname(parent)
+    return normalised
+
+
+def open_confined_directory(root_fd: int, path: str) -> int:
+    """Open/create a directory chain without following any symlink."""
+    fd = os.dup(root_fd)
+    try:
+        for part in path.split('/'):
+            if not part or part == '.':
+                continue
+            try:
+                os.mkdir(part, 0o755, dir_fd=fd)
+            except FileExistsError:
+                pass
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def temporary_entry(create) -> str:
+    """Reserve a fresh entry inside an already-open directory."""
+    for _ in range(100):
+        name = '.lccc-extract-' + secrets.token_hex(16)
+        try:
+            create(name)
+            return name
+        except FileExistsError:
+            continue
+    raise RuntimeError('unable to allocate a private extraction entry')
+
+
+def extract_confined(tar: tarfile.TarFile, members: list[tarfile.TarInfo], prefix: Path) -> None:
+    """Extract without following symlinks, even on pre-PEP-706 Python.
+
+    Files are written to exclusive temporary inodes and atomically renamed,
+    never truncated through a pre-existing file, hardlink, or symlink. The
+    stricter archive policy rejects links used as parent directories.
+    """
+    entries = validate_confined_members(members)
+    root_fd = os.open(prefix, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    written: set[str] = set()
+    try:
+        for member, name in entries:
+            kind = member_kind(member)
+            if name == '.':
+                continue
+            parent_fd = open_confined_directory(root_fd, posixpath.dirname(name))
+            leaf = posixpath.basename(name)
+            tmp = None
+            try:
+                if kind == 'dir':
+                    try:
+                        os.mkdir(leaf, 0o755, dir_fd=parent_fd)
+                    except FileExistsError:
+                        fd = os.open(leaf, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+                        os.close(fd)
+                    continue
+                if kind == 'file':
+                    stream = tar.extractfile(member)
+                    if stream is None:
+                        raise UnsafeArchiveError(f'cannot read archive member: {name!r}')
+                    fd_box: list[int] = []
+
+                    def create_file(candidate: str) -> None:
+                        fd_box.append(os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                                              | os.O_NOFOLLOW, 0o600, dir_fd=parent_fd))
+
+                    try:
+                        tmp = temporary_entry(create_file)
+                        # Match tarfile's data filter's permission restrictions:
+                        # ignore special and group/other write bits, require
+                        # owner read/write, and never grant executable bits to
+                        # a file that its owner could not execute in the tar.
+                        mode = member.mode & 0o755 | 0o600
+                        if not member.mode & 0o100:
+                            mode &= ~0o111
+                        with os.fdopen(fd_box.pop(), 'wb') as out:
+                            shutil.copyfileobj(stream, out)
+                            os.fchmod(out.fileno(), mode)
+                    finally:
+                        stream.close()
+                        for fd in fd_box:
+                            os.close(fd)
+                elif kind == 'sym':
+                    tmp = temporary_entry(lambda candidate: os.symlink(member.linkname, candidate, dir_fd=parent_fd))
+                else:  # hardlink to an earlier, successfully extracted file
+                    target = archive_name(member.linkname)
+                    if target not in written:
+                        raise UnsafeArchiveError(f'hardlink target not extracted: {target!r}')
+                    source_fd = open_confined_directory(root_fd, posixpath.dirname(target))
+                    try:
+                        source = posixpath.basename(target)
+                        if not stat.S_ISREG(os.stat(source, dir_fd=source_fd, follow_symlinks=False).st_mode):
+                            raise UnsafeArchiveError(f'hardlink target is not a regular file: {target!r}')
+                        tmp = temporary_entry(lambda candidate: os.link(
+                            source, candidate, src_dir_fd=source_fd, dst_dir_fd=parent_fd, follow_symlinks=False))
+                        if not stat.S_ISREG(os.stat(tmp, dir_fd=parent_fd, follow_symlinks=False).st_mode):
+                            raise UnsafeArchiveError(f'hardlink changed during extraction: {target!r}')
+                    finally:
+                        os.close(source_fd)
+                os.rename(tmp, leaf, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+                tmp = None
+                if kind in ('file', 'lnk'):
+                    written.add(name)
+            finally:
+                if tmp is not None:
+                    os.unlink(tmp, dir_fd=parent_fd)
+                os.close(parent_fd)
+    finally:
+        os.close(root_fd)
 
 
 def member_kind(member: tarfile.TarInfo) -> str:
@@ -139,22 +323,23 @@ def extract_untrusted(archive: Path, prefix: Path) -> list[dict]:
     """Validate every member, then extract; return the member descriptors.
 
     The declared Python floor does not universally provide extraction filters.
-    Never turn an unsupported host into an unfiltered extraction.
+    POSIX hosts use a descriptor-confined extractor, never an unfiltered
+    tarfile extraction. Other hosts require Python's native data filter.
+    Hosts with neither capability fail before opening the archive.
     """
     if not extraction_supported():
-        raise RuntimeError('secure agent-cache extraction needs a filter-capable Python')
-    # Validate the COMPLETE archive before writing anything.  The old precheck
-    # inspected only member names (and lstrip('./') even hid leading slashes
-    # and traversal), then delegated links to GNU tar.  GNU tar rejected the
-    # tested escape only after creating the attacker-selected symlink.
-    # Python's data filter checks paths, link targets, devices and modes; the
-    # separate validation pass ensures a late bad member cannot leave a
-    # partially extracted unsafe archive behind.
+        raise RuntimeError('secure agent-cache extraction needs a filter or confined POSIX operations')
+    # Validate the COMPLETE archive before writing anything. The descriptor
+    # path also avoids truncating pre-existing hardlinks and refuses symlink
+    # parents; the native filter is the portable alternative.
     with tarfile.open(archive) as tar:
         members = tar.getmembers()
-        for member in members:
-            tarfile.data_filter(member, str(prefix))
-        tar.extractall(prefix, members=members, filter='data')
+        if confined_extraction_supported():
+            extract_confined(tar, members, prefix)
+        else:
+            for member in members:
+                tarfile.data_filter(member, str(prefix))
+            tar.extractall(prefix, members=members, filter='data')
     installed: list[dict] = []
     for member in members:
         kind = member_kind(member)
@@ -167,7 +352,10 @@ def extract_untrusted(archive: Path, prefix: Path) -> list[dict]:
             # other write bits are host policy: extraction applies the local
             # umask/ACL (measured: a 0o775 member lands as 0o755), so comparing
             # them would report every correct prefix as damaged.
-            entry['exec'] = bool(stat.S_IMODE(member.mode) & 0o111)
+            # The data policy removes all execute bits unless the archived
+            # file was executable by its owner; compare the installed result,
+            # not an execute bit that policy deliberately stripped.
+            entry['exec'] = bool(stat.S_IMODE(member.mode) & 0o100)
         elif kind == 'sym':
             entry['link'] = member.linkname
         installed.append(entry)
@@ -406,7 +594,7 @@ def restore(repo: Path, remote: str, tag: str, prefix: Path, lock_path: Path | N
     # ---- verifying path --------------------------------------------------
     if not verify_only and not extraction_supported():
         # Fail in microseconds rather than after materialising ~500 MiB.
-        raise RuntimeError('secure agent-cache extraction needs a filter-capable Python')
+        raise RuntimeError('secure agent-cache extraction needs a filter or confined POSIX operations')
 
     parts_text = read_blob(repo, tag, 'PARTS.tsv.part00')
     parts: dict[str, int] = {}
@@ -615,7 +803,7 @@ def self_test() -> int:
         destination.mkdir()
         try:
             extract_untrusted(unsafe, destination)
-        except tarfile.FilterError:
+        except (UnsafeArchiveError, getattr(tarfile, 'FilterError', UnsafeArchiveError)):
             pass
         else:
             raise AssertionError('unsafe tar link was not rejected')

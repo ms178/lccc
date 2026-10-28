@@ -69,11 +69,28 @@ impl qualifiers::ConstLookup for Lowerer {
         self.types.const_base_typedefs.contains(name)
     }
 
+    fn typedef_const_pointer_level(&self, name: &str) -> Option<usize> {
+        self.types
+            .typedefs
+            .get(name)
+            .and_then(qualifiers::typedef_const_pointer_level)
+    }
+
     fn is_pointer(&self, expr: &Expr) -> bool {
         matches!(
             self.get_expr_ctype(expr),
             Some(CType::Pointer(..) | CType::Array(..))
         )
+    }
+
+    fn expr_const_pointer_level(&self, expr: &Expr) -> Option<usize> {
+        self.get_expr_ctype(expr)
+            .as_ref()
+            .and_then(qualifiers::typedef_const_pointer_level)
+    }
+
+    fn type_const_pointer_level(&self, ts: &TypeSpecifier) -> Option<usize> {
+        qualifiers::typedef_const_pointer_level(&self.type_spec_to_ctype(ts))
     }
 
     fn select_generic<'a>(
@@ -123,7 +140,7 @@ impl Lowerer {
                     false
                 }
             }
-            TypeSpecifier::TypeofType(inner) => self.is_type_spec_long_double(inner),
+            TypeSpecifier::TypeofType(inner, _) => self.is_type_spec_long_double(inner),
             _ => false,
         }
     }
@@ -2168,7 +2185,7 @@ impl Lowerer {
                 }
                 None // caller decides what to do
             }
-            TypeSpecifier::TypeofType(inner) => self.try_resolve_typeof_with_scope(inner, scope),
+            TypeSpecifier::TypeofType(inner, _) => self.try_resolve_typeof_with_scope(inner, scope),
             other => Some(other.clone()),
         }
     }

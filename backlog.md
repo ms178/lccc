@@ -1439,7 +1439,7 @@ completion. `OPEN` means the acceptance criterion has not been met or tested;
 
 | Item | Verdict | Observed evidence / remaining acceptance gap |
 |---|---|---|
-| GP-01 | PARTIAL | 33 attribute cases and two glibc headers at four optimization levels pass; 127 GCC-known names, 83 known-but-unimplemented inventory entries, and 48 implemented names (four are Clang-only). Semantic implementation of the 83 is not implied; function-typedef attribute diagnostics remain open. |
+| GP-01 | PARTIAL | 40 attribute cases and two glibc headers at four optimization levels pass; 127 GCC-known names, 83 known-but-unimplemented inventory entries, and 48 implemented names (four are Clang-only). Semantic implementation of the 83 is not implied; function-typedef attribute diagnostics remain open. |
 | GP-02 | OPEN, wrong code | `ms_abi` four-int sentinel: GCC/GCC returns success; GCC caller + LCCC callee returns 42 instead of success; LCCC caller + GCC callee dies SIGSEGV. No complete mixed-ABI matrix. |
 | GP-03 | OPEN, wrong code | The C `retain` sentinel still emits plain `.data` with `WA`, versus GCC `.data.retained` with `WAR`; frontend propagation is absent. The five integrated assemblers now preserve a uniquely named `R` section and GNU OSABI, and x86-64 `ld -r` preserves R/non-R separation. Same-named assembler variants are refused, and LCCC i686 userspace GC remains unimplemented. This is infrastructure, not attribute support. |
 | GP-04 | OPEN, wrong code | x86 interrupt sentinel under `-mgeneral-regs-only`: GCC ends in `iretq`; LCCC ends in `ret`, without a diagnostic. Other contract attributes remain unaudited here. |
@@ -1462,10 +1462,14 @@ completion. `OPEN` means the acceptance criterion has not been met or tested;
 | GP-21 | OPEN | LCCC fails all 4 checked queries (`-dumpfullversion`, `-print-multiarch`, `-print-multi-lib`, `-print-sysroot`); GCC answers all 4. |
 | GP-22 | OPEN | `-nostdinc` now suppresses implicit include paths, and unsupported GNU sysroot requests are refused rather than silently ignored. The legacy `LCCC_SYSROOT` overlay still falls back to host paths. `-pedantic` remains a diagnosed no-op for the GNU-expression sentinel; no complete accepted-option effect ledger is demonstrated. |
 | GP-23 | OPEN | The one GNU23 x86-64 macro differential above still has 211 LCCC-only and 153 GCC-only names; no all-target/all-dialect ratchet is claimed. |
-| GP-24 | PARTIAL | Seven derived gzip/zlib-ng/Expat kernels passed bounded GCC/Clang/LCCC checks; the new compare256 gate covers four optimization levels, two ABIs and a detected mutation. Verified zlib-ng 2.3.3 configure/Make static builds passed upstream `alltests` under GCC and LCCC, followed by 48 cross-compiler roundtrips and 24 system-gzip decodes. CMake/CTest, remaining workload projects and kernel-style diagnostic matrices remain unrun. |
+| GP-24 | PARTIAL | Seven derived gzip/zlib-ng/Expat kernels passed bounded GCC/Clang/LCCC checks; compare256 covers four optimization levels, two ABIs and a detected mutation. Verified zlib-ng 2.3.3 configure/Make static builds passed upstream `alltests` under GCC and LCCC, followed by 48 cross-compiler roundtrips and 24 system-gzip decodes. Manually configured upstream Expat 2.9.0 passed 5,196 checks with GCC, Clang and LCCC libraries, including an LCCC-compiled runner. Its bounded paired benchmark on this VM measured LCCC/GCC median CPU-time ratio 1.3161 [1.3077, 1.3206], not a speedup. Expat configure/CMake/CTest, other configurations and kernel-style diagnostic matrices remain open. |
 
 The `ms_abi`, `retain`, and `interrupt` findings are correctness/ABI hazards,
-not performance opportunities. The raw bounded audit is in `~/.cache/lccc/gp-sentinel-audit.{py,json,txt}`;
+not performance opportunities. Independent `typeof` red-teaming also found
+wrong `__builtin_types_compatible_p` constants and eliminated volatile reads;
+see `engineering/evidence/typeof-qualifier-gaps-2026-10-28/`. Those remain
+open despite the bounded const-propagation fix. The raw GP audit is in
+`~/.cache/lccc/gp-sentinel-audit.{py,json,txt}`;
 the checked-in attribute, warning, retain and workload regression gates provide
 repeatable coverage for the corresponding narrower claims. Older measurements
 elsewhere in the register are historical, not freshly re-measured verdicts.

@@ -1435,13 +1435,14 @@ impl Lowerer {
         // and must pass the same answer down.  Resolving it afterwards left the
         // bitfield path emitting non-volatile accesses for a volatile object.
         //
-        // p->f dereferences p; s.f accesses s directly — both inherit the
-        // base access's volatility (field-level quals are not tracked yet).
-        let is_vol = if is_pointer {
-            self.pointee_expr_is_volatile(base_expr)
-        } else {
-            self.expr_access_is_volatile(base_expr)
-        };
+        // p->f dereferences p; s.f accesses s directly. Either the base
+        // object or the field itself can make the access volatile.
+        let is_vol = self.member_is_volatile(base_expr, is_pointer, field_name)
+            || if is_pointer {
+                self.pointee_expr_is_volatile(base_expr)
+            } else {
+                self.expr_access_is_volatile(base_expr)
+            };
 
         // For bitfields, use extract_bitfield_from_addr which handles split loads
         // (packed bitfields that span storage unit boundaries).

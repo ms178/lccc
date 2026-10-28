@@ -12,16 +12,142 @@ BINUTILS = ROOT / 'scripts/ensure_binutils_247_binary.sh'
 
 
 class AgentToolchainCache(unittest.TestCase):
-    def test_untrusted_extract_fails_before_open_without_filter_support(self):
+    def test_untrusted_extract_fails_before_open_without_any_safe_extractor(self):
         spec = importlib.util.spec_from_file_location('agent_cache_restore_test', RESTORE)
         self.assertIsNotNone(spec)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         with mock.patch.object(module, 'extractall_takes_filter', return_value=False), \
+                mock.patch.object(module, 'confined_extraction_supported', return_value=False), \
                 mock.patch.object(module.tarfile, 'open') as archive_open:
-            with self.assertRaisesRegex(RuntimeError, 'filter-capable Python'):
+            with self.assertRaisesRegex(RuntimeError, 'filter or confined POSIX operations'):
                 module.extract_untrusted(Path('not-opened.tar'), Path('not-created'))
         archive_open.assert_not_called()
+
+    def test_confined_extractor_rejects_unsafe_members_before_writing(self):
+        import io
+        import tarfile
+        import tempfile
+        spec = importlib.util.spec_from_file_location('agent_cache_confined_test', RESTORE)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        if not module.confined_extraction_supported():
+            self.skipTest('descriptor-confined extraction is unavailable')
+
+        def info(name, kind=tarfile.REGTYPE, target=''):
+            member = tarfile.TarInfo(name)
+            member.type = kind
+            member.linkname = target
+            return member
+
+        cases = [
+            [info('../outside')],
+            [info('/absolute')],
+            [info('escape', tarfile.SYMTYPE, '../../outside')],
+            [info('absolute_link', tarfile.SYMTYPE, '/tmp')],
+            [info('root/link', tarfile.SYMTYPE, 'inside'), info('root/link/file')],
+            [info('missing', tarfile.LNKTYPE, 'elsewhere')],
+            [info('self', tarfile.LNKTYPE, 'self')],
+            [info('device', tarfile.CHRTYPE)],
+            [info('dup'), info('dup')],
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            for index, bad_members in enumerate(cases):
+                with self.subTest(index=index):
+                    archive = base / f'bad-{index}.tar'
+                    with tarfile.open(archive, 'w') as out:
+                        first = info('would-have-been-written')
+                        first.size = 1
+                        out.addfile(first, io.BytesIO(b'x'))
+                        for member in bad_members:
+                            out.addfile(member)
+                    prefix = base / f'prefix-{index}'
+                    prefix.mkdir()
+                    # Exercise the compatibility path even when running on a
+                    # newer Python with the native extraction-filter API.
+                    with mock.patch.object(module, 'extractall_takes_filter', return_value=False), \
+                            mock.patch.object(module.tarfile.TarFile, 'extractall',
+                                              side_effect=AssertionError('unfiltered extraction')):
+                        with self.assertRaises(module.UnsafeArchiveError):
+                            module.extract_untrusted(archive, prefix)
+                    self.assertEqual(list(prefix.iterdir()), [])
+
+    def test_confined_extractor_does_not_follow_existing_links(self):
+        import io
+        import os
+        import tarfile
+        import tempfile
+        spec = importlib.util.spec_from_file_location('agent_cache_existing_link_test', RESTORE)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        if not module.confined_extraction_supported():
+            self.skipTest('descriptor-confined extraction is unavailable')
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            outside = base / 'outside'
+            outside.mkdir()
+            canary = outside / 'canary'
+            canary.write_bytes(b'unchanged')
+            prefix = base / 'prefix'
+            prefix.mkdir()
+            os.symlink(outside, prefix / 'parent')
+            archive = base / 'bad-parent.tar'
+            with tarfile.open(archive, 'w') as out:
+                member = tarfile.TarInfo('parent/canary')
+                member.size = 7
+                out.addfile(member, io.BytesIO(b'corrupt'))
+            with self.assertRaises(OSError):
+                module.extract_untrusted(archive, prefix)
+            self.assertEqual(canary.read_bytes(), b'unchanged')
+
+            (prefix / 'parent').unlink()
+            os.symlink(canary, prefix / 'symlink')
+            os.link(canary, prefix / 'hardlink')
+            archive = base / 'safe.tar'
+            with tarfile.open(archive, 'w') as out:
+                for name in ('symlink', 'hardlink'):
+                    member = tarfile.TarInfo(name)
+                    member.size = 3
+                    member.mode = 0o6777
+                    out.addfile(member, io.BytesIO(b'new'))
+                link = tarfile.TarInfo('copied')
+                link.type = tarfile.LNKTYPE
+                link.linkname = 'hardlink'
+                out.addfile(link)
+                sym = tarfile.TarInfo('alias')
+                sym.type = tarfile.SYMTYPE
+                sym.linkname = 'hardlink'
+                out.addfile(sym)
+                group_exec_only = tarfile.TarInfo('group-exec-only')
+                group_exec_only.size = 3
+                group_exec_only.mode = 0o010
+                out.addfile(group_exec_only, io.BytesIO(b'new'))
+            entries = module.extract_untrusted(archive, prefix)
+            self.assertTrue(module.warm_members_match(prefix, entries))
+            self.assertEqual((prefix / 'group-exec-only').stat().st_mode & 0o111, 0)
+            self.assertEqual(canary.read_bytes(), b'unchanged')
+            for name in ('symlink', 'hardlink', 'copied', 'alias'):
+                self.assertEqual((prefix / name).read_bytes(), b'new')
+            self.assertEqual((prefix / 'hardlink').stat().st_mode & 0o7777, 0o755)
+            self.assertEqual((prefix / 'hardlink').stat().st_ino, (prefix / 'copied').stat().st_ino)
+
+    def test_atomic_writer_does_not_truncate_fixed_temporary_hardlink(self):
+        import os
+        import tempfile
+        spec = importlib.util.spec_from_file_location('agent_cache_atomic_test', RESTORE)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            canary = base / 'canary'
+            canary.write_bytes(b'unchanged')
+            target = base / 'wrapper'
+            os.link(canary, base / 'wrapper.tmp')
+            module.write_atomic(target, b'replacement', 0o755)
+            self.assertEqual(canary.read_bytes(), b'unchanged')
+            self.assertEqual(target.read_bytes(), b'replacement')
+            self.assertEqual(target.stat().st_mode & 0o777, 0o755)
 
     def test_restore_self_test_reassembles_and_extracts_a_tag(self):
         result = subprocess.run(
@@ -138,7 +264,7 @@ class AgentToolchainCache(unittest.TestCase):
             with mock.patch.object(module, 'extraction_supported', return_value=False), \
                     mock.patch.object(module, 'materialise') as materialise, \
                     mock.patch.object(module, 'read_blob') as read_blob:
-                with self.assertRaisesRegex(RuntimeError, 'filter-capable Python'):
+                with self.assertRaisesRegex(RuntimeError, 'filter or confined POSIX operations'):
                     module.restore(repo, '', 'synthetic', Path(tmp) / 'prefix', None,
                                    skip_lock=True, only=None, no_shims=False,
                                    verify_only=False, force=False)

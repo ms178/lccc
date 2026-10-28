@@ -1071,6 +1071,7 @@ pub struct InitDeclarator {
 pub const CVR_CONST: u8 = 1 << 0;
 pub const CVR_VOLATILE: u8 = 1 << 1;
 pub const CVR_RESTRICT: u8 = 1 << 2;
+pub const CVR_ALL: u8 = CVR_CONST | CVR_VOLATILE | CVR_RESTRICT;
 
 /// `true` when the `const` bit is set in a CVR mask.
 pub fn cvr_is_const(cvr: u8) -> bool {
@@ -1449,8 +1450,9 @@ pub enum TypeSpecifier {
     /// typeof(expr) - GCC extension: type of an expression. The flag is true for
     /// `typeof_unqual`, which also drops the expression's named address space.
     Typeof(Box<Expr>, bool),
-    /// typeof(type-name) - GCC extension: type from a type name
-    TypeofType(Box<TypeSpecifier>),
+    /// `typeof(type-name)`: retain the type name's qualifiers independently
+    /// of any qualifiers surrounding the `typeof` specifier.
+    TypeofType(Box<TypeSpecifier>, TypeofTypeQualifiers),
     /// __auto_type - GCC extension: type inferred from initializer expression
     AutoType,
     /// C23 `nullptr_t`, produced by `typeof(nullptr)` round-trips.
@@ -1462,6 +1464,18 @@ pub enum TypeSpecifier {
     /// __attribute__((ext_vector_type(N))) applied directly in a type name.
     /// The second field is the logical lane count, not the padded byte size.
     ExtVector(Box<TypeSpecifier>, usize),
+}
+
+/// Qualifiers spelled inside a `typeof(type-name)` operand. `CType` erases
+/// qualifiers, so retaining these is necessary when this type is subsequently
+/// qualified or used as the base of another declarator. The pointer levels are
+/// in CType creation order (innermost first).
+#[derive(Debug, Clone, Default)]
+pub struct TypeofTypeQualifiers {
+    pub base_const: bool,
+    pub base_volatile: bool,
+    pub pointer_quals: Vec<u8>,
+    pub unqual: bool,
 }
 
 /// A field declaration in a struct/union.
@@ -1701,6 +1715,9 @@ pub struct CompoundLiteralStorage {
     pub is_register: bool,
     pub is_thread_local: bool,
     pub is_const: bool,
+    /// `const` before the first star, distinct from the literal's top-level
+    /// constness (`(const P *){0}` for a pointer typedef `P`).
+    pub base_const: bool,
     /// `const` bits of the literal's pointer levels (bit `L-1` is pointer level
     /// `L`), the same encoding as [`CastQualifiers::pointer_const_levels`].
     /// A compound literal is an lvalue, so `*((int *const *){0}) = 0` modifies
@@ -2011,7 +2028,7 @@ impl TypeSpecifier {
                 }
             }
             TypeSpecifier::Pointer(inner, _)
-            | TypeSpecifier::TypeofType(inner)
+            | TypeSpecifier::TypeofType(inner, _)
             | TypeSpecifier::Vector(inner, _)
             | TypeSpecifier::ExtVector(inner, _) => inner.for_each_expr(f),
             TypeSpecifier::Array(element, bound) => {

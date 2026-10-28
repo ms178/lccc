@@ -101,7 +101,7 @@ impl Lowerer {
     pub(super) fn typeof_operand(type_spec: &TypeSpecifier) -> Option<&Expr> {
         match type_spec {
             TypeSpecifier::Typeof(operand, _) => Some(operand),
-            TypeSpecifier::TypeofType(inner) => Self::typeof_operand(inner),
+            TypeSpecifier::TypeofType(inner, _) => Self::typeof_operand(inner),
             _ => None,
         }
     }

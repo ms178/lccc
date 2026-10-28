@@ -4320,16 +4320,11 @@ fn forward_slot_loads_cfg_range(
 //
 // # Volatile
 //
-// The i686 backend emits no volatile marker at the asm level, so no asm-level
-// pass can distinguish a volatile access. This fold turns two 4-byte reads of
-// the object into one 8-byte read, which changes the access pattern a signal-
-// or thread-racing observer could see. It does not make volatility LESS
-// observable than the status quo: the unfolded code already splits a volatile
-// `double` into two non-atomic 4-byte reads, so it can already observe a torn
-// value, and one 8-byte read is strictly closer to the single access the
-// standard wants. Making this precise needs a volatile marker in the backend's
-// asm output; that is filed in the FOLLOWUP document rather than papered over
-// here.
+// Volatile IR accesses are quarantined as opaque regions before this pass,
+// so their emitted reads and stores cannot be folded. The i686 emitter may
+// still split a wide volatile access into multiple machine operations; this
+// quarantine preserves that emitted sequence rather than proving it is a
+// single hardware access.
 /// Next line index that carries an instruction (nops and `-g` `.loc`
 /// markers are transparent; other directives are not).
 fn next_insn(infos: &[LineInfo], from: usize) -> usize {
@@ -14076,14 +14071,14 @@ fn else_hoist_diamonds(asm: String) -> String {
 
 /// Run peephole optimization on i686 assembly text.
 /// Returns the optimized assembly string.
-/// Reclassify every line between `#APP` and `#NO_APP` as
-/// [`LineKind::InlineAsm`] so no pass rewrites user-authored assembly.
-/// Ported from the x86-64 peephole, where the missing quarantine deleted a
-/// deliberate `movq %rax, %rax` length template inside a kernel
-/// ALTERNATIVE() block (objtool: "empty alternative entry").  The markers
-/// themselves stay classified as comments and pass through untouched.
+/// Treat inline assembly and emitted volatile accesses as opaque. The latter
+/// carry the IR's volatility across this text-level optimizer: forwarding a
+/// local's stack reload would otherwise delete an observable memory access.
+/// Keep the marker comments through the terminal text passes so they can
+/// reestablish the same quarantine after reclassification.
 fn pin_inline_asm_regions(store: &LineStore, infos: &mut [LineInfo]) {
     let mut in_asm = false;
+    let mut volatile_depth = 0usize;
     for i in 0..store.len() {
         let t = trimmed(store, &infos[i], i);
         if t == "#APP" {
@@ -14094,7 +14089,15 @@ fn pin_inline_asm_regions(store: &LineStore, infos: &mut [LineInfo]) {
             in_asm = false;
             continue;
         }
-        if in_asm {
+        if t == "# LCCC_VOLATILE_BEGIN" {
+            volatile_depth = volatile_depth.saturating_add(1);
+            continue;
+        }
+        if t == "# LCCC_VOLATILE_END" {
+            volatile_depth = volatile_depth.saturating_sub(1);
+            continue;
+        }
+        if in_asm || volatile_depth != 0 {
             infos[i] = LineInfo {
                 kind: LineKind::InlineAsm,
                 trim_start: infos[i].trim_start,
@@ -14129,7 +14132,7 @@ pub fn peephole_optimize(asm: String) -> String {
         let _ = std::fs::write(path, &asm);
     }
     if std::env::var_os("CCC_NO_I686_PEEPHOLE").is_some() {
-        return asm;
+        return crate::backend::peephole_common::strip_volatile_markers(asm);
     }
     let mut store = LineStore::new(asm);
     let line_count = store.len();
@@ -14374,7 +14377,8 @@ pub fn peephole_optimize(asm: String) -> String {
     // image measured ≈625 bytes of them across 24 functions.  Runs last so no
     // structured pass ever sees a planted `label + instruction` replacement.
     // Kill switch: CCC_NO_I686_EPILOGUE_MERGE.
-    merge_duplicate_epilogues_terminal(hoisted)
+    let optimized = merge_duplicate_epilogues_terminal(hoisted);
+    crate::backend::peephole_common::strip_volatile_markers(optimized)
 }
 
 // ── Pass: redundant zero-extension elimination (i686 redundant_ext port) ────
@@ -15584,6 +15588,21 @@ fn hide_debug_rows(store: &LineStore, infos: &mut [LineInfo]) -> Vec<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn volatile_regions_keep_repeated_stack_loads_and_stores() {
+        let asm = "f:\n.cfi_startproc\n    subl $8, %esp\n\
+                   # LCCC_VOLATILE_BEGIN\n    movl $1, 4(%esp)\n    # LCCC_VOLATILE_END\n\
+                   # LCCC_VOLATILE_BEGIN\n    movl $2, 4(%esp)\n    # LCCC_VOLATILE_END\n\
+                   # LCCC_VOLATILE_BEGIN\n    movl 4(%esp), %eax\n    # LCCC_VOLATILE_END\n\
+                   # LCCC_VOLATILE_BEGIN\n    movl 4(%esp), %eax\n    # LCCC_VOLATILE_END\n\
+                   addl $8, %esp\n    ret\n.cfi_endproc\n.size f, .-f\n";
+        let result = peephole_optimize(asm.to_string());
+        assert!(result.contains("movl $1, 4(%esp)"), "{result}");
+        assert!(result.contains("movl $2, 4(%esp)"), "{result}");
+        assert_eq!(result.matches("movl 4(%esp), %eax").count(), 2, "{result}");
+        assert!(!result.contains("LCCC_VOLATILE_"), "{result}");
+    }
 
     #[test]
     fn flag_use_classifies_eflags_effects() {

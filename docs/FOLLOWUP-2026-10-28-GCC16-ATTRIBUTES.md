@@ -47,8 +47,8 @@ unchanged during this session.
   2.47, and mold 3.0.0. Eight GiB of swap is active.
 * `cargo build --profile fastbuild -j 2`, `cargo fmt --check`, and
   `cargo clippy --profile fastbuild -j 2 -- -D warnings`: PASS.
-* Attribute gate: PASS (33 focused probes, two header probes at four
-  optimization levels, 83 pinned names). Diagnostic red team: PASS (999
+* Attribute gate: PASS (40 focused probes, two header probes at four
+  optimization levels, 83 pinned names). Diagnostic red team: PASS (1,191
   contracts against exact GCC 16.2.0).
   Operand, severity (39 verdicts), position (12 cases), warning-compatibility,
   and frontend-recovery gates: PASS. Census ratchet: PASS.
@@ -114,6 +114,47 @@ these results do not replace them. The local evidence is under
 `~/.cache/lccc/zlib-configure-test-v2` and is not a target-hardware timing
 measurement.
 
+## Real Expat source and pointer-typedef red team
+
+A manually configured upstream Expat 2.9.0 build exposed 16 false errors on
+`const XML_Parser` in `xmlparse.c`: `const` qualifies the aliased pointer, not
+its pointee. The same underlying model silently accepted writes to an aliased
+const middle pointer, and lowering selected the wrong `_Generic` arm for a
+const-qualified pointer-typedef field. The fix tracks the aliased pointer level
+across declarations, fields, casts, compound literals and return types and
+shares the corrected base-const interpretation between sema and lowering.
+GCC 16.2 differential diagnostics, negative controls, four LCCC target drivers
+and runtime `_Generic` checks cover both legal and illegal examples. A further
+bounded fix propagates const through `typeof` type names and expressions,
+including middle-pointer qualifiers and shadowed declarations. Qualifier
+support is still incomplete: `__builtin_types_compatible_p` loses qualifiers
+inside `typeof` (six wrong-result cases are tracked). Direct scalar `typeof`
+volatility is now propagated through sema and lowering, but dereferenced
+operands, volatile pointer objects and typedefs can still lose observable
+reads. The i686 peephole now preserves marked volatile operations, but
+RISC-V still deletes ordinary volatile local/parameter reads. Separately,
+reads of volatile fields in nonvolatile structs are now preserved. Reproducers
+and limits are in
+`engineering/evidence/typeof-qualifier-gaps-2026-10-28/`.
+
+A separate red team found that file- and block-scope `extern volatile` objects
+and pointees lost their qualifiers in lowering, silently deleting loads and
+stores; extern const-pointee metadata was also missing from `_Generic`. The
+extern declaration paths now use the same qualifier setup as definitions.
+GCC 16.2 assembly controls cover scalar, pointer, array, struct and TLS
+accesses, with a nonvolatile negative control. This extern repair does not
+by itself resolve the remaining `typeof` qualifier paths.
+
+With the identical manual configuration, upstream's 5,196-check suite passes
+against GCC-, Clang- and LCCC-compiled libraries; an LCCC-compiled upstream test
+runner also passes. On one aligned synthetic XML input the upstream benchmark's
+40-round paired LCCC/GCC CPU-time median ratio was 1.3161, with 95% bootstrap
+interval [1.3077, 1.3206] on this virtualized Xeon; LCCC was slower in that
+bounded experiment. Callgrind whole-process Ir and source, configuration,
+correctness and reproducibility details are in
+`engineering/evidence/expat-2.9.0-2026-10-28/`. This was not an upstream
+configure/CMake/CTest build or a physical target-hardware measurement.
+
 ## Retained ELF sections: infrastructure, not frontend completion
 
 The integrated assemblers previously discarded the `R` section flag on all
@@ -177,13 +218,17 @@ linker semantics. `C_INCLUDE_PATH` is not consumed by LCCC. Until those
 semantics can be implemented together, the driver now **rejects** GNU sysroot
 requests (including `/` and linker passthrough forms) rather than producing
 potentially host-contaminated output. The extractor's printed recipe now makes
-these limits explicit. Six contract tests cover four targets, three modes,
+these limits explicit. Seven contract tests cover four targets, three modes,
 joined `-isysrootDIR` and preprocessor/linker passthroughs, nested response
 files and cycles, option-like operands, root-dependent queries, and a GCC
 private-header control. GCC 16.2 accepts `-isysrootDIR` and
-`-Wp,-isysroot,DIR`; the prior safeguard still ignored both. The response-file
-expander now handles nested files with a bounded cycle guard, and the query
-scan skips other options' operands. This is a fail-closed compatibility gap,
+`-Wp,-isysroot,DIR`; the prior safeguard still ignored both. A further GCC
+comparison found that an empty quoted response-file operand was dropped:
+`-I "" --sysroot=DIR` then swallowed the sysroot as an include operand and
+silently exposed host headers. Empty quoted operands now survive expansion,
+so the pre-scan refuses that request while preserving option-like filenames.
+The response-file expander handles nested files with a bounded cycle guard,
+and the query scan skips other options' operands. This is a fail-closed compatibility gap,
 not completed GNU sysroot support; the
 standalone `lccc-ld` and the legacy overlay need their own isolation audit.
 

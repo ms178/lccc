@@ -77,6 +77,49 @@ class SysrootRefusal(unittest.TestCase):
                 self.assertIn('sysroot', run.stderr.lower())
                 self.assertIn('not supported', run.stderr.lower())
 
+    def test_empty_quoted_response_operands_cannot_hide_sysroots(self):
+        # GCC preserves empty arguments in @files. Before this regression was
+        # fixed, LCCC dropped the empty -I operand, swallowed --sysroot as the
+        # include directory, and successfully exposed the host stdint.h.
+        self.source.write_text('#include <stdint.h>\nint x;\n')
+        inner = self.root / 'root.rsp'
+        outer = self.root / 'empty-operand.rsp'
+        inner.write_text(f'--sysroot="{self.sysroot}" -E "{self.source}"\n')
+        for quote in ('""', "''"):
+            outer.write_text(f'-I {quote} @"{inner}"\n')
+            reference = self.run_cc(GCC, f'@{outer}')
+            self.assertNotEqual(reference.returncode, 0, reference.stdout)
+            self.assertIn('stdint.h', reference.stderr)
+            for target in ('lccc', 'lccc-i686', 'lccc-arm', 'lccc-riscv'):
+                for option in ('-I', '-o', '-isystem', '-iquote', '-include', '-L'):
+                    with self.subTest(quote=quote, target=target, option=option):
+                        outer.write_text(f'{option} {quote} @"{inner}"\n')
+                        run = self.run_cc(LCCC.parent / target, f'@{outer}')
+                        self.assertNotEqual(run.returncode, 0, run.stdout)
+                        self.assertIn('sysroot', run.stderr.lower())
+                        self.assertIn('not supported', run.stderr.lower())
+                        self.assertEqual(run.stdout, '')
+
+        # Empty arguments are meaningful even without a sysroot: a later query
+        # is not consumed by -I, and a sysroot-looking output filename is still
+        # an operand, not an unsupported sysroot option.
+        self.source.write_text('int x;\n')
+        for quote in ('""', "''"):
+            outer.write_text(f'-I {quote} -dumpmachine\n')
+            for cc in (GCC, LCCC):
+                with self.subTest(quote=quote, cc=cc, query=True):
+                    run = self.run_cc(cc, f'@{outer}')
+                    self.assertEqual(run.returncode, 0, run.stderr)
+                    self.assertTrue(run.stdout.strip())
+            outer.write_text(f'-I {quote} -E -o --sysroot=output "{self.source}"\n')
+            for cc in (GCC, LCCC):
+                with self.subTest(quote=quote, cc=cc, output=True):
+                    output = self.root / '--sysroot=output'
+                    output.unlink(missing_ok=True)
+                    run = self.run_cc(cc, f'@{outer}')
+                    self.assertEqual(run.returncode, 0, run.stderr)
+                    self.assertTrue(output.is_file())
+
     def test_missing_root_operand_is_diagnosed(self):
         for option in ('--sysroot', '-isysroot'):
             run = self.run_cc(LCCC, option)

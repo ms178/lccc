@@ -97,7 +97,7 @@ impl Parser {
                     }
                     spec = self.typedef_type_specs.get(name)?;
                 }
-                TypeSpecifier::TypeofType(inner) => spec = inner,
+                TypeSpecifier::TypeofType(inner, _) => spec = inner,
                 // Only the *existence* of a width matters here (the total is
                 // used to validate the element type); the object size and the
                 // 10-byte x87 lane stride are resolved by `ExtVectorLayout`.
@@ -411,6 +411,7 @@ impl Parser {
             }
             n += 1;
         }
+        st.base_const = const_before_star;
         if (stars == 0 && const_before_star) || (stars > 0 && const_after_last_star) {
             st.is_const = true;
         }

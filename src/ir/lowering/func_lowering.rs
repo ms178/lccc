@@ -766,6 +766,8 @@ impl Lowerer {
             orig_param.is_const,
             self,
         );
+        let base_volatile =
+            orig_param.is_volatile || self.scalar_typeof_is_volatile(&orig_param.type_spec);
         self.insert_local_scoped(
             name,
             LocalInfo {
@@ -793,7 +795,7 @@ impl Lowerer {
                 asm_register: None,
                 asm_register_has_init: false,
                 cleanup_fn: None,
-                base_type_volatile: orig_param.is_volatile,
+                base_type_volatile: base_volatile,
                 // Parameter declarators do not record the object qualifier yet.
                 object_volatile: false,
                 fptr_sig: None,
@@ -856,6 +858,8 @@ impl Lowerer {
             orig_param.is_const,
             self,
         );
+        let base_volatile =
+            orig_param.is_volatile || self.scalar_typeof_is_volatile(&orig_param.type_spec);
         self.insert_local_scoped(
             name,
             LocalInfo {
@@ -883,7 +887,7 @@ impl Lowerer {
                 asm_register: None,
                 asm_register_has_init: false,
                 cleanup_fn: None,
-                base_type_volatile: orig_param.is_volatile,
+                base_type_volatile: base_volatile,
                 // Parameter declarators do not record the object qualifier yet.
                 object_volatile: false,
                 fptr_sig: None,
@@ -947,6 +951,8 @@ impl Lowerer {
             orig_param.is_const,
             self,
         );
+        let base_volatile =
+            orig_param.is_volatile || self.scalar_typeof_is_volatile(&orig_param.type_spec);
         self.insert_local_scoped(
             name,
             LocalInfo {
@@ -974,7 +980,7 @@ impl Lowerer {
                 asm_register: None,
                 asm_register_has_init: false,
                 cleanup_fn: None,
-                base_type_volatile: orig_param.is_volatile,
+                base_type_volatile: base_volatile,
                 // Parameter declarators do not record the object qualifier yet.
                 object_volatile: false,
                 fptr_sig: None,
@@ -1049,6 +1055,8 @@ impl Lowerer {
             orig_param.is_const,
             self,
         );
+        let base_volatile =
+            orig_param.is_volatile || self.scalar_typeof_is_volatile(&orig_param.type_spec);
         self.func_mut().locals.insert(
             name,
             LocalInfo {
@@ -1076,7 +1084,7 @@ impl Lowerer {
                 asm_register: None,
                 asm_register_has_init: false,
                 cleanup_fn: None,
-                base_type_volatile: orig_param.is_volatile,
+                base_type_volatile: base_volatile,
                 // Parameter declarators do not record the object qualifier yet.
                 object_volatile: false,
                 fptr_sig: None,

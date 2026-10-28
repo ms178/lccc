@@ -101,11 +101,13 @@ impl Lowerer {
             self.typeof_vm_base(&decl.type_spec)
         };
 
+        // Resolve before any declarator can shadow the typeof operand.
+        let inherited_volatile = self.scalar_typeof_is_volatile(&decl.type_spec);
         for declarator in &decl.declarators {
             if declarator.name.is_empty() {
                 continue;
             }
-            if decl.is_extern() && self.lower_extern_decl(decl, declarator) {
+            if decl.is_extern() && self.lower_extern_decl(decl, declarator, inherited_volatile) {
                 continue;
             }
             if self.try_lower_block_func_decl(decl, declarator) {
@@ -129,13 +131,7 @@ impl Lowerer {
             }
 
             let mut da = self.analyze_declaration(type_spec, &declarator.derived);
-            da.base_type_volatile = decl.is_volatile();
-            da.base_type_const = crate::common::qualifiers::type_name_const_base(
-                &decl.type_spec,
-                decl.is_const(),
-                self,
-            );
-            da.object_volatile = declarator.attrs.object_volatile;
+            self.apply_declaration_qualifiers(&mut da, decl, declarator, inherited_volatile);
             da.apply_decl_vector_type(decl);
             self.fixup_unsized_array(&mut da, type_spec, &declarator.derived, &declarator.init);
 
@@ -259,7 +255,7 @@ impl Lowerer {
     ) -> &'a TypeSpecifier {
         if !matches!(
             &decl.type_spec,
-            TypeSpecifier::Typeof(..) | TypeSpecifier::TypeofType(_) | TypeSpecifier::AutoType
+            TypeSpecifier::Typeof(..) | TypeSpecifier::TypeofType(..) | TypeSpecifier::AutoType
         ) {
             return &decl.type_spec;
         }

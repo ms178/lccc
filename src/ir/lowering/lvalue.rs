@@ -5,6 +5,31 @@ use crate::frontend::parser::ast::{BinOp, Expr, TypeSpecifier, UnaryOp};
 use crate::ir::reexports::{Instruction, IrBinOp, IrConst, Operand, Value};
 
 impl Lowerer {
+    /// Resolve volatile inherited through a non-pointer `typeof` operand.
+    /// A volatile pointee does not make its pointer object volatile.
+    pub(super) fn scalar_typeof_is_volatile(&self, ts: &TypeSpecifier) -> bool {
+        let is_non_pointer_object = |ty: &CType| {
+            !matches!(
+                ty,
+                CType::Pointer(..) | CType::Array(..) | CType::Function(..)
+            )
+        };
+        match crate::common::qualifiers::base_specifier(ts) {
+            TypeSpecifier::Typeof(expr, false) => {
+                matches!(expr.as_ref(), Expr::Identifier(..))
+                    && self
+                        .get_expr_ctype(expr)
+                        .is_some_and(|ty| is_non_pointer_object(&ty))
+                    && self.expr_access_is_volatile(expr)
+            }
+            TypeSpecifier::TypeofType(inner, quals) if !quals.unqual => {
+                is_non_pointer_object(&self.type_spec_to_ctype(inner))
+                    && (quals.base_volatile || self.scalar_typeof_is_volatile(inner))
+            }
+            _ => false,
+        }
+    }
+
     /// [`lower_lvalue`] for a destination that will be STORED through
     /// (assignment LHS, ++/--, unary `&` on a lane): value-only vector
     /// subscript bases (call results, ternaries, commas, casts) are
