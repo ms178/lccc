@@ -410,6 +410,11 @@ impl WarningConfig {
             && (!self.inhibit_all || (self.default_errors.contains(&kind) && self.is_error(kind)))
     }
 
+    /// Whether `kind` came from an explicit positive flag.
+    pub fn is_explicitly_requested(&self, kind: WarningKind) -> bool {
+        self.explicit_enable.contains(&kind)
+    }
+
     /// Check if a warning of the given kind should be promoted to an error.
     pub fn is_error(&self, kind: WarningKind) -> bool {
         ((self.errors.contains(&kind) || self.default_errors.contains(&kind))
@@ -728,6 +733,14 @@ impl DiagnosticEngine {
     /// expensive analysis for that warning category.
     pub fn warning_enabled(&self, kind: WarningKind) -> bool {
         self.warning_config.is_enabled(kind)
+    }
+
+    /// Whether the user asked for this warning class with a positive
+    /// `-W<name>` or `-Werror=<name>` flag (not merely its default state).
+    /// Used by the attribute inventory: GCC-known-but-unimplemented
+    /// attributes diagnose only on an explicit `-Wattributes` request.
+    pub fn warning_explicitly_requested(&self, kind: WarningKind) -> bool {
+        self.warning_config.is_explicitly_requested(kind)
     }
 
     /// Set the source manager for span resolution and snippet display.

@@ -88,6 +88,7 @@ impl Parser {
     }
 
     pub(super) fn parse_external_decl(&mut self) -> Option<ExternalDecl> {
+        self.attrs.parsing_attr_targets.clear();
         // Reset all declaration-level flags before parsing the next declaration.
         self.attrs = ParsedDeclAttrs::default();
 
@@ -216,6 +217,10 @@ impl Parser {
 
         // Handle post-type storage class specifiers (C allows "struct S typedef name;")
         self.consume_post_type_qualifiers();
+        // Specifier-position applicability records are settled here, before
+        // the declarator (parameters, post-declarator attributes) can add
+        // unrelated entries to the pool.
+        let spec_attr_targets = std::mem::take(&mut self.attrs.parsing_attr_targets);
 
         let (name, derived, decl_mode, decl_common, decl_aligned, _) =
             self.parse_declarator_with_attrs();
@@ -285,6 +290,7 @@ impl Parser {
 
         // Build per-declarator attributes struct from the collected flags
         let mut decl_attrs = DeclAttributes::default();
+        decl_attrs.parsing_attr_targets = spec_attr_targets;
         decl_attrs.object_space = declarator_object_space;
         decl_attrs.object_volatile = declarator_object_volatile;
         decl_attrs.pointer_const = declarator_pointer_const;
@@ -403,9 +409,13 @@ impl Parser {
         name: Option<String>,
         derived: Vec<DerivedDeclarator>,
         start: crate::common::source::Span,
-        decl_attrs: DeclAttributes,
+        mut decl_attrs: DeclAttributes,
         alignment: Option<usize>,
     ) -> Option<ExternalDecl> {
+        // The specifier-position applicability records ride `decl_attrs`
+        // from the spec parse; the kind check takes them.
+        let recorded = std::mem::take(&mut decl_attrs.parsing_attr_targets);
+        self.check_attribute_targets(&type_spec, &derived, &recorded);
         self.attrs.set_typedef(false); // function defs are never typedefs
         let (params, variadic, has_prototype) =
             if let Some(DerivedDeclarator::Function(p, v, has_prototype)) = derived.last() {
@@ -827,6 +837,10 @@ impl Parser {
         start: crate::common::source::Span,
         mut ctx: DeclContext,
     ) -> Option<ExternalDecl> {
+        // Placement-checked specifier attributes resolve against the first
+        // declarator (the take also keeps records off later declarations).
+        let recorded = std::mem::take(&mut ctx.attrs.parsing_attr_targets);
+        self.check_attribute_targets(&type_spec, &derived, &recorded);
         let mut declarators = Vec::with_capacity(4);
         // Same snapshot rationale as parse_local_declaration: initializer
         // casts to segment-qualified pointers clear parsing_address_space
@@ -1124,6 +1138,10 @@ impl Parser {
     }
 
     pub(super) fn parse_local_declaration(&mut self) -> Option<Declaration> {
+        // Residue from contexts that never reach a declaration-kind check
+        // (parameter lists, abstract declarators) must not attribute to
+        // this declaration.
+        self.attrs.parsing_attr_targets.clear();
         let start = self.peek_span();
         // Selective reset: only storage-class/qualifier flags need clearing here.
         // GCC attribute flags (constructor, weak, etc.) may carry over from the
@@ -1149,6 +1167,10 @@ impl Parser {
         self.attrs.set_maybe_unused(false);
 
         self.consume_post_type_qualifiers();
+        // Specifier-position applicability records settle here (before the
+        // declarator's parameters or trailing attributes join the pool).
+        let mut spec_attr_targets_for_loop =
+            Some(std::mem::take(&mut self.attrs.parsing_attr_targets));
         // Specifier-level visibility / TLS model apply to every declarator;
         // a declarator's own attribute applies to it alone (same rule as the
         // file-scope path). Both are TAKEN so neither can leak into a later
@@ -1212,6 +1234,11 @@ impl Parser {
         let mut alignment: Option<usize> = None;
         loop {
             let (name, derived, decl_mode, _, decl_aligned, _) = self.parse_declarator_with_attrs();
+            // The specifier records check the first declarator once; later
+            // declarators of the statement inherit the same verdict.
+            let mut pending = spec_attr_targets_for_loop.take().unwrap_or_default();
+            let recorded = std::mem::take(&mut pending);
+            self.check_attribute_targets(&type_spec, &derived, &recorded);
             let l_object_space = self.attrs.declarator_object_space;
             let l_object_volatile = self.attrs.declarator_object_volatile;
             let l_pointer_const = self.attrs.parsing_pointer_const();
@@ -1792,7 +1819,7 @@ impl Parser {
                     }
                 }
                 TokenKind::Attribute => {
-                    let (_, aligned, _, _, _) = self.parse_gcc_attributes();
+                    let (_, aligned, _, _, _) = self.parse_gcc_attributes_spec();
                     if let Some(a) = aligned {
                         self.attrs.parsed_alignas =
                             Some(self.attrs.parsed_alignas.map_or(a, |prev| prev.max(a)));

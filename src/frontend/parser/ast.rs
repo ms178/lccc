@@ -787,6 +787,15 @@ pub struct DeclAttributes {
     /// qualifier, not the declarator's own). A typedef recorded with this flag
     /// qualifies each use of the name (see `Parser::typedef_base_volatile`).
     pub base_volatile: bool,
+    /// Attributes written at specifier position whose measured applicability
+    /// must be checked once the declaration's kind is known
+    /// (`int __attribute__((noreturn)) x;` -> `'noreturn' attribute ignored`).
+    /// Taken (and thereby cleared) by the declaration-kind check.
+    pub parsing_attr_targets: Vec<(
+        String,
+        crate::common::source::Span,
+        crate::frontend::parser::attribute_registry::AttributeTarget,
+    )>,
     /// __attribute__((alias("target"))) - this symbol is an alias for target
     pub alias_target: Option<String>,
     /// __attribute__((ifunc("resolver"))) / [[gnu::ifunc("resolver")]] - GNU indirect function
