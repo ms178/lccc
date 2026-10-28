@@ -241,6 +241,31 @@ def require_compressed_inputs_link_identically(
             not any(name.startswith(".zdebug") for name in sections),
             f"{tag} {form}: a legacy .zdebug name reached the output",
         )
+        if form == "zlib-gabi":
+            # The section payload is exactly one stream, not a stream plus
+            # arbitrary padding. BFD 2.47 rejects an appended NUL; make sure
+            # the decoder's bit lookahead cannot silently accept it again.
+            trailing = work / f"{tag}-zlib-trailing.o"
+            shutil.copyfile(compressed[0], trailing)
+            payload = elf64_sections(compressed[0])[".debug_info"][1] + b"\0"
+            raw = work / f"{tag}-zlib-trailing.bin"
+            raw.write_bytes(payload)
+            run([objcopy, "--update-section", f".debug_info={raw}", str(trailing)])
+            require(
+                elf64_sections(trailing)[".debug_info"][1] == payload,
+                f"{tag}: objcopy canonicalized the trailing-byte mutation",
+            )
+            rejected = subprocess.run(
+                [lccc, "-nostdlib", "-no-pie", "-Wl,-e,dwarf_entry", str(trailing),
+                 "-o", str(work / f"{tag}-zlib-trailing-must-fail")],
+                cwd=work, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+            )
+            require(
+                rejected.returncode != 0
+                and "trailing data after zlib stream" in rejected.stderr,
+                f"{tag}: trailing zlib byte was not rejected specifically:\n"
+                f"rc={rejected.returncode}\n{rejected.stdout}{rejected.stderr}",
+            )
     return forms
 
 

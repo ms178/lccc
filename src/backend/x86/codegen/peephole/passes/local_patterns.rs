@@ -15,7 +15,7 @@
 
 use super::super::types::*;
 use super::dead_writes::{frame_slot_stable_in_range, parse_frame_slot};
-use super::flag_peepholes::{FlagsEffect, flags_dead_after, flags_effect};
+use super::flag_peepholes::{FlagsEffect, flags_dead_after, flags_effect, walk_flag_consumers};
 use super::fp_liveness::FpLiveness;
 use super::helpers::{
     HIGH_BYTE_NAMES, get_dest_reg, has_implicit_reg_usage, implicit_read_reg_family,
@@ -8089,6 +8089,299 @@ pub(super) fn fold_copy_shift_copyback(store: &mut LineStore, infos: &mut [LineI
         i = k + 1;
     }
     changed
+}
+
+/// Fold `movl S,T; shrl $24,T; movsbl T.b,D` to `movl S,D; sarl $24,D`.
+///
+/// At this one width/count combination the low byte of the logical result has
+/// its sign bit at the original bit 31, so arithmetic shift and byte
+/// sign-extension produce the same 32-bit result.  This is NOT a general
+/// logical-shift/narrowing rule: another count can put a different bit in that
+/// position.  T must be dead after the extension because the rewrite no
+/// longer leaves the logical-shift product there.  SAR and SHR also differ in
+/// SF (and in flags that are architecturally undefined at this count), so the
+/// CFG-aware consumer walk must prove every flag difference unobservable;
+/// calls and returns use the same ABI-boundary model as the existing shift
+/// folds.  Debug attribution is transparent, labels and pinned lines are not.
+pub(super) fn fold_copy_logical_shift_signext(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+) -> bool {
+    let len = store.len();
+    let mut live_out = None;
+    let mut changed = false;
+    let mut i = 0;
+    while i < len {
+        if infos[i].is_nop() || infos[i].pinned || infos[i].is_barrier() {
+            i += 1;
+            continue;
+        }
+        let a = infos[i].trimmed(store.get(i));
+        let Some(a) = a.strip_prefix("movl ") else {
+            i += 1;
+            continue;
+        };
+        let Some((a_src, a_dst)) = a.split_once(',') else {
+            i += 1;
+            continue;
+        };
+        let gp32 = |text: &str| {
+            let text = text.trim();
+            let fam = register_family_fast(text);
+            (is_valid_gp_reg(fam) && REG_NAMES[1][fam as usize] == text).then_some(fam)
+        };
+        let (Some(src), Some(tmp)) = (gp32(a_src), gp32(a_dst)) else {
+            i += 1;
+            continue;
+        };
+
+        let j = next_non_debug(store, infos, i + 1, len);
+        if j >= len || infos[j].pinned || infos[j].is_barrier() {
+            i += 1;
+            continue;
+        }
+        let b = infos[j].trimmed(store.get(j));
+        let Some(b) = b.strip_prefix("shrl ") else {
+            i += 1;
+            continue;
+        };
+        let Some((count, b_dst)) = b.split_once(',') else {
+            i += 1;
+            continue;
+        };
+        if count.trim() != "$24" || gp32(b_dst) != Some(tmp) {
+            i += 1;
+            continue;
+        }
+
+        let k = next_non_debug(store, infos, j + 1, len);
+        if k >= len || infos[k].pinned || infos[k].is_barrier() {
+            i += 1;
+            continue;
+        }
+        let c = infos[k].trimmed(store.get(k));
+        let Some(c) = c.strip_prefix("movsbl ") else {
+            i += 1;
+            continue;
+        };
+        let Some((c_src, c_dst)) = c.split_once(',') else {
+            i += 1;
+            continue;
+        };
+        let Some(dst) = gp32(c_dst) else {
+            i += 1;
+            continue;
+        };
+        if c_src.trim() != REG_NAMES[3][tmp as usize]
+            || dst == tmp
+            || get_dest_reg(&infos[j]) != tmp
+            || get_dest_reg(&infos[k]) != dst
+            || !all_editable(infos, &[i, j, k])
+        {
+            i += 1;
+            continue;
+        }
+
+        let flags = walk_flag_consumers(store, infos, k + 1, 0);
+        if !flags.proved || flags.saw_consumer {
+            i += 1;
+            continue;
+        }
+        let live = live_out.get_or_insert_with(|| compute_gpr_live_out(store, infos));
+        if live[k] & (1u16 << tmp) != 0 {
+            i += 1;
+            continue;
+        }
+
+        replace_line(
+            store,
+            &mut infos[i],
+            i,
+            format!(
+                "    movl {}, {}",
+                REG_NAMES[1][src as usize], REG_NAMES[1][dst as usize]
+            ),
+        );
+        replace_line(
+            store,
+            &mut infos[j],
+            j,
+            format!("    sarl $24, {}", REG_NAMES[1][dst as usize]),
+        );
+        mark_nop(&mut infos[k]);
+        changed = true;
+        // Later candidates must not consume liveness computed for the old
+        // register-transfer functions.  Recompute lazily only if one occurs.
+        live_out = None;
+        i = k + 1;
+    }
+    changed
+}
+
+#[cfg(test)]
+mod copy_logical_shift_signext_tests {
+    use super::*;
+
+    fn run(asm: &str) -> String {
+        let mut store = LineStore::new(asm.to_string());
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        fold_copy_logical_shift_signext(&mut store, &mut infos);
+        (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn assert_kept(body: &str) {
+        let out = run(&format!(".cfi_startproc\n{body}.cfi_endproc\n"));
+        assert!(out.contains("shrl $24"), "{out}");
+        assert!(out.contains("movsbl"), "{out}");
+    }
+
+    #[test]
+    fn folds_before_a_call_and_across_debug_attribution() {
+        let out = run(concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movl %ebx, %r10d\n",
+            ".loc 1 1 1\n",
+            "    shrl $24, %r10d\n",
+            ".loc 1 2 1\n",
+            "    movsbl %r10b, %edi\n",
+            "    call bar\n",
+            "# LCCC_CALL_ARGS 1\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("movl %ebx, %edi"), "{out}");
+        assert!(out.contains("sarl $24, %edi"), "{out}");
+        assert!(!out.contains("shrl $24"), "{out}");
+        assert!(!out.contains("movsbl"), "{out}");
+    }
+
+    #[test]
+    fn folds_when_a_full_flag_writer_precedes_the_consumer() {
+        let out = run(concat!(
+            ".cfi_startproc\n",
+            "    movl %ebx, %r10d\n",
+            "    shrl $24, %r10d\n",
+            "    movsbl %r10b, %edi\n",
+            "    cmpl %eax, %ebx\n",
+            "    setl %al\n",
+            "    movl $0, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("sarl $24, %edi"), "{out}");
+        assert!(out.contains("setl %al"), "{out}");
+    }
+
+    #[test]
+    fn refuses_live_temp_and_every_flag_consumer_class() {
+        assert_kept(concat!(
+            "    movl %ebx, %r10d\n",
+            "    shrl $24, %r10d\n",
+            "    movsbl %r10b, %edi\n",
+            "    movl %r10d, %eax\n",
+            "    ret\n",
+        ));
+        for consumer in ["setl %al", "setc %al", "pushfq\n    popq %rax"] {
+            assert_kept(&format!(
+                "    movl %ebx, %r10d\n    shrl $24, %r10d\n    movsbl %r10b, %edi\n    {consumer}\n    movl $0, %eax\n    ret\n"
+            ));
+        }
+    }
+
+    #[test]
+    fn refuses_a_temp_read_as_a_call_argument() {
+        assert_kept(concat!(
+            "    movl %ebx, %r9d\n",
+            "    shrl $24, %r9d\n",
+            "    movsbl %r9b, %edi\n",
+            "    call bar\n",
+            "    ret\n",
+        ));
+    }
+
+    #[test]
+    fn refuses_wrong_count_extension_and_in_place_destination() {
+        for count in [0, 1, 23, 25, 32] {
+            let out = run(&format!(
+                ".cfi_startproc\n    movl %ebx, %r10d\n    shrl ${count}, %r10d\n    movsbl %r10b, %edi\n    ret\n.cfi_endproc\n"
+            ));
+            assert!(out.contains(&format!("shrl ${count}")), "{out}");
+            assert!(out.contains("movsbl"), "{out}");
+        }
+        let zero_extend = run(concat!(
+            ".cfi_startproc\n",
+            "    movl %ebx, %r10d\n",
+            "    shrl $24, %r10d\n",
+            "    movzbl %r10b, %edi\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(zero_extend.contains("shrl $24"), "{zero_extend}");
+        assert!(zero_extend.contains("movzbl"), "{zero_extend}");
+        assert_kept(concat!(
+            "    movl %ebx, %r10d\n",
+            "    shrl $24, %r10d\n",
+            "    movsbl %r10b, %r10d\n",
+            "    ret\n",
+        ));
+    }
+
+    #[test]
+    fn source_may_alias_the_final_destination_or_the_dead_temp() {
+        let destination = run(concat!(
+            ".cfi_startproc\n",
+            "    movl %ebx, %r10d\n",
+            "    shrl $24, %r10d\n",
+            "    movsbl %r10b, %ebx\n",
+            "    call bar\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(destination.contains("sarl $24, %ebx"), "{destination}");
+        let temporary = run(concat!(
+            ".cfi_startproc\n",
+            "    movl %r10d, %r10d\n",
+            "    shrl $24, %r10d\n",
+            "    movsbl %r10b, %edi\n",
+            "    call bar\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(temporary.contains("movl %r10d, %edi"), "{temporary}");
+        assert!(temporary.contains("sarl $24, %edi"), "{temporary}");
+    }
+
+    #[test]
+    fn every_pinned_participant_vetoes_the_whole_fold() {
+        for pinned in ["movl %ebx, %r10d", "shrl $24, %r10d", "movsbl %r10b, %edi"] {
+            let mut store = LineStore::new(
+                concat!(
+                    ".cfi_startproc\n",
+                    "    movl %ebx, %r10d\n",
+                    "    shrl $24, %r10d\n",
+                    "    movsbl %r10b, %edi\n",
+                    "    ret\n",
+                    ".cfi_endproc\n",
+                )
+                .to_string(),
+            );
+            let mut infos: Vec<LineInfo> = (0..store.len())
+                .map(|i| classify_line(store.get(i)))
+                .collect();
+            let at = (0..store.len())
+                .find(|&i| store.get(i).trim() == pinned)
+                .unwrap();
+            infos[at].pinned = true;
+            assert!(!fold_copy_logical_shift_signext(&mut store, &mut infos));
+        }
+    }
 }
 
 /// Fold a zero-extended 32-bit XOR move diamond:

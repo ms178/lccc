@@ -648,6 +648,8 @@ jobs:
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_fp_contract_parity.sh
     - name: Verify W2 load->cast fold structure and runtime
       run: bash tests/regression/check_load_cast_fold.sh
+    - name: Verify exact shift and byte sign-extension fold
+      run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_shift_signext_fold.sh
     - name: ext_vector_type by-value ABI under the AVX ABI level vs the Clang 23.1.4 oracle
       run: |
         set -o pipefail

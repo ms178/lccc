@@ -716,6 +716,23 @@ Corollaries, all enforced:
   (fold-still-fires) controls; `scripts/peephole_families.py`'s shiftchain
   `far_use` kind generates the shape at stress scale.
 
+### Exact-width shift/sign-extension folding
+
+`CCC_PEEPHOLE_SKIP=shift_signext` independently disables the fold from
+`movl S,T; shrl $24,T; movsbl T.b,D` to `movl S,D; sarl $24,D`.  The identity
+is specific to 32-bit shift count 24 and an 8-bit signed result: bit 31 is then
+exactly the sign bit of the logical result's low byte.  Other widths/counts
+must not be generalized into this rule.  The implementation requires T to be
+dead after the extension and uses the CFG-aware flag-consumer walk because
+SHR and SAR do not produce identical EFLAGS.  Calls/returns follow the same
+ABI-boundary model as the existing shift folds; pinned participants, live
+call arguments, in-place T/D, and unknown flag consumers refuse the rewrite.
+Direct assembler tests cover those refusals, source aliases, killed flags and
+debug-attribution adjacency.  `tests/regression/check_shift_signext_fold.sh`
+adds the optimized/skip structural controls, exact signed results for all 256
+high bytes through an external call, and GCC output parity from -O0 through
+-Os; the registered `load-cast-fold` gate runs both cast-fold harnesses.
+
 ### Performance-Critical Formatting
 
 `write_rbp_pattern` formats `N(%rbp)` strings directly into a stack buffer

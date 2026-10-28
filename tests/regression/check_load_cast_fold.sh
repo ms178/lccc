@@ -78,4 +78,8 @@ fi
 "$CCC" -O2 "$td/f.c" -o "$td/f.bin"
 "$td/f.bin" || { rc=$?; echo "runtime check failed with exit $rc" >&2; exit 1; }
 
+# Same registered cast-fold gate, separate focused harness: the shift+byte
+# sign-extension fold has its own skip control and GCC runtime comparison.
+CCC="$CCC" GCC="${GCC:-gcc-16}" bash "$(dirname "$0")/check_shift_signext_fold.sh"
+
 echo "OK load_cast_fold (2 folded sext loads, debug=2, unsigned control, runtime)"

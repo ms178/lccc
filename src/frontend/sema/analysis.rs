@@ -274,11 +274,12 @@ pub struct SemanticAnalyzer {
     /// `void *` is silent) while the constraint errors still fire, so the
     /// warning sites consult this. Measured on gcc-16.2.
     unevaluated_depth: Cell<u32>,
-    /// Whether the expression currently being analyzed is the direct operand
-    /// of `&`. `&*p` is the one use of a pointer to an incomplete type that
-    /// does not compute a value (C23 6.5.3.2p4), so gcc-16.2 accepts it while
-    /// `*p` -- even as a discarded statement -- is "invalid use of undefined
-    /// type 'T'" (measured).
+    /// One-shot marker for a dereference directly underneath `&`. `&*p` is
+    /// the one use of a pointer to an incomplete type that does not compute a
+    /// value (C23 6.5.3.2p4), so gcc-16.2 accepts it while `*p` -- even as a
+    /// discarded statement -- is "invalid use of undefined type 'T'". The
+    /// dereference consumes this before analyzing its own operand: the
+    /// exemption must not leak into nested expressions (measured).
     address_of_operand: Cell<bool>,
 }
 
@@ -3546,8 +3547,12 @@ impl SemanticAnalyzer {
                 }
             }
             Expr::Deref(inner, span) => {
+                // Only this dereference may inherit a direct `&*` exemption.
+                // Clear the one-shot marker while walking the operand so an
+                // unrelated nested `*q` remains subject to the value rules.
+                let address_of = self.address_of_operand.replace(false);
                 self.analyze_expr(inner);
-                self.check_indirection_operand(inner, *span);
+                self.check_indirection_operand(inner, *span, address_of);
             }
             Expr::Comma(lhs, rhs, _) => {
                 self.analyze_expr(lhs);
@@ -5084,7 +5089,7 @@ impl SemanticAnalyzer {
     /// `dereferencing 'void *' pointer`; the lvalue it yields has type `void`,
     /// which the value rules then judge (`void value not ignored as it ought to
     /// be` when used, `invalid use of void expression` when written to).
-    fn check_indirection_operand(&self, operand: &Expr, op_span: Span) {
+    fn check_indirection_operand(&self, operand: &Expr, op_span: Span, address_of: bool) {
         let Some(ty) = self.exact_operand_ctype(operand) else {
             return; // Type not exact enough to judge
         };
@@ -5106,7 +5111,7 @@ impl SemanticAnalyzer {
         if let Some(name) = self.incomplete_record_name(pointee_of(&ty)) {
             // `sizeof(*p)` and a `_Generic` selector replace the value rule
             // with their own incomplete-type diagnostic (measured).
-            if !self.address_of_operand.get() && !self.in_unevaluated_operand() {
+            if !address_of && !self.in_unevaluated_operand() {
                 self.diagnostics
                     .borrow_mut()
                     .error(format!("invalid use of undefined type '{name}'"), op_span);

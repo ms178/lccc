@@ -11,10 +11,13 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import inspect
+import io
 import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -65,29 +68,50 @@ def parse_manifest(text: str) -> dict[str, str]:
     return out
 
 
-def safe_extract(archive: Path, prefix: Path) -> None:
+def extractall_takes_filter() -> bool:
+    """Probe the implementation, not an incomplete Python-version list."""
+    try:
+        return 'filter' in inspect.signature(tarfile.TarFile.extractall).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def extract_untrusted(archive: Path, prefix: Path) -> None:
+    # The declared Python floor does not universally provide extraction
+    # filters.  Never turn an unsupported host into an unfiltered extraction.
+    if not hasattr(tarfile, 'data_filter') or not extractall_takes_filter():
+        raise RuntimeError('secure agent-cache extraction needs a filter-capable Python')
+    # Validate the COMPLETE archive before writing anything.  The old precheck
+    # inspected only member names (and lstrip('./') even hid leading slashes
+    # and traversal), then delegated links to GNU tar.  GNU tar rejected the
+    # tested escape only after creating the attacker-selected symlink.
+    # Python's data filter checks paths, link targets, devices and modes; the
+    # separate validation pass ensures a late bad member cannot leave a
+    # partially extracted unsafe archive behind.
     with tarfile.open(archive) as tar:
-        for member in tar.getmembers():
-            name = member.name.lstrip('./')
-            if not name or name.startswith('/') or '..' in Path(name).parts:
-                raise RuntimeError(f'unsafe tar member {member.name!r} in {archive.name}')
-    subprocess.run(['tar', '-xf', str(archive), '-C', str(prefix), '--no-same-owner'], check=True)
+        members = tar.getmembers()
+        for member in members:
+            tarfile.data_filter(member, str(prefix))
+        tar.extractall(prefix, members=members, filter='data')
+
+
+def wrapper_body(target: Path, lib_dirs: list[str]) -> str:
+    libs = ':'.join(str(p) for p in lib_dirs)
+    return f'''#!/bin/sh
+export LD_LIBRARY_PATH="{libs}${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"
+exec "{target}" "$@"
+'''
 
 
 def write_wrapper(path: Path, target: Path, lib_dirs: list[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    libs = ':'.join(str(p) for p in lib_dirs)
-    body = f'''#!/bin/sh
-export LD_LIBRARY_PATH="{libs}${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}"
-exec "{target}" "$@"
-'''
     tmp = path.with_suffix(path.suffix + '.tmp')
-    tmp.write_text(body)
+    tmp.write_text(wrapper_body(target, lib_dirs))
     tmp.chmod(0o755)
     tmp.replace(path)
 
 
-def build_env(prefix: Path, cache: dict, lib_dirs: list[str], shim_dir: Path) -> None:
+def env_body(prefix: Path, cache: dict, lib_dirs: list[str], shim_dir: Path) -> str:
     tools = cache['tools']
     by_name = {name: spec for name, spec in tools.items()}
     cc = shim_dir / 'gcc-16' if (shim_dir / 'gcc-16').exists() else ''
@@ -105,7 +129,89 @@ def build_env(prefix: Path, cache: dict, lib_dirs: list[str], shim_dir: Path) ->
                      ('MOLD', mold), ('LCCC_QEMU_PREFIX', prefix / tools.get('qemu', {}).get('root', 'qemu-user-11.1.2-x86_64'))):
         if val:
             lines.append(f'export {var}="{val}"')
-    (prefix / 'env.sh').write_text('\n'.join(lines) + '\n')
+    return '\n'.join(lines) + '\n'
+
+
+def build_env(prefix: Path, cache: dict, lib_dirs: list[str], shim_dir: Path) -> None:
+    (prefix / 'env.sh').write_text(env_body(prefix, cache, lib_dirs, shim_dir))
+
+
+def shim_inputs(prefix: Path, cache: dict, selected: set[str]) -> tuple[list[str], list[Path]]:
+    """Return library paths and priority-deduplicated executable targets."""
+    tools = cache['tools']
+    lib_dirs: list[str] = []
+    for name in cache.get('priority', list(tools)):
+        if name not in selected:
+            continue
+        root = prefix / tools[name]['root']
+        for candidate in (root / 'lib', root / 'lib64', root / 'usr/lib',
+                          root / 'usr/lib/x86_64-linux-gnu'):
+            if candidate.is_dir() and str(candidate) not in lib_dirs:
+                lib_dirs.append(str(candidate))
+    entries: list[Path] = []
+    seen: set[str] = set()
+    # Priority order keeps current Rust/Clang ahead of the MSRV floor.  The
+    # seen set is essential now that wrappers are repaired unconditionally:
+    # a later lower-priority target must not overwrite the first choice.
+    for name in cache.get('priority', list(tools)):
+        if name not in selected:
+            continue
+        root = prefix / tools[name]['root']
+        for candidate in (root / 'bin', root / 'usr/bin'):
+            if candidate.is_dir():
+                for entry in sorted(candidate.iterdir()):
+                    if entry.is_dir() or not (entry.stat().st_mode & 0o111):
+                        continue
+                    if entry.name not in seen:
+                        entries.append(entry)
+                        seen.add(entry.name)
+    return lib_dirs, entries
+
+
+def payload_complete(prefix: Path, cache: dict, selected: set[str], work: Path) -> bool:
+    """Cheap warm-receipt check: member types, links and regular-file sizes."""
+    for name in selected:
+        archive = work / cache['tools'][name]['file']
+        with tarfile.open(archive) as tar:
+            for member in tar.getmembers():
+                path = prefix / member.name
+                try:
+                    mode = path.lstat().st_mode
+                except OSError:
+                    return False
+                if member.isdir():
+                    if not stat.S_ISDIR(mode):
+                        return False
+                elif member.issym():
+                    if not stat.S_ISLNK(mode) or os.readlink(path) != member.linkname:
+                        return False
+                elif member.islnk():
+                    if not stat.S_ISREG(mode):
+                        return False
+                elif member.isfile():
+                    if not stat.S_ISREG(mode) or path.stat().st_size != member.size:
+                        return False
+    return True
+
+
+def shims_complete(prefix: Path, cache: dict, selected: set[str]) -> bool:
+    shim_dir = prefix / 'bin'
+    lib_dirs, entries = shim_inputs(prefix, cache, selected)
+    for entry in entries:
+        wrapper = shim_dir / entry.name
+        try:
+            if not wrapper.is_file() or not (wrapper.stat().st_mode & 0o111):
+                return False
+            if wrapper.read_text() != wrapper_body(entry, lib_dirs):
+                return False
+        except OSError:
+            return False
+    try:
+        return ((prefix / 'env.sh').is_file()
+                and (prefix / 'env.sh').read_text()
+                == env_body(prefix, cache, lib_dirs, shim_dir))
+    except OSError:
+        return False
 
 
 def restore(repo: Path, remote: str, tag: str, prefix: Path, lock_path: Path | None,
@@ -159,43 +265,34 @@ def restore(repo: Path, remote: str, tag: str, prefix: Path, lock_path: Path | N
         prefix = prefix.resolve()
         prefix.mkdir(parents=True, exist_ok=True)
         stamp = prefix / '.lccc-agent-cache'
-        stamp_value = f'{tag_sha} {digest(work / "CACHE.json")}\n'
+        # A partial --only restore is not a receipt for a later full restore.
+        # Include the exact selection so the old early-return cannot suppress
+        # every payload that was absent from the first invocation.
+        selection = ','.join(sorted(selected))
+        stamp_value = f'{tag_sha} {digest(work / "CACHE.json")} select={selection}\n'
         if stamp.is_file() and stamp.read_text() == stamp_value and not force:
-            print(f'agent cache already restored in {prefix}; use --force to redo')
-            return 0
+            complete = payload_complete(prefix, cache, selected, work)
+            if complete and not no_shims:
+                complete = shims_complete(prefix, cache, selected)
+            if complete:
+                print(f'agent cache already restored and verified in {prefix}; use --force to redo')
+                return 0
+            print(f'agent cache receipt incomplete in {prefix}; repairing')
         for name in sorted(selected, key=lambda n: cache.get('priority', []).index(n)
                            if n in cache.get('priority', []) else 999):
             spec = tools[name]
             archive = work / spec['file']
             print(f'extracting {name} {spec["version"]}: {spec["file"]}')
-            safe_extract(archive, prefix)
+            extract_untrusted(archive, prefix)
         shim_dir = prefix / 'bin'
-        lib_dirs: list[str] = []
         if not no_shims:
             shim_dir.mkdir(parents=True, exist_ok=True)
-            # Collect library paths first, so every wrapper can set them even
-            # when the caller has not sourced env.sh.
-            for name in cache.get('priority', list(tools)):
-                if name not in selected:
-                    continue
-                root = prefix / tools[name]['root']
-                for candidate in (root / 'lib', root / 'lib64', root / 'usr/lib',
-                                  root / 'usr/lib/x86_64-linux-gnu'):
-                    if candidate.is_dir() and str(candidate) not in lib_dirs:
-                        lib_dirs.append(str(candidate))
-            # Priority order keeps current Rust/Clang ahead of the MSRV floor.
-            for name in cache.get('priority', list(tools)):
-                if name not in selected:
-                    continue
-                root = prefix / tools[name]['root']
-                for candidate in (root / 'bin', root / 'usr/bin'):
-                    if candidate.is_dir():
-                        for entry in sorted(candidate.iterdir()):
-                            if entry.is_dir() or not (entry.stat().st_mode & 0o111):
-                                continue
-                            target = shim_dir / entry.name
-                            if not target.exists():
-                                write_wrapper(target, entry, lib_dirs)
+            lib_dirs, entries = shim_inputs(prefix, cache, selected)
+            for entry in entries:
+                # Always repair/rewrite the selected wrapper.  shim_inputs has
+                # already deduplicated names by priority, so this cannot let a
+                # lower-priority MSRV tool replace the current tool.
+                write_wrapper(shim_dir / entry.name, entry, lib_dirs)
             build_env(prefix, cache, lib_dirs, shim_dir)
             stamp.write_text(stamp_value)
             (prefix / 'README.txt').write_text(
@@ -260,14 +357,60 @@ def self_test() -> int:
         commit = run(['git', '-C', str(repo), 'commit-tree', tree_sha, '-m', 'self-test']).stdout.strip()
         run(['git', '-C', str(repo), 'tag', '-a', 'agent-selftest', commit, '-m', 'self-test'])
         prefix = base / 'prefix'
+        # A partial restore must not mint a receipt that suppresses a later
+        # full restore.  This ordering reproduced the original warm-cache bug.
+        rc = restore(repo, '', 'agent-selftest', prefix, None, skip_lock=True,
+                     only={'binutils'}, no_shims=False, verify_only=False, force=False)
+        if rc != 0 or (prefix / 'bin/gcc-16').exists() or not (prefix / 'bin/as').is_file():
+            raise AssertionError('partial agent-cache restore was not exact')
         rc = restore(repo, '', 'agent-selftest', prefix, None, skip_lock=True,
                      only=None, no_shims=False, verify_only=False, force=False)
         if rc != 0:
             return rc
-        if not (prefix / 'bin' / 'gcc-16').is_file() or not (prefix / 'bin' / 'as').is_file():
-            raise AssertionError('self-test did not create wrappers')
+        if not (prefix / 'bin/gcc-16').is_file() or not (prefix / 'bin/as').is_file():
+            raise AssertionError('full restore after --only did not create every wrapper')
         if 'LCCC_AGENT_CACHE_PREFIX' not in (prefix / 'env.sh').read_text():
             raise AssertionError('self-test did not write env.sh')
+
+        # A matching warm receipt must still notice deleted payload/shims and
+        # repair them rather than trusting the stamp alone.
+        (prefix / 'bin/as').unlink()
+        (prefix / 'gcc-16/bin/gcc-16').unlink()
+        restore(repo, '', 'agent-selftest', prefix, None, skip_lock=True,
+                only=None, no_shims=False, verify_only=False, force=False)
+        if not (prefix / 'bin/as').is_file() or not (prefix / 'gcc-16/bin/gcc-16').is_file():
+            raise AssertionError('warm restore did not repair deleted payload/shims')
+
+        # --force must replace a corrupt wrapper as well as the payload.  The
+        # old exists() guard left this sentinel untouched forever.
+        wrapper = prefix / 'bin/as'
+        wrapper.write_text('stale wrapper\n')
+        restore(repo, '', 'agent-selftest', prefix, None, skip_lock=True,
+                only=None, no_shims=False, verify_only=False, force=True)
+        if wrapper.read_text() == 'stale wrapper\n' or 'exec ' not in wrapper.read_text():
+            raise AssertionError('forced restore did not repair a stale wrapper')
+
+        # Validate all members before extraction: even the unsafe symlink must
+        # not be left behind when a later member tries to escape through it.
+        unsafe = base / 'unsafe.tar'
+        with tarfile.open(unsafe, 'w') as output:
+            link = tarfile.TarInfo('root/link')
+            link.type = tarfile.SYMTYPE
+            link.linkname = '../../outside'
+            output.addfile(link)
+            member = tarfile.TarInfo('root/link/escaped')
+            member.size = 1
+            output.addfile(member, io.BytesIO(b'x'))
+        destination = base / 'unsafe-destination'
+        destination.mkdir()
+        try:
+            extract_untrusted(unsafe, destination)
+        except tarfile.FilterError:
+            pass
+        else:
+            raise AssertionError('unsafe tar link was not rejected')
+        if (destination / 'root/link').exists() or (destination / 'root/link').is_symlink():
+            raise AssertionError('rejected archive was partially extracted')
         print('agent cache restore self-test: PASS')
         return 0
 

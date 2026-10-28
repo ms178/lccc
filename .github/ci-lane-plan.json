@@ -1097,6 +1097,10 @@
           "name": "Verify W2 load->cast fold structure and runtime"
         },
         {
+          "measured_s": 1.0,
+          "name": "Verify exact shift and byte sign-extension fold"
+        },
+        {
           "measured_s": 5.0,
           "name": "ext_vector_type by-value ABI under the AVX ABI level vs the Clang 23.1.4 oracle"
         },

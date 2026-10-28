@@ -470,6 +470,24 @@ operand_incomplete_arith.c:15:32: error: invalid use of undefined type 'struct S
 operand_incomplete_arith.c:15:28: error: arithmetic on pointer to an incomplete type
 EOF
 
+# Only the dereference directly underneath `&` is exempt. In particular, the
+# outer `&*` must not suppress an independent `*q` nested in its operand; the
+# following direct form remains valid in the same translation unit.
+cat > operand_address_of_nesting.c <<'C'
+struct S;
+void nested(struct S *p, struct S *q) {
+    &*((*q, p));
+}
+void direct(struct S *p) {
+    (void)&*p;
+}
+C
+for std in gnu90 gnu17 gnu23; do
+    expect_diags operand_address_of_nesting.c "$std" 1 <<'EOF'
+operand_address_of_nesting.c:3:9: error: invalid use of undefined type 'struct S'
+EOF
+done
+
 # --------------------------- `?:` with two distinct records: message parity --
 # gcc carets the `:`, which lccc's AST does not record (see the header).
 for std in gnu90 gnu17 gnu23; do

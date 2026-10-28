@@ -1,14 +1,28 @@
 """The GitHub-only agent cache must round-trip from a synthetic orphan tag."""
+import importlib.util
+from pathlib import Path
 import subprocess
 import sys
 import unittest
-from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 RESTORE = ROOT / 'scripts/restore_agent_toolchain_cache.py'
+BINUTILS = ROOT / 'scripts/ensure_binutils_247_binary.sh'
 
 
 class AgentToolchainCache(unittest.TestCase):
+    def test_untrusted_extract_fails_before_open_without_filter_support(self):
+        spec = importlib.util.spec_from_file_location('agent_cache_restore_test', RESTORE)
+        self.assertIsNotNone(spec)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with mock.patch.object(module, 'extractall_takes_filter', return_value=False), \
+                mock.patch.object(module.tarfile, 'open') as archive_open:
+            with self.assertRaisesRegex(RuntimeError, 'filter-capable Python'):
+                module.extract_untrusted(Path('not-opened.tar'), Path('not-created'))
+        archive_open.assert_not_called()
+
     def test_restore_self_test_reassembles_and_extracts_a_tag(self):
         result = subprocess.run(
             [sys.executable, str(RESTORE), '--self-test'],
@@ -19,7 +33,7 @@ class AgentToolchainCache(unittest.TestCase):
 
     def test_binutils_installer_self_test_passes(self):
         result = subprocess.run(
-            ['bash', str(ROOT / 'scripts/ensure_binutils_247_binary.sh'), '--self-test'],
+            ['bash', str(BINUTILS), '--self-test'],
             cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             timeout=120)
         self.assertEqual(result.returncode, 0, result.stdout)

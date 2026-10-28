@@ -374,6 +374,12 @@ gate "vex-flag-reads" fast \
 gate "load-cast-fold" fast \
     env CCC="$LCCC" bash tests/regression/check_load_cast_fold.sh
 
+# Fold only the exact dead-temporary shr/movsbl form. The skip arm keeps the
+# structural control honest, while all 256 high bytes times six low-bit
+# patterns check signed results against both the unfolded code and GCC 16.
+gate "shift-signext-fold" fast \
+    env CCC="$LCCC" GCC=gcc-16 bash tests/regression/check_shift_signext_fold.sh
+
 gate "generator-map" fast \
     env CCC="$LCCC" bash tests/regression/check_generator_map.sh
 

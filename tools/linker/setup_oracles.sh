@@ -162,6 +162,7 @@ oracle_require_version "$PREFIX/bfd-$BINUTILS_VER/bin/ld" "$BINUTILS_VER"
 
 # ── mold 3.0.0 (Rust build; upstream defaults, self-contained binary) ──────
 if [ -x "$PREFIX/mold-$MOLD_VER/bin/mold" ]; then
+    mold_build_receipt="existing binary; build features not re-probed"
     note "mold  : $("$PREFIX/mold-$MOLD_VER/bin/mold" --version) (restored from $ARTIFACTS)"
 else
     TARBALL="$SRC/mold-$MOLD_VER.tar.gz"
@@ -180,6 +181,7 @@ else
       strip "$PREFIX/mold-$MOLD_VER/bin/mold" 2>/dev/null || true )
     rm -rf "$MT"
     cache_prefix "mold-$MOLD_VER"
+    mold_build_receipt="cargo features $MOLD_FEATURES"
     note "mold  : $("$PREFIX/mold-$MOLD_VER/bin/mold" --version) (built, features $MOLD_FEATURES)"
 fi
 
@@ -259,7 +261,7 @@ done
 {
     printf '# %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ) setup_oracles.sh"
     printf 'ld      %s\n' "$("$PREFIX/bfd-$BINUTILS_VER/bin/ld" --version | head -1)"
-    printf 'mold    %s (cargo features %s)\n' "$("$PREFIX/mold-$MOLD_VER/bin/mold" --version)" "$MOLD_FEATURES"
+    printf 'mold    %s (%s)\n' "$("$PREFIX/mold-$MOLD_VER/bin/mold" --version)" "$mold_build_receipt"
     printf 'ld.lld  %s\n' "$lld_banner"
     if [ "$wild_enabled" = 1 ]; then
         printf 'wild    %s (rev %s)\n' "$("$WILD_BIN" --version 2>&1 | head -1)" \
