@@ -1145,7 +1145,8 @@ impl Preprocessor {
                 self.macros.undefine("__amd64");
                 self.macros.undefine("__LP64__");
                 self.macros.undefine("_LP64");
-                self.macros.undefine("__SIZEOF_INT128__");
+                // __SIZEOF_INT128__ stays defined (=16): __int128 is supported
+                // on i686 by GCC and lccc's backend supports it too.
                 // i686 baseline does not include SSE (GCC only enables SSE with
                 // -march=pentium4 or higher). Remove SSE macros to match GCC.
                 self.macros.undefine("__SSE__");
