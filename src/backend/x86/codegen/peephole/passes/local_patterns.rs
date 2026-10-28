@@ -8359,6 +8359,51 @@ mod copy_logical_shift_signext_tests {
     }
 
     #[test]
+    fn refuses_a_flag_consumer_reached_through_a_label() {
+        // The consumer walk must follow the CFG, not just the next line: a
+        // fall-through label is a position, and the `setc` behind it still
+        // observes the CF/SAR difference.
+        assert_kept(concat!(
+            "    movl %ebx, %r10d\n",
+            "    shrl $24, %r10d\n",
+            "    movsbl %r10b, %edi\n",
+            ".Lconsumer:\n",
+            "    setc %al\n",
+            "    ret\n",
+        ));
+    }
+
+    #[test]
+    fn folds_across_a_label_with_no_consumer() {
+        let out = run(concat!(
+            ".cfi_startproc\n",
+            "    movl %ebx, %r10d\n",
+            "    shrl $24, %r10d\n",
+            "    movsbl %r10b, %edi\n",
+            ".Ljoin:\n",
+            "    movl $0, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("sarl $24, %edi"), "{out}");
+        assert!(!out.contains("shrl $24"), "{out}");
+    }
+
+    #[test]
+    fn refuses_a_consumer_behind_a_taken_branch() {
+        // `jne` is itself a flag consumer, so this arm additionally proves the
+        // early refusal path rather than the reachability walk alone.
+        assert_kept(concat!(
+            "    movl %ebx, %r10d\n",
+            "    shrl $24, %r10d\n",
+            "    movsbl %r10b, %edi\n",
+            "    jne .Lout\n",
+            ".Lout:\n",
+            "    ret\n",
+        ));
+    }
+
+    #[test]
     fn every_pinned_participant_vetoes_the_whole_fold() {
         for pinned in ["movl %ebx, %r10d", "shrl $24, %r10d", "movsbl %r10b, %edi"] {
             let mut store = LineStore::new(
