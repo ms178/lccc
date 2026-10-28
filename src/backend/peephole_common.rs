@@ -20,6 +20,20 @@
 //! destination — a silent mis-rewrite. Stores (`str x0, [x1]`) put the
 //! stored register *before* the first comma; do not use dest-first there.
 
+/// Remove internal volatile-access comments after the last text-level pass.
+/// These must remain present while any pass reclassifies the assembly.
+pub(crate) fn strip_volatile_markers(asm: String) -> String {
+    if !asm.contains("# LCCC_VOLATILE_") {
+        return asm;
+    }
+    asm.split_inclusive('\n')
+        .filter(|line| {
+            let t = line.trim();
+            t != "# LCCC_VOLATILE_BEGIN" && t != "# LCCC_VOLATILE_END"
+        })
+        .collect()
+}
+
 // ── Word-boundary matching ───────────────────────────────────────────────────
 
 /// ASCII alphanumeric, `.`, or `_` — ELF symbols and GAS labels.

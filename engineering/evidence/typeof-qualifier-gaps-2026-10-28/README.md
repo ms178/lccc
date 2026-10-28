@@ -42,11 +42,20 @@ object used as the operand, and a typedef of `typeof(source)`. At `-O2`, GCC
 none. These are silent wrong-code cases, not optimization wins; scalar
 coverage is not complete qualified-`typeof` support.
 
-Cross-target inspection also found an independent backend defect in ordinary
-volatile locals and parameters, without any `typeof`:
-`target-local-volatile.c` emits no actual local reads on i686 or RISC-V at
-`-O2`, while x86-64 and AArch64 retain them. The scalar gate is an x86-64
-assembly gate and does not establish volatile-local correctness elsewhere.
+Cross-target inspection also found independent backend defects in ordinary
+volatile locals and parameters, without any `typeof`. The i686 text peephole
+now quarantines IR-marked volatile accesses; the i686 gate checks scalar,
+byte, wide and indirect accesses plus a nonvolatile control at five levels.
+Its wide access still splits into multiple machine operations, unlike GCC
+16.2's single 64-bit load; preserving that sequence is not a claim of exact
+wide-access parity. RISC-V still deletes ordinary local/parameter reads in
+`target-local-volatile.c` at `-O2`; x86-64 and AArch64 retain them.
+
+Another independent frontend/lowering gap is a discarded read of a volatile
+field of a nonvolatile local struct: GCC 16.2 retains both reads for
+`struct S { volatile int x; }; void f(void) { struct S s = {9}; s.x; s.x; }`,
+while current LCCC deletes them on x86-64. Existing member tests cover stores
+and reads through volatile base objects, not this field-only read.
 
 A separate loss of qualifiers on ordinary file- and block-scope `extern`
 declarations has also been repaired. The volatile-access gate checks extern

@@ -739,7 +739,7 @@ impl Target {
                 // i686 peepholes could not be ruled out when triaging a
                 // miscompile (the flag silently did nothing on -m32).
                 let optimized = if std::env::var_os("LCCC_NO_PEEPHOLE").is_some() {
-                    raw
+                    peephole_common::strip_volatile_markers(raw)
                 } else {
                     i686::codegen::peephole::peephole_optimize(raw)
                 };

@@ -245,4 +245,13 @@ if ! python3 "$(dirname "$0")/check_typeof_scalar_volatile.py" --compiler "$CCC"
     rc=1
 fi
 
+i686_cc=${I686_CCC:-"$(dirname "$CCC")/lccc-i686"}
+if [[ -x "$i686_cc" ]]; then
+    if ! python3 "$(dirname "$0")/check_i686_volatile_access.py" --compiler "$i686_cc"; then
+        rc=1
+    fi
+else
+    echo "SKIP: i686 volatile codegen ($i686_cc not built)"
+fi
+
 exit $rc

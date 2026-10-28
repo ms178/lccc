@@ -131,8 +131,9 @@ support is still incomplete: `__builtin_types_compatible_p` loses qualifiers
 inside `typeof` (six wrong-result cases are tracked). Direct scalar `typeof`
 volatility is now propagated through sema and lowering, but dereferenced
 operands, volatile pointer objects and typedefs can still lose observable
-reads. Independent code generation defects also delete ordinary volatile
-local/parameter reads on i686 and RISC-V. Reproducers and limits are in
+reads. The i686 peephole now preserves marked volatile operations, but
+RISC-V still deletes ordinary volatile local/parameter reads. Reads of a
+volatile field in a nonvolatile local struct are also lost. Reproducers and limits are in
 `engineering/evidence/typeof-qualifier-gaps-2026-10-28/`.
 
 A separate red team found that file- and block-scope `extern volatile` objects

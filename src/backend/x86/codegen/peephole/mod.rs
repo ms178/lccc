@@ -52,15 +52,7 @@ pub(crate) fn lower_tls_call_markers(asm: String) -> String {
 /// hatch's output marker-free too, so the bisection tool does not change what
 /// the assembler or an asm-diff sees.
 pub(crate) fn strip_volatile_markers(asm: String) -> String {
-    if !asm.contains("# LCCC_VOLATILE_") {
-        return asm;
-    }
-    asm.split_inclusive('\n')
-        .filter(|line| {
-            let t = line.trim();
-            t != "# LCCC_VOLATILE_BEGIN" && t != "# LCCC_VOLATILE_END"
-        })
-        .collect()
+    crate::backend::peephole_common::strip_volatile_markers(asm)
 }
 
 #[cfg(test)]
