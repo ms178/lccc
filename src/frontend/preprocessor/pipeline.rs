@@ -1134,6 +1134,13 @@ impl Preprocessor {
         self.macros.undefine(name);
     }
 
+    /// Drop only the implicit compiler and system search directories.
+    /// Explicit -I/-iquote/-isystem/-idirafter paths remain available.
+    pub fn clear_default_include_paths(&mut self) {
+        self.system_include_paths.clear();
+        self.include_resolve_cache.clear();
+    }
+
     /// Add an include search path for #include directives (-I flag).
     /// Adds regardless of whether the directory currently exists.
     pub fn add_include_path(&mut self, path: &str) {
