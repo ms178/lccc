@@ -58,6 +58,13 @@ class AcceptsEveryLegalLowering(unittest.TestCase):
         body = "\trorxq $3, %r11, %r11\n\tmovslq %r11d, %r9\n"
         self.assertTrue(narrows_after_divide(body, 3))
 
+    def test_a_memory_destination_divide_still_counts(self):
+        # The gates predate this module and accepted any destination form; a
+        # strictly line-shaped pattern would have started rejecting the spilling
+        # form (`shrl $2, -4(%rbp)`) that the reduction kernels emit.
+        self.assertTrue(divides_byte_iv("\tshrl $2, -4(%rbp)\n", 2))
+        self.assertTrue(divides_byte_iv("\tshrq $3, 8(%rsp)\n", 3, require_64bit=True))
+
     def test_narrow_leniency_is_still_available_where_gates_need_it(self):
         # The remainder gate predates the 64-bit requirement and passes
         # require_64bit=False; a 32-bit spelling must keep satisfying it.

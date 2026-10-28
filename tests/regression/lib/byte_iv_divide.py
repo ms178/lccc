@@ -60,7 +60,10 @@ _DIVIDE = (
     r"|(?P<rorx>rorxq)[ \t]+\$(?P<rorx_amt>\d+),[ \t]*(?P<rorx_src>%[a-z0-9]+),"
     r"[ \t]*(?P<rorx_dst>%[a-z0-9]+))"
 )
-_DIVIDE_RE = re.compile(rf"(?m)^[ \t]*{_DIVIDE}[ \t]*$")
+# The plain-divide pattern is deliberately NOT anchored at the end of the line:
+# a divide can name a memory destination (`shrl $2, -4(%rbp)`), which the
+# original gates accepted and a strictly-shaped line would have rejected.
+_DIVIDE_RE = re.compile(rf"(?m)^[ \t]*{_DIVIDE}")
 _NARROW_RE = re.compile(rf"(?m)^[ \t]*{_DIVIDE}\n[ \t]*movslq[ \t]+%(?P<narrow>[a-z0-9]+),")
 
 
