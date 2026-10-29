@@ -1,9 +1,9 @@
 /*
  * Conditional-store statement form (PR #455 port with audit fixes) — gate.
  *
- * The rewrite turns `L=load p[i]; if (c1 && c2) store f(L) to p[i]` into a
- * nested-Select map shape against the dominating same-address load.  This
- * file pins:
+ * A guarded same-address store may become a nested-Select map only when its
+ * destination is proven private and the extra write is unobservable. Pointer
+ * parameters must retain their conditional stores. This file pins:
  *   (a) the statement-form casefold — must vectorize or run scalar, but be
  *       byte-exact either way, for every trip count;
  *   (b) the audit's MISCOMPILE repro: load `p[4-i]`, store `p[i-4]` — the
@@ -13,9 +13,8 @@
  *       decline is fine, wrong code is not;
  *   (d) a volatile stream — never rewritten.
  *   (e) the IN-PLACE statement form (`c = p[i]; if (c1 && c2) p[i] = f(c)`)
- *       — the same-address load dominates the guarded store, so the
- *       rewrite applies and the loop must vectorize or run scalar,
- *       byte-exact either way, for every trip count.
+ *       — a dominating load alone does not prove that the parameter is
+ *       writable or private; preserve skipped stores and exact values.
  *   (f) the in-place single-compare dword form (the map parser's dword
  *       conditional path).
  *

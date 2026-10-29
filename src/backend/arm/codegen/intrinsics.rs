@@ -1086,21 +1086,6 @@ impl ArmCodegen {
                 }
             }
 
-            // Not-yet-implemented register-based vector intrinsics for ARM.
-            IntrinsicOp::VecLoadF64x4
-            | IntrinsicOp::VecLoadI32x8
-            | IntrinsicOp::VecAddF64x4
-            | IntrinsicOp::VecMulF64x4
-            | IntrinsicOp::VecAddI32x8
-            | IntrinsicOp::VecHorizontalAddF64x4
-            | IntrinsicOp::VecHorizontalAddI32x8
-            | IntrinsicOp::VecZeroF64x4
-            | IntrinsicOp::VecZeroI32x8 => {
-                // Same invariant as the 256-bit arm below: an x86-shaped
-                // 4-wide/AVX op must not reach AArch64 at all.  Trap loudly
-                // instead of raising a compiler ICE.
-                self.emit_unreachable();
-            }
             // Long-double / _Float128 sign-bit intrinsics. AArch64 long
             // double is IEEE binary128: sign bit 127 = bit 63 of the HIGH
             // qword (unlike x87 80-bit, where x86 patches byte 9). Pure GPR
@@ -1194,13 +1179,38 @@ impl ArmCodegen {
                 }
             }
 
-            // Any vector intrinsic that reaches here has no NEON lowering.
-            // Dropping it silently would emit a read of an uninitialized
-            // vector register (observed: VecLoadI64x2 lowered to nothing and
-            // the reduction accumulated garbage). Fail the compilation loudly
-            // instead — a frontend gate that leaks an x86-shaped op to ARM is
-            // a bug we want to see, not paper over.
-            IntrinsicOp::VecAddF32x8
+            _ if unsupported_arm_vector_intrinsic(op) => self.emit_unreachable(),
+            _ => { /* x86-only scalar/SSE-builtin op on arm: no-op */ }
+        }
+    }
+
+    // ---- F128 (long double / IEEE quad precision) soft-float helpers ----
+    //
+    // On AArch64, long double is IEEE 754 binary128 (16 bytes).
+    // Hardware has no quad-precision FP ops, so we use compiler-rt/libgcc soft-float:
+    //   Comparison: __eqtf2, __lttf2, __letf2, __gttf2, __getf2
+    //   Arithmetic: __addtf3, __subtf3, __multf3, __divtf3
+    //   Conversion: __extenddftf2 (f64->f128), __trunctfdf2 (f128->f64)
+    // ABI: f128 passed/returned in Q registers (q0, q1). Int result in w0/x0.
+}
+
+/// These register-form vector operations have no AArch64 lowering.  The
+/// vectorizer must gate them by target; if one reaches the backend, emit a
+/// trap instead of silently using an uninitialized vector value.
+fn unsupported_arm_vector_intrinsic(op: &IntrinsicOp) -> bool {
+    matches!(
+        op,
+        IntrinsicOp::VecLoadF64x4
+            | IntrinsicOp::VecLoadI32x8
+            | IntrinsicOp::VecLoadStrided2I32x8
+            | IntrinsicOp::VecAddF64x4
+            | IntrinsicOp::VecMulF64x4
+            | IntrinsicOp::VecAddI32x8
+            | IntrinsicOp::VecHorizontalAddF64x4
+            | IntrinsicOp::VecHorizontalAddI32x8
+            | IntrinsicOp::VecZeroF64x4
+            | IntrinsicOp::VecZeroI32x8
+            | IntrinsicOp::VecAddF32x8
             | IntrinsicOp::VecBroadcastF32x8
             | IntrinsicOp::VecBroadcastF64x4
             | IntrinsicOp::VecBroadcastI32x8
@@ -1229,27 +1239,8 @@ impl ArmCodegen {
             | IntrinsicOp::VecWidenMaskedAddI32x4ToI64x4
             | IntrinsicOp::VecWidenAddValueI32x4ToI64x2
             | IntrinsicOp::VecWidenMaskedAddValueI32x4ToI64x2
-            | IntrinsicOp::VecMaskedAddValueI32x4 => {
-                // An x86-shaped 256-bit op reached the AArch64 emitter: the
-                // vectorizer's target gate is the invariant that prevents this,
-                // and `unimplemented!` used to turn that invariant into a
-                // compiler ICE.  Emit the target's trap instead -- the program
-                // fails loudly at the instruction, and a backend bug no longer
-                // aborts the compiler.
-                self.emit_unreachable();
-            }
-            _ => { /* x86-only scalar/SSE-builtin op on arm: no-op */ }
-        }
-    }
-
-    // ---- F128 (long double / IEEE quad precision) soft-float helpers ----
-    //
-    // On AArch64, long double is IEEE 754 binary128 (16 bytes).
-    // Hardware has no quad-precision FP ops, so we use compiler-rt/libgcc soft-float:
-    //   Comparison: __eqtf2, __lttf2, __letf2, __gttf2, __getf2
-    //   Arithmetic: __addtf3, __subtf3, __multf3, __divtf3
-    //   Conversion: __extenddftf2 (f64->f128), __trunctfdf2 (f128->f64)
-    // ABI: f128 passed/returned in Q registers (q0, q1). Int result in w0/x0.
+            | IntrinsicOp::VecMaskedAddValueI32x4
+    )
 }
 
 /// AArch64 PRFM operation for an `IntrinsicOp::Prefetch` payload: GCC's
@@ -1287,8 +1278,28 @@ fn emit_load_stack_guard_arm(cg: &mut ArmCodegen, dest: &Option<Value>) {
 
 #[cfg(test)]
 mod prefetch_prfop_tests {
-    use super::prefetch_prfop;
-    use crate::ir::reexports::PrefetchHint;
+    use super::{prefetch_prfop, unsupported_arm_vector_intrinsic};
+    use crate::ir::reexports::{IntrinsicOp, PrefetchHint};
+
+    #[test]
+    fn x86_only_vector_forms_are_not_silent_aarch64_operations() {
+        for op in [
+            IntrinsicOp::VecLoadStrided2I32x8,
+            IntrinsicOp::VecLoadI32x8,
+            IntrinsicOp::VecMulF64x4,
+            IntrinsicOp::VecStoreI32x8,
+            IntrinsicOp::VecWidenMaskedAddValueI32x4ToI64x2,
+        ] {
+            assert!(unsupported_arm_vector_intrinsic(&op));
+        }
+        for op in [
+            IntrinsicOp::VecLoadI32x4,
+            IntrinsicOp::VecAddI32x4,
+            IntrinsicOp::Prefetch(0),
+        ] {
+            assert!(!unsupported_arm_vector_intrinsic(&op));
+        }
+    }
 
     /// GCC 16 / aarch64-linux-gnu-gcc 14, measured for all eight forms.
     #[test]

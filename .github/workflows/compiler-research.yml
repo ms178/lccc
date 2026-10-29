@@ -8,6 +8,9 @@ on:
       - 'src/passes/vec_ssa.rs'
       - 'src/passes/slp_vectorizer.rs'
       - 'src/passes/vectorize.rs'
+      - 'src/passes/byte_load.rs'
+      - 'src/passes/join_store_forward.rs'
+      - 'src/backend/global_alignment.rs'
       - 'src/backend/x86/codegen/peephole/passes/self_zext.rs'
       - 'scripts/publish_cpu_runtime_evidence.py'
       - 'include/emmintrin.h'
@@ -77,19 +80,22 @@ jobs:
           path: ${{ runner.temp }}/toolchain-cache/toolchain-cache.json
           if-no-files-found: error
   evidence:
-    # Opt-in research: manual, or a PR explicitly changing this definition.
+    # Opt-in research: manual, or a PR touching watched compiler/research inputs.
     name: Same-host portable/native runtime and Callgrind
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    # Twenty workloads times two profiles, then four same-compiler controls and
+    # two Callgrind sweeps. The measurements are strictly correctness-gated,
+    # so the budget must cover the full selection instead of truncating it.
+    timeout-minutes: 150
     env:
       RUSTUP_TOOLCHAIN: stable
       CARGO_BUILD_JOBS: "2"
       RUSTFLAGS: -D warnings
       BASELINE_REF: ${{ inputs.baseline_ref || github.event.pull_request.base.sha || 'main' }}
-      # Cover the P-core and E-core outliers independently identified by the
-      # hybrid report, including workloads outside the ordinary CI shards.
-      # A dispatch can still select any registry subset or the whole corpus.
-      RESEARCH_CASES: ${{ inputs.cases || (github.event_name == 'pull_request' && 'zlib_ng_slide_hash,linux_list_sort,sqlite_vdbe_serial,byte_load_reassembly,f32_sse1_map,fp32_product_map,fp64_product_map,zlib_ng_compare256,arith_loop,sqlite_varint,hot_web_loop,sha256_transform' || 'nbody,hot_web_loop,byte_load_reassembly,expat_siphash24,double_reduction,spectral_norm,matmul,binary_trees,expat_xml_scan,zstd_count,f32_sse1_map,fp32_product_map,fp64_product_map') }}
+      # Cover P-core and E-core outliers independently identified by the
+      # hybrid report, including long-running branch, allocator and string
+      # workloads. A dispatch can select any registry subset or the corpus.
+      RESEARCH_CASES: ${{ inputs.cases || (github.event_name == 'pull_request' && 'zlib_ng_slide_hash,linux_list_sort,sqlite_vdbe_serial,byte_load_reassembly,f32_sse1_map,fp32_product_map,fp64_product_map,zlib_ng_compare256,arith_loop,sqlite_varint,hot_web_loop,sha256_transform,glibc_strstr,binary_trees,expat_xml_scan,strlen_bench,loop_patterns,mandelbrot,aarch64_select_patterns,qsort' || 'nbody,hot_web_loop,byte_load_reassembly,expat_siphash24,double_reduction,spectral_norm,matmul,binary_trees,expat_xml_scan,zstd_count,f32_sse1_map,fp32_product_map,fp64_product_map') }}
       RESEARCH_ROUNDS: ${{ inputs.rounds || (github.event_name == 'pull_request' && '9' || '31') }}
     steps:
       - uses: actions/checkout@v7
@@ -177,8 +183,41 @@ jobs:
           PYTYPES
           python3 scripts/ci_test_report.py -- \
             python3 tests/regression/check_public_simd_abi.py --gcc gcc-16
+      - name: Early native floating-point comparison control
+        if: ${{ contains(env.RESEARCH_CASES, 'mandelbrot') || env.RESEARCH_CASES == 'all' }}
+        timeout-minutes: 8
+        shell: bash
+        run: |
+          set -euo pipefail
+          out=results/research/fp-early
+          mkdir -p "$out"
+          # Keep the default-contract outcome, including mismatches. The full
+          # paired run below remains the authoritative strict gate.
+          if python3 tests/benchmark/run_benchmarks.py \
+              --lccc target/fastbuild/lccc --compilers lccc,gcc,clang,icx \
+              --gcc gcc-16 --clang "$CLANG" --icx "$ICX" \
+              --candidate "before=$RUNNER_TEMP/research-main-target/fastbuild/lccc" \
+              --opt=-O2 --cflag=-std=gnu17 --cflag=-march=native \
+              --only mandelbrot --cpu auto --skip-perf --no-pmu-probe --strict \
+              --artifact-dir "$out/default-artifacts" --json "$out/default.json" \
+              > "$out/default.log" 2>&1; then
+            echo 0 > "$out/default.exit"
+          else
+            echo "$?" > "$out/default.exit"
+          fi
+          test -s "$out/default.json"
+          # Diagnostic only: a control that reproduces a vendor-only difference
+          # must not abort the timing runs that follow. The paired strict gate
+          # below remains authoritative for correctness.
+          python3 scripts/diagnose_cpu_fp_mismatch.py \
+            --report "$out/default.json" --original-artifacts "$out/default-artifacts" \
+            --out "$out/contract-off" \
+            --lccc target/fastbuild/lccc --gcc gcc-16 --clang "$CLANG" --icx "$ICX" \
+            --candidate "before=$RUNNER_TEMP/research-main-target/fastbuild/lccc" \
+            || echo "pre-timing diagnostic recorded a mismatch control; the paired gate below decides"
       - name: Same-host before/after/vendor portable and native comparisons
-        timeout-minutes: 45
+        id: paired_runtime
+        timeout-minutes: 75
         shell: bash
         run: |
           set -euo pipefail
@@ -211,11 +250,78 @@ jobs:
               --json "results/research/$profile.json" \
               --markdown "results/research/$profile.md"
           done
+      - name: Diagnose native floating-point output differences
+        if: ${{ failure() && steps.paired_runtime.outcome == 'failure' }}
+        timeout-minutes: 8
+        run: |
+          python3 scripts/diagnose_cpu_fp_mismatch.py \
+            --report results/research/native.json \
+            --original-artifacts results/research/native-artifacts \
+            --out results/research/fp-mismatch-control \
+            --lccc target/fastbuild/lccc --gcc gcc-16 --clang "$CLANG" --icx "$ICX" \
+            --candidate "before=$RUNNER_TEMP/research-main-target/fastbuild/lccc" \
+            --candidate "rolled=$GITHUB_WORKSPACE/results/research/rolled-compiler"
       - name: Publish CPU-specific paired results through the checks API
         if: always()
-        run: python3 scripts/publish_cpu_runtime_evidence.py results/research
+        run: python3 scripts/publish_cpu_runtime_evidence.py results/research --expected-cases "$RESEARCH_CASES" --expected-compilers lccc,before,gcc,clang,icx,rolled
+      - name: Same-compiler list-merge join-forwarding experiment
+        timeout-minutes: 20
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$RESEARCH_CASES" != all && ",$RESEARCH_CASES," != *,linux_list_sort,* ]]; then
+            echo 'list-sort not selected; no join-forwarding timing requested'
+            exit 0
+          fi
+          cat > results/research/join-off-compiler <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          export CCC_DISABLE_PASSES=join_store_forward
+          exec "$(dirname -- "$0")/../../target/fastbuild/lccc" "$@"
+          SH
+          chmod +x results/research/join-off-compiler
+          for profile in portable native; do
+            flags="-O2 -std=gnu17"
+            if [[ "$profile" == native ]]; then flags+=" -march=native"; fi
+            out="results/research/$profile-join-ab"
+            python3 scripts/benchmark_native_batched.py \
+              --compiler lccc=target/fastbuild/lccc \
+              --compiler "join_off=$GITHUB_WORKSPACE/results/research/join-off-compiler" \
+              --compiler gcc=gcc-16 --reference join_off \
+              --gcc gcc-16 --flags="$flags" --cpu auto \
+              --only linux_list_sort --rounds "$RESEARCH_ROUNDS" --seconds .2 \
+              --out "$out"
+            for arm in lccc join_off; do
+              objdump -d "$out/linux_list_sort/$arm/original.o" > "$out/$arm.dis"
+            done
+          done
+          python3 - <<'PYJOIN'
+          import json
+          from pathlib import Path
+          from scripts.publish_cpu_runtime_evidence import focused_excerpt
+          parts = []
+          for profile in ('portable', 'native'):
+              root = Path('results/research') / (profile + '-join-ab')
+              report = json.loads((root / 'results.json').read_text())
+              row, = report['rows']
+              assert report['complete'] and report['pinning']['applied']
+              assert row['name'] == 'linux_list_sort'
+              ratios = {key: {k: v for k, v in value.items() if k != 'paired_ratios'}
+                        for key, value in row['comparisons'].items()}
+              parts.append(json.dumps({'profile': profile, 'reference': report['reference'],
+                                       'rounds': report['rounds'], 'ratios': ratios}, separators=(',', ':')))
+              for arm in ('lccc', 'join_off'):
+                  text = focused_excerpt((root / (arm + '.dis')).read_text(),
+                                         'merge_and_count', 650, 'first-loop')
+                  parts.append(f'=== {profile}/{arm} ===\n{text}')
+          text = '\n'.join(parts)
+          if len(text.encode()) > 3900:
+              raise SystemExit('join-forwarding notice exceeds byte budget')
+          text = text.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+          print('::notice title=Same-compiler list-merge join-forwarding A-B::' + text)
+          PYJOIN
       - name: Same-compiler fallthrough zero-extension ablation
-        timeout-minutes: 10
+        timeout-minutes: 15
         shell: bash
         run: |
           set -euo pipefail
@@ -270,8 +376,53 @@ jobs:
           print('::notice title=Zero-extension ablation::' + text)
           (root / 'zext-summary.json').write_text(json.dumps(summary, indent=2) + '\n')
           PYZEXT
+      - name: Isolate strided-load and string-inlining performance
+        timeout-minutes: 30
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > results/research/strided-off-compiler <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          export CCC_NO_STRIDED_REDUCE=1
+          exec "$(dirname -- "$0")/../../target/fastbuild/lccc" "$@"
+          SH
+          cat > results/research/string-inline-off-compiler <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          export CCC_INLINE_SKIP=two_way_short_needle
+          exec "$(dirname -- "$0")/../../target/fastbuild/lccc" "$@"
+          SH
+          chmod +x results/research/strided-off-compiler results/research/string-inline-off-compiler
+          for control in strided string_inline; do
+            if [[ "$control" == strided ]]; then
+              case_name=byte_load_reassembly
+              wrapper=strided-off-compiler
+            else
+              case_name=glibc_strstr
+              wrapper=string-inline-off-compiler
+            fi
+            if [[ "$RESEARCH_CASES" != all && ",$RESEARCH_CASES," != *,"$case_name",* ]]; then
+              continue
+            fi
+            for profile in portable native; do
+              flags="-O2 -std=gnu17"
+              if [[ "$profile" == native ]]; then flags+=" -march=native"; fi
+              python3 scripts/benchmark_native_batched.py \
+                --compiler lccc=target/fastbuild/lccc \
+                --compiler "disabled=$GITHUB_WORKSPACE/results/research/$wrapper" \
+                --compiler gcc=gcc-16 --reference disabled \
+                --gcc gcc-16 --flags="$flags" --cpu auto \
+                --only "$case_name" --rounds "$RESEARCH_ROUNDS" --seconds .2 \
+                --out "results/research/$profile-$control-ab"
+            done
+            python3 scripts/callgrind_corpus.py \
+              --mine target/fastbuild/lccc --ref "$GITHUB_WORKSPACE/results/research/$wrapper" \
+              --gcc-include-command gcc-16 --target-flags=-march=x86-64-v3 \
+              --only "$case_name" --out "results/research/callgrind-$control-ab"
+          done
       - name: Calibrated short-kernel entry timing without exec startup
-        timeout-minutes: 12
+        timeout-minutes: 20
         shell: bash
         run: |
           set -euo pipefail
@@ -311,7 +462,7 @@ jobs:
                       print('::notice title=Startup-excluded CPU runtime::' + text)
           PYCODE
       - name: Correctness-gated bounded Callgrind main/candidate A-B
-        timeout-minutes: 8
+        timeout-minutes: 20
         run: |
           if [[ "$RESEARCH_CASES" == all ]]; then RESEARCH_CASES=""; fi
           python3 scripts/callgrind_corpus.py \
@@ -320,7 +471,7 @@ jobs:
             --gcc-include-command gcc-16 --target-flags="" \
             --only "$RESEARCH_CASES" --out results/research/callgrind-main
       - name: Supplementary Callgrind against identified native GCC
-        timeout-minutes: 8
+        timeout-minutes: 20
         # Identified native GCC16; this is not measured execution of CE binaries.
         run: |
           if [[ "$RESEARCH_CASES" == all ]]; then RESEARCH_CASES=""; fi
@@ -359,7 +510,14 @@ jobs:
                   'ratios': {name: row['metrics']['ir_ratio'] for name, row in data['results'].items()},
                   'failed_cases': [row['name'] for row in data['failures']],
               }
-          text = json.dumps(summary, separators=(',', ':'))
+          from scripts.publish_cpu_runtime_evidence import (control_digest,
+                                                              optimization_controls)
+          controls = optimization_controls(root, selected)
+          summary['optimization_controls'] = controls
+          # The complete records stay in the files above; the notice carries a
+          # compact digest so a control payload can never crowd out the verdict.
+          notice = dict(summary, optimization_controls=control_digest(controls))
+          text = json.dumps(notice, separators=(',', ':'))
           assert len(text.encode()) <= 3900, 'checks API annotation budget exceeded'
           escaped = text.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
           print(f'::notice title=Compiler research evidence::{escaped}')
@@ -367,8 +525,8 @@ jobs:
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as stream:
               stream.write('```json\n' + json.dumps(summary, indent=2) + '\n```\n')
           PY
-      # Keep all assembly arms grouped by workload under the job-wide checks
-      # annotation budget, after the timing and Callgrind summaries.
+      # Bounded comparison windows fit both per-annotation and whole-job
+      # checks limits, after the timing and Callgrind summaries.
       - name: Publish portable word-saturation assembly
         if: always()
         run: python3 scripts/publish_cpu_runtime_evidence.py results/research --assembly-profile portable --assembly-cases zlib_ng_slide_hash
@@ -381,12 +539,12 @@ jobs:
       - name: Publish native floating-point assembly
         if: always()
         run: python3 scripts/publish_cpu_runtime_evidence.py results/research --assembly-profile native --assembly-cases fp64_product_map,fp32_product_map
-      - name: Publish portable list and SQLite assembly
+      - name: Publish portable list, SQLite and string-search assembly
         if: always()
-        run: python3 scripts/publish_cpu_runtime_evidence.py results/research --assembly-profile portable --assembly-cases linux_list_sort,sqlite_vdbe_serial
-      - name: Publish native list and SQLite assembly
+        run: python3 scripts/publish_cpu_runtime_evidence.py results/research --assembly-profile portable --assembly-cases linux_list_sort,sqlite_vdbe_serial,glibc_strstr
+      - name: Publish native list, SQLite and string-search assembly
         if: always()
-        run: python3 scripts/publish_cpu_runtime_evidence.py results/research --assembly-profile native --assembly-cases linux_list_sort,sqlite_vdbe_serial
+        run: python3 scripts/publish_cpu_runtime_evidence.py results/research --assembly-profile native --assembly-cases linux_list_sort,sqlite_vdbe_serial,glibc_strstr
       - name: Publish portable byte and arithmetic assembly
         if: always()
         run: python3 scripts/publish_cpu_runtime_evidence.py results/research --assembly-profile portable --assembly-cases byte_load_reassembly,zlib_ng_compare256,arith_loop,nbody

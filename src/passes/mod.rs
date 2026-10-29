@@ -53,6 +53,7 @@ pub(crate) mod ipa_pta;
 pub(crate) mod ipcp;
 pub(crate) mod iv_strength_reduce;
 pub(crate) mod iv_widen;
+mod join_store_forward;
 pub(crate) mod licm;
 pub(crate) mod live_range_shrinkage;
 pub(crate) mod load_forward;
@@ -3074,6 +3075,11 @@ pub(crate) fn run_passes(
             // conditional arm makes the arm side-effect-free so
             // if-conversion can fire.
             module.for_each_function(load_forward::run);
+            let forwarded = if !pass_disabled(&disabled, "join_store_forward") {
+                run_on_visited(module, &dirty, &mut changed, join_store_forward::run)
+            } else {
+                0
+            };
             verify::verify_after_pass(module, "load_forward");
             let n = timed_pass!(
                 "if_convert",
@@ -3084,9 +3090,9 @@ pub(crate) fn run_passes(
                     if_convert::if_convert_function
                 )
             );
-            cur_pass_changes[7] = n;
-            total_changes += n;
-            total_changes_excl_dce += n;
+            cur_pass_changes[7] = n + forwarded;
+            total_changes += n + forwarded;
+            total_changes_excl_dce += n + forwarded;
         }
 
         // Re-run bit-idiom recognition after if-conversion. Portable trees such

@@ -4973,6 +4973,25 @@ impl X86Codegen {
                     }
                 }
             }
+            IntrinsicOp::VecLoadStrided2I32x8 => {
+                // Four exact-width reads: no gap between scalar elements is
+                // accessed, even when it contains a separately shared or
+                // device-mapped object. The odd lanes are initialized to zero.
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
+                let mem = self.vec_mem_operand(&args[0], &args[1], Self::vec_disp_arg(args, 2));
+                self.state.emit_fmt(format_args!("    leaq {}, %rax", mem));
+                self.state.reg_cache.invalidate_acc();
+                self.state.emit("    vmovd (%rax), %xmm0");
+                self.state.emit("    vpinsrd $2, 8(%rax), %xmm0, %xmm0");
+                self.state.emit("    vmovd 16(%rax), %xmm1");
+                self.state.emit("    vpinsrd $2, 24(%rax), %xmm1, %xmm1");
+                self.state.emit("    vinserti128 $1, %xmm1, %ymm0, %ymm0");
+                if let Some(d) = dest {
+                    self.state.vector_values.insert(d.0);
+                    self.avx_store_dest(d);
+                }
+            }
             IntrinsicOp::VecLoadI32x8 => {
                 // Load straight into the destination's YMM home when it has
                 // one: the generic path stages through %ymm0 and pays a
@@ -11891,6 +11910,37 @@ mod fma_form_reencode_tests {
 #[cfg(test)]
 mod vector_address_contract_tests {
     use super::*;
+
+    #[test]
+    fn strided_load_reads_only_four_dwords() {
+        let mut cg = X86Codegen::new();
+        cg.reg_assignments.insert(0, super::super::machinst::R12);
+        cg.reg_assignments.insert(1, super::super::machinst::R13);
+        cg.reg_assignments.insert(2, PhysReg(24)); // xmm6 / ymm6
+        cg.emit_intrinsic_impl(
+            &Some(Value(2)),
+            &IntrinsicOp::VecLoadStrided2I32x8,
+            &None,
+            &[
+                Operand::Value(Value(0)),
+                Operand::Value(Value(1)),
+                Operand::Const(IrConst::I64(32)),
+            ],
+        );
+        let out = &cg.state.out.buf;
+        for inst in [
+            "leaq 32(%r12,%r13), %rax",
+            "vmovd (%rax), %xmm0",
+            "vpinsrd $2, 8(%rax), %xmm0, %xmm0",
+            "vmovd 16(%rax), %xmm1",
+            "vpinsrd $2, 24(%rax), %xmm1, %xmm1",
+            "vinserti128 $1, %xmm1, %ymm0, %ymm0",
+            "vmovdqa %ymm0, %ymm6",
+        ] {
+            assert!(out.contains(inst), "missing {inst}: {out}");
+        }
+        assert!(!out.contains("vmovdqu"), "{out}");
+    }
 
     #[test]
     fn unfused_packed_update_keeps_two_roundings_and_hoisted_factor() {

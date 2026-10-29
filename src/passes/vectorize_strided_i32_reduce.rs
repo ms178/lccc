@@ -14,13 +14,9 @@
 //!
 //! [`analyze`] requires the loop header's exit comparison to name the induction
 //! variable itself on one side and an `Operand::Const` on the other, so the trip
-//! count is known when the transform runs. A run-time bound -- including the
-//! `(i + 8) <= len` spelling this module used to document -- is declined: the
-//! guard-page contract below needs the scalar trip count `T` up front. Admitting
-//! one would need the grouped-bound machinery the map and matmul arms use (a
-//! `(bound - 1) >> 2` trip count and a per-vector in-range test in the
-//! preheader) plus a re-proof of the dereferenceability argument against a
-//! non-constant prefix; that is not implemented here.
+//! count is known when the transform runs. A run-time bound, including the
+//! `(i + 8) <= len` spelling, is declined: admitting it needs grouped-bound
+//! machinery and a proof for a non-constant vector prefix.
 //!
 //! The corpus gate `tests/regression/check_vector_remainder_codegen.sh` pins
 //! both dereferenceability paths below on
@@ -28,10 +24,10 @@
 //!
 //! ### Even-lane SIMD homomorphism (zero shuffles inside the loop)
 //!
-//! A single 256-bit `VecLoadI32x8` at `base + byte_iv` places four consecutive
-//! stride-8B dwords (`+0, +8, +16, +24`) in the **even** 32-bit lanes `0, 2,
-//! 4, 6` of a YMM register while lanes `1, 3, 5, 7` hold the intervening odd
-//! dwords (`+4, +12, +20, +28`). Because modular 32-bit lane operations
+//! A `VecLoadStrided2I32x8` places four stride-8B dwords (`+0, +8, +16,
+//! +24`) in the even 32-bit lanes `0, 2, 4, 6` of a YMM register without
+//! reading the gaps. A full `VecLoadI32x8` is permitted only for a proven
+//! private stack object with sufficient extent. Because modular lane operations
 //! (`vpaddd`, `vpsubd`, `vpmulld`, `vpand`, `vpor`, `vpxor`, `vpslld`,
 //! `vpsrld`, `vpsrad`) never propagate carries or traps across lane
 //! boundaries, evaluating the entire per-element DAG across all 8 lanes in
@@ -40,22 +36,16 @@
 //! accumulator with `0x0000_0000_FFFF_FFFF` (`VecBroadcastI64x4`) zeroes the
 //! odd lanes before `VecHorizontalAddI32x8`.
 //!
-//! ### Dereferenceability / guard-page contract
+//! ### Exact-access and guard-page contract
 //!
-//! Iteration `t` (`0 <= t < T`) of the scalar loop dereferences bytes
-//! `[t*8 .. t*8 + 3]`, proving `[0 .. (T - 1)*8 + 3]` readable on entry to the
-//! last iteration. A 32-byte `VecLoadI32x8` covering scalar iterations
-//! `4*v .. 4*v + 3` reads `[32*v .. 32*v + 31]`:
-//!
-//! * When every loaded base pointer names a locally binding `GlobalAddr` (via
-//!   [`ModuleSymbolFacts::global_min_bytes`]) or stack `Alloca` of at least
-//!   `T * 8` bytes, all `T / 4` vectors lie strictly within the allocated
-//!   object (`safe_vecs = T / 4`).
-//! * Otherwise, `32*v + 31 <= (T - 1)*8 + 3` holds unconditionally for all
-//!   `v < (T - 1) / 4` (`safe_vecs = (T - 1) / 4`), so the vector prefix never
-//!   reads a single byte past the scalar loop's own highest dereferenced byte;
-//!   the untouched original scalar loop executes the remaining `T - 4*used`
-//!   iterations.
+//! Iteration `t` reads `[8t, 8t+3]`. Bounding a wide load by the scalar
+//! loop's highest address does not make the *gaps* safe: they may be separate
+//! objects concurrently modified by another thread, or device registers.
+//! The default load therefore performs the same four 4-byte accesses as four
+//! scalar iterations. A contiguous load is used only when the complete vector
+//! prefix lies within an unescaped, nonvolatile stack allocation, so its gap
+//! bytes cannot be observed independently. The untouched scalar loop executes
+//! the remaining iterations.
 
 use super::*;
 
@@ -78,6 +68,7 @@ struct StridedI32ReducePattern {
     acc_init: Operand,
     safe_vecs: u64,
     load_bases: Vec<Value>,
+    private_wide_loads: Vec<bool>,
     expr: StridedExpr,
 }
 
@@ -167,20 +158,10 @@ fn scalar_trip_count(op: IrCmpOp, iv_ty: IrType, bound: i64) -> Option<u64> {
     (trips > 0).then_some(trips)
 }
 
-/// Vector iterations the guard-page contract allows for `scalar_trips`.
-///
-/// Iteration `t` reads `[8t, 8t+3]`, so the source program itself guarantees
-/// `[0, 8(T-1)+3]` is readable. A 32-byte vector covering iterations
-/// `4v..4v+3` reads `[32v, 32v+31]`, and `32v+31 <= 8(T-1)+3` holds for every
-/// `v < (T-1)/4`, so the vector prefix never touches a byte the scalar loop
-/// would not have touched. When every base is a proven object of at least
-/// `8T` bytes the tighter `T/4` is used instead.
-fn safe_vec_count(scalar_trips: u64, full_cover: bool) -> u64 {
-    if full_cover {
-        scalar_trips / VECTORS_PER_SCALAR_ITER
-    } else {
-        scalar_trips.saturating_sub(1) / VECTORS_PER_SCALAR_ITER
-    }
+/// Groups of four scalar iterations with exact-width loads. Full-width
+/// loads have an additional independent private-object extent proof.
+fn safe_vec_count(scalar_trips: u64) -> u64 {
+    scalar_trips / VECTORS_PER_SCALAR_ITER
 }
 
 /// The byte offset the scalar remainder loop resumes at, expressed in the IV's
@@ -209,38 +190,26 @@ pub(super) fn try_transform(
     func: &mut IrFunction,
     loop_info: &loop_analysis::NaturalLoop,
     cfg: &CfgAnalysis,
-    symbol_facts: &ModuleSymbolFacts,
 ) -> usize {
     if strided_reduce_disabled() {
         return 0;
     }
-    let Some(pattern) = analyze(func, loop_info, cfg, symbol_facts) else {
+    let Some(pattern) = analyze(func, loop_info, cfg) else {
         return 0;
     };
     transform(func, &pattern)
 }
 
-fn proven_object_bytes(
-    func: &IrFunction,
-    base: Value,
-    symbol_facts: &ModuleSymbolFacts,
-) -> Option<u64> {
-    for block in &func.blocks {
-        for inst in &block.instructions {
-            match inst {
-                Instruction::GlobalAddr { dest, name } if *dest == base => {
-                    return symbol_facts
-                        .global_min_bytes(name)
-                        .and_then(|n| u64::try_from(n).ok());
-                }
-                Instruction::Alloca { dest, size, .. } if *dest == base => {
-                    return u64::try_from(*size).ok();
-                }
-                _ => {}
-            }
-        }
+fn private_wide_load_safe(func: &IrFunction, base: Value, needed: u64) -> bool {
+    if !proves_private_stack_object(func, base) {
+        return false;
     }
-    None
+    func.blocks.iter().any(|block| {
+        block.instructions.iter().any(|inst| {
+            matches!(inst, Instruction::Alloca { dest, size, .. }
+                if *dest == base && u64::try_from(*size).is_ok_and(|sz| sz >= needed))
+        })
+    })
 }
 
 fn trace_iv_offset(
@@ -615,7 +584,6 @@ fn analyze(
     func: &IrFunction,
     loop_info: &loop_analysis::NaturalLoop,
     cfg: &CfgAnalysis,
-    symbol_facts: &ModuleSymbolFacts,
 ) -> Option<StridedI32ReducePattern> {
     if loop_info.body.len() != 2 {
         return None;
@@ -902,14 +870,15 @@ fn analyze(
         return None;
     }
 
-    let needed_bytes = scalar_trips.checked_mul(SCALAR_STEP_BYTES)?;
-    let all_bases_cover_full = load_bases.iter().all(|&base| {
-        proven_object_bytes(func, base, symbol_facts).is_some_and(|sz| sz >= needed_bytes)
-    });
-    let safe_vecs = safe_vec_count(scalar_trips, all_bases_cover_full);
+    let safe_vecs = safe_vec_count(scalar_trips);
     if safe_vecs < 4 {
         return None;
     }
+    let vector_bytes = safe_vecs.checked_mul(VECTOR_BYTES)?;
+    let private_wide_loads = load_bases
+        .iter()
+        .map(|&base| private_wide_load_safe(func, base, vector_bytes))
+        .collect();
 
     Some(StridedI32ReducePattern {
         preheader_idx,
@@ -922,12 +891,14 @@ fn analyze(
         acc_init,
         safe_vecs,
         load_bases,
+        private_wide_loads,
         expr,
     })
 }
 
 struct EmitCtx<'a> {
     load_bases: &'a [Value],
+    private_wide_loads: &'a [bool],
     byte_iv: Value,
     byte_disp: i64,
     vec_iv: Value,
@@ -957,7 +928,11 @@ impl EmitCtx<'_> {
                 }
                 self.body_insts.push(Instruction::Intrinsic {
                     dest: Some(dest),
-                    op: IntrinsicOp::VecLoadI32x8,
+                    op: if self.private_wide_loads[*idx] {
+                        IntrinsicOp::VecLoadI32x8
+                    } else {
+                        IntrinsicOp::VecLoadStrided2I32x8
+                    },
                     dest_ptr: None,
                     args,
                 });
@@ -1178,6 +1153,7 @@ fn transform(func: &mut IrFunction, p: &StridedI32ReducePattern) -> usize {
 
     let mut ctx = EmitCtx {
         load_bases: &p.load_bases,
+        private_wide_loads: &p.private_wide_loads,
         byte_iv: byte_iv_phi,
         byte_disp: 0,
         vec_iv: iv_vec_phi.unwrap_or(Value(0)),
@@ -1434,38 +1410,78 @@ fn transform(func: &mut IrFunction, p: &StridedI32ReducePattern) -> usize {
 mod tests {
     use super::*;
 
-    /// The whole transform rests on one arithmetic fact: every vector the pass
-    /// emits stays inside the byte footprint the scalar loop itself
-    /// dereferences. Check it for both admission arms over a dense sweep, using
-    /// the production bound function (not a copy of its formula).
+    /// Every exact load is one of the scalar program's own dword accesses,
+    /// including the last group when the final gap is unmapped.
     #[test]
-    fn guard_page_safe_vec_count_never_overreads_scalar_footprint() {
+    fn exact_load_groups_never_add_a_scalar_iteration() {
         for scalar_trips in MIN_SCALAR_TRIPS..=200_000 {
-            let max_scalar_byte = (scalar_trips - 1) * SCALAR_STEP_BYTES + 3;
-            // Unproven objects: the vector prefix must stay inside the bytes the
-            // scalar loop itself dereferences, so a guard page or an
-            // exactly-sized heap block cannot be crossed.
-            let vecs = safe_vec_count(scalar_trips, false);
+            let vecs = safe_vec_count(scalar_trips);
             if vecs > 0 {
-                let max_vec_byte = (vecs - 1) * VECTOR_BYTES + (VECTOR_BYTES - 1);
-                assert!(
-                    max_vec_byte <= max_scalar_byte,
-                    "trips={scalar_trips}: vector reads {max_vec_byte} > scalar \
-                     footprint {max_scalar_byte}"
-                );
+                for lane in 0..4 {
+                    let scalar_iteration = (vecs - 1) * 4 + lane;
+                    assert!(scalar_iteration < scalar_trips);
+                    let vector_address = (vecs - 1) * VECTOR_BYTES + lane * SCALAR_STEP_BYTES;
+                    assert_eq!(vector_address, scalar_iteration * SCALAR_STEP_BYTES);
+                }
             }
-            // Proven objects of >= 8T bytes: the stronger bound may use the
-            // whole object, which is exactly `8T` bytes.
-            let vecs = safe_vec_count(scalar_trips, true);
-            if vecs > 0 {
-                let max_vec_byte = (vecs - 1) * VECTOR_BYTES + (VECTOR_BYTES - 1);
-                assert!(
-                    max_vec_byte < scalar_trips * SCALAR_STEP_BYTES,
-                    "trips={scalar_trips} full-cover: vector reads {max_vec_byte} \
-                     past the proven object of {} bytes",
-                    scalar_trips * SCALAR_STEP_BYTES
-                );
-            }
+        }
+    }
+
+    #[test]
+    fn wide_load_requires_an_unescaped_stack_object_of_sufficient_size() {
+        let mut f = IrFunction::new("private".into(), IrType::Void, vec![], false);
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![Instruction::Alloca {
+                dest: Value(0),
+                ty: IrType::U8,
+                size: 128,
+                align: 16,
+                volatile: false,
+                semantic_volatile: false,
+            }],
+            terminator: Terminator::Return(None),
+            source_spans: vec![],
+        });
+        assert!(private_wide_load_safe(&f, Value(0), 128));
+        assert!(!private_wide_load_safe(&f, Value(0), 129));
+        f.blocks[0].terminator = Terminator::Return(Some(Operand::Value(Value(0))));
+        assert!(!private_wide_load_safe(&f, Value(0), 128));
+        f.blocks[0].terminator = Terminator::Return(None);
+        f.blocks[0].instructions[0] = Instruction::GlobalAddr {
+            dest: Value(0),
+            name: "shared".into(),
+        };
+        assert!(!private_wide_load_safe(&f, Value(0), 128));
+    }
+
+    #[test]
+    fn load_emission_selects_exact_or_proven_private_access() {
+        for private in [false, true] {
+            let mut ctx = EmitCtx {
+                load_bases: &[Value(0)],
+                private_wide_loads: &[private],
+                byte_iv: Value(1),
+                byte_disp: 32,
+                vec_iv: Value(2),
+                bcast_cache: vec![],
+                preheader_insts: vec![],
+                body_insts: vec![],
+                next_val: 3,
+            };
+            ctx.emit(&StridedExpr::LoadEven32(0));
+            let Instruction::Intrinsic { op, args, .. } = &ctx.body_insts[0] else {
+                panic!("expected vector load");
+            };
+            assert_eq!(
+                *op,
+                if private {
+                    IntrinsicOp::VecLoadI32x8
+                } else {
+                    IntrinsicOp::VecLoadStrided2I32x8
+                }
+            );
+            assert_eq!(args[2], Operand::Const(IrConst::I64(32)));
         }
     }
 

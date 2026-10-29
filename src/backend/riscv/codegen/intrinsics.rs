@@ -498,6 +498,7 @@ impl RiscvCodegen {
             IntrinsicOp::VecLoadF64x4
             | IntrinsicOp::VecLoadF64x2
             | IntrinsicOp::VecLoadI32x8
+            | IntrinsicOp::VecLoadStrided2I32x8
             | IntrinsicOp::VecLoadI32x4
             | IntrinsicOp::VecAddF64x4
             | IntrinsicOp::VecAddF64x2

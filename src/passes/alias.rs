@@ -142,6 +142,9 @@ pub(crate) fn vec_intrinsic_access<'a>(
         | IntrinsicOp::VecStoreI8x32
         | IntrinsicOp::VecStoreI16x16 => (true, 32),
         IntrinsicOp::VecStoreI32x4Pair => (true, 8),
+        // The actual accesses are four dwords at 0, 8, 16 and 24; the
+        // enclosing 28-byte interval is a conservative alias footprint.
+        IntrinsicOp::VecLoadStrided2I32x8 => (false, 28),
         IntrinsicOp::VecLoadF64x4
         | IntrinsicOp::VecLoadI32x8
         | IntrinsicOp::VecLoadF32x8
@@ -354,6 +357,17 @@ mod tests {
             konst,
             march,
         }
+    }
+    #[test]
+    fn strided_load_aliases_the_enclosing_interval() {
+        use crate::ir::reexports::IrConst;
+        let args = [
+            Operand::Value(Value(1)),
+            Operand::Value(Value(2)),
+            Operand::Const(IrConst::I64(32)),
+        ];
+        let access = vec_intrinsic_access(&IntrinsicOp::VecLoadStrided2I32x8, &args);
+        assert_eq!(access, Some((false, 28, &args[0], &args[1], 32)));
     }
     #[test]
     fn overflow_fails_closed() {

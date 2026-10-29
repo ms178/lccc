@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run self-checking switch fixtures on AArch64/RV64 without a cross libc.
+"""Run self-checking switch and memory fixtures on AArch64/RV64 without a cross libc.
 
 Requires LCCC target drivers, Clang's integrated assembler, a GNU target linker or LLD (including Rust's bundled LLD), and QEMU user emulators. printf/puts are intentionally
 no-ops: every selected fixture checks its own result through main's exit code.
@@ -18,7 +18,15 @@ FIXTURES = (
     "switch_u32_high_jump_table", "switch_jump_table_dirty_abi",
     "switch_lut_bitpack", "switch_lut_boundaries", "switch_lut_default_slot",
     "switch_lut_narrow_index", "switch_lut_two_val_modulo",
+    "narrow_big_endian_cross", "join_store_forward_cross",
+    "conditional_store_readonly_cross", "strided_reduction_cross",
 )
+CONTROL_PASSES = {
+    "narrow_big_endian_cross": "byte_load",
+    "join_store_forward_cross": "join_store_forward",
+    "conditional_store_readonly_cross": "vectorize",
+    "strided_reduction_cross": "vectorize",
+}
 START = {
     "aarch64": """.text
 .globl _start
@@ -105,8 +113,9 @@ def main():
                     # Replace, rather than inherit, pass controls: a host's
                     # bisection environment must not silently erase coverage.
                     env.pop("CCC_DISABLE_PASSES", None)
+                    pass_name = CONTROL_PASSES.get(fixture, "switch_lut")
                     if disable:
-                        env["CCC_DISABLE_PASSES"] = "switch_lut"
+                        env["CCC_DISABLE_PASSES"] = pass_name
                     asm, obj, exe = (work / name for name in ["test.s", "test.o", "test"])
                     subprocess.run([str(args.lccc_dir / driver), "-O2", "-isystem", str(Path(resource) / "include"), "-S",
                                     str(ROOT / "tests/regression" / f"{fixture}.c"),
@@ -117,7 +126,7 @@ def main():
                     subprocess.run([str(args.qemu_dir / f"qemu-{arch}"), str(exe)],
                                    check=True, timeout=30)
                     count += 1
-                    print(f"PASS {arch} {fixture} LUT={'off' if disable else 'on'}", flush=True)
+                    print(f"PASS {arch} {fixture} {pass_name}={'off' if disable else 'on'}", flush=True)
     print(f"{count} cross-target execution contracts passed")
     return 0
 

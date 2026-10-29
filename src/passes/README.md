@@ -898,7 +898,13 @@ CCC_DISABLE_PASSES=gvn,licm ./ccc input.c -o output.o
 
 Recognized names: `all`, `inline`, `cfg`, `copyprop`, `narrow`, `simplify`,
 `constfold`, `gvn`, `licm`, `ifconv`, `dce`, `ipcp`, `divconst`, `ivsr`,
-`reassoc_lat`.
+`reassoc_lat`, `join_store_forward`.
+
+`join_store_forward` replaces a pointer reload after a two-way join only when
+both direct incoming edges contain an exact, unclobbered store to that address.
+It preserves phi-edge provenance and refuses volatile, atomic, ambiguous or
+multiply defined values. It runs before if-conversion and can be disabled
+independently for same-compiler A/B measurements.
 
 Setting the variable to `all` skips the entire optimization pipeline.
 

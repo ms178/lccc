@@ -243,7 +243,7 @@ class ParallelLayout(unittest.TestCase):
         with self.assertRaises(AssertionError):
             validate(changed, self.benchmark)
 
-    def test_research_only_explicit_workflow_changes_opt_in(self):
+    def test_research_path_triggers_and_profiles_are_complete(self):
         research = yaml.load((ROOT / '.github/workflows/compiler-research.yml').read_text(),
                              Loader=yaml.BaseLoader)
         self.assertEqual(set(research['on']), {'workflow_dispatch', 'pull_request'})
@@ -254,6 +254,9 @@ class ParallelLayout(unittest.TestCase):
                 'src/passes/vec_ssa.rs',
                 'src/passes/slp_vectorizer.rs',
                 'src/passes/vectorize.rs',
+                'src/passes/byte_load.rs',
+                'src/passes/join_store_forward.rs',
+                'src/backend/global_alignment.rs',
                 'src/backend/x86/codegen/peephole/passes/self_zext.rs',
                 'scripts/publish_cpu_runtime_evidence.py',
                 'include/emmintrin.h',
@@ -272,10 +275,41 @@ class ParallelLayout(unittest.TestCase):
         self.assertTrue(fp_cases <= manual_cases)
         self.assertTrue({'zlib_ng_slide_hash', 'linux_list_sort', 'sqlite_vdbe_serial',
                          'byte_load_reassembly', 'zlib_ng_compare256', 'arith_loop',
-                         'sqlite_varint', 'hot_web_loop', 'sha256_transform'} <= pr_cases)
+                         'sqlite_varint', 'hot_web_loop', 'sha256_transform',
+                         'glibc_strstr', 'binary_trees', 'expat_xml_scan', 'strlen_bench',
+                         'loop_patterns', 'mandelbrot', 'aarch64_select_patterns', 'qsort'} <= pr_cases)
+        # Five per notice plus two identities must fit the 50-notice budget.
+        self.assertLessEqual(len(pr_cases), 20)
         manual_default = research['on']['workflow_dispatch']['inputs']['cases']['default']
         self.assertEqual(manual_cases, set(manual_default.split(',')))
         self.assertIn('&& \'9\'', research['jobs']['evidence']['env']['RESEARCH_ROUNDS'])
+        ab = next(step for step in research['jobs']['evidence']['steps']
+                  if step.get('name') == 'Same-compiler list-merge join-forwarding experiment')
+        self.assertIn('CCC_DISABLE_PASSES=join_store_forward', ab['run'])
+        self.assertIn('--reference join_off', ab['run'])
+        self.assertIn('--only linux_list_sort', ab['run'])
+        self.assertIn('identical_binary_to_reference',
+                      (ROOT / 'scripts/benchmark_native_batched.py').read_text())
+        self.assertIn('len(text.encode()) > 3900', ab['run'])
+        controls = next(step for step in research['jobs']['evidence']['steps']
+                        if step.get('name') == 'Isolate strided-load and string-inlining performance')
+        self.assertIn('CCC_NO_STRIDED_REDUCE=1', controls['run'])
+        self.assertIn('CCC_INLINE_SKIP=two_way_short_needle', controls['run'])
+        self.assertIn('--reference disabled', controls['run'])
+        self.assertIn('scripts/benchmark_native_batched.py', controls['run'])
+        self.assertIn('scripts/callgrind_corpus.py', controls['run'])
+        self.assertIn('--target-flags=-march=x86-64-v3', controls['run'])
+        zext = next(step for step in research['jobs']['evidence']['steps']
+                    if step.get('name') == 'Same-compiler fallthrough zero-extension ablation')
+        self.assertIn('CCC_NO_SELF_ZEXT_FALLTHROUGH=1', zext['run'])
+        self.assertIn('--only zlib_ng_slide_hash', zext['run'])
+        self.assertIn('callgrind-zext', zext['run'])
+        self.assertIn('len(text.encode()) <= 3900', zext['run'])
+        publisher = next(step for step in research['jobs']['evidence']['steps']
+                         if step.get('name') == 'Publish CPU-specific paired results through the checks API')
+        self.assertEqual(publisher.get('if'), 'always()')
+        self.assertIn('--expected-cases "$RESEARCH_CASES"', publisher['run'])
+        self.assertIn('--expected-compilers lccc,before,gcc,clang,icx,rolled', publisher['run'])
         self.assertTrue(research['jobs'])
         for job in research['jobs'].values():
             self.assertNotIn('continue-on-error', job)
