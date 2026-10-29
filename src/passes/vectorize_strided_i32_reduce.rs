@@ -102,6 +102,26 @@ fn strided_reduce_disabled() -> bool {
     !ENABLED.with(|cell| cell.get())
 }
 
+/// Diagnostic switch: report the analysis stage that declined this loop.
+///
+/// The transform fails closed at forty-odd preconditions, and a silent `None`
+/// makes "the optimization is dormant" indistinguishable from "no candidate
+/// loop exists" -- which is exactly how this pass sat unused without anyone
+/// noticing.  Setting `LCCC_VEC_STRIDED_TRACE=1` names the line that declined.
+fn trace_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LCCC_VEC_STRIDED_TRACE").is_some())
+}
+
+macro_rules! decline {
+    () => {{
+        if trace_enabled() {
+            eprintln!("[STRIDED] decline at line {}", line!());
+        }
+        return None;
+    }};
+}
+
 /// Smallest scalar trip count worth vectorizing: below this, the preheader
 /// setup and the masking/horizontal-add epilogue cost more than the four
 /// iterations per vector can save.
@@ -618,21 +638,21 @@ fn analyze(
     symbol_facts: &ModuleSymbolFacts,
 ) -> Option<StridedI32ReducePattern> {
     if loop_info.body.len() != 2 {
-        return None;
+        decline!();
     }
     let header_idx = loop_info.header;
     let body_idx = *loop_info.body.iter().find(|&&b| b != header_idx)?;
     let header_label = func.blocks[header_idx].label;
     let body_label = func.blocks[body_idx].label;
     if !matches!(func.blocks[body_idx].terminator, Terminator::Branch(lbl) if lbl == header_label) {
-        return None;
+        decline!();
     }
 
     // Unique external preheader jumping unconditionally to `header_idx`.
     let preheader_idx = loop_info.find_preheader(&cfg.preds)?;
     if !matches!(func.blocks[preheader_idx].terminator, Terminator::Branch(lbl) if lbl == header_label)
     {
-        return None;
+        decline!();
     }
     let preheader_label = func.blocks[preheader_idx].label;
 
@@ -643,14 +663,14 @@ fn analyze(
         false_label,
     } = func.blocks[header_idx].terminator
     else {
-        return None;
+        decline!();
     };
     if true_label != body_label {
-        return None;
+        decline!();
     }
     let exit_idx = func.blocks.iter().position(|b| b.label == false_label)?;
     if loop_info.body.contains(&exit_idx) {
-        return None;
+        decline!();
     }
 
     // Header must contain only two 2-way Phis (IV and accumulator) plus the exit Cmp.
@@ -662,7 +682,7 @@ fn analyze(
                 dest, ty, incoming, ..
             } => {
                 if incoming.len() != 2 {
-                    return None;
+                    decline!();
                 }
                 let pre = incoming
                     .iter()
@@ -685,39 +705,39 @@ fn analyze(
         }
     }
     if phis.len() != 2 {
-        return None;
+        decline!();
     }
     let (cmp_op, Operand::Value(cmp_lhs), Operand::Const(cmp_rhs_c), cmp_ty) = exit_cmp? else {
-        return None;
+        decline!();
     };
     let bound_raw = cmp_rhs_c.to_i64()?;
     if bound_raw <= 0 {
-        return None;
+        decline!();
     }
 
     // Identify which phi is `iv_phi` (compared in `exit_cmp`, starts at 0, steps by +8).
     let iv_pos = phis.iter().position(|(d, _, _, _)| *d == cmp_lhs)?;
     let (iv_phi, iv_ty, iv_init, Operand::Value(iv_next)) = phis[iv_pos].clone() else {
-        return None;
+        decline!();
     };
     let (acc_phi, acc_ty, acc_init, Operand::Value(acc_next)) = phis[1 - iv_pos].clone() else {
-        return None;
+        decline!();
     };
     if !matches!(iv_ty, IrType::U64 | IrType::I64 | IrType::U32 | IrType::I32)
         || cmp_ty != iv_ty
         || !matches!(acc_ty, IrType::I32 | IrType::U32)
     {
-        return None;
+        decline!();
     }
     let Operand::Const(iv_init_c) = iv_init else {
-        return None;
+        decline!();
     };
     if iv_init_c.to_i64() != Some(0) {
-        return None;
+        decline!();
     }
     let scalar_trips = scalar_trip_count(cmp_op, iv_ty, bound_raw)?;
     if scalar_trips < MIN_SCALAR_TRIPS {
-        return None;
+        decline!();
     }
 
     // Verify `iv_next = iv_phi + 8` in `body_idx`.
@@ -734,7 +754,7 @@ fn analyze(
         )
     });
     if !iv_step_ok {
-        return None;
+        decline!();
     }
 
     // Escape closure: only `acc_phi` may be observed outside `loop_info.body`.
@@ -773,7 +793,7 @@ fn analyze(
             }
         });
         if bad_escape {
-            return None;
+            decline!();
         }
     }
 
@@ -838,7 +858,7 @@ fn analyze(
                 } else if *rhs == Operand::Value(acc_phi) {
                     contrib_op = Some(lhs.clone());
                 } else {
-                    return None;
+                    decline!();
                 }
             }
             Instruction::BinOp { dest, op, ty, .. } if !op.can_trap() && ty.is_integer() => {
@@ -886,7 +906,7 @@ fn analyze(
         }
     }
     if consumed_u8_loads.len() != u8_loads.len() || acc_uses_in_body != 1 || load_bases.is_empty() {
-        return None;
+        decline!();
     }
     let contrib_op = contrib_op?;
     let expr = parse_expr(
@@ -899,7 +919,7 @@ fn analyze(
         0,
     )?;
     if !expr_has_load(&expr) {
-        return None;
+        decline!();
     }
 
     let needed_bytes = scalar_trips.checked_mul(SCALAR_STEP_BYTES)?;
@@ -908,7 +928,7 @@ fn analyze(
     });
     let safe_vecs = safe_vec_count(scalar_trips, all_bases_cover_full);
     if safe_vecs < 4 {
-        return None;
+        decline!();
     }
 
     Some(StridedI32ReducePattern {

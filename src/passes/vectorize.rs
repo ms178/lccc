@@ -929,6 +929,32 @@ fn vectorize_with_analysis_mode(
                 total_changes += n;
                 continue;
             }
+        } else if !neon
+            && !force_two_wide
+            && !late_minmax_only()
+            && !force_sse2
+            && x86_avx2_available()
+            && {
+                // FIRST REFUSAL: `analyze_reduction_pattern` matches this loop
+                // too (a strided `Sum`), and the reduction arm either rewrites
+                // it or declines -- either way the loop never reached the
+                // strided reducer, which is why that transform never fired:
+                // not on its own regression fixture, not on the byte_load
+                // benchmark it was written for.  A dormant optimization is a
+                // missed optimization, so the specific, fully-proved transform
+                // is asked first and the general one only sees what it
+                // declines.  `try_transform` returns 0 without mutating
+                // anything on a non-match, so the extra positional scan is the
+                // whole cost of the ordering.
+                let n = strided_i32_reduce::try_transform(func, loop_info, &cfg, symbol_facts);
+                total_changes += n;
+                n > 0
+            }
+        {
+            if debug {
+                eprintln!("[VEC] Strided I32 reduction pattern matched! Transformed to AVX2");
+            }
+            continue;
         } else if let Some(red_pattern) = analyze_reduction_pattern(
             func,
             loop_info,
@@ -1144,20 +1170,6 @@ fn vectorize_with_analysis_mode(
                     eprintln!("[VEC] Reduction pattern matched! Transforming to AVX2 4-wide");
                 }
                 total_changes += transform_reduction_avx2(func, &red_pattern, fp_contract);
-            }
-        } else if !neon
-            && !force_two_wide
-            && !late_minmax_only()
-            && !force_sse2
-            && x86_avx2_available()
-            && {
-                let n = strided_i32_reduce::try_transform(func, loop_info, &cfg, symbol_facts);
-                total_changes += n;
-                n > 0
-            }
-        {
-            if debug {
-                eprintln!("[VEC] Strided I32 reduction pattern matched! Transformed to AVX2");
             }
         } else if !no_map_vec() {
             // AUD-4: the late scope deliberately does NOT gate the map
