@@ -422,6 +422,12 @@ mod tests {
         }
     }
 
+    #[test]
+    fn unknown_directive_clears_zero_extension_facts() {
+        let asm = "    movl %esi, %edi\n    .byte 0x90\n    movl %edi, %edi\n";
+        assert_eq!(survivors(asm, "movl %edi, %edi"), 1);
+    }
+
     /// A 32-bit implicit write establishes the fact. `divl`/`mull`/`idivl` and
     /// the single-operand `imull` leave %eax and %edx each written 32 bits
     /// wide, so the self-zext the emitter adds to widen such a result for a

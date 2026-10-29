@@ -2,17 +2,10 @@
  * Shape fixture for the AVX2 strided-2 32-bit sum-reduction vectorizer
  * (src/passes/vectorize_strided_i32_reduce.rs).
  *
- * Two functions, because the transform has two dereferenceability proofs and
- * only one of them is exercised by a global array:
- *
- *   sum_global_full   reads a locally binding GlobalAddr, so `global_min_bytes`
- *                     proves every 32-byte vector lies inside the object and the
- *                     whole vector prefix is used (trip count a multiple of 4);
- *   sum_dynamic_tail  reads through a run-time pointer, so the transform may
- *                     only vectorize prefixes that stay inside the bytes the
- *                     scalar loop itself dereferences, and the untouched scalar
- *                     loop finishes the remainder (trip count 2049, i.e. one
- *                     iteration left over).
+ * The global and pointer forms require exact-width reads of scalar elements;
+ * their intervening bytes may be independently shared or device-mapped.
+ * Both full groups and a scalar tail are exercised. A protected page begins
+ * immediately after the last scalar dword of the full-group pointer case.
  *
  * Both accumulate the modular 32-bit sum of `dword(buf + i) ^ (uint32_t)i` with
  * a byte induction variable stepping by 8. The loop is written in the form the
@@ -27,6 +20,8 @@
  */
 #include <stdint.h>
 #include <stdio.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 #define BYTES_FULL 16384U /* 2048 iterations of 8 bytes: trip count % 4 == 0 */
 #define BYTES_TAIL 16392U /* 2049 iterations: one scalar iteration left over */
@@ -52,6 +47,15 @@ static uint32_t sum_dynamic_tail(const unsigned char *buf)
     return acc;
 }
 
+__attribute__((noinline))
+static uint32_t sum_dynamic_full(const unsigned char *buf)
+{
+    uint32_t acc = 0;
+    for (uint64_t i = 0; i < BYTES_FULL; i += 8)
+        acc += *(const uint32_t *)(buf + i) ^ (uint32_t)i;
+    return acc;
+}
+
 int main(void)
 {
     uint32_t s = 0x1234567U;
@@ -60,7 +64,19 @@ int main(void)
         g_buf[i] = s ^ (s >> 13);
     }
 
-    printf("%08x %08x\n", sum_global_full(),
-           sum_dynamic_tail((const unsigned char *)g_buf));
+    long page = sysconf(_SC_PAGESIZE);
+    if (page <= 0) return 1;
+    size_t span = ((BYTES_FULL + (size_t)page - 1) / (size_t)page) * (size_t)page;
+    unsigned char *map = mmap(0, span + (size_t)page, PROT_READ | PROT_WRITE,
+                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (map == MAP_FAILED) return 2;
+    if (mprotect(map + span, (size_t)page, PROT_NONE)) return 3;
+    unsigned char *exact = map + span - (BYTES_FULL - 4);
+    const unsigned char *source = (const unsigned char *)g_buf;
+    for (unsigned i = 0; i < BYTES_FULL - 4; ++i) exact[i] = source[i];
+    uint32_t full = sum_global_full();
+    if (sum_dynamic_full(exact) != full) return 4;
+    if (munmap(map, span + (size_t)page)) return 5;
+    printf("%08x %08x\n", full, sum_dynamic_tail((const unsigned char *)g_buf));
     return 0;
 }

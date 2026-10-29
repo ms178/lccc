@@ -2134,18 +2134,14 @@ fn speculative_arm_budget(
 /// the scalar could take.  The exact, target-independent rule:
 ///
 /// a load of canonical address key K in arm A of a decision (pred P, arms
-/// T/F, merge M) may be speculated iff K is dereferenced on every path
-/// P→M:
-///   - diamond:  K ∈ derefs(P) ∪ derefs(other arm)   (the two paths are
-///     P→T→M and P→F→M; the arm's own derefs cover the path through it)
-///   - triangle: K ∈ derefs(P)                        (the direct P→M edge
-///     touches only P's memory operations)
-///
-/// Under this rule the converted form executes exactly the addresses some
-/// scalar path already executed, the same number of times, in the same
-/// per-path order (apply_diamond appends the arm's instructions to P, so no
-/// memory operation is reordered within a path) — trap-for-trap equivalent,
-/// value-for-value equivalent on the consuming path and discarded elsewhere.
+/// T/F, merge M) may be speculated only if every path already reads at least
+/// the same bytes:
+///   - diamond:  K ∈ reads(P) ∪ reads(other arm)
+///   - triangle: K ∈ reads(P)
+/// A preceding write alone is not evidence that the bytes are readable:
+/// some systems permit mappings or device locations that can be written but
+/// not read. The converted form can perform an additional nonvolatile read,
+/// but only of bytes already read on that scalar path.
 ///
 /// This is also precisely the reference compilers' contract.  GCC 14 (-O3,
 /// x86-64-v3), measured: `d[i] = s[i] < 0 ? -a[i] : a[i]` loads `a[i]`
@@ -2233,9 +2229,9 @@ fn block_has_free_barrier(ctx: &IfConvCtx<'_>, block_idx: usize) -> bool {
         .any(may_free_or_unmap)
 }
 
-/// Canonical-address dereference map of one block: for every non-volatile,
-/// default-address-space Load/Store pointer, the WIDEST access made through
-/// that address key.
+/// Canonical-address read map of one block: for every non-volatile,
+/// default-address-space load, the WIDEST read made through that address key.
+/// A store does not establish that a speculative read is permitted.
 ///
 /// FREES BARRIER: the scan is in program order and a potential
 /// free/unmap (see [`may_free_or_unmap`]) clears everything accumulated so
@@ -2255,13 +2251,6 @@ fn block_deref_keys(ctx: &IfConvCtx<'_>, block_idx: usize) -> FxHashMap<String, 
         }
         let (ptr, volatile, seg, ty) = match inst {
             Instruction::Load {
-                ptr,
-                volatile,
-                seg_override,
-                ty,
-                ..
-            }
-            | Instruction::Store {
                 ptr,
                 volatile,
                 seg_override,
@@ -2299,8 +2288,8 @@ const MAX_DOM_DEREF_CHAIN: usize = 64;
 /// `block_idx` yields blocks that have all executed — in order, before
 /// `block_idx`'s terminator — on any execution that reaches `block_idx`, and
 /// hence on both arms of a diamond or triangle hanging off it.  A
-/// non-volatile, default-address-space access of `w` bytes there proves those
-/// `w` bytes are dereferenceable on both arms, which is precisely the
+/// non-volatile, default-address-space read of `w` bytes there proves those
+/// `w` bytes are readable on both arms, which is precisely the
 /// evidence [`arm_load_speculation_ok`] requires.  Blocks with more than one
 /// predecessor end the walk (they are not dominated), so the result is a
 /// conservative subset of the true dominator set — never an over-estimate.
@@ -4202,6 +4191,87 @@ mod tests {
                 .iter()
                 .any(|i| matches!(i, Instruction::Phi { dest: d, .. } if d.0 == 40))
         );
+    }
+
+    #[test]
+    fn a_store_does_not_prove_an_address_readable() {
+        let mut f = IrFunction::new(
+            "write_then_maybe_read".to_string(),
+            IrType::I32,
+            vec![],
+            false,
+        );
+        f.blocks.push(block(
+            0,
+            vec![
+                Instruction::ParamRef {
+                    dest: Value(0),
+                    param_idx: 0,
+                    ty: IrType::Ptr,
+                },
+                Instruction::ParamRef {
+                    dest: Value(1),
+                    param_idx: 1,
+                    ty: IrType::I32,
+                },
+            ],
+            Terminator::Branch(BlockId(1)),
+        ));
+        f.blocks.push(block(
+            1,
+            vec![Instruction::Store {
+                ptr: Value(0),
+                val: Operand::Const(IrConst::I32(9)),
+                ty: IrType::I32,
+                volatile: false,
+                seg_override: AddressSpace::Default,
+            }],
+            Terminator::CondBranch {
+                cond: Operand::Value(Value(1)),
+                true_label: BlockId(2),
+                false_label: BlockId(3),
+            },
+        ));
+        f.blocks.push(block(
+            2,
+            vec![Instruction::Load {
+                dest: Value(2),
+                ptr: Value(0),
+                ty: IrType::I32,
+                volatile: false,
+                seg_override: AddressSpace::Default,
+            }],
+            Terminator::Branch(BlockId(3)),
+        ));
+        f.blocks.push(block(
+            3,
+            vec![Instruction::Phi {
+                dest: Value(3),
+                ty: IrType::I32,
+                incoming: vec![
+                    (Operand::Value(Value(2)), BlockId(2)),
+                    (Operand::Const(IrConst::I32(0)), BlockId(1)),
+                ],
+            }],
+            Terminator::Return(Some(Operand::Value(Value(3)))),
+        ));
+        f.next_value_id = 5;
+        let ctx = IfConvCtx::build(&f);
+        assert!(!arm_load_speculation_ok(&ctx, 1, None, &Value(0), 4));
+        assert!(detect_triangle(&ctx, 1).is_none());
+
+        // A genuine prior read covers the same bytes and retains the useful
+        // if-conversion, even when the block also contains a store.
+        f.blocks[1].instructions.push(Instruction::Load {
+            dest: Value(4),
+            ptr: Value(0),
+            ty: IrType::I32,
+            volatile: false,
+            seg_override: AddressSpace::Default,
+        });
+        let ctx = IfConvCtx::build(&f);
+        assert!(arm_load_speculation_ok(&ctx, 1, None, &Value(0), 4));
+        assert!(detect_triangle(&ctx, 1).is_some());
     }
 
     #[test]

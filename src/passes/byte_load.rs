@@ -1,5 +1,5 @@
-//! Little-endian byte-load reassembly: fold `p[0] | p[1] << 8 | ...` back
-//! into one wide load.
+//! Byte-load reassembly: fold consecutive little- or big-endian byte chains
+//! into one exactly sized load, with a byte swap when needed.
 //!
 //! Portable C spells an unaligned little-endian integer read as a chain of
 //! byte loads (`SIP_U8TO64_LE`, Linux's `get_unaligned_le*`, `htole*`/`le*toh`
@@ -58,10 +58,10 @@
 //!   fault where the original did not. The ordering question above is deliberately *asymmetric*: a torn
 //!   wide load that overlaps a source byte lands on the conservative side and
 //!   can never invent a value the byte chain would not have produced.
-//! * **Value equivalence.** The chain ORs each byte at its own little-endian
-//!   position, a pure reinterpretation of the same `n` bytes — the only
-//!   target-dependent step, so the pass is gated to the little-endian x86
-//!   targets in [`run_function`].
+//! * **Value equivalence.** Little-endian chains reinterpret the loaded bytes;
+//!   big-endian chains reverse them. A run narrower than its carrier is then
+//!   zero-extended, because every source byte is unsigned. The target gate in
+//!   [`run_function`] admits only machines where the unaligned load is valid.
 //! * **Provenance.** Consumed values must be single-def *and* single-use, the
 //!   byte loads non-volatile with the default address space, and all terms
 //!   must share one base *expression* (peeled through `Copy`s and constant
@@ -77,18 +77,16 @@
 //!
 //! # Refused, deliberately
 //!
-//! * Big-endian order (`p[0] << 56 | ...`) — a `bswap` load, which
-//!   [`super::bit_idioms`] owns; the two passes must not fight over it.
 //! * Signed byte casts (`(int8_t)p[0]`): the sign extension is not a
 //!   reinterpretation, so a widened load would be wrong.
 //! * Chains split across blocks, a base redefined inside the window, any
 //!   multi-use/multi-def chain value, and duplicate or non-multiple-of-8
 //!   offsets.
-//!
-//! Pass name for `CCC_DISABLE_PASSES`: `byte_load`.
 //! * `-Os`/`-Oz`: a wide load is not always the smaller *sequence* on every
 //!   target (on x86-64 it is, by a wide margin — but the size profile is
 //!   handled by the pipeline, not by a special case here).
+//!
+//! Pass name for `CCC_DISABLE_PASSES`: `byte_load`.
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::{AddressSpace, IrType};
@@ -128,6 +126,9 @@ struct Plan {
     /// Destination of the load. Equal to `dest` unless a conversion follows,
     /// in which case it is one of the folded values reused as a dead temporary.
     load_dest: Value,
+    /// For a reversed narrow run, a second folded value holds the swap result
+    /// before it is zero-extended to the carrier.
+    swap_dest: Option<Value>,
     /// Conversion from the loaded bytes to the assembled value.
     convert: Option<Convert>,
     /// Values whose defining instructions are folded away.
@@ -141,6 +142,8 @@ enum Convert {
     Bswap,
     /// Little-endian run narrower than its carrier: zero-extend (`Cast`).
     Zext,
+    /// Big-endian run narrower than its carrier: swap, then zero-extend.
+    BswapZext,
 }
 
 /// Per-function context: the single definition of each value, plus exact use
@@ -772,13 +775,14 @@ fn validate(
         };
         (c, 0)
     } else if resolved.iter().enumerate().all(|(k, (_, o))| *o == big(k)) {
-        // Big-endian: one wide load plus a byte reversal. The carrier is
-        // exactly the run's width here, so no width-changing conversion has to
-        // follow the reversal.
-        if m != carrier {
-            return None;
-        }
-        (Some(Convert::Bswap), m - 1)
+        // Reverse exactly the run's width; a narrower run is then
+        // zero-extended because all of its byte terms are unsigned.
+        let c = if m < carrier {
+            Convert::BswapZext
+        } else {
+            Convert::Bswap
+        };
+        (Some(c), m - 1)
     } else {
         return None;
     };
@@ -864,26 +868,28 @@ fn validate(
         }
     }
 
-    // A conversion needs a temporary to hold the loaded bytes. Reuse a folded
-    // value: each is single-use and about to become dead, so its id is free
-    // and no new value is created. Its former type does not matter — types
-    // live on instructions, not on value ids.
+    // Conversions need one temporary for the load, and a reversed narrow
+    // run needs another for the swap. Each reused value is single-use and
+    // about to become dead, so no new id is needed. Its former type does not
+    // matter — types live on instructions, not on value ids.
     let load_dest = match convert {
         None => dest,
         Some(_) => *consumed.iter().find(|v| **v != dest)?,
+    };
+    let swap_dest = if convert == Some(Convert::BswapZext) {
+        Some(*consumed.iter().find(|v| **v != dest && **v != load_dest)?)
+    } else {
+        None
     };
 
     Some(Plan {
         block,
         dest,
         ty,
-        load_ty: unsigned_of(if convert == Some(Convert::Zext) {
-            m as u32 * 8
-        } else {
-            carrier_bits
-        })?,
+        load_ty: unsigned_of(m as u32 * 8)?,
         load_ptr,
         load_dest,
+        swap_dest,
         convert,
         consumed,
     })
@@ -948,6 +954,29 @@ fn apply_block(block: Option<&mut BasicBlock>, plans: &[&Plan]) -> usize {
                         op: crate::ir::reexports::IrUnaryOp::Bswap,
                         src: Operand::Value(plan.load_dest),
                         ty: plan.load_ty,
+                    });
+                    if let Some(span) = span {
+                        new_spans.push(span);
+                    }
+                }
+                Some(Convert::BswapZext) => {
+                    // A validated plan always reserves a distinct second
+                    // temporary, avoiding a new SSA value during block rebuild.
+                    let swap_dest = plan.swap_dest.expect("narrow swap temporary");
+                    new_insns.push(Instruction::UnaryOp {
+                        dest: swap_dest,
+                        op: crate::ir::reexports::IrUnaryOp::Bswap,
+                        src: Operand::Value(plan.load_dest),
+                        ty: plan.load_ty,
+                    });
+                    if let Some(span) = span {
+                        new_spans.push(span);
+                    }
+                    new_insns.push(Instruction::Cast {
+                        dest: plan.dest,
+                        src: Operand::Value(swap_dest),
+                        from_ty: plan.load_ty,
+                        to_ty: plan.ty,
                     });
                     if let Some(span) = span {
                         new_spans.push(span);
@@ -1464,20 +1493,185 @@ mod tests {
     }
 
     #[test]
-    fn refuses_a_big_endian_run_narrower_than_its_carrier() {
-        // `(int)((p[0] << 8) | p[1])`: the reversal would have to be followed
-        // by a width-changing conversion (bswap16 then zext). That chain is
-        // deliberately left alone rather than risk a width-sensitive sequence
-        // in the backend; the little-endian twin is handled above.
+    fn folds_narrow_big_endian_runs_and_preserves_their_footprint() {
+        for target in [X64, Target::I686, Target::Aarch64] {
+            for (bits, carrier, load_ty) in [
+                (16, IrType::U32, IrType::U16),
+                (16, IrType::I32, IrType::U16),
+                (16, IrType::U64, IrType::U16),
+                (32, IrType::U64, IrType::U32),
+                (32, IrType::I64, IrType::U32),
+            ] {
+                let mut f = chain_func(
+                    bits,
+                    carrier,
+                    Flags {
+                        big_endian: true,
+                        field_offset: 8,
+                        nested_gep: true,
+                        ..Flags::default()
+                    },
+                );
+                f.blocks[0].source_spans =
+                    vec![crate::common::source::Span::dummy(); f.blocks[0].instructions.len()];
+                let original = f.clone();
+                assert_eq!(
+                    run_function(&mut f, target),
+                    1,
+                    "{target:?} {bits} {carrier:?}"
+                );
+                assert_loads_stay_in_footprint(&original, &f);
+                let loads = wide_loads(&f);
+                assert_eq!(loads.len(), 1);
+                assert_eq!(loads[0].2, load_ty);
+                assert_eq!(resolve(&f, loads[0].1), (Value(0), 8));
+                let swaps: Vec<_> = f.blocks[0]
+                    .instructions
+                    .iter()
+                    .filter_map(|i| match i {
+                        Instruction::UnaryOp {
+                            dest,
+                            op: IrUnaryOp::Bswap,
+                            src,
+                            ty,
+                        } => Some((*dest, *src, *ty)),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(swaps.len(), 1);
+                assert_eq!(swaps[0].1, Operand::Value(loads[0].0));
+                assert_eq!(swaps[0].2, load_ty);
+                let casts: Vec<_> = f.blocks[0]
+                    .instructions
+                    .iter()
+                    .filter_map(|i| match i {
+                        Instruction::Cast {
+                            dest,
+                            src,
+                            from_ty,
+                            to_ty,
+                        } if *from_ty == load_ty && *to_ty == carrier => Some((*dest, *src)),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(casts.len(), 1);
+                assert_eq!(casts[0].1, Operand::Value(swaps[0].0));
+                assert!(matches!(
+                    &f.blocks[0].terminator,
+                    Terminator::Return(Some(Operand::Value(v))) if *v == casts[0].0
+                ));
+                assert_eq!(
+                    f.blocks[0].source_spans.len(),
+                    f.blocks[0].instructions.len()
+                );
+                let mut definitions = FxHashSet::default();
+                for inst in &f.blocks[0].instructions {
+                    if let Some(dest) = inst.dest() {
+                        assert!(definitions.insert(dest), "duplicate destination {dest:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn narrow_big_endian_reuses_the_zero_offset_base() {
         let mut f = chain_func(
             16,
             IrType::U32,
             Flags {
-                narrow_carrier: true,
                 big_endian: true,
                 ..Flags::default()
             },
         );
+        let original = f.clone();
+        assert_eq!(run_function(&mut f, X64), 1);
+        assert_loads_stay_in_footprint(&original, &f);
+        let loads = wide_loads(&f);
+        assert_eq!(loads.len(), 1);
+        assert_eq!(loads[0].2, IrType::U16);
+        assert_eq!(resolve(&f, loads[0].1), (Value(0), 0));
+    }
+
+    #[test]
+    fn narrow_big_endian_refuses_unordered_or_unsupported_accesses() {
+        for flags in [
+            Flags {
+                volatile: true,
+                ..Flags::default()
+            },
+            Flags {
+                extra_use: true,
+                ..Flags::default()
+            },
+            Flags {
+                duplicate_offset: true,
+                ..Flags::default()
+            },
+            Flags {
+                store_inside: true,
+                ..Flags::default()
+            },
+        ] {
+            let mut f = chain_func(
+                16,
+                IrType::U32,
+                Flags {
+                    big_endian: true,
+                    ..flags
+                },
+            );
+            assert_eq!(run_function(&mut f, X64), 0, "{flags:?}");
+        }
+        let mut f = chain_func(
+            16,
+            IrType::U32,
+            Flags {
+                big_endian: true,
+                ..Flags::default()
+            },
+        );
+        assert_eq!(run_function(&mut f, Target::Riscv64), 0);
+
+        let mut f = chain_func(
+            16,
+            IrType::U32,
+            Flags {
+                big_endian: true,
+                ..Flags::default()
+            },
+        );
+        let mut signed_load = false;
+        for inst in &mut f.blocks[0].instructions {
+            match inst {
+                Instruction::Load { ty, .. } if !signed_load && *ty == IrType::U8 => {
+                    *ty = IrType::I8;
+                    signed_load = true;
+                }
+                Instruction::Cast { from_ty, .. } if signed_load => {
+                    *from_ty = IrType::I8;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(signed_load);
+        assert_eq!(run_function(&mut f, X64), 0);
+
+        let mut f = chain_func(
+            16,
+            IrType::U32,
+            Flags {
+                big_endian: true,
+                ..Flags::default()
+            },
+        );
+        for inst in &mut f.blocks[0].instructions {
+            if let Instruction::Load { seg_override, .. } = inst {
+                *seg_override = AddressSpace::SegFs;
+                break;
+            }
+        }
         assert_eq!(run_function(&mut f, X64), 0);
     }
 

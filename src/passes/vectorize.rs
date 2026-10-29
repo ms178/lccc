@@ -94,6 +94,9 @@ mod byte_count_normalize;
 #[cfg(test)]
 #[path = "vectorize_byte_sum_tests.rs"]
 mod byte_sum_tests;
+#[cfg(test)]
+#[path = "vectorize_cond_store_tests.rs"]
+mod cond_store_safety_tests;
 #[path = "vectorize_generator_map.rs"]
 mod generator_map;
 #[path = "vectorize_strict_recip.rs"]
@@ -1151,7 +1154,7 @@ fn vectorize_with_analysis_mode(
             && !force_sse2
             && x86_avx2_available()
             && {
-                let n = strided_i32_reduce::try_transform(func, loop_info, &cfg, symbol_facts);
+                let n = strided_i32_reduce::try_transform(func, loop_info, &cfg);
                 total_changes += n;
                 n > 0
             }
@@ -1167,10 +1170,10 @@ fn vectorize_with_analysis_mode(
             // loops as well was collateral: it silently un-vectorized the
             // late map loops, and `check_vec_dead_remainder.sh` catches one
             // of them (`shape_u16_tail`) falling back to scalar.
-            // Conditional-store statement forms (`if (c1 && c2) s[i] = f(s[i]);`)
-            // are not map-shaped until the guarded store becomes a select
-            // against the dominating same-address load.  Rewrite first
-            // (fail-closed), then the standard analysis applies.
+            // A guarded same-address store can become a select map only for
+            // an unobservable private destination; an arbitrary pointer may
+            // be read-only or shared even when its dominating load succeeds.
+            // The rewrite proves that precondition before changing the CFG.
             if loop_info
                 .body
                 .iter()
@@ -7625,17 +7628,21 @@ impl<'a> MapEmitCtx<'a> {
 // died with the second condition block).  Fail-closed throughout: a
 // declined rewrite leaves the scalar loop byte-exact.
 
-/// Index every SSA definition to its (block, instruction) site.
-fn cond_store_def_sites(func: &IrFunction) -> FxHashMap<Value, (usize, usize)> {
+/// Index SSA definitions. The rewriter relies on a unique definition for
+/// every value it moves, compares or re-materializes; post-SSA IR can have
+/// repeated destinations, so reject that form instead of choosing a site.
+fn cond_store_def_sites(func: &IrFunction) -> Option<FxHashMap<Value, (usize, usize)>> {
     let mut defs = FxHashMap::default();
     for (bi, block) in func.blocks.iter().enumerate() {
         for (ii, inst) in block.instructions.iter().enumerate() {
             if let Some(d) = inst.dest() {
-                defs.insert(d, (bi, ii));
+                if defs.insert(d, (bi, ii)).is_some() {
+                    return None;
+                }
             }
         }
     }
-    defs
+    Some(defs)
 }
 
 /// Whether `a` and `b` compute the same pure value: same opcode, same
@@ -7778,7 +7785,7 @@ fn cond_store_materialize(
             from_ty,
             to_ty,
             ..
-        } => {
+        } if !from_ty.is_float() && !to_ty.is_float() => {
             let src = cond_store_materialize(
                 func,
                 defs,
@@ -7813,7 +7820,7 @@ fn cond_store_materialize(
             )?;
             Instruction::Copy { dest: d, src }
         }
-        Instruction::UnaryOp { op, src, ty, .. } => {
+        Instruction::UnaryOp { op, src, ty, .. } if !ty.is_float() => {
             let src = cond_store_materialize(
                 func,
                 defs,
@@ -7835,7 +7842,7 @@ fn cond_store_materialize(
         }
         Instruction::BinOp {
             op, lhs, rhs, ty, ..
-        } if !op.can_trap() || ty.is_float() => {
+        } if !op.can_trap() && !ty.is_float() => {
             let lhs = cond_store_materialize(
                 func,
                 defs,
@@ -7870,7 +7877,7 @@ fn cond_store_materialize(
         }
         Instruction::Cmp {
             op, lhs, rhs, ty, ..
-        } => {
+        } if !ty.is_float() => {
             let lhs = cond_store_materialize(
                 func,
                 defs,
@@ -8215,33 +8222,148 @@ fn cond_store_no_escaping_uses(
     true
 }
 
-/// Analyze a one-source copy/scale/add/affine store loop.
+/// Prove that an extra write cannot be observed outside this function.
 ///
-/// Strict legality: the loop must be straight-line (no internal conditionals),
-/// contain exactly one load and one store, only simple non-trapping arithmetic,
-/// and the two GEP base pointers must be provably distinct (separate globals
-/// or allocas) so the vector store cannot clobber a not-yet-read source lane.
-/// Rewrite the conditional-store statement form into the straight-line
-/// nested-Select map shape the standard pipeline already handles:
+/// Only a single-definition, non-volatile stack allocation reached through
+/// GEPs and copies is admitted. Track every such derived address, then reject
+/// address escapes, opaque uses, volatile or segmented accesses, and inline
+/// assembly/stack manipulation. In particular, neither an arbitrary pointer
+/// parameter nor a global becomes writable merely because a load succeeded.
+fn proves_private_stack_object(func: &IrFunction, ptr: Value) -> bool {
+    let mut defs = FxHashMap::default();
+    let mut multi_def = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Some(dest) = inst.dest() {
+                if defs.insert(dest, inst).is_some() {
+                    multi_def.insert(dest);
+                }
+            }
+        }
+    }
+    let mut root = ptr;
+    let mut seen = FxHashSet::default();
+    loop {
+        if !seen.insert(root) || multi_def.contains(&root) {
+            return false;
+        }
+        match defs.get(&root) {
+            Some(Instruction::Alloca {
+                volatile: false,
+                semantic_volatile: false,
+                ..
+            }) => break,
+            Some(Instruction::GetElementPtr { base, .. }) => root = *base,
+            Some(Instruction::Copy {
+                src: Operand::Value(src),
+                ..
+            }) => root = *src,
+            _ => return false,
+        }
+    }
+
+    let mut derived = FxHashSet::default();
+    derived.insert(root);
+    loop {
+        let mut changed = false;
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                let dest = match inst {
+                    Instruction::GetElementPtr { dest, base, .. } if derived.contains(base) => {
+                        Some(*dest)
+                    }
+                    Instruction::Copy {
+                        dest,
+                        src: Operand::Value(src),
+                    } if derived.contains(src) => Some(*dest),
+                    _ => None,
+                };
+                if let Some(dest) = dest {
+                    if multi_def.contains(&dest) {
+                        return false;
+                    }
+                    changed |= derived.insert(dest);
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let refers_to_derived = |op: &Operand| matches!(op, Operand::Value(v) if derived.contains(v));
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            match inst {
+                Instruction::GetElementPtr { offset, .. } if refers_to_derived(offset) => {
+                    return false;
+                }
+                Instruction::GetElementPtr { .. } | Instruction::Copy { .. } => {}
+                Instruction::Load {
+                    ptr,
+                    seg_override,
+                    volatile,
+                    ..
+                } if derived.contains(ptr) => {
+                    if *volatile || *seg_override != AddressSpace::Default {
+                        return false;
+                    }
+                }
+                Instruction::Store {
+                    val,
+                    ptr,
+                    seg_override,
+                    volatile,
+                    ..
+                } => {
+                    if refers_to_derived(val)
+                        || (derived.contains(ptr)
+                            && (*volatile || *seg_override != AddressSpace::Default))
+                    {
+                        return false;
+                    }
+                }
+                Instruction::InlineAsm { .. }
+                | Instruction::StackSave { .. }
+                | Instruction::StackRestore { .. }
+                | Instruction::DynAlloca { .. }
+                | Instruction::NonlocalGotoSave { .. }
+                | Instruction::NonlocalGoto { .. } => return false,
+                _ => {
+                    let mut escapes = false;
+                    inst.for_each_used_value(|v| escapes |= derived.contains(&Value(v)));
+                    if escapes {
+                        return false;
+                    }
+                }
+            }
+        }
+        let mut escapes = false;
+        block
+            .terminator
+            .for_each_used_value(|v| escapes |= derived.contains(&Value(v)));
+        if escapes {
+            return false;
+        }
+    }
+    derived.contains(&ptr)
+}
+
+/// Rewrite a guarded same-address store into a select map only when the
+/// destination is proven private and unobservable. A load followed by a
+/// write-back of the same value is still a write: for an arbitrary pointer it
+/// can fault on a read-only page or race with a concurrent reader. A hardware
+/// masked store, unlike an unconditional blend-and-store, does not write the
+/// inactive lanes. Until that distinction is represented in this map pipeline,
+/// unknown, escaped, volatile, and non-default-address-space destinations must
+/// retain their original control flow.
 ///
+/// The admitted local form is:
 ///   L = load s[i]; if (c1 && c2) s[i] = f(L);
-///   ── becomes ──
 ///   L = load s[i]; s[i] = select(c1, select(c2, f(L), L), L);
 ///
-/// The skip value is the SAME-address load that dominates the branch, so
-/// the store is never speculative: unselected lanes write back the bytes
-/// the scalar loop would have left untouched (the load+blend+store
-/// equivalence GCC's vpmaskmovd form and LLVM's if-conversion both rely
-/// on).  The condition chain is a linear dominator sequence of
-/// single-condition blocks whose non-storeward edges all bypass directly
-/// to the loop latch (the empty-else shape); the polarity of each
-/// condition (which edge continues toward the store) flips its compare
-/// when necessary, and the nested-Select form is exactly what the map
-/// parser recovers into `MaskConj` (and the range fold into `RangeMask`).
-///
-/// Fail-closed: any shape deviation (extra side effects, a second load, a
-/// different skip target, volatile access, non-integer compares the flip
-/// table does not cover) leaves the loop untouched.
+/// The condition chain is a linear sequence whose non-storeward edges bypass
+/// to the latch. The rewriter also rejects potentially trapping or observable
+/// floating-point computations on formerly skipped paths.
 fn rewrite_conditional_store(
     func: &mut IrFunction,
     loop_info: &loop_analysis::NaturalLoop,
@@ -8364,7 +8486,7 @@ fn rewrite_conditional_store(
                     .collect();
                 for inst in &block.instructions {
                     match inst {
-                        Instruction::Cmp { dest, .. } => {
+                        Instruction::Cmp { dest, ty, .. } if !ty.is_float() => {
                             if folded_tree.is_none() && cmp_seen.is_some() {
                                 return false;
                             }
@@ -8373,13 +8495,15 @@ fn rewrite_conditional_store(
                         Instruction::Load {
                             volatile: false, ..
                         } if is_first => {}
-                        Instruction::BinOp { op, dest, .. }
-                            if gep_offsets.contains(dest)
-                                || (folded_tree.is_some()
-                                    && matches!(op, IrBinOp::And | IrBinOp::Or)) => {}
-                        Instruction::GetElementPtr { .. }
-                        | Instruction::Cast { .. }
-                        | Instruction::Copy { .. } => {}
+                        Instruction::BinOp { op, dest, ty, .. }
+                            if !ty.is_float()
+                                && !op.can_trap()
+                                && (gep_offsets.contains(dest)
+                                    || (folded_tree.is_some()
+                                        && matches!(op, IrBinOp::And | IrBinOp::Or))) => {}
+                        Instruction::Cast { from_ty, to_ty, .. }
+                            if !from_ty.is_float() && !to_ty.is_float() => {}
+                        Instruction::GetElementPtr { .. } | Instruction::Copy { .. } => {}
                         _ => return false,
                     }
                 }
@@ -8516,18 +8640,18 @@ fn rewrite_conditional_store(
                 }
                 _store_gep = Some(*dest);
             }
-            Instruction::BinOp { op, ty, .. } if !op.can_trap() || ty.is_float() => {}
-            Instruction::Cast { .. } | Instruction::Copy { .. } | Instruction::UnaryOp { .. } => {}
+            Instruction::BinOp { op, ty, .. } if !op.can_trap() && !ty.is_float() => {}
+            Instruction::Cast { from_ty, to_ty, .. }
+                if !from_ty.is_float() && !to_ty.is_float() => {}
+            Instruction::UnaryOp { ty, .. } if !ty.is_float() => {}
+            Instruction::Copy { .. } => {}
             _ => return false, // loads, calls, branches-in-body: fail closed
         }
     }
     let Some((store_ptr, store_val, elem_ty)) = store_inst else {
         return false;
     };
-    if !matches!(
-        elem_ty,
-        IrType::I8 | IrType::U8 | IrType::I32 | IrType::U32 | IrType::F32 | IrType::F64
-    ) {
+    if !matches!(elem_ty, IrType::I8 | IrType::U8 | IrType::I32 | IrType::U32) {
         return false;
     }
     // The dominating load: exactly one, in the first chain block, same
@@ -8563,7 +8687,7 @@ fn rewrite_conditional_store(
             _ => false,
         }
     };
-    if !same_address {
+    if !same_address || !proves_private_stack_object(func, store_ptr) {
         return false;
     }
 
@@ -8618,7 +8742,9 @@ fn rewrite_conditional_store(
     if !cond_store_no_escaping_uses(func, &cleared, &moved_defs) {
         return false;
     }
-    let defs = cond_store_def_sites(func);
+    let Some(defs) = cond_store_def_sites(func) else {
+        return false;
+    };
     let mut next_id = func.next_value_id;
     let mut remap: FxHashMap<Value, Value> = FxHashMap::default();
     let mut prefix: Vec<Instruction> = Vec::new();
@@ -8782,12 +8908,14 @@ fn operand_equiv(func: &IrFunction, a: &Operand, b: &Operand, depth: usize) -> b
                 op: oa,
                 lhs: la,
                 rhs: ra,
+                ty: ta,
                 ..
             }),
             Some(Instruction::BinOp {
                 op: ob,
                 lhs: lb,
                 rhs: rb,
+                ty: tb,
                 ..
             }),
         ) => {
@@ -8800,12 +8928,25 @@ fn operand_equiv(func: &IrFunction, a: &Operand, b: &Operand, depth: usize) -> b
             let swapped = commutative
                 && operand_equiv(func, &la, &rb, depth - 1)
                 && operand_equiv(func, &ra, &lb, depth - 1);
-            oa == ob && (direct || swapped)
+            oa == ob && ta == tb && (direct || swapped)
         }
         (
-            Some(Instruction::Cast { src: sa, .. }) | Some(Instruction::Copy { src: sa, .. }),
-            Some(Instruction::Cast { src: sb, .. }) | Some(Instruction::Copy { src: sb, .. }),
-        ) => operand_equiv(func, &sa, &sb, depth - 1),
+            Some(Instruction::Cast {
+                src: sa,
+                from_ty: fa,
+                to_ty: ta,
+                ..
+            }),
+            Some(Instruction::Cast {
+                src: sb,
+                from_ty: fb,
+                to_ty: tb,
+                ..
+            }),
+        ) => fa == fb && ta == tb && operand_equiv(func, &sa, &sb, depth - 1),
+        (Some(Instruction::Copy { src: sa, .. }), Some(Instruction::Copy { src: sb, .. })) => {
+            operand_equiv(func, &sa, &sb, depth - 1)
+        }
         _ => false,
     }
 }
@@ -9015,11 +9156,10 @@ fn emit_cond_mask_selects(
 /// the loop's only store plus pure plumbing, the header holds exactly one
 /// non-volatile load of the element type, the mask must decompose into
 /// header-local compares via and/or (bounded depth; anything else — a
-/// loaded bool, a call result, a phi — declines), the store must sit on
-/// the branch's TRUE edge (the negated spelling is rare and stays
-/// scalar), and the store address must be PROVEN identical to the load
-/// address (same GEP value or structurally equivalent base+offset under
-/// the commutativity-restricted `operand_equiv`).
+/// loaded bool, a call result, a phi — declines), and the store address
+/// must be proven identical to the load address under the restricted
+/// `operand_equiv`. The same private-destination and non-observable
+/// speculation proof as the chain form is required.
 fn rewrite_folded_cond_store(
     func: &mut IrFunction,
     loop_info: &loop_analysis::NaturalLoop,
@@ -9097,18 +9237,18 @@ fn rewrite_folded_cond_store(
                 }
                 _store_gep = Some(*dest);
             }
-            Instruction::BinOp { op, ty, .. } if !op.can_trap() || ty.is_float() => {}
-            Instruction::Cast { .. } | Instruction::Copy { .. } | Instruction::UnaryOp { .. } => {}
+            Instruction::BinOp { op, ty, .. } if !op.can_trap() && !ty.is_float() => {}
+            Instruction::Cast { from_ty, to_ty, .. }
+                if !from_ty.is_float() && !to_ty.is_float() => {}
+            Instruction::UnaryOp { ty, .. } if !ty.is_float() => {}
+            Instruction::Copy { .. } => {}
             _ => return false, // loads, calls, branches-in-body: fail closed
         }
     }
     let Some((store_ptr, store_val, elem_ty)) = store_inst else {
         return false;
     };
-    if !matches!(
-        elem_ty,
-        IrType::I8 | IrType::U8 | IrType::I32 | IrType::U32 | IrType::F32 | IrType::F64
-    ) {
+    if !matches!(elem_ty, IrType::I8 | IrType::U8 | IrType::I32 | IrType::U32) {
         return false;
     }
 
@@ -9145,14 +9285,16 @@ fn rewrite_folded_cond_store(
                 }
                 load_inst = Some((*dest, *ptr));
             }
-            Instruction::Cmp { .. }
-            | Instruction::Cast { .. }
-            | Instruction::Copy { .. }
-            | Instruction::GetElementPtr { .. }
-            | Instruction::UnaryOp { .. } => {}
-            Instruction::BinOp { dest, op, .. }
-                if guard_gep_offsets.contains(dest) || matches!(op, IrBinOp::And | IrBinOp::Or) => {
-            }
+            Instruction::Cmp { ty, .. } if !ty.is_float() => {}
+            Instruction::Cast { from_ty, to_ty, .. }
+                if !from_ty.is_float() && !to_ty.is_float() => {}
+            Instruction::UnaryOp { ty, .. } if !ty.is_float() => {}
+            Instruction::Copy { .. } | Instruction::GetElementPtr { .. } => {}
+            Instruction::BinOp { dest, op, ty, .. }
+                if !ty.is_float()
+                    && !op.can_trap()
+                    && (guard_gep_offsets.contains(dest)
+                        || matches!(op, IrBinOp::And | IrBinOp::Or)) => {}
             _ => return false,
         }
     }
@@ -9172,7 +9314,7 @@ fn rewrite_folded_cond_store(
             _ => false,
         }
     };
-    if !same_address {
+    if !same_address || !proves_private_stack_object(func, store_ptr) {
         return false;
     }
 
@@ -9221,7 +9363,9 @@ fn rewrite_folded_cond_store(
     if !cond_store_no_escaping_uses(func, &cleared, &moved_defs) {
         return false;
     }
-    let defs = cond_store_def_sites(func);
+    let Some(defs) = cond_store_def_sites(func) else {
+        return false;
+    };
     let mut next_id = func.next_value_id;
     let mut remap: FxHashMap<Value, Value> = FxHashMap::default();
     let mut prefix: Vec<Instruction> = Vec::new();
@@ -35517,6 +35661,65 @@ mod cond_store_equiv_tests {
             IrBinOp::Add,
         );
         assert!(operand_equiv(
+            &f,
+            &Operand::Value(Value(0)),
+            &Operand::Value(Value(1)),
+            3
+        ));
+    }
+
+    #[test]
+    fn different_arithmetic_widths_are_not_equivalent() {
+        let mut f = build_func(
+            Operand::Value(Value(2)),
+            Operand::Const(IrConst::I64(4)),
+            IrBinOp::Add,
+            IrBinOp::Add,
+        );
+        if let Instruction::BinOp { ty, .. } = &mut f.blocks[0].instructions[1] {
+            *ty = IrType::I32;
+        }
+        assert!(!operand_equiv(
+            &f,
+            &Operand::Value(Value(0)),
+            &Operand::Value(Value(1)),
+            3
+        ));
+    }
+
+    #[test]
+    fn casts_must_match_and_are_not_copies() {
+        let mut f = build_func(
+            Operand::Value(Value(2)),
+            Operand::Const(IrConst::I64(4)),
+            IrBinOp::Add,
+            IrBinOp::Add,
+        );
+        f.blocks[0].instructions = vec![
+            Instruction::Cast {
+                dest: Value(0),
+                src: Operand::Value(Value(2)),
+                from_ty: IrType::U64,
+                to_ty: IrType::U8,
+            },
+            Instruction::Cast {
+                dest: Value(1),
+                src: Operand::Value(Value(2)),
+                from_ty: IrType::U64,
+                to_ty: IrType::U64,
+            },
+        ];
+        assert!(!operand_equiv(
+            &f,
+            &Operand::Value(Value(0)),
+            &Operand::Value(Value(1)),
+            3
+        ));
+        f.blocks[0].instructions[1] = Instruction::Copy {
+            dest: Value(1),
+            src: Operand::Value(Value(2)),
+        };
+        assert!(!operand_equiv(
             &f,
             &Operand::Value(Value(0)),
             &Operand::Value(Value(1)),

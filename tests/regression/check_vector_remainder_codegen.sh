@@ -24,11 +24,9 @@ fail() { # fail <title> <detail>
 "$CCC" "${flags[@]}" -S "$dir/../benchmark/patterns/simd_fp_oracle.c" \
     -o "$tmp/reduction.s"
 
-# The strided-2 i32 sum-reduction fixture: one function reading a global array
-# (the whole vector prefix is provably inside the object) and one reading a
-# run-time pointer (only the prefix inside the scalar loop's own bytes may be
-# vectorized). Its output is compared against GCC, so the packed arithmetic
-# assertion below cannot pass on a scalar fallback that happens to be correct.
+# The strided-2 i32 reduction fixture checks shared global and dynamic
+# pointers, exact-width loads, a protected final gap, and the scalar tail.
+# Compare arithmetic with GCC and require the packed path to remain live.
 strided_src="$dir/vectorize_strided_i32_reduce.c"
 "$CCC" "${flags[@]}" -S "$strided_src" -o "$tmp/strided.s"
 "$CCC" "${flags[@]}" "$strided_src" -o "$tmp/strided"
@@ -39,13 +37,24 @@ if [[ $actual_out != "$expected_out" ]]; then
     fail "strided i32 reduction arithmetic" \
         "output differs from GCC (lccc: $actual_out / gcc: $expected_out)"
 fi
+
+# Unlike guard-page bounds, a hardware read watchpoint observes a load of
+# an intervening object even when that object is accessible. The driver first
+# proves the watchpoint fires on a deliberate read, then runs the LCCC kernel.
+"$CCC" "${flags[@]}" -c "$dir/fixtures/strided_exact/kernel.c" -o "$tmp/watch-kernel.o"
+"$CCC" "${flags[@]}" -S "$dir/fixtures/strided_exact/kernel.c" -o "$tmp/watch-kernel.s"
+${GCC_BIN:-gcc} -O2 "$dir/fixtures/strided_exact/watch_driver.c" "$tmp/watch-kernel.o" -o "$tmp/watch"
+timeout 30 "$tmp/watch" || fail "strided exact-access watchpoint" "gap was read or watchpoint setup failed"
+if ! grep -q 'vpinsrd' "$tmp/watch-kernel.s"; then
+    fail "strided exact-access watchpoint" "kernel did not take the packed exact-load path"
+fi
 python3 - "$tmp/strided.s" <<'PY2'
 import re
 import sys
 
 text = open(sys.argv[1], encoding="utf-8").read()
 packed = re.compile(r"\bvp(?:addd|subd|xor[ds]?|ord|andd|mulld|slld|srld|srad)\b")
-for name in ("sum_global_full", "sum_dynamic_tail"):
+for name in ("sum_global_full", "sum_dynamic_tail", "sum_dynamic_full"):
     match = re.search(rf"(?ms)^{name}:\n(.*?)^\.size {name},", text)
     if not match:
         raise SystemExit(f"{name}: missing assembly body")
@@ -63,6 +72,8 @@ for name in ("sum_global_full", "sum_dynamic_tail"):
     if not packed.search(body):
         reject("no packed dword arithmetic in the reduction loop "
                "(a scalar fallback cannot be the vectorized transform)")
+    if len(re.findall(r"\bvpinsrd\b", body)) < 2 or "vinserti128" not in body:
+        reject("shared/dynamic stream lacks the exact four-dword load")
 PY2
 
 python3 - "$tmp/matmul.s" "$tmp/reduction.s" "$dir/lib" <<'PY'

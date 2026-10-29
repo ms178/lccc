@@ -1,7 +1,10 @@
 //! Data-placement policy; no instruction gains an aligned-access assumption.
 use super::common::PtrDirective;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
-use crate::ir::reexports::{Instruction, IntrinsicOp, IrBinOp, IrGlobal, IrModule, Operand};
+use crate::common::types::IrType;
+use crate::ir::reexports::{
+    CallInfo, Instruction, IntrinsicOp, IrBinOp, IrFunction, IrGlobal, IrModule, Operand,
+};
 
 pub(super) struct DataAlignment {
     optimize_size: bool,
@@ -12,67 +15,8 @@ impl DataAlignment {
     pub(super) fn new(module: &IrModule, ptr_dir: PtrDirective, optimize_size: bool) -> Self {
         let mut wide_globals = FxHashSet::default();
         // .quad identifies x86-64 here; AArch64/RV64 use .xword/.dword.
-        if !optimize_size && matches!(ptr_dir, PtrDirective::Quad) {
-            for function in &module.functions {
-                let mut pending = Vec::new();
-                for inst in function.blocks.iter().flat_map(|b| &b.instructions) {
-                    enqueue_wide_addresses(inst, &mut pending);
-                }
-                if pending.is_empty() {
-                    continue;
-                }
-                // Data emission may run AFTER phi destruction. A value can
-                // have both its entry copy and backedge copy: keeping only
-                // the last definition loses the global behind a recurrence.
-                // Taking their union only affects placement, never an alias
-                // or aligned-load assumption.
-                let mut definitions: FxHashMap<u32, Vec<&Instruction>> = FxHashMap::default();
-                for inst in function.blocks.iter().flat_map(|b| &b.instructions) {
-                    if let Some(dest) = inst.dest() {
-                        definitions.entry(dest.0).or_default().push(inst);
-                    }
-                }
-                let mut seen = FxHashSet::default();
-                while let Some(operand) = pending.pop() {
-                    let Operand::Value(value) = operand else {
-                        continue;
-                    };
-                    if !seen.insert(value.0) {
-                        continue;
-                    }
-                    let Some(sites) = definitions.get(&value.0) else {
-                        continue;
-                    };
-                    for instruction in sites {
-                        match instruction {
-                            Instruction::GlobalAddr { name, .. } => {
-                                wide_globals.insert(name.clone());
-                            }
-                            Instruction::GetElementPtr { base, .. } => {
-                                pending.push(Operand::Value(*base))
-                            }
-                            Instruction::Copy { src, .. } | Instruction::Cast { src, .. } => {
-                                pending.push(*src)
-                            }
-                            Instruction::Phi { incoming, .. } => {
-                                pending.extend(incoming.iter().map(|(op, _)| *op))
-                            }
-                            Instruction::Select {
-                                true_val,
-                                false_val,
-                                ..
-                            } => pending.extend([*true_val, *false_val]),
-                            Instruction::BinOp {
-                                op: IrBinOp::Add | IrBinOp::Sub,
-                                lhs,
-                                rhs,
-                                ..
-                            } => pending.extend([*lhs, *rhs]),
-                            _ => {}
-                        }
-                    }
-                }
-            }
+        if !optimize_size && matches!(ptr_dir, PtrDirective::Quad) && !module.globals.is_empty() {
+            wide_globals = trace_wide_globals(module);
         }
         Self {
             optimize_size,
@@ -99,6 +43,152 @@ impl DataAlignment {
         };
         global.align.max(minimum)
     }
+}
+
+type Definitions<'a> = FxHashMap<u32, Vec<&'a Instruction>>;
+
+fn definitions(function: &IrFunction) -> Definitions<'_> {
+    // Emission can run after phi destruction, when one value has several
+    // entry/backedge definitions. Their union affects placement only.
+    let mut definitions: Definitions<'_> = FxHashMap::default();
+    for inst in function.blocks.iter().flat_map(|block| &block.instructions) {
+        if let Some(dest) = inst.dest() {
+            definitions.entry(dest.0).or_default().push(inst);
+        }
+    }
+    definitions
+}
+
+fn trace_roots(
+    definitions: &Definitions<'_>,
+    mut pending: Vec<Operand>,
+    wide_globals: &mut FxHashSet<String>,
+) -> FxHashSet<usize> {
+    let mut params = FxHashSet::default();
+    let mut seen = FxHashSet::default();
+    while let Some(operand) = pending.pop() {
+        let Operand::Value(value) = operand else {
+            continue;
+        };
+        if !seen.insert(value.0) {
+            continue;
+        }
+        let Some(sites) = definitions.get(&value.0) else {
+            continue;
+        };
+        for instruction in sites {
+            match instruction {
+                Instruction::GlobalAddr { name, .. } => {
+                    wide_globals.insert(name.clone());
+                }
+                Instruction::ParamRef {
+                    param_idx,
+                    ty: IrType::Ptr,
+                    ..
+                } => {
+                    params.insert(*param_idx);
+                }
+                Instruction::GetElementPtr { base, .. } => pending.push(Operand::Value(*base)),
+                Instruction::Copy { src, .. } | Instruction::Cast { src, .. } => pending.push(*src),
+                Instruction::Phi { incoming, .. } => {
+                    pending.extend(incoming.iter().map(|(op, _)| *op))
+                }
+                Instruction::Select {
+                    true_val,
+                    false_val,
+                    ..
+                } => pending.extend([*true_val, *false_val]),
+                Instruction::BinOp {
+                    op: IrBinOp::Add | IrBinOp::Sub,
+                    lhs,
+                    rhs,
+                    ..
+                } => pending.extend([*lhs, *rhs]),
+                _ => {}
+            }
+        }
+    }
+    params
+}
+
+fn trace_wide_globals(module: &IrModule) -> FxHashSet<String> {
+    let mut wide_globals = FxHashSet::default();
+    // Construct definition maps lazily: most functions do not participate in
+    // a wide access or in a call chain feeding one.
+    let mut defs: Vec<Option<Definitions<'_>>> = vec![None; module.functions.len()];
+    let mut required_params: Vec<FxHashSet<usize>> =
+        vec![FxHashSet::default(); module.functions.len()];
+    let mut pending_params = Vec::new();
+
+    for (index, function) in module.functions.iter().enumerate() {
+        let mut addresses = Vec::new();
+        for inst in function.blocks.iter().flat_map(|block| &block.instructions) {
+            enqueue_wide_addresses(inst, &mut addresses);
+        }
+        if addresses.is_empty() {
+            continue;
+        }
+        let definitions = defs[index].get_or_insert_with(|| definitions(function));
+        for param in trace_roots(definitions, addresses, &mut wide_globals) {
+            if required_params[index].insert(param) {
+                pending_params.push((index, param));
+            }
+        }
+    }
+
+    if pending_params.is_empty() {
+        return wide_globals;
+    }
+    let mut callers: FxHashMap<&str, Vec<(usize, &CallInfo)>> = FxHashMap::default();
+    for (index, function) in module.functions.iter().enumerate() {
+        for inst in function.blocks.iter().flat_map(|block| &block.instructions) {
+            if let Instruction::Call { func, info } = inst {
+                callers
+                    .entry(func.as_str())
+                    .or_default()
+                    .push((index, info));
+            }
+        }
+    }
+
+    // A wide use of a formal parameter makes the corresponding arguments of
+    // direct callers placement candidates. Propagate only newly discovered
+    // (function, parameter) pairs, so recursion and call cycles terminate.
+    // Unresolved indirect calls and ambiguous ABI forms are intentionally not
+    // guessed. Nothing here changes alias information or instruction alignment.
+    while let Some((callee_index, param)) = pending_params.pop() {
+        let callee = &module.functions[callee_index];
+        if callee.is_variadic || callee.uses_sret {
+            continue;
+        }
+        let Some(sites) = callers.get(callee.name.as_str()) else {
+            continue;
+        };
+        for &(caller_index, info) in sites {
+            if info.is_variadic
+                || info.is_sret
+                || param >= info.num_fixed_args
+                || info.arg_types.get(param) != Some(&IrType::Ptr)
+                || info
+                    .struct_arg_sizes
+                    .get(param)
+                    .is_some_and(Option::is_some)
+            {
+                continue;
+            }
+            let Some(argument) = info.args.get(param).copied() else {
+                continue;
+            };
+            let caller = &module.functions[caller_index];
+            let definitions = defs[caller_index].get_or_insert_with(|| definitions(caller));
+            for caller_param in trace_roots(definitions, vec![argument], &mut wide_globals) {
+                if required_params[caller_index].insert(caller_param) {
+                    pending_params.push((caller_index, caller_param));
+                }
+            }
+        }
+    }
+    wide_globals
 }
 
 // Operand roles are explicit: a SIMD home width does not establish an access
@@ -334,6 +424,160 @@ mod tests {
             assert_eq!(policy.effective(&module.globals[0]), 32);
             assert_eq!(policy.effective(&module.globals[1]), 16);
             assert_eq!(policy.effective(&module.globals[2]), 32);
+        }
+    }
+
+    fn call(name: &str, args: Vec<Operand>) -> Instruction {
+        let count = args.len();
+        Instruction::Call {
+            func: name.into(),
+            info: CallInfo {
+                args,
+                arg_types: vec![IrType::Ptr; count],
+                return_type: IrType::Void,
+                num_fixed_args: count,
+                ..CallInfo::default()
+            },
+        }
+    }
+
+    fn param_chain() -> IrModule {
+        let mut module = fixture(IntrinsicOp::VecLoadF64x4);
+        let mut untouched = module.globals[0].clone();
+        untouched.name = "untouched".into();
+        module.globals.push(untouched);
+
+        let kernel = &mut module.functions[0];
+        kernel.name = "kernel".into();
+        kernel.blocks[0].instructions = vec![
+            Instruction::ParamRef {
+                dest: Value(0),
+                param_idx: 0,
+                ty: IrType::Ptr,
+            },
+            Instruction::Intrinsic {
+                dest: Some(Value(1)),
+                op: IntrinsicOp::VecLoadF64x4,
+                dest_ptr: None,
+                args: vec![Operand::Value(Value(0)), Operand::Const(IrConst::I64(0))],
+            },
+        ];
+
+        let mut relay = IrFunction::new("relay".into(), IrType::Void, vec![], false);
+        relay.blocks.push(BasicBlock {
+            label: BlockId(0),
+            source_spans: vec![],
+            terminator: Terminator::Return(None),
+            instructions: vec![
+                Instruction::ParamRef {
+                    dest: Value(0),
+                    param_idx: 0,
+                    ty: IrType::Ptr,
+                },
+                Instruction::ParamRef {
+                    dest: Value(1),
+                    param_idx: 1,
+                    ty: IrType::Ptr,
+                },
+                call(
+                    "kernel",
+                    vec![Operand::Value(Value(0)), Operand::Value(Value(1))],
+                ),
+                // A call cycle must not make the worklist run forever.
+                call(
+                    "relay",
+                    vec![Operand::Value(Value(0)), Operand::Value(Value(1))],
+                ),
+            ],
+        });
+        let mut caller = IrFunction::new("caller".into(), IrType::Void, vec![], false);
+        caller.blocks.push(BasicBlock {
+            label: BlockId(0),
+            source_spans: vec![],
+            terminator: Terminator::Return(None),
+            instructions: vec![
+                Instruction::GlobalAddr {
+                    dest: Value(0),
+                    name: "wide".into(),
+                },
+                Instruction::GlobalAddr {
+                    dest: Value(1),
+                    name: "untouched".into(),
+                },
+                call(
+                    "relay",
+                    vec![Operand::Value(Value(0)), Operand::Value(Value(1))],
+                ),
+            ],
+        });
+        module.functions.extend([relay, caller]);
+        module
+    }
+
+    #[test]
+    fn traces_wide_parameter_through_direct_calls_and_cycles() {
+        let module = param_chain();
+        let policy = DataAlignment::new(&module, PtrDirective::Quad, false);
+        assert_eq!(policy.effective(&module.globals[0]), 32);
+        assert_eq!(policy.effective(&module.globals[1]), 16);
+        // Placement is not an assertion that arbitrary incoming pointers or
+        // individual derived accesses are aligned.
+        assert_eq!(module.globals[0].align, 8);
+        assert_eq!(
+            DataAlignment::new(&module, PtrDirective::Quad, true).effective(&module.globals[0]),
+            8
+        );
+        assert_eq!(
+            DataAlignment::new(&module, PtrDirective::Xword, false).effective(&module.globals[0]),
+            16
+        );
+        for protected in 0..3 {
+            let mut global = module.globals[0].clone();
+            match protected {
+                0 => global.has_explicit_align = true,
+                1 => global.section = Some(".records".into()),
+                _ => global.is_thread_local = true,
+            }
+            assert_eq!(
+                policy.effective(&global),
+                if protected == 2 { 16 } else { 8 }
+            );
+        }
+    }
+
+    #[test]
+    fn ignores_indirect_calls_and_ambiguous_argument_abis() {
+        for mode in 0..9 {
+            let mut module = param_chain();
+            if mode == 5 {
+                module.functions[1].is_variadic = true;
+            } else if mode == 6 {
+                module.functions[1].uses_sret = true;
+            }
+            let call = &mut module.functions[2].blocks[0].instructions[2];
+            let Instruction::Call { info, .. } = call else {
+                unreachable!();
+            };
+            if mode == 0 {
+                let info = info.clone();
+                *call = Instruction::CallIndirect {
+                    func_ptr: Operand::Value(Value(7)),
+                    info,
+                };
+            } else {
+                match mode {
+                    1 => info.is_variadic = true,
+                    2 => info.is_sret = true,
+                    3 => info.arg_types[0] = IrType::I64,
+                    4 => info.struct_arg_sizes = vec![Some(32), None],
+                    7 => info.args.clear(),
+                    8 => info.num_fixed_args = 0,
+                    _ => {}
+                }
+            }
+            let policy = DataAlignment::new(&module, PtrDirective::Quad, false);
+            assert_eq!(policy.effective(&module.globals[0]), 16, "mode {mode}");
+            assert_eq!(policy.effective(&module.globals[1]), 16, "mode {mode}");
         }
     }
 

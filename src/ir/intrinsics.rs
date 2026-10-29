@@ -360,6 +360,11 @@ pub enum IntrinsicOp {
     /// Vector load: %dest_vec = load_vector(base_ptr, offset) - AVX2 8×I32
     /// args[0] = base pointer, args[1] = byte offset; dest = vector value
     VecLoadI32x8,
+    /// Read exactly four dwords at offsets 0, 8, 16 and 24 from
+    /// `base + byte_offset + optional_displacement`, placing them in lanes
+    /// 0, 2, 4 and 6 of an I32x8 result; the odd lanes are zero. Unlike a
+    /// full-width load, this does not touch the intervening objects.
+    VecLoadStrided2I32x8,
     /// Vector load: %dest_vec = load_vector(base_ptr, offset) - SSE2 4×I32
     /// args[0] = base pointer, args[1] = byte offset; dest = vector value
     VecLoadI32x4,
@@ -2107,7 +2112,7 @@ impl IntrinsicOp {
             | Dpbusd256 | Dpbssd256 | Dpwuud256 | Aesenc256 | Vpclmulqdq256
             | FmaF64x4 | FmaF64x4Hoisted | BroadcastLoadF64 | FmaF64x4SIB | FmaF64x4HoistedSIB | MulAddF64x4HoistedSIB
             | LoadF64x4 | LoadI32x8 | AddF64x4 | MulF64x4 | AddI32x8
-            | VecLoadF64x4 | VecLoadI32x8 | VecAddF64x4 | VecMulF64x4 | VecFmaF64x4 | VecMaddF64x4 | VecMaddF64x4Signed(..) | VecBroadcastF64x4 | VecAddI32x8 | VecMulI32x8 | VecBroadcastI32x8 | VecMaxI32x8
+            | VecLoadF64x4 | VecLoadI32x8 | VecLoadStrided2I32x8 | VecAddF64x4 | VecMulF64x4 | VecFmaF64x4 | VecMaddF64x4 | VecMaddF64x4Signed(..) | VecBroadcastF64x4 | VecAddI32x8 | VecMulI32x8 | VecBroadcastI32x8 | VecMaxI32x8
             | VecPackssdwI16x16 | VecSubI32x8 | VecAndI32x8 | VecOrI32x8 | VecXorI32x8
             | VecSubF64x4 | VecDivF64x4 | VecSqrtF64x4 | VecRoundF64x4 | VecXorF64x4
             | VecSubF32x8 | VecDivF32x8 | VecSqrtF32x8 | VecRoundF32x8 | VecXorF32x8
@@ -2500,6 +2505,7 @@ impl IntrinsicOp {
                 | IntrinsicOp::VecLoadF64x4
                 | IntrinsicOp::VecLoadF64x2
                 | IntrinsicOp::VecLoadI32x8
+                | IntrinsicOp::VecLoadStrided2I32x8
                 | IntrinsicOp::VecLoadI32x4
                 | IntrinsicOp::VecLoadF32x8
                 | IntrinsicOp::VecLoadF32x4
@@ -2554,6 +2560,7 @@ impl IntrinsicOp {
             // `VecLoad*(base, index[, disp])`.
             IntrinsicOp::VecLoadF64x4
             | IntrinsicOp::VecLoadI32x8
+            | IntrinsicOp::VecLoadStrided2I32x8
             | IntrinsicOp::VecLoadF32x8
             | IntrinsicOp::VecLoadI8x32
             | IntrinsicOp::VecLoadI64x4
@@ -2599,6 +2606,7 @@ impl IntrinsicOp {
                 | IntrinsicOp::VecLoadF64x4
                 | IntrinsicOp::VecLoadF64x2
                 | IntrinsicOp::VecLoadI32x8
+                | IntrinsicOp::VecLoadStrided2I32x8
                 | IntrinsicOp::VecLoadI32x4
                 | IntrinsicOp::VecPackssdwI16x16
                 | IntrinsicOp::VecLoadF32x8
@@ -3200,6 +3208,7 @@ mod vector_width_tests {
             "VecLoadF64x4" => IntrinsicOp::VecLoadF64x4,
             "VecLoadI32x4" => IntrinsicOp::VecLoadI32x4,
             "VecLoadI32x8" => IntrinsicOp::VecLoadI32x8,
+            "VecLoadStrided2I32x8" => IntrinsicOp::VecLoadStrided2I32x8,
             "VecLoadI64x2" => IntrinsicOp::VecLoadI64x2,
             "VecLoadI64x4" => IntrinsicOp::VecLoadI64x4,
             "VecLoadWidenI32ToI64x2" => IntrinsicOp::VecLoadWidenI32ToI64x2,
@@ -3549,6 +3558,7 @@ mod memory_classification_tests {
             O::VecLoadF32x8,
             O::VecLoadI32x4,
             O::VecLoadI32x8,
+            O::VecLoadStrided2I32x8,
             O::VecLoadI64x2,
             O::VecLoadI64x4,
             O::VecLoadI16x8,
@@ -3621,6 +3631,7 @@ mod vec_mem_offset_tests {
         for op in [
             O::VecLoadF64x4,
             O::VecLoadI32x8,
+            O::VecLoadStrided2I32x8,
             O::VecLoadF32x8,
             O::VecLoadI8x32,
             O::VecLoadI64x4,

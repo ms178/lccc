@@ -3,10 +3,18 @@
 import unittest
 from unittest.mock import patch
 
-from check_switch_cross_execute import main, select_linker
+from check_switch_cross_execute import CONTROL_PASSES, FIXTURES, main, select_linker
 
 
 class LinkerDiscoveryTests(unittest.TestCase):
+    def test_memory_fixtures_run_with_their_controls_in_the_cross_matrix(self):
+        for fixture, control in [('narrow_big_endian_cross', 'byte_load'),
+                                 ('join_store_forward_cross', 'join_store_forward'),
+                                 ('conditional_store_readonly_cross', 'vectorize'),
+                                 ('strided_reduction_cross', 'vectorize')]:
+            self.assertIn(fixture, FIXTURES)
+            self.assertEqual(CONTROL_PASSES[fixture], control)
+
     @patch('check_switch_cross_execute.subprocess.check_output', side_effect=RuntimeError('probe'))
     @patch('sys.argv', ['check_switch_cross_execute.py'])
     @patch.dict('os.environ', {'CLANG': '/cached/clang-23.1.4'}, clear=True)

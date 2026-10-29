@@ -7810,6 +7810,7 @@ fn collect_vecreg_candidates(func: &IrFunction) -> FxHashSet<u32> {
                 | O::VecLoadF64x4
                 | O::VecLoadI32x4
                 | O::VecLoadI32x8
+                | O::VecLoadStrided2I32x8
                 | O::VecLoadI32x4Pair
                 | O::VecPackI32x4Pair
                 | O::VecLoadI8x32
@@ -9369,7 +9370,11 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
             | O::VecFnmaF64x2
             | O::VecFmsF64x2
             | O::VecFnmsF64x2 => Some(4),
-            O::VecZeroI32x8 | O::VecLoadI32x8 | O::VecAddI32x8 | O::VecMulI32x8 => Some(5),
+            O::VecZeroI32x8
+            | O::VecLoadI32x8
+            | O::VecLoadStrided2I32x8
+            | O::VecAddI32x8
+            | O::VecMulI32x8 => Some(5),
             // BB-SLP 256-bit dword shifts: class 5 (I32x8 family; the
             // home-aware immediate-shift emitter reads/writes the YMM
             // home directly).
@@ -10498,6 +10503,7 @@ fn x86_map_intrinsic_class(op: &crate::ir::intrinsics::IntrinsicOp) -> Option<u8
         // included — their emitters resolve every vector operand
         // through the register cache.
         O::VecLoadI32x8
+        | O::VecLoadStrided2I32x8
         | O::VecSubI32x8
         | O::VecAddI32x8
         | O::VecMulI32x8
