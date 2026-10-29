@@ -14,9 +14,9 @@
 #   anything else (a signal such as 139, or any other status) = a FAILURE, never
 #   a rejection. A crash that happens to print an address-space message must not
 #   count as the right rejection.
-# A reject must also say why: its stderr needs an address-space diagnostic, so a
-# fixture rejected for an unrelated reason fails the gate even when the verdict
-# happens to match.
+# A reject must also say why: it needs either a direct address-space diagnostic
+# or the nested-pointer incompatible-pointer diagnostic GCC uses below the outer
+# pointer level, so an unrelated rejection cannot pass the gate.
 set -euo pipefail
 CCC=${CCC:-./target/fastbuild/lccc}
 dir=tests/regression/seg_conv
@@ -65,11 +65,11 @@ for f in "${files[@]}"; do
         fail=1
         continue
     fi
-    # Assignment, initializer and return conversions say "incompatible address
-    # space"; an argument keeps the argument diagnostic (same rule as
-    # check_seg_named_decl_qualifier.sh).
-    if [ "$want" = reject ] && ! grep -q -e 'address space' -e 'incompatible pointer type for argument' "$tmp/lccc.err"; then
-        echo "FAIL: lccc rejects $base without an address-space diagnostic" >&2
+    # An outermost space mismatch gets GCC's direct address-space diagnostic;
+    # a mismatch below that level is the controllable incompatible-pointer
+    # diagnostic. Arguments may use their context-specific wording.
+    if [ "$want" = reject ] && ! grep -q -e 'address space' -e 'incompatible pointer type' "$tmp/lccc.err"; then
+        echo "FAIL: lccc rejects $base without an address-space or pointer-compatibility diagnostic" >&2
         grep -m2 . "$tmp/lccc.err" >&2 || true
         fail=1
         continue

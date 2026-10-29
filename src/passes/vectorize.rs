@@ -7163,11 +7163,29 @@ impl MapExpr {
     }
 }
 
+/// Return the operands of an unsigned maximum in either parser form. AVX2's
+/// U16 parser folds the compare/select to `MinMax`; SSE2 keeps the exact
+/// unsigned compare/select tree because unsigned word min/max is unavailable.
+fn unsigned_max_operands(expr: &MapExpr) -> Option<(&MapExpr, &MapExpr)> {
+    match expr {
+        MapExpr::MinMax { is_max: true, l, r } => Some((l, r)),
+        MapExpr::Select(cond, t, f) => {
+            let MapExpr::Cmp(IrCmpOp::Ult | IrCmpOp::Ule, l, r) = cond.as_ref() else {
+                return None;
+            };
+            (t.as_ref() == r.as_ref() && f.as_ref() == l.as_ref())
+                .then_some((l.as_ref(), r.as_ref()))
+        }
+        _ => None,
+    }
+}
+
 /// Recognize an unsigned lane saturating subtract in the already-proven map
 /// tree. The narrow parser admits an unsigned compare only after proving its
 /// operands' ranges agree with the lane order. Equal inputs produce zero for
 /// both strict and non-strict forms. `max_u(a, b) - b` is the same operation
-/// and is the parser's existing AVX2 canonicalization.
+/// and is the parser's existing AVX2 canonicalization; the SSE2 compare/select
+/// max spelling is also exact and can use `psubusw` directly.
 ///
 /// This only identifies a tree; the caller must restrict it to U16 lanes and
 /// an x86-64 target with the corresponding SSE2/AVX2 lowering. The scalar tail
@@ -7195,13 +7213,11 @@ fn unsigned_saturating_sub_operands(expr: &MapExpr) -> Option<(&MapExpr, &MapExp
             None
         }
         MapExpr::BinOp(IrBinOp::Sub, max, subtrahend) => {
-            let MapExpr::MinMax { is_max: true, l, r } = max.as_ref() else {
-                return None;
-            };
-            if r == subtrahend {
-                Some((l, r))
-            } else if l == subtrahend {
-                Some((r, l))
+            let (max_l, max_r) = unsigned_max_operands(max.as_ref())?;
+            if max_l == subtrahend.as_ref() {
+                Some((max_r, subtrahend.as_ref()))
+            } else if max_r == subtrahend.as_ref() {
+                Some((max_l, subtrahend.as_ref()))
             } else {
                 None
             }
@@ -7261,6 +7277,31 @@ mod unsigned_saturating_sub_tests {
             );
             assert_eq!(unsigned_saturating_sub_operands(&sub(&max, &c)), None);
         }
+        // SSE2 retains the unsigned max as an exact compare/select tree;
+        // AVX2 folds the same shape to MinMax before emission.
+        for op in [IrCmpOp::Ult, IrCmpOp::Ule] {
+            for (l, r) in [(&a, &b), (&b, &a)] {
+                let max_select = select(cmp(op, l, r), (*r).clone(), (*l).clone());
+                assert_eq!(
+                    unsigned_saturating_sub_operands(&sub(&max_select, &b)),
+                    Some((&a, &b))
+                );
+                assert_eq!(
+                    unsigned_saturating_sub_operands(&sub(&max_select, &c)),
+                    None
+                );
+                let min_select = select(cmp(op, l, r), (*l).clone(), (*r).clone());
+                assert_eq!(
+                    unsigned_saturating_sub_operands(&sub(&min_select, &b)),
+                    None
+                );
+            }
+        }
+        let signed_max = select(cmp(IrCmpOp::Slt, &a, &b), b.clone(), a.clone());
+        assert_eq!(
+            unsigned_saturating_sub_operands(&sub(&signed_max, &b)),
+            None
+        );
         let min = MapExpr::MinMax {
             is_max: false,
             l: boxed(a.clone()),
@@ -35013,6 +35054,49 @@ pub(crate) fn vectorize_function_late_with_symbol_facts(
         FpContract::default(),
         symbol_facts,
     )
+}
+
+/// Run the strided-I32 reduction matcher before the early loop unroller.
+///
+/// The later full vectorizer is intentionally preceded by scalar unrolling to
+/// expose map/SLP opportunities, but this reduction matcher models the original
+/// IV step and its guard-page-safe scalar remainder. Letting the unroller
+/// rewrite that step first turns (for example) 8 into 128 and makes the proven
+/// AVX2 transform miss its intended loop. This narrow entry only applies the
+/// strided reducer; every decline leaves the function untouched for the
+/// ordinary unroll/vectorize pipeline.
+pub(crate) fn vectorize_strided_i32_reductions_before_unroll(
+    func: &mut IrFunction,
+    symbol_facts: &ModuleSymbolFacts,
+) -> usize {
+    if super::fp_environment_blocks_reordering(func) || !x86_avx2_available() {
+        return 0;
+    }
+    let mut total = 0usize;
+    for _ in 0..16 {
+        let cfg = CfgAnalysis::build(func);
+        let loops = loop_analysis::find_merged_natural_loops(
+            cfg.num_blocks,
+            &cfg.preds,
+            &cfg.succs,
+            &cfg.idom,
+        );
+        let mut changed = 0usize;
+        for lp in &loops {
+            changed = strided_i32_reduce::try_transform(func, lp, &cfg, symbol_facts);
+            if changed > 0 {
+                break;
+            }
+        }
+        total += changed;
+        if changed == 0 {
+            break;
+        }
+    }
+    if total > 0 {
+        crate::passes::dce::eliminate_dead_code(func);
+    }
+    total
 }
 
 /// Pre-unroll CONST-TRIP map vectorization.
