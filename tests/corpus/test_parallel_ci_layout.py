@@ -24,6 +24,7 @@ partition of the gates, and this one proves the DAG still wires them.
 from copy import deepcopy
 from pathlib import Path
 import importlib.util
+import re
 import tempfile
 import unittest
 try:
@@ -251,14 +252,29 @@ class ParallelLayout(unittest.TestCase):
             'paths': [
                 '.github/workflows/compiler-research.yml',
                 'src/passes/vec_ssa.rs',
+                'src/passes/slp_vectorizer.rs',
+                'src/passes/vectorize.rs',
+                'src/backend/x86/codegen/peephole/passes/self_zext.rs',
+                'scripts/publish_cpu_runtime_evidence.py',
                 'include/emmintrin.h',
                 'include/avxintrin.h',
                 'tests/regression/native_vector_bitcasts.c',
                 'tests/regression/check_native_vector_bitcasts.py',
             ],
         })
-        self.assertIn('f32_sse1_map,fp32_product_map,fp64_product_map',
-                      research['jobs']['evidence']['env']['RESEARCH_CASES'])
+        cases = research['jobs']['evidence']['env']['RESEARCH_CASES']
+        alternatives = [set(value.split(',')) for value in re.findall(r"'([a-z0-9_,]+)'", cases)
+                        if ',' in value]
+        self.assertEqual(len(alternatives), 2, 'PR and manual fallback case sets')
+        pr_cases, manual_cases = alternatives
+        fp_cases = {'f32_sse1_map', 'fp32_product_map', 'fp64_product_map'}
+        self.assertTrue(fp_cases <= pr_cases)
+        self.assertTrue(fp_cases <= manual_cases)
+        self.assertTrue({'zlib_ng_slide_hash', 'linux_list_sort', 'sqlite_vdbe_serial',
+                         'byte_load_reassembly', 'zlib_ng_compare256', 'arith_loop',
+                         'sqlite_varint', 'hot_web_loop', 'sha256_transform'} <= pr_cases)
+        manual_default = research['on']['workflow_dispatch']['inputs']['cases']['default']
+        self.assertEqual(manual_cases, set(manual_default.split(',')))
         self.assertIn('&& \'9\'', research['jobs']['evidence']['env']['RESEARCH_ROUNDS'])
         self.assertTrue(research['jobs'])
         for job in research['jobs'].values():

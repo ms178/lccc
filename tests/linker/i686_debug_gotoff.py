@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """Compare i386 DWARF GOTOFF fixups against the GNU linker and ELF symbols.
 
-This exercises S + A - GOT for local and global symbols, positive and
-negative addends, and static executable, PIE, and shared-object links.  Linker
-layouts differ, so the check independently calculates the expected field from
-each output's own symbols. A debug-only GOTOFF with no GOTPC is deliberately
-still rejected by LCCC; GNU is verified to accept it.
+Check S + A - GOT with positive/negative addends and static, PIE and shared
+links, both with and without code relocations requiring a GOT or PLT. Linker
+layouts differ, so each result is checked against its own symbol addresses.
+Also check undefined weak references and symbols resolved from another object.
 """
 import argparse
 import os
@@ -33,13 +32,37 @@ def symbols(path, cwd):
     return result
 
 
-def fields(path, cwd):
+def fields(path, cwd, count=3):
     run(["objcopy", "--dump-section", ".debug_loclists=section.bin", path], cwd)
     with open(os.path.join(cwd, "section.bin"), "rb") as f:
         data = f.read()
-    if len(data) != 12:
-        raise AssertionError(f"{path}: expected exactly 12 debug bytes, got {len(data)}")
-    return struct.unpack("<III", data)
+    if len(data) != 4 * count:
+        raise AssertionError(f"{path}: expected {4 * count} debug bytes, got {len(data)}")
+    return struct.unpack(f"<{count}I", data)
+
+
+def check_values(name, mode, kind, cwd, weak=False):
+    actual = fields("image", cwd, 4 if weak else 3)
+    syms = symbols("image", cwd)
+    for sym in ("foo", "local_data"):
+        if sym not in syms:
+            raise AssertionError(f"{name} {mode} {kind}: missing symbol {sym}")
+    if "_GLOBAL_OFFSET_TABLE_" in syms:
+        base = syms["_GLOBAL_OFFSET_TABLE_"]
+    elif name == "GNU" and kind != "gotpc":
+        # GNU can use an implicit, unexported anchor when no GOTPC refers
+        # to it. Derive it from one field, then check the remaining fields.
+        base = (syms["foo"] + 7 - actual[0]) & 0xffffffff
+    else:
+        raise AssertionError(f"{name} {mode} {kind}: missing GOT anchor")
+    expected = [syms["foo"] + 7 - base, syms["local_data"] - 4 - base,
+                syms["foo"] - 8 - base]
+    if weak:
+        expected.append(4 - base)  # Undefined weak symbol resolves to zero.
+    want = tuple(v & 0xffffffff for v in expected)
+    if actual != want:
+        raise AssertionError(f"{name} {mode} {kind}: {actual!r} != {want!r}")
+    print(f"PASS {name} {mode} {kind}{' weak' if weak else ''} {actual}")
 
 
 def main():
@@ -47,42 +70,48 @@ def main():
     parser.add_argument("--lccc-ld", required=True)
     args = parser.parse_args()
     linker = os.path.abspath(args.lccc_ld)
-    template = '''\n.globl _start\n.text\n_start:\n  xorl %eax,%eax\n  {got}\n  ret\n.data\n.space 17\n.globl foo\nfoo: .long 42\nlocal_data: .long 23\n.section .debug_loclists,"",@progbits\n.long foo@GOTOFF+7\n.long local_data@GOTOFF-4\n.long foo@GOTOFF-8\n.section .note.GNU-stack,"",@progbits\n'''
+    template = '''\n.globl _start, external_fn\n.text\n_start:\n  xorl %eax,%eax\n  {code}\n  ret\nexternal_fn: ret\n{data}\n{weak_decl}\n.section .debug_loclists,"",@progbits\n.long foo@GOTOFF+7\n.long local_data@GOTOFF-4\n.long foo@GOTOFF-8\n{weak_reloc}\n.section .note.GNU-stack,"",@progbits\n'''
+    data = '.data\n.space 17\n.globl foo\nfoo: .long 42\nlocal_data: .long 23'
+    cases = (("no-got", ""),
+             ("gotpc", "movl $_GLOBAL_OFFSET_TABLE_,%ebx"),
+             ("got-entry", "movl foo@GOT(%ebx),%eax"),
+             ("plt-entry", "call external_fn@PLT"))
     with tempfile.TemporaryDirectory(prefix="i686-debug-gotoff-") as td:
-        for got in (True, False):
-            source = template.format(got="movl $_GLOBAL_OFFSET_TABLE_,%ebx" if got else "")
-            with open(os.path.join(td, "fixture.s"), "w", encoding="utf-8") as f:
-                f.write(source)
-            run(["as", "--32", "fixture.s", "-o", "fixture.o"], td)
-            for mode in ("-static", "-pie", "-shared"):
-                for name, ld in (("GNU", "ld"), ("LCCC", linker)):
-                    cmd = [ld, "-m", "elf_i386", mode, "-o", "image", "fixture.o"]
-                    if not got and name == "LCCC":
-                        p = subprocess.run(cmd, cwd=td, stdout=subprocess.PIPE,
-                                           stderr=subprocess.PIPE, text=True)
-                        if p.returncode == 0 or "relocation type 9" not in p.stderr:
-                            raise AssertionError(f"{mode} debug-only: expected explicit rejection: {p.stderr}")
-                        continue
-                    run(cmd, td)
-                    actual = fields("image", td)
-                    if got:
-                        syms = symbols("image", td)
-                        for sym in ("foo", "local_data", "_GLOBAL_OFFSET_TABLE_"):
-                            if sym not in syms:
-                                raise AssertionError(f"{name} {mode}: missing symbol {sym}")
-                        base = syms["_GLOBAL_OFFSET_TABLE_"]
-                        want = tuple(v & 0xffffffff for v in (
-                            syms["foo"] + 7 - base,
-                            syms["local_data"] - 4 - base,
-                            syms["foo"] - 8 - base))
-                    else:
-                        # GNU may synthesize an unexported anchor even with
-                        # no GOT section; do not guess that anchor here.
-                        print(f"PASS {name} {mode} debug-only link {actual}")
-                        continue
-                    if actual != want:
-                        raise AssertionError(f"{name} {mode} GOTPC={got}: {actual!r} != {want!r}")
-                    print(f"PASS {name} {mode} GOTPC={got} {actual}")
+        for kind, code in cases:
+            for weak in (False, True):
+                source = template.format(code=code, data=data,
+                    weak_decl=".weak weak_missing" if weak else "",
+                    weak_reloc=".long weak_missing@GOTOFF+4" if weak else "")
+                with open(os.path.join(td, "fixture.s"), "w", encoding="utf-8") as f:
+                    f.write(source)
+                run(["as", "--32", "fixture.s", "-o", "fixture.o"], td)
+                for mode in ("-static", "-pie", "-shared"):
+                    for name, ld in (("GNU", "ld"), ("LCCC", linker)):
+                        cmd = [ld, "-m", "elf_i386", mode, "-o", "image", "fixture.o"]
+                        if weak and mode == "-shared":
+                            p = subprocess.run(cmd, cwd=td, stdout=subprocess.PIPE,
+                                               stderr=subprocess.PIPE, text=True)
+                            if p.returncode == 0 or "R_386_GOTOFF" not in p.stderr:
+                                raise AssertionError(f"{name} {mode} {kind}: expected rejection: {p.stderr}")
+                            print(f"PASS {name} {mode} {kind} undefined weak rejected")
+                        else:
+                            run(cmd, td)
+                            check_values(name, mode, kind, td, weak)
+
+        # The reference is undefined in the debug object's symbol table, but
+        # resolves statically in another object; shared links must accept it.
+        source = template.format(code="", data="", weak_decl="", weak_reloc="")
+        with open(os.path.join(td, "fixture.s"), "w", encoding="utf-8") as f:
+            f.write(source)
+        with open(os.path.join(td, "defs.s"), "w", encoding="utf-8") as f:
+            f.write('.data\n.space 17\n.globl foo,local_data\nfoo: .long 42\n'
+                    'local_data: .long 23\n.section .note.GNU-stack,"",@progbits\n')
+        for stem in ("fixture", "defs"):
+            run(["as", "--32", f"{stem}.s", "-o", f"{stem}.o"], td)
+        for mode in ("-static", "-pie", "-shared"):
+            for name, ld in (("GNU", "ld"), ("LCCC", linker)):
+                run([ld, "-m", "elf_i386", mode, "-o", "image", "fixture.o", "defs.o"], td)
+                check_values(name, mode, "cross-object", td)
     print("PASS i686 debug GOTOFF oracle comparison")
 
 

@@ -6,6 +6,10 @@ on:
     paths:
       - '.github/workflows/compiler-research.yml'
       - 'src/passes/vec_ssa.rs'
+      - 'src/passes/slp_vectorizer.rs'
+      - 'src/passes/vectorize.rs'
+      - 'src/backend/x86/codegen/peephole/passes/self_zext.rs'
+      - 'scripts/publish_cpu_runtime_evidence.py'
       - 'include/emmintrin.h'
       - 'include/avxintrin.h'
       - 'tests/regression/native_vector_bitcasts.c'
@@ -23,7 +27,7 @@ on:
       cases:
         description: Comma-separated canonical workloads (all selects the full corpus)
         required: false
-        default: "nbody,hot_web_loop,byte_load_reassembly,expat_siphash24,double_reduction,spectral_norm,matmul,binary_trees,expat_xml_scan,zstd_count,f32_sse1_map,fp32_product_map"
+        default: "nbody,hot_web_loop,byte_load_reassembly,expat_siphash24,double_reduction,spectral_norm,matmul,binary_trees,expat_xml_scan,zstd_count,f32_sse1_map,fp32_product_map,fp64_product_map"
       rounds:
         description: Paired native rounds, excluding three warm-ups
         required: true
@@ -82,7 +86,10 @@ jobs:
       CARGO_BUILD_JOBS: "2"
       RUSTFLAGS: -D warnings
       BASELINE_REF: ${{ inputs.baseline_ref || github.event.pull_request.base.sha || 'main' }}
-      RESEARCH_CASES: ${{ inputs.cases || (github.event_name == 'pull_request' && 'f32_sse1_map,fp32_product_map,fp64_product_map' || 'nbody,hot_web_loop,byte_load_reassembly,expat_siphash24,double_reduction,spectral_norm,matmul,binary_trees,expat_xml_scan,zstd_count,f32_sse1_map,fp32_product_map') }}
+      # Cover the P-core and E-core outliers independently identified by the
+      # hybrid report, including workloads outside the ordinary CI shards.
+      # A dispatch can still select any registry subset or the whole corpus.
+      RESEARCH_CASES: ${{ inputs.cases || (github.event_name == 'pull_request' && 'zlib_ng_slide_hash,linux_list_sort,sqlite_vdbe_serial,byte_load_reassembly,f32_sse1_map,fp32_product_map,fp64_product_map,zlib_ng_compare256,arith_loop,sqlite_varint,hot_web_loop,sha256_transform' || 'nbody,hot_web_loop,byte_load_reassembly,expat_siphash24,double_reduction,spectral_norm,matmul,binary_trees,expat_xml_scan,zstd_count,f32_sse1_map,fp32_product_map,fp64_product_map') }}
       RESEARCH_ROUNDS: ${{ inputs.rounds || (github.event_name == 'pull_request' && '9' || '31') }}
     steps:
       - uses: actions/checkout@v7
@@ -94,6 +101,17 @@ jobs:
       - name: Install and identify instrumentation tools
         run: |
           python3 scripts/ci_test_report.py -- bash scripts/ci_prepare_research_tools.sh
+      - name: Provision authenticated ICX 2026.2 for paired comparisons
+        timeout-minutes: 8
+        run: |
+          set -euo pipefail
+          mkdir -p results/research
+          binary=$(bash scripts/ensure_icx_2026.sh "$RUNNER_TEMP/research-icx-2026.2")
+          test -x "$binary"
+          echo "ICX=$binary" >> "$GITHUB_ENV"
+          cp "$RUNNER_TEMP/research-icx-2026.2/.lccc-icx.json" results/research/icx-install.json
+          "$binary" --version | tee results/research/icx-version.txt
+          sha256sum "$binary" > results/research/icx-binary.sha256
       - name: Build candidate and independently archived main baseline
         timeout-minutes: 20
         shell: bash
@@ -168,13 +186,24 @@ jobs:
           [[ "$RESEARCH_ROUNDS" =~ ^[0-9]+$ ]] && (( RESEARCH_ROUNDS >= 9 && RESEARCH_ROUNDS <= 101 ))
           as --version | head -1
           ld --version
+          # Same compiler, same inputs: isolate the small floating-point
+          # map-unroll policy rather than attributing all differences to it.
+          # The wrapper and its environment are retained with the receipts.
+          cat > results/research/rolled-compiler <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          export CCC_NO_MAP_FP_UNROLL=1
+          exec "$(dirname -- "$0")/../../target/fastbuild/lccc" "$@"
+          SH
+          chmod +x results/research/rolled-compiler
           for profile in portable native; do
             flags=()
             if [[ "$profile" == native ]]; then flags+=(--cflag=-march=native); fi
             python3 tests/benchmark/run_benchmarks.py \
-              --lccc target/fastbuild/lccc --compilers lccc,gcc,clang \
-              --gcc gcc-16 --clang "$CLANG" \
+              --lccc target/fastbuild/lccc --compilers lccc,gcc,clang,icx \
+              --gcc gcc-16 --clang "$CLANG" --icx "$ICX" \
               --candidate "before=$RUNNER_TEMP/research-main-target/fastbuild/lccc" \
+              --candidate "rolled=$GITHUB_WORKSPACE/results/research/rolled-compiler" \
               --opt=-O2 --cflag=-std=gnu17 "${flags[@]}" \
               --only "$RESEARCH_CASES" --reps "$RESEARCH_ROUNDS" --warmup 3 \
               --cpu auto --no-pmu-probe --strict \
@@ -185,6 +214,62 @@ jobs:
       - name: Publish CPU-specific paired results through the checks API
         if: always()
         run: python3 scripts/publish_cpu_runtime_evidence.py results/research
+      - name: Same-compiler fallthrough zero-extension ablation
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > results/research/no-fallthrough-compiler <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          export CCC_NO_SELF_ZEXT_FALLTHROUGH=1
+          exec "$(dirname -- "$0")/../../target/fastbuild/lccc" "$@"
+          SH
+          chmod +x results/research/no-fallthrough-compiler
+          for profile in portable native; do
+            flags=()
+            if [[ "$profile" == native ]]; then flags+=(--cflag=-march=native); fi
+            python3 tests/benchmark/run_benchmarks.py \
+              --lccc target/fastbuild/lccc --compilers lccc,gcc --gcc gcc-16 \
+              --candidate "no_fallthrough=$GITHUB_WORKSPACE/results/research/no-fallthrough-compiler" \
+              --opt=-O2 --cflag=-std=gnu17 "${flags[@]}" --only zlib_ng_slide_hash \
+              --reps "$RESEARCH_ROUNDS" --warmup 3 --cpu auto --no-pmu-probe --strict \
+              --artifact-dir "results/research/$profile-zext-artifacts" \
+              --json "results/research/$profile-zext.json"
+          done
+          python3 scripts/callgrind_corpus.py \
+            --mine target/fastbuild/lccc --ref "$GITHUB_WORKSPACE/results/research/no-fallthrough-compiler" \
+            --gcc-include-command gcc-16 --target-flags="" --only zlib_ng_slide_hash \
+            --out results/research/callgrind-zext
+          python3 - <<'PYZEXT'
+          import json
+          from pathlib import Path
+          root = Path('results/research')
+          summary = {'metric': 'paired elapsed time; bounded simulated Ir is not native cycles', 'profiles': {}}
+          def ratio_view(value):
+              return {'median': value['median'], 'ci95': value['median_ci95_bootstrap'], 'n': value['n']}
+          for profile in ('portable', 'native'):
+              report = json.loads((root / f'{profile}-zext.json').read_text())
+              assert report['metadata']['pinning']['applied']
+              row = report['benchmarks'][0]
+              assert row['name'] == 'zlib_ng_slide_hash'
+              for arm in ('lccc', 'gcc', 'no_fallthrough'):
+                  assert all(row['correctness'][arm][key] for key in
+                             ('all_runs_successful', 'matches_baseline', 'stable_within_compiler'))
+              summary['profiles'][profile] = {
+                  'cpu': report['metadata']['cpu_models'],
+                  'after_over_disabled': ratio_view(row['ratios_from_lccc']['no_fallthrough']),
+                  'after_over_gcc': ratio_view(row['ratios_from_lccc']['gcc']),
+                  'identical_binaries': row['compile']['lccc']['binary_sha256'] == row['compile']['no_fallthrough']['binary_sha256'],
+              }
+          cg = json.loads((root / 'callgrind-zext/index.json').read_text())
+          assert cg['complete'] and not cg['failures'] and set(cg['results']) == {'zlib_ng_slide_hash'}
+          summary['bounded_ir_after_over_disabled'] = cg['results']['zlib_ng_slide_hash']['metrics']['ir_ratio']
+          text = json.dumps(summary, separators=(',', ':'))
+          assert len(text.encode()) <= 3900
+          print('::notice title=Zero-extension ablation::' + text)
+          (root / 'zext-summary.json').write_text(json.dumps(summary, indent=2) + '\n')
+          PYZEXT
       - name: Calibrated short-kernel entry timing without exec startup
         timeout-minutes: 12
         shell: bash
@@ -282,6 +367,32 @@ jobs:
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as stream:
               stream.write('```json\n' + json.dumps(summary, indent=2) + '\n```\n')
           PY
+      # Keep all assembly arms grouped by workload under the job-wide checks
+      # annotation budget, after the timing and Callgrind summaries.
+      - name: Publish portable word-saturation assembly
+        if: always()
+        run: python3 scripts/publish_cpu_runtime_evidence.py results/research --assembly-profile portable --assembly-cases zlib_ng_slide_hash
+      - name: Publish native word-saturation assembly
+        if: always()
+        run: python3 scripts/publish_cpu_runtime_evidence.py results/research --assembly-profile native --assembly-cases zlib_ng_slide_hash
+      - name: Publish portable floating-point assembly
+        if: always()
+        run: python3 scripts/publish_cpu_runtime_evidence.py results/research --assembly-profile portable --assembly-cases fp64_product_map,fp32_product_map
+      - name: Publish native floating-point assembly
+        if: always()
+        run: python3 scripts/publish_cpu_runtime_evidence.py results/research --assembly-profile native --assembly-cases fp64_product_map,fp32_product_map
+      - name: Publish portable list and SQLite assembly
+        if: always()
+        run: python3 scripts/publish_cpu_runtime_evidence.py results/research --assembly-profile portable --assembly-cases linux_list_sort,sqlite_vdbe_serial
+      - name: Publish native list and SQLite assembly
+        if: always()
+        run: python3 scripts/publish_cpu_runtime_evidence.py results/research --assembly-profile native --assembly-cases linux_list_sort,sqlite_vdbe_serial
+      - name: Publish portable byte and arithmetic assembly
+        if: always()
+        run: python3 scripts/publish_cpu_runtime_evidence.py results/research --assembly-profile portable --assembly-cases byte_load_reassembly,zlib_ng_compare256,arith_loop,nbody
+      - name: Publish native byte and arithmetic assembly
+        if: always()
+        run: python3 scripts/publish_cpu_runtime_evidence.py results/research --assembly-profile native --assembly-cases byte_load_reassembly,zlib_ng_compare256,arith_loop,nbody
       - name: Retain all identities, flags, counters, assembly and failures
         if: always()
         uses: actions/upload-artifact@v7

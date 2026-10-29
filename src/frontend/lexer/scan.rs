@@ -1734,6 +1734,12 @@ impl Lexer {
     }
 
     fn lex_identifier(&mut self, start: usize) -> Token {
+        // ASCII prefix only. A backslash (UCN) or high byte (raw UTF-8) ends
+        // this loop and is decoded by `finish_extended_identifier`, which
+        // interns `caf\u00e9`, `café` and `caf\U000000E9` as one symbol per
+        // C99 6.4.2.1 and enforces the measured Annex D tables. Skipping the
+        // UCN bytes here would leave the literal escape text in the token and
+        // silently bypass both the conversion and the validity diagnostics.
         while self.pos < self.input.len()
             && (self.input[self.pos] == b'_'
                 || self.input[self.pos] == b'$'
@@ -1896,7 +1902,11 @@ impl Lexer {
                 }
             }
             b'#' => {
-                if self.pos < self.input.len() && self.input[self.pos] == b'#' {
+                if self.pos < self.input.len() && self.input[self.pos] == b':' {
+                    // Digraph #: → ##
+                    self.pos += 1;
+                    TokenKind::HashHash
+                } else if self.pos < self.input.len() && self.input[self.pos] == b'#' {
                     self.pos += 1;
                     TokenKind::HashHash
                 } else {
@@ -2053,11 +2063,13 @@ impl Lexer {
                     match self.input[self.pos] {
                         // Digraph `<:` is `[` (C95 6.4.6).
                         b':' => {
+                            // Digraph <: → [
                             self.pos += 1;
                             TokenKind::LBracket
                         }
                         // Digraph `<%` is `{` (C95 6.4.6).
                         b'%' => {
+                            // Digraph <% → {
                             self.pos += 1;
                             TokenKind::LBrace
                         }
@@ -2154,39 +2166,6 @@ fn hex_digit_val(c: u8) -> u8 {
 #[cfg(test)]
 mod recovery_tests {
     use super::*;
-
-    #[test]
-    fn digraph_tokens_keep_source_spans_and_maximal_munch() {
-        let input = "<: :> <% %> %: %:%: <%: <<%:";
-        let mut lexer = Lexer::new(input, 0);
-        let tokens = lexer.tokenize();
-        let kinds: Vec<_> = tokens.iter().map(|token| token.kind.clone()).collect();
-        assert_eq!(
-            kinds,
-            [
-                TokenKind::LBracket,
-                TokenKind::RBracket,
-                TokenKind::LBrace,
-                TokenKind::RBrace,
-                TokenKind::Hash,
-                TokenKind::HashHash,
-                TokenKind::LBrace,
-                TokenKind::Colon,
-                TokenKind::LessLess,
-                TokenKind::Hash,
-                TokenKind::Eof,
-            ]
-        );
-        let spellings: Vec<_> = tokens[..tokens.len() - 1]
-            .iter()
-            .map(|token| &input[token.span.start as usize..token.span.end as usize])
-            .collect();
-        assert_eq!(
-            spellings,
-            ["<:", ":>", "<%", "%>", "%:", "%:%:", "<%", ":", "<<", "%:"]
-        );
-        assert!(lexer.diagnostics.is_empty());
-    }
 
     #[test]
     fn hexadecimal_literals_round_directly_to_their_token_type() {

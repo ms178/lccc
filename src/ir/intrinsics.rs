@@ -1034,6 +1034,10 @@ pub enum IntrinsicOp {
     VecSubI16x16,
     /// SSE2 lane-wise word subtract: 8×I16/U16 (`psubw`).
     VecSubI16x8,
+    /// AVX2 unsigned saturating word subtract: 16×U16 (`vpsubusw`).
+    VecSubSatU16x16,
+    /// SSE2 unsigned saturating word subtract: 8×U16 (`psubusw`).
+    VecSubSatU16x8,
     /// AVX2 lane-wise word multiply, low half: 16×I16/U16 (`vpmullw`).
     /// Unlike bytes, words DO have a packed multiply, and it is low-half
     /// exact for both signednesses.
@@ -2119,6 +2123,7 @@ impl IntrinsicOp {
             | VecAddI8x32 | VecSubI8x32 | VecAndI8x32 | VecOrI8x32 | VecXorI8x32
             | VecAddI16x16
             | VecSubI16x16
+            | VecSubSatU16x16
             | VecMulI16x16
             | VecAndI16x16
             | VecOrI16x16
@@ -2237,6 +2242,7 @@ impl IntrinsicOp {
             | VecBroadcastI8x16
             | VecAddI16x8
             | VecSubI16x8
+            | VecSubSatU16x8
             | VecMulI16x8
             | VecCmpI16x8
             | VecMinI16x8
@@ -2639,6 +2645,7 @@ impl IntrinsicOp {
                 | IntrinsicOp::VecBroadcastI8x16
                 | IntrinsicOp::VecAddI16x16
                 | IntrinsicOp::VecSubI16x16
+                | IntrinsicOp::VecSubSatU16x16
                 | IntrinsicOp::VecMulI16x16
                 | IntrinsicOp::VecCmpI16x16
                 | IntrinsicOp::VecMinI16x16
@@ -2649,6 +2656,7 @@ impl IntrinsicOp {
                 | IntrinsicOp::VecBroadcastI16x16
                 | IntrinsicOp::VecAddI16x8
                 | IntrinsicOp::VecSubI16x8
+                | IntrinsicOp::VecSubSatU16x8
                 | IntrinsicOp::VecMulI16x8
                 | IntrinsicOp::VecCmpI16x8
                 | IntrinsicOp::VecMinI16x8
@@ -2838,6 +2846,21 @@ mod vector_width_tests {
         ] {
             assert_eq!(op.vector_home_width(), Some(width), "{op:?} home");
             assert_eq!(op.vector_result_width(), Some(width), "{op:?} result");
+        }
+    }
+
+    #[test]
+    fn unsigned_word_saturation_has_pure_vector_value_homes() {
+        for (op, width) in [
+            (IntrinsicOp::VecSubSatU16x8, 16),
+            (IntrinsicOp::VecSubSatU16x16, 32),
+        ] {
+            assert_eq!(op.vector_home_width(), Some(width));
+            assert_eq!(op.vector_result_width(), Some(width));
+            assert!(op.produces_vector_value());
+            assert!(op.is_pure());
+            assert!(!op.may_read_memory());
+            assert!(!op.writes_memory_via_args());
         }
     }
 
@@ -3275,6 +3298,8 @@ mod vector_width_tests {
             "VecMulI16x8" => IntrinsicOp::VecMulI16x8,
             "VecSubI16x16" => IntrinsicOp::VecSubI16x16,
             "VecSubI16x8" => IntrinsicOp::VecSubI16x8,
+            "VecSubSatU16x16" => IntrinsicOp::VecSubSatU16x16,
+            "VecSubSatU16x8" => IntrinsicOp::VecSubSatU16x8,
             "VecMaxI8x32" => IntrinsicOp::VecMaxI8x32,
             "VecMinI8x32" => IntrinsicOp::VecMinI8x32,
             "VecSubI32x4" => IntrinsicOp::VecSubI32x4,

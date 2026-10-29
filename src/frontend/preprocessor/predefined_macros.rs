@@ -1151,6 +1151,7 @@ impl Preprocessor {
     }
 
     pub fn set_target(&mut self, target: &str) {
+        self.invalidate_include_search();
         match target {
             "aarch64" => {
                 self.undefine_x86_baseline_macros();

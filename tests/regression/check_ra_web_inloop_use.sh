@@ -49,10 +49,11 @@
 #      stdout AND exit status. An A/B across a miscompile is meaningless, so this
 #      is checked before any codegen claim.
 #   2. THE MECHANISM FIRES — the default arm's `sha256_transform` must be
-#      strictly smaller than the kill-switch arm's, and its hottest loop's
-#      most-reloaded slot must be strictly less concentrated. A supply that
-#      silently stops firing (the failure mode this repo has been bitten by
-#      repeatedly) is a loud FAIL, never a pass.
+#      strictly smaller than the kill-switch arm's. Its hottest loop must have
+#      strictly less concentrated reloads unless both arms are already at the
+#      zero-reload floor. The direct `mark_loop_spanning` unit tests separately
+#      pin the actual web-wide flag and its independence from cap counts, even
+#      when later optimizations eliminate the assembly-level reload witness.
 #   3. THE KILL SWITCH IS WIRED — `CCC_NO_WEB_INLOOP_USE=1` observably changes
 #      the emitted code, so the A/B stays reproducible and a regression can be
 #      attributed without a rebuild.
@@ -233,6 +234,15 @@ def hottest_loop(lines):
     return best
 
 
+# A zero count is meaningful only if the extractor still finds real reloads.
+# Exercise a column-zero backedge, repeated plain slots, an indexed user-array
+# access and an address calculation before trusting the real assembly.
+probe = [".Lprobe:", "\tmovq 16(%rsp), %rax", "\taddq 16(%rsp), %rax",
+         "\tmovq 32(%rsp,%r10,4), %rax", "\tleaq 48(%rsp), %rax", "jne .Lprobe"]
+if hottest_loop(probe) != (4, 2, 1, 2):
+    print("  FAIL: reload-concentration extractor failed its fixture", file=sys.stderr)
+    sys.exit(1)
+
 arms = {}
 for lbl, name in (("default", "on.s"), ("killswitch", "off.s"), ("gcc", "gcc.s")):
     b = body(f"{work}/{name}")
@@ -265,9 +275,12 @@ if not d["insns"] < k["insns"]:
 if d["loop"] is None or k["loop"] is None:
     bad.append("could not locate the round loop in one of the arms")
 else:
-    if not d["loop"][3] < k["loop"][3]:
+    default_max, disabled_max = d["loop"][3], k["loop"][3]
+    if default_max == disabled_max == 0:
+        print("  both arms have zero hottest-loop reloads; concentration is at its floor")
+    elif not default_max < disabled_max:
         bad.append(f"hottest-loop reload concentration did not improve "
-                   f"(max-per-slot {d['loop'][3]} vs kill switch {k['loop'][3]})")
+                   f"(max-per-slot {default_max} vs kill switch {disabled_max})")
     if not d["loop"][1] <= k["loop"][1]:
         bad.append(f"hottest-loop stack traffic grew "
                    f"({d['loop'][1]} vs kill switch {k['loop'][1]} memops)")
@@ -282,7 +295,7 @@ sys.exit(1 if bad else 0)
 PYEOF
 rc=$?
 set -e
-if [[ $rc != 0 ]]; then fail=1; else note "web-wide supply fires: smaller function, less concentrated reloads"; fi
+if [[ $rc != 0 ]]; then fail=1; else note "web-wide supply's structural controls hold"; fi
 
 # --------------------------------------------------------------------------
 # 4. Presence semantics. `RaConfig::from_sources` is given a predicate that

@@ -76,8 +76,13 @@ pub struct Preprocessor {
     pub(super) after_include_paths: Vec<PathBuf>,
     /// System include paths (default search paths)
     pub(super) system_include_paths: Vec<PathBuf>,
-    /// Files currently being processed (for recursion detection)
+    /// Files currently being processed (for recursion detection).
     pub(super) include_stack: Vec<PathBuf>,
+    /// Search-chain slot that supplied each file, or None for the primary
+    /// source, an absolute include, or an include found beside its parent.
+    pub(super) include_origins: Vec<Option<usize>>,
+    /// Lazily normalized once per search-path configuration.
+    pub(super) include_search_chain: std::cell::OnceCell<super::includes::IncludeSearchChain>,
     /// Files that have been included with #pragma once (path fallback).
     pub(super) pragma_once_files: FxHashSet<PathBuf>,
     /// Device/inode identities for #pragma once files.  This avoids double
@@ -116,7 +121,8 @@ pub struct Preprocessor {
     /// multiple locations with the same include search path configuration.
     /// The current_dir_key is the parent directory of the including file for quoted
     /// includes (since resolution depends on it), or empty for system includes.
-    pub(super) include_resolve_cache: FxHashMap<(String, bool, PathBuf), Option<PathBuf>>,
+    pub(super) include_resolve_cache:
+        FxHashMap<(String, bool, PathBuf), Option<super::includes::IncludeResolution>>,
     /// Include guard detection: maps file paths to their guard macro names.
     ///
     /// After preprocessing an included file, we scan the raw source to detect if
@@ -166,6 +172,8 @@ impl Preprocessor {
             after_include_paths: Vec::new(),
             system_include_paths: Self::default_system_include_paths(),
             include_stack: Vec::new(),
+            include_origins: Vec::new(),
+            include_search_chain: std::cell::OnceCell::new(),
             pragma_once_files: FxHashSet::default(),
             pragma_once_identities: FxHashSet::default(),
             resolve_includes: true,
@@ -1045,6 +1053,7 @@ impl Preprocessor {
         let path = PathBuf::from(filename);
         let abs = super::includes::make_absolute(&path);
         self.include_stack.push(abs);
+        self.include_origins.push(None);
     }
 
     /// Get preprocessing errors.
@@ -1140,17 +1149,23 @@ impl Preprocessor {
         self.macros.undefine(name);
     }
 
-    /// Drop only the implicit compiler and system search directories.
-    /// Explicit -I/-iquote/-isystem/-idirafter paths remain available.
+    /// Invalidate cached lookups whenever the configured search paths change.
+    pub(super) fn invalidate_include_search(&mut self) {
+        self.include_search_chain.take();
+        self.include_resolve_cache.clear();
+    }
+
+    /// Drop only implicit compiler/system directories; explicit paths remain.
     pub fn clear_default_include_paths(&mut self) {
         self.system_include_paths.clear();
-        self.include_resolve_cache.clear();
+        self.invalidate_include_search();
     }
 
     /// Add an include search path for #include directives (-I flag).
     /// Adds regardless of whether the directory currently exists.
     pub fn add_include_path(&mut self, path: &str) {
         self.include_paths.push(PathBuf::from(path));
+        self.invalidate_include_search();
     }
 
     /// Add a quote-only include search path (-iquote flag).
@@ -1158,18 +1173,21 @@ impl Preprocessor {
     /// Searched after current directory, before -I paths.
     pub fn add_quote_include_path(&mut self, path: &str) {
         self.quote_include_paths.push(PathBuf::from(path));
+        self.invalidate_include_search();
     }
 
     /// Add a system include path (-isystem flag).
     /// These paths are searched after -I paths, before default system paths.
     pub fn add_system_include_path(&mut self, path: &str) {
         self.isystem_include_paths.push(PathBuf::from(path));
+        self.invalidate_include_search();
     }
 
     /// Add an after include path (-idirafter flag).
     /// These paths are searched last, after all other include paths.
     pub fn add_after_include_path(&mut self, path: &str) {
         self.after_include_paths.push(PathBuf::from(path));
+        self.invalidate_include_search();
     }
 
     /// Process a force-included file (-include flag). This preprocesses the file content
@@ -1177,6 +1195,15 @@ impl Preprocessor {
     /// All #define directives in the file take effect, and the preprocessed output
     /// is discarded (macros/typedefs persist in the preprocessor state).
     pub fn preprocess_force_include(&mut self, content: &str, resolved_path: &str) {
+        self.preprocess_force_include_with_origin(content, resolved_path, None);
+    }
+
+    pub(crate) fn preprocess_force_include_with_origin(
+        &mut self,
+        content: &str,
+        resolved_path: &str,
+        origin: Option<usize>,
+    ) {
         let resolved = PathBuf::from(resolved_path);
 
         // GCC lists -include files in make dependencies even when a guard
@@ -1198,6 +1225,7 @@ impl Preprocessor {
 
         // Push onto include stack
         self.include_stack.push(resolved.clone());
+        self.include_origins.push(origin);
 
         // Save and set __FILE__ (uses set_file to avoid full MacroDef allocation)
         let old_file = self.macros.get_file_body().map(|s| s.to_string());
@@ -1220,8 +1248,9 @@ impl Preprocessor {
             self.macros.set_file(old);
         }
 
-        // Pop include stack
+        // Pop include stack and its matching search provenance.
         self.include_stack.pop();
+        self.include_origins.pop();
     }
 
     /// Process a preprocessor directive line.

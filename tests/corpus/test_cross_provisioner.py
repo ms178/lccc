@@ -52,6 +52,25 @@ result=$(archive_name example-package)
         result = subprocess.run(["bash", "-c", probe], text=True, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_cross_generation_uses_system_gcc_not_path_oracle(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            system = root / "system-gcc"
+            system.write_text("#!/bin/sh\necho 13.3.0\n")
+            system.chmod(0o755)
+            oracle = root / "gcc"
+            oracle.write_text("#!/bin/sh\necho 16.2.0\n")
+            oracle.chmod(0o755)
+            probe = extract_function("system_gcc_major") + f'''
+LCCC_CROSS_SYSTEM_GCC="{system}"
+PATH="{root}:$PATH"
+result=$(system_gcc_major)
+[ "$result" = 13 ] || {{ echo "got: [$result]" >&2; exit 1; }}
+'''
+            result = subprocess.run(["bash", "-c", probe], text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_find_ldconfig_finds_absolute_binary_outside_path(self):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:

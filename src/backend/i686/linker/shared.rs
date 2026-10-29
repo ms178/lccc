@@ -1655,6 +1655,7 @@ pub(super) fn emit_shared_library_32(
         global_symbols,
         tls_addr,
         got_base,
+        !opts.is_pie,
     )?;
     let file_end = super::debug::place_debug_sections(output_sections, data_seg_file_end);
     shdrs.extend(Shdr32::of_outputs(output_sections));

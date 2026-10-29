@@ -827,6 +827,9 @@ gate "warning-precedence" fast \
 gate "macro-parity" fast \
     python3 tests/regression/check_macro_parity.py \
         --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"
+gate "include-next-search" fast \
+    python3 tests/regression/check_include_next_search.py \
+        --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"
 # GP-23: the PREDEFINED macro set itself (not the warning/macro *contract* above)
 # must match `gcc-16 -dM -E` for every (target, dialect) pair, with the libc
 # macros that belong to the headers required ABSENT (the GP-05 ratchet, never
@@ -2384,6 +2387,12 @@ gate "bb-slp-v7" fast \
 gate "bb-slp-v8" fast \
     bash tests/regression/check_bb_slp_v8_codegen.sh
 
+# A store whose bytes the next iteration loads is a register carry, not a
+# pack: BB-SLP declining it is what lets `loop_carried_forward` build
+# the header phi (sha256_transform 12 % slower when packed).
+gate "slp-loop-carried" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_slp_loop_carried_recurrence.sh
+
 # Nested-diamond if-conversion + sub-word SELECT demotion: the
 # unique-predecessor coverage walk (dominating_deref_keys), single-entry
 # single-exit arm regions, the recursive promoted-select demotion, Copy
@@ -2428,6 +2437,12 @@ gate "vec-adler-epic" fast \
 # backend can emit vfmadd.  Emission AND executed semantics are pinned.
 gate "vectorize-isa-gate" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_vectorize_isa_gate.sh
+
+# Unsigned word saturation: boundary values, scalar tails, overlap guards,
+# signed/nonzero negative controls and the SSE2/AVX2/disabled-ISA contracts.
+gate "u16-saturating-sub" fast \
+    env CCC=target/fastbuild/lccc GCC="${GCC:-gcc-16}" \
+        bash tests/regression/check_u16_saturating_sub.sh
 
 # Byte-compare window phase (`while (p < end && *p == *q)`, the
 # match-extension shape): emission contract (32B AVX2 / 16B SSE2 windows,
@@ -2925,6 +2940,12 @@ gate "godbolt-oracle-selftest" fast \
     python3 tools/oracle/godbolt_oracle_selftest.py
 gate "godbolt-explicit-local-selftest" fast \
     python3 tests/corpus/test_godbolt_explicit_local.py
+# Offline static comparison; the hosted ICX lane additionally runs the same
+# oracle with its authenticated Intel compiler and publishes paired timings.
+gate "gap-local-assembly-oracle" fast \
+    python3 scripts/godbolt.py compare --offline tests/regression/slp_independent_gap.c \
+        --function gap_pairs --flags='-O2 -march=x86-64-v3' --local "$LCCC" --oracles '' \
+        --local-ref "gcc=${GCC16:-gcc-16}"
 
 # One CE cache now backs four tools, and every way it can be wrong is silent:
 # a forgeable key serves one program's result for another's, a truncated

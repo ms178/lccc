@@ -6670,6 +6670,16 @@ impl X86Codegen {
                     self.emit_sse_binary_128(d, args, "psubw");
                 }
             }
+            IntrinsicOp::VecSubSatU16x16 => {
+                if let Some(d) = dest {
+                    self.emit_avx_binary_256(d, args, "vpsubusw", false);
+                }
+            }
+            IntrinsicOp::VecSubSatU16x8 => {
+                if let Some(d) = dest {
+                    self.emit_sse_binary_128(d, args, "psubusw");
+                }
+            }
             // Words DO have a packed multiply (bytes do not); `pmullw` keeps
             // the low half, which is exact for both signednesses.
             IntrinsicOp::VecMulI16x16 => {

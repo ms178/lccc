@@ -292,3 +292,22 @@ results were unavailable from this sandbox. The separate hosted ICX job passed
 on the earlier pushed head; its result on the final head must be checked anew.
 `gdb`, `pahole`, `objtool`, and `perf` were not available locally; Valgrind was
 run from the isolated verified package prefix. Eight GiB of swap remained active.
+
+## Assembly barrier markers (census knob ledger)
+
+The volatile-access and RISC-V jump-range work communicates through
+private assembly-marker comments emitted by codegen and consumed by the
+target peephole passes. They are not environment variables and have no
+tuning value; the census counts every `LCCC_*` literal in `src/`, so they
+are named here explicitly rather than left as undocumented "knobs":
+
+- `LCCC_VOLATILE_BEGIN` / `LCCC_VOLATILE_END` — delimit a volatile access
+  region on i686 and RISC-V so the peephole passes can quarantine
+  optimizations across it (see `tests/regression/check_riscv_volatile_access.py`
+  and `check_volatile_access_semantics.sh`).
+- `LCCC_VOLATILE_BEGI` — deliberately misspelled negative fixture inside the
+  RISC-V peephole unit tests: a malformed marker must survive both the
+  stripper and the optimizer instead of being treated as a region boundary.
+- `LCCC_RISCV_OPAQUE` — RISC-V barrier that makes a branch target opaque to
+  the in-file jump shortening pass, guarding the >1 MiB forward-jump
+  contract exercised under QEMU.

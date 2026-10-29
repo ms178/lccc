@@ -7854,6 +7854,7 @@ fn collect_vecreg_candidates(func: &IrFunction) -> FxHashSet<u32> {
                 | O::VecBroadcastI8x16
                 | O::VecAddI16x16
                 | O::VecSubI16x16
+                | O::VecSubSatU16x16
                 | O::VecMulI16x16
                 | O::VecCmpI16x16
                 | O::VecMinI16x16
@@ -7863,6 +7864,7 @@ fn collect_vecreg_candidates(func: &IrFunction) -> FxHashSet<u32> {
                 | O::VecBlendvI16x16
                 | O::VecAddI16x8
                 | O::VecSubI16x8
+                | O::VecSubSatU16x8
                 | O::VecMulI16x8
                 | O::VecCmpI16x8
                 | O::VecMinI16x8
@@ -8515,6 +8517,7 @@ fn is_sse128_chain_op(op: &IntrinsicOp) -> bool {
             // (`emit_vex_binary_128`, three-operand).
             | O::VecAddI16x8
             | O::VecSubI16x8
+            | O::VecSubSatU16x8
             | O::VecMinI16x8
             | O::VecMaxI16x8
             | O::VecCmpI32x4
@@ -9473,6 +9476,7 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
             O::VecLoadI16x8
             | O::VecAddI16x8
             | O::VecSubI16x8
+            | O::VecSubSatU16x8
             | O::VecMulI16x8
             | O::VecAndI16x8
             | O::VecOrI16x8
@@ -9689,6 +9693,7 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                 O::VecStoreI16x8
                     | O::VecAddI16x8
                     | O::VecSubI16x8
+                    | O::VecSubSatU16x8
                     | O::VecMulI16x8
                     | O::VecAndI16x8
                     | O::VecOrI16x8
@@ -9837,6 +9842,7 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                                 // function back to protected slots.
                                 | O::VecAddI16x16
                                 | O::VecSubI16x16
+                                | O::VecSubSatU16x16
                                 | O::VecMulI16x16
                                 | O::VecCmpI16x16
                                 | O::VecMinI16x16
@@ -10132,6 +10138,7 @@ fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
                     // same YMM file, same VecLoad/StoreI32x8 endpoints.
                     | O::VecAddI16x16
                     | O::VecSubI16x16
+                    | O::VecSubSatU16x16
                     | O::VecMulI16x16
                     | O::VecCmpI16x16
                     | O::VecMinI16x16
@@ -10216,6 +10223,7 @@ fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
                     // Word lanes (OP-05g) share the 128-bit integer class.
                     | O::VecAddI16x8
                     | O::VecSubI16x8
+                    | O::VecSubSatU16x8
                     | O::VecMulI16x8
                     | O::VecCmpI16x8
                     | O::VecMinI16x8
@@ -10522,6 +10530,7 @@ fn x86_map_intrinsic_class(op: &crate::ir::intrinsics::IntrinsicOp) -> Option<u8
         // YMM file, same VecLoad/StoreI32x8 endpoints.
         | O::VecAddI16x16
         | O::VecSubI16x16
+        | O::VecSubSatU16x16
         | O::VecMulI16x16
         | O::VecCmpI16x16
         | O::VecMinI16x16
@@ -10586,6 +10595,7 @@ fn x86_map_intrinsic_class(op: &crate::ir::intrinsics::IntrinsicOp) -> Option<u8
         | O::VecBlendvI8x16
         | O::VecAddI16x8
         | O::VecSubI16x8
+        | O::VecSubSatU16x8
         | O::VecMulI16x8
         | O::VecCmpI16x8
         | O::VecMinI16x8
@@ -10764,6 +10774,7 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
                     // same YMM file, same VecLoad/StoreI32x8 endpoints.
                     | O::VecAddI16x16
                     | O::VecSubI16x16
+                    | O::VecSubSatU16x16
                     | O::VecMulI16x16
                     | O::VecCmpI16x16
                     | O::VecMinI16x16
@@ -10840,6 +10851,7 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecBlendvI8x16
                     | O::VecAddI16x8
                     | O::VecSubI16x8
+                    | O::VecSubSatU16x8
                     | O::VecMulI16x8
                     | O::VecCmpI16x8
                     | O::VecMinI16x8

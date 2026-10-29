@@ -2057,26 +2057,31 @@ impl Driver {
         preprocessor: &mut Preprocessor,
     ) -> Result<(), String> {
         for path in &self.force_includes {
-            let resolved = if std::path::Path::new(path).is_absolute() {
-                std::path::PathBuf::from(path)
+            let (resolved, origin) = if std::path::Path::new(path).is_absolute() {
+                (std::path::PathBuf::from(path), None)
             } else {
-                // Try CWD first
+                // GCC first searches CWD for -include; a file found there
+                // has no search-chain slot, even if a later -I names CWD.
                 let cwd_path = std::env::current_dir()
                     .map(|cwd| cwd.join(path))
                     .unwrap_or_else(|_| std::path::PathBuf::from(path));
                 if cwd_path.is_file() {
-                    cwd_path
+                    (cwd_path, None)
                 } else {
-                    // Search include paths (like #include "file")
-                    preprocessor
-                        .resolve_include_path(path, false)
-                        .unwrap_or(cwd_path)
+                    match preprocessor.resolve_force_include_with_origin(path) {
+                        Some(found) => (found.path, found.origin),
+                        None => (cwd_path, None),
+                    }
                 }
             };
 
             let content = Self::read_c_source_file(&resolved.to_string_lossy())
                 .map_err(|e| format!("{}: {}", path, e))?;
-            preprocessor.preprocess_force_include(&content, &resolved.to_string_lossy());
+            preprocessor.preprocess_force_include_with_origin(
+                &content,
+                &resolved.to_string_lossy(),
+                origin,
+            );
         }
         Ok(())
     }

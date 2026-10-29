@@ -10,6 +10,19 @@ use super::pipeline::Preprocessor;
 /// Prevents infinite inclusion loops in files without `#pragma once`.
 const MAX_INCLUDE_DEPTH: usize = 200;
 
+/// The directory slot is needed even when a later `include_next` names a
+/// different header. Paths are kept as spelled (symlinks remain observable).
+#[derive(Clone)]
+pub(crate) struct IncludeResolution {
+    pub(crate) path: PathBuf,
+    pub(crate) origin: Option<usize>,
+}
+
+pub(super) struct IncludeSearchChain {
+    dirs: Vec<PathBuf>,
+    bracket_start: usize,
+}
+
 /// C23 `__has_embed` result, matching the `__STDC_EMBED_*` macro values.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum EmbedResult {
@@ -609,8 +622,10 @@ impl Preprocessor {
 
         // Resolve the include path to an actual file (and record it for
         // make-dependency output; __has_include probes never reach here)
-        if let Some(resolved_path) = self.resolve_and_record_include_path(&include_path, is_system)
-        {
+        if let Some(resolved) = self.resolve_include_with_origin(&include_path, is_system) {
+            let resolved_path = resolved.path;
+            let system_dir = self.is_system_directory(&resolved_path);
+            self.record_dep_file(resolved_path.clone(), system_dir);
             // Check for #pragma once (path and device/inode identity).
             if self.is_pragma_once_file(&resolved_path) {
                 return Some(String::new());
@@ -649,6 +664,7 @@ impl Preprocessor {
 
                     // Push onto include stack
                     self.include_stack.push(resolved_path.clone());
+                    self.include_origins.push(resolved.origin);
 
                     // Format path for line directive (relative when under cwd, matching GCC)
                     let display_path = format_path_for_line_directive(&resolved_path);
@@ -731,8 +747,9 @@ impl Preprocessor {
                         self.macros.set_file(old);
                     }
 
-                    // Pop include stack
+                    // Pop include stack and its search provenance.
                     self.include_stack.pop();
+                    self.include_origins.pop();
 
                     // Register the include guard for future fast-path skipping.
                     // We do this after preprocessing so that the guard macro is
@@ -815,14 +832,10 @@ impl Preprocessor {
             return None;
         }
 
-        // Get the current file path for include_next resolution
-        let current_file = self.include_stack.last().cloned();
-
-        // Resolve using include_next semantics (and record for make deps;
-        // the system verdict follows the resolved path's directory).
-        if let Some(resolved_path) =
-            self.resolve_include_next_path(&include_path, current_file.as_ref())
-        {
+        // Continue after the slot that opened this file, regardless of the
+        // new header's spelling. The result retains its own slot for nesting.
+        if let Some(resolved) = self.resolve_include_next_path(&include_path) {
+            let resolved_path = resolved.path;
             let system_dir = self.is_system_directory(&resolved_path);
             self.record_dep_file(resolved_path.clone(), system_dir);
             // Check for #pragma once (path and device/inode identity).
@@ -855,6 +868,7 @@ impl Preprocessor {
                     let detected_guard = detect_include_guard(&content);
 
                     self.include_stack.push(resolved_path.clone());
+                    self.include_origins.push(resolved.origin);
 
                     // Format path for line directive (relative when under cwd, matching GCC)
                     let display_path = format_path_for_line_directive(&resolved_path);
@@ -873,6 +887,7 @@ impl Preprocessor {
                     }
 
                     self.include_stack.pop();
+                    self.include_origins.pop();
 
                     if let Some(guard) = detected_guard {
                         self.include_guard_macros.insert(resolved_path, guard);
@@ -883,8 +898,16 @@ impl Preprocessor {
                 Err(_) => None,
             }
         } else {
-            // Fall back to regular include if include_next can't find it
-            self.handle_include(path, line_num, col)
+            // Exhaustion is an error, not a new search from the beginning.
+            // Restarting can alternate between two GCC wrapper headers until
+            // the recursion cap and silently omit the real libc header.
+            self.errors.push(super::pipeline::PreprocessorDiagnostic {
+                file: self.current_file(),
+                line: line_num,
+                col: col + "include_next ".len(),
+                message: format!("{}: No such file or directory", include_path),
+            });
+            None
         }
     }
 
@@ -1292,72 +1315,106 @@ impl Preprocessor {
         }
     }
 
-    /// Resolve an include path using #include_next semantics: search from the
-    /// next include path after the one containing the current file.
-    /// `current_file` is the full path to the file containing the #include_next.
+    /// GCC keeps the first duplicate within each category. A directory that
+    /// is also a system directory is ignored in `-I`; system and after
+    /// directories are then deduplicated in their effective search order.
+    /// The raw quote chain first drops a duplicate at its bracket join; only
+    /// then are duplicate quote entries and system directories removed. This
+    /// order matters when the same -iquote appears twice. Directory identity
+    /// is canonicalized only for deduplication, never for opening a header.
+    fn include_chain(&self) -> &IncludeSearchChain {
+        self.include_search_chain.get_or_init(|| {
+            use crate::common::fx_hash::FxHashSet;
+            let id = |path: &PathBuf| {
+                std::fs::canonicalize(path).unwrap_or_else(|_| make_absolute(path))
+            };
+            let systems: Vec<&PathBuf> = self
+                .isystem_include_paths
+                .iter()
+                .chain(self.system_include_paths.iter())
+                .chain(self.after_include_paths.iter())
+                .collect();
+            let system_ids: FxHashSet<PathBuf> = systems.iter().map(|p| id(p)).collect();
+            let mut seen = FxHashSet::default();
+            let mut bracket = Vec::new();
+            for path in &self.include_paths {
+                let key = id(path);
+                if !system_ids.contains(&key) && seen.insert(key) {
+                    bracket.push(path.clone());
+                }
+            }
+            for path in systems {
+                if seen.insert(id(path)) {
+                    bracket.push(path.clone());
+                }
+            }
+            let mut raw_quote: Vec<&PathBuf> = self.quote_include_paths.iter().collect();
+            if let (Some(last), Some(first)) = (raw_quote.last(), bracket.first()) {
+                if id(last) == id(first) {
+                    raw_quote.pop();
+                }
+            }
+            let mut quote_seen = FxHashSet::default();
+            let mut quote = Vec::new();
+            for path in raw_quote {
+                let key = id(path);
+                if !system_ids.contains(&key) && quote_seen.insert(key) {
+                    quote.push(path.clone());
+                }
+            }
+            let bracket_start = quote.len();
+            quote.extend(bracket);
+            IncludeSearchChain {
+                dirs: quote,
+                bracket_start,
+            }
+        })
+    }
+
+    /// Search after the directory which actually opened the current file.
+    /// A primary/absolute/parent-directory include has no search-chain slot,
+    /// so it starts at the beginning of the quote-plus-bracket chain. Unlike
+    /// `#include`, GCC's `#include_next` treats angle and quote forms alike.
     pub(super) fn resolve_include_next_path(
         &self,
         include_path: &str,
-        current_file: Option<&PathBuf>,
-    ) -> Option<PathBuf> {
-        // Collect all search paths in order:
-        // -iquote -> -I -> -isystem -> default system -> -idirafter
-        let all_paths: Vec<&Path> = self
-            .quote_include_paths
-            .iter()
-            .chain(self.include_paths.iter())
-            .chain(self.isystem_include_paths.iter())
-            .chain(self.system_include_paths.iter())
-            .chain(self.after_include_paths.iter())
-            .map(|p| p.as_path())
-            .collect();
+    ) -> Option<IncludeResolution> {
+        let direct = Path::new(include_path);
+        if direct.is_absolute() && direct.is_file() {
+            return Some(IncludeResolution {
+                path: make_absolute(direct),
+                origin: None,
+            });
+        }
+        let start = self
+            .include_origins
+            .last()
+            .copied()
+            .flatten()
+            .map_or(0, |i| i + 1);
+        self.search_chain_from(include_path, start)
+    }
 
-        // Canonicalize the current file path for comparison
-        let current_file_canon = current_file.and_then(|f| std::fs::canonicalize(f).ok());
-
-        // Find which search path contains the current file by checking if
-        // search_path/include_path resolves to the same file as the current file.
-        // This correctly handles subdirectory includes (e.g., sys/types.h).
-        let mut found_current = false;
-        if let Some(ref cur_canon) = current_file_canon {
-            for search_path in &all_paths {
-                let candidate = search_path.join(include_path);
-                if candidate.is_file() {
-                    if let Ok(candidate_canon) = std::fs::canonicalize(&candidate) {
-                        if &candidate_canon == cur_canon {
-                            found_current = true;
-                            continue;
-                        }
-                    }
-                }
-                if found_current {
-                    let candidate = search_path.join(include_path);
-                    if candidate.is_file() {
-                        return Some(make_absolute(&candidate));
-                    }
-                }
+    fn search_chain_from(&self, include_path: &str, start: usize) -> Option<IncludeResolution> {
+        for (i, dir) in self.include_chain().dirs.iter().enumerate().skip(start) {
+            let candidate = dir.join(include_path);
+            if candidate.is_file() {
+                return Some(IncludeResolution {
+                    path: make_absolute(&candidate),
+                    origin: Some(i),
+                });
             }
         }
-
-        // Fallback: if we couldn't find the current file in any search path,
-        // search all paths but skip any that resolve to the current file.
-        if !found_current {
-            for search_path in &all_paths {
-                let candidate = search_path.join(include_path);
-                if candidate.is_file() {
-                    // Use canonicalize for comparison to detect same-file
-                    let candidate_canon = std::fs::canonicalize(&candidate).ok();
-                    if let (Some(cur), Some(cand)) = (&current_file_canon, &candidate_canon) {
-                        if cur == cand {
-                            continue;
-                        }
-                    }
-                    return Some(make_absolute(&candidate));
-                }
-            }
-        }
-
         None
+    }
+
+    /// After CWD, -include searches the configured chain, not the main
+    /// source's directory. Preserve the matching slot for nested include_next.
+    pub(crate) fn resolve_force_include_with_origin(
+        &self,
+        include_path: &str,
+    ) -> Option<IncludeResolution> {
+        self.search_chain_from(include_path, 0)
     }
 
     /// Resolve an include path to an actual file path.
@@ -1372,7 +1429,17 @@ impl Preprocessor {
     /// path from the same context. The cache key includes the current directory
     /// for quoted includes (since resolution depends on it).
     pub fn resolve_include_path(&mut self, include_path: &str, is_system: bool) -> Option<PathBuf> {
-        // Compute cache key: (include_path, is_system, current_dir_for_quoted_includes)
+        self.resolve_include_with_origin(include_path, is_system)
+            .map(|r| r.path)
+    }
+
+    pub(crate) fn resolve_include_with_origin(
+        &mut self,
+        include_path: &str,
+        is_system: bool,
+    ) -> Option<IncludeResolution> {
+        // The current directory affects quoted lookup; the search-chain slot
+        // does not, because it matters only for a later include_next.
         let current_dir_key = if !is_system {
             self.include_stack
                 .last()
@@ -1382,11 +1449,9 @@ impl Preprocessor {
             PathBuf::new()
         };
         let cache_key = (include_path.to_string(), is_system, current_dir_key);
-
         if let Some(cached) = self.include_resolve_cache.get(&cache_key) {
             return cached.clone();
         }
-
         let result = self.resolve_include_path_uncached(include_path, is_system);
         self.include_resolve_cache.insert(cache_key, result.clone());
         result
@@ -1440,38 +1505,21 @@ impl Preprocessor {
         Some(resolved)
     }
 
-    /// Uncached include path resolution. Called by `resolve_include_path` on cache miss.
+    /// Uncached lookup: return the exact search slot as well as the path.
     fn resolve_include_path_uncached(
         &self,
         include_path: &str,
         is_system: bool,
-    ) -> Option<PathBuf> {
-        // For quoted includes (#include "..."), search in this order:
-        //   1. Current file's directory
-        //   2. -iquote paths
-        //   3. -I paths
-        //   4. -isystem paths
-        //   5. Default system paths
-        //   6. -idirafter paths
-        //
-        // For system includes (#include <...>), search in this order:
-        //   1. compiler-reserved bundled x86 intrinsic headers
-        //   2. -I paths
-        //   3. -isystem paths
-        //   4. Default system paths
-        //   5. -idirafter paths
-        //
-        // Absolute header names do not require any search directory. In
-        // particular they remain usable under -nostdinc, even for <...>.
+    ) -> Option<IncludeResolution> {
         let direct = Path::new(include_path);
         if direct.is_absolute() && direct.is_file() {
-            return Some(make_absolute(direct));
+            return Some(IncludeResolution {
+                path: make_absolute(direct),
+                origin: None,
+            });
         }
 
-        // The reserved-header step is active only when the bundled directory
-        // remains in the configured system search list, preserving -nostdinc
-        // behavior. It avoids GCC's newer unsupported intrinsic umbrella
-        // headers shadowing LCCC's ABI-matched intrinsic declarations.
+        // Preserve the compiler-reserved intrinsic-header override.
         if is_system && is_bundled_x86_intrinsic_header(include_path) {
             if let Some(bundled) = Preprocessor::bundled_include_dir() {
                 if self
@@ -1481,96 +1529,61 @@ impl Preprocessor {
                 {
                     let candidate = bundled.join(include_path);
                     if candidate.is_file() {
-                        return Some(make_absolute(&candidate));
+                        let origin = self
+                            .include_chain()
+                            .dirs
+                            .iter()
+                            .position(|dir| *dir == bundled);
+                        return Some(IncludeResolution {
+                            path: make_absolute(&candidate),
+                            origin,
+                        });
                     }
                 }
             }
         }
 
         if !is_system {
-            // Step 1: Search relative to the current file's directory
-            if let Some(current_file) = self.include_stack.last() {
-                if let Some(current_dir) = current_file.parent() {
-                    let candidate = current_dir.join(include_path);
-                    if candidate.is_file() {
-                        return Some(make_absolute(&candidate));
-                    }
+            if let Some(current_dir) = self.include_stack.last().and_then(|f| f.parent()) {
+                let candidate = current_dir.join(include_path);
+                if candidate.is_file() {
+                    return Some(IncludeResolution {
+                        path: make_absolute(&candidate),
+                        origin: None,
+                    });
                 }
             }
-            // Also try relative to the original source file directory
             if !self.filename.is_empty() {
                 if let Some(parent) = Path::new(&self.filename).parent() {
                     let candidate = parent.join(include_path);
                     if candidate.is_file() {
-                        return Some(make_absolute(&candidate));
+                        return Some(IncludeResolution {
+                            path: make_absolute(&candidate),
+                            origin: None,
+                        });
                     }
                 }
             }
-
-            // Step 2: Search -iquote paths (quoted includes only)
-            for dir in &self.quote_include_paths {
-                let candidate = dir.join(include_path);
-                if candidate.is_file() {
-                    return Some(make_absolute(&candidate));
-                }
-            }
         }
 
-        // GCC 16.2 falls back to its quote chain for an angle include when
-        // *no existing bracket-search directory* remains (notably
-        // `-nostdinc -iquote DIR`). Adding even an empty -I/-isystem dir
-        // disables that fallback. __has_include uses this same resolver.
-        // Keep the ordinary path cheap: default system directories normally
-        // make the first condition false.
-        if is_system
-            && self.system_include_paths.is_empty()
-            && !self
-                .include_paths
-                .iter()
-                .chain(self.isystem_include_paths.iter())
-                .chain(self.after_include_paths.iter())
-                .any(|path| path.is_dir())
-        {
-            for dir in &self.quote_include_paths {
-                let candidate = dir.join(include_path);
-                if candidate.is_file() {
-                    return Some(make_absolute(&candidate));
-                }
-            }
-        }
-
-        // Step 3: Search -I paths (user directories)
-        for dir in &self.include_paths {
+        let chain = self.include_chain();
+        // GCC falls back to the quote chain for an angle include if no
+        // existing bracket-search directory remains (e.g. -nostdinc -iquote).
+        let bracket_exists = chain.dirs[chain.bracket_start..].iter().any(|p| p.is_dir());
+        let start = if is_system && bracket_exists {
+            chain.bracket_start
+        } else {
+            0
+        };
+        for (i, dir) in chain.dirs.iter().enumerate().skip(start) {
             let candidate = dir.join(include_path);
             if candidate.is_file() {
-                return Some(make_absolute(&candidate));
+                return Some(IncludeResolution {
+                    path: make_absolute(&candidate),
+                    origin: Some(i),
+                });
             }
         }
-
-        // Step 4: Search -isystem paths (system directories)
-        for dir in &self.isystem_include_paths {
-            let candidate = dir.join(include_path);
-            if candidate.is_file() {
-                return Some(make_absolute(&candidate));
-            }
-        }
-
-        // Step 5: Search default system include paths
-        for dir in &self.system_include_paths {
-            let candidate = dir.join(include_path);
-            if candidate.is_file() {
-                return Some(make_absolute(&candidate));
-            }
-        }
-
-        // Step 6: Search -idirafter paths (system directories, GCC parity)
-        for dir in &self.after_include_paths {
-            let candidate = dir.join(include_path);
-            if candidate.is_file() {
-                return Some(make_absolute(&candidate));
-            }
-        }
-
         None
     }
 
