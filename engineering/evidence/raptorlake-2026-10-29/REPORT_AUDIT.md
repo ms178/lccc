@@ -79,10 +79,23 @@ Numbers greater than 1 indicate more LCCC work in that counter; a ratio below
   fallback, overlap, scalar-tail, SSE2, AVX2, and ISA-negative controls. This
   establishes the codegen pattern and semantic controls, not a Raptor Lake
   runtime win; the uploaded report's revision predates the change.
-* The list-sort lead remains: current-tree LCCC's merge loop calls its
-  comparator indirectly while GCC emits direct field comparisons in a
-  `merge.constprop` clone. The general IPA/devirtualization opportunity has
-  not been changed in this patch and needs independent analysis and target A/B.
+* A later strict correctness-only screen (fastbuild LCCC vs cached GCC 16.2)
+  found the list-sort comparator lead was stale or build-dependent: current
+  LCCC `merge_and_count` compares node keys directly in the hot merge loop,
+  rather than making an indirect callback. The report's list-sort runtime gap
+  remains unexplained; investigate pointer-chasing and branch behavior using
+  the exact report revision before proposing a transform. No timing was taken.
+* The same later screen confirms a concrete `fp64_product_map` specialization
+  lead in the current build: LCCC emits a generic `n` loop, while GCC emits a
+  `constprop.0` clone for the constant 512-element call. This is a candidate
+  for general internal-function constant specialization, not a benchmark-name
+  special case, and needs correctness safeguards, code-size analysis, and
+  target-hardware measurement. The SQLite decoder uses a jump table in the
+  screen; that is not itself evidence that a different lowering is faster.
+* A workload-by-workload follow-up hypothesis table and acceptance plan is in
+  `OPTIMIZATION_BACKLOG.md`. The later screen passed correctness for four
+  report workloads only; it collected no timing and does not change any
+  performance claim.
 * After rebasing the fixed session branch onto current `origin/main` at
   `2d95c4e` (PR #1017), the lane-plan self-test/audit, shard-partition
   self-test/audit, and workflow-shell audit all pass with PyYAML 6.0.3 in
@@ -103,9 +116,16 @@ Numbers greater than 1 indicate more LCCC work in that counter; a ratio below
   Fastbuild rebuild, rustfmt, clippy with `-D warnings`, audit census and
   `git diff --check` pass on the rebased tree.
 
-No local CI matrix was run, per request. Hosted GitHub CI has not been run for
-this worktree; there is no PR for this branch. The upload does not provide the
-separate follow-up list mentioned in the request. Those missing inputs, the
-revision mismatch, and the lack of access to the user's physical Raptor Lake
-machine prevent honest claims that all follow-ups or all 15 regressions are
-fixed. See the attached report for the full sample and per-task evidence.
+No local CI matrix was run, per request. Hosted GitHub Actions on PR #1019
+failed at `062a96b` because the unsigned-reduction regression was orphaned
+from both gate lists. That gate is now wired into the workflow, local gate
+manifest, and hosted lane plan in `971fd40`. The full rerun on `971fd40` has
+completed successfully, including CI, Debian exact-version oracle,
+relocation/PGO red-team, IPA-PTA/live-range, and targeted compiler research
+workflows. This green status applies to `971fd40`, not any later commit. The
+upload does not provide the separate follow-up list mentioned in the request.
+Those missing inputs, the revision mismatch, and lack of access to the user's
+physical Raptor Lake machine prevent honest claims that all follow-ups or all
+15 regressions are fixed. See `OPTIMIZATION_BACKLOG.md` for a prioritized,
+explicitly unvalidated optimization backlog, and the attached report for the
+full sample and per-task evidence.
