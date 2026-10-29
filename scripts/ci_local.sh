@@ -1673,6 +1673,9 @@ gate "reduction-vecreg" fast \
 gate "integer-reduction-vecreg" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_integer_reduction_vecreg_codegen.sh
 
+gate "unsigned-reduction-codegen" fast \
+    bash tests/regression/check_unsigned_reduction_codegen.sh
+
 # Integer abs comparison folds in simplify: abs(a) <= 0 -> a == 0 and
 # abs(a) < k -> the biased unsigned range test, with the
 # CCC_SIMPLIFY_SKIP=cmp differential ownership and the -fwrapv

@@ -2630,6 +2630,7 @@ jobs:
         bash tests/regression/check_redundant_test_elimination.sh
         bash tests/regression/check_bool_pair_prune.sh
         bash tests/regression/check_integer_reduction_vecreg_codegen.sh
+        bash tests/regression/check_unsigned_reduction_codegen.sh
         # Integer abs comparison folds in simplify (abs(a) <= 0 -> a == 0,
         # abs(a) < k -> biased unsigned range test), kill-switch ownership
         # and the -fwrapv INT_MIN contract.  Mirrored in
