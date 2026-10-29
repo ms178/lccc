@@ -2383,6 +2383,11 @@ gate "bb-slp-v8" fast \
 gate "bb-slp-nested-ifconv" fast \
     bash tests/regression/check_bb_slp_nested_ifconv.sh
 
+# Per-function __attribute__((target("avx2"))) must widen BB-SLP to ymm;
+# an unattributed twin must stay xmm (ISA gate never becomes a global enable).
+gate "target-attr-vec-isa" fast \
+    bash tests/regression/check_target_attr_vec_isa.sh
+
 # Two-block partial unroller + half-wide dword-pair SLP family: the
 # guard-free xk unroll of two-block counted loops (phi threading incl.
 # the IV-reference carried-phi class), the I32/U32 pair load/store/pack
