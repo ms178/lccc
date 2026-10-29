@@ -30,7 +30,11 @@ fail() { # fail <title> <detail>
 # vectorized). Its output is compared against GCC, so the packed arithmetic
 # assertion below cannot pass on a scalar fallback that happens to be correct.
 strided_src="$dir/vectorize_strided_i32_reduce.c"
-"$CCC" "${flags[@]}" -S "$strided_src" -o "$tmp/strided.s"
+CCC_TIME_PASSES=1 "$CCC" "${flags[@]}" -S "$strided_src" -o "$tmp/strided.s" 2>"$tmp/strided.passes"
+if ! grep -Eq '\[PASS\] iter=0 vectorize_strided_reduce_pre_unroll: .*\([1-9][0-9]* changes\)' "$tmp/strided.passes"; then
+    fail "strided i32 pre-unroll vectorization" \
+        "the dedicated pre-unroll pass did not transform the regression fixture"
+fi
 "$CCC" "${flags[@]}" "$strided_src" -o "$tmp/strided"
 ${GCC_BIN:-gcc} -O2 -march=x86-64-v3 "$strided_src" -o "$tmp/strided-ref"
 expected_out=$("$tmp/strided-ref")
