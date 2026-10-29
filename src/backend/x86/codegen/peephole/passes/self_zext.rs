@@ -142,7 +142,22 @@ pub(super) fn eliminate_redundant_self_zext(store: &mut LineStore, infos: &mut [
                 } else {
                     false
                 };
-                if writes_two_explicit_operands(mnem) {
+                if let Some(families) = implicit_32_bit_write(mnem, t) {
+                    // Widening multiply/divide: %eax and %edx each receive a
+                    // 32-bit result and nothing else is written, so both upper
+                    // halves are zero and the self-zext the emitter adds to
+                    // widen such a result is a no-op.  Decided from the
+                    // mnemonic and the operand SHAPE: the classifier reports
+                    // %rax for the `div`/`mul` spellings but REG_NONE for the
+                    // single-operand `imull`, and the explicit-destination
+                    // width test below would read the divisor `%edi` as a
+                    // destination, mismatch `%eax` and clear the fact this arm
+                    // just established.
+                    clear_families(&mut zero_upper, implicit_write_refs(t.as_bytes()));
+                    for fam in families {
+                        zero_upper[fam] = true;
+                    }
+                } else if writes_two_explicit_operands(mnem) {
                     // `xchg`/`xadd` write BOTH operands and `cmpxchg` writes
                     // %rax as well as its destination; the classified
                     // destination names only one of them.
@@ -153,16 +168,6 @@ pub(super) fn eliminate_redundant_self_zext(store: &mut LineStore, infos: &mut [
                     // for every mnemonic it lists, and clearing is the
                     // conservative answer for each family in it.
                     clear_families(&mut zero_upper, implicit_write_refs(t.as_bytes()));
-                    // ...but a 32-bit implicit write ESTABLISHES the fact for
-                    // the register it writes: `divl %r` leaves the quotient in
-                    // %eax and the remainder in %edx, and the architectural
-                    // 32-bit write zeroes each register's upper half. The
-                    // table above is deliberately a MAY-clear set, so without
-                    // this the `movl %eax, %eax` that widens a division result
-                    // for its 64-bit consumer survives as a no-op.
-                    for fam in implicit_written_families(mnem, t) {
-                        zero_upper[fam] = true;
-                    }
                     zero_upper[dest_reg as usize] = if mnem == "cdq" || mnem == "cltd" {
                         // The classifier names the primary destination %rax,
                         // the INPUT; the real 32-bit write is %edx.
@@ -283,20 +288,21 @@ fn xmm_bitcast_self_zext(
 /// so the write leaves the family's upper 32 bits zero.
 ///
 /// Restricted to the spellings the emitter actually produces, and only to the
-/// `l` (32-bit) forms: `divq %r` writes a 64-bit %rax, and the suffix-less
-/// `div`/`mul` aliases are ambiguous without the operand. `cltq`/`cdqe` are
-/// excluded on purpose -- they sign-extend into a full 64-bit %rax, the exact
-/// opposite of this property.
-fn implicit_written_families(mnem: &str, t: &str) -> Vec<usize> {
+/// `l` (32-bit) forms: `divq %r` writes a 64-bit %rax, so the extension after
+/// it is real, and the suffix-less `div`/`mul` aliases are ambiguous without
+/// the operand.  `cltq`/`cdqe` are excluded on purpose -- they sign-extend into
+/// a full 64-bit %rax, the exact opposite of this property.
+///
+/// `imull` is the one mnemonic here that also has explicit-destination forms;
+/// only the single-operand (widening) form writes %rax:%rdx implicitly.
+fn implicit_32_bit_write(mnem: &str, t: &str) -> Option<[usize; 2]> {
     const RAX: usize = 0;
     const RDX: usize = 2;
     match mnem {
-        // Widening multiplies and divides: %edx:%eax both receive 32 bits.
-        "mull" | "divl" | "idivl" => vec![RAX, RDX],
-        // Single-operand `imull` is the widening form; the two- and
-        // three-operand forms write only their explicit destination.
-        "imull" if !t.contains(',') => vec![RAX, RDX],
-        _ => Vec::new(),
+        // Widening multiply and divide: %edx:%eax both receive 32 bits.
+        "mull" | "divl" | "idivl" => Some([RAX, RDX]),
+        "imull" if !t.contains(',') => Some([RAX, RDX]),
+        _ => None,
     }
 }
 
@@ -360,39 +366,59 @@ mod tests {
             .count()
     }
 
-    /// A 32-bit implicit write establishes the fact. `divl`/`mull` leave
-    /// %eax and %edx each written 32 bits wide, so the self-zext the emitter
-    /// adds to widen a division result for a 64-bit consumer is a no-op.
-    /// The `q` forms must NOT be treated this way: `divq` writes a full
-    /// 64-bit %rax, so the same self-zext really does zero the upper half.
+    /// A 32-bit implicit write establishes the fact. `divl`/`mull`/`idivl` and
+    /// the single-operand `imull` leave %eax and %edx each written 32 bits
+    /// wide, so the self-zext the emitter adds to widen such a result for a
+    /// 64-bit consumer is a no-op.
     #[test]
     fn implicit_32_bit_writes_establish_the_fact() {
-        let cases = [
+        for (writer, self_zext) in [
             ("divl %edi", "movl %eax, %eax"),
-            ("idivl %edi", "movl %eax, %eax"),
-            ("mull %edi", "movl %eax, %eax"),
-            ("imull %edi", "movl %eax, %eax"),
             ("divl %edi", "movl %edx, %edx"),
+            ("idivl %edi", "movl %eax, %eax"),
+            ("idivl %edi", "movl %edx, %edx"),
+            ("mull %edi", "movl %eax, %eax"),
             ("mull %edi", "movl %edx, %edx"),
-        ];
-        for (writer, self_zext) in cases {
+            ("imull %edi", "movl %eax, %eax"),
+            ("imull %edi", "movl %edx, %edx"),
+        ] {
             let asm = format!("    {writer}\n    {self_zext}\n");
             assert_eq!(survivors(&asm, self_zext), 0, "after `{writer}`");
         }
-        // 64-bit forms and the explicit-destination forms keep the extension.
-        for (writer, self_zext) in [
-            ("divq %rdi", "movl %eax, %eax"),
-            ("divq %rdi", "movl %edx, %edx"),
-            ("imull %edi, %eax", "movl %eax, %eax"),
-            ("mulq %rdi", "movl %eax, %eax"),
-            // `cltq` sign-extends into a full 64-bit %rax.
-            ("cltq", "movl %eax, %eax"),
+    }
+
+    /// The forms that must KEEP the extension.  A 64-bit `%rax` write really
+    /// does need it, `cltq` sign-extends into a full 64-bit `%rax`, and the
+    /// explicit-destination `imull` establishes only its destination.
+    #[test]
+    fn implicit_64_bit_writes_and_explicit_forms_keep_the_extension() {
+        for (seed, writer, self_zext) in [
+            ("movl %esi, %eax", "divq %rdi", "movl %eax, %eax"),
+            ("movl %esi, %edx", "divq %rdi", "movl %edx, %edx"),
+            ("movl %esi, %eax", "mulq %rdi", "movl %eax, %eax"),
+            ("movl %esi, %edx", "mulq %rdi", "movl %edx, %edx"),
+            // sign-extends: the self-zext is load-bearing
+            ("movl %esi, %eax", "cltq", "movl %eax, %eax"),
         ] {
-            let asm = format!(
-                "    movl %esi, %eax\n    movl %esi, %edx\n    {writer}\n    {self_zext}\n"
-            );
+            let asm = format!("    {seed}\n    {writer}\n    {self_zext}\n");
             assert_eq!(survivors(&asm, self_zext), 1, "after `{writer}`");
         }
+        // `imull %edi, %eax` writes %eax 32 bits wide -- the fact holds for
+        // %eax -- and says nothing at all about %edx.
+        assert_eq!(
+            survivors(
+                "    imull %edi, %eax\n    movl %eax, %eax\n",
+                "movl %eax, %eax"
+            ),
+            0
+        );
+        assert_eq!(
+            survivors(
+                "    imull %edi, %eax\n    movl %edx, %edx\n",
+                "movl %edx, %edx"
+            ),
+            1
+        );
     }
 
     /// `movq %xmmN, %rX` + `movl %eX, %eX` is the float-bit-cast widening

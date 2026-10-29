@@ -2726,6 +2726,12 @@ jobs:
         bash tests/regression/check_linker_notype_code.sh
         bash tests/regression/check_call_secondary_cache.sh
         bash tests/regression/check_rmw_index_zext_codegen.sh
+        # Redundant zero extensions: the XMM->GPR->self-zext bit-cast pair
+        # must fold to one `movd` (both spellings), and a 32-bit implicit
+        # div/mul write must establish the zero-upper fact.  Shape and
+        # printed values come from the same binary.  Mirrored in
+        # scripts/ci_local.sh (parity-checked).
+        bash tests/regression/check_redundant_self_zext.sh
         python3 tests/regression/check_llvm_missed_zero_choice.py
         python3 scripts/check_ci_gate_parity.py
         # The differential linker oracles (mold, lld) must install with

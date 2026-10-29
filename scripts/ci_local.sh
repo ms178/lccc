@@ -1869,6 +1869,9 @@ gate "rmw-sib-folds" fast \
 gate "rmw-index-zext" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_rmw_index_zext_codegen.sh
 
+gate "redundant-self-zext" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_redundant_self_zext.sh
+
 gate "select-from-compare" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_select_from_compare.sh
 
