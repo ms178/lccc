@@ -32,7 +32,7 @@
 
 use crate::common::source::Span;
 use crate::common::symbol_table::SymbolTable;
-use crate::common::types::{AddressSpace, CType};
+use crate::common::types::{AddressSpace, CType, PtrQuals};
 use crate::frontend::parser::ast::{BinOp, Expr, GenericAssociation, Initializer, UnaryOp};
 use crate::ir::reexports::IrConst;
 
@@ -623,7 +623,7 @@ fn address_cast_is_constant(target: &CType) -> bool {
     match target {
         CType::Pointer(..) => true,
         t if t.is_integer() => {
-            let pointer = CType::Pointer(Box::new(CType::Void), AddressSpace::Default);
+            let pointer = CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC);
             t.size() == pointer.size()
         }
         _ => false,

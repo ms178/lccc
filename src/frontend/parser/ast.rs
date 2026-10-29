@@ -1,5 +1,5 @@
 use crate::common::source::Span;
-use crate::common::types::{AddressSpace, CType, ExtVectorLayout};
+use crate::common::types::{AddressSpace, CType, ExtVectorLayout, PtrQuals};
 
 /// A complete translation unit (one C source file).
 #[derive(Debug)]
@@ -395,6 +395,12 @@ pub struct FunctionDef {
     /// level `L`). `CType` erases qualifiers, so `int *const *f(void)` would
     /// otherwise look like `int **f(void)` and `*f() = 0` be accepted.
     pub return_pointer_const_levels: u32,
+    /// `const`/`volatile`/`restrict` written in the return type's specifiers
+    /// (`CVR_*` bits) ...
+    pub return_base_cvr: u8,
+    /// ... and each return-type star's, innermost first, when the return type
+    /// is a plain chain of stars (see [`return_star_chain`]); empty otherwise.
+    pub return_star_cvr: Vec<u8>,
     pub name: String,
     pub params: Vec<ParamDecl>,
     pub variadic: bool,
@@ -484,6 +490,19 @@ pub struct ParamDecl {
     /// levels too, whose `const` `CType` erases (`int *const *p`: `[0]` has
     /// [`CVR_CONST`], so `*p` is read-only).
     pub pointer_quals: Vec<u8>,
+    /// Whether the specifiers are `restrict`-qualified (a typedef'd pointer
+    /// base: `restrict ip *p`). With `is_const`/`is_volatile` these are the
+    /// base type's written qualifiers.
+    pub base_restrict: bool,
+    /// CVR bits of the stars inside a parenthesised declarator group, left
+    /// to right (`int (*const *p)[3]` is `[CONST, 0]`): the first star builds
+    /// the pointer closest to the array or parameter list and owns the
+    /// qualifiers written after it.
+    pub paren_star_quals: Vec<u8>,
+    /// For an array parameter (`decayed_array`): the CVR bits written inside
+    /// its first `[...]` (`int a[const 2]`), the own qualifiers of the
+    /// pointer it is adjusted to (C23 6.7.6.3p7). 0 otherwise.
+    pub adjusted_cvr: u8,
 }
 
 /// Bit masks for boolean flags in `Declaration::flags`.
@@ -813,6 +832,9 @@ pub struct DeclAttributes {
         crate::common::source::Span,
         crate::frontend::parser::attribute_registry::AttributeTarget,
     )>,
+    /// Whether the specifiers are `restrict`-qualified (a typedef'd pointer
+    /// base: `restrict ip *p`), so the pointee of `p`'s first star is.
+    pub base_restrict: bool,
     /// __attribute__((alias("target"))) - this symbol is an alias for target
     pub alias_target: Option<String>,
     /// __attribute__((ifunc("resolver"))) / [[gnu::ifunc("resolver")]] - GNU indirect function
@@ -1124,15 +1146,73 @@ pub struct InitDeclarator {
 
 /// CVR qualifier bits carried by a pointer star (`DerivedDeclarator::Pointer`).
 /// The layout matches the abstract-declarator path (`AbstractDeclaratorLevel`),
-/// where `apply_to` pushes the same encoding per pointer level.
-pub const CVR_CONST: u8 = 1 << 0;
-pub const CVR_VOLATILE: u8 = 1 << 1;
-pub const CVR_RESTRICT: u8 = 1 << 2;
+/// where `apply_to` pushes the same encoding per pointer level. They alias
+/// `PtrQuals`' bits so a star's qualifiers move into `CType::Pointer` unchanged.
+pub const CVR_CONST: u8 = PtrQuals::CONST;
+pub const CVR_VOLATILE: u8 = PtrQuals::VOLATILE;
+pub const CVR_RESTRICT: u8 = PtrQuals::RESTRICT;
 pub const CVR_ALL: u8 = CVR_CONST | CVR_VOLATILE | CVR_RESTRICT;
 
 /// `true` when the `const` bit is set in a CVR mask.
 pub fn cvr_is_const(cvr: u8) -> bool {
     cvr & CVR_CONST != 0
+}
+
+/// The `CVR_*` bits of each star of a function's return type, innermost
+/// first, when the declarator is one function suffix and a run of stars,
+/// optionally written on arrays (`const char *const *f(void)`,
+/// `const int (*f(void))[2]`), and `return_type` is exactly those arrays and
+/// stars on a non-derived base; empty for anything else. With arrays, the
+/// innermost star points at the arrays of the base, qualified by the base,
+/// as `pointee_quals_before` records for a variable `const int (*p)[2]`.
+pub fn return_star_chain(return_type: &TypeSpecifier, derived: &[DerivedDeclarator]) -> Vec<u8> {
+    let Some(fpos) = derived
+        .iter()
+        .position(|d| matches!(d, DerivedDeclarator::Function(..)))
+    else {
+        return Vec::new();
+    };
+    let (before, after) = (&derived[..fpos], &derived[fpos + 1..]);
+    let stars = if after.is_empty() {
+        before
+    } else if before.is_empty() {
+        after
+    } else {
+        return Vec::new();
+    };
+    let arrays = stars
+        .iter()
+        .take_while(|d| matches!(d, DerivedDeclarator::Array(_)))
+        .count();
+    let levels: Vec<u8> = stars[arrays..]
+        .iter()
+        .map_while(|d| match d {
+            DerivedDeclarator::Pointer(_, cvr) => Some(*cvr),
+            _ => None,
+        })
+        .collect();
+    let mut leaf = return_type;
+    let mut wraps = 0usize;
+    while let TypeSpecifier::Pointer(inner, _) = leaf {
+        wraps += 1;
+        leaf = inner;
+    }
+    let mut dims = 0usize;
+    while let TypeSpecifier::Array(inner, _) = leaf {
+        dims += 1;
+        leaf = inner;
+    }
+    let plain = arrays + levels.len() == stars.len()
+        && wraps == levels.len()
+        && dims == arrays
+        && !matches!(
+            leaf,
+            TypeSpecifier::Pointer(..)
+                | TypeSpecifier::Array(..)
+                | TypeSpecifier::FunctionPointer(..)
+                | TypeSpecifier::BareFunction(..)
+        );
+    if plain { levels } else { Vec::new() }
 }
 
 /// `const` bits of a function's RETURN type pointer levels, read from the
@@ -1285,6 +1365,9 @@ mod declarator_law_tests {
             pointer_depth: 0,
             pointer_const: false,
             pointer_quals: Vec::new(),
+            base_restrict: false,
+            paren_star_quals: Vec::new(),
+            adjusted_cvr: 0,
         }
     }
 
@@ -1558,6 +1641,9 @@ pub struct StructFieldDecl {
     /// `volatile` on the field's base type (`volatile u32 ctrl`, `volatile int a[4]`):
     /// the element or pointee access is volatile. Mirrors `DeclAttributes::base_volatile`.
     pub base_volatile: bool,
+    /// Whether the specifiers are `restrict`-qualified (a typedef'd pointer
+    /// base: `restrict ip *p`), so the pointee of `p`'s first star is.
+    pub base_restrict: bool,
     /// Const on the field's base type (element or innermost pointee).
     pub base_const: bool,
     /// `volatile` on the field object itself (`int *volatile p`). Mirrors
@@ -1799,6 +1885,57 @@ pub struct CastQualifiers {
     /// `CType` erases qualifiers, so `*(int *const *)p = 0` can only be
     /// diagnosed if the cast itself keeps the middle level's `const`.
     pub pointer_const_levels: u32,
+    /// `const`/`volatile`/`restrict` written before the first top-level `*`
+    /// (`CVR_*` bits): the base type's own qualifiers.
+    pub base_cvr: u8,
+    /// When the type name is a plain chain of stars on a non-derived base
+    /// (`(const char *const *)`), its length (`0` otherwise, or past
+    /// [`Self::MAX_STAR_CHAIN`] levels) ...
+    pub star_chain_len: u8,
+    /// ... and each star's `CVR_*` bits, 3 per level (level 1, closest to
+    /// the base, in the lowest bits). See [`Self::star_chain`].
+    pub star_chain_cvr: u64,
+}
+
+impl CastQualifiers {
+    /// The longest star chain [`Self::star_chain_cvr`] holds.
+    pub const MAX_STAR_CHAIN: usize = 21;
+
+    /// The per-level qualifiers of a plain star-chain type name, innermost
+    /// level first; `None` for any other type name.
+    pub fn star_chain(&self) -> Option<Vec<u8>> {
+        let len = usize::from(self.star_chain_len);
+        (len > 0).then(|| {
+            (0..len)
+                .map(|level| ((self.star_chain_cvr >> (3 * level)) & 0b111) as u8)
+                .collect()
+        })
+    }
+
+    /// Record `levels` (innermost first) if `ty` is a plain chain of exactly
+    /// that many stars on a non-derived base.
+    pub fn set_star_chain(&mut self, ty: &TypeSpecifier, levels: &[u8]) {
+        let mut leaf = ty;
+        let mut wraps = 0usize;
+        while let TypeSpecifier::Pointer(inner, _) = leaf {
+            wraps += 1;
+            leaf = inner;
+        }
+        let plain = wraps == levels.len()
+            && (1..=Self::MAX_STAR_CHAIN).contains(&wraps)
+            && !matches!(
+                leaf,
+                TypeSpecifier::Array(..)
+                    | TypeSpecifier::FunctionPointer(..)
+                    | TypeSpecifier::BareFunction(..)
+            );
+        if plain {
+            self.star_chain_len = wraps as u8;
+            self.star_chain_cvr = levels.iter().enumerate().fold(0, |bits, (level, cvr)| {
+                bits | (u64::from(cvr & 0b111) << (3 * level))
+            });
+        }
+    }
 }
 
 /// Expressions.
@@ -1842,9 +1979,11 @@ pub enum Expr {
     PostfixOp(PostfixOp, Box<Expr>, Span),
     Assign(Box<Expr>, Box<Expr>, Span),
     CompoundAssign(BinOp, Box<Expr>, Box<Expr>, Span),
+    /// The span names the colon token, not the condition or the full range.
     Conditional(Box<Expr>, Box<Expr>, Box<Expr>, Span),
     /// GNU extension: `cond ? : else_expr` - condition is evaluated once and used as the
     /// then-value if truthy. Semantically: `({ auto __tmp = cond; __tmp ? __tmp : else_expr; })`
+    /// The span names the colon token, as for the ordinary conditional.
     GnuConditional(Box<Expr>, Box<Expr>, Span),
     FunctionCall(Box<Expr>, Vec<Expr>, Span),
     ArraySubscript(Box<Expr>, Box<Expr>, Span),

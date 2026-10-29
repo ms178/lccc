@@ -12,7 +12,7 @@
 
 use super::global_init_helpers as h;
 use super::lower::Lowerer;
-use crate::common::types::{AddressSpace, CType, InitFieldResolution, IrType};
+use crate::common::types::{AddressSpace, CType, InitFieldResolution, IrType, PtrQuals};
 use crate::frontend::parser::ast::{Designator, Expr, Initializer, InitializerItem};
 use crate::ir::reexports::GlobalInit;
 
@@ -605,7 +605,7 @@ impl Lowerer {
             // For pointer arrays with a single expr, the first element is the addr
             let effective_ty = if is_ptr_array {
                 // Treat as a pointer write to the first element
-                &CType::Pointer(Box::new(CType::Void), AddressSpace::Default)
+                &CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC)
             } else {
                 &field.ty
             };
@@ -626,7 +626,7 @@ impl Lowerer {
                     CType::Array(_, Some(s)) => *s,
                     _ => inner_items.len(),
                 };
-                let ptr_ty = CType::Pointer(Box::new(CType::Void), AddressSpace::Default);
+                let ptr_ty = CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC);
                 let ptr_size = crate::common::types::target_ptr_size();
                 // Use a sequential index that respects designated initializers.
                 // Items may have [idx] designators that jump forward or backward.

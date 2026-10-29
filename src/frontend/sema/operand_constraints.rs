@@ -20,7 +20,7 @@
 //! operator's operand; every other combination, such as GCC's pointer/integer
 //! leniency, is outside this module and unchanged.
 
-use crate::common::types::{AddressSpace, CType};
+use crate::common::types::{AddressSpace, CType, PtrQuals};
 use crate::frontend::parser::ast::{BinOp, UnaryOp};
 
 /// The operand classes these constraints distinguish.
@@ -91,6 +91,10 @@ fn record_vector_pair(a: Kind, b: Kind) -> bool {
 pub(super) struct Operand<'a> {
     pub ty: &'a CType,
     pub null_constant: bool,
+    /// The width of a bit-field operand wider than `int` but narrower than
+    /// its declared type. Such a bit-field keeps its own type through the
+    /// integer promotions, which GCC 16.2 spells `'long unsigned int:40'`.
+    pub bit_width: Option<u32>,
 }
 
 pub(super) const VOID_VALUE: &str = "void value not ignored as it ought to be";
@@ -107,13 +111,6 @@ pub(super) const UNION_VALUE: &str = "used union type value where scalar is requ
 /// conditions) use. Both were measured on gcc-16.2.
 const VOID_USE: &str = "invalid use of void expression";
 
-/// GCC 16.2's spelling of a type in a diagnostic: `type_to_string`'s form,
-/// which differs from C's declaration syntax in ways that matter for
-/// verbatim message parity -- `long unsigned int` (not `unsigned long`),
-/// `long long int`, `__int128 unsigned`, `complex double` (not
-/// `_Complex double`), and `__vector(4) int` for a GNU vector. A typedef
-/// name cannot be reproduced (the inferred type no longer knows it), so
-/// GCC's `'T' {aka 'int'}` appears here as plain `'int'`.
 /// The parameter list of a function type in gcc's spelling: `void` for an
 /// empty prototype, `int, char *` otherwise, `...` appended when variadic.
 fn function_params(f: &crate::common::types::FunctionType) -> String {
@@ -127,8 +124,52 @@ fn function_params(f: &crate::common::types::FunctionType) -> String {
     params.join(", ")
 }
 
+/// GCC's spelling of the base of a pointer/array chain where it differs
+/// from [`CType`]'s `Display` (measured on gcc-16.2: `const long unsigned
+/// int *`, `short int (*)[2]`, `__int128 unsigned *`, `__vector(4) int *`).
+/// Unlike a top-level complex type (`complex double`), a complex base keeps
+/// its keyword inside a chain (`_Complex double *`), so it is not listed.
+fn chain_base_name(base: &CType) -> Option<String> {
+    Some(match base {
+        CType::Short => "short int".into(),
+        CType::UShort => "short unsigned int".into(),
+        CType::Long => "long int".into(),
+        CType::ULong => "long unsigned int".into(),
+        CType::LongLong => "long long int".into(),
+        CType::ULongLong => "long long unsigned int".into(),
+        CType::UInt128 => "__int128 unsigned".into(),
+        CType::Vector(..) => type_name(base),
+        _ => return None,
+    })
+}
+
+/// A pointer/array chain: `Display` already spells GCC's structure and the
+/// recorded qualifiers (`const char * const*`, `int (* const*)[3]`) and
+/// writes the base exactly once, leftmost after its qualifiers, so only the
+/// base's name is substituted.
+fn chain_name(ty: &CType) -> String {
+    let mut base = ty;
+    while let CType::Pointer(inner, _) | CType::Array(inner, _) = base {
+        base = inner;
+    }
+    let spelled = ty.to_string();
+    match chain_base_name(base) {
+        Some(gcc) => spelled.replacen(&base.to_string(), &gcc, 1),
+        None => spelled,
+    }
+}
+
+/// GCC 16.2's spelling of a type in a diagnostic: `type_to_string`'s form,
+/// which differs from C's declaration syntax in ways that matter for
+/// verbatim message parity -- `long unsigned int` (not `unsigned long`),
+/// `long long int`, `__int128 unsigned`, `complex double` (not
+/// `_Complex double`), and `__vector(4) int` for a GNU vector. A typedef
+/// name cannot be reproduced (the inferred type no longer knows it), so
+/// GCC's `'T' {aka 'int'}` appears here as plain `'int'`.
 pub(super) fn type_name(ty: &CType) -> String {
     match ty {
+        CType::Short => "short int".into(),
+        CType::UShort => "short unsigned int".into(),
         CType::Long => "long int".into(),
         CType::ULong => "long unsigned int".into(),
         CType::LongLong => "long long int".into(),
@@ -139,9 +180,8 @@ pub(super) fn type_name(ty: &CType) -> String {
         CType::ComplexDouble => "complex double".into(),
         CType::ComplexLongDouble => "complex long double".into(),
         // `type_to_string` writes a function type without the space its
-        // declaration syntax has (`int(void)`, not `int (void)`), a pointer
-        // to an array as `int (*)[3]`, and a pointer to a function as
-        // `int (*)(void)`.
+        // declaration syntax has (`int(void)`, not `int (void)`) and a
+        // pointer to a function as `int (*)(void)`.
         CType::Function(f) => {
             let mut spelling = type_name(&f.return_type);
             spelling.push('(');
@@ -149,17 +189,13 @@ pub(super) fn type_name(ty: &CType) -> String {
             spelling.push(')');
             spelling
         }
-        CType::Pointer(inner, AddressSpace::Default) => match &**inner {
-            CType::Array(elem, len) => format!(
-                "{} (*)[{}]",
-                type_name(elem),
-                len.map(|n| n.to_string()).unwrap_or_default()
-            ),
+        CType::Pointer(inner, quals) if quals.space == AddressSpace::Default => match &**inner {
             CType::Function(f) => {
                 format!("{} (*)({})", type_name(&f.return_type), function_params(f))
             }
-            _ => format!("{} *", type_name(inner)),
+            _ => chain_name(ty),
         },
+        CType::Array(..) => chain_name(ty),
         CType::Vector(elem, total_size) => {
             let lanes = match elem.size() {
                 0 => 1,
@@ -366,12 +402,16 @@ pub(super) fn binary(op: BinOp, lhs: Operand<'_>, rhs: Operand<'_>) -> Option<St
         (Kind::NullPtr, _) | (_, Kind::NullPtr) => false,
         _ => true,
     };
+    let spell = |operand: Operand<'_>| match operand.bit_width {
+        Some(width) => format!("{}:{width}", type_name(operand.ty)),
+        None => type_name(operand.ty),
+    };
     let invalid = |()| {
         format!(
             "invalid operands to binary {} (have '{}' and '{}')",
             binop_spelling(op),
-            lhs.ty,
-            rhs.ty
+            spell(lhs),
+            spell(rhs)
         )
     };
     if !valid {
@@ -589,16 +629,18 @@ mod tests {
         Operand {
             ty,
             null_constant: false,
+            bit_width: None,
         }
     }
     fn npc(ty: &CType) -> Operand<'_> {
         Operand {
             ty,
             null_constant: true,
+            bit_width: None,
         }
     }
     fn ptr(to: CType) -> CType {
-        CType::Pointer(Box::new(to), AddressSpace::Default)
+        CType::Pointer(Box::new(to), PtrQuals::GENERIC)
     }
 
     /// The constraint matrix measured on GCC 16.2 and Clang 23.1.3, which
@@ -918,6 +960,32 @@ mod tests {
         assert_eq!(type_name(&CType::Float16), "_Float16");
         assert_eq!(type_name(&CType::ComplexFloat), "complex float");
         assert_eq!(type_name(&CType::ComplexLongDouble), "complex long double");
+        // Pointer/array chains: GCC's base names inside `Display`'s structure
+        // and recorded qualifiers (measured on gcc-16.2.0).
+        let ptr = |t: CType| CType::Pointer(Box::new(t), PtrQuals::GENERIC);
+        let qptr = |t: CType, cvr: u8| {
+            CType::Pointer(Box::new(t), PtrQuals::recorded(AddressSpace::Default, cvr))
+        };
+        assert_eq!(
+            type_name(&qptr(CType::ULong, PtrQuals::CONST)),
+            "const long unsigned int *"
+        );
+        assert_eq!(
+            type_name(&ptr(CType::Array(Box::new(CType::Short), Some(2)))),
+            "short int (*)[2]"
+        );
+        assert_eq!(type_name(&ptr(CType::UShort)), "short unsigned int *");
+        assert_eq!(type_name(&ptr(CType::UInt128)), "__int128 unsigned *");
+        assert_eq!(
+            type_name(&ptr(CType::Vector(Box::new(CType::Int), 16))),
+            "__vector(4) int *"
+        );
+        assert_eq!(type_name(&ptr(CType::ComplexDouble)), "_Complex double *");
+        assert_eq!(
+            type_name(&ptr(qptr(CType::Int, PtrQuals::CONST))),
+            "const int **"
+        );
+        assert_eq!(type_name(&CType::Short), "short int");
         assert_eq!(
             type_name(&CType::Vector(Box::new(CType::Int), 16)),
             "__vector(4) int"

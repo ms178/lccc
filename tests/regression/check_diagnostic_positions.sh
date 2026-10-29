@@ -26,14 +26,16 @@ fail=0
 # first-position <compiler> <file> [flags...] -> "line:col" of the first
 # diagnostic that names <file>, or "-" when the compiler reported none.
 first_position() {
-    local cc=$1 file=$2
-    shift 2
-    "$cc" "$@" -S -o /dev/null "$file" 2>&1 |
+    local cc=$1 input=$2 file=$3
+    shift 3
+    "$cc" "$@" -S -o /dev/null "$input" 2>&1 |
         awk -v want="$file" '
             index($0, want ":") == 1 {
                 split($0, parts, ":")
-                print parts[2] ":" parts[3]
-                exit
+                if (parts[2] ~ /^[0-9]+$/ && parts[3] ~ /^[0-9]+$/) {
+                    print parts[2] ":" parts[3]
+                    exit
+                }
             }
             END { if (NR == 0) print "-" }' || true
 }
@@ -47,8 +49,8 @@ row() {
     local name=$1 expected=$2 file=$3 want_file=$4
     shift 4
     local got want
-    got=$(first_position "$CCC" "$want_file" "$@" || true)
-    want=$(first_position "$GCC" "$want_file" "$@" || true)
+    got=$(first_position "$CCC" "$file" "$want_file" "$@" || true)
+    want=$(first_position "$GCC" "$file" "$want_file" "$@" || true)
     if [ -z "$got" ] || [ -z "$want" ]; then
         echo "FAIL $name: no diagnostic (lccc='${got:-<none>}' gcc='${want:-<none>}')" >&2
         fail=$((fail + 1))
@@ -94,6 +96,29 @@ row "no include at all"              2:9  no_include.c  no_include.c
 row "far below an include"           6:11 inc_far.c    inc_far.c
 row "after a #define past the include" 5:11 inc_macro.c inc_macro.c
 row "after a #pragma past the include" 4:11 inc_pragma.c inc_pragma.c
+
+# The conditional AST retains the colon token rather than scanning backwards
+# through preprocessed text. A #line marker between ':' and the third operand
+# must not move the diagnostic to the condition or the remapped operand.
+cat > conditional_line.c <<'C'
+void f(int c, int *p) { (void)(c ? p :
+#line 100 "virtual.c"
+1); }
+C
+cat > conditional_nested.c <<'C'
+void f(int c, int *p) { (void)(c ? p : (c ? p : 1)); }
+C
+cat > conditional_gnu.c <<'C'
+void f(int c, int *p) { (void)(c ?: p); }
+C
+cat > conditional_macro.c <<'C'
+#define ID(x) x
+void f(int c, int *p) { (void)(c ? p : ID(1)); }
+C
+row "conditional across line marker" - conditional_line.c conditional_line.c -std=gnu17
+row "nested conditional colon" - conditional_nested.c conditional_nested.c -std=gnu17
+row "GNU conditional colon" - conditional_gnu.c conditional_gnu.c -std=gnu17
+row "conditional macro operand" - conditional_macro.c conditional_macro.c -std=gnu17
 
 # The include line itself is still blamed for a missing header -- the phantom
 # line was never the "not found" diagnostic's problem, and pinning it here keeps

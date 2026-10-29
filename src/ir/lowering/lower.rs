@@ -18,7 +18,7 @@ use crate::backend::Target;
 use crate::common::error::DiagnosticEngine;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::source::Span;
-use crate::common::types::{AddressSpace, CType, IrType, SsoMode};
+use crate::common::types::{AddressSpace, CType, IrType, PtrQuals, SsoMode};
 use crate::frontend::parser::ast::{
     self, BlockItem, CompoundStmt, Declaration, DerivedDeclarator, EnumVariant, Expr, ExprId,
     ExternalDecl, FunctionDef, ParamDecl, Stmt, TranslationUnit, TypeSpecifier,
@@ -1438,7 +1438,7 @@ impl Lowerer {
         } else {
             let mut ct = self.type_spec_to_ctype(ret_type_spec);
             for _ in 0..ptr_count {
-                ct = CType::Pointer(Box::new(ct), AddressSpace::Default);
+                ct = CType::Pointer(Box::new(ct), PtrQuals::GENERIC);
             }
             ct
         };

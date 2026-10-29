@@ -362,6 +362,148 @@ impl std::fmt::Display for AddressSpace {
     }
 }
 
+/// What a [`CType::Pointer`] points at, beyond the pointee's type: the named
+/// address space the pointee lives in and the pointee's own qualifiers.
+///
+/// The qualifiers are `const`/`volatile`/`restrict` of the POINTEE (for an
+/// array pointee, of its elements, where C puts them). They are recorded
+/// only where the constructing path saw every qualifier written at that
+/// level -- a declarator star always does, a `typedef` or `typeof` base may
+/// not -- and [`PtrQuals::cvr`] says `None` otherwise. Diagnostics act only
+/// on recorded qualifiers, so an unrecorded level can miss a warning but can
+/// never invent one.
+///
+/// Qualifiers change neither representation nor code generation, so
+/// equality and hashing look at the address space alone: every `CType`
+/// comparison outside the qualifier rules in `frontend::sema` behaves as if
+/// the qualifiers were absent.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PtrQuals {
+    pub space: AddressSpace,
+    /// The qualifier bits, plus [`Self::RECORDED`] when they are complete.
+    bits: u8,
+}
+
+impl PtrQuals {
+    pub const CONST: u8 = 1 << 0;
+    pub const VOLATILE: u8 = 1 << 1;
+    pub const RESTRICT: u8 = 1 << 2;
+    const CVR: u8 = Self::CONST | Self::VOLATILE | Self::RESTRICT;
+    const RECORDED: u8 = 1 << 7;
+
+    /// A pointer into the generic address space, qualifiers unrecorded.
+    pub const GENERIC: Self = Self::of(AddressSpace::Default);
+
+    /// A pointer into `space`, qualifiers unrecorded.
+    pub const fn of(space: AddressSpace) -> Self {
+        Self { space, bits: 0 }
+    }
+
+    /// A pointer into `space` whose pointee carries exactly `cvr`.
+    pub const fn recorded(space: AddressSpace, cvr: u8) -> Self {
+        Self {
+            space,
+            bits: (cvr & Self::CVR) | Self::RECORDED,
+        }
+    }
+
+    /// The pointee's qualifiers, if every one of them was recorded.
+    pub const fn cvr(self) -> Option<u8> {
+        if self.bits & Self::RECORDED != 0 {
+            Some(self.bits & Self::CVR)
+        } else {
+            None
+        }
+    }
+
+    /// A proven qualification mismatch. Unknown is not known-unqualified;
+    /// it cannot establish incompatibility. Unlike Eq, this is semantic.
+    pub const fn has_known_cvr_conflict(self, other: Self) -> bool {
+        matches!((self.cvr(), other.cvr()), (Some(a), Some(b)) if a != b)
+    }
+
+    /// The same qualifiers on a pointee in `space`.
+    #[must_use]
+    pub const fn in_space(self, space: AddressSpace) -> Self {
+        Self { space, ..self }
+    }
+
+    /// The same space with the pointee's qualifiers replaced.
+    #[must_use]
+    pub const fn with_cvr(self, cvr: Option<u8>) -> Self {
+        match cvr {
+            Some(cvr) => Self::recorded(self.space, cvr),
+            None => Self::of(self.space),
+        }
+    }
+}
+
+impl From<AddressSpace> for PtrQuals {
+    fn from(space: AddressSpace) -> Self {
+        Self::of(space)
+    }
+}
+
+impl PartialEq for PtrQuals {
+    fn eq(&self, other: &Self) -> bool {
+        self.space == other.space
+    }
+}
+
+impl Eq for PtrQuals {}
+
+impl std::hash::Hash for PtrQuals {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.space.hash(state);
+    }
+}
+
+// The bits are the parser's (`ast::CVR_*`), so a star's record is stored as is.
+const _: () = {
+    assert!(PtrQuals::CONST == crate::frontend::parser::ast::CVR_CONST);
+    assert!(PtrQuals::VOLATILE == crate::frontend::parser::ast::CVR_VOLATILE);
+    assert!(PtrQuals::RESTRICT == crate::frontend::parser::ast::CVR_RESTRICT);
+};
+
+/// `PtrQuals` qualifier bits as GCC spells them (`const volatile restrict`).
+pub fn cvr_spelling(cvr: u8) -> &'static str {
+    const NAMES: [&str; 8] = [
+        "",
+        "const",
+        "volatile",
+        "const volatile",
+        "restrict",
+        "const restrict",
+        "volatile restrict",
+        "const volatile restrict",
+    ];
+    NAMES[usize::from(cvr & 0b111)]
+}
+
+/// A qualification conflict anywhere in the shared derived shape. Parameter
+/// names and top-level parameter CVR are not type identity; pointer records
+/// describe the POINTEE and must still be compared inside function signatures.
+/// Missing records remain conservative. This must precede qualifier-blind Eq
+/// shortcuts in semantic conversion checks.
+pub fn recorded_qualifiers_conflict(a: &CType, b: &CType) -> bool {
+    match (a, b) {
+        (CType::Pointer(a, aq), CType::Pointer(b, bq)) => {
+            aq.has_known_cvr_conflict(*bq) || recorded_qualifiers_conflict(a, b)
+        }
+        (CType::Array(a, _), CType::Array(b, _)) => recorded_qualifiers_conflict(a, b),
+        (CType::Function(a), CType::Function(b)) => {
+            recorded_qualifiers_conflict(&a.return_type, &b.return_type)
+                || (a.has_prototype
+                    && b.has_prototype
+                    && a.params
+                        .iter()
+                        .zip(&b.params)
+                        .any(|((a, _), (b, _))| recorded_qualifiers_conflict(a, b)))
+        }
+        _ => false,
+    }
+}
+
 /// Compatibility of two C types in the sense of `__builtin_types_compatible_p`
 /// (C11 6.2.7 "compatible type and composite type").
 ///
@@ -390,12 +532,16 @@ impl std::fmt::Display for AddressSpace {
 ///   * enums: compatible with the integer type their value range picks
 ///     (C11 6.7.2.2p4), so a body-less `enum tag` still matches `int` or
 ///     `unsigned int` exactly like GCC;
-///   * everything else: structural equality.  (CV qualification lives in the
-///     parser's per-level qualifier vector, not in `CType`; the predicate's
-///     callers combine the two.)
+///   * recorded pointee qualification is significant at every pointer level,
+///     including function return/parameter types. Unknown records cannot prove
+///     a mismatch. Top-level object qualification is not stored in CType;
+///   * everything else: structural equality. Unlike ordinary CType Eq, this
+///     predicate is for semantic compatibility, not representation identity.
 pub fn ctypes_compatible(t1: &CType, t2: &CType) -> bool {
     match (t1, t2) {
-        (CType::Pointer(a, sa), CType::Pointer(b, sb)) => sa == sb && ctypes_compatible(a, b),
+        (CType::Pointer(a, sa), CType::Pointer(b, sb)) => {
+            sa.space == sb.space && !sa.has_known_cvr_conflict(*sb) && ctypes_compatible(a, b)
+        }
         (CType::Array(a, sa), CType::Array(b, sb)) => {
             ctypes_compatible(a, b) && (sa == sb || sa.is_none() || sb.is_none())
         }
@@ -466,10 +612,15 @@ fn composite_compatible_type(a: &CType, b: &CType) -> Option<CType> {
     }
 
     match (a, b) {
-        (CType::Pointer(a_inner, a_space), CType::Pointer(b_inner, _)) => Some(CType::Pointer(
-            Box::new(composite_compatible_type(a_inner, b_inner)?),
-            *a_space,
-        )),
+        // Compatibility ignores the pointee qualifiers (see `PtrQuals`), so
+        // the two records may disagree; the composite keeps only a common one.
+        (CType::Pointer(a_inner, a_quals), CType::Pointer(b_inner, b_quals)) => {
+            let cvr = a_quals.cvr().filter(|&cvr| b_quals.cvr() == Some(cvr));
+            Some(CType::Pointer(
+                Box::new(composite_compatible_type(a_inner, b_inner)?),
+                a_quals.with_cvr(cvr),
+            ))
+        }
         (CType::Array(a_elem, a_len), CType::Array(b_elem, b_len)) => Some(CType::Array(
             Box::new(composite_compatible_type(a_elem, b_elem)?),
             a_len.or(*b_len),
@@ -574,7 +725,8 @@ pub enum CType {
     ComplexDouble,
     /// C99 _Complex long double: two f128 values (real, imag) - uses F128 storage per component
     ComplexLongDouble,
-    Pointer(Box<CType>, AddressSpace),
+    /// A pointer to the boxed type; see [`PtrQuals`].
+    Pointer(Box<CType>, PtrQuals),
     /// C23 `nullptr_t` (6.2.5p25), the type of `nullptr`: an unqualified
     /// scalar with the size, alignment and representation of `void *` whose
     /// only value is the null pointer. It converts to any pointer type and
@@ -890,6 +1042,12 @@ pub struct StructField {
     /// order (index `L-1` is pointer level `L`). `CType` erases qualifiers, so
     /// a middle level's `const` (`int *const *p` as a member) lives here.
     pub pointer_quals: Vec<u8>,
+    /// The member object's complete own CVR bits (an array member: its
+    /// elements'), when exactly known: sema records them for a star-free
+    /// declarator whose specifier qualifiers are completely known (the same
+    /// rule as a variable's object record). `None` is "unknown", never "none":
+    /// `&s.m` and the decay of an array member then stay unrecorded.
+    pub own_cvr: Option<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1189,6 +1347,7 @@ impl StructLayoutBuilder {
             object_const: field.object_const,
             counted_by: field.counted_by.clone(),
             pointer_quals: field.pointer_quals.clone(),
+            own_cvr: field.own_cvr,
             offset: storage_offset,
             ty: storage_ty,
             bit_offset: Some(bit_offset_in_storage),
@@ -1284,6 +1443,7 @@ impl StructLayoutBuilder {
             object_const: field.object_const,
             counted_by: field.counted_by.clone(),
             pointer_quals: field.pointer_quals.clone(),
+            own_cvr: field.own_cvr,
             offset: field_storage_offset,
             ty: field.ty.clone(),
             bit_offset: Some(field_bit_in_storage),
@@ -1336,6 +1496,7 @@ impl StructLayoutBuilder {
             object_const: field.object_const,
             counted_by: field.counted_by.clone(),
             pointer_quals: field.pointer_quals.clone(),
+            own_cvr: field.own_cvr,
             offset: self.offset,
             ty: field.ty.clone(),
             bit_offset: None,
@@ -1517,6 +1678,8 @@ pub struct StructFieldLayout {
     /// CVR bits of each pointer level of the field's type (see
     /// [`StructField::pointer_quals`]).
     pub pointer_quals: Vec<u8>,
+    /// See [`StructField::own_cvr`].
+    pub own_cvr: Option<u8>,
 }
 
 impl StructLayout {
@@ -1671,6 +1834,7 @@ impl StructLayout {
                 object_const: field.object_const,
                 counted_by: field.counted_by.clone(),
                 pointer_quals: field.pointer_quals.clone(),
+                own_cvr: field.own_cvr,
                 offset: 0, // All union fields start at offset 0
                 ty: field.ty.clone(),
                 bit_offset: bf_offset,
@@ -2068,6 +2232,29 @@ impl StructLayout {
         None
     }
 
+    /// The complete own CVR bits of member `name` (see
+    /// [`StructField::own_cvr`]), searched like [`Self::field_offset`]: a
+    /// member reached through an anonymous one also carries that member's
+    /// qualifiers (`struct { const struct { int x; }; } s;` makes `s.x`
+    /// const). `None` when any link is unknown.
+    pub fn member_own_cvr(&self, name: &str, ctx: &dyn StructLayoutProvider) -> Option<u8> {
+        if let Some(f) = self.fields.iter().find(|f| f.name == name) {
+            return f.own_cvr;
+        }
+        for f in self.fields.iter().filter(|f| f.name.is_empty()) {
+            let (CType::Struct(key) | CType::Union(key)) = &f.ty else {
+                continue;
+            };
+            let Some(anon) = ctx.get_struct_layout(key) else {
+                continue;
+            };
+            if anon.field_offset(name, ctx).is_some() {
+                return Some(f.own_cvr? | anon.member_own_cvr(name, ctx)?);
+            }
+        }
+        None
+    }
+
     /// Look up a field by name, returning full layout info including bitfield details.
     pub fn field_layout(&self, name: &str) -> Option<&StructFieldLayout> {
         self.fields.iter().find(|f| f.name == name)
@@ -2260,11 +2447,86 @@ impl CType {
     }
 }
 
+/// Whether `ty` must be spelled with C's abstract declarator syntax: its
+/// pointer/array chain holds an array that is pointed to or nested in another
+/// array (`int (*)[3]`, `int[3][4]`), and nothing the plain spelling handles
+/// specially (a function, a named address space).
+fn needs_declarator_syntax(ty: &CType) -> bool {
+    let mut cur = ty;
+    let mut derived_above = false;
+    let mut found = false;
+    loop {
+        match cur {
+            CType::Pointer(inner, quals) => {
+                if quals.space != AddressSpace::Default {
+                    return false;
+                }
+                cur = inner;
+            }
+            CType::Array(inner, _) => {
+                found |= derived_above;
+                cur = inner;
+            }
+            CType::Function(_) => return false,
+            _ => return found,
+        }
+        derived_above = true;
+    }
+}
+
+/// GCC's spelling of a [`needs_declarator_syntax`] type, built inside out
+/// (measured on gcc-16.2): `int (*)[3]`, `int (**)[3]`, `const int (*)[3]`,
+/// `int (* const*)[3]`, `int * (*)[3]`, `char * const (*)[2]`,
+/// `int (*)[3][4]`, `int[3][4]`. A pointer level's recorded qualifiers follow
+/// its `*`; the base's lead; an array is qualified like its elements.
+fn write_declarator_type(f: &mut std::fmt::Formatter<'_>, ty: &CType) -> std::fmt::Result {
+    use std::fmt::Write as _;
+    let mut declarator = String::new();
+    // Qualifiers of the object of type `cur`: unknown (none) for the value
+    // itself, then each pointer's record of its pointee.
+    let mut own = 0u8;
+    let mut cur = ty;
+    loop {
+        match cur {
+            CType::Pointer(inner, quals) => {
+                let gap = if declarator.starts_with('(') { " " } else { "" };
+                declarator = if own != 0 {
+                    format!("* {}{gap}{declarator}", cvr_spelling(own))
+                } else {
+                    format!("*{gap}{declarator}")
+                };
+                own = quals.cvr().unwrap_or(0);
+                cur = inner;
+            }
+            CType::Array(inner, size) => {
+                if declarator.starts_with('*') {
+                    declarator = format!("({declarator})");
+                }
+                match size {
+                    Some(n) => write!(declarator, "[{n}]")?,
+                    None => declarator.push_str("[]"),
+                }
+                cur = inner;
+            }
+            leaf => {
+                if own != 0 {
+                    write!(f, "{} ", cvr_spelling(own))?;
+                }
+                let gap = if declarator.starts_with('[') { "" } else { " " };
+                return write!(f, "{leaf}{gap}{declarator}");
+            }
+        }
+    }
+}
+
 impl std::fmt::Display for CType {
     /// Format a CType as its C-language type name (e.g., `int`, `unsigned long`,
     /// `char *`, `void (*)(int, double)`). Used in compiler diagnostics to show
     /// user-friendly type names instead of the Rust Debug representation.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if needs_declarator_syntax(self) {
+            return write_declarator_type(f, self);
+        }
         match self {
             CType::Void => write!(f, "void"),
             CType::NullPtr => write!(f, "nullptr_t"),
@@ -2296,7 +2558,7 @@ impl std::fmt::Display for CType {
             CType::ComplexDouble => write!(f, "_Complex double"),
             CType::ComplexLongDouble => write!(f, "_Complex long double"),
             CType::Pointer(inner, addr_space) => {
-                let prefix = match addr_space {
+                let prefix = match addr_space.space {
                     AddressSpace::Default => "",
                     AddressSpace::SegGs => "__seg_gs ",
                     AddressSpace::SegFs => "__seg_fs ",
@@ -2322,7 +2584,21 @@ impl std::fmt::Display for CType {
                     }
                     write!(f, ")")
                 } else {
-                    write!(f, "{}{} *", prefix, inner)
+                    // GCC's spelling: the base type's qualifiers lead
+                    // (`const char *`), a pointer level's precede its own `*`
+                    // (`const char * const*`, `char **`).
+                    let cvr = addr_space.cvr().unwrap_or(0);
+                    match inner.as_ref() {
+                        CType::Pointer(next, _) if !matches!(next.as_ref(), CType::Function(_)) => {
+                            if cvr != 0 {
+                                write!(f, "{}{} {}*", prefix, inner, cvr_spelling(cvr))
+                            } else {
+                                write!(f, "{}{}*", prefix, inner)
+                            }
+                        }
+                        _ if cvr != 0 => write!(f, "{} {}{} *", cvr_spelling(cvr), prefix, inner),
+                        _ => write!(f, "{}{} *", prefix, inner),
+                    }
                 }
             }
             CType::Array(inner, size) => {
@@ -3751,7 +4027,11 @@ impl CType {
         match (self, assoc) {
             (CType::Enum(_), CType::Enum(_)) => self == assoc,
             (CType::Enum(e), other) | (other, CType::Enum(e)) => e.compatible_ctype() == *other,
-            (CType::Pointer(a, _), CType::Pointer(b, _)) => a.generic_association_matches(b),
+            (CType::Pointer(a, aq), CType::Pointer(b, bq)) => {
+                aq.space == bq.space
+                    && !aq.has_known_cvr_conflict(*bq)
+                    && a.generic_association_matches(b)
+            }
             (CType::Array(a, la), CType::Array(b, lb)) => {
                 (la.is_none() || lb.is_none() || la == lb) && a.generic_association_matches(b)
             }
@@ -3790,6 +4070,16 @@ impl CType {
         }
     }
 
+    /// This pointer type with its pointee's qualifiers replaced (see
+    /// [`PtrQuals`]); any other type unchanged.
+    #[must_use]
+    pub fn with_pointee_cvr(self, cvr: Option<u8>) -> CType {
+        match self {
+            CType::Pointer(inner, quals) => CType::Pointer(inner, quals.with_cvr(cvr)),
+            other => other,
+        }
+    }
+
     pub fn conditional_composite_type(
         then_ct: Option<CType>,
         else_ct: Option<CType>,
@@ -3813,16 +4103,31 @@ impl CType {
                     _ => {}
                 }
                 // Both pointers: C11 6.5.15p6 rules
-                if let (CType::Pointer(inner_t, _), CType::Pointer(inner_e, _)) = (&t, &e) {
+                if let (CType::Pointer(inner_t, t_quals), CType::Pointer(inner_e, e_quals)) =
+                    (&t, &e)
+                {
                     let t_is_void = matches!(inner_t.as_ref(), CType::Void);
                     let e_is_void = matches!(inner_e.as_ref(), CType::Void);
+                    // A null pointer constant arm yields the other arm's type;
+                    // otherwise the result points to a type with ALL the
+                    // qualifiers of both pointees (recorded only if both are).
+                    if then_is_npc && t_is_void {
+                        return Some(e);
+                    }
+                    if else_is_npc && e_is_void {
+                        return Some(t);
+                    }
+                    let joined = match (t_quals.cvr(), e_quals.cvr()) {
+                        (Some(a), Some(b)) => Some(a | b),
+                        _ => None,
+                    };
                     if t_is_void && !e_is_void {
-                        // then=void*, else=T*: if then is NPC, result is T*; else void*
-                        return if then_is_npc { Some(e) } else { Some(t) };
+                        // then=void*, else=T*: void*
+                        return Some(t.with_pointee_cvr(joined));
                     }
                     if e_is_void && !t_is_void {
-                        // then=T*, else=void*: if else is NPC, result is T*; else void*
-                        return if else_is_npc { Some(t) } else { Some(e) };
+                        // then=T*, else=void*: void*
+                        return Some(e.with_pointee_cvr(joined));
                     }
                     // Preserve the composite type contributed by either
                     // compatible pointer operand. In particular, when one
@@ -3830,8 +4135,17 @@ impl CType {
                     // unprototyped, the composite function type has that
                     // prototype; choosing the then-arm alone can incorrectly
                     // allow extra call arguments.
-                    if let Some(composite) = composite_compatible_type(&t, &e) {
-                        return Some(composite);
+                    // 6.5.15 joins the immediate pointee qualification; it
+                    // requires compatibility BELOW that qualification. Compare
+                    // the inner types directly, avoiding two cloned stripped
+                    // pointer trees just to ignore their immediate CVR.
+                    if t_quals.space == e_quals.space {
+                        if let Some(composite) = composite_compatible_type(inner_t, inner_e) {
+                            return Some(CType::Pointer(
+                                Box::new(composite),
+                                t_quals.with_cvr(joined),
+                            ));
+                        }
                     }
                     // Pointers to incompatible types: GCC diagnoses the
                     // mismatch (an error since GCC 14, a warning under
@@ -3841,12 +4155,12 @@ impl CType {
                     // byte, not four.
                     if Self::pointees_definitely_incompatible(inner_t, inner_e) {
                         let space = match &t {
-                            CType::Pointer(_, space) => *space,
-                            _ => AddressSpace::Default,
+                            CType::Pointer(_, quals) => PtrQuals::of(quals.space),
+                            _ => PtrQuals::GENERIC,
                         };
                         return Some(CType::Pointer(Box::new(CType::Void), space));
                     }
-                    return Some(t);
+                    return Some(t.with_pointee_cvr(None));
                 }
                 // One pointer, one integer: the pointer type, whether or not
                 // the integer is a null pointer constant (GCC 16.2: `c ? 1 :
@@ -3908,9 +4222,9 @@ impl CType {
     /// still carries the pointee qualifiers of `T`.
     pub fn decayed_value_ctype(&self) -> CType {
         match self {
-            CType::Array(elem, _) => CType::Pointer(elem.clone(), AddressSpace::Default),
+            CType::Array(elem, _) => CType::Pointer(elem.clone(), PtrQuals::GENERIC),
             CType::Function(ft) => {
-                CType::Pointer(Box::new(CType::Function(ft.clone())), AddressSpace::Default)
+                CType::Pointer(Box::new(CType::Function(ft.clone())), PtrQuals::GENERIC)
             }
             other => other.clone(),
         }
@@ -4373,7 +4687,7 @@ mod cast_nop_tests {
 
 #[cfg(test)]
 mod record_display_tag_tests {
-    use super::CType;
+    use super::{CType, PtrQuals};
 
     #[test]
     fn strips_the_struct_prefix() {
@@ -4416,6 +4730,46 @@ mod record_display_tag_tests {
         // diagnostic, or every shadowing scope would print an internal name.
         assert_eq!(CType::Struct("struct.S#1".into()).to_string(), "struct S");
         assert_eq!(CType::Union("union.U#2".into()).to_string(), "union U");
+    }
+
+    #[test]
+    fn display_spells_array_declarators_like_gcc() {
+        // Each expected string is gcc-16.2's spelling of the same type in an
+        // `incompatible pointer type` diagnostic.
+        let arr = |t: CType, n| CType::Array(Box::new(t), Some(n));
+        let ptr = |t: CType, cvr| CType::Pointer(Box::new(t), PtrQuals::GENERIC.with_cvr(cvr));
+        let c = Some(PtrQuals::CONST);
+        assert_eq!(ptr(arr(CType::Int, 3), None).to_string(), "int (*)[3]");
+        assert_eq!(
+            ptr(ptr(arr(CType::Int, 3), None), None).to_string(),
+            "int (**)[3]"
+        );
+        assert_eq!(ptr(arr(CType::Int, 3), c).to_string(), "const int (*)[3]");
+        assert_eq!(
+            ptr(ptr(arr(CType::Int, 3), Some(0)), c).to_string(),
+            "int (* const*)[3]"
+        );
+        assert_eq!(
+            ptr(arr(ptr(CType::Int, None), 3), None).to_string(),
+            "int * (*)[3]"
+        );
+        assert_eq!(
+            ptr(arr(ptr(CType::Char, Some(0)), 2), c).to_string(),
+            "char * const (*)[2]"
+        );
+        assert_eq!(
+            ptr(arr(arr(CType::Int, 4), 3), None).to_string(),
+            "int (*)[3][4]"
+        );
+        assert_eq!(arr(arr(CType::Int, 4), 3).to_string(), "int[3][4]");
+        assert_eq!(
+            ptr(ptr(ptr(arr(CType::Int, 5), Some(0)), Some(0)), c).to_string(),
+            "int (** const*)[5]"
+        );
+        // Shapes without a pointed-to or nested array keep the plain spelling.
+        assert_eq!(arr(CType::Int, 3).to_string(), "int[3]");
+        assert_eq!(arr(ptr(CType::Int, None), 3).to_string(), "int *[3]");
+        assert_eq!(ptr(ptr(CType::Char, c), None).to_string(), "const char **");
     }
 }
 
@@ -4675,10 +5029,10 @@ mod ext_vector_selector_tests {
 
 #[cfg(test)]
 mod conditional_type_tests {
-    use super::{AddressSpace, CType, FunctionType};
+    use super::{AddressSpace, CType, FunctionType, PtrQuals};
 
     fn ptr(ct: CType) -> CType {
-        CType::Pointer(Box::new(ct), AddressSpace::Default)
+        CType::Pointer(Box::new(ct), PtrQuals::GENERIC)
     }
 
     #[test]
@@ -4845,6 +5199,7 @@ mod conditional_type_tests {
         let ctx: super::FxHashMap<String, super::RcLayout> = Default::default();
         let fields = vec![
             super::StructField {
+                own_cvr: None,
                 name: "c".into(),
                 ty: CType::Char,
                 bit_width: None,
@@ -4859,6 +5214,7 @@ mod conditional_type_tests {
                 pointer_quals: Vec::new(),
             },
             super::StructField {
+                own_cvr: None,
                 name: "d".into(),
                 ty: CType::Double,
                 bit_width: None,
@@ -4884,6 +5240,7 @@ mod conditional_type_tests {
     fn per_field_packed_bitfield_and_pragma_pack_bitfield_size_match_gcc() {
         let ctx: super::FxHashMap<String, super::RcLayout> = Default::default();
         let packed_bf = vec![super::StructField {
+            own_cvr: None,
             name: "a".into(),
             ty: CType::UInt,
             bit_width: Some(4),
@@ -4902,6 +5259,7 @@ mod conditional_type_tests {
         assert_eq!(l1.size, 1);
 
         let pack2_bf = vec![super::StructField {
+            own_cvr: None,
             name: "a".into(),
             ty: CType::UInt,
             bit_width: Some(4),
@@ -4918,5 +5276,82 @@ mod conditional_type_tests {
         let l2 = super::StructLayout::for_struct_with_packing(&pack2_bf, Some(2), &ctx, false);
         assert_eq!(l2.align, 2);
         assert_eq!(l2.size, 2);
+    }
+}
+
+#[cfg(test)]
+mod pointer_qualifier_contract_tests {
+    use super::*;
+    use std::hash::{Hash, Hasher};
+
+    fn pointer(cvr: Option<u8>) -> CType {
+        CType::Pointer(Box::new(CType::Int), PtrQuals::GENERIC.with_cvr(cvr))
+    }
+
+    #[test]
+    fn representation_identity_and_semantic_conflicts_are_distinct() {
+        let records: Vec<_> = std::iter::once(None).chain((0..8).map(Some)).collect();
+        for &a in &records {
+            for &b in &records {
+                let aq = PtrQuals::GENERIC.with_cvr(a);
+                let bq = PtrQuals::GENERIC.with_cvr(b);
+                assert_eq!(aq, bq);
+                let hash = |q: PtrQuals| {
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    q.hash(&mut h);
+                    h.finish()
+                };
+                assert_eq!(hash(aq), hash(bq));
+                let conflict = matches!((a, b), (Some(a), Some(b)) if a != b);
+                assert_eq!(aq.has_known_cvr_conflict(bq), conflict);
+                assert_eq!(ctypes_compatible(&pointer(a), &pointer(b)), !conflict);
+            }
+        }
+        assert_ne!(PtrQuals::GENERIC, PtrQuals::of(AddressSpace::SegGs));
+        assert_eq!(PtrQuals::GENERIC.cvr(), None);
+        assert_eq!(PtrQuals::GENERIC.with_cvr(Some(0)).cvr(), Some(0));
+    }
+
+    #[test]
+    fn conditional_joins_all_known_immediate_qualifiers_without_guessing() {
+        let records: Vec<_> = std::iter::once(None).chain((0..8).map(Some)).collect();
+        for &a in &records {
+            for &b in &records {
+                let result = CType::conditional_composite_type(
+                    Some(pointer(a)),
+                    Some(pointer(b)),
+                    false,
+                    false,
+                )
+                .unwrap();
+                let CType::Pointer(_, quals) = result else {
+                    panic!("pointer expected")
+                };
+                assert_eq!(quals.cvr(), a.zip(b).map(|(a, b)| a | b));
+            }
+        }
+    }
+
+    #[test]
+    fn function_qualification_is_significant_but_parameter_names_are_not() {
+        let function = |param, name: &str, ret| {
+            CType::Function(Box::new(FunctionType {
+                return_type: ret,
+                params: vec![(param, Some(name.into()))],
+                variadic: false,
+                has_prototype: true,
+            }))
+        };
+        let plain = function(pointer(Some(0)), "x", CType::Void);
+        let renamed = function(pointer(Some(0)), "y", CType::Void);
+        let qualified = function(pointer(Some(PtrQuals::CONST)), "x", CType::Void);
+        assert!(ctypes_compatible(&plain, &renamed));
+        assert!(!recorded_qualifiers_conflict(&plain, &renamed));
+        assert!(!ctypes_compatible(&plain, &qualified));
+        assert!(recorded_qualifiers_conflict(&plain, &qualified));
+        let ret_a = function(CType::Int, "x", pointer(Some(0)));
+        let ret_b = function(CType::Int, "x", pointer(Some(PtrQuals::CONST)));
+        assert!(recorded_qualifiers_conflict(&ret_a, &ret_b));
+        assert!(!ctypes_compatible(&ret_a, &ret_b));
     }
 }

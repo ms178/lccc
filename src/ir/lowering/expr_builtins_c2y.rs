@@ -1395,7 +1395,12 @@ impl Lowerer {
                     idx += 1;
                 }
                 self.emit_coalesced_zero_stores(
-                    base_ptr, start, idx, base_align, addr_space, off_ty,
+                    base_ptr,
+                    start,
+                    idx,
+                    base_align,
+                    addr_space.space,
+                    off_ty,
                 );
             } else {
                 let byte_ptr = self.gep_byte_offset(base_ptr, idx, off_ty);
@@ -1404,7 +1409,7 @@ impl Lowerer {
                     dest: old_val,
                     ptr: byte_ptr,
                     ty: IrType::U8,
-                    seg_override: addr_space,
+                    seg_override: addr_space.space,
                     volatile: false,
                 });
                 let masked = self.emit_binop_val(
@@ -1417,7 +1422,7 @@ impl Lowerer {
                     val: Operand::Value(masked),
                     ptr: byte_ptr,
                     ty: IrType::U8,
-                    seg_override: addr_space,
+                    seg_override: addr_space.space,
                     volatile: false,
                 });
                 idx += 1;

@@ -67,6 +67,11 @@ struct Scope {
     /// qualifiers, so a middle level's `const` (`int *const *p`) exists only
     /// here; `pointee_readonly` consults it to reject `*p = 0`.
     pointer_quals: FxHashMap<String, Vec<u8>>,
+    /// The complete CVR bits of an object's own type, recorded only when
+    /// exactly known: a non-pointer object or an array of non-pointers
+    /// (whose elements carry them). `&x` and an array's decay produce a
+    /// pointer whose pointee is qualified by exactly these.
+    object_cvr: FxHashMap<String, u8>,
     /// Objects whose own (top-level) type is `const`: the declaration's
     /// `const` with no pointer star (`const int x`), or the `const` on the
     /// star closest to the name (`int *const p`). This is exactly the
@@ -142,6 +147,7 @@ impl Scope {
             written_type_names: FxHashMap::default(),
             volatile_base: FxHashSet::default(),
             pointer_quals: FxHashMap::default(),
+            object_cvr: FxHashMap::default(),
             folded_values: FxHashMap::default(),
             enumerators: FxHashSet::default(),
         }
@@ -462,6 +468,32 @@ impl SymbolTable {
             .rev()
             .find(|scope| scope.symbols.contains_key(name))
             .is_some_and(|scope| scope.volatile_base.contains(name))
+    }
+
+    /// Record (or, with `None`, forget) the innermost scope's object
+    /// `name`'s complete own qualifiers (see the `object_cvr` field on
+    /// `Scope`). A redeclaration replaces the earlier record.
+    pub fn mark_object_cvr(&mut self, name: &str, cvr: Option<u8>) {
+        if let Some(scope) = self.scopes.last_mut() {
+            match cvr {
+                Some(cvr) => {
+                    scope.object_cvr.insert(name.to_string(), cvr);
+                }
+                None => {
+                    scope.object_cvr.remove(name);
+                }
+            }
+        }
+    }
+
+    /// The complete own qualifiers of the innermost visible declaration of
+    /// `name`, if recorded (see `mark_object_cvr`).
+    pub fn object_cvr(&self, name: &str) -> Option<u8> {
+        self.scopes
+            .iter()
+            .rev()
+            .find(|scope| scope.symbols.contains_key(name))
+            .and_then(|scope| scope.object_cvr.get(name).copied())
     }
 
     /// Record that the innermost scope's object `name` has a top-level

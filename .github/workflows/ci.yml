@@ -1136,6 +1136,13 @@ jobs:
         python3 tests/regression/check_option_effect_ledger.py \
           --lccc target/fastbuild/lccc --gcc gcc-16
         env GCC=gcc-16 python3 tests/regression/check_attribute_diagnostics.py
+        python3 tests/regression/check_qualifier_conversions.py \
+          --lccc target/fastbuild/lccc --gcc gcc-16
+        python3 tests/regression/test_qualifier_gate.py
+        python3 tests/regression/check_qualifier_composition.py \
+          --lccc target/fastbuild/lccc --lccc target/fastbuild/lccc-i686 \
+          --lccc target/fastbuild/lccc-arm --lccc target/fastbuild/lccc-riscv \
+          --gcc gcc-16
     - name: Cargo gate resource isolation
       run: python3 scripts/test_ci_resources.py
     - name: Verify local oracle identity and ICX provisioning (offline, mock only)
@@ -3078,6 +3085,10 @@ jobs:
           GCC_SIGN_CMOV="${GCC16:-gcc}" CLANG_SIGN_CMOV="${CLANG:-clang}" \
           ICX_SIGN_CMOV="$LCCC_ICX_BIN" LCCC_FASTBUILD_BIN=target/fastbuild/lccc \
           bash tests/regression/check_sign_test_cmov.sh
+    - name: Qualifier composition against authenticated ICX
+      run: |
+        python3 tests/regression/check_qualifier_composition.py \
+          --lccc target/fastbuild/lccc --vendor-only --icx "$LCCC_ICX_BIN"
     - name: SSE1-only packed F32 workload against ICX
       run: |
         set -euo pipefail

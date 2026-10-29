@@ -8,7 +8,7 @@ use super::definitions::{DeclAnalysis, FuncSig, GlobalInfo};
 use super::lower::Lowerer;
 use super::vector_array_init::VectorArrayInitPlan;
 use crate::common::type_builder::TypeConvertContext;
-use crate::common::types::{AddressSpace, CType, IrType};
+use crate::common::types::{AddressSpace, CType, IrType, PtrQuals};
 use crate::frontend::parser::ast::{
     Declaration, DerivedDeclarator, Designator, Expr, InitDeclarator, Initializer, InitializerItem,
     ParamDecl, TypeSpecifier,
@@ -759,7 +759,7 @@ impl Lowerer {
             // is sizeof(pointer) not sizeof(struct), so we must NOT route to lower_array_of_structs_init.
             if da.array_dim_strides.len() > 1 {
                 self.zero_init_alloca(alloca, da.alloc_size);
-                let ptr_ct = CType::Pointer(Box::new(CType::Void), AddressSpace::Default);
+                let ptr_ct = CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC);
                 self.lower_array_init_list(items, alloca, &ptr_ct, &da.array_dim_strides);
             } else {
                 self.lower_1d_array_init(items, alloca, da, decl);

@@ -7,7 +7,9 @@
 use super::lower::Lowerer;
 use crate::common::fx_hash::FxHashMap;
 use crate::common::qualifiers;
-use crate::common::types::{AddressSpace, CType, IrType, target_int_ir_type, widened_op_type};
+use crate::common::types::{
+    AddressSpace, CType, IrType, PtrQuals, target_int_ir_type, widened_op_type,
+};
 use crate::frontend::parser::ast::{
     BinOp, BlockItem, CompoundStmt, Expr, GenericAssociation, Initializer, Stmt, TypeSpecifier,
     UnaryOp,
@@ -1468,7 +1470,7 @@ impl Lowerer {
                         // The decayed array keeps the space of its object:
                         // `*(arr + i)` on a __seg_gs array reads %gs.
                         let space = self.get_addr_space_of_struct_expr(lhs);
-                        return Some(CType::Pointer(elem.clone(), space));
+                        return Some(CType::Pointer(elem.clone(), PtrQuals::of(space)));
                     }
                     CType::Function(_) => {
                         if *op == BinOp::Sub
@@ -1476,7 +1478,7 @@ impl Lowerer {
                         {
                             return Some(CType::Long);
                         }
-                        return Some(CType::Pointer(Box::new(lct), AddressSpace::Default));
+                        return Some(CType::Pointer(Box::new(lct), PtrQuals::GENERIC));
                     }
                     _ => {}
                 }
@@ -1488,10 +1490,10 @@ impl Lowerer {
                         CType::Pointer(_, _) => return Some(rct),
                         CType::Array(elem, _) => {
                             let space = self.get_addr_space_of_struct_expr(rhs);
-                            return Some(CType::Pointer(elem, space));
+                            return Some(CType::Pointer(elem, PtrQuals::of(space)));
                         }
                         CType::Function(_) => {
-                            return Some(CType::Pointer(Box::new(rct), AddressSpace::Default));
+                            return Some(CType::Pointer(Box::new(rct), PtrQuals::GENERIC));
                         }
                         _ => {}
                     }
@@ -1786,7 +1788,7 @@ impl Lowerer {
                 // `T __seg_gs *`, not a generic pointer.
                 if let Some(inner_ct) = self.get_expr_ctype(inner) {
                     let space = self.get_addr_space_of_struct_expr(inner);
-                    return Some(CType::Pointer(Box::new(inner_ct), space));
+                    return Some(CType::Pointer(Box::new(inner_ct), PtrQuals::of(space)));
                 }
                 None
             }
@@ -1856,7 +1858,7 @@ impl Lowerer {
                 // String literals have type char[] which decays to char*
                 Some(CType::Pointer(
                     Box::new(CType::plain_char()),
-                    AddressSpace::Default,
+                    PtrQuals::of(AddressSpace::Default),
                 ))
             }
             Expr::BinaryOp(op, lhs, rhs, _) => self.get_binop_ctype(op, lhs, rhs),
@@ -1914,12 +1916,12 @@ impl Lowerer {
             },
             // Wide string literal L"..." has type wchar_t* (which is int* on all targets)
             Expr::WideStringLiteral(_, _) => {
-                Some(CType::Pointer(Box::new(CType::Int), AddressSpace::Default))
+                Some(CType::Pointer(Box::new(CType::Int), PtrQuals::GENERIC))
             }
             // char16_t string literal u"..." has type char16_t* (which is unsigned short*)
             Expr::Char16StringLiteral(_, _) => Some(CType::Pointer(
                 Box::new(CType::UShort),
-                AddressSpace::Default,
+                PtrQuals::of(AddressSpace::Default),
             )),
             Expr::FunctionCall(func, args, _) => {
                 if let Expr::Identifier(name, _) = func.as_ref() {
@@ -2288,7 +2290,7 @@ impl Lowerer {
                     .or_else(|| self.get_expr_ctype_with_scope(inner, scope))
                 {
                     let space = self.get_addr_space_of_struct_expr(inner);
-                    return Some(CType::Pointer(Box::new(inner_ct), space));
+                    return Some(CType::Pointer(Box::new(inner_ct), PtrQuals::of(space)));
                 }
                 None
             }
@@ -2393,16 +2395,16 @@ impl Lowerer {
                         let space = match arg0 {
                             Expr::PointerMemberAccess(base, _, _) => {
                                 match self.get_expr_ctype(base) {
-                                    Some(CType::Pointer(_, sp)) => sp,
+                                    Some(CType::Pointer(_, quals)) => quals.space,
                                     _ => AddressSpace::Default,
                                 }
                             }
                             _ => AddressSpace::Default,
                         };
-                        return Some(CType::Pointer(Box::new(cnt_ty), space));
+                        return Some(CType::Pointer(Box::new(cnt_ty), PtrQuals::of(space)));
                     }
                 }
-                Some(CType::Pointer(Box::new(CType::Void), AddressSpace::Default))
+                Some(CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC))
             }
             "__builtin_assoc_barrier" => args
                 .first()

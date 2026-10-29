@@ -78,9 +78,11 @@ impl Parser {
                 TokenKind::Volatile => {
                     self.advance();
                     self.attrs.set_volatile(true);
+                    self.attrs.volatile_from_stars = false;
                 }
                 TokenKind::Restrict => {
                     self.advance();
+                    self.attrs.set_restrict(true);
                 }
                 TokenKind::Register => {
                     self.advance();
@@ -422,6 +424,7 @@ impl Parser {
                         self.attrs.set_typedef_use(true);
                         if self.typedef_base_volatile.contains(&name) {
                             self.attrs.set_volatile(true);
+                            self.attrs.volatile_from_stars = false;
                         }
                         self.attrs.set_typedef_object_volatile(
                             self.typedef_object_volatile.contains(&name),
@@ -1083,7 +1086,11 @@ impl Parser {
     fn consume_qualifier_after_base(&mut self) {
         match self.peek() {
             TokenKind::Const => self.attrs.set_const(true),
-            TokenKind::Volatile => self.attrs.set_volatile(true),
+            TokenKind::Volatile => {
+                self.attrs.set_volatile(true);
+                self.attrs.volatile_from_stars = false;
+            }
+            TokenKind::Restrict => self.attrs.set_restrict(true),
             TokenKind::Constexpr => {
                 self.attrs.set_const(true);
                 self.attrs.set_constexpr(true);
@@ -1262,6 +1269,7 @@ impl Parser {
                         alignas_type,
                         is_packed: pre_spec_packed,
                         base_volatile: false,
+                        base_restrict: false,
                         base_const: self.attrs.parsing_const(),
                         object_volatile: false,
                         object_const: self.attrs.parsing_const(),
@@ -1405,6 +1413,7 @@ impl Parser {
                     alignas_type: alignas_type.clone(),
                     is_packed: packed_from_type || extra_packed,
                     base_volatile: false,
+                    base_restrict: false,
                     base_const: false,
                     object_volatile: false,
                     object_const: false,
@@ -1428,6 +1437,7 @@ impl Parser {
                 self.parse_declarator_with_attrs();
             // The declarator's volatile qualifiers (see `declarator_base_volatile`).
             let decl_base_volatile = self.attrs.declarator_base_volatile;
+            let decl_base_restrict = self.attrs.declarator_base_restrict;
             let decl_object_volatile = self.attrs.declarator_object_volatile;
             let field_base_const = field_spec_const;
             let field_object_const = if derived
@@ -1497,6 +1507,7 @@ impl Parser {
                 alignas_type: alignas_type.clone(),
                 is_packed,
                 base_volatile: decl_base_volatile,
+                base_restrict: decl_base_restrict,
                 base_const: field_base_const,
                 object_volatile: decl_object_volatile,
                 object_const: field_object_const,

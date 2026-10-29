@@ -708,7 +708,7 @@ impl Lowerer {
         let ptr_op = self.lower_expr(&args[3]);
         let ptr_val = self.operand_to_value(ptr_op);
         let seg_override = match self.get_expr_ctype(&args[3]) {
-            Some(CType::Pointer(_, sp)) => sp,
+            Some(CType::Pointer(_, quals)) => quals.space,
             _ => AddressSpace::Default,
         };
         let store_ty = match self.get_expr_ctype(&args[3]) {

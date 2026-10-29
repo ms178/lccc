@@ -19,10 +19,10 @@ use super::type_context::TypeContext;
 use crate::common::fx_hash::FxHashMap;
 use crate::common::qualifiers;
 use crate::common::symbol_table::SymbolTable;
-use crate::common::types::{AddressSpace, CType, FunctionType};
+use crate::common::types::{AddressSpace, CType, FunctionType, PtrQuals};
 use crate::frontend::parser::ast::{
-    BinOp, BlockItem, CompoundStmt, DerivedDeclarator, Expr, ExprId, GenericAssociation, Stmt,
-    StructFieldDecl, TypeSpecifier, UnaryOp,
+    BinOp, BlockItem, CastQualifiers, CompoundStmt, DerivedDeclarator, Expr, ExprId,
+    GenericAssociation, Stmt, StructFieldDecl, TypeSpecifier, UnaryOp,
 };
 
 /// Expression type checker that infers CTypes using only sema-available state.
@@ -123,6 +123,91 @@ impl qualifiers::ConstLookup for ExprTypeChecker<'_> {
 }
 
 impl<'a> ExprTypeChecker<'a> {
+    /// The value-context type, keeping object qualifiers when arrays decay.
+    /// Raw inference deliberately retains arrays for sizeof, &, and member
+    /// selection. All value consumers use this boundary rather than recreating
+    /// an unqualified pointer independently. Existing expression memoization
+    /// remains authoritative for each raw expression type.
+    pub(super) fn infer_value_ctype(&self, expr: &Expr) -> Option<CType> {
+        let raw = self.infer_expr_ctype(expr)?;
+        let array = matches!(raw, CType::Array(..));
+        let mut value = raw.decayed_value_ctype();
+        if array {
+            if let CType::Pointer(_, quals) = &mut value {
+                *quals = quals
+                    .in_space(self.lvalue_address_space(expr))
+                    .with_cvr(self.lvalue_object_cvr(expr));
+            }
+        }
+        Some(value)
+    }
+
+    /// The complete own CVR bits of the object the lvalue `expr` designates,
+    /// when exactly known: a variable's record; a member's own qualifiers
+    /// joined with its containing object's (C11 6.5.2.3p3, `.` and `->`
+    /// alike); and the pointee record of the pointer that `*`, `->` or a
+    /// subscript goes through (an array operand: the array object's own,
+    /// which are its elements'). `None` when any link is unknown.
+    fn lvalue_object_cvr(&self, expr: &Expr) -> Option<u8> {
+        match expr {
+            Expr::Identifier(name, _) => self.symbols.object_cvr(name),
+            Expr::MemberAccess(base, field, _) => {
+                let outer = self.lvalue_object_cvr(base)?;
+                let record = self.infer_expr_ctype(base)?;
+                Some(outer | self.member_own_cvr(&record, field)?)
+            }
+            Expr::PointerMemberAccess(base, field, _) => {
+                let (record, outer) = self.designated_pointee(base)?;
+                Some(outer | self.member_own_cvr(&record, field)?)
+            }
+            Expr::Deref(inner, _) => self.designated_pointee(inner).map(|(_, cvr)| cvr),
+            Expr::ArraySubscript(lhs, rhs, _) => {
+                let lhs_indexes = self
+                    .infer_expr_ctype(lhs)
+                    .is_some_and(|t| matches!(t, CType::Pointer(..) | CType::Array(..)));
+                let base = if lhs_indexes { lhs } else { rhs };
+                self.designated_pointee(base).map(|(_, cvr)| cvr)
+            }
+            Expr::GenericSelection(controlling, associations, _) => {
+                let index = self.generic_selection_index(controlling, associations)?;
+                self.lvalue_object_cvr(&associations[index].expr)
+            }
+            Expr::FunctionCall(callee, args, _)
+                if matches!(callee.as_ref(), Expr::Identifier(name, _)
+                    if name == "__builtin_choose_expr")
+                    && args.len() >= 3 =>
+            {
+                let chosen = if self.choose_expr_takes_first(&args[0]) {
+                    1
+                } else {
+                    2
+                };
+                self.lvalue_object_cvr(&args[chosen])
+            }
+            _ => None,
+        }
+    }
+
+    /// The object type `expr` points at (an array operand: its element) and
+    /// that object's complete own CVR bits, when exactly known.
+    fn designated_pointee(&self, expr: &Expr) -> Option<(CType, u8)> {
+        match self.infer_expr_ctype(expr)? {
+            CType::Pointer(pointee, quals) => Some((*pointee, quals.cvr()?)),
+            CType::Array(elem, _) => Some((*elem, self.lvalue_object_cvr(expr)?)),
+            _ => None,
+        }
+    }
+
+    /// Member `field`'s own CVR bits in record type `record` (see
+    /// `StructLayout::member_own_cvr`).
+    fn member_own_cvr(&self, record: &CType, field: &str) -> Option<u8> {
+        let (CType::Struct(key) | CType::Union(key)) = record else {
+            return None;
+        };
+        let layouts = self.types.borrow_struct_layouts();
+        layouts.get(&key[..])?.member_own_cvr(field, &*layouts)
+    }
+
     /// Infer the CType of an expression.
     ///
     /// Returns `Some(CType)` when the type can be determined from sema state,
@@ -206,14 +291,14 @@ impl<'a> ExprTypeChecker<'a> {
             Expr::ImaginaryLiteralLongDouble(_, _, _) => Some(CType::ComplexLongDouble),
             Expr::StringLiteral(_, _) => Some(CType::Pointer(
                 Box::new(CType::plain_char()),
-                AddressSpace::Default,
+                PtrQuals::of(AddressSpace::Default),
             )),
             Expr::WideStringLiteral(_, _) => {
-                Some(CType::Pointer(Box::new(CType::Int), AddressSpace::Default))
+                Some(CType::Pointer(Box::new(CType::Int), PtrQuals::GENERIC))
             }
             Expr::Char16StringLiteral(_, _) => Some(CType::Pointer(
                 Box::new(CType::UShort),
-                AddressSpace::Default,
+                PtrQuals::of(AddressSpace::Default),
             )),
 
             // Identifiers: look up in symbol table or enum constants
@@ -255,7 +340,7 @@ impl<'a> ExprTypeChecker<'a> {
             }
 
             // Cast: type is the target type
-            Expr::Cast(type_spec, _, _, _) => Some(self.resolve_type_spec(type_spec)),
+            Expr::Cast(type_spec, _, _, quals) => Some(self.cast_ctype(type_spec, quals)),
 
             // Sizeof, Countof, and Alignof always produce size_t (unsigned long on 64-bit)
             Expr::Sizeof(_, _)
@@ -277,10 +362,13 @@ impl<'a> ExprTypeChecker<'a> {
                     // a generic pointer and a call to the `__percpu`-qualified
                     // function it belongs to was rejected (kernel/softirq.c).
                     let space = self.lvalue_address_space(inner);
-                    Some(CType::Pointer(Box::new(inner_ct), space))
+                    Some(CType::Pointer(
+                        Box::new(inner_ct),
+                        PtrQuals::of(space).with_cvr(self.lvalue_object_cvr(inner)),
+                    ))
                 } else {
                     // Even if inner type unknown, result is some pointer
-                    Some(CType::Pointer(Box::new(CType::Void), space))
+                    Some(CType::Pointer(Box::new(CType::Void), PtrQuals::of(space)))
                 }
             }
 
@@ -382,9 +470,7 @@ impl<'a> ExprTypeChecker<'a> {
             // trusts the inferred type. The conversion lives in
             // `CType::decayed_value_ctype` so sema, the sizeof/alignof sizing
             // paths and the lowerer's type maps share one implementation.
-            Expr::Comma(_, rhs, _) => self
-                .infer_expr_ctype(rhs)
-                .map(|ct| ct.decayed_value_ctype()),
+            Expr::Comma(_, rhs, _) => self.infer_value_ctype(rhs),
 
             // Function call: determine return type
             Expr::FunctionCall(func, args, _) => {
@@ -503,9 +589,7 @@ impl<'a> ExprTypeChecker<'a> {
 
             // Label address: void*
             Expr::TypeOperand(ts, _, _) => Some(self.resolve_type_spec(ts)),
-            Expr::LabelAddr(_, _) => {
-                Some(CType::Pointer(Box::new(CType::Void), AddressSpace::Default))
-            }
+            Expr::LabelAddr(_, _) => Some(CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC)),
 
             // __builtin_types_compatible_p: int
             Expr::BuiltinTypesCompatibleP(_, _, _, _, _) => Some(CType::Int),
@@ -524,10 +608,22 @@ impl<'a> ExprTypeChecker<'a> {
             // `float`, 64-bit lanes for `double`); a scalar comparison and
             // the logical operators produce `int`.
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
-                let vector = [lhs, rhs]
-                    .into_iter()
-                    .filter_map(|e| self.infer_expr_ctype(e))
-                    .find(CType::is_vector);
+                // Two stack slots, no heap allocation on every scalar compare.
+                let operands = [self.infer_expr_ctype(lhs), self.infer_expr_ctype(rhs)];
+                let vector = operands.iter().flatten().find(|t| t.is_vector());
+                // A vector against a pointer is an invalid operand pair (GCC's
+                // `error_mark`): leave it untyped so no conversion diagnostic
+                // cascades from the already-reported error.
+                if vector.is_some()
+                    && operands.iter().flatten().any(|t| {
+                        matches!(
+                            t,
+                            CType::Pointer(..) | CType::Array(..) | CType::Function(..)
+                        )
+                    })
+                {
+                    return None;
+                }
                 return match vector {
                     Some(v) => v.vector_comparison_result(),
                     None => Some(CType::Int),
@@ -579,13 +675,16 @@ impl<'a> ExprTypeChecker<'a> {
                         let space = self
                             .operand_memory_space(lhs)
                             .unwrap_or(AddressSpace::Default);
-                        return Some(CType::Pointer(elem.clone(), space));
+                        return Some(CType::Pointer(
+                            elem.clone(),
+                            PtrQuals::of(space).with_cvr(self.lvalue_object_cvr(lhs)),
+                        ));
                     }
                     CType::Function(_) => {
                         if *op == BinOp::Sub && rct.as_ref().is_some_and(is_ptr_or_fn) {
                             return Some(CType::Long);
                         }
-                        return Some(CType::Pointer(Box::new(l.clone()), AddressSpace::Default));
+                        return Some(CType::Pointer(Box::new(l.clone()), PtrQuals::GENERIC));
                     }
                     _ => {}
                 }
@@ -599,12 +698,15 @@ impl<'a> ExprTypeChecker<'a> {
                             let space = self
                                 .operand_memory_space(rhs)
                                 .unwrap_or(AddressSpace::Default);
-                            return Some(CType::Pointer(elem.clone(), space));
+                            return Some(CType::Pointer(
+                                elem.clone(),
+                                PtrQuals::of(space).with_cvr(self.lvalue_object_cvr(rhs)),
+                            ));
                         }
                         CType::Function(_) => {
                             return Some(CType::Pointer(
                                 Box::new(r.clone()),
-                                AddressSpace::Default,
+                                PtrQuals::of(AddressSpace::Default),
                             ));
                         }
                         _ => {}
@@ -744,7 +846,7 @@ impl<'a> ExprTypeChecker<'a> {
 
     /// Look up the declared bit-field width when `expr` directly designates a
     /// struct/union bit-field member (including through anonymous records).
-    fn expr_bitfield_width(&self, expr: &Expr) -> Option<u32> {
+    pub fn expr_bitfield_width(&self, expr: &Expr) -> Option<u32> {
         let (base_expr, field_name, is_pointer) = match expr {
             Expr::MemberAccess(b, f, _) => (b.as_ref(), f.as_str(), false),
             Expr::PointerMemberAccess(b, f, _) => (b.as_ref(), f.as_str(), true),
@@ -858,6 +960,24 @@ impl<'a> ExprTypeChecker<'a> {
     /// Resolve a TypeSpecifier to a CType using sema's type context.
     /// Shared with `SemaConstEval` so compile-time constant evaluation and
     /// expression type checking always produce identical `CType`s.
+    /// The type a cast converts to, with the qualifiers of a plain star
+    /// chain's pointer levels recorded (see `PtrQuals`).
+    fn cast_ctype(&self, spec: &TypeSpecifier, quals: &CastQualifiers) -> CType {
+        let mut ty = self.resolve_type_spec(spec);
+        if let Some(levels) = quals.star_chain() {
+            let mut leaf = spec;
+            while let TypeSpecifier::Pointer(inner, _) = leaf {
+                leaf = inner;
+            }
+            let base =
+                crate::common::type_builder::specifier_cvr_with(leaf, quals.base_cvr, &|n| {
+                    self.types.typedef_top_cvr(n)
+                });
+            crate::common::type_builder::record_pointer_quals(&mut ty, base, &levels);
+        }
+        ty
+    }
+
     pub(super) fn resolve_type_spec(&self, spec: &TypeSpecifier) -> CType {
         // Use a simple inline resolution for common cases to avoid the trait dispatch
         match spec {
@@ -918,7 +1038,7 @@ impl<'a> ExprTypeChecker<'a> {
                     } else {
                         *space
                     };
-                    ty = CType::Pointer(Box::new(ty), space);
+                    ty = CType::Pointer(Box::new(ty), PtrQuals::of(space));
                 }
                 ty
             }
@@ -1032,8 +1152,15 @@ impl<'a> ExprTypeChecker<'a> {
                     .iter()
                     .map(|p| {
                         (
-                            crate::common::type_builder::param_decl_to_ctype_with(
+                            crate::common::type_builder::param_decl_to_ctype_qualified(
                                 &|ts| self.resolve_type_spec(ts),
+                                &|ts, written| {
+                                    crate::common::type_builder::specifier_cvr_with(
+                                        ts,
+                                        written,
+                                        &|name| self.types.typedef_top_cvr(name),
+                                    )
+                                },
                                 p,
                             ),
                             p.name.clone(),
@@ -1047,7 +1174,7 @@ impl<'a> ExprTypeChecker<'a> {
                         variadic: *variadic,
                         has_prototype: *has_prototype,
                     }))),
-                    AddressSpace::Default,
+                    PtrQuals::of(AddressSpace::Default),
                 )
             }
             TypeSpecifier::BareFunction(ret, params, variadic, has_prototype) => {
@@ -1056,8 +1183,15 @@ impl<'a> ExprTypeChecker<'a> {
                     .iter()
                     .map(|p| {
                         (
-                            crate::common::type_builder::param_decl_to_ctype_with(
+                            crate::common::type_builder::param_decl_to_ctype_qualified(
                                 &|ts| self.resolve_type_spec(ts),
+                                &|ts, written| {
+                                    crate::common::type_builder::specifier_cvr_with(
+                                        ts,
+                                        written,
+                                        &|name| self.types.typedef_top_cvr(name),
+                                    )
+                                },
                                 p,
                             ),
                             p.name.clone(),
@@ -1088,8 +1222,8 @@ impl<'a> ExprTypeChecker<'a> {
 
     /// The type of `c ? then_expr : else_expr` (C11 6.5.15p3-p6).
     fn conditional_ctype(&self, then_expr: &Expr, else_expr: &Expr) -> Option<CType> {
-        let then_ct = self.infer_expr_ctype(then_expr);
-        let else_ct = self.infer_expr_ctype(else_expr);
+        let then_ct = self.infer_value_ctype(then_expr);
+        let else_ct = self.infer_value_ctype(else_expr);
         let then_is_npc = self.conditional_arm_is_npc(then_expr, &then_ct, &else_ct);
         let else_is_npc = self.conditional_arm_is_npc(else_expr, &else_ct, &then_ct);
         CType::conditional_composite_type(then_ct, else_ct, then_is_npc, else_is_npc)
@@ -1206,7 +1340,7 @@ impl<'a> ExprTypeChecker<'a> {
                     }
                 }
                 self.resolve_type_spec(ts)
-                    == CType::Pointer(Box::new(CType::Void), AddressSpace::Default)
+                    == CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC)
             },
             &|operand| self.is_integer_constant_zero(operand),
         )
@@ -1288,6 +1422,7 @@ impl<'a> ExprTypeChecker<'a> {
                 // (it may lower it); see `StructField::type_align`.
                 let type_align = typedef_alignment(&f.type_spec);
                 Some(StructField {
+                    own_cvr: None,
                     name: f.name.clone().unwrap_or_default(),
                     ty,
                     bit_width: f
@@ -1533,7 +1668,7 @@ impl<'a> ExprTypeChecker<'a> {
             | "__builtin_frame_address"
             | "__builtin_return_address"
             | "__builtin_thread_pointer" => {
-                Some(CType::Pointer(Box::new(CType::Void), AddressSpace::Default))
+                Some(CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC))
             }
 
             // Void-returning builtins
@@ -1744,7 +1879,7 @@ impl<'a> ExprTypeChecker<'a> {
     /// an operand that is neither (an integer index).
     fn operand_memory_space(&self, operand: &Expr) -> Option<AddressSpace> {
         match self.infer_expr_ctype(operand)? {
-            CType::Pointer(_, space) => Some(space),
+            CType::Pointer(_, space) => Some(space.space),
             CType::Array(_, _) => Some(self.lvalue_object_space(operand)),
             _ => None,
         }
@@ -1772,7 +1907,7 @@ impl<'a> ExprTypeChecker<'a> {
                     .infer_expr_ctype(inner)
                     .or_else(|| self.infer_expr_ctype_with_scope(inner, scope))?;
                 let space = self.lvalue_address_space(inner);
-                Some(CType::Pointer(Box::new(inner_ct), space))
+                Some(CType::Pointer(Box::new(inner_ct), PtrQuals::of(space)))
             }
             // Statement expression: thread the current scope down so nested
             // typeof() patterns (kernel xchg/cmpxchg macros) resolve.
@@ -1841,9 +1976,9 @@ impl<'a> ExprTypeChecker<'a> {
     /// there) and otherwise looks through unqualified casts to `&obj`, matching
     /// `get_addr_space_of_ptr_expr` in the lowerer.
     fn pointee_address_space(&self, expr: &Expr) -> AddressSpace {
-        if let Some(CType::Pointer(_, space)) = self.infer_expr_ctype(expr) {
-            if space != AddressSpace::Default {
-                return space;
+        if let Some(CType::Pointer(_, quals)) = self.infer_expr_ctype(expr) {
+            if quals.space != AddressSpace::Default {
+                return quals.space;
             }
         }
         match expr {
@@ -1880,10 +2015,10 @@ impl<'a> ExprTypeChecker<'a> {
             "__builtin_counted_by_ref" => {
                 if let Some(arg0) = args.first() {
                     if let Some((cnt_ty, space)) = self.infer_counted_by_target(arg0) {
-                        return Some(CType::Pointer(Box::new(cnt_ty), space));
+                        return Some(CType::Pointer(Box::new(cnt_ty), PtrQuals::of(space)));
                     }
                 }
-                Some(CType::Pointer(Box::new(CType::Void), AddressSpace::Default))
+                Some(CType::Pointer(Box::new(CType::Void), PtrQuals::GENERIC))
             }
             "__builtin_assoc_barrier" => args
                 .first()
@@ -1910,7 +2045,7 @@ impl<'a> ExprTypeChecker<'a> {
         let base_ct = self.infer_expr_ctype(base_expr)?;
         let (record_ct, space) = if is_ptr {
             match base_ct.decayed_value_ctype() {
-                CType::Pointer(inner, sp) => (*inner, sp),
+                CType::Pointer(inner, quals) => (*inner, quals.space),
                 _ => return None,
             }
         } else {
@@ -1924,5 +2059,63 @@ impl<'a> ExprTypeChecker<'a> {
         let layout = layouts.get(&**key)?;
         let (_, cnt_ty, _) = layout.field_counted_by(field_name, &*layouts)?;
         Some((cnt_ty, space))
+    }
+}
+
+#[cfg(test)]
+mod qualifier_composition_tests {
+    use super::*;
+    use crate::common::source::Span;
+    use crate::common::symbol_table::Symbol;
+
+    #[test]
+    fn cached_and_uncached_compositions_keep_identical_qualifier_records() {
+        let mut symbols = SymbolTable::new();
+        symbols.declare(Symbol {
+            name: "a".into(),
+            ty: CType::Array(Box::new(CType::Int), Some(2)),
+            explicit_alignment: None,
+            type_align: None,
+            address_space: AddressSpace::Default,
+        });
+        symbols.mark_object_cvr("a", Some(PtrQuals::CONST));
+        let types = TypeContext::new();
+        let functions = FxHashMap::default();
+        let checker = ExprTypeChecker {
+            symbols: &symbols,
+            types: &types,
+            functions: &functions,
+            expr_types: None,
+            builtin_policy: Default::default(),
+            pre_c99: false,
+        };
+        let span = Span::new(0, 1, 0);
+        let array = Expr::Identifier("a".into(), span);
+        let comma = Expr::Comma(Box::new(Expr::IntLiteral(0, span)), Box::new(array), span);
+        let address = Expr::AddressOf(Box::new(Expr::Identifier("a".into(), span)), span);
+        let conditional = Expr::Conditional(
+            Box::new(Expr::IntLiteral(1, span)),
+            Box::new(address.clone()),
+            Box::new(address),
+            span,
+        );
+        for expr in [&comma, &conditional] {
+            let mut cache = FxHashMap::default();
+            expr.for_each_child(&mut |child| {
+                cache.insert(child.id(), checker.infer_expr_ctype(child).unwrap());
+            });
+            let cached = ExprTypeChecker {
+                expr_types: Some(&cache),
+                builtin_policy: Default::default(),
+                ..checker
+            };
+            let a = checker.infer_value_ctype(expr).unwrap();
+            let b = cached.infer_value_ctype(expr).unwrap();
+            let (CType::Pointer(_, aq), CType::Pointer(_, bq)) = (a, b) else {
+                panic!("pointer expected")
+            };
+            assert_eq!(aq.cvr(), Some(PtrQuals::CONST));
+            assert_eq!(aq.cvr(), bq.cvr());
+        }
     }
 }

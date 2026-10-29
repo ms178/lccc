@@ -135,6 +135,13 @@ pub enum WarningKind {
     /// measured; `_Bool` and enumeration targets never warn).
     /// GCC flag: -Wpointer-to-int-cast
     PointerToIntCast,
+    /// An implicit pointer conversion drops a qualifier of the pointed-to
+    /// type (`char *p = (const char *)q;`, C23 6.5.16.1p1).
+    /// GCC flag: -Wdiscarded-qualifiers (enabled by default).
+    DiscardedQualifiers,
+    /// The same for a pointer to an array, whose element type carries the
+    /// qualifier. GCC flag: -Wdiscarded-array-qualifiers (enabled by default).
+    DiscardedArrayQualifiers,
     /// An integer was cast to a pointer type whose object size differs from
     /// the integer's (measured against GCC 16.2: default-on in every
     /// dialect, never a dialect default error; `_Bool` and enumeration
@@ -147,9 +154,12 @@ pub enum WarningKind {
     /// `==`/`!=`/ordering between pointers to distinct pointee types
     /// (measured against GCC 16.2: default-on in every dialect, never a
     /// dialect default error; `void *` absorbs the other side at the
-    /// OUTERMOST level only, and signed/unsigned or enum-versus-int
-    /// pointees ARE distinct here even where the argument-passing rules
-    /// call them compatible).
+    /// OUTERMOST level only; the test is C23 6.2.7 compatibility of the
+    /// unqualified pointees (`int **` vs `int *const *` is silent, `int **`
+    /// vs `const int **` warns), so `int *` vs
+    /// `unsigned *` or `char *` vs `signed char *` warn, while an enum
+    /// against its own underlying type, `int (*)[3]` against `int (*)[]`
+    /// and a prototype against an unprototyped function type are silent).
     /// GCC flag: -Wcompare-distinct-pointer-types
     CompareDistinctPointerTypes,
     /// ISO C language-extension constraints (the `-pedantic` family).
@@ -330,6 +340,22 @@ pub const WARNING_REGISTRY: &[WarningDescriptor] = &[
         [],
         false,
         "pointer-to-integer cast of a different width"
+    ),
+    warning!(
+        DiscardedQualifiers,
+        "discarded-qualifiers",
+        true,
+        [],
+        false,
+        "pointer conversion dropping a pointee qualifier"
+    ),
+    warning!(
+        DiscardedArrayQualifiers,
+        "discarded-array-qualifiers",
+        true,
+        [],
+        false,
+        "pointer-to-array conversion dropping an element qualifier"
     ),
     warning!(
         IntToPointerCast,
@@ -1610,6 +1636,8 @@ mod dialect_severity_redteam_tests {
             WarningKind::ReturnMismatch,
             WarningKind::IntConversion,
             WarningKind::PointerToIntCast,
+            WarningKind::DiscardedQualifiers,
+            WarningKind::DiscardedArrayQualifiers,
             WarningKind::IntToPointerCast,
             WarningKind::CompareDistinctPointerTypes,
             WarningKind::Pedantic,
@@ -1709,6 +1737,8 @@ mod dialect_severity_redteam_tests {
             "pointer-to-int-cast",
             "int-to-pointer-cast",
             "compare-distinct-pointer-types",
+            "discarded-qualifiers",
+            "discarded-array-qualifiers",
             "undeclared",
         ];
         expected_defaults.sort_unstable();

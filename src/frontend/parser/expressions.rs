@@ -164,15 +164,18 @@ impl Parser {
     fn parse_conditional_expr(&mut self) -> Expr {
         let cond = self.parse_binary_expr(PrecedenceLevel::LogicalOr);
         if self.consume_if(&TokenKind::Question) {
-            let span = cond.span();
+            // As for binary operators, the AST span names the operator.
+            // Capture the colon token before parsing the third operand.
             // GNU extension: `cond ? : else_expr` (omitted middle operand)
             // Condition is evaluated once and used as the then-value if truthy.
             if self.peek() == &TokenKind::Colon {
+                let span = self.peek_span();
                 self.expect_context(&TokenKind::Colon, "in conditional expression");
                 let else_expr = self.parse_conditional_expr();
                 Expr::GnuConditional(Box::new(cond), Box::new(else_expr), span)
             } else {
                 let then_expr = self.parse_expr();
+                let span = self.peek_span();
                 self.expect_context(&TokenKind::Colon, "in conditional expression");
                 let else_expr = self.parse_conditional_expr();
                 Expr::Conditional(
@@ -301,10 +304,15 @@ impl Parser {
                 TokenKind::Const if depth == 0 && before_first_star => {
                     q.pointee_qualified = true;
                     q.base_const = true;
+                    q.base_cvr |= crate::frontend::parser::ast::CVR_CONST;
                 }
                 TokenKind::Volatile if depth == 0 && before_first_star => {
                     q.pointee_qualified = true;
                     volatile_before_star = true;
+                    q.base_cvr |= crate::frontend::parser::ast::CVR_VOLATILE;
+                }
+                TokenKind::Restrict if depth == 0 && before_first_star => {
+                    q.base_cvr |= crate::frontend::parser::ast::CVR_RESTRICT;
                 }
                 TokenKind::LParen | TokenKind::LBrace | TokenKind::LBracket => depth += 1,
                 TokenKind::RParen => {
@@ -473,6 +481,7 @@ impl Parser {
                             self.scan_compound_literal_storage_in_range(save + 1, type_end);
                         cl_storage.pointer_const_levels = levels_mask;
                         qualifiers.pointer_const_levels = levels_mask;
+                        qualifiers.set_star_chain(&result_type, &pointer_quals);
                         let span = self.peek_span();
                         // The cast expression's span covers the whole
                         // `(type)expr` form, starting at the `(`: storing only
