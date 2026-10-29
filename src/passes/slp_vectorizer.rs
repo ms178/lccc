@@ -47,6 +47,7 @@ use crate::ir::instruction::{BasicBlock, Instruction, Operand, Terminator, Value
 use crate::ir::intrinsics::IntrinsicOp;
 use crate::ir::ops::{IrBinOp, IrCmpOp, IrUnaryOp};
 use crate::ir::reexports::IrFunction;
+use crate::passes::CfgAnalysis;
 use crate::passes::vectorize::{x86_avx2_available_pub, x86_simd_available_pub};
 
 /// Hashable lane encoding for pack dedup. Exact — no lossy constant
@@ -1698,11 +1699,14 @@ pub(crate) fn run_bb_slp_with_contract(
     // see `cross_block_use_map`); one O(function) pass instead of a
     // rescan per fired seed.
     let cross = cross_block_use_map(func);
+    // The CFG and the loop-header induction steps are stable across this
+    // pass: SLP rewrites values, but never changes control-flow edges.
+    let loop_steps = loop_index_steps(func);
     // Fixpoint: each fired seed rewrites its block, so re-scan afterwards.
     for _round in 0..24 {
         let mut fired = 0usize;
         for b in 0..func.blocks.len() {
-            while slp_block_once(func, b, &cross, fp_contract, debug) == 1 {
+            while slp_block_once(func, b, &cross, fp_contract, debug, &loop_steps[b]) == 1 {
                 fired += 1;
             }
         }
@@ -1715,6 +1719,164 @@ pub(crate) fn run_bb_slp_with_contract(
         crate::passes::dce::eliminate_dead_code(func);
     }
     total
+}
+
+/// Recover a loop-header phi's constant additive step. Only a bounded chain
+/// of copies, same-width integer casts and integer +/- constants is accepted.
+/// Unknown/multi-defined values and definitions outside the loop fail closed.
+fn phi_additive_step(
+    value: Value,
+    phi: Value,
+    ty: IrType,
+    body: &FxHashSet<usize>,
+    defs: &FxHashMap<u32, (usize, &Instruction)>,
+    duplicate: &FxHashSet<u32>,
+    fuel: usize,
+) -> Option<i64> {
+    if fuel == 0 || duplicate.contains(&value.0) {
+        return None;
+    }
+    if value == phi {
+        return Some(0);
+    }
+    let (block, inst) = defs.get(&value.0)?;
+    if !body.contains(block) {
+        return None;
+    }
+    let prev = |v: Value| phi_additive_step(v, phi, ty, body, defs, duplicate, fuel - 1);
+    match inst {
+        Instruction::Copy {
+            src: Operand::Value(v),
+            ..
+        } => prev(*v),
+        Instruction::Cast {
+            src: Operand::Value(v),
+            from_ty,
+            to_ty,
+            ..
+        } if from_ty.is_integer()
+            && to_ty.is_integer()
+            && from_ty.size() == ty.size()
+            && to_ty.size() == ty.size() =>
+        {
+            prev(*v)
+        }
+        Instruction::BinOp {
+            op,
+            lhs,
+            rhs,
+            ty: op_ty,
+            ..
+        } if op_ty.is_integer() && op_ty.size() == ty.size() => {
+            let (v, constant, negate) = match (op, lhs, rhs) {
+                (IrBinOp::Add, Operand::Value(v), Operand::Const(c))
+                | (IrBinOp::Add, Operand::Const(c), Operand::Value(v)) => (*v, *c, false),
+                (IrBinOp::Sub, Operand::Value(v), Operand::Const(c)) => (*v, *c, true),
+                _ => return None,
+            };
+            let n = match constant {
+                IrConst::I8(n) => n as i64,
+                IrConst::I16(n) => n as i64,
+                IrConst::I32(n) => n as i64,
+                IrConst::I64(n) => n,
+                _ => return None,
+            };
+            prev(v)?.checked_add(if negate { n.checked_neg()? } else { n })
+        }
+        _ => None,
+    }
+}
+
+/// For each block, the index steps of its unambiguous innermost natural loop.
+/// A matching displacement alone does not imply a recurrence: in `i += 4`,
+/// `a[i-2]` and `a[i]` are independent even though they are two lanes apart.
+/// Only a single-latch loop with a unique preheader and a block that dominates
+/// the latch can be handled by the later loop-carried forwarding pass. An
+/// unrecognised loop or IV gets no profitability veto, not a guessed step.
+fn loop_index_steps(func: &IrFunction) -> Vec<FxHashMap<u32, i64>> {
+    let mut out = vec![FxHashMap::default(); func.blocks.len()];
+    let cfg = CfgAnalysis::build(func);
+    let loops = crate::passes::loop_analysis::find_merged_natural_loops(
+        cfg.num_blocks,
+        &cfg.preds,
+        &cfg.succs,
+        &cfg.idom,
+    );
+    if loops.is_empty() {
+        return out;
+    }
+    let mut defs = FxHashMap::default();
+    let mut duplicate = FxHashSet::default();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for inst in &block.instructions {
+            if let Some(d) = inst.dest() {
+                if defs.insert(d.0, (bi, inst)).is_some() {
+                    duplicate.insert(d.0);
+                }
+            }
+        }
+    }
+    // A block in a nested loop advances the INNER loop on its next visit.
+    // Do not use an outer loop's phi step there. Equally sized overlapping
+    // loops are ambiguous and deliberately receive no owner.
+    let mut smallest = vec![usize::MAX; func.blocks.len()];
+    let mut owner = vec![None; func.blocks.len()];
+    for (li, lp) in loops.iter().enumerate() {
+        for &bi in &lp.body {
+            if lp.body.len() < smallest[bi] {
+                smallest[bi] = lp.body.len();
+                owner[bi] = Some(li);
+            } else if lp.body.len() == smallest[bi] {
+                owner[bi] = None;
+            }
+        }
+    }
+    let dom = crate::passes::loop_analysis::DominanceChecker::new(cfg.num_blocks, &cfg.idom);
+    for (li, lp) in loops.iter().enumerate() {
+        let Some(preheader) = lp.find_preheader(&cfg.preds) else {
+            continue;
+        };
+        let Some(latch) = lp.single_latch(&cfg.preds) else {
+            continue;
+        };
+        let latch_label = func.blocks[latch].label;
+        let preheader_label = func.blocks[preheader].label;
+        let mut steps = FxHashMap::default();
+        for inst in &func.blocks[lp.header].instructions {
+            let Instruction::Phi { dest, ty, incoming } = inst else {
+                continue;
+            };
+            if !ty.is_integer()
+                || ty.is_128bit()
+                || incoming.len() != 2
+                || duplicate.contains(&dest.0)
+                || !incoming.iter().any(|(_, label)| *label == preheader_label)
+            {
+                continue;
+            }
+            let Some((Operand::Value(back), _)) =
+                incoming.iter().find(|(_, label)| *label == latch_label)
+            else {
+                continue;
+            };
+            if let Some(step) =
+                phi_additive_step(*back, *dest, *ty, &lp.body, &defs, &duplicate, 24)
+            {
+                if step != 0 {
+                    steps.insert(dest.0, step);
+                }
+            }
+        }
+        if steps.is_empty() {
+            continue;
+        }
+        for &bi in &lp.body {
+            if owner[bi] == Some(li) && dom.dominates(bi, latch) {
+                out[bi] = steps.clone();
+            }
+        }
+    }
+    out
 }
 
 /// Values (function-wide) that have at least one use OUTSIDE their
@@ -1775,6 +1937,10 @@ struct BlockCtx<'a> {
     /// The FP contraction contract (threaded from the driver): gates the
     /// packed FMA contraction exactly like the scalar gap-fused detector.
     fp_contract: crate::common::fp_contract::FpContract,
+    /// Recognised induction steps for this block's innermost loop.
+    loop_steps: &'a FxHashMap<u32, i64>,
+    /// `LCCC_DEBUG_SLP` (resolved once per module by the caller).
+    debug: bool,
 }
 
 fn build_ctx<'a>(
@@ -1782,6 +1948,8 @@ fn build_ctx<'a>(
     block_idx: usize,
     cross: &'a FxHashSet<u32>,
     fp_contract: crate::common::fp_contract::FpContract,
+    loop_steps: &'a FxHashMap<u32, i64>,
+    debug: bool,
 ) -> BlockCtx<'a> {
     let block = &func.blocks[block_idx];
     let mut def_pos: FxHashMap<u32, usize> = FxHashMap::default();
@@ -1813,6 +1981,8 @@ fn build_ctx<'a>(
         uses,
         external_uses: cross,
         fp_contract,
+        loop_steps,
+        debug,
     }
 }
 
@@ -2125,12 +2295,13 @@ fn slp_block_once(
     cross: &FxHashSet<u32>,
     fp_contract: crate::common::fp_contract::FpContract,
     debug: bool,
+    loop_steps: &FxHashMap<u32, i64>,
 ) -> usize {
     // All analysis under one immutable borrow; the plans are fully owned
     // (no lifetimes into the block), so the mutable rewrite afterwards
     // is borrow-clean.
     let (candidates, plans): (Vec<SeedCandidate>, Vec<Option<Plan>>) = {
-        let ctx = build_ctx(func, block_idx, cross, fp_contract);
+        let ctx = build_ctx(func, block_idx, cross, fp_contract, loop_steps, debug);
         let candidates = collect_seed_candidates(&ctx);
         // The alias facts scan the whole function: build them only for a
         // block that has seeds (this runs once per block per fixpoint
@@ -4825,10 +4996,71 @@ fn build_pack(
     }
 }
 
+/// Is this seed a candidate for scalar loop-carried store-to-load forwarding?
+///
+/// The stream displacement must equal both the pack size and the recognised
+/// per-iteration byte stride. A nearby load alone is not sufficient: two
+/// words loaded before two stores with `i += 4` are a non-recurrent map.
+/// This is a *profitability* veto, not a legality rule: when the analysis is
+/// unsure, preserve SLP's ordinary cost decision. The later forwarding pass
+/// still performs its own, stricter aliasing and speculation checks.
+fn closes_loop_carried_recurrence(ctx: &BlockCtx, cand: &SeedCandidate) -> bool {
+    let Some(anchor) = eval_sym_addr(ctx.block, &ctx.def_pos, cand.anchor_ptr) else {
+        return false;
+    };
+    let Some(var) = anchor.var else { return false };
+    let Some(step) = ctx.loop_steps.get(&var.0) else {
+        return false;
+    };
+    let Some(stride) = i64::try_from(anchor.mult)
+        .ok()
+        .and_then(|scale| scale.checked_mul(*step))
+    else {
+        return false;
+    };
+    let pack_bytes = (cand.width as i64).saturating_mul(cand.ty.size() as i64);
+    if pack_bytes <= 0 || stride != pack_bytes {
+        return false;
+    }
+    ctx.block.instructions.iter().any(|inst| {
+        let Instruction::Load {
+            ptr,
+            ty,
+            seg_override,
+            volatile,
+            ..
+        } = inst
+        else {
+            return false;
+        };
+        if *ty != cand.ty || *seg_override != AddressSpace::Default || *volatile {
+            return false;
+        }
+        let Some(load) = eval_sym_addr(ctx.block, &ctx.def_pos, *ptr) else {
+            return false;
+        };
+        load.base == anchor.base
+            && load.var == anchor.var
+            && load.mult == anchor.mult
+            && anchor.off.checked_sub(load.off) == Some(stride)
+    })
+}
+
 fn build_plan(ctx: &BlockCtx, cand: &SeedCandidate, bases: &RestrictBases) -> Option<Plan> {
     let block = ctx.block;
     let width = cand.width;
     let fam = family_for(cand.ty, width)?;
+    // Preserve the scalar form for the later loop-carried forwarding pass
+    // when both the stream displacement and loop step match the pack size.
+    if closes_loop_carried_recurrence(ctx, cand) {
+        if ctx.debug {
+            eprintln!(
+                "[SLP] decline seed (width {}) at block {:?}: loop-carried store->load recurrence",
+                cand.width, ctx.block.label
+            );
+        }
+        return None;
+    }
     let mut packs: Vec<Pack> = Vec::new();
     let mut dedup: FxHashMap<Vec<LaneKey>, usize> = FxHashMap::default();
 
@@ -5612,6 +5844,87 @@ fn lookup_var_ty(func: &IrFunction, v: Value) -> Option<IrType> {
         .filter(|t| t.is_integer() && t.size() <= 8)
 }
 
+/// Check the actual rebuild order before committing a plan.
+///
+/// Insertions have already been stably sorted by `(slot, order)`; equal keys
+/// are meaningful (e.g. the compare then blend emitted by one pack). Only
+/// surviving scalar instructions are rewritten through `extract_dest`.
+/// Inserted instructions retain their original operands. Definitions in
+/// another block are assumed to dominate as in the original IR; a definition
+/// removed from this block, however, must never be mistaken for such a value.
+fn plan_order_respects_ssa(
+    old: &[Instruction],
+    term: &Terminator,
+    inserts: &[(usize, usize, Instruction)],
+    removed: &FxHashSet<usize>,
+    extract_dest: &FxHashMap<u32, Value>,
+) -> bool {
+    let mut local = FxHashSet::default();
+    let mut deleted = FxHashSet::default();
+    for (i, inst) in old.iter().enumerate() {
+        if let Some(d) = inst.dest() {
+            if removed.contains(&i) {
+                deleted.insert(d.0);
+            } else {
+                local.insert(d.0);
+            }
+        }
+    }
+    for (_, _, inst) in inserts {
+        if let Some(d) = inst.dest() {
+            local.insert(d.0);
+        }
+    }
+
+    // Mirror the rebuild, including its stable ordering of equal keys and
+    // defensive trailing insertions. The boolean marks rewritten survivors.
+    let mut emitted = Vec::with_capacity(old.len() + inserts.len());
+    let mut next = 0;
+    for (i, inst) in old.iter().enumerate() {
+        while next < inserts.len() && inserts[next].0 == i {
+            emitted.push((&inserts[next].2, false));
+            next += 1;
+        }
+        if !removed.contains(&i) {
+            emitted.push((inst, true));
+        }
+    }
+    emitted.extend(inserts[next..].iter().map(|(_, _, inst)| (inst, false)));
+
+    let mut seen = FxHashSet::default();
+    let mut seen_non_phi = false;
+    for (inst, rewritten) in emitted {
+        let phi = matches!(inst, Instruction::Phi { .. });
+        if phi && seen_non_phi {
+            return false;
+        }
+        seen_non_phi |= !phi;
+        let mut ok = true;
+        inst.for_each_used_value(|v| {
+            let v = if rewritten {
+                extract_dest.get(&v).map_or(v, |x| x.0)
+            } else {
+                v
+            };
+            // Phi operands are edge uses, so a self-loop incoming can
+            // legitimately refer to a later definition in this block.
+            ok &= !deleted.contains(&v) && (phi || !local.contains(&v) || seen.contains(&v));
+        });
+        if !ok {
+            return false;
+        }
+        if let Some(d) = inst.dest() {
+            seen.insert(d.0);
+        }
+    }
+    let mut ok = true;
+    term.for_each_used_value(|v| {
+        let v = extract_dest.get(&v).map_or(v, |x| x.0);
+        ok &= !deleted.contains(&v) && (!local.contains(&v) || seen.contains(&v));
+    });
+    ok
+}
+
 fn apply_plan(
     func: &mut IrFunction,
     block_idx: usize,
@@ -5625,25 +5938,27 @@ fn apply_plan(
         None => return false,
     };
 
+    // Keep ID allocation speculative until the schedule is accepted.
+    let mut next_value_id = func.next_value_id;
     // New SSA values: one vector result per pack, one per extract.
     let mut vec_dest: Vec<Value> = Vec::with_capacity(plan.packs.len());
     for _ in 0..plan.packs.len() {
-        vec_dest.push(Value(func.next_value_id));
-        func.next_value_id += 1;
+        vec_dest.push(Value(next_value_id));
+        next_value_id += 1;
     }
     // The CmpBlendv packs carry TWO vector results (the compare mask and
     // the blend output); the mask value gets its own SSA id here.
     let mut cmp_mask_dest: FxHashMap<usize, Value> = FxHashMap::default();
     for (pi, p) in plan.packs.iter().enumerate() {
         if matches!(p.kind, PackKind::CmpBlendv { .. }) {
-            cmp_mask_dest.insert(pi, Value(func.next_value_id));
-            func.next_value_id += 1;
+            cmp_mask_dest.insert(pi, Value(next_value_id));
+            next_value_id += 1;
         }
     }
     let mut extract_dest: FxHashMap<u32, Value> = FxHashMap::default();
     for (&vid, _) in &plan.extract_of {
-        extract_dest.insert(vid, Value(func.next_value_id));
-        func.next_value_id += 1;
+        extract_dest.insert(vid, Value(next_value_id));
+        next_value_id += 1;
     }
     // FORWARD packs emit no instruction: their vector result IS the
     // forwarded value (the pre-wasted fresh id above is simply unused).
@@ -5750,8 +6065,8 @@ fn apply_plan(
             } else if let Some(&(cv, cp)) = cast_of.get(&v.0) {
                 (cv, cp)
             } else {
-                let cv = Value(func.next_value_id);
-                func.next_value_id += 1;
+                let cv = Value(next_value_id);
+                next_value_id += 1;
                 sib_materialize.push((
                     mat_pos,
                     sib_materialize.len(),
@@ -5768,8 +6083,8 @@ fn apply_plan(
             if mult == 1 {
                 sib_index.insert((v.0, mult), (cast_dest, cast_pos));
             } else {
-                let idx = Value(func.next_value_id);
-                func.next_value_id += 1;
+                let idx = Value(next_value_id);
+                next_value_id += 1;
                 let op = if mult.is_power_of_two() {
                     Instruction::BinOp {
                         dest: idx,
@@ -6049,8 +6364,30 @@ fn apply_plan(
         },
     ));
 
-    // Rebuild the instruction list (and the parallel span list).
     inserts.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+    // Synthetic packs without scalar lanes inherit a consumer's slot,
+    // while a shared input pack may already be pinned to a later slot.
+    // Topological depth orders instructions only *within* a slot. Check the
+    // complete emitted sequence and decline rather than introduce invalid
+    // SSA (or a missing definition) when those constraints conflict.
+    if !plan_order_respects_ssa(
+        &func.blocks[block_idx].instructions,
+        &func.blocks[block_idx].terminator,
+        &inserts,
+        &plan.removed,
+        &extract_dest,
+    ) {
+        if debug {
+            eprintln!(
+                "[SLP] decline plan at block {:?}: emitted schedule would break intra-block SSA order",
+                func.blocks[block_idx].label
+            );
+        }
+        return false;
+    }
+
+    func.next_value_id = next_value_id;
+    // Rebuild the instruction list (and the parallel span list).
     let old = std::mem::take(&mut func.blocks[block_idx].instructions);
     let old_spans = std::mem::take(&mut func.blocks[block_idx].source_spans);
     let has_spans = !old_spans.is_empty();
@@ -6246,6 +6583,240 @@ fn rewrite_term_uses_in_place(term: &mut Terminator, map: &FxHashMap<u32, Value>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn copy(dest: u32, src: Operand) -> Instruction {
+        Instruction::Copy {
+            dest: Value(dest),
+            src,
+        }
+    }
+
+    fn val(v: u32) -> Operand {
+        Operand::Value(Value(v))
+    }
+
+    fn constant() -> Operand {
+        Operand::Const(IrConst::I32(0))
+    }
+
+    #[test]
+    fn phi_step_requires_a_constant_same_width_loop_chain() {
+        let add = |dest, lhs, amount, ty| Instruction::BinOp {
+            dest: Value(dest),
+            op: IrBinOp::Add,
+            lhs: val(lhs),
+            rhs: Operand::Const(IrConst::I32(amount)),
+            ty,
+        };
+        let instructions = [
+            add(2, 1, 1, IrType::I32),
+            add(3, 2, 1, IrType::I32),
+            Instruction::Cast {
+                dest: Value(4),
+                src: val(3),
+                from_ty: IrType::I32,
+                to_ty: IrType::I64,
+            },
+            add(5, 3, 1, IrType::I64),
+        ];
+        let defs = instructions
+            .iter()
+            .map(|inst| (inst.dest().unwrap().0, (0, inst)))
+            .collect();
+        let body = FxHashSet::from_iter([0]);
+        let none = FxHashSet::default();
+        let duplicate = FxHashSet::from_iter([2]);
+        assert_eq!(
+            phi_additive_step(Value(3), Value(1), IrType::I32, &body, &defs, &none, 24),
+            Some(2)
+        );
+        assert_eq!(
+            phi_additive_step(
+                Value(3),
+                Value(1),
+                IrType::I32,
+                &body,
+                &defs,
+                &duplicate,
+                24
+            ),
+            None
+        );
+        assert_eq!(
+            phi_additive_step(Value(3), Value(1), IrType::I32, &body, &defs, &none, 2),
+            None
+        );
+        assert_eq!(
+            phi_additive_step(Value(4), Value(1), IrType::I32, &body, &defs, &none, 24),
+            None
+        );
+        assert_eq!(
+            phi_additive_step(Value(5), Value(1), IrType::I32, &body, &defs, &none, 24),
+            None
+        );
+        assert_eq!(
+            phi_additive_step(
+                Value(3),
+                Value(1),
+                IrType::I32,
+                &FxHashSet::default(),
+                &defs,
+                &none,
+                24
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn nested_blocks_use_only_the_innermost_loop_step() {
+        use crate::ir::instruction::BlockId;
+        let phi = |id, init, back, pre, latch| Instruction::Phi {
+            dest: Value(id),
+            ty: IrType::I32,
+            incoming: vec![(init, BlockId(pre)), (val(back), BlockId(latch))],
+        };
+        let add = |dest, lhs, step| Instruction::BinOp {
+            dest: Value(dest),
+            op: IrBinOp::Add,
+            lhs: val(lhs),
+            rhs: Operand::Const(IrConst::I32(step)),
+            ty: IrType::I32,
+        };
+        let block = |id, instructions, terminator| BasicBlock {
+            label: BlockId(id),
+            instructions,
+            terminator,
+            source_spans: Vec::new(),
+        };
+        let branch = |target| Terminator::Branch(BlockId(target));
+        let cond = |yes, no| Terminator::CondBranch {
+            cond: constant(),
+            true_label: BlockId(yes),
+            false_label: BlockId(no),
+        };
+        let mut f = IrFunction::new("nested".into(), IrType::Void, Vec::new(), false);
+        f.blocks = vec![
+            block(0, vec![], branch(1)),
+            block(1, vec![phi(1, constant(), 2, 0, 5)], cond(2, 6)),
+            block(2, vec![], branch(3)),
+            block(3, vec![phi(3, constant(), 4, 2, 4)], cond(4, 5)),
+            block(4, vec![add(4, 3, 2)], branch(3)),
+            block(5, vec![add(2, 1, 4)], branch(1)),
+            block(6, vec![], Terminator::Return(None)),
+        ];
+        let steps = loop_index_steps(&f);
+        assert_eq!(steps[4].get(&3), Some(&2));
+        assert!(
+            !steps[4].contains_key(&1),
+            "outer IV does not advance on each inner iteration"
+        );
+        assert_eq!(steps[5].get(&1), Some(&4));
+        assert!(steps[0].is_empty());
+        assert!(steps[6].is_empty());
+    }
+
+    #[test]
+    fn emitted_order_handles_ties_and_late_producers() {
+        let old = [copy(1, constant())];
+        let removed = FxHashSet::default();
+        let extracts = FxHashMap::default();
+        // CmpBlendv emits compare and blend with the same key. Stable sort
+        // keeps their push order, so a dependency at that key is legal.
+        let good = [(1, 0, copy(2, val(1))), (1, 0, copy(3, val(2)))];
+        assert!(plan_order_respects_ssa(
+            &old,
+            &Terminator::Return(None),
+            &good,
+            &removed,
+            &extracts
+        ));
+        let reversed = [(1, 0, copy(3, val(2))), (1, 0, copy(2, val(1)))];
+        assert!(!plan_order_respects_ssa(
+            &old,
+            &Terminator::Return(None),
+            &reversed,
+            &removed,
+            &extracts
+        ));
+        let late = [(0, 0, copy(3, val(2))), (1, 0, copy(2, val(1)))];
+        assert!(!plan_order_respects_ssa(
+            &old,
+            &Terminator::Return(None),
+            &late,
+            &removed,
+            &extracts
+        ));
+    }
+
+    #[test]
+    fn emitted_order_distinguishes_survivors_from_inserted_uses() {
+        let old = [copy(1, constant()), copy(2, val(1))];
+        let removed = FxHashSet::from_iter([0]);
+        let extracts = FxHashMap::from_iter([(1, Value(3))]);
+        let extract = [(1, 0, copy(3, constant()))];
+        assert!(plan_order_respects_ssa(
+            &old,
+            &Terminator::Return(Some(val(1))),
+            &extract,
+            &removed,
+            &extracts
+        ));
+        // Insertions are not rewritten by the rebuild: an inserted use of
+        // the removed scalar remains invalid even if an extract exists.
+        let inserted_use = [(1, 0, copy(3, constant())), (1, 1, copy(4, val(1)))];
+        assert!(!plan_order_respects_ssa(
+            &old,
+            &Terminator::Return(None),
+            &inserted_use,
+            &removed,
+            &extracts
+        ));
+        assert!(!plan_order_respects_ssa(
+            &old,
+            &Terminator::Return(Some(val(1))),
+            &[],
+            &removed,
+            &FxHashMap::default()
+        ));
+        let too_late = [(2, 0, copy(3, constant()))];
+        assert!(!plan_order_respects_ssa(
+            &old,
+            &Terminator::Return(None),
+            &too_late,
+            &removed,
+            &extracts
+        ));
+    }
+
+    #[test]
+    fn emitted_order_allows_phi_backedge_but_preserves_phi_prefix() {
+        let old = [
+            Instruction::Phi {
+                dest: Value(1),
+                ty: IrType::I32,
+                incoming: vec![(val(2), crate::ir::instruction::BlockId(1))],
+            },
+            copy(2, val(1)),
+        ];
+        let removed = FxHashSet::default();
+        let extracts = FxHashMap::default();
+        assert!(plan_order_respects_ssa(
+            &old,
+            &Terminator::Return(None),
+            &[],
+            &removed,
+            &extracts
+        ));
+        let before_phi = [(0, 0, copy(3, constant()))];
+        assert!(!plan_order_respects_ssa(
+            &old,
+            &Terminator::Return(None),
+            &before_phi,
+            &removed,
+            &extracts
+        ));
+    }
 
     /// `narrow_const` must materialize the constant in an `IrConst`
     /// variant whose width IS the lane width. The demoted select is typed

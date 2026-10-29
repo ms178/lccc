@@ -3,7 +3,7 @@
   "fns_over_300": 234,
   "fns_over_500": 97,
   "ignored_tests": 10,
-  "knob_literals": 541,
+  "knob_literals": 542,
   "knob_names": [
     "CCC_AGGREGATE_SPLIT",
     "CCC_AGG_BYVAL_DEBUG",
@@ -336,6 +336,7 @@
     "CCC_NO_SEGMENT_SCAN",
     "CCC_NO_SEG_OPERAND_FUSE",
     "CCC_NO_SEG_SIB",
+    "CCC_NO_SELF_ZEXT_FALLTHROUGH",
     "CCC_NO_SETCC_BRANCH",
     "CCC_NO_SEXT",
     "CCC_NO_SEXT_ELIM",

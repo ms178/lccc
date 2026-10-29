@@ -12,7 +12,9 @@ use super::helpers::*;
 ///   * 64-bit write  → family unknown (CLEAR)
 ///   * 8/16-bit write → no effect on the upper 32 bits (no change)
 ///   * flags-only lines (cmp/test/...) and flag reads → no change
-///   * labels / any control transfer → CLEAR ALL (join points)
+///   * labels / unconditional control transfer → CLEAR ALL (join points)
+///   * conditional jump → preserve facts on the fallthrough; its target label
+///     clears them independently before any joined path is processed
 ///   * call → CLEAR caller-saved families only (callee-saved keep the
 ///     property: the callee must preserve their full 64-bit value)
 ///   * anything unrecognised → CLEAR ALL (an unknown writer may be 64-bit)
@@ -20,6 +22,15 @@ use super::helpers::*;
 /// The unknown→CLEAR-ALL rule is what makes the pass safe against any future
 /// instruction: a missed opportunity is cheap, a false claim is a miscompile.
 pub(super) fn eliminate_redundant_self_zext(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let preserve_fallthrough = std::env::var_os("CCC_NO_SELF_ZEXT_FALLTHROUGH").is_none();
+    eliminate_redundant_self_zext_with_policy(store, infos, preserve_fallthrough)
+}
+
+fn eliminate_redundant_self_zext_with_policy(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+    preserve_fallthrough: bool,
+) -> bool {
     let len = store.len();
     let mut changed = false;
     // (self-zext line, destination family) deferred to the rewrite phase.
@@ -38,12 +49,18 @@ pub(super) fn eliminate_redundant_self_zext(store: &mut LineStore, infos: &mut [
         }
         let t = info.trimmed(store.get(i));
         match info.kind {
-            LineKind::Label
-            | LineKind::CondJmp
-            | LineKind::Jmp
-            | LineKind::JmpIndirect
-            | LineKind::Ret => {
+            LineKind::Label | LineKind::Jmp | LineKind::JmpIndirect | LineKind::Ret => {
                 zero_upper = [false; 16];
+                i += 1;
+                continue;
+            }
+            LineKind::CondJmp => {
+                // A conditional branch writes no GPR. Only its fallthrough is
+                // scanned here; any target (including a backward edge) starts
+                // at a label and clears facts before the joined block.
+                if !preserve_fallthrough {
+                    zero_upper = [false; 16];
+                }
                 i += 1;
                 continue;
             }
@@ -71,6 +88,13 @@ pub(super) fn eliminate_redundant_self_zext(store: &mut LineStore, infos: &mut [
                 } else {
                     clear_families(&mut zero_upper, implicit_write_refs(t.as_bytes()));
                 }
+                i += 1;
+                continue;
+            }
+            LineKind::Directive if !info.inert_dir => {
+                // Data/unknown directives can encode instructions or hide an
+                // entry point; only classified inert metadata is transparent.
+                zero_upper = [false; 16];
                 i += 1;
                 continue;
             }
@@ -351,7 +375,7 @@ fn writes_memory_only(mnem: &str, t: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::super::super::types::classify_line;
-    use super::eliminate_redundant_self_zext;
+    use super::{eliminate_redundant_self_zext, eliminate_redundant_self_zext_with_policy};
     use crate::backend::peephole_common::LineStore;
 
     /// Runs the pass; returns how many `movl %R, %R` lines survive.
@@ -364,6 +388,38 @@ mod tests {
         (0..store.len())
             .filter(|&i| !infos[i].is_nop() && store.get(i).trim() == self_zext)
             .count()
+    }
+
+    fn survivors_with_policy(asm: &str, self_zext: &str, preserve_fallthrough: bool) -> usize {
+        let mut store = LineStore::new(asm.to_string());
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        eliminate_redundant_self_zext_with_policy(&mut store, &mut infos, preserve_fallthrough);
+        (0..store.len())
+            .filter(|&i| !infos[i].is_nop() && store.get(i).trim() == self_zext)
+            .count()
+    }
+
+    #[test]
+    fn zero_extension_survives_a_conditional_fallthrough_but_not_a_join() {
+        // A conditional store in a hash-insertion loop: the branch does not
+        // change the index, and its fallthrough has no other predecessor.
+        let loop_arm = "    shrl $17, %edi\n    movzwl (%rsi,%rdi,2), %r12d\n    cmpl %r14d, %r12d\n    je .Lnext\n    movzwl %r10w, %r11d\n    andl $16383, %r11d\n    movw %r12w, (%rdx,%r11,2)\n    movl %edi, %edi\n    movw %r10w, (%rsi,%rdi,2)\n.Lnext:\n";
+        assert_eq!(survivors_with_policy(loop_arm, "movl %edi, %edi", true), 0);
+        assert_eq!(survivors_with_policy(loop_arm, "movl %edi, %edi", false), 1);
+
+        // The taken edge and other predecessors may carry different upper
+        // bits. Labels, unconditional jumps, and real 64-bit writes remain
+        // barriers even when fallthrough propagation is enabled.
+        for asm in [
+            "    movl %esi, %edi\n    je .Ljoin\n.Ljoin:\n    movl %edi, %edi\n",
+            "    movl %esi, %edi\n    je .Lother\n    movq %rax, %rdi\n    movl %edi, %edi\n.Lother:\n",
+            "    movl %esi, %edi\n    jmp .Lother\n    movl %edi, %edi\n.Lother:\n",
+            "    movl %esi, %edi\n    je .Lother\n    .byte 0x90\n    movl %edi, %edi\n.Lother:\n",
+        ] {
+            assert_eq!(survivors_with_policy(asm, "movl %edi, %edi", true), 1);
+        }
     }
 
     /// A 32-bit implicit write establishes the fact. `divl`/`mull`/`idivl` and

@@ -289,8 +289,9 @@ scripts/godbolt.py compare kernel.c --flags "-O3 -march=x86-64-v3" \
     --local ./target/fastbuild/lccc
 
 # Offline assembly comparison; paths may be compilers or launchers.
+# --offline fails before dispatch if any remote or provisioned oracle is requested.
 # This is static assembly only, not a correctness or performance verdict.
-scripts/godbolt.py compare kernel.c --function hot_loop --flags=-O2 \
+scripts/godbolt.py compare --offline kernel.c --function hot_loop --flags=-O2 \
     --local target/fastbuild/lccc --oracles '' \
     --local-ref gcc=/path/to/gcc-16 --local-ref clang=/path/to/clang-23 \
     --artifact-dir /tmp/local-comparison

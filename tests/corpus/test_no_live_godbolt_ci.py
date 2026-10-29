@@ -18,23 +18,48 @@ except ModuleNotFoundError as exc:  # pragma: no cover - host dependency
     ) from exc
 
 ROOT = Path(__file__).resolve().parents[2]
-LIVE_TOOLS = re.compile(r'\bscripts/(godbolt|codegen_oracle|benchmark_codegen|loop_density_oracle|tight_loop_oracle|tune_oracle|oracle_delta_gate)\.py\b([^\n]*)')
+LIVE_TOOLS = re.compile(r'\bscripts/(godbolt|codegen_oracle|benchmark_codegen|loop_density_oracle|tight_loop_oracle|tune_oracle|oracle_delta_gate)\.py\b')
 
 
 def live_invocations(run):
     run = run.replace('\\\n', ' ')
     found = []
-    for match in LIVE_TOOLS.finditer(run):
-        tool, tail = match.groups()
-        tokens = shlex.split(tail, comments=True)
+    matches = list(LIVE_TOOLS.finditer(run))
+    for index, match in enumerate(matches):
+        tool = match.group(1)
+        line_end = run.find('\n', match.end())
+        if line_end < 0:
+            line_end = len(run)
+        # Do not let a local command swallow a second live command on the
+        # same shell line; inspect each script invocation independently.
+        if index + 1 < len(matches):
+            line_end = min(line_end, matches[index + 1].start())
+        tokens = shlex.split(run[match.end():line_end], comments=True)
         if tool == 'oracle_delta_gate' and tokens == ['--self-test']:
             continue
         if tool == 'loop_density_oracle' and '--local-only' in tokens:
             continue
-        empty_oracles = '--oracles=' in tokens or any(
-            a == '--oracles' and b == '' for a, b in zip(tokens, tokens[1:]))
+        # argparse permits repeated options and the final value wins.  Merely
+        # finding one empty spelling is therefore not enough to prove offline.
+        oracle_values = []
+        for index, token in enumerate(tokens):
+            if token == '--oracles':
+                oracle_values.append(tokens[index + 1] if index + 1 < len(tokens) else None)
+            elif token.startswith('--oracles='):
+                oracle_values.append(token.partition('=')[2])
+        empty_oracles = oracle_values == ['']
         if tool in {'benchmark_codegen', 'codegen_oracle'} and empty_oracles:
             continue
+        if tool == 'godbolt' and tokens[:2] == ['compare', '--offline'] and empty_oracles:
+            # The dispatcher enforces --offline before any catalog or local
+            # oracle provisioning. Keep it immediately after the subcommand so
+            # it cannot be consumed as the value of another option.
+            refs = [tokens[i + 1] for i, token in enumerate(tokens[:-1])
+                    if token == '--local-ref']
+            refs += [token.partition('=')[2] for token in tokens
+                     if token.startswith('--local-ref=')]
+            if any('=' in ref and all(ref.partition('=')[::2]) for ref in refs):
+                continue
         found.append(tool)
     return found
 
@@ -106,9 +131,36 @@ class NoLiveGodboltCI(unittest.TestCase):
         for run in ('python3 scripts/oracle_delta_gate.py --self-test',
                     'python3 scripts/test_godbolt_cache.py',
                     "python3 scripts/benchmark_codegen.py --oracles '' --out results/local",
-                    'python3 scripts/loop_density_oracle.py --local-only'):
+                    'python3 scripts/loop_density_oracle.py --local-only',
+                    "python3 scripts/godbolt.py compare --offline input.c --oracles '' --local-ref icx=/opt/icx",
+                    "python3 scripts/godbolt.py compare --offline input.c --oracles= --local-ref=icx=/opt/icx"):
             with self.subTest(run=run):
                 self.assertEqual(live_invocations(run), [])
+
+    def test_godbolt_offline_exception_fails_closed(self):
+        prefix = 'python3 scripts/godbolt.py '
+        for invocation in (
+            'compare input.c --local-ref icx=/opt/icx',  # defaults include remote
+            'compare input.c --oracles icx2026.2',  # may provision from network
+            "compare input.c --oracles '' --local-ref icx=/opt/icx",  # no runtime guard
+            "compare --offline input.c --oracles ''",  # no actual comparator
+            "compare --offline input.c --oracles '' --local-ref icx=",
+            "compare --offline input.c --oracles '' --local-ref icx=/opt/icx --oracles gcc16.2",
+            "compare --offline input.c --oracles gcc16.2 --oracles= --local-ref icx=/opt/icx",
+            "compare input.c --flags --offline --oracles '' --local-ref icx=/opt/icx",
+            "compile gcc16.2 input.c --oracles '' --local-ref icx=/opt/icx",
+        ):
+            with self.subTest(invocation=invocation):
+                self.assertEqual(live_invocations(prefix + invocation), ['godbolt'])
+
+    def test_local_command_cannot_hide_a_live_command_on_the_same_line(self):
+        local = "python3 scripts/godbolt.py compare --offline in.c --oracles '' --local-ref x=/opt/cc"
+        for separator in ('; ', ' && ', ' | '):
+            for live in ('python3 scripts/godbolt.py compare remote.c',
+                         'python3 scripts/codegen_oracle.py --oracles gcc16.2'):
+                with self.subTest(separator=separator, live=live):
+                    self.assertEqual(live_invocations(local + separator + live),
+                                     ['godbolt' if 'godbolt.py' in live else 'codegen_oracle'])
 
 
 if __name__ == '__main__':

@@ -1182,6 +1182,7 @@ pub(super) fn emit_executable(
         global_symbols,
         tls_addr,
         got_base,
+        false,
     )?;
 
     // Build .eh_frame_hdr from relocated .eh_frame data

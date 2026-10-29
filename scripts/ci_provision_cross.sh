@@ -23,11 +23,10 @@
 # asserts the invariant on both sides of the provisioning step: the tool that
 # may break it is the one that reports breaking it.
 #
-# A provisioning failure is a WARNING, not an error: the cross-executed halves
-# of the TLS and relocation gates report SKIP explicitly rather than pretending
-# to have measured something, so the lane stays honest and green. The i386
-# invariant is the exception -- that one is an error, because it invalidates
-# gates that do not skip.
+# Hosted lanes require the cross-executed TLS and relocation gates as well as
+# i386: an unavailable toolchain is an error, not a silently green skip. Keep
+# the diagnostic tail in the check annotation for clients that cannot retrieve
+# GitHub's signed log archive.
 set -uo pipefail
 
 REPO=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -43,8 +42,16 @@ if ! m32_ok; then
     exit 1
 fi
 
-if ! bash "$REPO/scripts/ensure_cross_toolchains.sh" all; then
-    echo "::warning::cross toolchain provisioning failed; the TLS runtime half will SKIP"
+cross_log=$(mktemp "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/lccc-cross.XXXXXX")
+trap 'rm -f "$cross_log"' EXIT
+cross_rc=0
+if ! bash "$REPO/scripts/ensure_cross_toolchains.sh" all 2>&1 | tee "$cross_log"; then
+    details=$(tail -n 25 "$cross_log")
+    details=${details//'%'/'%25'}
+    details=${details//$'\n'/'%0A'}
+    details=${details//$'\r'/'%0D'}
+    echo "::error title=Cross toolchain provisioning failed::$details"
+    cross_rc=1
 fi
 
 if ! m32_ok; then
@@ -56,6 +63,8 @@ for tool in aarch64 riscv64; do
     if command -v "$tool-linux-gnu-gcc" >/dev/null 2>&1; then
         "$tool-linux-gnu-gcc" --version | head -n 1
     else
-        echo "::warning::$tool-linux-gnu-gcc unavailable"
+        echo "::error::$tool-linux-gnu-gcc unavailable"
+        cross_rc=1
     fi
 done
+exit "$cross_rc"

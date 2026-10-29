@@ -100,10 +100,21 @@ if [[ $need_aarch64 == 0 && $need_riscv64 == 0 && $need_qemu == 0 ]]; then
     exit 0
 fi
 
-# Resolve the *host* GCC major so the cross packages match the installed
-# libgcc/libc6-cross generation instead of a hardcoded number that rots.
-host_gcc_ver=$(gcc -dumpversion 2>/dev/null | cut -d. -f1)
-[[ -n "$host_gcc_ver" ]] || host_gcc_ver=14
+# Resolve the distribution's host GCC, not a compiler prepended to PATH by an
+# oracle lane.  Ubuntu's cross packages follow the system GCC generation; a
+# temporary `gcc` symlink to the pinned GCC 16 oracle otherwise asks apt for
+# cross-16 packages that the runner's distribution may not provide.
+# The override lets the behavioral test supply a fake system driver.
+system_gcc_major() {
+    local driver=${LCCC_CROSS_SYSTEM_GCC:-/usr/bin/gcc}
+    if [[ ! -x $driver ]]; then
+        driver=$(command -v gcc) || return 1
+    fi
+    "$driver" -dumpversion 2>/dev/null | cut -d. -f1
+}
+host_gcc_ver=$(system_gcc_major)
+[[ $host_gcc_ver =~ ^[0-9]+$ ]] || host_gcc_ver=14
+echo "[cross] distribution GCC major: $host_gcc_ver"
 
 pkgs=()
 if [[ $need_qemu == 1 ]]; then

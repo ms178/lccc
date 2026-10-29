@@ -3340,7 +3340,7 @@ profile-guided optimisation, or an oracle-compiler build for coverage"
                     use super::option_table::{Class, lookup};
                     match lookup(arg) {
                         // Deliberate no-op: the table row carries the reason.
-                        Some(c) if c.class == Class::BenignNoop => {}
+                        Some(c) if c.class == Class::Inert => {}
                         // Classified refusal: the request would change program
                         // meaning (LTO, sanitizers, ABI, ...), so a capability
                         // probe must read "unsupported" and fall back.

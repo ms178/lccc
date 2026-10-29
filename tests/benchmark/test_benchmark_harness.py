@@ -121,6 +121,8 @@ class BenchmarkHarnessTests(unittest.TestCase):
         self.assertEqual(sizes['llvm_scalar_facts'], '-DSCALAR_FACTS_TRIPS=1024')
         self.assertEqual(sizes['llvm_word_counts'], '-DROUNDS=1024')
         self.assertEqual(sizes['zlib_ng_compare256'], '-DPASSES=32')
+        self.assertEqual(sizes['zlib_ng_slide_hash'], '-DWSIZE=8192 -DHASH_BITS=13 -DPASSES=4')
+        self.assertNotIn('-DHASH_SIZE=', sizes['zlib_ng_slide_hash'])
         self.assertTrue(bench.source_for(by_name['zlib_ng_compare256']).is_file())
         self.assertEqual(corpus.workload_flags(by_name['llvm_word_counts'], sizes['llvm_word_counts']), ['-DROUNDS=1024'])
         self.assertEqual(corpus.workload_flags(by_name['linux_find_bit_scaled'], sizes['linux_find_bit_scaled']), ['-DPASSES=128'])

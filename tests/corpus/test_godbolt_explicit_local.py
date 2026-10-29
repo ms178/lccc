@@ -51,7 +51,7 @@ class OfflineCompare(unittest.TestCase):
 
     def test_local_only_runs_without_catalog_and_tracks_launcher_and_raw_source(self):
         with patch.object(godbolt,'list_compilers',side_effect=AssertionError('network requested')):
-            rc=self.compare(self.args('--oracles','','--local-ref',f'gcc={self.compiler}',
+            rc=self.compare(self.args('--offline','--oracles','','--local-ref',f'gcc={self.compiler}',
                                       '--local-ref',f'clang={self.compiler}'))
         self.assertEqual(rc,0)
         report=json.loads(self.report.read_text())
@@ -62,6 +62,21 @@ class OfflineCompare(unittest.TestCase):
             self.assertEqual(record['launcher_sha256'], hashlib.sha256(self.compiler.read_bytes()).hexdigest())
             self.assertIn('wrapper targets are not pinned', record['identity_scope'])
         self.assertEqual(report['oracles'][1]['instructions'],2)
+
+    def test_offline_guard_refuses_every_oracle_before_dispatch_or_provisioning(self):
+        mutations = [
+            ('--offline',),  # the default oracle list is remote
+            ('--offline', '--oracles', 'gcc16.2'),
+            ('--offline', '--oracles', 'icx2026.2'),  # its provisioner can download
+            ('--offline', '--oracles', '', '--oracles', 'gcc16.2',
+             '--local-ref', f'gcc={self.compiler}'),
+        ]
+        with patch.object(godbolt, 'list_compilers', side_effect=AssertionError('network')), \
+             patch.object(godbolt, '_validated_local_oracle', side_effect=AssertionError('provision')):
+            for extra in mutations:
+                with self.subTest(extra=extra):
+                    self.assertEqual(self.compare(self.args(*extra)), 1)
+                    self.assertFalse(self.report.exists())
 
     def test_failed_remote_catalog_is_recorded_and_cannot_pass(self):
         with patch.object(godbolt,'list_compilers',side_effect=godbolt.GodboltError('offline')):

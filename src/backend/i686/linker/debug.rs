@@ -126,17 +126,13 @@ pub(super) fn apply_debug_relocations(
     global_symbols: &FxHashMap<String, LinkerSymbol>,
     tls_addr: u32,
     got_base: u32,
+    shared_object: bool,
 ) -> Result<(), String> {
-    // GOTPC in a retained allocated section requires a real GOT anchor. A
-    // GOTOFF found only in debug information does not itself create one in
-    // GNU ld. Keep rejecting that unproven case instead of inventing a value.
-    let gotpc_in_image = inputs.iter().enumerate().any(|(obj_idx, obj)| {
-        obj.sections.iter().any(|sec| {
-            sec.flags & SHF_ALLOC != 0
-                && section_map.contains_key(&(obj_idx, sec.input_index))
-                && sec.relocations.iter().any(|r| r.1 == R_386_GOTPC)
-        })
-    });
+    // Both output paths assign `_GLOBAL_OFFSET_TABLE_` from this same
+    // layout-selected anchor before resolving debug relocations. The anchor
+    // remains defined even when no allocated GOTPC relocation or physical
+    // GOT section exists; a debug-only GOTOFF still has the same S+A-GOT
+    // meaning. It must not depend on an unrelated instruction's relocation.
     for (obj_idx, obj) in inputs.iter().enumerate() {
         for sec in &obj.sections {
             if sec.relocations.is_empty() {
@@ -162,6 +158,21 @@ pub(super) fn apply_debug_relocations(
                         obj.filename, sec.name
                     ));
                 };
+                if shared_object && rel_type == R_386_GOTOFF && sym.section_index == SHN_UNDEF {
+                    // A shared object cannot form a static GOT-relative
+                    // address for an unresolved or dynamically bound symbol.
+                    // In particular, an undefined weak symbol is not a
+                    // section tombstone; GNU ld rejects this relocation.
+                    let statically_defined = global_symbols
+                        .get(sym.name.as_str())
+                        .is_some_and(|g| g.is_defined && !g.is_dynamic);
+                    if !statically_defined {
+                        return Err(format!(
+                            "{}: R_386_GOTOFF against undefined symbol `{}` cannot be used in a shared object",
+                            obj.filename, sym.name
+                        ));
+                    }
+                }
                 let place = base + offset;
                 let value = match symbol_address(
                     obj_idx,
@@ -178,7 +189,7 @@ pub(super) fn apply_debug_relocations(
                             // A debug section has address 0, so P is its offset.
                             R_386_PC32 => s_plus_a.wrapping_sub(place),
                             R_386_TLS_LDO_32 => s_plus_a.wrapping_sub(tls_addr),
-                            R_386_GOTOFF if gotpc_in_image => s_plus_a.wrapping_sub(got_base),
+                            R_386_GOTOFF => s_plus_a.wrapping_sub(got_base),
                             other => {
                                 return Err(format!(
                                     "{}: relocation type {other} in {} is not supported \

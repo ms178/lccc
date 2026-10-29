@@ -828,6 +828,9 @@ def command_compare(args: argparse.Namespace) -> int:
     # the manifest records both its digest and the local raw-byte digest.
     source_text = source_bytes.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
     requested = [item.strip() for item in args.oracles.split(",") if item.strip()]
+    if getattr(args, "offline", False) and requested:
+        print("--offline requires an empty --oracles list and explicit local references", file=sys.stderr)
+        return 1
     if len(requested) != len(set(requested)):
         print("duplicate remote oracle label", file=sys.stderr)
         return 1
@@ -1057,6 +1060,8 @@ def build_parser() -> argparse.ArgumentParser:
     compare_p.add_argument("--flags", default="-O3 -march=x86-64-v3")
     compare_p.add_argument("--local-flags")
     compare_p.add_argument("--oracles", default=",".join(DEFAULT_ORACLES))
+    compare_p.add_argument("--offline", action="store_true",
+                           help="refuse all oracle channels and use explicit local references only")
     compare_p.add_argument("--local-ref", action="append", default=[], metavar="LABEL=EXECUTABLE",
                            help="add a native x86-64 LP64 compiler without network; repeatable")
     compare_p.add_argument("--function")

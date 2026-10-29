@@ -57,7 +57,7 @@
   "linux_list_sort": "-DELEMENTS=2000 -DPASSES=1",
   "zstd_double_fast": "-DINPUT_SIZE=4096 -DPASSES=1",
   "gzip_crc32_slice8": "-DBUF_SIZE=16384 -DPASSES=4",
-  "zlib_ng_slide_hash": "-DWSIZE=8192 -DHASH_SIZE=8192 -DPASSES=4",
+  "zlib_ng_slide_hash": "-DWSIZE=8192 -DHASH_BITS=13 -DPASSES=4",
   "expat_utf8_content": "-DDOC_CAP=16384 -DPASSES=4",
   "sqlite_vdbe_serial": "-DNUM_RECORDS=1024 -DPASSES=2",
   "linux_xxhash64": "-DBUF_SIZE=16384 -DPASSES=4",

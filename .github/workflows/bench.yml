@@ -58,6 +58,8 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Enable bounded swap for benchmark execution
+        run: bash scripts/ci_enable_swap.sh
       - name: Compute weekly apt cache key
         id: apt-epoch
         run: echo "week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"

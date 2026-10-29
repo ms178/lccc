@@ -3719,10 +3719,23 @@ fn multi_reduction_transform_supported(
             && accumulator_type == element_type)
 }
 
-/// Remainder counters preserve the source's signed width. Mixed-width and
-/// unsigned comparisons still require a separate lowering.
+/// Remainder counters preserve the source counter's width and signedness.
+/// Width-matched 32/64-bit integer domains are accepted in either signedness:
+/// the bound builders (`emit_invariant_vector_bound` /
+/// `constant_reduction_vector_bound`) and the scalar remainder select their
+/// division op (SDiv/AShr vs UDiv/LShr) and exit predicate (Slt vs Ult) from
+/// the comparison's own domain via `reduction_limit_domain`. Mixed-width
+/// comparisons still have no lowering. Min/max callers pass `signed = true`
+/// literally, because the vpmaxsd/vpminsd lane composites are signed-only.
 fn reduction_remainder_types_supported(iv_ty: IrType, limit_ty: IrType, signed: bool) -> bool {
-    matches!(iv_ty, IrType::I32 | IrType::I64) && limit_ty == iv_ty && signed
+    if limit_ty != iv_ty {
+        return false;
+    }
+    if signed {
+        matches!(iv_ty, IrType::I32 | IrType::I64)
+    } else {
+        matches!(iv_ty, IrType::U32 | IrType::U64)
+    }
 }
 
 /// Rewrite the guard compare of a conditional sum into the one form the
@@ -4401,11 +4414,17 @@ fn analyze_reduction_pattern(
         {
             let iv_on_left = matches!(lhs, Operand::Value(v) if iv_derived.contains(v));
             let iv_on_right = matches!(rhs, Operand::Value(v) if iv_derived.contains(v));
+            // Strict exclusive bounds in either signedness; the IV must be on
+            // the natural side (`iv < limit`, `limit > iv`). The type-domain
+            // helper above rejects a signed predicate on an unsigned IV (and
+            // vice versa), so an inclusive/equality predicate can never pass.
+            let iv_below_limit = matches!(*op, IrCmpOp::Slt | IrCmpOp::Ult) && iv_on_left;
+            let iv_above_limit = matches!(*op, IrCmpOp::Sgt | IrCmpOp::Ugt) && iv_on_right;
             in_loop(*true_label)
                 && !in_loop(*false_label)
                 && *false_label == exit_label
                 && iv_on_left != iv_on_right
-                && ((*op == IrCmpOp::Slt && iv_on_left) || (*op == IrCmpOp::Sgt && iv_on_right))
+                && (iv_below_limit || iv_above_limit)
         }
         _ => false,
     };
@@ -5194,10 +5213,19 @@ fn analyze_reduction_pattern(
         _ => return None,
     };
 
-    // Verify element type is vectorizable (F64, F32, I32, I64)
+    // Verify element type is vectorizable (F64, F32, I32, I64). Unsigned
+    // 32/64-bit accumulators are accepted for the same-width add families:
+    // packed `paddd`/`paddq` and low-half multiplies are pure
+    // two's-complement bit operations, so U32/U64 lanes are bit-identical to
+    // I32/I64 lanes — the same identity the map and byte-sum transforms rely
+    // on. The pattern below therefore carries the canonical signed lane
+    // type. Every WIDENING route stays signed-only (its composites
+    // sign-extend: vpmovsxdq/smlal), so unsigned widening is refused there
+    // rather than silently reinterpreting high-bit values.
+    let unsigned_source = matches!(element_type, IrType::U32 | IrType::U64);
     if !matches!(
         element_type,
-        IrType::F64 | IrType::F32 | IrType::I32 | IrType::I64
+        IrType::F64 | IrType::F32 | IrType::I32 | IrType::I64 | IrType::U32 | IrType::U64
     ) {
         if debug {
             eprintln!("[VEC-RED]   Unsupported element type: {:?}", element_type);
@@ -5205,6 +5233,11 @@ fn analyze_reduction_pattern(
         set_reject("accumulator element type is not F64/F32/I32/I64");
         return None;
     }
+    let element_type = match element_type {
+        IrType::U32 => IrType::I32,
+        IrType::U64 => IrType::I64,
+        other => other,
+    };
 
     // Determine what is being added to the accumulator
     let (lhs_val, rhs_val) = match add_inst {
@@ -5597,9 +5630,15 @@ fn analyze_reduction_pattern(
             let (element_type, accumulator_type) = if widened_i32 {
                 let both_widened = matches!(mul_lhs_inst, Instruction::Cast { .. })
                     && matches!(mul_rhs_inst, Instruction::Cast { .. });
-                if !both_widened || element_type != IrType::I64 {
+                // The widened dot composites sign-extend their lanes
+                // (smlal/vpmovsxdq); an unsigned source would mis-handle
+                // values with the high bit set, so unsigned widening has no
+                // expressible form and stays scalar.
+                if !both_widened || element_type != IrType::I64 || unsigned_source {
                     if debug {
-                        eprintln!("[VEC-RED]   Rejecting partially widened dot product");
+                        eprintln!(
+                            "[VEC-RED]   Rejecting partially or unsigned widened dot product"
+                        );
                     }
                     return None;
                 }
@@ -7121,6 +7160,113 @@ impl MapExpr {
     }
 }
 
+/// Recognize an unsigned lane saturating subtract in the already-proven map
+/// tree. The narrow parser admits an unsigned compare only after proving its
+/// operands' ranges agree with the lane order. Equal inputs produce zero for
+/// both strict and non-strict forms. `max_u(a, b) - b` is the same operation
+/// and is the parser's existing AVX2 canonicalization.
+///
+/// This only identifies a tree; the caller must restrict it to U16 lanes and
+/// an x86-64 target with the corresponding SSE2/AVX2 lowering. The scalar tail
+/// continues to use the original expression.
+fn unsigned_saturating_sub_operands(expr: &MapExpr) -> Option<(&MapExpr, &MapExpr)> {
+    match expr {
+        MapExpr::Select(cond, true_val, false_val) => {
+            let MapExpr::Cmp(IrCmpOp::Ult | IrCmpOp::Ule, lhs, rhs) = cond.as_ref() else {
+                return None;
+            };
+            let zero = |e: &MapExpr| matches!(e, MapExpr::Invariant(Operand::Const(c)) if c.to_i64() == Some(0));
+            if zero(true_val) {
+                if let MapExpr::BinOp(IrBinOp::Sub, a, b) = false_val.as_ref() {
+                    if a == lhs && b == rhs {
+                        return Some((a, b));
+                    }
+                }
+            } else if zero(false_val) {
+                if let MapExpr::BinOp(IrBinOp::Sub, a, b) = true_val.as_ref() {
+                    if a == rhs && b == lhs {
+                        return Some((a, b));
+                    }
+                }
+            }
+            None
+        }
+        MapExpr::BinOp(IrBinOp::Sub, max, subtrahend) => {
+            let MapExpr::MinMax { is_max: true, l, r } = max.as_ref() else {
+                return None;
+            };
+            if r == subtrahend {
+                Some((l, r))
+            } else if l == subtrahend {
+                Some((r, l))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod unsigned_saturating_sub_tests {
+    use super::*;
+
+    fn boxed(expr: MapExpr) -> Box<MapExpr> {
+        Box::new(expr)
+    }
+
+    fn sub(a: &MapExpr, b: &MapExpr) -> MapExpr {
+        MapExpr::BinOp(IrBinOp::Sub, boxed(a.clone()), boxed(b.clone()))
+    }
+
+    fn cmp(op: IrCmpOp, a: &MapExpr, b: &MapExpr) -> MapExpr {
+        MapExpr::Cmp(op, boxed(a.clone()), boxed(b.clone()))
+    }
+
+    fn select(cond: MapExpr, t: MapExpr, f: MapExpr) -> MapExpr {
+        MapExpr::Select(boxed(cond), boxed(t), boxed(f))
+    }
+
+    #[test]
+    fn only_exact_unsigned_selects_and_max_subtracts_match() {
+        let a = MapExpr::Load(0);
+        let b = MapExpr::Load(1);
+        let c = MapExpr::Load(2);
+        let zero = MapExpr::Invariant(Operand::Const(IrConst::I32(0)));
+        let one = MapExpr::Invariant(Operand::Const(IrConst::I32(1)));
+        for op in [IrCmpOp::Ult, IrCmpOp::Ule] {
+            let forward = select(cmp(op, &a, &b), zero.clone(), sub(&a, &b));
+            let reverse = select(cmp(op, &b, &a), sub(&a, &b), zero.clone());
+            assert_eq!(unsigned_saturating_sub_operands(&forward), Some((&a, &b)));
+            assert_eq!(unsigned_saturating_sub_operands(&reverse), Some((&a, &b)));
+            let wrong_direction = select(cmp(op, &a, &b), sub(&a, &b), zero.clone());
+            let nonzero = select(cmp(op, &a, &b), one.clone(), sub(&a, &b));
+            assert_eq!(unsigned_saturating_sub_operands(&wrong_direction), None);
+            assert_eq!(unsigned_saturating_sub_operands(&nonzero), None);
+        }
+        let signed = select(cmp(IrCmpOp::Slt, &a, &b), zero, sub(&a, &b));
+        assert_eq!(unsigned_saturating_sub_operands(&signed), None);
+        for (l, r) in [(&a, &b), (&b, &a)] {
+            let max = MapExpr::MinMax {
+                is_max: true,
+                l: boxed((*l).clone()),
+                r: boxed((*r).clone()),
+            };
+            assert_eq!(
+                unsigned_saturating_sub_operands(&sub(&max, &b)),
+                Some((&a, &b))
+            );
+            assert_eq!(unsigned_saturating_sub_operands(&sub(&max, &c)), None);
+        }
+        let min = MapExpr::MinMax {
+            is_max: false,
+            l: boxed(a.clone()),
+            r: boxed(b.clone()),
+        };
+        assert_eq!(unsigned_saturating_sub_operands(&sub(&min, &b)), None);
+    }
+}
+
 /// Emission context for the elementwise map tree (OP-05a). Owns the fresh
 /// value counter and accumulates preheader broadcasts (hoisted, hoisted-once
 /// per invariant operand) and the packed-body instruction list.
@@ -7146,6 +7292,8 @@ struct MapEmitCtx<'a> {
     cmp_op: &'a dyn Fn(&IrCmpOp) -> Option<(IntrinsicOp, i32)>,
     minmax_op: &'a dyn Fn(bool) -> Option<IntrinsicOp>,
     blendv_op: Option<IntrinsicOp>,
+    /// Packed-only U16 saturation; absent on targets without this lowering.
+    sat_sub_op: Option<IntrinsicOp>,
     /// Every emitted node, keyed by its tree shape: identical subexpressions
     /// (reused loads, shared compares) emit exactly once — free CSE keeps
     /// e.g. a clamp tree at one load instead of three.
@@ -7191,6 +7339,20 @@ impl<'a> MapEmitCtx<'a> {
     }
 
     fn emit_uncached(&mut self, expr: &MapExpr) -> Option<Value> {
+        if let Some(op) = self.sat_sub_op {
+            if let Some((lhs, rhs)) = unsigned_saturating_sub_operands(expr) {
+                let lhs = self.emit(lhs)?;
+                let rhs = self.emit(rhs)?;
+                let dest = self.fresh();
+                self.vec_insts.push(Instruction::Intrinsic {
+                    dest: Some(dest),
+                    op,
+                    dest_ptr: None,
+                    args: vec![Operand::Value(lhs), Operand::Value(rhs)],
+                });
+                return Some(dest);
+            }
+        }
         match expr {
             MapExpr::Load(stream) => {
                 let dest = self.fresh();
@@ -12364,6 +12526,7 @@ fn transform_byte_count_reduction_inner(
             cmp_op: &cmp_op,
             minmax_op: &minmax_op,
             blendv_op,
+            sat_sub_op: None,
             narrow_const_bytes: Some(1),
             byte_broadcast_op: Some(if ymm {
                 IntrinsicOp::VecBroadcastI8x32
@@ -16542,41 +16705,6 @@ fn range_within(r: WideRange, bound: (i64, i64)) -> bool {
     matches!(r, Some((lo, hi)) if lo >= bound.0 && hi <= bound.1)
 }
 
-/// Narrow-compare constant wrapping (see the `Cmp` arm of
-/// `parse_byte_map_expr`): if `e` is a single-point CONSTANT whose range
-/// misses the domain but the OTHER side's range lies inside `dom`, rewrite
-/// the constant to its value modulo the domain.  Returns whether the
-/// rewrite happened; on success the caller treats the compare in `dom`'s
-/// signedness.  Only constants wrap — a runtime invariant's value is
-/// unknowable, and a non-single-point range is not a folded spelling.
-fn try_wrap_lane_cmp_constant(
-    e: &mut MapExpr,
-    er: WideRange,
-    other_r: WideRange,
-    dom: (i64, i64),
-) -> bool {
-    let MapExpr::Invariant(Operand::Const(c)) = e else {
-        return false;
-    };
-    let Some(v) = c.to_i64() else {
-        return false;
-    };
-    let Some((lo, hi)) = er else {
-        return false;
-    };
-    if lo != hi || lo != v {
-        // Not the folded single-point spelling of this constant.
-        return false;
-    }
-    if !range_within(other_r, dom) {
-        return false;
-    }
-    let width = dom.1 - dom.0 + 1;
-    let wrapped = (v - dom.0).rem_euclid(width) + dom.0;
-    *e = MapExpr::Invariant(Operand::Const(IrConst::I32(wrapped as i32)));
-    true
-}
-
 /// A byte constant replicated across all four bytes of an `I32` broadcast
 /// lane.  `VecBroadcastI32x{4,8}` splats a dword; splatting `b*0x01010101`
 /// fills every BYTE lane with `b`, so the byte path needs no `vpbroadcastb`
@@ -16662,18 +16790,19 @@ fn normalize_cmp_for_lanes(op: IrCmpOp) -> (IrCmpOp, bool) {
     }
 }
 
-/// The lane form of a byte-map compare over parsed operands `l`/`r` (with
-/// their value ranges): the mask itself for `mask != 0`, otherwise a lane
-/// compare in the byte domain both sides fit (after wrapping a folded
-/// constant spelling), or `None` when no domain is exact.
+/// The lane form of a narrow-map compare over parsed operands `l`/`r`.
+/// A comparison already at lane width reads only the lane bits, including
+/// any folded signed spelling of a constant. A wider comparison requires
+/// both value ranges to fit one common lane domain; in particular its
+/// out-of-range constants cannot be silently reduced modulo the lane width.
 fn byte_map_cmp(
     op: IrCmpOp,
-    mut l: MapExpr,
+    l: MapExpr,
     lr: WideRange,
-    mut r: MapExpr,
+    r: MapExpr,
     rr: WideRange,
-    u_dom: (i64, i64),
-    s_dom: (i64, i64),
+    cmp_ty: IrType,
+    elem_bytes: u32,
 ) -> Option<(MapExpr, WideRange)> {
     // `m != 0` over a lane MASK is `m` itself in both worlds: the
     // scalar value of a compare is 0/1 and its packed value 0/-1,
@@ -16693,31 +16822,19 @@ fn byte_map_cmp(
             return Some((r, Some(MASK_RANGE)));
         }
     }
-    // The frontend's narrow-compare fold wraps compare constants
-    // to the lane width: C's `zext(x) == 0xAA` (an int compare
-    // against 170) arrives as a U8-lane compare against the I8
-    // spelling of 0xAA, i.e. −86.  The wrapped spelling is exact
-    // at the lane width, but the constant's range (−86, −86)
-    // fails the unsigned-domain side-condition below and the
-    // whole loop would stay scalar — precisely the shape memchr
-    // and table-lookup classifiers write.  Reinterpret a
-    // single-point CONSTANT modulo the other side's byte domain,
-    // rewriting the invariant so the packed splat, the range
-    // analysis, and the scalar remainder mirror all see the
-    // domain value (170 for the example).  Runtime invariants
-    // never wrap (their value is unknowable); only the folded
-    // constant spelling does.
-    let byte_op = if range_within(lr, u_dom) && range_within(rr, u_dom) {
+    // A narrow comparison consumes the low lane bits directly, and its
+    // predicate already specifies signed or unsigned ordering. Preserve it
+    // even when a constant is printed using the opposite signed spelling.
+    // A comparison at a wider type cannot use that argument: e.g. u16 x is
+    // always below 65536, whereas narrowing 65536 to zero reverses it.
+    let (u_dom, s_dom) = narrow_domains(elem_bytes);
+    let byte_op = if cmp_ty.size() == elem_bytes as usize {
+        op
+    } else if cmp_ty.size() < elem_bytes as usize {
+        return None;
+    } else if range_within(lr, u_dom) && range_within(rr, u_dom) {
         byte_predicate_unsigned(op)
     } else if range_within(lr, s_dom) && range_within(rr, s_dom) {
-        op
-    } else if try_wrap_lane_cmp_constant(&mut l, lr, rr, u_dom)
-        || try_wrap_lane_cmp_constant(&mut r, rr, lr, u_dom)
-    {
-        byte_predicate_unsigned(op)
-    } else if try_wrap_lane_cmp_constant(&mut l, lr, rr, s_dom)
-        || try_wrap_lane_cmp_constant(&mut r, rr, lr, s_dom)
-    {
         op
     } else {
         return None;
@@ -16728,6 +16845,114 @@ fn byte_map_cmp(
         MapExpr::Cmp(norm_op, Box::new(a), Box::new(b)),
         Some(MASK_RANGE),
     ))
+}
+
+#[cfg(test)]
+mod narrow_compare_width_tests {
+    use super::*;
+
+    fn constant(value: i32) -> MapExpr {
+        MapExpr::Invariant(Operand::Const(IrConst::I32(value)))
+    }
+
+    #[test]
+    fn wide_out_of_range_constants_cannot_be_wrapped() {
+        for (bytes, limit) in [(1, 256), (2, 65536)] {
+            let (unsigned, _) = narrow_domains(bytes);
+            for value in [-1, limit] {
+                assert_eq!(
+                    byte_map_cmp(
+                        IrCmpOp::Slt,
+                        MapExpr::Load(0),
+                        Some(unsigned),
+                        constant(value),
+                        Some((i64::from(value), i64::from(value))),
+                        IrType::I32,
+                        bytes,
+                    ),
+                    None
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn narrow_comparisons_keep_their_signedness_and_bit_spelling() {
+        for (ty, bytes, value) in [(IrType::I8, 1, -86), (IrType::I16, 2, -32768)] {
+            let (unsigned, _) = narrow_domains(bytes);
+            let actual = byte_map_cmp(
+                IrCmpOp::Slt,
+                MapExpr::Load(0),
+                Some(unsigned),
+                constant(value),
+                Some((i64::from(value), i64::from(value))),
+                ty,
+                bytes,
+            );
+            assert_eq!(
+                actual,
+                Some((
+                    MapExpr::Cmp(
+                        IrCmpOp::Slt,
+                        Box::new(MapExpr::Load(0)),
+                        Box::new(constant(value)),
+                    ),
+                    Some(MASK_RANGE),
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn narrow_unsigned_equality_keeps_folded_signed_constants() {
+        for (ty, bytes, value) in [(IrType::U8, 1, -86), (IrType::U16, 2, -32768)] {
+            let (unsigned, _) = narrow_domains(bytes);
+            let actual = byte_map_cmp(
+                IrCmpOp::Eq,
+                MapExpr::Load(0),
+                Some(unsigned),
+                constant(value),
+                Some((i64::from(value), i64::from(value))),
+                ty,
+                bytes,
+            );
+            assert_eq!(
+                actual,
+                Some((
+                    MapExpr::Cmp(
+                        IrCmpOp::Eq,
+                        Box::new(MapExpr::Load(0)),
+                        Box::new(constant(value)),
+                    ),
+                    Some(MASK_RANGE),
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn wide_in_range_comparison_still_uses_unsigned_lanes() {
+        let actual = byte_map_cmp(
+            IrCmpOp::Slt,
+            MapExpr::Load(0),
+            Some((0, 65535)),
+            constant(32768),
+            Some((32768, 32768)),
+            IrType::I32,
+            2,
+        );
+        assert_eq!(
+            actual,
+            Some((
+                MapExpr::Cmp(
+                    IrCmpOp::Ult,
+                    Box::new(MapExpr::Load(0)),
+                    Box::new(constant(32768)),
+                ),
+                Some(MASK_RANGE),
+            ))
+        );
+    }
 }
 
 /// Parse the expression feeding a BYTE store into a byte-lane `MapExpr`,
@@ -16770,14 +16995,14 @@ fn byte_map_cmp(
 /// `MinMax` folded out of a select-over-compare.  Both are discharged with
 /// the interval carried alongside each node:
 ///
-/// * both operands in [0, 255]  -> the wide signed order, the wide unsigned
-///   order and the byte unsigned order coincide; emit the UNSIGNED byte
-///   predicate (see `byte_predicate_unsigned`).
-/// * both operands in [-128, 127] -> the value is representable in `i8`, and
-///   `x |-> x mod 256` is an order isomorphism from that window onto the
-///   byte domain for BOTH the signed and the unsigned byte order; keep the
-///   predicate as written.
-/// * otherwise -> refuse, and the loop keeps its scalar form.
+/// * a comparison already at lane width depends only on those bits; retain
+///   its signed or unsigned predicate, even for a differently spelled constant.
+/// * a wider comparison with both operands in [0, 255] has the same wide
+///   signed, wide unsigned and byte unsigned order; use the unsigned predicate.
+/// * a wider comparison with both operands in [-128, 127] preserves the
+///   original signed or unsigned predicate when narrowed to those bytes.
+/// * other wider comparisons, and comparisons below the lane width, refuse
+///   demotion and leave the loop scalar.
 ///
 /// Multiplies and shifts are refused outright: x86 has no packed byte
 /// multiply and no packed byte shift at any vector width, so there is no
@@ -16922,7 +17147,9 @@ fn parse_byte_map_expr(
                 range_binop(*op, lr, rr),
             ))
         }
-        Instruction::Cmp { op, lhs, rhs, .. } => {
+        Instruction::Cmp {
+            op, lhs, rhs, ty, ..
+        } => {
             let (l, lr) = parse_byte_map_operand(
                 func,
                 loop_blocks,
@@ -16941,7 +17168,7 @@ fn parse_byte_map_expr(
                 depth + 1,
                 elem_bytes,
             )?;
-            byte_map_cmp(*op, l, lr, r, rr, u_dom, s_dom)
+            byte_map_cmp(*op, l, lr, r, rr, *ty, elem_bytes)
         }
         Instruction::Select {
             cond,
@@ -21499,8 +21726,8 @@ fn reduction_element_size(ty: IrType) -> Option<u32> {
     match ty {
         IrType::F64 => Some(8),
         IrType::F32 => Some(4),
-        IrType::I32 => Some(4),
-        IrType::I64 => Some(8),
+        IrType::I32 | IrType::U32 => Some(4),
+        IrType::I64 | IrType::U64 => Some(8),
         _ => None,
     }
 }
@@ -24182,13 +24409,16 @@ fn reduction_exit_is_canonical(func: &IrFunction, pattern: &ReductionPattern) ->
     else {
         return false;
     };
-    if !iv_ty.is_some_and(|iv_ty| reduction_remainder_types_supported(iv_ty, *ty, true)) {
+    // The predicate's own signedness selects the counter domain; the helper
+    // enforces the matching IV/limit widths (I32/I64 signed, U32/U64 unsigned).
+    let signed = matches!(op, IrCmpOp::Slt | IrCmpOp::Sgt);
+    if !iv_ty.is_some_and(|iv_ty| reduction_remainder_types_supported(iv_ty, *ty, signed)) {
         return false;
     }
     let iv = pattern.iv;
     match (lhs, rhs) {
-        (Operand::Value(l), _) if *l == iv => matches!(op, IrCmpOp::Slt),
-        (_, Operand::Value(r)) if *r == iv => matches!(op, IrCmpOp::Sgt),
+        (Operand::Value(l), _) if *l == iv => matches!(op, IrCmpOp::Slt | IrCmpOp::Ult),
+        (_, Operand::Value(r)) if *r == iv => matches!(op, IrCmpOp::Sgt | IrCmpOp::Ugt),
         _ => false,
     }
 }
@@ -26144,7 +26374,13 @@ fn insert_reduction_remainder_loop(
 
     let (counter_ty, signed) =
         reduction_limit_domain(func, pattern).expect("reduction counter domain was preflighted");
-    debug_assert!(signed && matches!(counter_ty, IrType::I32 | IrType::I64));
+    debug_assert!(reduction_remainder_types_supported(
+        counter_ty, counter_ty, signed
+    ));
+    // The scalar tail replays the source loop's exit test verbatim, so an
+    // unsigned counter uses the unsigned strict predicate; every bound feeding
+    // it is built in this same counter domain.
+    let exit_cmp_op = if signed { IrCmpOp::Slt } else { IrCmpOp::Ult };
     let counter_const = |n: i64| IrConst::from_i64(n, counter_ty);
 
     // Get element size in bytes
@@ -26669,10 +26905,11 @@ fn insert_reduction_remainder_loop(
             ],
         });
     }
-    // Comparison
+    // Comparison — same strict predicate family as the source loop; the
+    // counter stays in its original signed/unsigned domain.
     remainder_header_instructions.push(Instruction::Cmp {
         dest: i_rem_cmp,
-        op: IrCmpOp::Slt,
+        op: exit_cmp_op,
         lhs: Operand::Value(i_rem_iv),
         rhs: if max_shift != 0 && !byte_offset_iv {
             max_remainder_limit.clone()
@@ -27977,6 +28214,38 @@ mod reduction_bound_safety_tests {
             IrType::I32,
             false
         ));
+    }
+
+    #[test]
+    fn unsigned_remainder_domain_accepts_width_matched_u32_u64_only() {
+        // The unsigned leg mirrors the signed contract in width: only
+        // 32/64-bit unsigned counter domains, and never cross-signedness.
+        assert!(reduction_remainder_types_supported(
+            IrType::U32,
+            IrType::U32,
+            false
+        ));
+        assert!(reduction_remainder_types_supported(
+            IrType::U64,
+            IrType::U64,
+            false
+        ));
+        // Signed types with an unsigned predicate and vice versa fail closed.
+        for ty in [IrType::I32, IrType::I64] {
+            assert!(!reduction_remainder_types_supported(ty, ty, false));
+        }
+        for ty in [IrType::U32, IrType::U64] {
+            assert!(!reduction_remainder_types_supported(ty, ty, true));
+        }
+        // Width mismatch and narrow counters are unsupported in either domain.
+        assert!(!reduction_remainder_types_supported(
+            IrType::U64,
+            IrType::U32,
+            false
+        ));
+        for ty in [IrType::U8, IrType::U16, IrType::I8, IrType::I16] {
+            assert!(!reduction_remainder_types_supported(ty, ty, false));
+        }
     }
 
     #[test]
@@ -32390,6 +32659,18 @@ fn transform_map_vector(
             cmp_op: &cmp_op,
             minmax_op: &minmax_op,
             blendv_op,
+            sat_sub_op: if !neon
+                && x86_64_vector_intrinsics_available()
+                && pattern.elem_ty == IrType::U16
+            {
+                Some(if avx2 {
+                    IntrinsicOp::VecSubSatU16x16
+                } else {
+                    IntrinsicOp::VecSubSatU16x8
+                })
+            } else {
+                None
+            },
             narrow_const_bytes: map_elem_size(&pattern.elem_ty).filter(|_| {
                 matches!(
                     pattern.elem_ty,

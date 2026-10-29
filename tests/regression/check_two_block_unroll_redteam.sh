@@ -13,14 +13,17 @@
 #      half-wide pairs and the VEX forms must fail closed, never
 #      miscompile, when the ISA refuses them.
 #   5. Codegen contracts (scoped asm checks on the -S output):
-#      - d4_schedule_pairs (the sha256 message-schedule shape): at least
-#        3 vmovq pair loads and at least 6 VEX dword ops, and ZERO legacy
-#        SSE packed-ARITHMETIC ops inside the function (the seed-path
-#        gather deliberately uses the SSE2-exact movd/punpckldq pair: it
-#        must pack on every x86-64 baseline — no SSE4.1 dependency — and
-#        it executes once per group where any transition consideration is
-#        amortized to zero; the contract grep scopes to the per-iteration
-#        packed arithmetic, which is all-VEX by design);
+#      - d4_schedule_pairs (the sha256 message-schedule shape): NO
+#        store->load round trip across the backedge — the group packs a
+#        register carry into a pair store and then re-reads it, which
+#        measured 15.6 % slower than the scalar form on this very kernel,
+#        so BB-SLP declines it and the contract pins the absence of the
+#        reload. ZERO legacy SSE packed-ARITHMETIC ops inside the
+#        function (an invariant of the shape whatever form it takes: the
+#        seed-path gather deliberately uses the SSE2-exact
+#        movd/punpckldq pair, must pack on every x86-64 baseline — no
+#        SSE4.1 dependency — and the contract grep scopes to the
+#        per-iteration packed arithmetic, which is all-VEX by design);
 #      - f1_hash_chain: the folded constant-key compare (cmp{l,q} $imm,
 #        off(%reg)) is present — the immediate-source load fold;
 #      - the A1 miscompile-class kernel: at least one pair of adjacent
@@ -123,14 +126,23 @@ scoped_fn_asm() {
 }
 
 d4=$(scoped_fn_asm d4_schedule_pairs "$td/rt.s")
-# grep -c exits 1 on zero matches; the contract checks below own the verdict.
-vmovq=$(printf '%s\n' "$d4" | grep -c 'vmovq' || true)
-vexops=$(printf '%s\n' "$d4" | grep -cE '^ +v(padd|psrl|psll|pxor|por)' || true)
-legacy=$(printf '%s\n' "$d4" | grep -cE '^ +(padd|psrl|psll|pxor|por)[a-z]* ' || true)
-if [ "$vmovq" -lt 3 ] || [ "$vexops" -lt 6 ]; then
-    echo "FAIL: d4_schedule_pairs lost the half-wide pair form (vmovq=$vmovq vex=$vexops)"
+# grep -c exits on zero matches; the contract checks below own the verdict.
+#
+# d4 is the sha256 message-schedule shape, and its store is re-read by a
+# later iteration. Packing that group turns a register carry into an L1D
+# store->load round trip, which BB-SLP now declines: on this exact kernel
+# the packed form measured 77.75 ms against the scalar form's 67.27 ms
+# (15 interleaved reps; the medians and the minima agree to 15.6 %), and
+# 14-20 % on the benchmark's sha256_transform. So the contract is
+# INVERTED versus its original form: the round trip must be GONE. The
+# half-wide pair family itself is still exercised — on the shape it wins
+# on — by check_slp_loop_carried_recurrence.sh's strided-pair control.
+roundtrip=$(printf '%s\n' "$d4" | grep -cE '^ +v?movq +-[0-9]+\(%r[a-z0-9]+\), +%xmm' || true)
+if [ "$roundtrip" -ne 0 ]; then
+    echo "FAIL: d4_schedule_pairs packs a loop-carried store->load round trip ($roundtrip)"
     exit 1
 fi
+legacy=$(printf '%s\n' "$d4" | grep -cE '^ +(padd|psrl|psll|pxor|por)[a-z]* ' || true)
 if [ "$legacy" -ne 0 ]; then
     echo "FAIL: d4_schedule_pairs mixes legacy SSE with VEX ($legacy legacy ops)"
     exit 1

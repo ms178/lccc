@@ -324,7 +324,7 @@
     "backend-contracts-b": {
       "group": "backend-contracts",
       "mode": "shell",
-      "predicted_gate_seconds": 421.628,
+      "predicted_gate_seconds": 421.878,
       "shards": 2,
       "step": "Verify remaining fast local contracts (shard b of 2)",
       "steps": [
@@ -395,6 +395,10 @@
         {
           "measured_s": 0.25,
           "name": "bash tests/regression/check_integer_reduction_vecreg_codegen.sh"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "bash tests/regression/check_unsigned_reduction_codegen.sh"
         },
         {
           "measured_s": 0.4,
@@ -556,10 +560,10 @@
           "measured_s": 0.92,
           "name": "bash tests/regression/check_rmw_index_zext_codegen.sh"
         },
-          {
-           "measured_s": 0.14,
-           "name": "bash tests/regression/check_redundant_self_zext.sh"
-          },
+        {
+          "measured_s": 0.14,
+          "name": "bash tests/regression/check_redundant_self_zext.sh"
+        },
         {
           "measured_s": 0.78,
           "name": "python3 tests/regression/check_llvm_missed_zero_choice.py"

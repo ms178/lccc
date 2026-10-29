@@ -1129,6 +1129,8 @@ jobs:
           --lccc target/fastbuild/lccc --gcc gcc-16
         python3 tests/regression/check_macro_parity.py \
           --lccc target/fastbuild/lccc --gcc gcc-16
+        python3 tests/regression/check_include_next_search.py \
+          --lccc target/fastbuild/lccc --gcc gcc-16
         env CCC=target/fastbuild/lccc GCC=gcc-16 \
           bash tests/regression/check_macro_parity.sh
         python3 tests/regression/check_has_builtin_features.py \
@@ -1729,10 +1731,8 @@ jobs:
       # invariant here, at the point of cause, rather than 600 lines later in
       # the linker suite.
       #
-      # A missing cross toolchain is an infrastructure condition, not a code
-      # regression, and the gate already reports it as an explicit SKIP; so that
-      # path warns instead of failing the job. A broken i386 multilib is a real
-      # regression and fails hard.
+      # Hosted CI requires both cross-executed halves and the i386 suite; fail
+      # provisioning rather than silently accepting an architecture skip.
       env:
         LCCC_CROSS_DEB_DIR: /home/runner/.cache/lccc-cross-debs
       run: bash scripts/ci_provision_cross.sh
@@ -1798,6 +1798,10 @@ jobs:
       env:
         CCC: target/fastbuild/lccc
       run: bash tests/regression/check_bb_slp_v8_codegen.sh
+    - name: Verify BB-SLP declines loop-carried store->load recurrences
+      env:
+        CCC: target/fastbuild/lccc
+      run: bash tests/regression/check_slp_loop_carried_recurrence.sh
     - name: Verify nested if-conversion + sub-word SELECT demotion contracts
       env:
         CCC: target/fastbuild/lccc
@@ -1818,6 +1822,11 @@ jobs:
       env:
         CCC: target/fastbuild/lccc
       run: bash tests/regression/check_vectorize_isa_gate.sh
+    - name: Verify unsigned word saturation and ISA fallback
+      env:
+        CCC: target/fastbuild/lccc
+        GCC: gcc-16
+      run: bash tests/regression/check_u16_saturating_sub.sh
     - name: Verify byte-compare window phase
       env:
         CCC: target/fastbuild/lccc
@@ -2621,6 +2630,7 @@ jobs:
         bash tests/regression/check_redundant_test_elimination.sh
         bash tests/regression/check_bool_pair_prune.sh
         bash tests/regression/check_integer_reduction_vecreg_codegen.sh
+        bash tests/regression/check_unsigned_reduction_codegen.sh
         # Integer abs comparison folds in simplify (abs(a) <= 0 -> a == 0,
         # abs(a) < k -> biased unsigned range test), kill-switch ownership
         # and the -fwrapv INT_MIN contract.  Mirrored in
@@ -3049,6 +3059,8 @@ jobs:
     timeout-minutes: 35
     steps:
     - uses: actions/checkout@v7
+    - name: Enable bounded swap for vendor runtime evidence
+      run: bash scripts/ci_enable_swap.sh
     - uses: actions/download-artifact@v8
       with:
         name: lccc-fast-${{ github.sha }}
@@ -3099,6 +3111,19 @@ jobs:
           GCC_SIGN_CMOV="${GCC16:-gcc}" CLANG_SIGN_CMOV="${CLANG:-clang}" \
           ICX_SIGN_CMOV="$LCCC_ICX_BIN" LCCC_FASTBUILD_BIN=target/fastbuild/lccc \
           bash tests/regression/check_sign_test_cmov.sh
+        # Same-host, correctness-gated SHA-256 comparison. The saved report is
+        # VM screening evidence, not a universal CPU or hardware-PMU claim.
+        python3 tests/benchmark/run_benchmarks.py \
+          --only sha256_transform --compilers lccc,icx \
+          --lccc target/fastbuild/lccc --icx "$LCCC_ICX_BIN" \
+          --opt=-O2 --reps 9 --warmup 2 --cpu auto --no-pmu-probe --strict \
+          --artifact-dir intel-evidence/sha256-artifacts \
+          --json intel-evidence/sha256-runtime.json \
+          --markdown intel-evidence/sha256-runtime.md
+        python3 scripts/godbolt.py compare --offline tests/regression/slp_independent_gap.c \
+          --function gap_pairs --flags='-O2 -march=x86-64-v3' --local target/fastbuild/lccc \
+          --oracles '' --local-ref "icx=$LCCC_ICX_BIN" --artifact-dir intel-evidence/gap-oracle \
+          --json intel-evidence/gap-oracle/manifest.json
     - name: Qualifier composition against authenticated ICX
       run: |
         python3 tests/regression/check_qualifier_composition.py \
