@@ -21,6 +21,94 @@ def outcome(status=0, stdout=b'checksum\n', failure=None):
     return dict(returncode=status, stdout=stdout, stderr=b'', failure=failure)
 
 
+class BalancedOrderTests(unittest.TestCase):
+    def test_two_arm_blocks_are_balanced_deterministic_and_safe_after_failure(self):
+        import random
+        def schedule(seed):
+            rng = random.Random(seed)
+            result, prev = [], None
+            for i in range(9):
+                prev = bench.balanced_compiler_order(['lccc', 'gcc'], rng, i, prev)
+                result.append(prev)
+            return result
+        orders = schedule(42)
+        self.assertEqual(orders, schedule(42))
+        for i in range(0, 8, 2):
+            self.assertEqual(orders[i + 1], list(reversed(orders[i])))
+        self.assertIn(sum(order[0] == 'lccc' for order in orders), (4, 5))
+        self.assertEqual(bench.balanced_compiler_order(['gcc'], random.Random(2), 1, ['lccc', 'gcc']), ['gcc'])
+        more = bench.balanced_compiler_order(['a', 'b', 'c'], random.Random(3), 1, ['b', 'a'])
+        self.assertEqual(sorted(more), ['a', 'b', 'c'])
+
+
+class HybridPmuProbeTests(unittest.TestCase):
+    def test_actual_report_and_cpu_class_selection(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            for name, cpus in (("cpu_core", "0-15"), ("cpu_atom", "16-27")):
+                (root / name).mkdir()
+                (root / name / "cpus").write_text(cpus)
+            for cpu, pmu in ((0, "cpu_core"), (16, "cpu_atom")):
+                with self.subTest(cpu=cpu):
+                    rows = f"259234,,{pmu}/cycles/u,173437,100.00,,\n162988,,{pmu}/instructions/u,173437,100.00,,\n"
+                    result = {"ok": True, "returncode": 0, "stderr": rows, "error": ""}
+                    with mock.patch.object(bench.shutil, "which", return_value="/usr/bin/perf"), \
+                         mock.patch.object(bench, "invoke", return_value=result) as invoke:
+                        status = bench.probe_pmu(True, ["taskset", "-c", str(cpu)], cpu, root)
+                    self.assertTrue(status["available"], status)
+                    self.assertEqual(status["probe_pmu"], pmu)
+                    command = invoke.call_args.args[0]
+                    self.assertEqual(command[:3], ["taskset", "-c", str(cpu)])
+                    self.assertIn(f"{{{pmu}/cycles/,{pmu}/instructions/}}", command)
+                    self.assertIn("--all-user", command)
+
+    def test_bad_hybrid_results_never_become_evidence(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            for name, cpus in (("cpu_core", "0-15"), ("cpu_atom", "16-27")):
+                (root / name).mkdir()
+                (root / name / "cpus").write_text(cpus)
+            good = "123,,cpu_core/cycles/,10,100.00,,\n456,,cpu_core/instructions/,10,100.00,,\n"
+            for data in ("", good.replace("123", "<not counted>"), good.replace("123", "0"),
+                         good.replace("100.00", "94.0"), good + good, good.replace("456", "nan"),
+                         good.replace("cpu_core", "cpu_atom")):
+                with self.subTest(data=data), mock.patch.object(bench.shutil, "which", return_value="perf"), \
+                     mock.patch.object(bench, "invoke", return_value={"ok": True, "returncode": 0,
+                                        "stderr": data, "error": ""}):
+                    self.assertFalse(bench.probe_pmu(True, ["taskset", "-c", "0"], 0, root)["available"])
+            with mock.patch.object(bench.shutil, "which", return_value="perf"):
+                self.assertFalse(bench.probe_pmu(True, [], None, root)["available"])
+                (root / "cpu_core/cpus").write_text("0-15,broken")
+                self.assertFalse(bench.probe_pmu(True, ["taskset", "-c", "0"], 0, root)["available"])
+                (root / "cpu_core/cpus").write_text("0-16")
+                self.assertFalse(bench.probe_pmu(True, ["taskset", "-c", "16"], 16, root)["available"])
+
+    def test_generic_and_disabled_probe(self):
+        with tempfile.TemporaryDirectory() as td:
+            rows = "123,,cycles:u,10,100.00,,\n456,,instructions:u,10,100.00,,\n"
+            with mock.patch.object(bench.shutil, "which", return_value="perf"), \
+                 mock.patch.object(bench, "invoke", return_value={"ok": True, "returncode": 0,
+                                    "stderr": rows, "error": ""}):
+                self.assertTrue(bench.probe_pmu(True, ["taskset", "-c", "0"], 0, Path(td))["available"])
+                self.assertFalse(bench.probe_pmu(False, sysfs=Path(td))["available"])
+
+
+class DurationSensitivityTests(unittest.TestCase):
+    def test_short_samples_remain_visible_but_not_in_secondary_diagnostic(self):
+        def entry(name, lccc, gcc, ratio):
+            return {"name": name, "runtime": {"lccc": {"wall": {"median": lccc}},
+                    "gcc": {"wall": {"median": gcc}}},
+                    "correctness": {"lccc": {"matches_baseline": True}, "gcc": {"matches_baseline": True}},
+                    "ratios_to_gcc": {"lccc": {"median": ratio}}}
+        entries = [entry("short", .001, .1, .01), entry("long", .10, .1, 1.0)]
+        self.assertEqual(bench.aggregate_lccc_vs_gcc(entries)["n_correct_benchmarks"], 2)
+        result = bench.duration_sensitivity(entries)
+        self.assertEqual(result["included"], ["long"])
+        self.assertEqual(result["excluded_short_or_unknown"], ["short"])
+        self.assertEqual(result["aggregate"]["geometric_mean_ratio"], 1.0)
+        self.assertIn("not a replacement", result["interpretation"])
+
+
 class BenchmarkHarnessTests(unittest.TestCase):
     def test_instrumentation_merges_identity_with_explicit_size_overrides(self):
         sys.path.insert(0, str(ROOT / 'scripts'))
@@ -182,10 +270,6 @@ class BenchmarkHarnessTests(unittest.TestCase):
         self.assertEqual(paired_ab.summarise('test', raw)['samples_ms'], raw)
 
 
-if __name__ == '__main__':
-    unittest.main()
-
-
 class FlagValuedOptionParsing(unittest.TestCase):
     """`--opt`/`--cflag` take a compiler flag, so every legal value begins with
     a hyphen and argparse's default reading of the space-separated form is
@@ -231,3 +315,6 @@ class FlagValuedOptionParsing(unittest.TestCase):
             bench.build_arg_parser().parse_args(
                 bench.normalize_flag_valued_options(["--reps", "9", "--opt"])
             )
+
+if __name__ == '__main__':
+    unittest.main()

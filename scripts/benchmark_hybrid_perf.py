@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import random
 import shlex
+import statistics
 import shutil
 import subprocess
 import sys
@@ -126,6 +127,45 @@ def counter_status(text: str, pmu: str | None) -> tuple[bool, str]:
     return True, 'all four counters present; running >=95%'
 
 
+def summarize_perf(rounds: list[dict], pmu: str | None, seed: int) -> dict:
+    """Summarize only complete, correctness-checked pairs; retain raw rows elsewhere."""
+    if not rounds or any(set(r) != {'lccc', 'gcc'} or not all(x.get('ok') for x in r.values()) for r in rounds):
+        return {'complete': False, 'reason': 'missing or failed measured pair; no ratios computed'}
+    pairs = []
+    for pair in rounds:
+        counts = {}
+        for compiler, obs in pair.items():
+            ok, why = counter_status(obs.get('perf_csv', ''), pmu)
+            if not ok:
+                return {'complete': False, 'reason': f'{compiler}: {why}'}
+            values = {}
+            for row in csv.reader(obs['perf_csv'].splitlines(), delimiter=';'):
+                if len(row) < 3:
+                    continue
+                label = row[2].strip().removesuffix(':u').removesuffix(':k')
+                if label.endswith(('/u', '/k')):
+                    label = label[:-1]
+                for event in ('cycles', 'instructions', 'branches', 'branch-misses'):
+                    if label == (f'{pmu}/{event}/' if pmu else event):
+                        values[event] = float(row[0].strip())
+            counts[compiler] = values
+        pairs.append(counts)
+    result = {'complete': True, 'n': len(pairs), 'metrics': {},
+              'method': 'median of within-round LCCC/GCC counter ratios; balanced two-round order; perf rounds independent of wall timing',
+              'caveat': 'startup included; user-space counters; within-core-class only; no whole-application claim'}
+    if len(pairs) < 7:
+        result['warning'] = 'fewer than seven paired PMU rounds; no confidence interval reported'
+    for event in ('cycles', 'instructions', 'branches', 'branch-misses'):
+        if any(pair['gcc'][event] <= 0 for pair in pairs):
+            result['metrics'][event] = {'ratio': None, 'reason': 'zero GCC denominator'}
+            continue
+        values = [pair['lccc'][event] / pair['gcc'][event] for pair in pairs]
+        result['metrics'][event] = {'median_ratio': statistics.median(values), 'paired_ratios': values,
+            'median_ci95_bootstrap': bench.bootstrap_median_ci(values, bench.stable_seed(str(seed), event))
+            if len(values) >= 7 else None}
+    return result
+
+
 def publish(path: Path, data: str):
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, name = tempfile.mkstemp(prefix='.' + path.name + '.', dir=path.parent)
@@ -147,19 +187,55 @@ def run_perf(perf: str, cpu: int, pmu: str | None, binary: Path, timeout: int, e
         command = ['taskset', '-c', str(cpu), perf, 'stat', '--all-user', '--no-big-num', '-x', ';',
                    '-o', str(csvfile), *event_args(pmu), '--', str(binary)]
         try:
-            p = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               timeout=timeout, env=bench.controlled_environment(), cwd=ROOT)
-            stdout_hash = hashlib.sha256(p.stdout).hexdigest()
-            text = csvfile.read_text(errors='replace') if csvfile.exists() else ''
+            p = bench.process.run(command, timeout, cwd=ROOT, env=bench.controlled_environment(),
+                                  output_limit=1024 * 1024)
+            stdout_hash = p['stdout_sha256']
+            text = ''
+            too_large = False
+            if csvfile.exists():
+                with csvfile.open('rb') as f:
+                    raw = f.read(256 * 1024 + 1)
+                too_large = len(raw) > 256 * 1024
+                text = raw[:256 * 1024].decode('utf-8', errors='replace')
             ok, why = counter_status(text, pmu)
-            if p.returncode != 0:
-                ok, why = False, f'perf/program exit {p.returncode}; {why}'
+            if too_large:
+                ok, why = False, 'perf CSV exceeded 256 KiB; retained prefix only'
+            if p['failure']:
+                ok, why = False, f'perf/program execution failed: {p["failure"]}; {why}'
+            elif p['returncode'] != 0:
+                ok, why = False, f'perf/program exit {p["returncode"]}; {why}'
             if expected is not None and stdout_hash != expected:
                 ok, why = False, f'benchmark stdout differs from correctness run; {why}'
-            return {'ok': ok, 'reason': why, 'command': command, 'returncode': p.returncode,
-                    'stdout_sha256': stdout_hash, 'stderr': p.stderr.decode(errors='replace'), 'perf_csv': text}
-        except subprocess.TimeoutExpired:
-            return {'ok': False, 'reason': f'timeout after {timeout}s', 'command': command}
+            return {'ok': ok, 'reason': why, 'command': command, 'returncode': p['returncode'],
+                    'stdout_sha256': stdout_hash, 'stderr': p['stderr'].decode(errors='replace'), 'perf_csv': text,
+                    'execution_failure': p['failure']}
+        except OSError as exc:
+            return {'ok': False, 'reason': f'perf execution or evidence read failed: {exc}', 'command': command}
+
+
+
+def capture_source_delta(root: Path, artifacts: Path) -> dict:
+    """Retain bounded tracked Git changes; never pretend untracked files are included."""
+    git = shutil.which('git')
+    if not git:
+        return {'available': False, 'reason': 'git unavailable; retain exact source tree separately'}
+    try:
+        check = bench.process.run([git, 'rev-parse', '--show-toplevel'], 15, cwd=root)
+        if check['failure'] or check['returncode'] != 0 or Path(os.fsdecode(check['stdout']).strip()).resolve() != root.resolve():
+            return {'available': False, 'reason': 'source root is not the Git worktree root; retain exact source tree separately'}
+        diff = bench.process.run([git, 'diff', '--binary', '--no-ext-diff', 'HEAD', '--'], 30,
+                                 cwd=root, output_limit=16 * 1024 * 1024)
+        untracked = bench.process.run([git, 'ls-files', '--others', '--exclude-standard', '-z'], 30,
+                                      cwd=root, output_limit=1024 * 1024)
+        if diff['failure'] or diff['returncode'] != 0 or untracked['failure'] or untracked['returncode'] != 0:
+            return {'available': False, 'reason': 'git snapshot failed or exceeded its output limit; retain source tree separately'}
+        path = artifacts / 'tracked-source-diff.patch'
+        path.write_bytes(diff['stdout'])
+        names = [os.fsdecode(item) for item in untracked['stdout'].split(b'\0') if item]
+        return {'available': True, 'tracked_diff': str(path), 'tracked_diff_sha256': hashlib.sha256(diff['stdout']).hexdigest(),
+                'untracked_files': names, 'warning': 'untracked file contents are not included; retain them separately' if names else None}
+    except (OSError, ValueError) as exc:
+        return {'available': False, 'reason': f'source snapshot unavailable: {exc}'}
 
 
 def main(argv=None):
@@ -169,7 +245,7 @@ def main(argv=None):
     ap.add_argument('--output', type=Path, required=True, help='human-readable .txt report')
     ap.add_argument('--artifacts', type=Path, required=True, help='persistent evidence directory (must be new)')
     ap.add_argument('--reps', type=int, default=9)
-    ap.add_argument('--perf-reps', type=int, default=3)
+    ap.add_argument('--perf-reps', type=int, default=9)
     ap.add_argument('--warmup', type=int, default=2)
     ap.add_argument('--p-cpu', type=int)
     ap.add_argument('--e-cpu', type=int)
@@ -189,13 +265,16 @@ def main(argv=None):
         ap.error(str(exc))
     output = args.output.resolve()
     artifacts = args.artifacts.resolve()
+    source_evidence = capture_source_delta(ROOT, artifacts)
     header = ['LCCC vs GCC: ' + ('selected corpus' if args.only else 'full corpus') + ' / hybrid perf evidence',
               'Started UTC: ' + datetime.now(timezone.utc).isoformat(),
               'Evidence directory: ' + str(artifacts),
+              'Source delta evidence: ' + json.dumps(source_evidence, sort_keys=True),
               'CPU classes (kernel PMU topology intersected with affinity): ' + json.dumps(classes),
               'Times include program startup; short tests and shared machines can be noisy.',
               'Counters are per-task, user-space only, may be scaled; raw CSV includes running percentages.',
-              'No cross-class aggregation; counters and times cannot prove whole-application speedups.', '']
+              'No cross-class aggregation; counters and times cannot prove whole-application speedups.',
+              'PMU and wall rounds are separate; short processes include startup. No values are imputed.', '']
     lines = header + ['RUN IN PROGRESS; NOT COMPLETE\n']
     publish(output, '\n'.join(lines))
     failures = []
@@ -213,6 +292,12 @@ def main(argv=None):
             continue
         directory = artifacts / label.replace(' ', '_').replace('/', '_')
         directory.mkdir()
+        probe = run_perf(perf, cpu, pmu, Path('/bin/true'), 15, None)
+        lines += ['PMU preflight: ' + json.dumps(probe, indent=2), '']
+        if not probe['ok']:
+            failures.append(f'{label}: PMU preflight failed; corpus and counters not collected')
+            publish(output, '\n'.join(lines) + '\nRUN IN PROGRESS; NOT COMPLETE\n')
+            continue
         report = directory / 'corpus.json'
         command = [sys.executable, str(ROOT / 'tests/benchmark/run_benchmarks.py'),
                    '--compilers', 'lccc,gcc', '--lccc', args.lccc, '--gcc', args.gcc,
@@ -239,12 +324,6 @@ def main(argv=None):
         lines += ['Corpus metadata and settings:', json.dumps({k: data.get(k) for k in
                   ('metadata', 'settings', 'compilers', 'unavailable_compilers')}, indent=2),
                   'Corpus summary:', bench.render_terminal(data), '']
-        probe = run_perf(perf, cpu, pmu, Path('/bin/true'), 15, None)
-        lines += ['PMU preflight: ' + json.dumps(probe, indent=2), '']
-        if not probe['ok']:
-            failures.append(f'{label}: PMU preflight failed; counters not collected')
-            publish(output, '\n'.join(lines) + '\nRUN IN PROGRESS; NOT COMPLETE\n')
-            continue
         by_name = {b.name: b for b in bench.BENCHMARKS}
         for entry in data['benchmarks']:
             name = entry['name']
@@ -254,17 +333,26 @@ def main(argv=None):
                 failures.append(f'{label}/{name}: correctness')
                 continue
             rng = random.Random(bench.stable_seed(label, name))
+            measured_rounds = []
+            previous_order = None
             for round_no in range(args.perf_reps):
-                order = ['lccc', 'gcc']
-                rng.shuffle(order)
+                pair = {}
+                order = bench.balanced_compiler_order(['lccc', 'gcc'], rng, round_no, previous_order)
+                previous_order = order
                 for key in order:
                     binary = directory / 'artifacts' / name / key / 'benchmark.bin'
                     runs = entry['runs'][key]
                     expected = runs[0]['stdout_sha256']
                     obs = run_perf(perf, cpu, pmu, binary, by_name[name].timeout_s + 15, expected)
+                    pair[key] = obs
                     lines.append(json.dumps({'round': round_no, 'compiler': key, **obs}, sort_keys=True))
                     if not obs['ok']:
                         failures.append(f'{label}/{name}/{key}/round{round_no}: {obs["reason"]}')
+                measured_rounds.append(pair)
+            summary = summarize_perf(measured_rounds, pmu, bench.stable_seed(label, name))
+            lines.append('PMU paired summary: ' + json.dumps(summary, sort_keys=True))
+            if not summary['complete']:
+                failures.append(f'{label}/{name}: invalid PMU paired summary: {summary["reason"]}')
             publish(output, '\n'.join(lines) + '\nRUN IN PROGRESS; NOT COMPLETE\n')
     lines += ['', 'RESULT: ' + ('FAILED/INCOMPLETE' if failures else 'COMPLETE'),
               'Failures: ' + json.dumps(failures, indent=2),

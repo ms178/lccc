@@ -56,3 +56,35 @@ turbo, background load, thermal state and microcode when making decisions.
 surgical debugging, not a full-corpus claim. Each report is per class; no P/E
 samples are pooled. Wall-clock aggregate is not a proof of full-workload or
 hardware-counter speedup; inspect worst regressions as well as the geomean.
+
+## Evidence quality and hybrid probe
+
+The corpus metadata probe is pinned to the requested CPU and uses its matching
+`cpu_core` or `cpu_atom` PMU. An unidentified or overlapping hybrid topology
+is not guessed. In particular, `cpu_core/cycles/u` is not an unrecognized
+bare `cycles` row, and a probe on a P-core is not evidence for an E-core.
+Counter access is checked **before** the expensive corpus. Failures leave an
+explicit `FAILED/INCOMPLETE` report; do not weaken `perf_event_paranoid` or run
+makepkg as root to hide a failure.
+
+The report includes per-workload PMU paired medians and all raw ratios. The
+wall and PMU samples are independent runs. With at least seven PMU pairs, a
+paired bootstrap interval is included; fewer pairs have an explicit warning
+and no interval. This is a small-sample descriptive interval, not proof that a
+difference generalizes across sessions. The default is nine timing pairs and
+nine PMU pairs. The workload aggregate is sensitive to short and specialized
+cases; the supplementary >=20 ms view is a **sensitivity analysis**, not an
+unbiased replacement score. No short tests or outliers are silently discarded.
+
+Where a Git worktree is available, `evidence/tracked-source-diff.patch` saves
+the bounded tracked delta against the reported HEAD, with its SHA-256 in the
+report. Untracked filenames are disclosed but their contents are **not**
+archived; preserve those files and the original source tree separately. When
+no Git worktree exists the report explicitly says so. Binary hashes, workload
+source hashes, flags, disassembly, topology, and raw measurements remain
+necessary; a diff and a hash alone do not reproduce an experiment.
+
+For a two-compiler comparison, execution order is randomized at the start of
+each two-round block and reversed in the second round. Nine repetitions thus
+balance first/second position within one sample. This limits order imbalance;
+it does not eliminate thermal drift or make adjacent rounds independent.
