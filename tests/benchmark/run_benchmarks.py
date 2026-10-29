@@ -113,8 +113,13 @@ BENCHMARKS: tuple[Benchmark, ...] = (
               ("binary_trees.c",), ("synthetic", "allocation", "recursion"), 120),
     Benchmark("spectral_norm", "spectral norm / dense floating point",
               ("spectral_norm.c",), ("synthetic", "fp", "loop"), 120, ("-lm",)),
+    # Contraction changes the iteration count: a fused FMA rounds once where
+    # the source rounds twice, so an unbounded `-ffp-contract=fast` makes each
+    # compiler's own choice of fused forms decide the escape test. Pinning it
+    # off keeps every arm's output comparable while the timed code, the
+    # arithmetic itself, remains whatever that compiler chooses to emit.
     Benchmark("mandelbrot", "Mandelbrot / FP branch-heavy inner loop",
-              ("mandelbrot.c",), ("synthetic", "fp", "branch"), 120),
+              ("mandelbrot.c",), ("synthetic", "fp", "branch"), 120, ("-ffp-contract=off",)),
     Benchmark("hash_table", "hash table / pointer chasing",
               ("hash_table.c",), ("synthetic", "memory", "branch")),
     Benchmark("strlen_bench", "string operations / byte loops",

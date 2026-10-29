@@ -203,11 +203,15 @@ jobs:
             echo "$?" > "$out/default.exit"
           fi
           test -s "$out/default.json"
+          # Diagnostic only: a control that reproduces a vendor-only difference
+          # must not abort the timing runs that follow. The paired strict gate
+          # below remains authoritative for correctness.
           python3 scripts/diagnose_cpu_fp_mismatch.py \
             --report "$out/default.json" --original-artifacts "$out/default-artifacts" \
             --out "$out/contract-off" \
             --lccc target/fastbuild/lccc --gcc gcc-16 --clang "$CLANG" --icx "$ICX" \
-            --candidate "before=$RUNNER_TEMP/research-main-target/fastbuild/lccc"
+            --candidate "before=$RUNNER_TEMP/research-main-target/fastbuild/lccc" \
+            || echo "pre-timing diagnostic recorded a mismatch control; the paired gate below decides"
       - name: Same-host before/after/vendor portable and native comparisons
         id: paired_runtime
         timeout-minutes: 45

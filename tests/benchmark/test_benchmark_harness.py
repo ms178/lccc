@@ -139,6 +139,12 @@ class BenchmarkHarnessTests(unittest.TestCase):
             self.assertIn('-ffp-contract=off', flags)
             self.assertEqual(flags.count('-DFP_MAP_PASSES=128'), 1)
             self.assertEqual('-DFP_MAP_DOUBLE' in flags, name == 'fp64_product_map')
+        # A fused form rounds once where the source rounds twice, which flips
+        # Mandelbrot's escape test: the measured outputs must not depend on a
+        # vendor compiler's contraction choice.
+        flags = corpus.workload_flags(by_name['mandelbrot'], sizes['mandelbrot'])
+        self.assertEqual(flags.count('-ffp-contract=off'), 1)
+        self.assertIn('-DWIDTH=128', flags)
 
     def test_paired_timing_never_times_crashes_or_changed_output(self):
         sys.path.insert(0, str(ROOT / 'scripts'))
