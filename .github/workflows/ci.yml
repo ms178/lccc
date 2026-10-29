@@ -624,7 +624,9 @@ jobs:
     - name: Check temporary-file symlink isolation
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_temp_symlink.sh
     - name: Verify benchmark harness oracle and timing contracts
-      run: python3 tests/benchmark/test_benchmark_harness.py
+      run: |
+        python3 tests/benchmark/test_benchmark_harness.py
+        python3 scripts/test_benchmark_hybrid_perf.py
     - name: Verify zlib-ng match kernel across optimization levels and ABIs
       run: python3 tests/regression/check_zlib_compare256.py --lccc target/fastbuild/lccc --gcc gcc-16 --m32
     - name: Verify benchmark codegen registry and evidence (mock only)

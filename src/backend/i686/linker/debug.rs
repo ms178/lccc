@@ -125,7 +125,18 @@ pub(super) fn apply_debug_relocations(
     output_sections: &mut [OutputSection],
     global_symbols: &FxHashMap<String, LinkerSymbol>,
     tls_addr: u32,
+    got_base: u32,
 ) -> Result<(), String> {
+    // GOTPC in a retained allocated section requires a real GOT anchor. A
+    // GOTOFF found only in debug information does not itself create one in
+    // GNU ld. Keep rejecting that unproven case instead of inventing a value.
+    let gotpc_in_image = inputs.iter().enumerate().any(|(obj_idx, obj)| {
+        obj.sections.iter().any(|sec| {
+            sec.flags & SHF_ALLOC != 0
+                && section_map.contains_key(&(obj_idx, sec.input_index))
+                && sec.relocations.iter().any(|r| r.1 == R_386_GOTPC)
+        })
+    });
     for (obj_idx, obj) in inputs.iter().enumerate() {
         for sec in &obj.sections {
             if sec.relocations.is_empty() {
@@ -167,6 +178,7 @@ pub(super) fn apply_debug_relocations(
                             // A debug section has address 0, so P is its offset.
                             R_386_PC32 => s_plus_a.wrapping_sub(place),
                             R_386_TLS_LDO_32 => s_plus_a.wrapping_sub(tls_addr),
+                            R_386_GOTOFF if gotpc_in_image => s_plus_a.wrapping_sub(got_base),
                             other => {
                                 return Err(format!(
                                     "{}: relocation type {other} in {} is not supported \
