@@ -2321,6 +2321,39 @@ pub(crate) fn run_passes(
             total_changes_excl_dce += n;
         }
 
+        // The AVX2 strided-I32 reducer needs the original IV step and
+        // guard-safe scalar remainder. Give that narrowly-scoped matcher first
+        // refusal before early scalar unrolling rewrites the IV increment.
+        // All other loops are unchanged and continue through the unroller.
+        if iter == 0
+            && opt_level >= 2
+            && !optimize_for_size
+            && !dis.unroll
+            && matches!(target, crate::backend::Target::X86_64)
+            && !pass_disabled(&disabled, "vectorize")
+        {
+            let symbol_facts = module_symbol_facts::ModuleSymbolFacts::from_module(module, pic);
+            let n = timed_pass!(
+                "vectorize_strided_reduce_pre_unroll",
+                run_on_visited(
+                    module,
+                    &dirty,
+                    &mut changed,
+                    |f: &mut crate::ir::reexports::IrFunction| {
+                        let feats = f.target_features.clone();
+                        with_function_x86_vec_isa(target, x86_isa, x86_avx512vl, &feats, |_| {
+                            vectorize::vectorize_strided_i32_reductions_before_unroll(
+                                f,
+                                &symbol_facts,
+                            )
+                        })
+                    }
+                )
+            );
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
         // Phase 2b: Loop unrolling — iter 0 only, before GVN/LICM so that
         // subsequent passes can optimize the unrolled copies.
         // Pass name for CCC_DISABLE_PASSES: "unroll"

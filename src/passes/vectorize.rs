@@ -35056,6 +35056,49 @@ pub(crate) fn vectorize_function_late_with_symbol_facts(
     )
 }
 
+/// Run the strided-I32 reduction matcher before the early loop unroller.
+///
+/// The later full vectorizer is intentionally preceded by scalar unrolling to
+/// expose map/SLP opportunities, but this reduction matcher models the original
+/// IV step and its guard-page-safe scalar remainder. Letting the unroller
+/// rewrite that step first turns (for example) 8 into 128 and makes the proven
+/// AVX2 transform miss its intended loop. This narrow entry only applies the
+/// strided reducer; every decline leaves the function untouched for the
+/// ordinary unroll/vectorize pipeline.
+pub(crate) fn vectorize_strided_i32_reductions_before_unroll(
+    func: &mut IrFunction,
+    symbol_facts: &ModuleSymbolFacts,
+) -> usize {
+    if super::fp_environment_blocks_reordering(func) || !x86_avx2_available() {
+        return 0;
+    }
+    let mut total = 0usize;
+    for _ in 0..16 {
+        let cfg = CfgAnalysis::build(func);
+        let loops = loop_analysis::find_merged_natural_loops(
+            cfg.num_blocks,
+            &cfg.preds,
+            &cfg.succs,
+            &cfg.idom,
+        );
+        let mut changed = 0usize;
+        for lp in &loops {
+            changed = strided_i32_reduce::try_transform(func, lp, &cfg, symbol_facts);
+            if changed > 0 {
+                break;
+            }
+        }
+        total += changed;
+        if changed == 0 {
+            break;
+        }
+    }
+    if total > 0 {
+        crate::passes::dce::eliminate_dead_code(func);
+    }
+    total
+}
+
 /// Pre-unroll CONST-TRIP map vectorization.
 ///
 /// The complete unroller (Phase 2b, iter 0) runs BEFORE the Phase 2b-vec
