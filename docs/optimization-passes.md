@@ -35,6 +35,34 @@ passes; the backend peepholes are documented per backend
   with escaping, ambiguous, volatile, or otherwise unowned uses. Set
   `CCC_NO_SRET_COPY_ELISION` (presence-based, including an empty value) to
   disable both pipeline invocations for diagnosis.
+- **Two-block reduction unrolling** (`loop_unroll.rs`, Pass B) — guard-free
+  k-body unroll of a two-block counted loop, k | trip. Two profit reasons
+  admit a load-only latch whose k copies stay a single chain: a private
+  **unsigned** accumulation (`loop_unroll_reduction.rs`, which then balances
+  the additions) and, since the 2026-10-29 audit, a **serial carried
+  accumulator of any type** — `acc = acc + x`, one accumulation per iteration,
+  one use of the back-edge value. The second reason is what makes strict-FP
+  reductions unrollable: the k bodies are threaded, so the association order is
+  unchanged and no fast-math permission is needed. Measured with callgrind on
+  `reduction_vecreg` (corpus worst row): 3,277,948,036 → 1,803,403,033
+  instructions, ratio 1.905 → 1.048 against GCC 16.2. Gate:
+  `tests/regression/check_fp_reduction_unroll.sh` (shape + bit-exact results
+  across `-O0`/`-O1`/`-O2`/`-O3`/`-mno-avx`/`-march=x86-64-v3`, every trip
+  residue modulo 8, association-sensitive payloads).
+- **Constant-trip before the vectorizer** (`run_passes`, "Phase 2b-pre-vec") —
+  IPCP also runs *before* iteration 0's vectorizer and post-vectorize unroller,
+  not only at the end of each iteration. Without it a callee whose trip count
+  only becomes constant when its `n` parameter is specialized (the ubiquitous
+  `sum(const T *v, int n)` shape with one call site) is a dynamic-trip loop for
+  both, and by iteration 1 `loop_rotate` has already rewritten it into the
+  rotated self-loop form that no unroller accepts — so those callees never got
+  unrolled at all. The late IPCP stays (call-site simplification still wants the
+  end-of-iteration position); the early call is idempotent. It is placed after
+  the Early unroller on purpose: earlier placement perturbed shapes that the
+  store-motion and segment-SIB contracts depend on (measured: those gates'
+  fixtures then unrolled completely, which is why the two gates now state their
+  contract for what it is — see `check_loop_store_motion.sh`'s `UNROLLED` arm
+  and `check_seg_gs_runtime.sh`'s `CCC_DISABLE_PASSES=ipcp` shape build).
 - **DSE** (`dse.rs`) — same-block dead-store elimination with closed-alloca
   escape analysis and byte-range kills (`CCC_NO_DSE`).
 - **Backedge PRE** — integer recurrences default-on (1.14x measured);
@@ -406,6 +434,25 @@ double dot = 0.0;
 for (int i = 0; i < n; i++)
     dot += a[i] * b[i];
 ```
+
+### What deliberately stays scalar
+
+- **64-bit multiplies** (I64/U64 `Mul`, in a map or as a dot-product lane op).
+  No SSE2/AVX2 instruction produces a 64x64 low-half product (`vpmullq` is
+  AVX-512DQ), so `VecMulI64x2` is a 13-instruction emulation per **two** lanes —
+  6.5 instructions per lane against one scalar `imulq` — and the emulated
+  value's live range is long enough that its operand also lands in a stack
+  slot. callgrind on `unsigned_reduction`'s `dot_u64`: 291,009,947 instructions
+  against 202,784,913 for GCC 16.2's **scalar** loop (+50.3M `movq` lane
+  extractions, +77.6M `movdqu` spills, +33.6M `pshufd`). Refusing the shape
+  drops that program to 175,665,816 instructions (ratio 0.866 vs GCC) with
+  identical results. 64-bit **sums** keep their packed form: `paddq` is a real
+  instruction and that shape wins. `tests/regression/check_unsigned_reduction_codegen.sh`
+  pins both halves of the rule.
+- **Strict-FP reassociation.** A horizontal FP add tree changes the summation
+  order, so FP reductions either unroll as a *threaded* chain (see the
+  two-block reduction unrolling note) or wait for `-ffast-math`
+  (`fp_reassoc`) — never a reassociated packed tree.
 
 ### Transformation Strategy
 

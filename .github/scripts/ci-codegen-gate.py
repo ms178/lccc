@@ -24,6 +24,19 @@ bands. A metric may regress at most its tolerance (default 2%) without
 an explicit baseline refresh; improvements update the baseline via
 --update-baseline in the PR that lands them.
 
+Baseline notes (2026-10-29): the checked-in numbers were a stale snapshot —
+`--update-baseline` re-pins a broad improvement that shipped without a refresh
+(gzip_crc32 64→60 insns and 4→3 pushes, adler32 202→195 insns and 6→0 stack
+operands, expat_xml_scan 178→165, zstd_count 115→101 and 8→2, chacha20_block
+192→184 and 8→4, portable_bit_counts 236→227). One metric moved the other way
+and is intentional: `stencil5` 105→114 insns. That workload's final checksum
+loop (`for (i…) checksum += output[i]`) is a single carried FP accumulator with
+a constant trip, so the two-block reducer now unrolls it 4x: +3 static `addsd`
+per group in exchange for one compare/branch per four elements. Measured with
+callgrind on the same binary: 246,951,674 → 246,705,917 executed instructions
+(−245,757) with byte-identical output. Static size is the wrong metric for an
+unroll; the gate keeps the new number as its floor.
+
 Usage:
     python3 ci-codegen-gate.py --lccc target/fastbuild/lccc
     python3 ci-codegen-gate.py --lccc ... --update-baseline

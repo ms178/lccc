@@ -1832,6 +1832,10 @@ jobs:
         CCC: target/fastbuild/lccc
         REF: gcc-16
       run: bash tests/regression/check_vectorize_saturating_subtract.sh
+    - name: Verify strict-FP reduction unrolling
+      env:
+        CCC: target/fastbuild/lccc
+      run: bash tests/regression/check_fp_reduction_unroll.sh
     - name: Verify byte-compare window phase
       env:
         CCC: target/fastbuild/lccc

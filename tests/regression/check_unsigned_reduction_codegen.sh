@@ -44,7 +44,6 @@ must_vectorize = {
     "sum_u32_u32iv": (r"[vp]*paddd", r"[vp]*paddd"),
     "sum_u64": (r"[vp]*paddq", r"[vp]*paddq"),
     "dot_u32": (r"pmul(?:ld|udq)", r"vpmulld"),
-    "dot_u64": (r"[vp]*paddq", r"[vp]*paddq"),
 }
 for name, (sse2_pat, avx2_pat) in must_vectorize.items():
     for text, pat, level in (
@@ -62,12 +61,35 @@ for name, (sse2_pat, avx2_pat) in must_vectorize.items():
             raise SystemExit(f"{name} gained a signed exit predicate at {level}")
 
 # Functions that must stay scalar (no packed integer vector mnemonic at all).
-must_stay_scalar = ("widen_u32_to_u64", "guarded_u32", "sum_u32_le")
+#
+# `dot_u64` belongs here on COST, not on legality: the 64-bit products are
+# computable in packed form (pmuludq on the even lanes plus the odd-lane
+# shuffle), but no SSE2/AVX2 instruction produces a 64x64 low-half product
+# (`vpmullq` is AVX-512DQ), so `VecMulI64x2` is a 13-instruction emulation per
+# TWO lanes -- 6.5 instructions per lane against one scalar `imulq`, and the
+# value's live range is long enough that the vector operand also has to go
+# through a stack slot.  callgrind on `unsigned_reduction` measured the
+# vectorized form at 291,009,947 instructions versus 202,784,913 for GCC 16.2's
+# SCALAR loop (ratio 1.435: +50.3M movq lane extractions, +77.6M movdqu spills,
+# +33.6M pshufd).  Refusing the shape drops the program to 175,665,816
+# instructions (ratio 0.866) with identical results.  The SUM kernels keep
+# their packed form: `paddq` is a real instruction and that shape wins.
+must_stay_scalar = ("widen_u32_to_u64", "guarded_u32", "sum_u32_le", "dot_u64")
 for name in must_stay_scalar:
     for text, level in ((sse2, "SSE2"), (avx2, "AVX2")):
         b = body(text, name)
         if re.search(r"[vp]?(?:padd|pmul|psub|por|pand|pxor)", b):
             raise SystemExit(f"{name} unexpectedly vectorized at {level}")
+
+# ...and it must not reach the 64-bit multiply emulation by another route: a
+# `movq`/`pshufd`/`imulq`/`punpcklqdq` lane build around a `paddq` would be the
+# same pessimization wearing the sum's mnemonic.
+for text, level in ((sse2, "SSE2"), (avx2, "AVX2")):
+    b = body(text, "dot_u64")
+    if re.search(r"\bpunpcklqdq\b", b) and re.search(r"\bimulq\b", b):
+        raise SystemExit(
+            f"dot_u64 rebuilt the 64-bit multiply emulation at {level}"
+        )
 
 # The signed control kernel keeps its existing packed form.
 for text, level, pat in (
