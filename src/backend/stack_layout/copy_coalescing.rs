@@ -1714,6 +1714,7 @@ fn is_two_operand_binary(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
             | O::VecMaxU8x16
             | O::VecAddI16x8
             | O::VecSubI16x8
+            | O::VecSubSatU16x8
             | O::VecMulI16x8
             | O::VecMinI16x8
             | O::VecMaxI16x8
@@ -1927,6 +1928,7 @@ fn is_two_operand_binary(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
             | O::VecMaddwdI16x16
             | O::VecAddI16x16
             | O::VecSubI16x16
+            | O::VecSubSatU16x16
             | O::VecMulI16x16
             | O::VecMinI16x16
             | O::VecMaxI16x16
@@ -1992,6 +1994,7 @@ fn is_vec_ssa_producer(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
             | O::VecBroadcastI8x16
             | O::VecAddI16x16
             | O::VecSubI16x16
+            | O::VecSubSatU16x16
             | O::VecMulI16x16
             | O::VecCmpI16x16
             | O::VecMinI16x16
@@ -2001,6 +2004,7 @@ fn is_vec_ssa_producer(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
             | O::VecBlendvI16x16
             | O::VecAddI16x8
             | O::VecSubI16x8
+            | O::VecSubSatU16x8
             | O::VecMulI16x8
             | O::VecCmpI16x8
             | O::VecMinI16x8
@@ -2496,6 +2500,7 @@ pub(crate) fn memfold_consumer_128(op: &crate::ir::intrinsics::IntrinsicOp) -> O
         | O::VecSubI64x2
         | O::VecSubI32x4
         | O::VecSubI16x8
+        | O::VecSubSatU16x8
         | O::VecSubI8x16 => Some(false),
         _ => None,
     }

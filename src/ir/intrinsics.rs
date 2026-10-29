@@ -1034,6 +1034,19 @@ pub enum IntrinsicOp {
     VecSubI16x16,
     /// SSE2 lane-wise word subtract: 8×I16/U16 (`psubw`).
     VecSubI16x8,
+    /// AVX2 lane-wise UNSIGNED SATURATING word subtract: 16×U16
+    /// (`vpsubusw`), i.e. `max(a - b, 0)` per lane.
+    ///
+    /// This is the packed form of the `a >= b ? a - b : 0` ternary, which
+    /// every other spelling costs a compare, a sign-bias XOR pair and a
+    /// per-bit select to express.  Distinct from `Psubusw256`, the
+    /// destination-pointer form of the same instruction: the map vectorizer
+    /// emits SSA value results, so it needs a `Vec*` member.
+    VecSubSatU16x16,
+    /// SSE2 lane-wise UNSIGNED SATURATING word subtract: 8×U16
+    /// (`psubusw`); see `VecSubSatU16x16`.
+    VecSubSatU16x8,
+
     /// AVX2 lane-wise word multiply, low half: 16×I16/U16 (`vpmullw`).
     /// Unlike bytes, words DO have a packed multiply, and it is low-half
     /// exact for both signednesses.
@@ -2237,6 +2250,7 @@ impl IntrinsicOp {
             | VecBroadcastI8x16
             | VecAddI16x8
             | VecSubI16x8
+            | VecSubSatU16x8
             | VecMulI16x8
             | VecCmpI16x8
             | VecMinI16x8
@@ -2639,6 +2653,7 @@ impl IntrinsicOp {
                 | IntrinsicOp::VecBroadcastI8x16
                 | IntrinsicOp::VecAddI16x16
                 | IntrinsicOp::VecSubI16x16
+                | IntrinsicOp::VecSubSatU16x16
                 | IntrinsicOp::VecMulI16x16
                 | IntrinsicOp::VecCmpI16x16
                 | IntrinsicOp::VecMinI16x16
@@ -2649,6 +2664,7 @@ impl IntrinsicOp {
                 | IntrinsicOp::VecBroadcastI16x16
                 | IntrinsicOp::VecAddI16x8
                 | IntrinsicOp::VecSubI16x8
+                | IntrinsicOp::VecSubSatU16x8
                 | IntrinsicOp::VecMulI16x8
                 | IntrinsicOp::VecCmpI16x8
                 | IntrinsicOp::VecMinI16x8
@@ -3275,6 +3291,8 @@ mod vector_width_tests {
             "VecMulI16x8" => IntrinsicOp::VecMulI16x8,
             "VecSubI16x16" => IntrinsicOp::VecSubI16x16,
             "VecSubI16x8" => IntrinsicOp::VecSubI16x8,
+            "VecSubSatU16x16" => IntrinsicOp::VecSubSatU16x16,
+            "VecSubSatU16x8" => IntrinsicOp::VecSubSatU16x8,
             "VecMaxI8x32" => IntrinsicOp::VecMaxI8x32,
             "VecMinI8x32" => IntrinsicOp::VecMinI8x32,
             "VecSubI32x4" => IntrinsicOp::VecSubI32x4,

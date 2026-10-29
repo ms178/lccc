@@ -3296,7 +3296,15 @@ impl X86Codegen {
             | IntrinsicOp::Punpckhbw128
             | IntrinsicOp::Punpcklwd128
             | IntrinsicOp::Punpckhwd128 => {
-                if let Some(dptr) = dest_ptr {
+                // The explicit-intrinsic form writes through a memory result
+                // slot (`dest_ptr`); an internal pass may also emit the op in
+                // SSA form, with the result in `dest`.  Honouring only
+                // `dest_ptr` silently DROPPED the instruction for the SSA
+                // form, leaving the result slot unwritten -- code that reads
+                // uninitialised memory with no diagnostic.  Both shapes reach
+                // the same slot/value-aware helper now, so the SSA form emits
+                // the same instruction instead of vanishing.
+                if let Some(dptr) = dest_ptr.as_ref().or(dest.as_ref()) {
                     let inst = match op {
                         IntrinsicOp::Paddw128 => "paddw",
                         IntrinsicOp::Psubw128 => "psubw",
@@ -6668,6 +6676,19 @@ impl X86Codegen {
             IntrinsicOp::VecSubI16x8 => {
                 if let Some(d) = dest {
                     self.emit_sse_binary_128(d, args, "psubw");
+                }
+            }
+            // Unsigned saturating subtract: the packed floor at zero that the
+            // `a >= b ? a - b : 0` ternary needs.  Both widths are baseline
+            // SSE2, so unlike the min/max folds there is no SSE4.1 gate.
+            IntrinsicOp::VecSubSatU16x16 => {
+                if let Some(d) = dest {
+                    self.emit_avx_binary_256(d, args, "vpsubusw", false);
+                }
+            }
+            IntrinsicOp::VecSubSatU16x8 => {
+                if let Some(d) = dest {
+                    self.emit_sse_binary_128(d, args, "psubusw");
                 }
             }
             // Words DO have a packed multiply (bytes do not); `pmullw` keeps

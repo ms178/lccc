@@ -7146,6 +7146,11 @@ struct MapEmitCtx<'a> {
     cmp_op: &'a dyn Fn(&IrCmpOp) -> Option<(IntrinsicOp, i32)>,
     minmax_op: &'a dyn Fn(bool) -> Option<IntrinsicOp>,
     blendv_op: Option<IntrinsicOp>,
+    /// Packed UNSIGNED saturating subtract for the loop's lane type, when one
+    /// exists (`psubusb`/`psubusw` at byte/word lanes; x86 has no dword form,
+    /// so `U32`/`I32` lanes leave this `None`).  Used by the emitter to fold
+    /// the saturating-subtract ternary into a single instruction.
+    subsat_op: Option<IntrinsicOp>,
     /// Every emitted node, keyed by its tree shape: identical subexpressions
     /// (reused loads, shared compares) emit exactly once — free CSE keeps
     /// e.g. a clamp tree at one load instead of three.
@@ -7326,6 +7331,36 @@ impl<'a> MapEmitCtx<'a> {
                 Some(dest)
             }
             MapExpr::Select(cond, t, f) => {
+                // Unsigned saturating subtract: `a >= b ? a - b : 0` over
+                // byte or word lanes is one `psubusb`/`psubusw`.  Left to the
+                // generic path it costs a compare (two sign-bias XORs on
+                // SSE2, `pcmpgtw` and the mask inversion), a `psubw`, and a
+                // per-bit select -- thirteen instructions for what the ISA
+                // does in one.  This is the zlib-ng slide-hash loop, where
+                // the expansion measured 2.67x GCC's instruction count.
+                //
+                // The fold is exact, not an approximation: for unsigned
+                // lanes `psubusX`'s zero floor IS the false arm, and the
+                // equal-operand case yields 0 on both sides, which is why
+                // the strict predicates (`Ugt`/`Ult`) fold too even though
+                // they differ from the non-strict ones exactly where the
+                // result is 0.
+                if let Some(op) = self.subsat_op {
+                    if let Some((l, r)) = saturating_sub_operands(cond, t, f) {
+                        let lv = self.emit(l)?;
+                        let rv = self.emit(r)?;
+                        let dest = self.fresh();
+                        // args [l, r] lower to `psubusX r, l, dst`: r is the
+                        // subtrahend, which is the second source operand.
+                        self.vec_insts.push(Instruction::Intrinsic {
+                            dest: Some(dest),
+                            op,
+                            dest_ptr: None,
+                            args: vec![Operand::Value(lv), Operand::Value(rv)],
+                        });
+                        return Some(dest);
+                    }
+                }
                 // False, then true, then the mask LAST: the mask is usually a
                 // just-emitted compare whose result still lives in %ymm0 —
                 // the blendv emitter resolves the mask first (cache hit) and
@@ -7376,6 +7411,26 @@ impl<'a> MapEmitCtx<'a> {
                 Some(dest)
             }
             MapExpr::BinOp(op, l, r) => {
+                // `max(a, b) - b` and `a - min(a, b)` are the saturating
+                // subtract again, in the form the min/max fold produces:
+                // the larger operand minus the smaller is `a - b` when
+                // `a >= b` and exactly 0 otherwise.  AVX2 word loops reach
+                // the emitter this way (`vpmaxuw` + `vpsubw`, two packed
+                // ops); they become the single `vpsubusw`.
+                if let (Some(sat), IrBinOp::Sub) = (self.subsat_op, op) {
+                    if let Some((x, y)) = saturating_sub_from_minmax(l, r) {
+                        let lv = self.emit(x)?;
+                        let rv = self.emit(y)?;
+                        let dest = self.fresh();
+                        self.vec_insts.push(Instruction::Intrinsic {
+                            dest: Some(dest),
+                            op: sat,
+                            dest_ptr: None,
+                            args: vec![Operand::Value(lv), Operand::Value(rv)],
+                        });
+                        return Some(dest);
+                    }
+                }
                 // Contract-legal fusion (same gate as the affine path): a
                 // mul feeding an add fuses into the 3-operand madd when the
                 // other addend is not itself a mul (a*b + c*d has no single
@@ -12364,6 +12419,7 @@ fn transform_byte_count_reduction_inner(
             cmp_op: &cmp_op,
             minmax_op: &minmax_op,
             blendv_op,
+            subsat_op: saturating_sub_op(&IrType::U8, ymm),
             narrow_const_bytes: Some(1),
             byte_broadcast_op: Some(if ymm {
                 IntrinsicOp::VecBroadcastI8x32
@@ -15583,6 +15639,117 @@ fn map_elem_size(elem_ty: &IrType) -> Option<u32> {
         IrType::I16 | IrType::U16 => Some(2),
         _ => None,
     }
+}
+
+/// Packed unsigned saturating subtract for a lane type, when the map
+/// vocabulary has one.
+///
+/// `psubusw` floors a lane at zero instead of wrapping, which is exactly the
+/// value of the `a >= b ? a - b : 0` ternary over unsigned lanes.
+///
+/// Word lanes only.  Byte lanes never reach the map emitter today (a byte map
+/// is admitted only for 0/1 reduction trees, and a saturating subtract is not
+/// one), and dword lanes have no packed saturating form at any width, so both
+/// keep the compare+blend spelling rather than naming an instruction the
+/// backend cannot encode.
+fn saturating_sub_op(elem_ty: &IrType, ymm: bool) -> Option<IntrinsicOp> {
+    match (elem_ty, ymm) {
+        (IrType::U16, true) => Some(IntrinsicOp::VecSubSatU16x16),
+        (IrType::U16, false) => Some(IntrinsicOp::VecSubSatU16x8),
+        _ => None,
+    }
+}
+
+/// The constant zero arm of a select, as the map tree spells it.
+fn map_expr_is_const_zero(e: &MapExpr) -> bool {
+    matches!(e, MapExpr::Invariant(Operand::Const(c)) if c.to_i64() == Some(0))
+}
+
+/// Recognise `l - r` as a saturating subtract spelled through a min/max:
+/// `max(x, y) - y` and `x - min(x, y)` both equal `sat(x, y)` for unsigned
+/// lanes (when `x >= y` they are `x - y`, otherwise the min/max arm subtracts
+/// the value from itself).
+fn saturating_sub_from_minmax<'e>(
+    l: &'e MapExpr,
+    r: &'e MapExpr,
+) -> Option<(&'e MapExpr, &'e MapExpr)> {
+    let max_sub = |e: &'e MapExpr, other: &'e MapExpr| match e {
+        MapExpr::MinMax { is_max: true, l, r } => {
+            // `max(a, b) - b` and `max(a, b) - a` are both `sat(a, b)` up to
+            // which operand is named first; return the pair whose second
+            // element is the subtrahend.
+            if r.as_ref() == other {
+                Some((l.as_ref(), r.as_ref()))
+            } else if l.as_ref() == other {
+                Some((r.as_ref(), l.as_ref()))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    if let Some(pair) = max_sub(l, r) {
+        return Some(pair);
+    }
+    // `x - min(x, y)` / `x - min(y, x)`.
+    if let MapExpr::MinMax { is_max: false, l: a, r: b } = r {
+        if b.as_ref() == l {
+            return Some((l, a.as_ref()));
+        }
+        if a.as_ref() == l {
+            return Some((l, b.as_ref()));
+        }
+    }
+    None
+}
+
+/// Recognise `cond ? t : f` as an unsigned saturating subtract, returning its
+/// `(minuend, subtrahend)` subexpressions.
+///
+/// `sat(x, y) = x >= y ? x - y : 0` has two equivalent select spellings, one
+/// per arm order:
+///
+/// * `cond ? x - y : 0` needs `cond` to mean `x >= y`;
+/// * `cond ? 0 : x - y` needs `cond` to mean `x <= y`.
+///
+/// Each accept-spec (GE / LE) is satisfied by the non-strict and the strict
+/// unsigned predicate on the same operands, in either operand order, because
+/// the two predicates differ only where `x == y` and both spellings produce
+/// 0 there (`psubusX` and the zero arm agree).  Signed lanes are refused: the
+/// sign-bias algebra `psubsw` implements is a different function, and no
+/// packed saturating subtract exists for them.
+fn saturating_sub_operands<'e>(
+    cond: &'e MapExpr,
+    t: &'e MapExpr,
+    f: &'e MapExpr,
+) -> Option<(&'e MapExpr, &'e MapExpr)> {
+    let MapExpr::Cmp(op, a, b) = cond else {
+        return None;
+    };
+    let sub_of = |e: &'e MapExpr| match e {
+        MapExpr::BinOp(IrBinOp::Sub, x, y) => Some((x.as_ref(), y.as_ref())),
+        _ => None,
+    };
+    // The arm carrying the subtraction is taken when the comparison is true;
+    // the other arm must be the constant zero the saturating floor produces.
+    let ((x, y), cond_is_ge) = match (sub_of(t), sub_of(f)) {
+        (Some(lr), _) if map_expr_is_const_zero(f) => (lr, true),
+        (_, Some(lr)) if map_expr_is_const_zero(t) => (lr, false),
+        _ => return None,
+    };
+    let ok = matches!(
+        (op, cond_is_ge),
+        // Subtract arm on true: the comparison must mean `x >= y`, spelled
+        // directly or with the operands swapped under the strictness flip.
+        (IrCmpOp::Uge | IrCmpOp::Ugt, true) | (IrCmpOp::Ule | IrCmpOp::Ult, false)
+            if a.as_ref() == x && b.as_ref() == y
+    ) || matches!(
+        (op, cond_is_ge),
+        // ... or the other operand order, where it must mean `x <= y`.
+        (IrCmpOp::Ule | IrCmpOp::Ult, true) | (IrCmpOp::Uge | IrCmpOp::Ugt, false)
+            if a.as_ref() == y && b.as_ref() == x
+    );
+    ok.then_some((x, y))
 }
 
 /// Lane width in bits for the integer element types the map vectorizer
@@ -32390,6 +32557,7 @@ fn transform_map_vector(
             cmp_op: &cmp_op,
             minmax_op: &minmax_op,
             blendv_op,
+            subsat_op: saturating_sub_op(&pattern.elem_ty, avx2),
             narrow_const_bytes: map_elem_size(&pattern.elem_ty).filter(|_| {
                 matches!(
                     pattern.elem_ty,
