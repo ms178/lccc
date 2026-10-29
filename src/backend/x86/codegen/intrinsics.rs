@@ -17,6 +17,19 @@ use crate::backend::state::StackSlot;
 use crate::common::types::IrType;
 use crate::ir::reexports::{IntrinsicOp, IrConst, Operand, Value};
 
+/// Result destination of a value-producing intrinsic.  Source-level `_mm_`
+/// intrinsics write through a memory result slot (`dest_ptr`); internal pass
+/// emission uses the SSA form (`dest`).  Both spellings name the same result,
+/// so every value-producing emitter must honour both: a group that honours
+/// only `dest_ptr` silently drops the instruction for the SSA form and leaves
+/// the result unwritten -- a read of uninitialised memory with no diagnostic.
+/// Every helper reached from a routed group checks `reg_assignments` for the
+/// destination first and falls back to its slot, so both homings emit.
+#[inline]
+fn result_dest<'a>(dest: &'a Option<Value>, dest_ptr: &'a Option<Value>) -> Option<&'a Value> {
+    dest_ptr.as_ref().or(dest.as_ref())
+}
+
 /// Element width selector for the packed integer compare emitter.
 ///
 /// x86 gives `pcmpeq`/`pcmpgt` a suffix per element width and provides NO
@@ -2590,7 +2603,7 @@ impl X86Codegen {
             | IntrinsicOp::AddPd128
             | IntrinsicOp::SubPd128
             | IntrinsicOp::MulPd128 => {
-                if let Some(dptr) = dest_ptr {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
                     let inst = match op {
                         IntrinsicOp::Pcmpeqb128 => "pcmpeqb",
                         IntrinsicOp::Pcmpeqd128 => "pcmpeqd",
@@ -2618,7 +2631,7 @@ impl X86Codegen {
                 }
             }
             IntrinsicOp::SetEpi8 => {
-                if let Some(dptr) = dest_ptr {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
                     self.operand_to_reg(&args[0], "rax");
                     self.state.emit("    movd %eax, %xmm0");
                     self.state.emit("    punpcklbw %xmm0, %xmm0");
@@ -2628,7 +2641,7 @@ impl X86Codegen {
                 }
             }
             IntrinsicOp::SetEpi32 => {
-                if let Some(dptr) = dest_ptr {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
                     self.operand_to_reg(&args[0], "rax");
                     self.state.emit("    movd %eax, %xmm0");
                     self.state.emit("    pshufd $0, %xmm0, %xmm0");
@@ -3150,7 +3163,7 @@ impl X86Codegen {
             | IntrinsicOp::Aesenclast128
             | IntrinsicOp::Aesdec128
             | IntrinsicOp::Aesdeclast128 => {
-                if let Some(dptr) = dest_ptr {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
                     let inst = match op {
                         IntrinsicOp::Aesenc128 => "aesenc",
                         IntrinsicOp::Aesenclast128 => "aesenclast",
@@ -3163,7 +3176,7 @@ impl X86Codegen {
             }
             // AES-NI unary: aesimc
             IntrinsicOp::Aesimc128 => {
-                if let Some(dptr) = dest_ptr {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
                     self.sse_load_arg(&args[0], "xmm0");
                     self.state.emit("    aesimc %xmm0, %xmm0");
                     self.sse_store_dest(dptr, "xmm0");
@@ -3171,7 +3184,7 @@ impl X86Codegen {
             }
             // AES-NI: aeskeygenassist with immediate
             IntrinsicOp::Aeskeygenassist128 => {
-                if let Some(dptr) = dest_ptr {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
                     self.sse_load_arg(&args[0], "xmm0");
                     // args[1] is the immediate value
                     let imm = self.operand_to_imm_i64(&args[1]);
@@ -3182,7 +3195,7 @@ impl X86Codegen {
             }
             // CLMUL: pclmulqdq with immediate
             IntrinsicOp::Pclmulqdq128 => {
-                if let Some(dptr) = dest_ptr {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
                     self.sse_load_arg(&args[0], "xmm0");
                     self.sse_load_arg(&args[1], "xmm1");
                     let imm = self.operand_to_imm_i64(&args[2]);
@@ -3196,7 +3209,7 @@ impl X86Codegen {
             | IntrinsicOp::Psrldqi128
             | IntrinsicOp::Psllqi128
             | IntrinsicOp::Psrlqi128 => {
-                if let Some(dptr) = dest_ptr {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
                     let inst = match op {
                         IntrinsicOp::Pslldqi128 => "pslldq",
                         IntrinsicOp::Psrldqi128 => "psrldq",
@@ -3211,11 +3224,15 @@ impl X86Codegen {
             IntrinsicOp::Pshufd128 => {
                 if let Some(dptr) = dest_ptr {
                     self.emit_sse_shuffle_imm_128(dptr, args, "pshufd");
+                } else if dest.is_some() {
+                    panic!(
+                        "x86 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
             // Load low 64 bits, zero upper (MOVQ)
             IntrinsicOp::Loadldi128 => {
-                if let Some(dptr) = dest_ptr {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
                     let mut loaded = false;
                     if let Some(mem) = self.vec_arg_mem(&args[0]) {
                         self.state.emit_fmt(format_args!("    movq {}, %xmm0", mem));
@@ -3245,7 +3262,7 @@ impl X86Codegen {
 
             // Legacy PBLENDVB reads its mask implicitly from XMM0.
             IntrinsicOp::Pblendvb128 => {
-                if let Some(dptr) = dest_ptr {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
                     // args = [a, b, mask]; result = mask ? b : a
                     assert_eq!(args.len(), 3, "Pblendvb128 requires a, b, mask");
                     self.sse_load_arg(&args[2], "xmm0");
@@ -3258,7 +3275,7 @@ impl X86Codegen {
             // PBLENDW: packed 16-bit blend with immediate mask.
             // _mm_blend_epi16(a, b, imm8) → pblendw $imm8, b, a
             IntrinsicOp::Pblendw128 => {
-                if let Some(dptr) = dest_ptr {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
                     // args = [a, b, imm8]; result = blend words per imm8 bits
                     self.sse_load_arg(&args[0], "xmm0");
                     self.sse_load_arg(&args[1], "xmm1");
@@ -3296,7 +3313,7 @@ impl X86Codegen {
             | IntrinsicOp::Punpckhbw128
             | IntrinsicOp::Punpcklwd128
             | IntrinsicOp::Punpckhwd128 => {
-                if let Some(dptr) = dest_ptr {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
                     let inst = match op {
                         IntrinsicOp::Paddw128 => "paddw",
                         IntrinsicOp::Psubw128 => "psubw",
@@ -3335,7 +3352,7 @@ impl X86Codegen {
             // and turned valid _mm_cvtepu8_epi16/_mm_cvtepu16_epi32 programs
             // into a compiler panic.
             IntrinsicOp::Pmovzxbw128 | IntrinsicOp::Pmovzxwd128 => {
-                if let Some(dptr) = dest_ptr {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
                     let inst = if matches!(op, IntrinsicOp::Pmovzxbw128) {
                         "pmovzxbw"
                     } else {
@@ -3388,7 +3405,7 @@ impl X86Codegen {
             }
             // SSE2 variable-shift (count in xmm register)
             IntrinsicOp::Psllw128 | IntrinsicOp::Psrlw128 => {
-                if let Some(dptr) = dest_ptr {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
                     let inst = if matches!(op, IntrinsicOp::Psllw128) {
                         "psllw"
                     } else {
@@ -3406,7 +3423,7 @@ impl X86Codegen {
             // A latent bug where Pabsb128 was dispatched through the binary
             // emitter (panicked / malformed on `_mm_abs_epi8`).
             IntrinsicOp::Pabsb128 | IntrinsicOp::Pabsw128 | IntrinsicOp::Pabsd128 => {
-                if let Some(dptr) = dest_ptr {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
                     let inst = match op {
                         IntrinsicOp::Pabsb128 => "pabsb",
                         IntrinsicOp::Pabsw128 => "pabsw",
@@ -3437,7 +3454,7 @@ impl X86Codegen {
             | IntrinsicOp::Pxor256
             | IntrinsicOp::Por256
             | IntrinsicOp::Pand256 => {
-                if let Some(dptr) = dest_ptr {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
                     let inst = match op {
                         IntrinsicOp::Paddb256 => "vpaddb",
                         IntrinsicOp::Paddw256 => "vpaddw",
@@ -3479,7 +3496,7 @@ impl X86Codegen {
             }
             // vpabsb/vpabsw are UNARY (2-operand AT&T: src, dst).
             IntrinsicOp::Pabsb256 | IntrinsicOp::Pabsw256 => {
-                if let Some(dptr) = dest_ptr {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
                     let inst = if matches!(op, IntrinsicOp::Pabsb256) {
                         "vpabsb"
                     } else {
@@ -3500,7 +3517,7 @@ impl X86Codegen {
             | IntrinsicOp::Psrlidi256
             | IntrinsicOp::Psllwi256
             | IntrinsicOp::Psrlwi256 => {
-                if let Some(dptr) = dest_ptr {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
                     let inst = match op {
                         IntrinsicOp::Psllidi256 => "vpslld",
                         IntrinsicOp::Psrlidi256 => "vpsrld",
@@ -3512,7 +3529,7 @@ impl X86Codegen {
                 }
             }
             IntrinsicOp::Loadu256 | IntrinsicOp::Load256 => {
-                if let Some(dptr) = dest_ptr {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
                     let inst = if matches!(op, IntrinsicOp::Loadu256) {
                         "vmovdqu"
                     } else {
@@ -3531,7 +3548,7 @@ impl X86Codegen {
                 }
             }
             IntrinsicOp::Broadcast128to256 => {
-                if let Some(dptr) = dest_ptr {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
                     // vbroadcasti128 only has a memory-source form. When the
                     // source is slot-resolvable, broadcast from the slot
                     // directly (1 uop on the load port); otherwise spill the
@@ -3555,7 +3572,7 @@ impl X86Codegen {
                 }
             }
             IntrinsicOp::Zext128to256 => {
-                if let Some(dptr) = dest_ptr {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
                     // Zero-extend 128→256: VEX insert of the 128-bit value into
                     // a zeroed ymm. A lone vinserti128 $1 of the same xmm would
                     // DUPLICATE the low lane into the high lane (miscompile).
@@ -3570,14 +3587,14 @@ impl X86Codegen {
                 // Nothing to emit (lowering returns the operand directly).
             }
             IntrinsicOp::Cast256to128 => {
-                if let Some(dptr) = dest_ptr {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
                     self.avx_load_arg(&args[0]);
                     self.state.emit("    vextracti128 $0, %ymm0, %xmm0");
                     self.sse_store_dest(dptr, "xmm0");
                 }
             }
             IntrinsicOp::Insert128to256 => {
-                if let Some(dptr) = dest_ptr {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
                     self.avx_load_arg(&args[0]);
                     self.sse_load_arg(&args[1], "xmm1");
                     let lane = self.operand_to_imm_i64(&args[2]) & 1;
@@ -3592,7 +3609,7 @@ impl X86Codegen {
             | IntrinsicOp::SetEpi16_256
             | IntrinsicOp::SetEpi32_256
             | IntrinsicOp::SetEpi64x256 => {
-                if let Some(dptr) = dest_ptr {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
                     // Constant splats lower to a single memory-source broadcast:
                     //   vpbroadcast{b,w,d,q} .LvcN(%rip), %ymm0
                     // which is 1 uop handled by the load port (the modern best
@@ -3675,7 +3692,7 @@ impl X86Codegen {
             | IntrinsicOp::Dpwuuds256
             | IntrinsicOp::Dpwssd256
             | IntrinsicOp::Dpwssds256 => {
-                if let Some(dptr) = dest_ptr {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
                     let inst = match op {
                         IntrinsicOp::Dpbusd128 | IntrinsicOp::Dpbusd256 => "vpdpbusd",
                         IntrinsicOp::Dpbusds128 | IntrinsicOp::Dpbusds256 => "vpdpbusds",
@@ -3735,7 +3752,7 @@ impl X86Codegen {
             }
             // --- GFNI ---
             IntrinsicOp::Gf2p8mulb128 => {
-                if let Some(dptr) = dest_ptr {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
                     self.sse_load_arg(&args[0], "xmm0");
                     self.sse_load_arg(&args[1], "xmm1");
                     self.state.emit("    gf2p8mulb %xmm1, %xmm0");
@@ -3743,7 +3760,7 @@ impl X86Codegen {
                 }
             }
             IntrinsicOp::Gf2p8affineqb128 | IntrinsicOp::Gf2p8affineinvqb128 => {
-                if let Some(dptr) = dest_ptr {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
                     let inst = if matches!(op, IntrinsicOp::Gf2p8affineqb128) {
                         "gf2p8affineqb"
                     } else {
@@ -3763,7 +3780,7 @@ impl X86Codegen {
             | IntrinsicOp::Aesenclast256
             | IntrinsicOp::Aesdec256
             | IntrinsicOp::Aesdeclast256 => {
-                if let Some(dptr) = dest_ptr {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
                     let inst = match op {
                         IntrinsicOp::Aesenc256 => "vaesenc",
                         IntrinsicOp::Aesenclast256 => "vaesenclast",
@@ -3794,7 +3811,7 @@ impl X86Codegen {
                 }
             }
             IntrinsicOp::Vpclmulqdq256 => {
-                if let Some(dptr) = dest_ptr {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
                     self.avx_load_arg(&args[0]);
                     if let Operand::Value(v) = &args[1] {
                         if let Some(crate::backend::state::SlotAddr::Direct(slot)) =
@@ -3846,7 +3863,7 @@ impl X86Codegen {
             | IntrinsicOp::Punpckhdq128
             | IntrinsicOp::Punpcklqdq128
             | IntrinsicOp::Punpckhqdq128 => {
-                if let Some(dptr) = dest_ptr {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
                     let inst = match op {
                         IntrinsicOp::Paddusb128 => "paddusb",
                         IntrinsicOp::Paddsb128 => "paddsb",
@@ -3873,7 +3890,7 @@ impl X86Codegen {
                 }
             }
             IntrinsicOp::Setzero128 | IntrinsicOp::SetzeroPs128 => {
-                if let Some(dptr) = dest_ptr {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
                     self.state.emit(
                         if matches!(op, IntrinsicOp::SetzeroPs128) || !self.isa.simd {
                             "    xorps %xmm0, %xmm0"
@@ -3928,7 +3945,7 @@ impl X86Codegen {
             | IntrinsicOp::Phaddw256
             | IntrinsicOp::Phaddd256
             | IntrinsicOp::Pmuludq256 => {
-                if let Some(dptr) = dest_ptr {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
                     let (inst, comm) = match op {
                         IntrinsicOp::Pmulld256 => ("vpmulld", true),
                         IntrinsicOp::Psubd256 => ("vpsubd", false),
@@ -3968,7 +3985,7 @@ impl X86Codegen {
                 }
             }
             IntrinsicOp::Setzero256 => {
-                if let Some(dptr) = dest_ptr {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
                     // VEX.128 integer XOR is AVX1 and clears the upper YMM half.
                     self.state.emit("    vpxor %xmm0, %xmm0, %xmm0");
                     self.avx_store_dest(dptr);
@@ -3981,10 +3998,14 @@ impl X86Codegen {
                     self.state
                         .emit_fmt(format_args!("    vextracti128 ${}, %ymm0, %xmm0", lane));
                     self.sse_store_dest(dptr, "xmm0");
+                } else if dest.is_some() {
+                    panic!(
+                        "x86 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
             IntrinsicOp::LoaduPs256 | IntrinsicOp::LoaduPd256 => {
-                if let Some(dptr) = dest_ptr {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
                     self.avx_load_arg(&args[0]);
                     self.avx_store_dest(dptr);
                 }
@@ -3996,7 +4017,7 @@ impl X86Codegen {
                 }
             }
             IntrinsicOp::Permute2x128 => {
-                if let Some(dptr) = dest_ptr {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
                     self.avx_load_arg(&args[0]);
                     self.avx_load_arg_to(&args[1], "ymm1");
                     let imm = self.operand_to_imm_i64(&args[2]);
@@ -4006,7 +4027,7 @@ impl X86Codegen {
                 }
             }
             IntrinsicOp::Permute4x64 => {
-                if let Some(dptr) = dest_ptr {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
                     self.avx_load_arg(&args[0]);
                     let imm = self.operand_to_imm_i64(&args[1]);
                     self.state
@@ -4017,7 +4038,7 @@ impl X86Codegen {
             // VPERMD: dest[i] = src[idx[i] & 7]. AT&T: vpermd %src, %idx, %dest
             // (Intel VPERMD dest, idx, src).
             IntrinsicOp::Permutevar8x32 => {
-                if let Some(dptr) = dest_ptr {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
                     self.avx_load_arg(&args[0]);
                     self.avx_load_arg_to(&args[1], "ymm1");
                     self.state.emit("    vpermd %ymm0, %ymm1, %ymm0");
@@ -4025,7 +4046,7 @@ impl X86Codegen {
                 }
             }
             IntrinsicOp::Pshufd256 => {
-                if let Some(dptr) = dest_ptr {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
                     self.avx_load_arg(&args[0]);
                     let imm = self.operand_to_imm_i64(&args[1]);
                     self.state
@@ -4034,7 +4055,7 @@ impl X86Codegen {
                 }
             }
             IntrinsicOp::Pslldqi256 | IntrinsicOp::Psrldqi256 => {
-                if let Some(dptr) = dest_ptr {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
                     self.avx_load_arg(&args[0]);
                     let imm = self.operand_to_imm_i64(&args[1]) & 0xff;
                     let inst = if matches!(op, IntrinsicOp::Pslldqi256) {
@@ -4051,7 +4072,7 @@ impl X86Codegen {
             | IntrinsicOp::Psrlqi256
             | IntrinsicOp::Psrawi256
             | IntrinsicOp::Psradi256 => {
-                if let Some(dptr) = dest_ptr {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
                     let inst = match op {
                         IntrinsicOp::Psllqi256 => "vpsllq",
                         IntrinsicOp::Psrlqi256 => "vpsrlq",
@@ -4068,7 +4089,7 @@ impl X86Codegen {
             | IntrinsicOp::Pmovsxbw256
             | IntrinsicOp::Pmovsxbd256
             | IntrinsicOp::Pmovsxwd256 => {
-                if let Some(dptr) = dest_ptr {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
                     self.sse_load_arg(&args[0], "xmm0");
                     let inst = match op {
                         IntrinsicOp::Pmovzxbw256 => "vpmovzxbw",
@@ -4085,7 +4106,7 @@ impl X86Codegen {
                 }
             }
             IntrinsicOp::Pabsd256 => {
-                if let Some(dptr) = dest_ptr {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
                     self.avx_load_arg(&args[0]);
                     self.state.emit("    vpabsd %ymm0, %ymm0");
                     self.avx_store_dest(dptr);
@@ -4099,7 +4120,7 @@ impl X86Codegen {
             | IntrinsicOp::Psradi128
             | IntrinsicOp::Pslldi128
             | IntrinsicOp::Psrldi128 => {
-                if let Some(dptr) = dest_ptr {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
                     let inst = match op {
                         IntrinsicOp::Psllwi128 => "psllw",
                         IntrinsicOp::Psrlwi128 => "psrlw",
@@ -4116,7 +4137,7 @@ impl X86Codegen {
             // --- SSE2 set/insert/extract/convert ---
             IntrinsicOp::SetEpi16 => {
                 // Broadcast 16-bit value to all 8 lanes
-                if let Some(dptr) = dest_ptr {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
                     self.operand_to_reg(&args[0], "rax");
                     self.state.emit("    movd %eax, %xmm0");
                     self.state.emit("    punpcklwd %xmm0, %xmm0");
@@ -4129,7 +4150,7 @@ impl X86Codegen {
             | IntrinsicOp::Pinsrb128
             | IntrinsicOp::Pinsrq128 => {
                 // Insert scalar at lane: pinsrX $imm, %ecx, %xmm0
-                if let Some(dptr) = dest_ptr {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
                     let (inst, reg) = match op {
                         IntrinsicOp::Pinsrw128 => ("pinsrw", "ecx"),
                         IntrinsicOp::Pinsrd128 => ("pinsrd", "ecx"),
@@ -4193,7 +4214,7 @@ impl X86Codegen {
             }
             IntrinsicOp::Cvtsi32Si128 => {
                 // Convert int to __m128i (MOVD, zero-extends upper bits)
-                if let Some(dptr) = dest_ptr {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
                     self.operand_to_reg(&args[0], "rax");
                     self.state.emit("    movd %eax, %xmm0");
                     self.sse_store_dest(dptr, "xmm0");
@@ -4231,6 +4252,10 @@ impl X86Codegen {
                         _ => unreachable!("unexpected SSE shuffle op: {:?}", op),
                     };
                     self.emit_sse_shuffle_imm_128(dptr, args, inst);
+                } else if dest.is_some() {
+                    panic!(
+                        "x86 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
             IntrinsicOp::FmaF64x2 => {
@@ -4695,6 +4720,10 @@ impl X86Codegen {
                     self.operand_to_reg(&args[1], "rcx"); // byte offset
                     self.state.emit("    vmovupd (%rax,%rcx), %ymm0");
                     self.state.emit("    vmovupd %ymm0, (%rdx)"); // Store to %rdx
+                } else if dest.is_some() {
+                    panic!(
+                        "x86 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
             IntrinsicOp::LoadF64x2 => {
@@ -4707,6 +4736,10 @@ impl X86Codegen {
                     self.operand_to_reg(&args[1], "rcx");
                     self.state.emit("    movupd (%rax,%rcx), %xmm0");
                     self.state.emit("    movupd %xmm0, (%rdx)"); // Store to %rdx
+                } else if dest.is_some() {
+                    panic!(
+                        "x86 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
             IntrinsicOp::LoadI32x8 => {
@@ -4719,6 +4752,10 @@ impl X86Codegen {
                     self.operand_to_reg(&args[1], "rcx");
                     self.state.emit("    vmovdqu (%rax,%rcx), %ymm0");
                     self.state.emit("    vmovdqu %ymm0, (%rdx)"); // Store to %rdx
+                } else if dest.is_some() {
+                    panic!(
+                        "x86 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
             IntrinsicOp::LoadI32x4 => {
@@ -4731,37 +4768,41 @@ impl X86Codegen {
                     self.operand_to_reg(&args[1], "rcx");
                     self.state.emit("    movdqu (%rax,%rcx), %xmm0");
                     self.state.emit("    movdqu %xmm0, (%rdx)"); // Store to %rdx
+                } else if dest.is_some() {
+                    panic!(
+                        "x86 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
 
             // --- Vector arithmetic ---
             IntrinsicOp::AddF64x4 => {
-                if let Some(dptr) = dest_ptr {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
                     self.emit_avx_binary_256(dptr, args, "vaddpd", true);
                 }
             }
             IntrinsicOp::AddF64x2 => {
-                if let Some(dptr) = dest_ptr {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
                     self.emit_sse_binary_128(dptr, args, "addpd");
                 }
             }
             IntrinsicOp::MulF64x4 => {
-                if let Some(dptr) = dest_ptr {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
                     self.emit_avx_binary_256(dptr, args, "vmulpd", true);
                 }
             }
             IntrinsicOp::MulF64x2 => {
-                if let Some(dptr) = dest_ptr {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
                     self.emit_sse_binary_128(dptr, args, "mulpd");
                 }
             }
             IntrinsicOp::AddI32x8 => {
-                if let Some(dptr) = dest_ptr {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
                     self.emit_avx_binary_256(dptr, args, "vpaddd", true);
                 }
             }
             IntrinsicOp::AddI32x4 => {
-                if let Some(dptr) = dest_ptr {
+                if let Some(dptr) = result_dest(dest, dest_ptr) {
                     self.emit_sse_binary_128(dptr, args, "paddd");
                 }
             }
@@ -12882,5 +12923,163 @@ fn emit_load_stack_guard_x86(cg: &mut X86Codegen, dest: &Option<Value>) {
     cg.state.reg_cache.invalidate_acc();
     if let Some(d) = dest {
         cg.store_rax_to(d);
+    }
+}
+
+/// The destination contract of value-producing intrinsics: the memory-result
+/// form (`dest_ptr`, what source `_mm_` intrinsics use) and the SSA form
+/// (`dest`, what internal passes emit) must both emit the instruction.
+/// Whole opcode groups previously honoured only `dest_ptr`, silently dropping
+/// the SSA form and leaving the result unwritten — a read of uninitialized
+/// memory with no diagnostic.  These tests pin one representative of each
+/// routed helper family so a regression cannot reintroduce the silence.
+#[cfg(test)]
+mod intrinsic_destination_contract_tests {
+    use super::*;
+
+    fn slot_homed(cg: &mut X86Codegen, id: u32) {
+        cg.state.value_locations.insert(id, StackSlot(-32));
+        cg.state.vector_values.insert(id);
+    }
+
+    fn xmm_homed(cg: &mut X86Codegen, id: u32) {
+        cg.reg_assignments.insert(id, PhysReg(24)); // xmm6
+    }
+
+    /// (op, args, expected mnemonic) — one representative per routed helper
+    /// family: SSE2 packed binary, SSE2 unary-immediate shift, SSSE3 pabs,
+    /// SSE4.1 widening convert, AVX2 packed binary, AVX2 load, AVX2 broadcast.
+    fn families() -> Vec<(IntrinsicOp, Vec<Operand>, &'static str)> {
+        vec![
+            (
+                IntrinsicOp::Psubusw128,
+                vec![Operand::Value(Value(0)), Operand::Value(Value(1))],
+                "psubusw",
+            ),
+            (
+                IntrinsicOp::Paddw128,
+                vec![Operand::Value(Value(0)), Operand::Value(Value(1))],
+                "paddw",
+            ),
+            (
+                IntrinsicOp::Pmovzxbw128,
+                vec![Operand::Value(Value(0))],
+                "pmovzxbw",
+            ),
+            (
+                IntrinsicOp::Pabsb128,
+                vec![Operand::Value(Value(0))],
+                "pabsb",
+            ),
+            (
+                IntrinsicOp::Paddb256,
+                vec![Operand::Value(Value(0)), Operand::Value(Value(1))],
+                "vpaddb",
+            ),
+            (
+                IntrinsicOp::Loadu256,
+                vec![Operand::Value(Value(0)), Operand::Value(Value(1))],
+                "vmovdqu",
+            ),
+        ]
+    }
+
+    #[test]
+    fn routed_groups_emit_for_both_destination_spellings() {
+        for (op, args, mnemonic) in families() {
+            // SSA form: the result is register-homed (xmm6).
+            let mut cg = X86Codegen::new();
+            for id in [0u32, 1] {
+                slot_homed(&mut cg, id);
+            }
+            xmm_homed(&mut cg, 2);
+            cg.emit_intrinsic_impl(&Some(Value(2)), &op, &None, &args);
+            let out = &cg.state.out.buf;
+            assert!(
+                out.contains(mnemonic),
+                "{op:?} SSA form dropped the instruction entirely: {out}"
+            );
+            // 256-bit ops home in YMM registers; 128-bit ops in XMM.
+            let home = if op.vector_home_width() == Some(32) {
+                "ymm6"
+            } else {
+                "xmm6"
+            };
+            assert!(
+                out.contains(home),
+                "{op:?} SSA form ignored the register home: {out}"
+            );
+
+            // Memory-result form: the result goes to its stack slot.
+            let mut cg = X86Codegen::new();
+            for id in [0u32, 1, 3] {
+                slot_homed(&mut cg, id);
+            }
+            cg.emit_intrinsic_impl(&None, &op, &Some(Value(3)), &args);
+            let out = &cg.state.out.buf;
+            assert!(
+                out.contains(mnemonic),
+                "{op:?} dest_ptr form regressed: {out}"
+            );
+
+            // Both spellings: the explicit memory result wins (the shape the
+            // `_mm_` source path passes), and emission is unchanged.
+            let mut cg = X86Codegen::new();
+            for id in [0u32, 1, 3] {
+                slot_homed(&mut cg, id);
+            }
+            xmm_homed(&mut cg, 2);
+            cg.emit_intrinsic_impl(&Some(Value(2)), &op, &Some(Value(3)), &args);
+            let both = cg.state.out.buf.clone();
+            assert!(
+                both.contains(mnemonic),
+                "{op:?} both-spelling form regressed: {both}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_value_with_no_destination_at_all_is_a_benign_dead_op() {
+        let mut cg = X86Codegen::new();
+        for id in [0u32, 1] {
+            slot_homed(&mut cg, id);
+        }
+        cg.emit_intrinsic_impl(
+            &None,
+            &IntrinsicOp::Paddw128,
+            &None,
+            &[Operand::Value(Value(0)), Operand::Value(Value(1))],
+        );
+        assert!(
+            !cg.state.out.buf.contains("paddw"),
+            "a dead op must not emit: {}",
+            cg.state.out.buf
+        );
+    }
+
+    /// Groups whose destination plumbing is memory-form only (scalar
+    /// extracts, pointer-staged loads) refuse the SSA form loudly instead of
+    /// silently emitting nothing.
+    #[test]
+    fn memory_form_only_groups_refuse_the_ssa_form_loudly() {
+        for op in [IntrinsicOp::Extracti128, IntrinsicOp::LoadF64x2] {
+            let mut cg = X86Codegen::new();
+            for id in [0u32, 1] {
+                slot_homed(&mut cg, id);
+            }
+            xmm_homed(&mut cg, 2);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                cg.emit_intrinsic_impl(
+                    &Some(Value(2)),
+                    &op,
+                    &None,
+                    &[Operand::Value(Value(0)), Operand::Value(Value(1))],
+                );
+            }));
+            assert!(
+                result.is_err(),
+                "{op:?} silently accepted the SSA form again"
+            );
+        }
     }
 }

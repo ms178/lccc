@@ -1827,6 +1827,11 @@ jobs:
         CCC: target/fastbuild/lccc
         GCC: gcc-16
       run: bash tests/regression/check_u16_saturating_sub.sh
+    - name: Verify vectorizer saturating-subtract fold against GCC
+      env:
+        CCC: target/fastbuild/lccc
+        REF: gcc-16
+      run: bash tests/regression/check_vectorize_saturating_subtract.sh
     - name: Verify byte-compare window phase
       env:
         CCC: target/fastbuild/lccc

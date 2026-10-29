@@ -294,6 +294,10 @@ impl ArmCodegen {
                     self.state.emit("    ldr q0, [x0]");
                     self.load_ptr_to_reg(dptr, "x0");
                     self.state.emit("    str q0, [x0]");
+                } else if dest.is_some() {
+                    panic!(
+                        "arm emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
             IntrinsicOp::Storedqu => {
@@ -308,6 +312,10 @@ impl ArmCodegen {
             IntrinsicOp::Pcmpeqb128 => {
                 if let Some(dptr) = dest_ptr {
                     self.emit_neon_binary_128(dptr, args, "cmeq");
+                } else if dest.is_some() {
+                    panic!(
+                        "arm emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
             IntrinsicOp::Pcmpeqd128 => {
@@ -325,31 +333,55 @@ impl ArmCodegen {
                     self.state.emit("    cmeq v0.4s, v0.4s, v1.4s");
                     self.load_ptr_to_reg(dptr, "x0");
                     self.state.emit("    str q0, [x0]");
+                } else if dest.is_some() {
+                    panic!(
+                        "arm emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
             IntrinsicOp::Psubusb128 => {
                 if let Some(dptr) = dest_ptr {
                     self.emit_neon_binary_128(dptr, args, "uqsub");
+                } else if dest.is_some() {
+                    panic!(
+                        "arm emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
             IntrinsicOp::Psubsb128 => {
                 if let Some(dptr) = dest_ptr {
                     self.emit_neon_binary_128(dptr, args, "sqsub");
+                } else if dest.is_some() {
+                    panic!(
+                        "arm emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
             IntrinsicOp::Por128 => {
                 if let Some(dptr) = dest_ptr {
                     self.emit_neon_binary_128(dptr, args, "orr");
+                } else if dest.is_some() {
+                    panic!(
+                        "arm emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
             IntrinsicOp::Pand128 => {
                 if let Some(dptr) = dest_ptr {
                     self.emit_neon_binary_128(dptr, args, "and");
+                } else if dest.is_some() {
+                    panic!(
+                        "arm emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
             IntrinsicOp::Pxor128 => {
                 if let Some(dptr) = dest_ptr {
                     self.emit_neon_binary_128(dptr, args, "eor");
+                } else if dest.is_some() {
+                    panic!(
+                        "arm emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
             IntrinsicOp::Pmovmskb128 => {
@@ -384,6 +416,10 @@ impl ArmCodegen {
                     self.state.emit("    dup v0.16b, w0");
                     self.load_ptr_to_reg(dptr, "x0");
                     self.state.emit("    str q0, [x0]");
+                } else if dest.is_some() {
+                    panic!(
+                        "arm emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
             IntrinsicOp::SetEpi32 => {
@@ -392,6 +428,10 @@ impl ArmCodegen {
                     self.state.emit("    dup v0.4s, w0");
                     self.load_ptr_to_reg(dptr, "x0");
                     self.state.emit("    str q0, [x0]");
+                } else if dest.is_some() {
+                    panic!(
+                        "arm emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
             IntrinsicOp::Crc32_8
@@ -1180,7 +1220,16 @@ impl ArmCodegen {
             }
 
             _ if unsupported_arm_vector_intrinsic(op) => self.emit_unreachable(),
-            _ => { /* x86-only scalar/SSE-builtin op on arm: no-op */ }
+            // The former `_ => no-op` silently discarded every other
+            // unhandled computation (e.g. Psubusw128, which NEON could lower
+            // with `uqsub .8h`), leaving its result register uninitialized.
+            // This is the same contract as `unsupported_arm_vector_intrinsic`
+            // one arm above: a computation that reaches the backend without a
+            // lowering traps at runtime instead of corrupting silently.
+            unhandled => {
+                let _ = unhandled;
+                self.emit_unreachable()
+            }
         }
     }
 
@@ -1321,5 +1370,67 @@ mod prefetch_prfop_tests {
         for p in 0u8..=255 {
             assert_eq!(prefetch_prfop(p), prefetch_prfop(p & 7));
         }
+    }
+}
+
+/// ARM's value-producing groups are memory-result-form only: their helpers
+/// stage the destination as a pointer (`load_ptr_to_reg`) and store through
+/// it, so an SSA-form result (dest, no dest_ptr) has no home to write.  That
+/// shape must never come back as silence -- it must fail loudly.
+#[cfg(test)]
+mod intrinsic_destination_contract_tests {
+    use super::*;
+    use crate::backend::state::StackSlot;
+
+    #[test]
+    fn ssa_form_of_armed_value_ops_is_refused_not_silently_dropped() {
+        let mut cg = ArmCodegen::new();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cg.emit_intrinsic_arm(
+                &Some(Value(2)),
+                &IntrinsicOp::Psubusb128,
+                &None,
+                &[Operand::Value(Value(0)), Operand::Value(Value(1))],
+            );
+        }));
+        assert!(result.is_err(), "ARM silently accepted the SSA form again");
+    }
+
+    #[test]
+    fn memory_result_form_of_armed_ops_still_emits() {
+        let mut cg = ArmCodegen::new();
+        for id in [0u32, 1] {
+            cg.state.value_locations.insert(id, StackSlot(-32));
+            cg.state.vector_values.insert(id);
+        }
+        cg.emit_intrinsic_arm(
+            &None,
+            &IntrinsicOp::Psubusb128,
+            &Some(Value(3)),
+            &[Operand::Value(Value(0)), Operand::Value(Value(1))],
+        );
+        assert!(
+            cg.state.out.buf.contains("uqsub"),
+            "dest_ptr form regressed: {}",
+            cg.state.out.buf
+        );
+    }
+
+    /// Psubusw128 has no AArch64 lowering (NEON's `uqsub .8h` is not wired):
+    /// it must trap at runtime, not silently produce an uninitialized vector.
+    #[test]
+    fn unhandled_computations_trap_instead_of_silently_no_oping() {
+        let mut cg = ArmCodegen::new();
+        cg.emit_intrinsic_arm(
+            &None,
+            &IntrinsicOp::Psubusw128,
+            &Some(Value(3)),
+            &[Operand::Value(Value(0)), Operand::Value(Value(1))],
+        );
+        assert!(
+            cg.state.out.buf.contains("brk"),
+            "unhandled computation silently no-op'd again: {}",
+            cg.state.out.buf
+        );
     }
 }

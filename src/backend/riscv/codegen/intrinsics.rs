@@ -76,6 +76,10 @@ impl RiscvCodegen {
                     self.load_ptr_to_reg_rv(dptr, "t0");
                     self.state.emit("    sd t1, 0(t0)");
                     self.state.emit("    sd t2, 8(t0)");
+                } else if dest.is_some() {
+                    panic!(
+                        "riscv emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
             IntrinsicOp::Storedqu => {
@@ -93,39 +97,67 @@ impl RiscvCodegen {
                 // Byte-wise compare equal: result[i] = (a[i] == b[i]) ? 0xFF : 0x00
                 if let Some(dptr) = dest_ptr {
                     self.emit_rv_cmpeq_bytes(dptr, args);
+                } else if dest.is_some() {
+                    panic!(
+                        "riscv emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
             IntrinsicOp::Pcmpeqd128 => {
                 // 32-bit lane compare equal
                 if let Some(dptr) = dest_ptr {
                     self.emit_rv_cmpeq_dwords(dptr, args);
+                } else if dest.is_some() {
+                    panic!(
+                        "riscv emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
             IntrinsicOp::Psubusb128 => {
                 // Unsigned saturating byte subtract
                 if let Some(dptr) = dest_ptr {
                     self.emit_rv_binary_128_bytewise(dptr, args);
+                } else if dest.is_some() {
+                    panic!(
+                        "riscv emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
             IntrinsicOp::Psubsb128 => {
                 // Signed saturating byte subtract
                 if let Some(dptr) = dest_ptr {
                     self.emit_rv_psubsb_128(dptr, args);
+                } else if dest.is_some() {
+                    panic!(
+                        "riscv emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
             IntrinsicOp::Por128 => {
                 if let Some(dptr) = dest_ptr {
                     self.emit_rv_binary_128(dptr, args, "or");
+                } else if dest.is_some() {
+                    panic!(
+                        "riscv emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
             IntrinsicOp::Pand128 => {
                 if let Some(dptr) = dest_ptr {
                     self.emit_rv_binary_128(dptr, args, "and");
+                } else if dest.is_some() {
+                    panic!(
+                        "riscv emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
             IntrinsicOp::Pxor128 => {
                 if let Some(dptr) = dest_ptr {
                     self.emit_rv_binary_128(dptr, args, "xor");
+                } else if dest.is_some() {
+                    panic!(
+                        "riscv emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
             IntrinsicOp::Pmovmskb128 => {
@@ -161,6 +193,10 @@ impl RiscvCodegen {
                     self.load_ptr_to_reg_rv(dptr, "t1");
                     self.state.emit("    sd t0, 0(t1)");
                     self.state.emit("    sd t0, 8(t1)");
+                } else if dest.is_some() {
+                    panic!(
+                        "riscv emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
             IntrinsicOp::Crc32_8
@@ -578,7 +614,17 @@ impl RiscvCodegen {
                     self.emit_f128_store_a0_a1_tracked(d.0);
                 }
             }
-            _ => { /* x86-only SIMD op on riscv: no-op */ }
+            // The former `_ => no-op` catch-all silently discarded unhandled
+            // x86-only SIMD computations here, which the RoundScalarF64 arm
+            // above documents as "produced uninitialized registers".  Mirror
+            // the AArch64 backend's contract: a computation that reaches the
+            // backend without a lowering traps at runtime instead of
+            // corrupting silently.  Pure hint ops (Pause) have their own arms
+            // and never land here.
+            unhandled => {
+                let _ = unhandled;
+                self.emit_unreachable()
+            }
         }
     }
 
@@ -945,5 +991,48 @@ fn emit_load_stack_guard_riscv(cg: &mut RiscvCodegen, dest: &Option<Value>) {
     }
     if let Some(d) = dest {
         cg.store_t0_to(d);
+    }
+}
+
+/// RISC-V's unhandled-intrinsic catch-all used to be a silent no-op (the
+/// RoundScalarF64 arm's comment documents the uninitialized registers that
+/// produced).  Two contracts are pinned here: an unhandled computation is
+/// refused loudly, and the memory-result form of an armed packed op still
+/// emits.
+#[cfg(test)]
+mod intrinsic_destination_contract_tests {
+    use super::*;
+
+    #[test]
+    fn unhandled_computations_trap_instead_of_silently_no_oping() {
+        let mut cg = RiscvCodegen::new();
+        cg.emit_intrinsic_rv(
+            &None,
+            &IntrinsicOp::AddPs128,
+            &Some(Value(3)),
+            &[Operand::Value(Value(0)), Operand::Value(Value(1))],
+        );
+        assert!(
+            cg.state.out.buf.contains("ebreak"),
+            "unhandled computation silently no-op'd again: {}",
+            cg.state.out.buf
+        );
+    }
+
+    #[test]
+    fn ssa_form_of_value_ops_is_refused_not_silently_dropped() {
+        let mut cg = RiscvCodegen::new();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cg.emit_intrinsic_rv(
+                &Some(Value(2)),
+                &IntrinsicOp::Pcmpeqb128,
+                &None,
+                &[Operand::Value(Value(0)), Operand::Value(Value(1))],
+            );
+        }));
+        assert!(
+            result.is_err(),
+            "riscv silently accepted the SSA form again"
+        );
     }
 }

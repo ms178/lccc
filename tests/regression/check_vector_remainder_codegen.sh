@@ -76,8 +76,26 @@ for name in ("sum_global_full", "sum_dynamic_tail", "sum_dynamic_full"):
     if not packed.search(body):
         reject("no packed dword arithmetic in the reduction loop "
                "(a scalar fallback cannot be the vectorized transform)")
-    if len(re.findall(r"\bvpinsrd\b", body)) < 2 or "vinserti128" not in body:
-        reject("shared/dynamic stream lacks the exact four-dword load")
+    if name == "sum_global_full":
+        # The global stream reads a strong, locally binding definition whose
+        # defined size the reducer proves (`ModuleSymbolFacts::global_min_bytes`),
+        # so its loads widen to full 32-byte vectors: legal (every byte read is
+        # inside the object) and cheaper than the strided assembly.  The wide
+        # loads appear either materialised (`vmovdqu %ymm`) or memory-folded
+        # into their consumers (a 32-byte `vpxor <mem>` stream is the fold of a
+        # full wide load, which only contiguous loads qualify for).  What must
+        # NOT come back is the pointer-limited strided form: the object proof
+        # exists precisely so the shared stream stops paying for it.
+        wide = len(re.findall(r"\bvmovdqu\b[^,]*, %ymm", body)) + len(
+            re.findall(r"\bvpxor\s+-?\d*%\w+\(%\w+(?:,%\w+)?\)", body))
+        if wide < 3:
+            reject("sized global stream did not take the proven wide-load form")
+    else:
+        # Parameter streams have no provable extent, so they keep the
+        # element-exact strided form: four dwords assembled by two vpinsrd
+        # pairs and one vinserti128, never reading the inter-dword gaps.
+        if len(re.findall(r"\bvpinsrd\b", body)) < 2 or "vinserti128" not in body:
+            reject("shared/dynamic stream lacks the exact four-dword load")
 PY2
 
 python3 - "$tmp/matmul.s" "$tmp/reduction.s" "$dir/lib" <<'PY'

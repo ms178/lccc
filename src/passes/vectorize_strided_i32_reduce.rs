@@ -48,6 +48,8 @@
 //! the remaining iterations.
 
 use super::*;
+use crate::common::fx_hash::FxHashSet;
+use crate::ir::provenance::{ChainStep, RootLeaf, chain_step, root_leaf};
 
 #[derive(Clone, Debug, PartialEq)]
 enum StridedExpr {
@@ -68,7 +70,7 @@ struct StridedI32ReducePattern {
     acc_init: Operand,
     safe_vecs: u64,
     load_bases: Vec<Value>,
-    private_wide_loads: Vec<bool>,
+    wide_load_proven: Vec<bool>,
     expr: StridedExpr,
 }
 
@@ -190,26 +192,99 @@ pub(super) fn try_transform(
     func: &mut IrFunction,
     loop_info: &loop_analysis::NaturalLoop,
     cfg: &CfgAnalysis,
+    symbol_facts: &ModuleSymbolFacts,
 ) -> usize {
     if strided_reduce_disabled() {
         return 0;
     }
-    let Some(pattern) = analyze(func, loop_info, cfg) else {
+    let Some(pattern) = analyze(func, loop_info, cfg, symbol_facts) else {
         return 0;
     };
     transform(func, &pattern)
 }
 
-fn private_wide_load_safe(func: &IrFunction, base: Value, needed: u64) -> bool {
-    if !proves_private_stack_object(func, base) {
-        return false;
+/// Whether one wide `needed`-byte load from `base` can only touch memory the
+/// program itself names.  Two proofs qualify:
+///
+/// * a current-frame alloca of proven extent (`proves_private_stack_object`);
+/// * a strong, locally binding global whose defined size covers the window
+///   (`ModuleSymbolFacts::global_min_bytes` — interposable, weak, common,
+///   alias- and asm-label-redirected symbols and toplevel-asm units are
+///   excluded there, so the definition cannot be replaced by a smaller one at
+///   link time).
+///
+/// Everything else declines and keeps the strided load, which reads only the
+/// bytes the scalar loop already reads.
+fn wide_load_proven(
+    func: &IrFunction,
+    base: Value,
+    needed: u64,
+    symbol_facts: &ModuleSymbolFacts,
+) -> bool {
+    if proves_private_stack_object(func, base) {
+        return alloca_extent_at_least(func, base, needed);
     }
+    global_root_name(func, base).is_some_and(|name| {
+        // `ModuleSymbolFacts::from_module` already excludes redirected names
+        // from `defined_sizes`; the explicit check keeps this proof locally
+        // evident even if that construction invariant drifts.
+        !symbol_facts.aliased_names.contains(&name)
+            && symbol_facts
+                .global_min_bytes(&name)
+                .is_some_and(|sz| u64::try_from(sz).is_ok_and(|sz| sz >= needed))
+    })
+}
+
+/// Whether `base` is defined by a current-frame `alloca` whose byte size
+/// covers `needed`; the extent half of the private-stack proof.
+fn alloca_extent_at_least(func: &IrFunction, base: Value, needed: u64) -> bool {
     func.blocks.iter().any(|block| {
         block.instructions.iter().any(|inst| {
             matches!(inst, Instruction::Alloca { dest, size, .. }
                 if *dest == base && u64::try_from(*size).is_ok_and(|sz| sz >= needed))
         })
     })
+}
+
+/// Resolve `base` to the name of the global object it points into, following
+/// only provenance-preserving edges (the canonical [`root_leaf`] /
+/// [`chain_step`] rules).  Loads, calls, integer-to-pointer conversions,
+/// unknown definitions and cycles fail closed.
+fn global_root_name(func: &IrFunction, start: Value) -> Option<String> {
+    let mut cur = start;
+    let mut seen = FxHashSet::default();
+    for _ in 0..128 {
+        if !seen.insert(cur) {
+            return None;
+        }
+        let inst = unique_def(func, cur)?;
+        match root_leaf(inst) {
+            RootLeaf::Global(name) => return Some(name),
+            RootLeaf::NotLeaf => match chain_step(inst) {
+                ChainStep::Follow(next) => cur = next,
+                ChainStep::Stop => return None,
+            },
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// The unique definition of `value`.  Duplicate definitions make the pointer
+/// chain position-dependent, so they cannot support a proof.
+fn unique_def(func: &IrFunction, value: Value) -> Option<&Instruction> {
+    let mut found = None;
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if inst.dest() == Some(value) {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(inst);
+            }
+        }
+    }
+    found
 }
 
 fn trace_iv_offset(
@@ -584,6 +659,7 @@ fn analyze(
     func: &IrFunction,
     loop_info: &loop_analysis::NaturalLoop,
     cfg: &CfgAnalysis,
+    symbol_facts: &ModuleSymbolFacts,
 ) -> Option<StridedI32ReducePattern> {
     if loop_info.body.len() != 2 {
         return None;
@@ -875,9 +951,9 @@ fn analyze(
         return None;
     }
     let vector_bytes = safe_vecs.checked_mul(VECTOR_BYTES)?;
-    let private_wide_loads = load_bases
+    let wide_load_proven = load_bases
         .iter()
-        .map(|&base| private_wide_load_safe(func, base, vector_bytes))
+        .map(|&base| wide_load_proven(func, base, vector_bytes, symbol_facts))
         .collect();
 
     Some(StridedI32ReducePattern {
@@ -891,14 +967,14 @@ fn analyze(
         acc_init,
         safe_vecs,
         load_bases,
-        private_wide_loads,
+        wide_load_proven,
         expr,
     })
 }
 
 struct EmitCtx<'a> {
     load_bases: &'a [Value],
-    private_wide_loads: &'a [bool],
+    wide_load_proven: &'a [bool],
     byte_iv: Value,
     byte_disp: i64,
     vec_iv: Value,
@@ -928,7 +1004,7 @@ impl EmitCtx<'_> {
                 }
                 self.body_insts.push(Instruction::Intrinsic {
                     dest: Some(dest),
-                    op: if self.private_wide_loads[*idx] {
+                    op: if self.wide_load_proven[*idx] {
                         IntrinsicOp::VecLoadI32x8
                     } else {
                         IntrinsicOp::VecLoadStrided2I32x8
@@ -1153,7 +1229,7 @@ fn transform(func: &mut IrFunction, p: &StridedI32ReducePattern) -> usize {
 
     let mut ctx = EmitCtx {
         load_bases: &p.load_bases,
-        private_wide_loads: &p.private_wide_loads,
+        wide_load_proven: &p.wide_load_proven,
         byte_iv: byte_iv_phi,
         byte_disp: 0,
         vec_iv: iv_vec_phi.unwrap_or(Value(0)),
@@ -1428,7 +1504,15 @@ mod tests {
     }
 
     #[test]
-    fn wide_load_requires_an_unescaped_stack_object_of_sufficient_size() {
+    fn wide_load_requires_a_proven_object_of_sufficient_size() {
+        let facts = |sizes: &[(&str, usize)]| {
+            let mut facts = ModuleSymbolFacts::default();
+            for (name, size) in sizes {
+                facts.identity_witnesses.insert((*name).to_string());
+                facts.defined_sizes.insert((*name).to_string(), *size);
+            }
+            facts
+        };
         let mut f = IrFunction::new("private".into(), IrType::Void, vec![], false);
         f.blocks.push(BasicBlock {
             label: BlockId(0),
@@ -1443,16 +1527,51 @@ mod tests {
             terminator: Terminator::Return(None),
             source_spans: vec![],
         });
-        assert!(private_wide_load_safe(&f, Value(0), 128));
-        assert!(!private_wide_load_safe(&f, Value(0), 129));
+        let empty = facts(&[]);
+        assert!(wide_load_proven(&f, Value(0), 128, &empty));
+        assert!(!wide_load_proven(&f, Value(0), 129, &empty));
         f.blocks[0].terminator = Terminator::Return(Some(Operand::Value(Value(0))));
-        assert!(!private_wide_load_safe(&f, Value(0), 128));
+        assert!(!wide_load_proven(&f, Value(0), 128, &empty));
         f.blocks[0].terminator = Terminator::Return(None);
         f.blocks[0].instructions[0] = Instruction::GlobalAddr {
             dest: Value(0),
-            name: "shared".into(),
+            name: "arr".into(),
         };
-        assert!(!private_wide_load_safe(&f, Value(0), 128));
+        // No witness: a global the module cannot prove is declined.
+        assert!(!wide_load_proven(&f, Value(0), 128, &empty));
+        // A strong, locally binding definition of sufficient size is admitted.
+        assert!(wide_load_proven(&f, Value(0), 128, &facts(&[("arr", 128)])));
+        assert!(wide_load_proven(
+            &f,
+            Value(0),
+            128,
+            &facts(&[("arr", 4096)])
+        ));
+        // An undersized definition is declined.
+        assert!(!wide_load_proven(
+            &f,
+            Value(0),
+            129,
+            &facts(&[("arr", 128)])
+        ));
+        // An alias- or label-redirected name is never a size proof.
+        let mut redirected = facts(&[("arr", 4096)]);
+        redirected.aliased_names.insert("arr".to_string());
+        assert!(!wide_load_proven(&f, Value(0), 128, &redirected));
+        // A GEP off the global keeps the root (offset is irrelevant to the
+        // extent proof; the loop's own exit bounds the window).
+        f.blocks[0].instructions.push(Instruction::GetElementPtr {
+            dest: Value(1),
+            base: Value(0),
+            offset: Operand::Const(IrConst::I64(8)),
+            ty: IrType::U8,
+        });
+        assert!(wide_load_proven(
+            &f,
+            Value(1),
+            128,
+            &facts(&[("arr", 4096)])
+        ));
     }
 
     #[test]
@@ -1460,7 +1579,7 @@ mod tests {
         for private in [false, true] {
             let mut ctx = EmitCtx {
                 load_bases: &[Value(0)],
-                private_wide_loads: &[private],
+                wide_load_proven: &[private],
                 byte_iv: Value(1),
                 byte_disp: 32,
                 vec_iv: Value(2),

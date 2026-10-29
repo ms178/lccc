@@ -45,6 +45,10 @@ impl I686Codegen {
                     self.state
                         .emit_fmt(format_args!("    {} %xmm0, %ymm0", op.mnemonic()));
                     self.emit_avx_store_dest(ptr);
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
             IntrinsicOp::AvxTest(test) => {
@@ -145,6 +149,10 @@ impl I686Codegen {
                         _ => unreachable!("unexpected SSE binary op: {:?}", op),
                     };
                     self.emit_sse_binary_128(dptr, args, inst);
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
             IntrinsicOp::Pmovmskb128 => {
@@ -165,6 +173,10 @@ impl I686Codegen {
                     self.state.emit("    pshufd $0, %xmm0, %xmm0");
                     self.operand_to_eax(&Operand::Value(*dptr));
                     self.state.emit("    movdqu %xmm0, (%eax)");
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
             IntrinsicOp::SetEpi32 => {
@@ -174,6 +186,10 @@ impl I686Codegen {
                     self.state.emit("    pshufd $0, %xmm0, %xmm0");
                     self.operand_to_eax(&Operand::Value(*dptr));
                     self.state.emit("    movdqu %xmm0, (%eax)");
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
 
@@ -582,6 +598,10 @@ impl I686Codegen {
                         _ => unreachable!("AES-NI dispatch matched non-AES op: {:?}", op),
                     };
                     self.emit_sse_binary_128(dptr, args, inst);
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
             IntrinsicOp::Aesimc128 => {
@@ -591,6 +611,10 @@ impl I686Codegen {
                     self.state.emit("    aesimc %xmm0, %xmm0");
                     self.operand_to_eax(&Operand::Value(*dptr));
                     self.state.emit("    movdqu %xmm0, (%eax)");
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
             IntrinsicOp::Aeskeygenassist128 => {
@@ -602,6 +626,10 @@ impl I686Codegen {
                         .emit_fmt(format_args!("    aeskeygenassist ${}, %xmm0, %xmm0", imm));
                     self.operand_to_eax(&Operand::Value(*dptr));
                     self.state.emit("    movdqu %xmm0, (%eax)");
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
             IntrinsicOp::Pclmulqdq128 => {
@@ -615,6 +643,10 @@ impl I686Codegen {
                         .emit_fmt(format_args!("    pclmulqdq ${}, %xmm1, %xmm0", imm));
                     self.operand_to_eax(&Operand::Value(*dptr));
                     self.state.emit("    movdqu %xmm0, (%eax)");
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
 
@@ -632,12 +664,20 @@ impl I686Codegen {
                         _ => unreachable!("unexpected SSE shift-by-immediate op: {:?}", op),
                     };
                     self.emit_sse_unary_imm_128(dptr, args, inst);
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
             // SSE2 shuffle with immediate
             IntrinsicOp::Pshufd128 => {
                 if let Some(dptr) = dest_ptr {
                     self.emit_sse_shuffle_imm_128(dptr, args, "pshufd");
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
             IntrinsicOp::Loadldi128 => {
@@ -646,6 +686,10 @@ impl I686Codegen {
                     self.state.emit("    movq (%eax), %xmm0");
                     self.operand_to_eax(&Operand::Value(*dptr));
                     self.state.emit("    movdqu %xmm0, (%eax)");
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
 
@@ -747,6 +791,10 @@ impl I686Codegen {
                         _ => unreachable!("unexpected SSE binary op: {:?}", op),
                     };
                     self.emit_sse_binary_128(dptr, args, inst);
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
 
@@ -768,6 +816,10 @@ impl I686Codegen {
                         _ => unreachable!("unexpected SSE element shift op: {:?}", op),
                     };
                     self.emit_sse_unary_imm_128(dptr, args, inst);
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
 
@@ -875,6 +927,10 @@ impl I686Codegen {
                         _ => unreachable!("unexpected SSE float binary op: {:?}", op),
                     };
                     self.emit_sse_binary_128(dptr, args, inst);
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
 
@@ -900,6 +956,10 @@ impl I686Codegen {
                         .emit_fmt(format_args!("    {} ${}, %xmm1, %xmm0", inst, imm));
                     self.operand_to_eax(&Operand::Value(*dptr));
                     self.state.emit("    movups %xmm0, (%eax)");
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
 
@@ -925,6 +985,10 @@ impl I686Codegen {
                         .emit_fmt(format_args!("    {} ${}, %xmm1, %xmm0", inst, imm));
                     self.operand_to_eax(&Operand::Value(*dptr));
                     self.state.emit("    movdqu %xmm0, (%eax)");
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
 
@@ -948,6 +1012,10 @@ impl I686Codegen {
                         .emit_fmt(format_args!("    {} %xmm2, %xmm1", inst));
                     self.operand_to_eax(&Operand::Value(*dptr));
                     self.state.emit("    movdqu %xmm1, (%eax)");
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
 
@@ -963,6 +1031,10 @@ impl I686Codegen {
                     self.state.emit("    pblendvb %xmm1, %xmm2");
                     self.operand_to_eax(&Operand::Value(*dptr));
                     self.state.emit("    movdqu %xmm2, (%eax)");
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
 
@@ -978,6 +1050,10 @@ impl I686Codegen {
                         .emit_fmt(format_args!("    pblendw ${}, %xmm1, %xmm0", imm));
                     self.operand_to_eax(&Operand::Value(*dptr));
                     self.state.emit("    movdqu %xmm0, (%eax)");
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
 
@@ -993,6 +1069,10 @@ impl I686Codegen {
                         .emit_fmt(format_args!("    palignr ${}, %xmm1, %xmm0", imm));
                     self.operand_to_eax(&Operand::Value(*dptr));
                     self.state.emit("    movdqu %xmm0, (%eax)");
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
 
@@ -1043,6 +1123,10 @@ impl I686Codegen {
                         .emit_fmt(format_args!("    {} %xmm0, %xmm0", inst));
                     self.operand_to_eax(&Operand::Value(*dptr));
                     self.state.emit("    movups %xmm0, (%eax)");
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
 
@@ -1061,6 +1145,10 @@ impl I686Codegen {
                         .emit_fmt(format_args!("    {} ${}, %xmm0, %xmm0", inst, imm));
                     self.operand_to_eax(&Operand::Value(*dptr));
                     self.state.emit("    movdqu %xmm0, (%eax)");
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
 
@@ -1080,6 +1168,10 @@ impl I686Codegen {
                         .emit_fmt(format_args!("    {} %xmm1, %xmm0", inst));
                     self.operand_to_eax(&Operand::Value(*dptr));
                     self.state.emit("    movdqu %xmm0, (%eax)");
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
 
@@ -1120,6 +1212,10 @@ impl I686Codegen {
                         .emit_fmt(format_args!("    {} %xmm0, %xmm0", inst));
                     self.operand_to_eax(&Operand::Value(*dptr));
                     self.state.emit("    movdqu %xmm0, (%eax)");
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
 
@@ -1138,6 +1234,10 @@ impl I686Codegen {
                         .emit_fmt(format_args!("    {} %xmm0, %xmm0", inst));
                     self.operand_to_eax(&Operand::Value(*dptr));
                     self.state.emit("    movdqu %xmm0, (%eax)");
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
 
@@ -1157,6 +1257,10 @@ impl I686Codegen {
                         .emit_fmt(format_args!("    {} %eax, %xmm0", inst));
                     self.operand_to_eax(&Operand::Value(*dptr));
                     self.state.emit("    movdqu %xmm0, (%eax)");
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
 
@@ -1199,6 +1303,10 @@ impl I686Codegen {
                     self.state.emit("    xorps %xmm0, %xmm0");
                     self.operand_to_eax(&Operand::Value(*dptr));
                     self.state.emit("    movups %xmm0, (%eax)");
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
 
@@ -1208,6 +1316,10 @@ impl I686Codegen {
                     self.state.emit("    pxor %xmm0, %xmm0");
                     self.operand_to_eax(&Operand::Value(*dptr));
                     self.state.emit("    movdqu %xmm0, (%eax)");
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
 
@@ -1259,6 +1371,10 @@ impl I686Codegen {
                     self.state.emit("    pshufd $0, %xmm0, %xmm0");
                     self.operand_to_eax(&Operand::Value(*dptr));
                     self.state.emit("    movdqu %xmm0, (%eax)");
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
             IntrinsicOp::Pinsrw128 => {
@@ -1271,6 +1387,10 @@ impl I686Codegen {
                         .emit_fmt(format_args!("    pinsrw ${}, %ecx, %xmm0", imm));
                     self.operand_to_eax(&Operand::Value(*dptr));
                     self.state.emit("    movdqu %xmm0, (%eax)");
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
             IntrinsicOp::Pextrw128 => {
@@ -1295,6 +1415,10 @@ impl I686Codegen {
                         .emit_fmt(format_args!("    pinsrd ${}, %ecx, %xmm0", imm));
                     self.operand_to_eax(&Operand::Value(*dptr));
                     self.state.emit("    movdqu %xmm0, (%eax)");
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
             IntrinsicOp::Pextrd128 => {
@@ -1320,6 +1444,10 @@ impl I686Codegen {
                         .emit_fmt(format_args!("    pinsrb ${}, %ecx, %xmm0", imm));
                     self.operand_to_eax(&Operand::Value(*dptr));
                     self.state.emit("    movdqu %xmm0, (%eax)");
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
             IntrinsicOp::Pextrb128 => {
@@ -1351,6 +1479,10 @@ impl I686Codegen {
                     emit!(self.state, "    pinsrd ${}, %ecx, %xmm0", 2 * imm + 1);
                     self.operand_to_eax(&Operand::Value(*dptr));
                     self.state.emit("    movdqu %xmm0, (%eax)");
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
             IntrinsicOp::Pextrq128 => {
@@ -1389,6 +1521,10 @@ impl I686Codegen {
                     self.state.emit("    movd %eax, %xmm0");
                     self.operand_to_eax(&Operand::Value(*dptr));
                     self.state.emit("    movdqu %xmm0, (%eax)");
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
             IntrinsicOp::Cvtsi128Si64 => {
@@ -1412,6 +1548,10 @@ impl I686Codegen {
                         _ => unreachable!("unexpected SSE shuffle op: {:?}", op),
                     };
                     self.emit_sse_shuffle_imm_128(dptr, args, inst);
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
 
@@ -1551,6 +1691,10 @@ impl I686Codegen {
                         _ => unreachable!("unexpected AVX2 integer binary op: {:?}", op),
                     };
                     self.emit_avx_binary_256(dptr, args, inst);
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
 
@@ -1602,6 +1746,10 @@ impl I686Codegen {
                         _ => unreachable!("unexpected AVX float binary op: {:?}", op),
                     };
                     self.emit_avx_binary_256(dptr, args, inst);
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
 
@@ -1634,6 +1782,10 @@ impl I686Codegen {
                     self.state
                         .emit_fmt(format_args!("    {} %ymm0, %ymm0", inst));
                     self.emit_avx_store_dest(dptr);
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
 
@@ -1660,6 +1812,10 @@ impl I686Codegen {
                     self.state
                         .emit_fmt(format_args!("    {} ${}, %ymm1, %ymm0, %ymm0", inst, imm));
                     self.emit_avx_store_dest(dptr);
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
 
@@ -1681,6 +1837,10 @@ impl I686Codegen {
                     self.state
                         .emit_fmt(format_args!("    {} ${}, %ymm0, %ymm0", inst, imm));
                     self.emit_avx_store_dest(dptr);
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
 
@@ -1698,6 +1858,10 @@ impl I686Codegen {
                     self.state
                         .emit_fmt(format_args!("    {} ${}, %ymm1, %ymm0, %ymm0", inst, imm));
                     self.emit_avx_store_dest(dptr);
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
 
@@ -1715,6 +1879,10 @@ impl I686Codegen {
                     self.state
                         .emit_fmt(format_args!("    {} ${}, %xmm1, %ymm0, %ymm0", inst, imm));
                     self.emit_avx_store_dest(dptr);
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
 
@@ -1732,6 +1900,10 @@ impl I686Codegen {
                         .emit_fmt(format_args!("    {} ${}, %ymm0, %xmm0", inst, imm));
                     self.operand_to_eax(&Operand::Value(*dptr));
                     self.state.emit("    vmovdqu %xmm0, (%eax)");
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
 
@@ -1747,6 +1919,10 @@ impl I686Codegen {
                     self.state
                         .emit_fmt(format_args!("    {} %xmm1, %ymm0", inst));
                     self.emit_avx_store_dest(dptr);
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
 
@@ -1757,6 +1933,10 @@ impl I686Codegen {
                     self.emit_avx_load128(&args[0], "xmm0");
                     self.state.emit("    vinserti128 $1, %xmm0, %ymm0, %ymm0");
                     self.emit_avx_store_dest(dptr);
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
 
@@ -1767,6 +1947,10 @@ impl I686Codegen {
                     self.state.emit("    vpxor %ymm1, %ymm1, %ymm1");
                     self.state.emit("    vinserti128 $0, %xmm0, %ymm1, %ymm0");
                     self.emit_avx_store_dest(dptr);
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
 
@@ -1777,6 +1961,10 @@ impl I686Codegen {
                     self.state.emit("    vextracti128 $0, %ymm0, %xmm0");
                     self.operand_to_eax(&Operand::Value(*dptr));
                     self.state.emit("    vmovdqu %xmm0, (%eax)");
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
 
@@ -1795,6 +1983,10 @@ impl I686Codegen {
                     self.state
                         .emit_fmt(format_args!("    {} %ymm2, %ymm1, %ymm0, %ymm0", inst));
                     self.emit_avx_store_dest(dptr);
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
 
@@ -1821,6 +2013,10 @@ impl I686Codegen {
                     self.state
                         .emit_fmt(format_args!("    {} %ymm1, %ymm2, %ymm0", inst));
                     self.emit_avx_store_dest(dptr);
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
 
@@ -1831,6 +2027,10 @@ impl I686Codegen {
                     self.emit_avx_load(&args[1], "ymm1");
                     self.state.emit("    vpermd %ymm0, %ymm1, %ymm0");
                     self.emit_avx_store_dest(dptr);
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
 
@@ -1841,6 +2041,10 @@ impl I686Codegen {
                     self.state
                         .emit_fmt(format_args!("    vpshufd ${}, %ymm0, %ymm0", imm));
                     self.emit_avx_store_dest(dptr);
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
 
@@ -1851,6 +2055,10 @@ impl I686Codegen {
                     self.state
                         .emit_fmt(format_args!("    vpermq ${}, %ymm0, %ymm0", imm));
                     self.emit_avx_store_dest(dptr);
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
 
@@ -1867,6 +2075,10 @@ impl I686Codegen {
                     self.state
                         .emit_fmt(format_args!("    {} ${}, %ymm0, %ymm0", inst, imm));
                     self.emit_avx_store_dest(dptr);
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
 
@@ -1892,6 +2104,10 @@ impl I686Codegen {
                         _ => unreachable!("unexpected AVX shift op: {:?}", op),
                     };
                     self.emit_avx_packed_shift(dptr, args, inst);
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
             // SSE4.1 widening conversions with a 128-bit source, 256-bit dest.
@@ -1915,6 +2131,10 @@ impl I686Codegen {
                     self.state
                         .emit_fmt(format_args!("    {} %xmm0, %ymm0", inst));
                     self.emit_avx_store_dest(dptr);
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
 
@@ -1931,6 +2151,10 @@ impl I686Codegen {
                     self.state
                         .emit_fmt(format_args!("    {} %ymm0, %ymm0", inst));
                     self.emit_avx_store_dest(dptr);
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
 
@@ -1989,6 +2213,10 @@ impl I686Codegen {
                             .emit_fmt(format_args!("    {} %xmm0, %ymm0", inst));
                     }
                     self.emit_avx_store_dest(dptr);
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
 
@@ -1996,6 +2224,10 @@ impl I686Codegen {
                 if let Some(dptr) = dest_ptr {
                     self.emit_avx_load(&args[0], "ymm0");
                     self.emit_avx_store_dest(dptr);
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
             IntrinsicOp::Storeu256 | IntrinsicOp::Store256 => {
@@ -2008,6 +2240,10 @@ impl I686Codegen {
                 if let Some(dptr) = dest_ptr {
                     self.emit_avx_load(&args[0], "ymm0");
                     self.emit_avx_store_dest(dptr);
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
             IntrinsicOp::StoreuPs256 | IntrinsicOp::StoreuPd256 => {
@@ -2055,6 +2291,10 @@ impl I686Codegen {
                     // VEX.128 integer XOR is AVX1 and clears the upper YMM half.
                     self.state.emit("    vpxor %xmm0, %xmm0, %xmm0");
                     self.emit_avx_store_dest(dptr);
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
 
@@ -2144,6 +2384,10 @@ impl I686Codegen {
                         self.operand_to_eax(&Operand::Value(*dptr));
                         self.state.emit("    vmovdqu %xmm0, (%eax)");
                     }
+                } else if dest.is_some() {
+                    panic!(
+                        "i686 emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                    );
                 }
             }
 
@@ -2937,5 +3181,28 @@ fn emit_load_stack_guard_i686(cg: &mut I686Codegen, dest: &Option<Value>) {
     cg.state.reg_cache.invalidate_acc();
     if let Some(d) = dest {
         cg.store_eax_to(d);
+    }
+}
+
+/// The i686 emitter's value-producing groups are memory-result-form only:
+/// their helpers stage the destination as a pointer (`operand_to_eax`) and
+/// store through it, so an SSA-form result (dest, no dest_ptr) has no home to
+/// write.  That shape must never come back as silence — it must fail loudly.
+#[cfg(test)]
+mod intrinsic_destination_contract_tests {
+    use super::*;
+
+    #[test]
+    fn ssa_form_of_value_ops_is_refused_not_silently_dropped() {
+        let mut cg = I686Codegen::new();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cg.emit_intrinsic_impl(
+                &Some(Value(2)),
+                &IntrinsicOp::Psubusw128,
+                &None,
+                &[Operand::Value(Value(0)), Operand::Value(Value(1))],
+            );
+        }));
+        assert!(result.is_err(), "i686 silently accepted the SSA form again");
     }
 }

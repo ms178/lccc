@@ -1154,7 +1154,7 @@ fn vectorize_with_analysis_mode(
             && !force_sse2
             && x86_avx2_available()
             && {
-                let n = strided_i32_reduce::try_transform(func, loop_info, &cfg);
+                let n = strided_i32_reduce::try_transform(func, loop_info, &cfg, symbol_facts);
                 total_changes += n;
                 n > 0
             }
