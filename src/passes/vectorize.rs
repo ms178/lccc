@@ -35065,10 +35065,7 @@ pub(crate) fn vectorize_function_late_with_symbol_facts(
 /// AVX2 transform miss its intended loop. This narrow entry only applies the
 /// strided reducer; every decline leaves the function untouched for the
 /// ordinary unroll/vectorize pipeline.
-pub(crate) fn vectorize_strided_i32_reductions_before_unroll(
-    func: &mut IrFunction,
-    symbol_facts: &ModuleSymbolFacts,
-) -> usize {
+pub(crate) fn vectorize_strided_i32_reductions_before_unroll(func: &mut IrFunction) -> usize {
     if super::fp_environment_blocks_reordering(func) || !x86_avx2_available() {
         return 0;
     }
@@ -35083,7 +35080,11 @@ pub(crate) fn vectorize_strided_i32_reductions_before_unroll(
         );
         let mut changed = 0usize;
         for lp in &loops {
-            changed = strided_i32_reduce::try_transform(func, lp, &cfg, symbol_facts);
+            // The pass proves its own object properties: a contiguous load is
+            // admitted only inside a bounded, nonescaping private stack object,
+            // which module symbol facts cannot strengthen (a locally binding
+            // global is still observable by another thread).
+            changed = strided_i32_reduce::try_transform(func, lp, &cfg);
             if changed > 0 {
                 break;
             }

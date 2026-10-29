@@ -2332,7 +2332,6 @@ pub(crate) fn run_passes(
             && matches!(target, crate::backend::Target::X86_64)
             && !pass_disabled(&disabled, "vectorize")
         {
-            let symbol_facts = module_symbol_facts::ModuleSymbolFacts::from_module(module, pic);
             let n = timed_pass!(
                 "vectorize_strided_reduce_pre_unroll",
                 run_on_visited(
@@ -2342,10 +2341,7 @@ pub(crate) fn run_passes(
                     |f: &mut crate::ir::reexports::IrFunction| {
                         let feats = f.target_features.clone();
                         with_function_x86_vec_isa(target, x86_isa, x86_avx512vl, &feats, |_| {
-                            vectorize::vectorize_strided_i32_reductions_before_unroll(
-                                f,
-                                &symbol_facts,
-                            )
+                            vectorize::vectorize_strided_i32_reductions_before_unroll(f)
                         })
                     }
                 )
