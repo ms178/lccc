@@ -7729,29 +7729,38 @@ fn eliminate_redundant_test_i686(store: &mut LineStore, infos: &mut [LineInfo]) 
 
 // ── Pass: fold an arithmetic self-TEST into a sign-only branch ──────────────
 
-/// `subl %esi, %edx; testl %edx, %edx; jl .L` tests whether the *wrapped*
-/// result is negative.  TEST clears OF, so `jl` here is exactly `js`; the
-/// arithmetic producer has the same SF as the test at the same width.  The
-/// mirrored `jge` -> `jns` case is the non-negative predicate.  A logical
-/// AND/OR/XOR producer is flag-for-flag exact, so the strict `jg`/`jle`
-/// predicates are also admitted unchanged (their OF input is already the zero
-/// TEST would install).  All other conditions, width mismatches, redefinitions,
-/// barriers and unknown flag readers refuse conservatively.
-///
-/// The i686 backend lowers ternary selections to branches, not CMOVs, so this
-/// is the 32-bit twin of the x86-64 `fold_arithmetic_test_sign_cmov` pass.  It
-/// runs after the exact logical self-test eliminator (which already removes the
-/// TEST for `and`/`or`/`xor`) and before the sext/test fusion, with its own
-/// kill switch so an A/B can attribute the rewrite on its own.
-///
-/// Proof obligation after the branch: deleting TEST exposes the arithmetic
-/// producer's CF/OF/AF.  A bounded CFG walk from BOTH successors must reach a
-/// complete flag writer or a return without meeting another flag reader or an
-/// unresolvable edge.  This is stricter than the x86-64 ZF/SF/PF consumer
-/// licence and is cheap because i686 branches stay inside small generated
-/// blocks; it keeps the default-deny model of this module intact.
+// `subl %esi, %edx; testl %edx, %edx; jl .L` tests whether the *wrapped*
+// result is negative. TEST clears OF, so `jl` here is exactly `js`; the
+// arithmetic producer has the same SF as the test at the same width. The
+// mirrored `jge` -> `jns` case is the non-negative predicate. A logical
+// AND/OR/XOR producer is flag-for-flag exact, so the strict `jg`/`jle`
+// predicates are also admitted unchanged. All other conditions, width
+// mismatches, redefinitions, barriers and unknown flag readers refuse.
+//
+// The i686 backend lowers ternary selections to branches, not CMOVs. The fold
+// runs after exact logical self-test elimination and before sext/test fusion.
+// Deleting TEST exposes the arithmetic producer's CF/OF/AF, so a bounded CFG
+// walk from BOTH successors must reach a complete flag writer or a return
+// without another flag reader or an unresolvable edge. This is stricter than
+// the x86-64 ZF/SF/PF licence and keeps the default-deny model intact.
+thread_local! {
+    // Resolved once per translation unit by run_passes. Defaults to the
+    // environment-unset behavior for direct pass tests and compiler helpers.
+    static SIGN_JCC_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Set whether `CCC_NO_I686_SIGN_JCC` disables the sign-branch fold.
+pub(crate) fn set_sign_jcc_enabled(enabled: bool) {
+    SIGN_JCC_ENABLED.with(|cell| cell.set(enabled));
+}
+
+/// Current per-thread state of the sign-branch fold's kill switch.
+pub(crate) fn sign_jcc_enabled() -> bool {
+    SIGN_JCC_ENABLED.with(|cell| cell.get())
+}
+
 fn fold_arithmetic_test_sign_jcc_i686(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
-    if std::env::var_os("CCC_NO_I686_SIGN_JCC").is_some() {
+    if !sign_jcc_enabled() {
         return false;
     }
 
@@ -24620,7 +24629,8 @@ mod sign_test_jcc_tests {
 
     #[test]
     fn dedicated_kill_switch_disables_the_pass() {
-        let _guard = crate::test_support::EnvGuard::set("CCC_NO_I686_SIGN_JCC", "1");
+        let _guard =
+            crate::test_support::ScopedFlag::new(sign_jcc_enabled, set_sign_jcc_enabled, false);
         let (changed, out) = run_pass(&format!(
             ".text\nf:\n.cfi_startproc\n{}\n.cfi_endproc\n.size f, .-f\n",
             base_body("l")

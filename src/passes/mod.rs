@@ -1602,6 +1602,9 @@ pub(crate) fn run_passes(
     // outside that count.
     let strided_reduce_allowed = std::env::var_os("CCC_NO_STRIDED_REDUCE").is_none();
     vectorize::set_strided_reduce_enabled(strided_reduce_allowed);
+    crate::backend::i686::codegen::peephole::set_sign_jcc_enabled(
+        std::env::var_os("CCC_NO_I686_SIGN_JCC").is_none(),
+    );
     inline::set_ssa_param_config(inline::SsaParamConfig {
         enabled: std::env::var("CCC_NO_SSA_PARAM").is_err(),
         skip: std::env::var("CCC_SSA_PARAM_SKIP")
@@ -2332,7 +2335,6 @@ pub(crate) fn run_passes(
             && matches!(target, crate::backend::Target::X86_64)
             && !pass_disabled(&disabled, "vectorize")
         {
-            let symbol_facts = module_symbol_facts::ModuleSymbolFacts::from_module(module, pic);
             let n = timed_pass!(
                 "vectorize_strided_reduce_pre_unroll",
                 run_on_visited(
@@ -2342,10 +2344,7 @@ pub(crate) fn run_passes(
                     |f: &mut crate::ir::reexports::IrFunction| {
                         let feats = f.target_features.clone();
                         with_function_x86_vec_isa(target, x86_isa, x86_avx512vl, &feats, |_| {
-                            vectorize::vectorize_strided_i32_reductions_before_unroll(
-                                f,
-                                &symbol_facts,
-                            )
+                            vectorize::vectorize_strided_i32_reductions_before_unroll(f)
                         })
                     }
                 )
