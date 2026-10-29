@@ -154,9 +154,17 @@ Disassembly of section .fini:
                                 self.assertIn('=== before/vdbe_serial_get ===', call.args[1])
             self.assertEqual(total, 26)
             # AVX, paired timing for up to 20 cases (including identities),
-            # batched timing, the join A/B and Callgrind summaries must remain
-            # visible alongside every assembly excerpt.
-            self.assertLessEqual(6 + 10 + 6 + 1 + 1 + total, 50)
+            # batched timing, the join A/B, the zero-extension ablation and the
+            # Callgrind summaries must remain visible alongside every excerpt.
+            # Rows are packed, so count the real packing rather than a grid.
+            rows = [{'profile': 'native', 'name': f'case{i}', 'source_sha256': 'a' * 64,
+                     'whole_executable_identical': False, 'whole_executable_identical_rolled': False,
+                     'ratios_after_over': {arm: {'median': 1.0123, 'ci95': [0.9912, 1.0345]}
+                                           for arm in ('before', 'gcc', 'clang', 'icx', 'rolled')}}
+                    for i in range(20)]
+            packed = sum(len(m.row_notices(rows)) for _ in ('portable', 'native'))
+            self.assertLessEqual(packed, 6, '20 paired rows must pack into three notices per profile')
+            self.assertLessEqual(6 + packed + 6 + 1 + 1 + 1 + total, 50)
 
     def test_native_profile_requires_actual_native_flag(self):
         r = report()
