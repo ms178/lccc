@@ -7750,8 +7750,31 @@ fn eliminate_redundant_test_i686(store: &mut LineStore, infos: &mut [LineInfo]) 
 /// unresolvable edge.  This is stricter than the x86-64 ZF/SF/PF consumer
 /// licence and is cheap because i686 branches stay inside small generated
 /// blocks; it keeps the default-deny model of this module intact.
+thread_local! {
+    /// Whether the arithmetic/TEST sign-branch fold may run, resolved ONCE per
+    /// translation unit by `run_passes` (`set_sign_jcc_enabled`).
+    ///
+    /// The switch used to be read from the environment on every call. That is
+    /// a process-global read competing with every test that flips it for a
+    /// window, so a concurrently running fold could silently observe another
+    /// test's kill switch and skip an optimization it was asserting on. It is
+    /// also the pattern the environment-read ratchet forbids for per-call code:
+    /// a codegen switch belongs in per-thread state, resolved once.
+    static SIGN_JCC_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Record whether `CCC_NO_I686_SIGN_JCC` allows the fold.
+pub(crate) fn set_sign_jcc_enabled(enabled: bool) {
+    SIGN_JCC_ENABLED.with(|cell| cell.set(enabled));
+}
+
+/// Current state of the fold's kill switch.
+pub(crate) fn sign_jcc_enabled() -> bool {
+    SIGN_JCC_ENABLED.with(|cell| cell.get())
+}
+
 fn fold_arithmetic_test_sign_jcc_i686(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
-    if std::env::var_os("CCC_NO_I686_SIGN_JCC").is_some() {
+    if !sign_jcc_enabled() {
         return false;
     }
 
@@ -24620,7 +24643,10 @@ mod sign_test_jcc_tests {
 
     #[test]
     fn dedicated_kill_switch_disables_the_pass() {
-        let _guard = crate::test_support::EnvGuard::set("CCC_NO_I686_SIGN_JCC", "1");
+        // Per-thread switch behind the RAII guard: no environment mutation, so
+        // a concurrent test cannot observe or race this window.
+        let _guard =
+            crate::test_support::ScopedFlag::new(sign_jcc_enabled, set_sign_jcc_enabled, false);
         let (changed, out) = run_pass(&format!(
             ".text\nf:\n.cfi_startproc\n{}\n.cfi_endproc\n.size f, .-f\n",
             base_body("l")
