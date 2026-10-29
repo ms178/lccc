@@ -1790,7 +1790,7 @@ fn peephole_optimize_inner(
         if !sk("dead_regs") {
             global_changed |= dead_code::eliminate_dead_reg_moves(&store, &mut infos);
             global_changed |= dead_code::eliminate_dead_fp_moves(&store, &mut infos);
-            global_changed |= self_zext::eliminate_redundant_self_zext(&store, &mut infos);
+            global_changed |= self_zext::eliminate_redundant_self_zext(&mut store, &mut infos);
         }
         if !sk("lea_narrow") {
             global_changed |= lea_narrow::narrow_lea_truncations(&mut store, &mut infos);
@@ -1960,7 +1960,7 @@ fn peephole_optimize_inner(
             if !sk("dead_regs") {
                 changed2 |= dead_code::eliminate_dead_reg_moves(&store, &mut infos);
                 changed2 |= dead_code::eliminate_dead_fp_moves(&store, &mut infos);
-                changed2 |= self_zext::eliminate_redundant_self_zext(&store, &mut infos);
+                changed2 |= self_zext::eliminate_redundant_self_zext(&mut store, &mut infos);
             }
             if !sk("lea_narrow") {
                 changed2 |= lea_narrow::narrow_lea_truncations(&mut store, &mut infos);
@@ -2054,7 +2054,7 @@ fn peephole_optimize_inner(
     {
         renamed_late = true;
         if !sk("dead_regs") {
-            self_zext::eliminate_redundant_self_zext(&store, &mut infos);
+            self_zext::eliminate_redundant_self_zext(&mut store, &mut infos);
             dead_code::eliminate_dead_reg_moves(&store, &mut infos);
         }
         if !sk("lea_narrow") {
@@ -2069,7 +2069,7 @@ fn peephole_optimize_inner(
     {
         renamed_late = true;
         if !sk("dead_regs") {
-            self_zext::eliminate_redundant_self_zext(&store, &mut infos);
+            self_zext::eliminate_redundant_self_zext(&mut store, &mut infos);
             dead_code::eliminate_dead_reg_moves(&store, &mut infos);
         }
     }
@@ -2114,7 +2114,7 @@ fn peephole_optimize_inner(
             if !sk("dead_regs") {
                 changed3 |= dead_code::eliminate_dead_reg_moves(&store, &mut infos);
                 changed3 |= dead_code::eliminate_dead_fp_moves(&store, &mut infos);
-                changed3 |= self_zext::eliminate_redundant_self_zext(&store, &mut infos);
+                changed3 |= self_zext::eliminate_redundant_self_zext(&mut store, &mut infos);
             }
             if !sk("lea_narrow") {
                 changed3 |= lea_narrow::narrow_lea_truncations(&mut store, &mut infos);

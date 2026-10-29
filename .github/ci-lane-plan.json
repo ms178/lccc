@@ -324,7 +324,7 @@
     "backend-contracts-b": {
       "group": "backend-contracts",
       "mode": "shell",
-      "predicted_gate_seconds": 421.488,
+      "predicted_gate_seconds": 421.628,
       "shards": 2,
       "step": "Verify remaining fast local contracts (shard b of 2)",
       "steps": [
@@ -556,6 +556,10 @@
           "measured_s": 0.92,
           "name": "bash tests/regression/check_rmw_index_zext_codegen.sh"
         },
+          {
+           "measured_s": 0.14,
+           "name": "bash tests/regression/check_redundant_self_zext.sh"
+          },
         {
           "measured_s": 0.78,
           "name": "python3 tests/regression/check_llvm_missed_zero_choice.py"
@@ -1542,8 +1546,8 @@
   "provenance": {
     "backend-contracts": {
       "costs": "/tmp/audit/backend_contracts_costs.tsv",
-      "measured_seconds_total": 829.918,
-      "source": "measured: scripts/ci_gate_costs.py (previous plan measured_s); iabs-cmp-fold 0.40 s measured fresh by scripts/ci_gate_costs.py --only iabs_cmp; arithmetic-test-sign-cmov 2 s measured fresh by scripts/ci_local.sh --only arithmetic-test-sign-cmov (2026-10-24); count-observations 8.908 s measured with both pinned vendors and extra frozen-baseline mechanism leg (conservative hosted scheduling estimate, 2026-10-25); ipa-ra-interposition 0.7 s measured fresh by a timed run of tests/regression/check_ipa_ra_interposition.sh (2026-10-24)"
+      "measured_seconds_total": 830.058,
+      "source": "measured: scripts/ci_gate_costs.py (previous plan measured_s); iabs-cmp-fold 0.40 s measured fresh by scripts/ci_gate_costs.py --only iabs_cmp; arithmetic-test-sign-cmov 2 s measured fresh by scripts/ci_local.sh --only arithmetic-test-sign-cmov (2026-10-24); count-observations 8.908 s measured with both pinned vendors and extra frozen-baseline mechanism leg (conservative hosted scheduling estimate, 2026-10-25); ipa-ra-interposition 0.7 s measured fresh by a timed run of tests/regression/check_ipa_ra_interposition.sh (2026-10-24); redundant-self-zext 0.14 s measured fresh by scripts/ci_gate_costs.py --only redundant_self_zext (2026-10-29)"
     },
     "codegen": {
       "costs": "/home/user/.cache/tmp/codegen.tsv",
