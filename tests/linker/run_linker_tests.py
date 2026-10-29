@@ -7879,6 +7879,178 @@ def _linker_start_object(td):
     return sh([CC, "-c", "start.s", "-o", "start.o"], cwd=td)
 
 
+def _max_page_size_gnu_syntax_test(args, oracles):
+    """Script links parse GNU page-size syntax and preserve BFD's 4 KiB default."""
+    name = "max_page_size_gnu_syntax_script_links"
+    lccc_ld = os.path.abspath(os.path.join(os.path.dirname(args.lccc), "lccc-ld"))
+    if not os.path.exists(lccc_ld):
+        return Result(name, "SKIP", "no lccc-ld")
+
+    with tempfile.TemporaryDirectory(prefix="lccc-max-page-size-") as td:
+        compiled = _linker_start_object(td)
+        if compiled.returncode:
+            return Result(name, "SKIP", "x86-64 fixture compile failed: " +
+                          compiled.stderr.decode(errors="replace")[:200])
+        script = textwrap.dedent("""\
+            ENTRY(_start)
+            SECTIONS {
+              . = 0x400000 + SIZEOF_HEADERS;
+              .text : { *(.text .text.*) }
+              .rodata : { *(.rodata .rodata.*) }
+              .data : { *(.data .data.*) }
+              .bss : { *(.bss .bss.*) }
+            }
+        """)
+        with open(os.path.join(td, "page.lds"), "w", encoding="utf-8") as stream:
+            stream.write(script)
+
+        source32 = textwrap.dedent("""\
+            .text
+            .globl _start
+            .type _start,@function
+        _start:
+            mov $1, %eax
+            xor %ebx, %ebx
+            int $0x80
+            .size _start, .-_start
+            .section .note.GNU-stack,"",@progbits
+        """)
+        with open(os.path.join(td, "start32.s"), "w", encoding="utf-8") as stream:
+            stream.write(source32)
+        assembled32 = sh([CC, "-m32", "-c", "start32.s", "-o", "start32.o"], cwd=td)
+        have_i386 = assembled32.returncode == 0
+
+        def load_alignments(path):
+            phdrs = sh(["readelf", "-lW", path], cwd=td)
+            if phdrs.returncode:
+                return None, phdrs.stderr.decode(errors="replace")
+            loads = []
+            for line in phdrs.stdout.decode(errors="replace").splitlines():
+                fields = line.split()
+                if fields and fields[0] == "LOAD":
+                    try:
+                        loads.append(int(fields[-1], 16))
+                    except (ValueError, IndexError):
+                        return None, f"cannot parse LOAD alignment: {line!r}"
+            if not loads:
+                return None, "no PT_LOAD program headers"
+            return loads, None
+
+        # GNU ld 2.47's x86-64 and i386 script-link default is 4 KiB. The
+        # accepted integer forms below were checked against that local BFD
+        # oracle; zero selects the target's default rather than p_align=0.
+        accepted = (
+            ("default", (), 0x1000),
+            ("zero", ("-z", "max-page-size=0"), 0x1000),
+            ("octal", ("-zmax-page-size=010000",), 0x1000),
+            ("upper-hex", ("-z", "max-page-size=0X1000"), 0x1000),
+            ("leading-space", ("-z", "max-page-size= 4096"), 0x1000),
+            ("explicit-large", ("-z", "max-page-size=0x200000"), 0x200000),
+        )
+
+        def exercise(label, prefix, obj):
+            for suffix, option, expected in accepted:
+                output = f"{label}.{suffix}.out"
+                linked = sh([lccc_ld, *prefix, *option, obj, "-o", output], cwd=td)
+                if linked.returncode:
+                    return f"{label}/{suffix}: link failed: {linked.stderr.decode(errors='replace')[:300]}"
+                alignments, problem = load_alignments(output)
+                if problem:
+                    return f"{label}/{suffix}: {problem}"
+                if any(value != expected for value in alignments):
+                    return f"{label}/{suffix}: expected all LOAD alignments {expected:#x}, got {alignments}"
+
+            for suffix, value, expected_text in (
+                ("trailing-space", "max-page-size=4096 ", "invalid maximum page size"),
+                ("malformed", "max-page-size=3", "invalid maximum page size"),
+                ("sub-page", "max-page-size=2048", "unsupported maximum page size"),
+            ):
+                failed = sh(
+                    [lccc_ld, *prefix, "-z", value, obj, "-o", f"{label}.{suffix}.out"],
+                    cwd=td,
+                )
+                stderr = failed.stderr.decode(errors="replace")
+                if failed.returncode == 0 or expected_text not in stderr:
+                    return f"{label}/{suffix}: invalid value was not rejected correctly: {stderr!r}"
+            return None
+
+        modes = [("x86-64", ["-T", "page.lds"], "start.o")]
+        if have_i386:
+            modes.append(("i386", ["-m", "elf_i386", "-T", "page.lds"], "start32.o"))
+        for label, prefix, obj in modes:
+            failure = exercise(label, prefix, obj)
+            if failure:
+                return Result(name, "FAIL", failure)
+        note = "" if have_i386 else "; i386 assembler unavailable"
+        return Result(name, "PASS", "page-size parser and script alignment agree" + note)
+
+
+def _script_link_unsupported_option_warnings_test(args, oracles):
+    """Script links diagnose unsupported options and promote them consistently."""
+    name = "script_link_unsupported_option_warnings"
+    lccc_ld = os.path.abspath(os.path.join(os.path.dirname(args.lccc), "lccc-ld"))
+    if not os.path.exists(lccc_ld):
+        return Result(name, "SKIP", "no lccc-ld")
+
+    with tempfile.TemporaryDirectory(prefix="lccc-script-option-warnings-") as td:
+        compiled = _linker_start_object(td)
+        if compiled.returncode:
+            return Result(name, "SKIP", "fixture compile failed: " +
+                          compiled.stderr.decode(errors="replace")[:200])
+        with open(os.path.join(td, "page.lds"), "w", encoding="utf-8") as stream:
+            stream.write(textwrap.dedent("""\
+                ENTRY(_start)
+                SECTIONS { . = 0x400000 + SIZEOF_HEADERS; .text : { *(.text .text.*) } }
+            """))
+
+        cases = (
+            ("image-base", ("--image-base=0x80000",),
+             "--image-base ignored: explicit image bases are not implemented for linker-script links"),
+            ("relr", ("-z", "pack-relative-relocs"),
+             "--pack-dyn-relocs=relr / -z pack-relative-relocs ignored: RELR packing is not implemented for linker-script links"),
+            ("warn-common", ("--warn-common",),
+             "--warn-common ignored: common-symbol diagnostics are not implemented for linker-script links"),
+            ("global", ("-z", "global"), "-z global ignored"),
+        )
+        for label, option, message in cases:
+            plain = sh([lccc_ld, "-T", "page.lds", *option, "start.o", "-o", f"{label}.out"], cwd=td)
+            stderr = plain.stderr.decode(errors="replace")
+            if plain.returncode or message not in stderr:
+                return Result(name, "FAIL", f"{label}: unsupported request was not diagnosed: {stderr!r}")
+
+            for order, flags in (
+                ("fatal-first", ("--fatal-warnings", *option)),
+                ("fatal-last", (*option, "--fatal-warnings")),
+            ):
+                fatal = sh(
+                    [lccc_ld, "-T", "page.lds", *flags, "start.o", "-o", f"{label}.{order}.out"],
+                    cwd=td,
+                )
+                fatal_stderr = fatal.stderr.decode(errors="replace")
+                if (fatal.returncode == 0 or "warning treated as error" not in fatal_stderr
+                        or message not in fatal_stderr):
+                    return Result(
+                        name, "FAIL",
+                        f"{label}/{order}: warning was not promoted consistently: {fatal_stderr!r}",
+                    )
+
+        # `-z global` is implemented by the regular x86 linker, but not by
+        # the script emitter above. Keep the context-specific warning policy
+        # honest: the ordinary shared link emits DF_1_GLOBAL without warning.
+        global_link = sh(
+            [lccc_ld, "-shared", "-z", "global", "start.o", "-o", "global.so"],
+            cwd=td,
+        )
+        global_stderr = global_link.stderr.decode(errors="replace")
+        if global_link.returncode or "-z global ignored" in global_stderr:
+            return Result(name, "FAIL", f"regular -z global link was not honored: {global_stderr!r}")
+        dynamic = sh(["readelf", "-dW", "global.so"], cwd=td)
+        dynamic_text = dynamic.stdout.decode(errors="replace")
+        if dynamic.returncode or "(FLAGS_1)" not in dynamic_text or "GLOBAL" not in dynamic_text:
+            return Result(name, "FAIL", f"regular -z global did not set DF_1_GLOBAL: {dynamic_text!r}")
+        return Result(name, "PASS", "script warnings honor fatal state; regular x86 emits DF_1_GLOBAL")
+
+
 def _common_page_size_warning_test(args, oracles):
     """The ignored common-page-size warning survives all supported x86 link paths."""
     name = "common_page_size_warns_and_honors_fatal_warnings"
@@ -12478,6 +12650,10 @@ def _registry(args, oracles):
         one("positional_shared_operands", _positional_shared_operands_test, "dynamic"),
         one("common_page_size_warns_and_honors_fatal_warnings",
             _common_page_size_warning_test, "options", "layout", "diagnostics"),
+        one("max_page_size_gnu_syntax_script_links",
+            _max_page_size_gnu_syntax_test, "options", "layout", "script"),
+        one("script_link_unsupported_option_warnings",
+            _script_link_unsupported_option_warnings_test, "options", "script", "diagnostics"),
         one("image_base_sets_first_load", _image_base_layout_test, "options", "layout"),
         one("binary_output_matches_objcopy", _binary_output_matches_objcopy_test,
             "options", "layout"),

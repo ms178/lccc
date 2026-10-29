@@ -290,8 +290,29 @@ pub fn link_builtin(
     // is read; parsing later left early inputs (CRT objects, user objects and
     // scripts) searching only the driver's default directories.
     let parsed_args = linker_common::parse_linker_args(user_args);
-    parsed_args.validate_common_page_size()?;
+    // Reject malformed options and parse-only target settings before opening
+    // any CRT or user input, so a missing file cannot hide an option error.
+    parsed_args.validate_common_options()?;
+    let cet_flags = parsed_args.property_link_flags()?;
     let fatal_warnings = parsed_args.fatal_warnings;
+    let mut option_warnings: Vec<String> = parsed_args
+        .z_ignored_keywords
+        .iter()
+        .map(|kw| format!("-z {kw} ignored"))
+        .collect();
+    option_warnings.extend(parsed_args.z_other_keyword_warnings_except(&["global"]));
+    if parsed_args.emit_relocs {
+        option_warnings.push(
+            "--emit-relocs ignored: relocation retention is only implemented for -T script links"
+                .to_string(),
+        );
+    }
+    if fatal_warnings && !option_warnings.is_empty() {
+        return Err(format!("warning treated as error: {}", option_warnings[0]));
+    }
+    for warning in &option_warnings {
+        eprintln!("lccc-ld: warning: {warning}");
+    }
     if parsed_args.warn_common {
         objects.enable_warn_common();
     }
@@ -332,37 +353,6 @@ pub fn link_builtin(
     phase!("load-inputs");
     // Before the field moves below partially move `parsed_args`.
     let requested_dyn_flags = parsed_args.requested_dyn_flags();
-    // `-z ibt=func` & co: accepted, ignored, and warned about — verbatim
-    // GNU ld wording. Collect these together with the non-script
-    // `--emit-relocs` warning so the final --fatal-warnings state applies
-    // uniformly, independent of option order.
-    let mut option_warnings: Vec<String> = parsed_args
-        .z_ignored_keywords
-        .iter()
-        .map(|kw| format!("-z {kw} ignored"))
-        .collect();
-    // `--emit-relocs` is implemented only for `-T` script links
-    // (`emit_script` retains the applied relocations there); on this path
-    // the flag parses but the emitter cannot honour it, so say so rather
-    // than silently producing an image without them.
-    if parsed_args.emit_relocs {
-        option_warnings.push(
-            "--emit-relocs ignored: relocation retention is only implemented for -T script links"
-                .to_string(),
-        );
-    }
-    if parsed_args.fatal_warnings && !option_warnings.is_empty() {
-        return Err(format!("warning treated as error: {}", option_warnings[0]));
-    }
-    for warning in &option_warnings {
-        eprintln!("lccc-ld: warning: {warning}");
-    }
-    // Computed here, before the field moves below: the CET merge itself
-    // runs much later (see below), but `property_link_flags` borrows the
-    // parsed args, and an invalid `-z x86-64-*` level should fail the link
-    // before any real work happens anyway.
-    let cet_flags = parsed_args.property_link_flags()?;
-    parsed_args.validate_common_options()?;
     let layout_opts = super::types::EmitLayoutOpts {
         page_size: parsed_args.resolved_page_size(super::types::PAGE_SIZE)?,
         image_base: parsed_args.image_base,
@@ -1063,6 +1053,7 @@ pub fn link_shared(
         .iter()
         .map(|kw| format!("-z {kw} ignored"))
         .collect();
+    option_warnings.extend(parsed.z_other_keyword_warnings_except(&["global"]));
     if parsed.emit_relocs {
         option_warnings.push(
             "--emit-relocs ignored: relocation retention is only implemented for -T script links"

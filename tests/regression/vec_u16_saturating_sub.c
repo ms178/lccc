@@ -27,6 +27,16 @@ void sat_gt(word *restrict d, const word *restrict s, unsigned n, word k) {
     }
 }
 
+/* Spell max(x, k) explicitly so SSE2 exercises the compare/select matcher. */
+__attribute__((noinline))
+void sat_max_select(word *restrict d, const word *restrict s, unsigned n, word k) {
+    for (unsigned i = 0; i < n; ++i) {
+        word x = s[i];
+        word m = x > k ? x : k;
+        d[i] = (word)(m - k);
+    }
+}
+
 __attribute__((noinline))
 void sat_lt(word *restrict d, const word *restrict s, unsigned n, word k) {
     for (unsigned i = 0; i < n; ++i) {
@@ -170,6 +180,14 @@ int main(void) {
                     maps[m](output + GUARD + off, input + off, n, k);
                     if (!same("saturation", n, k)) return 1;
                 }
+                blank();
+                for (unsigned i = 0; i < n; ++i) {
+                    volatile word x = input[off + i];
+                    word m = x > k ? x : k;
+                    expected[GUARD + off + i] = (word)(m - k);
+                }
+                sat_max_select(output + GUARD + off, input + off, n, k);
+                if (!same("max-select", n, k)) return 1;
                 blank();
                 for (unsigned i = 0; i < n; ++i) {
                     volatile word x = input[off + i];

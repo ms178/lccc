@@ -39,15 +39,18 @@ for opt in -O2 -O3; do
         fi
         cmp "$tmp/$label.out" "$tmp/$label-gcc.out" || fail "$label disagrees with GCC"
         function_body sat_ge "$tmp/$label.s" > "$tmp/$label-sat.s"
+        function_body sat_max_select "$tmp/$label.s" > "$tmp/$label-sat-max.s"
         function_body signed_compare "$tmp/$label.s" > "$tmp/$label-signed.s"
         function_body nonzero_fallback "$tmp/$label.s" > "$tmp/$label-nonzero.s"
         if [[ "$mode" == sse2 ]]; then
             grep -Eq '\bpsubusw\b' "$tmp/$label-sat.s" || fail "$label lacks SSE2 saturation"
+            grep -Eq '\bpsubusw\b' "$tmp/$label-sat-max.s" || fail "$label lacks SSE2 compare/select max saturation"
             if grep -Eq '\b[yz]mm[0-9]+\b|\bvpsubusw\b' "$tmp/$label.s"; then
                 fail "$label emitted a post-SSE2 vector instruction"
             fi
         elif [[ "$mode" == avx2 ]]; then
             grep -Eq '\bvpsubusw\b.*%ymm' "$tmp/$label-sat.s" || fail "$label lacks AVX2 saturation"
+            grep -Eq '\bvpsubusw\b.*%ymm' "$tmp/$label-sat-max.s" || fail "$label lacks AVX2 compare/select max saturation"
         else
             if grep -Eq '\b[xyz]mm[0-9]+\b|\bv?psubusw\b' "$tmp/$label.s"; then
                 fail "$label emitted SIMD with SIMD disabled"

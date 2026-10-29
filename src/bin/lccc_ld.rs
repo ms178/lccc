@@ -191,25 +191,10 @@ fn two_arg<'a>(a: &'a str, args: &'a [String], i: &mut usize) -> String {
 
 /// Handle one `-z KEYWORD`, shared by the space form (`-z relro`, a match
 /// arm below) and the joined form (`-zrelro`, caught in the catch-all
-/// chain): GNU ld accepts the two identically, and routing both through
-/// this one function keeps them from drifting apart.  `max-page-size=` is
-/// honoured locally (the script link reads it from here); every keyword,
-/// including `max-page-size=`, is also forwarded so the shared pipeline's
-/// `-z` parser sees exactly what the driver saw.
-fn handle_z_keyword(
-    kw: &str,
-    max_page_size: &mut u64,
-    max_page_size_explicit: &mut bool,
-    passthrough: &mut Vec<String>,
-) {
-    if let Some(value) = kw.strip_prefix("max-page-size=") {
-        *max_page_size_explicit = true;
-        *max_page_size = if let Some(hex) = value.strip_prefix("0x") {
-            u64::from_str_radix(hex, 16).unwrap_or(*max_page_size)
-        } else {
-            value.parse().unwrap_or(*max_page_size)
-        };
-    }
+/// chain): GNU ld accepts the two identically. Forward both spellings through
+/// the shared linker-argument parser so syntax validation and page-size
+/// resolution cannot drift between the driver and backend paths.
+fn handle_z_keyword(kw: &str, passthrough: &mut Vec<String>) {
     passthrough.push(format!("-Wl,-z,{kw}"));
 }
 
@@ -384,8 +369,6 @@ fn run(args: &[String]) -> Result<(), String> {
     let mut shared = false;
     let mut soname: Option<String> = None;
     let mut dt_symbolic = false;
-    let mut max_page_size = 0x200000u64;
-    let mut max_page_size_explicit = false;
     let mut emulation = Emulation::X86_64;
     let mut trace = false;
     let mut fatal_warnings = false;
@@ -597,12 +580,7 @@ fn run(args: &[String]) -> Result<(), String> {
             "-z" => {
                 i += 1;
                 if let Some(kw) = args.get(i) {
-                    handle_z_keyword(
-                        kw,
-                        &mut max_page_size,
-                        &mut max_page_size_explicit,
-                        &mut passthrough,
-                    );
+                    handle_z_keyword(kw, &mut passthrough);
                 }
             }
             "-static" => {
@@ -885,12 +863,7 @@ fn run(args: &[String]) -> Result<(), String> {
                     // here — the match arm above consumes it — but an empty
                     // keyword is harmlessly skipped rather than asserted on.)
                     if !kw.is_empty() {
-                        handle_z_keyword(
-                            kw,
-                            &mut max_page_size,
-                            &mut max_page_size_explicit,
-                            &mut passthrough,
-                        );
+                        handle_z_keyword(kw, &mut passthrough);
                     }
                 } else if a.starts_with("--orphan-handling")
                     || a == "--no-warn-rwx-segments"
@@ -952,9 +925,6 @@ fn run(args: &[String]) -> Result<(), String> {
         return Err("no input files".into());
     }
     let elf_i386 = emulation == Emulation::I386;
-    if elf_i386 && !max_page_size_explicit {
-        max_page_size = 0x1000;
-    }
 
     // ------------------------------------------------------------------
     // Mode 1: relocatable link (ld -r).
@@ -1012,11 +982,60 @@ fn run(args: &[String]) -> Result<(), String> {
                     .into(),
             );
         }
-        let mut script_src = std::fs::read_to_string(&script_path)
-            .map_err(|e| format!("cannot read script '{}': {}", script_path, e))?;
         let ordered = ordered_args(&passthrough, &positional_files);
         let script_args = lccc::backend::linker_common::parse_linker_args(&ordered);
-        script_args.validate_common_page_size()?;
+        // Resolve command-line errors before reading the script or opening any
+        // input. A missing file must not hide an invalid linker option.
+        script_args.validate_common_options()?;
+        // GNU ld 2.47 uses 4 KiB by default for both x86-64 and i386
+        // script links; 2 MiB is an explicit max-page-size request (as used
+        // by the Linux kernel). A zero spelling selects that same default.
+        let default_page_size = 0x1000;
+        let max_page_size = script_args.resolved_page_size(default_page_size)?;
+        let (cet_flags, _property_warnings) = passthrough_property_flags(&passthrough)?;
+        let mut z_warnings: Vec<String> = script_args
+            .z_ignored_keywords
+            .iter()
+            .map(|kw| format!("-z {kw} ignored"))
+            .collect();
+        z_warnings.extend(script_args.z_other_keyword_warnings());
+        let mut script_option_warnings = Vec::new();
+        if script_args.image_base.is_some() {
+            script_option_warnings.push(
+                "--image-base ignored: explicit image bases are not implemented for linker-script links"
+                    .to_string(),
+            );
+        }
+        if script_args.z_pack_relative_relocs {
+            script_option_warnings.push(
+                "--pack-dyn-relocs=relr / -z pack-relative-relocs ignored: RELR packing is not implemented for linker-script links"
+                    .to_string(),
+            );
+        }
+        if script_args.warn_common {
+            script_option_warnings.push(
+                "--warn-common ignored: common-symbol diagnostics are not implemented for linker-script links"
+                    .to_string(),
+            );
+        }
+        if fatal_warnings && !script_option_warnings.is_empty() {
+            return Err(format!(
+                "warning treated as error: {}",
+                script_option_warnings[0]
+            ));
+        }
+        for warning in &script_option_warnings {
+            eprintln!("lccc-ld: warning: {warning}");
+        }
+        if fatal_warnings && !z_warnings.is_empty() {
+            return Err(format!("warning treated as error: {}", z_warnings[0]));
+        }
+        for warning in &z_warnings {
+            eprintln!("lccc-ld: warning: {warning}");
+        }
+
+        let mut script_src = std::fs::read_to_string(&script_path)
+            .map_err(|e| format!("cannot read script '{}': {}", script_path, e))?;
         let search_dirs = lccc::linker_entry::script_search_dirs(&script_src)?;
         let inputs =
             lccc::linker_entry::expand_file_mode_libs(&ordered, &inputs, &search_dirs, "-T")?;
@@ -1045,16 +1064,6 @@ fn run(args: &[String]) -> Result<(), String> {
         let real_inputs = objects.len();
         if build_id_style.is_enabled() {
             lccc::linker_entry::append_build_id_object_styled(&mut objects, &build_id_style);
-        }
-        let (cet_flags, z_ignored) = passthrough_property_flags(&passthrough)?;
-        if fatal_warnings && !z_ignored.is_empty() {
-            return Err(format!(
-                "warning treated as error: -z {} ignored",
-                z_ignored[0]
-            ));
-        }
-        for kw in z_ignored {
-            eprintln!("lccc-ld: warning: -z {kw} ignored");
         }
         if let Some(carrier) = lccc::linker_entry::merge_property_into_objects(
             &mut objects,
@@ -1216,42 +1225,21 @@ fn run(args: &[String]) -> Result<(), String> {
 mod tests {
     use super::handle_z_keyword;
 
-    /// Both `-z` spellings funnel through `handle_z_keyword`, so the
-    /// joined form (`-zrelro`) forwards exactly like the space form
-    /// (`-z relro`), and `max-page-size=` (decimal or hex) is honoured
-    /// locally either way.
+    /// Space and joined `-z` spellings share one forwarding path; the shared
+    /// linker-argument parser owns validation and page-size resolution.
     #[test]
-    fn z_keyword_handler_forwards_and_honours_page_size() {
-        let mut max_page_size = 0x200000u64;
-        let mut explicit = false;
+    fn z_keyword_handler_forwards_page_size_spellings() {
         let mut passthrough = Vec::new();
-        handle_z_keyword("relro", &mut max_page_size, &mut explicit, &mut passthrough);
-        handle_z_keyword(
-            "max-page-size=0x1000",
-            &mut max_page_size,
-            &mut explicit,
-            &mut passthrough,
-        );
+        handle_z_keyword("relro", &mut passthrough);
+        handle_z_keyword("max-page-size=0x1000", &mut passthrough);
+        handle_z_keyword("max-page-size=0X10000", &mut passthrough);
         assert_eq!(
             passthrough,
             vec![
                 "-Wl,-z,relro".to_string(),
-                "-Wl,-z,max-page-size=0x1000".to_string()
+                "-Wl,-z,max-page-size=0x1000".to_string(),
+                "-Wl,-z,max-page-size=0X10000".to_string(),
             ]
         );
-        assert!(explicit);
-        assert_eq!(max_page_size, 0x1000);
-
-        let mut max_page_size = 0x200000u64;
-        let mut explicit = false;
-        let mut passthrough = Vec::new();
-        handle_z_keyword(
-            "max-page-size=4096",
-            &mut max_page_size,
-            &mut explicit,
-            &mut passthrough,
-        );
-        assert!(explicit);
-        assert_eq!(max_page_size, 4096);
     }
 }

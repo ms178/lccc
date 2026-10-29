@@ -42,8 +42,8 @@ pub fn link_builtin(
 ) -> Result<(), String> {
     // Parse user arguments using shared infrastructure
     let parsed_args = linker_common::parse_linker_args(user_args);
-    parsed_args.validate_common_page_size()?;
-    parsed_args.warn_unimplemented_keyword_options()?;
+    parsed_args.validate_common_options()?;
+    parsed_args.warn_unimplemented_keyword_options(0x1000)?;
     let trace = parsed_args.trace_files;
     let rpath = linker_common::rpath_dyn_entry(&parsed_args);
     let is_static = parsed_args.is_static;
@@ -319,8 +319,8 @@ pub fn link_shared(
     implicit_libs: &[&str],
 ) -> Result<(), String> {
     let parsed_args = linker_common::parse_linker_args(user_args);
-    parsed_args.validate_common_page_size()?;
-    parsed_args.warn_unimplemented_keyword_options()?;
+    parsed_args.validate_common_options()?;
+    parsed_args.warn_unimplemented_keyword_options(0x1000)?;
     let (strip_all, strip_debug) = (parsed_args.strip_all, parsed_args.strip_debug);
     let rpath = linker_common::rpath_dyn_entry(&parsed_args);
 

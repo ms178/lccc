@@ -7163,11 +7163,29 @@ impl MapExpr {
     }
 }
 
+/// Return the operands of an unsigned maximum in either parser form. AVX2's
+/// U16 parser folds the compare/select to `MinMax`; SSE2 keeps the exact
+/// unsigned compare/select tree because unsigned word min/max is unavailable.
+fn unsigned_max_operands(expr: &MapExpr) -> Option<(&MapExpr, &MapExpr)> {
+    match expr {
+        MapExpr::MinMax { is_max: true, l, r } => Some((l, r)),
+        MapExpr::Select(cond, t, f) => {
+            let MapExpr::Cmp(IrCmpOp::Ult | IrCmpOp::Ule, l, r) = cond.as_ref() else {
+                return None;
+            };
+            (t.as_ref() == r.as_ref() && f.as_ref() == l.as_ref())
+                .then_some((l.as_ref(), r.as_ref()))
+        }
+        _ => None,
+    }
+}
+
 /// Recognize an unsigned lane saturating subtract in the already-proven map
 /// tree. The narrow parser admits an unsigned compare only after proving its
 /// operands' ranges agree with the lane order. Equal inputs produce zero for
 /// both strict and non-strict forms. `max_u(a, b) - b` is the same operation
-/// and is the parser's existing AVX2 canonicalization.
+/// and is the parser's existing AVX2 canonicalization; the SSE2 compare/select
+/// max spelling is also exact and can use `psubusw` directly.
 ///
 /// This only identifies a tree; the caller must restrict it to U16 lanes and
 /// an x86-64 target with the corresponding SSE2/AVX2 lowering. The scalar tail
@@ -7195,13 +7213,11 @@ fn unsigned_saturating_sub_operands(expr: &MapExpr) -> Option<(&MapExpr, &MapExp
             None
         }
         MapExpr::BinOp(IrBinOp::Sub, max, subtrahend) => {
-            let MapExpr::MinMax { is_max: true, l, r } = max.as_ref() else {
-                return None;
-            };
-            if r == subtrahend {
-                Some((l, r))
-            } else if l == subtrahend {
-                Some((r, l))
+            let (max_l, max_r) = unsigned_max_operands(max.as_ref())?;
+            if max_l == subtrahend.as_ref() {
+                Some((max_r, subtrahend.as_ref()))
+            } else if max_r == subtrahend.as_ref() {
+                Some((max_l, subtrahend.as_ref()))
             } else {
                 None
             }
@@ -7261,6 +7277,31 @@ mod unsigned_saturating_sub_tests {
             );
             assert_eq!(unsigned_saturating_sub_operands(&sub(&max, &c)), None);
         }
+        // SSE2 retains the unsigned max as an exact compare/select tree;
+        // AVX2 folds the same shape to MinMax before emission.
+        for op in [IrCmpOp::Ult, IrCmpOp::Ule] {
+            for (l, r) in [(&a, &b), (&b, &a)] {
+                let max_select = select(cmp(op, l, r), (*r).clone(), (*l).clone());
+                assert_eq!(
+                    unsigned_saturating_sub_operands(&sub(&max_select, &b)),
+                    Some((&a, &b))
+                );
+                assert_eq!(
+                    unsigned_saturating_sub_operands(&sub(&max_select, &c)),
+                    None
+                );
+                let min_select = select(cmp(op, l, r), (*l).clone(), (*r).clone());
+                assert_eq!(
+                    unsigned_saturating_sub_operands(&sub(&min_select, &b)),
+                    None
+                );
+            }
+        }
+        let signed_max = select(cmp(IrCmpOp::Slt, &a, &b), b.clone(), a.clone());
+        assert_eq!(
+            unsigned_saturating_sub_operands(&sub(&signed_max, &b)),
+            None
+        );
         let min = MapExpr::MinMax {
             is_max: false,
             l: boxed(a.clone()),

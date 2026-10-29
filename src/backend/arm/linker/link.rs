@@ -50,8 +50,8 @@ pub fn link_builtin(
     let all_lib_paths: Vec<String> = lib_paths.iter().map(|s| s.to_string()).collect();
 
     let parsed_common = linker_common::parse_linker_args(user_args);
-    parsed_common.validate_common_page_size()?;
-    parsed_common.warn_unimplemented_keyword_options()?;
+    parsed_common.validate_common_options()?;
+    parsed_common.warn_unimplemented_keyword_options(super::types::PAGE_SIZE)?;
     if parsed_common.warn_common {
         objects.enable_warn_common();
     }
@@ -450,8 +450,8 @@ pub fn link_shared(
     let lib_path_strings: Vec<String> = lib_paths.iter().map(|s| s.to_string()).collect();
 
     let parsed_args = linker_common::parse_linker_args(user_args);
-    parsed_args.validate_common_page_size()?;
-    parsed_args.warn_unimplemented_keyword_options()?;
+    parsed_args.validate_common_options()?;
+    parsed_args.warn_unimplemented_keyword_options(super::types::PAGE_SIZE)?;
     if parsed_args.warn_common {
         objects.enable_warn_common();
     }

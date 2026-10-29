@@ -167,9 +167,10 @@ expect_reject() { # expect_reject <label> <file>
         echo "FAIL: $1: accepted; GCC 14.2 rejects it" >&2
         exit 1
     fi
-    # Assignment and initializer conversions say "incompatible address space";
-    # an argument keeps the existing argument diagnostic (pointer_argument_compat).
-    if ! grep -q -e 'incompatible address space' -e 'incompatible pointer type for argument' "$tmp/rej.err"; then
+    # GCC 16.2 phrases the constraint as "pointer to non-enclosed address
+    # space" in every conversion context; retain the older accepted wording
+    # for toolchains whose diagnostic phrasing differs.
+    if ! grep -q -e 'pointer to non-enclosed address space' -e 'incompatible address space' -e 'incompatible pointer type for argument' "$tmp/rej.err"; then
         echo "FAIL: $1: rejected, but not for the address space" >&2
         cat "$tmp/rej.err" >&2
         exit 1
