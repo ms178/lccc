@@ -825,6 +825,16 @@ gate "warning-precedence" fast \
 gate "macro-parity" fast \
     python3 tests/regression/check_macro_parity.py \
         --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"
+# GP-23: the PREDEFINED macro set itself (not the warning/macro *contract* above)
+# must match `gcc-16 -dM -E` for every (target, dialect) pair, with the libc
+# macros that belong to the headers required ABSENT (the GP-05 ratchet, never
+# allowed to grow), the essential type-size set required present, and only
+# row-by-row justified value spellings tolerated.  It caught 19 real ILP32
+# defects on its first run: on i686 `__INT64_C(x)` built a 32-bit `long`, the
+# 80-bit x87 format was reported as 16 bytes, and the pointer-width limits
+# carried the LP64 values.
+gate "predefined-macro-parity" fast \
+    env CCC="$LCCC" GCC="${GCC16:-gcc-16}" bash tests/regression/check_macro_parity.sh
 gate "has-builtin-features" fast \
     python3 tests/regression/check_has_builtin_features.py \
         --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"
@@ -2383,6 +2393,11 @@ gate "bb-slp-v8" fast \
 gate "bb-slp-nested-ifconv" fast \
     bash tests/regression/check_bb_slp_nested_ifconv.sh
 
+# Per-function __attribute__((target("avx2"))) must widen BB-SLP to ymm;
+# an unattributed twin must stay xmm (ISA gate never becomes a global enable).
+gate "target-attr-vec-isa" fast \
+    bash tests/regression/check_target_attr_vec_isa.sh
+
 # Two-block partial unroller + half-wide dword-pair SLP family: the
 # guard-free xk unroll of two-block counted loops (phi threading incl.
 # the IV-reference carried-phi class), the I32/U32 pair load/store/pack
@@ -2972,16 +2987,39 @@ gate "rustfmt" fast cargo fmt --all -- --check
 # does, and this gate is its local mirror (check_ci_gate_parity.py requires
 # the pair). Needs the 1.97.0 toolchain: through rustup where available,
 # otherwise directly when the active rustc already IS the declared floor
-# (restored sandboxes install a plain dist toolchain without rustup).
+# (restored sandboxes install a plain dist toolchain without rustup), or from a
+# pinned dist toolchain unpacked outside rustup -- LCCC_MSRV_TOOLCHAIN, else the
+# tag-cache prefix the restored sandboxes build at $HOME/.cache/lccc/msrv-1.97.0.
+# rustup stays canonical and is tried first, so hosted runs are unchanged; the
+# pinned prefix is verified against the declared floor before it is trusted, so
+# a stale or wrong directory cannot turn this gate green: it stays fail-closed.
 msrv_check_gate() {
     if command -v rustup >/dev/null 2>&1; then
         cargo +1.97.0 check --locked
-    elif rustc --version | grep -q '^rustc 1\.97\.0'; then
+        return
+    fi
+    if rustc --version | grep -q '^rustc 1\.97\.0'; then
         cargo check --locked
-    else
-        echo "msrv-check: need rustc 1.97.0 (rustup missing, active $(rustc --version))" >&2
+        return
+    fi
+    local prefix="${LCCC_MSRV_TOOLCHAIN:-$HOME/.cache/lccc/msrv-1.97.0}"
+    local pinned=""
+    if [ -x "$prefix/bin/rustc" ]; then
+        pinned="$("$prefix/bin/rustc" --version 2>/dev/null)"
+    fi
+    case "$pinned" in
+    rustc\ 1.97.0*)
+        PATH="$prefix/bin:$PATH" CARGO_TARGET_DIR="${MSRV_TARGET_DIR:-target/msrv-cargo}" \
+            cargo check --locked
+        return
+        ;;
+    esac
+    if [ -n "$pinned" ]; then
+        echo "msrv-check: $prefix is not the declared floor ($pinned)" >&2
         return 1
     fi
+    echo "msrv-check: need rustc 1.97.0 (rustup missing, active $(rustc --version))" >&2
+    return 1
 }
 gate "msrv-check" fast msrv_check_gate
 

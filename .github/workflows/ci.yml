@@ -1127,6 +1127,8 @@ jobs:
           --lccc target/fastbuild/lccc --gcc gcc-16
         python3 tests/regression/check_macro_parity.py \
           --lccc target/fastbuild/lccc --gcc gcc-16
+        env CCC=target/fastbuild/lccc GCC=gcc-16 \
+          bash tests/regression/check_macro_parity.sh
         python3 tests/regression/check_has_builtin_features.py \
           --lccc target/fastbuild/lccc --gcc gcc-16
         python3 tests/regression/check_asm_constraints.py \
@@ -1798,6 +1800,10 @@ jobs:
       env:
         CCC: target/fastbuild/lccc
       run: bash tests/regression/check_bb_slp_nested_ifconv.sh
+    - name: Verify per-function target("avx2") widens vector register width
+      env:
+        CCC: target/fastbuild/lccc
+      run: bash tests/regression/check_target_attr_vec_isa.sh
     - name: Verify two-block unroll red-team contracts
       env:
         CCC: target/fastbuild/lccc

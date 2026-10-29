@@ -1144,17 +1144,47 @@ fn fold_select_idioms(func: &mut IrFunction) -> usize {
     n
 }
 
-pub(crate) fn promote_vector_allocas(module: &mut IrModule) -> usize {
-    let table = family_table();
-    if table.is_empty() {
+/// The per-function half of [`promote_vector_allocas`].  `table` must have
+/// been built under the ISA this function is allowed to use.
+fn promote_one_function(func: &mut IrFunction, table: &FxHashMap<IntrinsicOp, Family>) -> usize {
+    let mut n = promote_function(func, table);
+    n += hoist_param_loads(func, table);
+    n += fold_zero_identities(func);
+    n += fold_select_idioms(func);
+    n
+}
+
+pub(crate) fn promote_vector_allocas(
+    module: &mut IrModule,
+    target: crate::backend::Target,
+    base_isa: crate::backend::x86::isa::X86Isa,
+    base_avx512vl: bool,
+) -> usize {
+    let base_table = family_table();
+    if base_table.is_empty() {
         return 0;
     }
     let mut total = 0;
     for func in &mut module.functions {
-        total += promote_function(func, &table);
-        total += hoist_param_loads(func, &table);
-        total += fold_zero_identities(func);
-        total += fold_select_idioms(func);
+        // `family_for` gates its 256-bit arms on AVX2, so the table is
+        // ISA-dependent and has to follow the function rather than the TU: a
+        // `__attribute__((target("avx2")))` function compiled in a baseline TU
+        // has ymm families the module-wide table knows nothing about, and
+        // promotion would silently leave its vector objects in memory.
+        // Functions with no target features reuse the baseline table, which
+        // keeps this free for the overwhelmingly common case.
+        let feats = func.target_features.clone();
+        if target == crate::backend::Target::X86_64 && !feats.is_empty() {
+            total += crate::passes::with_function_x86_vec_isa(
+                target,
+                base_isa,
+                base_avx512vl,
+                &feats,
+                |_| promote_one_function(func, &family_table()),
+            );
+        } else {
+            total += promote_one_function(func, &base_table);
+        }
     }
     total
 }

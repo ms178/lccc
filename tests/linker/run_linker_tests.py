@@ -8434,9 +8434,22 @@ def _tls_shared_matrix_test(args, oracles):
              "  return !(ltv == 42 && ltv2 == 8 && get_ltv() == 42 && addr_ltv() == &ltv && r);\n}\n")
     ie = ["-fPIC", "-ftls-model=initial-exec"]
     # (tag, lccc driver, compiler, how to run, models: None = the default)
-    targets = [("x86-64", "lccc-x86", [CC], [], [None, ["-fPIC"], ie]),
-               ("i686", "lccc-i686", [CC, "-m32"], [], [None, ["-fPIC"], ie])]
+    targets = [("x86-64", "lccc-x86", [CC], [], [None, ["-fPIC"], ie])]
     skipped = []
+    # The i686 leg needs a 32-bit C environment to build its fixture (the
+    # pthread/stdout probe below uses `CC -m32`).  When the host has no 32-bit
+    # development files, that is the same class of absence as a missing cross
+    # compiler, so it joins `skipped` by name instead of failing the x86-64 MATRIX
+    # that ran fine -- the failure used to blame lccc-ld for a missing sysroot.
+    with tempfile.TemporaryDirectory(prefix="lccc-tls-m32-probe-") as probe_td:
+        probe_c = os.path.join(probe_td, "probe.c")
+        with open(probe_c, "w", encoding="utf-8") as stream:
+            stream.write("#include <pthread.h>\nint main(void){return 0;}\n")
+        probe = sh([CC, "-m32", "-fsyntax-only", probe_c])
+    if probe.returncode == 0:
+        targets.append(("i686", "lccc-i686", [CC, "-m32"], [], [None, ["-fPIC"], ie]))
+    else:
+        skipped.append("i686(no -m32 headers)")
     for triple, drv in (("aarch64-linux-gnu", "lccc-arm"), ("riscv64-linux-gnu", "lccc-riscv")):
         cross = shutil.which(triple + "-gcc")
         qemu = shutil.which("qemu-" + triple.split("-")[0])
@@ -11942,12 +11955,28 @@ def _defsym_order_test(args, oracles):
         _write(td, "m.c", _DEFSYM_ORDER_MAIN)
         _write(td, "t.ld", "SECTIONS { . = 0x400000; .text : { *(.text) } "
                            ". = 0x600000; .data : { *(.data) } }\n")
-        for cmd in ([CC, "-c", "d.s", "-o", "d.o"], [CC, "-m32", "-c", "d32.s", "-o", "d32.o"],
+        # The `-m32` legs are OPTIONAL extras: `m32.o`/`d32.o` are consumed by
+        # `defsym_forward_reference_i386` alone, so a host without 32-bit
+        # development files (no bits/libc-header-start.h for CC -m32) must
+        # degrade exactly that one test, not the six 64-bit ones that need
+        # nothing from it.  This used to return a FAIL for every name in the
+        # group, which turned a missing multilib environment into seven red
+        # linker tests.  The 64-bit fixtures stay mandatory: a failure there is
+        # a real fixture breakage.
+        m32_ok, m32_why = True, ""
+        for cmd in ([CC, "-c", "d.s", "-o", "d.o"],
                     [CC, "-O1", "-fPIC", "-c", "m.c", "-o", "m.o"],
                     [CC, "-O1", "-fPIE", "-c", "m.c", "-o", "mpie.o"],
+                    [CC, "-m32", "-c", "d32.s", "-o", "d32.o"],
                     [CC, "-m32", "-O1", "-fno-pic", "-c", "m.c", "-o", "m32.o"]):
             r = sh(cmd, cwd=td)
             if r.returncode != 0:
+                if "-m32" in cmd:
+                    m32_ok = False
+                    m32_why = (f"the -m32 development files are missing "
+                               f"({r.stderr.decode().strip()[:160]}); "
+                               "not measurable on this host")
+                    continue
                 return [Result(n, "FAIL", f"fixture: {' '.join(cmd)}: {r.stderr.decode()[:200]}")
                         for n in names]
 
@@ -12016,10 +12045,13 @@ def _defsym_order_test(args, oracles):
             results.append(Result(name, "FAIL" if problems else "PASS",
                                   "; ".join(problems)[:600]))
 
-        run("defsym_forward_reference_i386",
-            {"lccc": [CC, "-m32", f"-B{shim}", "-no-pie", "m32.o", "d32.o"],
-             "GNU": [CC, "-m32", "-no-pie", "m32.o", "d32.o"]},
-            b"4 4 4 1\n")
+        if m32_ok:
+            run("defsym_forward_reference_i386",
+                {"lccc": [CC, "-m32", f"-B{shim}", "-no-pie", "m32.o", "d32.o"],
+                 "GNU": [CC, "-m32", "-no-pie", "m32.o", "d32.o"]},
+                b"4 4 4 1\n")
+        else:
+            results.append(Result("defsym_forward_reference_i386", "SKIP", m32_why))
         # The addresses slide, the absolute does not (lccc only; see above).
         run("defsym_address_slides_in_pie",
             {"lccc": [CC, f"-B{shim}", "-pie", "m.o", "d.o"]}, b"4 4 4 1\n")
@@ -12274,10 +12306,41 @@ def _standalone_ld_flags_test(args, oracles):
                                      (names[1], ["-m32"], ["-m", "elf_i386"])):
             r = sh([CC] + cflags + ["-fPIC", "-c", "x.c", "-o", "x.o"], cwd=td)
             if r.returncode != 0:
-                results.append(Result(name, "FAIL", f"fixture: {r.stderr.decode()[:200]}"))
+                # The fixture needs the target's libc headers to name a symbol
+                # the link can resolve.  When the HOST compiler cannot build it
+                # either, the multilib development files are absent from this
+                # machine and nothing here is a statement about lccc-ld: report
+                # the gap by name instead of a red that blames the linker.
+                host = sh([CC] + cflags + ["-fPIC", "-c", "x.c", "-o", "host-probe.o"], cwd=td)
+                if host.returncode != 0:
+                    results.append(Result(
+                        name, "SKIP",
+                        f"{CC} {' '.join(cflags)} cannot compile the fixture either "
+                        f"({host.stderr.decode().strip()[:180]}); the -m32 development "
+                        "files are missing, so this comparison is not measurable here"))
+                else:
+                    results.append(Result(name, "FAIL", f"fixture: {r.stderr.decode()[:200]}"))
                 continue
+            # The comparison is only meaningful while the oracle can resolve a
+            # bare `-lc` itself: the reference here is GNU ld's own default
+            # search path. A stock binutils built for x86_64-pc-linux-gnu (the
+            # pinned tag-cache oracle is one) searches /usr/lib but not the
+            # distro's multiarch directory, so it cannot find libc at all and
+            # the comparison would be red purely because of how the oracle was
+            # configured. Probe first: when the oracle is unusable, still assert
+            # lccc-ld's half of the contract and say in the result that the
+            # comparison was dropped, rather than reporting a red that says
+            # nothing about lccc.
+            probe = sh(["ld"] + mflags + ["-shared", "x.o", "-lc", "-o", "probe.so"], cwd=td)
+            oracle_ok = not (probe.returncode != 0
+                             and "cannot find -lc" in probe.stderr.decode())
+            note = ""
+            if not oracle_ok:
+                note = ("[oracle unavailable: " + probe.stderr.decode().strip()[:160]
+                        + "] lccc-ld only, no GNU comparison; ")
             problems = []
-            for who, ld in (("lccc", lccc_ld), ("GNU", "ld")):
+            for who, ld in ([("lccc", lccc_ld), ("GNU", "ld")] if oracle_ok
+                            else [("lccc", lccc_ld)]):
                 r = sh([ld] + mflags + ["-shared", "x.o", "-lc", "-o", f"x.{who}.so"], cwd=td)
                 dyn = sh(["readelf", "-dW", f"x.{who}.so"], cwd=td).stdout.decode()
                 if r.returncode != 0 or "[libc.so.6]" not in dyn:
@@ -12289,7 +12352,7 @@ def _standalone_ld_flags_test(args, oracles):
                     problems.append(f"{who} -nostdlib: rc={r.returncode} "
                                     f"{r.stderr.decode()[:160]!r}, want \"cannot find -lc\"")
             results.append(Result(name, "FAIL" if problems else "PASS",
-                                  "; ".join(problems)[:600]))
+                                  (note + "; ".join(problems))[:600]))
             dname = name.replace("default_search_path", "new_dtags")
             problems = []
             for flag, tag in (("--disable-new-dtags", "(RPATH)"),
