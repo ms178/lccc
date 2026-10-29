@@ -2447,6 +2447,13 @@ gate "u16-saturating-sub" fast \
     env CCC=target/fastbuild/lccc GCC="${GCC:-gcc-16}" \
         bash tests/regression/check_u16_saturating_sub.sh
 
+# Byte/word saturating-subtract fold of the map vectorizer at every saturation
+# boundary against GCC, plus the dword lane's correctness-only contract (x86
+# has no packed dword saturating subtract to pin).
+gate "vectorize-saturating-subtract" fast \
+    env CCC=target/fastbuild/lccc REF="${GCC:-gcc-16}" \
+        bash tests/regression/check_vectorize_saturating_subtract.sh
+
 # Byte-compare window phase (`while (p < end && *p == *q)`, the
 # match-extension shape): emission contract (32B AVX2 / 16B SSE2 windows,
 # exactly one q-side page guard per phase, ctz-based exact mismatch exit),

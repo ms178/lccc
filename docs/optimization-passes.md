@@ -64,7 +64,16 @@ passes; the backend peepholes are documented per backend
   switch `CCC_NO_STRIDED_REDUCE`. The arithmetic that can be wrong — the trip
   count, the wrap-free admission and the resume constant — is factored into
   pure functions exercised by exhaustive unit tests in the pass
-  (`cargo test -p lccc vectorize_strided_i32_reduce`).
+  (`cargo test -p lccc vectorize_strided_i32_reduce`). `LCCC_VEC_STRIDED_TRACE`
+  names the analysis line that declined a candidate loop: the transform fails
+  closed at forty-odd preconditions, and a silent decline is indistinguishable
+  from "no candidate here" without it. A load base qualifies for the full
+  wide load (instead of the gap-skipping strided form) under one of two
+  proofs: a current-frame alloca of sufficient extent, or — through
+  `ModuleSymbolFacts` — a strong, locally binding global whose defined size
+  covers the window (interposable, weak, common, alias- and
+  asm-label-redirected names are excluded, so a link-time replacement can
+  never shrink the proof).
 - **Widening + masked conditional-sum reductions** — I32->I64 `paddq`
   pipelines, VEX-only bodies (9x AVX-SSE transition penalty avoided).
 - **Loop rotation** (`loop_rotate.rs`, IR) — **opt-in** at the IR level
