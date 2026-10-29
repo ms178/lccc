@@ -27,7 +27,7 @@ class BenchmarkCompletion(unittest.TestCase):
                                            '--skip-perf', '--strict', '--json='+str(path)]), \
              mock.patch.multiple(bench,
                  discover_compilers=mock.Mock(return_value=([bench.CompilerSpec('gcc','GCC','/nonexistent-oracle',())], {})),
-                 choose_affinity=mock.Mock(return_value=([], {}, [])),
+                 choose_affinity=mock.Mock(return_value=([], {'applied': False}, [])),
                  select_work_root=mock.Mock(return_value=(str(root), {})),
                  probe_pmu=mock.Mock(return_value={}),
                  collect_environment=mock.Mock(return_value={}),

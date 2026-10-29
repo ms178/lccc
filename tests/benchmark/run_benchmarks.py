@@ -265,6 +265,20 @@ def stable_seed(*parts: str) -> int:
     return int.from_bytes(hashlib.sha256(material).digest()[:8], "big")
 
 
+def balanced_compiler_order(items: list, rng: random.Random, round_number: int, previous: list | None) -> list:
+    """Randomize two-arm order in balanced two-round blocks; shuffle larger sets.
+
+    Reversal applies only if the two active compilers are unchanged; after a
+    failure changes the set, never reintroduce a failed compiler.
+    """
+    order = list(items)
+    if (len(order) == 2 and round_number % 2 == 1 and previous is not None
+            and len(previous) == 2 and all(item in order for item in previous)):
+        return list(reversed(previous))
+    rng.shuffle(order)
+    return order
+
+
 def first_nonempty_line(text: str) -> str:
     for line in text.splitlines():
         if line.strip():
@@ -538,56 +552,105 @@ def git_metadata() -> dict[str, Any]:
     return metadata
 
 
-def probe_pmu(enabled: bool) -> dict[str, Any]:
-    """Detect counter availability once; do not fabricate counter values."""
+def _cpu_list_contains(text: str, cpu: int) -> bool:
+    """Read kernel CPU-list syntax without accepting a malformed topology."""
+    if not text.strip():
+        raise ValueError("empty PMU CPU list")
+    present = False
+    for part in text.strip().split(","):
+        fields = part.split("-")
+        if len(fields) not in (1, 2) or any(not f.isascii() or not f.isdigit() for f in fields):
+            raise ValueError(f"invalid PMU CPU list: {text!r}")
+        lo, hi = int(fields[0]), int(fields[-1])
+        if lo > hi:
+            raise ValueError(f"invalid PMU CPU range: {part!r}")
+        present |= lo <= cpu <= hi
+    return present
+
+
+def probe_pmu(enabled: bool, affinity_prefix: list[str] | None = None,
+              cpu: int | None = None,
+              sysfs: Path = Path("/sys/bus/event_source/devices")) -> dict[str, Any]:
+    """Probe the selected task's PMU, not the PMU of an arbitrary core.
+
+    On Linux hybrid systems generic hardware events expand into both PMUs;
+    select the PMU belonging to the *pinned* CPU instead of combining events
+    or declaring the other core's <not counted> row a failure.
+    """
     status = {
         "probed": enabled,
         "perf_path": shutil.which("perf"),
         "available": False,
         "reason": "not probed",
         "perf_event_paranoid": read_first("/proc/sys/kernel/perf_event_paranoid"),
+        "probe_cpu": cpu,
+        "probe_pmu": None,
     }
     if not enabled:
         return status
     if not status["perf_path"]:
         status["reason"] = "perf is not installed"
         return status
-    command = [status["perf_path"], "stat", "--no-big-num", "-x", ",",
-               "-e", "cycles,instructions", "--", "/bin/true"]
-    result = invoke(command, timeout_s=15)
+    paths = {name: sysfs / name for name in ("cpu_core", "cpu_atom")}
+    if any(p.exists() for p in paths.values()):
+        if cpu is None or not affinity_prefix or not all(p.is_dir() for p in paths.values()):
+            status["reason"] = "hybrid PMU class requires an identified pinned CPU and complete topology"
+            return status
+        try:
+            matches = [name for name, p in paths.items()
+                       if _cpu_list_contains((p / "cpus").read_text(), cpu)]
+        except (OSError, ValueError) as exc:
+            status["reason"] = f"hybrid PMU topology unavailable: {exc}"
+            return status
+        if len(matches) != 1:
+            status["reason"] = f"CPU {cpu} belongs to {len(matches)} hybrid PMUs; cannot select one"
+            return status
+        status["probe_pmu"] = matches[0]
+    pmu = status["probe_pmu"]
+    def event(name: str) -> str:
+        return f"{pmu}/{name}/" if pmu else name
+    command = [*(affinity_prefix or []), status["perf_path"], "stat", "--all-user",
+               "--no-big-num", "-x", ",", "-e", f"{{{event('cycles')},{event('instructions')}}}",
+               "--", "/bin/true"]
+    result = invoke(command, timeout_s=15, env=controlled_environment())
     status["probe_command"] = command
     status["probe_returncode"] = result["returncode"]
     status["probe_stderr"] = result["stderr"]
     counts: dict[str, float] = {}
     invalid: set[str] = set()
-    required = {"cycles", "instructions"}
+    required = {event("cycles"), event("instructions")}
     for row in csv.reader(result["stderr"].splitlines()):
         if len(row) < 3:
             continue
-        event = row[2].strip().split(":", 1)[0]
-        if event not in required:
+        label = row[2].strip()
+        label = label.removesuffix(":u").removesuffix(":k")
+        if label.endswith(("/u", "/k")):
+            label = label[:-1]
+        if label not in required:
             continue
-        if event in counts:
-            invalid.add(event)
+        if label in counts:
+            invalid.add(label)
         try:
             count = float(row[0].strip())
-        except ValueError:
-            invalid.add(event)
+            running = float(row[4].strip())
+        except (ValueError, IndexError):
+            invalid.add(label)
             continue
-        if not math.isfinite(count) or count <= 0:
-            invalid.add(event)
+        if not math.isfinite(count) or count <= 0 or not math.isfinite(running) or not 95 <= running <= 100.01:
+            invalid.add(label)
             continue
-        counts[event] = count
+        counts[label] = count
     status["observed_counts"] = counts
     if result["ok"] and counts.keys() >= required and not invalid:
         status["available"] = True
-        status["reason"] = "perf returned usable cycles and instructions counters"
+        status["reason"] = ("perf returned usable cycles and instructions counters for the selected CPU/PMU"
+                            if cpu is not None else
+                            "perf returned usable generic cycles and instructions counters; probe was unpinned")
     elif result["ok"]:
-        status["reason"] = "perf exited zero without usable cycles/instructions counters"
+        status["reason"] = "perf exited zero without usable cycles/instructions counters (missing, duplicated, invalid, or running below 95%)"
     else:
         detail = first_nonempty_line(result["stderr"]) or result["error"] or f"exit={result['returncode']}"
         status["reason"] = detail
-
     return status
 
 
@@ -863,9 +926,10 @@ def run_benchmark(benchmark: Benchmark, compilers: list[CompilerSpec], args: arg
                 active = [item for item in active if item.key != compiler.key]
 
     timed_rounds = 1 if args.skip_perf else args.reps
+    previous_order = None
     for round_number in range(timed_rounds):
-        order = list(active)
-        rng.shuffle(order)
+        order = balanced_compiler_order(active, rng, round_number, previous_order)
+        previous_order = order
         round_info: dict[str, Any] = {"round": round_number, "order": [item.key for item in order], "runs": {}}
         for compiler in order:
             run = run_binary(binaries[compiler.key], affinity_prefix, benchmark.timeout_s, environment)
@@ -968,6 +1032,28 @@ def aggregate_lccc_vs_gcc(entries: list[dict[str, Any]]) -> dict[str, Any] | Non
     }
 
 
+def duration_sensitivity(entries: list[dict[str, Any]], threshold_s: float = 0.020) -> dict[str, Any]:
+    """Secondary, explicitly selected view; never erase short rows or change the main aggregate."""
+    selected, excluded = [], []
+    for entry in entries:
+        ratio = entry.get("ratios_to_gcc", {}).get("lccc")
+        if not ratio or not ratio.get("median"):
+            continue
+        if any(entry.get("correctness", {}).get(key, {}).get("matches_baseline") is not True
+               for key in ("lccc", "gcc")):
+            continue
+        walls = [entry.get("runtime", {}).get(key, {}).get("wall") for key in ("lccc", "gcc")]
+        if any(not wall or wall.get("median") is None or wall["median"] < threshold_s for wall in walls):
+            excluded.append(entry["name"])
+        else:
+            selected.append(entry)
+    return {"minimum_median_seconds_each_compiler": threshold_s,
+            "excluded_short_or_unknown": excluded,
+            "included": [entry["name"] for entry in selected],
+            "aggregate": aggregate_lccc_vs_gcc(selected),
+            "interpretation": "diagnostic sensitivity only; nonrepresentative selection, not a replacement score"}
+
+
 def aggregate_lccc_vs_best_reference(entries: list[dict[str, Any]]) -> dict[str, Any] | None:
     """Aggregate LCCC against the fastest available non-LCCC compiler per row."""
     ratios: list[tuple[str, str, float]] = []
@@ -1015,7 +1101,9 @@ def format_ratio(value: float | None) -> str:
 def render_terminal(report: dict[str, Any]) -> str:
     lines: list[str] = []
     metadata = report["metadata"]
-    measurement_class = "VM screening" if metadata["hypervisor_detected"] or not metadata["pmu"]["available"] else "bare-metal candidate"
+    measurement_class = ("VM screening" if metadata["hypervisor_detected"] else
+                         "bare-metal candidate" if metadata["pmu"]["available"] else
+                         "PMU-unverified screening")
     lines.append("=" * 108)
     lines.append("LCCC generated-code benchmark report")
     lines.append(f"Measurement class: {measurement_class}; PMU: {metadata['pmu']['reason']}")
@@ -1062,6 +1150,14 @@ def render_terminal(report: dict[str, Any]) -> str:
                      f"arithmetic mean={aggregate['arithmetic_mean_ratio']:.4f}")
         lines.append(f"  best={aggregate['best']['benchmark']} ({format_ratio(aggregate['best']['ratio'])}); "
                      f"worst={aggregate['worst']['benchmark']} ({format_ratio(aggregate['worst']['ratio'])})")
+    sensitivity = duration_sensitivity(report["benchmarks"])
+    if aggregate:
+        lines.append("  WARNING: workload mix and extreme specialized/short tests can dominate; not a whole-application score.")
+        if sensitivity["aggregate"]:
+            filtered = sensitivity["aggregate"]
+            lines.append(f"  sensitivity only (both medians >=20 ms): n={filtered['n_correct_benchmarks']}; "
+                         f"geomean={filtered['geometric_mean_ratio']:.4f}; "
+                         f"excluded={len(sensitivity['excluded_short_or_unknown'])}; selection is not representative")
     best_aggregate = report.get("aggregate_lccc_vs_best_reference")
     if best_aggregate:
         lines.append("LCCC / fastest available reference aggregate over correct benchmark pairs only:")
@@ -1082,7 +1178,7 @@ def render_markdown(report: dict[str, Any]) -> str:
     metadata = report["metadata"]
     method = ("correctness-only execution; no timing statistic emitted"
               if report["settings"]["skip_perf"]
-              else "randomized compiler order within each paired round; warm-ups excluded; median wall time and paired bootstrap CI; no automatic outlier removal")
+              else "randomized balanced two-round blocks for two compilers; independent shuffle otherwise; warm-ups excluded; median wall time and paired bootstrap CI; no automatic outlier removal")
     compiler_labels = {compiler["key"]: compiler["label"]
                        for compiler in report.get("compilers", [])}
     compiler_metadata = {compiler["key"]: compiler for compiler in report.get("compilers", [])}
@@ -1149,6 +1245,8 @@ def render_markdown(report: dict[str, Any]) -> str:
         lines.extend([
             "",
             "## Aggregate LCCC/GCC (correct pairs only)",
+            "",
+            "Workload mix and extreme specialized or short tests can dominate; this is not a whole-application score.",
             "",
             f"- Geometric mean ratio: `{aggregate['geometric_mean_ratio']:.4f}`",
             f"- Arithmetic mean ratio: `{aggregate['arithmetic_mean_ratio']:.4f}`",
@@ -1254,6 +1352,7 @@ def merge_reports(paths: list[Path]) -> dict[str, Any]:
         merged["runner_warnings"].append(
             "Mixed-CPU shards: aggregate describes workload/host pairs, not performance on one CPU.")
     merged["aggregate_lccc_vs_gcc"] = aggregate_lccc_vs_gcc(entries)
+    merged["duration_sensitivity_lccc_vs_gcc"] = duration_sensitivity(entries)
     merged["aggregate_lccc_vs_best_reference"] = aggregate_lccc_vs_best_reference(entries)
     return merged
 
@@ -1397,7 +1496,7 @@ def main(argv=None) -> int:
         artifacts.mkdir(parents=True, exist_ok=True)
     work_root, work_metadata = select_work_root(args.work_dir)
     affinity_prefix, pinning, affinity_warnings = choose_affinity(args.cpu)
-    pmu = probe_pmu(not args.no_pmu_probe)
+    pmu = probe_pmu(not args.no_pmu_probe, affinity_prefix, pinning["cpu"] if pinning["applied"] else None)
     metadata = collect_environment(pinning, work_metadata, pmu, compilers)
     environment = controlled_environment()
 
@@ -1412,7 +1511,7 @@ def main(argv=None) -> int:
             "warmup": 0 if args.skip_perf else args.warmup,
             "skip_perf": args.skip_perf,
             "seed": args.seed,
-            "compiler_order_policy": "randomized independently in every paired round",
+            "compiler_order_policy": "randomized balanced two-round blocks for two compilers; independent shuffle otherwise",
             "timer": "time.perf_counter_ns wall-clock plus resource.RUSAGE_CHILDREN CPU time",
             "outlier_policy": "MAD outliers counted and reported; none are removed",
         },
@@ -1451,6 +1550,7 @@ def main(argv=None) -> int:
             publish_report()
 
     report["aggregate_lccc_vs_gcc"] = aggregate_lccc_vs_gcc(report["benchmarks"])
+    report["duration_sensitivity_lccc_vs_gcc"] = duration_sensitivity(report["benchmarks"])
     report["aggregate_lccc_vs_best_reference"] = aggregate_lccc_vs_best_reference(report["benchmarks"])
     terminal = render_terminal(report)
     print(terminal)
