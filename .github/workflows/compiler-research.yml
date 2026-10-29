@@ -83,7 +83,10 @@ jobs:
     # Opt-in research: manual, or a PR touching watched compiler/research inputs.
     name: Same-host portable/native runtime and Callgrind
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    # Twenty workloads times two profiles, then four same-compiler controls and
+    # two Callgrind sweeps. The measurements are strictly correctness-gated,
+    # so the budget must cover the full selection instead of truncating it.
+    timeout-minutes: 150
     env:
       RUSTUP_TOOLCHAIN: stable
       CARGO_BUILD_JOBS: "2"
@@ -214,7 +217,7 @@ jobs:
             || echo "pre-timing diagnostic recorded a mismatch control; the paired gate below decides"
       - name: Same-host before/after/vendor portable and native comparisons
         id: paired_runtime
-        timeout-minutes: 45
+        timeout-minutes: 75
         shell: bash
         run: |
           set -euo pipefail
@@ -262,7 +265,7 @@ jobs:
         if: always()
         run: python3 scripts/publish_cpu_runtime_evidence.py results/research --expected-cases "$RESEARCH_CASES" --expected-compilers lccc,before,gcc,clang,icx,rolled
       - name: Same-compiler list-merge join-forwarding experiment
-        timeout-minutes: 15
+        timeout-minutes: 20
         shell: bash
         run: |
           set -euo pipefail
@@ -318,7 +321,7 @@ jobs:
           print('::notice title=Same-compiler list-merge join-forwarding A-B::' + text)
           PYJOIN
       - name: Same-compiler fallthrough zero-extension ablation
-        timeout-minutes: 10
+        timeout-minutes: 15
         shell: bash
         run: |
           set -euo pipefail
@@ -374,7 +377,7 @@ jobs:
           (root / 'zext-summary.json').write_text(json.dumps(summary, indent=2) + '\n')
           PYZEXT
       - name: Isolate strided-load and string-inlining performance
-        timeout-minutes: 25
+        timeout-minutes: 30
         shell: bash
         run: |
           set -euo pipefail
@@ -419,7 +422,7 @@ jobs:
               --only "$case_name" --out "results/research/callgrind-$control-ab"
           done
       - name: Calibrated short-kernel entry timing without exec startup
-        timeout-minutes: 12
+        timeout-minutes: 20
         shell: bash
         run: |
           set -euo pipefail
@@ -459,7 +462,7 @@ jobs:
                       print('::notice title=Startup-excluded CPU runtime::' + text)
           PYCODE
       - name: Correctness-gated bounded Callgrind main/candidate A-B
-        timeout-minutes: 8
+        timeout-minutes: 20
         run: |
           if [[ "$RESEARCH_CASES" == all ]]; then RESEARCH_CASES=""; fi
           python3 scripts/callgrind_corpus.py \
@@ -468,7 +471,7 @@ jobs:
             --gcc-include-command gcc-16 --target-flags="" \
             --only "$RESEARCH_CASES" --out results/research/callgrind-main
       - name: Supplementary Callgrind against identified native GCC
-        timeout-minutes: 8
+        timeout-minutes: 20
         # Identified native GCC16; this is not measured execution of CE binaries.
         run: |
           if [[ "$RESEARCH_CASES" == all ]]; then RESEARCH_CASES=""; fi
