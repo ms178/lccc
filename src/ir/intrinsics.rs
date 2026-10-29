@@ -2132,6 +2132,7 @@ impl IntrinsicOp {
             | VecAddI8x32 | VecSubI8x32 | VecAndI8x32 | VecOrI8x32 | VecXorI8x32
             | VecAddI16x16
             | VecSubI16x16
+            | VecSubSatU16x16
             | VecMulI16x16
             | VecAndI16x16
             | VecOrI16x16
