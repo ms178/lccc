@@ -2460,6 +2460,14 @@ gate "vectorize-saturating-subtract" fast \
     env CCC=target/fastbuild/lccc REF="${GCC:-gcc-16}" \
         bash tests/regression/check_vectorize_saturating_subtract.sh
 
+# Strict-FP reduction unrolling (the corpus' worst callgrind row,
+# `reduction_vecreg`): `float sum(const float *, int)` must unroll 4x with the
+# accumulation order intact, across every ISA/optimisation configuration, and
+# the bits must match a sequential reference on association-sensitive payloads
+# and every trip residue modulo 8.
+gate "fp-reduction-unroll" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_fp_reduction_unroll.sh
+
 # Byte-compare window phase (`while (p < end && *p == *q)`, the
 # match-extension shape): emission contract (32B AVX2 / 16B SSE2 windows,
 # exactly one q-side page guard per phase, ctz-based exact mismatch exit),

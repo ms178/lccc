@@ -144,8 +144,16 @@ sib_count() {
     grep -cE '%gs:\(.*, *%[a-z0-9]+, *[1248]\)' "$1" || true
 }
 idx_src=tests/regression/seg_gs_runtime/seg_gs_indexed.c
-"$CCC" -O2 -S -o "$tmp/idx_on.s" "$idx_src"
-CCC_NO_SEG_SIB=1 "$CCC" -O2 -S -o "$tmp/idx_off.s" "$idx_src"
+# `CCC_DISABLE_PASSES=ipcp` here only: these kernels take their trip count as a
+# parameter and have a single call site with a literal, so constant propagation
+# specializes the trip, the unroller clones the (16-iteration, tiny-body) loops
+# and every indexed access becomes a constant displacement — no SIB operand
+# remains to count, and this gate would stop exercising the indexed segment
+# path at all. The property under test is address formation, not the unroller,
+# so the shape check pins the address path with specialization held back; the
+# runtime half above already runs the specializing build and checks the values.
+CCC_DISABLE_PASSES=ipcp "$CCC" -O2 -S -o "$tmp/idx_on.s" "$idx_src"
+CCC_DISABLE_PASSES=ipcp CCC_NO_SEG_SIB=1 "$CCC" -O2 -S -o "$tmp/idx_off.s" "$idx_src"
 on=$(sib_count "$tmp/idx_on.s")
 off=$(sib_count "$tmp/idx_off.s")
 if [ "$on" -lt 18 ] || [ "$off" -ne 0 ]; then

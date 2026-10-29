@@ -160,16 +160,28 @@ fi
 
 # --- master gate default ON: a known firing TU applies when the variable
 #     is UNSET and silences for every documented off token ----------------
-env -u CCC_RA_GLOBAL_LOCATION CCC_DEBUG_SPLIT=1 CCC_GLA_TRACE=1 \
-  "$CCC" -O2 -S -o "$tmp/fire-default.s" "$fire_src" 2>"$tmp/fire-default.log"
+# `CCC_DISABLE_PASSES=ipcp` keeps this fixture's PRESSURE SHAPE, not its code
+# quality: every call site passes literals, so interprocedural constant
+# propagation (which now also runs before the iteration-0 loop transforms)
+# specializes the nine parameters into constants, the live producer set
+# collapses, and the planner correctly has nothing to rematerialize. That is a
+# win for the program and a blind spot for this gate -- this fixture is the only
+# runnable coverage of the critical-edge trampoline emitter, so it pins the
+# master gate with specialization held back. The nbody cell above exercises the
+# default pipeline end to end.
+env -u CCC_RA_GLOBAL_LOCATION CCC_DISABLE_PASSES=ipcp CCC_DEBUG_SPLIT=1 \
+  CCC_GLA_TRACE=1 "$CCC" -O2 -S -o "$tmp/fire-default.s" "$fire_src" \
+  2>"$tmp/fire-default.log"
 must_grep '\[GLA\] select_ptr_64 applied:' "$tmp/fire-default.log" \
   "GLA did not default-ON on gla_remat_trampoline"
-CCC_RA_GLOBAL_LOCATION=0 CCC_DEBUG_SPLIT=1 CCC_GLA_TRACE=1 \
-  "$CCC" -O2 -S -o "$tmp/fire-off.s" "$fire_src" 2>"$tmp/fire-off.log"
+CCC_RA_GLOBAL_LOCATION=0 CCC_DISABLE_PASSES=ipcp CCC_DEBUG_SPLIT=1 \
+  CCC_GLA_TRACE=1 "$CCC" -O2 -S -o "$tmp/fire-off.s" "$fire_src" \
+  2>"$tmp/fire-off.log"
 must_not_grep 'applied:' "$tmp/fire-off.log" "=0 did not disable GLA"
 for bad in 0 off OFF no NO false FALSE False ""; do
-  CCC_RA_GLOBAL_LOCATION="$bad" CCC_DEBUG_SPLIT=1 CCC_GLA_TRACE=1 \
-    "$CCC" -O2 -S -o "$tmp/kill.s" "$fire_src" 2>"$tmp/kill.log"
+  CCC_RA_GLOBAL_LOCATION="$bad" CCC_DISABLE_PASSES=ipcp CCC_DEBUG_SPLIT=1 \
+    CCC_GLA_TRACE=1 "$CCC" -O2 -S -o "$tmp/kill.s" "$fire_src" \
+    2>"$tmp/kill.log"
   must_not_grep 'applied:' "$tmp/kill.log" "off token '$bad' did not disable GLA"
 done
 

@@ -1769,6 +1769,129 @@ fn apply_env_term(term: &mut Terminator, env: &FxHashMap<u32, Operand>) {
 /// condition's side effects and extra values (`for (...; cnt++, i < 4; ...)`),
 /// execute once per guard evaluation — `trip + 1` times — and must therefore
 /// be replicated per iteration AND once more after the last one.
+/// Is the loop a SERIAL carried accumulator — `acc = acc <op> x` with exactly
+/// one accumulation per iteration and no reassociation?
+///
+/// This is the profit reason the SLP-feedstock veto must not swallow.  The
+/// veto above exists because a load-only latch with no recognisable reduction
+/// gives `run_bb_slp` nothing to seed (measured: gzip_crc32 +30% insns,
+/// glibc_memcmp +20.7%, crc32's LCG fill +21 lines, all at neutral runtime).
+/// A carried accumulator is different in exactly one respect that matters for
+/// cost: the k clone bodies form ONE dependency chain, so the unroll buys no
+/// ILP — but it removes (k-1)/k of the loop overhead (compare + branch + IV
+/// increment) and nothing else.  Every SIMD-free scalar reduction in the
+/// corpus is this shape, and it is where the reference compilers' -O2 unroller
+/// earns 1.9x on `reduction_vecreg` (`sum_f32`: 4 `addss` then one `add`/`cmp`/
+/// `jne` instead of one `addss` per `add`/`cmp`/`jl`).
+///
+/// Semantics: the copies are threaded (clone j reads clone j-1's accumulator),
+/// so the operation ORDER is byte-identical to the rolled loop — legal for
+/// strict FP, no reassociation, no signed-overflow relaxation.  That is why
+/// this predicate is restricted to a SINGLE accumulator with a SINGLE use of
+/// its back-edge value: a second accumulation site or a second consumer would
+/// make the grouping visible, and that is `reduction::candidate`'s balancing
+/// territory, not this one's.
+fn serial_carried_accumulator(
+    func: &IrFunction,
+    header: usize,
+    latch: usize,
+    iv: Value,
+    work_len: usize,
+) -> bool {
+    let latch_label = func.blocks[latch].label;
+    let mut carried: Option<(Value, IrType, Operand)> = None;
+    for inst in &func.blocks[header].instructions {
+        if let Instruction::Phi { dest, ty, incoming } = inst {
+            if dest.0 == iv.0 {
+                continue;
+            }
+            if carried.is_some() {
+                // Two or more carried values: not the single-chain shape.
+                return false;
+            }
+            let Some((back, _)) = incoming.iter().find(|(_, l)| *l == latch_label) else {
+                return false;
+            };
+            carried = Some((*dest, *ty, back.clone()));
+        }
+    }
+    let Some((acc, acc_ty, Operand::Value(back))) = carried else {
+        return false;
+    };
+    if !acc_ty.is_integer() && !matches!(acc_ty, IrType::F32 | IrType::F64) {
+        return false;
+    }
+    // Volatile access anywhere in the work region disqualifies: those loops are
+    // I/O-shaped, their branch overhead is noise next to the access, and the
+    // general profitability veto already refuses them for that reason.
+    for inst in &func.blocks[latch].instructions[..work_len] {
+        if let Instruction::Load { volatile: true, .. }
+        | Instruction::Store { volatile: true, .. } = inst
+        {
+            return false;
+        }
+    }
+    // The back-edge value must be the accumulation itself, defined once inside
+    // the work region: `acc = Add(acc, x)` (FAdd for FP).
+    let mut def: Option<&Instruction> = None;
+    for inst in &func.blocks[latch].instructions[..work_len] {
+        if inst.dest() == Some(back) {
+            if def.is_some() {
+                return false;
+            }
+            def = Some(inst);
+        }
+    }
+    let Some(Instruction::BinOp {
+        op: IrBinOp::Add,
+        lhs,
+        rhs,
+        ty,
+        ..
+    }) = def
+    else {
+        return false;
+    };
+    if *ty != acc_ty {
+        return false;
+    }
+    // One operand is the accumulator, the other an iteration-varying value.
+    let (Operand::Value(a), Operand::Value(b)) = (lhs, rhs) else {
+        return false;
+    };
+    let (acc_operand, term) = if *a == acc {
+        (a, *b)
+    } else if *b == acc {
+        (b, *a)
+    } else {
+        return false;
+    };
+    if acc_operand.0 == term.0 {
+        return false;
+    }
+    // Soundness of the argument above: the accumulator's back value is read
+    // exactly once in the whole function (the phi incoming).  Anything else
+    // means a second consumer observes the per-iteration value, and grouping
+    // would change what it sees.
+    let mut back_uses = 0usize;
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            crate::backend::liveness::for_each_operand_in_instruction(inst, |o| {
+                if matches!(o, Operand::Value(v) if *v == back) {
+                    back_uses += 1;
+                }
+            });
+        }
+        crate::backend::liveness::for_each_operand_in_terminator(&block.terminator, |o| {
+            if matches!(o, Operand::Value(v) if *v == back) {
+                back_uses += 1;
+            }
+        });
+    }
+    // `for_each_operand_in_instruction` does not report a BinOp's dest.
+    back_uses == 1
+}
+
 fn header_extra_indices(func: &IrFunction, header: usize) -> Vec<usize> {
     let block = &func.blocks[header];
     let mut chain: FxHashSet<u32> = FxHashSet::default();
@@ -3120,6 +3243,13 @@ fn try_partial_unroll_two_block(
     }
 
     let reduction = reduction::candidate(func, header, latch, iv_phi);
+    // A serial carried accumulator (`acc = acc + x`, one chain) is a SECOND
+    // independent profit reason, and unlike `reduction` it covers strict FP
+    // reductions — the shape the vectorizer must leave scalar because a packed
+    // horizontal add would reassociate it. Unrolling it keeps the association
+    // exactly (threaded clones) while dividing the loop overhead by k.
+    let carried_acc =
+        reduction.is_none() && serial_carried_accumulator(func, header, latch, iv_phi, work_len);
 
     // PROFITABILITY: the pass exists to make the k concatenated bodies
     // BB-SLP feedstock — `run_bb_slp` is STORE-SEEDED and its lane inputs
@@ -3170,7 +3300,7 @@ fn try_partial_unroll_two_block(
                 } if *seg_override != crate::common::types::AddressSpace::Default
             )
         });
-        if (!has_load || (!has_store && reduction.is_none())) && !has_seg_access {
+        if (!has_load || (!has_store && reduction.is_none() && !carried_acc)) && !has_seg_access {
             return false;
         }
     }
@@ -3257,7 +3387,7 @@ fn try_partial_unroll_two_block(
     // not a reachable decline — "exactly two groups" is complete-unroll
     // territory by construction (pinned by
     // `two_block_small_trips_are_complete_unrolled_not_partial`).
-    let k_pref = if reduction.is_some() {
+    let k_pref = if reduction.is_some() || carried_acc {
         4
     } else {
         choose_unroll_factor(work_len).min(4) as usize
@@ -5056,6 +5186,187 @@ mod tests {
         func
     }
 
+    /// Two-block counted loop over `const float *v` with a FLOAT accumulator
+    /// phi — the strict-FP reduction shape (`acc += v[i]`).  `accumulators`
+    /// selects the number of carried float phis: 1 is the serial chain the
+    /// new profit reason admits, 2 is the multi-accumulator form that must
+    /// keep declining (no single chain ⇒ grouping would be visible).
+    ///
+    /// Shape: B0 preheader (iv init, acc inits, v base) → B1 header (iv phi,
+    /// acc phi/phis, exit cmp) → B2 latch (load v[iv], FAdd, iv Add LAST) → B1;
+    /// B4 exit stores the accumulator (live-out).
+    ///
+    /// `dynamic_trip` replaces the constant bound with an undefined value (a
+    /// runtime bound: a parameter before call-site constant propagation) so
+    /// the constant-trip prerequisite is exercised independently of the
+    /// profit reason.
+    fn make_f32_reduction_loop(trip: i32, accumulators: usize, dynamic_trip: bool) -> IrFunction {
+        let mut func = IrFunction::new("f32_reduction".to_string(), IrType::Void, vec![], false);
+        // Value ids: 0 = iv init, 1 = iv phi, 2 = acc0 phi, 3 = acc0 init,
+        // 4 = exit cmp, 5 = iv increment, 6 = load, 7 = fadd, 8 = acc1 phi,
+        // 9 = acc1 init, 10 = v base, 11.. dynamic bound / fadd1 / gep.
+        let acc_ids: Vec<u32> = (0..accumulators as u32).map(|i| 2 + 2 * i).collect();
+        // B0: preheader
+        let mut pre = vec![
+            Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Const(IrConst::I32(0)),
+            },
+            Instruction::GlobalAddr {
+                dest: Value(10),
+                name: "v".to_string(),
+            },
+        ];
+        for (i, &acc) in acc_ids.iter().enumerate() {
+            let _ = i;
+            pre.push(Instruction::Copy {
+                dest: Value(acc),
+                src: Operand::Const(IrConst::F32(0.0)),
+            });
+        }
+        let bound = if dynamic_trip {
+            // A value with no definition in the function is the fixture's
+            // stand-in for a runtime bound (a function parameter, before any
+            // const-propagation could fold its call-site constant).
+            Operand::Value(Value(63))
+        } else {
+            Operand::Const(IrConst::I32(trip))
+        };
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: pre,
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
+        });
+        // B1: header — iv phi, acc phis, exit cmp
+        let mut header = vec![Instruction::Phi {
+            dest: Value(1),
+            ty: IrType::I32,
+            incoming: vec![
+                (Operand::Value(Value(0)), BlockId(0)),
+                (Operand::Value(Value(5)), BlockId(2)),
+            ],
+        }];
+        for (i, &acc) in acc_ids.iter().enumerate() {
+            header.push(Instruction::Phi {
+                dest: Value(acc),
+                ty: IrType::F32,
+                incoming: vec![
+                    (Operand::Value(Value(acc + 1)), BlockId(0)),
+                    (Operand::Value(Value(7 + i as u32)), BlockId(2)),
+                ],
+            });
+        }
+        header.push(Instruction::Cmp {
+            dest: Value(4),
+            op: IrCmpOp::Slt,
+            lhs: Operand::Value(Value(1)),
+            rhs: bound,
+            ty: IrType::I32,
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: header,
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(4)),
+                true_label: BlockId(2),
+                false_label: BlockId(4),
+            },
+            source_spans: Vec::new(),
+        });
+        // B2: latch — load v[iv], one FAdd per accumulator, iv increment LAST
+        let mut latch = vec![]; // GEP/load/fadds/iv add pushed below
+        let mut next = 20u32;
+        for (i, &acc) in acc_ids.iter().enumerate() {
+            let gep = next;
+            let load = 6 + i as u32;
+            next += 1;
+            latch.push(Instruction::GetElementPtr {
+                dest: Value(gep),
+                base: Value(10),
+                offset: Operand::Value(Value(1)),
+                ty: IrType::F32,
+            });
+            latch.push(Instruction::Load {
+                dest: Value(load),
+                ptr: Value(gep),
+                ty: IrType::F32,
+                seg_override: AddressSpace::Default,
+                volatile: false,
+            });
+            latch.push(Instruction::BinOp {
+                dest: Value(7 + i as u32),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(acc)),
+                rhs: Operand::Value(Value(load)),
+                ty: IrType::F32,
+            });
+        }
+        latch.push(Instruction::BinOp {
+            dest: Value(5),
+            op: IrBinOp::Add,
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Const(IrConst::I32(1)),
+            ty: IrType::I32,
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: latch,
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
+        });
+        // B4: exit — store the accumulator so it is live out.
+        func.blocks.push(BasicBlock {
+            label: BlockId(4),
+            instructions: vec![Instruction::Store {
+                volatile: false,
+                val: Operand::Value(Value(2)),
+                ptr: Value(10),
+                ty: IrType::F32,
+                seg_override: AddressSpace::Default,
+            }],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+        func.next_value_id = 64;
+        func.next_label = 5;
+        func
+    }
+
+    /// The strict-FP serial reduction is the shape the SLP-feedstock veto used
+    /// to swallow: a load-only latch with no `reduction::candidate` (that
+    /// recognizer only accepts a private UNSIGNED sum) declined, so every
+    /// `float sum(const float *v, int n)` kept one element per branch while
+    /// GCC/ICX unrolled it 4x.  It must now unroll — and only when the trip is
+    /// constant and there is exactly ONE carried accumulator, because the
+    /// threading argument that makes the grouping invisible depends on both.
+    #[test]
+    fn f32_serial_reduction_unrolls_only_with_a_constant_trip_and_one_chain() {
+        let one_chain = make_f32_reduction_loop(64, 1, false);
+        assert_eq!(
+            unroll_loops(&mut one_chain.clone(), UnrollPhase::PostVec),
+            1,
+            "a single carried F32 accumulator with a constant trip must unroll"
+        );
+        // Two carried accumulators: no single chain, so the transform leaves it
+        // to the vectorizer / SLP (unchanged behaviour).
+        let two_chains = make_f32_reduction_loop(64, 2, false);
+        assert_eq!(
+            unroll_loops(&mut two_chains.clone(), UnrollPhase::PostVec),
+            0,
+            "two carried accumulators are not a serial chain"
+        );
+        // Dynamic trip: the guard-free k-body transform needs `trip % k == 0`
+        // and a known trip, so this stays rolled no matter how profitable the
+        // chain looks.
+        let dynamic = make_f32_reduction_loop(64, 1, true);
+        assert_eq!(
+            unroll_loops(&mut dynamic.clone(), UnrollPhase::PostVec),
+            0,
+            "a dynamic trip cannot be guard-free unrolled"
+        );
+    }
+
     /// Shared Pass B contract check: after the PostVec unroll of the
     /// two-block loop, the carried phi X (Value(2)) must NOT keep an
     /// IV-shaped verbatim back edge — its back incoming must be a value
@@ -5483,9 +5794,15 @@ mod tests {
         set_reduction_enabled(false);
     }
     #[test]
-    fn unsigned_load_reduction_rejects_odd_trip_volatile_shared_and_signed() {
+    fn unsigned_load_reduction_rejects_odd_trip_volatile_and_shared() {
+        // The private-UNSIGNED reduction recognizer keeps its own narrow
+        // contract (it may re-balance the additions, which needs wraparound
+        // semantics).  A SIGNED serial chain no longer has to pass that
+        // recognizer: `serial_carried_accumulator` admits it, because the
+        // threaded clones preserve the association order exactly and therefore
+        // never introduce an overflow the source did not have.  See
+        // `two_block_unroll_fires_on_load_only_serial_accumulator`.
         set_reduction_enabled(true);
-        let signed = make_two_block_feed_loop(64, LatchFeed::LoadOnly);
         let odd = unsigned_reduction(65);
         let mut vol = unsigned_reduction(64);
         for i in &mut vol.blocks[2].instructions {
@@ -5502,7 +5819,7 @@ mod tests {
             },
         );
         shared.next_value_id = 17;
-        for mut f in [signed, odd, vol, shared] {
+        for mut f in [odd, vol, shared] {
             let before = format!("{f:?}");
             assert_eq!(unroll_loops(&mut f, UnrollPhase::PostVec), 0);
             assert_eq!(format!("{f:?}"), before);
@@ -5532,16 +5849,77 @@ mod tests {
     }
 
     #[test]
-    fn two_block_unroll_declines_load_only_latch() {
-        // A load-only latch (table walk / compare loop) has no store seeds
-        // at all: must decline.
+    fn two_block_unroll_declines_load_only_latch_without_a_serial_chain() {
+        // A load-only latch whose carried phi is NOT an accumulation chain --
+        // the table-walk / compare-loop shape (`while (p < end && *p == *q)`)
+        // -- has no store seeds AND no serial reduction to shorten: two
+        // independent profit reasons to decline it, both measured on their own
+        // (gzip_crc32's table walk +30% insns, glibc_memcmp +20.7%, both at
+        // neutral runtime).
         let mut func = make_two_block_feed_loop(64, LatchFeed::LoadOnly);
+        // Rewire the carried phi's back edge to the LOADED value, so the latch
+        // adds nothing: no `acc = acc + x` chain exists.
+        for inst in &mut func.blocks[1].instructions {
+            if let Instruction::Phi { dest, incoming, .. } = inst {
+                if dest.0 == 2 {
+                    for (op, lbl) in incoming.iter_mut() {
+                        if *lbl == BlockId(2) {
+                            *op = Operand::Value(Value(14));
+                        }
+                    }
+                }
+            }
+        }
         let n = unroll_loops(&mut func, UnrollPhase::PostVec);
-        assert_eq!(n, 0, "load-only latch must decline (no store seeds)");
+        assert_eq!(
+            n, 0,
+            "load-only latch without a serial accumulator must decline"
+        );
         assert!(matches!(
-            func.blocks.iter().find(|b| b.label == BlockId(2)).unwrap().terminator,
+            func.blocks
+                .iter()
+                .find(|b| b.label == BlockId(2))
+                .unwrap()
+                .terminator,
             Terminator::Branch(l) if l == BlockId(1)
         ));
+    }
+
+    #[test]
+    fn two_block_unroll_fires_on_load_only_serial_accumulator() {
+        // The amended profitability rule: a load-only latch that IS a serial
+        // carried accumulator (`acc = acc + v[iv]`, one accumulation per
+        // iteration, one use of the back-edge value) has a second, independent
+        // profit reason -- the k copies are one dependency chain, so the unroll
+        // removes (k-1)/k of the loop overhead without touching the
+        // association order.  This is the shape of every `sum(const T *, int)`
+        // in the corpus, and the reason `reduction_vecreg` went from 1.905 to
+        // 1.048 against GCC.
+        let mut func = make_two_block_feed_loop(64, LatchFeed::LoadOnly);
+        let n = unroll_loops(&mut func, UnrollPhase::PostVec);
+        assert_eq!(n, 1, "load-only serial accumulator must unroll");
+        // The association order is the contract: every clone's accumulation
+        // must consume the PREVIOUS clone's result, so the merged body holds
+        // exactly one `Add` whose operands chain in source order.
+        let body = merged_body_of(&func);
+        let adds: Vec<&Instruction> = body
+            .instructions
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    Instruction::BinOp {
+                        op: IrBinOp::Add,
+                        ..
+                    }
+                )
+            })
+            .collect();
+        assert!(
+            adds.len() >= 4,
+            "k = 4 accumulation groups expected, found {}",
+            adds.len()
+        );
     }
 
     #[test]

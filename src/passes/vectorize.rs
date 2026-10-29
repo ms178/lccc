@@ -499,6 +499,12 @@ pub(crate) fn set_strided_reduce_enabled(enabled: bool) {
     strided_i32_reduce::set_enabled(enabled);
 }
 
+/// `LCCC_VEC_STRIDED_TRACE`: name the analysis stage that declined a strided
+/// reduction, resolved once per translation unit alongside the enable switch.
+pub(crate) fn set_strided_reduce_trace(enabled: bool) {
+    strided_i32_reduce::set_trace_enabled(enabled);
+}
+
 pub(crate) fn set_strict_recip_pack_enabled(enabled: bool) {
     STRICT_RECIP_PACK_ENABLED.with(|cell| cell.set(enabled));
 }
@@ -932,6 +938,26 @@ fn vectorize_with_analysis_mode(
                 total_changes += n;
                 continue;
             }
+        } else if !neon && !force_two_wide && !late_minmax_only() && x86_simd_available() && {
+                // FIRST REFUSAL: `analyze_reduction_pattern` matches this loop
+                // too (a strided `Sum`), and the reduction arm either rewrites
+                // it or declines -- either way the loop never reached the
+                // strided reducer, which is why that transform never fired:
+                // not on its own regression fixture, not on the byte_load
+                // benchmark it was written for.  A dormant optimization is a
+                // missed optimization, so the specific, fully-proved transform
+                // is asked first and the general one only sees what it
+                // declines.  `try_transform` returns 0 without mutating
+                // anything on a non-match, so the extra positional scan is the
+                // whole cost of the ordering.
+                let n = strided_i32_reduce::try_transform(func, loop_info, &cfg, symbol_facts);
+                total_changes += n;
+                n > 0
+            }
+        {
+            if debug {
+                eprintln!("[VEC] Strided I32 reduction pattern matched! Transformed to SIMD");
+            }
         } else if let Some(red_pattern) = analyze_reduction_pattern(
             func,
             loop_info,
@@ -1147,14 +1173,6 @@ fn vectorize_with_analysis_mode(
                     eprintln!("[VEC] Reduction pattern matched! Transforming to AVX2 4-wide");
                 }
                 total_changes += transform_reduction_avx2(func, &red_pattern, fp_contract);
-            }
-        } else if !neon && !force_two_wide && !late_minmax_only() && x86_simd_available() && {
-            let n = strided_i32_reduce::try_transform(func, loop_info, &cfg, symbol_facts);
-            total_changes += n;
-            n > 0
-        } {
-            if debug {
-                eprintln!("[VEC] Strided I32 reduction pattern matched! Transformed to SIMD");
             }
         } else if !no_map_vec() {
             // AUD-4: the late scope deliberately does NOT gate the map
@@ -30578,11 +30596,30 @@ fn transform_reduction_sse2(
                     IntrinsicOp::VecHorizontalAddI64x2,
                 )
             }
+            IrType::I32
+                if pattern.accumulator_type == IrType::I64
+                    && pattern.kind == ReductionKind::DotProduct =>
+            {
+                // NO PACKED 64-BIT LOW-HALF PRODUCT EXISTS on the SSE2/AVX2
+                // baseline (vpmullq is AVX-512DQ), so `VecMulI64x2` is an
+                // emulation: movq/movq/imulq/movq/pshufd/pshufd/movq/movq/
+                // imulq/movq/punpcklqdq — 13 instructions per TWO lanes
+                // (6.5/lane) against one scalar `imulq` per lane, and it also
+                // lengthens the live ranges enough to force the vector operand
+                // through a stack slot.  Costed by callgrind on
+                // `unsigned_reduction`: the vectorized `dot_u64` ran 1.44x the
+                // reference compiler's SCALAR loop (291.0M vs 202.8M
+                // instructions, 50.3M of them `movq` extractions and 77.6M
+                // `movdqu` spills), and GCC leaves the same loop scalar.  Sums
+                // keep the 2-lane arm below — `paddq` is a real instruction
+                // and that shape IS a win.
+                return 0;
+            }
             IrType::I32 if pattern.accumulator_type == IrType::I64 => (
                 2u64,
                 IntrinsicOp::VecLoadWidenI32ToI64x2,
                 IntrinsicOp::VecAddI64x2,
-                Some(IntrinsicOp::VecMulI64x2),
+                None,
                 IntrinsicOp::VecHorizontalAddI64x2,
             ),
             IrType::I32 => {
@@ -30598,11 +30635,18 @@ fn transform_reduction_sse2(
                     IntrinsicOp::HorizontalAddI32x4,
                 )
             }
+            IrType::I64 if pattern.kind == ReductionKind::DotProduct => {
+                // Same emulation cost as the widening arm above: a 64x64
+                // low-half product needs 4 pmuludq plus unpacking per 2 lanes.
+                // GCC refuses it too; measured 1.44x slower than its scalar
+                // loop (see the I32->I64 arm's note).
+                return 0;
+            }
             IrType::I64 => (
                 2u64,
                 IntrinsicOp::VecLoadI64x2,
                 IntrinsicOp::VecAddI64x2,
-                Some(IntrinsicOp::VecMulI64x2),
+                None,
                 IntrinsicOp::VecHorizontalAddI64x2,
             ),
             IrType::F32 => (
@@ -31660,7 +31704,7 @@ fn transform_reduction_sse2(
             ),
             IntrinsicOp::VecLoadI64x2 => (
                 IntrinsicOp::VecLoadI64x2,
-                Some(IntrinsicOp::VecMulI64x2),
+                None,
                 IntrinsicOp::VecAddI64x2,
                 IntrinsicOp::VecZeroI64x2,
             ),
@@ -32542,7 +32586,13 @@ fn transform_map_vector(
             (IrType::I8 | IrType::U8, true, IrBinOp::Xor) => Some(IntrinsicOp::VecXorI8x32),
             (IrType::I8 | IrType::U8, false, IrBinOp::Xor) => Some(IntrinsicOp::VecXorI32x4),
             (IrType::I64 | IrType::U64, _, IrBinOp::Add) => Some(IntrinsicOp::VecAddI64x2),
-            (IrType::I64 | IrType::U64, _, IrBinOp::Mul) => Some(IntrinsicOp::VecMulI64x2),
+            // No packed 64x64 low-half product on SSE2/AVX2 (`vpmullq` is
+            // AVX-512DQ): `VecMulI64x2` is a 13-instruction emulation for two
+            // lanes, so a map that multiplies I64/U64 lanes stays scalar where
+            // the scalar form is `imulq` per lane.  Measured with callgrind on
+            // `unsigned_reduction`'s `dot_u64` (1.44x the reference compiler's
+            // scalar loop) and confirmed by GCC/ICX leaving the same loops
+            // scalar.
             (IrType::I64 | IrType::U64, _, IrBinOp::Sub) => Some(IntrinsicOp::VecSubI64x2),
             // ---- Word lanes (OP-05g) --------------------------------------
             // Words, unlike bytes, DO have a packed multiply (`pmullw`,

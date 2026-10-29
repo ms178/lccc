@@ -6,7 +6,7 @@
 # source at every saturation boundary.  The dword lane is checked for
 # correctness only: x86 has no packed dword saturating subtract.
 set -euo pipefail
-CCC=${CCC:-./target/release/lccc}
+CCC=${LCCC_BIN:-${CCC:-target/fastbuild/lccc}}
 REF=${REF:-gcc-16}
 dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 src="$dir/vectorize_saturating_subtract.c"

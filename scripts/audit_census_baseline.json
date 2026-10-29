@@ -1,6 +1,6 @@
 {
   "fns_over_1000": 26,
-  "fns_over_300": 234,
+  "fns_over_300": 233,
   "fns_over_500": 97,
   "ignored_tests": 10,
   "knob_literals": 543,
@@ -544,6 +544,7 @@
     "LCCC_STRICT_OPTIONS",
     "LCCC_SYSROOT",
     "LCCC_VA_CALL",
+    "LCCC_VEC_STRIDED_TRACE",
     "LCCC_VOLATILE_BEGIN",
     "LCCC_VOLATILE_END",
     "LCCC_VOLATILE_SLOT",
