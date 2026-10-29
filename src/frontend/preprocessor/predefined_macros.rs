@@ -584,6 +584,19 @@ impl Preprocessor {
         });
     }
 
+    /// Redefine one of the function-like predefined macros for a target whose
+    /// integer model differs from the x86-64 table above.
+    pub(super) fn define_function_macro(&mut self, name: &str, params: &[&str], body: &str) {
+        self.macros.define(MacroDef {
+            name: name.to_string(),
+            is_function_like: true,
+            params: params.iter().map(|p| p.to_string()).collect(),
+            is_variadic: false,
+            has_named_variadic: false,
+            body: body.to_string(),
+        });
+    }
+
     /// Return C-standard `__DATE__` and `__TIME__` macro replacement lists.
     ///
     /// `SOURCE_DATE_EPOCH` is honored for reproducible builds.  Without it we
@@ -1254,177 +1267,220 @@ impl Preprocessor {
                 // RISC-V uses IEEE 754 binary128 for long double (not x87 80-bit)
                 self.override_ldbl_binary128();
             }
-            "i686" | "i386" => {
-                // Remove x86-64 macros (keep x86 general macros)
-                self.macros.undefine("__x86_64__");
-                self.macros.undefine("__x86_64");
-                self.macros.undefine("__amd64__");
-                self.macros.undefine("__amd64");
-                self.macros.undefine("__LP64__");
-                self.macros.undefine("_LP64");
-                self.macros.undefine("__SIZEOF_INT128__");
-                // i686 baseline does not include SSE (GCC only enables SSE with
-                // -march=pentium4 or higher). Remove SSE macros to match GCC.
-                self.macros.undefine("__SSE__");
-                self.macros.undefine("__SSE2__");
-                self.macros.undefine("__MMX__");
-                self.macros.undefine("__SSE_MATH__");
-                self.macros.undefine("__SSE2_MATH__");
-                // i686-linux-gnu-gcc -m32 does NOT define __CET__ (CET is
-                // disabled by -m32).  We must match this because .S assembly
-                // files are assembled by GCC, and if the C code expects
-                // ENDBR_PRESENT (44-byte trampolines) but the assembly
-                // produces non-ENDBR trampolines (40 bytes), the mismatch
-                // causes crashes (e.g. libffi closures).
-                self.macros.undefine("__CET__");
-                // Define i686/i386 macros
-                self.define_simple_macro("__i386__", "1");
-                self.define_simple_macro("__i386", "1");
-                self.define_simple_macro("i386", "1");
-                self.define_simple_macro("__i686__", "1");
-                self.define_simple_macro("__i686", "1");
-                self.define_simple_macro("__ILP32__", "1");
-                self.define_simple_macro("_ILP32", "1");
-                // ILP32 data model: pointer/long/size_t are 4 bytes
-                self.define_simple_macro("__SIZEOF_POINTER__", "4");
-                self.define_simple_macro("__SIZEOF_LONG__", "4");
-                self.define_simple_macro("__SIZEOF_SIZE_T__", "4");
-                self.define_simple_macro("__SIZEOF_PTRDIFF_T__", "4");
-                // Long double is 12 bytes on i686 (80-bit x87 + 4 bytes padding)
-                self.define_simple_macro("__SIZEOF_LONG_DOUBLE__", "12");
-                // Type limits for ILP32
-                self.define_simple_macro("__LONG_MAX__", "2147483647L");
-                self.define_simple_macro("__SIZE_MAX__", "4294967295U");
-                self.define_simple_macro("__PTRDIFF_MAX__", "2147483647");
-                // NOTE: the unprefixed `<limits.h>`/`<stdint.h>` macros are
-                // deliberately NOT defined here (or at the LP64 default):
-                // GCC predefines none of them in any dialect (measured), so
-                // bare uses must fail equally in both compilers (GP-05).
-                // Type names for ILP32 (long is 32-bit, so many types change)
-                self.define_simple_macro("__SIZE_TYPE__", "unsigned int");
-                self.define_simple_macro("__PTRDIFF_TYPE__", "int");
-                self.define_simple_macro("__INTMAX_TYPE__", "long long int");
-                self.define_simple_macro("__UINTMAX_TYPE__", "long long unsigned int");
-                self.define_simple_macro("__INT64_TYPE__", "long long int");
-                self.define_simple_macro("__UINT64_TYPE__", "long long unsigned int");
-                self.define_simple_macro("__INTPTR_TYPE__", "int");
-                self.define_simple_macro("__UINTPTR_TYPE__", "unsigned int");
-                self.define_simple_macro("__INT_LEAST64_TYPE__", "long long int");
-                self.define_simple_macro("__UINT_LEAST64_TYPE__", "long long unsigned int");
-                self.define_simple_macro("__INT_FAST16_TYPE__", "int");
-                self.define_simple_macro("__INT_FAST32_TYPE__", "int");
-                self.define_simple_macro("__INT_FAST64_TYPE__", "long long int");
-                self.define_simple_macro("__UINT_FAST16_TYPE__", "unsigned int");
-                self.define_simple_macro("__UINT_FAST64_TYPE__", "long long unsigned int");
-                // Replace x86-64 include paths with i686 paths. The GCC
-                // *header* directory must survive this filter: on multilib
-                // layouts (Debian/Ubuntu gcc-multilib, which is also what
-                // real `gcc -m32` uses) /usr/lib/gcc/x86_64-linux-gnu/<v>/
-                // include serves BOTH word sizes — stddef.h, stdarg.h,
-                // stdatomic.h and the -march-guarded intrinsic headers are
-                // word-size-agnostic or macro-guarded. Dropping it left -m32
-                // compiles without stddef.h/stdarg.h entirely. Only the
-                // x86-64 *C library* dirs (glibc's /usr/include/x86_64-
-                // linux-gnu bits) are x86-64-specific and get filtered.
-                self.system_include_paths.retain(|p| {
-                    let s = p.to_string_lossy();
-                    if s.contains("/usr/lib/gcc/x86_64-") {
-                        return true;
-                    }
-                    !s.contains("x86_64")
-                });
-                let i686_paths = [
-                    "/usr/lib/gcc-cross/i686-linux-gnu/16/include",
-                    "/usr/lib/gcc-cross/i686-linux-gnu/15/include",
-                    "/usr/lib/gcc-cross/i686-linux-gnu/14/include",
-                    "/usr/lib/gcc-cross/i686-linux-gnu/13/include",
-                    "/usr/lib/gcc-cross/i686-linux-gnu/12/include",
-                    "/usr/lib/gcc-cross/i686-linux-gnu/11/include",
-                    "/usr/lib/gcc/i686-linux-gnu/16/include",
-                    "/usr/lib/gcc/i686-linux-gnu/15/include",
-                    "/usr/lib/gcc/i686-linux-gnu/14/include",
-                    "/usr/lib/gcc/i686-linux-gnu/13/include",
-                    "/usr/lib/gcc/i686-linux-gnu/12/include",
-                    "/usr/lib/gcc/i686-linux-gnu/11/include",
-                    "/usr/i686-linux-gnu/include",
-                    "/usr/include/i386-linux-gnu",
-                ];
-                let mapped: Vec<String> = i686_paths
-                    .iter()
-                    .map(|p| sysroot_candidate(p).to_string_lossy().into_owned())
-                    .collect();
-                let mapped_refs: Vec<&str> = mapped.iter().map(String::as_str).collect();
-                self.insert_arch_paths_after_bundled(&mapped_refs);
-                // GNU --sysroot remaps the *generic* C-library include dirs
-                // too, not only the arch-specific ones.  Without this the
-                // unprefixed host /usr/include still answers first for
-                // <stdio.h> & friends whenever the arch dirs don't carry the
-                // header themselves, so a rootless multilib sysroot on a host
-                // whose glibc headers are NOT single-tree i386-compatible
-                // (Debian multiarch layouts, cross-only CI images) resolves
-                // x86-64-flavored headers for i686 compiles and fails with
-                // missing bits/*.h.  Mapped generic dirs are appended after
-                // the arch dirs (still ahead of every unprefixed fallback);
-                // with no LCCC_SYSROOT nothing changes at all.
-                if std::env::var("LCCC_SYSROOT").is_ok_and(|r| !r.is_empty()) {
-                    const GENERIC_LIB_DIRS: [&str; 2] = ["/usr/local/include", "/usr/include"];
-                    let mapped_generic: Vec<String> = GENERIC_LIB_DIRS
-                        .iter()
-                        .map(|p| sysroot_candidate(p).to_string_lossy().into_owned())
-                        .collect();
-                    let generic_refs: Vec<&str> =
-                        mapped_generic.iter().map(String::as_str).collect();
-                    self.insert_arch_paths_after_bundled(&generic_refs);
-                }
-                // Override width macros for ILP32 (pointer/long/size_t/ptrdiff are 32-bit)
-                self.define_simple_macro("__LONG_WIDTH__", "32");
-                self.define_simple_macro("__PTRDIFF_WIDTH__", "32");
-                self.define_simple_macro("__SIZE_WIDTH__", "32");
-                self.define_simple_macro("__INTPTR_WIDTH__", "32");
-                self.define_simple_macro("__INT_FAST16_WIDTH__", "32");
-                self.define_simple_macro("__INT_FAST32_WIDTH__", "32");
-                // i686 uses the same x87 80-bit long double format as x86-64
-                // (LDBL macros are already set correctly), but sizeof differs (12 vs 16)
-
-                // Swap the x86-64 multiarch include dir for the i386 one.
-                // Debian puts the 32-bit `bits/` headers under
-                // /usr/include/i386-linux-gnu, and the arm above deliberately
-                // ships only arch-neutral paths, so without this every 32-bit
-                // compile fails at `#include <stdio.h>` with
-                // "bits/libc-header-start.h: No such file or directory" -- the
-                // x86-64 dir would be searched first and is wrong for the ABI.
-                // Order is preserved: the i386 dir takes the slot the x86-64
-                // one occupied, so /usr/local/include still wins and /usr/include
-                // is still the fallback.
-                // Exact match on the /usr/include multiarch dir only.  A
-                // substring test also caught /usr/lib/gcc/x86_64-linux-gnu/<ver>
-                // /include, which holds GCC's own freestanding headers
-                // (stddef.h, stdarg.h) and is *shared* between -m32 and -m64 --
-                // replacing it broke every 32-bit compile on <stdio.h>.
-                let mut swapped = false;
-                for slot in self.system_include_paths.iter_mut() {
-                    if slot == std::path::Path::new("/usr/include/x86_64-linux-gnu") {
-                        *slot = sysroot_candidate("/usr/include/i386-linux-gnu");
-                        swapped = true;
-                        break;
-                    }
-                }
-                if !swapped {
-                    // No x86-64 multiarch dir was present (e.g. a bare
-                    // /usr/include install); insert the i386 dir ahead of
-                    // /usr/include so the 32-bit headers win.
-                    let at = self
-                        .system_include_paths
-                        .iter()
-                        .position(|p| p == std::path::Path::new("/usr/include"))
-                        .unwrap_or(self.system_include_paths.len());
-                    self.system_include_paths
-                        .insert(at, sysroot_candidate("/usr/include/i386-linux-gnu"));
-                }
-            }
+            "i686" | "i386" => self.apply_i686_target(),
             _ => {
                 // x86_64 is already the default
             }
+        }
+    }
+
+    /// Apply the i686/i386 (ILP32) target overrides.
+    ///
+    /// Split out of `set_target`, whose arm had grown past the file's
+    /// function-length budget; the sequence is order-sensitive (the x86-64
+    /// spellings are undone or replaced one by one), so it stays together.
+    fn apply_i686_target(&mut self) {
+        // Remove x86-64 macros (keep x86 general macros)
+        self.macros.undefine("__x86_64__");
+        self.macros.undefine("__x86_64");
+        self.macros.undefine("__amd64__");
+        self.macros.undefine("__amd64");
+        self.macros.undefine("__LP64__");
+        self.macros.undefine("_LP64");
+        self.macros.undefine("__SIZEOF_INT128__");
+        // i686 baseline does not include SSE (GCC only enables SSE with
+        // -march=pentium4 or higher). Remove SSE macros to match GCC.
+        self.macros.undefine("__SSE__");
+        self.macros.undefine("__SSE2__");
+        self.macros.undefine("__MMX__");
+        self.macros.undefine("__SSE_MATH__");
+        self.macros.undefine("__SSE2_MATH__");
+        // i686-linux-gnu-gcc -m32 does NOT define __CET__ (CET is
+        // disabled by -m32).  We must match this because .S assembly
+        // files are assembled by GCC, and if the C code expects
+        // ENDBR_PRESENT (44-byte trampolines) but the assembly
+        // produces non-ENDBR trampolines (40 bytes), the mismatch
+        // causes crashes (e.g. libffi closures).
+        self.macros.undefine("__CET__");
+        // Define i686/i386 macros
+        self.define_simple_macro("__i386__", "1");
+        self.define_simple_macro("__i386", "1");
+        self.define_simple_macro("i386", "1");
+        self.define_simple_macro("__i686__", "1");
+        self.define_simple_macro("__i686", "1");
+        self.define_simple_macro("__ILP32__", "1");
+        self.define_simple_macro("_ILP32", "1");
+        // ILP32 data model: pointer/long/size_t are 4 bytes
+        self.define_simple_macro("__SIZEOF_POINTER__", "4");
+        self.define_simple_macro("__SIZEOF_LONG__", "4");
+        self.define_simple_macro("__SIZEOF_SIZE_T__", "4");
+        self.define_simple_macro("__SIZEOF_PTRDIFF_T__", "4");
+        // Long double is 12 bytes on i686 (80-bit x87 + 4 bytes padding)
+        self.define_simple_macro("__SIZEOF_LONG_DOUBLE__", "12");
+        // The 80-bit x87 format is 12 bytes (10 payload + 2 padding) on
+        // i386; the x86-64 table's 16 is the 128-bit format.
+        self.define_simple_macro("__SIZEOF_FLOAT80__", "12");
+        // ILP32 width and suffix overrides. The x86-64 table spells every
+        // 64-bit limit with a single `L` and defines the pointer-width
+        // limits from the LP64 model; on ILP32 `long` is 32 bits, so
+        // `0x7fffffffffffffffL` would name a 32-bit constant and
+        // `__INT64_C(x)` would build a `long` that cannot hold it.
+        // Values and spellings measured against `gcc-16 -m32 -dM -E`
+        // (2026-10-28).
+        self.define_simple_macro("__INTPTR_MAX__", "0x7fffffff");
+        self.define_simple_macro("__UINTPTR_MAX__", "0xffffffffU");
+        self.define_simple_macro("__INT_FAST16_MAX__", "0x7fffffff");
+        self.define_simple_macro("__UINT_FAST16_MAX__", "0xffffffffU");
+        self.define_simple_macro("__INT_FAST32_MAX__", "0x7fffffff");
+        self.define_simple_macro("__UINT_FAST32_MAX__", "0xffffffffU");
+        // `int_fast32_t` is `unsigned int` here, not `unsigned long`.
+        self.define_simple_macro("__UINT_FAST32_TYPE__", "unsigned int");
+        self.define_simple_macro("__INT64_MAX__", "0x7fffffffffffffffLL");
+        self.define_simple_macro("__UINT64_MAX__", "0xffffffffffffffffULL");
+        self.define_simple_macro("__INT_LEAST64_MAX__", "0x7fffffffffffffffLL");
+        self.define_simple_macro("__UINT_LEAST64_MAX__", "0xffffffffffffffffULL");
+        self.define_simple_macro("__INT_FAST64_MAX__", "0x7fffffffffffffffLL");
+        self.define_simple_macro("__UINT_FAST64_MAX__", "0xffffffffffffffffULL");
+        self.define_simple_macro("__INTMAX_MAX__", "0x7fffffffffffffffLL");
+        self.define_simple_macro("__UINTMAX_MAX__", "0xffffffffffffffffULL");
+        self.define_function_macro("__INT64_C", &["c"], "c ## LL");
+        self.define_function_macro("__UINT64_C", &["c"], "c ## ULL");
+        self.define_function_macro("__INTMAX_C", &["c"], "c ## LL");
+        self.define_function_macro("__UINTMAX_C", &["c"], "c ## ULL");
+        // Type limits for ILP32
+        self.define_simple_macro("__LONG_MAX__", "2147483647L");
+        self.define_simple_macro("__SIZE_MAX__", "4294967295U");
+        self.define_simple_macro("__PTRDIFF_MAX__", "2147483647");
+        // Override <limits.h> macros for ILP32 (long is 32-bit)
+        self.define_simple_macro("LONG_MIN", "(-2147483647L-1L)");
+        self.define_simple_macro("LONG_MAX", "2147483647L");
+        self.define_simple_macro("ULONG_MAX", "4294967295UL");
+        // Override <stdint.h> macros for ILP32 (pointer/size_t are 32-bit)
+        self.define_simple_macro("INTPTR_MIN", "(-2147483647-1)");
+        self.define_simple_macro("INTPTR_MAX", "2147483647");
+        self.define_simple_macro("UINTPTR_MAX", "4294967295U");
+        self.define_simple_macro("SIZE_MAX", "4294967295U");
+        self.define_simple_macro("PTRDIFF_MIN", "(-2147483647-1)");
+        self.define_simple_macro("PTRDIFF_MAX", "2147483647");
+        // Type names for ILP32 (long is 32-bit, so many types change)
+        self.define_simple_macro("__SIZE_TYPE__", "unsigned int");
+        self.define_simple_macro("__PTRDIFF_TYPE__", "int");
+        self.define_simple_macro("__INTMAX_TYPE__", "long long int");
+        self.define_simple_macro("__UINTMAX_TYPE__", "long long unsigned int");
+        self.define_simple_macro("__INT64_TYPE__", "long long int");
+        self.define_simple_macro("__UINT64_TYPE__", "long long unsigned int");
+        self.define_simple_macro("__INTPTR_TYPE__", "int");
+        self.define_simple_macro("__UINTPTR_TYPE__", "unsigned int");
+        self.define_simple_macro("__INT_LEAST64_TYPE__", "long long int");
+        self.define_simple_macro("__UINT_LEAST64_TYPE__", "long long unsigned int");
+        self.define_simple_macro("__INT_FAST16_TYPE__", "int");
+        self.define_simple_macro("__INT_FAST32_TYPE__", "int");
+        self.define_simple_macro("__INT_FAST64_TYPE__", "long long int");
+        self.define_simple_macro("__UINT_FAST16_TYPE__", "unsigned int");
+        self.define_simple_macro("__UINT_FAST64_TYPE__", "long long unsigned int");
+        // Replace x86-64 include paths with i686 paths. The GCC
+        // *header* directory must survive this filter: on multilib
+        // layouts (Debian/Ubuntu gcc-multilib, which is also what
+        // real `gcc -m32` uses) /usr/lib/gcc/x86_64-linux-gnu/<v>/
+        // include serves BOTH word sizes — stddef.h, stdarg.h,
+        // stdatomic.h and the -march-guarded intrinsic headers are
+        // word-size-agnostic or macro-guarded. Dropping it left -m32
+        // compiles without stddef.h/stdarg.h entirely. Only the
+        // x86-64 *C library* dirs (glibc's /usr/include/x86_64-
+        // linux-gnu bits) are x86-64-specific and get filtered.
+        self.system_include_paths.retain(|p| {
+            let s = p.to_string_lossy();
+            if s.contains("/usr/lib/gcc/x86_64-") {
+                return true;
+            }
+            !s.contains("x86_64")
+        });
+        let i686_paths = [
+            "/usr/lib/gcc-cross/i686-linux-gnu/16/include",
+            "/usr/lib/gcc-cross/i686-linux-gnu/15/include",
+            "/usr/lib/gcc-cross/i686-linux-gnu/14/include",
+            "/usr/lib/gcc-cross/i686-linux-gnu/13/include",
+            "/usr/lib/gcc-cross/i686-linux-gnu/12/include",
+            "/usr/lib/gcc-cross/i686-linux-gnu/11/include",
+            "/usr/lib/gcc/i686-linux-gnu/16/include",
+            "/usr/lib/gcc/i686-linux-gnu/15/include",
+            "/usr/lib/gcc/i686-linux-gnu/14/include",
+            "/usr/lib/gcc/i686-linux-gnu/13/include",
+            "/usr/lib/gcc/i686-linux-gnu/12/include",
+            "/usr/lib/gcc/i686-linux-gnu/11/include",
+            "/usr/i686-linux-gnu/include",
+            "/usr/include/i386-linux-gnu",
+        ];
+        let mapped: Vec<String> = i686_paths
+            .iter()
+            .map(|p| sysroot_candidate(p).to_string_lossy().into_owned())
+            .collect();
+        let mapped_refs: Vec<&str> = mapped.iter().map(String::as_str).collect();
+        self.insert_arch_paths_after_bundled(&mapped_refs);
+        // GNU --sysroot remaps the *generic* C-library include dirs
+        // too, not only the arch-specific ones.  Without this the
+        // unprefixed host /usr/include still answers first for
+        // <stdio.h> & friends whenever the arch dirs don't carry the
+        // header themselves, so a rootless multilib sysroot on a host
+        // whose glibc headers are NOT single-tree i386-compatible
+        // (Debian multiarch layouts, cross-only CI images) resolves
+        // x86-64-flavored headers for i686 compiles and fails with
+        // missing bits/*.h.  Mapped generic dirs are appended after
+        // the arch dirs (still ahead of every unprefixed fallback);
+        // with no LCCC_SYSROOT nothing changes at all.
+        if std::env::var("LCCC_SYSROOT").is_ok_and(|r| !r.is_empty()) {
+            const GENERIC_LIB_DIRS: [&str; 2] = ["/usr/local/include", "/usr/include"];
+            let mapped_generic: Vec<String> = GENERIC_LIB_DIRS
+                .iter()
+                .map(|p| sysroot_candidate(p).to_string_lossy().into_owned())
+                .collect();
+            let generic_refs: Vec<&str> = mapped_generic.iter().map(String::as_str).collect();
+            self.insert_arch_paths_after_bundled(&generic_refs);
+        }
+        // Override width macros for ILP32 (pointer/long/size_t/ptrdiff are 32-bit)
+        self.define_simple_macro("__LONG_WIDTH__", "32");
+        self.define_simple_macro("__PTRDIFF_WIDTH__", "32");
+        self.define_simple_macro("__SIZE_WIDTH__", "32");
+        self.define_simple_macro("__INTPTR_WIDTH__", "32");
+        self.define_simple_macro("__INT_FAST16_WIDTH__", "32");
+        self.define_simple_macro("__INT_FAST32_WIDTH__", "32");
+        // i686 uses the same x87 80-bit long double format as x86-64
+        // (LDBL macros are already set correctly), but sizeof differs (12 vs 16)
+
+        // Swap the x86-64 multiarch include dir for the i386 one.
+        // Debian puts the 32-bit `bits/` headers under
+        // /usr/include/i386-linux-gnu, and the arm above deliberately
+        // ships only arch-neutral paths, so without this every 32-bit
+        // compile fails at `#include <stdio.h>` with
+        // "bits/libc-header-start.h: No such file or directory" -- the
+        // x86-64 dir would be searched first and is wrong for the ABI.
+        // Order is preserved: the i386 dir takes the slot the x86-64
+        // one occupied, so /usr/local/include still wins and /usr/include
+        // is still the fallback.
+        // Exact match on the /usr/include multiarch dir only.  A
+        // substring test also caught /usr/lib/gcc/x86_64-linux-gnu/<ver>
+        // /include, which holds GCC's own freestanding headers
+        // (stddef.h, stdarg.h) and is *shared* between -m32 and -m64 --
+        // replacing it broke every 32-bit compile on <stdio.h>.
+        let mut swapped = false;
+        for slot in self.system_include_paths.iter_mut() {
+            if slot == std::path::Path::new("/usr/include/x86_64-linux-gnu") {
+                *slot = sysroot_candidate("/usr/include/i386-linux-gnu");
+                swapped = true;
+                break;
+            }
+        }
+        if !swapped {
+            // No x86-64 multiarch dir was present (e.g. a bare
+            // /usr/include install); insert the i386 dir ahead of
+            // /usr/include so the 32-bit headers win.
+            let at = self
+                .system_include_paths
+                .iter()
+                .position(|p| p == std::path::Path::new("/usr/include"))
+                .unwrap_or(self.system_include_paths.len());
+            self.system_include_paths
+                .insert(at, sysroot_candidate("/usr/include/i386-linux-gnu"));
         }
     }
 
