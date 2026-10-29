@@ -12373,6 +12373,17 @@ def _standalone_ld_flags_test(args, oracles):
     return results
 
 
+def _i686_debug_gotoff_test(args, oracles):
+    name = "i686_debug_gotoff"
+    ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
+    if not os.path.exists(ld):
+        return [Result(name, "SKIP", "lccc-ld not built")]
+    r = sh([sys.executable, os.path.join(HERE, "i686_debug_gotoff.py"),
+            "--lccc-ld", ld], timeout=90)
+    detail = (r.stderr + r.stdout).decode(errors="replace")[-1000:]
+    return [Result(name, "PASS" if r.returncode == 0 else "FAIL", detail)]
+
+
 class _Entry:
     """One registered test (or group of tests sharing a fixture).
 
@@ -12541,6 +12552,7 @@ def _registry(args, oracles):
         group(("defsym_layout_plus", "defsym_layout_arith", "defsym_layout_end_final",
                "defsym_layout_reloc_reference", "defsym_layout_shared"),
               _defsym_layout_test, "defsym", aux=("defsym_layout_expr",)),
+        one("i686_debug_gotoff", _i686_debug_gotoff_test, "reloc", "i386"),
         group(("lccc_ld_default_search_path_x86_64", "lccc_ld_default_search_path_i386",
                "lccc_ld_new_dtags_x86_64", "lccc_ld_new_dtags_i386"),
               _standalone_ld_flags_test, "dynamic", "i386"),
