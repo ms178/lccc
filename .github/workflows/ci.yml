@@ -1816,6 +1816,10 @@ jobs:
       env:
         CCC: target/fastbuild/lccc
       run: bash tests/regression/check_vectorize_isa_gate.sh
+    - name: Verify vectorizer saturating-subtract fold
+      env:
+        CCC: target/fastbuild/lccc
+      run: bash tests/regression/check_vectorize_saturating_subtract.sh
     - name: Verify byte-compare window phase
       env:
         CCC: target/fastbuild/lccc

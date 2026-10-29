@@ -109,8 +109,18 @@ fn strided_reduce_disabled() -> bool {
 /// loop exists" -- which is exactly how this pass sat unused without anyone
 /// noticing.  Setting `LCCC_VEC_STRIDED_TRACE=1` names the line that declined.
 fn trace_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("LCCC_VEC_STRIDED_TRACE").is_some())
+    TRACE.with(|cell| cell.get())
+}
+
+thread_local! {
+    static TRACE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Install the trace switch, resolved once per translation unit in
+/// `run_passes` (src/passes/mod.rs, which the env-read ratchet excludes) so
+/// this pass reads no environment variable of its own.
+pub(crate) fn set_trace_enabled(enabled: bool) {
+    TRACE.with(|cell| cell.set(enabled));
 }
 
 macro_rules! decline {
@@ -631,6 +641,66 @@ fn expr_has_load(e: &StridedExpr) -> bool {
     }
 }
 
+/// Every value the loop's own blocks define.
+fn loop_defined_values(
+    func: &IrFunction,
+    loop_info: &loop_analysis::NaturalLoop,
+) -> FxHashSet<Value> {
+    let mut defs = FxHashSet::default();
+    for &b in &loop_info.body {
+        for inst in &func.blocks[b].instructions {
+            if let Some(d) = inst.dest() {
+                defs.insert(d);
+            }
+        }
+    }
+    defs
+}
+
+/// Is any loop-defined value other than `acc` read outside the loop?
+///
+/// The transform rebuilds the loop body from the packed expression and leaves
+/// the scalar remainder to resume from the induction variable, so a value the
+/// loop defines cannot be consumed by the surrounding code afterwards: its new
+/// definition would not match. `acc` is the one exception -- it is the
+/// reduction's result and the caller keeps reading it.
+fn loop_value_escapes(
+    func: &IrFunction,
+    loop_info: &loop_analysis::NaturalLoop,
+    loop_defs: &FxHashSet<Value>,
+    acc: Value,
+) -> bool {
+    let escapes =
+        |op: &Operand| matches!(op, Operand::Value(v) if loop_defs.contains(v) && *v != acc);
+    for (b_idx, block) in func.blocks.iter().enumerate() {
+        if loop_info.body.contains(&b_idx) {
+            continue;
+        }
+        let mut bad = false;
+        for inst in &block.instructions {
+            crate::backend::liveness::for_each_operand_in_instruction(inst, |op| {
+                if escapes(op) {
+                    bad = true;
+                }
+            });
+            if let Instruction::GetElementPtr { base, .. } = inst {
+                if loop_defs.contains(base) && *base != acc {
+                    bad = true;
+                }
+            }
+        }
+        crate::backend::liveness::for_each_operand_in_terminator(&block.terminator, |op| {
+            if escapes(op) {
+                bad = true;
+            }
+        });
+        if bad {
+            return true;
+        }
+    }
+    false
+}
+
 fn analyze(
     func: &IrFunction,
     loop_info: &loop_analysis::NaturalLoop,
@@ -757,44 +827,11 @@ fn analyze(
         decline!();
     }
 
-    // Escape closure: only `acc_phi` may be observed outside `loop_info.body`.
-    let mut loop_defs = FxHashSet::default();
-    for &b in &loop_info.body {
-        for inst in &func.blocks[b].instructions {
-            if let Some(d) = inst.dest() {
-                loop_defs.insert(d);
-            }
-        }
-    }
-    for (b_idx, block) in func.blocks.iter().enumerate() {
-        if loop_info.body.contains(&b_idx) {
-            continue;
-        }
-        let mut bad_escape = false;
-        for inst in &block.instructions {
-            crate::backend::liveness::for_each_operand_in_instruction(inst, |op| {
-                if let Operand::Value(v) = op {
-                    if loop_defs.contains(v) && *v != acc_phi {
-                        bad_escape = true;
-                    }
-                }
-            });
-            if let Instruction::GetElementPtr { base, .. } = inst {
-                if loop_defs.contains(base) && *base != acc_phi {
-                    bad_escape = true;
-                }
-            }
-        }
-        crate::backend::liveness::for_each_operand_in_terminator(&block.terminator, |op| {
-            if let Operand::Value(v) = op {
-                if loop_defs.contains(v) && *v != acc_phi {
-                    bad_escape = true;
-                }
-            }
-        });
-        if bad_escape {
-            decline!();
-        }
+    // Escape closure: nothing the loop defines may be observed outside it,
+    // except the accumulator (which IS the loop's result).
+    let loop_defs = loop_defined_values(func, loop_info);
+    if loop_value_escapes(func, loop_info, &loop_defs, acc_phi) {
+        decline!();
     }
 
     // Scan `body_idx`: allow only pure non-trapping instructions and non-volatile

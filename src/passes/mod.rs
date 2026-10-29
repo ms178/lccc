@@ -1601,6 +1601,7 @@ pub(crate) fn run_passes(
     // outside that count.
     let strided_reduce_allowed = std::env::var_os("CCC_NO_STRIDED_REDUCE").is_none();
     vectorize::set_strided_reduce_enabled(strided_reduce_allowed);
+    vectorize::set_strided_reduce_trace(std::env::var_os("LCCC_VEC_STRIDED_TRACE").is_some());
     inline::set_ssa_param_config(inline::SsaParamConfig {
         enabled: std::env::var("CCC_NO_SSA_PARAM").is_err(),
         skip: std::env::var("CCC_SSA_PARAM_SKIP")

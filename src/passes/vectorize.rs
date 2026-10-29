@@ -496,6 +496,12 @@ pub(crate) fn set_strided_reduce_enabled(enabled: bool) {
     strided_i32_reduce::set_enabled(enabled);
 }
 
+/// Install the strided reducer's decline trace, resolved once per translation
+/// unit for the same reason as the kill switch above.
+pub(crate) fn set_strided_reduce_trace(enabled: bool) {
+    strided_i32_reduce::set_trace_enabled(enabled);
+}
+
 pub(crate) fn set_strict_recip_pack_enabled(enabled: bool) {
     STRICT_RECIP_PACK_ENABLED.with(|cell| cell.set(enabled));
 }
@@ -15704,7 +15710,12 @@ fn saturating_sub_from_minmax<'e>(
         return Some(pair);
     }
     // `x - min(x, y)` / `x - min(y, x)`.
-    if let MapExpr::MinMax { is_max: false, l: a, r: b } = r {
+    if let MapExpr::MinMax {
+        is_max: false,
+        l: a,
+        r: b,
+    } = r
+    {
         if b.as_ref() == l {
             return Some((l, a.as_ref()));
         }

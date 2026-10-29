@@ -2427,6 +2427,15 @@ gate "vec-adler-epic" fast \
 gate "vectorize-isa-gate" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_vectorize_isa_gate.sh
 
+# Unsigned saturating subtract in the map vectorizer: `a >= b ? a - b : 0`
+# over word lanes must be ONE packed `psubusw`/`vpsubusw`, not the
+# compare+sign-bias+blend expansion (13 instructions).  Both widths are gated
+# because the AVX2 path reaches the same fold through the min/max form, and
+# the compiled program is compared against GCC at every saturation boundary
+# (equal operands, UINT16_MAX, and the word the scalar remainder handles).
+gate "vectorize-saturating-subtract" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_vectorize_saturating_subtract.sh
+
 # Byte-compare window phase (`while (p < end && *p == *q)`, the
 # match-extension shape): emission contract (32B AVX2 / 16B SSE2 windows,
 # exactly one q-side page guard per phase, ctz-based exact mismatch exit),
