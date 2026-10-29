@@ -4775,8 +4775,36 @@ impl SemanticAnalyzer {
         span: Span,
         ctx: IConvContext<'_>,
     ) -> bool {
-        let Some(from_ty) = self.constraint_operand(from) else {
+        let Some(constraint_from_ty) = self.constraint_operand(from) else {
             return false;
+        };
+        // The constraint operand is value-decayed, but ordinary array decay
+        // uses the default address space. If the expression's object type
+        // identifies a different named space, update only that pointer-space
+        // field: the constraint type carries recorded pointee qualifiers which
+        // `decayed_value_ctype()` on an array would otherwise discard.
+        let from_ty = if let CType::Pointer(_, constraint_quals) = &constraint_from_ty {
+            self.expr_type_checker()
+                .infer_expr_ctype(from)
+                .map(|source_ty| {
+                    self.conversion_source_ctype(from, source_ty)
+                        .decayed_value_ctype()
+                })
+                .and_then(|source_ty| match source_ty {
+                    CType::Pointer(inner, source_quals)
+                        if source_quals.space != constraint_quals.space =>
+                    {
+                        let quals = constraint_quals.cvr().map_or_else(
+                            || PtrQuals::of(source_quals.space),
+                            |cvr| PtrQuals::recorded(source_quals.space, cvr),
+                        );
+                        Some(CType::Pointer(inner, quals))
+                    }
+                    _ => None,
+                })
+                .unwrap_or(constraint_from_ty)
+        } else {
+            constraint_from_ty
         };
         // GCC 16.2's anchors for the conversion verdicts below (measured with
         // `-Wint-conversion`, `-Wincompatible-pointer-types` and
@@ -4849,34 +4877,44 @@ impl SemanticAnalyzer {
         // also pre-emits the per-context checks below, replacing their
         // plain error (which `-Wno-incompatible-pointer-types` could not
         // disable) with the kind-aware, dialect-severity diagnostic.
-        // Two shapes belong to other owners and must fall through to them:
-        // a null-pointer constant spelled through `void` (`(void *)0` into
-        // an address-space pointer is accepted, measured with the
-        // `__seg_gs` conversion oracles), and a cross-address-space pair
-        // whose diagnostic is the address-space one, not the pointer one.
-        // The space gap may sit at ANY pointer level (`int **` against
-        // `__seg_gs int **` differs below the top), so the comparison
-        // mirrors `pointer_argument_compat`'s per-level space walk.
-        fn space_gap(a: &CType, b: &CType) -> bool {
-            match (a, b) {
-                (CType::Pointer(af, asp), CType::Pointer(bt, bsp)) => {
-                    asp != bsp || space_gap(af, bt)
+        // A null-pointer constant spelled through `void` is the measured
+        // exception to address-space conversion. For all other pointer-shaped
+        // sources, only a mismatch at the outermost pointer is the dedicated
+        // address-space constraint error. A mismatch below that level remains
+        // GCC's controllable `-Wincompatible-pointer-types` diagnostic.
+        let space_gap = first_space_mismatch(&from_ty, to).is_some();
+        let top_level_space_gap = matches!(
+            (&from_ty, to),
+            (
+                CType::Pointer(_, from_space),
+                CType::Pointer(_, to_space)
+            ) if from_space != to_space
+        );
+        if top_level_space_gap && !self.is_void_null_pointer_constant(from) {
+            let message = match ctx {
+                IConvContext::Initialization => {
+                    "initialization from pointer to non-enclosed address space".to_string()
                 }
-                (CType::Pointer(af, _), CType::Array(bt, _)) => space_gap(af, bt),
-                (CType::Array(af, _), CType::Pointer(bt, bsp)) => {
-                    let _ = bsp;
-                    space_gap(af, bt)
+                IConvContext::Assignment => {
+                    "assignment from pointer to non-enclosed address space".to_string()
                 }
-                _ => false,
-            }
+                IConvContext::Returning => {
+                    "return from pointer to non-enclosed address space".to_string()
+                }
+                IConvContext::Argument { index, callee } => format!(
+                    "passing argument {} of '{}' from pointer to non-enclosed address space",
+                    index + 1,
+                    callee
+                ),
+            };
+            self.diagnostics.borrow_mut().error(message, span);
+            return true;
         }
-        let space_ok = !space_gap(&from_ty, to);
         if matches!(to, CType::Pointer(..))
             && matches!(
                 from_ty,
                 CType::Pointer(..) | CType::Array(..) | CType::Function(..)
             )
-            && space_ok
             && !self.is_void_null_pointer_constant(from)
             && pointer_argument_compat(&from_ty, to) == PtrCompat::Incompatible
         {
@@ -4911,7 +4949,7 @@ impl SemanticAnalyzer {
         // the source's. GCC 16.2 warns (`-Wdiscarded-qualifiers`, or
         // `-Wdiscarded-array-qualifiers` for a pointer to an array) with the
         // measured phrasings and columns below.
-        if space_ok {
+        if !space_gap {
             if let Some((dropped, array)) = discarded_pointee_qualifiers(&from_ty, to) {
                 let quals = crate::common::types::cvr_spelling(dropped);
                 // Singular even for `'const volatile'` (measured).
@@ -6659,6 +6697,7 @@ dereference it before applying '->' to it?"
             Expr::MemberAccess(base, _, _) => self.object_expr_space(base),
             Expr::PointerMemberAccess(base, _, _) => self.pointee_space(base),
             Expr::ArraySubscript(base, _, _) => self.element_space(base),
+            Expr::Deref(base, _) => self.pointee_space(base),
             _ => AddressSpace::Default,
         }
     }

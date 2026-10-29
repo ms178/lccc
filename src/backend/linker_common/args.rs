@@ -178,7 +178,8 @@ pub struct LinkerArgs {
     /// `--image-base=ADDR`: explicit load base override.
     pub image_base: Option<u64>,
     pub image_base_invalid: Option<String>,
-    /// `-z max-page-size=N`: power-of-two segment page alignment (>= 4096).
+    /// `-z max-page-size=N`: zero selects the backend default; nonzero values
+    /// are power-of-two segment alignments (LCCC requires >= 4096).
     pub max_page_size: Option<u64>,
     pub max_page_size_invalid: Option<String>,
     /// Invalid `-z common-page-size=N` value, if any. The value is validated
@@ -208,9 +209,7 @@ impl LinkerArgs {
             return Err(format!("invalid --image-base address '{bad}'"));
         }
         if let Some(bad) = &self.max_page_size_invalid {
-            return Err(format!(
-                "invalid page size '{bad}': must be a power of two >= 0x1000"
-            ));
+            return Err(max_page_size_error(bad));
         }
         self.validate_common_page_size()?;
         if let Some(bad) = &self.pack_dyn_relocs_invalid {
@@ -226,21 +225,63 @@ impl LinkerArgs {
     /// ld still rejects malformed/non-power-of-two values there.
     pub fn validate_common_page_size(&self) -> Result<(), String> {
         if let Some(bad) = &self.common_page_size_invalid {
-            return Err(format!("invalid common page size `{bad}`"));
+            return Err(format!("invalid common page size `{bad}'"));
         }
         Ok(())
     }
 
+    /// `-z KEYWORD[=VALUE]` spellings kept in `z_other_keywords` that are
+    /// neither implemented nor equivalent to the linker's default.  These
+    /// spellings must remain visible to each target's warning policy.
+    pub fn z_other_keyword_warnings(&self) -> Vec<String> {
+        self.z_other_keyword_warnings_except(&[])
+    }
+
+    /// As above, for a link path that implements additional keywords beyond
+    /// the shared default-equivalent options.
+    pub fn z_other_keyword_warnings_except(&self, implemented: &[&str]) -> Vec<String> {
+        self.z_other_keywords
+            .iter()
+            .filter(|kw| {
+                !matches!(kw.as_str(), "separate-code" | "combreloc")
+                    && !kw.starts_with("max-page-size=")
+                    && !implemented.iter().any(|name| *name == kw.as_str())
+            })
+            .map(|kw| format!("-z {kw} ignored"))
+            .collect()
+    }
+
     /// Warn about accepted diagnostic/keyword options whose behavior the
     /// built-in backend does not implement, honoring the final
-    /// `--fatal-warnings` state. Target-specific backends call this for the
-    /// shared `-z KEY=VALUE` warning set.
-    pub fn warn_unimplemented_keyword_options(&self) -> Result<(), String> {
-        let warnings: Vec<String> = self
+    /// `--fatal-warnings` state. `backend_page_size` is a fixed target layout;
+    /// a differing explicit max-page-size cannot be honored by these backends.
+    pub fn warn_unimplemented_keyword_options(&self, backend_page_size: u64) -> Result<(), String> {
+        let mut warnings: Vec<String> = self
             .z_ignored_keywords
             .iter()
             .map(|kw| format!("-z {kw} ignored"))
             .collect();
+        warnings.extend(self.z_other_keyword_warnings());
+        if self.image_base.is_some() {
+            warnings.push(
+                "--image-base ignored: explicit image bases are not implemented for this backend"
+                    .to_string(),
+            );
+        }
+        if self.z_pack_relative_relocs {
+            warnings.push(
+                "--pack-dyn-relocs=relr / -z pack-relative-relocs ignored: RELR packing is not implemented for this backend"
+                    .to_string(),
+            );
+        }
+        if let Some(requested) = self.max_page_size
+            && requested != 0
+            && requested != backend_page_size
+        {
+            warnings.push(format!(
+                "-z max-page-size={requested:#x} ignored: this backend uses fixed {backend_page_size:#x} page alignment"
+            ));
+        }
         if self.fatal_warnings && !warnings.is_empty() {
             return Err(format!("warning treated as error: {}", warnings[0]));
         }
@@ -256,11 +297,14 @@ impl LinkerArgs {
 
     pub fn resolved_page_size(&self, default_page_size: u64) -> Result<u64, String> {
         if let Some(bad) = &self.max_page_size_invalid {
-            return Err(format!(
-                "invalid page size '{bad}': must be a power of two >= 0x1000"
-            ));
+            return Err(max_page_size_error(bad));
         }
-        Ok(self.max_page_size.unwrap_or(default_page_size))
+        let requested = self.max_page_size.unwrap_or(default_page_size);
+        Ok(if requested == 0 {
+            default_page_size
+        } else {
+            requested
+        })
     }
 
     /// The GNU property-note merge flags (`linker_common::cet`) for this
@@ -550,13 +594,19 @@ fn parse_u64_addr(raw: &str) -> Option<u64> {
     }
 }
 
-/// Parse the integer spelling used by GNU ld's `-z common-page-size`.
-/// `strtoul(..., 0)`-style inputs include decimal, hexadecimal, octal, and a
-/// leading plus; an empty value is accepted by BFD as zero.
-fn parse_common_page_size(raw: &str) -> Option<u64> {
-    let mut s = raw.trim();
-    if s.is_empty() {
+/// Parse the integer spelling used by GNU ld's `-z common-page-size` and
+/// `-z max-page-size` (`strtoul(..., 0)` syntax). BFD accepts decimal,
+/// hexadecimal, octal, a leading sign, and leading C whitespace. An empty
+/// option value is a special zero/default spelling; whitespace-only and
+/// trailing-whitespace spellings are rejected.
+fn parse_gnu_page_size_value(raw: &str) -> Option<u64> {
+    if raw.is_empty() {
         return Some(0);
+    }
+    let mut s =
+        raw.trim_start_matches(|c| matches!(c, ' ' | '\t' | '\n' | '\u{000b}' | '\u{000c}' | '\r'));
+    if s.is_empty() {
+        return None;
     }
     let negative = s.starts_with('-');
     if negative || s.starts_with('+') {
@@ -567,8 +617,12 @@ fn parse_common_page_size(raw: &str) -> Option<u64> {
     }
     let value = if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
         u64::from_str_radix(hex, 16).ok()
-    } else if s.len() > 1 && s.starts_with('0') {
-        u64::from_str_radix(&s[1..], 8).ok()
+    } else if let Some(octal) = s.strip_prefix('0') {
+        if octal.is_empty() {
+            Some(0)
+        } else {
+            u64::from_str_radix(octal, 8).ok()
+        }
     } else {
         s.parse::<u64>().ok()
     }?;
@@ -579,6 +633,25 @@ fn parse_common_page_size(raw: &str) -> Option<u64> {
     } else {
         value
     })
+}
+
+/// Parse and validate `-z common-page-size` syntax. Its value is not applied
+/// by this linker, but GNU ld rejects malformed and non-power-of-two values.
+fn parse_common_page_size(raw: &str) -> Option<u64> {
+    parse_gnu_page_size_value(raw)
+}
+
+fn max_page_size_error(value: &str) -> String {
+    match parse_gnu_page_size_value(value) {
+        Some(n) if n != 0 && n.is_power_of_two() && n < 0x1000 => {
+            // BFD accepts sub-page powers of two. This layout implementation
+            // deliberately rejects them rather than silently clamping to the
+            // host page size, so describe the limitation as unsupported, not
+            // malformed GNU syntax.
+            format!("unsupported maximum page size `{value}': LCCC requires at least 0x1000")
+        }
+        _ => format!("invalid maximum page size `{value}'"),
+    }
 }
 
 fn apply_kv_option(result: &mut LinkerArgs, tok: &str, next: Option<&str>) -> Option<bool> {
@@ -727,14 +800,24 @@ fn apply_z_keyword(result: &mut LinkerArgs, kw: &str) {
         "origin" | "nodelete" | "nodlopen" | "initfirst" | "interpose" | "nodefaultlib" => {
             result.z_dyn_flag_keywords.push(kw.to_string());
         }
+        "max-page-size" => {
+            // BFD accepts the bare keyword but warns that no value was given.
+            result.z_ignored_keywords.push(kw.to_string());
+        }
         k if k.starts_with("max-page-size=") => {
             let v = &k["max-page-size=".len()..];
-            match parse_u64_addr(v) {
-                Some(n) if n >= 0x1000 && n.is_power_of_two() => {
+            match parse_gnu_page_size_value(v) {
+                Some(n) if n == 0 || (n >= 0x1000 && n.is_power_of_two()) => {
                     result.max_page_size = Some(n);
-                    result.max_page_size_invalid = None;
                 }
-                _ => result.max_page_size_invalid = Some(v.to_string()),
+                _ => {
+                    // An invalid occurrence remains fatal even if a later
+                    // spelling is valid; GNU ld diagnoses each argument as it
+                    // parses it rather than letting later flags erase errors.
+                    result
+                        .max_page_size_invalid
+                        .get_or_insert_with(|| v.to_string());
+                }
             }
             result.z_other_keywords.push(kw.to_string());
         }
@@ -745,10 +828,12 @@ fn apply_z_keyword(result: &mut LinkerArgs, kw: &str) {
         k if k.starts_with("common-page-size=") => {
             let v = &k["common-page-size=".len()..];
             match parse_common_page_size(v) {
-                Some(n) if n == 0 || n.is_power_of_two() => {
-                    result.common_page_size_invalid = None;
+                Some(n) if n == 0 || n.is_power_of_two() => {}
+                _ => {
+                    result
+                        .common_page_size_invalid
+                        .get_or_insert_with(|| v.to_string());
                 }
-                _ => result.common_page_size_invalid = Some(v.to_string()),
             }
             // Layout currently has one page-granularity control. A distinct
             // common-page-size is not implemented, so keep the request visible
@@ -1824,6 +1909,8 @@ mod z_isa_level_tests {
             "+16",
             "-18446744073709551614",
             "-18446744073709551615",
+            " 16",
+            "\t010000",
         ] {
             let arg = format!("-Wl,-z,common-page-size={value}");
             let r = parse_linker_args(&args(&[&arg]));
@@ -1845,6 +1932,8 @@ mod z_isa_level_tests {
             "+",
             "-1",
             "-18446744073709551616",
+            "4096 ",
+            " ",
         ] {
             let arg = format!("-Wl,-z,common-page-size={value}");
             let r = parse_linker_args(&args(&[&arg]));
@@ -1856,7 +1945,7 @@ mod z_isa_level_tests {
             assert_eq!(r.max_page_size_invalid, None, "value {value:?}");
             assert_eq!(
                 r.validate_common_page_size().unwrap_err(),
-                format!("invalid common page size `{value}`")
+                format!("invalid common page size `{value}'")
             );
         }
 
@@ -1883,6 +1972,144 @@ mod z_isa_level_tests {
     }
 
     #[test]
+    fn max_page_size_uses_gnu_integer_syntax_and_zero_selects_default() {
+        let bare = parse_linker_args(&args(&["-Wl,-z,max-page-size"]));
+        assert_eq!(bare.max_page_size, None);
+        assert_eq!(bare.max_page_size_invalid, None);
+        assert!(
+            bare.z_ignored_keywords
+                .iter()
+                .any(|kw| kw == "max-page-size")
+        );
+
+        for (value, expected) in [
+            ("", 0),
+            ("0", 0),
+            ("00", 0),
+            ("0x1000", 0x1000),
+            ("0X1000", 0x1000),
+            ("010000", 0x1000),
+            ("+4096", 0x1000),
+            (" 4096", 0x1000),
+            ("-18446744073709547520", 0x1000),
+        ] {
+            let arg = format!("-Wl,-z,max-page-size={value}");
+            let parsed = parse_linker_args(&args(&[&arg]));
+            assert_eq!(parsed.max_page_size, Some(expected), "value {value:?}");
+            assert_eq!(parsed.max_page_size_invalid, None, "value {value:?}");
+            parsed.validate_common_options().unwrap();
+            assert_eq!(
+                parsed.resolved_page_size(0x200000).unwrap(),
+                if expected == 0 { 0x200000 } else { expected },
+                "value {value:?}"
+            );
+        }
+
+        // BFD accepts sub-page powers of two, but this layout implementation
+        // intentionally rejects them rather than silently clamping alignment.
+        for value in ["1", "2", "2048", "-18446744073709551615"] {
+            let arg = format!("-Wl,-z,max-page-size={value}");
+            let parsed = parse_linker_args(&args(&[&arg]));
+            assert_eq!(parsed.max_page_size_invalid.as_deref(), Some(value));
+            assert!(
+                parsed
+                    .validate_common_options()
+                    .unwrap_err()
+                    .contains("unsupported maximum page size")
+            );
+        }
+
+        for value in ["bad", "3", "0x1800", "08", "+", "4096 ", " "] {
+            let arg = format!("-Wl,-z,max-page-size={value}");
+            let parsed = parse_linker_args(&args(&[&arg]));
+            assert_eq!(parsed.max_page_size_invalid.as_deref(), Some(value));
+            assert!(
+                parsed
+                    .validate_common_options()
+                    .unwrap_err()
+                    .contains("invalid maximum page size")
+            );
+        }
+
+        // Any invalid spelling is fatal, even if another occurrence is valid.
+        let invalid_then_valid = parse_linker_args(&args(&[
+            "-Wl,-z,max-page-size=3",
+            "-Wl,-z,max-page-size=0x1000",
+        ]));
+        assert_eq!(invalid_then_valid.max_page_size, Some(0x1000));
+        assert_eq!(
+            invalid_then_valid.max_page_size_invalid.as_deref(),
+            Some("3")
+        );
+        let valid_then_invalid = parse_linker_args(&args(&[
+            "-Wl,-z,max-page-size=0x1000",
+            "-Wl,-z,max-page-size=3",
+        ]));
+        assert_eq!(
+            valid_then_invalid.max_page_size_invalid.as_deref(),
+            Some("3")
+        );
+    }
+
+    #[test]
+    fn fixed_backend_page_size_and_unknown_z_keywords_warn() {
+        let parsed = parse_linker_args(&args(&[
+            "-Wl,-z,max-page-size=0x200000",
+            "-Wl,-z,separate-code",
+            "-Wl,-z,global",
+            "-Wl,-z,not-a-real-keyword",
+        ]));
+        assert_eq!(
+            parsed.z_other_keyword_warnings(),
+            vec!["-z global ignored", "-z not-a-real-keyword ignored"]
+        );
+        assert_eq!(
+            parsed.z_other_keyword_warnings_except(&["global"]),
+            vec!["-z not-a-real-keyword ignored"]
+        );
+        assert!(parsed.warn_unimplemented_keyword_options(0x1000).is_ok());
+
+        let same = parse_linker_args(&args(&["-Wl,-z,max-page-size=0x1000"]));
+        assert!(same.warn_unimplemented_keyword_options(0x1000).is_ok());
+        let zero = parse_linker_args(&args(&["-Wl,-z,max-page-size=0"]));
+        assert!(zero.warn_unimplemented_keyword_options(0x1000).is_ok());
+
+        let fatal = parse_linker_args(&args(&[
+            "-Wl,-z,max-page-size=0x200000",
+            "-Wl,--fatal-warnings",
+        ]));
+        assert_eq!(
+            fatal
+                .warn_unimplemented_keyword_options(0x1000)
+                .unwrap_err(),
+            "warning treated as error: -z max-page-size=0x200000 ignored: this backend uses fixed 0x1000 page alignment"
+        );
+
+        let fatal_image_base = parse_linker_args(&args(&[
+            "-Wl,--image-base=0x80000",
+            "-Wl,-z,pack-relative-relocs",
+            "-Wl,--fatal-warnings",
+        ]));
+        assert_eq!(
+            fatal_image_base
+                .warn_unimplemented_keyword_options(0x1000)
+                .unwrap_err(),
+            "warning treated as error: --image-base ignored: explicit image bases are not implemented for this backend"
+        );
+
+        let fatal_relr = parse_linker_args(&args(&[
+            "-Wl,-z,pack-relative-relocs",
+            "-Wl,--fatal-warnings",
+        ]));
+        assert_eq!(
+            fatal_relr
+                .warn_unimplemented_keyword_options(0x1000)
+                .unwrap_err(),
+            "warning treated as error: --pack-dyn-relocs=relr / -z pack-relative-relocs ignored: RELR packing is not implemented for this backend"
+        );
+    }
+
+    #[test]
     fn warn_common_is_retained_for_driver_links() {
         let plain = parse_linker_args(&args(&["--warn-common"]));
         assert!(plain.warn_common);
@@ -1898,14 +2125,16 @@ mod z_isa_level_tests {
     #[test]
     fn ignored_keyword_warnings_obey_fatal_state() {
         let warning = parse_linker_args(&args(&["-Wl,-z,common-page-size=0x1000"]));
-        assert!(warning.warn_unimplemented_keyword_options().is_ok());
+        assert!(warning.warn_unimplemented_keyword_options(0x1000).is_ok());
 
         let fatal = parse_linker_args(&args(&[
             "-Wl,-z,common-page-size=0x1000",
             "-Wl,--fatal-warnings",
         ]));
         assert_eq!(
-            fatal.warn_unimplemented_keyword_options().unwrap_err(),
+            fatal
+                .warn_unimplemented_keyword_options(0x1000)
+                .unwrap_err(),
             "warning treated as error: -z common-page-size=0x1000 ignored"
         );
     }

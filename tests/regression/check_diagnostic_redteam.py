@@ -50,6 +50,18 @@ CASES = [
     ('mutable_parameter_array', 'void f(const int p[1]){p=0;}', False, None),
     ('const_parameter_element', 'void f(const int p[1]){p[0]=1;}', True, None),
     ('pointer_bool', '_Bool f(int *p){return p;}', False, None),
+    # GCC distinguishes an outermost address-space conversion (a hard error)
+    # from a mismatch below the outer pointer (`-Wincompatible-pointer-types`).
+    # Array decay, dereference and argument passing must preserve the same rule.
+    ('top_space_array_init', 'void f(void){int a[1];__seg_gs int*p=a;(void)p;}', True, None),
+    ('top_space_array_argument', 'void g(__seg_gs int*);void f(void){int a[1];g(a);}', True, None),
+    ('top_space_array_assignment', 'void f(void){int a[1];__seg_gs int*p;p=a;}', True, None),
+    ('top_space_array_return', '__seg_gs int*f(void){int a[1];return a;}', True, None),
+    ('top_space_deref_array_init', 'long __seg_gs g[3][4];void f(void){long __seg_gs(*p)[4]=g;long*q=*p;(void)q;}', True, None),
+    ('same_space_deref_array_init', 'long __seg_gs g[3][4];void f(void){long __seg_gs(*p)[4]=g;long __seg_gs*q=*p;(void)q;}', False, None),
+    ('nested_space_init', 'void f(int**q){__seg_gs int**p=q;(void)p;}', False, 'incompatible-pointer-types'),
+    ('nested_space_array_init', 'void f(void){int*a[1];__seg_gs int**p=a;(void)p;}', False, 'incompatible-pointer-types'),
+    ('nested_space_argument', 'void g(__seg_gs int**);void f(int**q){g(q);}', False, 'incompatible-pointer-types'),
     ('integer_pointer_init', 'void f(void){int *p=1;(void)p;}', False, 'int-conversion'),
     ('pointer_integer_init', 'void f(int *p){int x=p;(void)x;}', False, 'int-conversion'),
     ('pointer_integer_assign', 'void f(int *p){int x;x=p;}', False, 'int-conversion'),
@@ -293,7 +305,7 @@ def main():
                     legacy = kind in ('implicit-int', 'return-mismatch') and std == 'gnu90' and (
                         '-Wall' in flags or '-Wreturn-type' in flags)
                     explicitly_enabled = kind and '-Werror=' + kind in flags
-                    warn_live = enabled and (std != 'gnu90' or kind in ('int-conversion', 'pointer-to-int-cast')
+                    warn_live = enabled and (std != 'gnu90' or kind in ('int-conversion', 'pointer-to-int-cast', 'incompatible-pointer-types')
                                              or name == 'void_return_value' or legacy or (explicitly_enabled and kind != 'return-mismatch'))
                     default_error = warn_live and kind != 'pointer-to-int-cast' and (
                         std != 'gnu90' or permissive_flag == '-fno-permissive') and not permissive and not any(

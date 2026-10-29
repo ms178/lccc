@@ -2454,12 +2454,21 @@ fn link_with_script_machine(
     );
 
     // Assign file offsets: alloc PROGBITS sections in vaddr order get offsets
-    // congruent to their LMA modulo the requested maximum page size. The
-    // kernel proper uses 2 MiB; its vDSO explicitly requests 4 KiB.
-    let page = if max_page_size.is_power_of_two() {
-        max_page_size
-    } else {
-        0x200000
+    // congruent to their LMA modulo the requested maximum page size. The x86
+    // default is 4 KiB; the kernel proper requests 2 MiB explicitly, while its
+    // vDSO explicitly requests 4 KiB.
+    // Public script-link entry points may be called without the command-line
+    // parser. Preserve GNU's zero/default spelling and reject other invalid
+    // values rather than silently substituting a 2 MiB alignment.
+    let page = match max_page_size {
+        0 => 0x1000,
+        page if page >= 0x1000 && page.is_power_of_two() => page,
+        page if page.is_power_of_two() => {
+            return Err(format!(
+                "unsupported maximum page size `{page:#x}': LCCC requires at least 0x1000"
+            ));
+        }
+        _ => return Err(format!("invalid maximum page size `{max_page_size:#x}'")),
     };
     let mut order: Vec<usize> = (0..out_secs.len()).collect();
     order.sort_by_key(|&i| (!out_secs[i].is_alloc, out_secs[i].lma));
