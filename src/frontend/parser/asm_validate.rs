@@ -95,6 +95,28 @@ fn immediate_range(letter: char) -> Option<(i64, i64)> {
     }
 }
 
+/// Evaluate the integer truth value of the subset of constant conditions used
+/// by inline-asm operands. `__builtin_constant_p` is intentionally not part of
+/// the parser's general ICE evaluator, but its truth value is known whenever
+/// its argument is a folded integer constant.
+fn asm_condition_value(expr: &Expr, enums: &FxHashMap<String, i64>) -> Option<i64> {
+    if let Some(value) = super::Parser::eval_const_int_expr_with_enums(expr, Some(enums), None) {
+        return Some(value);
+    }
+    if let Expr::FunctionCall(callee, args, _) = expr {
+        if matches!(callee.as_ref(), Expr::Identifier(name, _) if name == "__builtin_constant_p") {
+            let arg = args.first()?;
+            if super::Parser::eval_const_int_expr_with_enums(arg, Some(enums), None).is_some() {
+                return Some(1);
+            }
+            if is_nonconstant(arg, enums) {
+                return Some(0);
+            }
+        }
+    }
+    None
+}
+
 /// Whether `expr` provably is not an integer constant expression. Conservative:
 /// shapes this compiler does not reason about report `false`.
 fn is_nonconstant(expr: &Expr, enums: &FxHashMap<String, i64>) -> bool {
@@ -109,11 +131,40 @@ fn is_nonconstant(expr: &Expr, enums: &FxHashMap<String, i64>) -> bool {
         }
         Expr::Cast(_, inner, _, _) | Expr::BitCast(_, inner, _) => is_nonconstant(inner, enums),
         Expr::Conditional(cond, then, els, _) => {
-            is_nonconstant(cond, enums) || is_nonconstant(then, enums) || is_nonconstant(els, enums)
+            if let Some(value) = asm_condition_value(cond, enums) {
+                if value != 0 {
+                    is_nonconstant(then, enums)
+                } else {
+                    is_nonconstant(els, enums)
+                }
+            } else {
+                is_nonconstant(cond, enums)
+                    || is_nonconstant(then, enums)
+                    || is_nonconstant(els, enums)
+            }
         }
         Expr::Comma(_, last, _) => is_nonconstant(last, enums),
-        Expr::FunctionCall(..)
-        | Expr::ArraySubscript(..)
+        Expr::FunctionCall(callee, args, _) => {
+            // The kernel's DEFINE()/order_base_2() asm operands contain
+            // __builtin_constant_p and __builtin_clz{,ll} in their expanded
+            // constant-expression trees. The parser's general ICE evaluator
+            // intentionally does not execute builtins, but a pure builtin
+            // with a provably constant argument is not evidence that the asm
+            // operand is dynamic. Leave its value Unknown for the post-opt
+            // IR check; only mark it NonConstant when the argument itself is
+            // known to be runtime-dependent.
+            let builtin = match callee.as_ref() {
+                Expr::Identifier(name, _) => name.as_str(),
+                _ => return true,
+            };
+            match builtin {
+                "__builtin_constant_p" | "__builtin_clz" | "__builtin_clzl" | "__builtin_clzll" => {
+                    args.first().is_none_or(|arg| is_nonconstant(arg, enums))
+                }
+                _ => true,
+            }
+        }
+        Expr::ArraySubscript(..)
         | Expr::MemberAccess(..)
         | Expr::PointerMemberAccess(..)
         | Expr::Assign(..)
@@ -163,7 +214,7 @@ fn check_constraint(
         }
     }
     // Explicit register (`{rax}`), condition code (`@cc`), or matching (`0`).
-    if body.starts_with('{') || body.starts_with("@cc") {
+    if body.starts_with('{') || body.starts_with('[') || body.starts_with("@cc") {
         return;
     }
     if body.is_empty() || body.chars().next().is_some_and(|c| c.is_ascii_digit()) {
@@ -403,6 +454,42 @@ mod tests {
             );
             assert_eq!(messages(&p), ["impossible constraint in 'asm'"], "{letter}");
         }
+    }
+
+    #[test]
+    fn constant_valued_builtin_operands_are_not_misclassified_as_dynamic() {
+        let span = crate::common::source::Span::dummy();
+        let constant_arg = Expr::IntLiteral(512, span);
+        let constant_builtin = Expr::FunctionCall(
+            Box::new(Expr::Identifier("__builtin_clzll".into(), span)),
+            vec![constant_arg],
+            span,
+        );
+        assert!(!is_nonconstant(&constant_builtin, &FxHashMap::default()));
+
+        let constant_p = Expr::FunctionCall(
+            Box::new(Expr::Identifier("__builtin_constant_p".into(), span)),
+            vec![Expr::IntLiteral(512, span)],
+            span,
+        );
+        let selected_constant = Expr::Conditional(
+            Box::new(constant_p),
+            Box::new(Expr::IntLiteral(9, span)),
+            Box::new(Expr::FunctionCall(
+                Box::new(Expr::Identifier("runtime_fallback".into(), span)),
+                vec![],
+                span,
+            )),
+            span,
+        );
+        assert!(!is_nonconstant(&selected_constant, &FxHashMap::default()));
+
+        let dynamic_builtin = Expr::FunctionCall(
+            Box::new(Expr::Identifier("__builtin_constant_p".into(), span)),
+            vec![Expr::Identifier("runtime_value".into(), span)],
+            span,
+        );
+        assert!(is_nonconstant(&dynamic_builtin, &FxHashMap::default()));
     }
 
     #[test]

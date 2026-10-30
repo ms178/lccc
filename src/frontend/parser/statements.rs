@@ -563,10 +563,22 @@ impl Parser {
         let is_x86 = matches!(crate::common::types::target_elf_machine(), 3 | 62);
         // Fold the operand expressions first: the fold borrows the enum table
         // immutably, and the diagnostics below need `&mut self`.
+        let defer_immediate_constness = self.asm_immediate_validation_deferred;
         let constness: Vec<asm_validate::Constness> = outputs
             .iter()
             .chain(inputs.iter())
-            .map(|op| asm_validate::constness(&op.expr, &self.enum_constants))
+            .map(|op| {
+                let value = asm_validate::constness(&op.expr, &self.enum_constants);
+                if defer_immediate_constness && value == asm_validate::Constness::NonConstant {
+                    // Immediate-only constraints are resolved after mandatory
+                    // inlining. Unknown is deliberately not accepted as proof
+                    // that a non-inline/dynamic operand is valid; it merely
+                    // avoids a premature definition-site rejection.
+                    asm_validate::Constness::Unknown
+                } else {
+                    value
+                }
+            })
             .collect();
         let out_view: Vec<asm_validate::Operand<'_>> = outputs
             .iter()
