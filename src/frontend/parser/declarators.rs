@@ -113,7 +113,10 @@ impl Parser {
 
         let mut pre_aligned: Option<usize> = None;
         let mut is_packed = false;
-        let (pre_packed, pre_align, _, _, _) = self.parse_gcc_attributes();
+        // `_spec` keeps the placement records for the declaration's
+        // `-Wattributes` verdict; the clearing variant is for attribute
+        // lists that belong to something other than a declaration.
+        let (pre_packed, pre_align, _, _, _) = self.parse_gcc_attributes_spec();
         is_packed = is_packed || pre_packed;
         if let Some(a) = pre_align {
             pre_aligned = Some(pre_aligned.map_or(a, |prev: usize| prev.max(a)));
@@ -221,6 +224,10 @@ impl Parser {
         let mut inner_object_quals = (false, false);
         let (name, inner_derived) = if let TokenKind::Identifier(n) = self.peek() {
             let n = n.clone();
+            // A *definition* reports `-Wstrict-prototypes` at its name, a
+            // declaration at its start (gcc-16, measured). Parameter lists
+            // parsed below would overwrite this, so they save and restore it.
+            self.attrs.last_decl_name_span = Some(self.peek_span());
             self.advance();
             (Some(n), Vec::new())
         } else if matches!(self.peek(), TokenKind::LParen) && self.is_paren_declarator() {
@@ -303,7 +310,19 @@ impl Parser {
                         open_paren,
                     );
                     innermost_suffix_is_function = Some(true);
+                    let saved_name_span = self.attrs.last_decl_name_span;
                     let (params, variadic, has_prototype) = self.parse_param_list();
+                    self.attrs.last_decl_name_span = saved_name_span;
+                    // `-Wstrict-prototypes`: `int f();` declares a function but
+                    // not a prototype. GCC's verdict belongs to the whole
+                    // declaration (it also fires for an unprototyped type
+                    // nested in a parameter) and is reported at the
+                    // declaration's location, so the fact is recorded here and
+                    // reported by the declaration funnel. C23 makes `()` a
+                    // prototype, which is why the flag is only set for the
+                    // older dialects (measured: `-std=gnu17` warns,
+                    // `-std=c23` does not).
+                    let _ = has_prototype;
                     outer_suffixes.push(DerivedDeclarator::Function(
                         params,
                         variadic,
@@ -317,7 +336,8 @@ impl Parser {
         // Combine using inside-out rule
         let combined = self.combine_declarator_parts(derived, inner_derived, outer_suffixes);
 
-        let (post_packed, post_aligned, mode_kind, has_common, _) = self.parse_gcc_attributes();
+        let (post_packed, post_aligned, mode_kind, has_common, _) =
+            self.parse_gcc_attributes_spec();
         is_packed = is_packed || post_packed;
         let aligned = match (pre_aligned, post_aligned) {
             (Some(a), Some(b)) => Some(a.max(b)),

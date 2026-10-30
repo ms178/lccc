@@ -1811,6 +1811,23 @@ impl X86Codegen {
         // named "r11" and PhysReg(11) is named "r10". The indirect target is
         // the literal "%r10", i.e. PhysReg(11).
         let indirect_target_regs = vec![crate::backend::regalloc::PhysReg(11)];
+        // A branch fused directly with an asm-goto flag output has no use for
+        // the boolean Load's machine value. Deny those one-use results a
+        // phantom home; when the output object's complete access set consists
+        // only of these branches, its alloca and trampoline stores are also
+        // omitted by the same proof.
+        let asm_cc_branch_values: FxHashSet<u32> =
+            self.state.asm_cc_branch_values.keys().copied().collect();
+        let asm_cc_branch_output_ptrs = self.state.asm_cc_branch_output_ptrs.clone();
+        let mut never_materialized = never_materialized;
+        never_materialized.extend(asm_cc_branch_values.iter().copied());
+        never_materialized.extend(asm_cc_branch_output_ptrs.iter().copied());
+        self.state
+            .never_materialized_values
+            .extend(asm_cc_branch_values);
+        self.state
+            .never_materialized_values
+            .extend(asm_cc_branch_output_ptrs);
         // Out-parameter of the allocator: the IPA-RA kept registers it homed
         // values in (see `RegAllocConfig::ipa_regs`).
         let mut ipa_used: Vec<PhysReg> = Vec::new();

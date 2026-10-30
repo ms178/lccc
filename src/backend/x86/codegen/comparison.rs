@@ -1320,21 +1320,10 @@ impl X86Codegen {
 
     #[inline]
     fn invert_jcc(cc: &str) -> &'static str {
-        match cc {
-            "je" => "jne",
-            "jne" => "je",
-            "jl" => "jge",
-            "jge" => "jl",
-            "jle" => "jg",
-            "jg" => "jle",
-            "jb" => "jae",
-            "jae" => "jb",
-            "jbe" => "ja",
-            "ja" => "jbe",
-            "jp" => "jnp",
-            "jnp" => "jp",
+        match crate::common::asm_constraints::inverse_jcc(cc) {
+            Some(inverse) => inverse,
             // A silent fallback here would branch on the wrong condition.
-            other => unreachable!("invert_jcc: unexpected condition {other}"),
+            None => unreachable!("invert_jcc: unexpected condition {cc}"),
         }
     }
 
@@ -1364,6 +1353,37 @@ impl X86Codegen {
         };
         let hot_next = next == Some(hot);
         let cold_next = next == Some(cold);
+
+        // GNU asm-goto flag outputs describe the live hardware condition
+        // flags. For the proven single-use branch shape, avoid reloading and
+        // testing the stored bool; setcc/mov/store and the output-edge
+        // trampoline preserve EFLAGS, so this branch can consume them here.
+        if let Operand::Value(value) = cond {
+            if let Some(cc) = self.state.asm_cc_branch_values.remove(&value.0) {
+                // The analysis stores the full `jcc` mnemonic, so this reads the
+                // condition the template produced without re-parsing a suffix:
+                // one fewer table lookup and one fewer unreachable site than
+                // mapping a string back through the shared table here.
+                let jcc = cc.as_str();
+                let jcc_hot = if pref_true {
+                    jcc
+                } else {
+                    Self::invert_jcc(jcc)
+                };
+                if hot_next {
+                    self.state
+                        .out
+                        .emit_jcc_block(Self::invert_jcc(jcc_hot), cold.0);
+                } else {
+                    self.state.out.emit_jcc_block(jcc_hot, hot.0);
+                    if !cold_next {
+                        self.state.out.emit_jmp_block(cold.0);
+                    }
+                }
+                self.state.reg_cache.invalidate_all();
+                return;
+            }
+        }
 
         // DE MORGAN SPLIT: `CondBranch(And/Or(CmpA, CmpB))` with all three
         // skipped at their own positions. Re-emit cmpA, short-circuit-jump

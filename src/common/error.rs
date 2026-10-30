@@ -112,6 +112,13 @@ pub enum WarningKind {
     /// Integer operands of a comparison have different signedness.
     /// GCC flag: -Wsign-compare (enabled by -Wextra for C).
     SignCompare,
+    /// An integer division or remainder has a constant zero divisor.
+    /// GCC flag: -Wdiv-by-zero (on by default in C, as GCC does).
+    DivByZero,
+    /// A function declaration without a parameter-type list: `int f();`.
+    /// GCC flag: -Wstrict-prototypes (off by default; C23 makes `()`
+    /// a prototype, so GCC stays silent there and so must we).
+    StrictPrototypes,
     /// A printf-family format string does not match its variadic arguments.
     /// GCC flag: -Wformat (enabled by -Wall).
     Format,
@@ -292,6 +299,22 @@ pub const WARNING_REGISTRY: &[WarningDescriptor] = &[
         [Extra],
         false,
         "mixed-sign integer comparison"
+    ),
+    warning!(
+        DivByZero,
+        "div-by-zero",
+        true,
+        [],
+        false,
+        "integer division or remainder by a constant zero"
+    ),
+    warning!(
+        StrictPrototypes,
+        "strict-prototypes",
+        false,
+        [],
+        false,
+        "function declaration without a parameter-type list"
     ),
     warning!(
         Format,
@@ -789,6 +812,13 @@ pub struct Diagnostic {
     /// missing `#include`) where the source manager is not yet available.
     /// Format: "file:line:" (rendered as the location prefix in output).
     pub explicit_location: Option<String>,
+    /// Disambiguates two diagnostics that are otherwise identical: same
+    /// severity, message and location. The engine drops a repeated warning
+    /// with the same key (the same issue reported twice by two phases), but
+    /// GCC reports one verdict per attribute list, so a caller that emits
+    /// several verdicts at one location sets this to a value that differs per
+    /// list (the list's own span). Zero means "no disambiguation".
+    pub dedup_salt: u64,
 }
 
 impl Diagnostic {
@@ -802,6 +832,7 @@ impl Diagnostic {
             notes: Vec::new(),
             fix_hint: None,
             explicit_location: None,
+            dedup_salt: 0,
         }
     }
 
@@ -815,6 +846,7 @@ impl Diagnostic {
             notes: Vec::new(),
             fix_hint: None,
             explicit_location: None,
+            dedup_salt: 0,
         }
     }
 
@@ -828,6 +860,7 @@ impl Diagnostic {
             notes: Vec::new(),
             fix_hint: None,
             explicit_location: None,
+            dedup_salt: 0,
         }
     }
 
@@ -841,6 +874,7 @@ impl Diagnostic {
             notes: Vec::new(),
             fix_hint: None,
             explicit_location: None,
+            dedup_salt: 0,
         }
     }
 
@@ -906,6 +940,15 @@ pub struct DiagnosticEngine {
     error_limit_noted: bool,
     /// Same latch for the warning cap (see `render_warning`).
     warning_limit_noted: bool,
+    /// Warnings already reported, keyed by (file, span, message hash).
+    ///
+    /// GCC reports one diagnostic per offending token, however many internal
+    /// paths notice the mistake. Two independent analyses of the same
+    /// declaration (the parser's placement check and the declaration-level
+    /// check) reach the same verdict on the same attribute; without this the
+    /// user sees the line twice. Warnings are therefore idempotent per
+    /// (span, message).
+    emitted_warnings: crate::common::fx_hash::FxHashSet<(u32, u32, u32, u64, u64)>,
 }
 
 impl DiagnosticEngine {
@@ -951,7 +994,15 @@ impl DiagnosticEngine {
             last_include_trace_file: None,
             error_limit_noted: false,
             warning_limit_noted: false,
+            emitted_warnings: crate::common::fx_hash::FxHashSet::default(),
         }
+    }
+
+    fn message_hash(message: &str) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        message.hash(&mut hasher);
+        hasher.finish()
     }
 
     /// Render an error-severity diagnostic subject to `MAX_RENDERED_ERRORS`.
@@ -1045,6 +1096,18 @@ impl DiagnosticEngine {
     /// - If -Werror or -Werror=<name> applies, it is promoted to an error.
     /// - The GCC-style `[-W<name>]` suffix is appended to the message.
     pub fn emit(&mut self, diag: &Diagnostic) {
+        if diag.severity == Severity::Warning
+            && let Some(span) = diag.span
+            && !self.emitted_warnings.insert((
+                span.file_id,
+                span.start,
+                span.end,
+                Self::message_hash(&diag.message),
+                diag.dedup_salt,
+            ))
+        {
+            return;
+        }
         // GCC suppresses diagnostics that come from a system header unless
         // -Wsystem-headers asks for them; the suppression applies to warnings
         // only. Without this, a project that merely includes <pthread.h>
@@ -1097,6 +1160,7 @@ impl DiagnosticEngine {
                             notes: diag.notes.clone(),
                             fix_hint: diag.fix_hint.clone(),
                             explicit_location: diag.explicit_location.clone(),
+                            dedup_salt: diag.dedup_salt,
                         };
                         self.render_error(&promoted);
                         return;
@@ -1111,6 +1175,7 @@ impl DiagnosticEngine {
                         notes: diag.notes.clone(),
                         fix_hint: diag.fix_hint.clone(),
                         explicit_location: diag.explicit_location.clone(),
+                        dedup_salt: diag.dedup_salt,
                     };
                     self.render_warning(&annotated);
                 } else {
@@ -1129,6 +1194,7 @@ impl DiagnosticEngine {
                             notes: diag.notes.clone(),
                             fix_hint: diag.fix_hint.clone(),
                             explicit_location: diag.explicit_location.clone(),
+                            dedup_salt: diag.dedup_salt,
                         };
                         self.render_error(&promoted);
                     } else {
@@ -1168,6 +1234,14 @@ impl DiagnosticEngine {
         self.emit(&diag);
     }
 
+    /// Emit a `note:` line that belongs to the diagnostic just reported, at
+    /// the same location GCC uses for it. Notes never change the exit status
+    /// and are not counted in the diagnostic totals.
+    pub fn note(&mut self, message: impl Into<String>, span: Span) {
+        let diag = Diagnostic::note(message).with_span(span);
+        self.emit(&diag);
+    }
+
     /// Emit a warning with a message and span.
     pub fn warning(&mut self, message: impl Into<String>, span: Span) {
         let diag = Diagnostic::warning(message).with_span(span);
@@ -1177,6 +1251,21 @@ impl DiagnosticEngine {
     /// Emit a categorized warning with a message, span, and kind.
     pub fn warning_with_kind(&mut self, message: impl Into<String>, span: Span, kind: WarningKind) {
         let diag = Diagnostic::warning_with_kind(message, kind).with_span(span);
+        self.emit(&diag);
+    }
+
+    /// Emit a categorized warning that must not be folded into an earlier
+    /// identical one. `salt` distinguishes the occurrences; see
+    /// [`Diagnostic::dedup_salt`].
+    pub fn warning_with_kind_salted(
+        &mut self,
+        message: impl Into<String>,
+        span: Span,
+        kind: WarningKind,
+        salt: u64,
+    ) {
+        let mut diag = Diagnostic::warning_with_kind(message, kind).with_span(span);
+        diag.dedup_salt = salt;
         self.emit(&diag);
     }
 

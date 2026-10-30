@@ -192,7 +192,7 @@ impl Parser {
         // Specifier-position applicability records are settled here, before
         // the declarator (parameters, post-declarator attributes) can add
         // unrelated entries to the pool.
-        let spec_attr_targets = std::mem::take(&mut self.attrs.parsing_attr_targets);
+        let mut spec_attr_targets = std::mem::take(&mut self.attrs.parsing_attr_targets);
 
         let (name, derived, decl_mode, decl_common, decl_aligned, _) =
             self.parse_declarator_with_attrs();
@@ -207,6 +207,41 @@ impl Parser {
         let declarator_base_restrict = self.attrs.declarator_base_restrict;
         let (post_ctor, post_dtor, post_mode, post_common, post_aligned, first_asm_reg) =
             self.parse_asm_and_attributes();
+        // Applicability is a property of the declaration, not of where the
+        // attribute was written: `int x __attribute__((noreturn));` is the
+        // same mistake as `__attribute__((noreturn)) int x;`, and GCC
+        // diagnoses both. Every position feeds one pool, and the verdict is
+        // taken once the declarator kind is known.
+        spec_attr_targets.extend(std::mem::take(&mut self.attrs.parsing_attr_targets));
+        self.check_attribute_targets(&type_spec, &derived, &spec_attr_targets, start);
+        // `cleanup` names a function to run when a *block* scope ends. A
+        // file-scope object never ends one, so GCC ignores the attribute
+        // there (measured: `'cleanup' attribute ignored`); the generic
+        // object/function rule cannot see the difference.
+        // Same location rule as the kind check above: GCC reports at the
+        // declaration, a leading attribute list included.
+        let decl_loc = match self.attrs.first_attr_span {
+            Some(attr) if attr.start < start.start => attr,
+            _ => start,
+        };
+        // A `cleanup` list with the wrong number of arguments is an error and
+        // gcc reports only that error, so the applicability warning is
+        // suppressed for it (measured).
+        let cleanup_arity_error = self.cleanup_diagnoses.iter().any(|(d, _)| {
+            matches!(
+                d,
+                crate::frontend::parser::parse::CleanupDiagnosis::WrongArgumentCount(_)
+            )
+        });
+        for (attr_name, _, _) in &spec_attr_targets {
+            if attr_name == "cleanup" && !cleanup_arity_error {
+                self.diagnostics.warning_with_kind(
+                    "'cleanup' attribute ignored",
+                    decl_loc,
+                    crate::common::error::WarningKind::Attributes,
+                );
+            }
+        }
         let mode_kind = decl_mode.or(post_mode);
         let is_common = decl_common || post_common;
         // Merge alignment from _Alignas (type specifier), declarator attrs, and post-declarator attrs.
@@ -288,6 +323,7 @@ impl Parser {
         decl_attrs.set_stack_protect(is_stack_protect);
         decl_attrs.set_no_stack_protector(is_no_stack_protector);
         decl_attrs.set_retain(self.attrs.parsing_retain());
+        decl_attrs.set_noplt(self.attrs.parsing_noplt());
         decl_attrs.set_noinit(self.attrs.parsing_noinit());
         decl_attrs.set_persistent(self.attrs.parsing_persistent());
         decl_attrs.set_nocommon(self.attrs.parsing_nocommon());
@@ -339,7 +375,7 @@ impl Parser {
         // `noinline` is a function property, not a one-declaration parsing
         // hint.  Preserve it from a prior prototype through a later bare
         // definition just like no_instrument_function above.
-        self.record_function_noinline(name.as_deref(), &derived, is_noinline);
+        self.record_function_entity(name.as_deref(), &derived, is_noinline);
 
         if is_funcdef {
             self.parse_function_def(
@@ -403,17 +439,43 @@ impl Parser {
         ExternalDecl::Declaration(Declaration::empty())
     }
 
-    /// Record a property of a function entity, not a pointer object. Call this
+    /// Record facts about a FUNCTION entity, not a pointer object. Call this
     /// for every declarator, after its own trailing attributes are consumed.
-    fn record_function_noinline(
+    ///
+    /// Two facts ride on the same shape test (`DerivedDeclarator::Function` last
+    /// means the declared entity is a function, not a pointer to one):
+    ///   * `noinline`, preserved from a prototype through a later bare
+    ///     definition (GCC merges declaration attributes into the definition);
+    ///   * the name itself, so an `asm "i"(f)` operand can be recognised as a
+    ///     link-time constant (`function_names`, see `asm_validate`).
+    fn record_function_entity(
         &mut self,
         name: Option<&str>,
         derived: &[DerivedDeclarator],
         noinline: bool,
     ) {
-        if noinline && matches!(derived.last(), Some(DerivedDeclarator::Function(..))) {
-            if let Some(name) = name {
+        if !matches!(derived.last(), Some(DerivedDeclarator::Function(..))) {
+            return;
+        }
+        if let Some(name) = name {
+            self.function_names.insert(name.to_owned());
+            if noinline {
                 self.func_decl_noinline.insert(name.to_owned());
+            }
+        }
+    }
+
+    /// An OBJECT declaration hides any same-named function: after
+    /// `void f(void);` a block-scope `int f;` makes `"i"(f)` an ordinary
+    /// object value, exactly as it hides a typedef name.  A declaration whose
+    /// last declarator is a function still names the function entity (a
+    /// redeclaration or definition), so it must not clear the record.
+    fn record_object_shadows(&mut self, declarators: &[InitDeclarator]) {
+        for decl in declarators {
+            if !decl.name.is_empty()
+                && !matches!(decl.derived.last(), Some(DerivedDeclarator::Function(..)))
+            {
+                self.function_names.remove(&decl.name);
             }
         }
     }
@@ -431,8 +493,15 @@ impl Parser {
         // The specifier-position applicability records ride `decl_attrs`
         // from the spec parse; the kind check takes them.
         let recorded = std::mem::take(&mut decl_attrs.parsing_attr_targets);
-        self.check_attribute_targets(&type_spec, &derived, &recorded);
+        self.check_attribute_targets(&type_spec, &derived, &recorded, start);
         self.attrs.set_typedef(false); // function defs are never typedefs
+        // Two distinct anchors, both measured against gcc-16.2: a function
+        // *definition* reports an unprototyped declarator at its name
+        // (`int k() {}` -> `1:5`), while a declaration reports it at the
+        // declaration's start (`int (*cb)();` -> `1:1`). The name must be
+        // captured here: K&R parameter declarations and the body both parse
+        // further declarations, and each of those overwrites the field.
+        let def_name_span = self.attrs.last_decl_name_span;
         let (params, variadic, has_prototype) =
             if let Some(DerivedDeclarator::Function(p, v, has_prototype)) = derived.last() {
                 (p.clone(), *v, *has_prototype)
@@ -519,7 +588,11 @@ impl Parser {
         let prior_asm_immediate_defer = self.asm_immediate_validation_deferred;
         self.asm_immediate_validation_deferred =
             prior_asm_immediate_defer || is_inline || is_always_inline;
+        let saved_asm_deferral = self.asm_deferred_instantiation;
+        self.asm_deferred_instantiation =
+            saved_asm_deferral || is_inline || is_always_inline || is_gnu_inline;
         let body = self.parse_compound_stmt();
+        self.asm_deferred_instantiation = saved_asm_deferral;
         self.asm_immediate_validation_deferred = prior_asm_immediate_defer;
         let body_span = self.through_previous_token(open);
         for n in shadowed_added {
@@ -527,6 +600,12 @@ impl Parser {
         }
         self.restore_enum_scope(enum_mark);
 
+        self.flush_declarator_verdicts(
+            start,
+            def_name_span,
+            DerivedDeclarator::has_unprototyped_function_type(&derived),
+            false,
+        );
         Some(ExternalDecl::FunctionDef(FunctionDef {
             alignment,
             return_base_const,
@@ -839,6 +918,8 @@ impl Parser {
     /// belong to the declaration specifiers are restored from DeclContext.
     fn clear_completed_declarator_attributes(&mut self) {
         self.attrs.set_weak(false);
+        self.attrs.first_attr_span = None;
+        self.attrs.set_noplt(false);
         self.attrs.parsing_alias_target = None;
         self.attrs.parsing_ifunc_target = None;
         self.attrs.parsing_target_clones = None;
@@ -876,13 +957,26 @@ impl Parser {
         // Placement-checked specifier attributes resolve against the first
         // declarator (the take also keeps records off later declarations).
         let recorded = std::mem::take(&mut ctx.attrs.parsing_attr_targets);
-        self.check_attribute_targets(&type_spec, &derived, &recorded);
+        // gcc anchors declaration-level verdicts at the declaration, and a
+        // leading attribute list is part of it: `__attribute__((cleanup))
+        // void *p;` anchors at the attribute, not at the type specifier
+        // (measured). Taken here because finishing the first declarator
+        // clears the record.
+        let decl_loc = match self.attrs.first_attr_span {
+            Some(attr) if attr.start < start.start => attr,
+            _ => start,
+        };
+        self.check_attribute_targets(&type_spec, &derived, &recorded, start);
         let mut declarators = Vec::with_capacity(4);
         // Same snapshot rationale as parse_local_declaration: initializer
         // casts to segment-qualified pointers clear parsing_address_space
         // before Declaration::new would read it.
         let decl_addr_space = self.attrs.decl_address_space;
         let spec_maybe_unused = ctx.attrs.is_maybe_unused();
+        // `noplt` written among the declaration specifiers applies to every
+        // declarator of the statement (`__attribute__((noplt)) void f(), g();`
+        // marks both, measured against gcc-16.2.0).
+        let spec_noplt = ctx.attrs.is_noplt();
         let init = if self.consume_if(&TokenKind::Assign) {
             Some(self.parse_initializer())
         } else {
@@ -1012,7 +1106,7 @@ impl Parser {
         if self.attrs.parsing_error_attr() {
             last_decl.attrs.set_error_attr(true);
         }
-        self.record_function_noinline(
+        self.record_function_entity(
             Some(&last_decl.name),
             &last_decl.derived,
             self.attrs.parsing_noinline(),
@@ -1104,6 +1198,7 @@ impl Parser {
                     da.set_const_attr(d_const_attr);
                     da.set_used(d_used);
                     da.set_maybe_unused(d_maybe_unused || spec_maybe_unused);
+                    da.set_noplt(spec_noplt);
                     da.set_fastcall(d_fastcall);
                     da.regparm = d_regparm;
                     da.alias_target = d_alias;
@@ -1140,12 +1235,22 @@ impl Parser {
             if let Some(a) = skip_aligned {
                 ctx.alignment = Some(ctx.alignment.map_or(a, |prev| prev.max(a)));
             }
-            self.record_function_noinline(
+            self.record_function_entity(
                 Some(&last_decl.name),
                 &last_decl.derived,
                 self.attrs.parsing_noinline(),
             );
             self.attrs.set_noinline(false);
+            // A trailing attribute written on a later sibling is still a
+            // declaration-level verdict for GCC: `int a, b __attribute__
+            // ((noreturn));` warns once, at the declaration (measured). The
+            // first declarator was checked before this loop; each sibling's
+            // own placement records are settled here.
+            let sibling_records = std::mem::take(&mut self.attrs.parsing_attr_targets);
+            if !sibling_records.is_empty() {
+                let sibling_derived = last_decl.derived.clone();
+                self.check_attribute_targets(&type_spec, &sibling_derived, &sibling_records, start);
+            }
         }
 
         // Register typedef names
@@ -1154,6 +1259,13 @@ impl Parser {
         self.register_typedefs(&type_spec, &declarators, decl_addr_space);
 
         self.expect_after(&TokenKind::Semicolon, "after declaration");
+        // `-Wstrict-prototypes` is a property of the declared types, so it is
+        // read off the finished declarators (`int f();`, `int (*p)();`, and a
+        // nested `void g(int (*h)());` all qualify) rather than tracked
+        // through the parse.
+        let unprototyped = declarators
+            .iter()
+            .any(|item| DerivedDeclarator::has_unprototyped_function_type(&item.derived));
         let mut d = Declaration::new(
             type_spec,
             declarators,
@@ -1178,6 +1290,15 @@ impl Parser {
         d.set_thread_local(self.attrs.parsing_thread_local());
         d.set_transparent_union(is_transparent_union);
         d.set_inline(self.attrs.parsing_inline());
+        self.flush_declarator_verdicts(
+            decl_loc,
+            None,
+            unprototyped,
+            // A file-scope object has static storage duration, so `cleanup`
+            // is ignored there whatever its argument looks like; only the
+            // arity error survives (measured).
+            false,
+        );
         Some(ExternalDecl::Declaration(d))
     }
 
@@ -1192,11 +1313,85 @@ impl Parser {
         pending
     }
 
+    /// Whether `expr` mentions the identifier `name` anywhere (a cheap guard
+    /// against recording `int x = x;` as a constant).
+    fn mentions_identifier(expr: &Expr, name: &str) -> bool {
+        let mut found = false;
+        let mut stack: Vec<&Expr> = Vec::new();
+        // `for_each_child` is the one-step visitor; recurse through it so the
+        // guard sees every nested occurrence without a second walker.
+        stack.push(expr);
+        while let Some(e) = stack.pop() {
+            if let Expr::Identifier(n, _) = e
+                && n == name
+            {
+                found = true;
+                break;
+            }
+            e.for_each_child(&mut |child| stack.push(child));
+        }
+        found
+    }
+
+    /// Record `name` as an integer constant when a block-scope declaration is
+    /// an integer scalar with a self-contained constant initializer.
+    ///
+    /// Deliberately conservative: pointers, aggregates, `volatile`, `extern`,
+    /// `static` and anything the parser's own integer folder cannot evaluate
+    /// are not recorded, so the `asm "i"` diagnostic is preserved for them —
+    /// exactly the set GCC also rejects.  The declarator must be a plain name
+    /// (no pointer/array/function derivation).
+    pub(super) fn record_local_constant(
+        &mut self,
+        name: &str,
+        derived: &[DerivedDeclarator],
+        init: &Initializer,
+    ) {
+        if !derived.is_empty() || self.attrs.parsing_volatile() || self.attrs.parsing_static() {
+            return;
+        }
+        // Only an expression initializer can be a scalar constant; a braced
+        // list is an aggregate (or a scalar with a redundant brace, which is
+        // not worth the special case).
+        let Initializer::Expr(expr) = init else {
+            return;
+        };
+        // A self-reference (`int x = x;`) must not resolve to itself.
+        if Self::mentions_identifier(expr, name) {
+            return;
+        }
+        // Constants already recorded in this or an enclosing block participate,
+        // so `int fl = 3; __auto_type v = (1 << 0) | (fl << 8);` folds.  GCC
+        // reaches the same answer by constant-propagating the local before it
+        // re-checks the `asm` statement.
+        let mut fold_enums = self.enum_constants.clone();
+        for (n, val) in &self.local_constants {
+            fold_enums.entry(n.clone()).or_insert(*val);
+        }
+        match Self::eval_const_int_expr_with_enums(expr, Some(&fold_enums), None) {
+            Some(v) => {
+                self.local_constants.insert(name.to_string(), v);
+            }
+            // A declaration without a foldable initializer SHADOWS any outer
+            // record of the same name: `int v = 5; { int v; asm("i"(v)); }`
+            // must not read the outer 5.
+            None => {
+                self.local_constants.remove(name);
+            }
+        }
+    }
+
     pub(super) fn parse_local_declaration(&mut self) -> Option<Declaration> {
         // Residue from contexts that never reach a declaration-kind check
         // (parameter lists, abstract declarators) must not attribute to
         // this declaration.
         self.attrs.parsing_attr_targets.clear();
+        // A leading attribute list of THIS declaration may already have been
+        // consumed by the statement-level pre-scan; take the record so it
+        // cannot leak into a later declaration (the file-scope path clears it
+        // when it finishes a declarator, this one owns it from entry).
+        let pre_attr_span = self.attrs.first_attr_span.take();
+        self.attrs.last_decl_name_span = None;
         let start = self.peek_span();
         // Selective reset: only storage-class/qualifier flags need clearing here.
         // GCC attribute flags (constructor, weak, etc.) may carry over from the
@@ -1244,6 +1439,8 @@ impl Parser {
         // an initializer can introduce attributes of its own.
         let spec_retain = self.attrs.parsing_retain();
         self.attrs.set_retain(false);
+        let spec_noplt = self.attrs.parsing_noplt();
+        self.attrs.set_noplt(false);
 
         // Snapshot the declaration's address space NOW: initializer parsing
         // can contain casts to segment-qualified pointers, and the abstract-
@@ -1301,7 +1498,7 @@ impl Parser {
             // declarators of the statement inherit the same verdict.
             let mut pending = spec_attr_targets_for_loop.take().unwrap_or_default();
             let recorded = std::mem::take(&mut pending);
-            self.check_attribute_targets(&type_spec, &derived, &recorded);
+            self.check_attribute_targets(&type_spec, &derived, &recorded, start);
             let l_object_space = self.attrs.declarator_object_space;
             let l_object_volatile = self.attrs.declarator_object_volatile;
             let l_pointer_const = self.attrs.parsing_pointer_const();
@@ -1336,6 +1533,19 @@ impl Parser {
             } else {
                 None
             };
+            // Record a block-scope integer constant so an `asm "i"` operand may
+            // name it (see `local_constants` in the parser state).  A
+            // declaration with no initializer still SHADOWS an outer record.
+            if let Some(decl_name) = name.as_ref() {
+                if !decl_name.is_empty() && !self.attrs.parsing_typedef() {
+                    match init.as_ref() {
+                        Some(init) => self.record_local_constant(decl_name, &derived, init),
+                        None => {
+                            self.local_constants.remove(decl_name.as_str());
+                        }
+                    }
+                }
+            }
             // Attributes parsed inside an initializer belong to that nested
             // construct, not to this declarator or the next comma sibling.
             self.attrs.set_retain(false);
@@ -1366,6 +1576,7 @@ impl Parser {
                     da.set_constructor(self.attrs.parsing_constructor());
                     da.set_destructor(self.attrs.parsing_destructor());
                     da.set_weak(self.attrs.parsing_weak());
+                    da.set_noplt(spec_noplt);
                     da.set_fastcall(self.attrs.parsing_fastcall());
                     da.regparm = self.attrs.parsing_regparm;
                     da.set_naked(self.attrs.parsing_naked());
@@ -1394,6 +1605,10 @@ impl Parser {
             if self.attrs.parsing_retain() {
                 last_decl.attrs.set_retain(true);
                 self.attrs.set_retain(false);
+            }
+            if self.attrs.parsing_noplt() {
+                last_decl.attrs.set_noplt(true);
+                self.attrs.set_noplt(false);
             }
             if let Some(a) = post_init_aligned {
                 alignment = Some(alignment.map_or(a, |prev| prev.max(a)));
@@ -1436,6 +1651,7 @@ impl Parser {
                     self.shadowed_typedefs.insert(decl.name.clone());
                 }
             }
+            self.record_object_shadows(&declarators);
         }
 
         self.expect_after(&TokenKind::Semicolon, "after declaration");
@@ -1455,6 +1671,22 @@ impl Parser {
         let alignas_type = self.attrs.parsed_alignas_type.take();
         let alignment_sizeof_type = self.attrs.parsed_alignment_sizeof_type.take();
         let is_transparent_union = self.take_transparent_union();
+        // gcc applies the `cleanup` argument-shape checks only to an
+        // automatic object: the one target C23 6.7.12.2 lets the attribute
+        // serve. Everything else is warned about and ignored.
+        let cleanup_auto_object = !self.attrs.parsing_static()
+            && !self.attrs.parsing_extern()
+            && !self.attrs.parsing_typedef()
+            && !declarators
+                .iter()
+                .all(|item| DerivedDeclarator::declares_function(&item.derived));
+        // `-Wstrict-prototypes` is a property of the declared types, so it is
+        // read off the finished declarators (`int f();`, `int (*p)();`, and a
+        // nested `void g(int (*h)());` all qualify) rather than tracked
+        // through the parse.
+        let unprototyped = declarators
+            .iter()
+            .any(|item| DerivedDeclarator::has_unprototyped_function_type(&item.derived));
         let mut d = Declaration::new(
             type_spec,
             declarators,
@@ -1481,6 +1713,14 @@ impl Parser {
         // declaration either (see the specifier snapshot above).
         self.attrs.parsing_visibility = None;
         self.attrs.parsing_tls_model = None;
+        // gcc anchors a declaration's verdicts at its first token, and a
+        // leading attribute list is part of it (`__attribute__((cleanup))
+        // void *p = 0;` anchors at the attribute).
+        let decl_loc = match pre_attr_span {
+            Some(attr) if attr.start < start.start => attr,
+            _ => start,
+        };
+        self.flush_declarator_verdicts(decl_loc, None, unprototyped, cleanup_auto_object);
         Some(d)
     }
 
@@ -1627,6 +1867,31 @@ impl Parser {
             Expr::CharLiteral(val, _) => Some(*val as i64),
             // Identifiers: look up enum constants if available
             Expr::Identifier(name, _) => enum_consts.and_then(|m| m.get(name.as_str()).copied()),
+            // Compile-time bit builtins.  `sema`/`lowering` already fold these
+            // through `common::const_eval`, but the *parser's* folder is the one
+            // the `asm "i"` validator consults, and it saw none of them, so a
+            // constant initializer built from a compile-time builtin (e.g.
+            // `__builtin_clz(64) - 1`) fell out of the constant-expression class
+            // and the statement was rejected.  The table is shared, so the two
+            // folds can never disagree.
+            Expr::FunctionCall(callee, args, _) => {
+                let Expr::Identifier(name, _) = callee.as_ref() else {
+                    return None;
+                };
+                if !name.starts_with("__builtin_") {
+                    return None;
+                }
+                let folded = crate::common::const_eval::eval_builtin_call_with_mode(
+                    name.as_str(),
+                    args,
+                    &|e| {
+                        Self::eval_const_int_expr_with_enums(e, enum_consts, tag_aligns)
+                            .map(crate::ir::reexports::IrConst::I64)
+                    },
+                    true,
+                )?;
+                folded.to_i64()
+            }
             Expr::BinaryOp(op, lhs, rhs, _) => {
                 let l = Self::eval_const_int_expr_with_enums(lhs, enum_consts, tag_aligns)?;
                 let r = Self::eval_const_int_expr_with_enums(rhs, enum_consts, tag_aligns)?;

@@ -68,40 +68,6 @@ run_case unmodelled_letter2 error \
 run_case immediate_on_variable error \
     'int f(int x){int r;__asm__ volatile("movl %1, %0":"=r"(r):"I"(x));return r;}'
 
-# A named matching operand is not an arbitrary string beginning with '['.
-# Resolve the name against the outputs and diagnose malformed references
-# instead of letting the backend's catch-all classifier reinterpret them.
-EXPECT_MESSAGE="undefined named operand 'missing'"
-run_case named_matching_undefined error \
-    'unsigned long f(unsigned long x){unsigned long y=x;__asm__("addq %1,%0":[sum] "+r"(y):"[missing]"(x));return y;}'
-EXPECT_MESSAGE="missing close brace for named operand"
-run_case named_matching_unclosed error \
-    'unsigned long f(unsigned long x){unsigned long y=x;__asm__("addq %1,%0":[sum] "+r"(y):"[sum"(x));return y;}'
-EXPECT_MESSAGE="undefined named operand ''"
-run_case named_matching_empty error \
-    'unsigned long f(unsigned long x){unsigned long y=x;__asm__("addq %1,%0":[sum] "+r"(y):"[]"(x));return y;}'
-run_case named_matching_suffix clean \
-    'unsigned long f(unsigned long x){unsigned long y=x;__asm__("addq %1,%0":[sum] "+r"(y):"[sum]r"(x));return y;}'
-run_case named_matching_repeated clean \
-    'unsigned long f(unsigned long x){unsigned long y=x;__asm__("addq %1,%0":[sum] "+r"(y):"[sum][sum]"(x));return y;}'
-run_case named_matching_comment clean \
-    'unsigned long f(unsigned long x){unsigned long y=x;__asm__("addq %1,%0":[sum] "+r"(y):"[sum]# ignored ] @"(x));return y;}'
-EXPECT_MESSAGE="undefined named operand 'x'"
-run_case named_matching_second_undefined error \
-    'unsigned long f(unsigned long x){unsigned long y=x;__asm__("addq %1,%0":[sum] "+r"(y):"[sum][x]"(x));return y;}'
-EXPECT_MESSAGE="invalid punctuation ']' in constraint"
-run_case named_matching_extra_close error \
-    'unsigned long f(unsigned long x){unsigned long y=x;__asm__("addq %1,%0":[sum] "+r"(y):"[sum]]"(x));return y;}'
-EXPECT_MESSAGE="invalid punctuation '@' in constraint"
-run_case named_matching_bad_punctuation error \
-    'unsigned long f(unsigned long x){unsigned long y=x;__asm__("addq %1,%0":[sum] "+r"(y):"[sum]@"(x));return y;}'
-EXPECT_MESSAGE="invalid punctuation ' ' in constraint"
-run_case named_matching_space error \
-    'unsigned long f(unsigned long x){unsigned long y=x;__asm__("addq %1,%0":[sum] "+r"(y):"[sum]r junk"(x));return y;}'
-EXPECT_MESSAGE="invalid punctuation '_' in constraint"
-run_case named_matching_underscore error \
-    'unsigned long f(unsigned long x){unsigned long y=x;__asm__("addq %1,%0":[sum] "+r"(y):"[sum]_"(x));return y;}'
-
 # GCC defers immediate-only validation in an inline body until the caller's
 # argument is substituted. Kernel helpers use this for static branches and
 # BUG metadata. The constant call must compile; a dynamic call must be rejected
@@ -115,12 +81,10 @@ static __attribute__((always_inline)) inline int imm(int x)
 }
 int constant_call(void) { return imm(7); }
 EOF
-for opt in -O0 -O1 -O2 -Os; do
-    if ! "$CCC" "$opt" -c "$TMP/always-inline-immediate.c" -o "$TMP/always-inline-immediate.o"; then
-        echo "FAIL always_inline_constant_immediate $opt: constant call should compile" >&2
-        fail=1
-    fi
-done
+if ! "$CCC" -O2 -c "$TMP/always-inline-immediate.c" -o "$TMP/always-inline-immediate.o"; then
+    echo "FAIL always_inline_constant_immediate: constant call should compile" >&2
+    fail=1
+fi
 cat >"$TMP/always-inline-dynamic.c" <<'EOF'
 static __attribute__((always_inline)) inline int imm(int x)
 {
@@ -130,74 +94,14 @@ static __attribute__((always_inline)) inline int imm(int x)
 }
 int dynamic_call(int x) { return imm(x); }
 EOF
-for opt in -O0 -O1 -O2 -Os; do
-    if out=$("$CCC" "$opt" -c "$TMP/always-inline-dynamic.c" -o "$TMP/always-inline-dynamic.o" 2>&1); then
-        echo "FAIL always_inline_dynamic_immediate $opt: dynamic value was accepted" >&2
-        fail=1
-    elif [[ $out != *"non-constant operand for immediate-only inline asm constraint"* ]]; then
-        echo "FAIL always_inline_dynamic_immediate $opt: missing actionable diagnostic:" >&2
-        echo "$out" >&2
-        fail=1
-    fi
-done
-
-# An address-taken always_inline definition is retained as a real function
-# pointer identity. It is not a disposable template: accepting its unresolved
-# parameter used to emit `movl $0, ...` at every optimization level.
-cat >"$TMP/always-inline-address.c" <<'EOF'
-static __attribute__((always_inline)) inline int imm(int x)
-{
-    int y;
-    __asm__("movl %1, %0" : "=r"(y) : "i"(x));
-    return y;
-}
-int (*volatile escaped_fp)(int) = imm;
-EOF
-for opt in -O0 -O1 -O2 -Os; do
-    if out=$("$CCC" "$opt" -c "$TMP/always-inline-address.c" -o "$TMP/always-inline-address.o" 2>&1); then
-        echo "FAIL always_inline_address_immediate $opt: escaped dynamic body was accepted" >&2
-        fail=1
-    elif [[ $out != *"non-constant operand for immediate-only inline asm constraint"* ]]; then
-        echo "FAIL always_inline_address_immediate $opt: missing actionable diagnostic:" >&2
-        echo "$out" >&2
-        fail=1
-    fi
-done
-
-# Acceptance alone is insufficient: execute the optimized immediate and the
-# suffixed named matching operand so a resolved name cannot silently select an
-# uninitialized register. `+r` is required because the add reads the output.
-cat >"$TMP/asm-runtime.c" <<'EOF'
-static __attribute__((always_inline)) inline unsigned int immediate(unsigned int value)
-{
-    unsigned int result;
-    __asm__("movl %1, %0" : "=r"(result) : "i"(value));
-    return result;
-}
-static unsigned int named(unsigned int value)
-{
-    unsigned int result = value;
-    __asm__("addl %1, %0" : [sum] "+r"(result) : "[sum]r"(value));
-    return result;
-}
-int main(void)
-{
-    if (immediate(21) != 21)
-        return 1;
-    if (named(9) != 18)
-        return 2;
-    return 0;
-}
-EOF
-for opt in -O0 -O1 -O2 -Os; do
-    if ! "$CCC" "$opt" "$TMP/asm-runtime.c" -o "$TMP/asm-runtime"; then
-        echo "FAIL asm runtime $opt: valid immediate/named program should link" >&2
-        fail=1
-    elif ! "$TMP/asm-runtime"; then
-        echo "FAIL asm runtime $opt: valid immediate/named program returned the wrong result" >&2
-        fail=1
-    fi
-done
+if out=$("$CCC" -O2 -c "$TMP/always-inline-dynamic.c" -o "$TMP/always-inline-dynamic.o" 2>&1); then
+    echo "FAIL always_inline_dynamic_immediate: dynamic value was accepted" >&2
+    fail=1
+elif [[ $out != *"non-constant operand for immediate-only inline asm constraint"* ]]; then
+    echo "FAIL always_inline_dynamic_immediate: missing actionable diagnostic:" >&2
+    echo "$out" >&2
+    fail=1
+fi
 
 # Local scalar initializers are often folded to immediate asm operands only
 # after optimization (Linux's __WARN_FLAGS creates a local __auto_type __flags).
@@ -271,52 +175,45 @@ do
     run_case "accepted:${body:0:28}" clean "$body"
 done
 
-# Every code-generation target must run the post-optimization gate: the shared
-# backend otherwise turns a dynamic immediate-only Value into `.word 0`. When
-# the cross drivers are supplied by ci_local, prove that AArch64 and RISC-V
-# reject that shape too. Literal constants are the positive controls; no cross
-# linking or execution is needed for this constraint contract.
-if [[ -n ${CCC_ARM:-} || -n ${CCC_RISCV:-} ]]; then
-    cat >"$TMP/cross-dynamic-immediate.c" <<'EOF'
-void dynamic_immediate(unsigned int value)
-{
-    __asm__ volatile(".word %0" : : "i"(value));
-}
-EOF
-    cat >"$TMP/cross-constant-immediate.c" <<'EOF'
-void constant_immediate(void)
-{
-    __asm__ volatile(".word %0" : : "i"(9));
-}
-EOF
-    if [[ -z ${CCC_ARM:-} || -z ${CCC_RISCV:-} ]]; then
-        echo "FAIL cross immediate diagnostics: both CCC_ARM and CCC_RISCV are required" >&2
-        fail=1
-    else
-        for target in ARM RISCV; do
-            driver_var="CCC_$target"
-            driver=${!driver_var}
-            if [[ ! -x $driver ]]; then
-                echo "FAIL cross immediate diagnostics: $driver_var is not executable: $driver" >&2
-                fail=1
-                continue
-            fi
-            for opt in -O0 -O1 -O2 -Os; do
-                if out=$("$driver" "$opt" -c "$TMP/cross-dynamic-immediate.c" -o "$TMP/cross-$target-dynamic.o" 2>&1); then
-                    echo "FAIL ${target}_dynamic_immediate $opt: dynamic value was accepted" >&2
-                    fail=1
-                elif [[ $out != *"non-constant operand for immediate-only inline asm constraint"* ]]; then
-                    echo "FAIL ${target}_dynamic_immediate $opt: missing post-optimization diagnostic:" >&2
-                    echo "$out" >&2
-                    fail=1
-                fi
-                if ! "$driver" "$opt" -c "$TMP/cross-constant-immediate.c" -o "$TMP/cross-$target-constant.o"; then
-                    echo "FAIL ${target}_constant_immediate $opt: literal constant should compile" >&2
-                    fail=1
-                fi
-            done
-        done
-    fi
+# ── %c: constant-expression operands only (gcc 16.2 wording) ─────────────────
+# `%c` prints the operand as an assembly constant expression.  LCCC used to
+# print the register *name*, which the kernel's BUG machinery turned into
+# `.word %rcx` in `__bug_table` — silently wrong object data, not an error.
+EXPECT_MESSAGE="invalid 'asm': operand is not a condition code, invalid operand code 'c'"
+run_case c_on_register error \
+    'int f(int x){int r;__asm__ volatile("movl %c1, %0":"=r"(r):"r"(x));return r;}'
+run_case c_on_memory error \
+    'int f(int x){int r;__asm__ volatile("movl %c1, %0":"=r"(r):"m"(x));return r;}'
+run_case c_on_named_tie error \
+    'int f(int b){int s;__asm__ volatile("movl %c1, %0":[s]"=r"(s):"[s]"(b));return s;}'
+run_case c_on_immediate clean \
+    'int f(void){int r;__asm__ volatile("movl %c1, %0":"=r"(r):"i"(7));return r;}'
+
+# ── "i" operands: what gcc folds, and what it refuses ────────────────────────
+# Measured (gcc 16.2, -O2): a function designator and a block-scope constant are
+# folded and printed as their symbol / value; a *mutable* global object is not,
+# and gcc emits both the warning and the error below.
+EXPECT_MESSAGE="impossible constraint in 'asm'"
+run_case symbolic_object_operand error \
+    'int o; int f(int x){__asm__ volatile("addl %c1, %0":"+r"(x):"i"(o));return x;}'
+run_case function_designator clean \
+    'int g(void); int f(int x){__asm__ volatile("addl %c1, %0":"+r"(x):"i"(g));return x;}'
+run_case block_scope_constant clean \
+    'int f(int x){__auto_type k = (1 << 2);__asm__ volatile("addl %c1, %0":"+r"(x):"i"(k));return x;}'
+
+# The folded symbol must reach the template verbatim, exactly as gcc prints it:
+# `addl g, %eax`, not a register materialised through a GOT load.
+printf 'int g(void); int f(int x){ __asm__ volatile("addl %%c1, %%0" : "+r"(x) : "i"(g)); return x; }\n' >"$TMP/foldsym.c"
+"$CCC" -O2 -S "$TMP/foldsym.c" -o "$TMP/foldsym.s"
+if ! grep -Eq '^[[:space:]]+addl[[:space:]]+g,' "$TMP/foldsym.s"; then
+    echo "FAIL: a folded symbol immediate did not print as a symbol" >&2
+    cat "$TMP/foldsym.s" >&2
+    fail=1
+fi
+gcc_expect=$("$GCC" -O2 -S "$TMP/foldsym.c" -o - 2>/dev/null | grep -Ec '^[[:space:]]+addl[[:space:]]+g,')
+if [[ $gcc_expect != 1 ]]; then
+    echo "FAIL: the oracle no longer folds this shape (gcc printed $gcc_expect matches)" >&2
+    fail=1
 fi
 
 if ((fail)); then

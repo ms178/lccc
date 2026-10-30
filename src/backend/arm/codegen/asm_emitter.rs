@@ -539,7 +539,7 @@ impl InlineAsmEmitter for ArmCodegen {
         result = crate::backend::inline_asm::substitute_goto_labels(
             &result,
             goto_labels,
-            operands.len(),
+            gcc_to_internal.len(),
         );
         result
     }

@@ -12,7 +12,7 @@
 use super::common::AsmOutput;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
-use crate::ir::reexports::{BlockId, IrCmpOp, Operand};
+use crate::ir::reexports::{BlockId, IrCmpOp, Operand, Value};
 use std::sync::Arc;
 
 /// Stack slot location for a value. Interpretation varies by arch:
@@ -48,6 +48,16 @@ pub enum SibcallTarget {
     Direct(String),
     RipSlot(String),
     Reg(&'static str),
+}
+
+/// Out-of-line edge block for an `asm goto` statement with output operands.
+/// The template branches to `label`; this block materializes the outputs and
+/// then transfers to the original C label `target`.
+#[derive(Debug, Clone)]
+pub struct PendingAsmGotoTrampoline {
+    pub label: BlockId,
+    pub target: BlockId,
+    pub outputs: Vec<(crate::backend::inline_asm::AsmOperand, Value, String)>,
 }
 
 /// Per-instruction sibling-call shape hint, computed by the generation
@@ -425,6 +435,10 @@ pub struct CodegenState {
     /// relocations, so default-visibility function pointers remain GOT-based
     /// in PIE even though ordinary extern data addresses may be direct.
     pub extern_function_symbols: FxHashSet<String>,
+    /// Symbols declared `__attribute__((noplt))` and left undefined here:
+    /// their calls must not be routed through a PLT stub. Per-symbol form of
+    /// the compiled-in `-fno-plt` (`no_plt`), which stays the blanket switch.
+    pub noplt_symbols: FxHashSet<String>,
     /// Compare-replay records: Cmp instructions whose boolean result is
     /// consumed by exactly one Select or CondBranch that is NOT adjacent to
     /// the Cmp (so pending-flag fusion cannot fire — an intervening ALU op
@@ -765,6 +779,20 @@ pub struct CodegenState {
     /// Label emitted immediately after the current block, if any. Used to
     /// elide unconditional jumps on the hot fall-through path.
     pub next_block_label: Option<BlockId>,
+    /// Next globally unused block-label number reserved for backend-generated
+    /// asm-goto output trampolines.
+    next_synthetic_block_id: u32,
+    /// Output-materialization trampolines queued by inline asm emission and
+    /// drained after the function's ordinary IR blocks have been emitted.
+    pub pending_asm_goto_trampolines: Vec<PendingAsmGotoTrampoline>,
+    /// CondBranch condition values whose truth is the live x86 condition
+    /// flags produced by an immediately preceding asm-goto flag output,
+    /// mapped to the full `jcc` mnemonic to emit. The x86 backend consumes
+    /// these to branch directly without a cmp/test.
+    pub asm_cc_branch_values: FxHashMap<u32, String>,
+    /// Condition-code output pointers whose only IR reads are certified
+    /// branches in `asm_cc_branch_values`; their setcc/store is dead.
+    pub asm_cc_branch_output_ptrs: FxHashSet<u32>,
     /// Output offset immediately after the current observable block's label.
     /// `None` means its address is not observed. Owned by the shared block
     /// driver; reset between functions, never inferred from assembly labels.
@@ -875,6 +903,7 @@ impl CodegenState {
             local_symbols: FxHashSet::default(),
             defined_symbols: FxHashSet::default(),
             extern_function_symbols: FxHashSet::default(),
+            noplt_symbols: FxHashSet::default(),
             cmp_replay: FxHashMap::default(),
             absolute_symbols: FxHashSet::default(),
             tls_symbols: FxHashSet::default(),
@@ -948,12 +977,37 @@ impl CodegenState {
             fp_const_pool: FxHashMap::default(),
             vec_const_pool: FxHashMap::default(),
             next_block_label: None,
+            next_synthetic_block_id: 0,
+            pending_asm_goto_trampolines: Vec::new(),
+            asm_cc_branch_values: FxHashMap::default(),
+            asm_cc_branch_output_ptrs: FxHashSet::default(),
             observable_block_start: None,
         }
     }
 
     pub fn next_label_id(&mut self) -> u32 {
         self.out.next_label_id()
+    }
+
+    /// Reserve synthetic `.LBBn` labels after every real module block label.
+    /// Called once before module emission, when all renumbered IR labels are
+    /// known.
+    pub fn reserve_synthetic_block_ids_after(&mut self, max_real_id: Option<u32>) {
+        self.next_synthetic_block_id = max_real_id.map_or(0, |id| {
+            id.checked_add(1)
+                .expect("IR block label space exhausted by asm-goto trampoline")
+        });
+        self.pending_asm_goto_trampolines.clear();
+    }
+
+    /// Allocate a module-unique block-style label for an out-of-line asm-goto
+    /// output trampoline.
+    pub fn fresh_synthetic_block_id(&mut self) -> BlockId {
+        let id = self.next_synthetic_block_id;
+        self.next_synthetic_block_id = id
+            .checked_add(1)
+            .expect("asm-goto trampoline label space exhausted");
+        BlockId(id)
     }
 
     /// Start the address-identity region AFTER emitting this block's label.
@@ -1239,6 +1293,15 @@ impl CodegenState {
         self.dirty_upper_ymm = false;
         self.uses_sret = false;
         self.next_block_label = None;
+        // Drop any trampolines a previous function failed to emit instead of
+        // asserting on them: a caller that returns before the drain (the
+        // `is_naked` path does) would otherwise panic every assertion-enabled
+        // build, and, worse, a release build would emit the stale trampolines
+        // into the *next* function. The drain itself asserts that it consumed
+        // the queue, so a genuine leak still fails loudly where it happens.
+        self.pending_asm_goto_trampolines.clear();
+        self.asm_cc_branch_values.clear();
+        self.asm_cc_branch_output_ptrs.clear();
         self.observable_block_start = None;
         // GEP-fold bookkeeping is function-local too: `folded_gep_values`
         // holds the value IDs of skipped address producers, and value IDs
@@ -1511,10 +1574,15 @@ impl CodegenState {
     /// GOT under `-fno-plt` (`call *sym@GOTPCREL(%rip)` on x86-64,
     /// `call *sym@GOT[(%ebx)]` on i686).
     pub fn needs_got_call(&self, name: &str) -> bool {
-        if !self.no_plt || self.code_model_kernel || name.starts_with('.') {
+        if self.code_model_kernel || name.starts_with('.') {
             return false;
         }
         let base = name.split('@').next().unwrap_or(name);
+        // `-fno-plt` covers the whole translation unit; `noplt` names one
+        // callee. Both land on the same GOT-indirect call sequence.
+        if !self.no_plt && !self.noplt_symbols.contains(base) {
+            return false;
+        }
         if self.local_symbols.contains(base) {
             return false;
         }
@@ -1526,7 +1594,10 @@ impl CodegenState {
 
     /// Returns true if a function call needs PLT indirection in PIC mode.
     pub fn needs_plt(&self, name: &str) -> bool {
-        !self.no_plt && self.needs_got(name)
+        if self.no_plt || self.noplt_symbols.contains(name) {
+            return false;
+        }
+        self.needs_got(name)
     }
 
     /// Returns true if a symbol needs GOT indirection on AArch64.

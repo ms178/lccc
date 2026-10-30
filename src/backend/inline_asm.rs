@@ -198,6 +198,12 @@ pub trait InlineAsmEmitter {
         false
     }
 
+    /// Whether a condition-code output can be written directly to its byte
+    /// stack home, avoiding a temporary GPR for setcc.
+    fn can_store_condition_code_output_direct(&self, _ptr: &Value, _ty: IrType) -> bool {
+        false
+    }
+
     /// Last-resort scratch register when all non-excluded candidates are
     /// exhausted and the constraint has no usable memory alternative.
     fn fallback_scratch_reg(&mut self, _kind: &AsmOperandKind) -> String {
@@ -531,6 +537,14 @@ pub fn emit_inline_asm_common(
     );
 }
 
+/// Whether a constraint writes its operand back (`=`, `=r`, `+r`, `=&m`, ...).
+///
+/// `+` implies both a read and a write, so it is an output for every purpose
+/// that only asks "is this operand stored after the template?".
+fn constraint_writes_operand(constraint: &str) -> bool {
+    constraint.contains('=') || constraint.contains('+')
+}
+
 pub fn emit_inline_asm_common_impl(
     emitter: &mut dyn InlineAsmEmitter,
     template: &str,
@@ -544,6 +558,30 @@ pub fn emit_inline_asm_common_impl(
     seg_overrides: &[AddressSpace],
 ) {
     emitter.reset_scratch_state();
+
+    // An asm-goto branch bypasses the normal post-template output stores.
+    // Give each possible target an out-of-line edge block when any output
+    // still needs materializing. Branch-only condition outputs have a proven
+    // empty store, so they keep the original direct target (and avoid an
+    // unnecessary trampoline jump). Asms without outputs also retain their
+    // direct labels, preserving static-branch/jump-table shapes.
+    let has_materialized_outputs = outputs.iter().any(|(constraint, ptr, _)| {
+        (constraint.contains('=') || constraint.contains('+'))
+            && !emitter
+                .asm_state()
+                .asm_cc_branch_output_ptrs
+                .contains(&ptr.0)
+    });
+    let mut emitted_goto_labels = goto_labels.to_vec();
+    let mut asm_goto_trampolines = Vec::new();
+    if has_materialized_outputs && !goto_labels.is_empty() {
+        emitted_goto_labels.clear();
+        for (name, target) in goto_labels {
+            let label = emitter.asm_state().fresh_synthetic_block_id();
+            emitted_goto_labels.push((name.clone(), label));
+            asm_goto_trampolines.push((label, *target));
+        }
+    }
 
     // Phase 1: Classify all operands and assign registers
     let (mut operands, input_tied_to) = classify_all_operands(emitter, outputs, inputs);
@@ -597,7 +635,7 @@ pub fn emit_inline_asm_common_impl(
             &operands,
             &gcc_to_internal,
             operand_types,
-            goto_labels,
+            &emitted_goto_labels,
         );
         // GCC mnemonic-prefix modifiers (glibc math uses `%vstmxcsr`,
         // `%vldmxcsr`, `%vdivss %1, %d0` and `%xbegin`):
@@ -655,6 +693,22 @@ pub fn emit_inline_asm_common_impl(
             emitter.store_output_from_reg(&operands[i], ptr, constraint, &all_output_regs);
         }
     }
+    if !asm_goto_trampolines.is_empty() {
+        let trampoline_outputs: Vec<_> = outputs
+            .iter()
+            .enumerate()
+            .filter(|(_, (constraint, _, _))| constraint_writes_operand(constraint))
+            .map(|(i, (constraint, ptr, _))| (operands[i].clone(), *ptr, constraint.clone()))
+            .collect();
+        let pending = &mut emitter.asm_state().pending_asm_goto_trampolines;
+        pending.extend(asm_goto_trampolines.into_iter().map(|(label, target)| {
+            crate::backend::state::PendingAsmGotoTrampoline {
+                label,
+                target,
+                outputs: trampoline_outputs.clone(),
+            }
+        }));
+    }
 }
 
 /// Phase 1a: Classify all output and input operands, returning the operand
@@ -685,19 +739,42 @@ fn classify_all_operands(
 
     // Classify inputs
     for (constraint, val, name) in inputs {
-        // Handle named tied operands: "[name]" resolves to the output with that name
-        let kind = if constraint.starts_with('[') && constraint.ends_with(']') {
-            let tied_name = &constraint[1..constraint.len() - 1];
-            let tied_idx = outputs
-                .iter()
-                .position(|(_, _, oname)| oname.as_deref() == Some(tied_name));
-            if let Some(idx) = tied_idx {
-                AsmOperandKind::Tied(idx)
-            } else {
-                emitter.classify_constraint(constraint)
+        // Handle named matching constraints: `[name]` ties this input to the
+        // output declared with that name (GCC's matching-constraint syntax).
+        //
+        // Two separate facts live here and were once conflated:
+        //   * the constraint string is `[name]`, the same spelling as an
+        //     *operand name*.  Indexing it as `constraint[1..len-1]` yields the
+        //     name, which is what the tie needs;
+        //   * if no output carries the name, GCC diagnoses `undefined named
+        //     operand 'name'` — it does not classify the text as a constraint,
+        //     which is what this compiler used to do: the whole string fell
+        //     through `classify_constraint`'s catch-all to `GpReg`, telling the
+        //     template a *register* it never tied, and the parse-time validator
+        //     called it an impossible constraint.  `kernel/arch/x86/lib/
+        //     csum-wrappers_64.c` writes `: [sum] "=r"(sum64) : "[sum]"(rest)`,
+        //     the documented GCC idiom.
+        //
+        // A named tie is Tied(idx) even when the output's own constraint is
+        // something other than a plain register: the input inherits whatever
+        // the output was allocated, which is exactly GCC's meaning.
+        let named_tie = constraint
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'));
+        let kind = match named_tie {
+            Some(tied_name) => {
+                match outputs
+                    .iter()
+                    .position(|(_, _, oname)| oname.as_deref() == Some(tied_name))
+                {
+                    Some(idx) => AsmOperandKind::Tied(idx),
+                    // Unreferable name: keep a register kind so the back end
+                    // still produces *some* well-formed instruction; the parser
+                    // has already reported GCC's error, so no code is emitted.
+                    None => AsmOperandKind::GpReg,
+                }
             }
-        } else {
-            emitter.classify_constraint(constraint)
+            None => emitter.classify_constraint(constraint),
         };
         let mut op = AsmOperand::new(kind.clone(), name.clone());
         op.constraint = constraint.clone();
@@ -1043,6 +1120,21 @@ fn assign_one_scratch(
     if !operands[i].reg.is_empty() {
         return;
     }
+    if i < outputs.len() && matches!(operands[i].kind, AsmOperandKind::ConditionCode(_)) {
+        let ptr = &outputs[i].1;
+        let branch_only = emitter
+            .asm_state()
+            .asm_cc_branch_output_ptrs
+            .contains(&ptr.0);
+        if branch_only
+            || emitter.can_store_condition_code_output_direct(ptr, operands[i].operand_type)
+        {
+            // Branch-only outputs have no observable store. Other byte flag
+            // outputs can use setcc directly on their stack home. Neither case
+            // needs a temporary GPR, leaving the pool available to operands.
+            return;
+        }
+    }
     match &operands[i].kind {
         AsmOperandKind::Memory | AsmOperandKind::Immediate => {}
         AsmOperandKind::Tied(_) => {}
@@ -1063,6 +1155,38 @@ fn assign_one_scratch(
                 // corresponding output in finalize_operands_and_build_gcc_map.
                 if input_idx < num_plus {
                     return;
+                }
+                if let Operand::Value(value) = &inputs[input_idx].1 {
+                    if let Some(home) = emitter.home_reg_name(value.0) {
+                        let compatible = match kind {
+                            AsmOperandKind::GpReg => {
+                                !home.starts_with("xmm") && !home.starts_with("st(")
+                            }
+                            AsmOperandKind::FpReg => home.starts_with("xmm"),
+                            AsmOperandKind::QReg => {
+                                matches!(home.as_str(), "rax" | "rcx" | "rdx" | "rbx")
+                            }
+                            _ => false,
+                        };
+                        let home_canonical = x86_normalize_reg_to_64bit(&home);
+                        let conflicts = excluded.iter().any(|reg| {
+                            reg == &home
+                                || match (
+                                    home_canonical.as_deref(),
+                                    x86_normalize_reg_to_64bit(reg).as_deref(),
+                                ) {
+                                    (Some(a), Some(b)) => a == b,
+                                    _ => false,
+                                }
+                        });
+                        if compatible && !conflicts {
+                            // An already-fresh home is a valid register input.
+                            // Reuse it rather than copying the value to a
+                            // second scratch register.
+                            operands[i].reg = home;
+                            return;
+                        }
+                    }
                 }
             }
             let kind_clone = kind.clone();

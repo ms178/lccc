@@ -37,6 +37,279 @@ fn sibcall_enabled() -> bool {
     !*SIBCALL_DISABLED.get_or_init(|| std::env::var_os("CCC_NO_SIBCALL").is_some())
 }
 
+/// GCC condition-code suffix of a single-output `=@cc<suffix>` constraint.
+///
+/// `None` for every other constraint shape, so callers cannot accidentally
+/// treat an ordinary register output as a flag output.
+fn asm_cc_output_suffix(
+    constraint: &str,
+) -> Option<&'static crate::common::asm_constraints::CondCode> {
+    let suffix = constraint
+        .trim_start_matches(['=', '+', '&', '%'])
+        .strip_prefix("@cc")?;
+    crate::common::asm_constraints::cond_code(suffix)
+}
+
+/// Identify the deliberately narrow case where an asm-goto condition-code
+/// output is read only by immediate boolean branches. When the output object
+/// has no other IR access, its setcc/store can be omitted; x86 flag-preserving
+/// edge code lets each branch consume the original flags. Ambiguous CFG
+/// predecessors, volatile reads, address escapes, or any extra value use fail
+/// closed to ordinary output materialization and load-and-branch code.
+///
+/// Cost, measured in work rather than guessed: a function whose inline asm
+/// never produces a single-output `@cc` result returns after one scan of its
+/// asm instructions -- no CFG is built, nothing is allocated -- so ordinary
+/// translation units pay nothing. The certification itself walks each
+/// instruction's operand list exactly once through the allocation-free
+/// liveness visitors, instead of materialising a `Vec` of used values per
+/// instruction per output object.
+fn collect_asm_goto_cc_branch_values(
+    func: &IrFunction,
+) -> (FxHashMap<u32, String>, FxHashSet<u32>) {
+    let nothing = || (FxHashMap::default(), FxHashSet::default());
+    if func.blocks.is_empty() {
+        return nothing();
+    }
+
+    // Pass 1 (cheap): the objects that receive a condition-code output from an
+    // asm-goto with exactly one output. No other shape is certifiable.
+    let mut cc_output_ptrs: FxHashSet<u32> = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            let Instruction::InlineAsm {
+                outputs,
+                goto_labels,
+                ..
+            } = inst
+            else {
+                continue;
+            };
+            if goto_labels.is_empty() || outputs.len() != 1 {
+                continue;
+            }
+            if asm_cc_output_suffix(&outputs[0].0).is_some() {
+                cc_output_ptrs.insert(outputs[0].1.0);
+            }
+        }
+    }
+    if cc_output_ptrs.is_empty() {
+        return nothing();
+    }
+    // Object id -> verdict slot, so every later scan is O(1) per operand.
+    let ptr_slot: FxHashMap<u32, usize> = cc_output_ptrs
+        .iter()
+        .enumerate()
+        .map(|(slot, &ptr)| (ptr, slot))
+        .collect();
+
+    // Pass 2: value use counts and asm-goto edge counts.
+    let mut use_counts: FxHashMap<u32, u32> = FxHashMap::default();
+    let mut asm_edge_counts: FxHashMap<crate::ir::reexports::BlockId, u32> = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            for_each_operand_in_instruction(inst, |op| {
+                if let Operand::Value(value) = op {
+                    *use_counts.entry(value.0).or_insert(0) += 1;
+                }
+            });
+            if let Instruction::InlineAsm { goto_labels, .. } = inst {
+                for (_, label) in goto_labels {
+                    *asm_edge_counts.entry(*label).or_insert(0) += 1;
+                }
+            }
+        }
+        for_each_operand_in_terminator(&block.terminator, |op| {
+            if let Operand::Value(value) = op {
+                *use_counts.entry(value.0).or_insert(0) += 1;
+            }
+        });
+    }
+
+    let label_to_idx = crate::ir::analysis::build_label_map(func);
+    let (preds, _) = crate::ir::analysis::build_cfg(func, &label_to_idx);
+    let mut fallthrough_fusions: FxHashMap<u32, String> = FxHashMap::default();
+    let mut certified_dests: FxHashSet<u32> = FxHashSet::default();
+    let mut label_fusions: Vec<(u32, &'static str, u32)> = Vec::new();
+    let mut target_edges: Vec<(usize, crate::ir::reexports::BlockId, u32, &'static str)> =
+        Vec::new();
+
+    for (source_idx, block) in func.blocks.iter().enumerate() {
+        for (inst_idx, inst) in block.instructions.iter().enumerate() {
+            let Instruction::InlineAsm {
+                outputs,
+                goto_labels,
+                ..
+            } = inst
+            else {
+                continue;
+            };
+            if outputs.len() != 1 || goto_labels.is_empty() {
+                continue;
+            }
+            let (constraint, output_ptr, _) = &outputs[0];
+            let Some(entry) = asm_cc_output_suffix(constraint) else {
+                continue;
+            };
+            let jcc = entry.jcc;
+            for (_, target) in goto_labels {
+                target_edges.push((source_idx, *target, output_ptr.0, jcc));
+            }
+
+            // Fall-through edge: the output's first load is the sole input to
+            // this block's CondBranch, with no intervening IR instruction.
+            if let (
+                Some(Instruction::Load {
+                    dest,
+                    ptr,
+                    ty,
+                    volatile: false,
+                    ..
+                }),
+                Terminator::CondBranch {
+                    cond: Operand::Value(branch_value),
+                    ..
+                },
+            ) = (block.instructions.get(inst_idx + 1), &block.terminator)
+            {
+                if *ptr == *output_ptr
+                    && matches!(*ty, IrType::I8 | IrType::U8)
+                    && *branch_value == *dest
+                    && use_counts.get(&dest.0) == Some(&1)
+                {
+                    fallthrough_fusions.insert(dest.0, jcc.to_string());
+                    certified_dests.insert(dest.0);
+                }
+            }
+        }
+    }
+
+    // A label-edge branch may reuse flags only when this asm-goto is its sole
+    // possible asm predecessor AND the target has exactly that one CFG
+    // predecessor. This rejects multiple asm sites to one label and ordinary
+    // C gotos that would arrive with unrelated condition flags.
+    for (source_idx, target, output_ptr, cc) in target_edges {
+        if asm_edge_counts.get(&target) != Some(&1) {
+            continue;
+        }
+        let Some(&target_idx) = label_to_idx.get(&target) else {
+            continue;
+        };
+        let predecessors = preds.row(target_idx);
+        if predecessors.len() != 1 || predecessors[0] as usize != source_idx {
+            continue;
+        }
+        let target_block = &func.blocks[target_idx];
+        let first = target_block
+            .instructions
+            .iter()
+            .find(|inst| !matches!(inst, Instruction::Phi { .. }));
+        if let (
+            Some(Instruction::Load {
+                dest,
+                ptr,
+                ty,
+                volatile: false,
+                ..
+            }),
+            Terminator::CondBranch {
+                cond: Operand::Value(branch_value),
+                ..
+            },
+        ) = (first, &target_block.terminator)
+        {
+            if ptr.0 == output_ptr
+                && matches!(*ty, IrType::I8 | IrType::U8)
+                && *branch_value == *dest
+                && use_counts.get(&dest.0) == Some(&1)
+            {
+                label_fusions.push((dest.0, cc, output_ptr));
+                certified_dests.insert(dest.0);
+            }
+        }
+    }
+
+    // Suppress the setcc and output stores only if every IR access to this
+    // output object is one of the certified branch loads. Any address escape,
+    // extra read/write, volatile access, or second asm output keeps the normal
+    // output materialization path.
+    let mut verdicts = vec![(0u32, 0u32, true); ptr_slot.len()];
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            match inst {
+                Instruction::InlineAsm {
+                    outputs, inputs, ..
+                } => {
+                    for (_, ptr, _) in outputs {
+                        if let Some(&slot) = ptr_slot.get(&ptr.0) {
+                            verdicts[slot].0 += 1;
+                        }
+                    }
+                    for (_, op, _) in inputs {
+                        if let Operand::Value(value) = op {
+                            if let Some(&slot) = ptr_slot.get(&value.0) {
+                                verdicts[slot].2 = false;
+                            }
+                        }
+                    }
+                }
+                Instruction::Load {
+                    dest,
+                    ptr,
+                    volatile,
+                    ..
+                } => {
+                    if let Some(&slot) = ptr_slot.get(&ptr.0) {
+                        if *volatile || !certified_dests.contains(&dest.0) {
+                            verdicts[slot].2 = false;
+                        } else {
+                            verdicts[slot].1 += 1;
+                        }
+                    }
+                }
+                _ => for_each_operand_in_instruction(inst, |op| {
+                    if let Operand::Value(value) = op {
+                        if let Some(&slot) = ptr_slot.get(&value.0) {
+                            verdicts[slot].2 = false;
+                        }
+                    }
+                }),
+            }
+        }
+        for_each_operand_in_terminator(&block.terminator, |op| {
+            if let Operand::Value(value) = op {
+                if let Some(&slot) = ptr_slot.get(&value.0) {
+                    verdicts[slot].2 = false;
+                }
+            }
+        });
+    }
+    let mut elidable_output_ptrs: FxHashSet<u32> = FxHashSet::default();
+    for (&output_ptr, &slot) in &ptr_slot {
+        let (output_defs, branch_loads, safe) = verdicts[slot];
+        if safe && output_defs == 1 && branch_loads > 0 {
+            elidable_output_ptrs.insert(output_ptr);
+        }
+    }
+
+    // Keep every fall-through fusion: its load is the *next* instruction and the
+    // branch is that block's terminator, so no instruction at all can sit
+    // between the template's flags and the fused test. Keep a label-edge fusion
+    // only when the output object carries no store anywhere; otherwise the
+    // synthetic edge block materialises outputs and transfers control, and the
+    // fused branch would consume flags produced by that path rather than by the
+    // template. Gating here makes the "store preserves EFLAGS" property
+    // unnecessary instead of merely true today, so teaching
+    // `store_output_from_reg` a flag-writing fixup cannot silently break it.
+    let mut result = fallthrough_fusions;
+    for (dest, cc, output_ptr) in label_fusions {
+        if elidable_output_ptrs.contains(&output_ptr) {
+            result.insert(dest, cc.to_string());
+        }
+    }
+    (result, elidable_output_ptrs)
+}
+
 /// Per-site sibling-call shape (TODO-3 / §5b): the block's LAST
 /// instruction is a call whose dest is returned verbatim by the block's
 /// `Return` terminator with no other use anywhere in the function
@@ -4319,6 +4592,9 @@ fn collect_symbol_sets(cg: &mut dyn ArchCodegen, module: &IrModule) {
     state
         .extern_function_symbols
         .extend(module.extern_function_symbols.iter().cloned());
+    state
+        .noplt_symbols
+        .extend(module.noplt_symbols.iter().cloned());
     for func in &module.functions {
         if !func.is_declaration {
             state.defined_symbols.insert(func.name.clone());
@@ -4619,6 +4895,12 @@ fn emit_functions_and_sections(
     ipa_reorder: bool,
 ) {
     let function_sections = cg.state().function_sections;
+    let max_block_id = module
+        .functions
+        .iter()
+        .flat_map(|func| func.blocks.iter().map(|block| block.label.0))
+        .max();
+    cg.state().reserve_synthetic_block_ids_after(max_block_id);
     if !function_sections {
         cg.state().emit(".text");
         cg.state().current_text_section = ".text".to_string();
@@ -5161,6 +5443,11 @@ fn generate_function_body(
     let func_sect = function_text_section(func, function_sections, func_retain);
 
     cg.state().reset_for_function();
+    if cg.supports_asm_cc_branch_fusion() {
+        let (branch_values, output_ptrs) = collect_asm_goto_cc_branch_values(func);
+        cg.state().asm_cc_branch_values = branch_values;
+        cg.state().asm_cc_branch_output_ptrs = output_ptrs;
+    }
 
     let dump_ir = cg.state_ref().ra_config.dump_ir;
     let dump_ir_func = cg.state_ref().ra_config.dump_ir_func.clone();
@@ -6826,6 +7113,7 @@ fn generate_function_body(
         cg.state().current_program_point += 1;
     }
 
+    cg.emit_pending_asm_goto_trampolines();
     if emit_cfi {
         cg.state().emit(".cfi_endproc");
     }
@@ -7033,11 +7321,23 @@ fn generate_instruction_body(
     if !matches!(inst, Instruction::Cmp { .. } | Instruction::Cast { .. }) {
         cg.flush_pending_widen();
     }
+    // The direct asm-goto flag branch consumes EFLAGS rather than the loaded
+    // boolean. Its stack store remains observable to other program state, but
+    // this one-use Load has no machine result to materialize.
+    let asm_cc_load_elided = matches!(
+        inst,
+        Instruction::Load { dest, .. }
+            if cg.state_ref().asm_cc_branch_values.contains_key(&dest.0)
+    );
     // Captured up front: the destination this instruction defines, so the
     // home-freshness note below cannot be skipped by any early return
     // inside the dispatch arms (the inline-memcpy/memset Call arms return
     // early with the result value already materialised).
-    let defined_dest = inst.dest();
+    let defined_dest = if asm_cc_load_elided {
+        None
+    } else {
+        inst.dest()
+    };
     // Diagnostic ([IRW], env-gated): watch instructions mentioning specific
     // value ids (`CCC_DEBUG_IR_VALS=312,384`), or every instruction
     // (`CCC_DEBUG_IR_VALS=ALL`). Cache the watch list once: the driver
@@ -7161,19 +7461,21 @@ fn generate_instruction_body(
             // explicit discard is not written instead.
             volatile: _,
         } => {
-            generate_load(
-                cg,
-                dest,
-                ptr,
-                *ty,
-                *seg_override,
-                gep_fold_map,
-                indexed_gep_map,
-                global_addr_map,
-                reg_off_sym_map,
-                dead_global_addrs,
-                const_addr_vals,
-            );
+            if !asm_cc_load_elided {
+                generate_load(
+                    cg,
+                    dest,
+                    ptr,
+                    *ty,
+                    *seg_override,
+                    gep_fold_map,
+                    indexed_gep_map,
+                    global_addr_map,
+                    reg_off_sym_map,
+                    dead_global_addrs,
+                    const_addr_vals,
+                );
+            }
         }
         Instruction::BinOp {
             dest,
