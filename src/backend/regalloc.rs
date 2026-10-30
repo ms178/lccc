@@ -4413,6 +4413,25 @@ fn find_overlapping_classes(
     overlapping_class_spans(spans)
 }
 
+/// The function's predecessor and successor adjacencies, built once per
+/// register allocation and reused across the whole phi-coalesce candidate
+/// loop.
+///
+/// Both the caller-saved window check and the source-home redefinition proof
+/// need CFG structure. Deriving it inside either check turned a linear scan
+/// into O(candidates x (V+E)) on every function, so both callers keep the
+/// cache in a local `Option` and pay for exactly one build.
+fn coalesce_cfg<'a>(
+    cache: &'a mut Option<(analysis::FlatAdj, analysis::FlatAdj)>,
+    func: &IrFunction,
+) -> (&'a analysis::FlatAdj, &'a analysis::FlatAdj) {
+    let (preds, succs) = cache.get_or_insert_with(|| {
+        let labels = analysis::build_label_map(func);
+        analysis::build_cfg(func, &labels)
+    });
+    (&*preds, &*succs)
+}
+
 pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllocResult {
     let has_builtin_setjmp = func.blocks.iter().any(|b| {
         b.instructions.iter().any(|i| {
@@ -4723,13 +4742,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             candidate.block_idx,
             candidate.copy_idx,
         ) > 0;
-        let (preds, succs) = {
-            let (preds, succs) = cfg.get_or_insert_with(|| {
-                let labels = analysis::build_label_map(func);
-                analysis::build_cfg(func, &labels)
-            });
-            (&*preds, &*succs)
-        };
+        let (preds, succs) = coalesce_cfg(&mut cfg, func);
         if !phi_window_clobbers_caller_saved(func, candidate, preds, succs)
             && !src_has_other_consumers
         {
@@ -13043,13 +13056,7 @@ fn apply_phi_coalesce_assignments_with_config(
             }
         }
 
-        let (preds, succs) = {
-            let (preds, succs) = cfg.get_or_insert_with(|| {
-                let label_to_idx = analysis::build_label_map(func);
-                analysis::build_cfg(func, &label_to_idx)
-            });
-            (&*preds, &*succs)
-        };
+        let (preds, succs) = coalesce_cfg(&mut cfg, func);
         if phi_window_clobbers_caller_saved(func, candidate, preds, succs)
             && !callee_saved.iter().any(|r| r.0 == reg.0)
         {
@@ -19201,12 +19208,16 @@ mod scalar_lane_class_tests {
     struct SplitLatchDiamondShape {
         old_phi_read: bool,
         middle_call: bool,
+        /// Redefine the phi destination inside the middle arm: the old value
+        /// is observed there, so the destructive update is unsound.
+        middle_redefines_dest: bool,
     }
 
     fn split_latch_diamond(shape: SplitLatchDiamondShape) -> IrFunction {
         let SplitLatchDiamondShape {
             old_phi_read,
             middle_call,
+            middle_redefines_dest,
         } = shape;
         use crate::common::types::AddressSpace;
         use crate::ir::reexports::IrCmpOp;
@@ -19236,6 +19247,12 @@ mod scalar_lane_class_tests {
             middle.push(Instruction::Call {
                 func: "strtol".into(),
                 info: crate::ir::reexports::CallInfo::default(),
+            });
+        }
+        if middle_redefines_dest {
+            middle.push(Instruction::Copy {
+                dest: Value(10),
+                src: Operand::Const(IrConst::I32(0)),
             });
         }
         let mut f = IrFunction::new("split_latch_diamond".into(), IrType::U32, vec![], false);
@@ -19368,6 +19385,106 @@ mod scalar_lane_class_tests {
             "a call on the middle arm is inside the destructive-update window"
         );
     }
+
+    /// Admission is worthless if the assignment never happens. Drive the
+    /// split-latch diamond through the apply phase and require the latch copy
+    /// to inherit the destination home.
+    #[test]
+    fn phi_coalesce_applies_across_split_latch_diamond() {
+        let f = split_latch_diamond(SplitLatchDiamondShape::default());
+        let liveness = compute_live_intervals(&f);
+        let iv_map = interval_map(&liveness);
+        let cands = detect_phi_coalesce_groups(&f, &liveness);
+        let cand = *cands
+            .iter()
+            .find(|c| c.phi_dest == 10 && c.backedge_src == 11)
+            .expect("the diamond must reach the candidate list");
+
+        let mut assignments = FxHashMap::default();
+        assignments.insert(10, PhysReg(1));
+        apply_phi_coalesce_assignments(
+            &f,
+            &liveness,
+            &iv_map,
+            &[cand],
+            &mut assignments,
+            &[PhysReg(1)],
+        );
+        assert_eq!(
+            assignments.get(&11).copied(),
+            Some(PhysReg(1)),
+            "the latch copy of a split-latch diamond must inherit the dest home: {assignments:?}"
+        );
+    }
+
+    /// The middle arm is INSIDE the destructive-update window. A caller-saved
+    /// home must not be inherited across a call there even though the source
+    /// also has a direct edge to the copy.
+    #[test]
+    fn phi_coalesce_refuses_caller_saved_home_over_diamond_middle_call() {
+        let f = split_latch_diamond(SplitLatchDiamondShape {
+            middle_call: true,
+            ..SplitLatchDiamondShape::default()
+        });
+        let liveness = compute_live_intervals(&f);
+        let iv_map = interval_map(&liveness);
+        let cands = detect_phi_coalesce_groups(&f, &liveness);
+        let cand = *cands
+            .iter()
+            .find(|c| c.phi_dest == 10 && c.backedge_src == 11)
+            .expect("a middle-arm call constrains the home, it does not remove the candidate");
+
+        let mut assignments = FxHashMap::default();
+        assignments.insert(10, PhysReg(14)); // %edi — caller-saved
+        apply_phi_coalesce_assignments(
+            &f,
+            &liveness,
+            &iv_map,
+            &[cand],
+            &mut assignments,
+            &[PhysReg(1)],
+        );
+        assert_eq!(
+            assignments.get(&11),
+            None,
+            "a middle-arm call must block caller-saved inheritance: {assignments:?}"
+        );
+
+        // The call preserves a callee-saved home, so that home stays legal.
+        let mut assignments = FxHashMap::default();
+        assignments.insert(10, PhysReg(1));
+        apply_phi_coalesce_assignments(
+            &f,
+            &liveness,
+            &iv_map,
+            &[cand],
+            &mut assignments,
+            &[PhysReg(1)],
+        );
+        assert_eq!(
+            assignments.get(&11).copied(),
+            Some(PhysReg(1)),
+            "a call-preserved home remains eligible: {assignments:?}"
+        );
+    }
+
+    /// A redefinition of the phi destination inside the middle arm observes
+    /// the old value, so the destructive update is unsound for this shape.
+    #[test]
+    fn phi_coalesce_refuses_diamond_that_redefines_the_dest_in_the_middle() {
+        let f = split_latch_diamond(SplitLatchDiamondShape {
+            middle_redefines_dest: true,
+            ..SplitLatchDiamondShape::default()
+        });
+        let liveness = compute_live_intervals(&f);
+        let cands = detect_phi_coalesce_groups(&f, &liveness);
+        assert!(
+            !cands
+                .iter()
+                .any(|c| c.phi_dest == 10 && c.backedge_src == 11),
+            "a middle-arm redefinition of the dest must refuse coalescing: {cands:?}"
+        );
+    }
 }
 
 /// Tests for the single definition of the phi-coalescer's chain shape.
@@ -19449,6 +19566,34 @@ mod phi_chain_shape_tests {
         let (preds, succs) = cfg_of(&f);
         assert_eq!(single_pred_chain(&preds, 0, 2), None);
         assert_eq!(phi_update_region(&preds, &succs, 0, 2), Some(vec![1]));
+    }
+
+    /// Every rejection condition in `phi_update_region` is exercised on its
+    /// own, so a future relaxation cannot pass by tripping a different check.
+    #[test]
+    fn split_latch_diamond_rejects_an_extra_source_successor() {
+        // 0 -> {1, 2, 3}, 1 -> 2, copy = 2: a third successor could reach the
+        // copy without entering the inspected middle arm.
+        let succs = analysis::FlatAdj::from_vecs_usize(&[vec![1, 2, 3], vec![2], vec![], vec![2]]);
+        let preds = analysis::FlatAdj::from_vecs_usize(&[vec![], vec![0], vec![0, 1, 3], vec![0]]);
+        assert_eq!(phi_update_region(&preds, &succs, 0, 2), None);
+    }
+
+    #[test]
+    fn split_latch_diamond_rejects_a_duplicate_direct_edge() {
+        // A malformed CFG whose source names the copy twice must not be read
+        // as "one direct edge plus one middle arm".
+        let succs = analysis::FlatAdj::from_vecs_usize(&[vec![2, 2], vec![2], vec![]]);
+        let preds = analysis::FlatAdj::from_vecs_usize(&[vec![], vec![0], vec![0, 1]]);
+        assert_eq!(phi_update_region(&preds, &succs, 0, 2), None);
+    }
+
+    #[test]
+    fn split_latch_diamond_rejects_a_middle_arm_that_leaves_the_copy() {
+        // The middle arm must converge on the copy and nowhere else.
+        let succs = analysis::FlatAdj::from_vecs_usize(&[vec![1, 2], vec![2, 3], vec![], vec![]]);
+        let preds = analysis::FlatAdj::from_vecs_usize(&[vec![], vec![0], vec![0, 1], vec![1]]);
+        assert_eq!(phi_update_region(&preds, &succs, 0, 2), None);
     }
 
     #[test]

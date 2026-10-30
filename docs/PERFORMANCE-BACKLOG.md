@@ -4,16 +4,27 @@ Keep unimplemented opportunities here only when a reproducible workload or
 assembly witness exists. Move completed work to its change review with measured
 results; do not turn unmeasured expectations into claims.
 
-## Split-latch diamond coalescing: exact witness closed
+## Split-latch diamond coalescing: shape implemented, reachability open
 
-The load-before-if/latch-copy case in `zlib_ng_slide_hash` is implemented and
-measured in [the S81 review](../engineering/FOLLOWUP-2026-10-30-phi-latch-diamond.md):
-S81/S80 is **0.9774543992** (CI95 [0.9719785956, 0.9790335418]) and
-S81/GCC is **0.8503659416** (CI95 [0.8418807346, 0.8571916937]) over 11
-output-checked batched rounds. Callgrind removes exactly one move per hash
-insert. Clang and ICX remain faster, so this is not a best-oracle result.
-Full diamonds and arbitrary multi-arm regions remain rejected; do not treat
-this exact proof as permission for broader coalescing or IV replacement.
+`phi_update_region` admits the load-before-if/latch-copy diamond
+`source -> {middle, copy}` with exact predecessor and successor counts. Full
+diamonds and arbitrary multi-arm regions remain rejected; this is not
+permission for broader coalescing or IV replacement.
+
+**Reachability is measured, not assumed.** The latch copy is a rename of an
+already-available value, so the current pipeline schedules it into the same
+block as its source definition. Every C shape probed (store arm, call arm,
+two-way merge) produced `source block == copy block` and took the pre-existing
+same-block path. The diamond is therefore covered by unit tests that build the
+CFG directly and by no execution fixture, and **no runtime gain is claimed for
+it in this tree**.
+
+The originating review reports S81/S80 **0.9774543992** (CI95
+[0.9719785956, 0.9790335418]) and S81/GCC **0.8503659416** (CI95
+[0.8418807346, 0.8571916937]) over 11 output-checked batched rounds, with one
+move removed per hash insert. Those numbers come from a pipeline that emitted
+the shape and are **not reproduced here**; treat them as the source review's
+evidence, not as a property of this commit.
 
 ## Unsigned saturating subtract: scalar work closed, extensions still proof-gated
 

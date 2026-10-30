@@ -1,9 +1,20 @@
-/* Destructive phi coalescing across a split-latch if diamond.
+/* Destructive phi coalescing around a conditional latch update.
  *
- * The incoming value is loaded before the if; both the store and skip arms
- * then reach the latch copy `last = h`.  Cover zero-trip, both arms, an old
- * phi read on the middle arm (which must refuse coalescing), and a call in
- * that arm (which constrains the register home).  Differential vs GCC.
+ * The incoming value is loaded before the if and copied to the phi at the
+ * latch. Three shapes are exercised: the plain update, an old-phi read on the
+ * store arm (which must refuse coalescing), and a call on that arm (which
+ * constrains the register home).  Zero-trip and both if arms are covered.
+ *
+ * SCOPE, measured rather than assumed: on this pipeline the latch copy is
+ * scheduled into the same block as its source definition, so these functions
+ * take the SAME-BLOCK coalescing path.  The `source -> {middle, copy}` diamond
+ * that `phi_update_region` also admits is not produced by the current C front
+ * end; it is covered by the `phi_coalesce_*split_latch_diamond*` unit tests,
+ * which construct the CFG directly.  This fixture is therefore an execution
+ * and differential-correctness guard for the same-block path, NOT a witness
+ * for the diamond -- do not read a diamond-specific claim out of it.
+ *
+ * Differential vs GCC.
  */
 #include <stdlib.h>
 
