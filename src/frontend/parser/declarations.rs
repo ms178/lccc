@@ -192,7 +192,7 @@ impl Parser {
         // Specifier-position applicability records are settled here, before
         // the declarator (parameters, post-declarator attributes) can add
         // unrelated entries to the pool.
-        let spec_attr_targets = std::mem::take(&mut self.attrs.parsing_attr_targets);
+        let mut spec_attr_targets = std::mem::take(&mut self.attrs.parsing_attr_targets);
 
         let (name, derived, decl_mode, decl_common, decl_aligned, _) =
             self.parse_declarator_with_attrs();
@@ -207,6 +207,32 @@ impl Parser {
         let declarator_base_restrict = self.attrs.declarator_base_restrict;
         let (post_ctor, post_dtor, post_mode, post_common, post_aligned, first_asm_reg) =
             self.parse_asm_and_attributes();
+        // Applicability is a property of the declaration, not of where the
+        // attribute was written: `int x __attribute__((noreturn));` is the
+        // same mistake as `__attribute__((noreturn)) int x;`, and GCC
+        // diagnoses both. Every position feeds one pool, and the verdict is
+        // taken once the declarator kind is known.
+        spec_attr_targets.extend(std::mem::take(&mut self.attrs.parsing_attr_targets));
+        self.check_attribute_targets(&type_spec, &derived, &spec_attr_targets, start);
+        // `cleanup` names a function to run when a *block* scope ends. A
+        // file-scope object never ends one, so GCC ignores the attribute
+        // there (measured: `'cleanup' attribute ignored`); the generic
+        // object/function rule cannot see the difference.
+        // Same location rule as the kind check above: GCC reports at the
+        // declaration, a leading attribute list included.
+        let decl_loc = match self.attrs.first_attr_span {
+            Some(attr) if attr.start < start.start => attr,
+            _ => start,
+        };
+        for (attr_name, _, _) in &spec_attr_targets {
+            if attr_name == "cleanup" {
+                self.diagnostics.warning_with_kind(
+                    "'cleanup' attribute ignored",
+                    decl_loc,
+                    crate::common::error::WarningKind::Attributes,
+                );
+            }
+        }
         let mode_kind = decl_mode.or(post_mode);
         let is_common = decl_common || post_common;
         // Merge alignment from _Alignas (type specifier), declarator attrs, and post-declarator attrs.
@@ -288,6 +314,7 @@ impl Parser {
         decl_attrs.set_stack_protect(is_stack_protect);
         decl_attrs.set_no_stack_protector(is_no_stack_protector);
         decl_attrs.set_retain(self.attrs.parsing_retain());
+        decl_attrs.set_noplt(self.attrs.parsing_noplt());
         decl_attrs.set_noinit(self.attrs.parsing_noinit());
         decl_attrs.set_persistent(self.attrs.parsing_persistent());
         decl_attrs.set_nocommon(self.attrs.parsing_nocommon());
@@ -431,7 +458,7 @@ impl Parser {
         // The specifier-position applicability records ride `decl_attrs`
         // from the spec parse; the kind check takes them.
         let recorded = std::mem::take(&mut decl_attrs.parsing_attr_targets);
-        self.check_attribute_targets(&type_spec, &derived, &recorded);
+        self.check_attribute_targets(&type_spec, &derived, &recorded, start);
         self.attrs.set_typedef(false); // function defs are never typedefs
         let (params, variadic, has_prototype) =
             if let Some(DerivedDeclarator::Function(p, v, has_prototype)) = derived.last() {
@@ -839,6 +866,8 @@ impl Parser {
     /// belong to the declaration specifiers are restored from DeclContext.
     fn clear_completed_declarator_attributes(&mut self) {
         self.attrs.set_weak(false);
+        self.attrs.first_attr_span = None;
+        self.attrs.set_noplt(false);
         self.attrs.parsing_alias_target = None;
         self.attrs.parsing_ifunc_target = None;
         self.attrs.parsing_target_clones = None;
@@ -876,13 +905,17 @@ impl Parser {
         // Placement-checked specifier attributes resolve against the first
         // declarator (the take also keeps records off later declarations).
         let recorded = std::mem::take(&mut ctx.attrs.parsing_attr_targets);
-        self.check_attribute_targets(&type_spec, &derived, &recorded);
+        self.check_attribute_targets(&type_spec, &derived, &recorded, start);
         let mut declarators = Vec::with_capacity(4);
         // Same snapshot rationale as parse_local_declaration: initializer
         // casts to segment-qualified pointers clear parsing_address_space
         // before Declaration::new would read it.
         let decl_addr_space = self.attrs.decl_address_space;
         let spec_maybe_unused = ctx.attrs.is_maybe_unused();
+        // `noplt` written among the declaration specifiers applies to every
+        // declarator of the statement (`__attribute__((noplt)) void f(), g();`
+        // marks both, measured against gcc-16.2.0).
+        let spec_noplt = ctx.attrs.is_noplt();
         let init = if self.consume_if(&TokenKind::Assign) {
             Some(self.parse_initializer())
         } else {
@@ -1104,6 +1137,7 @@ impl Parser {
                     da.set_const_attr(d_const_attr);
                     da.set_used(d_used);
                     da.set_maybe_unused(d_maybe_unused || spec_maybe_unused);
+                    da.set_noplt(spec_noplt);
                     da.set_fastcall(d_fastcall);
                     da.regparm = d_regparm;
                     da.alias_target = d_alias;
@@ -1146,6 +1180,16 @@ impl Parser {
                 self.attrs.parsing_noinline(),
             );
             self.attrs.set_noinline(false);
+            // A trailing attribute written on a later sibling is still a
+            // declaration-level verdict for GCC: `int a, b __attribute__
+            // ((noreturn));` warns once, at the declaration (measured). The
+            // first declarator was checked before this loop; each sibling's
+            // own placement records are settled here.
+            let sibling_records = std::mem::take(&mut self.attrs.parsing_attr_targets);
+            if !sibling_records.is_empty() {
+                let sibling_derived = last_decl.derived.clone();
+                self.check_attribute_targets(&type_spec, &sibling_derived, &sibling_records, start);
+            }
         }
 
         // Register typedef names
@@ -1244,6 +1288,8 @@ impl Parser {
         // an initializer can introduce attributes of its own.
         let spec_retain = self.attrs.parsing_retain();
         self.attrs.set_retain(false);
+        let spec_noplt = self.attrs.parsing_noplt();
+        self.attrs.set_noplt(false);
 
         // Snapshot the declaration's address space NOW: initializer parsing
         // can contain casts to segment-qualified pointers, and the abstract-
@@ -1301,7 +1347,7 @@ impl Parser {
             // declarators of the statement inherit the same verdict.
             let mut pending = spec_attr_targets_for_loop.take().unwrap_or_default();
             let recorded = std::mem::take(&mut pending);
-            self.check_attribute_targets(&type_spec, &derived, &recorded);
+            self.check_attribute_targets(&type_spec, &derived, &recorded, start);
             let l_object_space = self.attrs.declarator_object_space;
             let l_object_volatile = self.attrs.declarator_object_volatile;
             let l_pointer_const = self.attrs.parsing_pointer_const();
@@ -1366,6 +1412,7 @@ impl Parser {
                     da.set_constructor(self.attrs.parsing_constructor());
                     da.set_destructor(self.attrs.parsing_destructor());
                     da.set_weak(self.attrs.parsing_weak());
+                    da.set_noplt(spec_noplt);
                     da.set_fastcall(self.attrs.parsing_fastcall());
                     da.regparm = self.attrs.parsing_regparm;
                     da.set_naked(self.attrs.parsing_naked());
@@ -1394,6 +1441,10 @@ impl Parser {
             if self.attrs.parsing_retain() {
                 last_decl.attrs.set_retain(true);
                 self.attrs.set_retain(false);
+            }
+            if self.attrs.parsing_noplt() {
+                last_decl.attrs.set_noplt(true);
+                self.attrs.set_noplt(false);
             }
             if let Some(a) = post_init_aligned {
                 alignment = Some(alignment.map_or(a, |prev| prev.max(a)));

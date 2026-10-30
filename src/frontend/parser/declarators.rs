@@ -113,7 +113,10 @@ impl Parser {
 
         let mut pre_aligned: Option<usize> = None;
         let mut is_packed = false;
-        let (pre_packed, pre_align, _, _, _) = self.parse_gcc_attributes();
+        // `_spec` keeps the placement records for the declaration's
+        // `-Wattributes` verdict; the clearing variant is for attribute
+        // lists that belong to something other than a declaration.
+        let (pre_packed, pre_align, _, _, _) = self.parse_gcc_attributes_spec();
         is_packed = is_packed || pre_packed;
         if let Some(a) = pre_align {
             pre_aligned = Some(pre_aligned.map_or(a, |prev: usize| prev.max(a)));
@@ -304,6 +307,19 @@ impl Parser {
                     );
                     innermost_suffix_is_function = Some(true);
                     let (params, variadic, has_prototype) = self.parse_param_list();
+                    // `-Wstrict-prototypes`: `int f();` declares a function
+                    // but not a prototype. GCC's rule is about the
+                    // declaration, and it is dialect-sensitive: C23 makes
+                    // `()` a prototype, so the diagnostic disappears there
+                    // (measured against gcc-16: `-std=gnu17` warns,
+                    // `-std=c23` does not). The warning is off by default.
+                    if !has_prototype && !self.c23 {
+                        self.diagnostics.warning_with_kind(
+                            "function declaration isn't a prototype",
+                            open_paren,
+                            crate::common::error::WarningKind::StrictPrototypes,
+                        );
+                    }
                     outer_suffixes.push(DerivedDeclarator::Function(
                         params,
                         variadic,
@@ -317,7 +333,8 @@ impl Parser {
         // Combine using inside-out rule
         let combined = self.combine_declarator_parts(derived, inner_derived, outer_suffixes);
 
-        let (post_packed, post_aligned, mode_kind, has_common, _) = self.parse_gcc_attributes();
+        let (post_packed, post_aligned, mode_kind, has_common, _) =
+            self.parse_gcc_attributes_spec();
         is_packed = is_packed || post_packed;
         let aligned = match (pre_aligned, post_aligned) {
             (Some(a), Some(b)) => Some(a.max(b)),

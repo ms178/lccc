@@ -1527,6 +1527,55 @@ completion. `OPEN` means the acceptance criterion has not been met or tested;
 | GP-23 | PARTIAL | The ratchet gate landed: `check_macro_parity.py` pins the complete GNU23/x86-64 differential as three reviewed budgets (17 GCC-only, 33 LCCC-only, 34 value spellings), fails on any new divergence in either direction, and also fails on *stale* pins so the budgets can only move through a reviewed edit. Wired to CI next to the warning gates (gate-parity check green, 434 commands). Remaining: more targets/dialects (single target×dialect now) and converging the 34 value spellings. |
 | GP-24 | PARTIAL | Seven derived gzip/zlib-ng/Expat kernels passed bounded GCC/Clang/LCCC checks; compare256 covers four optimization levels, two ABIs and a detected mutation. Verified zlib-ng 2.3.3 configure/Make static builds passed upstream `alltests` under GCC and LCCC, followed by 48 cross-compiler roundtrips and 24 system-gzip decodes. Manually configured upstream Expat 2.9.0 passed 5,196 checks with GCC, Clang and LCCC libraries, including an LCCC-compiled runner. Its bounded paired benchmark on this VM measured LCCC/GCC median CPU-time ratio 1.3161 [1.3077, 1.3206], not a speedup. Expat configure/CMake/CTest, other configurations and kernel-style diagnostic matrices remain open. |
 
+**2026-10-30 progress (attribute applicability, `noplt`, two warning families).**
+
+* GP-01 — placement verdicts are now taken once per *declaration* instead of
+  per attribute position, matching GCC's rule that `int x __attribute__((noreturn));`
+  and `__attribute__((noreturn)) int x;` are the same mistake. Concretely:
+  specifier-position and post-declarator records survive to a single
+  declaration-level verdict; a trailing attribute on a later comma sibling
+  (`int a, b __attribute__((noreturn));`) is diagnosed too, which the previous
+  code dropped entirely. Verdicts report at the declaration's own location
+  (a leading `__attribute__` list included), which is what GCC prints
+  (`__attribute__((packed)) int x;` → column of the declaration, not of the
+  name). Two dedicated wordings measured and pinned: `'naked' attribute only
+  applies to functions`, `'noplt' attribute is only applicable on functions`.
+  Duplicate parser/sema verdicts are collapsed in `DiagnosticEngine::emit` on
+  (file, span, message), so the pooling cannot double-report. Remaining known
+  micro-divergence: when the attribute sits on a later *line* than the
+  declaration start, GCC's caret lands on that line's first token while LCCC
+  reports the declaration start; and `'x' attribute directive ignored`
+  (unknown names) still points at the name token. Both are recorded, not
+  silently accepted.
+* `noplt` is implemented rather than inventoried: `-Wattributes` was a false
+  positive on functions, and the semantic was missing. It is now a per-symbol
+  `-fno-plt`: calls dispatch through the GOT (`call *f@GOTPCREL(%rip)`),
+  verified byte-for-byte against gcc-16 on extern declarations, comma
+  siblings, post-declarator placement, block-scope declarations and
+  same-TU definitions (where GCC deliberately keeps the PLT call — so does
+  LCCC), plus leak controls proving the flag does not spread to neighbouring
+  declarations.
+* GP-09/GP-12 — `-Wdiv-by-zero` (default-on, `-Wall` label, `-Wno-`
+  effective) and `-Wstrict-prototypes` (opt-in, silent under `-std=c23`
+  because `()` is a prototype there) both match GCC's wording, gating and
+  diagnostic shape. `-Wdiv-by-zero` follows GCC's syntactic rule: it fires
+  inside `if (0)` and in both arms of a non-constant `?:`, but not for the
+  right operand of a deciding `&&`/`||`, the untaken arm of a constant `?:`,
+  or inside `sizeof`/`_Alignof`.
+* GP-22 — the option-effect ledger gained three rows (`-Wdiv-by-zero`,
+  `-Wstrict-prototypes`, `noplt`) and its priority set grew to 10; every row
+  was mutation-verified (removing the verdict fails the gate) and the
+  `-Wdiv-by-zero` row compares the warning *count* against GCC on seven
+  short-circuit/unevaluated shapes so the suppression rule cannot drift.
+* Stale claims corrected in this register: the GP-03 `retain` sentinel now
+  passes (measured: plain `__attribute__((retain))` → `.data.<name>`, flags
+  `WAR`, identical to gcc-16; `noinit`/`persistent` likewise), and
+  `-fstack-clash-protection` really does emit the probe loop for an 8 KiB
+  frame. `tests/regression/check_attribute_diagnostics.sh` had pinned the old
+  false negatives (`int x __attribute__((pure));` and friends expected silent,
+  while GCC warns); it now probes each attribute in a position GCC accepts and
+  keeps a separate misapplied class.
+
 The `ms_abi`, `retain`, and `interrupt` findings are correctness/ABI hazards,
 not performance opportunities. Independent `typeof` red-teaming also found
 wrong `__builtin_types_compatible_p` constants and eliminated volatile reads;

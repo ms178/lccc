@@ -218,6 +218,7 @@ const IMPLEMENTED: &[&str] = &[
     "nocommon",
     "noinit",
     "noinline",
+    "noplt",
     "noreturn",
     "optimize",
     "packed",
@@ -261,6 +262,7 @@ const TARGETS: &[(&str, AttributeTarget)] = &[
     ("pure", AttributeTarget::Function),
     ("naked", AttributeTarget::Function),
     ("gnu_inline", AttributeTarget::Function),
+    ("noplt", AttributeTarget::Function),
     ("packed", AttributeTarget::Record),
     ("cleanup", AttributeTarget::Object),
 ];

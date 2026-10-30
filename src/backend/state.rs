@@ -425,6 +425,10 @@ pub struct CodegenState {
     /// relocations, so default-visibility function pointers remain GOT-based
     /// in PIE even though ordinary extern data addresses may be direct.
     pub extern_function_symbols: FxHashSet<String>,
+    /// Symbols declared `__attribute__((noplt))` and left undefined here:
+    /// their calls must not be routed through a PLT stub. Per-symbol form of
+    /// the compiled-in `-fno-plt` (`no_plt`), which stays the blanket switch.
+    pub noplt_symbols: FxHashSet<String>,
     /// Compare-replay records: Cmp instructions whose boolean result is
     /// consumed by exactly one Select or CondBranch that is NOT adjacent to
     /// the Cmp (so pending-flag fusion cannot fire — an intervening ALU op
@@ -875,6 +879,7 @@ impl CodegenState {
             local_symbols: FxHashSet::default(),
             defined_symbols: FxHashSet::default(),
             extern_function_symbols: FxHashSet::default(),
+            noplt_symbols: FxHashSet::default(),
             cmp_replay: FxHashMap::default(),
             absolute_symbols: FxHashSet::default(),
             tls_symbols: FxHashSet::default(),
@@ -1511,10 +1516,15 @@ impl CodegenState {
     /// GOT under `-fno-plt` (`call *sym@GOTPCREL(%rip)` on x86-64,
     /// `call *sym@GOT[(%ebx)]` on i686).
     pub fn needs_got_call(&self, name: &str) -> bool {
-        if !self.no_plt || self.code_model_kernel || name.starts_with('.') {
+        if self.code_model_kernel || name.starts_with('.') {
             return false;
         }
         let base = name.split('@').next().unwrap_or(name);
+        // `-fno-plt` covers the whole translation unit; `noplt` names one
+        // callee. Both land on the same GOT-indirect call sequence.
+        if !self.no_plt && !self.noplt_symbols.contains(base) {
+            return false;
+        }
         if self.local_symbols.contains(base) {
             return false;
         }
@@ -1526,7 +1536,10 @@ impl CodegenState {
 
     /// Returns true if a function call needs PLT indirection in PIC mode.
     pub fn needs_plt(&self, name: &str) -> bool {
-        !self.no_plt && self.needs_got(name)
+        if self.no_plt || self.noplt_symbols.contains(name) {
+            return false;
+        }
+        self.needs_got(name)
     }
 
     /// Returns true if a symbol needs GOT indirection on AArch64.

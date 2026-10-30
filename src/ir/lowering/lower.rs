@@ -73,6 +73,10 @@ pub struct Lowerer {
     /// frontend/IR DCE. They are intentionally independent.
     pub(super) retained_function_decls: FxHashSet<String>,
     pub(super) used_function_decls: FxHashSet<String>,
+    /// Function names declared `__attribute__((noplt))`. Filtered against the
+    /// definitions of this unit once lowering is complete, because GCC only
+    /// honours the attribute for callees the unit does not define.
+    pub(super) noplt_decl_names: FxHashSet<String>,
     /// Set of function names declared with __attribute__((error("..."))) or __attribute__((warning("..."))).
     /// Calls to these functions should be treated as unreachable (they are compile-time assertion traps).
     pub(super) error_functions: FxHashSet<String>,
@@ -373,6 +377,7 @@ impl Lowerer {
             static_functions: FxHashSet::default(),
             retained_function_decls: FxHashSet::default(),
             used_function_decls: FxHashSet::default(),
+            noplt_decl_names: FxHashSet::default(),
             error_functions: FxHashSet::default(),
             diagnose_as_builtins: FxHashMap::default(),
             noreturn_functions: FxHashSet::default(),
@@ -946,6 +951,9 @@ impl Lowerer {
                         if declarator.attrs.is_used() {
                             self.used_function_decls.insert(declarator.name.clone());
                         }
+                        if declarator.attrs.is_noplt() {
+                            self.noplt_decl_names.insert(declarator.name.clone());
+                        }
                     }
                     // Collect __asm__("label") linker symbol redirects on function declarations.
                     // When a function declaration has __asm__("symbol"), calls to that function
@@ -1323,6 +1331,17 @@ impl Lowerer {
         self.module
             .extern_function_symbols
             .extend(extern_function_symbols);
+        // `noplt` is a call-site property, so only symbols this unit does not
+        // define need it: GCC emits an ordinary PLT call to a function defined
+        // in the same translation unit even when it carries the attribute
+        // (measured against gcc-16.2.0).
+        let noplt_symbols: Vec<String> = self
+            .noplt_decl_names
+            .iter()
+            .filter(|name| !self.defined_functions.contains(*name))
+            .map(|name| self.resolve_ref_name(name))
+            .collect();
+        self.module.noplt_symbols.extend(noplt_symbols);
 
         self.finalize_module_visibility();
         (self.module, self.diagnostics.into_inner())

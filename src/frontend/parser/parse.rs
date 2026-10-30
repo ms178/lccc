@@ -187,6 +187,11 @@ pub(super) mod parsed_attr_flag {
     pub const PERSISTENT: u64 = 1 << 35;
     /// `__attribute__((nocommon))` — tentative definition is not a common block.
     pub const NO_COMMON_ATTR: u64 = 1 << 36;
+    /// `__attribute__((noplt))` — calls to this function go through the GOT
+    /// instead of the PLT. Applies to the *declaration* being parsed; GCC only
+    /// honours it for functions not defined in the same translation unit
+    /// (measured 2026-10-30: a same-TU definition still gets `R_X86_64_PLT32`).
+    pub const NOPLT: u64 = 1 << 37;
     /// The storage-class specifiers a declaration carries (C11 6.7.1; GNU
     /// `auto` is NESTED_FN). `register` is not tracked.
     pub const STORAGE_CLASSES: u64 =
@@ -218,6 +223,12 @@ pub(super) struct ParsedDeclAttrs {
         crate::common::source::Span,
         super::attribute_registry::AttributeTarget,
     )>,
+    /// Location of the FIRST `__attribute__((...))` list of the declaration
+    /// being parsed. GCC reports every placement verdict at the declaration's
+    /// own location, which includes a leading attribute list: for
+    /// `__attribute__((noreturn)) int x;` it points at column 1, not at the
+    /// attribute or at `int` (measured on gcc-16.2.0).
+    pub(super) first_attr_span: Option<crate::common::source::Span>,
 
     /// `__seg_gs` or `__seg_fs` qualifier encountered.
     pub parsing_address_space: AddressSpace,
@@ -439,6 +450,14 @@ impl ParsedDeclAttrs {
     #[inline]
     pub fn set_retain(&mut self, v: bool) {
         self.set_flag(parsed_attr_flag::RETAIN, v)
+    }
+    #[inline]
+    pub fn parsing_noplt(&self) -> bool {
+        self.flags & parsed_attr_flag::NOPLT != 0
+    }
+    #[inline]
+    pub fn set_noplt(&mut self, v: bool) {
+        self.set_flag(parsed_attr_flag::NOPLT, v)
     }
     #[inline]
     pub fn parsing_noinit(&self) -> bool {
@@ -1625,7 +1644,8 @@ impl Parser {
     // === GCC extension helpers ===
 
     pub(super) fn skip_gcc_extensions(&mut self) {
-        let (_, aligned, _, _, _) = self.parse_gcc_attributes();
+        // `_spec`: records stay for the enclosing declaration's check.
+        let (_, aligned, _, _, _) = self.parse_gcc_attributes_spec();
         if let Some(a) = aligned {
             self.attrs.parsed_alignas =
                 Some(self.attrs.parsed_alignas.map_or(a, |prev| prev.max(a)));
@@ -1878,6 +1898,7 @@ impl Parser {
     ) -> (bool, Option<usize>, Option<ModeKind>, bool, Option<bool>) {
         let result = self.parse_gcc_attributes_inner();
         self.attrs.parsing_attr_targets.clear();
+        self.attrs.first_attr_span = None;
         result
     }
 
@@ -1895,6 +1916,7 @@ impl Parser {
                     self.advance();
                 }
                 TokenKind::LBracket if self.is_c23_attr_start() => {
+                    self.attrs.first_attr_span.get_or_insert(self.peek_span());
                     self.parse_c23_attribute_specifier(
                         &mut is_packed,
                         &mut aligned,
@@ -1904,6 +1926,7 @@ impl Parser {
                     );
                 }
                 TokenKind::Attribute => {
+                    self.attrs.first_attr_span.get_or_insert(self.peek_span());
                     self.advance();
                     if matches!(self.peek(), TokenKind::LParen) {
                         self.advance(); // outer (
@@ -2103,6 +2126,12 @@ impl Parser {
     /// placement-checked attribute either matches or warns exactly as GCC
     /// 16.2 does (measured phrasings, including `naked`'s dedicated wording
     /// and `const`/`pure` on a void-returning function).
+    ///
+    /// `start` is the declaration's own location and is what GCC reports for
+    /// every one of these verdicts, whichever position the attribute was
+    /// written in (measured: `int x __attribute__((noreturn));` and
+    /// `__attribute__((noreturn)) int x;` both point at the declaration).
+    #[track_caller]
     pub(super) fn check_attribute_targets(
         &mut self,
         type_spec: &TypeSpecifier,
@@ -2112,11 +2141,29 @@ impl Parser {
             crate::common::source::Span,
             attribute_registry::AttributeTarget,
         )],
+        start: crate::common::source::Span,
     ) {
         use super::attribute_registry::AttributeTarget;
+        if std::env::var("LCCC_ATTR_DEBUG").is_ok() {
+            eprintln!(
+                "[attr] {} {:?}",
+                std::panic::Location::caller(),
+                recorded
+                    .iter()
+                    .map(|(n, _, t)| format!("{n}:{t:?}"))
+                    .collect::<Vec<_>>()
+            );
+        }
         if recorded.is_empty() {
             return;
         }
+        // GCC's location for these verdicts is the declaration; a leading
+        // attribute list is part of it, so the earliest list wins when it
+        // starts before the specifier.
+        let start = match self.attrs.first_attr_span {
+            Some(attr) if attr.start < start.start => attr,
+            _ => start,
+        };
         // The final derived layer names the declaration kind: `void *f(int)`
         // is a function, while `int (*fp)(void)` is an object. This also
         // covers glibc's pointer-returning `__gnu_inline__` prototypes.
@@ -2132,11 +2179,11 @@ impl Parser {
         let is_typedef = matches!(type_spec, TypeSpecifier::TypedefName(_));
         let returns_void = matches!(type_spec, TypeSpecifier::Void)
             && crate::frontend::parser::ast::DerivedDeclarator::return_pointer_depth(derived) == 0;
-        for (name, span, target) in recorded {
+        for (name, _span, target) in recorded {
             if returns_void && is_function && matches!(name.as_str(), "const" | "pure") {
                 self.diagnostics.warning_with_kind(
                     format!("\'{name}\' attribute on function returning 'void'"),
-                    *span,
+                    start,
                     crate::common::error::WarningKind::Attributes,
                 );
                 continue;
@@ -2148,15 +2195,17 @@ impl Parser {
                 AttributeTarget::Record => is_record || is_typedef,
             };
             if !ok {
-                let message = if name == "naked" {
-                    // GCC's dedicated wording (measured on gcc-16.2.0).
-                    format!("\'{name}\' attribute only applies to functions")
-                } else {
-                    format!("\'{name}\' attribute ignored")
+                // Two names have dedicated wordings, both measured on
+                // gcc-16.2.0; every other misapplied attribute reuses the
+                // generic sentence.
+                let message = match name.as_str() {
+                    "naked" => format!("\'{name}\' attribute only applies to functions"),
+                    "noplt" => format!("\'{name}\' attribute is only applicable on functions"),
+                    _ => format!("\'{name}\' attribute ignored"),
                 };
                 self.diagnostics.warning_with_kind(
                     message,
-                    *span,
+                    start,
                     crate::common::error::WarningKind::Attributes,
                 );
             }
@@ -2282,6 +2331,15 @@ impl Parser {
             //   persistent-> `.persistent` (PROGBITS); diagnosed on an uninitialized one
             "retain" | "__retain__" => {
                 self.attrs.set_retain(true);
+                self.advance();
+            }
+            // `noplt` is a property of the *callee*: it selects a GOT-indirect
+            // call sequence for that symbol instead of a PLT stub. Recorded on
+            // the declaration and honoured by the backends through
+            // `BackendState::noplt_symbols`; GCC keeps it silent in every
+            // placement `TARGETS` allows.
+            "noplt" | "__noplt__" => {
+                self.attrs.set_noplt(true);
                 self.advance();
             }
             "noinit" | "__noinit__" => {

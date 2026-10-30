@@ -924,6 +924,9 @@ pub mod decl_attr_flag {
     /// `__attribute__((nocommon))` — a tentative definition goes to `.bss`
     /// instead of a common block, whatever `-fcommon` says.
     pub const NO_COMMON_ATTR: u32 = 1 << 19;
+    /// `__attribute__((noplt))` — calls to this function are dispatched
+    /// through the GOT rather than the PLT (`-fno-plt` for one symbol).
+    pub const NOPLT: u32 = 1 << 20;
 }
 
 impl DeclAttributes {
@@ -1008,6 +1011,14 @@ impl DeclAttributes {
     #[inline]
     pub fn set_noinit(&mut self, v: bool) {
         self.set_flag(decl_attr_flag::NOINIT, v)
+    }
+    #[inline]
+    pub fn is_noplt(&self) -> bool {
+        self.flags & decl_attr_flag::NOPLT != 0
+    }
+    #[inline]
+    pub fn set_noplt(&mut self, v: bool) {
+        self.set_flag(decl_attr_flag::NOPLT, v)
     }
     #[inline]
     pub fn is_persistent(&self) -> bool {

@@ -42,6 +42,23 @@ FIXTURES = {
     "attr.c": "__attribute__((nosuchattr)) int attr_probe(void) { return 0; }\n",
     "cov.c": "int cov_probe(int x) { return x + 1; }\n",
     "se.c": "int se_probe(int x) { int y = ({ int t = x; t + 1; }); return y; }\n",
+    "div.c": "int div_probe(void) { return 1 / 0; }\n",
+    "divquiet.c": (
+        "extern int u(void);\n"
+        "int q1(void) { return 0 && 1 / 0; }\n"      # never evaluated
+        "int q2(void) { return 1 || 1 / 0; }\n"      # never evaluated
+        "int q3(void) { return 0 ? 1 / 0 : 2; }\n"   # untaken arm
+        "int w1(void) { return u() && 1 / 0; }\n"    # may be evaluated
+        "int w2(int x) { return x ? 1 / 0 : 2; }\n"  # may be evaluated
+        "int w3(void) { if (0) { return 1 / 0; } return 0; }\n"  # syntactic
+        "int q4(void) { return (int)sizeof(int[1 / 0]); }\n"     # unevaluated
+    ),
+    "proto.c": "int proto_probe();\n",
+    "noplt.c": (
+        "extern void nf(void) __attribute__((noplt));\n"
+        "extern void pf(void);\n"
+        "void uses(void) { nf(); pf(); }\n"
+    ),
     "main.c": "int main(void) { return 0; }\n",
 }
 
@@ -50,6 +67,9 @@ PRIORITY_SET = (
     "-fprofile-arcs",
     "-ftest-coverage",
     "-Wattributes",
+    "-Wdiv-by-zero",
+    "-Wstrict-prototypes",
+    "noplt",
     "-Ofast",
     "-Og",
     "-static-pie",
@@ -111,6 +131,10 @@ def main() -> int:
         cov = base / "cov.c"
         se = base / "se.c"
         main_c = base / "main.c"
+        div_c = base / "div.c"
+        div_quiet_c = base / "divquiet.c"
+        proto_c = base / "proto.c"
+        noplt_c = base / "noplt.c"
 
         # --- effect: -fwhole-program internalises (GP-16's verified row) ---
         need("-fwhole-program")
@@ -198,6 +222,70 @@ def main() -> int:
                 failures.append(f"-Wattributes: {tag} diagnostic missing: {proc.stderr[:200]!r}")
         if not any(f.startswith("-Wattributes") for f in failures):
             print("ledger -Wattributes: PASS (fires [-Wattributes] in both compilers)")
+
+        # --- diagnostic: -Wdiv-by-zero (on with -Wall, gcc's own label) -----
+        need("-Wdiv-by-zero")
+        for compiler, tag in ((gcc, "GCC"), (lccc, "LCCC")):
+            proc = run(compiler, "-fsyntax-only", "-Wall", str(div_c), cwd=base)
+            if "division by zero" not in proc.stderr or "[-Wdiv-by-zero]" not in proc.stderr:
+                failures.append(
+                    f"-Wdiv-by-zero: {tag} diagnostic missing: {proc.stderr[:200]!r}"
+                )
+        # The negation has to undo it: a warning that cannot be switched off
+        # is not a warning.
+        off = run(lccc, "-fsyntax-only", "-Wall", "-Wno-div-by-zero", str(div_c), cwd=base)
+        if "division by zero" in off.stderr:
+            failures.append("-Wno-div-by-zero: LCCC ignored the negation")
+        # The verdict is syntactic -- it fires inside `if (0)` -- but it
+        # honours `&&`, `||`, `?:` with a deciding constant and unevaluated
+        # operands exactly as GCC does. All three of those silence it, and the
+        # may-be-evaluated shapes still fire, so both compilers must count the
+        # same three warnings in this fixture.
+        counts = {}
+        for compiler, tag in ((gcc, "GCC"), (lccc, "LCCC")):
+            proc = run(compiler, "-fsyntax-only", "-Wall", str(div_quiet_c), cwd=base)
+            counts[tag] = proc.stderr.count("division by zero")
+        if counts["GCC"] != 3:
+            failures.append(f"-Wdiv-by-zero: GCC shape drift: {counts['GCC']} verdicts")
+        if counts["LCCC"] != counts["GCC"]:
+            failures.append(f"-Wdiv-by-zero: LCCC {counts['LCCC']} verdicts, GCC {counts['GCC']}")
+        if not any(f.startswith("-Wdiv-by-zero") or f.startswith("-Wno-div") for f in failures):
+            print("ledger -Wdiv-by-zero: PASS (fires under -Wall, -Wno- silences, "
+                  "short-circuit/unevaluated shapes match GCC)")
+
+        # --- diagnostic: -Wstrict-prototypes (off by default, C23 silent) ---
+        need("-Wstrict-prototypes")
+        for compiler, tag in ((gcc, "GCC"), (lccc, "LCCC")):
+            proc = run(
+                compiler, "-std=gnu17", "-fsyntax-only", "-Wstrict-prototypes",
+                str(proto_c), cwd=base,
+            )
+            if "isn't a prototype" not in proc.stderr or "[-Wstrict-prototypes]" not in proc.stderr:
+                failures.append(
+                    f"-Wstrict-prototypes: {tag} diagnostic missing: {proc.stderr[:200]!r}"
+                )
+        # C23 makes `()` a prototype, so GCC itself falls silent there; so must
+        # we, and the warning must stay off without an explicit request.
+        for compiler, tag in ((gcc, "GCC"), (lccc, "LCCC")):
+            c23 = run(
+                compiler, "-std=c23", "-fsyntax-only", "-Wstrict-prototypes",
+                str(proto_c), cwd=base,
+            )
+            if "isn't a prototype" in c23.stderr:
+                failures.append(f"-Wstrict-prototypes: {tag} warns under -std=c23")
+        default_off = run(lccc, "-std=gnu17", "-fsyntax-only", str(proto_c), cwd=base)
+        if "isn't a prototype" in default_off.stderr:
+            failures.append("-Wstrict-prototypes: on without an explicit request")
+        if not any(f.startswith("-Wstrict-prototypes") for f in failures):
+            print("ledger -Wstrict-prototypes: PASS (opt-in, C23-silent, gcc's label)")
+
+        # --- effect: noplt dispatches one callee through the GOT -----------
+        need("noplt")
+        noplt_asm = asm(lccc, noplt_c, "-O2")
+        if "call *nf@GOTPCREL(%rip)" not in noplt_asm or "@PLT" not in noplt_asm:
+            failures.append(f"noplt: call sequence wrong: {noplt_asm[-200:]!r}")
+        else:
+            print("ledger noplt: PASS (GOT call for the marked callee, PLT for the other)")
 
         # --- diagnostic: -pedantic accepts and acts (GP-10) ----------------
         need("-pedantic")

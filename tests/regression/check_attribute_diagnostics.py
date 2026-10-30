@@ -59,6 +59,10 @@ PROBES = [
      "'target' attribute ignored", False),
     ('naked-int', 'int __attribute__((naked)) x;',
      "'naked' attribute only applies to functions", False),
+    ('noplt-int', 'int __attribute__((noplt)) x;',
+     "'noplt' attribute is only applicable on functions", False),
+    ('noplt-int-post', 'int x __attribute__((noplt));',
+     "'noplt' attribute is only applicable on functions", False),
     ('const-int', 'int __attribute__((const)) x;',
      "'const' attribute ignored", False),
     ('pure-int', 'int __attribute__((pure)) x;',
@@ -70,6 +74,7 @@ PROBES = [
     # accepted forms: gcc silent, lccc silent (inventory stays behind -W)
     ('ok-struct-packed', 'struct __attribute__((packed)) S{int a;};', None, False),
     ('ok-fn-noreturn', 'void __attribute__((noreturn)) h(void){}', None, False),
+    ('ok-fn-noplt', 'void __attribute__((noplt)) n(void){}', None, False),
     ('ok-int-aligned', 'int __attribute__((aligned(8))) x;', None, False),
     ('ok-fn-cold', 'void __attribute__((cold)) c(void){}', None, False),
     ('ok-format-default', '__attribute__((format(printf,1,2))) void g(const char*,...);', None, False),
@@ -132,7 +137,7 @@ may_alias ms_abi ms_hook_prologue ms_struct musttail no_address_safety_analysis
 no_callee_saved_registers no_caller_saved_registers no_icf no_profile_instrument_function
 no_reorder no_sanitize_address no_sanitize_coverage no_sanitize_thread no_split_stack
 no_stack_limit nocf_check noclone nodirect_extern_access noipa nonnull nonnull_if_nonzero
-nonstring noplt nothrow null_terminated_string_arg objc_nullability objc_root_class
+nonstring nothrow null_terminated_string_arg objc_nullability objc_root_class
 patchable_function_entry preserve_none reproducible returns_nonnull returns_twice sentinel
 signed_bool_precision simd sseregparm stdcall strict_flex_array strub sysv_abi tainted_args
 target_version thiscall transaction_callable transaction_may_cancel_outer transaction_pure

@@ -27,6 +27,12 @@ pub struct IrModule {
     /// PIE may use copy relocations for ordinary extern data, but no analogous
     /// mechanism makes an interposable extern function address PC-relative.
     pub extern_function_symbols: crate::common::fx_hash::FxHashSet<String>,
+    /// Functions declared `__attribute__((noplt))` and NOT defined in this
+    /// translation unit: calls to them must be dispatched through the GOT
+    /// instead of a PLT stub (`-fno-plt` for one symbol). GCC restricts the
+    /// attribute to that case too — a same-TU definition still gets a plain
+    /// `R_X86_64_PLT32` call (measured 2026-10-30).
+    pub noplt_symbols: crate::common::fx_hash::FxHashSet<String>,
     pub globals: Vec<IrGlobal>,
     pub string_literals: Vec<(String, String)>, // (label, value)
     /// Wide string literals (L"..."): (label, chars as u32 values including null terminator)
@@ -548,6 +554,7 @@ impl IrModule {
             function_alignments: crate::common::fx_hash::FxHashMap::default(),
             retained_functions: crate::common::fx_hash::FxHashSet::default(),
             extern_function_symbols: crate::common::fx_hash::FxHashSet::default(),
+            noplt_symbols: crate::common::fx_hash::FxHashSet::default(),
             globals: Vec::new(),
             string_literals: Vec::new(),
             wide_string_literals: Vec::new(),

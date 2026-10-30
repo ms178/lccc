@@ -112,6 +112,13 @@ pub enum WarningKind {
     /// Integer operands of a comparison have different signedness.
     /// GCC flag: -Wsign-compare (enabled by -Wextra for C).
     SignCompare,
+    /// An integer division or remainder has a constant zero divisor.
+    /// GCC flag: -Wdiv-by-zero (on by default in C, as GCC does).
+    DivByZero,
+    /// A function declaration without a parameter-type list: `int f();`.
+    /// GCC flag: -Wstrict-prototypes (off by default; C23 makes `()`
+    /// a prototype, so GCC stays silent there and so must we).
+    StrictPrototypes,
     /// A printf-family format string does not match its variadic arguments.
     /// GCC flag: -Wformat (enabled by -Wall).
     Format,
@@ -292,6 +299,22 @@ pub const WARNING_REGISTRY: &[WarningDescriptor] = &[
         [Extra],
         false,
         "mixed-sign integer comparison"
+    ),
+    warning!(
+        DivByZero,
+        "div-by-zero",
+        true,
+        [],
+        false,
+        "integer division or remainder by a constant zero"
+    ),
+    warning!(
+        StrictPrototypes,
+        "strict-prototypes",
+        false,
+        [],
+        false,
+        "function declaration without a parameter-type list"
     ),
     warning!(
         Format,
@@ -906,6 +929,15 @@ pub struct DiagnosticEngine {
     error_limit_noted: bool,
     /// Same latch for the warning cap (see `render_warning`).
     warning_limit_noted: bool,
+    /// Warnings already reported, keyed by (file, span, message hash).
+    ///
+    /// GCC reports one diagnostic per offending token, however many internal
+    /// paths notice the mistake. Two independent analyses of the same
+    /// declaration (the parser's placement check and the declaration-level
+    /// check) reach the same verdict on the same attribute; without this the
+    /// user sees the line twice. Warnings are therefore idempotent per
+    /// (span, message).
+    emitted_warnings: crate::common::fx_hash::FxHashSet<(u32, u32, u32, u64)>,
 }
 
 impl DiagnosticEngine {
@@ -951,7 +983,15 @@ impl DiagnosticEngine {
             last_include_trace_file: None,
             error_limit_noted: false,
             warning_limit_noted: false,
+            emitted_warnings: crate::common::fx_hash::FxHashSet::default(),
         }
+    }
+
+    fn message_hash(message: &str) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        message.hash(&mut hasher);
+        hasher.finish()
     }
 
     /// Render an error-severity diagnostic subject to `MAX_RENDERED_ERRORS`.
@@ -1045,6 +1085,17 @@ impl DiagnosticEngine {
     /// - If -Werror or -Werror=<name> applies, it is promoted to an error.
     /// - The GCC-style `[-W<name>]` suffix is appended to the message.
     pub fn emit(&mut self, diag: &Diagnostic) {
+        if diag.severity == Severity::Warning
+            && let Some(span) = diag.span
+            && !self.emitted_warnings.insert((
+                span.file_id,
+                span.start,
+                span.end,
+                Self::message_hash(&diag.message),
+            ))
+        {
+            return;
+        }
         // GCC suppresses diagnostics that come from a system header unless
         // -Wsystem-headers asks for them; the suppression applies to warnings
         // only. Without this, a project that merely includes <pthread.h>

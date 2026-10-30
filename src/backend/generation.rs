@@ -4319,6 +4319,9 @@ fn collect_symbol_sets(cg: &mut dyn ArchCodegen, module: &IrModule) {
     state
         .extern_function_symbols
         .extend(module.extern_function_symbols.iter().cloned());
+    state
+        .noplt_symbols
+        .extend(module.noplt_symbols.iter().cloned());
     for func in &module.functions {
         if !func.is_declaration {
             state.defined_symbols.insert(func.name.clone());
