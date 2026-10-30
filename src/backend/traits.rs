@@ -101,7 +101,13 @@ pub const MIN_JUMP_TABLE_DENSITY_PERCENT: usize = 40;
 ///
 /// The shared framework calls these methods during instruction dispatch.
 /// Each method should emit the appropriate assembly instructions.
-pub trait ArchCodegen {
+pub trait ArchCodegen: crate::backend::inline_asm::InlineAsmEmitter {
+    /// Whether this backend can branch directly on x86 condition flags carried
+    /// by an `asm goto` flag output.
+    fn supports_asm_cc_branch_fusion(&self) -> bool {
+        false
+    }
+
     /// Mutable access to the shared codegen state.
     fn state(&mut self) -> &mut CodegenState;
     /// Immutable access to the shared codegen state.
@@ -2120,6 +2126,34 @@ pub trait ArchCodegen {
             goto_labels,
             input_symbols,
         );
+    }
+
+    /// Emit the out-of-line output stores for asm-goto edges. The ordinary
+    /// fall-through path stores outputs immediately after the template; a
+    /// template branch skips those stores, so it targets one of these blocks.
+    fn emit_pending_asm_goto_trampolines(&mut self) {
+        let pending = std::mem::take(&mut self.state().pending_asm_goto_trampolines);
+        self.state().next_block_label = None;
+        for trampoline in pending {
+            self.state().reg_cache.invalidate_all();
+            self.state().emit_fmt(format_args!("{}:", trampoline.label));
+            let all_output_regs: Vec<String> = trampoline
+                .outputs
+                .iter()
+                .filter(|(_, _, constraint)| constraint.contains('=') || constraint.contains('+'))
+                .map(|(operand, _, _)| operand.reg.clone())
+                .collect();
+            let all_output_reg_refs: Vec<&str> =
+                all_output_regs.iter().map(String::as_str).collect();
+            for (operand, ptr, constraint) in &trampoline.outputs {
+                if constraint.contains('=') || constraint.contains('+') {
+                    self.store_output_from_reg(operand, ptr, constraint, &all_output_reg_refs);
+                }
+            }
+            self.state().reg_cache.invalidate_all();
+            self.emit_branch_to_block(trampoline.target);
+        }
+        debug_assert!(self.state().pending_asm_goto_trampolines.is_empty());
     }
 
     /// Emit a return terminator.

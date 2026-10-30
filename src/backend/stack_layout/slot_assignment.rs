@@ -766,6 +766,11 @@ fn classify_alloca(
 
     state.alloca_values.insert(dest.0);
     state.alloca_types.insert(dest.0, ty);
+    if state.asm_cc_branch_output_ptrs.contains(&dest.0) {
+        // The condition-code result is consumed only by certified branches;
+        // no machine output store or stack object survives that proof.
+        return;
+    }
     // The caller already created this callee-owned by-value object. Its
     // checked ABI alignment satisfies Alloca.align, including >16 alignment;
     // do not register a runtime align-up or reserve a second local object.

@@ -137,6 +137,12 @@ impl InlineAsmEmitter for X86Codegen {
         }
     }
 
+    fn can_store_condition_code_output_direct(&self, ptr: &Value, ty: IrType) -> bool {
+        matches!(ty, IrType::I8 | IrType::U8)
+            && self.state.get_slot(ptr.0).is_some()
+            && (self.state.is_alloca(ptr.0) || self.state.is_direct_slot(ptr.0))
+    }
+
     fn setup_operand_metadata(&self, op: &mut AsmOperand, val: &Operand, _is_output: bool) {
         if matches!(op.kind, AsmOperandKind::Memory) {
             if let Operand::Value(v) = val {
@@ -844,8 +850,26 @@ impl InlineAsmEmitter for X86Codegen {
         }
         // Handle =@cc<cond> condition code outputs: emit SETcc + movzbl
         if let AsmOperandKind::ConditionCode(ref cond) = op.kind {
+            if self.state.asm_cc_branch_output_ptrs.contains(&ptr.0) {
+                // Every read of this output is a branch proven to consume the
+                // live flags directly, so neither setcc nor a memory store is
+                // observable. The same proof applies in each output-edge
+                // trampoline.
+                return;
+            }
+            if matches!(op.operand_type, IrType::I8 | IrType::U8) {
+                if let Some(slot) = self.state.get_slot(ptr.0) {
+                    if self.state.is_alloca(ptr.0) || self.state.is_direct_slot(ptr.0) {
+                        let sr = self.slot_ref(slot.0);
+                        let x86_cond = Self::gcc_cc_to_x86(cond);
+                        self.state
+                            .emit_fmt(format_args!("    set{} {}", x86_cond, sr));
+                        return;
+                    }
+                }
+            }
             // `ptr` may be an address value with no stack slot (e.g., a
-            // register-resident pointer from cpuid.h's `__cpuid(level, *a, ...)`
+            // register-resident pointer from cpuid.h's `__cpuid(level, *a, ...)
             // pattern); store through it instead of silently dropping the
             // result. Emit SETcc + movzbl first, then the through-pointer store.
             if self.state.get_slot(ptr.0).is_none() {
@@ -866,9 +890,14 @@ impl InlineAsmEmitter for X86Codegen {
             let x86_cond = Self::gcc_cc_to_x86(cond);
             self.state
                 .emit_fmt(format_args!("    set{} %{}", x86_cond, reg8));
-            self.state
-                .out
-                .emit_instr_reg_reg("    movzbl", &reg8, &Self::reg_to_32(reg));
+            // A bool/U8 output is stored from its low byte directly. The
+            // zero-extension is needed only when the full register value is
+            // consumed; emitting it before `movb` is dead work.
+            if !matches!(op.operand_type, IrType::I8 | IrType::U8) {
+                self.state
+                    .out
+                    .emit_instr_reg_reg("    movzbl", &reg8, &Self::reg_to_32(reg));
+            }
             // Store the result (0 or 1) to the output variable
             if let Some(slot) = self.state.get_slot(ptr.0) {
                 let ty = op.operand_type;

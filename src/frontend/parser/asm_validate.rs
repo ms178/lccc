@@ -295,6 +295,7 @@ fn check_constraint(
 fn check_template(
     template: &str,
     operand_count: usize,
+    readwrite_count: usize,
     label_count: usize,
     problems: &mut Vec<Diagnostic>,
 ) {
@@ -337,15 +338,17 @@ fn check_template(
             // `%10` is not operand ten in GCC's x86 syntax: a single digit
             // follows the `%` (or the modifier), so only the first digit counts.
             let index: usize = template[start..start + 1].parse().unwrap_or(usize::MAX);
-            // `%lN` / `%LN` name a *label* of an `asm goto`, not an operand;
-            // GCC numbers them in a separate space that is empty for plain
-            // `asm`, so the bound is the operand count plus the label count.
-            let bound = if matches!(code, b'l' | b'L') {
-                operand_count + label_count
+            // A `+` output occupies an output position and an input position
+            // in GCC's label numbering, but LCCC's regular operand map keeps
+            // it as one operand. Label references start after this extra
+            // read/write position; ordinary `%N` references do not.
+            let out_of_range = if matches!(code, b'l' | b'L') {
+                let label_start = operand_count + readwrite_count;
+                index < label_start || index >= label_start + label_count
             } else {
-                operand_count
+                index >= operand_count
             };
-            if index >= bound {
+            if out_of_range {
                 problems.push(Diagnostic::error(
                     "invalid 'asm': operand number out of range",
                     None,
@@ -378,9 +381,14 @@ pub fn validate(
     // through their own substitution pass, so a valid aarch64/RISC-V template
     // must not be second-guessed here.
     if is_x86 && problems.iter().all(|p| !p.is_error) {
+        let readwrite_count = outputs
+            .iter()
+            .filter(|output| output.constraint.contains('+'))
+            .count();
         check_template(
             template,
             outputs.len() + inputs.len(),
+            readwrite_count,
             label_count,
             &mut problems,
         );
@@ -622,10 +630,37 @@ mod tests {
     }
 
     #[test]
+    fn asm_goto_label_indices_follow_readwrite_operand_numbering() {
+        // GCC positions the first label after both slots of a `+` output.
+        // The explicit input remains operand `%1` in the template mapping.
+        assert!(
+            validate(
+                "mov %0, %0; test %1, %1; jz %l3",
+                &[op("+r", Constness::Unknown)],
+                &[op("r", Constness::Unknown)],
+                1,
+                true,
+            )
+            .is_empty()
+        );
+        let p = validate(
+            "jmp %l2",
+            &[op("+r", Constness::Unknown)],
+            &[op("r", Constness::Unknown)],
+            1,
+            true,
+        );
+        assert_eq!(messages(&p), ["invalid 'asm': operand number out of range"]);
+    }
+
+    #[test]
     fn asm_goto_labels_are_not_operands() {
         // `asm goto("jmp %l0" :::: done)` names label 0, not operand 0.
         assert!(validate("jmp %l0", &[], &[], 1, true).is_empty());
         assert!(validate("jmp %l1", &[], &[], 2, true).is_empty());
+        let p = validate("jmp %l0", &[op("=r", Constness::Unknown)], &[], 1, true);
+        assert_eq!(messages(&p), ["invalid 'asm': operand number out of range"]);
+        assert!(validate("jmp %l1", &[op("=r", Constness::Unknown)], &[], 1, true).is_empty());
         let p = validate("jmp %l1", &[], &[], 1, true);
         assert_eq!(messages(&p), ["invalid 'asm': operand number out of range"]);
         // A plain `asm` labels nothing, so the same template is out of range.

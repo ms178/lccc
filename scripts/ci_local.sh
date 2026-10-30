@@ -2186,6 +2186,8 @@ gate "i686-boot-asm" fast \
 
 gate "asm-goto-phi-edge" fast \
     bash tests/regression/check_asm_goto_phi_edge.sh
+gate "asm-goto-outputs" fast \
+    bash tests/regression/check_asm_goto_outputs.sh
 gate "i686-label-ref-safety" fast \
     bash tests/regression/check_i686_label_ref_safety.sh
 

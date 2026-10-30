@@ -8235,6 +8235,10 @@ impl ArchCodegen for X86Codegen {
         Some(("#APP", "#NO_APP"))
     }
 
+    fn supports_asm_cc_branch_fusion(&self) -> bool {
+        true
+    }
+
     fn supports_switch_bounds(&self) -> bool {
         true
     }
