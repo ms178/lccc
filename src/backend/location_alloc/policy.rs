@@ -470,6 +470,11 @@ mod token_tests {
 
     #[test]
     fn opt_in_env_defaults_off_for_unset_and_honors_both_vocabularies() {
+        if !crate::test_support::env_isolate(
+            "backend::location_alloc::policy::token_tests::opt_in_env_defaults_off_for_unset_and_honors_both_vocabularies",
+        ) {
+            return;
+        }
         // `opt_in_env` reads the environment by contract, so this test mutates
         // it — behind the guard: one process-wide window per assertion, restored
         // even if one fails.  The bare `unsafe` block this replaces justified

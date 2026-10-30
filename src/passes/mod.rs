@@ -4194,6 +4194,11 @@ mod ivsr_scalar_derived_gate_tests {
 
     #[test]
     fn scalar_derived_ivsr_is_off_by_default() {
+        if !crate::test_support::env_isolate(
+            "passes::ivsr_scalar_derived_gate_tests::scalar_derived_ivsr_is_off_by_default",
+        ) {
+            return;
+        }
         // Unset environment: the measured-regression flavor stays off even
         // when IVSR itself runs.
         let _guard = EnvGuard::unset("CCC_IVSR_SCALAR_DERIVED");
@@ -4205,6 +4210,11 @@ mod ivsr_scalar_derived_gate_tests {
 
     #[test]
     fn scalar_derived_ivsr_opt_in_and_ivsr_gate() {
+        if !crate::test_support::env_isolate(
+            "passes::ivsr_scalar_derived_gate_tests::scalar_derived_ivsr_opt_in_and_ivsr_gate",
+        ) {
+            return;
+        }
         let _set = EnvGuard::set("CCC_IVSR_SCALAR_DERIVED", "1");
         assert!(
             ivsr_scalar_derived_enabled(true),

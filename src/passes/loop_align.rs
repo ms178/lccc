@@ -1302,6 +1302,11 @@ mod tests {
 
     #[test]
     fn unknown_tight_mode_knob_fails_closed_to_gcc_policy() {
+        if !crate::test_support::env_isolate(
+            "passes::loop_align::tests::unknown_tight_mode_knob_fails_closed_to_gcc_policy",
+        ) {
+            return;
+        }
         // `from_env` reads the environment by contract, so this test mutates it —
         // behind the guard, one assertion per window.  The bare `unsafe` block
         // this replaces claimed "single-threaded env mutation within this test",
