@@ -1032,6 +1032,27 @@ mod tests {
     }
 
     #[test]
+    fn plain_operand_numbers_reach_goto_labels() {
+        // Measured with `-S` on gcc 16.2: one flag output plus two inputs put
+        // the label at operand 3, and `%3` prints `$.L3` (the address) while
+        // `%l3` prints `.L3`.  The plain spelling used to be refused, so code
+        // that takes a goto label's address did not compile.
+        let outputs = [op("=@ccne", Constness::Unknown)];
+        let inputs = [op("r", Constness::Unknown), op("r", Constness::Unknown)];
+        assert!(validate("cmpl %1, %2; jmp %3", &outputs, &inputs, 1, true).is_empty());
+        assert!(validate("cmpl %1, %2; jmp %l3", &outputs, &inputs, 1, true).is_empty());
+        let p = validate("jmp %4", &outputs, &inputs, 1, true);
+        assert_eq!(messages(&p), ["invalid 'asm': operand number out of range"]);
+        // Both spellings skip the read-write slot: `"+r"(v) : "r"(x)` has
+        // operands 0/1 and its label is 3, never 2 (measured: gcc prints
+        // `plain=$.L3 named=.L3` and answers `%2` with "out of range").
+        let outputs = [op("+r", Constness::Unknown)];
+        let inputs = [op("r", Constness::Unknown)];
+        assert!(validate("jmp %3", &outputs, &inputs, 1, true).is_empty());
+        let p = validate("jmp %2", &outputs, &inputs, 1, true);
+        assert_eq!(messages(&p), ["invalid 'asm': operand number out of range"]);
+    }
+
     fn label_indices_are_multi_digit_like_gcc() {
         // Measured: with 13 inputs, `gcc -S` accepts `%l13` (it emits the
         // label's own name) and rejects `%l12`. Reading a single digit would
