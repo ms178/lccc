@@ -1639,29 +1639,6 @@ impl I686Codegen {
             IntrinsicOp::VecXorI8x16 => {
                 self.emit_vec_binop_i686(dest.clone(), args, "pxor", 1);
             }
-            // Typed `__builtin_shufflevector` 4x32->4 fast path
-            // (`lower_shufflevector`): one PSHUFD on the image. A missing
-            // arm here is not an ICE — the final x86-only arm is a no-op —
-            // so the store that follows would persist an unwritten slot
-            // (the typed-shuffle ABI gate caught exactly that).
-            IntrinsicOp::VecShufdI32x4 => {
-                let d = dest
-                    .clone()
-                    .expect("i686 VecShufdI32x4: value form expected");
-                assert!(args.len() == 2, "i686 VecShufdI32x4: expects image, imm");
-                let imm = match &args[1] {
-                    Operand::Const(c) => c.to_i64().unwrap_or(0xE4) as i32,
-                    other => panic!("i686 VecShufdI32x4: imm must be constant, got {:?}", other),
-                };
-                assert!(
-                    (0..=255).contains(&imm),
-                    "i686 VecShufdI32x4: imm8 out of range: {imm}"
-                );
-                self.vec_load_image(&args[0], "xmm0");
-                self.state
-                    .emit_fmt(format_args!("    pshufd ${:#x}, %xmm0, %xmm0", imm));
-                self.vec_store_result(&d, "xmm0");
-            }
             // Uniform-constant shifts: the frontend only emits in-range
             // immediates (0..lane_bits); 0 copies the image.
             IntrinsicOp::VecShlI16x8 => {

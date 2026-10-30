@@ -1,7 +1,7 @@
 {
   "fns_over_1000": 26,
-  "fns_over_300": 236,
-  "fns_over_500": 98,
+  "fns_over_300": 233,
+  "fns_over_500": 97,
   "ignored_tests": 10,
   "knob_literals": 544,
   "knob_names": [
@@ -550,8 +550,8 @@
     "LCCC_VOLATILE_SLOT",
     "LCCC_WHY_NOT_VECTORIZE"
   ],
-  "knobs_undocumented": 266,
-  "panic_sites": 941,
+  "knobs_undocumented": 265,
+  "panic_sites": 881,
   "panic_sites_hot": 101,
   "unsafe_sites": 25
 }
