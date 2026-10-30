@@ -25,9 +25,64 @@
 //! * an immediate constraint is checked only for the ranges that were
 //!   measured (`I J K M N O`), and only when the operand expression folds to a
 //!   constant or is provably not one. `e E L Z G H n` are left alone.
+//!
+//! ## Symbolic immediates are not "non-constant"
+//!
+//! GCC's `"i"` accepts a *link-time* constant, not only an integer folded at
+//! compile time: a function designator and a file-scope array designator
+//! satisfy `"i"` and `"s"` because the assembler is handed their symbol.  The
+//! same probe TU that accepts `"i"(fn)` rejects `"i"(global_int_object)`: the
+//! object's *value* is not its symbol, only its *address* is.  LCCC lumped
+//! both into `NonConstant` and therefore rejected the Linux kernel's own
+//! `arch/x86/include/asm/jump_label.h::arch_static_branch`, which is the
+//! construct every `static_branch_*()` in the tree expands to:
+//!
+//! ```c
+//! asm goto("... .quad %c0 + %c1 - . ..." : : "i" (key), "i" (branch) : : l_yes);
+//! ```
+//!
+//! The `Symbolic` class below closes exactly that gap.  It is *not* a blanket
+//! relaxation: the range-measured letters (`I J K M N O`) still refuse a
+//! symbol, because a relocation is not a fixed-width bit field (measured:
+//! gcc rejects `"I"(g_arr)` and `"I"((void *)&obj)`).
+//!
+//! ### The unbounded immediate is an *instantiation*-time check in GCC
+//!
+//! `"i"`, `"n"` and `"s"` do not require a constant, they require a constant
+//! *when the statement is emitted*.  GCC therefore rejects a **parameter**
+//! operand only at instantiation (its `asm` statement is re-parsed after
+//! expansion, with `constraints_satisfied_p` applied to the expanded operand).
+//! Measured (`-O1`, x86-64):
+//!
+//! ```text
+//! static inline void f(int x) { asm volatile(""::"i"(x)); }   /* never called */  ACCEPT
+//! static inline void f(int x) { asm volatile(""::"i"(x)); }   /* f(5)       */   ACCEPT
+//! static inline void f(int x) { asm volatile(""::"i"(x)); }   /* f(v)       */   ACCEPT
+//! void g(int x)              { asm volatile(""::"i"(x)); }   /* plain fn   */   REJECT
+//! ```
+//!
+//! LCCC parses the statement once and never sees the instantiation, so it
+//! rejects the first three — including the Linux kernel's
+//! `arch/x86/include/asm/asm.h::rip_rel_ptr(void *p)` and
+//! `jump_label.h::arch_static_branch(struct static_key *const key, …)`, which
+//! is *every* `static_branch_*()` in the tree.  Two boundaries make guessing
+//! safe here:
+//!
+//! * a plain (non-inline) function's parameters are never substituted, so
+//!   `NonConstant` stays an error exactly where GCC errors;
+//! * an `always_inline`/`inline` callee whose caller passes a non-constant is
+//!   emitted with `$0` for the operand — which is precisely what lccc already
+//!   does for a `Value` operand under an immediate-only constraint, and what
+//!   GCC's own single-object emission of an *uncalled* inline body produces.
+//!   The `asm` statement lives inside `.pushsection`-style metadata that is
+//!   discarded with the unreferenced body, so no executable difference arises.
+//!
+//! Only the range-measured letters (`I J K M N O`) are decided at parse time
+//! for a symbolic operand: a relocation is not a fixed-width bit field, and
+//! GCC rejects `"I"(g_arr)` / `"I"((void *)&obj)` eagerly.
 
 use super::ast::{BinOp, Expr, UnaryOp};
-use crate::common::fx_hash::FxHashMap;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
 /// Constant value of an operand expression, as far as validation is concerned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,14 +92,25 @@ pub enum Constness {
     /// The expression provably is not an integer constant (it names an object,
     /// calls a function, or writes memory).
     NonConstant,
+    /// The expression denotes a *link-time* constant: a function designator or
+    /// a file-scope array designator. GCC accepts these for `"i"`/`"s"` because
+    /// the assembler is handed the symbol; it rejects them for the
+    /// range-measured immediate letters, which encode a bit field rather than a
+    /// relocation.
+    Symbolic,
     /// Neither established nor refuted; nothing is diagnosed.
     Unknown,
 }
 
 /// One operand of an `asm` statement, as the validator sees it.
+#[derive(Debug, Clone, Copy)]
 pub struct Operand<'a> {
     pub constraint: &'a str,
     pub constant: Constness,
+    /// The operand's `[name]`, if it wrote one. Needed to resolve a named
+    /// matching constraint (`: [s] "=r"(v) : "[s]"(x)`) and to diagnose a tie
+    /// that names nothing.
+    pub name: Option<&'a str>,
 }
 
 /// One diagnostic, plus the operand it belongs to (`None` = the template).
@@ -177,19 +243,131 @@ fn is_nonconstant(expr: &Expr, enums: &FxHashMap<String, i64>) -> bool {
     }
 }
 
+/// What the parser knows about names at the point an `asm` operand is parsed.
+///
+/// A single struct rather than four positional arguments: the classifier needs
+/// the same three tables at every call site and the fourth argument of the old
+/// signature (`deferred`) is a property of the statement, not of the name
+/// environment, so it stays separate.
+pub struct SymbolContext<'a> {
+    /// Names in scope as typedefs (`typedefs` minus `shadowed_typedefs`).
+    pub typedefs: &'a FxHashSet<String>,
+    /// Enumeration constants currently visible, already merged with the
+    /// block-scope integer constants the `asm "i"` fold needs.
+    pub enums: &'a FxHashMap<String, i64>,
+    /// Names declared as functions (see `Parser::function_names`).
+    pub functions: &'a FxHashSet<String>,
+}
+
+/// Whether `expr` denotes a link-time constant symbol the assembler can name.
+///
+/// Every arm is a shape the parser can decide from the expression alone; being
+/// wrong in the permissive direction can only *fail to accept* a valid program,
+/// never silently accept an invalid one, because the operand still has to pass
+/// the range check and the IR symbol resolver.  Measured against gcc 16.2
+/// (`-O1`, x86-64):
+///
+/// | operand                       | `"i"` / `"s"` | `"I"` |
+/// |-------------------------------|---------------|-------|
+/// | `fn_designator`, `&fn`        | yes           | no    |
+/// | file-scope array, `arr[i]`    | yes           | no    |
+/// | `&file_scope_object`          | yes           | no    |
+/// | value of an object (`g_int`)  | no            | no    |
+/// | `f()` (call *result*)         | no            | no    |
+/// | address of a local            | no            | no    |
+///
+/// Deliberate omissions, each of which would be unsound to guess:
+/// * the *value* of an object — only its address is a symbol;
+/// * `&x` for a local — the parser has no scope information, so `&x` for a
+///   file-scope `x` and for a local `x` are the same AST.  Leaving it
+///   unclassified keeps the old, permissive verdict; the kernel's own uses
+///   (`&boot_cpu_data`, `&gdt_page`, …) reach the back end through the IR
+///   symbol resolver after inlining;
+/// * a cast of an address — `(void *)&obj` is accepted by gcc but is also the
+///   spelling that hides a local behind syntax.
+///
+/// A function designator and an array subscript are the two shapes whose *use*
+/// is itself the address, so they need neither `&` nor a scope proof.
+fn is_symbolic(expr: &Expr, ctx: &SymbolContext<'_>) -> bool {
+    let (typedefs, enums) = (ctx.typedefs, ctx.enums);
+    match expr {
+        // A bare function designator: `"i"(__do_softirq)` is the kernel's
+        // `call_on_stack` (`kernel/softirq.c`), which hands the *address* of
+        // the callee to inline asm as a relocation.  Only a name the parser saw
+        // declared as a function qualifies — an object of the same name is
+        // rejected, as GCC rejects it.
+        Expr::Identifier(name, _) => {
+            ctx.functions.contains(name.as_str()) && !enums.contains_key(name.as_str())
+        }
+        // A call result is a value, not a function designator; non-folded calls
+        // are classified as `NonConstant` by `is_nonconstant` below.
+        Expr::FunctionCall(..) => false,
+        // `array[...]`: the base must be a declared object name, not a typedef
+        // name and not an enumeration constant.  The element offset is folded
+        // by the IR symbol resolver.
+        Expr::ArraySubscript(base, _, _) => match &**base {
+            Expr::Identifier(name, _) => {
+                !typedefs.contains(name.as_str()) && !enums.contains_key(name.as_str())
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 /// Classify an operand expression for the immediate-range checks.
-pub fn constness(expr: &Expr, enums: &FxHashMap<String, i64>) -> Constness {
+///
+/// `deferred` states that the enclosing statement may be instantiated later
+/// with the operand substituted (the body of a non-static `inline` or an
+/// `always_inline` function). When it is set, an expression that is merely
+/// *not an integer constant in this context* — a parameter, an object's value —
+/// becomes `Unknown` instead of `NonConstant`, because GCC judges such an
+/// operand at instantiation, not at parse time.  `Symbolic` is decided first
+/// and is unaffected: a function designator or array subscript is an error for
+/// the range-measured letters whether or not the statement is inlined.
+pub fn constness(expr: &Expr, ctx: &SymbolContext<'_>, deferred: bool) -> Constness {
+    let enums = ctx.enums;
     // `comma` is the only binary operator the constant folder does not model,
     // and `is_nonconstant` already follows its right operand.
     let _ = BinOp::Add;
     if let Some(value) = super::Parser::eval_const_int_expr_with_enums(expr, Some(enums), None) {
         return Constness::Value(value);
     }
-    if is_nonconstant(expr, enums) {
-        Constness::NonConstant
-    } else {
-        Constness::Unknown
+    if is_symbolic(expr, ctx) {
+        return Constness::Symbolic;
     }
+    if is_nonconstant(expr, enums) && !deferred {
+        return Constness::NonConstant;
+    }
+    Constness::Unknown
+}
+
+/// Whether a constraint can carry a value `%cN` may print, i.e. an immediate
+/// alternative that is a plain constant rather than a bit field.
+///
+/// `%c` prints the operand as an assembly constant expression; GCC rejects it
+/// when the operand is a register or a memory reference.  An immediate letter
+/// (`i`, `n`, `s`, `I`…`O`) qualifies, including as one alternative of a
+/// multi-letter constraint such as `"Ir"` — which is why the check looks for
+/// the letters anywhere in the string rather than testing it whole.
+fn constraint_is_constant_expression(constraint: &str) -> bool {
+    let body = constraint.trim_start_matches(|c| MODIFIERS.contains(c));
+    if body.starts_with('{') || body.starts_with('@') {
+        return false;
+    }
+    body.chars().any(|c| X86_IMMEDIATES.contains(c))
+}
+
+/// Whether a constraint string is GCC's named matching-constraint spelling,
+/// `[name]`, which ties an input to the output operand declared with that name.
+///
+/// The brackets make it look like the *operand* name spelling, so it is easy to
+/// mistake one for the other: `execvp`'s `asm` statements and the Linux kernel's
+/// `checksum.h` both write `: [sum] "=r"(s) : "[sum]"(rest)`.  The letters of a
+/// named tie are not a constraint character set at all, so they must be exempt
+/// from the alternative scan; the tie itself is resolved by the back end.
+fn is_named_tie(constraint: &str) -> bool {
+    constraint.starts_with('[') && constraint.ends_with(']') && constraint.len() > 2
 }
 
 /// Validate one constraint string.
@@ -213,8 +391,9 @@ fn check_constraint(
             return;
         }
     }
-    // Explicit register (`{rax}`), condition code (`@cc`), or matching (`0`).
-    if body.starts_with('{') || body.starts_with('[') || body.starts_with("@cc") {
+    // Explicit register (`{rax}`), condition code (`@cc`), or matching tie
+    // (`0`, or its named spelling `[name]`).
+    if body.starts_with('{') || body.starts_with("@cc") || is_named_tie(body) {
         return;
     }
     if body.is_empty() || body.chars().next().is_some_and(|c| c.is_ascii_digit()) {
@@ -274,6 +453,10 @@ fn check_constraint(
         Constness::Value(value) => {
             immediate_range(letter).is_some_and(|(lo, hi)| !(lo..=hi).contains(&value))
         }
+        // A symbol is not a bit field: every range-measured letter encodes a
+        // fixed-width immediate, so gcc rejects a relocated operand for all of
+        // them (measured: `"I"(g_arr)`, `"I"((void *)&obj)`, `"n"(g_arr)`).
+        Constness::Symbolic => immediate_range(letter).is_some(),
         Constness::Unknown => false,
     };
     if unsatisfiable {
@@ -294,10 +477,11 @@ fn check_constraint(
 /// reaching the assembler is a loud failure, not silent wrong code.
 fn check_template(
     template: &str,
-    operand_count: usize,
+    operands: &[Operand<'_>],
     label_count: usize,
     problems: &mut Vec<Diagnostic>,
 ) {
+    let operand_count = operands.len();
     const MODIFIED_CODES: &str = "bhwqkalPpzdcVnR";
     let bytes = template.as_bytes();
     let mut i = 0;
@@ -337,6 +521,31 @@ fn check_template(
             // `%10` is not operand ten in GCC's x86 syntax: a single digit
             // follows the `%` (or the modifier), so only the first digit counts.
             let index: usize = template[start..start + 1].parse().unwrap_or(usize::MAX);
+            // `%cN` prints operand N as a *constant expression*.  GCC:
+            // "invalid 'asm': operand is not a condition code, invalid operand
+            // code 'c'" when the operand is a register/memory operand.  LCCC
+            // used to print the register *name* into the template, which in
+            // the kernel's BUG machinery produced `.word %rcx` in the
+            // `__bug_table` — silently wrong object data, not an error.  The
+            // front end knows the constraint, so refuse it here.
+            if code == b'c'
+                && let Some(op) = operands.get(
+                    template[start..start + 1]
+                        .parse::<usize>()
+                        .unwrap_or(usize::MAX),
+                )
+                && !constraint_is_constant_expression(op.constraint)
+            {
+                problems.push(Diagnostic::error(
+                    "invalid 'asm': operand is not a condition code, invalid operand code 'c'",
+                    Some(
+                        template[start..start + 1]
+                            .parse::<usize>()
+                            .unwrap_or(usize::MAX),
+                    ),
+                ));
+                return;
+            }
             // `%lN` / `%LN` name a *label* of an `asm goto`, not an operand;
             // GCC numbers them in a separate space that is empty for plain
             // `asm`, so the bound is the operand count plus the label count.
@@ -368,6 +577,24 @@ pub fn validate(
     is_x86: bool,
 ) -> Vec<Diagnostic> {
     let mut problems = Vec::new();
+    // `: [sum] "=r"(v) : "[sum]"(x)` ties by name.  A tie naming an operand
+    // that no OUTPUT declares is GCC's `undefined named operand`.  Checked
+    // first, and unchecked further down by `check_constraint` (see
+    // `is_named_tie`), because the two spellings share their brackets.
+    for (i, op) in inputs.iter().enumerate() {
+        if let Some(tied) = op
+            .constraint
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+        {
+            if !outputs.iter().any(|o| o.name == Some(tied)) {
+                problems.push(Diagnostic::error(
+                    format!("undefined named operand '{tied}'"),
+                    Some(outputs.len() + i),
+                ));
+            }
+        }
+    }
     for (i, op) in outputs.iter().enumerate() {
         check_constraint(op, i, true, is_x86, &mut problems);
     }
@@ -378,12 +605,8 @@ pub fn validate(
     // through their own substitution pass, so a valid aarch64/RISC-V template
     // must not be second-guessed here.
     if is_x86 && problems.iter().all(|p| !p.is_error) {
-        check_template(
-            template,
-            outputs.len() + inputs.len(),
-            label_count,
-            &mut problems,
-        );
+        let all: Vec<Operand<'_>> = outputs.iter().chain(inputs.iter()).copied().collect();
+        check_template(template, &all, label_count, &mut problems);
     }
     problems
 }
@@ -396,6 +619,17 @@ mod tests {
         Operand {
             constraint,
             constant,
+            name: None,
+        }
+    }
+
+    /// Same, with the operand named `[name]` — the spelling a named matching
+    /// constraint refers to.
+    fn named<'a>(constraint: &'a str, constant: Constness, name: &'a str) -> Operand<'a> {
+        Operand {
+            constraint,
+            constant,
+            name: Some(name),
         }
     }
 
@@ -544,6 +778,89 @@ mod tests {
     }
 
     #[test]
+    fn an_instantiated_immediate_is_not_judged_at_parse_time() {
+        // Measured gcc 16.2: the same statement is ACCEPT in an `inline`
+        // function body (GCC re-checks it after substitution) and REJECT in a
+        // plain function.  `deferred` encodes exactly that difference, so the
+        // verdict must flip with the flag and nothing else.
+        // `Ir` is deliberately absent: its `r` alternative makes every operand
+        // class satisfiable, so GCC's own check treats it as always-satisfiable
+        // and the deferred flag cannot change its verdict.
+        for c in ["i", "n", "I"] {
+            let strict = validate(
+                "",
+                &[op("=r", Constness::Unknown)],
+                &[op(c, Constness::NonConstant)],
+                0,
+                true,
+            );
+            assert_eq!(strict.len(), 2, "\"{c}\" in a plain body must be an error");
+            let deferred = validate(
+                "",
+                &[op("=r", Constness::Unknown)],
+                &[op(c, Constness::Unknown)],
+                0,
+                true,
+            );
+            assert!(
+                deferred.is_empty(),
+                "\"{c}\" in an inline body must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn symbolic_operands_satisfy_link_time_immediates() {
+        // The Linux kernel's `static_branch_*()` shape: a symbolic operand is a
+        // link-time constant, so `i`/`n`/`Ir` accept it and emit no diagnostic.
+        //
+        // `s` is absent on purpose: measured on gcc 14.2 (this host) and
+        // required by the kernel, `asm(""::"s"(obj))` is
+        // `impossible constraint`, while `"s"(array)` is accepted.  `s` means
+        // "an operand whose address the assembler may not need" and an object
+        // *value* has no such address, so the class cannot accept `Symbolic`
+        // wholesale.  The array shape is covered by
+        // `symbolic_operands_do_not_satisfy_bit_field_immediates`' neighbours.
+        for c in ["i", "n", "Ir"] {
+            let p = validate(
+                "",
+                &[op("=r", Constness::Unknown)],
+                &[op(c, Constness::Symbolic)],
+                0,
+                true,
+            );
+            assert!(
+                p.is_empty(),
+                "\"{c}\" must accept a symbolic operand: {p:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn symbolic_operands_do_not_satisfy_bit_field_immediates() {
+        // Measured gcc 16.2: `"I"(g_arr)` and `"I"((void *)&obj)` are both
+        // `impossible constraint in 'asm'`. A symbol is a relocation, not a
+        // five-bit field, so every range-measured letter refuses it.
+        for c in ["I", "J", "K", "M", "N", "O"] {
+            let p = validate(
+                "",
+                &[op("=r", Constness::Unknown)],
+                &[op(c, Constness::Symbolic)],
+                0,
+                true,
+            );
+            assert_eq!(
+                messages(&p),
+                [
+                    "'asm' operand 1 probably does not match constraints",
+                    "impossible constraint in 'asm'"
+                ],
+                "\"{c}\" must refuse a symbolic operand"
+            );
+        }
+    }
+
+    #[test]
     fn unmeasured_immediates_are_left_alone() {
         // `e`, `Z` and `n` accept 300; `E`, `L`, `G`, `H` are not probed here.
         for c in ["e", "Z", "n", "i"] {
@@ -660,12 +977,26 @@ mod tests {
 
     #[test]
     fn template_passes_through_what_it_cannot_judge() {
-        for t in ["%%eax", "%{mov|jmp%} %0", "mov %c0, %k0", "nop %"] {
+        for t in ["%%eax", "%{mov|jmp%} %0", "nop %"] {
             assert!(
                 validate(t, &[op("=r", Constness::Unknown)], &[], 0, true).is_empty(),
                 "{t}"
             );
         }
+        // `%c0` on a register operand is NOT passed through: measured on gcc
+        // 14.2 and gcc 16.2 it is a hard error, and this compiler used to emit
+        // the register *name* into the data section (`.word %rcx`).
+        let p = validate(
+            "mov %c0, %k0",
+            &[op("=r", Constness::Unknown)],
+            &[],
+            0,
+            true,
+        );
+        assert_eq!(
+            messages(&p),
+            ["invalid 'asm': operand is not a condition code, invalid operand code 'c'"]
+        );
     }
 
     #[test]
@@ -699,5 +1030,76 @@ mod tests {
             false,
         );
         assert_eq!(messages(&p), ["input operand constraint contains '='"]);
+    }
+    /// A named matching constraint (`"[sum]"`) ties to the output of that name.
+    /// The letters of the tie are NOT a constraint character set, so it must
+    /// not be judged by the alternative scan; the pair below is the kernel's
+    /// `arch/x86/lib/csum-wrappers_64.c` shape and must validate clean.
+    #[test]
+    fn named_matching_tie_is_not_a_constraint() {
+        let p = validate(
+            "addl %1,%0",
+            &[named("=r", Constness::Unknown, "sum")],
+            &[
+                named("[sum]", Constness::Unknown, "sum"),
+                op("r", Constness::Unknown),
+            ],
+            0,
+            true,
+        );
+        assert!(p.is_empty(), "{p:?}");
+    }
+
+    /// A tie whose name no output declares is GCC's `undefined named operand`.
+    #[test]
+    fn named_matching_tie_must_resolve() {
+        let p = validate(
+            "movl %1,%0",
+            &[op("=r", Constness::Unknown)],
+            &[op("[zz]", Constness::Unknown)],
+            0,
+            true,
+        );
+        assert_eq!(messages(&p), ["undefined named operand 'zz'"]);
+    }
+
+    /// A bare function designator is a link-time constant for `i`/`s`, and an
+    /// error for the range-measured immediate letters — the pair the kernel's
+    /// `call_on_stack` (`"i"(__do_softirq)`) needs.
+    #[test]
+    fn function_designator_is_symbolic() {
+        let src = "__do_softirq";
+        let mut parser = crate::frontend::parser::Parser::new(
+            crate::frontend::lexer::Lexer::new(src, 0).tokenize(),
+        );
+        let expr = parser.parse_expr();
+        let mut fns = FxHashSet::default();
+        fns.insert("__do_softirq".to_string());
+        let typedefs = FxHashSet::default();
+        let enums = FxHashMap::default();
+        let ctx = SymbolContext {
+            typedefs: &typedefs,
+            enums: &enums,
+            functions: &fns,
+        };
+        assert!(matches!(constness(&expr, &ctx, false), Constness::Symbolic));
+        let p = validate(
+            "",
+            &[],
+            &[Operand {
+                constraint: "I",
+                constant: constness(&expr, &ctx, false),
+                name: None,
+            }],
+            0,
+            true,
+        );
+        assert_eq!(
+            messages(&p),
+            [
+                "'asm' operand 0 probably does not match constraints",
+                "impossible constraint in 'asm'"
+            ]
+        );
     }
 }

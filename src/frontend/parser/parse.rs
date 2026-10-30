@@ -740,6 +740,17 @@ pub struct Parser {
     pub(super) typedef_base_volatile: FxHashSet<String>,
     /// Typedef names shadowed by local variable declarations in the current scope.
     pub(super) shadowed_typedefs: FxHashSet<String>,
+    /// Names declared as a FUNCTION (anywhere, any linkage): a designator of one
+    /// of these is a link-time constant, which is what `asm "i"(fn)` needs.
+    ///
+    /// The distinction that matters is function vs object, not scope: GCC
+    /// accepts `"i"(f)` for a *block-scope* function declaration too, and
+    /// rejects it once a block-scope object shadows the name
+    /// (`void target(void){}` then `int x;` → `"i"(target)` is still a symbol,
+    /// `"i"(x)` is not). `shadowed_typedefs` is the precedent for the storage
+    /// and its block save/restore; the removal on object declaration mirrors
+    /// how a typedef name is hidden by a variable of the same name.
+    pub(super) function_names: FxHashSet<String>,
     /// Accumulated declaration attributes from the current parse_type_specifier pass.
     /// Reset at the start of each top-level or local declaration.
     pub(super) attrs: ParsedDeclAttrs,
@@ -803,6 +814,25 @@ pub struct Parser {
     pub(super) enum_scope_log: Vec<(String, Option<i64>, bool)>,
     /// Compound-statement nesting: zero at file scope, where nothing is undone.
     pub(super) block_depth: u32,
+    /// True while parsing the body of a function that GCC re-instantiates after
+    /// expansion (`inline`, `__inline__`, `always_inline`, `gnu_inline`).  The
+    /// parser judges an `asm` immediate operand strictly (`constness` returns
+    /// `NonConstant` for a parameter), but GCC defers exactly that judgement to
+    /// instantiation, where the operand has already been substituted — so a
+    /// body that is never instantiated here, or is instantiated with a
+    /// constant, must not be rejected at parse time.  See `asm_validate`'s
+    /// module docs for the measured matrix.
+    pub(super) asm_deferred_instantiation: bool,
+    /// Parser-visible integer constants introduced by an *initialised local
+    /// object*: `__auto_type __flags = 1 | (2 << 8);` then `"i" (__flags)`.
+    /// GCC accepts that because it folds the local before re-checking the
+    /// `asm` statement at instantiation; the parser has no constant
+    /// propagation, so it keeps this small map and drops every entry when the
+    /// enclosing block ends.  A name that is ever assigned (or whose address is
+    /// taken) is removed, so a stale value can never licence a wrong fold.
+    /// Only integer scalars with a self-contained constant initializer are
+    /// recorded; anything else is simply absent, which keeps the diagnostic.
+    pub(super) local_constants: FxHashMap<String, i64>,
     /// `_Static_assert`s from struct member lists awaiting sema, emitted after
     /// the enclosing file-scope or block item (the members are not in scope
     /// as identifiers, so the assertion means the same there).
@@ -858,6 +888,7 @@ impl Parser {
             typedef_object_volatile: FxHashSet::default(),
             typedef_base_volatile: FxHashSet::default(),
             shadowed_typedefs: FxHashSet::default(),
+            function_names: FxHashSet::default(),
             attrs: ParsedDeclAttrs::default(),
             pragma_pack_stack: Vec::with_capacity(4),
             pragma_pack_align: None,
@@ -876,6 +907,8 @@ impl Parser {
             unevaluable_enum_constants: FxHashSet::default(),
             enum_scope_log: Vec::new(),
             block_depth: 0,
+            asm_deferred_instantiation: false,
+            local_constants: FxHashMap::default(),
             deferred_static_asserts: Vec::new(),
             struct_tag_alignments: FxHashMap::default(),
         }

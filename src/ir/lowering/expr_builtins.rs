@@ -1260,6 +1260,7 @@ impl Lowerer {
             BuiltinIntrinsic::Clz => self.lower_unary_intrinsic(name, args, IrUnaryOp::Clz),
             BuiltinIntrinsic::Ctz => self.lower_unary_intrinsic(name, args, IrUnaryOp::Ctz),
             BuiltinIntrinsic::Ffs => self.lower_ffs_intrinsic(name, args),
+            BuiltinIntrinsic::Fls => self.lower_fls_intrinsic(name, args),
             BuiltinIntrinsic::Clrsb => self.lower_clrsb_intrinsic(name, args),
             BuiltinIntrinsic::Bswap => self.lower_bswap_intrinsic(name, args),
             BuiltinIntrinsic::Popcount => {

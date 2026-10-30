@@ -567,6 +567,24 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
         "__builtin_ffsll",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::Ffs),
     );
+    // `__builtin_fls{,l,ll}`: index of the most significant set bit, 1-based,
+    // 0 for zero.  GCC 16.2 defines all three; the Linux kernel's
+    // `include/linux/log2.h::__ilog2_u32()` (via `order_base_2()` in
+    // `kernel/bounds.c`) needs `__builtin_fls`, and its absence turned a
+    // constant initializer into a call, which then failed the `asm "i"`
+    // constraint.  Width is selected by the same suffix rule as ffs/clz.
+    m.insert(
+        "__builtin_fls",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::Fls),
+    );
+    m.insert(
+        "__builtin_flsl",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::Fls),
+    );
+    m.insert(
+        "__builtin_flsll",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::Fls),
+    );
     m.insert(
         "__builtin_parity",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::Parity),
@@ -3591,6 +3609,8 @@ pub enum BuiltinIntrinsic {
     Ctz,
     /// ffs(x) = x == 0 ? 0 : ctz(x) + 1 — find first set bit (1-indexed)
     Ffs,
+    /// fls(x) = x == 0 ? 0 : bits - clz(x) — find last set bit (1-indexed)
+    Fls,
     Clrsb,
     Popcount,
     Bswap,
