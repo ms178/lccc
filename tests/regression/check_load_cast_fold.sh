@@ -78,4 +78,8 @@ fi
 "$CCC" -O2 "$td/f.c" -o "$td/f.bin"
 "$td/f.bin" || { rc=$?; echo "runtime check failed with exit $rc" >&2; exit 1; }
 
+# Same extension-ledger family, separate ANDQ immediate-width proof: cover the
+# full unsigned-byte mask range and keep the 0x100 negative boundary.
+CCC="$CCC" GCC="${GCC:-gcc-16}" bash "$(dirname "$0")/check_andq_narrow_width.sh"
+
 echo "OK load_cast_fold (2 folded sext loads, debug=2, unsigned control, runtime)"

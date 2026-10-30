@@ -78,7 +78,7 @@ impl RiscvCodegen {
                     self.state.emit("    sd t2, 8(t0)");
                 } else if dest.is_some() {
                     panic!(
-                        "riscv emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                        "riscv emit_intrinsic: {op:?} produces a value (dest) but only the dest_ptr form is supported here"
                     );
                 }
             }
@@ -99,7 +99,7 @@ impl RiscvCodegen {
                     self.emit_rv_cmpeq_bytes(dptr, args);
                 } else if dest.is_some() {
                     panic!(
-                        "riscv emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                        "riscv emit_intrinsic: {op:?} produces a value (dest) but only the dest_ptr form is supported here"
                     );
                 }
             }
@@ -109,7 +109,7 @@ impl RiscvCodegen {
                     self.emit_rv_cmpeq_dwords(dptr, args);
                 } else if dest.is_some() {
                     panic!(
-                        "riscv emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                        "riscv emit_intrinsic: {op:?} produces a value (dest) but only the dest_ptr form is supported here"
                     );
                 }
             }
@@ -119,7 +119,7 @@ impl RiscvCodegen {
                     self.emit_rv_binary_128_bytewise(dptr, args);
                 } else if dest.is_some() {
                     panic!(
-                        "riscv emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                        "riscv emit_intrinsic: {op:?} produces a value (dest) but only the dest_ptr form is supported here"
                     );
                 }
             }
@@ -129,7 +129,7 @@ impl RiscvCodegen {
                     self.emit_rv_psubsb_128(dptr, args);
                 } else if dest.is_some() {
                     panic!(
-                        "riscv emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                        "riscv emit_intrinsic: {op:?} produces a value (dest) but only the dest_ptr form is supported here"
                     );
                 }
             }
@@ -138,7 +138,7 @@ impl RiscvCodegen {
                     self.emit_rv_binary_128(dptr, args, "or");
                 } else if dest.is_some() {
                     panic!(
-                        "riscv emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                        "riscv emit_intrinsic: {op:?} produces a value (dest) but only the dest_ptr form is supported here"
                     );
                 }
             }
@@ -147,7 +147,7 @@ impl RiscvCodegen {
                     self.emit_rv_binary_128(dptr, args, "and");
                 } else if dest.is_some() {
                     panic!(
-                        "riscv emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                        "riscv emit_intrinsic: {op:?} produces a value (dest) but only the dest_ptr form is supported here"
                     );
                 }
             }
@@ -156,7 +156,7 @@ impl RiscvCodegen {
                     self.emit_rv_binary_128(dptr, args, "xor");
                 } else if dest.is_some() {
                     panic!(
-                        "riscv emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                        "riscv emit_intrinsic: {op:?} produces a value (dest) but only the dest_ptr form is supported here"
                     );
                 }
             }
@@ -195,7 +195,7 @@ impl RiscvCodegen {
                     self.state.emit("    sd t0, 8(t1)");
                 } else if dest.is_some() {
                     panic!(
-                        "riscv emit_intrinsic: {{op:?}} produces a value (dest) but only the dest_ptr form is supported here"
+                        "riscv emit_intrinsic: {op:?} produces a value (dest) but only the dest_ptr form is supported here"
                     );
                 }
             }
@@ -535,6 +535,8 @@ impl RiscvCodegen {
             | IntrinsicOp::VecLoadF64x2
             | IntrinsicOp::VecLoadI32x8
             | IntrinsicOp::VecLoadStrided2I32x8
+            | IntrinsicOp::VecLoadStrided2I32x4
+            | IntrinsicOp::VecLoadStrided2CompactI32x4
             | IntrinsicOp::VecLoadI32x4
             | IntrinsicOp::VecAddF64x4
             | IntrinsicOp::VecAddF64x2
@@ -1030,9 +1032,16 @@ mod intrinsic_destination_contract_tests {
                 &[Operand::Value(Value(0)), Operand::Value(Value(1))],
             );
         }));
+        let payload = result.expect_err("riscv silently accepted the SSA form again");
+        let text = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+            .unwrap_or_default();
         assert!(
-            result.is_err(),
-            "riscv silently accepted the SSA form again"
+            text.contains("Pcmpeqb128"),
+            "diagnostic lost the operation name: {text}"
         );
+        assert!(!text.contains("{op:?}"), "literal format hole: {text}");
     }
 }

@@ -52,13 +52,59 @@ timeout 30 "$tmp/watch" || fail "strided exact-access watchpoint" "gap was read 
 if ! grep -q 'vpinsrd' "$tmp/watch-kernel.s"; then
     fail "strided exact-access watchpoint" "kernel did not take the packed exact-load path"
 fi
+
+# SSE2 is the default x86-64 codegen target, not merely an AVX2 fallback.
+# Pin both lane representations: a sized global takes the compact wide form,
+# while dynamic pointers retain exact dword reads and pass the same watchpoint.
+sse2_flags=(-O2 -march=x86-64 -ffast-math -ffp-contract=fast)
+CCC_TIME_PASSES=1 "$CCC" "${sse2_flags[@]}" -S "$strided_src" -o "$tmp/strided-sse2.s" \
+    2>"$tmp/strided-sse2.passes"
+if ! grep -Eq '\[PASS\] iter=0 vectorize_strided_reduce_pre_unroll: .*\([1-9][0-9]* changes\)' \
+    "$tmp/strided-sse2.passes"; then
+    fail "strided i32 SSE2 pre-unroll vectorization" \
+        "the dedicated pre-unroll pass did not transform the regression fixture"
+fi
+"$CCC" "${sse2_flags[@]}" "$strided_src" -o "$tmp/strided-sse2"
+actual_out=$(timeout 60 "$tmp/strided-sse2")
+if [[ $actual_out != "$expected_out" ]]; then
+    fail "strided i32 SSE2 reduction arithmetic" \
+        "output differs from GCC (lccc: $actual_out / gcc: $expected_out)"
+fi
+"$CCC" "${sse2_flags[@]}" -c "$dir/fixtures/strided_exact/kernel.c" -o "$tmp/watch-kernel-sse2.o"
+"$CCC" "${sse2_flags[@]}" -S "$dir/fixtures/strided_exact/kernel.c" -o "$tmp/watch-kernel-sse2.s"
+${GCC_BIN:-gcc} -O2 "$dir/fixtures/strided_exact/watch_driver.c" "$tmp/watch-kernel-sse2.o" \
+    -o "$tmp/watch-sse2"
+timeout 30 "$tmp/watch-sse2" || fail "strided SSE2 exact-access watchpoint" \
+    "gap was read or watchpoint setup failed"
+python3 - "$tmp/strided-sse2.s" "$tmp/watch-kernel-sse2.s" <<'PY_SSE2'
+import re
+import sys
+
+text = open(sys.argv[1], encoding="utf-8").read()
+watch = open(sys.argv[2], encoding="utf-8").read()
+packed = re.compile(r"\b(paddd|psubd|pxor|por|pand|pmulld|pslld|psrld|psrad)\b")
+for name in ("sum_global_full", "sum_global_unaligned", "sum_dynamic_tail", "sum_dynamic_full"):
+    match = re.search(rf"(?ms)^{name}:\n(.*?)^\.size {name},", text)
+    if not match:
+        raise SystemExit(f"{name}: missing SSE2 assembly body")
+    body = match.group(1)
+    if "%xmm" not in body or not packed.search(body):
+        raise SystemExit(f"{name}: missing packed SSE2 reduction")
+    if name.startswith("sum_global_"):
+        if "shufps" not in body or "pand" in body:
+            raise SystemExit(f"{name}: proven window did not use compact full lanes")
+    elif "pslldq" not in body or "por" not in body:
+        raise SystemExit(f"{name}: dynamic stream lost the exact two-dword load")
+if "movd" not in watch or "pslldq" not in watch or "movdqu" in watch:
+    raise SystemExit("SSE2 watch kernel is not using exact dword loads")
+PY_SSE2
 python3 - "$tmp/strided.s" <<'PY2'
 import re
 import sys
 
 text = open(sys.argv[1], encoding="utf-8").read()
 packed = re.compile(r"\bvp(?:addd|subd|xor[ds]?|ord|andd|mulld|slld|srld|srad)\b")
-for name in ("sum_global_full", "sum_dynamic_tail", "sum_dynamic_full"):
+for name in ("sum_global_full", "sum_global_unaligned", "sum_dynamic_tail", "sum_dynamic_full"):
     match = re.search(rf"(?ms)^{name}:\n(.*?)^\.size {name},", text)
     if not match:
         raise SystemExit(f"{name}: missing assembly body")
@@ -76,7 +122,7 @@ for name in ("sum_global_full", "sum_dynamic_tail", "sum_dynamic_full"):
     if not packed.search(body):
         reject("no packed dword arithmetic in the reduction loop "
                "(a scalar fallback cannot be the vectorized transform)")
-    if name == "sum_global_full":
+    if name.startswith("sum_global_"):
         # The global stream reads a strong, locally binding definition whose
         # defined size the reducer proves (`ModuleSymbolFacts::global_min_bytes`),
         # so its loads widen to full 32-byte vectors: legal (every byte read is

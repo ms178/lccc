@@ -498,6 +498,20 @@ def audit(document: dict, plan: dict) -> list[str]:
             for gate in set(present) - set(expected):
                 if gate in planned and planned[gate] != lane:
                     problems.append(f"{lane}: gate {gate!r} is planned in {planned[gate]}")
+        # Predicted scheduling cost is not a second, independently editable
+        # source of truth: it is exactly the sum shown by the lane's measured
+        # steps. Two upstream gate additions once left backend-contracts-a
+        # 0.75 s short; keeping that drift would make future splits disagree
+        # with their own provenance.
+        for lane in lanes:
+            spec = plan["lanes"][lane]
+            measured = sum(float(step["measured_s"]) for step in spec.get("steps", []))
+            predicted = float(spec.get("predicted_gate_seconds", 0.0))
+            if abs(predicted - measured) > 0.0001:
+                problems.append(
+                    f"{lane}: predicted_gate_seconds {predicted:.3f} does not equal "
+                    f"measured_s sum {measured:.3f}"
+                )
         # Preamble identity: setup steps are the lane's identity, not work
         # that can be divided, so every shard must carry the same bytes.
         present_lanes = [lane for lane in lanes if lane in jobs]
@@ -567,6 +581,13 @@ def self_test() -> None:
     skewed = json.loads(json.dumps(plan))
     skewed["lanes"]["lane-b"]["predicted_gate_seconds"] = 40.0
     assert any("imbalanced" in p for p in audit(doc, skewed)), audit(doc, skewed)
+
+    # A measured step added without updating the predicted total: reject the
+    # provenance drift itself, independently of the balance check above.
+    underpriced = json.loads(json.dumps(plan))
+    underpriced["lanes"]["lane-a"]["predicted_gate_seconds"] = 9.75
+    assert any("predicted_gate_seconds" in p and "measured_s sum" in p
+               for p in audit(doc, underpriced)), audit(doc, underpriced)
 
     # Shell mode: gates are logical commands inside one run body.
     body = ("        set -Eeuo pipefail\n"

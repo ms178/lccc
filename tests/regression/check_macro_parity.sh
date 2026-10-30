@@ -38,6 +38,12 @@ readonly FORBIDDEN_LIST=(
     "SIG_DFL" "SIG_IGN" "SIG_ERR"
     # capability denial for a feature lccc implements (GP-05)
     "__STDC_NO_ATOMICS__"
+    # <limits.h>/<stdint.h> values: these are not compiler predefines on
+    # either LP64 or ILP32. In particular, fixing the __-prefixed ILP32
+    # constants must not reintroduce their unprefixed libc-owned spellings.
+    "LONG_MIN" "LONG_MAX" "ULONG_MAX"
+    "INTPTR_MIN" "INTPTR_MAX" "UINTPTR_MAX"
+    "SIZE_MAX" "PTRDIFF_MIN" "PTRDIFF_MAX"
 )
 readonly MISSING_ESSENTIAL=(
     # type sizes — the codegen depends on these matching the backend

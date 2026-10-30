@@ -63,13 +63,15 @@ for name, patterns in required.items():
 
 # The non-restrict shifted dependence is versioned at RUNTIME, exactly
 # like GCC's own loop versioning: the vector body is guarded by a
-# base-distance check (`dst - src` bytes vs the vector width + 1, the
-# `subq/subq $8/cmpq $17/jb` prologue) that falls back to the scalar
-# loop for every overlapping or near-overlapping call. Verified
-# bit-exact against scalar semantics AND GCC -O3 for shifts 0..200
-# (forward, backward, and crossing the vector width). The old check
-# ("no %ymm anywhere in the body") predated runtime versioning and
-# rejected the guarded design wholesale.
+# base-distance check (`dst - src` bytes vs the packed window + 1).
+# The current two-copy FP map unroll covers eight doubles per step, so
+# the exact element-granular guard is `subq/subq $8/cmpq $49/jb`; with
+# CCC_NO_MAP_FP_UNROLL=1 the four-double window uses $17 instead.  The
+# guard falls back to the scalar loop for every overlapping or
+# near-overlapping call. Verified bit-exact against scalar semantics
+# AND GCC -O3 for shifts 0..200 (forward, backward, and crossing the
+# vector width). The old check ("no %ymm anywhere in the body")
+# predated runtime versioning and rejected the guarded design wholesale.
 if "%ymm" in body(default, "shifted_overlap_f64"):
     # The guard is: distance = dst - src, minus one element, compared against
     # the per-iteration span, branching back to the scalar loop.  The SPAN
@@ -89,34 +91,31 @@ if "%ymm" in body(default, "shifted_overlap_f64"):
         )
 
 # A GNU `alias` can make two distinct GlobalAddr names the same object.
-# Keep the packed path for the disjoint case, but prove the one-element-ahead
-# overlap is versioned to the scalar recurrence. At x86-64-v3, eight I32 lanes
-# give a 32-byte window; after subtracting the 4-byte destination displacement,
-# the exact unsafe span is 25 bytes. This catches both an unsound global-root
-# proof (which removes the check and miscompiles) and a scalar-only workaround.
+# This particular local alias always overlaps one element ahead. Folding
+# the guard to the scalar recurrence is therefore stronger than emitting an
+# always-taken runtime check. If a packed body is emitted, however, it must
+# retain that guard. The span follows the packed window after subtracting the
+# 4-byte destination displacement; it must not be pinned to one unroll factor.
+# Accepting only the packed form rejected the valid constant-folded fallback;
+# accepting arbitrary scalar output would hide guard removal.
 alias_body = body(global_alias, "shift_add")
-# Soundness first: the aliased destination must never be packed WITHOUT a
-# runtime distance guard -- that is the miscompile this fixture exists to
-# catch, and main() additionally pins the recurrence at run time.
-if "%ymm" in alias_body and not re.search(r"\n\s*subq\s+\$4,\s*%r\w+\n", alias_body):
-    raise SystemExit(
-        "shift_add: packed body without the runtime distance guard"
-    )
-# KNOWN GAP: the packed path is not currently emitted for an aliased global
-# pair at all (the loop stays scalar), so the versioned form this fixture was
-# written for does not exist yet.  Asserting it here made the gate red on a
-# CORRECT compiler, which is worse than the gap: a red gate trains people to
-# ignore it.  This asserts the sound behaviour that is actually implemented;
-# when runtime versioning for aliased global roots lands, tighten it back to
-# requiring the packed body plus the guard.
-if "%ymm" not in alias_body:
-    print("note: shift_add is scalar (known gap: no runtime versioning for "
-          "aliased global roots)", file=sys.stderr)
-if "%ymm" in alias_body and not re.search(
-    r"subq\s+%r\w+,\s*%r\w+\n\s*subq\s+\$4,\s*%r\w+\n\s*cmpq\s+\$\d+,\s*%r\w+\n\s*jb\s",
-    alias_body,
-):
-    raise SystemExit("shift_add: missing GNU-alias runtime dependence guard")
+# Soundness first: every packed body needs the runtime distance guard. The
+# span tracks the packed window rather than pinning one unroll-dependent
+# literal. If the known-overlap guard folds to the scalar recurrence, retain a
+# positive shape check instead of accepting arbitrary scalar output.
+if "%ymm" in alias_body:
+    if not re.search(r"\bvpaddd\b", alias_body):
+        raise SystemExit("shift_add: packed body lacks the expected add")
+    if not re.search(
+        r"subq\s+%r\w+,\s*%r\w+\n\s*subq\s+\$4,\s*%r\w+\n\s*cmpq\s+\$\d+,\s*%r\w+\n\s*jb\s",
+        alias_body,
+    ):
+        raise SystemExit("shift_add: missing GNU-alias runtime dependence guard")
+else:
+    if not re.search(r"\bleal\s+2\(", alias_body):
+        raise SystemExit("shift_add: neither guarded packed map nor scalar recurrence")
+    print("note: shift_add uses the scalar recurrence for a provably aliased "
+          "global pair (runtime versioning cannot win this fixture)", file=sys.stderr)
 
 # Loop-invariant broadcasts stay in assigned YMM families and are consumed
 # directly by three-operand arithmetic.  No dead result-home spill may remain

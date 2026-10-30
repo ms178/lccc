@@ -2,9 +2,10 @@
  * Shape fixture for the AVX2 strided-2 32-bit sum-reduction vectorizer
  * (src/passes/vectorize_strided_i32_reduce.rs).
  *
- * The global and pointer forms require exact-width reads of scalar elements;
- * their intervening bytes may be independently shared or device-mapped.
- * Both full groups and a scalar tail are exercised. A protected page begins
+ * Pointer forms require exact-width reads of scalar elements; their
+ * intervening bytes may be independently shared or device-mapped. Sized
+ * globals additionally exercise proven wide loads, including a non-16-byte
+ * offset. Both full groups and a scalar tail are exercised. A protected page begins
  * immediately after the last scalar dword of the full-group pointer case.
  *
  * Both accumulate the modular 32-bit sum of `dword(buf + i) ^ (uint32_t)i` with
@@ -35,6 +36,16 @@ static uint32_t sum_global_full(void)
     uint32_t acc = 0;
     for (uint64_t i = 0; i < BYTES_FULL; i += 8)
         acc += *(const uint32_t *)((const unsigned char *)g_buf + i) ^ (uint32_t)i;
+    return acc;
+}
+
+__attribute__((noinline))
+static uint32_t sum_global_unaligned(void)
+{
+    const unsigned char *buf = (const unsigned char *)g_buf + 4;
+    uint32_t acc = 0;
+    for (uint64_t i = 0; i < BYTES_FULL; i += 8)
+        acc += *(const uint32_t *)(buf + i) ^ (uint32_t)i;
     return acc;
 }
 
@@ -77,6 +88,7 @@ int main(void)
     uint32_t full = sum_global_full();
     if (sum_dynamic_full(exact) != full) return 4;
     if (munmap(map, span + (size_t)page)) return 5;
-    printf("%08x %08x\n", full, sum_dynamic_tail((const unsigned char *)g_buf));
+    printf("%08x %08x %08x\n", full, sum_dynamic_tail((const unsigned char *)g_buf),
+           sum_global_unaligned());
     return 0;
 }

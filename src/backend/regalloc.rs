@@ -7811,6 +7811,8 @@ fn collect_vecreg_candidates(func: &IrFunction) -> FxHashSet<u32> {
                 | O::VecLoadI32x4
                 | O::VecLoadI32x8
                 | O::VecLoadStrided2I32x8
+                | O::VecLoadStrided2I32x4
+                | O::VecLoadStrided2CompactI32x4
                 | O::VecLoadI32x4Pair
                 | O::VecPackI32x4Pair
                 | O::VecLoadI8x32
@@ -9389,7 +9391,12 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
             // stays register-homed (no per-iter stack round-trip, which made
             // the vectorized find_max SLOWER than scalar).
             O::VecBroadcastI32x8 | O::VecMaxI32x8 | O::VecMinI32x8 => Some(5),
-            O::VecZeroI32x4 | O::VecLoadI32x4 | O::VecAddI32x4 | O::VecMulI32x4 => Some(6),
+            O::VecZeroI32x4
+            | O::VecLoadI32x4
+            | O::VecLoadStrided2I32x4
+            | O::VecLoadStrided2CompactI32x4
+            | O::VecAddI32x4
+            | O::VecMulI32x4 => Some(6),
             // HALF-WIDE dword-pair endpoints: the value web is the
             // I32x4 family (the intermediate ops ARE the I32x4
             // intrinsics), so the load/store/gather endpoints join
@@ -10580,6 +10587,8 @@ fn x86_map_intrinsic_class(op: &crate::ir::intrinsics::IntrinsicOp) -> Option<u8
         | O::VecOrI64x4
         | O::VecXorI64x4 => Some(3),
         O::VecLoadI32x4
+        | O::VecLoadStrided2I32x4
+        | O::VecLoadStrided2CompactI32x4
         | O::VecSubI32x4
         | O::VecAddI32x4
         | O::VecMulI32x4

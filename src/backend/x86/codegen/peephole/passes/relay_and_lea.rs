@@ -3377,11 +3377,10 @@ const RMW_CONSUMER_OPS: &[&str] = &[
 ///    fresh analysis, anchored at the consumer line): the deleted copy no
 ///    longer defines it. On failure every rewrite is rolled back textually
 ///    and the original pair stays.
-/// Parse an `and $imm, ...` source operand into its u32 mask. Accepts GAS
-/// decimal/hex immediates (`$127`, `$0x7f`, `$-1`); anything else (symbols,
-/// malformed) refuses so the caller falls back to `continue`.
-/// Parse a `$`-immediate operand (`$32`, `$0x20`, `$-1`) into its 32-bit
-/// value. Shared by the P1 mask check and the P2.5 shift-count check.
+/// Parse a `$`-immediate operand into its 32-bit two's-complement value.
+/// Positive decimal/hex spellings cover u32; negative decimal spellings cover
+/// the full i32 range, including `-2147483648`, whose magnitude does not fit
+/// in i32. Symbols, malformed values and out-of-range magnitudes refuse.
 fn parse_imm32(src: &str) -> Option<u32> {
     let digits = src.strip_prefix('$')?;
     if digits.is_empty() {
@@ -3393,7 +3392,10 @@ fn parse_imm32(src: &str) -> Option<u32> {
     {
         u32::from_str_radix(hex, 16).ok()
     } else if let Some(neg) = digits.strip_prefix('-') {
-        neg.parse::<i32>().ok().map(|v| (-v) as u32)
+        neg.parse::<u32>()
+            .ok()
+            .filter(|magnitude| *magnitude <= 0x8000_0000)
+            .map(|magnitude| magnitude.wrapping_neg())
     } else {
         digits.parse::<u32>().ok()
     }
@@ -4098,36 +4100,36 @@ fn dest_operand_text(t: &str) -> &str {
     }
 }
 
-/// If `t` is a 64-bit bitwise-AND with an immediate mask
-/// (`andq $imm, %qword`) whose sign-extended encoding provably zeroes the
-/// destination's upper 32 bits, return the narrowest width (8, 16 or 32) that
-/// contains every possible result.
+/// If `t` is a bitwise-AND with an immediate mask and a register destination,
+/// return the narrowest width (8, 16 or 32) that contains every possible
+/// 64-bit result. Register or memory mask sources cannot bound the result.
 ///
-/// `andq $imm32, %r64` encodes the immediate as a *sign-extended* imm32, so
-/// the effective mask is `sext_32(imm)`. Its bits 32..63 are zero exactly
-/// when `imm` is a nonnegative i32 (`0..=0x7FFF_FFFF`); a mask in
-/// `0x8000_0000..=0xFFFF_FFFF` sign-extends to all-ones up there and keeps
-/// the source's upper half, so those refuse. Within the nonnegative range
-/// the result width follows the mask itself: `x & m <= m`, hence
-/// `m <= 0x7F` proves a byte-width result and `m <= 0xFFFF` a word-width one.
-/// Register or memory mask sources cannot bound the result and return `None`.
-pub(super) fn andq_imm_narrow_width(t: &str, fam: RegId) -> Option<u8> {
+/// `andq $imm32, %r64` sign-extends its mask, so bits 32..63 of the effective
+/// mask are zero only for a nonnegative i32. A negative encoding keeps the
+/// source's upper half and must return `None`. `andl $imm32, %r32` instead
+/// always writes a zero-extended 32-bit result, for either sign spelling of
+/// the imm32. In both forms a mask <= 0xff proves an unsigned-byte result and
+/// a mask <= 0xffff proves an unsigned-word result; every other accepted mask
+/// proves width 32. Keeping these two encodings in one predicate prevents the
+/// older ANDQ facts from disappearing when an earlier pass legally selects
+/// the shorter ANDL form.
+pub(super) fn and_imm_narrow_width(t: &str, fam: RegId) -> Option<u8> {
     let mnemonic = t.split_whitespace().next()?;
-    if mnemonic != "andq" {
-        return None;
-    }
+    let reg_width = match mnemonic {
+        "andq" => 0,
+        "andl" => 1,
+        _ => return None,
+    };
     let rest = t[mnemonic.len()..].trim_start();
     let (src, dst) = split_two_operands(rest)?;
-    // The 64-bit destination name only: a 32-bit `andl` is handled by the
-    // architecture-wide dword zero-extension rule, not this mask analysis.
-    if dst != REG_NAMES[0][fam as usize] {
+    if dst != REG_NAMES[reg_width][fam as usize] {
         return None;
     }
     let imm = parse_imm32(src)?;
-    if (imm as i32) < 0 {
+    if reg_width == 0 && (imm as i32) < 0 {
         return None;
     }
-    Some(if imm <= 0x7F {
+    Some(if imm <= 0xFF {
         8
     } else if imm <= 0xFFFF {
         16
@@ -4144,7 +4146,7 @@ pub(super) fn andq_imm_narrow_width(t: &str, fam: RegId) -> Option<u8> {
 /// immediate (`movq $imm`: GAS sign-extends imm32, so only nonnegative
 /// counts — `$0xFFFFFFFF` is -1, NOT small; `movabsq $imm64`: only low
 /// 32 bits set), or a masked 64-bit AND whose sign-extended mask has no
-/// high bits (`andq_imm_narrow_width`). Callers guarantee lowercase text
+/// high bits (`and_imm_narrow_width`). Callers guarantee lowercase text
 /// (see `upper32_zero_at`).
 pub(super) fn s_write_proves_upper_zero(t: &str, fam: RegId) -> bool {
     if dest_operand_text(t) == REG_NAMES[1][fam as usize] {
@@ -4206,7 +4208,7 @@ pub(super) fn s_write_proves_upper_zero(t: &str, fam: RegId) -> bool {
     // mask carries zeroes in bits 32..63, so the AND result's upper half is
     // zero regardless of the incoming value.
     if mnemonic == "andq" {
-        return andq_imm_narrow_width(t, fam).is_some();
+        return and_imm_narrow_width(t, fam).is_some();
     }
     false
 }
@@ -6781,42 +6783,68 @@ mod tests {
         assert!(out.contains("movq %r10, (%rsi)"), "{out}");
     }
 
-    /// The masked-AND width predicate: a nonnegative imm32 mask bounds the
-    /// result width for every source value, while a negative imm32 encoding
-    /// sign-extends to an all-ones high mask and a register mask is unbounded.
+    /// The masked-AND width predicate covers both opcode encodings. ANDQ
+    /// rejects a negative imm32 because its effective 64-bit mask has an
+    /// all-ones upper half; ANDL still proves a zero-extended dword result.
     #[test]
-    fn andq_imm_narrow_width_predicate_boundaries() {
-        // r10 is GP family 10 in REG_NAMES.
-        assert_eq!(super::andq_imm_narrow_width("andq $127, %r10", 10), Some(8));
-        assert_eq!(
-            super::andq_imm_narrow_width("andq $0x7f, %r10", 10),
-            Some(8)
-        );
-        assert_eq!(
-            super::andq_imm_narrow_width("andq $65535, %r10", 10),
-            Some(16)
-        );
-        assert_eq!(
-            super::andq_imm_narrow_width("andq $1048575, %r10", 10),
-            Some(32)
-        );
-        assert_eq!(
-            super::andq_imm_narrow_width("andq $2147483647, %r10", 10),
-            Some(32)
-        );
-        // The imm32 sign-extension boundary: bits 32..63 of the effective mask
-        // are all ones, so the source's upper half survives.
-        assert_eq!(
-            super::andq_imm_narrow_width("andq $-2147483648, %r10", 10),
-            None
-        );
-        assert_eq!(super::andq_imm_narrow_width("andq $-1, %r10", 10), None);
-        // A register mask cannot bound the result.
-        assert_eq!(super::andq_imm_narrow_width("andq %rax, %r10", 10), None);
-        // The 32-bit form is not this predicate's job (dword rule handles it).
-        assert_eq!(super::andq_imm_narrow_width("andl $127, %r10d", 10), None);
-        // The destination must be the named family's 64-bit register.
-        assert_eq!(super::andq_imm_narrow_width("andq $127, %r11", 10), None);
+    fn and_imm_narrow_width_predicate_boundaries() {
+        // r10/r10d is GP family 10 in REG_NAMES.
+        for (mnemonic, dst) in [("andq", "%r10"), ("andl", "%r10d")] {
+            for mask in 0..=0xFF {
+                assert_eq!(
+                    super::and_imm_narrow_width(&format!("{mnemonic} ${mask}, {dst}"), 10),
+                    Some(8),
+                    "{mnemonic} byte mask {mask}"
+                );
+            }
+            for (mask, width) in [
+                (256, 16),
+                (65535, 16),
+                (65536, 32),
+                (1048575, 32),
+                (2147483647, 32),
+            ] {
+                assert_eq!(
+                    super::and_imm_narrow_width(&format!("{mnemonic} ${mask}, {dst}"), 10),
+                    Some(width),
+                    "{mnemonic} mask {mask}"
+                );
+            }
+            // A register mask cannot bound the result.
+            assert_eq!(
+                super::and_imm_narrow_width(&format!("{mnemonic} %rax, {dst}"), 10),
+                None
+            );
+        }
+        // The imm32 sign-extension boundary, in negative, decimal and hex
+        // spellings. Only ANDQ loses the upper-zero proof; ANDL returns a
+        // zero-extended 32-bit result for every one of these encodings.
+        for spelling in ["-2147483648", "2147483648", "0x80000000"] {
+            assert_eq!(
+                super::and_imm_narrow_width(&format!("andq ${spelling}, %r10"), 10),
+                None
+            );
+            assert_eq!(
+                super::and_imm_narrow_width(&format!("andl ${spelling}, %r10d"), 10),
+                Some(32)
+            );
+        }
+        for spelling in ["-1", "4294967295", "0xffffffff"] {
+            assert_eq!(
+                super::and_imm_narrow_width(&format!("andq ${spelling}, %r10"), 10),
+                None
+            );
+            assert_eq!(
+                super::and_imm_narrow_width(&format!("andl ${spelling}, %r10d"), 10),
+                Some(32)
+            );
+        }
+        // The destination width and family must match the opcode exactly.
+        assert_eq!(super::and_imm_narrow_width("andq $127, %r10d", 10), None);
+        assert_eq!(super::and_imm_narrow_width("andl $127, %r10", 10), None);
+        assert_eq!(super::and_imm_narrow_width("andq $127, %r11", 10), None);
+        assert_eq!(super::and_imm_narrow_width("andl $127, %r11d", 10), None);
+        assert_eq!(super::and_imm_narrow_width("andb $127, %r10b", 10), None);
     }
 
     /// revvarint shape: a byte load masked with `andq $127` provably fits in a

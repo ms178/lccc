@@ -1148,19 +1148,13 @@ fn vectorize_with_analysis_mode(
                 }
                 total_changes += transform_reduction_avx2(func, &red_pattern, fp_contract);
             }
-        } else if !neon
-            && !force_two_wide
-            && !late_minmax_only()
-            && !force_sse2
-            && x86_avx2_available()
-            && {
-                let n = strided_i32_reduce::try_transform(func, loop_info, &cfg, symbol_facts);
-                total_changes += n;
-                n > 0
-            }
-        {
+        } else if !neon && !force_two_wide && !late_minmax_only() && x86_simd_available() && {
+            let n = strided_i32_reduce::try_transform(func, loop_info, &cfg, symbol_facts);
+            total_changes += n;
+            n > 0
+        } {
             if debug {
-                eprintln!("[VEC] Strided I32 reduction pattern matched! Transformed to AVX2");
+                eprintln!("[VEC] Strided I32 reduction pattern matched! Transformed to SIMD");
             }
         } else if !no_map_vec() {
             // AUD-4: the late scope deliberately does NOT gate the map
@@ -32244,6 +32238,16 @@ fn transform_map_vector(
             }
         }
     } else if !neon
+        && matches!(pattern.elem_ty, IrType::U16)
+        && unsigned_saturating_sub_operands(&pattern.expr).is_some()
+    {
+        // A slide-hash map is one load, one psubusw and one store. Four
+        // independent copies amortize its control flow without increasing
+        // the live expression depth (Clang uses the same four-XMM schedule).
+        // Keep this tied to the proven saturation idiom rather than unrolling
+        // arbitrary U16 select trees and their larger register footprints.
+        4
+    } else if !neon
         && ((matches!(pattern.elem_ty, IrType::I32 | IrType::U32)
             && matches!(pattern.expr, MapExpr::BinOp(IrBinOp::Mul, _, _))
             && pattern.expr.unroll_cost() <= 3
@@ -35069,7 +35073,7 @@ pub(crate) fn vectorize_strided_i32_reductions_before_unroll(
     func: &mut IrFunction,
     symbol_facts: &ModuleSymbolFacts,
 ) -> usize {
-    if super::fp_environment_blocks_reordering(func) || !x86_avx2_available() {
+    if super::fp_environment_blocks_reordering(func) || !x86_simd_available() {
         return 0;
     }
     let mut total = 0usize;

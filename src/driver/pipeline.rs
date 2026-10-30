@@ -3047,6 +3047,7 @@ impl Driver {
             // and CCC_NO_AFFINE_EXIT_FOLD owns EVERY producer of that fold.
             std::env::var("CCC_NO_AFFINE_EXIT_FOLD").is_err(),
             std::env::var("CCC_DEBUG_AFFINE_FOLD").is_ok(),
+            std::env::var("CCC_NO_LOOP_DOWNCOUNT").is_err(),
         );
         for func in &mut module.functions {
             if !func.is_declaration {

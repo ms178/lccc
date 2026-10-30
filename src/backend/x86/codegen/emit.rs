@@ -5136,6 +5136,19 @@ impl X86Codegen {
     /// Load an operand value into any GP register (returned as string).
     /// Uses rcx as the scratch register.
     pub(super) fn operand_to_reg(&mut self, op: &Operand, reg: &str) {
+        if reg == "rcx" {
+            if let Operand::Value(v) = op {
+                let is_alloca = self.state.is_alloca(v.0);
+                if self.state.sec_has_verified(v.0, is_alloca) {
+                    return;
+                }
+            }
+            // Unlike operand_to_rcx, this generic loader does not park the
+            // newly staged value. It must not leave an older secondary-cache
+            // claim alive after overwriting %rcx; later users can then only
+            // reload or explicitly re-park, never consume the dead register.
+            self.state.reg_cache.invalidate_sec();
+        }
         match op {
             Operand::Const(c) => match c {
                 IrConst::I8(v) if *v == 0 => self

@@ -307,6 +307,12 @@ for disabled in 0 1; do
     done
 done
 
+# The separate dead-IV countdown contract uses the original switch/LUT
+# reproducer and its own kill switch.  Keep it in this established loop gate so
+# local and hosted CI execute the same structural and runtime proof.
+CCC="$CCC" GCC="$GCC" bash "$here/check_loop_downcount.sh" \
+    || bad "loop-downcount contract failed"
+
 [[ $fail -eq 0 ]] || { echo "check_affine_loop_fold: activation FAILED" >&2; exit 1; }
 
 echo "check_affine_loop_fold: PASS (oracle parity, default-on counted fold, nested+type-top folds, refusals pinned)"

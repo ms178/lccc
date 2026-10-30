@@ -262,6 +262,15 @@ impl LinkerArgs {
             .map(|kw| format!("-z {kw} ignored"))
             .collect();
         warnings.extend(self.z_other_keyword_warnings());
+        // AArch64 and RISC-V call this shared policy but do not emit the
+        // requested DT_FLAGS/DT_FLAGS_1 bits. Keep these options visible
+        // instead of accepting nodelete/origin/initfirst and their peers
+        // with empty stderr.
+        warnings.extend(
+            self.z_dyn_flag_keywords
+                .iter()
+                .map(|kw| format!("-z {kw} ignored")),
+        );
         if self.image_base.is_some() {
             warnings.push(
                 "--image-base ignored: explicit image bases are not implemented for this backend"
@@ -2137,6 +2146,34 @@ mod z_isa_level_tests {
                 .unwrap_err(),
             "warning treated as error: -z common-page-size=0x1000 ignored"
         );
+    }
+
+    #[test]
+    fn unimplemented_cross_keyword_warnings_obey_fatal_state() {
+        for kw in [
+            "origin",
+            "nodelete",
+            "nodlopen",
+            "initfirst",
+            "interpose",
+            "nodefaultlib",
+            "global",
+            "not-a-real-keyword",
+        ] {
+            let option = format!("-Wl,-z,{kw}");
+            let fatal = parse_linker_args(&args(&[option.as_str(), "-Wl,--fatal-warnings"]));
+            assert_eq!(
+                fatal
+                    .warn_unimplemented_keyword_options(0x1000)
+                    .unwrap_err(),
+                format!("warning treated as error: -z {kw} ignored")
+            );
+        }
+        for kw in ["separate-code", "combreloc"] {
+            let option = format!("-Wl,-z,{kw}");
+            let default = parse_linker_args(&args(&[option.as_str(), "-Wl,--fatal-warnings"]));
+            assert!(default.warn_unimplemented_keyword_options(0x1000).is_ok());
+        }
     }
 
     /// `--no-undefined-version` is a real GNU flag ("Disallow undefined

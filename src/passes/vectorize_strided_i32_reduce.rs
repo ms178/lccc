@@ -1,4 +1,4 @@
-//! AVX2 strided-2 32-bit integer sum-reduction vectorizer.
+//! AVX2/SSE2 strided-2 32-bit integer sum-reduction vectorizer.
 //!
 //! Recognizes counted innermost two-block reduction loops whose byte induction
 //! variable steps by 8 bytes (two 32-bit dwords per scalar iteration) and
@@ -26,15 +26,17 @@
 //!
 //! A `VecLoadStrided2I32x8` places four stride-8B dwords (`+0, +8, +16,
 //! +24`) in the even 32-bit lanes `0, 2, 4, 6` of a YMM register without
-//! reading the gaps. A full `VecLoadI32x8` is permitted only for a proven
-//! private stack object with sufficient extent. Because modular lane operations
+//! reading the gaps; `VecLoadStrided2I32x4` is the two-dword XMM equivalent.
+//! With a sufficient contiguous-object proof, SSE2 can instead compact two
+//! full XMM loads into four real lanes and omit the odd-lane mask. AVX2 uses
+//! a full `VecLoadI32x8` under the same proof. Because modular lane operations
 //! (`vpaddd`, `vpsubd`, `vpmulld`, `vpand`, `vpor`, `vpxor`, `vpslld`,
 //! `vpsrld`, `vpsrad`) never propagate carries or traps across lane
 //! boundaries, evaluating the entire per-element DAG across all 8 lanes in
 //! parallel computes the exact scalar values in lanes `0, 2, 4, 6` with zero
-//! in-loop shuffles or permutes. Once the vector loop exits, masking the vector
-//! accumulator with `0x0000_0000_FFFF_FFFF` (`VecBroadcastI64x4`) zeroes the
-//! odd lanes before `VecHorizontalAddI32x8`.
+//! in-loop shuffles or permutes on the exact-access forms. Once the vector
+//! loop exits, the even-lane accumulators mask their odd lanes before the
+//! horizontal add; the compact XMM form already contains only real elements.
 //!
 //! ### Exact-access and guard-page contract
 //!
@@ -224,14 +226,18 @@ fn wide_load_proven(
     if proves_private_stack_object(func, base) {
         return alloca_extent_at_least(func, base, needed);
     }
-    global_root_name(func, base).is_some_and(|name| {
+    global_root_and_offset(func, base).is_some_and(|(name, byte_offset)| {
         // `ModuleSymbolFacts::from_module` already excludes redirected names
         // from `defined_sizes`; the explicit check keeps this proof locally
-        // evident even if that construction invariant drifts.
+        // evident even if that construction invariant drifts. A GEP also
+        // consumes part of the object: only the remaining extent after its
+        // constant byte offset can cover the vector window.
         !symbol_facts.aliased_names.contains(&name)
             && symbol_facts
                 .global_min_bytes(&name)
-                .is_some_and(|sz| u64::try_from(sz).is_ok_and(|sz| sz >= needed))
+                .and_then(|sz| u64::try_from(sz).ok())
+                .and_then(|sz| sz.checked_sub(byte_offset))
+                .is_some_and(|remaining| remaining >= needed)
     })
 }
 
@@ -246,12 +252,15 @@ fn alloca_extent_at_least(func: &IrFunction, base: Value, needed: u64) -> bool {
     })
 }
 
-/// Resolve `base` to the name of the global object it points into, following
-/// only provenance-preserving edges (the canonical [`root_leaf`] /
-/// [`chain_step`] rules).  Loads, calls, integer-to-pointer conversions,
-/// unknown definitions and cycles fail closed.
-fn global_root_name(func: &IrFunction, start: Value) -> Option<String> {
+/// Resolve `base` to a global and the constant byte offset into that object,
+/// following only provenance-preserving edges (the canonical [`root_leaf`] /
+/// [`chain_step`] rules). Loads, calls, integer-to-pointer conversions,
+/// unknown definitions, nonconstant/negative GEP or pointer-add offsets and
+/// cycles fail closed. Keeping the offset is essential: `global + 8` has eight fewer
+/// usable bytes than the definition's total size.
+fn global_root_and_offset(func: &IrFunction, start: Value) -> Option<(String, u64)> {
     let mut cur = start;
+    let mut byte_offset = 0u64;
     let mut seen = FxHashSet::default();
     for _ in 0..128 {
         if !seen.insert(cur) {
@@ -259,10 +268,38 @@ fn global_root_name(func: &IrFunction, start: Value) -> Option<String> {
         }
         let inst = unique_def(func, cur)?;
         match root_leaf(inst) {
-            RootLeaf::Global(name) => return Some(name),
-            RootLeaf::NotLeaf => match chain_step(inst) {
-                ChainStep::Follow(next) => cur = next,
-                ChainStep::Stop => return None,
+            RootLeaf::Global(name) => return Some((name, byte_offset)),
+            RootLeaf::NotLeaf => match inst {
+                Instruction::GetElementPtr {
+                    base,
+                    offset: Operand::Const(c),
+                    ..
+                } => {
+                    let delta = u64::try_from(c.to_i64()?).ok()?;
+                    byte_offset = byte_offset.checked_add(delta)?;
+                    cur = *base;
+                }
+                Instruction::GetElementPtr { .. } => return None,
+                Instruction::BinOp {
+                    op: IrBinOp::Add,
+                    lhs,
+                    rhs,
+                    ty: IrType::Ptr | IrType::I64 | IrType::U64,
+                    ..
+                } => {
+                    let (base, c) = match (lhs, rhs) {
+                        (Operand::Value(base), Operand::Const(c))
+                        | (Operand::Const(c), Operand::Value(base)) => (*base, c),
+                        _ => return None,
+                    };
+                    let delta = u64::try_from(c.to_i64()?).ok()?;
+                    byte_offset = byte_offset.checked_add(delta)?;
+                    cur = base;
+                }
+                _ => match chain_step(inst) {
+                    ChainStep::Follow(next) => cur = next,
+                    ChainStep::Stop => return None,
+                },
             },
             _ => return None,
         }
@@ -972,7 +1009,98 @@ fn analyze(
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StridedWidth {
+    X4,
+    X4Compact,
+    X8,
+}
+
+impl StridedWidth {
+    fn vector_bytes(self) -> u64 {
+        match self {
+            Self::X4 => 16,
+            Self::X4Compact | Self::X8 => 32,
+        }
+    }
+
+    /// `analyze` counts four-dword groups. Exact SSE2 handles the same proven
+    /// prefix as twice as many two-dword groups; compact SSE2 and AVX2 retain
+    /// the four-dword group count. Any remainder stays in the scalar loop.
+    fn safe_vecs(self, x8_vecs: u64) -> u64 {
+        match self {
+            Self::X4 => x8_vecs * 2,
+            Self::X4Compact | Self::X8 => x8_vecs,
+        }
+    }
+
+    fn load(self, contiguous: bool) -> IntrinsicOp {
+        match (self, contiguous) {
+            (Self::X4, true) => IntrinsicOp::VecLoadI32x4,
+            (Self::X4, false) => IntrinsicOp::VecLoadStrided2I32x4,
+            (Self::X4Compact, true) => IntrinsicOp::VecLoadStrided2CompactI32x4,
+            (Self::X4Compact, false) => {
+                unreachable!("compact strided load requires the contiguous-window proof")
+            }
+            (Self::X8, true) => IntrinsicOp::VecLoadI32x8,
+            (Self::X8, false) => IntrinsicOp::VecLoadStrided2I32x8,
+        }
+    }
+
+    fn broadcast(self) -> IntrinsicOp {
+        match self {
+            Self::X4 | Self::X4Compact => IntrinsicOp::VecBroadcastI32x4,
+            Self::X8 => IntrinsicOp::VecBroadcastI32x8,
+        }
+    }
+
+    fn zero(self) -> IntrinsicOp {
+        match self {
+            Self::X4 | Self::X4Compact => IntrinsicOp::VecZeroI32x4,
+            Self::X8 => IntrinsicOp::VecZeroI32x8,
+        }
+    }
+
+    fn bin_op(self, op: IrBinOp) -> IntrinsicOp {
+        match (self, op) {
+            (Self::X4 | Self::X4Compact, IrBinOp::Add) => IntrinsicOp::VecAddI32x4,
+            (Self::X4 | Self::X4Compact, IrBinOp::Sub) => IntrinsicOp::VecSubI32x4,
+            (Self::X4 | Self::X4Compact, IrBinOp::Mul) => IntrinsicOp::VecMulI32x4,
+            (Self::X4 | Self::X4Compact, IrBinOp::And) => IntrinsicOp::VecAndI32x4,
+            (Self::X4 | Self::X4Compact, IrBinOp::Or) => IntrinsicOp::VecOrI32x4,
+            (Self::X4 | Self::X4Compact, IrBinOp::Xor) => IntrinsicOp::VecXorI32x4,
+            (Self::X8, IrBinOp::Add) => IntrinsicOp::VecAddI32x8,
+            (Self::X8, IrBinOp::Sub) => IntrinsicOp::VecSubI32x8,
+            (Self::X8, IrBinOp::Mul) => IntrinsicOp::VecMulI32x8,
+            (Self::X8, IrBinOp::And) => IntrinsicOp::VecAndI32x8,
+            (Self::X8, IrBinOp::Or) => IntrinsicOp::VecOrI32x8,
+            (Self::X8, IrBinOp::Xor) => IntrinsicOp::VecXorI32x8,
+            _ => unreachable!("validated strided lane operation"),
+        }
+    }
+
+    fn shift_op(self, op: IrBinOp) -> IntrinsicOp {
+        match (self, op) {
+            (Self::X4 | Self::X4Compact, IrBinOp::Shl) => IntrinsicOp::VecShlI32x4,
+            (Self::X4 | Self::X4Compact, IrBinOp::LShr) => IntrinsicOp::VecLShrI32x4,
+            (Self::X4 | Self::X4Compact, IrBinOp::AShr) => IntrinsicOp::VecAShrI32x4,
+            (Self::X8, IrBinOp::Shl) => IntrinsicOp::VecShlI32x8,
+            (Self::X8, IrBinOp::LShr) => IntrinsicOp::VecLShrI32x8,
+            (Self::X8, IrBinOp::AShr) => IntrinsicOp::VecAShrI32x8,
+            _ => unreachable!("validated constant strided shift"),
+        }
+    }
+
+    fn horizontal_add(self) -> IntrinsicOp {
+        match self {
+            Self::X4 | Self::X4Compact => IntrinsicOp::VecHorizontalAddI32x4,
+            Self::X8 => IntrinsicOp::VecHorizontalAddI32x8,
+        }
+    }
+}
+
 struct EmitCtx<'a> {
+    width: StridedWidth,
     load_bases: &'a [Value],
     wide_load_proven: &'a [bool],
     byte_iv: Value,
@@ -1004,11 +1132,7 @@ impl EmitCtx<'_> {
                 }
                 self.body_insts.push(Instruction::Intrinsic {
                     dest: Some(dest),
-                    op: if self.wide_load_proven[*idx] {
-                        IntrinsicOp::VecLoadI32x8
-                    } else {
-                        IntrinsicOp::VecLoadStrided2I32x8
-                    },
+                    op: self.width.load(self.wide_load_proven[*idx]),
                     dest_ptr: None,
                     args,
                 });
@@ -1028,7 +1152,7 @@ impl EmitCtx<'_> {
                 let dest = self.fresh();
                 self.preheader_insts.push(Instruction::Intrinsic {
                     dest: Some(dest),
-                    op: IntrinsicOp::VecBroadcastI32x8,
+                    op: self.width.broadcast(),
                     dest_ptr: None,
                     args: vec![bcast_src],
                 });
@@ -1041,12 +1165,7 @@ impl EmitCtx<'_> {
                     let StridedExpr::Invariant(sh_op) = r.as_ref() else {
                         unreachable!("validated constant shift")
                     };
-                    let vec_op = match op {
-                        IrBinOp::Shl => IntrinsicOp::VecShlI32x8,
-                        IrBinOp::LShr => IntrinsicOp::VecLShrI32x8,
-                        IrBinOp::AShr => IntrinsicOp::VecAShrI32x8,
-                        _ => unreachable!(),
-                    };
+                    let vec_op = self.width.shift_op(*op);
                     let dest = self.fresh();
                     self.body_insts.push(Instruction::Intrinsic {
                         dest: Some(dest),
@@ -1057,15 +1176,7 @@ impl EmitCtx<'_> {
                     return dest;
                 }
                 let rv = self.emit(r);
-                let vec_op = match op {
-                    IrBinOp::Add => IntrinsicOp::VecAddI32x8,
-                    IrBinOp::Sub => IntrinsicOp::VecSubI32x8,
-                    IrBinOp::Mul => IntrinsicOp::VecMulI32x8,
-                    IrBinOp::And => IntrinsicOp::VecAndI32x8,
-                    IrBinOp::Or => IntrinsicOp::VecOrI32x8,
-                    IrBinOp::Xor => IntrinsicOp::VecXorI32x8,
-                    _ => unreachable!(),
-                };
+                let vec_op = self.width.bin_op(*op);
                 let dest = self.fresh();
                 self.body_insts.push(Instruction::Intrinsic {
                     dest: Some(dest),
@@ -1080,15 +1191,36 @@ impl EmitCtx<'_> {
 }
 
 fn transform(func: &mut IrFunction, p: &StridedI32ReducePattern) -> usize {
-    // Two independent accumulator chains when there are enough vectors to
-    // keep both `vpaddd` pipelines busy.
-    let unroll: u64 = if p.safe_vecs >= 8 { 4 } else { 1 };
-    let vec_turns = p.safe_vecs / unroll;
+    let width = if x86_avx2_available() && !sse2_forced() {
+        StridedWidth::X8
+    } else if p.wide_load_proven.iter().all(|&proven| proven) {
+        // Every stream can read its full 32-byte window: compact two XMM
+        // halves into four real lanes instead of carrying zero odd lanes.
+        StridedWidth::X4Compact
+    } else {
+        // One unknown stream is enough to keep the whole expression on the
+        // exact-access representation; mixing lane meanings is not valid.
+        StridedWidth::X4
+    };
+    let vector_bytes = width.vector_bytes();
+    let safe_vecs = width.safe_vecs(p.safe_vecs);
+    // Preserve the proven AVX2 schedule exactly. SSE2 uses the same two
+    // independent accumulator chains, but only two XMM copies per turn:
+    // four copies were measured as a substantial regression.
+    let unroll: u64 = if safe_vecs >= 8 {
+        match width {
+            StridedWidth::X4 | StridedWidth::X4Compact => 2,
+            StridedWidth::X8 => 4,
+        }
+    } else {
+        1
+    };
+    let vec_turns = safe_vecs / unroll;
     if vec_turns == 0 {
         return 0;
     }
-    let step_bytes = (unroll * VECTOR_BYTES) as i64;
-    let total_vec_bytes = (vec_turns * unroll * VECTOR_BYTES) as i64;
+    let step_bytes = (unroll * vector_bytes) as i64;
+    let total_vec_bytes = (vec_turns * unroll * vector_bytes) as i64;
     // Decline *before* any mutation: every rewrite below assumes this constant
     // is representable in the IV's own type.
     let Some(rem_iv_const) = resume_offset_const(p.iv_ty, total_vec_bytes) else {
@@ -1104,6 +1236,10 @@ fn transform(func: &mut IrFunction, p: &StridedI32ReducePattern) -> usize {
         }
         uses_iv(&p.expr)
     };
+    // Two compact XMM streams can carry adjacent IV vectors directly. This
+    // replaces the second stream's per-turn register copy + offset add with
+    // one in-place step, while consuming the offset constant's old register.
+    let multi_iv = width == StridedWidth::X4Compact && unroll == 2 && needs_iv_vec;
 
     let mut next_val = func.next_value_id;
     let mut fresh = || {
@@ -1132,18 +1268,18 @@ fn transform(func: &mut IrFunction, p: &StridedI32ReducePattern) -> usize {
     let acc0_init = fresh();
     preheader_insts.push(Instruction::Intrinsic {
         dest: Some(acc0_init),
-        op: IntrinsicOp::VecZeroI32x8,
+        op: width.zero(),
         dest_ptr: None,
         args: vec![],
     });
     let acc0_phi = fresh();
     let acc0_next = fresh();
 
-    let (acc1_init, acc1_phi, acc1_next) = if unroll == 4 {
+    let (acc1_init, acc1_phi, acc1_next) = if unroll > 1 {
         let init = fresh();
         preheader_insts.push(Instruction::Intrinsic {
             dest: Some(init),
-            op: IntrinsicOp::VecZeroI32x8,
+            op: width.zero(),
             dest_ptr: None,
             args: vec![],
         });
@@ -1152,7 +1288,7 @@ fn transform(func: &mut IrFunction, p: &StridedI32ReducePattern) -> usize {
         (None, None, None)
     };
 
-    let ones_tbl = {
+    let ones_tbl = (width == StridedWidth::X8).then(|| {
         let tbl = fresh();
         // 16 i16 lanes `[1, 0, 1, 0, ..., 1, 0]` so `vpmaddwd(tbl, ones_tbl)`
         // zero/sign-extends the 8 even i16 lanes of `tbl` into i32x8 class 5.
@@ -1170,57 +1306,106 @@ fn transform(func: &mut IrFunction, p: &StridedI32ReducePattern) -> usize {
             args: bytes,
         });
         tbl
-    };
+    });
 
-    let (iv_vec_init, iv_vec_phi, iv_vec_next, iv_step_vec, iv_off_vecs) = if needs_iv_vec {
-        let raw_tbl = fresh();
-        // 16 i16 lanes `[0, 0, 0, 0, 8, 0, 0, 0, 16, 0, 0, 0, 24, 0, 0, 0]` ->
-        // `vpmaddwd(raw_tbl, ones_tbl)` produces i32x8 `[0, 0, 8, 0, 16, 0, 24, 0]`
-        // directly in reduction web class 5 (`I32x8`), keeping `iv_vec_phi`
-        // register-homed in a YMM register across the loop.
-        let lane_i16: [i16; 16] = [0, 0, 0, 0, 8, 0, 0, 0, 16, 0, 0, 0, 24, 0, 0, 0];
-        let mut init_bytes = Vec::with_capacity(32);
-        for v in lane_i16 {
-            for b in v.to_le_bytes() {
-                init_bytes.push(Operand::Const(IrConst::I8(b as i8)));
+    let (iv_vec_init, iv_vec_phi, iv_vec_next, iv_step_vec, iv_off_vecs, iv_extra) = if needs_iv_vec
+    {
+        let init = if width == StridedWidth::X8 {
+            let raw_tbl = fresh();
+            // 16 i16 lanes `[0, 0, 0, 0, 8, 0, 0, 0, 16, 0, 0, 0, 24, 0, 0, 0]` ->
+            // `vpmaddwd(raw_tbl, ones_tbl)` produces i32x8 `[0, 0, 8, 0, 16, 0, 24, 0]`
+            // directly in reduction web class 5 (`I32x8`), keeping `iv_vec_phi`
+            // register-homed in a YMM register across the loop.
+            let lane_i16: [i16; 16] = [0, 0, 0, 0, 8, 0, 0, 0, 16, 0, 0, 0, 24, 0, 0, 0];
+            let mut init_bytes = Vec::with_capacity(32);
+            for v in lane_i16 {
+                for b in v.to_le_bytes() {
+                    init_bytes.push(Operand::Const(IrConst::I8(b as i8)));
+                }
             }
-        }
-        preheader_insts.push(Instruction::Intrinsic {
-            dest: Some(raw_tbl),
-            op: IntrinsicOp::VecConstI8x32,
-            dest_ptr: None,
-            args: init_bytes,
-        });
-        let init = fresh();
-        preheader_insts.push(Instruction::Intrinsic {
-            dest: Some(init),
-            op: IntrinsicOp::VecMaddwdI16x16,
-            dest_ptr: None,
-            args: vec![Operand::Value(raw_tbl), Operand::Value(ones_tbl)],
-        });
+            preheader_insts.push(Instruction::Intrinsic {
+                dest: Some(raw_tbl),
+                op: IntrinsicOp::VecConstI8x32,
+                dest_ptr: None,
+                args: init_bytes,
+            });
+            let init = fresh();
+            preheader_insts.push(Instruction::Intrinsic {
+                dest: Some(init),
+                op: IntrinsicOp::VecMaddwdI16x16,
+                dest_ptr: None,
+                args: vec![Operand::Value(raw_tbl), Operand::Value(ones_tbl.unwrap())],
+            });
+            init
+        } else {
+            let init = fresh();
+            let lanes: [i32; 4] = if width == StridedWidth::X4Compact {
+                [0, 8, 16, 24]
+            } else {
+                [0, 0, 8, 0]
+            };
+            preheader_insts.push(Instruction::Intrinsic {
+                dest: Some(init),
+                op: IntrinsicOp::VecPackI32x4,
+                dest_ptr: None,
+                args: lanes
+                    .into_iter()
+                    .map(|v| Operand::Const(IrConst::I32(v)))
+                    .collect(),
+            });
+            init
+        };
         let step_v = fresh();
         preheader_insts.push(Instruction::Intrinsic {
             dest: Some(step_v),
-            op: IntrinsicOp::VecBroadcastI32x8,
+            op: width.broadcast(),
             dest_ptr: None,
             args: vec![Operand::Const(IrConst::I32(step_bytes as i32))],
         });
         let mut offs = Vec::new();
-        if unroll == 4 {
-            for copy_idx in 1..4i32 {
-                let ov = fresh();
-                preheader_insts.push(Instruction::Intrinsic {
-                    dest: Some(ov),
-                    op: IntrinsicOp::VecBroadcastI32x8,
-                    dest_ptr: None,
-                    args: vec![Operand::Const(IrConst::I32(copy_idx * 32))],
-                });
-                offs.push(ov);
+        let mut extra = Vec::new();
+        if unroll > 1 {
+            for copy_idx in 1..unroll as i32 {
+                let byte_offset = copy_idx * vector_bytes as i32;
+                if multi_iv {
+                    let init = fresh();
+                    preheader_insts.push(Instruction::Intrinsic {
+                        dest: Some(init),
+                        op: IntrinsicOp::VecPackI32x4,
+                        dest_ptr: None,
+                        args: [
+                            byte_offset,
+                            byte_offset + 8,
+                            byte_offset + 16,
+                            byte_offset + 24,
+                        ]
+                        .into_iter()
+                        .map(|v| Operand::Const(IrConst::I32(v)))
+                        .collect(),
+                    });
+                    extra.push((init, fresh(), fresh()));
+                } else {
+                    let ov = fresh();
+                    preheader_insts.push(Instruction::Intrinsic {
+                        dest: Some(ov),
+                        op: width.broadcast(),
+                        dest_ptr: None,
+                        args: vec![Operand::Const(IrConst::I32(byte_offset))],
+                    });
+                    offs.push(ov);
+                }
             }
         }
-        (Some(init), Some(fresh()), Some(fresh()), Some(step_v), offs)
+        (
+            Some(init),
+            Some(fresh()),
+            Some(fresh()),
+            Some(step_v),
+            offs,
+            extra,
+        )
     } else {
-        (None, None, None, None, Vec::new())
+        (None, None, None, None, Vec::new(), Vec::new())
     };
 
     let byte_iv_phi = fresh();
@@ -1228,6 +1413,7 @@ fn transform(func: &mut IrFunction, p: &StridedI32ReducePattern) -> usize {
     let vec_cmp_dest = fresh();
 
     let mut ctx = EmitCtx {
+        width,
         load_bases: &p.load_bases,
         wide_load_proven: &p.wide_load_proven,
         byte_iv: byte_iv_phi,
@@ -1239,18 +1425,24 @@ fn transform(func: &mut IrFunction, p: &StridedI32ReducePattern) -> usize {
         next_val,
     };
 
-    if unroll == 4 {
-        let mut copy_vals = Vec::with_capacity(4);
-        for copy_idx in 0..4usize {
-            ctx.byte_disp = (copy_idx as i64) * 32;
+    if unroll > 1 {
+        let mut copy_vals = Vec::with_capacity(unroll as usize);
+        for copy_idx in 0..unroll as usize {
+            ctx.byte_disp = (copy_idx as i64) * vector_bytes as i64;
             if needs_iv_vec {
-                if copy_idx == 0 {
+                if multi_iv {
+                    ctx.vec_iv = if copy_idx == 0 {
+                        iv_vec_phi.unwrap()
+                    } else {
+                        iv_extra[copy_idx - 1].1
+                    };
+                } else if copy_idx == 0 {
                     ctx.vec_iv = iv_vec_phi.unwrap();
                 } else {
                     let cur_iv = ctx.fresh();
                     ctx.body_insts.push(Instruction::Intrinsic {
                         dest: Some(cur_iv),
-                        op: IntrinsicOp::VecAddI32x8,
+                        op: width.bin_op(IrBinOp::Add),
                         dest_ptr: None,
                         args: vec![
                             Operand::Value(iv_vec_phi.unwrap()),
@@ -1262,51 +1454,81 @@ fn transform(func: &mut IrFunction, p: &StridedI32ReducePattern) -> usize {
             }
             copy_vals.push(ctx.emit(&p.expr));
         }
-        let sum02 = ctx.fresh();
-        ctx.body_insts.push(Instruction::Intrinsic {
-            dest: Some(sum02),
-            op: IntrinsicOp::VecAddI32x8,
-            dest_ptr: None,
-            args: vec![Operand::Value(acc0_phi), Operand::Value(copy_vals[0])],
-        });
-        ctx.body_insts.push(Instruction::Intrinsic {
-            dest: Some(acc0_next),
-            op: IntrinsicOp::VecAddI32x8,
-            dest_ptr: None,
-            args: vec![Operand::Value(sum02), Operand::Value(copy_vals[2])],
-        });
-        let sum13 = ctx.fresh();
-        ctx.body_insts.push(Instruction::Intrinsic {
-            dest: Some(sum13),
-            op: IntrinsicOp::VecAddI32x8,
-            dest_ptr: None,
-            args: vec![
-                Operand::Value(acc1_phi.unwrap()),
-                Operand::Value(copy_vals[1]),
-            ],
-        });
-        ctx.body_insts.push(Instruction::Intrinsic {
-            dest: Some(acc1_next.unwrap()),
-            op: IntrinsicOp::VecAddI32x8,
-            dest_ptr: None,
-            args: vec![Operand::Value(sum13), Operand::Value(copy_vals[3])],
-        });
+        if unroll == 4 {
+            let sum02 = ctx.fresh();
+            ctx.body_insts.push(Instruction::Intrinsic {
+                dest: Some(sum02),
+                op: width.bin_op(IrBinOp::Add),
+                dest_ptr: None,
+                args: vec![Operand::Value(acc0_phi), Operand::Value(copy_vals[0])],
+            });
+            ctx.body_insts.push(Instruction::Intrinsic {
+                dest: Some(acc0_next),
+                op: width.bin_op(IrBinOp::Add),
+                dest_ptr: None,
+                args: vec![Operand::Value(sum02), Operand::Value(copy_vals[2])],
+            });
+            let sum13 = ctx.fresh();
+            ctx.body_insts.push(Instruction::Intrinsic {
+                dest: Some(sum13),
+                op: width.bin_op(IrBinOp::Add),
+                dest_ptr: None,
+                args: vec![
+                    Operand::Value(acc1_phi.unwrap()),
+                    Operand::Value(copy_vals[1]),
+                ],
+            });
+            ctx.body_insts.push(Instruction::Intrinsic {
+                dest: Some(acc1_next.unwrap()),
+                op: width.bin_op(IrBinOp::Add),
+                dest_ptr: None,
+                args: vec![Operand::Value(sum13), Operand::Value(copy_vals[3])],
+            });
+        } else {
+            ctx.body_insts.push(Instruction::Intrinsic {
+                dest: Some(acc0_next),
+                op: width.bin_op(IrBinOp::Add),
+                dest_ptr: None,
+                args: vec![Operand::Value(acc0_phi), Operand::Value(copy_vals[0])],
+            });
+            ctx.body_insts.push(Instruction::Intrinsic {
+                dest: Some(acc1_next.unwrap()),
+                op: width.bin_op(IrBinOp::Add),
+                dest_ptr: None,
+                args: vec![
+                    Operand::Value(acc1_phi.unwrap()),
+                    Operand::Value(copy_vals[1]),
+                ],
+            });
+        }
     } else {
         ctx.byte_disp = 0;
         let v0 = ctx.emit(&p.expr);
         ctx.body_insts.push(Instruction::Intrinsic {
             dest: Some(acc0_next),
-            op: IntrinsicOp::VecAddI32x8,
+            op: width.bin_op(IrBinOp::Add),
             dest_ptr: None,
             args: vec![Operand::Value(acc0_phi), Operand::Value(v0)],
         });
     }
 
-    if let (Some(iv_phi_v), Some(iv_next_v), Some(step_v)) = (iv_vec_phi, iv_vec_next, iv_step_vec)
+    if multi_iv {
+        for (phi, next) in std::iter::once((iv_vec_phi.unwrap(), iv_vec_next.unwrap()))
+            .chain(iv_extra.iter().map(|&(_, phi, next)| (phi, next)))
+        {
+            ctx.body_insts.push(Instruction::Intrinsic {
+                dest: Some(next),
+                op: width.bin_op(IrBinOp::Add),
+                dest_ptr: None,
+                args: vec![Operand::Value(phi), Operand::Value(iv_step_vec.unwrap())],
+            });
+        }
+    } else if let (Some(iv_phi_v), Some(iv_next_v), Some(step_v)) =
+        (iv_vec_phi, iv_vec_next, iv_step_vec)
     {
         ctx.body_insts.push(Instruction::Intrinsic {
             dest: Some(iv_next_v),
-            op: IntrinsicOp::VecAddI32x8,
+            op: width.bin_op(IrBinOp::Add),
             dest_ptr: None,
             args: vec![Operand::Value(iv_phi_v), Operand::Value(step_v)],
         });
@@ -1357,6 +1579,16 @@ fn transform(func: &mut IrFunction, p: &StridedI32ReducePattern) -> usize {
             ],
         });
     }
+    for &(init, phi, next) in &iv_extra {
+        header_insts.push(Instruction::Phi {
+            dest: phi,
+            ty: IrType::I32,
+            incoming: vec![
+                (Operand::Value(init), preheader_label),
+                (Operand::Value(next), vec_body_label),
+            ],
+        });
+    }
     header_insts.push(Instruction::Cmp {
         dest: vec_cmp_dest,
         op: IrCmpOp::Ult,
@@ -1365,14 +1597,15 @@ fn transform(func: &mut IrFunction, p: &StridedI32ReducePattern) -> usize {
         ty: IrType::U64,
     });
 
-    // Reduce block: sum accumulators, mask even lanes 0,2,4,6, horizontal add,
-    // add `acc_init`, and hand off to the scalar header at `total_vec_bytes`.
+    // Reduce block: sum accumulators, mask only an even-lane representation,
+    // horizontally add, add `acc_init`, and hand off to the scalar header at
+    // `total_vec_bytes`.
     let mut reduce_insts = Vec::new();
     let merged_acc = if let Some(acc1_v) = acc1_phi {
         let m = ctx.fresh();
         reduce_insts.push(Instruction::Intrinsic {
             dest: Some(m),
-            op: IntrinsicOp::VecAddI32x8,
+            op: width.bin_op(IrBinOp::Add),
             dest_ptr: None,
             args: vec![Operand::Value(acc0_phi), Operand::Value(acc1_v)],
         });
@@ -1380,38 +1613,65 @@ fn transform(func: &mut IrFunction, p: &StridedI32ReducePattern) -> usize {
     } else {
         acc0_phi
     };
-    let mask_tbl = ctx.fresh();
-    let mask_i16: [i16; 16] = [-1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0];
-    let mut mask_bytes = Vec::with_capacity(32);
-    for v in mask_i16 {
-        for b in v.to_le_bytes() {
-            mask_bytes.push(Operand::Const(IrConst::I8(b as i8)));
+    let masked_acc = if width == StridedWidth::X4Compact {
+        // All four lanes are real strided elements; no odd-lane mask exists.
+        merged_acc
+    } else if width == StridedWidth::X8 {
+        let mask_tbl = ctx.fresh();
+        let mask_i16: [i16; 16] = [-1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0];
+        let mut mask_bytes = Vec::with_capacity(32);
+        for v in mask_i16 {
+            for b in v.to_le_bytes() {
+                mask_bytes.push(Operand::Const(IrConst::I8(b as i8)));
+            }
         }
-    }
-    reduce_insts.push(Instruction::Intrinsic {
-        dest: Some(mask_tbl),
-        op: IntrinsicOp::VecConstI8x32,
-        dest_ptr: None,
-        args: mask_bytes,
-    });
-    let even_mask = ctx.fresh();
-    reduce_insts.push(Instruction::Intrinsic {
-        dest: Some(even_mask),
-        op: IntrinsicOp::VecMaddwdI16x16,
-        dest_ptr: None,
-        args: vec![Operand::Value(mask_tbl), Operand::Value(ones_tbl)],
-    });
-    let masked_acc = ctx.fresh();
-    reduce_insts.push(Instruction::Intrinsic {
-        dest: Some(masked_acc),
-        op: IntrinsicOp::VecAndI32x8,
-        dest_ptr: None,
-        args: vec![Operand::Value(merged_acc), Operand::Value(even_mask)],
-    });
+        reduce_insts.push(Instruction::Intrinsic {
+            dest: Some(mask_tbl),
+            op: IntrinsicOp::VecConstI8x32,
+            dest_ptr: None,
+            args: mask_bytes,
+        });
+        let even_mask = ctx.fresh();
+        reduce_insts.push(Instruction::Intrinsic {
+            dest: Some(even_mask),
+            op: IntrinsicOp::VecMaddwdI16x16,
+            dest_ptr: None,
+            args: vec![Operand::Value(mask_tbl), Operand::Value(ones_tbl.unwrap())],
+        });
+        let masked_acc = ctx.fresh();
+        reduce_insts.push(Instruction::Intrinsic {
+            dest: Some(masked_acc),
+            op: width.bin_op(IrBinOp::And),
+            dest_ptr: None,
+            args: vec![Operand::Value(merged_acc), Operand::Value(even_mask)],
+        });
+        masked_acc
+    } else {
+        let even_mask = ctx.fresh();
+        reduce_insts.push(Instruction::Intrinsic {
+            dest: Some(even_mask),
+            op: IntrinsicOp::VecPackI32x4,
+            dest_ptr: None,
+            args: vec![
+                Operand::Const(IrConst::I32(-1)),
+                Operand::Const(IrConst::I32(0)),
+                Operand::Const(IrConst::I32(-1)),
+                Operand::Const(IrConst::I32(0)),
+            ],
+        });
+        let masked_acc = ctx.fresh();
+        reduce_insts.push(Instruction::Intrinsic {
+            dest: Some(masked_acc),
+            op: width.bin_op(IrBinOp::And),
+            dest_ptr: None,
+            args: vec![Operand::Value(merged_acc), Operand::Value(even_mask)],
+        });
+        masked_acc
+    };
     let hsum = ctx.fresh();
     reduce_insts.push(Instruction::Intrinsic {
         dest: Some(hsum),
-        op: IntrinsicOp::VecHorizontalAddI32x8,
+        op: width.horizontal_add(),
         dest_ptr: None,
         args: vec![Operand::Value(masked_acc)],
     });
@@ -1491,13 +1751,18 @@ mod tests {
     #[test]
     fn exact_load_groups_never_add_a_scalar_iteration() {
         for scalar_trips in MIN_SCALAR_TRIPS..=200_000 {
-            let vecs = safe_vec_count(scalar_trips);
-            if vecs > 0 {
-                for lane in 0..4 {
-                    let scalar_iteration = (vecs - 1) * 4 + lane;
-                    assert!(scalar_iteration < scalar_trips);
-                    let vector_address = (vecs - 1) * VECTOR_BYTES + lane * SCALAR_STEP_BYTES;
-                    assert_eq!(vector_address, scalar_iteration * SCALAR_STEP_BYTES);
+            let x8_vecs = safe_vec_count(scalar_trips);
+            for width in [StridedWidth::X4, StridedWidth::X4Compact, StridedWidth::X8] {
+                let vecs = width.safe_vecs(x8_vecs);
+                let lanes = width.vector_bytes() / SCALAR_STEP_BYTES;
+                if vecs > 0 {
+                    for lane in 0..lanes {
+                        let scalar_iteration = (vecs - 1) * lanes + lane;
+                        assert!(scalar_iteration < scalar_trips, "{width:?}");
+                        let vector_address =
+                            (vecs - 1) * width.vector_bytes() + lane * SCALAR_STEP_BYTES;
+                        assert_eq!(vector_address, scalar_iteration * SCALAR_STEP_BYTES);
+                    }
                 }
             }
         }
@@ -1558,8 +1823,11 @@ mod tests {
         let mut redirected = facts(&[("arr", 4096)]);
         redirected.aliased_names.insert("arr".to_string());
         assert!(!wide_load_proven(&f, Value(0), 128, &redirected));
-        // A GEP off the global keeps the root (offset is irrelevant to the
-        // extent proof; the loop's own exit bounds the window).
+        // A constant GEP off the global keeps the root, but its byte offset
+        // consumes part of the object extent. With 16 scalar iterations the
+        // final scalar dword ends at offset 131, so a 132-byte object is a
+        // valid scalar input; the 128-byte vector window ends at offset 135
+        // and must be refused. The exact 136-byte boundary is admitted.
         f.blocks[0].instructions.push(Instruction::GetElementPtr {
             dest: Value(1),
             base: Value(0),
@@ -1572,12 +1840,61 @@ mod tests {
             128,
             &facts(&[("arr", 4096)])
         ));
+        assert!(!wide_load_proven(
+            &f,
+            Value(1),
+            128,
+            &facts(&[("arr", 132)])
+        ));
+        assert!(!wide_load_proven(
+            &f,
+            Value(1),
+            128,
+            &facts(&[("arr", 135)])
+        ));
+        assert!(wide_load_proven(&f, Value(1), 128, &facts(&[("arr", 136)])));
+        // The frontend may canonicalize the same constant displacement as a
+        // pointer-typed integer add instead of a GEP; the extent is identical.
+        *f.blocks[0].instructions.last_mut().unwrap() = Instruction::BinOp {
+            dest: Value(1),
+            op: IrBinOp::Add,
+            lhs: Operand::Value(Value(0)),
+            rhs: Operand::Const(IrConst::I64(8)),
+            ty: IrType::I64,
+        };
+        assert!(!wide_load_proven(
+            &f,
+            Value(1),
+            128,
+            &facts(&[("arr", 135)])
+        ));
+        assert!(wide_load_proven(&f, Value(1), 128, &facts(&[("arr", 136)])));
+        // A nonconstant offset has no statically checkable remaining extent.
+        *f.blocks[0].instructions.last_mut().unwrap() = Instruction::GetElementPtr {
+            dest: Value(1),
+            base: Value(0),
+            offset: Operand::Value(Value(2)),
+            ty: IrType::U8,
+        };
+        assert!(!wide_load_proven(
+            &f,
+            Value(1),
+            128,
+            &facts(&[("arr", 4096)])
+        ));
     }
 
     #[test]
     fn load_emission_selects_exact_or_proven_private_access() {
-        for private in [false, true] {
+        for (width, private) in [
+            (StridedWidth::X8, false),
+            (StridedWidth::X8, true),
+            (StridedWidth::X4, false),
+            (StridedWidth::X4, true),
+            (StridedWidth::X4Compact, true),
+        ] {
             let mut ctx = EmitCtx {
+                width,
                 load_bases: &[Value(0)],
                 wide_load_proven: &[private],
                 byte_iv: Value(1),
@@ -1592,14 +1909,15 @@ mod tests {
             let Instruction::Intrinsic { op, args, .. } = &ctx.body_insts[0] else {
                 panic!("expected vector load");
             };
-            assert_eq!(
-                *op,
-                if private {
-                    IntrinsicOp::VecLoadI32x8
-                } else {
-                    IntrinsicOp::VecLoadStrided2I32x8
-                }
-            );
+            let expected = match (width, private) {
+                (StridedWidth::X8, true) => IntrinsicOp::VecLoadI32x8,
+                (StridedWidth::X8, false) => IntrinsicOp::VecLoadStrided2I32x8,
+                (StridedWidth::X4, true) => IntrinsicOp::VecLoadI32x4,
+                (StridedWidth::X4, false) => IntrinsicOp::VecLoadStrided2I32x4,
+                (StridedWidth::X4Compact, true) => IntrinsicOp::VecLoadStrided2CompactI32x4,
+                (StridedWidth::X4Compact, false) => unreachable!("tested above only with proof"),
+            };
+            assert_eq!(*op, expected, "{width:?} private={private}");
             assert_eq!(args[2], Operand::Const(IrConst::I64(32)));
         }
     }

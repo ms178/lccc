@@ -1655,6 +1655,8 @@ pub(crate) fn is_raw_reader_intrinsic(op: &crate::ir::intrinsics::IntrinsicOp) -
             | O::VecLoadI32x4
             | O::VecLoadI32x8
             | O::VecLoadStrided2I32x8
+            | O::VecLoadStrided2I32x4
+            | O::VecLoadStrided2CompactI32x4
             | O::VecLoadI8x32
             | O::VecLoadI16x16
             | O::VecLoadF32x4
@@ -2035,6 +2037,8 @@ fn is_vec_ssa_producer(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
             | O::VecLoadI32x4
             | O::VecLoadI32x8
             | O::VecLoadStrided2I32x8
+            | O::VecLoadStrided2I32x4
+            | O::VecLoadStrided2CompactI32x4
             | O::VecLoadF32x4
             | O::VecLoadF32x8
             | O::VecAddF64x2
@@ -3265,6 +3269,8 @@ mod cfg_copy_coalesce_tests {
             O::VecLoadI32x4,
             O::VecLoadI32x8,
             O::VecLoadStrided2I32x8,
+            O::VecLoadStrided2I32x4,
+            O::VecLoadStrided2CompactI32x4,
             O::VecLoadF32x4,
             O::VecLoadF32x8,
             O::VecLoadI8x32,

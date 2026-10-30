@@ -322,7 +322,7 @@ fn update_upper32_zero(t: &str, upper32_zero: &mut [bool]) {
 
     // A 64-bit masked AND with a nonnegative imm32 mask zeroes bits 32..63 for
     // every source value (the imm32 is sign-extended; see
-    // relay_and_lea::andq_imm_narrow_width for the 0x8000_0000 encoding
+    // relay_and_lea::and_imm_narrow_width for the 0x8000_0000 encoding
     // boundary). Without this the generic catch-all below would CLEAR the
     // fact on `andq $127, %r`, blocking a later 32-bit copy from covering a
     // 64-bit reader in the same block.
@@ -331,7 +331,7 @@ fn update_upper32_zero(t: &str, upper32_zero: &mut [bool]) {
             let dst = t[comma + 1..].trim();
             if let Some(df) = family_of_reg_name(dst) {
                 if (df as usize) < upper32_zero.len()
-                    && super::relay_and_lea::andq_imm_narrow_width(t, df).is_some()
+                    && super::relay_and_lea::and_imm_narrow_width(t, df).is_some()
                 {
                     upper32_zero[df as usize] = true;
                     return;
