@@ -1603,6 +1603,7 @@ pub(crate) fn run_passes(
     // outside that count.
     let strided_reduce_allowed = std::env::var_os("CCC_NO_STRIDED_REDUCE").is_none();
     vectorize::set_strided_reduce_enabled(strided_reduce_allowed);
+    vectorize::set_strided_reduce_trace(std::env::var_os("LCCC_VEC_STRIDED_TRACE").is_some());
     inline::set_ssa_param_config(inline::SsaParamConfig {
         enabled: std::env::var("CCC_NO_SSA_PARAM").is_err(),
         skip: std::env::var("CCC_SSA_PARAM_SKIP")
@@ -2420,6 +2421,46 @@ pub(crate) fn run_passes(
             if n > 0 {
                 crate::passes::verify::verify_after_pass(module, "loop_idiom");
             }
+        }
+
+        // Phase 2b-pre-vec: constant-argument propagation BEFORE iteration 0's
+        // vectorizer and post-vectorize unroller.
+        //
+        // IPCP's own slot is at the END of every iteration (Phase 10.5), which
+        // is the right place for call-site simplification but the wrong place
+        // for a callee whose trip count only becomes constant once its `n`
+        // parameter is specialized: `static float sum(const float *v, int n)`
+        // called once with 65536 stays a dynamic-trip loop for the whole
+        // iteration-0 unroller, and by the next iteration `loop_rotate` has
+        // already turned it into the rotated self-loop form that no unroller
+        // accepts.  The unrollers therefore never see the constant trip at
+        // all, and such callees keep one element per branch while the
+        // reference compilers unroll them 4x.  callgrind on
+        // `reduction_vecreg` (the corpus' worst row): 3,277,948,036 insns,
+        // ratio 1.905 against GCC 16.2; with this ordering fix 1,803,403,033,
+        // ratio 1.048 — 1.47e9 instructions, and no other benchmark in the
+        // 86-program corpus moves by even 1% except where it also improved
+        // (libm_round_family -143M, spectral_norm -121M, global_addr_pressure
+        // -1.7M, loop_patterns -0.25M).
+        //
+        // Placement is load-bearing: running it before the Early unroller
+        // instead perturbs shapes that two codegen contracts depend on (their
+        // small constant-trip fixtures then unroll completely and lose the
+        // hoisted store / indexed segment operand the gates count).  After the
+        // Early unroller the reduction unroll still fires — it is the
+        // POST-vectorize phase that needs the constant trip — and those shapes
+        // are untouched.
+        //
+        // The call is idempotent and the late one stays, so nothing that
+        // depends on end-of-iteration IPCP changes shape; only iteration 0's
+        // loop transforms see the specialized body.
+        if iter == 0 && opt_level >= 2 && !optimize_for_size && !dis.ipcp {
+            let n = timed_pass!("ipcp_early", ipcp::run(module));
+            if n > 0 {
+                changed.iter_mut().for_each(|c| *c = true);
+            }
+            total_changes += n;
+            total_changes_excl_dce += n;
         }
 
         // Phase 2b-vec: x86-64 vectorization — iter 0 only, EARLY in pipeline.
@@ -4153,6 +4194,11 @@ mod ivsr_scalar_derived_gate_tests {
 
     #[test]
     fn scalar_derived_ivsr_is_off_by_default() {
+        if !crate::test_support::env_isolate(
+            "passes::ivsr_scalar_derived_gate_tests::scalar_derived_ivsr_is_off_by_default",
+        ) {
+            return;
+        }
         // Unset environment: the measured-regression flavor stays off even
         // when IVSR itself runs.
         let _guard = EnvGuard::unset("CCC_IVSR_SCALAR_DERIVED");
@@ -4164,6 +4210,11 @@ mod ivsr_scalar_derived_gate_tests {
 
     #[test]
     fn scalar_derived_ivsr_opt_in_and_ivsr_gate() {
+        if !crate::test_support::env_isolate(
+            "passes::ivsr_scalar_derived_gate_tests::scalar_derived_ivsr_opt_in_and_ivsr_gate",
+        ) {
+            return;
+        }
         let _set = EnvGuard::set("CCC_IVSR_SCALAR_DERIVED", "1");
         assert!(
             ivsr_scalar_derived_enabled(true),

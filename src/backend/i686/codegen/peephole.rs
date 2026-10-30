@@ -22868,6 +22868,11 @@ f:
 
     #[test]
     fn tmp_debug_isolate_andl_deletion() {
+        if !crate::test_support::env_isolate(
+            "backend::i686::codegen::peephole::tests::tmp_debug_isolate_andl_deletion",
+        ) {
+            return;
+        }
         // Kill-switch isolation: with the testb pass disabled, the AND (and
         // the whole collapsible chain around it) must survive the other
         // passes — the EnvGuard keeps the mutation inside the sanctioned
@@ -23032,6 +23037,11 @@ f:
 
     #[test]
     fn redundant_test_pass_deletes_testb_after_xorb_zero_idiom() {
+        if !crate::test_support::env_isolate(
+            "backend::i686::codegen::peephole::tests::redundant_test_pass_deletes_testb_after_xorb_zero_idiom",
+        ) {
+            return;
+        }
         // L2: flag_equiv_producer listed andb/orb but omitted xorb — with
         // the zero-test pass disabled (the layered defense off), the
         // redundant-test pass must still delete the self-test after the xor
@@ -24620,6 +24630,11 @@ mod sign_test_jcc_tests {
 
     #[test]
     fn dedicated_kill_switch_disables_the_pass() {
+        if !crate::test_support::env_isolate(
+            "backend::i686::codegen::peephole::sign_test_jcc_tests::dedicated_kill_switch_disables_the_pass",
+        ) {
+            return;
+        }
         let _guard = crate::test_support::EnvGuard::set("CCC_NO_I686_SIGN_JCC", "1");
         let (changed, out) = run_pass(&format!(
             ".text\nf:\n.cfi_startproc\n{}\n.cfi_endproc\n.size f, .-f\n",

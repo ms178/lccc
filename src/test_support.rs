@@ -5,6 +5,19 @@
 //! the two, and cargo runs tests on a thread pool while REUSING its threads, so
 //! the leak lands on tests that have nothing to do with the one that failed.
 //! Restoring in `Drop` is the only form that survives a panic.
+//!
+//! The third helper, [`env_isolate`], exists because `Drop` and a lock are not
+//! enough for `environ`: the lock excludes only threads that take it, while
+//! every fold test that reaches `std::env::var_os` walks the `environ` array
+//! unsynchronized.  A guarded window running beside such a reader is a logical
+//! race — observed on hosted CI when a kill-switch window flipped a concurrent
+//! peephole test — and, because glibc's `setenv` may reallocate that array, a
+//! concurrent `getenv` is the exact hazard edition 2024 made these calls
+//! `unsafe` for.  Every test that mutates the environment therefore runs its
+//! whole body in an isolated child process (marker inherited through
+//! `Command::env`, one test selected with `--exact`), so the shared test
+//! process performs no `setenv` at all.  `check_env_test_hygiene` fails the
+//! build if an `EnvGuard::set`/`unset` site grows without `env_isolate`.
 
 use std::ffi::OsString;
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -155,6 +168,56 @@ impl Drop for EnvWindow {
     }
 }
 
+/// Marker: this process is an isolated child spawned by [`run_isolated`].
+// Deliberately lowercase with dashes: the audit census counts `CCC_*`/`LCCC_*`
+// uppercase literals as knob names, and this marker is an internal protocol
+// between a test and its child, not a knob.
+const ISOLATE_CHILD: &str = "lccc-isolated-test-child";
+
+/// Spawn this test binary so exactly one named test runs in an isolated child
+/// process; return `None` when *this* process already is that child.
+///
+/// The parent's environment is never touched: the child only inherits the
+/// marker through `Command::env`, performs its own `EnvGuard` windows in
+/// isolation, and exits.  `--exact` plus the harness's own `1 passed` line is
+/// required because a filter that matches no test exits 0, which would turn a
+/// misnamed test into a silent pass.
+pub(crate) fn run_isolated(test_full_name: &str) -> Option<std::process::Output> {
+    if std::env::var_os(ISOLATE_CHILD).is_some() {
+        return None;
+    }
+    let exe = std::env::current_exe().expect("test binary has a filesystem path");
+    let out = std::process::Command::new(exe)
+        .arg(test_full_name)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env(ISOLATE_CHILD, "1")
+        .output()
+        .expect("failed to spawn the isolated environment-mutation test");
+    Some(out)
+}
+
+/// Parent/child gate for an environment-mutating test: run the caller's body
+/// only in the child (`true`); in the parent (`false`) assert that the child
+/// ran that exact test and passed, then let the caller return.
+pub(crate) fn env_isolate(test_full_name: &str) -> bool {
+    match run_isolated(test_full_name) {
+        None => true,
+        Some(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let ran_exactly_one = stdout.contains("test result: ok. 1 passed; 0 failed");
+            assert!(
+                out.status.success() && ran_exactly_one,
+                "isolated test {test_full_name} did not pass in its child process (status {})\n\
+                 --- child stdout ---\n{stdout}\n--- child stderr ---\n{stderr}",
+                out.status
+            );
+            false
+        }
+    }
+}
+
 /// RAII guard over one process-global environment variable.
 ///
 /// This is the audit that five deferred-work markers — each reading "audit that
@@ -275,6 +338,11 @@ mod tests {
 
     #[test]
     fn env_guard_restores_the_previous_value() {
+        if !crate::test_support::env_isolate(
+            "test_support::tests::env_guard_restores_the_previous_value",
+        ) {
+            return;
+        }
         const KEY: &str = "CCC_TEST_SUPPORT_GUARD_PREVIOUS";
         // Nested on purpose: the window is reentrant for its own thread, which
         // is what makes "a fixture window around per-assertion windows" usable
@@ -296,6 +364,9 @@ mod tests {
 
     #[test]
     fn env_guard_restores_absence() {
+        if !crate::test_support::env_isolate("test_support::tests::env_guard_restores_absence") {
+            return;
+        }
         const KEY: &str = "CCC_TEST_SUPPORT_GUARD_ABSENT";
         let _outer = EnvGuard::unset(KEY);
         assert_eq!(value(KEY), None);
@@ -312,6 +383,11 @@ mod tests {
 
     #[test]
     fn the_guard_restores_even_when_the_body_panics() {
+        if !crate::test_support::env_isolate(
+            "test_support::tests::the_guard_restores_even_when_the_body_panics",
+        ) {
+            return;
+        }
         // The failure mode the deferred-work markers stood in for: an assertion
         // between set and restore.  `catch_unwind` runs the panic here so the
         // rest of the suite still sees a clean environment.
@@ -382,6 +458,11 @@ mod tests {
 
     #[test]
     fn the_lock_serializes_concurrent_guard_holders() {
+        if !crate::test_support::env_isolate(
+            "test_support::tests::the_lock_serializes_concurrent_guard_holders",
+        ) {
+            return;
+        }
         // Not a proof of mutual exclusion (that is the standard library's), but
         // a check that the guard really does hold the lock for its lifetime: if
         // it released early, two threads could be inside the window at once and

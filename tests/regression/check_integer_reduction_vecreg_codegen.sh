@@ -30,10 +30,11 @@ CCC_NO_REDUCTION_VECREG=1 \
 LCCC_FORCE_SSE2=1 "$CCC" -O3 -S "$dir/vectorize_sum_i32.c" -o "$tmp/sse.s"
 "$CCC" "${flags[@]}" -S "$dir/vectorize_sum_i64.c" -o "$tmp/i64.s"
 "$CCC" "${flags[@]}" -S "$dir/vectorize_i64_dot.c" -o "$tmp/i64-dot.s"
+LCCC_FORCE_SSE2=1 "$CCC" -O3 -S "$dir/vectorize_i32_dot_sse2.c" -o "$tmp/sse-dot.s"
 
 python3 - \
     "$tmp/avx.s" "$tmp/avx-control.s" \
-    "$tmp/sse.s" "$tmp/i64.s" "$tmp/i64-dot.s" <<'PY'
+    "$tmp/sse.s" "$tmp/i64.s" "$tmp/i64-dot.s" "$tmp/sse-dot.s" <<'PY'
 import re
 import sys
 
@@ -51,6 +52,7 @@ avx_control = body(sys.argv[2], "main")
 sse = body(sys.argv[3], "sum_i32")
 i64 = body(sys.argv[4], "sum_i64")
 i64_dot = body(sys.argv[5], "dot_i64")
+sse_dot = body(sys.argv[6], "dot_i32")
 stack = r"-?\d+\(%r(?:sp|bp)\)"
 
 # The benchmark contains two two-accumulator loops. Each packed add must
@@ -92,10 +94,33 @@ if re.search(rf"v?paddq {stack}", i64):
 if not re.search(r"pxor %xmm([2-9]|1[0-5]), %xmm\1", i64):
     raise SystemExit("I64: zero producer did not initialize an assigned XMM home directly")
 
-if not re.search(r"vpaddq .*, %(xmm(?:[3-9]|1[0-5])), %\1", i64_dot):
-    raise SystemExit("I64 dot: accumulator is not updated in an XMM3+ home")
-if re.search(rf"v?paddq {stack}", i64_dot):
-    raise SystemExit("I64 dot: packed accumulator still reads a stack home")
-if not re.search(r"pxor %xmm([3-9]|1[0-5]), %xmm\1", i64_dot):
-    raise SystemExit("I64 dot: XMM2 scratch quarantine disabled the whole SIMD pool")
+# I64 (and widening I32->I64) DOTS stay scalar, on cost: no SSE2/AVX2
+# instruction produces a 64x64 low-half product (`vpmullq` is AVX-512DQ), so the
+# packed form is a 13-instruction emulation per TWO lanes -- 6.5 per lane against
+# one scalar `imulq`, plus a stack round-trip for the operand.  callgrind on the
+# `unsigned_reduction` program: 291,009,947 instructions vectorized versus
+# 175,665,816 with the shape refused (GCC 16.2's scalar loop: 202,784,913).
+# The gate therefore asserts the REFUSAL, and pins the XMM2 quarantine on a
+# shape that still vectorizes: an I32 dot at SSE2, whose 4-lane product lowers
+# through `%xmm2` (below).
+for packed in (r"\bv?paddq\b", r"\bpmuludq\b", r"\bpunpcklqdq\b"):
+    if re.search(packed, i64_dot):
+        raise SystemExit(
+            f"I64 dot: packed 64-bit multiply route reappeared ({packed}) -- "
+            f"measured 1.44x the reference compiler's scalar loop"
+        )
+if not re.search(r"\bimulq\b", i64_dot):
+    raise SystemExit("I64 dot: expected one scalar imulq per element")
+
+# SSE2 I32 dot: the product emulation owns `%xmm2`, so every live accumulator
+# must be homed in `%xmm3`+ and the zero producer must initialise such a home
+# directly (the quarantine is the point of the assertion).
+if not re.search(r"paddd %xmm\d+, %(xmm(?:[3-9]|1[0-5]))", sse_dot):
+    raise SystemExit("SSE2 I32 dot: accumulator is not updated in an XMM3+ home")
+if re.search(rf"paddd {stack}", sse_dot):
+    raise SystemExit("SSE2 I32 dot: packed accumulator still reads a stack home")
+if not re.search(r"pxor %xmm([3-9]|1[0-5]), %xmm\1", sse_dot):
+    raise SystemExit("SSE2 I32 dot: XMM2 scratch quarantine disabled the whole SIMD pool")
+if not re.search(r"pmuludq %xmm\d+, %xmm2", sse_dot):
+    raise SystemExit("SSE2 I32 dot: expected the product emulation to stage through %xmm2")
 PY

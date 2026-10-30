@@ -289,6 +289,11 @@ mod tests {
 
     #[test]
     fn script_path_with_baked_sysroot_prefix_prefers_the_stripped_file() {
+        if !crate::test_support::env_isolate(
+            "backend::linker_common::resolve_lib::tests::script_path_with_baked_sysroot_prefix_prefers_the_stripped_file",
+        ) {
+            return;
+        }
         use crate::test_support::EnvGuard;
         let root = temp_root("strip");
         let rootfs = root.join("rootfs");
@@ -320,6 +325,11 @@ mod tests {
 
     #[test]
     fn script_path_prefixes_absolute_names_with_the_sysroot() {
+        if !crate::test_support::env_isolate(
+            "backend::linker_common::resolve_lib::tests::script_path_prefixes_absolute_names_with_the_sysroot",
+        ) {
+            return;
+        }
         use crate::test_support::EnvGuard;
         let root = temp_root("sysroot");
         let rootfs = root.join("rootfs");

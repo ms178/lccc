@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Four invariants this tree used to violate, each checkable by grep — so each can
+# Five invariants this tree used to violate, each checkable by grep — so each can
 # also silently come back unless something fails when it does.
 #
 # 1. No test mutates the process environment except through the RAII guard in
@@ -30,8 +30,24 @@
 #        | grep -v '^src/passes/mod\.rs:' | wc -l
 #
 # 4. No deferred-work markers survive in src/, tests/ or scripts/.  A marker is a
-#    claim that someone will come back; this tree's answer is to do the work, or
-#    to write down why it is not needed.
+# claim that someone will come back; this tree's answer is to do the work, or
+# to write down why it is not needed.
+#
+# 5. Every test that mutates the environment does so in an ISOLATED CHILD
+#    process (`test_support::env_isolate`).  Invariant 1 confines mutation to
+#    the guard, and the guard serializes writers — but neither helps readers:
+#    a fold test reaching `std::env::var_os` never takes the lock, so a
+#    concurrent guarded window is first a logical race (hosted CI, four test
+#    threads, 2026-10-29: the sign-jcc kill-switch window flipped a sibling
+#    peephole test) and, with glibc reallocating `environ` under `setenv`,
+#    the concurrent-`getenv` hazard invariant 1 quotes.  Isolation removes the
+#    mutation from the shared process entirely: the whole test body runs in a
+#    child spawned with `--exact`, the parent's `environ` is never written,
+#    and inside the child no other test exists to race.  The check: an
+#    `EnvGuard::set`/`unset` call line whose enclosing function (a `fn` line
+#    resets the window) contains no `env_isolate(` above it fails.  The
+#    guard's own mechanics tests live in src/test_support.rs and isolate
+#    themselves the same way.
 set -euo pipefail
 
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
@@ -131,8 +147,19 @@ hits=$(grep -rnI -e "$MARKER" src tests scripts 2>/dev/null |
     grep -v '^tests/corpus/clang-c/' || true)
 report "no deferred-work markers in src/, tests/ or scripts/ (verbatim imports excepted)" "$hits"
 
+# 5. environment-mutating tests run in an isolated child process (see the
+# header's fifth invariant).  Call syntax, like check 1.
+hits=$(find src -name '*.rs' -print0 | xargs -0 awk '
+    /^[[:space:]]*(pub(\(crate\))?[[:space:]]+)?fn[[:space:]]/ { iso = 0 }
+    /env_isolate\(/ { iso = 1 }
+    /EnvGuard::set\(|EnvGuard::unset\(/ {
+        if (!iso) print FILENAME ":" NR ": " $0
+    }
+')
+report "environment-mutating tests run behind env_isolate" "$hits"
+
 if (( fail != 0 )); then
     echo "check_env_test_hygiene: FAILED" >&2
     exit 1
 fi
-echo "check_env_test_hygiene: PASS (guard-only env mutation, migrated passes clean, reads not growing, no markers)"
+echo "check_env_test_hygiene: PASS (guard-only env mutation, migrated passes clean, reads not growing, no markers, isolated mutators)"
