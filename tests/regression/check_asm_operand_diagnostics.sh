@@ -175,6 +175,47 @@ do
     run_case "accepted:${body:0:28}" clean "$body"
 done
 
+# ── %c: constant-expression operands only (gcc 16.2 wording) ─────────────────
+# `%c` prints the operand as an assembly constant expression.  LCCC used to
+# print the register *name*, which the kernel's BUG machinery turned into
+# `.word %rcx` in `__bug_table` — silently wrong object data, not an error.
+EXPECT_MESSAGE="invalid 'asm': operand is not a condition code, invalid operand code 'c'"
+run_case c_on_register error \
+    'int f(int x){int r;__asm__ volatile("movl %c1, %0":"=r"(r):"r"(x));return r;}'
+run_case c_on_memory error \
+    'int f(int x){int r;__asm__ volatile("movl %c1, %0":"=r"(r):"m"(x));return r;}'
+run_case c_on_named_tie error \
+    'int f(int b){int s;__asm__ volatile("movl %c1, %0":[s]"=r"(s):"[s]"(b));return s;}'
+run_case c_on_immediate clean \
+    'int f(void){int r;__asm__ volatile("movl %c1, %0":"=r"(r):"i"(7));return r;}'
+
+# ── "i" operands: what gcc folds, and what it refuses ────────────────────────
+# Measured (gcc 16.2, -O2): a function designator and a block-scope constant are
+# folded and printed as their symbol / value; a *mutable* global object is not,
+# and gcc emits both the warning and the error below.
+EXPECT_MESSAGE="impossible constraint in 'asm'"
+run_case symbolic_object_operand error \
+    'int o; int f(int x){__asm__ volatile("addl %c1, %0":"+r"(x):"i"(o));return x;}'
+run_case function_designator clean \
+    'int g(void); int f(int x){__asm__ volatile("addl %c1, %0":"+r"(x):"i"(g));return x;}'
+run_case block_scope_constant clean \
+    'int f(int x){__auto_type k = (1 << 2);__asm__ volatile("addl %c1, %0":"+r"(x):"i"(k));return x;}'
+
+# The folded symbol must reach the template verbatim, exactly as gcc prints it:
+# `addl g, %eax`, not a register materialised through a GOT load.
+printf 'int g(void); int f(int x){ __asm__ volatile("addl %%c1, %%0" : "+r"(x) : "i"(g)); return x; }\n' >"$TMP/foldsym.c"
+"$CCC" -O2 -S "$TMP/foldsym.c" -o "$TMP/foldsym.s"
+if ! grep -Eq '^[[:space:]]+addl[[:space:]]+g,' "$TMP/foldsym.s"; then
+    echo "FAIL: a folded symbol immediate did not print as a symbol" >&2
+    cat "$TMP/foldsym.s" >&2
+    fail=1
+fi
+gcc_expect=$("$GCC" -O2 -S "$TMP/foldsym.c" -o - 2>/dev/null | grep -Ec '^[[:space:]]+addl[[:space:]]+g,')
+if [[ $gcc_expect != 1 ]]; then
+    echo "FAIL: the oracle no longer folds this shape (gcc printed $gcc_expect matches)" >&2
+    fail=1
+fi
+
 if ((fail)); then
     echo "check_asm_operand_diagnostics: FAILED" >&2
     exit 1

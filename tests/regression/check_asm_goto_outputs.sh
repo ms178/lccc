@@ -148,3 +148,90 @@ echo "PASS %l3 counts the implicit read-write input slot"
 expect_diagnostic "%l2 ignores the read-write slot" \
     'int f(int x){ int v=0; asm goto("testl %1,%1; jz %l2" : "+r"(v) : "r"(x) :: L); return v; L: return -1; }' \
     "operand number out of range"
+
+# ── Contract: a plain `%N` also names the goto label ─────────────────────────
+# Measured (gcc 16.2, `-S`): with one flag output and two inputs, the label is
+# operand 3; `%3` prints `$.L3` (the address) and `%l3` prints `.L3`.  LCCC used
+# to reject the plain spelling with "operand number out of range", so real gcc
+# programs that take a goto label's address did not compile at all.
+printf 'int f(int a, int b){ unsigned char o; asm goto("cmpl %%1, %%2\\n\\t# plain=%%3 named=%%l3" : "=@ccne"(o) : "r"(a), "r"(b) :: L); return o; L: return -1; }\n' >"$tmp/plain.c"
+"$CCC" -m64 -std=gnu11 -O2 -S "$tmp/plain.c" -o "$tmp/plain.s"
+grep -Eq '# plain=\$\.L[0-9A-Za-z_.]+ named=\.L[0-9A-Za-z_.]+' "$tmp/plain.s" \
+    || { echo "FAIL: plain %N did not print the label address" >&2; cat "$tmp/plain.s" >&2; exit 1; }
+plain_sym=$(sed -n 's/.*# plain=\$\([^ ]*\) named=\([^ ]*\).*/\1 \2/p' "$tmp/plain.s" | head -1)
+set -- $plain_sym
+[[ $1 == "$2" ]] || { echo "FAIL: plain %N and %lN name different labels ($1 vs $2)" >&2; exit 1; }
+echo "PASS plain %N prints the label address (same symbol as %lN)"
+expect_diagnostic "plain %N past the label slots" \
+    'int f(int a){ unsigned char o; asm goto("cmpl %1,%1\n\t# %3" : "=@ccne"(o) : "r"(a) :: L); return o; L: return -1; }' \
+    "operand number out of range"
+
+# ── Runtime: two flag outputs in one statement ───────────────────────────────
+# gcc 16.2 accepts `"=@ccne"(n), "=@ccl"(l)` and answers 0/1/1, 0/1/1, 0/1/1
+# for (1,2), (2,1), (3,3) at -O0 and -O2.  The fusion analysis proves single
+# output / single use only, so this shape must stay on the materialised path.
+cat >"$tmp/two_cc.c" <<'CEOF'
+#include <stdio.h>
+static int f(int a, int b, int *ne, int *lt) {
+    unsigned char n, l;
+    __asm__ goto("cmpl %4, %3" : "=@ccne"(n), "=@ccl"(l) : "r"(a), "r"(b) : "cc" : out);
+    *ne = n; *lt = l;
+    return 0;
+out:
+    *ne = n; *lt = l;
+    return 1;
+}
+int main(void) {
+    int ne, lt, r1 = f(1, 2, &ne, &lt), a = ne, b = lt;
+    int r2 = f(2, 1, &ne, &lt), c = ne, d = lt;
+    printf("%d %d%d %d %d%d\n", r1, a, b, r2, c, d);
+    return 0;
+}
+CEOF
+"$CCC" -m64 -std=gnu11 -O2 "$tmp/two_cc.c" -o "$tmp/two_cc"
+[[ $("$tmp/two_cc") == "0 11 0 11" ]] \
+    || { echo "FAIL: two flag outputs disagree with gcc ($("$tmp/two_cc"))" >&2; exit 1; }
+echo "PASS two @cc outputs in one statement (gcc-measured values)"
+
+# ── Contract: outputs are defined on every edge at every level ───────────────
+# gcc and clang leave an asm-goto output undefined on a taken edge and disagree
+# with themselves between -O0 and -O2, so the extension is pinned against the
+# -O0 answer instead of an oracle.  Freestanding, so the 32-bit leg needs no
+# multilib headers and runs on any host.
+cat >"$tmp/edges.c" <<'CEOF'
+static void exit_with(int code) {
+#if defined(__x86_64__)
+    __asm__ volatile("syscall" :: "a"(60), "D"(code) : "rcx", "r11", "memory");
+#else
+    __asm__ volatile("int $0x80" :: "a"(1), "b"(code) : "memory");
+#endif
+    __builtin_unreachable();
+}
+__attribute__((noinline)) static int pick(int c, int *p) {
+    int r = 0;
+    __asm__ goto("movl $7, %0\n\ttestl %2, %2\n\tjnz %l3"
+                 : "=r"(r) : "r"(c), "r"(c) : "cc" : taken);
+    *p = r;
+    return *p + 10;
+taken:
+    *p = r;
+    return *p + 20;
+}
+void _start(void) {
+    int v = 0;
+    exit_with((pick(0, &v) * 8 + pick(1, &v)) & 0xff);
+}
+CEOF
+for arch in m64 m32; do
+    want=""
+    for opt in 0 1 2 3 s; do
+        "$CCC" "-$arch" -O"$opt" -ffreestanding -nostdlib -static -fno-pie -no-pie \
+            "$tmp/edges.c" -o "$tmp/edges" 
+        got=0
+        "$tmp/edges" || got=$?
+        if [[ -z $want ]]; then want=$got; fi
+        [[ $got == "$want" ]] \
+            || { echo "FAIL: -$arch -O$opt edge value $got != $want at -O0" >&2; exit 1; }
+    done
+    echo "PASS -$arch asm-goto outputs identical at -O0/-O1/-O2/-O3/-Os ($want)"
+done

@@ -340,6 +340,17 @@ pub(crate) fn substitute_x86_asm_operands(
                     num = num * 10 + (chars[i] as usize - '0' as usize);
                     i += 1;
                 }
+                // A plain `%N` whose index lands in the label slots is a
+                // `goto` label, printed as its address.  gcc measures `%4`
+                // with four operand slots and prints `$.L3` for it.
+                if num >= gcc_to_internal.len() {
+                    let label_idx = num - gcc_to_internal.len();
+                    if label_idx < goto_labels.len() {
+                        result.push('$');
+                        result.push_str(&goto_labels[label_idx].1.to_string());
+                        continue;
+                    }
+                }
                 let internal_idx = if num < gcc_to_internal.len() {
                     gcc_to_internal[num]
                 } else {

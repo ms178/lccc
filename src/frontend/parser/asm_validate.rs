@@ -592,11 +592,17 @@ fn check_template(
             // in GCC's label numbering, but LCCC's regular operand map keeps
             // it as one operand. Label references start after this extra
             // read/write position; ordinary `%N` references do not.
+            // Both spellings reach the label slots: `%lN` (label mnemonic) and
+            // the plain `%N`, which gcc prints as the label's address
+            // (`$.L3`; measured with `-S`).  The plain form also numbers from
+            // the end of the operand map, so the read-write slots are skipped
+            // there too.
+            let label_start = operand_count + readwrite_count;
+            let in_labels = index >= label_start && index < label_start + label_count;
             let out_of_range = if is_label {
-                let label_start = operand_count + readwrite_count;
-                index < label_start || index >= label_start + label_count
+                !in_labels
             } else {
-                index >= operand_count
+                index >= operand_count && !in_labels
             };
             if out_of_range {
                 problems.push(Diagnostic::error(
