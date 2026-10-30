@@ -2872,8 +2872,17 @@ impl Lowerer {
             let shape = self
                 .get_expr_ctype(&args[0])
                 .and_then(|ct| super::vector_simd::simd_shape(&ct));
+            // x86-64 only: this path hands the permutation to `vecssa` as a
+            // register web. The i686 register allocator has no XMM class, so
+            // the promoted chain (vec_shuffle compose + the vector-assign
+            // copies around it) drifted to mismatched slot offsets — the
+            // typed-shuffle ABI gate saw an 8-byte-off read of the
+            // intermediate. i686 keeps the raw Pshufd128 dest_ptr form
+            // below, which needs no homes (the -m32 differential and the
+            // packed-arithmetic ceiling do not depend on this path).
             if let Some(shape) = shape.filter(|_| {
-                !self.expr_access_is_volatile(&args[0])
+                self.target == crate::backend::Target::X86_64
+                    && !self.expr_access_is_volatile(&args[0])
                     && !self.expr_access_is_volatile(&args[1])
                     && self.aggregate_lvalue_space(&args[0]) == AddressSpace::Default
                     && self.aggregate_lvalue_space(&args[1]) == AddressSpace::Default

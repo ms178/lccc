@@ -550,8 +550,8 @@
     "LCCC_VOLATILE_SLOT",
     "LCCC_WHY_NOT_VECTORIZE"
   ],
-  "knobs_undocumented": 265,
-  "panic_sites": 881,
+  "knobs_undocumented": 266,
+  "panic_sites": 941,
   "panic_sites_hot": 101,
   "unsafe_sites": 25
 }
