@@ -70,35 +70,49 @@ pub struct CondCode {
     pub inverse_jcc: &'static str,
 }
 
+impl CondCode {
+    /// Const constructor: keeps one table row on one line, which is what makes
+    /// the table readable as a table and stable under `cargo fmt --check`. A
+    /// struct literal in an array element is reflowed to four lines each.
+    const fn new(
+        gcc: &'static str,
+        setcc: &'static str,
+        jcc: &'static str,
+        inverse_jcc: &'static str,
+    ) -> Self {
+        Self { gcc, setcc, jcc, inverse_jcc }
+    }
+}
+
 pub const CONDITION_CODES: [CondCode; 28] = [
-    CondCode { gcc: "e", setcc: "e", jcc: "je", inverse_jcc: "jne" },
-    CondCode { gcc: "z", setcc: "e", jcc: "je", inverse_jcc: "jne" },
-    CondCode { gcc: "ne", setcc: "ne", jcc: "jne", inverse_jcc: "je" },
-    CondCode { gcc: "nz", setcc: "ne", jcc: "jne", inverse_jcc: "je" },
-    CondCode { gcc: "s", setcc: "s", jcc: "js", inverse_jcc: "jns" },
-    CondCode { gcc: "ns", setcc: "ns", jcc: "jns", inverse_jcc: "js" },
-    CondCode { gcc: "o", setcc: "o", jcc: "jo", inverse_jcc: "jno" },
-    CondCode { gcc: "no", setcc: "no", jcc: "jno", inverse_jcc: "jo" },
-    CondCode { gcc: "c", setcc: "c", jcc: "jc", inverse_jcc: "jnc" },
-    CondCode { gcc: "nc", setcc: "nc", jcc: "jnc", inverse_jcc: "jc" },
-    CondCode { gcc: "a", setcc: "a", jcc: "ja", inverse_jcc: "jbe" },
-    CondCode { gcc: "nbe", setcc: "a", jcc: "ja", inverse_jcc: "jbe" },
-    CondCode { gcc: "ae", setcc: "ae", jcc: "jae", inverse_jcc: "jb" },
-    CondCode { gcc: "nb", setcc: "ae", jcc: "jae", inverse_jcc: "jb" },
-    CondCode { gcc: "b", setcc: "b", jcc: "jb", inverse_jcc: "jae" },
-    CondCode { gcc: "nae", setcc: "b", jcc: "jb", inverse_jcc: "jae" },
-    CondCode { gcc: "be", setcc: "be", jcc: "jbe", inverse_jcc: "ja" },
-    CondCode { gcc: "na", setcc: "be", jcc: "jbe", inverse_jcc: "ja" },
-    CondCode { gcc: "g", setcc: "g", jcc: "jg", inverse_jcc: "jle" },
-    CondCode { gcc: "nle", setcc: "g", jcc: "jg", inverse_jcc: "jle" },
-    CondCode { gcc: "ge", setcc: "ge", jcc: "jge", inverse_jcc: "jl" },
-    CondCode { gcc: "nl", setcc: "ge", jcc: "jge", inverse_jcc: "jl" },
-    CondCode { gcc: "l", setcc: "l", jcc: "jl", inverse_jcc: "jge" },
-    CondCode { gcc: "nge", setcc: "l", jcc: "jl", inverse_jcc: "jge" },
-    CondCode { gcc: "le", setcc: "le", jcc: "jle", inverse_jcc: "jg" },
-    CondCode { gcc: "ng", setcc: "le", jcc: "jle", inverse_jcc: "jg" },
-    CondCode { gcc: "p", setcc: "p", jcc: "jp", inverse_jcc: "jnp" },
-    CondCode { gcc: "np", setcc: "np", jcc: "jnp", inverse_jcc: "jp" },
+    CondCode::new("e", "e", "je", "jne"),
+    CondCode::new("z", "e", "je", "jne"),
+    CondCode::new("ne", "ne", "jne", "je"),
+    CondCode::new("nz", "ne", "jne", "je"),
+    CondCode::new("s", "s", "js", "jns"),
+    CondCode::new("ns", "ns", "jns", "js"),
+    CondCode::new("o", "o", "jo", "jno"),
+    CondCode::new("no", "no", "jno", "jo"),
+    CondCode::new("c", "c", "jc", "jnc"),
+    CondCode::new("nc", "nc", "jnc", "jc"),
+    CondCode::new("a", "a", "ja", "jbe"),
+    CondCode::new("nbe", "a", "ja", "jbe"),
+    CondCode::new("ae", "ae", "jae", "jb"),
+    CondCode::new("nb", "ae", "jae", "jb"),
+    CondCode::new("b", "b", "jb", "jae"),
+    CondCode::new("nae", "b", "jb", "jae"),
+    CondCode::new("be", "be", "jbe", "ja"),
+    CondCode::new("na", "be", "jbe", "ja"),
+    CondCode::new("g", "g", "jg", "jle"),
+    CondCode::new("nle", "g", "jg", "jle"),
+    CondCode::new("ge", "ge", "jge", "jl"),
+    CondCode::new("nl", "ge", "jge", "jl"),
+    CondCode::new("l", "l", "jl", "jge"),
+    CondCode::new("nge", "l", "jl", "jge"),
+    CondCode::new("le", "le", "jle", "jg"),
+    CondCode::new("ng", "le", "jle", "jg"),
+    CondCode::new("p", "p", "jp", "jnp"),
+    CondCode::new("np", "np", "jnp", "jp"),
 ];
 
 /// Look up a GCC condition-code suffix (`"e"`, `"nbe"`, ...).
