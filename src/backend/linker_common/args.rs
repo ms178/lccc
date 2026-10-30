@@ -731,6 +731,24 @@ fn apply_kv_option(result: &mut LinkerArgs, tok: &str, next: Option<&str>) -> Op
         }
         return Some(false);
     }
+    // `-b FORMAT` is BFD's deprecated alias for `--oformat`. It reaches the
+    // linker only through `-Wl,`, so it must not be treated as an unknown
+    // token and dropped: dropping it silently produced an ELF file for a
+    // caller that asked for a flat image.
+    if let Some(v) = tok.strip_prefix("-b")
+        && !v.starts_with('-')
+    {
+        let v = v.strip_prefix('=').unwrap_or(v);
+        if !v.is_empty() {
+            result.oformat = Some(v.to_string());
+            return Some(false);
+        }
+        if let Some(v) = next {
+            result.oformat = Some(v.to_string());
+            return Some(true);
+        }
+        return Some(false);
+    }
     if let Some(v) = tok.strip_prefix("--oformat=") {
         result.oformat = Some(v.to_string());
         return Some(false);
@@ -2115,6 +2133,46 @@ mod z_isa_level_tests {
                 .warn_unimplemented_keyword_options(0x1000)
                 .unwrap_err(),
             "warning treated as error: --pack-dyn-relocs=relr / -z pack-relative-relocs ignored: RELR packing is not implemented for this backend"
+        );
+    }
+
+    /// `-b FORMAT` is BFD's deprecated `--oformat` alias, and it has to be
+    /// recorded rather than dropped: the driver historically ignored both
+    /// spellings and wrote an ELF file for a request that asked for a flat
+    /// image.
+    #[test]
+    fn dash_b_is_an_oformat_alias() {
+        assert_eq!(
+            parse_linker_args(&args(&["-Wl,-b,binary"]))
+                .oformat
+                .as_deref(),
+            Some("binary")
+        );
+        assert_eq!(
+            parse_linker_args(&args(&["-Wl,-bbinary"]))
+                .oformat
+                .as_deref(),
+            Some("binary")
+        );
+        assert_eq!(
+            parse_linker_args(&args(&["-Wl,-b", "-Wl,binary"]))
+                .oformat
+                .as_deref(),
+            Some("binary")
+        );
+        assert_eq!(
+            parse_linker_args(&args(&["-Wl,--oformat=binary"]))
+                .oformat
+                .as_deref(),
+            Some("binary")
+        );
+        // `-b` with no value records nothing, and unrelated `--...` flags are
+        // untouched.
+        assert!(parse_linker_args(&args(&["-Wl,-b"])).oformat.is_none());
+        assert!(
+            parse_linker_args(&args(&["-Wl,--build-id=sha1"]))
+                .oformat
+                .is_none()
         );
     }
 
