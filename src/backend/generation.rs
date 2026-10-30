@@ -223,7 +223,7 @@ fn collect_asm_goto_cc_branch_values(
                 && *branch_value == *dest
                 && use_counts.get(&dest.0) == Some(&1)
             {
-                label_fusions.push((dest.0, jcc, output_ptr));
+                label_fusions.push((dest.0, cc, output_ptr));
                 certified_dests.insert(dest.0);
             }
         }
