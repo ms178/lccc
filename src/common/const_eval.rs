@@ -434,30 +434,6 @@ pub fn eval_builtin_call_with_mode(
                 Some(IrConst::I32(v.trailing_zeros() as i32 + 1))
             }
         }
-        // `fls{,l,ll}`: 1-based index of the most significant set bit, 0 for
-        // zero.  Used by the Linux kernel through `include/linux/log2.h`
-        // (`__ilog2_u32`), where it must fold so that `order_base_2(CONST)`
-        // stays an integer constant expression.
-        "__builtin_fls" => {
-            let val = eval_fn(args.first()?)?;
-            let v = val.to_i64()? as u32;
-            Some(IrConst::I32(32 - v.leading_zeros() as i32))
-        }
-        "__builtin_flsl" => {
-            let val = eval_fn(args.first()?)?;
-            if target_is_32bit() {
-                let v = val.to_i64()? as u32;
-                Some(IrConst::I32(32 - v.leading_zeros() as i32))
-            } else {
-                let v = val.to_i64()? as u64;
-                Some(IrConst::I32(64 - v.leading_zeros() as i32))
-            }
-        }
-        "__builtin_flsll" => {
-            let val = eval_fn(args.first()?)?;
-            let v = val.to_i64()? as u64;
-            Some(IrConst::I32(64 - v.leading_zeros() as i32))
-        }
         "__builtin_parity" => {
             let val = eval_fn(args.first()?)?;
             let v = val.to_i64()? as u32;

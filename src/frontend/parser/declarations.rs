@@ -1869,11 +1869,11 @@ impl Parser {
             Expr::Identifier(name, _) => enum_consts.and_then(|m| m.get(name.as_str()).copied()),
             // Compile-time bit builtins.  `sema`/`lowering` already fold these
             // through `common::const_eval`, but the *parser's* folder is the one
-            // the `asm "i"` validator consults, and it saw none of them: the
-            // Linux kernel's `order_base_2(CONFIG_NR_CPUS)` is
-            // `__builtin_fls(...) - 1`, so the whole initializer fell out of the
-            // constant-expression class and the statement was rejected.  The
-            // table is shared, so the two folds can never disagree.
+            // the `asm "i"` validator consults, and it saw none of them, so a
+            // constant initializer built from a compile-time builtin (e.g.
+            // `__builtin_clz(64) - 1`) fell out of the constant-expression class
+            // and the statement was rejected.  The table is shared, so the two
+            // folds can never disagree.
             Expr::FunctionCall(callee, args, _) => {
                 let Expr::Identifier(name, _) = callee.as_ref() else {
                     return None;

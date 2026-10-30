@@ -645,11 +645,8 @@ impl Parser {
             .iter()
             .chain(inputs.iter())
             .map(|op| {
-                let value = asm_validate::constness(
-                    &op.expr,
-                    &ctx,
-                    self.asm_deferred_instantiation,
-                );
+                let value =
+                    asm_validate::constness(&op.expr, &ctx, self.asm_deferred_instantiation);
                 if defer_immediate_constness && value == asm_validate::Constness::NonConstant {
                     // Preserve the existing post-optimization deferral for
                     // immediate-only constraints; dynamic operands are checked

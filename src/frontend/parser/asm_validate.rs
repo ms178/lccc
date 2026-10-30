@@ -434,6 +434,8 @@ fn check_constraint(
                 Some(index),
             ));
         }
+        return;
+    }
     if body.is_empty() || body.chars().next().is_some_and(|c| c.is_ascii_digit()) {
         return;
     }
@@ -586,9 +588,6 @@ fn check_template(
                 ));
                 return;
             }
-            } else {
-                digits[..1].parse().unwrap_or(usize::MAX)
-            };
             // A `+` output occupies an output position and an input position
             // in GCC's label numbering, but LCCC's regular operand map keeps
             // it as one operand. Label references start after this extra

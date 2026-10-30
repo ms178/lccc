@@ -176,69 +176,6 @@ impl Lowerer {
         Some(Operand::Value(dest))
     }
 
-    /// Lower __builtin_fls{,l,ll}(x) - find the last (most significant) set
-    /// bit, 1-based, and 0 for x == 0.
-    ///
-    /// `fls(x) = x == 0 ? 0 : bits - clz(x)`.  The zero case cannot ride on
-    /// `clz(0)` (its result is undefined in the IR), so it is an explicit
-    /// select on the same `x == 0` compare that lower_ffs_intrinsic uses, and
-    /// the `bits - clz` arm is only computed on the non-zero path the select
-    /// guarantees.  Mirrors the FFS lowering exactly, so the two share the
-    /// back end's compare/select and CTZ/CLZ patterns.
-    pub(super) fn lower_fls_intrinsic(&mut self, name: &str, args: &[Expr]) -> Option<Operand> {
-        if args.is_empty() {
-            return Some(Operand::Const(IrConst::I64(0)));
-        }
-        let ty = Self::intrinsic_type_from_suffix(name);
-        let arg = self.lower_expr_with_type(&args[0], ty);
-        let width: i64 = if ty == IrType::I64 { 64 } else { 32 };
-        let int_const = |v: i64| {
-            if ty == IrType::I64 {
-                IrConst::I64(v)
-            } else {
-                IrConst::I32(v as i32)
-            }
-        };
-
-        // clz_val = clz(x)
-        let clz_val = self.fresh_value();
-        self.emit(Instruction::UnaryOp {
-            dest: clz_val,
-            op: IrUnaryOp::Clz,
-            src: arg,
-            ty,
-        });
-
-        // bits_minus_clz = width - clz(x)  ==  index of the highest set bit + 1
-        let bits_minus_clz = self.emit_binop_val(
-            IrBinOp::Sub,
-            Operand::Const(int_const(width)),
-            Operand::Value(clz_val),
-            ty,
-        );
-
-        // is_zero = (x == 0)
-        let is_zero = self.fresh_value();
-        self.emit(Instruction::Cmp {
-            dest: is_zero,
-            op: IrCmpOp::Eq,
-            lhs: arg,
-            rhs: Operand::Const(int_const(0)),
-            ty,
-        });
-
-        // result = select(is_zero, 0, bits_minus_clz)
-        let result = self.fresh_value();
-        self.emit(Instruction::Select {
-            dest: result,
-            cond: Operand::Value(is_zero),
-            true_val: Operand::Const(int_const(0)),
-            false_val: Operand::Value(bits_minus_clz),
-            ty,
-        });
-        Some(Operand::Value(result))
-    }
-
     /// Lower __builtin_clrsb{,l,ll}(x) - count leading redundant sign bits.
     /// Computes: clz(x ^ negate(x >>> (bits-1))) - 1
     /// Uses logical shift + negate to create sign mask (avoids AShr 32-bit backend issues).
