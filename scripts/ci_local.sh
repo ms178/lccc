@@ -662,6 +662,12 @@ gate "vector-static-init" fast \
 gate "vector-ext-codegen" fast \
     env CCC="$LCCC" GCC="${GCC:-gcc-16}" bash tests/regression/check_vector_ext_codegen.sh
 
+# MMX entry points: the generated 90-intrinsic __m64 differential against
+# GCC's real-MMX implementation (m64 + m32) plus the packed-codegen
+# witnesses (one SSE2 op on the XMM low half, no per-lane scalar loop).
+gate "mmx-intrinsics" fast \
+    env CCC="$LCCC" GCC="${GCC:-gcc-16}" bash tests/regression/check_mmx_intrinsics.sh
+
 # Incoming x86-64 by-value objects, both frame modes and kill-switch control.
 gate "incoming-byval-homes" fast \
     env CCC="$LCCC" GCC="${GCC:-gcc-16}" bash tests/regression/check_incoming_byval_homes.sh

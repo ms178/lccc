@@ -16,6 +16,19 @@
  * register. */
 typedef int __m64 __attribute__((__vector_size__(8), __may_alias__));
 
+/* Packed working images for the MMX entry points: every _mm_*_pi* op below
+ * runs as its SSE2 counterpart on the low 64 bits of a 128-bit register
+ * image (zero-extended into the working vector, low 8 bytes extracted), so
+ * the header emits one packed instruction instead of a per-lane C loop.
+ * The lane widths below are spelled to match the __builtin_ia32_* argument
+ * types exactly (signed vectors for the integer/packed builtins). */
+typedef signed char __v16qq __attribute__((__vector_size__(16)));
+typedef short __v8hh __attribute__((__vector_size__(16)));
+typedef int __v4ss __attribute__((__vector_size__(16)));
+typedef unsigned char __v16qu __attribute__((__vector_size__(16)));
+typedef unsigned short __v8hu __attribute__((__vector_size__(16)));
+typedef unsigned int __v4su __attribute__((__vector_size__(16)));
+
 /* === Empty (EMMS) === */
 
 /* Signal end of MMX state usage (EMMS). No-op in our scalar implementation
@@ -151,39 +164,36 @@ _mm_xor_si64(__m64 __a, __m64 __b)
 static __inline__ __m64 __attribute__((__always_inline__))
 _mm_add_pi8(__m64 __a, __m64 __b)
 {
+    __v16qu __x = {0}, __y = {0}, __v;
+    __builtin_memcpy(&__x, &__a, 8);
+    __builtin_memcpy(&__y, &__b, 8);
+    __v = __x + __y;
     __m64 __r;
-    unsigned char *__ra = (unsigned char *)&__a;
-    unsigned char *__rb = (unsigned char *)&__b;
-    unsigned char __rr[8];
-    for (int __i = 0; __i < 8; __i++)
-        __rr[__i] = __ra[__i] + __rb[__i];
-    __builtin_memcpy(&__r, __rr, 8);
+    __builtin_memcpy(&__r, &__v, 8);
     return __r;
 }
 
 static __inline__ __m64 __attribute__((__always_inline__))
 _mm_add_pi16(__m64 __a, __m64 __b)
 {
+    __v8hu __x = {0}, __y = {0}, __v;
+    __builtin_memcpy(&__x, &__a, 8);
+    __builtin_memcpy(&__y, &__b, 8);
+    __v = __x + __y;
     __m64 __r;
-    unsigned short *__ra = (unsigned short *)&__a;
-    unsigned short *__rb = (unsigned short *)&__b;
-    unsigned short __rr[4];
-    for (int __i = 0; __i < 4; __i++)
-        __rr[__i] = __ra[__i] + __rb[__i];
-    __builtin_memcpy(&__r, __rr, 8);
+    __builtin_memcpy(&__r, &__v, 8);
     return __r;
 }
 
 static __inline__ __m64 __attribute__((__always_inline__))
 _mm_add_pi32(__m64 __a, __m64 __b)
 {
+    __v4su __x = {0}, __y = {0}, __v;
+    __builtin_memcpy(&__x, &__a, 8);
+    __builtin_memcpy(&__y, &__b, 8);
+    __v = __x + __y;
     __m64 __r;
-    unsigned int *__ra = (unsigned int *)&__a;
-    unsigned int *__rb = (unsigned int *)&__b;
-    unsigned int __rr[2];
-    for (int __i = 0; __i < 2; __i++)
-        __rr[__i] = __ra[__i] + __rb[__i];
-    __builtin_memcpy(&__r, __rr, 8);
+    __builtin_memcpy(&__r, &__v, 8);
     return __r;
 }
 
@@ -192,39 +202,36 @@ _mm_add_pi32(__m64 __a, __m64 __b)
 static __inline__ __m64 __attribute__((__always_inline__))
 _mm_sub_pi8(__m64 __a, __m64 __b)
 {
+    __v16qu __x = {0}, __y = {0}, __v;
+    __builtin_memcpy(&__x, &__a, 8);
+    __builtin_memcpy(&__y, &__b, 8);
+    __v = __x - __y;
     __m64 __r;
-    unsigned char *__ra = (unsigned char *)&__a;
-    unsigned char *__rb = (unsigned char *)&__b;
-    unsigned char __rr[8];
-    for (int __i = 0; __i < 8; __i++)
-        __rr[__i] = __ra[__i] - __rb[__i];
-    __builtin_memcpy(&__r, __rr, 8);
+    __builtin_memcpy(&__r, &__v, 8);
     return __r;
 }
 
 static __inline__ __m64 __attribute__((__always_inline__))
 _mm_sub_pi16(__m64 __a, __m64 __b)
 {
+    __v8hu __x = {0}, __y = {0}, __v;
+    __builtin_memcpy(&__x, &__a, 8);
+    __builtin_memcpy(&__y, &__b, 8);
+    __v = __x - __y;
     __m64 __r;
-    unsigned short *__ra = (unsigned short *)&__a;
-    unsigned short *__rb = (unsigned short *)&__b;
-    unsigned short __rr[4];
-    for (int __i = 0; __i < 4; __i++)
-        __rr[__i] = __ra[__i] - __rb[__i];
-    __builtin_memcpy(&__r, __rr, 8);
+    __builtin_memcpy(&__r, &__v, 8);
     return __r;
 }
 
 static __inline__ __m64 __attribute__((__always_inline__))
 _mm_sub_pi32(__m64 __a, __m64 __b)
 {
+    __v4su __x = {0}, __y = {0}, __v;
+    __builtin_memcpy(&__x, &__a, 8);
+    __builtin_memcpy(&__y, &__b, 8);
+    __v = __x - __y;
     __m64 __r;
-    unsigned int *__ra = (unsigned int *)&__a;
-    unsigned int *__rb = (unsigned int *)&__b;
-    unsigned int __rr[2];
-    for (int __i = 0; __i < 2; __i++)
-        __rr[__i] = __ra[__i] - __rb[__i];
-    __builtin_memcpy(&__r, __rr, 8);
+    __builtin_memcpy(&__r, &__v, 8);
     return __r;
 }
 
@@ -233,66 +240,48 @@ _mm_sub_pi32(__m64 __a, __m64 __b)
 static __inline__ __m64 __attribute__((__always_inline__))
 _mm_adds_pi8(__m64 __a, __m64 __b)
 {
+    __v16qq __x = {0}, __y = {0}, __v;
+    __builtin_memcpy(&__x, &__a, 8);
+    __builtin_memcpy(&__y, &__b, 8);
+    __v = __builtin_ia32_paddsb128(__x, __y);
     __m64 __r;
-    signed char *__ra = (signed char *)&__a;
-    signed char *__rb = (signed char *)&__b;
-    signed char __rr[8];
-    for (int __i = 0; __i < 8; __i++) {
-        int __sum = (int)__ra[__i] + (int)__rb[__i];
-        if (__sum > 127) __sum = 127;
-        if (__sum < -128) __sum = -128;
-        __rr[__i] = (signed char)__sum;
-    }
-    __builtin_memcpy(&__r, __rr, 8);
+    __builtin_memcpy(&__r, &__v, 8);
     return __r;
 }
 
 static __inline__ __m64 __attribute__((__always_inline__))
 _mm_adds_pi16(__m64 __a, __m64 __b)
 {
+    __v8hh __x = {0}, __y = {0}, __v;
+    __builtin_memcpy(&__x, &__a, 8);
+    __builtin_memcpy(&__y, &__b, 8);
+    __v = __builtin_ia32_paddsw128(__x, __y);
     __m64 __r;
-    short *__ra = (short *)&__a;
-    short *__rb = (short *)&__b;
-    short __rr[4];
-    for (int __i = 0; __i < 4; __i++) {
-        int __sum = (int)__ra[__i] + (int)__rb[__i];
-        if (__sum > 32767) __sum = 32767;
-        if (__sum < -32768) __sum = -32768;
-        __rr[__i] = (short)__sum;
-    }
-    __builtin_memcpy(&__r, __rr, 8);
+    __builtin_memcpy(&__r, &__v, 8);
     return __r;
 }
 
 static __inline__ __m64 __attribute__((__always_inline__))
 _mm_adds_pu8(__m64 __a, __m64 __b)
 {
+    __v16qq __x = {0}, __y = {0}, __v;
+    __builtin_memcpy(&__x, &__a, 8);
+    __builtin_memcpy(&__y, &__b, 8);
+    __v = __builtin_ia32_paddusb128(__x, __y);
     __m64 __r;
-    unsigned char *__ra = (unsigned char *)&__a;
-    unsigned char *__rb = (unsigned char *)&__b;
-    unsigned char __rr[8];
-    for (int __i = 0; __i < 8; __i++) {
-        unsigned int __sum = (unsigned int)__ra[__i] + (unsigned int)__rb[__i];
-        if (__sum > 255) __sum = 255;
-        __rr[__i] = (unsigned char)__sum;
-    }
-    __builtin_memcpy(&__r, __rr, 8);
+    __builtin_memcpy(&__r, &__v, 8);
     return __r;
 }
 
 static __inline__ __m64 __attribute__((__always_inline__))
 _mm_adds_pu16(__m64 __a, __m64 __b)
 {
+    __v8hh __x = {0}, __y = {0}, __v;
+    __builtin_memcpy(&__x, &__a, 8);
+    __builtin_memcpy(&__y, &__b, 8);
+    __v = __builtin_ia32_paddusw128(__x, __y);
     __m64 __r;
-    unsigned short *__ra = (unsigned short *)&__a;
-    unsigned short *__rb = (unsigned short *)&__b;
-    unsigned short __rr[4];
-    for (int __i = 0; __i < 4; __i++) {
-        unsigned int __sum = (unsigned int)__ra[__i] + (unsigned int)__rb[__i];
-        if (__sum > 65535) __sum = 65535;
-        __rr[__i] = (unsigned short)__sum;
-    }
-    __builtin_memcpy(&__r, __rr, 8);
+    __builtin_memcpy(&__r, &__v, 8);
     return __r;
 }
 
@@ -301,66 +290,48 @@ _mm_adds_pu16(__m64 __a, __m64 __b)
 static __inline__ __m64 __attribute__((__always_inline__))
 _mm_subs_pi8(__m64 __a, __m64 __b)
 {
+    __v16qq __x = {0}, __y = {0}, __v;
+    __builtin_memcpy(&__x, &__a, 8);
+    __builtin_memcpy(&__y, &__b, 8);
+    __v = __builtin_ia32_psubsb128(__x, __y);
     __m64 __r;
-    signed char *__ra = (signed char *)&__a;
-    signed char *__rb = (signed char *)&__b;
-    signed char __rr[8];
-    for (int __i = 0; __i < 8; __i++) {
-        int __diff = (int)__ra[__i] - (int)__rb[__i];
-        if (__diff > 127) __diff = 127;
-        if (__diff < -128) __diff = -128;
-        __rr[__i] = (signed char)__diff;
-    }
-    __builtin_memcpy(&__r, __rr, 8);
+    __builtin_memcpy(&__r, &__v, 8);
     return __r;
 }
 
 static __inline__ __m64 __attribute__((__always_inline__))
 _mm_subs_pi16(__m64 __a, __m64 __b)
 {
+    __v8hh __x = {0}, __y = {0}, __v;
+    __builtin_memcpy(&__x, &__a, 8);
+    __builtin_memcpy(&__y, &__b, 8);
+    __v = __builtin_ia32_psubsw128(__x, __y);
     __m64 __r;
-    short *__ra = (short *)&__a;
-    short *__rb = (short *)&__b;
-    short __rr[4];
-    for (int __i = 0; __i < 4; __i++) {
-        int __diff = (int)__ra[__i] - (int)__rb[__i];
-        if (__diff > 32767) __diff = 32767;
-        if (__diff < -32768) __diff = -32768;
-        __rr[__i] = (short)__diff;
-    }
-    __builtin_memcpy(&__r, __rr, 8);
+    __builtin_memcpy(&__r, &__v, 8);
     return __r;
 }
 
 static __inline__ __m64 __attribute__((__always_inline__))
 _mm_subs_pu8(__m64 __a, __m64 __b)
 {
+    __v16qq __x = {0}, __y = {0}, __v;
+    __builtin_memcpy(&__x, &__a, 8);
+    __builtin_memcpy(&__y, &__b, 8);
+    __v = __builtin_ia32_psubusb128(__x, __y);
     __m64 __r;
-    unsigned char *__ra = (unsigned char *)&__a;
-    unsigned char *__rb = (unsigned char *)&__b;
-    unsigned char __rr[8];
-    for (int __i = 0; __i < 8; __i++) {
-        int __diff = (int)__ra[__i] - (int)__rb[__i];
-        if (__diff < 0) __diff = 0;
-        __rr[__i] = (unsigned char)__diff;
-    }
-    __builtin_memcpy(&__r, __rr, 8);
+    __builtin_memcpy(&__r, &__v, 8);
     return __r;
 }
 
 static __inline__ __m64 __attribute__((__always_inline__))
 _mm_subs_pu16(__m64 __a, __m64 __b)
 {
+    __v8hh __x = {0}, __y = {0}, __v;
+    __builtin_memcpy(&__x, &__a, 8);
+    __builtin_memcpy(&__y, &__b, 8);
+    __v = __builtin_ia32_psubusw128(__x, __y);
     __m64 __r;
-    unsigned short *__ra = (unsigned short *)&__a;
-    unsigned short *__rb = (unsigned short *)&__b;
-    unsigned short __rr[4];
-    for (int __i = 0; __i < 4; __i++) {
-        int __diff = (int)__ra[__i] - (int)__rb[__i];
-        if (__diff < 0) __diff = 0;
-        __rr[__i] = (unsigned short)__diff;
-    }
-    __builtin_memcpy(&__r, __rr, 8);
+    __builtin_memcpy(&__r, &__v, 8);
     return __r;
 }
 
@@ -370,13 +341,12 @@ _mm_subs_pu16(__m64 __a, __m64 __b)
 static __inline__ __m64 __attribute__((__always_inline__))
 _mm_mullo_pi16(__m64 __a, __m64 __b)
 {
+    __v8hh __x = {0}, __y = {0}, __v;
+    __builtin_memcpy(&__x, &__a, 8);
+    __builtin_memcpy(&__y, &__b, 8);
+    __v = __x * __y;
     __m64 __r;
-    short *__ra = (short *)&__a;
-    short *__rb = (short *)&__b;
-    short __rr[4];
-    for (int __i = 0; __i < 4; __i++)
-        __rr[__i] = (short)((int)__ra[__i] * (int)__rb[__i]);
-    __builtin_memcpy(&__r, __rr, 8);
+    __builtin_memcpy(&__r, &__v, 8);
     return __r;
 }
 
@@ -384,13 +354,12 @@ _mm_mullo_pi16(__m64 __a, __m64 __b)
 static __inline__ __m64 __attribute__((__always_inline__))
 _mm_mulhi_pi16(__m64 __a, __m64 __b)
 {
+    __v8hh __x = {0}, __y = {0}, __v;
+    __builtin_memcpy(&__x, &__a, 8);
+    __builtin_memcpy(&__y, &__b, 8);
+    __v = __builtin_ia32_pmulhw128(__x, __y);
     __m64 __r;
-    short *__ra = (short *)&__a;
-    short *__rb = (short *)&__b;
-    short __rr[4];
-    for (int __i = 0; __i < 4; __i++)
-        __rr[__i] = (short)(((int)__ra[__i] * (int)__rb[__i]) >> 16);
-    __builtin_memcpy(&__r, __rr, 8);
+    __builtin_memcpy(&__r, &__v, 8);
     return __r;
 }
 
@@ -419,11 +388,10 @@ _mm_slli_pi16(__m64 __a, int __count)
         __r = (__m64)(long long)(0);
         return __r;
     }
-    unsigned short *__ra = (unsigned short *)&__a;
-    unsigned short __rr[4];
-    for (int __i = 0; __i < 4; __i++)
-        __rr[__i] = __ra[__i] << __count;
-    __builtin_memcpy(&__r, __rr, 8);
+    __v8hh __x = {0}, __v;
+    __builtin_memcpy(&__x, &__a, 8);
+    __v = __builtin_ia32_psllwi128(__x, __count);
+    __builtin_memcpy(&__r, &__v, 8);
     return __r;
 }
 
@@ -436,11 +404,10 @@ _mm_slli_pi32(__m64 __a, int __count)
         __r = (__m64)(long long)(0);
         return __r;
     }
-    unsigned int *__ra = (unsigned int *)&__a;
-    unsigned int __rr[2];
-    for (int __i = 0; __i < 2; __i++)
-        __rr[__i] = __ra[__i] << __count;
-    __builtin_memcpy(&__r, __rr, 8);
+    __v4ss __x = {0}, __v;
+    __builtin_memcpy(&__x, &__a, 8);
+    __v = __builtin_ia32_pslldi128(__x, __count);
+    __builtin_memcpy(&__r, &__v, 8);
     return __r;
 }
 
@@ -466,11 +433,10 @@ _mm_srli_pi16(__m64 __a, int __count)
         __r = (__m64)(long long)(0);
         return __r;
     }
-    unsigned short *__ra = (unsigned short *)&__a;
-    unsigned short __rr[4];
-    for (int __i = 0; __i < 4; __i++)
-        __rr[__i] = __ra[__i] >> __count;
-    __builtin_memcpy(&__r, __rr, 8);
+    __v8hh __x = {0}, __v;
+    __builtin_memcpy(&__x, &__a, 8);
+    __v = __builtin_ia32_psrlwi128(__x, __count);
+    __builtin_memcpy(&__r, &__v, 8);
     return __r;
 }
 
@@ -483,11 +449,10 @@ _mm_srli_pi32(__m64 __a, int __count)
         __r = (__m64)(long long)(0);
         return __r;
     }
-    unsigned int *__ra = (unsigned int *)&__a;
-    unsigned int __rr[2];
-    for (int __i = 0; __i < 2; __i++)
-        __rr[__i] = __ra[__i] >> __count;
-    __builtin_memcpy(&__r, __rr, 8);
+    __v4ss __x = {0}, __v;
+    __builtin_memcpy(&__x, &__a, 8);
+    __v = __builtin_ia32_psrldi128(__x, __count);
+    __builtin_memcpy(&__r, &__v, 8);
     return __r;
 }
 
@@ -511,11 +476,10 @@ _mm_srai_pi16(__m64 __a, int __count)
     __m64 __r;
     if (__count > 15) __count = 15;
     if (__count < 0) __count = 0;
-    short *__ra = (short *)&__a;
-    short __rr[4];
-    for (int __i = 0; __i < 4; __i++)
-        __rr[__i] = __ra[__i] >> __count;
-    __builtin_memcpy(&__r, __rr, 8);
+    __v8hh __x = {0}, __v;
+    __builtin_memcpy(&__x, &__a, 8);
+    __v = __builtin_ia32_psrawi128(__x, __count);
+    __builtin_memcpy(&__r, &__v, 8);
     return __r;
 }
 
@@ -526,11 +490,10 @@ _mm_srai_pi32(__m64 __a, int __count)
     __m64 __r;
     if (__count > 31) __count = 31;
     if (__count < 0) __count = 0;
-    int *__ra = (int *)&__a;
-    int __rr[2];
-    for (int __i = 0; __i < 2; __i++)
-        __rr[__i] = __ra[__i] >> __count;
-    __builtin_memcpy(&__r, __rr, 8);
+    __v4ss __x = {0}, __v;
+    __builtin_memcpy(&__x, &__a, 8);
+    __v = __builtin_ia32_psradi128(__x, __count);
+    __builtin_memcpy(&__r, &__v, 8);
     return __r;
 }
 
@@ -542,23 +505,12 @@ _mm_srai_pi32(__m64 __a, int __count)
 static __inline__ __m64 __attribute__((__always_inline__))
 _mm_packs_pi32(__m64 __a, __m64 __b)
 {
+    __v16qq __v;
+    __builtin_memcpy(&__v, &__a, 8);
+    __builtin_memcpy((char *)&__v + 8, &__b, 8);
+    __v = __builtin_ia32_packssdw128(__v, __v);
     __m64 __r;
-    int *__ra = (int *)&__a;
-    int *__rb = (int *)&__b;
-    short __rr[4];
-    for (int __i = 0; __i < 2; __i++) {
-        int __v = __ra[__i];
-        if (__v > 32767) __v = 32767;
-        if (__v < -32768) __v = -32768;
-        __rr[__i] = (short)__v;
-    }
-    for (int __i = 0; __i < 2; __i++) {
-        int __v = __rb[__i];
-        if (__v > 32767) __v = 32767;
-        if (__v < -32768) __v = -32768;
-        __rr[__i + 2] = (short)__v;
-    }
-    __builtin_memcpy(&__r, __rr, 8);
+    __builtin_memcpy(&__r, &__v, 8);
     return __r;
 }
 
@@ -567,23 +519,12 @@ _mm_packs_pi32(__m64 __a, __m64 __b)
 static __inline__ __m64 __attribute__((__always_inline__))
 _mm_packs_pi16(__m64 __a, __m64 __b)
 {
+    __v16qq __v;
+    __builtin_memcpy(&__v, &__a, 8);
+    __builtin_memcpy((char *)&__v + 8, &__b, 8);
+    __v = __builtin_ia32_packsswb128(__v, __v);
     __m64 __r;
-    short *__ra = (short *)&__a;
-    short *__rb = (short *)&__b;
-    signed char __rr[8];
-    for (int __i = 0; __i < 4; __i++) {
-        int __v = __ra[__i];
-        if (__v > 127) __v = 127;
-        if (__v < -128) __v = -128;
-        __rr[__i] = (signed char)__v;
-    }
-    for (int __i = 0; __i < 4; __i++) {
-        int __v = __rb[__i];
-        if (__v > 127) __v = 127;
-        if (__v < -128) __v = -128;
-        __rr[__i + 4] = (signed char)__v;
-    }
-    __builtin_memcpy(&__r, __rr, 8);
+    __builtin_memcpy(&__r, &__v, 8);
     return __r;
 }
 
@@ -592,23 +533,12 @@ _mm_packs_pi16(__m64 __a, __m64 __b)
 static __inline__ __m64 __attribute__((__always_inline__))
 _mm_packs_pu16(__m64 __a, __m64 __b)
 {
+    __v16qq __v;
+    __builtin_memcpy(&__v, &__a, 8);
+    __builtin_memcpy((char *)&__v + 8, &__b, 8);
+    __v = __builtin_ia32_packuswb128(__v, __v);
     __m64 __r;
-    short *__ra = (short *)&__a;
-    short *__rb = (short *)&__b;
-    unsigned char __rr[8];
-    for (int __i = 0; __i < 4; __i++) {
-        int __v = __ra[__i];
-        if (__v > 255) __v = 255;
-        if (__v < 0) __v = 0;
-        __rr[__i] = (unsigned char)__v;
-    }
-    for (int __i = 0; __i < 4; __i++) {
-        int __v = __rb[__i];
-        if (__v > 255) __v = 255;
-        if (__v < 0) __v = 0;
-        __rr[__i + 4] = (unsigned char)__v;
-    }
-    __builtin_memcpy(&__r, __rr, 8);
+    __builtin_memcpy(&__r, &__v, 8);
     return __r;
 }
 
@@ -617,78 +547,72 @@ _mm_packs_pu16(__m64 __a, __m64 __b)
 static __inline__ __m64 __attribute__((__always_inline__))
 _mm_cmpeq_pi8(__m64 __a, __m64 __b)
 {
+    __v16qu __x = {0}, __y = {0}, __v;
+    __builtin_memcpy(&__x, &__a, 8);
+    __builtin_memcpy(&__y, &__b, 8);
+    __v = __x == __y;
     __m64 __r;
-    unsigned char *__ra = (unsigned char *)&__a;
-    unsigned char *__rb = (unsigned char *)&__b;
-    unsigned char __rr[8];
-    for (int __i = 0; __i < 8; __i++)
-        __rr[__i] = (__ra[__i] == __rb[__i]) ? 0xFF : 0x00;
-    __builtin_memcpy(&__r, __rr, 8);
+    __builtin_memcpy(&__r, &__v, 8);
     return __r;
 }
 
 static __inline__ __m64 __attribute__((__always_inline__))
 _mm_cmpeq_pi16(__m64 __a, __m64 __b)
 {
+    __v8hu __x = {0}, __y = {0}, __v;
+    __builtin_memcpy(&__x, &__a, 8);
+    __builtin_memcpy(&__y, &__b, 8);
+    __v = __x == __y;
     __m64 __r;
-    unsigned short *__ra = (unsigned short *)&__a;
-    unsigned short *__rb = (unsigned short *)&__b;
-    unsigned short __rr[4];
-    for (int __i = 0; __i < 4; __i++)
-        __rr[__i] = (__ra[__i] == __rb[__i]) ? 0xFFFF : 0x0000;
-    __builtin_memcpy(&__r, __rr, 8);
+    __builtin_memcpy(&__r, &__v, 8);
     return __r;
 }
 
 static __inline__ __m64 __attribute__((__always_inline__))
 _mm_cmpeq_pi32(__m64 __a, __m64 __b)
 {
+    __v4su __x = {0}, __y = {0}, __v;
+    __builtin_memcpy(&__x, &__a, 8);
+    __builtin_memcpy(&__y, &__b, 8);
+    __v = __x == __y;
     __m64 __r;
-    unsigned int *__ra = (unsigned int *)&__a;
-    unsigned int *__rb = (unsigned int *)&__b;
-    unsigned int __rr[2];
-    for (int __i = 0; __i < 2; __i++)
-        __rr[__i] = (__ra[__i] == __rb[__i]) ? 0xFFFFFFFFU : 0x00000000U;
-    __builtin_memcpy(&__r, __rr, 8);
+    __builtin_memcpy(&__r, &__v, 8);
     return __r;
 }
 
 static __inline__ __m64 __attribute__((__always_inline__))
 _mm_cmpgt_pi8(__m64 __a, __m64 __b)
 {
+    __v16qq __x = {0}, __y = {0}, __v;
+    __builtin_memcpy(&__x, &__a, 8);
+    __builtin_memcpy(&__y, &__b, 8);
+    __v = __x > __y;
     __m64 __r;
-    signed char *__ra = (signed char *)&__a;
-    signed char *__rb = (signed char *)&__b;
-    unsigned char __rr[8];
-    for (int __i = 0; __i < 8; __i++)
-        __rr[__i] = (__ra[__i] > __rb[__i]) ? 0xFF : 0x00;
-    __builtin_memcpy(&__r, __rr, 8);
+    __builtin_memcpy(&__r, &__v, 8);
     return __r;
 }
 
 static __inline__ __m64 __attribute__((__always_inline__))
 _mm_cmpgt_pi16(__m64 __a, __m64 __b)
 {
+    __v8hh __x = {0}, __y = {0}, __v;
+    __builtin_memcpy(&__x, &__a, 8);
+    __builtin_memcpy(&__y, &__b, 8);
+    __v = __x > __y;
     __m64 __r;
-    short *__ra = (short *)&__a;
-    short *__rb = (short *)&__b;
-    unsigned short __rr[4];
-    for (int __i = 0; __i < 4; __i++)
-        __rr[__i] = (__ra[__i] > __rb[__i]) ? 0xFFFF : 0x0000;
-    __builtin_memcpy(&__r, __rr, 8);
+    __builtin_memcpy(&__r, &__v, 8);
     return __r;
 }
 
 static __inline__ __m64 __attribute__((__always_inline__))
 _mm_cmpgt_pi32(__m64 __a, __m64 __b)
 {
+    __v4ss __x = {0}, __y = {0}, __v;
+    __builtin_memcpy(&__x, &__a, 8);
+    __builtin_memcpy(&__y, &__b, 8);
+    __v = __x > __y;
     __m64 __r;
-    int *__ra = (int *)&__a;
-    int *__rb = (int *)&__b;
-    unsigned int __rr[2];
-    for (int __i = 0; __i < 2; __i++)
-        __rr[__i] = (__ra[__i] > __rb[__i]) ? 0xFFFFFFFFU : 0x00000000U;
-    __builtin_memcpy(&__r, __rr, 8);
+    __builtin_memcpy(&__r, &__v, 8);
     return __r;
 }
 

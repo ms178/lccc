@@ -1353,7 +1353,7 @@
     "frontend-c": {
       "group": "frontend",
       "mode": "steps",
-      "predicted_gate_seconds": 273.42,
+      "predicted_gate_seconds": 279.52,
       "shards": 3,
       "steps": [
         {
@@ -1419,6 +1419,14 @@
         {
           "measured_s": 56.0,
           "name": "GNU vector-extension whole-vector lowering (runtime vs GCC + ceilings)"
+        },
+        {
+          "measured_s": 6.0,
+          "name": "MMX intrinsics differential and packed-codegen witnesses"
+        },
+        {
+          "measured_s": 0.1,
+          "name": "Surface MMX intrinsic failures in annotations"
         },
         {
           "measured_s": 5.0,
