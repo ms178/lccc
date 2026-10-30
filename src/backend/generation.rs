@@ -105,8 +105,7 @@ fn collect_asm_goto_cc_branch_values(
 
     // Pass 2: value use counts and asm-goto edge counts.
     let mut use_counts: FxHashMap<u32, u32> = FxHashMap::default();
-    let mut asm_edge_counts: FxHashMap<crate::ir::reexports::BlockId, u32> =
-        FxHashMap::default();
+    let mut asm_edge_counts: FxHashMap<crate::ir::reexports::BlockId, u32> = FxHashMap::default();
     for block in &func.blocks {
         for inst in &block.instructions {
             for_each_operand_in_instruction(inst, |op| {
@@ -238,7 +237,9 @@ fn collect_asm_goto_cc_branch_values(
     for block in &func.blocks {
         for inst in &block.instructions {
             match inst {
-                Instruction::InlineAsm { outputs, inputs, .. } => {
+                Instruction::InlineAsm {
+                    outputs, inputs, ..
+                } => {
                     for (_, ptr, _) in outputs {
                         if let Some(&slot) = ptr_slot.get(&ptr.0) {
                             verdicts[slot].0 += 1;

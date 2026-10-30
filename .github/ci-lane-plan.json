@@ -324,7 +324,7 @@
     "backend-contracts-b": {
       "group": "backend-contracts",
       "mode": "shell",
-      "predicted_gate_seconds": 426.208,
+      "predicted_gate_seconds": 428.208,
       "shards": 2,
       "step": "Verify remaining fast local contracts (shard b of 2)",
       "steps": [
@@ -703,6 +703,10 @@
         {
           "measured_s": 5.61,
           "name": "bash tests/regression/check_vec_dead_remainder.sh"
+        },
+        {
+          "measured_s": 2.0,
+          "name": "bash tests/regression/check_asm_goto_outputs.sh"
         }
       ]
     },
