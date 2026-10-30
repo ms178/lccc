@@ -80,7 +80,12 @@ impl CondCode {
         jcc: &'static str,
         inverse_jcc: &'static str,
     ) -> Self {
-        Self { gcc, setcc, jcc, inverse_jcc }
+        Self {
+            gcc,
+            setcc,
+            jcc,
+            inverse_jcc,
+        }
     }
 }
 
