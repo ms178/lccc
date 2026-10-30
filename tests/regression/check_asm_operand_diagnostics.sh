@@ -68,6 +68,70 @@ run_case unmodelled_letter2 error \
 run_case immediate_on_variable error \
     'int f(int x){int r;__asm__ volatile("movl %1, %0":"=r"(r):"I"(x));return r;}'
 
+# GCC defers immediate-only validation in an inline body until the caller's
+# argument is substituted. Kernel helpers use this for static branches and
+# BUG metadata. The constant call must compile; a dynamic call must be rejected
+# after optimization rather than receiving the backend's zero placeholder.
+cat >"$TMP/always-inline-immediate.c" <<'EOF'
+static __attribute__((always_inline)) inline int imm(int x)
+{
+    int y;
+    __asm__("movl %1, %0" : "=r"(y) : "i"(x));
+    return y;
+}
+int constant_call(void) { return imm(7); }
+EOF
+if ! "$CCC" -O2 -c "$TMP/always-inline-immediate.c" -o "$TMP/always-inline-immediate.o"; then
+    echo "FAIL always_inline_constant_immediate: constant call should compile" >&2
+    fail=1
+fi
+cat >"$TMP/always-inline-dynamic.c" <<'EOF'
+static __attribute__((always_inline)) inline int imm(int x)
+{
+    int y;
+    __asm__("movl %1, %0" : "=r"(y) : "i"(x));
+    return y;
+}
+int dynamic_call(int x) { return imm(x); }
+EOF
+if out=$("$CCC" -O2 -c "$TMP/always-inline-dynamic.c" -o "$TMP/always-inline-dynamic.o" 2>&1); then
+    echo "FAIL always_inline_dynamic_immediate: dynamic value was accepted" >&2
+    fail=1
+elif [[ $out != *"non-constant operand for immediate-only inline asm constraint"* ]]; then
+    echo "FAIL always_inline_dynamic_immediate: missing actionable diagnostic:" >&2
+    echo "$out" >&2
+    fail=1
+fi
+
+# Local scalar initializers are often folded to immediate asm operands only
+# after optimization (Linux's __WARN_FLAGS creates a local __auto_type __flags).
+# Keep that path distinct from inline-parameter substitution above.
+cat >"$TMP/local-constant-immediate.c" <<'EOF'
+void local_constant(void)
+{
+    unsigned int flags = 9;
+    __asm__ volatile(".long %c0" : : "i"(flags));
+}
+EOF
+if ! "$CCC" -O2 -c "$TMP/local-constant-immediate.c" -o "$TMP/local-constant-immediate.o"; then
+    echo "FAIL local_constant_immediate: optimized local constant should compile" >&2
+    fail=1
+fi
+cat >"$TMP/local-dynamic-immediate.c" <<'EOF'
+void local_dynamic(unsigned int flags)
+{
+    __asm__ volatile(".long %c0" : : "i"(flags));
+}
+EOF
+if out=$("$CCC" -O2 -c "$TMP/local-dynamic-immediate.c" -o "$TMP/local-dynamic-immediate.o" 2>&1); then
+    echo "FAIL local_dynamic_immediate: dynamic value was accepted" >&2
+    fail=1
+elif [[ $out != *"non-constant operand for immediate-only inline asm constraint"* ]]; then
+    echo "FAIL local_dynamic_immediate: missing actionable diagnostic:" >&2
+    echo "$out" >&2
+    fail=1
+fi
+
 EXPECT_MESSAGE="probably does not match constraints"
 run_case immediate_out_of_range error \
     'int f(void){int r;__asm__ volatile("movl %1, %0":"=r"(r):"I"(300));return r;}'
@@ -87,6 +151,7 @@ for body in \
     'int f(int x){int r;__asm__ volatile("movl %1, %0":"=r"(r):"r"(x));return r;}' \
     'int f(unsigned long *a,long n){int c;__asm__ volatile("btsq %2, %1":"=@ccc"(c),"+m"(*a):"Ir"(n));return c;}' \
     'int f(int x){int r;__asm__ volatile("addl %1, %0":"=r"(r):"0"(x));return r;}' \
+    'int f(unsigned long x){unsigned long y;__asm__ volatile("" : [sum] "=r"(y) : "[sum]"(x));return y;}' \
     'int f(int x){int r;__asm__ volatile("addl %1, %0":"+r"(r):"g"(x));return r;}' \
     'int f(void){int r=0;__asm__ volatile("movl $7, %0":"=r"(r):);return r;}' \
     'int f(void){int r;__asm__ volatile("movl %1, %0":"=r"(r):"i"(7));return r;}' \

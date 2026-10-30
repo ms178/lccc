@@ -2309,6 +2309,11 @@ impl Driver {
         let mut parser = Parser::new(tokens);
         parser.set_diagnostics(diagnostics);
         parser.set_c23(self.c23_dialect());
+        // Code generation will run the post-optimization asm-constraint
+        // validator, which can prove local constant initializers and inlined
+        // arguments that the parser alone cannot classify. Syntax-only mode
+        // deliberately leaves this disabled above.
+        parser.set_deferred_asm_immediate_validation(true);
         let ast = parser.parse();
         if time_phases {
             eprintln!("[TIME] parse: {:.3}s", t2.elapsed().as_secs_f64());
@@ -2553,6 +2558,43 @@ impl Driver {
             ra_config.as_ref(),
             time_phases,
         );
+        // Immediate-only asm constraints may depend on a local constant or
+        // an inline parameter that is not resolvable during parsing. Recheck
+        // the optimized IR here. A Value is not an immediate; emitting the
+        // backend's historical zero placeholder would silently miscompile a
+        // dynamic operand (e.g. `.long %c0`). The original always_inline
+        // helper body is exempt because it is retained only as the inline template;
+        // any reachable caller must have a constant or symbol after inlining.
+        if matches!(self.target, Target::X86_64 | Target::I686) {
+            for func in &module.functions {
+                if func.is_declaration || func.is_always_inline {
+                    continue;
+                }
+                for block in &func.blocks {
+                    for inst in &block.instructions {
+                        if let crate::ir::reexports::Instruction::InlineAsm {
+                            inputs,
+                            input_symbols,
+                            ..
+                        } = inst
+                        {
+                            for (index, (constraint, operand, _)) in inputs.iter().enumerate() {
+                                if crate::backend::inline_asm::constraint_is_immediate_only(
+                                    constraint,
+                                ) && matches!(operand, crate::ir::reexports::Operand::Value(_))
+                                    && input_symbols.get(index).and_then(Option::as_ref).is_none()
+                                {
+                                    return Err(format!(
+                                        "non-constant operand for immediate-only inline asm constraint `{constraint}` remains after optimization in function `{}`",
+                                        func.name
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let mut module = self.split_and_layout_blocks(module, time_phases);
         self.renumber_module_labels(&mut module);
         let module = self.finalize_module_for_codegen(module, &pgo_unit);

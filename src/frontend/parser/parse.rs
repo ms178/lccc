@@ -773,6 +773,13 @@ pub struct Parser {
     /// Number of currently-live expression-parse frames (E5 hardening).
     /// Bounded by `PARSER_FRAME_BUDGET`; see `enter_expr_frame`.
     pub(super) parser_frame_depth: u32,
+    /// Defer immediate-only asm constness checks during an optimizing compile.
+    /// GCC can fold a local initialized from constants (Linux's `__flags` in
+    /// WARN/BUG helpers) or substitute an inline parameter only after parsing.
+    /// The IR pipeline revalidates operands that remain dynamic after the
+    /// optimization/inlining pipeline. Syntax-only mode leaves this false so
+    /// it still diagnoses invalid dynamic operands without code generation.
+    pub(super) asm_immediate_validation_deferred: bool,
     /// Set once the frame-budget diagnostic has been emitted, so a single
     /// pathological nesting level produces exactly one error, not a flood.
     pub(super) nesting_budget_diagnosed: bool,
@@ -862,6 +869,7 @@ impl Parser {
             func_decl_noinline: FxHashSet::default(),
             error_count: 0,
             parser_frame_depth: 0,
+            asm_immediate_validation_deferred: false,
             nesting_budget_diagnosed: false,
             diagnostics: DiagnosticEngine::new(),
             enum_constants: FxHashMap::default(),
@@ -882,6 +890,13 @@ impl Parser {
     /// Select the C23 dialect (see the `c23` field).
     pub fn set_c23(&mut self, enabled: bool) {
         self.c23 = enabled;
+    }
+
+    /// Defer immediate-only inline-asm constness checks until optimized IR.
+    /// The normal code-generation pipeline must enable this before parsing;
+    /// syntax-only callers should leave it disabled.
+    pub fn set_deferred_asm_immediate_validation(&mut self, enabled: bool) {
+        self.asm_immediate_validation_deferred = enabled;
     }
 
     /// Take the diagnostic engine back from the parser (transfers ownership).

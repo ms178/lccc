@@ -293,7 +293,11 @@ impl Parser {
         let return_base_const = self.attrs.parsing_const();
         self.attrs.set_noreturn(false);
         let open = self.peek_span();
+        let prior_asm_immediate_defer = self.asm_immediate_validation_deferred;
+        self.asm_immediate_validation_deferred =
+            prior_asm_immediate_defer || is_inline || is_always_inline;
         let body = self.parse_compound_stmt();
+        self.asm_immediate_validation_deferred = prior_asm_immediate_defer;
         let body_span = self.through_previous_token(open);
         for n in shadowed_added {
             self.shadowed_typedefs.remove(&n);

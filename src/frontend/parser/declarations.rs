@@ -512,7 +512,15 @@ impl Parser {
             );
         }
         let open = self.peek_span();
+        // In an optimizing compile, a local initialized with a constant or
+        // an inline parameter may become an immediate only after optimization.
+        // Preserve the translation-unit's defer mode through this body; the
+        // post-optimization IR check rejects any dynamic operand that remains.
+        let prior_asm_immediate_defer = self.asm_immediate_validation_deferred;
+        self.asm_immediate_validation_deferred =
+            prior_asm_immediate_defer || is_inline || is_always_inline;
         let body = self.parse_compound_stmt();
+        self.asm_immediate_validation_deferred = prior_asm_immediate_defer;
         let body_span = self.through_previous_token(open);
         for n in shadowed_added {
             self.shadowed_typedefs.remove(&n);
