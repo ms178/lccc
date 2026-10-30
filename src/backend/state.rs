@@ -786,8 +786,9 @@ pub struct CodegenState {
     /// drained after the function's ordinary IR blocks have been emitted.
     pub pending_asm_goto_trampolines: Vec<PendingAsmGotoTrampoline>,
     /// CondBranch condition values whose truth is the live x86 condition
-    /// flags produced by an immediately preceding asm-goto flag output.
-    /// The x86 backend consumes these to branch directly without a cmp/test.
+    /// flags produced by an immediately preceding asm-goto flag output,
+    /// mapped to the full `jcc` mnemonic to emit. The x86 backend consumes
+    /// these to branch directly without a cmp/test.
     pub asm_cc_branch_values: FxHashMap<u32, String>,
     /// Condition-code output pointers whose only IR reads are certified
     /// branches in `asm_cc_branch_values`; their setcc/store is dead.

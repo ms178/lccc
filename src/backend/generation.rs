@@ -151,9 +151,9 @@ fn collect_asm_goto_cc_branch_values(
             let Some(entry) = asm_cc_output_suffix(constraint) else {
                 continue;
             };
-            let cc = entry.gcc;
+            let jcc = entry.jcc;
             for (_, target) in goto_labels {
-                target_edges.push((source_idx, *target, output_ptr.0, cc));
+                target_edges.push((source_idx, *target, output_ptr.0, jcc));
             }
 
             // Fall-through edge: the output's first load is the sole input to
@@ -177,7 +177,7 @@ fn collect_asm_goto_cc_branch_values(
                     && *branch_value == *dest
                     && use_counts.get(&dest.0) == Some(&1)
                 {
-                    fallthrough_fusions.insert(dest.0, cc.to_string());
+                    fallthrough_fusions.insert(dest.0, jcc.to_string());
                     certified_dests.insert(dest.0);
                 }
             }
@@ -223,7 +223,7 @@ fn collect_asm_goto_cc_branch_values(
                 && *branch_value == *dest
                 && use_counts.get(&dest.0) == Some(&1)
             {
-                label_fusions.push((dest.0, cc, output_ptr));
+                label_fusions.push((dest.0, jcc, output_ptr));
                 certified_dests.insert(dest.0);
             }
         }
