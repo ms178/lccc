@@ -1382,6 +1382,28 @@ sessions have now spent time re-deriving that these numbers are not gaps.
 
 ---
 
+## 8a. Declaration-parser tail split (measured 2026-10-30)
+
+The attribute/cleanup verdict work feeds one declaration-level verdict pool, and
+the three declaration entry points each carry the tail that turns the collected
+flags into a `Declaration`.  They cross the 300-line ratchet:
+
+| function | file | lines | main |
+|---|---|---|---|
+| `parse_declaration_rest` | `src/frontend/parser/declarations.rs` | 355 | 315 |
+| `parse_local_declaration` | same | 342 | 291 |
+| `parse_external_decl` | same | 317 | 277 |
+| `lower` | `src/ir/lowering/lower.rs` | 514 | 500 |
+
+`scripts/audit_census_baseline.json` was raised by those three and one count in
+the commit that added them, which is the ratchet's own escape hatch.  The
+refactor that pays it back is mechanical and is the next item here: extract the
+`Declaration::new` + `set_*` tail into one `finish_declaration(...)` helper
+shared by the three entry points, and split `lower`'s call lowering from its
+statement walk.  Nothing in the current change depends on the split, and the
+semantics are already covered by `tests/regression/check_attribute_diagnostics.*`
+plus the attribute option ledger.
+
 ## 9a. SSE/AVX audit follow-through (2026-10-26)
 
 These are **open obligations**, not an ISA/manual sign-off. Start with

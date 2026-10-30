@@ -158,7 +158,10 @@ printf 'int f(int a, int b){ unsigned char o; asm goto("cmpl %%1, %%2\\n\\t# pla
 "$CCC" -m64 -std=gnu11 -O2 -S "$tmp/plain.c" -o "$tmp/plain.s"
 grep -Eq '# plain=\$\.L[0-9A-Za-z_.]+ named=\.L[0-9A-Za-z_.]+' "$tmp/plain.s" \
     || { echo "FAIL: plain %N did not print the label address" >&2; cat "$tmp/plain.s" >&2; exit 1; }
-plain_sym=$(sed -n 's/.*# plain=\$\([^ ]*\) named=\([^ ]*\).*/\1 \2/p' "$tmp/plain.s" | head -1)
+# `sed -n p;q` rather than `head -1`: this file runs under `set -o
+# pipefail`, and a consumer that stops reading early turns the
+# producer's SIGPIPE into a failure of the whole gate.
+plain_sym=$(sed -n 's/.*# plain=\$\\([^ ]*\\) named=\\([^ ]*\\).*/\\1 \\2/p;q' "$tmp/plain.s")
 set -- $plain_sym
 [[ $1 == "$2" ]] || { echo "FAIL: plain %N and %lN name different labels ($1 vs $2)" >&2; exit 1; }
 echo "PASS plain %N prints the label address (same symbol as %lN)"

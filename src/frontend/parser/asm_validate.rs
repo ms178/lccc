@@ -1170,6 +1170,33 @@ mod tests {
     }
 
     #[test]
+    fn condition_code_modifier_follows_one_named_tie() {
+        // `%c` prints a constant expression.  A named tie (`"[sum]"`) carries
+        // the *output's* constraint, so the verdict has to look through it:
+        // measured on gcc 16.2, `: [s] "=r"(s) : "[s]"(b)` with `%c1` is
+        // `invalid 'asm': operand is not a condition code, invalid operand
+        // code 'c'`, exactly like the untied register spelling, while a tie to
+        // an immediate output is not that error (gcc only warns that a
+        // matching constraint cannot take a register, which is about the tie
+        // itself, not about `%c`).
+        let outputs = [named("=r", Constness::Unknown, "s")];
+        let inputs = [op("[s]", Constness::Unknown)];
+        let p = validate("mov %c1, %0", &outputs, &inputs, 0, true);
+        assert_eq!(
+            messages(&p),
+            ["invalid 'asm': operand is not a condition code, invalid operand code 'c'"]
+        );
+        let outputs = [named("=n", Constness::Unknown, "s")];
+        let inputs = [op("[s]", Constness::Unknown)];
+        let p = validate("mov %c1, %0", &outputs, &inputs, 0, true);
+        assert!(
+            p.iter()
+                .all(|d| !d.message.contains("not a condition code")),
+            "{p:?}"
+        );
+    }
+
+    #[test]
     fn modelled_constraints_pass() {
         for c in [
             "r", "m", "g", "rm", "=r", "+r", "&r", "Yz", "x", "v", "Q", "A", "X", "t", "u",
