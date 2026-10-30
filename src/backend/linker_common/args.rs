@@ -1078,6 +1078,10 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
         "--image-base",
         "--pack-dyn-relocs",
         "--oformat",
+        // BFD's deprecated alias for `--oformat`; `-Wl,-b -Wl,binary` must be
+        // re-joined like the long spelling, or the format word falls through
+        // to the input list and is reported as a missing file.
+        "-b",
         "-rpath",
         "-rpath-link",
         "--rpath-link",

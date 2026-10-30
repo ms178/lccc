@@ -8502,22 +8502,25 @@ def _binary_output_matches_objcopy_test(args, oracles):
         # linker only through `-Wl,`, where an unparsed token is silently
         # dropped rather than rejected.  Both joined spellings must produce the
         # same flat image as the long option above.
-        for alias in (["-Wl,-b,binary"], ["-Wl,-bbinary"]):
+        for alias in (["-Wl,-b,binary"], ["-Wl,-bbinary"],
+                      # A driver forwards `-b binary` as two groups; the pair
+                      # has to be re-joined or `binary` becomes an input file.
+                      ["-Wl,-b", "-Wl,binary"]):
             alias_out = "driver.alias.bin"
             alias_link = sh([args.lccc, "-O1", "-fno-pic", "driver.c", "-o",
                              alias_out, *alias, "-Wl,--build-id=none"], cwd=td)
             if alias_link.returncode:
-                return Result(name, "FAIL", f"{alias[0]} link failed: " +
+                return Result(name, "FAIL", f"{' '.join(alias)} link failed: " +
                               alias_link.stderr.decode(errors="replace")[:300])
             with open(os.path.join(td, alias_out), "rb") as image:
                 alias_bytes = image.read()
             if alias_bytes.startswith(b"\x7fELF"):
                 return Result(name, "FAIL",
-                              f"{alias[0]} produced an ELF file: the -b alias was "
+                              f"{' '.join(alias)} produced an ELF file: the -b alias was "
                               f"parsed as an unknown token and dropped")
             if alias_bytes != driver_expected:
                 return Result(name, "FAIL",
-                              f"{alias[0]} flat image differs from objcopy "
+                              f"{' '.join(alias)} flat image differs from objcopy "
                               f"({len(alias_bytes)} vs {len(driver_expected)} bytes)")
         return Result(name, "PASS")
 
