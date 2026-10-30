@@ -1292,7 +1292,13 @@ impl CodegenState {
         self.dirty_upper_ymm = false;
         self.uses_sret = false;
         self.next_block_label = None;
-        debug_assert!(self.pending_asm_goto_trampolines.is_empty());
+        // Drop any trampolines a previous function failed to emit instead of
+        // asserting on them: a caller that returns before the drain (the
+        // `is_naked` path does) would otherwise panic every assertion-enabled
+        // build, and, worse, a release build would emit the stale trampolines
+        // into the *next* function. The drain itself asserts that it consumed
+        // the queue, so a genuine leak still fails loudly where it happens.
+        self.pending_asm_goto_trampolines.clear();
         self.asm_cc_branch_values.clear();
         self.asm_cc_branch_output_ptrs.clear();
         self.observable_block_start = None;

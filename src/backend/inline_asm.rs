@@ -537,6 +537,14 @@ pub fn emit_inline_asm_common(
     );
 }
 
+/// Whether a constraint writes its operand back (`=`, `=r`, `+r`, `=&m`, ...).
+///
+/// `+` implies both a read and a write, so it is an output for every purpose
+/// that only asks "is this operand stored after the template?".
+fn constraint_writes_operand(constraint: &str) -> bool {
+    constraint.contains('=') || constraint.contains('+')
+}
+
 pub fn emit_inline_asm_common_impl(
     emitter: &mut dyn InlineAsmEmitter,
     template: &str,
@@ -689,7 +697,7 @@ pub fn emit_inline_asm_common_impl(
         let trampoline_outputs: Vec<_> = outputs
             .iter()
             .enumerate()
-            .filter(|(_, (constraint, _, _))| constraint.contains('=') || constraint.contains('+'))
+            .filter(|(_, (constraint, _, _))| constraint_writes_operand(constraint))
             .map(|(i, (constraint, ptr, _))| (operands[i].clone(), *ptr, constraint.clone()))
             .collect();
         let pending = &mut emitter.asm_state().pending_asm_goto_trampolines;

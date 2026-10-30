@@ -81,27 +81,19 @@ fn resolve_dialect_alternatives(line: &str) -> Cow<'_, str> {
 /// GCC's `=@cc<cond>` output constraint maps directly to x86 condition codes.
 /// This mapping is identical for both x86-64 and i686.
 pub(crate) fn gcc_cc_to_x86(cond: &str) -> &'static str {
-    match cond {
-        "e" | "z" => "e",    // equal / zero
-        "ne" | "nz" => "ne", // not equal / not zero
-        "s" => "s",          // sign (negative)
-        "ns" => "ns",        // not sign (non-negative)
-        "o" => "o",          // overflow
-        "no" => "no",        // no overflow
-        "c" => "c",          // carry
-        "nc" => "nc",        // no carry
-        "a" | "nbe" => "a",  // above (unsigned >)
-        "ae" | "nb" => "ae", // above or equal (unsigned >=)
-        "b" | "nae" => "b",  // below (unsigned <)
-        "be" | "na" => "be", // below or equal (unsigned <=)
-        "g" | "nle" => "g",  // greater (signed >)
-        "ge" | "nl" => "ge", // greater or equal (signed >=)
-        "l" | "nge" => "l",  // less (signed <)
-        "le" | "ng" => "le", // less or equal (signed <=)
-        "p" | "pe" => "p",   // parity even
-        "np" | "po" => "np", // parity odd / no parity
-        // TODO: emit a warning/diagnostic for unrecognized condition code suffixes
-        _ => "e", // fallback to equal
+    match crate::common::asm_constraints::cond_code(cond) {
+        Some(entry) => entry.setcc,
+        // Unreachable for any program this compiler accepts: `asm_validate`
+        // diagnoses every `=@cc` suffix outside the shared table with GCC's own
+        // `unknown 'asm' flag output` message, and an `@cc` operand is the only
+        // way a condition code reaches this function. The historical `e`
+        // fallback is kept deliberately: a backend must never panic on a
+        // malformed constraint, and a diagnostic has already been issued where
+        // the program was parsed. (Before the shared table, `pe`/`po` were
+        // silently mapped here even though GCC and Clang both reject them,
+        // which made this compiler encode a constraint no other compiler
+        // accepts.)
+        None => "e",
     }
 }
 

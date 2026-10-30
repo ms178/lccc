@@ -1320,51 +1320,23 @@ impl X86Codegen {
 
     #[inline]
     fn invert_jcc(cc: &str) -> &'static str {
-        match cc {
-            "je" => "jne",
-            "jne" => "je",
-            "jl" => "jge",
-            "jge" => "jl",
-            "jle" => "jg",
-            "jg" => "jle",
-            "jb" | "jc" => "jae",
-            "jae" => "jb",
-            "jbe" => "ja",
-            "ja" => "jbe",
-            "jp" => "jnp",
-            "jnp" => "jp",
-            "js" => "jns",
-            "jns" => "js",
-            "jo" => "jno",
-            "jno" => "jo",
-            "jnc" => "jc",
+        match crate::common::asm_constraints::inverse_jcc(cc) {
+            Some(inverse) => inverse,
             // A silent fallback here would branch on the wrong condition.
-            other => unreachable!("invert_jcc: unexpected condition {other}"),
+            None => unreachable!("invert_jcc: unexpected condition {cc}"),
         }
     }
 
+    /// Full `jcc` mnemonic for a GCC condition-code suffix, so a fused
+    /// `asm goto` flag output branches on the condition the template produced.
     #[inline]
     fn asm_cc_jcc(cond: &str) -> &'static str {
-        match crate::backend::x86_common::gcc_cc_to_x86(cond) {
-            "e" => "je",
-            "ne" => "jne",
-            "s" => "js",
-            "ns" => "jns",
-            "o" => "jo",
-            "no" => "jno",
-            "c" => "jc",
-            "nc" => "jnc",
-            "a" => "ja",
-            "ae" => "jae",
-            "b" => "jb",
-            "be" => "jbe",
-            "g" => "jg",
-            "ge" => "jge",
-            "l" => "jl",
-            "le" => "jle",
-            "p" => "jp",
-            "np" => "jnp",
-            _ => unreachable!("gcc_cc_to_x86 returned an unsupported suffix"),
+        match crate::common::asm_constraints::cond_code(cond) {
+            Some(entry) => entry.jcc,
+            // The fusion analysis certifies only suffixes from the shared table,
+            // so an unknown one here is an internal invariant violation rather
+            // than a property of the input program.
+            None => unreachable!("asm_cc_jcc: unsupported condition code {cond}"),
         }
     }
 

@@ -392,11 +392,23 @@ pub fn collect_inline_asm_callee_saved_i686(
                 }
             }
 
-            let has_cc_output = outputs.iter().any(|(constraint, _, _)| {
-                constraint
-                    .trim_start_matches(['=', '+', '&', '%'])
-                    .starts_with("@cc")
-            });
+            // A flag output written straight to its byte stack home
+            // (`setcc <slot>`, the `direct_byte_store` case above) consumes no
+            // scratch register, so it cannot perturb the caller-saved prefix
+            // the mixed-shape rule below guards. Counting it as if it did
+            // reserved the entire callee-saved pool -- a push/pop in the
+            // prologue -- for instructions that never needed one.
+            let mut has_scratch_cc_output = false;
+            for (op_idx, (constraint, ptr, _)) in outputs.iter().enumerate() {
+                let stripped = constraint.trim_start_matches(['=', '+', '&', '%']);
+                let direct_byte_store =
+                    matches!(operand_types.get(op_idx), Some(IrType::I8 | IrType::U8))
+                        && alloca_ids.contains(&ptr.0);
+                if stripped.starts_with("@cc") && !direct_byte_store {
+                    has_scratch_cc_output = true;
+                    break;
+                }
+            }
             let has_register_output = outputs.iter().any(|(constraint, _, _)| {
                 let c = constraint.trim_start_matches(['=', '+', '&', '%']);
                 c.contains('r') || c.contains('q') || c.contains('g')
@@ -408,7 +420,7 @@ pub fn collect_inline_asm_callee_saved_i686(
             let caller_scratch_saturated = demand > 0 && demand >= avail.max(0);
             if demand > avail.max(0)
                 || caller_scratch_saturated
-                || (has_cc_output && has_register_output && has_register_input)
+                || (has_scratch_cc_output && has_register_output && has_register_input)
             {
                 // Mixed flag and register outputs make the generic scratch
                 // allocator's available caller-saved prefix depend on live RA

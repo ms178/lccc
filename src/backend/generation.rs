@@ -37,37 +37,17 @@ fn sibcall_enabled() -> bool {
     !*SIBCALL_DISABLED.get_or_init(|| std::env::var_os("CCC_NO_SIBCALL").is_some())
 }
 
-fn is_supported_gcc_cc_output(cond: &str) -> bool {
-    matches!(
-        cond,
-        "e" | "z"
-            | "ne"
-            | "nz"
-            | "s"
-            | "ns"
-            | "o"
-            | "no"
-            | "c"
-            | "nc"
-            | "a"
-            | "nbe"
-            | "ae"
-            | "nb"
-            | "b"
-            | "nae"
-            | "be"
-            | "na"
-            | "g"
-            | "nle"
-            | "ge"
-            | "nl"
-            | "l"
-            | "nge"
-            | "le"
-            | "ng"
-            | "p"
-            | "np"
-    )
+/// GCC condition-code suffix of a single-output `=@cc<suffix>` constraint.
+///
+/// `None` for every other constraint shape, so callers cannot accidentally
+/// treat an ordinary register output as a flag output.
+fn asm_cc_output_suffix(
+    constraint: &str,
+) -> Option<&'static crate::common::asm_constraints::CondCode> {
+    let suffix = constraint
+        .trim_start_matches(['=', '+', '&', '%'])
+        .strip_prefix("@cc")?;
+    crate::common::asm_constraints::cond_code(suffix)
 }
 
 /// Identify the deliberately narrow case where an asm-goto condition-code
@@ -76,36 +56,82 @@ fn is_supported_gcc_cc_output(cond: &str) -> bool {
 /// edge code lets each branch consume the original flags. Ambiguous CFG
 /// predecessors, volatile reads, address escapes, or any extra value use fail
 /// closed to ordinary output materialization and load-and-branch code.
+///
+/// Cost, measured in work rather than guessed: a function whose inline asm
+/// never produces a single-output `@cc` result returns after one scan of its
+/// asm instructions -- no CFG is built, nothing is allocated -- so ordinary
+/// translation units pay nothing. The certification itself walks each
+/// instruction's operand list exactly once through the allocation-free
+/// liveness visitors, instead of materialising a `Vec` of used values per
+/// instruction per output object.
 fn collect_asm_goto_cc_branch_values(
     func: &IrFunction,
 ) -> (FxHashMap<u32, String>, FxHashSet<u32>) {
+    let nothing = || (FxHashMap::default(), FxHashSet::default());
     if func.blocks.is_empty() {
-        return (FxHashMap::default(), FxHashSet::default());
+        return nothing();
     }
 
-    let mut use_counts: FxHashMap<u32, usize> = FxHashMap::default();
-    let mut asm_edge_counts: FxHashMap<crate::ir::reexports::BlockId, usize> = FxHashMap::default();
+    // Pass 1 (cheap): the objects that receive a condition-code output from an
+    // asm-goto with exactly one output. No other shape is certifiable.
+    let mut cc_output_ptrs: FxHashSet<u32> = FxHashSet::default();
     for block in &func.blocks {
         for inst in &block.instructions {
-            for used in inst.used_values() {
-                *use_counts.entry(used).or_insert(0) += 1;
+            let Instruction::InlineAsm {
+                outputs,
+                goto_labels,
+                ..
+            } = inst
+            else {
+                continue;
+            };
+            if goto_labels.is_empty() || outputs.len() != 1 {
+                continue;
             }
+            if asm_cc_output_suffix(&outputs[0].0).is_some() {
+                cc_output_ptrs.insert(outputs[0].1.0);
+            }
+        }
+    }
+    if cc_output_ptrs.is_empty() {
+        return nothing();
+    }
+    // Object id -> verdict slot, so every later scan is O(1) per operand.
+    let ptr_slot: FxHashMap<u32, usize> = cc_output_ptrs
+        .iter()
+        .enumerate()
+        .map(|(slot, &ptr)| (ptr, slot))
+        .collect();
+
+    // Pass 2: value use counts and asm-goto edge counts.
+    let mut use_counts: FxHashMap<u32, u32> = FxHashMap::default();
+    let mut asm_edge_counts: FxHashMap<BlockId, u32> = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            for_each_operand_in_instruction(inst, |op| {
+                if let Operand::Value(value) = op {
+                    *use_counts.entry(value.0).or_insert(0) += 1;
+                }
+            });
             if let Instruction::InlineAsm { goto_labels, .. } = inst {
                 for (_, label) in goto_labels {
                     *asm_edge_counts.entry(*label).or_insert(0) += 1;
                 }
             }
         }
-        for used in block.terminator.used_values() {
-            *use_counts.entry(used).or_insert(0) += 1;
-        }
+        for_each_operand_in_terminator(&block.terminator, |op| {
+            if let Operand::Value(value) = op {
+                *use_counts.entry(value.0).or_insert(0) += 1;
+            }
+        });
     }
 
     let label_to_idx = crate::ir::analysis::build_label_map(func);
     let (preds, _) = crate::ir::analysis::build_cfg(func, &label_to_idx);
-    let mut result = FxHashMap::default();
-    let mut cc_output_ptrs = FxHashSet::default();
-    let mut target_edges = Vec::new();
+    let mut fallthrough_fusions: FxHashMap<u32, String> = FxHashMap::default();
+    let mut certified_dests: FxHashSet<u32> = FxHashSet::default();
+    let mut label_fusions: Vec<(u32, &'static str, u32)> = Vec::new();
+    let mut target_edges: Vec<(usize, BlockId, u32, &'static str)> = Vec::new();
 
     for (source_idx, block) in func.blocks.iter().enumerate() {
         for (inst_idx, inst) in block.instructions.iter().enumerate() {
@@ -121,14 +147,12 @@ fn collect_asm_goto_cc_branch_values(
                 continue;
             }
             let (constraint, output_ptr, _) = &outputs[0];
-            let cc = constraint
-                .trim_start_matches(['=', '+', '&', '%'])
-                .strip_prefix("@cc")
-                .filter(|cc| is_supported_gcc_cc_output(cc));
-            let Some(cc) = cc else { continue };
-            cc_output_ptrs.insert(output_ptr.0);
+            let Some(entry) = asm_cc_output_suffix(constraint) else {
+                continue;
+            };
+            let cc = entry.gcc;
             for (_, target) in goto_labels {
-                target_edges.push((source_idx, *target, *output_ptr, cc.to_string()));
+                target_edges.push((source_idx, *target, output_ptr.0, cc));
             }
 
             // Fall-through edge: the output's first load is the sole input to
@@ -152,7 +176,8 @@ fn collect_asm_goto_cc_branch_values(
                     && *branch_value == *dest
                     && use_counts.get(&dest.0) == Some(&1)
                 {
-                    result.insert(dest.0, cc.to_string());
+                    fallthrough_fusions.insert(dest.0, cc.to_string());
+                    certified_dests.insert(dest.0);
                 }
             }
         }
@@ -192,12 +217,13 @@ fn collect_asm_goto_cc_branch_values(
             },
         ) = (first, &target_block.terminator)
         {
-            if *ptr == output_ptr
+            if ptr.0 == output_ptr
                 && matches!(*ty, IrType::I8 | IrType::U8)
                 && *branch_value == *dest
                 && use_counts.get(&dest.0) == Some(&1)
             {
-                result.insert(dest.0, cc);
+                label_fusions.push((dest.0, cc, output_ptr));
+                certified_dests.insert(dest.0);
             }
         }
     }
@@ -206,49 +232,76 @@ fn collect_asm_goto_cc_branch_values(
     // output object is one of the certified branch loads. Any address escape,
     // extra read/write, volatile access, or second asm output keeps the normal
     // output materialization path.
-    let mut elidable_output_ptrs = FxHashSet::default();
-    for output_ptr in cc_output_ptrs {
-        let mut output_defs = 0usize;
-        let mut branch_loads = 0usize;
-        let mut safe = true;
-        for block in &func.blocks {
-            for inst in &block.instructions {
-                match inst {
-                    Instruction::InlineAsm {
-                        outputs, inputs, ..
-                    } => {
-                        output_defs += outputs
-                            .iter()
-                            .filter(|(_, ptr, _)| ptr.0 == output_ptr)
-                            .count();
-                        if inputs.iter().any(|(_, op, _)| {
-                            matches!(op, Operand::Value(value) if value.0 == output_ptr)
-                        }) {
-                            safe = false;
+    let mut verdicts = vec![(0u32, 0u32, true); ptr_slot.len()];
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            match inst {
+                Instruction::InlineAsm { outputs, inputs, .. } => {
+                    for (_, ptr, _) in outputs {
+                        if let Some(&slot) = ptr_slot.get(&ptr.0) {
+                            verdicts[slot].0 += 1;
                         }
                     }
-                    Instruction::Load {
-                        dest,
-                        ptr,
-                        volatile,
-                        ..
-                    } if ptr.0 == output_ptr => {
-                        if *volatile || !result.contains_key(&dest.0) {
-                            safe = false;
-                        } else {
-                            branch_loads += 1;
+                    for (_, op, _) in inputs {
+                        if let Operand::Value(value) = op {
+                            if let Some(&slot) = ptr_slot.get(&value.0) {
+                                verdicts[slot].2 = false;
+                            }
                         }
                     }
-                    _ if inst.used_values().contains(&output_ptr) => safe = false,
-                    _ => {}
                 }
-            }
-            if block.terminator.used_values().contains(&output_ptr) {
-                safe = false;
+                Instruction::Load {
+                    dest,
+                    ptr,
+                    volatile,
+                    ..
+                } => {
+                    if let Some(&slot) = ptr_slot.get(&ptr.0) {
+                        if *volatile || !certified_dests.contains(&dest.0) {
+                            verdicts[slot].2 = false;
+                        } else {
+                            verdicts[slot].1 += 1;
+                        }
+                    }
+                }
+                _ => for_each_operand_in_instruction(inst, |op| {
+                    if let Operand::Value(value) = op {
+                        if let Some(&slot) = ptr_slot.get(&value.0) {
+                            verdicts[slot].2 = false;
+                        }
+                    }
+                }),
             }
         }
+        for_each_operand_in_terminator(&block.terminator, |op| {
+            if let Operand::Value(value) = op {
+                if let Some(&slot) = ptr_slot.get(&value.0) {
+                    verdicts[slot].2 = false;
+                }
+            }
+        });
+    }
+    let mut elidable_output_ptrs: FxHashSet<u32> = FxHashSet::default();
+    for (&output_ptr, &slot) in &ptr_slot {
+        let (output_defs, branch_loads, safe) = verdicts[slot];
         if safe && output_defs == 1 && branch_loads > 0 {
             elidable_output_ptrs.insert(output_ptr);
+        }
+    }
+
+    // Keep every fall-through fusion: its load is the *next* instruction and the
+    // branch is that block's terminator, so no instruction at all can sit
+    // between the template's flags and the fused test. Keep a label-edge fusion
+    // only when the output object carries no store anywhere; otherwise the
+    // synthetic edge block materialises outputs and transfers control, and the
+    // fused branch would consume flags produced by that path rather than by the
+    // template. Gating here makes the "store preserves EFLAGS" property
+    // unnecessary instead of merely true today, so teaching
+    // `store_output_from_reg` a flag-writing fixup cannot silently break it.
+    let mut result = fallthrough_fusions;
+    for (dest, cc, output_ptr) in label_fusions {
+        if elidable_output_ptrs.contains(&output_ptr) {
+            result.insert(dest, cc.to_string());
         }
     }
     (result, elidable_output_ptrs)
