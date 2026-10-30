@@ -1096,7 +1096,32 @@ impl DiagnosticEngine {
     /// - If -Werror or -Werror=<name> applies, it is promoted to an error.
     /// - The GCC-style `[-W<name>]` suffix is appended to the message.
     pub fn emit(&mut self, diag: &Diagnostic) {
+        // GCC suppresses diagnostics that come from a system header unless
+        // -Wsystem-headers asks for them; the suppression applies to warnings
+        // only. Without this, a project that merely includes <pthread.h>
+        // would see our honest `'returns_twice' attribute ignored` note on a
+        // declaration it does not own. It runs before the per-occurrence
+        // dedupe below: a suppressed warning must not consume the occurrence
+        // slot of the same diagnostic emitted later under `-Wsystem-headers`.
         if diag.severity == Severity::Warning
+            && !self.warning_config.system_headers
+            && diag
+                .span
+                .is_some_and(|span| self.span_is_in_system_header(span))
+        {
+            return;
+        }
+        // Verdicts about a *named attribute occurrence* are emitted at most
+        // once per occurrence: the same declaration can be parsed
+        // speculatively and again for real, and two call sites judge the same
+        // record. The salt is the attribute's own offset, so a declaration
+        // that writes the attribute twice (`__attribute__((noreturn))
+        // __attribute__((noreturn)) int x;`, which gcc reports twice) keeps
+        // both verdicts. Every other warning is not deduplicated at all —
+        // gcc reports one diagnostic per offending token, and two independent
+        // problems at the same span are two diagnostics.
+        if diag.severity == Severity::Warning
+            && diag.dedup_salt != 0
             && let Some(span) = diag.span
             && !self.emitted_warnings.insert((
                 span.file_id,
@@ -1105,19 +1130,6 @@ impl DiagnosticEngine {
                 Self::message_hash(&diag.message),
                 diag.dedup_salt,
             ))
-        {
-            return;
-        }
-        // GCC suppresses diagnostics that come from a system header unless
-        // -Wsystem-headers asks for them; the suppression applies to warnings
-        // only. Without this, a project that merely includes <pthread.h>
-        // would see our honest `'returns_twice' attribute ignored` note on a
-        // declaration it does not own.
-        if diag.severity == Severity::Warning
-            && !self.warning_config.system_headers
-            && diag
-                .span
-                .is_some_and(|span| self.span_is_in_system_header(span))
         {
             return;
         }
@@ -1731,6 +1743,7 @@ mod dialect_severity_redteam_tests {
             WarningKind::CompareDistinctPointerTypes,
             WarningKind::Pedantic,
             WarningKind::Vla,
+            WarningKind::DivByZero,
         ];
         let registered: HashSet<_> = WARNING_REGISTRY.iter().map(|entry| entry.kind).collect();
         let names: HashSet<_> = WARNING_REGISTRY.iter().map(|entry| entry.name).collect();
@@ -1828,6 +1841,7 @@ mod dialect_severity_redteam_tests {
             "compare-distinct-pointer-types",
             "discarded-qualifiers",
             "discarded-array-qualifiers",
+            "div-by-zero",
             "undeclared",
         ];
         expected_defaults.sort_unstable();
