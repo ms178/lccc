@@ -375,7 +375,7 @@ impl Parser {
         // `noinline` is a function property, not a one-declaration parsing
         // hint.  Preserve it from a prior prototype through a later bare
         // definition just like no_instrument_function above.
-        self.record_function_noinline(name.as_deref(), &derived, is_noinline);
+        self.record_function_entity(name.as_deref(), &derived, is_noinline);
 
         if is_funcdef {
             self.parse_function_def(
@@ -439,17 +439,43 @@ impl Parser {
         ExternalDecl::Declaration(Declaration::empty())
     }
 
-    /// Record a property of a function entity, not a pointer object. Call this
+    /// Record facts about a FUNCTION entity, not a pointer object. Call this
     /// for every declarator, after its own trailing attributes are consumed.
-    fn record_function_noinline(
+    ///
+    /// Two facts ride on the same shape test (`DerivedDeclarator::Function` last
+    /// means the declared entity is a function, not a pointer to one):
+    ///   * `noinline`, preserved from a prototype through a later bare
+    ///     definition (GCC merges declaration attributes into the definition);
+    ///   * the name itself, so an `asm "i"(f)` operand can be recognised as a
+    ///     link-time constant (`function_names`, see `asm_validate`).
+    fn record_function_entity(
         &mut self,
         name: Option<&str>,
         derived: &[DerivedDeclarator],
         noinline: bool,
     ) {
-        if noinline && matches!(derived.last(), Some(DerivedDeclarator::Function(..))) {
-            if let Some(name) = name {
+        if !matches!(derived.last(), Some(DerivedDeclarator::Function(..))) {
+            return;
+        }
+        if let Some(name) = name {
+            self.function_names.insert(name.to_owned());
+            if noinline {
                 self.func_decl_noinline.insert(name.to_owned());
+            }
+        }
+    }
+
+    /// An OBJECT declaration hides any same-named function: after
+    /// `void f(void);` a block-scope `int f;` makes `"i"(f)` an ordinary
+    /// object value, exactly as it hides a typedef name.  A declaration whose
+    /// last declarator is a function still names the function entity (a
+    /// redeclaration or definition), so it must not clear the record.
+    fn record_object_shadows(&mut self, declarators: &[InitDeclarator]) {
+        for decl in declarators {
+            if !decl.name.is_empty()
+                && !matches!(decl.derived.last(), Some(DerivedDeclarator::Function(..)))
+            {
+                self.function_names.remove(&decl.name);
             }
         }
     }
@@ -562,7 +588,11 @@ impl Parser {
         let prior_asm_immediate_defer = self.asm_immediate_validation_deferred;
         self.asm_immediate_validation_deferred =
             prior_asm_immediate_defer || is_inline || is_always_inline;
+        let saved_asm_deferral = self.asm_deferred_instantiation;
+        self.asm_deferred_instantiation =
+            saved_asm_deferral || is_inline || is_always_inline || is_gnu_inline;
         let body = self.parse_compound_stmt();
+        self.asm_deferred_instantiation = saved_asm_deferral;
         self.asm_immediate_validation_deferred = prior_asm_immediate_defer;
         let body_span = self.through_previous_token(open);
         for n in shadowed_added {
@@ -1076,7 +1106,7 @@ impl Parser {
         if self.attrs.parsing_error_attr() {
             last_decl.attrs.set_error_attr(true);
         }
-        self.record_function_noinline(
+        self.record_function_entity(
             Some(&last_decl.name),
             &last_decl.derived,
             self.attrs.parsing_noinline(),
@@ -1205,7 +1235,7 @@ impl Parser {
             if let Some(a) = skip_aligned {
                 ctx.alignment = Some(ctx.alignment.map_or(a, |prev| prev.max(a)));
             }
-            self.record_function_noinline(
+            self.record_function_entity(
                 Some(&last_decl.name),
                 &last_decl.derived,
                 self.attrs.parsing_noinline(),
@@ -1281,6 +1311,74 @@ impl Parser {
         let pending = self.attrs.parsing_transparent_union();
         self.attrs.set_transparent_union(false);
         pending
+    }
+
+    /// Whether `expr` mentions the identifier `name` anywhere (a cheap guard
+    /// against recording `int x = x;` as a constant).
+    fn mentions_identifier(expr: &Expr, name: &str) -> bool {
+        let mut found = false;
+        let mut stack: Vec<&Expr> = Vec::new();
+        // `for_each_child` is the one-step visitor; recurse through it so the
+        // guard sees every nested occurrence without a second walker.
+        stack.push(expr);
+        while let Some(e) = stack.pop() {
+            if let Expr::Identifier(n, _) = e
+                && n == name
+            {
+                found = true;
+                break;
+            }
+            e.for_each_child(&mut |child| stack.push(child));
+        }
+        found
+    }
+
+    /// Record `name` as an integer constant when a block-scope declaration is
+    /// an integer scalar with a self-contained constant initializer.
+    ///
+    /// Deliberately conservative: pointers, aggregates, `volatile`, `extern`,
+    /// `static` and anything the parser's own integer folder cannot evaluate
+    /// are not recorded, so the `asm "i"` diagnostic is preserved for them —
+    /// exactly the set GCC also rejects.  The declarator must be a plain name
+    /// (no pointer/array/function derivation).
+    pub(super) fn record_local_constant(
+        &mut self,
+        name: &str,
+        derived: &[DerivedDeclarator],
+        init: &Initializer,
+    ) {
+        if !derived.is_empty() || self.attrs.parsing_volatile() || self.attrs.parsing_static() {
+            return;
+        }
+        // Only an expression initializer can be a scalar constant; a braced
+        // list is an aggregate (or a scalar with a redundant brace, which is
+        // not worth the special case).
+        let Initializer::Expr(expr) = init else {
+            return;
+        };
+        // A self-reference (`int x = x;`) must not resolve to itself.
+        if Self::mentions_identifier(expr, name) {
+            return;
+        }
+        // Constants already recorded in this or an enclosing block participate,
+        // so `int fl = 3; __auto_type v = (1 << 0) | (fl << 8);` folds.  GCC
+        // reaches the same answer by constant-propagating the local before it
+        // re-checks the `asm` statement.
+        let mut fold_enums = self.enum_constants.clone();
+        for (n, val) in &self.local_constants {
+            fold_enums.entry(n.clone()).or_insert(*val);
+        }
+        match Self::eval_const_int_expr_with_enums(expr, Some(&fold_enums), None) {
+            Some(v) => {
+                self.local_constants.insert(name.to_string(), v);
+            }
+            // A declaration without a foldable initializer SHADOWS any outer
+            // record of the same name: `int v = 5; { int v; asm("i"(v)); }`
+            // must not read the outer 5.
+            None => {
+                self.local_constants.remove(name);
+            }
+        }
     }
 
     pub(super) fn parse_local_declaration(&mut self) -> Option<Declaration> {
@@ -1435,6 +1533,19 @@ impl Parser {
             } else {
                 None
             };
+            // Record a block-scope integer constant so an `asm "i"` operand may
+            // name it (see `local_constants` in the parser state).  A
+            // declaration with no initializer still SHADOWS an outer record.
+            if let Some(decl_name) = name.as_ref() {
+                if !decl_name.is_empty() && !self.attrs.parsing_typedef() {
+                    match init.as_ref() {
+                        Some(init) => self.record_local_constant(decl_name, &derived, init),
+                        None => {
+                            self.local_constants.remove(decl_name.as_str());
+                        }
+                    }
+                }
+            }
             // Attributes parsed inside an initializer belong to that nested
             // construct, not to this declarator or the next comma sibling.
             self.attrs.set_retain(false);
@@ -1540,6 +1651,7 @@ impl Parser {
                     self.shadowed_typedefs.insert(decl.name.clone());
                 }
             }
+            self.record_object_shadows(&declarators);
         }
 
         self.expect_after(&TokenKind::Semicolon, "after declaration");
@@ -1755,6 +1867,31 @@ impl Parser {
             Expr::CharLiteral(val, _) => Some(*val as i64),
             // Identifiers: look up enum constants if available
             Expr::Identifier(name, _) => enum_consts.and_then(|m| m.get(name.as_str()).copied()),
+            // Compile-time bit builtins.  `sema`/`lowering` already fold these
+            // through `common::const_eval`, but the *parser's* folder is the one
+            // the `asm "i"` validator consults, and it saw none of them: the
+            // Linux kernel's `order_base_2(CONFIG_NR_CPUS)` is
+            // `__builtin_fls(...) - 1`, so the whole initializer fell out of the
+            // constant-expression class and the statement was rejected.  The
+            // table is shared, so the two folds can never disagree.
+            Expr::FunctionCall(callee, args, _) => {
+                let Expr::Identifier(name, _) = callee.as_ref() else {
+                    return None;
+                };
+                if !name.starts_with("__builtin_") {
+                    return None;
+                }
+                let folded = crate::common::const_eval::eval_builtin_call_with_mode(
+                    name.as_str(),
+                    args,
+                    &|e| {
+                        Self::eval_const_int_expr_with_enums(e, enum_consts, tag_aligns)
+                            .map(crate::ir::reexports::IrConst::I64)
+                    },
+                    true,
+                )?;
+                folded.to_i64()
+            }
             Expr::BinaryOp(op, lhs, rhs, _) => {
                 let l = Self::eval_const_int_expr_with_enums(lhs, enum_consts, tag_aligns)?;
                 let r = Self::eval_const_int_expr_with_enums(rhs, enum_consts, tag_aligns)?;
