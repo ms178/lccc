@@ -1744,6 +1744,7 @@ mod dialect_severity_redteam_tests {
             WarningKind::Pedantic,
             WarningKind::Vla,
             WarningKind::DivByZero,
+            WarningKind::StrictPrototypes,
         ];
         let registered: HashSet<_> = WARNING_REGISTRY.iter().map(|entry| entry.kind).collect();
         let names: HashSet<_> = WARNING_REGISTRY.iter().map(|entry| entry.name).collect();
