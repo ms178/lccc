@@ -2663,6 +2663,11 @@ jobs:
         # only).  Mirrored in scripts/ci_local.sh (parity-checked).
         bash tests/regression/check_char_signedness.sh
         bash tests/regression/check_asm_goto_phi_edge.sh
+        # asm-goto output operands: label-edge materialization, @cc suffix
+        # contract, multi-digit %l<N> numbering and the x86-64 flag-output
+        # fusion (mirrored in scripts/ci_local.sh as `asm-goto-outputs`,
+        # parity-checked).
+        bash tests/regression/check_asm_goto_outputs.sh
         # The differential oracle's own contract suites, compiler-free
         # like the encdiff one but anchored to the REAL pinned pair
         # (provisioned above): asmdiff's parser/oracle unit tests
