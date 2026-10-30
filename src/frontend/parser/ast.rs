@@ -1766,6 +1766,9 @@ pub enum Stmt {
         clobbers: Vec<String>,
         /// Goto labels for asm goto (e.g., `asm goto("..." : : : : label1, label2)`)
         goto_labels: Vec<String>,
+        /// Source span of the `asm` keyword, so post-optimization diagnostics
+        /// and debug info can name the statement instead of a bare message.
+        span: Span,
     },
 }
 
@@ -1842,7 +1845,8 @@ impl Stmt {
             | Stmt::Label(_, _, span) => Some(*span),
             Stmt::Expr(Some(expr)) => Some(expr.span()),
             Stmt::Declaration(decl) => Some(decl.span),
-            Stmt::Expr(None) | Stmt::Compound(_) | Stmt::InlineAsm { .. } => None,
+            Stmt::InlineAsm { span, .. } => Some(*span),
+            Stmt::Expr(None) | Stmt::Compound(_) => None,
         }
     }
 }

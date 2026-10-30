@@ -165,14 +165,7 @@ for flags in "${levels[@]}"; do
     prefix_symbols L_ "$tmp/m.l.o"
     prefix_symbols G_ "$tmp/m.g.o"
     # shellcheck disable=SC2086
-    drvdefs=()
-    case " $flags " in
-        *" -m32 "*)
-            # Named, printed i686 ABI-gap exclusions (driver.c spells the
-            # closed list and still fails on any OTHER divergence).
-            drvdefs+=(-DLCCC_M32_KNOWN_ABI_GAPS) ;;
-    esac
-    "$gcc_bin" -O0 $gflags "${drvdefs[@]}" -w -Wno-psabi "$drv" "$tmp/m.l.o" "$tmp/m.g.o" -o "$tmp/rt.bin"
+    "$gcc_bin" -O0 $gflags -w -Wno-psabi "$drv" "$tmp/m.l.o" "$tmp/m.g.o" -o "$tmp/rt.bin"
     if ! out=$("$tmp/rt.bin" 2>&1); then
         fail "runtime differential at $flags:"$'\n'"$out"
         continue
@@ -180,13 +173,6 @@ for flags in "${levels[@]}"; do
     case $out in
         *" checks passed"*) runs=$((runs + 1)) ;;
         *) fail "runtime differential at $flags: unexpected output: $out" ;;
-    esac
-    case " $flags " in
-        *" -m32 "*)
-            case $out in
-                *"known i686 ABI gaps reported"*)
-                    echo "m32 $flags: $(printf '%s' "$out" | tail -c 200)" ;;
-            esac ;;
     esac
 done
 [ "$runs" -gt 0 ] || fail "no runtime differential ran"

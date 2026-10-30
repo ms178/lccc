@@ -1666,6 +1666,27 @@ mod tests {
     }
 
     #[test]
+    fn resolve_tied_and_types_copies_the_named_outputs_register_home() {
+        let mut output = AsmOperand::new(AsmOperandKind::Specific("rcx".to_string()), None);
+        output.reg = "rcx".to_string();
+        output.operand_type = IrType::I64;
+        let mut input = AsmOperand::new(AsmOperandKind::Tied(0), None);
+        input.constraint = "[sum]".to_string();
+        let mut operands = vec![output, input];
+        let outputs = vec![("=r".to_string(), Value(0), Some("sum".to_string()))];
+        resolve_tied_and_types(
+            &mut operands,
+            &[Some(0)],
+            &outputs,
+            &[IrType::I64, IrType::I64],
+        );
+        assert!(matches!(operands[1].kind, AsmOperandKind::Specific(_)));
+        assert_eq!(operands[1].reg, "rcx");
+        assert_eq!(operands[1].operand_type, IrType::I64);
+        assert_eq!(operands[1].constraint, "[sum]");
+    }
+
+    #[test]
     fn copy_metadata_from_preserves_tied_operand_class_and_immediates() {
         let source = AsmOperand {
             kind: AsmOperandKind::Immediate,

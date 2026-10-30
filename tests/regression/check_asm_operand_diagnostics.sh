@@ -355,6 +355,10 @@ EOF
                 echo "FAIL ${target}_dynamic_immediate $opt: missing post-optimization diagnostic:" >&2
                 echo "$out" >&2
                 fail=1
+            elif ! grep -Eq 'cross-dynamic-immediate\.c:[0-9]+:[0-9]+:.*non-constant operand for immediate-only inline asm constraint' <<<"$out"; then
+                echo "FAIL ${target}_dynamic_immediate $opt: post-optimization diagnostic lost file:line:col:" >&2
+                echo "$out" >&2
+                fail=1
             fi
             if ! "$driver" "$opt" -c "$TMP/cross-constant-immediate.c" -o "$TMP/cross-$target-constant.o"; then
                 echo "FAIL ${target}_constant_immediate $opt: literal constant should compile" >&2

@@ -487,31 +487,7 @@ static void fill(void*p,int n,int kind){ unsigned char*b=p; for(int i=0;i<n;i++)
   (N)=(__typeof__(N))(rnd()%(sizeof((A)[0])*8-2)); \
 } while(0)
 static int fails=0, total=0;
-#ifdef LCCC_M32_KNOWN_ABI_GAPS
-/*
- * -m32 only: stack/return-ABI gaps between LCCC's i686 lowering and the GCC
- * i386 psABI that this gate newly exposed (the m32 leg is the first -m32
- * differential these shapes ever ran).  The exact GCC positions are
- * recorded as an oracle table in docs/PERFORMANCE-BACKLOG.md
- * ("i686 aggregate/32-byte stack ABI"): a vector-member struct keeps its
- * natural 16/32-byte alignment on the stack (even after the sret pointer),
- * while an attribute-aligned struct stays 4-granular — LCCC currently packs
- * every struct 4-granular.  These names are reported as KNOWN-ABI, never
- * silently: any name NOT in this list still fails the gate, so a new
- * divergence cannot hide behind the exclusion, and every entry must be
- * removed when the ABI alignment fix lands.
- */
-static const char *const m32_known_abi[] = {
-    "s4i_add.v", "s4i_add.tag", "cf_wrap_phi", "sadd", "sh_vs_shr_ul", "st_v32l",
-};
-static int known_abi_skips = 0;
-#endif
-static void check(const char*n,const void*a,const void*b,int sz){ total++; if(memcmp(a,b,sz)){
-#ifdef LCCC_M32_KNOWN_ABI_GAPS
-  for (unsigned i = 0; i < sizeof m32_known_abi / sizeof m32_known_abi[0]; i++)
-    if (!strcmp(n, m32_known_abi[i])) { known_abi_skips++; printf("KNOWN-ABI %s\n", n); return; }
-#endif
-  fails++; printf("MISMATCH %s\n",n);} }
+static void check(const char*n,const void*a,const void*b,int sz){ total++; if(memcmp(a,b,sz)){ fails++; printf("MISMATCH %s\n",n);} }
 
 
 struct S4i { v16i v; int tag; };
@@ -632,9 +608,9 @@ static void cf_checks(void){
 #define SHLS(T,N,CT) { T a; fill(&a,sizeof a,0); CT n; SIGNED_LEFT_SCALAR_INPUT(a,n); T r1=G_##N(a,n), r2=L_##N(a,n); check(#N,&r1,&r2,sizeof r1); }
 static void shift_checks(void){
   for(int rep=0;rep<4;rep++){
-    SHVV(v32u,sh_vv_u,32) SHVV(v32ul,sh_vv_ul,64) SHVV(v16u,sh_vv_u4,32) SHLV(v32i,sh_then_add)
+    SHVV(v32u,sh_vv_u,32) SHVV(v32ul,sh_vv_ul,(int)(sizeof(unsigned long)*8)) SHVV(v16u,sh_vv_u4,32) SHLV(v32i,sh_then_add)
     SHLS(v32i,sh_vs_shl,int) SHVS(v32i,sh_vs_sar,int,32) SHVS(v32u,sh_vs_shr,unsigned,32)
-    SHLS(v32l,sh_vs_shl_l,long) SHVS(v32ul,sh_vs_shr_ul,int,64)
+    SHLS(v32l,sh_vs_shl_l,long) SHVS(v32ul,sh_vs_shr_ul,int,(int)(sizeof(unsigned long)*8))
     SHVS(v16i,sh4_vs_sar,int,32) SHLV(v16l,sh4_vv_shl_l)
     { v16i a,b,c; fill(&a,sizeof a,0); fill(&b,sizeof b,0); fill(&c,sizeof c,0); SIGNED_LEFT_INPUT(a,b); for(int i=0;i<4;i++) c[i]&=31; v16i r1=G_sh4_chain(a,b,c), r2=L_sh4_chain(a,b,c); check("sh4_chain",&r1,&r2,sizeof r1); }
     { v32i a; v32u b; fill(&a,sizeof a,0); fill(&b,sizeof b,0); SIGNED_LEFT_INPUT(a,b); v32i r1=G_sh_mixsign(a,b), r2=L_sh_mixsign(a,b); check("sh_mixsign",&r1,&r2,sizeof r1); }
@@ -1015,8 +991,8 @@ int main(void){ extra_checks(); fma_checks(); handoff_checks(); cf_checks(); shi
 { long x=(long)(rnd()%200); v32l r1=G_splat_v32l(x), r2=L_splat_v32l(x); check("splat_v32l",&r1,&r2,sizeof r1); }
 { v32l a; fill(&a,sizeof a,0); for(int i=0;i<4;i++) a[i]=(long)(int)(rnd()%200); long r1=G_lane2_v32l(a), r2=L_lane2_v32l(a); check("lane2_v32l",&r1,&r2,sizeof r1); }
 { v32l a; fill(&a,sizeof a,0); for(int i=0;i<4;i++) a[i]=(long)(int)(rnd()%200); long x=(long)(rnd()%200); v32l r1=G_setlane_v32l(a,x), r2=L_setlane_v32l(a,x); check("setlane_v32l",&r1,&r2,sizeof r1); }
-{ long p[4]; fill(p,sizeof p,0); v32l r1=G_ld_v32l(p), r2=L_ld_v32l(p); check("ld_v32l",&r1,&r2,sizeof r1); }
-{ v32l v; fill(&v,sizeof v,0); long p1[4],p2[4]; G_st_v32l(p1,v); L_st_v32l(p2,v); check("st_v32l",p1,p2,sizeof p1); }
+{ long p[sizeof(v32l)/sizeof(long)]; fill(p,sizeof p,0); v32l r1=G_ld_v32l(p), r2=L_ld_v32l(p); check("ld_v32l",&r1,&r2,sizeof r1); }
+{ v32l v; fill(&v,sizeof v,0); long p1[sizeof(v32l)/sizeof(long)],p2[sizeof(v32l)/sizeof(long)]; G_st_v32l(p1,v); L_st_v32l(p2,v); check("st_v32l",p1,p2,sizeof p1); }
 { v32l a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0); for(int i=0;i<4;i++) { a[i]=(long)(int)(rnd()%200); b[i]=(long)(int)(rnd()%200); } for(int c=0;c<2;c++) { v32l r1=G_cond_v32l(a,b,c), r2=L_cond_v32l(a,b,c); check("cond_v32l",&r1,&r2,sizeof r1); } }
 { v32l p[6]; for(int k=0;k<6;k++) for(int i=0;i<4;i++) p[k][i]=(long)(int)(rnd()%100); for(int n=0;n<=6;n+=3) { v32l r1=G_acc_v32l(p,n), r2=L_acc_v32l(p,n); check("acc_v32l",&r1,&r2,sizeof r1); } }
 { v16f a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
@@ -1149,10 +1125,5 @@ int main(void){ extra_checks(); fma_checks(); handoff_checks(); cf_checks(); shi
 { v32d p[6]; for(int k=0;k<6;k++) for(int i=0;i<4;i++) p[k][i]=(double)(int)(rnd()%100); for(int n=0;n<=6;n+=3) { v32d r1=G_acc_v32d(p,n), r2=L_acc_v32d(p,n); check("acc_v32d",&r1,&r2,sizeof r1); } }
 { struct S8f a,b; for(int i=0;i<8;i++){a.v[i]=(float)(int)(rnd()%100); b.v[i]=(float)(int)(rnd()%100);} struct S8f r1=G_sadd(a,b), r2=L_sadd(a,b); check("sadd",&r1,&r2,sizeof r1); }
 { v32f a,b; for(int i=0;i<8;i++){a[i]=(float)(int)(rnd()%100); b[i]=(float)(int)(rnd()%100);} v32f r1=G_viacall(a,b), r2=L_viacall(a,b); check("viacall",&r1,&r2,sizeof r1); }
-#ifdef LCCC_M32_KNOWN_ABI_GAPS
-  printf("%d/%d checks passed (%d known i686 ABI gaps reported)\n",
-         total-fails, total, known_abi_skips);
-#else
   printf("%d/%d checks passed\n", total-fails, total);
-#endif
   return fails!=0; }

@@ -345,9 +345,15 @@ impl Lowerer {
                     if struct_size.is_some() {
                         if let Some(layout) = self.get_struct_layout_for_type(&param.type_spec) {
                             let ctx = &*self.types.borrow_struct_layouts();
-                            let classes = match &sysv_abi {
-                                Some((classes, _)) => classes.clone(),
-                                None => layout.classify_sysv_eightbytes(ctx),
+                            let classes = if let Some(classes) =
+                                self.i386_gnu_vector_memory_classes(&param_ctype)
+                            {
+                                classes
+                            } else {
+                                match &sysv_abi {
+                                    Some((classes, _)) => classes.clone(),
+                                    None => layout.classify_sysv_eightbytes(ctx),
+                                }
                             };
                             let rv_class = layout.classify_riscv_float_fields(ctx);
                             (Some(layout.align), classes, rv_class)

@@ -1756,13 +1756,15 @@ mod dialect_severity_redteam_tests {
             WarningKind::DivByZero,
             WarningKind::StrictPrototypes,
         ];
+        let expected: HashSet<_> = kinds.into_iter().collect();
         let registered: HashSet<_> = WARNING_REGISTRY.iter().map(|entry| entry.kind).collect();
         let names: HashSet<_> = WARNING_REGISTRY.iter().map(|entry| entry.name).collect();
-        assert_eq!(WARNING_REGISTRY.len(), kinds.len());
-        assert_eq!(registered.len(), kinds.len());
-        assert_eq!(names.len(), kinds.len());
-        for kind in kinds {
-            assert!(registered.contains(&kind));
+        // The registry must be a bijection onto the measured warning kinds:
+        // no missing leaf, no duplicate row, and no duplicate flag spelling.
+        assert_eq!(WARNING_REGISTRY.len(), expected.len());
+        assert_eq!(registered, expected);
+        assert_eq!(names.len(), expected.len());
+        for kind in expected {
             assert_eq!(WarningKind::from_flag_name(kind.flag_name()), Some(kind));
         }
         for group in ["all", "extra", "implicit", "unused"] {
@@ -2118,5 +2120,66 @@ mod system_header_tests {
     fn command_line_and_builtin_locations_are_system() {
         assert!(is_system_header_path("<built-in>"));
         assert!(is_system_header_path("<command line>"));
+    }
+}
+
+#[cfg(test)]
+mod warning_dedup_tests {
+    use super::{DiagnosticEngine, WarningConfig, WarningKind};
+    use crate::common::source::{SourceManager, Span};
+
+    fn engine_with_user_file() -> (DiagnosticEngine, Span) {
+        let mut sm = SourceManager::new();
+        let file = sm.add_file("src/main.c".to_string(), "int v;\n".to_string());
+        let mut engine = DiagnosticEngine::new();
+        engine.set_source_manager(sm);
+        (engine, Span::new(0, 3, file))
+    }
+
+    #[test]
+    fn unsalted_identical_warnings_are_not_folded() {
+        let (mut engine, span) = engine_with_user_file();
+        engine.warning("same text", span);
+        engine.warning("same text", span);
+        assert_eq!(engine.warning_count(), 2);
+    }
+
+    #[test]
+    fn salted_identical_warnings_fold_per_salt() {
+        let (mut engine, span) = engine_with_user_file();
+        engine.warning_with_kind_salted("same text", span, WarningKind::Attributes, 1);
+        engine.warning_with_kind_salted("same text", span, WarningKind::Attributes, 1);
+        assert_eq!(engine.warning_count(), 1);
+        engine.warning_with_kind_salted("same text", span, WarningKind::Attributes, 2);
+        assert_eq!(engine.warning_count(), 2);
+    }
+
+    #[test]
+    fn suppressed_salted_warning_does_not_consume_a_later_visible_emission() {
+        let (mut engine, span) = engine_with_user_file();
+        let mut config = WarningConfig::new();
+        config.disable(WarningKind::Attributes);
+        engine.set_warning_config(config.clone());
+        engine.warning_with_kind_salted("same text", span, WarningKind::Attributes, 7);
+        assert_eq!(engine.warning_count(), 0);
+        config.enable(WarningKind::Attributes);
+        engine.set_warning_config(config);
+        engine.warning_with_kind_salted("same text", span, WarningKind::Attributes, 7);
+        assert_eq!(engine.warning_count(), 1);
+    }
+
+    #[test]
+    fn system_header_suppression_does_not_consume_salted_dedup_slot() {
+        let mut sm = SourceManager::new();
+        let sys = sm.add_file("/usr/include/x.h".to_string(), "int v;\n".to_string());
+        let usr = sm.add_file("src/main.c".to_string(), "int v;\n".to_string());
+        let mut engine = DiagnosticEngine::new();
+        engine.set_source_manager(sm);
+        let sys_span = Span::new(0, 3, sys);
+        let usr_span = Span::new(0, 3, usr);
+        engine.warning_with_kind_salted("same text", sys_span, WarningKind::Attributes, 9);
+        assert_eq!(engine.warning_count(), 0);
+        engine.warning_with_kind_salted("same text", usr_span, WarningKind::Attributes, 9);
+        assert_eq!(engine.warning_count(), 1);
     }
 }

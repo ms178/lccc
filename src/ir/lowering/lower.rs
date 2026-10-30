@@ -1743,27 +1743,19 @@ impl Lowerer {
             .enumerate()
             .map(|(i, p)| {
                 if param_struct_sizes.get(i).copied().flatten().is_some() {
-                    if matches!(self.type_spec_to_ctype(&p.type_spec), CType::Float128)
-                        || self.type_spec_to_ctype(&p.type_spec) == CType::Decimal128
-                    {
+                    let ct = self.type_spec_to_ctype(&p.type_spec);
+                    if matches!(ct, CType::Float128) || ct == CType::Decimal128 {
                         vec![
                             crate::common::types::EightbyteClass::Sse,
                             crate::common::types::EightbyteClass::Sse,
                         ]
-                    } else if let Some((classes, _)) =
-                        self.sysv_arg_abi(&self.type_spec_to_ctype(&p.type_spec))
-                    {
+                    } else if let Some((classes, _)) = self.sysv_arg_abi(&ct) {
                         // x86-64: the psABI classes of the struct, union or
-                        // vector (`[Memory]`, `[Sse, SseUp]`, ...).
+                        // vector (`[Memory]`, `[Sse, SseUp]`, ...). On i686
+                        // this also carries the 32/64-byte XMM vector pieces.
                         classes
-                    } else if self.target == crate::backend::Target::I686
-                        && matches!(self.type_spec_to_ctype(&p.type_spec), CType::Vector(..))
-                    {
-                        // Target-local GNU-vector marker; see func_lowering.
-                        vec![
-                            crate::common::types::EightbyteClass::Memory,
-                            crate::common::types::EightbyteClass::NoClass,
-                        ]
+                    } else if let Some(classes) = self.i386_gnu_vector_memory_classes(&ct) {
+                        classes
                     } else if let Some(layout) = self.get_struct_layout_for_type(&p.type_spec) {
                         layout.classify_sysv_eightbytes(&*self.types.borrow_struct_layouts())
                     } else {

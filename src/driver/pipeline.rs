@@ -2585,7 +2585,7 @@ impl Driver {
                 continue;
             }
             for block in &func.blocks {
-                for inst in &block.instructions {
+                for (inst_idx, inst) in block.instructions.iter().enumerate() {
                     if let crate::ir::reexports::Instruction::InlineAsm {
                         inputs,
                         input_symbols,
@@ -2597,8 +2597,20 @@ impl Driver {
                                 && matches!(operand, crate::ir::reexports::Operand::Value(_))
                                 && input_symbols.get(index).and_then(Option::as_ref).is_none()
                             {
+                                let span = block
+                                    .source_spans
+                                    .get(inst_idx)
+                                    .copied()
+                                    .filter(|span| *span != crate::common::source::Span::dummy())
+                                    .unwrap_or(func.body_span);
+                                let location = source_manager
+                                    .map(|sm| sm.resolve_span(span))
+                                    .map(|loc| {
+                                        format!("{}:{}:{}: ", loc.file, loc.line, loc.column)
+                                    })
+                                    .unwrap_or_else(|| format!("{input_file}:1:1: "));
                                 return Err(format!(
-                                    "non-constant operand for immediate-only inline asm constraint `{constraint}` remains after optimization in function `{}`",
+                                    "{location}non-constant operand for immediate-only inline asm constraint `{constraint}` remains after optimization in function `{}`",
                                     func.name
                                 ));
                             }

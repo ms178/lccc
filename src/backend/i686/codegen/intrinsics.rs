@@ -1570,6 +1570,27 @@ impl I686Codegen {
                 self.state.emit("    punpckldq %xmm2, %xmm0");
                 self.vec_store_result(&d, "xmm0");
             }
+            // Single-source dword permutation. The frontend's typed
+            // `__builtin_shufflevector` path emits this value form once the
+            // i686 SSE2 ceiling admits whole-vector lowering; without it the
+            // arm fell through to the x86-64-only no-op tail and returned an
+            // uninitialized result image (GCC 16.2 -m32 -msse2 -O2 oracle:
+            // `shufflevector(a,a,3,2,1,0)` must reverse the lanes).
+            IntrinsicOp::VecShufdI32x4 => {
+                let Some(d) = dest.clone() else {
+                    self.reject_value_form(op);
+                };
+                assert!(args.len() == 2, "i686 VecShufdI32x4: expects v, imm");
+                let imm = Self::operand_to_imm_i64(&args[1]);
+                assert!(
+                    (0..=255).contains(&imm),
+                    "i686 VecShufdI32x4: imm8 out of range"
+                );
+                self.vec_load_image(&args[0], "xmm0");
+                self.state
+                    .emit_fmt(format_args!("    pshufd ${}, %xmm0, %xmm0", imm));
+                self.vec_store_result(&d, "xmm0");
+            }
             IntrinsicOp::VecAddI64x2 => {
                 self.emit_vec_binop_i686(dest.clone(), args, "paddq", 8);
             }
@@ -2508,7 +2529,17 @@ impl I686Codegen {
                 }
             }
 
-            _ => { /* x86-only SIMD op on i686: no-op */ }
+            _ => {
+                // Fail closed: an op that reaches the i686 dispatcher with a
+                // destination must have an explicit arm. The historical no-op
+                // left the result slot uninitialized (VecShufdI32x4 typed
+                // shuffles). Ops with no destination are side-effect-only or
+                // already handled above; a stray x86-only no-result op stays a
+                // no-op rather than inventing an i686 encoding.
+                if dest.is_some() || dest_ptr.is_some() {
+                    self.reject_value_form(op);
+                }
+            }
         }
         self.state.reg_cache.invalidate_acc();
     }
@@ -2516,7 +2547,7 @@ impl I686Codegen {
     /// The pointer-form SIMD families above must never be asked to produce a
     /// register-image value.  Keep the invariant message in one place so every
     /// arm reports the same ICE and the audit census counts the contract once.
-    fn reject_value_form(&self, op: &IntrinsicOp) -> ! {
+    fn reject_value_form(&self, op: &impl std::fmt::Debug) -> ! {
         panic!(
             "i686 emit_intrinsic: {op:?} produces a value (dest) but only the dest_ptr form is supported here"
         )

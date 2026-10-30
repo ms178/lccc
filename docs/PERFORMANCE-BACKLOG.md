@@ -221,28 +221,16 @@ are Callgrind counts (modeled, not hardware).
 * **Ir gaps to GCC 16.2:** reduction_vecreg 3278 vs 1721, popcount 5801
   vs 4728, nbody 3385 vs 2965, switch_dispatch 978 vs 766, zstd
   `double_fast` 2823.5 vs 2686.2.
-* **i686 aggregate/32-byte stack ABI (oracle table, 2026-10-30).** The
-  vector-extension m32 differential (`check_vector_ext_codegen.sh`, first
-  -m32 run ever) exposed the exact position rule GCC 16.2 `-m32` uses for
-  stack structs whose TYPE carries a vector-member alignment, measured from
-  callee `%ebp` reads with the sret pointer at `ebp+8`:
-  `struct { double d[2]; } __attribute__((aligned(16)))` -> `ebp+12`
-  (attribute alignment stays 4-granular: compat mode), `struct { v16i;
-  int; }` -> `ebp+24` (natural 16 honoured across the sret pointer),
-  `struct { v32f; }` -> `ebp+40` (natural 32 honoured), raw `v32f` argument
-  -> `ebp+8` with caller-side 32-byte alignment (already correct: the
-  `[Memory, NoClass]` marker path).  LCCC packs every struct 4-granular, so
-  `sadd`, `s4i_add`, `cf_wrap_phi` (and, through other classes,
-  `sh_vs_shr_ul`/`st_v32l`) mismatch the GCC-built driver — the gate names
-  them in the closed `LCCC_M32_KNOWN_ABI_GAPS` list in `vector_ext/driver.c`
-  (printed as `KNOWN-ABI`, any other divergence still fails; the list must
-  shrink to empty when the fix lands).  The fix direction: honour
-  `align_ctx` on i686 stack struct arguments exactly when the type
-  `contains_gnu_vector && !has_user_align` (both predicates already exist on
-  `CType` in `common/types.rs`), keeping the 4-granular cap for
-  attribute-aligned and ordinary records — one placement rule shared by the
-  outgoing (`I686Codegen::stack_arg_align`) and incoming (prologue param
-  capture) paths, oracle-checked against the table above before landing.
+* **i686 aggregate/32-byte stack ABI (fixed).** The vector-extension m32
+  differential now runs with no ABI exclusions. GCC 16.2 `-m32` honours the
+  natural alignment of a stack record whose type contains a GNU vector
+  (`struct { v16i; int; }` at `ebp+24`, `struct { v32f; }` at `ebp+40`),
+  while an explicitly `aligned(N)` or ordinary record stays 4-granular.
+  `Lowerer::i386_gnu_vector_memory_classes` emits the same
+  `[Memory, NoClass]` marker used by raw vectors for exactly
+  `contains_gnu_vector && !has_user_align`, after the SysV register-carrier
+  check so XMM-passed 32/64-byte vectors are untouched. The caller, the
+  callee prologue and `va_arg` share `i386_gnu_vector_stack_align`.
 * **SSE2-baseline vector value reuse (hot-instruction evidence,
   2026-10-30).** `hotdiff --bench double_reduction` attributes the 1.104 Ir
   ratio to the legacy (non-VEX) path re-reading images from slots per use:

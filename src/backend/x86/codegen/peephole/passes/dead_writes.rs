@@ -1810,6 +1810,62 @@ mod tests {
         }
     }
 
+    #[test]
+    fn dead_flag_write_to_gpr_rbp_is_retired_but_frame_rbp_is_not() {
+        let gpr = run_dead_flag_writes(concat!(
+            "    pushq %rbp\n",
+            ".cfi_def_cfa_offset 16\n",
+            ".cfi_offset %rbp, -16\n",
+            "    addl $1, %ebp\n",
+            "    popq %rbp\n",
+            ".cfi_def_cfa_offset 8\n",
+        ));
+        assert!(!gpr.contains("addl $1, %ebp"), "{gpr}");
+        let frame = run_dead_flag_writes(concat!(
+            "    pushq %rbp\n",
+            ".cfi_def_cfa_offset 16\n",
+            ".cfi_offset %rbp, -16\n",
+            "    movq %rsp, %rbp\n",
+            ".cfi_def_cfa_register 6\n",
+            "    addl $1, %ebp\n",
+            "    popq %rbp\n",
+            ".cfi_def_cfa_offset 8\n",
+        ));
+        assert!(frame.contains("addl $1, %ebp"), "{frame}");
+    }
+
+    #[test]
+    fn dead_pure_write_to_gpr_rbp_is_retired_but_frame_rbp_is_not() {
+        let gpr = run_dead_write_fixpoint(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    pushq %rbp\n",
+            ".cfi_def_cfa_offset 16\n",
+            ".cfi_offset %rbp, -16\n",
+            "    leaq (%rsi, %rdi), %rbp\n",
+            "    popq %rbp\n",
+            ".cfi_def_cfa_offset 8\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(!gpr.contains("leaq (%rsi, %rdi), %rbp"), "{gpr}");
+        let frame = run_dead_write_fixpoint(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    pushq %rbp\n",
+            ".cfi_def_cfa_offset 16\n",
+            ".cfi_offset %rbp, -16\n",
+            "    movq %rsp, %rbp\n",
+            ".cfi_def_cfa_register 6\n",
+            "    leaq (%rsi, %rdi), %rbp\n",
+            "    popq %rbp\n",
+            ".cfi_def_cfa_offset 8\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(frame.contains("leaq (%rsi, %rdi), %rbp"), "{frame}");
+    }
+
     fn slot_refs(out: &str, slot: &str) -> usize {
         out.lines().filter(|l| l.contains(slot)).count()
     }

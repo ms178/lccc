@@ -86,6 +86,21 @@ impl Lowerer {
         Some((passing.arg_classes(), one_xmm))
     }
 
+    /// Target-local i386 MEMORY marker for a naturally aligned GNU vector or
+    /// a record that contains one. GCC passes these at their natural stack
+    /// alignment (16/32/64), while ordinary and explicitly `aligned(N)`
+    /// records stay at the 4-byte cdecl granularity. The marker is consumed
+    /// only by `call_abi::i386_gnu_vector_stack_align`; XMM-register vector
+    /// pieces answer `sysv_arg_abi` first and never reach this fallback.
+    pub(super) fn i386_gnu_vector_memory_classes(&self, ct: &CType) -> Option<Vec<EightbyteClass>> {
+        if self.target != crate::backend::Target::I686 || self.sysv_arg_abi(ct).is_some() {
+            return None;
+        }
+        let ctx = &*self.types.borrow_struct_layouts();
+        (ct.contains_gnu_vector(ctx) && !ct.has_user_align(ctx))
+            .then(|| vec![EightbyteClass::Memory, EightbyteClass::NoClass])
+    }
+
     /// Return convention for a function returning `ret_ct` (a struct,
     /// union or vector of `size` bytes) by value.
     pub(super) fn aggregate_return(&self, ret_ct: &CType, size: usize) -> AggregateReturn {

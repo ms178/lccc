@@ -551,6 +551,7 @@ impl Parser {
     // === Inline assembly parsing ===
 
     fn parse_inline_asm(&mut self) -> Stmt {
+        let span = self.peek_span();
         self.advance(); // consume 'asm' / '__asm__'
         // Skip optional qualifiers: volatile, goto, inline
         while matches!(self.peek(), TokenKind::Volatile)
@@ -603,6 +604,7 @@ impl Parser {
             inputs,
             clobbers,
             goto_labels,
+            span,
         }
     }
 

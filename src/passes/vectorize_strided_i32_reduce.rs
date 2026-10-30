@@ -1148,10 +1148,10 @@ impl StridedWidth {
     /// `analyze` counts four-dword groups. Exact SSE2 handles the same proven
     /// prefix as twice as many two-dword groups; compact SSE2 and AVX2 retain
     /// the four-dword group count. Any remainder stays in the scalar loop.
-    fn safe_vecs(self, x8_vecs: u64) -> u64 {
+    fn safe_vecs(self, x8_vecs: u64) -> Option<u64> {
         match self {
-            Self::X4 => x8_vecs * 2,
-            Self::X4Compact | Self::X8 => x8_vecs,
+            Self::X4 => x8_vecs.checked_mul(2),
+            Self::X4Compact | Self::X8 => Some(x8_vecs),
         }
     }
 
@@ -1336,8 +1336,11 @@ impl VectorSchedule {
             // exact-access representation; mixing lane meanings is not valid.
             StridedWidth::X4
         };
+        if p.load_bases.is_empty() || p.wide_load_proven.len() != p.load_bases.len() {
+            return None;
+        }
         let vector_bytes = width.vector_bytes();
-        let safe_vecs = width.safe_vecs(p.safe_vecs);
+        let safe_vecs = width.safe_vecs(p.safe_vecs)?;
         // Preserve the proven AVX2 schedule exactly. SSE2 uses the same two
         // independent accumulator chains, but only two XMM copies per turn:
         // four copies were measured as a substantial regression.
@@ -2216,7 +2219,9 @@ mod tests {
         for scalar_trips in MIN_SCALAR_TRIPS..=200_000 {
             let x8_vecs = safe_vec_count(scalar_trips);
             for width in [StridedWidth::X4, StridedWidth::X4Compact, StridedWidth::X8] {
-                let vecs = width.safe_vecs(x8_vecs);
+                let vecs = width
+                    .safe_vecs(x8_vecs)
+                    .expect("safe_vec_count is bounded by the scalar trip count");
                 let lanes = width.vector_bytes() / SCALAR_STEP_BYTES;
                 if vecs > 0 {
                     for lane in 0..lanes {
