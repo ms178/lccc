@@ -1034,17 +1034,33 @@ impl StridedWidth {
         }
     }
 
-    fn load(self, contiguous: bool) -> IntrinsicOp {
-        match (self, contiguous) {
+    /// Load for one stream.  `contiguous` is the reducer's per-stream proof:
+    /// with it, [`Self::X4`] may read all four lanes of its 16-byte window
+    /// (the two gap dwords are computed speculatively and masked off before
+    /// the horizontal add) and [`Self::X4Compact`] may merge two proven
+    /// halves; without it both stay on the exact-access forms, which never
+    /// touch a gap.
+    ///
+    /// `None` is the combination the schedule cannot produce — the compact
+    /// form is *selected* only when every stream is proven, because it has no
+    /// gap-free two-dword lowering.  Returning it keeps that a decline rather
+    /// than an abort, and `debug_assert!` keeps the invariant loud in tests.
+    fn load(self, contiguous: bool) -> Option<IntrinsicOp> {
+        let intrinsic = match (self, contiguous) {
             (Self::X4, true) => IntrinsicOp::VecLoadI32x4,
             (Self::X4, false) => IntrinsicOp::VecLoadStrided2I32x4,
             (Self::X4Compact, true) => IntrinsicOp::VecLoadStrided2CompactI32x4,
             (Self::X4Compact, false) => {
-                unreachable!("compact strided load requires the contiguous-window proof")
+                debug_assert!(
+                    false,
+                    "compact strided load requires the contiguous-window proof"
+                );
+                return None;
             }
             (Self::X8, true) => IntrinsicOp::VecLoadI32x8,
             (Self::X8, false) => IntrinsicOp::VecLoadStrided2I32x8,
-        }
+        };
+        Some(intrinsic)
     }
 
     fn broadcast(self) -> IntrinsicOp {
@@ -1061,8 +1077,18 @@ impl StridedWidth {
         }
     }
 
-    fn bin_op(self, op: IrBinOp) -> IntrinsicOp {
-        match (self, op) {
+    /// Lane operation for `op`, or `None` when this width has no lowering.
+    ///
+    /// Today `None` is unreachable: the expression analyser builds only the
+    /// operations the reducers below can emit.  Spelling the failure as a
+    /// value rather than an abort keeps a future widening of that set a
+    /// *missed optimisation* instead of a compiler crash, and the caller's
+    /// contract is exactly "decline the whole loop" — `transform` performs no
+    /// mutation before its last block, so a decline leaves the scalar loop
+    /// untouched.  `debug_assert!` keeps the invariant visible in test builds
+    /// without turning it into a release-mode abort.
+    fn bin_op(self, op: IrBinOp) -> Option<IntrinsicOp> {
+        let intrinsic = match (self, op) {
             (Self::X4 | Self::X4Compact, IrBinOp::Add) => IntrinsicOp::VecAddI32x4,
             (Self::X4 | Self::X4Compact, IrBinOp::Sub) => IntrinsicOp::VecSubI32x4,
             (Self::X4 | Self::X4Compact, IrBinOp::Mul) => IntrinsicOp::VecMulI32x4,
@@ -1075,20 +1101,35 @@ impl StridedWidth {
             (Self::X8, IrBinOp::And) => IntrinsicOp::VecAndI32x8,
             (Self::X8, IrBinOp::Or) => IntrinsicOp::VecOrI32x8,
             (Self::X8, IrBinOp::Xor) => IntrinsicOp::VecXorI32x8,
-            _ => unreachable!("validated strided lane operation"),
-        }
+            _ => {
+                debug_assert!(
+                    false,
+                    "unvalidated strided lane operation {op:?} for {self:?}"
+                );
+                return None;
+            }
+        };
+        Some(intrinsic)
     }
 
-    fn shift_op(self, op: IrBinOp) -> IntrinsicOp {
-        match (self, op) {
+    /// Shift operation for `op`; `None` mirrors [`Self::bin_op`]'s contract.
+    /// The analyser guarantees a *constant* shift count (`StridedExpr::Invariant`
+    /// as the right operand), which is why the vector form takes the count as
+    /// an immediate operand instead of a lane.
+    fn shift_op(self, op: IrBinOp) -> Option<IntrinsicOp> {
+        let intrinsic = match (self, op) {
             (Self::X4 | Self::X4Compact, IrBinOp::Shl) => IntrinsicOp::VecShlI32x4,
             (Self::X4 | Self::X4Compact, IrBinOp::LShr) => IntrinsicOp::VecLShrI32x4,
             (Self::X4 | Self::X4Compact, IrBinOp::AShr) => IntrinsicOp::VecAShrI32x4,
             (Self::X8, IrBinOp::Shl) => IntrinsicOp::VecShlI32x8,
             (Self::X8, IrBinOp::LShr) => IntrinsicOp::VecLShrI32x8,
             (Self::X8, IrBinOp::AShr) => IntrinsicOp::VecAShrI32x8,
-            _ => unreachable!("validated constant strided shift"),
-        }
+            _ => {
+                debug_assert!(false, "unvalidated strided shift {op:?} for {self:?}");
+                return None;
+            }
+        };
+        Some(intrinsic)
     }
 
     fn horizontal_add(self) -> IntrinsicOp {
@@ -1119,7 +1160,16 @@ impl EmitCtx<'_> {
         v
     }
 
-    fn emit(&mut self, expr: &StridedExpr) -> Value {
+    /// Emit one lane-DAG node, or `None` when the DAG contains something this
+    /// width cannot lower.
+    ///
+    /// Every failure is a value, never an abort: a `None` propagates to
+    /// `transform`, which declines the loop *before* its first mutation.  The
+    /// only shape that can produce it today is a shift whose right operand is
+    /// not a proven invariant, which the analyser also refuses — the check is
+    /// kept because it is what makes the args below well-typed (a lane-valued
+    /// shift count is not expressible in the vector form).
+    fn emit(&mut self, expr: &StridedExpr) -> Option<Value> {
         match expr {
             StridedExpr::LoadEven32(idx) => {
                 let dest = self.fresh();
@@ -1132,16 +1182,16 @@ impl EmitCtx<'_> {
                 }
                 self.body_insts.push(Instruction::Intrinsic {
                     dest: Some(dest),
-                    op: self.width.load(self.wide_load_proven[*idx]),
+                    op: self.width.load(self.wide_load_proven[*idx])?,
                     dest_ptr: None,
                     args,
                 });
-                dest
+                Some(dest)
             }
-            StridedExpr::IvLow32 => self.vec_iv,
+            StridedExpr::IvLow32 => Some(self.vec_iv),
             StridedExpr::Invariant(op) => {
                 if let Some(&(_, cached)) = self.bcast_cache.iter().find(|(k, _)| k == op) {
-                    return cached;
+                    return Some(cached);
                 }
                 let bcast_src = match op {
                     Operand::Const(c) => {
@@ -1157,15 +1207,16 @@ impl EmitCtx<'_> {
                     args: vec![bcast_src],
                 });
                 self.bcast_cache.push((op.clone(), dest));
-                dest
+                Some(dest)
             }
             StridedExpr::BinOp(op, l, r) => {
-                let lv = self.emit(l);
+                let lv = self.emit(l)?;
                 if matches!(op, IrBinOp::Shl | IrBinOp::LShr | IrBinOp::AShr) {
                     let StridedExpr::Invariant(sh_op) = r.as_ref() else {
-                        unreachable!("validated constant shift")
+                        debug_assert!(false, "lane-valued strided shift count reached emission");
+                        return None;
                     };
-                    let vec_op = self.width.shift_op(*op);
+                    let vec_op = self.width.shift_op(*op)?;
                     let dest = self.fresh();
                     self.body_insts.push(Instruction::Intrinsic {
                         dest: Some(dest),
@@ -1173,10 +1224,10 @@ impl EmitCtx<'_> {
                         dest_ptr: None,
                         args: vec![Operand::Value(lv), sh_op.clone()],
                     });
-                    return dest;
+                    return Some(dest);
                 }
-                let rv = self.emit(r);
-                let vec_op = self.width.bin_op(*op);
+                let rv = self.emit(r)?;
+                let vec_op = self.width.bin_op(*op)?;
                 let dest = self.fresh();
                 self.body_insts.push(Instruction::Intrinsic {
                     dest: Some(dest),
@@ -1184,10 +1235,360 @@ impl EmitCtx<'_> {
                     dest_ptr: None,
                     args: vec![Operand::Value(lv), Operand::Value(rv)],
                 });
-                dest
+                Some(dest)
             }
         }
     }
+}
+
+/// One accumulator chain. `init`, `phi` and `next` exist together or not at
+/// all, so the emitter never re-establishes an invariant the schedule already
+/// decided — and never has to `unwrap` it.
+#[derive(Clone, Copy)]
+struct AccChain {
+    init: Value,
+    phi: Value,
+    next: Value,
+}
+
+/// The vector induction stream, present exactly when the body reads the IV.
+struct IvStream {
+    init: Value,
+    phi: Value,
+    next: Value,
+    /// Broadcast `step_bytes`: the single-stream update's operand.
+    step: Value,
+    /// Per-copy broadcast offsets when every copy shares one IV stream.
+    offs: Vec<Value>,
+    /// Per-copy chains when each copy carries its own adjacent IV vector
+    /// (`multi_iv`): `extra[i]` belongs to copy `i + 1`.
+    extra: Vec<AccChain>,
+}
+
+/// Everything the preheader seeds, grouped by the schedule that owns it.
+///
+/// The two `Option`s are decided *here*, once, from `width`/`unroll`/
+/// `needs_iv_vec`; that is what removes them — and every `unwrap` of them —
+/// from the body emitter downstream.
+struct Seeds {
+    acc0: AccChain,
+    acc1: Option<AccChain>,
+    /// `VecConstI8x32([1, 0, …])`: the `vpmaddwd` partner that sign-extends
+    /// the packed i16 tables into i32 lanes. YMM (`X8`) only — the XMM
+    /// schedules build their seeds with `VecPackI32x4` and need no table.
+    ones: Option<Value>,
+    iv: Option<IvStream>,
+}
+
+/// Append the preheader seed instructions and return the values they define.
+///
+/// `None` means the schedule asked for a seed its width cannot build. No such
+/// combination exists today (`X8` is the only width that creates `ones`, and
+/// it is also the only one that consumes it), so the two sites that rely on
+/// that implication assert it, and the caller's contract is "decline the
+/// loop" — nothing has been mutated yet.
+///
+/// Value-numbering order is part of this pass's output (ids feed the register
+/// allocator's ordering), so it is preserved exactly: accumulators, then the
+/// YMM table, then the IV stream's init/step/offsets and finally its
+/// phi/next pair.
+fn seed_preheader(
+    width: StridedWidth,
+    unroll: u64,
+    needs_iv_vec: bool,
+    multi_iv: bool,
+    vector_bytes: u64,
+    step_bytes: i64,
+    fresh: &mut impl FnMut() -> Value,
+    out: &mut Vec<Instruction>,
+) -> Option<Seeds> {
+    let acc0 = AccChain {
+        init: fresh(),
+        phi: fresh(),
+        next: fresh(),
+    };
+    out.push(Instruction::Intrinsic {
+        dest: Some(acc0.init),
+        op: width.zero(),
+        dest_ptr: None,
+        args: vec![],
+    });
+
+    let acc1 = if unroll > 1 {
+        let chain = AccChain {
+            init: fresh(),
+            phi: fresh(),
+            next: fresh(),
+        };
+        out.push(Instruction::Intrinsic {
+            dest: Some(chain.init),
+            op: width.zero(),
+            dest_ptr: None,
+            args: vec![],
+        });
+        Some(chain)
+    } else {
+        None
+    };
+
+    let ones = if width == StridedWidth::X8 {
+        let tbl = fresh();
+        // 16 i16 lanes `[1, 0, 1, 0, …]` so `vpmaddwd(tbl, ones)` sign-extends
+        // the 8 even i16 lanes of `tbl` into i32x8, reduction web class 5,
+        // with no shuffle.
+        let mut bytes = Vec::with_capacity(32);
+        for i in 0..16usize {
+            let v: i16 = if i % 2 == 0 { 1 } else { 0 };
+            for b in v.to_le_bytes() {
+                bytes.push(Operand::Const(IrConst::I8(b as i8)));
+            }
+        }
+        out.push(Instruction::Intrinsic {
+            dest: Some(tbl),
+            op: IntrinsicOp::VecConstI8x32,
+            dest_ptr: None,
+            args: bytes,
+        });
+        Some(tbl)
+    } else {
+        None
+    };
+
+    let iv = if needs_iv_vec {
+        let init = if width == StridedWidth::X8 {
+            let raw_tbl = fresh();
+            // 16 i16 lanes `[0,0,0,0, 8,0,0,0, 16,0,0,0, 24,0,0,0]`, fed
+            // through the same `vpmaddwd` partner: i32x8 `[0,0,8,0,16,0,24,0]`
+            // in reduction web class 5, so `phi` stays register-homed in a YMM
+            // across the loop instead of round-tripping through a stack slot.
+            let lane_i16: [i16; 16] = [0, 0, 0, 0, 8, 0, 0, 0, 16, 0, 0, 0, 24, 0, 0, 0];
+            let mut init_bytes = Vec::with_capacity(32);
+            for v in lane_i16 {
+                for b in v.to_le_bytes() {
+                    init_bytes.push(Operand::Const(IrConst::I8(b as i8)));
+                }
+            }
+            out.push(Instruction::Intrinsic {
+                dest: Some(raw_tbl),
+                op: IntrinsicOp::VecConstI8x32,
+                dest_ptr: None,
+                args: init_bytes,
+            });
+            let Some(ones_tbl) = ones else {
+                debug_assert!(false, "X8 induction seed without its i16 ones table");
+                return None;
+            };
+            let widened = fresh();
+            out.push(Instruction::Intrinsic {
+                dest: Some(widened),
+                op: IntrinsicOp::VecMaddwdI16x16,
+                dest_ptr: None,
+                args: vec![Operand::Value(raw_tbl), Operand::Value(ones_tbl)],
+            });
+            widened
+        } else {
+            let init = fresh();
+            // X4Compact: four real strided elements `[0, 8, 16, 24]`.
+            // X4: the exact two-dword form, so the odd lanes start at zero.
+            let lanes: [i32; 4] = if width == StridedWidth::X4Compact {
+                [0, 8, 16, 24]
+            } else {
+                [0, 0, 8, 0]
+            };
+            out.push(Instruction::Intrinsic {
+                dest: Some(init),
+                op: IntrinsicOp::VecPackI32x4,
+                dest_ptr: None,
+                args: lanes
+                    .into_iter()
+                    .map(|v| Operand::Const(IrConst::I32(v)))
+                    .collect(),
+            });
+            init
+        };
+        let step = fresh();
+        out.push(Instruction::Intrinsic {
+            dest: Some(step),
+            op: width.broadcast(),
+            dest_ptr: None,
+            args: vec![Operand::Const(IrConst::I32(step_bytes as i32))],
+        });
+        let mut offs = Vec::new();
+        let mut extra = Vec::new();
+        if unroll > 1 {
+            for copy_idx in 1..unroll as i32 {
+                let byte_offset = copy_idx * vector_bytes as i32;
+                if multi_iv {
+                    let chain_init = fresh();
+                    out.push(Instruction::Intrinsic {
+                        dest: Some(chain_init),
+                        op: IntrinsicOp::VecPackI32x4,
+                        dest_ptr: None,
+                        args: [
+                            byte_offset,
+                            byte_offset + 8,
+                            byte_offset + 16,
+                            byte_offset + 24,
+                        ]
+                        .into_iter()
+                        .map(|v| Operand::Const(IrConst::I32(v)))
+                        .collect(),
+                    });
+                    extra.push(AccChain {
+                        init: chain_init,
+                        phi: fresh(),
+                        next: fresh(),
+                    });
+                } else {
+                    let ov = fresh();
+                    out.push(Instruction::Intrinsic {
+                        dest: Some(ov),
+                        op: width.broadcast(),
+                        dest_ptr: None,
+                        args: vec![Operand::Const(IrConst::I32(byte_offset))],
+                    });
+                    offs.push(ov);
+                }
+            }
+        }
+        let phi = fresh();
+        let next = fresh();
+        Some(IvStream {
+            init,
+            phi,
+            next,
+            step,
+            offs,
+            extra,
+        })
+    } else {
+        None
+    };
+
+    Some(Seeds {
+        acc0,
+        acc1,
+        ones,
+        iv,
+    })
+}
+
+/// Reduce-block instructions: merge the accumulator chains, kill the odd lanes
+/// that only a gap-carrying representation has, horizontally add, then fold in
+/// the scalar seed.
+///
+/// `None` mirrors [`seed_preheader`]'s contract: a width asked for a mask seed
+/// it does not own. Every mask is derived from constants this function builds
+/// itself, so the reduce block never depends on a value the vector loop
+/// carries.
+fn emit_reduce_epilogue(
+    ctx: &mut EmitCtx<'_>,
+    width: StridedWidth,
+    acc0_phi: Value,
+    acc1_phi: Option<Value>,
+    ones: Option<Value>,
+    acc_init: &Operand,
+    acc_ty: IrType,
+    out: &mut Vec<Instruction>,
+) -> Option<Value> {
+    let merged_acc = if let Some(acc1_v) = acc1_phi {
+        let Some(op) = width.bin_op(IrBinOp::Add) else {
+            return None;
+        };
+        let m = ctx.fresh();
+        out.push(Instruction::Intrinsic {
+            dest: Some(m),
+            op,
+            dest_ptr: None,
+            args: vec![Operand::Value(acc0_phi), Operand::Value(acc1_v)],
+        });
+        m
+    } else {
+        acc0_phi
+    };
+
+    let masked_acc = if width == StridedWidth::X4Compact {
+        // All four lanes are real strided elements; no odd-lane mask exists.
+        merged_acc
+    } else if width == StridedWidth::X8 {
+        let mask_tbl = ctx.fresh();
+        let mask_i16: [i16; 16] = [-1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0];
+        let mut mask_bytes = Vec::with_capacity(32);
+        for v in mask_i16 {
+            for b in v.to_le_bytes() {
+                mask_bytes.push(Operand::Const(IrConst::I8(b as i8)));
+            }
+        }
+        out.push(Instruction::Intrinsic {
+            dest: Some(mask_tbl),
+            op: IntrinsicOp::VecConstI8x32,
+            dest_ptr: None,
+            args: mask_bytes,
+        });
+        let Some(ones_tbl) = ones else {
+            debug_assert!(false, "X8 reduce mask without its i16 ones table");
+            return None;
+        };
+        let even_mask = ctx.fresh();
+        out.push(Instruction::Intrinsic {
+            dest: Some(even_mask),
+            op: IntrinsicOp::VecMaddwdI16x16,
+            dest_ptr: None,
+            args: vec![Operand::Value(mask_tbl), Operand::Value(ones_tbl)],
+        });
+        let Some(op) = width.bin_op(IrBinOp::And) else {
+            return None;
+        };
+        let masked_acc = ctx.fresh();
+        out.push(Instruction::Intrinsic {
+            dest: Some(masked_acc),
+            op,
+            dest_ptr: None,
+            args: vec![Operand::Value(merged_acc), Operand::Value(even_mask)],
+        });
+        masked_acc
+    } else {
+        let even_mask = ctx.fresh();
+        out.push(Instruction::Intrinsic {
+            dest: Some(even_mask),
+            op: IntrinsicOp::VecPackI32x4,
+            dest_ptr: None,
+            args: vec![
+                Operand::Const(IrConst::I32(-1)),
+                Operand::Const(IrConst::I32(0)),
+                Operand::Const(IrConst::I32(-1)),
+                Operand::Const(IrConst::I32(0)),
+            ],
+        });
+        let Some(op) = width.bin_op(IrBinOp::And) else {
+            return None;
+        };
+        let masked_acc = ctx.fresh();
+        out.push(Instruction::Intrinsic {
+            dest: Some(masked_acc),
+            op,
+            dest_ptr: None,
+            args: vec![Operand::Value(merged_acc), Operand::Value(even_mask)],
+        });
+        masked_acc
+    };
+
+    let hsum = ctx.fresh();
+    out.push(Instruction::Intrinsic {
+        dest: Some(hsum),
+        op: width.horizontal_add(),
+        dest_ptr: None,
+        args: vec![Operand::Value(masked_acc)],
+    });
+    let combined_acc = ctx.fresh();
+    out.push(Instruction::BinOp {
+        dest: combined_acc,
+        op: IrBinOp::Add,
+        lhs: acc_init.clone(),
+        rhs: Operand::Value(hsum),
+        ty: acc_ty,
+    });
+    Some(combined_acc)
 }
 
 fn transform(func: &mut IrFunction, p: &StridedI32ReducePattern) -> usize {
@@ -1264,148 +1665,23 @@ fn transform(func: &mut IrFunction, p: &StridedI32ReducePattern) -> usize {
 
     let preheader_label = func.blocks[p.preheader_idx].label;
     let mut preheader_insts = Vec::new();
-
-    let acc0_init = fresh();
-    preheader_insts.push(Instruction::Intrinsic {
-        dest: Some(acc0_init),
-        op: width.zero(),
-        dest_ptr: None,
-        args: vec![],
-    });
-    let acc0_phi = fresh();
-    let acc0_next = fresh();
-
-    let (acc1_init, acc1_phi, acc1_next) = if unroll > 1 {
-        let init = fresh();
-        preheader_insts.push(Instruction::Intrinsic {
-            dest: Some(init),
-            op: width.zero(),
-            dest_ptr: None,
-            args: vec![],
-        });
-        (Some(init), Some(fresh()), Some(fresh()))
-    } else {
-        (None, None, None)
-    };
-
-    let ones_tbl = (width == StridedWidth::X8).then(|| {
-        let tbl = fresh();
-        // 16 i16 lanes `[1, 0, 1, 0, ..., 1, 0]` so `vpmaddwd(tbl, ones_tbl)`
-        // zero/sign-extends the 8 even i16 lanes of `tbl` into i32x8 class 5.
-        let mut bytes = Vec::with_capacity(32);
-        for i in 0..16usize {
-            let v: i16 = if i % 2 == 0 { 1 } else { 0 };
-            for b in v.to_le_bytes() {
-                bytes.push(Operand::Const(IrConst::I8(b as i8)));
-            }
-        }
-        preheader_insts.push(Instruction::Intrinsic {
-            dest: Some(tbl),
-            op: IntrinsicOp::VecConstI8x32,
-            dest_ptr: None,
-            args: bytes,
-        });
-        tbl
-    });
-
-    let (iv_vec_init, iv_vec_phi, iv_vec_next, iv_step_vec, iv_off_vecs, iv_extra) = if needs_iv_vec
-    {
-        let init = if width == StridedWidth::X8 {
-            let raw_tbl = fresh();
-            // 16 i16 lanes `[0, 0, 0, 0, 8, 0, 0, 0, 16, 0, 0, 0, 24, 0, 0, 0]` ->
-            // `vpmaddwd(raw_tbl, ones_tbl)` produces i32x8 `[0, 0, 8, 0, 16, 0, 24, 0]`
-            // directly in reduction web class 5 (`I32x8`), keeping `iv_vec_phi`
-            // register-homed in a YMM register across the loop.
-            let lane_i16: [i16; 16] = [0, 0, 0, 0, 8, 0, 0, 0, 16, 0, 0, 0, 24, 0, 0, 0];
-            let mut init_bytes = Vec::with_capacity(32);
-            for v in lane_i16 {
-                for b in v.to_le_bytes() {
-                    init_bytes.push(Operand::Const(IrConst::I8(b as i8)));
-                }
-            }
-            preheader_insts.push(Instruction::Intrinsic {
-                dest: Some(raw_tbl),
-                op: IntrinsicOp::VecConstI8x32,
-                dest_ptr: None,
-                args: init_bytes,
-            });
-            let init = fresh();
-            preheader_insts.push(Instruction::Intrinsic {
-                dest: Some(init),
-                op: IntrinsicOp::VecMaddwdI16x16,
-                dest_ptr: None,
-                args: vec![Operand::Value(raw_tbl), Operand::Value(ones_tbl.unwrap())],
-            });
-            init
-        } else {
-            let init = fresh();
-            let lanes: [i32; 4] = if width == StridedWidth::X4Compact {
-                [0, 8, 16, 24]
-            } else {
-                [0, 0, 8, 0]
-            };
-            preheader_insts.push(Instruction::Intrinsic {
-                dest: Some(init),
-                op: IntrinsicOp::VecPackI32x4,
-                dest_ptr: None,
-                args: lanes
-                    .into_iter()
-                    .map(|v| Operand::Const(IrConst::I32(v)))
-                    .collect(),
-            });
-            init
-        };
-        let step_v = fresh();
-        preheader_insts.push(Instruction::Intrinsic {
-            dest: Some(step_v),
-            op: width.broadcast(),
-            dest_ptr: None,
-            args: vec![Operand::Const(IrConst::I32(step_bytes as i32))],
-        });
-        let mut offs = Vec::new();
-        let mut extra = Vec::new();
-        if unroll > 1 {
-            for copy_idx in 1..unroll as i32 {
-                let byte_offset = copy_idx * vector_bytes as i32;
-                if multi_iv {
-                    let init = fresh();
-                    preheader_insts.push(Instruction::Intrinsic {
-                        dest: Some(init),
-                        op: IntrinsicOp::VecPackI32x4,
-                        dest_ptr: None,
-                        args: [
-                            byte_offset,
-                            byte_offset + 8,
-                            byte_offset + 16,
-                            byte_offset + 24,
-                        ]
-                        .into_iter()
-                        .map(|v| Operand::Const(IrConst::I32(v)))
-                        .collect(),
-                    });
-                    extra.push((init, fresh(), fresh()));
-                } else {
-                    let ov = fresh();
-                    preheader_insts.push(Instruction::Intrinsic {
-                        dest: Some(ov),
-                        op: width.broadcast(),
-                        dest_ptr: None,
-                        args: vec![Operand::Const(IrConst::I32(byte_offset))],
-                    });
-                    offs.push(ov);
-                }
-            }
-        }
-        (
-            Some(init),
-            Some(fresh()),
-            Some(fresh()),
-            Some(step_v),
-            offs,
-            extra,
-        )
-    } else {
-        (None, None, None, None, Vec::new(), Vec::new())
+    let Some(Seeds {
+        acc0,
+        acc1,
+        ones,
+        iv,
+    }) = seed_preheader(
+        width,
+        unroll,
+        needs_iv_vec,
+        multi_iv,
+        vector_bytes,
+        step_bytes,
+        &mut fresh,
+        &mut preheader_insts,
+    )
+    else {
+        return 0;
     };
 
     let byte_iv_phi = fresh();
@@ -1418,120 +1694,144 @@ fn transform(func: &mut IrFunction, p: &StridedI32ReducePattern) -> usize {
         wide_load_proven: &p.wide_load_proven,
         byte_iv: byte_iv_phi,
         byte_disp: 0,
-        vec_iv: iv_vec_phi.unwrap_or(Value(0)),
+        vec_iv: iv.as_ref().map_or(Value(0), |stream| stream.phi),
         bcast_cache: Vec::new(),
         preheader_insts,
         body_insts: Vec::new(),
         next_val,
     };
 
-    if unroll > 1 {
+    if let Some(chain) = acc1 {
         let mut copy_vals = Vec::with_capacity(unroll as usize);
         for copy_idx in 0..unroll as usize {
             ctx.byte_disp = (copy_idx as i64) * vector_bytes as i64;
-            if needs_iv_vec {
-                if multi_iv {
-                    ctx.vec_iv = if copy_idx == 0 {
-                        iv_vec_phi.unwrap()
-                    } else {
-                        iv_extra[copy_idx - 1].1
+            if let Some(stream) = iv.as_ref() {
+                ctx.vec_iv = if copy_idx == 0 {
+                    stream.phi
+                } else if multi_iv {
+                    // `multi_iv` implies one extra chain per additional copy.
+                    let Some(extra) = stream.extra.get(copy_idx - 1) else {
+                        debug_assert!(false, "multi-IV copy {copy_idx} has no chain");
+                        return 0;
                     };
-                } else if copy_idx == 0 {
-                    ctx.vec_iv = iv_vec_phi.unwrap();
+                    extra.phi
                 } else {
+                    let Some(&offset) = stream.offs.get(copy_idx - 1) else {
+                        debug_assert!(false, "copy {copy_idx} has no IV offset");
+                        return 0;
+                    };
+                    let Some(op) = width.bin_op(IrBinOp::Add) else {
+                        return 0;
+                    };
                     let cur_iv = ctx.fresh();
                     ctx.body_insts.push(Instruction::Intrinsic {
                         dest: Some(cur_iv),
-                        op: width.bin_op(IrBinOp::Add),
+                        op,
                         dest_ptr: None,
-                        args: vec![
-                            Operand::Value(iv_vec_phi.unwrap()),
-                            Operand::Value(iv_off_vecs[copy_idx - 1]),
-                        ],
+                        args: vec![Operand::Value(stream.phi), Operand::Value(offset)],
                     });
-                    ctx.vec_iv = cur_iv;
-                }
+                    cur_iv
+                };
             }
-            copy_vals.push(ctx.emit(&p.expr));
+            let Some(lane_value) = ctx.emit(&p.expr) else {
+                return 0;
+            };
+            copy_vals.push(lane_value);
         }
+        let Some(add_op) = width.bin_op(IrBinOp::Add) else {
+            return 0;
+        };
         if unroll == 4 {
+            // IEEE-style pairwise schedule: (copy0 + copy2) and
+            // (copy1 + copy3) feed the two independent accumulator chains, so
+            // the per-turn dependency chain stays two adds deep.
+            let [c0, c1, c2, c3] = copy_vals[..] else {
+                debug_assert!(false, "unroll 4 emitted {} copies", copy_vals.len());
+                return 0;
+            };
             let sum02 = ctx.fresh();
             ctx.body_insts.push(Instruction::Intrinsic {
                 dest: Some(sum02),
-                op: width.bin_op(IrBinOp::Add),
+                op: add_op,
                 dest_ptr: None,
-                args: vec![Operand::Value(acc0_phi), Operand::Value(copy_vals[0])],
+                args: vec![Operand::Value(acc0.phi), Operand::Value(c0)],
             });
             ctx.body_insts.push(Instruction::Intrinsic {
-                dest: Some(acc0_next),
-                op: width.bin_op(IrBinOp::Add),
+                dest: Some(acc0.next),
+                op: add_op,
                 dest_ptr: None,
-                args: vec![Operand::Value(sum02), Operand::Value(copy_vals[2])],
+                args: vec![Operand::Value(sum02), Operand::Value(c2)],
             });
             let sum13 = ctx.fresh();
             ctx.body_insts.push(Instruction::Intrinsic {
                 dest: Some(sum13),
-                op: width.bin_op(IrBinOp::Add),
+                op: add_op,
                 dest_ptr: None,
-                args: vec![
-                    Operand::Value(acc1_phi.unwrap()),
-                    Operand::Value(copy_vals[1]),
-                ],
+                args: vec![Operand::Value(chain.phi), Operand::Value(c1)],
             });
             ctx.body_insts.push(Instruction::Intrinsic {
-                dest: Some(acc1_next.unwrap()),
-                op: width.bin_op(IrBinOp::Add),
+                dest: Some(chain.next),
+                op: add_op,
                 dest_ptr: None,
-                args: vec![Operand::Value(sum13), Operand::Value(copy_vals[3])],
+                args: vec![Operand::Value(sum13), Operand::Value(c3)],
             });
         } else {
+            let [c0, c1] = copy_vals[..] else {
+                debug_assert!(false, "unroll 2 emitted {} copies", copy_vals.len());
+                return 0;
+            };
             ctx.body_insts.push(Instruction::Intrinsic {
-                dest: Some(acc0_next),
-                op: width.bin_op(IrBinOp::Add),
+                dest: Some(acc0.next),
+                op: add_op,
                 dest_ptr: None,
-                args: vec![Operand::Value(acc0_phi), Operand::Value(copy_vals[0])],
+                args: vec![Operand::Value(acc0.phi), Operand::Value(c0)],
             });
             ctx.body_insts.push(Instruction::Intrinsic {
-                dest: Some(acc1_next.unwrap()),
-                op: width.bin_op(IrBinOp::Add),
+                dest: Some(chain.next),
+                op: add_op,
                 dest_ptr: None,
-                args: vec![
-                    Operand::Value(acc1_phi.unwrap()),
-                    Operand::Value(copy_vals[1]),
-                ],
+                args: vec![Operand::Value(chain.phi), Operand::Value(c1)],
             });
         }
     } else {
         ctx.byte_disp = 0;
-        let v0 = ctx.emit(&p.expr);
+        let Some(v0) = ctx.emit(&p.expr) else {
+            return 0;
+        };
+        let Some(op) = width.bin_op(IrBinOp::Add) else {
+            return 0;
+        };
         ctx.body_insts.push(Instruction::Intrinsic {
-            dest: Some(acc0_next),
-            op: width.bin_op(IrBinOp::Add),
+            dest: Some(acc0.next),
+            op,
             dest_ptr: None,
-            args: vec![Operand::Value(acc0_phi), Operand::Value(v0)],
+            args: vec![Operand::Value(acc0.phi), Operand::Value(v0)],
         });
     }
 
-    if multi_iv {
-        for (phi, next) in std::iter::once((iv_vec_phi.unwrap(), iv_vec_next.unwrap()))
-            .chain(iv_extra.iter().map(|&(_, phi, next)| (phi, next)))
-        {
+    if let Some(stream) = iv.as_ref() {
+        let Some(op) = width.bin_op(IrBinOp::Add) else {
+            return 0;
+        };
+        if multi_iv {
+            for (phi, next) in std::iter::once((stream.phi, stream.next))
+                .chain(stream.extra.iter().map(|chain| (chain.phi, chain.next)))
+            {
+                ctx.body_insts.push(Instruction::Intrinsic {
+                    dest: Some(next),
+                    op,
+                    dest_ptr: None,
+                    args: vec![Operand::Value(phi), Operand::Value(stream.step)],
+                });
+            }
+        } else {
             ctx.body_insts.push(Instruction::Intrinsic {
-                dest: Some(next),
-                op: width.bin_op(IrBinOp::Add),
+                dest: Some(stream.next),
+                op,
                 dest_ptr: None,
-                args: vec![Operand::Value(phi), Operand::Value(iv_step_vec.unwrap())],
+                args: vec![Operand::Value(stream.phi), Operand::Value(stream.step)],
             });
         }
-    } else if let (Some(iv_phi_v), Some(iv_next_v), Some(step_v)) =
-        (iv_vec_phi, iv_vec_next, iv_step_vec)
-    {
-        ctx.body_insts.push(Instruction::Intrinsic {
-            dest: Some(iv_next_v),
-            op: width.bin_op(IrBinOp::Add),
-            dest_ptr: None,
-            args: vec![Operand::Value(iv_phi_v), Operand::Value(step_v)],
-        });
     }
     ctx.body_insts.push(Instruction::BinOp {
         dest: byte_iv_next,
@@ -1551,43 +1851,43 @@ fn transform(func: &mut IrFunction, p: &StridedI32ReducePattern) -> usize {
             ],
         },
         Instruction::Phi {
-            dest: acc0_phi,
+            dest: acc0.phi,
             ty: IrType::I32,
             incoming: vec![
-                (Operand::Value(acc0_init), preheader_label),
-                (Operand::Value(acc0_next), vec_body_label),
+                (Operand::Value(acc0.init), preheader_label),
+                (Operand::Value(acc0.next), vec_body_label),
             ],
         },
     ];
-    if let (Some(init), Some(phi), Some(next)) = (acc1_init, acc1_phi, acc1_next) {
+    if let Some(chain) = acc1 {
         header_insts.push(Instruction::Phi {
-            dest: phi,
+            dest: chain.phi,
             ty: IrType::I32,
             incoming: vec![
-                (Operand::Value(init), preheader_label),
-                (Operand::Value(next), vec_body_label),
+                (Operand::Value(chain.init), preheader_label),
+                (Operand::Value(chain.next), vec_body_label),
             ],
         });
     }
-    if let (Some(init), Some(phi), Some(next)) = (iv_vec_init, iv_vec_phi, iv_vec_next) {
+    if let Some(stream) = iv.as_ref() {
         header_insts.push(Instruction::Phi {
-            dest: phi,
+            dest: stream.phi,
             ty: IrType::I32,
             incoming: vec![
-                (Operand::Value(init), preheader_label),
-                (Operand::Value(next), vec_body_label),
+                (Operand::Value(stream.init), preheader_label),
+                (Operand::Value(stream.next), vec_body_label),
             ],
         });
-    }
-    for &(init, phi, next) in &iv_extra {
-        header_insts.push(Instruction::Phi {
-            dest: phi,
-            ty: IrType::I32,
-            incoming: vec![
-                (Operand::Value(init), preheader_label),
-                (Operand::Value(next), vec_body_label),
-            ],
-        });
+        for chain in &stream.extra {
+            header_insts.push(Instruction::Phi {
+                dest: chain.phi,
+                ty: IrType::I32,
+                incoming: vec![
+                    (Operand::Value(chain.init), preheader_label),
+                    (Operand::Value(chain.next), vec_body_label),
+                ],
+            });
+        }
     }
     header_insts.push(Instruction::Cmp {
         dest: vec_cmp_dest,
@@ -1597,92 +1897,22 @@ fn transform(func: &mut IrFunction, p: &StridedI32ReducePattern) -> usize {
         ty: IrType::U64,
     });
 
-    // Reduce block: sum accumulators, mask only an even-lane representation,
-    // horizontally add, add `acc_init`, and hand off to the scalar header at
-    // `total_vec_bytes`.
+    // Reduce block: sum the accumulator chains, mask only an even-lane
+    // representation, horizontally add, add `acc_init`, and hand off to the
+    // scalar header at `total_vec_bytes`.
     let mut reduce_insts = Vec::new();
-    let merged_acc = if let Some(acc1_v) = acc1_phi {
-        let m = ctx.fresh();
-        reduce_insts.push(Instruction::Intrinsic {
-            dest: Some(m),
-            op: width.bin_op(IrBinOp::Add),
-            dest_ptr: None,
-            args: vec![Operand::Value(acc0_phi), Operand::Value(acc1_v)],
-        });
-        m
-    } else {
-        acc0_phi
+    let Some(combined_acc) = emit_reduce_epilogue(
+        &mut ctx,
+        width,
+        acc0.phi,
+        acc1.map(|chain| chain.phi),
+        ones,
+        &p.acc_init,
+        p.acc_ty,
+        &mut reduce_insts,
+    ) else {
+        return 0;
     };
-    let masked_acc = if width == StridedWidth::X4Compact {
-        // All four lanes are real strided elements; no odd-lane mask exists.
-        merged_acc
-    } else if width == StridedWidth::X8 {
-        let mask_tbl = ctx.fresh();
-        let mask_i16: [i16; 16] = [-1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0, -1, 0, 0, 0];
-        let mut mask_bytes = Vec::with_capacity(32);
-        for v in mask_i16 {
-            for b in v.to_le_bytes() {
-                mask_bytes.push(Operand::Const(IrConst::I8(b as i8)));
-            }
-        }
-        reduce_insts.push(Instruction::Intrinsic {
-            dest: Some(mask_tbl),
-            op: IntrinsicOp::VecConstI8x32,
-            dest_ptr: None,
-            args: mask_bytes,
-        });
-        let even_mask = ctx.fresh();
-        reduce_insts.push(Instruction::Intrinsic {
-            dest: Some(even_mask),
-            op: IntrinsicOp::VecMaddwdI16x16,
-            dest_ptr: None,
-            args: vec![Operand::Value(mask_tbl), Operand::Value(ones_tbl.unwrap())],
-        });
-        let masked_acc = ctx.fresh();
-        reduce_insts.push(Instruction::Intrinsic {
-            dest: Some(masked_acc),
-            op: width.bin_op(IrBinOp::And),
-            dest_ptr: None,
-            args: vec![Operand::Value(merged_acc), Operand::Value(even_mask)],
-        });
-        masked_acc
-    } else {
-        let even_mask = ctx.fresh();
-        reduce_insts.push(Instruction::Intrinsic {
-            dest: Some(even_mask),
-            op: IntrinsicOp::VecPackI32x4,
-            dest_ptr: None,
-            args: vec![
-                Operand::Const(IrConst::I32(-1)),
-                Operand::Const(IrConst::I32(0)),
-                Operand::Const(IrConst::I32(-1)),
-                Operand::Const(IrConst::I32(0)),
-            ],
-        });
-        let masked_acc = ctx.fresh();
-        reduce_insts.push(Instruction::Intrinsic {
-            dest: Some(masked_acc),
-            op: width.bin_op(IrBinOp::And),
-            dest_ptr: None,
-            args: vec![Operand::Value(merged_acc), Operand::Value(even_mask)],
-        });
-        masked_acc
-    };
-    let hsum = ctx.fresh();
-    reduce_insts.push(Instruction::Intrinsic {
-        dest: Some(hsum),
-        op: width.horizontal_add(),
-        dest_ptr: None,
-        args: vec![Operand::Value(masked_acc)],
-    });
-    let combined_acc = ctx.fresh();
-    reduce_insts.push(Instruction::BinOp {
-        dest: combined_acc,
-        op: IrBinOp::Add,
-        lhs: p.acc_init.clone(),
-        rhs: Operand::Value(hsum),
-        ty: p.acc_ty,
-    });
 
     let scalar_header_label = func.blocks[p.header_idx].label;
     for inst in &mut func.blocks[p.header_idx].instructions {
