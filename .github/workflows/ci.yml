@@ -1104,7 +1104,7 @@ jobs:
     - name: Inline-asm memory operands always carry an address
       run: env GCC=gcc-16 CCC=target/fastbuild/lccc python3 tests/regression/check_rmwcc_mem_operand.py
     - name: Inline-asm operand and template diagnostics match GCC 16.2
-      run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_asm_operand_diagnostics.sh
+      run: env CCC=target/fastbuild/lccc CCC_ARM=target/fastbuild/lccc-arm CCC_RISCV=target/fastbuild/lccc-riscv GCC=gcc-16 bash tests/regression/check_asm_operand_diagnostics.sh
     - name: One-lane ext_vector FP/int carrier correctness
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_lane1_abi.sh
     - name: Ill-typed builtin acceptance

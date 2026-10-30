@@ -192,6 +192,52 @@ pub fn constness(expr: &Expr, enums: &FxHashMap<String, i64>) -> Constness {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum NamedMatchingError {
+    MissingClose,
+    InvalidPunctuation(char),
+}
+
+/// Return every name in a GNU named matching constraint (`[sum]`, optionally
+/// followed by constraint text). GCC 16.2 accepts repeated references such as
+/// `[sum][sum]` and resolves every name; it does not treat the first closing
+/// bracket as permission to ignore malformed trailing text.
+///
+/// Keep the accepted punctuation deliberately limited to characters measured
+/// in a named matching constraint. `#` starts a constraint comment. Alphabetic
+/// constraint-class semantics remain the existing target-specific validator's
+/// responsibility; this routine only owns bracket structure and punctuation.
+pub(super) fn named_matching_names(
+    constraint: &str,
+) -> Result<Option<Vec<&str>>, NamedMatchingError> {
+    let body = constraint.trim_start_matches(|c| MODIFIERS.contains(c));
+    if !body.starts_with('[') {
+        return Ok(None);
+    }
+    let mut names = Vec::new();
+    let mut rest = body;
+    while let Some(ch) = rest.chars().next() {
+        match ch {
+            '#' => break,
+            '[' => {
+                rest = &rest[1..];
+                let close = rest.find(']').ok_or(NamedMatchingError::MissingClose)?;
+                names.push(&rest[..close]);
+                rest = &rest[close + 1..];
+            }
+            ']' => return Err(NamedMatchingError::InvalidPunctuation(ch)),
+            '!' | '$' | '*' | '<' | '>' | '?' | '^' => {
+                rest = &rest[ch.len_utf8()..];
+            }
+            _ if ch.is_ascii_alphanumeric() => {
+                rest = &rest[ch.len_utf8()..];
+            }
+            _ => return Err(NamedMatchingError::InvalidPunctuation(ch)),
+        }
+    }
+    Ok(Some(names))
+}
+
 /// Validate one constraint string.
 fn check_constraint(
     operand: &Operand<'_>,
@@ -213,8 +259,31 @@ fn check_constraint(
             return;
         }
     }
+    // A named matching reference is an input-only constraint. Accept the
+    // complete `[name]` prefix (and any suffix handled by the backend), but
+    // do not let its opening bracket hide an unclosed or output-side form.
+    if !is_output {
+        match named_matching_names(constraint) {
+            Ok(Some(_)) => return,
+            Err(NamedMatchingError::MissingClose) => {
+                problems.push(Diagnostic::error(
+                    "missing close brace for named operand",
+                    Some(index),
+                ));
+                return;
+            }
+            Err(NamedMatchingError::InvalidPunctuation(ch)) => {
+                problems.push(Diagnostic::error(
+                    format!("invalid punctuation '{ch}' in constraint"),
+                    Some(index),
+                ));
+                return;
+            }
+            Ok(None) => {}
+        }
+    }
     // Explicit register (`{rax}`), condition code (`@cc`), or matching (`0`).
-    if body.starts_with('{') || body.starts_with('[') || body.starts_with("@cc") {
+    if body.starts_with('{') || body.starts_with("@cc") {
         return;
     }
     if body.is_empty() || body.chars().next().is_some_and(|c| c.is_ascii_digit()) {

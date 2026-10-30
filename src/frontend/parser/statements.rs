@@ -561,6 +561,25 @@ impl Parser {
             return;
         }
         let is_x86 = matches!(crate::common::types::target_elf_machine(), 3 | 62);
+        // A named matching input must name an output, not merely have a
+        // bracketed spelling. Otherwise the backend's catch-all constraint
+        // classifier silently treats an undefined name as register/memory
+        // letters instead of diagnosing the invalid asm as GCC does.
+        for input in inputs {
+            if let Ok(Some(names)) = asm_validate::named_matching_names(&input.constraint) {
+                for name in names {
+                    if !outputs
+                        .iter()
+                        .any(|output| output.name.as_deref() == Some(name))
+                    {
+                        self.emit_error(
+                            format!("undefined named operand '{name}'"),
+                            input.expr.span(),
+                        );
+                    }
+                }
+            }
+        }
         // Fold the operand expressions first: the fold borrows the enum table
         // immutably, and the diagnostics below need `&mut self`.
         let defer_immediate_constness = self.asm_immediate_validation_deferred;

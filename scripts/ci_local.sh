@@ -223,7 +223,9 @@ gate "lexer-extensions" fast \
 gate "ucn-identifier-table" fast \
     env CCC="$LCCC" GCC="${GCC16:-gcc-16}" bash tests/regression/check_ucn_identifier_table.sh
 gate "asm-operand-diagnostics" fast \
-    env CCC="$LCCC" GCC="${GCC16:-gcc-16}" bash tests/regression/check_asm_operand_diagnostics.sh
+    env CCC="$LCCC" CCC_ARM=target/fastbuild/lccc-arm \
+    CCC_RISCV=target/fastbuild/lccc-riscv GCC="${GCC16:-gcc-16}" \
+    bash tests/regression/check_asm_operand_diagnostics.sh
 gate "trapv-boundary-matrix-m64" fast \
     env CCC="$LCCC" bash tests/regression/check_trapv_boundary_matrix.sh --bits -m64
 gate "trapv-boundary-matrix-m32" fast \
