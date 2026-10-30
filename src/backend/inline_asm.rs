@@ -741,39 +741,29 @@ fn classify_all_operands(
     for (constraint, val, name) in inputs {
         // Handle named matching constraints: `[name]` ties this input to the
         // output declared with that name (GCC's matching-constraint syntax).
-        //
-        // Two separate facts live here and were once conflated:
-        //   * the constraint string is `[name]`, the same spelling as an
-        //     *operand name*.  Indexing it as `constraint[1..len-1]` yields the
-        //     name, which is what the tie needs;
-        //   * if no output carries the name, GCC diagnoses `undefined named
-        //     operand 'name'` — it does not classify the text as a constraint,
-        //     which is what this compiler used to do: the whole string fell
-        //     through `classify_constraint`'s catch-all to `GpReg`, telling the
-        //     template a *register* it never tied, and the parse-time validator
-        //     called it an impossible constraint.  `kernel/arch/x86/lib/
-        //     csum-wrappers_64.c` writes `: [sum] "=r"(sum64) : "[sum]"(rest)`,
-        //     the documented GCC idiom.
+        // The shared grammar also accepts the measured suffix/repeated forms
+        // (`[sum]r`, `[sum][sum]`, `[sum]r[sum]`); treating only the exact
+        // `[name]` spelling as a tie let the suffix letters fall through the
+        // target classifier and allocate an unrelated register.
         //
         // A named tie is Tied(idx) even when the output's own constraint is
         // something other than a plain register: the input inherits whatever
         // the output was allocated, which is exactly GCC's meaning.
-        let named_tie = constraint
-            .strip_prefix('[')
-            .and_then(|rest| rest.strip_suffix(']'));
+        let named_tie = crate::common::asm_constraints::named_matching_names(constraint)
+            .ok()
+            .flatten()
+            .and_then(|names| {
+                names.iter().find_map(|tied_name| {
+                    outputs
+                        .iter()
+                        .position(|(_, _, oname)| oname.as_deref() == Some(*tied_name))
+                })
+            });
         let kind = match named_tie {
-            Some(tied_name) => {
-                match outputs
-                    .iter()
-                    .position(|(_, _, oname)| oname.as_deref() == Some(tied_name))
-                {
-                    Some(idx) => AsmOperandKind::Tied(idx),
-                    // Unreferable name: keep a register kind so the back end
-                    // still produces *some* well-formed instruction; the parser
-                    // has already reported GCC's error, so no code is emitted.
-                    None => AsmOperandKind::GpReg,
-                }
-            }
+            Some(idx) => AsmOperandKind::Tied(idx),
+            // Unreferable or malformed name: keep a register kind so the back
+            // end still produces *some* well-formed instruction; the parser
+            // has already reported GCC's error, so no code is emitted.
             None => emitter.classify_constraint(constraint),
         };
         let mut op = AsmOperand::new(kind.clone(), name.clone());

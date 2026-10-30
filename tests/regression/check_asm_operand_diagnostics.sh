@@ -56,6 +56,24 @@ EXPECT_MESSAGE="input operand constraint contains '+'"
 run_case plus_on_input error \
     'int f(int x){int r;__asm__ volatile("movl %1, %0":"=r"(r):"+r"(x));return r;}'
 
+EXPECT_MESSAGE="input operand constraint contains '&'"
+run_case early_clobber_on_input error \
+    'int f(int x){int r;__asm__ volatile("movl %1, %0":"=r"(r):"&r"(x));return r;}'
+
+# A named matching input is not a letter list.  The undefined-name check must
+# see through the measured suffix/repeated spellings, not only exact `[name]`.
+EXPECT_MESSAGE="undefined named operand 'zz'"
+run_case undefined_suffixed_named_tie error \
+    'int f(int x){int r;__asm__ volatile("movl %1, %0":[sum]"=r"(r):"[zz]r"(x));return r;}'
+run_case undefined_repeated_named_tie error \
+    'int f(int x){int r;__asm__ volatile("movl %1, %0":[sum]"=r"(r):"[sum][zz]"(x));return r;}'
+EXPECT_MESSAGE="missing close brace for named operand"
+run_case named_tie_missing_close error \
+    'int f(int x){int r;__asm__ volatile("movl %1, %0":[sum]"=r"(r):"[sum"(x));return r;}'
+EXPECT_MESSAGE="invalid punctuation '@' in constraint"
+run_case named_tie_invalid_punctuation error \
+    'int f(int x){int r;__asm__ volatile("movl %1, %0":[sum]"=r"(r):"[sum]@"(x));return r;}'
+
 EXPECT_MESSAGE="impossible constraint in 'asm'"
 run_case unmodelled_letter error \
     'int f(int x){int r;__asm__ volatile("movl %1, %0":"=r"(r):"z"(x));return r;}'
@@ -81,10 +99,12 @@ static __attribute__((always_inline)) inline int imm(int x)
 }
 int constant_call(void) { return imm(7); }
 EOF
-if ! "$CCC" -O2 -c "$TMP/always-inline-immediate.c" -o "$TMP/always-inline-immediate.o"; then
-    echo "FAIL always_inline_constant_immediate: constant call should compile" >&2
-    fail=1
-fi
+for opt in -O0 -O1 -O2 -Os; do
+    if ! "$CCC" "$opt" -c "$TMP/always-inline-immediate.c" -o "$TMP/always-inline-immediate.o"; then
+        echo "FAIL always_inline_constant_immediate $opt: constant call should compile" >&2
+        fail=1
+    fi
+done
 cat >"$TMP/always-inline-dynamic.c" <<'EOF'
 static __attribute__((always_inline)) inline int imm(int x)
 {
@@ -94,14 +114,39 @@ static __attribute__((always_inline)) inline int imm(int x)
 }
 int dynamic_call(int x) { return imm(x); }
 EOF
-if out=$("$CCC" -O2 -c "$TMP/always-inline-dynamic.c" -o "$TMP/always-inline-dynamic.o" 2>&1); then
-    echo "FAIL always_inline_dynamic_immediate: dynamic value was accepted" >&2
-    fail=1
-elif [[ $out != *"non-constant operand for immediate-only inline asm constraint"* ]]; then
-    echo "FAIL always_inline_dynamic_immediate: missing actionable diagnostic:" >&2
-    echo "$out" >&2
-    fail=1
-fi
+for opt in -O0 -O1 -O2 -Os; do
+    if out=$("$CCC" "$opt" -c "$TMP/always-inline-dynamic.c" -o "$TMP/always-inline-dynamic.o" 2>&1); then
+        echo "FAIL always_inline_dynamic_immediate $opt: dynamic value was accepted" >&2
+        fail=1
+    elif [[ $out != *"non-constant operand for immediate-only inline asm constraint"* ]]; then
+        echo "FAIL always_inline_dynamic_immediate $opt: missing actionable diagnostic:" >&2
+        echo "$out" >&2
+        fail=1
+    fi
+done
+
+# An address-taken always_inline definition is retained as a real function
+# pointer identity. It is not a disposable template: accepting its unresolved
+# parameter used to emit `movl $0, ...` at every optimization level.
+cat >"$TMP/always-inline-address.c" <<'EOF'
+static __attribute__((always_inline)) inline int imm(int x)
+{
+    int y;
+    __asm__("movl %1, %0" : "=r"(y) : "i"(x));
+    return y;
+}
+int (*volatile escaped_fp)(int) = imm;
+EOF
+for opt in -O0 -O1 -O2 -Os; do
+    if out=$("$CCC" "$opt" -c "$TMP/always-inline-address.c" -o "$TMP/always-inline-address.o" 2>&1); then
+        echo "FAIL always_inline_address_immediate $opt: escaped dynamic body was accepted" >&2
+        fail=1
+    elif [[ $out != *"non-constant operand for immediate-only inline asm constraint"* ]]; then
+        echo "FAIL always_inline_address_immediate $opt: missing actionable diagnostic:" >&2
+        echo "$out" >&2
+        fail=1
+    fi
+done
 
 # Local scalar initializers are often folded to immediate asm operands only
 # after optimization (Linux's __WARN_FLAGS creates a local __auto_type __flags).
@@ -131,6 +176,66 @@ elif [[ $out != *"non-constant operand for immediate-only inline asm constraint"
     echo "$out" >&2
     fail=1
 fi
+
+# Acceptance alone is insufficient: execute the optimized immediate and the
+# suffixed/repeated named matching operands.  The output is uninitialized, so
+# a broken tie cannot hide behind equal input/output values: GCC returns 18
+# for input 9 because the tied input supplies the output's initial value.
+cat >"$TMP/asm-runtime.c" <<'EOF'
+static __attribute__((always_inline)) inline unsigned int immediate(unsigned int value)
+{
+    unsigned int result;
+    __asm__("movl %1, %0" : "=r"(result) : "i"(value));
+    return result;
+}
+static __attribute__((noinline)) unsigned int named_plain(unsigned int value)
+{
+    unsigned int result;
+    __asm__ volatile("addl %1, %0" : [sum] "=r"(result) : "[sum]"(value));
+    return result;
+}
+static __attribute__((noinline)) unsigned int named_suffix(unsigned int value)
+{
+    unsigned int result;
+    __asm__ volatile("addl %1, %0" : [sum] "=r"(result) : "[sum]r"(value));
+    return result;
+}
+static __attribute__((noinline)) unsigned int named_repeat(unsigned int value)
+{
+    unsigned int result;
+    __asm__ volatile("addl %1, %0" : [sum] "=r"(result) : "[sum][sum]"(value));
+    return result;
+}
+static __attribute__((noinline)) unsigned int named_suffix_repeat(unsigned int value)
+{
+    unsigned int result;
+    __asm__ volatile("addl %1, %0" : [sum] "=r"(result) : "[sum]r[sum]"(value));
+    return result;
+}
+int main(void)
+{
+    if (immediate(21) != 21)
+        return 1;
+    if (named_plain(9) != 18)
+        return 2;
+    if (named_suffix(9) != 18)
+        return 3;
+    if (named_repeat(9) != 18)
+        return 4;
+    if (named_suffix_repeat(9) != 18)
+        return 5;
+    return 0;
+}
+EOF
+for opt in -O0 -O1 -O2 -Os; do
+    if ! "$CCC" "$opt" "$TMP/asm-runtime.c" -o "$TMP/asm-runtime"; then
+        echo "FAIL asm runtime $opt: valid immediate/named program should link" >&2
+        fail=1
+    elif ! "$TMP/asm-runtime"; then
+        echo "FAIL asm runtime $opt: valid immediate/named program returned the wrong result" >&2
+        fail=1
+    fi
+done
 
 EXPECT_MESSAGE="probably does not match constraints"
 run_case immediate_out_of_range error \
@@ -214,6 +319,57 @@ gcc_expect=$("$GCC" -O2 -S "$TMP/foldsym.c" -o - 2>/dev/null | grep -Ec '^[[:spa
 if [[ $gcc_expect != 1 ]]; then
     echo "FAIL: the oracle no longer folds this shape (gcc printed $gcc_expect matches)" >&2
     fail=1
+fi
+
+# Every code-generation target must run the post-optimization gate: the shared
+# backend otherwise turns a dynamic immediate-only Value into `.word 0`. When
+# the cross drivers are supplied by ci_local/CI, prove that AArch64, RISC-V and
+# i686 reject that too. Literal constants are positive controls, and the emitted
+# assembly must contain the folded value rather than a zero placeholder.
+if [[ -n ${CCC_ARM:-} || -n ${CCC_RISCV:-} || -n ${CCC_I686:-} ]]; then
+    cat >"$TMP/cross-dynamic-immediate.c" <<'EOF'
+void dynamic_immediate(unsigned int value)
+{
+    __asm__ volatile(".word %0" : : "i"(value));
+}
+EOF
+    cat >"$TMP/cross-constant-immediate.c" <<'EOF'
+void constant_immediate(void)
+{
+    __asm__ volatile(".word %0" : : "i"(9));
+}
+EOF
+    for target in ARM RISCV I686; do
+        driver_var="CCC_$target"
+        driver=${!driver_var:-}
+        if [[ ! -x $driver ]]; then
+            echo "FAIL cross immediate diagnostics: $driver_var is required and executable: ${driver:-<unset>}" >&2
+            fail=1
+            continue
+        fi
+        for opt in -O0 -O1 -O2 -Os; do
+            if out=$("$driver" "$opt" -c "$TMP/cross-dynamic-immediate.c" -o "$TMP/cross-$target-dynamic.o" 2>&1); then
+                echo "FAIL ${target}_dynamic_immediate $opt: dynamic value was accepted" >&2
+                fail=1
+            elif [[ $out != *"non-constant operand for immediate-only inline asm constraint"* ]]; then
+                echo "FAIL ${target}_dynamic_immediate $opt: missing post-optimization diagnostic:" >&2
+                echo "$out" >&2
+                fail=1
+            fi
+            if ! "$driver" "$opt" -c "$TMP/cross-constant-immediate.c" -o "$TMP/cross-$target-constant.o"; then
+                echo "FAIL ${target}_constant_immediate $opt: literal constant should compile" >&2
+                fail=1
+            fi
+            if ! "$driver" "$opt" -S "$TMP/cross-constant-immediate.c" -o "$TMP/cross-$target-constant.s"; then
+                echo "FAIL ${target}_constant_immediate $opt: literal constant should assemble" >&2
+                fail=1
+            elif ! grep -Eq '\.word[[:space:]]+\$?9\b' "$TMP/cross-$target-constant.s"; then
+                echo "FAIL ${target}_constant_immediate $opt: folded immediate did not reach assembly:" >&2
+                cat "$TMP/cross-$target-constant.s" >&2
+                fail=1
+            fi
+        done
+    done
 fi
 
 if ((fail)); then

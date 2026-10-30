@@ -832,19 +832,12 @@ impl Lowerer {
             || referenced_statics.contains(&func.name))
     }
 
-    pub fn lower(mut self, tu: &TranslationUnit) -> (IrModule, DiagnosticEngine) {
-        // Sema has already populated TypeContext with typedefs, enum constants,
-        // struct/union layouts, function typedefs, and function pointer typedefs.
-        // We only need to seed target-dependent builtin typedefs (va_list, size_t, etc.)
-        // and libc math function signatures that sema doesn't know about.
-        self.seed_builtin_typedefs();
-        self.seed_libc_math_functions();
-
-        // Pre-pass: update typedefs that have __attribute__((vector_size(N))) or
-        // __attribute__((ext_vector_type(N))).
-        // Sema doesn't handle vector_size, so the typedef map has the unwrapped base type.
-        // We need to apply vector_size wrapping before registering function metadata,
-        // so that function return types using vector typedefs are correctly resolved.
+    /// Apply vector-size typedef attributes before function metadata and ABI
+    /// classification are registered.  Sema leaves the typedef map at the
+    /// unwrapped base type; struct/union layouts that mention the typedef must
+    /// then be recomputed by key, because their `CType` references already use
+    /// the sema-assigned layout key.
+    fn apply_vector_typedefs(&mut self, tu: &TranslationUnit) {
         let mut has_vector_typedefs = false;
         for decl in &tu.decls {
             if let ExternalDecl::Declaration(decl) = decl {
@@ -868,16 +861,23 @@ impl Lowerer {
                 }
             }
         }
-
-        // After updating vector typedefs, re-compute struct/union layouts that may
-        // contain vector typedef fields. Sema computed these layouts before vector_size
-        // was applied, so their field sizes may be wrong (e.g., float4 was treated as
-        // float instead of vector(float, 16)). We must update the EXISTING layout
-        // entries (by key) rather than creating new ones, because CType::Union/Struct
-        // references use the key assigned by sema.
         if has_vector_typedefs {
             self.recompute_vector_struct_layouts(tu);
         }
+    }
+
+    pub fn lower(mut self, tu: &TranslationUnit) -> (IrModule, DiagnosticEngine) {
+        // Sema has already populated TypeContext with typedefs, enum constants,
+        // struct/union layouts, function typedefs, and function pointer typedefs.
+        // We only need to seed target-dependent builtin typedefs (va_list, size_t, etc.)
+        // and libc math function signatures that sema doesn't know about.
+        self.seed_builtin_typedefs();
+        self.seed_libc_math_functions();
+
+        // Pre-pass: update typedefs that have __attribute__((vector_size(N))) or
+        // __attribute__((ext_vector_type(N))), then refresh any struct/union
+        // layouts whose fields depend on those typedefs.
+        self.apply_vector_typedefs(tu);
 
         // Pre-pass: register struct/union layouts from all declarations and function
         // definitions so that function signature registration (below) can compute

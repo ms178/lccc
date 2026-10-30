@@ -82,6 +82,7 @@
 //! GCC rejects `"I"(g_arr)` / `"I"((void *)&obj)` eagerly.
 
 use super::ast::{BinOp, Expr, UnaryOp};
+use crate::common::asm_constraints::{NamedMatchingError, named_matching_names};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
 /// Constant value of an operand expression, as far as validation is concerned.
@@ -358,27 +359,17 @@ fn constraint_is_constant_expression(constraint: &str) -> bool {
     body.chars().any(|c| X86_IMMEDIATES.contains(c))
 }
 
-/// Whether a constraint string is GCC's named matching-constraint spelling,
-/// `[name]`, which ties an input to the output operand declared with that name.
-///
-/// The brackets make it look like the *operand* name spelling, so it is easy to
-/// mistake one for the other: `execvp`'s `asm` statements and the Linux kernel's
-/// `checksum.h` both write `: [sum] "=r"(s) : "[sum]"(rest)`.  The letters of a
-/// named tie are not a constraint character set at all, so they must be exempt
-/// from the alternative scan; the tie itself is resolved by the back end.
-fn is_named_tie(constraint: &str) -> bool {
-    constraint.starts_with('[') && constraint.ends_with(']') && constraint.len() > 2
-}
-
 /// The constraint `%cN` must judge, following one named-tie hop: `[sum]` is
 /// spelled like a register tie but means "whatever the output named `sum`
 /// declares", and that output may itself be an immediate alternative
-/// (`: [sum] "=n"(s) : "[sum]"(x)`), where `%c` is legal.
+/// (`: [sum] "=n"(s) : "[sum]"(x)`), where `%c` is legal.  The shared grammar
+/// also covers the measured suffix/repeated spellings (`[sum]r`, `[sum][sum]`).
 fn resolved_constraint<'a>(operand: &Operand<'a>, operands: &[Operand<'a>]) -> &'a str {
-    if is_named_tie(operand.constraint) {
-        let tied = &operand.constraint[1..operand.constraint.len() - 1];
-        if let Some(output) = operands.iter().find(|o| o.name == Some(tied)) {
-            return output.constraint;
+    if let Ok(Some(names)) = named_matching_names(operand.constraint) {
+        for tied in names {
+            if let Some(output) = operands.iter().find(|o| o.name == Some(tied)) {
+                return output.constraint;
+            }
         }
     }
     operand.constraint
@@ -395,9 +386,10 @@ fn check_constraint(
     let constraint = operand.constraint;
     let body = constraint.trim_start_matches(|c| MODIFIERS.contains(c));
     for m in constraint[..constraint.len() - body.len()].chars() {
-        // `=` and `+` say how the operand is written to; on an input they
-        // contradict the operand's role and GCC rejects the statement.
-        if (m == '=' || m == '+') && !is_output {
+        // `=`, `+` and `&` say how the operand is written to or clobbered; on
+        // an input they contradict the operand's role and GCC rejects the
+        // statement (measured: `&r` is `input operand constraint contains '&'`).
+        if (m == '=' || m == '+' || m == '&') && !is_output {
             problems.push(Diagnostic::error(
                 format!("input operand constraint contains '{m}'"),
                 Some(index),
@@ -405,9 +397,30 @@ fn check_constraint(
             return;
         }
     }
-    // Explicit register (`{rax}`) and matching (`0`) constraints have their own
-    // grammar and are not letter lists.
-    if body.starts_with('{') || body.starts_with('[') {
+    // Explicit register (`{rax}`) constraints have their own grammar and are
+    // not letter lists.  A named matching input is validated by `validate`
+    // (undefined names) and by the shared bracket grammar here; its letters
+    // are an operand name, not a target constraint class.
+    if body.starts_with('{') {
+        return;
+    }
+    if body.starts_with('[') {
+        if is_output {
+            problems.push(Diagnostic::error(
+                "output operand constraint lacks '='",
+                Some(index),
+            ));
+        } else if let Err(err) = named_matching_names(constraint) {
+            let message = match err {
+                NamedMatchingError::MissingClose => {
+                    "missing close brace for named operand".to_string()
+                }
+                NamedMatchingError::InvalidPunctuation(ch) => {
+                    format!("invalid punctuation '{ch}' in constraint")
+                }
+            };
+            problems.push(Diagnostic::error(message, Some(index)));
+        }
         return;
     }
     // Condition-code operands (`=@cc<suffix>`). Measured against gcc 16.2: every
@@ -628,20 +641,19 @@ pub fn validate(
 ) -> Vec<Diagnostic> {
     let mut problems = Vec::new();
     // `: [sum] "=r"(v) : "[sum]"(x)` ties by name.  A tie naming an operand
-    // that no OUTPUT declares is GCC's `undefined named operand`.  Checked
-    // first, and unchecked further down by `check_constraint` (see
-    // `is_named_tie`), because the two spellings share their brackets.
+    // that no OUTPUT declares is GCC's `undefined named operand`.  Every
+    // referenced name is checked, including suffix/repeated spellings such as
+    // `[zz]r` and `[sum][zz]`; checking only the exact `[name]` form let an
+    // undefined name reach the back end as a register class.
     for (i, op) in inputs.iter().enumerate() {
-        if let Some(tied) = op
-            .constraint
-            .strip_prefix('[')
-            .and_then(|rest| rest.strip_suffix(']'))
-        {
-            if !outputs.iter().any(|o| o.name == Some(tied)) {
-                problems.push(Diagnostic::error(
-                    format!("undefined named operand '{tied}'"),
-                    Some(outputs.len() + i),
-                ));
+        if let Ok(Some(names)) = named_matching_names(op.constraint) {
+            for tied in names {
+                if !outputs.iter().any(|o| o.name == Some(tied)) {
+                    problems.push(Diagnostic::error(
+                        format!("undefined named operand '{tied}'"),
+                        Some(outputs.len() + i),
+                    ));
+                }
             }
         }
     }
@@ -1271,5 +1283,69 @@ mod tests {
                 "impossible constraint in 'asm'"
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod named_matching_tests {
+    use super::*;
+
+    fn named<'a>(constraint: &'a str, name: &'a str) -> Operand<'a> {
+        Operand {
+            constraint,
+            constant: Constness::Unknown,
+            name: Some(name),
+        }
+    }
+
+    fn input(constraint: &str) -> Operand<'_> {
+        Operand {
+            constraint,
+            constant: Constness::Unknown,
+            name: None,
+        }
+    }
+
+    fn messages(p: &[Diagnostic]) -> Vec<&str> {
+        p.iter().map(|d| d.message.as_str()).collect()
+    }
+
+    #[test]
+    fn suffixed_and_repeated_named_ties_resolve_every_name() {
+        let outputs = [named("=r", "sum")];
+        for constraint in ["[sum]", "[sum]r", "[sum][sum]", "[sum]r[sum]"] {
+            let p = validate("", &outputs, &[input(constraint)], 0, true);
+            assert!(p.is_empty(), "{constraint}: {p:?}");
+        }
+        let p = validate("", &outputs, &[input("[zz]r")], 0, true);
+        assert_eq!(messages(&p), ["undefined named operand 'zz'"]);
+        let p = validate("", &outputs, &[input("[sum][zz]")], 0, true);
+        assert_eq!(messages(&p), ["undefined named operand 'zz'"]);
+    }
+
+    #[test]
+    fn malformed_named_ties_are_diagnosed_not_classified_as_letters() {
+        let outputs = [named("=r", "sum")];
+        let p = validate("", &outputs, &[input("[sum")], 0, true);
+        assert_eq!(messages(&p), ["missing close brace for named operand"]);
+        let p = validate("", &outputs, &[input("[sum]@")], 0, true);
+        assert_eq!(messages(&p), ["invalid punctuation '@' in constraint"]);
+        let p = validate("", &outputs, &[input("[]")], 0, true);
+        assert_eq!(messages(&p), ["undefined named operand ''"]);
+    }
+
+    #[test]
+    fn early_clobber_modifier_on_input_is_an_error() {
+        let outputs = [named("=r", "sum")];
+        let p = validate("", &outputs, &[input("&r")], 0, true);
+        assert_eq!(messages(&p), ["input operand constraint contains '&'"]);
+        let p = validate("", &outputs, &[input("&[sum]")], 0, true);
+        assert_eq!(messages(&p), ["input operand constraint contains '&'"]);
+    }
+
+    #[test]
+    fn named_matching_constraint_is_not_an_output_constraint() {
+        let p = validate("", &[input("[sum]")], &[], 0, true);
+        assert_eq!(messages(&p), ["output operand constraint lacks '='"]);
     }
 }

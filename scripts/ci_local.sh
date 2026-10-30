@@ -224,7 +224,8 @@ gate "ucn-identifier-table" fast \
     env CCC="$LCCC" GCC="${GCC16:-gcc-16}" bash tests/regression/check_ucn_identifier_table.sh
 gate "asm-operand-diagnostics" fast \
     env CCC="$LCCC" CCC_ARM=target/fastbuild/lccc-arm \
-    CCC_RISCV=target/fastbuild/lccc-riscv GCC="${GCC16:-gcc-16}" \
+    CCC_RISCV=target/fastbuild/lccc-riscv CCC_I686=target/fastbuild/lccc-i686 \
+    GCC="${GCC16:-gcc-16}" \
     bash tests/regression/check_asm_operand_diagnostics.sh
 gate "trapv-boundary-matrix-m64" fast \
     env CCC="$LCCC" bash tests/regression/check_trapv_boundary_matrix.sh --bits -m64

@@ -3,6 +3,52 @@
 //! Used by the inline pass (symbol resolution), cfg_simplify (dead block detection),
 //! and the backend (operand emission) to consistently identify immediate-only constraints.
 
+/// A malformed GNU named matching constraint (`[name]`, `[name]r`, `[a][b]`).
+///
+/// The parser owns the diagnostic wording; the back end only needs the names.
+/// Keeping the grammar here prevents the two from disagreeing about what a
+/// named tie is, which is how `[sum]r` once became a register class instead of
+/// a tie to the output named `sum`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NamedMatchingError {
+    MissingClose,
+    InvalidPunctuation(char),
+}
+
+/// Return every output name referenced by a GNU named matching constraint.
+///
+/// GCC 16.2 accepts a suffix after the closing bracket (`[sum]r`), repeated
+/// references (`[sum][sum]`), and a `#` constraint comment.  The letters inside
+/// the brackets are an operand name, not constraint letters; the letters after
+/// them do not turn the reference into an immediate/register class.  This
+/// routine therefore owns only bracket structure and the punctuation measured
+/// in a named matching constraint, leaving target-specific class semantics to
+/// the validator.
+pub fn named_matching_names(constraint: &str) -> Result<Option<Vec<&str>>, NamedMatchingError> {
+    let body = constraint.trim_start_matches(['=', '+', '&', '%']);
+    if !body.starts_with('[') {
+        return Ok(None);
+    }
+    let mut names = Vec::new();
+    let mut rest = body;
+    while let Some(ch) = rest.chars().next() {
+        match ch {
+            '#' => break,
+            '[' => {
+                rest = &rest[1..];
+                let close = rest.find(']').ok_or(NamedMatchingError::MissingClose)?;
+                names.push(&rest[..close]);
+                rest = &rest[close + 1..];
+            }
+            ']' => return Err(NamedMatchingError::InvalidPunctuation(ch)),
+            '!' | '$' | '*' | '?' | '^' => rest = &rest[ch.len_utf8()..],
+            _ if ch.is_ascii_alphanumeric() => rest = &rest[ch.len_utf8()..],
+            _ => return Err(NamedMatchingError::InvalidPunctuation(ch)),
+        }
+    }
+    Ok(Some(names))
+}
+
 /// Check whether a constraint string is purely immediate (no register or memory alternatives).
 ///
 /// Returns true for constraints like "i", "n", "e" that ONLY accept compile-time constants.
@@ -16,7 +62,10 @@ pub fn constraint_is_immediate_only(constraint: &str) -> bool {
     if stripped.is_empty() {
         return false;
     }
-    if stripped.starts_with('[') && stripped.ends_with(']') {
+    // A bracketed operand name is never an immediate class, even when the
+    // spelling is malformed; the parser owns that diagnostic.  Falling through
+    // to the letter scan would let `[i` or `[sum]i` masquerade as `"i"`.
+    if stripped.starts_with('[') {
         return false;
     }
     // Must have at least one immediate letter
@@ -136,4 +185,60 @@ pub fn inverse_jcc(jcc: &str) -> Option<&'static str> {
         .iter()
         .find(|c| c.jcc == jcc)
         .map(|c| c.inverse_jcc)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn named_matching_names_cover_the_measured_gcc_spellings() {
+        for (constraint, expected) in [
+            ("[sum]", vec!["sum"]),
+            ("[sum]r", vec!["sum"]),
+            ("[sum][sum]", vec!["sum", "sum"]),
+            ("[sum]r[sum]", vec!["sum", "sum"]),
+            ("[sum][other]", vec!["sum", "other"]),
+            ("[sum]#comment", vec!["sum"]),
+            ("[]", vec![""]),
+        ] {
+            assert_eq!(
+                named_matching_names(constraint).unwrap(),
+                Some(expected),
+                "{constraint}"
+            );
+        }
+        assert_eq!(named_matching_names("r").unwrap(), None);
+        assert_eq!(named_matching_names("0").unwrap(), None);
+        assert_eq!(named_matching_names("i").unwrap(), None);
+    }
+
+    #[test]
+    fn named_matching_names_reject_malformed_brackets_and_punctuation() {
+        assert_eq!(
+            named_matching_names("[sum"),
+            Err(NamedMatchingError::MissingClose)
+        );
+        assert_eq!(
+            named_matching_names("[sum]["),
+            Err(NamedMatchingError::MissingClose)
+        );
+        for ch in ['@', '_', ' ', '.', '/', '\\', ';', '\'', '(', ')', '}', ']'] {
+            let constraint = format!("[sum]{ch}");
+            assert_eq!(
+                named_matching_names(&constraint),
+                Err(NamedMatchingError::InvalidPunctuation(ch)),
+                "{constraint}"
+            );
+        }
+    }
+
+    #[test]
+    fn named_matching_constraints_are_not_immediate_only_classes() {
+        for constraint in ["[sum]", "[sum]i", "[sum][sum]n", "[sum]r"] {
+            assert!(!constraint_is_immediate_only(constraint), "{constraint}");
+        }
+        assert!(constraint_is_immediate_only("i"));
+        assert!(!constraint_is_immediate_only("Ir"));
+    }
 }

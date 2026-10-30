@@ -1005,6 +1005,26 @@ impl DiagnosticEngine {
         hasher.finish()
     }
 
+    /// Remember a warning only when it is actually going to be rendered (or
+    /// promoted to an error).  A suppressed warning is not an emission: if
+    /// `-Wsystem-headers` or a later `-W<name>` makes the same diagnostic
+    /// visible, deduplicating against the suppressed attempt would lose it.
+    fn record_warning_emission(&mut self, diag: &Diagnostic) -> bool {
+        if diag.severity != Severity::Warning {
+            return true;
+        }
+        let Some(span) = diag.span else {
+            return true;
+        };
+        self.emitted_warnings.insert((
+            span.file_id,
+            span.start,
+            span.end,
+            Self::message_hash(&diag.message),
+            diag.dedup_salt,
+        ))
+    }
+
     /// Render an error-severity diagnostic subject to `MAX_RENDERED_ERRORS`.
     fn render_error(&mut self, diag: &Diagnostic) {
         if self.error_count < Self::MAX_RENDERED_ERRORS {
@@ -1096,18 +1116,6 @@ impl DiagnosticEngine {
     /// - If -Werror or -Werror=<name> applies, it is promoted to an error.
     /// - The GCC-style `[-W<name>]` suffix is appended to the message.
     pub fn emit(&mut self, diag: &Diagnostic) {
-        if diag.severity == Severity::Warning
-            && let Some(span) = diag.span
-            && !self.emitted_warnings.insert((
-                span.file_id,
-                span.start,
-                span.end,
-                Self::message_hash(&diag.message),
-                diag.dedup_salt,
-            ))
-        {
-            return;
-        }
         // GCC suppresses diagnostics that come from a system header unless
         // -Wsystem-headers asks for them; the suppression applies to warnings
         // only. Without this, a project that merely includes <pthread.h>
@@ -1133,6 +1141,9 @@ impl DiagnosticEngine {
                     // Check if this warning category is enabled
                     if !self.warning_config.is_enabled(kind) {
                         return; // suppressed by -Wno-<name>
+                    }
+                    if !self.record_warning_emission(diag) {
+                        return;
                     }
 
                     // Check if this warning should be promoted to an error
@@ -1183,6 +1194,9 @@ impl DiagnosticEngine {
                     // warnings (GCC 16.2: `-w` silences unclassified user-code
                     // warnings too), subject to global -Werror otherwise.
                     if self.warning_config.inhibit_all {
+                        return;
+                    }
+                    if !self.record_warning_emission(diag) {
                         return;
                     }
                     if self.warning_config.werror_all {
@@ -1719,6 +1733,8 @@ mod dialect_severity_redteam_tests {
             WarningKind::Attributes,
             WarningKind::UnusedVariable,
             WarningKind::SignCompare,
+            WarningKind::DivByZero,
+            WarningKind::StrictPrototypes,
             WarningKind::Format,
             WarningKind::FormatSecurity,
             WarningKind::ImplicitInt,
@@ -1828,6 +1844,7 @@ mod dialect_severity_redteam_tests {
             "compare-distinct-pointer-types",
             "discarded-qualifiers",
             "discarded-array-qualifiers",
+            "div-by-zero",
             "undeclared",
         ];
         expected_defaults.sort_unstable();

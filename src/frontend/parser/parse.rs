@@ -2308,16 +2308,6 @@ impl Parser {
         start: crate::common::source::Span,
     ) {
         use super::attribute_registry::AttributeTarget;
-        if std::env::var("LCCC_ATTR_DEBUG").is_ok() {
-            eprintln!(
-                "[attr] {} {:?}",
-                std::panic::Location::caller(),
-                recorded
-                    .iter()
-                    .map(|(n, _, t)| format!("{n}:{t:?}"))
-                    .collect::<Vec<_>>()
-            );
-        }
         if recorded.is_empty() {
             return;
         }

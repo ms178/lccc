@@ -87,6 +87,37 @@ impl Parser {
         TypeSpecifier::Int
     }
 
+    /// Finish a file-level bare type declaration such as `struct S { ... };`.
+    /// The transparent-union attribute belongs to this declaration alone and
+    /// must not leak into the next one.
+    fn parse_external_bare_type(&mut self, type_spec: TypeSpecifier, start: Span) -> ExternalDecl {
+        self.consume_if(&TokenKind::Semicolon);
+        let is_transparent_union = self.take_transparent_union();
+        let mut d = Declaration::new(
+            type_spec,
+            Vec::new(),
+            None,
+            None,
+            None,
+            self.attrs.decl_address_space,
+            self.attrs.parsing_vector_size.take(),
+            self.attrs.parsing_ext_vector_nelem.take(),
+            start,
+        );
+        d.set_vector_size_expr(self.attrs.parsing_vector_size_expr.take());
+        d.set_static(self.attrs.parsing_static());
+        d.set_extern(self.attrs.parsing_extern());
+        d.set_typedef(self.attrs.parsing_typedef());
+        d.set_const(self.attrs.parsing_const());
+        d.set_constexpr(self.attrs.parsing_constexpr());
+        d.set_constexpr_last(self.attrs.parsing_constexpr_last());
+        d.set_volatile(self.attrs.parsing_volatile());
+        d.set_pointer_const(self.attrs.parsing_pointer_const());
+        d.set_thread_local(self.attrs.parsing_thread_local());
+        d.set_transparent_union(is_transparent_union);
+        ExternalDecl::Declaration(d)
+    }
+
     pub(super) fn parse_external_decl(&mut self) -> Option<ExternalDecl> {
         self.attrs.parsing_attr_targets.clear();
         // Reset all declaration-level flags before parsing the next declaration.
@@ -157,34 +188,7 @@ impl Parser {
 
         // Bare type with no declarator (e.g., struct definition)
         if self.at_eof() || matches!(self.peek(), TokenKind::Semicolon) {
-            self.consume_if(&TokenKind::Semicolon);
-            // `union U { ... } __attribute__((transparent_union));` names the
-            // attribute here and nowhere else; it must also not leak into the
-            // next declaration (see `take_transparent_union`).
-            let is_transparent_union = self.take_transparent_union();
-            let mut d = Declaration::new(
-                type_spec,
-                Vec::new(),
-                None,
-                None,
-                None,
-                self.attrs.decl_address_space,
-                self.attrs.parsing_vector_size.take(),
-                self.attrs.parsing_ext_vector_nelem.take(),
-                start,
-            );
-            d.set_vector_size_expr(self.attrs.parsing_vector_size_expr.take());
-            d.set_static(self.attrs.parsing_static());
-            d.set_extern(self.attrs.parsing_extern());
-            d.set_typedef(self.attrs.parsing_typedef());
-            d.set_const(self.attrs.parsing_const());
-            d.set_constexpr(self.attrs.parsing_constexpr());
-            d.set_constexpr_last(self.attrs.parsing_constexpr_last());
-            d.set_volatile(self.attrs.parsing_volatile());
-            d.set_pointer_const(self.attrs.parsing_pointer_const());
-            d.set_thread_local(self.attrs.parsing_thread_local());
-            d.set_transparent_union(is_transparent_union);
-            return Some(ExternalDecl::Declaration(d));
+            return Some(self.parse_external_bare_type(type_spec, start));
         }
 
         // Handle post-type storage class specifiers (C allows "struct S typedef name;")
@@ -1381,6 +1385,74 @@ impl Parser {
         }
     }
 
+    /// Finish a block-scope bare type declaration such as `struct S { ... };`.
+    /// The address space is lexical to this declaration: a nested declaration
+    /// inside `typeof` must not donate its space to the enclosing one.
+    fn parse_local_bare_type(
+        &mut self,
+        type_spec: TypeSpecifier,
+        decl_addr_space: AddressSpace,
+        is_static: bool,
+        is_extern: bool,
+        start: Span,
+    ) -> Declaration {
+        self.advance();
+        let is_transparent_union = self.take_transparent_union();
+        self.attrs.parsing_address_space = AddressSpace::Default;
+        let mut d = Declaration::new(
+            type_spec,
+            Vec::new(),
+            None,
+            None,
+            None,
+            decl_addr_space,
+            self.attrs.parsing_vector_size.take(),
+            self.attrs.parsing_ext_vector_nelem.take(),
+            start,
+        );
+        d.set_vector_size_expr(self.attrs.parsing_vector_size_expr.take());
+        d.set_static(is_static);
+        d.set_extern(is_extern);
+        d.set_typedef(self.attrs.parsing_typedef());
+        d.set_const(self.attrs.parsing_const());
+        d.set_constexpr(self.attrs.parsing_constexpr());
+        d.set_constexpr_last(self.attrs.parsing_constexpr_last());
+        d.set_volatile(self.attrs.parsing_volatile());
+        d.set_pointer_const(self.attrs.parsing_pointer_const());
+        d.set_thread_local(self.attrs.parsing_thread_local());
+        d.set_transparent_union(is_transparent_union);
+        d
+    }
+
+    /// Register block-scope typedef names, or record the typedef/object shadows
+    /// introduced by ordinary declarations.  Returns whether the declaration
+    /// was a typedef so the caller can stamp the finished `Declaration`.
+    fn register_local_typedefs(
+        &mut self,
+        declarators: &[InitDeclarator],
+        decl_addr_space: AddressSpace,
+    ) -> bool {
+        let is_typedef = self.attrs.parsing_typedef();
+        if is_typedef {
+            self.record_typedef_object_spaces(declarators, decl_addr_space);
+            for decl in declarators {
+                if !decl.name.is_empty() {
+                    self.typedefs.insert(decl.name.clone());
+                    self.shadowed_typedefs.remove(&decl.name);
+                }
+            }
+            self.attrs.set_typedef(false);
+        } else {
+            for decl in declarators {
+                if !decl.name.is_empty() && self.typedefs.contains(&decl.name) {
+                    self.shadowed_typedefs.insert(decl.name.clone());
+                }
+            }
+            self.record_object_shadows(declarators);
+        }
+        is_typedef
+    }
+
     pub(super) fn parse_local_declaration(&mut self) -> Option<Declaration> {
         // Residue from contexts that never reach a declaration-kind check
         // (parameter lists, abstract declarators) must not attribute to
@@ -1458,36 +1530,13 @@ impl Parser {
 
         // Handle bare type with semicolon (struct/enum/union definition)
         if matches!(self.peek(), TokenKind::Semicolon) {
-            self.advance();
-            let is_transparent_union = self.take_transparent_union();
-            // The declaration's address space is lexical to it: a nested
-            // declaration parsed inside this one's type specifier (a
-            // statement expression inside typeof) must not leave its space
-            // behind for the ENCLOSING declaration to inherit.
-            self.attrs.parsing_address_space = AddressSpace::Default;
-            let mut d = Declaration::new(
+            return Some(self.parse_local_bare_type(
                 type_spec,
-                declarators,
-                None,
-                None,
-                None,
                 decl_addr_space,
-                self.attrs.parsing_vector_size.take(),
-                self.attrs.parsing_ext_vector_nelem.take(),
+                is_static,
+                is_extern,
                 start,
-            );
-            d.set_vector_size_expr(self.attrs.parsing_vector_size_expr.take());
-            d.set_static(is_static);
-            d.set_extern(is_extern);
-            d.set_typedef(self.attrs.parsing_typedef());
-            d.set_const(self.attrs.parsing_const());
-            d.set_constexpr(self.attrs.parsing_constexpr());
-            d.set_constexpr_last(self.attrs.parsing_constexpr_last());
-            d.set_volatile(self.attrs.parsing_volatile());
-            d.set_pointer_const(self.attrs.parsing_pointer_const());
-            d.set_thread_local(self.attrs.parsing_thread_local());
-            d.set_transparent_union(is_transparent_union);
-            return Some(d);
+            ));
         }
 
         let mut mode_kind: Option<ModeKind> = None;
@@ -1635,24 +1684,7 @@ impl Parser {
         }
 
         // Register typedef names or shadow them for variable declarations
-        let is_typedef = self.attrs.parsing_typedef();
-        if self.attrs.parsing_typedef() {
-            self.record_typedef_object_spaces(&declarators, decl_addr_space);
-            for decl in &declarators {
-                if !decl.name.is_empty() {
-                    self.typedefs.insert(decl.name.clone());
-                    self.shadowed_typedefs.remove(&decl.name);
-                }
-            }
-            self.attrs.set_typedef(false);
-        } else {
-            for decl in &declarators {
-                if !decl.name.is_empty() && self.typedefs.contains(&decl.name) {
-                    self.shadowed_typedefs.insert(decl.name.clone());
-                }
-            }
-            self.record_object_shadows(&declarators);
-        }
+        let is_typedef = self.register_local_typedefs(&declarators, decl_addr_space);
 
         self.expect_after(&TokenKind::Semicolon, "after declaration");
         // The declaration's address space is lexical to it: consume it now
