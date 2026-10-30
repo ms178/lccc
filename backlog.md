@@ -1541,7 +1541,8 @@ completion. `OPEN` means the acceptance criterion has not been met or tested;
   name). Two dedicated wordings measured and pinned: `'naked' attribute only
   applies to functions`, `'noplt' attribute is only applicable on functions`.
   Duplicate parser/sema verdicts are collapsed in `DiagnosticEngine::emit` on
-  (file, span, message), so the pooling cannot double-report. Remaining known
+  (file, span, message); see the second-pass note below for the per-list salt
+  that keeps two real lists from collapsing into one. Remaining known
   micro-divergence: when the attribute sits on a later *line* than the
   declaration start, GCC's caret lands on that line's first token while LCCC
   reports the declaration start; and `'x' attribute directive ignored`
@@ -1575,6 +1576,58 @@ completion. `OPEN` means the acceptance criterion has not been met or tested;
   false negatives (`int x __attribute__((pure));` and friends expected silent,
   while GCC warns); it now probes each attribute in a position GCC accepts and
   keeps a separate misapplied class.
+
+**2026-10-30, second pass (declaration-level verdict anchors and `cleanup`).**
+Measured against gcc-16.2.0 with a differential harness (51 probes over
+`-Wattributes`, `-Wdiv-by-zero` and `-Wstrict-prototypes`); the exact-match
+score went from 32/51 to 41/51 with the remaining ten accounted for below.
+
+* One verdict per attribute *list*: the engine's warning dedupe keyed on
+  (file, span, message), which folded
+  `__attribute__((noreturn)) __attribute__((noreturn)) int x;` into a single
+  warning where GCC prints two. `Diagnostic` now carries a `dedup_salt` that
+  the attribute verdict sets from the list's own span, so repeats inside one
+  list still collapse while two lists report twice.
+* `noreturn` on a function *type* is silent, as in GCC:
+  `extern int (*fp)(void) __attribute__((noreturn));` and
+  `typedef void (*handler)(int) __attribute__((noreturn));` produced a false
+  `'noreturn' attribute ignored` because the object-target rule treated the
+  declarator as a plain object. The verdict is skipped whenever the
+  declarator's derived part names a function or a function pointer.
+* `cleanup` is checked, not merely parsed. GCC's matrix (measured, all
+  anchored at the declaration): zero or two arguments →
+  `error: wrong number of arguments specified for 'cleanup' attribute` plus
+  `note: expected 1, found N`; a non-identifier argument →
+  `error: cleanup argument not an identifier`; a well-formed attribute on an
+  automatic object → silent; on a function, or on an object with static
+  storage duration → only `'cleanup' attribute ignored`, with the shape
+  checks suppressed. The old parser took one identifier and left the rest of
+  the list in the token stream, so `cleanup()` produced cascading
+  `expected ';'` errors and `cleanup(1)` was silently accepted.
+* `-Wstrict-prototypes` is derived from the finished declarator tree instead
+  of transient parser state, which fixes the two shapes GCC reports and LCCC
+  did not: an unprototyped type nested in a prototype
+  (`void g(int (*h)());`) and a K&R definition. Locations now match GCC
+  column for column: a declaration reports at its first token (a leading
+  attribute list included), a definition at its name (`int k() {}` → the
+  `k`). Pinned by the option-effect ledger, which compares the verdict
+  locations against GCC on a three-shape fixture.
+* Coverage: `check_attribute_diagnostics.py` grew to 49 probes (two
+  `noreturn`-on-a-function-type silences, three `cleanup` verdicts, one
+  silent well-formed `cleanup`), and `DiagnosticEngine::note` makes the
+  `expected 1, found N` note a first-class emission.
+
+Remaining measured deltas, kept explicit: when an attribute sits on a later
+line than the declaration, GCC's caret lands on that line's first token while
+LCCC reports the declaration start (the same rule decides
+`'x' attribute directive ignored`, which still points at the name token);
+`int x [[gnu::noreturn]];` under `-std=c23` is silent here because the C23
+attribute-specifier path does not yet run the placement verdict; a macro
+expansion adds a `note: in expansion of macro` that GCC omits; and
+`int a[1 / 0];` prints its warning after the semantic error in LCCC
+(GCC: warning first), with the counted driver summary as a third line that
+GCC does not print at all (the summary is LCCC's own contract, pinned by
+`tools/corpus`).
 
 The `ms_abi`, `retain`, and `interrupt` findings are correctness/ABI hazards,
 not performance opportunities. Independent `typeof` red-teaming also found

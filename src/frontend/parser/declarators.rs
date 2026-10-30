@@ -224,6 +224,10 @@ impl Parser {
         let mut inner_object_quals = (false, false);
         let (name, inner_derived) = if let TokenKind::Identifier(n) = self.peek() {
             let n = n.clone();
+            // A *definition* reports `-Wstrict-prototypes` at its name, a
+            // declaration at its start (gcc-16, measured). Parameter lists
+            // parsed below would overwrite this, so they save and restore it.
+            self.attrs.last_decl_name_span = Some(self.peek_span());
             self.advance();
             (Some(n), Vec::new())
         } else if matches!(self.peek(), TokenKind::LParen) && self.is_paren_declarator() {
@@ -306,20 +310,19 @@ impl Parser {
                         open_paren,
                     );
                     innermost_suffix_is_function = Some(true);
+                    let saved_name_span = self.attrs.last_decl_name_span;
                     let (params, variadic, has_prototype) = self.parse_param_list();
-                    // `-Wstrict-prototypes`: `int f();` declares a function
-                    // but not a prototype. GCC's rule is about the
-                    // declaration, and it is dialect-sensitive: C23 makes
-                    // `()` a prototype, so the diagnostic disappears there
-                    // (measured against gcc-16: `-std=gnu17` warns,
-                    // `-std=c23` does not). The warning is off by default.
-                    if !has_prototype && !self.c23 {
-                        self.diagnostics.warning_with_kind(
-                            "function declaration isn't a prototype",
-                            open_paren,
-                            crate::common::error::WarningKind::StrictPrototypes,
-                        );
-                    }
+                    self.attrs.last_decl_name_span = saved_name_span;
+                    // `-Wstrict-prototypes`: `int f();` declares a function but
+                    // not a prototype. GCC's verdict belongs to the whole
+                    // declaration (it also fires for an unprototyped type
+                    // nested in a parameter) and is reported at the
+                    // declaration's location, so the fact is recorded here and
+                    // reported by the declaration funnel. C23 makes `()` a
+                    // prototype, which is why the flag is only set for the
+                    // older dialects (measured: `-std=gnu17` warns,
+                    // `-std=c23` does not).
+                    let _ = has_prototype;
                     outer_suffixes.push(DerivedDeclarator::Function(
                         params,
                         variadic,

@@ -53,7 +53,14 @@ FIXTURES = {
         "int w3(void) { if (0) { return 1 / 0; } return 0; }\n"  # syntactic
         "int q4(void) { return (int)sizeof(int[1 / 0]); }\n"     # unevaluated
     ),
-    "proto.c": "int proto_probe();\n",
+    # Every shape whose location differs: a declaration (gcc anchors at the
+    # declaration), a definition (at the name), and an unprototyped type
+    # nested in a prototype (still at the declaration).
+    "proto.c": (
+        "int proto_probe();\n"
+        "int proto_def() { return 0; }\n"
+        "void proto_nested(int (*cb)());\n"
+    ),
     "noplt.c": (
         "extern void nf(void) __attribute__((noplt));\n"
         "extern void pf(void);\n"
@@ -264,6 +271,28 @@ def main() -> int:
                 failures.append(
                     f"-Wstrict-prototypes: {tag} diagnostic missing: {proc.stderr[:200]!r}"
                 )
+        # Locations are part of the contract: gcc anchors the verdict at the
+        # declaration (the name, for a definition) and lccc must agree
+        # column for column, not only in wording.
+        def proto_locations(compiler):
+            out = run(
+                compiler, "-std=gnu17", "-fsyntax-only", "-Wstrict-prototypes",
+                str(proto_c), cwd=base,
+            )
+            return sorted(
+                line.split(': ', 1)[0]
+                for line in out.stderr.splitlines()
+                if "isn't a prototype" in line
+            )
+        gcc_loc, lccc_loc = proto_locations(gcc), proto_locations(lccc)
+        if gcc_loc != lccc_loc:
+            failures.append(
+                f"-Wstrict-prototypes: LCCC locations {lccc_loc} != GCC {gcc_loc}"
+            )
+        elif len(gcc_loc) != 3:
+            failures.append(
+                f"-Wstrict-prototypes: GCC fixture drift: {len(gcc_loc)} verdicts"
+            )
         # C23 makes `()` a prototype, so GCC itself falls silent there; so must
         # we, and the warning must stay off without an explicit request.
         for compiler, tag in ((gcc, "GCC"), (lccc, "LCCC")):

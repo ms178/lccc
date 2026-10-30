@@ -123,6 +123,27 @@ PROBES = [
      "'noinline' attribute ignored", False),
     ('ignored-cleanup-on-pointer-return-function', 'int __attribute__((cleanup(c))) *f(void);',
      "'cleanup' attribute ignored", False),
+    # `noreturn` on a declarator that names a function TYPE belongs to that
+    # type; gcc-16.2 is silent for a function-pointer object and a typedef
+    # (measured), so the object-target verdict must not fire.
+    ('ok-noreturn-function-pointer-object',
+     'extern int (*fp)(void) __attribute__((noreturn));', None, False),
+    ('ok-noreturn-typedef-function-pointer',
+     'typedef void (*handler)(int) __attribute__((noreturn));', None, False),
+    # `cleanup` argument checking: the count is an error with an `expected 1,
+    # found N` note, a non-identifier argument is an error, and a well-formed
+    # attribute on an automatic object is silent.
+    ('cleanup-arity-zero', 'void __attribute__((cleanup)) f(void) {}',
+     "wrong number of arguments specified for 'cleanup' attribute", False),
+    ('cleanup-arity-two',
+     'void h(void *p) { (void)p; } void __attribute__((cleanup(h, h))) f(void) {}',
+     "wrong number of arguments specified for 'cleanup' attribute", False),
+    ('cleanup-argument-shape',
+     'void f(void) { __attribute__((cleanup(1))) int x = 0; (void)x; }',
+     "cleanup argument not an identifier", False),
+    ('ok-cleanup-well-formed',
+     'void h(void *p) { (void)p; } void f(void) { '
+     '__attribute__((cleanup(h))) int x = 0; (void)x; }', None, False),
 ]
 
 # Generated from the registry: GCC 16.2 knows these, lccc's dispatcher has

@@ -224,8 +224,17 @@ impl Parser {
             Some(attr) if attr.start < start.start => attr,
             _ => start,
         };
+        // A `cleanup` list with the wrong number of arguments is an error and
+        // gcc reports only that error, so the applicability warning is
+        // suppressed for it (measured).
+        let cleanup_arity_error = self.cleanup_diagnoses.iter().any(|(d, _)| {
+            matches!(
+                d,
+                crate::frontend::parser::parse::CleanupDiagnosis::WrongArgumentCount(_)
+            )
+        });
         for (attr_name, _, _) in &spec_attr_targets {
-            if attr_name == "cleanup" {
+            if attr_name == "cleanup" && !cleanup_arity_error {
                 self.diagnostics.warning_with_kind(
                     "'cleanup' attribute ignored",
                     decl_loc,
@@ -460,6 +469,13 @@ impl Parser {
         let recorded = std::mem::take(&mut decl_attrs.parsing_attr_targets);
         self.check_attribute_targets(&type_spec, &derived, &recorded, start);
         self.attrs.set_typedef(false); // function defs are never typedefs
+        // Two distinct anchors, both measured against gcc-16.2: a function
+        // *definition* reports an unprototyped declarator at its name
+        // (`int k() {}` -> `1:5`), while a declaration reports it at the
+        // declaration's start (`int (*cb)();` -> `1:1`). The name must be
+        // captured here: K&R parameter declarations and the body both parse
+        // further declarations, and each of those overwrites the field.
+        let def_name_span = self.attrs.last_decl_name_span;
         let (params, variadic, has_prototype) =
             if let Some(DerivedDeclarator::Function(p, v, has_prototype)) = derived.last() {
                 (p.clone(), *v, *has_prototype)
@@ -554,6 +570,12 @@ impl Parser {
         }
         self.restore_enum_scope(enum_mark);
 
+        self.flush_declarator_verdicts(
+            start,
+            def_name_span,
+            DerivedDeclarator::has_unprototyped_function_type(&derived),
+            false,
+        );
         Some(ExternalDecl::FunctionDef(FunctionDef {
             alignment,
             return_base_const,
@@ -905,6 +927,15 @@ impl Parser {
         // Placement-checked specifier attributes resolve against the first
         // declarator (the take also keeps records off later declarations).
         let recorded = std::mem::take(&mut ctx.attrs.parsing_attr_targets);
+        // gcc anchors declaration-level verdicts at the declaration, and a
+        // leading attribute list is part of it: `__attribute__((cleanup))
+        // void *p;` anchors at the attribute, not at the type specifier
+        // (measured). Taken here because finishing the first declarator
+        // clears the record.
+        let decl_loc = match self.attrs.first_attr_span {
+            Some(attr) if attr.start < start.start => attr,
+            _ => start,
+        };
         self.check_attribute_targets(&type_spec, &derived, &recorded, start);
         let mut declarators = Vec::with_capacity(4);
         // Same snapshot rationale as parse_local_declaration: initializer
@@ -1198,6 +1229,13 @@ impl Parser {
         self.register_typedefs(&type_spec, &declarators, decl_addr_space);
 
         self.expect_after(&TokenKind::Semicolon, "after declaration");
+        // `-Wstrict-prototypes` is a property of the declared types, so it is
+        // read off the finished declarators (`int f();`, `int (*p)();`, and a
+        // nested `void g(int (*h)());` all qualify) rather than tracked
+        // through the parse.
+        let unprototyped = declarators
+            .iter()
+            .any(|item| DerivedDeclarator::has_unprototyped_function_type(&item.derived));
         let mut d = Declaration::new(
             type_spec,
             declarators,
@@ -1222,6 +1260,15 @@ impl Parser {
         d.set_thread_local(self.attrs.parsing_thread_local());
         d.set_transparent_union(is_transparent_union);
         d.set_inline(self.attrs.parsing_inline());
+        self.flush_declarator_verdicts(
+            decl_loc,
+            None,
+            unprototyped,
+            // A file-scope object has static storage duration, so `cleanup`
+            // is ignored there whatever its argument looks like; only the
+            // arity error survives (measured).
+            false,
+        );
         Some(ExternalDecl::Declaration(d))
     }
 
@@ -1241,6 +1288,12 @@ impl Parser {
         // (parameter lists, abstract declarators) must not attribute to
         // this declaration.
         self.attrs.parsing_attr_targets.clear();
+        // A leading attribute list of THIS declaration may already have been
+        // consumed by the statement-level pre-scan; take the record so it
+        // cannot leak into a later declaration (the file-scope path clears it
+        // when it finishes a declarator, this one owns it from entry).
+        let pre_attr_span = self.attrs.first_attr_span.take();
+        self.attrs.last_decl_name_span = None;
         let start = self.peek_span();
         // Selective reset: only storage-class/qualifier flags need clearing here.
         // GCC attribute flags (constructor, weak, etc.) may carry over from the
@@ -1506,6 +1559,22 @@ impl Parser {
         let alignas_type = self.attrs.parsed_alignas_type.take();
         let alignment_sizeof_type = self.attrs.parsed_alignment_sizeof_type.take();
         let is_transparent_union = self.take_transparent_union();
+        // gcc applies the `cleanup` argument-shape checks only to an
+        // automatic object: the one target C23 6.7.12.2 lets the attribute
+        // serve. Everything else is warned about and ignored.
+        let cleanup_auto_object = !self.attrs.parsing_static()
+            && !self.attrs.parsing_extern()
+            && !self.attrs.parsing_typedef()
+            && !declarators
+                .iter()
+                .all(|item| DerivedDeclarator::declares_function(&item.derived));
+        // `-Wstrict-prototypes` is a property of the declared types, so it is
+        // read off the finished declarators (`int f();`, `int (*p)();`, and a
+        // nested `void g(int (*h)());` all qualify) rather than tracked
+        // through the parse.
+        let unprototyped = declarators
+            .iter()
+            .any(|item| DerivedDeclarator::has_unprototyped_function_type(&item.derived));
         let mut d = Declaration::new(
             type_spec,
             declarators,
@@ -1532,6 +1601,14 @@ impl Parser {
         // declaration either (see the specifier snapshot above).
         self.attrs.parsing_visibility = None;
         self.attrs.parsing_tls_model = None;
+        // gcc anchors a declaration's verdicts at its first token, and a
+        // leading attribute list is part of it (`__attribute__((cleanup))
+        // void *p = 0;` anchors at the attribute).
+        let decl_loc = match pre_attr_span {
+            Some(attr) if attr.start < start.start => attr,
+            _ => start,
+        };
+        self.flush_declarator_verdicts(decl_loc, None, unprototyped, cleanup_auto_object);
         Some(d)
     }
 

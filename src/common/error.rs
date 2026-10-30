@@ -812,6 +812,13 @@ pub struct Diagnostic {
     /// missing `#include`) where the source manager is not yet available.
     /// Format: "file:line:" (rendered as the location prefix in output).
     pub explicit_location: Option<String>,
+    /// Disambiguates two diagnostics that are otherwise identical: same
+    /// severity, message and location. The engine drops a repeated warning
+    /// with the same key (the same issue reported twice by two phases), but
+    /// GCC reports one verdict per attribute list, so a caller that emits
+    /// several verdicts at one location sets this to a value that differs per
+    /// list (the list's own span). Zero means "no disambiguation".
+    pub dedup_salt: u64,
 }
 
 impl Diagnostic {
@@ -825,6 +832,7 @@ impl Diagnostic {
             notes: Vec::new(),
             fix_hint: None,
             explicit_location: None,
+            dedup_salt: 0,
         }
     }
 
@@ -838,6 +846,7 @@ impl Diagnostic {
             notes: Vec::new(),
             fix_hint: None,
             explicit_location: None,
+            dedup_salt: 0,
         }
     }
 
@@ -851,6 +860,7 @@ impl Diagnostic {
             notes: Vec::new(),
             fix_hint: None,
             explicit_location: None,
+            dedup_salt: 0,
         }
     }
 
@@ -864,6 +874,7 @@ impl Diagnostic {
             notes: Vec::new(),
             fix_hint: None,
             explicit_location: None,
+            dedup_salt: 0,
         }
     }
 
@@ -937,7 +948,7 @@ pub struct DiagnosticEngine {
     /// check) reach the same verdict on the same attribute; without this the
     /// user sees the line twice. Warnings are therefore idempotent per
     /// (span, message).
-    emitted_warnings: crate::common::fx_hash::FxHashSet<(u32, u32, u32, u64)>,
+    emitted_warnings: crate::common::fx_hash::FxHashSet<(u32, u32, u32, u64, u64)>,
 }
 
 impl DiagnosticEngine {
@@ -1092,6 +1103,7 @@ impl DiagnosticEngine {
                 span.start,
                 span.end,
                 Self::message_hash(&diag.message),
+                diag.dedup_salt,
             ))
         {
             return;
@@ -1148,6 +1160,7 @@ impl DiagnosticEngine {
                             notes: diag.notes.clone(),
                             fix_hint: diag.fix_hint.clone(),
                             explicit_location: diag.explicit_location.clone(),
+                            dedup_salt: diag.dedup_salt,
                         };
                         self.render_error(&promoted);
                         return;
@@ -1162,6 +1175,7 @@ impl DiagnosticEngine {
                         notes: diag.notes.clone(),
                         fix_hint: diag.fix_hint.clone(),
                         explicit_location: diag.explicit_location.clone(),
+                        dedup_salt: diag.dedup_salt,
                     };
                     self.render_warning(&annotated);
                 } else {
@@ -1180,6 +1194,7 @@ impl DiagnosticEngine {
                             notes: diag.notes.clone(),
                             fix_hint: diag.fix_hint.clone(),
                             explicit_location: diag.explicit_location.clone(),
+                            dedup_salt: diag.dedup_salt,
                         };
                         self.render_error(&promoted);
                     } else {
@@ -1219,6 +1234,14 @@ impl DiagnosticEngine {
         self.emit(&diag);
     }
 
+    /// Emit a `note:` line that belongs to the diagnostic just reported, at
+    /// the same location GCC uses for it. Notes never change the exit status
+    /// and are not counted in the diagnostic totals.
+    pub fn note(&mut self, message: impl Into<String>, span: Span) {
+        let diag = Diagnostic::note(message).with_span(span);
+        self.emit(&diag);
+    }
+
     /// Emit a warning with a message and span.
     pub fn warning(&mut self, message: impl Into<String>, span: Span) {
         let diag = Diagnostic::warning(message).with_span(span);
@@ -1228,6 +1251,21 @@ impl DiagnosticEngine {
     /// Emit a categorized warning with a message, span, and kind.
     pub fn warning_with_kind(&mut self, message: impl Into<String>, span: Span, kind: WarningKind) {
         let diag = Diagnostic::warning_with_kind(message, kind).with_span(span);
+        self.emit(&diag);
+    }
+
+    /// Emit a categorized warning that must not be folded into an earlier
+    /// identical one. `salt` distinguishes the occurrences; see
+    /// [`Diagnostic::dedup_salt`].
+    pub fn warning_with_kind_salted(
+        &mut self,
+        message: impl Into<String>,
+        span: Span,
+        kind: WarningKind,
+        salt: u64,
+    ) {
+        let mut diag = Diagnostic::warning_with_kind(message, kind).with_span(span);
+        diag.dedup_salt = salt;
         self.emit(&diag);
     }
 

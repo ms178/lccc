@@ -1321,6 +1321,33 @@ impl DerivedDeclarator {
         matches!(derived.last(), Some(DerivedDeclarator::Function(..)))
     }
 
+    /// Whether the declarator tree contains a function type whose parameter
+    /// list is not a prototype (`int f();`, `int (*p)();`), which is what
+    /// GCC's `-Wstrict-prototypes` reports.
+    ///
+    /// The rule is a property of the declared type, not of the parse order, so
+    /// it is derived from the finished declarator. Nested function types are
+    /// included because gcc-16 warns for them too: `void g(int (*h)());`
+    /// produces the warning at the declaration (measured), while
+    /// `int (*h)(void)` does not.
+    pub fn has_unprototyped_function_type(derived: &[DerivedDeclarator]) -> bool {
+        derived.iter().any(|d| match d {
+            DerivedDeclarator::Function(params, _, has_prototype)
+            | DerivedDeclarator::FunctionPointer(params, _, has_prototype) => {
+                !*has_prototype || Self::params_have_unprototyped_function_type(params)
+            }
+            DerivedDeclarator::Pointer(..) | DerivedDeclarator::Array(_) => false,
+        })
+    }
+
+    fn params_have_unprototyped_function_type(params: &[ParamDecl]) -> bool {
+        params.iter().any(|p| {
+            p.fptr_params.as_ref().is_some_and(|inner| {
+                !p.fptr_has_prototype || Self::params_have_unprototyped_function_type(inner)
+            })
+        })
+    }
+
     /// Pointer indirection depth of the RETURN type a derived list encodes.
     ///
     /// For a FUNCTION declarator (the entity's own parameter list last) the

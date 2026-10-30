@@ -198,6 +198,17 @@ pub(super) mod parsed_attr_flag {
         TYPEDEF | STATIC | EXTERN | THREAD_LOCAL | NESTED_FN | CONSTEXPR | CONSTEXPR_LAST;
 }
 
+/// Why a `cleanup` attribute cannot be honoured. Both forms are hard errors
+/// in gcc-16.2 (measured), reported at the declaration's location.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum CleanupDiagnosis {
+    /// Zero arguments (bare `cleanup` or `cleanup()`) or more than one.
+    WrongArgumentCount(usize),
+    /// The single argument is not a bare identifier (`cleanup(1)`,
+    /// `cleanup("f")`).
+    NotAnIdentifier,
+}
+
 /// Accumulated storage-class specifiers, type qualifiers, and GCC attributes
 /// parsed during declaration/type-specifier processing.
 ///
@@ -223,6 +234,11 @@ pub(super) struct ParsedDeclAttrs {
         crate::common::source::Span,
         super::attribute_registry::AttributeTarget,
     )>,
+    /// Location of the declarator name being parsed, when it is a plain
+    /// identifier. GCC reports `-Wstrict-prototypes` for a *definition* at
+    /// the name (`int k() {}` → the `k`), unlike a declaration, which it
+    /// reports at the declaration's start.
+    pub(super) last_decl_name_span: Option<crate::common::source::Span>,
     /// Location of the FIRST `__attribute__((...))` list of the declaration
     /// being parsed. GCC reports every placement verdict at the declaration's
     /// own location, which includes a leading attribute list: for
@@ -773,6 +789,20 @@ pub struct Parser {
     /// Current default visibility from #pragma GCC visibility push(...).
     /// None means default visibility (no pragma active).
     pub(super) pragma_default_visibility: Option<String>,
+    /// Unhonourable `cleanup` attributes seen while parsing the current
+    /// declaration, drained by the declaration funnel and reported there at
+    /// the declaration's own location: gcc-16 anchors `wrong number of
+    /// arguments specified for 'cleanup' attribute` and `cleanup argument not
+    /// an identifier` at the declaration, not at the attribute (measured with
+    /// the attribute written first and after the type specifier). Kept on the
+    /// parser and not on the attribute state because that state is
+    /// snapshot-and-restored by parameter declarators and speculative parses,
+    /// which dropped the record for block-scope declarations.
+    pub(super) cleanup_diagnoses: Vec<(CleanupDiagnosis, crate::common::source::Span)>,
+    /// Attributes already reported, so a declaration parsed twice (a
+    /// speculative pass followed by the real one) reports each `cleanup`
+    /// verdict exactly once.
+    pub(super) reported_cleanup_attrs: crate::common::fx_hash::FxHashSet<u32>,
     /// S13: file-scope function names whose DECLARATION carried
     /// `no_instrument_function`. GCC merges declaration attributes into the
     /// definition (C redeclaration rules); the torture suite writes
@@ -885,6 +915,8 @@ impl Parser {
             func_decl_no_instrument: FxHashSet::default(),
             func_decl_stack_protect: FxHashSet::default(),
             func_decl_no_stack_protector: FxHashSet::default(),
+            cleanup_diagnoses: Vec::new(),
+            reported_cleanup_attrs: crate::common::fx_hash::FxHashSet::default(),
             func_decl_noinline: FxHashSet::default(),
             error_count: 0,
             parser_frame_depth: 0,
@@ -2121,6 +2153,79 @@ impl Parser {
         );
     }
 
+    /// Report the declaration-level verdicts recorded while the declarators
+    /// were parsed: `-Wstrict-prototypes` and a malformed `cleanup`
+    /// attribute. Both belong to the declaration as a whole, and gcc-16
+    /// reports them at the declaration's own location -- except for a
+    /// function *definition*, where `-Wstrict-prototypes` points at the name.
+    /// `decl_start` must already include a leading attribute list when the
+    /// declaration has one (`__attribute__((cleanup)) void *p;` anchors at
+    /// the attribute, measured).
+    pub(super) fn flush_declarator_verdicts(
+        &mut self,
+        decl_start: crate::common::source::Span,
+        definition_name: Option<crate::common::source::Span>,
+        unprototyped: bool,
+        cleanup_auto_object: bool,
+    ) {
+        self.attrs.last_decl_name_span = None;
+        if unprototyped && !self.c23 {
+            let span = definition_name.unwrap_or(decl_start);
+            self.diagnostics.warning_with_kind(
+                "function declaration isn't a prototype",
+                span,
+                crate::common::error::WarningKind::StrictPrototypes,
+            );
+        }
+        // One report per attribute: a block-scope declaration can be parsed
+        // speculatively and then for real, and both passes record the same
+        // attribute. The argument count is checked before the argument's
+        // shape, so an arity verdict wins over an identifier verdict for the
+        // same attribute (measured: `cleanup` and `cleanup()` report the
+        // count, `cleanup(1)` reports the shape).
+        let mut by_attr: crate::common::fx_hash::FxHashMap<u32, CleanupDiagnosis> =
+            crate::common::fx_hash::FxHashMap::default();
+        for (diagnosis, attr_span) in std::mem::take(&mut self.cleanup_diagnoses) {
+            let entry = by_attr.entry(attr_span.start);
+            entry
+                .and_modify(|existing| {
+                    if matches!(diagnosis, CleanupDiagnosis::WrongArgumentCount(_))
+                        && !matches!(existing, CleanupDiagnosis::WrongArgumentCount(_))
+                    {
+                        *existing = diagnosis;
+                    }
+                })
+                .or_insert(diagnosis);
+        }
+        for (attr_start, diagnosis) in by_attr {
+            if !self.reported_cleanup_attrs.insert(attr_start) {
+                continue;
+            }
+            match diagnosis {
+                CleanupDiagnosis::WrongArgumentCount(found) => {
+                    self.diagnostics.error(
+                        "wrong number of arguments specified for 'cleanup' attribute",
+                        decl_start,
+                    );
+                    self.diagnostics
+                        .note(format!("expected 1, found {found}"), decl_start);
+                }
+                // GCC checks the argument's *shape* only for a target the
+                // attribute can actually apply to. On a function, or on an object
+                // with static storage duration, the attribute is ignored and the
+                // only diagnostic is the `'cleanup' attribute ignored` warning
+                // (measured: `__attribute__((cleanup(1))) void f(void)` and
+                // `__attribute__((cleanup(1))) void *g;` are warning-only, while
+                // the same argument on a local is an error).
+                CleanupDiagnosis::NotAnIdentifier if cleanup_auto_object => {
+                    self.diagnostics
+                        .error("cleanup argument not an identifier", decl_start);
+                }
+                CleanupDiagnosis::NotAnIdentifier => {}
+            }
+        }
+    }
+
     /// The declaration-kind half of the applicability rule: once the
     /// specifier and first declarator are known, each recorded
     /// placement-checked attribute either matches or warns exactly as GCC
@@ -2179,13 +2284,36 @@ impl Parser {
         let is_typedef = matches!(type_spec, TypeSpecifier::TypedefName(_));
         let returns_void = matches!(type_spec, TypeSpecifier::Void)
             && crate::frontend::parser::ast::DerivedDeclarator::return_pointer_depth(derived) == 0;
-        for (name, _span, target) in recorded {
+        for (name, span, target) in recorded {
             if returns_void && is_function && matches!(name.as_str(), "const" | "pure") {
                 self.diagnostics.warning_with_kind(
                     format!("\'{name}\' attribute on function returning 'void'"),
                     start,
                     crate::common::error::WarningKind::Attributes,
                 );
+                continue;
+            }
+            // `noreturn` on a declaration that names a function *type* --
+            // a function, or any object of function-pointer type -- applies
+            // to that function type, and gcc-16.2 is silent for it:
+            // `int (*fp)(void) __attribute__((noreturn));` and
+            // `typedef void (*handler)(int) __attribute__((noreturn));`
+            // produce no diagnostic, while `int *ordinary` does (measured).
+            // The attribute is carried by the type, not the object, so the
+            // object-target verdict does not apply.
+            if name == "noreturn" && Self::declares_function_type(derived) {
+                continue;
+            }
+            // A `cleanup` list with the wrong number of arguments is an error,
+            // and gcc reports only that error: the applicability warning is
+            // suppressed (measured on a function target, where the warning
+            // would otherwise also apply).
+            if name == "cleanup"
+                && self
+                    .cleanup_diagnoses
+                    .iter()
+                    .any(|(d, _)| matches!(d, CleanupDiagnosis::WrongArgumentCount(_)))
+            {
                 continue;
             }
             let ok = match target {
@@ -2203,13 +2331,31 @@ impl Parser {
                     "noplt" => format!("\'{name}\' attribute is only applicable on functions"),
                     _ => format!("\'{name}\' attribute ignored"),
                 };
-                self.diagnostics.warning_with_kind(
+                // One verdict per attribute list: gcc-16.2 reports
+                // `__attribute__((noreturn)) __attribute__((noreturn)) int x;`
+                // twice, so the record's own span salts the dedupe key while
+                // both diagnostics still point at the declaration.
+                self.diagnostics.warning_with_kind_salted(
                     message,
                     start,
                     crate::common::error::WarningKind::Attributes,
+                    u64::from(span.start),
                 );
             }
         }
+    }
+
+    /// Whether the declarator declares a function *type* rather than a plain
+    /// object: a function, or an object whose type involves a function
+    /// declarator (`int (*fp)(void)`, `typedef void (*handler)(int)`).
+    fn declares_function_type(derived: &[crate::frontend::parser::ast::DerivedDeclarator]) -> bool {
+        derived.iter().any(|d| {
+            matches!(
+                d,
+                crate::frontend::parser::ast::DerivedDeclarator::Function(..)
+                    | crate::frontend::parser::ast::DerivedDeclarator::FunctionPointer(..)
+            )
+        })
     }
 
     /// Dispatch a single GCC attribute by name.
@@ -2751,16 +2897,74 @@ impl Parser {
     }
 
     fn parse_cleanup_attr(&mut self) {
+        let attr_span = self.peek_span();
         if !matches!(self.peek(), TokenKind::LParen) {
+            // `__attribute__((cleanup))`: GCC counts zero arguments.
+            self.cleanup_diagnoses
+                .push((CleanupDiagnosis::WrongArgumentCount(0), attr_span));
             return;
         }
-        self.advance();
-        if let TokenKind::Identifier(func_name) = self.peek() {
-            self.attrs.parsing_cleanup_fn = Some(func_name.clone());
-            self.advance();
+        self.advance(); // '('
+        // Split the argument list on top-level commas and keep the tokens of
+        // each argument. The previous version consumed at most one identifier
+        // and then gave up, which left the remaining tokens in the stream
+        // (cascading parse errors for `cleanup()`) or accepted a malformed
+        // attribute without a word (`cleanup(1)`).
+        let mut groups: Vec<Vec<TokenKind>> = Vec::new();
+        let mut current: Vec<TokenKind> = Vec::new();
+        let mut depth = 0i32;
+        loop {
+            match self.peek().clone() {
+                TokenKind::Eof => break,
+                TokenKind::RParen if depth == 0 => {
+                    self.advance();
+                    break;
+                }
+                TokenKind::Comma if depth == 0 => {
+                    self.advance();
+                    groups.push(std::mem::take(&mut current));
+                }
+                tk @ (TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace) => {
+                    depth += 1;
+                    current.push(tk);
+                    self.advance();
+                }
+                tk @ (TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace) => {
+                    depth -= 1;
+                    current.push(tk);
+                    self.advance();
+                }
+                tk => {
+                    current.push(tk);
+                    self.advance();
+                }
+            }
         }
-        if matches!(self.peek(), TokenKind::RParen) {
-            self.advance();
+        if !current.is_empty() || !groups.is_empty() {
+            groups.push(current);
+        }
+        match groups.len() {
+            1 if groups[0].len() == 1 => {
+                if let TokenKind::Identifier(name) = &groups[0][0] {
+                    self.attrs.parsing_cleanup_fn = Some(name.clone());
+                } else {
+                    self.attrs.parsing_cleanup_fn = None;
+                    self.cleanup_diagnoses
+                        .push((CleanupDiagnosis::NotAnIdentifier, attr_span));
+                }
+            }
+            1 => {
+                // Several tokens that are not a bare identifier: `cleanup((f))`,
+                // `cleanup(a b)`, `cleanup("f")`.
+                self.attrs.parsing_cleanup_fn = None;
+                self.cleanup_diagnoses
+                    .push((CleanupDiagnosis::NotAnIdentifier, attr_span));
+            }
+            n => {
+                self.attrs.parsing_cleanup_fn = None;
+                self.cleanup_diagnoses
+                    .push((CleanupDiagnosis::WrongArgumentCount(n), attr_span));
+            }
         }
     }
 
