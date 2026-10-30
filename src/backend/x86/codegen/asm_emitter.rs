@@ -986,7 +986,13 @@ impl InlineAsmEmitter for X86Codegen {
         }
     }
 
+    fn reset_scratch_state(&mut self) {
+        self.asm_scratch_idx = 0;
+        self.asm_xmm_scratch_idx = 0;
+    }
+}
 
+impl X86Codegen {
     /// Store one `=@cc<cond>` output operand.
     ///
     /// Three shapes, in the order the proof allows them:
@@ -1112,13 +1118,6 @@ impl InlineAsmEmitter for X86Codegen {
         }
     }
 
-    fn reset_scratch_state(&mut self) {
-        self.asm_scratch_idx = 0;
-        self.asm_xmm_scratch_idx = 0;
-    }
-}
-
-impl X86Codegen {
     /// Store an asm output register through a destination that has no stack
     /// slot: the destination is an address VALUE (a register-resident pointer,
     /// e.g., cpuid.h's `__cpuid(level, *a, *b, *c, *d)` outputs). The pointer
