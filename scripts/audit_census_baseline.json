@@ -1,7 +1,7 @@
 {
   "fns_over_1000": 26,
-  "fns_over_300": 233,
-  "fns_over_500": 97,
+  "fns_over_300": 236,
+  "fns_over_500": 98,
   "ignored_tests": 10,
   "knob_literals": 544,
   "knob_names": [

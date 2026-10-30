@@ -1382,6 +1382,73 @@ sessions have now spent time re-deriving that these numbers are not gaps.
 
 ---
 
+## 7a. asm-goto fusion: three measured codegen gaps it exposes (2026-10-30)
+
+The `=@cc` fusion in this branch is correct and it removes the
+setcc -> store -> reload -> test round trip, but the function around it
+still carries three instructions that serve nothing.  Measured on
+
+```c
+__attribute__((noinline)) static int cc_branch(unsigned x) {
+    _Bool err;
+    asm goto("testl %1, %1; jz %l[label]" : "=@ccz"(err) : "r"(x) : "cc" : label);
+    if (err) return 1;
+    return 0;
+label:
+    if (err) return 2;
+    return 3;
+}
+```
+
+at `-O2` on x86-64 (lccc fastbuild vs gcc 16.2, same source):
+
+| | per-call uops on the `x != 0` path | what it is |
+|---|---|---|
+| gcc 16.2 | 4 | `testl/jz`, `sete`, `movzbl`, `ret` |
+| lccc (this branch) | 8 | `subq $8,%rsp`, `movl %edi,%eax` (dead), `movl %edi,%ecx`, `testl/jz`, `jne` (always taken), `xorl`, `addq $8,%rsp`, `ret` |
+
+1. The frame is empty: the fused path stores nothing, yet the prologue still
+   runs `subq $8, %rsp` / `addq $8, %rsp`.  Frame sizing happens before the
+   fusion decision, so eliding it needs either a second sizing pass for
+   `asm goto` functions or a deferred-offset scheme.
+2. `movl %edi, %eax` is dead: it is the asm output's register home, allocated
+   before the fusion proved the home unused.  Freeing it is the same
+   "allocate after the fusion decision" change.
+3. `.LBB1: movl $1, %eax; ...; ret` is unreachable: on the label edge the
+   fusion emits `jne` whose target is statically never chosen (the edge is
+   only reachable through `jz`), but the block is still emitted.  A
+   reachability pass over the emitted CFG would delete it.
+
+Runtime consequence, measured: 40M calls of the function above take 51.07 ms
+with this branch, 50.95 ms with `origin/main` (0.2%, noise) and 38.73 ms with
+gcc 16.2.  The fusion is performance-neutral on this shape — it trades a
+setcc/movzbl pair for a taken branch — and the 32% gap to gcc is those three
+instructions plus the extra branch.  The correctness win is the real one: the
+same program prints 2 (correct, gcc-equal) here and 3 (stale taken-edge
+output) with `origin/main`.
+
+## 8a. Declaration-parser tail split (measured 2026-10-30)
+
+The attribute/cleanup verdict work feeds one declaration-level verdict pool, and
+the three declaration entry points each carry the tail that turns the collected
+flags into a `Declaration`.  They cross the 300-line ratchet:
+
+| function | file | lines | main |
+|---|---|---|---|
+| `parse_declaration_rest` | `src/frontend/parser/declarations.rs` | 355 | 315 |
+| `parse_local_declaration` | same | 342 | 291 |
+| `parse_external_decl` | same | 317 | 277 |
+| `lower` | `src/ir/lowering/lower.rs` | 514 | 500 |
+
+`scripts/audit_census_baseline.json` was raised by those three and one count in
+the commit that added them, which is the ratchet's own escape hatch.  The
+refactor that pays it back is mechanical and is the next item here: extract the
+`Declaration::new` + `set_*` tail into one `finish_declaration(...)` helper
+shared by the three entry points, and split `lower`'s call lowering from its
+statement walk.  Nothing in the current change depends on the split, and the
+semantics are already covered by `tests/regression/check_attribute_diagnostics.*`
+plus the attribute option ledger.
+
 ## 9a. SSE/AVX audit follow-through (2026-10-26)
 
 These are **open obligations**, not an ISA/manual sign-off. Start with

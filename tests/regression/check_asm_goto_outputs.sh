@@ -21,8 +21,36 @@ tmp=${TMPDIR:-/tmp}/lccc-asm-goto-outputs.$$
 trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp"
 
+# The 32-bit runtime legs need a 32-bit C library.  A host without one (no
+# gcc-multilib) cannot link them, and failing the whole gate there would make it
+# unrunnable outside CI; hosted CI provisions multilib, so it must never skip.
+have_multilib() {
+    local probe
+    probe=$(mktemp "${TMPDIR:-/tmp}/lccc-m32probe.XXXXXX.c")
+    printf '#include <stdio.h>\nint main(void){return 0;}\n' >"$probe"
+    if "$CCC" -m32 -c "$probe" -o "${probe%.c}.o" >/dev/null 2>&1; then
+        rm -f "$probe" "${probe%.c}.o"
+        return 0
+    fi
+    rm -f "$probe" "${probe%.c}.o"
+    return 1
+}
+
+m32_runtime_supported() {
+    local bits=$1
+    [[ $bits == 32 ]] || return 0
+    have_multilib && return 0
+    if [[ ${GITHUB_ACTIONS:-} == true ]]; then
+        echo "FAIL: -m32 runtime legs skipped under GITHUB_ACTIONS (no 32-bit C library)" >&2
+        exit 1
+    fi
+    echo "SKIP-RUN: -m32 needs a 32-bit C library (install gcc-multilib); -m64 legs still ran"
+    return 1
+}
+
 run_one() {
     local bits=$1 opt=$2
+    m32_runtime_supported "$bits" || return 0
     "$CCC" -m"$bits" -std=gnu11 -O"$opt" -Wall -Wextra -Werror "$src" -o "$tmp/test"
     local interp
     interp=$(readelf -l "$tmp/test" | sed -n 's/.*Requesting program interpreter: \([^]]*\)].*/\1/p')
@@ -49,6 +77,7 @@ run_one 32 2
 # separate translation unit from the portable runtime test.
 ext=$root/tests/regression/asm_goto_outputs_ext.c
 for bits in 64 32; do
+    m32_runtime_supported "$bits" || continue
     "$CCC" -m"$bits" -std=gnu11 -O2 -Wall -Wextra -Werror "$ext" -o "$tmp/ext"
     interp=$(readelf -l "$tmp/ext" | sed -n 's/.*Requesting program interpreter: \([^]]*\)].*/\1/p')
     if [[ -n $interp && ! -e $interp ]]; then
@@ -158,7 +187,12 @@ printf 'int f(int a, int b){ unsigned char o; asm goto("cmpl %%1, %%2\\n\\t# pla
 "$CCC" -m64 -std=gnu11 -O2 -S "$tmp/plain.c" -o "$tmp/plain.s"
 grep -Eq '# plain=\$\.L[0-9A-Za-z_.]+ named=\.L[0-9A-Za-z_.]+' "$tmp/plain.s" \
     || { echo "FAIL: plain %N did not print the label address" >&2; cat "$tmp/plain.s" >&2; exit 1; }
+# `sed -n 1p` rather than `head -1`: this file runs under `set -o pipefail`,
+# and a consumer that stops reading early turns the producer's SIGPIPE into a
+# failure of the whole gate.  (`sed 'p;q'` is NOT the equivalent: `q` ends the
+# input after the first *line*, not after the first match.)
 plain_sym=$(sed -n 's/.*# plain=\$\([^ ]*\) named=\([^ ]*\).*/\1 \2/p' "$tmp/plain.s" | sed -n '1p')
+[[ -n $plain_sym ]] || { echo "FAIL: no %N/%lN marker in the template output" >&2; cat "$tmp/plain.s" >&2; exit 1; }
 set -- $plain_sym
 [[ $1 == "$2" ]] || { echo "FAIL: plain %N and %lN name different labels ($1 vs $2)" >&2; exit 1; }
 echo "PASS plain %N prints the label address (same symbol as %lN)"
@@ -226,7 +260,7 @@ for arch in m64 m32; do
     want=""
     for opt in 0 1 2 3 s; do
         "$CCC" "-$arch" -O"$opt" -ffreestanding -nostdlib -static -fno-pie -no-pie \
-            "$tmp/edges.c" -o "$tmp/edges"
+            "$tmp/edges.c" -o "$tmp/edges" 
         got=0
         "$tmp/edges" || got=$?
         if [[ -z $want ]]; then want=$got; fi
