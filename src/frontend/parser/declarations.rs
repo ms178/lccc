@@ -237,12 +237,16 @@ impl Parser {
                 crate::frontend::parser::parse::CleanupDiagnosis::WrongArgumentCount(_)
             )
         });
-        for (attr_name, _, _) in &spec_attr_targets {
+        for (attr_name, attr_span, _) in &spec_attr_targets {
             if attr_name == "cleanup" && !cleanup_arity_error {
-                self.diagnostics.warning_with_kind(
+                // One verdict per written attribute: gcc reports
+                // `int x __attribute__((noreturn)) __attribute__((noreturn));`
+                // twice, and `cleanup` behaves the same way (measured).
+                self.diagnostics.warning_with_kind_salted(
                     "'cleanup' attribute ignored",
                     decl_loc,
                     crate::common::error::WarningKind::Attributes,
+                    Self::attribute_dedup_salt(*attr_span),
                 );
             }
         }

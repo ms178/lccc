@@ -2285,6 +2285,16 @@ impl Parser {
         }
     }
 
+    /// The dedupe key for a verdict about one written attribute.
+    ///
+    /// Two attribute lists on one declaration are two occurrences and keep
+    /// two verdicts (gcc reports both), while the same occurrence judged by
+    /// two call sites stays one. The bias keeps a first-byte attribute out of
+    /// the "no salt" value.
+    pub(super) fn attribute_dedup_salt(span: crate::common::source::Span) -> u64 {
+        u64::from(span.start) + 1
+    }
+
     /// The declaration-kind half of the applicability rule: once the
     /// specifier and first declarator are known, each recorded
     /// placement-checked attribute either matches or warns exactly as GCC
@@ -2335,10 +2345,11 @@ impl Parser {
             && crate::frontend::parser::ast::DerivedDeclarator::return_pointer_depth(derived) == 0;
         for (name, span, target) in recorded {
             if returns_void && is_function && matches!(name.as_str(), "const" | "pure") {
-                self.diagnostics.warning_with_kind(
+                self.diagnostics.warning_with_kind_salted(
                     format!("\'{name}\' attribute on function returning 'void'"),
                     start,
                     crate::common::error::WarningKind::Attributes,
+                    Self::attribute_dedup_salt(*span),
                 );
                 continue;
             }
@@ -2391,7 +2402,7 @@ impl Parser {
                     message,
                     start,
                     crate::common::error::WarningKind::Attributes,
-                    u64::from(span.start),
+                    Self::attribute_dedup_salt(*span),
                 );
             }
         }

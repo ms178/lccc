@@ -1005,12 +1005,15 @@ impl DiagnosticEngine {
         hasher.finish()
     }
 
-    /// Remember a warning only when it is actually going to be rendered (or
-    /// promoted to an error).  A suppressed warning is not an emission: if
-    /// `-Wsystem-headers` or a later `-W<name>` makes the same diagnostic
-    /// visible, deduplicating against the suppressed attempt would lose it.
+    /// Remember a *salted* warning occurrence only when it is actually going
+    /// to be rendered (or promoted to an error).  A suppressed warning is not
+    /// an emission: if `-Wsystem-headers`, `-Wno-<name>`, or `-w` hid the first
+    /// attempt, a later visible attempt must not be deduplicated against it.
+    /// Unsalted warnings are never deduplicated: GCC reports one diagnostic
+    /// per offending token, and two independent problems at the same span are
+    /// two diagnostics.
     fn record_warning_emission(&mut self, diag: &Diagnostic) -> bool {
-        if diag.severity != Severity::Warning {
+        if diag.severity != Severity::Warning || diag.dedup_salt == 0 {
             return true;
         }
         let Some(span) = diag.span else {
@@ -1120,7 +1123,9 @@ impl DiagnosticEngine {
         // -Wsystem-headers asks for them; the suppression applies to warnings
         // only. Without this, a project that merely includes <pthread.h>
         // would see our honest `'returns_twice' attribute ignored` note on a
-        // declaration it does not own.
+        // declaration it does not own. It runs before the per-occurrence
+        // dedupe below: a suppressed warning must not consume the occurrence
+        // slot of the same diagnostic emitted later under `-Wsystem-headers`.
         if diag.severity == Severity::Warning
             && !self.warning_config.system_headers
             && diag
@@ -1129,6 +1134,7 @@ impl DiagnosticEngine {
         {
             return;
         }
+
         match diag.severity {
             Severity::Warning => {
                 if let Some(mut kind) = diag.warning_kind {
@@ -1747,6 +1753,8 @@ mod dialect_severity_redteam_tests {
             WarningKind::CompareDistinctPointerTypes,
             WarningKind::Pedantic,
             WarningKind::Vla,
+            WarningKind::DivByZero,
+            WarningKind::StrictPrototypes,
         ];
         let registered: HashSet<_> = WARNING_REGISTRY.iter().map(|entry| entry.kind).collect();
         let names: HashSet<_> = WARNING_REGISTRY.iter().map(|entry| entry.name).collect();
