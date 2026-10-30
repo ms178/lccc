@@ -1226,7 +1226,8 @@ impl Parser {
             // assertion is queued and emitted after the enclosing item, where
             // sema decides it like any other.
             if matches!(self.peek(), TokenKind::StaticAssert) {
-                let deferred = self.parse_static_assert();
+                let mut deferred = self.parse_static_assert();
+                deferred.deferred_member = true;
                 // Speculative parses (nested-function and cast lookahead)
                 // can parse one member list twice inside an item; the
                 // queue drains only between items, so the span identifies

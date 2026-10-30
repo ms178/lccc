@@ -177,4 +177,7 @@ if (( fail != 0 )); then
     echo "check_boot_size_measurement: FAILED" >&2
     exit 1
 fi
-echo "check_boot_size_measurement: PASS (code bytes by flag, ranking by delta)"
+# The same setup-size probes must not overwrite a real Kbuild's offsets.
+# Run the isolated staging regression in the existing local + hosted gate.
+bash "$repo_root/tests/regression/check_boot_offset_isolation.sh"
+echo "check_boot_size_measurement: PASS (code bytes, ranking, offset isolation)"

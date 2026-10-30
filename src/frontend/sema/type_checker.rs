@@ -546,7 +546,9 @@ impl<'a> ExprTypeChecker<'a> {
 
             // Statement expression: type of the last expression statement
             Expr::StmtExpr(compound, _) => {
-                if let Some(BlockItem::Statement(Stmt::Expr(Some(expr)))) = compound.items.last() {
+                if let Some(BlockItem::Statement(Stmt::Expr(Some(expr)))) =
+                    compound.syntactic_last_item()
+                {
                     // Nested statement expression: resolve it scope-threaded
                     // FIRST.  Plain inference of a not-yet-executed nested
                     // stmt-expr can "succeed" with a wrong fallback type
@@ -764,11 +766,11 @@ impl<'a> ExprTypeChecker<'a> {
             // preferring the scope cannot change its answer; where the scope holds
             // something else, that something else is what the name means.
             if let Some(sym) = self.symbols.lookup(name) {
-                if matches!(sym.ty, CType::Function(_)) {
-                    if let Some(ct) = Self::extract_return_ctype_from_type(&sym.ty) {
-                        return Some(ct);
-                    }
-                }
+                // A function-pointer object is also an ordinary-name binding:
+                // it must shadow a same-named file-scope function even when
+                // the latter has an incompatible return type. If the binding
+                // is not callable, do not fall back to the hidden function.
+                return Self::extract_return_ctype_from_type(&sym.ty);
             }
             // Check function signatures (external entities and implicit decls)
             if let Some(func_info) = self.functions.get(name.as_str()) {
@@ -777,10 +779,6 @@ impl<'a> ExprTypeChecker<'a> {
             // Check builtin return types
             if let Some(ct) = Self::builtin_return_ctype(name) {
                 return Some(ct);
-            }
-            // Check symbol table for function pointer variables
-            if let Some(sym) = self.symbols.lookup(name) {
-                return Self::extract_return_ctype_from_type(&sym.ty);
             }
         }
 
@@ -1793,7 +1791,7 @@ impl<'a> ExprTypeChecker<'a> {
         compound: &CompoundStmt,
         parent_scope: Option<&FxHashMap<String, CType>>,
     ) -> Option<CType> {
-        if let Some(BlockItem::Statement(Stmt::Expr(Some(expr)))) = compound.items.last() {
+        if let Some(BlockItem::Statement(Stmt::Expr(Some(expr)))) = compound.syntactic_last_item() {
             // Nested statement expression: build this compound's scope and
             // recurse with it as the parent so inner typeof()s can see
             // variables declared here.  Do this before plain inference for

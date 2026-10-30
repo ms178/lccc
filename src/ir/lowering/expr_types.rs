@@ -185,7 +185,7 @@ impl Lowerer {
             Expr::StmtExpr(compound, _) => {
                 if let Some(crate::frontend::parser::ast::BlockItem::Statement(
                     crate::frontend::parser::ast::Stmt::Expr(Some(inner_expr)),
-                )) = compound.items.last()
+                )) = compound.syntactic_last_item()
                 {
                     self.dynamic_struct_value_size(inner_expr)
                 } else {
@@ -296,7 +296,7 @@ impl Lowerer {
                 // Statement expression: recurse into the last expression statement
                 if let Some(crate::frontend::parser::ast::BlockItem::Statement(
                     crate::frontend::parser::ast::Stmt::Expr(Some(inner_expr)),
-                )) = compound.items.last()
+                )) = compound.syntactic_last_item()
                 {
                     if let Some(size) = self.struct_value_size(inner_expr) {
                         return Some(size);
@@ -1402,7 +1402,9 @@ impl Lowerer {
                 if let Some(ctype) = self.get_expr_ctype(expr) {
                     return IrType::from_ctype(&ctype);
                 }
-                if let Some(BlockItem::Statement(Stmt::Expr(Some(expr)))) = compound.items.last() {
+                if let Some(BlockItem::Statement(Stmt::Expr(Some(expr)))) =
+                    compound.syntactic_last_item()
+                {
                     return self.get_expr_type(expr);
                 }
                 target_int_ir_type()
@@ -2081,7 +2083,7 @@ impl Lowerer {
     /// Extract the value expression of a GNU statement expression by unwrapping
     /// top-level label wrappers around the final statement.
     fn stmt_expr_result_expr<'a>(&self, compound: &'a CompoundStmt) -> Option<&'a Expr> {
-        let stmt = match compound.items.last() {
+        let stmt = match compound.syntactic_last_item() {
             Some(BlockItem::Statement(stmt)) => stmt,
             _ => return None,
         };
@@ -2353,7 +2355,9 @@ impl Lowerer {
             // This handles nested stmt exprs like the kernel's cmpxchg macro where
             // the inner compound uses typeof() referencing outer compound variables.
             Expr::StmtExpr(compound, _) => {
-                if let Some(BlockItem::Statement(Stmt::Expr(Some(expr)))) = compound.items.last() {
+                if let Some(BlockItem::Statement(Stmt::Expr(Some(expr)))) =
+                    compound.syntactic_last_item()
+                {
                     // First try normal resolution
                     if let Some(ctype) = self.get_expr_ctype(expr) {
                         return Some(ctype);

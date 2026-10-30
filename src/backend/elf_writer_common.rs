@@ -2282,31 +2282,32 @@ impl<A: X86Arch> ElfWriterCore<A> {
         self.ensure_section()?;
         let sec_idx = self.current_section.ok_or("no active section for .org")?;
         let current = self.sections[sec_idx].cursor();
-        let target = if sym.is_empty() {
-            offset as u64
+        let base = if sym.is_empty() {
+            0
         } else if sym == "." {
-            // `.` is the location counter, so `.org . + 16` advances 16 bytes
-            // from wherever we currently are rather than seeking to absolute
-            // offset 16.  It is not a label, so it never appears in
-            // `label_positions` and previously fell through to an error.
-            (current as i64 + offset) as u64
+            // A relative position must advance; unlike a label target it
+            // cannot become valid after jump relaxation.
+            if offset < 0 {
+                return Err(".org: attempt to move .org backwards".into());
+            }
+            current
         } else if let Some(&(label_sec, label_off)) = self.label_positions.get(sym) {
-            if label_sec == sec_idx {
-                (label_off as i64 + offset) as u64
-            } else {
+            if label_sec != sec_idx {
                 return Err(format!(".org symbol {} not in current section", sym));
             }
+            label_off
         } else if let Some((label_sec, label_off)) =
             self.resolve_numeric_label(sym, current, sec_idx)
         {
-            if label_sec == sec_idx {
-                (label_off as i64 + offset) as u64
-            } else {
+            if label_sec != sec_idx {
                 return Err(format!(".org symbol {} not in current section", sym));
             }
+            label_off
         } else {
             return Err(format!(".org: unknown symbol {}", sym));
         };
+        let target = u64::try_from(i128::from(base) + i128::from(offset))
+            .map_err(|_| ".org: target outside section range".to_string())?;
         let padding = if target > current {
             (target - current) as usize
         } else {
@@ -2325,9 +2326,12 @@ impl<A: X86Arch> ElfWriterCore<A> {
             }
             self.charge_fill(padding)?;
         }
-        // Record .org marker for post-relaxation fixup (even when padding == 0,
-        // because code before it may shrink during jump relaxation)
-        if !sym.is_empty() {
+        // Absolute and label-based targets must be rechecked after relaxation:
+        // an initially backwards target may become valid when jumps shrink,
+        // and a target still backwards in the final layout is an error. A
+        // dot-relative target instead moves with its own position and its
+        // padding is already final.
+        if sym != "." {
             self.sections[sec_idx].align_markers.push(AlignMarker {
                 offset: current as usize,
                 padding,
@@ -3868,6 +3872,31 @@ impl<A: X86Arch> ElfWriterCore<A> {
         // (.eh_frame never had its `.align` padding fixed up otherwise).
         for sec_idx in 0..self.sections.len() {
             self.fixup_alignment_markers(sec_idx)?;
+        }
+
+        // Enforce GAS's no-backwards rule on the *final* layout. Checking
+        // during initial emission rejects valid fixed-size vector entries
+        // whose jumps have yet to relax; silently clamping at the end instead
+        // emits corrupt tables when an entry really does overrun its slot.
+        for (sec_idx, section) in self.sections.iter().enumerate() {
+            for marker in &section.align_markers {
+                if let AlignMarkerKind::Org { label, addend, .. } = &marker.kind {
+                    let base = if label.is_empty() {
+                        0
+                    } else if let Some(&(label_sec, label_off)) = self.label_positions.get(label) {
+                        if label_sec != sec_idx {
+                            return Err(format!(".org symbol {label} not in current section"));
+                        }
+                        label_off
+                    } else {
+                        return Err(format!(".org: unknown symbol {label}"));
+                    };
+                    let target = i128::from(base) + i128::from(*addend);
+                    if target < marker.offset as i128 {
+                        return Err(".org: attempt to move .org backwards".into());
+                    }
+                }
+            }
         }
 
         // Now that the tight buckets are final, recompute section header

@@ -421,11 +421,11 @@ gate "reg-off-sym-fold" fast \
 gate "array-bound-contract" fast \
     python3 scripts/check_array_bound_contract.py --lccc "$LCCC"
 
-# UB-exploitation invariant (E22): `-fno-strict-aliasing`, `-fwrapv` and
-# `-fno-strict-overflow` are tolerated because this optimizer exploits no
-# type-based aliasing or signed-overflow poison. That is a precondition, not
-# a property of the universe: the day such a concept lands in src/, the
-# tolerated spellings become silent miscompiles. The tripwire names them.
+# UB-exploitation source tripwire (E22): scan for specific TBAA/poison
+# spellings. This is not proof that the optimizer cannot exploit C undefined
+# behavior: range folds can do so without an IR poison flag. Signed `-fwrapv`
+# is implemented and `-fno-strict-overflow` implements its signed portion;
+# the umbrella's pointer-overflow semantics remain unaudited and diagnosed.
 gate "ub-exploitation-invariant" fast \
     python3 scripts/check_no_ub_exploitation.py --root src
 
@@ -866,6 +866,11 @@ gate "option-effect-ledger" fast \
         --lccc "$LCCC" --gcc "${GCC16:-gcc-16}"
 gate "attribute-diagnostics" fast \
     env GCC="${GCC16:-gcc-16}" python3 tests/regression/check_attribute_diagnostics.py
+# Kernel _calc_vm_trans selects an arm using an integer comparison. Check
+# C-width-aware diagnostics, live branches and GNU ?: against GCC in both
+# target modes; an untaken zero division must not become -Werror.
+gate "div-zero-constant-arms" fast \
+    env CCC="$LCCC" GCC="${GCC16:-gcc-16}" bash tests/regression/check_divzero_constant_arms.sh
 # Pointer-target qualifiers of implicit conversions (-Wdiscarded-qualifiers
 # and the multi-level incompatible-pointer-types errors), byte-for-byte
 # against required GCC 16.2, including all suppression and promotion variants.
@@ -2512,6 +2517,11 @@ gate "range-fold-branch" fast \
 # (`sort -n` reads a %+8d column as 0 and ordered the table by object name).
 gate "boot-size-measurement" fast \
     bash tests/regression/check_boot_size_measurement.sh
+
+# Fake-QEMU verdict controls: success, panic, missing markers/log and failed
+# process. This checks the harness only, not whether an actual kernel boots.
+gate "qemu-defconfig-smoke-verdict" fast \
+    bash tests/regression/check_qemu_defconfig_smoke.sh
 
 # Vector copy elimination.  The GP copy machinery declines every vector family
 # by construction (`is_xmm_family` keeps families 24..39 out of the GP reg_refs

@@ -2336,6 +2336,7 @@ impl Parser {
             cond: expr,
             message,
             span: assert_span,
+            deferred_member: false,
         }
     }
 }

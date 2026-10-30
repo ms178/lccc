@@ -1056,7 +1056,7 @@ impl Lowerer {
                 // produces packed struct data (e.g., ({ pfn_pte(...); }))
                 if let Some(crate::frontend::parser::ast::BlockItem::Statement(
                     crate::frontend::parser::ast::Stmt::Expr(Some(inner_expr)),
-                )) = compound.items.last()
+                )) = compound.syntactic_last_item()
                 {
                     return self.expr_produces_packed_struct_data(inner_expr);
                 }

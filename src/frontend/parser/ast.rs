@@ -26,6 +26,9 @@ pub struct StaticAssert {
     pub cond: Expr,
     pub message: Option<String>,
     pub span: Span,
+    /// Extracted from a struct/union member list for later semantic checking.
+    /// This synthetic block item is not a source-level trailing declaration.
+    pub deferred_member: bool,
 }
 
 /// Attributes that can be applied to function definitions via storage-class
@@ -1713,6 +1716,17 @@ pub struct CompoundStmt {
     pub local_labels: Vec<String>,
     /// True when synthesized by `if (init; cond)` or `switch (init; expr)` (C2y 6.8.5).
     pub is_synthetic_init_scope: bool,
+}
+
+impl CompoundStmt {
+    /// The syntactic tail of a statement expression. Member assertions may be
+    /// queued after the item that contained their struct definition; they must
+    /// still be checked, but must not erase that item's expression value.
+    pub fn syntactic_last_item(&self) -> Option<&BlockItem> {
+        self.items.iter().rev().find(
+            |item| !matches!(item, BlockItem::StaticAssert(assertion) if assertion.deferred_member),
+        )
+    }
 }
 
 /// Items within a block.

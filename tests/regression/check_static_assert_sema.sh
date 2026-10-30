@@ -33,6 +33,7 @@ negatives=(
     'void f(void) { { enum Small { SV = -5 }; } _Static_assert(TY(SA) == 1 && sizeof(enum Small) == 8, "scope"); }'
     'struct M { int x; _Static_assert(sizeof(struct S) == 3, "member"); };'
     'void f(void) { struct N { _Static_assert(_Alignof(struct S) == 1, "nested member"); int y; } n; (void)n; }'
+    'void f(void) { (void)({ sizeof(struct { _Static_assert(sizeof(int) == 99, "member in expression"); }); }); }'
 )
 for i in "${!negatives[@]}"; do
     src="$work/neg$i.c"

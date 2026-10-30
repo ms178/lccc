@@ -59,10 +59,6 @@ cd "$K"
 . "$SCRIPT_DIR/boot_flags.sh"
 # shellcheck source=boot_offsets.sh
 . "$SCRIPT_DIR/boot_offsets.sh"
-# A preceding full Kbuild may have replaced the setup-only zoffset.h with a
-# generated file that lacks the mixed-mode EFI symbols.  The setup harness is
-# deliberately stubbed, so restore deterministic immediates before header.S.
-ensure_boot_offset_stubs
 RMF="$LCCC_BOOT_CFLAGS"
 INC="$LCCC_BOOT_CPPFLAGS"
 # Extra flags for kconfigless staging (see boot_kconfigless_stage.sh): ways to
@@ -73,6 +69,11 @@ INC="$LCCC_BOOT_CPPFLAGS"
 EXTRA="${LCCC_BOOT_EXTRA:-}"
 
 mkdir -p "$OUT"
+# Never modify Kbuild's real generated offsets: the setup-only stubs belong to
+# a disposable private include directory, even if this probe is interrupted.
+header_stage=$(mktemp -d "$OUT/.boot-header.XXXXXX")
+trap 'rm -rf -- "$header_stage"' EXIT
+lccc_boot_stage_header "$header_stage"
 
 # ---- generated headers -----------------------------------------------------
 # cpustr.h (needs the mkcpustr host tool)
@@ -86,7 +87,9 @@ fi
 ASM_FILES=("${LCCC_BOOT_ASM_FILES[@]}")
 for f in "${ASM_FILES[@]}"; do
   echo "AS   $f.S"
-  "$LCCC" $INC $RMF $EXTRA -D__ASSEMBLY__ -c "arch/x86/boot/$f.S" -o "$OUT/$f.o"
+  source="arch/x86/boot/$f.S"
+  [[ $f != header ]] || source="$header_stage/header.S"
+  "$LCCC" $INC $RMF $EXTRA -D__ASSEMBLY__ -c "$source" -o "$OUT/$f.o"
 done
 
 # ---- compile the .c files --------------------------------------------------

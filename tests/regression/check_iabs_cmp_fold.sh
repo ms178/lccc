@@ -166,6 +166,20 @@ for opt in -O2 -O3; do
         echo "exec leg $opt -fwrapv: $out" >&2
         exit 1
     fi
+    # The kernel passes this umbrella rather than -fwrapv. Its signed part
+    # must use the same pass policy; the pointer part is still diagnosed.
+    "$CCC" $opt -fno-strict-overflow -DWRAPV_LEG=1 "$tmp/exec.c" -o "$tmp/exec_no_strict" 2>"$tmp/partial.err"
+    grep -q 'pointer-overflow semantics are not established' "$tmp/partial.err"
+    out=$("$tmp/exec_no_strict")
+    if [ "$out" != "OK" ]; then
+        echo "exec leg $opt -fno-strict-overflow: $out" >&2
+        exit 1
+    fi
 done
+if LCCC_STRICT_OPTIONS=1 "$CCC" -fno-strict-overflow -c "$tmp/shapes.c" -o "$tmp/strict.o" >"$tmp/strict.err" 2>&1; then
+    echo 'partial -fno-strict-overflow must fail a strict capability probe' >&2
+    exit 1
+fi
+grep -q 'only partially implemented' "$tmp/strict.err"
 
 echo "iabs-cmp-fold gate OK"

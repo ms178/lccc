@@ -618,24 +618,6 @@ fn parse_line_items(line: &str) -> Result<Vec<AsmItem>, String> {
         return Ok(items);
     }
 
-    // Check for GAS symbol assignment: symbol = expr (e.g., L4_PAGE_OFFSET = 42)
-    // This is equivalent to .set symbol, expr
-    if let Some(eq_pos) = rest.find('=') {
-        let before = rest[..eq_pos].trim();
-        // Make sure it looks like a symbol name (no spaces, not a register, not starting with special chars)
-        if !before.is_empty()
-            && !before.contains(' ')
-            && !before.contains('\t')
-            && !before.starts_with('$')
-            && !before.starts_with('%')
-            && (before.as_bytes()[0].is_ascii_alphabetic() || before.starts_with('_'))
-        {
-            let expr = rest[eq_pos + 1..].trim();
-            items.push(AsmItem::Set(before.to_string(), expr.to_string()));
-            return Ok(items);
-        }
-    }
-
     // Handle multiple labels on same line (e.g. "771: 999: .pushsection ...")
     let mut rest = rest;
     while let Some((label, remaining)) = try_parse_label(rest) {
@@ -646,6 +628,29 @@ fn parse_line_items(line: &str) -> Result<Vec<AsmItem>, String> {
     // If there's nothing after the labels, we're done
     if rest.is_empty() {
         return Ok(items);
+    }
+
+    // GAS location-counter assignment is an `.org` with zero fill, not a
+    // symbol definition. In particular Linux kexec's exception vectors use
+    // `. = base + (index * stride)` to enforce fixed entry positions.
+    if let Some(eq_pos) = rest.find('=') {
+        let before = rest[..eq_pos].trim();
+        let expr = rest[eq_pos + 1..].trim();
+        if before == "." {
+            items.push(parse_directive(&format!(".org {expr}"))?);
+            return Ok(items);
+        }
+        // Ordinary GAS symbol assignment is equivalent to `.set`.
+        if !before.is_empty()
+            && !before.contains(' ')
+            && !before.contains('\t')
+            && !before.starts_with('$')
+            && !before.starts_with('%')
+            && (before.as_bytes()[0].is_ascii_alphabetic() || before.starts_with('_'))
+        {
+            items.push(AsmItem::Set(before.to_string(), expr.to_string()));
+            return Ok(items);
+        }
     }
 
     // Parse the remaining content as a directive or instruction
@@ -883,6 +888,9 @@ fn parse_directive(line: &str) -> Result<AsmItem, String> {
                 ),
                 None => (args, 0u8),
             };
+            if args.is_empty() {
+                return Err("missing .org expression".to_string());
+            }
             if let Ok(val) = parse_integer_expr(args) {
                 Ok(AsmItem::Org(String::new(), val, fill))
             } else {

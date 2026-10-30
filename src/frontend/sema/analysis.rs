@@ -3402,9 +3402,9 @@ impl SemanticAnalyzer {
                 self.analyze_expr(lhs);
                 // `0 && x` and `1 || x` never evaluate `x`, and GCC's
                 // division verdict follows that (`u() && 1 / 0` still warns).
-                let short_circuited = match (op, Self::expr_int_value(lhs)) {
-                    (BinOp::LogicalAnd, Some(0)) => true,
-                    (BinOp::LogicalOr, Some(v)) if v != 0 => true,
+                let short_circuited = match op {
+                    BinOp::LogicalAnd => self.div_zero_constant_bool(lhs) == Some(false),
+                    BinOp::LogicalOr => self.div_zero_constant_bool(lhs) == Some(true),
                     _ => false,
                 };
                 if short_circuited {
@@ -3538,12 +3538,12 @@ impl SemanticAnalyzer {
             }
             Expr::Conditional(cond, then_expr, else_expr, span) => {
                 self.analyze_expr(cond);
-                match Self::expr_int_value(cond) {
-                    Some(0) => {
+                match self.div_zero_constant_bool(cond) {
+                    Some(false) => {
                         self.analyze_unevaluated_by_constant(then_expr);
                         self.analyze_expr(else_expr);
                     }
-                    Some(_) => {
+                    Some(true) => {
                         self.analyze_expr(then_expr);
                         self.analyze_unevaluated_by_constant(else_expr);
                     }
@@ -3558,7 +3558,11 @@ impl SemanticAnalyzer {
             }
             Expr::GnuConditional(cond, else_expr, span) => {
                 self.analyze_expr(cond);
-                self.analyze_expr(else_expr);
+                if self.div_zero_constant_bool(cond) == Some(true) {
+                    self.analyze_unevaluated_by_constant(else_expr);
+                } else {
+                    self.analyze_expr(else_expr);
+                }
                 // `a ?: b` is `a ? a : b` with `a` evaluated once.
                 self.check_scalar_condition(cond);
                 self.check_conditional_arms(cond, else_expr, *span);
@@ -5473,7 +5477,7 @@ impl SemanticAnalyzer {
                 if under_ext_vector {
                     return true;
                 }
-                match compound.items.last() {
+                match compound.syntactic_last_item() {
                     Some(BlockItem::Statement(Stmt::Expr(Some(tail)))) => {
                         self.is_known_rvalue(tail, false)
                     }
@@ -8313,13 +8317,34 @@ dereference it before applying '->' to it?"
         Some(self.gcc_pointer_type_text(&base, base_const, base_volatile, &levels))
     }
 
-    /// An integer constant spelled as an expression, for byte-offset folding.
-    /// The signed value GCC 16.2's read-only printer folds in an index or
-    /// offset (measured): integer literals, a leading unary `-`, and
-    /// arithmetic whose leaves are all literals (`1+0` -> `1`, `2*2` ->
-    /// `4`, `1-3` -> `-2`). Identifiers never fold, even when declared
-    /// `const` (`a[N]` keeps its source), and division keeps integer
-    /// semantics with a zero divisor refusing the fold.
+    /// Decide a syntactic integer constant with the shared C type-aware
+    /// evaluator. Do not use the printer's untyped i64 literal folder: e.g.
+    /// `0u - 1u < 1u` is false, not true. Nor may a folded ordinary `const`
+    /// object quiet this syntactic warning. ICE checking enforces that rule;
+    /// disabling the generic value cache also prevents such values leaking in.
+    fn div_zero_constant_bool(&self, expr: &Expr) -> Option<bool> {
+        match expr {
+            Expr::IntLiteral(v, _) | Expr::LongLiteral(v, _) | Expr::LongLongLiteral(v, _) => {
+                return Some(*v != 0);
+            }
+            Expr::UIntLiteral(v, _) | Expr::ULongLiteral(v, _) | Expr::ULongLongLiteral(v, _) => {
+                return Some(*v != 0);
+            }
+            _ => {}
+        }
+        if !self.is_integer_constant_expr(expr) {
+            return None;
+        }
+        SemaConstEval {
+            const_values: None,
+            named_constants_only: true,
+            ..self.sema_const_eval()
+        }
+        .eval_required_constant(expr)
+        .and_then(|v| v.to_i128())
+        .map(|v| v != 0)
+    }
+
     /// `-Wdiv-by-zero`: a constant zero divisor in an *integer* division or
     /// remainder. GCC diagnoses exactly that case -- a floating-point divisor
     /// of zero is IEEE arithmetic, and a runtime zero is not visible here --
@@ -8335,7 +8360,7 @@ dereference it before applying '->' to it?"
             .expr_type_checker()
             .infer_expr_ctype(lhs)
             .is_some_and(|ty| ty.is_floating());
-        if is_floating || Self::expr_int_value(rhs) != Some(0) {
+        if is_floating || self.div_zero_constant_bool(rhs) != Some(false) {
             return;
         }
         self.diagnostics.borrow_mut().warning_with_kind(
@@ -8345,6 +8370,9 @@ dereference it before applying '->' to it?"
         );
     }
 
+    /// Literal-only signed folder for diagnostic source rendering. This does
+    /// not implement C's usual arithmetic conversions; do not use it to
+    /// decide whether evaluation or diagnostics can be skipped.
     fn expr_int_value(expr: &Expr) -> Option<i64> {
         match expr {
             Expr::IntLiteral(v, _) => Some(*v),
