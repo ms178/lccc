@@ -986,7 +986,6 @@ impl InlineAsmEmitter for X86Codegen {
         }
     }
 
-
     fn reset_scratch_state(&mut self) {
         self.asm_scratch_idx = 0;
         self.asm_xmm_scratch_idx = 0;
