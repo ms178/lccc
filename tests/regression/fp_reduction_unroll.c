@@ -7,19 +7,22 @@
  * order is byte-identical); every check below is chosen so a reassociated or
  * vectorized rewrite changes the answer.
  *
- *   * `assoc_seq` sums values whose exact order matters: 1e8 then -1e8 twice
- *     leaves 0.0 in order and 0.0... no: it leaves 1.0 in order, because
- *     (1 + 1e8) - 1e8 = 0 while the tail 1.0 is consumed later.  Any tree
- *     reassociation lands on a different value.
+ *   * `assoc_seq` sums values whose exact order matters: the repeating
+ *     1.0, 1e8, -1e8 triple evaluates to 0.0 in source order (the leading
+ *     1.0 is swallowed when it meets 1e8) and the array ends on its own
+ *     1.0, so the answer is 1.0.  Any tree that pairs 1e8 with -1e8 first
+ *     keeps every 1.0 and lands on 22.0 instead.
  *   * `num_tail_*` use trips that are NOT multiples of the unroll factor, so a
  *     transform that assumed divisibility would drop or double the tail.
- *   * `num_dynamic` keeps a runtime bound: it must stay rolled and stay exact.
+ *   * `num_dynamic` is called with a runtime bound (stays rolled) and with
+ *     a literal (may specialize to a constant trip); either way the answer
+ *     must stay exact.
  *   * `num_dot_serial` is the multiply-accumulate chain (dot product), the
  *     second shape the reduction unroller admits.
  *
- * The reference value is computed here by a `volatile`-driven sequential loop,
- * so the two computations share one source and one compiler; only the loop
- * shape differs.
+ * The reference values are computed here by plain sequential loops (the
+ * association payload reads a `volatile` array), so both computations share
+ * one source and one compiler; only the loop shape differs.
  */
 #include <stdio.h>
 
@@ -102,16 +105,24 @@ static void check_u32(const char *what, unsigned got, unsigned want) {
     }
 }
 
+static void check_u64(const char *what, unsigned long long got,
+                      unsigned long long want) {
+    if (got != want) {
+        printf("FAIL %s: got %016llx want %016llx\n", what, got, want);
+        fail = 1;
+    }
+}
+
 static int bits32(float f) {
     union { float f; unsigned u; } v;
     v.f = f;
     return (int)v.u;
 }
 
-static int bits64(double d) {
+static unsigned long long bits64(double d) {
     union { double d; unsigned long long u; } v;
     v.d = d;
-    return (int)(v.u >> 32) ^ (int)v.u;
+    return v.u;
 }
 
 int main(void) {
@@ -135,10 +146,6 @@ int main(void) {
         float s = 0.0f;
         for (int i = 0; i < 64; ++i)
             s += fseq_src[i];
-        for (int i = 0; i < 64; ++i) {
-            float one = fseq_src[i];
-            (void)one;
-        }
         printf("%08x\n", (unsigned)bits32(s));
         check_u32("serial_f32_assoc", (unsigned)bits32(num_serial_f32((const float *)fseq_src, 64)),
                   (unsigned)bits32(s));
@@ -147,9 +154,9 @@ int main(void) {
         double s = 0.0;
         for (int i = 0; i < 64; ++i)
             s += dseq_src[i];
-        printf("%08x\n", (unsigned)bits64(s));
-        check_u32("serial_f64_assoc", (unsigned)bits64(num_serial_f64((const double *)dseq_src, 64)),
-                  (unsigned)bits64(s));
+        printf("%016llx\n", bits64(s));
+        check_u64("serial_f64_assoc", bits64(num_serial_f64((const double *)dseq_src, 64)),
+                  bits64(s));
     }
 
     /* 2. Plain in-order sums over the full array, divisible trip. */
@@ -164,8 +171,8 @@ int main(void) {
         double s = 0.0;
         for (int i = 0; i < N; ++i)
             s += da[i];
-        check_u32("serial_f64", (unsigned)bits64(num_serial_f64(da, N)), (unsigned)bits64(s));
-        printf("%08x\n", (unsigned)bits64(s));
+        check_u64("serial_f64", bits64(num_serial_f64(da, N)), bits64(s));
+        printf("%016llx\n", bits64(s));
     }
     {
         float s = 0.0f;
@@ -193,7 +200,7 @@ int main(void) {
         double g = 0.0;
         for (int i = 0; i < N; ++i)
             g += da[i];
-        check_u32("sum_lit_f64", (unsigned)bits64(sum_lit_f64(da)), (unsigned)bits64(g));
+        check_u64("sum_lit_f64", bits64(sum_lit_f64(da)), bits64(g));
     }
 
     /* 3. Tails: every trip residue modulo 8 around the full array. */
@@ -206,8 +213,7 @@ int main(void) {
         double d = 0.0;
         for (int i = 0; i < n; ++i)
             d += da[i];
-        check_u32("serial_f64_tail", (unsigned)bits64(num_serial_f64(da, n)),
-                  (unsigned)bits64(d));
+        check_u64("serial_f64_tail", bits64(num_serial_f64(da, n)), bits64(d));
     }
 
     /* 4. Runtime bound, including the empty and single-element trips. */
