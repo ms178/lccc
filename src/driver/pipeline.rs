@@ -2411,12 +2411,28 @@ impl Driver {
         // width above and is reset per TU like every other target cell.
         {
             let isa = self.x86_isa();
-            let bytes = if self.target != Target::X86_64 || !isa.simd || self.opt_level == 0 {
+            // i686 participates at the SSE2 ceiling: the default -m32
+            // baseline (`-march=x86-64` minus the x86-64 bit) has SSE2, and
+            // `resolved_i686_sse2` denies it for pre-SSE -march rows and the
+            // -mno-sse* spellings, exactly like the rest of the i686 SIMD
+            // permissions.  The ceiling stops at 16 bytes: the i686 Vec*
+            // emitters cover the 128-bit image, while 256-bit packed
+            // lowering (and the optimizer's vectorizer permission below)
+            // stays x86-64-only, so 32-byte shapes keep their per-lane
+            // scalar fallback on -m32.  The -O0 contract is unchanged: the
+            // scalar form remains the differential oracle of the packed path.
+            let bytes = if self.opt_level == 0 {
                 0
-            } else if isa.ymm {
-                32
-            } else {
+            } else if self.target == Target::X86_64 && isa.simd {
+                if isa.ymm {
+                    32
+                } else {
+                    16
+                }
+            } else if self.target == Target::I686 && self.resolved_i686_sse2() {
                 16
+            } else {
+                0
             };
             crate::common::types::set_target_vector_lowering_bytes(bytes);
             crate::passes::vectorize::set_x86_simd_isa(

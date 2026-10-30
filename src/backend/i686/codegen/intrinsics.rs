@@ -1572,36 +1572,244 @@ impl I686Codegen {
                 }
             }
 
+            // ── GNU vector-extension families (value-form, slot-homed) ────
+            //
+            // Emitted by the frontend's whole-vector lowering once
+            // `target_vector_lowering_bytes` publishes the i686 SSE2 ceiling
+            // (pipeline.rs).  128-bit images only: 32-byte shapes keep the
+            // per-lane scalar fallback (`simd_shape` refuses them at ceiling
+            // 16), and the optimizer's vectorizer permission stays x86-64.
+            IntrinsicOp::VecAddF64x2 => {
+                self.emit_vec_binop_i686(dest.clone(), args, "addpd", 8);
+            }
+            IntrinsicOp::VecSubF64x2 => {
+                self.emit_vec_binop_i686(dest.clone(), args, "subpd", 8);
+            }
+            IntrinsicOp::VecMulF64x2 => {
+                self.emit_vec_binop_i686(dest.clone(), args, "mulpd", 8);
+            }
+            IntrinsicOp::VecDivF64x2 => {
+                self.emit_vec_binop_i686(dest.clone(), args, "divpd", 8);
+            }
+            IntrinsicOp::VecXorF64x2 => {
+                self.emit_vec_binop_i686(dest.clone(), args, "xorpd", 8);
+            }
+            IntrinsicOp::VecAddF32x4 => {
+                self.emit_vec_binop_i686(dest.clone(), args, "addps", 4);
+            }
+            IntrinsicOp::VecSubF32x4 => {
+                self.emit_vec_binop_i686(dest.clone(), args, "subps", 4);
+            }
+            IntrinsicOp::VecMulF32x4 => {
+                self.emit_vec_binop_i686(dest.clone(), args, "mulps", 4);
+            }
+            IntrinsicOp::VecDivF32x4 => {
+                self.emit_vec_binop_i686(dest.clone(), args, "divps", 4);
+            }
+            IntrinsicOp::VecXorF32x4 => {
+                self.emit_vec_binop_i686(dest.clone(), args, "xorps", 4);
+            }
+            IntrinsicOp::VecAddI32x4 => {
+                self.emit_vec_binop_i686(dest.clone(), args, "paddd", 4);
+            }
+            IntrinsicOp::VecSubI32x4 => {
+                self.emit_vec_binop_i686(dest.clone(), args, "psubd", 4);
+            }
+            IntrinsicOp::VecAndI32x4 => {
+                self.emit_vec_binop_i686(dest.clone(), args, "pand", 4);
+            }
+            IntrinsicOp::VecOrI32x4 => {
+                self.emit_vec_binop_i686(dest.clone(), args, "por", 4);
+            }
+            IntrinsicOp::VecXorI32x4 => {
+                self.emit_vec_binop_i686(dest.clone(), args, "pxor", 4);
+            }
+            IntrinsicOp::VecMulI32x4 => {
+                // SSE2 baseline: the bit-identical pmuludq pair (pmulld is
+                // SSE4.1).  Same lane math as X86Codegen::emit_int_mul_i32x4.
+                let d = dest.clone().expect("i686 VecMulI32x4: value form expected");
+                assert!(args.len() >= 2, "i686 VecMulI32x4: malformed args");
+                self.vec_load_image(&args[1], "xmm1");
+                self.vec_load_image(&args[0], "xmm0");
+                self.state.emit("    pshufd $0xf5, %xmm0, %xmm2");
+                self.state.emit("    pmuludq %xmm1, %xmm0");
+                self.state.emit("    pshufd $0xf5, %xmm1, %xmm1");
+                self.state.emit("    pmuludq %xmm1, %xmm2");
+                self.state.emit("    pshufd $0x08, %xmm0, %xmm0");
+                self.state.emit("    pshufd $0x08, %xmm2, %xmm2");
+                self.state.emit("    punpckldq %xmm2, %xmm0");
+                self.vec_store_result(&d, "xmm0");
+            }
+            IntrinsicOp::VecAddI64x2 => {
+                self.emit_vec_binop_i686(dest.clone(), args, "paddq", 8);
+            }
+            IntrinsicOp::VecSubI64x2 => {
+                self.emit_vec_binop_i686(dest.clone(), args, "psubq", 8);
+            }
+            IntrinsicOp::VecAndI64x2 => {
+                self.emit_vec_binop_i686(dest.clone(), args, "pand", 8);
+            }
+            IntrinsicOp::VecOrI64x2 => {
+                self.emit_vec_binop_i686(dest.clone(), args, "por", 8);
+            }
+            IntrinsicOp::VecXorI64x2 => {
+                self.emit_vec_binop_i686(dest.clone(), args, "pxor", 8);
+            }
+            IntrinsicOp::VecAddI16x8 => {
+                self.emit_vec_binop_i686(dest.clone(), args, "paddw", 2);
+            }
+            IntrinsicOp::VecSubI16x8 => {
+                self.emit_vec_binop_i686(dest.clone(), args, "psubw", 2);
+            }
+            IntrinsicOp::VecMulI16x8 => {
+                self.emit_vec_binop_i686(dest.clone(), args, "pmullw", 2);
+            }
+            IntrinsicOp::VecAndI16x8 => {
+                self.emit_vec_binop_i686(dest.clone(), args, "pand", 2);
+            }
+            IntrinsicOp::VecOrI16x8 => {
+                self.emit_vec_binop_i686(dest.clone(), args, "por", 2);
+            }
+            IntrinsicOp::VecXorI16x8 => {
+                self.emit_vec_binop_i686(dest.clone(), args, "pxor", 2);
+            }
+            IntrinsicOp::VecAddI8x16 => {
+                self.emit_vec_binop_i686(dest.clone(), args, "paddb", 1);
+            }
+            IntrinsicOp::VecSubI8x16 => {
+                self.emit_vec_binop_i686(dest.clone(), args, "psubb", 1);
+            }
+            IntrinsicOp::VecAndI8x16 => {
+                self.emit_vec_binop_i686(dest.clone(), args, "pand", 1);
+            }
+            IntrinsicOp::VecOrI8x16 => {
+                self.emit_vec_binop_i686(dest.clone(), args, "por", 1);
+            }
+            IntrinsicOp::VecXorI8x16 => {
+                self.emit_vec_binop_i686(dest.clone(), args, "pxor", 1);
+            }
+            // Uniform-constant shifts: the frontend only emits in-range
+            // immediates (0..lane_bits); 0 copies the image.
+            IntrinsicOp::VecShlI16x8 => {
+                self.emit_vec_shift_i686(dest.clone(), args, "psllw", 16);
+            }
+            IntrinsicOp::VecLShrI16x8 => {
+                self.emit_vec_shift_i686(dest.clone(), args, "psrlw", 16);
+            }
+            IntrinsicOp::VecAShrI16x8 => {
+                self.emit_vec_shift_i686(dest.clone(), args, "psraw", 16);
+            }
+            IntrinsicOp::VecShlI32x4 => {
+                self.emit_vec_shift_i686(dest.clone(), args, "pslld", 32);
+            }
+            IntrinsicOp::VecLShrI32x4 => {
+                self.emit_vec_shift_i686(dest.clone(), args, "psrld", 32);
+            }
+            IntrinsicOp::VecAShrI32x4 => {
+                self.emit_vec_shift_i686(dest.clone(), args, "psrad", 32);
+            }
+            IntrinsicOp::VecShlI64x2 => {
+                self.emit_vec_shift_i686(dest.clone(), args, "psllq", 64);
+            }
+            IntrinsicOp::VecLShrI64x2 => {
+                self.emit_vec_shift_i686(dest.clone(), args, "psrlq", 64);
+            }
+            // Packed compares (the frontend's (x, y, pred) form; 64-bit
+            // integer lanes never reach packed lowering at the 16-byte
+            // ceiling — see try_lower_vector_cmp_simd).
+            IntrinsicOp::VecCmpI8x16 => {
+                self.emit_vec_cmp_int_i686(dest.clone(), args, "b", 1);
+            }
+            IntrinsicOp::VecCmpI16x8 => {
+                self.emit_vec_cmp_int_i686(dest.clone(), args, "w", 2);
+            }
+            IntrinsicOp::VecCmpI32x4 => {
+                self.emit_vec_cmp_int_i686(dest.clone(), args, "d", 4);
+            }
+            IntrinsicOp::VecCmpF32x4 => {
+                self.emit_vec_cmp_fp_i686(dest.clone(), args, "cmpps");
+            }
+            IntrinsicOp::VecCmpF64x2 => {
+                self.emit_vec_cmp_fp_i686(dest.clone(), args, "cmppd");
+            }
+            // Broadcasts / zeros (the family table's zero ops and the
+            // halfword/byte families that spell zero as a broadcast).
+            IntrinsicOp::VecBroadcastI8x16 => {
+                let d = dest.clone().expect("i686 VecBroadcast: value form expected");
+                self.vec_splat_operand(&args[0], 1, "xmm0");
+                self.vec_store_result(&d, "xmm0");
+            }
+            IntrinsicOp::VecBroadcastI16x8 => {
+                let d = dest.clone().expect("i686 VecBroadcast: value form expected");
+                self.vec_splat_operand(&args[0], 2, "xmm0");
+                self.vec_store_result(&d, "xmm0");
+            }
+            IntrinsicOp::VecBroadcastI32x4 => {
+                let d = dest.clone().expect("i686 VecBroadcast: value form expected");
+                self.vec_splat_operand(&args[0], 4, "xmm0");
+                self.vec_store_result(&d, "xmm0");
+            }
+            IntrinsicOp::VecBroadcastI64x2 => {
+                let d = dest.clone().expect("i686 VecBroadcast: value form expected");
+                self.vec_splat_operand(&args[0], 8, "xmm0");
+                self.vec_store_result(&d, "xmm0");
+            }
+            IntrinsicOp::VecBroadcastF32x4 => {
+                let d = dest.clone().expect("i686 VecBroadcast: value form expected");
+                self.vec_splat_operand(&args[0], 4, "xmm0");
+                self.vec_store_result(&d, "xmm0");
+            }
+            IntrinsicOp::VecBroadcastF64x2 => {
+                let d = dest.clone().expect("i686 VecBroadcast: value form expected");
+                self.vec_splat_operand(&args[0], 8, "xmm0");
+                self.vec_store_result(&d, "xmm0");
+            }
+            IntrinsicOp::VecZeroI32x4
+            | IntrinsicOp::VecZeroI64x2
+            | IntrinsicOp::VecZeroF32x4
+            | IntrinsicOp::VecZeroF64x2 => {
+                // All-zero bits are +0.0 in both FP domains (the zero
+                // families take no operand; -0.0 goes through xorps).
+                let d = dest.clone().expect("i686 VecZero: value form expected");
+                self.state.emit("    pxor %xmm0, %xmm0");
+                self.vec_store_result(&d, "xmm0");
+            }
+            // Whole-object endpoints.
+            IntrinsicOp::VecLoadI8x16
+            | IntrinsicOp::VecLoadI16x8
+            | IntrinsicOp::VecLoadI32x4
+            | IntrinsicOp::VecLoadI64x2
+            | IntrinsicOp::VecLoadF32x4
+            | IntrinsicOp::VecLoadF64x2 => {
+                self.emit_vec_load_i686(dest.clone(), args);
+            }
+            IntrinsicOp::VecStoreI8x16
+            | IntrinsicOp::VecStoreI16x8
+            | IntrinsicOp::VecStoreI32x4
+            | IntrinsicOp::VecStoreI64x2
+            | IntrinsicOp::VecStoreF32x4
+            | IntrinsicOp::VecStoreF64x2 => {
+                self.emit_vec_store_i686(dest_ptr.clone(), args);
+            }
+
             // Register-based vector intrinsics (x86-64-specific, not implemented for i686)
             IntrinsicOp::VecLoadF64x4
-            | IntrinsicOp::VecLoadF64x2
             | IntrinsicOp::VecLoadI32x8
             | IntrinsicOp::VecLoadStrided2I32x8
             | IntrinsicOp::VecLoadStrided2I32x4
             | IntrinsicOp::VecLoadStrided2CompactI32x4
-            | IntrinsicOp::VecLoadI32x4
             | IntrinsicOp::VecAddF64x4
-            | IntrinsicOp::VecAddF64x2
             | IntrinsicOp::VecMulF64x4
-            | IntrinsicOp::VecMulF64x2
             | IntrinsicOp::VecAddI32x8
-            | IntrinsicOp::VecAddI32x4
             | IntrinsicOp::VecHorizontalAddF64x4
             | IntrinsicOp::VecHorizontalAddF64x2
             | IntrinsicOp::VecHorizontalAddI32x8
             | IntrinsicOp::VecHorizontalAddI32x4
             | IntrinsicOp::VecZeroF64x4
-            | IntrinsicOp::VecZeroF64x2
             | IntrinsicOp::VecZeroI32x8
-            | IntrinsicOp::VecZeroI32x4
             | IntrinsicOp::VecLoadWidenI32ToI64x2
-            | IntrinsicOp::VecAddI64x2
             | IntrinsicOp::VecMulI64x2
             | IntrinsicOp::VecHorizontalAddI64x2
-            | IntrinsicOp::VecZeroI64x2
-            | IntrinsicOp::VecMulI32x4
-            | IntrinsicOp::VecBroadcastI32x4
-            | IntrinsicOp::VecStoreI32x4
             | IntrinsicOp::VecSadalpI32x4
             | IntrinsicOp::VecSmlalLoI32x4
             | IntrinsicOp::VecSmlalHiI32x4 => {
@@ -2637,6 +2845,329 @@ impl I686Codegen {
                 self.state.emit_fmt(format_args!("    movd %eax, %{}", xmm));
             }
         }
+    }
+
+    // ── GNU vector-extension (Vec*) emission: value-form, slot-homed ────────
+    //
+    // The frontend's whole-vector lowering (`target_vector_lowering_bytes`,
+    // published for i686 at the SSE2 ceiling from `resolved_i686_sse2`) emits
+    // the `Vec*` families with `dest: Some(value)` — a register-image VALUE.
+    // x86-64 homes those images in XMM registers; i686 has no XMM class in
+    // the register allocator, so every value lives in a stack slot.  These
+    // helpers move the 16-byte image through %xmm0/%xmm1 (plus %xmm2 as the
+    // compare/unsigned-bias scratch) against the slots directly.  Scalar
+    // lane constants on image operands (the frontend's all-ones identities
+    // and -0.0 sign masks) are splatted per lane width.
+
+    /// Full 16-byte image of a vector VALUE into `%reg`, straight from its
+    /// stack slot (MOVUPS: homes are only 8-aligned).
+    fn vec_load_image(&mut self, arg: &Operand, reg: &'static str) {
+        let Operand::Value(v) = arg else {
+            panic!("i686 Vec op: image operand must be a value, got {:?}", arg);
+        };
+        let slot = self
+            .state
+            .get_slot(v.0)
+            .unwrap_or_else(|| panic!("i686 Vec op: value %{} has no stack slot", v.0));
+        let sr = self.slot_ref(slot);
+        self.state
+            .emit_fmt(format_args!("    movups {}, %{}", sr, reg));
+    }
+
+    /// Write `%reg` back as the image of the destination VALUE's slot.
+    fn vec_store_result(&mut self, dest: &Value, reg: &'static str) {
+        let slot = self
+            .state
+            .get_slot(dest.0)
+            .unwrap_or_else(|| panic!("i686 Vec op: dest %{} has no stack slot", dest.0));
+        let sr = self.slot_ref(slot);
+        self.state
+            .emit_fmt(format_args!("    movups %{}, {}", reg, sr));
+    }
+
+    /// Splat a lane-typed operand (constant or scalar value) of `lane`-byte
+    /// lanes into the full 16-byte image of `%reg`.
+    fn vec_splat_operand(&mut self, arg: &Operand, lane: u8, reg: &'static str) {
+        // Stage the lane's bit pattern in %eax (32-bit staging; qwords go
+        // staging covers every lane width; FP constants go through their
+        // bit pattern identically — the splat moves bits, not numbers).
+        match arg {
+            Operand::Const(c) => match c {
+                IrConst::F32(f) => {
+                    self.state
+                        .emit_fmt(format_args!("    movl ${:#x}, %eax", f.to_bits()));
+                }
+                IrConst::F64(f) if lane != 8 => {
+                    // lane-4 bit staging of an F64 spelling (only the low
+                    // dword can matter for a 4-byte splat): eax pattern.
+                    self.state
+                        .emit_fmt(format_args!("    movl ${:#x}, %eax", f.to_bits() as u32));
+                }
+                IrConst::F64(f) => {
+                    let bits = f.to_bits();
+                    self.state
+                        .emit_fmt(format_args!("    pushl ${}", ((bits >> 32) as u32) as i32));
+                    self.state
+                        .emit_fmt(format_args!("    pushl ${}", bits as u32));
+                    self.state
+                        .emit_fmt(format_args!("    movsd (%esp), %{}", reg));
+                    self.state.emit("    addl $8, %esp");
+                    self.state
+                        .emit_fmt(format_args!("    punpcklqdq %{}, %{}", reg, reg));
+                    return;
+                }
+                other => {
+                    let v = other.to_i64().unwrap_or(0);
+                    if lane == 8 {
+                        // i686: no %rax — stage through the stack exactly
+                        // like the scalar F64 constant helper does.
+                        let pat = v as u64;
+                        self.state
+                            .emit_fmt(format_args!("    pushl ${}", ((pat >> 32) as u32) as i32));
+                        self.state
+                            .emit_fmt(format_args!("    pushl ${}", pat as u32));
+                        self.state
+                            .emit_fmt(format_args!("    movsd (%esp), %{}", reg));
+                        self.state.emit("    addl $8, %esp");
+                        self.state
+                            .emit_fmt(format_args!("    punpcklqdq %{}, %{}", reg, reg));
+                        return;
+                    }
+                    let pat = match lane {
+                        1 => (v as u64) & 0xff,
+                        2 => (v as u64) & 0xffff,
+                        _ => (v as u64) & 0xffff_ffff,
+                    };
+                    self.state
+                        .emit_fmt(format_args!("    movl ${:#x}, %eax", pat as u32));
+                }
+            },
+            Operand::Value(_) => match lane {
+                // Slotless scalars are real (folds, register-homed params):
+                // the scalar xmm staging helpers already fall back to
+                // `operand_to_eax`, and their slot loads copy the bits
+                // verbatim — integer dword lanes take the same path (the
+                // splat only reads the low lane of the staged pattern).
+                8 => {
+                    self.emit_f64_scalar_bits_to_xmm(arg, reg);
+                    self.state
+                        .emit_fmt(format_args!("    punpcklqdq %{}, %{}", reg, reg));
+                    return;
+                }
+                4 => {
+                    self.emit_f32_scalar_bits_to_xmm(arg, reg);
+                    self.state
+                        .emit_fmt(format_args!("    pshufd $0x00, %{}, %{}", reg, reg));
+                    return;
+                }
+                1 | 2 => {
+                    self.operand_to_eax(arg);
+                    // Zero-extend: the slot/reg source may carry junk above
+                    // the lane, and every replication step below reads it.
+                    if lane == 1 {
+                        self.state.emit("    movzbl %al, %eax");
+                    } else {
+                        self.state.emit("    movzwl %ax, %eax");
+                    }
+                    self.state
+                        .emit_fmt(format_args!("    movd %eax, %{}", reg));
+                }
+                _ => unreachable!("i686 Vec splat: lane {} unsupported", lane),
+            },
+        }
+        // Lane 8 returned from its staging branches above (32-bit mode has
+        // no %rax; every qword path stages through %xmm directly).  The
+        // dword/word/byte replication below reads ONLY the well-defined low
+        // lane of the staged pattern (the const paths mask, the value paths
+        // zero-extend), so each interleave doubles the replicated prefix:
+        // byte = movd + punpcklbw x4 (1 -> 2 -> 4 -> 8 -> 16), word = movd +
+        // punpcklwd x2 (1 -> 2 -> 4 -> 8 words), dword = one pshufd.
+        match lane {
+            8 => unreachable!("i686 Vec splat: qword staging returns early"),
+            4 => {
+                self.state
+                    .emit_fmt(format_args!("    movd %eax, %{}", reg));
+                self.state
+                    .emit_fmt(format_args!("    pshufd $0x00, %{}, %{}", reg, reg));
+            }
+            2 => {
+                self.state
+                    .emit_fmt(format_args!("    movd %eax, %{}", reg));
+                // 1 -> 2 -> 4 -> 8 replicated words (each interleave doubles
+                // the replicated prefix out of the low 64 bits).
+                for _ in 0..3 {
+                    self.state
+                        .emit_fmt(format_args!("    punpcklwd %{}, %{}", reg, reg));
+                }
+            }
+            _ => {
+                self.state
+                    .emit_fmt(format_args!("    movd %eax, %{}", reg));
+                for _ in 0..4 {
+                    self.state
+                        .emit_fmt(format_args!("    punpcklbw %{}, %{}", reg, reg));
+                }
+            }
+        }
+    }
+
+    /// Two-image packed binop: `%xmm0 = a <inst> b`, written back to the
+    /// destination value's slot.  `args[1]` may be the frontend's lane
+    /// constant (all-ones / -0.0 identities); `args[0]` is always an image.
+    fn emit_vec_binop_i686(
+        &mut self,
+        dest: Option<Value>,
+        args: &[Operand],
+        inst: &'static str,
+        lane: u8,
+    ) {
+        let d = dest.expect("i686 Vec binop: value form expected");
+        assert!(args.len() >= 2, "i686 Vec binop {}: malformed args", inst);
+        self.vec_load_image(&args[0], "xmm0");
+        match &args[1] {
+            Operand::Value(_) => self.vec_load_image(&args[1], "xmm1"),
+            Operand::Const(_) => self.vec_splat_operand(&args[1], lane, "xmm1"),
+        }
+        self.state
+            .emit_fmt(format_args!("    {} %xmm1, %xmm0", inst));
+        self.vec_store_result(&d, "xmm0");
+    }
+
+    /// Immediate-shift packed op: constant amount in `args[1]`; amount 0 is
+    /// the identity (the frontend admits `0..lane_bits`, so copy the image).
+    fn emit_vec_shift_i686(
+        &mut self,
+        dest: Option<Value>,
+        args: &[Operand],
+        inst: &'static str,
+        lane_bits: i64,
+    ) {
+        let d = dest.expect("i686 Vec shift: value form expected");
+        assert!(args.len() == 2, "i686 Vec shift {}: malformed args", inst);
+        let amount = Self::operand_to_imm_i64(&args[1]);
+        assert!(
+            (0..lane_bits).contains(&amount),
+            "i686 Vec shift {}: amount {} outside 0..{}",
+            inst,
+            amount,
+            lane_bits
+        );
+        self.vec_load_image(&args[0], "xmm0");
+        if amount != 0 {
+            self.state
+                .emit_fmt(format_args!("    {} ${}, %xmm0", inst, amount));
+        }
+        self.vec_store_result(&d, "xmm0");
+    }
+
+    /// Integer packed compare (`pcmpeq*`/`pcmpgt*` vocabulary), mirroring
+    /// `X86Codegen::emit_int_cmp`'s predicate decode on the legacy two-op
+    /// forms — see the HISTORY note there: the ne/le/unsigned decodes must
+    /// not be "simplified".  The frontend has already reflected the mirrored
+    /// relations via (x, y), so the operand order below IS the test order.
+    fn emit_vec_cmp_int_i686(
+        &mut self,
+        dest: Option<Value>,
+        args: &[Operand],
+        sfx: &'static str,
+        lane: u8,
+    ) {
+        let d = dest.expect("i686 Vec cmp: value form expected");
+        assert!(args.len() == 3, "i686 Vec cmp: expects lhs, rhs, predicate");
+        let imm = match &args[2] {
+            Operand::Const(c) => c.to_i64().unwrap_or(-1),
+            other => panic!("i686 Vec cmp: predicate must be constant, got {:?}", other),
+        };
+        let unsigned = matches!(imm, 5 | 6);
+        let invert = matches!(imm, 2 | 4 | 6);
+        let eq = matches!(imm, 0 | 4);
+        self.vec_load_image(&args[0], "xmm0"); // a
+        self.vec_load_image(&args[1], "xmm1"); // b
+        if unsigned {
+            // bias = the sign bit replicated per lane: pcmpeqd (all ones),
+            // then a per-lane left shift by lane_bits-1.
+            self.state.emit("    pcmpeqd %xmm2, %xmm2");
+            self.state.emit_fmt(format_args!(
+                "    psll{} ${}, %xmm2",
+                match lane {
+                    1 => 'b',
+                    2 => 'w',
+                    4 => 'd',
+                    _ => panic!("i686 Vec cmp: lane {} has no packed bias shift", lane),
+                },
+                lane as i64 * 8 - 1
+            ));
+            self.state.emit("    pxor %xmm2, %xmm0"); // a'
+            self.state.emit("    pxor %xmm2, %xmm1"); // b'
+        }
+        let result = if eq {
+            self.state
+                .emit_fmt(format_args!("    pcmpeq{} %xmm1, %xmm0", sfx));
+            "xmm0"
+        } else if invert {
+            // le.s / le.u: !(a > b) tested directly as a > b, inverted below.
+            self.state
+                .emit_fmt(format_args!("    pcmpgt{} %xmm1, %xmm0", sfx));
+            "xmm0"
+        } else {
+            // lt.s / lt.u: a < b  ⇔  b > a; AT&T `pcmpgt src, dst` writes
+            // dst = dst > src, so the greater-side source is src.
+            self.state
+                .emit_fmt(format_args!("    pcmpgt{} %xmm0, %xmm1", sfx));
+            "xmm1"
+        };
+        if invert {
+            self.state.emit("    pcmpeqd %xmm2, %xmm2");
+            self.state.emit_fmt(format_args!("    pxor %xmm2, %{}", result));
+        }
+        self.vec_store_result(&d, result);
+    }
+
+    /// FP packed compare: the raw `cmpps`/`cmppd` predicate immediate has
+    /// the frontend's exact vocabulary (0 eq, 1 lt, 2 le, 4 neq) — no
+    /// integer-style decode.
+    fn emit_vec_cmp_fp_i686(
+        &mut self,
+        dest: Option<Value>,
+        args: &[Operand],
+        inst: &'static str,
+    ) {
+        let d = dest.expect("i686 Vec cmp: value form expected");
+        assert!(args.len() == 3, "i686 Vec cmp: expects lhs, rhs, predicate");
+        let imm = match &args[2] {
+            Operand::Const(c) => c.to_i64().unwrap_or(0),
+            other => panic!("i686 Vec cmp: predicate must be constant, got {:?}", other),
+        };
+        self.vec_load_image(&args[0], "xmm0");
+        self.vec_load_image(&args[1], "xmm1");
+        self.state
+            .emit_fmt(format_args!("    {} ${}, %xmm1, %xmm0", inst, imm));
+        self.vec_store_result(&d, "xmm0");
+    }
+
+    /// Whole-vector load: `args = [ptr, 0]` (the frontend's displacement is
+    /// folded to 0; any future displacement form must not reach here).
+    fn emit_vec_load_i686(&mut self, dest: Option<Value>, args: &[Operand]) {
+        let d = dest.expect("i686 VecLoad: value form expected");
+        assert!(!args.is_empty(), "i686 VecLoad: malformed args");
+        if let Some(Operand::Const(c)) = args.get(1) {
+            assert!(c.to_i64() == Some(0), "i686 VecLoad: nonzero displacement");
+        }
+        self.operand_to_eax(&args[0]);
+        self.state.emit("    movups (%eax), %xmm0");
+        self.vec_store_result(&d, "xmm0");
+    }
+
+    /// Whole-vector store: `args = [val, ptr, 0]`, `dest_ptr` mirrors
+    /// `args[1]` so every memory-effect contract sees the write.
+    fn emit_vec_store_i686(&mut self, dest_ptr: Option<Value>, args: &[Operand]) {
+        assert!(args.len() >= 2, "i686 VecStore: malformed args");
+        // dest_ptr mirrors args[1]; the contracts read dest_ptr, the address
+        // itself is the same alloca.
+        let ptr = dest_ptr.expect("i686 VecStore: dest_ptr form expected");
+        self.operand_to_eax(&Operand::Value(ptr));
+        self.vec_load_image(&args[0], "xmm0");
+        self.state.emit("    movups %xmm0, (%eax)");
     }
 
     /// Emit a binary SSE 128-bit operation: load two 128-bit operands from
