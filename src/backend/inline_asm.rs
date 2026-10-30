@@ -198,6 +198,12 @@ pub trait InlineAsmEmitter {
         false
     }
 
+    /// Whether a condition-code output can be written directly to its byte
+    /// stack home, avoiding a temporary GPR for setcc.
+    fn can_store_condition_code_output_direct(&self, _ptr: &Value, _ty: IrType) -> bool {
+        false
+    }
+
     /// Last-resort scratch register when all non-excluded candidates are
     /// exhausted and the constraint has no usable memory alternative.
     fn fallback_scratch_reg(&mut self, _kind: &AsmOperandKind) -> String {
@@ -545,6 +551,30 @@ pub fn emit_inline_asm_common_impl(
 ) {
     emitter.reset_scratch_state();
 
+    // An asm-goto branch bypasses the normal post-template output stores.
+    // Give each possible target an out-of-line edge block when any output
+    // still needs materializing. Branch-only condition outputs have a proven
+    // empty store, so they keep the original direct target (and avoid an
+    // unnecessary trampoline jump). Asms without outputs also retain their
+    // direct labels, preserving static-branch/jump-table shapes.
+    let has_materialized_outputs = outputs.iter().any(|(constraint, ptr, _)| {
+        (constraint.contains('=') || constraint.contains('+'))
+            && !emitter
+                .asm_state()
+                .asm_cc_branch_output_ptrs
+                .contains(&ptr.0)
+    });
+    let mut emitted_goto_labels = goto_labels.to_vec();
+    let mut asm_goto_trampolines = Vec::new();
+    if has_materialized_outputs && !goto_labels.is_empty() {
+        emitted_goto_labels.clear();
+        for (name, target) in goto_labels {
+            let label = emitter.asm_state().fresh_synthetic_block_id();
+            emitted_goto_labels.push((name.clone(), label));
+            asm_goto_trampolines.push((label, *target));
+        }
+    }
+
     // Phase 1: Classify all operands and assign registers
     let (mut operands, input_tied_to) = classify_all_operands(emitter, outputs, inputs);
     // Pre-populate operand types early so assign_scratch_registers can use them
@@ -597,7 +627,7 @@ pub fn emit_inline_asm_common_impl(
             &operands,
             &gcc_to_internal,
             operand_types,
-            goto_labels,
+            &emitted_goto_labels,
         );
         // GCC mnemonic-prefix modifiers (glibc math uses `%vstmxcsr`,
         // `%vldmxcsr`, `%vdivss %1, %d0` and `%xbegin`):
@@ -654,6 +684,22 @@ pub fn emit_inline_asm_common_impl(
         if constraint.contains('=') || constraint.contains('+') {
             emitter.store_output_from_reg(&operands[i], ptr, constraint, &all_output_regs);
         }
+    }
+    if !asm_goto_trampolines.is_empty() {
+        let trampoline_outputs: Vec<_> = outputs
+            .iter()
+            .enumerate()
+            .filter(|(_, (constraint, _, _))| constraint.contains('=') || constraint.contains('+'))
+            .map(|(i, (constraint, ptr, _))| (operands[i].clone(), *ptr, constraint.clone()))
+            .collect();
+        let pending = &mut emitter.asm_state().pending_asm_goto_trampolines;
+        pending.extend(asm_goto_trampolines.into_iter().map(|(label, target)| {
+            crate::backend::state::PendingAsmGotoTrampoline {
+                label,
+                target,
+                outputs: trampoline_outputs.clone(),
+            }
+        }));
     }
 }
 
@@ -1044,6 +1090,21 @@ fn assign_one_scratch(
     if !operands[i].reg.is_empty() {
         return;
     }
+    if i < outputs.len() && matches!(operands[i].kind, AsmOperandKind::ConditionCode(_)) {
+        let ptr = &outputs[i].1;
+        let branch_only = emitter
+            .asm_state()
+            .asm_cc_branch_output_ptrs
+            .contains(&ptr.0);
+        if branch_only
+            || emitter.can_store_condition_code_output_direct(ptr, operands[i].operand_type)
+        {
+            // Branch-only outputs have no observable store. Other byte flag
+            // outputs can use setcc directly on their stack home. Neither case
+            // needs a temporary GPR, leaving the pool available to operands.
+            return;
+        }
+    }
     match &operands[i].kind {
         AsmOperandKind::Memory | AsmOperandKind::Immediate => {}
         AsmOperandKind::Tied(_) => {}
@@ -1064,6 +1125,38 @@ fn assign_one_scratch(
                 // corresponding output in finalize_operands_and_build_gcc_map.
                 if input_idx < num_plus {
                     return;
+                }
+                if let Operand::Value(value) = &inputs[input_idx].1 {
+                    if let Some(home) = emitter.home_reg_name(value.0) {
+                        let compatible = match kind {
+                            AsmOperandKind::GpReg => {
+                                !home.starts_with("xmm") && !home.starts_with("st(")
+                            }
+                            AsmOperandKind::FpReg => home.starts_with("xmm"),
+                            AsmOperandKind::QReg => {
+                                matches!(home.as_str(), "rax" | "rcx" | "rdx" | "rbx")
+                            }
+                            _ => false,
+                        };
+                        let home_canonical = x86_normalize_reg_to_64bit(&home);
+                        let conflicts = excluded.iter().any(|reg| {
+                            reg == &home
+                                || match (
+                                    home_canonical.as_deref(),
+                                    x86_normalize_reg_to_64bit(reg).as_deref(),
+                                ) {
+                                    (Some(a), Some(b)) => a == b,
+                                    _ => false,
+                                }
+                        });
+                        if compatible && !conflicts {
+                            // An already-fresh home is a valid register input.
+                            // Reuse it rather than copying the value to a
+                            // second scratch register.
+                            operands[i].reg = home;
+                            return;
+                        }
+                    }
                 }
             }
             let kind_clone = kind.clone();

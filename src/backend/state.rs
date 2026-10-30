@@ -12,7 +12,7 @@
 use super::common::AsmOutput;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
-use crate::ir::reexports::{BlockId, IrCmpOp, Operand};
+use crate::ir::reexports::{BlockId, IrCmpOp, Operand, Value};
 use std::sync::Arc;
 
 /// Stack slot location for a value. Interpretation varies by arch:
@@ -48,6 +48,16 @@ pub enum SibcallTarget {
     Direct(String),
     RipSlot(String),
     Reg(&'static str),
+}
+
+/// Out-of-line edge block for an `asm goto` statement with output operands.
+/// The template branches to `label`; this block materializes the outputs and
+/// then transfers to the original C label `target`.
+#[derive(Debug, Clone)]
+pub struct PendingAsmGotoTrampoline {
+    pub label: BlockId,
+    pub target: BlockId,
+    pub outputs: Vec<(crate::backend::inline_asm::AsmOperand, Value, String)>,
 }
 
 /// Per-instruction sibling-call shape hint, computed by the generation
@@ -769,6 +779,19 @@ pub struct CodegenState {
     /// Label emitted immediately after the current block, if any. Used to
     /// elide unconditional jumps on the hot fall-through path.
     pub next_block_label: Option<BlockId>,
+    /// Next globally unused block-label number reserved for backend-generated
+    /// asm-goto output trampolines.
+    next_synthetic_block_id: u32,
+    /// Output-materialization trampolines queued by inline asm emission and
+    /// drained after the function's ordinary IR blocks have been emitted.
+    pub pending_asm_goto_trampolines: Vec<PendingAsmGotoTrampoline>,
+    /// CondBranch condition values whose truth is the live x86 condition
+    /// flags produced by an immediately preceding asm-goto flag output.
+    /// The x86 backend consumes these to branch directly without a cmp/test.
+    pub asm_cc_branch_values: FxHashMap<u32, String>,
+    /// Condition-code output pointers whose only IR reads are certified
+    /// branches in `asm_cc_branch_values`; their setcc/store is dead.
+    pub asm_cc_branch_output_ptrs: FxHashSet<u32>,
     /// Output offset immediately after the current observable block's label.
     /// `None` means its address is not observed. Owned by the shared block
     /// driver; reset between functions, never inferred from assembly labels.
@@ -953,12 +976,37 @@ impl CodegenState {
             fp_const_pool: FxHashMap::default(),
             vec_const_pool: FxHashMap::default(),
             next_block_label: None,
+            next_synthetic_block_id: 0,
+            pending_asm_goto_trampolines: Vec::new(),
+            asm_cc_branch_values: FxHashMap::default(),
+            asm_cc_branch_output_ptrs: FxHashSet::default(),
             observable_block_start: None,
         }
     }
 
     pub fn next_label_id(&mut self) -> u32 {
         self.out.next_label_id()
+    }
+
+    /// Reserve synthetic `.LBBn` labels after every real module block label.
+    /// Called once before module emission, when all renumbered IR labels are
+    /// known.
+    pub fn reserve_synthetic_block_ids_after(&mut self, max_real_id: Option<u32>) {
+        self.next_synthetic_block_id = max_real_id.map_or(0, |id| {
+            id.checked_add(1)
+                .expect("IR block label space exhausted by asm-goto trampoline")
+        });
+        self.pending_asm_goto_trampolines.clear();
+    }
+
+    /// Allocate a module-unique block-style label for an out-of-line asm-goto
+    /// output trampoline.
+    pub fn fresh_synthetic_block_id(&mut self) -> BlockId {
+        let id = self.next_synthetic_block_id;
+        self.next_synthetic_block_id = id
+            .checked_add(1)
+            .expect("asm-goto trampoline label space exhausted");
+        BlockId(id)
     }
 
     /// Start the address-identity region AFTER emitting this block's label.
@@ -1244,6 +1292,9 @@ impl CodegenState {
         self.dirty_upper_ymm = false;
         self.uses_sret = false;
         self.next_block_label = None;
+        debug_assert!(self.pending_asm_goto_trampolines.is_empty());
+        self.asm_cc_branch_values.clear();
+        self.asm_cc_branch_output_ptrs.clear();
         self.observable_block_start = None;
         // GEP-fold bookkeeping is function-local too: `folded_gep_values`
         // holds the value IDs of skipped address producers, and value IDs

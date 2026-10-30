@@ -274,7 +274,7 @@ pub(crate) fn substitute_x86_asm_operands(
                 }
                 // GCC numbers goto labels after all operands.
                 // %l<N> where N >= num_operands refers to label (N - num_operands).
-                let label_idx = num.wrapping_sub(op_regs.len());
+                let label_idx = num.wrapping_sub(gcc_to_internal.len());
                 if label_idx < goto_labels.len() {
                     result.push_str(&goto_labels[label_idx].1.to_string());
                     continue;

@@ -1327,14 +1327,44 @@ impl X86Codegen {
             "jge" => "jl",
             "jle" => "jg",
             "jg" => "jle",
-            "jb" => "jae",
+            "jb" | "jc" => "jae",
             "jae" => "jb",
             "jbe" => "ja",
             "ja" => "jbe",
             "jp" => "jnp",
             "jnp" => "jp",
+            "js" => "jns",
+            "jns" => "js",
+            "jo" => "jno",
+            "jno" => "jo",
+            "jnc" => "jc",
             // A silent fallback here would branch on the wrong condition.
             other => unreachable!("invert_jcc: unexpected condition {other}"),
+        }
+    }
+
+    #[inline]
+    fn asm_cc_jcc(cond: &str) -> &'static str {
+        match crate::backend::x86_common::gcc_cc_to_x86(cond) {
+            "e" => "je",
+            "ne" => "jne",
+            "s" => "js",
+            "ns" => "jns",
+            "o" => "jo",
+            "no" => "jno",
+            "c" => "jc",
+            "nc" => "jnc",
+            "a" => "ja",
+            "ae" => "jae",
+            "b" => "jb",
+            "be" => "jbe",
+            "g" => "jg",
+            "ge" => "jge",
+            "l" => "jl",
+            "le" => "jle",
+            "p" => "jp",
+            "np" => "jnp",
+            _ => unreachable!("gcc_cc_to_x86 returned an unsupported suffix"),
         }
     }
 
@@ -1364,6 +1394,33 @@ impl X86Codegen {
         };
         let hot_next = next == Some(hot);
         let cold_next = next == Some(cold);
+
+        // GNU asm-goto flag outputs describe the live hardware condition
+        // flags. For the proven single-use branch shape, avoid reloading and
+        // testing the stored bool; setcc/mov/store and the output-edge
+        // trampoline preserve EFLAGS, so this branch can consume them here.
+        if let Operand::Value(value) = cond {
+            if let Some(cc) = self.state.asm_cc_branch_values.remove(&value.0) {
+                let jcc = Self::asm_cc_jcc(&cc);
+                let jcc_hot = if pref_true {
+                    jcc
+                } else {
+                    Self::invert_jcc(jcc)
+                };
+                if hot_next {
+                    self.state
+                        .out
+                        .emit_jcc_block(Self::invert_jcc(jcc_hot), cold.0);
+                } else {
+                    self.state.out.emit_jcc_block(jcc_hot, hot.0);
+                    if !cold_next {
+                        self.state.out.emit_jmp_block(cold.0);
+                    }
+                }
+                self.state.reg_cache.invalidate_all();
+                return;
+            }
+        }
 
         // DE MORGAN SPLIT: `CondBranch(And/Or(CmpA, CmpB))` with all three
         // skipped at their own positions. Re-emit cmpA, short-circuit-jump

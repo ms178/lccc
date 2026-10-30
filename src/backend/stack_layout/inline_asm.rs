@@ -251,10 +251,10 @@ fn is_generic_gp_constraint(constraint: &str) -> bool {
 /// dropped.
 ///
 /// Demand counting is deliberately over-approximate: every operand that is
-/// not a tied digit, an immediate-only class, an @cc flag output, or an
-/// explicit single-register letter counts as one scratch register (two if
-/// its operand type is 64-bit, since i686 uses a register pair). Memory
-/// operands count too (address staging draws from the same pool).
+/// not a tied digit, an immediate-only class, a directly stored byte @cc
+/// output, or an explicit single-register letter counts as one scratch
+/// register (two if its operand type is 64-bit, since i686 uses a register
+/// pair). Memory operands count too (address staging draws from the same pool).
 pub fn collect_inline_asm_callee_saved_i686(
     func: &IrFunction,
     used: &mut Vec<PhysReg>,
@@ -287,6 +287,15 @@ pub fn collect_inline_asm_callee_saved_i686(
             })
     }
 
+    let alloca_ids: FxHashSet<u32> = func
+        .blocks
+        .iter()
+        .flat_map(|block| block.instructions.iter())
+        .filter_map(|inst| match inst {
+            Instruction::Alloca { dest, .. } => Some(dest.0),
+            _ => None,
+        })
+        .collect();
     let mut all_blocks_fit = true;
     'scan: for block in &func.blocks {
         for inst in &block.instructions {
@@ -315,6 +324,14 @@ pub fn collect_inline_asm_callee_saved_i686(
                            demand: &mut i32| {
                 let c = c.trim_start_matches(['=', '+', '&', '%']);
                 if c.starts_with("@cc") {
+                    let direct_byte_store =
+                        matches!(operand_types.get(op_idx), Some(IrType::I8 | IrType::U8))
+                            && outputs
+                                .get(op_idx)
+                                .is_some_and(|(_, ptr, _)| alloca_ids.contains(&ptr.0));
+                    if !direct_byte_store {
+                        *demand += 1;
+                    }
                     return;
                 }
                 if !c.is_empty() && c.chars().all(|ch| ch.is_ascii_digit()) {
@@ -375,7 +392,29 @@ pub fn collect_inline_asm_callee_saved_i686(
                 }
             }
 
-            if demand > avail.max(0) {
+            let has_cc_output = outputs.iter().any(|(constraint, _, _)| {
+                constraint
+                    .trim_start_matches(['=', '+', '&', '%'])
+                    .starts_with("@cc")
+            });
+            let has_register_output = outputs.iter().any(|(constraint, _, _)| {
+                let c = constraint.trim_start_matches(['=', '+', '&', '%']);
+                c.contains('r') || c.contains('q') || c.contains('g')
+            });
+            let has_register_input = inputs.iter().any(|(constraint, _, _)| {
+                let c = constraint.trim_start_matches(['=', '+', '&', '%']);
+                c.contains('r') || c.contains('q') || c.contains('g')
+            });
+            let caller_scratch_saturated = demand > 0 && demand >= avail.max(0);
+            if demand > avail.max(0)
+                || caller_scratch_saturated
+                || (has_cc_output && has_register_output && has_register_input)
+            {
+                // Mixed flag and register outputs make the generic scratch
+                // allocator's available caller-saved prefix depend on live RA
+                // homes, which the early demand scan cannot see. Reserve the
+                // callee-saved pool rather than risk an unsaved asm scratch
+                // clobber on this uncommon shape.
                 all_blocks_fit = false;
                 break 'scan;
             }
