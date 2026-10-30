@@ -853,8 +853,14 @@ fn downcount_after_invert(func: &mut IrFunction, plan: &Plan, debug: bool) -> bo
             _ => None,
         }
     }
-    let guard_cmp = 0;
-    let Some((iv, limit_const, ty)) = cmp_shape(&func.blocks[h].instructions[0], guard_cond) else {
+    // The header gate above (`instructions.len() != 1`) has already proven the
+    // header holds exactly this compare, so the site is a constant and every
+    // later rewrite can address it by index.
+    const GUARD_CMP: usize = 0;
+    let guard_cmp = GUARD_CMP;
+    let Some((iv, limit_const, ty)) =
+        cmp_shape(&func.blocks[h].instructions[guard_cmp], guard_cond)
+    else {
         return false;
     };
     let Some(latch_cmp) = func.blocks[t]
@@ -893,12 +899,9 @@ fn downcount_after_invert(func: &mut IrFunction, plan: &Plan, debug: bool) -> bo
     if iv_defs.len() != 2 {
         return false;
     }
-    let Some(&(pre_bi, init)) = iv_defs.iter().find(|(bi, _)| *bi == p) else {
+    let Some(&(_, init)) = iv_defs.iter().find(|(bi, _)| *bi == p) else {
         return false;
     };
-    if pre_bi != p {
-        return false;
-    }
     let Some(&(_, copy)) = iv_defs.iter().find(|(bi, _)| *bi == t) else {
         return false;
     };

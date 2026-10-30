@@ -1419,6 +1419,13 @@ fn seed_preheader(
             for copy_idx in 1..unroll as i32 {
                 let byte_offset = copy_idx * vector_bytes as i32;
                 if multi_iv {
+                    // Only the compact XMM pair carries two strided streams, so
+                    // this packer's four i32 lanes are the complete vector.  Any
+                    // wider width has to go through `width.broadcast()` below.
+                    debug_assert!(
+                        width == StridedWidth::X4Compact,
+                        "multi-IV offset chains are an X4Compact-only shape"
+                    );
                     let chain_init = fresh();
                     out.push(Instruction::Intrinsic {
                         dest: Some(chain_init),
